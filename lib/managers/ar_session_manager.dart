@@ -1,23 +1,76 @@
+import 'dart:async';
+import 'dart:io';
 import 'dart:math' show sqrt;
 import 'dart:typed_data';
 
 import 'package:ar_flutter_plugin_2/datatypes/config_planedetection.dart';
+import 'package:ar_flutter_plugin_2/datatypes/image_format.dart';
 import 'package:ar_flutter_plugin_2/models/ar_anchor.dart';
 import 'package:ar_flutter_plugin_2/models/ar_hittest_result.dart';
+import 'package:ar_flutter_plugin_2/models/ar_capture_config.dart';
+import 'package:ar_flutter_plugin_2/capabilities/ar_camera_capabilities.dart';
 import 'package:ar_flutter_plugin_2/utils/json_converters.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:vector_math/vector_math_64.dart';
+import 'ar_capture_manager.dart';
 
 // Type definitions to enforce a consistent use of the API
 typedef ARHitResultHandler = void Function(List<ARHitTestResult> hits);
 typedef ARPlaneResultHandler = void Function(int planeCount);
 typedef ErrorHandler = void Function(String error);
 
+/// AR Session states for lifecycle management
+enum ARSessionState {
+  notInitialized,
+  initializing,
+  initialized,
+  resuming,
+  running,
+  pausing,
+  paused,
+  error,
+  disposed,
+}
+
+/// AR Configuration for session setup
+class ARConfiguration {
+  final bool enableCapture;
+  final ARCaptureConfig? captureConfig;
+  final PlaneDetectionConfig? planeDetectionConfig;
+  final bool showAnimatedGuide;
+  final bool showFeaturePoints;
+  final bool showPlanes;
+  final String? customPlaneTexturePath;
+  final bool showWorldOrigin;
+  final bool handleTaps;
+  final bool handlePans;
+  final bool handleRotation;
+  final bool debug;
+  
+  const ARConfiguration({
+    this.enableCapture = false,
+    this.captureConfig,
+    this.planeDetectionConfig,
+    this.showAnimatedGuide = true,
+    this.showFeaturePoints = false,
+    this.showPlanes = true,
+    this.customPlaneTexturePath,
+    this.showWorldOrigin = false,
+    this.handleTaps = true,
+    this.handlePans = false,
+    this.handleRotation = false,
+    this.debug = false,
+  });
+}
+
 /// Manages the session configuration, parameters and events of an [ARView]
 class ARSessionManager {
   /// Platform channel used for communication from and to [ARSessionManager]
   late MethodChannel _channel;
+
+  /// Complete AR Configuration for session setup
+  final ARConfiguration? _arConfig;
 
   /// Debugging status flag. If true, all platform calls are printed. Defaults to false.
   final bool debug;
@@ -28,6 +81,21 @@ class ARSessionManager {
   /// Determines the types of planes ARCore and ARKit should show
   final PlaneDetectionConfig planeDetectionConfig;
 
+  /// Capture manager - created at construction time if config provided
+  ARCaptureManager? _captureManager;
+
+  /// Current session state
+  ARSessionState _sessionState = ARSessionState.notInitialized;
+
+  /// Session state change stream controller
+  final StreamController<ARSessionState> _stateController = StreamController.broadcast();
+
+  /// Initialization completion completer
+  Completer<void>? _initializationCompleter;
+
+  /// Error state tracker
+  String? _lastError;
+
   /// Receives hit results from user taps with tracked planes or feature points
   late ARHitResultHandler onPlaneOrPointTap;
 
@@ -37,12 +105,463 @@ class ARSessionManager {
   /// Callback that is triggered once error is triggered
   ErrorHandler? onError;
 
+  // Legacy constructor for backward compatibility
   ARSessionManager(int id, this.buildContext, this.planeDetectionConfig,
-      {this.debug = false}) {
+      {this.debug = false, ARCaptureConfig? captureConfig}) : _arConfig = null {
     _channel = MethodChannel('arsession_$id');
     _channel.setMethodCallHandler(_platformCallHandler);
+
+    try {
+      // Validate configurations before initialization
+      _validateConfigurations(planeDetectionConfig, captureConfig);
+
+      // Initialize capture manager if config provided
+      if (captureConfig != null) {
+        _captureManager = ARCaptureManager(this, captureConfig, buildContext);
+        if (debug) {
+          print("ARSessionManager initialized with capture capabilities");
+        }
+      } else {
+        if (debug) {
+          print("ARSessionManager initialized without capture capabilities");
+        }
+      }
+
+      _sessionState = ARSessionState.initialized;
+      if (debug) {
+        print("ARSessionManager initialized");
+      }
+    } catch (e) {
+      _sessionState = ARSessionState.error;
+      _lastError = e.toString();
+      throw ARSessionException('ARSessionManager initialization failed: $e');
+    }
+  }
+
+  // Enhanced constructor with ARConfiguration
+  ARSessionManager.withConfig({
+    required this.buildContext,
+    required ARConfiguration arConfig,
+    int? id,
+  }) : _arConfig = arConfig,
+        debug = arConfig.debug,
+        planeDetectionConfig = arConfig.planeDetectionConfig ?? PlaneDetectionConfig.horizontal {
+    
+    final sessionId = id ?? DateTime.now().millisecondsSinceEpoch;
+    _channel = MethodChannel('arsession_$sessionId');
+    _channel.setMethodCallHandler(_platformCallHandler);
+
     if (debug) {
-      print("ARSessionManager initialized");
+      print("ARSessionManager created with enhanced configuration");
+    }
+  }
+
+  /// Access to capture functionality (non-null if captureConfig was provided)
+  ARCaptureManager? get captureManager => _captureManager;
+
+  /// Check if capture manager is available
+  bool get hasCaptureManager => _captureManager != null;
+
+  /// Check if capture is currently enabled
+  bool get isCaptureEnabled => _captureManager?.isEnabled ?? false;
+
+  // PHASE 6 LIFECYCLE MANAGEMENT METHODS
+
+  /// Check if session is initialized
+  bool get isInitialized => _sessionState == ARSessionState.initialized || 
+                           _sessionState == ARSessionState.running ||
+                           _sessionState == ARSessionState.paused;
+
+  /// Check if capture is ready for use
+  bool get isCaptureReady => _captureManager != null && _captureManager!.isEnabled && isInitialized;
+
+  /// Get current session state
+  ARSessionState get sessionState => _sessionState;
+
+  /// Get last error message if any
+  String? get lastError => _lastError;
+
+  /// Stream of session state changes
+  Stream<ARSessionState> get stateStream => _stateController.stream;
+
+  /// Initialize AR session with integrated capture
+  Future<void> initialize() async {
+    if (_sessionState != ARSessionState.notInitialized) {
+      if (debug) {
+        print('Session already initialized or in process');
+      }
+      return;
+    }
+
+    try {
+      _setState(ARSessionState.initializing);
+      _lastError = null;
+
+      if (debug) {
+        print('Starting AR session initialization...');
+      }
+
+      // Validate configurations if using enhanced config
+      if (_arConfig != null) {
+        await _validateARConfiguration(_arConfig!);
+      }
+
+      // Initialize capture manager if enabled
+      if (_arConfig?.enableCapture == true && _arConfig?.captureConfig != null) {
+        if (debug) {
+          print('Initializing integrated capture manager...');
+        }
+        
+        _captureManager = ARCaptureManager(this, _arConfig!.captureConfig!, buildContext);
+        
+        if (debug) {
+          print('Capture manager initialized successfully');
+        }
+      }
+
+      // Initialize platform AR session
+      await _initializePlatformSession();
+
+      _setState(ARSessionState.initialized);
+      
+      if (debug) {
+        print('AR session initialization completed');
+      }
+
+    } catch (e) {
+      _lastError = e.toString();
+      _setState(ARSessionState.error);
+      throw ARSessionException('Failed to initialize AR session: $e');
+    }
+  }
+
+  /// Resume AR session and capture
+  Future<void> resume() async {
+    if (_sessionState != ARSessionState.initialized && _sessionState != ARSessionState.paused) {
+      throw ARSessionException('Cannot resume session in state: $_sessionState');
+    }
+
+    try {
+      _setState(ARSessionState.resuming);
+      _lastError = null;
+
+      if (debug) {
+        print('Resuming AR session...');
+      }
+
+      // Resume platform AR session
+      await _channel.invokeMethod('resumeSession');
+
+      // Resume capture if available
+      if (_captureManager != null) {
+        // Capture manager doesn't need explicit resume - it's always ready when session is running
+        if (debug) {
+          print('Capture manager is ready');
+        }
+      }
+
+      _setState(ARSessionState.running);
+
+      if (debug) {
+        print('AR session resumed successfully');
+      }
+
+    } catch (e) {
+      _lastError = e.toString();
+      _setState(ARSessionState.error);
+      throw ARSessionException('Failed to resume AR session: $e');
+    }
+  }
+
+  /// Pause AR session and capture
+  Future<void> pause() async {
+    if (_sessionState != ARSessionState.running) {
+      if (debug) {
+        print('Session not running, current state: $_sessionState');
+      }
+      return;
+    }
+
+    try {
+      _setState(ARSessionState.pausing);
+
+      if (debug) {
+        print('Pausing AR session...');
+      }
+
+      // Pause platform AR session
+      await _channel.invokeMethod('pauseSession');
+
+      _setState(ARSessionState.paused);
+
+      if (debug) {
+        print('AR session paused successfully');
+      }
+
+    } catch (e) {
+      _lastError = e.toString();
+      _setState(ARSessionState.error);
+      throw ARSessionException('Failed to pause AR session: $e');
+    }
+  }
+
+  /// Enhanced dispose with integrated cleanup
+  @override
+  Future<void> dispose() async {
+    if (_sessionState == ARSessionState.disposed) {
+      if (debug) {
+        print('Session already disposed');
+      }
+      return;
+    }
+
+    try {
+      if (debug) {
+        print('Disposing AR session...');
+      }
+
+      _setState(ARSessionState.disposed);
+
+      // Dispose capture manager first
+      if (_captureManager != null) {
+        if (debug) {
+          print('Disposing capture manager...');
+        }
+        _captureManager!.dispose();
+        _captureManager = null;
+      }
+
+      // Dispose platform AR session
+      await _channel.invokeMethod<void>("dispose");
+
+      // Close state stream
+      await _stateController.close();
+
+      if (debug) {
+        print('AR session disposed successfully');
+      }
+
+    } catch (e) {
+      _lastError = e.toString();
+      if (debug) {
+        print('Error during disposal: $e');
+      }
+    }
+  }
+
+  /// Set session state and notify listeners
+  void _setState(ARSessionState newState) {
+    if (_sessionState != newState) {
+      _sessionState = newState;
+      _stateController.add(newState);
+      
+      if (debug) {
+        print('Session state changed to: $newState');
+      }
+    }
+  }
+
+  /// Validate AR configuration
+  Future<void> _validateARConfiguration(ARConfiguration config) async {
+    if (config.enableCapture && config.captureConfig == null) {
+      throw ARSessionException('Capture enabled but no capture config provided');
+    }
+
+    if (config.captureConfig != null) {
+      _validateCaptureConfigSync(config.captureConfig!);
+      await _validateCaptureConfigAsync(config.captureConfig!);
+    }
+
+    if (debug) {
+      print('AR configuration validation completed');
+    }
+  }
+
+  /// Initialize platform-specific AR session
+  Future<void> _initializePlatformSession() async {
+    final config = _arConfig ?? ARConfiguration(
+      planeDetectionConfig: planeDetectionConfig,
+      debug: debug,
+    );
+
+    await _channel.invokeMethod('init', {
+      'showAnimatedGuide': config.showAnimatedGuide,
+      'showFeaturePoints': config.showFeaturePoints,
+      'planeDetectionConfig': config.planeDetectionConfig?.index ?? planeDetectionConfig.index,
+      'showPlanes': config.showPlanes,
+      'customPlaneTexturePath': config.customPlaneTexturePath,
+      'showWorldOrigin': config.showWorldOrigin,
+      'handleTaps': config.handleTaps,
+      'handlePans': config.handlePans,
+      'handleRotation': config.handleRotation,
+    });
+
+    if (debug) {
+      print('Platform AR session initialized');
+    }
+  }
+
+  /// Validate all provided configurations before initialization
+  void _validateConfigurations(
+    PlaneDetectionConfig planeDetectionConfig,
+    ARCaptureConfig? captureConfig,
+  ) {
+    try {
+      // Validate plane detection configuration
+      _validatePlaneDetectionConfig(planeDetectionConfig);
+
+      // Validate capture configuration if provided
+      if (captureConfig != null) {
+        _validateCaptureConfigSync(captureConfig);
+        // Schedule async validation
+        _scheduleCaptureConfigValidation(captureConfig);
+      }
+
+      // Check configuration compatibility
+      if (captureConfig != null) {
+        _checkConfigurationCompatibility(planeDetectionConfig, captureConfig);
+      }
+
+      if (debug) {
+        print('Configuration validation passed');
+      }
+    } catch (e) {
+      throw ARSessionException('Configuration validation failed: $e');
+    }
+  }
+
+  /// Validate plane detection configuration
+  void _validatePlaneDetectionConfig(PlaneDetectionConfig config) {
+    // Basic validation - all plane detection configs are currently valid
+    if (debug) {
+      print('Plane detection configuration validated');
+    }
+  }
+
+  /// Synchronous validation of capture configuration
+  void _validateCaptureConfigSync(ARCaptureConfig config) {
+    // Check platform support
+    if (!Platform.isAndroid) {
+      throw ARSessionException('Capture not supported on this platform');
+    }
+
+    // Validate basic configuration values
+    if (config.captureIntervalMs < 100) {
+      throw ARSessionException('Capture interval must be at least 100ms');
+    }
+
+    if (config.captureIntervalMs > 3600000) {
+      // 1 hour
+      throw ARSessionException('Capture interval cannot exceed 1 hour');
+    }
+
+    // Validate resolution values
+    if (config.resolution.width <= 0 || config.resolution.height <= 0) {
+      throw ARSessionException('Resolution dimensions must be positive');
+    }
+
+    if (config.resolution.width > 8192 || config.resolution.height > 8192) {
+      throw ARSessionException(
+          'Resolution dimensions cannot exceed 8192 pixels');
+    }
+
+    if (debug) {
+      print('Capture configuration basic validation passed');
+    }
+  }
+
+  /// Schedule asynchronous validation of capture configuration
+  void _scheduleCaptureConfigValidation(ARCaptureConfig config) {
+    // Use microtask to avoid blocking constructor
+    scheduleMicrotask(() async {
+      try {
+        await _validateCaptureConfigAsync(config);
+      } catch (e) {
+        if (debug) {
+          print('Warning: Async capture validation failed: $e');
+        }
+        // Note: We don't throw here as constructor is already complete
+        // This validation provides warnings only
+      }
+    });
+  }
+
+  /// Asynchronous validation of capture configuration
+  Future<void> _validateCaptureConfigAsync(ARCaptureConfig config) async {
+    final capabilities = ARCameraCapabilities();
+
+    try {
+      // Validate using full capability system
+      final validationResult = await capabilities.validateCaptureConfig(config);
+
+      if (!validationResult.isValid) {
+        if (debug) {
+          print('Warning: Capture configuration validation issues:');
+          for (final error in validationResult.errors) {
+            print('  - Error: $error');
+          }
+        }
+      }
+
+      if (validationResult.hasWarnings) {
+        if (debug) {
+          print('Capture configuration warnings:');
+          for (final warning in validationResult.warnings) {
+            print('  - Warning: $warning');
+          }
+        }
+      }
+
+      if (validationResult.suggestedConfig != null) {
+        if (debug) {
+          print('Suggested configuration: ${validationResult.suggestedConfig}');
+        }
+      }
+
+      if (debug) {
+        print('Async capture configuration validation completed');
+      }
+    } catch (e) {
+      if (debug) {
+        print('Async validation error: $e');
+      }
+    }
+  }
+
+  /// Check compatibility between different configurations
+  void _checkConfigurationCompatibility(
+    PlaneDetectionConfig planeConfig,
+    ARCaptureConfig captureConfig,
+  ) {
+    // Check for known incompatibilities
+
+    // High-frequency capture with intensive plane detection may cause issues
+    if (captureConfig.captureIntervalMs < 1000) {
+      if (debug) {
+        print('Warning: High-frequency capture may impact performance');
+      }
+    }
+
+    // Raw format with frequent capture may cause memory issues
+    if (captureConfig.format == ImageFormat.raw &&
+        captureConfig.captureIntervalMs < 5000) {
+      if (debug) {
+        print(
+            'Warning: RAW format with frequent capture may cause memory pressure');
+      }
+    }
+
+    // High resolution capture
+    if (captureConfig.resolution.totalPixels > 8000000) {
+      // 4K+
+      if (debug) {
+        print(
+            'Warning: High resolution capture may impact AR tracking performance');
+      }
+    }
+
+    if (debug) {
+      print('Configuration compatibility check completed');
     }
   }
 
@@ -122,9 +641,9 @@ class ARSessionManager {
   }
 
   //Show or hide planes
-  void showPlanes(bool showPlanes){
+  void showPlanes(bool showPlanes) {
     _channel.invokeMethod<void>('showPlanes', {
-    "showPlanes": showPlanes,
+      "showPlanes": showPlanes,
     });
   }
 
@@ -138,14 +657,13 @@ class ARSessionManager {
           if (onError != null) {
             onError!(call.arguments[0]);
             print(call.arguments);
-          }
-          else{
+          } else {
             ScaffoldMessenger.of(buildContext).showSnackBar(SnackBar(
                 content: Text(call.arguments[0]),
                 action: SnackBarAction(
                     label: 'HIDE',
-                    onPressed:
-                    ScaffoldMessenger.of(buildContext).hideCurrentSnackBar)));
+                    onPressed: ScaffoldMessenger.of(buildContext)
+                        .hideCurrentSnackBar)));
           }
           break;
         case 'onPlaneOrPointTap':
@@ -207,11 +725,13 @@ class ARSessionManager {
     });
   }
 
-
-  /// Dispose the AR view on the platforms to pause the scenes and disconnect the platform handlers.
-  /// You should call this before removing the AR view to prevent out of memory erros
-  dispose() async {
+  /// Legacy dispose method for backward compatibility
+  /// You should call this before removing the AR view to prevent out of memory errors
+  Future<void> disposeLegacy() async {
     try {
+      // Dispose capture manager first
+      _captureManager?.dispose();
+
       await _channel.invokeMethod<void>("dispose");
     } catch (e) {
       print(e);
@@ -223,4 +743,13 @@ class ARSessionManager {
     final result = await _channel.invokeMethod<Uint8List>('snapshot');
     return MemoryImage(result!);
   }
+}
+
+/// Exception thrown when session operations fail
+class ARSessionException implements Exception {
+  final String message;
+  ARSessionException(this.message);
+
+  @override
+  String toString() => 'ARSessionException: $message';
 }

@@ -6,11 +6,13 @@ import androidx.lifecycle.LifecycleOwner
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
+import com.uhg0.ar_flutter_plugin_2.capabilities.MethodChannelARCameraCapabilities
 
 class ArFlutterPlugin: FlutterPlugin, ActivityAware {
     private var activity: Activity? = null
     private var lifecycle: Lifecycle? = null
     private var flutterPluginBinding: FlutterPlugin.FlutterPluginBinding? = null
+    private var cameraCapabilities: MethodChannelARCameraCapabilities? = null
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         flutterPluginBinding = binding
@@ -34,12 +36,17 @@ class ArFlutterPlugin: FlutterPlugin, ActivityAware {
                     lifecycle = lifecycle!!
                 )
             )
+            
+            // Initialize camera capabilities method channel
+            cameraCapabilities = MethodChannelARCameraCapabilities(activity!!.applicationContext)
+            cameraCapabilities?.setupMethodChannel(flutterBinding.binaryMessenger)
         }
     }
 
     override fun onDetachedFromActivityForConfigChanges() {
         activity = null
         lifecycle = null
+        cameraCapabilities = null
     }
 
     override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
@@ -56,11 +63,16 @@ class ArFlutterPlugin: FlutterPlugin, ActivityAware {
                     lifecycle = lifecycle!!
                 )
             )
+            
+            // Re-initialize camera capabilities method channel after config changes
+            cameraCapabilities = MethodChannelARCameraCapabilities(activity!!.applicationContext)
+            cameraCapabilities?.setupMethodChannel(flutterBinding.binaryMessenger)
         }
     }
 
     override fun onDetachedFromActivity() {
         activity = null
         lifecycle = null
+        cameraCapabilities = null
     }
 }
