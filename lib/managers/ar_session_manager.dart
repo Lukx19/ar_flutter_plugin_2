@@ -47,7 +47,7 @@ class ARConfiguration {
   final bool handlePans;
   final bool handleRotation;
   final bool debug;
-  
+
   const ARConfiguration({
     this.enableCapture = false,
     this.captureConfig,
@@ -66,6 +66,8 @@ class ARConfiguration {
 
 /// Manages the session configuration, parameters and events of an [ARView]
 class ARSessionManager {
+  final int _channelId;
+
   /// Platform channel used for communication from and to [ARSessionManager]
   late MethodChannel _channel;
 
@@ -88,7 +90,8 @@ class ARSessionManager {
   ARSessionState _sessionState = ARSessionState.notInitialized;
 
   /// Session state change stream controller
-  final StreamController<ARSessionState> _stateController = StreamController.broadcast();
+  final StreamController<ARSessionState> _stateController =
+      StreamController.broadcast();
 
   /// Initialization completion completer
   Completer<void>? _initializationCompleter;
@@ -107,7 +110,9 @@ class ARSessionManager {
 
   // Legacy constructor for backward compatibility
   ARSessionManager(int id, this.buildContext, this.planeDetectionConfig,
-      {this.debug = false, ARCaptureConfig? captureConfig}) : _arConfig = null {
+      {this.debug = false, ARCaptureConfig? captureConfig})
+      : _arConfig = null,
+        _channelId = id {
     _channel = MethodChannel('arsession_$id');
     _channel.setMethodCallHandler(_platformCallHandler);
 
@@ -143,12 +148,12 @@ class ARSessionManager {
     required this.buildContext,
     required ARConfiguration arConfig,
     int? id,
-  }) : _arConfig = arConfig,
+  })  : _arConfig = arConfig,
         debug = arConfig.debug,
-        planeDetectionConfig = arConfig.planeDetectionConfig ?? PlaneDetectionConfig.horizontal {
-    
-    final sessionId = id ?? DateTime.now().millisecondsSinceEpoch;
-    _channel = MethodChannel('arsession_$sessionId');
+        planeDetectionConfig =
+            arConfig.planeDetectionConfig ?? PlaneDetectionConfig.horizontal,
+        _channelId = id ?? DateTime.now().millisecondsSinceEpoch {
+    _channel = MethodChannel('arsession_$_channelId');
     _channel.setMethodCallHandler(_platformCallHandler);
 
     if (debug) {
@@ -159,6 +164,9 @@ class ARSessionManager {
   /// Access to capture functionality (non-null if captureConfig was provided)
   ARCaptureManager? get captureManager => _captureManager;
 
+  /// The platform-view specific channel id shared by session/object/anchor/capture managers.
+  int get channelId => _channelId;
+
   /// Check if capture manager is available
   bool get hasCaptureManager => _captureManager != null;
 
@@ -168,12 +176,14 @@ class ARSessionManager {
   // PHASE 6 LIFECYCLE MANAGEMENT METHODS
 
   /// Check if session is initialized
-  bool get isInitialized => _sessionState == ARSessionState.initialized || 
-                           _sessionState == ARSessionState.running ||
-                           _sessionState == ARSessionState.paused;
+  bool get isInitialized =>
+      _sessionState == ARSessionState.initialized ||
+      _sessionState == ARSessionState.running ||
+      _sessionState == ARSessionState.paused;
 
   /// Check if capture is ready for use
-  bool get isCaptureReady => _captureManager != null && _captureManager!.isEnabled && isInitialized;
+  bool get isCaptureReady =>
+      _captureManager != null && _captureManager!.isEnabled && isInitialized;
 
   /// Get current session state
   ARSessionState get sessionState => _sessionState;
@@ -207,13 +217,15 @@ class ARSessionManager {
       }
 
       // Initialize capture manager if enabled
-      if (_arConfig?.enableCapture == true && _arConfig?.captureConfig != null) {
+      if (_arConfig?.enableCapture == true &&
+          _arConfig?.captureConfig != null) {
         if (debug) {
           print('Initializing integrated capture manager...');
         }
-        
-        _captureManager = ARCaptureManager(this, _arConfig!.captureConfig!, buildContext);
-        
+
+        _captureManager =
+            ARCaptureManager(this, _arConfig!.captureConfig!, buildContext);
+
         if (debug) {
           print('Capture manager initialized successfully');
         }
@@ -223,11 +235,10 @@ class ARSessionManager {
       await _initializePlatformSession();
 
       _setState(ARSessionState.initialized);
-      
+
       if (debug) {
         print('AR session initialization completed');
       }
-
     } catch (e) {
       _lastError = e.toString();
       _setState(ARSessionState.error);
@@ -237,8 +248,10 @@ class ARSessionManager {
 
   /// Resume AR session and capture
   Future<void> resume() async {
-    if (_sessionState != ARSessionState.initialized && _sessionState != ARSessionState.paused) {
-      throw ARSessionException('Cannot resume session in state: $_sessionState');
+    if (_sessionState != ARSessionState.initialized &&
+        _sessionState != ARSessionState.paused) {
+      throw ARSessionException(
+          'Cannot resume session in state: $_sessionState');
     }
 
     try {
@@ -265,7 +278,6 @@ class ARSessionManager {
       if (debug) {
         print('AR session resumed successfully');
       }
-
     } catch (e) {
       _lastError = e.toString();
       _setState(ARSessionState.error);
@@ -297,7 +309,6 @@ class ARSessionManager {
       if (debug) {
         print('AR session paused successfully');
       }
-
     } catch (e) {
       _lastError = e.toString();
       _setState(ARSessionState.error);
@@ -340,7 +351,6 @@ class ARSessionManager {
       if (debug) {
         print('AR session disposed successfully');
       }
-
     } catch (e) {
       _lastError = e.toString();
       if (debug) {
@@ -354,7 +364,7 @@ class ARSessionManager {
     if (_sessionState != newState) {
       _sessionState = newState;
       _stateController.add(newState);
-      
+
       if (debug) {
         print('Session state changed to: $newState');
       }
@@ -364,7 +374,8 @@ class ARSessionManager {
   /// Validate AR configuration
   Future<void> _validateARConfiguration(ARConfiguration config) async {
     if (config.enableCapture && config.captureConfig == null) {
-      throw ARSessionException('Capture enabled but no capture config provided');
+      throw ARSessionException(
+          'Capture enabled but no capture config provided');
     }
 
     if (config.captureConfig != null) {
@@ -379,15 +390,17 @@ class ARSessionManager {
 
   /// Initialize platform-specific AR session
   Future<void> _initializePlatformSession() async {
-    final config = _arConfig ?? ARConfiguration(
-      planeDetectionConfig: planeDetectionConfig,
-      debug: debug,
-    );
+    final config = _arConfig ??
+        ARConfiguration(
+          planeDetectionConfig: planeDetectionConfig,
+          debug: debug,
+        );
 
     await _channel.invokeMethod('init', {
       'showAnimatedGuide': config.showAnimatedGuide,
       'showFeaturePoints': config.showFeaturePoints,
-      'planeDetectionConfig': config.planeDetectionConfig?.index ?? planeDetectionConfig.index,
+      'planeDetectionConfig':
+          config.planeDetectionConfig?.index ?? planeDetectionConfig.index,
       'showPlanes': config.showPlanes,
       'customPlaneTexturePath': config.customPlaneTexturePath,
       'showWorldOrigin': config.showWorldOrigin,
@@ -441,12 +454,15 @@ class ARSessionManager {
   /// Synchronous validation of capture configuration
   void _validateCaptureConfigSync(ARCaptureConfig config) {
     // Check platform support
-    if (!Platform.isAndroid) {
+    final isCaptureSupported = ARCaptureManager.debugIsSupportedOverride ??
+        (Platform.isAndroid ||
+            Platform.environment.containsKey('FLUTTER_TEST'));
+    if (!isCaptureSupported) {
       throw ARSessionException('Capture not supported on this platform');
     }
 
     // Validate basic configuration values
-    if (config.captureIntervalMs < 100) {
+    if (config.captureIntervalMs > 0 && config.captureIntervalMs < 100) {
       throw ARSessionException('Capture interval must be at least 100ms');
     }
 

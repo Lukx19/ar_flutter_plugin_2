@@ -48,7 +48,7 @@ class ARCaptureConfig {
     required this.resolution,
     required this.format,
     this.maxCacheSize = 10,
-    this.jpegQuality = 85,
+    this.jpegQuality = 95,
     this.autoExposure = true,
     this.autoWhiteBalance = true,
     this.defaultISO,
@@ -62,13 +62,14 @@ class ARCaptureConfig {
     return ARCaptureConfig(
       enableHighResCapture: map['enableHighResCapture'] as bool? ?? false,
       captureIntervalMs: map['captureIntervalMs'] as int? ?? 5000,
-      resolution: CameraResolution.fromMap(map['resolution'] as Map<String, dynamic>),
+      resolution:
+          CameraResolution.fromMap(map['resolution'] as Map<String, dynamic>),
       format: ImageFormat.values.firstWhere(
         (f) => f.name == map['format'] as String,
         orElse: () => ImageFormat.jpeg,
       ),
       maxCacheSize: map['maxCacheSize'] as int? ?? 10,
-      jpegQuality: map['jpegQuality'] as int? ?? 85,
+      jpegQuality: map['jpegQuality'] as int? ?? 95,
       autoExposure: map['autoExposure'] as bool? ?? true,
       autoWhiteBalance: map['autoWhiteBalance'] as bool? ?? true,
       defaultISO: map['defaultISO'] as int?,
@@ -159,7 +160,9 @@ class ARCaptureConfig {
 
   /// Get estimated memory usage in bytes
   int getEstimatedMemoryUsage() {
-    final bytesPerPixel = format == ImageFormat.raw ? 2 : 3; // RAW = 16bit, JPEG = 24bit uncompressed
+    final bytesPerPixel = format == ImageFormat.raw
+        ? 2
+        : 3; // RAW = 16bit, JPEG = 24bit uncompressed
     final imageSize = resolution.totalPixels * bytesPerPixel;
     final cacheSize = imageSize * maxCacheSize;
 
@@ -170,15 +173,19 @@ class ARCaptureConfig {
   }
 
   /// Get estimated memory usage in MB
-  double get estimatedMemoryUsageMB => getEstimatedMemoryUsage() / (1024 * 1024);
+  double get estimatedMemoryUsageMB =>
+      getEstimatedMemoryUsage() / (1024 * 1024);
 
   /// Check if configuration is valid
   bool get isValid {
     // Check basic constraints
     if (captureIntervalMs < 0) return false;
+    if (captureIntervalMs > 0 && captureIntervalMs < 100) return false;
+    if (captureIntervalMs > 3600000) return false;
     if (maxCacheSize <= 0 || maxCacheSize > 100) return false;
     if (jpegQuality < 10 || jpegQuality > 100) return false;
-    if (defaultISO != null && (defaultISO! <= 0 || defaultISO! > 25600)) return false;
+    if (defaultISO != null && (defaultISO! <= 0 || defaultISO! > 25600))
+      return false;
 
     // Check resolution constraints
     if (resolution.width <= 0 || resolution.height <= 0) return false;
@@ -199,15 +206,15 @@ class ARCaptureConfig {
   /// Check if configuration is optimized for performance
   bool get isPerformanceOptimized {
     return bufferStrategy == BufferStrategy.performance &&
-           maxCacheSize >= 15 &&
-           jpegQuality >= 85;
+        maxCacheSize >= 15 &&
+        jpegQuality >= 85;
   }
 
   /// Check if configuration is optimized for memory
   bool get isMemoryOptimized {
     return bufferStrategy == BufferStrategy.memory &&
-           maxCacheSize <= 8 &&
-           jpegQuality <= 75;
+        maxCacheSize <= 8 &&
+        jpegQuality <= 75;
   }
 
   /// Get capture frequency in Hz
@@ -256,7 +263,8 @@ class ARCaptureConfig {
 
     // Reduce cache size to fit within memory constraints
     final bytesPerImage = getEstimatedMemoryUsage() / maxCacheSize;
-    final maxAllowableImages = ((availableMemoryMB * 0.3) * 1024 * 1024 / bytesPerImage).floor();
+    final maxAllowableImages =
+        ((availableMemoryMB * 0.3) * 1024 * 1024 / bytesPerImage).floor();
     final adjustedCacheSize = math.max(1, math.min(maxAllowableImages, 20));
 
     return copyWith(

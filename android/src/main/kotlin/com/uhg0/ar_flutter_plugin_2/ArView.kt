@@ -57,6 +57,9 @@ import io.github.sceneview.math.Scale
 import io.github.sceneview.math.colorOf
 import io.github.sceneview.loaders.MaterialLoader
 import com.google.ar.core.exceptions.SessionPausedException
+import com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraCapabilityQuerier
+import com.uhg0.ar_flutter_plugin_2.capture.ArCaptureSession
+import com.uhg0.ar_flutter_plugin_2.capture.CaptureSessionException
 
 class ArView(
     context: Context,
@@ -76,6 +79,8 @@ class ArView(
     private val sessionChannel: MethodChannel = MethodChannel(messenger, "arsession_$id")
     private val objectChannel: MethodChannel = MethodChannel(messenger, "arobjects_$id")
     private val anchorChannel: MethodChannel = MethodChannel(messenger, "aranchors_$id")
+    private val captureChannel: MethodChannel = MethodChannel(messenger, "arcapture_$id")
+    private val cameraCapabilityQuerier = CameraCapabilityQuerier(context)
     private val nodesMap = mutableMapOf<String, ModelNode>()
     private var planeCount = 0
     private var selectedNode: Node? = null
@@ -90,6 +95,7 @@ class ArView(
     private var handlePans = false  
     private var handleRotation = false
     private var isSessionPaused = false
+    private lateinit var arCaptureSession: ArCaptureSession
 
     private class PointCloudNode(
         modelInstance: ModelInstance,
@@ -165,6 +171,74 @@ class ArView(
             }
         }
 
+    private val onCaptureMethodCall =
+        MethodChannel.MethodCallHandler { call, result ->
+            try {
+                when (call.method) {
+                    "initializeCapture" -> {
+                        val config = call.arguments as? Map<String, Any?>
+                        if (config == null) {
+                            result.error("CONFIG_INVALID", "Capture configuration is required", null)
+                        } else {
+                            arCaptureSession.initialize(config)
+                            result.success(true)
+                        }
+                    }
+                    "captureHighResImage" -> result.success(arCaptureSession.captureImage())
+                    "getCameraIntrinsics" -> {
+                        val intrinsics = arCaptureSession.getCameraIntrinsics()
+                        if (intrinsics != null) {
+                            result.success(intrinsics)
+                        } else {
+                            result.error(
+                                "INTRINSICS_ERROR",
+                                "Unable to extract camera intrinsics",
+                                null,
+                            )
+                        }
+                    }
+                    "getImageData" -> {
+                        val imageId = call.argument<String>("imageId")
+                        val format = call.argument<String>("format") ?: "jpeg"
+                        if (imageId == null) {
+                            result.error("INVALID_ARGUMENTS", "imageId is required", null)
+                        } else {
+                            result.success(arCaptureSession.getImageData(imageId, format))
+                        }
+                    }
+                    "getImageSize" -> {
+                        val imageId = call.argument<String>("imageId")
+                        if (imageId == null) {
+                            result.error("INVALID_ARGUMENTS", "imageId is required", null)
+                        } else {
+                            result.success(arCaptureSession.getImageSize(imageId))
+                        }
+                    }
+                    "saveImageToFile" -> {
+                        val imageId = call.argument<String>("imageId")
+                        val filePath = call.argument<String>("filePath")
+                        val format = call.argument<String>("format") ?: "jpeg"
+                        if (imageId == null || filePath == null) {
+                            result.error("INVALID_ARGUMENTS", "imageId and filePath are required", null)
+                        } else {
+                            result.success(arCaptureSession.saveImageToFile(imageId, filePath, format))
+                        }
+                    }
+                    "dispose" -> {
+                        arCaptureSession.dispose()
+                        result.success(null)
+                    }
+                    else -> result.notImplemented()
+                }
+            } catch (error: CaptureSessionException) {
+                result.error(error.code, error.message, null)
+            } catch (error: IllegalArgumentException) {
+                result.error("CONFIG_INVALID", error.message, null)
+            } catch (error: Exception) {
+                result.error("CAPTURE_FAILED", error.message, null)
+            }
+        }
+
     init {
         sceneView = ARSceneView(
             context = viewContext,
@@ -180,11 +254,16 @@ class ArView(
             }
         )
         
+        arCaptureSession = ArCaptureSession(
+            sceneView = sceneView,
+            capabilityQuerier = cameraCapabilityQuerier,
+        )
         rootLayout.addView(sceneView)
 
         sessionChannel.setMethodCallHandler(onSessionMethodCall)
         objectChannel.setMethodCallHandler(onObjectMethodCall)
         anchorChannel.setMethodCallHandler(onAnchorMethodCall)
+        captureChannel.setMethodCallHandler(onCaptureMethodCall)
     }
 
     
@@ -1144,6 +1223,8 @@ class ArView(
         sessionChannel.setMethodCallHandler(null)
         objectChannel.setMethodCallHandler(null)
         anchorChannel.setMethodCallHandler(null)
+        captureChannel.setMethodCallHandler(null)
+        arCaptureSession.dispose()
         nodesMap.clear()
         sceneView.destroy()
         pointCloudNodes.toList().forEach { removePointCloudNode(it) }

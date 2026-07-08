@@ -5,6 +5,7 @@ import android.content.Context
 import android.graphics.ImageFormat
 import android.media.Image
 import android.util.Log
+import java.io.ByteArrayOutputStream
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
@@ -28,14 +29,16 @@ data class CacheConfiguration(
 
 class ImageCacheManager(
     private val config: ParsedCaptureConfig,
-    private val context: Context
+    private val context: Context?,
+    private val availableMemoryMBOverride: Int? = null,
 ) {
     private val imageCache = ConcurrentHashMap<String, CachedImage>()
     private val memoryUsage = AtomicLong(0L)
+    private val cacheSequence = AtomicLong(0L)
     private var cacheConfiguration: CacheConfiguration? = null
 
     // Memory management
-    private val availableMemoryMB: Int = getAvailableMemoryMB()
+    private val availableMemoryMB: Int = availableMemoryMBOverride ?: getAvailableMemoryMB()
     private var maxAllowedMemoryBytes: Long = 0L
 
     init {
@@ -116,51 +119,53 @@ class ImageCacheManager(
 
     /// Cache image with configuration-based management
     fun cacheImage(imageId: String, image: Image, format: Int): Boolean {
-        if (imageCache.size >= (cacheConfiguration?.maxCacheSize ?: 10)) {
-            evictOldestImages(1)
-        }
-
         return try {
-            val cachedImage = CachedImage(
-                id = imageId,
-                image = cloneImage(image),
-                format = format,
-                timestamp = System.currentTimeMillis(),
-                sizeBytes = estimateImageSize(image)
-            )
-
-            // Check if adding this image would exceed memory limits
-            val newMemoryUsage = memoryUsage.get() + cachedImage.sizeBytes
-            if (newMemoryUsage > maxAllowedMemoryBytes) {
-                val imagesToEvict = calculateEvictionCount(cachedImage.sizeBytes)
-                evictOldestImages(imagesToEvict)
-            }
-
-            imageCache[imageId] = cachedImage
-            memoryUsage.addAndGet(cachedImage.sizeBytes)
-
-            // Optionally compress if enabled
-            if (cacheConfiguration?.compressionEnabled == true && format == ImageFormat.JPEG) {
-                compressImage(cachedImage)
-            }
-
-            Log.d("ImageCacheManager", "Cached image $imageId (${cachedImage.sizeBytes} bytes), total memory: ${memoryUsage.get() / 1024 / 1024}MB")
-            true
+            val imageBytes = imageToByteArray(image, format)
+            cacheImageBytes(imageId, imageBytes, format)
         } catch (e: Exception) {
             Log.e("ImageCacheManager", "Failed to cache image $imageId", e)
             false
         }
     }
 
+    /// Cache already-encoded image bytes.
+    fun cacheImageBytes(imageId: String, imageBytes: ByteArray, format: Int): Boolean {
+        val cachedImage = CachedImage(
+            id = imageId,
+            bytes = imageBytes.copyOf(),
+            format = format,
+            timestamp = System.currentTimeMillis(),
+            sizeBytes = imageBytes.size.toLong(),
+            sequence = cacheSequence.incrementAndGet(),
+        )
+
+        // Check if adding this image would exceed memory limits
+        val newMemoryUsage = memoryUsage.get() + cachedImage.sizeBytes
+        if (newMemoryUsage > maxAllowedMemoryBytes) {
+            val imagesToEvict = calculateEvictionCount(cachedImage.sizeBytes)
+            evictOldestImages(imagesToEvict)
+        }
+        if (imageCache.size >= (cacheConfiguration?.maxCacheSize ?: 10)) {
+            evictOldestImages(1)
+        }
+
+        imageCache[imageId] = cachedImage
+        memoryUsage.addAndGet(cachedImage.sizeBytes)
+
+        Log.d("ImageCacheManager", "Cached image $imageId (${cachedImage.sizeBytes} bytes), total memory: ${memoryUsage.get() / 1024 / 1024}MB")
+        return true
+    }
+
     /// Get image from cache
     fun getImage(imageId: String): Image? {
-        return imageCache[imageId]?.image
+        Log.w("ImageCacheManager", "getImage is unsupported for byte-backed cached images: $imageId")
+        return null
     }
 
     /// Get image data as byte array
     fun getImageData(imageId: String): ByteArray? {
         val cachedImage = imageCache[imageId] ?: return null
-        return imageToByteArray(cachedImage.image, cachedImage.format)
+        return cachedImage.bytes.copyOf()
     }
 
     /// Save image to file
@@ -168,8 +173,13 @@ class ImageCacheManager(
         val cachedImage = imageCache[imageId] ?: return false
 
         return try {
-            val imageData = imageToByteArray(cachedImage.image, format)
-            java.io.File(filePath).writeBytes(imageData)
+            if (format != cachedImage.format) {
+                Log.w("ImageCacheManager", "Requested format $format does not match cached format ${cachedImage.format} for $imageId")
+            }
+            val imageData = cachedImage.bytes
+            val destination = java.io.File(filePath)
+            destination.parentFile?.mkdirs()
+            destination.writeBytes(imageData)
             Log.d("ImageCacheManager", "Saved image $imageId to $filePath")
             true
         } catch (e: Exception) {
@@ -233,7 +243,8 @@ class ImageCacheManager(
     }
 
     private fun getAvailableMemoryMB(): Int {
-        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val safeContext = context ?: return 2048
+        val activityManager = safeContext.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         val memoryInfo = ActivityManager.MemoryInfo()
         activityManager.getMemoryInfo(memoryInfo)
         return (memoryInfo.availMem / (1024 * 1024)).toInt()
@@ -250,7 +261,7 @@ class ImageCacheManager(
     }
 
     private fun evictOldestImages(count: Int) {
-        val sortedImages = imageCache.values.sortedBy { it.timestamp }
+        val sortedImages = imageCache.values.sortedBy { it.sequence }
         repeat(Math.min(count, sortedImages.size)) { index ->
             removeImage(sortedImages[index].id)
         }
@@ -258,38 +269,45 @@ class ImageCacheManager(
 
     private fun removeImage(imageId: String) {
         imageCache[imageId]?.let { cachedImage ->
-            cachedImage.image.close()
             memoryUsage.addAndGet(-cachedImage.sizeBytes)
             imageCache.remove(imageId)
         }
     }
 
-    private fun cloneImage(original: Image): Image {
-        // Implementation would clone the Image object for safe caching
-        // This is a simplified placeholder - in practice, you'd need to copy the image data
-        return original
-    }
-
-    private fun compressImage(cachedImage: CachedImage) {
-        // Implementation would compress JPEG images to save memory
-        // This is a placeholder for compression logic
-    }
-
-    private fun estimateImageSize(image: Image): Long {
-        return getPerImageBytes() // Simplified estimation
-    }
-
     private fun imageToByteArray(image: Image, format: Int): ByteArray {
-        // Implementation would convert Image to byte array based on format
-        // This is a placeholder
-        return ByteArray(0)
+        return when (format) {
+            ImageFormat.JPEG -> {
+                val buffer = image.planes.first().buffer
+                ByteArray(buffer.remaining()).also(buffer::get)
+            }
+            ImageFormat.RAW_SENSOR -> {
+                val buffer = image.planes.first().buffer
+                ByteArray(buffer.remaining()).also(buffer::get)
+            }
+            ImageFormat.YUV_420_888 -> {
+                ByteArrayOutputStream().use { output ->
+                    image.planes.forEach { plane ->
+                        val buffer = plane.buffer.duplicate()
+                        val bytes = ByteArray(buffer.remaining())
+                        buffer.get(bytes)
+                        output.write(bytes)
+                    }
+                    output.toByteArray()
+                }
+            }
+            else -> {
+                val buffer = image.planes.first().buffer
+                ByteArray(buffer.remaining()).also(buffer::get)
+            }
+        }
     }
 }
 
 data class CachedImage(
     val id: String,
-    val image: Image,
+    val bytes: ByteArray,
     val format: Int,
     val timestamp: Long,
-    val sizeBytes: Long
+    val sizeBytes: Long,
+    val sequence: Long,
 )

@@ -1,17 +1,18 @@
 import 'dart:async';
-import 'package:flutter/material.dart';
+
 import 'package:ar_flutter_plugin_2/ar_flutter_plugin.dart';
 import 'package:ar_flutter_plugin_2/managers/ar_capture_manager.dart';
 import 'package:ar_flutter_plugin_2/managers/ar_session_manager.dart';
+import 'package:flutter/material.dart';
 import 'package:vector_math/vector_math_64.dart' as vector;
 
 /// Phase 5: Runtime Camera Controls Example
-/// 
+///
 /// This example demonstrates the comprehensive runtime camera control features:
 /// - Dynamic ISO and exposure controls with real-time feedback
-/// - Focus control with tap-to-focus and focus peaking
+/// - Focus control with tap-to-focus
 /// - White balance and color temperature controls
-/// - Scene mode and flash control integration
+/// - Flash and torch control integration
 /// - Camera parameter profiles and quick switching
 class Phase5RuntimeCameraControlsWidget extends StatefulWidget {
   const Phase5RuntimeCameraControlsWidget({Key? key}) : super(key: key);
@@ -25,21 +26,21 @@ class _Phase5RuntimeCameraControlsWidgetState
     extends State<Phase5RuntimeCameraControlsWidget> {
   ARSessionManager? arSessionManager;
   ARCaptureManager? captureManager;
-  
+
   // Stream subscriptions
   StreamSubscription<CameraExposureState>? _exposureSubscription;
   StreamSubscription<CameraFocusState>? _focusSubscription;
   StreamSubscription<CameraWhiteBalanceState>? _whiteBalanceSubscription;
-  StreamSubscription<CameraSceneFlashState>? _sceneFlashSubscription;
+  StreamSubscription<CameraFlashState>? _flashSubscription;
   StreamSubscription<ProfileApplicationStatus>? _profileSubscription;
-  
+
   // Current camera states
   CameraExposureState? _currentExposureState;
   CameraFocusState? _currentFocusState;
   CameraWhiteBalanceState? _currentWhiteBalanceState;
-  CameraSceneFlashState? _currentSceneFlashState;
+  CameraFlashState? _currentFlashState;
   ProfileApplicationStatus? _profileStatus;
-  
+
   // UI State
   bool _showAdvancedControls = false;
   bool _isCapturing = false;
@@ -82,10 +83,10 @@ class _Phase5RuntimeCameraControlsWidgetState
       if (captureManager != null) {
         // Subscribe to camera state streams
         _subscribeToStreams();
-        
+
         // Load profiles
         await _loadProfiles();
-        
+
         setState(() {
           _statusMessage = 'AR session ready - Runtime camera controls active';
         });
@@ -105,49 +106,41 @@ class _Phase5RuntimeCameraControlsWidgetState
     if (captureManager == null) return;
 
     // Subscribe to exposure state changes
-    _exposureSubscription = captureManager!.exposureStateStream.listen(
-      (state) {
-        setState(() {
-          _currentExposureState = state;
-        });
-      },
-    );
+    _exposureSubscription = captureManager!.exposureStateStream.listen((state) {
+      setState(() {
+        _currentExposureState = state;
+      });
+    });
 
     // Subscribe to focus state changes
-    _focusSubscription = captureManager!.focusStateStream.listen(
-      (state) {
-        setState(() {
-          _currentFocusState = state;
-        });
-      },
-    );
+    _focusSubscription = captureManager!.focusStateStream.listen((state) {
+      setState(() {
+        _currentFocusState = state;
+      });
+    });
 
     // Subscribe to white balance state changes
-    _whiteBalanceSubscription = captureManager!.whiteBalanceStateStream.listen(
-      (state) {
-        setState(() {
-          _currentWhiteBalanceState = state;
-        });
-      },
-    );
+    _whiteBalanceSubscription = captureManager!.whiteBalanceStateStream.listen((
+      state,
+    ) {
+      setState(() {
+        _currentWhiteBalanceState = state;
+      });
+    });
 
-    // Subscribe to scene/flash state changes
-    _sceneFlashSubscription = captureManager!.sceneFlashStateStream.listen(
-      (state) {
-        setState(() {
-          _currentSceneFlashState = state;
-        });
-      },
-    );
+    // Subscribe to flash state changes
+    _flashSubscription = captureManager!.flashStateStream.listen((state) {
+      setState(() {
+        _currentFlashState = state;
+      });
+    });
 
     // Subscribe to profile application status
-    _profileSubscription = captureManager!.profileStatusStream.listen(
-      (status) {
-        setState(() {
-          _profileStatus = status;
-        });
-      },
-    );
+    _profileSubscription = captureManager!.profileStatusStream.listen((status) {
+      setState(() {
+        _profileStatus = status;
+      });
+    });
   }
 
   Future<void> _loadProfiles() async {
@@ -156,7 +149,7 @@ class _Phase5RuntimeCameraControlsWidgetState
     try {
       final saved = await captureManager!.getSavedProfiles();
       final builtIn = await captureManager!.getBuiltInProfiles();
-      
+
       setState(() {
         _savedProfiles = saved;
         _builtInProfiles = builtIn;
@@ -222,25 +215,29 @@ class _Phase5RuntimeCameraControlsWidgetState
               ],
             ),
           ),
-          
+
           // AR View
           Expanded(
             flex: 2,
             child: arSessionManager != null
                 ? ARView(
-                    onARViewCreated: (arSessionManager, arObjectManager, arAnchorManager, arLocationManager) {
-                      // AR view created with all managers
-                    },
+                    onARViewCreated:
+                        (
+                          arSessionManager,
+                          arObjectManager,
+                          arAnchorManager,
+                          arLocationManager,
+                        ) {
+                          // AR view created with all managers
+                        },
                     planeDetectionConfig: PlaneDetectionConfig.horizontal,
                   )
                 : Container(
                     color: Colors.black,
-                    child: const Center(
-                      child: CircularProgressIndicator(),
-                    ),
+                    child: const Center(child: CircularProgressIndicator()),
                   ),
           ),
-          
+
           // Camera Controls
           Expanded(
             flex: 2,
@@ -263,44 +260,48 @@ class _Phase5RuntimeCameraControlsWidgetState
                             _showAdvancedControls = !_showAdvancedControls;
                           });
                         },
-                        child: Text(_showAdvancedControls ? 'Hide Controls' : 'Show Controls'),
+                        child: Text(
+                          _showAdvancedControls
+                              ? 'Hide Controls'
+                              : 'Show Controls',
+                        ),
                       ),
                     ],
                   ),
-                  
+
                   const SizedBox(height: 16),
-                  
+
                   if (_showAdvancedControls) ...[
                     // Quick Profile Controls
                     _buildQuickProfileControls(),
-                    
+
                     const SizedBox(height: 16),
-                    
+
                     // Current Camera State Display
                     _buildCameraStateDisplay(),
-                    
+
                     const SizedBox(height: 16),
-                    
+
                     // Exposure Controls
                     _buildExposureControls(),
-                    
+
                     const SizedBox(height: 16),
-                    
+
                     // Focus Controls
                     _buildFocusControls(),
-                    
+
                     const SizedBox(height: 16),
-                    
+
                     // White Balance Controls
                     _buildWhiteBalanceControls(),
-                    
+
                     const SizedBox(height: 16),
-                    
+
                     // Scene Mode and Flash Controls
-                    _buildSceneFlashControls(),
-                    
+                    _buildFlashControls(),
+
                     const SizedBox(height: 16),
-                    
+
                     // Profile Management
                     _buildProfileManagement(),
                   ],
@@ -355,13 +356,15 @@ class _Phase5RuntimeCameraControlsWidgetState
             if (_currentExposureState != null)
               Text('ISO: ${_currentExposureState!.currentISO ?? "Auto"}'),
             if (_currentExposureState != null)
-              Text('Exposure: ${_currentExposureState!.currentExposureTime?.inMicroseconds ?? "Auto"}μs'),
+              Text(
+                'Exposure: ${_currentExposureState!.currentExposureTime?.inMicroseconds ?? "Auto"}μs',
+              ),
             if (_currentFocusState != null)
               Text('Focus: ${_currentFocusState!.currentFocusMode.name}'),
             if (_currentWhiteBalanceState != null)
               Text('WB: ${_currentWhiteBalanceState!.currentMode.name}'),
-            if (_currentSceneFlashState != null)
-              Text('Scene: ${_currentSceneFlashState!.currentSceneMode.name}'),
+            if (_currentFlashState != null)
+              Text('Flash: ${_currentFlashState!.currentFlashMode.name}'),
           ],
         ),
       ),
@@ -453,20 +456,6 @@ class _Phase5RuntimeCameraControlsWidgetState
                 ),
               ],
             ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                ElevatedButton(
-                  onPressed: () => _setFocusPeaking(true),
-                  child: const Text('Enable Peaking'),
-                ),
-                const SizedBox(width: 8),
-                ElevatedButton(
-                  onPressed: () => _setFocusPeaking(false),
-                  child: const Text('Disable Peaking'),
-                ),
-              ],
-            ),
           ],
         ),
       ),
@@ -497,7 +486,8 @@ class _Phase5RuntimeCameraControlsWidgetState
                   child: const Text('Daylight'),
                 ),
                 ElevatedButton(
-                  onPressed: () => _setWhiteBalance(WhiteBalanceMode.incandescent),
+                  onPressed: () =>
+                      _setWhiteBalance(WhiteBalanceMode.incandescent),
                   child: const Text('Incandescent'),
                 ),
                 ElevatedButton(
@@ -516,7 +506,7 @@ class _Phase5RuntimeCameraControlsWidgetState
     );
   }
 
-  Widget _buildSceneFlashControls() {
+  Widget _buildFlashControls() {
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
@@ -524,27 +514,8 @@ class _Phase5RuntimeCameraControlsWidgetState
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              'Scene Mode & Flash Controls',
+              'Flash Controls',
               style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                ElevatedButton(
-                  onPressed: () => _setSceneMode(SceneMode.portrait),
-                  child: const Text('Portrait'),
-                ),
-                const SizedBox(width: 8),
-                ElevatedButton(
-                  onPressed: () => _setSceneMode(SceneMode.landscape),
-                  child: const Text('Landscape'),
-                ),
-                const SizedBox(width: 8),
-                ElevatedButton(
-                  onPressed: () => _setSceneMode(SceneMode.night),
-                  child: const Text('Night'),
-                ),
-              ],
             ),
             const SizedBox(height: 8),
             Row(
@@ -661,14 +632,6 @@ class _Phase5RuntimeCameraControlsWidgetState
     }
   }
 
-  Future<void> _setFocusPeaking(bool enabled) async {
-    try {
-      await captureManager?.setFocusPeakingEnabled(enabled);
-    } catch (e) {
-      debugPrint('Failed to set focus peaking: $e');
-    }
-  }
-
   Future<void> _setWhiteBalance(WhiteBalanceMode mode) async {
     try {
       await captureManager?.setWhiteBalanceMode(mode);
@@ -685,14 +648,6 @@ class _Phase5RuntimeCameraControlsWidgetState
     }
   }
 
-  Future<void> _setSceneMode(SceneMode mode) async {
-    try {
-      await captureManager?.setSceneMode(mode);
-    } catch (e) {
-      debugPrint('Failed to set scene mode: $e');
-    }
-  }
-
   Future<void> _setFlashMode(FlashMode mode) async {
     try {
       await captureManager?.setFlashMode(mode);
@@ -704,7 +659,10 @@ class _Phase5RuntimeCameraControlsWidgetState
   Future<void> _saveCurrentProfile() async {
     try {
       final name = 'Custom_${DateTime.now().millisecondsSinceEpoch}';
-      await captureManager?.saveProfile(name, description: 'User saved profile');
+      await captureManager?.saveProfile(
+        name,
+        description: 'User saved profile',
+      );
       await _loadProfiles();
     } catch (e) {
       debugPrint('Failed to save profile: $e');
@@ -724,7 +682,7 @@ class _Phase5RuntimeCameraControlsWidgetState
     _exposureSubscription?.cancel();
     _focusSubscription?.cancel();
     _whiteBalanceSubscription?.cancel();
-    _sceneFlashSubscription?.cancel();
+    _flashSubscription?.cancel();
     _profileSubscription?.cancel();
     arSessionManager?.dispose();
     super.dispose();
