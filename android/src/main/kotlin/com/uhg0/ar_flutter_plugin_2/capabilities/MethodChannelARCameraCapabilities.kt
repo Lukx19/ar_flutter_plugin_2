@@ -1,6 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.capabilities
 
 import android.content.Context
+import com.google.ar.core.ArCoreApk
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -28,12 +29,48 @@ class MethodChannelARCameraCapabilities(private val context: Context) : MethodCa
         try {
             when (call.method) {
                 "getSupportedResolutions" -> getSupportedResolutions(result)
+                "getSupportedSharedCameraResolutions" ->
+                    getSupportedSharedCameraResolutions(result)
                 "getSupportedFormats" -> getSupportedFormats(result)
                 "getSupportedISORange" -> getSupportedISORange(result)
                 "getSupportedExposureRange" -> getSupportedExposureRange(result)
                 "isResolutionSupported" -> isResolutionSupported(call, result)
                 "isFormatSupported" -> isFormatSupported(call, result)
                 "getCameraIntrinsics" -> getCameraIntrinsics(result)
+                "getDeviceCapabilityProfile" ->
+                    result.success(capabilityQuerier.getDeviceCapabilityProfile())
+                "getARCoreAvailability" -> {
+                    val availability = ArCoreApk.getInstance().checkAvailability(context)
+                    result.success(
+                        mapOf(
+                            "name" to availability.name,
+                            "supported" to availability.isSupported,
+                            "transient" to availability.isTransient,
+                            "unknown" to availability.isUnknown,
+                        ),
+                    )
+                }
+                "saveSharedCameraUnsupported" -> {
+                    capabilityQuerier.saveSharedCameraUnsupported(
+                        call.argument<String>("reason") ?: "Shared camera is unsupported",
+                    )
+                    result.success(null)
+                }
+                "saveRawJpegProbeResult" -> {
+                    capabilityQuerier.saveRawJpegProbeResult(
+                        call.argument<Boolean>("supported") ?: false,
+                        call.argument<String>("reason"),
+                    )
+                    result.success(null)
+                }
+                "saveFormatProbeResult" -> {
+                    capabilityQuerier.saveFormatProbeResult(
+                        call.argument<String>("format") ?: "",
+                        call.argument<Boolean>("supported") ?: false,
+                        call.argument<String>("reason"),
+                    )
+                    result.success(null)
+                }
                 else -> result.notImplemented()
             }
         } catch (e: Exception) {
@@ -50,6 +87,18 @@ class MethodChannelARCameraCapabilities(private val context: Context) : MethodCa
             )
         }
         result.success(resolutionMaps)
+    }
+
+    private fun getSupportedSharedCameraResolutions(result: MethodChannel.Result) {
+        val resolutions = capabilityQuerier.getSupportedSharedCameraResolutions()
+        result.success(
+            resolutions.map { resolution ->
+                mapOf(
+                    "width" to resolution.width,
+                    "height" to resolution.height,
+                )
+            },
+        )
     }
 
     private fun getSupportedFormats(result: MethodChannel.Result) {

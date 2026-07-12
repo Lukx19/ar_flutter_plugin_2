@@ -64,10 +64,12 @@ class ARCaptureConfig {
       captureIntervalMs: map['captureIntervalMs'] as int? ?? 5000,
       resolution:
           CameraResolution.fromMap(map['resolution'] as Map<String, dynamic>),
-      format: ImageFormat.values.firstWhere(
-        (f) => f.name == map['format'] as String,
-        orElse: () => ImageFormat.jpeg,
-      ),
+      format: map['format'] == 'raw+jpeg'
+          ? ImageFormat.rawJpeg
+          : ImageFormat.values.firstWhere(
+              (f) => f.name == map['format'] as String,
+              orElse: () => ImageFormat.jpeg,
+            ),
       maxCacheSize: map['maxCacheSize'] as int? ?? 10,
       jpegQuality: map['jpegQuality'] as int? ?? 95,
       autoExposure: map['autoExposure'] as bool? ?? true,
@@ -90,7 +92,7 @@ class ARCaptureConfig {
       'enableHighResCapture': enableHighResCapture,
       'captureIntervalMs': captureIntervalMs,
       'resolution': resolution.toMap(),
-      'format': format.name,
+      'format': format == ImageFormat.rawJpeg ? 'raw+jpeg' : format.name,
       'maxCacheSize': maxCacheSize,
       'jpegQuality': jpegQuality,
       'autoExposure': autoExposure,
@@ -141,7 +143,7 @@ class ARCaptureConfig {
   /// Create configuration for research/professional use
   factory ARCaptureConfig.research({
     required CameraResolution resolution,
-    ImageFormat format = ImageFormat.raw,
+    ImageFormat format = ImageFormat.rawJpeg,
     int captureIntervalMs = 10000,
   }) {
     return ARCaptureConfig(
@@ -160,9 +162,10 @@ class ARCaptureConfig {
 
   /// Get estimated memory usage in bytes
   int getEstimatedMemoryUsage() {
-    final bytesPerPixel = format == ImageFormat.raw
-        ? 2
-        : 3; // RAW = 16bit, JPEG = 24bit uncompressed
+    final bytesPerPixel =
+        format == ImageFormat.raw || format == ImageFormat.rawJpeg
+            ? 2
+            : 3; // RAW = 16bit, JPEG = 24bit uncompressed
     final imageSize = resolution.totalPixels * bytesPerPixel;
     final cacheSize = imageSize * maxCacheSize;
 

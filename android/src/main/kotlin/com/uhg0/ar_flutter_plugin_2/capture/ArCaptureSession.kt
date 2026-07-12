@@ -3,35 +3,223 @@ package com.uhg0.ar_flutter_plugin_2.capture
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
+import android.graphics.SurfaceTexture
 import android.media.Image
+import android.os.BatteryManager
+import android.os.Debug
 import android.util.Log
 import android.util.Size
+import android.view.Surface
 import com.google.ar.core.TrackingState
+import com.google.android.filament.Stream
 import com.google.ar.core.exceptions.NotYetAvailableException
 import com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraCapabilityQuerier
 import io.github.sceneview.ar.ARSceneView
+import com.google.ar.core.Frame
+import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
+import java.io.File
 
 internal class CaptureSessionException(
     val code: String,
     override val message: String,
 ) : IllegalStateException(message)
 
-class ArCaptureSession(
+internal class ArCaptureSession(
     private val sceneView: ARSceneView,
     private val capabilityQuerier: CameraCapabilityQuerier,
+    private val captureChannel: MethodChannel,
+    private val onCapacityChanged: (Map<String, Any?>) -> Unit = {},
+    private val onObservedControlStateChanged: (ArCaptureSession) -> Unit = {},
+    private val onCaptureAccepted: (Map<String, Any?>) -> Unit = {},
+    private val onCaptureFinalized: (Map<String, Any?>) -> Unit = {},
+    private val poseUpdateRateLimiter: PoseUpdateRateLimiter = PoseUpdateRateLimiter(),
 ) {
+    companion object {
+        private const val TrackingPoseReadyTimeoutMs = 2_000L
+    }
+
     private var config: CaptureConfig? = null
     private var isCaptureInProgress = false
     private val byteCache = CaptureByteCache()
+    private val resourceCounters = CaptureResourceCounters()
+    private val poseDataExtractor = PoseDataExtractor()
+    private var sharedCameraManager: SharedCameraManager? = null
+    private var sharedImageCacheManager: ImageCacheManager? = null
+    private var highResCaptureEnabled = false
+    private var sharedCameraFilamentStream: Stream? = null
+    private var sharedCameraPreviewSurfaceTexture: SurfaceTexture? = null
+    private var sharedCameraPreviewSurface: Surface? = null
+    private val highResCapturePipeline =
+        HighResCapturePipeline(
+            cache =
+                object : HighResCaptureCache {
+                    override fun releaseReservation(reservationToken: String): Boolean =
+                        sharedImageCacheManager?.releaseReservation(reservationToken) ?: false
+
+                    override fun commitReservedImage(
+                        reservationToken: String,
+                        imageId: String,
+                        imageBytes: ByteArray,
+                        format: Int,
+                    ): Boolean =
+                        sharedImageCacheManager?.commitReservedImage(
+                            reservationToken = reservationToken,
+                            imageId = imageId,
+                            imageBytes = imageBytes,
+                            format = format,
+                        ) ?: false
+
+                    override fun commitReservedAssets(
+                        reservationToken: String,
+                        imageId: String,
+                        assets: Map<String, CachedImageAsset>,
+                    ): Boolean =
+                        sharedImageCacheManager?.commitReservedAssets(
+                            reservationToken = reservationToken,
+                            imageId = imageId,
+                            assets = assets,
+                        ) ?: false
+                },
+            poseResolver =
+                object : HighResPoseResolver {
+                    override fun resolvePose(
+                        captureTiming: PoseDataExtractor.CaptureTiming,
+                    ): PoseDataExtractor.AlignedPose? {
+                        val resolved = poseDataExtractor.resolvePose(captureTiming)
+                        if (resolved == null) {
+                            Log.w(
+                                "ArCaptureSession",
+                                "Shared capture pose alignment failed: " +
+                                    poseDataExtractor.alignmentDiagnostics(captureTiming),
+                            )
+                        }
+                        return resolved ?: emulatorPoseFallback(captureTiming)
+                    }
+
+                    override fun toPoseMap(
+                        alignedPose: PoseDataExtractor.AlignedPose,
+                    ): Map<String, Any?> = poseDataExtractor.toPoseMap(alignedPose)
+                },
+            qualityAnalyzer = ::analyzeSharedQuality,
+            qualityAnalysisTimeoutMs =
+                if (SharedCameraEmulatorCompatibility.isRunningOnEmulator()) 1_000L else 500L,
+        )
 
     fun initialize(configMap: Map<String, Any?>) {
         val parsedConfig = CaptureConfig.fromMap(configMap)
         config = parsedConfig
-        byteCache.initialize(parsedConfig)
+        highResCaptureEnabled = configMap["enableHighResCapture"] as? Boolean ?: false
+        if (highResCaptureEnabled) {
+            SharedCameraInteropPlanner
+                .checkAvailability(
+                    hasSession = sceneView.session != null,
+                    hasSharedCamera = sceneView.session?.sharedCamera != null,
+                )?.let { failure ->
+                    throw CaptureSessionException(
+                        code = failure.code,
+                        message = failure.message,
+                    )
+                }
+            @Suppress("UNCHECKED_CAST")
+            val typedConfigMap = configMap.mapValues { it.value } as Map<String, Any>
+            val sharedConfig = ParsedCaptureConfig.fromMap(typedConfigMap)
+            val imageCacheManager =
+                ImageCacheManager(
+                    config = sharedConfig,
+                    context = sceneView.context,
+                    onCapacityChanged = onCapacityChanged,
+                )
+            sharedImageCacheManager = imageCacheManager
+            val scenePreviewSurface = createSharedCameraPreviewSurface()
+            val manager =
+                SharedCameraManager(
+                    context = sceneView.context,
+                    methodChannel = captureChannel,
+                    session = sceneView.session,
+                    cameraTextureIds = {
+                        sceneView.cameraStream?.cameraTextureIds ?: intArrayOf()
+                    },
+                    scenePreviewSurface = scenePreviewSurface,
+                    configMap = typedConfigMap,
+                    onObservedCaptureStateChanged = {
+                        onObservedControlStateChanged(this)
+                    },
+                    resolvePoseBeforeEncoding = { timing ->
+                        poseDataExtractor.resolvePose(timing).also { resolved ->
+                            if (resolved == null) {
+                                Log.w(
+                                    "ArCaptureSession",
+                                    "Pre-encode pose alignment failed: " +
+                                        poseDataExtractor.alignmentDiagnostics(timing),
+                                )
+                            }
+                        }
+                    },
+                    onCaptureAccepted = { accepted ->
+                        onCaptureAccepted(
+                            mapOf(
+                                "imageId" to accepted.imageId,
+                                "width" to accepted.width,
+                                "height" to accepted.height,
+                                "format" to accepted.format,
+                                "captureTimestampMs" to accepted.captureTimestampMs,
+                                "pose" to poseDataExtractor.toPoseMap(accepted.alignedPose),
+                                "quality" to accepted.quality,
+                                "state" to "acceptedPending",
+                            ),
+                        )
+                    },
+                    onCaptureEncoded = { encoded, policy ->
+                        try {
+                            onCaptureFinalized(
+                                highResCapturePipeline.processCapture(encoded, policy) +
+                                    ("state" to "committed"),
+                            )
+                        } catch (error: Throwable) {
+                            onCaptureFinalized(
+                                mapOf(
+                                    "state" to "backgroundFailed",
+                                    "imageId" to encoded.imageId,
+                                    "code" to
+                                        (error as? CaptureSessionException)?.code.orEmpty()
+                                            .ifEmpty { "FINALIZATION_FAILED" },
+                                    "message" to (error.message ?: "Capture finalization failed"),
+                                ),
+                            )
+                        }
+                    },
+                    onCaptureFinalizationFailed = { imageId, error ->
+                        onCaptureFinalized(
+                            mapOf(
+                                "state" to "backgroundFailed",
+                                "imageId" to imageId,
+                                "code" to "ENCODING_FAILED",
+                                "message" to (error.message ?: "Image encoding failed"),
+                            ),
+                        )
+                    },
+                    resourceCounters = resourceCounters,
+                )
+            try {
+                manager.initialize(imageCacheManager)
+                sharedCameraManager = manager
+            } catch (error: Exception) {
+                sharedImageCacheManager = null
+                throw CaptureSessionException(
+                    code = "SHARED_CAMERA_STARTUP_FAILED",
+                    message = error.cause?.message ?: error.message
+                        ?: "Shared-camera startup failed",
+                )
+            }
+        } else {
+            byteCache.initialize(parsedConfig)
+        }
+        poseUpdateRateLimiter.onResume()
+        emitCapacityChanged()
     }
 
-    fun captureImage(): Map<String, Any?> {
+    fun captureImage(qualityPolicyMap: Map<String, Any?>? = null): Map<String, Any?> {
         requireInitialized()
         if (isCaptureInProgress) {
             throw CaptureSessionException(
@@ -42,6 +230,40 @@ class ArCaptureSession(
 
         isCaptureInProgress = true
         try {
+            sharedCameraManager?.let { manager ->
+                if (!poseDataExtractor.awaitTrackingPose(TrackingPoseReadyTimeoutMs)) {
+                    throw CaptureSessionException(
+                        code = "NOT_TRACKING",
+                        message = "AR tracking is not ready for a shared-camera capture",
+                    )
+                }
+                val qualityPolicy = qualityPolicyMap?.let(::buildQualityPolicyMap)
+                if (config?.format == "png" ||
+                    config?.format == "jpeg" ||
+                    config?.format == "raw"
+                ) {
+                    val accepted = manager.captureDeferredImageAccepted(qualityPolicy)
+                    return acceptedAttemptMap(accepted)
+                }
+                val sharedResult =
+                    try {
+                        manager.captureImageResult(qualityPolicy)
+                    } catch (rejected: SharedBlurRejectedException) {
+                        return mapOf(
+                            "status" to "rejectedBlur",
+                            "attemptId" to "attempt_${System.currentTimeMillis()}",
+                            "imageId" to null,
+                            "capture" to null,
+                            "quality" to rejected.quality,
+                        )
+                    }
+                if (sharedResult.preAlignedPose == null) {
+                    awaitPoseAfter(sharedResult.sensorTimestampNs)
+                }
+                return highResCapturePipeline.processCapture(sharedResult, qualityPolicy)
+            }
+
+            val qualityPolicy = qualityPolicyMap?.let(::buildQualityPolicyMap)
             val frame = sceneView.session?.update() ?: throw CaptureSessionException(
                 code = "CAPTURE_NOT_INITIALIZED",
                 message = "No AR frame is available for capture",
@@ -54,6 +276,7 @@ class ArCaptureSession(
                 )
             }
 
+            poseDataExtractor.onFrame(frame)
             val image = try {
                 frame.acquireCameraImage()
             } catch (error: NotYetAvailableException) {
@@ -64,20 +287,31 @@ class ArCaptureSession(
             }
 
             image.use { acquiredImage ->
+                val quality = qualityPolicy?.let { analyzeQuality(acquiredImage, it) }
                 val jpegBytes = imageToJpegBytes(acquiredImage, config!!.jpegQuality)
                 val timestampMs = System.currentTimeMillis()
+                val sensorTimestampNs = acquiredImage.timestamp
                 val imageId = byteCache.nextImageId(timestampMs)
-                byteCache.cacheCapture(
-                    imageId = imageId,
-                    bytes = jpegBytes,
-                    width = acquiredImage.width,
-                    height = acquiredImage.height,
-                    timestampMs = timestampMs,
-                )
+                val intrinsics =
+                    capabilityQuerier.getCameraIntrinsicsForSize(
+                        Size(acquiredImage.width, acquiredImage.height),
+                    ) ?: capabilityQuerier.getCameraIntrinsics()
+                val alignedPose =
+                    poseDataExtractor.resolvePose(
+                        PoseDataExtractor.CaptureTiming(
+                            sensorTimestampNs = sensorTimestampNs,
+                            exposureTimeNs = 0L,
+                            rollingShutterSkewNs = 0L,
+                        ),
+                        waitForFuturePoseMs = 0L,
+                    ) ?: throw CaptureSessionException(
+                        code = "POSE_SYNC_FAILED",
+                        message = "No aligned pose was available for the captured image",
+                    )
 
-                return mapOf(
+                val captureResult = mapOf(
                     "imageId" to imageId,
-                    "pose" to buildPoseMap(camera),
+                    "pose" to poseDataExtractor.toPoseMap(alignedPose),
                     "resolution" to mapOf(
                         "width" to acquiredImage.width,
                         "height" to acquiredImage.height,
@@ -86,7 +320,56 @@ class ArCaptureSession(
                     "captureTimestampMs" to timestampMs,
                     "imageSizeBytes" to jpegBytes.size,
                     "isHighResolution" to false,
+                    "exposureStartTimestampNs" to sensorTimestampNs,
+                    "exposureTimeNs" to 0,
+                    "rollingShutterSkewNs" to 0,
+                    "intrinsics" to intrinsics,
                     "filePath" to null,
+                )
+
+                if (quality != null && !quality["blurPassed"].asBoolean()) {
+                    if (qualityPolicy.keepRejectedCaptures) {
+                        byteCache.cacheCapture(
+                            imageId = imageId,
+                            bytes = jpegBytes,
+                            width = acquiredImage.width,
+                            height = acquiredImage.height,
+                            timestampMs = timestampMs,
+                        )
+                        return mapOf(
+                            "status" to "rejectedBlur",
+                            "attemptId" to "attempt_$timestampMs",
+                            "imageId" to imageId,
+                            "capture" to captureResult,
+                            "quality" to quality,
+                        )
+                    }
+
+                    emitCapacityChanged()
+                    return mapOf(
+                        "status" to "rejectedBlur",
+                        "attemptId" to "attempt_$timestampMs",
+                        "imageId" to null,
+                        "capture" to null,
+                        "quality" to quality,
+                    )
+                }
+
+                byteCache.cacheCapture(
+                    imageId = imageId,
+                    bytes = jpegBytes,
+                    width = acquiredImage.width,
+                    height = acquiredImage.height,
+                    timestampMs = timestampMs,
+                )
+                emitCapacityChanged()
+
+                return mapOf(
+                    "status" to "staged",
+                    "attemptId" to "attempt_$timestampMs",
+                    "imageId" to imageId,
+                    "capture" to captureResult,
+                    "quality" to quality,
                 )
             }
         } finally {
@@ -96,21 +379,81 @@ class ArCaptureSession(
 
     fun getImageData(imageId: String, format: String): ByteArray? {
         requireInitialized()
-        return byteCache.getImageData(imageId, format)
+        return sharedCameraManager?.getImageData(imageId, format) ?: byteCache.getImageData(imageId, format)
+    }
+
+    fun getCaptureCapacity(): Map<String, Any?> {
+        requireInitialized()
+        return sharedCameraManager?.getCaptureCapacity() ?: byteCache.getCaptureCapacity()
+    }
+
+    fun getPerformanceSnapshot(): Map<String, Any?> {
+        val runtime = Runtime.getRuntime()
+        val batteryManager =
+            sceneView.context.getSystemService(BatteryManager::class.java)
+        val batteryPercent =
+            batteryManager
+                ?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+                ?.takeIf { it in 0..100 }
+        val chargeCounterMicroAh =
+            batteryManager
+                ?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER)
+                ?.takeIf { it != Int.MIN_VALUE }
+        return resourceCounters.snapshot() +
+            mapOf(
+                "processPssBytes" to Debug.getPss().toLong() * 1024L,
+                "dartAndJavaHeapUsedBytes" to
+                    runtime.totalMemory() - runtime.freeMemory(),
+                "openFileDescriptors" to
+                    (File("/proc/self/fd").list()?.size ?: -1),
+                "threadCount" to Thread.getAllStackTraces().size,
+                "batteryPercent" to batteryPercent,
+                "batteryChargeCounterMicroAh" to chargeCounterMicroAh,
+            )
     }
 
     fun getImageSize(imageId: String): Map<String, Any>? {
         requireInitialized()
-        return byteCache.getImageSize(imageId)
+        return sharedCameraManager?.getImageSize(imageId) ?: byteCache.getImageSize(imageId)
     }
 
     fun saveImageToFile(imageId: String, filePath: String, format: String): Boolean {
         requireInitialized()
-        return byteCache.saveImageToFile(imageId, filePath, format)
+        return sharedCameraManager?.saveImageToFile(imageId, filePath, format)
+            ?: byteCache.saveImageToFile(imageId, filePath, format)
+    }
+
+    fun persistCapture(
+        imageId: String,
+        destinationRoot: String,
+        sessionFolder: String,
+        baseName: String,
+        format: String,
+    ): Map<String, Any> {
+        requireInitialized()
+        val persisted =
+            sharedCameraManager?.persistCapture(imageId, destinationRoot, sessionFolder, baseName, format)
+                ?: byteCache.persistCapture(imageId, destinationRoot, sessionFolder, baseName, format)
+        if (sharedCameraManager == null) {
+            emitCapacityChanged()
+        }
+        return persisted
+    }
+
+    fun discardCapture(imageId: String): Boolean {
+        requireInitialized()
+        return (sharedCameraManager?.discardCapture(imageId) ?: byteCache.discardCapture(imageId)).also {
+            if (sharedCameraManager == null) {
+                emitCapacityChanged()
+            }
+        }
     }
 
     fun getCameraIntrinsics(): Map<String, Any>? {
         requireInitialized()
+        sharedCameraManager?.let { manager ->
+            return manager.getCameraIntrinsics()
+        }
         val captureConfig = config ?: throw CaptureSessionException(
             code = "CAPTURE_NOT_INITIALIZED",
             message = "Capture session is not initialized",
@@ -121,9 +464,287 @@ class ArCaptureSession(
         ) ?: capabilityQuerier.getCameraIntrinsics()
     }
 
+    fun setISO(isoValue: Int): Int? {
+        requireInitialized()
+        return requireSharedCameraControls().setISO(isoValue)
+    }
+
+    fun setExposureTime(exposureTimeMicros: Long): Long? {
+        requireInitialized()
+        return requireSharedCameraControls().setExposureTime(exposureTimeMicros)
+    }
+
+    fun setAutoExposureEnabled(enabled: Boolean): Boolean {
+        requireInitialized()
+        return requireSharedCameraControls().setAutoExposureEnabled(enabled)
+    }
+
+    fun getCurrentISO(): Int? {
+        requireInitialized()
+        return requireSharedCameraControls().getCurrentISO()
+    }
+
+    fun getCurrentExposureTimeMicros(): Long? {
+        requireInitialized()
+        return requireSharedCameraControls().getCurrentExposureTimeMicros()
+    }
+
+    fun getSupportedISORange(): List<Int> {
+        requireInitialized()
+        return requireSharedCameraControls().getSupportedISORange()
+    }
+
+    fun getSupportedExposureRange(): Map<String, Long> {
+        requireInitialized()
+        return requireSharedCameraControls().getSupportedExposureRange()
+    }
+
+    fun getCurrentExposureState(): Map<String, Any?> {
+        requireInitialized()
+        return requireSharedCameraControls().getCurrentExposureState()
+    }
+
+    fun getExposureCompensationInfo(): Map<String, Double> {
+        requireInitialized()
+        return requireSharedCameraControls().getExposureCompensationInfo()
+    }
+
+    fun setExposureCompensation(evStep: Double): Double {
+        requireInitialized()
+        return requireSharedCameraControls().setExposureCompensation(evStep)
+    }
+
+    fun lockExposure(): Boolean {
+        requireInitialized()
+        return requireSharedCameraControls().lockExposure()
+    }
+
+    fun unlockExposure(): Boolean {
+        requireInitialized()
+        return requireSharedCameraControls().unlockExposure()
+    }
+
+    fun setFocusDistance(normalizedDistance: Double): Double? {
+        requireInitialized()
+        return requireSharedCameraControls().setFocusDistance(normalizedDistance)
+    }
+
+    fun focusAtPoint(
+        x: Double,
+        y: Double,
+    ): Boolean {
+        requireInitialized()
+        return requireSharedCameraControls().focusAtPoint(x, y)
+    }
+
+    fun setAutofocusEnabled(enabled: Boolean): Boolean {
+        requireInitialized()
+        return requireSharedCameraControls().setAutofocusEnabled(enabled)
+    }
+
+    fun getCurrentFocusState(): Map<String, Any?> {
+        requireInitialized()
+        return requireSharedCameraControls().getCurrentFocusState()
+    }
+
+    fun getSupportedFocusModes(): List<String> {
+        requireInitialized()
+        return requireSharedCameraControls().getSupportedFocusModes()
+    }
+
+    fun setFocusMode(mode: String): Boolean {
+        requireInitialized()
+        return requireSharedCameraControls().setFocusMode(mode)
+    }
+
+    fun setWhiteBalanceMode(mode: String): Boolean {
+        requireInitialized()
+        return requireSharedCameraControls().setWhiteBalanceMode(mode)
+    }
+
+    fun setColorTemperature(colorTemperatureK: Int): Int {
+        requireInitialized()
+        return requireSharedCameraControls().setColorTemperature(colorTemperatureK)
+    }
+
+    fun getCurrentWhiteBalanceState(): Map<String, Any?> {
+        requireInitialized()
+        return requireSharedCameraControls().getCurrentWhiteBalanceState()
+    }
+
+    fun getSupportedColorTemperatureRange(): Map<String, Int> {
+        requireInitialized()
+        return requireSharedCameraControls().getSupportedColorTemperatureRange()
+    }
+
+    fun setWhiteBalanceFromPoint(
+        x: Double,
+        y: Double,
+    ): Boolean {
+        requireInitialized()
+        return requireSharedCameraControls().setWhiteBalanceFromPoint(x, y)
+    }
+
+    fun lockWhiteBalance(): Boolean {
+        requireInitialized()
+        return requireSharedCameraControls().lockWhiteBalance()
+    }
+
+    fun unlockWhiteBalance(): Boolean {
+        requireInitialized()
+        return requireSharedCameraControls().unlockWhiteBalance()
+    }
+
+    fun getSupportedWhiteBalanceModes(): List<String> {
+        requireInitialized()
+        return requireSharedCameraControls().getSupportedWhiteBalanceModes()
+    }
+
+    fun setFlashMode(mode: String): Boolean {
+        requireInitialized()
+        return requireSharedCameraControls().setFlashMode(mode)
+    }
+
+    fun setTorchEnabled(enabled: Boolean): Boolean {
+        requireInitialized()
+        return requireSharedCameraControls().setTorchEnabled(enabled)
+    }
+
+    fun getCurrentFlashState(): Map<String, Any?> {
+        requireInitialized()
+        return requireSharedCameraControls().getCurrentFlashState()
+    }
+
+    fun isFlashAvailable(): Boolean {
+        requireInitialized()
+        return requireSharedCameraControls().isFlashAvailable()
+    }
+
+    fun buildPoseUpdate(frame: Frame): Map<String, Any?>? {
+        requireInitialized()
+        poseDataExtractor.onFrame(frame)
+
+        val sensorTimestampNs = frame.timestamp
+        if (!poseUpdateRateLimiter.shouldEmit(sensorTimestampNs)) {
+            return null
+        }
+        val latestPose = poseDataExtractor.latest() ?: return null
+        return poseDataExtractor.toPoseMap(
+            poseDataExtractor.toAlignedPose(
+                pose = latestPose,
+                sensorTimestampNs = latestPose.timestampNs,
+                poseAlignment = "exact",
+                poseTimeErrorNs = 0L,
+            ),
+        )
+    }
+
+    fun onSessionPaused() {
+        poseUpdateRateLimiter.onPause()
+        sharedCameraManager?.onArSessionPaused()
+    }
+
+    fun onSessionResumed() {
+        poseUpdateRateLimiter.onResume()
+        sharedCameraManager?.onArSessionResumed()
+    }
+
     fun dispose() {
         byteCache.dispose()
+        sharedCameraManager?.cleanup()
+        sharedCameraManager = null
+        sharedCameraFilamentStream?.let { stream ->
+            runCatching { sceneView.engine.destroyStream(stream) }
+                .onFailure { error ->
+                    Log.w(
+                        "ArCaptureSession",
+                        "SceneView engine was already destroyed while releasing preview stream",
+                        error,
+                    )
+                }
+        }
+        sharedCameraFilamentStream = null
+        sharedCameraPreviewSurface?.release()
+        sharedCameraPreviewSurface = null
+        sharedCameraPreviewSurfaceTexture?.release()
+        sharedCameraPreviewSurfaceTexture = null
+        sharedImageCacheManager = null
         config = null
+        highResCaptureEnabled = false
+        poseUpdateRateLimiter.onDispose()
+    }
+
+    private fun createSharedCameraPreviewSurface(): Surface {
+        sharedCameraPreviewSurface?.let { return it }
+        val textureSize = sceneView.session?.cameraConfig?.textureSize
+            ?: Size(1920, 1080)
+        val surfaceTexture = SurfaceTexture(0).apply {
+            try {
+                detachFromGLContext()
+            } catch (_: RuntimeException) {
+                // A newly-created SurfaceTexture may already be detached.
+            }
+            setDefaultBufferSize(textureSize.width, textureSize.height)
+        }
+        sharedCameraFilamentStream?.let(sceneView.engine::destroyStream)
+        val stream =
+            Stream.Builder()
+                .stream(surfaceTexture)
+                .build(sceneView.engine)
+        val cameraTexture = sceneView.cameraStream?.cameraTexture
+            ?: throw CaptureSessionException(
+                code = "CAMERA_TEXTURE_UNAVAILABLE",
+                message = "SceneView camera texture is not ready",
+            )
+        cameraTexture.setExternalStream(sceneView.engine, stream)
+        val surface = Surface(surfaceTexture)
+        sharedCameraFilamentStream = stream
+        sharedCameraPreviewSurfaceTexture = surfaceTexture
+        sharedCameraPreviewSurface = surface
+        Log.i(
+            "ArCaptureSession",
+            "Created ${textureSize.width}x${textureSize.height} Camera2 preview stream for Filament",
+        )
+        return surface
+    }
+
+    private fun emitCapacityChanged() {
+        onCapacityChanged(sharedCameraManager?.getCaptureCapacity() ?: byteCache.getCaptureCapacity())
+    }
+
+    private fun awaitPoseAfter(
+        sensorTimestampNs: Long,
+        timeoutMs: Long = TrackingPoseReadyTimeoutMs,
+    ) {
+        val deadlineNs = System.nanoTime() + timeoutMs * 1_000_000L
+        while (System.nanoTime() < deadlineNs) {
+            val latestTimestampNs = poseDataExtractor.latest()?.timestampNs ?: Long.MIN_VALUE
+            if (latestTimestampNs >= sensorTimestampNs) {
+                return
+            }
+            Thread.sleep(5)
+        }
+        Log.w(
+            "ArCaptureSession",
+            "Timed out waiting for a post-capture pose after $sensorTimestampNs",
+        )
+    }
+
+    private fun emulatorPoseFallback(
+        captureTiming: PoseDataExtractor.CaptureTiming,
+    ): PoseDataExtractor.AlignedPose? {
+        if (!SharedCameraEmulatorCompatibility.isRunningOnEmulator()) {
+            return null
+        }
+        val latestPose = poseDataExtractor.latest() ?: return null
+        return poseDataExtractor.toAlignedPose(
+            pose = latestPose,
+            sensorTimestampNs = captureTiming.referenceTimestampNs,
+            poseAlignment = "emulatorFallback",
+            poseTimeErrorNs = Long.MAX_VALUE,
+            exposureTimeNs = captureTiming.exposureTimeNs,
+            rollingShutterSkewNs = captureTiming.rollingShutterSkewNs,
+        )
     }
 
     private fun requireInitialized() {
@@ -135,29 +756,148 @@ class ArCaptureSession(
         }
     }
 
-    private fun buildPoseMap(camera: com.google.ar.core.Camera): Map<String, Any?> {
-        val pose = camera.pose
-        val transform = FloatArray(16)
-        pose.toMatrix(transform, 0)
+    private fun requireSharedCameraControls(): SharedCameraManager {
+        if (!highResCaptureEnabled || sharedCameraManager == null) {
+            throw CaptureSessionException(
+                code = "CONTROL_UNSUPPORTED",
+                message =
+                    "Runtime camera controls require the high-resolution shared-camera capture path",
+            )
+        }
+        return sharedCameraManager!!
+    }
 
-        return mapOf(
-            "position" to mapOf(
-                "x" to pose.tx().toDouble(),
-                "y" to pose.ty().toDouble(),
-                "z" to pose.tz().toDouble(),
-            ),
-            "rotation" to mapOf(
-                "x" to pose.rotationQuaternion[0].toDouble(),
-                "y" to pose.rotationQuaternion[1].toDouble(),
-                "z" to pose.rotationQuaternion[2].toDouble(),
-                "w" to pose.rotationQuaternion[3].toDouble(),
-            ),
-            "transform" to transform.map { it.toDouble() },
-            "timestampMs" to System.currentTimeMillis(),
-            "confidence" to 1.0,
-            "isTracking" to true,
+    private fun buildQualityPolicyMap(
+        qualityPolicyMap: Map<String, Any?>,
+    ): CaptureQualityPolicy {
+        return CaptureQualityPolicy(
+            blurFilterEnabled = qualityPolicyMap["blurFilterEnabled"] as? Boolean ?: true,
+            blurThreshold = (qualityPolicyMap["blurThreshold"] as? Number)?.toDouble()
+                ?: 110.0,
+            keepRejectedCaptures =
+                qualityPolicyMap["keepRejectedCaptures"] as? Boolean ?: false,
         )
     }
+
+    private fun acceptedAttemptMap(accepted: SharedCaptureAccepted): Map<String, Any?> =
+        mapOf(
+            "status" to "acceptedPending",
+            "attemptId" to "attempt_${accepted.captureTimestampMs}",
+            "imageId" to accepted.imageId,
+            "capture" to
+                mapOf(
+                    "imageId" to accepted.imageId,
+                    "pose" to poseDataExtractor.toPoseMap(accepted.alignedPose),
+                    "resolution" to
+                        mapOf("width" to accepted.width, "height" to accepted.height),
+                    "format" to accepted.format,
+                    "formats" to listOf(accepted.format),
+                    "captureTimestampMs" to accepted.captureTimestampMs,
+                    "imageSizeBytes" to 0,
+                    "imageSizeBytesByFormat" to mapOf(accepted.format to 0),
+                    "isHighResolution" to true,
+                    "exposureStartTimestampNs" to accepted.sensorTimestampNs,
+                    "exposureTimeNs" to accepted.exposureTimeNs,
+                    "rollingShutterSkewNs" to accepted.rollingShutterSkewNs,
+                    "intrinsics" to accepted.intrinsics,
+                    "filePath" to null,
+                ),
+            "quality" to accepted.quality,
+        )
+
+    private fun analyzeQuality(
+        image: Image,
+        qualityPolicy: CaptureQualityPolicy,
+    ): Map<String, Any> {
+        if (!qualityPolicy.blurFilterEnabled) {
+            return mapOf(
+                "blurScore" to 0.0,
+                "blurThreshold" to qualityPolicy.blurThreshold,
+                "blurPassed" to true,
+                "analyzedWidth" to 0,
+                "analyzedHeight" to 0,
+                "algorithm" to "previewLaplacianVarianceV1",
+            )
+        }
+
+        if (image.format != ImageFormat.YUV_420_888) {
+            throw CaptureSessionException(
+                code = "QUALITY_ANALYSIS_FAILED",
+                message = "Preview blur analysis requires YUV_420_888 image data",
+            )
+        }
+
+        val luma = extractLumaPlane(image)
+        val quality = PreviewBlurAnalyzer.analyzeLaplacianVariance(
+            luma = luma,
+            width = image.width,
+            height = image.height,
+        )
+        val blurPassed = quality.blurScore >= qualityPolicy.blurThreshold
+        return qualityMap(
+            "blurScore" to quality.blurScore,
+            "blurThreshold" to qualityPolicy.blurThreshold,
+            "blurPassed" to blurPassed,
+            "analyzedWidth" to quality.analyzedWidth,
+            "analyzedHeight" to quality.analyzedHeight,
+            "algorithm" to quality.algorithm,
+        )
+    }
+
+    private fun analyzeSharedQuality(
+        sharedResult: SharedCameraCaptureResult,
+        qualityPolicy: CaptureQualityPolicy,
+    ): Map<String, Any> {
+        if (!qualityPolicy.blurFilterEnabled) {
+            return mapOf(
+                "blurScore" to 0.0,
+                "blurThreshold" to qualityPolicy.blurThreshold,
+                "blurPassed" to true,
+                "analyzedWidth" to 0,
+                "analyzedHeight" to 0,
+                "algorithm" to "jpegLaplacianVarianceV1",
+            )
+        }
+
+        val quality = JpegBlurAnalyzer.analyzeLaplacianVariance(sharedResult.imageBytes)
+        val blurPassed = quality.blurScore >= qualityPolicy.blurThreshold
+
+        return qualityMap(
+            "blurScore" to quality.blurScore,
+            "blurThreshold" to qualityPolicy.blurThreshold,
+            "blurPassed" to blurPassed,
+            "analyzedWidth" to quality.analyzedWidth,
+            "analyzedHeight" to quality.analyzedHeight,
+            "algorithm" to quality.algorithm,
+        )
+    }
+
+    private fun qualityMap(vararg entries: Pair<String, Any>): Map<String, Any> {
+        val quality = mapOf(*entries)
+        Log.i(
+            "ArCaptureSession",
+            "Blur analysis algorithm=${quality["algorithm"]} score=${quality["blurScore"]} threshold=${quality["blurThreshold"]} passed=${quality["blurPassed"]} size=${quality["analyzedWidth"]}x${quality["analyzedHeight"]}",
+        )
+        return quality
+    }
+
+    private fun extractLumaPlane(image: Image): ByteArray {
+        val plane = image.planes[0]
+        val width = image.width
+        val height = image.height
+        val output = ByteArray(width * height)
+        copyPlane(
+            plane = plane,
+            width = width,
+            height = height,
+            output = output,
+            offset = 0,
+            pixelStrideOut = 1,
+        )
+        return output
+    }
+
+    private fun Any?.asBoolean(): Boolean = this as? Boolean ?: false
 
     private fun imageToJpegBytes(image: Image, jpegQuality: Int): ByteArray {
         return when (image.format) {

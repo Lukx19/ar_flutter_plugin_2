@@ -13,12 +13,15 @@ import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
+import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
 import com.google.ar.core.Anchor.CloudAnchorState
 import com.google.ar.core.Config
 import com.google.ar.core.Frame
 import com.google.ar.core.Plane
 import com.google.ar.core.Pose
+import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
 import com.uhg0.ar_flutter_plugin_2.Serialization.deserializeMatrix4
 import com.uhg0.ar_flutter_plugin_2.Serialization.serializeHitResult
@@ -41,6 +44,8 @@ import io.github.sceneview.node.ModelNode
 import io.github.sceneview.node.Node
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import io.github.sceneview.math.Position as ScenePosition
@@ -60,6 +65,7 @@ import com.google.ar.core.exceptions.SessionPausedException
 import com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraCapabilityQuerier
 import com.uhg0.ar_flutter_plugin_2.capture.ArCaptureSession
 import com.uhg0.ar_flutter_plugin_2.capture.CaptureSessionException
+import com.uhg0.ar_flutter_plugin_2.capture.SharedCameraSessionFeaturePlanner
 
 class ArView(
     context: Context,
@@ -67,11 +73,12 @@ class ArView(
     private val lifecycle: Lifecycle,
     messenger: BinaryMessenger,
     id: Int,
+    initialSessionFeatures: Set<Session.Feature> = emptySet(),
 ) : PlatformView {
     private val TAG: String = ArView::class.java.name
     private val viewContext: Context = context
     private var sceneView: ARSceneView
-    private val mainScope = CoroutineScope(Dispatchers.Main)
+    private val mainScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var worldOriginNode: Node? = null
 
     private val rootLayout: ViewGroup = FrameLayout(context)
@@ -96,6 +103,25 @@ class ArView(
     private var handleRotation = false
     private var isSessionPaused = false
     private lateinit var arCaptureSession: ArCaptureSession
+    private var hasReportedSessionFailure = false
+    // SceneView creates the ARCore session from this value. It must be set by
+    // platform-view creation parameters, not initializeCapture, because ARCore
+    // cannot add SHARED_CAMERA to a live session.
+    private var requestedSessionFeatures: Set<Session.Feature> = initialSessionFeatures
+    private val sessionLifecycleObserver =
+        object : DefaultLifecycleObserver {
+            override fun onPause(owner: LifecycleOwner) {
+                if (::arCaptureSession.isInitialized) {
+                    arCaptureSession.onSessionPaused()
+                }
+            }
+
+            override fun onResume(owner: LifecycleOwner) {
+                if (::arCaptureSession.isInitialized && !isSessionPaused) {
+                    arCaptureSession.onSessionResumed()
+                }
+            }
+        }
 
     private class PointCloudNode(
         modelInstance: ModelInstance,
@@ -108,7 +134,10 @@ class ArView(
             when (call.method) {
                 "init" -> handleInit(call, result)
                 "showPlanes" -> handleShowPlanes(call, result)
-                "dispose" -> dispose()
+                "dispose" -> {
+                    dispose()
+                    result.success(null)
+                }
                 "getAnchorPose" -> handleGetAnchorPose(call, result)
                 "getCameraPose" -> handleGetCameraPose(result)
                 "snapshot" -> handleSnapshot(result)
@@ -120,6 +149,7 @@ class ArView(
     private fun handleDisableCamera(result: MethodChannel.Result) {
         try {
             isSessionPaused = true
+            arCaptureSession.onSessionPaused()
             sceneView.session?.pause()
             result.success(null)
         } catch (e: Exception) {
@@ -129,6 +159,7 @@ class ArView(
     private fun handleEnableCamera(result: MethodChannel.Result) {
         try {
             isSessionPaused = false
+            arCaptureSession.onSessionResumed()
             sceneView.session?.resume()
             result.success(null)
         } catch (e: Exception) {
@@ -180,11 +211,64 @@ class ArView(
                         if (config == null) {
                             result.error("CONFIG_INVALID", "Capture configuration is required", null)
                         } else {
+                            val enableHighResCapture =
+                                config["enableHighResCapture"] as? Boolean ?: false
+                            val featurePlan =
+                                SharedCameraSessionFeaturePlanner.plan(
+                                    enableHighResCapture = enableHighResCapture,
+                                    currentSessionFeatures = requestedSessionFeatures,
+                                    hasLiveSession = sceneView.session != null,
+                                )
+                            if (featurePlan.failureCode != null) {
+                                result.error(
+                                    featurePlan.failureCode,
+                                    featurePlan.failureMessage,
+                                    null,
+                                )
+                                return@MethodCallHandler
+                            }
+                            if (featurePlan.requiresSceneRebuild) {
+                                rebuildSceneView(featurePlan.targetSessionFeatures)
+                            }
                             arCaptureSession.initialize(config)
-                            result.success(true)
+                            result.success(
+                                mapOf(
+                                    "mode" to if (enableHighResCapture) "sharedCamera" else "previewFallback",
+                                    "warning" to
+                                        if (enableHighResCapture) {
+                                            null
+                                        } else {
+                                            "Capture is using preview-resolution fallback; high-resolution shared camera is disabled for this session."
+                                        },
+                                ),
+                            )
                         }
                     }
-                    "captureHighResImage" -> result.success(arCaptureSession.captureImage())
+                    "captureHighResImage" -> {
+                        val args = call.arguments as? Map<String, Any?>
+                        val qualityPolicy = args?.get("qualityPolicy") as? Map<String, Any?>
+                        mainScope.launch {
+                            try {
+                                val capture =
+                                    withContext(Dispatchers.Default) {
+                                        arCaptureSession.captureImage(qualityPolicy)
+                                    }
+                                result.success(capture)
+                            } catch (error: CaptureSessionException) {
+                                result.error(error.code, error.message, null)
+                            } catch (error: IllegalArgumentException) {
+                                result.error("CONFIG_INVALID", error.message, null)
+                            } catch (error: Exception) {
+                                result.error("CAPTURE_FAILED", error.message, null)
+                            }
+                        }
+                    }
+                    "getCaptureCapacity" -> {
+                        result.success(arCaptureSession.getCaptureCapacity())
+                    }
+                    "getPerformanceSnapshot" -> {
+                        result.success(arCaptureSession.getPerformanceSnapshot())
+                    }
                     "getCameraIntrinsics" -> {
                         val intrinsics = arCaptureSession.getCameraIntrinsics()
                         if (intrinsics != null) {
@@ -214,6 +298,190 @@ class ArView(
                             result.success(arCaptureSession.getImageSize(imageId))
                         }
                     }
+                    "setISO" -> {
+                        val isoValue = call.argument<Int>("isoValue")
+                        if (isoValue == null) {
+                            result.error("INVALID_ARGUMENTS", "isoValue is required", null)
+                        } else {
+                            result.success(
+                                mapOf(
+                                    "actualISO" to arCaptureSession.setISO(isoValue),
+                                ),
+                            )
+                        }
+                    }
+                    "setExposureTime" -> {
+                        val exposureTimeMicros = call.argument<Number>("exposureTimeMicroseconds")?.toLong()
+                        if (exposureTimeMicros == null) {
+                            result.error(
+                                "INVALID_ARGUMENTS",
+                                "exposureTimeMicroseconds is required",
+                                null,
+                            )
+                        } else {
+                            result.success(
+                                mapOf(
+                                    "actualExposureTimeMicroseconds" to
+                                        arCaptureSession.setExposureTime(exposureTimeMicros),
+                                ),
+                            )
+                        }
+                    }
+                    "setAutoExposureEnabled" -> {
+                        val enabled = call.argument<Boolean>("enabled")
+                        if (enabled == null) {
+                            result.error("INVALID_ARGUMENTS", "enabled is required", null)
+                        } else {
+                            result.success(arCaptureSession.setAutoExposureEnabled(enabled))
+                        }
+                    }
+                    "getCurrentISO" -> {
+                        result.success(arCaptureSession.getCurrentISO())
+                    }
+                    "getCurrentExposureTime" -> {
+                        result.success(arCaptureSession.getCurrentExposureTimeMicros())
+                    }
+                    "getSupportedISORange" -> {
+                        result.success(arCaptureSession.getSupportedISORange())
+                    }
+                    "getSupportedExposureRange" -> {
+                        result.success(arCaptureSession.getSupportedExposureRange())
+                    }
+                    "getCurrentExposureState" -> {
+                        result.success(arCaptureSession.getCurrentExposureState())
+                    }
+                    "getExposureCompensationInfo" -> {
+                        result.success(arCaptureSession.getExposureCompensationInfo())
+                    }
+                    "setExposureCompensation" -> {
+                        val evStep = call.argument<Number>("evStep")?.toDouble()
+                        if (evStep == null) {
+                            result.error("INVALID_ARGUMENTS", "evStep is required", null)
+                        } else {
+                            result.success(
+                                mapOf(
+                                    "actualCompensation" to
+                                        arCaptureSession.setExposureCompensation(evStep),
+                                ),
+                            )
+                        }
+                    }
+                    "lockExposure" -> {
+                        result.success(arCaptureSession.lockExposure())
+                    }
+                    "unlockExposure" -> {
+                        result.success(arCaptureSession.unlockExposure())
+                    }
+                    "setFocusDistance" -> {
+                        val distance = call.argument<Number>("distance")?.toDouble()
+                        if (distance == null) {
+                            result.error("INVALID_ARGUMENTS", "distance is required", null)
+                        } else {
+                            result.success(
+                                mapOf(
+                                    "actualDistance" to arCaptureSession.setFocusDistance(distance),
+                                ),
+                            )
+                        }
+                    }
+                    "setAutofocusEnabled" -> {
+                        val enabled = call.argument<Boolean>("enabled")
+                        if (enabled == null) {
+                            result.error("INVALID_ARGUMENTS", "enabled is required", null)
+                        } else {
+                            result.success(arCaptureSession.setAutofocusEnabled(enabled))
+                        }
+                    }
+                    "focusAtPoint" -> {
+                        val x = call.argument<Number>("x")?.toDouble()
+                        val y = call.argument<Number>("y")?.toDouble()
+                        if (x == null || y == null) {
+                            result.error("INVALID_ARGUMENTS", "x and y are required", null)
+                        } else {
+                            result.success(arCaptureSession.focusAtPoint(x, y))
+                        }
+                    }
+                    "getCurrentFocusState" -> {
+                        result.success(arCaptureSession.getCurrentFocusState())
+                    }
+                    "getSupportedFocusModes" -> {
+                        result.success(arCaptureSession.getSupportedFocusModes())
+                    }
+                    "setFocusMode" -> {
+                        val mode = call.argument<String>("mode")
+                        if (mode == null) {
+                            result.error("INVALID_ARGUMENTS", "mode is required", null)
+                        } else {
+                            result.success(arCaptureSession.setFocusMode(mode))
+                        }
+                    }
+                    "setWhiteBalanceMode" -> {
+                        val mode = call.argument<String>("mode")
+                        if (mode == null) {
+                            result.error("INVALID_ARGUMENTS", "mode is required", null)
+                        } else {
+                            result.success(arCaptureSession.setWhiteBalanceMode(mode))
+                        }
+                    }
+                    "setColorTemperature" -> {
+                        val colorTemperatureK = call.argument<Int>("colorTemperatureK")
+                        if (colorTemperatureK == null) {
+                            result.error("INVALID_ARGUMENTS", "colorTemperatureK is required", null)
+                        } else {
+                            result.success(
+                                mapOf(
+                                    "actualColorTemperature" to
+                                        arCaptureSession.setColorTemperature(colorTemperatureK),
+                                ),
+                            )
+                        }
+                    }
+                    "getCurrentWhiteBalanceState" -> {
+                        result.success(arCaptureSession.getCurrentWhiteBalanceState())
+                    }
+                    "getSupportedColorTemperatureRange" -> {
+                        result.success(arCaptureSession.getSupportedColorTemperatureRange())
+                    }
+                    "lockWhiteBalance" -> {
+                        result.success(arCaptureSession.lockWhiteBalance())
+                    }
+                    "unlockWhiteBalance" -> {
+                        result.success(arCaptureSession.unlockWhiteBalance())
+                    }
+                    "setWhiteBalanceFromPoint" -> {
+                        val x = call.argument<Number>("x")?.toDouble()
+                        val y = call.argument<Number>("y")?.toDouble()
+                        if (x == null || y == null) {
+                            result.error("INVALID_ARGUMENTS", "x and y are required", null)
+                        } else {
+                            result.success(arCaptureSession.setWhiteBalanceFromPoint(x, y))
+                        }
+                    }
+                    "getSupportedWhiteBalanceModes" -> {
+                        result.success(arCaptureSession.getSupportedWhiteBalanceModes())
+                    }
+                    "setFlashMode" -> {
+                        val mode = call.argument<String>("mode")
+                        if (mode == null) {
+                            result.error("INVALID_ARGUMENTS", "mode is required", null)
+                        } else {
+                            result.success(arCaptureSession.setFlashMode(mode))
+                        }
+                    }
+                    "getCurrentFlashState" -> {
+                        result.success(arCaptureSession.getCurrentFlashState())
+                    }
+                    "isFlashAvailable" -> {
+                        result.success(arCaptureSession.isFlashAvailable())
+                    }
+                    "setTorchEnabled" -> {
+                        val enabled = call.argument<Boolean>("enabled")
+                        if (enabled == null) {
+                            result.error("INVALID_ARGUMENTS", "enabled is required", null)
+                        } else {
+                            result.success(arCaptureSession.setTorchEnabled(enabled))
+                        }
+                    }
                     "saveImageToFile" -> {
                         val imageId = call.argument<String>("imageId")
                         val filePath = call.argument<String>("filePath")
@@ -221,7 +489,75 @@ class ArView(
                         if (imageId == null || filePath == null) {
                             result.error("INVALID_ARGUMENTS", "imageId and filePath are required", null)
                         } else {
-                            result.success(arCaptureSession.saveImageToFile(imageId, filePath, format))
+                            mainScope.launch {
+                                try {
+                                    val saved =
+                                        withContext(Dispatchers.IO) {
+                                            arCaptureSession.saveImageToFile(
+                                                imageId,
+                                                filePath,
+                                                format,
+                                            )
+                                        }
+                                    result.success(saved)
+                                } catch (error: CaptureSessionException) {
+                                    result.error(error.code, error.message, null)
+                                } catch (error: IllegalArgumentException) {
+                                    result.error("CONFIG_INVALID", error.message, null)
+                                } catch (error: Exception) {
+                                    result.error("CAPTURE_FAILED", error.message, null)
+                                }
+                            }
+                        }
+                    }
+                    "persistCapture" -> {
+                        val imageId = call.argument<String>("imageId")
+                        val destination = call.argument<Map<String, Any?>>("destination")
+                        val destinationRoot = destination?.get("root") as? String
+                        val sessionFolder = call.argument<String>("sessionFolder")
+                        val baseName = call.argument<String>("baseName")
+                        val format = call.argument<String>("format") ?: "jpeg"
+                        if (
+                            imageId == null ||
+                                destinationRoot == null ||
+                                sessionFolder == null ||
+                                baseName == null
+                        ) {
+                            result.error(
+                                "INVALID_ARGUMENTS",
+                                "imageId, destination.root, sessionFolder, and baseName are required",
+                                null,
+                            )
+                        } else {
+                            mainScope.launch {
+                                try {
+                                    val persisted =
+                                        withContext(Dispatchers.IO) {
+                                            arCaptureSession.persistCapture(
+                                                imageId,
+                                                destinationRoot,
+                                                sessionFolder,
+                                                baseName,
+                                                format,
+                                            )
+                                        }
+                                    result.success(persisted)
+                                } catch (error: CaptureSessionException) {
+                                    result.error(error.code, error.message, null)
+                                } catch (error: IllegalArgumentException) {
+                                    result.error("CONFIG_INVALID", error.message, null)
+                                } catch (error: Exception) {
+                                    result.error("CAPTURE_FAILED", error.message, null)
+                                }
+                            }
+                        }
+                    }
+                    "discardCapture" -> {
+                        val imageId = call.argument<String>("imageId")
+                        if (imageId == null) {
+                            result.error("INVALID_ARGUMENTS", "imageId is required", null)
+                        } else {
+                            result.success(arCaptureSession.discardCapture(imageId))
                         }
                     }
                     "dispose" -> {
@@ -240,24 +576,9 @@ class ArView(
         }
 
     init {
-        sceneView = ARSceneView(
-            context = viewContext,
-            sharedLifecycle = lifecycle,
-            sessionConfiguration = { session, config ->
-                config.apply {
-                    depthMode = Config.DepthMode.DISABLED
-                    instantPlacementMode = Config.InstantPlacementMode.DISABLED
-                    lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
-                    focusMode = Config.FocusMode.AUTO
-                    planeFindingMode = Config.PlaneFindingMode.DISABLED
-                }
-            }
-        )
-        
-        arCaptureSession = ArCaptureSession(
-            sceneView = sceneView,
-            capabilityQuerier = cameraCapabilityQuerier,
-        )
+        lifecycle.addObserver(sessionLifecycleObserver)
+        sceneView = createSceneView(sessionFeatures = requestedSessionFeatures)
+        arCaptureSession = createCaptureSession()
         rootLayout.addView(sceneView)
 
         sessionChannel.setMethodCallHandler(onSessionMethodCall)
@@ -461,20 +782,26 @@ class ArView(
             handlePans = call.argument<Boolean>("handlePans") ?: false
             handleRotation = call.argument<Boolean>("handleRotation") ?: false
 
-            sceneView.session?.let { session ->
-                session.configure(session.config.apply {
-                    depthMode = when (session.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) {
-                        true -> Config.DepthMode.AUTOMATIC
-                        else -> Config.DepthMode.DISABLED
-                    }
-                    planeFindingMode = when (argPlaneDetectionConfig) {
-                        1 -> Config.PlaneFindingMode.HORIZONTAL
-                        2 -> Config.PlaneFindingMode.VERTICAL
-                        3 -> Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
-                        else -> Config.PlaneFindingMode.DISABLED
-                    }
-                })
+            val session = sceneView.session
+            if (session == null) {
+                val message = "Unable to create an AR session on this device."
+                notifySessionFailure(message)
+                result.error("AR_SESSION_UNAVAILABLE", message, null)
+                return
             }
+
+            session.configure(session.config.apply {
+                depthMode = when (session.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) {
+                    true -> Config.DepthMode.AUTOMATIC
+                    else -> Config.DepthMode.DISABLED
+                }
+                planeFindingMode = when (argPlaneDetectionConfig) {
+                    1 -> Config.PlaneFindingMode.HORIZONTAL
+                    2 -> Config.PlaneFindingMode.VERTICAL
+                    3 -> Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
+                    else -> Config.PlaneFindingMode.DISABLED
+                }
+            })
 
             handleShowWorldOrigin(showWorldOrigin)
             
@@ -500,10 +827,13 @@ class ArView(
                     pointCloudNodes.toList().forEach { removePointCloudNode(it) }
                 }
 
-                onFrame = { frameTime ->
+                onFrame = { _ ->
                     try {
                         if (!isSessionPaused) {
-                            session?.update()?.let { frame ->
+                            // ARSceneView updates the ARCore session before it invokes this
+                            // callback. Updating it again here exhausts ARCore's camera-image
+                            // queue on shared-camera devices and stalls tracking.
+                            sceneView.frame?.let { frame ->
                                 if (showAnimatedGuide) {
                                     frame.getUpdatedTrackables(Plane::class.java).forEach { plane ->
                                         if (plane.trackingState == TrackingState.TRACKING) {
@@ -558,6 +888,17 @@ class ArView(
                                         }
                                     }
                                 }
+
+                                try {
+                                    arCaptureSession.buildPoseUpdate(frame)?.let { poseUpdate ->
+                                        mainScope.launch {
+                                            captureChannel.invokeMethod("onPoseUpdate", poseUpdate)
+                                        }
+                                    }
+                                } catch (_: CaptureSessionException) {
+                                    // Capture stream is not initialized yet; pose updates begin once the
+                                    // per-view capture manager has been initialized from Dart.
+                                }
                             }
                         }
                     } catch (e: Exception) {
@@ -568,6 +909,7 @@ class ArView(
                             }
                             else -> {
                                 Log.e(TAG, "Error during frame update", e)
+                                notifySessionFailure("AR session failed while running on this device.")
                                 e.printStackTrace()
                             }
                         }
@@ -594,7 +936,7 @@ class ArView(
                             }
                             true
                         } else {
-                            session?.update()?.let { frame ->
+                            sceneView.frame?.let { frame ->
                                 val hitResults = frame.hitTest(motionEvent)
 
                                 Log.d("ArView", "Hit Results count: ${hitResults.size}")
@@ -656,6 +998,7 @@ class ArView(
             }
             result.success(null)
         } catch (e: Exception) {
+            notifySessionFailure("Unable to initialize AR on this device.")
             result.error("AR_VIEW_ERROR", e.message, null)
         }
     }
@@ -1220,6 +1563,8 @@ class ArView(
 
     override fun dispose() {
         Log.i(TAG, "dispose")
+        mainScope.cancel("ArView disposed")
+        lifecycle.removeObserver(sessionLifecycleObserver)
         sessionChannel.setMethodCallHandler(null)
         objectChannel.setMethodCallHandler(null)
         anchorChannel.setMethodCallHandler(null)
@@ -1235,6 +1580,104 @@ class ArView(
         mainScope.launch {
             sessionChannel.invokeMethod("onError", listOf(error))
         }
+    }
+
+    private fun createSceneView(
+        sessionFeatures: Set<Session.Feature>,
+    ): ARSceneView {
+        requestedSessionFeatures = sessionFeatures
+        val created = ARSceneView(
+            context = viewContext,
+            sharedLifecycle = lifecycle,
+            sessionFeatures = sessionFeatures,
+            sessionConfiguration = { session, config ->
+                config.apply {
+                    depthMode = Config.DepthMode.DISABLED
+                    instantPlacementMode = Config.InstantPlacementMode.DISABLED
+                    lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
+                    focusMode = Config.FocusMode.AUTO
+                    planeFindingMode = Config.PlaneFindingMode.DISABLED
+                }
+            },
+        )
+        if (sessionFeatures.contains(Session.Feature.SHARED_CAMERA)) {
+            // SceneView observes an already-resumed host lifecycle during
+            // platform-view construction. Pause the newly-created ARCore
+            // session before its first frame; SharedCameraManager resumes it
+            // only after Camera2 repeating is active. SceneView's renderer
+            // itself remains resumed, so Session.update later runs with the
+            // Filament GL context current.
+            created.session?.pause()
+        }
+        return created
+    }
+
+    private fun createCaptureSession(): ArCaptureSession =
+        ArCaptureSession(
+            sceneView = sceneView,
+            capabilityQuerier = cameraCapabilityQuerier,
+            captureChannel = captureChannel,
+            onCapacityChanged = { capacity ->
+                mainScope.launch {
+                    captureChannel.invokeMethod("onCaptureCapacityChanged", capacity)
+                }
+            },
+            onObservedControlStateChanged = { session ->
+                mainScope.launch {
+                    captureChannel.invokeMethod(
+                        "onExposureStateChanged",
+                        session.getCurrentExposureState(),
+                    )
+                    captureChannel.invokeMethod(
+                        "onFocusStateChanged",
+                        session.getCurrentFocusState(),
+                    )
+                    captureChannel.invokeMethod(
+                        "onWhiteBalanceStateChanged",
+                        session.getCurrentWhiteBalanceState(),
+                    )
+                    captureChannel.invokeMethod(
+                        "onFlashStateChanged",
+                        session.getCurrentFlashState(),
+                    )
+                }
+            },
+            onCaptureAccepted = { accepted ->
+                val dispatched = java.util.concurrent.CountDownLatch(1)
+                mainScope.launch {
+                    try {
+                        captureChannel.invokeMethod("onCaptureAccepted", accepted)
+                    } finally {
+                        dispatched.countDown()
+                    }
+                }
+                dispatched.await(500, java.util.concurrent.TimeUnit.MILLISECONDS)
+            },
+            onCaptureFinalized = { finalized ->
+                mainScope.launch {
+                    captureChannel.invokeMethod("onCaptureFinalized", finalized)
+                }
+            },
+        )
+
+    private fun rebuildSceneView(
+        sessionFeatures: Set<Session.Feature>,
+    ) {
+        val oldSceneView = sceneView
+        rootLayout.removeView(oldSceneView)
+        oldSceneView.destroy()
+        sceneView = createSceneView(sessionFeatures)
+        arCaptureSession.dispose()
+        arCaptureSession = createCaptureSession()
+        rootLayout.addView(sceneView, 0)
+    }
+
+    private fun notifySessionFailure(message: String) {
+        if (hasReportedSessionFailure) {
+            return
+        }
+        hasReportedSessionFailure = true
+        notifyError(message)
     }
 
     private fun notifyCloudAnchorUploaded(args: Map<String, Any>) {

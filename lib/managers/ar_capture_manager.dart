@@ -9,21 +9,18 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../datatypes/image_format.dart';
 import '../models/ar_camera_intrinsics.dart';
+import '../models/ar_capture_attempt_result.dart';
 import '../models/ar_capture_config.dart';
 import '../models/ar_capture_result.dart';
 import '../models/ar_frame_pose.dart';
 import '../models/camera_resolution.dart';
+import '../models/capture_capacity.dart';
+import '../models/capture_quality_policy.dart';
 import '../models/image_size.dart';
 import 'ar_session_manager.dart';
 
 /// Available exposure modes
-enum ExposureMode {
-  auto,
-  manual,
-  program,
-  aperturePriority,
-  shutterPriority,
-}
+enum ExposureMode { auto, manual, program, aperturePriority, shutterPriority }
 
 /// Available focus modes
 enum FocusMode {
@@ -36,13 +33,7 @@ enum FocusMode {
 }
 
 /// Focus status indicators
-enum FocusStatus {
-  inactive,
-  scanning,
-  locked,
-  notLocked,
-  error,
-}
+enum FocusStatus { inactive, scanning, locked, notLocked, error }
 
 /// White balance modes
 enum WhiteBalanceMode {
@@ -58,31 +49,47 @@ enum WhiteBalanceMode {
 }
 
 /// White balance status
-enum WhiteBalanceStatus {
-  inactive,
-  searching,
-  converged,
-  locked,
-  error,
-}
+enum WhiteBalanceStatus { inactive, searching, converged, locked, error }
 
 /// Flash modes
-enum FlashMode {
-  off,
-  auto,
-  on,
-  redEyeReduction,
-  torch,
-}
+enum FlashMode { off, auto, on, redEyeReduction, torch }
 
 /// Flash status indicators
-enum FlashStatus {
-  unavailable,
-  charging,
-  ready,
-  firing,
-  partial,
-  error,
+enum FlashStatus { unavailable, charging, ready, firing, partial, error }
+
+enum CaptureInitializationMode { sharedCamera, previewFallback }
+
+class CaptureInitializationResult {
+  const CaptureInitializationResult({
+    required this.mode,
+    this.warning,
+  });
+
+  factory CaptureInitializationResult.fromPlatformValue(dynamic value) {
+    if (value is Map) {
+      final map = _deepCastMap(value);
+      final modeName = map['mode'] as String? ?? 'sharedCamera';
+      final mode = CaptureInitializationMode.values.firstWhere(
+        (candidate) => candidate.name == modeName,
+        orElse: () => CaptureInitializationMode.sharedCamera,
+      );
+      return CaptureInitializationResult(
+        mode: mode,
+        warning: map['warning'] as String?,
+      );
+    }
+
+    return const CaptureInitializationResult(
+      mode: CaptureInitializationMode.sharedCamera,
+    );
+  }
+
+  final CaptureInitializationMode mode;
+  final String? warning;
+
+  bool get isSharedCamera => mode == CaptureInitializationMode.sharedCamera;
+  bool get isPreviewFallback =>
+      mode == CaptureInitializationMode.previewFallback;
 }
 
 /// Current camera exposure state for UI display
@@ -278,6 +285,12 @@ class ARCaptureManager {
       StreamController.broadcast();
   final StreamController<ARCaptureResult> _captureResultController =
       StreamController.broadcast();
+  final StreamController<Map<String, dynamic>> _captureAcceptedController =
+      StreamController.broadcast();
+  final StreamController<Map<String, dynamic>> _captureFinalizedController =
+      StreamController.broadcast();
+  final StreamController<CaptureCapacity> _captureCapacityController =
+      StreamController.broadcast();
   final StreamController<CameraExposureState> _exposureStateController =
       StreamController.broadcast();
   final StreamController<CameraFocusState> _focusStateController =
@@ -289,15 +302,20 @@ class ARCaptureManager {
   final StreamController<ProfileApplicationStatus> _profileStatusController =
       StreamController.broadcast();
   static const String _profilesKey = 'ar_capture_profiles';
+  static const String _profileNotFoundCode = 'PROFILE_NOT_FOUND';
   final ARCaptureConfig _config;
   Future<void>? _initializationFuture;
   bool _isDisposed = false;
+  CaptureInitializationResult? _initializationResult;
 
   bool get isSupported =>
       debugIsSupportedOverride ??
       (Platform.isAndroid || Platform.environment.containsKey('FLUTTER_TEST'));
-  bool get isEnabled => !_isDisposed && isSupported && _config.enableHighResCapture;
+  bool get isEnabled =>
+      !_isDisposed && isSupported && _config.enableHighResCapture;
   ARCaptureConfig get config => _config;
+  CaptureInitializationResult? get initializationResult =>
+      _initializationResult;
 
   void _throwIfDisposed() {
     if (_isDisposed) {
@@ -314,7 +332,10 @@ class ARCaptureManager {
 
   /// Create capture manager with configuration at construction time
   ARCaptureManager(
-      this._sessionManager, this._config, BuildContext buildContext) {
+    this._sessionManager,
+    this._config,
+    BuildContext buildContext,
+  ) {
     _channel = MethodChannel('arcapture_${_sessionManager.channelId}');
     _channel.setMethodCallHandler(_platformCallHandler);
   }
@@ -340,10 +361,17 @@ class ARCaptureManager {
       }
 
       // Initialize native capture system immediately
-      await _channel.invokeMethod('initializeCapture', _config.toMap());
+      final result = await _channel.invokeMethod<dynamic>(
+        'initializeCapture',
+        _config.toMap(),
+      );
+      _initializationResult = CaptureInitializationResult.fromPlatformValue(
+        result,
+      );
 
       debugPrint(
-          'ARCaptureManager initialized with config: ${_config.toString()}');
+        'ARCaptureManager initialized with config: ${_config.toString()}',
+      );
     } on PlatformException catch (e) {
       throw _captureExceptionFromPlatformException(
         e,
@@ -358,7 +386,10 @@ class ARCaptureManager {
   }
 
   /// Capture high-resolution image with synchronized pose data
-  Future<ARCaptureResult?> captureImage() async {
+  Future<ARCaptureAttemptResult> captureImageAttempt({
+    CaptureQualityPolicy qualityPolicy =
+        const CaptureQualityPolicy.productionDefault(),
+  }) async {
     _throwIfDisposed();
     if (!isEnabled) {
       throw const ARCaptureException(
@@ -369,12 +400,17 @@ class ARCaptureManager {
 
     try {
       await _ensureInitialized();
-      final Map<dynamic, dynamic>? result =
-          await _channel.invokeMethod('captureHighResImage');
-      if (result != null) {
-        return ARCaptureResult.fromMap(_deepCastMap(result));
+      final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
+        'captureHighResImage',
+        <String, dynamic>{'qualityPolicy': qualityPolicy.toMap()},
+      );
+      if (result == null) {
+        throw const ARCaptureException(
+          'Capture attempt result was missing',
+          code: 'CAPTURE_RESULT_MISSING',
+        );
       }
-      return null;
+      return ARCaptureAttemptResult.fromMap(_deepCastMap(result));
     } on PlatformException catch (e) {
       throw _captureExceptionFromPlatformException(
         e,
@@ -383,9 +419,64 @@ class ARCaptureManager {
     }
   }
 
+  /// Backward-compatible helper while the wider app migrates to attempt results.
+  Future<ARCaptureResult?> captureImage() async {
+    final attempt = await captureImageAttempt();
+    return attempt.capture;
+  }
+
+  Future<CaptureCapacity?> getCaptureCapacity() async {
+    _throwIfDisposed();
+    if (!isEnabled) return null;
+
+    try {
+      await _ensureInitialized();
+      final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
+        'getCaptureCapacity',
+      );
+      if (result == null) {
+        return null;
+      }
+      return CaptureCapacity.fromMap(_deepCastMap(result));
+    } on PlatformException catch (e) {
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'get capture capacity',
+      );
+    }
+  }
+
+  /// Returns a lightweight native resource snapshot for release diagnostics.
+  Future<Map<String, dynamic>?> getPerformanceSnapshot() async {
+    _throwIfDisposed();
+    try {
+      await _ensureInitialized();
+      final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+        'getPerformanceSnapshot',
+      );
+      return result == null ? null : _deepCastMap(result);
+    } on PlatformException catch (error) {
+      throw _captureExceptionFromPlatformException(
+        error,
+        operation: 'get capture performance snapshot',
+      );
+    }
+  }
+
   /// Stream of automatic capture results based on configured interval
   Stream<ARCaptureResult> get automaticCaptureStream =>
       _captureResultController.stream;
+
+  /// Emitted after pose correlation and blur acceptance, before encoding.
+  Stream<Map<String, dynamic>> get captureAcceptedStream =>
+      _captureAcceptedController.stream;
+
+  /// Emitted when an accepted capture is encoded and staged, or finalization fails.
+  Stream<Map<String, dynamic>> get captureFinalizedStream =>
+      _captureFinalizedController.stream;
+
+  Stream<CaptureCapacity> get captureCapacityStream =>
+      _captureCapacityController.stream;
 
   /// Get camera intrinsics data (unified for both AR tracking and capture)
   Future<ARCameraIntrinsics?> getCameraIntrinsics() async {
@@ -394,8 +485,9 @@ class ARCaptureManager {
 
     try {
       await _ensureInitialized();
-      final Map<dynamic, dynamic>? result =
-          await _channel.invokeMethod('getCameraIntrinsics');
+      final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
+        'getCameraIntrinsics',
+      );
       if (result != null) {
         return ARCameraIntrinsics.fromMap(_deepCastMap(result));
       }
@@ -410,7 +502,10 @@ class ARCaptureManager {
 
   /// Save captured image to disk by ID
   Future<bool> saveImageToFile(
-      String imageId, String filePath, ImageFormat format) async {
+    String imageId,
+    String filePath,
+    ImageFormat format,
+  ) async {
     _throwIfDisposed();
     if (!isEnabled) return false;
 
@@ -422,9 +517,63 @@ class ARCaptureManager {
         'format': format.name,
       });
     } on PlatformException catch (e) {
+      throw _captureExceptionFromPlatformException(e, operation: 'save image');
+    }
+  }
+
+  /// Persist a staged capture into a destination root/session folder and
+  /// release its cache slot after the destination part file is written.
+  Future<ARPersistedCaptureResult?> persistCapture(
+    String imageId,
+    String rootPath,
+    String sessionFolder,
+    String baseName,
+    ImageFormat format,
+  ) async {
+    _throwIfDisposed();
+    if (!isEnabled) return null;
+
+    try {
+      await _ensureInitialized();
+      final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
+        'persistCapture',
+        {
+          'imageId': imageId,
+          'destination': <String, dynamic>{
+            'kind': 'appPath',
+            'root': rootPath,
+          },
+          'sessionFolder': sessionFolder,
+          'baseName': baseName,
+          'format': format.name,
+        },
+      );
+      if (result == null) {
+        return null;
+      }
+      return ARPersistedCaptureResult.fromMap(_deepCastMap(result));
+    } on PlatformException catch (e) {
       throw _captureExceptionFromPlatformException(
         e,
-        operation: 'save image',
+        operation: 'persist capture',
+      );
+    }
+  }
+
+  /// Discard a staged capture and release its cache slot.
+  Future<bool> discardCapture(String imageId) async {
+    _throwIfDisposed();
+    if (!isEnabled) return false;
+
+    try {
+      await _ensureInitialized();
+      return await _channel.invokeMethod('discardCapture', {
+        'imageId': imageId,
+      });
+    } on PlatformException catch (e) {
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'discard capture',
       );
     }
   }
@@ -436,10 +585,10 @@ class ARCaptureManager {
 
     try {
       await _ensureInitialized();
-      final Map<dynamic, dynamic>? result =
-          await _channel.invokeMethod('getImageSize', {
-        'imageId': imageId,
-      });
+      final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
+        'getImageSize',
+        {'imageId': imageId},
+      );
       if (result != null) {
         return ImageSize.fromMap(Map<String, dynamic>.from(result));
       }
@@ -459,11 +608,10 @@ class ARCaptureManager {
 
     try {
       await _ensureInitialized();
-      final Uint8List? result =
-          await _channel.invokeMethod<Uint8List>('getImageData', {
-        'imageId': imageId,
-        'format': format.name,
-      });
+      final Uint8List? result = await _channel.invokeMethod<Uint8List>(
+        'getImageData',
+        {'imageId': imageId, 'format': format.name},
+      );
       return result;
     } on PlatformException catch (e) {
       throw _captureExceptionFromPlatformException(
@@ -488,36 +636,38 @@ class ARCaptureManager {
         if (isoValue < minISO || isoValue > maxISO) {
           final clampedISO = isoValue.clamp(minISO, maxISO);
           debugPrint(
-              'ISO $isoValue out of range [$minISO-$maxISO], using $clampedISO');
+            'ISO $isoValue out of range [$minISO-$maxISO], using $clampedISO',
+          );
           isoValue = clampedISO;
         }
       }
 
-      final Map<dynamic, dynamic>? result =
-          await _channel.invokeMethod('setISO', {
-        'isoValue': isoValue,
-        'temporary': temporary,
-      });
+      final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
+        'setISO',
+        {'isoValue': isoValue, 'temporary': temporary},
+      );
 
       if (result != null) {
         final actualISO = result['actualISO'] as int?;
-
-        // Update exposure state stream
-        _updateExposureState();
 
         return actualISO;
       }
 
       return null;
     } on PlatformException catch (e) {
-      throw ARCaptureException('Failed to set ISO: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'set ISO',
+      );
     }
   }
 
   /// Runtime exposure time control with validation
   /// Returns actual exposure time set by camera
-  Future<Duration?> setExposureTime(Duration exposureTime,
-      {bool temporary = true}) async {
+  Future<Duration?> setExposureTime(
+    Duration exposureTime, {
+    bool temporary = true,
+  }) async {
     if (!isEnabled) return null;
 
     try {
@@ -535,7 +685,8 @@ class ARCaptureManager {
             ),
           );
           debugPrint(
-              'Exposure time ${exposureTime.inMicroseconds}μs out of range, using ${clampedExposure.inMicroseconds}μs');
+            'Exposure time ${exposureTime.inMicroseconds}μs out of range, using ${clampedExposure.inMicroseconds}μs',
+          );
           exposureTime = clampedExposure;
         }
       }
@@ -550,9 +701,6 @@ class ARCaptureManager {
         final actualMicroseconds =
             result['actualExposureTimeMicroseconds'] as int?;
 
-        // Update exposure state stream
-        _updateExposureState();
-
         return actualMicroseconds != null
             ? Duration(microseconds: actualMicroseconds)
             : null;
@@ -560,7 +708,10 @@ class ARCaptureManager {
 
       return null;
     } on PlatformException catch (e) {
-      throw ARCaptureException('Failed to set exposure time: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'set exposure time',
+      );
     }
   }
 
@@ -571,7 +722,10 @@ class ARCaptureManager {
     try {
       return await _channel.invokeMethod('getCurrentISO');
     } on PlatformException catch (e) {
-      throw ARCaptureException('Failed to get current ISO: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'get current ISO',
+      );
     }
   }
 
@@ -580,15 +734,18 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
-      final int? microseconds =
-          await _channel.invokeMethod('getCurrentExposureTime');
+      final int? microseconds = await _channel.invokeMethod(
+        'getCurrentExposureTime',
+      );
       if (microseconds != null) {
         return Duration(microseconds: microseconds);
       }
       return null;
     } on PlatformException catch (e) {
-      throw ARCaptureException(
-          'Failed to get current exposure time: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'get current exposure time',
+      );
     }
   }
 
@@ -597,12 +754,15 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
-      final List<dynamic>? result =
-          await _channel.invokeMethod('getSupportedISORange');
+      final List<dynamic>? result = await _channel.invokeMethod(
+        'getSupportedISORange',
+      );
       return result?.cast<int>();
     } on PlatformException catch (e) {
-      throw ARCaptureException(
-          'Failed to get supported ISO range: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'get supported ISO range',
+      );
     }
   }
 
@@ -611,8 +771,9 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
-      final Map<dynamic, dynamic>? result =
-          await _channel.invokeMethod('getSupportedExposureRange');
+      final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
+        'getSupportedExposureRange',
+      );
       if (result != null) {
         return {
           'min': Duration(microseconds: result['min'] ?? 0),
@@ -621,8 +782,10 @@ class ARCaptureManager {
       }
       return null;
     } on PlatformException catch (e) {
-      throw ARCaptureException(
-          'Failed to get supported exposure range: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'get supported exposure range',
+      );
     }
   }
 
@@ -631,17 +794,17 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
-      final bool result =
-          await _channel.invokeMethod('setAutoExposureEnabled', {
-        'enabled': enabled,
-      });
-
-      // Update exposure state stream
-      _updateExposureState();
+      final bool result = await _channel.invokeMethod(
+        'setAutoExposureEnabled',
+        {'enabled': enabled},
+      );
 
       return result;
     } on PlatformException catch (e) {
-      throw ARCaptureException('Failed to set auto exposure: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'set auto exposure',
+      );
     }
   }
 
@@ -657,8 +820,9 @@ class ARCaptureManager {
     }
 
     try {
-      final Map<dynamic, dynamic>? result =
-          await _channel.invokeMethod('getCurrentExposureState');
+      final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
+        'getCurrentExposureState',
+      );
       if (result != null) {
         return CameraExposureState.fromMap(Map<String, dynamic>.from(result));
       }
@@ -670,7 +834,10 @@ class ARCaptureManager {
         exposureMode: ExposureMode.auto,
       );
     } on PlatformException catch (e) {
-      throw ARCaptureException('Failed to get exposure state: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'get exposure state',
+      );
     }
   }
 
@@ -679,16 +846,20 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
-      final Map<dynamic, dynamic>? result =
-          await _channel.invokeMethod('getExposureCompensationInfo');
+      final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
+        'getExposureCompensationInfo',
+      );
       if (result != null) {
         return ExposureCompensationInfo.fromMap(
-            Map<String, dynamic>.from(result));
+          Map<String, dynamic>.from(result),
+        );
       }
       return null;
     } on PlatformException catch (e) {
-      throw ARCaptureException(
-          'Failed to get exposure compensation info: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'get exposure compensation info',
+      );
     }
   }
 
@@ -697,24 +868,23 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
-      final Map<dynamic, dynamic>? result =
-          await _channel.invokeMethod('setExposureCompensation', {
-        'evStep': evStep,
-      });
+      final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
+        'setExposureCompensation',
+        {'evStep': evStep},
+      );
 
       if (result != null) {
         final actualCompensation = result['actualCompensation'] as double?;
-
-        // Update exposure state stream
-        _updateExposureState();
 
         return actualCompensation;
       }
 
       return null;
     } on PlatformException catch (e) {
-      throw ARCaptureException(
-          'Failed to set exposure compensation: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'set exposure compensation',
+      );
     }
   }
 
@@ -725,12 +895,12 @@ class ARCaptureManager {
     try {
       final bool result = await _channel.invokeMethod('lockExposure');
 
-      // Update exposure state stream
-      _updateExposureState();
-
       return result;
     } on PlatformException catch (e) {
-      throw ARCaptureException('Failed to lock exposure: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'lock exposure',
+      );
     }
   }
 
@@ -741,22 +911,12 @@ class ARCaptureManager {
     try {
       final bool result = await _channel.invokeMethod('unlockExposure');
 
-      // Update exposure state stream
-      _updateExposureState();
-
       return result;
     } on PlatformException catch (e) {
-      throw ARCaptureException('Failed to unlock exposure: ${e.message}');
-    }
-  }
-
-  /// Update exposure state stream for real-time UI updates
-  Future<void> _updateExposureState() async {
-    try {
-      final state = await getCurrentExposureState();
-      _exposureStateController.add(state);
-    } catch (e) {
-      debugPrint('Failed to update exposure state: $e');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'unlock exposure',
+      );
     }
   }
 
@@ -774,23 +934,23 @@ class ARCaptureManager {
     distance = distance.clamp(0.0, 1.0);
 
     try {
-      final Map<dynamic, dynamic>? result =
-          await _channel.invokeMethod('setFocusDistance', {
-        'distance': distance,
-      });
+      final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
+        'setFocusDistance',
+        {'distance': distance},
+      );
 
       if (result != null) {
         final actualDistance = result['actualDistance'] as double?;
-
-        // Update focus state stream
-        _updateFocusState();
 
         return actualDistance;
       }
 
       return null;
     } on PlatformException catch (e) {
-      throw ARCaptureException('Failed to set focus distance: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'set focus distance',
+      );
     }
   }
 
@@ -803,12 +963,12 @@ class ARCaptureManager {
         'enabled': enabled,
       });
 
-      // Update focus state stream
-      _updateFocusState();
-
       return result;
     } on PlatformException catch (e) {
-      throw ARCaptureException('Failed to set autofocus: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'set autofocus',
+      );
     }
   }
 
@@ -822,12 +982,12 @@ class ARCaptureManager {
         'y': screenPoint.dy,
       });
 
-      // Update focus state stream
-      _updateFocusState();
-
       return result;
     } on PlatformException catch (e) {
-      throw ARCaptureException('Failed to focus at point: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'focus at point',
+      );
     }
   }
 
@@ -844,8 +1004,9 @@ class ARCaptureManager {
     }
 
     try {
-      final Map<dynamic, dynamic>? result =
-          await _channel.invokeMethod('getCurrentFocusState');
+      final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
+        'getCurrentFocusState',
+      );
       if (result != null) {
         return CameraFocusState.fromMap(Map<String, dynamic>.from(result));
       }
@@ -858,7 +1019,10 @@ class ARCaptureManager {
         focusStatus: FocusStatus.inactive,
       );
     } on PlatformException catch (e) {
-      throw ARCaptureException('Failed to get focus state: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'get focus state',
+      );
     }
   }
 
@@ -867,17 +1031,22 @@ class ARCaptureManager {
     if (!isEnabled) return [FocusMode.auto];
 
     try {
-      final List<dynamic> result =
-          await _channel.invokeMethod('getSupportedFocusModes');
+      final List<dynamic> result = await _channel.invokeMethod(
+        'getSupportedFocusModes',
+      );
       return result
-          .map((name) => FocusMode.values.firstWhere(
-                (mode) => mode.name == name,
-                orElse: () => FocusMode.auto,
-              ))
+          .map(
+            (name) => FocusMode.values.firstWhere(
+              (mode) => mode.name == name,
+              orElse: () => FocusMode.auto,
+            ),
+          )
           .toList();
     } on PlatformException catch (e) {
-      throw ARCaptureException(
-          'Failed to get supported focus modes: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'get supported focus modes',
+      );
     }
   }
 
@@ -890,22 +1059,12 @@ class ARCaptureManager {
         'mode': mode.name,
       });
 
-      // Update focus state stream
-      _updateFocusState();
-
       return result;
     } on PlatformException catch (e) {
-      throw ARCaptureException('Failed to set focus mode: ${e.message}');
-    }
-  }
-
-  /// Update focus state stream
-  Future<void> _updateFocusState() async {
-    try {
-      final state = await getCurrentFocusState();
-      _focusStateController.add(state);
-    } catch (e) {
-      debugPrint('Failed to update focus state: $e');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'set focus mode',
+      );
     }
   }
 
@@ -923,13 +1082,12 @@ class ARCaptureManager {
         'mode': mode.name,
       });
 
-      // Update white balance state stream
-      _updateWhiteBalanceState();
-
       return result;
     } on PlatformException catch (e) {
-      throw ARCaptureException(
-          'Failed to set white balance mode: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'set white balance mode',
+      );
     }
   }
 
@@ -947,28 +1105,29 @@ class ARCaptureManager {
         if (colorTemperatureK < minTemp || colorTemperatureK > maxTemp) {
           final clampedTemp = colorTemperatureK.clamp(minTemp, maxTemp);
           debugPrint(
-              'Color temperature ${colorTemperatureK}K out of range [$minTemp-${maxTemp}K], using ${clampedTemp}K');
+            'Color temperature ${colorTemperatureK}K out of range [$minTemp-${maxTemp}K], using ${clampedTemp}K',
+          );
           colorTemperatureK = clampedTemp;
         }
       }
 
-      final Map<dynamic, dynamic>? result =
-          await _channel.invokeMethod('setColorTemperature', {
-        'colorTemperatureK': colorTemperatureK,
-      });
+      final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
+        'setColorTemperature',
+        {'colorTemperatureK': colorTemperatureK},
+      );
 
       if (result != null) {
         final actualTemp = result['actualColorTemperature'] as int?;
-
-        // Update white balance state stream
-        _updateWhiteBalanceState();
 
         return actualTemp;
       }
 
       return null;
     } on PlatformException catch (e) {
-      throw ARCaptureException('Failed to set color temperature: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'set color temperature',
+      );
     }
   }
 
@@ -984,11 +1143,13 @@ class ARCaptureManager {
     }
 
     try {
-      final Map<dynamic, dynamic>? result =
-          await _channel.invokeMethod('getCurrentWhiteBalanceState');
+      final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
+        'getCurrentWhiteBalanceState',
+      );
       if (result != null) {
         return CameraWhiteBalanceState.fromMap(
-            Map<String, dynamic>.from(result));
+          Map<String, dynamic>.from(result),
+        );
       }
 
       return const CameraWhiteBalanceState(
@@ -998,8 +1159,10 @@ class ARCaptureManager {
         status: WhiteBalanceStatus.inactive,
       );
     } on PlatformException catch (e) {
-      throw ARCaptureException(
-          'Failed to get white balance state: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'get white balance state',
+      );
     }
   }
 
@@ -1008,8 +1171,9 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
-      final Map<dynamic, dynamic>? result =
-          await _channel.invokeMethod('getSupportedColorTemperatureRange');
+      final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
+        'getSupportedColorTemperatureRange',
+      );
       if (result != null) {
         return {
           'min': result['min'] as int? ?? 2000,
@@ -1018,8 +1182,10 @@ class ARCaptureManager {
       }
       return null;
     } on PlatformException catch (e) {
-      throw ARCaptureException(
-          'Failed to get supported color temperature range: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'get supported color temperature range',
+      );
     }
   }
 
@@ -1030,12 +1196,12 @@ class ARCaptureManager {
     try {
       final bool result = await _channel.invokeMethod('lockWhiteBalance');
 
-      // Update white balance state stream
-      _updateWhiteBalanceState();
-
       return result;
     } on PlatformException catch (e) {
-      throw ARCaptureException('Failed to lock white balance: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'lock white balance',
+      );
     }
   }
 
@@ -1046,12 +1212,12 @@ class ARCaptureManager {
     try {
       final bool result = await _channel.invokeMethod('unlockWhiteBalance');
 
-      // Update white balance state stream
-      _updateWhiteBalanceState();
-
       return result;
     } on PlatformException catch (e) {
-      throw ARCaptureException('Failed to unlock white balance: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'unlock white balance',
+      );
     }
   }
 
@@ -1060,19 +1226,17 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
-      final bool result =
-          await _channel.invokeMethod('setWhiteBalanceFromPoint', {
-        'x': screenPoint.dx,
-        'y': screenPoint.dy,
-      });
-
-      // Update white balance state stream
-      _updateWhiteBalanceState();
+      final bool result = await _channel.invokeMethod(
+        'setWhiteBalanceFromPoint',
+        {'x': screenPoint.dx, 'y': screenPoint.dy},
+      );
 
       return result;
     } on PlatformException catch (e) {
-      throw ARCaptureException(
-          'Failed to set white balance from point: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'set white balance from point',
+      );
     }
   }
 
@@ -1081,27 +1245,22 @@ class ARCaptureManager {
     if (!isEnabled) return [WhiteBalanceMode.auto];
 
     try {
-      final List<dynamic> result =
-          await _channel.invokeMethod('getSupportedWhiteBalanceModes');
+      final List<dynamic> result = await _channel.invokeMethod(
+        'getSupportedWhiteBalanceModes',
+      );
       return result
-          .map((name) => WhiteBalanceMode.values.firstWhere(
-                (mode) => mode.name == name,
-                orElse: () => WhiteBalanceMode.auto,
-              ))
+          .map(
+            (name) => WhiteBalanceMode.values.firstWhere(
+              (mode) => mode.name == name,
+              orElse: () => WhiteBalanceMode.auto,
+            ),
+          )
           .toList();
     } on PlatformException catch (e) {
-      throw ARCaptureException(
-          'Failed to get supported white balance modes: ${e.message}');
-    }
-  }
-
-  /// Update white balance state stream
-  Future<void> _updateWhiteBalanceState() async {
-    try {
-      final state = await getCurrentWhiteBalanceState();
-      _whiteBalanceStateController.add(state);
-    } catch (e) {
-      debugPrint('Failed to update white balance state: $e');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'get supported white balance modes',
+      );
     }
   }
 
@@ -1125,12 +1284,12 @@ class ARCaptureManager {
         'mode': mode.name,
       });
 
-      // Update flash state stream
-      _updateFlashState();
-
       return result;
     } on PlatformException catch (e) {
-      throw ARCaptureException('Failed to set flash mode: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'set flash mode',
+      );
     }
   }
 
@@ -1146,8 +1305,9 @@ class ARCaptureManager {
     }
 
     try {
-      final Map<dynamic, dynamic>? result =
-          await _channel.invokeMethod('getCurrentSceneFlashState');
+      final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
+        'getCurrentFlashState',
+      );
       if (result != null) {
         return CameraFlashState.fromMap(Map<String, dynamic>.from(result));
       }
@@ -1159,7 +1319,10 @@ class ARCaptureManager {
         flashStatus: FlashStatus.unavailable,
       );
     } on PlatformException catch (e) {
-      throw ARCaptureException('Failed to get scene/flash state: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'get scene/flash state',
+      );
     }
   }
 
@@ -1170,8 +1333,10 @@ class ARCaptureManager {
     try {
       return await _channel.invokeMethod('isFlashAvailable');
     } on PlatformException catch (e) {
-      throw ARCaptureException(
-          'Failed to check flash availability: ${e.message}');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'check flash availability',
+      );
     }
   }
 
@@ -1190,22 +1355,12 @@ class ARCaptureManager {
         'enabled': enabled,
       });
 
-      // Update flash state stream
-      _updateFlashState();
-
       return result;
     } on PlatformException catch (e) {
-      throw ARCaptureException('Failed to set torch: ${e.message}');
-    }
-  }
-
-  /// Update flash state stream.
-  Future<void> _updateFlashState() async {
-    try {
-      final state = await getCurrentFlashState();
-      _flashStateController.add(state);
-    } catch (e) {
-      debugPrint('Failed to update flash state: $e');
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'set torch',
+      );
     }
   }
 
@@ -1220,34 +1375,16 @@ class ARCaptureManager {
 
     try {
       // Capture current parameters
-      final profile = await createProfileFromCurrentSettings(profileName,
-          description: description);
+      final profile = await createProfileFromCurrentSettings(
+        profileName,
+        description: description,
+      );
 
-      // Get existing profiles
-      final existingProfiles = await getSavedProfiles();
-
-      // Remove existing profile with same name
-      existingProfiles.removeWhere((p) => p.name == profileName);
-
-      // Add new profile
-      existingProfiles.add(profile);
-
-      // Save to device storage
-      final profilesJson = existingProfiles.map((p) => p.toMap()).toList();
-
-      try {
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setString(_profilesKey, jsonEncode(profilesJson));
-
-        _profileStatusController.add(ProfileApplicationStatus.saved);
-        debugPrint('Profile "$profileName" saved successfully');
-
-        return true;
-      } catch (e) {
-        debugPrint('Failed to save profile to storage: $e');
-        return false;
-      }
+      return await _persistProfile(profile);
     } catch (e) {
+      if (e is ARCaptureException) {
+        rethrow;
+      }
       throw ARCaptureException('Failed to save profile: $e');
     }
   }
@@ -1270,8 +1407,10 @@ class ARCaptureManager {
             builtInProfiles.where((p) => p.name == profileName).firstOrNull;
 
         if (builtInProfile == null) {
-          _profileStatusController.add(ProfileApplicationStatus.error);
-          throw ARCaptureException('Profile "$profileName" not found');
+          throw ARCaptureException(
+            'Profile "$profileName" not found',
+            code: _profileNotFoundCode,
+          );
         }
 
         return await _applyProfile(builtInProfile);
@@ -1280,6 +1419,9 @@ class ARCaptureManager {
       return await _applyProfile(profile);
     } catch (e) {
       _profileStatusController.add(ProfileApplicationStatus.error);
+      if (e is ARCaptureException) {
+        rethrow;
+      }
       throw ARCaptureException('Failed to load profile: $e');
     }
   }
@@ -1360,8 +1502,7 @@ class ARCaptureManager {
         );
       }
 
-      // Save imported profile
-      return await saveProfile(profile.name, description: profile.description);
+      return await _persistProfile(profile);
     } catch (e) {
       debugPrint('Failed to import profile: $e');
       return false;
@@ -1469,13 +1610,18 @@ class ARCaptureManager {
 
       return await loadProfile(profileName);
     } catch (e) {
+      if (e is ARCaptureException) {
+        rethrow;
+      }
       throw ARCaptureException('Failed to apply quick profile: $e');
     }
   }
 
   /// Create profile from current camera settings
-  Future<CameraProfile> createProfileFromCurrentSettings(String name,
-      {String? description}) async {
+  Future<CameraProfile> createProfileFromCurrentSettings(
+    String name, {
+    String? description,
+  }) async {
     // Gather all current camera parameters
     final exposureState = await getCurrentExposureState();
     final focusState = await getCurrentFocusState();
@@ -1510,45 +1656,104 @@ class ARCaptureManager {
 
       final params = profile.parameters;
       bool allSuccessful = true;
+      _ProfileApplicationStage? firstFailedStage;
+
+      void recordStageFailure(_ProfileApplicationStage stage) {
+        allSuccessful = false;
+        firstFailedStage ??= stage;
+      }
 
       // Apply parameters in stable order.
 
       // 1. White balance settings
-      if (!await setWhiteBalanceMode(params.whiteBalanceMode))
-        allSuccessful = false;
+      if (!await _runProfileStageAction(
+        _ProfileApplicationStage.whiteBalance,
+        () => setWhiteBalanceMode(params.whiteBalanceMode),
+      )) {
+        recordStageFailure(_ProfileApplicationStage.whiteBalance);
+      }
       if (params.colorTemperature != null) {
-        final result = await setColorTemperature(params.colorTemperature!);
-        if (result == null) allSuccessful = false;
+        final result = await _runProfileStageAction(
+          _ProfileApplicationStage.whiteBalance,
+          () async =>
+              await setColorTemperature(params.colorTemperature!) != null,
+        );
+        if (!result) {
+          recordStageFailure(_ProfileApplicationStage.whiteBalance);
+        }
       }
 
       // 2. Focus settings
-      if (!await setAutofocusEnabled(params.autofocusEnabled))
-        allSuccessful = false;
-      if (!await setFocusMode(params.focusMode)) allSuccessful = false;
+      if (!await _runProfileStageAction(
+        _ProfileApplicationStage.focus,
+        () async =>
+            await setAutofocusEnabled(params.autofocusEnabled) ==
+            params.autofocusEnabled,
+      )) {
+        recordStageFailure(_ProfileApplicationStage.focus);
+      }
+      if (!await _runProfileStageAction(
+        _ProfileApplicationStage.focus,
+        () => setFocusMode(params.focusMode),
+      )) {
+        recordStageFailure(_ProfileApplicationStage.focus);
+      }
       if (params.focusDistance != null) {
-        final result = await setFocusDistance(params.focusDistance!);
-        if (result == null) allSuccessful = false;
+        final result = await _runProfileStageAction(
+          _ProfileApplicationStage.focus,
+          () async => await setFocusDistance(params.focusDistance!) != null,
+        );
+        if (!result) {
+          recordStageFailure(_ProfileApplicationStage.focus);
+        }
       }
 
       // 3. Exposure settings
-      if (!await setAutoExposureEnabled(params.autoExposureEnabled))
-        allSuccessful = false;
+      if (!await _runProfileStageAction(
+        _ProfileApplicationStage.exposure,
+        () async =>
+            await setAutoExposureEnabled(params.autoExposureEnabled) ==
+            params.autoExposureEnabled,
+      )) {
+        recordStageFailure(_ProfileApplicationStage.exposure);
+      }
       if (params.isoValue != null) {
-        final result = await setISO(params.isoValue!);
-        if (result == null) allSuccessful = false;
+        final result = await _runProfileStageAction(
+          _ProfileApplicationStage.exposure,
+          () async => await setISO(params.isoValue!) != null,
+        );
+        if (!result) {
+          recordStageFailure(_ProfileApplicationStage.exposure);
+        }
       }
       if (params.exposureTime != null) {
-        final result = await setExposureTime(params.exposureTime!);
-        if (result == null) allSuccessful = false;
+        final result = await _runProfileStageAction(
+          _ProfileApplicationStage.exposure,
+          () async => await setExposureTime(params.exposureTime!) != null,
+        );
+        if (!result) {
+          recordStageFailure(_ProfileApplicationStage.exposure);
+        }
       }
       if (params.exposureCompensation != null) {
-        final result =
-            await setExposureCompensation(params.exposureCompensation!);
-        if (result == null) allSuccessful = false;
+        final result = await _runProfileStageAction(
+          _ProfileApplicationStage.exposure,
+          () async =>
+              await setExposureCompensation(params.exposureCompensation!) !=
+              null,
+        );
+        if (!result) {
+          recordStageFailure(_ProfileApplicationStage.exposure);
+        }
       }
 
       // 4. Flash settings
-      if (!await setFlashMode(params.flashMode)) allSuccessful = false;
+      if (!await _runProfileStageAction(
+        _ProfileApplicationStage.flash,
+        () => setFlashMode(params.flashMode),
+      )) {
+        recordStageFailure(_ProfileApplicationStage.flash);
+      }
 
       // Update last used timestamp
       await _updateProfileLastUsed(profile.name);
@@ -1557,9 +1762,13 @@ class ARCaptureManager {
         _profileStatusController.add(ProfileApplicationStatus.applied);
         debugPrint('Profile "${profile.name}" applied successfully');
       } else {
-        _profileStatusController.add(ProfileApplicationStatus.partiallyApplied);
+        _profileStatusController.add(
+          firstFailedStage?.failureStatus ??
+              ProfileApplicationStatus.partiallyApplied,
+        );
         debugPrint(
-            'Profile "${profile.name}" partially applied (some parameters failed)');
+          'Profile "${profile.name}" partially applied (first failed stage: ${firstFailedStage?.name ?? 'unknown'})',
+        );
       }
 
       return allSuccessful;
@@ -1572,12 +1781,14 @@ class ARCaptureManager {
 
   /// Apply automatic profile settings
   Future<bool> _applyAutoProfile() async {
-    return await _applyProfile(CameraProfile(
-      name: 'Auto',
-      description: 'Automatic camera settings',
-      createdAt: DateTime.now(),
-      parameters: const CameraProfileParameters(),
-    ));
+    return await _applyProfile(
+      CameraProfile(
+        name: 'Auto',
+        description: 'Automatic camera settings',
+        createdAt: DateTime.now(),
+        parameters: const CameraProfileParameters(),
+      ),
+    );
   }
 
   /// Update profile last used timestamp
@@ -1613,6 +1824,40 @@ class ARCaptureManager {
   Stream<ProfileApplicationStatus> get profileStatusStream =>
       _profileStatusController.stream;
 
+  Future<bool> _runProfileStageAction(
+    _ProfileApplicationStage stage,
+    Future<bool> Function() action,
+  ) async {
+    try {
+      return await action();
+    } catch (e) {
+      debugPrint('Failed to apply ${stage.name} profile stage: $e');
+      return false;
+    }
+  }
+
+  Future<bool> _persistProfile(CameraProfile profile) async {
+    final existingProfiles = await getSavedProfiles();
+
+    existingProfiles.removeWhere((p) => p.name == profile.name);
+    existingProfiles.add(profile);
+
+    final profilesJson = existingProfiles.map((p) => p.toMap()).toList();
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_profilesKey, jsonEncode(profilesJson));
+
+      _profileStatusController.add(ProfileApplicationStatus.saved);
+      debugPrint('Profile "${profile.name}" saved successfully');
+
+      return true;
+    } catch (e) {
+      debugPrint('Failed to save profile to storage: $e');
+      return false;
+    }
+  }
+
   /// Real-time pose data stream (empty on unsupported platforms)
   Stream<ARFramePose> get poseDataStream => _poseStreamController.stream;
 
@@ -1625,9 +1870,45 @@ class ARCaptureManager {
           _poseStreamController.add(pose);
           break;
         case 'onAutomaticCapture':
-          final captureResult =
-              ARCaptureResult.fromMap(_deepCastMap(call.arguments));
+          final captureResult = ARCaptureResult.fromMap(
+            _deepCastMap(call.arguments),
+          );
           _captureResultController.add(captureResult);
+          break;
+        case 'onCaptureAccepted':
+          _captureAcceptedController.add(_deepCastMap(call.arguments));
+          break;
+        case 'onCaptureFinalized':
+          _captureFinalizedController.add(_deepCastMap(call.arguments));
+          break;
+        case 'onCaptureCapacityChanged':
+          final capacity =
+              CaptureCapacity.fromMap(_deepCastMap(call.arguments));
+          _captureCapacityController.add(capacity);
+          break;
+        case 'onExposureStateChanged':
+          final exposureState = CameraExposureState.fromMap(
+            _deepCastMap(call.arguments),
+          );
+          _exposureStateController.add(exposureState);
+          break;
+        case 'onFocusStateChanged':
+          final focusState = CameraFocusState.fromMap(
+            _deepCastMap(call.arguments),
+          );
+          _focusStateController.add(focusState);
+          break;
+        case 'onWhiteBalanceStateChanged':
+          final whiteBalanceState = CameraWhiteBalanceState.fromMap(
+            _deepCastMap(call.arguments),
+          );
+          _whiteBalanceStateController.add(whiteBalanceState);
+          break;
+        case 'onFlashStateChanged':
+          final flashState = CameraFlashState.fromMap(
+            _deepCastMap(call.arguments),
+          );
+          _flashStateController.add(flashState);
           break;
         case 'onCaptureError':
           final error = call.arguments['error'] as String?;
@@ -1646,26 +1927,32 @@ class ARCaptureManager {
   /// DEPRECATED: Resolution is fixed at configuration time
   /// To use a different resolution, create a new ARSessionManager with different ARCaptureConfig
   @Deprecated(
-      'Resolution is fixed at configuration time. Create new session for different resolution.')
+    'Resolution is fixed at configuration time. Create new session for different resolution.',
+  )
   Future<void> setResolution(CameraResolution resolution) async {
     throw UnsupportedError(
-        'Resolution changes not supported. Create new ARSessionManager with different ARCaptureConfig to use different resolution.');
+      'Resolution changes not supported. Create new ARSessionManager with different ARCaptureConfig to use different resolution.',
+    );
   }
 
   /// DEPRECATED: Use ARCameraCapabilities for pre-configuration queries
   @Deprecated(
-      'Use ARCameraCapabilities.getSupportedResolutions() for pre-configuration queries.')
+    'Use ARCameraCapabilities.getSupportedResolutions() for pre-configuration queries.',
+  )
   Future<List<CameraResolution>> getSupportedResolutions() async {
     throw UnsupportedError(
-        'Runtime resolution queries not supported. Use ARCameraCapabilities.getSupportedResolutions() before creating session.');
+      'Runtime resolution queries not supported. Use ARCameraCapabilities.getSupportedResolutions() before creating session.',
+    );
   }
 
   /// DEPRECATED: Use ARCameraCapabilities for resolution validation
   @Deprecated(
-      'Use ARCameraCapabilities.isResolutionSupported() for pre-configuration validation.')
+    'Use ARCameraCapabilities.isResolutionSupported() for pre-configuration validation.',
+  )
   Future<bool> isResolutionSupported(CameraResolution resolution) async {
     throw UnsupportedError(
-        'Runtime resolution validation not supported. Use ARCameraCapabilities.isResolutionSupported() before creating session.');
+      'Runtime resolution validation not supported. Use ARCameraCapabilities.isResolutionSupported() before creating session.',
+    );
   }
 
   /// Cleanup resources
@@ -1682,6 +1969,9 @@ class ARCaptureManager {
 
     _poseStreamController.close();
     _captureResultController.close();
+    _captureAcceptedController.close();
+    _captureFinalizedController.close();
+    _captureCapacityController.close();
     _exposureStateController.close();
     _focusStateController.close();
     _whiteBalanceStateController.close();
@@ -1705,6 +1995,39 @@ class ARCaptureException implements Exception {
     }
     return 'ARCaptureException($code): $message';
   }
+}
+
+class ARPersistedCaptureResult {
+  const ARPersistedCaptureResult({
+    required this.files,
+    required this.sizes,
+    required this.hashes,
+  });
+
+  factory ARPersistedCaptureResult.fromMap(Map<String, dynamic> map) {
+    final files = _deepCastMap(map['files'] ?? const <String, dynamic>{});
+    final sizes = _deepCastMap(map['sizes'] ?? const <String, dynamic>{});
+    final hashes = _deepCastMap(map['hashes'] ?? const <String, dynamic>{});
+    return ARPersistedCaptureResult(
+      files: files.map(
+        (key, value) => MapEntry(key, value.toString()),
+      ),
+      sizes: sizes.map(
+        (key, value) => MapEntry(key, (value as num).toInt()),
+      ),
+      hashes: hashes.map(
+        (key, value) => MapEntry(key, value.toString()),
+      ),
+    );
+  }
+
+  final Map<String, String> files;
+  final Map<String, int> sizes;
+  final Map<String, String> hashes;
+
+  String? fileFor(ImageFormat format) => files[format.name];
+  int? sizeFor(ImageFormat format) => sizes[format.name];
+  String? hashFor(ImageFormat format) => hashes[format.name];
 }
 
 ARCaptureException _captureExceptionFromPlatformException(
@@ -1747,14 +2070,7 @@ List<dynamic> _deepCastList(List<dynamic> value) {
 }
 
 /// Quick profile types for common scenarios
-enum QuickProfileType {
-  auto,
-  portrait,
-  landscape,
-  night,
-  sports,
-  macro,
-}
+enum QuickProfileType { auto, portrait, landscape, night, sports, macro }
 
 /// Profile application status
 enum ProfileApplicationStatus {
@@ -1762,8 +2078,32 @@ enum ProfileApplicationStatus {
   applying,
   applied,
   partiallyApplied,
+  failedWhiteBalance,
+  failedFocus,
+  failedExposure,
+  failedFlash,
   saved,
   error,
+}
+
+enum _ProfileApplicationStage {
+  whiteBalance,
+  focus,
+  exposure,
+  flash,
+}
+
+extension on _ProfileApplicationStage {
+  ProfileApplicationStatus get failureStatus {
+    return switch (this) {
+      _ProfileApplicationStage.whiteBalance =>
+        ProfileApplicationStatus.failedWhiteBalance,
+      _ProfileApplicationStage.focus => ProfileApplicationStatus.failedFocus,
+      _ProfileApplicationStage.exposure =>
+        ProfileApplicationStatus.failedExposure,
+      _ProfileApplicationStage.flash => ProfileApplicationStatus.failedFlash,
+    };
+  }
 }
 
 /// All camera parameters in a profile
@@ -1799,8 +2139,8 @@ class CameraProfileParameters {
           ? Duration(microseconds: map['exposureTime'] as int)
           : null,
       autoExposureEnabled: map['autoExposureEnabled'] as bool? ?? true,
-      exposureCompensation: map['exposureCompensation'] as double?,
-      focusDistance: map['focusDistance'] as double?,
+      exposureCompensation: (map['exposureCompensation'] as num?)?.toDouble(),
+      focusDistance: (map['focusDistance'] as num?)?.toDouble(),
       autofocusEnabled: map['autofocusEnabled'] as bool? ?? true,
       focusMode: FocusMode.values.firstWhere(
         (mode) => mode.name == map['focusMode'],
@@ -1863,7 +2203,8 @@ class CameraProfile {
           ? DateTime.parse(map['lastUsed'] as String)
           : null,
       parameters: CameraProfileParameters.fromMap(
-          Map<String, dynamic>.from(map['parameters'] as Map)),
+        Map<String, dynamic>.from(map['parameters'] as Map),
+      ),
       isBuiltIn: map['isBuiltIn'] as bool? ?? false,
       author: map['author'] as String?,
     );

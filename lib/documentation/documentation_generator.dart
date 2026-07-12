@@ -1,11 +1,5 @@
 import 'dart:io';
 import 'dart:convert';
-import 'package:flutter/services.dart';
-import '../ar_flutter_plugin.dart';
-import '../capabilities/ar_camera_capabilities.dart';
-import '../models/ar_capture_config.dart';
-import '../models/ar_camera_intrinsics.dart';
-import '../models/camera_resolution.dart';
 
 /// Documentation generation utilities for AR Flutter Plugin
 /// 
@@ -112,7 +106,7 @@ class DocumentationGenerator {
   static Future<void> validateDocumentation() async {
     print('Validating documentation examples...');
     
-    final validationResults = <String, ValidationResult>{};
+    final validationResults = <String, DocumentationValidationResult>{};
     
     // Validate API examples
     validationResults['api_examples'] = await _validateAPIExamples();
@@ -764,27 +758,27 @@ if (impact == PerformanceImpact.high || impact == PerformanceImpact.extreme) {
     };
   }
   
-  static Future<ValidationResult> _validateAPIExamples() async {
+  static Future<DocumentationValidationResult> _validateAPIExamples() async {
     // Mock validation - in real implementation would compile and test examples
-    return const ValidationResult(
+    return const DocumentationValidationResult(
       isValid: true,
       errors: [],
       warnings: [],
     );
   }
   
-  static Future<ValidationResult> _validateIntegrationExamples() async {
+  static Future<DocumentationValidationResult> _validateIntegrationExamples() async {
     // Mock validation
-    return const ValidationResult(
+    return const DocumentationValidationResult(
       isValid: true,
       errors: [],
       warnings: [],
     );
   }
   
-  static Future<ValidationResult> _validateMigrationExamples() async {
+  static Future<DocumentationValidationResult> _validateMigrationExamples() async {
     // Mock validation
-    return const ValidationResult(
+    return const DocumentationValidationResult(
       isValid: true,
       errors: [],
       warnings: [],
@@ -840,7 +834,7 @@ ${JsonEncoder.withIndent('  ').convert(docs)}
     await file.writeAsString(markdownContent);
   }
   
-  static Future<void> _generateValidationReport(Map<String, ValidationResult> results) async {
+  static Future<void> _generateValidationReport(Map<String, DocumentationValidationResult> results) async {
     final report = {
       'validation_date': DateTime.now().toIso8601String(),
       'version': _version,
@@ -885,12 +879,12 @@ class CaptureAPIDoc {
 }
 
 /// Validation result for documentation validation
-class ValidationResult {
+class DocumentationValidationResult {
   final bool isValid;
   final List<String> errors;
   final List<String> warnings;
   
-  const ValidationResult({
+  const DocumentationValidationResult({
     required this.isValid,
     this.errors = const [],
     this.warnings = const [],

@@ -3,12 +3,9 @@ export 'package:ar_flutter_plugin_2/widgets/ar_view.dart';
 // Core Managers
 export 'package:ar_flutter_plugin_2/managers/ar_session_manager.dart';
 export 'package:ar_flutter_plugin_2/managers/ar_capture_manager.dart';
-export 'package:ar_flutter_plugin_2/managers/shared_camera_manager.dart';
-export 'package:ar_flutter_plugin_2/managers/capture_memory_manager.dart';
 export 'package:ar_flutter_plugin_2/managers/ar_anchor_manager.dart';
 export 'package:ar_flutter_plugin_2/managers/ar_object_manager.dart';
 export 'package:ar_flutter_plugin_2/managers/ar_location_manager.dart';
-export 'package:ar_flutter_plugin_2/managers/memory_manager.dart';
 
 // Camera Capabilities API
 export 'package:ar_flutter_plugin_2/capabilities/ar_camera_capabilities.dart';
@@ -22,16 +19,14 @@ export 'package:ar_flutter_plugin_2/models/camera_resolution.dart';
 export 'package:ar_flutter_plugin_2/models/focal_length.dart';
 export 'package:ar_flutter_plugin_2/models/image_size.dart';
 export 'package:ar_flutter_plugin_2/models/principal_point.dart';
+export 'package:ar_flutter_plugin_2/models/compatibility_result.dart';
 
 // Data Types
 export 'package:ar_flutter_plugin_2/datatypes/image_format.dart';
 export 'package:ar_flutter_plugin_2/datatypes/config_planedetection.dart';
 
 // Validation
-export 'package:ar_flutter_plugin_2/validation/configuration_compatibility_checker.dart';
-
-// Workflows
-export 'package:ar_flutter_plugin_2/workflows/integrated_capture_workflow.dart';
+export 'package:ar_flutter_plugin_2/validation/configuration_compatibility_validator.dart';
 
 import 'dart:async';
 

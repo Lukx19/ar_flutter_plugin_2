@@ -1,5 +1,6 @@
 import 'dart:math' as math;
 import 'camera_resolution.dart';
+import 'crop_region.dart';
 import 'focal_length.dart';
 import 'principal_point.dart';
 import 'field_of_view.dart';
@@ -15,6 +16,9 @@ class ARCameraIntrinsics {
   
   /// Image resolution these intrinsics apply to
   final CameraResolution resolution;
+
+  /// Crop region in active-array coordinates that was applied to derive these intrinsics
+  final CropRegion? cropRegion;
   
   /// Radial and tangential distortion coefficients (optional)
   /// Format: [k1, k2, p1, p2, k3] following OpenCV convention
@@ -27,6 +31,7 @@ class ARCameraIntrinsics {
     required this.focalLength,
     required this.principalPoint, 
     required this.resolution,
+    this.cropRegion,
     this.distortionCoefficients,
     required this.fieldOfView,
   });
@@ -37,6 +42,9 @@ class ARCameraIntrinsics {
       focalLength: FocalLength.fromMap(map['focalLength'] ?? {}),
       principalPoint: PrincipalPoint.fromMap(map['principalPoint'] ?? {}),
       resolution: CameraResolution.fromMap(map['resolution'] ?? {}),
+      cropRegion: map['cropRegion'] != null
+          ? CropRegion.fromMap(map['cropRegion'] as Map<String, dynamic>)
+          : null,
       distortionCoefficients: (map['distortionCoefficients'] as List<dynamic>?)?.cast<double>(),
       fieldOfView: FieldOfView.fromMap(map['fieldOfView'] ?? {}),
     );
@@ -48,6 +56,7 @@ class ARCameraIntrinsics {
       'focalLength': focalLength.toMap(),
       'principalPoint': principalPoint.toMap(),
       'resolution': resolution.toMap(),
+      if (cropRegion != null) 'cropRegion': cropRegion!.toMap(),
       'distortionCoefficients': distortionCoefficients,
       'fieldOfView': fieldOfView.toMap(),
     };
@@ -81,6 +90,7 @@ class ARCameraIntrinsics {
       focalLength: focalLength,
       principalPoint: principalPoint,
       resolution: resolution,
+      cropRegion: null,
       distortionCoefficients: distortionCoefficients,
       fieldOfView: fieldOfView,
     );
@@ -198,6 +208,7 @@ class ARCameraIntrinsics {
         cy: principalPoint.cy * scaleY,
       ),
       resolution: newResolution,
+      cropRegion: cropRegion,
       distortionCoefficients: distortionCoefficients, // Distortion coefficients don't scale
       fieldOfView: fieldOfView, // FOV remains the same
     );
@@ -210,6 +221,7 @@ class ARCameraIntrinsics {
         other.focalLength == focalLength &&
         other.principalPoint == principalPoint &&
         other.resolution == resolution &&
+        other.cropRegion == cropRegion &&
         _listEquals(other.distortionCoefficients, distortionCoefficients) &&
         other.fieldOfView == fieldOfView;
   }
@@ -219,6 +231,7 @@ class ARCameraIntrinsics {
     return focalLength.hashCode ^
         principalPoint.hashCode ^
         resolution.hashCode ^
+        cropRegion.hashCode ^
         (distortionCoefficients?.hashCode ?? 0) ^
         fieldOfView.hashCode;
   }

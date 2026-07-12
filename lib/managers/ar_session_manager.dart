@@ -718,7 +718,7 @@ class ARSessionManager {
   /// Function to initialize the platform-specific AR view. Can be used to initially set or update session settings.
   /// [customPlaneTexturePath] refers to flutter assets from the app that is calling this function, NOT to assets within this plugin. Make sure
   /// the assets are correctly registered in the pubspec.yaml of the parent app (e.g. the ./example app in this plugin's repo)
-  onInitialize({
+  Future<void> onInitialize({
     bool showAnimatedGuide = true,
     bool showFeaturePoints = false,
     bool showPlanes = true,
@@ -727,8 +727,8 @@ class ARSessionManager {
     bool handleTaps = true,
     bool handlePans = false, // nodes are not draggable by default
     bool handleRotation = false, // nodes can not be rotated by default
-  }) {
-    _channel.invokeMethod<void>('init', {
+  }) async {
+    await _channel.invokeMethod<void>('init', {
       'showAnimatedGuide': showAnimatedGuide,
       'showFeaturePoints': showFeaturePoints,
       'planeDetectionConfig': planeDetectionConfig.index,

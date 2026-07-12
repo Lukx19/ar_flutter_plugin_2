@@ -1,188 +1,68 @@
-import 'package:flutter/services.dart';
 import '../models/ar_capture_config.dart';
-import '../datatypes/buffer_strategy.dart';
 
 /// Memory management for AR capture operations
+@Deprecated(
+  'The global ar_flutter_plugin_2/memory channel is not wired. '
+  'Use ARCaptureManager.getCaptureCapacity() on the live per-view capture path instead.',
+)
 class MemoryManager {
-  static const MethodChannel _channel = MethodChannel('ar_flutter_plugin_2/memory');
-  static const EventChannel _eventChannel = EventChannel('ar_flutter_plugin_2/memory_events');
+  static UnsupportedError _unsupported() {
+    return UnsupportedError(
+      'MemoryManager uses the deprecated global ar_flutter_plugin_2/memory channel, '
+      'which has no native handler in the current capture pipeline. '
+      'Use ARCaptureManager.getCaptureCapacity() on the per-view capture channel instead.',
+    );
+  }
 
   /// Get memory statistics from native side
   static Future<Map<String, dynamic>> getMemoryStats() async {
-    try {
-      final result = await _channel.invokeMethod('getMemoryStats');
-      return Map<String, dynamic>.from(result);
-    } on PlatformException catch (e) {
-      throw MemoryManagerException('Failed to get memory stats: ${e.message}');
-    }
+    throw _unsupported();
   }
 
   /// Get recommended configuration for current memory situation
   static Future<ARCaptureConfig> getMemoryOptimizedConfig(
     ARCaptureConfig baseConfig
   ) async {
-    try {
-      final memStats = await getMemoryStats();
-      final availableMemoryMB = memStats['availableMemoryMB'] as int? ?? 1024;
-
-      if (availableMemoryMB < 512) {
-        // Very low memory device
-        return baseConfig.copyWith(
-          maxCacheSize: 3,
-          jpegQuality: 60,
-          bufferStrategy: BufferStrategy.memory,
-        );
-      } else if (availableMemoryMB < 1024) {
-        // Low memory device
-        return baseConfig.copyWith(
-          maxCacheSize: 5,
-          jpegQuality: 70,
-          bufferStrategy: BufferStrategy.memory,
-        );
-      } else {
-        // Sufficient memory
-        return baseConfig;
-      }
-    } catch (e) {
-      // Return conservative config on error
-      return baseConfig.copyWith(
-        maxCacheSize: 5,
-        jpegQuality: 70,
-        bufferStrategy: BufferStrategy.memory,
-      );
-    }
+    throw _unsupported();
   }
 
   /// Monitor memory usage during capture session
   static Stream<Map<String, dynamic>> monitorMemoryUsage() {
-    return _eventChannel.receiveBroadcastStream().map((event) {
-      return Map<String, dynamic>.from(event);
-    });
+    throw _unsupported();
   }
 
   /// Get device memory class (low, medium, high)
   static Future<DeviceMemoryClass> getDeviceMemoryClass() async {
-    try {
-      final memStats = await getMemoryStats();
-      final totalMemoryMB = memStats['totalMemoryMB'] as int? ?? 0;
-      final availableMemoryMB = memStats['availableMemoryMB'] as int? ?? 0;
-
-      if (totalMemoryMB < 2048 || availableMemoryMB < 512) {
-        return DeviceMemoryClass.low;
-      } else if (totalMemoryMB < 6144 || availableMemoryMB < 1536) {
-        return DeviceMemoryClass.medium;
-      } else {
-        return DeviceMemoryClass.high;
-      }
-    } catch (e) {
-      return DeviceMemoryClass.low; // Conservative fallback
-    }
+    throw _unsupported();
   }
 
   /// Get optimal configuration based on device memory class
   static Future<ARCaptureConfig> getOptimalConfigForDevice(
     ARCaptureConfig baseConfig
   ) async {
-    final memoryClass = await getDeviceMemoryClass();
-    
-    switch (memoryClass) {
-      case DeviceMemoryClass.low:
-        return ARCaptureConfig.memoryOptimized(
-          resolution: baseConfig.resolution,
-          format: baseConfig.format,
-          captureIntervalMs: 8000, // Less frequent captures
-        );
-      
-      case DeviceMemoryClass.medium:
-        return baseConfig.copyWith(
-          maxCacheSize: 8,
-          jpegQuality: 80,
-          bufferStrategy: BufferStrategy.balanced,
-        );
-      
-      case DeviceMemoryClass.high:
-        return ARCaptureConfig.performance(
-          resolution: baseConfig.resolution,
-          format: baseConfig.format,
-          captureIntervalMs: baseConfig.captureIntervalMs,
-        );
-    }
+    throw _unsupported();
   }
 
   /// Check if configuration is safe for current device
   static Future<ConfigurationSafety> checkConfigurationSafety(
     ARCaptureConfig config
   ) async {
-    try {
-      final memStats = await getMemoryStats();
-      final availableMemoryMB = memStats['availableMemoryMB'] as int? ?? 1024;
-      final estimatedUsageMB = config.estimatedMemoryUsageMB;
-
-      if (estimatedUsageMB > availableMemoryMB * 0.8) {
-        return ConfigurationSafety(
-          isSafe: false,
-          riskLevel: MemoryRiskLevel.critical,
-          message: 'Configuration requires ${estimatedUsageMB.toStringAsFixed(1)}MB but only ${availableMemoryMB}MB available',
-          recommendation: 'Reduce cache size or resolution',
-        );
-      } else if (estimatedUsageMB > availableMemoryMB * 0.5) {
-        return ConfigurationSafety(
-          isSafe: true,
-          riskLevel: MemoryRiskLevel.high,
-          message: 'Configuration will use significant memory (${estimatedUsageMB.toStringAsFixed(1)}MB)',
-          recommendation: 'Monitor memory usage carefully',
-        );
-      } else if (estimatedUsageMB > availableMemoryMB * 0.2) {
-        return ConfigurationSafety(
-          isSafe: true,
-          riskLevel: MemoryRiskLevel.medium,
-          message: 'Configuration should work well (${estimatedUsageMB.toStringAsFixed(1)}MB)',
-          recommendation: null,
-        );
-      } else {
-        return ConfigurationSafety(
-          isSafe: true,
-          riskLevel: MemoryRiskLevel.low,
-          message: 'Configuration is very safe (${estimatedUsageMB.toStringAsFixed(1)}MB)',
-          recommendation: null,
-        );
-      }
-    } catch (e) {
-      return ConfigurationSafety(
-        isSafe: false,
-        riskLevel: MemoryRiskLevel.unknown,
-        message: 'Unable to assess configuration safety',
-        recommendation: 'Use conservative settings',
-      );
-    }
+    throw _unsupported();
   }
 
   /// Force garbage collection on native side
   static Future<bool> forceGarbageCollection() async {
-    try {
-      return await _channel.invokeMethod('forceGarbageCollection');
-    } on PlatformException catch (e) {
-      throw MemoryManagerException('Failed to force garbage collection: ${e.message}');
-    }
+    throw _unsupported();
   }
 
   /// Get detailed memory breakdown
   static Future<MemoryBreakdown> getDetailedMemoryBreakdown() async {
-    try {
-      final result = await _channel.invokeMethod('getDetailedMemoryBreakdown');
-      return MemoryBreakdown.fromMap(Map<String, dynamic>.from(result));
-    } on PlatformException catch (e) {
-      throw MemoryManagerException('Failed to get memory breakdown: ${e.message}');
-    }
+    throw _unsupported();
   }
 
   /// Cleanup memory caches
   static Future<bool> cleanupMemoryCaches() async {
-    try {
-      return await _channel.invokeMethod('cleanupMemoryCaches');
-    } on PlatformException catch (e) {
-      throw MemoryManagerException('Failed to cleanup memory caches: ${e.message}');
-    }
+    throw _unsupported();
   }
 }
 

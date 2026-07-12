@@ -1,6 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.capture
 
 import java.io.File
+import java.security.MessageDigest
 import java.util.LinkedHashMap
 
 internal data class CaptureConfig(
@@ -21,10 +22,10 @@ internal data class CaptureConfig(
             val maxCacheSize = (configMap["maxCacheSize"] as? Number)?.toInt() ?: 10
             val jpegQuality = (configMap["jpegQuality"] as? Number)?.toInt() ?: 95
 
-            if (format != "jpeg") {
+            if (format !in setOf("jpeg", "raw+jpeg", "raw", "png")) {
                 throw CaptureSessionException(
                     code = "FORMAT_NOT_CAPTURED",
-                    message = "Only JPEG capture is currently supported",
+                    message = "Unsupported capture mode=$format",
                 )
             }
             if (captureIntervalMs < 0) {
@@ -92,7 +93,6 @@ internal class CaptureByteCache {
     fun initialize(config: CaptureConfig) {
         isDisposed = false
         this.config = config
-        trimCache()
     }
 
     fun nextImageId(timestampMs: Long): String = "img_${timestampMs}_${cache.size + 1}"
@@ -105,6 +105,13 @@ internal class CaptureByteCache {
         timestampMs: Long,
     ): CachedCapture {
         requireInitialized()
+        val maxEntries = config?.maxCacheSize ?: 0
+        if (!cache.containsKey(imageId) && cache.size >= maxEntries) {
+            throw CaptureSessionException(
+                code = "CACHE_FULL",
+                message = "Capture cache is full",
+            )
+        }
         val cachedCapture = CachedCapture(
             imageId = imageId,
             bytes = bytes.copyOf(),
@@ -113,8 +120,34 @@ internal class CaptureByteCache {
             timestampMs = timestampMs,
         )
         cache[imageId] = cachedCapture
-        trimCache()
         return cachedCapture
+    }
+
+    fun getCaptureCapacity(): Map<String, Any?> {
+        requireInitialized()
+        val currentConfig = config ?: throw CaptureSessionException(
+            code = "CAPTURE_NOT_INITIALIZED",
+            message = "Capture session is not initialized",
+        )
+        val stagedBytes = cache.values.sumOf { it.bytes.size.toLong() }
+        val maxStagedBytes =
+            currentConfig.maxCacheSize.toLong() *
+                currentConfig.resolutionWidth.toLong() *
+                currentConfig.resolutionHeight.toLong() * 4L
+        val usedEntries = cache.size
+
+        return mapOf(
+            "maxEntries" to currentConfig.maxCacheSize,
+            "usedEntries" to usedEntries,
+            "reservedEntries" to 0,
+            "readyEntries" to usedEntries,
+            "persistingEntries" to 0,
+            "pendingRetryEntries" to 0,
+            "stagedBytes" to stagedBytes,
+            "maxStagedBytes" to maxStagedBytes,
+            "canCapture" to (usedEntries < currentConfig.maxCacheSize),
+            "blockedReason" to if (usedEntries < currentConfig.maxCacheSize) null else "cacheFull",
+        )
     }
 
     fun getImageData(imageId: String, format: String): ByteArray {
@@ -143,6 +176,39 @@ internal class CaptureByteCache {
         destination.parentFile?.mkdirs()
         destination.writeBytes(capture.bytes)
         return true
+    }
+
+    fun persistCapture(
+        imageId: String,
+        destinationRoot: String,
+        sessionFolder: String,
+        baseName: String,
+        format: String,
+    ): Map<String, Any> {
+        requireInitialized()
+        requireJpegFormat(format)
+        require(baseName.isNotBlank()) { "baseName is required" }
+        val capture = requireCachedCapture(imageId)
+        val destinationDirectory =
+            if (sessionFolder.isBlank()) {
+                File(destinationRoot)
+            } else {
+                File(destinationRoot, sessionFolder)
+            }
+        destinationDirectory.mkdirs()
+        val destinationPartFile = File(destinationDirectory, "$baseName.jpg.part")
+        destinationPartFile.writeBytes(capture.bytes)
+        cache.remove(imageId)
+        return mapOf(
+            "files" to mapOf("jpeg" to destinationPartFile.absolutePath),
+            "sizes" to mapOf("jpeg" to capture.bytes.size),
+            "hashes" to mapOf("jpeg" to sha256(capture.bytes)),
+        )
+    }
+
+    fun discardCapture(imageId: String): Boolean {
+        requireInitialized()
+        return cache.remove(imageId) != null
     }
 
     fun dispose() {
@@ -186,11 +252,8 @@ internal class CaptureByteCache {
         )
     }
 
-    private fun trimCache() {
-        val maxEntries = config?.maxCacheSize ?: return
-        while (cache.size > maxEntries) {
-            val oldestKey = cache.entries.firstOrNull()?.key ?: return
-            cache.remove(oldestKey)
-        }
+    private fun sha256(bytes: ByteArray): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
+        return digest.joinToString(separator = "") { byte -> "%02x".format(byte) }
     }
 }
