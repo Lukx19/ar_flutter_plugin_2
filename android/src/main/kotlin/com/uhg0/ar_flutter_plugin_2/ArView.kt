@@ -13,6 +13,8 @@ import com.google.ar.core.Frame
 import com.google.ar.core.Anchor.CloudAnchorState
 import com.google.ar.core.Plane
 import com.google.ar.core.Session
+import com.google.ar.core.TrackingState
+import com.google.ar.core.exceptions.NotTrackingException
 import com.uhg0.ar_flutter_plugin_2.capture.ArCaptureSession
 import com.uhg0.ar_flutter_plugin_2.capture.CaptureSessionException
 import com.uhg0.ar_flutter_plugin_2.sceneview.PluginAnchorRecord
@@ -279,6 +281,63 @@ internal class ArView(
                     sessionConfig = sessionConfig.copy(cloudAnchorEnabled = true)
                     sceneHost.configure(sessionConfig)
                     result.success(null)
+                }
+                "estimateFeatureMapQualityForHosting" -> {
+                    val session = sceneHost.activeSession
+                        ?: throw IllegalStateException("AR Session is not available")
+                    val camera = sceneHost.latestFrame?.camera
+                    if (camera?.trackingState != TrackingState.TRACKING) {
+                        result.error("NOT_TRACKING", "ARCore camera is not tracking", null)
+                        return
+                    }
+                    val quality = try {
+                        session.estimateFeatureMapQualityForHosting(camera.pose)
+                    } catch (error: NotTrackingException) {
+                        result.error("NOT_TRACKING", error.message, null)
+                        return
+                    }
+                    result.success(
+                        when (quality) {
+                            Session.FeatureMapQuality.INSUFFICIENT -> "insufficient"
+                            Session.FeatureMapQuality.SUFFICIENT -> "sufficient"
+                            Session.FeatureMapQuality.GOOD -> "good"
+                        },
+                    )
+                }
+                "addAnchorAtCurrentCameraPose" -> {
+                    val name = call.argument<String>("name")
+                        ?: throw IllegalArgumentException("Anchor name is required")
+                    val ttlDays = call.argument<Number>("ttl")?.toInt() ?: 1
+                    require(ttlDays in 1..365) {
+                        "Cloud Anchor TTL must be between 1 and 365 days"
+                    }
+                    val camera = sceneHost.latestFrame?.camera
+                    if (camera?.trackingState != TrackingState.TRACKING) {
+                        result.error("NOT_TRACKING", "ARCore camera is not tracking", null)
+                        return
+                    }
+                    val transform = camera.pose.toPluginTransform()
+                    val record = PluginAnchorRecord(
+                        id = name,
+                        transform = transform,
+                        ttlDays = ttlDays,
+                    )
+                    anchorRecords[name] = record
+                    if (!sceneHost.addOrUpdateAnchor(record)) {
+                        anchorRecords.remove(name)
+                        result.error("ANCHOR_CREATE_FAILED", "Could not create local anchor", null)
+                        return
+                    }
+                    result.success(
+                        mapOf(
+                            "type" to 0,
+                            "name" to name,
+                            "transformation" to transform.matrix,
+                            "childNodes" to emptyList<String>(),
+                            "cloudanchorid" to null,
+                            "ttl" to ttlDays,
+                        ),
+                    )
                 }
                 "addAnchor" -> {
                     val record = anchorRecord(call.arguments as Map<String, Any?>)
@@ -551,7 +610,12 @@ internal class ArView(
                 )
                 result.success(true)
             } else {
-                result.error("HOSTING_ERROR", "Failed to host cloud anchor: $state", null)
+                val code = if (state == CloudAnchorState.ERROR_NOT_AUTHORIZED) {
+                    "ANCHOR_NOT_AUTHORIZED"
+                } else {
+                    "ANCHOR_HOST_FAILED"
+                }
+                result.error(code, "Failed to host cloud anchor: $state", null)
             }
         }
         val cancelOperation = { future.cancel(); localAnchor.detach(); Unit }
@@ -611,7 +675,12 @@ internal class ArView(
                 )
                 result.success(true)
             } else {
-                result.error("RESOLVE_ERROR", "Failed to resolve cloud anchor: $state", null)
+                val code = if (state == CloudAnchorState.ERROR_NOT_AUTHORIZED) {
+                    "ANCHOR_NOT_AUTHORIZED"
+                } else {
+                    "ANCHOR_RESOLVE_FAILED"
+                }
+                result.error(code, "Failed to resolve cloud anchor: $state", null)
             }
         }
         val cancelOperation = { future.cancel(); Unit }
@@ -638,13 +707,17 @@ internal class ArView(
         )
     }
 
-    private fun anchorRecord(data: Map<String, Any?>) = PluginAnchorRecord(
-        id = data["name"] as String,
-        transform = (data["transformation"] as List<Number>).toPluginTransform(),
-        childNodeIds = (data["childNodes"] as? List<*>)?.map(Any?::toString).orEmpty(),
-        cloudAnchorId = data["cloudanchorid"] as? String,
-        ttlDays = (data["ttl"] as? Number)?.toInt() ?: 1,
-    )
+    private fun anchorRecord(data: Map<String, Any?>): PluginAnchorRecord {
+        val ttlDays = (data["ttl"] as? Number)?.toInt() ?: 1
+        require(ttlDays in 1..365) { "Cloud Anchor TTL must be between 1 and 365 days" }
+        return PluginAnchorRecord(
+            id = data["name"] as String,
+            transform = (data["transformation"] as List<Number>).toPluginTransform(),
+            childNodeIds = (data["childNodes"] as? List<*>)?.map(Any?::toString).orEmpty(),
+            cloudAnchorId = data["cloudanchorid"] as? String,
+            ttlDays = ttlDays,
+        )
+    }
 
     private fun List<Number>.toPluginTransform() = PluginTransform(map(Number::toDouble))
 

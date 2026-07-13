@@ -2,6 +2,10 @@ import 'package:ar_flutter_plugin_2/models/ar_anchor.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/material.dart';
 
+/// ARCore's estimate of whether the currently observed visual features are
+/// sufficient to host a durable Google Cloud Anchor.
+enum AndroidFeatureMapQuality { insufficient, sufficient, good }
+
 // Type definitions to enforce a consistent use of the API
 typedef AnchorUploadedHandler = void Function(ARAnchor arAnchor);
 typedef AnchorDownloadedHandler = ARAnchor Function(
@@ -33,8 +37,48 @@ class ARAnchorManager {
   }
 
   /// Activates collaborative AR mode (using Google Cloud Anchors)
-  initGoogleCloudAnchorMode() async {
-    _channel.invokeMethod<bool>('initGoogleCloudAnchorMode', {});
+  Future<void> initGoogleCloudAnchorMode() async {
+    await _channel.invokeMethod<void>('initGoogleCloudAnchorMode', {});
+  }
+
+  /// Estimates hosting quality at ARCore's current native camera pose.
+  ///
+  /// App-facing pose streams may use an export coordinate convention, so the
+  /// native camera pose is deliberately selected on the platform side.
+  Future<AndroidFeatureMapQuality> estimateFeatureMapQualityForHosting() async {
+    final quality = await _channel.invokeMethod<String>(
+      'estimateFeatureMapQualityForHosting',
+    );
+    return switch (quality) {
+      'insufficient' => AndroidFeatureMapQuality.insufficient,
+      'sufficient' => AndroidFeatureMapQuality.sufficient,
+      'good' => AndroidFeatureMapQuality.good,
+      _ => throw PlatformException(
+          code: 'ANCHOR_QUALITY_INVALID',
+          message: 'ARCore returned an unknown feature-map quality: $quality',
+        ),
+    };
+  }
+
+  /// Creates a local anchor at ARCore's current native camera pose.
+  Future<ARPlaneAnchor> addAnchorAtCurrentCameraPose({
+    required String name,
+    int ttl = 1,
+  }) async {
+    if (ttl < 1 || ttl > 365) {
+      throw ArgumentError.value(ttl, 'ttl', 'must be between 1 and 365 days');
+    }
+    final serialized = await _channel.invokeMapMethod<String, dynamic>(
+      'addAnchorAtCurrentCameraPose',
+      <String, dynamic>{'name': name, 'ttl': ttl},
+    );
+    if (serialized == null) {
+      throw PlatformException(
+        code: 'ANCHOR_CREATE_FAILED',
+        message: 'ARCore did not return the created local anchor.',
+      );
+    }
+    return ARPlaneAnchor.fromJson(serialized);
   }
 
   Future<dynamic> _platformCallHandler(MethodCall call) async {
@@ -98,20 +142,36 @@ class ARAnchorManager {
 
   /// Upload given anchor from the underlying AR scene to the Google Cloud Anchor API
   Future<bool?> uploadAnchor(ARAnchor anchor) async {
+    if (anchor is ARPlaneAnchor &&
+        (anchor.ttl == null || anchor.ttl! < 1 || anchor.ttl! > 365)) {
+      throw ArgumentError.value(
+        anchor.ttl,
+        'anchor.ttl',
+        'Cloud Anchor TTL must be between 1 and 365 days.',
+      );
+    }
+    if (!pendingAnchors.contains(anchor)) {
+      pendingAnchors.add(anchor);
+    }
     try {
       final response =
           await _channel.invokeMethod<bool>('uploadAnchor', anchor.toJson());
-      pendingAnchors.add(anchor);
+      if (response != true) {
+        pendingAnchors.remove(anchor);
+      }
       return response;
-    } on PlatformException catch (e) {
-      return false;
+    } on PlatformException {
+      pendingAnchors.remove(anchor);
+      rethrow;
     }
   }
 
   /// Try to download anchor with the given ID from the Google Cloud Anchor API and add it to the scene
   Future<bool?> downloadAnchor(String cloudanchorid) async {
     print("TRYING TO DOWNLOAD ANCHOR WITH ID " + cloudanchorid);
-    _channel
-        .invokeMethod<bool>('downloadAnchor', {"cloudanchorid": cloudanchorid});
+    return _channel.invokeMethod<bool>(
+      'downloadAnchor',
+      {"cloudanchorid": cloudanchorid},
+    );
   }
 }

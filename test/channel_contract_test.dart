@@ -86,6 +86,7 @@ void main() {
       anchorCalls.add(call);
       return switch (call.method) {
         'addAnchor' || 'uploadAnchor' || 'downloadAnchor' => true,
+        'estimateFeatureMapQualityForHosting' => 'good',
         'removeAnchor' => 'removed',
         _ => null,
       };
@@ -390,10 +391,14 @@ void main() {
     };
 
     await manager.initGoogleCloudAnchorMode();
+    expect(
+      await manager.estimateFeatureMapQualityForHosting(),
+      AndroidFeatureMapQuality.good,
+    );
     expect(await manager.addAnchor(anchor), isTrue);
     expect(await manager.uploadAnchor(anchor), isTrue);
     manager.removeAnchor(anchor);
-    await manager.downloadAnchor('cloud-1');
+    expect(await manager.downloadAnchor('cloud-1'), isTrue);
 
     await _sendPlatformCall(
       anchorChannel,
@@ -420,11 +425,118 @@ void main() {
       anchorCalls.map((call) => call.method),
       containsAllInOrder(<String>[
         'initGoogleCloudAnchorMode',
+        'estimateFeatureMapQualityForHosting',
         'addAnchor',
         'uploadAnchor',
         'removeAnchor',
         'downloadAnchor',
       ]),
+    );
+    final qualityCall = anchorCalls.firstWhere(
+      (call) => call.method == 'estimateFeatureMapQualityForHosting',
+    );
+    expect(qualityCall.arguments, isNull);
+  });
+
+  test('native-camera anchor creation preserves name and TTL', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(anchorChannel, (call) async {
+      anchorCalls.add(call);
+      if (call.method == 'addAnchorAtCurrentCameraPose') {
+        return <String, dynamic>{
+          'type': 0,
+          'name': call.arguments['name'],
+          'transformation': Matrix4.identity().storage.toList(),
+          'childNodes': <String>[],
+          'cloudanchorid': null,
+          'ttl': call.arguments['ttl'],
+        };
+      }
+      return true;
+    });
+    final manager = ARAnchorManager(42);
+
+    final anchor = await manager.addAnchorAtCurrentCameraPose(
+      name: 'native-camera-anchor',
+      ttl: 7,
+    );
+
+    expect(anchor.name, 'native-camera-anchor');
+    expect(anchor.ttl, 7);
+    expect(anchorCalls.single.arguments, <String, dynamic>{
+      'name': 'native-camera-anchor',
+      'ttl': 7,
+    });
+  });
+
+  test('anchor is pending before native upload completion callback', () async {
+    final uploadStarted = Completer<void>();
+    final completeUpload = Completer<bool>();
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(anchorChannel, (call) async {
+      anchorCalls.add(call);
+      if (call.method == 'uploadAnchor') {
+        uploadStarted.complete();
+        return completeUpload.future;
+      }
+      return true;
+    });
+    final manager = ARAnchorManager(42);
+    final anchor = ARPlaneAnchor(
+      transformation: Matrix4.identity(),
+      name: 'race-free-anchor',
+    );
+
+    final upload = manager.uploadAnchor(anchor);
+    await uploadStarted.future;
+
+    expect(manager.pendingAnchors, contains(anchor));
+    completeUpload.complete(true);
+    expect(await upload, isTrue);
+  });
+
+  test('cloud anchor authorization errors remain actionable', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(anchorChannel, (call) async {
+      if (call.method == 'uploadAnchor') {
+        throw PlatformException(
+          code: 'ANCHOR_NOT_AUTHORIZED',
+          message: 'Package and certificate are not registered.',
+        );
+      }
+      return true;
+    });
+    final manager = ARAnchorManager(42);
+    final anchor = ARPlaneAnchor(
+      transformation: Matrix4.identity(),
+      name: 'unauthorized-anchor',
+    );
+
+    await expectLater(
+      manager.uploadAnchor(anchor),
+      throwsA(
+        isA<PlatformException>().having(
+          (error) => error.code,
+          'code',
+          'ANCHOR_NOT_AUTHORIZED',
+        ),
+      ),
+    );
+    expect(manager.pendingAnchors, isEmpty);
+  });
+
+  test('cloud anchor TTL is validated before a platform call', () async {
+    final manager = ARAnchorManager(42);
+    final anchor = ARPlaneAnchor(
+      transformation: Matrix4.identity(),
+      name: 'invalid-ttl-anchor',
+      ttl: 366,
+    );
+
+    await expectLater(manager.uploadAnchor(anchor), throwsArgumentError);
+    expect(
+      anchorCalls.where((call) => call.method == 'uploadAnchor'),
+      isEmpty,
     );
   });
 
