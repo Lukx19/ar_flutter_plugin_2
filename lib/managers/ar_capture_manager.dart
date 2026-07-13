@@ -1956,13 +1956,13 @@ class ARCaptureManager {
   }
 
   /// Cleanup resources
-  void dispose() {
+  Future<void> dispose() async {
     if (_isDisposed) {
       return;
     }
     _isDisposed = true;
     try {
-      _channel.invokeMethod('dispose');
+      await _channel.invokeMethod<void>('dispose');
     } catch (e) {
       debugPrint('Error disposing capture manager: $e');
     }

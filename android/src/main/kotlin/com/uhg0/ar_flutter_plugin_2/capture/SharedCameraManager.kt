@@ -27,7 +27,6 @@ import com.google.ar.core.Session
 import com.google.ar.core.SharedCamera
 import com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraCapabilityQuerier
 import io.flutter.plugin.common.MethodChannel
-import io.github.sceneview.ar.arcore.ARSession
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
@@ -149,6 +148,7 @@ internal class SharedCameraManager(
     private val methodChannel: MethodChannel,
     private var session: Session?,
     private val cameraTextureIds: () -> IntArray,
+    private val prepareSessionResume: (Session) -> Unit,
     private val scenePreviewSurface: Surface,
     private val configMap: Map<String, Any>,
     private val onObservedCaptureStateChanged: (RuntimeObservedCaptureState) -> Unit = {},
@@ -247,6 +247,8 @@ internal class SharedCameraManager(
     private var activeCameraCharacteristics: CameraCharacteristics? = null
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
+    private var captureCallbackThread: HandlerThread? = null
+    private var captureCallbackHandler: Handler? = null
     private val finalizationWorkersDelegate = lazy {
         val transientBytes =
             config.resolution.width.toLong() * config.resolution.height.toLong() * 7L
@@ -272,6 +274,14 @@ internal class SharedCameraManager(
     private var sceneViewResumeReconfigurationDisabled = false
     @Volatile
     private var observedCaptureState: RuntimeObservedCaptureState? = null
+    @Volatile
+    private var cleanupRequested = false
+    @Volatile
+    private var captureSessionClosed = false
+    @Volatile
+    private var cameraDeviceClosed = false
+    @Volatile
+    private var cameraCloseLatch = CountDownLatch(1)
 
     private var isInitialized = false
     private val requestGeneration = CaptureRequestGeneration()
@@ -343,7 +353,7 @@ internal class SharedCameraManager(
             ).apply {
                 setOnImageAvailableListener({ reader ->
                     handlePreviewImageAvailable(reader)
-                }, backgroundHandler)
+                }, captureCallbackHandler)
             }
         if (config.rawJpeg) {
             val rawSize = selectRawResolution(characteristics)
@@ -356,7 +366,7 @@ internal class SharedCameraManager(
                 ).apply {
                     setOnImageAvailableListener({ reader ->
                         handleRawImageAvailable(reader)
-                    }, backgroundHandler)
+                    }, captureCallbackHandler)
                 }
         }
         // Keep the live AR session limited to ARCore's own GPU/tracking
@@ -385,6 +395,12 @@ internal class SharedCameraManager(
                     cameraDevice = null
                     startupBarrier.fail("Shared camera failed to open (error=$error)")
                     Log.e("SharedCameraManager", "Camera error: $error")
+                }
+
+                override fun onClosed(camera: CameraDevice) {
+                    cameraDeviceClosed = true
+                    signalCameraCloseBarrierIfComplete()
+                    scheduleBackgroundThreadShutdownWhenClosed()
                 }
             }
         val wrappedDeviceStateCallback =
@@ -628,7 +644,7 @@ internal class SharedCameraManager(
                         try {
                             sharedCamera.setCaptureCallback(
                                 sharedCameraCaptureCallback,
-                                backgroundHandler,
+                                captureCallbackHandler,
                             )
                             recordActiveSharedResolution()
                             startupBarrier.markConfigured()
@@ -651,6 +667,12 @@ internal class SharedCameraManager(
                     override fun onConfigureFailed(session: CameraCaptureSession) {
                         startupBarrier.fail("Failed to configure shared camera capture session")
                         Log.e("SharedCameraManager", "Failed to configure capture session")
+                    }
+
+                    override fun onClosed(session: CameraCaptureSession) {
+                        captureSessionClosed = true
+                        signalCameraCloseBarrierIfComplete()
+                        scheduleBackgroundThreadShutdownWhenClosed()
                     }
                 }
             val wrappedSessionStateCallback =
@@ -818,17 +840,12 @@ internal class SharedCameraManager(
         return textureId
     }
 
-    /** Uses the maintained SceneView fork's explicit shared-camera resume seam. */
+    /** Delegates lifecycle preparation to the SceneView 4.21.2 renderer host. */
     private fun disableSceneViewResumeReconfiguration(arSession: Session) {
         if (sceneViewResumeReconfigurationDisabled) {
             return
         }
-        val sceneViewSession = arSession as? ARSession
-            ?: throw CaptureSessionException(
-                code = "SCENEVIEW_SHARED_CAMERA_SEAM_UNAVAILABLE",
-                message = "Pinned SceneView session does not expose the shared-camera resume seam",
-            )
-        sceneViewSession.invokeOnResumedCallback = false
+        prepareSessionResume(arSession)
         sceneViewResumeReconfigurationDisabled = true
         Log.i(
             "SharedCameraManager",
@@ -844,7 +861,7 @@ internal class SharedCameraManager(
             captureSession.setRepeatingRequest(
                 requestBuilder.build(),
                 sharedCameraCaptureCallback,
-                backgroundHandler,
+                captureCallbackHandler,
             )
             repeatingRequestLifecycle.markRepeatingStarted()
             Log.i("SharedCameraManager", "Shared-camera repeating request started")
@@ -865,7 +882,7 @@ internal class SharedCameraManager(
             captureSession?.setRepeatingRequest(
                 requestBuilder.build(),
                 sharedCameraCaptureCallback,
-                backgroundHandler,
+                captureCallbackHandler,
             )
             Log.i("SharedCameraManager", "Shared-camera repeating request updated from runtime controls")
         } catch (e: Exception) {
@@ -899,7 +916,7 @@ internal class SharedCameraManager(
             captureSession.setRepeatingRequest(
                 requestBuilder.build(),
                 sharedCameraCaptureCallback,
-                backgroundHandler,
+                captureCallbackHandler,
             )
             Log.i("SharedCameraManager", "Shared-camera repeating request resumed")
         } catch (e: Exception) {
@@ -1500,7 +1517,7 @@ internal class SharedCameraManager(
             activeSession.capture(
                 builder.build(),
                 sharedCameraCaptureCallback,
-                backgroundHandler,
+                captureCallbackHandler,
             )
             true
         } catch (error: Exception) {
@@ -1779,6 +1796,7 @@ internal class SharedCameraManager(
     }
 
     fun cleanup() {
+        cleanupRequested = true
         pendingManualCapture?.let { pending ->
             pending.error = CaptureSessionException(
                 code = "CAPTURE_DISPOSED",
@@ -1789,11 +1807,16 @@ internal class SharedCameraManager(
             pendingManualCaptureOwner.release(pending)
             pending.latch.countDown()
         }
-        captureSession?.close()
+        val closingCaptureSession = captureSession
+        captureSessionClosed = closingCaptureSession == null
+        closingCaptureSession?.close()
         captureSession = null
 
-        cameraDevice?.close()
+        val closingCameraDevice = cameraDevice
+        cameraDeviceClosed = closingCameraDevice == null
+        closingCameraDevice?.close()
         cameraDevice = null
+        signalCameraCloseBarrierIfComplete()
 
         previewImageReader?.close()
         previewImageReader = null
@@ -1807,12 +1830,31 @@ internal class SharedCameraManager(
 
         if (finalizationWorkersDelegate.isInitialized()) finalizationWorkers.close()
 
-        stopBackgroundThread()
+        scheduleBackgroundThreadShutdownWhenClosed()
+        // Vendor fallback: close callbacks are expected, but never retain a
+        // handler thread indefinitely if a HAL omits one.
+        backgroundHandler?.postDelayed(::quitBackgroundThreadFromCameraCallback, 3_000L)
 
         observedCaptureState = null
         sceneViewResumeReconfigurationDisabled = false
         isInitialized = false
         Log.i("SharedCameraManager", "Cleanup completed")
+    }
+
+    /**
+     * Waits until Camera2 has delivered both wrapped close callbacks. ARCore's
+     * SharedCamera callbacks still dereference the ARCore Session, so the host
+     * must not destroy that Session before this barrier opens.
+     */
+    fun finishCameraShutdown(timeoutMs: Long) {
+        val callbacksCompleted = cameraCloseLatch.await(timeoutMs, TimeUnit.MILLISECONDS)
+        stopBackgroundThreadsAfterDrain()
+        if (!callbacksCompleted) {
+            Log.i(
+                "SharedCameraManager",
+                "Camera2 close callbacks were not forwarded; callback handlers drained before ARCore disposal",
+            )
+        }
     }
 
     private fun getActiveSharedCameraCharacteristics(): CameraCharacteristics {
@@ -2384,8 +2426,40 @@ internal class SharedCameraManager(
         } ?: config.resolution
 
     private fun startBackgroundThread() {
+        cleanupRequested = false
+        captureSessionClosed = false
+        cameraDeviceClosed = false
+        cameraCloseLatch = CountDownLatch(1)
         backgroundThread = HandlerThread("CameraBackground").apply { start() }
         backgroundHandler = Handler(backgroundThread!!.looper)
+        captureCallbackThread = HandlerThread("CameraCaptureCallbacks").apply { start() }
+        captureCallbackHandler = Handler(captureCallbackThread!!.looper)
+    }
+
+    private fun scheduleBackgroundThreadShutdownWhenClosed() {
+        if (!cleanupRequested || !captureSessionClosed || !cameraDeviceClosed) return
+        // Samsung may enqueue terminal capture callbacks from its executor
+        // immediately after both framework onClosed callbacks. Keep the
+        // handler alive for a bounded drain window before stopping its looper.
+        backgroundHandler?.postDelayed(
+            ::quitBackgroundThreadFromCameraCallback,
+            1_500L,
+        )
+    }
+
+    private fun signalCameraCloseBarrierIfComplete() {
+        if (captureSessionClosed && cameraDeviceClosed) {
+            cameraCloseLatch.countDown()
+        }
+    }
+
+    private fun quitBackgroundThreadFromCameraCallback() {
+        backgroundThread?.quitSafely()
+        backgroundThread = null
+        backgroundHandler = null
+        captureCallbackThread?.quitSafely()
+        captureCallbackThread = null
+        captureCallbackHandler = null
     }
 
     private fun stopBackgroundThread() {
@@ -2397,5 +2471,20 @@ internal class SharedCameraManager(
         } catch (e: InterruptedException) {
             Log.e("SharedCameraManager", "Error stopping background thread", e)
         }
+    }
+
+    private fun stopBackgroundThreadsAfterDrain() {
+        val cameraThread = backgroundThread
+        val captureThread = captureCallbackThread
+        cameraThread?.quitSafely()
+        captureThread?.quitSafely()
+        runCatching { cameraThread?.join() }
+            .onFailure { Log.e("SharedCameraManager", "Error joining camera thread", it) }
+        runCatching { captureThread?.join() }
+            .onFailure { Log.e("SharedCameraManager", "Error joining capture callback thread", it) }
+        backgroundThread = null
+        backgroundHandler = null
+        captureCallbackThread = null
+        captureCallbackHandler = null
     }
 }

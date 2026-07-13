@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -1474,7 +1475,7 @@ void main() {
       _FakeBuildContext(),
     );
 
-    captureManager.dispose();
+    await captureManager.dispose();
 
     await expectLater(
       captureManager.captureImage(),
@@ -1488,6 +1489,39 @@ void main() {
             ),
       ),
     );
+  });
+
+  test('dispose completes only after native shutdown completes', () async {
+    final nativeShutdown = Completer<void>();
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(captureChannel, (call) async {
+      methodCalls.add(call);
+      if (call.method == 'dispose') {
+        await nativeShutdown.future;
+      }
+      return null;
+    });
+    final sessionManager = ARSessionManager(
+      42,
+      _FakeBuildContext(),
+      PlaneDetectionConfig.horizontal,
+    );
+    final captureManager = ARCaptureManager(
+      sessionManager,
+      captureConfig,
+      _FakeBuildContext(),
+    );
+
+    var completed = false;
+    final disposal = captureManager.dispose().then((_) => completed = true);
+    await Future<void>.delayed(Duration.zero);
+
+    expect(methodCalls.map((call) => call.method), contains('dispose'));
+    expect(completed, isFalse);
+
+    nativeShutdown.complete();
+    await disposal;
+    expect(completed, isTrue);
   });
 
   test('surfaces concurrent capture errors from the native channel', () async {
@@ -2013,6 +2047,80 @@ void main() {
     expect(saved.parameters.autoExposureEnabled, isFalse);
     expect(saved.parameters.focusMode, FocusMode.fixed);
     expect(saved.parameters.whiteBalanceMode, WhiteBalanceMode.shade);
+  });
+
+  test('profile creation, export, and deletion preserve the public API',
+      () async {
+    final sessionManager = ARSessionManager(
+      42,
+      _FakeBuildContext(),
+      PlaneDetectionConfig.horizontal,
+    );
+    final captureManager = ARCaptureManager(
+      sessionManager,
+      captureConfig,
+      _FakeBuildContext(),
+    );
+
+    final created = await captureManager.createProfileFromCurrentSettings(
+      'Current',
+      description: 'Live state',
+    );
+    expect(created.name, 'Current');
+    expect(created.description, 'Live state');
+    expect(created.parameters.isoValue, 320);
+    expect(created.parameters.focusDistance, 0.4);
+    expect(created.parameters.whiteBalanceMode, WhiteBalanceMode.daylight);
+    expect(created.parameters.flashMode, FlashMode.auto);
+
+    expect(await captureManager.importProfile(created.toJsonString()), isTrue);
+    final exported = await captureManager.exportProfile('Current');
+    expect(exported, isNotNull);
+    expect(
+      CameraProfile.fromMap(
+        Map<String, dynamic>.from(jsonDecode(exported!) as Map),
+      ).name,
+      'Current',
+    );
+    expect(await captureManager.deleteProfile('Current'), isTrue);
+    expect(await captureManager.getSavedProfiles(), isEmpty);
+
+    final builtIn = await captureManager.exportProfile('Landscape');
+    expect(
+      CameraProfile.fromMap(
+        Map<String, dynamic>.from(jsonDecode(builtIn!) as Map),
+      ).isBuiltIn,
+      isTrue,
+    );
+    expect(await captureManager.exportProfile('missing'), isNull);
+  });
+
+  test('deprecated runtime resolution APIs fail with migration guidance',
+      () async {
+    final sessionManager = ARSessionManager(
+      42,
+      _FakeBuildContext(),
+      PlaneDetectionConfig.horizontal,
+    );
+    final captureManager = ARCaptureManager(
+      sessionManager,
+      captureConfig,
+      _FakeBuildContext(),
+    );
+    const resolution = CameraResolution(width: 1920, height: 1080);
+
+    await expectLater(
+      captureManager.setResolution(resolution),
+      throwsA(isA<UnsupportedError>()),
+    );
+    await expectLater(
+      captureManager.getSupportedResolutions(),
+      throwsA(isA<UnsupportedError>()),
+    );
+    await expectLater(
+      captureManager.isResolutionSupported(resolution),
+      throwsA(isA<UnsupportedError>()),
+    );
   });
 
   test(

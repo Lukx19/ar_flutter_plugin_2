@@ -14,8 +14,8 @@ import com.google.ar.core.TrackingState
 import com.google.android.filament.Stream
 import com.google.ar.core.exceptions.NotYetAvailableException
 import com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraCapabilityQuerier
-import io.github.sceneview.ar.ARSceneView
 import com.google.ar.core.Frame
+import com.uhg0.ar_flutter_plugin_2.sceneview.SceneViewCaptureHost
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -26,7 +26,7 @@ internal class CaptureSessionException(
 ) : IllegalStateException(message)
 
 internal class ArCaptureSession(
-    private val sceneView: ARSceneView,
+    private val sceneHost: SceneViewCaptureHost,
     private val capabilityQuerier: CameraCapabilityQuerier,
     private val captureChannel: MethodChannel,
     private val onCapacityChanged: (Map<String, Any?>) -> Unit = {},
@@ -113,8 +113,8 @@ internal class ArCaptureSession(
         if (highResCaptureEnabled) {
             SharedCameraInteropPlanner
                 .checkAvailability(
-                    hasSession = sceneView.session != null,
-                    hasSharedCamera = sceneView.session?.sharedCamera != null,
+                    hasSession = sceneHost.activeSession != null,
+                    hasSharedCamera = sceneHost.activeSession?.sharedCamera != null,
                 )?.let { failure ->
                     throw CaptureSessionException(
                         code = failure.code,
@@ -127,19 +127,18 @@ internal class ArCaptureSession(
             val imageCacheManager =
                 ImageCacheManager(
                     config = sharedConfig,
-                    context = sceneView.context,
+                    context = sceneHost.context,
                     onCapacityChanged = onCapacityChanged,
                 )
             sharedImageCacheManager = imageCacheManager
             val scenePreviewSurface = createSharedCameraPreviewSurface()
             val manager =
                 SharedCameraManager(
-                    context = sceneView.context,
+                    context = sceneHost.context,
                     methodChannel = captureChannel,
-                    session = sceneView.session,
-                    cameraTextureIds = {
-                        sceneView.cameraStream?.cameraTextureIds ?: intArrayOf()
-                    },
+                    session = sceneHost.activeSession,
+                    cameraTextureIds = { sceneHost.cameraTextureIds },
+                    prepareSessionResume = sceneHost::prepareSharedCameraResume,
                     scenePreviewSurface = scenePreviewSurface,
                     configMap = typedConfigMap,
                     onObservedCaptureStateChanged = {
@@ -264,7 +263,7 @@ internal class ArCaptureSession(
             }
 
             val qualityPolicy = qualityPolicyMap?.let(::buildQualityPolicyMap)
-            val frame = sceneView.session?.update() ?: throw CaptureSessionException(
+            val frame = sceneHost.frameForCapture() ?: throw CaptureSessionException(
                 code = "CAPTURE_NOT_INITIALIZED",
                 message = "No AR frame is available for capture",
             )
@@ -390,7 +389,7 @@ internal class ArCaptureSession(
     fun getPerformanceSnapshot(): Map<String, Any?> {
         val runtime = Runtime.getRuntime()
         val batteryManager =
-            sceneView.context.getSystemService(BatteryManager::class.java)
+            sceneHost.context.getSystemService(BatteryManager::class.java)
         val batteryPercent =
             batteryManager
                 ?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
@@ -621,7 +620,10 @@ internal class ArCaptureSession(
     }
 
     fun buildPoseUpdate(frame: Frame): Map<String, Any?>? {
-        requireInitialized()
+        // AR frames also flow when high-resolution capture is disabled, and a
+        // final Compose frame can race deterministic disposal. In both cases
+        // there is no capture pose stream to update.
+        if (config == null) return null
         poseDataExtractor.onFrame(frame)
 
         val sensorTimestampNs = frame.timestamp
@@ -651,17 +653,13 @@ internal class ArCaptureSession(
 
     fun dispose() {
         byteCache.dispose()
-        sharedCameraManager?.cleanup()
+        sharedCameraManager?.let { manager ->
+            manager.cleanup()
+            manager.finishCameraShutdown(1_000L)
+        }
         sharedCameraManager = null
         sharedCameraFilamentStream?.let { stream ->
-            runCatching { sceneView.engine.destroyStream(stream) }
-                .onFailure { error ->
-                    Log.w(
-                        "ArCaptureSession",
-                        "SceneView engine was already destroyed while releasing preview stream",
-                        error,
-                    )
-                }
+            sceneHost.destroyCaptureStream(stream)
         }
         sharedCameraFilamentStream = null
         sharedCameraPreviewSurface?.release()
@@ -676,7 +674,7 @@ internal class ArCaptureSession(
 
     private fun createSharedCameraPreviewSurface(): Surface {
         sharedCameraPreviewSurface?.let { return it }
-        val textureSize = sceneView.session?.cameraConfig?.textureSize
+        val textureSize = sceneHost.activeSession?.cameraConfig?.textureSize
             ?: Size(1920, 1080)
         val surfaceTexture = SurfaceTexture(0).apply {
             try {
@@ -686,17 +684,17 @@ internal class ArCaptureSession(
             }
             setDefaultBufferSize(textureSize.width, textureSize.height)
         }
-        sharedCameraFilamentStream?.let(sceneView.engine::destroyStream)
+        sharedCameraFilamentStream?.let(sceneHost.engine::destroyStream)
         val stream =
             Stream.Builder()
                 .stream(surfaceTexture)
-                .build(sceneView.engine)
-        val cameraTexture = sceneView.cameraStream?.cameraTexture
+                .build(sceneHost.engine)
+        val cameraTexture = sceneHost.cameraTexture
             ?: throw CaptureSessionException(
                 code = "CAMERA_TEXTURE_UNAVAILABLE",
                 message = "SceneView camera texture is not ready",
             )
-        cameraTexture.setExternalStream(sceneView.engine, stream)
+        cameraTexture.setExternalStream(sceneHost.engine, stream)
         val surface = Surface(surfaceTexture)
         sharedCameraFilamentStream = stream
         sharedCameraPreviewSurfaceTexture = surfaceTexture

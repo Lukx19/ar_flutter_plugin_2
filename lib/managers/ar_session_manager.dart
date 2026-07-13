@@ -100,10 +100,10 @@ class ARSessionManager {
   String? _lastError;
 
   /// Receives hit results from user taps with tracked planes or feature points
-  late ARHitResultHandler onPlaneOrPointTap;
+  ARHitResultHandler? onPlaneOrPointTap;
 
   /// Receives total number of Planes when a plane is detected and added to the view
-  late ARPlaneResultHandler onPlaneDetected;
+  ARPlaneResultHandler? onPlaneDetected;
 
   /// Callback that is triggered once error is triggered
   ErrorHandler? onError;
@@ -338,7 +338,7 @@ class ARSessionManager {
         if (debug) {
           print('Disposing capture manager...');
         }
-        _captureManager!.dispose();
+        await _captureManager!.dispose();
         _captureManager = null;
       }
 
@@ -692,13 +692,13 @@ class ARSessionManager {
             final hitTestResults = serializedHitTestResults.map((e) {
               return ARHitTestResult.fromJson(e);
             }).toList();
-            onPlaneOrPointTap(hitTestResults);
+            onPlaneOrPointTap!(hitTestResults);
           }
           break;
         case 'onPlaneDetected':
           if (onPlaneDetected != null) {
             final planeCountResult = call.arguments as int;
-            onPlaneDetected(planeCountResult);
+            onPlaneDetected!(planeCountResult);
           }
           break;
         case 'dispose':
@@ -746,7 +746,7 @@ class ARSessionManager {
   Future<void> disposeLegacy() async {
     try {
       // Dispose capture manager first
-      _captureManager?.dispose();
+      await _captureManager?.dispose();
 
       await _channel.invokeMethod<void>("dispose");
     } catch (e) {

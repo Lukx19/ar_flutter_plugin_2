@@ -1,4 +1,0 @@
-[submodule "third_party/sceneview-android"]
-	path = third_party/sceneview-android
-	url = https://github.com/Lukx19/sceneview.git
-	branch = capture3d-v2.2.1

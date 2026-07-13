@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import '../models/camera_resolution.dart';
 import '../models/ar_capture_config.dart';
@@ -15,10 +16,14 @@ class ARCameraCapabilities {
       MethodChannel('ar_flutter_plugin_2/camera_capabilities');
 
   /// Platform availability check - currently supports Android only
-  bool get isSupported => Platform.isAndroid;
+  bool get isSupported => _supportedOverride ?? Platform.isAndroid;
+
+  final bool? _supportedOverride;
 
   /// Initialize capability querier
-  ARCameraCapabilities();
+  ARCameraCapabilities({
+    @visibleForTesting bool? supportedOverride,
+  }) : _supportedOverride = supportedOverride;
 
   /// Queries ARCore's authoritative asynchronous availability state.
   Future<ARCoreAvailability> getARCoreAvailability() async {
