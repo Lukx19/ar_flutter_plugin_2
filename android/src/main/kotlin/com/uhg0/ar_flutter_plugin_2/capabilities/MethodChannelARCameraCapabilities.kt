@@ -1,6 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.capabilities
 
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import com.google.ar.core.ArCoreApk
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
@@ -56,6 +57,10 @@ class MethodChannelARCameraCapabilities(private val context: Context) : MethodCa
                     )
                     result.success(null)
                 }
+                "saveSharedCameraSupported" -> {
+                    capabilityQuerier.saveSharedCameraSupported()
+                    result.success(null)
+                }
                 "saveRawJpegProbeResult" -> {
                     capabilityQuerier.saveRawJpegProbeResult(
                         call.argument<Boolean>("supported") ?: false,
@@ -70,6 +75,20 @@ class MethodChannelARCameraCapabilities(private val context: Context) : MethodCa
                         call.argument<String>("reason"),
                     )
                     result.success(null)
+                }
+                "resetCapabilityProfileForTesting" -> {
+                    val isDebuggable =
+                        context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+                    if (!isDebuggable) {
+                        result.error(
+                            "DEBUG_ONLY",
+                            "Capability profile reset is available only in debuggable builds",
+                            null,
+                        )
+                    } else {
+                        capabilityQuerier.resetCapabilityProfileForTesting()
+                        result.success(null)
+                    }
                 }
                 else -> result.notImplemented()
             }
@@ -103,7 +122,7 @@ class MethodChannelARCameraCapabilities(private val context: Context) : MethodCa
 
     private fun getSupportedFormats(result: MethodChannel.Result) {
         val formats = capabilityQuerier.getSupportedFormats()
-        val formatStrings = formats.map { it.name }
+        val formatStrings = formats.map { it.name.lowercase() }
         result.success(formatStrings)
     }
 

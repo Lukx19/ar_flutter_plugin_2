@@ -42,7 +42,7 @@ class PoseDataExtractorTest {
         assertNull(
             extractor.resolvePose(
                 PoseDataExtractor.CaptureTiming(
-                    sensorTimestampNs = 10_000_000L,
+                    sensorTimestampNs = 300_000_000L,
                     exposureTimeNs = 0,
                 ),
                 waitForFuturePoseMs = 0,
@@ -92,7 +92,66 @@ class PoseDataExtractorTest {
     }
 
     @Test
-    fun `does not use a one sided nearest sample`() {
+    fun `falls back to bounded monotonic observation correlation across clock domains`() {
+        val extractor = PoseDataExtractor()
+        extractor.addSample(
+            sample(
+                timestampNs = 5_000_000_000L,
+                observedTimestampNs = 1_000_000_000L,
+                positionX = 0f,
+            ),
+        )
+        extractor.addSample(
+            sample(
+                timestampNs = 5_040_000_000L,
+                observedTimestampNs = 1_040_000_000L,
+                positionX = 4f,
+            ),
+        )
+
+        val resolved =
+            extractor.resolvePose(
+                PoseDataExtractor.CaptureTiming(
+                    sensorTimestampNs = 90_000_000_000L,
+                    exposureTimeNs = 10_000_000L,
+                    observedTimestampNs = 1_015_000_000L,
+                ),
+                waitForFuturePoseMs = 0,
+            )
+
+        assertNotNull(resolved)
+        assertEquals("observedMonotonicInterpolated", resolved!!.poseAlignment)
+        assertEquals(2.0f, resolved.pose.position[0], 0.0001f)
+        assertEquals(90_005_000_000L, resolved.sensorTimestampNs)
+    }
+
+    @Test
+    fun `monotonic observation correlation accepts a bounded one sided nearest pose`() {
+        val extractor = PoseDataExtractor()
+        extractor.addSample(
+            sample(
+                timestampNs = 5_000_000_000L,
+                observedTimestampNs = 1_000_000_000L,
+            ),
+        )
+
+        val resolved =
+            extractor.resolvePose(
+                PoseDataExtractor.CaptureTiming(
+                    sensorTimestampNs = 90_000_000_000L,
+                    exposureTimeNs = 0L,
+                    observedTimestampNs = 1_020_000_000L,
+                ),
+                waitForFuturePoseMs = 0,
+            )
+
+        assertNotNull(resolved)
+        assertEquals("observedMonotonicNearest", resolved!!.poseAlignment)
+        assertEquals(20_000_000L, resolved.poseTimeErrorNs)
+    }
+
+    @Test
+    fun `uses a bounded nearest sample when no interpolation bracket exists`() {
         val extractor = PoseDataExtractor()
         extractor.addSample(sample(timestampNs = 1_000_000_000L, positionX = 3f))
 
@@ -105,7 +164,9 @@ class PoseDataExtractorTest {
                 waitForFuturePoseMs = 0,
             )
 
-        assertNull(resolved)
+        assertNotNull(resolved)
+        assertEquals("nearest", resolved!!.poseAlignment)
+        assertEquals(20_000_000L, resolved.poseTimeErrorNs)
     }
 
     @Test
@@ -116,7 +177,7 @@ class PoseDataExtractorTest {
         }
         val rejected = PoseDataExtractor().apply {
             addSample(sample(timestampNs = 1_000_000_000L, positionX = 0f))
-            addSample(sample(timestampNs = 1_300_000_001L, positionX = 10f))
+            addSample(sample(timestampNs = 1_300_000_002L, positionX = 10f))
         }
 
         assertNotNull(
@@ -131,7 +192,7 @@ class PoseDataExtractorTest {
         assertNull(
             rejected.resolvePose(
                 PoseDataExtractor.CaptureTiming(
-                    sensorTimestampNs = 1_150_000_000L,
+                    sensorTimestampNs = 1_150_000_001L,
                     exposureTimeNs = 0L,
                 ),
                 waitForFuturePoseMs = 0,
@@ -147,7 +208,7 @@ class PoseDataExtractorTest {
         val resolved =
             extractor.resolvePose(
                 PoseDataExtractor.CaptureTiming(
-                    sensorTimestampNs = 1_050_000_001L,
+                    sensorTimestampNs = 1_150_000_001L,
                     exposureTimeNs = 0,
                 ),
                 waitForFuturePoseMs = 0,
@@ -240,6 +301,7 @@ class PoseDataExtractorTest {
 
     private fun sample(
         timestampNs: Long,
+        observedTimestampNs: Long = timestampNs,
         positionX: Float = 0f,
         isTracking: Boolean = true,
         transform: FloatArray? = null,
@@ -261,6 +323,7 @@ class PoseDataExtractorTest {
             isTracking = isTracking,
             confidence = if (isTracking) 1.0f else 0.0f,
             trackingState = trackingState,
+            observedTimestampNs = observedTimestampNs,
         )
     }
 }

@@ -9,7 +9,7 @@ import '../datatypes/image_format.dart';
 /// Provides information about available camera capabilities for AR capture
 /// Can be used independently throughout the application for capability discovery
 class ARCameraCapabilities {
-  static const int capabilityPresetVersion = 6;
+  static const int capabilityPresetVersion = 10;
 
   /// Platform channel for camera capability queries
   static const MethodChannel _channel =
@@ -58,6 +58,13 @@ class ARCameraCapabilities {
     );
   }
 
+  /// Persists base shared-camera support after a live capture has completed
+  /// with a pose correlated to its Camera2 sensor timestamp.
+  Future<void> saveSharedCameraSupported() async {
+    if (!isSupported) return;
+    await _channel.invokeMethod<void>('saveSharedCameraSupported');
+  }
+
   Future<void> saveRawJpegProbeResult({
     required bool supported,
     String? reason,
@@ -80,6 +87,16 @@ class ARCameraCapabilities {
       'supported': supported,
       'reason': reason,
     });
+  }
+
+  /// Clears only the native camera capability preset in debuggable builds.
+  ///
+  /// This is intended for physical-device integration tests. Capture history,
+  /// app settings, and persisted images are not modified.
+  @visibleForTesting
+  Future<void> resetCapabilityProfileForTesting() async {
+    if (!isSupported) return;
+    await _channel.invokeMethod<void>('resetCapabilityProfileForTesting');
   }
 
   /// Get list of all supported camera resolutions
@@ -462,6 +479,9 @@ class DeviceCameraCapabilityProfile {
     required this.rawCapture,
     required this.manualSensorControls,
     required this.flash,
+    required this.primaryPhysicalCameraIds,
+    required this.logicalMultiCamera,
+    required this.concurrentCameraIdSets,
     required this.rearConcurrentCameraIds,
     required this.cached,
   });
@@ -485,6 +505,9 @@ class DeviceCameraCapabilityProfile {
         rawCapture = false,
         manualSensorControls = false,
         flash = false,
+        primaryPhysicalCameraIds = const [],
+        logicalMultiCamera = false,
+        concurrentCameraIdSets = const [],
         rearConcurrentCameraIds = const [],
         cached = false;
 
@@ -521,6 +544,13 @@ class DeviceCameraCapabilityProfile {
       rawCapture: map['rawCapture'] as bool? ?? false,
       manualSensorControls: map['manualSensorControls'] as bool? ?? false,
       flash: map['flash'] as bool? ?? false,
+      primaryPhysicalCameraIds: List<String>.from(
+          map['primaryPhysicalCameraIds'] as List? ?? const []),
+      logicalMultiCamera: map['logicalMultiCamera'] as bool? ?? false,
+      concurrentCameraIdSets:
+          (map['concurrentCameraIdSets'] as List<dynamic>? ?? const [])
+              .map((value) => List<String>.from(value as List))
+              .toList(growable: false),
       rearConcurrentCameraIds: List<String>.from(
           map['rearConcurrentCameraIds'] as List? ?? const []),
       cached: map['cached'] as bool? ?? false,
@@ -545,6 +575,9 @@ class DeviceCameraCapabilityProfile {
   final bool rawCapture;
   final bool manualSensorControls;
   final bool flash;
+  final List<String> primaryPhysicalCameraIds;
+  final bool logicalMultiCamera;
+  final List<List<String>> concurrentCameraIdSets;
   final List<String> rearConcurrentCameraIds;
   final bool cached;
 

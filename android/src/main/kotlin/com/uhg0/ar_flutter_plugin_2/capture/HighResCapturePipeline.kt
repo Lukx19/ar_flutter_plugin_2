@@ -61,6 +61,7 @@ internal class HighResCapturePipeline(
                         sensorTimestampNs = sharedResult.sensorTimestampNs,
                         exposureTimeNs = sharedResult.exposureTimeNs,
                         rollingShutterSkewNs = sharedResult.rollingShutterSkewNs,
+                        observedTimestampNs = sharedResult.observedTimestampNs,
                     ),
                 )
             }

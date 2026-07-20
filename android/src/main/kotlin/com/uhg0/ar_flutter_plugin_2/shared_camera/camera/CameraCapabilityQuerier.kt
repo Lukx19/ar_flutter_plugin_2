@@ -5,6 +5,7 @@ import android.graphics.Rect
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.os.Build
+import android.util.Log
 import android.util.Size
 import kotlin.math.atan
 import kotlin.math.abs
@@ -18,7 +19,8 @@ enum class ImageFormat {
 class CameraCapabilityQuerier(private val context: Context) {
 
     companion object {
-        const val CAPABILITY_PRESET_VERSION = 6
+        const val CAPABILITY_PRESET_VERSION = 10
+        private const val TAG = "CameraCapabilityQuerier"
     }
 
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -37,22 +39,28 @@ class CameraCapabilityQuerier(private val context: Context) {
         val characteristics = getCameraCharacteristics(primaryId)
         val capabilities = characteristics
             .get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
+        val primaryPhysicalCameraIds = characteristics.physicalCameraIds.sorted()
+        val concurrentCameraIdSets =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                cameraManager.concurrentCameraIds
+            } else {
+                emptySet()
+            }
+        val lensFacingByCameraId =
+            cameraManager.cameraIdList.associateWith { cameraId ->
+                getCameraCharacteristics(cameraId).get(CameraCharacteristics.LENS_FACING)
+            }
         val rearConcurrentIds =
             if (cacheHit) {
                 preferences.getString("profile_rear_concurrent_ids", "")
                     .orEmpty().split(',').filter(String::isNotBlank)
             } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                cameraManager.concurrentCameraIds
-                    .filter { primaryId in it }
-                    .flatten()
-                    .filter { cameraId ->
-                        cameraId != primaryId &&
-                            getCameraCharacteristics(cameraId)
-                                .get(CameraCharacteristics.LENS_FACING) ==
-                            CameraCharacteristics.LENS_FACING_BACK
-                    }
-                    .distinct()
-                    .sorted()
+                CameraCapabilityProfileResolver.rearConcurrentCameraIds(
+                    primaryId = primaryId,
+                    concurrentCameraIdSets = concurrentCameraIdSets,
+                    lensFacingByCameraId = lensFacingByCameraId,
+                    backFacingValue = CameraCharacteristics.LENS_FACING_BACK,
+                )
             } else {
                 emptyList()
             }
@@ -64,17 +72,41 @@ class CameraCapabilityQuerier(private val context: Context) {
             } else {
                 "pending"
             }
-        val rawCapture = cacheHit && preferences.contains("profile_raw_capture")
-            .let { cached -> if (cached) preferences.getBoolean("profile_raw_capture", false)
-                else capabilities.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW) }
-        val manualControls = cacheHit && preferences.contains("profile_manual_controls")
-            .let { cached -> if (cached) preferences.getBoolean("profile_manual_controls", false)
-                else capabilities.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) }
+        val rawCapture =
+            CameraCapabilityProfileResolver.resolveCachedOrDetectedBoolean(
+                cacheHit = cacheHit,
+                cachedValuePresent = preferences.contains("profile_raw_capture"),
+                cachedValue = preferences.getBoolean("profile_raw_capture", false),
+                detectedValue =
+                    capabilities.contains(
+                        CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW,
+                    ),
+            )
+        val manualControls =
+            CameraCapabilityProfileResolver.resolveCachedOrDetectedBoolean(
+                cacheHit = cacheHit,
+                cachedValuePresent = preferences.contains("profile_manual_controls"),
+                cachedValue = preferences.getBoolean("profile_manual_controls", false),
+                detectedValue =
+                    capabilities.contains(
+                        CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR,
+                    ),
+            )
         val flash = if (cacheHit && preferences.contains("profile_flash")) {
             preferences.getBoolean("profile_flash", false)
         } else {
             characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
         }
+
+        Log.i(
+            TAG,
+            "Capability topology primary=$primaryId cacheHit=$cacheHit " +
+                "cameraIds=${cameraManager.cameraIdList.toList()} " +
+                "lensFacing=$lensFacingByCameraId " +
+                "physicalIds=$primaryPhysicalCameraIds " +
+                "concurrentSets=${concurrentCameraIdSets.map { it.sorted() }.sortedBy { it.joinToString() }} " +
+                "rearConcurrentIds=$rearConcurrentIds raw=$rawCapture manual=$manualControls",
+        )
 
         return mapOf(
             "fingerprint" to fingerprint,
@@ -108,6 +140,15 @@ class CameraCapabilityQuerier(private val context: Context) {
             "rawCapture" to rawCapture,
             "manualSensorControls" to manualControls,
             "flash" to flash,
+            "primaryPhysicalCameraIds" to primaryPhysicalCameraIds,
+            "logicalMultiCamera" to
+                capabilities.contains(
+                    CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA,
+                ),
+            "concurrentCameraIdSets" to
+                concurrentCameraIdSets
+                    .map { it.sorted() }
+                    .sortedBy { it.joinToString() },
             // These are rear cameras advertised by Camera2 in a concurrent set
             // containing the primary rear camera. No manufacturer allowlist is used.
             "rearConcurrentCameraIds" to rearConcurrentIds,
@@ -331,6 +372,13 @@ class CameraCapabilityQuerier(private val context: Context) {
         capabilityCache.clear()
     }
 
+    fun resetCapabilityProfileForTesting() {
+        check(preferences.edit().clear().commit()) {
+            "Unable to clear the camera capability profile"
+        }
+        clearCache()
+    }
+
     private fun extractUnifiedIntrinsics(characteristics: CameraCharacteristics): Map<String, Any> {
         val baseIntrinsics = extractBaseIntrinsics(characteristics)
         return CameraIntrinsicsDeriver.derive(
@@ -400,6 +448,15 @@ class CameraCapabilityQuerier(private val context: Context) {
                 .joinToString(",") { "${it.width}x${it.height}" }
         preferences.edit()
             .putString(validatedResolutionKey(cameraId), encoded)
+            .apply()
+    }
+
+    /** Marks the base shared-camera path supported only after a live capture
+     * has completed with an ARCore-correlated pose. Surface validation alone
+     * is necessary but is not sufficient capability evidence.
+     */
+    fun saveSharedCameraSupported() {
+        preferences.edit()
             .putString("profile_shared_camera_status", "supported")
             .remove("profile_shared_camera_error")
             .apply()
@@ -437,7 +494,7 @@ class CameraCapabilityQuerier(private val context: Context) {
     fun saveSupportedRawOnlyResolutions(resolutions: List<CameraResolution>) {
         preferences.edit().putString(
             rawOnlyResolutionKey(getDefaultCameraId()), encodeResolutions(resolutions),
-        ).putString("profile_raw_only_status", "supported").remove("profile_raw_only_error").apply()
+        ).apply()
     }
 
     fun getSupportedPngResolutions() =
@@ -446,8 +503,7 @@ class CameraCapabilityQuerier(private val context: Context) {
     fun saveSupportedPngResolutions(resolutions: List<CameraResolution>) {
         preferences.edit().putString(
             pngResolutionKey(getDefaultCameraId()), encodeResolutions(resolutions),
-        ).putString("profile_png_status", if (resolutions.isEmpty()) "unsupported" else "supported")
-            .remove("profile_png_error").apply()
+        ).apply()
     }
 
     fun saveFormatProbeResult(format: String, supported: Boolean, reason: String?) {

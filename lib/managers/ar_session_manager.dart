@@ -14,6 +14,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:vector_math/vector_math_64.dart';
 import 'ar_capture_manager.dart';
+import 'ar_point_cloud_manager.dart';
 
 // Type definitions to enforce a consistent use of the API
 typedef ARHitResultHandler = void Function(List<ARHitTestResult> hits);
@@ -86,6 +87,9 @@ class ARSessionManager {
   /// Capture manager - created at construction time if config provided
   ARCaptureManager? _captureManager;
 
+  /// Per-view point-cloud transport. Native acquisition starts only after init.
+  late final ARPointCloudManager pointCloudManager;
+
   /// Current session state
   ARSessionState _sessionState = ARSessionState.notInitialized;
 
@@ -115,6 +119,7 @@ class ARSessionManager {
         _channelId = id {
     _channel = MethodChannel('arsession_$id');
     _channel.setMethodCallHandler(_platformCallHandler);
+    pointCloudManager = ARPointCloudManager(id);
 
     try {
       // Validate configurations before initialization
@@ -155,6 +160,7 @@ class ARSessionManager {
         _channelId = id ?? DateTime.now().millisecondsSinceEpoch {
     _channel = MethodChannel('arsession_$_channelId');
     _channel.setMethodCallHandler(_platformCallHandler);
+    pointCloudManager = ARPointCloudManager(_channelId);
 
     if (debug) {
       print("ARSessionManager created with enhanced configuration");
@@ -326,36 +332,46 @@ class ARSessionManager {
       return;
     }
 
+    if (debug) {
+      print('Disposing AR session...');
+    }
+    _setState(ARSessionState.disposed);
+    Object? firstError;
+
+    final captureManager = _captureManager;
+    _captureManager = null;
+    if (captureManager != null) {
+      try {
+        await captureManager.dispose();
+      } catch (error) {
+        firstError ??= error;
+      }
+    }
     try {
-      if (debug) {
-        print('Disposing AR session...');
-      }
-
-      _setState(ARSessionState.disposed);
-
-      // Dispose capture manager first
-      if (_captureManager != null) {
-        if (debug) {
-          print('Disposing capture manager...');
-        }
-        await _captureManager!.dispose();
-        _captureManager = null;
-      }
-
-      // Dispose platform AR session
-      await _channel.invokeMethod<void>("dispose");
-
-      // Close state stream
+      await pointCloudManager.dispose();
+    } catch (error) {
+      firstError ??= error;
+    }
+    try {
+      await _channel.invokeMethod<void>('dispose');
+    } catch (error) {
+      firstError ??= error;
+    } finally {
+      _channel.setMethodCallHandler(null);
+    }
+    try {
       await _stateController.close();
+    } catch (error) {
+      firstError ??= error;
+    }
 
+    if (firstError != null) {
+      _lastError = firstError.toString();
       if (debug) {
-        print('AR session disposed successfully');
+        print('Error during disposal: $firstError');
       }
-    } catch (e) {
-      _lastError = e.toString();
-      if (debug) {
-        print('Error during disposal: $e');
-      }
+    } else if (debug) {
+      print('AR session disposed successfully');
     }
   }
 
@@ -747,6 +763,11 @@ class ARSessionManager {
     try {
       // Dispose capture manager first
       await _captureManager?.dispose();
+
+      // Legacy view recreation must release the per-view point-cloud handler
+      // and streams as well; the native session channel is not their owner on
+      // iOS/older hosts.
+      await pointCloudManager.dispose();
 
       await _channel.invokeMethod<void>("dispose");
     } catch (e) {

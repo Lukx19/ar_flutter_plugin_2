@@ -116,6 +116,7 @@ data class SharedCameraCaptureResult(
     val sensorTimestampNs: Long,
     val exposureTimeNs: Long,
     val rollingShutterSkewNs: Long,
+    val observedTimestampNs: Long? = null,
     val intrinsics: Map<String, Any>?,
     val rawDngEncoder: (() -> ByteArray)? = null,
     val closeRawImage: (() -> Unit)? = null,
@@ -177,8 +178,26 @@ internal class SharedCameraManager(
     private val repeatingRequestLifecycle = SharedCameraRepeatingRequestLifecycle()
     private val rawJpegCaptureCorrelator =
         RawJpegCaptureCorrelator<Image, TotalCaptureResult>(::closeTrackedImage)
+    private val captureObservationLock = Any()
+    private val captureObservedTimestampsNs = linkedMapOf<Long, Long>()
     private val sharedCameraCaptureCallback =
         object : CameraCaptureSession.CaptureCallback() {
+            override fun onCaptureStarted(
+                session: CameraCaptureSession,
+                request: CaptureRequest,
+                timestamp: Long,
+                frameNumber: Long,
+            ) {
+                val pending = pendingManualCapture ?: return
+                val requestTag = request.tag as? ManualCaptureTag ?: return
+                if (requestTag.generation != pending.generation ||
+                    !requestGeneration.isCurrent(requestTag.generation)
+                ) {
+                    return
+                }
+                recordCaptureObservation(timestamp, System.nanoTime())
+            }
+
             override fun onCaptureCompleted(
                 session: CameraCaptureSession,
                 request: CaptureRequest,
@@ -205,6 +224,10 @@ internal class SharedCameraManager(
                     onObservedCaptureStateChanged,
                 )
                 val sensorTimestampNs = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return
+                val observedTimestampNs = captureObservation(sensorTimestampNs)
+                    ?: System.nanoTime().also {
+                        recordCaptureObservation(sensorTimestampNs, it)
+                    }
                 if (config.rawJpeg) {
                     handleRawJpegCaptureResult(sensorTimestampNs, result)
                     return
@@ -224,6 +247,7 @@ internal class SharedCameraManager(
                                 result.get(CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW) ?: 0L,
                             cropRegion = result.get(CaptureResult.SCALER_CROP_REGION),
                             receivedAtMs = System.currentTimeMillis(),
+                            observedTimestampNs = observedTimestampNs,
                         ),
                     )?.let(::handleCorrelatedProcessedFrame)
                     return
@@ -235,6 +259,7 @@ internal class SharedCameraManager(
                     rollingShutterSkewNs =
                         result.get(CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW) ?: 0L,
                     cropRegion = result.get(CaptureResult.SCALER_CROP_REGION),
+                    observedTimestampNs = observedTimestampNs,
                 )?.let(::handleCorrelatedStillCapture)
             }
         }
@@ -288,6 +313,20 @@ internal class SharedCameraManager(
     private val pendingManualCaptureOwner = CaptureAttemptOwner<PendingManualCapture>()
     private val pendingManualCapture: PendingManualCapture?
         get() = pendingManualCaptureOwner.get()
+
+    private fun recordCaptureObservation(sensorTimestampNs: Long, observedTimestampNs: Long) {
+        synchronized(captureObservationLock) {
+            captureObservedTimestampsNs[sensorTimestampNs] = observedTimestampNs
+            while (captureObservedTimestampsNs.size > 32) {
+                captureObservedTimestampsNs.remove(captureObservedTimestampsNs.entries.first().key)
+            }
+        }
+    }
+
+    private fun captureObservation(sensorTimestampNs: Long): Long? =
+        synchronized(captureObservationLock) {
+            captureObservedTimestampsNs[sensorTimestampNs]
+        }
 
     private data class PendingManualCapture(
         val latch: CountDownLatch,
@@ -550,11 +589,6 @@ internal class SharedCameraManager(
                         characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)?.let {
                             it.lower..it.upper
                         },
-                    // The Android emulator VirtualScene camera reports UNKNOWN
-                    // although ARCore still supplies correlated Camera2 results.
-                    // Hardware remains strictly realtime-only.
-                    allowNonRealtimeTimestampSource =
-                        SharedCameraEmulatorCompatibility.isRunningOnEmulator(),
                 ),
             requestedWidth = config.resolution.width,
             requestedHeight = config.resolution.height,
@@ -705,7 +739,6 @@ internal class SharedCameraManager(
             capabilityQuerier.saveSupportedRawJpegResolutions(
                 capabilityQuerier.getSupportedRawJpegResolutions() + active,
             )
-            capabilityQuerier.saveRawJpegProbeResult(true, null)
         } else {
             capabilityQuerier.saveSupportedSharedCameraResolutions(
                 capabilityQuerier.getSupportedSharedCameraResolutions() + active,
@@ -1086,6 +1119,7 @@ internal class SharedCameraManager(
                     exposureTimeNs = totalResult.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L,
                     rollingShutterSkewNs =
                         totalResult.get(CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW) ?: 0L,
+                    observedTimestampNs = captureObservation(sensorTimestampNs),
                     intrinsics =
                         capabilityQuerier.getCameraIntrinsicsForSize(
                             captureSize = Size(jpeg.width, jpeg.height),
@@ -1137,6 +1171,7 @@ internal class SharedCameraManager(
                     sensorTimestampNs = sensorTimestampNs,
                     exposureTimeNs = exposureTimeNs,
                     rollingShutterSkewNs = rollingShutterSkewNs,
+                    observedTimestampNs = captureObservation(sensorTimestampNs),
                 ),
             )
         if (alignedPose == null) {
@@ -1230,6 +1265,7 @@ internal class SharedCameraManager(
                             sensorTimestampNs = sensorTimestampNs,
                             exposureTimeNs = exposureTimeNs,
                             rollingShutterSkewNs = rollingShutterSkewNs,
+                            observedTimestampNs = captureObservation(sensorTimestampNs),
                             intrinsics = intrinsics,
                             primaryAssetName = "raw",
                             preEncodeQuality = pending.preEncodeQuality,
@@ -1384,6 +1420,7 @@ internal class SharedCameraManager(
                 sensorTimestampNs = correlated.result.sensorTimestampNs,
                 exposureTimeNs = correlated.result.exposureTimeNs,
                 rollingShutterSkewNs = correlated.result.rollingShutterSkewNs,
+                observedTimestampNs = correlated.result.observedTimestampNs,
             )
         val alignedPose = resolvePoseBeforeEncoding(timing)
         if (alignedPose == null) {
@@ -1426,6 +1463,7 @@ internal class SharedCameraManager(
                             sensorTimestampNs = correlated.result.sensorTimestampNs,
                             exposureTimeNs = correlated.result.exposureTimeNs,
                             rollingShutterSkewNs = correlated.result.rollingShutterSkewNs,
+                            observedTimestampNs = correlated.result.observedTimestampNs,
                             intrinsics =
                                 capabilityQuerier.getCameraIntrinsicsForSize(
                                     captureSize =
@@ -1772,6 +1810,7 @@ internal class SharedCameraManager(
                     "resolutionSelectionReason" to report.resolutionSelectionReason,
                     "timestampSource" to report.timestampSourceLabel,
                     "timestampSourceRealtimeVerified" to report.timestampSourceRealtimeVerified,
+                    "timestampCorrelationProbeRequired" to report.timestampCorrelationProbeRequired,
                     "supportedResolutions" to supportedResolutionMaps,
                 )
             } ?: emptyMap()
@@ -1818,12 +1857,6 @@ internal class SharedCameraManager(
         cameraDevice = null
         signalCameraCloseBarrierIfComplete()
 
-        previewImageReader?.close()
-        previewImageReader = null
-        clearPendingRawJpegComponents()
-        processedFrameCorrelator.clear()
-        rawImageReader?.close()
-        rawImageReader = null
         activeCameraCharacteristics = null
         previewCaptureRequestBuilder = null
         manualCaptureRequestBuilder = null
@@ -1848,6 +1881,10 @@ internal class SharedCameraManager(
      */
     fun finishCameraShutdown(timeoutMs: Long) {
         val callbacksCompleted = cameraCloseLatch.await(timeoutMs, TimeUnit.MILLISECONDS)
+        // Match ARCore's SharedCamera sample: readers remain valid until the
+        // wrapped camera close callback has completed, then their callback
+        // handlers are drained before the ARCore Session is destroyed.
+        closeImageReaders()
         stopBackgroundThreadsAfterDrain()
         if (!callbacksCompleted) {
             Log.i(
@@ -1855,6 +1892,15 @@ internal class SharedCameraManager(
                 "Camera2 close callbacks were not forwarded; callback handlers drained before ARCore disposal",
             )
         }
+    }
+
+    private fun closeImageReaders() {
+        previewImageReader?.close()
+        previewImageReader = null
+        clearPendingRawJpegComponents()
+        processedFrameCorrelator.clear()
+        rawImageReader?.close()
+        rawImageReader = null
     }
 
     private fun getActiveSharedCameraCharacteristics(): CameraCharacteristics {
@@ -2256,6 +2302,7 @@ internal class SharedCameraManager(
                     sensorTimestampNs = capture.result.sensorTimestampNs,
                     exposureTimeNs = capture.result.exposureTimeNs,
                     rollingShutterSkewNs = capture.result.rollingShutterSkewNs,
+                    observedTimestampNs = capture.result.observedTimestampNs,
                     intrinsics = intrinsics,
                     primaryAssetName = if (config.png) "png" else "jpeg",
                     preEncodeQuality = pending.preEncodeQuality,

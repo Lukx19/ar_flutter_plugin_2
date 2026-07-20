@@ -5,7 +5,6 @@ internal data class SharedCaptureCapabilities(
     val timestampSource: Int?,
     val isoRange: IntRange? = null,
     val exposureTimeRangeNs: LongRange? = null,
-    val allowNonRealtimeTimestampSource: Boolean = false,
 )
 
 internal data class SharedCaptureCapabilityReport(
@@ -17,6 +16,7 @@ internal data class SharedCaptureCapabilityReport(
     val timestampSource: Int?,
     val timestampSourceLabel: String,
     val timestampSourceRealtimeVerified: Boolean,
+    val timestampCorrelationProbeRequired: Boolean,
     val supportedOutputSizes: List<Pair<Int, Int>>,
 )
 
@@ -45,11 +45,6 @@ internal object SharedCaptureCapabilityValidator {
 
         val timestampSourceRealtimeVerified =
             capabilities.timestampSource == TIMESTAMP_SOURCE_REALTIME
-        if (!timestampSourceRealtimeVerified && !capabilities.allowNonRealtimeTimestampSource) {
-            throw IllegalStateException(
-                "Camera timestamp source must be SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME",
-            )
-        }
 
         if (defaultIso != null) {
             val isoRange = capabilities.isoRange
@@ -81,6 +76,7 @@ internal object SharedCaptureCapabilityValidator {
             timestampSource = capabilities.timestampSource,
             timestampSourceLabel = describeTimestampSource(capabilities.timestampSource),
             timestampSourceRealtimeVerified = timestampSourceRealtimeVerified,
+            timestampCorrelationProbeRequired = !timestampSourceRealtimeVerified,
             supportedOutputSizes =
                 capabilities.supportedOutputSizes.sortedByDescending { (width, height) ->
                     width.toLong() * height.toLong()

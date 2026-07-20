@@ -45,6 +45,12 @@ void main() {
             'rawCapture': false,
             'manualSensorControls': true,
             'flash': true,
+            'primaryPhysicalCameraIds': <String>['2', '5', '6'],
+            'logicalMultiCamera': true,
+            'concurrentCameraIdSets': <List<String>>[
+              <String>['0', '1'],
+              <String>['0', '3'],
+            ],
             'rearConcurrentCameraIds': <String>['0', '2'],
             'cached': true,
           },
@@ -90,6 +96,12 @@ void main() {
     final profile = await capabilities.getDeviceCapabilityProfile();
     expect(profile.isCurrentPreset, isTrue);
     expect(profile.sharedCameraCapture, isTrue);
+    expect(profile.primaryPhysicalCameraIds, <String>['2', '5', '6']);
+    expect(profile.logicalMultiCamera, isTrue);
+    expect(profile.concurrentCameraIdSets, <List<String>>[
+      <String>['0', '1'],
+      <String>['0', '3'],
+    ]);
     expect(profile.rearConcurrentCameraIds, <String>['0', '2']);
     expect(profile.validatedSharedResolutions.single,
         const CameraResolution(width: 1920, height: 1080));
@@ -124,6 +136,7 @@ void main() {
   test('persists operational probe outcomes with stable payloads', () async {
     final capabilities = ARCameraCapabilities(supportedOverride: true);
 
+    await capabilities.saveSharedCameraSupported();
     await capabilities.saveSharedCameraUnsupported('camera conflict');
     await capabilities.saveRawJpegProbeResult(
       supported: false,
@@ -133,22 +146,27 @@ void main() {
       format: 'png',
       supported: true,
     );
+    await capabilities.resetCapabilityProfileForTesting();
 
     expect(calls.map((call) => call.method), <String>[
+      'saveSharedCameraSupported',
       'saveSharedCameraUnsupported',
       'saveRawJpegProbeResult',
       'saveFormatProbeResult',
+      'resetCapabilityProfileForTesting',
     ]);
-    expect(calls[0].arguments, <String, dynamic>{'reason': 'camera conflict'});
-    expect(calls[1].arguments, <String, dynamic>{
+    expect(calls[0].arguments, isNull);
+    expect(calls[1].arguments, <String, dynamic>{'reason': 'camera conflict'});
+    expect(calls[2].arguments, <String, dynamic>{
       'supported': false,
       'reason': 'unsupported topology',
     });
-    expect(calls[2].arguments, <String, dynamic>{
+    expect(calls[3].arguments, <String, dynamic>{
       'format': 'png',
       'supported': true,
       'reason': null,
     });
+    expect(calls[4].arguments, isNull);
   });
 
   test('validates, suggests, recommends, and scores configurations', () async {

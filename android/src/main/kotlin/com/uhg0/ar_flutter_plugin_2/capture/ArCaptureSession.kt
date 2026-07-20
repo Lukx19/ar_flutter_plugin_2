@@ -94,7 +94,7 @@ internal class ArCaptureSession(
                                     poseDataExtractor.alignmentDiagnostics(captureTiming),
                             )
                         }
-                        return resolved ?: emulatorPoseFallback(captureTiming)
+                        return resolved
                     }
 
                     override fun toPoseMap(
@@ -102,8 +102,9 @@ internal class ArCaptureSession(
                     ): Map<String, Any?> = poseDataExtractor.toPoseMap(alignedPose)
                 },
             qualityAnalyzer = ::analyzeSharedQuality,
-            qualityAnalysisTimeoutMs =
-                if (SharedCameraEmulatorCompatibility.isRunningOnEmulator()) 1_000L else 500L,
+            // Analysis cost depends on output size, format, and runtime load.
+            // Use one conservative deadline for every supported device.
+            qualityAnalysisTimeoutMs = 1_000L,
         )
 
     fun initialize(configMap: Map<String, Any?>) {
@@ -725,23 +726,6 @@ internal class ArCaptureSession(
         Log.w(
             "ArCaptureSession",
             "Timed out waiting for a post-capture pose after $sensorTimestampNs",
-        )
-    }
-
-    private fun emulatorPoseFallback(
-        captureTiming: PoseDataExtractor.CaptureTiming,
-    ): PoseDataExtractor.AlignedPose? {
-        if (!SharedCameraEmulatorCompatibility.isRunningOnEmulator()) {
-            return null
-        }
-        val latestPose = poseDataExtractor.latest() ?: return null
-        return poseDataExtractor.toAlignedPose(
-            pose = latestPose,
-            sensorTimestampNs = captureTiming.referenceTimestampNs,
-            poseAlignment = "emulatorFallback",
-            poseTimeErrorNs = Long.MAX_VALUE,
-            exposureTimeNs = captureTiming.exposureTimeNs,
-            rollingShutterSkewNs = captureTiming.rollingShutterSkewNs,
         )
     }
 

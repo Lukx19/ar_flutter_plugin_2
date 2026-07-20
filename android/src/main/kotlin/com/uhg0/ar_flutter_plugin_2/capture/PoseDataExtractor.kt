@@ -20,15 +20,20 @@ class PoseDataExtractor(private val capacity: Int = 120) {
         val isTracking: Boolean,
         val confidence: Float,
         val trackingState: String,
+        val observedTimestampNs: Long = timestampNs,
     )
 
     data class CaptureTiming(
         val sensorTimestampNs: Long,
         val exposureTimeNs: Long,
         val rollingShutterSkewNs: Long = 0,
+        val observedTimestampNs: Long? = null,
     ) {
         val referenceTimestampNs: Long
             get() = sensorTimestampNs + exposureTimeNs / 2L
+
+        val observedReferenceTimestampNs: Long?
+            get() = observedTimestampNs?.plus(exposureTimeNs / 2L)
     }
 
     data class AlignedPose(
@@ -46,15 +51,20 @@ class PoseDataExtractor(private val capacity: Int = 120) {
     companion object {
         const val OPENCV_CONVENTION = "opencv_c2w_v1"
         const val EXACT_MATCH_THRESHOLD_NS = 2_000_000L
+        // When ARCore pauses around a still request, a two-sided interpolation
+        // bracket may not exist. A bounded nearest tracked pose is still a
+        // useful relative camera pose, and its measured offset is preserved in
+        // poseTimeErrorNs so downstream reconstruction can weight it.
+        const val NEAREST_MATCH_THRESHOLD_NS = 150_000_000L
+        const val OBSERVED_NEAREST_MATCH_THRESHOLD_NS = 300_000_000L
         // A one-shot multi-megapixel Camera2 request can suppress several
         // ARCore frames. Physical release evidence observed a 253.2 ms tracked
         // bracket. The 300 ms ceiling still requires tracked samples on both
         // sides and never permits extrapolation.
         const val INTERPOLATION_GAP_LIMIT_NS = 300_000_000L
-        // Some physical shared-camera devices pause ARCore delivery for several
-        // frames around a multi-megapixel still. Waiting longer does not relax
-        // the 150 ms interpolation gap or permit extrapolation; it only allows
-        // the required post-exposure bracket sample to arrive.
+        // Some shared-camera devices pause ARCore delivery for several frames
+        // around a still. Wait for a preferred bracket before using the
+        // explicitly bounded nearest-pose fallback.
         const val OBSERVED_FRAME_WAIT_MS = 1_000L
     }
 
@@ -79,6 +89,7 @@ class PoseDataExtractor(private val capacity: Int = 120) {
                 isTracking = camera.trackingState == TrackingState.TRACKING,
                 confidence = if (camera.trackingState == TrackingState.TRACKING) 1.0f else 0.0f,
                 trackingState = trackingState,
+                observedTimestampNs = System.nanoTime(),
             ),
         )
     }
@@ -108,10 +119,15 @@ class PoseDataExtractor(private val capacity: Int = 120) {
         val after = tracked.firstOrNull { it.timestampNs >= target }
         val bracketGap =
             if (before != null && after != null) after.timestampNs - before.timestampNs else null
+        val observedTarget = captureTiming.observedReferenceTimestampNs
+        val observedNearestError = observedTarget?.let { targetNs ->
+            tracked.minOfOrNull { abs(it.observedTimestampNs - targetNs) }
+        }
         "targetNs=$target trackedCount=${tracked.size} " +
             "oldestTrackedNs=${tracked.firstOrNull()?.timestampNs} " +
             "latestTrackedNs=${tracked.lastOrNull()?.timestampNs} nearestErrorNs=$nearestError " +
-            "beforeNs=${before?.timestampNs} afterNs=${after?.timestampNs} bracketGapNs=$bracketGap"
+            "beforeNs=${before?.timestampNs} afterNs=${after?.timestampNs} bracketGapNs=$bracketGap " +
+            "observedTargetNs=$observedTarget observedNearestErrorNs=$observedNearestError"
     }
 
     /**
@@ -155,6 +171,7 @@ class PoseDataExtractor(private val capacity: Int = 120) {
     }
 
     fun toPoseMap(alignedPose: AlignedPose): Map<String, Any?> {
+        val trackingTransform = alignedPose.pose.transform.clone()
         val openCvTransform = glToOpenCvTransform(alignedPose.pose.transform)
         val openCvPosition = floatArrayOf(
             openCvTransform[12],
@@ -184,6 +201,21 @@ class PoseDataExtractor(private val capacity: Int = 120) {
             "trackingState" to alignedPose.pose.trackingState,
             "poseAlignment" to alignedPose.poseAlignment,
             "poseTimeErrorNs" to alignedPose.poseTimeErrorNs,
+            "trackingPose" to mapOf(
+                "convention" to "arcore_gl_c2w_v1",
+                "position" to mapOf(
+                    "x" to alignedPose.pose.position[0].toDouble(),
+                    "y" to alignedPose.pose.position[1].toDouble(),
+                    "z" to alignedPose.pose.position[2].toDouble(),
+                ),
+                "rotation" to mapOf(
+                    "x" to alignedPose.pose.rotationQuaternion[0].toDouble(),
+                    "y" to alignedPose.pose.rotationQuaternion[1].toDouble(),
+                    "z" to alignedPose.pose.rotationQuaternion[2].toDouble(),
+                    "w" to alignedPose.pose.rotationQuaternion[3].toDouble(),
+                ),
+                "cameraToWorld" to trackingTransform.map { it.toDouble() },
+            ),
         )
     }
 
@@ -199,18 +231,28 @@ class PoseDataExtractor(private val capacity: Int = 120) {
                     return resolved
                 }
 
-                val latestTrackedTimestampNs =
-                    poses.lastOrNull { it.isTracking }?.timestampNs
-                if (
-                    latestTrackedTimestampNs != null &&
-                        latestTrackedTimestampNs >= captureTiming.referenceTimestampNs
+                val observedResolved = resolveObservedPoseLocked(captureTiming)
+                if (observedResolved != null) {
+                    return observedResolved
+                }
+
+                val latestTracked = poses.lastOrNull { it.isTracking }
+                val observedTarget = captureTiming.observedReferenceTimestampNs
+                if (observedTarget != null) {
+                    if (latestTracked != null &&
+                        latestTracked.observedTimestampNs >= observedTarget
+                    ) {
+                        return resolveNearestPoseLocked(captureTiming)
+                    }
+                } else if (latestTracked != null &&
+                    latestTracked.timestampNs >= captureTiming.referenceTimestampNs
                 ) {
-                    return null
+                    return resolveNearestPoseLocked(captureTiming)
                 }
 
                 val remainingMs = deadlineMs - System.currentTimeMillis()
                 if (remainingMs <= 0) {
-                    return null
+                    return resolveNearestPoseLocked(captureTiming)
                 }
                 lock.wait(remainingMs)
             }
@@ -295,6 +337,118 @@ class PoseDataExtractor(private val capacity: Int = 120) {
         }
 
         return null
+    }
+
+    /**
+     * Correlates through the process monotonic clock when Camera2 and ARCore do
+     * not advertise a common sensor clock. This still resolves a bounded pose
+     * at exposure time; it never substitutes an unbounded latest-pose guess.
+     */
+    private fun resolveObservedPoseLocked(
+        captureTiming: CaptureTiming,
+    ): AlignedPose? {
+        val targetTimestampNs = captureTiming.observedReferenceTimestampNs ?: return null
+        val trackedPoses = poses.filter { it.isTracking }
+        if (trackedPoses.isEmpty()) {
+            return null
+        }
+
+        trackedPoses
+            .filter { abs(it.observedTimestampNs - targetTimestampNs) <= EXACT_MATCH_THRESHOLD_NS }
+            .minByOrNull { abs(it.observedTimestampNs - targetTimestampNs) }
+            ?.let { exactPose ->
+                return AlignedPose(
+                    pose = exactPose,
+                    sensorTimestampNs = captureTiming.referenceTimestampNs,
+                    poseAlignment = "observedMonotonicExact",
+                    poseTimeErrorNs = abs(exactPose.observedTimestampNs - targetTimestampNs),
+                    exposureTimeNs = captureTiming.exposureTimeNs,
+                    rollingShutterSkewNs = captureTiming.rollingShutterSkewNs,
+                )
+            }
+
+        val before = trackedPoses.lastOrNull { it.observedTimestampNs <= targetTimestampNs }
+        val after = trackedPoses.firstOrNull { it.observedTimestampNs >= targetTimestampNs }
+        if (before == null || after == null || before === after) {
+            return null
+        }
+        val gapNs = after.observedTimestampNs - before.observedTimestampNs
+        if (gapNs > INTERPOLATION_GAP_LIMIT_NS) {
+            return null
+        }
+
+        val alpha =
+            ((targetTimestampNs - before.observedTimestampNs).toDouble() / gapNs.toDouble())
+                .coerceIn(0.0, 1.0)
+        val interpolatedPosition = lerp(before.position, after.position, alpha)
+        val interpolatedRotation = slerp(before.rotationQuaternion, after.rotationQuaternion, alpha)
+        val interpolatedTransform = transformFrom(interpolatedPosition, interpolatedRotation)
+        val interpolatedPoseTimestampNs =
+            interpolateLong(before.timestampNs, after.timestampNs, alpha)
+
+        return AlignedPose(
+            pose =
+                CachedPose(
+                    position = interpolatedPosition,
+                    rotationQuaternion = interpolatedRotation,
+                    transform = interpolatedTransform,
+                    timestampNs = interpolatedPoseTimestampNs,
+                    systemTimestampMs =
+                        interpolateLong(before.systemTimestampMs, after.systemTimestampMs, alpha),
+                    isTracking = true,
+                    confidence = interpolateFloat(before.confidence, after.confidence, alpha),
+                    trackingState = "tracking",
+                    observedTimestampNs = targetTimestampNs,
+                ),
+            sensorTimestampNs = captureTiming.referenceTimestampNs,
+            poseAlignment = "observedMonotonicInterpolated",
+            poseTimeErrorNs = 0L,
+            exposureTimeNs = captureTiming.exposureTimeNs,
+            rollingShutterSkewNs = captureTiming.rollingShutterSkewNs,
+        )
+    }
+
+    private fun resolveNearestPoseLocked(
+        captureTiming: CaptureTiming,
+    ): AlignedPose? {
+        val trackedPoses = poses.filter { it.isTracking }
+        val sensorTargetNs = captureTiming.referenceTimestampNs
+        val nearestSensorPose = trackedPoses.minByOrNull {
+            abs(it.timestampNs - sensorTargetNs)
+        }
+        val sensorErrorNs = nearestSensorPose?.let {
+            abs(it.timestampNs - sensorTargetNs)
+        }
+        if (nearestSensorPose != null &&
+            sensorErrorNs != null &&
+            sensorErrorNs <= NEAREST_MATCH_THRESHOLD_NS
+        ) {
+            return AlignedPose(
+                pose = nearestSensorPose,
+                sensorTimestampNs = sensorTargetNs,
+                poseAlignment = "nearest",
+                poseTimeErrorNs = sensorErrorNs,
+                exposureTimeNs = captureTiming.exposureTimeNs,
+                rollingShutterSkewNs = captureTiming.rollingShutterSkewNs,
+            )
+        }
+
+        val observedTargetNs = captureTiming.observedReferenceTimestampNs ?: return null
+        val nearestObservedPose = trackedPoses.minByOrNull {
+            abs(it.observedTimestampNs - observedTargetNs)
+        } ?: return null
+        val observedErrorNs = abs(nearestObservedPose.observedTimestampNs - observedTargetNs)
+        if (observedErrorNs > OBSERVED_NEAREST_MATCH_THRESHOLD_NS) {
+            return null
+        }
+        return AlignedPose(
+            pose = nearestObservedPose,
+            sensorTimestampNs = sensorTargetNs,
+            poseAlignment = "observedMonotonicNearest",
+            poseTimeErrorNs = observedErrorNs,
+            exposureTimeNs = captureTiming.exposureTimeNs,
+            rollingShutterSkewNs = captureTiming.rollingShutterSkewNs,
+        )
     }
 
     private fun lerp(start: FloatArray, end: FloatArray, alpha: Double): FloatArray {

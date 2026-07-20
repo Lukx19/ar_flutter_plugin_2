@@ -39,6 +39,7 @@ class SharedCaptureCapabilityValidatorTest {
         assertEquals("exact", report.resolutionSelectionReason)
         assertEquals("realtime", report.timestampSourceLabel)
         assertTrue(report.timestampSourceRealtimeVerified)
+        assertFalse(report.timestampCorrelationProbeRequired)
         assertEquals(listOf(4032 to 3024, 1920 to 1080, 1280 to 720), report.supportedOutputSizes)
     }
 
@@ -81,35 +82,13 @@ class SharedCaptureCapabilityValidatorTest {
     }
 
     @Test
-    fun `rejects non realtime timestamp source`() {
-        val error =
-            captureException {
-                SharedCaptureCapabilityValidator.validate(
-                    capabilities =
-                        SharedCaptureCapabilities(
-                            supportedOutputSizes = listOf(4032 to 3024),
-                            timestampSource = SharedCaptureCapabilityValidator.TIMESTAMP_SOURCE_UNKNOWN,
-                        ),
-                    requestedWidth = 4032,
-                    requestedHeight = 3024,
-                )
-            }
-
-        assertEquals(
-            "Camera timestamp source must be SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME",
-            error.message,
-        )
-    }
-
-    @Test
-    fun `allows unknown timestamp source only when an emulator override is explicit`() {
+    fun `unknown timestamp source remains provisional until operational correlation probe`() {
         val report =
             SharedCaptureCapabilityValidator.validateAndReport(
                 capabilities =
                     SharedCaptureCapabilities(
                         supportedOutputSizes = listOf(1280 to 720),
                         timestampSource = SharedCaptureCapabilityValidator.TIMESTAMP_SOURCE_UNKNOWN,
-                        allowNonRealtimeTimestampSource = true,
                     ),
                 requestedWidth = 1280,
                 requestedHeight = 720,
@@ -117,6 +96,25 @@ class SharedCaptureCapabilityValidatorTest {
 
         assertEquals("unknown", report.timestampSourceLabel)
         assertFalse(report.timestampSourceRealtimeVerified)
+        assertTrue(report.timestampCorrelationProbeRequired)
+    }
+
+    @Test
+    fun `missing timestamp metadata also requires operational correlation probe`() {
+        val report =
+            SharedCaptureCapabilityValidator.validateAndReport(
+                capabilities =
+                    SharedCaptureCapabilities(
+                        supportedOutputSizes = listOf(1280 to 720),
+                        timestampSource = null,
+                    ),
+                requestedWidth = 1280,
+                requestedHeight = 720,
+            )
+
+        assertEquals("missing", report.timestampSourceLabel)
+        assertFalse(report.timestampSourceRealtimeVerified)
+        assertTrue(report.timestampCorrelationProbeRequired)
     }
 
     @Test

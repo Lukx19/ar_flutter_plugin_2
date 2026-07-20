@@ -78,7 +78,7 @@ void main() {
       objectCalls.add(call);
       return switch (call.method) {
         'addNode' || 'addNodeToPlaneAnchor' => true,
-        'removeNode' => 'removed',
+        'removeNode' => true,
         _ => null,
       };
     });
@@ -312,7 +312,7 @@ void main() {
     expect(await manager.addNode(node), isTrue);
     node.position = Vector3(1, 2, 3);
     await Future<void>.delayed(Duration.zero);
-    manager.removeNode(node);
+    await manager.removeNode(node);
 
     await _sendPlatformCall(objectChannel, 'onNodeTap', <String>['node-1']);
     await _sendPlatformCall(objectChannel, 'onPanStart', 'node-1');

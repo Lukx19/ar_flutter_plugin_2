@@ -2,6 +2,7 @@ package com.uhg0.ar_flutter_plugin_2
 
 import android.app.Activity
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import android.view.MotionEvent
 import android.view.View
 import android.widget.FrameLayout
@@ -26,6 +27,7 @@ import com.uhg0.ar_flutter_plugin_2.sceneview.PluginTransform
 import com.uhg0.ar_flutter_plugin_2.sceneview.SceneViewHost
 import com.uhg0.ar_flutter_plugin_2.sceneview.decompose
 import com.uhg0.ar_flutter_plugin_2.sceneview.resolveNodeUri
+import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudMethodChannel
 import com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraCapabilityQuerier
 import io.flutter.FlutterInjector
 import io.flutter.plugin.common.BinaryMessenger
@@ -60,6 +62,8 @@ internal class ArView(
     private val detectedPlanes = mutableSetOf<Plane>()
     private var sessionConfig = defaultSessionConfig()
     private var sessionPausedByFlutter = false
+    private var shutdownPrepared = false
+    private var disposed = false
     private val pendingCloudOperations = mutableSetOf<() -> Unit>()
 
     private val sceneHost = SceneViewHost(
@@ -71,9 +75,21 @@ internal class ArView(
         onTrackingFailureChanged = { failure ->
             sessionChannel.invokeMethod("onTrackingFailure", failure)
         },
+        onCoverageRendererMounted = ::setCoverageRendererMounted,
         onTouch = ::onTouch,
         onNodeGesture = ::onNodeGesture,
     )
+    private lateinit var pointCloudChannel: PointCloudMethodChannel
+
+    init {
+        pointCloudChannel = PointCloudMethodChannel(
+            messenger = messenger,
+            viewId = id,
+            isDebuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0,
+            onRendererStateChanged = sceneHost::updateCoverageRenderer,
+        )
+    }
+
     private val captureSession = ArCaptureSession(
         sceneHost = sceneHost,
         capabilityQuerier = CameraCapabilityQuerier(context),
@@ -97,12 +113,22 @@ internal class ArView(
         },
     )
 
+    private fun setCoverageRendererMounted(mounted: Boolean) {
+        if (::pointCloudChannel.isInitialized) {
+            pointCloudChannel.setRendererMounted(mounted)
+        }
+    }
+
     private val lifecycleObserver = object : DefaultLifecycleObserver {
         override fun onPause(owner: LifecycleOwner) {
+            pointCloudChannel.pause()
             captureSession.onSessionPaused()
+            sceneHost.pause()
         }
 
         override fun onResume(owner: LifecycleOwner) {
+            sceneHost.resume()
+            pointCloudChannel.resume()
             if (!sessionPausedByFlutter) captureSession.onSessionResumed()
         }
     }
@@ -123,16 +149,30 @@ internal class ArView(
     override fun getView(): View = root
 
     override fun dispose() {
+        if (disposed) return
+        disposed = true
+        prepareForDispose()
         sessionChannel.setMethodCallHandler(null)
         objectChannel.setMethodCallHandler(null)
         anchorChannel.setMethodCallHandler(null)
         captureChannel.setMethodCallHandler(null)
+        pointCloudChannel.dispose()
         lifecycle.removeObserver(lifecycleObserver)
         captureSession.dispose()
         pendingCloudOperations.toList().forEach { it() }
         pendingCloudOperations.clear()
         sceneHost.dispose()
         scope.cancel()
+    }
+
+    private fun prepareForDispose() {
+        if (shutdownPrepared) return
+        shutdownPrepared = true
+        // ARCore's SharedCamera sample pauses the Session before closing
+        // Camera2. Its wrapped image/session callbacks retain native Session
+        // state until Camera2 shutdown completes.
+        sceneHost.pause()
+        captureSession.onSessionPaused()
     }
 
     private fun onSessionCall(call: MethodCall, result: MethodChannel.Result) {
@@ -176,6 +216,7 @@ internal class ArView(
                 }
                 "disableCamera" -> {
                     sessionPausedByFlutter = true
+                    pointCloudChannel.pause()
                     captureSession.onSessionPaused()
                     sceneHost.pause()
                     result.success(null)
@@ -183,6 +224,7 @@ internal class ArView(
                 "enableCamera" -> {
                     sessionPausedByFlutter = false
                     sceneHost.resume()
+                    pointCloudChannel.resume()
                     captureSession.onSessionResumed()
                     result.success(null)
                 }
@@ -262,7 +304,7 @@ internal class ArView(
                     } else {
                         nodeAnchorIds.remove(name)
                         sceneHost.removeNode(name)
-                        result.success(name)
+                        result.success(true)
                     }
                 }
                 else -> result.notImplemented()
@@ -538,6 +580,7 @@ internal class ArView(
                     call.argument<String>("imageId") ?: throw IllegalArgumentException("imageId is required"),
                 ))
                 "dispose" -> {
+                    prepareForDispose()
                     captureSession.dispose()
                     result.success(null)
                 }
@@ -551,6 +594,7 @@ internal class ArView(
     }
 
     private fun onFrame(session: Session, frame: Frame) {
+        pointCloudChannel.onFrame(frame)
         captureSession.buildPoseUpdate(frame)?.let { captureChannel.invokeMethod("onPoseUpdate", it) }
         frame.getUpdatedTrackables(Plane::class.java).forEach { plane ->
             if (detectedPlanes.add(plane)) {
