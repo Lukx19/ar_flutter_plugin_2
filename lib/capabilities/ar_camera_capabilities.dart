@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import '../models/camera_resolution.dart';
 import '../models/ar_capture_config.dart';
@@ -8,15 +9,95 @@ import '../datatypes/image_format.dart';
 /// Provides information about available camera capabilities for AR capture
 /// Can be used independently throughout the application for capability discovery
 class ARCameraCapabilities {
+  static const int capabilityPresetVersion = 10;
+
   /// Platform channel for camera capability queries
   static const MethodChannel _channel =
       MethodChannel('ar_flutter_plugin_2/camera_capabilities');
 
   /// Platform availability check - currently supports Android only
-  bool get isSupported => Platform.isAndroid;
+  bool get isSupported => _supportedOverride ?? Platform.isAndroid;
+
+  final bool? _supportedOverride;
 
   /// Initialize capability querier
-  ARCameraCapabilities();
+  ARCameraCapabilities({
+    @visibleForTesting bool? supportedOverride,
+  }) : _supportedOverride = supportedOverride;
+
+  /// Queries ARCore's authoritative asynchronous availability state.
+  Future<ARCoreAvailability> getARCoreAvailability() async {
+    if (!isSupported) return const ARCoreAvailability.unsupported('platform');
+    final result = await _channel.invokeMapMethod<dynamic, dynamic>(
+      'getARCoreAvailability',
+    );
+    final values = Map<String, dynamic>.from(result ?? const {});
+    return ARCoreAvailability(
+      name: values['name'] as String? ?? 'UNKNOWN_ERROR',
+      supported: values['supported'] as bool? ?? false,
+      transient: values['transient'] as bool? ?? false,
+      unknown: values['unknown'] as bool? ?? true,
+    );
+  }
+
+  Future<DeviceCameraCapabilityProfile> getDeviceCapabilityProfile() async {
+    if (!isSupported) return const DeviceCameraCapabilityProfile.unsupported();
+    final result = await _channel.invokeMapMethod<dynamic, dynamic>(
+      'getDeviceCapabilityProfile',
+    );
+    return DeviceCameraCapabilityProfile.fromMap(
+      Map<String, dynamic>.from(result ?? const {}),
+    );
+  }
+
+  Future<void> saveSharedCameraUnsupported(String reason) async {
+    if (!isSupported) return;
+    await _channel.invokeMethod<void>(
+      'saveSharedCameraUnsupported',
+      <String, dynamic>{'reason': reason},
+    );
+  }
+
+  /// Persists base shared-camera support after a live capture has completed
+  /// with a pose correlated to its Camera2 sensor timestamp.
+  Future<void> saveSharedCameraSupported() async {
+    if (!isSupported) return;
+    await _channel.invokeMethod<void>('saveSharedCameraSupported');
+  }
+
+  Future<void> saveRawJpegProbeResult({
+    required bool supported,
+    String? reason,
+  }) async {
+    if (!isSupported) return;
+    await _channel.invokeMethod<void>(
+      'saveRawJpegProbeResult',
+      <String, dynamic>{'supported': supported, 'reason': reason},
+    );
+  }
+
+  Future<void> saveFormatProbeResult({
+    required String format,
+    required bool supported,
+    String? reason,
+  }) async {
+    if (!isSupported) return;
+    await _channel.invokeMethod<void>('saveFormatProbeResult', {
+      'format': format,
+      'supported': supported,
+      'reason': reason,
+    });
+  }
+
+  /// Clears only the native camera capability preset in debuggable builds.
+  ///
+  /// This is intended for physical-device integration tests. Capture history,
+  /// app settings, and persisted images are not modified.
+  @visibleForTesting
+  Future<void> resetCapabilityProfileForTesting() async {
+    if (!isSupported) return;
+    await _channel.invokeMethod<void>('resetCapabilityProfileForTesting');
+  }
 
   /// Get list of all supported camera resolutions
   /// Returns empty list on unsupported platforms
@@ -33,6 +114,30 @@ class ARCameraCapabilities {
     } on PlatformException catch (e) {
       throw ARCameraCapabilityException(
           'Failed to get supported resolutions: ${e.message}');
+    }
+  }
+
+  /// Get resolutions previously validated with the complete ARCore shared
+  /// session surface combination on this device. The list is empty until a
+  /// shared-camera session has run capability validation at least once.
+  Future<List<CameraResolution>> getSupportedSharedCameraResolutions() async {
+    if (!isSupported) return [];
+
+    try {
+      final List<dynamic> result = await _channel.invokeMethod(
+        'getSupportedSharedCameraResolutions',
+      );
+      return result
+          .map(
+            (map) => CameraResolution.fromMap(
+              Map<String, dynamic>.from(map as Map),
+            ),
+          )
+          .toList();
+    } on PlatformException catch (e) {
+      throw ARCameraCapabilityException(
+        'Failed to get shared-camera resolutions: ${e.message}',
+      );
     }
   }
 
@@ -123,7 +228,7 @@ class ARCameraCapabilities {
     if (!isSupported) return null;
 
     try {
-      final Map<dynamic, dynamic>? result = 
+      final Map<dynamic, dynamic>? result =
           await _channel.invokeMethod('getCameraIntrinsics');
       if (result != null) {
         final intrinsicsMap = Map<String, dynamic>.from(result);
@@ -353,6 +458,167 @@ class ARCameraCapabilities {
     }
   }
 }
+
+class DeviceCameraCapabilityProfile {
+  const DeviceCameraCapabilityProfile({
+    required this.presetVersion,
+    required this.fingerprint,
+    required this.primaryCameraId,
+    required this.sharedResolutionValidationComplete,
+    required this.sharedCameraProbeStatus,
+    required this.sharedCameraProbeError,
+    required this.validatedSharedResolutions,
+    required this.validatedRawJpegResolutions,
+    required this.rawJpegProbeStatus,
+    required this.rawJpegProbeError,
+    required this.validatedRawOnlyResolutions,
+    required this.rawOnlyProbeStatus,
+    required this.rawOnlyProbeError,
+    required this.validatedPngResolutions,
+    required this.pngProbeStatus,
+    required this.rawCapture,
+    required this.manualSensorControls,
+    required this.flash,
+    required this.primaryPhysicalCameraIds,
+    required this.logicalMultiCamera,
+    required this.concurrentCameraIdSets,
+    required this.rearConcurrentCameraIds,
+    required this.cached,
+  });
+
+  const DeviceCameraCapabilityProfile.unsupported()
+      : presetVersion = 0,
+        fingerprint = '',
+        primaryCameraId = '',
+        sharedResolutionValidationComplete = false,
+        sharedCameraProbeStatus = 'unsupported',
+        sharedCameraProbeError = 'Platform unsupported',
+        validatedSharedResolutions = const [],
+        validatedRawJpegResolutions = const [],
+        rawJpegProbeStatus = 'unsupported',
+        rawJpegProbeError = 'Platform unsupported',
+        validatedRawOnlyResolutions = const [],
+        rawOnlyProbeStatus = 'unsupported',
+        rawOnlyProbeError = 'Platform unsupported',
+        validatedPngResolutions = const [],
+        pngProbeStatus = 'unsupported',
+        rawCapture = false,
+        manualSensorControls = false,
+        flash = false,
+        primaryPhysicalCameraIds = const [],
+        logicalMultiCamera = false,
+        concurrentCameraIdSets = const [],
+        rearConcurrentCameraIds = const [],
+        cached = false;
+
+  factory DeviceCameraCapabilityProfile.fromMap(Map<String, dynamic> map) {
+    return DeviceCameraCapabilityProfile(
+      presetVersion: map['presetVersion'] as int? ?? 0,
+      fingerprint: map['fingerprint'] as String? ?? '',
+      primaryCameraId: map['primaryCameraId'] as String? ?? '',
+      sharedResolutionValidationComplete:
+          map['sharedResolutionValidationComplete'] as bool? ?? false,
+      sharedCameraProbeStatus:
+          map['sharedCameraProbeStatus'] as String? ?? 'pending',
+      sharedCameraProbeError: map['sharedCameraProbeError'] as String?,
+      validatedSharedResolutions:
+          (map['validatedSharedResolutions'] as List<dynamic>? ?? const [])
+              .map((value) => CameraResolution.fromMap(
+                    Map<String, dynamic>.from(value as Map),
+                  ))
+              .toList(growable: false),
+      validatedRawJpegResolutions:
+          (map['validatedRawJpegResolutions'] as List<dynamic>? ?? const [])
+              .map((value) => CameraResolution.fromMap(
+                    Map<String, dynamic>.from(value as Map),
+                  ))
+              .toList(growable: false),
+      rawJpegProbeStatus: map['rawJpegProbeStatus'] as String? ?? 'pending',
+      rawJpegProbeError: map['rawJpegProbeError'] as String?,
+      validatedRawOnlyResolutions:
+          _resolutionList(map['validatedRawOnlyResolutions']),
+      rawOnlyProbeStatus: map['rawOnlyProbeStatus'] as String? ?? 'pending',
+      rawOnlyProbeError: map['rawOnlyProbeError'] as String?,
+      validatedPngResolutions: _resolutionList(map['validatedPngResolutions']),
+      pngProbeStatus: map['pngProbeStatus'] as String? ?? 'pending',
+      rawCapture: map['rawCapture'] as bool? ?? false,
+      manualSensorControls: map['manualSensorControls'] as bool? ?? false,
+      flash: map['flash'] as bool? ?? false,
+      primaryPhysicalCameraIds: List<String>.from(
+          map['primaryPhysicalCameraIds'] as List? ?? const []),
+      logicalMultiCamera: map['logicalMultiCamera'] as bool? ?? false,
+      concurrentCameraIdSets:
+          (map['concurrentCameraIdSets'] as List<dynamic>? ?? const [])
+              .map((value) => List<String>.from(value as List))
+              .toList(growable: false),
+      rearConcurrentCameraIds: List<String>.from(
+          map['rearConcurrentCameraIds'] as List? ?? const []),
+      cached: map['cached'] as bool? ?? false,
+    );
+  }
+
+  final int presetVersion;
+  final String fingerprint;
+  final String primaryCameraId;
+  final bool sharedResolutionValidationComplete;
+  final String sharedCameraProbeStatus;
+  final String? sharedCameraProbeError;
+  final List<CameraResolution> validatedSharedResolutions;
+  final List<CameraResolution> validatedRawJpegResolutions;
+  final String rawJpegProbeStatus;
+  final String? rawJpegProbeError;
+  final List<CameraResolution> validatedRawOnlyResolutions;
+  final String rawOnlyProbeStatus;
+  final String? rawOnlyProbeError;
+  final List<CameraResolution> validatedPngResolutions;
+  final String pngProbeStatus;
+  final bool rawCapture;
+  final bool manualSensorControls;
+  final bool flash;
+  final List<String> primaryPhysicalCameraIds;
+  final bool logicalMultiCamera;
+  final List<List<String>> concurrentCameraIdSets;
+  final List<String> rearConcurrentCameraIds;
+  final bool cached;
+
+  bool get rearConcurrentCamera => rearConcurrentCameraIds.isNotEmpty;
+  bool get probeComplete => sharedCameraProbeStatus != 'pending';
+  bool get sharedCameraCapture => sharedCameraProbeStatus == 'supported';
+  bool get rawJpegCapture => rawJpegProbeStatus == 'supported';
+  bool get rawJpegProbeComplete => rawJpegProbeStatus != 'pending';
+  bool get rawOnlyCapture => rawOnlyProbeStatus == 'supported';
+  bool get rawOnlyProbeComplete => rawOnlyProbeStatus != 'pending';
+  bool get pngCapture => pngProbeStatus == 'supported';
+  bool get pngProbeComplete => pngProbeStatus != 'pending';
+
+  bool get isCurrentPreset =>
+      presetVersion == ARCameraCapabilities.capabilityPresetVersion;
+}
+
+class ARCoreAvailability {
+  const ARCoreAvailability({
+    required this.name,
+    required this.supported,
+    required this.transient,
+    required this.unknown,
+  });
+
+  const ARCoreAvailability.unsupported(this.name)
+      : supported = false,
+        transient = false,
+        unknown = false;
+
+  final String name;
+  final bool supported;
+  final bool transient;
+  final bool unknown;
+}
+
+List<CameraResolution> _resolutionList(Object? value) =>
+    (value as List<dynamic>? ?? const [])
+        .map((item) =>
+            CameraResolution.fromMap(Map<String, dynamic>.from(item as Map)))
+        .toList(growable: false);
 
 /// Exception thrown when camera capability operations fail
 class ARCameraCapabilityException implements Exception {

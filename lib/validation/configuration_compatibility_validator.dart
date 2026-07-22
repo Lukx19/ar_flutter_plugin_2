@@ -373,22 +373,10 @@ class ConfigurationCompatibilityValidator {
     List<String> warnings,
     List<String> suggestions,
   ) async {
-    // Device-specific performance characteristics
-    final lowEndDevices = [
-      'SM-A105',
-      'Redmi 8A',
-      'Galaxy A10'
-    ]; // Example low-end devices
-    final highEndDevices = [
-      'Pixel 7',
-      'Galaxy S23',
-      'OnePlus 11'
-    ]; // Example high-end devices
-
-    final isLowEndDevice =
-        lowEndDevices.any((device) => deviceModel.contains(device));
-    final isHighEndDevice =
-        highEndDevices.any((device) => deviceModel.contains(device));
+    // Compatibility decisions must come from runtime capability and stream
+    // validation. A model name is diagnostic context, never an allow/deny key.
+    const isLowEndDevice = false;
+    const isHighEndDevice = false;
 
     if (isLowEndDevice) {
       // More restrictive recommendations for low-end devices
@@ -586,15 +574,10 @@ class ConfigurationCompatibilityValidator {
 
   static Map<String, dynamic> _getDeviceSpecificOptimizations(
       String deviceModel) {
-    // This would be expanded with real device database
-    final lowEndDevices = ['SM-A105', 'Redmi 8A', 'Galaxy A10'];
-    final isLowEnd =
-        lowEndDevices.any((device) => deviceModel.contains(device));
-
     return {
-      'reduceResolution': isLowEnd,
-      'increaseInterval': isLowEnd,
-      'preferMemoryStrategy': isLowEnd,
+      'reduceResolution': false,
+      'increaseInterval': false,
+      'preferMemoryStrategy': false,
     };
   }
 

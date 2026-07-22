@@ -1,0 +1,27 @@
+material {
+    name : "Capture3D Coverage Points",
+    requires : [ color ],
+    parameters : [
+        {
+            type : float,
+            name : pointSize
+        }
+    ],
+    shadingModel : unlit,
+    blending : opaque,
+    depthWrite : true,
+    depthCulling : true
+}
+
+vertex {
+    void materialVertex(inout MaterialVertexInputs material) {
+        gl_PointSize = materialParams.pointSize;
+    }
+}
+
+fragment {
+    void material(inout MaterialInputs material) {
+        prepareMaterial(material);
+        material.baseColor = getColor();
+    }
+}

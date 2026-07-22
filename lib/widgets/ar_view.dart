@@ -2,6 +2,7 @@ import 'package:ar_flutter_plugin_2/managers/ar_anchor_manager.dart';
 import 'package:ar_flutter_plugin_2/managers/ar_location_manager.dart';
 import 'package:ar_flutter_plugin_2/models/ar_capture_config.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:ar_flutter_plugin_2/managers/ar_session_manager.dart';
@@ -51,9 +52,10 @@ createManagers(
     return;
   }
   arViewCreatedCallback(
-      ARSessionManager(id, context, planeDetectionConfig, captureConfig: captureConfig),
-      ARObjectManager(id), 
-      ARAnchorManager(id), 
+      ARSessionManager(id, context, planeDetectionConfig,
+          captureConfig: captureConfig),
+      ARObjectManager(id),
+      ARAnchorManager(id),
       ARLocationManager());
 }
 
@@ -68,7 +70,8 @@ class AndroidARView implements PlatformARView {
   @override
   void onPlatformViewCreated(int id) {
     print("Android platform view created!");
-    createManagers(id, _context, _arViewCreatedCallback, _planeDetectionConfig, _captureConfig);
+    createManagers(id, _context, _arViewCreatedCallback, _planeDetectionConfig,
+        _captureConfig);
   }
 
   @override
@@ -84,14 +87,37 @@ class AndroidARView implements PlatformARView {
     // This is used in the platform side to register the view.
     final String viewType = 'ar_flutter_plugin_2';
     // Pass parameters to the platform side.
-    final Map<String, dynamic> creationParams = <String, dynamic>{};
+    final Map<String, dynamic> creationParams = <String, dynamic>{
+      // ARCore session features are immutable after session creation. Keep this
+      // creation-time value in sync with the Android view key below so a mode
+      // change disposes the entire platform view and starts a new AR session.
+      'enableHighResCapture': captureConfig?.enableHighResCapture ?? false,
+    };
 
-    return AndroidView(
+    return PlatformViewLink(
+      key: ValueKey<bool>(
+        captureConfig?.enableHighResCapture ?? false,
+      ),
       viewType: viewType,
-      layoutDirection: TextDirection.ltr,
-      creationParams: creationParams,
-      creationParamsCodec: const StandardMessageCodec(),
-      onPlatformViewCreated: onPlatformViewCreated,
+      surfaceFactory: (context, controller) => AndroidViewSurface(
+        controller: controller as AndroidViewController,
+        hitTestBehavior: PlatformViewHitTestBehavior.opaque,
+        gestureRecognizers: const {},
+      ),
+      onCreatePlatformView: (params) {
+        final controller = PlatformViewsService.initSurfaceAndroidView(
+          id: params.id,
+          viewType: viewType,
+          layoutDirection: TextDirection.ltr,
+          creationParams: creationParams,
+          creationParamsCodec: const StandardMessageCodec(),
+        );
+        controller
+            .addOnPlatformViewCreatedListener(params.onPlatformViewCreated);
+        controller.addOnPlatformViewCreatedListener(onPlatformViewCreated);
+        controller.create();
+        return controller;
+      },
     );
   }
 }
@@ -106,7 +132,8 @@ class IosARView implements PlatformARView {
   @override
   void onPlatformViewCreated(int id) {
     print("iOS platform view created!");
-    createManagers(id, _context, _arViewCreatedCallback, _planeDetectionConfig, _captureConfig);
+    createManagers(id, _context, _arViewCreatedCallback, _planeDetectionConfig,
+        _captureConfig);
   }
 
   @override
@@ -222,7 +249,7 @@ class _ARViewState extends State<ARView> {
   build(BuildContext context) {
     switch (_cameraPermission) {
       case (PermissionStatus
-          .limited): //iOS-specific: permissions granted for this specific application
+            .limited): //iOS-specific: permissions granted for this specific application
       case (PermissionStatus.granted):
         {
           return Column(children: [
@@ -248,7 +275,7 @@ class _ARViewState extends State<ARView> {
           ));
         }
       case (PermissionStatus
-          .permanentlyDenied): //Android-specific: User needs to open Settings to give permissions
+            .permanentlyDenied): //Android-specific: User needs to open Settings to give permissions
         {
           return Center(
               child: Column(

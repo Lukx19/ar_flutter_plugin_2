@@ -2,7 +2,7 @@ group 'com.uhg0.ar_flutter_plugin_2'
 version '1.0-SNAPSHOT'
 
 buildscript {
-    ext.kotlin_version = '1.9.10'
+    ext.kotlin_version = '2.4.0'
     repositories {
         mavenLocal()
         google()
@@ -10,8 +10,9 @@ buildscript {
     }
 
     dependencies {
-        classpath 'com.android.tools.build:gradle:8.3.2'
+        classpath 'com.android.tools.build:gradle:8.9.1'
         classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+        classpath "org.jetbrains.kotlin:compose-compiler-gradle-plugin:$kotlin_version"
     }
 }
 
@@ -25,9 +26,10 @@ allprojects {
 
 apply plugin: 'com.android.library'
 apply plugin: 'kotlin-android'
+apply plugin: 'org.jetbrains.kotlin.plugin.compose'
 
 android {
-    compileSdk 34
+    compileSdk 36
     namespace 'com.uhg0.ar_flutter_plugin_2'
 
     compileOptions {
@@ -52,11 +54,21 @@ android {
     testOptions {
         unitTests.returnDefaultValues = true
     }
+
+    buildFeatures {
+        compose true
+    }
+
 }
 
 dependencies {
     implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk7:$kotlin_version"
-    implementation 'io.github.sceneview:arsceneview:2.2.1'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0'
+    implementation platform('androidx.compose:compose-bom:2026.05.01')
+    implementation 'androidx.compose.ui:ui'
+    implementation 'androidx.compose.foundation:foundation'
+    implementation 'androidx.activity:activity-compose:1.13.0'
+    implementation 'io.github.sceneview:arsceneview:4.21.2'
     implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
     testImplementation 'junit:junit:4.13.2'
 }

@@ -7,7 +7,6 @@ import 'examples/camera_intrinsics_models.dart';
 import 'examples/ar_with_camera_capabilities.dart';
 import 'examples/unified_camera_intrinsics.dart';
 import 'examples/phase5_runtime_camera_controls.dart';
-import 'examples/phase6_integrated_workflow.dart';
 import 'examples/phase7_testing_framework.dart';
 import 'examples/phase8_documentation_examples.dart';
 
@@ -35,7 +34,6 @@ class CameraCapabilitiesExamplesApp extends StatelessWidget {
         '/ar-integration': (context) => const ARWithCameraCapabilitiesExample(),
         '/unified-intrinsics': (context) => const UnifiedCameraIntrinsicsExample(),
         '/phase5-runtime-controls': (context) => const Phase5RuntimeCameraControlsWidget(),
-        '/phase6-integrated-workflow': (context) => const Phase6IntegratedWorkflowExample(),
         '/phase7-testing-framework': (context) => const Phase7TestingFrameworkExample(),
         '/phase8-documentation-examples': (context) => const Phase8DocumentationExamplesWidget(),
       },

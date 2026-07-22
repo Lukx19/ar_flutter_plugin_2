@@ -1,5 +1,6 @@
 import 'dart:math' as math;
 import 'camera_resolution.dart';
+import 'crop_region.dart';
 import 'focal_length.dart';
 import 'principal_point.dart';
 import 'field_of_view.dart';
@@ -9,24 +10,28 @@ import 'field_of_view.dart';
 class ARCameraIntrinsics {
   /// Camera focal length in pixels (fx, fy)
   final FocalLength focalLength;
-  
+
   /// Camera principal point in pixels (cx, cy) - image center
   final PrincipalPoint principalPoint;
-  
+
   /// Image resolution these intrinsics apply to
   final CameraResolution resolution;
-  
+
+  /// Crop region in active-array coordinates that was applied to derive these intrinsics
+  final CropRegion? cropRegion;
+
   /// Radial and tangential distortion coefficients (optional)
   /// Format: [k1, k2, p1, p2, k3] following OpenCV convention
   final List<double>? distortionCoefficients;
-  
+
   /// Field of view in radians (horizontal, vertical)
   final FieldOfView fieldOfView;
 
   const ARCameraIntrinsics({
     required this.focalLength,
-    required this.principalPoint, 
+    required this.principalPoint,
     required this.resolution,
+    this.cropRegion,
     this.distortionCoefficients,
     required this.fieldOfView,
   });
@@ -34,11 +39,15 @@ class ARCameraIntrinsics {
   /// Create from platform channel data
   factory ARCameraIntrinsics.fromMap(Map<String, dynamic> map) {
     return ARCameraIntrinsics(
-      focalLength: FocalLength.fromMap(map['focalLength'] ?? {}),
-      principalPoint: PrincipalPoint.fromMap(map['principalPoint'] ?? {}),
-      resolution: CameraResolution.fromMap(map['resolution'] ?? {}),
-      distortionCoefficients: (map['distortionCoefficients'] as List<dynamic>?)?.cast<double>(),
-      fieldOfView: FieldOfView.fromMap(map['fieldOfView'] ?? {}),
+      focalLength: FocalLength.fromMap(_stringMap(map['focalLength'])),
+      principalPoint: PrincipalPoint.fromMap(_stringMap(map['principalPoint'])),
+      resolution: CameraResolution.fromMap(_stringMap(map['resolution'])),
+      cropRegion: map['cropRegion'] != null
+          ? CropRegion.fromMap(_stringMap(map['cropRegion']))
+          : null,
+      distortionCoefficients:
+          (map['distortionCoefficients'] as List<dynamic>?)?.cast<double>(),
+      fieldOfView: FieldOfView.fromMap(_stringMap(map['fieldOfView'])),
     );
   }
 
@@ -48,6 +57,7 @@ class ARCameraIntrinsics {
       'focalLength': focalLength.toMap(),
       'principalPoint': principalPoint.toMap(),
       'resolution': resolution.toMap(),
+      if (cropRegion != null) 'cropRegion': cropRegion!.toMap(),
       'distortionCoefficients': distortionCoefficients,
       'fieldOfView': fieldOfView.toMap(),
     };
@@ -71,16 +81,18 @@ class ARCameraIntrinsics {
 
     final focalLength = FocalLength(fx: fx, fy: fy);
     final principalPoint = PrincipalPoint(cx: cx, cy: cy);
-    
+
     // Calculate field of view from focal length and resolution
     final fovHorizontal = 2 * math.atan(resolution.width / (2 * fx));
     final fovVertical = 2 * math.atan(resolution.height / (2 * fy));
-    final fieldOfView = FieldOfView(horizontal: fovHorizontal, vertical: fovVertical);
+    final fieldOfView =
+        FieldOfView(horizontal: fovHorizontal, vertical: fovVertical);
 
     return ARCameraIntrinsics(
       focalLength: focalLength,
       principalPoint: principalPoint,
       resolution: resolution,
+      cropRegion: null,
       distortionCoefficients: distortionCoefficients,
       fieldOfView: fieldOfView,
     );
@@ -99,21 +111,27 @@ class ARCameraIntrinsics {
   bool get isValid {
     // Check for positive focal lengths
     if (focalLength.fx <= 0 || focalLength.fy <= 0) return false;
-    
+
     // Check if principal point is within resolution bounds
-    if (principalPoint.cx < 0 || principalPoint.cx >= resolution.width) return false;
-    if (principalPoint.cy < 0 || principalPoint.cy >= resolution.height) return false;
-    
+    if (principalPoint.cx < 0 || principalPoint.cx >= resolution.width)
+      return false;
+    if (principalPoint.cy < 0 || principalPoint.cy >= resolution.height)
+      return false;
+
     // Check for reasonable focal length values (not too extreme)
     final minFocalLength = math.min(resolution.width, resolution.height) * 0.1;
     final maxFocalLength = math.max(resolution.width, resolution.height) * 10.0;
-    if (focalLength.fx < minFocalLength || focalLength.fx > maxFocalLength) return false;
-    if (focalLength.fy < minFocalLength || focalLength.fy > maxFocalLength) return false;
-    
+    if (focalLength.fx < minFocalLength || focalLength.fx > maxFocalLength)
+      return false;
+    if (focalLength.fy < minFocalLength || focalLength.fy > maxFocalLength)
+      return false;
+
     // Check field of view reasonableness (0.1 to 3.0 radians)
-    if (fieldOfView.horizontal <= 0.1 || fieldOfView.horizontal >= 3.0) return false;
-    if (fieldOfView.vertical <= 0.1 || fieldOfView.vertical >= 3.0) return false;
-    
+    if (fieldOfView.horizontal <= 0.1 || fieldOfView.horizontal >= 3.0)
+      return false;
+    if (fieldOfView.vertical <= 0.1 || fieldOfView.vertical >= 3.0)
+      return false;
+
     return true;
   }
 
@@ -125,7 +143,8 @@ class ARCameraIntrinsics {
         [0.0, focalLength.fy, principalPoint.cy],
         [0.0, 0.0, 1.0],
       ],
-      'distortion_coefficients': distortionCoefficients ?? [0.0, 0.0, 0.0, 0.0, 0.0],
+      'distortion_coefficients':
+          distortionCoefficients ?? [0.0, 0.0, 0.0, 0.0, 0.0],
       'image_size': [resolution.width, resolution.height],
     };
   }
@@ -135,23 +154,38 @@ class ARCameraIntrinsics {
   List<List<double>> getProjectionMatrix(double nearPlane, double farPlane) {
     final width = resolution.width.toDouble();
     final height = resolution.height.toDouble();
-    
+
     // Convert from camera intrinsics to OpenGL projection matrix
     final fx = focalLength.fx;
     final fy = focalLength.fy;
     final cx = principalPoint.cx;
     final cy = principalPoint.cy;
-    
+
     final left = -cx * nearPlane / fx;
     final right = (width - cx) * nearPlane / fx;
     final bottom = -(height - cy) * nearPlane / fy;
     final top = cy * nearPlane / fy;
-    
+
     // OpenGL projection matrix
     return [
-      [2 * nearPlane / (right - left), 0.0, (right + left) / (right - left), 0.0],
-      [0.0, 2 * nearPlane / (top - bottom), (top + bottom) / (top - bottom), 0.0],
-      [0.0, 0.0, -(farPlane + nearPlane) / (farPlane - nearPlane), -2 * farPlane * nearPlane / (farPlane - nearPlane)],
+      [
+        2 * nearPlane / (right - left),
+        0.0,
+        (right + left) / (right - left),
+        0.0
+      ],
+      [
+        0.0,
+        2 * nearPlane / (top - bottom),
+        (top + bottom) / (top - bottom),
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        -(farPlane + nearPlane) / (farPlane - nearPlane),
+        -2 * farPlane * nearPlane / (farPlane - nearPlane)
+      ],
       [0.0, 0.0, -1.0, 0.0],
     ];
   }
@@ -172,14 +206,16 @@ class ARCameraIntrinsics {
   /// Check if intrinsics are suitable for stereo calibration
   bool isSuitableForStereo(ARCameraIntrinsics other) {
     // Focal lengths should be similar
-    final fxDiff = (focalLength.fx - other.focalLength.fx).abs() / focalLength.fx;
-    final fyDiff = (focalLength.fy - other.focalLength.fy).abs() / focalLength.fy;
-    
+    final fxDiff =
+        (focalLength.fx - other.focalLength.fx).abs() / focalLength.fx;
+    final fyDiff =
+        (focalLength.fy - other.focalLength.fy).abs() / focalLength.fy;
+
     if (fxDiff > 0.1 || fyDiff > 0.1) return false; // More than 10% difference
-    
+
     // Resolutions should match
     if (resolution != other.resolution) return false;
-    
+
     return true;
   }
 
@@ -187,7 +223,7 @@ class ARCameraIntrinsics {
   ARCameraIntrinsics scaleForResolution(CameraResolution newResolution) {
     final scaleX = newResolution.width / resolution.width;
     final scaleY = newResolution.height / resolution.height;
-    
+
     return ARCameraIntrinsics(
       focalLength: FocalLength(
         fx: focalLength.fx * scaleX,
@@ -198,7 +234,9 @@ class ARCameraIntrinsics {
         cy: principalPoint.cy * scaleY,
       ),
       resolution: newResolution,
-      distortionCoefficients: distortionCoefficients, // Distortion coefficients don't scale
+      cropRegion: cropRegion,
+      distortionCoefficients:
+          distortionCoefficients, // Distortion coefficients don't scale
       fieldOfView: fieldOfView, // FOV remains the same
     );
   }
@@ -210,6 +248,7 @@ class ARCameraIntrinsics {
         other.focalLength == focalLength &&
         other.principalPoint == principalPoint &&
         other.resolution == resolution &&
+        other.cropRegion == cropRegion &&
         _listEquals(other.distortionCoefficients, distortionCoefficients) &&
         other.fieldOfView == fieldOfView;
   }
@@ -219,6 +258,7 @@ class ARCameraIntrinsics {
     return focalLength.hashCode ^
         principalPoint.hashCode ^
         resolution.hashCode ^
+        cropRegion.hashCode ^
         (distortionCoefficients?.hashCode ?? 0) ^
         fieldOfView.hashCode;
   }
@@ -244,3 +284,6 @@ class ARCameraIntrinsics {
     return true;
   }
 }
+
+Map<String, dynamic> _stringMap(Object? value) =>
+    Map<String, dynamic>.from(value as Map? ?? const <String, dynamic>{});

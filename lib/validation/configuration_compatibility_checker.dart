@@ -12,8 +12,10 @@ import '../managers/ar_session_manager.dart';
 enum CompatibilityStrategy {
   /// Conservative approach - prioritize reliability
   conservative,
+
   /// Performance approach - prioritize speed and efficiency
   performance,
+
   /// Balanced approach - balance between reliability and performance
   balanced,
 }
@@ -75,8 +77,8 @@ class CompatibilityIssue {
   }
 }
 
-/// Comprehensive compatibility result
-class CompatibilityResult {
+/// Comprehensive compatibility result for the legacy checker.
+class ConfigurationCompatibilityCheckResult {
   final bool isCompatible;
   final List<CompatibilityIssue> issues;
   final List<String> warnings;
@@ -86,7 +88,7 @@ class CompatibilityResult {
   final DateTime checkTimestamp;
   final CompatibilityStrategy? recommendedStrategy;
 
-  const CompatibilityResult({
+  const ConfigurationCompatibilityCheckResult({
     required this.isCompatible,
     required this.issues,
     required this.warnings,
@@ -98,20 +100,24 @@ class CompatibilityResult {
   });
 
   /// Get issues by severity
-  List<CompatibilityIssue> getIssuesBySeverity(CompatibilityIssueSeverity severity) {
+  List<CompatibilityIssue> getIssuesBySeverity(
+      CompatibilityIssueSeverity severity) {
     return issues.where((issue) => issue.severity == severity).toList();
   }
 
   /// Get issues by category
-  List<CompatibilityIssue> getIssuesByCategory(CompatibilityIssueCategory category) {
+  List<CompatibilityIssue> getIssuesByCategory(
+      CompatibilityIssueCategory category) {
     return issues.where((issue) => issue.category == category).toList();
   }
 
   /// Check if has issues of specified severity or higher
   bool hasIssuesOfSeverity(CompatibilityIssueSeverity minSeverity) {
-    final severityIndex = CompatibilityIssueSeverity.values.indexOf(minSeverity);
-    return issues.any((issue) => 
-        CompatibilityIssueSeverity.values.indexOf(issue.severity) >= severityIndex);
+    final severityIndex =
+        CompatibilityIssueSeverity.values.indexOf(minSeverity);
+    return issues.any((issue) =>
+        CompatibilityIssueSeverity.values.indexOf(issue.severity) >=
+        severityIndex);
   }
 
   Map<String, dynamic> toMap() {
@@ -154,9 +160,13 @@ class DeviceCapabilityInfo {
 }
 
 /// Comprehensive configuration compatibility checking system
+@Deprecated(
+  'ConfigurationCompatibilityChecker is a legacy global surface. '
+  'Use ConfigurationCompatibilityValidator and models/compatibility_result.dart instead.',
+)
 class ConfigurationCompatibilityChecker {
   static ConfigurationCompatibilityChecker? _instance;
-  static ConfigurationCompatibilityChecker get instance => 
+  static ConfigurationCompatibilityChecker get instance =>
       _instance ??= ConfigurationCompatibilityChecker._();
 
   ConfigurationCompatibilityChecker._();
@@ -171,8 +181,7 @@ class ConfigurationCompatibilityChecker {
   DateTime? _capabilitiesCacheTime;
   static const Duration _cacheValidDuration = Duration(hours: 1);
 
-  // Compatibility rules and matrices
-  final Map<String, List<String>> _compatibilityMatrix = {};
+  // Compatibility rules
   final List<CompatibilityRule> _rules = [];
 
   /// Initialize the compatibility checker
@@ -182,26 +191,26 @@ class ConfigurationCompatibilityChecker {
     try {
       _debug = debug;
       _channel = const MethodChannel('configuration_compatibility_checker');
-      
+
       // Load compatibility rules
       await _loadCompatibilityRules();
-      
+
       // Initialize compatibility matrix
       await _buildCompatibilityMatrix();
-      
+
       _isInitialized = true;
-      
+
       if (_debug) {
         debugPrint('ConfigurationCompatibilityChecker initialized');
       }
-
     } catch (e) {
-      throw Exception('Failed to initialize ConfigurationCompatibilityChecker: $e');
+      throw Exception(
+          'Failed to initialize ConfigurationCompatibilityChecker: $e');
     }
   }
 
   /// Check compatibility between AR and capture configurations
-  Future<CompatibilityResult> checkCompatibility({
+  Future<ConfigurationCompatibilityCheckResult> checkCompatibility({
     required ARConfiguration arConfig,
     required ARCaptureConfig captureConfig,
     String? deviceId,
@@ -217,46 +226,54 @@ class ConfigurationCompatibilityChecker {
 
       // Get device capabilities
       final deviceCapabilities = await _getDeviceCapabilities(deviceId);
-      
+
       // Initialize compatibility checking
       final issues = <CompatibilityIssue>[];
       final warnings = <String>[];
       final suggestedChanges = <String, dynamic>{};
-      
+
       // Check individual configuration validity
-      issues.addAll(await _checkARConfigCompatibility(arConfig, deviceCapabilities));
-      issues.addAll(await _checkCaptureConfigCompatibility(captureConfig, deviceCapabilities));
-      
+      issues.addAll(
+          await _checkARConfigCompatibility(arConfig, deviceCapabilities));
+      issues.addAll(await _checkCaptureConfigCompatibility(
+          captureConfig, deviceCapabilities));
+
       // Check cross-configuration compatibility
-      issues.addAll(await _checkCrossConfigCompatibility(arConfig, captureConfig, deviceCapabilities));
-      
+      issues.addAll(await _checkCrossConfigCompatibility(
+          arConfig, captureConfig, deviceCapabilities));
+
       // Check platform-specific compatibility
-      issues.addAll(await _checkPlatformCompatibility(arConfig, captureConfig, deviceCapabilities));
-      
+      issues.addAll(await _checkPlatformCompatibility(
+          arConfig, captureConfig, deviceCapabilities));
+
       // Check performance implications
-      issues.addAll(await _checkPerformanceCompatibility(arConfig, captureConfig, deviceCapabilities));
-      
+      issues.addAll(await _checkPerformanceCompatibility(
+          arConfig, captureConfig, deviceCapabilities));
+
       // Check memory requirements
-      issues.addAll(await _checkMemoryCompatibility(arConfig, captureConfig, deviceCapabilities));
-      
+      issues.addAll(await _checkMemoryCompatibility(
+          arConfig, captureConfig, deviceCapabilities));
+
       // Generate warnings from non-critical issues
       warnings.addAll(_generateWarnings(issues));
-      
+
       // Generate suggested changes
-      suggestedChanges.addAll(await _generateSuggestedChanges(arConfig, captureConfig, issues, deviceCapabilities));
-      
+      suggestedChanges.addAll(await _generateSuggestedChanges(
+          arConfig, captureConfig, issues, deviceCapabilities));
+
       // Calculate compatibility score
       final compatibilityScore = _calculateCompatibilityScore(issues);
-      
+
       // Determine if compatible (no critical or error issues)
-      final isCompatible = !issues.any((issue) => 
+      final isCompatible = !issues.any((issue) =>
           issue.severity == CompatibilityIssueSeverity.critical ||
           issue.severity == CompatibilityIssueSeverity.error);
-      
+
       // Recommend strategy
-      final recommendedStrategy = _recommendStrategy(issues, deviceCapabilities);
-      
-      final result = CompatibilityResult(
+      final recommendedStrategy =
+          _recommendStrategy(issues, deviceCapabilities);
+
+      final result = ConfigurationCompatibilityCheckResult(
         isCompatible: isCompatible,
         issues: issues,
         warnings: warnings,
@@ -268,13 +285,13 @@ class ConfigurationCompatibilityChecker {
       );
 
       if (_debug) {
-        debugPrint('Compatibility check completed: ${result.isCompatible ? 'COMPATIBLE' : 'INCOMPATIBLE'}');
+        debugPrint(
+            'Compatibility check completed: ${result.isCompatible ? 'COMPATIBLE' : 'INCOMPATIBLE'}');
         debugPrint('Score: ${result.compatibilityScore.toStringAsFixed(2)}');
         debugPrint('Issues: ${result.issues.length}');
       }
 
       return result;
-
     } catch (e) {
       throw Exception('Failed to check compatibility: $e');
     }
@@ -311,19 +328,22 @@ class ConfigurationCompatibilityChecker {
 
       // Get device capabilities
       final deviceCapabilities = await _getDeviceCapabilities();
-      
+
       // Create resolved configuration based on strategy
       var resolvedConfig = captureConfig;
-      
+
       switch (strategy) {
         case CompatibilityStrategy.conservative:
-          resolvedConfig = await _resolveConservative(arConfig, captureConfig, compatibilityResult, deviceCapabilities);
+          resolvedConfig = await _resolveConservative(
+              arConfig, captureConfig, compatibilityResult, deviceCapabilities);
           break;
         case CompatibilityStrategy.performance:
-          resolvedConfig = await _resolvePerformance(arConfig, captureConfig, compatibilityResult, deviceCapabilities);
+          resolvedConfig = await _resolvePerformance(
+              arConfig, captureConfig, compatibilityResult, deviceCapabilities);
           break;
         case CompatibilityStrategy.balanced:
-          resolvedConfig = await _resolveBalanced(arConfig, captureConfig, compatibilityResult, deviceCapabilities);
+          resolvedConfig = await _resolveBalanced(
+              arConfig, captureConfig, compatibilityResult, deviceCapabilities);
           break;
       }
 
@@ -334,11 +354,11 @@ class ConfigurationCompatibilityChecker {
       );
 
       if (_debug) {
-        debugPrint('Resolution completed. New compatibility score: ${verificationResult.compatibilityScore.toStringAsFixed(2)}');
+        debugPrint(
+            'Resolution completed. New compatibility score: ${verificationResult.compatibilityScore.toStringAsFixed(2)}');
       }
 
       return resolvedConfig;
-
     } catch (e) {
       throw Exception('Failed to resolve compatibility: $e');
     }
@@ -356,7 +376,7 @@ class ConfigurationCompatibilityChecker {
 
     try {
       final deviceCapabilities = await _getDeviceCapabilities(deviceId);
-      
+
       // Start with a base configuration
       var optimalConfig = ARCaptureConfig(
         resolution: _selectOptimalResolution(deviceCapabilities, strategy),
@@ -366,14 +386,15 @@ class ConfigurationCompatibilityChecker {
       );
 
       // Refine based on AR configuration requirements
-      optimalConfig = await _refineForARConfiguration(arConfig, optimalConfig, deviceCapabilities, strategy);
+      optimalConfig = await _refineForARConfiguration(
+          arConfig, optimalConfig, deviceCapabilities, strategy);
 
       if (_debug) {
-        debugPrint('Generated optimal configuration: ${optimalConfig.toString()}');
+        debugPrint(
+            'Generated optimal configuration: ${optimalConfig.toString()}');
       }
 
       return optimalConfig;
-
     } catch (e) {
       throw Exception('Failed to get optimal configuration: $e');
     }
@@ -386,20 +407,24 @@ class ConfigurationCompatibilityChecker {
     String? deviceId,
   }) async {
     final deviceCapabilities = await _getDeviceCapabilities(deviceId);
-    
+
     // Check if resolution is supported by device
     if (!deviceCapabilities.supportedResolutions.contains(resolution)) {
       return false;
     }
 
     // Check memory requirements
-    final memoryRequired = _calculateMemoryRequirement(resolution, ImageFormat.jpeg);
-    if (memoryRequired > deviceCapabilities.maxMemory * 0.8) { // Use max 80% of available memory
+    final memoryRequired =
+        _calculateMemoryRequirement(resolution, ImageFormat.jpeg);
+    if (memoryRequired > deviceCapabilities.maxMemory * 0.8) {
+      // Use max 80% of available memory
       return false;
     }
 
     // Check performance implications
-    if (resolution.totalPixels > 8000000 && !deviceCapabilities.hasAdvancedCamera) { // 4K+
+    if (resolution.totalPixels > 8000000 &&
+        !deviceCapabilities.hasAdvancedCamera) {
+      // 4K+
       return false;
     }
 
@@ -407,7 +432,8 @@ class ConfigurationCompatibilityChecker {
   }
 
   /// Get device capabilities
-  Future<DeviceCapabilityInfo> _getDeviceCapabilities([String? deviceId]) async {
+  Future<DeviceCapabilityInfo> _getDeviceCapabilities(
+      [String? deviceId]) async {
     // Check cache first
     if (_deviceCapabilities != null && _capabilitiesCacheTime != null) {
       final age = DateTime.now().difference(_capabilitiesCacheTime!);
@@ -433,23 +459,26 @@ class ConfigurationCompatibilityChecker {
         osVersion: deviceInfo['osVersion'] ?? 'unknown',
         supportedResolutions: supportedResolutions,
         supportedFormats: supportedFormats,
-        maxMemory: deviceInfo['maxMemory'] ?? 512 * 1024 * 1024, // Default 512MB
+        maxMemory:
+            deviceInfo['maxMemory'] ?? 512 * 1024 * 1024, // Default 512MB
         hasARSupport: deviceInfo['hasARSupport'] ?? false,
         hasAdvancedCamera: deviceInfo['hasAdvancedCamera'] ?? false,
-        additionalCapabilities: Map<String, dynamic>.from(deviceInfo['additionalCapabilities'] ?? {}),
+        additionalCapabilities: Map<String, dynamic>.from(
+            deviceInfo['additionalCapabilities'] ?? {}),
       );
 
       _capabilitiesCacheTime = DateTime.now();
-      
-      return _deviceCapabilities!;
 
+      return _deviceCapabilities!;
     } catch (e) {
       // Fallback to basic capabilities
       return DeviceCapabilityInfo(
         deviceId: 'fallback',
         model: 'unknown',
         osVersion: Platform.version,
-        supportedResolutions: [const CameraResolution(width: 1920, height: 1080)],
+        supportedResolutions: [
+          const CameraResolution(width: 1920, height: 1080)
+        ],
         supportedFormats: [ImageFormat.jpeg],
         maxMemory: 256 * 1024 * 1024, // 256MB fallback
         hasARSupport: Platform.isAndroid,
@@ -461,9 +490,7 @@ class ConfigurationCompatibilityChecker {
 
   /// Check AR configuration compatibility
   Future<List<CompatibilityIssue>> _checkARConfigCompatibility(
-    ARConfiguration arConfig, 
-    DeviceCapabilityInfo deviceCapabilities
-  ) async {
+      ARConfiguration arConfig, DeviceCapabilityInfo deviceCapabilities) async {
     final issues = <CompatibilityIssue>[];
 
     // Check AR support
@@ -495,23 +522,27 @@ class ConfigurationCompatibilityChecker {
 
   /// Check capture configuration compatibility
   Future<List<CompatibilityIssue>> _checkCaptureConfigCompatibility(
-    ARCaptureConfig captureConfig, 
-    DeviceCapabilityInfo deviceCapabilities
-  ) async {
+      ARCaptureConfig captureConfig,
+      DeviceCapabilityInfo deviceCapabilities) async {
     final issues = <CompatibilityIssue>[];
 
     // Check resolution support
-    if (!deviceCapabilities.supportedResolutions.contains(captureConfig.resolution)) {
+    if (!deviceCapabilities.supportedResolutions
+        .contains(captureConfig.resolution)) {
       issues.add(CompatibilityIssue(
         id: 'resolution_not_supported',
         category: CompatibilityIssueCategory.resolution,
         severity: CompatibilityIssueSeverity.error,
         title: 'Unsupported Resolution',
-        description: 'Resolution ${captureConfig.resolution} is not supported by this device',
-        suggestedFix: 'Use one of the supported resolutions: ${deviceCapabilities.supportedResolutions.map((r) => r.toString()).join(', ')}',
+        description:
+            'Resolution ${captureConfig.resolution} is not supported by this device',
+        suggestedFix:
+            'Use one of the supported resolutions: ${deviceCapabilities.supportedResolutions.map((r) => r.toString()).join(', ')}',
         context: {
           'requestedResolution': captureConfig.resolution.toString(),
-          'supportedResolutions': deviceCapabilities.supportedResolutions.map((r) => r.toString()).toList(),
+          'supportedResolutions': deviceCapabilities.supportedResolutions
+              .map((r) => r.toString())
+              .toList(),
         },
       ));
     }
@@ -523,8 +554,10 @@ class ConfigurationCompatibilityChecker {
         category: CompatibilityIssueCategory.format,
         severity: CompatibilityIssueSeverity.error,
         title: 'Unsupported Format',
-        description: 'Format ${captureConfig.format} is not supported by this device',
-        suggestedFix: 'Use one of the supported formats: ${deviceCapabilities.supportedFormats.map((f) => f.name).join(', ')}',
+        description:
+            'Format ${captureConfig.format} is not supported by this device',
+        suggestedFix:
+            'Use one of the supported formats: ${deviceCapabilities.supportedFormats.map((f) => f.name).join(', ')}',
       ));
     }
 
@@ -535,8 +568,10 @@ class ConfigurationCompatibilityChecker {
         category: CompatibilityIssueCategory.performance,
         severity: CompatibilityIssueSeverity.warning,
         title: 'Very Short Capture Interval',
-        description: 'Capture interval of ${captureConfig.captureIntervalMs}ms may impact performance',
-        suggestedFix: 'Consider using intervals >= 500ms for better performance',
+        description:
+            'Capture interval of ${captureConfig.captureIntervalMs}ms may impact performance',
+        suggestedFix:
+            'Consider using intervals >= 500ms for better performance',
       ));
     }
 
@@ -545,10 +580,9 @@ class ConfigurationCompatibilityChecker {
 
   /// Check cross-configuration compatibility
   Future<List<CompatibilityIssue>> _checkCrossConfigCompatibility(
-    ARConfiguration arConfig,
-    ARCaptureConfig captureConfig, 
-    DeviceCapabilityInfo deviceCapabilities
-  ) async {
+      ARConfiguration arConfig,
+      ARCaptureConfig captureConfig,
+      DeviceCapabilityInfo deviceCapabilities) async {
     final issues = <CompatibilityIssue>[];
 
     // Check if high-frequency capture with AR tracking is sustainable
@@ -558,20 +592,25 @@ class ConfigurationCompatibilityChecker {
         category: CompatibilityIssueCategory.performance,
         severity: CompatibilityIssueSeverity.warning,
         title: 'High Frequency Capture with AR',
-        description: 'Frequent capture operations may interfere with AR tracking',
-        suggestedFix: 'Use capture intervals >= 1000ms when AR tracking is active',
+        description:
+            'Frequent capture operations may interfere with AR tracking',
+        suggestedFix:
+            'Use capture intervals >= 1000ms when AR tracking is active',
       ));
     }
 
     // Check high resolution capture impact on AR
-    if (captureConfig.resolution.totalPixels > 8000000) { // 4K+
+    if (captureConfig.resolution.totalPixels > 8000000) {
+      // 4K+
       issues.add(CompatibilityIssue(
         id: 'high_resolution_ar_impact',
         category: CompatibilityIssueCategory.performance,
         severity: CompatibilityIssueSeverity.warning,
         title: 'High Resolution May Impact AR',
-        description: 'High resolution capture may reduce AR tracking performance',
-        suggestedFix: 'Consider using lower resolution for AR sessions or enable shared camera mode',
+        description:
+            'High resolution capture may reduce AR tracking performance',
+        suggestedFix:
+            'Consider using lower resolution for AR sessions or enable shared camera mode',
       ));
     }
 
@@ -580,10 +619,9 @@ class ConfigurationCompatibilityChecker {
 
   /// Check platform-specific compatibility
   Future<List<CompatibilityIssue>> _checkPlatformCompatibility(
-    ARConfiguration arConfig,
-    ARCaptureConfig captureConfig, 
-    DeviceCapabilityInfo deviceCapabilities
-  ) async {
+      ARConfiguration arConfig,
+      ARCaptureConfig captureConfig,
+      DeviceCapabilityInfo deviceCapabilities) async {
     final issues = <CompatibilityIssue>[];
 
     // Check platform support
@@ -603,17 +641,17 @@ class ConfigurationCompatibilityChecker {
 
   /// Check performance compatibility
   Future<List<CompatibilityIssue>> _checkPerformanceCompatibility(
-    ARConfiguration arConfig,
-    ARCaptureConfig captureConfig, 
-    DeviceCapabilityInfo deviceCapabilities
-  ) async {
+      ARConfiguration arConfig,
+      ARCaptureConfig captureConfig,
+      DeviceCapabilityInfo deviceCapabilities) async {
     final issues = <CompatibilityIssue>[];
 
     // Calculate estimated performance load
     double performanceLoad = 0.0;
-    
+
     if (arConfig.enableCapture) performanceLoad += 0.3;
-    if (captureConfig.resolution.totalPixels > 2000000) performanceLoad += 0.2; // HD+
+    if (captureConfig.resolution.totalPixels > 2000000)
+      performanceLoad += 0.2; // HD+
     if (captureConfig.captureIntervalMs < 1000) performanceLoad += 0.3;
     if (captureConfig.format == ImageFormat.raw) performanceLoad += 0.2;
 
@@ -624,7 +662,8 @@ class ConfigurationCompatibilityChecker {
         severity: CompatibilityIssueSeverity.warning,
         title: 'High Performance Load',
         description: 'Configuration may exceed device performance capabilities',
-        suggestedFix: 'Reduce resolution, increase capture interval, or use JPEG format',
+        suggestedFix:
+            'Reduce resolution, increase capture interval, or use JPEG format',
         context: {
           'estimatedLoad': performanceLoad,
           'deviceCapable': deviceCapabilities.hasAdvancedCamera,
@@ -637,18 +676,19 @@ class ConfigurationCompatibilityChecker {
 
   /// Check memory compatibility
   Future<List<CompatibilityIssue>> _checkMemoryCompatibility(
-    ARConfiguration arConfig,
-    ARCaptureConfig captureConfig, 
-    DeviceCapabilityInfo deviceCapabilities
-  ) async {
+      ARConfiguration arConfig,
+      ARCaptureConfig captureConfig,
+      DeviceCapabilityInfo deviceCapabilities) async {
     final issues = <CompatibilityIssue>[];
 
     // Calculate memory requirements
-    final memoryRequired = _calculateMemoryRequirement(captureConfig.resolution, captureConfig.format);
+    final memoryRequired = _calculateMemoryRequirement(
+        captureConfig.resolution, captureConfig.format);
     final cacheMemory = captureConfig.maxCacheSize;
     final totalMemory = memoryRequired + cacheMemory;
 
-    if (totalMemory > deviceCapabilities.maxMemory * 0.9) { // Use max 90% of available memory
+    if (totalMemory > deviceCapabilities.maxMemory * 0.9) {
+      // Use max 90% of available memory
       issues.add(CompatibilityIssue(
         id: 'insufficient_memory',
         category: CompatibilityIssueCategory.memory,
@@ -661,13 +701,15 @@ class ConfigurationCompatibilityChecker {
           'availableMemory': deviceCapabilities.maxMemory,
         },
       ));
-    } else if (totalMemory > deviceCapabilities.maxMemory * 0.7) { // Warn at 70%
+    } else if (totalMemory > deviceCapabilities.maxMemory * 0.7) {
+      // Warn at 70%
       issues.add(CompatibilityIssue(
         id: 'high_memory_usage',
         category: CompatibilityIssueCategory.memory,
         severity: CompatibilityIssueSeverity.warning,
         title: 'High Memory Usage',
-        description: 'Configuration uses significant memory which may impact performance',
+        description:
+            'Configuration uses significant memory which may impact performance',
         suggestedFix: 'Consider reducing cache size for better performance',
       ));
     }
@@ -676,18 +718,18 @@ class ConfigurationCompatibilityChecker {
   }
 
   /// Calculate memory requirement for configuration
-  int _calculateMemoryRequirement(CameraResolution resolution, ImageFormat format) {
+  int _calculateMemoryRequirement(
+      CameraResolution resolution, ImageFormat format) {
     final pixelCount = resolution.width * resolution.height;
-    
+
     switch (format) {
       case ImageFormat.jpeg:
         return (pixelCount * 0.5).round(); // JPEG compression ~50%
       case ImageFormat.raw:
+      case ImageFormat.rawJpeg:
         return pixelCount * 4; // RGBA
       // case ImageFormat.yuv420:
       //   return (pixelCount * 1.5).round(); // YUV420 is 1.5 bytes per pixel
-      default:
-        return pixelCount * 3; // RGB default
     }
   }
 
@@ -711,16 +753,19 @@ class ConfigurationCompatibilityChecker {
     for (final issue in issues) {
       switch (issue.id) {
         case 'resolution_not_supported':
-          suggestions['resolution'] = _selectOptimalResolution(deviceCapabilities, CompatibilityStrategy.conservative);
+          suggestions['resolution'] = _selectOptimalResolution(
+              deviceCapabilities, CompatibilityStrategy.conservative);
           break;
         case 'format_not_supported':
-          suggestions['format'] = _selectOptimalFormat(deviceCapabilities, CompatibilityStrategy.conservative);
+          suggestions['format'] = _selectOptimalFormat(
+              deviceCapabilities, CompatibilityStrategy.conservative);
           break;
         case 'capture_interval_too_short':
           suggestions['captureInterval'] = const Duration(milliseconds: 1000);
           break;
         case 'insufficient_memory':
-          suggestions['maxCacheSize'] = deviceCapabilities.maxMemory ~/ 4; // Use 25% of memory for cache
+          suggestions['maxCacheSize'] =
+              deviceCapabilities.maxMemory ~/ 4; // Use 25% of memory for cache
           break;
       }
     }
@@ -733,7 +778,7 @@ class ConfigurationCompatibilityChecker {
     if (issues.isEmpty) return 1.0;
 
     double score = 1.0;
-    
+
     for (final issue in issues) {
       switch (issue.severity) {
         case CompatibilityIssueSeverity.critical:
@@ -759,14 +804,18 @@ class ConfigurationCompatibilityChecker {
     List<CompatibilityIssue> issues,
     DeviceCapabilityInfo deviceCapabilities,
   ) {
-    final hasPerformanceIssues = issues.any((issue) => 
-        issue.category == CompatibilityIssueCategory.performance);
-    final hasMemoryIssues = issues.any((issue) => 
-        issue.category == CompatibilityIssueCategory.memory);
-    
-    if (hasPerformanceIssues || hasMemoryIssues || !deviceCapabilities.hasAdvancedCamera) {
+    final hasPerformanceIssues = issues.any(
+        (issue) => issue.category == CompatibilityIssueCategory.performance);
+    final hasMemoryIssues = issues
+        .any((issue) => issue.category == CompatibilityIssueCategory.memory);
+
+    if (hasPerformanceIssues ||
+        hasMemoryIssues ||
+        !deviceCapabilities.hasAdvancedCamera) {
       return CompatibilityStrategy.conservative;
-    } else if (deviceCapabilities.hasAdvancedCamera && deviceCapabilities.maxMemory > 1024 * 1024 * 1024) { // 1GB+
+    } else if (deviceCapabilities.hasAdvancedCamera &&
+        deviceCapabilities.maxMemory > 1024 * 1024 * 1024) {
+      // 1GB+
       return CompatibilityStrategy.performance;
     } else {
       return CompatibilityStrategy.balanced;
@@ -779,7 +828,8 @@ class ConfigurationCompatibilityChecker {
     CompatibilityStrategy strategy,
   ) {
     final resolutions = deviceCapabilities.supportedResolutions;
-    if (resolutions.isEmpty) return const CameraResolution(width: 1920, height: 1080);
+    if (resolutions.isEmpty)
+      return const CameraResolution(width: 1920, height: 1080);
 
     switch (strategy) {
       case CompatibilityStrategy.conservative:
@@ -790,8 +840,8 @@ class ConfigurationCompatibilityChecker {
         );
       case CompatibilityStrategy.performance:
         // Select highest resolution if device can handle it
-        return deviceCapabilities.hasAdvancedCamera 
-            ? resolutions.last 
+        return deviceCapabilities.hasAdvancedCamera
+            ? resolutions.last
             : resolutions[resolutions.length ~/ 2];
       case CompatibilityStrategy.balanced:
         // Select middle resolution
@@ -811,7 +861,8 @@ class ConfigurationCompatibilityChecker {
       case CompatibilityStrategy.conservative:
         return ImageFormat.jpeg; // Most compatible
       case CompatibilityStrategy.performance:
-        return formats.contains(ImageFormat.raw) && deviceCapabilities.hasAdvancedCamera
+        return formats.contains(ImageFormat.raw) &&
+                deviceCapabilities.hasAdvancedCamera
             ? ImageFormat.raw
             : ImageFormat.jpeg;
       case CompatibilityStrategy.balanced:
@@ -825,7 +876,7 @@ class ConfigurationCompatibilityChecker {
     CompatibilityStrategy strategy,
   ) {
     final maxMemory = deviceCapabilities.maxMemory;
-    
+
     switch (strategy) {
       case CompatibilityStrategy.conservative:
         return maxMemory ~/ 8; // Use 12.5% of memory
@@ -840,14 +891,16 @@ class ConfigurationCompatibilityChecker {
   Future<ARCaptureConfig> _resolveConservative(
     ARConfiguration arConfig,
     ARCaptureConfig captureConfig,
-    CompatibilityResult compatibilityResult,
+    ConfigurationCompatibilityCheckResult compatibilityResult,
     DeviceCapabilityInfo deviceCapabilities,
   ) async {
     return ARCaptureConfig(
-      resolution: _selectOptimalResolution(deviceCapabilities, CompatibilityStrategy.conservative),
+      resolution: _selectOptimalResolution(
+          deviceCapabilities, CompatibilityStrategy.conservative),
       format: ImageFormat.jpeg,
       captureIntervalMs: 2000, // 2 seconds
-      maxCacheSize: _selectOptimalCacheSize(deviceCapabilities, CompatibilityStrategy.conservative),
+      maxCacheSize: _selectOptimalCacheSize(
+          deviceCapabilities, CompatibilityStrategy.conservative),
     );
   }
 
@@ -855,14 +908,17 @@ class ConfigurationCompatibilityChecker {
   Future<ARCaptureConfig> _resolvePerformance(
     ARConfiguration arConfig,
     ARCaptureConfig captureConfig,
-    CompatibilityResult compatibilityResult,
+    ConfigurationCompatibilityCheckResult compatibilityResult,
     DeviceCapabilityInfo deviceCapabilities,
   ) async {
     return ARCaptureConfig(
-      resolution: _selectOptimalResolution(deviceCapabilities, CompatibilityStrategy.performance),
-      format: _selectOptimalFormat(deviceCapabilities, CompatibilityStrategy.performance),
+      resolution: _selectOptimalResolution(
+          deviceCapabilities, CompatibilityStrategy.performance),
+      format: _selectOptimalFormat(
+          deviceCapabilities, CompatibilityStrategy.performance),
       captureIntervalMs: 500, // 500ms
-      maxCacheSize: _selectOptimalCacheSize(deviceCapabilities, CompatibilityStrategy.performance),
+      maxCacheSize: _selectOptimalCacheSize(
+          deviceCapabilities, CompatibilityStrategy.performance),
     );
   }
 
@@ -870,14 +926,16 @@ class ConfigurationCompatibilityChecker {
   Future<ARCaptureConfig> _resolveBalanced(
     ARConfiguration arConfig,
     ARCaptureConfig captureConfig,
-    CompatibilityResult compatibilityResult,
+    ConfigurationCompatibilityCheckResult compatibilityResult,
     DeviceCapabilityInfo deviceCapabilities,
   ) async {
     return ARCaptureConfig(
-      resolution: _selectOptimalResolution(deviceCapabilities, CompatibilityStrategy.balanced),
+      resolution: _selectOptimalResolution(
+          deviceCapabilities, CompatibilityStrategy.balanced),
       format: ImageFormat.jpeg,
       captureIntervalMs: 1000, // 1 second
-      maxCacheSize: _selectOptimalCacheSize(deviceCapabilities, CompatibilityStrategy.balanced),
+      maxCacheSize: _selectOptimalCacheSize(
+          deviceCapabilities, CompatibilityStrategy.balanced),
     );
   }
 
@@ -933,8 +991,10 @@ class ConfigurationCompatibilityChecker {
 class CompatibilityRule {
   final String id;
   final String description;
-  final bool Function(ARConfiguration, ARCaptureConfig, DeviceCapabilityInfo) check;
-  final CompatibilityIssue Function(ARConfiguration, ARCaptureConfig, DeviceCapabilityInfo) createIssue;
+  final bool Function(ARConfiguration, ARCaptureConfig, DeviceCapabilityInfo)
+      check;
+  final CompatibilityIssue Function(
+      ARConfiguration, ARCaptureConfig, DeviceCapabilityInfo) createIssue;
 
   const CompatibilityRule({
     required this.id,

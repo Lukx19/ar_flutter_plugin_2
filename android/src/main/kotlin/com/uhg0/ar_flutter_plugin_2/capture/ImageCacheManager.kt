@@ -6,8 +6,29 @@ import android.graphics.ImageFormat
 import android.media.Image
 import android.util.Log
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
+
+internal object CaptureMemoryBudgetPolicy {
+    const val VERSION = "capture-memory-v1"
+    const val AVAILABLE_MEMORY_FRACTION = 0.30
+    const val MAX_CACHE_BYTES = 200L * 1024L * 1024L
+    const val METADATA_BYTES_PER_IMAGE = 1024L
+
+    fun maxEntries(
+        budgetBytes: Long,
+        payloadBytesPerImage: Long,
+        requestedEntries: Int,
+    ): Int {
+        val perEntryBytes = payloadBytesPerImage + METADATA_BYTES_PER_IMAGE
+        return minOf(
+            (budgetBytes / perEntryBytes).toInt().coerceAtLeast(1),
+            requestedEntries,
+        )
+    }
+}
 
 data class MemoryUsageEstimate(
     val perImageBytes: Long,
@@ -16,7 +37,8 @@ data class MemoryUsageEstimate(
     val totalBytes: Long
 ) {
     val totalMB: Double get() = totalBytes / (1024.0 * 1024.0)
-    val isWithinBounds: Boolean get() = totalMB < 200.0 // 200MB limit
+    val isWithinBounds: Boolean
+        get() = totalBytes <= CaptureMemoryBudgetPolicy.MAX_CACHE_BYTES
 }
 
 data class CacheConfiguration(
@@ -27,24 +49,48 @@ data class CacheConfiguration(
     val maxImageAgeMins: Int
 )
 
+enum class CachedImageState {
+    READY,
+    PERSISTING,
+    PENDING_RETRY,
+}
+
+data class CacheReservation(
+    val token: String,
+    val timestamp: Long,
+    val sequence: Long,
+    val reservedBytes: Long = 0L,
+)
+
 class ImageCacheManager(
     private val config: ParsedCaptureConfig,
     private val context: Context?,
     private val availableMemoryMBOverride: Int? = null,
+    private val onCapacityChanged: ((Map<String, Any?>) -> Unit)? = null,
 ) {
     private val imageCache = ConcurrentHashMap<String, CachedImage>()
+    private val reservations = ConcurrentHashMap<String, CacheReservation>()
     private val memoryUsage = AtomicLong(0L)
     private val cacheSequence = AtomicLong(0L)
     private var cacheConfiguration: CacheConfiguration? = null
+    private val cacheLock = Any()
 
     // Memory management
     private val availableMemoryMB: Int = availableMemoryMBOverride ?: getAvailableMemoryMB()
     private var maxAllowedMemoryBytes: Long = 0L
 
     init {
+        val availableFractionBytes =
+            (availableMemoryMB * CaptureMemoryBudgetPolicy.AVAILABLE_MEMORY_FRACTION * 1024 * 1024)
+                .toLong()
+        maxAllowedMemoryBytes =
+            minOf(availableFractionBytes, CaptureMemoryBudgetPolicy.MAX_CACHE_BYTES)
         cacheConfiguration = configure()
-        maxAllowedMemoryBytes = (availableMemoryMB * 0.3 * 1024 * 1024).toLong() // Use 30% of available memory
-        Log.i("ImageCacheManager", "Initialized with config: $cacheConfiguration")
+        Log.i(
+            "ImageCacheManager",
+            "Initialized with ${CaptureMemoryBudgetPolicy.VERSION}, " +
+                "cacheBudgetBytes=$maxAllowedMemoryBytes config=$cacheConfiguration",
+        )
     }
 
     /// Configure cache based on ARCaptureConfig settings and available memory
@@ -52,7 +98,7 @@ class ImageCacheManager(
         val baseEstimate = estimateMemoryUsage(config.maxCacheSize)
 
         // Adjust for memory constraints
-        val adjustedConfig = if (baseEstimate.totalMB > availableMemoryMB * 0.3) {
+        val adjustedConfig = if (baseEstimate.totalBytes > maxAllowedMemoryBytes) {
             adjustForMemoryConstraints()
         } else {
             CacheConfiguration(
@@ -83,16 +129,18 @@ class ImageCacheManager(
 
     /// Get optimal cache size based on configuration and available memory
     fun getOptimalCacheSize(): Int {
-        val perImageBytes = getPerImageBytes()
-        val maxImages = (maxAllowedMemoryBytes / perImageBytes).toInt()
-        return Math.min(maxImages, config.maxCacheSize)
+        return CaptureMemoryBudgetPolicy.maxEntries(
+            budgetBytes = maxAllowedMemoryBytes,
+            payloadBytesPerImage = getPerImageBytes(),
+            requestedEntries = config.maxCacheSize,
+        )
     }
 
     /// Estimate memory usage for given cache size
     fun estimateMemoryUsage(cacheSize: Int = config.maxCacheSize): MemoryUsageEstimate {
         val perImageBytes = getPerImageBytes()
         val totalCacheBytes = perImageBytes * cacheSize
-        val overheadBytes = cacheSize * 1024L // 1KB overhead per image for metadata
+        val overheadBytes = cacheSize * CaptureMemoryBudgetPolicy.METADATA_BYTES_PER_IMAGE
         val totalBytes = totalCacheBytes + overheadBytes
 
         return MemoryUsageEstimate(
@@ -130,29 +178,148 @@ class ImageCacheManager(
 
     /// Cache already-encoded image bytes.
     fun cacheImageBytes(imageId: String, imageBytes: ByteArray, format: Int): Boolean {
-        val cachedImage = CachedImage(
-            id = imageId,
-            bytes = imageBytes.copyOf(),
-            format = format,
-            timestamp = System.currentTimeMillis(),
-            sizeBytes = imageBytes.size.toLong(),
-            sequence = cacheSequence.incrementAndGet(),
+        return cacheImageAssets(
+            imageId = imageId,
+            assets = mapOf(formatName(format) to CachedImageAsset(imageBytes.copyOf(), format)),
         )
+    }
 
-        // Check if adding this image would exceed memory limits
-        val newMemoryUsage = memoryUsage.get() + cachedImage.sizeBytes
-        if (newMemoryUsage > maxAllowedMemoryBytes) {
-            val imagesToEvict = calculateEvictionCount(cachedImage.sizeBytes)
-            evictOldestImages(imagesToEvict)
+    private fun cacheImageAssets(
+        imageId: String,
+        assets: Map<String, CachedImageAsset>,
+        sequence: Long = cacheSequence.incrementAndGet(),
+    ): Boolean {
+        require(assets.isNotEmpty()) { "At least one capture asset is required" }
+        synchronized(cacheLock) {
+            val existingImage = imageCache[imageId]
+            val currentConfig = cacheConfiguration ?: configure()
+            val usedEntries = imageCache.size + reservations.size
+
+            if (existingImage == null && usedEntries >= currentConfig.maxCacheSize) {
+                throw CaptureSessionException(
+                    code = "CACHE_FULL",
+                    message = "Capture cache is full",
+                )
+            }
+
+            val cachedImage = CachedImage(
+                id = imageId,
+                assets = assets.mapValues { (_, asset) -> asset.copy(bytes = asset.bytes.copyOf()) },
+                timestamp = System.currentTimeMillis(),
+                sequence = sequence,
+                state = CachedImageState.READY,
+            )
+            existingImage?.let { memoryUsage.addAndGet(-it.sizeBytes) }
+            imageCache[imageId] = cachedImage
+            memoryUsage.addAndGet(cachedImage.sizeBytes)
         }
-        if (imageCache.size >= (cacheConfiguration?.maxCacheSize ?: 10)) {
-            evictOldestImages(1)
+
+        notifyCapacityChanged()
+        Log.d("ImageCacheManager", "Cached capture $imageId, total memory: ${memoryUsage.get() / 1024 / 1024}MB")
+        return true
+    }
+
+    fun reserveCaptureSlot(estimatedIncomingBytes: Long = getPerImageBytes().coerceAtLeast(1L)): String {
+        require(estimatedIncomingBytes > 0L) { "estimatedIncomingBytes must be positive" }
+        val reservation =
+            synchronized(cacheLock) {
+                val currentConfig = cacheConfiguration ?: configure()
+                val stagedBytes = imageCache.values.sumOf { it.sizeBytes }
+                val reservedBytes = reservations.values.sumOf { it.reservedBytes }
+                val usedEntries = imageCache.size + reservations.size
+                val maxStagedBytes = effectiveMaxStagedBytes(currentConfig)
+
+                when {
+                    usedEntries >= currentConfig.maxCacheSize ->
+                        throw CaptureSessionException(
+                            code = "CACHE_FULL",
+                            message = "Capture cache is full",
+                        )
+                    stagedBytes + reservedBytes + estimatedIncomingBytes > maxStagedBytes ->
+                        throw CaptureSessionException(
+                            code = "CACHE_FULL",
+                            message = "Capture cache has reached the staged byte budget",
+                        )
+                }
+
+                CacheReservation(
+                    token = "reservation_${cacheSequence.incrementAndGet()}",
+                    timestamp = System.currentTimeMillis(),
+                    sequence = cacheSequence.get(),
+                    reservedBytes = estimatedIncomingBytes,
+                ).also { reservations[it.token] = it }
+            }
+        notifyCapacityChanged()
+        return reservation.token
+    }
+
+    fun releaseReservation(reservationToken: String): Boolean {
+        val released =
+            synchronized(cacheLock) {
+                reservations.remove(reservationToken) != null
+            }
+        if (released) {
+            notifyCapacityChanged()
         }
+        return released
+    }
 
-        imageCache[imageId] = cachedImage
-        memoryUsage.addAndGet(cachedImage.sizeBytes)
+    fun commitReservedImage(
+        reservationToken: String,
+        imageId: String,
+        imageBytes: ByteArray,
+        format: Int,
+    ): Boolean {
+        return commitReservedAssets(
+            reservationToken = reservationToken,
+            imageId = imageId,
+            assets = mapOf(formatName(format) to CachedImageAsset(imageBytes.copyOf(), format)),
+        )
+    }
 
-        Log.d("ImageCacheManager", "Cached image $imageId (${cachedImage.sizeBytes} bytes), total memory: ${memoryUsage.get() / 1024 / 1024}MB")
+    fun commitReservedAssets(
+        reservationToken: String,
+        imageId: String,
+        assets: Map<String, CachedImageAsset>,
+    ): Boolean {
+        require(assets.isNotEmpty()) { "At least one capture asset is required" }
+        synchronized(cacheLock) {
+            val reservation =
+                reservations[reservationToken]
+                    ?: throw CaptureSessionException(
+                        code = "INVALID_RESERVATION",
+                        message = "No active reservation exists for token=$reservationToken",
+                    )
+            val existingImage = imageCache[imageId]
+            val actualBytes = assets.values.sumOf { it.bytes.size.toLong() }
+            val currentConfig = cacheConfiguration ?: configure()
+            val stagedWithoutExisting =
+                imageCache.values.sumOf { it.sizeBytes } - (existingImage?.sizeBytes ?: 0L)
+            val otherReservedBytes =
+                reservations.values.sumOf { it.reservedBytes } - reservation.reservedBytes
+            if (stagedWithoutExisting + otherReservedBytes + actualBytes >
+                effectiveMaxStagedBytes(currentConfig)
+            ) {
+                reservations.remove(reservationToken)
+                throw CaptureSessionException(
+                    code = "CACHE_BYTE_BUDGET_EXCEEDED",
+                    message = "Encoded capture exceeds the staged byte budget",
+                )
+            }
+            reservations.remove(reservationToken)
+            val cachedImage =
+                CachedImage(
+                    id = imageId,
+                    assets = assets.mapValues { (_, asset) -> asset.copy(bytes = asset.bytes.copyOf()) },
+                    timestamp = System.currentTimeMillis(),
+                    sequence = reservation.sequence,
+                    state = CachedImageState.READY,
+                )
+            existingImage?.let { memoryUsage.addAndGet(-it.sizeBytes) }
+            imageCache[imageId] = cachedImage
+            memoryUsage.addAndGet(cachedImage.sizeBytes)
+        }
+        notifyCapacityChanged()
         return true
     }
 
@@ -165,7 +332,56 @@ class ImageCacheManager(
     /// Get image data as byte array
     fun getImageData(imageId: String): ByteArray? {
         val cachedImage = imageCache[imageId] ?: return null
-        return cachedImage.bytes.copyOf()
+        return cachedImage.assets["jpeg"]?.bytes?.copyOf()
+    }
+
+    fun getImageData(imageId: String, format: String): ByteArray {
+        return requireAsset(requireCachedImage(imageId), format).bytes.copyOf()
+    }
+
+    fun getCaptureCapacity(): Map<String, Any?> {
+        val currentConfig = cacheConfiguration ?: configure()
+        val stagedBytes = imageCache.values.sumOf { it.sizeBytes }
+        val reservedEntries = reservations.size
+        val usedEntries = imageCache.size + reservedEntries
+        val maxEntries = currentConfig.maxCacheSize
+        val maxStagedBytes = effectiveMaxStagedBytes(currentConfig)
+        val readyEntries = imageCache.values.count { it.state == CachedImageState.READY }
+        val persistingEntries =
+            imageCache.values.count { it.state == CachedImageState.PERSISTING }
+        val pendingRetryEntries =
+            imageCache.values.count { it.state == CachedImageState.PENDING_RETRY }
+        val canCapture = usedEntries < maxEntries && stagedBytes < maxStagedBytes
+        val blockedReason =
+            when {
+                usedEntries >= maxEntries -> "cacheFull"
+                stagedBytes >= maxStagedBytes -> "memoryFull"
+                else -> null
+            }
+
+        return mapOf(
+            "maxEntries" to maxEntries,
+            "usedEntries" to usedEntries,
+            "reservedEntries" to reservedEntries,
+            "readyEntries" to readyEntries,
+            "persistingEntries" to persistingEntries,
+            "pendingRetryEntries" to pendingRetryEntries,
+            "stagedBytes" to stagedBytes,
+            "maxStagedBytes" to maxStagedBytes,
+            "canCapture" to canCapture,
+            "blockedReason" to blockedReason,
+        )
+    }
+
+    fun getImageSize(imageId: String): Map<String, Any> {
+        val cachedImage = requireCachedImage(imageId)
+        return mapOf(
+            "width" to config.resolution.width,
+            "height" to config.resolution.height,
+            "bytesPerPixel" to 1,
+            "totalBytes" to cachedImage.sizeBytes,
+            "bytesByFormat" to cachedImage.assets.mapValues { it.value.sizeBytes },
+        )
     }
 
     /// Save image to file
@@ -173,10 +389,7 @@ class ImageCacheManager(
         val cachedImage = imageCache[imageId] ?: return false
 
         return try {
-            if (format != cachedImage.format) {
-                Log.w("ImageCacheManager", "Requested format $format does not match cached format ${cachedImage.format} for $imageId")
-            }
-            val imageData = cachedImage.bytes
+            val imageData = requireAsset(cachedImage, formatName(format)).bytes
             val destination = java.io.File(filePath)
             destination.parentFile?.mkdirs()
             destination.writeBytes(imageData)
@@ -186,6 +399,83 @@ class ImageCacheManager(
             Log.e("ImageCacheManager", "Failed to save image $imageId", e)
             false
         }
+    }
+
+    fun saveImageToFile(imageId: String, filePath: String, format: String): Boolean {
+        val cachedImage = requireCachedImage(imageId)
+        requireFormatPath(format, filePath)
+        val asset = requireAsset(cachedImage, format)
+        val destination = File(filePath)
+        destination.parentFile?.mkdirs()
+        destination.writeBytes(asset.bytes)
+        return true
+    }
+
+    fun persistCapture(
+        imageId: String,
+        destinationRoot: String,
+        sessionFolder: String,
+        baseName: String,
+        format: String,
+    ): Map<String, Any> {
+        require(baseName.isNotBlank()) { "baseName is required" }
+        val cachedImage = requireCachedImage(imageId)
+        imageCache[imageId] = cachedImage.copy(state = CachedImageState.PERSISTING)
+        notifyCapacityChanged()
+        val destinationDirectory =
+            if (sessionFolder.isBlank()) {
+                File(destinationRoot)
+            } else {
+                File(destinationRoot, sessionFolder)
+            }
+        return try {
+            destinationDirectory.mkdirs()
+            val files = linkedMapOf<String, String>()
+            val sizes = linkedMapOf<String, Int>()
+            val hashes = linkedMapOf<String, String>()
+            val created = mutableListOf<File>()
+            try {
+                cachedImage.assets.forEach { (assetFormat, asset) ->
+                    val extension = when (assetFormat) {
+                        "raw" -> "dng"
+                        "png" -> "png"
+                        else -> "jpg"
+                    }
+                    val partFile = File(destinationDirectory, "$baseName.$extension.part")
+                    partFile.writeBytes(asset.bytes)
+                    created += partFile
+                    files[assetFormat] = partFile.absolutePath
+                    sizes[assetFormat] = asset.bytes.size
+                    hashes[assetFormat] = sha256(asset.bytes)
+                }
+            } catch (error: Throwable) {
+                created.forEach { it.delete() }
+                throw error
+            }
+            removeImage(imageId)
+            notifyCapacityChanged()
+            mapOf(
+                "files" to files,
+                "sizes" to sizes,
+                "hashes" to hashes,
+            )
+        } catch (error: Exception) {
+            imageCache[imageId] = cachedImage.copy(state = CachedImageState.PENDING_RETRY)
+            notifyCapacityChanged()
+            throw CaptureSessionException(
+                code = "PERSIST_FAILED",
+                message = "Failed to persist cached capture: ${error.message}",
+            )
+        }
+    }
+
+    fun discardCapture(imageId: String): Boolean {
+        val existed = imageCache.containsKey(imageId)
+        removeImage(imageId)
+        if (existed) {
+            notifyCapacityChanged()
+        }
+        return existed
     }
 
     /// Get current memory statistics
@@ -216,11 +506,14 @@ class ImageCacheManager(
         }
 
         Log.d("ImageCacheManager", "Cleanup removed ${expiredImages.size} expired images")
+        if (expiredImages.isNotEmpty()) {
+            notifyCapacityChanged()
+        }
     }
 
     // Private helper methods
     private fun getPerImageBytes(): Long {
-        val pixelsPerImage = config.resolution.width * config.resolution.height
+        val pixelsPerImage = config.resolution.width.toLong() * config.resolution.height.toLong()
         val bytesPerPixel = when (config.format) {
             ImageFormat.JPEG -> 3L
             ImageFormat.RAW_SENSOR -> 2L
@@ -250,27 +543,25 @@ class ImageCacheManager(
         return (memoryInfo.availMem / (1024 * 1024)).toInt()
     }
 
-    private fun calculateEvictionCount(newImageSize: Long): Int {
-        val requiredFreeSpace = newImageSize * 2 // Double the space to prevent frequent evictions
-        val currentOverage = memoryUsage.get() + requiredFreeSpace - maxAllowedMemoryBytes
-
-        if (currentOverage <= 0) return 0
-
-        val averageImageSize = if (imageCache.isEmpty()) getPerImageBytes() else memoryUsage.get() / imageCache.size
-        return Math.max(1, (currentOverage / averageImageSize).toInt())
-    }
-
-    private fun evictOldestImages(count: Int) {
-        val sortedImages = imageCache.values.sortedBy { it.sequence }
-        repeat(Math.min(count, sortedImages.size)) { index ->
-            removeImage(sortedImages[index].id)
-        }
-    }
-
     private fun removeImage(imageId: String) {
         imageCache[imageId]?.let { cachedImage ->
             memoryUsage.addAndGet(-cachedImage.sizeBytes)
             imageCache.remove(imageId)
+        }
+    }
+
+    private fun effectiveMaxStagedBytes(configuration: CacheConfiguration): Long {
+        val memoryBudget =
+            if (maxAllowedMemoryBytes > 0L) {
+                maxAllowedMemoryBytes
+            } else {
+                configuration.memoryUsageEstimate.totalCacheBytes
+            }
+        val configuredEstimate = configuration.memoryUsageEstimate.totalCacheBytes
+        return if (configuredEstimate > 0L) {
+            minOf(configuredEstimate, memoryBudget).coerceAtLeast(1L)
+        } else {
+            memoryBudget.coerceAtLeast(1L)
         }
     }
 
@@ -301,13 +592,78 @@ class ImageCacheManager(
             }
         }
     }
+
+    private fun requireCachedImage(imageId: String): CachedImage {
+        return imageCache[imageId] ?: throw CaptureSessionException(
+            code = "IMAGE_NOT_FOUND",
+            message = "No cached capture exists for imageId=$imageId",
+        )
+    }
+
+    private fun requireAsset(cachedImage: CachedImage, format: String): CachedImageAsset {
+        if (format !in setOf("jpeg", "raw", "png")) {
+            throw CaptureSessionException(
+                code = "FORMAT_NOT_CAPTURED",
+                message = "Unknown capture asset format=$format",
+            )
+        }
+        return cachedImage.assets[format] ?: throw CaptureSessionException(
+            code = "FORMAT_NOT_CAPTURED",
+            message = "Capture ${cachedImage.id} does not contain a $format asset",
+        )
+    }
+
+    private fun requireFormatPath(format: String, filePath: String) {
+        val lowerPath = filePath.lowercase()
+        val matches =
+            when (format) {
+                "jpeg" -> lowerPath.endsWith(".jpg") || lowerPath.endsWith(".jpeg")
+                "raw" -> lowerPath.endsWith(".dng")
+                "png" -> lowerPath.endsWith(".png")
+                else -> false
+            }
+        if (!matches) {
+            throw CaptureSessionException(
+                code = "FORMAT_MISMATCH",
+                message = "$format capture asset has an incompatible destination extension",
+            )
+        }
+    }
+
+    private fun formatName(format: Int): String =
+        when (format) {
+            ImageFormat.JPEG -> "jpeg"
+            ImageFormat.RAW_SENSOR -> "raw"
+            PNG_ASSET_FORMAT -> "png"
+            else -> throw CaptureSessionException(
+                code = "FORMAT_NOT_CAPTURED",
+                message = "Unsupported cached image format=$format",
+            )
+        }
+
+    private fun sha256(bytes: ByteArray): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
+        return digest.joinToString(separator = "") { byte -> "%02x".format(byte) }
+    }
+
+    private fun notifyCapacityChanged() {
+        onCapacityChanged?.invoke(getCaptureCapacity())
+    }
 }
 
 data class CachedImage(
     val id: String,
+    val assets: Map<String, CachedImageAsset>,
+    val timestamp: Long,
+    val sequence: Long,
+    val state: CachedImageState,
+) {
+    val sizeBytes: Long get() = assets.values.sumOf { it.sizeBytes }
+}
+
+data class CachedImageAsset(
     val bytes: ByteArray,
     val format: Int,
-    val timestamp: Long,
-    val sizeBytes: Long,
-    val sequence: Long,
-)
+) {
+    val sizeBytes: Long get() = bytes.size.toLong()
+}

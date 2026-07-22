@@ -1,5 +1,6 @@
 import 'ar_frame_pose.dart';
 import 'camera_resolution.dart';
+import 'ar_camera_intrinsics.dart';
 import '../datatypes/image_format.dart';
 
 /// Result of AR capture operation with synchronized pose data
@@ -8,9 +9,15 @@ class ARCaptureResult {
   final ARFramePose pose;
   final CameraResolution resolution;
   final ImageFormat format;
+  final List<ImageFormat> formats;
+  final Map<ImageFormat, int> imageSizeBytesByFormat;
   final DateTime captureTimestamp;
   final int imageSizeBytes;
   final bool isHighResolution;
+  final int? exposureStartTimestampNs;
+  final int? exposureTimeNs;
+  final int? rollingShutterSkewNs;
+  final ARCameraIntrinsics? intrinsics;
   final String? filePath;
 
   const ARCaptureResult({
@@ -18,9 +25,15 @@ class ARCaptureResult {
     required this.pose,
     required this.resolution,
     required this.format,
+    this.formats = const [ImageFormat.jpeg],
+    this.imageSizeBytesByFormat = const {},
     required this.captureTimestamp,
     required this.imageSizeBytes,
     required this.isHighResolution,
+    this.exposureStartTimestampNs,
+    this.exposureTimeNs,
+    this.rollingShutterSkewNs,
+    this.intrinsics,
     this.filePath,
   });
 
@@ -28,14 +41,32 @@ class ARCaptureResult {
     return ARCaptureResult(
       imageId: map['imageId'] as String,
       pose: ARFramePose.fromMap(map['pose'] as Map<String, dynamic>),
-      resolution: CameraResolution.fromMap(map['resolution'] as Map<String, dynamic>),
-      format: ImageFormat.values.firstWhere(
-        (f) => f.name == map['format'],
-        orElse: () => ImageFormat.jpeg,
+      resolution:
+          CameraResolution.fromMap(map['resolution'] as Map<String, dynamic>),
+      format: _captureFormatFromWire(map['format'] as String?),
+      formats: ((map['formats'] as List<dynamic>?) ?? const ['jpeg'])
+          .map((value) => _assetFormatFromWire(value as String))
+          .toList(growable: false),
+      imageSizeBytesByFormat:
+          ((map['imageSizeBytesByFormat'] as Map<dynamic, dynamic>?) ??
+                  const {})
+              .map(
+        (key, value) => MapEntry(
+          _assetFormatFromWire(key as String),
+          (value as num).toInt(),
+        ),
       ),
-      captureTimestamp: DateTime.fromMillisecondsSinceEpoch(map['captureTimestampMs'] as int),
+      captureTimestamp:
+          DateTime.fromMillisecondsSinceEpoch(map['captureTimestampMs'] as int),
       imageSizeBytes: map['imageSizeBytes'] as int,
       isHighResolution: map['isHighResolution'] as bool,
+      exposureStartTimestampNs: map['exposureStartTimestampNs'] as int?,
+      exposureTimeNs: map['exposureTimeNs'] as int?,
+      rollingShutterSkewNs: map['rollingShutterSkewNs'] as int?,
+      intrinsics: map['intrinsics'] != null
+          ? ARCameraIntrinsics.fromMap(
+              map['intrinsics'] as Map<String, dynamic>)
+          : null,
       filePath: map['filePath'] as String?,
     );
   }
@@ -46,9 +77,19 @@ class ARCaptureResult {
       'pose': pose.toMap(),
       'resolution': resolution.toMap(),
       'format': format.name,
+      'formats': formats.map((value) => value.name).toList(growable: false),
+      'imageSizeBytesByFormat': imageSizeBytesByFormat.map(
+        (key, value) => MapEntry(key.name, value),
+      ),
       'captureTimestampMs': captureTimestamp.millisecondsSinceEpoch,
       'imageSizeBytes': imageSizeBytes,
       'isHighResolution': isHighResolution,
+      if (exposureStartTimestampNs != null)
+        'exposureStartTimestampNs': exposureStartTimestampNs,
+      if (exposureTimeNs != null) 'exposureTimeNs': exposureTimeNs,
+      if (rollingShutterSkewNs != null)
+        'rollingShutterSkewNs': rollingShutterSkewNs,
+      if (intrinsics != null) 'intrinsics': intrinsics!.toMap(),
       'filePath': filePath,
     };
   }
@@ -70,9 +111,15 @@ class ARCaptureResult {
         other.pose == pose &&
         other.resolution == resolution &&
         other.format == format &&
+        _listEquals(other.formats, formats) &&
+        _mapEquals(other.imageSizeBytesByFormat, imageSizeBytesByFormat) &&
         other.captureTimestamp == captureTimestamp &&
         other.imageSizeBytes == imageSizeBytes &&
         other.isHighResolution == isHighResolution &&
+        other.exposureStartTimestampNs == exposureStartTimestampNs &&
+        other.exposureTimeNs == exposureTimeNs &&
+        other.rollingShutterSkewNs == rollingShutterSkewNs &&
+        other.intrinsics == intrinsics &&
         other.filePath == filePath;
   }
 
@@ -82,12 +129,40 @@ class ARCaptureResult {
       pose.hashCode ^
       resolution.hashCode ^
       format.hashCode ^
+      Object.hashAll(formats) ^
+      Object.hashAllUnordered(imageSizeBytesByFormat.entries) ^
       captureTimestamp.hashCode ^
       imageSizeBytes.hashCode ^
       isHighResolution.hashCode ^
+      exposureStartTimestampNs.hashCode ^
+      exposureTimeNs.hashCode ^
+      rollingShutterSkewNs.hashCode ^
+      intrinsics.hashCode ^
       filePath.hashCode;
 
   @override
   String toString() => 'ARCaptureResult(id: $imageId, res: $resolution, '
       'size: ${sizeInMB.toStringAsFixed(1)}MB, tracking: ${pose.isTracking})';
+}
+
+ImageFormat _captureFormatFromWire(String? value) => value == 'raw+jpeg'
+    ? ImageFormat.rawJpeg
+    : _assetFormatFromWire(value ?? 'jpeg');
+
+ImageFormat _assetFormatFromWire(String value) => ImageFormat.values.firstWhere(
+      (format) => format.name == value,
+      orElse: () => ImageFormat.jpeg,
+    );
+
+bool _listEquals<T>(List<T> left, List<T> right) {
+  if (left.length != right.length) return false;
+  for (var index = 0; index < left.length; index++) {
+    if (left[index] != right[index]) return false;
+  }
+  return true;
+}
+
+bool _mapEquals<K, V>(Map<K, V> left, Map<K, V> right) {
+  if (left.length != right.length) return false;
+  return left.entries.every((entry) => right[entry.key] == entry.value);
 }

@@ -158,14 +158,6 @@ class ExamplesHomeScreen extends StatelessWidget {
         color: Colors.indigo,
       ),
       ExampleInfo(
-        title: 'Integrated Workflow',
-        subtitle: 'Phase 6: End-to-end capture system',
-        description: 'Complete integrated workflow with AR session management, shared camera resources, memory optimization, and compatibility checking.',
-        icon: Icons.integration_instructions_rounded,
-        route: '/phase6-integrated-workflow',
-        color: Colors.deepPurple,
-      ),
-      ExampleInfo(
         title: 'Testing Framework',
         subtitle: 'Phase 7: Comprehensive testing & validation',
         description: 'Advanced testing framework with unit tests, integration tests, platform validation, cross-platform compatibility, and performance testing.',
