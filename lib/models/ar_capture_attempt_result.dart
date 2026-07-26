@@ -49,6 +49,8 @@ class ARCaptureAttemptResult {
     this.imageId,
     this.capture,
     this.quality,
+    this.pipelineTimingVersion,
+    this.pipelineTimingMs = const <String, int>{},
   });
 
   final NativeCaptureStatus status;
@@ -56,6 +58,11 @@ class ARCaptureAttemptResult {
   final String? imageId;
   final ARCaptureResult? capture;
   final CaptureQualityResult? quality;
+
+  /// Ephemeral native timing diagnostics for the immediately completed
+  /// capture attempt. They are intentionally not persisted as capture data.
+  final String? pipelineTimingVersion;
+  final Map<String, int> pipelineTimingMs;
 
   bool get isStaged => status == NativeCaptureStatus.staged;
   bool get isAcceptedPending => status == NativeCaptureStatus.acceptedPending;
@@ -75,7 +82,20 @@ class ARCaptureAttemptResult {
       quality: map['quality'] != null
           ? CaptureQualityResult.fromMap(map['quality'] as Map<String, dynamic>)
           : null,
+      pipelineTimingVersion: map['pipelineTimingVersion'] as String?,
+      pipelineTimingMs: _pipelineTimingMsFromMap(map['pipelineTimingMs']),
     );
+  }
+
+  static Map<String, int> _pipelineTimingMsFromMap(Object? rawTimings) {
+    if (rawTimings is! Map) {
+      return const <String, int>{};
+    }
+    return Map<String, int>.unmodifiable({
+      for (final entry in rawTimings.entries)
+        if (entry.key is String && entry.value is num && entry.value >= 0)
+          entry.key as String: (entry.value as num).round(),
+    });
   }
 
   Map<String, dynamic> toMap() {
@@ -85,6 +105,9 @@ class ARCaptureAttemptResult {
       'imageId': imageId,
       'capture': capture?.toMap(),
       'quality': quality?.toMap(),
+      if (pipelineTimingVersion != null)
+        'pipelineTimingVersion': pipelineTimingVersion,
+      if (pipelineTimingMs.isNotEmpty) 'pipelineTimingMs': pipelineTimingMs,
     };
   }
 }

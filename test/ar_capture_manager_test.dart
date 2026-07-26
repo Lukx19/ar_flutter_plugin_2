@@ -121,6 +121,11 @@ void main() {
             'status': 'staged',
             'attemptId': 'attempt-1',
             'imageId': 'img-1',
+            'pipelineTimingVersion': 'capture_pipeline_timing_v1',
+            'pipelineTimingMs': <String, int>{
+              'requestToProcessedFrame': 27,
+              'jpegEncoding': 41,
+            },
             'capture': <String, dynamic>{
               'imageId': 'img-1',
               'pose': <String, dynamic>{
@@ -536,6 +541,11 @@ void main() {
 
     expect(attempt.isStaged, isTrue);
     expect(attempt.capture?.imageId, 'img-1');
+    expect(attempt.pipelineTimingVersion, 'capture_pipeline_timing_v1');
+    expect(attempt.pipelineTimingMs, const {
+      'requestToProcessedFrame': 27,
+      'jpegEncoding': 41,
+    });
     expect(qualityPolicy['blurFilterEnabled'], isTrue);
     expect(qualityPolicy['blurThreshold'], 90.0);
     expect(qualityPolicy['keepRejectedCaptures'], isFalse);
