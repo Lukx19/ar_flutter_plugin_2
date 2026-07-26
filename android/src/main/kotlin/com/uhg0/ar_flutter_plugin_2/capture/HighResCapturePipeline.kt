@@ -57,7 +57,12 @@ internal class HighResCapturePipeline(
         sharedResult: SharedCameraCaptureResult,
         qualityPolicy: CaptureQualityPolicy?,
     ): Map<String, Any?> = runBlocking {
+        val finalizationStartedAtNs = System.nanoTime()
         var committed = false
+        var qualityAwaitMs = 0L
+        var poseAwaitMs = 0L
+        var rawDngEncodingMs = 0L
+        var cacheCommitMs = 0L
         val poseDeferred =
             async(workerDispatcher) {
                 sharedResult.preAlignedPose ?: poseResolver.resolvePose(
@@ -95,8 +100,8 @@ internal class HighResCapturePipeline(
                         message = "Blur analysis exceeded ${qualityAnalysisTimeoutMs}ms deadline",
                     )
                 }
-            val qualityElapsedMs = (System.nanoTime() - qualityStartNs) / 1_000_000L
-            if (quality != null && qualityElapsedMs > qualityAnalysisTimeoutMs) {
+            qualityAwaitMs = (System.nanoTime() - qualityStartNs) / 1_000_000L
+            if (quality != null && qualityAwaitMs > qualityAnalysisTimeoutMs) {
                 throw CaptureSessionException(
                     code = "QUALITY_ANALYSIS_FAILED",
                     message = "Blur analysis exceeded ${qualityAnalysisTimeoutMs}ms deadline",
@@ -116,6 +121,7 @@ internal class HighResCapturePipeline(
                         "quality" to quality,
                     )
                 } else {
+                    val poseAwaitStartedAtNs = System.nanoTime()
                     val alignedPose = try {
                         poseDeferred.await()
                     } catch (_: CancellationException) {
@@ -124,19 +130,24 @@ internal class HighResCapturePipeline(
                             code = "POSE_SYNC_FAILED",
                             message = "No aligned pose was available for the captured image",
                         )
+                    poseAwaitMs = (System.nanoTime() - poseAwaitStartedAtNs) / 1_000_000L
                     val assets = linkedMapOf(
                         sharedResult.primaryAssetName to CachedImageAsset(
                             sharedResult.imageBytes,
                             sharedResult.format,
                         ),
                     )
+                    val rawDngEncodingStartedAtNs = System.nanoTime()
                     sharedResult.rawDngEncoder?.invoke()?.let { dngBytes ->
                         assets["dng"] = CachedImageAsset(
                             dngBytes,
                             android.graphics.ImageFormat.RAW_SENSOR,
                         )
                     }
+                    rawDngEncodingMs =
+                        (System.nanoTime() - rawDngEncodingStartedAtNs) / 1_000_000L
                     val captureResult = buildSharedCaptureResult(sharedResult, alignedPose, assets)
+                    val cacheCommitStartedAtNs = System.nanoTime()
                     val cacheCommitted = cache?.commitReservedAssets(
                         reservationToken = sharedResult.reservationToken,
                         imageId = sharedResult.imageId,
@@ -148,6 +159,8 @@ internal class HighResCapturePipeline(
                             message = "Capture cache rejected the reserved assets",
                         )
                     }
+                    cacheCommitMs =
+                        (System.nanoTime() - cacheCommitStartedAtNs) / 1_000_000L
                     committed = true
 
                     if (quality != null && !quality["blurPassed"].asBoolean()) {
@@ -169,7 +182,17 @@ internal class HighResCapturePipeline(
                     }
                 }
 
-            result
+            result +
+                ("pipelineTimingMs" to
+                    (sharedResult.pipelineTimingMs +
+                        mapOf(
+                            "qualityAwait" to qualityAwaitMs,
+                            "poseAwait" to poseAwaitMs,
+                            "rawDngEncoding" to rawDngEncodingMs,
+                            "cacheCommit" to cacheCommitMs,
+                            "nativeFinalizationTotal" to
+                                ((System.nanoTime() - finalizationStartedAtNs) / 1_000_000L),
+                        )))
         } catch (error: Throwable) {
             qualityDeferred?.cancel()
             poseDeferred.cancel()

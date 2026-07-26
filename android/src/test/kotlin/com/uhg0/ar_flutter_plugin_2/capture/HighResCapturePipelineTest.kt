@@ -178,6 +178,11 @@ class HighResCapturePipelineTest {
         val capture = result["capture"] as Map<*, *>
         assertEquals("image-1", capture["imageId"])
         assertEquals(4_000_000L, capture["exposureTimeNs"])
+        val timing = result["pipelineTimingMs"] as Map<*, *>
+        assertTrue(timing.containsKey("qualityAwait"))
+        assertTrue(timing.containsKey("poseAwait"))
+        assertTrue(timing.containsKey("cacheCommit"))
+        assertTrue(timing.containsKey("nativeFinalizationTotal"))
     }
 
     @Test

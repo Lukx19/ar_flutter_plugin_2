@@ -121,6 +121,7 @@ data class SharedCameraCaptureResult(
     val primaryAssetName: String = "jpeg",
     val preEncodeQuality: Map<String, Any>? = null,
     val preAlignedPose: PoseDataExtractor.AlignedPose? = null,
+    val pipelineTimingMs: Map<String, Long> = emptyMap(),
 )
 
 internal class SharedBlurRejectedException(val quality: Map<String, Any>) :
@@ -320,6 +321,7 @@ internal class SharedCameraManager(
         val reservationToken: String,
         val qualityPolicy: CaptureQualityPolicy?,
         val generation: Long,
+        val requestStartedAtNs: Long = System.nanoTime(),
         @Volatile var result: SharedCameraCaptureResult? = null,
         @Volatile var error: Throwable? = null,
         @Volatile var preEncodeQuality: Map<String, Any>? = null,
@@ -1177,6 +1179,7 @@ internal class SharedCameraManager(
         correlated: CorrelatedProcessedFrame<PackedYuv420>,
     ) {
         val pending = pendingManualCapture ?: return
+        val processedFrameAtNs = System.nanoTime()
         val timing =
             PoseDataExtractor.CaptureTiming(
                 sensorTimestampNs = correlated.result.sensorTimestampNs,
@@ -1184,7 +1187,9 @@ internal class SharedCameraManager(
                 rollingShutterSkewNs = correlated.result.rollingShutterSkewNs,
                 observedTimestampNs = correlated.result.observedTimestampNs,
             )
+        val poseStartedAtNs = System.nanoTime()
         val alignedPose = resolvePoseBeforeEncoding(timing)
+        val poseResolutionMs = (System.nanoTime() - poseStartedAtNs) / 1_000_000L
         if (alignedPose == null) {
             pending.error =
                 CaptureSessionException(
@@ -1202,12 +1207,15 @@ internal class SharedCameraManager(
         )
         val imageId = generateImageId()
         val workerStartGate = CountDownLatch(1)
+        val workerSubmittedAtNs = System.nanoTime()
         val submitted =
             finalizationWorkers.submit {
                 try {
                     workerStartGate.await()
-                    val startedAtMs = System.currentTimeMillis()
+                    val workerStartedAtNs = System.nanoTime()
+                    val encodingStartedAtNs = System.nanoTime()
                     val encodedBytes = encodePackedYuv420AsJpeg(correlated.frame)
+                    val jpegEncodingMs = (System.nanoTime() - encodingStartedAtNs) / 1_000_000L
                     val assetName = "jpeg"
                     val assetFormat = ImageFormat.JPEG
                     val encoded =
@@ -1233,12 +1241,21 @@ internal class SharedCameraManager(
                             primaryAssetName = assetName,
                             preEncodeQuality = pending.preEncodeQuality,
                             preAlignedPose = alignedPose,
+                            pipelineTimingMs =
+                                mapOf(
+                                    "requestToProcessedFrame" to
+                                        ((processedFrameAtNs - pending.requestStartedAtNs) / 1_000_000L),
+                                    "preAcceptancePose" to poseResolutionMs,
+                                    "finalizationQueueWait" to
+                                        ((workerStartedAtNs - workerSubmittedAtNs) / 1_000_000L),
+                                    "jpegEncoding" to jpegEncodingMs,
+                                ),
                         )
                     onCaptureEncoded(encoded, pending.qualityPolicy)
                     Log.i(
                         "SharedCameraManager",
                         "Encoded ${encodedBytes.size} ${assetName.uppercase()} bytes in " +
-                            "${System.currentTimeMillis() - startedAtMs}ms",
+                            "${jpegEncodingMs}ms",
                     )
                 } catch (error: Throwable) {
                     pending.error = error
