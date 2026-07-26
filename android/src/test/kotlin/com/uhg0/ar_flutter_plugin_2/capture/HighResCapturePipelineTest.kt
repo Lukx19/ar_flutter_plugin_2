@@ -11,6 +11,28 @@ import org.junit.Test
 
 class HighResCapturePipelineTest {
     @Test
+    fun `hardware JPEG acquisition records every pre-finalization timing stage`() {
+        val timing = hardwareJpegAcquisitionTimings(
+            requestStartedAtNs = 1_000_000L,
+            correlatedFrameAtNs = 351_000_000L,
+        )
+
+        assertEquals(
+            setOf(
+                CapturePipelineTimingContract.REQUEST_TO_PROCESSED_FRAME,
+                CapturePipelineTimingContract.PRE_ACCEPTANCE_POSE,
+                CapturePipelineTimingContract.FINALIZATION_QUEUE_WAIT,
+                CapturePipelineTimingContract.JPEG_ENCODING,
+            ),
+            timing.keys,
+        )
+        assertEquals(350L, timing[CapturePipelineTimingContract.REQUEST_TO_PROCESSED_FRAME])
+        assertEquals(0L, timing[CapturePipelineTimingContract.PRE_ACCEPTANCE_POSE])
+        assertEquals(0L, timing[CapturePipelineTimingContract.FINALIZATION_QUEUE_WAIT])
+        assertEquals(0L, timing[CapturePipelineTimingContract.JPEG_ENCODING])
+    }
+
+    @Test
     fun `releases reservation and skips commit when blur is rejected without retention`() {
         val cache = FakeCache()
         val poseResolver = FakePoseResolver()

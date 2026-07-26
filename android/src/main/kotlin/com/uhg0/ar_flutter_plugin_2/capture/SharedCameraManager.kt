@@ -125,6 +125,23 @@ data class SharedCameraCaptureResult(
     val pipelineTimingMs: Map<String, Long> = emptyMap(),
 )
 
+/**
+ * The ordinary shared-camera JPEG path receives hardware-encoded bytes. Its
+ * material wait is shutter request to correlated image delivery; it does not
+ * queue a software finalization worker or perform a second JPEG encode.
+ */
+internal fun hardwareJpegAcquisitionTimings(
+    requestStartedAtNs: Long,
+    correlatedFrameAtNs: Long,
+): Map<String, Long> =
+    mapOf(
+        CapturePipelineTimingContract.REQUEST_TO_PROCESSED_FRAME to
+            ((correlatedFrameAtNs - requestStartedAtNs).coerceAtLeast(0L) / 1_000_000L),
+        CapturePipelineTimingContract.PRE_ACCEPTANCE_POSE to 0L,
+        CapturePipelineTimingContract.FINALIZATION_QUEUE_WAIT to 0L,
+        CapturePipelineTimingContract.JPEG_ENCODING to 0L,
+    )
+
 internal class SharedBlurRejectedException(val quality: Map<String, Any>) :
     RuntimeException("Capture rejected by the pre-encode blur filter")
 
@@ -2086,6 +2103,10 @@ internal class SharedCameraManager(
                     primaryAssetName = "jpeg",
                     preEncodeQuality = pending.preEncodeQuality,
                     requiresPose = pending.requiresPose,
+                    pipelineTimingMs = hardwareJpegAcquisitionTimings(
+                        requestStartedAtNs = pending.requestStartedAtNs,
+                        correlatedFrameAtNs = System.nanoTime(),
+                    ),
                 )
 
             pending.result = captureResult
