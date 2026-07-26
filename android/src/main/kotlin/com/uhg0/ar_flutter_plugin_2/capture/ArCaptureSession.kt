@@ -166,7 +166,9 @@ internal class ArCaptureSession(
                                 "height" to accepted.height,
                                 "format" to accepted.format,
                                 "captureTimestampMs" to accepted.captureTimestampMs,
-                                "pose" to poseDataExtractor.toPoseMap(accepted.alignedPose),
+                                "pose" to accepted.alignedPose?.let(
+                                    poseDataExtractor::toPoseMap,
+                                ),
                                 "quality" to accepted.quality,
                                 "state" to "acceptedPending",
                             ),
@@ -220,7 +222,10 @@ internal class ArCaptureSession(
         emitCapacityChanged()
     }
 
-    fun captureImage(qualityPolicyMap: Map<String, Any?>? = null): Map<String, Any?> {
+    fun captureImage(
+        qualityPolicyMap: Map<String, Any?>? = null,
+        requiresPose: Boolean = true,
+    ): Map<String, Any?> {
         requireInitialized()
         if (isCaptureInProgress) {
             throw CaptureSessionException(
@@ -232,7 +237,7 @@ internal class ArCaptureSession(
         isCaptureInProgress = true
         try {
             sharedCameraManager?.let { manager ->
-                if (!poseDataExtractor.awaitTrackingPose(TrackingPoseReadyTimeoutMs)) {
+                if (requiresPose && !poseDataExtractor.awaitTrackingPose(TrackingPoseReadyTimeoutMs)) {
                     throw CaptureSessionException(
                         code = "NOT_TRACKING",
                         message = "AR tracking is not ready for a shared-camera capture",
@@ -241,7 +246,10 @@ internal class ArCaptureSession(
                 val qualityPolicy = qualityPolicyMap?.let(::buildQualityPolicyMap)
                 val sharedResult =
                     try {
-                        manager.captureImageResult(qualityPolicy)
+                        manager.captureImageResult(
+                            qualityPolicy = qualityPolicy,
+                            requiresPose = requiresPose,
+                        )
                     } catch (rejected: SharedBlurRejectedException) {
                         return mapOf(
                             "status" to "rejectedBlur",
@@ -251,7 +259,7 @@ internal class ArCaptureSession(
                             "quality" to rejected.quality,
                         )
                     }
-                if (sharedResult.preAlignedPose == null) {
+                if (requiresPose && sharedResult.preAlignedPose == null) {
                     awaitPoseAfter(sharedResult.sensorTimestampNs)
                 }
                 return highResCapturePipeline.processCapture(sharedResult, qualityPolicy)
@@ -263,14 +271,16 @@ internal class ArCaptureSession(
                 message = "No AR frame is available for capture",
             )
             val camera = frame.camera
-            if (camera.trackingState != TrackingState.TRACKING) {
+            if (requiresPose && camera.trackingState != TrackingState.TRACKING) {
                 throw CaptureSessionException(
                     code = "NOT_TRACKING",
                     message = "AR camera is not tracking",
                 )
             }
 
-            poseDataExtractor.onFrame(frame)
+            if (requiresPose) {
+                poseDataExtractor.onFrame(frame)
+            }
             val image = try {
                 frame.acquireCameraImage()
             } catch (error: NotYetAvailableException) {
@@ -291,21 +301,25 @@ internal class ArCaptureSession(
                         Size(acquiredImage.width, acquiredImage.height),
                     ) ?: capabilityQuerier.getCameraIntrinsics()
                 val alignedPose =
-                    poseDataExtractor.resolvePose(
-                        PoseDataExtractor.CaptureTiming(
-                            sensorTimestampNs = sensorTimestampNs,
-                            exposureTimeNs = 0L,
-                            rollingShutterSkewNs = 0L,
-                        ),
-                        waitForFuturePoseMs = 0L,
-                    ) ?: throw CaptureSessionException(
-                        code = "POSE_SYNC_FAILED",
-                        message = "No aligned pose was available for the captured image",
-                    )
+                    if (requiresPose) {
+                        poseDataExtractor.resolvePose(
+                            PoseDataExtractor.CaptureTiming(
+                                sensorTimestampNs = sensorTimestampNs,
+                                exposureTimeNs = 0L,
+                                rollingShutterSkewNs = 0L,
+                            ),
+                            waitForFuturePoseMs = 0L,
+                        ) ?: throw CaptureSessionException(
+                            code = "POSE_SYNC_FAILED",
+                            message = "No aligned pose was available for the captured image",
+                        )
+                    } else {
+                        null
+                    }
 
                 val captureResult = mapOf(
                     "imageId" to imageId,
-                    "pose" to poseDataExtractor.toPoseMap(alignedPose),
+                    "pose" to alignedPose?.let(poseDataExtractor::toPoseMap),
                     "resolution" to mapOf(
                         "width" to acquiredImage.width,
                         "height" to acquiredImage.height,
@@ -773,10 +787,10 @@ internal class ArCaptureSession(
             "status" to "acceptedPending",
             "attemptId" to "attempt_${accepted.captureTimestampMs}",
             "imageId" to accepted.imageId,
-            "capture" to
+            "capture" to accepted.alignedPose?.let { pose ->
                 mapOf(
                     "imageId" to accepted.imageId,
-                    "pose" to poseDataExtractor.toPoseMap(accepted.alignedPose),
+                    "pose" to poseDataExtractor.toPoseMap(pose),
                     "resolution" to
                         mapOf("width" to accepted.width, "height" to accepted.height),
                     "format" to accepted.format,
@@ -790,7 +804,8 @@ internal class ArCaptureSession(
                     "rollingShutterSkewNs" to accepted.rollingShutterSkewNs,
                     "intrinsics" to accepted.intrinsics,
                     "filePath" to null,
-                ),
+                )
+            },
             "quality" to accepted.quality,
         )
 

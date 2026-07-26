@@ -257,6 +257,35 @@ class HighResCapturePipelineTest {
         assertEquals(listOf("raw"), capture["formats"])
     }
 
+    @Test
+    fun `temporary calibration capture stages without resolving a pose`() {
+        val cache = FakeCache()
+        val poseResolver = FakePoseResolver()
+        val pipeline =
+            HighResCapturePipeline(
+                cache = cache,
+                poseResolver = poseResolver,
+                qualityAnalyzer = { _, _ -> qualityMap(blurPassed = true, blurThreshold = 110.0) },
+            )
+
+        val result =
+            pipeline.processCapture(
+                sharedResult = sampleSharedResult().copy(requiresPose = false),
+                qualityPolicy =
+                    CaptureQualityPolicy(
+                        blurFilterEnabled = false,
+                        blurThreshold = 0.0,
+                        keepRejectedCaptures = false,
+                    ),
+            )
+
+        assertEquals("staged", result["status"])
+        assertEquals("image-1", result["imageId"])
+        assertNull(result["capture"])
+        assertTrue(poseResolver.resolvedTimings.isEmpty())
+        assertEquals(listOf("reservation-1"), cache.committedReservations)
+    }
+
     private fun sampleSharedResult() =
         SharedCameraCaptureResult(
             reservationToken = "reservation-1",

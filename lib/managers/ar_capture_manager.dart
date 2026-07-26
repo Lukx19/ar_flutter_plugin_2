@@ -385,10 +385,12 @@ class ARCaptureManager {
     }
   }
 
-  /// Capture high-resolution image with synchronized pose data
+  /// Captures a high-resolution image. Normal captures require pose metadata;
+  /// temporary responsiveness measurements may omit it while AR remains active.
   Future<ARCaptureAttemptResult> captureImageAttempt({
     CaptureQualityPolicy qualityPolicy =
         const CaptureQualityPolicy.productionDefault(),
+    bool requiresPose = true,
   }) async {
     _throwIfDisposed();
     if (!isEnabled) {
@@ -402,7 +404,10 @@ class ARCaptureManager {
       await _ensureInitialized();
       final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
         'captureHighResImage',
-        <String, dynamic>{'qualityPolicy': qualityPolicy.toMap()},
+        <String, dynamic>{
+          'qualityPolicy': qualityPolicy.toMap(),
+          'requiresPose': requiresPose,
+        },
       );
       if (result == null) {
         throw const ARCaptureException(

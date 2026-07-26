@@ -539,6 +539,28 @@ void main() {
     expect(qualityPolicy['blurFilterEnabled'], isTrue);
     expect(qualityPolicy['blurThreshold'], 90.0);
     expect(qualityPolicy['keepRejectedCaptures'], isFalse);
+    expect(captureArgs['requiresPose'], isTrue);
+  });
+
+  test('can request a temporary capture without pose metadata', () async {
+    final sessionManager = ARSessionManager(
+      42,
+      _FakeBuildContext(),
+      PlaneDetectionConfig.horizontal,
+    );
+    final captureManager = ARCaptureManager(
+      sessionManager,
+      captureConfig,
+      _FakeBuildContext(),
+    );
+
+    await captureManager.captureImageAttempt(requiresPose: false);
+
+    final captureCall = methodCalls.firstWhere(
+      (call) => call.method == 'captureHighResImage',
+    );
+    final captureArgs = captureCall.arguments as Map<dynamic, dynamic>;
+    expect(captureArgs['requiresPose'], isFalse);
   });
 
   test('parses rejected blur attempt results', () async {

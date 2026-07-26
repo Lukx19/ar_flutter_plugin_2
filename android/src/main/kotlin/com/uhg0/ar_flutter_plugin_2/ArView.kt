@@ -434,7 +434,12 @@ internal class ArView(
                     try {
                         val args = call.arguments as? Map<String, Any?>
                         val policy = args?.get("qualityPolicy") as? Map<String, Any?>
-                        result.success(withContext(Dispatchers.Default) { captureSession.captureImage(policy) })
+                        val requiresPose = args?.get("requiresPose") as? Boolean ?: true
+                        result.success(
+                            withContext(Dispatchers.Default) {
+                                captureSession.captureImage(policy, requiresPose)
+                            },
+                        )
                     } catch (error: CaptureSessionException) {
                         result.error(error.code, error.message, null)
                     } catch (error: IllegalArgumentException) {

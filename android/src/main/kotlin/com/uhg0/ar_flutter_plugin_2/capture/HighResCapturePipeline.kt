@@ -91,15 +91,19 @@ internal class HighResCapturePipeline(
         var rawDngEncodingMs = 0L
         var cacheCommitMs = 0L
         val poseDeferred =
-            async(workerDispatcher) {
-                sharedResult.preAlignedPose ?: poseResolver.resolvePose(
-                    PoseDataExtractor.CaptureTiming(
-                        sensorTimestampNs = sharedResult.sensorTimestampNs,
-                        exposureTimeNs = sharedResult.exposureTimeNs,
-                        rollingShutterSkewNs = sharedResult.rollingShutterSkewNs,
-                        observedTimestampNs = sharedResult.observedTimestampNs,
-                    ),
-                )
+            if (sharedResult.requiresPose) {
+                async(workerDispatcher) {
+                    sharedResult.preAlignedPose ?: poseResolver.resolvePose(
+                        PoseDataExtractor.CaptureTiming(
+                            sensorTimestampNs = sharedResult.sensorTimestampNs,
+                            exposureTimeNs = sharedResult.exposureTimeNs,
+                            rollingShutterSkewNs = sharedResult.rollingShutterSkewNs,
+                            observedTimestampNs = sharedResult.observedTimestampNs,
+                        ),
+                    )
+                }
+            } else {
+                null
             }
         val qualityDeferred =
             qualityPolicy?.let { policy ->
@@ -137,7 +141,7 @@ internal class HighResCapturePipeline(
 
             val result =
                 if (quality != null && !quality["blurPassed"].asBoolean() && !qualityPolicy!!.keepRejectedCaptures) {
-                    poseDeferred.cancel()
+                    poseDeferred?.cancel()
                     sharedResult.closeRawImage?.invoke()
                     cache?.releaseReservation(sharedResult.reservationToken)
                     mapOf(
@@ -149,15 +153,22 @@ internal class HighResCapturePipeline(
                     )
                 } else {
                     val poseAwaitStartedAtNs = System.nanoTime()
-                    val alignedPose = try {
-                        poseDeferred.await()
-                    } catch (_: CancellationException) {
-                        null
-                    } ?: throw CaptureSessionException(
-                            code = "POSE_SYNC_FAILED",
-                            message = "No aligned pose was available for the captured image",
-                        )
-                    poseAwaitMs = (System.nanoTime() - poseAwaitStartedAtNs) / 1_000_000L
+                    val alignedPose =
+                        if (sharedResult.requiresPose) {
+                            (try {
+                                poseDeferred?.await()
+                            } catch (_: CancellationException) {
+                                null
+                            } ?: throw CaptureSessionException(
+                                code = "POSE_SYNC_FAILED",
+                                message = "No aligned pose was available for the captured image",
+                            )).also {
+                                poseAwaitMs =
+                                    (System.nanoTime() - poseAwaitStartedAtNs) / 1_000_000L
+                            }
+                        } else {
+                            null
+                        }
                     val assets = linkedMapOf(
                         sharedResult.primaryAssetName to CachedImageAsset(
                             sharedResult.imageBytes,
@@ -173,7 +184,10 @@ internal class HighResCapturePipeline(
                     }
                     rawDngEncodingMs =
                         (System.nanoTime() - rawDngEncodingStartedAtNs) / 1_000_000L
-                    val captureResult = buildSharedCaptureResult(sharedResult, alignedPose, assets)
+                    val captureResult =
+                        alignedPose?.let { pose ->
+                            buildSharedCaptureResult(sharedResult, pose, assets)
+                        }
                     val cacheCommitStartedAtNs = System.nanoTime()
                     val cacheCommitted = cache?.commitReservedAssets(
                         reservationToken = sharedResult.reservationToken,
@@ -223,7 +237,7 @@ internal class HighResCapturePipeline(
                         )))
         } catch (error: Throwable) {
             qualityDeferred?.cancel()
-            poseDeferred.cancel()
+            poseDeferred?.cancel()
             if (!committed) {
                 sharedResult.closeRawImage?.invoke()
                 cache?.releaseReservation(sharedResult.reservationToken)

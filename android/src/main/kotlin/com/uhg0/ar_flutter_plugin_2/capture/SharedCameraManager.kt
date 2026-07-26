@@ -121,6 +121,7 @@ data class SharedCameraCaptureResult(
     val primaryAssetName: String = "jpeg",
     val preEncodeQuality: Map<String, Any>? = null,
     val preAlignedPose: PoseDataExtractor.AlignedPose? = null,
+    val requiresPose: Boolean = true,
     val pipelineTimingMs: Map<String, Long> = emptyMap(),
 )
 
@@ -133,7 +134,7 @@ internal data class SharedCaptureAccepted(
     val height: Int,
     val format: String,
     val captureTimestampMs: Long,
-    val alignedPose: PoseDataExtractor.AlignedPose,
+    val alignedPose: PoseDataExtractor.AlignedPose?,
     val quality: Map<String, Any>?,
     val sensorTimestampNs: Long,
     val exposureTimeNs: Long,
@@ -321,6 +322,7 @@ internal class SharedCameraManager(
         val reservationToken: String,
         val qualityPolicy: CaptureQualityPolicy?,
         val generation: Long,
+        val requiresPose: Boolean = true,
         val requestStartedAtNs: Long = System.nanoTime(),
         @Volatile var result: SharedCameraCaptureResult? = null,
         @Volatile var error: Throwable? = null,
@@ -1188,9 +1190,9 @@ internal class SharedCameraManager(
                 observedTimestampNs = correlated.result.observedTimestampNs,
             )
         val poseStartedAtNs = System.nanoTime()
-        val alignedPose = resolvePoseBeforeEncoding(timing)
+        val alignedPose = if (pending.requiresPose) resolvePoseBeforeEncoding(timing) else null
         val poseResolutionMs = (System.nanoTime() - poseStartedAtNs) / 1_000_000L
-        if (alignedPose == null) {
+        if (pending.requiresPose && alignedPose == null) {
             pending.error =
                 CaptureSessionException(
                     code = "POSE_SYNC_FAILED",
@@ -1200,11 +1202,13 @@ internal class SharedCameraManager(
             return
         }
         pending.preAlignedPose = alignedPose
-        Log.i(
-            "SharedCameraManager",
-            "Pose ${alignedPose.poseAlignment} resolved before finalization " +
-                "for sensor timestamp ${correlated.result.sensorTimestampNs}",
-        )
+        if (alignedPose != null) {
+            Log.i(
+                "SharedCameraManager",
+                "Pose ${alignedPose.poseAlignment} resolved before finalization " +
+                    "for sensor timestamp ${correlated.result.sensorTimestampNs}",
+            )
+        }
         val imageId = generateImageId()
         val workerStartGate = CountDownLatch(1)
         val workerSubmittedAtNs = System.nanoTime()
@@ -1241,6 +1245,7 @@ internal class SharedCameraManager(
                             primaryAssetName = assetName,
                             preEncodeQuality = pending.preEncodeQuality,
                             preAlignedPose = alignedPose,
+                            requiresPose = pending.requiresPose,
                             pipelineTimingMs =
                                 mapOf(
                                     CapturePipelineTimingContract.REQUEST_TO_PROCESSED_FRAME to
@@ -1342,6 +1347,7 @@ internal class SharedCameraManager(
 
     fun captureImageResult(
         qualityPolicy: CaptureQualityPolicy? = null,
+        requiresPose: Boolean = true,
         timeoutMs: Long = ManualCaptureTimeoutMs,
     ): SharedCameraCaptureResult {
         if (!isInitialized) {
@@ -1355,6 +1361,7 @@ internal class SharedCameraManager(
             reservationToken,
             qualityPolicy,
             requestGeneration.next(),
+            requiresPose,
         )
         if (!pendingManualCaptureOwner.acquire(pending)) {
             imageCacheManager?.releaseReservation(reservationToken)
@@ -2078,6 +2085,7 @@ internal class SharedCameraManager(
                     intrinsics = intrinsics,
                     primaryAssetName = "jpeg",
                     preEncodeQuality = pending.preEncodeQuality,
+                    requiresPose = pending.requiresPose,
                 )
 
             pending.result = captureResult
