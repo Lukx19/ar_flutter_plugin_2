@@ -653,7 +653,7 @@ class ConfigurationCompatibilityChecker {
     if (captureConfig.resolution.totalPixels > 2000000)
       performanceLoad += 0.2; // HD+
     if (captureConfig.captureIntervalMs < 1000) performanceLoad += 0.3;
-    if (captureConfig.format == ImageFormat.raw) performanceLoad += 0.2;
+    if (captureConfig.format == CaptureFormat.rawJpeg) performanceLoad += 0.2;
 
     if (performanceLoad > 0.8 && !deviceCapabilities.hasAdvancedCamera) {
       issues.add(CompatibilityIssue(
@@ -725,7 +725,6 @@ class ConfigurationCompatibilityChecker {
     switch (format) {
       case ImageFormat.jpeg:
         return (pixelCount * 0.5).round(); // JPEG compression ~50%
-      case ImageFormat.raw:
       case ImageFormat.rawJpeg:
         return pixelCount * 4; // RGBA
       // case ImageFormat.yuv420:
@@ -861,9 +860,9 @@ class ConfigurationCompatibilityChecker {
       case CompatibilityStrategy.conservative:
         return ImageFormat.jpeg; // Most compatible
       case CompatibilityStrategy.performance:
-        return formats.contains(ImageFormat.raw) &&
+        return formats.contains(CaptureFormat.rawJpeg) &&
                 deviceCapabilities.hasAdvancedCamera
-            ? ImageFormat.raw
+            ? CaptureFormat.rawJpeg
             : ImageFormat.jpeg;
       case CompatibilityStrategy.balanced:
         return ImageFormat.jpeg; // Good balance of quality and performance

@@ -11,6 +11,7 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
     let sessionManagerChannel: FlutterMethodChannel
     let objectManagerChannel: FlutterMethodChannel
     let anchorManagerChannel: FlutterMethodChannel
+    let captureChannel: FlutterMethodChannel
     var showPlanes = false
     var planeCount = 0
     var customPlaneTexturePath: String? = nil
@@ -48,6 +49,7 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
         self.sessionManagerChannel = FlutterMethodChannel(name: "arsession_\(viewId)", binaryMessenger: messenger)
         self.objectManagerChannel = FlutterMethodChannel(name: "arobjects_\(viewId)", binaryMessenger: messenger)
         self.anchorManagerChannel = FlutterMethodChannel(name: "aranchors_\(viewId)", binaryMessenger: messenger)
+        self.captureChannel = FlutterMethodChannel(name: "arcapture_\(viewId)", binaryMessenger: messenger)
         super.init()
 
         let configuration = ARWorldTrackingConfiguration() // Create default configuration before initializeARView is called
@@ -59,6 +61,7 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
         self.sessionManagerChannel.setMethodCallHandler(self.onSessionMethodCalled)
         self.objectManagerChannel.setMethodCallHandler(self.onObjectMethodCalled)
         self.anchorManagerChannel.setMethodCallHandler(self.onAnchorMethodCalled)
+        self.captureChannel.setMethodCallHandler(self.onCaptureMethodCalled)
     }
 
     func view() -> UIView {
@@ -70,8 +73,28 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
                 self.sessionManagerChannel.setMethodCallHandler(nil)
                 self.objectManagerChannel.setMethodCallHandler(nil)
                 self.anchorManagerChannel.setMethodCallHandler(nil)
+                self.captureChannel.setMethodCallHandler(nil)
                 result(nil)
             }
+
+    func onCaptureMethodCalled(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
+        switch call.method {
+        case "dispose":
+            result(nil)
+        case "initializeCapture", "captureHighResImage", "getCaptureCapacity", "getPerformanceSnapshot", "discardCapture", "persistCapture":
+            result(FlutterError(
+                code: "UNSUPPORTED_PLATFORM",
+                message: "iOS image capture is not implemented.",
+                details: ["capability": false, "wireVersion": "pose_batch_v1"]
+            ))
+        default:
+            result(FlutterError(
+                code: "NOT_IMPLEMENTED",
+                message: "iOS capture method \(call.method) is not implemented.",
+                details: nil
+            ))
+        }
+    }
 
     func onSessionMethodCalled(_ call :FlutterMethodCall, _ result:FlutterResult) {
         let arguments = call.arguments as? Dictionary<String, Any>

@@ -8,9 +8,9 @@ class ARCaptureResult {
   final String imageId;
   final ARFramePose pose;
   final CameraResolution resolution;
-  final ImageFormat format;
-  final List<ImageFormat> formats;
-  final Map<ImageFormat, int> imageSizeBytesByFormat;
+  final CaptureFormat format;
+  final List<CaptureAssetFormat> formats;
+  final Map<CaptureAssetFormat, int> imageSizeBytesByFormat;
   final DateTime captureTimestamp;
   final int imageSizeBytes;
   final bool isHighResolution;
@@ -25,7 +25,7 @@ class ARCaptureResult {
     required this.pose,
     required this.resolution,
     required this.format,
-    this.formats = const [ImageFormat.jpeg],
+    this.formats = const [CaptureAssetFormat.jpeg],
     this.imageSizeBytesByFormat = const {},
     required this.captureTimestamp,
     required this.imageSizeBytes,
@@ -43,16 +43,16 @@ class ARCaptureResult {
       pose: ARFramePose.fromMap(map['pose'] as Map<String, dynamic>),
       resolution:
           CameraResolution.fromMap(map['resolution'] as Map<String, dynamic>),
-      format: _captureFormatFromWire(map['format'] as String?),
+      format: CaptureFormat.fromWire(map['format']),
       formats: ((map['formats'] as List<dynamic>?) ?? const ['jpeg'])
-          .map((value) => _assetFormatFromWire(value as String))
+          .map(CaptureAssetFormat.fromWire)
           .toList(growable: false),
       imageSizeBytesByFormat:
           ((map['imageSizeBytesByFormat'] as Map<dynamic, dynamic>?) ??
                   const {})
               .map(
         (key, value) => MapEntry(
-          _assetFormatFromWire(key as String),
+          CaptureAssetFormat.fromWire(key),
           (value as num).toInt(),
         ),
       ),
@@ -76,10 +76,10 @@ class ARCaptureResult {
       'imageId': imageId,
       'pose': pose.toMap(),
       'resolution': resolution.toMap(),
-      'format': format.name,
-      'formats': formats.map((value) => value.name).toList(growable: false),
+      'format': format.wireValue,
+      'formats': formats.map((value) => value.wireValue).toList(growable: false),
       'imageSizeBytesByFormat': imageSizeBytesByFormat.map(
-        (key, value) => MapEntry(key.name, value),
+        (key, value) => MapEntry(key.wireValue, value),
       ),
       'captureTimestampMs': captureTimestamp.millisecondsSinceEpoch,
       'imageSizeBytes': imageSizeBytes,
@@ -144,15 +144,6 @@ class ARCaptureResult {
   String toString() => 'ARCaptureResult(id: $imageId, res: $resolution, '
       'size: ${sizeInMB.toStringAsFixed(1)}MB, tracking: ${pose.isTracking})';
 }
-
-ImageFormat _captureFormatFromWire(String? value) => value == 'raw+jpeg'
-    ? ImageFormat.rawJpeg
-    : _assetFormatFromWire(value ?? 'jpeg');
-
-ImageFormat _assetFormatFromWire(String value) => ImageFormat.values.firstWhere(
-      (format) => format.name == value,
-      orElse: () => ImageFormat.jpeg,
-    );
 
 bool _listEquals<T>(List<T> left, List<T> right) {
   if (left.length != right.length) return false;

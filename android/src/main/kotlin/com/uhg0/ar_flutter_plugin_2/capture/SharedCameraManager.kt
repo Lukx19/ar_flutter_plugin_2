@@ -3,7 +3,6 @@ package com.uhg0.ar_flutter_plugin_2.capture
 import android.content.Context
 import android.graphics.ImageFormat
 import android.graphics.Rect
-import android.graphics.Bitmap
 import android.graphics.YuvImage
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
@@ -31,9 +30,6 @@ import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import java.util.stream.IntStream
-
-internal const val PNG_ASSET_FORMAT = -100
 
 /// Complete configuration object parsed from ARCaptureConfig
 data class ParsedCaptureConfig(
@@ -50,8 +46,6 @@ data class ParsedCaptureConfig(
     val enablePoseStream: Boolean,
     val bufferStrategy: String,
     val rawJpeg: Boolean = false,
-    val rawOnly: Boolean = false,
-    val png: Boolean = false,
     val processed: Boolean = false,
 ){
     companion object {
@@ -65,16 +59,20 @@ data class ParsedCaptureConfig(
                         (resolutionMap["height"] as Number).toInt(),
                     )
 
-                val formatName = configMap["format"] as String
+                val formatName = configMap["format"] as? String
+                    ?: throw CaptureSessionException(
+                        "UNSUPPORTED_CAPTURE_FORMAT",
+                        "A capture format is required",
+                    )
                 val rawJpeg = formatName == "raw+jpeg"
-                val rawOnly = formatName == "raw"
-                val png = formatName == "png"
                 val format =
                     when (formatName) {
-                        "jpeg", "png" -> android.graphics.ImageFormat.YUV_420_888
+                        "jpeg" -> android.graphics.ImageFormat.JPEG
                         "raw+jpeg" -> android.graphics.ImageFormat.JPEG
-                        "raw" -> android.graphics.ImageFormat.RAW_SENSOR
-                        else -> android.graphics.ImageFormat.JPEG
+                        else -> throw CaptureSessionException(
+                            "UNSUPPORTED_CAPTURE_FORMAT",
+                            "Supported formats are jpeg and raw+jpeg; received $formatName",
+                        )
                     }
 
                 return ParsedCaptureConfig(
@@ -91,9 +89,7 @@ data class ParsedCaptureConfig(
                     enablePoseStream = configMap["enablePoseStream"] as Boolean? ?: true,
                     bufferStrategy = configMap["bufferStrategy"] as String? ?: "balanced",
                     rawJpeg = rawJpeg,
-                    rawOnly = rawOnly,
-                    png = png,
-                    processed = formatName == "jpeg" || png,
+                    processed = false,
                 )
             } catch (e: CaptureSessionException) {
                 throw e
@@ -169,9 +165,6 @@ internal class SharedCameraManager(
 
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     private val capabilityQuerier = CameraCapabilityQuerier(context)
-    // PNG encoding can take several seconds at full sensor resolution. Keep
-    // the Camera2 result long enough to correlate after encoding; entry count
-    // remains strictly bounded by the correlator.
     private val stillCaptureCorrelator = PendingStillCaptureCorrelator(timeoutMs = 30_000L)
     private val processedFrameCorrelator = ProcessedFrameCorrelator<PackedYuv420>()
     private val startupBarrier = SharedCameraStartupBarrier()
@@ -232,11 +225,6 @@ internal class SharedCameraManager(
                     handleRawJpegCaptureResult(sensorTimestampNs, result)
                     return
                 }
-                if (config.rawOnly) {
-                    rawCaptureCorrelator.onResult(sensorTimestampNs, result)
-                        ?.let(::handleCorrelatedRawCapture)
-                    return
-                }
                 if (config.processed) {
                     processedFrameCorrelator.onResult(
                         PendingStillResultMetadata(
@@ -263,7 +251,6 @@ internal class SharedCameraManager(
                 )?.let(::handleCorrelatedStillCapture)
             }
         }
-    private val rawCaptureCorrelator = RawCaptureCorrelator<Image, TotalCaptureResult> { closeTrackedImage(it) }
 
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
@@ -385,8 +372,8 @@ internal class SharedCameraManager(
 
         previewImageReader =
             ImageReader.newInstance(
-                if (config.rawOnly) selectRawResolution(characteristics).width else effectiveResolution.width,
-                if (config.rawOnly) selectRawResolution(characteristics).height else effectiveResolution.height,
+                effectiveResolution.width,
+                effectiveResolution.height,
                 config.format,
                 2,
             ).apply {
@@ -475,21 +462,6 @@ internal class SharedCameraManager(
             }
         val validated = mutableListOf<com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraResolution>()
 
-        if (config.rawOnly) {
-            val reader = previewImageReader ?: throw CaptureSessionException("RAW_UNSUPPORTED", "RAW reader missing")
-            val configuration = SessionConfiguration(
-                SessionConfiguration.SESSION_REGULAR,
-                (arCoreSurfaces + reader.surface).map(::OutputConfiguration), executor, stateCallback,
-            )
-            if (!camera.isSessionConfigurationSupported(configuration)) {
-                throw CaptureSessionException("RAW_UNSUPPORTED", "ARCore plus RAW_SENSOR is unsupported")
-            }
-            capabilityQuerier.saveSupportedRawOnlyResolutions(
-                listOf(com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraResolution(reader.width, reader.height)),
-            )
-            return
-        }
-
         for (candidate in capabilityQuerier.getSharedCameraResolutionCandidates(config.format)) {
             val reader =
                 ImageReader.newInstance(
@@ -523,9 +495,7 @@ internal class SharedCameraManager(
             }
         }
 
-        if (config.png) {
-            capabilityQuerier.saveSupportedPngResolutions(validated)
-        } else if (config.rawJpeg) {
+        if (config.rawJpeg) {
             capabilityQuerier.saveSupportedRawJpegResolutions(validated)
         } else {
             capabilityQuerier.saveSupportedSharedCameraResolutions(validated)
@@ -729,13 +699,7 @@ internal class SharedCameraManager(
                 reader.width,
                 reader.height,
             )
-        if (config?.rawOnly == true) {
-            capabilityQuerier.saveSupportedRawOnlyResolutions(listOf(active))
-        } else if (config?.png == true) {
-            capabilityQuerier.saveSupportedPngResolutions(
-                capabilityQuerier.getSupportedPngResolutions() + active,
-            )
-        } else if (config?.rawJpeg == true) {
+        if (config?.rawJpeg == true) {
             capabilityQuerier.saveSupportedRawJpegResolutions(
                 capabilityQuerier.getSupportedRawJpegResolutions() + active,
             )
@@ -963,12 +927,6 @@ internal class SharedCameraManager(
         // callback on this same handler, preventing timestamp correlation.
         val image = reader.acquireLatestImage() ?: return
         resourceCounters.onImageAcquired()
-        if (config.rawOnly) {
-            if (pendingManualCapture == null) closeTrackedImage(image)
-            else rawCaptureCorrelator.onRaw(image.timestamp, image)
-                ?.let(::handleCorrelatedRawCapture)
-            return
-        }
         try {
             if (pendingManualCapture == null) {
                 return
@@ -1022,12 +980,10 @@ internal class SharedCameraManager(
                     ?.let(::handleCorrelatedProcessedFrame)
                 return
             }
-            val jpegBytes =
-                if (image.format == ImageFormat.JPEG) {
-                    readImageBytes(image)
-                } else {
-                    encodeYuv420ImageAsJpeg(image)
-                }
+            check(image.format == ImageFormat.JPEG) {
+                "Supported shared-camera capture modes must deliver hardware JPEG"
+            }
+            val jpegBytes = readImageBytes(image)
             Log.i(
                 "SharedCameraManager",
                 "Encoded ${jpegBytes.size} bytes in ${System.currentTimeMillis() - encodeStartedAtMs}ms",
@@ -1110,7 +1066,7 @@ internal class SharedCameraManager(
                     reservationToken = pending.reservationToken,
                     imageId = imageId,
                     imageBytes = jpeg.bytes,
-                    format = if (config.png) PNG_ASSET_FORMAT else ImageFormat.JPEG,
+                    format = ImageFormat.JPEG,
                     width = jpeg.width,
                     height = jpeg.height,
                     imageSizeBytes = jpeg.bytes.size,
@@ -1140,176 +1096,13 @@ internal class SharedCameraManager(
                     closeRawImage = closeRaw,
                     rawWidth = rawImage.width,
                     rawHeight = rawImage.height,
-                    primaryAssetName = if (config.png) "png" else "jpeg",
+                    primaryAssetName = "jpeg",
                 )
             pending.latch.countDown()
         } catch (error: Throwable) {
             closeRaw()
             imageCacheManager?.releaseReservation(pending.reservationToken)
             pending.error = error
-            pending.latch.countDown()
-        }
-    }
-
-    private fun handleCorrelatedRawCapture(capture: CorrelatedRawCapture<Image, TotalCaptureResult>) {
-        val pending = pendingManualCapture ?: run { closeTrackedImage(capture.raw); return }
-        val characteristics = activeCameraCharacteristics ?: run { closeTrackedImage(capture.raw); return }
-        val rawWidth = capture.raw.width
-        val rawHeight = capture.raw.height
-        val rawClosed = java.util.concurrent.atomic.AtomicBoolean(false)
-        val closeRaw = {
-            if (rawClosed.compareAndSet(false, true)) closeTrackedImage(capture.raw)
-        }
-        val sensorTimestampNs =
-            capture.result.get(CaptureResult.SENSOR_TIMESTAMP) ?: capture.raw.timestamp
-        val exposureTimeNs = capture.result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
-        val rollingShutterSkewNs =
-            capture.result.get(CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW) ?: 0L
-        val alignedPose =
-            resolvePoseBeforeEncoding(
-                PoseDataExtractor.CaptureTiming(
-                    sensorTimestampNs = sensorTimestampNs,
-                    exposureTimeNs = exposureTimeNs,
-                    rollingShutterSkewNs = rollingShutterSkewNs,
-                    observedTimestampNs = captureObservation(sensorTimestampNs),
-                ),
-            )
-        if (alignedPose == null) {
-            closeRaw()
-            pending.error =
-                CaptureSessionException(
-                    code = "POSE_SYNC_FAILED",
-                    message = "No exact or interpolated pose was available before DNG encoding",
-                )
-            pending.latch.countDown()
-            return
-        }
-        pending.preAlignedPose = alignedPose
-
-        val policy = pending.qualityPolicy
-        if (policy != null) {
-            val analyzed =
-                try {
-                    if (policy.blurFilterEnabled) {
-                        val plane = capture.raw.planes.first()
-                        RawPlaneBlurAnalyzer.analyze(
-                            buffer = plane.buffer,
-                            rowStride = plane.rowStride,
-                            pixelStride = plane.pixelStride,
-                            width = rawWidth,
-                            height = rawHeight,
-                        )
-                    } else {
-                        PreviewBlurQuality(0.0, 0, 0, "rawBayerPhaseLaplacianVarianceV1")
-                    }
-                } catch (error: Throwable) {
-                    closeRaw()
-                    pending.error =
-                        CaptureSessionException(
-                            code = "QUALITY_ANALYSIS_FAILED",
-                            message = "RAW sensor blur analysis failed: ${error.message}",
-                        )
-                    pending.latch.countDown()
-                    return
-                }
-            pending.preEncodeQuality =
-                mapOf(
-                    "blurScore" to analyzed.blurScore,
-                    "blurThreshold" to policy.blurThreshold,
-                    "blurPassed" to
-                        (!policy.blurFilterEnabled || analyzed.blurScore >= policy.blurThreshold),
-                    "analyzedWidth" to analyzed.analyzedWidth,
-                    "analyzedHeight" to analyzed.analyzedHeight,
-                    "algorithm" to analyzed.algorithm,
-                )
-            if (pending.preEncodeQuality?.get("blurPassed") != true &&
-                !policy.keepRejectedCaptures
-            ) {
-                closeRaw()
-                pending.error = SharedBlurRejectedException(pending.preEncodeQuality!!)
-                pending.latch.countDown()
-                return
-            }
-        }
-
-        val imageId = generateImageId()
-        val captureTimestampMs = System.currentTimeMillis()
-        val intrinsics =
-            capabilityQuerier.getCameraIntrinsicsForSize(
-                Size(rawWidth, rawHeight),
-                capture.result.get(CaptureResult.SCALER_CROP_REGION),
-            )
-        val workerStartGate = CountDownLatch(1)
-        val submitted =
-            finalizationWorkers.submit {
-                try {
-                    workerStartGate.await()
-                    val bytes =
-                        ByteArrayOutputStream().use { output ->
-                            DngCreator(characteristics, capture.result).use {
-                                it.writeImage(output, capture.raw)
-                            }
-                            output.toByteArray()
-                        }
-                    closeRaw()
-                    onCaptureEncoded(
-                        SharedCameraCaptureResult(
-                            reservationToken = pending.reservationToken,
-                            imageId = imageId,
-                            imageBytes = bytes,
-                            format = ImageFormat.RAW_SENSOR,
-                            width = rawWidth,
-                            height = rawHeight,
-                            imageSizeBytes = bytes.size,
-                            captureTimestampMs = captureTimestampMs,
-                            sensorTimestampNs = sensorTimestampNs,
-                            exposureTimeNs = exposureTimeNs,
-                            rollingShutterSkewNs = rollingShutterSkewNs,
-                            observedTimestampNs = captureObservation(sensorTimestampNs),
-                            intrinsics = intrinsics,
-                            primaryAssetName = "raw",
-                            preEncodeQuality = pending.preEncodeQuality,
-                            preAlignedPose = alignedPose,
-                        ),
-                        pending.qualityPolicy,
-                    )
-                } catch (error: Throwable) {
-                    closeRaw()
-                    imageCacheManager?.releaseReservation(pending.reservationToken)
-                    onCaptureFinalizationFailed(imageId, error)
-                }
-            }
-        if (submitted != FinalizationSubmissionStatus.ACCEPTED) {
-            closeRaw()
-            pending.error =
-                CaptureSessionException(
-                    code = "ENCODER_BACKPRESSURE",
-                    message = "Capture finalization queue is full",
-                )
-            pending.latch.countDown()
-            workerStartGate.countDown()
-            return
-        }
-
-        val accepted =
-            SharedCaptureAccepted(
-                imageId = imageId,
-                width = rawWidth,
-                height = rawHeight,
-                format = "raw",
-                captureTimestampMs = captureTimestampMs,
-                alignedPose = alignedPose,
-                quality = pending.preEncodeQuality,
-                sensorTimestampNs = sensorTimestampNs,
-                exposureTimeNs = exposureTimeNs,
-                rollingShutterSkewNs = rollingShutterSkewNs,
-                intrinsics = intrinsics,
-            )
-        pending.accepted = accepted
-        try {
-            onCaptureAccepted(accepted)
-        } finally {
-            workerStartGate.countDown()
             pending.latch.countDown()
         }
     }
@@ -1343,37 +1136,6 @@ internal class SharedCameraManager(
             v.buffer.toByteArrayFromStart(), v.rowStride, v.pixelStride,
             crop.left, crop.top,
         )
-    }
-
-    private fun encodeYuv420AsPng(yuv: PackedYuv420): ByteArray {
-        val width = yuv.width
-        val height = yuv.height
-        val pixels = IntArray(width * height)
-        IntStream.range(0, height).parallel().forEach { row ->
-            val sourceRow = row + yuv.cropTop
-            val yRow = sourceRow * yuv.yRowStride
-            val uRow = (sourceRow / 2) * yuv.uRowStride
-            val vRow = (sourceRow / 2) * yuv.vRowStride
-            for (col in 0 until width) {
-                val sourceCol = col + yuv.cropLeft
-                val yy =
-                    yuv.yBytes[yRow + sourceCol * yuv.yPixelStride].toInt() and 255
-                val uu =
-                    (yuv.uBytes[uRow + (sourceCol / 2) * yuv.uPixelStride].toInt() and 255) - 128
-                val vv =
-                    (yuv.vBytes[vRow + (sourceCol / 2) * yuv.vPixelStride].toInt() and 255) - 128
-                val r = (yy + ((1436 * vv) shr 10)).coerceIn(0, 255)
-                val g = (yy - ((352 * uu + 731 * vv) shr 10)).coerceIn(0, 255)
-                val b = (yy + ((1815 * uu) shr 10)).coerceIn(0, 255)
-                pixels[row * width + col] =
-                    (255 shl 24) or (r shl 16) or (g shl 8) or b
-            }
-        }
-        return ByteArrayOutputStream().use { out ->
-            Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888).apply {
-                compress(Bitmap.CompressFormat.PNG, 100, out); recycle()
-            }; out.toByteArray()
-        }
     }
 
     private fun encodePackedYuv420AsJpeg(yuv: PackedYuv420): ByteArray {
@@ -1445,11 +1207,9 @@ internal class SharedCameraManager(
                 try {
                     workerStartGate.await()
                     val startedAtMs = System.currentTimeMillis()
-                    val encodedBytes =
-                        if (config.png) encodeYuv420AsPng(correlated.frame)
-                        else encodePackedYuv420AsJpeg(correlated.frame)
-                    val assetName = if (config.png) "png" else "jpeg"
-                    val assetFormat = if (config.png) PNG_ASSET_FORMAT else ImageFormat.JPEG
+                    val encodedBytes = encodePackedYuv420AsJpeg(correlated.frame)
+                    val assetName = "jpeg"
+                    val assetFormat = ImageFormat.JPEG
                     val encoded =
                         SharedCameraCaptureResult(
                             reservationToken = pending.reservationToken,
@@ -1501,7 +1261,7 @@ internal class SharedCameraManager(
                     imageId = imageId,
                     width = correlated.frame.width,
                     height = correlated.frame.height,
-                    format = if (config.png) "png" else "jpeg",
+                    format = "jpeg",
                     captureTimestampMs = System.currentTimeMillis(),
                     alignedPose = alignedPose,
                     quality = pending.preEncodeQuality,
@@ -1535,7 +1295,6 @@ internal class SharedCameraManager(
 
     private fun clearPendingRawJpegComponents() {
         rawJpegCaptureCorrelator.clear()
-        rawCaptureCorrelator.clear()
     }
 
     private fun closeTrackedImage(image: Image) {
@@ -1601,7 +1360,7 @@ internal class SharedCameraManager(
         }
         val effectiveTimeoutMs =
             if (timeoutMs != ManualCaptureTimeoutMs) timeoutMs
-            else if (config.png || config.rawOnly || config.rawJpeg) 20_000L
+            else if (config.rawJpeg) 20_000L
             else timeoutMs
         val completed = pending.latch.await(effectiveTimeoutMs, TimeUnit.MILLISECONDS)
         pendingManualCaptureOwner.release(pending)
@@ -1631,7 +1390,7 @@ internal class SharedCameraManager(
         qualityPolicy: CaptureQualityPolicy?,
         timeoutMs: Long = ManualCaptureTimeoutMs,
     ): SharedCaptureAccepted {
-        check(config.processed || config.rawOnly) {
+        check(config.processed) {
             "Two-phase capture is not enabled for this format"
         }
         if (!isInitialized) throw IllegalStateException("SharedCameraManager is not initialized")
@@ -1822,11 +1581,7 @@ internal class SharedCameraManager(
             "format" to
                 if (config.rawJpeg) {
                     "raw+jpeg"
-                } else when (config.format) {
-                    android.graphics.ImageFormat.JPEG -> "jpeg"
-                    android.graphics.ImageFormat.RAW_SENSOR -> "raw"
-                    else -> "jpeg"
-                },
+                } else "jpeg",
             "maxCacheSize" to config.maxCacheSize,
             "jpegQuality" to config.jpegQuality,
             "bufferStrategy" to config.bufferStrategy,
@@ -2304,7 +2059,7 @@ internal class SharedCameraManager(
                     rollingShutterSkewNs = capture.result.rollingShutterSkewNs,
                     observedTimestampNs = capture.result.observedTimestampNs,
                     intrinsics = intrinsics,
-                    primaryAssetName = if (config.png) "png" else "jpeg",
+                    primaryAssetName = "jpeg",
                     preEncodeQuality = pending.preEncodeQuality,
                 )
 

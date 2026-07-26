@@ -49,6 +49,10 @@ internal class HighResCapturePipeline(
     private val workerDispatcher: CoroutineDispatcher = Dispatchers.Default,
     private val qualityAnalysisTimeoutMs: Long = 200L,
 ) {
+    /// A process-wide session instance serializes all finalization ownership.
+    /// Camera callbacks can be concurrent, but cache mutation and terminal
+    /// emission for this capture session must remain exactly once and ordered.
+    @Synchronized
     fun processCapture(
         sharedResult: SharedCameraCaptureResult,
         qualityPolicy: CaptureQualityPolicy?,
@@ -127,7 +131,7 @@ internal class HighResCapturePipeline(
                         ),
                     )
                     sharedResult.rawDngEncoder?.invoke()?.let { dngBytes ->
-                        assets["raw"] = CachedImageAsset(
+                        assets["dng"] = CachedImageAsset(
                             dngBytes,
                             android.graphics.ImageFormat.RAW_SENSOR,
                         )
@@ -190,7 +194,7 @@ internal class HighResCapturePipeline(
                 "height" to sharedResult.height,
             ),
             "format" to if (sharedResult.rawDngEncoder == null) sharedResult.primaryAssetName else "raw+jpeg",
-            "formats" to if (sharedResult.rawDngEncoder == null) listOf(sharedResult.primaryAssetName) else listOf("raw", sharedResult.primaryAssetName),
+            "formats" to if (sharedResult.rawDngEncoder == null) listOf(sharedResult.primaryAssetName) else listOf("dng", sharedResult.primaryAssetName),
             "captureTimestampMs" to sharedResult.captureTimestampMs,
             "imageSizeBytes" to assets.values.sumOf { it.bytes.size },
             "imageSizeBytesByFormat" to assets.mapValues { it.value.bytes.size },

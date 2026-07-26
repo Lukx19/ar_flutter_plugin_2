@@ -16,7 +16,7 @@ class ARCaptureConfig {
   final CameraResolution resolution;
 
   /// Image format for captures (required)
-  final ImageFormat format;
+  final CaptureFormat format;
 
   /// Maximum number of images to cache in memory
   final int maxCacheSize;
@@ -64,12 +64,7 @@ class ARCaptureConfig {
       captureIntervalMs: map['captureIntervalMs'] as int? ?? 5000,
       resolution:
           CameraResolution.fromMap(map['resolution'] as Map<String, dynamic>),
-      format: map['format'] == 'raw+jpeg'
-          ? ImageFormat.rawJpeg
-          : ImageFormat.values.firstWhere(
-              (f) => f.name == map['format'] as String,
-              orElse: () => ImageFormat.jpeg,
-            ),
+      format: CaptureFormat.fromWire(map['format']),
       maxCacheSize: map['maxCacheSize'] as int? ?? 10,
       jpegQuality: map['jpegQuality'] as int? ?? 95,
       autoExposure: map['autoExposure'] as bool? ?? true,
@@ -92,7 +87,7 @@ class ARCaptureConfig {
       'enableHighResCapture': enableHighResCapture,
       'captureIntervalMs': captureIntervalMs,
       'resolution': resolution.toMap(),
-      'format': format == ImageFormat.rawJpeg ? 'raw+jpeg' : format.name,
+      'format': format.wireValue,
       'maxCacheSize': maxCacheSize,
       'jpegQuality': jpegQuality,
       'autoExposure': autoExposure,
@@ -107,7 +102,7 @@ class ARCaptureConfig {
   /// Create configuration optimized for performance
   factory ARCaptureConfig.performance({
     required CameraResolution resolution,
-    ImageFormat format = ImageFormat.jpeg,
+    CaptureFormat format = CaptureFormat.jpeg,
     int captureIntervalMs = 1000,
   }) {
     return ARCaptureConfig(
@@ -125,7 +120,7 @@ class ARCaptureConfig {
   /// Create configuration optimized for memory usage
   factory ARCaptureConfig.memoryOptimized({
     required CameraResolution resolution,
-    ImageFormat format = ImageFormat.jpeg,
+    CaptureFormat format = CaptureFormat.jpeg,
     int captureIntervalMs = 5000,
   }) {
     return ARCaptureConfig(
@@ -143,7 +138,7 @@ class ARCaptureConfig {
   /// Create configuration for research/professional use
   factory ARCaptureConfig.research({
     required CameraResolution resolution,
-    ImageFormat format = ImageFormat.rawJpeg,
+    CaptureFormat format = CaptureFormat.rawJpeg,
     int captureIntervalMs = 10000,
   }) {
     return ARCaptureConfig(
@@ -163,7 +158,7 @@ class ARCaptureConfig {
   /// Get estimated memory usage in bytes
   int getEstimatedMemoryUsage() {
     final bytesPerPixel =
-        format == ImageFormat.raw || format == ImageFormat.rawJpeg
+        format == CaptureFormat.rawJpeg
             ? 2
             : 3; // RAW = 16bit, JPEG = 24bit uncompressed
     final imageSize = resolution.totalPixels * bytesPerPixel;
@@ -230,7 +225,7 @@ class ARCaptureConfig {
     bool? enableHighResCapture,
     int? captureIntervalMs,
     CameraResolution? resolution,
-    ImageFormat? format,
+    CaptureFormat? format,
     int? maxCacheSize,
     int? jpegQuality,
     bool? autoExposure,

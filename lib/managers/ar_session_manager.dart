@@ -575,7 +575,7 @@ class ARSessionManager {
     }
 
     // Raw format with frequent capture may cause memory issues
-    if (captureConfig.format == ImageFormat.raw &&
+        if (captureConfig.format == CaptureFormat.rawJpeg &&
         captureConfig.captureIntervalMs < 5000) {
       if (debug) {
         print(

@@ -33,7 +33,6 @@ internal class ArCaptureSession(
     private val onObservedControlStateChanged: (ArCaptureSession) -> Unit = {},
     private val onCaptureAccepted: (Map<String, Any?>) -> Unit = {},
     private val onCaptureFinalized: (Map<String, Any?>) -> Unit = {},
-    private val poseUpdateRateLimiter: PoseUpdateRateLimiter = PoseUpdateRateLimiter(),
 ) {
     companion object {
         private const val TrackingPoseReadyTimeoutMs = 2_000L
@@ -47,6 +46,7 @@ internal class ArCaptureSession(
     private var sharedCameraManager: SharedCameraManager? = null
     private var sharedImageCacheManager: ImageCacheManager? = null
     private var highResCaptureEnabled = false
+    private var poseSequence = 0L
     private var sharedCameraFilamentStream: Stream? = null
     private var sharedCameraPreviewSurfaceTexture: SurfaceTexture? = null
     private var sharedCameraPreviewSurface: Surface? = null
@@ -215,7 +215,6 @@ internal class ArCaptureSession(
         } else {
             byteCache.initialize(parsedConfig)
         }
-        poseUpdateRateLimiter.onResume()
         emitCapacityChanged()
     }
 
@@ -238,13 +237,6 @@ internal class ArCaptureSession(
                     )
                 }
                 val qualityPolicy = qualityPolicyMap?.let(::buildQualityPolicyMap)
-                if (config?.format == "png" ||
-                    config?.format == "jpeg" ||
-                    config?.format == "raw"
-                ) {
-                    val accepted = manager.captureDeferredImageAccepted(qualityPolicy)
-                    return acceptedAttemptMap(accepted)
-                }
                 val sharedResult =
                     try {
                         manager.captureImageResult(qualityPolicy)
@@ -628,9 +620,6 @@ internal class ArCaptureSession(
         poseDataExtractor.onFrame(frame)
 
         val sensorTimestampNs = frame.timestamp
-        if (!poseUpdateRateLimiter.shouldEmit(sensorTimestampNs)) {
-            return null
-        }
         val latestPose = poseDataExtractor.latest() ?: return null
         return poseDataExtractor.toPoseMap(
             poseDataExtractor.toAlignedPose(
@@ -639,16 +628,17 @@ internal class ArCaptureSession(
                 poseAlignment = "exact",
                 poseTimeErrorNs = 0L,
             ),
+        ) + mapOf(
+            "wireVersion" to "pose_batch_v1",
+            "sequence" to ++poseSequence,
         )
     }
 
     fun onSessionPaused() {
-        poseUpdateRateLimiter.onPause()
         sharedCameraManager?.onArSessionPaused()
     }
 
     fun onSessionResumed() {
-        poseUpdateRateLimiter.onResume()
         sharedCameraManager?.onArSessionResumed()
     }
 
@@ -670,7 +660,6 @@ internal class ArCaptureSession(
         sharedImageCacheManager = null
         config = null
         highResCaptureEnabled = false
-        poseUpdateRateLimiter.onDispose()
     }
 
     private fun createSharedCameraPreviewSurface(): Surface {

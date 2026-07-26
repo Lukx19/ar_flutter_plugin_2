@@ -50,9 +50,10 @@ class CaptureByteCacheTest {
     }
 
     @Test
-    fun `config parser accepts raw only and png formats`() {
-        listOf("raw", "png").forEach { format ->
-            val config = CaptureConfig.fromMap(
+    fun `config parser rejects removed and unknown logical formats`() {
+        listOf("raw", "raw_only", "png", "heif", null).forEach { format ->
+            val error = captureException {
+                CaptureConfig.fromMap(
                 mapOf(
                     "format" to format,
                     "resolution" to mapOf(
@@ -63,7 +64,8 @@ class CaptureByteCacheTest {
                     "jpegQuality" to 95,
                 ),
             )
-            assertEquals(format, config.format)
+            }
+            assertEquals("UNSUPPORTED_CAPTURE_FORMAT", error.code)
         }
     }
 

@@ -14,7 +14,11 @@ internal data class CaptureConfig(
 ) {
     companion object {
         fun fromMap(configMap: Map<String, Any?>): CaptureConfig {
-            val format = configMap["format"] as? String ?: "jpeg"
+            val format = configMap["format"] as? String
+                ?: throw CaptureSessionException(
+                    code = "UNSUPPORTED_CAPTURE_FORMAT",
+                    message = "A logical capture format is required",
+                )
             val captureIntervalMs = (configMap["captureIntervalMs"] as? Number)?.toInt() ?: 5000
             val resolutionMap = configMap["resolution"] as? Map<*, *>
             val resolutionWidth = (resolutionMap?.get("width") as? Number)?.toInt() ?: 0
@@ -22,9 +26,9 @@ internal data class CaptureConfig(
             val maxCacheSize = (configMap["maxCacheSize"] as? Number)?.toInt() ?: 10
             val jpegQuality = (configMap["jpegQuality"] as? Number)?.toInt() ?: 95
 
-            if (format !in setOf("jpeg", "raw+jpeg", "raw", "png")) {
+            if (format !in setOf("jpeg", "raw+jpeg")) {
                 throw CaptureSessionException(
-                    code = "FORMAT_NOT_CAPTURED",
+                    code = "UNSUPPORTED_CAPTURE_FORMAT",
                     message = "Unsupported capture mode=$format",
                 )
             }

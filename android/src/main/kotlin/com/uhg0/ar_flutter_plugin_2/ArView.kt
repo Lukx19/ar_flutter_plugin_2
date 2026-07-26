@@ -18,6 +18,7 @@ import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.NotTrackingException
 import com.uhg0.ar_flutter_plugin_2.capture.ArCaptureSession
 import com.uhg0.ar_flutter_plugin_2.capture.CaptureSessionException
+import com.uhg0.ar_flutter_plugin_2.capture.PoseBatchDispatcher
 import com.uhg0.ar_flutter_plugin_2.sceneview.PluginAnchorRecord
 import com.uhg0.ar_flutter_plugin_2.sceneview.PluginHitResult
 import com.uhg0.ar_flutter_plugin_2.sceneview.PluginNodeRecord
@@ -56,6 +57,11 @@ internal class ArView(
     private val objectChannel = MethodChannel(messenger, "arobjects_$id")
     private val anchorChannel = MethodChannel(messenger, "aranchors_$id")
     private val captureChannel = MethodChannel(messenger, "arcapture_$id")
+    private val poseBatchDispatcher = PoseBatchDispatcher(
+        send = { method, arguments, result ->
+            captureChannel.invokeMethod(method, arguments, result)
+        },
+    )
     private val nodeRecords = mutableMapOf<String, PluginNodeRecord>()
     private val nodeAnchorIds = mutableMapOf<String, String>()
     private val anchorRecords = mutableMapOf<String, PluginAnchorRecord>()
@@ -151,6 +157,7 @@ internal class ArView(
     override fun dispose() {
         if (disposed) return
         disposed = true
+        poseBatchDispatcher.clear()
         prepareForDispose()
         sessionChannel.setMethodCallHandler(null)
         objectChannel.setMethodCallHandler(null)
@@ -595,7 +602,7 @@ internal class ArView(
 
     private fun onFrame(session: Session, frame: Frame) {
         pointCloudChannel.onFrame(frame)
-        captureSession.buildPoseUpdate(frame)?.let { captureChannel.invokeMethod("onPoseUpdate", it) }
+        captureSession.buildPoseUpdate(frame)?.let(poseBatchDispatcher::offer)
         frame.getUpdatedTrackables(Plane::class.java).forEach { plane ->
             if (detectedPlanes.add(plane)) {
                 sessionChannel.invokeMethod("onPlaneDetected", detectedPlanes.size)

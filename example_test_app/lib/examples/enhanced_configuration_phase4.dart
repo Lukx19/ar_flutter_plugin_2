@@ -105,7 +105,7 @@ class _EnhancedConfigurationPhase4ExampleState extends State<EnhancedConfigurati
         (r) => r.totalPixels >= 3000000, // 3MP+
         orElse: () => resolutions.first,
       ),
-      format: ImageFormat.raw,
+      format: ImageFormat.rawJpeg,
     );
 
     // Example 4: Custom configuration with all parameters

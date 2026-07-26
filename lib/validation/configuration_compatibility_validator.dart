@@ -105,7 +105,7 @@ class ConfigurationCompatibilityValidator {
     }
 
     // RAW format with frequent capture
-    if (captureConfig.format == ImageFormat.raw &&
+    if (captureConfig.format == CaptureFormat.rawJpeg &&
         isAutomaticCapture &&
         captureConfig.captureIntervalMs < 5000) {
       warnings.add(CompatibilityWarning(
@@ -214,7 +214,7 @@ class ConfigurationCompatibilityValidator {
     }
 
     // Analyze format impact
-    if (captureConfig.format == ImageFormat.raw) {
+    if (captureConfig.format == CaptureFormat.rawJpeg) {
       performanceScore -= 20;
       impactFactors.add('RAW format processing overhead');
       recommendations.add('Use JPEG format for better performance');
@@ -248,7 +248,7 @@ class ConfigurationCompatibilityValidator {
       optimizations.add(
           'Reduce cache size from ${captureConfig.maxCacheSize} to ${(captureConfig.maxCacheSize * 0.7).round()}');
     }
-    if (captureConfig.format == ImageFormat.raw && memoryPressure > 0.3) {
+    if (captureConfig.format == CaptureFormat.rawJpeg && memoryPressure > 0.3) {
       optimizations.add('Switch from RAW to JPEG format');
     }
     if (captureConfig.bufferStrategy == BufferStrategy.performance &&
@@ -276,7 +276,7 @@ class ConfigurationCompatibilityValidator {
     }
 
     // Check if specific format is supported on this platform version
-    if (captureConfig.format == ImageFormat.raw && Platform.isAndroid) {
+    if (captureConfig.format == CaptureFormat.rawJpeg && Platform.isAndroid) {
       // RAW support requires Android API 21+
       // This would require platform channel call to check actual API level
       // Simplified here for demonstration
@@ -313,7 +313,7 @@ class ConfigurationCompatibilityValidator {
     }
 
     // Deduct for RAW format
-    if (captureConfig.format == ImageFormat.raw) {
+    if (captureConfig.format == CaptureFormat.rawJpeg) {
       performanceScore -= 20;
     }
 
@@ -471,7 +471,7 @@ class ConfigurationCompatibilityValidator {
     }
 
     // Check for mismatched quality levels
-    if (captureConfig.format == ImageFormat.raw &&
+    if (captureConfig.format == CaptureFormat.rawJpeg &&
         captureConfig.jpegQuality < 90) {
       warnings.add(
           'RAW format specified but JPEG quality setting is low - JPEG quality ignored for RAW');

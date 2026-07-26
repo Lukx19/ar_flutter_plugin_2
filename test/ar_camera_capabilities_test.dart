@@ -38,10 +38,6 @@ void main() {
             ],
             'validatedRawJpegResolutions': <Map<String, int>>[],
             'rawJpegProbeStatus': 'unsupported',
-            'validatedRawOnlyResolutions': <Map<String, int>>[],
-            'rawOnlyProbeStatus': 'unsupported',
-            'validatedPngResolutions': <Map<String, int>>[],
-            'pngProbeStatus': 'pending',
             'rawCapture': false,
             'manualSensorControls': true,
             'flash': true,
@@ -62,7 +58,7 @@ void main() {
         'getSupportedSharedCameraResolutions' => <Map<String, int>>[
             <String, int>{'width': 1920, 'height': 1080},
           ],
-        'getSupportedFormats' => <String>['jpeg', 'raw', 'unknown'],
+        'getSupportedFormats' => <String>['jpeg', 'raw+jpeg', 'unknown'],
         'getSupportedISORange' => <int>[50, 3200],
         'getSupportedExposureRange' => <String, int>{
             'min': 100,
@@ -112,10 +108,9 @@ void main() {
         <CameraResolution>[
           const CameraResolution(width: 1920, height: 1080),
         ]);
-    expect(await capabilities.getSupportedFormats(), <ImageFormat>[
-      ImageFormat.jpeg,
-      ImageFormat.raw,
-      ImageFormat.jpeg,
+    expect(await capabilities.getSupportedFormats(), <CaptureFormat>[
+      CaptureFormat.jpeg,
+      CaptureFormat.rawJpeg,
     ]);
     expect(await capabilities.getSupportedISORange(), <int>[50, 3200]);
     expect((await capabilities.getSupportedExposureRange())['min'],
@@ -126,7 +121,7 @@ void main() {
       ),
       isTrue,
     );
-    expect(await capabilities.isFormatSupported(ImageFormat.jpeg), isTrue);
+    expect(await capabilities.isFormatSupported(CaptureFormat.jpeg), isTrue);
     final intrinsics = await capabilities.getCameraIntrinsics();
     expect(intrinsics?.isValid, isTrue);
     expect(intrinsics?.resolution,
@@ -142,17 +137,12 @@ void main() {
       supported: false,
       reason: 'unsupported topology',
     );
-    await capabilities.saveFormatProbeResult(
-      format: 'png',
-      supported: true,
-    );
     await capabilities.resetCapabilityProfileForTesting();
 
     expect(calls.map((call) => call.method), <String>[
       'saveSharedCameraSupported',
       'saveSharedCameraUnsupported',
       'saveRawJpegProbeResult',
-      'saveFormatProbeResult',
       'resetCapabilityProfileForTesting',
     ]);
     expect(calls[0].arguments, isNull);
@@ -161,12 +151,7 @@ void main() {
       'supported': false,
       'reason': 'unsupported topology',
     });
-    expect(calls[3].arguments, <String, dynamic>{
-      'format': 'png',
-      'supported': true,
-      'reason': null,
-    });
-    expect(calls[4].arguments, isNull);
+    expect(calls[3].arguments, isNull);
   });
 
   test('validates, suggests, recommends, and scores configurations', () async {

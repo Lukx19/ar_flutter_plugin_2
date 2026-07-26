@@ -437,8 +437,7 @@ class ImageCacheManager(
             try {
                 cachedImage.assets.forEach { (assetFormat, asset) ->
                     val extension = when (assetFormat) {
-                        "raw" -> "dng"
-                        "png" -> "png"
+                        "dng" -> "dng"
                         else -> "jpg"
                     }
                     val partFile = File(destinationDirectory, "$baseName.$extension.part")
@@ -601,7 +600,7 @@ class ImageCacheManager(
     }
 
     private fun requireAsset(cachedImage: CachedImage, format: String): CachedImageAsset {
-        if (format !in setOf("jpeg", "raw", "png")) {
+        if (format !in setOf("jpeg", "dng")) {
             throw CaptureSessionException(
                 code = "FORMAT_NOT_CAPTURED",
                 message = "Unknown capture asset format=$format",
@@ -618,8 +617,7 @@ class ImageCacheManager(
         val matches =
             when (format) {
                 "jpeg" -> lowerPath.endsWith(".jpg") || lowerPath.endsWith(".jpeg")
-                "raw" -> lowerPath.endsWith(".dng")
-                "png" -> lowerPath.endsWith(".png")
+                "dng" -> lowerPath.endsWith(".dng")
                 else -> false
             }
         if (!matches) {
@@ -633,8 +631,7 @@ class ImageCacheManager(
     private fun formatName(format: Int): String =
         when (format) {
             ImageFormat.JPEG -> "jpeg"
-            ImageFormat.RAW_SENSOR -> "raw"
-            PNG_ASSET_FORMAT -> "png"
+            ImageFormat.RAW_SENSOR -> "dng"
             else -> throw CaptureSessionException(
                 code = "FORMAT_NOT_CAPTURED",
                 message = "Unsupported cached image format=$format",

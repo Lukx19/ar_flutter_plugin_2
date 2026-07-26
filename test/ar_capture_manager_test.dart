@@ -580,7 +580,7 @@ void main() {
 
     final imageBytes = await captureManager.getImageData(
       'img-1',
-      ImageFormat.jpeg,
+      CaptureAssetFormat.jpeg,
     );
 
     expect(imageBytes, Uint8List.fromList(<int>[1, 2, 3, 4, 5, 6]));
@@ -601,7 +601,7 @@ void main() {
     final saveSucceeded = await captureManager.saveImageToFile(
       'img-1',
       '/tmp/test.jpg',
-      ImageFormat.jpeg,
+      CaptureAssetFormat.jpeg,
     );
 
     expect(saveSucceeded, isTrue);
@@ -625,7 +625,7 @@ void main() {
       '/tmp/root',
       'session/images',
       'img-1',
-      ImageFormat.jpeg,
+      CaptureFormat.jpeg,
     );
 
     final persistCall = methodCalls.firstWhere(
@@ -633,10 +633,10 @@ void main() {
     );
 
     expect(persistResult, isNotNull);
-    expect(persistResult?.fileFor(ImageFormat.jpeg),
+    expect(persistResult?.fileFor(CaptureAssetFormat.jpeg),
         '/tmp/session/images/img-1.jpg.part');
-    expect(persistResult?.sizeFor(ImageFormat.jpeg), 6);
-    expect(persistResult?.hashFor(ImageFormat.jpeg), 'abc123');
+    expect(persistResult?.sizeFor(CaptureAssetFormat.jpeg), 6);
+    expect(persistResult?.hashFor(CaptureAssetFormat.jpeg), 'abc123');
     expect(
       persistCall.arguments,
       <String, dynamic>{
@@ -655,7 +655,7 @@ void main() {
   test(
     'surfaces explicit unsupported raw capture from native initialization',
     () async {
-      final rawConfig = captureConfig.copyWith(format: ImageFormat.raw);
+      final rawConfig = captureConfig.copyWith(format: CaptureFormat.rawJpeg);
       initializeErrorCode = 'RAW_JPEG_UNSUPPORTED';
       initializeErrorMessage =
           'RAW capture is not yet supported on the live shared-camera path';
@@ -1286,6 +1286,57 @@ void main() {
     await subscription.cancel();
   });
 
+  test('accepts a bounded acknowledged pose batch', () async {
+    final sessionManager = ARSessionManager(
+      42,
+      _FakeBuildContext(),
+      PlaneDetectionConfig.horizontal,
+    );
+    final captureManager = ARCaptureManager(
+      sessionManager,
+      captureConfig,
+      _FakeBuildContext(),
+    );
+    final poses = <dynamic>[];
+    final subscription = captureManager.poseDataStream.listen(poses.add);
+    final sample = <String, dynamic>{
+      'position': <String, dynamic>{'x': 1.0, 'y': 2.0, 'z': 3.0},
+      'rotation': <String, dynamic>{'x': 0.0, 'y': 0.0, 'z': 0.0, 'w': 1.0},
+      'transform': List<double>.generate(
+        16,
+        (index) => index % 5 == 0 ? 1.0 : 0.0,
+      ),
+      'convention': 'opencv_c2w_v1',
+      'timestampMs': DateTime(2026).millisecondsSinceEpoch,
+      'sensorTimestampNs': 123456789,
+      'confidence': 1.0,
+      'isTracking': true,
+      'trackingState': 'tracking',
+      'wireVersion': 'pose_batch_v1',
+      'sequence': 7,
+    };
+    final codec = const StandardMethodCodec();
+
+    await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .handlePlatformMessage(
+      'arcapture_42',
+      codec.encodeMethodCall(
+        MethodCall('onPoseBatch', <String, dynamic>{
+          'wireVersion': 'pose_batch_v1',
+          'samples': <Map<String, dynamic>>[sample],
+          'droppedOldestCount': 2,
+        }),
+      ),
+      (_) {},
+    );
+    await Future<void>.delayed(Duration.zero);
+
+    expect(poses, hasLength(1));
+    expect(poses.single.sequence, 7);
+    expect(poses.single.wireVersion, 'pose_batch_v1');
+    await subscription.cancel();
+  });
+
   test('emits observed control-state updates from platform events', () async {
     final sessionManager = ARSessionManager(
       42,
@@ -1420,7 +1471,7 @@ void main() {
     );
 
     await expectLater(
-      captureManager.getImageData('missing-image', ImageFormat.jpeg),
+        captureManager.getImageData('missing-image', CaptureAssetFormat.jpeg),
       throwsA(
         isA<ARCaptureException>()
             .having((error) => error.code, 'code', 'IMAGE_NOT_FOUND')
@@ -1449,7 +1500,7 @@ void main() {
       captureManager.saveImageToFile(
         'img-1',
         '/tmp/test.png',
-        ImageFormat.jpeg,
+          CaptureAssetFormat.jpeg,
       ),
       throwsA(
         isA<ARCaptureException>()
@@ -2267,7 +2318,7 @@ void main() {
       isEmpty,
     );
     expect(
-      await captureManager.getImageData('img-1', ImageFormat.jpeg),
+        await captureManager.getImageData('img-1', CaptureAssetFormat.jpeg),
       isNull,
     );
     expect(await captureManager.getCameraIntrinsics(), isNull);

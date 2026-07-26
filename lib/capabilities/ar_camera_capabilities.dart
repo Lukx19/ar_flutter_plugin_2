@@ -9,7 +9,7 @@ import '../datatypes/image_format.dart';
 /// Provides information about available camera capabilities for AR capture
 /// Can be used independently throughout the application for capability discovery
 class ARCameraCapabilities {
-  static const int capabilityPresetVersion = 10;
+  static const int capabilityPresetVersion = 11;
 
   /// Platform channel for camera capability queries
   static const MethodChannel _channel =
@@ -76,19 +76,6 @@ class ARCameraCapabilities {
     );
   }
 
-  Future<void> saveFormatProbeResult({
-    required String format,
-    required bool supported,
-    String? reason,
-  }) async {
-    if (!isSupported) return;
-    await _channel.invokeMethod<void>('saveFormatProbeResult', {
-      'format': format,
-      'supported': supported,
-      'reason': reason,
-    });
-  }
-
   /// Clears only the native camera capability preset in debuggable builds.
   ///
   /// This is intended for physical-device integration tests. Capture history,
@@ -143,17 +130,15 @@ class ARCameraCapabilities {
 
   /// Get list of all supported image formats
   /// Returns empty list on unsupported platforms
-  Future<List<ImageFormat>> getSupportedFormats() async {
+  Future<List<CaptureFormat>> getSupportedFormats() async {
     if (!isSupported) return [];
 
     try {
       final List<dynamic> result =
           await _channel.invokeMethod('getSupportedFormats');
       return result
-          .map((formatString) => ImageFormat.values.firstWhere(
-                (format) => format.name == formatString,
-                orElse: () => ImageFormat.jpeg,
-              ))
+          .map(CaptureFormat.tryFromWire)
+          .whereType<CaptureFormat>()
           .toList();
     } on PlatformException catch (e) {
       throw ARCameraCapabilityException(
@@ -211,11 +196,11 @@ class ARCameraCapabilities {
 
   /// Check if specific format is supported on current device
   /// Returns false on unsupported platforms
-  Future<bool> isFormatSupported(ImageFormat format) async {
+  Future<bool> isFormatSupported(CaptureFormat format) async {
     if (!isSupported) return false;
 
     try {
-      return await _channel.invokeMethod('isFormatSupported', format.name);
+      return await _channel.invokeMethod('isFormatSupported', format.wireValue);
     } on PlatformException catch (e) {
       throw ARCameraCapabilityException(
           'Failed to check format support: ${e.message}');
@@ -275,12 +260,12 @@ class ARCameraCapabilities {
       if (!isFormatSupported) {
         errors.add('Image format ${config.format.name} is not supported');
         final supportedFormats = await getSupportedFormats();
-        if (supportedFormats.contains(ImageFormat.jpeg)) {
+        if (supportedFormats.contains(CaptureFormat.jpeg)) {
           suggestedConfig = ARCaptureConfig(
             enableHighResCapture: config.enableHighResCapture,
             captureIntervalMs: config.captureIntervalMs,
             resolution: suggestedConfig?.resolution ?? config.resolution,
-            format: ImageFormat.jpeg,
+            format: CaptureFormat.jpeg,
           );
         }
       }
@@ -361,8 +346,8 @@ class ARCameraCapabilities {
           : sortedResolutions.first;
 
       // Prefer JPEG for compatibility
-      final recommendedFormat = supportedFormats.contains(ImageFormat.jpeg)
-          ? ImageFormat.jpeg
+      final recommendedFormat = supportedFormats.contains(CaptureFormat.jpeg)
+          ? CaptureFormat.jpeg
           : supportedFormats.first;
 
       return ARCaptureConfig(
@@ -444,7 +429,7 @@ class ARCameraCapabilities {
       }
 
       // Format impact
-      if (config.format == ImageFormat.raw) {
+      if (config.format == CaptureFormat.rawJpeg) {
         impactScore += 2.0;
       }
 
@@ -471,11 +456,6 @@ class DeviceCameraCapabilityProfile {
     required this.validatedRawJpegResolutions,
     required this.rawJpegProbeStatus,
     required this.rawJpegProbeError,
-    required this.validatedRawOnlyResolutions,
-    required this.rawOnlyProbeStatus,
-    required this.rawOnlyProbeError,
-    required this.validatedPngResolutions,
-    required this.pngProbeStatus,
     required this.rawCapture,
     required this.manualSensorControls,
     required this.flash,
@@ -497,11 +477,6 @@ class DeviceCameraCapabilityProfile {
         validatedRawJpegResolutions = const [],
         rawJpegProbeStatus = 'unsupported',
         rawJpegProbeError = 'Platform unsupported',
-        validatedRawOnlyResolutions = const [],
-        rawOnlyProbeStatus = 'unsupported',
-        rawOnlyProbeError = 'Platform unsupported',
-        validatedPngResolutions = const [],
-        pngProbeStatus = 'unsupported',
         rawCapture = false,
         manualSensorControls = false,
         flash = false,
@@ -535,12 +510,6 @@ class DeviceCameraCapabilityProfile {
               .toList(growable: false),
       rawJpegProbeStatus: map['rawJpegProbeStatus'] as String? ?? 'pending',
       rawJpegProbeError: map['rawJpegProbeError'] as String?,
-      validatedRawOnlyResolutions:
-          _resolutionList(map['validatedRawOnlyResolutions']),
-      rawOnlyProbeStatus: map['rawOnlyProbeStatus'] as String? ?? 'pending',
-      rawOnlyProbeError: map['rawOnlyProbeError'] as String?,
-      validatedPngResolutions: _resolutionList(map['validatedPngResolutions']),
-      pngProbeStatus: map['pngProbeStatus'] as String? ?? 'pending',
       rawCapture: map['rawCapture'] as bool? ?? false,
       manualSensorControls: map['manualSensorControls'] as bool? ?? false,
       flash: map['flash'] as bool? ?? false,
@@ -567,11 +536,6 @@ class DeviceCameraCapabilityProfile {
   final List<CameraResolution> validatedRawJpegResolutions;
   final String rawJpegProbeStatus;
   final String? rawJpegProbeError;
-  final List<CameraResolution> validatedRawOnlyResolutions;
-  final String rawOnlyProbeStatus;
-  final String? rawOnlyProbeError;
-  final List<CameraResolution> validatedPngResolutions;
-  final String pngProbeStatus;
   final bool rawCapture;
   final bool manualSensorControls;
   final bool flash;
@@ -586,10 +550,6 @@ class DeviceCameraCapabilityProfile {
   bool get sharedCameraCapture => sharedCameraProbeStatus == 'supported';
   bool get rawJpegCapture => rawJpegProbeStatus == 'supported';
   bool get rawJpegProbeComplete => rawJpegProbeStatus != 'pending';
-  bool get rawOnlyCapture => rawOnlyProbeStatus == 'supported';
-  bool get rawOnlyProbeComplete => rawOnlyProbeStatus != 'pending';
-  bool get pngCapture => pngProbeStatus == 'supported';
-  bool get pngProbeComplete => pngProbeStatus != 'pending';
 
   bool get isCurrentPreset =>
       presetVersion == ARCameraCapabilities.capabilityPresetVersion;
@@ -613,12 +573,6 @@ class ARCoreAvailability {
   final bool transient;
   final bool unknown;
 }
-
-List<CameraResolution> _resolutionList(Object? value) =>
-    (value as List<dynamic>? ?? const [])
-        .map((item) =>
-            CameraResolution.fromMap(Map<String, dynamic>.from(item as Map)))
-        .toList(growable: false);
 
 /// Exception thrown when camera capability operations fail
 class ARCameraCapabilityException implements Exception {

@@ -342,7 +342,7 @@ class _CameraCapabilitiesBasicExampleState extends State<CameraCapabilitiesBasic
                 const SizedBox(width: 8),
                 Expanded(
                   child: ElevatedButton.icon(
-                    onPressed: () => _testFormatSupport(ImageFormat.raw),
+                    onPressed: () => _testFormatSupport(ImageFormat.rawJpeg),
                     icon: const Icon(Icons.raw_on),
                     label: const Text('Test RAW'),
                   ),

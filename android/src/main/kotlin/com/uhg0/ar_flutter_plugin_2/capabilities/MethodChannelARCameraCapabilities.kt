@@ -9,7 +9,7 @@ import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraCapabilityQuerier
 import com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraResolution
-import com.uhg0.ar_flutter_plugin_2.shared_camera.camera.ImageFormat
+import com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CaptureFormat
 
 class MethodChannelARCameraCapabilities(private val context: Context) : MethodCallHandler {
 
@@ -68,14 +68,6 @@ class MethodChannelARCameraCapabilities(private val context: Context) : MethodCa
                     )
                     result.success(null)
                 }
-                "saveFormatProbeResult" -> {
-                    capabilityQuerier.saveFormatProbeResult(
-                        call.argument<String>("format") ?: "",
-                        call.argument<Boolean>("supported") ?: false,
-                        call.argument<String>("reason"),
-                    )
-                    result.success(null)
-                }
                 "resetCapabilityProfileForTesting" -> {
                     val isDebuggable =
                         context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
@@ -122,7 +114,7 @@ class MethodChannelARCameraCapabilities(private val context: Context) : MethodCa
 
     private fun getSupportedFormats(result: MethodChannel.Result) {
         val formats = capabilityQuerier.getSupportedFormats()
-        val formatStrings = formats.map { it.name.lowercase() }
+        val formatStrings = formats.map { it.wireValue }
         result.success(formatStrings)
     }
 
@@ -167,11 +159,13 @@ class MethodChannelARCameraCapabilities(private val context: Context) : MethodCa
             return
         }
 
-        val format = try {
-            ImageFormat.valueOf(formatString.uppercase())
-        } catch (e: IllegalArgumentException) {
-            result.success(false)
-            return
+        val format = when (formatString) {
+            "jpeg" -> CaptureFormat.JPEG
+            "raw+jpeg" -> CaptureFormat.RAW_JPEG
+            else -> {
+                result.success(false)
+                return
+            }
         }
 
         val isSupported = capabilityQuerier.isFormatSupported(format)

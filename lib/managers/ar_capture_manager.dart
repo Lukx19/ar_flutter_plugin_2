@@ -504,7 +504,7 @@ class ARCaptureManager {
   Future<bool> saveImageToFile(
     String imageId,
     String filePath,
-    ImageFormat format,
+    CaptureAssetFormat format,
   ) async {
     _throwIfDisposed();
     if (!isEnabled) return false;
@@ -514,7 +514,7 @@ class ARCaptureManager {
       return await _channel.invokeMethod('saveImageToFile', {
         'imageId': imageId,
         'filePath': filePath,
-        'format': format.name,
+        'format': format.wireValue,
       });
     } on PlatformException catch (e) {
       throw _captureExceptionFromPlatformException(e, operation: 'save image');
@@ -528,7 +528,7 @@ class ARCaptureManager {
     String rootPath,
     String sessionFolder,
     String baseName,
-    ImageFormat format,
+    CaptureFormat format,
   ) async {
     _throwIfDisposed();
     if (!isEnabled) return null;
@@ -545,7 +545,7 @@ class ARCaptureManager {
           },
           'sessionFolder': sessionFolder,
           'baseName': baseName,
-          'format': format.name,
+          'format': format.wireValue,
         },
       );
       if (result == null) {
@@ -602,7 +602,10 @@ class ARCaptureManager {
   }
 
   /// Get image data into provided buffer
-  Future<Uint8List?> getImageData(String imageId, ImageFormat format) async {
+  Future<Uint8List?> getImageData(
+    String imageId,
+    CaptureAssetFormat format,
+  ) async {
     _throwIfDisposed();
     if (!isEnabled) return null;
 
@@ -610,7 +613,7 @@ class ARCaptureManager {
       await _ensureInitialized();
       final Uint8List? result = await _channel.invokeMethod<Uint8List>(
         'getImageData',
-        {'imageId': imageId, 'format': format.name},
+        {'imageId': imageId, 'format': format.wireValue},
       );
       return result;
     } on PlatformException catch (e) {
@@ -1869,6 +1872,22 @@ class ARCaptureManager {
           final pose = ARFramePose.fromMap(_deepCastMap(call.arguments));
           _poseStreamController.add(pose);
           break;
+        case 'onPoseBatch':
+          final batch = _deepCastMap(call.arguments);
+          if (batch['wireVersion'] != poseBatchWireVersion) {
+            throw FormatException('Unsupported pose batch wire version.');
+          }
+          final samples = batch['samples'];
+          if (samples is! List || samples.length > 8) {
+            throw FormatException(
+                'Pose batch must contain one to eight samples.');
+          }
+          for (final sample in samples) {
+            _poseStreamController.add(
+              ARFramePose.fromMap(_deepCastMap(sample)),
+            );
+          }
+          break;
         case 'onAutomaticCapture':
           final captureResult = ARCaptureResult.fromMap(
             _deepCastMap(call.arguments),
@@ -2025,9 +2044,9 @@ class ARPersistedCaptureResult {
   final Map<String, int> sizes;
   final Map<String, String> hashes;
 
-  String? fileFor(ImageFormat format) => files[format.name];
-  int? sizeFor(ImageFormat format) => sizes[format.name];
-  String? hashFor(ImageFormat format) => hashes[format.name];
+  String? fileFor(CaptureAssetFormat format) => files[format.wireValue];
+  int? sizeFor(CaptureAssetFormat format) => sizes[format.wireValue];
+  String? hashFor(CaptureAssetFormat format) => hashes[format.wireValue];
 }
 
 ARCaptureException _captureExceptionFromPlatformException(

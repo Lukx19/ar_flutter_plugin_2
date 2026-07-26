@@ -81,7 +81,7 @@ class _DirectConfigurationPatternExampleState extends State<DirectConfigurationP
       enableHighResCapture: true,
       captureIntervalMs: 5000, // Longer interval for RAW to manage memory
       resolution: CameraResolution(width: 1920, height: 1080),
-      format: ImageFormat.raw,
+      format: ImageFormat.rawJpeg,
     );
   }
 

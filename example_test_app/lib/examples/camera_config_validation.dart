@@ -44,7 +44,7 @@ class _CameraConfigValidationExampleState extends State<CameraConfigValidationEx
           enableHighResCapture: true,
           captureIntervalMs: 1000,
           resolution: const CameraResolution(width: 3840, height: 2160), // 4K
-          format: ImageFormat.raw,
+          format: ImageFormat.rawJpeg,
         ),
         ARCaptureConfig(
           enableHighResCapture: true,

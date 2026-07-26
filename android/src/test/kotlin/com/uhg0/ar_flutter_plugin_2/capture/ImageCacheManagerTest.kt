@@ -168,13 +168,13 @@ class ImageCacheManagerTest {
             imageId = "pair-1",
             assets = mapOf(
                 "jpeg" to CachedImageAsset(jpeg, ImageFormat.JPEG),
-                "raw" to CachedImageAsset(dng, ImageFormat.RAW_SENSOR),
+                "dng" to CachedImageAsset(dng, ImageFormat.RAW_SENSOR),
             ),
         )
 
         assertEquals(1, manager.getCaptureCapacity()["usedEntries"])
         assertArrayEquals(jpeg, manager.getImageData("pair-1", "jpeg"))
-        assertArrayEquals(dng, manager.getImageData("pair-1", "raw"))
+        assertArrayEquals(dng, manager.getImageData("pair-1", "dng"))
         assertEquals(
             7L,
             manager.getImageSize("pair-1")["totalBytes"],
@@ -192,7 +192,7 @@ class ImageCacheManagerTest {
             imageId = "pair-1",
             assets = mapOf(
                 "jpeg" to CachedImageAsset(jpeg, ImageFormat.JPEG),
-                "raw" to CachedImageAsset(dng, ImageFormat.RAW_SENSOR),
+                "dng" to CachedImageAsset(dng, ImageFormat.RAW_SENSOR),
             ),
         )
 
@@ -206,18 +206,18 @@ class ImageCacheManagerTest {
 
         val files = persisted["files"] as Map<*, *>
         assertArrayEquals(jpeg, File(files["jpeg"] as String).readBytes())
-        assertArrayEquals(dng, File(files["raw"] as String).readBytes())
+        assertArrayEquals(dng, File(files["dng"] as String).readBytes())
         assertNull(manager.getImageData("pair-1"))
         assertEquals(0, manager.getCaptureCapacity()["usedEntries"])
     }
 
     @Test
-    fun `requesting absent raw asset fails explicitly`() {
+    fun `requesting absent dng asset fails explicitly`() {
         val manager = createManager(maxCacheSize = 2)
         manager.cacheImageBytes("jpeg-1", byteArrayOf(1), ImageFormat.JPEG)
 
         try {
-            manager.getImageData("jpeg-1", "raw")
+            manager.getImageData("jpeg-1", "dng")
             fail("Expected FORMAT_NOT_CAPTURED")
         } catch (error: CaptureSessionException) {
             assertEquals("FORMAT_NOT_CAPTURED", error.code)

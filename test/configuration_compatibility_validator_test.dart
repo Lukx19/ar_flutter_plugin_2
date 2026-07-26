@@ -102,7 +102,7 @@ void main() {
       enableHighResCapture: true,
       captureIntervalMs: 3000,
       resolution: resolution1080p,
-      format: ImageFormat.raw,
+      format: ImageFormat.rawJpeg,
       maxCacheSize: 10,
       jpegQuality: 95,
     );

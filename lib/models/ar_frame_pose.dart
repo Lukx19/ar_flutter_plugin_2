@@ -1,6 +1,7 @@
 import 'package:vector_math/vector_math_64.dart';
 
 const String arcoreGlCameraToWorldConvention = 'arcore_gl_c2w_v1';
+const String poseBatchWireVersion = 'pose_batch_v1';
 
 /// A camera-to-world transform with an explicit coordinate convention.
 final class ARPoseTransform {
@@ -18,7 +19,8 @@ final class ARPoseTransform {
     final rotation = _quaternionMap(map['rotation']);
     final values = (map['cameraToWorld'] as List).cast<num>();
     if (values.length != 16) {
-      throw const FormatException('trackingPose cameraToWorld must have 16 values.');
+      throw const FormatException(
+          'trackingPose cameraToWorld must have 16 values.');
     }
     return ARPoseTransform(
       position: position,
@@ -73,6 +75,8 @@ class ARFramePose {
   final String? poseAlignment;
   final int? poseTimeErrorNs;
   final String? trackingState;
+  final String? wireVersion;
+  final int? sequence;
 
   const ARFramePose({
     required this.position,
@@ -87,6 +91,8 @@ class ARFramePose {
     this.poseAlignment,
     this.poseTimeErrorNs,
     this.trackingState,
+    this.wireVersion,
+    this.sequence,
   });
 
   factory ARFramePose.fromMap(Map<String, dynamic> map) {
@@ -96,7 +102,9 @@ class ARFramePose {
       position: position,
       rotation: rotation,
       transform: Matrix4.fromList(
-        (map['transform'] as List).map((value) => (value as num).toDouble()).toList(),
+        (map['transform'] as List)
+            .map((value) => (value as num).toDouble())
+            .toList(),
       ),
       timestamp: DateTime.fromMillisecondsSinceEpoch(map['timestampMs'] as int),
       convention: map['convention'] as String?,
@@ -111,6 +119,8 @@ class ARFramePose {
       poseAlignment: map['poseAlignment'] as String?,
       poseTimeErrorNs: map['poseTimeErrorNs'] as int?,
       trackingState: map['trackingState'] as String?,
+      wireVersion: map['wireVersion'] as String?,
+      sequence: (map['sequence'] as num?)?.toInt(),
     );
   }
 
@@ -137,6 +147,8 @@ class ARFramePose {
       if (poseAlignment != null) 'poseAlignment': poseAlignment,
       if (poseTimeErrorNs != null) 'poseTimeErrorNs': poseTimeErrorNs,
       if (trackingState != null) 'trackingState': trackingState,
+      if (wireVersion != null) 'wireVersion': wireVersion,
+      if (sequence != null) 'sequence': sequence,
     };
   }
 
@@ -155,7 +167,9 @@ class ARFramePose {
         other.isTracking == isTracking &&
         other.poseAlignment == poseAlignment &&
         other.poseTimeErrorNs == poseTimeErrorNs &&
-        other.trackingState == trackingState;
+        other.trackingState == trackingState &&
+        other.wireVersion == wireVersion &&
+        other.sequence == sequence;
   }
 
   @override
@@ -171,7 +185,9 @@ class ARFramePose {
       isTracking.hashCode ^
       poseAlignment.hashCode ^
       poseTimeErrorNs.hashCode ^
-      trackingState.hashCode;
+      trackingState.hashCode ^
+      wireVersion.hashCode ^
+      sequence.hashCode;
 
   @override
   String toString() =>

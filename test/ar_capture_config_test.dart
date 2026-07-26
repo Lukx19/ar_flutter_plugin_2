@@ -62,6 +62,22 @@ void main() {
     expect(roundTripped.toMap(), equals(baseConfig.toMap()));
   });
 
+  test('rejects removed, missing, and unknown logical capture formats', () {
+    for (final format in <Object?>['raw', 'raw_only', 'png', 'heif', null]) {
+      expect(
+        () => ARCaptureConfig.fromMap(<String, dynamic>{
+          ...baseConfig.toMap(),
+          if (format != null) 'format': format else 'format': null,
+        }),
+        throwsA(
+          isA<CaptureFormatException>()
+              .having((error) => error.code, 'code', 'UNSUPPORTED_CAPTURE_FORMAT')
+              .having((error) => error.wireValue, 'wire value', format),
+        ),
+      );
+    }
+  });
+
   test('adjustForAvailableMemory keeps config when usage is already safe', () {
     final adjusted = baseConfig.adjustForAvailableMemory(512);
 

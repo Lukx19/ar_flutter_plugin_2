@@ -12,14 +12,15 @@ import kotlin.math.abs
 
 data class CameraResolution(val width: Int, val height: Int)
 
-enum class ImageFormat {
-    JPEG, RAW
+enum class CaptureFormat(val wireValue: String) {
+    JPEG("jpeg"),
+    RAW_JPEG("raw+jpeg"),
 }
 
 class CameraCapabilityQuerier(private val context: Context) {
 
     companion object {
-        const val CAPABILITY_PRESET_VERSION = 10
+        const val CAPABILITY_PRESET_VERSION = 11
         private const val TAG = "CameraCapabilityQuerier"
     }
 
@@ -128,15 +129,6 @@ class CameraCapabilityQuerier(private val context: Context) {
                 else "pending",
             "rawJpegProbeError" to
                 if (cacheHit) preferences.getString("profile_raw_jpeg_error", null) else null,
-            "validatedRawOnlyResolutions" to getSupportedRawOnlyResolutions().map {
-                mapOf("width" to it.width, "height" to it.height)
-            },
-            "rawOnlyProbeStatus" to if (cacheHit) preferences.getString("profile_raw_only_status", "pending").orEmpty() else "pending",
-            "rawOnlyProbeError" to if (cacheHit) preferences.getString("profile_raw_only_error", null) else null,
-            "validatedPngResolutions" to getSupportedPngResolutions().map {
-                mapOf("width" to it.width, "height" to it.height)
-            },
-            "pngProbeStatus" to if (cacheHit) preferences.getString("profile_png_status", "pending").orEmpty() else "pending",
             "rawCapture" to rawCapture,
             "manualSensorControls" to manualControls,
             "flash" to flash,
@@ -167,9 +159,9 @@ class CameraCapabilityQuerier(private val context: Context) {
                     .remove("profile_shared_camera_error")
                     .putString("profile_raw_jpeg_status", "pending")
                     .remove("profile_raw_jpeg_error")
-                    .putString("profile_raw_only_status", "pending")
+                    .remove("profile_raw_only_status")
                     .remove("profile_raw_only_error")
-                    .putString("profile_png_status", "pending")
+                    .remove("profile_png_status")
             }
             editor.apply()
         }
@@ -200,37 +192,37 @@ class CameraCapabilityQuerier(private val context: Context) {
         }
     }
 
-    fun getSupportedFormats(): List<ImageFormat> {
+    fun getSupportedFormats(): List<CaptureFormat> {
         val cacheKey = "supported_formats"
         if (capabilityCache.containsKey(cacheKey)) {
             @Suppress("UNCHECKED_CAST")
-            return capabilityCache[cacheKey] as List<ImageFormat>
+            return capabilityCache[cacheKey] as List<CaptureFormat>
         }
 
         try {
             val cameraId = getDefaultCameraId()
             val characteristics = getCameraCharacteristics(cameraId)
             val configMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-                ?: return listOf(ImageFormat.JPEG)
+                ?: return listOf(CaptureFormat.JPEG)
 
-            val supportedFormats = mutableListOf<ImageFormat>()
+            val supportedFormats = mutableListOf<CaptureFormat>()
 
             // Check for JPEG support (should always be available)
             val jpegSizes = configMap.getOutputSizes(android.graphics.ImageFormat.JPEG)
             if (jpegSizes != null && jpegSizes.isNotEmpty()) {
-                supportedFormats.add(ImageFormat.JPEG)
+                supportedFormats.add(CaptureFormat.JPEG)
             }
 
             // Check for RAW support
             val rawSizes = configMap.getOutputSizes(android.graphics.ImageFormat.RAW_SENSOR)
             if (rawSizes != null && rawSizes.isNotEmpty()) {
-                supportedFormats.add(ImageFormat.RAW)
+                supportedFormats.add(CaptureFormat.RAW_JPEG)
             }
 
             capabilityCache[cacheKey] = supportedFormats
             return supportedFormats
         } catch (e: Exception) {
-            return listOf(ImageFormat.JPEG) // Fallback to JPEG
+            return listOf(CaptureFormat.JPEG) // Fallback to JPEG
         }
     }
 
@@ -287,7 +279,7 @@ class CameraCapabilityQuerier(private val context: Context) {
         }
     }
 
-    fun isFormatSupported(format: ImageFormat): Boolean {
+    fun isFormatSupported(format: CaptureFormat): Boolean {
         val supportedFormats = getSupportedFormats()
         return supportedFormats.contains(format)
     }
@@ -488,34 +480,6 @@ class CameraCapabilityQuerier(private val context: Context) {
         editor.apply()
     }
 
-    fun getSupportedRawOnlyResolutions() =
-        decodeResolutions(preferences.getString(rawOnlyResolutionKey(getDefaultCameraId()), null))
-
-    fun saveSupportedRawOnlyResolutions(resolutions: List<CameraResolution>) {
-        preferences.edit().putString(
-            rawOnlyResolutionKey(getDefaultCameraId()), encodeResolutions(resolutions),
-        ).apply()
-    }
-
-    fun getSupportedPngResolutions() =
-        decodeResolutions(preferences.getString(pngResolutionKey(getDefaultCameraId()), null))
-
-    fun saveSupportedPngResolutions(resolutions: List<CameraResolution>) {
-        preferences.edit().putString(
-            pngResolutionKey(getDefaultCameraId()), encodeResolutions(resolutions),
-        ).apply()
-    }
-
-    fun saveFormatProbeResult(format: String, supported: Boolean, reason: String?) {
-        require(format == "raw_only" || format == "png")
-        val editor = preferences.edit().putString(
-            "profile_${format}_status", if (supported) "supported" else "unsupported",
-        )
-        if (reason == null) editor.remove("profile_${format}_error")
-        else editor.putString("profile_${format}_error", reason)
-        editor.apply()
-    }
-
     private fun encodeResolutions(resolutions: List<CameraResolution>) =
         resolutions.distinct()
             .sortedByDescending { it.width.toLong() * it.height.toLong() }
@@ -536,12 +500,6 @@ class CameraCapabilityQuerier(private val context: Context) {
 
     private fun rawJpegResolutionKey(cameraId: String) =
         "validated_raw_jpeg_resolutions_v${CAPABILITY_PRESET_VERSION}_${Build.FINGERPRINT}_$cameraId"
-
-    private fun rawOnlyResolutionKey(cameraId: String) =
-        "validated_raw_only_resolutions_v${CAPABILITY_PRESET_VERSION}_${Build.FINGERPRINT}_$cameraId"
-
-    private fun pngResolutionKey(cameraId: String) =
-        "validated_png_resolutions_v${CAPABILITY_PRESET_VERSION}_${Build.FINGERPRINT}_$cameraId"
 
     private fun extractUnifiedIntrinsicsForSize(
         characteristics: CameraCharacteristics,
