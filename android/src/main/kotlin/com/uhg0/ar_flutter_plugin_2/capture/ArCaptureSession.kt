@@ -109,7 +109,7 @@ internal class ArCaptureSession(
             qualityAnalysisTimeoutMs = 1_000L,
         )
 
-    fun initialize(configMap: Map<String, Any?>) {
+    suspend fun initialize(configMap: Map<String, Any?>) {
         val parsedConfig = CaptureConfig.fromMap(configMap)
         config = parsedConfig
         highResCaptureEnabled = configMap["enableHighResCapture"] as? Boolean ?: false

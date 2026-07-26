@@ -30,6 +30,8 @@ import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /// Complete configuration object parsed from ARCaptureConfig
 data class ParsedCaptureConfig(
@@ -352,7 +354,15 @@ internal class SharedCameraManager(
         override fun toString(): String = "$ManualCaptureRequestTagPrefix:$generation"
     }
 
-    fun initialize(cacheManager: ImageCacheManager) {
+    /**
+     * Starts Camera2 without ever blocking the Android main thread.
+     *
+     * SceneView and ARCore setup must stay on the caller (main) thread, but
+     * Camera2 reports readiness through its background callback. Waiting for
+     * that callback on the method-channel thread can turn a transient camera
+     * startup failure into an ANR.
+     */
+    suspend fun initialize(cacheManager: ImageCacheManager) {
         if (isInitialized) {
             throw IllegalStateException("SharedCameraManager already initialized")
         }
@@ -361,6 +371,7 @@ internal class SharedCameraManager(
             imageCacheManager = cacheManager
             startBackgroundThread()
             setupCameraBasedOnConfig()
+            awaitSharedCameraStartup()
             allocateBuffersBasedOnConfig()
             isInitialized = true
             Log.i("SharedCameraManager", "Initialized with config: $config")
@@ -458,7 +469,12 @@ internal class SharedCameraManager(
             wrappedDeviceStateCallback,
             backgroundHandler,
         )
-        startupBarrier.awaitReady(StartupTimeoutMs)
+    }
+
+    private suspend fun awaitSharedCameraStartup() {
+        withContext(Dispatchers.IO) {
+            startupBarrier.awaitReady(StartupTimeoutMs)
+        }
     }
 
     private fun validateSharedResolutionCandidates(camera: CameraDevice) {

@@ -425,10 +425,20 @@ internal class ArView(
                 "initializeCapture" -> {
                     val config = call.arguments as? Map<String, Any?>
                         ?: throw IllegalArgumentException("Capture configuration is required")
-                    captureSession.initialize(config)
-                    result.success(mapOf(
-                        "mode" to if (config["enableHighResCapture"] == true) "sharedCamera" else "previewFallback",
-                    ))
+                    scope.launch {
+                        try {
+                            captureSession.initialize(config)
+                            result.success(mapOf(
+                                "mode" to if (config["enableHighResCapture"] == true) "sharedCamera" else "previewFallback",
+                            ))
+                        } catch (error: CaptureSessionException) {
+                            result.error(error.code, error.message, null)
+                        } catch (error: IllegalArgumentException) {
+                            result.error("CONFIG_INVALID", error.message, null)
+                        } catch (error: Exception) {
+                            result.error("CAPTURE_FAILED", error.message, null)
+                        }
+                    }
                 }
                 "captureHighResImage" -> scope.launch {
                     try {
