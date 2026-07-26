@@ -42,6 +42,33 @@ internal interface HighResPoseResolver {
     fun toPoseMap(alignedPose: PoseDataExtractor.AlignedPose): Map<String, Any?>
 }
 
+internal object CapturePipelineTimingContract {
+    const val VERSION = "capture_pipeline_timing_v1"
+
+    const val REQUEST_TO_PROCESSED_FRAME = "requestToProcessedFrame"
+    const val PRE_ACCEPTANCE_POSE = "preAcceptancePose"
+    const val FINALIZATION_QUEUE_WAIT = "finalizationQueueWait"
+    const val JPEG_ENCODING = "jpegEncoding"
+    const val QUALITY_AWAIT = "qualityAwait"
+    const val POSE_AWAIT = "poseAwait"
+    const val RAW_DNG_ENCODING = "rawDngEncoding"
+    const val CACHE_COMMIT = "cacheCommit"
+    const val NATIVE_FINALIZATION_TOTAL = "nativeFinalizationTotal"
+
+    val REQUIRED_KEYS =
+        setOf(
+            REQUEST_TO_PROCESSED_FRAME,
+            PRE_ACCEPTANCE_POSE,
+            FINALIZATION_QUEUE_WAIT,
+            JPEG_ENCODING,
+            QUALITY_AWAIT,
+            POSE_AWAIT,
+            RAW_DNG_ENCODING,
+            CACHE_COMMIT,
+            NATIVE_FINALIZATION_TOTAL,
+        )
+}
+
 internal class HighResCapturePipeline(
     private val cache: HighResCaptureCache?,
     private val poseResolver: HighResPoseResolver,
@@ -183,14 +210,15 @@ internal class HighResCapturePipeline(
                 }
 
             result +
+                ("pipelineTimingVersion" to CapturePipelineTimingContract.VERSION) +
                 ("pipelineTimingMs" to
                     (sharedResult.pipelineTimingMs +
                         mapOf(
-                            "qualityAwait" to qualityAwaitMs,
-                            "poseAwait" to poseAwaitMs,
-                            "rawDngEncoding" to rawDngEncodingMs,
-                            "cacheCommit" to cacheCommitMs,
-                            "nativeFinalizationTotal" to
+                            CapturePipelineTimingContract.QUALITY_AWAIT to qualityAwaitMs,
+                            CapturePipelineTimingContract.POSE_AWAIT to poseAwaitMs,
+                            CapturePipelineTimingContract.RAW_DNG_ENCODING to rawDngEncodingMs,
+                            CapturePipelineTimingContract.CACHE_COMMIT to cacheCommitMs,
+                            CapturePipelineTimingContract.NATIVE_FINALIZATION_TOTAL to
                                 ((System.nanoTime() - finalizationStartedAtNs) / 1_000_000L),
                         )))
         } catch (error: Throwable) {

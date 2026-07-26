@@ -178,11 +178,9 @@ class HighResCapturePipelineTest {
         val capture = result["capture"] as Map<*, *>
         assertEquals("image-1", capture["imageId"])
         assertEquals(4_000_000L, capture["exposureTimeNs"])
+        assertEquals(CapturePipelineTimingContract.VERSION, result["pipelineTimingVersion"])
         val timing = result["pipelineTimingMs"] as Map<*, *>
-        assertTrue(timing.containsKey("qualityAwait"))
-        assertTrue(timing.containsKey("poseAwait"))
-        assertTrue(timing.containsKey("cacheCommit"))
-        assertTrue(timing.containsKey("nativeFinalizationTotal"))
+        assertEquals(CapturePipelineTimingContract.REQUIRED_KEYS, timing.keys)
     }
 
     @Test
@@ -273,6 +271,13 @@ class HighResCapturePipelineTest {
             exposureTimeNs = 4_000_000L,
             rollingShutterSkewNs = 500_000L,
             intrinsics = mapOf("fx" to 1000.0),
+            pipelineTimingMs =
+                mapOf(
+                    CapturePipelineTimingContract.REQUEST_TO_PROCESSED_FRAME to 12L,
+                    CapturePipelineTimingContract.PRE_ACCEPTANCE_POSE to 1L,
+                    CapturePipelineTimingContract.FINALIZATION_QUEUE_WAIT to 2L,
+                    CapturePipelineTimingContract.JPEG_ENCODING to 40L,
+                ),
         )
 
     private fun qualityMap(

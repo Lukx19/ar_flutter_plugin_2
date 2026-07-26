@@ -6,7 +6,9 @@ import android.graphics.YuvImage
 import android.graphics.SurfaceTexture
 import android.media.Image
 import android.os.BatteryManager
+import android.os.Build
 import android.os.Debug
+import android.os.PowerManager
 import android.util.Log
 import android.util.Size
 import android.view.Surface
@@ -391,6 +393,21 @@ internal class ArCaptureSession(
             batteryManager
                 ?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER)
                 ?.takeIf { it != Int.MIN_VALUE }
+        val thermalStatus =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                when (sceneHost.context.getSystemService(PowerManager::class.java)?.currentThermalStatus) {
+                    PowerManager.THERMAL_STATUS_NONE -> "none"
+                    PowerManager.THERMAL_STATUS_LIGHT -> "light"
+                    PowerManager.THERMAL_STATUS_MODERATE -> "moderate"
+                    PowerManager.THERMAL_STATUS_SEVERE -> "severe"
+                    PowerManager.THERMAL_STATUS_CRITICAL -> "critical"
+                    PowerManager.THERMAL_STATUS_EMERGENCY -> "emergency"
+                    PowerManager.THERMAL_STATUS_SHUTDOWN -> "shutdown"
+                    else -> "unknown"
+                }
+            } else {
+                null
+            }
         return resourceCounters.snapshot() +
             mapOf(
                 "processPssBytes" to Debug.getPss().toLong() * 1024L,
@@ -401,6 +418,7 @@ internal class ArCaptureSession(
                 "threadCount" to Thread.getAllStackTraces().size,
                 "batteryPercent" to batteryPercent,
                 "batteryChargeCounterMicroAh" to chargeCounterMicroAh,
+                "thermalStatus" to thermalStatus,
             )
     }
 

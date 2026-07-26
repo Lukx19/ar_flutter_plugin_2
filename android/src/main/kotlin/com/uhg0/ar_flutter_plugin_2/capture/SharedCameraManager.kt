@@ -1243,12 +1243,12 @@ internal class SharedCameraManager(
                             preAlignedPose = alignedPose,
                             pipelineTimingMs =
                                 mapOf(
-                                    "requestToProcessedFrame" to
+                                    CapturePipelineTimingContract.REQUEST_TO_PROCESSED_FRAME to
                                         ((processedFrameAtNs - pending.requestStartedAtNs) / 1_000_000L),
-                                    "preAcceptancePose" to poseResolutionMs,
-                                    "finalizationQueueWait" to
+                                    CapturePipelineTimingContract.PRE_ACCEPTANCE_POSE to poseResolutionMs,
+                                    CapturePipelineTimingContract.FINALIZATION_QUEUE_WAIT to
                                         ((workerStartedAtNs - workerSubmittedAtNs) / 1_000_000L),
-                                    "jpegEncoding" to jpegEncodingMs,
+                                    CapturePipelineTimingContract.JPEG_ENCODING to jpegEncodingMs,
                                 ),
                         )
                     onCaptureEncoded(encoded, pending.qualityPolicy)
