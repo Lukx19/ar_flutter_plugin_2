@@ -17,6 +17,7 @@ export 'package:ar_flutter_plugin_2/models/ar_capture_result.dart';
 export 'package:ar_flutter_plugin_2/models/ar_frame_pose.dart';
 export 'package:ar_flutter_plugin_2/models/ar_camera_intrinsics.dart';
 export 'package:ar_flutter_plugin_2/models/ar_point_cloud.dart';
+export 'package:ar_flutter_plugin_2/models/ar_visibility_grid.dart';
 export 'package:ar_flutter_plugin_2/models/camera_resolution.dart';
 export 'package:ar_flutter_plugin_2/models/focal_length.dart';
 export 'package:ar_flutter_plugin_2/models/image_size.dart';

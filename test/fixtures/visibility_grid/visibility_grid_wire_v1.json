@@ -1,0 +1,120 @@
+{
+  "version": "visibility_grid_wire_v1",
+  "fixtureSchema": "visibility_grid_fixture_v1",
+  "voxelKeyConvention": "coverage_grid_v3",
+  "matrixConvention": "column_major_gl_meters_v1",
+  "defaults": {
+    "voxelSizeMeters": 0.1,
+    "candidateSamples": 5,
+    "candidateSpanNs": 500000000,
+    "candidateMaxStdDevMeters": 0.05,
+    "relocationHysteresisMeters": 0.015,
+    "jumpResetMeters": 0.3,
+    "depthConfidenceMinimum": 128,
+    "safetyBandMeters": 0.15,
+    "freeEvidenceToCarve": 8,
+    "separatedDirectionBinsRequired": 2
+  },
+  "scenarios": [
+    {
+      "name": "group_transform_and_packed_keys",
+      "worldFromGroupGl": [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        1.0, 2.0, 3.0, 1.0
+      ],
+      "groupFromWorldGl": [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        -1.0, -2.0, -3.0, 1.0
+      ],
+      "worldPoints": [
+        [1.05, 2.05, 3.05],
+        [1.15, 2.05, 3.05],
+        [0.95, 2.05, 2.05]
+      ],
+      "expectedGroupCellCoordinates": [
+        [0, 0, 0],
+        [1, 0, 0],
+        [-1, 0, -10]
+      ],
+      "expectedPackedKeys": [
+        "4611688217451692032",
+        "4611692615498203136",
+        "4611683819405180918"
+      ]
+    },
+    {
+      "name": "persistent_id_relocation",
+      "featureId": "42",
+      "observations": [
+        {"timestampNs": 0, "positionGroup": [0.020, 0.020, 0.020], "confidence": 0.9},
+        {"timestampNs": 125000000, "positionGroup": [0.021, 0.020, 0.020], "confidence": 0.9},
+        {"timestampNs": 250000000, "positionGroup": [0.019, 0.020, 0.020], "confidence": 0.9},
+        {"timestampNs": 375000000, "positionGroup": [0.020, 0.021, 0.020], "confidence": 0.9},
+        {"timestampNs": 500000000, "positionGroup": [0.020, 0.019, 0.020], "confidence": 0.9},
+        {"timestampNs": 625000000, "positionGroup": [0.160, 0.020, 0.020], "confidence": 0.9},
+        {"timestampNs": 750000000, "positionGroup": [0.170, 0.020, 0.020], "confidence": 0.9}
+      ],
+      "promotedKey": "4611688217451692032",
+      "relocatedKey": "4611692615498203136",
+      "maximumContributedVoxels": 1
+    },
+    {
+      "name": "shared_feature_support",
+      "voxelKey": "4611688217451692032",
+      "featureIds": ["42", "84"],
+      "supportAfterPromotion": 2,
+      "removedFeatureId": "42",
+      "supportAfterRemoval": 1,
+      "voxelRemainsOccupied": true
+    },
+    {
+      "name": "depth_safe_band_and_multiview_carving",
+      "cameraGroup": [0.05, 0.05, 0.05],
+      "surfaceGroup": [0.05, 0.05, -0.95],
+      "surfaceKey": "4611688217451692022",
+      "freeKeysBeforeSafetyBand": [
+        "4611688217451692031",
+        "4611688217451692030",
+        "4611688217451692029",
+        "4611688217451692028",
+        "4611688217451692027",
+        "4611688217451692026",
+        "4611688217451692025",
+        "4611688217451692024"
+      ],
+      "safetyBandMeters": 0.15,
+      "singleViewRemovesOccupied": false,
+      "separatedDirectionBinsRequired": 2,
+      "freeEvidenceToCarve": 8,
+      "occupiedEvidenceToRestore": 4
+    },
+    {
+      "name": "geometry_revision_and_resync",
+      "orderedDelta": {
+        "baseGeometryRevision": 4,
+        "geometryRevision": 5,
+        "reset": false,
+        "upsertKeys": ["4611688217451692032"],
+        "removalKeys": ["4611692615498203136"]
+      },
+      "gapDelta": {
+        "baseGeometryRevision": 7,
+        "geometryRevision": 8,
+        "reset": false
+      },
+      "expectedGapAction": "requestSnapshot",
+      "snapshot": {
+        "baseGeometryRevision": 5,
+        "geometryRevision": 8,
+        "reset": true,
+        "upsertKeys": ["4611688217451692032"],
+        "removalKeys": []
+      },
+      "acknowledgedGeometryRevision": 8
+    }
+  ]
+}
