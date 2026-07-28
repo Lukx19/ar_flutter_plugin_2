@@ -50,7 +50,7 @@ enum ARVisibilityGridErrorCode {
 }
 
 class ARVisibilityGridNativeConfig {
-  const ARVisibilityGridNativeConfig({
+  ARVisibilityGridNativeConfig({
     this.renderCapacity = 100000,
     this.featureTrackCapacity = 200000,
     this.maxFeaturesPerObservation = 2000,
@@ -60,16 +60,23 @@ class ARVisibilityGridNativeConfig {
     this.featureConfidenceMinimum = 0.3,
     this.depthConfidenceMinimum = 128,
     this.syntheticSource = false,
-  })  : assert(renderCapacity > 0 && renderCapacity <= 100000),
-        assert(featureTrackCapacity > 0 && featureTrackCapacity <= 200000),
-        assert(maxFeaturesPerObservation > 0),
-        assert(maxDepthPixelsPerObservation > 0),
-        assert(maxRayVisitsPerObservation > 0),
-        assert(publishIntervalMs >= 500),
-        assert(
-          featureConfidenceMinimum >= 0 && featureConfidenceMinimum <= 1,
-        ),
-        assert(depthConfidenceMinimum >= 0 && depthConfidenceMinimum <= 255);
+  }) {
+    if (renderCapacity <= 0 ||
+        renderCapacity > 100000 ||
+        featureTrackCapacity <= 0 ||
+        featureTrackCapacity > 200000 ||
+        maxFeaturesPerObservation <= 0 ||
+        maxDepthPixelsPerObservation <= 0 ||
+        maxRayVisitsPerObservation <= 0 ||
+        publishIntervalMs < 500 ||
+        !featureConfidenceMinimum.isFinite ||
+        featureConfidenceMinimum < 0 ||
+        featureConfidenceMinimum > 1 ||
+        depthConfidenceMinimum < 0 ||
+        depthConfidenceMinimum > 255) {
+      throw ArgumentError('Invalid visibility-grid native configuration.');
+    }
+  }
 
   final int renderCapacity;
   final int featureTrackCapacity;

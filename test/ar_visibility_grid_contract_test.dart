@@ -112,7 +112,7 @@ void main() {
 
   group('visibility_grid_wire_v1 outbound contract', () {
     test('encodes bounded native initialization budgets', () {
-      const config = ARVisibilityGridNativeConfig(syntheticSource: true);
+      final config = ARVisibilityGridNativeConfig(syntheticSource: true);
 
       expect(config.toMap(), <String, Object>{
         'version': visibilityGridWireVersion,
@@ -126,6 +126,23 @@ void main() {
         'depthConfidenceMinimum': 128,
         'syntheticSource': true,
       });
+    });
+
+    test('rejects invalid native budgets at runtime', () {
+      expect(
+        () => ARVisibilityGridNativeConfig(renderCapacity: 100001),
+        throwsArgumentError,
+      );
+      expect(
+        () => ARVisibilityGridNativeConfig(publishIntervalMs: 499),
+        throwsArgumentError,
+      );
+      expect(
+        () => ARVisibilityGridNativeConfig(
+          featureConfidenceMinimum: double.nan,
+        ),
+        throwsArgumentError,
+      );
     });
 
     test('encodes group transforms and restored baseline keys', () {
@@ -458,7 +475,10 @@ void main() {
         'group_transform_and_packed_keys',
         'persistent_id_relocation',
         'shared_feature_support',
+        'android_raw_depth_unprojection',
         'depth_safe_band_and_multiview_carving',
+        'ios_scene_depth_orientation_and_fallback',
+        'source_health_and_resource_closure',
         'geometry_revision_and_resync',
       ]),
     );
@@ -466,13 +486,66 @@ void main() {
     final transform = scenarios.firstWhere(
       (scenario) => scenario['name'] == 'group_transform_and_packed_keys',
     );
-    final expectedKeys =
-        (transform['expectedPackedKeys'] as List<dynamic>).cast<String>();
-    expect(expectedKeys, <String>[
-      '4611688217451692032',
-      '4611692615498203136',
-      '4611683819405180918',
-    ]);
+    final groupFromWorld = _doubleList(transform['groupFromWorldGl']);
+    final worldPoints =
+        (transform['worldPoints'] as List<dynamic>).map(_doubleList).toList();
+    final computedCoordinates = worldPoints
+        .map((point) => _transformPoint(groupFromWorld, point))
+        .map(
+          (point) =>
+              point.map((coordinate) => (coordinate / 0.1).floor()).toList(),
+        )
+        .toList();
+    expect(
+      computedCoordinates,
+      (transform['expectedGroupCellCoordinates'] as List<dynamic>)
+          .map((value) => (value as List<dynamic>).cast<int>())
+          .toList(),
+    );
+    expect(
+      computedCoordinates
+          .map((coordinates) => _packKey(coordinates).toString())
+          .toList(),
+      (transform['expectedPackedKeys'] as List<dynamic>).cast<String>(),
+    );
+
+    final unprojection = scenarios.firstWhere(
+      (scenario) => scenario['name'] == 'android_raw_depth_unprojection',
+    );
+    final frame = _map(unprojection['sourceFrame']);
+    final intrinsics = _map(frame['intrinsics']);
+    final sample = _map(unprojection['sample']);
+    final pixel = (sample['pixel'] as List<dynamic>).cast<int>();
+    final depthMeters = (sample['depthMillimeters'] as num).toDouble() / 1000;
+    final cameraPoint = <double>[
+      (pixel[0] - (intrinsics['cx'] as num).toDouble()) *
+          depthMeters /
+          (intrinsics['fx'] as num).toDouble(),
+      -(pixel[1] - (intrinsics['cy'] as num).toDouble()) *
+          depthMeters /
+          (intrinsics['fy'] as num).toDouble(),
+      -depthMeters,
+    ];
+    _expectClose(cameraPoint, _doubleList(unprojection['expectedCameraGl']));
+    final worldPoint = _transformPoint(
+      _doubleList(frame['worldFromCameraGl']),
+      cameraPoint,
+    );
+    final groupPoint = _transformPoint(
+      _doubleList(frame['groupFromWorldGl']),
+      worldPoint,
+    );
+    _expectClose(groupPoint, _doubleList(unprojection['expectedGroupPoint']));
+    final cellCoordinates =
+        groupPoint.map((coordinate) => (coordinate / 0.1).floor()).toList();
+    expect(
+      cellCoordinates,
+      (unprojection['expectedCellCoordinates'] as List<dynamic>).cast<int>(),
+    );
+    expect(
+      _packKey(cellCoordinates).toString(),
+      unprojection['expectedPackedKey'],
+    );
 
     final carving = scenarios.firstWhere(
       (scenario) => scenario['name'] == 'depth_safe_band_and_multiview_carving',
@@ -480,5 +553,112 @@ void main() {
     expect(carving['safetyBandMeters'], 0.15);
     expect(carving['singleViewRemovesOccupied'], isFalse);
     expect(carving['separatedDirectionBinsRequired'], 2);
+    expect(
+      (carving['evidenceSteps'] as List<dynamic>)
+          .map((step) => _map(step)['expectedState']),
+      <String>['occupied', 'contradicted', 'restored'],
+    );
+
+    final movement = scenarios.firstWhere(
+      (scenario) => scenario['name'] == 'persistent_id_relocation',
+    );
+    expect(
+      (_map(movement['jumpObservation'])['expectedContributedVoxels']),
+      0,
+    );
+    expect(
+      (movement['observations'] as List<dynamic>)
+          .map((observation) => _map(observation)['expectedState']),
+      <String>[
+        'candidate',
+        'candidate',
+        'candidate',
+        'candidate',
+        'stable',
+        'stable',
+        'relocated',
+      ],
+    );
+
+    final ios = scenarios.firstWhere(
+      (scenario) =>
+          scenario['name'] == 'ios_scene_depth_orientation_and_fallback',
+    );
+    final iosFrame = _map(ios['sourceFrame']);
+    final rawPixel = (ios['rawPixel'] as List<dynamic>).cast<int>();
+    final orientedPixel = <int>[
+      rawPixel[1],
+      (iosFrame['imageWidth'] as int) - 1 - rawPixel[0],
+    ];
+    expect(
+      orientedPixel,
+      (ios['expectedOrientedPixel'] as List<dynamic>).cast<int>(),
+    );
+    const confidenceRank = <String, int>{'low': 0, 'medium': 1, 'high': 2};
+    final minimum = confidenceRank[ios['confidenceMinimum']]!;
+    for (final value in ios['samples'] as List<dynamic>) {
+      final sample = _map(value);
+      expect(
+        confidenceRank[sample['confidence']]! >= minimum,
+        sample['expectedAccepted'],
+      );
+    }
+    expect(
+      _map(ios['unsupported'])['expectedActiveMode'],
+      'featureOnly',
+    );
+
+    final resources = scenarios.firstWhere(
+      (scenario) => scenario['name'] == 'source_health_and_resource_closure',
+    );
+    final android = _map(resources['android']);
+    for (final eventName in <String>['usableFrame', 'transientUnavailable']) {
+      final event = _map(android[eventName]);
+      expect(event['depthImagesClosed'], event['depthImagesAcquired']);
+      expect(
+        event['confidenceImagesClosed'],
+        event['confidenceImagesAcquired'],
+      );
+    }
+    final iosResources = _map(resources['ios']);
+    expect(
+      iosResources['sceneDepthBuffersReleased'],
+      iosResources['sceneDepthBuffersRetained'],
+    );
+    expect(
+      iosResources['confidenceBuffersReleased'],
+      iosResources['confidenceBuffersRetained'],
+    );
   });
+}
+
+Map<String, dynamic> _map(Object? value) => (value as Map<String, dynamic>);
+
+List<double> _doubleList(Object? value) => (value as List<dynamic>)
+    .map((element) => (element as num).toDouble())
+    .toList();
+
+List<double> _transformPoint(List<double> matrix, List<double> point) {
+  final homogeneous = <double>[...point, 1];
+  return List<double>.generate(
+    3,
+    (row) => List<double>.generate(
+      4,
+      (column) => matrix[column * 4 + row] * homogeneous[column],
+    ).reduce((sum, value) => sum + value),
+  );
+}
+
+int _packKey(List<int> coordinates) {
+  const bias = 1 << 20;
+  return ((coordinates[0] + bias) << 42) |
+      ((coordinates[1] + bias) << 21) |
+      (coordinates[2] + bias);
+}
+
+void _expectClose(List<double> actual, List<double> expected) {
+  expect(actual, hasLength(expected.length));
+  for (var index = 0; index < expected.length; index++) {
+    expect(actual[index], closeTo(expected[index], 1e-9));
+  }
 }

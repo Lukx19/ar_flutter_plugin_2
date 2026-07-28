@@ -50,17 +50,25 @@
       "name": "persistent_id_relocation",
       "featureId": "42",
       "observations": [
-        {"timestampNs": 0, "positionGroup": [0.020, 0.020, 0.020], "confidence": 0.9},
-        {"timestampNs": 125000000, "positionGroup": [0.021, 0.020, 0.020], "confidence": 0.9},
-        {"timestampNs": 250000000, "positionGroup": [0.019, 0.020, 0.020], "confidence": 0.9},
-        {"timestampNs": 375000000, "positionGroup": [0.020, 0.021, 0.020], "confidence": 0.9},
-        {"timestampNs": 500000000, "positionGroup": [0.020, 0.019, 0.020], "confidence": 0.9},
-        {"timestampNs": 625000000, "positionGroup": [0.160, 0.020, 0.020], "confidence": 0.9},
-        {"timestampNs": 750000000, "positionGroup": [0.170, 0.020, 0.020], "confidence": 0.9}
+        {"timestampNs": 0, "positionGroup": [0.020, 0.020, 0.020], "confidence": 0.9, "expectedState": "candidate"},
+        {"timestampNs": 125000000, "positionGroup": [0.021, 0.020, 0.020], "confidence": 0.9, "expectedState": "candidate"},
+        {"timestampNs": 250000000, "positionGroup": [0.019, 0.020, 0.020], "confidence": 0.9, "expectedState": "candidate"},
+        {"timestampNs": 375000000, "positionGroup": [0.020, 0.021, 0.020], "confidence": 0.9, "expectedState": "candidate"},
+        {"timestampNs": 500000000, "positionGroup": [0.020, 0.019, 0.020], "confidence": 0.9, "expectedState": "stable"},
+        {"timestampNs": 625000000, "positionGroup": [0.160, 0.020, 0.020], "confidence": 0.9, "expectedState": "stable"},
+        {"timestampNs": 750000000, "positionGroup": [0.170, 0.020, 0.020], "confidence": 0.9, "expectedState": "relocated"}
       ],
       "promotedKey": "4611688217451692032",
       "relocatedKey": "4611692615498203136",
-      "maximumContributedVoxels": 1
+      "maximumContributedVoxels": 1,
+      "jumpObservation": {
+        "timestampNs": 875000000,
+        "positionGroup": [2.170, 0.020, 0.020],
+        "confidence": 0.9,
+        "expectedState": "candidate",
+        "expectedRemovedKey": "4611692615498203136",
+        "expectedContributedVoxels": 0
+      }
     },
     {
       "name": "shared_feature_support",
@@ -70,6 +78,39 @@
       "removedFeatureId": "42",
       "supportAfterRemoval": 1,
       "voxelRemainsOccupied": true
+    },
+    {
+      "name": "android_raw_depth_unprojection",
+      "sourceMode": "rawDepthOnly",
+      "sourceFrame": {
+        "timestampNs": 1000000000,
+        "tracking": true,
+        "imageWidth": 4,
+        "imageHeight": 3,
+        "imageOrientation": "landscapeRight",
+        "intrinsics": {"fx": 2.0, "fy": 2.0, "cx": 1.5, "cy": 1.0},
+        "worldFromCameraGl": [
+          1.0, 0.0, 0.0, 0.0,
+          0.0, 1.0, 0.0, 0.0,
+          0.0, 0.0, 1.0, 0.0,
+          1.0, 2.0, 3.0, 1.0
+        ],
+        "groupFromWorldGl": [
+          1.0, 0.0, 0.0, 0.0,
+          0.0, 1.0, 0.0, 0.0,
+          0.0, 0.0, 1.0, 0.0,
+          -1.0, -2.0, -3.0, 1.0
+        ]
+      },
+      "sample": {
+        "pixel": [2, 1],
+        "depthMillimeters": 1000,
+        "confidence": 200
+      },
+      "expectedCameraGl": [0.25, 0.0, -1.0],
+      "expectedGroupPoint": [0.25, 0.0, -1.0],
+      "expectedCellCoordinates": [2, 0, -10],
+      "expectedPackedKey": "4611697013544714230"
     },
     {
       "name": "depth_safe_band_and_multiview_carving",
@@ -90,7 +131,74 @@
       "singleViewRemovesOccupied": false,
       "separatedDirectionBinsRequired": 2,
       "freeEvidenceToCarve": 8,
-      "occupiedEvidenceToRestore": 4
+      "occupiedEvidenceToRestore": 4,
+      "evidenceSteps": [
+        {"occupied": 0, "free": 4, "directionBins": [0], "expectedState": "occupied"},
+        {"occupied": 0, "free": 8, "directionBins": [0, 2], "expectedState": "contradicted"},
+        {"occupied": 4, "free": 8, "directionBins": [0, 2], "expectedState": "restored"}
+      ]
+    },
+    {
+      "name": "ios_scene_depth_orientation_and_fallback",
+      "sourceMode": "sceneDepth",
+      "capabilitySupported": true,
+      "sourceFrame": {
+        "timestampNs": 2000000000,
+        "imageWidth": 3,
+        "imageHeight": 2,
+        "imageOrientation": "portrait"
+      },
+      "rawPixel": [0, 1],
+      "expectedOrientedDimensions": [2, 3],
+      "expectedOrientedPixel": [1, 2],
+      "confidenceMinimum": "medium",
+      "samples": [
+        {"confidence": "high", "expectedAccepted": true},
+        {"confidence": "medium", "expectedAccepted": true},
+        {"confidence": "low", "expectedAccepted": false}
+      ],
+      "nilSceneDepth": {
+        "expectedHealth": "transientUnavailable",
+        "expectedActiveMode": "sceneDepth"
+      },
+      "unsupported": {
+        "expectedHealth": "unsupported",
+        "expectedActiveMode": "featureOnly"
+      }
+    },
+    {
+      "name": "source_health_and_resource_closure",
+      "android": {
+        "modeHierarchy": ["rawDepthOnly", "automatic", "featureOnly"],
+        "usableFrame": {
+          "depthImagesAcquired": 1,
+          "depthImagesClosed": 1,
+          "confidenceImagesAcquired": 1,
+          "confidenceImagesClosed": 1,
+          "expectedHealth": "healthy"
+        },
+        "transientUnavailable": {
+          "notYetAvailableCount": 1,
+          "depthImagesAcquired": 0,
+          "depthImagesClosed": 0,
+          "confidenceImagesAcquired": 0,
+          "confidenceImagesClosed": 0,
+          "expectedHealth": "transientUnavailable",
+          "expectedActiveMode": "rawDepthOnly"
+        },
+        "terminalFailure": {
+          "consecutiveFailures": 3,
+          "expectedHealth": "failed",
+          "expectedActiveMode": "featureOnly"
+        }
+      },
+      "ios": {
+        "sceneDepthBuffersRetained": 1,
+        "sceneDepthBuffersReleased": 1,
+        "confidenceBuffersRetained": 1,
+        "confidenceBuffersReleased": 1,
+        "expectedHealth": "healthy"
+      }
     },
     {
       "name": "geometry_revision_and_resync",
