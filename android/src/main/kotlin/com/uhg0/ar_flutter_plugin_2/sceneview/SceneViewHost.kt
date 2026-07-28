@@ -45,6 +45,7 @@ import com.google.ar.core.Session
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.ArCoreDepthModeController
 import io.github.sceneview.SurfaceType
 import io.github.sceneview.ar.ARSceneView
 import io.github.sceneview.ar.camera.ARCameraStream
@@ -282,13 +283,8 @@ internal class SceneViewHost(
                             Log.i("SceneViewHost", "Selected ARCore rear camera $requestedId")
                         }
                     }
-                    arConfig.depthMode = if (
-                        session.isDepthModeSupported(Config.DepthMode.AUTOMATIC)
-                    ) {
-                        Config.DepthMode.AUTOMATIC
-                    } else {
-                        Config.DepthMode.DISABLED
-                    }
+                    arConfig.depthMode =
+                        selectVisibilityGridDepthMode(session::isDepthModeSupported)
                     arConfig.instantPlacementMode = Config.InstantPlacementMode.DISABLED
                     arConfig.lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
                     arConfig.focusMode = Config.FocusMode.AUTO
@@ -1090,3 +1086,11 @@ internal class SceneViewHost(
         )
     }
 }
+
+internal fun selectVisibilityGridDepthMode(
+    isSupported: (Config.DepthMode) -> Boolean,
+): Config.DepthMode =
+    ArCoreDepthModeController(
+        rawDepthSupported = isSupported(Config.DepthMode.RAW_DEPTH_ONLY),
+        automaticDepthSupported = isSupported(Config.DepthMode.AUTOMATIC),
+    ).activeMode

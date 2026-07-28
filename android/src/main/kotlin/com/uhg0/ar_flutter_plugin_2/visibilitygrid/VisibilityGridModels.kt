@@ -11,6 +11,7 @@ internal const val RESTORED_VOXEL_WORST_CASE_BYTES = 160L
 internal const val PENDING_GEOMETRY_KEY_ESTIMATED_BYTES = 64L
 internal const val IN_FLIGHT_GEOMETRY_KEY_ESTIMATED_BYTES = 32L
 internal const val FEATURE_ASSOCIATION_WORST_CASE_BYTES = 512L
+internal const val DEPTH_EVIDENCE_ESTIMATED_BYTES = 32L
 internal const val VISIBILITY_GRID_MEMORY_BUDGET_BYTES = 16L * 1024L * 1024L
 
 data class VisibilityGridFeatureConfig(
@@ -40,6 +41,91 @@ data class VisibilityGridFeatureConfig(
         require(candidateExpiryNs > 0)
     }
 }
+
+data class VisibilityGridDepthConfig(
+    val confidenceMinimum: Int = 128,
+    val safetyBandMeters: Double = 0.15,
+    val minimumDepthMeters: Double = 0.20,
+    val maximumDepthMeters: Double = 8.0,
+    val occupiedEvidenceToShow: Int = 4,
+    val freeEvidenceToCarve: Int = 8,
+    val freeEvidenceMargin: Int = 4,
+    val separatedDirectionBinsRequired: Int = 2,
+    val maxAcceptedPixelsPerObservation: Int = 4_096,
+    val maxRayVisitsPerObservation: Int = 65_536,
+    val terminalFailureThreshold: Int = 3,
+) {
+    init {
+        require(confidenceMinimum in 0..255)
+        require(safetyBandMeters.isFinite() && safetyBandMeters >= 0.0)
+        require(minimumDepthMeters.isFinite() && minimumDepthMeters > 0.0)
+        require(maximumDepthMeters.isFinite() && maximumDepthMeters > minimumDepthMeters)
+        require(occupiedEvidenceToShow in 1..255)
+        require(freeEvidenceToCarve in 1..255)
+        require(freeEvidenceMargin in 0..255)
+        require(separatedDirectionBinsRequired in 1..24)
+        require(maxAcceptedPixelsPerObservation in 1..4_096)
+        require(maxRayVisitsPerObservation in 1..65_536)
+        require(terminalFailureThreshold > 0)
+    }
+}
+
+data class DepthIntrinsics(
+    val fx: Double,
+    val fy: Double,
+    val cx: Double,
+    val cy: Double,
+) {
+    init {
+        require(fx.isFinite() && fx > 0.0)
+        require(fy.isFinite() && fy > 0.0)
+        require(cx.isFinite())
+        require(cy.isFinite())
+    }
+}
+
+enum class DepthImageOrientation(val wireName: String) {
+    LANDSCAPE_RIGHT("landscapeRight"),
+}
+
+data class DepthObservation(
+    val timestampNs: Long,
+    val groupGeneration: Long,
+    val sessionGeneration: Long,
+    val tracking: Boolean,
+    val width: Int,
+    val height: Int,
+    val samples: List<DepthPixelSample>,
+    val sourceRejectedPixels: Int = 0,
+    val intrinsics: DepthIntrinsics,
+    val worldFromCameraGl: DoubleArray,
+    val imageOrientation: DepthImageOrientation = DepthImageOrientation.LANDSCAPE_RIGHT,
+) {
+    init {
+        require(timestampNs >= 0)
+        require(groupGeneration >= 0)
+        require(sessionGeneration >= 0)
+        require(width > 0 && height > 0)
+        require(samples.size <= 4_096)
+        require(sourceRejectedPixels >= 0)
+        require(samples.all { it.x in 0 until width && it.y in 0 until height })
+        require(worldFromCameraGl.size == 16 && worldFromCameraGl.all(Double::isFinite))
+    }
+}
+
+data class DepthPixelSample(
+    val x: Int,
+    val y: Int,
+    val depthMillimeters: Int,
+    val confidence: Int,
+)
+
+data class DepthFusionResult(
+    val acceptedPixels: Int,
+    val rejectedPixels: Int,
+    val rayVisits: Int,
+    val duplicateTimestamp: Boolean = false,
+)
 
 data class VisibilityGridGroupConfig(
     val wireVersion: String = VISIBILITY_GRID_WIRE_VERSION,
@@ -134,6 +220,15 @@ data class VisibilityGridDiagnostics(
     val lastFeatureFusionNs: Long,
     val maxFeatureFusionNs: Long,
     val estimatedStateBytes: Long,
+    val depthHealth: String = "unsupported",
+    val depthAcceptedPixels: Long = 0,
+    val depthRejectedPixels: Long = 0,
+    val depthCapacityRejectedPixels: Long = 0,
+    val depthRayVisits: Long = 0,
+    val depthTransientUnavailableCount: Long = 0,
+    val depthFailureCount: Long = 0,
+    val lastDepthFusionNs: Long = 0,
+    val maxDepthFusionNs: Long = 0,
 )
 
 data class VisibilityGridGeometryAck(
@@ -189,13 +284,15 @@ data class VisibilityGridDelta(
             "sourceHealth" to
                 mapOf(
                     "feature" to diagnostics.featureHealth,
-                    "depth" to "unsupported",
+                    "depth" to diagnostics.depthHealth,
                     "renderer" to "configured",
                     "totalGrid" to
-                        if (diagnostics.featureHealth == "failed") {
-                            "failed"
-                        } else {
-                            "healthy"
+                        when {
+                            diagnostics.featureHealth == "failed" &&
+                                diagnostics.depthHealth != "healthy" -> "failed"
+                            diagnostics.featureHealth == "failed" -> "healthy"
+                            diagnostics.depthHealth == "failed" -> "featureOnly"
+                            else -> "healthy"
                         },
                 ),
             "diagnostics" to
@@ -212,6 +309,16 @@ data class VisibilityGridDelta(
                     "lastFeatureFusionNs" to diagnostics.lastFeatureFusionNs,
                     "maxFeatureFusionNs" to diagnostics.maxFeatureFusionNs,
                     "estimatedStateBytes" to diagnostics.estimatedStateBytes,
+                    "depthAcceptedPixels" to diagnostics.depthAcceptedPixels,
+                    "depthRejectedPixels" to diagnostics.depthRejectedPixels,
+                    "depthCapacityRejectedPixels" to
+                        diagnostics.depthCapacityRejectedPixels,
+                    "depthRayVisits" to diagnostics.depthRayVisits,
+                    "depthTransientUnavailableCount" to
+                        diagnostics.depthTransientUnavailableCount,
+                    "depthFailureCount" to diagnostics.depthFailureCount,
+                    "lastDepthFusionNs" to diagnostics.lastDepthFusionNs,
+                    "maxDepthFusionNs" to diagnostics.maxDepthFusionNs,
                 ),
         )
 }

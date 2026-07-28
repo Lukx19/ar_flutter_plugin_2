@@ -1,10 +1,16 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
+import kotlin.math.PI
+import kotlin.math.asin
+import kotlin.math.atan2
+import kotlin.math.cos
 import kotlin.math.floor
+import kotlin.math.sin
 import kotlin.math.sqrt
 
 class NativeVisibilityGrid(
-    private val config: VisibilityGridFeatureConfig,
+    private val featureConfig: VisibilityGridFeatureConfig,
+    private val depthConfig: VisibilityGridDepthConfig? = null,
 ) {
     private enum class FeatureHealth(val wireName: String) {
         CONFIGURED("configured"),
@@ -16,6 +22,14 @@ class NativeVisibilityGrid(
     private enum class PendingGeometryState {
         UPSERT,
         REMOVAL,
+    }
+
+    private enum class DepthHealth(val wireName: String) {
+        UNSUPPORTED("unsupported"),
+        CONFIGURED("configured"),
+        HEALTHY("healthy"),
+        TRANSIENT_UNAVAILABLE("transientUnavailable"),
+        FAILED("failed"),
     }
 
     private data class Position(
@@ -42,10 +56,19 @@ class NativeVisibilityGrid(
         var stableCoordinates: IntArray? = null,
     )
 
+    private data class DepthEvidence(
+        var occupied: Int = 0,
+        var free: Int = 0,
+        var directionMask: Int = 0,
+        var contradicted: Boolean = false,
+    )
+
     private lateinit var group: VisibilityGridGroupConfig
     private val tracks = HashMap<Int, Track>()
     private val supportByKey = HashMap<Long, Int>()
     private val restoredKeys = HashSet<Long>()
+    private val visibleKeys = HashSet<Long>()
+    private val depthEvidenceByKey = HashMap<Long, DepthEvidence>()
     private val pendingGeometry = HashMap<Long, PendingGeometryState>()
     private var snapshotRequired = false
     private var geometryRevision = 0L
@@ -60,10 +83,24 @@ class NativeVisibilityGrid(
     private var featureFailureCount = 0L
     private var lastFeatureFusionNs = 0L
     private var maxFeatureFusionNs = 0L
+    private var lastDepthTimestampNs = -1L
+    private var depthHealth =
+        if (depthConfig == null) DepthHealth.UNSUPPORTED else DepthHealth.CONFIGURED
+    private var consecutiveDepthFailures = 0
+    private var depthAcceptedPixels = 0L
+    private var depthRejectedPixels = 0L
+    private var depthCapacityRejectedPixels = 0L
+    private var depthReservations = 0
+    private var nonRestoredDepthEvidenceCount = 0
+    private var depthRayVisits = 0L
+    private var depthTransientUnavailableCount = 0L
+    private var depthFailureCount = 0L
+    private var lastDepthFusionNs = 0L
+    private var maxDepthFusionNs = 0L
 
     @Synchronized
     fun startGroup(group: VisibilityGridGroupConfig): VisibilityGridSnapshot {
-        require(group.capacity <= config.stableVoxelCapacity)
+        require(group.capacity <= featureConfig.stableVoxelCapacity)
         require(
             group.restoredKeys.size * RESTORED_VOXEL_WORST_CASE_BYTES <=
                 VISIBILITY_GRID_MEMORY_BUDGET_BYTES,
@@ -86,6 +123,9 @@ class NativeVisibilityGrid(
         supportByKey.clear()
         restoredKeys.clear()
         restoredKeys.addAll(group.restoredKeys.asList())
+        visibleKeys.clear()
+        visibleKeys.addAll(group.restoredKeys.asList())
+        depthEvidenceByKey.clear()
         pendingGeometry.clear()
         snapshotRequired = false
         geometryRevision = group.restoredGeometryRevision
@@ -100,6 +140,20 @@ class NativeVisibilityGrid(
         featureFailureCount = 0
         lastFeatureFusionNs = 0
         maxFeatureFusionNs = 0
+        lastDepthTimestampNs = -1
+        depthHealth =
+            if (depthConfig == null) DepthHealth.UNSUPPORTED else DepthHealth.CONFIGURED
+        consecutiveDepthFailures = 0
+        depthAcceptedPixels = 0
+        depthRejectedPixels = 0
+        depthCapacityRejectedPixels = 0
+        depthReservations = 0
+        nonRestoredDepthEvidenceCount = 0
+        depthRayVisits = 0
+        depthTransientUnavailableCount = 0
+        depthFailureCount = 0
+        lastDepthFusionNs = 0
+        maxDepthFusionNs = 0
         return snapshot()
     }
 
@@ -124,7 +178,7 @@ class NativeVisibilityGrid(
             val accepted =
                 if (
                     observation.sanitized &&
-                    observation.samples.size <= config.maxFeaturesPerObservation
+                    observation.samples.size <= featureConfig.maxFeaturesPerObservation
                 ) {
                     rejectedSamples += observation.sourceRejectedSamples
                     observation.samples
@@ -139,7 +193,7 @@ class NativeVisibilityGrid(
                 }
                 val track = tracks[sample.id]
                 if (track == null) {
-                    if (tracks.size >= config.featureTrackCapacity ||
+                    if (tracks.size >= featureConfig.featureTrackCapacity ||
                         relocationReservationCount() >= group.capacity ||
                         !canAdmitFeatureAssociation()
                     ) {
@@ -189,6 +243,174 @@ class NativeVisibilityGrid(
         }
     }
 
+    @Synchronized
+    fun observeDepth(observation: DepthObservation): DepthFusionResult {
+        check(::group.isInitialized) { "startGroup must be called before observeDepth" }
+        val config = checkNotNull(depthConfig) { "depth fusion is unsupported" }
+        require(observation.imageOrientation == DepthImageOrientation.LANDSCAPE_RIGHT) {
+            "Android raw depth must use landscapeRight source orientation"
+        }
+        require(observation.groupGeneration == group.groupGeneration) {
+            "stale group generation"
+        }
+        require(observation.sessionGeneration == group.sessionGeneration) {
+            "stale session generation"
+        }
+        val startedNs = System.nanoTime()
+        try {
+            if (!observation.tracking) {
+                val rejected = observation.samples.size + observation.sourceRejectedPixels
+                depthRejectedPixels += rejected
+                return DepthFusionResult(0, rejected, 0)
+            }
+            if (observation.timestampNs <= lastDepthTimestampNs) {
+                val rejected = observation.samples.size + observation.sourceRejectedPixels
+                depthRejectedPixels += rejected
+                return DepthFusionResult(
+                    acceptedPixels = 0,
+                    rejectedPixels = rejected,
+                    rayVisits = 0,
+                    duplicateTimestamp = true,
+                )
+            }
+            lastDepthTimestampNs = observation.timestampNs
+
+            val cameraWorld = transformPoint(observation.worldFromCameraGl, Position(0.0, 0.0, 0.0))
+            val cameraGroup = transformPoint(group.groupFromWorldGl, cameraWorld)
+            val touched = HashSet<Long>()
+            val occupiedKeys = HashSet<Long>()
+            val freeDirectionByKey = HashMap<Long, Int>()
+            var accepted = 0
+            var rejected = observation.sourceRejectedPixels
+            var visits = 0
+            observation.samples.take(config.maxAcceptedPixelsPerObservation).forEach { sample ->
+                val depthMm = sample.depthMillimeters
+                val confidence = sample.confidence
+                val depthMeters = depthMm / 1_000.0
+                if (depthMm <= 0 ||
+                    confidence !in config.confidenceMinimum..255 ||
+                    !depthMeters.isFinite() ||
+                    depthMeters !in config.minimumDepthMeters..config.maximumDepthMeters
+                ) {
+                    rejected++
+                    return@forEach
+                }
+                val cameraPoint =
+                    Position(
+                        x = (sample.x - observation.intrinsics.cx) * depthMeters /
+                            observation.intrinsics.fx,
+                        y = -(sample.y - observation.intrinsics.cy) * depthMeters /
+                            observation.intrinsics.fy,
+                        z = -depthMeters,
+                    )
+                val endpointWorld = transformPoint(observation.worldFromCameraGl, cameraPoint)
+                val endpointGroup = transformPoint(group.groupFromWorldGl, endpointWorld)
+                if (!isQuantizable(endpointGroup)) {
+                    rejected++
+                    return@forEach
+                }
+                val endpointKey = keyFor(endpointGroup)
+                val endpointEvidence = evidenceFor(endpointKey)
+                if (endpointEvidence == null) {
+                    depthCapacityRejectedPixels++
+                } else {
+                    occupiedKeys += endpointKey
+                }
+                val remainingVisitBudget = config.maxRayVisitsPerObservation - visits
+                val rayX = endpointGroup.x - cameraGroup.x
+                val rayY = endpointGroup.y - cameraGroup.y
+                val rayZ = endpointGroup.z - cameraGroup.z
+                if (remainingVisitBudget > 0 &&
+                    rayX * rayX + rayY * rayY + rayZ * rayZ >
+                    config.safetyBandMeters * config.safetyBandMeters
+                ) {
+                    val freeKeys =
+                        traverseFreeKeys(
+                            camera = cameraGroup,
+                            endpoint = endpointGroup,
+                            maximumVisits = remainingVisitBudget,
+                            safetyBandMeters = config.safetyBandMeters,
+                        )
+                    freeKeys.forEach { key ->
+                        val evidence =
+                            if (isVisible(key) || key in depthEvidenceByKey) {
+                                evidenceFor(key)
+                            } else {
+                                null
+                            }
+                        if (evidence != null) {
+                            freeDirectionByKey.putIfAbsent(
+                                key,
+                                directionBin(cameraGroup, voxelCenter(key)),
+                            )
+                        }
+                    }
+                    visits += freeKeys.size
+                }
+                accepted++
+            }
+            rejected +=
+                (observation.samples.size - config.maxAcceptedPixelsPerObservation)
+                    .coerceAtLeast(0)
+            occupiedKeys.forEach { key ->
+                depthEvidenceByKey.getValue(key).occupied =
+                    saturatingIncrement(depthEvidenceByKey.getValue(key).occupied)
+                touched += key
+            }
+            freeDirectionByKey.forEach { (key, directionBin) ->
+                depthEvidenceByKey.getValue(key).let { evidence ->
+                    evidence.free = saturatingIncrement(evidence.free)
+                    evidence.directionMask =
+                        evidence.directionMask or (1 shl directionBin)
+                }
+                touched += key
+            }
+            touched.forEach(::applyDepthState)
+            depthAcceptedPixels += accepted
+            depthRejectedPixels += rejected
+            depthRayVisits += visits
+            depthHealth = DepthHealth.HEALTHY
+            consecutiveDepthFailures = 0
+            return DepthFusionResult(accepted, rejected, visits)
+        } finally {
+            lastDepthFusionNs = System.nanoTime() - startedNs
+            maxDepthFusionNs = maxOf(maxDepthFusionNs, lastDepthFusionNs)
+        }
+    }
+
+    @Synchronized
+    fun reportDepthTransientUnavailable() {
+        if (depthConfig == null || depthHealth == DepthHealth.FAILED) return
+        depthHealth = DepthHealth.TRANSIENT_UNAVAILABLE
+        depthTransientUnavailableCount++
+    }
+
+    @Synchronized
+    fun reportDepthFailure() {
+        val config = depthConfig ?: return
+        if (depthHealth == DepthHealth.FAILED) return
+        consecutiveDepthFailures++
+        depthFailureCount++
+        if (consecutiveDepthFailures >= config.terminalFailureThreshold) {
+            depthHealth = DepthHealth.FAILED
+        } else {
+            depthHealth = DepthHealth.TRANSIENT_UNAVAILABLE
+        }
+    }
+
+    fun consumeDepth(result: DepthAcquisitionResult): DepthFusionResult? =
+        when (result) {
+            is DepthAcquisitionResult.Observation -> observeDepth(result.value)
+            DepthAcquisitionResult.TransientUnavailable -> {
+                reportDepthTransientUnavailable()
+                null
+            }
+            is DepthAcquisitionResult.Failure -> {
+                reportDepthFailure()
+                null
+            }
+        }
+
     fun consumeNext(source: FeatureObservationSource): Boolean {
         val observation =
             try {
@@ -214,7 +436,7 @@ class NativeVisibilityGrid(
     @Synchronized
     fun snapshot(): VisibilityGridSnapshot {
         check(::group.isInitialized) { "startGroup must be called before snapshot" }
-        val stableKeys = (restoredKeys + supportByKey.keys).sorted()
+        val stableKeys = visibleKeys.sorted()
         return VisibilityGridSnapshot(
             groupId = group.groupId,
             groupGeneration = group.groupGeneration,
@@ -236,7 +458,7 @@ class NativeVisibilityGrid(
         if (
             lastPublicationNs != Long.MIN_VALUE &&
             (nowNs < lastPublicationNs ||
-                nowNs - lastPublicationNs < config.publishIntervalMs * 1_000_000L)
+                nowNs - lastPublicationNs < featureConfig.publishIntervalMs * 1_000_000L)
         ) {
             return null
         }
@@ -247,7 +469,7 @@ class NativeVisibilityGrid(
             reset = snapshotRequired,
             upserts =
                 if (snapshotRequired) {
-                    (restoredKeys + supportByKey.keys).sorted()
+                    visibleKeys.sorted()
                 } else {
                     pendingGeometry
                         .filterValues { it == PendingGeometryState.UPSERT }
@@ -310,7 +532,7 @@ class NativeVisibilityGrid(
             baseRevision = request.receiverGeometryRevision,
             revision = nextRevision,
             reset = true,
-            upserts = (restoredKeys + supportByKey.keys).sorted(),
+            upserts = visibleKeys.sorted(),
             removals = emptyList(),
         ).also {
             geometryRevision = nextRevision
@@ -325,8 +547,8 @@ class NativeVisibilityGrid(
         track: Track,
         timestampNs: Long,
     ) {
-        if (track.sampleCount < config.candidateSamples ||
-            timestampNs - track.firstTimestampNs < config.candidateSpanNs ||
+        if (track.sampleCount < featureConfig.candidateSamples ||
+            timestampNs - track.firstTimestampNs < featureConfig.candidateSpanNs ||
             !hasLowVariance(track)
         ) {
             return
@@ -353,7 +575,9 @@ class NativeVisibilityGrid(
         val jumpZ = position.z - previousFiltered.z
         val jumpDistanceSquared =
             jumpX * jumpX + jumpY * jumpY + jumpZ * jumpZ
-        if (jumpDistanceSquared >= config.jumpResetMeters * config.jumpResetMeters) {
+        if (jumpDistanceSquared >=
+            featureConfig.jumpResetMeters * featureConfig.jumpResetMeters
+        ) {
             detachSupport(checkNotNull(track.stableKey))
             track.filtered = position
             track.sampleCount = 1
@@ -375,21 +599,27 @@ class NativeVisibilityGrid(
         var nextX = current[0]
         var nextY = current[1]
         var nextZ = current[2]
-        val xLower = current[0] * group.voxelSizeMeters - config.relocationHysteresisMeters
+        val xLower =
+            current[0] * group.voxelSizeMeters - featureConfig.relocationHysteresisMeters
         val xUpper =
-            (current[0] + 1) * group.voxelSizeMeters + config.relocationHysteresisMeters
+            (current[0] + 1) * group.voxelSizeMeters +
+                featureConfig.relocationHysteresisMeters
         if (track.filtered.x < xLower || track.filtered.x >= xUpper) {
             nextX = floor(track.filtered.x / group.voxelSizeMeters).toInt()
         }
-        val yLower = current[1] * group.voxelSizeMeters - config.relocationHysteresisMeters
+        val yLower =
+            current[1] * group.voxelSizeMeters - featureConfig.relocationHysteresisMeters
         val yUpper =
-            (current[1] + 1) * group.voxelSizeMeters + config.relocationHysteresisMeters
+            (current[1] + 1) * group.voxelSizeMeters +
+                featureConfig.relocationHysteresisMeters
         if (track.filtered.y < yLower || track.filtered.y >= yUpper) {
             nextY = floor(track.filtered.y / group.voxelSizeMeters).toInt()
         }
-        val zLower = current[2] * group.voxelSizeMeters - config.relocationHysteresisMeters
+        val zLower =
+            current[2] * group.voxelSizeMeters - featureConfig.relocationHysteresisMeters
         val zUpper =
-            (current[2] + 1) * group.voxelSizeMeters + config.relocationHysteresisMeters
+            (current[2] + 1) * group.voxelSizeMeters +
+                featureConfig.relocationHysteresisMeters
         if (track.filtered.z < zLower || track.filtered.z >= zUpper) {
             nextZ = floor(track.filtered.z / group.voxelSizeMeters).toInt()
         }
@@ -407,18 +637,29 @@ class NativeVisibilityGrid(
         val remaining = supportByKey.getValue(key) - 1
         if (remaining == 0) {
             supportByKey.remove(key)
-            if (key !in restoredKeys) {
-                recordGeometryState(key, PendingGeometryState.REMOVAL)
+            if (key !in restoredKeys && key in depthEvidenceByKey) {
+                depthReservations++
             }
         } else {
             supportByKey[key] = remaining
         }
+        refreshVisibility(key)
     }
 
     private fun attachSupport(key: Long) {
-        val wasVisible = key in restoredKeys || supportByKey.getOrDefault(key, 0) > 0
         supportByKey[key] = supportByKey.getOrDefault(key, 0) + 1
-        if (!wasVisible) recordGeometryState(key, PendingGeometryState.UPSERT)
+        if (supportByKey.getValue(key) == 1 &&
+            key !in restoredKeys &&
+            key in depthEvidenceByKey
+        ) {
+            depthReservations--
+        }
+        depthEvidenceByKey[key]?.let { evidence ->
+            evidence.contradicted = false
+            evidence.free = 0
+            evidence.directionMask = 0
+        }
+        refreshVisibility(key)
     }
 
     private fun createDelta(
@@ -442,12 +683,11 @@ class NativeVisibilityGrid(
         )
 
     private fun diagnostics(): VisibilityGridDiagnostics {
-        val stableKeys = restoredKeys + supportByKey.keys
         return VisibilityGridDiagnostics(
             candidateTracks = tracks.values.count { it.stableKey == null },
             stableTracks = tracks.values.count { it.stableKey != null },
-            stableVoxels = stableKeys.size,
-            featureTrackCapacity = config.featureTrackCapacity,
+            stableVoxels = visibleKeys.size,
+            featureTrackCapacity = featureConfig.featureTrackCapacity,
             stableVoxelCapacity = group.capacity,
             acceptedSamples = acceptedSamples,
             rejectedSamples = rejectedSamples,
@@ -457,12 +697,16 @@ class NativeVisibilityGrid(
             featureFailureCount = featureFailureCount,
             lastFeatureFusionNs = lastFeatureFusionNs,
             maxFeatureFusionNs = maxFeatureFusionNs,
-            estimatedStateBytes =
-                tracks.size * FEATURE_TRACK_ESTIMATED_BYTES +
-                    (supportByKey.size + restoredKeys.size) *
-                    STABLE_VOXEL_ESTIMATED_BYTES +
-                    pendingGeometry.size * PENDING_GEOMETRY_KEY_ESTIMATED_BYTES +
-                    inFlightGeometryKeyCount() * IN_FLIGHT_GEOMETRY_KEY_ESTIMATED_BYTES,
+            estimatedStateBytes = estimatedStateBytes(),
+            depthHealth = depthHealth.wireName,
+            depthAcceptedPixels = depthAcceptedPixels,
+            depthRejectedPixels = depthRejectedPixels,
+            depthCapacityRejectedPixels = depthCapacityRejectedPixels,
+            depthRayVisits = depthRayVisits,
+            depthTransientUnavailableCount = depthTransientUnavailableCount,
+            depthFailureCount = depthFailureCount,
+            lastDepthFusionNs = lastDepthFusionNs,
+            maxDepthFusionNs = maxDepthFusionNs,
         )
     }
 
@@ -483,7 +727,7 @@ class NativeVisibilityGrid(
             val variance =
                 (track.sampleSquareSums[axis] / track.sampleCount - mean * mean)
                     .coerceAtLeast(0.0)
-            sqrt(variance) <= config.candidateMaxStdDevMeters
+            sqrt(variance) <= featureConfig.candidateMaxStdDevMeters
         }
 
     private fun transformToGroup(sample: FeatureSample): Position {
@@ -534,8 +778,8 @@ class NativeVisibilityGrid(
         val sanitized =
             sanitizeFeatureSamples(
                 samples = samples,
-                minimumConfidence = config.minimumConfidence,
-                maximumSamples = config.maxFeaturesPerObservation,
+                minimumConfidence = featureConfig.minimumConfidence,
+                maximumSamples = featureConfig.maxFeaturesPerObservation,
             )
         rejectedSamples += sanitized.rejectedSamples
         return sanitized.samples
@@ -555,17 +799,280 @@ class NativeVisibilityGrid(
     private fun expireCandidates(timestampNs: Long) {
         tracks.entries.removeAll { (_, track) ->
             track.stableKey == null &&
-                timestampNs - track.lastTimestampNs > config.candidateExpiryNs
+                timestampNs - track.lastTimestampNs > featureConfig.candidateExpiryNs
         }
     }
 
     private fun relocationReservationCount(): Int =
-        restoredKeys.size + tracks.values.count { it.stableKey != null }
+        restoredKeys.size +
+            tracks.values.count { it.stableKey != null } +
+            depthReservations
 
     private fun canAdmitFeatureAssociation(): Boolean =
-        (tracks.size + 1L) * FEATURE_ASSOCIATION_WORST_CASE_BYTES +
-            restoredKeys.size * RESTORED_VOXEL_WORST_CASE_BYTES <=
+        estimatedStateBytes() + FEATURE_ASSOCIATION_WORST_CASE_BYTES <=
             VISIBILITY_GRID_MEMORY_BUDGET_BYTES
+
+    private fun estimatedStateBytes(): Long =
+        tracks.size * FEATURE_TRACK_ESTIMATED_BYTES +
+            supportByKey.size * STABLE_VOXEL_ESTIMATED_BYTES +
+            restoredKeys.size * RESTORED_VOXEL_WORST_CASE_BYTES +
+            pendingGeometry.size * PENDING_GEOMETRY_KEY_ESTIMATED_BYTES +
+            inFlightGeometryKeyCount() * IN_FLIGHT_GEOMETRY_KEY_ESTIMATED_BYTES +
+            nonRestoredDepthEvidenceCount * DEPTH_EVIDENCE_ESTIMATED_BYTES
+
+    private fun transformPoint(
+        matrix: DoubleArray,
+        point: Position,
+    ): Position =
+        Position(
+            x =
+                matrix[0] * point.x +
+                    matrix[4] * point.y +
+                    matrix[8] * point.z +
+                    matrix[12],
+            y =
+                matrix[1] * point.x +
+                    matrix[5] * point.y +
+                    matrix[9] * point.z +
+                    matrix[13],
+            z =
+                matrix[2] * point.x +
+                    matrix[6] * point.y +
+                    matrix[10] * point.z +
+                    matrix[14],
+        )
+
+    private fun keyFor(position: Position): Long {
+        val coordinates = coordinatesFor(position)
+        return packVisibilityGridKey(coordinates[0], coordinates[1], coordinates[2])
+    }
+
+    private fun voxelCenter(key: Long): Position {
+        val mask = (1L shl 21) - 1
+        val bias = 1 shl 20
+        val x = ((key ushr 42) and mask).toInt() - bias
+        val y = ((key ushr 21) and mask).toInt() - bias
+        val z = (key and mask).toInt() - bias
+        val halfVoxel = group.voxelSizeMeters / 2.0
+        return Position(
+            x = x * group.voxelSizeMeters + halfVoxel,
+            y = y * group.voxelSizeMeters + halfVoxel,
+            z = z * group.voxelSizeMeters + halfVoxel,
+        )
+    }
+
+    private fun evidenceFor(key: Long): DepthEvidence? {
+        depthEvidenceByKey[key]?.let { return it }
+        val requiresReservation =
+            key !in restoredKeys && supportByKey.getOrDefault(key, 0) == 0
+        if (requiresReservation && relocationReservationCount() >= group.capacity) return null
+        val additionalBytes =
+            if (key in restoredKeys) 0 else DEPTH_EVIDENCE_ESTIMATED_BYTES
+        val nextEstimate = estimatedStateBytes() + additionalBytes
+        if (nextEstimate > VISIBILITY_GRID_MEMORY_BUDGET_BYTES) return null
+        return DepthEvidence().also {
+            depthEvidenceByKey[key] = it
+            if (key !in restoredKeys) nonRestoredDepthEvidenceCount++
+            if (requiresReservation) depthReservations++
+        }
+    }
+
+    private fun saturatingIncrement(value: Int): Int = minOf(255, value + 1)
+
+    private fun directionBin(
+        camera: Position,
+        endpoint: Position,
+    ): Int {
+        val x = endpoint.x - camera.x
+        val y = endpoint.y - camera.y
+        val z = endpoint.z - camera.z
+        val length = sqrt(x * x + y * y + z * z)
+        val azimuth = atan2(x, -z)
+        val azimuthBin =
+            floor((azimuth + PI) / (2.0 * PI) * 8.0).toInt().coerceIn(0, 7)
+        val elevation = asin((y / length).coerceIn(-1.0, 1.0))
+        val elevationBin =
+            when {
+                elevation < -PI / 8.0 -> 0
+                elevation > PI / 8.0 -> 2
+                else -> 1
+            }
+        return elevationBin * 8 + azimuthBin
+    }
+
+    private fun traverseFreeKeys(
+        camera: Position,
+        endpoint: Position,
+        maximumVisits: Int,
+        safetyBandMeters: Double,
+    ): List<Long> {
+        if (maximumVisits <= 0) return emptyList()
+        val dx = endpoint.x - camera.x
+        val dy = endpoint.y - camera.y
+        val dz = endpoint.z - camera.z
+        val distance = sqrt(dx * dx + dy * dy + dz * dz)
+        val maximumDistance = distance - safetyBandMeters
+        if (!maximumDistance.isFinite() || maximumDistance <= 0.0) return emptyList()
+        val unitX = dx / distance
+        val unitY = dy / distance
+        val unitZ = dz / distance
+        val voxel = group.voxelSizeMeters
+        var x = floor(camera.x / voxel).toInt()
+        var y = floor(camera.y / voxel).toInt()
+        var z = floor(camera.z / voxel).toInt()
+        val stepX = unitX.compareTo(0.0)
+        val stepY = unitY.compareTo(0.0)
+        val stepZ = unitZ.compareTo(0.0)
+
+        fun firstBoundaryDistance(
+            coordinate: Double,
+            cell: Int,
+            step: Int,
+            unit: Double,
+        ): Double {
+            if (step == 0) return Double.POSITIVE_INFINITY
+            val boundary = if (step > 0) (cell + 1) * voxel else cell * voxel
+            return (boundary - coordinate) / unit
+        }
+
+        var nextX = firstBoundaryDistance(camera.x, x, stepX, unitX)
+        var nextY = firstBoundaryDistance(camera.y, y, stepY, unitY)
+        var nextZ = firstBoundaryDistance(camera.z, z, stepZ, unitZ)
+        val deltaX = if (stepX == 0) Double.POSITIVE_INFINITY else voxel / kotlin.math.abs(unitX)
+        val deltaY = if (stepY == 0) Double.POSITIVE_INFINITY else voxel / kotlin.math.abs(unitY)
+        val deltaZ = if (stepZ == 0) Double.POSITIVE_INFINITY else voxel / kotlin.math.abs(unitZ)
+        val keys = ArrayList<Long>(minOf(maximumVisits, 64))
+        while (keys.size < maximumVisits) {
+            val next = minOf(nextX, nextY, nextZ)
+            if (next >= maximumDistance) break
+            val crossX = nextX == next
+            val crossY = nextY == next
+            val crossZ = nextZ == next
+            val oldX = x
+            val oldY = y
+            val oldZ = z
+            if (crossX) {
+                x += stepX
+                nextX += deltaX
+            }
+            if (crossY) {
+                y += stepY
+                nextY += deltaY
+            }
+            if (crossZ) {
+                z += stepZ
+                nextZ += deltaZ
+            }
+            val crossedAxes =
+                intArrayOf(
+                    if (crossX) 0 else -1,
+                    if (crossY) 1 else -1,
+                    if (crossZ) 2 else -1,
+                ).filter { it >= 0 }
+            for (combination in 1 until (1 shl crossedAxes.size)) {
+                var candidateX = oldX
+                var candidateY = oldY
+                var candidateZ = oldZ
+                crossedAxes.forEachIndexed { bit, axis ->
+                    if (combination and (1 shl bit) != 0) {
+                        when (axis) {
+                            0 -> candidateX += stepX
+                            1 -> candidateY += stepY
+                            else -> candidateZ += stepZ
+                        }
+                    }
+                }
+                if (candidateX in VOXEL_COORDINATE_MIN..VOXEL_COORDINATE_MAX &&
+                    candidateY in VOXEL_COORDINATE_MIN..VOXEL_COORDINATE_MAX &&
+                    candidateZ in VOXEL_COORDINATE_MIN..VOXEL_COORDINATE_MAX
+                ) {
+                    keys += packVisibilityGridKey(candidateX, candidateY, candidateZ)
+                    if (keys.size >= maximumVisits) break
+                }
+            }
+        }
+        return keys
+    }
+
+    private fun applyDepthState(key: Long) {
+        val config = checkNotNull(depthConfig)
+        val evidence = depthEvidenceByKey[key] ?: return
+        if (evidence.contradicted) {
+            if (evidence.occupied >= config.occupiedEvidenceToShow) {
+                evidence.contradicted = false
+                evidence.free = 0
+                evidence.directionMask = 0
+            }
+        } else if (
+            evidence.free >= config.freeEvidenceToCarve &&
+            evidence.free - evidence.occupied >= config.freeEvidenceMargin &&
+            hasSeparatedDirections(evidence.directionMask, config.separatedDirectionBinsRequired)
+        ) {
+            evidence.contradicted = true
+            evidence.occupied = 0
+        }
+        refreshVisibility(key)
+    }
+
+    private fun hasSeparatedDirections(
+        mask: Int,
+        required: Int,
+    ): Boolean {
+        val bins = (0 until 24).filter { mask and (1 shl it) != 0 }
+        if (bins.size < required) return false
+        if (required == 1) return true
+        return bins.any { first ->
+            bins.any { second ->
+                first != second && directionBinDot(first, second) <= cos(PI / 6.0)
+            }
+        }
+    }
+
+    private fun directionBinDot(
+        first: Int,
+        second: Int,
+    ): Double {
+        fun vector(bin: Int): DoubleArray {
+            val elevation =
+                when (bin / 8) {
+                    0 -> -PI / 4.0
+                    1 -> 0.0
+                    else -> PI / 4.0
+                }
+            val azimuth = -PI + (bin % 8 + 0.5) * PI / 4.0
+            val horizontal = cos(elevation)
+            return doubleArrayOf(
+                sin(azimuth) * horizontal,
+                sin(elevation),
+                -cos(azimuth) * horizontal,
+            )
+        }
+        val left = vector(first)
+        val right = vector(second)
+        return left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
+    }
+
+    private fun isVisible(key: Long): Boolean {
+        val evidence = depthEvidenceByKey[key]
+        if (evidence?.contradicted == true) return false
+        return key in restoredKeys ||
+            supportByKey.getOrDefault(key, 0) > 0 ||
+            (evidence != null &&
+                evidence.occupied >= checkNotNull(depthConfig).occupiedEvidenceToShow)
+    }
+
+    private fun refreshVisibility(key: Long) {
+        val shouldBeVisible = isVisible(key)
+        val wasVisible = key in visibleKeys
+        if (shouldBeVisible == wasVisible) return
+        if (shouldBeVisible) {
+            visibleKeys += key
+            recordGeometryState(key, PendingGeometryState.UPSERT)
+        } else {
+            visibleKeys -= key
+            recordGeometryState(key, PendingGeometryState.REMOVAL)
+        }
+    }
 
     private fun recordGeometryState(
         key: Long,

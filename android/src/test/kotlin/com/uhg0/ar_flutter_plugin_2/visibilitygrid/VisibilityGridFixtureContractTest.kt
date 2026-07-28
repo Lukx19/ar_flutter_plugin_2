@@ -67,6 +67,10 @@ class VisibilityGridFixtureContractTest {
                 it.getValue("name").jsonPrimitive.content == "android_raw_depth_unprojection"
             }
         val frame = unprojection.getValue("sourceFrame").jsonObject
+        assertEquals(
+            DepthImageOrientation.LANDSCAPE_RIGHT.wireName,
+            frame.getValue("imageOrientation").jsonPrimitive.content,
+        )
         val intrinsics = frame.getValue("intrinsics").jsonObject
         val sample = unprojection.getValue("sample").jsonObject
         val pixel =
@@ -96,6 +100,75 @@ class VisibilityGridFixtureContractTest {
         assertEquals(
             unprojection.getValue("expectedPackedKey").jsonPrimitive.content.toLong(),
             packKey(depthCoordinates),
+        )
+        val depthDefaults = fixture.getValue("defaults").jsonObject
+        val depthGrid =
+            NativeVisibilityGrid(
+                featureConfig = VisibilityGridFeatureConfig(),
+                depthConfig =
+                    VisibilityGridDepthConfig(
+                        confidenceMinimum = depthDefaults.int("depthConfidenceMinimum"),
+                        safetyBandMeters = depthDefaults.double("safetyBandMeters"),
+                        freeEvidenceToCarve = depthDefaults.int("freeEvidenceToCarve"),
+                        separatedDirectionBinsRequired =
+                            depthDefaults.int("separatedDirectionBinsRequired"),
+                    ),
+            )
+        val depthGroupFromWorld =
+            frame.getValue("groupFromWorldGl").doubleList().toDoubleArray()
+        val worldFromGroup =
+            doubleArrayOf(
+                1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                1.0, 2.0, 3.0, 1.0,
+            )
+        depthGrid.startGroup(
+            VisibilityGridGroupConfig(
+                groupId = "depth-fixture",
+                groupGeneration = 1,
+                sessionGeneration = 1,
+                voxelSizeMeters = depthDefaults.double("voxelSizeMeters"),
+                capacity = 100,
+                groupFromWorldGl = depthGroupFromWorld,
+                worldFromGroupGl = worldFromGroup,
+            ),
+        )
+        repeat(4) { index ->
+            depthGrid.observeDepth(
+                DepthObservation(
+                    timestampNs =
+                        frame.getValue("timestampNs").jsonPrimitive.content.toLong() + index,
+                    groupGeneration = 1,
+                    sessionGeneration = 1,
+                    tracking = frame.getValue("tracking").jsonPrimitive.content.toBoolean(),
+                    width = frame.int("imageWidth"),
+                    height = frame.int("imageHeight"),
+                    samples =
+                        listOf(
+                            DepthPixelSample(
+                                x = pixel[0],
+                                y = pixel[1],
+                                depthMillimeters = sample.int("depthMillimeters"),
+                                confidence = sample.int("confidence"),
+                            ),
+                        ),
+                    intrinsics =
+                        DepthIntrinsics(
+                            fx = intrinsics.double("fx"),
+                            fy = intrinsics.double("fy"),
+                            cx = intrinsics.double("cx"),
+                            cy = intrinsics.double("cy"),
+                        ),
+                    worldFromCameraGl =
+                        frame.getValue("worldFromCameraGl").doubleList().toDoubleArray(),
+                    imageOrientation = DepthImageOrientation.LANDSCAPE_RIGHT,
+                ),
+            )
+        }
+        assertEquals(
+            listOf(unprojection.getValue("expectedPackedKey").jsonPrimitive.content.toLong()),
+            depthGrid.snapshot().stableKeys,
         )
 
         val carving =
