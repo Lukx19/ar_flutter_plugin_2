@@ -14,6 +14,8 @@ class PointCloudModelsTest {
         assertFails { PointCloudNativeConfig(minConfidence = 1.1f) }
         assertFails { PointCloudNativeConfig(frameRateHz = 0) }
         assertFails { PointCloudNativeConfig(voxelSizeMeters = 0f) }
+        assertFails { PointCloudNativeConfig(cubeSizeFactor = 0f) }
+        assertFails { PointCloudNativeConfig(cubeSizeFactor = 1.1f) }
     }
 
     @Test

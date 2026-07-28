@@ -14,6 +14,8 @@ class PointCloudMethodChannel internal constructor(
     private val isDebuggable: Boolean,
     private val onRendererStateChanged:
         (CoveragePointRenderSnapshot?, PointCloudNativeConfig?) -> Unit = { _, _ -> },
+    private val onRawPointCloudChanged:
+        (CoveragePointRenderSnapshot?) -> Unit = {},
     private val sourceFactory: (PointCloudNativeConfig) -> PointCloudSource = { config ->
         if (config.syntheticSource) {
             SyntheticPointCloudSource()
@@ -29,6 +31,8 @@ class PointCloudMethodChannel internal constructor(
         isDebuggable: Boolean,
         onRendererStateChanged:
             (CoveragePointRenderSnapshot?, PointCloudNativeConfig?) -> Unit = { _, _ -> },
+        onRawPointCloudChanged:
+            (CoveragePointRenderSnapshot?) -> Unit = {},
         sourceFactory: (PointCloudNativeConfig) -> PointCloudSource = { config ->
             if (config.syntheticSource) {
                 SyntheticPointCloudSource()
@@ -40,6 +44,7 @@ class PointCloudMethodChannel internal constructor(
         endpoint = FlutterPointCloudChannelEndpoint(messenger, viewId),
         isDebuggable = isDebuggable,
         onRendererStateChanged = onRendererStateChanged,
+        onRawPointCloudChanged = onRawPointCloudChanged,
         sourceFactory = sourceFactory,
         callbackScheduler = AndroidPointCloudCallbackScheduler(),
     )
@@ -48,6 +53,7 @@ class PointCloudMethodChannel internal constructor(
     private var config: PointCloudNativeConfig? = null
     private var source: PointCloudSource? = null
     private var renderer: CoveragePointRendererState? = null
+    private var latestRawPointSnapshot: CoveragePointRenderSnapshot? = null
     private var acquisitionReady = false
     private var rendererReady = false
     private var rendererMounted = false
@@ -81,7 +87,12 @@ class PointCloudMethodChannel internal constructor(
                 "init" -> initialize(call, result)
                 "updateVoxels" -> updateVoxels(call, result)
                 "setPointsEnabled" -> {
-                    requireRenderer().setEnabled(requiredBoolean(call, "enabled"))
+                    val enabled = requiredBoolean(call, "enabled")
+                    requireRenderer().setEnabled(enabled)
+                    config = config?.copy(enabled = enabled)
+                    latestRawPointSnapshot =
+                        latestRawPointSnapshot?.copy(enabled = enabled)
+                    onRawPointCloudChanged(latestRawPointSnapshot)
                     publishRendererState()
                     result.success(true)
                 }
@@ -89,7 +100,14 @@ class PointCloudMethodChannel internal constructor(
                     val mode = requiredVoxelRenderMode(call)
                     requireRenderer().setRenderMode(mode)
                     config = config?.copy(voxelRenderMode = mode)
-                    publishRendererState()
+                    if (mode != VoxelRenderMode.POINTS) {
+                        latestRawPointSnapshot = null
+                        onRawPointCloudChanged(null)
+                    }
+                    // A repeated selection is also an explicit renderer refresh.
+                    // Always republish so a retained node cannot remain in the
+                    // previous visual mode after an interrupted UI command.
+                    publishRendererState(force = true)
                     result.success(true)
                 }
                 "getRenderingStats" -> result.success(currentStats().toMap())
@@ -175,6 +193,14 @@ class PointCloudMethodChannel internal constructor(
             }
             successfulPointCloudSamples++
             consecutiveAcquisitionErrors = 0
+            if (activeConfig.voxelRenderMode == VoxelRenderMode.POINTS) {
+                latestRawPointSnapshot = sample.toRawPointRenderSnapshot(
+                    capacity = activeConfig.renderCapacity,
+                    color = activeConfig.defaultColor,
+                    enabled = activeConfig.enabled,
+                )
+                onRawPointCloudChanged(latestRawPointSnapshot)
+            }
             val emit = queue.offer(sample)
             syncCoalescingStats()
             if (emit != null) emit(emit)
@@ -209,6 +235,8 @@ class PointCloudMethodChannel internal constructor(
         renderer = null
         rendererReady = false
         rendererMounted = false
+        latestRawPointSnapshot = null
+        onRawPointCloudChanged(null)
         onRendererStateChanged(null, null)
         callbackScheduler.removeAll()
         endpoint.setMethodCallHandler(null)
@@ -232,6 +260,8 @@ class PointCloudMethodChannel internal constructor(
         acquisitionReady = false
         lastAcquisitionNs = Long.MIN_VALUE
         queue.clear()
+        latestRawPointSnapshot = null
+        onRawPointCloudChanged(null)
         callbackScheduler.removeAll()
         publishReadiness()
     }
@@ -276,6 +306,7 @@ class PointCloudMethodChannel internal constructor(
                     ?: VoxelRenderMode.POINTS.wireName,
             ),
             voxelSizeMeters = optionalFiniteFloat(call, "voxelSizeMeters", 0.1f),
+            cubeSizeFactor = optionalFiniteFloat(call, "cubeSizeFactor", 1f),
         )
         val nextRenderer = try {
             CoveragePointRendererState(parsed)
@@ -326,6 +357,8 @@ class PointCloudMethodChannel internal constructor(
         acquisitionErrors = 0
         successfulPointCloudSamples = 0
         queue.clear()
+        latestRawPointSnapshot = null
+        onRawPointCloudChanged(null)
         initializationGeneration++
         val generation = initializationGeneration
         publishRendererState(force = true)
@@ -348,7 +381,16 @@ class PointCloudMethodChannel internal constructor(
             ?: throw IllegalArgumentException("positionsWorld must be Float32List")
         val colors = call.argument<IntArray>("colors")
             ?: throw IllegalArgumentException("colors must be Int32List")
-        val applied = state.updateVoxels(epoch, keys, positions, colors)
+        val gridRotationWorld =
+            call.argument<FloatArray>("gridRotationWorld")
+                ?: identityGridRotation()
+        val applied = state.updateVoxels(
+            epoch,
+            keys,
+            positions,
+            colors,
+            gridRotationWorld,
+        )
         publishRendererState()
         result.success(
             mapOf(

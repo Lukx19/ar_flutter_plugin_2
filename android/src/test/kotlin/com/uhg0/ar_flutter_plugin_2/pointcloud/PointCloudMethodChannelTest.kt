@@ -63,20 +63,32 @@ class PointCloudMethodChannelTest {
     fun `runtime voxel mode toggle updates renderer configuration`() {
         val endpoint = FakeEndpoint()
         val configs = mutableListOf<PointCloudNativeConfig?>()
+        val rawSnapshots = mutableListOf<CoveragePointRenderSnapshot?>()
         val channel = PointCloudMethodChannel(
             endpoint = endpoint,
             isDebuggable = true,
             onRendererStateChanged = { _, config -> configs += config },
+            onRawPointCloudChanged = { rawSnapshots += it },
             sourceFactory = { SyntheticPointCloudSource() },
             callbackScheduler = FakeScheduler(),
         )
         endpoint.call("init", initArguments())
+        channel.onFrameForTest(0)
+        assertEquals(4, rawSnapshots.last()!!.count)
+        assertTrue(rawSnapshots.last()!!.colors.all { it == 0xFFFF0000.toInt() })
 
         assertEquals(
             true,
-            endpoint.call("setVoxelRenderMode", mapOf("mode" to "cubes")).successValue,
+            endpoint.call("setVoxelRenderMode", mapOf("mode" to "centroids")).successValue,
         )
-        assertEquals(VoxelRenderMode.CUBES, configs.last()!!.voxelRenderMode)
+        assertEquals(VoxelRenderMode.CENTROIDS, configs.last()!!.voxelRenderMode)
+        assertEquals(null, rawSnapshots.last())
+        assertEquals(
+            true,
+            endpoint.call("setPointsEnabled", mapOf("enabled" to false)).successValue,
+        )
+        assertFalse(configs.last()!!.enabled)
+        assertEquals(null, rawSnapshots.last())
         assertEquals(
             "PC_PROTOCOL_INVALID",
             endpoint.call("setVoxelRenderMode", mapOf("mode" to "invalid")).errorCode,

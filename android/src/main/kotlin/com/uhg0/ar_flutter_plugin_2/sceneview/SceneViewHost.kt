@@ -29,10 +29,13 @@ import androidx.lifecycle.setViewTreeViewModelStoreOwner
 import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import com.google.android.filament.Engine
+import com.google.android.filament.RenderableManager
 import com.google.android.filament.Stream
 import com.google.android.filament.Texture
 import com.google.ar.core.Anchor
 import com.google.ar.core.Config
+import com.google.ar.core.CameraConfig
+import com.google.ar.core.CameraConfigFilter
 import com.google.ar.core.Frame
 import com.google.ar.core.HitResult
 import com.google.ar.core.Plane
@@ -76,6 +79,7 @@ internal class SceneViewHost(
     activity: Activity,
     private val lifecycle: Lifecycle,
     private val sessionFeatures: Set<Session.Feature>,
+    private val requestedRearCameraId: String? = null,
     private val onSessionCreated: (Session) -> Unit = {},
     private val onSessionUpdated: (Session, Frame) -> Unit = { _, _ -> },
     private val onTrackingFailureChanged: (String?) -> Unit = {},
@@ -110,6 +114,7 @@ internal class SceneViewHost(
     // recompose at the acquisition rate causes camera/overlay frame jitter.
     private val coverageRenderConfig = mutableStateOf<PointCloudNativeConfig?>(null)
     private val coverageSnapshotRef = AtomicReference<CoveragePointRenderSnapshot?>()
+    private val rawPointSnapshotRef = AtomicReference<CoveragePointRenderSnapshot?>()
     private val coverageMeshRef = AtomicReference<CoveragePointMeshBinding?>()
     private val sharedCameraLifecycleGate = SharedCameraSceneLifecycleGate(
         Session.Feature.SHARED_CAMERA in sessionFeatures,
@@ -120,6 +125,24 @@ internal class SceneViewHost(
     private val cameraStreamRef = AtomicReference<ARCameraStream?>()
     private val frameCadenceTracker = FrameCadenceTracker()
     private var disposed = false
+    private val replaySettledTextureResize: Runnable = Runnable {
+        if (disposed) return@Runnable
+        val textureView = composeView.findTextureView() ?: return@Runnable
+        if (textureView.width <= 0 || textureView.height <= 0) return@Runnable
+        val surfaceTexture = textureView.surfaceTexture ?: return@Runnable
+        val surfaceTextureListener =
+            textureView.surfaceTextureListener ?: return@Runnable
+        Log.i(
+            "SceneViewHost",
+            "Replaying TextureView surface resize at " +
+                "${textureView.width}x${textureView.height}",
+        )
+        surfaceTextureListener.onSurfaceTextureSizeChanged(
+            surfaceTexture,
+            textureView.width,
+            textureView.height,
+        )
+    }
 
     private val gestureListener = object : GestureDetector.SimpleOnGestureListener() {
         override fun onSingleTapConfirmed(e: MotionEvent, node: Node?) {
@@ -176,7 +199,25 @@ internal class SceneViewHost(
         }
     }
 
-    private val composeView = ComposeView(context).apply {
+    private val composeView: ComposeView = ComposeView(context).apply {
+        addOnLayoutChangeListener { _, left, top, right, bottom,
+            oldLeft, oldTop, oldRight, oldBottom ->
+            val newWidth = right - left
+            val newHeight = bottom - top
+            val oldWidth = oldRight - oldLeft
+            val oldHeight = oldBottom - oldTop
+            if (oldWidth > 0 &&
+                oldHeight > 0 &&
+                (newWidth != oldWidth || newHeight != oldHeight)
+            ) {
+                // Flutter's texture-layer platform view can resize this Compose
+                // host without forwarding the corresponding size callback to
+                // SceneView's nested TextureView. Filament recreates its swap
+                // chain from that callback, so replay it after layout settles.
+                removeCallbacks(replaySettledTextureResize)
+                postDelayed(replaySettledTextureResize, 100)
+            }
+        }
         setViewTreeLifecycleOwner(lifecycleOwner)
         setViewTreeViewModelStoreOwner(viewModelStoreOwner)
         setViewTreeSavedStateRegistryOwner(savedStateRegistryOwner)
@@ -227,6 +268,20 @@ internal class SceneViewHost(
                 },
                 planeRenderer = config.showPlanes && config.customPlaneTexturePath == null,
                 sessionConfiguration = { session, arConfig ->
+                    requestedRearCameraId?.let { requestedId ->
+                        val selectedConfig =
+                            session.getSupportedCameraConfigs(CameraConfigFilter(session))
+                                .firstOrNull {
+                                    it.cameraId == requestedId &&
+                                        it.facingDirection == CameraConfig.FacingDirection.BACK
+                                }
+                        if (selectedConfig == null) {
+                            Log.w("SceneViewHost", "Requested ARCore rear camera $requestedId is unavailable")
+                        } else {
+                            session.cameraConfig = selectedConfig
+                            Log.i("SceneViewHost", "Selected ARCore rear camera $requestedId")
+                        }
+                    }
                     arConfig.depthMode = if (
                         session.isDepthModeSupported(Config.DepthMode.AUTOMATIC)
                     ) {
@@ -343,23 +398,31 @@ internal class SceneViewHost(
                     key(
                         coverage.renderCapacity,
                         coverage.voxelSizeMeters,
+                        coverage.cubeSizeFactor,
                         coverage.pointSizePx,
                     ) {
                         val pointResources = remember(engine, coverage.renderCapacity) {
+                            CoveragePointMeshResources(engine, coverage.renderCapacity)
+                        }
+                        val centroidResources = remember(engine, coverage.renderCapacity) {
                             CoveragePointMeshResources(engine, coverage.renderCapacity)
                         }
                         val cubeResources = remember(
                             engine,
                             coverage.renderCapacity,
                             coverage.voxelSizeMeters,
+                            coverage.cubeSizeFactor,
                         ) {
                             CoverageCubeMeshResources(
                                 engine,
                                 coverage.renderCapacity,
-                                coverage.voxelSizeMeters,
+                                coverage.voxelSizeMeters * coverage.cubeSizeFactor,
                             )
                         }
                         val pointMaterial = remember(materialLoader) {
+                            materialLoader.createMaterial("materials/coverage_points.filamat")
+                        }
+                        val centroidMaterial = remember(materialLoader) {
                             materialLoader.createMaterial("materials/coverage_points.filamat")
                         }
                         val cubeMaterial = remember(materialLoader) {
@@ -368,19 +431,32 @@ internal class SceneViewHost(
                         val pointMaterialInstance = remember(materialLoader, pointMaterial) {
                             materialLoader.createInstance(pointMaterial)
                         }
+                        val centroidMaterialInstance =
+                            remember(materialLoader, centroidMaterial) {
+                                materialLoader.createInstance(centroidMaterial)
+                            }
                         val cubeMaterialInstance = remember(materialLoader, cubeMaterial) {
                             materialLoader.createInstance(cubeMaterial)
                         }
+                        val cubeOutlineMaterialInstance = remember(materialLoader) {
+                            materialLoader.createUnlitColorInstance(android.graphics.Color.BLACK)
+                        }
                         val binding = remember(
                             pointResources,
+                            centroidResources,
                             cubeResources,
                             pointMaterialInstance,
+                            centroidMaterialInstance,
                             cubeMaterialInstance,
                         ) {
                             CoveragePointMeshBinding(
                                 pointTarget = CoverageMeshTarget(
                                     pointResources,
                                     pointMaterialInstance,
+                                ),
+                                centroidTarget = CoverageMeshTarget(
+                                    centroidResources,
+                                    centroidMaterialInstance,
                                 ),
                                 cubeTarget = CoverageMeshTarget(
                                     cubeResources,
@@ -391,12 +467,14 @@ internal class SceneViewHost(
                         }
                         SideEffect {
                             binding.setMode(coverage.voxelRenderMode)
-                            binding.update(coverageSnapshotRef.get())
+                            binding.updateCoverage(coverageSnapshotRef.get())
+                            binding.updateRawPoints(rawPointSnapshotRef.get())
                         }
                         DisposableEffect(binding) {
                             coverageMeshRef.set(binding)
                             binding.setMode(coverage.voxelRenderMode)
-                            binding.update(coverageSnapshotRef.get())
+                            binding.updateCoverage(coverageSnapshotRef.get())
+                            binding.updateRawPoints(rawPointSnapshotRef.get())
                             onCoverageRendererMounted(true)
                             onDispose {
                                 val wasCurrent = coverageMeshRef.compareAndSet(binding, null)
@@ -432,24 +510,54 @@ internal class SceneViewHost(
                             cubeResources,
                             cubeMaterial,
                             cubeMaterialInstance,
+                            cubeOutlineMaterialInstance,
                         ) {
-                            CoverageOwnedMeshNode(
+                            CoverageOwnedCubeNode(
                                 engine = engine,
                                 resources = cubeResources,
                                 boundingBox = CoverageCubeMeshResources.DEFAULT_BOUNDING_BOX,
                                 materialInstance = cubeMaterialInstance,
+                                outlineMaterialInstance = cubeOutlineMaterialInstance,
                                 beforeDestroy = {
                                     binding.clearNode(VoxelRenderMode.CUBES)
                                 },
                             ) {
+                                materialLoader.destroyMaterialInstance(
+                                    cubeOutlineMaterialInstance,
+                                )
                                 materialLoader.destroyMaterialInstance(cubeMaterialInstance)
                                 materialLoader.destroyMaterial(cubeMaterial)
                             }.also { binding.setNode(VoxelRenderMode.CUBES, it) }
                         }
+                        val centroidNode = remember(
+                            engine,
+                            centroidResources,
+                            centroidMaterial,
+                            centroidMaterialInstance,
+                        ) {
+                            CoverageOwnedMeshNode(
+                                engine = engine,
+                                resources = centroidResources,
+                                boundingBox = CoveragePointMeshResources.DEFAULT_BOUNDING_BOX,
+                                materialInstance = centroidMaterialInstance,
+                                beforeDestroy = {
+                                    binding.clearNode(VoxelRenderMode.CENTROIDS)
+                                },
+                            ) {
+                                materialLoader.destroyMaterialInstance(
+                                    centroidMaterialInstance,
+                                )
+                                materialLoader.destroyMaterial(centroidMaterial)
+                            }.also {
+                                binding.setNode(VoxelRenderMode.CENTROIDS, it)
+                            }
+                        }
                         NodeLifecycle(pointNode) {}
+                        NodeLifecycle(centroidNode) {}
                         NodeLifecycle(cubeNode) {}
                     }
-                } else if (config.showFeaturePoints) {
+                }
+                if (coverage == null && config.showFeaturePoints) {
                     val pointMaterial = remember(materialLoader) {
                         materialLoader.createUnlitColorInstance(android.graphics.Color.CYAN)
                     }
@@ -542,23 +650,34 @@ internal class SceneViewHost(
     ) {
         if (snapshot == null || config == null) {
             coverageSnapshotRef.set(null)
-            coverageMeshRef.get()?.update(null)
+            coverageMeshRef.get()?.updateCoverage(null)
             coverageRenderConfig.value = null
             return
         }
 
         coverageSnapshotRef.set(snapshot)
+        coverageMeshRef.get()?.let { binding ->
+            binding.setMode(config.voxelRenderMode)
+            binding.updateCoverage(snapshot)
+        }
         val current = coverageRenderConfig.value
         if (current == null ||
             current.renderCapacity != config.renderCapacity ||
             current.pointSizePx != config.pointSizePx ||
+            current.enabled != config.enabled ||
             current.voxelRenderMode != config.voxelRenderMode ||
-            current.voxelSizeMeters != config.voxelSizeMeters
+            current.voxelSizeMeters != config.voxelSizeMeters ||
+            current.cubeSizeFactor != config.cubeSizeFactor
         ) {
             coverageRenderConfig.value = config
         } else {
-            coverageMeshRef.get()?.update(snapshot)
+            coverageMeshRef.get()?.updateCoverage(snapshot)
         }
+    }
+
+    fun updateRawPointCloud(snapshot: CoveragePointRenderSnapshot?) {
+        rawPointSnapshotRef.set(snapshot)
+        coverageMeshRef.get()?.updateRawPoints(snapshot)
     }
 
     fun resume() {
@@ -576,6 +695,7 @@ internal class SceneViewHost(
     fun dispose() {
         if (!ownership.onDispose()) return
         disposed = true
+        composeView.removeCallbacks(replaySettledTextureResize)
         nodes.clear()
         anchors.values.forEach { it.anchor.detach() }
         anchors.clear()
@@ -825,49 +945,111 @@ internal class SceneViewHost(
         }
     }
 
+    private class CoverageOwnedCubeNode(
+        engine: Engine,
+        private val resources: CoverageCubeMeshResources,
+        boundingBox: com.google.android.filament.Box,
+        materialInstance: com.google.android.filament.MaterialInstance,
+        outlineMaterialInstance: com.google.android.filament.MaterialInstance,
+        private val beforeDestroy: () -> Unit,
+        private val releaseMaterials: () -> Unit,
+    ) : Node(engine = engine) {
+        private var coverageDestroyed = false
+
+        init {
+            RenderableManager.Builder(2)
+                .boundingBox(boundingBox)
+                .culling(true)
+                .geometry(
+                    0,
+                    RenderableManager.PrimitiveType.TRIANGLES,
+                    resources.vertexBuffer,
+                    resources.indexBuffer,
+                )
+                .material(0, materialInstance)
+                .geometry(
+                    CoverageCubeMeshResources.OUTLINE_PRIMITIVE_INDEX,
+                    RenderableManager.PrimitiveType.LINES,
+                    resources.vertexBuffer,
+                    resources.outlineIndexBuffer,
+                )
+                .material(
+                    CoverageCubeMeshResources.OUTLINE_PRIMITIVE_INDEX,
+                    outlineMaterialInstance,
+                )
+                .build(engine, entity)
+            isVisible = false
+        }
+
+        override fun destroy() {
+            if (coverageDestroyed) return
+            coverageDestroyed = true
+            beforeDestroy()
+            engine.renderableManager.destroy(entity)
+            super.destroy()
+            resources.destroy()
+            releaseMaterials()
+        }
+    }
+
     private class CoverageMeshTarget(
         val resources: CoverageVoxelMeshResources,
         val materialInstance: com.google.android.filament.MaterialInstance,
     ) {
-        var node: MeshNode? = null
+        var node: Node? = null
     }
 
     /** Retains both render modes so a UI toggle never replaces a live SceneView node. */
     private class CoveragePointMeshBinding(
         private val pointTarget: CoverageMeshTarget,
+        private val centroidTarget: CoverageMeshTarget,
         private val cubeTarget: CoverageMeshTarget,
         private val pointSizePx: Float,
     ) {
-        private var latestSnapshot: CoveragePointRenderSnapshot? = null
+        private var latestCoverageSnapshot: CoveragePointRenderSnapshot? = null
+        private var latestRawPointSnapshot: CoveragePointRenderSnapshot? = null
         private var mode = VoxelRenderMode.POINTS
 
-        fun setNode(mode: VoxelRenderMode, value: MeshNode) {
+        fun setNode(mode: VoxelRenderMode, value: Node) {
             target(mode).node = value
-            update(latestSnapshot)
+            updateActiveTarget()
         }
 
         fun setMode(value: VoxelRenderMode) {
             if (mode == value) return
             mode = value
-            update(latestSnapshot)
+            updateActiveTarget()
         }
 
         fun clearNode(mode: VoxelRenderMode) {
             target(mode).node = null
         }
 
-        fun update(snapshot: CoveragePointRenderSnapshot?) {
-            latestSnapshot = snapshot
+        fun updateCoverage(snapshot: CoveragePointRenderSnapshot?) {
+            latestCoverageSnapshot = snapshot
+            if (mode != VoxelRenderMode.POINTS) updateActiveTarget()
+        }
+
+        fun updateRawPoints(snapshot: CoveragePointRenderSnapshot?) {
+            latestRawPointSnapshot = snapshot
+            if (mode == VoxelRenderMode.POINTS) updateActiveTarget()
+        }
+
+        private fun updateActiveTarget() {
             val active = target(mode)
-            val inactive = target(if (mode == VoxelRenderMode.POINTS) {
-                VoxelRenderMode.CUBES
-            } else {
-                VoxelRenderMode.POINTS
-            })
-            inactive.node?.isVisible = false
+            targets()
+                .filterNot { it === active }
+                .forEach { inactive ->
+                    inactive.node?.let(inactive.resources::hide)
+                }
             val currentNode = active.node ?: return
+            val snapshot = when (mode) {
+                VoxelRenderMode.POINTS -> latestRawPointSnapshot
+                VoxelRenderMode.CENTROIDS,
+                VoxelRenderMode.CUBES -> latestCoverageSnapshot
+            }
             if (snapshot == null) {
-                currentNode.isVisible = false
+                active.resources.hide(currentNode)
                 return
             }
             active.resources.update(
@@ -880,14 +1062,20 @@ internal class SceneViewHost(
 
         fun dispose() {
             pointTarget.node = null
+            centroidTarget.node = null
             cubeTarget.node = null
-            latestSnapshot = null
+            latestCoverageSnapshot = null
+            latestRawPointSnapshot = null
         }
 
         private fun target(mode: VoxelRenderMode): CoverageMeshTarget = when (mode) {
             VoxelRenderMode.POINTS -> pointTarget
+            VoxelRenderMode.CENTROIDS -> centroidTarget
             VoxelRenderMode.CUBES -> cubeTarget
         }
+
+        private fun targets(): List<CoverageMeshTarget> =
+            listOf(pointTarget, centroidTarget, cubeTarget)
     }
 
     private companion object {

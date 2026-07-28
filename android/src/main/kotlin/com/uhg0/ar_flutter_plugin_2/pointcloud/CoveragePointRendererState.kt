@@ -7,6 +7,7 @@ class CoveragePointRendererState(
     private val keys = LongArray(config.renderCapacity)
     private val positions = FloatArray(config.renderCapacity * 3)
     private val colors = IntArray(config.renderCapacity)
+    private var gridRotationWorld = identityGridRotation()
     private val slotsByKey = HashMap<Long, Int>(config.renderCapacity)
     private var count = 0
     private var enabled = config.enabled
@@ -32,6 +33,7 @@ class CoveragePointRendererState(
         patchKeys: LongArray,
         patchPositions: FloatArray,
         patchColors: IntArray,
+        patchGridRotationWorld: FloatArray = identityGridRotation(),
     ): Boolean {
         ensureActive()
         require(epoch >= 0)
@@ -39,6 +41,8 @@ class CoveragePointRendererState(
         require(patchColors.size == patchKeys.size)
         require(patchKeys.size <= config.renderCapacity)
         require(patchPositions.all { it.isFinite() })
+        require(patchGridRotationWorld.size == 9)
+        require(patchGridRotationWorld.all { it.isFinite() })
         if (epoch < lastAppliedColorEpoch) return false
         val hadPendingDirtySlots = pendingDirtySlots.isNotEmpty()
         var changed = false
@@ -76,6 +80,10 @@ class CoveragePointRendererState(
             }
         }
         lastAppliedColorEpoch = epoch
+        if (!gridRotationWorld.contentEquals(patchGridRotationWorld)) {
+            gridRotationWorld = patchGridRotationWorld.copyOf()
+            changed = true
+        }
         emittedFrames++
         if (changed) revision++
         if (changed) geometryRevision++
@@ -175,6 +183,7 @@ class CoveragePointRendererState(
             keys = snapshotKeys,
             positions = snapshotPositions,
             colors = snapshotColors,
+            gridRotationWorld = gridRotationWorld.copyOf(),
             update = update,
         )
     }

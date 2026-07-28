@@ -225,6 +225,7 @@ internal class ArCaptureSession(
     fun captureImage(
         qualityPolicyMap: Map<String, Any?>? = null,
         requiresPose: Boolean = true,
+        exposureBracketEnabled: Boolean = false,
     ): Map<String, Any?> {
         requireInitialized()
         if (isCaptureInProgress) {
@@ -249,6 +250,7 @@ internal class ArCaptureSession(
                         manager.captureImageResult(
                             qualityPolicy = qualityPolicy,
                             requiresPose = requiresPose,
+                            exposureBracketEnabled = exposureBracketEnabled,
                         )
                     } catch (rejected: SharedBlurRejectedException) {
                         return mapOf(

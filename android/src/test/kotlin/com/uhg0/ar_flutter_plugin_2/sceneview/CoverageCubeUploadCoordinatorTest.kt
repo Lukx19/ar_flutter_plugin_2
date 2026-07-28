@@ -72,6 +72,34 @@ class CoverageCubeUploadCoordinatorTest {
             0f,
         )
     }
+
+    @Test
+    fun `cube corners follow the visibility grid rotation`() {
+        val uploader = FakeCubeUploader()
+        val coordinator = CoverageCubeMeshResources.CoverageCubeUploadCoordinator(
+            capacity = 1,
+            halfSize = 0.5f,
+            uploader = uploader,
+        )
+
+        coordinator.submit(
+            cubeSnapshot(
+                revision = 1,
+                position = floatArrayOf(0f, 0f, 0f),
+                gridRotationWorld = floatArrayOf(
+                    0f, 1f, 0f,
+                    -1f, 0f, 0f,
+                    0f, 0f, 1f,
+                ),
+            ),
+        )
+
+        assertArrayEquals(
+            floatArrayOf(0.5f, -0.5f, -0.5f),
+            uploader.positionSubmissions.single().copyOfRange(0, 3),
+            0f,
+        )
+    }
 }
 
 private class FakeCubeUploader : CoverageCubeMeshResources.CoverageCubeVertexUploader {
@@ -116,6 +144,11 @@ private fun cubeSnapshot(
     revision: Long,
     position: FloatArray,
     color: Int = 0xFF445566.toInt(),
+    gridRotationWorld: FloatArray = floatArrayOf(
+        1f, 0f, 0f,
+        0f, 1f, 0f,
+        0f, 0f, 1f,
+    ),
 ): CoveragePointRenderSnapshot = CoveragePointRenderSnapshot(
     revision = revision,
     enabled = true,
@@ -124,4 +157,5 @@ private fun cubeSnapshot(
     keys = longArrayOf(revision),
     positions = position,
     colors = intArrayOf(color),
+    gridRotationWorld = gridRotationWorld,
 )

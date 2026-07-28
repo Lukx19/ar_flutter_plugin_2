@@ -98,6 +98,27 @@ class CoveragePointMeshResourcesTest {
     }
 
     @Test
+    fun `cube outline contains all twelve edges exactly once`() {
+        val indices = CoverageCubeMeshResources.cubeOutlineIndices()
+
+        assertEquals(24, indices.size)
+        assertEquals(0, indices.minOrNull())
+        assertEquals(7, indices.maxOrNull())
+
+        val edges = indices
+            .toList()
+            .chunked(2)
+            .map { edge -> edge.sorted() }
+            .toSet()
+        assertEquals(12, edges.size)
+
+        val degreeByCorner = indices.toList().groupingBy { it }.eachCount()
+        for (corner in 0..7) {
+            assertEquals(3, degreeByCorner[corner])
+        }
+    }
+
+    @Test
     fun `repeated physical frame uploads reuse bounded direct buffers`() {
         val uploads = CoveragePointUploadBuffers(capacity = 4)
         val positionBuffer = uploads.positionBuffer

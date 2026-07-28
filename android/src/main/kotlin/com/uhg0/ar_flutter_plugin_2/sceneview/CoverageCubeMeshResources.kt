@@ -9,7 +9,7 @@ import com.google.android.filament.MaterialInstance
 import com.google.android.filament.RenderableManager
 import com.google.android.filament.VertexBuffer
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
-import io.github.sceneview.node.MeshNode
+import io.github.sceneview.node.Node
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -26,6 +26,7 @@ internal class CoverageCubeMeshResources(
     private val halfSize = voxelSizeMeters / 2f
     private val vertexCapacity = capacity * VERTICES_PER_VOXEL
     private val indexCapacity = capacity * INDICES_PER_VOXEL
+    private val outlineIndexCapacity = capacity * OUTLINE_INDICES_PER_VOXEL
 
     override val vertexBuffer: VertexBuffer = VertexBuffer.Builder()
         .bufferCount(2)
@@ -48,6 +49,11 @@ internal class CoverageCubeMeshResources(
         .bufferType(IndexBuffer.Builder.IndexType.UINT)
         .build(engine)
 
+    val outlineIndexBuffer: IndexBuffer = IndexBuffer.Builder()
+        .indexCount(outlineIndexCapacity)
+        .bufferType(IndexBuffer.Builder.IndexType.UINT)
+        .build(engine)
+
     override val primitiveType: RenderableManager.PrimitiveType =
         RenderableManager.PrimitiveType.TRIANGLES
 
@@ -57,6 +63,7 @@ internal class CoverageCubeMeshResources(
         uploader = FilamentCoverageCubeVertexUploader(engine, vertexBuffer),
     )
     private var indexStaging: java.nio.IntBuffer? = null
+    private var outlineIndexStaging: java.nio.IntBuffer? = null
     private var lastRevision = Long.MIN_VALUE
     private var destroyed = false
 
@@ -77,10 +84,30 @@ internal class CoverageCubeMeshResources(
             indexCapacity,
             Handler(Looper.getMainLooper()),
         ) { indexStaging = null }
+
+        val outlineIndices = ByteBuffer
+            .allocateDirect(outlineIndexCapacity * Int.SIZE_BYTES)
+            .order(ByteOrder.nativeOrder())
+            .asIntBuffer()
+        repeat(capacity) { voxel ->
+            val vertexOffset = voxel * VERTICES_PER_VOXEL
+            CUBE_OUTLINE_INDICES.forEach { index ->
+                outlineIndices.put(vertexOffset + index)
+            }
+        }
+        outlineIndices.flip()
+        outlineIndexStaging = outlineIndices
+        outlineIndexBuffer.setBuffer(
+            engine,
+            outlineIndices,
+            0,
+            outlineIndexCapacity,
+            Handler(Looper.getMainLooper()),
+        ) { outlineIndexStaging = null }
     }
 
     override fun update(
-        node: MeshNode,
+        node: Node,
         snapshot: CoveragePointRenderSnapshot,
         materialInstance: MaterialInstance,
         pointSizePx: Float,
@@ -93,19 +120,40 @@ internal class CoverageCubeMeshResources(
             if (snapshot.count > 0) {
                 uploadCoordinator.submit(snapshot)
             }
-            val instance = engine.renderableManager.getInstance(node.entity)
-            engine.renderableManager.setGeometryAt(
-                instance,
-                0,
-                primitiveType,
-                vertexBuffer,
-                indexBuffer,
-                0,
-                snapshot.count * INDICES_PER_VOXEL,
-            )
             lastRevision = snapshot.revision
         }
+        setDrawCount(
+            node,
+            if (snapshot.enabled) snapshot.count else 0,
+        )
         node.isVisible = snapshot.enabled && snapshot.count > 0
+    }
+
+    override fun hide(node: Node) {
+        setDrawCount(node, 0)
+        node.isVisible = false
+    }
+
+    private fun setDrawCount(node: Node, voxelCount: Int) {
+        val instance = engine.renderableManager.getInstance(node.entity)
+        engine.renderableManager.setGeometryAt(
+            instance,
+            0,
+            primitiveType,
+            vertexBuffer,
+            indexBuffer,
+            0,
+            voxelCount * INDICES_PER_VOXEL,
+        )
+        engine.renderableManager.setGeometryAt(
+            instance,
+            OUTLINE_PRIMITIVE_INDEX,
+            RenderableManager.PrimitiveType.LINES,
+            vertexBuffer,
+            outlineIndexBuffer,
+            0,
+            voxelCount * OUTLINE_INDICES_PER_VOXEL,
+        )
     }
 
     override fun destroy() {
@@ -113,8 +161,10 @@ internal class CoverageCubeMeshResources(
         destroyed = true
         uploadCoordinator.destroy()
         indexStaging = null
+        outlineIndexStaging = null
         engine.destroyVertexBuffer(vertexBuffer)
         engine.destroyIndexBuffer(indexBuffer)
+        engine.destroyIndexBuffer(outlineIndexBuffer)
     }
 
     internal companion object {
@@ -124,6 +174,8 @@ internal class CoverageCubeMeshResources(
         const val COLOR_COMPONENTS = 4
         const val VERTICES_PER_VOXEL = 8
         const val INDICES_PER_VOXEL = 36
+        const val OUTLINE_INDICES_PER_VOXEL = 24
+        const val OUTLINE_PRIMITIVE_INDEX = 1
 
         // Two triangles per cube face, using the eight corners in the order:
         // (-,-,-), (+,-,-), (+,+,-), (-,+,-), (-,-,+), (+,-,+), (+,+,+), (-,+,+).
@@ -147,6 +199,13 @@ internal class CoverageCubeMeshResources(
             -1f, 1f, 1f,
         )
 
+        // Twelve cube edges, expressed as line-segment vertex pairs.
+        private val CUBE_OUTLINE_INDICES = intArrayOf(
+            0, 1, 1, 2, 2, 3, 3, 0,
+            4, 5, 5, 6, 6, 7, 7, 4,
+            0, 4, 1, 5, 2, 6, 3, 7,
+        )
+
         val DEFAULT_BOUNDING_BOX = Box(
             0f,
             0f,
@@ -159,6 +218,9 @@ internal class CoverageCubeMeshResources(
         internal fun cubeIndices(): IntArray = CUBE_INDICES.copyOf()
 
         internal fun cubeCorners(): FloatArray = CUBE_CORNERS.copyOf()
+
+        internal fun cubeOutlineIndices(): IntArray =
+            CUBE_OUTLINE_INDICES.copyOf()
     }
 
     internal class CoverageCubeUploadCoordinator(
@@ -215,11 +277,27 @@ internal class CoverageCubeMeshResources(
                 val y = snapshot.positions[sourceOffset + 1]
                 val z = snapshot.positions[sourceOffset + 2]
                 val color = snapshot.colors[voxel]
+                val rotation = snapshot.gridRotationWorld
                 repeat(VERTICES_PER_VOXEL) { corner ->
                     val cornerOffset = corner * POSITION_COMPONENTS
-                    positionBuffer.put(x + CUBE_CORNERS[cornerOffset] * halfSize)
-                    positionBuffer.put(y + CUBE_CORNERS[cornerOffset + 1] * halfSize)
-                    positionBuffer.put(z + CUBE_CORNERS[cornerOffset + 2] * halfSize)
+                    val localX = CUBE_CORNERS[cornerOffset] * halfSize
+                    val localY = CUBE_CORNERS[cornerOffset + 1] * halfSize
+                    val localZ = CUBE_CORNERS[cornerOffset + 2] * halfSize
+                    positionBuffer.put(
+                        x + rotation[0] * localX +
+                            rotation[3] * localY +
+                            rotation[6] * localZ,
+                    )
+                    positionBuffer.put(
+                        y + rotation[1] * localX +
+                            rotation[4] * localY +
+                            rotation[7] * localZ,
+                    )
+                    positionBuffer.put(
+                        z + rotation[2] * localX +
+                            rotation[5] * localY +
+                            rotation[8] * localZ,
+                    )
                     colorBuffer.put((color shr 16 and 0xFF).toByte())
                     colorBuffer.put((color shr 8 and 0xFF).toByte())
                     colorBuffer.put((color and 0xFF).toByte())

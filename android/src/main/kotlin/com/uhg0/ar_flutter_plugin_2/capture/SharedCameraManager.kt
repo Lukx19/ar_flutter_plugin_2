@@ -30,6 +30,7 @@ import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -125,7 +126,28 @@ data class SharedCameraCaptureResult(
     val preAlignedPose: PoseDataExtractor.AlignedPose? = null,
     val requiresPose: Boolean = true,
     val pipelineTimingMs: Map<String, Long> = emptyMap(),
+    val exposureBracketMembers: List<ExposureBracketMember> = emptyList(),
 )
+
+/** One JPEG member of an app-owned three-exposure capture bundle. */
+data class ExposureBracketMember(
+    val exposureEv: Int,
+    val imageBytes: ByteArray,
+    val width: Int,
+    val height: Int,
+    val sensorTimestampNs: Long,
+    val exposureTimeNs: Long,
+    val rollingShutterSkewNs: Long,
+    val observedTimestampNs: Long?,
+    val intrinsics: Map<String, Any>?,
+) {
+    val assetName: String
+        get() = when {
+            exposureEv < 0 -> "jpeg_ev$exposureEv"
+            exposureEv > 0 -> "jpeg_ev+$exposureEv"
+            else -> "jpeg"
+        }
+}
 
 /**
  * The ordinary shared-camera JPEG path receives hardware-encoded bytes. Its
@@ -217,6 +239,8 @@ internal class SharedCameraManager(
                 request: CaptureRequest,
                 result: TotalCaptureResult,
             ) {
+                latestPreviewExposureState =
+                    buildObservedExposureState(result, runtimeCameraController)
                 if (pendingManualCapture != null) {
                     Log.i(
                         "SharedCameraManager",
@@ -269,6 +293,7 @@ internal class SharedCameraManager(
                         result.get(CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW) ?: 0L,
                     cropRegion = result.get(CaptureResult.SCALER_CROP_REGION),
                     observedTimestampNs = observedTimestampNs,
+                    bracketIndex = requestTag.bracketIndex,
                 )?.let(::handleCorrelatedStillCapture)
             }
         }
@@ -308,6 +333,8 @@ internal class SharedCameraManager(
     @Volatile
     private var observedCaptureState: RuntimeObservedCaptureState? = null
     @Volatile
+    private var latestPreviewExposureState: RuntimeObservedExposureState? = null
+    @Volatile
     private var cleanupRequested = false
     @Volatile
     private var captureSessionClosed = false
@@ -342,16 +369,27 @@ internal class SharedCameraManager(
         val qualityPolicy: CaptureQualityPolicy?,
         val generation: Long,
         val requiresPose: Boolean = true,
+        val exposureBracket: List<ExposureBracketSpec> = emptyList(),
         val requestStartedAtNs: Long = System.nanoTime(),
         @Volatile var result: SharedCameraCaptureResult? = null,
         @Volatile var error: Throwable? = null,
         @Volatile var preEncodeQuality: Map<String, Any>? = null,
         @Volatile var preAlignedPose: PoseDataExtractor.AlignedPose? = null,
         @Volatile var accepted: SharedCaptureAccepted? = null,
+        val bracketedCaptures: MutableMap<Int, ExposureBracketMember> = mutableMapOf(),
     )
 
-    private data class ManualCaptureTag(val generation: Long) {
-        override fun toString(): String = "$ManualCaptureRequestTagPrefix:$generation"
+    private data class ExposureBracketSpec(
+        val exposureEv: Int,
+        val compensationSteps: Int,
+    )
+
+    private data class ManualCaptureTag(
+        val generation: Long,
+        val bracketIndex: Int = 0,
+    ) {
+        override fun toString(): String =
+            "$ManualCaptureRequestTagPrefix:$generation:$bracketIndex"
     }
 
     /**
@@ -1357,20 +1395,70 @@ internal class SharedCameraManager(
         resourceCounters.onImageClosed()
     }
 
-    fun captureImage(): Boolean {
+    private fun exposureBracketSpecs(): List<ExposureBracketSpec> {
+        if (config.rawJpeg || config.processed) {
+            throw CaptureSessionException(
+                "HDR_BRACKET_UNSUPPORTED",
+                "HDR exposure bracketing is available for JPEG capture only",
+            )
+        }
+        val characteristics = activeCameraCharacteristics
+            ?: throw CaptureSessionException("CONTROL_UNSUPPORTED", "Camera characteristics are unavailable")
+        val range = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+            ?: throw CaptureSessionException("CONTROL_UNSUPPORTED", "Exposure compensation is unavailable")
+        val step = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)
+            ?.toFloat()
+            ?.takeIf { it > 0f }
+            ?: throw CaptureSessionException("CONTROL_UNSUPPORTED", "Exposure compensation step is unavailable")
+        val specs = listOf(-2, 0, 2).map { exposureEv ->
+            ExposureBracketSpec(
+                exposureEv = exposureEv,
+                compensationSteps = (exposureEv / step).roundToInt().coerceIn(range.lower, range.upper),
+            )
+        }
+        if (specs.map(ExposureBracketSpec::compensationSteps).toSet().size != specs.size) {
+            throw CaptureSessionException(
+                "HDR_BRACKET_UNSUPPORTED",
+                "This camera cannot produce distinct -2 EV, 0 EV, and +2 EV exposures",
+            )
+        }
+        return specs
+    }
+
+    private fun captureImage(exposureBracket: List<ExposureBracketSpec> = emptyList()): Boolean {
         val activeSession = captureSession ?: return false
         val builder = manualCaptureRequestBuilder ?: return false
         if (!repeatingRequestLifecycle.isRepeatingActive()) {
             return false
         }
-        val generation = pendingManualCapture?.generation ?: return false
-        builder.setTag(ManualCaptureTag(generation))
+        val pending = pendingManualCapture ?: return false
+        val generation = pending.generation
         return try {
-            activeSession.capture(
-                builder.build(),
-                sharedCameraCaptureCallback,
-                captureCallbackHandler,
-            )
+            if (exposureBracket.isEmpty()) {
+                builder.setTag(ManualCaptureTag(generation))
+                activeSession.capture(
+                    builder.build(),
+                    sharedCameraCaptureCallback,
+                    captureCallbackHandler,
+                )
+            } else {
+                val originalCompensation =
+                    runtimeCameraController?.getCurrentExposureCompensationSteps() ?: 0
+                val requests = exposureBracket.mapIndexed { index, member ->
+                    builder.setTag(ManualCaptureTag(generation, index))
+                    builder.set(
+                        CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
+                        member.compensationSteps,
+                    )
+                    builder.build()
+                }
+                builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, originalCompensation)
+                activeSession.captureBurst(
+                    requests,
+                    sharedCameraCaptureCallback,
+                    captureCallbackHandler,
+                )
+            }
             true
         } catch (error: Exception) {
             Log.e("SharedCameraManager", "Failed to submit one-shot shared capture", error)
@@ -1381,11 +1469,13 @@ internal class SharedCameraManager(
     fun captureImageResult(
         qualityPolicy: CaptureQualityPolicy? = null,
         requiresPose: Boolean = true,
+        exposureBracketEnabled: Boolean = false,
         timeoutMs: Long = ManualCaptureTimeoutMs,
     ): SharedCameraCaptureResult {
         if (!isInitialized) {
             throw IllegalStateException("SharedCameraManager is not initialized")
         }
+        val exposureBracket = if (exposureBracketEnabled) exposureBracketSpecs() else emptyList()
         val reservationToken =
             imageCacheManager?.reserveCaptureSlot()
                 ?: throw IllegalStateException("ImageCacheManager is not initialized")
@@ -1395,6 +1485,7 @@ internal class SharedCameraManager(
             qualityPolicy,
             requestGeneration.next(),
             requiresPose,
+            exposureBracket,
         )
         if (!pendingManualCaptureOwner.acquire(pending)) {
             imageCacheManager?.releaseReservation(reservationToken)
@@ -1402,7 +1493,7 @@ internal class SharedCameraManager(
         }
         val started =
             try {
-                captureImage()
+                captureImage(exposureBracket)
             } catch (error: Throwable) {
                 imageCacheManager?.releaseReservation(reservationToken)
                 pendingManualCaptureOwner.release(pending)
@@ -1418,6 +1509,7 @@ internal class SharedCameraManager(
         val effectiveTimeoutMs =
             if (timeoutMs != ManualCaptureTimeoutMs) timeoutMs
             else if (config.rawJpeg) 20_000L
+            else if (exposureBracket.isNotEmpty()) 12_000L
             else timeoutMs
         val completed = pending.latch.await(effectiveTimeoutMs, TimeUnit.MILLISECONDS)
         pendingManualCaptureOwner.release(pending)
@@ -1681,6 +1773,7 @@ internal class SharedCameraManager(
         backgroundHandler?.postDelayed(::quitBackgroundThreadFromCameraCallback, 3_000L)
 
         observedCaptureState = null
+        latestPreviewExposureState = null
         sceneViewResumeReconfigurationDisabled = false
         isInitialized = false
         Log.i("SharedCameraManager", "Cleanup completed")
@@ -1764,7 +1857,11 @@ internal class SharedCameraManager(
                 ),
             target =
                 object : RuntimeExposureControlTarget {
-                    override fun setISO(isoValue: Int): Boolean = controller.setISO(isoValue)
+                    override fun setISO(
+                        isoValue: Int,
+                        preservedExposureTimeMicros: Long?,
+                    ): Boolean =
+                        controller.setISO(isoValue, preservedExposureTimeMicros)
 
                     override fun setExposureTime(exposureTimeMicros: Long): Boolean =
                         controller.setExposureTime(exposureTimeMicros)
@@ -1793,7 +1890,7 @@ internal class SharedCameraManager(
                         controller.isExposureLocked()
 
                     override fun getObservedExposureState(): RuntimeObservedExposureState? =
-                        observedCaptureState?.exposure
+                        latestPreviewExposureState ?: observedCaptureState?.exposure
                 },
         )
     }
@@ -2095,6 +2192,69 @@ internal class SharedCameraManager(
             return
         }
         try {
+            if (pending.exposureBracket.isNotEmpty()) {
+                val bracketIndex = capture.result.bracketIndex
+                val spec = pending.exposureBracket.getOrNull(bracketIndex)
+                    ?: throw CaptureSessionException(
+                        "CAPTURE_FAILED",
+                        "Received an exposure-bracket image with an unknown index",
+                    )
+                val member = ExposureBracketMember(
+                    exposureEv = spec.exposureEv,
+                    imageBytes = capture.image.bytes,
+                    width = capture.image.width,
+                    height = capture.image.height,
+                    sensorTimestampNs = capture.result.sensorTimestampNs,
+                    exposureTimeNs = capture.result.exposureTimeNs,
+                    rollingShutterSkewNs = capture.result.rollingShutterSkewNs,
+                    observedTimestampNs = capture.result.observedTimestampNs,
+                    intrinsics = capabilityQuerier.getCameraIntrinsicsForSize(
+                        captureSize = Size(capture.image.width, capture.image.height),
+                        cropRegion = capture.result.cropRegion,
+                    ),
+                )
+                pending.bracketedCaptures[bracketIndex] = member
+                if (pending.bracketedCaptures.size < pending.exposureBracket.size) {
+                    return
+                }
+                val members = pending.exposureBracket.indices.map { index ->
+                    pending.bracketedCaptures[index]
+                        ?: throw CaptureSessionException(
+                            "CAPTURE_FAILED",
+                            "Exposure bracket completed without all expected images",
+                        )
+                }
+                val center = members.firstOrNull { it.exposureEv == 0 }
+                    ?: throw CaptureSessionException(
+                        "CAPTURE_FAILED",
+                        "Exposure bracket completed without a 0 EV image",
+                    )
+                pending.result = SharedCameraCaptureResult(
+                    reservationToken = pending.reservationToken,
+                    imageId = generateImageId(),
+                    imageBytes = center.imageBytes,
+                    format = config.format,
+                    width = center.width,
+                    height = center.height,
+                    imageSizeBytes = members.sumOf { it.imageBytes.size },
+                    captureTimestampMs = System.currentTimeMillis(),
+                    sensorTimestampNs = center.sensorTimestampNs,
+                    exposureTimeNs = center.exposureTimeNs,
+                    rollingShutterSkewNs = center.rollingShutterSkewNs,
+                    observedTimestampNs = center.observedTimestampNs,
+                    intrinsics = center.intrinsics,
+                    primaryAssetName = "jpeg",
+                    preEncodeQuality = pending.preEncodeQuality,
+                    requiresPose = pending.requiresPose,
+                    pipelineTimingMs = hardwareJpegAcquisitionTimings(
+                        requestStartedAtNs = pending.requestStartedAtNs,
+                        correlatedFrameAtNs = System.nanoTime(),
+                    ),
+                    exposureBracketMembers = members,
+                )
+                pending.latch.countDown()
+                return
+            }
             val imageId = generateImageId()
             val intrinsics =
                 capabilityQuerier.getCameraIntrinsicsForSize(

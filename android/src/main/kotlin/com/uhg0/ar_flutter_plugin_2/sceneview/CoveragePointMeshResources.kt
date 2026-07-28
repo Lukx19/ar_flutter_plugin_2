@@ -7,7 +7,7 @@ import com.google.android.filament.MaterialInstance
 import com.google.android.filament.RenderableManager
 import com.google.android.filament.VertexBuffer
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
-import io.github.sceneview.node.MeshNode
+import io.github.sceneview.node.Node
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -68,7 +68,7 @@ internal class CoveragePointMeshResources(
     }
 
     override fun update(
-        node: MeshNode,
+        node: Node,
         snapshot: CoveragePointRenderSnapshot,
         materialInstance: MaterialInstance,
         pointSizePx: Float,
@@ -81,21 +81,33 @@ internal class CoveragePointMeshResources(
             if (snapshot.count > 0) {
                 uploadCoordinator.submit(snapshot)
             }
-            val renderableManager = engine.renderableManager
-            val instance = renderableManager.getInstance(node.entity)
-            renderableManager.setGeometryAt(
-                instance,
-                0,
-                primitiveType,
-                vertexBuffer,
-                indexBuffer,
-                0,
-                snapshot.count,
-            )
             lastRevision = snapshot.revision
         }
+        setDrawCount(
+            node,
+            if (snapshot.enabled) snapshot.count else 0,
+        )
         materialInstance.setParameter("pointSize", pointSizePx)
         node.isVisible = snapshot.enabled && snapshot.count > 0
+    }
+
+    override fun hide(node: Node) {
+        setDrawCount(node, 0)
+        node.isVisible = false
+    }
+
+    private fun setDrawCount(node: Node, count: Int) {
+        val renderableManager = engine.renderableManager
+        val instance = renderableManager.getInstance(node.entity)
+        renderableManager.setGeometryAt(
+            instance,
+            0,
+            primitiveType,
+            vertexBuffer,
+            indexBuffer,
+            0,
+            count,
+        )
     }
 
     override fun destroy() {

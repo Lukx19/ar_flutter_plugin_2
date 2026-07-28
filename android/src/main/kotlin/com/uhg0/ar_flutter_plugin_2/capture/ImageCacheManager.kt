@@ -435,12 +435,19 @@ class ImageCacheManager(
             val hashes = linkedMapOf<String, String>()
             val created = mutableListOf<File>()
             try {
+                val isExposureBracket = cachedImage.assets.keys.any { key ->
+                    key.startsWith("jpeg_ev")
+                }
                 cachedImage.assets.forEach { (assetFormat, asset) ->
-                    val extension = when (assetFormat) {
-                        "dng" -> "dng"
-                        else -> "jpg"
+                    val filename = when {
+                        assetFormat == "dng" -> "$baseName.dng.part"
+                        assetFormat == "jpeg" && isExposureBracket -> "${baseName}_ev0.jpg.part"
+                        assetFormat == "jpeg" -> "$baseName.jpg.part"
+                        assetFormat.startsWith("jpeg_ev") ->
+                            "$baseName${assetFormat.removePrefix("jpeg")}.jpg.part"
+                        else -> "$baseName.$assetFormat.part"
                     }
-                    val partFile = File(destinationDirectory, "$baseName.$extension.part")
+                    val partFile = File(destinationDirectory, filename)
                     partFile.writeBytes(asset.bytes)
                     created += partFile
                     files[assetFormat] = partFile.absolutePath

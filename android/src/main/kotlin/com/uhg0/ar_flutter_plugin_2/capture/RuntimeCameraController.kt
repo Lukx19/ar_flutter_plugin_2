@@ -169,8 +169,17 @@ internal class RuntimeCameraSettingsState {
         }
     }
 
-    fun setISO(iso: Int) {
+    fun setISO(
+        iso: Int,
+        preservedExposureTimeMicros: Long? = null,
+    ) {
         currentISO = iso
+        if (isAutoExposureEnabled &&
+            currentExposureTimeNs == null &&
+            preservedExposureTimeMicros != null
+        ) {
+            currentExposureTimeNs = preservedExposureTimeMicros * 1000
+        }
         isAutoExposureEnabled = false
     }
 
@@ -413,9 +422,12 @@ internal class RuntimeCameraController(
         }
     }
 
-    fun setISO(iso: Int): Boolean =
+    fun setISO(
+        iso: Int,
+        preservedExposureTimeMicros: Long? = null,
+    ): Boolean =
         try {
-            state.setISO(iso)
+            state.setISO(iso, preservedExposureTimeMicros)
             updateCameraSettings()
             Log.i("RuntimeCameraController", "Set ISO to $iso")
             true

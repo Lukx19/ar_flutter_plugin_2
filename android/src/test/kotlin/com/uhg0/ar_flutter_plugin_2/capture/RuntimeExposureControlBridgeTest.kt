@@ -8,6 +8,39 @@ import org.junit.Test
 
 class RuntimeExposureControlBridgeTest {
     @Test
+    fun `first manual iso change preserves observed auto exposure time`() {
+        val target =
+            FakeExposureTarget().apply {
+                observedState =
+                    RuntimeObservedExposureState(
+                        currentISO = 320,
+                        currentExposureTimeMicros = 10000L,
+                        isAutoExposureEnabled = true,
+                        isExposureLocked = false,
+                        exposureCompensationSteps = 0,
+                    )
+            }
+        val bridge =
+            RuntimeExposureControlBridge(
+                capabilities =
+                    RuntimeExposureCapabilities(
+                        supportedIsoRange = 100..1600,
+                        supportedExposureTimeMicrosRange = 500L..50000L,
+                        exposureCompensationStepsRange = -4..4,
+                        exposureCompensationStepEv = 0.5,
+                        exposureLockSupported = true,
+                    ),
+                target = target,
+            )
+
+        bridge.setISO(321)
+
+        assertEquals(321, target.stagedIso)
+        assertEquals(10000L, target.stagedExposureTimeMicros)
+        assertFalse(target.autoExposureEnabled)
+    }
+
+    @Test
     fun `setISO clamps to supported range before staging`() {
         val target = FakeExposureTarget()
         val bridge =
@@ -234,11 +267,17 @@ class RuntimeExposureControlBridgeTest {
         var exposureLocked: Boolean = false
         var observedState: RuntimeObservedExposureState? = null
 
-        override fun setISO(isoValue: Int): Boolean {
+        override fun setISO(
+            isoValue: Int,
+            preservedExposureTimeMicros: Long?,
+        ): Boolean {
             if (failIsoUpdate) {
                 return false
             }
             stagedIso = isoValue
+            if (autoExposureEnabled && preservedExposureTimeMicros != null) {
+                stagedExposureTimeMicros = preservedExposureTimeMicros
+            }
             autoExposureEnabled = false
             return true
         }

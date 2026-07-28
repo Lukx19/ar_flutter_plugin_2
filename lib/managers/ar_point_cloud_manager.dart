@@ -64,8 +64,12 @@ class ARPointCloudManager {
 
   Future<void> setVoxelRenderMode(String mode) async {
     _ensureActive();
-    if (mode != 'points' && mode != 'cubes') {
-      throw ArgumentError.value(mode, 'mode', 'Expected points or cubes.');
+    if (mode != 'points' && mode != 'centroids' && mode != 'cubes') {
+      throw ArgumentError.value(
+        mode,
+        'mode',
+        'Expected points, centroids, or cubes.',
+      );
     }
     await _channel.invokeMethod<bool>('setVoxelRenderMode', <String, Object>{
       'mode': mode,

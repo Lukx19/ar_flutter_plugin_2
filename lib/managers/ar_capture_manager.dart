@@ -391,6 +391,7 @@ class ARCaptureManager {
     CaptureQualityPolicy qualityPolicy =
         const CaptureQualityPolicy.productionDefault(),
     bool requiresPose = true,
+    bool exposureBracketEnabled = false,
   }) async {
     _throwIfDisposed();
     if (!isEnabled) {
@@ -407,6 +408,7 @@ class ARCaptureManager {
         <String, dynamic>{
           'qualityPolicy': qualityPolicy.toMap(),
           'requiresPose': requiresPose,
+          'exposureBracketEnabled': exposureBracketEnabled,
         },
       );
       if (result == null) {

@@ -4,15 +4,32 @@ const val POINT_CLOUD_WIRE_VERSION = "pointcloud_wire_v4"
 
 enum class VoxelRenderMode(val wireName: String) {
     POINTS("points"),
+    CENTROIDS("centroids"),
     CUBES("cubes"),
     ;
 
     companion object {
         fun fromWire(value: String): VoxelRenderMode =
             entries.firstOrNull { it.wireName == value }
-                ?: throw IllegalArgumentException("voxelRenderMode must be points or cubes")
+                ?: throw IllegalArgumentException(
+                    "voxelRenderMode must be points, centroids, or cubes",
+                )
     }
 }
+
+data class CoverageVisualizationLayers(
+    val rawPointCloud: Boolean,
+    val visibilityGridCentroids: Boolean,
+    val visibilityGridCubes: Boolean,
+)
+
+fun PointCloudNativeConfig.visualizationLayers(): CoverageVisualizationLayers =
+    CoverageVisualizationLayers(
+        rawPointCloud = enabled && voxelRenderMode == VoxelRenderMode.POINTS,
+        visibilityGridCentroids =
+            enabled && voxelRenderMode == VoxelRenderMode.CENTROIDS,
+        visibilityGridCubes = enabled && voxelRenderMode == VoxelRenderMode.CUBES,
+    )
 
 data class PointCloudNativeConfig(
     val wireVersion: String = POINT_CLOUD_WIRE_VERSION,
@@ -26,6 +43,7 @@ data class PointCloudNativeConfig(
     val syntheticSource: Boolean = false,
     val voxelRenderMode: VoxelRenderMode = VoxelRenderMode.POINTS,
     val voxelSizeMeters: Float = 0.1f,
+    val cubeSizeFactor: Float = 1f,
 ) {
     init {
         require(wireVersion == POINT_CLOUD_WIRE_VERSION)
@@ -35,6 +53,7 @@ data class PointCloudNativeConfig(
         require(maxConsecutiveAcquisitionErrors > 0)
         require(minConfidence in 0f..1f)
         require(voxelSizeMeters.isFinite() && voxelSizeMeters > 0f)
+        require(cubeSizeFactor.isFinite() && cubeSizeFactor in 0.1f..1f)
     }
 }
 
@@ -51,6 +70,31 @@ data class PointCloudSample(
     }
 }
 
+fun PointCloudSample.toRawPointRenderSnapshot(
+    capacity: Int,
+    color: Int,
+    enabled: Boolean,
+): CoveragePointRenderSnapshot {
+    val renderedCount = minOf(ids.size, capacity)
+    val positions = FloatArray(renderedCount * 3)
+    repeat(renderedCount) { index ->
+        val sourceOffset = index * 4
+        val destinationOffset = index * 3
+        positions[destinationOffset] = points[sourceOffset]
+        positions[destinationOffset + 1] = points[sourceOffset + 1]
+        positions[destinationOffset + 2] = points[sourceOffset + 2]
+    }
+    return CoveragePointRenderSnapshot(
+        revision = sequence,
+        enabled = enabled,
+        capacity = capacity,
+        count = renderedCount,
+        keys = LongArray(renderedCount) { ids[it].toLong() },
+        positions = positions,
+        colors = IntArray(renderedCount) { color },
+    )
+}
+
 data class CoveragePointRenderSnapshot(
     val revision: Long,
     val enabled: Boolean,
@@ -59,7 +103,14 @@ data class CoveragePointRenderSnapshot(
     val keys: LongArray,
     val positions: FloatArray,
     val colors: IntArray,
+    val gridRotationWorld: FloatArray = identityGridRotation(),
     val update: CoveragePointRenderUpdate? = null,
+)
+
+fun identityGridRotation(): FloatArray = floatArrayOf(
+    1f, 0f, 0f,
+    0f, 1f, 0f,
+    0f, 0f, 1f,
 )
 
 data class CoveragePointSpan(

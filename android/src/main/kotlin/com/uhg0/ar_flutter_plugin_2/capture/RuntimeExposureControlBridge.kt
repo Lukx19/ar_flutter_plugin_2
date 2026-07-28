@@ -9,7 +9,10 @@ internal data class RuntimeExposureCapabilities(
 )
 
 internal interface RuntimeExposureControlTarget {
-    fun setISO(isoValue: Int): Boolean
+    fun setISO(
+        isoValue: Int,
+        preservedExposureTimeMicros: Long? = null,
+    ): Boolean
 
     fun setExposureTime(exposureTimeMicros: Long): Boolean
 
@@ -44,7 +47,13 @@ internal class RuntimeExposureControlBridge(
                     message = "Runtime ISO control is not supported on this camera",
                 )
         val clampedIso = isoValue.coerceIn(isoRange.first, isoRange.last)
-        if (!target.setISO(clampedIso)) {
+        val preservedExposureTimeMicros =
+            if (target.isAutoExposureEnabled()) {
+                target.getObservedExposureState()?.currentExposureTimeMicros
+            } else {
+                null
+            }
+        if (!target.setISO(clampedIso, preservedExposureTimeMicros)) {
             throw CaptureSessionException(
                 code = "CONTROL_UPDATE_FAILED",
                 message = "Failed to stage ISO $clampedIso for the next still capture",

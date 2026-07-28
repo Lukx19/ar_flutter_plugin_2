@@ -7,8 +7,12 @@ import android.hardware.camera2.CameraManager
 import android.os.Build
 import android.util.Log
 import android.util.Size
+import com.google.ar.core.CameraConfig
+import com.google.ar.core.CameraConfigFilter
+import com.google.ar.core.Session
 import kotlin.math.atan
 import kotlin.math.abs
+import kotlin.math.PI
 
 data class CameraResolution(val width: Int, val height: Int)
 
@@ -20,7 +24,7 @@ enum class CaptureFormat(val wireValue: String) {
 class CameraCapabilityQuerier(private val context: Context) {
 
     companion object {
-        const val CAPABILITY_PRESET_VERSION = 11
+        const val CAPABILITY_PRESET_VERSION = 12
         private const val TAG = "CameraCapabilityQuerier"
     }
 
@@ -106,7 +110,7 @@ class CameraCapabilityQuerier(private val context: Context) {
                 "lensFacing=$lensFacingByCameraId " +
                 "physicalIds=$primaryPhysicalCameraIds " +
                 "concurrentSets=${concurrentCameraIdSets.map { it.sorted() }.sortedBy { it.joinToString() }} " +
-                "rearConcurrentIds=$rearConcurrentIds raw=$rawCapture manual=$manualControls",
+            "rearConcurrentIds=$rearConcurrentIds raw=$rawCapture manual=$manualControls",
         )
 
         return mapOf(
@@ -165,6 +169,98 @@ class CameraCapabilityQuerier(private val context: Context) {
             }
             editor.apply()
         }
+    }
+
+    /**
+     * Returns one representative ARCore config for every selectable rear
+     * camera. Call only while no AR session is active (the Settings route): a
+     * second ARCore session may otherwise disrupt a live shared-camera session.
+     */
+    fun getSelectableRearCameras(): List<Map<String, Any?>> =
+        runCatching {
+            val session = Session(context, setOf(Session.Feature.SHARED_CAMERA))
+            try {
+                val candidates =
+                    session.getSupportedCameraConfigs(CameraConfigFilter(session))
+                        .asSequence()
+                        .filter { it.facingDirection == CameraConfig.FacingDirection.BACK }
+                        .groupBy { it.cameraId }
+                        .map { (cameraId, configs) ->
+                            val characteristics = getCameraCharacteristics(cameraId)
+                            ArCoreRearCameraCandidate(
+                                cameraId = cameraId,
+                                fieldOfViewDegrees = horizontalFieldOfViewDegrees(characteristics),
+                                minimumZoom = zoomRange(characteristics).first,
+                                maximumZoom = zoomRange(characteristics).second,
+                                preferred = configs.first(),
+                            )
+                        }
+                        .sortedWith(
+                            compareByDescending<ArCoreRearCameraCandidate> {
+                                it.fieldOfViewDegrees ?: Double.NEGATIVE_INFINITY
+                            }.thenBy { it.cameraId },
+                        )
+                        .toList()
+                candidates.mapIndexed { index, candidate ->
+                    mapOf<String, Any?>(
+                        "cameraId" to candidate.cameraId,
+                        "lensLabel" to inferredLensLabel(index, candidates.size),
+                        "fieldOfViewDegrees" to candidate.fieldOfViewDegrees,
+                        "minimumZoom" to candidate.minimumZoom,
+                        "maximumZoom" to candidate.maximumZoom,
+                    )
+                }
+            } finally {
+                session.close()
+            }
+        }.getOrElse { error ->
+            Log.w(TAG, "Unable to enumerate ARCore rear camera configs", error)
+            emptyList()
+        }
+
+    private data class ArCoreRearCameraCandidate(
+        val cameraId: String,
+        val fieldOfViewDegrees: Double?,
+        val minimumZoom: Float,
+        val maximumZoom: Float,
+        // Retaining a supported config in this value prevents accidental
+        // selection from an arbitrary Camera2 ID while building the list.
+        @Suppress("unused") val preferred: CameraConfig,
+    )
+
+    private fun inferredLensLabel(index: Int, count: Int): String =
+        when (count) {
+            0, 1 -> "Primary rear camera"
+            2 -> if (index == 0) "Wide rear camera (estimated)" else "Zoom rear camera (estimated)"
+            else -> when (index) {
+                0 -> "Ultra-wide rear camera (estimated)"
+                count - 1 -> "Zoom rear camera (estimated)"
+                else -> "Wide rear camera (estimated)"
+            }
+        }
+
+    private fun horizontalFieldOfViewDegrees(
+        characteristics: CameraCharacteristics,
+    ): Double? {
+        val sensorSize = characteristics.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+            ?: return null
+        val focalLength = characteristics
+            .get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+            ?.minOrNull()
+            ?: return null
+        if (sensorSize.width <= 0f || focalLength <= 0f) return null
+        return 2.0 * atan(sensorSize.width / (2.0 * focalLength)) * 180.0 / PI
+    }
+
+    private fun zoomRange(characteristics: CameraCharacteristics): Pair<Float, Float> {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.let {
+                return it.lower to it.upper
+            }
+        }
+        return 1f to (
+            characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
+        )
     }
 
     fun getSupportedResolutions(): List<CameraResolution> {

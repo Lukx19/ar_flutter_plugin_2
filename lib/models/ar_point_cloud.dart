@@ -47,10 +47,20 @@ class ARVoxelRenderPatch {
     required Int64List keys,
     required Float32List positionsWorld,
     required Int32List colors,
+    Float32List? gridRotationWorld,
   })  : keys = Int64List.fromList(keys),
         positionsWorld = Float32List.fromList(positionsWorld),
-        colors = Int32List.fromList(colors) {
-    _validatePatch(epoch, this.keys, this.positionsWorld, this.colors);
+        colors = Int32List.fromList(colors),
+        gridRotationWorld = Float32List.fromList(
+          gridRotationWorld ?? _identityGridRotation,
+        ) {
+    _validatePatch(
+      epoch,
+      this.keys,
+      this.positionsWorld,
+      this.colors,
+      this.gridRotationWorld,
+    );
   }
 
   ARVoxelRenderPatch.owned({
@@ -58,8 +68,10 @@ class ARVoxelRenderPatch {
     required this.keys,
     required this.positionsWorld,
     required this.colors,
-  }) {
-    _validatePatch(epoch, keys, positionsWorld, colors);
+    Float32List? gridRotationWorld,
+  }) : gridRotationWorld =
+            gridRotationWorld ?? Float32List.fromList(_identityGridRotation) {
+    _validatePatch(epoch, keys, positionsWorld, colors, this.gridRotationWorld);
   }
 
   static void _validatePatch(
@@ -67,10 +79,13 @@ class ARVoxelRenderPatch {
     Int64List keys,
     Float32List positionsWorld,
     Int32List colors,
+    Float32List gridRotationWorld,
   ) {
     if (epoch < 0 ||
         keys.length != colors.length ||
-        positionsWorld.length != keys.length * 3) {
+        positionsWorld.length != keys.length * 3 ||
+        gridRotationWorld.length != 9 ||
+        gridRotationWorld.any((value) => !value.isFinite)) {
       throw ArgumentError('Invalid voxel render patch.');
     }
   }
@@ -79,14 +94,28 @@ class ARVoxelRenderPatch {
   final Int64List keys;
   final Float32List positionsWorld;
   final Int32List colors;
+  final Float32List gridRotationWorld;
 
   Map<String, Object> toMap() => <String, Object>{
         'epoch': epoch,
         'keys': keys,
         'positionsWorld': positionsWorld,
         'colors': colors,
+        'gridRotationWorld': gridRotationWorld,
       };
 }
+
+const List<double> _identityGridRotation = <double>[
+  1,
+  0,
+  0,
+  0,
+  1,
+  0,
+  0,
+  0,
+  1,
+];
 
 class ARPointCloudNativeConfig {
   const ARPointCloudNativeConfig({
@@ -101,6 +130,7 @@ class ARPointCloudNativeConfig {
     this.syntheticSource = false,
     this.voxelRenderMode = 'points',
     this.voxelSizeMeters = 0.1,
+    this.cubeSizeFactor = 1.0,
   });
 
   final String wireVersion;
@@ -114,6 +144,7 @@ class ARPointCloudNativeConfig {
   final bool syntheticSource;
   final String voxelRenderMode;
   final double voxelSizeMeters;
+  final double cubeSizeFactor;
 
   Map<String, Object> toMap() => <String, Object>{
         'version': wireVersion,
@@ -127,6 +158,7 @@ class ARPointCloudNativeConfig {
         'syntheticSource': syntheticSource,
         'voxelRenderMode': voxelRenderMode,
         'voxelSizeMeters': voxelSizeMeters,
+        'cubeSizeFactor': cubeSizeFactor,
       };
 }
 

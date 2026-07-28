@@ -18,6 +18,7 @@ internal data class PendingStillResultMetadata(
     val cropRegion: Rect? = null,
     val receivedAtMs: Long,
     val observedTimestampNs: Long? = null,
+    val bracketIndex: Int = 0,
 )
 
 internal data class CorrelatedStillCapture(
@@ -89,6 +90,7 @@ internal class PendingStillCaptureCorrelator(
         rollingShutterSkewNs: Long,
         cropRegion: Rect? = null,
         observedTimestampNs: Long? = null,
+        bracketIndex: Int = 0,
     ): CorrelatedStillCapture? {
         cleanupExpired()
         if (
@@ -111,7 +113,8 @@ internal class PendingStillCaptureCorrelator(
                         rollingShutterSkewNs = rollingShutterSkewNs,
                         cropRegion = cropRegion,
                         receivedAtMs = clockMs(),
-                        observedTimestampNs = observedTimestampNs,
+                    observedTimestampNs = observedTimestampNs,
+                    bracketIndex = bracketIndex,
                     ),
             )
         }
@@ -126,6 +129,7 @@ internal class PendingStillCaptureCorrelator(
                 cropRegion = cropRegion,
                 receivedAtMs = clockMs(),
                 observedTimestampNs = observedTimestampNs,
+                bracketIndex = bracketIndex,
             ),
         )
         trimPendingMap(pendingResultsByTimestampNs)

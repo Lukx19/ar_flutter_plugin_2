@@ -50,6 +50,7 @@ internal class ArView(
     messenger: BinaryMessenger,
     id: Int,
     initialSessionFeatures: Set<Session.Feature> = emptySet(),
+    requestedRearCameraId: String? = null,
 ) : PlatformView {
     private val root = FrameLayout(context)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -70,6 +71,7 @@ internal class ArView(
     private var sessionPausedByFlutter = false
     private var shutdownPrepared = false
     private var disposed = false
+    private var coverageRendererMounted = false
     private val pendingCloudOperations = mutableSetOf<() -> Unit>()
 
     private val sceneHost = SceneViewHost(
@@ -77,6 +79,7 @@ internal class ArView(
         activity = activity,
         lifecycle = lifecycle,
         sessionFeatures = initialSessionFeatures,
+        requestedRearCameraId = requestedRearCameraId,
         onSessionUpdated = ::onFrame,
         onTrackingFailureChanged = { failure ->
             sessionChannel.invokeMethod("onTrackingFailure", failure)
@@ -93,7 +96,12 @@ internal class ArView(
             viewId = id,
             isDebuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0,
             onRendererStateChanged = sceneHost::updateCoverageRenderer,
+            onRawPointCloudChanged = sceneHost::updateRawPointCloud,
         )
+        // SceneView composition can mount its retained coverage nodes before
+        // this channel has finished construction. Replay that state so native
+        // readiness cannot remain false while the renderer is already live.
+        pointCloudChannel.setRendererMounted(coverageRendererMounted)
     }
 
     private val captureSession = ArCaptureSession(
@@ -120,6 +128,7 @@ internal class ArView(
     )
 
     private fun setCoverageRendererMounted(mounted: Boolean) {
+        coverageRendererMounted = mounted
         if (::pointCloudChannel.isInitialized) {
             pointCloudChannel.setRendererMounted(mounted)
         }
@@ -447,7 +456,12 @@ internal class ArView(
                         val requiresPose = args?.get("requiresPose") as? Boolean ?: true
                         result.success(
                             withContext(Dispatchers.Default) {
-                                captureSession.captureImage(policy, requiresPose)
+                                captureSession.captureImage(
+                                    qualityPolicyMap = policy,
+                                    requiresPose = requiresPose,
+                                    exposureBracketEnabled =
+                                        call.argument<Boolean>("exposureBracketEnabled") ?: false,
+                                )
                             },
                         )
                     } catch (error: CaptureSessionException) {

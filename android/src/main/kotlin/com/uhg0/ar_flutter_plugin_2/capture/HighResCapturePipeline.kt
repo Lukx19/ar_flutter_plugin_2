@@ -175,6 +175,14 @@ internal class HighResCapturePipeline(
                             sharedResult.format,
                         ),
                     )
+                    sharedResult.exposureBracketMembers
+                        .filter { member -> member.assetName != sharedResult.primaryAssetName }
+                        .forEach { member ->
+                            assets[member.assetName] = CachedImageAsset(
+                                member.imageBytes,
+                                android.graphics.ImageFormat.JPEG,
+                            )
+                        }
                     val rawDngEncodingStartedAtNs = System.nanoTime()
                     sharedResult.rawDngEncoder?.invoke()?.let { dngBytes ->
                         assets["dng"] = CachedImageAsset(
@@ -262,14 +270,30 @@ internal class HighResCapturePipeline(
             "formats" to if (sharedResult.rawDngEncoder == null) listOf(sharedResult.primaryAssetName) else listOf("dng", sharedResult.primaryAssetName),
             "captureTimestampMs" to sharedResult.captureTimestampMs,
             "imageSizeBytes" to assets.values.sumOf { it.bytes.size },
-            "imageSizeBytesByFormat" to assets.mapValues { it.value.bytes.size },
+            "imageSizeBytesByFormat" to mapOf(
+                "jpeg" to assets.values.sumOf { it.bytes.size },
+            ),
             "isHighResolution" to true,
             "exposureStartTimestampNs" to sharedResult.sensorTimestampNs,
             "exposureTimeNs" to sharedResult.exposureTimeNs,
             "rollingShutterSkewNs" to sharedResult.rollingShutterSkewNs,
             "intrinsics" to sharedResult.intrinsics,
             "filePath" to null,
-        )
+        ) + if (sharedResult.exposureBracketMembers.isNotEmpty()) {
+            mapOf(
+                "exposureBracket" to sharedResult.exposureBracketMembers.map { member ->
+                    mapOf(
+                        "exposureEv" to member.exposureEv,
+                        "sensorTimestampNs" to member.sensorTimestampNs,
+                        "exposureTimeNs" to member.exposureTimeNs,
+                        "rollingShutterSkewNs" to member.rollingShutterSkewNs,
+                        "imageSizeBytes" to member.imageBytes.size,
+                    )
+                },
+            )
+        } else {
+            emptyMap()
+        }
 
     private fun Any?.asBoolean(): Boolean = this as? Boolean ?: false
 }

@@ -33,7 +33,8 @@ abstract class PlatformARView {
       {@required BuildContext context,
       @required ARViewCreatedCallback arViewCreatedCallback,
       @required PlaneDetectionConfig planeDetectionConfig,
-      ARCaptureConfig? captureConfig});
+      ARCaptureConfig? captureConfig,
+      String? rearCameraId});
 
   /// Callback function that is executed once the view is established
   void onPlatformViewCreated(int id);
@@ -79,7 +80,8 @@ class AndroidARView implements PlatformARView {
       {BuildContext? context,
       ARViewCreatedCallback? arViewCreatedCallback,
       PlaneDetectionConfig? planeDetectionConfig,
-      ARCaptureConfig? captureConfig}) {
+      ARCaptureConfig? captureConfig,
+      String? rearCameraId}) {
     _context = context;
     _arViewCreatedCallback = arViewCreatedCallback;
     _planeDetectionConfig = planeDetectionConfig;
@@ -92,11 +94,12 @@ class AndroidARView implements PlatformARView {
       // creation-time value in sync with the Android view key below so a mode
       // change disposes the entire platform view and starts a new AR session.
       'enableHighResCapture': captureConfig?.enableHighResCapture ?? false,
+      'rearCameraId': rearCameraId,
     };
 
     return PlatformViewLink(
-      key: ValueKey<bool>(
-        captureConfig?.enableHighResCapture ?? false,
+      key: ValueKey<(bool, String?)>(
+        (captureConfig?.enableHighResCapture ?? false, rearCameraId),
       ),
       viewType: viewType,
       surfaceFactory: (context, controller) => AndroidViewSurface(
@@ -141,7 +144,8 @@ class IosARView implements PlatformARView {
       {BuildContext? context,
       ARViewCreatedCallback? arViewCreatedCallback,
       PlaneDetectionConfig? planeDetectionConfig,
-      ARCaptureConfig? captureConfig}) {
+      ARCaptureConfig? captureConfig,
+      String? rearCameraId}) {
     _context = context;
     _arViewCreatedCallback = arViewCreatedCallback;
     _planeDetectionConfig = planeDetectionConfig;
@@ -181,6 +185,11 @@ class ARView extends StatefulWidget {
   /// Optional capture configuration for direct configuration pattern
   final ARCaptureConfig? captureConfig;
 
+  /// An ARCore-advertised rear Camera2 ID to use when creating the session.
+  /// Changes rebuild the native platform view; an active AR session cannot
+  /// safely hot-swap cameras.
+  final String? rearCameraId;
+
   /// Configures whether or not to display the device's platform type above the AR view. Defaults to false
   final bool showPlatformType;
 
@@ -189,6 +198,7 @@ class ARView extends StatefulWidget {
       required this.onARViewCreated,
       this.planeDetectionConfig = PlaneDetectionConfig.none,
       this.captureConfig,
+      this.rearCameraId,
       this.showPlatformType = false,
       this.permissionPromptDescription =
           "Camera permission must be given to the app for AR functions to work",
@@ -259,7 +269,8 @@ class _ARViewState extends State<ARView> {
                     context: context,
                     arViewCreatedCallback: widget.onARViewCreated,
                     planeDetectionConfig: widget.planeDetectionConfig,
-                    captureConfig: widget.captureConfig)),
+                    captureConfig: widget.captureConfig,
+                    rearCameraId: widget.rearCameraId)),
           ]);
         }
       case (PermissionStatus.denied):

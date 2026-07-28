@@ -67,7 +67,10 @@ void main() {
   test('uses pointcloud_wire_v4 methods and typed voxel payloads', () async {
     final manager = ARPointCloudManager(77);
     final initialized = await manager.initialize(
-      const ARPointCloudNativeConfig(syntheticSource: true),
+      const ARPointCloudNativeConfig(
+        syntheticSource: true,
+        cubeSizeFactor: 0.5,
+      ),
     );
     expect(initialized.rendererReady, isTrue);
     expect(initialized.acquisitionReady, isTrue);
@@ -83,6 +86,7 @@ void main() {
       isTrue,
     );
     await manager.setPointsEnabled(false);
+    await manager.setVoxelRenderMode('centroids');
     await manager.setVoxelRenderMode('cubes');
     expect((await manager.getRenderingStats()).livePointCount, 4);
     await manager.clear();
@@ -95,6 +99,7 @@ void main() {
         'updateVoxels',
         'setPointsEnabled',
         'setVoxelRenderMode',
+        'setVoxelRenderMode',
         'getRenderingStats',
         'clear',
         'dispose',
@@ -102,6 +107,9 @@ void main() {
     );
     final voxelArguments =
         Map<Object?, Object?>.from(calls[1].arguments as Map);
+    final initArguments =
+        Map<Object?, Object?>.from(calls.first.arguments as Map);
+    expect(initArguments['cubeSizeFactor'], 0.5);
     expect(voxelArguments['keys'], isA<Int64List>());
     expect(voxelArguments['positionsWorld'], isA<Float32List>());
     expect(voxelArguments['colors'], isA<Int32List>());

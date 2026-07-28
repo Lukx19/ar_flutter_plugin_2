@@ -20,6 +20,10 @@ class ARCaptureResult {
   final ARCameraIntrinsics? intrinsics;
   final String? filePath;
 
+  /// The three source frames in an app-owned HDR exposure bracket. The
+  /// logical capture still has one [imageId] and one AR pose.
+  final List<Map<String, dynamic>> exposureBracket;
+
   const ARCaptureResult({
     required this.imageId,
     required this.pose,
@@ -35,6 +39,7 @@ class ARCaptureResult {
     this.rollingShutterSkewNs,
     this.intrinsics,
     this.filePath,
+    this.exposureBracket = const <Map<String, dynamic>>[],
   });
 
   factory ARCaptureResult.fromMap(Map<String, dynamic> map) {
@@ -68,6 +73,12 @@ class ARCaptureResult {
               map['intrinsics'] as Map<String, dynamic>)
           : null,
       filePath: map['filePath'] as String?,
+      exposureBracket: ((map['exposureBracket'] as List<dynamic>?) ?? const [])
+          .whereType<Map>()
+          .map(
+            (member) => Map<String, dynamic>.from(member),
+          )
+          .toList(growable: false),
     );
   }
 
@@ -77,7 +88,8 @@ class ARCaptureResult {
       'pose': pose.toMap(),
       'resolution': resolution.toMap(),
       'format': format.wireValue,
-      'formats': formats.map((value) => value.wireValue).toList(growable: false),
+      'formats':
+          formats.map((value) => value.wireValue).toList(growable: false),
       'imageSizeBytesByFormat': imageSizeBytesByFormat.map(
         (key, value) => MapEntry(key.wireValue, value),
       ),
@@ -91,6 +103,7 @@ class ARCaptureResult {
         'rollingShutterSkewNs': rollingShutterSkewNs,
       if (intrinsics != null) 'intrinsics': intrinsics!.toMap(),
       'filePath': filePath,
+      if (exposureBracket.isNotEmpty) 'exposureBracket': exposureBracket,
     };
   }
 
@@ -120,7 +133,8 @@ class ARCaptureResult {
         other.exposureTimeNs == exposureTimeNs &&
         other.rollingShutterSkewNs == rollingShutterSkewNs &&
         other.intrinsics == intrinsics &&
-        other.filePath == filePath;
+        other.filePath == filePath &&
+        _mapListEquals(other.exposureBracket, exposureBracket);
   }
 
   @override
@@ -138,7 +152,12 @@ class ARCaptureResult {
       exposureTimeNs.hashCode ^
       rollingShutterSkewNs.hashCode ^
       intrinsics.hashCode ^
-      filePath.hashCode;
+      filePath.hashCode ^
+      Object.hashAll(
+        exposureBracket.map(
+          (member) => Object.hashAllUnordered(member.entries),
+        ),
+      );
 
   @override
   String toString() => 'ARCaptureResult(id: $imageId, res: $resolution, '
@@ -156,4 +175,15 @@ bool _listEquals<T>(List<T> left, List<T> right) {
 bool _mapEquals<K, V>(Map<K, V> left, Map<K, V> right) {
   if (left.length != right.length) return false;
   return left.entries.every((entry) => right[entry.key] == entry.value);
+}
+
+bool _mapListEquals(
+  List<Map<String, dynamic>> left,
+  List<Map<String, dynamic>> right,
+) {
+  if (left.length != right.length) return false;
+  for (var index = 0; index < left.length; index++) {
+    if (!_mapEquals(left[index], right[index])) return false;
+  }
+  return true;
 }

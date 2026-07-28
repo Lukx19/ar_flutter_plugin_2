@@ -50,6 +50,25 @@ class ARCameraCapabilities {
     );
   }
 
+  /// Enumerates rear cameras that ARCore itself permits for a new session.
+  ///
+  /// This expensive Android-only probe must only be called while no AR view is
+  /// active; it is intentionally exposed for the Settings route rather than
+  /// included in the background capability profile.
+  Future<List<RearCameraOption>> getSelectableRearCameras() async {
+    if (!isSupported) return const [];
+    final result = await _channel.invokeListMethod<dynamic>(
+      'getSelectableRearCameras',
+    );
+    return (result ?? const [])
+        .map(
+          (value) => RearCameraOption.fromMap(
+            Map<String, dynamic>.from(value as Map),
+          ),
+        )
+        .toList(growable: false);
+  }
+
   Future<void> saveSharedCameraUnsupported(String reason) async {
     if (!isSupported) return;
     await _channel.invokeMethod<void>(
@@ -463,6 +482,7 @@ class DeviceCameraCapabilityProfile {
     required this.logicalMultiCamera,
     required this.concurrentCameraIdSets,
     required this.rearConcurrentCameraIds,
+    required this.selectableRearCameras,
     required this.cached,
   });
 
@@ -484,6 +504,7 @@ class DeviceCameraCapabilityProfile {
         logicalMultiCamera = false,
         concurrentCameraIdSets = const [],
         rearConcurrentCameraIds = const [],
+        selectableRearCameras = const [],
         cached = false;
 
   factory DeviceCameraCapabilityProfile.fromMap(Map<String, dynamic> map) {
@@ -522,6 +543,14 @@ class DeviceCameraCapabilityProfile {
               .toList(growable: false),
       rearConcurrentCameraIds: List<String>.from(
           map['rearConcurrentCameraIds'] as List? ?? const []),
+      selectableRearCameras:
+          (map['selectableRearCameras'] as List<dynamic>? ?? const [])
+              .map(
+                (value) => RearCameraOption.fromMap(
+                  Map<String, dynamic>.from(value as Map),
+                ),
+              )
+              .toList(growable: false),
       cached: map['cached'] as bool? ?? false,
     );
   }
@@ -543,6 +572,10 @@ class DeviceCameraCapabilityProfile {
   final bool logicalMultiCamera;
   final List<List<String>> concurrentCameraIdSets;
   final List<String> rearConcurrentCameraIds;
+
+  /// Rear cameras that ARCore, rather than Camera2 alone, permits this app to
+  /// use for an AR session. Lens labels are field-of-view estimates.
+  final List<RearCameraOption> selectableRearCameras;
   final bool cached;
 
   bool get rearConcurrentCamera => rearConcurrentCameraIds.isNotEmpty;
@@ -553,6 +586,37 @@ class DeviceCameraCapabilityProfile {
 
   bool get isCurrentPreset =>
       presetVersion == ARCameraCapabilities.capabilityPresetVersion;
+}
+
+/// An ARCore-supported rear camera that may be selected before an AR session
+/// is created. Android does not provide a human lens name, so [lensLabel] is
+/// inferred from relative fields of view and must not be treated as vendor
+/// branding.
+class RearCameraOption {
+  const RearCameraOption({
+    required this.cameraId,
+    required this.lensLabel,
+    required this.fieldOfViewDegrees,
+    required this.minimumZoom,
+    required this.maximumZoom,
+  });
+
+  factory RearCameraOption.fromMap(Map<String, dynamic> map) =>
+      RearCameraOption(
+        cameraId: map['cameraId'] as String? ?? '',
+        lensLabel: map['lensLabel'] as String? ?? 'Rear camera',
+        fieldOfViewDegrees: (map['fieldOfViewDegrees'] as num?)?.toDouble(),
+        minimumZoom: (map['minimumZoom'] as num?)?.toDouble() ?? 1,
+        maximumZoom: (map['maximumZoom'] as num?)?.toDouble() ?? 1,
+      );
+
+  final String cameraId;
+  final String lensLabel;
+  final double? fieldOfViewDegrees;
+  final double minimumZoom;
+  final double maximumZoom;
+
+  bool get supportsZoom => maximumZoom > minimumZoom;
 }
 
 class ARCoreAvailability {

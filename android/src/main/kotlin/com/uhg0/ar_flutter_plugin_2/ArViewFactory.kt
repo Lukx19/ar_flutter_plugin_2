@@ -19,6 +19,7 @@ class ArViewFactory(
         val creationParams = args as? Map<*, *>
         val enableHighResCapture =
             creationParams?.get("enableHighResCapture") as? Boolean ?: false
+        val requestedRearCameraId = creationParams?.get("rearCameraId") as? String
         val initialSessionFeatures =
             if (enableHighResCapture) setOf(Session.Feature.SHARED_CAMERA) else emptySet()
 
@@ -29,6 +30,7 @@ class ArViewFactory(
             messenger = messenger,
             id = viewId,
             initialSessionFeatures = initialSessionFeatures,
+            requestedRearCameraId = requestedRearCameraId,
         )
     }
 }

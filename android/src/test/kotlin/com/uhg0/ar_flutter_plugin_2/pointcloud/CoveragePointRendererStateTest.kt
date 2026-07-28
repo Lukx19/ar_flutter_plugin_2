@@ -10,6 +10,72 @@ import org.junit.Test
 
 class CoveragePointRendererStateTest {
     @Test
+    fun `raw ARCore samples become bounded red point snapshots`() {
+        val snapshot = PointCloudSample(
+            sequence = 7,
+            timestampNs = 9,
+            ids = intArrayOf(41, 42, 43),
+            points = floatArrayOf(
+                1f, 2f, 3f, 0.9f,
+                4f, 5f, 6f, 0.8f,
+                7f, 8f, 9f, 0.7f,
+            ),
+        ).toRawPointRenderSnapshot(
+            capacity = 2,
+            color = 0xFFFF0000.toInt(),
+            enabled = true,
+        )
+
+        assertEquals(7, snapshot.revision)
+        assertEquals(2, snapshot.count)
+        assertArrayEquals(longArrayOf(41, 42), snapshot.keys)
+        assertArrayEquals(floatArrayOf(1f, 2f, 3f, 4f, 5f, 6f), snapshot.positions, 0f)
+        assertArrayEquals(
+            intArrayOf(0xFFFF0000.toInt(), 0xFFFF0000.toInt()),
+            snapshot.colors,
+        )
+    }
+
+    @Test
+    fun `raw points and both visibility grid modes select exclusive layers`() {
+        assertEquals(
+            CoverageVisualizationLayers(
+                rawPointCloud = true,
+                visibilityGridCentroids = false,
+                visibilityGridCubes = false,
+            ),
+            config(capacity = 2).copy(voxelRenderMode = VoxelRenderMode.POINTS)
+                .visualizationLayers(),
+        )
+        assertEquals(
+            CoverageVisualizationLayers(
+                rawPointCloud = false,
+                visibilityGridCentroids = true,
+                visibilityGridCubes = false,
+            ),
+            config(capacity = 2).copy(voxelRenderMode = VoxelRenderMode.CENTROIDS)
+                .visualizationLayers(),
+        )
+        assertEquals(
+            CoverageVisualizationLayers(
+                rawPointCloud = false,
+                visibilityGridCentroids = false,
+                visibilityGridCubes = true,
+            ),
+            config(capacity = 2).copy(voxelRenderMode = VoxelRenderMode.CUBES)
+                .visualizationLayers(),
+        )
+        assertEquals(
+            CoverageVisualizationLayers(
+                rawPointCloud = false,
+                visibilityGridCentroids = false,
+                visibilityGridCubes = false,
+            ),
+            config(capacity = 2).copy(enabled = false).visualizationLayers(),
+        )
+    }
+
+    @Test
     fun `voxel keys upsert stable centroid rows without expiry`() {
         val state = CoveragePointRendererState(config(capacity = 2))
         assertTrue(state.updateVoxels(1, longArrayOf(11), positions(1f), colors(1)))
@@ -20,6 +86,26 @@ class CoveragePointRendererStateTest {
         assertArrayEquals(longArrayOf(11, 22), snapshot.keys)
         assertArrayEquals(floatArrayOf(2f, 1f, -1f, 3f, 1f, -1f), snapshot.positions, 0f)
         assertEquals(2, state.stats().emittedFrames)
+    }
+
+    @Test
+    fun `visibility grid rotation is retained with voxel snapshots`() {
+        val state = CoveragePointRendererState(config(capacity = 1))
+        val rotation = floatArrayOf(
+            0f, 1f, 0f,
+            -1f, 0f, 0f,
+            0f, 0f, 1f,
+        )
+
+        state.updateVoxels(
+            1,
+            longArrayOf(11),
+            positions(1f),
+            colors(1),
+            rotation,
+        )
+
+        assertArrayEquals(rotation, state.snapshot().gridRotationWorld, 0f)
     }
 
     @Test
