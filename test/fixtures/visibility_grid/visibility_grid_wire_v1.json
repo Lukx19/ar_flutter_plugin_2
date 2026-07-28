@@ -132,6 +132,7 @@
       "separatedDirectionBinsRequired": 2,
       "freeEvidenceToCarve": 8,
       "occupiedEvidenceToRestore": 4,
+      "initialFeatureSupport": 1,
       "evidenceSteps": [
         {"occupied": 0, "free": 4, "directionBins": [0], "expectedState": "occupied"},
         {"occupied": 0, "free": 8, "directionBins": [0, 2], "expectedState": "contradicted"},
@@ -210,6 +211,7 @@
         "removalKeys": ["4611692615498203136"]
       },
       "gapDelta": {
+        "receiverGeometryRevision": 5,
         "baseGeometryRevision": 7,
         "geometryRevision": 8,
         "reset": false

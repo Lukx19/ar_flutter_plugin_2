@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:ar_flutter_plugin_2/models/ar_visibility_grid.dart';
@@ -554,31 +555,45 @@ void main() {
     expect(carving['singleViewRemovesOccupied'], isFalse);
     expect(carving['separatedDirectionBinsRequired'], 2);
     expect(
+      _referenceCarvingStates(carving),
       (carving['evidenceSteps'] as List<dynamic>)
-          .map((step) => _map(step)['expectedState']),
-      <String>['occupied', 'contradicted', 'restored'],
+          .map((step) => _map(step)['expectedState'])
+          .toList(),
+    );
+    expect(
+      _referenceFreeKeys(carving).map((key) => key.toString()).toList(),
+      (carving['freeKeysBeforeSafetyBand'] as List<dynamic>).cast<String>(),
     );
 
     final movement = scenarios.firstWhere(
       (scenario) => scenario['name'] == 'persistent_id_relocation',
     );
-    expect(
-      (_map(movement['jumpObservation'])['expectedContributedVoxels']),
-      0,
+    final featureResult = _referenceFeatureStates(
+      movement,
+      _map(fixture['defaults']),
     );
     expect(
+      featureResult.states,
       (movement['observations'] as List<dynamic>)
-          .map((observation) => _map(observation)['expectedState']),
-      <String>[
-        'candidate',
-        'candidate',
-        'candidate',
-        'candidate',
-        'stable',
-        'stable',
-        'relocated',
-      ],
+          .map((observation) => _map(observation)['expectedState'])
+          .toList(),
     );
+    expect(featureResult.promotedKey.toString(), movement['promotedKey']);
+    expect(featureResult.relocatedKey.toString(), movement['relocatedKey']);
+    final jump = _map(movement['jumpObservation']);
+    expect(featureResult.jumpState, jump['expectedState']);
+    expect(featureResult.jumpRemovedKey.toString(), jump['expectedRemovedKey']);
+    expect(
+        featureResult.jumpContributedVoxels, jump['expectedContributedVoxels']);
+
+    final sharedSupport = scenarios.firstWhere(
+      (scenario) => scenario['name'] == 'shared_feature_support',
+    );
+    final featureIds = (sharedSupport['featureIds'] as List<dynamic>).toSet();
+    expect(featureIds.length, sharedSupport['supportAfterPromotion']);
+    featureIds.remove(sharedSupport['removedFeatureId']);
+    expect(featureIds.length, sharedSupport['supportAfterRemoval']);
+    expect(featureIds.isNotEmpty, sharedSupport['voxelRemainsOccupied']);
 
     final ios = scenarios.firstWhere(
       (scenario) =>
@@ -629,6 +644,32 @@ void main() {
       iosResources['confidenceBuffersReleased'],
       iosResources['confidenceBuffersRetained'],
     );
+
+    final revisions = scenarios.firstWhere(
+      (scenario) => scenario['name'] == 'geometry_revision_and_resync',
+    );
+    final ordered = _map(revisions['orderedDelta']);
+    expect(
+      ordered['geometryRevision'],
+      (ordered['baseGeometryRevision'] as int) + 1,
+    );
+    final gap = _map(revisions['gapDelta']);
+    expect(
+      gap['baseGeometryRevision'],
+      isNot(gap['receiverGeometryRevision']),
+    );
+    expect(
+      gap['geometryRevision'],
+      (gap['baseGeometryRevision'] as int) + 1,
+    );
+    expect(revisions['expectedGapAction'], 'requestSnapshot');
+    final snapshot = _map(revisions['snapshot']);
+    expect(snapshot['reset'], isTrue);
+    expect(snapshot['geometryRevision'], gap['geometryRevision']);
+    expect(
+      revisions['acknowledgedGeometryRevision'],
+      snapshot['geometryRevision'],
+    );
   });
 }
 
@@ -661,4 +702,172 @@ void _expectClose(List<double> actual, List<double> expected) {
   for (var index = 0; index < expected.length; index++) {
     expect(actual[index], closeTo(expected[index], 1e-9));
   }
+}
+
+class _FeatureReferenceResult {
+  const _FeatureReferenceResult({
+    required this.states,
+    required this.promotedKey,
+    required this.relocatedKey,
+    required this.jumpState,
+    required this.jumpRemovedKey,
+    required this.jumpContributedVoxels,
+  });
+
+  final List<String> states;
+  final int promotedKey;
+  final int relocatedKey;
+  final String jumpState;
+  final int jumpRemovedKey;
+  final int jumpContributedVoxels;
+}
+
+_FeatureReferenceResult _referenceFeatureStates(
+  Map<String, dynamic> fixture,
+  Map<String, dynamic> defaults,
+) {
+  final voxelSize = (defaults['voxelSizeMeters'] as num).toDouble();
+  final requiredSamples = defaults['candidateSamples'] as int;
+  final requiredSpan = defaults['candidateSpanNs'] as int;
+  final maxStdDev = (defaults['candidateMaxStdDevMeters'] as num).toDouble();
+  final hysteresis = (defaults['relocationHysteresisMeters'] as num).toDouble();
+  final jumpThreshold = (defaults['jumpResetMeters'] as num).toDouble();
+  final samples = <List<double>>[];
+  final states = <String>[];
+  List<double>? filtered;
+  int? firstTimestamp;
+  List<int>? stableCoordinates;
+  int? promotedKey;
+  int? relocatedKey;
+
+  for (final value in fixture['observations'] as List<dynamic>) {
+    final observation = _map(value);
+    final position = _doubleList(observation['positionGroup']);
+    final timestamp = observation['timestampNs'] as int;
+    final confidence = (observation['confidence'] as num).toDouble();
+    if (filtered == null) {
+      filtered = List<double>.from(position);
+    } else {
+      final alpha = (0.15 + 0.35 * confidence).clamp(0.15, 0.50);
+      final previous = filtered;
+      filtered = List<double>.generate(
+        3,
+        (index) =>
+            previous[index] + alpha * (position[index] - previous[index]),
+      );
+    }
+
+    if (stableCoordinates == null) {
+      firstTimestamp ??= timestamp;
+      samples.add(position);
+      final stableEnough = samples.length >= requiredSamples &&
+          timestamp - firstTimestamp >= requiredSpan &&
+          List<int>.generate(3, (index) => index).every((axis) {
+            final mean =
+                samples.map((sample) => sample[axis]).reduce((a, b) => a + b) /
+                    samples.length;
+            final variance = samples
+                    .map((sample) => math.pow(sample[axis] - mean, 2))
+                    .reduce((a, b) => a + b) /
+                samples.length;
+            return math.sqrt(variance) <= maxStdDev;
+          });
+      if (stableEnough) {
+        stableCoordinates = filtered
+            .map((coordinate) => (coordinate / voxelSize).floor())
+            .toList();
+        promotedKey = _packKey(stableCoordinates);
+        states.add('stable');
+      } else {
+        states.add('candidate');
+      }
+      continue;
+    }
+
+    final nextCoordinates = List<int>.from(stableCoordinates);
+    for (var axis = 0; axis < 3; axis++) {
+      final lower = stableCoordinates[axis] * voxelSize - hysteresis;
+      final upper = (stableCoordinates[axis] + 1) * voxelSize + hysteresis;
+      if (filtered[axis] < lower || filtered[axis] >= upper) {
+        nextCoordinates[axis] = (filtered[axis] / voxelSize).floor();
+      }
+    }
+    if (_packKey(nextCoordinates) != _packKey(stableCoordinates)) {
+      stableCoordinates = nextCoordinates;
+      relocatedKey = _packKey(stableCoordinates);
+      states.add('relocated');
+    } else {
+      states.add('stable');
+    }
+  }
+
+  final jump = _map(fixture['jumpObservation']);
+  final jumpPosition = _doubleList(jump['positionGroup']);
+  final jumpDistance = math.sqrt(
+    List<int>.generate(
+      3,
+      (index) => index,
+    ).map((axis) => math.pow(jumpPosition[axis] - filtered![axis], 2)).reduce(
+          (a, b) => a + b,
+        ),
+  );
+  final removedKey = _packKey(stableCoordinates!);
+  return _FeatureReferenceResult(
+    states: states,
+    promotedKey: promotedKey!,
+    relocatedKey: relocatedKey!,
+    jumpState: jumpDistance >= jumpThreshold ? 'candidate' : 'stable',
+    jumpRemovedKey: removedKey,
+    jumpContributedVoxels: jumpDistance >= jumpThreshold ? 0 : 1,
+  );
+}
+
+List<String> _referenceCarvingStates(Map<String, dynamic> fixture) {
+  final freeThreshold = fixture['freeEvidenceToCarve'] as int;
+  final occupiedRestore = fixture['occupiedEvidenceToRestore'] as int;
+  final requiredBins = fixture['separatedDirectionBinsRequired'] as int;
+  var contradicted = false;
+  return (fixture['evidenceSteps'] as List<dynamic>).map((value) {
+    final step = _map(value);
+    final occupied = step['occupied'] as int;
+    final free = step['free'] as int;
+    final bins = (step['directionBins'] as List<dynamic>).toSet().length;
+    if (contradicted && occupied >= occupiedRestore) {
+      contradicted = false;
+      return 'restored';
+    }
+    if (!contradicted &&
+        free >= freeThreshold &&
+        bins >= requiredBins &&
+        free >= occupied + 4) {
+      contradicted = true;
+      return 'contradicted';
+    }
+    return 'occupied';
+  }).toList();
+}
+
+List<int> _referenceFreeKeys(Map<String, dynamic> fixture) {
+  final start = _doubleList(fixture['cameraGroup']);
+  final end = _doubleList(fixture['surfaceGroup']);
+  final safety = (fixture['safetyBandMeters'] as num).toDouble();
+  const voxelSize = 0.1;
+  final delta = List<double>.generate(3, (index) => end[index] - start[index]);
+  final length =
+      math.sqrt(delta.map((value) => value * value).reduce((a, b) => a + b));
+  final direction = delta.map((value) => value / length).toList();
+  final keys = <int>[];
+  for (var distance = voxelSize;
+      distance <= length - safety + 1e-9;
+      distance += voxelSize) {
+    final point = List<double>.generate(
+      3,
+      (index) => start[index] + direction[index] * distance,
+    );
+    final coordinates =
+        point.map((coordinate) => (coordinate / voxelSize).floor()).toList();
+    final key = _packKey(coordinates);
+    if (keys.isEmpty || keys.last != key) keys.add(key);
+  }
+  return keys;
 }

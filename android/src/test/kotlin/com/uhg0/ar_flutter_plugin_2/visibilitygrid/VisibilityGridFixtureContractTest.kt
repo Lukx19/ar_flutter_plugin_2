@@ -111,10 +111,66 @@ class VisibilityGridFixtureContractTest {
             carving.getValue("separatedDirectionBinsRequired").jsonPrimitive.content.toInt(),
         )
         assertEquals(
-            listOf("occupied", "contradicted", "restored"),
+            referenceCarvingStates(carving),
             carving.getValue("evidenceSteps").jsonArray.map {
                 it.jsonObject.getValue("expectedState").jsonPrimitive.content
             },
+        )
+        assertEquals(
+            carving.getValue("freeKeysBeforeSafetyBand").jsonArray.map {
+                it.jsonPrimitive.content.toLong()
+            },
+            referenceFreeKeys(carving),
+        )
+
+        val movement =
+            scenarios.single {
+                it.getValue("name").jsonPrimitive.content == "persistent_id_relocation"
+            }
+        val featureResult =
+            referenceFeatureStates(
+                movement,
+                fixture.getValue("defaults").jsonObject,
+            )
+        assertEquals(
+            movement.getValue("observations").jsonArray.map {
+                it.jsonObject.getValue("expectedState").jsonPrimitive.content
+            },
+            featureResult.states,
+        )
+        assertEquals(
+            movement.getValue("promotedKey").jsonPrimitive.content.toLong(),
+            featureResult.promotedKey,
+        )
+        assertEquals(
+            movement.getValue("relocatedKey").jsonPrimitive.content.toLong(),
+            featureResult.relocatedKey,
+        )
+        val jump = movement.getValue("jumpObservation").jsonObject
+        assertEquals(jump.getValue("expectedState").jsonPrimitive.content, featureResult.jumpState)
+        assertEquals(
+            jump.getValue("expectedRemovedKey").jsonPrimitive.content.toLong(),
+            featureResult.jumpRemovedKey,
+        )
+        assertEquals(
+            jump.getValue("expectedContributedVoxels").jsonPrimitive.content.toInt(),
+            featureResult.jumpContributedVoxels,
+        )
+
+        val sharedSupport =
+            scenarios.single {
+                it.getValue("name").jsonPrimitive.content == "shared_feature_support"
+            }
+        val featureIds =
+            sharedSupport.getValue("featureIds").jsonArray
+                .map { it.jsonPrimitive.content }
+                .toMutableSet()
+        assertEquals(sharedSupport.int("supportAfterPromotion"), featureIds.size)
+        featureIds.remove(sharedSupport.getValue("removedFeatureId").jsonPrimitive.content)
+        assertEquals(sharedSupport.int("supportAfterRemoval"), featureIds.size)
+        assertEquals(
+            sharedSupport.getValue("voxelRemainsOccupied").jsonPrimitive.content.toBoolean(),
+            featureIds.isNotEmpty(),
         )
 
         val ios =
@@ -173,6 +229,27 @@ class VisibilityGridFixtureContractTest {
             iosResources.int("confidenceBuffersRetained"),
             iosResources.int("confidenceBuffersReleased"),
         )
+
+        val revisions =
+            scenarios.single {
+                it.getValue("name").jsonPrimitive.content == "geometry_revision_and_resync"
+            }
+        val ordered = revisions.getValue("orderedDelta").jsonObject
+        assertEquals(ordered.int("baseGeometryRevision") + 1, ordered.int("geometryRevision"))
+        val gap = revisions.getValue("gapDelta").jsonObject
+        assertTrue(gap.int("baseGeometryRevision") != gap.int("receiverGeometryRevision"))
+        assertEquals(gap.int("baseGeometryRevision") + 1, gap.int("geometryRevision"))
+        assertEquals(
+            "requestSnapshot",
+            revisions.getValue("expectedGapAction").jsonPrimitive.content,
+        )
+        val snapshot = revisions.getValue("snapshot").jsonObject
+        assertTrue(snapshot.getValue("reset").jsonPrimitive.content.toBoolean())
+        assertEquals(gap.int("geometryRevision"), snapshot.int("geometryRevision"))
+        assertEquals(
+            snapshot.int("geometryRevision"),
+            revisions.getValue("acknowledgedGeometryRevision").jsonPrimitive.content.toInt(),
+        )
     }
 
     private fun kotlinx.serialization.json.JsonElement.doubleList(): List<Double> =
@@ -211,5 +288,164 @@ class VisibilityGridFixtureContractTest {
         expected.indices.forEach { index ->
             assertEquals(expected[index], actual[index], 1e-9)
         }
+    }
+
+    private data class FeatureReferenceResult(
+        val states: List<String>,
+        val promotedKey: Long,
+        val relocatedKey: Long,
+        val jumpState: String,
+        val jumpRemovedKey: Long,
+        val jumpContributedVoxels: Int,
+    )
+
+    private fun referenceFeatureStates(
+        fixture: kotlinx.serialization.json.JsonObject,
+        defaults: kotlinx.serialization.json.JsonObject,
+    ): FeatureReferenceResult {
+        val voxelSize = defaults.double("voxelSizeMeters")
+        val requiredSamples = defaults.int("candidateSamples")
+        val requiredSpan = defaults.getValue("candidateSpanNs").jsonPrimitive.content.toLong()
+        val maxStdDev = defaults.double("candidateMaxStdDevMeters")
+        val hysteresis = defaults.double("relocationHysteresisMeters")
+        val jumpThreshold = defaults.double("jumpResetMeters")
+        val samples = mutableListOf<List<Double>>()
+        val states = mutableListOf<String>()
+        var filtered: List<Double>? = null
+        var firstTimestamp: Long? = null
+        var stableCoordinates: List<Int>? = null
+        var promotedKey: Long? = null
+        var relocatedKey: Long? = null
+
+        fixture.getValue("observations").jsonArray.forEach { value ->
+            val observation = value.jsonObject
+            val position = observation.getValue("positionGroup").doubleList()
+            val timestamp = observation.getValue("timestampNs").jsonPrimitive.content.toLong()
+            val confidence = observation.double("confidence")
+            filtered =
+                filtered?.let { previous ->
+                    val alpha = (0.15 + 0.35 * confidence).coerceIn(0.15, 0.50)
+                    List(3) { index ->
+                        previous[index] + alpha * (position[index] - previous[index])
+                    }
+                } ?: position
+
+            if (stableCoordinates == null) {
+                if (firstTimestamp == null) firstTimestamp = timestamp
+                samples += position
+                val stableEnough =
+                    samples.size >= requiredSamples &&
+                        timestamp - checkNotNull(firstTimestamp) >= requiredSpan &&
+                        (0 until 3).all { axis ->
+                            val mean = samples.sumOf { sample -> sample[axis] } / samples.size
+                            val variance =
+                                samples.sumOf { sample ->
+                                    val difference = sample[axis] - mean
+                                    difference * difference
+                                } / samples.size
+                            kotlin.math.sqrt(variance) <= maxStdDev
+                        }
+                if (stableEnough) {
+                    stableCoordinates =
+                        checkNotNull(filtered).map { coordinate ->
+                            kotlin.math.floor(coordinate / voxelSize).toInt()
+                        }
+                    promotedKey = packKey(checkNotNull(stableCoordinates))
+                    states += "stable"
+                } else {
+                    states += "candidate"
+                }
+                return@forEach
+            }
+
+            val current = checkNotNull(stableCoordinates)
+            val next = current.toMutableList()
+            (0 until 3).forEach { axis ->
+                val lower = current[axis] * voxelSize - hysteresis
+                val upper = (current[axis] + 1) * voxelSize + hysteresis
+                val coordinate = checkNotNull(filtered)[axis]
+                if (coordinate < lower || coordinate >= upper) {
+                    next[axis] = kotlin.math.floor(coordinate / voxelSize).toInt()
+                }
+            }
+            if (packKey(next) != packKey(current)) {
+                stableCoordinates = next
+                relocatedKey = packKey(next)
+                states += "relocated"
+            } else {
+                states += "stable"
+            }
+        }
+
+        val jump = fixture.getValue("jumpObservation").jsonObject
+        val jumpPosition = jump.getValue("positionGroup").doubleList()
+        val jumpDistance =
+            kotlin.math.sqrt(
+                (0 until 3).sumOf { axis ->
+                    val difference = jumpPosition[axis] - checkNotNull(filtered)[axis]
+                    difference * difference
+                },
+            )
+        val removedKey = packKey(checkNotNull(stableCoordinates))
+        return FeatureReferenceResult(
+            states = states,
+            promotedKey = checkNotNull(promotedKey),
+            relocatedKey = checkNotNull(relocatedKey),
+            jumpState = if (jumpDistance >= jumpThreshold) "candidate" else "stable",
+            jumpRemovedKey = removedKey,
+            jumpContributedVoxels = if (jumpDistance >= jumpThreshold) 0 else 1,
+        )
+    }
+
+    private fun referenceCarvingStates(
+        fixture: kotlinx.serialization.json.JsonObject,
+    ): List<String> {
+        val freeThreshold = fixture.int("freeEvidenceToCarve")
+        val occupiedRestore = fixture.int("occupiedEvidenceToRestore")
+        val requiredBins = fixture.int("separatedDirectionBinsRequired")
+        var contradicted = false
+        return fixture.getValue("evidenceSteps").jsonArray.map { value ->
+            val step = value.jsonObject
+            val occupied = step.int("occupied")
+            val free = step.int("free")
+            val bins = step.getValue("directionBins").jsonArray.toSet().size
+            if (contradicted && occupied >= occupiedRestore) {
+                contradicted = false
+                "restored"
+            } else if (
+                !contradicted &&
+                free >= freeThreshold &&
+                bins >= requiredBins &&
+                free >= occupied + 4
+            ) {
+                contradicted = true
+                "contradicted"
+            } else {
+                "occupied"
+            }
+        }
+    }
+
+    private fun referenceFreeKeys(
+        fixture: kotlinx.serialization.json.JsonObject,
+    ): List<Long> {
+        val start = fixture.getValue("cameraGroup").doubleList()
+        val end = fixture.getValue("surfaceGroup").doubleList()
+        val safety = fixture.double("safetyBandMeters")
+        val voxelSize = 0.1
+        val delta = List(3) { index -> end[index] - start[index] }
+        val length = kotlin.math.sqrt(delta.sumOf { value -> value * value })
+        val direction = delta.map { value -> value / length }
+        val keys = mutableListOf<Long>()
+        var distance = voxelSize
+        while (distance <= length - safety + 1e-9) {
+            val point = List(3) { index -> start[index] + direction[index] * distance }
+            val coordinates =
+                point.map { coordinate -> kotlin.math.floor(coordinate / voxelSize).toInt() }
+            val key = packKey(coordinates)
+            if (keys.lastOrNull() != key) keys += key
+            distance += voxelSize
+        }
+        return keys
     }
 }
