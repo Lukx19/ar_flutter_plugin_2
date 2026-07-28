@@ -127,10 +127,11 @@ class VisibilityGridFixtureContractTest {
             scenarios.single {
                 it.getValue("name").jsonPrimitive.content == "persistent_id_relocation"
             }
+        val defaults = fixture.getValue("defaults").jsonObject
         val featureResult =
             referenceFeatureStates(
                 movement,
-                fixture.getValue("defaults").jsonObject,
+                defaults,
             )
         assertEquals(
             movement.getValue("observations").jsonArray.map {
@@ -156,6 +157,73 @@ class VisibilityGridFixtureContractTest {
             jump.getValue("expectedContributedVoxels").jsonPrimitive.content.toInt(),
             featureResult.jumpContributedVoxels,
         )
+        val nativeGrid =
+            NativeVisibilityGrid(
+                VisibilityGridFeatureConfig(
+                    stableVoxelCapacity = 100,
+                    featureTrackCapacity = 100,
+                    candidateSamples = defaults.int("candidateSamples"),
+                    candidateSpanNs =
+                        defaults.getValue("candidateSpanNs").jsonPrimitive.content.toLong(),
+                    candidateMaxStdDevMeters = defaults.double("candidateMaxStdDevMeters"),
+                    relocationHysteresisMeters =
+                        defaults.double("relocationHysteresisMeters"),
+                    jumpResetMeters = defaults.double("jumpResetMeters"),
+                ),
+            )
+        nativeGrid.startGroup(
+            VisibilityGridGroupConfig(
+                groupId = "fixture-group",
+                groupGeneration = 1,
+                sessionGeneration = 1,
+                voxelSizeMeters = defaults.double("voxelSizeMeters"),
+                capacity = 100,
+                groupFromWorldGl = identityVisibilityGridTransform(),
+            ),
+        )
+        val featureId = movement.getValue("featureId").jsonPrimitive.content.toInt()
+        movement.getValue("observations").jsonArray.forEach { value ->
+            val observation = value.jsonObject
+            val position = observation.getValue("positionGroup").doubleList()
+            nativeGrid.observe(
+                FeatureObservation(
+                    timestampNs =
+                        observation.getValue("timestampNs").jsonPrimitive.content.toLong(),
+                    groupGeneration = 1,
+                    sessionGeneration = 1,
+                    samples =
+                        listOf(
+                            FeatureSample(
+                                id = featureId,
+                                xWorld = position[0],
+                                yWorld = position[1],
+                                zWorld = position[2],
+                                confidence = observation.double("confidence"),
+                            ),
+                        ),
+                ),
+            )
+        }
+        assertEquals(listOf(featureResult.relocatedKey), nativeGrid.snapshot().stableKeys)
+        val jumpPosition = jump.getValue("positionGroup").doubleList()
+        nativeGrid.observe(
+            FeatureObservation(
+                timestampNs = jump.getValue("timestampNs").jsonPrimitive.content.toLong(),
+                groupGeneration = 1,
+                sessionGeneration = 1,
+                samples =
+                    listOf(
+                        FeatureSample(
+                            id = featureId,
+                            xWorld = jumpPosition[0],
+                            yWorld = jumpPosition[1],
+                            zWorld = jumpPosition[2],
+                            confidence = jump.double("confidence"),
+                        ),
+                    ),
+            ),
+        )
+        assertTrue(nativeGrid.snapshot().stableKeys.isEmpty())
 
         val sharedSupport =
             scenarios.single {
