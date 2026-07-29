@@ -7,7 +7,7 @@ internal class SharedCameraStartupBarrier {
     private val readyLatch = CountDownLatch(1)
 
     @Volatile
-    private var failureMessage: String? = null
+    private var failure: Throwable? = null
 
     @Volatile
     private var configured = false
@@ -18,7 +18,11 @@ internal class SharedCameraStartupBarrier {
     }
 
     fun fail(message: String) {
-        failureMessage = message
+        fail(IllegalStateException(message))
+    }
+
+    fun fail(error: Throwable) {
+        failure = error
         readyLatch.countDown()
     }
 
@@ -28,8 +32,8 @@ internal class SharedCameraStartupBarrier {
             throw IllegalStateException("Timed out waiting for shared camera startup")
         }
 
-        failureMessage?.let { message ->
-            throw IllegalStateException(message)
+        failure?.let { error ->
+            throw error
         }
 
         if (!configured) {

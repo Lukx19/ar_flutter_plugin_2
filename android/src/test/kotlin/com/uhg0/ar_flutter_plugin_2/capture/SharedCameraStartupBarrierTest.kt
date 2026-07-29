@@ -31,6 +31,28 @@ class SharedCameraStartupBarrierTest {
     }
 
     @Test
+    fun `awaitReady preserves typed startup failure`() {
+        val barrier = SharedCameraStartupBarrier()
+        val expected =
+            SharedCameraStartupException(
+                reason = SharedCameraStartupFailureReason.SESSION_CONFIGURATION,
+                message = "configuration failed",
+            )
+
+        barrier.fail(expected)
+
+        val error =
+            try {
+                barrier.awaitReady(timeoutMs = 1)
+                null
+            } catch (failure: SharedCameraStartupException) {
+                failure
+            }
+
+        assertEquals(expected, error)
+    }
+
+    @Test
     fun `awaitReady times out when startup never completes`() {
         val barrier = SharedCameraStartupBarrier()
 

@@ -21,6 +21,8 @@ import com.uhg0.ar_flutter_plugin_2.sceneview.SceneViewCaptureHost
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
 import java.io.File
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 internal class CaptureSessionException(
     val code: String,
@@ -135,7 +137,7 @@ internal class ArCaptureSession(
                 )
             sharedImageCacheManager = imageCacheManager
             val scenePreviewSurface = createSharedCameraPreviewSurface()
-            val manager =
+            val createManager = {
                 SharedCameraManager(
                     context = sceneHost.context,
                     methodChannel = captureChannel,
@@ -205,11 +207,35 @@ internal class ArCaptureSession(
                     },
                     resourceCounters = resourceCounters,
                 )
-            try {
-                manager.initialize(imageCacheManager)
-                sharedCameraManager = manager
-            } catch (error: Exception) {
+            }
+            var startupError: Exception? = null
+            for (attempt in 1..2) {
+                val manager = createManager()
+                try {
+                    manager.initialize(imageCacheManager)
+                    sharedCameraManager = manager
+                    break
+                } catch (error: Exception) {
+                    startupError = error
+                    withContext(Dispatchers.IO) {
+                        manager.finishCameraShutdown(1_000L)
+                    }
+                    if (
+                        attempt == 2 ||
+                            !SharedCameraStartupRetryPolicy.shouldRetry(error)
+                    ) {
+                        break
+                    }
+                    Log.w(
+                        "ArCaptureSession",
+                        "Retrying transient shared-camera startup after vendor drain",
+                        error,
+                    )
+                }
+            }
+            if (sharedCameraManager == null) {
                 sharedImageCacheManager = null
+                val error = checkNotNull(startupError)
                 throw CaptureSessionException(
                     code = "SHARED_CAMERA_STARTUP_FAILED",
                     message = error.cause?.message ?: error.message

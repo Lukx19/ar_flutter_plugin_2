@@ -17,6 +17,7 @@ import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Build
+import android.os.SystemClock
 import android.util.Log
 import android.util.Size
 import android.view.Surface
@@ -32,6 +33,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 
 /// Complete configuration object parsed from ARCaptureConfig
@@ -201,9 +203,13 @@ internal class SharedCameraManager(
     private val resourceCounters: CaptureResourceCounters = CaptureResourceCounters(),
 ) {
     companion object {
+        private const val VendorCameraDrainWindowMs = 3_500L
+        private const val ShutdownCompletionPollMs = 50L
         private const val StartupTimeoutMs = 5000L
         private const val ManualCaptureTimeoutMs = 5000L
         private const val ManualCaptureRequestTagPrefix = "capture3d_manual_shared_still"
+        private val processRestartGate =
+            SharedCameraRestartGate(cooldownMs = VendorCameraDrainWindowMs)
     }
 
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -342,6 +348,7 @@ internal class SharedCameraManager(
     private var cameraDeviceClosed = false
     @Volatile
     private var cameraCloseLatch = CountDownLatch(1)
+    private var processShutdownGeneration: Long? = null
 
     private var isInitialized = false
     private val requestGeneration = CaptureRequestGeneration()
@@ -407,6 +414,7 @@ internal class SharedCameraManager(
 
         try {
             imageCacheManager = cacheManager
+            awaitSharedCameraRestartWindow()
             startBackgroundThread()
             setupCameraBasedOnConfig()
             awaitSharedCameraStartup()
@@ -507,6 +515,26 @@ internal class SharedCameraManager(
             wrappedDeviceStateCallback,
             backgroundHandler,
         )
+    }
+
+    private suspend fun awaitSharedCameraRestartWindow() {
+        var waitLogged = false
+        while (true) {
+            val remaining =
+                processRestartGate.restartDelayMs(
+                    nowMs = SystemClock.elapsedRealtime(),
+                    completionPollMs = ShutdownCompletionPollMs,
+                )
+            if (remaining == 0L) return
+            if (!waitLogged) {
+                Log.i(
+                    "SharedCameraManager",
+                    "Waiting for previous Camera2 session ownership to drain",
+                )
+                waitLogged = true
+            }
+            delay(remaining)
+        }
     }
 
     private suspend fun awaitSharedCameraStartup() {
@@ -744,7 +772,6 @@ internal class SharedCameraManager(
                     }
 
                     override fun onConfigureFailed(session: CameraCaptureSession) {
-                        startupBarrier.fail("Failed to configure shared camera capture session")
                         Log.e("SharedCameraManager", "Failed to configure capture session")
                     }
 
@@ -756,9 +783,11 @@ internal class SharedCameraManager(
                 }
             val wrappedSessionStateCallback =
                 sharedCamera.createARSessionStateCallback(sessionStateCallback, backgroundHandler)
+            val guardedSessionStateCallback =
+                guardArCoreStartupStateCallback(wrappedSessionStateCallback)
             cameraDevice.createCaptureSession(
                 sessionSurfaces,
-                wrappedSessionStateCallback,
+                guardedSessionStateCallback,
                 backgroundHandler,
             )
         } catch (e: Exception) {
@@ -1425,6 +1454,75 @@ internal class SharedCameraManager(
         return specs
     }
 
+    private fun guardArCoreStartupStateCallback(
+        callback: CameraCaptureSession.StateCallback,
+    ): CameraCaptureSession.StateCallback =
+        object : CameraCaptureSession.StateCallback() {
+            override fun onConfigured(session: CameraCaptureSession) =
+                forwardArCoreStartupCallback("configured", session) {
+                    callback.onConfigured(session)
+                }
+
+            override fun onConfigureFailed(session: CameraCaptureSession) =
+                forwardArCoreStartupCallback("configureFailed", session) {
+                    callback.onConfigureFailed(session)
+                    failSharedCameraConfiguration(
+                        session = session,
+                        stage = "configureFailed",
+                        cause = null,
+                    )
+                }
+
+            override fun onReady(session: CameraCaptureSession) = callback.onReady(session)
+
+            override fun onActive(session: CameraCaptureSession) = callback.onActive(session)
+
+            override fun onCaptureQueueEmpty(session: CameraCaptureSession) =
+                callback.onCaptureQueueEmpty(session)
+
+            override fun onClosed(session: CameraCaptureSession) = callback.onClosed(session)
+
+            override fun onSurfacePrepared(session: CameraCaptureSession, surface: Surface) =
+                callback.onSurfacePrepared(session, surface)
+        }
+
+    private inline fun forwardArCoreStartupCallback(
+        stage: String,
+        session: CameraCaptureSession,
+        callback: () -> Unit,
+    ) {
+        SharedCameraCallbackGuard.run(
+            onFailure = { error ->
+                failSharedCameraConfiguration(
+                    session = session,
+                    stage = stage,
+                    cause = error,
+                )
+            },
+            callback = callback,
+        )
+    }
+
+    private fun failSharedCameraConfiguration(
+        session: CameraCaptureSession,
+        stage: String,
+        cause: Throwable?,
+    ) {
+        val error =
+            SharedCameraStartupException(
+                reason = SharedCameraStartupFailureReason.SESSION_CONFIGURATION,
+                message = "ARCore shared-camera session configuration failed at $stage",
+                cause = cause,
+            )
+        startupBarrier.fail(error)
+        runCatching { session.close() }
+        Log.e(
+            "SharedCameraManager",
+            "ARCore shared-camera session configuration failed at $stage",
+            cause,
+        )
+    }
+
     private fun captureImage(exposureBracket: List<ExposureBracketSpec> = emptyList()): Boolean {
         val activeSession = captureSession ?: return false
         val builder = manualCaptureRequestBuilder ?: return false
@@ -1739,6 +1837,9 @@ internal class SharedCameraManager(
     }
 
     fun cleanup() {
+        if (processShutdownGeneration == null) {
+            processShutdownGeneration = processRestartGate.markShutdownStarted()
+        }
         cleanupRequested = true
         pendingManualCapture?.let { pending ->
             pending.error = CaptureSessionException(
@@ -1785,17 +1886,27 @@ internal class SharedCameraManager(
      * must not destroy that Session before this barrier opens.
      */
     fun finishCameraShutdown(timeoutMs: Long) {
-        val callbacksCompleted = cameraCloseLatch.await(timeoutMs, TimeUnit.MILLISECONDS)
-        // Match ARCore's SharedCamera sample: readers remain valid until the
-        // wrapped camera close callback has completed, then their callback
-        // handlers are drained before the ARCore Session is destroyed.
-        closeImageReaders()
-        stopBackgroundThreadsAfterDrain()
-        if (!callbacksCompleted) {
-            Log.i(
-                "SharedCameraManager",
-                "Camera2 close callbacks were not forwarded; callback handlers drained before ARCore disposal",
-            )
+        try {
+            val callbacksCompleted = cameraCloseLatch.await(timeoutMs, TimeUnit.MILLISECONDS)
+            // Match ARCore's SharedCamera sample: readers remain valid until the
+            // wrapped camera close callback has completed, then their callback
+            // handlers are drained before the ARCore Session is destroyed.
+            closeImageReaders()
+            stopBackgroundThreadsAfterDrain()
+            if (!callbacksCompleted) {
+                Log.i(
+                    "SharedCameraManager",
+                    "Camera2 close callbacks were not forwarded; callback handlers drained before ARCore disposal",
+                )
+            }
+        } finally {
+            processShutdownGeneration?.let { generation ->
+                processRestartGate.markShutdownCompleted(
+                    generation = generation,
+                    nowMs = SystemClock.elapsedRealtime(),
+                )
+            }
+            processShutdownGeneration = null
         }
     }
 
