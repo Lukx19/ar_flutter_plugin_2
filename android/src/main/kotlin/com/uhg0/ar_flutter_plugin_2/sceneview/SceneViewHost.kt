@@ -122,6 +122,7 @@ internal class SceneViewHost(
     )
     private val sessionRef = AtomicReference<Session?>()
     private val frameRef = AtomicReference<Frame?>()
+    private val visibilityGridDepthModeCache = VisibilityGridDepthModeCache()
     private val engineRef = AtomicReference<Engine?>()
     private val cameraStreamRef = AtomicReference<ARCameraStream?>()
     private val frameCadenceTracker = FrameCadenceTracker()
@@ -284,7 +285,10 @@ internal class SceneViewHost(
                         }
                     }
                     arConfig.depthMode =
-                        selectVisibilityGridDepthMode(session::isDepthModeSupported)
+                        visibilityGridDepthModeCache.configure(
+                            session,
+                            session::isDepthModeSupported,
+                        )
                     arConfig.instantPlacementMode = Config.InstantPlacementMode.DISABLED
                     arConfig.lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
                     arConfig.focusMode = Config.FocusMode.AUTO
@@ -689,9 +693,7 @@ internal class SceneViewHost(
         frameCadenceTracker.snapshot()
 
     fun visibilityGridDepthMode(): Config.DepthMode =
-        activeSession?.let { session ->
-            selectVisibilityGridDepthMode(session::isDepthModeSupported)
-        } ?: Config.DepthMode.DISABLED
+        visibilityGridDepthModeCache.current()
 
     fun dispose() {
         if (!ownership.onDispose()) return
@@ -703,6 +705,7 @@ internal class SceneViewHost(
         detectedPlanes.clear()
         frameRef.set(null)
         sessionRef.set(null)
+        visibilityGridDepthModeCache.reset()
         cameraStreamRef.set(null)
         engineRef.set(null)
         composeView.disposeComposition()
@@ -1099,3 +1102,34 @@ internal fun selectVisibilityGridDepthMode(
         rawDepthSupported = isSupported(Config.DepthMode.RAW_DEPTH_ONLY),
         automaticDepthSupported = isSupported(Config.DepthMode.AUTOMATIC),
     ).activeMode
+
+internal class VisibilityGridDepthModeCache {
+    @Volatile
+    private var configuredSession: Any? = null
+
+    @Volatile
+    private var activeMode: Config.DepthMode? = null
+
+    @Synchronized
+    fun configure(
+        sessionIdentity: Any,
+        isSupported: (Config.DepthMode) -> Boolean,
+    ): Config.DepthMode {
+        if (configuredSession === sessionIdentity) {
+            activeMode?.let { return it }
+        }
+        val selected = selectVisibilityGridDepthMode(isSupported)
+        configuredSession = sessionIdentity
+        activeMode = selected
+        return selected
+    }
+
+    fun current(): Config.DepthMode =
+        activeMode ?: Config.DepthMode.DISABLED
+
+    @Synchronized
+    fun reset() {
+        configuredSession = null
+        activeMode = null
+    }
+}
