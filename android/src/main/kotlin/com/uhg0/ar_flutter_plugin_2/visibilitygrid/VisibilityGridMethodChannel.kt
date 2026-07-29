@@ -24,6 +24,11 @@ class VisibilityGridMethodChannel(
     private val channel = MethodChannel(messenger, "arpointcloud_$viewId")
     private val main = Handler(Looper.getMainLooper())
     private val executor = Executors.newSingleThreadExecutor()
+    private val sensorDrainDispatcher =
+        FairExecutorDrainDispatcher(
+            executor = executor,
+            drainOne = ::drainOneSensorBatch,
+        )
     private val lifecycleGuard = VisibilityGridLifecycleGuard()
     @Volatile private var grid: NativeVisibilityGrid? = null
     private var renderer: VisibilityGridRendererState? = null
@@ -36,7 +41,6 @@ class VisibilityGridMethodChannel(
     @Volatile private var checkpointBarrierActive = false
     private var pendingCheckpointResult: MethodChannel.Result? = null
     private val sensorHandoff = LatestSensorHandoff<FeatureWork, DepthWork>()
-    private var draining = false
     private var featureConfidenceMinimum = 0.30
     private var maxFeaturesPerObservation = 2_000
     @Volatile private var lastEmittedGeometryRevision = -1L
@@ -151,42 +155,45 @@ class VisibilityGridMethodChannel(
             } else {
                 DepthAcquisitionResult.TransientUnavailable
             }
-        synchronized(this) {
-            if (
-                disposed ||
-                group !== activeGroup ||
-                grid !== activeGrid ||
-                renderer !== activeRenderer ||
-                !lifecycleGuard.allows(lifecycleToken)
-            ) {
-                return
-            }
-            callbackCopySamples.record(System.nanoTime() - callbackStartedNs)
-            val context =
-                ObservationContext(
-                    activeGrid,
-                    activeRenderer,
-                    activeGroup,
-                    lifecycleToken,
-                )
-            if (
-                sensorHandoff.offerFeature(
-                    FeatureWork(context, frame.timestamp, feature),
-                )
-            ) {
-                coalescedFeatureObservations++
-            }
-            if (
-                sensorHandoff.offerDepth(
-                    DepthWork(context, frame.timestamp, depth),
-                )
-            ) {
-                coalescedDepthObservations++
-            }
-            if (draining) return
-            draining = true
-        }
-        executor.execute(::drain)
+        val admitted =
+            admitSensorWork(
+                lock = this,
+                isBlocked = {
+                    disposed ||
+                        paused ||
+                        checkpointBarrierActive ||
+                        group !== activeGroup ||
+                        grid !== activeGrid ||
+                        renderer !== activeRenderer ||
+                        !lifecycleGuard.allows(lifecycleToken)
+                },
+                offer = {
+                    callbackCopySamples.record(System.nanoTime() - callbackStartedNs)
+                    val context =
+                        ObservationContext(
+                            activeGrid,
+                            activeRenderer,
+                            activeGroup,
+                            lifecycleToken,
+                        )
+                    if (
+                        sensorHandoff.offerFeature(
+                            FeatureWork(context, frame.timestamp, feature),
+                        )
+                    ) {
+                        coalescedFeatureObservations++
+                    }
+                    if (
+                        sensorHandoff.offerDepth(
+                            DepthWork(context, frame.timestamp, depth),
+                        )
+                    ) {
+                        coalescedDepthObservations++
+                    }
+                },
+            )
+        if (!admitted) return
+        sensorDrainDispatcher.request()
     }
 
     fun dispose() {
@@ -200,7 +207,6 @@ class VisibilityGridMethodChannel(
             checkpointResult = pendingCheckpointResult
             pendingCheckpointResult = null
             sensorHandoff.clear()
-            draining = false
             oldRenderer = renderer
             renderer = null
             rendererConfig = null
@@ -521,98 +527,96 @@ class VisibilityGridMethodChannel(
         result.success(mapOf("released" to released))
     }
 
-    private fun drain() {
+    private fun drainOneSensorBatch() {
         var failed: ObservationContext? = null
         try {
-            while (true) {
-                val next =
-                    synchronized(this) {
-                        sensorHandoff.take()
-                    } ?: return
-                val feature = next.feature
-                val depth = next.depth
-                sensorProcessingOrder(
-                    feature?.timestampNs,
-                    depth?.timestampNs,
-                ).forEach { source ->
-                    when (source) {
-                        SensorHandoffSource.FEATURE -> {
-                            val work = checkNotNull(feature)
-                            failed = work.context
-                            consumeFeature(work)
-                        }
-                        SensorHandoffSource.DEPTH -> {
-                            val work = checkNotNull(depth)
-                            failed = work.context
-                            consumeDepth(work)
-                        }
+            val next =
+                synchronized(this) {
+                    sensorHandoff.take()
+                } ?: return
+            val feature = next.feature
+            val depth = next.depth
+            sensorProcessingOrder(
+                feature?.timestampNs,
+                depth?.timestampNs,
+            ).forEach { source ->
+                when (source) {
+                    SensorHandoffSource.FEATURE -> {
+                        val work = checkNotNull(feature)
+                        failed = work.context
+                        consumeFeature(work)
+                    }
+                    SensorHandoffSource.DEPTH -> {
+                        val work = checkNotNull(depth)
+                        failed = work.context
+                        consumeDepth(work)
                     }
                 }
-                val context = next.depth?.context ?: next.feature?.context ?: continue
-                failed = context
-                if (!isCurrent(context)) continue
-                val health = currentHealth(context.grid.snapshot().diagnostics)
-                if (health != lastEmittedHealth) {
-                    lastEmittedHealth = health
-                    val healthPayload = healthWireMap()
+            }
+            val context = next.depth?.context ?: next.feature?.context ?: return
+            failed = context
+            if (!isCurrent(context)) return
+            val health = currentHealth(context.grid.snapshot().diagnostics)
+            if (health != lastEmittedHealth) {
+                lastEmittedHealth = health
+                val healthPayload = healthWireMap()
+                main.post {
+                    if (
+                        lifecycleGuard.allows(context.lifecycleToken) &&
+                        group === context.group &&
+                        renderer === context.renderer
+                    ) {
+                        channel.invokeMethod(
+                            "onGridHealth",
+                            healthPayload,
+                        )
+                    }
+                }
+            }
+            context.grid.takeGeometryDelta()?.let { delta ->
+                if (
+                    delta.geometryRevision != lastEmittedGeometryRevision &&
+                    isCurrent(context)
+                ) {
+                    val applied =
+                        synchronized(this) {
+                            if (!isCurrent(context)) {
+                                false
+                            } else {
+                                check(
+                                    context.renderer.applyGeometry(
+                                        revision = delta.geometryRevision,
+                                        reset = delta.reset,
+                                        upsertKeys = delta.upsertKeys.toLongArray(),
+                                        removalKeys = delta.removalKeys.toLongArray(),
+                                    ),
+                                )
+                                lastEmittedGeometryRevision = delta.geometryRevision
+                                true
+                            }
+                        }
+                    if (!applied) return@let
                     main.post {
+                        val activeGroup = group
                         if (
                             lifecycleGuard.allows(context.lifecycleToken) &&
-                            group === context.group &&
-                            renderer === context.renderer
+                            renderer === context.renderer &&
+                            activeGroup === context.group &&
+                            activeGroup.groupId == delta.groupId &&
+                            activeGroup.groupGeneration == delta.groupGeneration &&
+                            activeGroup.sessionGeneration == delta.sessionGeneration
                         ) {
+                            runCatching(::publishRenderer)
+                                .onFailure(::emitRendererError)
                             channel.invokeMethod(
-                                "onGridHealth",
-                                healthPayload,
+                                "onGridDelta",
+                                deltaWireMap(delta, context.renderer),
                             )
                         }
                     }
                 }
-                context.grid.takeGeometryDelta()?.let { delta ->
-                    if (
-                        delta.geometryRevision != lastEmittedGeometryRevision &&
-                        isCurrent(context)
-                    ) {
-                        val applied =
-                            synchronized(this) {
-                                if (!isCurrent(context)) {
-                                    false
-                                } else {
-                                    check(
-                                        context.renderer.applyGeometry(
-                                            revision = delta.geometryRevision,
-                                            reset = delta.reset,
-                                            upsertKeys = delta.upsertKeys.toLongArray(),
-                                            removalKeys = delta.removalKeys.toLongArray(),
-                                        ),
-                                    )
-                                    lastEmittedGeometryRevision = delta.geometryRevision
-                                    true
-                                }
-                            }
-                        if (!applied) return@let
-                        main.post {
-                            val activeGroup = group
-                            if (
-                                lifecycleGuard.allows(context.lifecycleToken) &&
-                                renderer === context.renderer &&
-                                activeGroup === context.group &&
-                                activeGroup.groupId == delta.groupId &&
-                                activeGroup.groupGeneration == delta.groupGeneration &&
-                                activeGroup.sessionGeneration == delta.sessionGeneration
-                            ) {
-                                runCatching(::publishRenderer)
-                                    .onFailure(::emitRendererError)
-                                channel.invokeMethod(
-                                    "onGridDelta",
-                                    deltaWireMap(delta, context.renderer),
-                                )
-                            }
-                        }
-                    }
-                }
-                failed = null
             }
+            failed = null
         } catch (error: Exception) {
             val failedWork = failed
             if (failedWork != null) {
@@ -621,20 +625,6 @@ class VisibilityGridMethodChannel(
                         emitRendererError(error)
                     }
                 }
-            }
-        } finally {
-            val reschedule =
-                synchronized(this) {
-                    draining = false
-                    if (!disposed && sensorHandoff.hasPending) {
-                        draining = true
-                        true
-                    } else {
-                        false
-                    }
-                }
-            if (reschedule) {
-                executor.execute(::drain)
             }
         }
     }
