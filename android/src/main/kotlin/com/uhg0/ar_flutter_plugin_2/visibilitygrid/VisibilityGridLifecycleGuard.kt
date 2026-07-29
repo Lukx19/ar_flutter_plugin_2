@@ -16,6 +16,9 @@ internal class VisibilityGridLifecycleGuard {
 
     fun allows(token: Long): Boolean = !disposed && !paused && token == epoch
 
+    /** Allows a durable snapshot after sensor admission has been paused. */
+    fun allowsCheckpoint(token: Long): Boolean = !disposed && token == epoch
+
     @Synchronized
     fun pause() {
         if (disposed || paused) return

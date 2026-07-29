@@ -480,7 +480,7 @@ class VisibilityGridMethodChannel(
                 lastEmittedGeometryRevision = snapshot.geometryRevision
                 main.post {
                     if (claimCheckpointResult(result)) {
-                        if (!lifecycleGuard.allows(lifecycleToken)) {
+                        if (!lifecycleGuard.allowsCheckpoint(lifecycleToken)) {
                             checkpointBarrierActive = false
                             result.error(
                                 "VG_NOT_INITIALIZED",

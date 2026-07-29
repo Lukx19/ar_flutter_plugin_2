@@ -34,4 +34,21 @@ class VisibilityGridLifecycleGuardTest {
         assertFalse(guard.allows(recreated))
         assertFalse(guard.allows(guard.token()))
     }
+
+    @Test
+    fun `checkpoint snapshot is allowed for the current paused epoch`() {
+        val guard = VisibilityGridLifecycleGuard()
+
+        guard.pause()
+        val paused = guard.token()
+
+        assertFalse(guard.allows(paused))
+        assertTrue(guard.allowsCheckpoint(paused))
+
+        guard.resume()
+        assertFalse(guard.allowsCheckpoint(paused))
+
+        guard.dispose()
+        assertFalse(guard.allowsCheckpoint(guard.token()))
+    }
 }
