@@ -28,4 +28,9 @@ A Flutter plugin for shared AR experiences supporting Android and iOS.
   # Flutter.framework does not contain a i386 slice.
   s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES', 'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386' }
   s.swift_version = '5.0'
+
+  s.test_spec 'VisibilityGridTests' do |test_spec|
+    test_spec.source_files = 'Tests/**/*.swift'
+    test_spec.resources = '../test/fixtures/visibility_grid/*.json'
+  end
 end

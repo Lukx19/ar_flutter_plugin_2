@@ -39,6 +39,7 @@ ios/Flutter/flutter_export_environment.sh
 ios/Runner.xcworkspace/
 ios/Runner.xcodeproj/
 ios/build/
+ios/.build/
 
 # Output and temporary files
 repomix-output.txt

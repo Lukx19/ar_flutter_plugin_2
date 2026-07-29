@@ -1,0 +1,380 @@
+import XCTest
+@testable import ar_flutter_plugin_2
+
+final class VisibilityGridCoreTests: XCTestCase {
+    private lazy var corpus: [String: Any] = {
+        let bundle = Bundle(for: type(of: self))
+        let bundled = bundle.url(
+                forResource: "visibility_grid_wire_v1",
+                withExtension: "json"
+            )
+        let sourceFixture = ProcessInfo.processInfo.environment[
+            "CAPTURE3D_PLUGIN_ROOT"
+        ].map {
+            URL(fileURLWithPath: $0)
+                .appendingPathComponent(
+                    "test/fixtures/visibility_grid/" +
+                    "visibility_grid_wire_v1.json"
+                )
+        }
+        let url = try! XCTUnwrap(
+            bundled ?? sourceFixture
+        )
+        let data = try! Data(contentsOf: url)
+        return try! JSONSerialization.jsonObject(with: data) as! [String: Any]
+    }()
+
+    private func scenario(_ name: String) -> [String: Any] {
+        let scenarios = corpus["scenarios"] as! [[String: Any]]
+        return scenarios.first { $0["name"] as? String == name }!
+    }
+
+    func testSharedCorpusPackedKeysAndGroupTransform() throws {
+        XCTAssertEqual(corpus["version"] as? String, visibilityGridWireVersion)
+        let fixture = scenario("group_transform_and_packed_keys")
+        let groupFromWorld = fixture["groupFromWorldGl"] as! [Double]
+        let worldPoints = fixture["worldPoints"] as! [[Double]]
+        let expectedCoordinates =
+            fixture["expectedGroupCellCoordinates"] as! [[Int]]
+        let expectedKeys = fixture["expectedPackedKeys"] as! [String]
+
+        for index in worldPoints.indices {
+            let groupPoint = VisibilityGridPoint.transform(
+                matrix: groupFromWorld,
+                point: VisibilityGridPoint(worldPoints[index])
+            )
+            let coordinates = groupPoint.cellCoordinates(voxelSizeMeters: 0.1)
+            XCTAssertEqual(coordinates, expectedCoordinates[index])
+            XCTAssertEqual(
+                String(packVisibilityGridKey(coordinates)),
+                expectedKeys[index]
+            )
+        }
+    }
+
+    func testPersistentIdentifierRelocatesOneContributionAndResetsOnJump() throws {
+        let fixture = scenario("persistent_id_relocation")
+        let observations = fixture["observations"] as! [[String: Any]]
+        let group = try VisibilityGridGroupConfiguration.fixture()
+        let grid = try NativeVisibilityGrid(
+            featureConfiguration: .fixture(),
+            depthConfiguration: nil
+        )
+        try grid.startGroup(group)
+
+        for item in observations {
+            let position = item["positionGroup"] as! [Double]
+            try grid.observeFeatures(
+                FeatureObservation(
+                    timestampNanoseconds:
+                        (item["timestampNs"] as! NSNumber).int64Value,
+                    groupGeneration: group.groupGeneration,
+                    sessionGeneration: group.sessionGeneration,
+                    samples: [
+                        FeatureSample(
+                            identifier: 42,
+                            world: VisibilityGridPoint(position),
+                            confidence: item["confidence"] as! Double
+                        )
+                    ]
+                )
+            )
+        }
+        XCTAssertEqual(
+            grid.snapshot().stableKeys,
+            [UInt64(fixture["relocatedKey"] as! String)!]
+        )
+
+        let jump = fixture["jumpObservation"] as! [String: Any]
+        try grid.observeFeatures(
+            FeatureObservation(
+                timestampNanoseconds:
+                    (jump["timestampNs"] as! NSNumber).int64Value,
+                groupGeneration: group.groupGeneration,
+                sessionGeneration: group.sessionGeneration,
+                samples: [
+                    FeatureSample(
+                        identifier: 42,
+                        world: VisibilityGridPoint(
+                            jump["positionGroup"] as! [Double]
+                        ),
+                        confidence: 0.9
+                    )
+                ]
+            )
+        )
+        XCTAssertTrue(grid.snapshot().stableKeys.isEmpty)
+    }
+
+    func testSharedSupportKeepsVoxelUntilLastTrackLeaves() throws {
+        let group = try VisibilityGridGroupConfiguration.fixture()
+        let grid = try NativeVisibilityGrid(
+            featureConfiguration: .fixture(
+                candidateSamples: 1,
+                candidateSpanNanoseconds: 0
+            ),
+            depthConfiguration: nil
+        )
+        try grid.startGroup(group)
+        let origin = VisibilityGridPoint(x: 0.02, y: 0.02, z: 0.02)
+        try grid.observeFeatures(
+            FeatureObservation(
+                timestampNanoseconds: 1,
+                groupGeneration: 1,
+                sessionGeneration: 1,
+                samples: [
+                    FeatureSample(identifier: 42, world: origin, confidence: 1),
+                    FeatureSample(identifier: 84, world: origin, confidence: 1)
+                ]
+            )
+        )
+        let key = try XCTUnwrap(grid.snapshot().stableKeys.first)
+        XCTAssertEqual(grid.snapshot().supportByKey[key], 2)
+
+        try grid.observeFeatures(
+            FeatureObservation(
+                timestampNanoseconds: 2,
+                groupGeneration: 1,
+                sessionGeneration: 1,
+                samples: [
+                    FeatureSample(
+                        identifier: 42,
+                        world: VisibilityGridPoint(x: 2, y: 0, z: 0),
+                        confidence: 1
+                    )
+                ]
+            )
+        )
+        XCTAssertEqual(grid.snapshot().supportByKey[key], 1)
+        XCTAssertTrue(grid.snapshot().stableKeys.contains(key))
+    }
+
+    func testRevisionDeltaAcknowledgementAndSnapshotAreExact() throws {
+        let grid = try NativeVisibilityGrid(
+            featureConfiguration: .fixture(
+                candidateSamples: 1,
+                candidateSpanNanoseconds: 0,
+                publishIntervalMilliseconds: 500
+            ),
+            depthConfiguration: nil
+        )
+        let group = try VisibilityGridGroupConfiguration.fixture()
+        try grid.startGroup(group)
+        try grid.observeFeatures(
+            FeatureObservation(
+                timestampNanoseconds: 1,
+                groupGeneration: 1,
+                sessionGeneration: 1,
+                samples: [
+                    FeatureSample(
+                        identifier: 7,
+                        world: VisibilityGridPoint(x: 0, y: 0, z: -1),
+                        confidence: 1
+                    )
+                ]
+            )
+        )
+        let delta = try XCTUnwrap(
+            grid.takeGeometryDelta(nowNanoseconds: 500_000_000)
+        )
+        XCTAssertEqual(delta.baseGeometryRevision, 0)
+        XCTAssertEqual(delta.geometryRevision, 1)
+        XCTAssertTrue(
+            grid.acknowledgeGeometry(
+                identity: group.identity,
+                acceptedGeometryRevision: 1
+            )
+        )
+        let snapshot = try XCTUnwrap(
+            grid.requestSnapshot(
+                identity: group.identity,
+                receiverGeometryRevision: 5,
+                nowNanoseconds: 1_000_000_000
+            )
+        )
+        XCTAssertTrue(snapshot.reset)
+        XCTAssertEqual(snapshot.baseGeometryRevision, 5)
+        XCTAssertEqual(snapshot.geometryRevision, 6)
+    }
+
+    func testStoppedGridStillRejectsAStaleGroupGeneration() throws {
+        let grid = try NativeVisibilityGrid(
+            featureConfiguration: .fixture(),
+            depthConfiguration: nil
+        )
+        let group = try VisibilityGridGroupConfiguration.fixture()
+        try grid.startGroup(group)
+        grid.stopGroup()
+        XCTAssertThrowsError(try grid.startGroup(group)) {
+            XCTAssertEqual(
+                $0 as? VisibilityGridContractError,
+                .staleIdentity
+            )
+        }
+    }
+
+    func testBoundedSpatialAssociationIsPredictiveAndOneToOne() throws {
+        let associator = try BoundedFeatureAssociator(capacity: 2)
+        let first = associator.associate(
+            timestampNanoseconds: 1,
+            samples: [
+                UnassociatedFeatureSample(
+                    world: VisibilityGridPoint(x: 0, y: 0, z: 0),
+                    confidence: 1
+                ),
+                UnassociatedFeatureSample(
+                    world: VisibilityGridPoint(x: 1, y: 0, z: 0),
+                    confidence: 1
+                )
+            ]
+        )
+        XCTAssertEqual(first.samples.count, 2)
+        let firstIds = first.samples.map(\.identifier)
+
+        let second = associator.associate(
+            timestampNanoseconds: 2,
+            samples: [
+                UnassociatedFeatureSample(
+                    world: VisibilityGridPoint(x: 0.08, y: 0, z: 0),
+                    confidence: 1
+                ),
+                UnassociatedFeatureSample(
+                    world: VisibilityGridPoint(x: 0.09, y: 0, z: 0),
+                    confidence: 1
+                )
+            ]
+        )
+        XCTAssertEqual(second.samples.count, 1)
+        XCTAssertEqual(second.rejectedSamples, 1)
+        XCTAssertEqual(second.samples[0].identifier, firstIds[0])
+
+        let predicted = associator.associate(
+            timestampNanoseconds: 3,
+            samples: [
+                UnassociatedFeatureSample(
+                    world: VisibilityGridPoint(x: 0.17, y: 0, z: 0),
+                    confidence: 1
+                )
+            ]
+        )
+        XCTAssertEqual(predicted.samples[0].identifier, firstIds[0])
+    }
+
+    func testBoundedSpatialAssociationExpiresAndReusesCapacity() throws {
+        let associator = try BoundedFeatureAssociator(
+            capacity: 1,
+            expiryNanoseconds: 10
+        )
+        let first = associator.associate(
+            timestampNanoseconds: 1,
+            samples: [
+                UnassociatedFeatureSample(
+                    world: VisibilityGridPoint(x: 0, y: 0, z: 0),
+                    confidence: 1
+                )
+            ]
+        )
+        let rejected = associator.associate(
+            timestampNanoseconds: 2,
+            samples: [
+                UnassociatedFeatureSample(
+                    world: VisibilityGridPoint(x: 1, y: 0, z: 0),
+                    confidence: 1
+                )
+            ]
+        )
+        XCTAssertTrue(rejected.samples.isEmpty)
+        XCTAssertEqual(rejected.rejectedSamples, 1)
+
+        let afterExpiry = associator.associate(
+            timestampNanoseconds: 12,
+            samples: [
+                UnassociatedFeatureSample(
+                    world: VisibilityGridPoint(x: 1, y: 0, z: 0),
+                    confidence: 1
+                )
+            ]
+        )
+        XCTAssertEqual(afterExpiry.samples.count, 1)
+        XCTAssertNotEqual(
+            afterExpiry.samples[0].identifier,
+            first.samples[0].identifier
+        )
+    }
+
+    func testAssociationChoosesGloballyNearestCandidateFirst() throws {
+        let associator = try BoundedFeatureAssociator(capacity: 2)
+        let first = associator.associate(
+            timestampNanoseconds: 1,
+            samples: [
+                UnassociatedFeatureSample(
+                    world: VisibilityGridPoint(x: 0.1, y: 0, z: 0),
+                    confidence: 1
+                ),
+                UnassociatedFeatureSample(
+                    world: VisibilityGridPoint(x: 0.3, y: 0, z: 0),
+                    confidence: 1
+                )
+            ]
+        )
+        let nearestTrack = try XCTUnwrap(
+            first.samples.first { $0.world.x == 0.1 }
+        )
+
+        let second = associator.associate(
+            timestampNanoseconds: 2,
+            samples: [
+                UnassociatedFeatureSample(
+                    world: VisibilityGridPoint(x: 0, y: 0, z: 0),
+                    confidence: 1
+                ),
+                UnassociatedFeatureSample(
+                    world: VisibilityGridPoint(x: 0.09, y: 0, z: 0),
+                    confidence: 1
+                )
+            ]
+        )
+
+        XCTAssertEqual(second.samples.count, 1)
+        XCTAssertEqual(second.rejectedSamples, 1)
+        XCTAssertEqual(second.samples[0].identifier, nearestTrack.identifier)
+        XCTAssertEqual(second.samples[0].world.x, 0.09)
+    }
+
+    func testAssociationCapacityIsClampedToItsMemoryBudget() throws {
+        let associator = try BoundedFeatureAssociator(capacity: 200_000)
+        XCTAssertEqual(associator.acceptedCapacity, 12_288)
+    }
+}
+
+extension VisibilityGridFeatureConfiguration {
+    static func fixture(
+        candidateSamples: Int = 5,
+        candidateSpanNanoseconds: Int64 = 500_000_000,
+        publishIntervalMilliseconds: Int = 500
+    ) -> VisibilityGridFeatureConfiguration {
+        try! VisibilityGridFeatureConfiguration(
+            stableVoxelCapacity: 100,
+            featureTrackCapacity: 200,
+            maxFeaturesPerObservation: 2_000,
+            publishIntervalMilliseconds: publishIntervalMilliseconds,
+            minimumConfidence: 0.3,
+            candidateSamples: candidateSamples,
+            candidateSpanNanoseconds: candidateSpanNanoseconds
+        )
+    }
+}
+
+extension VisibilityGridGroupConfiguration {
+    static func fixture() throws -> VisibilityGridGroupConfiguration {
+        try VisibilityGridGroupConfiguration(
+            groupId: "group",
+            groupGeneration: 1,
+            sessionGeneration: 1,
+            voxelSizeMeters: 0.1,
+            capacity: 100,
+            groupFromWorldGL: identityVisibilityGridTransform(),
+            worldFromGroupGL: identityVisibilityGridTransform()
+        )
+    }
+}
