@@ -26,6 +26,51 @@ void main() {
           'renderer': 'healthy',
           'totalGrid': 'healthy',
         },
+        'diagnostics': <Object?, Object?>{
+          'candidateTracks': 2,
+          'stableTracks': 18,
+          'stableVoxels': 17,
+          'featureTrackCapacity': 200000,
+          'stableVoxelCapacity': 100000,
+          'featureObservationCount': 42,
+          'featureMigrations': 3,
+          'featureJumpResets': 1,
+          'candidateExpirations': 4,
+          'supportRemovals': 5,
+          'acceptedSamples': 123,
+          'rejectedSamples': 6,
+          'capacityRejectedCandidates': 7,
+          'featureTransientUnavailableCount': 8,
+          'featureFailureCount': 9,
+          'lastFeatureFusionNs': 1000,
+          'maxFeatureFusionNs': 2000,
+          'featureFusionP95Ns': 1500,
+          'estimatedStateBytes': 4096,
+          'depthObservationCount': 10,
+          'depthAcceptedPixels': 11,
+          'depthRejectedPixels': 12,
+          'depthCapacityRejectedPixels': 13,
+          'depthRayVisits': 14,
+          'carvedVoxels': 15,
+          'restoredVoxels': 16,
+          'depthTransientUnavailableCount': 17,
+          'depthFailureCount': 18,
+          'lastDepthFusionNs': 3000,
+          'maxDepthFusionNs': 4000,
+          'depthFusionP95Ns': 3500,
+          'callbackCopyP95Ns': 500,
+          'coalescedFeatureObservations': 2,
+          'coalescedDepthObservations': 1,
+          'coalescedGeometryChanges': 19,
+          'geometryRevision': 4,
+          'pendingGeometryKeys': 0,
+          'unacknowledgedGeometryCallbacks': 1,
+          'publishedDeltaCount': 20,
+          'snapshotRecoveryCount': 2,
+          'geometryAcknowledgementCount': 18,
+          'rendererRows': 17,
+          'rendererFreeRows': 99983,
+        },
       });
 
       expect(delta.groupId, 'group-1');
@@ -36,6 +81,27 @@ void main() {
       expect(delta.upsertKeys, <int>[10, 20]);
       expect(delta.removalKeys, <int>[30]);
       expect(delta.sourceHealth.depth, ARVisibilityGridSourceState.featureOnly);
+      expect(delta.diagnostics.featureMigrations, 3);
+      expect(delta.diagnostics.featureJumpResets, 1);
+      expect(delta.diagnostics.carvedVoxels, 15);
+      expect(delta.diagnostics.restoredVoxels, 16);
+      expect(delta.diagnostics.featureFusionP95Ns, 1500);
+      expect(delta.diagnostics.depthFusionP95Ns, 3500);
+      expect(delta.diagnostics.rendererRows, 17);
+      expect(delta.diagnostics.rendererFreeRows, 99983);
+    });
+
+    test('accepts feature p95 normalized from fewer than 1000 points', () {
+      final diagnostics = _initialDiagnostics(100, 200)
+        ..['acceptedSamples'] = 100
+        ..['lastFeatureFusionNs'] = 1000
+        ..['maxFeatureFusionNs'] = 1000
+        ..['featureFusionP95Ns'] = 10000;
+
+      expect(
+        ARVisibilityGridDiagnostics.fromMap(diagnostics).featureFusionP95Ns,
+        10000,
+      );
     });
 
     test('rejects a non-reset revision gap', () {
@@ -383,6 +449,7 @@ void main() {
           'depthActiveMode': 'rawDepthOnly',
           'renderCapacity': 100000,
           'featureTrackCapacity': 200000,
+          'diagnostics': _initialDiagnostics(100000, 200000),
           'health': <Object?, Object?>{
             'feature': 'healthy',
             'depth': 'transientUnavailable',
@@ -403,6 +470,8 @@ void main() {
         result.health.depth,
         ARVisibilityGridSourceState.transientUnavailable,
       );
+      expect(result.diagnostics.featureTrackCapacity, 200000);
+      expect(result.diagnostics.rendererFreeRows, 100000);
     });
 
     test('rejects health state used as a selected depth mode', () {
@@ -418,6 +487,7 @@ void main() {
             'depthActiveMode': 'transientUnavailable',
             'renderCapacity': 100000,
             'featureTrackCapacity': 200000,
+            'diagnostics': _initialDiagnostics(100000, 200000),
             'health': <Object?, Object?>{
               'feature': 'healthy',
               'depth': 'transientUnavailable',
@@ -679,6 +749,53 @@ void main() {
     );
   });
 }
+
+Map<String, Object> _initialDiagnostics(int capacity, int featureCapacity) =>
+    <String, Object>{
+      'candidateTracks': 0,
+      'stableTracks': 0,
+      'stableVoxels': 0,
+      'featureTrackCapacity': featureCapacity,
+      'stableVoxelCapacity': capacity,
+      'featureObservationCount': 0,
+      'featureMigrations': 0,
+      'featureJumpResets': 0,
+      'candidateExpirations': 0,
+      'supportRemovals': 0,
+      'acceptedSamples': 0,
+      'rejectedSamples': 0,
+      'capacityRejectedCandidates': 0,
+      'featureTransientUnavailableCount': 0,
+      'featureFailureCount': 0,
+      'lastFeatureFusionNs': 0,
+      'maxFeatureFusionNs': 0,
+      'featureFusionP95Ns': 0,
+      'estimatedStateBytes': 0,
+      'depthObservationCount': 0,
+      'depthAcceptedPixels': 0,
+      'depthRejectedPixels': 0,
+      'depthCapacityRejectedPixels': 0,
+      'depthRayVisits': 0,
+      'carvedVoxels': 0,
+      'restoredVoxels': 0,
+      'depthTransientUnavailableCount': 0,
+      'depthFailureCount': 0,
+      'lastDepthFusionNs': 0,
+      'maxDepthFusionNs': 0,
+      'depthFusionP95Ns': 0,
+      'callbackCopyP95Ns': 0,
+      'coalescedFeatureObservations': 0,
+      'coalescedDepthObservations': 0,
+      'coalescedGeometryChanges': 0,
+      'geometryRevision': 0,
+      'pendingGeometryKeys': 0,
+      'unacknowledgedGeometryCallbacks': 0,
+      'publishedDeltaCount': 0,
+      'snapshotRecoveryCount': 0,
+      'geometryAcknowledgementCount': 0,
+      'rendererRows': 0,
+      'rendererFreeRows': capacity,
+    };
 
 Map<String, dynamic> _map(Object? value) => (value as Map<String, dynamic>);
 

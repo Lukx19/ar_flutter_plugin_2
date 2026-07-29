@@ -35,6 +35,9 @@ final class VisibilityGridDepthCoreTests: XCTestCase {
             )
         }
         XCTAssertTrue(grid.snapshot().stableKeys.contains(key))
+        XCTAssertEqual(grid.snapshot().diagnostics.depthObservationCount, 12)
+        XCTAssertEqual(grid.snapshot().diagnostics.carvedVoxels, 1)
+        XCTAssertEqual(grid.snapshot().diagnostics.restoredVoxels, 1)
     }
 
     func testDepthObservationMapsEndpointRejectsEdgesAndNeverCarvesBehind()
@@ -105,6 +108,11 @@ final class VisibilityGridDepthCoreTests: XCTestCase {
         XCTAssertTrue(visible.contains(freeCell))
         XCTAssertTrue(visible.contains(endpoint))
         XCTAssertTrue(visible.contains(behind))
+        XCTAssertEqual(grid.snapshot().diagnostics.depthObservationCount, 4)
+        XCTAssertGreaterThan(
+            grid.snapshot().diagnostics.depthFusionP95Nanoseconds,
+            0
+        )
     }
 
     func testTerminalDepthFailureAndRendererHealthRemainIndependent()

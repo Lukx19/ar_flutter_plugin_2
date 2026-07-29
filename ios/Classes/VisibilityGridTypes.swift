@@ -398,6 +398,11 @@ struct VisibilityGridDiagnostics {
     var stableVoxels = 0
     var featureTrackCapacity = 0
     var stableVoxelCapacity = 0
+    var featureObservationCount: Int64 = 0
+    var featureMigrations: Int64 = 0
+    var featureJumpResets: Int64 = 0
+    var candidateExpirations: Int64 = 0
+    var supportRemovals: Int64 = 0
     var acceptedSamples: Int64 = 0
     var rejectedSamples: Int64 = 0
     var capacityRejectedCandidates: Int64 = 0
@@ -406,16 +411,33 @@ struct VisibilityGridDiagnostics {
     var featureFailureCount: Int64 = 0
     var lastFeatureFusionNanoseconds: Int64 = 0
     var maxFeatureFusionNanoseconds: Int64 = 0
+    var featureFusionP95Nanoseconds: Int64 = 0
     var estimatedStateBytes: Int64 = 0
     var depthHealth = "unsupported"
+    var depthObservationCount: Int64 = 0
     var depthAcceptedPixels: Int64 = 0
     var depthRejectedPixels: Int64 = 0
     var depthCapacityRejectedPixels: Int64 = 0
     var depthRayVisits: Int64 = 0
+    var carvedVoxels: Int64 = 0
+    var restoredVoxels: Int64 = 0
     var depthTransientUnavailableCount: Int64 = 0
     var depthFailureCount: Int64 = 0
     var lastDepthFusionNanoseconds: Int64 = 0
     var maxDepthFusionNanoseconds: Int64 = 0
+    var depthFusionP95Nanoseconds: Int64 = 0
+    var callbackCopyP95Nanoseconds: Int64 = 0
+    var coalescedFeatureObservations: Int64 = 0
+    var coalescedDepthObservations: Int64 = 0
+    var coalescedGeometryChanges: Int64 = 0
+    var geometryRevision: Int64 = 0
+    var pendingGeometryKeys = 0
+    var unacknowledgedGeometryCallbacks = 0
+    var publishedDeltaCount: Int64 = 0
+    var snapshotRecoveryCount: Int64 = 0
+    var geometryAcknowledgementCount: Int64 = 0
+    var rendererRows = 0
+    var rendererFreeRows = 0
 
     func health(renderer: String = "configured") -> [String: String] {
         let total: String
@@ -442,22 +464,50 @@ struct VisibilityGridDiagnostics {
             "stableVoxels": stableVoxels,
             "featureTrackCapacity": featureTrackCapacity,
             "stableVoxelCapacity": stableVoxelCapacity,
+            "featureObservationCount": featureObservationCount,
+            "featureMigrations": featureMigrations,
+            "featureJumpResets": featureJumpResets,
+            "candidateExpirations": candidateExpirations,
+            "supportRemovals": supportRemovals,
+            "acceptedSamples": acceptedSamples,
+            "rejectedSamples": rejectedSamples,
             "capacityRejectedCandidates": capacityRejectedCandidates,
             "featureTransientUnavailableCount":
                 featureTransientUnavailableCount,
             "featureFailureCount": featureFailureCount,
             "lastFeatureFusionNs": lastFeatureFusionNanoseconds,
             "maxFeatureFusionNs": maxFeatureFusionNanoseconds,
+            "featureFusionP95Ns": featureFusionP95Nanoseconds,
             "estimatedStateBytes": estimatedStateBytes,
+            "depthObservationCount": depthObservationCount,
             "depthAcceptedPixels": depthAcceptedPixels,
             "depthRejectedPixels": depthRejectedPixels,
             "depthCapacityRejectedPixels": depthCapacityRejectedPixels,
             "depthRayVisits": depthRayVisits,
+            "carvedVoxels": carvedVoxels,
+            "restoredVoxels": restoredVoxels,
             "depthTransientUnavailableCount":
                 depthTransientUnavailableCount,
             "depthFailureCount": depthFailureCount,
             "lastDepthFusionNs": lastDepthFusionNanoseconds,
-            "maxDepthFusionNs": maxDepthFusionNanoseconds
+            "maxDepthFusionNs": maxDepthFusionNanoseconds,
+            "depthFusionP95Ns": depthFusionP95Nanoseconds,
+            "callbackCopyP95Ns": callbackCopyP95Nanoseconds,
+            "coalescedFeatureObservations":
+                coalescedFeatureObservations,
+            "coalescedDepthObservations":
+                coalescedDepthObservations,
+            "coalescedGeometryChanges": coalescedGeometryChanges,
+            "geometryRevision": geometryRevision,
+            "pendingGeometryKeys": pendingGeometryKeys,
+            "unacknowledgedGeometryCallbacks":
+                unacknowledgedGeometryCallbacks,
+            "publishedDeltaCount": publishedDeltaCount,
+            "snapshotRecoveryCount": snapshotRecoveryCount,
+            "geometryAcknowledgementCount":
+                geometryAcknowledgementCount,
+            "rendererRows": rendererRows,
+            "rendererFreeRows": rendererFreeRows
         ]
     }
 }

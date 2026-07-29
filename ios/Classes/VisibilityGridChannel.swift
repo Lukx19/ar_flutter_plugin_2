@@ -3,13 +3,22 @@ import Flutter
 import Foundation
 import SceneKit
 
-private struct VisibilityGridObservationWork {
+private struct VisibilityGridObservationContext {
     let token: Int64
     let identity: VisibilityGridIdentity
+}
+
+private struct VisibilityGridFeatureWork {
+    let context: VisibilityGridObservationContext
     let featureTimestampNanoseconds: Int64
     let features: [UnassociatedFeatureSample]?
     let sourceRejectedFeatures: Int
     let featureUnavailable: Bool
+}
+
+private struct VisibilityGridDepthWork {
+    let context: VisibilityGridObservationContext
+    let timestampNanoseconds: Int64
     let depth: SceneDepthAcquisition
 }
 
@@ -36,7 +45,8 @@ final class VisibilityGridChannel {
     private var depthConfiguration: VisibilityGridDepthConfiguration?
     private var sessionGeneration: Int64 = 0
     private var visibilityRevision: Int64 = 0
-    private var pending: VisibilityGridObservationWork?
+    private let sensorHandoff =
+        LatestSensorHandoff<VisibilityGridFeatureWork, VisibilityGridDepthWork>()
     private var draining = false
     private var disposed = false
     private var paused = false
@@ -46,6 +56,10 @@ final class VisibilityGridChannel {
     private var lastEmittedHealth: [String: String]?
     private var lastEmittedGeometryRevision: Int64 = -1
     private var rendererHealth = "configured"
+    private var coalescedFeatureObservations: Int64 = 0
+    private var coalescedDepthObservations: Int64 = 0
+    private var callbackCopySamples: [Int64] = []
+    private var healthHeartbeatGeneration: Int64 = 0
 
     init(
         messenger: FlutterBinaryMessenger,
@@ -69,6 +83,7 @@ final class VisibilityGridChannel {
     }
 
     func onFrame(_ frame: ARFrame) {
+        let callbackStarted = DispatchTime.now().uptimeNanoseconds
         lock.lock()
         guard !disposed, !paused, !checkpointActive,
             let activeGroup = group,
@@ -98,15 +113,23 @@ final class VisibilityGridChannel {
         } else {
             depth = .transientlyUnavailable
         }
-        let work = VisibilityGridObservationWork(
+        let context = VisibilityGridObservationContext(
             token: token,
-            identity: activeGroup.identity,
+            identity: activeGroup.identity
+        )
+        let featureWork = VisibilityGridFeatureWork(
+            context: context,
             featureTimestampNanoseconds:
                 feature?.timestampNanoseconds ??
                 max(0, Int64(frame.timestamp * 1_000_000_000)),
             features: feature?.samples,
             sourceRejectedFeatures: feature?.rejectedSamples ?? 0,
-            featureUnavailable: frame.rawFeaturePoints == nil,
+            featureUnavailable: frame.rawFeaturePoints == nil
+        )
+        let depthWork = VisibilityGridDepthWork(
+            context: context,
+            timestampNanoseconds:
+                max(0, Int64(frame.timestamp * 1_000_000_000)),
             depth: depth
         )
         lock.lock()
@@ -117,7 +140,20 @@ final class VisibilityGridChannel {
             lock.unlock()
             return
         }
-        pending = work
+        let callbackElapsed =
+            Int64(DispatchTime.now().uptimeNanoseconds - callbackStarted)
+        callbackCopySamples.append(max(0, callbackElapsed))
+        if callbackCopySamples.count > 256 {
+            callbackCopySamples.removeFirst(
+                callbackCopySamples.count - 256
+            )
+        }
+        if sensorHandoff.offerFeature(featureWork) {
+            coalescedFeatureObservations += 1
+        }
+        if sensorHandoff.offerDepth(depthWork) {
+            coalescedDepthObservations += 1
+        }
         if draining {
             lock.unlock()
             return
@@ -135,9 +171,10 @@ final class VisibilityGridChannel {
                 return
             }
             paused = true
-            pending = nil
+            sensorHandoff.clear()
             checkpointActive = false
             lifecycle.pause()
+            healthHeartbeatGeneration += 1
             lock.unlock()
         }
     }
@@ -153,6 +190,7 @@ final class VisibilityGridChannel {
             lifecycle.resume()
             lock.unlock()
         }
+        restartHealthHeartbeat()
     }
 
     func resetSession() {
@@ -166,8 +204,9 @@ final class VisibilityGridChannel {
                 return
             }
             resetIdentity = group?.identity
-            pending = nil
+            sensorHandoff.clear()
             checkpointActive = false
+            healthHeartbeatGeneration += 1
             lifecycle.resetSession()
             resetToken = lifecycle.token
             sessionGeneration += 1
@@ -216,8 +255,9 @@ final class VisibilityGridChannel {
             lock.lock()
             if !disposed {
                 disposed = true
-                pending = nil
+                sensorHandoff.clear()
                 lifecycle.dispose()
+                healthHeartbeatGeneration += 1
                 group = nil
                 didDispose = true
             }
@@ -335,6 +375,11 @@ final class VisibilityGridChannel {
             ]
         case "requestSnapshot":
             return try requestSnapshot(arguments(call))
+        case "getHealth":
+            guard let payload = healthWireMap() else {
+                throw VisibilityGridContractError.notInitialized
+            }
+            return payload
         case "applyVisibility":
             return try applyVisibility(arguments(call))
         case "checkpointBarrier":
@@ -382,8 +427,9 @@ final class VisibilityGridChannel {
         case "stopGrid":
             _ = try requireIdentity(arguments(call))
             lock.lock()
-            pending = nil
+            sensorHandoff.clear()
             checkpointActive = false
+            healthHeartbeatGeneration += 1
             lifecycle.changeGroup()
             group = nil
             lock.unlock()
@@ -524,8 +570,12 @@ final class VisibilityGridChannel {
         depthConfiguration = depth
         maximumFeatures = featureConfiguration.maxFeaturesPerObservation
         minimumFeatureConfidence = featureConfiguration.minimumConfidence
-        pending = nil
+        sensorHandoff.clear()
+        coalescedFeatureObservations = 0
+        coalescedDepthObservations = 0
+        callbackCopySamples.removeAll(keepingCapacity: true)
         checkpointActive = false
+        healthHeartbeatGeneration += 1
         lifecycle.resetSession()
         group = nil
         lock.unlock()
@@ -537,6 +587,14 @@ final class VisibilityGridChannel {
             "renderer": "healthy",
             "totalGrid": "healthy"
         ]
+        var diagnostics = VisibilityGridDiagnostics()
+        diagnostics.featureTrackCapacity =
+            featureConfiguration.featureTrackCapacity
+        diagnostics.stableVoxelCapacity =
+            featureConfiguration.stableVoxelCapacity
+        diagnostics.rendererFreeRows =
+            featureConfiguration.stableVoxelCapacity
+        diagnostics.estimatedStateBytes = 8_192
         return [
             "version": visibilityGridWireVersion,
             "sessionGeneration": initializedSessionGeneration,
@@ -550,7 +608,8 @@ final class VisibilityGridChannel {
             "renderCapacity": featureConfiguration.stableVoxelCapacity,
             "featureTrackCapacity":
                 featureConfiguration.featureTrackCapacity,
-            "health": lastEmittedHealth!
+            "health": lastEmittedHealth!,
+            "diagnostics": diagnostics.wireMap()
         ]
     }
 
@@ -609,10 +668,13 @@ final class VisibilityGridChannel {
         )
         visibilityRevision = next.restoredVisibilityRevision
         lock.lock()
-        pending = nil
+        sensorHandoff.clear()
         checkpointActive = false
         lifecycle.changeGroup()
         group = next
+        coalescedFeatureObservations = 0
+        coalescedDepthObservations = 0
+        callbackCopySamples.removeAll(keepingCapacity: true)
         lock.unlock()
         guard let delta = activeGrid.requestSnapshot(
             identity: next.identity,
@@ -632,7 +694,8 @@ final class VisibilityGridChannel {
         rendererHealth = "healthy"
         lastEmittedGeometryRevision = delta.geometryRevision
         publishRenderer()
-        return delta.wireMap(rendererHealth: rendererHealth)
+        restartHealthHeartbeat()
+        return deltaWireMap(delta)
     }
 
     private func requestSnapshot(
@@ -658,7 +721,7 @@ final class VisibilityGridChannel {
         rendererHealth = "healthy"
         lastEmittedGeometryRevision = delta.geometryRevision
         publishRenderer()
-        return delta.wireMap(rendererHealth: rendererHealth)
+        return deltaWireMap(delta)
     }
 
     private func applyVisibility(
@@ -720,7 +783,7 @@ final class VisibilityGridChannel {
             )
         }
         checkpointActive = true
-        pending = nil
+        sensorHandoff.clear()
         lock.unlock()
         guard let delta = try requireGrid().requestSnapshot(
             identity: identity,
@@ -747,83 +810,56 @@ final class VisibilityGridChannel {
         rendererHealth = "healthy"
         lastEmittedGeometryRevision = delta.geometryRevision
         publishRenderer()
-        return delta.wireMap(rendererHealth: rendererHealth)
+        return deltaWireMap(delta)
     }
 
     private func drain() {
         while true {
             lock.lock()
-            guard let work = pending else {
+            guard let work = sensorHandoff.take() else {
                 draining = false
                 lock.unlock()
                 return
             }
-            pending = nil
-            let valid =
-                lifecycle.allows(work.token) &&
-                group?.identity == work.identity
             lock.unlock()
-            guard valid, let activeGrid = grid else { continue }
+            guard let activeGrid = grid else { continue }
             do {
-                if let features = work.features,
-                    let associator {
-                    let associated = associator.associate(
-                        timestampNanoseconds:
-                            work.featureTimestampNanoseconds,
-                        samples: features
-                    )
-                    try activeGrid.observeFeatures(
-                        FeatureObservation(
-                            timestampNanoseconds:
-                                work.featureTimestampNanoseconds,
-                            groupGeneration:
-                                work.identity.groupGeneration,
-                            sessionGeneration:
-                                work.identity.sessionGeneration,
-                            samples: associated.samples,
-                            sourceRejectedSamples:
-                                work.sourceRejectedFeatures +
-                                associated.rejectedSamples
+                for source in sensorProcessingOrder(
+                    featureTimestampNanoseconds:
+                        work.feature?.featureTimestampNanoseconds,
+                    depthTimestampNanoseconds:
+                        work.depth?.timestampNanoseconds
+                ) {
+                    switch source {
+                    case .feature:
+                        try consumeFeature(
+                            work.feature!,
+                            using: activeGrid
                         )
-                    )
-                } else if work.featureUnavailable {
-                    activeGrid.reportFeatureTransientUnavailable()
-                }
-                switch work.depth {
-                case .observation(let observation):
-                    _ = try activeGrid.observeDepth(observation)
-                case .transientlyUnavailable:
-                    activeGrid.reportDepthTransientUnavailable()
-                case .failure(let reason):
-                    let previousDepthHealth =
-                        activeGrid.snapshot().diagnostics.depthHealth
-                    activeGrid.reportDepthFailure()
-                    let currentDepthHealth =
-                        activeGrid.snapshot().diagnostics.depthHealth
-                    if previousDepthHealth != "failed" &&
-                        currentDepthHealth == "failed" {
-                        emitError(
-                            code: "VG_DEPTH_FAILED",
-                            message:
-                                "\(reason); continuing feature-only"
+                    case .depth:
+                        try consumeDepth(
+                            work.depth!,
+                            using: activeGrid
                         )
                     }
                 }
+                guard let context =
+                    work.depth?.context ?? work.feature?.context,
+                    isCurrent(context)
+                else { continue }
                 let health = activeGrid.snapshot().diagnostics.health(
                     renderer: rendererHealth
                 )
                 if health != lastEmittedHealth {
                     lastEmittedHealth = health
+                    let healthPayload = healthWireMap()
                     DispatchQueue.main.async { [weak self] in
-                        guard let self, self.isCurrent(work) else {
+                        guard let self, self.isCurrent(context) else {
                             return
                         }
                         self.channel.invokeMethod(
                             "onGridHealth",
-                            arguments: [
-                                "version": visibilityGridWireVersion,
-                                "sourceHealth": health
-                            ]
+                            arguments: healthPayload
                         )
                     }
                 }
@@ -856,28 +892,25 @@ final class VisibilityGridChannel {
                             )
                         if failedHealth != lastEmittedHealth {
                             lastEmittedHealth = failedHealth
+                            let healthPayload = healthWireMap()
                             DispatchQueue.main.async { [weak self] in
-                                guard let self, self.isCurrent(work) else {
+                                guard let self,
+                                    self.isCurrent(context)
+                                else {
                                     return
                                 }
                                 self.channel.invokeMethod(
                                     "onGridHealth",
-                                    arguments: [
-                                        "version":
-                                            visibilityGridWireVersion,
-                                        "sourceHealth": failedHealth
-                                    ]
+                                    arguments: healthPayload
                                 )
                             }
                         }
                     }
                     let renderSnapshot =
                         rendererApplied ? renderer?.snapshot() : nil
-                    let deltaWireMap = delta.wireMap(
-                        rendererHealth: rendererHealth
-                    )
+                    let wirePayload = deltaWireMap(delta)
                     DispatchQueue.main.async { [weak self] in
-                        guard let self, self.isCurrent(work) else {
+                        guard let self, self.isCurrent(context) else {
                             return
                         }
                         if rendererApplied {
@@ -885,7 +918,7 @@ final class VisibilityGridChannel {
                         }
                         self.channel.invokeMethod(
                             "onGridDelta",
-                            arguments: deltaWireMap
+                            arguments: wirePayload
                         )
                     }
                 }
@@ -893,6 +926,62 @@ final class VisibilityGridChannel {
                 emitError(
                     code: "VG_INTERNAL",
                     message: String(describing: error)
+                )
+            }
+        }
+    }
+
+    private func consumeFeature(
+        _ work: VisibilityGridFeatureWork,
+        using grid: NativeVisibilityGrid
+    ) throws {
+        guard isCurrent(work.context) else { return }
+        if let features = work.features,
+            let associator {
+            let associated = associator.associate(
+                timestampNanoseconds: work.featureTimestampNanoseconds,
+                samples: features
+            )
+            try grid.observeFeatures(
+                FeatureObservation(
+                    timestampNanoseconds:
+                        work.featureTimestampNanoseconds,
+                    groupGeneration:
+                        work.context.identity.groupGeneration,
+                    sessionGeneration:
+                        work.context.identity.sessionGeneration,
+                    samples: associated.samples,
+                    sourceRejectedSamples:
+                        work.sourceRejectedFeatures +
+                        associated.rejectedSamples
+                )
+            )
+        } else if work.featureUnavailable {
+            grid.reportFeatureTransientUnavailable()
+        }
+    }
+
+    private func consumeDepth(
+        _ work: VisibilityGridDepthWork,
+        using grid: NativeVisibilityGrid
+    ) throws {
+        guard isCurrent(work.context) else { return }
+        switch work.depth {
+        case .observation(let observation):
+            _ = try grid.observeDepth(observation)
+        case .transientlyUnavailable:
+            grid.reportDepthTransientUnavailable()
+        case .failure(let reason):
+            let previousDepthHealth =
+                grid.snapshot().diagnostics.depthHealth
+            grid.reportDepthFailure()
+            let currentDepthHealth =
+                grid.snapshot().diagnostics.depthHealth
+            if previousDepthHealth != "failed" &&
+                currentDepthHealth == "failed" {
+                emitError(
+                    code: "VG_DEPTH_FAILED",
+                    message: "\(reason); continuing feature-only"
                 )
             }
         }
@@ -931,7 +1020,9 @@ final class VisibilityGridChannel {
         )
     }
 
-    private func isCurrent(_ work: VisibilityGridObservationWork) -> Bool {
+    private func isCurrent(
+        _ work: VisibilityGridObservationContext
+    ) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         return !disposed &&
@@ -955,6 +1046,121 @@ final class VisibilityGridChannel {
                 self.sceneRenderer.render(snapshot)
             }
         }
+    }
+
+    private func restartHealthHeartbeat() {
+        lock.lock()
+        healthHeartbeatGeneration += 1
+        let generation = healthHeartbeatGeneration
+        let shouldSchedule =
+            !disposed && !paused && group != nil
+        lock.unlock()
+        guard shouldSchedule else { return }
+        scheduleHealthHeartbeat(generation)
+    }
+
+    private func scheduleHealthHeartbeat(_ generation: Int64) {
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .seconds(1)
+        ) { [weak self] in
+            self?.queue.async { [weak self] in
+                self?.emitHealthHeartbeat(generation)
+            }
+        }
+    }
+
+    private func emitHealthHeartbeat(_ generation: Int64) {
+        lock.lock()
+        let valid =
+            !disposed &&
+            !paused &&
+            group != nil &&
+            generation == healthHeartbeatGeneration
+        lock.unlock()
+        guard valid, let payload = healthWireMap() else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let stillValid =
+                !self.disposed &&
+                !self.paused &&
+                self.group != nil &&
+                generation == self.healthHeartbeatGeneration
+            self.lock.unlock()
+            guard stillValid else { return }
+            self.channel.invokeMethod(
+                "onGridHealth",
+                arguments: payload
+            )
+        }
+        scheduleHealthHeartbeat(generation)
+    }
+
+    private func enrichedDiagnostics(
+        _ diagnostics: VisibilityGridDiagnostics
+    ) -> VisibilityGridDiagnostics {
+        lock.lock()
+        let featureCoalescing = coalescedFeatureObservations
+        let depthCoalescing = coalescedDepthObservations
+        let sortedCallbackSamples = callbackCopySamples.sorted()
+        lock.unlock()
+        let callbackP95: Int64
+        if sortedCallbackSamples.isEmpty {
+            callbackP95 = 0
+        } else {
+            let index = min(
+                sortedCallbackSamples.count - 1,
+                max(
+                    0,
+                    (sortedCallbackSamples.count * 95 + 99) / 100 - 1
+                )
+            )
+            callbackP95 = sortedCallbackSamples[index]
+        }
+        var enriched = diagnostics
+        enriched.callbackCopyP95Nanoseconds = callbackP95
+        enriched.coalescedFeatureObservations = featureCoalescing
+        enriched.coalescedDepthObservations = depthCoalescing
+        let freeRows = renderer?.freeRowCount ??
+            diagnostics.stableVoxelCapacity
+        enriched.rendererRows =
+            (renderer?.capacity ?? diagnostics.stableVoxelCapacity) - freeRows
+        enriched.rendererFreeRows = freeRows
+        return enriched
+    }
+
+    private func healthWireMap() -> [String: Any]? {
+        guard group != nil, let grid else { return nil }
+        let diagnostics = enrichedDiagnostics(
+            grid.snapshot().diagnostics
+        )
+        return [
+            "version": visibilityGridWireVersion,
+            "sourceHealth":
+                diagnostics.health(renderer: rendererHealth),
+            "diagnostics": diagnostics.wireMap()
+        ]
+    }
+
+    private func deltaWireMap(
+        _ delta: VisibilityGridDelta
+    ) -> [String: Any] {
+        let freeRows = renderer?.freeRowCount ?? delta.capacity
+        let enriched = enrichedDiagnostics(delta.diagnostics)
+        return VisibilityGridDelta(
+            identity: delta.identity,
+            baseGeometryRevision: delta.baseGeometryRevision,
+            geometryRevision: delta.geometryRevision,
+            reset: delta.reset,
+            upsertKeys: delta.upsertKeys,
+            removalKeys: delta.removalKeys,
+            capacity: delta.capacity,
+            diagnostics: enriched
+        ).wireMap(
+            rendererHealth: rendererHealth,
+            rendererRows: delta.capacity - freeRows,
+            rendererFreeRows: freeRows
+        )
     }
 
     private func emitError(code: String, message: String) {
@@ -1121,8 +1327,17 @@ final class VisibilityGridChannel {
 }
 
 private extension VisibilityGridDelta {
-    func wireMap(rendererHealth: String) -> [String: Any] {
-        [
+    func wireMap(
+        rendererHealth: String,
+        rendererRows: Int? = nil,
+        rendererFreeRows: Int? = nil
+    ) -> [String: Any] {
+        var wireDiagnostics = diagnostics
+        if let rendererRows, let rendererFreeRows {
+            wireDiagnostics.rendererRows = rendererRows
+            wireDiagnostics.rendererFreeRows = rendererFreeRows
+        }
+        return [
             "version": visibilityGridWireVersion,
             "groupId": identity.groupId,
             "groupGeneration": identity.groupGeneration,
@@ -1134,7 +1349,7 @@ private extension VisibilityGridDelta {
             "removalKeys": visibilityGridInt64Data(removalKeys),
             "capacity": capacity,
             "sourceHealth": diagnostics.health(renderer: rendererHealth),
-            "diagnostics": diagnostics.wireMap()
+            "diagnostics": wireDiagnostics.wireMap()
         ]
     }
 }

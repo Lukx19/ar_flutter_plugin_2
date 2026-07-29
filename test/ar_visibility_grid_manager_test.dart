@@ -44,6 +44,7 @@ void main() {
             'renderCapacity': 100,
             'featureTrackCapacity': 200,
             'health': _health(),
+            'diagnostics': _initialDiagnostics(100, 200),
           },
         'startGrid' => _delta(revision: 1, reset: true),
         'ackGeometry' => <String, Object>{'accepted': true},
@@ -51,6 +52,11 @@ void main() {
         'checkpointBarrier' => _delta(revision: 8, reset: true),
         'releaseCheckpoint' => <String, Object>{'released': true},
         'applyVisibility' => <String, Object>{'applied': true},
+        'getHealth' => <String, Object>{
+            'version': visibilityGridWireVersion,
+            'sourceHealth': _health(),
+            'diagnostics': _diagnostics(1),
+          },
         'setPointsEnabled' ||
         'setVoxelRenderMode' ||
         'stopGrid' ||
@@ -70,8 +76,10 @@ void main() {
     final manager = ARVisibilityGridManager(91);
     final received = <ARVisibilityGridDelta>[];
     final health = <ARVisibilityGridSourceHealth>[];
+    final diagnostics = <ARVisibilityGridDiagnostics>[];
     manager.deltas.listen(received.add);
     manager.health.listen(health.add);
+    manager.diagnostics.listen(diagnostics.add);
     final initialized = await manager.initialize(
       ARVisibilityGridNativeConfig(
         renderCapacity: 100,
@@ -80,6 +88,8 @@ void main() {
       ),
     );
     expect(initialized.sessionGeneration, 4);
+    expect(initialized.diagnostics.geometryRevision, 0);
+    expect(initialized.diagnostics.rendererFreeRows, 100);
 
     final started = await manager.startGrid(
       ARVisibilityGridGroupConfig(
@@ -106,11 +116,14 @@ void main() {
         ..._health(),
         'depth': 'transientUnavailable',
       },
+      'diagnostics': _diagnostics(2),
     });
     expect(
       health.single.depth,
       ARVisibilityGridSourceState.transientUnavailable,
     );
+    expect(diagnostics.single.geometryRevision, 2);
+    expect((await manager.getHealth()).diagnostics.geometryRevision, 1);
     expect(await manager.ackGeometry(received.single), isTrue);
     expect((await manager.requestSnapshot(received.single)).reset, isTrue);
     final barrier = await manager.checkpointBarrier(
@@ -135,6 +148,7 @@ void main() {
     expect(calls.map((call) => call.method), <String>[
       'init',
       'startGrid',
+      'getHealth',
       'ackGeometry',
       'requestSnapshot',
       'checkpointBarrier',
@@ -166,6 +180,26 @@ Map<String, Object> _health() => const <String, Object>{
       'totalGrid': 'healthy',
     };
 
+Map<String, Object> _initialDiagnostics(int capacity, int featureCapacity) =>
+    <String, Object>{
+      ..._diagnostics(0),
+      'stableTracks': 0,
+      'stableVoxels': 0,
+      'featureTrackCapacity': featureCapacity,
+      'stableVoxelCapacity': capacity,
+      'featureObservationCount': 0,
+      'acceptedSamples': 0,
+      'lastFeatureFusionNs': 0,
+      'maxFeatureFusionNs': 0,
+      'featureFusionP95Ns': 0,
+      'estimatedStateBytes': 0,
+      'unacknowledgedGeometryCallbacks': 0,
+      'publishedDeltaCount': 0,
+      'geometryAcknowledgementCount': 0,
+      'rendererRows': 0,
+      'rendererFreeRows': capacity,
+    };
+
 Map<String, Object> _delta({required int revision, bool reset = false}) =>
     <String, Object>{
       'version': visibilityGridWireVersion,
@@ -179,6 +213,53 @@ Map<String, Object> _delta({required int revision, bool reset = false}) =>
       'removalKeys': Int64List(0),
       'capacity': 100,
       'sourceHealth': _health(),
+      'diagnostics': _diagnostics(revision),
+    };
+
+Map<String, Object> _diagnostics(int revision) => <String, Object>{
+      'candidateTracks': 0,
+      'stableTracks': 1,
+      'stableVoxels': 1,
+      'featureTrackCapacity': 10,
+      'stableVoxelCapacity': 100,
+      'featureObservationCount': 1,
+      'featureMigrations': 0,
+      'featureJumpResets': 0,
+      'candidateExpirations': 0,
+      'supportRemovals': 0,
+      'acceptedSamples': 1,
+      'rejectedSamples': 0,
+      'capacityRejectedCandidates': 0,
+      'featureTransientUnavailableCount': 0,
+      'featureFailureCount': 0,
+      'lastFeatureFusionNs': 1,
+      'maxFeatureFusionNs': 1,
+      'featureFusionP95Ns': 1,
+      'estimatedStateBytes': 512,
+      'depthObservationCount': 0,
+      'depthAcceptedPixels': 0,
+      'depthRejectedPixels': 0,
+      'depthCapacityRejectedPixels': 0,
+      'depthRayVisits': 0,
+      'carvedVoxels': 0,
+      'restoredVoxels': 0,
+      'depthTransientUnavailableCount': 0,
+      'depthFailureCount': 0,
+      'lastDepthFusionNs': 0,
+      'maxDepthFusionNs': 0,
+      'depthFusionP95Ns': 0,
+      'callbackCopyP95Ns': 0,
+      'coalescedFeatureObservations': 0,
+      'coalescedDepthObservations': 0,
+      'coalescedGeometryChanges': 0,
+      'geometryRevision': revision,
+      'pendingGeometryKeys': 0,
+      'unacknowledgedGeometryCallbacks': 1,
+      'publishedDeltaCount': revision,
+      'snapshotRecoveryCount': 0,
+      'geometryAcknowledgementCount': revision - 1,
+      'rendererRows': 1,
+      'rendererFreeRows': 99,
     };
 
 const List<double> _identity = <double>[

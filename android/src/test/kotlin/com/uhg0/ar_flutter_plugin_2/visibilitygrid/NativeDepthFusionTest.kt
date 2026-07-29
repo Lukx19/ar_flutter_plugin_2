@@ -199,6 +199,11 @@ class NativeDepthFusionTest {
             )
         }
         assertTrue(staleKey in grid.snapshot().stableKeys)
+        val diagnostics = grid.snapshot().diagnostics
+        assertEquals(12, diagnostics.depthObservationCount)
+        assertEquals(1, diagnostics.carvedVoxels)
+        assertEquals(1, diagnostics.restoredVoxels)
+        assertTrue(diagnostics.depthFusionP95Ns > 0)
 
         grid.observeDepth(singleRay(40L, 0.05, 0.05))
         assertTrue(staleKey in grid.snapshot().stableKeys)

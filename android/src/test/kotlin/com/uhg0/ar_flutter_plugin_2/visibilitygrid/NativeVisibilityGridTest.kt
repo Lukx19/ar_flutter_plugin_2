@@ -93,6 +93,9 @@ class NativeVisibilityGridTest {
         assertTrue(reset.stableKeys.isEmpty())
         assertEquals(0, reset.diagnostics.stableTracks)
         assertEquals(1, reset.diagnostics.candidateTracks)
+        assertEquals(1, reset.diagnostics.featureMigrations)
+        assertEquals(1, reset.diagnostics.featureJumpResets)
+        assertEquals(2, reset.diagnostics.supportRemovals)
 
         listOf(1_000_000_000L, 1_125_000_000L, 1_250_000_000L, 1_375_000_000L)
             .forEach { timestamp ->
@@ -102,6 +105,7 @@ class NativeVisibilityGridTest {
             listOf(packVisibilityGridKey(21, 0, 0)),
             grid.snapshot().stableKeys,
         )
+        assertEquals(12, grid.snapshot().diagnostics.featureObservationCount)
     }
 
     @Test
@@ -180,6 +184,11 @@ class NativeVisibilityGridTest {
         assertEquals(2, coalesced.geometryRevision)
         assertEquals(listOf(packVisibilityGridKey(0, 0, 0)), coalesced.upsertKeys)
         assertEquals(listOf(packVisibilityGridKey(1, 0, 0)), coalesced.removalKeys)
+        assertTrue(coalesced.diagnostics.coalescedGeometryChanges > 0)
+        assertEquals(2, coalesced.diagnostics.publishedDeltaCount)
+        assertEquals(1, coalesced.diagnostics.unacknowledgedGeometryCallbacks)
+        assertEquals(coalesced.geometryRevision, coalesced.diagnostics.geometryRevision)
+        assertEquals(coalesced.upsertKeys.size, coalesced.diagnostics.rendererRows)
         val wire = coalesced.toWireMap()
         assertTrue("featureIds" !in wire)
         assertTrue("points" !in wire)
@@ -203,7 +212,9 @@ class NativeVisibilityGridTest {
         assertEquals(0, snapshot.baseGeometryRevision)
         assertTrue(snapshot.geometryRevision > coalesced.geometryRevision)
         assertEquals(listOf(packVisibilityGridKey(0, 0, 0)), snapshot.upsertKeys)
+        assertEquals(1, snapshot.diagnostics.snapshotRecoveryCount)
         assertTrue(grid.ackGeometry(ack(snapshot.geometryRevision)))
+        assertEquals(2, grid.snapshot().diagnostics.geometryAcknowledgementCount)
     }
 
     @Test
@@ -318,6 +329,7 @@ class NativeVisibilityGridTest {
         assertEquals(listOf(packVisibilityGridKey(2, 0, 0)), expired.stableKeys)
         assertEquals(1, expired.diagnostics.stableTracks)
         assertEquals(1, expired.diagnostics.candidateTracks)
+        assertEquals(1, expired.diagnostics.candidateExpirations)
 
         assertFails { grid.startGroup(group().copy(capacity = 10)) }
         grid.startGroup(
@@ -565,6 +577,37 @@ class NativeVisibilityGridTest {
         assertEquals(100_000, defaults.stableVoxelCapacity)
         assertEquals(200_000, defaults.featureTrackCapacity)
         assertFails { VisibilityGridFeatureConfig(maxFeaturesPerObservation = 2_001) }
+    }
+
+    @Test
+    fun `zero accepted observations do not enter normalized feature latency p95`() {
+        val grid =
+            NativeVisibilityGrid(
+                VisibilityGridFeatureConfig(
+                    stableVoxelCapacity = 10,
+                    featureTrackCapacity = 10,
+                    candidateSamples = 1,
+                    candidateSpanNs = 0,
+                ),
+            )
+        grid.startGroup(group().copy(capacity = 10))
+        grid.observe(feature(timestampNs = 1, x = 0.02, y = 0.02, z = 0.02))
+        val p95AfterAccepted = grid.snapshot().diagnostics.featureFusionP95Ns
+
+        grid.observe(
+            FeatureObservation(
+                timestampNs = 2,
+                groupGeneration = 1,
+                sessionGeneration = 1,
+                samples = emptyList(),
+                sanitized = true,
+            ),
+        )
+
+        assertEquals(
+            p95AfterAccepted,
+            grid.snapshot().diagnostics.featureFusionP95Ns,
+        )
     }
 
     private fun newGrid() =

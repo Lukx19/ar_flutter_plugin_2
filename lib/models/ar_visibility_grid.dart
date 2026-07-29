@@ -178,6 +178,7 @@ class ARVisibilityGridInitializationResult {
     required this.renderCapacity,
     required this.featureTrackCapacity,
     required this.health,
+    required this.diagnostics,
   });
 
   /// Parses a native result, throwing [FormatException] on contract drift.
@@ -204,6 +205,7 @@ class ARVisibilityGridInitializationResult {
     final renderCapacity = map['renderCapacity'];
     final featureTrackCapacity = map['featureTrackCapacity'];
     final health = map['health'];
+    final diagnostics = map['diagnostics'];
     if (sessionGeneration is! int ||
         sessionGeneration < 0 ||
         rendererReady is! bool ||
@@ -213,9 +215,18 @@ class ARVisibilityGridInitializationResult {
         renderCapacity <= 0 ||
         featureTrackCapacity is! int ||
         featureTrackCapacity <= 0 ||
-        health is! Map<Object?, Object?>) {
+        health is! Map<Object?, Object?> ||
+        diagnostics is! Map<Object?, Object?>) {
       throw const FormatException(
         'Invalid visibility-grid initialization result.',
+      );
+    }
+    final parsedDiagnostics = ARVisibilityGridDiagnostics.fromMap(diagnostics);
+    if (parsedDiagnostics.geometryRevision != 0 ||
+        parsedDiagnostics.featureTrackCapacity != featureTrackCapacity ||
+        parsedDiagnostics.stableVoxelCapacity != renderCapacity) {
+      throw const FormatException(
+        'Visibility-grid initialization diagnostics do not match capacities.',
       );
     }
     return ARVisibilityGridInitializationResult(
@@ -228,6 +239,7 @@ class ARVisibilityGridInitializationResult {
       renderCapacity: renderCapacity,
       featureTrackCapacity: featureTrackCapacity,
       health: ARVisibilityGridSourceHealth.fromMap(health),
+      diagnostics: parsedDiagnostics,
     );
   }
 
@@ -257,6 +269,9 @@ class ARVisibilityGridInitializationResult {
 
   /// Initial component health.
   final ARVisibilityGridSourceHealth health;
+
+  /// Zero-revision counters and negotiated native capacity baselines.
+  final ARVisibilityGridDiagnostics diagnostics;
 }
 
 /// Typed native visibility-grid failure.
@@ -560,6 +575,204 @@ class ARVisibilityGridSourceHealth {
   final ARVisibilityGridSourceState totalGrid;
 }
 
+/// Lightweight native heartbeat containing health and bounded diagnostics.
+class ARVisibilityGridHealthSnapshot {
+  const ARVisibilityGridHealthSnapshot({
+    required this.sourceHealth,
+    required this.diagnostics,
+  });
+
+  /// Parses the strict v1 health payload.
+  factory ARVisibilityGridHealthSnapshot.fromMap(Map<Object?, Object?> map) {
+    if (map['version'] != visibilityGridWireVersion ||
+        map['sourceHealth'] is! Map<Object?, Object?> ||
+        map['diagnostics'] is! Map<Object?, Object?>) {
+      throw const FormatException('Invalid visibility-grid health payload.');
+    }
+    return ARVisibilityGridHealthSnapshot(
+      sourceHealth: ARVisibilityGridSourceHealth.fromMap(
+        map['sourceHealth']! as Map<Object?, Object?>,
+      ),
+      diagnostics: ARVisibilityGridDiagnostics.fromMap(
+        map['diagnostics']! as Map<Object?, Object?>,
+      ),
+    );
+  }
+
+  /// Current component health.
+  final ARVisibilityGridSourceHealth sourceHealth;
+
+  /// Bounded counters sampled independently of geometry publication.
+  final ARVisibilityGridDiagnostics diagnostics;
+}
+
+/// Bounded native counters and latency samples carried with each geometry
+/// revision.
+///
+/// Raw feature coordinates, depth samples, and platform identifiers are never
+/// included.
+class ARVisibilityGridDiagnostics {
+  const ARVisibilityGridDiagnostics({
+    required this.candidateTracks,
+    required this.stableTracks,
+    required this.stableVoxels,
+    required this.featureTrackCapacity,
+    required this.stableVoxelCapacity,
+    required this.featureObservationCount,
+    required this.featureMigrations,
+    required this.featureJumpResets,
+    required this.candidateExpirations,
+    required this.supportRemovals,
+    required this.acceptedSamples,
+    required this.rejectedSamples,
+    required this.capacityRejectedCandidates,
+    required this.featureTransientUnavailableCount,
+    required this.featureFailureCount,
+    required this.lastFeatureFusionNs,
+    required this.maxFeatureFusionNs,
+    required this.featureFusionP95Ns,
+    required this.estimatedStateBytes,
+    required this.depthObservationCount,
+    required this.depthAcceptedPixels,
+    required this.depthRejectedPixels,
+    required this.depthCapacityRejectedPixels,
+    required this.depthRayVisits,
+    required this.carvedVoxels,
+    required this.restoredVoxels,
+    required this.depthTransientUnavailableCount,
+    required this.depthFailureCount,
+    required this.lastDepthFusionNs,
+    required this.maxDepthFusionNs,
+    required this.depthFusionP95Ns,
+    required this.callbackCopyP95Ns,
+    required this.coalescedFeatureObservations,
+    required this.coalescedDepthObservations,
+    required this.coalescedGeometryChanges,
+    required this.geometryRevision,
+    required this.pendingGeometryKeys,
+    required this.unacknowledgedGeometryCallbacks,
+    required this.publishedDeltaCount,
+    required this.snapshotRecoveryCount,
+    required this.geometryAcknowledgementCount,
+    required this.rendererRows,
+    required this.rendererFreeRows,
+  });
+
+  /// Parses a complete v1 diagnostics payload.
+  factory ARVisibilityGridDiagnostics.fromMap(Map<Object?, Object?> map) {
+    int read(String field) {
+      final value = map[field];
+      if (value is! int || value < 0) {
+        throw FormatException('Invalid visibility-grid diagnostic $field.');
+      }
+      return value;
+    }
+
+    final result = ARVisibilityGridDiagnostics(
+      candidateTracks: read('candidateTracks'),
+      stableTracks: read('stableTracks'),
+      stableVoxels: read('stableVoxels'),
+      featureTrackCapacity: read('featureTrackCapacity'),
+      stableVoxelCapacity: read('stableVoxelCapacity'),
+      featureObservationCount: read('featureObservationCount'),
+      featureMigrations: read('featureMigrations'),
+      featureJumpResets: read('featureJumpResets'),
+      candidateExpirations: read('candidateExpirations'),
+      supportRemovals: read('supportRemovals'),
+      acceptedSamples: read('acceptedSamples'),
+      rejectedSamples: read('rejectedSamples'),
+      capacityRejectedCandidates: read('capacityRejectedCandidates'),
+      featureTransientUnavailableCount:
+          read('featureTransientUnavailableCount'),
+      featureFailureCount: read('featureFailureCount'),
+      lastFeatureFusionNs: read('lastFeatureFusionNs'),
+      maxFeatureFusionNs: read('maxFeatureFusionNs'),
+      featureFusionP95Ns: read('featureFusionP95Ns'),
+      estimatedStateBytes: read('estimatedStateBytes'),
+      depthObservationCount: read('depthObservationCount'),
+      depthAcceptedPixels: read('depthAcceptedPixels'),
+      depthRejectedPixels: read('depthRejectedPixels'),
+      depthCapacityRejectedPixels: read('depthCapacityRejectedPixels'),
+      depthRayVisits: read('depthRayVisits'),
+      carvedVoxels: read('carvedVoxels'),
+      restoredVoxels: read('restoredVoxels'),
+      depthTransientUnavailableCount: read('depthTransientUnavailableCount'),
+      depthFailureCount: read('depthFailureCount'),
+      lastDepthFusionNs: read('lastDepthFusionNs'),
+      maxDepthFusionNs: read('maxDepthFusionNs'),
+      depthFusionP95Ns: read('depthFusionP95Ns'),
+      callbackCopyP95Ns: read('callbackCopyP95Ns'),
+      coalescedFeatureObservations: read('coalescedFeatureObservations'),
+      coalescedDepthObservations: read('coalescedDepthObservations'),
+      coalescedGeometryChanges: read('coalescedGeometryChanges'),
+      geometryRevision: read('geometryRevision'),
+      pendingGeometryKeys: read('pendingGeometryKeys'),
+      unacknowledgedGeometryCallbacks: read('unacknowledgedGeometryCallbacks'),
+      publishedDeltaCount: read('publishedDeltaCount'),
+      snapshotRecoveryCount: read('snapshotRecoveryCount'),
+      geometryAcknowledgementCount: read('geometryAcknowledgementCount'),
+      rendererRows: read('rendererRows'),
+      rendererFreeRows: read('rendererFreeRows'),
+    );
+    if (result.depthFusionP95Ns > result.maxDepthFusionNs ||
+        result.unacknowledgedGeometryCallbacks > 1 ||
+        result.candidateTracks + result.stableTracks >
+            result.featureTrackCapacity ||
+        result.stableVoxels > result.stableVoxelCapacity ||
+        result.rendererRows + result.rendererFreeRows !=
+            result.stableVoxelCapacity) {
+      throw const FormatException(
+        'Inconsistent visibility-grid diagnostics.',
+      );
+    }
+    return result;
+  }
+
+  final int candidateTracks;
+  final int stableTracks;
+  final int stableVoxels;
+  final int featureTrackCapacity;
+  final int stableVoxelCapacity;
+  final int featureObservationCount;
+  final int featureMigrations;
+  final int featureJumpResets;
+  final int candidateExpirations;
+  final int supportRemovals;
+  final int acceptedSamples;
+  final int rejectedSamples;
+  final int capacityRejectedCandidates;
+  final int featureTransientUnavailableCount;
+  final int featureFailureCount;
+  final int lastFeatureFusionNs;
+  final int maxFeatureFusionNs;
+  final int featureFusionP95Ns;
+  final int estimatedStateBytes;
+  final int depthObservationCount;
+  final int depthAcceptedPixels;
+  final int depthRejectedPixels;
+  final int depthCapacityRejectedPixels;
+  final int depthRayVisits;
+  final int carvedVoxels;
+  final int restoredVoxels;
+  final int depthTransientUnavailableCount;
+  final int depthFailureCount;
+  final int lastDepthFusionNs;
+  final int maxDepthFusionNs;
+  final int depthFusionP95Ns;
+  final int callbackCopyP95Ns;
+  final int coalescedFeatureObservations;
+  final int coalescedDepthObservations;
+  final int coalescedGeometryChanges;
+  final int geometryRevision;
+  final int pendingGeometryKeys;
+  final int unacknowledgedGeometryCallbacks;
+  final int publishedDeltaCount;
+  final int snapshotRecoveryCount;
+  final int geometryAcknowledgementCount;
+  final int rendererRows;
+  final int rendererFreeRows;
+}
+
 /// One bounded revisioned geometry change or full reset snapshot.
 class ARVisibilityGridDelta {
   ARVisibilityGridDelta({
@@ -573,6 +786,7 @@ class ARVisibilityGridDelta {
     required Int64List removalKeys,
     required this.capacity,
     required this.sourceHealth,
+    required this.diagnostics,
   })  : upsertKeys = Int64List.fromList(upsertKeys),
         removalKeys = Int64List.fromList(removalKeys);
 
@@ -594,6 +808,7 @@ class ARVisibilityGridDelta {
     final removalKeys = map['removalKeys'];
     final capacity = map['capacity'];
     final sourceHealth = map['sourceHealth'];
+    final diagnostics = map['diagnostics'];
     if (groupId is! String ||
         groupId.isEmpty ||
         groupGeneration is! int ||
@@ -609,7 +824,8 @@ class ARVisibilityGridDelta {
         removalKeys is! Int64List ||
         capacity is! int ||
         capacity <= 0 ||
-        sourceHealth is! Map<Object?, Object?>) {
+        sourceHealth is! Map<Object?, Object?> ||
+        diagnostics is! Map<Object?, Object?>) {
       throw const FormatException('Invalid visibility-grid geometry delta.');
     }
     if (!reset && geometryRevision != baseGeometryRevision + 1) {
@@ -633,6 +849,13 @@ class ARVisibilityGridDelta {
         'Visibility-grid delta exceeds its negotiated capacity.',
       );
     }
+    final parsedDiagnostics = ARVisibilityGridDiagnostics.fromMap(diagnostics);
+    if (parsedDiagnostics.geometryRevision != geometryRevision ||
+        parsedDiagnostics.stableVoxelCapacity != capacity) {
+      throw const FormatException(
+        'Visibility-grid diagnostics do not match the delta revision.',
+      );
+    }
     return ARVisibilityGridDelta(
       groupId: groupId,
       groupGeneration: groupGeneration,
@@ -644,6 +867,7 @@ class ARVisibilityGridDelta {
       removalKeys: removalKeys,
       capacity: capacity,
       sourceHealth: ARVisibilityGridSourceHealth.fromMap(sourceHealth),
+      diagnostics: parsedDiagnostics,
     );
   }
 
@@ -676,6 +900,9 @@ class ARVisibilityGridDelta {
 
   /// Component health sampled with this geometry revision.
   final ARVisibilityGridSourceHealth sourceHealth;
+
+  /// Native counters sampled atomically with [geometryRevision].
+  final ARVisibilityGridDiagnostics diagnostics;
 }
 
 bool _hasDuplicates(Iterable<int> values) {

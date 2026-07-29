@@ -104,6 +104,9 @@ final class VisibilityGridCoreTests: XCTestCase {
             )
         )
         XCTAssertTrue(grid.snapshot().stableKeys.isEmpty)
+        XCTAssertEqual(grid.snapshot().diagnostics.featureMigrations, 1)
+        XCTAssertEqual(grid.snapshot().diagnostics.featureJumpResets, 1)
+        XCTAssertEqual(grid.snapshot().diagnostics.supportRemovals, 2)
 
         for item in
             fixture["jumpRecoveryObservations"] as! [[String: Any]] {
@@ -132,6 +135,16 @@ final class VisibilityGridCoreTests: XCTestCase {
         XCTAssertEqual(
             grid.snapshot().stableKeys.count,
             fixture["expectedRecoveredContributedVoxels"] as! Int
+        )
+        XCTAssertEqual(
+            grid.snapshot().diagnostics.featureObservationCount,
+            Int64(
+                observations.count + 1 +
+                    (
+                        fixture["jumpRecoveryObservations"]
+                            as! [[String: Any]]
+                    ).count
+            )
         )
     }
 
@@ -502,6 +515,114 @@ final class VisibilityGridCoreTests: XCTestCase {
     func testAssociationCapacityIsClampedToItsMemoryBudget() throws {
         let associator = try BoundedFeatureAssociator(capacity: 200_000)
         XCTAssertEqual(associator.acceptedCapacity, 12_288)
+    }
+
+    func testSensorHandoffCoalescesFeatureAndDepthIndependently() {
+        let handoff = LatestSensorHandoff<String, Int>()
+        XCTAssertFalse(handoff.offerFeature("feature-1"))
+        XCTAssertFalse(handoff.offerDepth(1))
+        XCTAssertTrue(handoff.offerFeature("feature-2"))
+
+        let first = handoff.take()
+        XCTAssertEqual(first?.feature, "feature-2")
+        XCTAssertEqual(first?.depth, 1)
+        XCTAssertFalse(handoff.hasPending)
+
+        XCTAssertFalse(handoff.offerDepth(2))
+        XCTAssertTrue(handoff.offerDepth(3))
+        let second = handoff.take()
+        XCTAssertNil(second?.feature)
+        XCTAssertEqual(second?.depth, 3)
+    }
+
+    func testSensorHandoffProcessesTimestampOrderAfterCoalescing() {
+        struct Timed {
+            let timestampNanoseconds: Int64
+        }
+
+        let handoff = LatestSensorHandoff<Timed, Timed>()
+        handoff.offerFeature(Timed(timestampNanoseconds: 30))
+        handoff.offerDepth(Timed(timestampNanoseconds: 20))
+        let depthFirst = handoff.take()
+        XCTAssertEqual(
+            sensorProcessingOrder(
+                featureTimestampNanoseconds:
+                    depthFirst?.feature?.timestampNanoseconds,
+                depthTimestampNanoseconds:
+                    depthFirst?.depth?.timestampNanoseconds
+            ),
+            [.depth, .feature]
+        )
+
+        handoff.offerFeature(Timed(timestampNanoseconds: 10))
+        handoff.offerDepth(Timed(timestampNanoseconds: 40))
+        let featureFirst = handoff.take()
+        XCTAssertEqual(
+            sensorProcessingOrder(
+                featureTimestampNanoseconds:
+                    featureFirst?.feature?.timestampNanoseconds,
+                depthTimestampNanoseconds:
+                    featureFirst?.depth?.timestampNanoseconds
+            ),
+            [.feature, .depth]
+        )
+
+        handoff.offerFeature(Timed(timestampNanoseconds: 50))
+        XCTAssertTrue(
+            handoff.offerFeature(Timed(timestampNanoseconds: 15))
+        )
+        handoff.offerDepth(Timed(timestampNanoseconds: 25))
+        let displaced = handoff.take()
+        XCTAssertEqual(
+            sensorProcessingOrder(
+                featureTimestampNanoseconds:
+                    displaced?.feature?.timestampNanoseconds,
+                depthTimestampNanoseconds:
+                    displaced?.depth?.timestampNanoseconds
+            ),
+            [.feature, .depth]
+        )
+    }
+
+    func testZeroAcceptedObservationsDoNotEnterNormalizedFeatureP95() throws {
+        let grid = try NativeVisibilityGrid(
+            featureConfiguration: .fixture(
+                candidateSamples: 1,
+                candidateSpanNanoseconds: 0
+            ),
+            depthConfiguration: nil
+        )
+        try grid.startGroup(.fixture())
+        try grid.observeFeatures(
+            FeatureObservation(
+                timestampNanoseconds: 1,
+                groupGeneration: 1,
+                sessionGeneration: 1,
+                samples: [
+                    FeatureSample(
+                        identifier: 1,
+                        world: VisibilityGridPoint(x: 0.02, y: 0.02, z: 0.02),
+                        confidence: 1
+                    )
+                ]
+            )
+        )
+        let p95AfterAccepted =
+            grid.snapshot().diagnostics.featureFusionP95Nanoseconds
+
+        try grid.observeFeatures(
+            FeatureObservation(
+                timestampNanoseconds: 2,
+                groupGeneration: 1,
+                sessionGeneration: 1,
+                samples: []
+            )
+        )
+
+        XCTAssertEqual(
+            grid.snapshot().diagnostics.featureFusionP95Nanoseconds,
+            p95AfterAccepted
+        )
     }
 }
 

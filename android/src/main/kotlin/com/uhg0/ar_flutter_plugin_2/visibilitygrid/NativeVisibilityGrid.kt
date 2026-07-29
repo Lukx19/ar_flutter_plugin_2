@@ -78,25 +78,39 @@ class NativeVisibilityGrid(
     private var acceptedSamples = 0L
     private var rejectedSamples = 0L
     private var capacityRejectedCandidates = 0L
+    private var featureObservationCount = 0L
+    private var featureMigrations = 0L
+    private var featureJumpResets = 0L
+    private var candidateExpirations = 0L
+    private var supportRemovals = 0L
     private var featureHealth = FeatureHealth.CONFIGURED
     private var featureTransientUnavailableCount = 0L
     private var featureFailureCount = 0L
     private var lastFeatureFusionNs = 0L
     private var maxFeatureFusionNs = 0L
+    private val featureFusionSamples = BoundedLatencySamples()
     private var lastDepthTimestampNs = -1L
     private var depthHealth =
         if (depthConfig == null) DepthHealth.UNSUPPORTED else DepthHealth.CONFIGURED
     private var consecutiveDepthFailures = 0
     private var depthAcceptedPixels = 0L
+    private var depthObservationCount = 0L
     private var depthRejectedPixels = 0L
     private var depthCapacityRejectedPixels = 0L
     private var depthReservations = 0
     private var nonRestoredDepthEvidenceCount = 0
     private var depthRayVisits = 0L
+    private var carvedVoxels = 0L
+    private var restoredVoxels = 0L
     private var depthTransientUnavailableCount = 0L
     private var depthFailureCount = 0L
     private var lastDepthFusionNs = 0L
     private var maxDepthFusionNs = 0L
+    private val depthFusionSamples = BoundedLatencySamples()
+    private var coalescedGeometryChanges = 0L
+    private var publishedDeltaCount = 0L
+    private var snapshotRecoveryCount = 0L
+    private var geometryAcknowledgementCount = 0L
 
     @Synchronized
     fun startGroup(group: VisibilityGridGroupConfig): VisibilityGridSnapshot {
@@ -135,25 +149,39 @@ class NativeVisibilityGrid(
         acceptedSamples = 0
         rejectedSamples = 0
         capacityRejectedCandidates = 0
+        featureObservationCount = 0
+        featureMigrations = 0
+        featureJumpResets = 0
+        candidateExpirations = 0
+        supportRemovals = 0
         featureHealth = FeatureHealth.CONFIGURED
         featureTransientUnavailableCount = 0
         featureFailureCount = 0
         lastFeatureFusionNs = 0
         maxFeatureFusionNs = 0
+        featureFusionSamples.clear()
         lastDepthTimestampNs = -1
         depthHealth =
             if (depthConfig == null) DepthHealth.UNSUPPORTED else DepthHealth.CONFIGURED
         consecutiveDepthFailures = 0
         depthAcceptedPixels = 0
+        depthObservationCount = 0
         depthRejectedPixels = 0
         depthCapacityRejectedPixels = 0
         depthReservations = 0
         nonRestoredDepthEvidenceCount = 0
         depthRayVisits = 0
+        carvedVoxels = 0
+        restoredVoxels = 0
         depthTransientUnavailableCount = 0
         depthFailureCount = 0
         lastDepthFusionNs = 0
         maxDepthFusionNs = 0
+        depthFusionSamples.clear()
+        coalescedGeometryChanges = 0
+        publishedDeltaCount = 0
+        snapshotRecoveryCount = 0
+        geometryAcknowledgementCount = 0
         return snapshot()
     }
 
@@ -167,7 +195,9 @@ class NativeVisibilityGrid(
             "stale session generation"
         }
         val startedNs = System.nanoTime()
+        val acceptedBefore = acceptedSamples
         try {
+            featureObservationCount++
             if (observation.timestampNs <= lastObservationTimestampNs) {
                 rejectedSamples += observation.samples.size
                 return
@@ -240,6 +270,12 @@ class NativeVisibilityGrid(
         } finally {
             lastFeatureFusionNs = System.nanoTime() - startedNs
             maxFeatureFusionNs = maxOf(maxFeatureFusionNs, lastFeatureFusionNs)
+            val accepted = acceptedSamples - acceptedBefore
+            if (accepted > 0) {
+                featureFusionSamples.record(
+                    lastFeatureFusionNs * 1_000 / accepted,
+                )
+            }
         }
     }
 
@@ -258,6 +294,7 @@ class NativeVisibilityGrid(
         }
         val startedNs = System.nanoTime()
         try {
+            depthObservationCount++
             if (!observation.tracking) {
                 val rejected = observation.samples.size + observation.sourceRejectedPixels
                 depthRejectedPixels += rejected
@@ -375,6 +412,7 @@ class NativeVisibilityGrid(
         } finally {
             lastDepthFusionNs = System.nanoTime() - startedNs
             maxDepthFusionNs = maxOf(maxDepthFusionNs, lastDepthFusionNs)
+            depthFusionSamples.record(lastDepthFusionNs)
         }
     }
 
@@ -463,34 +501,39 @@ class NativeVisibilityGrid(
             return null
         }
         val nextRevision = geometryRevision + 1
+        val reset = snapshotRequired
+        val upserts =
+            if (reset) {
+                visibleKeys.sorted()
+            } else {
+                pendingGeometry
+                    .filterValues { it == PendingGeometryState.UPSERT }
+                    .keys
+                    .sorted()
+            }
+        val removals =
+            if (reset) {
+                emptyList()
+            } else {
+                pendingGeometry
+                    .filterValues { it == PendingGeometryState.REMOVAL }
+                    .keys
+                    .sorted()
+            }
+        geometryRevision = nextRevision
+        pendingGeometry.clear()
+        snapshotRequired = false
+        lastPublicationNs = nowNs
+        publishedDeltaCount++
         return createDelta(
-            baseRevision = geometryRevision,
+            baseRevision = nextRevision - 1,
             revision = nextRevision,
-            reset = snapshotRequired,
-            upserts =
-                if (snapshotRequired) {
-                    visibleKeys.sorted()
-                } else {
-                    pendingGeometry
-                        .filterValues { it == PendingGeometryState.UPSERT }
-                        .keys
-                        .sorted()
-                },
-            removals =
-                if (snapshotRequired) {
-                    emptyList()
-                } else {
-                    pendingGeometry
-                        .filterValues { it == PendingGeometryState.REMOVAL }
-                        .keys
-                        .sorted()
-                },
+            reset = reset,
+            upserts = upserts,
+            removals = removals,
+            publishing = true,
         ).also {
-            geometryRevision = nextRevision
-            pendingGeometry.clear()
-            snapshotRequired = false
             inFlightDelta = it
-            lastPublicationNs = nowNs
         }
     }
 
@@ -509,6 +552,7 @@ class NativeVisibilityGrid(
                 ?: return acknowledgement.acceptedGeometryRevision == geometryRevision
         if (current.geometryRevision != acknowledgement.acceptedGeometryRevision) return false
         inFlightDelta = null
+        geometryAcknowledgementCount++
         return true
     }
 
@@ -528,18 +572,21 @@ class NativeVisibilityGrid(
             return null
         }
         val nextRevision = maxOf(geometryRevision, request.receiverGeometryRevision) + 1
+        geometryRevision = nextRevision
+        pendingGeometry.clear()
+        snapshotRequired = false
+        lastPublicationNs = nowNs
+        publishedDeltaCount++
+        snapshotRecoveryCount++
         return createDelta(
             baseRevision = request.receiverGeometryRevision,
             revision = nextRevision,
             reset = true,
             upserts = visibleKeys.sorted(),
             removals = emptyList(),
+            publishing = true,
         ).also {
-            geometryRevision = nextRevision
-            pendingGeometry.clear()
-            snapshotRequired = false
             inFlightDelta = it
-            lastPublicationNs = nowNs
         }
     }
 
@@ -578,6 +625,7 @@ class NativeVisibilityGrid(
         if (jumpDistanceSquared >=
             featureConfig.jumpResetMeters * featureConfig.jumpResetMeters
         ) {
+            featureJumpResets++
             detachSupport(checkNotNull(track.stableKey))
             track.filtered = position
             track.sampleCount = 1
@@ -627,6 +675,7 @@ class NativeVisibilityGrid(
         val nextKey = packVisibilityGridKey(nextX, nextY, nextZ)
         if (nextKey == previousKey) return
 
+        featureMigrations++
         detachSupport(previousKey)
         attachSupport(nextKey)
         track.stableKey = nextKey
@@ -634,6 +683,7 @@ class NativeVisibilityGrid(
     }
 
     private fun detachSupport(key: Long) {
+        supportRemovals++
         val remaining = supportByKey.getValue(key) - 1
         if (remaining == 0) {
             supportByKey.remove(key)
@@ -668,6 +718,7 @@ class NativeVisibilityGrid(
         reset: Boolean,
         upserts: List<Long>,
         removals: List<Long>,
+        publishing: Boolean = false,
     ): VisibilityGridDelta =
         VisibilityGridDelta(
             groupId = group.groupId,
@@ -679,16 +730,21 @@ class NativeVisibilityGrid(
             upsertKeys = upserts,
             removalKeys = removals,
             capacity = group.capacity,
-            diagnostics = diagnostics(),
+            diagnostics = diagnostics(publishing),
         )
 
-    private fun diagnostics(): VisibilityGridDiagnostics {
+    private fun diagnostics(publishing: Boolean = false): VisibilityGridDiagnostics {
         return VisibilityGridDiagnostics(
             candidateTracks = tracks.values.count { it.stableKey == null },
             stableTracks = tracks.values.count { it.stableKey != null },
             stableVoxels = visibleKeys.size,
             featureTrackCapacity = featureConfig.featureTrackCapacity,
             stableVoxelCapacity = group.capacity,
+            featureObservationCount = featureObservationCount,
+            featureMigrations = featureMigrations,
+            featureJumpResets = featureJumpResets,
+            candidateExpirations = candidateExpirations,
+            supportRemovals = supportRemovals,
             acceptedSamples = acceptedSamples,
             rejectedSamples = rejectedSamples,
             capacityRejectedCandidates = capacityRejectedCandidates,
@@ -697,16 +753,31 @@ class NativeVisibilityGrid(
             featureFailureCount = featureFailureCount,
             lastFeatureFusionNs = lastFeatureFusionNs,
             maxFeatureFusionNs = maxFeatureFusionNs,
+            featureFusionP95Ns = featureFusionSamples.p95(),
             estimatedStateBytes = estimatedStateBytes(),
             depthHealth = depthHealth.wireName,
+            depthObservationCount = depthObservationCount,
             depthAcceptedPixels = depthAcceptedPixels,
             depthRejectedPixels = depthRejectedPixels,
             depthCapacityRejectedPixels = depthCapacityRejectedPixels,
             depthRayVisits = depthRayVisits,
+            carvedVoxels = carvedVoxels,
+            restoredVoxels = restoredVoxels,
             depthTransientUnavailableCount = depthTransientUnavailableCount,
             depthFailureCount = depthFailureCount,
             lastDepthFusionNs = lastDepthFusionNs,
             maxDepthFusionNs = maxDepthFusionNs,
+            depthFusionP95Ns = depthFusionSamples.p95(),
+            coalescedGeometryChanges = coalescedGeometryChanges,
+            geometryRevision = geometryRevision,
+            pendingGeometryKeys = pendingGeometry.size,
+            unacknowledgedGeometryCallbacks =
+                if (publishing || inFlightDelta != null) 1 else 0,
+            publishedDeltaCount = publishedDeltaCount,
+            snapshotRecoveryCount = snapshotRecoveryCount,
+            geometryAcknowledgementCount = geometryAcknowledgementCount,
+            rendererRows = visibleKeys.size,
+            rendererFreeRows = group.capacity - visibleKeys.size,
         )
     }
 
@@ -797,10 +868,12 @@ class NativeVisibilityGrid(
         )
 
     private fun expireCandidates(timestampNs: Long) {
+        val before = tracks.size
         tracks.entries.removeAll { (_, track) ->
             track.stableKey == null &&
                 timestampNs - track.lastTimestampNs > featureConfig.candidateExpiryNs
         }
+        candidateExpirations += (before - tracks.size).toLong()
     }
 
     private fun relocationReservationCount(): Int =
@@ -813,7 +886,8 @@ class NativeVisibilityGrid(
             VISIBILITY_GRID_MEMORY_BUDGET_BYTES
 
     private fun estimatedStateBytes(): Long =
-        tracks.size * FEATURE_TRACK_ESTIMATED_BYTES +
+        FIXED_DIAGNOSTICS_ESTIMATED_BYTES +
+            tracks.size * FEATURE_TRACK_ESTIMATED_BYTES +
             supportByKey.size * STABLE_VOXEL_ESTIMATED_BYTES +
             restoredKeys.size * RESTORED_VOXEL_WORST_CASE_BYTES +
             pendingGeometry.size * PENDING_GEOMETRY_KEY_ESTIMATED_BYTES +
@@ -1000,6 +1074,7 @@ class NativeVisibilityGrid(
         if (evidence.contradicted) {
             if (evidence.occupied >= config.occupiedEvidenceToShow) {
                 evidence.contradicted = false
+                restoredVoxels++
                 evidence.free = 0
                 evidence.directionMask = 0
             }
@@ -1009,6 +1084,7 @@ class NativeVisibilityGrid(
             hasSeparatedDirections(evidence.directionMask, config.separatedDirectionBinsRequired)
         ) {
             evidence.contradicted = true
+            carvedVoxels++
             evidence.occupied = 0
         }
         refreshVisibility(key)
@@ -1079,6 +1155,7 @@ class NativeVisibilityGrid(
         state: PendingGeometryState,
     ) {
         if (snapshotRequired) return
+        if (key in pendingGeometry) coalescedGeometryChanges++
         pendingGeometry[key] = state
         // Switch to a reset before a relocation can exceed the negotiated
         // capacity with separate removal and upsert lists.
@@ -1090,4 +1167,34 @@ class NativeVisibilityGrid(
 
     private fun inFlightGeometryKeyCount(): Int =
         inFlightDelta?.let { it.upsertKeys.size + it.removalKeys.size } ?: 0
+
+    private class BoundedLatencySamples(
+        private val capacity: Int = 256,
+    ) {
+        private val values = LongArray(capacity)
+        private var count = 0
+        private var next = 0
+
+        fun clear() {
+            count = 0
+            next = 0
+        }
+
+        fun record(value: Long) {
+            values[next] = value.coerceAtLeast(0)
+            next = (next + 1) % capacity
+            count = minOf(count + 1, capacity)
+        }
+
+        fun p95(): Long {
+            if (count == 0) return 0
+            val sorted = values.copyOf(count).sortedArray()
+            val index = ((count * 95 + 99) / 100 - 1).coerceIn(0, count - 1)
+            return sorted[index]
+        }
+    }
+
+    private companion object {
+        const val FIXED_DIAGNOSTICS_ESTIMATED_BYTES = 8_192L
+    }
 }

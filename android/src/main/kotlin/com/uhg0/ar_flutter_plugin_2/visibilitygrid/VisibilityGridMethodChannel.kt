@@ -35,12 +35,16 @@ class VisibilityGridMethodChannel(
     @Volatile private var paused = false
     @Volatile private var checkpointBarrierActive = false
     private var pendingCheckpointResult: MethodChannel.Result? = null
-    private var pending: ObservationBundle? = null
+    private val sensorHandoff = LatestSensorHandoff<FeatureWork, DepthWork>()
     private var draining = false
     private var featureConfidenceMinimum = 0.30
     private var maxFeaturesPerObservation = 2_000
     @Volatile private var lastEmittedGeometryRevision = -1L
     @Volatile private var lastEmittedHealth: Map<String, String>? = null
+    private var coalescedFeatureObservations = 0L
+    private var coalescedDepthObservations = 0L
+    private val callbackCopySamples = VisibilityGridChannelLatencySamples()
+    private var healthHeartbeatGeneration = 0L
 
     init {
         channel.setMethodCallHandler(this)
@@ -73,8 +77,14 @@ class VisibilityGridMethodChannel(
                         )
                         lastEmittedGeometryRevision = snapshot.geometryRevision
                         publishRenderer()
-                        result.success(snapshot.toWireMap(currentHealth(snapshot.diagnostics)))
+                        result.success(deltaWireMap(snapshot))
                     }
+                }
+                "getHealth" -> {
+                    result.success(
+                        healthWireMap()
+                            ?: throw IllegalStateException("Visibility group is not started"),
+                    )
                 }
                 "applyVisibility" -> applyVisibility(call, result)
                 "checkpointBarrier" -> checkpointBarrier(call, result)
@@ -83,9 +93,10 @@ class VisibilityGridMethodChannel(
                 "setVoxelRenderMode" -> setVoxelRenderMode(call, result)
                 "stopGrid" -> {
                     requireIdentity(call)
-                    synchronized(this) { pending = null }
+                    synchronized(this) { sensorHandoff.clear() }
                     synchronized(this) {
                         lifecycleGuard.advance()
+                        healthHeartbeatGeneration++
                         cancelPendingCheckpoint("Visibility group stopped during checkpoint")
                         group = null
                         checkpointBarrierActive = false
@@ -100,6 +111,8 @@ class VisibilityGridMethodChannel(
                 }
                 else -> result.notImplemented()
             }
+        } catch (error: VisibilityGridMethodException) {
+            result.error(error.code, error.message, null)
         } catch (error: IllegalArgumentException) {
             result.error("VG_PROTOCOL_INVALID", error.message, null)
         } catch (error: IllegalStateException) {
@@ -111,6 +124,7 @@ class VisibilityGridMethodChannel(
 
     fun onFrame(frame: Frame) {
         if (paused || checkpointBarrierActive) return
+        val callbackStartedNs = System.nanoTime()
         val lifecycleToken = lifecycleGuard.token()
         val activeGroup = group ?: return
         val activeGrid = grid ?: return
@@ -147,15 +161,28 @@ class VisibilityGridMethodChannel(
             ) {
                 return
             }
-            pending =
-                ObservationBundle(
+            callbackCopySamples.record(System.nanoTime() - callbackStartedNs)
+            val context =
+                ObservationContext(
                     activeGrid,
                     activeRenderer,
                     activeGroup,
-                    feature,
-                    depth,
                     lifecycleToken,
                 )
+            if (
+                sensorHandoff.offerFeature(
+                    FeatureWork(context, frame.timestamp, feature),
+                )
+            ) {
+                coalescedFeatureObservations++
+            }
+            if (
+                sensorHandoff.offerDepth(
+                    DepthWork(context, frame.timestamp, depth),
+                )
+            ) {
+                coalescedDepthObservations++
+            }
             if (draining) return
             draining = true
         }
@@ -169,9 +196,10 @@ class VisibilityGridMethodChannel(
             if (disposed) return
             disposed = true
             lifecycleGuard.dispose()
+            healthHeartbeatGeneration++
             checkpointResult = pendingCheckpointResult
             pendingCheckpointResult = null
-            pending = null
+            sensorHandoff.clear()
             draining = false
             oldRenderer = renderer
             renderer = null
@@ -195,7 +223,8 @@ class VisibilityGridMethodChannel(
         synchronized(this) {
             paused = true
             lifecycleGuard.pause()
-            pending = null
+            healthHeartbeatGeneration++
+            sensorHandoff.clear()
             cancelPendingCheckpoint("Visibility grid paused during checkpoint")
         }
     }
@@ -205,6 +234,7 @@ class VisibilityGridMethodChannel(
             paused = false
             lifecycleGuard.resume()
         }
+        restartHealthHeartbeat()
     }
 
     private fun initialize(call: MethodCall, result: MethodChannel.Result) {
@@ -240,8 +270,9 @@ class VisibilityGridMethodChannel(
         val cubeSizeFactor = call.requiredDouble("cubeSizeFactor", 0.1, 1.0).toFloat()
         synchronized(this) {
             lifecycleGuard.advance()
+            healthHeartbeatGeneration++
             cancelPendingCheckpoint("Visibility grid reinitialized during checkpoint")
-            pending = null
+            sensorHandoff.clear()
             checkpointBarrierActive = false
             grid = NativeVisibilityGrid(featureConfig, depthConfig)
             renderer?.dispose()
@@ -270,6 +301,9 @@ class VisibilityGridMethodChannel(
             lastEmittedGeometryRevision = -1
             lastEmittedHealth = capabilities.initialHealth()
             sessionGeneration++
+            coalescedFeatureObservations = 0
+            coalescedDepthObservations = 0
+            callbackCopySamples.clear()
         }
         result.success(
             mapOf(
@@ -284,6 +318,30 @@ class VisibilityGridMethodChannel(
                 "renderCapacity" to featureConfig.stableVoxelCapacity,
                 "featureTrackCapacity" to featureConfig.featureTrackCapacity,
                 "health" to capabilities.initialHealth(),
+                "diagnostics" to
+                    VisibilityGridDiagnostics(
+                        candidateTracks = 0,
+                        stableTracks = 0,
+                        stableVoxels = 0,
+                        featureTrackCapacity = featureConfig.featureTrackCapacity,
+                        stableVoxelCapacity = featureConfig.stableVoxelCapacity,
+                        acceptedSamples = 0,
+                        rejectedSamples = 0,
+                        capacityRejectedCandidates = 0,
+                        featureHealth = "configured",
+                        featureTransientUnavailableCount = 0,
+                        featureFailureCount = 0,
+                        lastFeatureFusionNs = 0,
+                        maxFeatureFusionNs = 0,
+                        estimatedStateBytes = 8_192,
+                        depthHealth =
+                            if (capabilities.depthCapability == "unsupported") {
+                                "unsupported"
+                            } else {
+                                "configured"
+                            },
+                        rendererFreeRows = featureConfig.stableVoxelCapacity,
+                    ).toWireMap(),
             ),
         )
     }
@@ -309,6 +367,9 @@ class VisibilityGridMethodChannel(
                 lifecycleGuard.advance()
                 cancelPendingCheckpoint("Visibility group changed during checkpoint")
                 active.startGroup(next)
+                coalescedFeatureObservations = 0
+                coalescedDepthObservations = 0
+                callbackCopySamples.clear()
                 group = next
                 checkpointBarrierActive = false
                 renderer?.startGroup(
@@ -345,7 +406,8 @@ class VisibilityGridMethodChannel(
                 }
             }
         publishRenderer()
-        result.success(snapshot.toWireMap(currentHealth(snapshot.diagnostics)))
+        restartHealthHeartbeat()
+        result.success(deltaWireMap(snapshot))
     }
 
     private fun applyVisibility(call: MethodCall, result: MethodChannel.Result) {
@@ -358,8 +420,12 @@ class VisibilityGridMethodChannel(
         val colors = call.argument<IntArray>("colors")
             ?: throw IllegalArgumentException("colors must be Int32List")
         require(keys.size == colors.size && keys.distinct().size == keys.size)
-        require(geometryRevision == active.geometryRevision)
-        require(nextVisibilityRevision > visibilityRevision)
+        validateVisibilityRevisions(
+            namedGeometryRevision = geometryRevision,
+            currentGeometryRevision = active.geometryRevision,
+            nextVisibilityRevision = nextVisibilityRevision,
+            currentVisibilityRevision = visibilityRevision,
+        )
         require(
             requireNotNull(renderer).applyVisibility(
                 namedGeometryRevision = geometryRevision,
@@ -388,7 +454,7 @@ class VisibilityGridMethodChannel(
         synchronized(this) {
             check(pendingCheckpointResult == null) { "Checkpoint barrier is already pending" }
             checkpointBarrierActive = true
-            pending = null
+            sensorHandoff.clear()
             pendingCheckpointResult = result
         }
         executor.execute {
@@ -420,12 +486,12 @@ class VisibilityGridMethodChannel(
                         try {
                             publishRenderer()
                             result.success(
-                                snapshot.toWireMap(currentHealth(snapshot.diagnostics)),
+                                deltaWireMap(snapshot),
                             )
                         } catch (error: Exception) {
                             emitRendererError(error)
                             result.success(
-                                snapshot.toWireMap(currentHealth(snapshot.diagnostics)),
+                                deltaWireMap(snapshot),
                             )
                         }
                     }
@@ -456,59 +522,64 @@ class VisibilityGridMethodChannel(
     }
 
     private fun drain() {
-        var failed: ObservationBundle? = null
+        var failed: ObservationContext? = null
         try {
             while (true) {
                 val next =
                     synchronized(this) {
-                        pending.also { pending = null }
+                        sensorHandoff.take()
                     } ?: return
-                failed = next
-                when (val feature = next.feature) {
-                    is FeatureAcquisition.Observation ->
-                        next.grid.consumeNext(FeatureObservationSource { feature.value })
-                    FeatureAcquisition.TransientUnavailable ->
-                        next.grid.consumeNext(FeatureObservationSource { null })
-                    is FeatureAcquisition.Failure ->
-                        next.grid.consumeNext(
-                            FeatureObservationSource {
-                                throw IllegalStateException(feature.reason)
-                            },
-                        )
+                val feature = next.feature
+                val depth = next.depth
+                sensorProcessingOrder(
+                    feature?.timestampNs,
+                    depth?.timestampNs,
+                ).forEach { source ->
+                    when (source) {
+                        SensorHandoffSource.FEATURE -> {
+                            val work = checkNotNull(feature)
+                            failed = work.context
+                            consumeFeature(work)
+                        }
+                        SensorHandoffSource.DEPTH -> {
+                            val work = checkNotNull(depth)
+                            failed = work.context
+                            consumeDepth(work)
+                        }
+                    }
                 }
-                next.grid.consumeDepth(next.depth)
-                if (!isCurrent(next)) continue
-                val health = currentHealth(next.grid.snapshot().diagnostics)
+                val context = next.depth?.context ?: next.feature?.context ?: continue
+                failed = context
+                if (!isCurrent(context)) continue
+                val health = currentHealth(context.grid.snapshot().diagnostics)
                 if (health != lastEmittedHealth) {
                     lastEmittedHealth = health
+                    val healthPayload = healthWireMap()
                     main.post {
                         if (
-                            lifecycleGuard.allows(next.lifecycleToken) &&
-                            group === next.group &&
-                            renderer === next.renderer
+                            lifecycleGuard.allows(context.lifecycleToken) &&
+                            group === context.group &&
+                            renderer === context.renderer
                         ) {
                             channel.invokeMethod(
                                 "onGridHealth",
-                                mapOf(
-                                    "version" to VISIBILITY_GRID_WIRE_VERSION,
-                                    "sourceHealth" to health,
-                                ),
+                                healthPayload,
                             )
                         }
                     }
                 }
-                next.grid.takeGeometryDelta()?.let { delta ->
+                context.grid.takeGeometryDelta()?.let { delta ->
                     if (
                         delta.geometryRevision != lastEmittedGeometryRevision &&
-                        isCurrent(next)
+                        isCurrent(context)
                     ) {
                         val applied =
                             synchronized(this) {
-                                if (!isCurrent(next)) {
+                                if (!isCurrent(context)) {
                                     false
                                 } else {
                                     check(
-                                        next.renderer.applyGeometry(
+                                        context.renderer.applyGeometry(
                                             revision = delta.geometryRevision,
                                             reset = delta.reset,
                                             upsertKeys = delta.upsertKeys.toLongArray(),
@@ -523,9 +594,9 @@ class VisibilityGridMethodChannel(
                         main.post {
                             val activeGroup = group
                             if (
-                                lifecycleGuard.allows(next.lifecycleToken) &&
-                                renderer === next.renderer &&
-                                activeGroup === next.group &&
+                                lifecycleGuard.allows(context.lifecycleToken) &&
+                                renderer === context.renderer &&
+                                activeGroup === context.group &&
                                 activeGroup.groupId == delta.groupId &&
                                 activeGroup.groupGeneration == delta.groupGeneration &&
                                 activeGroup.sessionGeneration == delta.sessionGeneration
@@ -534,7 +605,7 @@ class VisibilityGridMethodChannel(
                                     .onFailure(::emitRendererError)
                                 channel.invokeMethod(
                                     "onGridDelta",
-                                    delta.toWireMap(currentHealth(delta.diagnostics)),
+                                    deltaWireMap(delta, context.renderer),
                                 )
                             }
                         }
@@ -555,7 +626,7 @@ class VisibilityGridMethodChannel(
             val reschedule =
                 synchronized(this) {
                     draining = false
-                    if (!disposed && pending != null) {
+                    if (!disposed && sensorHandoff.hasPending) {
                         draining = true
                         true
                     } else {
@@ -568,13 +639,37 @@ class VisibilityGridMethodChannel(
         }
     }
 
-    private fun isCurrent(work: ObservationBundle): Boolean =
+    private fun isCurrent(work: ObservationContext): Boolean =
         synchronized(this) {
             lifecycleGuard.allows(work.lifecycleToken) &&
                 grid === work.grid &&
                 renderer === work.renderer &&
                 group === work.group
         }
+
+    private fun consumeFeature(work: FeatureWork) {
+        if (!isCurrent(work.context)) return
+        when (val feature = work.feature) {
+            is FeatureAcquisition.Observation ->
+                work.context.grid.consumeNext(
+                    FeatureObservationSource { feature.value },
+                )
+            FeatureAcquisition.TransientUnavailable ->
+                work.context.grid.consumeNext(FeatureObservationSource { null })
+            is FeatureAcquisition.Failure ->
+                work.context.grid.consumeNext(
+                    FeatureObservationSource {
+                        throw IllegalStateException(feature.reason)
+                    },
+                )
+        }
+    }
+
+    private fun consumeDepth(work: DepthWork) {
+        if (isCurrent(work.context)) {
+            work.context.grid.consumeDepth(work.depth)
+        }
+    }
 
     private fun copyFeatures(
         frame: Frame,
@@ -711,6 +806,78 @@ class VisibilityGridMethodChannel(
         return health
     }
 
+    private fun restartHealthHeartbeat() {
+        val generation =
+            synchronized(this) {
+                healthHeartbeatGeneration++
+                if (disposed || paused || group == null) return
+                healthHeartbeatGeneration
+            }
+        main.postDelayed(
+            { emitHealthHeartbeat(generation) },
+            HEALTH_HEARTBEAT_INTERVAL_MS,
+        )
+    }
+
+    private fun emitHealthHeartbeat(generation: Long) {
+        val payload =
+            synchronized(this) {
+                if (
+                    disposed ||
+                    paused ||
+                    group == null ||
+                    generation != healthHeartbeatGeneration
+                ) {
+                    null
+                } else {
+                    healthWireMap()
+                }
+            } ?: return
+        channel.invokeMethod("onGridHealth", payload)
+        main.postDelayed(
+            { emitHealthHeartbeat(generation) },
+            HEALTH_HEARTBEAT_INTERVAL_MS,
+        )
+    }
+
+    private fun healthWireMap(): Map<String, Any>? {
+        val activeGrid = grid ?: return null
+        val activeRenderer = renderer ?: return null
+        if (group == null) return null
+        val diagnostics =
+            enrichDiagnostics(activeGrid.snapshot().diagnostics, activeRenderer)
+        return mapOf(
+            "version" to VISIBILITY_GRID_WIRE_VERSION,
+            "sourceHealth" to currentHealth(diagnostics),
+            "diagnostics" to diagnostics.toWireMap(),
+        )
+    }
+
+    private fun enrichDiagnostics(
+        diagnostics: VisibilityGridDiagnostics,
+        rendererState: VisibilityGridRendererState,
+    ): VisibilityGridDiagnostics =
+        synchronized(this) {
+            val freeRows = rendererState.freeRowCount
+            diagnostics.copy(
+                callbackCopyP95Ns = callbackCopySamples.p95(),
+                coalescedFeatureObservations = coalescedFeatureObservations,
+                coalescedDepthObservations = coalescedDepthObservations,
+                rendererRows = rendererState.capacity - freeRows,
+                rendererFreeRows = freeRows,
+            )
+        }
+
+    private fun deltaWireMap(
+        delta: VisibilityGridDelta,
+        rendererState: VisibilityGridRendererState? = renderer,
+    ): Map<String, Any> {
+        val enriched = rendererState?.let {
+            enrichDiagnostics(delta.diagnostics, it)
+        } ?: delta.diagnostics
+        return delta.copy(diagnostics = enriched).toWireMap(currentHealth(enriched))
+    }
+
     private fun requireIdentity(call: MethodCall) {
         val active = group ?: error("Visibility group is not started")
         require(call.argument<String>("version") == VISIBILITY_GRID_WIRE_VERSION)
@@ -738,23 +905,58 @@ class VisibilityGridMethodChannel(
             receiverGeometryRevision = requiredLong("receiverGeometryRevision"),
         )
     }
+}
 
-    private data class ObservationBundle(
-        val grid: NativeVisibilityGrid,
-        val renderer: VisibilityGridRendererState,
-        val group: VisibilityGridGroupConfig,
-        val feature: FeatureAcquisition,
-        val depth: DepthAcquisitionResult,
-        val lifecycleToken: Long,
-    )
+private class VisibilityGridChannelLatencySamples(
+    private val capacity: Int = 256,
+) {
+    private val values = LongArray(capacity)
+    private var count = 0
+    private var next = 0
 
-    private sealed interface FeatureAcquisition {
-        data class Observation(val value: FeatureObservation) : FeatureAcquisition
-
-        data object TransientUnavailable : FeatureAcquisition
-
-        data class Failure(val reason: String) : FeatureAcquisition
+    fun clear() {
+        count = 0
+        next = 0
     }
+
+    fun record(value: Long) {
+        values[next] = value.coerceAtLeast(0)
+        next = (next + 1) % capacity
+        count = minOf(count + 1, capacity)
+    }
+
+    fun p95(): Long {
+        if (count == 0) return 0
+        val sorted = values.copyOf(count).sortedArray()
+        return sorted[((count * 95 + 99) / 100 - 1).coerceIn(0, count - 1)]
+    }
+}
+
+private data class ObservationContext(
+    val grid: NativeVisibilityGrid,
+    val renderer: VisibilityGridRendererState,
+    val group: VisibilityGridGroupConfig,
+    val lifecycleToken: Long,
+)
+
+private data class FeatureWork(
+    val context: ObservationContext,
+    val timestampNs: Long,
+    val feature: FeatureAcquisition,
+)
+
+private data class DepthWork(
+    val context: ObservationContext,
+    val timestampNs: Long,
+    val depth: DepthAcquisitionResult,
+)
+
+private sealed interface FeatureAcquisition {
+    data class Observation(val value: FeatureObservation) : FeatureAcquisition
+
+    data object TransientUnavailable : FeatureAcquisition
+
+    data class Failure(val reason: String) : FeatureAcquisition
 }
 
 private fun MethodCall.requiredString(name: String): String =
@@ -818,4 +1020,31 @@ data class VisibilityGridRuntimeCapabilities(
                     "failed"
                 },
         )
+}
+
+private const val HEALTH_HEARTBEAT_INTERVAL_MS = 1_000L
+
+internal class VisibilityGridMethodException(
+    val code: String,
+    message: String,
+) : IllegalArgumentException(message)
+
+internal fun validateVisibilityRevisions(
+    namedGeometryRevision: Long,
+    currentGeometryRevision: Long,
+    nextVisibilityRevision: Long,
+    currentVisibilityRevision: Long,
+) {
+    if (namedGeometryRevision != currentGeometryRevision) {
+        throw VisibilityGridMethodException(
+            "VG_GEOMETRY_REVISION_GAP",
+            "Visibility patch geometry revision is stale",
+        )
+    }
+    if (nextVisibilityRevision <= currentVisibilityRevision) {
+        throw VisibilityGridMethodException(
+            "VG_VISIBILITY_REVISION_STALE",
+            "Visibility revision must increase",
+        )
+    }
 }

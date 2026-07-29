@@ -18,6 +18,8 @@ class ARVisibilityGridManager {
       StreamController<ARVisibilityGridError>.broadcast(sync: true);
   final StreamController<ARVisibilityGridSourceHealth> _health =
       StreamController<ARVisibilityGridSourceHealth>.broadcast(sync: true);
+  final StreamController<ARVisibilityGridDiagnostics> _diagnostics =
+      StreamController<ARVisibilityGridDiagnostics>.broadcast(sync: true);
   bool _disposed = false;
 
   /// Revisioned stable-key upserts, removals, and reset snapshots.
@@ -28,6 +30,9 @@ class ARVisibilityGridManager {
 
   /// Latest component health without raw sensor payloads.
   Stream<ARVisibilityGridSourceHealth> get health => _health.stream;
+
+  /// Latest bounded native counters, including heartbeat-only updates.
+  Stream<ARVisibilityGridDiagnostics> get diagnostics => _diagnostics.stream;
 
   /// Negotiates the v1 protocol and bounded native configuration.
   ///
@@ -114,6 +119,18 @@ class ARVisibilityGridManager {
       patch.toMap(),
     );
     return result?['applied'] == true;
+  }
+
+  /// Reads current health and diagnostics without waiting for geometry.
+  Future<ARVisibilityGridHealthSnapshot> getHealth() async {
+    _ensureActive();
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      'getHealth',
+    );
+    if (result == null) {
+      throw const FormatException('Missing visibility-grid health payload.');
+    }
+    return ARVisibilityGridHealthSnapshot.fromMap(result);
   }
 
   /// Freezes native acquisition and returns an authoritative reset snapshot.
@@ -217,6 +234,7 @@ class ARVisibilityGridManager {
       await _deltas.close();
       await _errors.close();
       await _health.close();
+      await _diagnostics.close();
     }
   }
 
@@ -232,20 +250,16 @@ class ARVisibilityGridManager {
         }
         return null;
       case 'onGridHealth':
-        final map = _map(call.arguments);
-        if (map['version'] != visibilityGridWireVersion ||
-            map['sourceHealth'] is! Map<Object?, Object?>) {
-          final error = const FormatException(
-            'Invalid visibility-grid health payload.',
+        try {
+          final snapshot = ARVisibilityGridHealthSnapshot.fromMap(
+            _map(call.arguments),
           );
+          _health.add(snapshot.sourceHealth);
+          _diagnostics.add(snapshot.diagnostics);
+        } on FormatException catch (error) {
           _errors.add(_protocolError(error.message));
-          throw error;
+          rethrow;
         }
-        _health.add(
-          ARVisibilityGridSourceHealth.fromMap(
-            map['sourceHealth']! as Map<Object?, Object?>,
-          ),
-        );
         return null;
       case 'onError':
         _errors.add(ARVisibilityGridError.fromMap(_map(call.arguments)));

@@ -1,5 +1,69 @@
 import Foundation
 
+/// Two independently coalesced latest-value slots used before serialized
+/// feature/depth fusion. Callers provide synchronization.
+final class LatestSensorHandoff<Feature, Depth> {
+    private var feature: Feature?
+    private var depth: Depth?
+
+    var hasPending: Bool {
+        feature != nil || depth != nil
+    }
+
+    @discardableResult
+    func offerFeature(_ value: Feature) -> Bool {
+        let replaced = feature != nil
+        feature = value
+        return replaced
+    }
+
+    @discardableResult
+    func offerDepth(_ value: Depth) -> Bool {
+        let replaced = depth != nil
+        depth = value
+        return replaced
+    }
+
+    func take() -> (feature: Feature?, depth: Depth?)? {
+        guard hasPending else { return nil }
+        let result = (feature: feature, depth: depth)
+        feature = nil
+        depth = nil
+        return result
+    }
+
+    func clear() {
+        feature = nil
+        depth = nil
+    }
+}
+
+enum SensorHandoffSource: Equatable {
+    case feature
+    case depth
+}
+
+func sensorProcessingOrder(
+    featureTimestampNanoseconds: Int64?,
+    depthTimestampNanoseconds: Int64?
+) -> [SensorHandoffSource] {
+    switch (
+        featureTimestampNanoseconds,
+        depthTimestampNanoseconds
+    ) {
+    case (nil, nil):
+        return []
+    case (nil, _):
+        return [.depth]
+    case (_, nil):
+        return [.feature]
+    case let (.some(feature), .some(depth)) where depth < feature:
+        return [.depth, .feature]
+    default:
+        return [.feature, .depth]
+    }
+}
+
 final class NativeVisibilityGrid {
     private enum PendingGeometryState {
         case upsert
@@ -59,6 +123,8 @@ final class NativeVisibilityGrid {
     private var diagnostics = VisibilityGridDiagnostics()
     private var consecutiveDepthFailures = 0
     private var depthReservations = 0
+    private let featureFusionSamples = BoundedLatencySamples()
+    private let depthFusionSamples = BoundedLatencySamples()
 
     init(
         featureConfiguration: VisibilityGridFeatureConfiguration,
@@ -108,6 +174,8 @@ final class NativeVisibilityGrid {
         consecutiveDepthFailures = 0
         depthReservations = 0
         diagnostics = VisibilityGridDiagnostics()
+        featureFusionSamples.clear()
+        depthFusionSamples.clear()
         diagnostics.featureTrackCapacity =
             featureConfiguration.featureTrackCapacity
         diagnostics.stableVoxelCapacity = next.capacity
@@ -137,14 +205,23 @@ final class NativeVisibilityGrid {
             sessionGeneration: observation.sessionGeneration
         )
         let started = DispatchTime.now().uptimeNanoseconds
+        let acceptedBefore = diagnostics.acceptedSamples
         defer {
             let elapsed =
                 Int64(DispatchTime.now().uptimeNanoseconds - started)
             diagnostics.lastFeatureFusionNanoseconds = elapsed
             diagnostics.maxFeatureFusionNanoseconds =
                 max(diagnostics.maxFeatureFusionNanoseconds, elapsed)
+            let accepted =
+                diagnostics.acceptedSamples - acceptedBefore
+            if accepted > 0 {
+                featureFusionSamples.record(elapsed * 1_000 / accepted)
+                diagnostics.featureFusionP95Nanoseconds =
+                    featureFusionSamples.p95()
+            }
             refreshDiagnostics()
         }
+        diagnostics.featureObservationCount += 1
         guard observation.timestampNanoseconds >
             lastObservationTimestampNanoseconds
         else {
@@ -235,8 +312,12 @@ final class NativeVisibilityGrid {
             diagnostics.lastDepthFusionNanoseconds = elapsed
             diagnostics.maxDepthFusionNanoseconds =
                 max(diagnostics.maxDepthFusionNanoseconds, elapsed)
+            depthFusionSamples.record(elapsed)
+            diagnostics.depthFusionP95Nanoseconds =
+                depthFusionSamples.p95()
             refreshDiagnostics()
         }
+        diagnostics.depthObservationCount += 1
         guard observation.tracking else {
             let rejected =
                 observation.samples.count +
@@ -341,7 +422,8 @@ final class NativeVisibilityGrid {
         )
         try applyDepthEvidence(
             occupiedKeys: occupiedKeys,
-            freeDirectionsByKey: freeDirectionsByKey
+            freeDirectionsByKey: freeDirectionsByKey,
+            countObservation: false
         )
         diagnostics.depthAcceptedPixels += Int64(accepted)
         diagnostics.depthRejectedPixels += Int64(rejected)
@@ -353,9 +435,13 @@ final class NativeVisibilityGrid {
 
     func applyDepthEvidence(
         occupiedKeys: Set<UInt64>,
-        freeDirectionsByKey: [UInt64: Int]
+        freeDirectionsByKey: [UInt64: Int],
+        countObservation: Bool = true
     ) throws {
         _ = try requireDepthConfiguration()
+        if countObservation {
+            diagnostics.depthObservationCount += 1
+        }
         var touched: Set<UInt64> = []
         for key in occupiedKeys where ensureDepthEvidence(for: key) {
             var evidence = depthEvidenceByKey[key]!
@@ -449,31 +535,36 @@ final class NativeVisibilityGrid {
             return nil
         }
         let nextRevision = geometryRevision + 1
-        let delta = VisibilityGridDelta(
-            identity: active.identity,
-            baseGeometryRevision: geometryRevision,
-            geometryRevision: nextRevision,
-            reset: snapshotRequired,
-            upsertKeys:
-                snapshotRequired
+        let previousRevision = geometryRevision
+        let reset = snapshotRequired
+        let upserts =
+            reset
                 ? visibleKeys.sorted()
                 : pendingGeometry.compactMap {
                     $0.value == .upsert ? $0.key : nil
-                }.sorted(),
-            removalKeys:
-                snapshotRequired
+                }.sorted()
+        let removals =
+            reset
                 ? []
                 : pendingGeometry.compactMap {
                     $0.value == .removal ? $0.key : nil
-                }.sorted(),
-            capacity: active.capacity,
-            diagnostics: currentDiagnostics()
-        )
+                }.sorted()
         geometryRevision = nextRevision
         pendingGeometry.removeAll(keepingCapacity: true)
         snapshotRequired = false
-        inFlightDelta = delta
         lastPublicationNanoseconds = nowNanoseconds
+        diagnostics.publishedDeltaCount += 1
+        let delta = VisibilityGridDelta(
+            identity: active.identity,
+            baseGeometryRevision: previousRevision,
+            geometryRevision: nextRevision,
+            reset: reset,
+            upsertKeys: upserts,
+            removalKeys: removals,
+            capacity: active.capacity,
+            diagnostics: currentDiagnostics(publishing: true)
+        )
+        inFlightDelta = delta
         return delta
     }
 
@@ -491,6 +582,7 @@ final class NativeVisibilityGrid {
             return false
         }
         inFlightDelta = nil
+        diagnostics.geometryAcknowledgementCount += 1
         return true
     }
 
@@ -507,6 +599,12 @@ final class NativeVisibilityGrid {
         }
         let nextRevision =
             max(geometryRevision, receiverGeometryRevision) + 1
+        geometryRevision = nextRevision
+        pendingGeometry.removeAll(keepingCapacity: true)
+        snapshotRequired = false
+        lastPublicationNanoseconds = nowNanoseconds
+        diagnostics.publishedDeltaCount += 1
+        diagnostics.snapshotRecoveryCount += 1
         let delta = VisibilityGridDelta(
             identity: active.identity,
             baseGeometryRevision: receiverGeometryRevision,
@@ -515,13 +613,9 @@ final class NativeVisibilityGrid {
             upsertKeys: visibleKeys.sorted(),
             removalKeys: [],
             capacity: active.capacity,
-            diagnostics: currentDiagnostics()
+            diagnostics: currentDiagnostics(publishing: true)
         )
-        geometryRevision = nextRevision
-        pendingGeometry.removeAll(keepingCapacity: true)
-        snapshotRequired = false
         inFlightDelta = delta
-        lastPublicationNanoseconds = nowNanoseconds
         return delta
     }
 
@@ -560,6 +654,7 @@ final class NativeVisibilityGrid {
         if dx * dx + dy * dy + dz * dz >=
             featureConfiguration.jumpResetMeters *
                 featureConfiguration.jumpResetMeters {
+            diagnostics.featureJumpResets += 1
             detachSupport(track.stableKey!)
             track.filtered = position
             track.sampleCount = 1
@@ -605,6 +700,7 @@ final class NativeVisibilityGrid {
         }
         let nextKey = packVisibilityGridKey(next)
         guard nextKey != previousKey else { return }
+        diagnostics.featureMigrations += 1
         detachSupport(previousKey)
         attachSupport(nextKey)
         track.stableKey = nextKey
@@ -628,6 +724,7 @@ final class NativeVisibilityGrid {
     }
 
     private func detachSupport(_ key: UInt64) {
+        diagnostics.supportRemovals += 1
         let remaining = (supportByKey[key] ?? 1) - 1
         if remaining <= 0 {
             supportByKey[key] = nil
@@ -709,12 +806,14 @@ final class NativeVisibilityGrid {
     }
 
     private func expireCandidates(_ timestampNanoseconds: Int64) {
+        let before = tracks.count
         tracks = tracks.filter {
             $0.value.stableKey != nil ||
             timestampNanoseconds -
                 $0.value.lastTimestampNanoseconds <=
                 featureConfiguration.candidateExpiryNanoseconds
         }
+        diagnostics.candidateExpirations += Int64(before - tracks.count)
     }
 
     private func isQuantizable(_ point: VisibilityGridPoint) -> Bool {
@@ -774,6 +873,7 @@ final class NativeVisibilityGrid {
         if evidence.contradicted {
             if evidence.occupied >= config.occupiedEvidenceToShow {
                 evidence.contradicted = false
+                diagnostics.restoredVoxels += 1
                 evidence.free = 0
                 evidence.directionMask = 0
             }
@@ -783,8 +883,9 @@ final class NativeVisibilityGrid {
             hasSeparatedDirections(
                 evidence.directionMask,
                 required: config.separatedDirectionBinsRequired
-            ) {
+        ) {
             evidence.contradicted = true
+            diagnostics.carvedVoxels += 1
             evidence.occupied = 0
         }
         depthEvidenceByKey[key] = evidence
@@ -826,6 +927,9 @@ final class NativeVisibilityGrid {
         state: PendingGeometryState
     ) {
         guard !snapshotRequired, let active = group else { return }
+        if pendingGeometry[key] != nil {
+            diagnostics.coalescedGeometryChanges += 1
+        }
         pendingGeometry[key] = state
         if pendingGeometry.count > active.capacity {
             pendingGeometry.removeAll(keepingCapacity: true)
@@ -1002,7 +1106,8 @@ final class NativeVisibilityGrid {
     }
 
     private func estimatedStateBytes() -> Int64 {
-        Int64(tracks.count * 192) +
+        8_192 +
+            Int64(tracks.count * 192) +
             Int64(supportByKey.count * 128) +
             Int64(restoredKeys.count * 160) +
             Int64(pendingGeometry.count * 64) +
@@ -1022,11 +1127,60 @@ final class NativeVisibilityGrid {
             tracks.values.filter { $0.stableKey != nil }.count
         diagnostics.stableVoxels = visibleKeys.count
         diagnostics.estimatedStateBytes = estimatedStateBytes()
+        diagnostics.geometryRevision = geometryRevision
+        diagnostics.pendingGeometryKeys = pendingGeometry.count
+        diagnostics.unacknowledgedGeometryCallbacks =
+            inFlightDelta == nil ? 0 : 1
+        diagnostics.rendererRows = visibleKeys.count
+        diagnostics.rendererFreeRows =
+            max(0, (group?.capacity ?? 0) - visibleKeys.count)
     }
 
-    private func currentDiagnostics() -> VisibilityGridDiagnostics {
+    private func currentDiagnostics(
+        publishing: Bool = false
+    ) -> VisibilityGridDiagnostics {
         refreshDiagnostics()
+        if publishing {
+            diagnostics.unacknowledgedGeometryCallbacks = 1
+        }
         return diagnostics
+    }
+
+    private final class BoundedLatencySamples {
+        private let capacity: Int
+        private var values: [Int64] = []
+        private var next = 0
+
+        init(capacity: Int = 256) {
+            self.capacity = capacity
+            values.reserveCapacity(capacity)
+        }
+
+        func clear() {
+            values.removeAll(keepingCapacity: true)
+            next = 0
+        }
+
+        func record(_ value: Int64) {
+            let bounded = max(0, value)
+            if values.count < capacity {
+                values.append(bounded)
+            } else {
+                values[next] = bounded
+                next = (next + 1) % capacity
+            }
+        }
+
+        func p95() -> Int64 {
+            guard !values.isEmpty else { return 0 }
+            let sorted = values.sorted()
+            let index =
+                min(
+                    sorted.count - 1,
+                    max(0, (sorted.count * 95 + 99) / 100 - 1)
+                )
+            return sorted[index]
+        }
     }
 
     private func requireGroup() throws
