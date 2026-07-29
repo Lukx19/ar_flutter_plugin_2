@@ -830,6 +830,13 @@ internal class SharedCameraManager(
                             appSurfaces = listOf(scenePreviewSurface),
                         )
                     repeatingTargets.forEach(::addTarget)
+                    session?.cameraConfig?.fpsRange?.let { arCoreFpsRange ->
+                        set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, arCoreFpsRange)
+                        Log.i(
+                            "SharedCameraManager",
+                            "Requested shared-camera repeating range $arCoreFpsRange fps",
+                        )
+                    }
                 }
             previewCaptureRequestBuilder = repeatingBuilder
 

@@ -107,6 +107,7 @@ internal class ArView(
                 )
             },
             render = sceneHost::updateCoverageRenderer,
+            renderRawPoints = sceneHost::updateRawPointCloud,
         )
     }
 

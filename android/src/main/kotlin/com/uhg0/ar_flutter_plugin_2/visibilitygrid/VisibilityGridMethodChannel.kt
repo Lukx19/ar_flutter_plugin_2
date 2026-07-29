@@ -4,6 +4,7 @@ import android.os.Handler
 import android.os.Looper
 import com.google.ar.core.Config
 import com.google.ar.core.Frame
+import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.NotYetAvailableException
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
@@ -20,6 +21,7 @@ class VisibilityGridMethodChannel(
     private val isDebuggable: Boolean,
     private val runtimeCapabilities: () -> VisibilityGridRuntimeCapabilities,
     private val render: (CoveragePointRenderSnapshot?, PointCloudNativeConfig?) -> Unit,
+    private val renderRawPoints: (CoveragePointRenderSnapshot?) -> Unit = {},
 ) : MethodChannel.MethodCallHandler {
     private val channel = MethodChannel(messenger, "arpointcloud_$viewId")
     private val main = Handler(Looper.getMainLooper())
@@ -32,7 +34,7 @@ class VisibilityGridMethodChannel(
     private val lifecycleGuard = VisibilityGridLifecycleGuard()
     @Volatile private var grid: NativeVisibilityGrid? = null
     private var renderer: VisibilityGridRendererState? = null
-    private var rendererConfig: PointCloudNativeConfig? = null
+    @Volatile private var rendererConfig: PointCloudNativeConfig? = null
     @Volatile private var group: VisibilityGridGroupConfig? = null
     private var sessionGeneration = 0L
     private var visibilityRevision = 0L
@@ -48,6 +50,10 @@ class VisibilityGridMethodChannel(
     private var coalescedFeatureObservations = 0L
     private var coalescedDepthObservations = 0L
     private val callbackCopySamples = VisibilityGridChannelLatencySamples()
+    private val frameCadence = VisibilityGridFrameCadence()
+    private val rawPointRenderHandoff =
+        LatestRawPointRenderHandoff<CoveragePointRenderSnapshot>()
+    private var rawPointSnapshotPublished = false
     private var healthHeartbeatGeneration = 0L
 
     init {
@@ -107,6 +113,7 @@ class VisibilityGridMethodChannel(
                         renderer?.stopGroup()
                     }
                     render(null, null)
+                    clearRawPoints()
                     result.success(true)
                 }
                 "dispose" -> {
@@ -128,21 +135,52 @@ class VisibilityGridMethodChannel(
 
     fun onFrame(frame: Frame) {
         if (paused || checkpointBarrierActive) return
-        val callbackStartedNs = System.nanoTime()
+        if (!shouldAcquireVisibilityFeatures(frame.camera.trackingState)) {
+            rawPointRenderHandoff.clear()
+            main.post(::clearRawPoints)
+            frameCadence.reset()
+            return
+        }
         val lifecycleToken = lifecycleGuard.token()
         val activeGroup = group ?: return
         val activeGrid = grid ?: return
         val activeRenderer = renderer ?: return
+        val capabilities = runtimeCapabilities()
+        val framePlan =
+            frameCadence.plan(
+                timestampNs = frame.timestamp,
+                depthEnabled = capabilities.depthMode != Config.DepthMode.DISABLED,
+            )
+        if (!framePlan.acquireFeature && !framePlan.acquireDepth) return
+        val callbackStartedNs = System.nanoTime()
         val feature =
-            try {
-                FeatureAcquisition.Observation(copyFeatures(frame, activeGroup))
-            } catch (_: NotYetAvailableException) {
-                FeatureAcquisition.TransientUnavailable
-            } catch (error: RuntimeException) {
-                FeatureAcquisition.Failure(error.message ?: "feature acquisition failed")
+            if (framePlan.acquireFeature) {
+                try {
+                    FeatureAcquisition.Observation(copyFeatures(frame, activeGroup))
+                } catch (_: NotYetAvailableException) {
+                    FeatureAcquisition.TransientUnavailable
+                } catch (error: RuntimeException) {
+                    FeatureAcquisition.Failure(error.message ?: "feature acquisition failed")
+                }
+            } else {
+                null
             }
+        val rawConfig = rendererConfig
+        if (
+            feature is FeatureAcquisition.Observation &&
+            rawConfig?.voxelRenderMode == VoxelRenderMode.POINTS &&
+            rawConfig.enabled
+        ) {
+            scheduleRawPoints(
+                feature.value.toRawPointRenderSnapshot(
+                    capacity = rawConfig.renderCapacity,
+                    color = rawConfig.defaultColor,
+                    enabled = true,
+                ),
+            )
+        }
         val depth =
-            if (runtimeCapabilities().depthMode != Config.DepthMode.DISABLED) {
+            if (framePlan.acquireDepth) {
                 try {
                     ArCoreRawDepthSource().acquire(
                         frame,
@@ -153,7 +191,7 @@ class VisibilityGridMethodChannel(
                     DepthAcquisitionResult.Failure(error.message ?: "depth acquisition failed")
                 }
             } else {
-                DepthAcquisitionResult.TransientUnavailable
+                null
             }
         val admitted =
             admitSensorWork(
@@ -176,19 +214,23 @@ class VisibilityGridMethodChannel(
                             activeGroup,
                             lifecycleToken,
                         )
-                    if (
-                        sensorHandoff.offerFeature(
-                            FeatureWork(context, frame.timestamp, feature),
-                        )
-                    ) {
-                        coalescedFeatureObservations++
+                    if (feature != null) {
+                        if (
+                            sensorHandoff.offerFeature(
+                                FeatureWork(context, frame.timestamp, feature),
+                            )
+                        ) {
+                            coalescedFeatureObservations++
+                        }
                     }
-                    if (
-                        sensorHandoff.offerDepth(
-                            DepthWork(context, frame.timestamp, depth),
-                        )
-                    ) {
-                        coalescedDepthObservations++
+                    if (depth != null) {
+                        if (
+                            sensorHandoff.offerDepth(
+                                DepthWork(context, frame.timestamp, depth),
+                            )
+                        ) {
+                            coalescedDepthObservations++
+                        }
                     }
                 },
             )
@@ -207,6 +249,7 @@ class VisibilityGridMethodChannel(
             checkpointResult = pendingCheckpointResult
             pendingCheckpointResult = null
             sensorHandoff.clear()
+            frameCadence.reset()
             oldRenderer = renderer
             renderer = null
             rendererConfig = null
@@ -223,6 +266,7 @@ class VisibilityGridMethodChannel(
         channel.setMethodCallHandler(null)
         oldRenderer?.dispose()
         render(null, null)
+        clearRawPoints()
     }
 
     fun pause() {
@@ -231,14 +275,17 @@ class VisibilityGridMethodChannel(
             lifecycleGuard.pause()
             healthHeartbeatGeneration++
             sensorHandoff.clear()
+            frameCadence.reset()
             cancelPendingCheckpoint("Visibility grid paused during checkpoint")
         }
+        clearRawPoints()
     }
 
     fun resume() {
         synchronized(this) {
             paused = false
             lifecycleGuard.resume()
+            frameCadence.reset()
         }
         restartHealthHeartbeat()
     }
@@ -279,12 +326,14 @@ class VisibilityGridMethodChannel(
             healthHeartbeatGeneration++
             cancelPendingCheckpoint("Visibility grid reinitialized during checkpoint")
             sensorHandoff.clear()
+            frameCadence.reset()
             checkpointBarrierActive = false
             grid = NativeVisibilityGrid(featureConfig, depthConfig)
             renderer?.dispose()
             renderer = null
             rendererConfig = null
             render(null, null)
+            clearRawPoints()
             renderer =
                 VisibilityGridRendererState(
                     capacity = featureConfig.stableVoxelCapacity,
@@ -575,24 +624,29 @@ class VisibilityGridMethodChannel(
             }
             context.grid.takeGeometryDelta()?.let { delta ->
                 if (
-                    delta.geometryRevision != lastEmittedGeometryRevision &&
+                    delta.geometryRevision > lastEmittedGeometryRevision &&
                     isCurrent(context)
                 ) {
                     val applied =
                         synchronized(this) {
-                            if (!isCurrent(context)) {
+                            if (
+                                !isCurrent(context) ||
+                                delta.geometryRevision <= lastEmittedGeometryRevision
+                            ) {
                                 false
                             } else {
-                                check(
-                                    context.renderer.applyGeometry(
-                                        revision = delta.geometryRevision,
-                                        reset = delta.reset,
-                                        upsertKeys = delta.upsertKeys.toLongArray(),
-                                        removalKeys = delta.removalKeys.toLongArray(),
-                                    ),
-                                )
-                                lastEmittedGeometryRevision = delta.geometryRevision
-                                true
+                                val sync =
+                                    synchronizeRendererGeometry(
+                                        renderer = context.renderer,
+                                        delta = delta,
+                                        fullSnapshot = context.grid::snapshot,
+                                    )
+                                if (sync == RendererGeometrySyncResult.REJECTED) {
+                                    false
+                                } else {
+                                    lastEmittedGeometryRevision = delta.geometryRevision
+                                    true
+                                }
                             }
                         }
                     if (!applied) return@let
@@ -622,7 +676,7 @@ class VisibilityGridMethodChannel(
             if (failedWork != null) {
                 main.post {
                     if (isCurrent(failedWork)) {
-                        emitRendererError(error)
+                        emitGridError(error)
                     }
                 }
             }
@@ -714,6 +768,8 @@ class VisibilityGridMethodChannel(
                 ?: throw IllegalArgumentException("enabled is required")
         requireNotNull(renderer).setEnabled(enabled)
         rendererConfig = requireNotNull(rendererConfig).copy(enabled = enabled)
+        frameCadence.reset()
+        if (!enabled) clearRawPoints()
         publishRenderer()
         result.success(true)
     }
@@ -722,6 +778,8 @@ class VisibilityGridMethodChannel(
         val mode = VoxelRenderMode.fromWire(call.requiredString("mode"))
         requireNotNull(renderer).setRenderMode(mode)
         rendererConfig = requireNotNull(rendererConfig).copy(voxelRenderMode = mode)
+        frameCadence.reset()
+        if (mode != VoxelRenderMode.POINTS) clearRawPoints()
         publishRenderer()
         result.success(true)
     }
@@ -729,6 +787,34 @@ class VisibilityGridMethodChannel(
     private fun publishRenderer() {
         val state = renderer ?: return
         render(state.snapshot(), requireNotNull(rendererConfig))
+    }
+
+    private fun scheduleRawPoints(snapshot: CoveragePointRenderSnapshot) {
+        if (rawPointRenderHandoff.offer(snapshot)) {
+            main.post(::drainRawPoints)
+        }
+    }
+
+    private fun drainRawPoints() {
+        val snapshot = rawPointRenderHandoff.takeLatest() ?: return
+        val config = rendererConfig
+        if (
+            config?.enabled != true ||
+            config.voxelRenderMode != VoxelRenderMode.POINTS ||
+            paused ||
+            disposed
+        ) {
+            return
+        }
+        rawPointSnapshotPublished = true
+        renderRawPoints(snapshot)
+    }
+
+    private fun clearRawPoints() {
+        rawPointRenderHandoff.clear()
+        if (!rawPointSnapshotPublished) return
+        rawPointSnapshotPublished = false
+        renderRawPoints(null)
     }
 
     private fun emitRendererError(error: Throwable) {
@@ -744,6 +830,24 @@ class VisibilityGridMethodChannel(
                 "fatalToDepth" to false,
                 "fatalToRenderer" to true,
                 "fatalToGrid" to false,
+                "groupGeneration" to group?.groupGeneration,
+                "sessionGeneration" to group?.sessionGeneration,
+            ),
+        )
+    }
+
+    private fun emitGridError(error: Throwable) {
+        if (disposed) return
+        channel.invokeMethod(
+            "onError",
+            mapOf(
+                "code" to "VG_GRID_FAILED",
+                "message" to (error.message ?: "Visibility-grid processing failed"),
+                "recoverable" to true,
+                "fatalToFeature" to false,
+                "fatalToDepth" to false,
+                "fatalToRenderer" to false,
+                "fatalToGrid" to true,
                 "groupGeneration" to group?.groupGeneration,
                 "sessionGeneration" to group?.sessionGeneration,
             ),
@@ -896,6 +1000,9 @@ class VisibilityGridMethodChannel(
         )
     }
 }
+
+internal fun shouldAcquireVisibilityFeatures(trackingState: TrackingState): Boolean =
+    trackingState == TrackingState.TRACKING
 
 private class VisibilityGridChannelLatencySamples(
     private val capacity: Int = 256,

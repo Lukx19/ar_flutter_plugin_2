@@ -270,19 +270,24 @@ internal class SceneViewHost(
                 },
                 planeRenderer = config.showPlanes && config.customPlaneTexturePath == null,
                 sessionConfiguration = { session, arConfig ->
-                    requestedRearCameraId?.let { requestedId ->
-                        val selectedConfig =
-                            session.getSupportedCameraConfigs(CameraConfigFilter(session))
-                                .firstOrNull {
-                                    it.cameraId == requestedId &&
-                                        it.facingDirection == CameraConfig.FacingDirection.BACK
-                                }
-                        if (selectedConfig == null) {
-                            Log.w("SceneViewHost", "Requested ARCore rear camera $requestedId is unavailable")
-                        } else {
-                            session.cameraConfig = selectedConfig
-                            Log.i("SceneViewHost", "Selected ARCore rear camera $requestedId")
-                        }
+                    val requestedId = requestedRearCameraId ?: session.cameraConfig.cameraId
+                    val matchingConfigs =
+                        session.getSupportedCameraConfigs(CameraConfigFilter(session))
+                            .filter {
+                                it.cameraId == requestedId &&
+                                    it.facingDirection == CameraConfig.FacingDirection.BACK
+                            }
+                    val selectedConfig =
+                        preferHighestFpsConfig(matchingConfigs) { it.fpsRange.upper }
+                    if (selectedConfig == null) {
+                        Log.w("SceneViewHost", "Requested ARCore rear camera $requestedId is unavailable")
+                    } else {
+                        session.cameraConfig = selectedConfig
+                        Log.i(
+                            "SceneViewHost",
+                            "Selected ARCore rear camera $requestedId at " +
+                                "${selectedConfig.fpsRange} fps",
+                        )
                     }
                     arConfig.depthMode =
                         visibilityGridDepthModeCache.configure(
@@ -466,14 +471,18 @@ internal class SceneViewHost(
                             )
                         }
                         SideEffect {
-                            binding.setMode(coverage.voxelRenderMode)
-                            binding.updateCoverage(coverageSnapshotRef.get())
+                            binding.updateCoverage(
+                                coverageSnapshotRef.get(),
+                                coverage.voxelRenderMode,
+                            )
                             binding.updateRawPoints(rawPointSnapshotRef.get())
                         }
                         DisposableEffect(binding) {
                             coverageMeshRef.set(binding)
-                            binding.setMode(coverage.voxelRenderMode)
-                            binding.updateCoverage(coverageSnapshotRef.get())
+                            binding.updateCoverage(
+                                coverageSnapshotRef.get(),
+                                coverage.voxelRenderMode,
+                            )
                             binding.updateRawPoints(rawPointSnapshotRef.get())
                             onCoverageRendererMounted(true)
                             onDispose {
@@ -656,10 +665,7 @@ internal class SceneViewHost(
         }
 
         coverageSnapshotRef.set(snapshot)
-        coverageMeshRef.get()?.let { binding ->
-            binding.setMode(config.voxelRenderMode)
-            binding.updateCoverage(snapshot)
-        }
+        coverageMeshRef.get()?.updateCoverage(snapshot, config.voxelRenderMode)
         val current = coverageRenderConfig.value
         if (current == null ||
             current.renderCapacity != config.renderCapacity ||
@@ -670,8 +676,6 @@ internal class SceneViewHost(
             current.cubeSizeFactor != config.cubeSizeFactor
         ) {
             coverageRenderConfig.value = config
-        } else {
-            coverageMeshRef.get()?.updateCoverage(snapshot)
         }
     }
 
@@ -1029,9 +1033,14 @@ internal class SceneViewHost(
             target(mode).node = null
         }
 
-        fun updateCoverage(snapshot: CoveragePointRenderSnapshot?) {
+        fun updateCoverage(
+            snapshot: CoveragePointRenderSnapshot?,
+            requestedMode: VoxelRenderMode = mode,
+        ) {
             latestCoverageSnapshot = snapshot
-            if (mode != VoxelRenderMode.POINTS) updateActiveTarget()
+            val modeChanged = mode != requestedMode
+            mode = requestedMode
+            if (modeChanged || mode != VoxelRenderMode.POINTS) updateActiveTarget()
         }
 
         fun updateRawPoints(snapshot: CoveragePointRenderSnapshot?) {

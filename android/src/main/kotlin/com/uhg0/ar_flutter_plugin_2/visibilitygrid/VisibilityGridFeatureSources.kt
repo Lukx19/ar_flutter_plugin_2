@@ -1,6 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
 import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudSample
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import java.util.ArrayDeque
 
 internal data class SanitizedFeatureSamples(
@@ -25,6 +26,30 @@ internal fun sanitizeFeatureSamples(
     return SanitizedFeatureSamples(
         samples = accepted,
         rejectedSamples = samples.size - accepted.size,
+    )
+}
+
+internal fun FeatureObservation.toRawPointRenderSnapshot(
+    capacity: Int,
+    color: Int,
+    enabled: Boolean,
+): CoveragePointRenderSnapshot {
+    val rendered = samples.take(capacity)
+    return CoveragePointRenderSnapshot(
+        revision = timestampNs,
+        enabled = enabled,
+        capacity = capacity,
+        count = rendered.size,
+        keys = LongArray(rendered.size) { rendered[it].id.toLong() },
+        positions =
+            FloatArray(rendered.size * 3).also { positions ->
+                rendered.forEachIndexed { index, sample ->
+                    positions[index * 3] = sample.xWorld.toFloat()
+                    positions[index * 3 + 1] = sample.yWorld.toFloat()
+                    positions[index * 3 + 2] = sample.zWorld.toFloat()
+                }
+            },
+        colors = IntArray(rendered.size) { color },
     )
 }
 
