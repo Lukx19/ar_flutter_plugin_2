@@ -48,8 +48,14 @@ void main() {
         'startGrid' => _delta(revision: 1, reset: true),
         'ackGeometry' => <String, Object>{'accepted': true},
         'requestSnapshot' => _delta(revision: 7, reset: true),
+        'checkpointBarrier' => _delta(revision: 8, reset: true),
+        'releaseCheckpoint' => <String, Object>{'released': true},
         'applyVisibility' => <String, Object>{'applied': true},
-        'setPointsEnabled' || 'stopGrid' || 'dispose' => true,
+        'setPointsEnabled' ||
+        'setVoxelRenderMode' ||
+        'stopGrid' ||
+        'dispose' =>
+          true,
         _ => null,
       };
     });
@@ -107,6 +113,23 @@ void main() {
     );
     expect(await manager.ackGeometry(received.single), isTrue);
     expect((await manager.requestSnapshot(received.single)).reset, isTrue);
+    final barrier = await manager.checkpointBarrier(
+      groupId: 'group',
+      groupGeneration: 3,
+      sessionGeneration: 4,
+      receiverGeometryRevision: 7,
+    );
+    expect(barrier.geometryRevision, 8);
+    expect(
+      await manager.releaseCheckpoint(
+        groupId: 'group',
+        groupGeneration: 3,
+        sessionGeneration: 4,
+        geometryRevision: 8,
+        visibilityRevision: 2,
+      ),
+      isTrue,
+    );
     await manager.dispose();
 
     expect(calls.map((call) => call.method), <String>[
@@ -114,6 +137,8 @@ void main() {
       'startGrid',
       'ackGeometry',
       'requestSnapshot',
+      'checkpointBarrier',
+      'releaseCheckpoint',
       'dispose',
     ]);
   });

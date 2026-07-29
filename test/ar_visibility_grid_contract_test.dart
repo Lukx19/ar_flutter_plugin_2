@@ -126,6 +126,11 @@ void main() {
         'featureConfidenceMinimum': 0.3,
         'depthConfidenceMinimum': 128,
         'syntheticSource': true,
+        'defaultColor': 0xFFFF0000,
+        'pointSizePx': 6.0,
+        'enabled': true,
+        'voxelRenderMode': 'centroids',
+        'cubeSizeFactor': 1.0,
       });
     });
 
@@ -191,6 +196,7 @@ void main() {
         worldFromGroupGl: worldFromGroup,
         groupFromWorldGl: groupFromWorld,
         restoredGeometryRevision: 12,
+        restoredVisibilityRevision: 8,
         restoredKeys: Int64List.fromList(<int>[10, 20]),
       );
 
@@ -200,6 +206,7 @@ void main() {
       expect(map['groupFrameConvention'], 'gravity_y_up_meters_v1');
       expect(map['matrixConvention'], 'column_major_gl_v1');
       expect(map['restoredGeometryRevision'], 12);
+      expect(map['restoredVisibilityRevision'], 8);
       expect(map['restoredKeys'], <int>[10, 20]);
     });
 

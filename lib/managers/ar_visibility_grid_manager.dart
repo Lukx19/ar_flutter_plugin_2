@@ -116,11 +116,74 @@ class ARVisibilityGridManager {
     return result?['applied'] == true;
   }
 
+  /// Freezes native acquisition and returns an authoritative reset snapshot.
+  ///
+  /// Throws [StateError] after disposal and [FormatException] when native
+  /// returns no snapshot or a payload outside the v1 contract.
+  Future<ARVisibilityGridDelta> checkpointBarrier({
+    required String groupId,
+    required int groupGeneration,
+    required int sessionGeneration,
+    required int receiverGeometryRevision,
+  }) async {
+    _ensureActive();
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      'checkpointBarrier',
+      <String, Object>{
+        'version': visibilityGridWireVersion,
+        'groupId': groupId,
+        'groupGeneration': groupGeneration,
+        'sessionGeneration': sessionGeneration,
+        'receiverGeometryRevision': receiverGeometryRevision,
+      },
+    );
+    if (result == null) {
+      throw const FormatException('Missing checkpoint barrier snapshot.');
+    }
+    return ARVisibilityGridDelta.fromMap(result);
+  }
+
+  /// Releases a barrier after comparing the exact final revision pair.
+  ///
+  /// Returns false for a mismatch (native still unfreezes to avoid deadlock).
+  /// Throws [StateError] after disposal.
+  Future<bool> releaseCheckpoint({
+    required String groupId,
+    required int groupGeneration,
+    required int sessionGeneration,
+    required int geometryRevision,
+    required int visibilityRevision,
+  }) async {
+    _ensureActive();
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      'releaseCheckpoint',
+      <String, Object>{
+        'version': visibilityGridWireVersion,
+        'groupId': groupId,
+        'groupGeneration': groupGeneration,
+        'sessionGeneration': sessionGeneration,
+        'geometryRevision': geometryRevision,
+        'visibilityRevision': visibilityRevision,
+      },
+    );
+    return result?['released'] == true;
+  }
+
   /// Changes renderer visibility without changing grid acquisition.
   Future<void> setPointsEnabled(bool enabled) async {
     _ensureActive();
     await _channel.invokeMethod<bool>('setPointsEnabled', <String, Object>{
       'enabled': enabled,
+    });
+  }
+
+  /// Switches the retained native renderer without rebuilding geometry.
+  ///
+  /// Throws [StateError] after this manager has been disposed.
+  Future<void> setVoxelRenderMode(ARVisibilityGridRenderMode mode) async {
+    _ensureActive();
+    await _channel.invokeMethod<bool>('setVoxelRenderMode', <String, Object>{
+      'mode': mode.name,
     });
   }
 

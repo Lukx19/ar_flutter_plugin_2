@@ -187,7 +187,12 @@ internal class CoveragePointUploadCoordinator(
 
     fun submit(snapshot: CoveragePointRenderSnapshot) {
         if (destroyed) return
-        pendingSnapshot = snapshot
+        pendingSnapshot =
+            if (uploadBusy && snapshot.update?.reset == false) {
+                snapshot.copy(update = snapshot.update.copy(reset = true))
+            } else {
+                snapshot
+            }
         drain()
     }
 

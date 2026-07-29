@@ -103,9 +103,10 @@ internal class ArView(
                     // reported later through source health.
                     featureReady = true,
                     depthMode = sceneHost.visibilityGridDepthMode(),
-                    rendererReady = coverageRendererMounted,
+                    rendererReady = true,
                 )
             },
+            render = sceneHost::updateCoverageRenderer,
         )
     }
 

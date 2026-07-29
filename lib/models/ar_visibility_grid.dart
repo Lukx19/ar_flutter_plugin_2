@@ -71,6 +71,11 @@ class ARVisibilityGridNativeConfig {
     this.featureConfidenceMinimum = 0.3,
     this.depthConfidenceMinimum = 128,
     this.syntheticSource = false,
+    this.defaultColor = 0xFFFF0000,
+    this.pointSizePx = 6,
+    this.enabled = true,
+    this.voxelRenderMode = ARVisibilityGridRenderMode.centroids,
+    this.cubeSizeFactor = 1,
   }) {
     if (renderCapacity <= 0 ||
         renderCapacity > 100000 ||
@@ -86,6 +91,13 @@ class ARVisibilityGridNativeConfig {
         depthConfidenceMinimum < 0 ||
         depthConfidenceMinimum > 255) {
       throw ArgumentError('Invalid visibility-grid native configuration.');
+    }
+    if (!pointSizePx.isFinite ||
+        pointSizePx <= 0 ||
+        !cubeSizeFactor.isFinite ||
+        cubeSizeFactor < 0.1 ||
+        cubeSizeFactor > 1) {
+      throw ArgumentError('Invalid visibility-grid renderer configuration.');
     }
   }
 
@@ -116,6 +128,21 @@ class ARVisibilityGridNativeConfig {
   /// Whether debug-only deterministic input is requested.
   final bool syntheticSource;
 
+  /// Packed ARGB color assigned until Dart supplies saved-image visibility.
+  final int defaultColor;
+
+  /// Requested point diameter for centroid/point renderer modes.
+  final double pointSizePx;
+
+  /// Whether the retained native overlay starts visible.
+  final bool enabled;
+
+  /// Native representation selected without rebuilding stable geometry.
+  final ARVisibilityGridRenderMode voxelRenderMode;
+
+  /// Cube edge length as a fraction of the configured voxel size.
+  final double cubeSizeFactor;
+
   /// Serializes the immutable v1 initialization payload.
   Map<String, Object> toMap() => <String, Object>{
         'version': visibilityGridWireVersion,
@@ -128,8 +155,16 @@ class ARVisibilityGridNativeConfig {
         'featureConfidenceMinimum': featureConfidenceMinimum,
         'depthConfidenceMinimum': depthConfidenceMinimum,
         'syntheticSource': syntheticSource,
+        'defaultColor': defaultColor,
+        'pointSizePx': pointSizePx,
+        'enabled': enabled,
+        'voxelRenderMode': voxelRenderMode.name,
+        'cubeSizeFactor': cubeSizeFactor,
       };
 }
+
+/// Native retained-overlay representation.
+enum ARVisibilityGridRenderMode { points, centroids, cubes }
 
 /// Validated capabilities and resource bounds returned by native init.
 class ARVisibilityGridInitializationResult {
@@ -319,6 +354,7 @@ class ARVisibilityGridGroupConfig {
     required Float64List worldFromGroupGl,
     required Float64List groupFromWorldGl,
     this.restoredGeometryRevision = 0,
+    this.restoredVisibilityRevision = 0,
     Int64List? restoredKeys,
   })  : worldFromGroupGl = Float64List.fromList(worldFromGroupGl),
         groupFromWorldGl = Float64List.fromList(groupFromWorldGl),
@@ -334,6 +370,7 @@ class ARVisibilityGridGroupConfig {
         worldFromGroupGl.any((value) => !value.isFinite) ||
         groupFromWorldGl.any((value) => !value.isFinite) ||
         restoredGeometryRevision < 0 ||
+        restoredVisibilityRevision < 0 ||
         this.restoredKeys.length > capacity ||
         _hasDuplicates(this.restoredKeys) ||
         (this.restoredKeys.isNotEmpty && restoredGeometryRevision == 0)) {
@@ -367,6 +404,9 @@ class ARVisibilityGridGroupConfig {
   /// Geometry revision represented by [restoredKeys].
   final int restoredGeometryRevision;
 
+  /// Last color revision paired with the restored geometry artifact.
+  final int restoredVisibilityRevision;
+
   /// Stable keys restored before live acquisition.
   final Int64List restoredKeys;
 
@@ -382,6 +422,7 @@ class ARVisibilityGridGroupConfig {
         'worldFromGroupGl': Float64List.fromList(worldFromGroupGl),
         'groupFromWorldGl': Float64List.fromList(groupFromWorldGl),
         'restoredGeometryRevision': restoredGeometryRevision,
+        'restoredVisibilityRevision': restoredVisibilityRevision,
         'restoredKeys': Int64List.fromList(restoredKeys),
       };
 }

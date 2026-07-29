@@ -5,6 +5,9 @@ import android.os.Looper
 import com.google.ar.core.Config
 import com.google.ar.core.Frame
 import com.google.ar.core.exceptions.NotYetAvailableException
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
+import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
+import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -16,22 +19,28 @@ class VisibilityGridMethodChannel(
     viewId: Int,
     private val isDebuggable: Boolean,
     private val runtimeCapabilities: () -> VisibilityGridRuntimeCapabilities,
+    private val render: (CoveragePointRenderSnapshot?, PointCloudNativeConfig?) -> Unit,
 ) : MethodChannel.MethodCallHandler {
     private val channel = MethodChannel(messenger, "arpointcloud_$viewId")
     private val main = Handler(Looper.getMainLooper())
     private val executor = Executors.newSingleThreadExecutor()
-    private var grid: NativeVisibilityGrid? = null
-    private var group: VisibilityGridGroupConfig? = null
+    private val lifecycleGuard = VisibilityGridLifecycleGuard()
+    @Volatile private var grid: NativeVisibilityGrid? = null
+    private var renderer: VisibilityGridRendererState? = null
+    private var rendererConfig: PointCloudNativeConfig? = null
+    @Volatile private var group: VisibilityGridGroupConfig? = null
     private var sessionGeneration = 0L
     private var visibilityRevision = 0L
-    private var disposed = false
-    private var paused = false
+    @Volatile private var disposed = false
+    @Volatile private var paused = false
+    @Volatile private var checkpointBarrierActive = false
+    private var pendingCheckpointResult: MethodChannel.Result? = null
     private var pending: ObservationBundle? = null
     private var draining = false
     private var featureConfidenceMinimum = 0.30
     private var maxFeaturesPerObservation = 2_000
-    private var lastEmittedGeometryRevision = -1L
-    private var lastEmittedHealth: Map<String, String>? = null
+    @Volatile private var lastEmittedGeometryRevision = -1L
+    @Volatile private var lastEmittedHealth: Map<String, String>? = null
 
     init {
         channel.setMethodCallHandler(this)
@@ -54,16 +63,35 @@ class VisibilityGridMethodChannel(
                     if (snapshot == null) {
                         result.error("VG_PROTOCOL_INVALID", "Snapshot identity is invalid", null)
                     } else {
+                        check(
+                            requireNotNull(renderer).applyGeometry(
+                                revision = snapshot.geometryRevision,
+                                reset = true,
+                                upsertKeys = snapshot.upsertKeys.toLongArray(),
+                                removalKeys = snapshot.removalKeys.toLongArray(),
+                            ),
+                        )
                         lastEmittedGeometryRevision = snapshot.geometryRevision
+                        publishRenderer()
                         result.success(snapshot.toWireMap(currentHealth(snapshot.diagnostics)))
                     }
                 }
                 "applyVisibility" -> applyVisibility(call, result)
-                "setPointsEnabled" -> result.success(true)
+                "checkpointBarrier" -> checkpointBarrier(call, result)
+                "releaseCheckpoint" -> releaseCheckpoint(call, result)
+                "setPointsEnabled" -> setPointsEnabled(call, result)
+                "setVoxelRenderMode" -> setVoxelRenderMode(call, result)
                 "stopGrid" -> {
                     requireIdentity(call)
-                    group = null
                     synchronized(this) { pending = null }
+                    synchronized(this) {
+                        lifecycleGuard.advance()
+                        cancelPendingCheckpoint("Visibility group stopped during checkpoint")
+                        group = null
+                        checkpointBarrierActive = false
+                        renderer?.stopGroup()
+                    }
+                    render(null, null)
                     result.success(true)
                 }
                 "dispose" -> {
@@ -82,9 +110,11 @@ class VisibilityGridMethodChannel(
     }
 
     fun onFrame(frame: Frame) {
-        if (paused) return
+        if (paused || checkpointBarrierActive) return
+        val lifecycleToken = lifecycleGuard.token()
         val activeGroup = group ?: return
         val activeGrid = grid ?: return
+        val activeRenderer = renderer ?: return
         val feature =
             try {
                 FeatureAcquisition.Observation(copyFeatures(frame, activeGroup))
@@ -108,8 +138,24 @@ class VisibilityGridMethodChannel(
                 DepthAcquisitionResult.TransientUnavailable
             }
         synchronized(this) {
-            if (disposed || group !== activeGroup || grid !== activeGrid) return
-            pending = ObservationBundle(activeGrid, feature, depth)
+            if (
+                disposed ||
+                group !== activeGroup ||
+                grid !== activeGrid ||
+                renderer !== activeRenderer ||
+                !lifecycleGuard.allows(lifecycleToken)
+            ) {
+                return
+            }
+            pending =
+                ObservationBundle(
+                    activeGrid,
+                    activeRenderer,
+                    activeGroup,
+                    feature,
+                    depth,
+                    lifecycleToken,
+                )
             if (draining) return
             draining = true
         }
@@ -117,25 +163,48 @@ class VisibilityGridMethodChannel(
     }
 
     fun dispose() {
-        if (disposed) return
-        disposed = true
+        var checkpointResult: MethodChannel.Result? = null
+        var oldRenderer: VisibilityGridRendererState? = null
         synchronized(this) {
+            if (disposed) return
+            disposed = true
+            lifecycleGuard.dispose()
+            checkpointResult = pendingCheckpointResult
+            pendingCheckpointResult = null
             pending = null
             draining = false
+            oldRenderer = renderer
+            renderer = null
+            rendererConfig = null
+            grid = null
+            group = null
+            checkpointBarrierActive = false
         }
+        checkpointResult?.error(
+            "VG_NOT_INITIALIZED",
+            "Visibility grid was disposed during checkpoint",
+            null,
+        )
         executor.shutdownNow()
         channel.setMethodCallHandler(null)
-        grid = null
-        group = null
+        oldRenderer?.dispose()
+        render(null, null)
     }
 
     fun pause() {
-        paused = true
-        synchronized(this) { pending = null }
+        synchronized(this) {
+            paused = true
+            lifecycleGuard.pause()
+            pending = null
+            cancelPendingCheckpoint("Visibility grid paused during checkpoint")
+        }
     }
 
     fun resume() {
-        paused = false
+        synchronized(this) {
+            paused = false
+            lifecycleGuard.resume()
+        }
     }
 
     private fun initialize(call: MethodCall, result: MethodChannel.Result) {
@@ -162,12 +231,46 @@ class VisibilityGridMethodChannel(
                     call.requiredInt("maxRayVisitsPerObservation", 1, 65_536),
             )
         val capabilities = runtimeCapabilities()
-        grid = NativeVisibilityGrid(featureConfig, depthConfig)
-        group = null
-        visibilityRevision = 0
-        lastEmittedGeometryRevision = -1
-        lastEmittedHealth = capabilities.initialHealth()
-        sessionGeneration++
+        val defaultColor = call.requiredColor("defaultColor")
+        val pointSizePx =
+            call.requiredDouble("pointSizePx", Double.MIN_VALUE, Double.MAX_VALUE).toFloat()
+        val enabled = call.argument<Boolean>("enabled") ?: true
+        val renderMode =
+            VoxelRenderMode.fromWire(call.requiredString("voxelRenderMode"))
+        val cubeSizeFactor = call.requiredDouble("cubeSizeFactor", 0.1, 1.0).toFloat()
+        synchronized(this) {
+            lifecycleGuard.advance()
+            cancelPendingCheckpoint("Visibility grid reinitialized during checkpoint")
+            pending = null
+            checkpointBarrierActive = false
+            grid = NativeVisibilityGrid(featureConfig, depthConfig)
+            renderer?.dispose()
+            renderer = null
+            rendererConfig = null
+            render(null, null)
+            renderer =
+                VisibilityGridRendererState(
+                    capacity = featureConfig.stableVoxelCapacity,
+                    defaultColor = defaultColor,
+                ).also {
+                    it.setEnabled(enabled)
+                    it.setRenderMode(renderMode)
+                }
+            rendererConfig =
+                PointCloudNativeConfig(
+                    renderCapacity = featureConfig.stableVoxelCapacity,
+                    defaultColor = defaultColor,
+                    pointSizePx = pointSizePx,
+                    enabled = enabled,
+                    voxelRenderMode = renderMode,
+                    cubeSizeFactor = cubeSizeFactor,
+                )
+            group = null
+            visibilityRevision = 0
+            lastEmittedGeometryRevision = -1
+            lastEmittedHealth = capabilities.initialHealth()
+            sessionGeneration++
+        }
         result.success(
             mapOf(
                 "version" to VISIBILITY_GRID_WIRE_VERSION,
@@ -196,25 +299,52 @@ class VisibilityGridMethodChannel(
                 groupFromWorldGl = call.requiredDoubleArray("groupFromWorldGl"),
                 worldFromGroupGl = call.requiredDoubleArray("worldFromGroupGl"),
                 restoredGeometryRevision = call.requiredLong("restoredGeometryRevision"),
+                restoredVisibilityRevision = call.requiredLong("restoredVisibilityRevision"),
                 restoredKeys = call.argument<LongArray>("restoredKeys")
                     ?: throw IllegalArgumentException("restoredKeys must be Int64List"),
             )
-        val active = requireGrid()
-        active.startGroup(next)
-        group = next
         val snapshot =
-            checkNotNull(
-                active.requestSnapshot(
-                    VisibilityGridSnapshotRequest(
-                        groupId = next.groupId,
-                        groupGeneration = next.groupGeneration,
-                        sessionGeneration = next.sessionGeneration,
-                        receiverGeometryRevision = next.restoredGeometryRevision,
+            synchronized(this) {
+                val active = requireGrid()
+                lifecycleGuard.advance()
+                cancelPendingCheckpoint("Visibility group changed during checkpoint")
+                active.startGroup(next)
+                group = next
+                checkpointBarrierActive = false
+                renderer?.startGroup(
+                    config = next,
+                    geometryRevision = next.restoredGeometryRevision,
+                    visibilityRevision = next.restoredVisibilityRevision,
+                    restoredKeys = next.restoredKeys,
+                )
+                visibilityRevision = next.restoredVisibilityRevision
+                rendererConfig =
+                    checkNotNull(rendererConfig).copy(
+                        voxelSizeMeters = next.voxelSizeMeters.toFloat(),
+                    )
+                checkNotNull(
+                    active.requestSnapshot(
+                        VisibilityGridSnapshotRequest(
+                            groupId = next.groupId,
+                            groupGeneration = next.groupGeneration,
+                            sessionGeneration = next.sessionGeneration,
+                            receiverGeometryRevision = next.restoredGeometryRevision,
+                        ),
                     ),
-                ),
-            )
-        lastEmittedGeometryRevision = snapshot.geometryRevision
-        lastEmittedHealth = currentHealth(snapshot.diagnostics)
+                ).also {
+                    lastEmittedGeometryRevision = it.geometryRevision
+                    lastEmittedHealth = currentHealth(it.diagnostics)
+                    check(
+                        renderer?.applyGeometry(
+                            revision = it.geometryRevision,
+                            reset = true,
+                            upsertKeys = it.upsertKeys.toLongArray(),
+                            removalKeys = it.removalKeys.toLongArray(),
+                        ) == true,
+                    )
+                }
+            }
+        publishRenderer()
         result.success(snapshot.toWireMap(currentHealth(snapshot.diagnostics)))
     }
 
@@ -230,8 +360,16 @@ class VisibilityGridMethodChannel(
         require(keys.size == colors.size && keys.distinct().size == keys.size)
         require(geometryRevision == active.geometryRevision)
         require(nextVisibilityRevision > visibilityRevision)
-        require(keys.all(active.stableKeys.toHashSet()::contains))
+        require(
+            requireNotNull(renderer).applyVisibility(
+                namedGeometryRevision = geometryRevision,
+                nextVisibilityRevision = nextVisibilityRevision,
+                patchKeys = keys,
+                patchColors = colors,
+            ),
+        )
         visibilityRevision = nextVisibilityRevision
+        runCatching(::publishRenderer).onFailure(::emitRendererError)
         result.success(
             mapOf(
                 "applied" to true,
@@ -241,61 +379,202 @@ class VisibilityGridMethodChannel(
         )
     }
 
-    private fun drain() {
-        while (true) {
-            val next =
-                synchronized(this) {
-                    val value = pending
-                    pending = null
-                    if (value == null || disposed) {
-                        draining = false
-                        return
+    private fun checkpointBarrier(call: MethodCall, result: MethodChannel.Result) {
+        requireIdentity(call)
+        val request = call.snapshotRequest()
+        val lifecycleToken = lifecycleGuard.token()
+        val checkpointGrid = requireGrid()
+        val checkpointRenderer = requireNotNull(renderer)
+        synchronized(this) {
+            check(pendingCheckpointResult == null) { "Checkpoint barrier is already pending" }
+            checkpointBarrierActive = true
+            pending = null
+            pendingCheckpointResult = result
+        }
+        executor.execute {
+            try {
+                val snapshot =
+                    requireNotNull(checkpointGrid.requestSnapshot(request)) {
+                        "Snapshot identity is invalid"
                     }
-                    value
-                }
-            when (val feature = next.feature) {
-                is FeatureAcquisition.Observation ->
-                    next.grid.consumeNext(FeatureObservationSource { feature.value })
-                FeatureAcquisition.TransientUnavailable ->
-                    next.grid.consumeNext(FeatureObservationSource { null })
-                is FeatureAcquisition.Failure ->
-                    next.grid.consumeNext(
-                        FeatureObservationSource {
-                            throw IllegalStateException(feature.reason)
-                        },
-                    )
-            }
-            next.grid.consumeDepth(next.depth)
-            val health = currentHealth(next.grid.snapshot().diagnostics)
-            if (health != lastEmittedHealth) {
-                lastEmittedHealth = health
+                check(
+                    checkpointRenderer.applyGeometry(
+                        revision = snapshot.geometryRevision,
+                        reset = true,
+                        upsertKeys = snapshot.upsertKeys.toLongArray(),
+                        removalKeys = snapshot.removalKeys.toLongArray(),
+                    ),
+                )
+                lastEmittedGeometryRevision = snapshot.geometryRevision
                 main.post {
-                    if (!disposed) {
-                        channel.invokeMethod(
-                            "onGridHealth",
-                            mapOf(
-                                "version" to VISIBILITY_GRID_WIRE_VERSION,
-                                "sourceHealth" to health,
-                            ),
-                        )
-                    }
-                }
-            }
-            next.grid.takeGeometryDelta()?.let { delta ->
-                if (delta.geometryRevision != lastEmittedGeometryRevision) {
-                    lastEmittedGeometryRevision = delta.geometryRevision
-                    main.post {
-                        if (!disposed) {
-                            channel.invokeMethod(
-                                "onGridDelta",
-                                delta.toWireMap(currentHealth(delta.diagnostics)),
+                    if (claimCheckpointResult(result)) {
+                        if (!lifecycleGuard.allows(lifecycleToken)) {
+                            checkpointBarrierActive = false
+                            result.error(
+                                "VG_NOT_INITIALIZED",
+                                "Visibility lifecycle changed during checkpoint",
+                                null,
+                            )
+                            return@post
+                        }
+                        try {
+                            publishRenderer()
+                            result.success(
+                                snapshot.toWireMap(currentHealth(snapshot.diagnostics)),
+                            )
+                        } catch (error: Exception) {
+                            emitRendererError(error)
+                            result.success(
+                                snapshot.toWireMap(currentHealth(snapshot.diagnostics)),
                             )
                         }
+                    }
+                }
+            } catch (error: Exception) {
+                checkpointBarrierActive = false
+                main.post {
+                    if (claimCheckpointResult(result)) {
+                        result.error("VG_INTERNAL", error.message, null)
                     }
                 }
             }
         }
     }
+
+    private fun releaseCheckpoint(call: MethodCall, result: MethodChannel.Result) {
+        requireIdentity(call)
+        val expectedGeometryRevision = call.requiredLong("geometryRevision")
+        val expectedVisibilityRevision = call.requiredLong("visibilityRevision")
+        val activeRenderer = requireNotNull(renderer)
+        val barrierWasActive = checkpointBarrierActive
+        val released =
+            barrierWasActive &&
+                activeRenderer.currentGeometryRevision == expectedGeometryRevision &&
+                activeRenderer.currentVisibilityRevision == expectedVisibilityRevision
+        if (barrierWasActive) checkpointBarrierActive = false
+        result.success(mapOf("released" to released))
+    }
+
+    private fun drain() {
+        var failed: ObservationBundle? = null
+        try {
+            while (true) {
+                val next =
+                    synchronized(this) {
+                        pending.also { pending = null }
+                    } ?: return
+                failed = next
+                when (val feature = next.feature) {
+                    is FeatureAcquisition.Observation ->
+                        next.grid.consumeNext(FeatureObservationSource { feature.value })
+                    FeatureAcquisition.TransientUnavailable ->
+                        next.grid.consumeNext(FeatureObservationSource { null })
+                    is FeatureAcquisition.Failure ->
+                        next.grid.consumeNext(
+                            FeatureObservationSource {
+                                throw IllegalStateException(feature.reason)
+                            },
+                        )
+                }
+                next.grid.consumeDepth(next.depth)
+                if (!isCurrent(next)) continue
+                val health = currentHealth(next.grid.snapshot().diagnostics)
+                if (health != lastEmittedHealth) {
+                    lastEmittedHealth = health
+                    main.post {
+                        if (
+                            lifecycleGuard.allows(next.lifecycleToken) &&
+                            group === next.group &&
+                            renderer === next.renderer
+                        ) {
+                            channel.invokeMethod(
+                                "onGridHealth",
+                                mapOf(
+                                    "version" to VISIBILITY_GRID_WIRE_VERSION,
+                                    "sourceHealth" to health,
+                                ),
+                            )
+                        }
+                    }
+                }
+                next.grid.takeGeometryDelta()?.let { delta ->
+                    if (
+                        delta.geometryRevision != lastEmittedGeometryRevision &&
+                        isCurrent(next)
+                    ) {
+                        val applied =
+                            synchronized(this) {
+                                if (!isCurrent(next)) {
+                                    false
+                                } else {
+                                    check(
+                                        next.renderer.applyGeometry(
+                                            revision = delta.geometryRevision,
+                                            reset = delta.reset,
+                                            upsertKeys = delta.upsertKeys.toLongArray(),
+                                            removalKeys = delta.removalKeys.toLongArray(),
+                                        ),
+                                    )
+                                    lastEmittedGeometryRevision = delta.geometryRevision
+                                    true
+                                }
+                            }
+                        if (!applied) return@let
+                        main.post {
+                            val activeGroup = group
+                            if (
+                                lifecycleGuard.allows(next.lifecycleToken) &&
+                                renderer === next.renderer &&
+                                activeGroup === next.group &&
+                                activeGroup.groupId == delta.groupId &&
+                                activeGroup.groupGeneration == delta.groupGeneration &&
+                                activeGroup.sessionGeneration == delta.sessionGeneration
+                            ) {
+                                runCatching(::publishRenderer)
+                                    .onFailure(::emitRendererError)
+                                channel.invokeMethod(
+                                    "onGridDelta",
+                                    delta.toWireMap(currentHealth(delta.diagnostics)),
+                                )
+                            }
+                        }
+                    }
+                }
+                failed = null
+            }
+        } catch (error: Exception) {
+            val failedWork = failed
+            if (failedWork != null) {
+                main.post {
+                    if (isCurrent(failedWork)) {
+                        emitRendererError(error)
+                    }
+                }
+            }
+        } finally {
+            val reschedule =
+                synchronized(this) {
+                    draining = false
+                    if (!disposed && pending != null) {
+                        draining = true
+                        true
+                    } else {
+                        false
+                    }
+                }
+            if (reschedule) {
+                executor.execute(::drain)
+            }
+        }
+    }
+
+    private fun isCurrent(work: ObservationBundle): Boolean =
+        synchronized(this) {
+            lifecycleGuard.allows(work.lifecycleToken) &&
+                grid === work.grid &&
+                renderer === work.renderer &&
+                group === work.group
+        }
 
     private fun copyFeatures(
         frame: Frame,
@@ -343,6 +622,67 @@ class VisibilityGridMethodChannel(
 
     private fun requireGrid(): NativeVisibilityGrid =
         grid ?: error("Visibility grid is not initialized")
+
+    private fun setPointsEnabled(call: MethodCall, result: MethodChannel.Result) {
+        val enabled =
+            call.argument<Boolean>("enabled")
+                ?: throw IllegalArgumentException("enabled is required")
+        requireNotNull(renderer).setEnabled(enabled)
+        rendererConfig = requireNotNull(rendererConfig).copy(enabled = enabled)
+        publishRenderer()
+        result.success(true)
+    }
+
+    private fun setVoxelRenderMode(call: MethodCall, result: MethodChannel.Result) {
+        val mode = VoxelRenderMode.fromWire(call.requiredString("mode"))
+        requireNotNull(renderer).setRenderMode(mode)
+        rendererConfig = requireNotNull(rendererConfig).copy(voxelRenderMode = mode)
+        publishRenderer()
+        result.success(true)
+    }
+
+    private fun publishRenderer() {
+        val state = renderer ?: return
+        render(state.snapshot(), requireNotNull(rendererConfig))
+    }
+
+    private fun emitRendererError(error: Throwable) {
+        if (disposed) return
+        renderer?.markUploadFailed()
+        channel.invokeMethod(
+            "onError",
+            mapOf(
+                "code" to "VG_RENDERER_FAILED",
+                "message" to (error.message ?: "Visibility-grid renderer failed"),
+                "recoverable" to true,
+                "fatalToFeature" to false,
+                "fatalToDepth" to false,
+                "fatalToRenderer" to true,
+                "fatalToGrid" to false,
+                "groupGeneration" to group?.groupGeneration,
+                "sessionGeneration" to group?.sessionGeneration,
+            ),
+        )
+    }
+
+    private fun claimCheckpointResult(result: MethodChannel.Result): Boolean =
+        synchronized(this) {
+            if (pendingCheckpointResult !== result) {
+                false
+            } else {
+                pendingCheckpointResult = null
+                true
+            }
+        }
+
+    private fun cancelPendingCheckpoint(message: String) {
+        val checkpointResult =
+            synchronized(this) {
+                pendingCheckpointResult.also { pendingCheckpointResult = null }
+            }
+        checkpointBarrierActive = false
+        checkpointResult?.error("VG_NOT_INITIALIZED", message, null)
+    }
 
     private fun currentHealth(
         diagnostics: VisibilityGridDiagnostics,
@@ -401,8 +741,11 @@ class VisibilityGridMethodChannel(
 
     private data class ObservationBundle(
         val grid: NativeVisibilityGrid,
+        val renderer: VisibilityGridRendererState,
+        val group: VisibilityGridGroupConfig,
         val feature: FeatureAcquisition,
         val depth: DepthAcquisitionResult,
+        val lifecycleToken: Long,
     )
 
     private sealed interface FeatureAcquisition {
@@ -425,6 +768,14 @@ private fun MethodCall.requiredLong(name: String): Long =
 private fun MethodCall.requiredInt(name: String, minimum: Int, maximum: Int): Int =
     (argument<Number>(name)?.toInt() ?: throw IllegalArgumentException("$name is required"))
         .also { require(it in minimum..maximum) }
+
+private fun MethodCall.requiredColor(name: String): Int {
+    val value =
+        argument<Number>(name)?.toLong()
+            ?: throw IllegalArgumentException("$name is required")
+    require(value in Int.MIN_VALUE.toLong()..0xFFFF_FFFFL)
+    return value.toInt()
+}
 
 private fun MethodCall.requiredDouble(name: String, minimum: Double, maximum: Double): Double =
     (argument<Number>(name)?.toDouble() ?: throw IllegalArgumentException("$name is required"))

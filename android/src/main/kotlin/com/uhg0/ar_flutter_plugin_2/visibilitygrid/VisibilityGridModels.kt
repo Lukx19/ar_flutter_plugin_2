@@ -139,6 +139,7 @@ data class VisibilityGridGroupConfig(
     val groupFromWorldGl: DoubleArray,
     val worldFromGroupGl: DoubleArray = identityVisibilityGridTransform(),
     val restoredGeometryRevision: Long = 0,
+    val restoredVisibilityRevision: Long = 0,
     val restoredKeys: LongArray = longArrayOf(),
 ) {
     init {
@@ -154,6 +155,7 @@ data class VisibilityGridGroupConfig(
         require(worldFromGroupGl.size == 16 && worldFromGroupGl.all(Double::isFinite))
         require(areInverseTransforms(groupFromWorldGl, worldFromGroupGl))
         require(restoredGeometryRevision >= 0)
+        require(restoredVisibilityRevision >= 0)
         require(restoredKeys.distinct().size == restoredKeys.size)
         require(restoredKeys.size <= capacity)
         require(restoredKeys.isEmpty() || restoredGeometryRevision > 0)
@@ -349,4 +351,13 @@ fun packVisibilityGridKey(
     return ((x + VOXEL_COORDINATE_BIAS) shl 42) or
         ((y + VOXEL_COORDINATE_BIAS) shl 21) or
         (z + VOXEL_COORDINATE_BIAS)
+}
+
+fun unpackVisibilityGridKey(key: Long): IntArray {
+    val mask = (1L shl 21) - 1
+    return intArrayOf(
+        ((key ushr 42) and mask).toInt() - VOXEL_COORDINATE_BIAS.toInt(),
+        ((key ushr 21) and mask).toInt() - VOXEL_COORDINATE_BIAS.toInt(),
+        (key and mask).toInt() - VOXEL_COORDINATE_BIAS.toInt(),
+    )
 }

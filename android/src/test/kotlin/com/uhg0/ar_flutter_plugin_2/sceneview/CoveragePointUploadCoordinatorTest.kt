@@ -60,6 +60,24 @@ class CoveragePointUploadCoordinatorTest {
 
         assertEquals(2, uploader.positionSubmissions.size)
     }
+
+    @Test
+    fun `replacing a pending partial update uploads the latest complete state`() {
+        val uploader = FakeUploader()
+        val coordinator = CoveragePointUploadCoordinator(2, uploader)
+        coordinator.submit(snapshot(1, 1f))
+        uploader.completeAll()
+
+        coordinator.submit(partialSnapshot(2, floatArrayOf(2f, 2f, 2f, 20f, 20f, 20f), 0))
+        coordinator.submit(partialSnapshot(3, floatArrayOf(3f, 3f, 3f, 30f, 30f, 30f), 1))
+        uploader.completeAll()
+
+        assertArrayEquals(
+            floatArrayOf(3f, 3f, 3f, 30f, 30f, 30f),
+            uploader.positionSubmissions.last(),
+            0f,
+        )
+    }
 }
 
 private class FakeUploader : CoveragePointVertexUploader {
@@ -126,4 +144,36 @@ private fun snapshot(
         } else {
             null
         },
+    )
+
+private fun partialSnapshot(
+    revision: Long,
+    positions: FloatArray,
+    dirtyRow: Int,
+): CoveragePointRenderSnapshot =
+    CoveragePointRenderSnapshot(
+        revision = revision,
+        enabled = true,
+        capacity = 2,
+        count = 2,
+        keys = longArrayOf(1, 2),
+        positions = positions,
+        colors = intArrayOf(0xFF000000.toInt(), 0xFF000000.toInt()),
+        update =
+            com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate(
+                geometryRevision = revision,
+                visibilityRevision = revision,
+                enabled = true,
+                count = 2,
+                spans =
+                    listOf(
+                        com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan(
+                            startSlot = dirtyRow,
+                            positions =
+                                positions.copyOfRange(dirtyRow * 3, dirtyRow * 3 + 3),
+                            colors = intArrayOf(0xFF000000.toInt()),
+                        ),
+                    ),
+                reset = false,
+            ),
     )
