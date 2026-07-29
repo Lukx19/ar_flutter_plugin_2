@@ -68,7 +68,15 @@
         "expectedState": "candidate",
         "expectedRemovedKey": "4611692615498203136",
         "expectedContributedVoxels": 0
-      }
+      },
+      "jumpRecoveryObservations": [
+        {"timestampNs": 1000000000, "positionGroup": [2.171, 0.020, 0.020], "confidence": 0.9},
+        {"timestampNs": 1125000000, "positionGroup": [2.169, 0.020, 0.020], "confidence": 0.9},
+        {"timestampNs": 1250000000, "positionGroup": [2.170, 0.021, 0.020], "confidence": 0.9},
+        {"timestampNs": 1375000000, "positionGroup": [2.170, 0.019, 0.020], "confidence": 0.9}
+      ],
+      "expectedRecoveredKey": "4611780576428425216",
+      "expectedRecoveredContributedVoxels": 1
     },
     {
       "name": "shared_feature_support",
@@ -200,6 +208,50 @@
         "confidenceBuffersReleased": 1,
         "expectedHealth": "healthy"
       }
+    },
+    {
+      "name": "synthetic_quality_certification",
+      "voxelSizeMeters": 0.1,
+      "wallSurfaceZMeters": -1.0,
+      "maximumWallDistanceVoxels": 3,
+      "minimumWallInlierFraction": 0.95,
+      "wallCellCoordinates": [
+        [-10, 0, -10],
+        [-9, 0, -10],
+        [-8, 0, -10],
+        [-7, 0, -10],
+        [-6, 0, -10],
+        [-5, 0, -10],
+        [-4, 0, -10],
+        [-3, 0, -10],
+        [-2, 0, -10],
+        [-1, 0, -10],
+        [0, 0, -10],
+        [1, 0, -10],
+        [2, 0, -10],
+        [3, 0, -10],
+        [4, 0, -10],
+        [5, 0, -10],
+        [6, 0, -10],
+        [7, 0, -10],
+        [8, 0, -10],
+        [9, 0, -14]
+      ],
+      "corridorPhantomCoordinates": [
+        [0, 0, -2],
+        [0, 0, -3],
+        [0, 0, -4],
+        [0, 0, -5],
+        [0, 0, -6]
+      ],
+      "freeEvidenceDirectionBins": [0, 0, 0, 0, 2, 2, 2, 2],
+      "maximumRemainingPhantomThicknessVoxels": 2,
+      "thinWallCoordinates": [
+        [0, 0, -9]
+      ],
+      "doubleWallCoordinates": [
+        [0, 0, -12]
+      ]
     },
     {
       "name": "geometry_revision_and_resync",

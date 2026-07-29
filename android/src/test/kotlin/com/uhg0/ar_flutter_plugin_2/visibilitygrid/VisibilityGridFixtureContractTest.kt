@@ -11,16 +11,134 @@ import org.junit.Test
 
 class VisibilityGridFixtureContractTest {
     @Test
-    fun `shared corpus pins Kotlin visibility-grid contract`() {
-        val fixtureText =
-            checkNotNull(
-                javaClass.classLoader?.getResourceAsStream(
-                    "visibility_grid/visibility_grid_wire_v1.json",
+    fun `shared synthetic wall meets the quality threshold in Kotlin`() {
+        val fixture = loadFixture()
+        val quality =
+            fixture.getValue("scenarios").jsonArray
+                .map { it.jsonObject }
+                .single {
+                    it.getValue("name").jsonPrimitive.content ==
+                        "synthetic_quality_certification"
+                }
+        val voxelSize = quality.double("voxelSizeMeters")
+        val wallCoordinates =
+            quality.getValue("wallCellCoordinates").jsonArray.map { value ->
+                value.jsonArray.map {
+                    it.jsonPrimitive.content.toInt()
+                }
+            }
+        val grid =
+            NativeVisibilityGrid(
+                VisibilityGridFeatureConfig(
+                    stableVoxelCapacity = 100,
+                    featureTrackCapacity = 100,
                 ),
-            ) { "Shared visibility-grid fixture is missing from test resources." }
-                .bufferedReader()
-                .use { it.readText() }
-        val fixture = Json.parseToJsonElement(fixtureText).jsonObject
+            )
+        grid.startGroup(
+            VisibilityGridGroupConfig(
+                groupId = "synthetic-quality",
+                groupGeneration = 1,
+                sessionGeneration = 1,
+                voxelSizeMeters = voxelSize,
+                capacity = 100,
+                groupFromWorldGl = identityVisibilityGridTransform(),
+            ),
+        )
+        repeat(5) { observationIndex ->
+            grid.observe(
+                FeatureObservation(
+                    timestampNs = observationIndex * 125_000_000L,
+                    groupGeneration = 1,
+                    sessionGeneration = 1,
+                    samples =
+                        wallCoordinates.mapIndexed { index, coordinate ->
+                            FeatureSample(
+                                id = index + 1,
+                                xWorld = (coordinate[0] + 0.5) * voxelSize,
+                                yWorld = (coordinate[1] + 0.5) * voxelSize,
+                                zWorld = (coordinate[2] + 0.5) * voxelSize,
+                                confidence = 1.0,
+                            )
+                        },
+                ),
+            )
+        }
+
+        val surfaceCell =
+            kotlin.math.floor(
+                quality.double("wallSurfaceZMeters") / voxelSize,
+            ).toInt()
+        val maximumDistance =
+            quality.int("maximumWallDistanceVoxels")
+        val stableCoordinates =
+            grid.snapshot().stableKeys.map(::unpackVisibilityGridKey)
+        val inlierFraction =
+            stableCoordinates.count {
+                kotlin.math.abs(it[2] - surfaceCell) <= maximumDistance
+            }.toDouble() / stableCoordinates.size
+        assertEquals(wallCoordinates.size, stableCoordinates.size)
+        assertTrue(
+            "wall inlier fraction was $inlierFraction",
+            inlierFraction >= quality.double("minimumWallInlierFraction"),
+        )
+
+        val corridorCoordinates =
+            quality.getValue("corridorPhantomCoordinates").coordinateList()
+        val corridorKeys = corridorCoordinates.map(::packKey)
+        val directionBins =
+            quality.getValue("freeEvidenceDirectionBins").jsonArray.map {
+                it.jsonPrimitive.content.toInt()
+            }
+        val corridorGrid = qualityDepthGrid(voxelSize, corridorKeys)
+        repeat(directionBins.count { it == 0 }) { index ->
+            corridorGrid.observeDepth(qualityRay(10L + index, 0.05, 0.05))
+        }
+        corridorCoordinates.sortedBy { it[2] }.forEachIndexed { coordinateIndex, coordinates ->
+            val targetZ = (coordinates[2] + 0.5) * voxelSize
+            val fractionAlongRay = (0.05 - targetZ) / 1.0
+            val cameraX = 0.55
+            val endpointX =
+                cameraX + (0.05 - cameraX) / fractionAlongRay
+            repeat(directionBins.count { it == 2 }) { observationIndex ->
+                corridorGrid.observeDepth(
+                    qualityRay(
+                        timestampNs =
+                            100L + coordinateIndex * 10 + observationIndex,
+                        cameraX = cameraX,
+                        endpointX = endpointX,
+                    ),
+                )
+            }
+        }
+        val remainingPhantomKeys =
+            corridorGrid.snapshot().stableKeys.toSet().intersect(corridorKeys.toSet())
+        assertTrue(
+            "remaining phantom keys were $remainingPhantomKeys",
+            remainingPhantomKeys.size <=
+                quality.int("maximumRemainingPhantomThicknessVoxels"),
+        )
+
+        val protectedCoordinates =
+            quality.getValue("thinWallCoordinates").coordinateList() +
+                quality.getValue("doubleWallCoordinates").coordinateList()
+        val protectedKeys = protectedCoordinates.map(::packKey)
+        val protectedGrid = qualityDepthGrid(voxelSize, protectedKeys)
+        repeat(directionBins.count { it == 0 }) { index ->
+            protectedGrid.observeDepth(qualityRay(1_000L + index, 0.05, 0.05))
+        }
+        repeat(directionBins.count { it == 2 }) { index ->
+            protectedGrid.observeDepth(qualityRay(2_000L + index, 0.55, -0.45))
+        }
+        val protectedStableKeys = protectedGrid.snapshot().stableKeys.toSet()
+        assertTrue(
+            "protected wall keys missing from $protectedStableKeys",
+            protectedKeys.all { it in protectedStableKeys },
+        )
+    }
+
+    @Test
+    fun `shared corpus pins Kotlin visibility-grid contract`() {
+        val fixture = loadFixture()
 
         assertEquals("visibility_grid_wire_v1", fixture.getValue("version").jsonPrimitive.content)
         assertEquals("coverage_grid_v3", fixture.getValue("voxelKeyConvention").jsonPrimitive.content)
@@ -33,6 +151,7 @@ class VisibilityGridFixtureContractTest {
         assertTrue("depth_safe_band_and_multiview_carving" in names)
         assertTrue("ios_scene_depth_orientation_and_fallback" in names)
         assertTrue("source_health_and_resource_closure" in names)
+        assertTrue("synthetic_quality_certification" in names)
         assertTrue("geometry_revision_and_resync" in names)
 
         val transform =
@@ -297,6 +416,38 @@ class VisibilityGridFixtureContractTest {
             ),
         )
         assertTrue(nativeGrid.snapshot().stableKeys.isEmpty())
+        movement.getValue("jumpRecoveryObservations").jsonArray.forEach { value ->
+            val observation = value.jsonObject
+            val position = observation.getValue("positionGroup").doubleList()
+            nativeGrid.observe(
+                FeatureObservation(
+                    timestampNs =
+                        observation.getValue("timestampNs").jsonPrimitive.content.toLong(),
+                    groupGeneration = 1,
+                    sessionGeneration = 1,
+                    samples =
+                        listOf(
+                            FeatureSample(
+                                id = featureId,
+                                xWorld = position[0],
+                                yWorld = position[1],
+                                zWorld = position[2],
+                                confidence = observation.double("confidence"),
+                            ),
+                        ),
+                ),
+            )
+        }
+        assertEquals(
+            listOf(
+                movement.getValue("expectedRecoveredKey").jsonPrimitive.content.toLong(),
+            ),
+            nativeGrid.snapshot().stableKeys,
+        )
+        assertEquals(
+            movement.int("expectedRecoveredContributedVoxels"),
+            nativeGrid.snapshot().stableKeys.size,
+        )
 
         val sharedSupport =
             scenarios.single {
@@ -396,6 +547,22 @@ class VisibilityGridFixtureContractTest {
     private fun kotlinx.serialization.json.JsonElement.doubleList(): List<Double> =
         jsonArray.map { it.jsonPrimitive.content.toDouble() }
 
+    private fun kotlinx.serialization.json.JsonElement.coordinateList(): List<List<Int>> =
+        jsonArray.map { value ->
+            value.jsonArray.map { it.jsonPrimitive.content.toInt() }
+        }
+
+    private fun loadFixture() =
+        Json.parseToJsonElement(
+            checkNotNull(
+                javaClass.classLoader?.getResourceAsStream(
+                    "visibility_grid/visibility_grid_wire_v1.json",
+                ),
+            ) { "Shared visibility-grid fixture is missing from test resources." }
+                .bufferedReader()
+                .use { it.readText() },
+        ).jsonObject
+
     private fun kotlinx.serialization.json.JsonObject.double(field: String): Double =
         getValue(field).jsonPrimitive.content.toDouble()
 
@@ -419,6 +586,59 @@ class VisibilityGridFixtureContractTest {
         return ((coordinates[0] + bias) shl 42) or
             ((coordinates[1] + bias) shl 21) or
             (coordinates[2] + bias)
+    }
+
+    private fun qualityDepthGrid(
+        voxelSize: Double,
+        restoredKeys: List<Long>,
+    ): NativeVisibilityGrid =
+        NativeVisibilityGrid(
+            featureConfig = VisibilityGridFeatureConfig(),
+            depthConfig = VisibilityGridDepthConfig(),
+        ).also { grid ->
+            grid.startGroup(
+                VisibilityGridGroupConfig(
+                    groupId = "shared-quality-depth",
+                    groupGeneration = 1,
+                    sessionGeneration = 1,
+                    voxelSizeMeters = voxelSize,
+                    capacity = 100,
+                    groupFromWorldGl = identityVisibilityGridTransform(),
+                    restoredGeometryRevision = 1,
+                    restoredKeys = restoredKeys.toLongArray(),
+                ),
+            )
+        }
+
+    private fun qualityRay(
+        timestampNs: Long,
+        cameraX: Double,
+        endpointX: Double,
+    ): DepthObservation {
+        val depthMillimeters = 1_000
+        val depthMeters = depthMillimeters / 1_000.0
+        return DepthObservation(
+            timestampNs = timestampNs,
+            groupGeneration = 1,
+            sessionGeneration = 1,
+            tracking = true,
+            width = 1,
+            height = 1,
+            samples = listOf(DepthPixelSample(0, 0, depthMillimeters, 255)),
+            intrinsics =
+                DepthIntrinsics(
+                    fx = 1.0,
+                    fy = 1.0,
+                    cx = (cameraX - endpointX) / depthMeters,
+                    cy = 0.0,
+                ),
+            worldFromCameraGl =
+                identityVisibilityGridTransform().also {
+                    it[12] = cameraX
+                    it[13] = 0.05
+                    it[14] = 0.05
+                },
+        )
     }
 
     private fun assertClose(

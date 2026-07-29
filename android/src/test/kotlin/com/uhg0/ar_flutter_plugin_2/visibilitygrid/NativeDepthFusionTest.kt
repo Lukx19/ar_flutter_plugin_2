@@ -94,6 +94,75 @@ class NativeDepthFusionTest {
     }
 
     @Test
+    fun `synthetic corridor removes a five-voxel phantom band`() {
+        val phantomCoordinates = (-6..-2).map { z -> intArrayOf(0, 0, z) }
+        val phantomKeys =
+            phantomCoordinates.map { coordinates ->
+                packVisibilityGridKey(
+                    coordinates[0],
+                    coordinates[1],
+                    coordinates[2],
+                )
+            }
+        val grid = depthGrid(restoredKeys = phantomKeys.toLongArray())
+
+        repeat(4) { index ->
+            grid.observeDepth(singleRay(10L + index, 0.05, 0.05))
+        }
+        phantomCoordinates.forEachIndexed { coordinateIndex, coordinates ->
+            val targetX = 0.05
+            val targetZ = (coordinates[2] + 0.5) * 0.1
+            val fractionAlongRay = (0.05 - targetZ) / 1.0
+            val cameraX = 0.55
+            val endpointX =
+                cameraX + (targetX - cameraX) / fractionAlongRay
+            repeat(4) { observationIndex ->
+                grid.observeDepth(
+                    singleRay(
+                        timestampNs =
+                            100L + coordinateIndex * 10 + observationIndex,
+                        cameraX = cameraX,
+                        endpointX = endpointX,
+                    ),
+                )
+            }
+        }
+
+        val remaining =
+            phantomCoordinates.filter { coordinates ->
+                packVisibilityGridKey(
+                    coordinates[0],
+                    coordinates[1],
+                    coordinates[2],
+                ) in grid.snapshot().stableKeys
+            }
+        assertTrue(
+            "remaining phantom band was ${remaining.size} voxels: " +
+                remaining.joinToString { it.contentToString() },
+            remaining.size <= 2,
+        )
+    }
+
+    @Test
+    fun `synthetic thin and double walls survive conservative carving`() {
+        val thinFront = packVisibilityGridKey(0, 0, -9)
+        val doubleBack = packVisibilityGridKey(0, 0, -12)
+        val grid =
+            depthGrid(restoredKeys = longArrayOf(thinFront, doubleBack))
+
+        repeat(4) { index ->
+            grid.observeDepth(singleRay(10L + index, 0.05, 0.05))
+        }
+        repeat(4) { index ->
+            grid.observeDepth(singleRay(20L + index, 0.55, -0.45))
+        }
+
+        val stable = grid.snapshot().stableKeys
+        assertTrue(thinFront in stable)
+        assertTrue(doubleBack in stable)
+    }
+
+    @Test
     fun `many rays from one observation count as only one view per voxel`() {
         val staleKey = packVisibilityGridKey(0, 0, -5)
         val grid = depthGrid(restoredKeys = longArrayOf(staleKey))

@@ -104,6 +104,35 @@ final class VisibilityGridCoreTests: XCTestCase {
             )
         )
         XCTAssertTrue(grid.snapshot().stableKeys.isEmpty)
+
+        for item in
+            fixture["jumpRecoveryObservations"] as! [[String: Any]] {
+            try grid.observeFeatures(
+                FeatureObservation(
+                    timestampNanoseconds:
+                        (item["timestampNs"] as! NSNumber).int64Value,
+                    groupGeneration: group.groupGeneration,
+                    sessionGeneration: group.sessionGeneration,
+                    samples: [
+                        FeatureSample(
+                            identifier: 42,
+                            world: VisibilityGridPoint(
+                                item["positionGroup"] as! [Double]
+                            ),
+                            confidence: item["confidence"] as! Double
+                        )
+                    ]
+                )
+            )
+        }
+        XCTAssertEqual(
+            grid.snapshot().stableKeys,
+            [UInt64(fixture["expectedRecoveredKey"] as! String)!]
+        )
+        XCTAssertEqual(
+            grid.snapshot().stableKeys.count,
+            fixture["expectedRecoveredContributedVoxels"] as! Int
+        )
     }
 
     func testSharedSupportKeepsVoxelUntilLastTrackLeaves() throws {
@@ -147,6 +176,135 @@ final class VisibilityGridCoreTests: XCTestCase {
         )
         XCTAssertEqual(grid.snapshot().supportByKey[key], 1)
         XCTAssertTrue(grid.snapshot().stableKeys.contains(key))
+    }
+
+    func testSharedSyntheticQualityCertification() throws {
+        let fixture = scenario("synthetic_quality_certification")
+        let voxelSize = fixture["voxelSizeMeters"] as! Double
+        let wallCoordinates =
+            fixture["wallCellCoordinates"] as! [[Int]]
+        let wallGrid = try NativeVisibilityGrid(
+            featureConfiguration: .fixture(),
+            depthConfiguration: nil
+        )
+        try wallGrid.startGroup(.fixture())
+        for observationIndex in 0..<5 {
+            try wallGrid.observeFeatures(
+                FeatureObservation(
+                    timestampNanoseconds:
+                        Int64(observationIndex) * 125_000_000,
+                    groupGeneration: 1,
+                    sessionGeneration: 1,
+                    samples: wallCoordinates.enumerated().map {
+                        index, coordinate in
+                        FeatureSample(
+                            identifier: UInt64(index + 1),
+                            world: VisibilityGridPoint(
+                                x: (Double(coordinate[0]) + 0.5) *
+                                    voxelSize,
+                                y: (Double(coordinate[1]) + 0.5) *
+                                    voxelSize,
+                                z: (Double(coordinate[2]) + 0.5) *
+                                    voxelSize
+                            ),
+                            confidence: 1
+                        )
+                    }
+                )
+            )
+        }
+        let maximumDistance =
+            fixture["maximumWallDistanceVoxels"] as! Int
+        let expectedFraction =
+            fixture["minimumWallInlierFraction"] as! Double
+        let surfaceCell = Int(
+            floor(
+                (fixture["wallSurfaceZMeters"] as! Double) /
+                    voxelSize
+            )
+        )
+        let stableCoordinates =
+            wallGrid.snapshot().stableKeys.map(unpackVisibilityGridKey)
+        let inlierCount = stableCoordinates.filter {
+            abs($0[2] - surfaceCell) <= maximumDistance
+        }.count
+        XCTAssertEqual(stableCoordinates.count, wallCoordinates.count)
+        XCTAssertGreaterThanOrEqual(
+            Double(inlierCount) / Double(stableCoordinates.count),
+            expectedFraction
+        )
+
+        let corridorCoordinates =
+            fixture["corridorPhantomCoordinates"] as! [[Int]]
+        let corridorKeys =
+            corridorCoordinates.map(packVisibilityGridKey)
+        let corridorGrid = try NativeVisibilityGrid(
+            featureConfiguration: .fixture(),
+            depthConfiguration: VisibilityGridDepthConfiguration()
+        )
+        try corridorGrid.startGroup(
+            try VisibilityGridGroupConfiguration(
+                groupId: "corridor",
+                groupGeneration: 1,
+                sessionGeneration: 1,
+                voxelSizeMeters: voxelSize,
+                capacity: 100,
+                groupFromWorldGL: identityVisibilityGridTransform(),
+                restoredGeometryRevision: 1,
+                restoredKeys: corridorKeys
+            )
+        )
+        for direction in
+            fixture["freeEvidenceDirectionBins"] as! [Int] {
+            try corridorGrid.applyDepthEvidence(
+                occupiedKeys: [],
+                freeDirectionsByKey: Dictionary(
+                    uniqueKeysWithValues:
+                        corridorKeys.map { ($0, direction) }
+                )
+            )
+        }
+        XCTAssertLessThanOrEqual(
+            corridorGrid.snapshot().stableKeys.count,
+            fixture[
+                "maximumRemainingPhantomThicknessVoxels"
+            ] as! Int
+        )
+
+        let protectedCoordinates =
+            (fixture["thinWallCoordinates"] as! [[Int]]) +
+            (fixture["doubleWallCoordinates"] as! [[Int]])
+        let protectedKeys =
+            protectedCoordinates.map(packVisibilityGridKey)
+        let protectedGrid = try NativeVisibilityGrid(
+            featureConfiguration: .fixture(),
+            depthConfiguration: VisibilityGridDepthConfiguration()
+        )
+        try protectedGrid.startGroup(
+            try VisibilityGridGroupConfiguration(
+                groupId: "protected-walls",
+                groupGeneration: 1,
+                sessionGeneration: 1,
+                voxelSizeMeters: voxelSize,
+                capacity: 100,
+                groupFromWorldGL: identityVisibilityGridTransform(),
+                restoredGeometryRevision: 1,
+                restoredKeys: protectedKeys
+            )
+        )
+        for _ in 0..<8 {
+            try protectedGrid.applyDepthEvidence(
+                occupiedKeys: [],
+                freeDirectionsByKey: Dictionary(
+                    uniqueKeysWithValues:
+                        protectedKeys.map { ($0, 0) }
+                )
+            )
+        }
+        XCTAssertEqual(
+            Set(protectedGrid.snapshot().stableKeys),
+            Set(protectedKeys)
+        )
     }
 
     func testRevisionDeltaAcknowledgementAndSnapshotAreExact() throws {
