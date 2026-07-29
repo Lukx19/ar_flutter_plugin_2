@@ -1,0 +1,219 @@
+import 'dart:async';
+
+import 'package:flutter/services.dart';
+
+import '../models/ar_visibility_grid.dart';
+
+/// Strict Dart endpoint for the per-view `visibility_grid_wire_v1` channel.
+class ARVisibilityGridManager {
+  ARVisibilityGridManager(int viewId, {MethodChannel? channel})
+      : _channel = channel ?? MethodChannel('arpointcloud_$viewId') {
+    _channel.setMethodCallHandler(_handleNativeCall);
+  }
+
+  final MethodChannel _channel;
+  final StreamController<ARVisibilityGridDelta> _deltas =
+      StreamController<ARVisibilityGridDelta>.broadcast(sync: true);
+  final StreamController<ARVisibilityGridError> _errors =
+      StreamController<ARVisibilityGridError>.broadcast(sync: true);
+  final StreamController<ARVisibilityGridSourceHealth> _health =
+      StreamController<ARVisibilityGridSourceHealth>.broadcast(sync: true);
+  bool _disposed = false;
+
+  /// Revisioned stable-key upserts, removals, and reset snapshots.
+  Stream<ARVisibilityGridDelta> get deltas => _deltas.stream;
+
+  /// Typed native protocol failures.
+  Stream<ARVisibilityGridError> get errors => _errors.stream;
+
+  /// Latest component health without raw sensor payloads.
+  Stream<ARVisibilityGridSourceHealth> get health => _health.stream;
+
+  /// Negotiates the v1 protocol and bounded native configuration.
+  ///
+  /// Throws [FormatException] when the native response violates the contract.
+  Future<ARVisibilityGridInitializationResult> initialize(
+    ARVisibilityGridNativeConfig config,
+  ) async {
+    _ensureActive();
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      'init',
+      config.toMap(),
+    );
+    if (result == null) {
+      throw const FormatException(
+        'Missing visibility-grid initialization result.',
+      );
+    }
+    return ARVisibilityGridInitializationResult.fromMap(result);
+  }
+
+  /// Starts acquisition for one validated capture-group coordinate frame.
+  Future<ARVisibilityGridDelta> startGrid(
+    ARVisibilityGridGroupConfig config,
+  ) async {
+    _ensureActive();
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      'startGrid',
+      config.toMap(),
+    );
+    if (result == null) {
+      throw const FormatException('Missing visibility-grid start snapshot.');
+    }
+    return ARVisibilityGridDelta.fromMap(result);
+  }
+
+  /// Acknowledges an atomically applied geometry revision.
+  Future<bool> ackGeometry(ARVisibilityGridDelta delta) async {
+    _ensureActive();
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      'ackGeometry',
+      <String, Object>{
+        'version': visibilityGridWireVersion,
+        'groupId': delta.groupId,
+        'groupGeneration': delta.groupGeneration,
+        'sessionGeneration': delta.sessionGeneration,
+        'acceptedGeometryRevision': delta.geometryRevision,
+      },
+    );
+    return result?['accepted'] == true;
+  }
+
+  /// Requests a bounded full reset after a revision gap.
+  Future<ARVisibilityGridDelta> requestSnapshot(
+    ARVisibilityGridDelta current,
+  ) async {
+    _ensureActive();
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      'requestSnapshot',
+      <String, Object>{
+        'version': visibilityGridWireVersion,
+        'groupId': current.groupId,
+        'groupGeneration': current.groupGeneration,
+        'sessionGeneration': current.sessionGeneration,
+        'receiverGeometryRevision': current.geometryRevision,
+      },
+    );
+    if (result == null) {
+      throw const FormatException('Missing visibility-grid snapshot.');
+    }
+    final snapshot = ARVisibilityGridDelta.fromMap(result);
+    if (!snapshot.reset) {
+      throw const FormatException('Visibility-grid snapshot must reset.');
+    }
+    return snapshot;
+  }
+
+  /// Applies colors to existing native-owned geometry only.
+  Future<bool> applyVisibility(
+    ARVisibilityGridVisibilityPatch patch,
+  ) async {
+    _ensureActive();
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      'applyVisibility',
+      patch.toMap(),
+    );
+    return result?['applied'] == true;
+  }
+
+  /// Changes renderer visibility without changing grid acquisition.
+  Future<void> setPointsEnabled(bool enabled) async {
+    _ensureActive();
+    await _channel.invokeMethod<bool>('setPointsEnabled', <String, Object>{
+      'enabled': enabled,
+    });
+  }
+
+  /// Stops the exact active group generation.
+  Future<void> stopGrid({
+    required String groupId,
+    required int groupGeneration,
+    required int sessionGeneration,
+  }) async {
+    _ensureActive();
+    await _channel.invokeMethod<bool>('stopGrid', <String, Object>{
+      'version': visibilityGridWireVersion,
+      'groupId': groupId,
+      'groupGeneration': groupGeneration,
+      'sessionGeneration': sessionGeneration,
+    });
+  }
+
+  /// Releases the per-view channel and all stream controllers.
+  Future<void> dispose() async {
+    if (_disposed) return;
+    _disposed = true;
+    try {
+      try {
+        await _channel.invokeMethod<bool>('dispose');
+      } on MissingPluginException {
+        // Session teardown remains safe on hosts without the new protocol.
+      }
+    } finally {
+      _channel.setMethodCallHandler(null);
+      await _deltas.close();
+      await _errors.close();
+      await _health.close();
+    }
+  }
+
+  Future<Object?> _handleNativeCall(MethodCall call) async {
+    if (_disposed) return null;
+    switch (call.method) {
+      case 'onGridDelta':
+        try {
+          _deltas.add(ARVisibilityGridDelta.fromMap(_map(call.arguments)));
+        } on FormatException catch (error) {
+          _errors.add(_protocolError(error.message));
+          rethrow;
+        }
+        return null;
+      case 'onGridHealth':
+        final map = _map(call.arguments);
+        if (map['version'] != visibilityGridWireVersion ||
+            map['sourceHealth'] is! Map<Object?, Object?>) {
+          final error = const FormatException(
+            'Invalid visibility-grid health payload.',
+          );
+          _errors.add(_protocolError(error.message));
+          throw error;
+        }
+        _health.add(
+          ARVisibilityGridSourceHealth.fromMap(
+            map['sourceHealth']! as Map<Object?, Object?>,
+          ),
+        );
+        return null;
+      case 'onError':
+        _errors.add(ARVisibilityGridError.fromMap(_map(call.arguments)));
+        return null;
+      default:
+        throw MissingPluginException(
+          'Unknown visibility-grid callback ${call.method}.',
+        );
+    }
+  }
+
+  ARVisibilityGridError _protocolError(String message) => ARVisibilityGridError(
+        code: ARVisibilityGridErrorCode.protocolInvalid,
+        message: message,
+        recoverable: false,
+        fatalToFeature: false,
+        fatalToDepth: false,
+        fatalToRenderer: false,
+        fatalToGrid: true,
+      );
+
+  void _ensureActive() {
+    if (_disposed) {
+      throw StateError('ARVisibilityGridManager is disposed.');
+    }
+  }
+}
+
+Map<Object?, Object?> _map(Object? value) {
+  if (value is! Map) {
+    throw const FormatException('Expected visibility-grid map payload.');
+  }
+  return Map<Object?, Object?>.from(value);
+}

@@ -688,6 +688,11 @@ internal class SceneViewHost(
     fun rendererPerformanceSnapshot(): Map<String, Any> =
         frameCadenceTracker.snapshot()
 
+    fun visibilityGridDepthMode(): Config.DepthMode =
+        activeSession?.let { session ->
+            selectVisibilityGridDepthMode(session::isDepthModeSupported)
+        } ?: Config.DepthMode.DISABLED
+
     fun dispose() {
         if (!ownership.onDispose()) return
         disposed = true

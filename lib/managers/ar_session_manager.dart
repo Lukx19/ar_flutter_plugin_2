@@ -14,7 +14,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:vector_math/vector_math_64.dart';
 import 'ar_capture_manager.dart';
-import 'ar_point_cloud_manager.dart';
+import 'ar_visibility_grid_manager.dart';
 
 // Type definitions to enforce a consistent use of the API
 typedef ARHitResultHandler = void Function(List<ARHitTestResult> hits);
@@ -87,8 +87,8 @@ class ARSessionManager {
   /// Capture manager - created at construction time if config provided
   ARCaptureManager? _captureManager;
 
-  /// Per-view point-cloud transport. Native acquisition starts only after init.
-  late final ARPointCloudManager pointCloudManager;
+  /// Cleaned stable-voxel transport for coverage and planning.
+  late final ARVisibilityGridManager visibilityGridManager;
 
   /// Current session state
   ARSessionState _sessionState = ARSessionState.notInitialized;
@@ -119,7 +119,7 @@ class ARSessionManager {
         _channelId = id {
     _channel = MethodChannel('arsession_$id');
     _channel.setMethodCallHandler(_platformCallHandler);
-    pointCloudManager = ARPointCloudManager(id);
+    visibilityGridManager = ARVisibilityGridManager(id);
 
     try {
       // Validate configurations before initialization
@@ -160,7 +160,7 @@ class ARSessionManager {
         _channelId = id ?? DateTime.now().millisecondsSinceEpoch {
     _channel = MethodChannel('arsession_$_channelId');
     _channel.setMethodCallHandler(_platformCallHandler);
-    pointCloudManager = ARPointCloudManager(_channelId);
+    visibilityGridManager = ARVisibilityGridManager(_channelId);
 
     if (debug) {
       print("ARSessionManager created with enhanced configuration");
@@ -348,7 +348,7 @@ class ARSessionManager {
       }
     }
     try {
-      await pointCloudManager.dispose();
+      await visibilityGridManager.dispose();
     } catch (error) {
       firstError ??= error;
     }
@@ -575,7 +575,7 @@ class ARSessionManager {
     }
 
     // Raw format with frequent capture may cause memory issues
-        if (captureConfig.format == CaptureFormat.rawJpeg &&
+    if (captureConfig.format == CaptureFormat.rawJpeg &&
         captureConfig.captureIntervalMs < 5000) {
       if (debug) {
         print(
@@ -764,11 +764,7 @@ class ARSessionManager {
       // Dispose capture manager first
       await _captureManager?.dispose();
 
-      // Legacy view recreation must release the per-view point-cloud handler
-      // and streams as well; the native session channel is not their owner on
-      // iOS/older hosts.
-      await pointCloudManager.dispose();
-
+      await visibilityGridManager.dispose();
       await _channel.invokeMethod<void>("dispose");
     } catch (e) {
       print(e);

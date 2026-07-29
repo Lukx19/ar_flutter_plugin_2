@@ -28,7 +28,8 @@ import com.uhg0.ar_flutter_plugin_2.sceneview.PluginTransform
 import com.uhg0.ar_flutter_plugin_2.sceneview.SceneViewHost
 import com.uhg0.ar_flutter_plugin_2.sceneview.decompose
 import com.uhg0.ar_flutter_plugin_2.sceneview.resolveNodeUri
-import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudMethodChannel
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridMethodChannel
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridRuntimeCapabilities
 import com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraCapabilityQuerier
 import io.flutter.FlutterInjector
 import io.flutter.plugin.common.BinaryMessenger
@@ -88,20 +89,24 @@ internal class ArView(
         onTouch = ::onTouch,
         onNodeGesture = ::onNodeGesture,
     )
-    private lateinit var pointCloudChannel: PointCloudMethodChannel
+    private lateinit var visibilityGridChannel: VisibilityGridMethodChannel
 
     init {
-        pointCloudChannel = PointCloudMethodChannel(
+        visibilityGridChannel = VisibilityGridMethodChannel(
             messenger = messenger,
             viewId = id,
             isDebuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0,
-            onRendererStateChanged = sceneHost::updateCoverageRenderer,
-            onRawPointCloudChanged = sceneHost::updateRawPointCloud,
+            runtimeCapabilities = {
+                VisibilityGridRuntimeCapabilities(
+                    // ARCore point-cloud acquisition is part of every
+                    // supported Android AR session; transient session state is
+                    // reported later through source health.
+                    featureReady = true,
+                    depthMode = sceneHost.visibilityGridDepthMode(),
+                    rendererReady = coverageRendererMounted,
+                )
+            },
         )
-        // SceneView composition can mount its retained coverage nodes before
-        // this channel has finished construction. Replay that state so native
-        // readiness cannot remain false while the renderer is already live.
-        pointCloudChannel.setRendererMounted(coverageRendererMounted)
     }
 
     private val captureSession = ArCaptureSession(
@@ -129,21 +134,18 @@ internal class ArView(
 
     private fun setCoverageRendererMounted(mounted: Boolean) {
         coverageRendererMounted = mounted
-        if (::pointCloudChannel.isInitialized) {
-            pointCloudChannel.setRendererMounted(mounted)
-        }
     }
 
     private val lifecycleObserver = object : DefaultLifecycleObserver {
         override fun onPause(owner: LifecycleOwner) {
-            pointCloudChannel.pause()
+            visibilityGridChannel.pause()
             captureSession.onSessionPaused()
             sceneHost.pause()
         }
 
         override fun onResume(owner: LifecycleOwner) {
             sceneHost.resume()
-            pointCloudChannel.resume()
+            visibilityGridChannel.resume()
             if (!sessionPausedByFlutter) captureSession.onSessionResumed()
         }
     }
@@ -172,7 +174,7 @@ internal class ArView(
         objectChannel.setMethodCallHandler(null)
         anchorChannel.setMethodCallHandler(null)
         captureChannel.setMethodCallHandler(null)
-        pointCloudChannel.dispose()
+        visibilityGridChannel.dispose()
         lifecycle.removeObserver(lifecycleObserver)
         captureSession.dispose()
         pendingCloudOperations.toList().forEach { it() }
@@ -232,7 +234,7 @@ internal class ArView(
                 }
                 "disableCamera" -> {
                     sessionPausedByFlutter = true
-                    pointCloudChannel.pause()
+                    visibilityGridChannel.pause()
                     captureSession.onSessionPaused()
                     sceneHost.pause()
                     result.success(null)
@@ -240,7 +242,7 @@ internal class ArView(
                 "enableCamera" -> {
                     sessionPausedByFlutter = false
                     sceneHost.resume()
-                    pointCloudChannel.resume()
+                    visibilityGridChannel.resume()
                     captureSession.onSessionResumed()
                     result.success(null)
                 }
@@ -630,7 +632,7 @@ internal class ArView(
     }
 
     private fun onFrame(session: Session, frame: Frame) {
-        pointCloudChannel.onFrame(frame)
+        visibilityGridChannel.onFrame(frame)
         captureSession.buildPoseUpdate(frame)?.let(poseBatchDispatcher::offer)
         frame.getUpdatedTrackables(Plane::class.java).forEach { plane ->
             if (detectedPlanes.add(plane)) {

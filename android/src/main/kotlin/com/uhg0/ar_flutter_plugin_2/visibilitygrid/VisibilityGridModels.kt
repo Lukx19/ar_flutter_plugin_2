@@ -269,7 +269,9 @@ data class VisibilityGridDelta(
     val capacity: Int,
     val diagnostics: VisibilityGridDiagnostics,
 ) {
-    fun toWireMap(): Map<String, Any> =
+    fun toWireMap(
+        sourceHealth: Map<String, String> = diagnostics.toHealthWireMap(),
+    ): Map<String, Any> =
         mapOf(
             "version" to VISIBILITY_GRID_WIRE_VERSION,
             "groupId" to groupId,
@@ -282,19 +284,7 @@ data class VisibilityGridDelta(
             "removalKeys" to removalKeys.toLongArray(),
             "capacity" to capacity,
             "sourceHealth" to
-                mapOf(
-                    "feature" to diagnostics.featureHealth,
-                    "depth" to diagnostics.depthHealth,
-                    "renderer" to "configured",
-                    "totalGrid" to
-                        when {
-                            diagnostics.featureHealth == "failed" &&
-                                diagnostics.depthHealth != "healthy" -> "failed"
-                            diagnostics.featureHealth == "failed" -> "healthy"
-                            diagnostics.depthHealth == "failed" -> "featureOnly"
-                            else -> "healthy"
-                        },
-                ),
+                sourceHealth,
             "diagnostics" to
                 mapOf(
                     "candidateTracks" to diagnostics.candidateTracks,
@@ -322,6 +312,23 @@ data class VisibilityGridDelta(
                 ),
         )
 }
+
+fun VisibilityGridDiagnostics.toHealthWireMap(
+    rendererHealth: String = "configured",
+): Map<String, String> =
+    mapOf(
+        "feature" to featureHealth,
+        "depth" to depthHealth,
+        "renderer" to rendererHealth,
+        "totalGrid" to
+            when {
+                featureHealth == "failed" &&
+                    (depthHealth == "failed" || depthHealth == "unsupported") -> "failed"
+                featureHealth == "failed" -> "healthy"
+                depthHealth == "failed" -> "featureOnly"
+                else -> "healthy"
+            },
+    )
 
 fun identityVisibilityGridTransform(): DoubleArray =
     doubleArrayOf(

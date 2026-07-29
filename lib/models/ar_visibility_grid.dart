@@ -1,7 +1,9 @@
 import 'dart:typed_data';
 
+/// Exact native/Dart protocol identifier for cleaned visibility-grid traffic.
 const String visibilityGridWireVersion = 'visibility_grid_wire_v1';
 
+/// Depth acquisition capabilities advertised by the native runtime.
 enum ARVisibilityGridDepthCapability {
   unsupported,
   rawDepthOnly,
@@ -9,6 +11,7 @@ enum ARVisibilityGridDepthCapability {
   sceneDepth,
 }
 
+/// Depth source selected for the active native grid.
 enum ARVisibilityGridDepthMode {
   disabled,
   featureOnly,
@@ -17,6 +20,7 @@ enum ARVisibilityGridDepthMode {
   sceneDepth,
 }
 
+/// Health states shared by feature, depth, renderer, and total-grid sources.
 enum ARVisibilityGridSourceState {
   unsupported,
   configured,
@@ -27,6 +31,7 @@ enum ARVisibilityGridSourceState {
   disabled,
 }
 
+/// Stable machine-readable visibility-grid error categories.
 enum ARVisibilityGridErrorCode {
   versionMismatch('VG_VERSION_MISMATCH'),
   protocolInvalid('VG_PROTOCOL_INVALID'),
@@ -46,9 +51,15 @@ enum ARVisibilityGridErrorCode {
   internal('VG_INTERNAL');
 
   const ARVisibilityGridErrorCode(this.wireName);
+
+  /// Native wire value used in structured error payloads.
   final String wireName;
 }
 
+/// Bounded configuration negotiated before a capture group is started.
+///
+/// Construction throws [ArgumentError] when any resource or confidence bound
+/// is outside the v1 contract.
 class ARVisibilityGridNativeConfig {
   ARVisibilityGridNativeConfig({
     this.renderCapacity = 100000,
@@ -78,16 +89,34 @@ class ARVisibilityGridNativeConfig {
     }
   }
 
+  /// Maximum stable voxels and renderer rows.
   final int renderCapacity;
+
+  /// Maximum native persistent feature tracks.
   final int featureTrackCapacity;
+
+  /// Maximum copied feature samples per observation.
   final int maxFeaturesPerObservation;
+
+  /// Maximum accepted depth pixels per observation.
   final int maxDepthPixelsPerObservation;
+
+  /// Maximum depth-carving voxel visits per observation.
   final int maxRayVisitsPerObservation;
+
+  /// Minimum interval between geometry publications.
   final int publishIntervalMs;
+
+  /// Minimum accepted AR feature confidence.
   final double featureConfidenceMinimum;
+
+  /// Minimum accepted raw-depth confidence byte.
   final int depthConfidenceMinimum;
+
+  /// Whether debug-only deterministic input is requested.
   final bool syntheticSource;
 
+  /// Serializes the immutable v1 initialization payload.
   Map<String, Object> toMap() => <String, Object>{
         'version': visibilityGridWireVersion,
         'renderCapacity': renderCapacity,
@@ -102,6 +131,7 @@ class ARVisibilityGridNativeConfig {
       };
 }
 
+/// Validated capabilities and resource bounds returned by native init.
 class ARVisibilityGridInitializationResult {
   const ARVisibilityGridInitializationResult({
     required this.sessionGeneration,
@@ -115,6 +145,7 @@ class ARVisibilityGridInitializationResult {
     required this.health,
   });
 
+  /// Parses a native result, throwing [FormatException] on contract drift.
   factory ARVisibilityGridInitializationResult.fromMap(
     Map<Object?, Object?> map,
   ) {
@@ -165,17 +196,35 @@ class ARVisibilityGridInitializationResult {
     );
   }
 
+  /// Monotonic native session identity.
   final int sessionGeneration;
+
+  /// Whether the native overlay can currently accept colors.
   final bool rendererReady;
+
+  /// Whether feature acquisition is supported.
   final bool featureReady;
+
+  /// Best available depth capability.
   final ARVisibilityGridDepthCapability depthCapability;
+
+  /// Whether a depth adapter was configured.
   final bool depthConfigured;
+
+  /// Depth mode selected for this session.
   final ARVisibilityGridDepthMode depthActiveMode;
+
+  /// Accepted stable voxel capacity.
   final int renderCapacity;
+
+  /// Accepted native feature-track capacity.
   final int featureTrackCapacity;
+
+  /// Initial component health.
   final ARVisibilityGridSourceHealth health;
 }
 
+/// Typed native visibility-grid failure.
 class ARVisibilityGridError {
   const ARVisibilityGridError({
     required this.code,
@@ -189,6 +238,7 @@ class ARVisibilityGridError {
     this.sessionGeneration,
   });
 
+  /// Parses a native error, throwing [FormatException] when malformed.
   factory ARVisibilityGridError.fromMap(Map<Object?, Object?> map) {
     final wireCode = map['code'];
     final code = ARVisibilityGridErrorCode.values
@@ -228,17 +278,38 @@ class ARVisibilityGridError {
     );
   }
 
+  /// Stable error category.
   final ARVisibilityGridErrorCode code;
+
+  /// Human-readable diagnostic.
   final String message;
+
+  /// Whether retrying within this generation is valid.
   final bool recoverable;
+
+  /// Whether feature fusion must stop.
   final bool fatalToFeature;
+
+  /// Whether depth fusion must stop.
   final bool fatalToDepth;
+
+  /// Whether visualization must stop.
   final bool fatalToRenderer;
+
+  /// Whether the complete grid must stop.
   final bool fatalToGrid;
+
+  /// Affected group generation, when known.
   final int? groupGeneration;
+
+  /// Affected session generation, when known.
   final int? sessionGeneration;
 }
 
+/// Group identity, transforms, and restored geometry sent to native start.
+///
+/// Construction throws [ArgumentError] for invalid identity, bounds, keys, or
+/// non-inverse transforms.
 class ARVisibilityGridGroupConfig {
   ARVisibilityGridGroupConfig({
     required this.groupId,
@@ -275,15 +346,31 @@ class ARVisibilityGridGroupConfig {
     }
   }
 
+  /// Durable capture-group identifier.
   final String groupId;
+
+  /// Monotonic runtime generation of that group.
   final int groupGeneration;
+
+  /// Native/Dart shared voxel edge length.
   final double voxelSizeMeters;
+
+  /// Maximum stable keys for the group.
   final int capacity;
+
+  /// Column-major group-to-world transform.
   final Float64List worldFromGroupGl;
+
+  /// Column-major world-to-group inverse transform.
   final Float64List groupFromWorldGl;
+
+  /// Geometry revision represented by [restoredKeys].
   final int restoredGeometryRevision;
+
+  /// Stable keys restored before live acquisition.
   final Int64List restoredKeys;
 
+  /// Serializes the immutable v1 start payload.
   Map<String, Object> toMap() => <String, Object>{
         'version': visibilityGridWireVersion,
         'groupId': groupId,
@@ -330,6 +417,10 @@ T _enumByName<T extends Enum>(
   throw FormatException('Invalid visibility-grid value for $field.');
 }
 
+/// Color-only update for keys in an acknowledged geometry revision.
+///
+/// Construction throws [ArgumentError] for invalid revisions, lengths, or
+/// duplicate keys.
 class ARVisibilityGridVisibilityPatch {
   ARVisibilityGridVisibilityPatch({
     required this.groupId,
@@ -352,14 +443,28 @@ class ARVisibilityGridVisibilityPatch {
     }
   }
 
+  /// Durable capture-group identifier.
   final String groupId;
+
+  /// Exact active group generation.
   final int groupGeneration;
+
+  /// Exact active session generation.
   final int sessionGeneration;
+
+  /// Acknowledged geometry revision being colored.
   final int geometryRevision;
+
+  /// Independent increasing color revision.
   final int visibilityRevision;
+
+  /// Existing stable voxel keys.
   final Int64List keys;
+
+  /// Packed colors parallel to [keys].
   final Int32List colors;
 
+  /// Serializes the immutable v1 color payload.
   Map<String, Object> toMap() => <String, Object>{
         'version': visibilityGridWireVersion,
         'groupId': groupId,
@@ -372,6 +477,7 @@ class ARVisibilityGridVisibilityPatch {
       };
 }
 
+/// Current health of each native visibility-grid component.
 class ARVisibilityGridSourceHealth {
   const ARVisibilityGridSourceHealth({
     required this.feature,
@@ -380,6 +486,7 @@ class ARVisibilityGridSourceHealth {
     required this.totalGrid,
   });
 
+  /// Parses health, throwing [FormatException] for an unknown state.
   factory ARVisibilityGridSourceHealth.fromMap(Map<Object?, Object?> map) {
     ARVisibilityGridSourceState read(String field) {
       final value = map[field];
@@ -399,12 +506,20 @@ class ARVisibilityGridSourceHealth {
     );
   }
 
+  /// Feature fusion health.
   final ARVisibilityGridSourceState feature;
+
+  /// Depth fusion health.
   final ARVisibilityGridSourceState depth;
+
+  /// Renderer health.
   final ARVisibilityGridSourceState renderer;
+
+  /// Overall acquisition health.
   final ARVisibilityGridSourceState totalGrid;
 }
 
+/// One bounded revisioned geometry change or full reset snapshot.
 class ARVisibilityGridDelta {
   ARVisibilityGridDelta({
     required this.groupId,
@@ -420,6 +535,10 @@ class ARVisibilityGridDelta {
   })  : upsertKeys = Int64List.fromList(upsertKeys),
         removalKeys = Int64List.fromList(removalKeys);
 
+  /// Parses and validates a native delta.
+  ///
+  /// Throws [FormatException] for stale protocol shape, non-adjacent
+  /// revisions, duplicate/overlapping keys, or capacity violations.
   factory ARVisibilityGridDelta.fromMap(Map<Object?, Object?> map) {
     if (map['version'] != visibilityGridWireVersion) {
       throw const FormatException('Unsupported visibility-grid wire version.');
@@ -458,10 +577,19 @@ class ARVisibilityGridDelta {
     }
     final removals = removalKeys.toSet();
     if (upsertKeys.length != upsertKeys.toSet().length ||
-        removalKeys.length != removals.length ||
-        upsertKeys.any(removals.contains)) {
+        removalKeys.length != removals.length) {
+      throw const FormatException(
+        'Visibility-grid delta keys must be unique.',
+      );
+    }
+    if (upsertKeys.any(removals.contains)) {
       throw const FormatException(
         'A visibility-grid key cannot be upserted and removed together.',
+      );
+    }
+    if (upsertKeys.length + removalKeys.length > capacity) {
+      throw const FormatException(
+        'Visibility-grid delta exceeds its negotiated capacity.',
       );
     }
     return ARVisibilityGridDelta(
@@ -478,15 +606,34 @@ class ARVisibilityGridDelta {
     );
   }
 
+  /// Durable capture-group identifier.
   final String groupId;
+
+  /// Exact active group generation.
   final int groupGeneration;
+
+  /// Exact active session generation.
   final int sessionGeneration;
+
+  /// Receiver revision this delta builds on.
   final int baseGeometryRevision;
+
+  /// Resulting geometry revision.
   final int geometryRevision;
+
+  /// Whether [upsertKeys] is a complete replacement snapshot.
   final bool reset;
+
+  /// Stable keys inserted or refreshed.
   final Int64List upsertKeys;
+
+  /// Stable keys removed from the mirror.
   final Int64List removalKeys;
+
+  /// Negotiated maximum change-set size.
   final int capacity;
+
+  /// Component health sampled with this geometry revision.
   final ARVisibilityGridSourceHealth sourceHealth;
 }
 

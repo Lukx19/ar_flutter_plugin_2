@@ -219,7 +219,7 @@ class NativeVisibilityGridTest {
                     jumpResetMeters = 1_000.0,
                 ),
             )
-        grid.startGroup(group().copy(capacity = 10))
+        grid.startGroup(group().copy(capacity = 2))
         grid.observe(feature(0, 0.02, 0.02, 0.02))
         grid.observe(feature(1, 0.42, 0.02, 0.02))
         grid.observe(feature(2, 0.82, 0.02, 0.02))

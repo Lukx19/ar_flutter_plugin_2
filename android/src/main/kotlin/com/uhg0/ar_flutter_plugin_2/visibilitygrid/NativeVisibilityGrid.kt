@@ -1080,12 +1080,9 @@ class NativeVisibilityGrid(
     ) {
         if (snapshotRequired) return
         pendingGeometry[key] = state
-        val maximumPendingKeys =
-            minOf(
-                group.capacity * 2,
-                maxOf(1, tracks.size * 2),
-            )
-        if (pendingGeometry.size > maximumPendingKeys) {
+        // Switch to a reset before a relocation can exceed the negotiated
+        // capacity with separate removal and upsert lists.
+        if (pendingGeometry.size > group.capacity) {
             pendingGeometry.clear()
             snapshotRequired = true
         }
