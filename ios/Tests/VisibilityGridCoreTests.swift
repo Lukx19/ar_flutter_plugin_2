@@ -624,6 +624,42 @@ final class VisibilityGridCoreTests: XCTestCase {
             p95AfterAccepted
         )
     }
+
+    func testPausedLifecycleAllowsOnlyCurrentCheckpointEpoch() {
+        let lifecycle = VisibilityGridLifecycleEpoch()
+        let active = lifecycle.token
+
+        lifecycle.pause()
+        let paused = lifecycle.token
+
+        XCTAssertFalse(lifecycle.allows(active))
+        XCTAssertFalse(lifecycle.allows(paused))
+        XCTAssertFalse(lifecycle.allowsCheckpoint(active))
+        XCTAssertTrue(lifecycle.allowsCheckpoint(paused))
+        XCTAssertTrue(
+            lifecycle.allowsCall("checkpointBarrier", token: paused)
+        )
+        XCTAssertTrue(
+            lifecycle.allowsCall("releaseCheckpoint", token: paused)
+        )
+        XCTAssertFalse(lifecycle.allowsCall("getHealth", token: paused))
+
+        lifecycle.resume()
+        XCTAssertFalse(lifecycle.allowsCheckpoint(paused))
+
+        let resumed = lifecycle.token
+        XCTAssertTrue(lifecycle.allows(resumed))
+        XCTAssertTrue(lifecycle.allowsCheckpoint(resumed))
+
+        lifecycle.changeGroup()
+        XCTAssertFalse(lifecycle.allowsCheckpoint(resumed))
+
+        let changedGroup = lifecycle.token
+        XCTAssertTrue(lifecycle.allowsCheckpoint(changedGroup))
+        lifecycle.dispose()
+        XCTAssertFalse(lifecycle.allowsCheckpoint(changedGroup))
+        XCTAssertFalse(lifecycle.allowsCheckpoint(lifecycle.token))
+    }
 }
 
 extension VisibilityGridFeatureConfiguration {

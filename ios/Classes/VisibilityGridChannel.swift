@@ -285,7 +285,9 @@ final class VisibilityGridChannel {
         }
         lock.lock()
         let admissionToken = lifecycle.token
-        let admitted = !disposed && lifecycle.allows(admissionToken)
+        let admitted =
+            !disposed &&
+            lifecycle.allowsCall(call.method, token: admissionToken)
         lock.unlock()
         guard admitted else {
             result(error("VG_NOT_INITIALIZED", "Visibility grid is disposed"))
@@ -295,7 +297,11 @@ final class VisibilityGridChannel {
             guard let self else { return }
             self.lock.lock()
             let stillAdmitted =
-                self.lifecycle.allows(admissionToken) && !self.disposed
+                self.lifecycle.allowsCall(
+                    call.method,
+                    token: admissionToken
+                ) &&
+                !self.disposed
             self.lock.unlock()
             guard stillAdmitted else {
                 DispatchQueue.main.async {
@@ -316,7 +322,10 @@ final class VisibilityGridChannel {
                 DispatchQueue.main.async {
                     self.lock.lock()
                     let valid =
-                        self.lifecycle.allows(completionToken) &&
+                        self.lifecycle.allowsCall(
+                            call.method,
+                            token: completionToken
+                        ) &&
                         !self.disposed
                     self.lock.unlock()
                     if valid {
@@ -337,7 +346,10 @@ final class VisibilityGridChannel {
                 DispatchQueue.main.async {
                     self.lock.lock()
                     let valid =
-                        self.lifecycle.allows(completionToken) &&
+                        self.lifecycle.allowsCall(
+                            call.method,
+                            token: completionToken
+                        ) &&
                         !self.disposed
                     self.lock.unlock()
                     result(

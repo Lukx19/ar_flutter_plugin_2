@@ -558,6 +558,19 @@ final class VisibilityGridLifecycleEpoch {
         !disposed && !paused && token == candidate
     }
 
+    func allowsCheckpoint(_ candidate: Int64) -> Bool {
+        !disposed && token == candidate
+    }
+
+    func allowsCall(_ method: String, token candidate: Int64) -> Bool {
+        switch method {
+        case "checkpointBarrier", "releaseCheckpoint":
+            return allowsCheckpoint(candidate)
+        default:
+            return allows(candidate)
+        }
+    }
+
     func pause() {
         guard !disposed && !paused else { return }
         paused = true
