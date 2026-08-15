@@ -40,23 +40,24 @@ object M0PictureViewBins24 {
     )
 
     fun classify(vector: M0Q15Vector): Int {
+        val lengthSquared = vector.x.toLong() * vector.x +
+            vector.y.toLong() * vector.y +
+            vector.z.toLong() * vector.z
+        val nineY2 = 9L * vector.y * vector.y
         val band = when {
-            vector.y * 3 < -32767 -> 0
-            vector.y * 3 < 32767 -> 1
-            else -> 2
+            vector.y < 0 && nineY2 > lengthSquared -> 0
+            vector.y > 0 && nineY2 >= lengthSquared -> 2
+            else -> 1
         }
         val absoluteX = kotlin.math.abs(vector.x)
         val absoluteZ = kotlin.math.abs(vector.z)
         val azimuth = when {
-            absoluteX == 0 && absoluteZ == 0 -> 0
-            absoluteX == absoluteZ -> when {
-                vector.x < 0 && vector.z < 0 -> 1
-                vector.x < 0 -> 3
-                vector.z >= 0 -> 5
-                else -> 7
-            }
-            absoluteX < absoluteZ -> if (vector.z < 0) 0 else 4
-            else -> if (vector.x < 0) 2 else 6
+            vector.x == 0 -> if (vector.z > 0) 4 else 0
+            vector.z == 0 -> if (vector.x < 0) 2 else 6
+            vector.x < 0 && vector.z < 0 -> if (absoluteX < absoluteZ) 0 else 1
+            vector.x < 0 && vector.z > 0 -> if (absoluteX > absoluteZ) 2 else 3
+            vector.x > 0 && vector.z > 0 -> if (absoluteX < absoluteZ) 4 else 5
+            else -> if (absoluteX > absoluteZ) 6 else 7
         }
         return band * 8 + azimuth
     }

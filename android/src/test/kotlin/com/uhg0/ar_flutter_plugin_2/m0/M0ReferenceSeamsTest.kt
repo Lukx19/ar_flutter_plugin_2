@@ -209,6 +209,10 @@ class M0ReferenceSeamsTest {
         assertEquals(12, M0PictureViewBins24.classify(M0Q15Vector(0, 0, 32767)))
         assertEquals(14, M0PictureViewBins24.classify(M0Q15Vector(32767, 0, 0)))
         assertEquals(9, M0PictureViewBins24.classify(M0Q15Vector(-32767, 0, -32767)))
+        assertEquals(11, M0PictureViewBins24.classify(M0Q15Vector(-1, 0, 32767)))
+        assertEquals(15, M0PictureViewBins24.classify(M0Q15Vector(1, 0, -32767)))
+        assertEquals(21, M0PictureViewBins24.classify(M0Q15Vector(6, 3, 6)))
+        assertEquals(13, M0PictureViewBins24.classify(M0Q15Vector(6, -3, 6)))
         assertEquals(M0Q15Vector(0, 0, -32767), M0PictureViewBins24.normalize(0, 0, -100))
 
         val coverage = M0VisibilityCoverage24()
