@@ -143,6 +143,30 @@ class M0ReferenceSeamsTest {
     }
 
     @Test
+    fun `schema five canonical and coverage shards round trip`() {
+        val region = M0RegionCoordinate(-1, 2, 0)
+        val canonical = M0RegionShardV5.encodeCanonical(
+            region = region,
+            captureEvaluatedThrough = 4,
+            pendingThrough = 2,
+            surfaceRows = listOf(ByteArray(19)),
+            lineageRows = listOf(ByteArray(9)),
+        )
+        val coverage = M0RegionShardV5.encodeCoverage(
+            region = region,
+            captureEvaluatedThrough = 4,
+            pendingThrough = 2,
+            surfaceRows = listOf(ByteArray(56)),
+            overflowRows = listOf(ByteArray(13)),
+            compression = M0RegionShardV5.Compression.ZLIB,
+        )
+        assertEquals(1, M0RegionShardV5.decode(canonical).surfaceRows.size)
+        assertEquals(M0RegionShardV5.Compression.ZLIB, M0RegionShardV5.decode(coverage).compression)
+        coverage[coverage.lastIndex] = (coverage.last().toInt() xor 1).toByte()
+        assertThrows<IllegalArgumentException> { M0RegionShardV5.decode(coverage) }
+    }
+
+    @Test
     fun `centroid renderer uses stable reusable slots and accessible labels`() {
         val renderer = M0CentroidRendererState(3)
         assertTrue(renderer.upsert(M0CentroidRow("g/s1", 0f, 0f, 0f, M0SemanticState.COVERED)))

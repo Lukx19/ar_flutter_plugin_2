@@ -31,6 +31,7 @@ import com.uhg0.ar_flutter_plugin_2.sceneview.resolveNodeUri
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridMethodChannel
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridRuntimeCapabilities
 import com.uhg0.ar_flutter_plugin_2.m0.M0aVisibilitySurfaceStreamChannel
+import com.uhg0.ar_flutter_plugin_2.m0.M0aVisibilityGridControlChannel
 import com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraCapabilityQuerier
 import io.flutter.FlutterInjector
 import io.flutter.plugin.common.BinaryMessenger
@@ -95,6 +96,7 @@ internal class ArView(
     // Keep it out of release builds so an incomplete V2 transport cannot
     // become observable product behavior.
     private var m0aSurfaceStreamChannel: M0aVisibilitySurfaceStreamChannel? = null
+    private var m0aControlChannel: M0aVisibilityGridControlChannel? = null
 
     init {
         visibilityGridChannel = VisibilityGridMethodChannel(
@@ -116,6 +118,7 @@ internal class ArView(
         )
         if (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
             m0aSurfaceStreamChannel = M0aVisibilitySurfaceStreamChannel(messenger, id)
+            m0aControlChannel = M0aVisibilityGridControlChannel(messenger, id)
         }
     }
 
@@ -186,6 +189,7 @@ internal class ArView(
         captureChannel.setMethodCallHandler(null)
         visibilityGridChannel.dispose()
         m0aSurfaceStreamChannel?.dispose()
+        m0aControlChannel?.dispose()
         lifecycle.removeObserver(lifecycleObserver)
         captureSession.dispose()
         pendingCloudOperations.toList().forEach { it() }
