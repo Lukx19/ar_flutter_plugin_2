@@ -81,7 +81,7 @@ object M0PictureViewBins24 {
         }
         if (
             4 * numerator == lengthSquared * (2 * result + 1) * (2 * result + 1) &&
-            result % 2L == 0L
+            result % 2L != 0L
         ) {
             result++
         }
