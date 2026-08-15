@@ -156,6 +156,12 @@ class M0ReferenceSeamsTest {
         assertEquals(1, plan.dirtySpans.size)
         assertEquals(M0DirtySpan(0, 1), plan.dirtySpans.single())
         assertFalse(plan.reset)
+        renderer.loseContext()
+        assertTrue(renderer.isContextLost)
+        assertTrue(renderer.flush().rebuild)
+        renderer.restoreContext()
+        assertTrue(renderer.flush().rebuild)
+        assertFalse(renderer.isContextLost)
     }
 
     @Test

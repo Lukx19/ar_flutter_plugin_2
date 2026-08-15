@@ -20,6 +20,7 @@ data class M0RendererFramePlan(
     val uploadBytes: Int,
     val reset: Boolean,
     val rowCount: Int,
+    val rebuild: Boolean = false,
 )
 
 class M0CentroidRendererState(
@@ -35,10 +36,27 @@ class M0CentroidRendererState(
     private val rows = mutableListOf<M0CentroidRow?>()
     private val dirtyRows = sortedSetOf<Int>()
     private var reset = true
+    private var rebuild = false
+    var isContextLost: Boolean = false
+        private set
     var mode: M0RendererMode = M0RendererMode.CENTROIDS
         private set
 
     val rowCount: Int get() = slotsByKey.size
+
+    fun loseContext() {
+        isContextLost = true
+        rebuild = true
+        reset = true
+        dirtyRows += slotsByKey.values
+    }
+
+    fun restoreContext() {
+        isContextLost = false
+        rebuild = true
+        reset = true
+        dirtyRows += slotsByKey.values
+    }
 
     fun setMode(value: M0RendererMode) {
         if (mode == value) return
@@ -88,9 +106,10 @@ class M0CentroidRendererState(
             }
         }
         val bytes = spans.sumOf { it.endExclusive - it.start } * bytesPerRow
-        val plan = M0RendererFramePlan(mode, spans, minOf(bytes, maxUploadBytes), reset, rowCount)
+        val plan = M0RendererFramePlan(mode, spans, minOf(bytes, maxUploadBytes), reset, rowCount, rebuild)
         dirtyRows.removeAll(selectedRows)
         reset = false
+        rebuild = false
         return plan
     }
 
