@@ -1,4 +1,5 @@
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:flutter/services.dart';
 
@@ -53,5 +54,38 @@ final class ARVisibilitySurfaceStream {
 
   void _ensureOpen() {
     if (_closed) throw StateError('Visibility surface stream is disposed.');
+  }
+}
+
+/// Stateless entry point for a real Flutter background isolate.
+///
+/// The caller must invoke this from the spawned isolate and pass the root
+/// token captured before spawning. No ordinary surface collection is
+/// materialized by the root isolate; only the bounded packed request and
+/// response cross the isolate boundary.
+final class ARVisibilitySurfaceStreamWorker {
+  const ARVisibilitySurfaceStreamWorker._();
+
+  static Future<Uint8List> exchange({
+    required ui.RootIsolateToken rootIsolateToken,
+    required int viewId,
+    required Uint8List request,
+  }) async {
+    BackgroundIsolateBinaryMessenger.ensureInitialized(rootIsolateToken);
+    final channel = BasicMessageChannel<ByteData?>(
+      'visibility_surface_stream_$viewId',
+      const BinaryCodec(),
+      binaryMessenger: BackgroundIsolateBinaryMessenger.instance,
+    );
+    final response = await channel.send(ByteData.sublistView(request));
+    if (response == null) {
+      throw StateError('Visibility surface stream returned no response.');
+    }
+    return Uint8List.fromList(
+      response.buffer.asUint8List(
+        response.offsetInBytes,
+        response.offsetInBytes + response.lengthInBytes,
+      ),
+    );
   }
 }
