@@ -10,7 +10,7 @@ final class ARVisibilityGridV2Control {
   ARVisibilityGridV2Control(
     int viewId, {
     MethodChannel? channel,
-  }) : _channel = channel ?? MethodChannel('visibility_grid_control_$viewId');
+  }) : _channel = channel ?? MethodChannel('arpointcloud_$viewId');
 
   final MethodChannel _channel;
 

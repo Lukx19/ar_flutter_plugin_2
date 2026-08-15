@@ -164,7 +164,8 @@ class M0BoundedTsdfKernel(
             surfaces = visible.mapIndexed { index, entry ->
                 M0CanonicalSurface(ids.idFor(entry.key), entry.key, entry.value, normalOctant(entry.key))
             },
-            overflowObservationCount = overflow + (signedDistance.size - visible.size).coerceAtLeast(0),
+            overflowObservationCount = overflow +
+                (signedDistance.size - capacity).coerceAtLeast(0),
         )
     }
 }

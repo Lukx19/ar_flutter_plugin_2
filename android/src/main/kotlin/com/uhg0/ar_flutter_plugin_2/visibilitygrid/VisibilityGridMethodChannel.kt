@@ -6,6 +6,9 @@ import com.google.ar.core.Config
 import com.google.ar.core.Frame
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.NotYetAvailableException
+import com.uhg0.ar_flutter_plugin_2.m0.M0aControlCodec
+import com.uhg0.ar_flutter_plugin_2.m0.M0aControlOperation
+import com.uhg0.ar_flutter_plugin_2.m0.M0aControlResponse
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
@@ -55,6 +58,8 @@ class VisibilityGridMethodChannel(
         LatestRawPointRenderHandoff<CoveragePointRenderSnapshot>()
     private var rawPointSnapshotPublished = false
     private var healthHeartbeatGeneration = 0L
+    private var lastM0aControlRequest: ByteArray? = null
+    private var lastM0aControlResponse: ByteArray? = null
 
     init {
         channel.setMethodCallHandler(this)
@@ -63,6 +68,14 @@ class VisibilityGridMethodChannel(
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         if (disposed && call.method != "dispose") {
             result.error("VG_NOT_INITIALIZED", "Visibility grid is disposed", null)
+            return
+        }
+        if (
+            isDebuggable &&
+            call.method in setOf("start", "beginCheckpoint", "releaseCheckpoint", "stop") &&
+            (call.method != "releaseCheckpoint" || call.arguments is ByteArray)
+        ) {
+            handleM0aControl(call, result)
             return
         }
         try {
@@ -256,6 +269,8 @@ class VisibilityGridMethodChannel(
             grid = null
             group = null
             checkpointBarrierActive = false
+            lastM0aControlRequest = null
+            lastM0aControlResponse = null
         }
         checkpointResult?.error(
             "VG_NOT_INITIALIZED",
@@ -267,6 +282,71 @@ class VisibilityGridMethodChannel(
         oldRenderer?.dispose()
         render(null, null)
         clearRawPoints()
+    }
+
+    private fun handleM0aControl(call: MethodCall, result: MethodChannel.Result) {
+        val operation = when (call.method) {
+            "start" -> M0aControlOperation.START
+            "beginCheckpoint" -> M0aControlOperation.BEGIN_CHECKPOINT
+            "releaseCheckpoint" -> M0aControlOperation.RELEASE_CHECKPOINT
+            "stop" -> M0aControlOperation.STOP
+            else -> null
+        }
+        val bytes = call.arguments as? ByteArray
+        if (operation == null || bytes == null) {
+            result.error("VG_PROTOCOL_INVALID", "M0a control requires one Uint8List", null)
+            return
+        }
+        executor.execute {
+            try {
+                val response: ByteArray? = synchronized(this) {
+                    if (disposed) return@synchronized null
+                    val request = M0aControlCodec.decodeRequest(bytes)
+                    require(request.operation == operation) { "Control method and operation differ" }
+                    val previous = lastM0aControlRequest
+                    if (previous != null && previous.contentEquals(bytes)) {
+                        return@synchronized lastM0aControlResponse!!.copyOf()
+                    }
+                    require(
+                        previous == null ||
+                            request.controlRequestId !=
+                                M0aControlCodec.decodeRequest(previous).controlRequestId,
+                    ) { "Control request replay conflict" }
+                    val encoded = M0aControlCodec.encodeResponse(
+                        M0aControlResponse(
+                            operation = request.operation,
+                            outcome = 0,
+                            resultFlags = 0,
+                            errorId = 0,
+                            controlRequestId = request.controlRequestId,
+                            sessionId = request.sessionId,
+                            captureGroupId = request.captureGroupId,
+                            sessionGeneration = request.sessionGeneration,
+                            groupGeneration = request.groupGeneration,
+                            coverageEpoch = request.coverageEpoch,
+                            streamToken = if (request.operation == M0aControlOperation.START) {
+                                1
+                            } else {
+                                request.streamToken
+                            },
+                            nextExchangeRequestSequence = 1,
+                            nativeTransactionId = 0,
+                        ),
+                        M0aControlCodec.hardCeilingBytes,
+                    )
+                    lastM0aControlRequest = bytes.copyOf()
+                    lastM0aControlResponse = encoded.copyOf()
+                    encoded
+                }
+                if (response == null) {
+                    result.error("VG_NOT_INITIALIZED", "Visibility grid is disposed", null)
+                } else {
+                    result.success(response)
+                }
+            } catch (error: Exception) {
+                result.error("VG_PROTOCOL_INVALID", error.message, null)
+            }
+        }
     }
 
     fun pause() {
