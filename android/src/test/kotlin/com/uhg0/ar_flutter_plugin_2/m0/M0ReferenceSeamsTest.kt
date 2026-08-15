@@ -62,6 +62,59 @@ class M0ReferenceSeamsTest {
     }
 
     @Test
+    fun `M0a control and error detail use the pinned envelopes`() {
+        val id = M0aUuid(
+            byteArrayOf(
+                0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x46, 0x17,
+                0x98.toByte(), 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+            ),
+        )
+        val session = M0aUuid(id.bytes.map { (it.toInt() xor 1).toByte() }.toByteArray())
+        val group = M0aUuid(id.bytes.map { (it.toInt() xor 2).toByte() }.toByteArray())
+        val request = M0aControlRequest(
+            M0aControlOperation.START,
+            0,
+            id,
+            session,
+            group,
+            1,
+            2,
+            3,
+            0,
+            byteArrayOf(1, 2, 3),
+        )
+        val requestBytes = M0aControlCodec.encodeRequest(request)
+        assertEquals(107, requestBytes.size)
+        assertEquals(request, M0aControlCodec.decodeRequest(requestBytes))
+
+        val detail = M0aErrorDetail(
+            6, 0, 0, 2, 0, 4, 1, 0,
+            7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+        )
+        assertEquals(detail, M0aControlCodec.decodeErrorDetail(M0aControlCodec.encodeErrorDetail(detail)))
+        val response = M0aControlResponse(
+            M0aControlOperation.START,
+            1,
+            1,
+            6,
+            id,
+            session,
+            group,
+            1,
+            2,
+            3,
+            0,
+            0,
+            0,
+            M0aControlCodec.encodeErrorDetail(detail),
+            byteArrayOf(4, 5),
+        )
+        val responseBytes = M0aControlCodec.encodeResponse(response, 4096)
+        assertEquals(226, responseBytes.size)
+        assertEquals(response, M0aControlCodec.decodeResponse(responseBytes))
+    }
+
+    @Test
     fun `signed coordinates and pages match the Dart reference`() {
         assertEquals(M0RegionCoordinate(-1, 0, -1), m0RegionForMillimetres(-1, 0, -3000))
         assertEquals(M0RegionCoordinate(-1, -2, 0), m0RegionForMillimetres(-3000, -3001, 2999))

@@ -25,6 +25,13 @@ data class M0FusionResult(
     val overflowObservationCount: Int,
 )
 
+class M0StableSurfaceIdAllocator {
+    private val ids = mutableMapOf<M0VoxelKey, Long>()
+    private var next = 1L
+
+    fun idFor(key: M0VoxelKey): Long = ids.getOrPut(key) { next++ }
+}
+
 interface M0FusionKernel {
     val candidateId: String
     fun fuse(observations: Iterable<M0VoxelObservation>): M0FusionResult
@@ -36,6 +43,7 @@ open class M0SignedOccupancyKernel(
     private val occupancyThreshold: Int = 2,
     private val saturation: Int = 127,
 ) : M0FusionKernel {
+    protected val ids = M0StableSurfaceIdAllocator()
     init {
         require(capacity > 0 && occupancyThreshold > 0 && saturation > occupancyThreshold)
     }
@@ -57,7 +65,7 @@ open class M0SignedOccupancyKernel(
             .take(capacity)
         return M0FusionResult(
             surfaces = visible.mapIndexed { index, entry ->
-                M0CanonicalSurface(index + 1L, entry.key, entry.value, normalOctant(entry.key))
+                M0CanonicalSurface(ids.idFor(entry.key), entry.key, entry.value, normalOctant(entry.key))
             },
             overflowObservationCount = overflow + (weights.size - visible.size).coerceAtLeast(0),
         )
@@ -77,7 +85,7 @@ class M0PlanarConsolidationKernel(
             // M0's conservative reference must not collapse distinct z layers;
             // the locked corpus decides whether a richer planar merge is safe.
             surfaces = base.surfaces.mapIndexed { index, surface ->
-                surface.copy(surfaceId = index + 1L)
+                surface.copy(surfaceId = ids.idFor(surface.key))
             },
             overflowObservationCount = base.overflowObservationCount,
         )
@@ -88,6 +96,7 @@ class M0BoundedTsdfKernel(
     private val capacity: Int = 100_000,
     private val narrowBand: Int = 4,
 ) : M0FusionKernel {
+    private val ids = M0StableSurfaceIdAllocator()
     init {
         require(capacity > 0 && narrowBand > 0)
     }
@@ -107,7 +116,7 @@ class M0BoundedTsdfKernel(
         val visible = signedDistance.entries.filter { it.value > 0 }.take(capacity)
         return M0FusionResult(
             surfaces = visible.mapIndexed { index, entry ->
-                M0CanonicalSurface(index + 1L, entry.key, entry.value, normalOctant(entry.key))
+                M0CanonicalSurface(ids.idFor(entry.key), entry.key, entry.value, normalOctant(entry.key))
             },
             overflowObservationCount = overflow + (signedDistance.size - visible.size).coerceAtLeast(0),
         )
