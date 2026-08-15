@@ -1,5 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.m0
 
+import java.util.PriorityQueue
+
 enum class M0RendererMode { CENTROIDS, CUBES, RAW_POINTS, OVERVIEW }
 enum class M0SemanticState { UNCOVERED, COVERED, PENDING, STALE, DEGRADED }
 
@@ -34,6 +36,7 @@ class M0CentroidRendererState(
 
     private val slotsByKey = linkedMapOf<String, Int>()
     private val rows = mutableListOf<M0CentroidRow?>()
+    private val freeSlots = PriorityQueue<Int>()
     private val dirtyRows = sortedSetOf<Int>()
     private var reset = true
     private var rebuild = false
@@ -43,6 +46,8 @@ class M0CentroidRendererState(
         private set
 
     val rowCount: Int get() = slotsByKey.size
+
+    fun slotFor(key: String): Int? = slotsByKey[key]
 
     fun loseContext() {
         isContextLost = true
@@ -74,8 +79,12 @@ class M0CentroidRendererState(
             return true
         }
         if (rowCount >= capacity) return false
-        val slot = rows.indexOfFirst { it == null }.let { if (it == -1) rows.size else it }
-        if (slot == rows.size) rows += null
+        val slot = if (freeSlots.isNotEmpty()) {
+            freeSlots.remove()
+        } else {
+            if (rows.size >= capacity) return false
+            rows.size.also { rows += null }
+        }
         slotsByKey[row.qualifiedKey] = slot
         rows[slot] = row
         dirtyRows += slot
@@ -85,6 +94,7 @@ class M0CentroidRendererState(
     fun remove(key: String): Boolean {
         val slot = slotsByKey.remove(key) ?: return false
         rows[slot] = null
+        freeSlots += slot
         dirtyRows += slot
         return true
     }

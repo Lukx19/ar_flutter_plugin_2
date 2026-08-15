@@ -189,6 +189,20 @@ class M0ReferenceSeamsTest {
     }
 
     @Test
+    fun `centroid renderer uses a bounded free list for 100k rows`() {
+        val renderer = M0CentroidRendererState(100_000)
+        repeat(100_000) { index ->
+            assertTrue(renderer.upsert(M0CentroidRow("g/$index", index.toFloat(), 0f, 0f, M0SemanticState.COVERED)))
+        }
+        assertEquals(100_000, renderer.rowCount)
+        assertTrue(renderer.flush().uploadBytes <= 64 * 1024)
+        assertTrue(renderer.remove("g/0"))
+        assertTrue(renderer.remove("g/1"))
+        assertTrue(renderer.upsert(M0CentroidRow("g/reused", 0f, 0f, 0f, M0SemanticState.PENDING)))
+        assertEquals(0, renderer.slotFor("g/reused"))
+    }
+
+    @Test
     fun `signed occupancy keeps supported cells and records overflow`() {
         val kernel = M0SignedOccupancyKernel(capacity = 10)
         val result = kernel.fuse(
