@@ -203,6 +203,30 @@ class M0ReferenceSeamsTest {
     }
 
     @Test
+    fun `visibility bins and normalization match the Dart reference`() {
+        assertEquals(8, M0PictureViewBins24.classify(M0Q15Vector(0, 0, -32767)))
+        assertEquals(10, M0PictureViewBins24.classify(M0Q15Vector(-32767, 0, 0)))
+        assertEquals(12, M0PictureViewBins24.classify(M0Q15Vector(0, 0, 32767)))
+        assertEquals(14, M0PictureViewBins24.classify(M0Q15Vector(32767, 0, 0)))
+        assertEquals(9, M0PictureViewBins24.classify(M0Q15Vector(-32767, 0, -32767)))
+        assertEquals(M0Q15Vector(0, 0, -32767), M0PictureViewBins24.normalize(0, 0, -100))
+
+        val coverage = M0VisibilityCoverage24()
+        listOf(8, 10, 12).forEach { coverage.credit(it, 2) }
+        val result = coverage.evaluate(M0Q15Vector(0, 32767, 0), 0)
+        assertEquals(listOf(8, 10, 12), result.indices)
+        assertEquals(255, result.score)
+        assertTrue(result.complete)
+        assertEquals(1, coverage.directionalNeedCode(8, complete = false))
+
+        val overflow = M0VisibilityCoverage24()
+        overflow.credit(0, 65536)
+        assertEquals(65535, overflow.packedCounts()[0])
+        assertEquals(1L, overflow.overflowCounts()[0])
+        assertEquals(65536L, overflow.countAt(0))
+    }
+
+    @Test
     fun `planar candidate preserves distinct thin and opposed layers`() {
         val result = M0PlanarConsolidationKernel().fuse(
             listOf(
