@@ -91,7 +91,10 @@ internal class ArView(
         onNodeGesture = ::onNodeGesture,
     )
     private lateinit var visibilityGridChannel: VisibilityGridMethodChannel
-    private lateinit var m0aSurfaceStreamChannel: M0aVisibilitySurfaceStreamChannel
+    // M0a is a reference seam until the locked decision record selects V2.
+    // Keep it out of release builds so an incomplete V2 transport cannot
+    // become observable product behavior.
+    private var m0aSurfaceStreamChannel: M0aVisibilitySurfaceStreamChannel? = null
 
     init {
         visibilityGridChannel = VisibilityGridMethodChannel(
@@ -111,7 +114,9 @@ internal class ArView(
             render = sceneHost::updateCoverageRenderer,
             renderRawPoints = sceneHost::updateRawPointCloud,
         )
-        m0aSurfaceStreamChannel = M0aVisibilitySurfaceStreamChannel(messenger, id)
+        if (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+            m0aSurfaceStreamChannel = M0aVisibilitySurfaceStreamChannel(messenger, id)
+        }
     }
 
     private val captureSession = ArCaptureSession(
@@ -180,7 +185,7 @@ internal class ArView(
         anchorChannel.setMethodCallHandler(null)
         captureChannel.setMethodCallHandler(null)
         visibilityGridChannel.dispose()
-        m0aSurfaceStreamChannel.dispose()
+        m0aSurfaceStreamChannel?.dispose()
         lifecycle.removeObserver(lifecycleObserver)
         captureSession.dispose()
         pendingCloudOperations.toList().forEach { it() }
