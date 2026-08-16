@@ -45,6 +45,7 @@ android {
         main.java.srcDirs += 'src/main/kotlin'
         test.java.srcDirs += 'src/test/kotlin'
         test.resources.srcDirs += '../test/fixtures'
+        test.resources.srcDirs += '../../../docs/m0'
     }
 
     defaultConfig {

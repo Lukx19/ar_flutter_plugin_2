@@ -25,6 +25,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
         val conflict = messenger.exchange(request(sequence = 1, token = 92))
         val conflictResponse = M0aPacketCodec.decodeResponse(conflict)
         assertEquals(255, conflictResponse.messageKind)
+        assertEquals(30, conflictResponse.errorId)
         assertEquals(1L, conflictResponse.requestSequence)
 
         binding.dispose()
@@ -45,10 +46,14 @@ class M0aVisibilitySurfaceStreamChannelTest {
         val malformed = request(sequence = 1, token = 4).also { it[20] = (it[20].toInt() xor 1).toByte() }
         val malformedResponse = M0aPacketCodec.decodeResponse(messenger.exchange(malformed))
         assertEquals(255, malformedResponse.messageKind)
-        assertEquals(1, malformedResponse.errorId)
+        assertEquals(6, malformedResponse.errorId)
 
         val accepted = messenger.exchange(request(sequence = 1, token = 4))
         assertEquals(0, M0aPacketCodec.decodeResponse(accepted).messageKind)
+        assertEquals(0, M0aPacketCodec.decodeResponse(messenger.exchange(request(sequence = 2, token = 4))).messageKind)
+        val stale = M0aPacketCodec.decodeResponse(messenger.exchange(request(sequence = 1, token = 5)))
+        assertEquals(255, stale.messageKind)
+        assertEquals(31, stale.errorId)
         binding.dispose()
     }
 

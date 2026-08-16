@@ -30,6 +30,8 @@ class M0aVisibilitySurfaceStreamChannel(
     private var lastRequest: ByteArray? = null
     private var lastResponse: ByteArray? = null
 
+    private class BindingError(val errorId: Int) : IllegalArgumentException()
+
     init {
         channel.setMessageHandler { message, reply ->
             val bytes = message?.let { buffer ->
@@ -51,16 +53,16 @@ class M0aVisibilitySurfaceStreamChannel(
                         val previousSequence = lastSequence
                         when {
                             previousSequence == request.requestSequence -> {
-                                check(lastRequest!!.contentEquals(bytes)) {
-                                    "Request replay conflict"
+                                if (!lastRequest!!.contentEquals(bytes)) {
+                                    throw BindingError(REPLAY_CONFLICT_ERROR_ID)
                                 }
                                 lastResponse!!.copyOf()
                             }
                             previousSequence != null && request.requestSequence <= previousSequence -> {
-                                throw IllegalArgumentException("Request sequence is stale")
+                                throw BindingError(STALE_SEQUENCE_ERROR_ID)
                             }
                             request.requestSequence != nextExpectedSequence -> {
-                                throw IllegalArgumentException("Request sequence gap")
+                                throw BindingError(SEQUENCE_GAP_ERROR_ID)
                             }
                             else -> {
                                 val encoded = M0aPacketCodec.encodeResponse(
@@ -78,6 +80,23 @@ class M0aVisibilitySurfaceStreamChannel(
                                 encoded
                             }
                         }
+                    } catch (error: BindingError) {
+                        val sequence = if (bytes.size >= M0aPacketCodec.requestHeaderBytes) {
+                            ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getLong(64)
+                                .coerceAtLeast(0)
+                        } else {
+                            0
+                        }
+                        val token = decodedRequest?.streamToken ?: 0
+                        M0aPacketCodec.encodeResponse(
+                            M0aPacketCodec.error(
+                                streamToken = token,
+                                requestSequence = sequence,
+                                nextExpectedRequestSequence = nextExpectedSequence,
+                                errorId = error.errorId,
+                            ),
+                            M0aPacketCodec.responseMinimumBytes,
+                        )
                     } catch (_: Exception) {
                         val sequence = if (bytes.size >= M0aPacketCodec.requestHeaderBytes) {
                             ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getLong(64)
@@ -91,8 +110,7 @@ class M0aVisibilitySurfaceStreamChannel(
                                 streamToken = token,
                                 requestSequence = sequence,
                                 nextExpectedRequestSequence = nextExpectedSequence,
-                                errorId = if (decodedRequest != null &&
-                                    sequence > nextExpectedSequence) 32 else 1,
+                                errorId = MALFORMED_PACKET_ERROR_ID,
                             ),
                             M0aPacketCodec.responseMinimumBytes,
                         )
@@ -119,5 +137,12 @@ class M0aVisibilitySurfaceStreamChannel(
         }
         channel.setMessageHandler(null)
         executor.shutdownNow()
+    }
+
+    private companion object {
+        const val MALFORMED_PACKET_ERROR_ID = 6
+        const val REPLAY_CONFLICT_ERROR_ID = 30
+        const val STALE_SEQUENCE_ERROR_ID = 31
+        const val SEQUENCE_GAP_ERROR_ID = 32
     }
 }
