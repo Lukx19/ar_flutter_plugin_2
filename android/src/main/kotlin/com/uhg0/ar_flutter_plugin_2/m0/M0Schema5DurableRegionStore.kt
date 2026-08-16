@@ -16,6 +16,23 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
 
+/** Directory durability policy for schema-5 atomic publication. */
+fun interface M0DirectorySync {
+    fun sync(directory: File)
+
+    companion object {
+        /** Keeps the JVM/reference campaign portable when the host rejects directory fsync. */
+        val bestEffort: M0DirectorySync = M0DirectorySync { directory ->
+            runCatching { M0AndroidDirectorySync.sync(directory) }
+        }
+
+        /** Fails the caller when the Android filesystem cannot fsync the directory. */
+        val strictAndroid: M0DirectorySync = M0DirectorySync { directory ->
+            M0AndroidDirectorySync.sync(directory)
+        }
+    }
+}
+
 /** The complete canonical/coverage cut that one schema-5 root exposes. */
 data class M0RegionPairCut(
     val region: M0RegionCoordinate,
@@ -197,6 +214,7 @@ class M0Schema5DurableRegionCutStore(
     private val directory: File,
     initialCuts: List<M0RegionPairCut> = emptyList(),
     private val onBeforeProcessDeathCut: (() -> Unit)? = null,
+    private val directorySync: M0DirectorySync = M0DirectorySync.bestEffort,
 ) {
     private val rootsDirectory = File(directory, "roots")
     private val roots = linkedMapOf<Long, Map<M0RegionCoordinate, M0RegionPairCut>>()
@@ -209,6 +227,8 @@ class M0Schema5DurableRegionCutStore(
     init {
         require(directory.mkdirs() || directory.isDirectory)
         require(rootsDirectory.mkdirs() || rootsDirectory.isDirectory)
+        directorySync.sync(directory)
+        directorySync.sync(rootsDirectory)
         recover()
         if (roots.isEmpty()) {
             val initial = validateCuts(initialCuts, allowEmpty = true)
@@ -431,7 +451,11 @@ class M0Schema5DurableRegionCutStore(
     private fun pointerFile(slot: M0Schema5PointerSlot) = File(directory, "root-${if (slot == M0Schema5PointerSlot.A) 'A' else 'B'}.ptr")
 
     private fun clearStaging() {
-        listOf("root.staging.json", "canonical.staging.json", "coverage.staging.json").forEach { File(directory, it).delete() }
+        var changed = false
+        listOf("root.staging.json", "canonical.staging.json", "coverage.staging.json").forEach {
+            changed = File(directory, it).delete() || changed
+        }
+        if (changed) directorySync.sync(directory)
     }
 
     private fun rootJson(rootId: Long, cuts: Map<M0RegionCoordinate, M0RegionPairCut>): String = buildString {
@@ -474,6 +498,7 @@ class M0Schema5DurableRegionCutStore(
             output.write(text.toByteArray(Charsets.UTF_8))
             output.fd.sync()
         }
+        file.parentFile?.let(directorySync::sync)
     }
 
     private fun writeAtomic(file: File, bytes: ByteArray) {
@@ -488,6 +513,7 @@ class M0Schema5DurableRegionCutStore(
         } catch (_: AtomicMoveNotSupportedException) {
             Files.move(temporary.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING)
         }
+        file.parentFile?.let(directorySync::sync)
     }
 
     private fun sha256(bytes: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(bytes)
