@@ -99,6 +99,38 @@ class M0aVisibilitySurfaceStreamChannelTest {
         replacement.dispose()
     }
 
+    @Test
+    fun `queued work returns binding lost after disposal`() {
+        val messenger = TestMessenger(21)
+        val executor = HoldingExecutor()
+        val binding = M0aVisibilitySurfaceStreamChannel(
+            messenger,
+            21,
+            workerExecutor = executor,
+            shutdownWorkerOnDispose = false,
+        )
+        val reply = arrayOfNulls<ByteArray>(1)
+        val completed = CountDownLatch(1)
+        messenger.send(
+            "visibility_surface_stream_21",
+            ByteBuffer.wrap(request(sequence = 1, token = 7)),
+        ) { response ->
+            reply[0] = response?.let { buffer ->
+                val copy = ByteArray(buffer.remaining())
+                buffer.slice().get(copy)
+                copy
+            }
+            completed.countDown()
+        }
+        binding.dispose()
+        executor.runQueued()
+        assertTrue(completed.await(2, TimeUnit.SECONDS))
+        val decoded = M0aPacketCodec.decodeResponse(reply[0]!!)
+        assertEquals(255, decoded.messageKind)
+        assertEquals(144, decoded.errorId)
+        assertEquals(1L, decoded.requestSequence)
+    }
+
     private fun request(sequence: Long, token: Long): ByteArray =
         M0aPacketCodec.encodeRequest(
             M0aPacketCodec.Request(
@@ -114,6 +146,18 @@ class M0aVisibilitySurfaceStreamChannelTest {
                 requestSequence = sequence,
             ),
         )
+}
+
+private class HoldingExecutor : Executor {
+    private var queued: Runnable? = null
+
+    override fun execute(command: Runnable) {
+        queued = command
+    }
+
+    fun runQueued() {
+        checkNotNull(queued).run()
+    }
 }
 
 private class TestMessenger(viewId: Int) : BinaryMessenger {

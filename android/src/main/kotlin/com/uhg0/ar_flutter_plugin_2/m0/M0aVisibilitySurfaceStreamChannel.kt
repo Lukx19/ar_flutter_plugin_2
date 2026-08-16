@@ -49,7 +49,7 @@ class M0aVisibilitySurfaceStreamChannel(
             try {
                 workerExecutor.execute {
                     val response = synchronized(this) {
-                        if (disposed) return@synchronized null
+                        if (disposed) return@synchronized workerLostResponseBytes(bytes)
                         var decodedRequest: M0aPacketCodec.Request? = null
                         try {
                             val request = M0aPacketCodec.decodeRequest(bytes)
@@ -120,7 +120,7 @@ class M0aVisibilitySurfaceStreamChannel(
                             )
                         }
                     }
-                    reply.reply(response?.let {
+                    reply.reply(response.let {
                         // Flutter's Android messenger passes position() as the
                         // JNI message length, so leave the reply positioned after
                         // the bytes rather than flipping it to zero.
@@ -149,6 +149,11 @@ class M0aVisibilitySurfaceStreamChannel(
     }
 
     private fun workerLostResponse(bytes: ByteArray): ByteBuffer {
+        val encoded = workerLostResponseBytes(bytes)
+        return ByteBuffer.allocateDirect(encoded.size).apply { put(encoded) }
+    }
+
+    private fun workerLostResponseBytes(bytes: ByteArray): ByteArray {
         val sequence = if (bytes.size >= M0aPacketCodec.requestHeaderBytes) {
             ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getLong(64).coerceAtLeast(0)
         } else {
@@ -164,7 +169,7 @@ class M0aVisibilitySurfaceStreamChannel(
             ),
             M0aPacketCodec.responseMinimumBytes,
         )
-        return ByteBuffer.allocateDirect(encoded.size).apply { put(encoded) }
+        return encoded
     }
 
     private companion object {
