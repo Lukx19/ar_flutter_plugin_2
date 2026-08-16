@@ -101,6 +101,38 @@ class M0aVisibilitySurfaceStreamChannelTest {
     }
 
     @Test
+    fun `accepted worker exception returns binding lost error and replacement recovers`() {
+        val messenger = TestMessenger(24)
+        val failedBinding = M0aVisibilitySurfaceStreamChannel(
+            messenger,
+            24,
+            workerExecutor = Executor { command ->
+                Thread(command, "m0a-accepted-worker-exit").start()
+            },
+            shutdownWorkerOnDispose = false,
+            beforeWorkerProcessing = {
+                throw IllegalStateException("worker exited after accepting task")
+            },
+        )
+
+        val failed = M0aPacketCodec.decodeResponse(
+            messenger.exchange(request(sequence = 1, token = 10)),
+        )
+        assertEquals(255, failed.messageKind)
+        assertEquals(144, failed.errorId)
+        assertEquals(1L, failed.requestSequence)
+        assertNull(messenger.tryExchange(request(sequence = 2, token = 10)))
+        failedBinding.dispose()
+
+        val replacement = M0aVisibilitySurfaceStreamChannel(messenger, 24)
+        val recovered = M0aPacketCodec.decodeResponse(
+            messenger.exchange(request(sequence = 1, token = 10)),
+        )
+        assertEquals(0, recovered.messageKind)
+        replacement.dispose()
+    }
+
+    @Test
     fun `queued work returns binding lost after disposal`() {
         val messenger = TestMessenger(21)
         val executor = HoldingExecutor()
