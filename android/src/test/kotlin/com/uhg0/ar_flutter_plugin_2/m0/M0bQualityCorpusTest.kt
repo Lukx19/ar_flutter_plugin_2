@@ -50,6 +50,10 @@ class M0bQualityCorpusTest {
                 output.intersect(phantom).size.toDouble() / phantom.size
             val recall = output.intersect(expected).size.toDouble() / expected.size
             val retention = output.intersect(protected).size.toDouble() / protected.size
+            assertTrue(
+                candidate,
+                falseThickness(output, phantom) <= gates.double("p95ThicknessOverVoxelMax"),
+            )
             candidate to Triple(falseResidual, recall, retention)
         }
 
@@ -126,6 +130,27 @@ class M0bQualityCorpusTest {
             val key = row.jsonArray.map { it.jsonPrimitive.int }
             M0VoxelKey(key[0], key[1], key[2])
         }
+
+    private fun falseThickness(
+        output: Set<M0VoxelKey>,
+        phantom: Set<M0VoxelKey>,
+    ): Int = output.intersect(phantom)
+        .groupBy { it.x to it.y }
+        .values
+        .maxOfOrNull { column ->
+            val values = column.map { it.z }.sorted()
+            var longest = if (values.isEmpty()) 0 else 1
+            var current = longest
+            for (index in 1 until values.size) {
+                if (values[index] == values[index - 1] + 1) {
+                    current++
+                    longest = maxOf(longest, current)
+                } else {
+                    current = 1
+                }
+            }
+            longest
+        } ?: 0
 
     private fun fixture(): JsonObject =
         Json.parseToJsonElement(
