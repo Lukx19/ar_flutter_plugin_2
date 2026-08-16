@@ -7,6 +7,7 @@ import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import java.security.MessageDigest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -15,47 +16,9 @@ class M0bQualityCorpusTest {
     @Test
     fun `synthetic quality corpus measures A B and C against one oracle`() {
         val root = fixture()
-        val scenes = root.getValue("scenes").jsonArray.map { it.jsonObject }
-        val observations = scenes.flatMap { scene ->
-            scene.getValue("observations").jsonArray.map { value ->
-                val row = value.jsonObject
-                val key = row.getValue("key").jsonArray.map { it.jsonPrimitive.int }
-                M0VoxelObservation(
-                    x = key[0],
-                    y = key[1],
-                    z = key[2],
-                    signedWeight = row.int("signedWeight"),
-                    supportId = row.int("supportId"),
-                )
-            }
-        }
-        val expected = scenes.flatMap { keys(it.getValue("expectedSurfaceKeys")) }.toSet()
-        val phantom = scenes.flatMap { keys(it.getValue("phantomKeys")) }.toSet()
-        val protected = scenes.flatMap { keys(it.getValue("protectedKeys")) }.toSet()
         val gates = root.getValue("gates").jsonObject
         val baseline = root.double("proposal07BaselineRecall")
-
-        val factories = listOf(
-            "A" to { M0SignedOccupancyKernel() },
-            "B" to { M0PlanarConsolidationKernel() },
-            "C" to { M0BoundedTsdfKernel() },
-        )
-        val measurements = factories.associate { (candidate, factory) ->
-            val first = factory().fuse(observations)
-            val repeat = factory().fuse(observations)
-            val output = expandedKeys(first.surfaces)
-            val repeated = expandedKeys(repeat.surfaces)
-            assertEquals(candidate, output, repeated)
-            val falseResidual =
-                output.intersect(phantom).size.toDouble() / phantom.size
-            val recall = output.intersect(expected).size.toDouble() / expected.size
-            val retention = output.intersect(protected).size.toDouble() / protected.size
-            assertTrue(
-                candidate,
-                falseThickness(output, phantom) <= gates.double("p95ThicknessOverVoxelMax"),
-            )
-            candidate to Triple(falseResidual, recall, retention)
-        }
+        val measurements = candidateMeasurements(root)
 
         assertEquals(0.0, measurements.getValue("A").first, 0.000001)
         assertEquals(0.0, measurements.getValue("B").first, 0.000001)
@@ -70,6 +33,45 @@ class M0bQualityCorpusTest {
         val comparisons = gates.int("affectedSurfaceCount") * gates.int("pictureCount")
         assertTrue((comparisons + 499) / 500 < gates.int("replayP95MillisecondsMaxExclusive"))
         assertTrue((comparisons + 199) / 200 <= gates.int("replayMaximumMilliseconds"))
+    }
+
+    @Test
+    fun `locked quality stage is hash-bound and passes synthetic quality gates`() {
+        val manifest = fixture("m0b_reference_corpus_v1.json")
+        val stages = manifest
+            .getValue("syntheticQualityCorpus").jsonObject
+            .getValue("stageCorpora").jsonObject
+        val sceneNames = mutableMapOf<String, Set<String>>()
+        stages.forEach { (stage, descriptorElement) ->
+            val descriptor = descriptorElement.jsonObject
+            val fileName = descriptor.getValue("file").jsonPrimitive.content
+            val bytes = resourceBytes(fileName)
+            assertEquals(
+                descriptor.getValue("sha256").jsonPrimitive.content,
+                sha256(bytes),
+            )
+            val root = Json.parseToJsonElement(bytes.decodeToString()).jsonObject
+            assertEquals(stage, root.getValue("stage").jsonPrimitive.content)
+            sceneNames[stage] = root.getValue("scenes").jsonArray
+                .map { it.jsonObject.getValue("name").jsonPrimitive.content }
+                .toSet()
+        }
+        assertTrue(sceneNames.getValue("train").intersect(sceneNames.getValue("validation")).isEmpty())
+        assertTrue(sceneNames.getValue("train").intersect(sceneNames.getValue("lockedAcceptance")).isEmpty())
+        assertTrue(sceneNames.getValue("validation").intersect(sceneNames.getValue("lockedAcceptance")).isEmpty())
+
+        val locked = Json.parseToJsonElement(
+            resourceBytes("m0b_quality_locked_v1.json").decodeToString(),
+        ).jsonObject
+        val measurements = candidateMeasurements(locked)
+        assertEquals(0.0, measurements.getValue("A").first, 0.000001)
+        assertEquals(0.0, measurements.getValue("B").first, 0.000001)
+        assertTrue(
+            measurements.getValue("C").first >
+                locked.getValue("gates").jsonObject.double("falseSheetResidualMax"),
+        )
+        assertTrue(measurements.values.all { it.second >= 0.93 })
+        assertTrue(measurements.values.all { it.third >= 0.90 })
     }
 
     @Test
@@ -125,6 +127,40 @@ class M0bQualityCorpusTest {
             }
         }
 
+    private fun candidateMeasurements(root: JsonObject): Map<String, Triple<Double, Double, Double>> {
+        val scenes = root.getValue("scenes").jsonArray.map { it.jsonObject }
+        val observations = scenes.flatMap { scene ->
+            scene.getValue("observations").jsonArray.map { value ->
+                val row = value.jsonObject
+                val key = row.getValue("key").jsonArray.map { it.jsonPrimitive.int }
+                M0VoxelObservation(key[0], key[1], key[2], row.int("signedWeight"), row.int("supportId"))
+            }
+        }
+        val expected = scenes.flatMap { keys(it.getValue("expectedSurfaceKeys")) }.toSet()
+        val phantom = scenes.flatMap { keys(it.getValue("phantomKeys")) }.toSet()
+        val protected = scenes.flatMap { keys(it.getValue("protectedKeys")) }.toSet()
+        val gates = root.getValue("gates").jsonObject
+        val factories = listOf(
+            "A" to { M0SignedOccupancyKernel() },
+            "B" to { M0PlanarConsolidationKernel() },
+            "C" to { M0BoundedTsdfKernel() },
+        )
+        return factories.associate { (candidate, factory) ->
+            val first = factory().fuse(observations)
+            val repeat = factory().fuse(observations)
+            assertEquals(candidate, first.surfaces, repeat.surfaces)
+            val output = expandedKeys(first.surfaces)
+            val falseResidual = if (phantom.isEmpty()) 0.0
+            else output.intersect(phantom).size.toDouble() / phantom.size
+            val recall = if (expected.isEmpty()) 1.0
+            else output.intersect(expected).size.toDouble() / expected.size
+            val retention = if (protected.isEmpty()) 1.0
+            else output.intersect(protected).size.toDouble() / protected.size
+            assertTrue(candidate, falseThickness(output, phantom) <= gates.double("p95ThicknessOverVoxelMax"))
+            candidate to Triple(falseResidual, recall, retention)
+        }
+    }
+
     private fun keys(value: kotlinx.serialization.json.JsonElement): List<M0VoxelKey> =
         value.jsonArray.map { row ->
             val key = row.jsonArray.map { it.jsonPrimitive.int }
@@ -152,12 +188,18 @@ class M0bQualityCorpusTest {
             longest
         } ?: 0
 
-    private fun fixture(): JsonObject =
+    private fun fixture(fileName: String = "m0b_quality_corpus_v1.json"): JsonObject =
         Json.parseToJsonElement(
-            requireNotNull(javaClass.classLoader?.getResourceAsStream("m0b_quality_corpus_v1.json"))
-                .bufferedReader()
-                .use { it.readText() },
+            resourceBytes(fileName).decodeToString(),
         ).jsonObject
+
+    private fun resourceBytes(fileName: String): ByteArray =
+        requireNotNull(javaClass.classLoader?.getResourceAsStream(fileName)).readBytes()
+
+    private fun sha256(bytes: ByteArray): String = MessageDigest
+        .getInstance("SHA-256")
+        .digest(bytes)
+        .joinToString("") { byte -> "%02x".format(byte) }
 
     private fun JsonObject.int(key: String): Int = getValue(key).jsonPrimitive.int
 
