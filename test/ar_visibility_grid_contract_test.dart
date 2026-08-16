@@ -557,6 +557,7 @@ void main() {
         'depth_safe_band_and_multiview_carving',
         'ios_scene_depth_orientation_and_fallback',
         'source_health_and_resource_closure',
+        'synthetic_arcore_arkit_sensor_frames',
         'geometry_revision_and_resync',
       ]),
     );

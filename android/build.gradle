@@ -75,3 +75,19 @@ dependencies {
     testImplementation 'junit:junit:4.13.2'
     testImplementation 'org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0'
 }
+
+// The Flutter Gradle plugin injects this dependency when the plugin is built
+// through a Flutter application. Keep the standalone JVM project equivalent
+// for deterministic native adapter tests without bundling Flutter into the
+// plugin artifact itself.
+def flutterSdk = providers.gradleProperty('flutter.sdk').orNull ?: System.getenv('FLUTTER_ROOT')
+if (flutterSdk != null) {
+    def engineVersion = file("$flutterSdk/bin/cache/engine.stamp").text.trim()
+    repositories {
+        maven { url = uri('https://storage.googleapis.com/download.flutter.io') }
+    }
+    dependencies {
+        debugCompileOnly "io.flutter:flutter_embedding_debug:1.0.0-$engineVersion"
+        testImplementation "io.flutter:flutter_embedding_debug:1.0.0-$engineVersion"
+    }
+}
