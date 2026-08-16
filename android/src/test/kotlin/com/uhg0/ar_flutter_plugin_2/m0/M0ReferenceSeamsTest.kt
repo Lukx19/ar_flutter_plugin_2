@@ -255,6 +255,74 @@ class M0ReferenceSeamsTest {
         assertEquals(2, result.surfaces.size)
     }
 
+    @Test
+    fun `bounded tsdf uses checked ties to even averaging`() {
+        assertTrue(
+            M0BoundedTsdfKernel().fuse(
+                listOf(M0VoxelObservation(0, 0, 0, 1), M0VoxelObservation(0, 0, 0, 0)),
+            ).surfaces.isEmpty(),
+        )
+        assertEquals(
+            2,
+            M0BoundedTsdfKernel().fuse(
+                listOf(M0VoxelObservation(0, 0, 0, 2), M0VoxelObservation(0, 0, 0, 1)),
+            ).surfaces.single().weight,
+        )
+    }
+
+    @Test
+    fun `picture visibility projection occlusion and guidance match Dart reference`() {
+        val camera = M0PictureVisibilityCamera(
+            imageWidth = 100,
+            imageHeight = 100,
+            fxQ8 = 6144,
+            fyQ8 = 6144,
+            cxQ8 = 12800,
+            cyQ8 = 12800,
+            groupFromCameraTranslationMm = M0VoxelKey(50, 50, 0),
+            cameraFromGroupRotationQ30 = listOf(
+                1L shl 30, 0, 0,
+                0, 1L shl 30, 0,
+                0, 0, 1L shl 30,
+            ),
+        )
+        val surface = M0PictureVisibilitySurface(
+            surfaceId = 7,
+            key = M0VoxelKey(0, 0, -2),
+            normal = M0Q15Vector(0, 0, 32767),
+            normalConfidence = 200,
+        )
+        val approved = M0PictureVisibilityEvaluator.evaluate(camera, surface)
+        assertEquals(M0PictureVisibilityRejection.APPROVED, approved.rejection)
+        assertEquals(12, approved.bin)
+        assertEquals(camera.cxQ8, approved.projectedUQ8)
+        assertEquals(camera.cyQ8, approved.projectedVQ8)
+        assertEquals(150, approved.depthMm)
+        assertTrue(approved.footprintQ16 >= 64L * 65536L)
+        assertEquals(
+            M0PictureVisibilityRejection.OCCLUDED,
+            M0PictureVisibilityEvaluator.evaluate(
+                camera,
+                surface,
+                occludingCells = listOf(M0VoxelKey(0, 0, -1)),
+            ).rejection,
+        )
+        assertTrue(
+            M0SupercoverCells100mm.cellsBetween(
+                camera.groupFromCameraTranslationMm,
+                M0VoxelKey(50, 50, -150),
+            ).contains(M0VoxelKey(0, 0, -1)),
+        )
+        val target = M0GuidanceReference.select(
+            listOf(
+                M0GuidanceCandidateInput(9, approved, surface.normal, 0, M0PictureVisibilityOccupancy.CONFIRMED),
+                M0GuidanceCandidateInput(8, approved, surface.normal, 1, M0PictureVisibilityOccupancy.CONFIRMED),
+            ),
+        ).first()
+        assertEquals(9L, target.surfaceId)
+        assertEquals(1698, target.standpointMm.z)
+    }
+
     private inline fun <reified T : Throwable> assertThrows(block: () -> Unit) {
         try {
             block()

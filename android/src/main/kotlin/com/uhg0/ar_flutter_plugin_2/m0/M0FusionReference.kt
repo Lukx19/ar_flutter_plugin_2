@@ -155,7 +155,9 @@ class M0BoundedTsdfKernel(
             counts[key] = (counts[key] ?: 0) + 1
         }
         val signedDistance = sums.mapValues { (key, sum) ->
-            Math.round(sum.toDouble() / counts.getValue(key)).toInt().coerceIn(-narrowBand, narrowBand)
+            roundTiesEven(sum.toLong(), counts.getValue(key).toLong())
+                .toInt()
+                .coerceIn(-narrowBand, narrowBand)
         }
         val visible = signedDistance.entries
             .filter { it.value > 0 && hasNonPositiveNeighbor(it.key, signedDistance) }
@@ -224,3 +226,17 @@ private fun hasNonPositiveNeighbor(key: M0VoxelKey, values: Map<M0VoxelKey, Int>
 
 private fun normalOctant(key: M0VoxelKey): Int =
     ((key.x.compareTo(0) shl 2) or (key.y.compareTo(0) shl 1) or key.z.compareTo(0)) and 7
+
+private fun roundTiesEven(numerator: Long, denominator: Long): Long {
+    require(denominator > 0)
+    val negative = numerator < 0
+    val absolute = kotlin.math.abs(numerator)
+    var quotient = absolute / denominator
+    val remainder = absolute % denominator
+    if (2 * remainder > denominator ||
+        (2 * remainder == denominator && quotient % 2L != 0L)
+    ) {
+        quotient++
+    }
+    return if (negative) -quotient else quotient
+}
