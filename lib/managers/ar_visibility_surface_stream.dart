@@ -40,10 +40,7 @@ final class ARVisibilitySurfaceStream {
     if (response == null) {
       throw StateError('Visibility surface stream returned no response.');
     }
-    return Uint8List.fromList(response.buffer.asUint8List(
-      response.offsetInBytes,
-      response.lengthInBytes,
-    ));
+    return _copyResponseBytes(response);
   }
 
   Future<void> dispose() async {
@@ -81,11 +78,13 @@ final class ARVisibilitySurfaceStreamWorker {
     if (response == null) {
       throw StateError('Visibility surface stream returned no response.');
     }
-    return Uint8List.fromList(
-      response.buffer.asUint8List(
-        response.offsetInBytes,
-        response.offsetInBytes + response.lengthInBytes,
-      ),
-    );
+    return _copyResponseBytes(response);
   }
 }
+
+Uint8List _copyResponseBytes(ByteData response) => Uint8List.fromList(
+      response.buffer.asUint8List(
+        response.offsetInBytes,
+        response.lengthInBytes,
+      ),
+    );
