@@ -1,5 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.m0
 
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.security.MessageDigest
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -8,6 +10,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.int
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -78,6 +81,22 @@ class M0cGoldenVectorTest {
         assertEquals(M0RegionShardV5.Compression.ZLIB, decodedCoverage.compression)
         assertEquals(56, decodedCoverage.surfaceRows.single().size)
         assertEquals(13, decodedCoverage.secondaryRows.single().size)
+    }
+
+    @Test
+    fun `schema five decoder rejects declared row bytes that do not match payload`() {
+        val packet = M0RegionShardV5.encodeCanonical(
+            region = M0RegionCoordinate(1, 2, 3),
+            captureEvaluatedThrough = 2,
+            pendingThrough = 1,
+            surfaceRows = listOf(ByteArray(19) { it.toByte() }),
+            lineageRows = listOf(ByteArray(9) { (it + 19).toByte() }),
+        )
+        ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN).putInt(24, 0)
+
+        assertThrows(IllegalArgumentException::class.java) {
+            M0RegionShardV5.decode(packet)
+        }
     }
 
     private fun fixture(fileName: String = "m0c_golden_vector_v1.json"): JsonObject =
