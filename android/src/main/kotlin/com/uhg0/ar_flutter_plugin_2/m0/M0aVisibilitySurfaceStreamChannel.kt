@@ -99,9 +99,10 @@ class M0aVisibilitySurfaceStreamChannel(
                     }
                 }
                 reply.reply(response?.let {
-                    val buffer = ByteBuffer.allocateDirect(it.size)
-                    buffer.put(it)
-                    buffer
+                    // Flutter's Android messenger passes position() as the
+                    // JNI message length, so leave the reply positioned after
+                    // the bytes rather than flipping it to zero.
+                    ByteBuffer.allocateDirect(it.size).apply { put(it) }
                 })
             }
         }
