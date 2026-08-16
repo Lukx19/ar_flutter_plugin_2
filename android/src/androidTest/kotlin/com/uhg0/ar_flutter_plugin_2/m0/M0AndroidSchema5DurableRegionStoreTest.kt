@@ -2,6 +2,8 @@ package com.uhg0.ar_flutter_plugin_2.m0
 
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import android.content.Intent
+import android.os.SystemClock
 import java.io.File
 import java.util.UUID
 import org.junit.After
@@ -58,6 +60,42 @@ class M0AndroidSchema5DurableRegionStoreTest {
         val restarted = nativeStore(deep)
         assertEquals(1L, restarted.visibleRootId)
         assertEquals(2L, restarted.visibleCuts.values.single().generation)
+    }
+
+    @Test
+    fun childProcessDeathBeforeRootSwitchKeepsTheOldPointerAndOrphanRoot() {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val testContext = instrumentation.context
+        val directory = File(
+            instrumentation.targetContext.noBackupFilesDir,
+            "m0c-process-${UUID.randomUUID()}",
+        )
+        check(directory.mkdirs())
+        try {
+            testContext.startService(
+                Intent(testContext, M0CrashBeforeRootSwitchService::class.java)
+                    .putExtra(M0CrashBeforeRootSwitchService.EXTRA_DIRECTORY, directory.path),
+            )
+            val orphanRoot = File(directory, "roots/root_1.json")
+            val deadline = SystemClock.uptimeMillis() + 10_000L
+            while (!orphanRoot.isFile && SystemClock.uptimeMillis() < deadline) {
+                SystemClock.sleep(50L)
+            }
+            assertTrue("child process must persist the orphan root", orphanRoot.isFile)
+            // The callback kills the child immediately after persistRoot and
+            // before receipt/pointer publication; allow the process teardown
+            // to finish before reopening the directory from this process.
+            SystemClock.sleep(500L)
+
+            val recovered = nativeStore(directory)
+            assertEquals(0L, recovered.visibleRootId)
+            assertEquals(setOf(1L), recovered.visibleCuts.values.map { it.generation }.toSet())
+            assertTrue(recovered.hasRoot(1))
+            assertFalse(recovered.hasReceipt(1))
+            assertFalse(recovered.hasStaging)
+        } finally {
+            directory.deleteRecursively()
+        }
     }
 
     private fun nativeStore(directory: File) = M0Schema5DurableRegionCutStore(
