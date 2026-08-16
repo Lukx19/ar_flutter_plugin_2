@@ -52,7 +52,7 @@ open class M0SignedOccupancyKernel(
     private val saturation: Int = 127,
     private val hysteresis: Int = 1,
     private val maxObservations: Int = DEFAULT_MAX_OBSERVATIONS,
-    private val maxLineageIds: Int = DEFAULT_MAX_LINEAGE_IDS,
+    protected val maxLineageIds: Int = DEFAULT_MAX_LINEAGE_IDS,
 ) : M0FusionKernel {
     protected val ids = M0StableSurfaceIdAllocator()
     private val activeKeys = mutableSetOf<M0VoxelKey>()
@@ -142,6 +142,7 @@ class M0PlanarConsolidationKernel(
         val byKey = base.surfaces.associateBy { it.key }
         val remaining = byKey.keys.toMutableSet()
         val consolidated = mutableListOf<M0CanonicalSurface>()
+        var mergeOverflow = 0
         for (anchor in byKey.keys.sorted()) {
             if (!remaining.contains(anchor)) continue
             val patch = findPatch(anchor, byKey, remaining)
@@ -152,6 +153,8 @@ class M0PlanarConsolidationKernel(
             }
             remaining.removeAll(patch.keys.toSet())
             val members = patch.keys.map { byKey.getValue(it) }
+            val mergedLineage = mergeBoundedLineage(members, maxLineageIds)
+            mergeOverflow += mergedLineage.overflowCount
             consolidated += M0CanonicalSurface(
                 surfaceId = ids.idFor(anchor),
                 key = anchor,
@@ -160,13 +163,13 @@ class M0PlanarConsolidationKernel(
                 extentU = 2,
                 extentV = 2,
                 planeAxis = patch.planeAxis,
-                lineageIds = members.flatMap { it.lineageIds }.distinct().sorted(),
+                lineageIds = mergedLineage.ids,
                 observationCount = members.sumOf { it.observationCount },
             )
         }
         return M0FusionResult(
             surfaces = consolidated.sortedBy { it.key },
-            overflowObservationCount = base.overflowObservationCount,
+            overflowObservationCount = base.overflowObservationCount + mergeOverflow,
         )
     }
 }
@@ -239,6 +242,17 @@ private fun addBoundedLineage(
     if (!supportIds.add(supportId) || supportIds.size <= maximum) return false
     supportIds.remove(supportIds.maxOrNull())
     return true
+}
+
+private data class BoundedLineage(val ids: List<Int>, val overflowCount: Int)
+
+private fun mergeBoundedLineage(
+    surfaces: Iterable<M0CanonicalSurface>,
+    maximum: Int,
+): BoundedLineage {
+    val ids = surfaces.flatMap { it.lineageIds }.distinct().sorted()
+    val overflowCount = (ids.size - maximum).coerceAtLeast(0)
+    return BoundedLineage(ids.take(maximum), overflowCount)
 }
 
 private data class PlanarPatch(val keys: List<M0VoxelKey>, val planeAxis: Int)

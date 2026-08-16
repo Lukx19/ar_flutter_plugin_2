@@ -363,6 +363,25 @@ class M0ReferenceSeamsTest {
     }
 
     @Test
+    fun `candidate B reapplies the lineage bound after consolidation`() {
+        val result = M0PlanarConsolidationKernel(maxLineageIds = 2).fuse(
+            listOf(
+                M0VoxelObservation(0, 0, 0, 2, 1),
+                M0VoxelObservation(0, 0, 0, 2, 2),
+                M0VoxelObservation(1, 0, 0, 2, 3),
+                M0VoxelObservation(1, 0, 0, 2, 4),
+                M0VoxelObservation(0, 1, 0, 2, 5),
+                M0VoxelObservation(0, 1, 0, 2, 6),
+                M0VoxelObservation(1, 1, 0, 2, 7),
+                M0VoxelObservation(1, 1, 0, 2, 8),
+            ),
+        )
+
+        assertEquals(listOf(1, 2), result.surfaces.single().lineageIds)
+        assertEquals(6, result.overflowObservationCount)
+    }
+
+    @Test
     fun `visibility bins and normalization match the Dart reference`() {
         assertEquals(8, M0PictureViewBins24.classify(M0Q15Vector(0, 0, -32767)))
         assertEquals(10, M0PictureViewBins24.classify(M0Q15Vector(-32767, 0, 0)))
