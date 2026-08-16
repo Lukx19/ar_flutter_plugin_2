@@ -12,9 +12,91 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class M0aFaultCorpusTest {
+    @Test
+    fun `M0a train validation and locked fault corpora are hash-bound`() {
+        val manifest = fixture("m0a_reference_corpus_v1.json")
+        val faultCorpus = manifest.getValue("faultCorpus").jsonObject
+        val stages = faultCorpus.getValue("stageCorpora").jsonObject
+        val stageNames = mutableMapOf<String, Set<String>>()
+        val allNames = mutableSetOf<String>()
+        var caseCount = 0
+        val base = fixture(faultCorpus.getValue("baseCorpus").jsonPrimitive.content)
+        val baseCases = base.getValue("cases").jsonArray
+            .associateBy { it.jsonObject.getValue("name").jsonPrimitive.content }
+        val vectors = baseVectors()
+
+        stages.forEach { (stage, descriptorElement) ->
+            val descriptor = descriptorElement.jsonObject
+            val fileName = descriptor.getValue("file").jsonPrimitive.content
+            val bytes = resourceBytes(fileName)
+            assertEquals(
+                descriptor.getValue("sha256").jsonPrimitive.content,
+                sha256(bytes),
+            )
+            val root = Json.parseToJsonElement(bytes.decodeToString()).jsonObject
+            assertEquals(stage, root.getValue("stage").jsonPrimitive.content)
+            assertEquals(
+                faultCorpus.getValue("status").jsonPrimitive.content,
+                root.getValue("status").jsonPrimitive.content,
+            )
+            val cases = root.getValue("cases").jsonArray
+            val names = cases
+                .map { it.jsonObject.getValue("name").jsonPrimitive.content }
+                .toSet()
+            assertTrue(names.isNotEmpty())
+            assertEquals(cases.size, names.size)
+            assertEquals(emptySet<String>(), allNames.intersect(names))
+            allNames += names
+            stageNames[stage] = names
+            caseCount += names.size
+            cases.forEach { value ->
+                val fault = value.jsonObject
+                val name = fault.getValue("name").jsonPrimitive.content
+                assertEquals(baseCases.getValue(name), value)
+                val packet = if (fault.getValue("packet").jsonPrimitive.content == "request") {
+                    vectors.request
+                } else {
+                    vectors.response
+                }
+                val mutated = applyFault(packet, fault)
+                assertThrows(IllegalArgumentException::class.java) {
+                    if (fault.getValue("packet").jsonPrimitive.content == "request") {
+                        M0aPacketCodec.decodeRequest(mutated)
+                    } else {
+                        M0aPacketCodec.decodeResponse(mutated)
+                    }
+                }
+            }
+        }
+
+        assertEquals(
+            emptySet<String>(),
+            stageNames.getValue("train").intersect(stageNames.getValue("validation")),
+        )
+        assertEquals(
+            emptySet<String>(),
+            stageNames.getValue("train").intersect(stageNames.getValue("lockedAcceptance")),
+        )
+        assertEquals(
+            emptySet<String>(),
+            stageNames.getValue("validation").intersect(stageNames.getValue("lockedAcceptance")),
+        )
+
+        val baseNames = base.getValue("cases").jsonArray
+            .map { it.jsonObject.getValue("name").jsonPrimitive.content }
+            .toSet()
+        assertEquals(faultCorpus.int("expectedCaseCount"), caseCount)
+        assertEquals(baseNames, allNames)
+        assertEquals(
+            faultCorpus.int("seededRequestMutations"),
+            base.getValue("bounds").jsonObject.int("seededRequestMutations"),
+        )
+    }
+
     @Test
     fun `shared M0a fault corpus rejects malformed request and response packets`() {
         val corpus = fixture("m0a_fault_corpus_v1.json")
@@ -161,6 +243,14 @@ class M0aFaultCorpusTest {
             .bufferedReader()
             .use { it.readText() },
     ).jsonObject
+
+    private fun resourceBytes(name: String): ByteArray =
+        requireNotNull(javaClass.classLoader?.getResourceAsStream(name)).readBytes()
+
+    private fun sha256(bytes: ByteArray): String = MessageDigest
+        .getInstance("SHA-256")
+        .digest(bytes)
+        .joinToString("") { byte -> "%02x".format(byte) }
 
     private fun hex(value: String): ByteArray = ByteArray(value.length / 2) { index ->
         value.substring(index * 2, index * 2 + 2).toInt(16).toByte()
