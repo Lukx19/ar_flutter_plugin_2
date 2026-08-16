@@ -55,19 +55,19 @@ class M0aVisibilitySurfaceStreamChannel(
     private val shutdownWorkerOnDispose: Boolean = true,
     private val workerTimeoutMillis: Long = DEFAULT_WORKER_TIMEOUT_MILLIS,
     private val timeoutScheduler: M0aTimeoutScheduler = M0aTimeoutScheduler.real(),
-    private val shutdownTimeoutSchedulerOnDispose: Boolean = true,
+    private val beforeWorkerProcessing: (() -> Unit)? = null,
 ) {
     private val channel = BasicMessageChannel<ByteBuffer>(
         messenger,
         "visibility_surface_stream_$viewId",
         BinaryCodec.INSTANCE,
     )
-    private var disposed = false
-    private var lastSequence: Long? = null
-    private var nextExpectedSequence = 1L
-    private var lastRequest: ByteArray? = null
-    private var lastResponse: ByteArray? = null
-    private var bindingAbandoned = false
+    private val disposed = AtomicBoolean(false)
+    @Volatile private var lastSequence: Long? = null
+    @Volatile private var nextExpectedSequence = 1L
+    @Volatile private var lastRequest: ByteArray? = null
+    @Volatile private var lastResponse: ByteArray? = null
+    private val bindingAbandoned = AtomicBoolean(false)
 
     private class BindingError(val errorId: Int) : IllegalArgumentException()
 
@@ -89,13 +89,14 @@ class M0aVisibilitySurfaceStreamChannel(
             try {
                 workerExecutor.execute {
                     val response = synchronized(this) {
-                        if (disposed) {
+                        beforeWorkerProcessing?.invoke()
+                        if (disposed.get()) {
                             if (pendingReply.tryClaim()) {
                                 workerLostResponseBytes(bytes)
                             } else {
                                 null
                             }
-                        } else if (bindingAbandoned) {
+                        } else if (bindingAbandoned.get()) {
                             null
                         } else {
                             var decodedRequest: M0aPacketCodec.Request? = null
@@ -190,39 +191,35 @@ class M0aVisibilitySurfaceStreamChannel(
     }
 
     fun dispose() {
-        synchronized(this) {
-            if (disposed) return
-            disposed = true
-            lastRequest = null
-            lastResponse = null
-            lastSequence = null
-            nextExpectedSequence = 1L
+        if (!disposed.compareAndSet(false, true)) return
+        bindingAbandoned.set(true)
+        lastRequest = null
+        lastResponse = null
+        lastSequence = null
+        nextExpectedSequence = 1L
+        channel.setMessageHandler(null)
+        if (shutdownWorkerOnDispose && workerExecutor is java.util.concurrent.ExecutorService) {
+            workerExecutor.shutdownNow()
+        }
+        timeoutScheduler.shutdown()
+    }
+
+    private fun abandonForTimeout(pendingReply: PendingReply, bytes: ByteArray) {
+        if (!pendingReply.tryClaim()) return
+        if (disposed.get()) {
+            pendingReply.reply(workerLostResponse(bytes))
+            return
+        }
+        if (!bindingAbandoned.compareAndSet(false, true)) {
+            pendingReply.reply(workerLostResponse(bytes))
+            return
         }
         channel.setMessageHandler(null)
         if (shutdownWorkerOnDispose && workerExecutor is java.util.concurrent.ExecutorService) {
             workerExecutor.shutdownNow()
         }
-        if (shutdownTimeoutSchedulerOnDispose) {
-            timeoutScheduler.shutdown()
-        }
-    }
-
-    private fun abandonForTimeout(pendingReply: PendingReply, bytes: ByteArray) {
-        val shouldReply = synchronized(this) {
-            if (disposed || bindingAbandoned || !pendingReply.tryClaim()) {
-                false
-            } else {
-                bindingAbandoned = true
-                true
-            }
-        }
-        if (shouldReply) {
-            channel.setMessageHandler(null)
-            if (shutdownTimeoutSchedulerOnDispose) {
-                timeoutScheduler.shutdown()
-            }
-            pendingReply.reply(workerAbandonedResponse(bytes))
-        }
+        timeoutScheduler.shutdown()
+        pendingReply.reply(workerAbandonedResponse(bytes))
     }
 
     private class PendingReply(

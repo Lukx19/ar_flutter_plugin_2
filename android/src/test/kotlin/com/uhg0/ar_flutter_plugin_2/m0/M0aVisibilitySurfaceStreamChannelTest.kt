@@ -186,6 +186,56 @@ class M0aVisibilitySurfaceStreamChannelTest {
         replacement.dispose()
     }
 
+    @Test
+    fun `active worker stall does not hold the timeout behind the channel monitor`() {
+        val messenger = TestMessenger(23)
+        val scheduler = HoldingTimeoutScheduler()
+        val started = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        var workerThread: Thread? = null
+        val binding = M0aVisibilitySurfaceStreamChannel(
+            messenger,
+            23,
+            workerExecutor = Executor { command ->
+                val thread = Thread(command, "m0a-active-stall")
+                workerThread = thread
+                thread.start()
+            },
+            shutdownWorkerOnDispose = false,
+            timeoutScheduler = scheduler,
+            beforeWorkerProcessing = {
+                started.countDown()
+                check(release.await(2, TimeUnit.SECONDS))
+            },
+        )
+        val reply = arrayOfNulls<ByteArray>(1)
+        val completed = CountDownLatch(1)
+        messenger.send(
+            "visibility_surface_stream_23",
+            ByteBuffer.wrap(request(sequence = 1, token = 9)),
+        ) { response ->
+            reply[0] = response?.let { buffer ->
+                val copy = ByteArray(buffer.remaining())
+                buffer.slice().get(copy)
+                copy
+            }
+            completed.countDown()
+        }
+
+        assertTrue(started.await(2, TimeUnit.SECONDS))
+        scheduler.fireNext()
+        assertTrue(completed.await(2, TimeUnit.SECONDS))
+        val abandoned = M0aPacketCodec.decodeResponse(reply[0]!!)
+        assertEquals(255, abandoned.messageKind)
+        assertEquals(142, abandoned.errorId)
+
+        release.countDown()
+        val completedWorker = checkNotNull(workerThread)
+        completedWorker.join(2_000)
+        assertTrue(!completedWorker.isAlive)
+        binding.dispose()
+    }
+
     private fun request(sequence: Long, token: Long): ByteArray =
         M0aPacketCodec.encodeRequest(
             M0aPacketCodec.Request(
