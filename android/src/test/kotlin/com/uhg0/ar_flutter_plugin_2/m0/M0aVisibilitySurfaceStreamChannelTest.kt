@@ -3,6 +3,8 @@ package com.uhg0.ar_flutter_plugin_2.m0
 import io.flutter.plugin.common.BinaryMessenger
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executor
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -68,6 +70,32 @@ class M0aVisibilitySurfaceStreamChannelTest {
         val replacement = M0aVisibilitySurfaceStreamChannel(messenger, 19)
         val response = messenger.exchange(request(sequence = 1, token = 5))
         assertEquals(0, M0aPacketCodec.decodeResponse(response).messageKind)
+        replacement.dispose()
+    }
+
+    @Test
+    fun `worker rejection returns stable binding lost error and replacement recovers`() {
+        val messenger = TestMessenger(20)
+        val failedBinding = M0aVisibilitySurfaceStreamChannel(
+            messenger,
+            20,
+            workerExecutor = Executor { throw RejectedExecutionException("worker exited") },
+            shutdownWorkerOnDispose = false,
+        )
+
+        val failed = M0aPacketCodec.decodeResponse(
+            messenger.exchange(request(sequence = 1, token = 6)),
+        )
+        assertEquals(255, failed.messageKind)
+        assertEquals(144, failed.errorId)
+        assertEquals(1L, failed.requestSequence)
+        failedBinding.dispose()
+
+        val replacement = M0aVisibilitySurfaceStreamChannel(messenger, 20)
+        val recovered = M0aPacketCodec.decodeResponse(
+            messenger.exchange(request(sequence = 1, token = 6)),
+        )
+        assertEquals(0, recovered.messageKind)
         replacement.dispose()
     }
 

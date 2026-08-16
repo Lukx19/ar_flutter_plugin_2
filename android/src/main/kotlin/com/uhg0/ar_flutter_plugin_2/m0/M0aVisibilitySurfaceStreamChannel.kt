@@ -5,7 +5,9 @@ import io.flutter.plugin.common.BinaryCodec
 import io.flutter.plugin.common.BinaryMessenger
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.Executor
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 
 /**
  * M0a's real per-view T2 binding seam.
@@ -17,13 +19,14 @@ import java.util.concurrent.Executors
 class M0aVisibilitySurfaceStreamChannel(
     messenger: BinaryMessenger,
     viewId: Int,
+    private val workerExecutor: Executor = Executors.newSingleThreadExecutor(),
+    private val shutdownWorkerOnDispose: Boolean = true,
 ) {
     private val channel = BasicMessageChannel<ByteBuffer>(
         messenger,
         "visibility_surface_stream_$viewId",
         BinaryCodec.INSTANCE,
     )
-    private val executor = Executors.newSingleThreadExecutor()
     private var disposed = false
     private var lastSequence: Long? = null
     private var nextExpectedSequence = 1L
@@ -43,85 +46,89 @@ class M0aVisibilitySurfaceStreamChannel(
                 reply.reply(null)
                 return@setMessageHandler
             }
-            executor.execute {
-                val response = synchronized(this) {
-                    if (disposed) return@synchronized null
-                    var decodedRequest: M0aPacketCodec.Request? = null
-                    try {
-                        val request = M0aPacketCodec.decodeRequest(bytes)
-                        decodedRequest = request
-                        val previousSequence = lastSequence
-                        when {
-                            previousSequence == request.requestSequence -> {
-                                if (!lastRequest!!.contentEquals(bytes)) {
-                                    throw BindingError(REPLAY_CONFLICT_ERROR_ID)
+            try {
+                workerExecutor.execute {
+                    val response = synchronized(this) {
+                        if (disposed) return@synchronized null
+                        var decodedRequest: M0aPacketCodec.Request? = null
+                        try {
+                            val request = M0aPacketCodec.decodeRequest(bytes)
+                            decodedRequest = request
+                            val previousSequence = lastSequence
+                            when {
+                                previousSequence == request.requestSequence -> {
+                                    if (!lastRequest!!.contentEquals(bytes)) {
+                                        throw BindingError(REPLAY_CONFLICT_ERROR_ID)
+                                    }
+                                    lastResponse!!.copyOf()
                                 }
-                                lastResponse!!.copyOf()
+                                previousSequence != null && request.requestSequence <= previousSequence -> {
+                                    throw BindingError(STALE_SEQUENCE_ERROR_ID)
+                                }
+                                request.requestSequence != nextExpectedSequence -> {
+                                    throw BindingError(SEQUENCE_GAP_ERROR_ID)
+                                }
+                                else -> {
+                                    val encoded = M0aPacketCodec.encodeResponse(
+                                        M0aPacketCodec.noChanges(
+                                            streamToken = request.streamToken,
+                                            requestSequence = request.requestSequence,
+                                            nextExpectedRequestSequence = request.requestSequence + 1,
+                                        ),
+                                        request.maximumResponseBytes,
+                                    )
+                                    lastSequence = request.requestSequence
+                                    nextExpectedSequence = request.requestSequence + 1
+                                    lastRequest = bytes.copyOf()
+                                    lastResponse = encoded.copyOf()
+                                    encoded
+                                }
                             }
-                            previousSequence != null && request.requestSequence <= previousSequence -> {
-                                throw BindingError(STALE_SEQUENCE_ERROR_ID)
+                        } catch (error: BindingError) {
+                            val sequence = if (bytes.size >= M0aPacketCodec.requestHeaderBytes) {
+                                ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getLong(64)
+                                    .coerceAtLeast(0)
+                            } else {
+                                0
                             }
-                            request.requestSequence != nextExpectedSequence -> {
-                                throw BindingError(SEQUENCE_GAP_ERROR_ID)
+                            val token = decodedRequest?.streamToken ?: 0
+                            M0aPacketCodec.encodeResponse(
+                                M0aPacketCodec.error(
+                                    streamToken = token,
+                                    requestSequence = sequence,
+                                    nextExpectedRequestSequence = nextExpectedSequence,
+                                    errorId = error.errorId,
+                                ),
+                                M0aPacketCodec.responseMinimumBytes,
+                            )
+                        } catch (_: Exception) {
+                            val sequence = if (bytes.size >= M0aPacketCodec.requestHeaderBytes) {
+                                ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getLong(64)
+                                    .coerceAtLeast(0)
+                            } else {
+                                0
                             }
-                            else -> {
-                                val encoded = M0aPacketCodec.encodeResponse(
-                                    M0aPacketCodec.noChanges(
-                                        streamToken = request.streamToken,
-                                        requestSequence = request.requestSequence,
-                                        nextExpectedRequestSequence = request.requestSequence + 1,
-                                    ),
-                                    request.maximumResponseBytes,
-                                )
-                                lastSequence = request.requestSequence
-                                nextExpectedSequence = request.requestSequence + 1
-                                lastRequest = bytes.copyOf()
-                                lastResponse = encoded.copyOf()
-                                encoded
-                            }
+                            val token = decodedRequest?.streamToken ?: 0
+                            M0aPacketCodec.encodeResponse(
+                                M0aPacketCodec.error(
+                                    streamToken = token,
+                                    requestSequence = sequence,
+                                    nextExpectedRequestSequence = nextExpectedSequence,
+                                    errorId = MALFORMED_PACKET_ERROR_ID,
+                                ),
+                                M0aPacketCodec.responseMinimumBytes,
+                            )
                         }
-                    } catch (error: BindingError) {
-                        val sequence = if (bytes.size >= M0aPacketCodec.requestHeaderBytes) {
-                            ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getLong(64)
-                                .coerceAtLeast(0)
-                        } else {
-                            0
-                        }
-                        val token = decodedRequest?.streamToken ?: 0
-                        M0aPacketCodec.encodeResponse(
-                            M0aPacketCodec.error(
-                                streamToken = token,
-                                requestSequence = sequence,
-                                nextExpectedRequestSequence = nextExpectedSequence,
-                                errorId = error.errorId,
-                            ),
-                            M0aPacketCodec.responseMinimumBytes,
-                        )
-                    } catch (_: Exception) {
-                        val sequence = if (bytes.size >= M0aPacketCodec.requestHeaderBytes) {
-                            ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getLong(64)
-                                .coerceAtLeast(0)
-                        } else {
-                            0
-                        }
-                        val token = decodedRequest?.streamToken ?: 0
-                        M0aPacketCodec.encodeResponse(
-                            M0aPacketCodec.error(
-                                streamToken = token,
-                                requestSequence = sequence,
-                                nextExpectedRequestSequence = nextExpectedSequence,
-                                errorId = MALFORMED_PACKET_ERROR_ID,
-                            ),
-                            M0aPacketCodec.responseMinimumBytes,
-                        )
                     }
+                    reply.reply(response?.let {
+                        // Flutter's Android messenger passes position() as the
+                        // JNI message length, so leave the reply positioned after
+                        // the bytes rather than flipping it to zero.
+                        ByteBuffer.allocateDirect(it.size).apply { put(it) }
+                    })
                 }
-                reply.reply(response?.let {
-                    // Flutter's Android messenger passes position() as the
-                    // JNI message length, so leave the reply positioned after
-                    // the bytes rather than flipping it to zero.
-                    ByteBuffer.allocateDirect(it.size).apply { put(it) }
-                })
+            } catch (_: RejectedExecutionException) {
+                reply.reply(workerLostResponse(bytes))
             }
         }
     }
@@ -136,7 +143,28 @@ class M0aVisibilitySurfaceStreamChannel(
             nextExpectedSequence = 1L
         }
         channel.setMessageHandler(null)
-        executor.shutdownNow()
+        if (shutdownWorkerOnDispose && workerExecutor is java.util.concurrent.ExecutorService) {
+            workerExecutor.shutdownNow()
+        }
+    }
+
+    private fun workerLostResponse(bytes: ByteArray): ByteBuffer {
+        val sequence = if (bytes.size >= M0aPacketCodec.requestHeaderBytes) {
+            ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getLong(64).coerceAtLeast(0)
+        } else {
+            0
+        }
+        val token = runCatching { M0aPacketCodec.decodeRequest(bytes).streamToken }.getOrDefault(0)
+        val encoded = M0aPacketCodec.encodeResponse(
+            M0aPacketCodec.error(
+                streamToken = token,
+                requestSequence = sequence,
+                nextExpectedRequestSequence = nextExpectedSequence,
+                errorId = WORKER_BINDING_LOST_ERROR_ID,
+            ),
+            M0aPacketCodec.responseMinimumBytes,
+        )
+        return ByteBuffer.allocateDirect(encoded.size).apply { put(encoded) }
     }
 
     private companion object {
@@ -144,5 +172,6 @@ class M0aVisibilitySurfaceStreamChannel(
         const val REPLAY_CONFLICT_ERROR_ID = 30
         const val STALE_SEQUENCE_ERROR_ID = 31
         const val SEQUENCE_GAP_ERROR_ID = 32
+        const val WORKER_BINDING_LOST_ERROR_ID = 144
     }
 }

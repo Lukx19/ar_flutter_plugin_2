@@ -115,6 +115,35 @@ class M0ReferenceSeamsTest {
     }
 
     @Test
+    fun `every stable error detail id round trips without widening`() {
+        for (errorId in 1..150) {
+            val detail = M0aErrorDetail(
+                errorId = errorId,
+                scope = errorId % 8,
+                disposition = errorId % 3,
+                validationPhase = errorId % 10 + 1,
+                recoveryAction = errorId % 10,
+                fieldId = errorId,
+                authorityKind = errorId + 100,
+                diagnosticBytes = errorId % 257,
+                geometryRevision = errorId.toLong(),
+                lineageRevision = errorId + 1L,
+                captureRevision = errorId + 2L,
+                coverageRevision = errorId + 3L,
+                acceptedStyleRevision = errorId + 4L,
+                regionManifestRevision = errorId + 5L,
+                nextSurfaceIdHighWater = errorId + 6L,
+                expectedValue = errorId + 7L,
+                observedValue = errorId + 8L,
+                schemaRootRevision = errorId + 9L,
+            )
+            val bytes = M0aControlCodec.encodeErrorDetail(detail)
+            assertEquals(detail, M0aControlCodec.decodeErrorDetail(bytes))
+            assertEquals(96, bytes.size)
+        }
+    }
+
+    @Test
     fun `signed coordinates and pages match the Dart reference`() {
         assertEquals(M0RegionCoordinate(-1, 0, -1), m0RegionForMillimetres(-1, 0, -3000))
         assertEquals(M0RegionCoordinate(-1, -2, 0), m0RegionForMillimetres(-3000, -3001, 2999))
@@ -200,6 +229,42 @@ class M0ReferenceSeamsTest {
         assertTrue(renderer.remove("g/1"))
         assertTrue(renderer.upsert(M0CentroidRow("g/reused", 0f, 0f, 0f, M0SemanticState.PENDING)))
         assertEquals(0, renderer.slotFor("g/reused"))
+    }
+
+    @Test
+    fun `renderer modes honor fixed populations upload and allocation budgets`() {
+        M0RendererMode.entries.forEach { mode ->
+            val renderer = M0CentroidRendererState(
+                M0RendererPopulationLimits.maximumRows(mode),
+            )
+            renderer.setMode(mode)
+            repeat(M0RendererPopulationLimits.maximumRows(mode)) { index ->
+                assertTrue(
+                    renderer.upsert(
+                        M0CentroidRow(
+                            "$mode/$index",
+                            index.toFloat(),
+                            0f,
+                            0f,
+                            M0SemanticState.COVERED,
+                        ),
+                    ),
+                )
+            }
+            var plan = renderer.flush()
+            while (plan.dirtySpans.isNotEmpty()) {
+                assertTrue(plan.uploadBytes <= 64 * 1024)
+                plan = renderer.flush()
+            }
+            assertTrue(renderer.withinFixedPopulation)
+            assertTrue(renderer.allocatedBytes <= 8 * 1024 * 1024)
+            assertTrue(renderer.remove("$mode/0"))
+            assertTrue(renderer.upsert(M0CentroidRow("$mode/replacement", 0f, 1f, 0f, M0SemanticState.COVERED)))
+            renderer.loseContext()
+            assertTrue(renderer.flush().rebuild)
+            renderer.restoreContext()
+            assertTrue(renderer.flush().rebuild)
+        }
     }
 
     @Test

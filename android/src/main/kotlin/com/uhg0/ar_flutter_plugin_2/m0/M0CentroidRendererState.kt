@@ -5,6 +5,25 @@ import java.util.PriorityQueue
 enum class M0RendererMode { CENTROIDS, CUBES, RAW_POINTS, OVERVIEW }
 enum class M0SemanticState { UNCOVERED, COVERED, PENDING, STALE, DEGRADED }
 
+object M0RendererPopulationLimits {
+    const val CENTROID_ROWS = 20_000
+    const val CUBE_ROWS = 8_000
+    const val RAW_POINT_ROWS = 2_000
+    const val OVERVIEW_ROWS = 2_000
+
+    fun maximumRows(mode: M0RendererMode): Int = when (mode) {
+        M0RendererMode.CENTROIDS -> CENTROID_ROWS
+        M0RendererMode.CUBES -> CUBE_ROWS
+        M0RendererMode.RAW_POINTS -> RAW_POINT_ROWS
+        M0RendererMode.OVERVIEW -> OVERVIEW_ROWS
+    }
+
+    fun fixedAllocationBytes(mode: M0RendererMode): Int = when (mode) {
+        M0RendererMode.CUBES -> 2_944_000 + 1_024_000 + 1_920_000
+        else -> 0
+    }
+}
+
 data class M0CentroidRow(
     val qualifiedKey: String,
     val x: Float,
@@ -46,6 +65,10 @@ class M0CentroidRendererState(
         private set
 
     val rowCount: Int get() = slotsByKey.size
+    val allocatedBytes: Int
+        get() = rows.size * bytesPerRow + M0RendererPopulationLimits.fixedAllocationBytes(mode)
+    val withinFixedPopulation: Boolean
+        get() = rowCount <= M0RendererPopulationLimits.maximumRows(mode)
 
     fun slotFor(key: String): Int? = slotsByKey[key]
 
