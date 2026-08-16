@@ -133,6 +133,28 @@ class M0aVisibilitySurfaceStreamChannelTest {
     }
 
     @Test
+    fun `reply delivery failure abandons the binding after claiming the reply`() {
+        val messenger = TestMessenger(25)
+        val executor = HoldingExecutor()
+        val binding = M0aVisibilitySurfaceStreamChannel(
+            messenger,
+            25,
+            workerExecutor = executor,
+            shutdownWorkerOnDispose = false,
+        )
+        messenger.failNextReplyDelivery()
+        messenger.send(
+            "visibility_surface_stream_25",
+            ByteBuffer.wrap(request(sequence = 1, token = 11)),
+        ) { }
+
+        executor.runQueued()
+
+        assertNull(messenger.tryExchange(request(sequence = 2, token = 11)))
+        binding.dispose()
+    }
+
+    @Test
     fun `queued work returns binding lost after disposal`() {
         val messenger = TestMessenger(21)
         val executor = HoldingExecutor()
@@ -319,6 +341,7 @@ private class HoldingTimeoutScheduler : M0aTimeoutScheduler {
 private class TestMessenger(viewId: Int) : BinaryMessenger {
     private val channelName = "visibility_surface_stream_$viewId"
     private var handler: BinaryMessenger.BinaryMessageHandler? = null
+    @Volatile private var failNextReplyDelivery = false
 
     override fun send(channel: String, message: ByteBuffer?) {
         send(channel, message, null)
@@ -338,6 +361,10 @@ private class TestMessenger(viewId: Int) : BinaryMessenger {
         currentHandler.onMessage(
             message,
             BinaryMessenger.BinaryReply { reply ->
+                if (failNextReplyDelivery) {
+                    failNextReplyDelivery = false
+                    throw IllegalStateException("reply port closed")
+                }
                 val engineReply = reply?.let { buffer ->
                     val length = buffer.position()
                     val copy = ByteArray(length)
@@ -350,6 +377,10 @@ private class TestMessenger(viewId: Int) : BinaryMessenger {
                 callback?.reply(engineReply)
             },
         )
+    }
+
+    fun failNextReplyDelivery() {
+        failNextReplyDelivery = true
     }
 
     override fun setMessageHandler(

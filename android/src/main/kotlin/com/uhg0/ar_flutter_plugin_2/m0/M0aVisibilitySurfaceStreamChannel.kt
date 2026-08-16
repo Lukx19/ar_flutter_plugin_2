@@ -1,10 +1,13 @@
 package com.uhg0.ar_flutter_plugin_2.m0
 
+import android.os.Handler
+import android.os.Looper
 import io.flutter.plugin.common.BasicMessageChannel
 import io.flutter.plugin.common.BinaryCodec
 import io.flutter.plugin.common.BinaryMessenger
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
@@ -57,6 +60,7 @@ class M0aVisibilitySurfaceStreamChannel(
     private val timeoutScheduler: M0aTimeoutScheduler = M0aTimeoutScheduler.real(),
     private val beforeWorkerProcessing: (() -> Unit)? = null,
 ) {
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val channel = BasicMessageChannel<ByteBuffer>(
         messenger,
         "visibility_surface_stream_$viewId",
@@ -181,7 +185,7 @@ class M0aVisibilitySurfaceStreamChannel(
                                 ByteBuffer.allocateDirect(it.size).apply { put(it) }
                             })
                         }
-                    } catch (_: Throwable) {
+                    } catch (_: Exception) {
                         abandonForWorkerLoss(pendingReply, bytes)
                     }
                 }
@@ -199,7 +203,7 @@ class M0aVisibilitySurfaceStreamChannel(
         lastResponse = null
         lastSequence = null
         nextExpectedSequence = 1L
-        channel.setMessageHandler(null)
+        clearMessageHandler()
         if (shutdownWorkerOnDispose && workerExecutor is java.util.concurrent.ExecutorService) {
             workerExecutor.shutdownNow()
         }
@@ -216,7 +220,7 @@ class M0aVisibilitySurfaceStreamChannel(
             pendingReply.reply(workerLostResponse(bytes))
             return
         }
-        channel.setMessageHandler(null)
+        clearMessageHandler()
         if (shutdownWorkerOnDispose && workerExecutor is java.util.concurrent.ExecutorService) {
             workerExecutor.shutdownNow()
         }
@@ -225,17 +229,41 @@ class M0aVisibilitySurfaceStreamChannel(
     }
 
     private fun abandonForWorkerLoss(pendingReply: PendingReply, bytes: ByteArray) {
-        if (!pendingReply.tryClaim()) return
+        val ownsReply = pendingReply.tryClaim()
         if (!bindingAbandoned.compareAndSet(false, true)) {
-            pendingReply.reply(workerLostResponse(bytes))
+            if (ownsReply) pendingReply.reply(workerLostResponse(bytes))
             return
         }
-        channel.setMessageHandler(null)
+        clearMessageHandler()
         if (shutdownWorkerOnDispose && workerExecutor is java.util.concurrent.ExecutorService) {
             workerExecutor.shutdownNow()
         }
         timeoutScheduler.shutdown()
-        pendingReply.reply(workerLostResponse(bytes))
+        if (ownsReply) pendingReply.reply(workerLostResponse(bytes))
+    }
+
+    private fun clearMessageHandler() {
+        val clear = { channel.setMessageHandler(null) }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            clear()
+        } else {
+            val completed = CountDownLatch(1)
+            check(mainHandler.post {
+                try {
+                    clear()
+                } finally {
+                    completed.countDown()
+                }
+            }) { "Flutter main looper is unavailable." }
+            try {
+                check(completed.await(MAIN_HANDLER_CLEAR_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)) {
+                    "Flutter main looper did not clear the binding handler."
+                }
+            } catch (error: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw IllegalStateException("Interrupted clearing binding handler.", error)
+            }
+        }
     }
 
     private class PendingReply(
@@ -301,5 +329,6 @@ class M0aVisibilitySurfaceStreamChannel(
         const val STREAM_BINDING_ABANDONED_ERROR_ID = 142
         const val WORKER_BINDING_LOST_ERROR_ID = 144
         const val DEFAULT_WORKER_TIMEOUT_MILLIS = 2_000L
+        const val MAIN_HANDLER_CLEAR_TIMEOUT_MILLIS = 2_000L
     }
 }
