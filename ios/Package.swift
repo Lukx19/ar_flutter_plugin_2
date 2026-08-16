@@ -25,7 +25,7 @@ let package = Package(
                 "VisibilityGridAssociation.swift",
                 "VisibilityGridCore.swift",
                 "VisibilityGridTypes.swift",
-                "M0PortableReference.swift"
+                "M0PortableInterfaces.swift"
             ]
         ),
         .testTarget(
@@ -36,7 +36,6 @@ let package = Package(
             sources: [
                 "VisibilityGridCoreTests.swift",
                 "VisibilityGridDepthCoreTests.swift",
-                "M0PortableReferenceTests.swift"
             ]
         )
     ],
