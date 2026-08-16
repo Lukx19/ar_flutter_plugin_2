@@ -218,12 +218,23 @@ class M0ReferenceSeamsTest {
     }
 
     @Test
-    fun `centroid renderer uses a bounded free list for 100k rows`() {
+    fun `centroid renderer rejects rows beyond the fixed population`() {
         val renderer = M0CentroidRendererState(100_000)
-        repeat(100_000) { index ->
+        repeat(M0RendererPopulationLimits.CENTROID_ROWS) { index ->
             assertTrue(renderer.upsert(M0CentroidRow("g/$index", index.toFloat(), 0f, 0f, M0SemanticState.COVERED)))
         }
-        assertEquals(100_000, renderer.rowCount)
+        assertFalse(
+            renderer.upsert(
+                M0CentroidRow(
+                    "g/over-cap",
+                    0f,
+                    0f,
+                    0f,
+                    M0SemanticState.COVERED,
+                ),
+            ),
+        )
+        assertEquals(M0RendererPopulationLimits.CENTROID_ROWS, renderer.rowCount)
         assertTrue(renderer.flush().uploadBytes <= 64 * 1024)
         assertTrue(renderer.remove("g/0"))
         assertTrue(renderer.remove("g/1"))

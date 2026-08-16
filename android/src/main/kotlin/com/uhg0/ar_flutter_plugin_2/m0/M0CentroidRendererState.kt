@@ -88,6 +88,7 @@ class M0CentroidRendererState(
 
     fun setMode(value: M0RendererMode) {
         if (mode == value) return
+        if (rowCount > M0RendererPopulationLimits.maximumRows(value)) return
         mode = value
         reset = true
         dirtyRows += slotsByKey.values
@@ -101,7 +102,8 @@ class M0CentroidRendererState(
             dirtyRows += existing
             return true
         }
-        if (rowCount >= capacity) return false
+        if (rowCount >= capacity ||
+            rowCount >= M0RendererPopulationLimits.maximumRows(mode)) return false
         val slot = if (freeSlots.isNotEmpty()) {
             freeSlots.remove()
         } else {
