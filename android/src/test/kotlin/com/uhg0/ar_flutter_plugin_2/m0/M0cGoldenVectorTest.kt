@@ -191,6 +191,31 @@ class M0cGoldenVectorTest {
         }
     }
 
+    @Test
+    fun `hash bound schema five shard error corpus preserves Kotlin outcomes`() {
+        val manifest = fixture("m0c_shard_error_corpus_v1.json")
+        val vectorBytes = resourceBytes(manifest.getValue("baseVector").jsonPrimitive.content)
+        assertEquals(
+            manifest.getValue("baseVectorSha256").jsonPrimitive.content,
+            sha256(vectorBytes),
+        )
+        val vector = Json.parseToJsonElement(vectorBytes.decodeToString()).jsonObject
+        manifest.getValue("cases").jsonArray.forEach { raw ->
+            val fault = raw.jsonObject
+            val packet = applyShardErrorCase(vector, fault)
+            if (fault.getValue("outcome").jsonPrimitive.content == "accept") {
+                assertTrue(
+                    fault.getValue("name").jsonPrimitive.content,
+                    runCatching { M0RegionShardV5.decode(packet) }.isSuccess,
+                )
+            } else {
+                assertThrows(IllegalArgumentException::class.java) {
+                    M0RegionShardV5.decode(packet)
+                }
+            }
+        }
+    }
+
     private fun fixture(fileName: String = "m0c_golden_vector_v1.json"): JsonObject =
         Json.parseToJsonElement(
             requireNotNull(javaClass.classLoader?.getResourceAsStream(fileName))
@@ -206,6 +231,65 @@ class M0cGoldenVectorTest {
         assertEquals(spec.getValue("sha256").jsonPrimitive.content, sha256(bytes))
         assertEquals(spec.getValue("hex").jsonPrimitive.content, hex(bytes))
         assertTrue(bytes.isNotEmpty())
+    }
+
+    private fun applyShardErrorCase(vector: JsonObject, fault: JsonObject): ByteArray {
+        val regionValues = vector.getValue("region").jsonArray.map { it.jsonPrimitive.int }
+        val region = M0RegionCoordinate(regionValues[0], regionValues[1], regionValues[2])
+        val capture = vector.int("captureEvaluatedThrough").toLong()
+        val pending = vector.int("pendingThrough").toLong()
+        return when (fault.getValue("operation").jsonPrimitive.content) {
+            "zero-canonical-surface-count" -> M0RegionShardV5.encodeCanonical(
+                region = region,
+                captureEvaluatedThrough = capture,
+                pendingThrough = pending,
+                surfaceRows = listOf(ByteArray(19) { it.toByte() }),
+                lineageRows = listOf(ByteArray(9) { (it + 19).toByte() }),
+            ).also { packet ->
+                ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN).putInt(24, 0)
+            }
+            "encode-empty-coverage" -> M0RegionShardV5.encodeCoverage(
+                region = region,
+                captureEvaluatedThrough = capture,
+                pendingThrough = pending,
+                surfaceRows = emptyList(),
+                overflowRows = emptyList(),
+                compression = M0RegionShardV5.Compression.ZLIB,
+            )
+            else -> {
+                val base = M0RegionShardV5.encodeCoverage(
+                    region = region,
+                    captureEvaluatedThrough = capture,
+                    pendingThrough = pending,
+                    surfaceRows = listOf(ByteArray(56)),
+                    overflowRows = listOf(ByteArray(13)),
+                    compression = M0RegionShardV5.Compression.ZLIB,
+                )
+                val originalPayload = base.copyOfRange(M0RegionShardV5.headerBytes, base.size)
+                val payload = when (fault.getValue("operation").jsonPrimitive.content) {
+                    "append-byte" -> originalPayload +
+                        byteArrayOf(fault.getValue("byte").jsonPrimitive.int.toByte())
+                    "append-last-bytes" -> originalPayload + originalPayload.copyOfRange(
+                        originalPayload.size - fault.int("count"),
+                        originalPayload.size,
+                    )
+                    "xor-last-byte" -> originalPayload.copyOf().also { bytes ->
+                        bytes[bytes.lastIndex] = (
+                            bytes[bytes.lastIndex].toInt() xor fault.int("mask")
+                        ).toByte()
+                    }
+                    else -> error("Unknown M0c shard error operation")
+                }
+                val malformed = base.copyOf(M0RegionShardV5.headerBytes + payload.size)
+                payload.copyInto(malformed, M0RegionShardV5.headerBytes)
+                ByteBuffer.wrap(malformed).order(ByteOrder.LITTLE_ENDIAN)
+                    .putInt(52, payload.size)
+                MessageDigest.getInstance("SHA-256")
+                    .digest(payload)
+                    .copyInto(malformed, 64)
+                malformed
+            }
+        }
     }
 
     private fun JsonObject.int(key: String): Int = getValue(key).jsonPrimitive.int
