@@ -243,14 +243,18 @@ internal class ArView(
                         result.error("SNAPSHOT_ERROR", it.message, null)
                     }
                 }
-                "disableCamera" -> {
+                // Keep the legacy explicit camera controls and the
+                // ARSessionManager lifecycle names on one native seam. The
+                // Dart manager uses pauseSession/resumeSession, while older
+                // callers use disableCamera/enableCamera.
+                "disableCamera", "pauseSession" -> {
                     sessionPausedByFlutter = true
                     visibilityGridChannel.pause()
                     captureSession.onSessionPaused()
                     sceneHost.pause()
                     result.success(null)
                 }
-                "enableCamera" -> {
+                "enableCamera", "resumeSession" -> {
                     sessionPausedByFlutter = false
                     sceneHost.resume()
                     visibilityGridChannel.resume()

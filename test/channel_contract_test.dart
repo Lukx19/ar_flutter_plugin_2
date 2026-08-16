@@ -63,6 +63,11 @@ void main() {
         case 'getCameraPose':
         case 'getAnchorPose':
           return identity;
+        case 'getRendererPerformanceSnapshot':
+          return <String, Object?>{
+            'sampleCount': 2,
+            'medianFps': 30.0,
+          };
         case 'snapshot':
           return Uint8List.fromList(<int>[137, 80, 78, 71]);
         case 'failOnce':
@@ -128,6 +133,10 @@ void main() {
     manager.disableCamera();
     manager.enableCamera();
     expect(await manager.getCameraPose(), isNotNull);
+    expect(
+      await manager.getRendererPerformanceSnapshot(),
+      <String, Object?>{'sampleCount': 2, 'medianFps': 30.0},
+    );
     final anchor =
         ARPlaneAnchor(transformation: Matrix4.identity(), name: 'a1');
     expect(await manager.getPose(anchor), isNotNull);
@@ -151,6 +160,7 @@ void main() {
         'disableCamera',
         'enableCamera',
         'getCameraPose',
+        'getRendererPerformanceSnapshot',
         'getAnchorPose',
         'snapshot',
       ]),
@@ -261,6 +271,28 @@ void main() {
     expect(
       sessionCalls.where((call) => call.method == 'getCameraPose'),
       hasLength(1),
+    );
+  });
+
+  test('pose queries treat an unavailable native pose as null', () async {
+    final manager = ARSessionManager(
+      42,
+      _FakeBuildContext(),
+      PlaneDetectionConfig.horizontal,
+    );
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(sessionChannel, (call) async {
+      sessionCalls.add(call);
+      return null;
+    });
+
+    expect(await manager.getCameraPose(), isNull);
+    expect(
+      await manager.getPose(
+        ARPlaneAnchor(transformation: Matrix4.identity(), name: 'missing'),
+      ),
+      isNull,
     );
   });
 
