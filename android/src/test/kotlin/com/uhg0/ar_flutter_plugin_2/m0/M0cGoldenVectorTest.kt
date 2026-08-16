@@ -99,6 +99,29 @@ class M0cGoldenVectorTest {
         }
     }
 
+    @Test
+    fun `schema five decoder rejects zlib payload trailing bytes`() {
+        val packet = M0RegionShardV5.encodeCoverage(
+            region = M0RegionCoordinate(1, 2, 3),
+            captureEvaluatedThrough = 2,
+            pendingThrough = 1,
+            surfaceRows = listOf(ByteArray(56)),
+            overflowRows = listOf(ByteArray(13)),
+            compression = M0RegionShardV5.Compression.ZLIB,
+        )
+        val malformed = packet.copyOf(packet.size + 1)
+        malformed[malformed.lastIndex] = 0x7f
+        ByteBuffer.wrap(malformed).order(ByteOrder.LITTLE_ENDIAN)
+            .putInt(52, malformed.size - M0RegionShardV5.headerBytes)
+        MessageDigest.getInstance("SHA-256")
+            .digest(malformed.copyOfRange(M0RegionShardV5.headerBytes, malformed.size))
+            .copyInto(malformed, 64)
+
+        assertThrows(IllegalArgumentException::class.java) {
+            M0RegionShardV5.decode(malformed)
+        }
+    }
+
     private fun fixture(fileName: String = "m0c_golden_vector_v1.json"): JsonObject =
         Json.parseToJsonElement(
             requireNotNull(javaClass.classLoader?.getResourceAsStream(fileName))
