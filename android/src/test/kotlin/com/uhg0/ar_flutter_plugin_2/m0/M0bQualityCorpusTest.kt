@@ -64,6 +64,12 @@ class M0bQualityCorpusTest {
         val locked = Json.parseToJsonElement(
             resourceBytes("m0b_quality_locked_v1.json").decodeToString(),
         ).jsonObject
+        assertEquals(
+            19,
+            locked.getValue("stages").jsonObject
+                .getValue("lockedAcceptance").jsonObject
+                .int("materializedObservationCount"),
+        )
         val measurements = candidateMeasurements(locked)
         assertEquals(0.0, measurements.getValue("A").first, 0.000001)
         assertEquals(0.0, measurements.getValue("B").first, 0.000001)
@@ -77,11 +83,14 @@ class M0bQualityCorpusTest {
 
     @Test
     fun `synthetic population reaches the exact bounded association seam`() {
+        val resource = fixture("m0b_quality_locked_v1.json").getValue("resourceCampaign").jsonObject
+        val surfaceCapacity = resource.int("surfaceCapacity")
+        val associationCount = resource.int("associationCount")
         val observations = sequence {
-            repeat(200_000) { index ->
+            repeat(associationCount) { index ->
                 yield(
                     M0VoxelObservation(
-                        x = index % 100_000,
+                        x = index % surfaceCapacity,
                         y = 0,
                         z = 0,
                         signedWeight = 1,
@@ -91,23 +100,31 @@ class M0bQualityCorpusTest {
             }
         }.asIterable()
         val result = M0SignedOccupancyKernel(
-            capacity = 100_000,
-            maxObservations = 200_000,
+            capacity = surfaceCapacity,
+            maxObservations = associationCount,
         ).fuse(observations)
-        assertEquals(0, result.overflowObservationCount)
-        assertEquals(100_000, result.surfaces.size)
+        assertEquals(resource.int("expectedOverflowObservationCount"), result.overflowObservationCount)
+        assertEquals(resource.int("expectedSurfaceCount"), result.surfaces.size)
 
         val overBudget = sequence {
-            repeat(200_001) { index ->
-                yield(M0VoxelObservation(index % 100_000, 0, 1, 1, index))
+            repeat(associationCount + 1) { index ->
+                yield(M0VoxelObservation(index % surfaceCapacity, 0, 1, 1, index))
             }
         }.asIterable()
         assertEquals(
             1,
-            M0SignedOccupancyKernel(maxObservations = 200_000)
+            M0SignedOccupancyKernel(maxObservations = associationCount)
                 .fuse(overBudget)
                 .overflowObservationCount,
         )
+        val memoryBytes = 64 * surfaceCapacity + 24 * associationCount + 16 * surfaceCapacity
+        assertEquals(resource.int("expectedMemoryBytes"), memoryBytes)
+        assertTrue(memoryBytes <= resource.int("memoryBudgetBytes"))
+        val comparisons = resource.int("pictureCount") * resource.int("affectedSurfaceCount")
+        assertEquals(resource.int("expectedReplaySemanticComparisons"), comparisons)
+        assertEquals(resource.int("expectedReplayP95Milliseconds"), (comparisons + 499) / 500)
+        assertEquals(resource.int("expectedReplayMaximumMilliseconds"), (comparisons + 199) / 200)
+        assertEquals(resource.int("expectedCpuWorkUnits"), associationCount + result.surfaces.size)
     }
 
     private fun expandedKeys(surfaces: List<M0CanonicalSurface>): Set<M0VoxelKey> =
@@ -161,6 +178,7 @@ class M0bQualityCorpusTest {
         val confidence = pointCloud.getValue("confidence").jsonArray.map { it.jsonPrimitive.double }
         val minimumConfidence = pointCloud.double("minimumConfidence")
         val metersToVoxel = pointCloud.double("metersToVoxel")
+        val origin = pointCloud.getValue("voxelOrigin").jsonArray.map { it.jsonPrimitive.int }
         assertEquals(points.size, pointIds.size)
         assertEquals(points.size, confidence.size)
         val acceptedIndices = points.indices.filter { confidence[it] >= minimumConfidence }
@@ -176,9 +194,9 @@ class M0bQualityCorpusTest {
             acceptedIndices.map { index ->
                 val point = points[index]
                 M0VoxelKey(
-                    kotlin.math.round(point[0] * metersToVoxel).toInt(),
-                    kotlin.math.round(point[1] * metersToVoxel).toInt(),
-                    kotlin.math.round(point[2] * metersToVoxel).toInt(),
+                    origin[0] + kotlin.math.round(point[0] * metersToVoxel).toInt(),
+                    origin[1] + kotlin.math.round(point[1] * metersToVoxel).toInt(),
+                    origin[2] + kotlin.math.round(point[2] * metersToVoxel).toInt(),
                 )
             },
         )
@@ -197,9 +215,60 @@ class M0bQualityCorpusTest {
             depths.indices.count { depths[it] > 0.0 && ranks.getValue(depthConfidence[it]) >= minimumDepthConfidence },
         )
         assertEquals(
+            depthMap.getValue("projectedVoxelKeys").jsonArray.size,
+            depths.size,
+        )
+        assertEquals(
             listOf(height, width),
             depthMap.getValue("expectedOrientedDimensions").jsonArray.map { it.jsonPrimitive.int },
         )
+    }
+
+    private fun sensorObservations(root: JsonObject): List<M0VoxelObservation> {
+        val frames = root["sensorFrames"]?.jsonObject ?: return emptyList()
+        val pointCloud = frames.getValue("arcorePointCloud").jsonObject
+        val pointIds = pointCloud.getValue("pointIds").jsonArray.map { it.jsonPrimitive.int }
+        val points = pointCloud.getValue("pointsMeters").jsonArray.map { row ->
+            row.jsonArray.map { it.jsonPrimitive.double }
+        }
+        val confidence = pointCloud.getValue("confidence").jsonArray.map { it.jsonPrimitive.double }
+        val minimumConfidence = pointCloud.double("minimumConfidence")
+        val metersToVoxel = pointCloud.double("metersToVoxel")
+        val origin = pointCloud.getValue("voxelOrigin").jsonArray.map { it.jsonPrimitive.int }
+        val pointWeight = pointCloud.int("observationWeight")
+        val observations = points.indices
+            .filter { confidence[it] >= minimumConfidence }
+            .map { index ->
+                val point = points[index]
+                M0VoxelObservation(
+                    origin[0] + kotlin.math.round(point[0] * metersToVoxel).toInt(),
+                    origin[1] + kotlin.math.round(point[1] * metersToVoxel).toInt(),
+                    origin[2] + kotlin.math.round(point[2] * metersToVoxel).toInt(),
+                    pointWeight,
+                    pointIds[index],
+                )
+            }
+            .toMutableList()
+
+        val depthMap = frames.getValue("arkitDepthMap").jsonObject
+        val depths = depthMap.getValue("depthMeters").jsonArray.map { it.jsonPrimitive.double }
+        val depthConfidence = depthMap.getValue("confidence").jsonArray.map { it.jsonPrimitive.content }
+        val projected = depthMap.getValue("projectedVoxelKeys").jsonArray.map { row ->
+            row.jsonArray.map { it.jsonPrimitive.int }
+        }
+        val ranks = mapOf("none" to 0, "low" to 1, "medium" to 2, "high" to 3)
+        val minimumDepthConfidence = ranks.getValue(depthMap.getValue("minimumConfidence").jsonPrimitive.content)
+        val depthWeight = depthMap.int("observationWeight")
+        val supportIdBase = depthMap.int("supportIdBase")
+        depths.indices
+            .filter { depths[it] > 0.0 && ranks.getValue(depthConfidence[it]) >= minimumDepthConfidence }
+            .forEach { index ->
+                val key = projected[index]
+                observations += M0VoxelObservation(
+                    key[0], key[1], key[2], depthWeight, supportIdBase + index,
+                )
+            }
+        return observations
     }
 
     private fun candidateMeasurements(root: JsonObject): Map<String, Triple<Double, Double, Double>> {
@@ -210,7 +279,7 @@ class M0bQualityCorpusTest {
                 val key = row.getValue("key").jsonArray.map { it.jsonPrimitive.int }
                 M0VoxelObservation(key[0], key[1], key[2], row.int("signedWeight"), row.int("supportId"))
             }
-        }
+        } + sensorObservations(root)
         val expected = scenes.flatMap { keys(it.getValue("expectedSurfaceKeys")) }.toSet()
         val phantom = scenes.flatMap { keys(it.getValue("phantomKeys")) }.toSet()
         val protected = scenes.flatMap { keys(it.getValue("protectedKeys")) }.toSet()
