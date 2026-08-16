@@ -5,6 +5,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.MessageDigest
 import java.util.zip.Deflater
+import java.util.zip.DataFormatException
 import java.util.zip.Inflater
 
 /** Portable schema-5 shard codec mirrored by the Dart reference. */
@@ -175,6 +176,8 @@ object M0RegionShardV5 {
             val count = inflater.inflate(output)
             require(inflater.finished() && count == expected && inflater.remaining == 0)
             output
+        } catch (error: DataFormatException) {
+            throw IllegalArgumentException("Zlib shard payload is invalid", error)
         } finally {
             inflater.end()
         }
