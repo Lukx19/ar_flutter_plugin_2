@@ -1,5 +1,12 @@
 package com.uhg0.ar_flutter_plugin_2.m0
 
+import java.io.ByteArrayOutputStream
+import java.security.MessageDigest
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -144,6 +151,41 @@ class M0ReferenceSeamsTest {
     }
 
     @Test
+    fun `error detail bytes match the shared one through 150 vector hash`() {
+        val vector = errorDetailVector()
+        val bytes = ByteArrayOutputStream()
+        for (errorId in vector.int("firstErrorId")..vector.int("lastErrorId")) {
+            bytes.write(
+                M0aControlCodec.encodeErrorDetail(
+                    M0aErrorDetail(
+                        errorId = errorId,
+                        scope = errorId % 8,
+                        disposition = errorId % 3,
+                        validationPhase = errorId % 10 + 1,
+                        recoveryAction = errorId % 10,
+                        fieldId = errorId,
+                        authorityKind = errorId + 100,
+                        diagnosticBytes = errorId % 257,
+                        geometryRevision = errorId.toLong(),
+                        lineageRevision = errorId + 1L,
+                        captureRevision = errorId + 2L,
+                        coverageRevision = errorId + 3L,
+                        acceptedStyleRevision = errorId + 4L,
+                        regionManifestRevision = errorId + 5L,
+                        nextSurfaceIdHighWater = errorId + 6L,
+                        expectedValue = errorId + 7L,
+                        observedValue = errorId + 8L,
+                        schemaRootRevision = errorId + 9L,
+                    ),
+                ),
+            )
+        }
+        val concatenated = bytes.toByteArray()
+        assertEquals(vector.int("concatenatedBytes"), concatenated.size)
+        assertEquals(vector.getValue("sha256").jsonPrimitive.content, sha256(concatenated))
+    }
+
+    @Test
     fun `signed coordinates and pages match the Dart reference`() {
         assertEquals(M0RegionCoordinate(-1, 0, -1), m0RegionForMillimetres(-1, 0, -3000))
         assertEquals(M0RegionCoordinate(-1, -2, 0), m0RegionForMillimetres(-3000, -3001, 2999))
@@ -272,9 +314,19 @@ class M0ReferenceSeamsTest {
             assertTrue(renderer.remove("$mode/0"))
             assertTrue(renderer.upsert(M0CentroidRow("$mode/replacement", 0f, 1f, 0f, M0SemanticState.COVERED)))
             renderer.loseContext()
-            assertTrue(renderer.flush().rebuild)
+            plan = renderer.flush()
+            assertTrue(plan.rebuild)
+            while (plan.dirtySpans.isNotEmpty()) {
+                assertTrue(plan.uploadBytes <= 64 * 1024)
+                plan = renderer.flush()
+            }
             renderer.restoreContext()
-            assertTrue(renderer.flush().rebuild)
+            plan = renderer.flush()
+            assertTrue(plan.rebuild)
+            while (plan.dirtySpans.isNotEmpty()) {
+                assertTrue(plan.uploadBytes <= 64 * 1024)
+                plan = renderer.flush()
+            }
         }
     }
 
@@ -421,6 +473,20 @@ class M0ReferenceSeamsTest {
             ).isEmpty(),
         )
     }
+
+    private fun errorDetailVector(): JsonObject =
+        Json.parseToJsonElement(
+            requireNotNull(javaClass.classLoader?.getResourceAsStream("m0a_error_detail_vector_v1.json"))
+                .bufferedReader()
+                .use { it.readText() },
+        ).jsonObject
+
+    private fun JsonObject.int(key: String): Int = getValue(key).jsonPrimitive.int
+
+    private fun sha256(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { byte ->
+            "%02x".format(byte)
+        }
 
     private inline fun <reified T : Throwable> assertThrows(block: () -> Unit) {
         try {
