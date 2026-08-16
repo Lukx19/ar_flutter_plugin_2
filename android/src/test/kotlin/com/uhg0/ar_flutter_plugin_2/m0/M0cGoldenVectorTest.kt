@@ -3,6 +3,7 @@ package com.uhg0.ar_flutter_plugin_2.m0
 import java.security.MessageDigest
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.int
@@ -11,6 +12,37 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class M0cGoldenVectorTest {
+    @Test
+    fun `staged M0c fault corpus is hash bound and complete`() {
+        val manifest = fixture("m0c_reference_corpus_v1.json")
+        val faultCorpus = manifest.getValue("faultCorpus").jsonObject
+        val base = fixture(faultCorpus.getValue("baseCorpus").jsonPrimitive.content)
+        val baseCases = base.getValue("faults").jsonArray.associateBy {
+            it.jsonObject.getValue("name").jsonPrimitive.content
+        }
+        val stages = faultCorpus.getValue("stageCorpora").jsonObject
+        val namesByStage = mutableMapOf<String, Set<String>>()
+        var caseCount = 0
+        stages.forEach { (stage, descriptorElement) ->
+            val descriptor = descriptorElement.jsonObject
+            val bytes = resourceBytes(descriptor.getValue("file").jsonPrimitive.content)
+            assertEquals(descriptor.getValue("sha256").jsonPrimitive.content, sha256(bytes))
+            val root = Json.parseToJsonElement(bytes.decodeToString()).jsonObject
+            assertEquals(stage, root.getValue("stage").jsonPrimitive.content)
+            assertEquals(faultCorpus.getValue("status"), root.getValue("status"))
+            val names = root.getValue("cases").jsonArray.map { value ->
+                val fault = value.jsonObject
+                val name = fault.getValue("name").jsonPrimitive.content
+                assertEquals(baseCases.getValue(name), fault)
+                caseCount++
+                name
+            }.toSet()
+            namesByStage[stage] = names
+        }
+        assertEquals(faultCorpus.int("expectedCaseCount"), caseCount)
+        assertEquals(baseCases.keys, namesByStage.values.flatten().toSet())
+    }
+
     @Test
     fun `pinned Dart schema five shards have identical Kotlin bytes and values`() {
         val root = fixture()
@@ -48,12 +80,15 @@ class M0cGoldenVectorTest {
         assertEquals(13, decodedCoverage.secondaryRows.single().size)
     }
 
-    private fun fixture(): JsonObject =
+    private fun fixture(fileName: String = "m0c_golden_vector_v1.json"): JsonObject =
         Json.parseToJsonElement(
-            requireNotNull(javaClass.classLoader?.getResourceAsStream("m0c_golden_vector_v1.json"))
+            requireNotNull(javaClass.classLoader?.getResourceAsStream(fileName))
                 .bufferedReader()
                 .use { it.readText() },
         ).jsonObject
+
+    private fun resourceBytes(fileName: String): ByteArray =
+        requireNotNull(javaClass.classLoader?.getResourceAsStream(fileName)).readBytes()
 
     private fun assertVector(bytes: ByteArray, spec: JsonObject) {
         assertEquals(spec.int("length"), bytes.size)
