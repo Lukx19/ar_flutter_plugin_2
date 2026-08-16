@@ -7,6 +7,7 @@ import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import java.security.MessageDigest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -79,6 +80,75 @@ class M0bQualityCorpusTest {
         )
         assertTrue(measurements.values.all { it.second >= 0.93 })
         assertTrue(measurements.values.all { it.third >= 0.90 })
+    }
+
+    @Test
+    fun `locked synthetic selection keeps first passing order without promotion`() {
+        val root = Json.parseToJsonElement(
+            resourceBytes("m0b_quality_locked_v1.json").decodeToString(),
+        ).jsonObject
+        val gates = root.getValue("gates").jsonObject
+        val baseline = root.double("proposal07BaselineRecall")
+        val measurements = candidateMeasurements(root)
+        val memoryBytes = 64 * gates.int("surfaceCapacity") +
+            24 * gates.int("associationCount") +
+            16 * gates.int("surfaceCapacity")
+        val comparisons = gates.int("pictureCount") * gates.int("affectedSurfaceCount")
+        fun passes(candidate: String): Boolean {
+            val (falseResidual, recall, retention) = measurements.getValue(candidate)
+            return falseResidual <= gates.double("falseSheetResidualMax") &&
+                (recall - baseline) * 100.0 >= gates.double("recallDeltaPpMin") &&
+                retention >= gates.double("faceRetentionMin") &&
+                memoryBytes <= gates.int("memoryBudgetBytes") &&
+                (comparisons + 499) / 500 < gates.int("replayP95MillisecondsMaxExclusive") &&
+                (comparisons + 199) / 200 <= gates.int("replayMaximumMilliseconds")
+        }
+
+        fun failures(candidate: String): List<String> {
+            val (falseResidual, recall, retention) = measurements.getValue(candidate)
+            return buildList {
+                if (falseResidual > gates.double("falseSheetResidualMax")) add("false-sheet-residual")
+                if ((recall - baseline) * 100.0 < gates.double("recallDeltaPpMin")) add("recall-delta")
+                if (retention < gates.double("faceRetentionMin")) add("face-retention")
+                if (memoryBytes > gates.int("memoryBudgetBytes")) add("memory-budget")
+                if ((comparisons + 499) / 500 >= gates.int("replayP95MillisecondsMaxExclusive")) add("replay-p95")
+                if ((comparisons + 199) / 200 > gates.int("replayMaximumMilliseconds")) add("replay-maximum")
+            }
+        }
+
+        assertTrue(passes("A"))
+        assertTrue(passes("B"))
+        assertTrue(!passes("C"))
+        val selection = root.getValue("selectionCampaign").jsonObject
+        val expectedFailures = selection.getValue("expectedGateFailures").jsonObject
+        listOf("A", "B", "C").forEach { candidate ->
+            assertEquals(
+                expectedFailures.getValue(candidate).jsonArray.map { it.jsonPrimitive.content },
+                failures(candidate),
+            )
+        }
+        assertEquals(
+            selection.getValue("candidateOrder").jsonArray.map { it.jsonPrimitive.content },
+            listOf("A", "B", "C"),
+        )
+        assertEquals(
+            selection.getValue("expectedFirstPassingCandidate").jsonPrimitive.content,
+            listOf("A", "B", "C").firstOrNull(::passes),
+        )
+        assertEquals(
+            selection.getValue("promotedCandidate").jsonPrimitive.contentOrNull,
+            null,
+        )
+        assertEquals(
+            selection.getValue("promotionBlockers").jsonArray.map { it.jsonPrimitive.content },
+            listOf(
+                "native-allocation-measurement",
+                "native-cpu-work-measurement",
+                "native-wall-clock-replay-measurement",
+                "lineage-guidance-cross-language-decision-equality",
+                "native-100000-surface-200000-association-resource-campaign",
+            ),
+        )
     }
 
     @Test
