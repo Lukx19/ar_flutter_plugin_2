@@ -345,6 +345,24 @@ class M0ReferenceSeamsTest {
     }
 
     @Test
+    fun `fusion input and lineage bounds are deterministic and counted`() {
+        val result = M0SignedOccupancyKernel(
+            maxObservations = 3,
+            maxLineageIds = 2,
+        ).fuse(
+            listOf(
+                M0VoxelObservation(0, 0, 0, 2, 9),
+                M0VoxelObservation(0, 0, 0, 2, 7),
+                M0VoxelObservation(0, 0, 0, 2, 8),
+                M0VoxelObservation(0, 0, 0, 2, 6),
+            ),
+        )
+        assertEquals(listOf(7, 8), result.surfaces.single().lineageIds)
+        assertEquals(3, result.surfaces.single().observationCount)
+        assertEquals(2, result.overflowObservationCount)
+    }
+
+    @Test
     fun `visibility bins and normalization match the Dart reference`() {
         assertEquals(8, M0PictureViewBins24.classify(M0Q15Vector(0, 0, -32767)))
         assertEquals(10, M0PictureViewBins24.classify(M0Q15Vector(-32767, 0, 0)))

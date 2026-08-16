@@ -42,19 +42,25 @@ interface M0FusionKernel {
     fun fuse(observations: Iterable<M0VoxelObservation>): M0FusionResult
 }
 
+private const val DEFAULT_MAX_OBSERVATIONS = 200_000
+private const val DEFAULT_MAX_LINEAGE_IDS = 16
+
 /** Candidate A: fixed signed occupancy and deterministic thresholding. */
 open class M0SignedOccupancyKernel(
     private val capacity: Int = 100_000,
     private val occupancyThreshold: Int = 2,
     private val saturation: Int = 127,
     private val hysteresis: Int = 1,
+    private val maxObservations: Int = DEFAULT_MAX_OBSERVATIONS,
+    private val maxLineageIds: Int = DEFAULT_MAX_LINEAGE_IDS,
 ) : M0FusionKernel {
     protected val ids = M0StableSurfaceIdAllocator()
     private val activeKeys = mutableSetOf<M0VoxelKey>()
     init {
         require(
             capacity > 0 && occupancyThreshold > 0 && saturation > occupancyThreshold &&
-                hysteresis in 0 until occupancyThreshold,
+                hysteresis in 0 until occupancyThreshold && maxObservations > 0 &&
+                maxLineageIds > 0,
         )
     }
 
@@ -65,13 +71,21 @@ open class M0SignedOccupancyKernel(
         val lineage = sortedMapOf<M0VoxelKey, MutableSet<Int>>()
         val observationCounts = sortedMapOf<M0VoxelKey, Int>()
         var overflow = 0
-        observations.forEach { observation ->
+        var acceptedObservations = 0
+        for (observation in observations) {
+            if (acceptedObservations == maxObservations) {
+                overflow++
+                break
+            }
+            acceptedObservations++
             val key = M0VoxelKey(observation.x, observation.y, observation.z)
             val previous = weights[key] ?: 0
             val next = previous + observation.signedWeight
             if (next > saturation || next < -saturation) overflow++
             weights[key] = next.coerceIn(-saturation, saturation)
-            lineage.getOrPut(key) { mutableSetOf() } += observation.supportId
+            if (addBoundedLineage(lineage, key, observation.supportId, maxLineageIds)) {
+                overflow++
+            }
             observationCounts[key] = (observationCounts[key] ?: 0) + 1
         }
         val visible = buildList {
@@ -111,7 +125,16 @@ class M0PlanarConsolidationKernel(
     occupancyThreshold: Int = 2,
     saturation: Int = 127,
     hysteresis: Int = 1,
-) : M0SignedOccupancyKernel(capacity, occupancyThreshold, saturation, hysteresis) {
+    maxObservations: Int = DEFAULT_MAX_OBSERVATIONS,
+    maxLineageIds: Int = DEFAULT_MAX_LINEAGE_IDS,
+) : M0SignedOccupancyKernel(
+    capacity,
+    occupancyThreshold,
+    saturation,
+    hysteresis,
+    maxObservations,
+    maxLineageIds,
+) {
     override val candidateId: String = "B"
 
     override fun fuse(observations: Iterable<M0VoxelObservation>): M0FusionResult {
@@ -151,10 +174,12 @@ class M0PlanarConsolidationKernel(
 class M0BoundedTsdfKernel(
     private val capacity: Int = 100_000,
     private val narrowBand: Int = 4,
+    private val maxObservations: Int = DEFAULT_MAX_OBSERVATIONS,
+    private val maxLineageIds: Int = DEFAULT_MAX_LINEAGE_IDS,
 ) : M0FusionKernel {
     private val ids = M0StableSurfaceIdAllocator()
     init {
-        require(capacity > 0 && narrowBand > 0)
+        require(capacity > 0 && narrowBand > 0 && maxObservations > 0 && maxLineageIds > 0)
     }
 
     override val candidateId: String = "C"
@@ -164,12 +189,20 @@ class M0BoundedTsdfKernel(
         val counts = sortedMapOf<M0VoxelKey, Int>()
         val lineage = sortedMapOf<M0VoxelKey, MutableSet<Int>>()
         var overflow = 0
-        observations.forEach { observation ->
+        var acceptedObservations = 0
+        for (observation in observations) {
+            if (acceptedObservations == maxObservations) {
+                overflow++
+                break
+            }
+            acceptedObservations++
             val key = M0VoxelKey(observation.x, observation.y, observation.z)
             if (observation.signedWeight > narrowBand || observation.signedWeight < -narrowBand) overflow++
             sums[key] = (sums[key] ?: 0) + observation.signedWeight
             counts[key] = (counts[key] ?: 0) + 1
-            lineage.getOrPut(key) { mutableSetOf() } += observation.supportId
+            if (addBoundedLineage(lineage, key, observation.supportId, maxLineageIds)) {
+                overflow++
+            }
         }
         val signedDistance = sums.mapValues { (key, sum) ->
             roundTiesEven(sum.toLong(), counts.getValue(key).toLong())
@@ -194,6 +227,18 @@ class M0BoundedTsdfKernel(
                 (signedDistance.size - capacity).coerceAtLeast(0),
         )
     }
+}
+
+private fun addBoundedLineage(
+    lineage: MutableMap<M0VoxelKey, MutableSet<Int>>,
+    key: M0VoxelKey,
+    supportId: Int,
+    maximum: Int,
+): Boolean {
+    val supportIds = lineage.getOrPut(key) { mutableSetOf() }
+    if (!supportIds.add(supportId) || supportIds.size <= maximum) return false
+    supportIds.remove(supportIds.maxOrNull())
+    return true
 }
 
 private data class PlanarPatch(val keys: List<M0VoxelKey>, val planeAxis: Int)
