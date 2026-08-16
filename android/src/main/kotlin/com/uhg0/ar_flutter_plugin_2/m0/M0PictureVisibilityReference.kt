@@ -1,5 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.m0
 
+import java.math.BigInteger
+
 enum class M0PictureVisibilityOccupancy { CONFIRMED, AMBIGUOUS, ABSENT }
 
 data class M0PictureVisibilityCamera(
@@ -14,6 +16,8 @@ data class M0PictureVisibilityCamera(
     val model: String = "rectified_pinhole_q24_8_v1",
     val nearMm: Int = 100,
     val farMm: Int = 3000,
+    val imageOrientation: String = "top_left_x_right_y_down_v1",
+    val affineLastRowQ30: List<Long> = listOf(0, 0, 0, 1L shl 30),
     val poseValid: Boolean = true,
 ) {
     val isValid: Boolean
@@ -22,8 +26,12 @@ data class M0PictureVisibilityCamera(
             fxQ8 in 1..65535 && fyQ8 in 1..65535 &&
             cxQ8 in 0..imageWidth * 256 && cyQ8 in 0..imageHeight * 256 &&
             nearMm == 100 && farMm == 3000 &&
+            imageOrientation == "top_left_x_right_y_down_v1" &&
             cameraFromGroupRotationQ30.size == 9 &&
-            cameraFromGroupRotationQ30.all { it in -(1L shl 30)..(1L shl 30) }
+            affineLastRowQ30.size == 4 &&
+            cameraFromGroupRotationQ30.all { it in -(1L shl 30)..(1L shl 30) } &&
+            rotationIsOrthonormal(cameraFromGroupRotationQ30) &&
+            affineRowIsValid(affineLastRowQ30)
 }
 
 data class M0PictureVisibilitySurface(
@@ -43,6 +51,7 @@ data class M0PictureVisibilityCutState(
     val cutIncompatible: Boolean = false,
     val historyIndeterminate: Boolean = false,
     val coveragePending: Boolean = false,
+    val occlusionIndeterminate: Boolean = false,
 )
 
 enum class M0PictureVisibilityRejection {
@@ -178,6 +187,19 @@ object M0PictureVisibilityEvaluator {
             )
         }
         val occluding = occludingCells.toSet()
+        if (surface.occlusionEligible && cut.occlusionIndeterminate) {
+            return reject(
+                M0PictureVisibilityRejection.OCCLUSION_INDETERMINATE,
+                surfaceCenter,
+                cameraPoint,
+                depth,
+                projectedU,
+                projectedV,
+                footprint,
+                facing,
+                viewDirection,
+            )
+        }
         if (surface.occlusionEligible &&
             M0SupercoverCells100mm.cellsBetween(cameraCenter, surfaceCenter).any { it in occluding }
         ) {
@@ -325,6 +347,12 @@ data class M0GuidanceCandidateInput(
     val occupancy: M0PictureVisibilityOccupancy,
 )
 
+data class M0GuidanceEnvironment(
+    val gridMinMm: M0VoxelKey,
+    val gridMaxMm: M0VoxelKey,
+    val occupiedCells: Set<M0VoxelKey>,
+)
+
 data class M0GuidanceTarget(
     val surfaceId: Long,
     val bin: Int,
@@ -333,7 +361,10 @@ data class M0GuidanceTarget(
 )
 
 object M0GuidanceReference {
-    fun select(candidates: Iterable<M0GuidanceCandidateInput>): List<M0GuidanceTarget> =
+    fun select(
+        candidates: Iterable<M0GuidanceCandidateInput>,
+        environment: M0GuidanceEnvironment? = null,
+    ): List<M0GuidanceTarget> =
         candidates.mapNotNull { candidate ->
             val evaluation = candidate.evaluation
             val bin = evaluation.bin ?: return@mapNotNull null
@@ -361,21 +392,87 @@ object M0GuidanceReference {
             gain = roundTiesEven(gain * need, 10)
             val center = evaluation.surfaceCenterMm ?: return@mapNotNull null
             val direction = M0PictureViewBins24.centers[bin]
+            val standpoint = M0VoxelKey(
+                center.x + roundTiesEven(direction.x.toLong() * 2000, 32767).toInt(),
+                center.y + roundTiesEven(direction.y.toLong() * 2000, 32767).toInt(),
+                center.z + roundTiesEven(direction.z.toLong() * 2000, 32767).toInt(),
+            )
+            if (environment != null && !validStandpoint(environment, standpoint, center)) {
+                return@mapNotNull null
+            }
             M0GuidanceTarget(
                 surfaceId = candidate.surfaceId,
                 bin = bin,
                 gainQ16 = gain.coerceIn(0, 65535).toInt(),
-                standpointMm = M0VoxelKey(
-                    center.x + roundTiesEven(direction.x.toLong() * 2000, 32767).toInt(),
-                    center.y + roundTiesEven(direction.y.toLong() * 2000, 32767).toInt(),
-                    center.z + roundTiesEven(direction.z.toLong() * 2000, 32767).toInt(),
-                ),
+                standpointMm = standpoint,
             )
         }.sortedWith(compareByDescending<M0GuidanceTarget> { it.gainQ16 }
             .thenBy { it.surfaceId }
-            .thenBy { it.bin })
+        .thenBy { it.bin })
         .take(3)
 
+    private fun validStandpoint(
+        environment: M0GuidanceEnvironment,
+        standpoint: M0VoxelKey,
+        target: M0VoxelKey,
+    ): Boolean {
+        if (standpoint.x < environment.gridMinMm.x ||
+            standpoint.y < environment.gridMinMm.y ||
+            standpoint.z < environment.gridMinMm.z ||
+            standpoint.x > environment.gridMaxMm.x ||
+            standpoint.y > environment.gridMaxMm.y ||
+            standpoint.z > environment.gridMaxMm.z
+        ) return false
+        environment.occupiedCells.forEach { cell ->
+            val occupied = M0VoxelKey(100 * cell.x + 50, 100 * cell.y + 50, 100 * cell.z + 50)
+            val dx = standpoint.x - occupied.x
+            val dy = standpoint.y - occupied.y
+            val dz = standpoint.z - occupied.z
+            if (dx * dx + dy * dy + dz * dz < 300 * 300) return false
+        }
+        return M0SupercoverCells100mm.cellsBetween(standpoint, target)
+            .none { it in environment.occupiedCells }
+    }
+
+}
+
+private fun rotationIsOrthonormal(rotation: List<Long>): Boolean {
+    val scale = 1L shl 30
+    val scaleSquared = BigInteger.valueOf(scale) * BigInteger.valueOf(scale)
+    for (column in 0 until 3) {
+        var norm = BigInteger.ZERO
+        for (row in 0 until 3) {
+            val value = BigInteger.valueOf(rotation[row * 3 + column])
+            norm += value * value
+        }
+        if ((norm - scaleSquared).abs() * BigInteger.valueOf(10_000) >= scaleSquared) {
+            return false
+        }
+    }
+    for (left in 0 until 3) {
+        for (right in left + 1 until 3) {
+            var dot = BigInteger.ZERO
+            for (row in 0 until 3) {
+                dot += BigInteger.valueOf(rotation[row * 3 + left]) *
+                    BigInteger.valueOf(rotation[row * 3 + right])
+            }
+            if (dot.abs() * BigInteger.valueOf(10_000) >= scaleSquared) return false
+        }
+    }
+    val a = rotation.map { BigInteger.valueOf(it) }
+    val determinant = a[0] * (a[4] * a[8] - a[5] * a[7]) -
+        a[1] * (a[3] * a[8] - a[5] * a[6]) +
+        a[2] * (a[3] * a[7] - a[4] * a[6])
+    return determinant.signum() > 0
+}
+
+private fun affineRowIsValid(row: List<Long>): Boolean {
+    val scale = 1L shl 30
+    val expected = listOf(BigInteger.ZERO, BigInteger.ZERO, BigInteger.ZERO, BigInteger.valueOf(scale))
+    val tolerance = BigInteger.valueOf(1_000_000)
+    return row.indices.all { index ->
+        (BigInteger.valueOf(row[index]) - expected[index]).abs() * tolerance <= BigInteger.valueOf(scale)
+    }
 }
 
 private fun roundTiesEven(numerator: Long, denominator: Long): Long {

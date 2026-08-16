@@ -300,6 +300,19 @@ class M0ReferenceSeamsTest {
         assertEquals(150, approved.depthMm)
         assertTrue(approved.footprintQ16 >= 64L * 65536L)
         assertEquals(
+            M0PictureVisibilityRejection.OCCLUSION_INDETERMINATE,
+            M0PictureVisibilityEvaluator.evaluate(
+                camera,
+                surface,
+                cut = M0PictureVisibilityCutState(occlusionIndeterminate = true),
+            ).rejection,
+        )
+        val invalidCamera = camera.copy(cameraFromGroupRotationQ30 = List(9) { 0L })
+        assertEquals(
+            M0PictureVisibilityRejection.CAMERA_MODEL_UNSUPPORTED,
+            M0PictureVisibilityEvaluator.evaluate(invalidCamera, surface).rejection,
+        )
+        assertEquals(
             M0PictureVisibilityRejection.OCCLUDED,
             M0PictureVisibilityEvaluator.evaluate(
                 camera,
@@ -321,6 +334,16 @@ class M0ReferenceSeamsTest {
         ).first()
         assertEquals(9L, target.surfaceId)
         assertEquals(1698, target.standpointMm.z)
+        assertTrue(
+            M0GuidanceReference.select(
+                listOf(M0GuidanceCandidateInput(9, approved, surface.normal, 0, M0PictureVisibilityOccupancy.CONFIRMED)),
+                environment = M0GuidanceEnvironment(
+                    M0VoxelKey(-10_000, -10_000, -10_000),
+                    M0VoxelKey(10_000, 10_000, 1_000),
+                    emptySet(),
+                ),
+            ).isEmpty(),
+        )
     }
 
     private inline fun <reified T : Throwable> assertThrows(block: () -> Unit) {
