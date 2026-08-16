@@ -52,6 +52,7 @@ class M0bQualityCorpusTest {
             )
             val root = Json.parseToJsonElement(bytes.decodeToString()).jsonObject
             assertEquals(stage, root.getValue("stage").jsonPrimitive.content)
+            assertSyntheticSensorFrames(root)
             sceneNames[stage] = root.getValue("scenes").jsonArray
                 .map { it.jsonObject.getValue("name").jsonPrimitive.content }
                 .toSet()
@@ -127,6 +128,80 @@ class M0bQualityCorpusTest {
             }
         }
 
+    private fun assertExpectedOutput(expected: JsonObject, actual: M0FusionResult) {
+        assertEquals(expected.int("overflowObservationCount"), actual.overflowObservationCount)
+        val expectedSurfaces = expected.getValue("surfaces").jsonArray
+        assertEquals(expectedSurfaces.size, actual.surfaces.size)
+        expectedSurfaces.forEachIndexed { index, element ->
+            val expectedSurface = element.jsonObject
+            val surface = actual.surfaces[index]
+            val key = expectedSurface.getValue("key").jsonArray.map { it.jsonPrimitive.int }
+            assertEquals(expectedSurface.int("surfaceId").toLong(), surface.surfaceId)
+            assertEquals(M0VoxelKey(key[0], key[1], key[2]), surface.key)
+            assertEquals(expectedSurface.int("weight"), surface.weight)
+            assertEquals(expectedSurface.int("normalOctant"), surface.normalOctant)
+            assertEquals(expectedSurface.int("extentU"), surface.extentU)
+            assertEquals(expectedSurface.int("extentV"), surface.extentV)
+            assertEquals(expectedSurface.int("planeAxis"), surface.planeAxis)
+            assertEquals(
+                expectedSurface.getValue("lineageIds").jsonArray.map { it.jsonPrimitive.int },
+                surface.lineageIds,
+            )
+            assertEquals(expectedSurface.int("observationCount"), surface.observationCount)
+        }
+    }
+
+    private fun assertSyntheticSensorFrames(root: JsonObject) {
+        val frames = root.getValue("sensorFrames").jsonObject
+        val pointCloud = frames.getValue("arcorePointCloud").jsonObject
+        val pointIds = pointCloud.getValue("pointIds").jsonArray.map { it.jsonPrimitive.int }
+        val points = pointCloud.getValue("pointsMeters").jsonArray.map { row ->
+            row.jsonArray.map { it.jsonPrimitive.double }
+        }
+        val confidence = pointCloud.getValue("confidence").jsonArray.map { it.jsonPrimitive.double }
+        val minimumConfidence = pointCloud.double("minimumConfidence")
+        val metersToVoxel = pointCloud.double("metersToVoxel")
+        assertEquals(points.size, pointIds.size)
+        assertEquals(points.size, confidence.size)
+        val acceptedIndices = points.indices.filter { confidence[it] >= minimumConfidence }
+        assertEquals(
+            pointCloud.getValue("expectedAcceptedPointIds").jsonArray.map { it.jsonPrimitive.int },
+            acceptedIndices.map { pointIds[it] },
+        )
+        assertEquals(
+            pointCloud.getValue("expectedVoxelKeys").jsonArray.map { row ->
+                val key = row.jsonArray.map { it.jsonPrimitive.int }
+                M0VoxelKey(key[0], key[1], key[2])
+            },
+            acceptedIndices.map { index ->
+                val point = points[index]
+                M0VoxelKey(
+                    kotlin.math.round(point[0] * metersToVoxel).toInt(),
+                    kotlin.math.round(point[1] * metersToVoxel).toInt(),
+                    kotlin.math.round(point[2] * metersToVoxel).toInt(),
+                )
+            },
+        )
+
+        val depthMap = frames.getValue("arkitDepthMap").jsonObject
+        val width = depthMap.int("width")
+        val height = depthMap.int("height")
+        val depths = depthMap.getValue("depthMeters").jsonArray.map { it.jsonPrimitive.double }
+        val depthConfidence = depthMap.getValue("confidence").jsonArray.map { it.jsonPrimitive.content }
+        val ranks = mapOf("none" to 0, "low" to 1, "medium" to 2, "high" to 3)
+        val minimumDepthConfidence = ranks.getValue(depthMap.getValue("minimumConfidence").jsonPrimitive.content)
+        assertEquals(width * height, depths.size)
+        assertEquals(depths.size, depthConfidence.size)
+        assertEquals(
+            depthMap.int("expectedValidPixelCount"),
+            depths.indices.count { depths[it] > 0.0 && ranks.getValue(depthConfidence[it]) >= minimumDepthConfidence },
+        )
+        assertEquals(
+            listOf(height, width),
+            depthMap.getValue("expectedOrientedDimensions").jsonArray.map { it.jsonPrimitive.int },
+        )
+    }
+
     private fun candidateMeasurements(root: JsonObject): Map<String, Triple<Double, Double, Double>> {
         val scenes = root.getValue("scenes").jsonArray.map { it.jsonObject }
         val observations = scenes.flatMap { scene ->
@@ -149,6 +224,9 @@ class M0bQualityCorpusTest {
             val first = factory().fuse(observations)
             val repeat = factory().fuse(observations)
             assertEquals(candidate, first.surfaces, repeat.surfaces)
+            root["expectedCandidateOutputs"]?.jsonObject?.let { expected ->
+                assertExpectedOutput(expected.getValue(candidate).jsonObject, first)
+            }
             val output = expandedKeys(first.surfaces)
             val falseResidual = if (phantom.isEmpty()) 0.0
             else output.intersect(phantom).size.toDouble() / phantom.size
