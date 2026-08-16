@@ -21,6 +21,8 @@ data class M0CanonicalSurface(
     val extentU: Int = 1,
     val extentV: Int = 1,
     val planeAxis: Int = 3,
+    val lineageIds: List<Int> = emptyList(),
+    val observationCount: Int = 0,
 )
 
 data class M0FusionResult(
@@ -60,6 +62,8 @@ open class M0SignedOccupancyKernel(
 
     override fun fuse(observations: Iterable<M0VoxelObservation>): M0FusionResult {
         val weights = sortedMapOf<M0VoxelKey, Int>()
+        val lineage = sortedMapOf<M0VoxelKey, MutableSet<Int>>()
+        val observationCounts = sortedMapOf<M0VoxelKey, Int>()
         var overflow = 0
         observations.forEach { observation ->
             val key = M0VoxelKey(observation.x, observation.y, observation.z)
@@ -67,6 +71,8 @@ open class M0SignedOccupancyKernel(
             val next = previous + observation.signedWeight
             if (next > saturation || next < -saturation) overflow++
             weights[key] = next.coerceIn(-saturation, saturation)
+            lineage.getOrPut(key) { mutableSetOf() } += observation.supportId
+            observationCounts[key] = (observationCounts[key] ?: 0) + 1
         }
         val visible = buildList {
             val deactivationThreshold = occupancyThreshold - hysteresis
@@ -86,7 +92,14 @@ open class M0SignedOccupancyKernel(
         }
         return M0FusionResult(
             surfaces = visible.map { (key, weight) ->
-                M0CanonicalSurface(ids.idFor(key), key, weight, normalOctant(key))
+                M0CanonicalSurface(
+                    surfaceId = ids.idFor(key),
+                    key = key,
+                    weight = weight,
+                    normalOctant = normalOctant(key),
+                    lineageIds = lineage.getValue(key).sorted(),
+                    observationCount = observationCounts.getValue(key),
+                )
             },
             overflowObservationCount = overflow,
         )
@@ -124,6 +137,8 @@ class M0PlanarConsolidationKernel(
                 extentU = 2,
                 extentV = 2,
                 planeAxis = patch.planeAxis,
+                lineageIds = members.flatMap { it.lineageIds }.distinct().sorted(),
+                observationCount = members.sumOf { it.observationCount },
             )
         }
         return M0FusionResult(
@@ -147,12 +162,14 @@ class M0BoundedTsdfKernel(
     override fun fuse(observations: Iterable<M0VoxelObservation>): M0FusionResult {
         val sums = sortedMapOf<M0VoxelKey, Int>()
         val counts = sortedMapOf<M0VoxelKey, Int>()
+        val lineage = sortedMapOf<M0VoxelKey, MutableSet<Int>>()
         var overflow = 0
         observations.forEach { observation ->
             val key = M0VoxelKey(observation.x, observation.y, observation.z)
             if (observation.signedWeight > narrowBand || observation.signedWeight < -narrowBand) overflow++
             sums[key] = (sums[key] ?: 0) + observation.signedWeight
             counts[key] = (counts[key] ?: 0) + 1
+            lineage.getOrPut(key) { mutableSetOf() } += observation.supportId
         }
         val signedDistance = sums.mapValues { (key, sum) ->
             roundTiesEven(sum.toLong(), counts.getValue(key).toLong())
@@ -164,7 +181,14 @@ class M0BoundedTsdfKernel(
             .take(capacity)
         return M0FusionResult(
             surfaces = visible.mapIndexed { index, entry ->
-                M0CanonicalSurface(ids.idFor(entry.key), entry.key, entry.value, normalOctant(entry.key))
+                M0CanonicalSurface(
+                    surfaceId = ids.idFor(entry.key),
+                    key = entry.key,
+                    weight = entry.value,
+                    normalOctant = normalOctant(entry.key),
+                    lineageIds = lineage.getValue(entry.key).sorted(),
+                    observationCount = counts.getValue(entry.key),
+                )
             },
             overflowObservationCount = overflow +
                 (signedDistance.size - capacity).coerceAtLeast(0),

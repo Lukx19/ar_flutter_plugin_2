@@ -6,6 +6,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -131,6 +132,60 @@ class M0aVisibilitySurfaceStreamChannelTest {
         assertEquals(1L, decoded.requestSequence)
     }
 
+    @Test
+    fun `stalled accepted work abandons binding once and late worker output is ignored`() {
+        val messenger = TestMessenger(22)
+        val executor = HoldingExecutor()
+        val scheduler = HoldingTimeoutScheduler()
+        val binding = M0aVisibilitySurfaceStreamChannel(
+            messenger,
+            22,
+            workerExecutor = executor,
+            shutdownWorkerOnDispose = false,
+            timeoutScheduler = scheduler,
+        )
+        val replies = AtomicInteger(0)
+        val result = arrayOfNulls<ByteArray>(1)
+        val completed = CountDownLatch(1)
+        messenger.send(
+            "visibility_surface_stream_22",
+            ByteBuffer.wrap(request(sequence = 1, token = 8)),
+        ) { response ->
+            replies.incrementAndGet()
+            result[0] = response?.let { buffer ->
+                val copy = ByteArray(buffer.remaining())
+                buffer.slice().get(copy)
+                copy
+            }
+            completed.countDown()
+        }
+
+        scheduler.fireNext()
+
+        assertTrue(completed.await(2, TimeUnit.SECONDS))
+        val abandoned = M0aPacketCodec.decodeResponse(result[0]!!)
+        assertEquals(255, abandoned.messageKind)
+        assertEquals(142, abandoned.errorId)
+        assertEquals(1L, abandoned.requestSequence)
+        assertEquals(1, replies.get())
+        assertNull(messenger.tryExchange(request(sequence = 2, token = 8)))
+
+        executor.runQueued()
+        assertEquals(1, replies.get())
+
+        binding.dispose()
+        val replacement = M0aVisibilitySurfaceStreamChannel(
+            messenger,
+            22,
+            timeoutScheduler = HoldingTimeoutScheduler(),
+        )
+        val recovered = M0aPacketCodec.decodeResponse(
+            messenger.exchange(request(sequence = 1, token = 8)),
+        )
+        assertEquals(0, recovered.messageKind)
+        replacement.dispose()
+    }
+
     private fun request(sequence: Long, token: Long): ByteArray =
         M0aPacketCodec.encodeRequest(
             M0aPacketCodec.Request(
@@ -157,6 +212,25 @@ private class HoldingExecutor : Executor {
 
     fun runQueued() {
         checkNotNull(queued).run()
+    }
+}
+
+private class HoldingTimeoutScheduler : M0aTimeoutScheduler {
+    private var pending: (() -> Unit)? = null
+
+    override fun schedule(delayMillis: Long, task: () -> Unit): M0aTimeoutHandle {
+        pending = task
+        return M0aTimeoutHandle { pending = null }
+    }
+
+    override fun shutdown() {
+        pending = null
+    }
+
+    fun fireNext() {
+        val task = checkNotNull(pending)
+        pending = null
+        task()
     }
 }
 
