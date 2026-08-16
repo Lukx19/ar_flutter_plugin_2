@@ -193,6 +193,11 @@ class M0cGoldenVectorTest {
 
     @Test
     fun `hash bound schema five shard error corpus preserves Kotlin outcomes`() {
+        val corpusBytes = resourceBytes("m0c_shard_error_corpus_v1.json")
+        assertEquals(
+            "406cd6957437b5d31e5c303be95ef7fb9c8b1441785d4cac6f48de041b5b1ab6",
+            sha256(corpusBytes),
+        )
         val manifest = fixture("m0c_shard_error_corpus_v1.json")
         val vectorBytes = resourceBytes(manifest.getValue("baseVector").jsonPrimitive.content)
         assertEquals(
@@ -200,9 +205,18 @@ class M0cGoldenVectorTest {
             sha256(vectorBytes),
         )
         val vector = Json.parseToJsonElement(vectorBytes.decodeToString()).jsonObject
-        manifest.getValue("cases").jsonArray.forEach { raw ->
+        val cases = manifest.getValue("cases").jsonArray
+        val expectedNames = manifest.getValue("expectedCaseNames").jsonArray
+            .map { it.jsonPrimitive.content }
+        assertEquals(manifest.int("expectedCaseCount"), cases.size)
+        assertEquals(
+            expectedNames,
+            cases.map { it.jsonObject.getValue("name").jsonPrimitive.content },
+        )
+        cases.forEach { raw ->
             val fault = raw.jsonObject
             val packet = applyShardErrorCase(vector, fault)
+            assertEquals(fault.getValue("packetSha256").jsonPrimitive.content, sha256(packet))
             if (fault.getValue("outcome").jsonPrimitive.content == "accept") {
                 assertTrue(
                     fault.getValue("name").jsonPrimitive.content,
