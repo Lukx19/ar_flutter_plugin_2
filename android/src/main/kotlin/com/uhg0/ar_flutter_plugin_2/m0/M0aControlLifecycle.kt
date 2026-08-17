@@ -16,24 +16,26 @@ class M0aControlLifecycle(
     private var state = State.IDLE
     private var nextStreamToken = 1L
     private var activeStreamToken = 0L
-    private var lastRequest: ByteArray? = null
-    private var lastResponse: ByteArray? = null
+    private data class Receipt(val request: ByteArray, val response: ByteArray, val id: M0aUuid)
+
+    private val receipts = mutableListOf<Receipt>()
 
     fun state(): State = state
 
     fun streamToken(): Long = activeStreamToken
 
+    fun cachedRequestBytes(): Int = receipts.sumOf { it.request.size }
+
+    fun cachedResponseBytes(): Int = receipts.sumOf { it.response.size }
+
     /** Handles one already-decoded request and returns a packed VGD2 receipt. */
     @Synchronized
     fun handle(request: M0aControlRequest, encodedRequest: ByteArray): ByteArray {
-        val cachedRequest = lastRequest
-        val cachedResponse = lastResponse
-        if (cachedRequest != null && cachedResponse != null) {
-            if (cachedRequest.contentEquals(encodedRequest)) return cachedResponse.copyOf()
-            val previous = M0aControlCodec.decodeRequest(cachedRequest)
-            if (previous.controlRequestId == request.controlRequestId) {
+        for (receipt in receipts) {
+            if (receipt.request.contentEquals(encodedRequest)) return receipt.response.copyOf()
+            if (receipt.id == request.controlRequestId) {
                 return cache(
-                    encodedRequest,
+                    null,
                     error(request, M0aControlError.REQUEST_REPLAY_CONFLICT),
                 )
             }
@@ -112,9 +114,15 @@ class M0aControlLifecycle(
             maximumResponseBytes,
         )
 
-    private fun cache(request: ByteArray, response: ByteArray): ByteArray {
-        lastRequest = request.copyOf()
-        lastResponse = response.copyOf()
+    private fun cache(request: ByteArray?, response: ByteArray): ByteArray {
+        if (request != null) {
+            receipts += Receipt(
+                request = request.copyOf(),
+                response = response.copyOf(),
+                id = M0aControlCodec.decodeRequest(request).controlRequestId,
+            )
+            if (receipts.size > 8) receipts.removeAt(0)
+        }
         return response.copyOf()
     }
 

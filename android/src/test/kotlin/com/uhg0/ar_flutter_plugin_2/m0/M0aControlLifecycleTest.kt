@@ -43,7 +43,11 @@ class M0aControlLifecycleTest {
     fun `same control id with changed bytes is a replay conflict`() {
         val lifecycle = M0aControlLifecycle()
         val first = request(M0aControlOperation.START, 0, 1)
-        lifecycle.handle(first, M0aControlCodec.encodeRequest(first))
+        val firstBytes = M0aControlCodec.encodeRequest(first)
+        val firstResponse = lifecycle.handle(first, firstBytes)
+
+        val checkpoint = request(M0aControlOperation.BEGIN_CHECKPOINT, 1, 2)
+        lifecycle.handle(checkpoint, M0aControlCodec.encodeRequest(checkpoint))
 
         val conflict = request(M0aControlOperation.START, 0, 2).copy(
             controlRequestId = first.controlRequestId,
@@ -54,6 +58,7 @@ class M0aControlLifecycleTest {
         )
         assertEquals(1, response.outcome)
         assertEquals(30, response.errorId)
+        assertArrayEquals(firstResponse, lifecycle.handle(first, firstBytes))
     }
 
     private fun request(
