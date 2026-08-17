@@ -131,6 +131,28 @@ class M0aTransactionReferenceTest {
         }
     }
 
+    @Test
+    fun `producer accepts exact request ceiling and rejects one byte over`() {
+        val maximum = ByteArray(M0aPacketCodec.requestCeilingBytes)
+        val frames = M0aStructuralTransactionProducerV1.produce(
+            transactionId = 3,
+            baseGeometryRevision = 4,
+            targetGeometryRevision = 5,
+            targetLineageRevision = 6,
+            bytes = maximum,
+        )
+        assertEquals(18, frames.size)
+        assertThrows(IllegalArgumentException::class.java) {
+            M0aStructuralTransactionProducerV1.produce(
+                transactionId = 3,
+                baseGeometryRevision = 4,
+                targetGeometryRevision = 5,
+                targetLineageRevision = 6,
+                bytes = ByteArray(M0aPacketCodec.requestCeilingBytes + 1),
+            )
+        }
+    }
+
     private fun begin(bytes: ByteArray) = M0aTransactionBeginV1(
         transactionId = 7,
         baseGeometryRevision = 10,
