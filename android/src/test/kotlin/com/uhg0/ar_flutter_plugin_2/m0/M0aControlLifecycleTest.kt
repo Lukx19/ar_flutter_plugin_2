@@ -61,6 +61,28 @@ class M0aControlLifecycleTest {
         assertArrayEquals(firstResponse, lifecycle.handle(first, firstBytes))
     }
 
+    @Test
+    fun `control receipt storage is bounded to four entries`() {
+        val lifecycle = M0aControlLifecycle()
+        val start = request(M0aControlOperation.START, 0, 1)
+        lifecycle.handle(start, M0aControlCodec.encodeRequest(start))
+
+        repeat(4) { offset ->
+            val checkpoint = request(
+                M0aControlOperation.BEGIN_CHECKPOINT,
+                1,
+                offset + 2,
+            )
+            lifecycle.handle(checkpoint, M0aControlCodec.encodeRequest(checkpoint))
+        }
+
+        val latest = request(M0aControlOperation.BEGIN_CHECKPOINT, 1, 5)
+        val latestBytes = M0aControlCodec.encodeRequest(latest)
+        val latestResponse = lifecycle.handle(latest, latestBytes)
+        assertEquals(4 * latestBytes.size, lifecycle.cachedRequestBytes())
+        assertEquals(4 * latestResponse.size, lifecycle.cachedResponseBytes())
+    }
+
     private fun request(
         operation: M0aControlOperation,
         streamToken: Long,

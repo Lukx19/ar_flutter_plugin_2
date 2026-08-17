@@ -121,7 +121,7 @@ class M0aControlLifecycle(
                 response = response.copyOf(),
                 id = M0aControlCodec.decodeRequest(request).controlRequestId,
             )
-            if (receipts.size > 8) receipts.removeAt(0)
+            if (receipts.size > M0aControlError.MAX_RECEIPTS) receipts.removeAt(0)
         }
         return response.copyOf()
     }
@@ -130,5 +130,6 @@ class M0aControlLifecycle(
         const val REQUEST_REPLAY_CONFLICT = 30
         const val STREAM_TOKEN_STALE = 4
         const val LIFECYCLE_STATE_INVALID = 48
+        const val MAX_RECEIPTS = 4
     }
 }
