@@ -2,6 +2,7 @@ package com.uhg0.ar_flutter_plugin_2.m0
 
 import io.flutter.plugin.common.BinaryMessenger
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
 import java.util.concurrent.RejectedExecutionException
@@ -11,9 +12,68 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class M0aVisibilitySurfaceStreamChannelTest {
+    @Test
+    fun `packet codec validates all portable ordinals and response envelope fields`() {
+        val base = M0aPacketCodec.encodeRequest(
+            M0aPacketCodec.Request(
+                requestFlags = 0,
+                streamToken = 91,
+                acknowledgedTransactionId = 0,
+                acknowledgedGeometryRevision = 0,
+                acknowledgedLineageRevision = 0,
+                nextStyleRevision = 0,
+                maximumResponseBytes = 4096,
+                styleRecords = emptyList(),
+                commandBytes = byteArrayOf(),
+                requestSequence = 1,
+            ),
+        )
+        listOf(24, 32, 40, 48).forEach { offset ->
+            val mutated = base.copyOf()
+            ByteBuffer.wrap(mutated).order(ByteOrder.LITTLE_ENDIAN)
+                .putLong(offset, Long.MIN_VALUE)
+            rewriteCrc(mutated, 72)
+            assertThrows(IllegalArgumentException::class.java) {
+                M0aPacketCodec.decodeRequest(mutated)
+            }
+        }
+
+        val invalidKind = M0aPacketCodec.encodeResponse(
+            M0aPacketCodec.noChanges(
+                streamToken = 91,
+                requestSequence = 1,
+                nextExpectedRequestSequence = 2,
+            ),
+            4096,
+        ).also { packet ->
+            packet[8] = 6
+            rewriteCrc(packet, 104)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            M0aPacketCodec.decodeResponse(invalidKind)
+        }
+
+        val oversized = ByteArray(M0aPacketCodec.catchUpMaximumBytes + 1)
+        oversized[0] = 'V'.code.toByte()
+        oversized[1] = 'G'.code.toByte()
+        oversized[2] = 'S'.code.toByte()
+        oversized[3] = '2'.code.toByte()
+        ByteBuffer.wrap(oversized).order(ByteOrder.LITTLE_ENDIAN).apply {
+            putShort(4, 2)
+            putShort(6, M0aPacketCodec.responseHeaderBytes.toShort())
+            putInt(16, oversized.size)
+            putInt(100, oversized.size - M0aPacketCodec.responseHeaderBytes)
+        }
+        rewriteCrc(oversized, 104)
+        assertThrows(IllegalArgumentException::class.java) {
+            M0aPacketCodec.decodeResponse(oversized)
+        }
+    }
+
     @Test
     fun `serial binding returns exact response for duplicate and rejects conflict`() {
         val messenger = TestMessenger(17)
@@ -305,6 +365,24 @@ class M0aVisibilitySurfaceStreamChannelTest {
                 requestSequence = sequence,
             ),
         )
+
+    private fun rewriteCrc(packet: ByteArray, crcOffset: Int) {
+        val data = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
+        data.putInt(crcOffset, 0)
+        data.putInt(crcOffset, crc32(packet, crcOffset))
+    }
+
+    private fun crc32(bytes: ByteArray, zeroOffset: Int): Int {
+        var crc = -1
+        bytes.forEachIndexed { index, original ->
+            val value = if (index in zeroOffset until zeroOffset + 4) 0 else original.toInt() and 0xff
+            crc = crc xor value
+            repeat(8) {
+                crc = if ((crc and 1) == 1) (crc ushr 1) xor 0xedb88320.toInt() else crc ushr 1
+            }
+        }
+        return crc xor -1
+    }
 }
 
 private class HoldingExecutor : Executor {

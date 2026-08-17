@@ -10,6 +10,7 @@ object M0aPacketCodec {
     const val requestCeilingBytes = 16 * 1024
     const val responseMinimumBytes = 4 * 1024
     const val responseMaximumBytes = 16 * 1024
+    const val catchUpMaximumBytes = 64 * 1024
     const val styleRecordBytes = 8
 
     data class Request(
@@ -138,6 +139,10 @@ object M0aPacketCodec {
         )
         validateOrdinal(request.streamToken, "streamToken")
         validateOrdinal(request.requestSequence, "requestSequence")
+        validateOrdinal(request.acknowledgedTransactionId, "acknowledgedTransactionId", true)
+        validateOrdinal(request.acknowledgedGeometryRevision, "acknowledgedGeometryRevision", true)
+        validateOrdinal(request.acknowledgedLineageRevision, "acknowledgedLineageRevision", true)
+        validateOrdinal(request.nextStyleRevision, "nextStyleRevision", true)
         require(request.requestFlags <= 0x3f) { "Request flags contain reserved bits" }
         require(request.maximumResponseBytes in responseMinimumBytes..responseMaximumBytes) {
             "maximumResponseBytes is outside the negotiated range"
@@ -146,8 +151,7 @@ object M0aPacketCodec {
     }
 
     fun encodeResponse(response: Response, maximumBytes: Int): ByteArray {
-        require(response.messageKind in 0..255)
-        require(response.responseFlags in 0..255)
+        validateResponse(response)
         require(response.resultFlags in 0..0x1f)
         require(response.errorId in 0..0xffff)
         require(response.requestSequence in 0..Long.MAX_VALUE)
@@ -205,6 +209,7 @@ object M0aPacketCodec {
 
     fun decodeResponse(packet: ByteArray): Response {
         require(packet.size >= responseHeaderBytes) { "Response is shorter than its header" }
+        require(packet.size <= catchUpMaximumBytes) { "Response exceeds the 64 KiB catch-up ceiling" }
         val data = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
         require(packet.magicIs("VGS2")) { "Packet magic is invalid" }
         require(data.getShort(4).toInt() and 0xffff == 2)
@@ -240,7 +245,7 @@ object M0aPacketCodec {
             payload = packet.copyOfRange(responseHeaderBytes, split),
             diagnostic = packet.copyOfRange(split, packet.size),
             regionResultCount = data.getShort(98).toInt() and 0xffff,
-        )
+        ).also(::validateResponse)
     }
 
     fun noChanges(
@@ -276,6 +281,35 @@ object M0aPacketCodec {
         require(value >= (if (allowZero) 0 else 1) && value <= Long.MAX_VALUE) {
             "$name is outside PortableOrdinal"
         }
+    }
+
+    private fun validateResponse(response: Response) {
+        require(response.messageKind in setOf(0, 1, 2, 3, 4, 5, 255)) {
+            "Response message kind is invalid"
+        }
+        require(response.responseFlags in 0..0x1f) {
+            "Response flags contain reserved bits"
+        }
+        if (response.messageKind == 255) {
+            require(response.errorId in 1..150) { "Error response has no stable error ID" }
+        } else {
+            require(response.errorId == 0) { "Non-error response has a non-zero error ID" }
+        }
+        require(response.requestSequence in 0..Long.MAX_VALUE)
+        validateOrdinal(response.streamToken, "streamToken", true)
+        validateOrdinal(response.nextExpectedRequestSequence, "nextExpectedRequestSequence", true)
+        validateOrdinal(response.transactionId, "transactionId", true)
+        validateOrdinal(response.baseGeometryRevision, "baseGeometryRevision", true)
+        validateOrdinal(response.targetGeometryRevision, "targetGeometryRevision", true)
+        validateOrdinal(response.targetLineageRevision, "targetLineageRevision", true)
+        validateOrdinal(response.acceptedStyleRevision, "acceptedStyleRevision", true)
+        require(response.chunkIndex in 0..0xffff)
+        require(response.chunkCount in 0..0xffff)
+        require(response.upsertCount in 0..0xffff)
+        require(response.removalCount in 0..0xffff)
+        require(response.lineageCount in 0..0xffff)
+        require(response.regionResultCount in 0..0xffff)
+        require(response.diagnostic.size <= 1024) { "Response diagnostic exceeds 1 KiB" }
     }
 
     private fun ByteArray.writeMagic(value: String) {
