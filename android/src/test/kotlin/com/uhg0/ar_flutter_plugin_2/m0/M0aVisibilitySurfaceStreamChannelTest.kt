@@ -5,6 +5,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
+import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -175,6 +176,92 @@ class M0aVisibilitySurfaceStreamChannelTest {
     }
 
     @Test
+    fun `stream accepts only the active control lifecycle token`() {
+        val lifecycle = M0aControlLifecycle()
+        val start = controlRequest(M0aControlOperation.START, 0, 1)
+        lifecycle.handle(start, M0aControlCodec.encodeRequest(start))
+        val messenger = TestMessenger(28)
+        val executor = Executors.newSingleThreadExecutor()
+        val binding = M0aVisibilitySurfaceStreamChannel(
+            messenger = messenger,
+            viewId = 28,
+            workerExecutor = executor,
+            shutdownWorkerOnDispose = false,
+            controlLifecycle = lifecycle,
+        )
+
+        val stale = M0aPacketCodec.decodeResponse(messenger.exchange(request(1, 99)))
+        assertEquals(255, stale.messageKind)
+        assertEquals(4, stale.errorId)
+        val accepted = M0aPacketCodec.decodeResponse(messenger.exchange(request(1, 1)))
+        assertEquals(M0aPacketCodec.ordinaryMessageKind, accepted.messageKind)
+        assertTrue(lifecycle.acceptsStreamToken(1))
+        binding.dispose()
+        executor.shutdownNow()
+    }
+
+    @Test
+    fun `exact restored and post commit baselines advance without resync`() {
+        val restoredMessenger = TestMessenger(30)
+        val restoredBinding = M0aVisibilitySurfaceStreamChannel(restoredMessenger, 30)
+        restoredBinding.setCommittedBaseline(9, 10, 11, 12)
+        val restoredResponse = M0aPacketCodec.decodeResponse(
+            restoredMessenger.exchange(
+                request(
+                    sequence = 1,
+                    token = 30,
+                    acknowledgedTransaction = 9,
+                    acknowledgedGeometry = 10,
+                    acknowledgedLineage = 11,
+                    styleRevision = 12,
+                ),
+            ),
+        )
+        assertEquals(M0aPacketCodec.ordinaryMessageKind, restoredResponse.messageKind)
+        restoredBinding.dispose()
+
+        val messenger = TestMessenger(29)
+        val binding = M0aVisibilitySurfaceStreamChannel(messenger, 29)
+        binding.queueStructuralTransaction(
+            M0aStructuralTransactionProducerV1.produce(
+                transactionId = 3,
+                baseGeometryRevision = 4,
+                targetGeometryRevision = 5,
+                targetLineageRevision = 6,
+                bytes = byteArrayOf(1),
+            ),
+        )
+        messenger.exchange(request(1, 29))
+        messenger.exchange(request(2, 29))
+        messenger.exchange(request(3, 29))
+        val restored = M0aPacketCodec.decodeResponse(
+            messenger.exchange(
+                request(
+                    sequence = 4,
+                    token = 29,
+                    acknowledgedTransaction = 3,
+                    acknowledgedGeometry = 5,
+                    acknowledgedLineage = 6,
+                ),
+            ),
+        )
+        assertEquals(M0aPacketCodec.ordinaryMessageKind, restored.messageKind)
+        val mismatched = M0aPacketCodec.decodeResponse(
+            messenger.exchange(
+                request(
+                    sequence = 5,
+                    token = 29,
+                    acknowledgedTransaction = 3,
+                    acknowledgedGeometry = 5,
+                    acknowledgedLineage = 7,
+                ),
+            ),
+        )
+        assertEquals(5, mismatched.messageKind)
+        binding.dispose()
+    }
+
+    @Test
     fun `ahead acknowledgement emits packed resync required response`() {
         val messenger = TestMessenger(26)
         val binding = M0aVisibilitySurfaceStreamChannel(messenger, 26)
@@ -220,7 +307,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
         val recovered = M0aPacketCodec.decodeResponse(
             messenger.exchange(M0aPacketCodec.encodeRequest(resync)),
         )
-        assertEquals(0, recovered.messageKind)
+        assertEquals(M0aPacketCodec.ordinaryMessageKind, recovered.messageKind)
         assertEquals(2L, recovered.requestSequence)
         binding.dispose()
     }
@@ -243,8 +330,8 @@ class M0aVisibilitySurfaceStreamChannelTest {
         assertEquals(6, malformedResponse.errorId)
 
         val accepted = messenger.exchange(request(sequence = 1, token = 4))
-        assertEquals(0, M0aPacketCodec.decodeResponse(accepted).messageKind)
-        assertEquals(0, M0aPacketCodec.decodeResponse(messenger.exchange(request(sequence = 2, token = 4))).messageKind)
+        assertEquals(M0aPacketCodec.ordinaryMessageKind, M0aPacketCodec.decodeResponse(accepted).messageKind)
+        assertEquals(M0aPacketCodec.ordinaryMessageKind, M0aPacketCodec.decodeResponse(messenger.exchange(request(sequence = 2, token = 4))).messageKind)
         val stale = M0aPacketCodec.decodeResponse(messenger.exchange(request(sequence = 1, token = 5)))
         assertEquals(255, stale.messageKind)
         assertEquals(31, stale.errorId)
@@ -261,7 +348,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
 
         val replacement = M0aVisibilitySurfaceStreamChannel(messenger, 19)
         val response = messenger.exchange(request(sequence = 1, token = 5))
-        assertEquals(0, M0aPacketCodec.decodeResponse(response).messageKind)
+        assertEquals(M0aPacketCodec.ordinaryMessageKind, M0aPacketCodec.decodeResponse(response).messageKind)
         replacement.dispose()
     }
 
@@ -287,7 +374,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
         val recovered = M0aPacketCodec.decodeResponse(
             messenger.exchange(request(sequence = 1, token = 6)),
         )
-        assertEquals(0, recovered.messageKind)
+        assertEquals(M0aPacketCodec.ordinaryMessageKind, recovered.messageKind)
         replacement.dispose()
     }
 
@@ -319,7 +406,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
         val recovered = M0aPacketCodec.decodeResponse(
             messenger.exchange(request(sequence = 1, token = 10)),
         )
-        assertEquals(0, recovered.messageKind)
+        assertEquals(M0aPacketCodec.ordinaryMessageKind, recovered.messageKind)
         replacement.dispose()
     }
 
@@ -427,7 +514,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
         val recovered = M0aPacketCodec.decodeResponse(
             messenger.exchange(request(sequence = 1, token = 8)),
         )
-        assertEquals(0, recovered.messageKind)
+        assertEquals(M0aPacketCodec.ordinaryMessageKind, recovered.messageKind)
         replacement.dispose()
     }
 
@@ -481,21 +568,51 @@ class M0aVisibilitySurfaceStreamChannelTest {
         binding.dispose()
     }
 
-    private fun request(sequence: Long, token: Long): ByteArray =
+    private fun request(
+        sequence: Long,
+        token: Long,
+        acknowledgedTransaction: Long = 0,
+        acknowledgedGeometry: Long = 0,
+        acknowledgedLineage: Long = 0,
+        styleRevision: Long = 0,
+    ): ByteArray =
         M0aPacketCodec.encodeRequest(
             M0aPacketCodec.Request(
                 requestFlags = 0,
                 streamToken = token,
-                acknowledgedTransactionId = 0,
-                acknowledgedGeometryRevision = 0,
-                acknowledgedLineageRevision = 0,
-                nextStyleRevision = 0,
+                acknowledgedTransactionId = acknowledgedTransaction,
+                acknowledgedGeometryRevision = acknowledgedGeometry,
+                acknowledgedLineageRevision = acknowledgedLineage,
+                nextStyleRevision = styleRevision,
                 maximumResponseBytes = 4096,
                 styleRecords = emptyList(),
                 commandBytes = byteArrayOf(),
                 requestSequence = sequence,
             ),
         )
+
+    private fun controlRequest(
+        operation: M0aControlOperation,
+        streamToken: Long,
+        seed: Int,
+    ): M0aControlRequest = M0aControlRequest(
+        operation = operation,
+        flags = 0,
+        controlRequestId = uuid(seed),
+        sessionId = uuid(20),
+        captureGroupId = uuid(40),
+        sessionGeneration = 1,
+        groupGeneration = 1,
+        coverageEpoch = 1,
+        streamToken = streamToken,
+    )
+
+    private fun uuid(seed: Int): M0aUuid {
+        val bytes = ByteArray(16) { (seed + it).toByte() }
+        bytes[6] = 0x40
+        bytes[8] = 0x80.toByte()
+        return M0aUuid(bytes)
+    }
 
     private fun ByteArray.copyAcknowledgement(transaction: Long): ByteArray {
         val copy = copyOf()

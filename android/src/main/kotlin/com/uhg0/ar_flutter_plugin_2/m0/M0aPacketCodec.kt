@@ -12,6 +12,7 @@ object M0aPacketCodec {
     const val responseMaximumBytes = 16 * 1024
     const val catchUpMaximumBytes = 64 * 1024
     const val styleRecordBytes = 8
+    const val ordinaryMessageKind = 1
 
     data class Request(
         val requestFlags: Int,
@@ -255,7 +256,7 @@ object M0aPacketCodec {
         requestSequence: Long,
         nextExpectedRequestSequence: Long,
     ): Response = Response(
-        messageKind = 0,
+        messageKind = ordinaryMessageKind,
         responseFlags = 0,
         resultFlags = 0,
         errorId = 0,
@@ -294,6 +295,22 @@ object M0aPacketCodec {
         nextExpectedRequestSequence = nextExpectedRequestSequence,
     )
 
+    /** CRC-32 for transaction payloads, shared by all VGS2 body codecs. */
+    internal fun crc32Payload(bytes: ByteArray): Long {
+        var crc = -1
+        bytes.forEach { original ->
+            crc = crc xor (original.toInt() and 0xff)
+            repeat(8) {
+                crc = if ((crc and 1) == 1) {
+                    (crc ushr 1) xor 0xedb88320.toInt()
+                } else {
+                    crc ushr 1
+                }
+            }
+        }
+        return (crc xor -1).toLong() and 0xffff_ffffL
+    }
+
     private fun validateOrdinal(value: Long, name: String, allowZero: Boolean = false) {
         require(value >= (if (allowZero) 0 else 1) && value <= Long.MAX_VALUE) {
             "$name is outside PortableOrdinal"
@@ -301,7 +318,7 @@ object M0aPacketCodec {
     }
 
     private fun validateResponse(response: Response) {
-        require(response.messageKind in setOf(0, 1, 2, 3, 4, 5, 255)) {
+        require(response.messageKind in setOf(1, 2, 3, 4, 5, 255)) {
             "Response message kind is invalid"
         }
         require(response.responseFlags in 0..0x1f) {

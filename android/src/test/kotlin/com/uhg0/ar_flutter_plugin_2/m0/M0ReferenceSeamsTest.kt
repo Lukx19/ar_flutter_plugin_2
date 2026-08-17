@@ -46,7 +46,7 @@ class M0ReferenceSeamsTest {
         assertEquals(1, responseDecoded.requestSequence)
         assertEquals(2, responseDecoded.nextExpectedRequestSequence)
         assertEquals(7, responseDecoded.streamToken)
-        assertEquals(0, responseDecoded.messageKind)
+        assertEquals(M0aPacketCodec.ordinaryMessageKind, responseDecoded.messageKind)
     }
 
     @Test

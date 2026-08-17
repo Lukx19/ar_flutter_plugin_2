@@ -16,6 +16,8 @@ import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.util.concurrent.Executors
+import java.util.concurrent.Executor
+import java.util.concurrent.ExecutorService
 
 /** Per-view `visibility_grid_wire_v1` endpoint. Raw sensor arrays stay native. */
 class VisibilityGridMethodChannel(
@@ -25,10 +27,13 @@ class VisibilityGridMethodChannel(
     private val runtimeCapabilities: () -> VisibilityGridRuntimeCapabilities,
     private val render: (CoveragePointRenderSnapshot?, PointCloudNativeConfig?) -> Unit,
     private val renderRawPoints: (CoveragePointRenderSnapshot?) -> Unit = {},
+    private val m0aControlLifecycle: M0aControlLifecycle = M0aControlLifecycle(),
+    sharedExecutor: Executor? = null,
 ) : MethodChannel.MethodCallHandler {
     private val channel = MethodChannel(messenger, "arpointcloud_$viewId")
     private val main = Handler(Looper.getMainLooper())
-    private val executor = Executors.newSingleThreadExecutor()
+    private val executor: ExecutorService =
+        (sharedExecutor as? ExecutorService) ?: Executors.newSingleThreadExecutor()
     private val sensorDrainDispatcher =
         FairExecutorDrainDispatcher(
             executor = executor,
@@ -58,7 +63,6 @@ class VisibilityGridMethodChannel(
         LatestRawPointRenderHandoff<CoveragePointRenderSnapshot>()
     private var rawPointSnapshotPublished = false
     private var healthHeartbeatGeneration = 0L
-    private val m0aControlLifecycle = M0aControlLifecycle()
 
     init {
         channel.setMethodCallHandler(this)

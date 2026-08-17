@@ -60,6 +60,7 @@ class M0aVisibilitySurfaceStreamChannel(
     private val workerTimeoutMillis: Long = DEFAULT_WORKER_TIMEOUT_MILLIS,
     private val timeoutScheduler: M0aTimeoutScheduler = M0aTimeoutScheduler.real(),
     private val beforeWorkerProcessing: (() -> Unit)? = null,
+    private val controlLifecycle: M0aControlLifecycle? = null,
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val channel = BasicMessageChannel<ByteBuffer>(
@@ -77,6 +78,14 @@ class M0aVisibilitySurfaceStreamChannel(
     private val transactionReceiver = M0aStructuralTransactionReceiverV1()
     private val telemetry = M0aTransportInstrumentation()
     private val structuralFrames = ArrayDeque<M0aTransactionFrameV1>()
+    private data class CommittedBaseline(
+        val transactionId: Long,
+        val geometryRevision: Long,
+        val lineageRevision: Long,
+        val styleRevision: Long,
+    )
+    private var committedBaseline = CommittedBaseline(0, 0, 0, 0)
+    private var queuedTransactionBaseline: CommittedBaseline? = null
 
     /** The bounded begin/chunk/commit seam owned by this binding. */
     val structuralTransactionReceiver: M0aStructuralTransactionReceiverV1
@@ -84,10 +93,6 @@ class M0aVisibilitySurfaceStreamChannel(
 
     /** Numeric telemetry for this packed binding; no surface arrays are exposed. */
     val transportInstrumentation: M0aTransportInstrumentation
-        get() = telemetry
-
-    /** Alias retained for callers that use the shorter telemetry name. */
-    val instrumentation: M0aTransportInstrumentation
         get() = telemetry
 
     /**
@@ -102,6 +107,31 @@ class M0aVisibilitySurfaceStreamChannel(
             check(structuralFrames.isEmpty()) { "A structural transaction is already queued" }
             validateStructuralTransaction(frames)
             frames.forEach { structuralFrames.addLast(it) }
+            val begin = (frames.first() as M0aTransactionBeginFrameV1).value
+            queuedTransactionBaseline = CommittedBaseline(
+                transactionId = begin.transactionId,
+                geometryRevision = begin.targetGeometryRevision,
+                lineageRevision = begin.targetLineageRevision,
+                styleRevision = committedBaseline.styleRevision,
+            )
+        }
+    }
+
+    /** Restores the native committed baseline after a worker/binding restart. */
+    fun setCommittedBaseline(
+        transactionId: Long,
+        geometryRevision: Long,
+        lineageRevision: Long,
+        styleRevision: Long,
+    ) {
+        require(transactionId >= 0 && geometryRevision >= 0 && lineageRevision >= 0 && styleRevision >= 0)
+        synchronized(this) {
+            committedBaseline = CommittedBaseline(
+                transactionId,
+                geometryRevision,
+                lineageRevision,
+                styleRevision,
+            )
         }
     }
 
@@ -143,6 +173,9 @@ class M0aVisibilitySurfaceStreamChannel(
                                 val encoded = try {
                                     val request = M0aPacketCodec.decodeRequest(bytes)
                                     decodedRequest = request
+                                    controlLifecycle?.streamTokenError(request.streamToken)?.let {
+                                        throw BindingError(it)
+                                    }
                                     val previousSequence = lastSequence
                                     when {
                                         previousSequence == request.requestSequence -> {
@@ -167,11 +200,7 @@ class M0aVisibilitySurfaceStreamChannel(
                                                 !isValidResyncRequest(request)) {
                                                 throw BindingError(TRANSACTION_STATE_ERROR_ID)
                                             }
-                                            val requiresResync =
-                                                request.acknowledgedTransactionId != 0L ||
-                                                    request.acknowledgedGeometryRevision != 0L ||
-                                                    request.acknowledgedLineageRevision != 0L ||
-                                                    request.nextStyleRevision != 0L
+                                            val requiresResync = requiresResync(request)
                                             val encoded = M0aPacketCodec.encodeResponse(
                                                 when {
                                                     resyncPending -> {
@@ -282,7 +311,11 @@ class M0aVisibilitySurfaceStreamChannel(
         resyncPending = false
         lastSequence = null
         nextExpectedSequence = 1L
-        synchronized(this) { structuralFrames.clear() }
+        synchronized(this) {
+            structuralFrames.clear()
+            queuedTransactionBaseline = null
+        }
+        controlLifecycle?.abandon()
         transactionReceiver.stop()
         clearMessageHandler()
         if (shutdownWorkerOnDispose && workerExecutor is java.util.concurrent.ExecutorService) {
@@ -303,6 +336,7 @@ class M0aVisibilitySurfaceStreamChannel(
             return
         }
         transactionReceiver.abandon()
+        controlLifecycle?.abandon()
         clearMessageHandler()
         if (shutdownWorkerOnDispose && workerExecutor is java.util.concurrent.ExecutorService) {
             workerExecutor.shutdownNow()
@@ -319,6 +353,7 @@ class M0aVisibilitySurfaceStreamChannel(
         }
         telemetry.workerLost()
         transactionReceiver.abandon()
+        controlLifecycle?.abandon()
         clearMessageHandler()
         if (shutdownWorkerOnDispose && workerExecutor is java.util.concurrent.ExecutorService) {
             workerExecutor.shutdownNow()
@@ -363,6 +398,19 @@ class M0aVisibilitySurfaceStreamChannel(
             payload.lastCommittedLineageRevision == request.acknowledgedLineageRevision
     }
 
+    private fun requiresResync(request: M0aPacketCodec.Request): Boolean {
+        val hasAcknowledgement = request.acknowledgedTransactionId != 0L ||
+            request.acknowledgedGeometryRevision != 0L ||
+            request.acknowledgedLineageRevision != 0L ||
+            request.nextStyleRevision != 0L
+        return hasAcknowledgement && CommittedBaseline(
+            transactionId = request.acknowledgedTransactionId,
+            geometryRevision = request.acknowledgedGeometryRevision,
+            lineageRevision = request.acknowledgedLineageRevision,
+            styleRevision = request.nextStyleRevision,
+        ) != committedBaseline
+    }
+
     private fun nextStructuralResponse(request: M0aPacketCodec.Request): M0aPacketCodec.Response {
         synchronized(this) {
             val frame = structuralFrames.peekFirst()
@@ -382,6 +430,11 @@ class M0aVisibilitySurfaceStreamChannel(
             val encoded = M0aPacketCodec.encodeResponse(response, request.maximumResponseBytes)
             check(encoded.isNotEmpty())
             structuralFrames.removeFirst()
+            if (frame is M0aTransactionCommitFrameV1) {
+                committedBaseline = queuedTransactionBaseline
+                    ?: error("COMMIT has no queued transaction baseline")
+                queuedTransactionBaseline = null
+            }
             return response
         }
     }

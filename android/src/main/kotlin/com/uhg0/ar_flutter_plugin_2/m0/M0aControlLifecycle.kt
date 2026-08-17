@@ -11,7 +11,7 @@ package com.uhg0.ar_flutter_plugin_2.m0
 class M0aControlLifecycle(
     private val maximumResponseBytes: Int = M0aControlCodec.hardCeilingBytes,
 ) {
-    enum class State { IDLE, ACTIVE, STOPPED }
+    enum class State { IDLE, ACTIVE, ABANDONED, STOPPED }
 
     private var state = State.IDLE
     private var nextStreamToken = 1L
@@ -23,6 +23,23 @@ class M0aControlLifecycle(
     fun state(): State = state
 
     fun streamToken(): Long = activeStreamToken
+
+    /** Returns null when a stream request may use this active binding token. */
+    @Synchronized
+    fun streamTokenError(token: Long): Int? = when {
+        state != State.ACTIVE -> M0aControlError.LIFECYCLE_STATE_INVALID
+        token != activeStreamToken -> M0aControlError.STREAM_TOKEN_STALE
+        else -> null
+    }
+
+    @Synchronized
+    fun acceptsStreamToken(token: Long): Boolean = streamTokenError(token) == null
+
+    /** Fences both control and stream work after an unknown native outcome. */
+    @Synchronized
+    fun abandon() {
+        if (state != State.STOPPED) state = State.ABANDONED
+    }
 
     fun cachedRequestBytes(): Int = receipts.sumOf { it.request.size }
 

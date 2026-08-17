@@ -132,6 +132,27 @@ class M0aTransactionReferenceTest {
     }
 
     @Test
+    fun `structural response kinds match canonical Ch13 IDs`() {
+        val frames = M0aStructuralTransactionProducerV1.produce(
+            transactionId = 3,
+            baseGeometryRevision = 4,
+            targetGeometryRevision = 5,
+            targetLineageRevision = 6,
+            bytes = byteArrayOf(1),
+        )
+        val kinds = frames.map { frame ->
+            M0aTransactionResponseCodecV1.encodeFrame(
+                frame = frame,
+                streamToken = 1,
+                requestSequence = 1,
+                nextExpectedRequestSequence = 2,
+            ).messageKind
+        }
+        assertEquals(listOf(2, 3, 4), kinds)
+        assertEquals(1, M0aPacketCodec.ordinaryMessageKind)
+    }
+
+    @Test
     fun `producer accepts exact request ceiling and rejects one byte over`() {
         val maximum = ByteArray(M0aPacketCodec.requestCeilingBytes)
         val frames = M0aStructuralTransactionProducerV1.produce(

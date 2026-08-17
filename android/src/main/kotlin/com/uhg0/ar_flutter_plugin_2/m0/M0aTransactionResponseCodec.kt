@@ -5,11 +5,12 @@ import java.nio.ByteOrder
 
 /** VGS2 structural BEGIN/CHUNK/COMMIT body codec shared with Dart. */
 object M0aTransactionResponseCodecV1 {
-    const val beginMessageKind = 1
-    const val chunkMessageKind = 2
-    const val commitMessageKind = 3
+    const val ordinaryMessageKind = M0aPacketCodec.ordinaryMessageKind
+    const val beginMessageKind = 2
+    const val chunkMessageKind = 3
+    const val commitMessageKind = 4
 
-    fun payloadChecksum(bytes: ByteArray): Long = crc32(bytes)
+    fun payloadChecksum(bytes: ByteArray): Long = M0aPacketCodec.crc32Payload(bytes)
 
     fun encodeFrame(
         frame: M0aTransactionFrameV1,
@@ -51,7 +52,7 @@ object M0aTransactionResponseCodecV1 {
                     .order(ByteOrder.LITTLE_ENDIAN)
                     .putInt(offset)
                     .putInt(value.bytes.size)
-                    .putInt(crc32(value.bytes).toInt())
+                    .putInt(M0aPacketCodec.crc32Payload(value.bytes).toInt())
                     .put(value.bytes)
                     .array()
                 M0aPacketCodec.Response(
@@ -119,7 +120,9 @@ object M0aTransactionResponseCodecV1 {
                 require(length > 0 && length == response.payload.size - 12)
                 require(offset <= M0aPacketCodec.requestCeilingBytes && offset <= 0xffff_ffffL - length)
                 val bytes = response.payload.copyOfRange(12, response.payload.size)
-                require(crc32(bytes) == checksum) { "CHUNK checksum is invalid" }
+                require(M0aPacketCodec.crc32Payload(bytes) == checksum) {
+                    "CHUNK checksum is invalid"
+                }
                 M0aTransactionChunkFrameV1(
                     M0aTransactionChunkV1(response.transactionId, response.chunkIndex, bytes, offset.toInt()),
                 )
@@ -139,14 +142,4 @@ object M0aTransactionResponseCodecV1 {
 
     private const val chunkStride = 1024
 
-    private fun crc32(bytes: ByteArray): Long {
-        var crc = -1
-        bytes.forEach { original ->
-            crc = crc xor (original.toInt() and 0xff)
-            repeat(8) {
-                crc = if (crc and 1 == 1) (crc ushr 1) xor 0xedb88320.toInt() else crc ushr 1
-            }
-        }
-        return (crc xor -1).toLong() and 0xffff_ffffL
-    }
 }

@@ -71,7 +71,7 @@ object M0aStructuralTransactionProducerV1 {
         require(maximumChunkBytes in 1..0xffff) { "maximumChunkBytes is outside the bounded transaction range" }
         require(bytes.size <= M0aPacketCodec.requestCeilingBytes) { "Transaction bytes exceed the request ceiling" }
         val chunkCount = if (bytes.isEmpty()) 0 else (bytes.size + maximumChunkBytes - 1) / maximumChunkBytes
-        val checksum = crc32(bytes)
+        val checksum = M0aPacketCodec.crc32Payload(bytes)
         val frames = mutableListOf<M0aTransactionFrameV1>(
             M0aTransactionBeginFrameV1(
                 M0aTransactionBeginV1(
@@ -104,14 +104,6 @@ object M0aStructuralTransactionProducerV1 {
         return frames.toList()
     }
 
-    private fun crc32(bytes: ByteArray): Long {
-        var crc = -1
-        bytes.forEach { original ->
-            crc = crc xor (original.toInt() and 0xff)
-            repeat(8) { crc = if (crc and 1 == 1) (crc ushr 1) xor 0xedb88320.toInt() else crc ushr 1 }
-        }
-        return (crc xor -1).toLong() and 0xffff_ffffL
-    }
 }
 
 /** Bounded receiver staging with atomic publication after COMMIT acknowledgement. */
@@ -191,7 +183,9 @@ class M0aStructuralTransactionReceiverV1(
                 nextChunk == current.chunkCount && stagedBytes == current.totalBytes,
         ) { "COMMIT does not match the complete staged transaction" }
         val bytes = staging.toByteArray()
-        require(crc32(bytes) == current.payloadChecksum) { "COMMIT payload checksum is invalid" }
+        require(M0aPacketCodec.crc32Payload(bytes) == current.payloadChecksum) {
+            "COMMIT payload checksum is invalid"
+        }
         pendingCommit = M0aTransactionAcknowledgementV1(
             transactionId = current.transactionId,
             geometryRevision = current.targetGeometryRevision,
@@ -263,12 +257,4 @@ class M0aStructuralTransactionReceiverV1(
         pendingCommit = null
     }
 
-    private fun crc32(bytes: ByteArray): Long {
-        var crc = -1
-        bytes.forEach { original ->
-            crc = crc xor (original.toInt() and 0xff)
-            repeat(8) { crc = if (crc and 1 == 1) (crc ushr 1) xor 0xedb88320.toInt() else crc ushr 1 }
-        }
-        return (crc xor -1).toLong() and 0xffff_ffffL
-    }
 }
