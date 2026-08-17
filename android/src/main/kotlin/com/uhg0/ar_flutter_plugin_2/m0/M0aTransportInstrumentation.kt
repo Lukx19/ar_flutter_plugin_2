@@ -11,6 +11,9 @@ import java.util.concurrent.atomic.AtomicLong
  * this class does not expose a surface-array escape hatch.
  */
 class M0aTransportInstrumentation {
+    /** Fixed M0a budgets; these are configuration observables, not pass claims. */
+    val resourceLimits = ResourceLimits()
+
     private val submittedRequests = AtomicLong()
     private val submittedRequestBytes = AtomicLong()
     private val acceptedRequests = AtomicLong()
@@ -102,6 +105,7 @@ class M0aTransportInstrumentation {
         inFlight = inFlight.get(),
         workerLatencyNanos = workerLatencyNanos.get(),
         maxWorkerLatencyNanos = maxWorkerLatencyNanos.get(),
+        resourceLimits = resourceLimits,
         allocationBytesObserved = null,
         compressionBytesObserved = 0,
         decompressionBytesObserved = 0,
@@ -125,10 +129,22 @@ class M0aTransportInstrumentation {
         val inFlight: Int,
         val workerLatencyNanos: Long,
         val maxWorkerLatencyNanos: Long,
+        val resourceLimits: ResourceLimits,
         val allocationBytesObserved: Long?,
         val compressionBytesObserved: Long,
         val decompressionBytesObserved: Long,
         val decompressionRejects: Long,
         val ordinaryRootSurfaceBytes: Long,
+    )
+
+    data class ResourceLimits(
+        val requestCeilingBytes: Int = 16 * 1024,
+        val ordinaryResponseCeilingBytes: Int = 16 * 1024,
+        val catchUpResponseCeilingBytes: Int = 64 * 1024,
+        val diagnosticSummaryBytes: Int = 1024,
+        val diagnosticSummaryRateHz: Int = 5,
+        val structuralTransactionFrames: Int = 18,
+        val structuralChunkBytes: Int = 1024,
+        val ordinaryRootSurfaceBytes: Long = 0,
     )
 }
