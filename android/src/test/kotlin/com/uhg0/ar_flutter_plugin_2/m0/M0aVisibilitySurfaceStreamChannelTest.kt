@@ -108,6 +108,26 @@ class M0aVisibilitySurfaceStreamChannelTest {
     }
 
     @Test
+    fun `binding owns structural transaction receiver through disposal`() {
+        val messenger = TestMessenger(25)
+        val binding = M0aVisibilitySurfaceStreamChannel(messenger, 25)
+        binding.structuralTransactionReceiver.begin(
+            M0aTransactionBeginV1(
+                transactionId = 1,
+                baseGeometryRevision = 1,
+                targetGeometryRevision = 2,
+                targetLineageRevision = 3,
+                chunkCount = 0,
+                totalBytes = 0,
+                payloadChecksum = 0,
+            ),
+        )
+        assertEquals(M0aStructuralTransactionState.SENDING_BEGIN, binding.structuralTransactionReceiver.state)
+        binding.dispose()
+        assertEquals(M0aStructuralTransactionState.STOPPED, binding.structuralTransactionReceiver.state)
+    }
+
+    @Test
     fun `ahead acknowledgement emits packed resync required response`() {
         val messenger = TestMessenger(26)
         val binding = M0aVisibilitySurfaceStreamChannel(messenger, 26)
@@ -139,7 +159,15 @@ class M0aVisibilitySurfaceStreamChannelTest {
             nextStyleRevision = 0,
             maximumResponseBytes = 4096,
             styleRecords = emptyList(),
-            commandBytes = byteArrayOf(4, 1),
+            commandBytes = M0aResyncCommandV1(
+                M0aResyncPayloadV1(
+                    lastCommittedTransactionId = 1,
+                    lastCommittedGeometryRevision = 0,
+                    lastCommittedLineageRevision = 0,
+                    failedTransactionId = 2,
+                    reason = M0aResyncReason.INVALID_TRANSACTION_ORDER,
+                ),
+            ).encode(),
             requestSequence = 2,
         )
         val recovered = M0aPacketCodec.decodeResponse(

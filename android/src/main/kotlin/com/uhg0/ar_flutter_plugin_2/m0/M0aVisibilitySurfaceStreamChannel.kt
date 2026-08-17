@@ -73,6 +73,11 @@ class M0aVisibilitySurfaceStreamChannel(
     @Volatile private var lastResponse: ByteArray? = null
     @Volatile private var resyncPending = false
     private val bindingAbandoned = AtomicBoolean(false)
+    private val transactionReceiver = M0aStructuralTransactionReceiverV1()
+
+    /** The bounded begin/chunk/commit seam owned by this binding. */
+    val structuralTransactionReceiver: M0aStructuralTransactionReceiverV1
+        get() = transactionReceiver
 
     private class BindingError(val errorId: Int) : IllegalArgumentException()
 
@@ -124,12 +129,14 @@ class M0aVisibilitySurfaceStreamChannel(
                                             throw BindingError(SEQUENCE_GAP_ERROR_ID)
                                         }
                                         resyncPending &&
-                                            ((request.requestFlags and RESYNC_REQUEST_FLAG) == 0 ||
-                                                request.styleRecords.isNotEmpty() ||
-                                                request.commandBytes.isEmpty()) -> {
+                                            !isValidResyncRequest(request) -> {
                                             throw BindingError(TRANSACTION_STATE_ERROR_ID)
                                         }
                                         else -> {
+                                            if (request.requestFlags and RESYNC_REQUEST_FLAG != 0 &&
+                                                !isValidResyncRequest(request)) {
+                                                throw BindingError(TRANSACTION_STATE_ERROR_ID)
+                                            }
                                             val requiresResync =
                                                 request.acknowledgedTransactionId != 0L ||
                                                     request.acknowledgedGeometryRevision != 0L ||
@@ -138,6 +145,12 @@ class M0aVisibilitySurfaceStreamChannel(
                                             val encoded = M0aPacketCodec.encodeResponse(
                                                 when {
                                                     resyncPending -> {
+                                                        if (transactionReceiver.state ==
+                                                            M0aStructuralTransactionState.RESYNC_PENDING) {
+                                                            transactionReceiver.resync(
+                                                                M0aResyncCommandV1.decode(request.commandBytes),
+                                                            )
+                                                        }
                                                         resyncPending = false
                                                         M0aPacketCodec.noChanges(
                                                             streamToken = request.streamToken,
@@ -236,6 +249,7 @@ class M0aVisibilitySurfaceStreamChannel(
         resyncPending = false
         lastSequence = null
         nextExpectedSequence = 1L
+        transactionReceiver.stop()
         clearMessageHandler()
         if (shutdownWorkerOnDispose && workerExecutor is java.util.concurrent.ExecutorService) {
             workerExecutor.shutdownNow()
@@ -253,6 +267,7 @@ class M0aVisibilitySurfaceStreamChannel(
             pendingReply.reply(workerLostResponse(bytes))
             return
         }
+        transactionReceiver.abandon()
         clearMessageHandler()
         if (shutdownWorkerOnDispose && workerExecutor is java.util.concurrent.ExecutorService) {
             workerExecutor.shutdownNow()
@@ -267,6 +282,7 @@ class M0aVisibilitySurfaceStreamChannel(
             if (ownsReply) pendingReply.reply(workerLostResponse(bytes))
             return
         }
+        transactionReceiver.abandon()
         clearMessageHandler()
         if (shutdownWorkerOnDispose && workerExecutor is java.util.concurrent.ExecutorService) {
             workerExecutor.shutdownNow()
@@ -297,6 +313,18 @@ class M0aVisibilitySurfaceStreamChannel(
                 throw IllegalStateException("Interrupted clearing binding handler.", error)
             }
         }
+    }
+
+    private fun isValidResyncRequest(request: M0aPacketCodec.Request): Boolean {
+        if (request.requestFlags != RESYNC_REQUEST_FLAG || request.styleRecords.isNotEmpty()) {
+            return false
+        }
+        val command = runCatching { M0aResyncCommandV1.decode(request.commandBytes) }
+            .getOrNull() ?: return false
+        val payload = command.payload
+        return payload.lastCommittedTransactionId == request.acknowledgedTransactionId &&
+            payload.lastCommittedGeometryRevision == request.acknowledgedGeometryRevision &&
+            payload.lastCommittedLineageRevision == request.acknowledgedLineageRevision
     }
 
     private class PendingReply(
