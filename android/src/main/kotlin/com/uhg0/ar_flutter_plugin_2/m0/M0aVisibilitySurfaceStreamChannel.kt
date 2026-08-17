@@ -71,6 +71,7 @@ class M0aVisibilitySurfaceStreamChannel(
     @Volatile private var nextExpectedSequence = 1L
     @Volatile private var lastRequest: ByteArray? = null
     @Volatile private var lastResponse: ByteArray? = null
+    @Volatile private var resyncPending = false
     private val bindingAbandoned = AtomicBoolean(false)
 
     private class BindingError(val errorId: Int) : IllegalArgumentException()
@@ -122,25 +123,43 @@ class M0aVisibilitySurfaceStreamChannel(
                                         request.requestSequence != nextExpectedSequence -> {
                                             throw BindingError(SEQUENCE_GAP_ERROR_ID)
                                         }
+                                        resyncPending &&
+                                            ((request.requestFlags and RESYNC_REQUEST_FLAG) == 0 ||
+                                                request.styleRecords.isNotEmpty() ||
+                                                request.commandBytes.isEmpty()) -> {
+                                            throw BindingError(TRANSACTION_STATE_ERROR_ID)
+                                        }
                                         else -> {
+                                            val requiresResync =
+                                                request.acknowledgedTransactionId != 0L ||
+                                                    request.acknowledgedGeometryRevision != 0L ||
+                                                    request.acknowledgedLineageRevision != 0L ||
+                                                    request.nextStyleRevision != 0L
                                             val encoded = M0aPacketCodec.encodeResponse(
-                                                if (
-                                                    request.acknowledgedTransactionId != 0L ||
-                                                        request.acknowledgedGeometryRevision != 0L ||
-                                                        request.acknowledgedLineageRevision != 0L ||
-                                                        request.nextStyleRevision != 0L
-                                                ) {
-                                                    M0aPacketCodec.resyncRequired(
-                                                        streamToken = request.streamToken,
-                                                        requestSequence = request.requestSequence,
-                                                        nextExpectedRequestSequence = request.requestSequence + 1,
-                                                    )
-                                                } else {
-                                                    M0aPacketCodec.noChanges(
-                                                        streamToken = request.streamToken,
-                                                        requestSequence = request.requestSequence,
-                                                        nextExpectedRequestSequence = request.requestSequence + 1,
-                                                    )
+                                                when {
+                                                    resyncPending -> {
+                                                        resyncPending = false
+                                                        M0aPacketCodec.noChanges(
+                                                            streamToken = request.streamToken,
+                                                            requestSequence = request.requestSequence,
+                                                            nextExpectedRequestSequence = request.requestSequence + 1,
+                                                        )
+                                                    }
+                                                    requiresResync -> {
+                                                        resyncPending = true
+                                                        M0aPacketCodec.resyncRequired(
+                                                            streamToken = request.streamToken,
+                                                            requestSequence = request.requestSequence,
+                                                            nextExpectedRequestSequence = request.requestSequence + 1,
+                                                        )
+                                                    }
+                                                    else -> {
+                                                        M0aPacketCodec.noChanges(
+                                                            streamToken = request.streamToken,
+                                                            requestSequence = request.requestSequence,
+                                                            nextExpectedRequestSequence = request.requestSequence + 1,
+                                                        )
+                                                    }
                                                 },
                                                 request.maximumResponseBytes,
                                             )
@@ -214,6 +233,7 @@ class M0aVisibilitySurfaceStreamChannel(
         bindingAbandoned.set(true)
         lastRequest = null
         lastResponse = null
+        resyncPending = false
         lastSequence = null
         nextExpectedSequence = 1L
         clearMessageHandler()
@@ -339,6 +359,8 @@ class M0aVisibilitySurfaceStreamChannel(
         const val REPLAY_CONFLICT_ERROR_ID = 30
         const val STALE_SEQUENCE_ERROR_ID = 31
         const val SEQUENCE_GAP_ERROR_ID = 32
+        const val TRANSACTION_STATE_ERROR_ID = 34
+        const val RESYNC_REQUEST_FLAG = 1 shl 2
         const val STREAM_BINDING_ABANDONED_ERROR_ID = 142
         const val WORKER_BINDING_LOST_ERROR_ID = 144
         const val DEFAULT_WORKER_TIMEOUT_MILLIS = 2_000L

@@ -123,6 +123,30 @@ class M0aVisibilitySurfaceStreamChannelTest {
         assertEquals(8, response.resultFlags)
         assertEquals(0, response.errorId)
         assertEquals(2L, response.nextExpectedRequestSequence)
+
+        val missingResync = M0aPacketCodec.decodeResponse(
+            messenger.exchange(request(sequence = 2, token = 12)),
+        )
+        assertEquals(255, missingResync.messageKind)
+        assertEquals(34, missingResync.errorId)
+
+        val resync = M0aPacketCodec.Request(
+            requestFlags = 1 shl 2,
+            streamToken = 12,
+            acknowledgedTransactionId = 1,
+            acknowledgedGeometryRevision = 0,
+            acknowledgedLineageRevision = 0,
+            nextStyleRevision = 0,
+            maximumResponseBytes = 4096,
+            styleRecords = emptyList(),
+            commandBytes = byteArrayOf(4, 1),
+            requestSequence = 2,
+        )
+        val recovered = M0aPacketCodec.decodeResponse(
+            messenger.exchange(M0aPacketCodec.encodeRequest(resync)),
+        )
+        assertEquals(0, recovered.messageKind)
+        assertEquals(2L, recovered.requestSequence)
         binding.dispose()
     }
 
