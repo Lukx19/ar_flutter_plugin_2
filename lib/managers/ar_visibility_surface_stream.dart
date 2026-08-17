@@ -1,7 +1,26 @@
+import 'dart:async';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/services.dart';
+
+/// Immutable bytes pinned for one platform invocation. The bytes remain
+/// unchanged while the invocation is in flight, including after a timeout.
+final class ARVisibilitySurfaceStreamAttempt {
+  ARVisibilitySurfaceStreamAttempt(Uint8List request)
+      : requestBytes = Uint8List.fromList(request);
+
+  final Uint8List requestBytes;
+}
+
+/// Raised when a timeout leaves the native invocation outcome unknown.
+final class ARVisibilitySurfaceStreamUnknownOutcome implements Exception {
+  const ARVisibilitySurfaceStreamUnknownOutcome();
+
+  @override
+  String toString() =>
+      'ARVisibilitySurfaceStreamUnknownOutcome: binding must be replaced.';
+}
 
 /// Worker-facing packed T2 stream. Ordinary surface bytes must stay in the
 /// worker isolate; callers receive only the response for their request.
@@ -17,19 +36,31 @@ final class ARVisibilitySurfaceStream {
 
   final BasicMessageChannel<ByteData?> _channel;
   bool _closed = false;
+  bool _abandoned = false;
   Future<void>? _inFlight;
 
   /// Sends one packed request. A second request waits for the first, keeping
   /// one outstanding binding invocation as required by chapter 8.
-  Future<Uint8List> exchange(Uint8List request) async {
+  Future<Uint8List> exchange(
+    Uint8List request, {
+    Duration? timeout,
+  }) async {
     _ensureOpen();
+    final attempt = ARVisibilitySurfaceStreamAttempt(request);
     final previous = _inFlight;
     if (previous != null) await previous;
-    final operation = _exchangeNow(request);
+    final operation = _exchangeNow(attempt.requestBytes);
     final completion = operation.then<void>((_) {});
     _inFlight = completion;
     try {
-      return await operation;
+      final response = timeout == null
+          ? await operation
+          : await operation.timeout(timeout);
+      return response;
+    } on TimeoutException {
+      _abandoned = true;
+      _inFlight = null;
+      throw const ARVisibilitySurfaceStreamUnknownOutcome();
     } finally {
       if (identical(_inFlight, completion)) _inFlight = null;
     }
@@ -45,12 +76,16 @@ final class ARVisibilitySurfaceStream {
 
   Future<void> dispose() async {
     _closed = true;
+    _abandoned = true;
     final inFlight = _inFlight;
-    if (inFlight != null) await inFlight;
+    if (inFlight != null && !_abandoned) await inFlight;
   }
 
   void _ensureOpen() {
     if (_closed) throw StateError('Visibility surface stream is disposed.');
+    if (_abandoned) {
+      throw const ARVisibilitySurfaceStreamUnknownOutcome();
+    }
   }
 }
 
