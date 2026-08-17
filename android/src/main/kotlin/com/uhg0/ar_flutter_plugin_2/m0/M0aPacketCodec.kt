@@ -171,7 +171,9 @@ object M0aPacketCodec {
         require(response.diagnostic.size <= 1024) { "Response diagnostic exceeds 1 KiB" }
         val body = response.payload + response.diagnostic
         val packetBytes = responseHeaderBytes + body.size
-        require(packetBytes <= maximumBytes) { "Response exceeds negotiated ceiling" }
+        require(packetBytes <= maximumBytes && packetBytes <= catchUpMaximumBytes) {
+            "Response exceeds negotiated or hard ceiling"
+        }
         val packet = ByteArray(packetBytes)
         val data = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
         packet.writeMagic("VGS2")

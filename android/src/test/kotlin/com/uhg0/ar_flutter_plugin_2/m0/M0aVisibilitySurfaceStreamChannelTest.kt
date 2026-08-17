@@ -72,6 +72,19 @@ class M0aVisibilitySurfaceStreamChannelTest {
         assertThrows(IllegalArgumentException::class.java) {
             M0aPacketCodec.decodeResponse(oversized)
         }
+
+        assertThrows(IllegalArgumentException::class.java) {
+            M0aPacketCodec.encodeResponse(
+                M0aPacketCodec.noChanges(
+                    streamToken = 91,
+                    requestSequence = 1,
+                    nextExpectedRequestSequence = 2,
+                ).copy(
+                    payload = ByteArray(M0aPacketCodec.catchUpMaximumBytes),
+                ),
+                M0aPacketCodec.catchUpMaximumBytes + 1,
+            )
+        }
     }
 
     @Test
