@@ -74,10 +74,19 @@ class M0aVisibilitySurfaceStreamChannel(
     @Volatile private var resyncPending = false
     private val bindingAbandoned = AtomicBoolean(false)
     private val transactionReceiver = M0aStructuralTransactionReceiverV1()
+    private val telemetry = M0aTransportInstrumentation()
 
     /** The bounded begin/chunk/commit seam owned by this binding. */
     val structuralTransactionReceiver: M0aStructuralTransactionReceiverV1
         get() = transactionReceiver
+
+    /** Numeric telemetry for this packed binding; no surface arrays are exposed. */
+    val transportInstrumentation: M0aTransportInstrumentation
+        get() = telemetry
+
+    /** Alias retained for callers that use the shorter telemetry name. */
+    val instrumentation: M0aTransportInstrumentation
+        get() = telemetry
 
     private class BindingError(val errorId: Int) : IllegalArgumentException()
 
@@ -92,12 +101,15 @@ class M0aVisibilitySurfaceStreamChannel(
                 reply.reply(null)
                 return@setMessageHandler
             }
+            telemetry.submitted(bytes.size)
+            telemetry.queued()
             val pendingReply = PendingReply(reply)
             val timeoutHandle = timeoutScheduler.schedule(workerTimeoutMillis) {
                 abandonForTimeout(pendingReply, bytes)
             }
             try {
                 workerExecutor.execute {
+                    telemetry.dequeued()
                     try {
                         val response = synchronized(this) {
                             beforeWorkerProcessing?.invoke()
@@ -120,6 +132,7 @@ class M0aVisibilitySurfaceStreamChannel(
                                             if (!lastRequest!!.contentEquals(bytes)) {
                                                 throw BindingError(REPLAY_CONFLICT_ERROR_ID)
                                             }
+                                            telemetry.replayed()
                                             lastResponse!!.copyOf()
                                         }
                                         previousSequence != null && request.requestSequence <= previousSequence -> {
@@ -180,10 +193,12 @@ class M0aVisibilitySurfaceStreamChannel(
                                             nextExpectedSequence = request.requestSequence + 1
                                             lastRequest = bytes.copyOf()
                                             lastResponse = encoded.copyOf()
+                                            telemetry.accepted(bytes.size, encoded.size)
                                             encoded
                                         }
                                     }
                                 } catch (error: BindingError) {
+                                    telemetry.rejected()
                                     val sequence = if (bytes.size >= M0aPacketCodec.requestHeaderBytes) {
                                         ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getLong(64)
                                             .coerceAtLeast(0)
@@ -196,11 +211,12 @@ class M0aVisibilitySurfaceStreamChannel(
                                             streamToken = token,
                                             requestSequence = sequence,
                                             nextExpectedRequestSequence = nextExpectedSequence,
-                                            errorId = error.errorId,
-                                        ),
+                                        errorId = error.errorId,
+                                    ),
                                         M0aPacketCodec.responseMinimumBytes,
                                     )
                                 } catch (_: Exception) {
+                                    telemetry.malformed()
                                     val sequence = if (bytes.size >= M0aPacketCodec.requestHeaderBytes) {
                                         ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getLong(64)
                                             .coerceAtLeast(0)
@@ -232,9 +248,13 @@ class M0aVisibilitySurfaceStreamChannel(
                         }
                     } catch (_: Exception) {
                         abandonForWorkerLoss(pendingReply, bytes)
+                    } finally {
+                        telemetry.completed()
                     }
                 }
             } catch (_: RejectedExecutionException) {
+                telemetry.dequeued()
+                telemetry.completed()
                 timeoutHandle.cancel()
                 abandonForWorkerLoss(pendingReply, bytes)
             }
@@ -259,6 +279,7 @@ class M0aVisibilitySurfaceStreamChannel(
 
     private fun abandonForTimeout(pendingReply: PendingReply, bytes: ByteArray) {
         if (!pendingReply.tryClaim()) return
+        telemetry.timedOut()
         if (disposed.get()) {
             pendingReply.reply(workerLostResponse(bytes))
             return
@@ -282,6 +303,7 @@ class M0aVisibilitySurfaceStreamChannel(
             if (ownsReply) pendingReply.reply(workerLostResponse(bytes))
             return
         }
+        telemetry.workerLost()
         transactionReceiver.abandon()
         clearMessageHandler()
         if (shutdownWorkerOnDispose && workerExecutor is java.util.concurrent.ExecutorService) {
