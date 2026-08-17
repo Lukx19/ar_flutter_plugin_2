@@ -124,11 +124,24 @@ class M0aVisibilitySurfaceStreamChannel(
                                         }
                                         else -> {
                                             val encoded = M0aPacketCodec.encodeResponse(
-                                                M0aPacketCodec.noChanges(
-                                                    streamToken = request.streamToken,
-                                                    requestSequence = request.requestSequence,
-                                                    nextExpectedRequestSequence = request.requestSequence + 1,
-                                                ),
+                                                if (
+                                                    request.acknowledgedTransactionId != 0L ||
+                                                        request.acknowledgedGeometryRevision != 0L ||
+                                                        request.acknowledgedLineageRevision != 0L ||
+                                                        request.nextStyleRevision != 0L
+                                                ) {
+                                                    M0aPacketCodec.resyncRequired(
+                                                        streamToken = request.streamToken,
+                                                        requestSequence = request.requestSequence,
+                                                        nextExpectedRequestSequence = request.requestSequence + 1,
+                                                    )
+                                                } else {
+                                                    M0aPacketCodec.noChanges(
+                                                        streamToken = request.streamToken,
+                                                        requestSequence = request.requestSequence,
+                                                        nextExpectedRequestSequence = request.requestSequence + 1,
+                                                    )
+                                                },
                                                 request.maximumResponseBytes,
                                             )
                                             lastSequence = request.requestSequence

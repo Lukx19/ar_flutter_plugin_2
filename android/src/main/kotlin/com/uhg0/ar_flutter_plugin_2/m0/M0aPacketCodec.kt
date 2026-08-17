@@ -264,6 +264,21 @@ object M0aPacketCodec {
         nextExpectedRequestSequence = nextExpectedRequestSequence,
     )
 
+    /** A bounded response instructing the worker to rebuild its acknowledgement baseline. */
+    fun resyncRequired(
+        streamToken: Long,
+        requestSequence: Long,
+        nextExpectedRequestSequence: Long,
+    ): Response = Response(
+        messageKind = 5,
+        responseFlags = 0,
+        resultFlags = 8,
+        errorId = 0,
+        requestSequence = requestSequence,
+        streamToken = streamToken,
+        nextExpectedRequestSequence = nextExpectedRequestSequence,
+    )
+
     fun error(
         streamToken: Long,
         requestSequence: Long,

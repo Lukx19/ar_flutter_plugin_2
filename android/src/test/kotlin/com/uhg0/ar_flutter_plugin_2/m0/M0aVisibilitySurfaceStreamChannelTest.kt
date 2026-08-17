@@ -108,6 +108,25 @@ class M0aVisibilitySurfaceStreamChannelTest {
     }
 
     @Test
+    fun `ahead acknowledgement emits packed resync required response`() {
+        val messenger = TestMessenger(26)
+        val binding = M0aVisibilitySurfaceStreamChannel(messenger, 26)
+
+        val response = M0aPacketCodec.decodeResponse(
+            messenger.exchange(
+                request(sequence = 1, token = 12).copyAcknowledgement(
+                    transaction = 1,
+                ),
+            ),
+        )
+        assertEquals(5, response.messageKind)
+        assertEquals(8, response.resultFlags)
+        assertEquals(0, response.errorId)
+        assertEquals(2L, response.nextExpectedRequestSequence)
+        binding.dispose()
+    }
+
+    @Test
     fun `binding reports sequence gap and malformed packet without crashing executor`() {
         val messenger = TestMessenger(18)
         val binding = M0aVisibilitySurfaceStreamChannel(messenger, 18)
@@ -378,6 +397,13 @@ class M0aVisibilitySurfaceStreamChannelTest {
                 requestSequence = sequence,
             ),
         )
+
+    private fun ByteArray.copyAcknowledgement(transaction: Long): ByteArray {
+        val copy = copyOf()
+        ByteBuffer.wrap(copy).order(ByteOrder.LITTLE_ENDIAN).putLong(24, transaction)
+        rewriteCrc(copy, 72)
+        return copy
+    }
 
     private fun rewriteCrc(packet: ByteArray, crcOffset: Int) {
         val data = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
