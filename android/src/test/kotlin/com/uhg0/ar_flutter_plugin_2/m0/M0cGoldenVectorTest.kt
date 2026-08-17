@@ -192,6 +192,68 @@ class M0cGoldenVectorTest {
     }
 
     @Test
+    fun `schema five decoder rejects non portable unsigned watermarks`() {
+        val packet = M0RegionShardV5.encodeCoverage(
+            region = M0RegionCoordinate(1, 2, 3),
+            captureEvaluatedThrough = 2,
+            pendingThrough = 1,
+            surfaceRows = listOf(ByteArray(56)),
+            overflowRows = listOf(ByteArray(13)),
+        )
+        ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
+            .putLong(32, Long.MIN_VALUE)
+
+        assertThrows(IllegalArgumentException::class.java) {
+            M0RegionShardV5.decode(packet)
+        }
+    }
+
+    @Test
+    fun `schema five decoder rejects a packet larger than the total shard limit`() {
+        val packet = M0RegionShardV5.encodeCoverage(
+            region = M0RegionCoordinate(1, 2, 3),
+            captureEvaluatedThrough = 2,
+            pendingThrough = 1,
+            surfaceRows = listOf(ByteArray(56)),
+            overflowRows = listOf(ByteArray(13)),
+        )
+        val oversized = ByteArray(M0RegionShardV5.maximumBytes + 1)
+        packet.copyInto(oversized)
+
+        assertThrows(IllegalArgumentException::class.java) {
+            M0RegionShardV5.decode(oversized)
+        }
+    }
+
+    @Test
+    fun `hash bound schema five resource corpus preserves bounds precedence`() {
+        val corpusBytes = resourceBytes("m0c_shard_resource_corpus_v1.json")
+        assertEquals(
+            "db975c3001f3e682958399fd9a25deb29c3fbe4333836d5fe0f3443e77fe1875",
+            sha256(corpusBytes),
+        )
+        val manifest = fixture("m0c_shard_resource_corpus_v1.json")
+        val baseVector = fixture(manifest.getValue("baseVector").jsonPrimitive.content)
+        val cases = manifest.getValue("cases").jsonArray
+        assertEquals(manifest.int("expectedCaseCount"), cases.size)
+        assertEquals(
+            manifest.getValue("expectedCaseNames").jsonArray.map { it.jsonPrimitive.content },
+            cases.map { it.jsonObject.getValue("name").jsonPrimitive.content },
+        )
+        val base = resourceBasePacket(baseVector)
+        cases.forEach { raw ->
+            val fault = raw.jsonObject
+            val malformed = applyResourceCase(
+                base,
+                fault.getValue("operation").jsonPrimitive.content,
+            )
+            assertThrows(IllegalArgumentException::class.java) {
+                M0RegionShardV5.decode(malformed)
+            }
+        }
+    }
+
+    @Test
     fun `hash bound schema five shard error corpus preserves Kotlin outcomes`() {
         val corpusBytes = resourceBytes("m0c_shard_error_corpus_v1.json")
         assertEquals(
@@ -242,6 +304,35 @@ class M0cGoldenVectorTest {
 
     private fun resourceBytes(fileName: String): ByteArray =
         requireNotNull(javaClass.classLoader?.getResourceAsStream(fileName)).readBytes()
+
+    private fun resourceBasePacket(vector: JsonObject): ByteArray {
+        val regionValues = vector.getValue("region").jsonArray.map { it.jsonPrimitive.int }
+        return M0RegionShardV5.encodeCoverage(
+            region = M0RegionCoordinate(regionValues[0], regionValues[1], regionValues[2]),
+            captureEvaluatedThrough = vector.int("captureEvaluatedThrough").toLong(),
+            pendingThrough = vector.int("pendingThrough").toLong(),
+            compression = M0RegionShardV5.Compression.ZLIB,
+            surfaceRows = listOf(ByteArray(56)),
+            overflowRows = listOf(ByteArray(13)),
+        )
+    }
+
+    private fun applyResourceCase(base: ByteArray, operation: String): ByteArray {
+        if (operation == "oversize-packet") {
+            return ByteArray(M0RegionShardV5.maximumBytes + 1).also { oversized ->
+                base.copyInto(oversized)
+            }
+        }
+        val malformed = base.copyOf()
+        val data = ByteBuffer.wrap(malformed).order(ByteOrder.LITTLE_ENDIAN)
+        when (operation) {
+            "set-capture-high-bit" -> data.putLong(32, Long.MIN_VALUE)
+            "set-pending-high-bit" -> data.putLong(40, Long.MIN_VALUE)
+            "set-stored-bytes-zero" -> data.putInt(52, 0)
+            else -> error("Unknown M0c resource operation: $operation")
+        }
+        return malformed
+    }
 
     private fun assertVector(bytes: ByteArray, spec: JsonObject) {
         assertEquals(spec.int("length"), bytes.size)

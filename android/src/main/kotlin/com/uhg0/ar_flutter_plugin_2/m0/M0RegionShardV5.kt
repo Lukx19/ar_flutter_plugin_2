@@ -12,6 +12,7 @@ import java.util.zip.Inflater
 object M0RegionShardV5 {
     const val headerBytes = 96
     const val maximumBytes = 16 * 1024 * 1024
+    const val maximumPayloadBytes = maximumBytes - headerBytes
 
     enum class Kind { CANONICAL, COVERAGE }
     enum class Compression { NONE, ZLIB }
@@ -88,8 +89,8 @@ object M0RegionShardV5 {
         require(surfaceCount <= 100_000)
         require(kind != Kind.COVERAGE || overflow <= surfaceCount * 24)
         require(surfaceCount * surfaceWidth + secondaryCount * secondaryWidth.toLong() == decodedBytes)
-        require(storedBytes == bytes.size.toLong() - headerBytes && storedBytes <= maximumBytes.toLong())
-        require(decodedBytes <= maximumBytes.toLong())
+        require(storedBytes == bytes.size.toLong() - headerBytes && storedBytes <= maximumPayloadBytes.toLong())
+        require(decodedBytes <= maximumPayloadBytes.toLong())
         require(MessageDigest.isEqual(sha256(bytes.copyOfRange(headerBytes, bytes.size)), bytes.copyOfRange(64, 96)))
         val decoded = decodePayload(bytes.copyOfRange(headerBytes, bytes.size), compression, decodedBytes.toInt())
         var offset = 0
@@ -135,9 +136,9 @@ object M0RegionShardV5 {
         require(secondaryRows.all { it.size == secondaryWidth })
         val decoded = surfaceRows.flatMap { it.asIterable() }.toByteArray() +
             secondaryRows.flatMap { it.asIterable() }.toByteArray()
-        require(decoded.size <= maximumBytes)
+        require(decoded.size <= maximumPayloadBytes)
         val stored = if (compression == Compression.NONE) decoded else zlibEncode(decoded)
-        require(stored.size <= maximumBytes)
+        require(stored.size <= maximumPayloadBytes)
         require(decoded.isEmpty() || decoded.size <= maxOf(4096, stored.size * 64))
         val result = ByteArray(headerBytes + stored.size)
         val data = ByteBuffer.wrap(result).order(ByteOrder.LITTLE_ENDIAN)

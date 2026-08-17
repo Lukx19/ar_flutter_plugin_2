@@ -1,0 +1,39 @@
+{
+  "format": "m0c_shard_resource_corpus_v1",
+  "status": "hash-bound-synthetic-boundary",
+  "baseVector": "m0c_golden_vector_v1.json",
+  "baseVectorSha256": "6f453800e077cf110f2043fcc1e1e67a5d588113310502ad27a5f29c2e7ca3c5",
+  "expectedCaseCount": 4,
+  "expectedCaseNames": [
+    "capture-watermark-high-bit",
+    "pending-watermark-high-bit",
+    "declared-stored-bytes-mismatch",
+    "packet-total-overflow"
+  ],
+  "cases": [
+    {
+      "name": "capture-watermark-high-bit",
+      "operation": "set-capture-high-bit",
+      "outcome": "reject",
+      "errorClass": "bounds"
+    },
+    {
+      "name": "pending-watermark-high-bit",
+      "operation": "set-pending-high-bit",
+      "outcome": "reject",
+      "errorClass": "bounds"
+    },
+    {
+      "name": "declared-stored-bytes-mismatch",
+      "operation": "set-stored-bytes-zero",
+      "outcome": "reject",
+      "errorClass": "bounds"
+    },
+    {
+      "name": "packet-total-overflow",
+      "operation": "oversize-packet",
+      "outcome": "reject",
+      "errorClass": "length"
+    }
+  ]
+}
