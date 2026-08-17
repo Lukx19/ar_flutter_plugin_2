@@ -60,4 +60,29 @@ void main() {
     await stream.dispose();
     channel.setMockMessageHandler(null);
   });
+
+  test('dispose waits for an accepted invocation before returning', () async {
+    final pending = Completer<ByteData?>();
+    final channel = BasicMessageChannel<ByteData?>(
+      'visibility_surface_stream_dispose_wait',
+      const BinaryCodec(),
+    );
+    channel.setMockMessageHandler((_) => pending.future);
+
+    final stream = ARVisibilitySurfaceStream(0, channel: channel);
+    final exchange = stream.exchange(Uint8List.fromList(<int>[1]));
+    await Future<void>.delayed(Duration.zero);
+
+    var disposed = false;
+    final dispose = stream.dispose().then<void>((_) => disposed = true);
+    await Future<void>.delayed(Duration.zero);
+    expect(disposed, isFalse);
+
+    pending.complete(ByteData.sublistView(Uint8List.fromList(<int>[2])));
+    expect(await exchange, orderedEquals(<int>[2]));
+    await dispose;
+    expect(disposed, isTrue);
+
+    channel.setMockMessageHandler(null);
+  });
 }

@@ -78,7 +78,12 @@ final class ARVisibilitySurfaceStream {
     _closed = true;
     _abandoned = true;
     final inFlight = _inFlight;
-    if (inFlight != null && !_abandoned) await inFlight;
+    // Marking the binding abandoned fences new calls, but an invocation that
+    // was already accepted still owns a native reply. Wait for that reply so
+    // platform-view teardown cannot race the serial worker. A timed-out
+    // attempt clears `_inFlight`, so disposal remains bounded after the
+    // unknown-outcome fence.
+    if (inFlight != null) await inFlight;
   }
 
   void _ensureOpen() {
