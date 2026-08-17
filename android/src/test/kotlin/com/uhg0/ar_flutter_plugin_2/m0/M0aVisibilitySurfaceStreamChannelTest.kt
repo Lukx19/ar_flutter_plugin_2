@@ -136,6 +136,37 @@ class M0aVisibilitySurfaceStreamChannelTest {
     }
 
     @Test
+    fun `serial worker pull delivers queued structural frames and replays exactly`() {
+        val messenger = TestMessenger(27)
+        val binding = M0aVisibilitySurfaceStreamChannel(messenger, 27)
+        val frames = M0aStructuralTransactionProducerV1.produce(
+            transactionId = 3,
+            baseGeometryRevision = 4,
+            targetGeometryRevision = 5,
+            targetLineageRevision = 6,
+            bytes = byteArrayOf(1, 2, 3, 4, 5),
+            maximumChunkBytes = 1024,
+        )
+        binding.queueStructuralTransaction(frames)
+
+        val responses = frames.indices.map { index ->
+            messenger.exchange(request(sequence = index.toLong() + 1, token = 27))
+        }
+        responses.forEachIndexed { index, packet ->
+            val response = M0aPacketCodec.decodeResponse(packet)
+            val frame = M0aTransactionResponseCodecV1.decodeFrame(response)
+            assertEquals(frames[index]::class, frame::class)
+            assertEquals(index.toLong() + 1, response.requestSequence)
+        }
+        assertArrayEquals(
+            responses.last(),
+            messenger.exchange(request(sequence = responses.size.toLong(), token = 27)),
+        )
+        assertEquals(1L, binding.transportInstrumentation.snapshot().replayedRequests)
+        binding.dispose()
+    }
+
+    @Test
     fun `ahead acknowledgement emits packed resync required response`() {
         val messenger = TestMessenger(26)
         val binding = M0aVisibilitySurfaceStreamChannel(messenger, 26)

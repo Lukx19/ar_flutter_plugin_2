@@ -14,6 +14,7 @@ import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.ArrayDeque
 
 /** Small seam so lifecycle deadlines are deterministic in the JVM corpus. */
 fun interface M0aTimeoutHandle {
@@ -75,6 +76,7 @@ class M0aVisibilitySurfaceStreamChannel(
     private val bindingAbandoned = AtomicBoolean(false)
     private val transactionReceiver = M0aStructuralTransactionReceiverV1()
     private val telemetry = M0aTransportInstrumentation()
+    private val structuralFrames = ArrayDeque<M0aTransactionFrameV1>()
 
     /** The bounded begin/chunk/commit seam owned by this binding. */
     val structuralTransactionReceiver: M0aStructuralTransactionReceiverV1
@@ -87,6 +89,21 @@ class M0aVisibilitySurfaceStreamChannel(
     /** Alias retained for callers that use the shorter telemetry name. */
     val instrumentation: M0aTransportInstrumentation
         get() = telemetry
+
+    /**
+     * Queues one bounded structural transaction for worker-pull delivery.
+     * Frames are consumed only after their response is encoded and accepted;
+     * an exact request replay therefore never advances the producer.
+     */
+    fun queueStructuralTransaction(frames: List<M0aTransactionFrameV1>) {
+        require(frames.isNotEmpty()) { "A structural transaction cannot be empty" }
+        synchronized(this) {
+            check(!disposed.get() && !bindingAbandoned.get()) { "Binding is abandoned" }
+            check(structuralFrames.isEmpty()) { "A structural transaction is already queued" }
+            validateStructuralTransaction(frames)
+            frames.forEach { structuralFrames.addLast(it) }
+        }
+    }
 
     private class BindingError(val errorId: Int) : IllegalArgumentException()
 
@@ -180,11 +197,7 @@ class M0aVisibilitySurfaceStreamChannel(
                                                         )
                                                     }
                                                     else -> {
-                                                        M0aPacketCodec.noChanges(
-                                                            streamToken = request.streamToken,
-                                                            requestSequence = request.requestSequence,
-                                                            nextExpectedRequestSequence = request.requestSequence + 1,
-                                                        )
+                                                        nextStructuralResponse(request)
                                                     }
                                                 },
                                                 request.maximumResponseBytes,
@@ -269,6 +282,7 @@ class M0aVisibilitySurfaceStreamChannel(
         resyncPending = false
         lastSequence = null
         nextExpectedSequence = 1L
+        synchronized(this) { structuralFrames.clear() }
         transactionReceiver.stop()
         clearMessageHandler()
         if (shutdownWorkerOnDispose && workerExecutor is java.util.concurrent.ExecutorService) {
@@ -349,6 +363,56 @@ class M0aVisibilitySurfaceStreamChannel(
             payload.lastCommittedLineageRevision == request.acknowledgedLineageRevision
     }
 
+    private fun nextStructuralResponse(request: M0aPacketCodec.Request): M0aPacketCodec.Response {
+        synchronized(this) {
+            val frame = structuralFrames.peekFirst()
+                ?: return M0aPacketCodec.noChanges(
+                    streamToken = request.streamToken,
+                    requestSequence = request.requestSequence,
+                    nextExpectedRequestSequence = request.requestSequence + 1,
+                )
+            val response = M0aTransactionResponseCodecV1.encodeFrame(
+                frame = frame,
+                streamToken = request.streamToken,
+                requestSequence = request.requestSequence,
+                nextExpectedRequestSequence = request.requestSequence + 1,
+            )
+            // The caller encodes this response under the negotiated ceiling
+            // before returning. Only then is the producer advanced.
+            val encoded = M0aPacketCodec.encodeResponse(response, request.maximumResponseBytes)
+            check(encoded.isNotEmpty())
+            structuralFrames.removeFirst()
+            return response
+        }
+    }
+
+    private fun validateStructuralTransaction(frames: List<M0aTransactionFrameV1>) {
+        require(frames.size <= MAX_STRUCTURAL_FRAMES) { "Structural transaction is too large" }
+        val begin = (frames.firstOrNull() as? M0aTransactionBeginFrameV1)?.value
+            ?: error("Structural transaction must begin with BEGIN")
+        val commit = (frames.lastOrNull() as? M0aTransactionCommitFrameV1)?.value
+            ?: error("Structural transaction must end with COMMIT")
+        require(begin.transactionId > 0 && commit.transactionId == begin.transactionId)
+        require(frames.size == begin.chunkCount + 2)
+        require(begin.totalBytes in 0..M0aPacketCodec.requestCeilingBytes)
+        require(begin.chunkCount in 0..0xffff)
+        var totalBytes = 0
+        frames.drop(1).dropLast(1).forEachIndexed { index, frame ->
+            val chunk = (frame as? M0aTransactionChunkFrameV1)?.value
+                ?: error("Structural transaction contains a non-CHUNK frame")
+            require(chunk.transactionId == begin.transactionId && chunk.chunkIndex == index)
+            require(chunk.bytes.isNotEmpty())
+            require(chunk.offset == null || chunk.offset == totalBytes)
+            totalBytes += chunk.bytes.size
+            require(totalBytes <= begin.totalBytes)
+        }
+        require(totalBytes == begin.totalBytes)
+        require(commit.payloadChecksum == begin.payloadChecksum)
+        require(M0aTransactionResponseCodecV1.payloadChecksum(
+            frames.drop(1).dropLast(1).flatMap { (it as M0aTransactionChunkFrameV1).value.bytes.toList() }.toByteArray(),
+        ) == begin.payloadChecksum)
+    }
+
     private class PendingReply(
         private val callback: BasicMessageChannel.Reply<ByteBuffer>,
     ) {
@@ -415,5 +479,6 @@ class M0aVisibilitySurfaceStreamChannel(
         const val WORKER_BINDING_LOST_ERROR_ID = 144
         const val DEFAULT_WORKER_TIMEOUT_MILLIS = 2_000L
         const val MAIN_HANDLER_CLEAR_TIMEOUT_MILLIS = 2_000L
+        const val MAX_STRUCTURAL_FRAMES = 18
     }
 }

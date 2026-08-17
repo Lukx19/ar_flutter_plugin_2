@@ -35,6 +35,9 @@ class M0aTransactionReferenceTest {
         assertThrows(IllegalArgumentException::class.java) {
             receiver.chunk(M0aTransactionChunkV1(7, 1, byteArrayOf(1)))
         }
+        assertThrows(IllegalArgumentException::class.java) {
+            receiver.chunk(M0aTransactionChunkV1(7, 0, byteArrayOf(1), 1))
+        }
         receiver.chunk(M0aTransactionChunkV1(7, 0, byteArrayOf(1, 2)))
         receiver.chunk(M0aTransactionChunkV1(7, 1, byteArrayOf(3, 4)))
         assertThrows(IllegalArgumentException::class.java) {
@@ -83,6 +86,49 @@ class M0aTransactionReferenceTest {
         assertEquals(0, (frames[1] as M0aTransactionChunkFrameV1).value.chunkIndex)
         assertArrayEquals(byteArrayOf(3, 4), (frames[2] as M0aTransactionChunkFrameV1).value.bytes)
         assertTrue(frames[4] is M0aTransactionCommitFrameV1)
+    }
+
+    @Test
+    fun `structural frames round trip through the packed response envelope`() {
+        val frames = M0aStructuralTransactionProducerV1.produce(
+            transactionId = 3,
+            baseGeometryRevision = 4,
+            targetGeometryRevision = 5,
+            targetLineageRevision = 6,
+            bytes = byteArrayOf(1, 2, 3, 4, 5),
+            maximumChunkBytes = 1024,
+        )
+        frames.forEachIndexed { index, frame ->
+            val encoded = M0aPacketCodec.encodeResponse(
+                M0aTransactionResponseCodecV1.encodeFrame(
+                    frame = frame,
+                    streamToken = 91,
+                    requestSequence = index.toLong() + 1,
+                    nextExpectedRequestSequence = index.toLong() + 2,
+                ),
+                M0aPacketCodec.responseMaximumBytes,
+            )
+            val decoded = M0aTransactionResponseCodecV1.decodeFrame(
+                M0aPacketCodec.decodeResponse(encoded),
+            )
+            when (frame) {
+                is M0aTransactionBeginFrameV1 -> {
+                    val actual = decoded as M0aTransactionBeginFrameV1
+                    assertEquals(frame.value, actual.value)
+                }
+                is M0aTransactionChunkFrameV1 -> {
+                    val actual = decoded as M0aTransactionChunkFrameV1
+                    assertEquals(frame.value.transactionId, actual.value.transactionId)
+                    assertEquals(frame.value.chunkIndex, actual.value.chunkIndex)
+                    assertEquals(frame.value.offset, actual.value.offset)
+                    assertArrayEquals(frame.value.bytes, actual.value.bytes)
+                }
+                is M0aTransactionCommitFrameV1 -> {
+                    val actual = decoded as M0aTransactionCommitFrameV1
+                    assertEquals(frame.value, actual.value)
+                }
+            }
+        }
     }
 
     private fun begin(bytes: ByteArray) = M0aTransactionBeginV1(

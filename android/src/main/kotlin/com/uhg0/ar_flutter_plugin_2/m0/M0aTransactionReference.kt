@@ -31,11 +31,13 @@ data class M0aTransactionChunkV1(
     val transactionId: Long,
     val chunkIndex: Int,
     val bytes: ByteArray,
+    val offset: Int? = null,
 ) {
     override fun equals(other: Any?): Boolean = other is M0aTransactionChunkV1 &&
-        transactionId == other.transactionId && chunkIndex == other.chunkIndex && bytes.contentEquals(other.bytes)
+        transactionId == other.transactionId && chunkIndex == other.chunkIndex &&
+            offset == other.offset && bytes.contentEquals(other.bytes)
 
-    override fun hashCode(): Int = 31 * (31 * transactionId.hashCode() + chunkIndex) + bytes.contentHashCode()
+    override fun hashCode(): Int = 31 * (31 * (31 * transactionId.hashCode() + chunkIndex) + offset.hashCode()) + bytes.contentHashCode()
 }
 
 data class M0aTransactionCommitV1(
@@ -88,7 +90,12 @@ object M0aStructuralTransactionProducerV1 {
         while (offset < bytes.size) {
             val end = minOf(offset + maximumChunkBytes, bytes.size)
             frames += M0aTransactionChunkFrameV1(
-                M0aTransactionChunkV1(transactionId, index, bytes.copyOfRange(offset, end)),
+                M0aTransactionChunkV1(
+                    transactionId,
+                    index,
+                    bytes.copyOfRange(offset, end),
+                    offset,
+                ),
             )
             offset = end
             index++
@@ -130,6 +137,7 @@ class M0aStructuralTransactionReceiverV1(
     private var begin: M0aTransactionBeginV1? = null
     private var staging = ByteArrayOutputStream()
     private var nextChunk = 0
+    private var nextChunkOffset = 0
     private var pendingCommit: M0aTransactionAcknowledgementV1? = null
     private var lastAcknowledgement: M0aTransactionAcknowledgementV1? = null
     private var visible = byteArrayOf()
@@ -140,6 +148,7 @@ class M0aStructuralTransactionReceiverV1(
         begin = value
         staging = ByteArrayOutputStream(value.totalBytes)
         nextChunk = 0
+        nextChunkOffset = 0
         state = M0aStructuralTransactionState.SENDING_BEGIN
     }
 
@@ -157,7 +166,11 @@ class M0aStructuralTransactionReceiverV1(
     fun chunk(value: M0aTransactionChunkV1) {
         requireState(M0aStructuralTransactionState.SENDING_CHUNKS)
         val current = requireNotNull(begin)
-        require(value.transactionId == current.transactionId && value.chunkIndex == nextChunk) {
+        require(
+            value.transactionId == current.transactionId &&
+                value.chunkIndex == nextChunk &&
+                (value.offset == null || value.offset == nextChunkOffset),
+        ) {
             "Chunk transaction identity or ordinal is invalid"
         }
         require(value.bytes.isNotEmpty()) { "Chunk must not be empty" }
@@ -166,6 +179,7 @@ class M0aStructuralTransactionReceiverV1(
         }
         staging.write(value.bytes)
         nextChunk++
+        nextChunkOffset += value.bytes.size
     }
 
     fun commit(value: M0aTransactionCommitV1) {
@@ -245,6 +259,7 @@ class M0aStructuralTransactionReceiverV1(
         begin = null
         staging = ByteArrayOutputStream()
         nextChunk = 0
+        nextChunkOffset = 0
         pendingCommit = null
     }
 
