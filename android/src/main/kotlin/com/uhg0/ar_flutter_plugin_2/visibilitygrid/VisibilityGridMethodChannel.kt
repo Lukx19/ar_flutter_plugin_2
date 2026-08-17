@@ -7,8 +7,8 @@ import com.google.ar.core.Frame
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.NotYetAvailableException
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlCodec
+import com.uhg0.ar_flutter_plugin_2.m0.M0aControlLifecycle
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlOperation
-import com.uhg0.ar_flutter_plugin_2.m0.M0aControlResponse
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
@@ -58,8 +58,7 @@ class VisibilityGridMethodChannel(
         LatestRawPointRenderHandoff<CoveragePointRenderSnapshot>()
     private var rawPointSnapshotPublished = false
     private var healthHeartbeatGeneration = 0L
-    private var lastM0aControlRequest: ByteArray? = null
-    private var lastM0aControlResponse: ByteArray? = null
+    private val m0aControlLifecycle = M0aControlLifecycle()
 
     init {
         channel.setMethodCallHandler(this)
@@ -269,8 +268,6 @@ class VisibilityGridMethodChannel(
             grid = null
             group = null
             checkpointBarrierActive = false
-            lastM0aControlRequest = null
-            lastM0aControlResponse = null
         }
         checkpointResult?.error(
             "VG_NOT_INITIALIZED",
@@ -303,39 +300,7 @@ class VisibilityGridMethodChannel(
                     if (disposed) return@synchronized null
                     val request = M0aControlCodec.decodeRequest(bytes)
                     require(request.operation == operation) { "Control method and operation differ" }
-                    val previous = lastM0aControlRequest
-                    if (previous != null && previous.contentEquals(bytes)) {
-                        return@synchronized lastM0aControlResponse!!.copyOf()
-                    }
-                    require(
-                        previous == null ||
-                            request.controlRequestId !=
-                                M0aControlCodec.decodeRequest(previous).controlRequestId,
-                    ) { "Control request replay conflict" }
-                    val encoded = M0aControlCodec.encodeResponse(
-                        M0aControlResponse(
-                            operation = request.operation,
-                            outcome = 0,
-                            resultFlags = 0,
-                            errorId = 0,
-                            controlRequestId = request.controlRequestId,
-                            sessionId = request.sessionId,
-                            captureGroupId = request.captureGroupId,
-                            sessionGeneration = request.sessionGeneration,
-                            groupGeneration = request.groupGeneration,
-                            coverageEpoch = request.coverageEpoch,
-                            streamToken = if (request.operation == M0aControlOperation.START) {
-                                1
-                            } else {
-                                request.streamToken
-                            },
-                            nextExchangeRequestSequence = 1,
-                            nativeTransactionId = 0,
-                        ),
-                        M0aControlCodec.hardCeilingBytes,
-                    )
-                    lastM0aControlRequest = bytes.copyOf()
-                    lastM0aControlResponse = encoded.copyOf()
+                    val encoded = m0aControlLifecycle.handle(request, bytes)
                     encoded
                 }
                 if (response == null) {
