@@ -289,6 +289,10 @@ object M0aControlCodec {
 
     private fun validateResponse(response: M0aControlResponse) {
         require(response.outcome in 0..1 && response.resultFlags in 0..0x1f)
+        require(
+            if (response.outcome == 0) response.errorId == 0
+            else response.errorId in 1..150,
+        )
         require(response.errorId in 0..0xffff && response.diagnostic.size <= 256)
         validateOrdinal(response.sessionGeneration, "sessionGeneration")
         validateOrdinal(response.groupGeneration, "groupGeneration")
