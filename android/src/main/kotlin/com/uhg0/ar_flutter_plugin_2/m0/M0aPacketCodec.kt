@@ -12,7 +12,6 @@ object M0aPacketCodec {
     const val responseMaximumBytes = 16 * 1024
     const val catchUpMaximumBytes = 64 * 1024
     const val styleRecordBytes = 8
-    const val ordinaryMessageKind = 1
 
     data class Request(
         val requestFlags: Int,
@@ -255,14 +254,16 @@ object M0aPacketCodec {
         streamToken: Long,
         requestSequence: Long,
         nextExpectedRequestSequence: Long,
+        acceptedStyleRevision: Long = 0,
     ): Response = Response(
-        messageKind = ordinaryMessageKind,
+        messageKind = 0,
         responseFlags = 0,
         resultFlags = 0,
         errorId = 0,
         requestSequence = requestSequence,
         streamToken = streamToken,
         nextExpectedRequestSequence = nextExpectedRequestSequence,
+        acceptedStyleRevision = acceptedStyleRevision,
     )
 
     /** A bounded response instructing the worker to rebuild its acknowledgement baseline. */
@@ -318,7 +319,7 @@ object M0aPacketCodec {
     }
 
     private fun validateResponse(response: Response) {
-        require(response.messageKind in setOf(1, 2, 3, 4, 5, 255)) {
+        require(response.messageKind in setOf(0, 1, 2, 3, 4, 5, 255)) {
             "Response message kind is invalid"
         }
         require(response.responseFlags in 0..0x1f) {

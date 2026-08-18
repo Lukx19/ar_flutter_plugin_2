@@ -194,10 +194,56 @@ class M0aVisibilitySurfaceStreamChannelTest {
         assertEquals(255, stale.messageKind)
         assertEquals(4, stale.errorId)
         val accepted = M0aPacketCodec.decodeResponse(messenger.exchange(request(1, 1)))
-        assertEquals(M0aPacketCodec.ordinaryMessageKind, accepted.messageKind)
-        assertTrue(lifecycle.acceptsStreamToken(1))
+        assertEquals(0, accepted.messageKind)
         binding.dispose()
         executor.shutdownNow()
+    }
+
+    @Test
+    fun `stream adopts the baseline carried by the shared control lifecycle`() {
+        val lifecycle = M0aControlLifecycle(
+            initialCommittedBaseline = M0aCommittedBaselineV1(9, 10, 11, 12),
+        )
+        val start = controlRequest(M0aControlOperation.START, 0, 1)
+        lifecycle.handle(start, M0aControlCodec.encodeRequest(start))
+        val messenger = TestMessenger(32)
+        val binding = M0aVisibilitySurfaceStreamChannel(
+            messenger = messenger,
+            viewId = 32,
+            controlLifecycle = lifecycle,
+        )
+        val response = M0aPacketCodec.decodeResponse(
+            messenger.exchange(
+                request(
+                    sequence = 1,
+                    token = 1,
+                    acknowledgedTransaction = 9,
+                    acknowledgedGeometry = 10,
+                    acknowledgedLineage = 11,
+                    styleRevision = 13,
+                ),
+            ),
+        )
+        assertEquals(0, response.messageKind)
+        binding.dispose()
+    }
+
+    @Test
+    fun `empty acknowledgement is fenced against a restored baseline`() {
+        val messenger = TestMessenger(33)
+        val binding = M0aVisibilitySurfaceStreamChannel(messenger, 33)
+        binding.setCommittedBaseline(9, 10, 11, 12)
+        val response = M0aPacketCodec.decodeResponse(
+            messenger.exchange(
+                request(
+                    sequence = 1,
+                    token = 33,
+                    styleRevision = 13,
+                ),
+            ),
+        )
+        assertEquals(5, response.messageKind)
+        binding.dispose()
     }
 
     @Test
@@ -213,11 +259,11 @@ class M0aVisibilitySurfaceStreamChannelTest {
                     acknowledgedTransaction = 9,
                     acknowledgedGeometry = 10,
                     acknowledgedLineage = 11,
-                    styleRevision = 12,
+                    styleRevision = 13,
                 ),
             ),
         )
-        assertEquals(M0aPacketCodec.ordinaryMessageKind, restoredResponse.messageKind)
+        assertEquals(0, restoredResponse.messageKind)
         restoredBinding.dispose()
 
         val messenger = TestMessenger(29)
@@ -245,7 +291,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
                 ),
             ),
         )
-        assertEquals(M0aPacketCodec.ordinaryMessageKind, restored.messageKind)
+        assertEquals(0, restored.messageKind)
         val mismatched = M0aPacketCodec.decodeResponse(
             messenger.exchange(
                 request(
@@ -258,6 +304,23 @@ class M0aVisibilitySurfaceStreamChannelTest {
             ),
         )
         assertEquals(5, mismatched.messageKind)
+        binding.dispose()
+    }
+
+    @Test
+    fun `style acknowledgement is checked independently from structural baseline`() {
+        val messenger = TestMessenger(31)
+        val binding = M0aVisibilitySurfaceStreamChannel(messenger, 31)
+        binding.setCommittedBaseline(0, 0, 0, 4)
+        val adjacent = M0aPacketCodec.decodeResponse(
+            messenger.exchange(request(sequence = 1, token = 31, styleRevision = 5)),
+        )
+        assertEquals(0, adjacent.messageKind)
+        assertEquals(4, adjacent.acceptedStyleRevision)
+        val mismatch = M0aPacketCodec.decodeResponse(
+            messenger.exchange(request(sequence = 2, token = 31, styleRevision = 7)),
+        )
+        assertEquals(5, mismatch.messageKind)
         binding.dispose()
     }
 
@@ -307,7 +370,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
         val recovered = M0aPacketCodec.decodeResponse(
             messenger.exchange(M0aPacketCodec.encodeRequest(resync)),
         )
-        assertEquals(M0aPacketCodec.ordinaryMessageKind, recovered.messageKind)
+        assertEquals(0, recovered.messageKind)
         assertEquals(2L, recovered.requestSequence)
         binding.dispose()
     }
@@ -330,8 +393,8 @@ class M0aVisibilitySurfaceStreamChannelTest {
         assertEquals(6, malformedResponse.errorId)
 
         val accepted = messenger.exchange(request(sequence = 1, token = 4))
-        assertEquals(M0aPacketCodec.ordinaryMessageKind, M0aPacketCodec.decodeResponse(accepted).messageKind)
-        assertEquals(M0aPacketCodec.ordinaryMessageKind, M0aPacketCodec.decodeResponse(messenger.exchange(request(sequence = 2, token = 4))).messageKind)
+        assertEquals(0, M0aPacketCodec.decodeResponse(accepted).messageKind)
+        assertEquals(0, M0aPacketCodec.decodeResponse(messenger.exchange(request(sequence = 2, token = 4))).messageKind)
         val stale = M0aPacketCodec.decodeResponse(messenger.exchange(request(sequence = 1, token = 5)))
         assertEquals(255, stale.messageKind)
         assertEquals(31, stale.errorId)
@@ -348,7 +411,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
 
         val replacement = M0aVisibilitySurfaceStreamChannel(messenger, 19)
         val response = messenger.exchange(request(sequence = 1, token = 5))
-        assertEquals(M0aPacketCodec.ordinaryMessageKind, M0aPacketCodec.decodeResponse(response).messageKind)
+        assertEquals(0, M0aPacketCodec.decodeResponse(response).messageKind)
         replacement.dispose()
     }
 
@@ -374,7 +437,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
         val recovered = M0aPacketCodec.decodeResponse(
             messenger.exchange(request(sequence = 1, token = 6)),
         )
-        assertEquals(M0aPacketCodec.ordinaryMessageKind, recovered.messageKind)
+        assertEquals(0, recovered.messageKind)
         replacement.dispose()
     }
 
@@ -406,7 +469,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
         val recovered = M0aPacketCodec.decodeResponse(
             messenger.exchange(request(sequence = 1, token = 10)),
         )
-        assertEquals(M0aPacketCodec.ordinaryMessageKind, recovered.messageKind)
+        assertEquals(0, recovered.messageKind)
         replacement.dispose()
     }
 
@@ -514,7 +577,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
         val recovered = M0aPacketCodec.decodeResponse(
             messenger.exchange(request(sequence = 1, token = 8)),
         )
-        assertEquals(M0aPacketCodec.ordinaryMessageKind, recovered.messageKind)
+        assertEquals(0, recovered.messageKind)
         replacement.dispose()
     }
 

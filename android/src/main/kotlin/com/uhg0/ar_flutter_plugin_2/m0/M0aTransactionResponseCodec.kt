@@ -5,7 +5,6 @@ import java.nio.ByteOrder
 
 /** VGS2 structural BEGIN/CHUNK/COMMIT body codec shared with Dart. */
 object M0aTransactionResponseCodecV1 {
-    const val ordinaryMessageKind = M0aPacketCodec.ordinaryMessageKind
     const val beginMessageKind = 2
     const val chunkMessageKind = 3
     const val commitMessageKind = 4

@@ -149,7 +149,6 @@ class M0aTransactionReferenceTest {
             ).messageKind
         }
         assertEquals(listOf(2, 3, 4), kinds)
-        assertEquals(1, M0aPacketCodec.ordinaryMessageKind)
     }
 
     @Test

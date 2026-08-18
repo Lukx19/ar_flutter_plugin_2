@@ -148,7 +148,7 @@ class M0aFaultCorpusTest {
         }
 
         val response = M0aPacketCodec.Response(
-            messageKind = M0aPacketCodec.ordinaryMessageKind,
+            messageKind = 0,
             responseFlags = 0,
             resultFlags = 0,
             errorId = 0,

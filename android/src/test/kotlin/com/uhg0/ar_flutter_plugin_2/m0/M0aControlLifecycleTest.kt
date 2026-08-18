@@ -19,6 +19,22 @@ class M0aControlLifecycleTest {
     }
 
     @Test
+    fun `start receipt carries the authoritative restored committed baseline`() {
+        val lifecycle = M0aControlLifecycle(
+            initialCommittedBaseline = M0aCommittedBaselineV1(9, 10, 11, 12),
+        )
+        val start = request(M0aControlOperation.START, 0, 1)
+        val response = M0aControlCodec.decodeResponse(
+            lifecycle.handle(start, M0aControlCodec.encodeRequest(start)),
+        )
+        assertEquals(9L, response.nativeTransactionId)
+        assertEquals(
+            M0aCommittedBaselineV1(9, 10, 11, 12),
+            M0aCommittedBaselineV1.decode(response.payload),
+        )
+    }
+
+    @Test
     fun `checkpoint and stop require active token and stale token is fenced`() {
         val lifecycle = M0aControlLifecycle()
         val start = request(M0aControlOperation.START, 0, 1)
