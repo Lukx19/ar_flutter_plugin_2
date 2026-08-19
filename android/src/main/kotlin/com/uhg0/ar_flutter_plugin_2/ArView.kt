@@ -31,7 +31,7 @@ import com.uhg0.ar_flutter_plugin_2.sceneview.resolveNodeUri
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridMethodChannel
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridRuntimeCapabilities
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlLifecycle
-import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineV1
+import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineAuthority
 import com.uhg0.ar_flutter_plugin_2.m0.M0aVisibilitySurfaceStreamChannel
 import com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraCapabilityQuerier
 import io.flutter.FlutterInjector
@@ -56,7 +56,7 @@ internal class ArView(
     id: Int,
     initialSessionFeatures: Set<Session.Feature> = emptySet(),
     requestedRearCameraId: String? = null,
-    initialM0aCommittedBaseline: M0aCommittedBaselineV1 = M0aCommittedBaselineV1.ZERO,
+    m0aCommittedBaselineAuthority: M0aCommittedBaselineAuthority,
 ) : PlatformView {
     private val root = FrameLayout(context)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -100,7 +100,7 @@ internal class ArView(
     // become observable product behavior.
     private var m0aSurfaceStreamChannel: M0aVisibilitySurfaceStreamChannel? = null
     private val m0aControlLifecycle = M0aControlLifecycle(
-        initialCommittedBaseline = initialM0aCommittedBaseline,
+        committedBaselineAuthority = m0aCommittedBaselineAuthority,
     )
     private val m0aExecutor = Executors.newSingleThreadExecutor()
 

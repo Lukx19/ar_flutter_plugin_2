@@ -8,11 +8,13 @@ import io.flutter.plugin.common.StandardMessageCodec
 import io.flutter.plugin.platform.PlatformView
 import io.flutter.plugin.platform.PlatformViewFactory
 import androidx.lifecycle.Lifecycle
+import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineAuthority
 
 class ArViewFactory(
     private val messenger: BinaryMessenger,
     private val activity: Activity,
-    private val lifecycle: Lifecycle
+    private val lifecycle: Lifecycle,
+    private val m0aCommittedBaselineAuthority: M0aCommittedBaselineAuthority,
 ) : PlatformViewFactory(StandardMessageCodec.INSTANCE) {
 
     override fun create(context: Context, viewId: Int, args: Any?): PlatformView {
@@ -31,6 +33,7 @@ class ArViewFactory(
             id = viewId,
             initialSessionFeatures = initialSessionFeatures,
             requestedRearCameraId = requestedRearCameraId,
+            m0aCommittedBaselineAuthority = m0aCommittedBaselineAuthority,
         )
     }
 }

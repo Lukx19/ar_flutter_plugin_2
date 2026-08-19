@@ -53,6 +53,7 @@ class M0aControlCorpusTest {
                 streamToken = response.long("streamToken"),
                 nextExchangeRequestSequence = response.long("nextExchangeRequestSequence"),
                 nativeTransactionId = response.long("nativeTransactionId"),
+                payload = hex(response.string("payloadHex")),
             ),
             M0aControlCodec.hardCeilingBytes,
         )

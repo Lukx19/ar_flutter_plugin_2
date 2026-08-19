@@ -12,6 +12,7 @@ object M0aPacketCodec {
     const val responseMaximumBytes = 16 * 1024
     const val catchUpMaximumBytes = 64 * 1024
     const val styleRecordBytes = 8
+    const val noChangesMessageKind = 0
 
     data class Request(
         val requestFlags: Int,
@@ -254,15 +255,21 @@ object M0aPacketCodec {
         streamToken: Long,
         requestSequence: Long,
         nextExpectedRequestSequence: Long,
+        transactionId: Long = 0,
+        targetGeometryRevision: Long = 0,
+        targetLineageRevision: Long = 0,
         acceptedStyleRevision: Long = 0,
     ): Response = Response(
-        messageKind = 0,
+        messageKind = noChangesMessageKind,
         responseFlags = 0,
         resultFlags = 0,
         errorId = 0,
         requestSequence = requestSequence,
         streamToken = streamToken,
         nextExpectedRequestSequence = nextExpectedRequestSequence,
+        transactionId = transactionId,
+        targetGeometryRevision = targetGeometryRevision,
+        targetLineageRevision = targetLineageRevision,
         acceptedStyleRevision = acceptedStyleRevision,
     )
 

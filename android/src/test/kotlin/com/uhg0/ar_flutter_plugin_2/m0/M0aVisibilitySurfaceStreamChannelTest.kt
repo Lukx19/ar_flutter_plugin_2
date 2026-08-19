@@ -225,6 +225,10 @@ class M0aVisibilitySurfaceStreamChannelTest {
             ),
         )
         assertEquals(0, response.messageKind)
+        assertEquals(9L, response.transactionId)
+        assertEquals(10L, response.targetGeometryRevision)
+        assertEquals(11L, response.targetLineageRevision)
+        assertEquals(12L, response.acceptedStyleRevision)
         binding.dispose()
     }
 

@@ -3,6 +3,8 @@ package com.uhg0.ar_flutter_plugin_2.m0
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Test
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 class M0aControlLifecycleTest {
     @Test
@@ -27,11 +29,43 @@ class M0aControlLifecycleTest {
         val response = M0aControlCodec.decodeResponse(
             lifecycle.handle(start, M0aControlCodec.encodeRequest(start)),
         )
-        assertEquals(9L, response.nativeTransactionId)
-        assertEquals(
-            M0aCommittedBaselineV1(9, 10, 11, 12),
-            M0aCommittedBaselineV1.decode(response.payload),
+        assertEquals(0L, response.nativeTransactionId)
+        assertEquals(M0aStartResultCodecV2.byteLength, response.payload.size)
+        val result = ByteBuffer.wrap(response.payload).order(ByteOrder.LITTLE_ENDIAN)
+        assertEquals(10L, result.getLong(96))
+        assertEquals(11L, result.getLong(104))
+        assertEquals(12L, result.getLong(136))
+        assertEquals(0L, result.getLong(176))
+    }
+
+    @Test
+    fun `factory authority survives a replaced view binding`() {
+        val authority = M0aCommittedBaselineAuthority(
+            M0aCommittedBaselineV1(7, 8, 9, 10),
         )
+        val firstLifecycle = M0aControlLifecycle(
+            committedBaselineAuthority = authority,
+        )
+        val firstStart = request(M0aControlOperation.START, 0, 1)
+        firstLifecycle.handle(firstStart, M0aControlCodec.encodeRequest(firstStart))
+        firstLifecycle.setCommittedBaseline(M0aCommittedBaselineV1(41, 42, 43, 44))
+
+        val replacementLifecycle = M0aControlLifecycle(
+            committedBaselineAuthority = authority,
+        )
+        val replacementStart = request(M0aControlOperation.START, 0, 60)
+        val response = M0aControlCodec.decodeResponse(
+            replacementLifecycle.handle(
+                replacementStart,
+                M0aControlCodec.encodeRequest(replacementStart),
+            ),
+        )
+        assertEquals(184, response.payload.size)
+        val result = ByteBuffer.wrap(response.payload).order(ByteOrder.LITTLE_ENDIAN)
+        assertEquals(42L, result.getLong(96))
+        assertEquals(43L, result.getLong(104))
+        assertEquals(44L, result.getLong(136))
+        assertEquals(M0aCommittedBaselineV1(41, 42, 43, 44), authority.snapshot())
     }
 
     @Test

@@ -213,6 +213,9 @@ class M0aVisibilitySurfaceStreamChannel(
                                                             streamToken = request.streamToken,
                                                             requestSequence = request.requestSequence,
                                                             nextExpectedRequestSequence = request.requestSequence + 1,
+                                                            transactionId = committedBaseline.transactionId,
+                                                            targetGeometryRevision = committedBaseline.geometryRevision,
+                                                            targetLineageRevision = committedBaseline.lineageRevision,
                                                             acceptedStyleRevision = committedBaseline.styleRevision,
                                                         )
                                                     }
@@ -421,6 +424,9 @@ class M0aVisibilitySurfaceStreamChannel(
                     streamToken = request.streamToken,
                     requestSequence = request.requestSequence,
                     nextExpectedRequestSequence = request.requestSequence + 1,
+                    transactionId = committedBaseline.transactionId,
+                    targetGeometryRevision = committedBaseline.geometryRevision,
+                    targetLineageRevision = committedBaseline.lineageRevision,
                     acceptedStyleRevision = committedBaseline.styleRevision,
                 )
             val response = M0aTransactionResponseCodecV1.encodeFrame(

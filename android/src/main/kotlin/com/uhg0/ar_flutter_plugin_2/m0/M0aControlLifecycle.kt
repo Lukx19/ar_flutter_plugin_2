@@ -1,8 +1,5 @@
 package com.uhg0.ar_flutter_plugin_2.m0
 
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-
 /**
  * Bounded control state for one V2 binding.
  *
@@ -21,32 +18,14 @@ data class M0aCommittedBaselineV1(
         require(transactionId >= 0 && geometryRevision >= 0 && lineageRevision >= 0 && styleRevision >= 0)
     }
 
-    fun encode(): ByteArray = ByteBuffer.allocate(BYTE_LENGTH).order(ByteOrder.LITTLE_ENDIAN)
-        .putLong(transactionId)
-        .putLong(geometryRevision)
-        .putLong(lineageRevision)
-        .putLong(styleRevision)
-        .array()
-
     companion object {
-        const val BYTE_LENGTH = 32
         val ZERO = M0aCommittedBaselineV1(0, 0, 0, 0)
-
-        fun decode(bytes: ByteArray): M0aCommittedBaselineV1 {
-            require(bytes.size == BYTE_LENGTH) { "Committed baseline payload has invalid length" }
-            val data = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-            return M0aCommittedBaselineV1(
-                data.long,
-                data.long,
-                data.long,
-                data.long,
-            )
-        }
     }
 }
 
 class M0aControlLifecycle(
     private val maximumResponseBytes: Int = M0aControlCodec.hardCeilingBytes,
+    private val committedBaselineAuthority: M0aCommittedBaselineAuthority? = null,
     initialCommittedBaseline: M0aCommittedBaselineV1 = M0aCommittedBaselineV1.ZERO,
 ) {
     enum class State { IDLE, ACTIVE, ABANDONED, STOPPED }
@@ -70,6 +49,7 @@ class M0aControlLifecycle(
     @Synchronized
     fun setCommittedBaseline(value: M0aCommittedBaselineV1) {
         committedBaseline = value
+        committedBaselineAuthority?.publish(value)
     }
 
     /** Returns null when a stream request may use this active binding token. */
@@ -114,6 +94,7 @@ class M0aControlLifecycle(
 
     private fun start(request: M0aControlRequest): ByteArray {
         if (state != State.IDLE) return error(request, M0aControlError.LIFECYCLE_STATE_INVALID)
+        committedBaseline = committedBaselineAuthority?.snapshot() ?: committedBaseline
         activeStreamToken = nextStreamToken++
         state = State.ACTIVE
         return success(request, activeStreamToken, committedBaseline)
@@ -155,9 +136,12 @@ class M0aControlLifecycle(
                 coverageEpoch = request.coverageEpoch,
                 streamToken = streamToken,
                 nextExchangeRequestSequence = 1,
-                nativeTransactionId = baseline?.transactionId ?: 0,
-                payload = baseline?.takeUnless { it == M0aCommittedBaselineV1.ZERO }
-                    ?.encode() ?: byteArrayOf(),
+                nativeTransactionId = 0,
+                payload = if (request.operation == M0aControlOperation.START) {
+                    M0aStartResultCodecV2.encode(baseline ?: committedBaseline)
+                } else {
+                    byteArrayOf()
+                },
             ),
             maximumResponseBytes,
         )
