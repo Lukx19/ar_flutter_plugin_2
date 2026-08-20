@@ -40,6 +40,11 @@ class M0StableSurfaceIdAllocator {
 interface M0FusionKernel {
     val candidateId: String
     fun fuse(observations: Iterable<M0VoxelObservation>): M0FusionResult
+    fun persistentSession(
+        surfaceCapacity: Int,
+        associationCapacity: Int,
+        maxLineageIds: Int,
+    ): M0bPersistentFusionSession
 }
 
 private const val DEFAULT_MAX_OBSERVATIONS = 200_000
@@ -65,6 +70,19 @@ open class M0SignedOccupancyKernel(
     }
 
     override val candidateId: String = "A"
+
+    override fun persistentSession(
+        surfaceCapacity: Int,
+        associationCapacity: Int,
+        maxLineageIds: Int,
+    ): M0bPersistentFusionSession = M0bSignedPersistentSession(
+        candidateId = candidateId,
+        surfaceCapacity = surfaceCapacity,
+        associationCapacity = associationCapacity,
+        maximumLineageIds = maxLineageIds,
+        occupancyThreshold = occupancyThreshold,
+        saturation = saturation,
+    )
 
     override fun fuse(observations: Iterable<M0VoxelObservation>): M0FusionResult {
         val weights = sortedMapOf<M0VoxelKey, Int>()
@@ -137,6 +155,17 @@ class M0PlanarConsolidationKernel(
 ) {
     override val candidateId: String = "B"
 
+    override fun persistentSession(
+        surfaceCapacity: Int,
+        associationCapacity: Int,
+        maxLineageIds: Int,
+    ): M0bPersistentFusionSession = M0bPlanarPersistentSession(
+        candidateId = candidateId,
+        surfaceCapacity = surfaceCapacity,
+        associationCapacity = associationCapacity,
+        maximumLineageIds = maxLineageIds,
+    )
+
     override fun fuse(observations: Iterable<M0VoxelObservation>): M0FusionResult {
         val base = super.fuse(observations)
         val byKey = base.surfaces.associateBy { it.key }
@@ -186,6 +215,18 @@ class M0BoundedTsdfKernel(
     }
 
     override val candidateId: String = "C"
+
+    override fun persistentSession(
+        surfaceCapacity: Int,
+        associationCapacity: Int,
+        maxLineageIds: Int,
+    ): M0bPersistentFusionSession = M0bTsdfPersistentSession(
+        candidateId = candidateId,
+        surfaceCapacity = surfaceCapacity,
+        associationCapacity = associationCapacity,
+        maximumLineageIds = maxLineageIds,
+        narrowBand = narrowBand,
+    )
 
     override fun fuse(observations: Iterable<M0VoxelObservation>): M0FusionResult {
         val sums = sortedMapOf<M0VoxelKey, Int>()

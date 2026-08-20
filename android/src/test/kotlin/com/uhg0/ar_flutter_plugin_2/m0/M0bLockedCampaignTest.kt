@@ -20,10 +20,11 @@ import org.junit.Test
 class M0bLockedCampaignTest {
     @Test
     fun `compact candidate boundary rejects invalid populations`() {
-        assertThrows(IllegalArgumentException::class.java) { M0bCompactFusionLedger(0, 1) }
-        assertThrows(IllegalArgumentException::class.java) { M0bCompactFusionLedger(100_001, 1) }
-        assertThrows(IllegalArgumentException::class.java) { M0bCompactFusionLedger(1, 0) }
-        assertThrows(IllegalArgumentException::class.java) { M0bCompactFusionLedger(1, 200_001) }
+        val kernel = M0SignedOccupancyKernel()
+        assertThrows(IllegalArgumentException::class.java) { kernel.persistentSession(0, 1, 1) }
+        assertThrows(IllegalArgumentException::class.java) { kernel.persistentSession(100_001, 1, 1) }
+        assertThrows(IllegalArgumentException::class.java) { kernel.persistentSession(1, 0, 1) }
+        assertThrows(IllegalArgumentException::class.java) { kernel.persistentSession(1, 200_001, 1) }
     }
 
     @Test
@@ -60,29 +61,6 @@ class M0bLockedCampaignTest {
             "B" to { M0PlanarConsolidationKernel() },
             "C" to { M0BoundedTsdfKernel() },
         )
-        val boundaryFactories = linkedMapOf<String, M0bKernelFactory>(
-            "A" to M0bKernelFactory { capacity, observations, lineage ->
-                M0SignedOccupancyKernel(
-                    capacity = capacity,
-                    maxObservations = observations,
-                    maxLineageIds = lineage,
-                )
-            },
-            "B" to M0bKernelFactory { capacity, observations, lineage ->
-                M0PlanarConsolidationKernel(
-                    capacity = capacity,
-                    maxObservations = observations,
-                    maxLineageIds = lineage,
-                )
-            },
-            "C" to M0bKernelFactory { capacity, observations, lineage ->
-                M0BoundedTsdfKernel(
-                    capacity = capacity,
-                    maxObservations = observations,
-                    maxLineageIds = lineage,
-                )
-            },
-        )
         factories.forEach { (candidate, factory) ->
             val canonical = JsonArray(scenes.map { scene ->
                 val first = factory().fuse(scene.observations)
@@ -104,7 +82,6 @@ class M0bLockedCampaignTest {
         assertEquals(0.8, baselineRecall, 0.0)
         val receipt = measuredReceipt(
             factories,
-            boundaryFactories,
             manifest,
             comparisonScenes,
             baselineRecall,
@@ -129,6 +106,7 @@ class M0bLockedCampaignTest {
             assertEquals(391, candidate.int("boundaryKernelInvocationCount"))
             assertEquals(300, candidate.int("replayKernelInvocationCount"))
             assertEquals(60_000, candidate.int("replayAssociationCount"))
+            assertEquals(1, candidate.int("kernelInstanceCount"))
         }
         assertEquals(
             3,
@@ -144,30 +122,23 @@ class M0bLockedCampaignTest {
 
     private fun measuredReceipt(
         factories: Map<String, () -> M0FusionKernel>,
-        boundaryFactories: Map<String, M0bKernelFactory>,
         manifest: JsonObject,
         comparisonScenes: List<Scene>,
         baselineRecall: Double,
     ): String {
         enableThreadAllocationMeasurement()
         val candidateJson = buildJsonObject {
-            factories.forEach { (candidate, _) ->
-                val factory = boundaryFactories.getValue(candidate)
-                repeat(2) {
-                    executeBoundary(candidate, factory)
-                    executeReplay(candidate, factory)
-                }
-                val cpuRuns = MutableList(5) { executeBoundary(candidate, factory) }
-                val cpu = cpuRuns.map { it.second.peakKernelCpuMicros }.sorted()
-                val boundaryTotals = cpuRuns.map { it.first }.sorted()
-                val replayRuns = MutableList(5) { executeReplay(candidate, factory) }
-                val replay = replayRuns.map { it.first }.sorted()
-                val boundary = cpuRuns.first().second
-                val replayBoundary = replayRuns.first().second
+            factories.forEach { (candidate, factory) ->
+                repeat(2) { executePersistent(factory) }
+                val runs = MutableList(5) { executePersistent(factory) }
+                val cpu = runs.map { it.peakAdmissionCpuMicros }.sorted()
+                val boundaryTotals = runs.map { it.totalBoundaryCpuMicros }.sorted()
+                val replay = runs.map { it.replayCpuMicros }.sorted()
+                val boundary = runs.first()
                 val candidateRecall = candidateRecall(factories.getValue(candidate), comparisonScenes)
-                assertTrue(cpuRuns.all { it.second.fusionChecksum == boundary.fusionChecksum })
-                assertTrue(replayRuns.all { it.second.checksum == replayBoundary.checksum })
-                val allocations = cpuRuns.map { it.second.peakAllocationBytes }.sorted()
+                assertTrue(runs.all { it.fusionChecksum == boundary.fusionChecksum })
+                assertTrue(runs.all { it.replayChecksum == boundary.replayChecksum })
+                val allocations = runs.map { it.peakAllocationBytes }.sorted()
                 put(candidate, buildJsonObject {
                     put("replaySamplesMicros", longArray(replay))
                     put("replayP95Micros", replay[4].coerceAtLeast(1L))
@@ -183,11 +154,12 @@ class M0bLockedCampaignTest {
                     put("associationCount", boundary.associationCount)
                     put("semanticBytes", boundary.semanticBytes)
                     put("outputSurfaceCount", boundary.outputSurfaceCount)
-                    put("boundaryKernelInvocationCount", boundary.invocationCount)
-                    put("replayKernelInvocationCount", replayBoundary.invocationCount)
-                    put("replayAssociationCount", replayBoundary.associationCount)
+                    put("kernelInstanceCount", boundary.kernelInstanceCount)
+                    put("boundaryKernelInvocationCount", boundary.admissionCallCount)
+                    put("replayKernelInvocationCount", boundary.replayCallCount)
+                    put("replayAssociationCount", boundary.replayAssociationCount)
                     put("fusionChecksum", boundary.fusionChecksum)
-                    put("replayChecksum", replayBoundary.checksum)
+                    put("replayChecksum", boundary.replayChecksum)
                     put("checkedOverflowFailures", boundary.checkedOverflowFailures)
                     put("capacityOverflowCount", boundary.capacityOverflowCount)
                     put("lineageOverflowCount", boundary.lineageOverflowCount)
@@ -229,35 +201,15 @@ class M0bLockedCampaignTest {
         }.toString()
     }
 
-    private fun executeBoundary(
-        candidate: String,
-        factory: M0bKernelFactory,
-    ): Pair<Long, M0bBoundaryResult> {
-        val before = currentThreadCpuTime()
-        val result = M0bKernelBoundaryAdapter(
-            candidate,
-            factory,
+    private fun executePersistent(
+        factory: () -> M0FusionKernel,
+    ): M0bPersistentCampaignResult =
+        M0bPersistentKernelHarness(
+            factory(),
             ::currentThreadAllocatedBytes,
             ::currentThreadCpuTime,
         )
-            .executeBoundary()
-        return ((currentThreadCpuTime() - before) / 1_000).coerceAtLeast(1L) to result
-    }
-
-    private fun executeReplay(
-        candidate: String,
-        factory: M0bKernelFactory,
-    ): Pair<Long, M0bReplayBoundaryResult> {
-        val before = currentThreadCpuTime()
-        val result = M0bKernelBoundaryAdapter(
-            candidate,
-            factory,
-            ::currentThreadAllocatedBytes,
-            ::currentThreadCpuTime,
-        )
-            .executeReplay()
-        return ((currentThreadCpuTime() - before) / 1_000).coerceAtLeast(1L) to result
-    }
+            .execute()
 
     private fun inputHashes(manifest: JsonObject): JsonObject = buildJsonObject {
         manifest.getValue("partitions").jsonArray.forEach { raw ->
