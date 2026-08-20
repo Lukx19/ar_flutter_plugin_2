@@ -2,25 +2,44 @@ package com.uhg0.ar_flutter_plugin_2.m0
 
 import java.util.PriorityQueue
 
-enum class M0RendererMode { CENTROIDS, CUBES, RAW_POINTS, OVERVIEW }
+enum class M0RendererMode {
+    CENTROIDS,
+    CUBES,
+    RAW_POINTS,
+    WARM_PROXIES,
+    OVERVIEW,
+    GLYPHS,
+    SUPPRESSED_DEBUG,
+}
 enum class M0SemanticState { UNCOVERED, COVERED, PENDING, STALE, DEGRADED }
 
 object M0RendererPopulationLimits {
     const val CENTROID_ROWS = 20_000
     const val CUBE_ROWS = 8_000
     const val RAW_POINT_ROWS = 2_000
-    const val OVERVIEW_ROWS = 2_000
+    const val WARM_PROXY_ROWS = 4_096
+    const val OVERVIEW_ROWS = 512
+    const val GLYPH_ROWS = 256
+    const val SUPPRESSED_DEBUG_ROWS = 1_024
 
     fun maximumRows(mode: M0RendererMode): Int = when (mode) {
         M0RendererMode.CENTROIDS -> CENTROID_ROWS
         M0RendererMode.CUBES -> CUBE_ROWS
         M0RendererMode.RAW_POINTS -> RAW_POINT_ROWS
+        M0RendererMode.WARM_PROXIES -> WARM_PROXY_ROWS
         M0RendererMode.OVERVIEW -> OVERVIEW_ROWS
+        M0RendererMode.GLYPHS -> GLYPH_ROWS
+        M0RendererMode.SUPPRESSED_DEBUG -> SUPPRESSED_DEBUG_ROWS
     }
 
     fun fixedAllocationBytes(mode: M0RendererMode): Int = when (mode) {
         M0RendererMode.CUBES -> 2_944_000 + 1_024_000 + 1_920_000
-        else -> 0
+        M0RendererMode.CENTROIDS,
+        M0RendererMode.RAW_POINTS,
+        M0RendererMode.WARM_PROXIES,
+        M0RendererMode.OVERVIEW,
+        M0RendererMode.GLYPHS,
+        M0RendererMode.SUPPRESSED_DEBUG -> 0
     }
 }
 

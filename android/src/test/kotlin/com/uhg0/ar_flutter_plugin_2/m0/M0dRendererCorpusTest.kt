@@ -163,7 +163,10 @@ class M0dRendererCorpusTest {
         "centroids" -> M0RendererMode.CENTROIDS
         "cubes" -> M0RendererMode.CUBES
         "rawPoints" -> M0RendererMode.RAW_POINTS
+        "warmProxies" -> M0RendererMode.WARM_PROXIES
         "overview" -> M0RendererMode.OVERVIEW
+        "glyphs" -> M0RendererMode.GLYPHS
+        "suppressedDebug" -> M0RendererMode.SUPPRESSED_DEBUG
         else -> error("Unknown renderer mode $value")
     }
 
