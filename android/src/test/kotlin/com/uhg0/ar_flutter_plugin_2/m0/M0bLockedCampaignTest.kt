@@ -59,7 +59,7 @@ class M0bLockedCampaignTest {
 
         val receipt = measuredReceipt(factories, scenes)
         val report = File("build/reports/tests/m0b_kotlin_receipt_v1.json")
-        report.parentFile.mkdirs()
+        requireNotNull(report.parentFile).mkdirs()
         report.writeText(receipt)
         val parsed = Json.parseToJsonElement(receipt).jsonObject
         assertEquals(12_800_000, parsed.getValue("resource").jsonObject.int("semanticBytes"))
@@ -85,17 +85,22 @@ class M0bLockedCampaignTest {
                 repeat(2) { runWindow(factory, scenes) }
                 val cpu = MutableList(5) { runWindow(factory, scenes) }.sorted()
                 val replay = MutableList(5) { runReplayWindow() }.sorted()
-                val before = currentThreadAllocatedBytes()
-                val ledger = M0bCompactFusionLedger()
-                val checksum = ledger.populateDeterministically()
-                val allocation = currentThreadAllocatedBytes() - before
-                assertTrue(checksum != Long.MIN_VALUE)
+                val allocations = MutableList(5) {
+                    val before = currentThreadAllocatedBytes()
+                    val ledger = M0bCompactFusionLedger()
+                    val checksum = ledger.populateDeterministically()
+                    assertTrue(checksum != Long.MIN_VALUE)
+                    currentThreadAllocatedBytes() - before
+                }.sorted()
                 put(candidate, buildJsonObject {
+                    put("replaySamplesMicros", longArray(replay))
                     put("replayP95Micros", replay[4].coerceAtLeast(1L))
                     put("replayMaximumMicros", replay.max().coerceAtLeast(1L))
                     put("replayImageBytes", 0)
+                    put("cpuWindowSamplesMicros", longArray(cpu))
                     put("cpuWindowP95Micros", cpu[4].coerceAtLeast(1L))
-                    put("allocationBytes", allocation)
+                    put("allocationSamplesBytes", longArray(allocations))
+                    put("allocationBytes", allocations[4])
                     put("checkedOverflowFailures", checkedOverflowFailures(factory))
                     put("capacityOverflowCount", capacityOverflow())
                     put("lineageOverflowCount", lineageOverflow())
@@ -107,6 +112,9 @@ class M0bLockedCampaignTest {
             put("runner", buildJsonObject {
                 put("name", "kotlin-jvm-native-kernel")
                 put("jvm", System.getProperty("java.version"))
+                put("osName", System.getProperty("os.name"))
+                put("osVersion", System.getProperty("os.version"))
+                put("osArch", System.getProperty("os.arch"))
                 put("warmupWindows", 2)
                 put("measuredWindows", 5)
                 put("clock", "ThreadMXBean.currentThreadCpuTime")
@@ -145,7 +153,7 @@ class M0bLockedCampaignTest {
 
     private fun managementBean(): Any {
         val factory = Class.forName("java.lang.management.ManagementFactory")
-        return factory.getMethod("getThreadMXBean").invoke(null)
+        return requireNotNull(factory.getMethod("getThreadMXBean").invoke(null))
     }
 
     private fun enableThreadAllocationMeasurement() {
@@ -215,4 +223,6 @@ class M0bLockedCampaignTest {
     private fun JsonObject.int(key: String): Int = getValue(key).jsonPrimitive.int
     private fun JsonObject.string(key: String): String = getValue(key).jsonPrimitive.content
     private fun number(value: Int): JsonElement = Json.parseToJsonElement(value.toString())
+    private fun longArray(values: List<Long>): JsonArray =
+        JsonArray(values.map { Json.parseToJsonElement(it.coerceAtLeast(1L).toString()) })
 }
