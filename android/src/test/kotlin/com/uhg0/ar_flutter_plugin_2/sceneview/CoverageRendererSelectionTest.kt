@@ -18,7 +18,7 @@ class CoverageRendererSelectionTest {
         assertEquals(2_000, CoverageRendererLimits.RAW_POINT_CAPACITY)
         assertEquals(20_000, CoverageRendererLimits.CENTROID_CAPACITY)
         assertEquals(8_000, CoverageRendererLimits.CUBE_CAPACITY)
-        assertEquals(6_622_208, CoverageRendererLimits.maximumActiveRendererBytes)
+        assertEquals(7_486_208, CoverageRendererLimits.maximumActiveRendererBytes)
         assertTrue(
             CoverageRendererLimits.maximumActiveRendererBytes <=
                 CoverageRendererLimits.SHARED_OWNED_BUFFER_LIMIT_BYTES,
@@ -33,6 +33,10 @@ class CoverageRendererSelectionTest {
             CoverageRendererLimits.NATIVE_SELECTION_BYTES,
         )
         telemetry.setOwnedBufferBytes("auxiliary", CoverageRendererLimits.AUXILIARY_BYTES)
+        telemetry.setOwnedBufferBytes(
+            "snapshot-handoff",
+            CoverageRendererLimits.CUBE_SNAPSHOT_HANDOFF_BYTES,
+        )
         telemetry.setOwnedBufferBytes(
             "cubes",
             CoverageRendererLimits.CUBE_CAPACITY * CoverageCubeMeshResources.OWNED_BYTES_PER_VOXEL,
@@ -57,6 +61,10 @@ class CoverageRendererSelectionTest {
         telemetry.setOwnedBufferBytes("selection", CoverageRendererLimits.NATIVE_SELECTION_BYTES)
         telemetry.setOwnedBufferBytes("auxiliary", CoverageRendererLimits.AUXILIARY_BYTES)
         telemetry.setOwnedBufferBytes(
+            "snapshot-handoff",
+            CoverageRendererLimits.CUBE_SNAPSHOT_HANDOFF_BYTES,
+        )
+        telemetry.setOwnedBufferBytes(
             "active",
             CoverageRendererLimits.CUBE_CAPACITY * CoverageCubeMeshResources.OWNED_BYTES_PER_VOXEL,
         )
@@ -69,6 +77,7 @@ class CoverageRendererSelectionTest {
         assertEquals(
             CoverageRendererLimits.NATIVE_SELECTION_BYTES +
                 CoverageRendererLimits.AUXILIARY_BYTES +
+                CoverageRendererLimits.CUBE_SNAPSHOT_HANDOFF_BYTES +
                 CoverageRendererLimits.CENTROID_CAPACITY * CoveragePointMeshResources.OWNED_BYTES_PER_ROW,
             telemetry.snapshot().getValue("ownedBufferBytes"),
         )

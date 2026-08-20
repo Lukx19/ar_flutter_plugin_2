@@ -25,6 +25,17 @@ internal object CoverageRendererLimits {
         (WARM_PROXY_CAPACITY + COLD_OVERVIEW_CAPACITY + GLYPH_CAPACITY + DEBUG_ROW_CAPACITY) *
             AUXILIARY_ROW_BYTES
 
+    // A semantic 20k snapshot is retained at the host seam while the active
+    // coordinator may retain both its in-flight and coalesced-next cube
+    // presentation snapshots. These copies are deliberately charged rather
+    // than treated as invisible JVM transients.
+    const val SEMANTIC_SNAPSHOT_BYTES = CENTROID_CAPACITY * 24
+    const val CUBE_PRESENTATION_SNAPSHOT_BYTES = CUBE_CAPACITY * 24
+    const val CUBE_SNAPSHOT_HANDOFF_BYTES =
+        SEMANTIC_SNAPSHOT_BYTES + CUBE_PRESENTATION_SNAPSHOT_BYTES * 2
+    const val CENTROID_SNAPSHOT_HANDOFF_BYTES =
+        SEMANTIC_SNAPSHOT_BYTES + SEMANTIC_SNAPSHOT_BYTES * 2
+
     // Point resources own 36 bytes per row; cube resources own 736 bytes per
     // row. Keeping all three dormant mode resources under this bound makes a
     // replacement safe even while Compose retires the previous node.
@@ -35,12 +46,21 @@ internal object CoverageRendererLimits {
 
     val maximumActiveRendererBytes: Int =
         CUBE_CAPACITY * CoverageCubeMeshResources.OWNED_BYTES_PER_VOXEL +
-            NATIVE_SELECTION_BYTES + AUXILIARY_BYTES
+            NATIVE_SELECTION_BYTES + AUXILIARY_BYTES + CUBE_SNAPSHOT_HANDOFF_BYTES
 
     init {
         check(allModeOwnedBufferBytes <= SHARED_OWNED_BUFFER_LIMIT_BYTES)
         check(maximumActiveRendererBytes <= SHARED_OWNED_BUFFER_LIMIT_BYTES)
     }
+
+    fun snapshotHandoffBytes(mode: com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode): Int =
+        when (mode) {
+            com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CUBES ->
+                CUBE_SNAPSHOT_HANDOFF_BYTES
+            com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.POINTS,
+            com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS ->
+                CENTROID_SNAPSHOT_HANDOFF_BYTES
+        }
 }
 
 /**

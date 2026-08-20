@@ -533,6 +533,7 @@ internal class SceneViewHost(
             coverageRenderConfig.value = null
             rendererTelemetry.removeOwner("coverage-selection-state")
             rendererTelemetry.removeOwner("coverage-auxiliary-state")
+            rendererTelemetry.removeOwner("coverage-snapshot-handoff")
             return
         }
 
@@ -562,6 +563,10 @@ internal class SceneViewHost(
         } else {
             coverageMeshRef.get()?.updateCoverage(snapshot, config.voxelRenderMode)
         }
+        rendererTelemetry.setOwnedBufferBytes(
+            "coverage-snapshot-handoff",
+            CoverageRendererLimits.snapshotHandoffBytes(config.voxelRenderMode),
+        )
     }
 
     fun updateRawPointCloud(snapshot: CoveragePointRenderSnapshot?) {
