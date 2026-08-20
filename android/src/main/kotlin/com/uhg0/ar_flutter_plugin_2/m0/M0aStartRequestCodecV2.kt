@@ -6,6 +6,10 @@ import java.nio.ByteOrder
 /** Strict decoder for the canonical Chapter 13 StartRequestV2 payload. */
 object M0aStartRequestCodecV2 {
     const val byteLength = 464
+    /** Chapter 13 freezes the M0 start negotiation at minor version zero. */
+    const val supportedMinor = 0
+    /** M0a has no promoted optional capability bits yet. */
+    const val supportedCapabilities = 0L
 
     data class Configuration(
         val minimumMinor: Int,
@@ -23,7 +27,13 @@ object M0aStartRequestCodecV2 {
         val requestedModelCapacity: Int,
         val requestedPendingObservationCapacity: Int,
         val restoredRevisions: LongArray,
-    )
+    ) {
+        fun hasRestoredCutConflict(baseline: M0aCommittedBaselineV1): Boolean =
+            restoreRequested && baseline != M0aCommittedBaselineV1.ZERO &&
+                (restoredRevisions[1] != baseline.geometryRevision ||
+                    restoredRevisions[2] != baseline.lineageRevision ||
+                    restoredRevisions[6] != baseline.styleRevision)
+    }
 
     fun decode(bytes: ByteArray): Configuration {
         require(bytes.size == byteLength) { "Start request payload must be exactly 464 bytes" }

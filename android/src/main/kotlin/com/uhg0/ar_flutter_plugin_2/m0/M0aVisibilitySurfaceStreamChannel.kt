@@ -228,6 +228,12 @@ class M0aVisibilitySurfaceStreamChannel(
                                                         )
                                                     }
                                                     else -> {
+                                                        if (request.styleRecords.isNotEmpty()) {
+                                                            committedBaseline = committedBaseline.copy(
+                                                                styleRevision = request.nextStyleRevision,
+                                                            )
+                                                            controlLifecycle?.setCommittedBaseline(committedBaseline)
+                                                        }
                                                         nextStructuralResponse(request)
                                                     }
                                                 },
@@ -438,7 +444,7 @@ class M0aVisibilitySurfaceStreamChannel(
                 streamToken = request.streamToken,
                 requestSequence = request.requestSequence,
                 nextExpectedRequestSequence = request.requestSequence + 1,
-            )
+            ).copy(acceptedStyleRevision = committedBaseline.styleRevision)
             // The caller encodes this response under the negotiated ceiling
             // before returning. Only then is the producer advanced.
             val encoded = M0aPacketCodec.encodeResponse(response, request.maximumResponseBytes)
@@ -446,6 +452,7 @@ class M0aVisibilitySurfaceStreamChannel(
             structuralFrames.removeFirst()
             if (frame is M0aTransactionCommitFrameV1) {
                 committedBaseline = queuedTransactionBaseline
+                    ?.copy(styleRevision = committedBaseline.styleRevision)
                     ?: error("COMMIT has no queued transaction baseline")
                 queuedTransactionBaseline = null
                 controlLifecycle?.setCommittedBaseline(committedBaseline)

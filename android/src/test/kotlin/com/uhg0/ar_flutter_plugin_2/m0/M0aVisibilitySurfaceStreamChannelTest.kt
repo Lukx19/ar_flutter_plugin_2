@@ -327,11 +327,22 @@ class M0aVisibilitySurfaceStreamChannelTest {
             ),
         )
         assertEquals(0, adjacent.messageKind)
-        assertEquals(4, adjacent.acceptedStyleRevision)
-        val mismatch = M0aPacketCodec.decodeResponse(
+        assertEquals(5, adjacent.acceptedStyleRevision)
+        val empty = M0aPacketCodec.decodeResponse(
             messenger.exchange(
                 request(
                     sequence = 2,
+                    token = 31,
+                    styleRevision = 5,
+                ),
+            ),
+        )
+        assertEquals(0, empty.messageKind)
+        assertEquals(5, empty.acceptedStyleRevision)
+        val mismatch = M0aPacketCodec.decodeResponse(
+            messenger.exchange(
+                request(
+                    sequence = 3,
                     token = 31,
                     styleRevision = 7,
                     styleRecords = listOf(ByteArray(8)),

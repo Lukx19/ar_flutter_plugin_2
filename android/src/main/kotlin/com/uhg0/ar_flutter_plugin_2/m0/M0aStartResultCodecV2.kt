@@ -23,14 +23,16 @@ object M0aStartResultCodecV2 {
     ): ByteArray {
         val packet = ByteArray(byteLength)
         val data = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
-        data.putShort(0, 0)
+        data.putShort(0, M0aStartRequestCodecV2.supportedMinor.toShort())
         data.putShort(2, configuration.persistenceSchema.toShort())
         data.put(4, configuration.profile.toByte())
         data.put(5, 0)
         data.putShort(6, 0)
-        val acceptedCapabilities = configuration.requiredCapabilities or configuration.desiredCapabilities
+        val acceptedCapabilities =
+            (configuration.requiredCapabilities or configuration.desiredCapabilities) and
+                M0aStartRequestCodecV2.supportedCapabilities
         data.putLong(8, acceptedCapabilities)
-        data.putLong(16, acceptedCapabilities)
+        data.putLong(16, M0aStartRequestCodecV2.supportedCapabilities)
         data.putInt(24, if (configuration.requestedModelCapacity == 0) acceptedModelCapacity else configuration.requestedModelCapacity)
         data.putInt(28, if (configuration.requestedPendingObservationCapacity == 0) acceptedPendingObservationCapacity else configuration.requestedPendingObservationCapacity)
         data.putInt(32, 0)
@@ -48,10 +50,27 @@ object M0aStartResultCodecV2 {
         data.putInt(76, regionEdgeMillimetres)
         data.putInt(80, pageEdgeMillimetres)
         data.putInt(84, 0)
-        val revisions = configuration.restoredRevisions.copyOf()
-        revisions[1] = if (baseline.geometryRevision == 0L) revisions[1] else baseline.geometryRevision
-        revisions[2] = if (baseline.lineageRevision == 0L) revisions[2] else baseline.lineageRevision
-        revisions[6] = if (baseline.styleRevision == 0L) revisions[6] else baseline.styleRevision
+        // A restored request and a replacement baseline are each complete
+        // authority cuts. Never overlay selected fields from one onto the
+        // other: an empty request uses the persisted baseline, while a
+        // restored request uses all of its own revisions after conflict
+        // validation in the lifecycle.
+        val revisions = if (configuration.restoreRequested || baseline == M0aCommittedBaselineV1.ZERO) {
+            configuration.restoredRevisions.copyOf()
+        } else {
+            longArrayOf(
+                0L,
+                baseline.geometryRevision,
+                baseline.lineageRevision,
+                0L,
+                0L,
+                0L,
+                baseline.styleRevision,
+                0L,
+                0L,
+                0L,
+            )
+        }
         revisions.forEachIndexed { index, revision -> data.putLong(88 + index * 8, revision) }
         data.putLong(168, 1)
         data.putLong(176, 0)

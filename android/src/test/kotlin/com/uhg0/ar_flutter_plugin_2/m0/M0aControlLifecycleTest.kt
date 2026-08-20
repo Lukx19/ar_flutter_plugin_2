@@ -21,6 +21,74 @@ class M0aControlLifecycleTest {
     }
 
     @Test
+    fun `start negotiates frozen minor and ignores unsupported desired bits`() {
+        val lifecycle = M0aControlLifecycle()
+        val desired = request(M0aControlOperation.START, 0, 2).copy(
+            payload = startPayload {
+                putLong(16, 1L)
+            },
+        )
+        val response = M0aControlCodec.decodeResponse(
+            lifecycle.handle(desired, M0aControlCodec.encodeRequest(desired)),
+        )
+        assertEquals(0, response.outcome)
+        val result = ByteBuffer.wrap(response.payload).order(ByteOrder.LITTLE_ENDIAN)
+        assertEquals(0L, result.getLong(8))
+        assertEquals(0L, result.getLong(16))
+    }
+
+    @Test
+    fun `start rejects unsupported required capability and minor range`() {
+        val capabilityLifecycle = M0aControlLifecycle()
+        val required = request(M0aControlOperation.START, 0, 3).copy(
+            payload = startPayload {
+                putLong(8, 1L)
+            },
+        )
+        val capabilityResponse = M0aControlCodec.decodeResponse(
+            capabilityLifecycle.handle(required, M0aControlCodec.encodeRequest(required)),
+        )
+        assertEquals(1, capabilityResponse.outcome)
+        assertEquals(46, capabilityResponse.errorId)
+
+        val minorLifecycle = M0aControlLifecycle()
+        val minor = request(M0aControlOperation.START, 0, 4).copy(
+            payload = startPayload {
+                putShort(0, 1)
+                putShort(2, 1)
+            },
+        )
+        val minorResponse = M0aControlCodec.decodeResponse(
+            minorLifecycle.handle(minor, M0aControlCodec.encodeRequest(minor)),
+        )
+        assertEquals(1, minorResponse.outcome)
+        assertEquals(1, minorResponse.errorId)
+    }
+
+    @Test
+    fun `restored cut conflict is rejected rather than overlaid`() {
+        val lifecycle = M0aControlLifecycle(
+            initialCommittedBaseline = M0aCommittedBaselineV1(7, 11, 13, 17),
+        )
+        val conflicting = request(M0aControlOperation.START, 0, 5).copy(
+            payload = startPayload {
+                put(7, 1)
+                putLong(64, 12L)
+                putLong(72, 13L)
+                putLong(104, 17L)
+                put(392, 1)
+                put(424, 1)
+            },
+        )
+        val response = M0aControlCodec.decodeResponse(
+            lifecycle.handle(conflicting, M0aControlCodec.encodeRequest(conflicting)),
+        )
+        assertEquals(1, response.outcome)
+        assertEquals(58, response.errorId)
+        assertEquals(M0aControlLifecycle.State.IDLE, lifecycle.state())
+    }
+
+    @Test
     fun `start receipt carries the authoritative restored committed baseline`() {
         val lifecycle = M0aControlLifecycle(
             initialCommittedBaseline = M0aCommittedBaselineV1(9, 10, 11, 12),
@@ -88,6 +156,25 @@ class M0aControlLifecycleTest {
         assertEquals(0L, result.getLong(96))
         assertEquals(0L, result.getLong(104))
         assertEquals(0L, result.getLong(136))
+    }
+
+    @Test
+    fun `baseline authority survives same group replacement with a new coverage epoch`() {
+        val authority = M0aCommittedBaselineAuthority()
+        val firstLifecycle = M0aControlLifecycle(committedBaselineAuthority = authority)
+        val firstStart = request(M0aControlOperation.START, 0, 72)
+        firstLifecycle.handle(firstStart, M0aControlCodec.encodeRequest(firstStart))
+        firstLifecycle.setCommittedBaseline(M0aCommittedBaselineV1(61, 62, 63, 64))
+
+        val replacement = request(M0aControlOperation.START, 0, 73).copy(coverageEpoch = 2)
+        val replacementLifecycle = M0aControlLifecycle(committedBaselineAuthority = authority)
+        val response = M0aControlCodec.decodeResponse(
+            replacementLifecycle.handle(replacement, M0aControlCodec.encodeRequest(replacement)),
+        )
+        val result = ByteBuffer.wrap(response.payload).order(ByteOrder.LITTLE_ENDIAN)
+        assertEquals(62L, result.getLong(96))
+        assertEquals(63L, result.getLong(104))
+        assertEquals(64L, result.getLong(136))
     }
 
     @Test
@@ -178,6 +265,11 @@ class M0aControlLifecycleTest {
             },
         )
     }
+
+    private fun startPayload(mutate: ByteBuffer.() -> Unit): ByteArray =
+        M0aStartRequestCodecV2.defaultPayload().also {
+            ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).apply(mutate)
+        }
 
     private fun uuid(seed: Int): M0aUuid {
         val bytes = ByteArray(16) { (seed + it).toByte() }

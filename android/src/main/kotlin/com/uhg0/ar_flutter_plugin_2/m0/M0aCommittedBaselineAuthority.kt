@@ -15,7 +15,6 @@ data class M0aCommittedBaselineScopeV1(
     val captureGroupId: M0aUuid,
     val sessionGeneration: Long,
     val groupGeneration: Long,
-    val coverageEpoch: Long,
 ) {
     companion object {
         fun from(request: M0aControlRequest): M0aCommittedBaselineScopeV1 =
@@ -24,7 +23,6 @@ data class M0aCommittedBaselineScopeV1(
                 captureGroupId = request.captureGroupId,
                 sessionGeneration = request.sessionGeneration,
                 groupGeneration = request.groupGeneration,
-                coverageEpoch = request.coverageEpoch,
             )
     }
 }

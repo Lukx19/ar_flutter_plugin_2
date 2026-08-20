@@ -20,6 +20,16 @@ data class M0aCommittedBaselineV1(
 
     companion object {
         val ZERO = M0aCommittedBaselineV1(0, 0, 0, 0)
+
+        fun fromRestoredRevisions(revisions: LongArray): M0aCommittedBaselineV1 {
+            require(revisions.size >= 7) { "A canonical START cut has seven revisions" }
+            return M0aCommittedBaselineV1(
+                transactionId = 0,
+                geometryRevision = revisions[1],
+                lineageRevision = revisions[2],
+                styleRevision = revisions[6],
+            )
+        }
     }
 }
 
@@ -97,8 +107,31 @@ class M0aControlLifecycle(
         if (state != State.IDLE) return error(request, M0aControlError.LIFECYCLE_STATE_INVALID)
         val configuration = M0aStartRequestCodecV2.decode(request.payload)
         activeScope = M0aCommittedBaselineScopeV1.from(request)
-        committedBaseline = committedBaselineAuthority?.snapshot(activeScope!!)
-            ?: committedBaseline
+        val persistedBaseline = committedBaselineAuthority?.snapshot(activeScope!!)
+            ?: M0aCommittedBaselineV1.ZERO
+        val availableBaseline = if (persistedBaseline != M0aCommittedBaselineV1.ZERO) {
+            persistedBaseline
+        } else {
+            committedBaseline
+        }
+        if (configuration.minimumMinor > M0aStartRequestCodecV2.supportedMinor ||
+            configuration.maximumMinor < M0aStartRequestCodecV2.supportedMinor) {
+            return error(request, M0aControlError.UNSUPPORTED_WIRE_VERSION)
+        }
+        if (configuration.requiredCapabilities and
+            M0aStartRequestCodecV2.supportedCapabilities != configuration.requiredCapabilities) {
+            return error(request, M0aControlError.REQUIRED_CAPABILITY_UNSUPPORTED)
+        }
+        if (configuration.hasRestoredCutConflict(availableBaseline)) {
+            return error(request, M0aControlError.CUT_INCOMPATIBLE)
+        }
+        committedBaseline = if (availableBaseline != M0aCommittedBaselineV1.ZERO) {
+            availableBaseline
+        } else if (configuration.restoreRequested) {
+            M0aCommittedBaselineV1.fromRestoredRevisions(configuration.restoredRevisions)
+        } else {
+            M0aCommittedBaselineV1.ZERO
+        }
         activeStreamToken = nextStreamToken++
         state = State.ACTIVE
         return success(request, activeStreamToken, committedBaseline, configuration)
@@ -187,6 +220,9 @@ class M0aControlLifecycle(
     }
 
     private object M0aControlError {
+        const val UNSUPPORTED_WIRE_VERSION = 1
+        const val REQUIRED_CAPABILITY_UNSUPPORTED = 46
+        const val CUT_INCOMPATIBLE = 58
         const val REQUEST_REPLAY_CONFLICT = 30
         const val STREAM_TOKEN_STALE = 4
         const val LIFECYCLE_STATE_INVALID = 48
