@@ -220,7 +220,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
                     acknowledgedTransaction = 9,
                     acknowledgedGeometry = 10,
                     acknowledgedLineage = 11,
-                    styleRevision = 13,
+                    styleRevision = 12,
                 ),
             ),
         )
@@ -263,7 +263,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
                     acknowledgedTransaction = 9,
                     acknowledgedGeometry = 10,
                     acknowledgedLineage = 11,
-                    styleRevision = 13,
+                    styleRevision = 12,
                 ),
             ),
         )
@@ -317,12 +317,26 @@ class M0aVisibilitySurfaceStreamChannelTest {
         val binding = M0aVisibilitySurfaceStreamChannel(messenger, 31)
         binding.setCommittedBaseline(0, 0, 0, 4)
         val adjacent = M0aPacketCodec.decodeResponse(
-            messenger.exchange(request(sequence = 1, token = 31, styleRevision = 5)),
+            messenger.exchange(
+                request(
+                    sequence = 1,
+                    token = 31,
+                    styleRevision = 5,
+                    styleRecords = listOf(ByteArray(8)),
+                ),
+            ),
         )
         assertEquals(0, adjacent.messageKind)
         assertEquals(4, adjacent.acceptedStyleRevision)
         val mismatch = M0aPacketCodec.decodeResponse(
-            messenger.exchange(request(sequence = 2, token = 31, styleRevision = 7)),
+            messenger.exchange(
+                request(
+                    sequence = 2,
+                    token = 31,
+                    styleRevision = 7,
+                    styleRecords = listOf(ByteArray(8)),
+                ),
+            ),
         )
         assertEquals(5, mismatch.messageKind)
         binding.dispose()
@@ -642,6 +656,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
         acknowledgedGeometry: Long = 0,
         acknowledgedLineage: Long = 0,
         styleRevision: Long = 0,
+        styleRecords: List<ByteArray> = emptyList(),
     ): ByteArray =
         M0aPacketCodec.encodeRequest(
             M0aPacketCodec.Request(
@@ -652,7 +667,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
                 acknowledgedLineageRevision = acknowledgedLineage,
                 nextStyleRevision = styleRevision,
                 maximumResponseBytes = 4096,
-                styleRecords = emptyList(),
+                styleRecords = styleRecords,
                 commandBytes = byteArrayOf(),
                 requestSequence = sequence,
             ),
@@ -672,6 +687,11 @@ class M0aVisibilitySurfaceStreamChannelTest {
         groupGeneration = 1,
         coverageEpoch = 1,
         streamToken = streamToken,
+        payload = if (operation == M0aControlOperation.START) {
+            M0aStartRequestCodecV2.defaultPayload()
+        } else {
+            byteArrayOf()
+        },
     )
 
     private fun uuid(seed: Int): M0aUuid {

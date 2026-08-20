@@ -34,6 +34,7 @@ class M0aControlLifecycle(
     private var nextStreamToken = 1L
     private var activeStreamToken = 0L
     private var committedBaseline = initialCommittedBaseline
+    private var activeScope: M0aCommittedBaselineScopeV1? = null
     private data class Receipt(val request: ByteArray, val response: ByteArray, val id: M0aUuid)
 
     private val receipts = mutableListOf<Receipt>()
@@ -49,7 +50,7 @@ class M0aControlLifecycle(
     @Synchronized
     fun setCommittedBaseline(value: M0aCommittedBaselineV1) {
         committedBaseline = value
-        committedBaselineAuthority?.publish(value)
+        activeScope?.let { scope -> committedBaselineAuthority?.publish(scope, value) }
     }
 
     /** Returns null when a stream request may use this active binding token. */
@@ -94,10 +95,13 @@ class M0aControlLifecycle(
 
     private fun start(request: M0aControlRequest): ByteArray {
         if (state != State.IDLE) return error(request, M0aControlError.LIFECYCLE_STATE_INVALID)
-        committedBaseline = committedBaselineAuthority?.snapshot() ?: committedBaseline
+        val configuration = M0aStartRequestCodecV2.decode(request.payload)
+        activeScope = M0aCommittedBaselineScopeV1.from(request)
+        committedBaseline = committedBaselineAuthority?.snapshot(activeScope!!)
+            ?: committedBaseline
         activeStreamToken = nextStreamToken++
         state = State.ACTIVE
-        return success(request, activeStreamToken, committedBaseline)
+        return success(request, activeStreamToken, committedBaseline, configuration)
     }
 
     private fun checkpoint(request: M0aControlRequest): ByteArray {
@@ -121,12 +125,13 @@ class M0aControlLifecycle(
         request: M0aControlRequest,
         streamToken: Long,
         baseline: M0aCommittedBaselineV1? = null,
+        configuration: M0aStartRequestCodecV2.Configuration? = null,
     ): ByteArray =
         M0aControlCodec.encodeResponse(
             M0aControlResponse(
                 operation = request.operation,
                 outcome = 0,
-                resultFlags = 0,
+                resultFlags = if (request.operation == M0aControlOperation.START) 3 else 0,
                 errorId = 0,
                 controlRequestId = request.controlRequestId,
                 sessionId = request.sessionId,
@@ -138,7 +143,10 @@ class M0aControlLifecycle(
                 nextExchangeRequestSequence = 1,
                 nativeTransactionId = 0,
                 payload = if (request.operation == M0aControlOperation.START) {
-                    M0aStartResultCodecV2.encode(baseline ?: committedBaseline)
+                    M0aStartResultCodecV2.encode(
+                        configuration ?: error("START has no canonical configuration"),
+                        baseline ?: committedBaseline,
+                    )
                 } else {
                     byteArrayOf()
                 },

@@ -40,9 +40,7 @@ class M0aControlLifecycleTest {
 
     @Test
     fun `factory authority survives a replaced view binding`() {
-        val authority = M0aCommittedBaselineAuthority(
-            M0aCommittedBaselineV1(7, 8, 9, 10),
-        )
+        val authority = M0aCommittedBaselineAuthority()
         val firstLifecycle = M0aControlLifecycle(
             committedBaselineAuthority = authority,
         )
@@ -65,7 +63,31 @@ class M0aControlLifecycleTest {
         assertEquals(42L, result.getLong(96))
         assertEquals(43L, result.getLong(104))
         assertEquals(44L, result.getLong(136))
-        assertEquals(M0aCommittedBaselineV1(41, 42, 43, 44), authority.snapshot())
+        assertEquals(
+            M0aCommittedBaselineV1(41, 42, 43, 44),
+            authority.snapshot(M0aCommittedBaselineScopeV1.from(firstStart)),
+        )
+    }
+
+    @Test
+    fun `baseline authority cannot cross group epochs`() {
+        val authority = M0aCommittedBaselineAuthority()
+        val firstLifecycle = M0aControlLifecycle(committedBaselineAuthority = authority)
+        val firstStart = request(M0aControlOperation.START, 0, 70)
+        firstLifecycle.handle(firstStart, M0aControlCodec.encodeRequest(firstStart))
+        firstLifecycle.setCommittedBaseline(M0aCommittedBaselineV1(51, 52, 53, 54))
+
+        val otherGroup = request(M0aControlOperation.START, 0, 71).copy(
+            captureGroupId = uuid(90),
+        )
+        val otherLifecycle = M0aControlLifecycle(committedBaselineAuthority = authority)
+        val response = M0aControlCodec.decodeResponse(
+            otherLifecycle.handle(otherGroup, M0aControlCodec.encodeRequest(otherGroup)),
+        )
+        val result = ByteBuffer.wrap(response.payload).order(ByteOrder.LITTLE_ENDIAN)
+        assertEquals(0L, result.getLong(96))
+        assertEquals(0L, result.getLong(104))
+        assertEquals(0L, result.getLong(136))
     }
 
     @Test
@@ -149,6 +171,11 @@ class M0aControlLifecycleTest {
             groupGeneration = 1,
             coverageEpoch = 1,
             streamToken = streamToken,
+            payload = if (operation == M0aControlOperation.START) {
+                M0aStartRequestCodecV2.defaultPayload()
+            } else {
+                byteArrayOf()
+            },
         )
     }
 

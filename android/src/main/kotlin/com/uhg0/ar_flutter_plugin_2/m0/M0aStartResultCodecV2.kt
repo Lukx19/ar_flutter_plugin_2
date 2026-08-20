@@ -17,18 +17,22 @@ object M0aStartResultCodecV2 {
     private const val pageEdgeMillimetres = 1_000
 
     /** Encodes one accepted restored cut without inventing a private payload. */
-    fun encode(baseline: M0aCommittedBaselineV1): ByteArray {
+    fun encode(
+        configuration: M0aStartRequestCodecV2.Configuration,
+        baseline: M0aCommittedBaselineV1,
+    ): ByteArray {
         val packet = ByteArray(byteLength)
         val data = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
         data.putShort(0, 0)
-        data.putShort(2, persistenceSchema.toShort())
-        data.put(4, 0)
+        data.putShort(2, configuration.persistenceSchema.toShort())
+        data.put(4, configuration.profile.toByte())
         data.put(5, 0)
         data.putShort(6, 0)
-        data.putLong(8, 0)
-        data.putLong(16, 0)
-        data.putInt(24, acceptedModelCapacity)
-        data.putInt(28, acceptedPendingObservationCapacity)
+        val acceptedCapabilities = configuration.requiredCapabilities or configuration.desiredCapabilities
+        data.putLong(8, acceptedCapabilities)
+        data.putLong(16, acceptedCapabilities)
+        data.putInt(24, if (configuration.requestedModelCapacity == 0) acceptedModelCapacity else configuration.requestedModelCapacity)
+        data.putInt(28, if (configuration.requestedPendingObservationCapacity == 0) acceptedPendingObservationCapacity else configuration.requestedPendingObservationCapacity)
         data.putInt(32, 0)
         data.putInt(36, 0)
         data.putInt(40, 0)
@@ -37,23 +41,18 @@ object M0aStartResultCodecV2 {
         data.putInt(52, 0)
         data.putInt(56, 0)
         data.putInt(60, 0)
-        data.putInt(64, ordinaryResponseBytes)
-        data.putInt(68, catchUpResponseBytes)
-        data.putShort(72, regionCommandLimit.toShort())
+        data.putInt(64, configuration.requestedOrdinaryResponseBytes)
+        data.putInt(68, configuration.requestedCatchUpResponseBytes)
+        data.putShort(72, configuration.requestedRegionCommandLimit.toShort())
         data.putShort(74, directionBinCount.toShort())
         data.putInt(76, regionEdgeMillimetres)
         data.putInt(80, pageEdgeMillimetres)
         data.putInt(84, 0)
-        data.putLong(88, 0)
-        data.putLong(96, baseline.geometryRevision)
-        data.putLong(104, baseline.lineageRevision)
-        data.putLong(112, 0)
-        data.putLong(120, 0)
-        data.putLong(128, 0)
-        data.putLong(136, baseline.styleRevision)
-        data.putLong(144, 0)
-        data.putLong(152, 0)
-        data.putLong(160, 0)
+        val revisions = configuration.restoredRevisions.copyOf()
+        revisions[1] = if (baseline.geometryRevision == 0L) revisions[1] else baseline.geometryRevision
+        revisions[2] = if (baseline.lineageRevision == 0L) revisions[2] else baseline.lineageRevision
+        revisions[6] = if (baseline.styleRevision == 0L) revisions[6] else baseline.styleRevision
+        revisions.forEachIndexed { index, revision -> data.putLong(88 + index * 8, revision) }
         data.putLong(168, 1)
         data.putLong(176, 0)
         return packet

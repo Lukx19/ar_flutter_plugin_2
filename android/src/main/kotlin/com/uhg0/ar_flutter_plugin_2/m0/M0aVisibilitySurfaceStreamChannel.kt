@@ -412,8 +412,12 @@ class M0aVisibilitySurfaceStreamChannel(
             (request.acknowledgedTransactionId != committedBaseline.transactionId ||
                 request.acknowledgedGeometryRevision != committedBaseline.geometryRevision ||
                 request.acknowledgedLineageRevision != committedBaseline.lineageRevision)
-        val styleMismatch = request.nextStyleRevision != 0L &&
-            request.nextStyleRevision != committedBaseline.styleRevision + 1
+        val expectedStyleRevision = if (request.styleRecords.isEmpty()) {
+            committedBaseline.styleRevision
+        } else {
+            committedBaseline.styleRevision + 1
+        }
+        val styleMismatch = request.nextStyleRevision != expectedStyleRevision
         return structuralMismatch || styleMismatch
     }
 

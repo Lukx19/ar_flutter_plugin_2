@@ -10,16 +10,34 @@ package com.uhg0.ar_flutter_plugin_2.m0
  * binding-start result therefore reports the canonical binding transaction
  * value while the full cut remains available to the native stream.
  */
-class M0aCommittedBaselineAuthority(
-    initial: M0aCommittedBaselineV1 = M0aCommittedBaselineV1.ZERO,
+data class M0aCommittedBaselineScopeV1(
+    val sessionId: M0aUuid,
+    val captureGroupId: M0aUuid,
+    val sessionGeneration: Long,
+    val groupGeneration: Long,
+    val coverageEpoch: Long,
 ) {
-    @Volatile private var value = initial
+    companion object {
+        fun from(request: M0aControlRequest): M0aCommittedBaselineScopeV1 =
+            M0aCommittedBaselineScopeV1(
+                sessionId = request.sessionId,
+                captureGroupId = request.captureGroupId,
+                sessionGeneration = request.sessionGeneration,
+                groupGeneration = request.groupGeneration,
+                coverageEpoch = request.coverageEpoch,
+            )
+    }
+}
+
+class M0aCommittedBaselineAuthority {
+    private val values = mutableMapOf<M0aCommittedBaselineScopeV1, M0aCommittedBaselineV1>()
 
     @Synchronized
-    fun snapshot(): M0aCommittedBaselineV1 = value
+    fun snapshot(scope: M0aCommittedBaselineScopeV1): M0aCommittedBaselineV1 =
+        values[scope] ?: M0aCommittedBaselineV1.ZERO
 
     @Synchronized
-    fun publish(next: M0aCommittedBaselineV1) {
-        value = next
+    fun publish(scope: M0aCommittedBaselineScopeV1, next: M0aCommittedBaselineV1) {
+        values[scope] = next
     }
 }
