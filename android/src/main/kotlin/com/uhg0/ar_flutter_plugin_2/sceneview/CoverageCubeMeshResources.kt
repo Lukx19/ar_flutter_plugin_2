@@ -71,6 +71,7 @@ internal class CoverageCubeMeshResources(
     private var outlineIndexStaging: java.nio.IntBuffer? = null
     private var lastRevision = Long.MIN_VALUE
     private var destroyed = false
+    private val presentationSelector = CoveragePresentationSelector(capacity)
 
     init {
         // This exact per-cube buffer ledger is 736 bytes: 128 bytes vertex
@@ -121,7 +122,7 @@ internal class CoverageCubeMeshResources(
         materialInstance: MaterialInstance,
         pointSizePx: Float,
     ) {
-        val presentation = snapshot.boundedForPresentation(capacity)
+        val presentation = presentationSelector.select(snapshot)
         check(presentation.capacity == capacity)
         check(presentation.count in 0..capacity)
         check(presentation.positions.size == presentation.count * POSITION_COMPONENTS)

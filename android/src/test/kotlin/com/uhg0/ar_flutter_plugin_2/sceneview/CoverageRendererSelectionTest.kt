@@ -100,4 +100,96 @@ class CoverageRendererSelectionTest {
         assertTrue(update.reset)
         assertEquals(2, update.spans.single().colors.size)
     }
+
+    @Test
+    fun `ordinary retained-row change preserves selected identities and emits one dirty span`() {
+        val selector = CoveragePresentationSelector(2)
+        selector.select(
+            CoveragePointRenderSnapshot(
+                revision = 1,
+                enabled = true,
+                capacity = 4,
+                count = 4,
+                keys = longArrayOf(30, 10, 20, 40),
+                positions = FloatArray(12),
+                colors = IntArray(4),
+            ),
+        )
+
+        val bounded = selector.select(
+            CoveragePointRenderSnapshot(
+                revision = 2,
+                enabled = true,
+                capacity = 4,
+                count = 4,
+                keys = longArrayOf(30, 10, 20, 40),
+                positions = floatArrayOf(0f, 0f, 0f, 11f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f),
+                colors = IntArray(4),
+                update = com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate(
+                    geometryRevision = 2,
+                    visibilityRevision = 0,
+                    enabled = true,
+                    count = 4,
+                    spans = listOf(
+                        com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan(
+                            startSlot = 1,
+                            positions = floatArrayOf(11f, 0f, 0f),
+                            colors = intArrayOf(0),
+                        ),
+                    ),
+                    reset = false,
+                ),
+            ),
+        )
+
+        assertArrayEquals(longArrayOf(10, 20), bounded.keys)
+        assertEquals(false, checkNotNull(bounded.update).reset)
+        assertEquals(0, bounded.update.spans.single().startSlot)
+        assertArrayEquals(floatArrayOf(11f, 0f, 0f), bounded.update.spans.single().positions, 0f)
+    }
+
+    @Test
+    fun `new lower identity replaces only by an explicit reset`() {
+        val selector = CoveragePresentationSelector(2)
+        selector.select(
+            CoveragePointRenderSnapshot(
+                revision = 1,
+                enabled = true,
+                capacity = 3,
+                count = 3,
+                keys = longArrayOf(30, 10, 20),
+                positions = FloatArray(9),
+                colors = IntArray(3),
+            ),
+        )
+
+        val bounded = selector.select(
+            CoveragePointRenderSnapshot(
+                revision = 2,
+                enabled = true,
+                capacity = 4,
+                count = 4,
+                keys = longArrayOf(30, 10, 20, 5),
+                positions = FloatArray(12),
+                colors = IntArray(4),
+                update = com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate(
+                    geometryRevision = 2,
+                    visibilityRevision = 0,
+                    enabled = true,
+                    count = 4,
+                    spans = listOf(
+                        com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan(
+                            startSlot = 3,
+                            positions = floatArrayOf(0f, 0f, 0f),
+                            colors = intArrayOf(0),
+                        ),
+                    ),
+                    reset = false,
+                ),
+            ),
+        )
+
+        assertArrayEquals(longArrayOf(5, 10), bounded.keys)
+        assertTrue(checkNotNull(bounded.update).reset)
+    }
 }

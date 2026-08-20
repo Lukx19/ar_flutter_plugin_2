@@ -44,6 +44,7 @@ internal class CoveragePointMeshResources(
 
     private var lastRevision = Long.MIN_VALUE
     private var destroyed = false
+    private val presentationSelector = CoveragePresentationSelector(capacity)
     private val uploadCoordinator = CoveragePointUploadCoordinator(
         capacity = capacity,
         uploader = FilamentCoveragePointVertexUploader(engine, vertexBuffer),
@@ -82,7 +83,7 @@ internal class CoveragePointMeshResources(
         materialInstance: MaterialInstance,
         pointSizePx: Float,
     ) {
-        val presentation = snapshot.boundedForPresentation(capacity)
+        val presentation = presentationSelector.select(snapshot)
         check(presentation.capacity == capacity)
         check(presentation.count in 0..capacity)
         check(presentation.positions.size == presentation.count * POSITION_COMPONENTS)
