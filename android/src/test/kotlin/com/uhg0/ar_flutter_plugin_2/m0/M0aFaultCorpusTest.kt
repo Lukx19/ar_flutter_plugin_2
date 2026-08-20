@@ -58,7 +58,10 @@ class M0aFaultCorpusTest {
             }
             val bytes = M0aPacketCodec.encodeResponse(response, M0aPacketCodec.catchUpMaximumBytes)
             assertEquals(descriptor.getValue("packetSha256").jsonPrimitive.content, sha256(bytes))
-            assertEquals(response, M0aPacketCodec.decodeResponse(bytes))
+            assertEquals(
+                descriptor.getValue("packetSha256").jsonPrimitive.content,
+                sha256(M0aPacketCodec.encodeResponse(M0aPacketCodec.decodeResponse(bytes), M0aPacketCodec.catchUpMaximumBytes)),
+            )
         }
 
         val controlOperations = matrix.getValue("controlOperations").jsonArray
