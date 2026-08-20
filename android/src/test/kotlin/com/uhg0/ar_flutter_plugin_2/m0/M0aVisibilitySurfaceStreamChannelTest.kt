@@ -1,6 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.m0
 
 import io.flutter.plugin.common.BinaryMessenger
+import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.CountDownLatch
@@ -127,6 +128,12 @@ class M0aVisibilitySurfaceStreamChannelTest {
         assertEquals(168, binding.transportInstrumentation.tryEncodeBoundedSummary(1_000_000_000)!!.size)
         assertNull(binding.transportInstrumentation.tryEncodeBoundedSummary(1_100_000_000))
         assertEquals(168, binding.transportInstrumentation.tryEncodeBoundedSummary(1_200_000_000)!!.size)
+
+        val receipt = File(System.getProperty("user.dir"), "build/m0a/t5_receipt.json")
+        receipt.parentFile.mkdirs()
+        receipt.writeText(
+            """{"tier":"T5","status":"pass","submittedRequests":${telemetry.submittedRequests},"acceptedRequests":${telemetry.acceptedRequests},"replayedRequests":${telemetry.replayedRequests},"ordinaryRootSurfaceBytes":${telemetry.ordinaryRootSurfaceBytes},"peakQueueDepth":${telemetry.peakQueueDepth},"maximumSingleAllocationBytes":${telemetry.maximumSingleAllocationBytes},"peakWorkingSetBytes":${telemetry.peakWorkingSetBytes},"retainedAllocationBytes":${telemetry.retainedAllocationBytes},"summaryBytes":168,"summaryRateHz":5,"scratchBytesPerSide":${telemetry.resourceLimits.scratchBytesPerSide}}""",
+        )
 
         val conflict = messenger.exchange(request(sequence = 1, token = 92))
         val conflictResponse = M0aPacketCodec.decodeResponse(conflict)
