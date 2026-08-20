@@ -47,6 +47,11 @@ void main() {
             'diagnostics': _initialDiagnostics(100, 200),
           },
         'startGrid' => _delta(revision: 1, reset: true),
+        'startGridSummary' => <String, Object>{
+            ..._delta(revision: 1, reset: true),
+          }
+            ..remove('upsertKeys')
+            ..remove('removalKeys'),
         'ackGeometry' => <String, Object>{'accepted': true},
         'requestSnapshot' => _delta(revision: 7, reset: true),
         'checkpointBarrier' => _delta(revision: 8, reset: true),
@@ -176,6 +181,18 @@ void main() {
     final manager = ARVisibilityGridManager(91);
     final received = <ARVisibilityGridDeltaSummary>[];
     manager.summaries.listen(received.add);
+
+    final started = await manager.startGridSummary(
+      ARVisibilityGridGroupConfig(
+        groupId: 'group',
+        groupGeneration: 3,
+        voxelSizeMeters: 0.1,
+        capacity: 100,
+        worldFromGroupGl: Float64List.fromList(_identity),
+        groupFromWorldGl: Float64List.fromList(_identity),
+      ),
+    );
+    expect(started.geometryRevision, 1);
 
     final summary = <String, Object>{
       ..._delta(revision: 2),
