@@ -99,7 +99,10 @@ class M0cLockedCampaignTest {
                 listOf("T0", "T1", "T2", "T3").forEach { add(JsonPrimitive(it)) }
             })
             put("pathLength", policy.pathLength)
+            put("cumulativeOwnerCount", policy.cumulativeOwnerCount)
+            put("cumulativePageCount", policy.cumulativePageCount)
             put("cumulativeSurfaceCount", policy.cumulativeSurfaceCount)
+            put("reverseRevisitIdentity", policy.reverseRevisitIdentity)
             put("selectedCandidateOrNone", policy.selectedCandidateOrNone)
             put("candidates", buildJsonObject {
                 policy.candidates.forEach { (id, value) ->
@@ -109,9 +112,13 @@ class M0cLockedCampaignTest {
                         put("maximumPrefetchRegions", value.maximumPrefetchRegions)
                         put("maximumOpenFiles", value.maximumOpenFiles)
                         put("maximumDirectoryBytes", value.maximumDirectoryBytes)
+                        put("measuredOwnerCount", value.measuredOwnerCount)
+                        put("measuredPageCount", value.measuredPageCount)
+                        put("measuredSurfaceCount", value.measuredSurfaceCount)
                         put("stableRevisitIdentity", value.stableRevisitIdentity)
                         put("noPartialDemand", value.noPartialDemand)
                         put("noStarvation", value.noStarvation)
+                        put("complexityScore", value.complexityScore)
                         put("gateFailures", buildJsonArray {
                             value.gateFailures.forEach { add(JsonPrimitive(it)) }
                         })

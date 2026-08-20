@@ -31,6 +31,54 @@ data class M0PageCoordinate(val region: M0RegionCoordinate, val x: Int, val y: I
         M0PageCoordinate::y,
         M0PageCoordinate::z,
     )
+
+    val isValidLocalPage: Boolean get() = x in 0..2 && y in 0..2 && z in 0..2
+    val linearIndex: Int get() {
+        require(isValidLocalPage)
+        return x + 3 * (y + 3 * z)
+    }
+}
+
+data class M0ResolvedResidencyCoordinate(
+    val xMillimetres: Int,
+    val yMillimetres: Int,
+    val zMillimetres: Int,
+    val owner: M0RegionCoordinate,
+    val page: M0PageCoordinate,
+)
+
+data class M0ResidencyDecision(
+    val accepted: Boolean,
+    val active: List<M0RegionCoordinate>,
+    val reason: String? = null,
+)
+
+/** The common signed-owner residency seam used by every M0c policy drain. */
+class M0ResidencyModel(private val maxResidentRegions: Int) {
+    private val activeOwners = sortedSetOf<M0RegionCoordinate>()
+
+    init {
+        require(maxResidentRegions > 0)
+    }
+
+    val activeRegions: List<M0RegionCoordinate> get() = activeOwners.toList()
+
+    fun resolveMillimetres(x: Int, y: Int, z: Int): M0ResolvedResidencyCoordinate {
+        val owner = m0RegionForMillimetres(x, y, z)
+        val page = owner.pageForMillimetres(x, y, z)
+        require(page.isValidLocalPage)
+        return M0ResolvedResidencyCoordinate(x, y, z, owner, page)
+    }
+
+    fun submitDemand(requested: Collection<M0RegionCoordinate>): M0ResidencyDecision {
+        val demanded = requested.toSortedSet()
+        if (demanded.size > maxResidentRegions) {
+            return M0ResidencyDecision(false, activeRegions, "densityExceeded")
+        }
+        activeOwners.clear()
+        activeOwners.addAll(demanded)
+        return M0ResidencyDecision(true, activeRegions)
+    }
 }
 
 fun m0RegionForMillimetres(x: Int, y: Int, z: Int): M0RegionCoordinate = M0RegionCoordinate(
