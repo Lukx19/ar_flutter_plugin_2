@@ -439,6 +439,54 @@ class M0aFaultCorpusTest {
             assertEquals(112, M0aPacketCodec.responseHeaderBytes)
             assertEquals(104, M0aControlCodec.requestHeaderBytes)
             assertEquals(128, M0aControlCodec.responseHeaderBytes)
+            when (name) {
+                "ordinary-min-4096", "ordinary-max-16384", "catch-up-max-65536" -> {
+                    val ceiling = when (name) {
+                        "ordinary-min-4096" -> M0aPacketCodec.responseMinimumBytes
+                        "ordinary-max-16384" -> M0aPacketCodec.responseMaximumBytes
+                        else -> M0aPacketCodec.catchUpMaximumBytes
+                    }
+                    val encoded = M0aPacketCodec.encodeResponse(
+                        M0aPacketCodec.Response(
+                            messageKind = if (name == "catch-up-max-65536") 4 else 1,
+                            responseFlags = 0, resultFlags = 0, errorId = 0,
+                            requestSequence = 1, streamToken = 7, nextExpectedRequestSequence = 2,
+                            payload = ByteArray(ceiling - M0aPacketCodec.responseHeaderBytes),
+                        ), ceiling,
+                    )
+                    assertEquals(ceiling, encoded.size)
+                }
+                "diagnostic-max-1024" -> {
+                    val encoded = M0aPacketCodec.encodeResponse(
+                        M0aPacketCodec.Response(
+                            messageKind = 1, responseFlags = 0, resultFlags = 0, errorId = 0,
+                            requestSequence = 1, streamToken = 7, nextExpectedRequestSequence = 2,
+                            diagnostic = ByteArray(1024),
+                        ), M0aPacketCodec.responseMinimumBytes,
+                    )
+                    assertEquals(1024, M0aPacketCodec.decodeResponse(encoded).diagnostic.size)
+                }
+                "portable-ordinal-zero" -> assertEquals(0, M0aPacketCodec.decodeRequest(baseVectors().request).acknowledgedTransactionId)
+                "portable-ordinal-max" -> {
+                    val encoded = M0aPacketCodec.encodeRequest(baseRequest().copy(streamToken = Long.MAX_VALUE, requestSequence = Long.MAX_VALUE))
+                    assertEquals(Long.MAX_VALUE, M0aPacketCodec.decodeRequest(encoded).streamToken)
+                }
+                "style-count-max" -> {
+                    val count = (M0aPacketCodec.requestCeilingBytes - M0aPacketCodec.requestHeaderBytes) / M0aPacketCodec.styleRecordBytes
+                    assertEquals(M0aPacketCodec.requestCeilingBytes, M0aPacketCodec.encodeRequest(baseRequest().copy(styleRecords = List(count) { ByteArray(8) }, commandBytes = byteArrayOf())).size)
+                }
+                "command-length-max" -> {
+                    val count = M0aPacketCodec.requestCeilingBytes - M0aPacketCodec.requestHeaderBytes
+                    assertEquals(M0aPacketCodec.requestCeilingBytes, M0aPacketCodec.encodeRequest(baseRequest().copy(styleRecords = emptyList(), commandBytes = ByteArray(count))).size)
+                }
+                "allocation-before-validation-zero" -> {
+                    val malformed = baseVectors().request.copyOf()
+                    ByteBuffer.wrap(malformed).order(ByteOrder.LITTLE_ENDIAN).putInt(12, -1).putInt(72, 0)
+                    ByteBuffer.wrap(malformed).order(ByteOrder.LITTLE_ENDIAN).putInt(72, crc32(malformed, 72))
+                    assertThrows(IllegalArgumentException::class.java) { M0aPacketCodec.decodeRequest(malformed) }
+                }
+                "live-decompression-zero" -> assertTrue(M0RegionShardV5.decode(M0RegionShardV5.encodeCanonical(M0RegionCoordinate(0, 0, 0), 1, 0, emptyList(), emptyList(), M0RegionShardV5.Compression.NONE)).surfaceRows.isEmpty())
+            }
             return
         }
         if (name == "unknown-kind" || name.startsWith("unknown-error")) {
@@ -455,10 +503,101 @@ class M0aFaultCorpusTest {
             }
             return
         }
-        val bytes = baseVectors().request.copyOf()
-        bytes[72] = (bytes[72].toInt() xor 1).toByte()
-        assertThrows(IllegalArgumentException::class.java) { M0aPacketCodec.decodeRequest(bytes) }
+        when (name) {
+            "ordinary-one-over", "catch-up-one-over" -> {
+                val ceiling = if (name == "ordinary-one-over") M0aPacketCodec.responseMaximumBytes else M0aPacketCodec.catchUpMaximumBytes
+                assertThrows(IllegalArgumentException::class.java) {
+                    M0aPacketCodec.encodeResponse(
+                        M0aPacketCodec.Response(
+                            messageKind = 1, responseFlags = 0, resultFlags = 0, errorId = 0,
+                            requestSequence = 1, streamToken = 7, nextExpectedRequestSequence = 2,
+                            payload = ByteArray(ceiling - M0aPacketCodec.responseHeaderBytes + 1),
+                        ), ceiling,
+                    )
+                }
+            }
+            "diagnostic-one-over" -> assertThrows(IllegalArgumentException::class.java) {
+                M0aPacketCodec.encodeResponse(
+                    M0aPacketCodec.Response(
+                        messageKind = 1, responseFlags = 0, resultFlags = 0, errorId = 0,
+                        requestSequence = 1, streamToken = 7, nextExpectedRequestSequence = 2,
+                        diagnostic = ByteArray(1025),
+                    ), M0aPacketCodec.responseMinimumBytes,
+                )
+            }
+            "portable-ordinal-overflow" -> assertThrows(IllegalArgumentException::class.java) {
+                M0aPacketCodec.encodeRequest(baseRequest().copy(streamToken = Long.MIN_VALUE))
+            }
+            "reserved-bits", "live-compression-bit" -> assertThrows(IllegalArgumentException::class.java) {
+                M0aPacketCodec.encodeRequest(baseRequest().copy(requestFlags = 0x40))
+            }
+            "crc-response" -> {
+                val bytes = baseVectors().response.copyOf().also { it[104] = (it[104].toInt() xor 1).toByte() }
+                assertThrows(IllegalArgumentException::class.java) { M0aPacketCodec.decodeResponse(bytes) }
+            }
+            "crc-control-request", "crc-control-response" -> {
+                val request = boundaryControlRequest()
+                val bytes = if (name == "crc-control-request") {
+                    M0aControlCodec.encodeRequest(request).also { it[96] = (it[96].toInt() xor 1).toByte() }
+                } else {
+                    val lifecycle = M0aControlLifecycle()
+                    lifecycle.handle(request, M0aControlCodec.encodeRequest(request)).also { it[120] = (it[120].toInt() xor 1).toByte() }
+                }
+                assertThrows(IllegalArgumentException::class.java) {
+                    if (name == "crc-control-request") M0aControlCodec.decodeRequest(bytes) else M0aControlCodec.decodeResponse(bytes)
+                }
+            }
+            "truncated-every-header" -> {
+                val request = boundaryControlRequest()
+                val lifecycle = M0aControlLifecycle()
+                val controlRequest = M0aControlCodec.encodeRequest(request)
+                val packets = listOf(
+                    baseVectors().request to M0aPacketCodec.requestHeaderBytes,
+                    baseVectors().response to M0aPacketCodec.responseHeaderBytes,
+                    controlRequest to M0aControlCodec.requestHeaderBytes,
+                    lifecycle.handle(request, controlRequest) to M0aControlCodec.responseHeaderBytes,
+                )
+                packets.forEachIndexed { index, (packet, header) ->
+                    repeat(header) { length ->
+                        assertThrows(IllegalArgumentException::class.java) {
+                            when (index) {
+                                0 -> M0aPacketCodec.decodeRequest(packet.copyOf(length))
+                                1 -> M0aPacketCodec.decodeResponse(packet.copyOf(length))
+                                2 -> M0aControlCodec.decodeRequest(packet.copyOf(length))
+                                else -> M0aControlCodec.decodeResponse(packet.copyOf(length))
+                            }
+                        }
+                    }
+                }
+            }
+            else -> {
+                val bytes = baseVectors().request.copyOf()
+                val data = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+                when (name) {
+                    "length-underflow" -> data.putInt(12, bytes.size - 1)
+                    "length-overflow" -> data.putInt(12, bytes.size + 1)
+                    "multiplication-overflow" -> data.putShort(60, 0xffff.toShort())
+                    else -> bytes[72] = (bytes[72].toInt() xor 1).toByte()
+                }
+                if (name == "length-underflow" || name == "length-overflow" || name == "multiplication-overflow") {
+                    data.putInt(72, 0)
+                    data.putInt(72, crc32(bytes, 72))
+                }
+                assertThrows(IllegalArgumentException::class.java) { M0aPacketCodec.decodeRequest(bytes) }
+            }
+        }
     }
+
+    private fun baseRequest(): M0aPacketCodec.Request = M0aPacketCodec.decodeRequest(baseVectors().request)
+
+    private fun boundaryControlRequest(): M0aControlRequest = M0aControlRequest(
+        M0aControlOperation.START, 0, uuid(2), uuid(10), uuid(20), 1, 2, 3, 0,
+        hex(
+            fixture("m0a_crosslang_matrix_v2.json").getValue("controlOperations").jsonArray
+                .map { it.jsonObject }.first { it.int("operation") == 1 }
+                .getValue("payloadHex").jsonPrimitive.content,
+        ),
+    )
 
     private fun executeLifecycle(matrix: JsonObject, descriptor: JsonObject) {
         val name = descriptor.getValue("covers").jsonPrimitive.content

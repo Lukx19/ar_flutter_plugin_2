@@ -590,7 +590,7 @@
       "executor": "family:malformed",
       "seed": 19,
       "expectedPacketSha256": "17fb4d8159f5594f537c7d4de2aea5b669ed312173cd21f50476ecc5bd6f5695",
-      "expectedErrorId": 6,
+      "expectedErrorId": 0,
       "expectedResult": "codec-error"
     },
     {
@@ -749,7 +749,7 @@
       "id": "boundary:style-count-max",
       "covers": "style-count-max",
       "executor": "boundary:style-count-max",
-      "expectedErrorId": 6,
+      "expectedErrorId": 0,
       "expectedResult": "rejected-before-effect"
     },
     {
