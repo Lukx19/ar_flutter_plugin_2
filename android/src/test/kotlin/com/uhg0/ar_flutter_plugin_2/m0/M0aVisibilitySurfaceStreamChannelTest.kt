@@ -130,7 +130,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
         assertEquals(168, binding.transportInstrumentation.tryEncodeBoundedSummary(1_200_000_000)!!.size)
 
         val receipt = File(System.getProperty("user.dir"), "build/m0a/t5_receipt.json")
-        receipt.parentFile.mkdirs()
+        receipt.parentFile?.mkdirs()
         receipt.writeText(
             """{"tier":"T5","status":"pass","submittedRequests":${telemetry.submittedRequests},"acceptedRequests":${telemetry.acceptedRequests},"replayedRequests":${telemetry.replayedRequests},"ordinaryRootSurfaceBytes":${telemetry.ordinaryRootSurfaceBytes},"peakQueueDepth":${telemetry.peakQueueDepth},"maximumSingleAllocationBytes":${telemetry.maximumSingleAllocationBytes},"peakWorkingSetBytes":${telemetry.peakWorkingSetBytes},"retainedAllocationBytes":${telemetry.retainedAllocationBytes},"summaryBytes":168,"summaryRateHz":5,"scratchBytesPerSide":${telemetry.resourceLimits.scratchBytesPerSide}}""",
         )

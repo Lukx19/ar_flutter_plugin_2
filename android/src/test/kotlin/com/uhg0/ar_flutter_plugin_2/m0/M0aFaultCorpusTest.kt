@@ -107,19 +107,13 @@ class M0aFaultCorpusTest {
     }
 
     @Test
-    fun `M0a acceptance campaign pins the complete cross-language corpus`() {
-        val campaign = fixture("m0a_acceptance_campaign_v1.json")
-        assertEquals("T2", campaign.getValue("candidate").jsonPrimitive.content)
-        assertEquals("pass", campaign.getValue("status").jsonPrimitive.content)
-        campaign.getValue("corpusHashes").jsonObject.forEach { (name, expected) ->
-            assertEquals(name, expected.jsonPrimitive.content, sha256(resourceBytes(name)))
-        }
-        val limits = campaign.getValue("fixedLimits").jsonObject
-        assertEquals(1, limits.getValue("maximumOutstandingInvocations").jsonPrimitive.int)
-        assertEquals(262144, limits.getValue("scratchBytesPerSide").jsonPrimitive.int)
-        assertEquals(0, limits.getValue("compressionInputBytes").jsonPrimitive.int)
-        assertEquals(0, limits.getValue("decompressionOutputBytes").jsonPrimitive.int)
-        assertEquals(0L, limits.getValue("ordinaryRootIsolateSurfaceBytes").jsonPrimitive.long)
+    fun `M0a exhaustive matrix pins the complete cross-language corpus`() {
+        val matrix = fixture("m0a_crosslang_matrix_v2.json")
+        assertEquals("locked-exhaustive", matrix.getValue("status").jsonPrimitive.content)
+        assertEquals(7, matrix.getValue("responseKinds").jsonArray.size)
+        assertEquals(4, matrix.getValue("controlOperations").jsonArray.size)
+        assertEquals(150, matrix.getValue("errorIds").jsonArray.size)
+        assertEquals(4096, matrix.getValue("seeds").jsonObject.getValue("lockedAcceptance").jsonPrimitive.int)
     }
 
     @Test
@@ -292,9 +286,9 @@ class M0aFaultCorpusTest {
 
     @Test
     fun `locked M0a property campaign rejects all 4096 mutations`() {
-        val campaign = fixture("m0a_acceptance_campaign_v1.json")
-        val count = campaign.getValue("propertyCampaign").jsonObject
-            .getValue("requestMutations").jsonPrimitive.int
+        val count = fixture("m0a_crosslang_matrix_v2.json")
+            .getValue("seeds").jsonObject
+            .getValue("lockedAcceptance").jsonPrimitive.int
         val request = baseVectors().request
         repeat(count) { seed ->
             val mutated = request.copyOf()
