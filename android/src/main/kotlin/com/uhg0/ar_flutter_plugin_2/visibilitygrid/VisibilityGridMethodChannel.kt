@@ -85,6 +85,8 @@ class VisibilityGridMethodChannel(
             when (call.method) {
                 "init" -> initialize(call, result)
                 "startGrid" -> startGrid(call, result)
+                "startGridSummary" -> startGrid(call, result, summaryOnly = true)
+                "pullGridDelta" -> pullGridDelta(call, result)
                 "ackGeometry" -> result.success(
                     mapOf("accepted" to requireGrid().ackGeometry(call.geometryAck())),
                 )
@@ -454,7 +456,11 @@ class VisibilityGridMethodChannel(
         )
     }
 
-    private fun startGrid(call: MethodCall, result: MethodChannel.Result) {
+    private fun startGrid(
+        call: MethodCall,
+        result: MethodChannel.Result,
+        summaryOnly: Boolean = false,
+    ) {
         val next =
             VisibilityGridGroupConfig(
                 groupId = call.requiredString("groupId"),
@@ -520,7 +526,24 @@ class VisibilityGridMethodChannel(
             }
         publishRenderer()
         restartHealthHeartbeat()
-        result.success(deltaWireMap(snapshot))
+        result.success(
+            if (summaryOnly) deltaSummaryWireMap(snapshot) else deltaWireMap(snapshot),
+        )
+    }
+
+    /**
+     * Background-worker-only semantic hand-off. The ordinary callback names
+     * this retained revision without moving stable keys through the root
+     * isolate. The delta stays retained until the existing ack accepts it.
+     */
+    private fun pullGridDelta(call: MethodCall, result: MethodChannel.Result) {
+        requireIdentity(call)
+        val delta = requireGrid().inFlightGeometryDelta()
+            ?: throw VisibilityGridMethodException(
+                "VG_NO_PENDING_DELTA",
+                "No retained visibility-grid delta is available",
+            )
+        result.success(deltaWireMap(delta))
     }
 
     private fun applyVisibility(call: MethodCall, result: MethodChannel.Result) {
@@ -726,8 +749,8 @@ class VisibilityGridMethodChannel(
                             runCatching(::publishRenderer)
                                 .onFailure(::emitRendererError)
                             channel.invokeMethod(
-                                "onGridDelta",
-                                deltaWireMap(delta, context.renderer),
+                                "onGridSummary",
+                                deltaSummaryWireMap(delta, context.renderer),
                             )
                         }
                     }
@@ -1039,6 +1062,28 @@ class VisibilityGridMethodChannel(
             enrichDiagnostics(delta.diagnostics, it)
         } ?: delta.diagnostics
         return delta.copy(diagnostics = enriched).toWireMap(currentHealth(enriched))
+    }
+
+    /** Fixed-size ordinary callback map: it has no stable-key arrays. */
+    private fun deltaSummaryWireMap(
+        delta: VisibilityGridDelta,
+        rendererState: VisibilityGridRendererState? = renderer,
+    ): Map<String, Any> {
+        val enriched = rendererState?.let {
+            enrichDiagnostics(delta.diagnostics, it)
+        } ?: delta.diagnostics
+        return mapOf(
+            "version" to VISIBILITY_GRID_WIRE_VERSION,
+            "groupId" to delta.groupId,
+            "groupGeneration" to delta.groupGeneration,
+            "sessionGeneration" to delta.sessionGeneration,
+            "baseGeometryRevision" to delta.baseGeometryRevision,
+            "geometryRevision" to delta.geometryRevision,
+            "reset" to delta.reset,
+            "capacity" to delta.capacity,
+            "sourceHealth" to currentHealth(enriched),
+            "diagnostics" to enriched.toWireMap(),
+        )
     }
 
     private fun requireIdentity(call: MethodCall) {

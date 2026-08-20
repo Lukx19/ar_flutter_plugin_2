@@ -171,6 +171,27 @@ void main() {
     expect(errors.single.code, ARVisibilityGridErrorCode.protocolInvalid);
     await manager.dispose();
   });
+
+  test('ordinary summary callbacks contain no semantic surface keys', () async {
+    final manager = ARVisibilityGridManager(91);
+    final received = <ARVisibilityGridDeltaSummary>[];
+    manager.summaries.listen(received.add);
+
+    final summary = <String, Object>{
+      ..._delta(revision: 2),
+    }
+      ..remove('upsertKeys')
+      ..remove('removalKeys');
+    await _platformCall(channel, 'onGridSummary', summary);
+
+    expect(received.single.geometryRevision, 2);
+    expect(received.single.capacity, 100);
+    await expectLater(
+      _platformCall(channel, 'onGridSummary', _delta(revision: 3)),
+      throwsA(isA<PlatformException>()),
+    );
+    await manager.dispose();
+  });
 }
 
 Map<String, Object> _health() => const <String, Object>{

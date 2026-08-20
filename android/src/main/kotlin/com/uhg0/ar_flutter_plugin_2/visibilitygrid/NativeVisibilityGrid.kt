@@ -570,6 +570,10 @@ class NativeVisibilityGrid(
         return true
     }
 
+    /** Returns the exact revision retained until its consumer acknowledges it. */
+    @Synchronized
+    fun inFlightGeometryDelta(): VisibilityGridDelta? = inFlightDelta
+
     @Synchronized
     fun requestSnapshot(
         request: VisibilityGridSnapshotRequest,

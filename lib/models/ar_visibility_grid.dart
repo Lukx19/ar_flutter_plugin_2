@@ -905,6 +905,99 @@ class ARVisibilityGridDelta {
   final ARVisibilityGridDiagnostics diagnostics;
 }
 
+/// Fixed-size notification that a native-owned geometry revision is ready.
+///
+/// This is deliberately distinct from [ARVisibilityGridDelta]: ordinary
+/// platform callbacks carry no stable-key collections into the root isolate.
+/// A background worker must pull and validate the corresponding delta before
+/// acknowledging the revision. Full deltas remain available only through the
+/// explicit worker-pull/recovery endpoint.
+class ARVisibilityGridDeltaSummary {
+  ARVisibilityGridDeltaSummary({
+    required this.groupId,
+    required this.groupGeneration,
+    required this.sessionGeneration,
+    required this.baseGeometryRevision,
+    required this.geometryRevision,
+    required this.reset,
+    required this.capacity,
+    required this.sourceHealth,
+    required this.diagnostics,
+  });
+
+  factory ARVisibilityGridDeltaSummary.fromMap(Map<Object?, Object?> map) {
+    if (map['version'] != visibilityGridWireVersion) {
+      throw const FormatException('Unsupported visibility-grid wire version.');
+    }
+    // Rejecting these fields is intentional: accepting them would make an
+    // ordinary root-isolate callback a semantic-surface transport again.
+    if (map.containsKey('upsertKeys') || map.containsKey('removalKeys')) {
+      throw const FormatException(
+        'Visibility-grid summary must not contain semantic keys.',
+      );
+    }
+    final groupId = map['groupId'];
+    final groupGeneration = map['groupGeneration'];
+    final sessionGeneration = map['sessionGeneration'];
+    final baseGeometryRevision = map['baseGeometryRevision'];
+    final geometryRevision = map['geometryRevision'];
+    final reset = map['reset'];
+    final capacity = map['capacity'];
+    final sourceHealth = map['sourceHealth'];
+    final diagnostics = map['diagnostics'];
+    if (groupId is! String ||
+        groupId.isEmpty ||
+        groupGeneration is! int ||
+        groupGeneration < 0 ||
+        sessionGeneration is! int ||
+        sessionGeneration < 0 ||
+        baseGeometryRevision is! int ||
+        baseGeometryRevision < 0 ||
+        geometryRevision is! int ||
+        geometryRevision <= baseGeometryRevision ||
+        reset is! bool ||
+        capacity is! int ||
+        capacity <= 0 ||
+        sourceHealth is! Map<Object?, Object?> ||
+        diagnostics is! Map<Object?, Object?>) {
+      throw const FormatException('Invalid visibility-grid delta summary.');
+    }
+    if (!reset && geometryRevision != baseGeometryRevision + 1) {
+      throw const FormatException(
+        'Non-reset geometry revisions must be adjacent.',
+      );
+    }
+    final parsedDiagnostics = ARVisibilityGridDiagnostics.fromMap(diagnostics);
+    if (parsedDiagnostics.geometryRevision != geometryRevision ||
+        parsedDiagnostics.stableVoxelCapacity != capacity) {
+      throw const FormatException(
+        'Visibility-grid diagnostics do not match the summary revision.',
+      );
+    }
+    return ARVisibilityGridDeltaSummary(
+      groupId: groupId,
+      groupGeneration: groupGeneration,
+      sessionGeneration: sessionGeneration,
+      baseGeometryRevision: baseGeometryRevision,
+      geometryRevision: geometryRevision,
+      reset: reset,
+      capacity: capacity,
+      sourceHealth: ARVisibilityGridSourceHealth.fromMap(sourceHealth),
+      diagnostics: parsedDiagnostics,
+    );
+  }
+
+  final String groupId;
+  final int groupGeneration;
+  final int sessionGeneration;
+  final int baseGeometryRevision;
+  final int geometryRevision;
+  final bool reset;
+  final int capacity;
+  final ARVisibilityGridSourceHealth sourceHealth;
+  final ARVisibilityGridDiagnostics diagnostics;
+}
+
 bool _hasDuplicates(Iterable<int> values) {
   final unique = <int>{};
   for (final value in values) {

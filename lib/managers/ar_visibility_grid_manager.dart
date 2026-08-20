@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:ui' as ui;
 
 import 'package:flutter/services.dart';
 
@@ -7,13 +8,17 @@ import '../models/ar_visibility_grid.dart';
 /// Strict Dart endpoint for the per-view `visibility_grid_wire_v1` channel.
 class ARVisibilityGridManager {
   ARVisibilityGridManager(int viewId, {MethodChannel? channel})
-      : _channel = channel ?? MethodChannel('arpointcloud_$viewId') {
+      : viewId = viewId,
+        _channel = channel ?? MethodChannel('arpointcloud_$viewId') {
     _channel.setMethodCallHandler(_handleNativeCall);
   }
 
   final MethodChannel _channel;
+  final int viewId;
   final StreamController<ARVisibilityGridDelta> _deltas =
       StreamController<ARVisibilityGridDelta>.broadcast(sync: true);
+  final StreamController<ARVisibilityGridDeltaSummary> _summaries =
+      StreamController<ARVisibilityGridDeltaSummary>.broadcast(sync: true);
   final StreamController<ARVisibilityGridError> _errors =
       StreamController<ARVisibilityGridError>.broadcast(sync: true);
   final StreamController<ARVisibilityGridSourceHealth> _health =
@@ -24,6 +29,9 @@ class ARVisibilityGridManager {
 
   /// Revisioned stable-key upserts, removals, and reset snapshots.
   Stream<ARVisibilityGridDelta> get deltas => _deltas.stream;
+
+  /// Fixed-size ordinary callbacks. No semantic keys cross the UI isolate.
+  Stream<ARVisibilityGridDeltaSummary> get summaries => _summaries.stream;
 
   /// Typed native protocol failures.
   Stream<ARVisibilityGridError> get errors => _errors.stream;
@@ -68,6 +76,22 @@ class ARVisibilityGridManager {
     return ARVisibilityGridDelta.fromMap(result);
   }
 
+  /// Starts native acquisition without materializing its reset keys on the
+  /// root isolate. A background worker must call [pullDeltaInBackground].
+  Future<ARVisibilityGridDeltaSummary> startGridSummary(
+    ARVisibilityGridGroupConfig config,
+  ) async {
+    _ensureActive();
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      'startGridSummary',
+      config.toMap(),
+    );
+    if (result == null) {
+      throw const FormatException('Missing visibility-grid start summary.');
+    }
+    return ARVisibilityGridDeltaSummary.fromMap(result);
+  }
+
   /// Acknowledges an atomically applied geometry revision.
   Future<bool> ackGeometry(ARVisibilityGridDelta delta) async {
     _ensureActive();
@@ -79,6 +103,23 @@ class ARVisibilityGridManager {
         'groupGeneration': delta.groupGeneration,
         'sessionGeneration': delta.sessionGeneration,
         'acceptedGeometryRevision': delta.geometryRevision,
+      },
+    );
+    return result?['accepted'] == true;
+  }
+
+  /// Acknowledges a worker-pulled revision without reintroducing its keys to
+  /// the root isolate.
+  Future<bool> ackGeometrySummary(ARVisibilityGridDeltaSummary summary) async {
+    _ensureActive();
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      'ackGeometry',
+      <String, Object>{
+        'version': visibilityGridWireVersion,
+        'groupId': summary.groupId,
+        'groupGeneration': summary.groupGeneration,
+        'sessionGeneration': summary.sessionGeneration,
+        'acceptedGeometryRevision': summary.geometryRevision,
       },
     );
     return result?['accepted'] == true;
@@ -232,6 +273,7 @@ class ARVisibilityGridManager {
     } finally {
       _channel.setMethodCallHandler(null);
       await _deltas.close();
+      await _summaries.close();
       await _errors.close();
       await _health.close();
       await _diagnostics.close();
@@ -244,6 +286,16 @@ class ARVisibilityGridManager {
       case 'onGridDelta':
         try {
           _deltas.add(ARVisibilityGridDelta.fromMap(_map(call.arguments)));
+        } on FormatException catch (error) {
+          _errors.add(_protocolError(error.message));
+          rethrow;
+        }
+        return null;
+      case 'onGridSummary':
+        try {
+          _summaries.add(
+            ARVisibilityGridDeltaSummary.fromMap(_map(call.arguments)),
+          );
         } on FormatException catch (error) {
           _errors.add(_protocolError(error.message));
           rethrow;
@@ -285,6 +337,43 @@ class ARVisibilityGridManager {
     if (_disposed) {
       throw StateError('ARVisibilityGridManager is disposed.');
     }
+  }
+}
+
+/// Production background-isolate pull for the semantic delta named by a
+/// root-isolate [ARVisibilityGridDeltaSummary].
+///
+/// The method channel is initialized in the worker isolate, so no ordinary
+/// callback or semantic key collection is materialized by the UI isolate.
+final class ARVisibilityGridBackgroundWorker {
+  const ARVisibilityGridBackgroundWorker._();
+
+  static Future<ARVisibilityGridDelta> pullDelta({
+    required ui.RootIsolateToken rootIsolateToken,
+    required int viewId,
+    required String groupId,
+    required int groupGeneration,
+    required int sessionGeneration,
+  }) async {
+    BackgroundIsolateBinaryMessenger.ensureInitialized(rootIsolateToken);
+    final channel = MethodChannel(
+      'arpointcloud_$viewId',
+      const StandardMethodCodec(),
+      BackgroundIsolateBinaryMessenger.instance,
+    );
+    final result = await channel.invokeMapMethod<Object?, Object?>(
+      'pullGridDelta',
+      <String, Object>{
+        'version': visibilityGridWireVersion,
+        'groupId': groupId,
+        'groupGeneration': groupGeneration,
+        'sessionGeneration': sessionGeneration,
+      },
+    );
+    if (result == null) {
+      throw const FormatException('Missing worker-pulled visibility delta.');
+    }
+    return ARVisibilityGridDelta.fromMap(result);
   }
 }
 
