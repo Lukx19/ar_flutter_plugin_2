@@ -8,8 +8,8 @@ object M0aStartRequestCodecV2 {
     const val byteLength = 464
     /** Chapter 13 freezes the M0 start negotiation at minor version zero. */
     const val supportedMinor = 0
-    /** M0a has no promoted optional capability bits yet. */
-    const val supportedCapabilities = 0L
+    /** Chapter 13 MVP support: occupancy, normals, lineage, and region paging. */
+    const val supportedCapabilities = 0x107L
 
     data class Configuration(
         val minimumMinor: Int,

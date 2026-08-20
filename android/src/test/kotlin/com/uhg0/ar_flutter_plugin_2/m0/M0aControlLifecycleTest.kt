@@ -25,7 +25,7 @@ class M0aControlLifecycleTest {
         val lifecycle = M0aControlLifecycle()
         val desired = request(M0aControlOperation.START, 0, 2).copy(
             payload = startPayload {
-                putLong(16, 1L)
+                putLong(16, 1L shl 3)
             },
         )
         val response = M0aControlCodec.decodeResponse(
@@ -34,7 +34,7 @@ class M0aControlLifecycleTest {
         assertEquals(0, response.outcome)
         val result = ByteBuffer.wrap(response.payload).order(ByteOrder.LITTLE_ENDIAN)
         assertEquals(0L, result.getLong(8))
-        assertEquals(0L, result.getLong(16))
+        assertEquals(0x107L, result.getLong(16))
     }
 
     @Test
@@ -42,7 +42,7 @@ class M0aControlLifecycleTest {
         val capabilityLifecycle = M0aControlLifecycle()
         val required = request(M0aControlOperation.START, 0, 3).copy(
             payload = startPayload {
-                putLong(8, 1L)
+                putLong(8, 1L shl 3)
             },
         )
         val capabilityResponse = M0aControlCodec.decodeResponse(
