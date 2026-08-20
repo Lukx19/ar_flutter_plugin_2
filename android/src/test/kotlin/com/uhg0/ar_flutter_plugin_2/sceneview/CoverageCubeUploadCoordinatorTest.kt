@@ -5,6 +5,7 @@ import java.nio.ByteBuffer
 import java.nio.FloatBuffer
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CoverageCubeUploadCoordinatorTest {
@@ -137,6 +138,35 @@ class CoverageCubeUploadCoordinatorTest {
 
         assertEquals(listOf(80L), completions)
     }
+
+    @Test
+    fun `a large cube reset is paged at the ordinary upload ceiling`() {
+        val uploader = FakeCubeUploader()
+        val submittedBytes = mutableListOf<Int>()
+        val count = 513
+        val coordinator = CoverageCubeMeshResources.CoverageCubeUploadCoordinator(
+            capacity = count,
+            halfSize = 0.5f,
+            uploader = uploader,
+            onUploadSubmitted = submittedBytes::add,
+        )
+
+        coordinator.submit(
+            CoveragePointRenderSnapshot(
+                revision = 1,
+                enabled = true,
+                capacity = count,
+                count = count,
+                keys = LongArray(count) { it.toLong() },
+                positions = FloatArray(count * 3),
+                colors = IntArray(count) { 0xFF000000.toInt() },
+            ),
+        )
+        uploader.completeAll()
+
+        assertEquals(listOf(64 * 1024, 128), submittedBytes)
+        assertTrue(submittedBytes.all { it <= 64 * 1024 })
+    }
 }
 
 private class FakeCubeUploader : CoverageCubeMeshResources.CoverageCubeVertexUploader {
@@ -148,6 +178,7 @@ private class FakeCubeUploader : CoverageCubeMeshResources.CoverageCubeVertexUpl
 
     override fun uploadPositions(
         buffer: FloatBuffer,
+        destOffsetBytes: Int,
         elementCount: Int,
         onConsumed: () -> Unit,
     ) {
@@ -160,6 +191,7 @@ private class FakeCubeUploader : CoverageCubeMeshResources.CoverageCubeVertexUpl
 
     override fun uploadColors(
         buffer: ByteBuffer,
+        destOffsetBytes: Int,
         byteCount: Int,
         onConsumed: () -> Unit,
     ) {

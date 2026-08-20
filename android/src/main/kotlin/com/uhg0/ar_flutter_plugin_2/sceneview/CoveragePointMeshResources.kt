@@ -202,15 +202,21 @@ internal class CoveragePointUploadCoordinator(
     private var hasUploadedSnapshot = false
     private var destroyed = false
     private var activeUploadStartedNanos = 0L
+    private var activeSnapshot: CoveragePointRenderSnapshot? = null
+    private val pendingRanges = ArrayDeque<UploadRange>()
 
     fun submit(snapshot: CoveragePointRenderSnapshot) {
         if (destroyed) return
         pendingSnapshot =
-            if (uploadBusy && snapshot.update?.reset == false) {
+            if ((uploadBusy || pendingRanges.isNotEmpty()) && snapshot.update?.reset == false) {
                 snapshot.copy(update = snapshot.update.copy(reset = true))
             } else {
                 snapshot
             }
+        // Do not mutate the direct buffers while Filament still owns the
+        // current range. Once its two callbacks return, a newer revision
+        // supersedes every remaining chunk from the old snapshot.
+        if (uploadBusy) pendingRanges.clear()
         drain()
     }
 
@@ -219,35 +225,39 @@ internal class CoveragePointUploadCoordinator(
     fun destroy() {
         destroyed = true
         pendingSnapshot = null
+        activeSnapshot = null
+        pendingRanges.clear()
     }
 
     private fun drain() {
         if (destroyed || uploadBusy) return
-        val snapshot = pendingSnapshot ?: return
-        pendingSnapshot = null
-        val update = snapshot.update
-        val spans = update?.spans.orEmpty()
-        val fullUpload = !hasUploadedSnapshot || update == null || update.reset
-        if (!fullUpload && spans.isEmpty()) {
-            return
+        if (pendingRanges.isEmpty()) {
+            val snapshot = pendingSnapshot ?: return
+            pendingSnapshot = null
+            val update = snapshot.update
+            val spans = update?.spans.orEmpty()
+            val fullUpload = !hasUploadedSnapshot || update == null || update.reset
+            if (!fullUpload && spans.isEmpty()) return
+            activeSnapshot = snapshot
+            pendingRanges.addAll(
+                uploadRanges(
+                    count = snapshot.count,
+                    fullUpload = fullUpload,
+                    spans = spans,
+                ),
+            )
+            hasUploadedSnapshot = true
         }
-        val startSlot = if (fullUpload) {
-            0
-        } else {
-            spans.minOf { it.startSlot }
-        }
-        val endSlot = if (fullUpload) {
-            snapshot.count
-        } else {
-            spans.maxOf { it.startSlot + it.colors.size }
-        }
+        val snapshot = checkNotNull(activeSnapshot)
+        val range = pendingRanges.removeFirstOrNull() ?: return
+        val startSlot = range.startSlot
+        val endSlot = range.endSlotExclusive
         buffers.writeRange(snapshot.positions, snapshot.colors, startSlot, endSlot)
         onUploadSubmitted(
             (endSlot - startSlot) *
                 (CoveragePointMeshResources.POSITION_COMPONENTS * Float.SIZE_BYTES +
                     CoveragePointMeshResources.COLOR_COMPONENTS),
         )
-        hasUploadedSnapshot = true
         uploadBusy = true
         consumedCallbackMask = 0
         activeUploadStartedNanos = clockNanos()
@@ -272,11 +282,43 @@ internal class CoveragePointUploadCoordinator(
         if (consumedCallbackMask == BOTH_CALLBACKS) {
             onUploadCompleted((clockNanos() - activeUploadStartedNanos).coerceAtLeast(0L))
             uploadBusy = false
+            if (pendingRanges.isEmpty()) activeSnapshot = null
             drain()
         }
     }
 
+    private fun uploadRanges(
+        count: Int,
+        fullUpload: Boolean,
+        spans: List<com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan>,
+    ): List<UploadRange> {
+        val sourceRanges =
+            if (fullUpload) {
+                listOf(UploadRange(0, count))
+            } else {
+                spans.map { span ->
+                    UploadRange(span.startSlot, span.startSlot + span.colors.size)
+                }
+            }
+        return buildList {
+            sourceRanges.forEach { range ->
+                var start = range.startSlot
+                while (start < range.endSlotExclusive) {
+                    val end = minOf(start + MAX_ROWS_PER_UPLOAD, range.endSlotExclusive)
+                    add(UploadRange(start, end))
+                    start = end
+                }
+            }
+        }
+    }
+
+    private data class UploadRange(val startSlot: Int, val endSlotExclusive: Int)
+
     private companion object {
+        const val MAX_ROWS_PER_UPLOAD =
+            RendererTelemetry.ORDINARY_UPLOAD_LIMIT_BYTES /
+                (CoveragePointMeshResources.POSITION_COMPONENTS * Float.SIZE_BYTES +
+                    CoveragePointMeshResources.COLOR_COMPONENTS)
         const val POSITION_CALLBACK = 1
         const val COLOR_CALLBACK = 2
         const val BOTH_CALLBACKS = POSITION_CALLBACK or COLOR_CALLBACK

@@ -255,43 +255,82 @@ internal class CoverageCubeMeshResources(
         private var activeUploadId = 0L
         private var destroyed = false
         private var activeUploadStartedNanos = 0L
+        private var activeSnapshot: CoveragePointRenderSnapshot? = null
+        private val pendingRanges = ArrayDeque<UploadRange>()
 
         fun submit(snapshot: CoveragePointRenderSnapshot) {
             if (destroyed) return
-            pendingSnapshot = snapshot
+            pendingSnapshot =
+                if ((uploadBusy || pendingRanges.isNotEmpty()) && snapshot.update?.reset == false) {
+                    snapshot.copy(update = snapshot.update.copy(reset = true))
+                } else {
+                    snapshot
+                }
+            if (uploadBusy) pendingRanges.clear()
             drain()
         }
 
         fun destroy() {
             destroyed = true
             pendingSnapshot = null
+            activeSnapshot = null
+            pendingRanges.clear()
         }
 
         private fun drain() {
             if (destroyed || uploadBusy) return
-            val snapshot = pendingSnapshot ?: return
-            pendingSnapshot = null
-            write(snapshot)
+            if (pendingRanges.isEmpty()) {
+                val snapshot = pendingSnapshot ?: return
+                pendingSnapshot = null
+                activeSnapshot = snapshot
+                pendingRanges.addAll(uploadRanges(snapshot.count))
+            }
+            val snapshot = checkNotNull(activeSnapshot)
+            val range = pendingRanges.removeFirstOrNull() ?: return
+            writeRange(snapshot, range.startSlot, range.endSlotExclusive)
             uploadBusy = true
             consumedCallbackMask = 0
             activeUploadStartedNanos = clockNanos()
             val uploadId = ++activeUploadId
-            val vertexCount = snapshot.count * VERTICES_PER_VOXEL
+            val startVertex = range.startSlot * VERTICES_PER_VOXEL
+            val vertexCount =
+                (range.endSlotExclusive - range.startSlot) * VERTICES_PER_VOXEL
             onUploadSubmitted(
                 vertexCount * (POSITION_COMPONENTS * Float.SIZE_BYTES + COLOR_COMPONENTS),
             )
-            uploader.uploadPositions(positionBuffer, vertexCount * POSITION_COMPONENTS) {
+            uploader.uploadPositions(
+                positionBuffer,
+                startVertex * POSITION_COMPONENTS * Float.SIZE_BYTES,
+                vertexCount * POSITION_COMPONENTS,
+            ) {
                 consumed(uploadId, POSITION_CALLBACK)
             }
-            uploader.uploadColors(colorBuffer, vertexCount * COLOR_COMPONENTS) {
+            uploader.uploadColors(
+                colorBuffer,
+                startVertex * COLOR_COMPONENTS,
+                vertexCount * COLOR_COMPONENTS,
+            ) {
                 consumed(uploadId, COLOR_CALLBACK)
             }
         }
 
-        private fun write(snapshot: CoveragePointRenderSnapshot) {
-            positionBuffer.clear()
-            colorBuffer.clear()
-            for (voxel in 0 until snapshot.count) {
+        private fun writeRange(
+            snapshot: CoveragePointRenderSnapshot,
+            startSlot: Int,
+            endSlotExclusive: Int,
+        ) {
+            val firstPosition = startSlot * VERTICES_PER_VOXEL * POSITION_COMPONENTS
+            val lastPosition =
+                endSlotExclusive * VERTICES_PER_VOXEL * POSITION_COMPONENTS
+            val positionTarget = positionBuffer.duplicate()
+            positionTarget.clear()
+            positionTarget.position(firstPosition)
+            val firstColor = startSlot * VERTICES_PER_VOXEL * COLOR_COMPONENTS
+            val lastColor = endSlotExclusive * VERTICES_PER_VOXEL * COLOR_COMPONENTS
+            val colorTarget = colorBuffer.duplicate()
+            colorTarget.clear()
+            colorTarget.position(firstColor)
+            for (voxel in startSlot until endSlotExclusive) {
                 val sourceOffset = voxel * POSITION_COMPONENTS
                 val x = snapshot.positions[sourceOffset]
                 val y = snapshot.positions[sourceOffset + 1]
@@ -303,29 +342,33 @@ internal class CoverageCubeMeshResources(
                     val localX = CUBE_CORNERS[cornerOffset] * halfSize
                     val localY = CUBE_CORNERS[cornerOffset + 1] * halfSize
                     val localZ = CUBE_CORNERS[cornerOffset + 2] * halfSize
-                    positionBuffer.put(
+                    positionTarget.put(
                         x + rotation[0] * localX +
                             rotation[3] * localY +
                             rotation[6] * localZ,
                     )
-                    positionBuffer.put(
+                    positionTarget.put(
                         y + rotation[1] * localX +
                             rotation[4] * localY +
                             rotation[7] * localZ,
                     )
-                    positionBuffer.put(
+                    positionTarget.put(
                         z + rotation[2] * localX +
                             rotation[5] * localY +
                             rotation[8] * localZ,
                     )
-                    colorBuffer.put((color shr 16 and 0xFF).toByte())
-                    colorBuffer.put((color shr 8 and 0xFF).toByte())
-                    colorBuffer.put((color and 0xFF).toByte())
-                    colorBuffer.put((color ushr 24 and 0xFF).toByte())
+                    colorTarget.put((color shr 16 and 0xFF).toByte())
+                    colorTarget.put((color shr 8 and 0xFF).toByte())
+                    colorTarget.put((color and 0xFF).toByte())
+                    colorTarget.put((color ushr 24 and 0xFF).toByte())
                 }
             }
-            positionBuffer.flip()
-            colorBuffer.flip()
+            positionBuffer.clear()
+            positionBuffer.position(firstPosition)
+            positionBuffer.limit(lastPosition)
+            colorBuffer.clear()
+            colorBuffer.position(firstColor)
+            colorBuffer.limit(lastColor)
         }
 
         private fun consumed(uploadId: Long, callbackBit: Int) {
@@ -336,11 +379,27 @@ internal class CoverageCubeMeshResources(
             if (consumedCallbackMask == BOTH_CALLBACKS) {
                 onUploadCompleted((clockNanos() - activeUploadStartedNanos).coerceAtLeast(0L))
                 uploadBusy = false
+                if (pendingRanges.isEmpty()) activeSnapshot = null
                 drain()
             }
         }
 
+        private fun uploadRanges(count: Int): List<UploadRange> = buildList {
+            var start = 0
+            while (start < count) {
+                val end = minOf(start + MAX_VOXELS_PER_UPLOAD, count)
+                add(UploadRange(start, end))
+                start = end
+            }
+        }
+
+        private data class UploadRange(val startSlot: Int, val endSlotExclusive: Int)
+
         private companion object {
+            const val MAX_VOXELS_PER_UPLOAD =
+                RendererTelemetry.ORDINARY_UPLOAD_LIMIT_BYTES /
+                    (VERTICES_PER_VOXEL *
+                        (POSITION_COMPONENTS * Float.SIZE_BYTES + COLOR_COMPONENTS))
             const val POSITION_CALLBACK = 1
             const val COLOR_CALLBACK = 2
             const val BOTH_CALLBACKS = POSITION_CALLBACK or COLOR_CALLBACK
@@ -348,8 +407,18 @@ internal class CoverageCubeMeshResources(
     }
 
     internal interface CoverageCubeVertexUploader {
-        fun uploadPositions(buffer: FloatBuffer, elementCount: Int, onConsumed: () -> Unit)
-        fun uploadColors(buffer: ByteBuffer, byteCount: Int, onConsumed: () -> Unit)
+        fun uploadPositions(
+            buffer: FloatBuffer,
+            destOffsetBytes: Int,
+            elementCount: Int,
+            onConsumed: () -> Unit,
+        )
+        fun uploadColors(
+            buffer: ByteBuffer,
+            destOffsetBytes: Int,
+            byteCount: Int,
+            onConsumed: () -> Unit,
+        )
     }
 
     private class FilamentCoverageCubeVertexUploader(
@@ -360,6 +429,7 @@ internal class CoverageCubeMeshResources(
 
         override fun uploadPositions(
             buffer: FloatBuffer,
+            destOffsetBytes: Int,
             elementCount: Int,
             onConsumed: () -> Unit,
         ) {
@@ -367,7 +437,7 @@ internal class CoverageCubeMeshResources(
                 engine,
                 POSITION_BUFFER_INDEX,
                 buffer,
-                0,
+                destOffsetBytes,
                 elementCount,
                 callbackHandler,
                 Runnable(onConsumed),
@@ -376,6 +446,7 @@ internal class CoverageCubeMeshResources(
 
         override fun uploadColors(
             buffer: ByteBuffer,
+            destOffsetBytes: Int,
             byteCount: Int,
             onConsumed: () -> Unit,
         ) {
@@ -383,7 +454,7 @@ internal class CoverageCubeMeshResources(
                 engine,
                 COLOR_BUFFER_INDEX,
                 buffer,
-                0,
+                destOffsetBytes,
                 byteCount,
                 callbackHandler,
                 Runnable(onConsumed),

@@ -37,3 +37,30 @@ struct M0PortableResponseDescriptor {
     let lineageRevision: UInt64
     let payload: Data
 }
+
+/// Declaration-only future iOS seam for M0d's selected centroid renderer.
+///
+/// This freezes the platform boundary without adding a Swift renderer,
+/// SceneKit/ARKit adapter, lifecycle implementation, or executable behavior.
+protocol M0PortableCentroidRendererInterface {
+    func replaceCommittedCut(_ descriptor: M0PortableRendererCutDescriptor) async throws
+    func setPresentation(_ descriptor: M0PortableRendererPresentationDescriptor) async throws
+    func disposeRendererGeneration(_ generation: UInt64) async
+}
+
+/// Shape-only committed semantic-cut descriptor for a future renderer owner.
+struct M0PortableRendererCutDescriptor {
+    let rendererGeneration: UInt64
+    let geometryRevision: UInt64
+    let visibilityRevision: UInt64
+    let packedRows: Data
+}
+
+/// Shape-only presentation descriptor. Semantic truth remains outside the
+/// renderer and these fields intentionally contain no rendering algorithm.
+struct M0PortableRendererPresentationDescriptor {
+    let rendererGeneration: UInt64
+    let mode: String
+    let pointsEnabled: Bool
+    let guidanceEnabled: Bool
+}

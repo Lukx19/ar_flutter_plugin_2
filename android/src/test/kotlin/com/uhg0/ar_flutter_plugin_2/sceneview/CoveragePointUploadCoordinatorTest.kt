@@ -6,6 +6,7 @@ import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CoveragePointUploadCoordinatorTest {
@@ -97,6 +98,36 @@ class CoveragePointUploadCoordinatorTest {
             uploader.positionSubmissions.last(),
             0f,
         )
+    }
+
+    @Test
+    fun `a reset larger than one ordinary frame is paged at sixty four KiB`() {
+        val uploader = FakeUploader()
+        val submittedBytes = mutableListOf<Int>()
+        val coordinator = CoveragePointUploadCoordinator(
+            capacity = 5_000,
+            uploader = uploader,
+            onUploadSubmitted = submittedBytes::add,
+        )
+        val count = 5_000
+        coordinator.submit(
+            CoveragePointRenderSnapshot(
+                revision = 1,
+                enabled = true,
+                capacity = count,
+                count = count,
+                keys = LongArray(count) { it.toLong() },
+                positions = FloatArray(count * 3) { it.toFloat() },
+                colors = IntArray(count) { 0xFF000000.toInt() },
+            ),
+        )
+        uploader.completeAll()
+
+        assertEquals(listOf(64 * 1024, (count - 4_096) * 16), submittedBytes)
+        assertTrue(submittedBytes.all { it <= 64 * 1024 })
+        assertEquals(2, uploader.positionSubmissions.size)
+        assertEquals(4_096 * 3, uploader.positionSubmissions.first().size)
+        assertEquals((count - 4_096) * 3, uploader.positionSubmissions.last().size)
     }
 }
 

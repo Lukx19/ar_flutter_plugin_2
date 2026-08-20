@@ -33,8 +33,11 @@ internal class RendererTelemetry {
     }
 
     fun recordUpload(bytes: Int) {
-        require(bytes >= 0)
-        currentUpdateUploadBytes += bytes
+        require(bytes in 0..ORDINARY_UPLOAD_LIMIT_BYTES)
+        // A paged reset may span several callbacks. Each callback submits one
+        // independently renderable range, so the ledger reports its actual
+        // per-frame payload rather than incorrectly summing a resync batch.
+        currentUpdateUploadBytes = bytes
         peakUpdateUploadBytes = maxOf(peakUpdateUploadBytes, currentUpdateUploadBytes)
     }
 
