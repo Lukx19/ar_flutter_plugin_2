@@ -1,5 +1,8 @@
 package com.uhg0.ar_flutter_plugin_2.m0
 
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+
 /**
  * Bounded control state for one V2 binding.
  *
@@ -118,6 +121,25 @@ class M0aControlLifecycle(
             unsupportedDesiredCapabilityBits =
                 (unsupportedDesiredCapabilityBits + java.lang.Long.bitCount(unsupported))
                     .coerceAtMost(MAX_UNSUPPORTED_DESIRED_CAPABILITY_BITS)
+        }
+
+        /** Canonical 32-byte diagnostic block containing only the bounded count. */
+        fun unsupportedDesiredCapabilitiesDiagnostic(maximumBytes: Int): ByteArray {
+            if (unsupportedDesiredCapabilityBits == 0L || maximumBytes < 32) return byteArrayOf()
+            return ByteArray(32).also { bytes ->
+                ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).apply {
+                    putShort(0, 1)
+                    putShort(2, 1)
+                    putLong(4, 0)
+                    putInt(12, 0)
+                    putShort(16, 5)
+                    put(18, 0)
+                    put(19, 0)
+                    putShort(20, 0)
+                    putShort(22, 0)
+                    putLong(24, unsupportedDesiredCapabilityBits)
+                }
+            }
         }
     }
 
@@ -267,6 +289,9 @@ class M0aControlLifecycle(
                 } else {
                     byteArrayOf()
                 },
+                diagnostic = configuration?.let {
+                    metrics.unsupportedDesiredCapabilitiesDiagnostic(it.requestedDiagnosticBytes)
+                } ?: byteArrayOf(),
             ),
             maximumResponseBytes,
         )

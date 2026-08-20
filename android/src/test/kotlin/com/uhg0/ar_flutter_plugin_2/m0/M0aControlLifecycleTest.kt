@@ -27,6 +27,7 @@ class M0aControlLifecycleTest {
         val desired = request(M0aControlOperation.START, 0, 2).copy(
             payload = startPayload {
                 putLong(16, 1L shl 4)
+                putShort(32, 32)
             },
         )
         val response = M0aControlCodec.decodeResponse(
@@ -37,6 +38,11 @@ class M0aControlLifecycleTest {
         assertEquals(0L, result.getLong(8))
         assertEquals(0x107L, result.getLong(16))
         assertEquals(1L, lifecycle.metrics.unsupportedDesiredCapabilityBits)
+        assertEquals(32, response.diagnostic.size)
+        val diagnostic = ByteBuffer.wrap(response.diagnostic).order(ByteOrder.LITTLE_ENDIAN)
+        assertEquals(1, diagnostic.getShort(2).toInt())
+        assertEquals(5, diagnostic.getShort(16).toInt())
+        assertEquals(1L, diagnostic.getLong(24))
 
         repeat(1_200) {
             lifecycle.metrics.recordUnsupportedDesiredCapabilityBits(Long.MAX_VALUE)
