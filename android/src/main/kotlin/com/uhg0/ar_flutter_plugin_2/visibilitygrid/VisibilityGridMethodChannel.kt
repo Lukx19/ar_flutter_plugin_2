@@ -1016,12 +1016,18 @@ class VisibilityGridMethodChannel(
     ): VisibilityGridDiagnostics =
         synchronized(this) {
             val freeRows = rendererState.freeRowCount
+            val renderedRows = rendererState.capacity - freeRows
             diagnostics.copy(
                 callbackCopyP95Ns = callbackCopySamples.p95(),
                 coalescedFeatureObservations = coalescedFeatureObservations,
                 coalescedDepthObservations = coalescedDepthObservations,
-                rendererRows = rendererState.capacity - freeRows,
-                rendererFreeRows = freeRows,
+                // This wire contract describes the authoritative semantic
+                // grid, whose 100k capacity remains distinct from M0d's 20k
+                // presentation selection. Keep its row/free invariant valid
+                // for Dart while the bounded renderer is ledgered separately.
+                rendererRows = renderedRows,
+                rendererFreeRows =
+                    (diagnostics.stableVoxelCapacity - renderedRows).coerceAtLeast(0),
             )
         }
 
