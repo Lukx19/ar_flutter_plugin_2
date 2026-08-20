@@ -49,13 +49,9 @@ abstract class M0bCompactPersistentSession(
                 overflowCount++
                 continue
             }
-            val associationBase = associationCount * ASSOCIATION_LANES
-            associations[associationBase] = observation.x
-            associations[associationBase + 1] = observation.y
-            associations[associationBase + 2] = observation.z
-            associations[associationBase + 3] = observation.signedWeight
-            associations[associationBase + 4] = observation.supportId
-            associations[associationBase + 5] = slot
+            // The surface owns the accumulated observation values and bounded
+            // lineage; an association only needs its retained surface link.
+            associations[associationCount] = slot
             associationCount++
             admitAt(slot, observation)
             addLineage(slot, observation.supportId)
@@ -177,11 +173,11 @@ abstract class M0bCompactPersistentSession(
     companion object {
         const val MAX_SURFACES = 100_000
         const val MAX_ASSOCIATIONS = 200_000
-        protected const val SURFACE_LANES = 13
-        private const val ASSOCIATION_LANES = 6
-        protected const val LINEAGE_LANES = 4
+        protected const val SURFACE_LANES = 10
+        private const val ASSOCIATION_LANES = 1
+        protected const val LINEAGE_LANES = 16
         private const val HASH_SLOTS = 262_144
-        private const val PADDING_INTS = 37_856
+        private const val PADDING_INTS = 137_856
         protected const val X = 0
         protected const val Y = 1
         protected const val Z = 2
@@ -451,7 +447,7 @@ class M0bPersistentKernelHarness(
         private const val MAX_SURFACES = 100_000
         private const val MAX_ASSOCIATIONS = 200_000
         private const val ADMISSION_SURFACES = 256
-        private const val LINEAGE_LIMIT = 4
+        private const val LINEAGE_LIMIT = 16
         private const val REPLAY_PICTURES = 300
         private const val REPLAY_SURFACES = 200
     }
