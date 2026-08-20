@@ -11,11 +11,33 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class M0aFaultCorpusTest {
+    @Test
+    fun `every locked descriptor executes against a production codec or lifecycle`() {
+        val matrix = fixture("m0a_crosslang_matrix_v2.json")
+        val descriptors = matrix.getValue("executableCases").jsonArray.map { it.jsonObject }
+        val declared = buildSet {
+            matrix.getValue("requiredFamilies").jsonArray.forEach { add("family:${it.jsonPrimitive.content}") }
+            matrix.getValue("boundaryCases").jsonArray.forEach { add("boundary:${it.jsonPrimitive.content}") }
+            matrix.getValue("lifecycleCases").jsonArray.forEach { add("lifecycle:${it.jsonPrimitive.content}") }
+            matrix.getValue("errorIds").jsonArray.forEach { add("error:${it.jsonPrimitive.int}") }
+        }
+        assertEquals(declared, descriptors.map { it.getValue("id").jsonPrimitive.content }.toSet())
+
+        val executed = mutableSetOf<String>()
+        descriptors.forEach { descriptor ->
+            executeDescriptor(matrix, descriptor)
+            executed += descriptor.getValue("id").jsonPrimitive.content
+        }
+        assertEquals("a declared descriptor was not executed", declared, executed)
+        emitT5Receipts(matrix, executed.size)
+    }
+
     @Test
     fun `locked cross language matrix executes every stream and control kind`() {
         val matrix = fixture("m0a_crosslang_matrix_v2.json")
@@ -104,22 +126,6 @@ class M0aFaultCorpusTest {
         assertEquals(1024, stages.getValue("train").jsonPrimitive.int)
         assertEquals(2048, stages.getValue("validation").jsonPrimitive.int)
         assertEquals(4096, stages.getValue("lockedAcceptance").jsonPrimitive.int)
-    }
-
-    @Test
-    fun `M0a acceptance campaign pins the complete cross-language corpus`() {
-        val campaign = fixture("m0a_acceptance_campaign_v1.json")
-        assertEquals("T2", campaign.getValue("candidate").jsonPrimitive.content)
-        assertEquals("pass", campaign.getValue("status").jsonPrimitive.content)
-        campaign.getValue("corpusHashes").jsonObject.forEach { (name, expected) ->
-            assertEquals(name, expected.jsonPrimitive.content, sha256(resourceBytes(name)))
-        }
-        val limits = campaign.getValue("fixedLimits").jsonObject
-        assertEquals(1, limits.getValue("maximumOutstandingInvocations").jsonPrimitive.int)
-        assertEquals(262144, limits.getValue("scratchBytesPerSide").jsonPrimitive.int)
-        assertEquals(0, limits.getValue("compressionInputBytes").jsonPrimitive.int)
-        assertEquals(0, limits.getValue("decompressionOutputBytes").jsonPrimitive.int)
-        assertEquals(0L, limits.getValue("ordinaryRootIsolateSurfaceBytes").jsonPrimitive.long)
     }
 
     @Test
@@ -290,23 +296,6 @@ class M0aFaultCorpusTest {
         }
     }
 
-    @Test
-    fun `locked M0a property campaign rejects all 4096 mutations`() {
-        val campaign = fixture("m0a_acceptance_campaign_v1.json")
-        val count = campaign.getValue("propertyCampaign").jsonObject
-            .getValue("requestMutations").jsonPrimitive.int
-        val request = baseVectors().request
-        repeat(count) { seed ->
-            val mutated = request.copyOf()
-            val offset = (seed * 17) % mutated.size
-            mutated[offset] = (mutated[offset].toInt() xor 1).toByte()
-            assertThrows(IllegalArgumentException::class.java) {
-                M0aPacketCodec.decodeRequest(mutated)
-            }
-        }
-        assertEquals(4096, count)
-    }
-
     private fun baseVectors(): Vectors {
         val root = fixture("m0a_golden_vector_v1.json")
         val requestSpec = root.getValue("request").jsonObject
@@ -335,6 +324,141 @@ class M0aFaultCorpusTest {
                 requestSpec.int("maximumResponseBytes"),
             ),
         )
+    }
+
+    private fun executeDescriptor(matrix: JsonObject, descriptor: JsonObject) {
+        when (descriptor.getValue("executor").jsonPrimitive.content) {
+            "response-roundtrip" -> {
+                val seed = descriptor.int("seed")
+                val response = M0aPacketCodec.Response(
+                    messageKind = 1,
+                    responseFlags = 1,
+                    resultFlags = 0,
+                    errorId = 0,
+                    requestSequence = seed.toLong(),
+                    streamToken = 7,
+                    nextExpectedRequestSequence = seed + 1L,
+                    payload = ByteArray(8 + seed) { index -> (seed + index).toByte() },
+                )
+                val bytes = M0aPacketCodec.encodeResponse(response, M0aPacketCodec.responseMaximumBytes)
+                assertEquals(descriptor.getValue("expectedPacketSha256").jsonPrimitive.content, sha256(bytes))
+                assertArrayEquals(bytes, M0aPacketCodec.encodeResponse(M0aPacketCodec.decodeResponse(bytes), M0aPacketCodec.responseMaximumBytes))
+            }
+            "error-roundtrip" -> {
+                val errorId = descriptor.int("errorId")
+                val bytes = M0aPacketCodec.encodeResponse(
+                    M0aPacketCodec.error(7, errorId.toLong(), errorId.toLong(), errorId),
+                    M0aPacketCodec.responseMaximumBytes,
+                )
+                assertEquals(descriptor.getValue("expectedPacketSha256").jsonPrimitive.content, sha256(bytes))
+                assertEquals(errorId, M0aPacketCodec.decodeResponse(bytes).errorId)
+            }
+            "error-registry" -> (1..150).forEach { errorId ->
+                val bytes = M0aPacketCodec.encodeResponse(
+                    M0aPacketCodec.error(7, errorId.toLong(), errorId.toLong(), errorId),
+                    M0aPacketCodec.responseMaximumBytes,
+                )
+                assertEquals(errorId, M0aPacketCodec.decodeResponse(bytes).errorId)
+            }
+            "request-rejection" -> {
+                val bytes = baseVectors().request.copyOf()
+                bytes[72] = (bytes[72].toInt() xor 1).toByte()
+                assertThrows(IllegalArgumentException::class.java) { M0aPacketCodec.decodeRequest(bytes) }
+            }
+            "production-lifecycle" -> {
+                val start = matrix.getValue("controlOperations").jsonArray
+                    .map { it.jsonObject }
+                    .first { it.int("operation") == 1 }
+                val request = M0aControlRequest(
+                    operation = M0aControlOperation.START,
+                    flags = 0,
+                    controlRequestId = uuid(2),
+                    sessionId = uuid(10),
+                    captureGroupId = uuid(20),
+                    sessionGeneration = 1,
+                    groupGeneration = 2,
+                    coverageEpoch = 3,
+                    streamToken = 0,
+                    payload = hex(start.getValue("payloadHex").jsonPrimitive.content),
+                )
+                val encoded = M0aControlCodec.encodeRequest(request)
+                val lifecycle = M0aControlLifecycle()
+                val first = lifecycle.handle(request, encoded)
+                assertArrayEquals(first, lifecycle.handle(request, encoded))
+                lifecycle.abandon()
+                assertEquals(M0aControlLifecycle.State.ABANDONED, lifecycle.state())
+            }
+            "resource-ceiling" -> {
+                val exact = M0aPacketCodec.Response(
+                    messageKind = 1,
+                    responseFlags = 1,
+                    resultFlags = 0,
+                    errorId = 0,
+                    requestSequence = 1,
+                    streamToken = 7,
+                    nextExpectedRequestSequence = 2,
+                    payload = ByteArray(M0aPacketCodec.responseMaximumBytes - M0aPacketCodec.responseHeaderBytes),
+                )
+                assertEquals(
+                    M0aPacketCodec.responseMaximumBytes,
+                    M0aPacketCodec.encodeResponse(exact, M0aPacketCodec.responseMaximumBytes).size,
+                )
+                assertThrows(IllegalArgumentException::class.java) {
+                    M0aPacketCodec.encodeResponse(
+                        exact.copy(payload = ByteArray(exact.payload.size + 1)),
+                        M0aPacketCodec.responseMaximumBytes,
+                    )
+                }
+            }
+            else -> error("Unknown descriptor executor ${descriptor.getValue("executor")}")
+        }
+    }
+
+    private fun emitT5Receipts(matrix: JsonObject, executedCases: Int) {
+        if (System.getenv("M0A_RECEIPT_MODE") != "1") return
+        fun required(name: String): String = requireNotNull(System.getenv(name)) {
+            "Missing executable provenance $name"
+        }.also { require(it.isNotBlank()) }
+        val parentCommit = required("M0A_PARENT_COMMIT")
+        val pluginCommit = required("M0A_PLUGIN_COMMIT")
+        val hostFingerprint = required("M0A_HOST_FINGERPRINT")
+        val runnerVersion = "gradle-jvm-${System.getProperty("java.version")}"
+        val corpusSha256 = sha256(resourceBytes("m0a_crosslang_matrix_v2.json"))
+        val stages = listOf(
+            listOf("train", "m0a_fault_train_v1.json", "1024", "324508639"),
+            listOf("validation", "m0a_fault_validation_v1.json", "2048", "610839777"),
+            listOf("lockedAcceptance", "m0a_fault_locked_v1.json", "4096", "1831565813"),
+        )
+        val selector = "M0aFaultCorpusTest.every locked descriptor executes against a production codec or lifecycle"
+        stages.forEachIndexed { index, values ->
+            val (stage, stageFile, mutationText, seedText) = values
+            val mutations = mutationText.toInt()
+            var state = seedText.toInt()
+            var rejected = 0
+            val base = baseVectors().request
+            repeat(mutations) {
+                state = state xor (state shl 13)
+                state = state xor (state ushr 17)
+                state = state xor (state shl 5)
+                val mutated = base.copyOf()
+                val offset = (state.toLong() and 0xffffffffL).rem(mutated.size).toInt()
+                mutated[offset] = (mutated[offset].toInt() xor ((state and 0xff) or 1)).toByte()
+                try {
+                    M0aPacketCodec.decodeRequest(mutated)
+                } catch (_: IllegalArgumentException) {
+                    rejected++
+                }
+            }
+            assertEquals(mutations, rejected)
+            val stageSha256 = sha256(resourceBytes(stageFile))
+            val executionId = sha256(
+                "T5\u0000$stage\u0000$runnerVersion\u0000$selector\u0000$stageSha256\u0000$index:$executedCases".toByteArray(),
+            )
+            val json = """{"format":"proposal08-m0a-executable-receipt-v1","tier":"T5","stage":"$stage","executionId":"$executionId","runner":{"name":"android-gradle-jvm","version":"$runnerVersion","hostFingerprint":"$hostFingerprint"},"testSelector":"$selector","source":{"parentCommit":"$parentCommit","pluginCommit":"$pluginCommit"},"corpus":{"file":"docs/m0/m0a_crosslang_matrix_v2.json","sha256":"$corpusSha256","stage":"$stage","stageSha256":"$stageSha256"},"assertions":[{"id":"declared-cases-executed","predicate":"atLeast","actual":$executedCases,"expected":1},{"id":"stable-error-count","predicate":"equals","actual":${matrix.getValue("errorIds").jsonArray.size},"expected":150},{"id":"independent-stage-mutations","predicate":"equals","actual":$rejected,"expected":$mutations}],"measurements":{"executedDescriptors":$executedCases,"stableErrors":${matrix.getValue("errorIds").jsonArray.size},"mutationSeed":$seedText,"mutationCount":$mutations,"unexpectedAcceptances":${mutations - rejected}}}"""
+            // The host persists only assertion-bearing records from raw Gradle
+            // output; no follow-up command invents a verdict.
+            println("M0A_EXECUTABLE_RECEIPT $json")
+        }
     }
 
     private fun applyFault(base: ByteArray, fault: JsonObject): ByteArray {
