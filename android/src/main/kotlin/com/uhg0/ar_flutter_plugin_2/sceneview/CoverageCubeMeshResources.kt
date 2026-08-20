@@ -65,6 +65,7 @@ internal class CoverageCubeMeshResources(
         uploader = FilamentCoverageCubeVertexUploader(engine, vertexBuffer),
         onUploadSubmitted = { bytes -> telemetry?.recordUpload(bytes) },
         onUploadCallback = { telemetry?.recordUploadCallback() },
+        onUploadCompleted = { elapsedNanos -> telemetry?.recordUploadCompletion(elapsedNanos) },
     )
     private var indexStaging: java.nio.IntBuffer? = null
     private var outlineIndexStaging: java.nio.IntBuffer? = null
@@ -239,6 +240,8 @@ internal class CoverageCubeMeshResources(
         private val uploader: CoverageCubeVertexUploader,
         private val onUploadSubmitted: (Int) -> Unit = {},
         private val onUploadCallback: () -> Unit = {},
+        private val onUploadCompleted: (Long) -> Unit = {},
+        private val clockNanos: () -> Long = System::nanoTime,
     ) {
         private val positionBuffer = ByteBuffer.allocateDirect(
             capacity * VERTICES_PER_VOXEL * POSITION_COMPONENTS * Float.SIZE_BYTES,
@@ -251,6 +254,7 @@ internal class CoverageCubeMeshResources(
         private var consumedCallbackMask = 0
         private var activeUploadId = 0L
         private var destroyed = false
+        private var activeUploadStartedNanos = 0L
 
         fun submit(snapshot: CoveragePointRenderSnapshot) {
             if (destroyed) return
@@ -270,6 +274,7 @@ internal class CoverageCubeMeshResources(
             write(snapshot)
             uploadBusy = true
             consumedCallbackMask = 0
+            activeUploadStartedNanos = clockNanos()
             val uploadId = ++activeUploadId
             val vertexCount = snapshot.count * VERTICES_PER_VOXEL
             onUploadSubmitted(
@@ -329,6 +334,7 @@ internal class CoverageCubeMeshResources(
             onUploadCallback()
             consumedCallbackMask = consumedCallbackMask or callbackBit
             if (consumedCallbackMask == BOTH_CALLBACKS) {
+                onUploadCompleted((clockNanos() - activeUploadStartedNanos).coerceAtLeast(0L))
                 uploadBusy = false
                 drain()
             }

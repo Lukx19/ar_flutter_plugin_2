@@ -100,6 +100,43 @@ class CoverageCubeUploadCoordinatorTest {
             0f,
         )
     }
+
+    @Test
+    fun `destroy cancels a pending cube upload and late callbacks are harmless`() {
+        val uploader = FakeCubeUploader()
+        val coordinator = CoverageCubeMeshResources.CoverageCubeUploadCoordinator(
+            capacity = 1,
+            halfSize = 0.5f,
+            uploader = uploader,
+        )
+
+        coordinator.submit(cubeSnapshot(1, floatArrayOf(1f, 1f, 1f)))
+        coordinator.submit(cubeSnapshot(2, floatArrayOf(2f, 2f, 2f)))
+        coordinator.destroy()
+        uploader.completeAll()
+
+        assertEquals(1, uploader.positionSubmissions.size)
+    }
+
+    @Test
+    fun `cube upload reports hand-off duration after both callbacks`() {
+        val uploader = FakeCubeUploader()
+        var now = 10L
+        val completions = mutableListOf<Long>()
+        val coordinator = CoverageCubeMeshResources.CoverageCubeUploadCoordinator(
+            capacity = 1,
+            halfSize = 0.5f,
+            uploader = uploader,
+            onUploadCompleted = completions::add,
+            clockNanos = { now },
+        )
+
+        coordinator.submit(cubeSnapshot(1, floatArrayOf(1f, 1f, 1f)))
+        now = 90L
+        uploader.completeAll()
+
+        assertEquals(listOf(80L), completions)
+    }
 }
 
 private class FakeCubeUploader : CoverageCubeMeshResources.CoverageCubeVertexUploader {

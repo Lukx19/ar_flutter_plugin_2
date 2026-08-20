@@ -12,6 +12,7 @@ class RendererTelemetryTest {
         telemetry.beginRendererUpdate()
         telemetry.recordUpload(64)
         telemetry.recordUploadCallback()
+        telemetry.recordUploadCompletion(24_000)
         telemetry.removeOwner("points")
 
         val snapshot = telemetry.snapshot()
@@ -20,6 +21,10 @@ class RendererTelemetryTest {
         assertEquals(49_408, snapshot.getValue("peakOwnedBufferBytes"))
         assertEquals(64, snapshot.getValue("currentUpdateUploadBytes"))
         assertEquals(1, snapshot.getValue("uploadCallbackCount"))
+        assertEquals(1, snapshot.getValue("completedUploadCount"))
+        assertEquals(24_000L, snapshot.getValue("meanUploadCompletionNanos"))
+        assertEquals(false, snapshot.getValue("gpuTimingAvailable"))
+        assertEquals(false, snapshot.getValue("gpuAllocationAvailable"))
         assertEquals(64 * 1024, snapshot.getValue("ordinaryUploadLimitBytes"))
     }
 }

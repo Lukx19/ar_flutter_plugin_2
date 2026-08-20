@@ -49,6 +49,7 @@ internal class CoveragePointMeshResources(
         uploader = FilamentCoveragePointVertexUploader(engine, vertexBuffer),
         onUploadSubmitted = { bytes -> telemetry?.recordUpload(bytes) },
         onUploadCallback = { telemetry?.recordUploadCallback() },
+        onUploadCompleted = { elapsedNanos -> telemetry?.recordUploadCompletion(elapsedNanos) },
     )
     private var indexStaging: java.nio.IntBuffer? = null
 
@@ -190,6 +191,8 @@ internal class CoveragePointUploadCoordinator(
     private val uploader: CoveragePointVertexUploader,
     private val onUploadSubmitted: (Int) -> Unit = {},
     private val onUploadCallback: () -> Unit = {},
+    private val onUploadCompleted: (Long) -> Unit = {},
+    private val clockNanos: () -> Long = System::nanoTime,
 ) {
     private val buffers = CoveragePointUploadBuffers(capacity)
     private var uploadBusy = false
@@ -198,6 +201,7 @@ internal class CoveragePointUploadCoordinator(
     private var pendingSnapshot: CoveragePointRenderSnapshot? = null
     private var hasUploadedSnapshot = false
     private var destroyed = false
+    private var activeUploadStartedNanos = 0L
 
     fun submit(snapshot: CoveragePointRenderSnapshot) {
         if (destroyed) return
@@ -246,6 +250,7 @@ internal class CoveragePointUploadCoordinator(
         hasUploadedSnapshot = true
         uploadBusy = true
         consumedCallbackMask = 0
+        activeUploadStartedNanos = clockNanos()
         val uploadId = ++activeUploadId
         uploader.uploadPositions(
             buffers.positionBuffer,
@@ -265,6 +270,7 @@ internal class CoveragePointUploadCoordinator(
         onUploadCallback()
         consumedCallbackMask = consumedCallbackMask or callbackBit
         if (consumedCallbackMask == BOTH_CALLBACKS) {
+            onUploadCompleted((clockNanos() - activeUploadStartedNanos).coerceAtLeast(0L))
             uploadBusy = false
             drain()
         }

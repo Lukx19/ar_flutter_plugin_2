@@ -48,6 +48,26 @@ class CoveragePointUploadCoordinatorTest {
     }
 
     @Test
+    fun `completed upload reports one bounded hand-off duration and ignores late callbacks`() {
+        val uploader = FakeUploader()
+        var now = 100L
+        val completions = mutableListOf<Long>()
+        val coordinator = CoveragePointUploadCoordinator(
+            capacity = 2,
+            uploader = uploader,
+            onUploadCompleted = completions::add,
+            clockNanos = { now },
+        )
+
+        coordinator.submit(snapshot(1, 1f))
+        now = 175L
+        uploader.completeAll()
+        uploader.completeAll()
+
+        assertEquals(listOf(75L), completions)
+    }
+
+    @Test
     fun `first snapshot after a mesh replacement uploads even without dirty spans`() {
         val uploader = FakeUploader()
         val coordinator = CoveragePointUploadCoordinator(2, uploader)

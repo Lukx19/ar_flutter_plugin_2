@@ -11,6 +11,9 @@ internal class RendererTelemetry {
     private var peakUpdateUploadBytes = 0
     private var peakOwnedBufferBytes = 0
     private var uploadCallbackCount = 0
+    private var completedUploadCount = 0
+    private var totalUploadCompletionNanos = 0L
+    private var peakUploadCompletionNanos = 0L
     private var rendererUpdateCount = 0
 
     fun setOwnedBufferBytes(owner: String, bytes: Int) {
@@ -39,6 +42,18 @@ internal class RendererTelemetry {
         uploadCallbackCount++
     }
 
+    /**
+     * Records the native hand-off duration from submitting an upload to both
+     * Filament consumption callbacks. This is not a GPU frame-time metric:
+     * Filament intentionally does not expose driver timer-query results here.
+     */
+    fun recordUploadCompletion(elapsedNanos: Long) {
+        require(elapsedNanos >= 0)
+        completedUploadCount++
+        totalUploadCompletionNanos += elapsedNanos
+        peakUploadCompletionNanos = maxOf(peakUploadCompletionNanos, elapsedNanos)
+    }
+
     private val ownedBufferBytes: Int
         get() = allocationsByOwner.values.sum()
 
@@ -49,6 +64,19 @@ internal class RendererTelemetry {
         "currentUpdateUploadBytes" to currentUpdateUploadBytes,
         "peakUpdateUploadBytes" to peakUpdateUploadBytes,
         "uploadCallbackCount" to uploadCallbackCount,
+        "completedUploadCount" to completedUploadCount,
+        "meanUploadCompletionNanos" to if (completedUploadCount == 0) {
+            0L
+        } else {
+            totalUploadCompletionNanos / completedUploadCount
+        },
+        "peakUploadCompletionNanos" to peakUploadCompletionNanos,
+        // The ledger above is exact for renderer-owned buffers. Android's
+        // public Filament API does not provide a portable driver allocation or
+        // GPU timer-query counter, including on the supported emulator.
+        "gpuTimingAvailable" to false,
+        "gpuAllocationAvailable" to false,
+        "gpuCounterStatus" to "unavailable: Filament driver counters are not exposed",
         "ordinaryUploadLimitBytes" to ORDINARY_UPLOAD_LIMIT_BYTES,
         "rendererAllocationLimitBytes" to RENDERER_ALLOCATION_LIMIT_BYTES,
     )
