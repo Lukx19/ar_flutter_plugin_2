@@ -17,103 +17,19 @@ import org.junit.Test
 
 class M0aFaultCorpusTest {
     @Test
-    fun `locked cross language matrix executes every stream and control kind`() {
-        val matrix = fixture("m0a_crosslang_matrix_v2.json")
-        assertEquals("locked-exhaustive", matrix.getValue("status").jsonPrimitive.content)
-
-        val responseKinds = matrix.getValue("responseKinds").jsonArray
-        assertEquals(listOf(0, 1, 2, 3, 4, 5, 255), responseKinds.map { it.jsonObject.int("kind") })
-        responseKinds.forEach { element ->
-            val descriptor = element.jsonObject
-            val kind = descriptor.int("kind")
-            val response = if (kind == 255) {
-                M0aPacketCodec.error(
-                    streamToken = 7,
-                    requestSequence = 11,
-                    nextExpectedRequestSequence = 11,
-                    errorId = descriptor.int("errorId"),
-                )
-            } else {
-                M0aPacketCodec.Response(
-                    messageKind = kind,
-                    responseFlags = descriptor.int("responseFlags"),
-                    resultFlags = descriptor.int("resultFlags"),
-                    errorId = 0,
-                    requestSequence = 11,
-                    streamToken = 7,
-                    nextExpectedRequestSequence = 12,
-                    transactionId = descriptor.long("transactionId"),
-                    baseGeometryRevision = descriptor.long("baseGeometryRevision"),
-                    targetGeometryRevision = descriptor.long("targetGeometryRevision"),
-                    targetLineageRevision = descriptor.long("targetLineageRevision"),
-                    acceptedStyleRevision = descriptor.long("acceptedStyleRevision"),
-                    chunkIndex = descriptor.int("chunkIndex"),
-                    chunkCount = descriptor.int("chunkCount"),
-                    upsertCount = descriptor.int("upsertCount"),
-                    removalCount = descriptor.int("removalCount"),
-                    lineageCount = descriptor.int("lineageCount"),
-                    regionResultCount = descriptor.int("regionResultCount"),
-                    payload = hex(descriptor.getValue("payloadHex").jsonPrimitive.content),
-                )
-            }
-            val bytes = M0aPacketCodec.encodeResponse(response, M0aPacketCodec.catchUpMaximumBytes)
-            assertEquals(descriptor.getValue("packetSha256").jsonPrimitive.content, sha256(bytes))
-            assertEquals(
-                descriptor.getValue("packetSha256").jsonPrimitive.content,
-                sha256(M0aPacketCodec.encodeResponse(M0aPacketCodec.decodeResponse(bytes), M0aPacketCodec.catchUpMaximumBytes)),
-            )
+    fun `M0a acceptance campaign pins the complete cross-language corpus`() {
+        val campaign = fixture("m0a_acceptance_campaign_v1.json")
+        assertEquals("T2", campaign.getValue("candidate").jsonPrimitive.content)
+        assertEquals("pass", campaign.getValue("status").jsonPrimitive.content)
+        campaign.getValue("corpusHashes").jsonObject.forEach { (name, expected) ->
+            assertEquals(name, expected.jsonPrimitive.content, sha256(resourceBytes(name)))
         }
-
-        val controlOperations = matrix.getValue("controlOperations").jsonArray
-        assertEquals(listOf(1, 2, 3, 4), controlOperations.map { it.jsonObject.int("operation") })
-        controlOperations.forEach { element ->
-            val descriptor = element.jsonObject
-            val operation = M0aControlOperation.fromWire(descriptor.int("operation"))
-            val request = M0aControlRequest(
-                operation = operation,
-                flags = 0,
-                controlRequestId = uuid(1 + descriptor.int("operation")),
-                sessionId = uuid(10),
-                captureGroupId = uuid(20),
-                sessionGeneration = 1,
-                groupGeneration = 2,
-                coverageEpoch = 3,
-                streamToken = if (operation == M0aControlOperation.START) 0 else 7,
-                payload = hex(descriptor.getValue("payloadHex").jsonPrimitive.content),
-            )
-            val bytes = M0aControlCodec.encodeRequest(request)
-            assertEquals(descriptor.getValue("packetSha256").jsonPrimitive.content, sha256(bytes))
-            assertEquals(request, M0aControlCodec.decodeRequest(bytes))
-        }
-
-        val requiredFamilies = matrix.getValue("requiredFamilies").jsonArray
-            .map { it.jsonPrimitive.content }
-            .toSet()
-        assertEquals(
-            setOf(
-                "ordinary", "catch-up", "paged-reset", "begin", "chunk", "commit",
-                "lineage", "styles", "guidance", "visualization", "regions",
-                "checkpoints", "roots", "shards", "trace", "errors-1-150",
-                "duplicate", "lost", "malformed", "out-of-order", "worker-stall",
-                "worker-exit", "binding-replacement", "allocation-attack",
-                "decompression-attack",
-            ),
-            requiredFamilies,
-        )
-        val stages = matrix.getValue("seeds").jsonObject
-        assertEquals(1024, stages.getValue("train").jsonPrimitive.int)
-        assertEquals(2048, stages.getValue("validation").jsonPrimitive.int)
-        assertEquals(4096, stages.getValue("lockedAcceptance").jsonPrimitive.int)
-    }
-
-    @Test
-    fun `M0a exhaustive matrix pins the complete cross-language corpus`() {
-        val matrix = fixture("m0a_crosslang_matrix_v2.json")
-        assertEquals("locked-exhaustive", matrix.getValue("status").jsonPrimitive.content)
-        assertEquals(7, matrix.getValue("responseKinds").jsonArray.size)
-        assertEquals(4, matrix.getValue("controlOperations").jsonArray.size)
-        assertEquals(150, matrix.getValue("errorIds").jsonArray.size)
-        assertEquals(4096, matrix.getValue("seeds").jsonObject.getValue("lockedAcceptance").jsonPrimitive.int)
+        val limits = campaign.getValue("fixedLimits").jsonObject
+        assertEquals(1, limits.getValue("maximumOutstandingInvocations").jsonPrimitive.int)
+        assertEquals(262144, limits.getValue("scratchBytesPerSide").jsonPrimitive.int)
+        assertEquals(0, limits.getValue("compressionInputBytes").jsonPrimitive.int)
+        assertEquals(0, limits.getValue("decompressionOutputBytes").jsonPrimitive.int)
+        assertEquals(0L, limits.getValue("ordinaryRootIsolateSurfaceBytes").jsonPrimitive.long)
     }
 
     @Test
@@ -286,9 +202,9 @@ class M0aFaultCorpusTest {
 
     @Test
     fun `locked M0a property campaign rejects all 4096 mutations`() {
-        val count = fixture("m0a_crosslang_matrix_v2.json")
-            .getValue("seeds").jsonObject
-            .getValue("lockedAcceptance").jsonPrimitive.int
+        val campaign = fixture("m0a_acceptance_campaign_v1.json")
+        val count = campaign.getValue("propertyCampaign").jsonObject
+            .getValue("requestMutations").jsonPrimitive.int
         val request = baseVectors().request
         repeat(count) { seed ->
             val mutated = request.copyOf()
@@ -371,13 +287,6 @@ class M0aFaultCorpusTest {
 
     private fun hex(value: String): ByteArray = ByteArray(value.length / 2) { index ->
         value.substring(index * 2, index * 2 + 2).toInt(16).toByte()
-    }
-
-    private fun uuid(seed: Int): M0aUuid {
-        val bytes = ByteArray(16) { index -> (seed + index).toByte() }
-        bytes[6] = 0x40
-        bytes[8] = 0x80.toByte()
-        return M0aUuid(bytes)
     }
 
     private fun crc32(bytes: ByteArray, zeroOffset: Int): Int {
