@@ -296,7 +296,11 @@ class M0aVisibilitySurfaceStreamChannel(
                                                     else -> {
                                                         if (request.styleRecords.isNotEmpty()) {
                                                             committedBaseline = committedBaseline.copy(
-                                                                styleRevision = request.nextStyleRevision,
+                                                                styleRevision = M0aStyleRevisionSemantics.committedRevision(
+                                                                    committedBaseline.styleRevision,
+                                                                    request.nextStyleRevision,
+                                                                    true,
+                                                                ),
                                                             )
                                                             controlLifecycle?.setCommittedBaseline(committedBaseline)
                                                         }
@@ -492,12 +496,11 @@ class M0aVisibilitySurfaceStreamChannel(
             (request.acknowledgedTransactionId != committedBaseline.transactionId ||
                 request.acknowledgedGeometryRevision != committedBaseline.geometryRevision ||
                 request.acknowledgedLineageRevision != committedBaseline.lineageRevision)
-        val expectedStyleRevision = if (request.styleRecords.isEmpty()) {
-            committedBaseline.styleRevision
-        } else {
-            committedBaseline.styleRevision + 1
-        }
-        val styleMismatch = request.nextStyleRevision != expectedStyleRevision
+        val styleMismatch = !M0aStyleRevisionSemantics.accepts(
+            committedBaseline.styleRevision,
+            request.nextStyleRevision,
+            request.styleRecords.isNotEmpty(),
+        )
         return structuralMismatch || styleMismatch
     }
 

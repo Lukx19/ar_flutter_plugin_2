@@ -394,7 +394,24 @@ class M0aFaultCorpusTest {
                     assertEquals(frame::class, M0aTransactionResponseCodecV1.decodeFrame(M0aPacketCodec.decodeResponse(bytes))::class)
                 }
             }
-            "checkpoints", "roots" -> executeLifecycle(matrix, descriptorForLifecycle(if (family == "checkpoints") "checkpoint-replay" else "restored-baseline"))
+            "styles" -> {
+                val currentRevision = 0L
+                val request = baseRequest().copy(
+                    nextStyleRevision = 1,
+                    styleRecords = listOf(byteArrayOf(1, 0, 0, 0, 2, 0, 0, 0)),
+                    commandBytes = byteArrayOf(),
+                )
+                val decoded = M0aPacketCodec.decodeRequest(M0aPacketCodec.encodeRequest(request))
+                val committed = M0aStyleRevisionSemantics.committedRevision(
+                    currentRevision,
+                    decoded.nextStyleRevision,
+                    decoded.styleRecords.isNotEmpty(),
+                )
+                assertEquals(1L, committed)
+                assertTrue(M0aStyleRevisionSemantics.accepts(committed, 1, false))
+            }
+            "checkpoints" -> executeLifecycle(matrix, descriptorForLifecycle("checkpoint-replay"))
+            "roots" -> executeRetainedRootAuthority()
             "errors-1-150" -> (1..150).forEach { errorId ->
                 val bytes = M0aPacketCodec.encodeResponse(M0aPacketCodec.error(7, errorId.toLong(), errorId.toLong(), errorId), M0aPacketCodec.responseMaximumBytes)
                 assertEquals(errorId, M0aPacketCodec.decodeResponse(bytes).errorId)
@@ -429,6 +446,39 @@ class M0aFaultCorpusTest {
                 assertArrayEquals(bytes, M0aPacketCodec.encodeResponse(M0aPacketCodec.decodeResponse(bytes), M0aPacketCodec.catchUpMaximumBytes))
             }
         }
+    }
+
+    private fun executeRetainedRootAuthority() {
+        val payload = M0aStartRequestCodecV2.defaultPayload()
+        val data = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+        payload[7] = 1
+        repeat(10) { index -> data.putLong(56 + index * 8, (index + 1).toLong()) }
+        payload.fill(1, 392, 424)
+        payload.fill(2, 424, 456)
+        val configuration = M0aStartRequestCodecV2.decode(payload)
+        val baseline = M0aCommittedBaselineV1.fromRestoredConfiguration(configuration)
+        val acceptedLifecycle = M0aControlLifecycle(initialCommittedBaseline = baseline)
+        val acceptedRequest = boundaryControlRequest().copy(payload = payload)
+        val acceptedBytes = acceptedLifecycle.handle(
+            acceptedRequest,
+            M0aControlCodec.encodeRequest(acceptedRequest),
+        )
+        val accepted = M0aControlCodec.decodeResponse(acceptedBytes)
+        assertEquals(0, accepted.outcome)
+        assertEquals(configuration.schemaRootHashIdentity, acceptedLifecycle.committedBaseline().schemaRootHashIdentity)
+        assertEquals(configuration.manifestRootHashIdentity, acceptedLifecycle.committedBaseline().manifestRootHashIdentity)
+        assertEquals(configuration.groupFromWorldIdentity, acceptedLifecycle.committedBaseline().groupFromWorldIdentity)
+        assertEquals(configuration.worldFromGroupIdentity, acceptedLifecycle.committedBaseline().worldFromGroupIdentity)
+
+        val mismatched = baseline.copy(schemaRootHashIdentity = "ff${baseline.schemaRootHashIdentity.drop(2)}")
+        val rejectedLifecycle = M0aControlLifecycle(initialCommittedBaseline = mismatched)
+        val rejectedBytes = rejectedLifecycle.handle(
+            acceptedRequest,
+            M0aControlCodec.encodeRequest(acceptedRequest),
+        )
+        val rejected = M0aControlCodec.decodeResponse(rejectedBytes)
+        assertEquals(1, rejected.outcome)
+        assertEquals(58, rejected.errorId)
     }
 
     private fun executeBoundary(descriptor: JsonObject) {
