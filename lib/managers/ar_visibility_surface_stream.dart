@@ -53,9 +53,8 @@ final class ARVisibilitySurfaceStream {
     final completion = operation.then<void>((_) {});
     _inFlight = completion;
     try {
-      final response = timeout == null
-          ? await operation
-          : await operation.timeout(timeout);
+      final response =
+          timeout == null ? await operation : await operation.timeout(timeout);
       return response;
     } on TimeoutException {
       _abandoned = true;
@@ -120,6 +119,22 @@ final class ARVisibilitySurfaceStreamWorker {
     }
     return _copyResponseBytes(response);
   }
+}
+
+/// Low-rate fixed-width numeric telemetry for one V2 stream binding.
+///
+/// Native throttles this channel to five samples per second. The 168-byte
+/// result contains counters only and never includes surface or packet bytes.
+final class ARVisibilitySurfaceMetrics {
+  ARVisibilitySurfaceMetrics(int viewId)
+      : _channel = BasicMessageChannel<ByteData>(
+          'visibility_surface_metrics_$viewId',
+          const BinaryCodec(),
+        );
+
+  final BasicMessageChannel<ByteData> _channel;
+
+  Future<ByteData?> sample() => _channel.send(ByteData(0));
 }
 
 Uint8List _copyResponseBytes(ByteData response) => Uint8List.fromList(

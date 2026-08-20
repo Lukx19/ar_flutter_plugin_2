@@ -68,7 +68,13 @@ class M0aVisibilitySurfaceStreamChannel(
         "visibility_surface_stream_$viewId",
         BinaryCodec.INSTANCE,
     )
+    private val metricsChannel = BasicMessageChannel<ByteBuffer>(
+        messenger,
+        "visibility_surface_metrics_$viewId",
+        BinaryCodec.INSTANCE,
+    )
     private val disposed = AtomicBoolean(false)
+    private val outstandingInvocation = AtomicBoolean(false)
     @Volatile private var lastSequence: Long? = null
     @Volatile private var nextExpectedSequence = 1L
     @Volatile private var lastRequest: ByteArray? = null
@@ -102,6 +108,7 @@ class M0aVisibilitySurfaceStreamChannel(
             check(structuralFrames.isEmpty()) { "A structural transaction is already queued" }
             validateStructuralTransaction(frames)
             frames.forEach { structuralFrames.addLast(it) }
+            telemetry.retainedStructuralStaging(structuralPayloadBytes())
             val begin = (frames.first() as M0aTransactionBeginFrameV1).value
             queuedTransactionBaseline = committedBaseline.copy(
                 transactionId = begin.transactionId,
@@ -176,6 +183,12 @@ class M0aVisibilitySurfaceStreamChannel(
     private class BindingError(val errorId: Int) : IllegalArgumentException()
 
     init {
+        metricsChannel.setMessageHandler { _, reply ->
+            val summary = telemetry.tryEncodeBoundedSummary()
+            reply.reply(summary?.let { bytes ->
+                ByteBuffer.allocateDirect(bytes.size).apply { put(bytes) }
+            })
+        }
         channel.setMessageHandler { message, reply ->
             val bytes = message?.let { buffer ->
                 val copy = ByteArray(buffer.remaining())
@@ -187,8 +200,18 @@ class M0aVisibilitySurfaceStreamChannel(
                 return@setMessageHandler
             }
             telemetry.submitted(bytes.size)
+            telemetry.allocated(bytes.size)
+            if (!outstandingInvocation.compareAndSet(false, true)) {
+                telemetry.rejected()
+                val rejected = backpressureResponse(bytes)
+                telemetry.allocated(rejected.remaining())
+                reply.reply(rejected)
+                return@setMessageHandler
+            }
             telemetry.queued()
-            val pendingReply = PendingReply(reply)
+            val pendingReply = PendingReply(reply) {
+                outstandingInvocation.set(false)
+            }
             val timeoutHandle = timeoutScheduler.schedule(workerTimeoutMillis) {
                 abandonForTimeout(pendingReply, bytes)
             }
@@ -286,6 +309,8 @@ class M0aVisibilitySurfaceStreamChannel(
                                             nextExpectedSequence = request.requestSequence + 1
                                             lastRequest = bytes.copyOf()
                                             lastResponse = encoded.copyOf()
+                                            telemetry.allocated(bytes.size + encoded.size)
+                                            telemetry.retainedReplayCache(bytes.size, encoded.size)
                                             telemetry.accepted(bytes.size, encoded.size)
                                             encoded
                                         }
@@ -327,11 +352,13 @@ class M0aVisibilitySurfaceStreamChannel(
                                         M0aPacketCodec.responseMinimumBytes,
                                     )
                                 }
+                                telemetry.allocated(encoded.size)
                                 if (pendingReply.tryClaim()) encoded else null
                             }
                         }
                         timeoutHandle.cancel()
                         if (response != null) {
+                            telemetry.allocated(response.size)
                             reply.reply(response.let {
                                 // Flutter's Android messenger passes position() as the
                                 // JNI message length, so leave the reply positioned after
@@ -366,6 +393,7 @@ class M0aVisibilitySurfaceStreamChannel(
             structuralFrames.clear()
             queuedTransactionBaseline = null
         }
+        telemetry.clearRetained()
         controlLifecycle?.abandon()
         transactionReceiver.stop()
         clearMessageHandler()
@@ -414,7 +442,10 @@ class M0aVisibilitySurfaceStreamChannel(
     }
 
     private fun clearMessageHandler() {
-        val clear = { channel.setMessageHandler(null) }
+        val clear = {
+            channel.setMessageHandler(null)
+            metricsChannel.setMessageHandler(null)
+        }
         if (Looper.myLooper() == Looper.getMainLooper()) {
             clear()
         } else {
@@ -493,6 +524,7 @@ class M0aVisibilitySurfaceStreamChannel(
             val encoded = M0aPacketCodec.encodeResponse(response, request.maximumResponseBytes)
             check(encoded.isNotEmpty())
             structuralFrames.removeFirst()
+            telemetry.retainedStructuralStaging(structuralPayloadBytes())
             if (frame is M0aTransactionCommitFrameV1) {
                 committedBaseline = queuedTransactionBaseline
                     ?.copy(styleRevision = committedBaseline.styleRevision)
@@ -531,12 +563,24 @@ class M0aVisibilitySurfaceStreamChannel(
         ) == begin.payloadChecksum)
     }
 
+    private fun structuralPayloadBytes(): Int = structuralFrames.sumOf { frame ->
+        when (frame) {
+            is M0aTransactionChunkFrameV1 -> frame.value.bytes.size
+            else -> 0
+        }
+    }
+
     private class PendingReply(
         private val callback: BasicMessageChannel.Reply<ByteBuffer>,
+        private val onClaimed: () -> Unit,
     ) {
         private val claimed = AtomicBoolean(false)
 
-        fun tryClaim(): Boolean = claimed.compareAndSet(false, true)
+        fun tryClaim(): Boolean {
+            val ownsReply = claimed.compareAndSet(false, true)
+            if (ownsReply) onClaimed()
+            return ownsReply
+        }
 
         fun reply(buffer: ByteBuffer) {
             callback.reply(buffer)
@@ -556,6 +600,22 @@ class M0aVisibilitySurfaceStreamChannel(
                 requestSequence = sequence,
                 nextExpectedRequestSequence = nextExpectedSequence,
                 errorId = STREAM_BINDING_ABANDONED_ERROR_ID,
+            ),
+            M0aPacketCodec.responseMinimumBytes,
+        )
+        return ByteBuffer.allocateDirect(encoded.size).apply { put(encoded) }
+    }
+
+    private fun backpressureResponse(bytes: ByteArray): ByteBuffer {
+        val request = runCatching { M0aPacketCodec.decodeRequest(bytes) }.getOrNull()
+        val sequence = request?.requestSequence ?: 0
+        val token = request?.streamToken ?: 0
+        val encoded = M0aPacketCodec.encodeResponse(
+            M0aPacketCodec.error(
+                streamToken = token,
+                requestSequence = sequence,
+                nextExpectedRequestSequence = nextExpectedSequence,
+                errorId = STREAM_BACKPRESSURE_ERROR_ID,
             ),
             M0aPacketCodec.responseMinimumBytes,
         )
@@ -588,6 +648,7 @@ class M0aVisibilitySurfaceStreamChannel(
 
     private companion object {
         const val MALFORMED_PACKET_ERROR_ID = 6
+        const val STREAM_BACKPRESSURE_ERROR_ID = 8
         const val REPLAY_CONFLICT_ERROR_ID = 30
         const val STALE_SEQUENCE_ERROR_ID = 31
         const val SEQUENCE_GAP_ERROR_ID = 32

@@ -17,6 +17,22 @@ import org.junit.Test
 
 class M0aFaultCorpusTest {
     @Test
+    fun `M0a acceptance campaign pins the complete cross-language corpus`() {
+        val campaign = fixture("m0a_acceptance_campaign_v1.json")
+        assertEquals("T2", campaign.getValue("candidate").jsonPrimitive.content)
+        assertEquals("pass", campaign.getValue("status").jsonPrimitive.content)
+        campaign.getValue("corpusHashes").jsonObject.forEach { (name, expected) ->
+            assertEquals(name, expected.jsonPrimitive.content, sha256(resourceBytes(name)))
+        }
+        val limits = campaign.getValue("fixedLimits").jsonObject
+        assertEquals(1, limits.getValue("maximumOutstandingInvocations").jsonPrimitive.int)
+        assertEquals(262144, limits.getValue("scratchBytesPerSide").jsonPrimitive.int)
+        assertEquals(0, limits.getValue("compressionInputBytes").jsonPrimitive.int)
+        assertEquals(0, limits.getValue("decompressionOutputBytes").jsonPrimitive.int)
+        assertEquals(0L, limits.getValue("ordinaryRootIsolateSurfaceBytes").jsonPrimitive.long)
+    }
+
+    @Test
     fun `M0a train validation and locked fault corpora are hash-bound`() {
         val manifest = fixture("m0a_reference_corpus_v1.json")
         val faultCorpus = manifest.getValue("faultCorpus").jsonObject
@@ -182,6 +198,23 @@ class M0aFaultCorpusTest {
                 M0aPacketCodec.decodeRequest(mutated)
             }
         }
+    }
+
+    @Test
+    fun `locked M0a property campaign rejects all 4096 mutations`() {
+        val campaign = fixture("m0a_acceptance_campaign_v1.json")
+        val count = campaign.getValue("propertyCampaign").jsonObject
+            .getValue("requestMutations").jsonPrimitive.int
+        val request = baseVectors().request
+        repeat(count) { seed ->
+            val mutated = request.copyOf()
+            val offset = (seed * 17) % mutated.size
+            mutated[offset] = (mutated[offset].toInt() xor 1).toByte()
+            assertThrows(IllegalArgumentException::class.java) {
+                M0aPacketCodec.decodeRequest(mutated)
+            }
+        }
+        assertEquals(4096, count)
     }
 
     private fun baseVectors(): Vectors {

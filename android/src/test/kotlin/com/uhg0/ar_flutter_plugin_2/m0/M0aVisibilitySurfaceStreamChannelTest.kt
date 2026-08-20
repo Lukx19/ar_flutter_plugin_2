@@ -113,7 +113,20 @@ class M0aVisibilitySurfaceStreamChannelTest {
         assertEquals(5, telemetry.resourceLimits.diagnosticSummaryRateHz)
         assertEquals(18, telemetry.resourceLimits.structuralTransactionFrames)
         assertEquals(1024, telemetry.resourceLimits.structuralChunkBytes)
-        assertEquals(null, telemetry.allocationBytesObserved)
+        assertTrue(telemetry.allocationBytesObserved > 0)
+        assertTrue(telemetry.maximumSingleAllocationBytes <= 64 * 1024)
+        assertTrue(telemetry.peakWorkingSetBytes <= 256 * 1024)
+        assertEquals(request.size + first.size.toLong(), telemetry.retainedAllocationBytes)
+        assertEquals(0L, telemetry.compressionBytesObserved)
+        assertEquals(0L, telemetry.decompressionBytesObserved)
+        assertEquals(0L, telemetry.ordinaryRootIsolateTimeNanos)
+        assertEquals(0, telemetry.resourceLimits.compressionInputBytes)
+        assertEquals(0, telemetry.resourceLimits.decompressionOutputBytes)
+        assertEquals(256 * 1024, telemetry.resourceLimits.scratchBytesPerSide)
+        assertTrue(binding.transportInstrumentation.encodeBoundedSummary().size <= 1024)
+        assertEquals(168, binding.transportInstrumentation.tryEncodeBoundedSummary(1_000_000_000)!!.size)
+        assertNull(binding.transportInstrumentation.tryEncodeBoundedSummary(1_100_000_000))
+        assertEquals(168, binding.transportInstrumentation.tryEncodeBoundedSummary(1_200_000_000)!!.size)
 
         val conflict = messenger.exchange(request(sequence = 1, token = 92))
         val conflictResponse = M0aPacketCodec.decodeResponse(conflict)
@@ -121,6 +134,35 @@ class M0aVisibilitySurfaceStreamChannelTest {
         assertEquals(30, conflictResponse.errorId)
         assertEquals(1L, conflictResponse.requestSequence)
 
+        binding.dispose()
+    }
+
+    @Test
+    fun `binding rejects a second outstanding invocation without queue growth`() {
+        val messenger = TestMessenger(34)
+        val executor = HoldingExecutor()
+        val binding = M0aVisibilitySurfaceStreamChannel(
+            messenger,
+            34,
+            workerExecutor = executor,
+            shutdownWorkerOnDispose = false,
+        )
+        val firstCompleted = CountDownLatch(1)
+        messenger.send(
+            "visibility_surface_stream_34",
+            ByteBuffer.wrap(request(sequence = 1, token = 34)),
+        ) { firstCompleted.countDown() }
+
+        val rejected = M0aPacketCodec.decodeResponse(
+            messenger.exchange(request(sequence = 2, token = 34)),
+        )
+        assertEquals(255, rejected.messageKind)
+        assertEquals(8, rejected.errorId)
+        assertEquals(1L, rejected.nextExpectedRequestSequence)
+        assertEquals(1, binding.transportInstrumentation.snapshot().peakQueueDepth)
+
+        executor.runQueued()
+        assertTrue(firstCompleted.await(2, TimeUnit.SECONDS))
         binding.dispose()
     }
 
@@ -771,7 +813,8 @@ private class HoldingTimeoutScheduler : M0aTimeoutScheduler {
 
 private class TestMessenger(viewId: Int) : BinaryMessenger {
     private val channelName = "visibility_surface_stream_$viewId"
-    private var handler: BinaryMessenger.BinaryMessageHandler? = null
+    private val metricsChannelName = "visibility_surface_metrics_$viewId"
+    private val handlers = mutableMapOf<String, BinaryMessenger.BinaryMessageHandler>()
     @Volatile private var failNextReplyDelivery = false
 
     override fun send(channel: String, message: ByteBuffer?) {
@@ -783,8 +826,8 @@ private class TestMessenger(viewId: Int) : BinaryMessenger {
         message: ByteBuffer?,
         callback: BinaryMessenger.BinaryReply?,
     ) {
-        check(channel == channelName)
-        val currentHandler = handler
+        check(channel == channelName || channel == metricsChannelName)
+        val currentHandler = handlers[channel]
         if (currentHandler == null) {
             callback?.reply(null)
             return
@@ -818,8 +861,12 @@ private class TestMessenger(viewId: Int) : BinaryMessenger {
         channel: String,
         handler: BinaryMessenger.BinaryMessageHandler?,
     ) {
-        check(channel == channelName)
-        this.handler = handler
+        check(channel == channelName || channel == metricsChannelName)
+        if (handler == null) {
+            handlers.remove(channel)
+        } else {
+            handlers[channel] = handler
+        }
     }
 
     fun exchange(request: ByteArray): ByteArray =
