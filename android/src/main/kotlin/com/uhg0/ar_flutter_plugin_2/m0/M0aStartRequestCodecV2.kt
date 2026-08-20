@@ -3,6 +3,17 @@ package com.uhg0.ar_flutter_plugin_2.m0
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
+internal const val M0A_IDENTITY_MATRIX_IDENTITY =
+    "3ff0000000000000,0,0,0,0,3ff0000000000000,0,0,0,0,3ff0000000000000,0,0,0,0,3ff0000000000000"
+
+internal fun m0aMatrixIdentity(data: ByteBuffer, offset: Int): String =
+    (0 until 16).joinToString(",") { index ->
+        data.getDouble(offset + index * 8).toBits().toString(16)
+    }
+
+internal fun m0aHashIdentity(bytes: ByteArray): String =
+    bytes.joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+
 /** Strict decoder for the canonical Chapter 13 StartRequestV2 payload. */
 object M0aStartRequestCodecV2 {
     const val byteLength = 464
@@ -26,13 +37,29 @@ object M0aStartRequestCodecV2 {
         val voxelSizeMicrometres: Int,
         val requestedModelCapacity: Int,
         val requestedPendingObservationCapacity: Int,
+        val schemaRootHashIdentity: String,
+        val manifestRootHashIdentity: String,
+        val groupFrameConvention: Int,
+        val matrixConvention: Int,
+        val directionConvention: Int,
+        val normalEncoding: Int,
+        val groupFromWorldIdentity: String,
+        val worldFromGroupIdentity: String,
         val restoredRevisions: LongArray,
     ) {
         fun hasRestoredCutConflict(baseline: M0aCommittedBaselineV1): Boolean =
             restoreRequested && baseline != M0aCommittedBaselineV1.ZERO &&
-                restoredRevisions.indices.any { index ->
+                (restoredRevisions.indices.any { index ->
                     restoredRevisions[index] != baseline.resultRevisionCut()[index]
-                }
+                } ||
+                    schemaRootHashIdentity != baseline.schemaRootHashIdentity ||
+                    manifestRootHashIdentity != baseline.manifestRootHashIdentity ||
+                    groupFrameConvention != baseline.groupFrameConvention ||
+                    matrixConvention != baseline.matrixConvention ||
+                    directionConvention != baseline.directionConvention ||
+                    normalEncoding != baseline.normalEncoding ||
+                    groupFromWorldIdentity != baseline.groupFromWorldIdentity ||
+                    worldFromGroupIdentity != baseline.worldFromGroupIdentity)
     }
 
     fun decode(bytes: ByteArray): Configuration {
@@ -56,15 +83,19 @@ object M0aStartRequestCodecV2 {
         val voxel = data.getInt(36)
         val modelCapacity = data.getInt(40)
         val pendingCapacity = data.getInt(44)
+        val groupFrameConvention = data.getShort(48).toInt() and 0xffff
+        val matrixConvention = data.getShort(50).toInt() and 0xffff
+        val directionConvention = data.getShort(52).toInt() and 0xffff
+        val normalEncoding = data.getShort(54).toInt() and 0xffff
         require(ordinary in 4096..16384)
         require(catchUp in ordinary..65536)
         require(diagnostic <= 1024 && regionLimit in 1..8)
         require(voxel > 0 && 1_000_000 % voxel == 0 && 3_000_000 % voxel == 0)
         require(modelCapacity in 0..100_000 && pendingCapacity in 0..200_000)
-        require(data.getShort(48).toInt() and 0xffff == 1)
-        require(data.getShort(50).toInt() and 0xffff == 1)
-        require(data.getShort(52).toInt() and 0xffff == 1)
-        require(data.getShort(54).toInt() and 0xffff == 1)
+        require(groupFrameConvention == 1)
+        require(matrixConvention == 1)
+        require(directionConvention == 1)
+        require(normalEncoding == 1)
         val revisions = LongArray(10) { index -> data.getLong(56 + index * 8) }
         require(revisions.all { it >= 0 })
         validateMatrix(data, 136)
@@ -94,6 +125,14 @@ object M0aStartRequestCodecV2 {
             voxel,
             modelCapacity,
             pendingCapacity,
+            m0aHashIdentity(schemaHash),
+            m0aHashIdentity(manifestHash),
+            groupFrameConvention,
+            matrixConvention,
+            directionConvention,
+            normalEncoding,
+            m0aMatrixIdentity(data, 136),
+            m0aMatrixIdentity(data, 264),
             revisions,
         )
     }

@@ -36,6 +36,12 @@ class M0aControlLifecycleTest {
         val result = ByteBuffer.wrap(response.payload).order(ByteOrder.LITTLE_ENDIAN)
         assertEquals(0L, result.getLong(8))
         assertEquals(0x107L, result.getLong(16))
+        assertEquals(1L, lifecycle.metrics.unsupportedDesiredCapabilityBits)
+
+        repeat(1_200) {
+            lifecycle.metrics.recordUnsupportedDesiredCapabilityBits(Long.MAX_VALUE)
+        }
+        assertEquals(0xffffL, lifecycle.metrics.unsupportedDesiredCapabilityBits)
 
         val mandatoryLifecycle = M0aControlLifecycle()
         val mandatory = request(M0aControlOperation.START, 0, 6).copy(
@@ -100,6 +106,40 @@ class M0aControlLifecycleTest {
         assertEquals(1, response.outcome)
         assertEquals(58, response.errorId)
         assertEquals(M0aControlLifecycle.State.IDLE, lifecycle.state())
+    }
+
+    @Test
+    fun `restored cut requires matching roots and transform identity`() {
+        val restoredPayload = restoredPayload()
+        val restored = M0aStartRequestCodecV2.decode(restoredPayload)
+        val baseline = M0aCommittedBaselineV1.fromRestoredConfiguration(restored)
+
+        val exactLifecycle = M0aControlLifecycle(initialCommittedBaseline = baseline)
+        val exact = request(M0aControlOperation.START, 0, 8).copy(payload = restoredPayload)
+        val exactResponse = M0aControlCodec.decodeResponse(
+            exactLifecycle.handle(exact, M0aControlCodec.encodeRequest(exact)),
+        )
+        assertEquals(0, exactResponse.outcome)
+
+        val rootMismatch = restoredPayload.copyOf().also { it[392] = (it[392].toInt() xor 1).toByte() }
+        val rootLifecycle = M0aControlLifecycle(initialCommittedBaseline = baseline)
+        val rootRequest = request(M0aControlOperation.START, 0, 9).copy(payload = rootMismatch)
+        val rootResponse = M0aControlCodec.decodeResponse(
+            rootLifecycle.handle(rootRequest, M0aControlCodec.encodeRequest(rootRequest)),
+        )
+        assertEquals(1, rootResponse.outcome)
+        assertEquals(58, rootResponse.errorId)
+
+        val transformMismatch = restoredPayload.copyOf().also {
+            ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putDouble(136, 2.0)
+        }
+        val transformLifecycle = M0aControlLifecycle(initialCommittedBaseline = baseline)
+        val transformRequest = request(M0aControlOperation.START, 0, 10).copy(payload = transformMismatch)
+        val transformResponse = M0aControlCodec.decodeResponse(
+            transformLifecycle.handle(transformRequest, M0aControlCodec.encodeRequest(transformRequest)),
+        )
+        assertEquals(1, transformResponse.outcome)
+        assertEquals(58, transformResponse.errorId)
     }
 
     @Test
@@ -198,6 +238,35 @@ class M0aControlLifecycleTest {
             M0aCommittedBaselineV1(41, 42, 43, 44),
             authority.snapshot(M0aCommittedBaselineScopeV1.from(firstStart)),
         )
+    }
+
+    @Test
+    fun `factory authority retains restored roots and transform identity`() {
+        val authority = M0aCommittedBaselineAuthority()
+        val restoredPayload = restoredPayload()
+        val restored = M0aStartRequestCodecV2.decode(restoredPayload)
+        val baseline = M0aCommittedBaselineV1.fromRestoredConfiguration(restored)
+        val firstStart = request(M0aControlOperation.START, 0, 61).copy(payload = restoredPayload)
+        val firstLifecycle = M0aControlLifecycle(committedBaselineAuthority = authority)
+        firstLifecycle.handle(firstStart, M0aControlCodec.encodeRequest(firstStart))
+        firstLifecycle.setCommittedBaseline(baseline)
+
+        val exactStart = request(M0aControlOperation.START, 0, 62).copy(payload = restoredPayload)
+        val exactLifecycle = M0aControlLifecycle(committedBaselineAuthority = authority)
+        val exactResponse = M0aControlCodec.decodeResponse(
+            exactLifecycle.handle(exactStart, M0aControlCodec.encodeRequest(exactStart)),
+        )
+        assertEquals(0, exactResponse.outcome)
+        assertEquals(baseline, exactLifecycle.committedBaseline())
+
+        val mismatchedPayload = restoredPayload.copyOf().also { it[424] = (it[424].toInt() xor 1).toByte() }
+        val mismatchStart = request(M0aControlOperation.START, 0, 63).copy(payload = mismatchedPayload)
+        val mismatchLifecycle = M0aControlLifecycle(committedBaselineAuthority = authority)
+        val mismatchResponse = M0aControlCodec.decodeResponse(
+            mismatchLifecycle.handle(mismatchStart, M0aControlCodec.encodeRequest(mismatchStart)),
+        )
+        assertEquals(1, mismatchResponse.outcome)
+        assertEquals(58, mismatchResponse.errorId)
     }
 
     @Test
@@ -333,6 +402,14 @@ class M0aControlLifecycleTest {
         M0aStartRequestCodecV2.defaultPayload().also {
             ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).apply(mutate)
         }
+
+    private fun restoredPayload(): ByteArray = startPayload {
+        put(7, 1)
+        putLong(8, M0aStartRequestCodecV2.supportedCapabilities)
+        repeat(10) { index -> putLong(56 + index * 8, 41L + index * 2) }
+        repeat(32) { index -> put(392 + index, (index + 1).toByte()) }
+        repeat(32) { index -> put(424 + index, (index + 33).toByte()) }
+    }
 
     private fun uuid(seed: Int): M0aUuid {
         val bytes = ByteArray(16) { (seed + it).toByte() }

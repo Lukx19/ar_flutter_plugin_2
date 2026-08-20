@@ -20,6 +20,14 @@ data class M0aCommittedBaselineV1(
     val regionManifestRevision: Long = 0,
     val schemaRootRevision: Long = 0,
     val nextSurfaceIdHighWater: Long = 0,
+    val schemaRootHashIdentity: String = "",
+    val manifestRootHashIdentity: String = "",
+    val groupFrameConvention: Int = 1,
+    val matrixConvention: Int = 1,
+    val directionConvention: Int = 1,
+    val normalEncoding: Int = 1,
+    val groupFromWorldIdentity: String = M0A_IDENTITY_MATRIX_IDENTITY,
+    val worldFromGroupIdentity: String = M0A_IDENTITY_MATRIX_IDENTITY,
 ) {
     init {
         require(
@@ -58,7 +66,10 @@ data class M0aCommittedBaselineV1(
     companion object {
         val ZERO = M0aCommittedBaselineV1(0, 0, 0, 0)
 
-        fun fromRestoredRevisions(revisions: LongArray): M0aCommittedBaselineV1 {
+        fun fromRestoredConfiguration(
+            configuration: M0aStartRequestCodecV2.Configuration,
+        ): M0aCommittedBaselineV1 {
+            val revisions = configuration.restoredRevisions
             require(revisions.size >= 7) { "A canonical START cut has seven revisions" }
             return M0aCommittedBaselineV1(
                 transactionId = 0,
@@ -72,6 +83,14 @@ data class M0aCommittedBaselineV1(
                 regionManifestRevision = revisions[7],
                 schemaRootRevision = revisions[8],
                 nextSurfaceIdHighWater = revisions[9],
+                schemaRootHashIdentity = configuration.schemaRootHashIdentity,
+                manifestRootHashIdentity = configuration.manifestRootHashIdentity,
+                groupFrameConvention = configuration.groupFrameConvention,
+                matrixConvention = configuration.matrixConvention,
+                directionConvention = configuration.directionConvention,
+                normalEncoding = configuration.normalEncoding,
+                groupFromWorldIdentity = configuration.groupFromWorldIdentity,
+                worldFromGroupIdentity = configuration.worldFromGroupIdentity,
             )
         }
     }
@@ -83,6 +102,26 @@ class M0aControlLifecycle(
     initialCommittedBaseline: M0aCommittedBaselineV1 = M0aCommittedBaselineV1.ZERO,
 ) {
     enum class State { IDLE, ACTIVE, ABANDONED, STOPPED }
+
+    /** Bounded scalar telemetry; requested bit identities are never retained. */
+    class Metrics {
+        companion object {
+            const val MAX_UNSUPPORTED_DESIRED_CAPABILITY_BITS = 0xffffL
+        }
+
+        var unsupportedDesiredCapabilityBits: Long = 0
+            private set
+
+        fun recordUnsupportedDesiredCapabilityBits(desiredCapabilities: Long) {
+            val unsupported = desiredCapabilities and
+                M0aStartRequestCodecV2.supportedCapabilities.inv()
+            unsupportedDesiredCapabilityBits =
+                (unsupportedDesiredCapabilityBits + java.lang.Long.bitCount(unsupported))
+                    .coerceAtMost(MAX_UNSUPPORTED_DESIRED_CAPABILITY_BITS)
+        }
+    }
+
+    val metrics = Metrics()
 
     private var state = State.IDLE
     private var nextStreamToken = 1L
@@ -150,6 +189,7 @@ class M0aControlLifecycle(
     private fun start(request: M0aControlRequest): ByteArray {
         if (state != State.IDLE) return error(request, M0aControlError.LIFECYCLE_STATE_INVALID)
         val configuration = M0aStartRequestCodecV2.decode(request.payload)
+        metrics.recordUnsupportedDesiredCapabilityBits(configuration.desiredCapabilities)
         activeScope = M0aCommittedBaselineScopeV1.from(request)
         val persistedBaseline = committedBaselineAuthority?.snapshot(activeScope!!)
             ?: M0aCommittedBaselineV1.ZERO
@@ -172,7 +212,7 @@ class M0aControlLifecycle(
         committedBaseline = if (availableBaseline != M0aCommittedBaselineV1.ZERO) {
             availableBaseline
         } else if (configuration.restoreRequested) {
-            M0aCommittedBaselineV1.fromRestoredRevisions(configuration.restoredRevisions)
+            M0aCommittedBaselineV1.fromRestoredConfiguration(configuration)
         } else {
             M0aCommittedBaselineV1.ZERO
         }

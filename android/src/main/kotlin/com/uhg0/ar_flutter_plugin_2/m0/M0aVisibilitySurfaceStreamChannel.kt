@@ -124,6 +124,14 @@ class M0aVisibilitySurfaceStreamChannel(
         regionManifestRevision: Long = 0,
         schemaRootRevision: Long = 0,
         nextSurfaceIdHighWater: Long = 0,
+        schemaRootHashIdentity: String = "",
+        manifestRootHashIdentity: String = "",
+        groupFrameConvention: Int = 1,
+        matrixConvention: Int = 1,
+        directionConvention: Int = 1,
+        normalEncoding: Int = 1,
+        groupFromWorldIdentity: String = M0A_IDENTITY_MATRIX_IDENTITY,
+        worldFromGroupIdentity: String = M0A_IDENTITY_MATRIX_IDENTITY,
     ) {
         require(
             listOf(
@@ -153,6 +161,14 @@ class M0aVisibilitySurfaceStreamChannel(
                 regionManifestRevision,
                 schemaRootRevision,
                 nextSurfaceIdHighWater,
+                schemaRootHashIdentity,
+                manifestRootHashIdentity,
+                groupFrameConvention,
+                matrixConvention,
+                directionConvention,
+                normalEncoding,
+                groupFromWorldIdentity,
+                worldFromGroupIdentity,
             )
         }
     }
