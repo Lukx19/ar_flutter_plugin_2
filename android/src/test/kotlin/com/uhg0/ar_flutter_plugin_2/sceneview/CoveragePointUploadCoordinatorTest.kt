@@ -20,6 +20,7 @@ class CoveragePointUploadCoordinatorTest {
         val d = snapshot(4, 4f)
 
         coordinator.submit(a)
+        coordinator.onRendererFrame()
         val positionsAtA = uploader.positionSubmissions.single().copyOf()
         coordinator.submit(b)
         coordinator.submit(c)
@@ -29,6 +30,8 @@ class CoveragePointUploadCoordinatorTest {
         uploader.completeNext()
         assertEquals(1, uploader.positionSubmissions.size)
         uploader.completeNext()
+        assertEquals(1, uploader.positionSubmissions.size)
+        coordinator.onRendererFrame()
         assertEquals(2, uploader.positionSubmissions.size)
         assertArrayEquals(floatArrayOf(4f, 4f, 4f), uploader.positionSubmissions[1], 0f)
     }
@@ -38,6 +41,7 @@ class CoveragePointUploadCoordinatorTest {
         val uploader = FakeUploader()
         val coordinator = CoveragePointUploadCoordinator(2, uploader)
         coordinator.submit(snapshot(1, 1f))
+        coordinator.onRendererFrame()
         val first = uploader.pendingCallbacks[0]
         first()
         first()
@@ -61,6 +65,7 @@ class CoveragePointUploadCoordinatorTest {
         )
 
         coordinator.submit(snapshot(1, 1f))
+        coordinator.onRendererFrame()
         now = 175L
         uploader.completeAll()
         uploader.completeAll()
@@ -73,11 +78,13 @@ class CoveragePointUploadCoordinatorTest {
         val uploader = FakeUploader()
         val coordinator = CoveragePointUploadCoordinator(2, uploader)
         coordinator.submit(snapshot(1, 1f))
+        coordinator.onRendererFrame()
         uploader.completeAll()
 
         coordinator.destroy()
         val replacement = CoveragePointUploadCoordinator(2, uploader)
         replacement.submit(snapshot(2, 2f, withEmptyUpdate = true))
+        replacement.onRendererFrame()
 
         assertEquals(2, uploader.positionSubmissions.size)
     }
@@ -87,10 +94,12 @@ class CoveragePointUploadCoordinatorTest {
         val uploader = FakeUploader()
         val coordinator = CoveragePointUploadCoordinator(2, uploader)
         coordinator.submit(snapshot(1, 1f))
+        coordinator.onRendererFrame()
         uploader.completeAll()
 
         coordinator.submit(partialSnapshot(2, floatArrayOf(2f, 2f, 2f, 20f, 20f, 20f), 0))
         coordinator.submit(partialSnapshot(3, floatArrayOf(3f, 3f, 3f, 30f, 30f, 30f), 1))
+        coordinator.onRendererFrame()
         uploader.completeAll()
 
         assertArrayEquals(
@@ -121,6 +130,10 @@ class CoveragePointUploadCoordinatorTest {
                 colors = IntArray(count) { 0xFF000000.toInt() },
             ),
         )
+        coordinator.onRendererFrame()
+        uploader.completeAll()
+        assertEquals(1, uploader.positionSubmissions.size)
+        coordinator.onRendererFrame()
         uploader.completeAll()
 
         assertEquals(listOf(64 * 1024, (count - 4_096) * 16), submittedBytes)
@@ -128,6 +141,32 @@ class CoveragePointUploadCoordinatorTest {
         assertEquals(2, uploader.positionSubmissions.size)
         assertEquals(4_096 * 3, uploader.positionSubmissions.first().size)
         assertEquals((count - 4_096) * 3, uploader.positionSubmissions.last().size)
+        assertEquals(listOf(0, 4_096 * 3 * Float.SIZE_BYTES), uploader.positionOffsets)
+        assertEquals(listOf(0, 4_096 * 4), uploader.colorOffsets)
+    }
+
+    @Test
+    fun `destroy after a paged callback prevents the next frame from resuming uploads`() {
+        val uploader = FakeUploader()
+        val coordinator = CoveragePointUploadCoordinator(5_000, uploader)
+        coordinator.submit(
+            CoveragePointRenderSnapshot(
+                revision = 1,
+                enabled = true,
+                capacity = 5_000,
+                count = 5_000,
+                keys = LongArray(5_000) { it.toLong() },
+                positions = FloatArray(5_000 * 3),
+                colors = IntArray(5_000),
+            ),
+        )
+        coordinator.onRendererFrame()
+
+        uploader.completeAll()
+        coordinator.destroy()
+        coordinator.onRendererFrame()
+
+        assertEquals(1, uploader.positionSubmissions.size)
     }
 }
 
@@ -135,6 +174,8 @@ private class FakeUploader : CoveragePointVertexUploader {
     val positionSubmissions = mutableListOf<FloatArray>()
     val colorSubmissions = mutableListOf<ByteArray>()
     val pendingCallbacks = mutableListOf<() -> Unit>()
+    val positionOffsets = mutableListOf<Int>()
+    val colorOffsets = mutableListOf<Int>()
 
     override fun uploadPositions(
         buffer: FloatBuffer,
@@ -142,6 +183,7 @@ private class FakeUploader : CoveragePointVertexUploader {
         elementCount: Int,
         onConsumed: () -> Unit,
     ) {
+        positionOffsets += destOffsetBytes
         val copy = FloatArray(buffer.remaining())
         buffer.duplicate().get(copy)
         positionSubmissions += copy
@@ -154,6 +196,7 @@ private class FakeUploader : CoveragePointVertexUploader {
         byteCount: Int,
         onConsumed: () -> Unit,
     ) {
+        colorOffsets += destOffsetBytes
         val copy = ByteArray(buffer.remaining())
         buffer.duplicate().get(copy)
         colorSubmissions += copy

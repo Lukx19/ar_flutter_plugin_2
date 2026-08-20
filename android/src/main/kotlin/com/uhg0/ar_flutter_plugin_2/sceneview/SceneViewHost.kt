@@ -323,6 +323,11 @@ internal class SceneViewHost(
                     // of the renderer cadence contract once pause has been
                     // acknowledged to Flutter.
                     if (!rendererPaused) {
+                        // Upload pages are renderer-frame work, not callback
+                        // work. Admit at most one bounded page for the active
+                        // mesh after resetting this frame's shared ledger.
+                        rendererTelemetry.beginRendererFrame()
+                        coverageMeshRef.get()?.onRendererFrame()
                         frameCadenceTracker.record(System.nanoTime())
                     }
                     sessionRef.set(session)
@@ -522,7 +527,6 @@ internal class SceneViewHost(
         snapshot: CoveragePointRenderSnapshot?,
         config: PointCloudNativeConfig?,
     ) {
-        rendererTelemetry.beginRendererUpdate()
         if (snapshot == null || config == null) {
             coverageSnapshotRef.set(null)
             coverageMeshRef.get()?.updateCoverage(null)
@@ -561,7 +565,6 @@ internal class SceneViewHost(
     }
 
     fun updateRawPointCloud(snapshot: CoveragePointRenderSnapshot?) {
-        rendererTelemetry.beginRendererUpdate()
         rawPointSnapshotRef.set(snapshot)
         coverageMeshRef.get()?.updateRawPoints(snapshot)
     }
@@ -1132,6 +1135,10 @@ internal class SceneViewHost(
             if (disposed) return
             latestRawPointSnapshot = snapshot
             if (mode == VoxelRenderMode.POINTS) updateActiveTarget()
+        }
+
+        fun onRendererFrame() {
+            if (!disposed) target.resources.onRendererFrame()
         }
 
         private fun updateActiveTarget() {

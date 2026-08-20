@@ -7,8 +7,8 @@ package com.uhg0.ar_flutter_plugin_2.sceneview
  */
 internal class RendererTelemetry {
     private val allocationsByOwner = linkedMapOf<String, Int>()
-    private var currentUpdateUploadBytes = 0
-    private var peakUpdateUploadBytes = 0
+    private var currentFrameUploadBytes = 0
+    private var peakFrameUploadBytes = 0
     private var peakOwnedBufferBytes = 0
     private var uploadCallbackCount = 0
     private var completedUploadCount = 0
@@ -37,18 +37,19 @@ internal class RendererTelemetry {
         allocationsByOwner.remove(owner)
     }
 
-    fun beginRendererUpdate() {
-        currentUpdateUploadBytes = 0
+    fun beginRendererFrame() {
+        currentFrameUploadBytes = 0
         rendererUpdateCount++
     }
 
     fun recordUpload(bytes: Int) {
         require(bytes in 0..ORDINARY_UPLOAD_LIMIT_BYTES)
-        // A paged reset may span several callbacks. Each callback submits one
-        // independently renderable range, so the ledger reports its actual
-        // per-frame payload rather than incorrectly summing a resync batch.
-        currentUpdateUploadBytes = bytes
-        peakUpdateUploadBytes = maxOf(peakUpdateUploadBytes, currentUpdateUploadBytes)
+        val nextFrameBytes = currentFrameUploadBytes + bytes
+        require(nextFrameBytes <= ORDINARY_UPLOAD_LIMIT_BYTES) {
+            "renderer frame upload exceeds $ORDINARY_UPLOAD_LIMIT_BYTES bytes"
+        }
+        currentFrameUploadBytes = nextFrameBytes
+        peakFrameUploadBytes = maxOf(peakFrameUploadBytes, currentFrameUploadBytes)
     }
 
     fun recordUploadCallback() {
@@ -74,8 +75,8 @@ internal class RendererTelemetry {
         "rendererUpdateCount" to rendererUpdateCount,
         "ownedBufferBytes" to ownedBufferBytes,
         "peakOwnedBufferBytes" to peakOwnedBufferBytes,
-        "currentUpdateUploadBytes" to currentUpdateUploadBytes,
-        "peakUpdateUploadBytes" to peakUpdateUploadBytes,
+        "currentUpdateUploadBytes" to currentFrameUploadBytes,
+        "peakUpdateUploadBytes" to peakFrameUploadBytes,
         "uploadCallbackCount" to uploadCallbackCount,
         "completedUploadCount" to completedUploadCount,
         "meanUploadCompletionNanos" to if (completedUploadCount == 0) {

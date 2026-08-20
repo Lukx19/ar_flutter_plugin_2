@@ -24,5 +24,7 @@ internal interface CoverageVoxelMeshResources {
     /** Removes this mesh from the next draw without destroying retained buffers. */
     fun hide(node: Node)
 
+    fun onRendererFrame()
+
     fun destroy()
 }

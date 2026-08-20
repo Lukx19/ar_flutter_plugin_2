@@ -144,6 +144,8 @@ internal class CoverageCubeMeshResources(
         node.isVisible = false
     }
 
+    override fun onRendererFrame() = uploadCoordinator.onRendererFrame()
+
     private fun setDrawCount(node: Node, voxelCount: Int) {
         val instance = engine.renderableManager.getInstance(node.entity)
         engine.renderableManager.setGeometryAt(
@@ -258,6 +260,9 @@ internal class CoverageCubeMeshResources(
         private var activeUploadStartedNanos = 0L
         private var activeSnapshot: CoveragePointRenderSnapshot? = null
         private val pendingRanges = ArrayDeque<UploadRange>()
+        // A page is work for an actual renderer frame. Construction and data
+        // callbacks never create an implicit frame budget.
+        private var frameAvailable = false
 
         fun submit(snapshot: CoveragePointRenderSnapshot) {
             if (destroyed) return
@@ -278,8 +283,13 @@ internal class CoverageCubeMeshResources(
             pendingRanges.clear()
         }
 
+        fun onRendererFrame() {
+            frameAvailable = true
+            drain()
+        }
+
         private fun drain() {
-            if (destroyed || uploadBusy) return
+            if (destroyed || uploadBusy || !frameAvailable) return
             if (pendingRanges.isEmpty()) {
                 val snapshot = pendingSnapshot ?: return
                 pendingSnapshot = null
@@ -288,6 +298,7 @@ internal class CoverageCubeMeshResources(
             }
             val snapshot = checkNotNull(activeSnapshot)
             val range = pendingRanges.removeFirstOrNull() ?: return
+            frameAvailable = false
             writeRange(snapshot, range.startSlot, range.endSlotExclusive)
             uploadBusy = true
             consumedCallbackMask = 0
@@ -381,7 +392,8 @@ internal class CoverageCubeMeshResources(
                 onUploadCompleted((clockNanos() - activeUploadStartedNanos).coerceAtLeast(0L))
                 uploadBusy = false
                 if (pendingRanges.isEmpty()) activeSnapshot = null
-                drain()
+                // A completed callback only releases the page. The next page
+                // is admitted by a distinct rendered frame.
             }
         }
 

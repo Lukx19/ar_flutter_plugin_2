@@ -10,7 +10,7 @@ class RendererTelemetryTest {
         val telemetry = RendererTelemetry()
         telemetry.setOwnedBufferBytes("points", 2_304)
         telemetry.setOwnedBufferBytes("cubes", 47_104)
-        telemetry.beginRendererUpdate()
+        telemetry.beginRendererFrame()
         telemetry.recordUpload(64)
         telemetry.recordUploadCallback()
         telemetry.recordUploadCompletion(24_000)
@@ -42,5 +42,23 @@ class RendererTelemetryTest {
         }
 
         assertEquals(20_000 * 36, telemetry.snapshot().getValue("ownedBufferBytes"))
+    }
+
+    @Test
+    fun `telemetry accumulates uploads within a renderer frame and rejects overflow`() {
+        val telemetry = RendererTelemetry()
+        telemetry.beginRendererFrame()
+        telemetry.recordUpload(32 * 1024)
+        telemetry.recordUpload(32 * 1024)
+
+        assertEquals(64 * 1024, telemetry.snapshot().getValue("currentUpdateUploadBytes"))
+        assertThrows(IllegalArgumentException::class.java) {
+            telemetry.recordUpload(1)
+        }
+
+        telemetry.beginRendererFrame()
+        telemetry.recordUpload(1)
+        assertEquals(1, telemetry.snapshot().getValue("currentUpdateUploadBytes"))
+        assertEquals(64 * 1024, telemetry.snapshot().getValue("peakUpdateUploadBytes"))
     }
 }

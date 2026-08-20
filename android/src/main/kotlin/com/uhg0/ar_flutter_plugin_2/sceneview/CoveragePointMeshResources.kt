@@ -106,6 +106,8 @@ internal class CoveragePointMeshResources(
         node.isVisible = false
     }
 
+    override fun onRendererFrame() = uploadCoordinator.onRendererFrame()
+
     private fun setDrawCount(node: Node, count: Int) {
         val renderableManager = engine.renderableManager
         val instance = renderableManager.getInstance(node.entity)
@@ -205,11 +207,16 @@ internal class CoveragePointUploadCoordinator(
     private var activeUploadStartedNanos = 0L
     private var activeSnapshot: CoveragePointRenderSnapshot? = null
     private val pendingRanges = ArrayDeque<UploadRange>()
+    // A page is work for an actual renderer frame. Construction and data
+    // callbacks never create an implicit frame budget.
+    private var frameAvailable = false
 
     fun submit(snapshot: CoveragePointRenderSnapshot) {
         if (destroyed) return
         pendingSnapshot =
-            if ((uploadBusy || pendingRanges.isNotEmpty()) && snapshot.update?.reset == false) {
+            if ((uploadBusy || pendingRanges.isNotEmpty() || pendingSnapshot != null) &&
+                snapshot.update?.reset == false
+            ) {
                 snapshot.copy(update = snapshot.update.copy(reset = true))
             } else {
                 snapshot
@@ -223,6 +230,8 @@ internal class CoveragePointUploadCoordinator(
 
     fun stagingBuffers(): CoveragePointUploadBuffers = buffers
 
+    fun onRendererFrame() { frameAvailable = true; drain() }
+
     fun destroy() {
         destroyed = true
         pendingSnapshot = null
@@ -231,7 +240,7 @@ internal class CoveragePointUploadCoordinator(
     }
 
     private fun drain() {
-        if (destroyed || uploadBusy) return
+        if (destroyed || uploadBusy || !frameAvailable) return
         if (pendingRanges.isEmpty()) {
             val snapshot = pendingSnapshot ?: return
             pendingSnapshot = null
@@ -251,6 +260,7 @@ internal class CoveragePointUploadCoordinator(
         }
         val snapshot = checkNotNull(activeSnapshot)
         val range = pendingRanges.removeFirstOrNull() ?: return
+        frameAvailable = false
         val startSlot = range.startSlot
         val endSlot = range.endSlotExclusive
         buffers.writeRange(snapshot.positions, snapshot.colors, startSlot, endSlot)
@@ -284,7 +294,7 @@ internal class CoveragePointUploadCoordinator(
             onUploadCompleted((clockNanos() - activeUploadStartedNanos).coerceAtLeast(0L))
             uploadBusy = false
             if (pendingRanges.isEmpty()) activeSnapshot = null
-            drain()
+            // The next page is admitted only by onRendererFrame.
         }
     }
 

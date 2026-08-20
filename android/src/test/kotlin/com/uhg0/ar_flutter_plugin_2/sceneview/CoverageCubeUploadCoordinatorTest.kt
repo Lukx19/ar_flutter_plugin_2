@@ -25,6 +25,7 @@ class CoverageCubeUploadCoordinatorTest {
                 color = 0x7F112233,
             ),
         )
+        coordinator.onRendererFrame()
 
         assertArrayEquals(
             floatArrayOf(
@@ -60,11 +61,14 @@ class CoverageCubeUploadCoordinatorTest {
         )
 
         coordinator.submit(cubeSnapshot(1, floatArrayOf(1f, 1f, 1f)))
+        coordinator.onRendererFrame()
         coordinator.submit(cubeSnapshot(2, floatArrayOf(2f, 2f, 2f)))
         coordinator.submit(cubeSnapshot(3, floatArrayOf(3f, 3f, 3f)))
 
         assertEquals(1, uploader.positionSubmissions.size)
         uploader.completeAll()
+        assertEquals(1, uploader.positionSubmissions.size)
+        coordinator.onRendererFrame()
 
         assertEquals(2, uploader.positionSubmissions.size)
         assertArrayEquals(
@@ -94,6 +98,7 @@ class CoverageCubeUploadCoordinatorTest {
                 ),
             ),
         )
+        coordinator.onRendererFrame()
 
         assertArrayEquals(
             floatArrayOf(0.5f, -0.5f, -0.5f),
@@ -112,6 +117,7 @@ class CoverageCubeUploadCoordinatorTest {
         )
 
         coordinator.submit(cubeSnapshot(1, floatArrayOf(1f, 1f, 1f)))
+        coordinator.onRendererFrame()
         coordinator.submit(cubeSnapshot(2, floatArrayOf(2f, 2f, 2f)))
         coordinator.destroy()
         uploader.completeAll()
@@ -133,6 +139,7 @@ class CoverageCubeUploadCoordinatorTest {
         )
 
         coordinator.submit(cubeSnapshot(1, floatArrayOf(1f, 1f, 1f)))
+        coordinator.onRendererFrame()
         now = 90L
         uploader.completeAll()
 
@@ -162,10 +169,44 @@ class CoverageCubeUploadCoordinatorTest {
                 colors = IntArray(count) { 0xFF000000.toInt() },
             ),
         )
+        coordinator.onRendererFrame()
+        uploader.completeAll()
+        assertEquals(1, uploader.positionSubmissions.size)
+        coordinator.onRendererFrame()
         uploader.completeAll()
 
         assertEquals(listOf(64 * 1024, 128), submittedBytes)
         assertTrue(submittedBytes.all { it <= 64 * 1024 })
+        assertEquals(listOf(0, 512 * 8 * 3 * Float.SIZE_BYTES), uploader.positionOffsets)
+        assertEquals(listOf(0, 512 * 8 * 4), uploader.colorOffsets)
+    }
+
+    @Test
+    fun `destroy after a paged cube callback prevents next frame resume`() {
+        val uploader = FakeCubeUploader()
+        val coordinator = CoverageCubeMeshResources.CoverageCubeUploadCoordinator(
+            capacity = 513,
+            halfSize = 0.5f,
+            uploader = uploader,
+        )
+        coordinator.submit(
+            CoveragePointRenderSnapshot(
+                revision = 1,
+                enabled = true,
+                capacity = 513,
+                count = 513,
+                keys = LongArray(513) { it.toLong() },
+                positions = FloatArray(513 * 3),
+                colors = IntArray(513),
+            ),
+        )
+        coordinator.onRendererFrame()
+
+        uploader.completeAll()
+        coordinator.destroy()
+        coordinator.onRendererFrame()
+
+        assertEquals(1, uploader.positionSubmissions.size)
     }
 }
 
@@ -174,6 +215,8 @@ private class FakeCubeUploader : CoverageCubeMeshResources.CoverageCubeVertexUpl
     val colorSubmissions = mutableListOf<ByteArray>()
     val positionElementCounts = mutableListOf<Int>()
     val colorByteCounts = mutableListOf<Int>()
+    val positionOffsets = mutableListOf<Int>()
+    val colorOffsets = mutableListOf<Int>()
     private val pendingCallbacks = mutableListOf<() -> Unit>()
 
     override fun uploadPositions(
@@ -182,6 +225,7 @@ private class FakeCubeUploader : CoverageCubeMeshResources.CoverageCubeVertexUpl
         elementCount: Int,
         onConsumed: () -> Unit,
     ) {
+        positionOffsets += destOffsetBytes
         positionSubmissions += FloatArray(buffer.remaining()).also { copy ->
             buffer.duplicate().get(copy)
         }
@@ -195,6 +239,7 @@ private class FakeCubeUploader : CoverageCubeMeshResources.CoverageCubeVertexUpl
         byteCount: Int,
         onConsumed: () -> Unit,
     ) {
+        colorOffsets += destOffsetBytes
         colorSubmissions += ByteArray(buffer.remaining()).also { copy ->
             buffer.duplicate().get(copy)
         }
