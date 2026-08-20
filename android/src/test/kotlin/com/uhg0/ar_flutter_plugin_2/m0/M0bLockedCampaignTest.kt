@@ -24,9 +24,6 @@ class M0bLockedCampaignTest {
         assertThrows(IllegalArgumentException::class.java) { M0bCompactFusionLedger(100_001, 1) }
         assertThrows(IllegalArgumentException::class.java) { M0bCompactFusionLedger(1, 0) }
         assertThrows(IllegalArgumentException::class.java) { M0bCompactFusionLedger(1, 200_001) }
-        assertThrows(IllegalArgumentException::class.java) {
-            M0bCompactFusionLedger(1, 1).executeCandidate("D")
-        }
     }
 
     @Test
@@ -63,6 +60,29 @@ class M0bLockedCampaignTest {
             "B" to { M0PlanarConsolidationKernel() },
             "C" to { M0BoundedTsdfKernel() },
         )
+        val boundaryFactories = linkedMapOf<String, M0bKernelFactory>(
+            "A" to M0bKernelFactory { capacity, observations, lineage ->
+                M0SignedOccupancyKernel(
+                    capacity = capacity,
+                    maxObservations = observations,
+                    maxLineageIds = lineage,
+                )
+            },
+            "B" to M0bKernelFactory { capacity, observations, lineage ->
+                M0PlanarConsolidationKernel(
+                    capacity = capacity,
+                    maxObservations = observations,
+                    maxLineageIds = lineage,
+                )
+            },
+            "C" to M0bKernelFactory { capacity, observations, lineage ->
+                M0BoundedTsdfKernel(
+                    capacity = capacity,
+                    maxObservations = observations,
+                    maxLineageIds = lineage,
+                )
+            },
+        )
         factories.forEach { (candidate, factory) ->
             val canonical = JsonArray(scenes.map { scene ->
                 val first = factory().fuse(scene.observations)
@@ -82,7 +102,13 @@ class M0bLockedCampaignTest {
 
         val baselineRecall = proposal07Recall(comparisonScenes)
         assertEquals(0.8, baselineRecall, 0.0)
-        val receipt = measuredReceipt(factories, manifest, comparisonScenes, baselineRecall)
+        val receipt = measuredReceipt(
+            factories,
+            boundaryFactories,
+            manifest,
+            comparisonScenes,
+            baselineRecall,
+        )
         val report = File("build/reports/tests/m0b_kotlin_receipt_v1.json")
         requireNotNull(report.parentFile).mkdirs()
         report.writeText(receipt)
@@ -100,6 +126,9 @@ class M0bLockedCampaignTest {
             assertEquals(100_000, candidate.int("surfaceCount"))
             assertEquals(200_000, candidate.int("associationCount"))
             assertEquals(12_800_000, candidate.int("semanticBytes"))
+            assertEquals(391, candidate.int("boundaryKernelInvocationCount"))
+            assertEquals(300, candidate.int("replayKernelInvocationCount"))
+            assertEquals(60_000, candidate.int("replayAssociationCount"))
         }
         assertEquals(
             3,
@@ -107,10 +136,15 @@ class M0bLockedCampaignTest {
                 .map { it.jsonObject.getValue("fusionChecksum").jsonPrimitive.content }
                 .toSet().size,
         )
+        val candidates = parsed.getValue("candidates").jsonObject
+        assertEquals(100_000, candidates.getValue("A").jsonObject.int("outputSurfaceCount"))
+        assertEquals(25_000, candidates.getValue("B").jsonObject.int("outputSurfaceCount"))
+        assertEquals(100_000, candidates.getValue("C").jsonObject.int("outputSurfaceCount"))
     }
 
     private fun measuredReceipt(
         factories: Map<String, () -> M0FusionKernel>,
+        boundaryFactories: Map<String, M0bKernelFactory>,
         manifest: JsonObject,
         comparisonScenes: List<Scene>,
         baselineRecall: Double,
@@ -118,22 +152,22 @@ class M0bLockedCampaignTest {
         enableThreadAllocationMeasurement()
         val candidateJson = buildJsonObject {
             factories.forEach { (candidate, _) ->
-                repeat(2) { executeBoundary(candidate) }
-                val cpuRuns = MutableList(5) { executeBoundary(candidate) }
-                val cpu = cpuRuns.map { it.first }.sorted()
-                val replayRuns = MutableList(5) { executeBoundary(candidate) }
+                val factory = boundaryFactories.getValue(candidate)
+                repeat(2) {
+                    executeBoundary(candidate, factory)
+                    executeReplay(candidate, factory)
+                }
+                val cpuRuns = MutableList(5) { executeBoundary(candidate, factory) }
+                val cpu = cpuRuns.map { it.second.peakKernelCpuMicros }.sorted()
+                val boundaryTotals = cpuRuns.map { it.first }.sorted()
+                val replayRuns = MutableList(5) { executeReplay(candidate, factory) }
                 val replay = replayRuns.map { it.first }.sorted()
-                val boundary = replayRuns.first().second
+                val boundary = cpuRuns.first().second
+                val replayBoundary = replayRuns.first().second
                 val candidateRecall = candidateRecall(factories.getValue(candidate), comparisonScenes)
-                assertTrue(replayRuns.all { it.second.fusionChecksum == boundary.fusionChecksum })
-                assertTrue(replayRuns.all { it.second.replayChecksum == boundary.replayChecksum })
-                val allocations = MutableList(5) {
-                    val before = currentThreadAllocatedBytes()
-                    val ledger = M0bCompactFusionLedger()
-                    val result = ledger.executeCandidate(candidate)
-                    assertEquals(candidate, result.candidateId)
-                    currentThreadAllocatedBytes() - before
-                }.sorted()
+                assertTrue(cpuRuns.all { it.second.fusionChecksum == boundary.fusionChecksum })
+                assertTrue(replayRuns.all { it.second.checksum == replayBoundary.checksum })
+                val allocations = cpuRuns.map { it.second.peakAllocationBytes }.sorted()
                 put(candidate, buildJsonObject {
                     put("replaySamplesMicros", longArray(replay))
                     put("replayP95Micros", replay[4].coerceAtLeast(1L))
@@ -141,13 +175,19 @@ class M0bLockedCampaignTest {
                     put("replayImageBytes", 0)
                     put("cpuWindowSamplesMicros", longArray(cpu))
                     put("cpuWindowP95Micros", cpu[4].coerceAtLeast(1L))
+                    put("boundaryTotalSamplesMicros", longArray(boundaryTotals))
+                    put("boundaryTotalP95Micros", boundaryTotals[4].coerceAtLeast(1L))
                     put("allocationSamplesBytes", longArray(allocations))
                     put("allocationBytes", allocations[4])
                     put("surfaceCount", boundary.surfaceCount)
                     put("associationCount", boundary.associationCount)
                     put("semanticBytes", boundary.semanticBytes)
+                    put("outputSurfaceCount", boundary.outputSurfaceCount)
+                    put("boundaryKernelInvocationCount", boundary.invocationCount)
+                    put("replayKernelInvocationCount", replayBoundary.invocationCount)
+                    put("replayAssociationCount", replayBoundary.associationCount)
                     put("fusionChecksum", boundary.fusionChecksum)
-                    put("replayChecksum", boundary.replayChecksum)
+                    put("replayChecksum", replayBoundary.checksum)
                     put("checkedOverflowFailures", boundary.checkedOverflowFailures)
                     put("capacityOverflowCount", boundary.capacityOverflowCount)
                     put("lineageOverflowCount", boundary.lineageOverflowCount)
@@ -189,9 +229,33 @@ class M0bLockedCampaignTest {
         }.toString()
     }
 
-    private fun executeBoundary(candidate: String): Pair<Long, M0bBoundaryResult> {
+    private fun executeBoundary(
+        candidate: String,
+        factory: M0bKernelFactory,
+    ): Pair<Long, M0bBoundaryResult> {
         val before = currentThreadCpuTime()
-        val result = M0bCompactFusionLedger().executeCandidate(candidate)
+        val result = M0bKernelBoundaryAdapter(
+            candidate,
+            factory,
+            ::currentThreadAllocatedBytes,
+            ::currentThreadCpuTime,
+        )
+            .executeBoundary()
+        return ((currentThreadCpuTime() - before) / 1_000).coerceAtLeast(1L) to result
+    }
+
+    private fun executeReplay(
+        candidate: String,
+        factory: M0bKernelFactory,
+    ): Pair<Long, M0bReplayBoundaryResult> {
+        val before = currentThreadCpuTime()
+        val result = M0bKernelBoundaryAdapter(
+            candidate,
+            factory,
+            ::currentThreadAllocatedBytes,
+            ::currentThreadCpuTime,
+        )
+            .executeReplay()
         return ((currentThreadCpuTime() - before) / 1_000).coerceAtLeast(1L) to result
     }
 
