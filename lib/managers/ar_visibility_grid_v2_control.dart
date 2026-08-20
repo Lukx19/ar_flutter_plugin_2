@@ -32,5 +32,7 @@ final class ARVisibilityGridV2Control {
     return Uint8List.fromList(response);
   }
 
-  Future<void> dispose() => _channel.invokeMethod<void>('dispose');
+  /// Fences only the V2 binding while leaving the shared V1 point-cloud/
+  /// visibility channel alive for the owning platform view's normal teardown.
+  Future<void> dispose() => _channel.invokeMethod<void>('disposeM0aBinding');
 }

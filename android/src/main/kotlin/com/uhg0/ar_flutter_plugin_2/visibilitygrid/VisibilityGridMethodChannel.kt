@@ -136,6 +136,10 @@ class VisibilityGridMethodChannel(
                     dispose()
                     result.success(true)
                 }
+                "disposeM0aBinding" -> {
+                    m0aControlLifecycle.abandon()
+                    result.success(true)
+                }
                 else -> result.notImplemented()
             }
         } catch (error: VisibilityGridMethodException) {

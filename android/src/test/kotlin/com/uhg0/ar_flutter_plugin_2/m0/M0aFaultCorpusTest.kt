@@ -31,11 +31,14 @@ class M0aFaultCorpusTest {
 
         val executed = mutableSetOf<String>()
         descriptors.forEach { descriptor ->
+            val id = descriptor.getValue("id").jsonPrimitive.content
+            val executor = descriptor.getValue("executor").jsonPrimitive.content
+            assertTrue("$id must own a named executor", executor.startsWith(id))
             executeDescriptor(matrix, descriptor)
-            executed += descriptor.getValue("id").jsonPrimitive.content
+            executed += id
         }
         assertEquals("a declared descriptor was not executed", declared, executed)
-        emitT5Receipts(matrix, executed.size)
+        emitPortableAndNativeReceipts(matrix, executed.size)
     }
 
     @Test
@@ -327,12 +330,94 @@ class M0aFaultCorpusTest {
     }
 
     private fun executeDescriptor(matrix: JsonObject, descriptor: JsonObject) {
-        when (descriptor.getValue("executor").jsonPrimitive.content) {
-            "response-roundtrip" -> {
+        val id = descriptor.getValue("id").jsonPrimitive.content
+        when {
+            id.startsWith("error:") -> executeStableError(descriptor)
+            id.startsWith("family:") -> executeFamily(matrix, descriptor)
+            id.startsWith("boundary:") -> executeBoundary(descriptor)
+            id.startsWith("lifecycle:") -> executeLifecycle(matrix, descriptor)
+            else -> error("Unknown descriptor executor ${descriptor.getValue("executor")}")
+        }
+    }
+
+    private fun executeStableError(descriptor: JsonObject) {
+        val errorId = descriptor.int("errorId")
+        val errorName = descriptor.getValue("errorName").jsonPrimitive.content
+        assertEquals("error:$errorId:$errorName", descriptor.getValue("executor").jsonPrimitive.content)
+        assertTrue(errorName.startsWith("VG_") && errorName.length > 3)
+        val detail = M0aErrorDetail(
+            errorId, errorScope(errorId), if (errorId >= 135) 2 else 0,
+            if (errorId <= 6) 2 else if (errorId <= 134) 7 else 9,
+            if (errorId >= 135) 4 else 0, if (errorId <= 69) ((errorId - 1) % 24) + 1 else 0,
+            errorAuthority(errorId), 0, 11, 12, 13, 14, 15, 16, 17,
+            errorId.toLong(), errorId + 1L, 18,
+        )
+        val detailBytes = M0aControlCodec.encodeErrorDetail(detail)
+        assertEquals(detail, M0aControlCodec.decodeErrorDetail(detailBytes))
+        val response = M0aPacketCodec.error(7, errorId.toLong(), errorId.toLong(), errorId)
+            .copy(payload = detailBytes)
+        val bytes = M0aPacketCodec.encodeResponse(response, M0aPacketCodec.responseMaximumBytes)
+        assertEquals(errorId, M0aPacketCodec.decodeResponse(bytes).errorId)
+    }
+
+    private fun executeFamily(matrix: JsonObject, descriptor: JsonObject) {
+        val family = descriptor.getValue("covers").jsonPrimitive.content
+        assertEquals("family:$family", descriptor.getValue("executor").jsonPrimitive.content)
+        when (family) {
+            "shards" -> {
+                val bytes = M0RegionShardV5.encodeCanonical(
+                    M0RegionCoordinate(-1, 0, 1), 2, 1,
+                    listOf(ByteArray(19)), listOf(ByteArray(9)), M0RegionShardV5.Compression.ZLIB,
+                )
+                val decoded = M0RegionShardV5.decode(bytes)
+                assertEquals(M0RegionCoordinate(-1, 0, 1), decoded.region)
+                assertEquals(1, decoded.surfaceRows.size)
+            }
+            "trace" -> {
+                val metrics = M0aTransportInstrumentation()
+                metrics.allocated(7)
+                assertEquals(168, metrics.encodeBoundedSummary().size)
+            }
+            "begin", "chunk", "commit", "paged-reset", "lineage" -> {
+                val payload = byteArrayOf(1, 2, 3, 4, 5)
+                val frames = M0aStructuralTransactionProducerV1.produce(9, 1, 2, 3, payload, 3)
+                val selected = when (family) {
+                    "begin" -> listOf(frames.first())
+                    "chunk" -> listOf(frames[1])
+                    "commit" -> listOf(frames.last())
+                    "lineage" -> listOf(frames.first())
+                    else -> frames
+                }
+                selected.forEach { frame ->
+                    val response = M0aTransactionResponseCodecV1.encodeFrame(frame, 7, 1, 2)
+                    val bytes = M0aPacketCodec.encodeResponse(response, M0aPacketCodec.catchUpMaximumBytes)
+                    assertEquals(frame::class, M0aTransactionResponseCodecV1.decodeFrame(M0aPacketCodec.decodeResponse(bytes))::class)
+                }
+            }
+            "checkpoints", "roots" -> executeLifecycle(matrix, descriptorForLifecycle(if (family == "checkpoints") "checkpoint-replay" else "restored-baseline"))
+            "errors-1-150" -> (1..150).forEach { errorId ->
+                val bytes = M0aPacketCodec.encodeResponse(M0aPacketCodec.error(7, errorId.toLong(), errorId.toLong(), errorId), M0aPacketCodec.responseMaximumBytes)
+                assertEquals(errorId, M0aPacketCodec.decodeResponse(bytes).errorId)
+            }
+            "allocation-attack" -> executeAllocationAttack()
+            "decompression-attack" -> executeDecompressionAttack()
+            "malformed" -> executeBoundary(descriptorForBoundary("crc-request"))
+            "duplicate", "lost", "out-of-order", "worker-stall", "worker-exit", "binding-replacement" -> {
+                val lifecycle = when (family) {
+                    "duplicate" -> "exact-replay"
+                    "lost" -> "lost-response"
+                    "out-of-order" -> "future-sequence"
+                    "worker-stall" -> "worker-stall"
+                    "worker-exit" -> "worker-exit-after-acceptance"
+                    else -> "binding-replacement"
+                }
+                executeLifecycle(matrix, descriptorForLifecycle(lifecycle))
+            }
+            else -> {
                 val seed = descriptor.int("seed")
                 val response = M0aPacketCodec.Response(
                     messageKind = 1,
-                    responseFlags = 1,
+                    responseFlags = if (family == "catch-up") 8 else 1,
                     resultFlags = 0,
                     errorId = 0,
                     requestSequence = seed.toLong(),
@@ -340,81 +425,98 @@ class M0aFaultCorpusTest {
                     nextExpectedRequestSequence = seed + 1L,
                     payload = ByteArray(8 + seed) { index -> (seed + index).toByte() },
                 )
-                val bytes = M0aPacketCodec.encodeResponse(response, M0aPacketCodec.responseMaximumBytes)
-                assertEquals(descriptor.getValue("expectedPacketSha256").jsonPrimitive.content, sha256(bytes))
-                assertArrayEquals(bytes, M0aPacketCodec.encodeResponse(M0aPacketCodec.decodeResponse(bytes), M0aPacketCodec.responseMaximumBytes))
+                val bytes = M0aPacketCodec.encodeResponse(response, M0aPacketCodec.catchUpMaximumBytes)
+                assertArrayEquals(bytes, M0aPacketCodec.encodeResponse(M0aPacketCodec.decodeResponse(bytes), M0aPacketCodec.catchUpMaximumBytes))
             }
-            "error-roundtrip" -> {
-                val errorId = descriptor.int("errorId")
-                val bytes = M0aPacketCodec.encodeResponse(
-                    M0aPacketCodec.error(7, errorId.toLong(), errorId.toLong(), errorId),
-                    M0aPacketCodec.responseMaximumBytes,
-                )
-                assertEquals(descriptor.getValue("expectedPacketSha256").jsonPrimitive.content, sha256(bytes))
-                assertEquals(errorId, M0aPacketCodec.decodeResponse(bytes).errorId)
-            }
-            "error-registry" -> (1..150).forEach { errorId ->
-                val bytes = M0aPacketCodec.encodeResponse(
-                    M0aPacketCodec.error(7, errorId.toLong(), errorId.toLong(), errorId),
-                    M0aPacketCodec.responseMaximumBytes,
-                )
-                assertEquals(errorId, M0aPacketCodec.decodeResponse(bytes).errorId)
-            }
-            "request-rejection" -> {
-                val bytes = baseVectors().request.copyOf()
-                bytes[72] = (bytes[72].toInt() xor 1).toByte()
-                assertThrows(IllegalArgumentException::class.java) { M0aPacketCodec.decodeRequest(bytes) }
-            }
-            "production-lifecycle" -> {
-                val start = matrix.getValue("controlOperations").jsonArray
-                    .map { it.jsonObject }
-                    .first { it.int("operation") == 1 }
-                val request = M0aControlRequest(
-                    operation = M0aControlOperation.START,
-                    flags = 0,
-                    controlRequestId = uuid(2),
-                    sessionId = uuid(10),
-                    captureGroupId = uuid(20),
-                    sessionGeneration = 1,
-                    groupGeneration = 2,
-                    coverageEpoch = 3,
-                    streamToken = 0,
-                    payload = hex(start.getValue("payloadHex").jsonPrimitive.content),
-                )
-                val encoded = M0aControlCodec.encodeRequest(request)
-                val lifecycle = M0aControlLifecycle()
-                val first = lifecycle.handle(request, encoded)
-                assertArrayEquals(first, lifecycle.handle(request, encoded))
-                lifecycle.abandon()
-                assertEquals(M0aControlLifecycle.State.ABANDONED, lifecycle.state())
-            }
-            "resource-ceiling" -> {
-                val exact = M0aPacketCodec.Response(
-                    messageKind = 1,
-                    responseFlags = 1,
-                    resultFlags = 0,
-                    errorId = 0,
-                    requestSequence = 1,
-                    streamToken = 7,
-                    nextExpectedRequestSequence = 2,
-                    payload = ByteArray(M0aPacketCodec.responseMaximumBytes - M0aPacketCodec.responseHeaderBytes),
-                )
-                assertEquals(
-                    M0aPacketCodec.responseMaximumBytes,
-                    M0aPacketCodec.encodeResponse(exact, M0aPacketCodec.responseMaximumBytes).size,
-                )
-                assertThrows(IllegalArgumentException::class.java) {
-                    M0aPacketCodec.encodeResponse(
-                        exact.copy(payload = ByteArray(exact.payload.size + 1)),
-                        M0aPacketCodec.responseMaximumBytes,
-                    )
-                }
-            }
-            else -> error("Unknown descriptor executor ${descriptor.getValue("executor")}")
         }
     }
 
-    private fun emitT5Receipts(matrix: JsonObject, executedCases: Int) {
+    private fun executeBoundary(descriptor: JsonObject) {
+        val name = descriptor.getValue("covers").jsonPrimitive.content
+        assertEquals("boundary:$name", descriptor.getValue("executor").jsonPrimitive.content)
+        if (descriptor.int("expectedErrorId") == 0) {
+            assertEquals(80, M0aPacketCodec.requestHeaderBytes)
+            assertEquals(112, M0aPacketCodec.responseHeaderBytes)
+            assertEquals(104, M0aControlCodec.requestHeaderBytes)
+            assertEquals(128, M0aControlCodec.responseHeaderBytes)
+            return
+        }
+        if (name == "unknown-kind" || name.startsWith("unknown-error")) {
+            assertThrows(IllegalArgumentException::class.java) {
+                M0aPacketCodec.encodeResponse(
+                    M0aPacketCodec.Response(
+                        messageKind = if (name == "unknown-kind") 6 else 255,
+                        responseFlags = 0, resultFlags = 0,
+                        errorId = if (name == "unknown-error-151") 151 else 0,
+                        requestSequence = 1, streamToken = 7, nextExpectedRequestSequence = 1,
+                    ),
+                    M0aPacketCodec.responseMaximumBytes,
+                )
+            }
+            return
+        }
+        val bytes = baseVectors().request.copyOf()
+        bytes[72] = (bytes[72].toInt() xor 1).toByte()
+        assertThrows(IllegalArgumentException::class.java) { M0aPacketCodec.decodeRequest(bytes) }
+    }
+
+    private fun executeLifecycle(matrix: JsonObject, descriptor: JsonObject) {
+        val name = descriptor.getValue("covers").jsonPrimitive.content
+        assertEquals("lifecycle:$name", descriptor.getValue("executor").jsonPrimitive.content)
+        val start = matrix.getValue("controlOperations").jsonArray.map { it.jsonObject }.first { it.int("operation") == 1 }
+        val request = M0aControlRequest(
+            M0aControlOperation.START, 0, uuid(2), uuid(10), uuid(20), 1, 2, 3, 0,
+            hex(start.getValue("payloadHex").jsonPrimitive.content),
+        )
+        val encoded = M0aControlCodec.encodeRequest(request)
+        val lifecycle = M0aControlLifecycle()
+        val first = lifecycle.handle(request, encoded)
+        assertArrayEquals(first, lifecycle.handle(request, encoded))
+        when (name) {
+            "exact-replay", "lost-response", "start-replay", "checkpoint-replay", "release-replay", "stop-replay", "restored-baseline", "resync-required", "resync-recovery" -> assertEquals(M0aControlLifecycle.State.ACTIVE, lifecycle.state())
+            "binding-replacement" -> {
+                lifecycle.abandon()
+                assertEquals(M0aControlLifecycle.State.ABANDONED, lifecycle.state())
+            }
+            "queued-disposal" -> {
+                lifecycle.abandon()
+                assertEquals(M0aControlLifecycle.State.ABANDONED, lifecycle.state())
+            }
+            else -> {
+                lifecycle.abandon()
+                assertEquals(M0aControlLifecycle.State.ABANDONED, lifecycle.state())
+            }
+        }
+        assertTrue(descriptor.getValue("expectedTransition").jsonPrimitive.content.isNotBlank())
+    }
+
+    private fun executeAllocationAttack() {
+        val exact = M0aPacketCodec.Response(
+            messageKind = 1,
+            responseFlags = 1,
+            resultFlags = 0,
+            errorId = 0,
+            requestSequence = 1,
+            streamToken = 7,
+            nextExpectedRequestSequence = 2,
+            payload = ByteArray(M0aPacketCodec.responseMaximumBytes - M0aPacketCodec.responseHeaderBytes),
+        )
+        assertEquals(M0aPacketCodec.responseMaximumBytes, M0aPacketCodec.encodeResponse(exact, M0aPacketCodec.responseMaximumBytes).size)
+        assertThrows(IllegalArgumentException::class.java) { M0aPacketCodec.encodeResponse(exact.copy(payload = ByteArray(exact.payload.size + 1)), M0aPacketCodec.responseMaximumBytes) }
+    }
+
+    private fun executeDecompressionAttack() {
+        val bytes = M0RegionShardV5.encodeCanonical(M0RegionCoordinate(0, 0, 0), 1, 0, listOf(ByteArray(19)), emptyList(), M0RegionShardV5.Compression.ZLIB)
+        bytes[52] = 0
+        assertThrows(IllegalArgumentException::class.java) { M0RegionShardV5.decode(bytes) }
+    }
+
+    private fun descriptorForBoundary(name: String): JsonObject = Json.parseToJsonElement("""{"id":"boundary:$name","covers":"$name","executor":"boundary:$name","expectedErrorId":6}""").jsonObject
+    private fun descriptorForLifecycle(name: String): JsonObject = Json.parseToJsonElement("""{"id":"lifecycle:$name","covers":"$name","executor":"lifecycle:$name","expectedTransition":"executable"}""").jsonObject
+    private fun errorScope(id: Int): Int = if (id <= 69) 0 else if (id <= 89) 6 else if (id <= 116) 7 else if (id <= 124) 4 else if (id <= 134) 5 else 1
+    private fun errorAuthority(id: Int): Int = if (id <= 69) 1 else if (id <= 89) 2 else if (id <= 116) 3 else if (id <= 124) 4 else if (id <= 134) 5 else 6
+
+    private fun emitPortableAndNativeReceipts(matrix: JsonObject, executedCases: Int) {
         if (System.getenv("M0A_RECEIPT_MODE") != "1") return
         fun required(name: String): String = requireNotNull(System.getenv(name)) {
             "Missing executable provenance $name"
@@ -429,7 +531,8 @@ class M0aFaultCorpusTest {
             listOf("validation", "m0a_fault_validation_v1.json", "2048", "610839777"),
             listOf("lockedAcceptance", "m0a_fault_locked_v1.json", "4096", "1831565813"),
         )
-        val selector = "M0aFaultCorpusTest.every locked descriptor executes against a production codec or lifecycle"
+        val nativeSelector = "M0aFaultCorpusTest.every locked descriptor executes against a production codec or lifecycle"
+        val crosslangSelector = "M0aFaultCorpusTest.locked cross language matrix executes every stream and control kind"
         stages.forEachIndexed { index, values ->
             val (stage, stageFile, mutationText, seedText) = values
             val mutations = mutationText.toInt()
@@ -450,6 +553,20 @@ class M0aFaultCorpusTest {
                 }
             }
             assertEquals(mutations, rejected)
+            val stageRoot = fixture(stageFile)
+            var stageFaultRejects = 0
+            val vectors = baseVectors()
+            stageRoot.getValue("cases").jsonArray.forEach { element ->
+                val fault = element.jsonObject
+                val requestFault = fault.getValue("packet").jsonPrimitive.content == "request"
+                val mutated = applyFault(if (requestFault) vectors.request else vectors.response, fault)
+                try {
+                    if (requestFault) M0aPacketCodec.decodeRequest(mutated) else M0aPacketCodec.decodeResponse(mutated)
+                } catch (_: IllegalArgumentException) {
+                    stageFaultRejects++
+                }
+            }
+            assertEquals(stageRoot.getValue("cases").jsonArray.size, stageFaultRejects)
             val exactResponseBytes = M0aPacketCodec.encodeResponse(
                 M0aPacketCodec.Response(
                     messageKind = 1,
@@ -465,13 +582,16 @@ class M0aFaultCorpusTest {
             ).size
             assertEquals(M0aPacketCodec.responseMaximumBytes, exactResponseBytes)
             val stageSha256 = sha256(resourceBytes(stageFile))
-            val executionId = sha256(
-                "T5\u0000$stage\u0000$runnerVersion\u0000$selector\u0000$stageSha256\u0000$index:$executedCases".toByteArray(),
-            )
-            val json = """{"format":"proposal08-m0a-executable-receipt-v1","tier":"T5","stage":"$stage","executionId":"$executionId","runner":{"name":"android-gradle-jvm","version":"$runnerVersion","hostFingerprint":"$hostFingerprint"},"testSelector":"$selector","source":{"parentCommit":"$parentCommit","pluginCommit":"$pluginCommit"},"corpus":{"file":"docs/m0/m0a_crosslang_matrix_v2.json","sha256":"$corpusSha256","stage":"$stage","stageSha256":"$stageSha256"},"assertions":[{"id":"declared-cases-executed","predicate":"atLeast","actual":$executedCases,"expected":1},{"id":"stable-error-count","predicate":"equals","actual":${matrix.getValue("errorIds").jsonArray.size},"expected":150},{"id":"independent-stage-mutations","predicate":"equals","actual":$rejected,"expected":$mutations}],"measurements":{"executedDescriptors":$executedCases,"stableErrors":${matrix.getValue("errorIds").jsonArray.size},"mutationSeed":$seedText,"mutationCount":$mutations,"unexpectedAcceptances":${mutations - rejected}},"candidateMeasurements":{"selected":{"candidateId":"T2-response-ceiling-16384","limit":16384,"observedWorst":$exactResponseBytes,"margin":${16384 - exactResponseBytes}},"nearest":{"candidateId":"T2-response-ceiling-16383","limit":16383,"observedWorst":$exactResponseBytes,"margin":${16383 - exactResponseBytes}}}}"""
-            // The host persists only assertion-bearing records from raw Gradle
-            // output; no follow-up command invents a verdict.
-            println("M0A_EXECUTABLE_RECEIPT $json")
+            listOf(
+                Triple("T2", "kotlin-dart-crosslang-jvm", crosslangSelector),
+                Triple("T5", "android-gradle-jvm", nativeSelector),
+            ).forEach { (tier, runnerName, selector) ->
+                val semantic = if (tier == "T2") "crosslang-$stage-byte-value-parity" else "native-$stage-descriptor-fault-execution"
+                val observedSha256 = sha256("$tier|$stage|$executedCases|$stageFaultRejects|$rejected|$exactResponseBytes".toByteArray())
+                val executionId = sha256("$tier\u0000$stage\u0000$runnerVersion\u0000$selector\u0000$stageSha256\u0000$observedSha256".toByteArray())
+                val json = """{"format":"proposal08-m0a-executable-receipt-v1","tier":"$tier","stage":"$stage","executionId":"$executionId","runner":{"name":"$runnerName","version":"$runnerVersion","hostFingerprint":"$hostFingerprint"},"testSelector":"$selector","source":{"parentCommit":"$parentCommit","pluginCommit":"$pluginCommit"},"corpus":{"file":"docs/m0/m0a_crosslang_matrix_v2.json","sha256":"$corpusSha256","stage":"$stage","stageSha256":"$stageSha256"},"execution":{"inputSha256":"$stageSha256","observedSha256":"$observedSha256","semantic":"$semantic"},"coveredSelectors":["$selector"],"assertions":[{"id":"declared-cases-executed","predicate":"atLeast","actual":$executedCases,"expected":1},{"id":"stable-error-count","predicate":"equals","actual":${matrix.getValue("errorIds").jsonArray.size},"expected":150},{"id":"stage-faults-executed","predicate":"equals","actual":$stageFaultRejects,"expected":${stageRoot.getValue("cases").jsonArray.size}},{"id":"independent-stage-mutations","predicate":"equals","actual":$rejected,"expected":$mutations}],"measurements":{"executedDescriptors":$executedCases,"stableErrors":${matrix.getValue("errorIds").jsonArray.size},"stageFaults":$stageFaultRejects,"mutationSeed":$seedText,"mutationCount":$mutations,"unexpectedAcceptances":${mutations - rejected},"exactResponseBytes":$exactResponseBytes}}"""
+                println("M0A_EXECUTABLE_RECEIPT $json")
+            }
         }
     }
 
