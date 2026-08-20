@@ -129,6 +129,7 @@ internal class SceneViewHost(
     private val frameCadenceTracker = FrameCadenceTracker()
     private val rendererTelemetry = RendererTelemetry()
     private var disposed = false
+    private var rendererPaused = false
     private val replaySettledTextureResize: Runnable = Runnable {
         if (disposed) return@Runnable
         val textureView = composeView.findTextureView() ?: return@Runnable
@@ -317,7 +318,13 @@ internal class SceneViewHost(
                     }
                 },
                 onSessionUpdated = { session, frame ->
-                    frameCadenceTracker.record(System.nanoTime())
+                    // ARCore can deliver an already-queued callback while
+                    // Session.pause() is completing. Keep that callback out
+                    // of the renderer cadence contract once pause has been
+                    // acknowledged to Flutter.
+                    if (!rendererPaused) {
+                        frameCadenceTracker.record(System.nanoTime())
+                    }
                     sessionRef.set(session)
                     frameRef.set(frame)
                     frame.getUpdatedTrackables(Plane::class.java).forEach { plane ->
@@ -403,21 +410,24 @@ internal class SceneViewHost(
                 val coverage = coverageRenderConfig.value
                 if (coverage != null) {
                     key(
+                        coverage.enabled,
                         coverage.voxelRenderMode,
                         coverage.voxelSizeMeters,
                         coverage.cubeSizeFactor,
                         coverage.pointSizePx,
                     ) {
-                        when (coverage.voxelRenderMode) {
-                            VoxelRenderMode.POINTS -> NodeLifecycle(
-                                CoverageActivePointNode(engine, materialLoader, rendererTelemetry, coverage, coverageSnapshotRef.get(), rawPointSnapshotRef.get(), coverageMeshRef, onCoverageRendererMounted),
-                            ) {}
-                            VoxelRenderMode.CENTROIDS -> NodeLifecycle(
-                                CoverageActiveCentroidNode(engine, materialLoader, rendererTelemetry, coverage, coverageSnapshotRef.get(), rawPointSnapshotRef.get(), coverageMeshRef, onCoverageRendererMounted),
-                            ) {}
-                            VoxelRenderMode.CUBES -> NodeLifecycle(
-                                CoverageActiveCubeNode(engine, materialLoader, rendererTelemetry, coverage, coverageSnapshotRef.get(), rawPointSnapshotRef.get(), coverageMeshRef, onCoverageRendererMounted),
-                            ) {}
+                        if (coverage.enabled) {
+                            when (coverage.voxelRenderMode) {
+                                VoxelRenderMode.POINTS -> NodeLifecycle(
+                                    CoverageActivePointNode(engine, materialLoader, rendererTelemetry, coverage, coverageSnapshotRef.get(), rawPointSnapshotRef.get(), coverageMeshRef, onCoverageRendererMounted),
+                                ) {}
+                                VoxelRenderMode.CENTROIDS -> NodeLifecycle(
+                                    CoverageActiveCentroidNode(engine, materialLoader, rendererTelemetry, coverage, coverageSnapshotRef.get(), rawPointSnapshotRef.get(), coverageMeshRef, onCoverageRendererMounted),
+                                ) {}
+                                VoxelRenderMode.CUBES -> NodeLifecycle(
+                                    CoverageActiveCubeNode(engine, materialLoader, rendererTelemetry, coverage, coverageSnapshotRef.get(), rawPointSnapshotRef.get(), coverageMeshRef, onCoverageRendererMounted),
+                                ) {}
+                            }
                         }
                     }
                 }
@@ -559,10 +569,14 @@ internal class SceneViewHost(
     fun resume() {
         checkNotDisposed()
         activeSession?.resume()
+        rendererPaused = false
     }
 
     fun pause() {
-        if (!disposed) activeSession?.pause()
+        if (!disposed) {
+            rendererPaused = true
+            activeSession?.pause()
+        }
     }
 
     fun rendererPerformanceSnapshot(): Map<String, Any> =
