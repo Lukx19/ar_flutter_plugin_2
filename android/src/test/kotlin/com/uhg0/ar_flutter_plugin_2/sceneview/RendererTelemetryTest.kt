@@ -1,6 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.sceneview
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class RendererTelemetryTest {
@@ -26,5 +27,20 @@ class RendererTelemetryTest {
         assertEquals(false, snapshot.getValue("gpuTimingAvailable"))
         assertEquals(false, snapshot.getValue("gpuAllocationAvailable"))
         assertEquals(64 * 1024, snapshot.getValue("ordinaryUploadLimitBytes"))
+    }
+
+    @Test
+    fun `telemetry rejects a renderer-owned allocation above the shared cap`() {
+        val telemetry = RendererTelemetry()
+        telemetry.setOwnedBufferBytes("centroids", 20_000 * 36)
+
+        assertThrows(IllegalStateException::class.java) {
+            telemetry.setOwnedBufferBytes(
+                "cubes",
+                RendererTelemetry.RENDERER_ALLOCATION_LIMIT_BYTES,
+            )
+        }
+
+        assertEquals(20_000 * 36, telemetry.snapshot().getValue("ownedBufferBytes"))
     }
 }

@@ -67,7 +67,10 @@ class NativeVisibilityGrid(
     private val tracks = HashMap<Int, Track>()
     private val supportByKey = HashMap<Long, Int>()
     private val restoredKeys = HashSet<Long>()
-    private val visibleKeys = HashSet<Long>()
+    // Ordering is part of the presentation contract: a bounded renderer can
+    // ask for the first N stable identities without scanning/sorting the
+    // 100k semantic grid. The grid remains authoritative for all identities.
+    private val visibleKeys = java.util.TreeSet<Long>()
     private val depthEvidenceByKey = HashMap<Long, DepthEvidence>()
     private val pendingGeometry = HashMap<Long, PendingGeometryState>()
     private var snapshotRequired = false
@@ -474,7 +477,7 @@ class NativeVisibilityGrid(
     @Synchronized
     fun snapshot(): VisibilityGridSnapshot {
         check(::group.isInitialized) { "startGroup must be called before snapshot" }
-        val stableKeys = visibleKeys.sorted()
+        val stableKeys = visibleKeys.toList()
         return VisibilityGridSnapshot(
             groupId = group.groupId,
             groupGeneration = group.groupGeneration,
@@ -486,6 +489,17 @@ class NativeVisibilityGrid(
             supportByKey = supportByKey.toSortedMap(),
             diagnostics = diagnostics(),
         )
+    }
+
+    /**
+     * Returns the deterministic presentation selection without copying the
+     * full semantic-grid population. Callers must retain their own slots;
+     * this is deliberately an identity-only seam, not a second grid mirror.
+     */
+    @Synchronized
+    fun selectedRenderKeys(capacity: Int): LongArray {
+        require(capacity > 0)
+        return visibleKeys.asSequence().take(capacity).toList().toLongArray()
     }
 
     @Synchronized
@@ -504,7 +518,7 @@ class NativeVisibilityGrid(
         val reset = snapshotRequired
         val upserts =
             if (reset) {
-                visibleKeys.sorted()
+                visibleKeys.toList()
             } else {
                 pendingGeometry
                     .filterValues { it == PendingGeometryState.UPSERT }
@@ -582,7 +596,7 @@ class NativeVisibilityGrid(
             baseRevision = request.receiverGeometryRevision,
             revision = nextRevision,
             reset = true,
-            upserts = visibleKeys.sorted(),
+            upserts = visibleKeys.toList(),
             removals = emptyList(),
             publishing = true,
         ).also {

@@ -48,6 +48,34 @@ class VisibilityGridRendererStateTest {
     }
 
     @Test
+    fun `bounded presentation selection keeps semantic capacity separate and replaces by identity`() {
+        val state = VisibilityGridRendererState(capacity = 2)
+        state.startGroup(group(100_000), geometryRevision = 0, restoredKeys = longArrayOf())
+        val first = packVisibilityGridKey(1, 0, 0)
+        val second = packVisibilityGridKey(2, 0, 0)
+        val third = packVisibilityGridKey(3, 0, 0)
+
+        assertTrue(state.applyGeometry(1, false, longArrayOf(second, third), longArrayOf()))
+        assertTrue(state.applyGeometry(2, false, longArrayOf(first), longArrayOf()))
+        assertArrayEquals(longArrayOf(first, second), state.snapshot().keys.sortedArray())
+
+        // A selected removal asks the authoritative grid for only its next
+        // bounded presentation set, preserving the semantic 100k capacity.
+        assertTrue(
+            state.applyGeometry(
+                3,
+                false,
+                longArrayOf(),
+                longArrayOf(first),
+                selectedKeysForResetOrReplacement = { longArrayOf(second, third) },
+            ),
+        )
+        assertArrayEquals(longArrayOf(second, third), state.snapshot().keys.sortedArray())
+        assertEquals(100_000, group(100_000).capacity)
+        assertEquals(0, state.freeRowCount)
+    }
+
+    @Test
     fun `visibility patches are revision exact atomic and geometry only`() {
         val state = VisibilityGridRendererState(capacity = 2)
         val key = packVisibilityGridKey(0, 0, 0)

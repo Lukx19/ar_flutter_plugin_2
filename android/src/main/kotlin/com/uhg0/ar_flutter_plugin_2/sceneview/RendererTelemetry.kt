@@ -19,7 +19,17 @@ internal class RendererTelemetry {
     fun setOwnedBufferBytes(owner: String, bytes: Int) {
         require(owner.isNotBlank())
         require(bytes >= 0)
-        allocationsByOwner[owner] = bytes
+        val previous = allocationsByOwner.put(owner, bytes)
+        if (ownedBufferBytes > RENDERER_ALLOCATION_LIMIT_BYTES) {
+            if (previous == null) {
+                allocationsByOwner.remove(owner)
+            } else {
+                allocationsByOwner[owner] = previous
+            }
+            throw IllegalStateException(
+                "renderer-owned buffers exceed $RENDERER_ALLOCATION_LIMIT_BYTES bytes",
+            )
+        }
         peakOwnedBufferBytes = maxOf(peakOwnedBufferBytes, ownedBufferBytes)
     }
 

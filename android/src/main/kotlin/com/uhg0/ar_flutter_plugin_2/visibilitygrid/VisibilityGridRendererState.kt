@@ -8,15 +8,22 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.identityGridRotation
 import java.util.TreeSet
 
 /**
- * Dense renderer-row mirror of authoritative native grid geometry.
+ * Dense, bounded renderer-row selection over authoritative native grid geometry.
  *
- * Removal uses swap-remove, so both point and cube modes share the same
- * contiguous rows and every removed row is immediately reusable.
+ * The semantic grid can retain 100k rows while this mirror retains only the
+ * deterministic lowest stable identities admitted by its fixed presentation
+ * capacity. Removal uses swap-remove, so rows are immediately reusable and a
+ * replacement never requires a second full renderer map.
  */
 class VisibilityGridRendererState(
     val capacity: Int,
     private val defaultColor: Int = 0xFFFF0000.toInt(),
 ) {
+    companion object {
+        /** Chapter 17 M0d maximum for clean centroid presentation rows. */
+        const val CENTROID_PRESENTATION_CAPACITY = 20_000
+    }
+
     init {
         require(capacity in 1..100_000)
     }
@@ -25,6 +32,7 @@ class VisibilityGridRendererState(
     private val positions = FloatArray(capacity * 3)
     private val colors = IntArray(capacity)
     private val rowsByKey = HashMap<Long, Int>(capacity)
+    private val selectedKeys = TreeSet<Long>()
     private val dirtyRows = TreeSet<Int>()
     private var group: VisibilityGridGroupConfig? = null
     private var count = 0
@@ -60,7 +68,6 @@ class VisibilityGridRendererState(
         restoredKeys: LongArray,
     ) {
         ensureActive()
-        require(config.capacity <= capacity)
         require(geometryRevision >= 0)
         require(restoredKeys.size <= config.capacity)
         require(restoredKeys.toSet().size == restoredKeys.size)
@@ -70,7 +77,7 @@ class VisibilityGridRendererState(
         require(visibilityRevision >= 0)
         this.visibilityRevision = visibilityRevision
         ignoredVisibilityKeyCount = 0
-        restoredKeys.forEach(::append)
+        restoredKeys.sorted().take(capacity).forEach(::append)
         dirtyRows += 0 until count
         resetUpload = true
         renderRevision++
@@ -82,6 +89,7 @@ class VisibilityGridRendererState(
         reset: Boolean,
         upsertKeys: LongArray,
         removalKeys: LongArray,
+        selectedKeysForResetOrReplacement: (() -> LongArray)? = null,
     ): Boolean {
         ensureActive()
         val active = group ?: return false
@@ -93,26 +101,43 @@ class VisibilityGridRendererState(
         ) {
             return false
         }
-        val finalKeys =
-            if (reset) {
-                upsertKeys.toSet()
-            } else {
-                rowsByKey.keys.toMutableSet().apply {
-                    removeAll(removalKeys.toSet())
-                    addAll(upsertKeys.toSet())
-                }
-            }
-        if (finalKeys.size > active.capacity) return false
-
         if (reset) {
+            val selected = selectedKeysForResetOrReplacement?.invoke()
+                ?: upsertKeys.sortedArray().take(capacity).toLongArray()
+            if (selected.size > capacity || selected.toSet().size != selected.size) return false
             clearRows()
-            upsertKeys.forEach(::append)
+            selected.forEach(::append)
             dirtyRows += 0 until count
             resetUpload = true
         } else {
-            removalKeys.forEach(::remove)
-            upsertKeys.forEach { key ->
-                if (key !in rowsByKey) append(key)
+            val removedSelectedIdentity = removalKeys.any(rowsByKey::containsKey)
+            if (removedSelectedIdentity) {
+                // The semantic grid supplies only the first presentation-cap
+                // identities. Reconciliation is bounded by this state's
+                // capacity, never by the 100k semantic population.
+                val selected = selectedKeysForResetOrReplacement?.invoke()
+                if (selected != null) {
+                    if (selected.size > capacity || selected.toSet().size != selected.size) return false
+                    reconcileSelectedKeys(selected)
+                    resetUpload = true
+                } else {
+                    // Unit/reference callers without a semantic-grid selector
+                    // keep the historical delta-only free-row behavior.
+                    removalKeys.forEach(::remove)
+                    upsertKeys.sorted().forEach { key ->
+                        if (key !in rowsByKey && count < capacity) append(key)
+                    }
+                }
+            } else {
+                upsertKeys.sorted().forEach { key ->
+                    if (key in rowsByKey) return@forEach
+                    if (count < capacity) {
+                        append(key)
+                    } else if (key < checkNotNull(selectedKeys.lastOrNull())) {
+                        remove(checkNotNull(selectedKeys.lastOrNull()))
+                        append(key)
+                    }
+                }
             }
         }
         geometryRevision = revision
@@ -232,6 +257,7 @@ class VisibilityGridRendererState(
         colors[row] = defaultColor
         writePosition(row, key)
         rowsByKey[key] = row
+        selectedKeys += key
         dirtyRows += row
     }
 
@@ -250,6 +276,7 @@ class VisibilityGridRendererState(
         }
         keys[last] = 0
         colors[last] = 0
+        selectedKeys -= key
     }
 
     private fun writePosition(row: Int, key: Long) {
@@ -295,8 +322,18 @@ class VisibilityGridRendererState(
         positions.fill(0f)
         colors.fill(0)
         rowsByKey.clear()
+        selectedKeys.clear()
         dirtyRows.clear()
         count = 0
+    }
+
+    private fun reconcileSelectedKeys(nextSelected: LongArray) {
+        val desired = nextSelected.toSet()
+        rowsByKey.keys.filterNot(desired::contains).toList().forEach(::remove)
+        nextSelected.sorted().forEach { key ->
+            if (key !in rowsByKey) append(key)
+        }
+        check(count == nextSelected.size)
     }
 
     private fun ensureActive() {

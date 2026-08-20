@@ -387,9 +387,9 @@ class VisibilityGridMethodChannel(
             rendererConfig = null
             render(null, null)
             clearRawPoints()
-            renderer =
-                VisibilityGridRendererState(
-                    capacity = featureConfig.stableVoxelCapacity,
+                renderer =
+                    VisibilityGridRendererState(
+                    capacity = VisibilityGridRendererState.CENTROID_PRESENTATION_CAPACITY,
                     defaultColor = defaultColor,
                 ).also {
                     it.setEnabled(enabled)
@@ -397,7 +397,7 @@ class VisibilityGridMethodChannel(
                 }
             rendererConfig =
                 PointCloudNativeConfig(
-                    renderCapacity = featureConfig.stableVoxelCapacity,
+                    renderCapacity = VisibilityGridRendererState.CENTROID_PRESENTATION_CAPACITY,
                     defaultColor = defaultColor,
                     pointSizePx = pointSizePx,
                     enabled = enabled,
@@ -509,6 +509,11 @@ class VisibilityGridMethodChannel(
                             reset = true,
                             upsertKeys = it.upsertKeys.toLongArray(),
                             removalKeys = it.removalKeys.toLongArray(),
+                            selectedKeysForResetOrReplacement = {
+                                active.selectedRenderKeys(
+                                    VisibilityGridRendererState.CENTROID_PRESENTATION_CAPACITY,
+                                )
+                            },
                         ) == true,
                     )
                 }
@@ -693,6 +698,11 @@ class VisibilityGridMethodChannel(
                                         renderer = context.renderer,
                                         delta = delta,
                                         fullSnapshot = context.grid::snapshot,
+                                        selectedRenderKeys = {
+                                            context.grid.selectedRenderKeys(
+                                                VisibilityGridRendererState.CENTROID_PRESENTATION_CAPACITY,
+                                            )
+                                        },
                                     )
                                 if (sync == RendererGeometrySyncResult.REJECTED) {
                                     false

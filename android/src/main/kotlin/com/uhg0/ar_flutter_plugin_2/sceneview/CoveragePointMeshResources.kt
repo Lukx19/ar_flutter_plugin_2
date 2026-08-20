@@ -82,22 +82,23 @@ internal class CoveragePointMeshResources(
         materialInstance: MaterialInstance,
         pointSizePx: Float,
     ) {
-        check(snapshot.capacity == capacity)
-        check(snapshot.count in 0..capacity)
-        check(snapshot.positions.size == snapshot.count * POSITION_COMPONENTS)
-        check(snapshot.colors.size == snapshot.count)
-        if (snapshot.revision != lastRevision) {
-            if (snapshot.count > 0) {
-                uploadCoordinator.submit(snapshot)
+        val presentation = snapshot.boundedForPresentation(capacity)
+        check(presentation.capacity == capacity)
+        check(presentation.count in 0..capacity)
+        check(presentation.positions.size == presentation.count * POSITION_COMPONENTS)
+        check(presentation.colors.size == presentation.count)
+        if (presentation.revision != lastRevision) {
+            if (presentation.count > 0) {
+                uploadCoordinator.submit(presentation)
             }
-            lastRevision = snapshot.revision
+            lastRevision = presentation.revision
         }
         setDrawCount(
             node,
-            if (snapshot.enabled) snapshot.count else 0,
+            if (presentation.enabled) presentation.count else 0,
         )
         materialInstance.setParameter("pointSize", pointSizePx)
-        node.isVisible = snapshot.enabled && snapshot.count > 0
+        node.isVisible = presentation.enabled && presentation.count > 0
     }
 
     override fun hide(node: Node) {

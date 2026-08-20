@@ -2,10 +2,29 @@ package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
 import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudSample
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class NativeVisibilityGridTest {
+    @Test
+    fun `bounded render selection is ordered without copying the semantic population`() {
+        val grid = NativeVisibilityGrid(VisibilityGridFeatureConfig(stableVoxelCapacity = 100_000))
+        val first = packVisibilityGridKey(1, 0, 0)
+        val second = packVisibilityGridKey(2, 0, 0)
+        val third = packVisibilityGridKey(3, 0, 0)
+        grid.startGroup(
+            group().copy(
+                capacity = 100_000,
+                restoredGeometryRevision = 1,
+                restoredKeys = longArrayOf(third, first, second),
+            ),
+        )
+
+        assertArrayEquals(longArrayOf(first, second), grid.selectedRenderKeys(2))
+        assertEquals(3, grid.snapshot().stableKeys.size)
+    }
+
     @Test
     fun `stable same-id jitter contributes exactly one voxel`() {
         val grid = newGrid()
