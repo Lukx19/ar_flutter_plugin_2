@@ -76,7 +76,7 @@ class VisibilityGridRendererState(
         require(visibilityRevision >= 0)
         this.visibilityRevision = visibilityRevision
         ignoredVisibilityKeyCount = 0
-        restoredKeys.sorted().take(capacity).forEach(::append)
+        restoredKeys.forEach(::admitCandidate)
         dirtyRows.addRange(count)
         resetUpload = true
         renderRevision++
@@ -102,10 +102,11 @@ class VisibilityGridRendererState(
         }
         if (reset) {
             val selected = selectedKeysForResetOrReplacement?.invoke()
-                ?: upsertKeys.sortedArray().take(capacity).toLongArray()
-            if (selected.size > capacity || selected.toSet().size != selected.size) return false
+            if (selected != null &&
+                (selected.size > capacity || selected.toSet().size != selected.size)
+            ) return false
             clearRows()
-            selected.forEach(::append)
+            (selected ?: upsertKeys).forEach(::admitCandidate)
             dirtyRows.addRange(count)
             resetUpload = true
         } else {
@@ -123,12 +124,12 @@ class VisibilityGridRendererState(
                     // Unit/reference callers without a semantic-grid selector
                     // keep the historical delta-only free-row behavior.
                     removalKeys.forEach(::remove)
-                    upsertKeys.sorted().forEach { key ->
+                    upsertKeys.forEach { key ->
                         if (key !in rowsByKey && count < capacity) append(key)
                     }
                 }
             } else {
-                upsertKeys.sorted().forEach { key ->
+                upsertKeys.forEach { key ->
                     if (key in rowsByKey) return@forEach
                     if (count < capacity) {
                         append(key)
@@ -258,6 +259,20 @@ class VisibilityGridRendererState(
         rowsByKey[key] = row
         selectedKeys.add(key, rowsByKey::containsKey)
         dirtyRows.add(row)
+    }
+
+    /** Deterministic bounded admission without a steady full-key sort. */
+    private fun admitCandidate(key: Long) {
+        if (rowsByKey.containsKey(key)) return
+        if (count < capacity) {
+            append(key)
+            return
+        }
+        val largest = selectedKeys.largest(rowsByKey::containsKey) ?: return
+        if (key < largest) {
+            remove(largest)
+            append(key)
+        }
     }
 
     private fun remove(key: Long) {
