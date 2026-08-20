@@ -14,9 +14,21 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class M0bLockedCampaignTest {
+    @Test
+    fun `compact candidate boundary rejects invalid populations`() {
+        assertThrows(IllegalArgumentException::class.java) { M0bCompactFusionLedger(0, 1) }
+        assertThrows(IllegalArgumentException::class.java) { M0bCompactFusionLedger(100_001, 1) }
+        assertThrows(IllegalArgumentException::class.java) { M0bCompactFusionLedger(1, 0) }
+        assertThrows(IllegalArgumentException::class.java) { M0bCompactFusionLedger(1, 200_001) }
+        assertThrows(IllegalArgumentException::class.java) {
+            M0bCompactFusionLedger(1, 1).executeCandidate("D")
+        }
+    }
+
     @Test
     fun `locked T0 through T3 campaign produces a native receipt`() {
         val manifest = fixture("m0b_campaign_manifest_v1.json")
@@ -24,17 +36,28 @@ class M0bLockedCampaignTest {
         val expectedHashes = fixture("m0b_crosslang_lock_v1.json")
             .getValue("candidateOutputSha256").jsonObject
         val scenes = mutableListOf<Scene>()
+        val comparisonScenes = mutableListOf<Scene>()
+        var comparisonSceneCount = 0
         manifest.getValue("partitions").jsonArray.forEach { raw ->
             val descriptor = raw.jsonObject
             val fileName = descriptor.string("file")
             val bytes = resourceBytes(fileName)
             assertEquals(descriptor.string("sha256"), sha256(bytes))
-            if (descriptor.string("stage") != "proposal07Comparison") {
+            if (descriptor.string("stage") == "proposal07Comparison") {
+                fixture(fileName).getValue("scenes").jsonArray.forEach { rawScene ->
+                    val input = rawScene.jsonObject
+                    val parsedScene = scene(input, input.getValue("reference").jsonObject)
+                    scenes += parsedScene
+                    comparisonScenes += parsedScene
+                    comparisonSceneCount++
+                }
+            } else {
                 fixture(fileName).getValue("scenes").jsonArray.forEach { scene ->
                     scenes += scene(scene.jsonObject, oracle)
                 }
             }
         }
+        assertTrue("Proposal-07 comparison partition must execute", comparisonSceneCount > 0)
         val factories = linkedMapOf<String, () -> M0FusionKernel>(
             "A" to { M0SignedOccupancyKernel() },
             "B" to { M0PlanarConsolidationKernel() },
@@ -57,7 +80,9 @@ class M0bLockedCampaignTest {
             )
         }
 
-        val receipt = measuredReceipt(factories, scenes)
+        val baselineRecall = proposal07Recall(comparisonScenes)
+        assertEquals(0.8, baselineRecall, 0.0)
+        val receipt = measuredReceipt(factories, manifest, comparisonScenes, baselineRecall)
         val report = File("build/reports/tests/m0b_kotlin_receipt_v1.json")
         requireNotNull(report.parentFile).mkdirs()
         report.writeText(receipt)
@@ -72,24 +97,41 @@ class M0bLockedCampaignTest {
             assertEquals(0, candidate.int("checkedOverflowFailures"))
             assertEquals(1, candidate.int("capacityOverflowCount"))
             assertEquals(1, candidate.int("lineageOverflowCount"))
+            assertEquals(100_000, candidate.int("surfaceCount"))
+            assertEquals(200_000, candidate.int("associationCount"))
+            assertEquals(12_800_000, candidate.int("semanticBytes"))
         }
+        assertEquals(
+            3,
+            parsed.getValue("candidates").jsonObject.values
+                .map { it.jsonObject.getValue("fusionChecksum").jsonPrimitive.content }
+                .toSet().size,
+        )
     }
 
     private fun measuredReceipt(
         factories: Map<String, () -> M0FusionKernel>,
-        scenes: List<Scene>,
+        manifest: JsonObject,
+        comparisonScenes: List<Scene>,
+        baselineRecall: Double,
     ): String {
         enableThreadAllocationMeasurement()
         val candidateJson = buildJsonObject {
-            factories.forEach { (candidate, factory) ->
-                repeat(2) { runWindow(factory, scenes) }
-                val cpu = MutableList(5) { runWindow(factory, scenes) }.sorted()
-                val replay = MutableList(5) { runReplayWindow() }.sorted()
+            factories.forEach { (candidate, _) ->
+                repeat(2) { executeBoundary(candidate) }
+                val cpuRuns = MutableList(5) { executeBoundary(candidate) }
+                val cpu = cpuRuns.map { it.first }.sorted()
+                val replayRuns = MutableList(5) { executeBoundary(candidate) }
+                val replay = replayRuns.map { it.first }.sorted()
+                val boundary = replayRuns.first().second
+                val candidateRecall = candidateRecall(factories.getValue(candidate), comparisonScenes)
+                assertTrue(replayRuns.all { it.second.fusionChecksum == boundary.fusionChecksum })
+                assertTrue(replayRuns.all { it.second.replayChecksum == boundary.replayChecksum })
                 val allocations = MutableList(5) {
                     val before = currentThreadAllocatedBytes()
                     val ledger = M0bCompactFusionLedger()
-                    val checksum = ledger.populateDeterministically()
-                    assertTrue(checksum != Long.MIN_VALUE)
+                    val result = ledger.executeCandidate(candidate)
+                    assertEquals(candidate, result.candidateId)
                     currentThreadAllocatedBytes() - before
                 }.sorted()
                 put(candidate, buildJsonObject {
@@ -101,14 +143,24 @@ class M0bLockedCampaignTest {
                     put("cpuWindowP95Micros", cpu[4].coerceAtLeast(1L))
                     put("allocationSamplesBytes", longArray(allocations))
                     put("allocationBytes", allocations[4])
-                    put("checkedOverflowFailures", checkedOverflowFailures(factory))
-                    put("capacityOverflowCount", capacityOverflow())
-                    put("lineageOverflowCount", lineageOverflow())
+                    put("surfaceCount", boundary.surfaceCount)
+                    put("associationCount", boundary.associationCount)
+                    put("semanticBytes", boundary.semanticBytes)
+                    put("fusionChecksum", boundary.fusionChecksum)
+                    put("replayChecksum", boundary.replayChecksum)
+                    put("checkedOverflowFailures", boundary.checkedOverflowFailures)
+                    put("capacityOverflowCount", boundary.capacityOverflowCount)
+                    put("lineageOverflowCount", boundary.lineageOverflowCount)
+                    put("proposal07BaselineRecall", baselineRecall)
+                    put("proposal07CandidateRecall", candidateRecall)
                 })
             }
         }
         return buildJsonObject {
             put("format", "proposal08-m0b-kotlin-receipt-v1")
+            val pins = fixture("m0b_source_pins_v1.json")
+            put("source", pins)
+            put("inputs", inputHashes(manifest))
             put("runner", buildJsonObject {
                 put("name", "kotlin-jvm-native-kernel")
                 put("jvm", System.getProperty("java.version"))
@@ -137,19 +189,41 @@ class M0bLockedCampaignTest {
         }.toString()
     }
 
-    private fun runWindow(factory: () -> M0FusionKernel, scenes: List<Scene>): Long {
+    private fun executeBoundary(candidate: String): Pair<Long, M0bBoundaryResult> {
         val before = currentThreadCpuTime()
-        scenes.forEach { factory().fuse(it.observations) }
-        return ((currentThreadCpuTime() - before) / 1_000).coerceAtLeast(1L)
+        val result = M0bCompactFusionLedger().executeCandidate(candidate)
+        return ((currentThreadCpuTime() - before) / 1_000).coerceAtLeast(1L) to result
     }
 
-    private fun runReplayWindow(): Long {
-        val before = currentThreadCpuTime()
-        var checksum = 0L
-        repeat(300) { picture -> repeat(200) { surface -> checksum = checksum xor (picture * 200L + surface) } }
-        check(checksum >= 0)
-        return ((currentThreadCpuTime() - before) / 1_000).coerceAtLeast(1L)
+    private fun inputHashes(manifest: JsonObject): JsonObject = buildJsonObject {
+        manifest.getValue("partitions").jsonArray.forEach { raw ->
+            val descriptor = raw.jsonObject
+            put(descriptor.string("stage"), descriptor.string("sha256"))
+        }
+        put("oracle", manifest.getValue("oracle").jsonObject.string("sha256"))
+        listOf("m0b_crosslang_lock_v1.json", "m0b_guidance_vector_v1.json", "m0b_fusion_vector_v1.json")
+            .forEach { name -> put(name, sha256(resourceBytes(name))) }
     }
+
+    private fun proposal07Recall(scenes: List<Scene>): Double {
+        val expected = scenes.sumOf { it.expected.size }
+        val retained = scenes.sumOf { scene ->
+            scene.observations.filter { it.signedWeight > 0 }.map { it.key() }.toSet()
+                .intersect(scene.expected).size
+        }
+        return if (expected == 0) 1.0 else retained.toDouble() / expected
+    }
+
+    private fun candidateRecall(factory: () -> M0FusionKernel, scenes: List<Scene>): Double {
+        val expected = scenes.sumOf { it.expected.size }
+        val retained = scenes.sumOf { scene ->
+            factory().fuse(scene.observations).surfaces.map { it.key }.toSet()
+                .intersect(scene.expected).size
+        }
+        return if (expected == 0) 1.0 else retained.toDouble() / expected
+    }
+
+    private fun M0VoxelObservation.key(): M0VoxelKey = M0VoxelKey(x, y, z)
 
     private fun managementBean(): Any {
         val factory = Class.forName("java.lang.management.ManagementFactory")
@@ -173,19 +247,6 @@ class M0bLockedCampaignTest {
         return contract.getMethod("getCurrentThreadCpuTime").invoke(managementBean()) as Long
     }
 
-    private fun checkedOverflowFailures(factory: () -> M0FusionKernel): Int =
-        if (factory().fuse(listOf(M0VoxelObservation(0, 0, 0, Int.MAX_VALUE, 1)))
-                .overflowObservationCount == 1
-        ) 0 else 1
-
-    private fun capacityOverflow(): Int = M0SignedOccupancyKernel(capacity = 1).fuse(
-        listOf(M0VoxelObservation(0, 0, 0, 2, 1), M0VoxelObservation(1, 0, 0, 2, 2)),
-    ).overflowObservationCount
-
-    private fun lineageOverflow(): Int = M0SignedOccupancyKernel(maxLineageIds = 1).fuse(
-        listOf(M0VoxelObservation(0, 0, 0, 1, 1), M0VoxelObservation(0, 0, 0, 1, 2)),
-    ).overflowObservationCount
-
     private fun canonical(result: M0FusionResult): JsonObject = buildJsonObject {
         put("overflowObservationCount", result.overflowObservationCount)
         put("surfaces", JsonArray(result.surfaces.map { surface -> buildJsonObject {
@@ -203,20 +264,31 @@ class M0bLockedCampaignTest {
 
     private fun scene(input: JsonObject, oracle: JsonObject): Scene {
         val name = input.string("name")
-        val truth = oracle.getValue("scenes").jsonArray
-            .first { it.jsonObject.string("name") == name }.jsonObject
+        val truth = if (oracle.containsKey("scenes")) {
+            oracle.getValue("scenes").jsonArray.first { it.jsonObject.string("name") == name }.jsonObject
+        } else {
+            oracle
+        }
         assertTrue(truth.getValue("faces").jsonArray.isNotEmpty())
         val minimum = input.int("minimumConfidenceQ15")
+        val expected = truth.getValue("expectedSurfaceKeys").jsonArray.map { raw ->
+            val key = raw.jsonArray.map { it.jsonPrimitive.int }
+            M0VoxelKey(key[0], key[1], key[2])
+        }.toSet()
         return Scene(name, input.getValue("observations").jsonArray.mapNotNull { raw ->
             val row = raw.jsonObject
             if (row.int("confidenceQ15") < minimum) null else {
                 val key = row.getValue("key").jsonArray.map { it.jsonPrimitive.int }
                 M0VoxelObservation(key[0], key[1], key[2], row.int("signedWeight"), row.int("supportId"))
             }
-        })
+        }, expected)
     }
 
-    private data class Scene(val name: String, val observations: List<M0VoxelObservation>)
+    private data class Scene(
+        val name: String,
+        val observations: List<M0VoxelObservation>,
+        val expected: Set<M0VoxelKey>,
+    )
     private fun fixture(name: String): JsonObject = Json.parseToJsonElement(resourceBytes(name).decodeToString()).jsonObject
     private fun resourceBytes(name: String): ByteArray = requireNotNull(javaClass.classLoader?.getResourceAsStream(name)).readBytes()
     private fun sha256(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
