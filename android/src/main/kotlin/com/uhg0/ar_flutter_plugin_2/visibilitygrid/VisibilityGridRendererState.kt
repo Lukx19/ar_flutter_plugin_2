@@ -5,7 +5,6 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import com.uhg0.ar_flutter_plugin_2.pointcloud.identityGridRotation
-import java.util.TreeSet
 
 /**
  * Dense, bounded renderer-row selection over authoritative native grid geometry.
@@ -31,9 +30,9 @@ class VisibilityGridRendererState(
     private val keys = LongArray(capacity)
     private val positions = FloatArray(capacity * 3)
     private val colors = IntArray(capacity)
-    private val rowsByKey = HashMap<Long, Int>(capacity)
-    private val selectedKeys = TreeSet<Long>()
-    private val dirtyRows = TreeSet<Int>()
+    private val rowsByKey = LongRowIndex(capacity)
+    private val selectedKeys = SelectedKeyMaxHeap(capacity)
+    private val dirtyRows = DirtyRowQueue(capacity)
     private var group: VisibilityGridGroupConfig? = null
     private var count = 0
     private var renderRevision = 0L
@@ -78,7 +77,7 @@ class VisibilityGridRendererState(
         this.visibilityRevision = visibilityRevision
         ignoredVisibilityKeyCount = 0
         restoredKeys.sorted().take(capacity).forEach(::append)
-        dirtyRows += 0 until count
+        dirtyRows.addRange(count)
         resetUpload = true
         renderRevision++
     }
@@ -107,7 +106,7 @@ class VisibilityGridRendererState(
             if (selected.size > capacity || selected.toSet().size != selected.size) return false
             clearRows()
             selected.forEach(::append)
-            dirtyRows += 0 until count
+            dirtyRows.addRange(count)
             resetUpload = true
         } else {
             val removedSelectedIdentity = removalKeys.any(rowsByKey::containsKey)
@@ -133,8 +132,8 @@ class VisibilityGridRendererState(
                     if (key in rowsByKey) return@forEach
                     if (count < capacity) {
                         append(key)
-                    } else if (key < checkNotNull(selectedKeys.lastOrNull())) {
-                        remove(checkNotNull(selectedKeys.lastOrNull()))
+                    } else if (key < checkNotNull(selectedKeys.largest(rowsByKey::containsKey))) {
+                        remove(checkNotNull(selectedKeys.largest(rowsByKey::containsKey)))
                         append(key)
                     }
                 }
@@ -168,7 +167,7 @@ class VisibilityGridRendererState(
             }
             if (colors[row] != patchColors[index]) {
                 colors[row] = patchColors[index]
-                dirtyRows += row
+                dirtyRows.add(row)
             }
         }
         visibilityRevision = nextVisibilityRevision
@@ -227,7 +226,7 @@ class VisibilityGridRendererState(
     fun markUploadFailed() {
         ensureActive()
         resetUpload = true
-        dirtyRows += 0 until count
+        dirtyRows.addRange(count)
         renderRevision++
     }
 
@@ -257,8 +256,8 @@ class VisibilityGridRendererState(
         colors[row] = defaultColor
         writePosition(row, key)
         rowsByKey[key] = row
-        selectedKeys += key
-        dirtyRows += row
+        selectedKeys.add(key, rowsByKey::containsKey)
+        dirtyRows.add(row)
     }
 
     private fun remove(key: Long) {
@@ -272,11 +271,10 @@ class VisibilityGridRendererState(
             positions[last * 3 + 1].let { positions[row * 3 + 1] = it }
             positions[last * 3 + 2].let { positions[row * 3 + 2] = it }
             rowsByKey[movedKey] = row
-            dirtyRows += row
+            dirtyRows.add(row)
         }
         keys[last] = 0
         colors[last] = 0
-        selectedKeys -= key
     }
 
     private fun writePosition(row: Int, key: Long) {
@@ -296,7 +294,7 @@ class VisibilityGridRendererState(
     }
 
     private fun dirtySpans(): List<CoveragePointSpan> {
-        val activeRows = dirtyRows.filter { it < count }
+        val activeRows = dirtyRows.drainActive(count)
         if (activeRows.isEmpty()) return emptyList()
         val spans = mutableListOf<CoveragePointSpan>()
         var cursor = 0
@@ -328,9 +326,16 @@ class VisibilityGridRendererState(
     }
 
     private fun reconcileSelectedKeys(nextSelected: LongArray) {
-        val desired = nextSelected.toSet()
-        rowsByKey.keys.filterNot(desired::contains).toList().forEach(::remove)
-        nextSelected.sorted().forEach { key ->
+        val desired = LongRowIndex(maxOf(1, nextSelected.size))
+        nextSelected.forEach { key -> desired[key] = 0 }
+        val removals = LongArray(count)
+        var removalCount = 0
+        for (row in 0 until count) {
+            val key = keys[row]
+            if (!desired.containsKey(key)) removals[removalCount++] = key
+        }
+        for (index in 0 until removalCount) remove(removals[index])
+        nextSelected.forEach { key ->
             if (key !in rowsByKey) append(key)
         }
         check(count == nextSelected.size)
