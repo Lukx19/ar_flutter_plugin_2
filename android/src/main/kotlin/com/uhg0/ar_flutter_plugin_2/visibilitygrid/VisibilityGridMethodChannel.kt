@@ -90,24 +90,8 @@ class VisibilityGridMethodChannel(
                 "ackGeometry" -> result.success(
                     mapOf("accepted" to requireGrid().ackGeometry(call.geometryAck())),
                 )
-                "requestSnapshot" -> {
-                    val snapshot = requireGrid().requestSnapshot(call.snapshotRequest())
-                    if (snapshot == null) {
-                        result.error("VG_PROTOCOL_INVALID", "Snapshot identity is invalid", null)
-                    } else {
-                        check(
-                            requireNotNull(renderer).applyGeometry(
-                                revision = snapshot.geometryRevision,
-                                reset = true,
-                                upsertKeys = snapshot.upsertKeys.toLongArray(),
-                                removalKeys = snapshot.removalKeys.toLongArray(),
-                            ),
-                        )
-                        lastEmittedGeometryRevision = snapshot.geometryRevision
-                        publishRenderer()
-                        result.success(deltaWireMap(snapshot))
-                    }
-                }
+                "requestSnapshot" -> requestSnapshot(call, result)
+                "requestSnapshotSummary" -> requestSnapshot(call, result, summaryOnly = true)
                 "getHealth" -> {
                     result.success(
                         healthWireMap()
@@ -544,6 +528,32 @@ class VisibilityGridMethodChannel(
                 "No retained visibility-grid delta is available",
             )
         result.success(deltaWireMap(delta))
+    }
+
+    /** Explicit recovery reset. Product callers receive only its summary. */
+    private fun requestSnapshot(
+        call: MethodCall,
+        result: MethodChannel.Result,
+        summaryOnly: Boolean = false,
+    ) {
+        val snapshot = requireGrid().requestSnapshot(call.snapshotRequest())
+        if (snapshot == null) {
+            result.error("VG_PROTOCOL_INVALID", "Snapshot identity is invalid", null)
+            return
+        }
+        check(
+            requireNotNull(renderer).applyGeometry(
+                revision = snapshot.geometryRevision,
+                reset = true,
+                upsertKeys = snapshot.upsertKeys.toLongArray(),
+                removalKeys = snapshot.removalKeys.toLongArray(),
+            ),
+        )
+        lastEmittedGeometryRevision = snapshot.geometryRevision
+        publishRenderer()
+        result.success(
+            if (summaryOnly) deltaSummaryWireMap(snapshot) else deltaWireMap(snapshot),
+        )
     }
 
     private fun applyVisibility(call: MethodCall, result: MethodChannel.Result) {

@@ -54,6 +54,11 @@ void main() {
             ..remove('removalKeys'),
         'ackGeometry' => <String, Object>{'accepted': true},
         'requestSnapshot' => _delta(revision: 7, reset: true),
+        'requestSnapshotSummary' => <String, Object>{
+            ..._delta(revision: 7, reset: true),
+          }
+            ..remove('upsertKeys')
+            ..remove('removalKeys'),
         'checkpointBarrier' => _delta(revision: 8, reset: true),
         'releaseCheckpoint' => <String, Object>{'released': true},
         'applyVisibility' => <String, Object>{'applied': true},
@@ -193,6 +198,15 @@ void main() {
       ),
     );
     expect(started.geometryRevision, 1);
+
+    final recovered = await manager.requestSnapshotSummary(
+      groupId: 'group',
+      groupGeneration: 3,
+      sessionGeneration: 4,
+      receiverGeometryRevision: 1,
+    );
+    expect(recovered.reset, isTrue);
+    expect(recovered.geometryRevision, 7);
 
     final summary = <String, Object>{
       ..._delta(revision: 2),

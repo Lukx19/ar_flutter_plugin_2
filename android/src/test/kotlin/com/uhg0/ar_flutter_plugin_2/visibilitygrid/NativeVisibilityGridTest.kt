@@ -189,10 +189,14 @@ class NativeVisibilityGridTest {
         assertEquals(1, first.geometryRevision)
         assertEquals(listOf(packVisibilityGridKey(0, 0, 0)), first.upsertKeys)
         assertTrue(first.removalKeys.isEmpty())
+        // Worker-pull reads this retained value; publication cannot advance
+        // semantic state until that exact revision is acknowledged.
+        assertEquals(first, grid.inFlightGeometryDelta())
         assertEquals(first, grid.takeGeometryDelta(nowNs = 0))
         assertTrue(!grid.ackGeometry(ack(1, groupId = "wrong-group")))
         assertEquals(first, grid.takeGeometryDelta(nowNs = 0))
         assertTrue(grid.ackGeometry(ack(1)))
+        assertEquals(null, grid.inFlightGeometryDelta())
 
         grid.observe(feature(1, 0.200, 0.020, 0.020))
         grid.observe(feature(2, 0.020, 0.020, 0.020))

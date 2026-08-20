@@ -150,6 +150,35 @@ class ARVisibilityGridManager {
     return snapshot;
   }
 
+  /// Explicit recovery reset without returning semantic keys to the root
+  /// isolate. The coverage worker pulls the retained reset before ACK.
+  Future<ARVisibilityGridDeltaSummary> requestSnapshotSummary({
+    required String groupId,
+    required int groupGeneration,
+    required int sessionGeneration,
+    required int receiverGeometryRevision,
+  }) async {
+    _ensureActive();
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      'requestSnapshotSummary',
+      <String, Object>{
+        'version': visibilityGridWireVersion,
+        'groupId': groupId,
+        'groupGeneration': groupGeneration,
+        'sessionGeneration': sessionGeneration,
+        'receiverGeometryRevision': receiverGeometryRevision,
+      },
+    );
+    if (result == null) {
+      throw const FormatException('Missing visibility-grid recovery summary.');
+    }
+    final summary = ARVisibilityGridDeltaSummary.fromMap(result);
+    if (!summary.reset) {
+      throw const FormatException('Visibility-grid recovery must reset.');
+    }
+    return summary;
+  }
+
   /// Applies colors to existing native-owned geometry only.
   Future<bool> applyVisibility(
     ARVisibilityGridVisibilityPatch patch,
