@@ -103,11 +103,10 @@ class M0aVisibilitySurfaceStreamChannel(
             validateStructuralTransaction(frames)
             frames.forEach { structuralFrames.addLast(it) }
             val begin = (frames.first() as M0aTransactionBeginFrameV1).value
-            queuedTransactionBaseline = M0aCommittedBaselineV1(
+            queuedTransactionBaseline = committedBaseline.copy(
                 transactionId = begin.transactionId,
                 geometryRevision = begin.targetGeometryRevision,
                 lineageRevision = begin.targetLineageRevision,
-                styleRevision = committedBaseline.styleRevision,
             )
         }
     }
@@ -118,14 +117,42 @@ class M0aVisibilitySurfaceStreamChannel(
         geometryRevision: Long,
         lineageRevision: Long,
         styleRevision: Long,
+        evidenceRevision: Long = 0,
+        captureRevision: Long = 0,
+        coverageRevision: Long = 0,
+        producedStyleRevision: Long = 0,
+        regionManifestRevision: Long = 0,
+        schemaRootRevision: Long = 0,
+        nextSurfaceIdHighWater: Long = 0,
     ) {
-        require(transactionId >= 0 && geometryRevision >= 0 && lineageRevision >= 0 && styleRevision >= 0)
+        require(
+            listOf(
+                transactionId,
+                geometryRevision,
+                lineageRevision,
+                styleRevision,
+                evidenceRevision,
+                captureRevision,
+                coverageRevision,
+                producedStyleRevision,
+                regionManifestRevision,
+                schemaRootRevision,
+                nextSurfaceIdHighWater,
+            ).all { it >= 0 },
+        )
         synchronized(this) {
             committedBaseline = M0aCommittedBaselineV1(
                 transactionId,
                 geometryRevision,
                 lineageRevision,
                 styleRevision,
+                evidenceRevision,
+                captureRevision,
+                coverageRevision,
+                producedStyleRevision,
+                regionManifestRevision,
+                schemaRootRevision,
+                nextSurfaceIdHighWater,
             )
         }
     }

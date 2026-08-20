@@ -30,9 +30,9 @@ object M0aStartRequestCodecV2 {
     ) {
         fun hasRestoredCutConflict(baseline: M0aCommittedBaselineV1): Boolean =
             restoreRequested && baseline != M0aCommittedBaselineV1.ZERO &&
-                (restoredRevisions[1] != baseline.geometryRevision ||
-                    restoredRevisions[2] != baseline.lineageRevision ||
-                    restoredRevisions[6] != baseline.styleRevision)
+                restoredRevisions.indices.any { index ->
+                    restoredRevisions[index] != baseline.resultRevisionCut()[index]
+                }
     }
 
     fun decode(bytes: ByteArray): Configuration {

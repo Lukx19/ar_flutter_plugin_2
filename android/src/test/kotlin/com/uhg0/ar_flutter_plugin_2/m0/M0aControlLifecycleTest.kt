@@ -5,6 +5,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.MessageDigest
 
 class M0aControlLifecycleTest {
     @Test
@@ -25,7 +26,7 @@ class M0aControlLifecycleTest {
         val lifecycle = M0aControlLifecycle()
         val desired = request(M0aControlOperation.START, 0, 2).copy(
             payload = startPayload {
-                putLong(16, 1L shl 3)
+                putLong(16, 1L shl 4)
             },
         )
         val response = M0aControlCodec.decodeResponse(
@@ -35,6 +36,19 @@ class M0aControlLifecycleTest {
         val result = ByteBuffer.wrap(response.payload).order(ByteOrder.LITTLE_ENDIAN)
         assertEquals(0L, result.getLong(8))
         assertEquals(0x107L, result.getLong(16))
+
+        val mandatoryLifecycle = M0aControlLifecycle()
+        val mandatory = request(M0aControlOperation.START, 0, 6).copy(
+            payload = startPayload {
+                putLong(8, M0aStartRequestCodecV2.supportedCapabilities)
+            },
+        )
+        val mandatoryResponse = M0aControlCodec.decodeResponse(
+            mandatoryLifecycle.handle(mandatory, M0aControlCodec.encodeRequest(mandatory)),
+        )
+        val mandatoryResult = ByteBuffer.wrap(mandatoryResponse.payload).order(ByteOrder.LITTLE_ENDIAN)
+        assertEquals(0x107L, mandatoryResult.getLong(8))
+        assertEquals(0x107L, mandatoryResult.getLong(16))
     }
 
     @Test
@@ -42,7 +56,7 @@ class M0aControlLifecycleTest {
         val capabilityLifecycle = M0aControlLifecycle()
         val required = request(M0aControlOperation.START, 0, 3).copy(
             payload = startPayload {
-                putLong(8, 1L shl 3)
+                putLong(8, 1L shl 4)
             },
         )
         val capabilityResponse = M0aControlCodec.decodeResponse(
@@ -86,6 +100,55 @@ class M0aControlLifecycleTest {
         assertEquals(1, response.outcome)
         assertEquals(58, response.errorId)
         assertEquals(M0aControlLifecycle.State.IDLE, lifecycle.state())
+    }
+
+    @Test
+    fun `start retains one complete cut with non-default configuration`() {
+        val lifecycle = M0aControlLifecycle(
+            initialCommittedBaseline = M0aCommittedBaselineV1(
+                transactionId = 12,
+                geometryRevision = 3,
+                lineageRevision = 4,
+                styleRevision = 8,
+                evidenceRevision = 2,
+                captureRevision = 5,
+                coverageRevision = 6,
+                producedStyleRevision = 7,
+                regionManifestRevision = 9,
+                schemaRootRevision = 10,
+                nextSurfaceIdHighWater = 11,
+            ),
+        )
+        val start = request(M0aControlOperation.START, 0, 7).copy(
+            payload = startPayload {
+                put(6, 1)
+                putLong(8, M0aStartRequestCodecV2.supportedCapabilities)
+                putInt(24, 8192)
+                putInt(28, 32768)
+                putShort(34, 5)
+                putInt(40, 12345)
+                putInt(44, 23456)
+            },
+        )
+
+        val response = M0aControlCodec.decodeResponse(
+            lifecycle.handle(start, M0aControlCodec.encodeRequest(start)),
+        )
+        val result = ByteBuffer.wrap(response.payload).order(ByteOrder.LITTLE_ENDIAN)
+        assertEquals(1, result.get(4).toInt())
+        assertEquals(0x107L, result.getLong(8))
+        assertEquals(12345, result.getInt(24))
+        assertEquals(23456, result.getInt(28))
+        assertEquals(8192, result.getInt(64))
+        assertEquals(32768, result.getInt(68))
+        assertEquals(5, result.getShort(72).toInt())
+        assertEquals(
+            listOf(2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L, 10L, 11L, 1L, 0L),
+            List(12) { index -> result.getLong(88 + index * 8) },
+        )
+        val digest = MessageDigest.getInstance("SHA-256").digest(response.payload)
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        assertEquals("cd708be10b2af6f51f6beab2b4fde2d7eeb6034b8ec48f360accf102bfdd7138", digest)
     }
 
     @Test

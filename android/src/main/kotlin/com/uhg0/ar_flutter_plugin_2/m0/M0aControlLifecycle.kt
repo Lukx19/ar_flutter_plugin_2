@@ -13,10 +13,47 @@ data class M0aCommittedBaselineV1(
     val geometryRevision: Long,
     val lineageRevision: Long,
     val styleRevision: Long,
+    val evidenceRevision: Long = 0,
+    val captureRevision: Long = 0,
+    val coverageRevision: Long = 0,
+    val producedStyleRevision: Long = 0,
+    val regionManifestRevision: Long = 0,
+    val schemaRootRevision: Long = 0,
+    val nextSurfaceIdHighWater: Long = 0,
 ) {
     init {
-        require(transactionId >= 0 && geometryRevision >= 0 && lineageRevision >= 0 && styleRevision >= 0)
+        require(
+            listOf(
+                transactionId,
+                geometryRevision,
+                lineageRevision,
+                styleRevision,
+                evidenceRevision,
+                captureRevision,
+                coverageRevision,
+                producedStyleRevision,
+                regionManifestRevision,
+                schemaRootRevision,
+                nextSurfaceIdHighWater,
+            ).all { it >= 0 },
+        )
     }
+
+    /** Complete accepted StartResultV2 cut in canonical revision order. */
+    fun resultRevisionCut(): LongArray = longArrayOf(
+        evidenceRevision,
+        geometryRevision,
+        lineageRevision,
+        captureRevision,
+        coverageRevision,
+        producedStyleRevision,
+        styleRevision,
+        regionManifestRevision,
+        schemaRootRevision,
+        nextSurfaceIdHighWater,
+        1L,
+        0L,
+    )
 
     companion object {
         val ZERO = M0aCommittedBaselineV1(0, 0, 0, 0)
@@ -28,6 +65,13 @@ data class M0aCommittedBaselineV1(
                 geometryRevision = revisions[1],
                 lineageRevision = revisions[2],
                 styleRevision = revisions[6],
+                evidenceRevision = revisions[0],
+                captureRevision = revisions[3],
+                coverageRevision = revisions[4],
+                producedStyleRevision = revisions[5],
+                regionManifestRevision = revisions[7],
+                schemaRootRevision = revisions[8],
+                nextSurfaceIdHighWater = revisions[9],
             )
         }
     }

@@ -50,26 +50,13 @@ object M0aStartResultCodecV2 {
         data.putInt(76, regionEdgeMillimetres)
         data.putInt(80, pageEdgeMillimetres)
         data.putInt(84, 0)
-        // A restored request and a replacement baseline are each complete
-        // authority cuts. Never overlay selected fields from one onto the
-        // other: an empty request uses the persisted baseline, while a
-        // restored request uses all of its own revisions after conflict
-        // validation in the lifecycle.
-        val revisions = if (configuration.restoreRequested || baseline == M0aCommittedBaselineV1.ZERO) {
-            configuration.restoredRevisions.copyOf()
+        // The request supplies the accepted configuration, while a retained
+        // baseline supplies one complete accepted revision/high-water cut.
+        // Never overlay selected fields from unrelated cuts.
+        val revisions = if (baseline != M0aCommittedBaselineV1.ZERO) {
+            baseline.resultRevisionCut()
         } else {
-            longArrayOf(
-                0L,
-                baseline.geometryRevision,
-                baseline.lineageRevision,
-                0L,
-                0L,
-                0L,
-                baseline.styleRevision,
-                0L,
-                0L,
-                0L,
-            )
+            configuration.restoredRevisions + longArrayOf(1L, 0L)
         }
         revisions.forEachIndexed { index, revision -> data.putLong(88 + index * 8, revision) }
         data.putLong(168, 1)
