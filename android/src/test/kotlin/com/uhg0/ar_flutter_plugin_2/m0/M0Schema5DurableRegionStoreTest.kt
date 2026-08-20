@@ -8,10 +8,46 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class M0Schema5DurableRegionStoreTest {
+    @Test
+    fun `receipt resumes exact retry after death before root switch`() {
+        val directory = Files.createTempDirectory("m0c-receipt-").toFile()
+        try {
+            val old = listOf(cut(1, -1), cut(1, 0))
+            val next = listOf(cut(2, -1), cut(2, 0))
+            val store = M0Schema5DurableRegionCutStore(directory, old)
+            val interrupted = store.publish(
+                next,
+                fault = M0DurableCutFaultPoint.afterReceipt,
+                operationId = "checkpoint-7",
+            )
+            assertFalse(interrupted.published)
+            assertEquals(0L, interrupted.visibleRootId)
+
+            val restarted = M0Schema5DurableRegionCutStore(directory)
+            val resumed = restarted.publish(next, operationId = "checkpoint-7")
+            assertTrue(resumed.published)
+            assertEquals(1L, resumed.visibleRootId)
+            assertTrue(restarted.hasActivation(1))
+            assertTrue(restarted.hasEviction(1))
+            assertTrue(restarted.hasMigration(1))
+            assertTrue(restarted.hasTombstone(1))
+
+            val replay = restarted.publish(next, operationId = "checkpoint-7")
+            assertEquals(1L, replay.visibleRootId)
+            assertFalse(restarted.hasRoot(2))
+            assertThrows(IllegalArgumentException::class.java) {
+                restarted.publish(listOf(cut(3, -1), cut(3, 0)), operationId = "checkpoint-7")
+            }
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
     @Test
     fun `Kotlin durable root executes the shared twenty case fault matrix`() {
         val corpus = fixture("m0c_fault_corpus_v1.json")

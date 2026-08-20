@@ -9,6 +9,30 @@ import org.junit.Test
 
 class M0StorageQuotaTest {
     @Test
+    fun `phone wide quota serializes cross session reservations and races`() {
+        val gb = 1_000_000_000L
+        val policy = M0StorageQuotaPolicy.forVolume(64 * gb)
+        val coordinator = M0StorageBudgetCoordinator(policy, 31 * gb, 33 * gb)
+        val first = coordinator.tryReserve(600_000_000, "session-a/checkpoint")!!
+        val second = coordinator.tryReserve(400_000_000, "session-b/picture")!!
+        assertEquals(gb, coordinator.reservedBytes)
+        assertNull(coordinator.tryReserve(1, "session-c/trace"))
+        coordinator.commit(first, 500_000_000)
+        coordinator.release(second)
+        assertEquals(31_500_000_000, coordinator.committedBytes)
+
+        val raced = coordinator.tryReserve(100_000_000, "session-b/migration")!!
+        coordinator.updateFreeBytes(policy.freeSpaceFloorBytes + raced.bytes - 1)
+        assertThrows(IllegalStateException::class.java) { coordinator.commit(raced, raced.bytes) }
+        assertEquals(raced.bytes, coordinator.reservedBytes)
+        coordinator.updateFreeBytes(policy.freeSpaceFloorBytes + raced.bytes)
+        coordinator.commit(raced, raced.bytes)
+        coordinator.reclaim(100_000_000)
+        assertEquals(31_500_000_000, coordinator.committedBytes)
+        assertEquals(policy.freeSpaceFloorBytes + raced.bytes, coordinator.freeBytes)
+    }
+
+    @Test
     fun `quota policy rounds volume floor like the Dart reference`() {
         assertEquals(
             M0StorageQuotaPolicy(500L, 4L * 1024 * 1024 * 1024),
@@ -61,7 +85,7 @@ class M0StorageQuotaTest {
         assertNull(coordinator.tryReserve(1))
         assertThrows(IllegalArgumentException::class.java) { coordinator.updateFreeBytes(-1) }
         assertThrows(IllegalStateException::class.java) {
-            coordinator.release(M0StorageReservation(99, 1))
+            coordinator.release(M0StorageReservation(99, 1, "stale"))
         }
     }
 }

@@ -259,8 +259,29 @@ class M0Schema5DurableRegionCutStore(
     fun publish(
         replacement: List<M0RegionPairCut>,
         fault: M0DurableCutFaultPoint? = null,
+        operationId: String? = null,
     ): M0DurableCutCommitResult {
         val nextCuts = validateCuts(replacement, allowEmpty = false)
+        val operationDigest = operationId?.let { operationDigest(it, nextCuts) }
+        if (operationId != null) {
+            val prior = readOperationReceipt(operationId)
+            if (prior != null) {
+                require(prior.digest == operationDigest) {
+                    "Durable operation identity conflicts with different bytes."
+                }
+                require(roots.containsKey(prior.rootId) && rootFile(prior.rootId).isFile) {
+                    "Durable operation receipt references a missing root."
+                }
+                if (visibleRoot != prior.rootId) {
+                    val previousRoot = visibleRoot
+                    writeVisibleRoot(prior.rootId, previousRoot)
+                    visibleRoot = prior.rootId
+                    clearStaging()
+                    completePublication(previousRoot, prior.rootId)
+                }
+                return M0DurableCutCommitResult(true, null, prior.rootId, !hasStaging)
+            }
+        }
         val previousRoot = visibleRoot
         val rootId = nextRoot++
         clearStaging()
@@ -280,7 +301,7 @@ class M0Schema5DurableRegionCutStore(
             inject(fault, M0DurableCutFaultPoint.afterRootPersistBeforeRootSwitch)
             inject(fault, M0DurableCutFaultPoint.processDeathBeforeRootSwitch)
             inject(fault, M0DurableCutFaultPoint.beforeReceipt)
-            writeText(File(directory, "receipt_$rootId.json"), "{\"schema\":5,\"rootId\":$rootId}")
+            writeReceipt(rootId, operationId, operationDigest)
             inject(fault, M0DurableCutFaultPoint.afterReceipt)
             roots[rootId] = nextCuts
             writeVisibleRoot(rootId, previousRoot)
@@ -338,6 +359,59 @@ class M0Schema5DurableRegionCutStore(
         cuts: Map<M0RegionCoordinate, M0RegionPairCut>,
         name: String,
     ) = writeText(File(directory, name), rootJson(rootId, cuts))
+
+    private fun operationReceiptFile(operationId: String): File = File(
+        directory,
+        "operation_${sha256(operationId.toByteArray(Charsets.UTF_8)).hex()}.json",
+    )
+
+    private fun operationDigest(
+        operationId: String,
+        cuts: Map<M0RegionCoordinate, M0RegionPairCut>,
+    ): String {
+        require(operationId.matches(Regex("[A-Za-z0-9._:/-]{1,128}"))) {
+            "Durable operation identity is invalid."
+        }
+        return sha256(rootJson(0, cuts).toByteArray(Charsets.UTF_8)).hex()
+    }
+
+    private fun writeReceipt(rootId: Long, operationId: String?, digest: String?) {
+        val receipt = buildString {
+            append("{\"schema\":5,\"rootId\":").append(rootId)
+            if (operationId != null) {
+                append(",\"operationId\":\"").append(operationId).append('"')
+                append(",\"operationDigest\":\"").append(digest).append('"')
+            }
+            append('}')
+        }
+        writeText(File(directory, "receipt_$rootId.json"), receipt)
+        if (operationId != null) writeAtomic(
+            operationReceiptFile(operationId),
+            receipt.toByteArray(Charsets.UTF_8),
+        )
+    }
+
+    private fun readOperationReceipt(operationId: String): OperationReceipt? {
+        require(operationId.matches(Regex("[A-Za-z0-9._:/-]{1,128}"))) {
+            "Durable operation identity is invalid."
+        }
+        val file = operationReceiptFile(operationId)
+        if (!file.isFile) return null
+        val value = Json.parseToJsonElement(file.readText()).jsonObject
+        require(value.getValue("schema").jsonPrimitive.int == 5)
+        require(value.getValue("operationId").jsonPrimitive.content == operationId)
+        return OperationReceipt(
+            value.getValue("rootId").jsonPrimitive.long,
+            value.getValue("operationDigest").jsonPrimitive.content,
+        )
+    }
+
+    private fun completePublication(previousRoot: Long, rootId: Long) {
+        writeText(File(directory, "active_root"), "$rootId\n")
+        writeText(File(directory, "eviction_$rootId.json"), "{\"evictedRootId\":$previousRoot,\"rootId\":$rootId}")
+        writeText(File(directory, "migration_$rootId.json"), "{\"schema\":5,\"rootId\":$rootId}")
+        writeText(File(directory, "tombstone_$rootId"), "$rootId\n")
+    }
 
     private fun persistRoot(rootId: Long, cuts: Map<M0RegionCoordinate, M0RegionPairCut>) =
         writeAtomic(rootFile(rootId), rootJson(rootId, cuts).toByteArray(Charsets.UTF_8))
@@ -518,6 +592,9 @@ class M0Schema5DurableRegionCutStore(
 
     private fun sha256(bytes: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(bytes)
 
+    private fun ByteArray.hex(): String = joinToString("") { byte -> "%02x".format(byte) }
+
     private data class PointerCandidate(val pointer: M0Schema5RootPointerV1, val rootId: Long)
+    private data class OperationReceipt(val rootId: Long, val digest: String)
     private class M0DurableCutFault(val point: M0DurableCutFaultPoint) : RuntimeException()
 }

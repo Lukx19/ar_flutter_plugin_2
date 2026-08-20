@@ -134,9 +134,22 @@ object M0RegionShardV5 {
         require(surfaceRows.size <= 100_000)
         require(surfaceRows.all { it.size == surfaceWidth })
         require(secondaryRows.all { it.size == secondaryWidth })
-        val decoded = surfaceRows.flatMap { it.asIterable() }.toByteArray() +
-            secondaryRows.flatMap { it.asIterable() }.toByteArray()
-        require(decoded.size <= maximumPayloadBytes)
+        require(kind != Kind.COVERAGE || secondaryRows.size <= surfaceRows.size * 24L)
+        val decodedSize = Math.addExact(
+            Math.multiplyExact(surfaceRows.size.toLong(), surfaceWidth.toLong()),
+            Math.multiplyExact(secondaryRows.size.toLong(), secondaryWidth.toLong()),
+        )
+        require(decodedSize <= maximumPayloadBytes)
+        val decoded = ByteArray(decodedSize.toInt())
+        var decodedOffset = 0
+        surfaceRows.forEach { row ->
+            row.copyInto(decoded, decodedOffset)
+            decodedOffset += row.size
+        }
+        secondaryRows.forEach { row ->
+            row.copyInto(decoded, decodedOffset)
+            decodedOffset += row.size
+        }
         val stored = if (compression == Compression.NONE) decoded else zlibEncode(decoded)
         require(stored.size <= maximumPayloadBytes)
         require(decoded.isEmpty() || decoded.size <= maxOf(4096, stored.size * 64))

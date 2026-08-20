@@ -24,6 +24,7 @@ data class M0StorageQuotaPolicy(
 data class M0StorageReservation(
     val reservationId: Long,
     val bytes: Long,
+    val ownerId: String,
 )
 
 /** Deterministic all-or-none owner for the phone-wide storage byte ledger. */
@@ -42,8 +43,8 @@ class M0StorageBudgetCoordinator(
     val reservedBytes: Long
         get() = reservations.values.fold(0L) { total, reservation -> checkedAdd(total, reservation.bytes) }
 
-    fun tryReserve(bytes: Long): M0StorageReservation? {
-        if (bytes <= 0) return null
+    fun tryReserve(bytes: Long, ownerId: String = "legacy-reference-owner"): M0StorageReservation? {
+        if (bytes <= 0 || ownerId.isEmpty() || ownerId.length > 128) return null
         val reserved = reservedBytes
         if (committed > Long.MAX_VALUE - reserved ||
             checkedAdd(committed, reserved) > Long.MAX_VALUE - bytes ||
@@ -56,7 +57,7 @@ class M0StorageBudgetCoordinator(
         val floorAndReserved = checkedAdd(policy.freeSpaceFloorBytes, reservedAfterReservation)
         if (committedAfterReservation > policy.globalQuotaBytes || floorAndReserved > free) return null
 
-        val reservation = M0StorageReservation(nextReservationId++, bytes)
+        val reservation = M0StorageReservation(nextReservationId++, bytes, ownerId)
         reservations[reservation.reservationId] = reservation
         return reservation
     }
@@ -86,6 +87,13 @@ class M0StorageBudgetCoordinator(
 
     fun updateFreeBytes(bytes: Long) {
         free = checkedNonNegative(bytes)
+    }
+
+    /** Applies only filesystem-confirmed physical reclamation. */
+    fun reclaim(bytes: Long) {
+        require(bytes > 0 && bytes <= committed)
+        committed -= bytes
+        free = checkedAdd(free, bytes)
     }
 
     private fun requireOwned(reservation: M0StorageReservation) {
