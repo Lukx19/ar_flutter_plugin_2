@@ -18,6 +18,8 @@ import android.os.Looper
 internal class CoveragePointMeshResources(
     private val engine: Engine,
     override val capacity: Int,
+    private val telemetry: RendererTelemetry? = null,
+    private val telemetryOwner: String = "coverage-points",
 ) : CoverageVoxelMeshResources {
     override val vertexBuffer: VertexBuffer = VertexBuffer.Builder()
         .bufferCount(2)
@@ -45,6 +47,8 @@ internal class CoveragePointMeshResources(
     private val uploadCoordinator = CoveragePointUploadCoordinator(
         capacity = capacity,
         uploader = FilamentCoveragePointVertexUploader(engine, vertexBuffer),
+        onUploadSubmitted = { bytes -> telemetry?.recordUpload(bytes) },
+        onUploadCallback = { telemetry?.recordUploadCallback() },
     )
     private var indexStaging: java.nio.IntBuffer? = null
 
@@ -52,6 +56,10 @@ internal class CoveragePointMeshResources(
         RenderableManager.PrimitiveType.POINTS
 
     init {
+        // Position/color GPU buffers, index buffer, and retained direct upload
+        // staging are renderer-owned. The transient index staging is excluded
+        // here because it is released after the initial upload callback.
+        telemetry?.setOwnedBufferBytes(telemetryOwner, capacity * OWNED_BYTES_PER_ROW)
         val indices = ByteBuffer.allocateDirect(capacity * Int.SIZE_BYTES)
             .order(ByteOrder.nativeOrder())
             .asIntBuffer()
@@ -115,6 +123,7 @@ internal class CoveragePointMeshResources(
         destroyed = true
         uploadCoordinator.destroy()
         indexStaging = null
+        telemetry?.removeOwner(telemetryOwner)
         engine.destroyVertexBuffer(vertexBuffer)
         engine.destroyIndexBuffer(indexBuffer)
     }
@@ -135,6 +144,9 @@ internal class CoveragePointMeshResources(
         const val COLOR_BUFFER_INDEX = 1
         const val POSITION_COMPONENTS = 3
         const val COLOR_COMPONENTS = 4
+        const val OWNED_BYTES_PER_ROW =
+            POSITION_COMPONENTS * Float.SIZE_BYTES + COLOR_COMPONENTS +
+                Int.SIZE_BYTES + POSITION_COMPONENTS * Float.SIZE_BYTES + COLOR_COMPONENTS
 
         // VertexBuffer.setBufferAt sizes a typed FloatBuffer in float elements,
         // while the color upload below uses a raw ByteBuffer and therefore uses
@@ -176,6 +188,8 @@ internal interface CoveragePointVertexUploader {
 internal class CoveragePointUploadCoordinator(
     capacity: Int,
     private val uploader: CoveragePointVertexUploader,
+    private val onUploadSubmitted: (Int) -> Unit = {},
+    private val onUploadCallback: () -> Unit = {},
 ) {
     private val buffers = CoveragePointUploadBuffers(capacity)
     private var uploadBusy = false
@@ -224,6 +238,11 @@ internal class CoveragePointUploadCoordinator(
             spans.maxOf { it.startSlot + it.colors.size }
         }
         buffers.writeRange(snapshot.positions, snapshot.colors, startSlot, endSlot)
+        onUploadSubmitted(
+            (endSlot - startSlot) *
+                (CoveragePointMeshResources.POSITION_COMPONENTS * Float.SIZE_BYTES +
+                    CoveragePointMeshResources.COLOR_COMPONENTS),
+        )
         hasUploadedSnapshot = true
         uploadBusy = true
         consumedCallbackMask = 0
@@ -243,6 +262,7 @@ internal class CoveragePointUploadCoordinator(
     private fun consumed(uploadId: Long, callbackBit: Int) {
         if (destroyed || !uploadBusy || uploadId != activeUploadId) return
         if (consumedCallbackMask and callbackBit != 0) return
+        onUploadCallback()
         consumedCallbackMask = consumedCallbackMask or callbackBit
         if (consumedCallbackMask == BOTH_CALLBACKS) {
             uploadBusy = false

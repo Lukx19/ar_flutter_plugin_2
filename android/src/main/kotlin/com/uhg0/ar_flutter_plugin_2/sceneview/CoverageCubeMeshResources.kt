@@ -22,6 +22,8 @@ internal class CoverageCubeMeshResources(
     private val engine: Engine,
     override val capacity: Int,
     voxelSizeMeters: Float,
+    private val telemetry: RendererTelemetry? = null,
+    private val telemetryOwner: String = "coverage-cubes",
 ) : CoverageVoxelMeshResources {
     private val halfSize = voxelSizeMeters / 2f
     private val vertexCapacity = capacity * VERTICES_PER_VOXEL
@@ -61,6 +63,8 @@ internal class CoverageCubeMeshResources(
         capacity = capacity,
         halfSize = halfSize,
         uploader = FilamentCoverageCubeVertexUploader(engine, vertexBuffer),
+        onUploadSubmitted = { bytes -> telemetry?.recordUpload(bytes) },
+        onUploadCallback = { telemetry?.recordUploadCallback() },
     )
     private var indexStaging: java.nio.IntBuffer? = null
     private var outlineIndexStaging: java.nio.IntBuffer? = null
@@ -68,6 +72,10 @@ internal class CoverageCubeMeshResources(
     private var destroyed = false
 
     init {
+        // This exact per-cube buffer ledger is 736 bytes: 128 bytes vertex
+        // GPU data, 240 bytes triangle/outline indices, 128 bytes retained
+        // upload staging, and 240 bytes initial index staging.
+        telemetry?.setOwnedBufferBytes(telemetryOwner, capacity * OWNED_BYTES_PER_VOXEL)
         val indices = ByteBuffer.allocateDirect(indexCapacity * Int.SIZE_BYTES)
             .order(ByteOrder.nativeOrder())
             .asIntBuffer()
@@ -162,6 +170,7 @@ internal class CoverageCubeMeshResources(
         uploadCoordinator.destroy()
         indexStaging = null
         outlineIndexStaging = null
+        telemetry?.removeOwner(telemetryOwner)
         engine.destroyVertexBuffer(vertexBuffer)
         engine.destroyIndexBuffer(indexBuffer)
         engine.destroyIndexBuffer(outlineIndexBuffer)
@@ -176,6 +185,7 @@ internal class CoverageCubeMeshResources(
         const val INDICES_PER_VOXEL = 36
         const val OUTLINE_INDICES_PER_VOXEL = 24
         const val OUTLINE_PRIMITIVE_INDEX = 1
+        const val OWNED_BYTES_PER_VOXEL = 736
 
         // Two triangles per cube face, using the eight corners in the order:
         // (-,-,-), (+,-,-), (+,+,-), (-,+,-), (-,-,+), (+,-,+), (+,+,+), (-,+,+).
@@ -227,6 +237,8 @@ internal class CoverageCubeMeshResources(
         capacity: Int,
         private val halfSize: Float,
         private val uploader: CoverageCubeVertexUploader,
+        private val onUploadSubmitted: (Int) -> Unit = {},
+        private val onUploadCallback: () -> Unit = {},
     ) {
         private val positionBuffer = ByteBuffer.allocateDirect(
             capacity * VERTICES_PER_VOXEL * POSITION_COMPONENTS * Float.SIZE_BYTES,
@@ -260,6 +272,9 @@ internal class CoverageCubeMeshResources(
             consumedCallbackMask = 0
             val uploadId = ++activeUploadId
             val vertexCount = snapshot.count * VERTICES_PER_VOXEL
+            onUploadSubmitted(
+                vertexCount * (POSITION_COMPONENTS * Float.SIZE_BYTES + COLOR_COMPONENTS),
+            )
             uploader.uploadPositions(positionBuffer, vertexCount * POSITION_COMPONENTS) {
                 consumed(uploadId, POSITION_CALLBACK)
             }
@@ -311,6 +326,7 @@ internal class CoverageCubeMeshResources(
         private fun consumed(uploadId: Long, callbackBit: Int) {
             if (destroyed || !uploadBusy || uploadId != activeUploadId) return
             if (consumedCallbackMask and callbackBit != 0) return
+            onUploadCallback()
             consumedCallbackMask = consumedCallbackMask or callbackBit
             if (consumedCallbackMask == BOTH_CALLBACKS) {
                 uploadBusy = false

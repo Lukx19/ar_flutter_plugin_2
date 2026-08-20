@@ -126,6 +126,7 @@ internal class SceneViewHost(
     private val engineRef = AtomicReference<Engine?>()
     private val cameraStreamRef = AtomicReference<ARCameraStream?>()
     private val frameCadenceTracker = FrameCadenceTracker()
+    private val rendererTelemetry = RendererTelemetry()
     private var disposed = false
     private val replaySettledTextureResize: Runnable = Runnable {
         if (disposed) return@Runnable
@@ -407,10 +408,20 @@ internal class SceneViewHost(
                         coverage.pointSizePx,
                     ) {
                         val pointResources = remember(engine, coverage.renderCapacity) {
-                            CoveragePointMeshResources(engine, coverage.renderCapacity)
+                            CoveragePointMeshResources(
+                                engine,
+                                coverage.renderCapacity,
+                                rendererTelemetry,
+                                "coverage-points",
+                            )
                         }
                         val centroidResources = remember(engine, coverage.renderCapacity) {
-                            CoveragePointMeshResources(engine, coverage.renderCapacity)
+                            CoveragePointMeshResources(
+                                engine,
+                                coverage.renderCapacity,
+                                rendererTelemetry,
+                                "coverage-centroids",
+                            )
                         }
                         val cubeResources = remember(
                             engine,
@@ -422,6 +433,8 @@ internal class SceneViewHost(
                                 engine,
                                 coverage.renderCapacity,
                                 coverage.voxelSizeMeters * coverage.cubeSizeFactor,
+                                rendererTelemetry,
+                                "coverage-cubes",
                             )
                         }
                         val pointMaterial = remember(materialLoader) {
@@ -657,6 +670,7 @@ internal class SceneViewHost(
         snapshot: CoveragePointRenderSnapshot?,
         config: PointCloudNativeConfig?,
     ) {
+        rendererTelemetry.beginRendererUpdate()
         if (snapshot == null || config == null) {
             coverageSnapshotRef.set(null)
             coverageMeshRef.get()?.updateCoverage(null)
@@ -680,6 +694,7 @@ internal class SceneViewHost(
     }
 
     fun updateRawPointCloud(snapshot: CoveragePointRenderSnapshot?) {
+        rendererTelemetry.beginRendererUpdate()
         rawPointSnapshotRef.set(snapshot)
         coverageMeshRef.get()?.updateRawPoints(snapshot)
     }
@@ -694,7 +709,7 @@ internal class SceneViewHost(
     }
 
     fun rendererPerformanceSnapshot(): Map<String, Any> =
-        frameCadenceTracker.snapshot()
+        frameCadenceTracker.snapshot() + rendererTelemetry.snapshot()
 
     fun visibilityGridDepthMode(): Config.DepthMode =
         visibilityGridDepthModeCache.current()
