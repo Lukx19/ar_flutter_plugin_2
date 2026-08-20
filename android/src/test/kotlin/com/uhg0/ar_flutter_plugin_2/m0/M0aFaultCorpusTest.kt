@@ -450,11 +450,25 @@ class M0aFaultCorpusTest {
                 }
             }
             assertEquals(mutations, rejected)
+            val exactResponseBytes = M0aPacketCodec.encodeResponse(
+                M0aPacketCodec.Response(
+                    messageKind = 1,
+                    responseFlags = 1,
+                    resultFlags = 0,
+                    errorId = 0,
+                    requestSequence = 1,
+                    streamToken = 7,
+                    nextExpectedRequestSequence = 2,
+                    payload = ByteArray(M0aPacketCodec.responseMaximumBytes - M0aPacketCodec.responseHeaderBytes),
+                ),
+                M0aPacketCodec.responseMaximumBytes,
+            ).size
+            assertEquals(M0aPacketCodec.responseMaximumBytes, exactResponseBytes)
             val stageSha256 = sha256(resourceBytes(stageFile))
             val executionId = sha256(
                 "T5\u0000$stage\u0000$runnerVersion\u0000$selector\u0000$stageSha256\u0000$index:$executedCases".toByteArray(),
             )
-            val json = """{"format":"proposal08-m0a-executable-receipt-v1","tier":"T5","stage":"$stage","executionId":"$executionId","runner":{"name":"android-gradle-jvm","version":"$runnerVersion","hostFingerprint":"$hostFingerprint"},"testSelector":"$selector","source":{"parentCommit":"$parentCommit","pluginCommit":"$pluginCommit"},"corpus":{"file":"docs/m0/m0a_crosslang_matrix_v2.json","sha256":"$corpusSha256","stage":"$stage","stageSha256":"$stageSha256"},"assertions":[{"id":"declared-cases-executed","predicate":"atLeast","actual":$executedCases,"expected":1},{"id":"stable-error-count","predicate":"equals","actual":${matrix.getValue("errorIds").jsonArray.size},"expected":150},{"id":"independent-stage-mutations","predicate":"equals","actual":$rejected,"expected":$mutations}],"measurements":{"executedDescriptors":$executedCases,"stableErrors":${matrix.getValue("errorIds").jsonArray.size},"mutationSeed":$seedText,"mutationCount":$mutations,"unexpectedAcceptances":${mutations - rejected}}}"""
+            val json = """{"format":"proposal08-m0a-executable-receipt-v1","tier":"T5","stage":"$stage","executionId":"$executionId","runner":{"name":"android-gradle-jvm","version":"$runnerVersion","hostFingerprint":"$hostFingerprint"},"testSelector":"$selector","source":{"parentCommit":"$parentCommit","pluginCommit":"$pluginCommit"},"corpus":{"file":"docs/m0/m0a_crosslang_matrix_v2.json","sha256":"$corpusSha256","stage":"$stage","stageSha256":"$stageSha256"},"assertions":[{"id":"declared-cases-executed","predicate":"atLeast","actual":$executedCases,"expected":1},{"id":"stable-error-count","predicate":"equals","actual":${matrix.getValue("errorIds").jsonArray.size},"expected":150},{"id":"independent-stage-mutations","predicate":"equals","actual":$rejected,"expected":$mutations}],"measurements":{"executedDescriptors":$executedCases,"stableErrors":${matrix.getValue("errorIds").jsonArray.size},"mutationSeed":$seedText,"mutationCount":$mutations,"unexpectedAcceptances":${mutations - rejected}},"candidateMeasurements":{"selected":{"candidateId":"T2-response-ceiling-16384","limit":16384,"observedWorst":$exactResponseBytes,"margin":${16384 - exactResponseBytes}},"nearest":{"candidateId":"T2-response-ceiling-16383","limit":16383,"observedWorst":$exactResponseBytes,"margin":${16383 - exactResponseBytes}}}}"""
             // The host persists only assertion-bearing records from raw Gradle
             // output; no follow-up command invents a verdict.
             println("M0A_EXECUTABLE_RECEIPT $json")
