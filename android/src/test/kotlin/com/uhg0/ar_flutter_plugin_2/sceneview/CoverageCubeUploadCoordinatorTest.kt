@@ -46,6 +46,28 @@ class CoverageCubeUploadCoordinatorTest {
     }
 
     @Test
+    fun `destroyed cube coordinator fences and reports callbacks without completing its upload`() {
+        val uploader = FakeCubeUploader()
+        var fencedCallbacks = 0
+        var completedUploads = 0
+        val coordinator = CoverageCubeMeshResources.CoverageCubeUploadCoordinator(
+            capacity = 1,
+            halfSize = 0.5f,
+            uploader = uploader,
+            onDestroyedUploadCallback = { fencedCallbacks++ },
+            onUploadCompleted = { completedUploads++ },
+        )
+
+        coordinator.submit(cubeSnapshot(1, floatArrayOf(1f, 1f, 1f)))
+        coordinator.onRendererFrame()
+        coordinator.destroy()
+        uploader.completeAll()
+
+        assertEquals("both Filament buffers are fenced after destruction", 2, fencedCallbacks)
+        assertEquals("a fenced callback cannot complete the destroyed upload", 0, completedUploads)
+    }
+
+    @Test
     fun `cube reset and checkpoint callbacks retain their page origins`() {
         val uploader = FakeCubeUploader()
         val submittedOrigins = mutableListOf<RendererUploadPageOrigin>()

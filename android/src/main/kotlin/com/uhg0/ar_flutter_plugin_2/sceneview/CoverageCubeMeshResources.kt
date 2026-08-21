@@ -69,6 +69,9 @@ internal class CoverageCubeMeshResources(
         onUploadCompletedAttributed = { elapsedNanos, origin ->
             telemetry?.recordUploadCompletion(elapsedNanos, origin)
         },
+        onDestroyedUploadCallback = {
+            telemetry?.recordFencedDestroyedUploadCallback()
+        },
         onUploadPageReleased = { onUploadPageReleased() },
     )
     private var indexStaging: java.nio.IntBuffer? = null
@@ -284,6 +287,7 @@ internal class CoverageCubeMeshResources(
         private val onUploadCallbackAttributed: (RendererUploadPageOrigin) -> Unit = {},
         private val onUploadCompleted: (Long) -> Unit = {},
         private val onUploadCompletedAttributed: (Long, RendererUploadPageOrigin) -> Unit = { _, _ -> },
+        private val onDestroyedUploadCallback: () -> Unit = {},
         private val onUploadPageReleased: () -> Unit = {},
         private val clockNanos: () -> Long = System::nanoTime,
     ) {
@@ -475,7 +479,11 @@ internal class CoverageCubeMeshResources(
         }
 
         private fun consumed(uploadId: Long, callbackBit: Int) {
-            if (destroyed || !uploadBusy || uploadId != activeUploadId) return
+            if (destroyed) {
+                onDestroyedUploadCallback()
+                return
+            }
+            if (!uploadBusy || uploadId != activeUploadId) return
             if (consumedCallbackMask and callbackBit != 0) return
             onUploadCallback()
             onUploadCallbackAttributed(activeOrigin)

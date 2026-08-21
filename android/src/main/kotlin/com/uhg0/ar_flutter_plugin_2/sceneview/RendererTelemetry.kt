@@ -115,6 +115,15 @@ internal class RendererTelemetry {
     fun recordUploadCompletion(elapsedNanos: Long) =
         recordUploadCompletion(elapsedNanos, RendererUploadPageOrigin.ORDINARY)
 
+    /**
+     * The platform-view recreation gate samples this process-scoped audit from
+     * its replacement view. A callback delivered after its owning coordinator
+     * is destroyed is fenced from renderer state and remains observable here.
+     */
+    fun recordFencedDestroyedUploadCallback() {
+        fencedDestroyedUploadCallbacks.incrementAndGet()
+    }
+
     private val ownedBufferBytes: Int
         get() = allocationsByOwner.values.sum()
 
@@ -136,6 +145,8 @@ internal class RendererTelemetry {
         "ordinaryCompletionCount" to ordinaryCompletionCount.get(),
         "lastUploadPageReason" to lastUploadPageReason,
         "lastUploadCompletionReason" to lastUploadCompletionReason,
+        "fencedDestroyedUploadCallbackCount" to
+            fencedDestroyedUploadCallbacks.get(),
         "meanUploadCompletionNanos" to if (completedUploadCount == 0) {
             0L
         } else {
@@ -155,6 +166,7 @@ internal class RendererTelemetry {
     internal companion object {
         const val ORDINARY_UPLOAD_LIMIT_BYTES = 64 * 1024
         const val RENDERER_ALLOCATION_LIMIT_BYTES = 8 * 1024 * 1024
+        private val fencedDestroyedUploadCallbacks = AtomicInteger()
     }
 }
 

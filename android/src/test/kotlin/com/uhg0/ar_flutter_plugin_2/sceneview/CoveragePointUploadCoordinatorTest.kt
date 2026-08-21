@@ -45,6 +45,27 @@ class CoveragePointUploadCoordinatorTest {
     }
 
     @Test
+    fun `destroyed coordinator fences and reports callbacks without completing its upload`() {
+        val uploader = FakeUploader()
+        var fencedCallbacks = 0
+        var completedUploads = 0
+        val coordinator = CoveragePointUploadCoordinator(
+            capacity = 2,
+            uploader = uploader,
+            onDestroyedUploadCallback = { fencedCallbacks++ },
+            onUploadCompleted = { completedUploads++ },
+        )
+
+        coordinator.submit(snapshot(1, 1f))
+        coordinator.onRendererFrame()
+        coordinator.destroy()
+        uploader.completeAll()
+
+        assertEquals("both Filament buffers are fenced after destruction", 2, fencedCallbacks)
+        assertEquals("a fenced callback cannot complete the destroyed upload", 0, completedUploads)
+    }
+
+    @Test
     fun `retained reset and checkpoint pages retain separate origins`() {
         val uploader = FakeUploader()
         val submittedOrigins = mutableListOf<RendererUploadPageOrigin>()
