@@ -130,7 +130,10 @@ internal class SceneViewHost(
     private val rendererTelemetry = RendererTelemetry()
     private val rendererAllocationLedger = CoverageRendererAllocationLedger(rendererTelemetry)
     private var disposed = false
-    private var rendererPaused = false
+    // SceneView dispatches session updates on its render callback while the
+    // platform channel pauses from the Android main thread. A volatile gate
+    // prevents a stale read from admitting extra upload frames after pause.
+    @Volatile private var rendererPaused = false
     private val replaySettledTextureResize: Runnable = Runnable {
         if (disposed) return@Runnable
         val textureView = composeView.findTextureView() ?: return@Runnable
