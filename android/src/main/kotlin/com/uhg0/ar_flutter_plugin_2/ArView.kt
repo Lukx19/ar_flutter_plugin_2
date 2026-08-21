@@ -26,6 +26,7 @@ import com.uhg0.ar_flutter_plugin_2.sceneview.PluginNodeSource
 import com.uhg0.ar_flutter_plugin_2.sceneview.PluginSessionConfig
 import com.uhg0.ar_flutter_plugin_2.sceneview.PluginTransform
 import com.uhg0.ar_flutter_plugin_2.sceneview.SceneViewHost
+import com.uhg0.ar_flutter_plugin_2.sceneview.BoundedReplyFence
 import com.uhg0.ar_flutter_plugin_2.sceneview.decompose
 import com.uhg0.ar_flutter_plugin_2.sceneview.resolveNodeUri
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridMethodChannel
@@ -80,9 +81,16 @@ internal class ArView(
     private var shutdownPrepared = false
     private var disposed = false
     private var coverageRendererMounted = false
-    private var resumeGeneration = 0L
-    private var pendingResume: Pair<Long, MethodChannel.Result>? = null
+    private val resumeReplyFence = BoundedReplyFence<ResumeTerminal>()
     private val pendingCloudOperations = mutableSetOf<() -> Unit>()
+
+    private enum class ResumeTerminal {
+        SUCCESS,
+        SUPERSEDED,
+        CANCELLED,
+        TIMEOUT,
+        FAILED,
+    }
 
     private val sceneHost = SceneViewHost(
         context = context,
@@ -201,13 +209,7 @@ internal class ArView(
     override fun dispose() {
         if (disposed) return
         disposed = true
-        resumeGeneration++
-        pendingResume?.second?.error(
-            "SESSION_RESUME_CANCELLED",
-            "AR view was disposed before Session.resume completed",
-            null,
-        )
-        pendingResume = null
+        resumeReplyFence.dispose(ResumeTerminal.CANCELLED)
         poseBatchDispatcher.clear()
         prepareForDispose()
         sessionChannel.setMethodCallHandler(null)
@@ -285,7 +287,6 @@ internal class ArView(
                     result.success(null)
                 }
                 "enableCamera", "resumeSession" -> {
-                    sessionPausedByFlutter = false
                     resumeSessionBounded(result)
                 }
                 "dispose" -> {
@@ -300,33 +301,54 @@ internal class ArView(
     }
 
     private fun resumeSessionBounded(result: MethodChannel.Result) {
-        val generation = ++resumeGeneration
-        pendingResume?.second?.error(
-            "SESSION_RESUME_SUPERSEDED",
-            "A newer resume request replaced this request",
-            null,
+        val generation = resumeReplyFence.begin(
+            next = { terminal ->
+                when (terminal) {
+                    ResumeTerminal.SUCCESS -> {
+                        sessionPausedByFlutter = false
+                        visibilityGridChannel.resume()
+                        captureSession.onSessionResumed()
+                        result.success(null)
+                    }
+                    ResumeTerminal.SUPERSEDED -> result.error(
+                        "SESSION_RESUME_SUPERSEDED",
+                        "A newer resume request replaced this request",
+                        null,
+                    )
+                    ResumeTerminal.CANCELLED -> result.error(
+                        "SESSION_RESUME_CANCELLED",
+                        "AR view was disposed before Session.resume completed",
+                        null,
+                    )
+                    ResumeTerminal.TIMEOUT -> result.error(
+                        "SESSION_RESUME_TIMEOUT",
+                        "Session.resume exceeded the 5000ms native bound",
+                        null,
+                    )
+                    ResumeTerminal.FAILED -> result.error(
+                        "SESSION_RESUME_FAILED",
+                        "Session.resume failed",
+                        null,
+                    )
+                }
+            },
+            superseded = ResumeTerminal.SUPERSEDED,
         )
-        pendingResume = generation to result
         scope.launch {
             val failure = runCatching {
                 withTimeout(5_000) {
                     withContext(Dispatchers.Default) { sceneHost.resume() }
                 }
             }.exceptionOrNull()
-            if (disposed || pendingResume?.first != generation) return@launch
-            val reply = pendingResume?.second ?: return@launch
-            pendingResume = null
             if (failure == null) {
-                visibilityGridChannel.resume()
-                captureSession.onSessionResumed()
-                reply.success(null)
+                resumeReplyFence.settle(generation, ResumeTerminal.SUCCESS)
             } else {
-                val code = if (failure is TimeoutCancellationException) {
-                    "SESSION_RESUME_TIMEOUT"
+                val terminal = if (failure is TimeoutCancellationException) {
+                    ResumeTerminal.TIMEOUT
                 } else {
-                    "SESSION_RESUME_FAILED"
+                    ResumeTerminal.FAILED
                 }
-                reply.error(code, failure.message ?: "Session.resume failed", null)
+                resumeReplyFence.settle(generation, terminal)
             }
         }
     }
