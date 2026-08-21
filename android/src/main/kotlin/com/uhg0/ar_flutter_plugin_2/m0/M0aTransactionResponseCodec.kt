@@ -97,7 +97,7 @@ object M0aTransactionResponseCodecV1 {
         return when (response.messageKind) {
             beginMessageKind -> {
                 require(response.payload.size == 8 && response.transactionId > 0)
-                require(response.baseGeometryRevision > 0)
+                require(response.baseGeometryRevision >= 0)
                 require(response.targetGeometryRevision > 0 && response.targetLineageRevision > 0)
                 M0aTransactionBeginFrameV1(
                     M0aTransactionBeginV1(

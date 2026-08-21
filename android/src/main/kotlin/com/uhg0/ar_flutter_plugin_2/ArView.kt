@@ -31,9 +31,8 @@ import com.uhg0.ar_flutter_plugin_2.sceneview.decompose
 import com.uhg0.ar_flutter_plugin_2.sceneview.resolveNodeUri
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridMethodChannel
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridRuntimeCapabilities
-import com.uhg0.ar_flutter_plugin_2.m0.M0aControlLifecycle
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridV2Binding
 import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineAuthority
-import com.uhg0.ar_flutter_plugin_2.m0.M0aVisibilitySurfaceStreamChannel
 import com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraCapabilityQuerier
 import io.flutter.FlutterInjector
 import io.flutter.plugin.common.BinaryMessenger
@@ -47,7 +46,6 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.util.concurrent.Executors
 
 /** SceneView 4.21.2 platform-view implementation. Flutter channels remain unchanged. */
 internal class ArView(
@@ -112,14 +110,11 @@ internal class ArView(
         onNodeGesture = ::onNodeGesture,
     )
     private lateinit var visibilityGridChannel: VisibilityGridMethodChannel
-    // M0a is a reference seam until the locked decision record selects V2.
-    // Keep it out of release builds so an incomplete V2 transport cannot
-    // become observable product behavior.
-    private var m0aSurfaceStreamChannel: M0aVisibilitySurfaceStreamChannel? = null
-    private val m0aControlLifecycle = M0aControlLifecycle(
+    private val visibilityGridV2Binding = VisibilityGridV2Binding(
+        messenger = messenger,
+        viewId = id,
         committedBaselineAuthority = m0aCommittedBaselineAuthority,
     )
-    private val m0aExecutor = Executors.newSingleThreadExecutor()
 
     init {
         visibilityGridChannel = VisibilityGridMethodChannel(
@@ -138,18 +133,7 @@ internal class ArView(
             },
             render = sceneHost::updateCoverageRenderer,
             renderRawPoints = sceneHost::updateRawPointCloud,
-            m0aControlLifecycle = m0aControlLifecycle,
-            sharedExecutor = m0aExecutor,
         )
-        if (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
-            m0aSurfaceStreamChannel = M0aVisibilitySurfaceStreamChannel(
-                messenger = messenger,
-                viewId = id,
-                workerExecutor = m0aExecutor,
-                shutdownWorkerOnDispose = false,
-                controlLifecycle = m0aControlLifecycle,
-            )
-        }
     }
 
     private val captureSession = ArCaptureSession(
@@ -236,7 +220,7 @@ internal class ArView(
         anchorChannel.setMethodCallHandler(null)
         captureChannel.setMethodCallHandler(null)
         visibilityGridChannel.dispose()
-        m0aSurfaceStreamChannel?.dispose()
+        visibilityGridV2Binding.dispose()
         lifecycle.removeObserver(lifecycleObserver)
         captureSession.dispose()
         pendingCloudOperations.toList().forEach { it() }

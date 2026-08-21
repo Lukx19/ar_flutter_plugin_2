@@ -7,14 +7,25 @@ import Foundation
 /// remains a separate ticket.
 protocol M0PortableSurfaceStreamInterface {
     func exchange(request: Data) async throws -> Data
-    func stop() async
+    func stop(request: Data) async throws -> Data
 }
 
 /// Declaration-only future iOS seam for control, replay, and lifecycle.
 protocol M0PortableControlInterface {
     func start(request: Data) async throws -> Data
-    func replay(request: Data) async throws -> Data
-    func stop() async
+    func beginCheckpoint(request: Data) async throws -> Data
+    func releaseCheckpoint(request: Data) async throws -> Data
+    func stop(request: Data) async throws -> Data
+}
+
+/// Declaration-only production V2 binding seam. Implementing these methods,
+/// registering channels, or decoding packets on Apple platforms is deferred.
+protocol VisibilityGridV2BindingInterface {
+    func start(request: Data) async throws -> Data
+    func exchange(request: Data) async throws -> Data
+    func beginCheckpoint(request: Data) async throws -> Data
+    func releaseCheckpoint(request: Data) async throws -> Data
+    func stop(request: Data) async throws -> Data
 }
 
 /// Wire constants shared by the future interface and the executable Android
@@ -26,6 +37,50 @@ enum M0PortableInterfaceConstants {
     static let controlResponseMagic = "VGD2"
     static let maximumRequestBytes = 16 * 1024
     static let maximumDiagnosticBytes = 1024
+    static let exchangeRequestHeaderBytes = 80
+    static let exchangeResponseHeaderBytes = 112
+    static let controlRequestHeaderBytes = 104
+    static let controlResponseHeaderBytes = 128
+    static let startRequestBytes = 464
+    static let startResultBytes = 184
+}
+
+/// Shape-only immutable group and runtime-binding identity.
+struct VisibilityGridV2BindingIdentity {
+    let sessionID: UUID
+    let sessionGeneration: UInt64
+    let captureGroupID: UUID
+    let groupGeneration: UInt64
+    let coverageEpoch: UInt64
+    let streamToken: UInt64
+    let bindingGeneration: UInt64
+}
+
+/// Shape-only control receipt shared by START/checkpoint/release/stop.
+struct VisibilityGridV2ControlReceiptDescriptor {
+    let operation: UInt8
+    let controlRequestID: UUID
+    let binding: VisibilityGridV2BindingIdentity
+    let requestAccepted: Bool
+    let authorityMutated: Bool
+    let nextExchangeRequestSequence: UInt64
+    let nativeTransactionID: UInt64
+    let payload: Data
+}
+
+/// Shape-only START payload. Matrices are declared as fixed-convention lanes;
+/// no validation, codec, or ARKit adapter is implemented here.
+struct VisibilityGridV2StartDescriptor {
+    let minimumMinor: UInt16
+    let maximumMinor: UInt16
+    let persistenceSchema: UInt16
+    let requiredCapabilities: UInt64
+    let desiredCapabilities: UInt64
+    let groupFromWorldColumnMajor: [Double]
+    let worldFromGroupColumnMajor: [Double]
+    let restoredRevisionVector: [UInt64]
+    let schemaRootSHA256: Data
+    let manifestRootSHA256: Data
 }
 
 /// Shape-only DTO for a future native response handoff.

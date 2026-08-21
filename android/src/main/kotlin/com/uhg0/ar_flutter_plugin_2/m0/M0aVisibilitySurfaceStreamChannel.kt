@@ -61,6 +61,7 @@ class M0aVisibilitySurfaceStreamChannel(
     private val timeoutScheduler: M0aTimeoutScheduler = M0aTimeoutScheduler.real(),
     private val beforeWorkerProcessing: (() -> Unit)? = null,
     private val controlLifecycle: M0aControlLifecycle? = null,
+    private val onExecutorOperation: ((String) -> Unit)? = null,
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val channel = BasicMessageChannel<ByteBuffer>(
@@ -220,6 +221,7 @@ class M0aVisibilitySurfaceStreamChannel(
                     telemetry.dequeued()
                     try {
                         val response = synchronized(this) {
+                            onExecutorOperation?.invoke("exchange")
                             beforeWorkerProcessing?.invoke()
                             if (disposed.get()) {
                                 if (pendingReply.tryClaim()) {

@@ -5,9 +5,8 @@ import 'package:flutter_test/flutter_test.dart';
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
-  test('dispose fences only the M0a binding on the registered channel',
-      () async {
-    const channel = MethodChannel('arpointcloud_41');
+  test('dispose fences only the V2 binding on its dedicated channel', () async {
+    const channel = MethodChannel('visibility_grid_v2_control_41');
     final methods = <String>[];
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (call) async {
@@ -21,6 +20,6 @@ void main() {
 
     await ARVisibilityGridV2Control(41).dispose();
 
-    expect(methods, <String>['disposeM0aBinding']);
+    expect(methods, <String>['disposeBinding']);
   });
 }

@@ -230,9 +230,11 @@ class M0aStructuralTransactionReceiverV1(
     }
 
     private fun validateBegin(value: M0aTransactionBeginV1) {
+        require(value.baseGeometryRevision >= 0) {
+            "baseGeometryRevision is outside PortableOrdinal"
+        }
         listOf(
             "transactionId" to value.transactionId,
-            "baseGeometryRevision" to value.baseGeometryRevision,
             "targetGeometryRevision" to value.targetGeometryRevision,
             "targetLineageRevision" to value.targetLineageRevision,
         ).forEach { (name, number) -> require(number > 0) { "$name is outside PortableOrdinal" } }

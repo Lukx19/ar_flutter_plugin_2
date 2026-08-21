@@ -89,6 +89,29 @@ class M0aTransactionReferenceTest {
     }
 
     @Test
+    fun `fresh binding transaction advances from zero committed geometry`() {
+        val frames = M0aStructuralTransactionProducerV1.produce(
+            transactionId = 1,
+            baseGeometryRevision = 0,
+            targetGeometryRevision = 1,
+            targetLineageRevision = 1,
+            bytes = byteArrayOf(),
+        )
+        val receiver = M0aStructuralTransactionReceiverV1()
+
+        receiver.begin((frames[0] as M0aTransactionBeginFrameV1).value)
+        receiver.acknowledgeBegin(M0aTransactionBeginAcknowledgementV1(1, 1, 1))
+        receiver.commit((frames[1] as M0aTransactionCommitFrameV1).value)
+        receiver.acknowledgeCommit(M0aTransactionAcknowledgementV1(1, 1, 1))
+
+        assertEquals(M0aStructuralTransactionState.READY, receiver.state)
+        assertEquals(1L, receiver.visibleTransactionId)
+        assertEquals(1L, receiver.visibleGeometryRevision)
+        assertEquals(1L, receiver.visibleLineageRevision)
+        assertTrue(receiver.visibleBytes.isEmpty())
+    }
+
+    @Test
     fun `structural frames round trip through the packed response envelope`() {
         val frames = M0aStructuralTransactionProducerV1.produce(
             transactionId = 3,
