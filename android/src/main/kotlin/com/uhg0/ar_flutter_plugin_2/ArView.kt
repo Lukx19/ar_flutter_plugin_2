@@ -184,6 +184,7 @@ internal class ArView(
 
     private val lifecycleObserver = object : DefaultLifecycleObserver {
         override fun onPause(owner: LifecycleOwner) {
+            resumeCoordinator.invalidate(ResumeTerminal.SUPERSEDED)
             visibilityGridChannel.pause()
             captureSession.onSessionPaused()
             sceneHost.pause()
@@ -302,6 +303,7 @@ internal class ArView(
                 // callers use disableCamera/enableCamera.
                 "disableCamera", "pauseSession" -> {
                     sessionPausedByFlutter = true
+                    resumeCoordinator.invalidate(ResumeTerminal.SUPERSEDED)
                     visibilityGridChannel.pause()
                     captureSession.onSessionPaused()
                     sceneHost.pause()

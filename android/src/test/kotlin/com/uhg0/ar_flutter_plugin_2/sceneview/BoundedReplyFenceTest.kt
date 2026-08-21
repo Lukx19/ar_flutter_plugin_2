@@ -74,6 +74,51 @@ class BoundedReplyFenceTest {
         operations.single().invoke()
         assertEquals(listOf("resume", "pause", "dispose"), effects)
     }
+
+    @Test fun `pause fences a stalled resume before its success and serializes a later resume`() {
+        val operations = mutableListOf<() -> Unit>()
+        val deadlines = mutableListOf<() -> Unit>()
+        val terminals = mutableListOf<String>()
+        val effects = mutableListOf<String>()
+        val coordinator = BoundedOperationCoordinator<String>(
+            launchOperation = operations::add,
+            scheduleDeadline = { _, deadline -> deadlines += deadline },
+            dispatchTerminal = { terminal -> terminal() },
+        )
+        coordinator.begin(
+            timeoutMillis = 1,
+            next = terminals::add,
+            superseded = "superseded",
+            timedOut = "timeout",
+            failed = "failed",
+            succeeded = "success",
+            operation = { effects += "resume-1" },
+            rollbackLateSuccess = { effects += "rollback-1" },
+        )
+        coordinator.invalidate("superseded")
+        // The host performs this pause synchronously with invalidation.
+        effects += "pause"
+        coordinator.begin(
+            timeoutMillis = 1,
+            next = terminals::add,
+            superseded = "superseded",
+            timedOut = "timeout",
+            failed = "failed",
+            succeeded = "success",
+            operation = { effects += "resume-2" },
+            rollbackLateSuccess = { effects += "rollback-2" },
+        )
+        assertEquals(1, operations.size)
+        operations.single().invoke()
+        assertEquals(listOf("resume-1", "pause", "rollback-1"), effects)
+        assertEquals(2, operations.size)
+        operations.last().invoke()
+        assertEquals(
+            listOf("resume-1", "pause", "rollback-1", "resume-2"),
+            effects,
+        )
+        assertEquals(listOf("superseded", "success"), terminals)
+    }
     @Test fun `success replies exactly once`() {
         val values = mutableListOf<String>(); val fence = BoundedReplyFence<String>()
         val token = fence.begin(values::add, "superseded")

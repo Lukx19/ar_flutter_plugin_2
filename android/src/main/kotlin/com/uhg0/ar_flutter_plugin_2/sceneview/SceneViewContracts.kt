@@ -356,6 +356,25 @@ internal class BoundedOperationCoordinator<T>(
         if (drainNow) onDrained()
     }
 
+    /**
+     * Fence a currently stalled operation and discard a queued successor.
+     * The running native call cannot be interrupted, so its eventual success
+     * still reaches [launch] and is rolled back before another queued resume
+     * is allowed to start.  This is the lifecycle pause boundary.
+     */
+    fun invalidate(invalidated: T) {
+        val tokens = mutableListOf<Long>()
+        synchronized(lock) {
+            running?.let { tokens += it.token }
+            queued?.let {
+                it.abandonedBeforeStart = true
+                tokens += it.token
+            }
+            queued = null
+        }
+        tokens.forEach { fence.settle(it, invalidated) }
+    }
+
     private fun launch(pending: Operation<T>) {
         launchOperation {
             val success = runCatching(pending.operation).isSuccess
