@@ -1,6 +1,8 @@
 package com.uhg0.ar_flutter_plugin_2.sceneview
 
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererCoverage
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
@@ -18,7 +20,7 @@ class CoverageRendererSelectionTest {
         assertEquals(2_000, CoverageRendererLimits.RAW_POINT_CAPACITY)
         assertEquals(20_000, CoverageRendererLimits.CENTROID_CAPACITY)
         assertEquals(8_000, CoverageRendererLimits.CUBE_CAPACITY)
-        assertEquals(7_486_208, CoverageRendererLimits.maximumActiveRendererBytes)
+        assertEquals(8_382_208, CoverageRendererLimits.maximumActiveRendererBytes)
         assertTrue(
             CoverageRendererLimits.maximumActiveRendererBytes <=
                 CoverageRendererLimits.SHARED_OWNED_BUFFER_LIMIT_BYTES,
@@ -155,6 +157,39 @@ class CoverageRendererSelectionTest {
         assertEquals(false, checkNotNull(bounded.update).reset)
         assertEquals(0, bounded.update.spans.single().startSlot)
         assertArrayEquals(floatArrayOf(11f, 0f, 0f), bounded.update.spans.single().positions, 0f)
+    }
+
+    @Test
+    fun `presentation selection preserves style rows with their stable identities`() {
+        val uncovered = CoverageRendererStyleRowV1().encode()
+        val complete = CoverageRendererStyleRowV1(
+            semanticGeneration = 3,
+            styleGeneration = 4,
+            coverage = CoverageRendererCoverage.COMPLETE,
+        ).encode()
+        val snapshot = CoveragePointRenderSnapshot(
+            revision = 7,
+            enabled = true,
+            capacity = 3,
+            count = 3,
+            keys = longArrayOf(30, 10, 20),
+            positions = FloatArray(9),
+            colors = intArrayOf(30, 10, 20),
+            styleRows = uncovered + complete + uncovered,
+        )
+
+        val bounded = snapshot.boundedForPresentation(2)
+
+        assertArrayEquals(longArrayOf(10, 20), bounded.keys)
+        assertEquals(
+            CoverageRendererCoverage.COMPLETE,
+            CoverageRendererStyleRowV1.decode(bounded.styleRows).coverage,
+        )
+        assertEquals(
+            CoverageRendererCoverage.UNCOVERED,
+            CoverageRendererStyleRowV1.decode(bounded.styleRows, 16).coverage,
+        )
+        assertArrayEquals(bounded.styleRows, bounded.update!!.spans.single().styleRows)
     }
 
     @Test

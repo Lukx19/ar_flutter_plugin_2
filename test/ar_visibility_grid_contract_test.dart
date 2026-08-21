@@ -385,7 +385,41 @@ void main() {
       );
     });
 
-    test('encodes a color-only visibility patch', () {
+    test('encodes a bounded semantic style visibility patch', () {
+      final style = ARCoverageRendererStyleRowV1(
+        semanticGeneration: 0xffffffff,
+        styleGeneration: 17,
+        semantic: ARCoverageRendererSemantic.ambiguous,
+        coverage: ARCoverageRendererCoverage.partial,
+        palette: ARCoverageRendererPalette.direction,
+        cut: ARCoverageRendererCut.indeterminateHistory,
+        residency: ARCoverageRendererResidency.warmL1,
+        target: ARCoverageRendererTarget.halo,
+        directionBin: 23,
+        glyph: ARCoverageRendererGlyph.viewRose,
+        lineageCount: 0xffff,
+        age: ARCoverageRendererAge.old,
+        sourceHealth: ARCoverageRendererSourceHealth.featureOnly,
+      );
+      expect(style.encode(), <int>[
+        1,
+        149,
+        72,
+        31,
+        23,
+        0,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        17,
+        0,
+        0,
+        0,
+      ]);
+      expect(ARCoverageRendererStyleRowV1.decode(style.encode()), style);
       final patch = ARVisibilityGridVisibilityPatch(
         groupId: 'group-1',
         groupGeneration: 7,
@@ -393,7 +427,7 @@ void main() {
         geometryRevision: 4,
         visibilityRevision: 9,
         keys: Int64List.fromList(<int>[10, 20]),
-        colors: Int32List.fromList(<int>[0xFFFF0000, 0xFF00FF00]),
+        styles: <ARCoverageRendererStyleRowV1>[style, style],
       );
 
       final map = patch.toMap();
@@ -401,11 +435,12 @@ void main() {
       expect(map['geometryRevision'], 4);
       expect(map['visibilityRevision'], 9);
       expect(map['keys'], <int>[10, 20]);
-      expect(map['colors'], <int>[-65536, -16711936]);
+      expect(map['styles'], <int>[...style.encode(), ...style.encode()]);
+      expect(map, isNot(contains('colors')));
       expect(map, isNot(contains('positions')));
     });
 
-    test('rejects visibility keys and colors with different lengths', () {
+    test('rejects visibility keys and styles with different lengths', () {
       expect(
         () => ARVisibilityGridVisibilityPatch(
           groupId: 'group-1',
@@ -414,7 +449,7 @@ void main() {
           geometryRevision: 4,
           visibilityRevision: 9,
           keys: Int64List.fromList(<int>[10]),
-          colors: Int32List(0),
+          styles: <ARCoverageRendererStyleRowV1>[],
         ),
         throwsArgumentError,
       );
@@ -429,9 +464,29 @@ void main() {
           geometryRevision: 4,
           visibilityRevision: 9,
           keys: Int64List.fromList(<int>[10, 10]),
-          colors: Int32List.fromList(<int>[0xFFFF0000, 0xFF00FF00]),
+          styles: <ARCoverageRendererStyleRowV1>[
+            ARCoverageRendererStyleRowV1(),
+            ARCoverageRendererStyleRowV1(),
+          ],
         ),
         throwsArgumentError,
+      );
+    });
+
+    test('rejects reserved renderer style codes and invalid glyph cuts', () {
+      expect(
+        () => ARCoverageRendererStyleRowV1(
+          directionBin: 0,
+          glyph: ARCoverageRendererGlyph.none,
+        ),
+        throwsArgumentError,
+      );
+      expect(
+        () => ARCoverageRendererStyleRowV1.decode(
+          Uint8List.fromList(
+              <int>[1, 0, 0x80, 0, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        ),
+        throwsFormatException,
       );
     });
   });

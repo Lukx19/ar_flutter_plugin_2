@@ -3,6 +3,7 @@ package com.uhg0.ar_flutter_plugin_2.sceneview
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan
+import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.DirtyRowQueue
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.LongRowIndex
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.SelectedKeyMaxHeap
@@ -19,9 +20,9 @@ internal object CoverageRendererLimits {
     const val SHARED_OWNED_BUFFER_LIMIT_BYTES = 8 * 1024 * 1024
 
     // Fixed, renderer-owned native selection rows: key, world position,
-    // colour, and slot/revision bookkeeping. The semantic grid's 100k state
+    // colour, 16-byte semantic/style cut, and slot/revision bookkeeping. The semantic grid's 100k state
     // is deliberately not charged here; it belongs to M0b's 16 MiB ledger.
-    const val NATIVE_SELECTION_BYTES_PER_ROW = 32
+    const val NATIVE_SELECTION_BYTES_PER_ROW = 48
     const val NATIVE_SELECTION_BYTES = CENTROID_CAPACITY * NATIVE_SELECTION_BYTES_PER_ROW
     const val AUXILIARY_ROW_BYTES = 16
     const val AUXILIARY_BYTES =
@@ -32,8 +33,8 @@ internal object CoverageRendererLimits {
     // coordinator may retain both its in-flight and coalesced-next cube
     // presentation snapshots. These copies are deliberately charged rather
     // than treated as invisible JVM transients.
-    const val SEMANTIC_SNAPSHOT_BYTES = CENTROID_CAPACITY * 24
-    const val CUBE_PRESENTATION_SNAPSHOT_BYTES = CUBE_CAPACITY * 24
+    const val SEMANTIC_SNAPSHOT_BYTES = CENTROID_CAPACITY * 40
+    const val CUBE_PRESENTATION_SNAPSHOT_BYTES = CUBE_CAPACITY * 40
     const val CUBE_SNAPSHOT_HANDOFF_BYTES =
         SEMANTIC_SNAPSHOT_BYTES + CUBE_PRESENTATION_SNAPSHOT_BYTES * 2
     const val CENTROID_SNAPSHOT_HANDOFF_BYTES =
@@ -87,6 +88,8 @@ internal class CoveragePresentationSelector(
     private val selectedPositions =
         FloatArray(presentationCapacity * CoveragePointMeshResources.POSITION_COMPONENTS)
     private val selectedColors = IntArray(presentationCapacity)
+    private val selectedStyleRows =
+        ByteArray(presentationCapacity * COVERAGE_RENDERER_STYLE_ROW_BYTES)
     private val selectedKeyToDestination = LongRowIndex(presentationCapacity)
     private val selectedKeyMaxHeap = SelectedKeyMaxHeap(presentationCapacity)
     private val freeDestinations = IntArray(presentationCapacity) { presentationCapacity - it - 1 }
@@ -96,6 +99,7 @@ internal class CoveragePresentationSelector(
     private var sourceCount = 0
     private var sourceSlotToDestination = IntArray(0)
     private var initialized = false
+    private var styleRowsPresent = false
 
     init {
         require(presentationCapacity > 0)
@@ -103,6 +107,7 @@ internal class CoveragePresentationSelector(
 
     fun select(snapshot: CoveragePointRenderSnapshot): CoveragePointRenderSnapshot {
         validate(snapshot)
+        styleRowsPresent = snapshot.styleRows.isNotEmpty()
         ensureSourceCapacity(snapshot.capacity)
         val sourceRewritten = initialized && selectedIdentityChanged(snapshot)
         if (!initialized || sourceRewritten || snapshot.count < sourceCount) {
@@ -244,6 +249,7 @@ internal class CoveragePresentationSelector(
                         (firstDestination + run) * CoveragePointMeshResources.POSITION_COMPONENTS,
                     ),
                     colors = selectedColors.copyOfRange(firstDestination, firstDestination + run),
+                    styleRows = selectedStyleRange(firstDestination, firstDestination + run),
                 )
             }
         }
@@ -271,6 +277,14 @@ internal class CoveragePresentationSelector(
             endIndex = (source + 1) * CoveragePointMeshResources.POSITION_COMPONENTS,
         )
         selectedColors[destination] = snapshot.colors[source]
+        if (snapshot.styleRows.isNotEmpty()) {
+            snapshot.styleRows.copyInto(
+                selectedStyleRows,
+                destination * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                source * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                (source + 1) * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+            )
+        }
     }
 
     private fun presentation(
@@ -285,6 +299,7 @@ internal class CoveragePresentationSelector(
             selectedCount * CoveragePointMeshResources.POSITION_COMPONENTS,
         ),
         colors = selectedColors.copyOf(selectedCount),
+        styleRows = selectedStyleRange(0, selectedCount),
         update = CoveragePointRenderUpdate(
             geometryRevision = source.update?.geometryRevision ?: source.revision,
             visibilityRevision = source.update?.visibilityRevision ?: source.revision,
@@ -304,6 +319,7 @@ internal class CoveragePresentationSelector(
                         selectedCount * CoveragePointMeshResources.POSITION_COMPONENTS,
                     ),
                     selectedColors.copyOf(selectedCount),
+                    selectedStyleRange(0, selectedCount),
                 ),
             )
         }
@@ -322,6 +338,7 @@ internal class CoveragePresentationSelector(
                     endExclusive * CoveragePointMeshResources.POSITION_COMPONENTS,
                 ),
                 colors = selectedColors.copyOfRange(start, endExclusive),
+                styleRows = selectedStyleRange(start, endExclusive),
             )
         }
         for (index in 1 until destinations.size) {
@@ -346,7 +363,17 @@ internal class CoveragePresentationSelector(
         require(snapshot.keys.size == snapshot.count)
         require(snapshot.positions.size == snapshot.count * CoveragePointMeshResources.POSITION_COMPONENTS)
         require(snapshot.colors.size == snapshot.count)
+        require(
+            snapshot.styleRows.isEmpty() ||
+                snapshot.styleRows.size == snapshot.count * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+        )
     }
+
+    private fun selectedStyleRange(start: Int, endExclusive: Int): ByteArray =
+        if (!styleRowsPresent) ByteArray(0) else selectedStyleRows.copyOfRange(
+            start * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+            endExclusive * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+        )
 
     private fun siftUp(heap: IntArray, start: Int, keys: LongArray) {
         var child = start

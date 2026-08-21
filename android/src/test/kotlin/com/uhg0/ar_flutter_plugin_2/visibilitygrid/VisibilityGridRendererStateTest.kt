@@ -1,5 +1,11 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
+import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererCoverage
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererCut
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererGlyph
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -76,24 +82,92 @@ class VisibilityGridRendererStateTest {
     }
 
     @Test
-    fun `visibility patches are revision exact atomic and geometry only`() {
+    fun `visibility patches carry bounded style cuts and reject stale generations`() {
         val state = VisibilityGridRendererState(capacity = 2)
         val key = packVisibilityGridKey(0, 0, 0)
         state.startGroup(group(2), geometryRevision = 4, restoredKeys = longArrayOf(key))
-        val green = 0xFF00FF00.toInt()
+        val complete = CoverageRendererStyleRowV1(
+            semanticGeneration = 8,
+            styleGeneration = 3,
+            coverage = CoverageRendererCoverage.COMPLETE,
+            palette = CoverageRendererPalette.COVERAGE,
+        )
 
-        assertFalse(state.applyVisibility(3, 1, longArrayOf(key), intArrayOf(green)))
+        assertFalse(state.applyVisibility(3, 1, longArrayOf(key), styles(complete)))
         assertTrue(
             state.applyVisibility(
                 4,
                 1,
                 longArrayOf(key, packVisibilityGridKey(1, 0, 0)),
-                intArrayOf(green, green),
+                styles(complete, complete),
             ),
         )
         assertEquals(1, state.ignoredDeletedVisibilityKeys)
-        assertEquals(green, state.snapshot().colors.single())
-        assertFalse(state.applyVisibility(4, 1, longArrayOf(key), intArrayOf(0)))
+        val snapshot = state.snapshot()
+        assertEquals(0xFF00C853.toInt(), snapshot.colors.single())
+        assertEquals(complete, CoverageRendererStyleRowV1.decode(snapshot.styleRows))
+        assertFalse(state.applyVisibility(4, 1, longArrayOf(key), styles(complete)))
+        assertFalse(
+            state.applyVisibility(
+                4,
+                2,
+                longArrayOf(key),
+                styles(complete.copy(semanticGeneration = 7, styleGeneration = 4)),
+            ),
+        )
+        assertFalse(
+            state.applyVisibility(
+                4,
+                2,
+                longArrayOf(key),
+                styles(complete.copy(styleGeneration = 2)),
+            ),
+        )
+    }
+
+    @Test
+    fun `pending indeterminate direction and unavailable cuts reach production spans`() {
+        val state = VisibilityGridRendererState(capacity = 4)
+        val keys = LongArray(4) { packVisibilityGridKey(it, 0, 0) }
+        state.startGroup(group(4), geometryRevision = 1, restoredKeys = keys)
+        val rows = arrayOf(
+            CoverageRendererStyleRowV1(
+                semanticGeneration = 1,
+                styleGeneration = 1,
+                cut = CoverageRendererCut.COVERAGE_PENDING,
+            ),
+            CoverageRendererStyleRowV1(
+                semanticGeneration = 1,
+                styleGeneration = 1,
+                cut = CoverageRendererCut.INDETERMINATE_HISTORY,
+            ),
+            CoverageRendererStyleRowV1(
+                semanticGeneration = 1,
+                styleGeneration = 1,
+                palette = CoverageRendererPalette.DIRECTION,
+                directionBin = 23,
+                glyph = CoverageRendererGlyph.DESIRED_DIRECTION,
+            ),
+            CoverageRendererStyleRowV1(
+                semanticGeneration = 1,
+                styleGeneration = 1,
+                cut = CoverageRendererCut.UNAVAILABLE,
+            ),
+        )
+
+        assertTrue(state.applyVisibility(1, 1, keys, styles(*rows)))
+        val snapshot = state.snapshot()
+        assertEquals(keys.size * COVERAGE_RENDERER_STYLE_ROW_BYTES, snapshot.styleRows.size)
+        assertArrayEquals(
+            intArrayOf(
+                0xFFFFA000.toInt(),
+                0xFF616161.toInt(),
+                0xFF26A69A.toInt(),
+                0x00000000,
+            ),
+            snapshot.colors,
+        )
+        assertArrayEquals(snapshot.styleRows, snapshot.update!!.spans.single().styleRows)
     }
 
     @Test
@@ -109,8 +183,9 @@ class VisibilityGridRendererStateTest {
 
         assertArrayEquals(longArrayOf(key), state.snapshot().keys)
         assertEquals(11, state.currentVisibilityRevision)
-        assertFalse(state.applyVisibility(7, 11, longArrayOf(key), intArrayOf(0)))
-        assertTrue(state.applyVisibility(7, 12, longArrayOf(key), intArrayOf(0)))
+        val baseline = CoverageRendererStyleRowV1()
+        assertFalse(state.applyVisibility(7, 11, longArrayOf(key), styles(baseline)))
+        assertTrue(state.applyVisibility(7, 12, longArrayOf(key), styles(baseline)))
         assertTrue(state.applyGeometry(8, false, longArrayOf(), longArrayOf(key)))
         assertEquals(1, state.freeRowCount)
         state.dispose()
@@ -183,4 +258,7 @@ class VisibilityGridRendererStateTest {
             restoredGeometryRevision = 0,
             restoredKeys = longArrayOf(),
         )
+
+    private fun styles(vararg rows: CoverageRendererStyleRowV1): ByteArray =
+        rows.fold(ByteArray(0)) { bytes, row -> bytes + row.encode() }
 }

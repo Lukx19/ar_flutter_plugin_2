@@ -3,6 +3,8 @@ package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan
+import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import com.uhg0.ar_flutter_plugin_2.pointcloud.identityGridRotation
 
@@ -30,6 +32,7 @@ class VisibilityGridRendererState(
     private val keys = LongArray(capacity)
     private val positions = FloatArray(capacity * 3)
     private val colors = IntArray(capacity)
+    private val styleRows = ByteArray(capacity * COVERAGE_RENDERER_STYLE_ROW_BYTES)
     private val rowsByKey = LongRowIndex(capacity)
     private val selectedKeys = SelectedKeyMaxHeap(capacity)
     private val dirtyRows = DirtyRowQueue(capacity)
@@ -150,15 +153,29 @@ class VisibilityGridRendererState(
         namedGeometryRevision: Long,
         nextVisibilityRevision: Long,
         patchKeys: LongArray,
-        patchColors: IntArray,
+        patchStyleRows: ByteArray,
     ): Boolean {
         ensureActive()
         if (namedGeometryRevision != geometryRevision ||
             nextVisibilityRevision <= visibilityRevision ||
-            patchKeys.size != patchColors.size ||
+            patchStyleRows.size != patchKeys.size * COVERAGE_RENDERER_STYLE_ROW_BYTES ||
             patchKeys.toSet().size != patchKeys.size
         ) {
             return false
+        }
+        val decoded = Array(patchKeys.size) { index ->
+            CoverageRendererStyleRowV1.decode(
+                patchStyleRows,
+                index * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+            )
+        }
+        patchKeys.indices.forEach { index ->
+            val row = rowsByKey[patchKeys[index]] ?: return@forEach
+            val current = styleAt(row)
+            val next = decoded[index]
+            if (next.semanticGeneration < current.semanticGeneration ||
+                next.styleGeneration < current.styleGeneration
+            ) return false
         }
         patchKeys.indices.forEach { index ->
             val row = rowsByKey[patchKeys[index]]
@@ -166,8 +183,13 @@ class VisibilityGridRendererState(
                 ignoredVisibilityKeyCount++
                 return@forEach
             }
-            if (colors[row] != patchColors[index]) {
-                colors[row] = patchColors[index]
+            val next = decoded[index]
+            val encoded = next.encode()
+            val styleOffset = row * COVERAGE_RENDERER_STYLE_ROW_BYTES
+            val color = next.packedColor()
+            if (!styleRows.regionMatches(styleOffset, encoded) || colors[row] != color) {
+                encoded.copyInto(styleRows, styleOffset)
+                colors[row] = color
                 dirtyRows.add(row)
             }
         }
@@ -218,6 +240,7 @@ class VisibilityGridRendererState(
             keys = snapshotKeys,
             positions = snapshotPositions,
             colors = snapshotColors,
+            styleRows = styleRows.copyOf(count * COVERAGE_RENDERER_STYLE_ROW_BYTES),
             gridRotationWorld = identityGridRotation(),
             update = update,
         )
@@ -254,7 +277,9 @@ class VisibilityGridRendererState(
         check(count < capacity)
         val row = count++
         keys[row] = key
-        colors[row] = defaultColor
+        val initialStyle = CoverageRendererStyleRowV1()
+        initialStyle.encode().copyInto(styleRows, row * COVERAGE_RENDERER_STYLE_ROW_BYTES)
+        colors[row] = initialStyle.packedColor()
         writePosition(row, key)
         rowsByKey[key] = row
         selectedKeys.add(key, rowsByKey::containsKey)
@@ -282,6 +307,12 @@ class VisibilityGridRendererState(
             val movedKey = keys[last]
             keys[row] = movedKey
             colors[row] = colors[last]
+            styleRows.copyInto(
+                styleRows,
+                row * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                last * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                (last + 1) * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+            )
             positions[last * 3].let { positions[row * 3] = it }
             positions[last * 3 + 1].let { positions[row * 3 + 1] = it }
             positions[last * 3 + 2].let { positions[row * 3 + 2] = it }
@@ -290,6 +321,11 @@ class VisibilityGridRendererState(
         }
         keys[last] = 0
         colors[last] = 0
+        styleRows.fill(
+            0,
+            last * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+            (last + 1) * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+        )
     }
 
     private fun writePosition(row: Int, key: Long) {
@@ -325,6 +361,10 @@ class VisibilityGridRendererState(
                     startSlot = start,
                     positions = positions.copyOfRange(start * 3, (end + 1) * 3),
                     colors = colors.copyOfRange(start, end + 1),
+                    styleRows = styleRows.copyOfRange(
+                        start * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                        (end + 1) * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                    ),
                 )
         }
         return spans
@@ -334,6 +374,7 @@ class VisibilityGridRendererState(
         keys.fill(0)
         positions.fill(0f)
         colors.fill(0)
+        styleRows.fill(0)
         rowsByKey.clear()
         selectedKeys.clear()
         dirtyRows.clear()
@@ -358,5 +399,18 @@ class VisibilityGridRendererState(
 
     private fun ensureActive() {
         check(!disposed) { "VisibilityGridRendererState is disposed" }
+    }
+
+    private fun styleAt(row: Int): CoverageRendererStyleRowV1 =
+        CoverageRendererStyleRowV1.decode(
+            styleRows,
+            row * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+        )
+
+    private fun ByteArray.regionMatches(offset: Int, other: ByteArray): Boolean {
+        for (index in other.indices) {
+            if (this[offset + index] != other[index]) return false
+        }
+        return true
     }
 }

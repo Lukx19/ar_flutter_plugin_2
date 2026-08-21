@@ -581,9 +581,14 @@ class VisibilityGridMethodChannel(
         val nextVisibilityRevision = call.requiredLong("visibilityRevision")
         val keys = call.argument<LongArray>("keys")
             ?: throw IllegalArgumentException("keys must be Int64List")
-        val colors = call.argument<IntArray>("colors")
-            ?: throw IllegalArgumentException("colors must be Int32List")
-        require(keys.size == colors.size && keys.distinct().size == keys.size)
+        val styles = call.argument<ByteArray>("styles")
+            ?: throw IllegalArgumentException("styles must be Uint8List")
+        require(
+            keys.size <= com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_MAX_STYLE_PATCH_ROWS &&
+                styles.size == keys.size *
+                    com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES &&
+                keys.distinct().size == keys.size,
+        )
         validateVisibilityRevisions(
             namedGeometryRevision = geometryRevision,
             currentGeometryRevision = active.geometryRevision,
@@ -595,7 +600,7 @@ class VisibilityGridMethodChannel(
                 namedGeometryRevision = geometryRevision,
                 nextVisibilityRevision = nextVisibilityRevision,
                 patchKeys = keys,
-                patchColors = colors,
+                patchStyleRows = styles,
             ),
         )
         visibilityRevision = nextVisibilityRevision
