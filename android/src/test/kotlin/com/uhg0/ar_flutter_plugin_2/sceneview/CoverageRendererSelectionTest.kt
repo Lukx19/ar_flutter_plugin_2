@@ -11,6 +11,25 @@ import org.junit.Test
 
 class CoverageRendererSelectionTest {
     @Test
+    fun `production resource factory releases the old generation before creating replacement`() {
+        val events = mutableListOf<String>()
+        val factory = CoverageRendererResourceFactory()
+        factory.replace(
+            create = { "cube".also { events += "create:$it" } },
+            release = { value: String -> events += "release:$value" },
+        )
+        factory.replace(
+            create = { "centroid".also { events += "create:$it" } },
+            release = { value: String -> events += "release:$value" },
+        )
+        factory.clear()
+        assertEquals(
+            listOf("create:cube", "release:cube", "create:centroid", "release:centroid"),
+            events,
+        )
+    }
+
+    @Test
     fun `M0d lazy mode resource peaks stay within the shared eight MiB cap`() {
         assertEquals(2_000, CoverageRendererLimits.RAW_POINT_CAPACITY)
         assertEquals(20_000, CoverageRendererLimits.CENTROID_CAPACITY)

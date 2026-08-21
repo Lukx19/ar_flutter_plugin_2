@@ -10,6 +10,7 @@ import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePointUploadCoordinator
 import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePointVertexUploader
 import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationSelector
 import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageRendererAllocationLedger
+import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageRendererResourceFactory
 import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageRendererLimits
 import com.uhg0.ar_flutter_plugin_2.sceneview.RendererTelemetry
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.LongRowIndex
@@ -298,14 +299,33 @@ internal object M0dT5ReceiptCampaign {
     private fun exerciseOwnedBufferLedger(): JsonObject {
         val telemetry = RendererTelemetry()
         val ledger = CoverageRendererAllocationLedger(telemetry)
+        val resources = CoverageRendererResourceFactory()
+        data class ReceiptResource(val mode: VoxelRenderMode, val release: () -> Unit)
+        fun construct(mode: VoxelRenderMode): ReceiptResource {
+            ledger.installPersistentCoverageState(VisibilityGridRendererState(CoverageRendererLimits.presentationCapacity(mode)))
+            ledger.updateSnapshotHandoff(mode)
+            when (mode) {
+                VoxelRenderMode.CUBES -> ledger.installCubeResources("active", CoverageRendererLimits.CUBE_CAPACITY)
+                VoxelRenderMode.POINTS -> ledger.installPointResources("active", CoverageRendererLimits.RAW_POINT_CAPACITY)
+                VoxelRenderMode.CENTROIDS -> ledger.installPointResources("active", CoverageRendererLimits.CENTROID_CAPACITY)
+            }
+            return ReceiptResource(mode) {
+                when (mode) {
+                    VoxelRenderMode.CUBES -> ledger.releaseCubeResources("active")
+                    else -> ledger.releasePointResources("active")
+                }
+                ledger.clearCoverageState()
+            }
+        }
         val cubeState = VisibilityGridRendererState(CoverageRendererLimits.CUBE_CAPACITY)
         assertEquals(
             CoverageRendererLimits.rendererStateBytes(VoxelRenderMode.CUBES),
             cubeState.ownedStorageBytes,
         )
-        ledger.installPersistentCoverageState(cubeState)
-        ledger.updateSnapshotHandoff(VoxelRenderMode.CUBES)
-        ledger.installCubeResources("active", CoverageRendererLimits.CUBE_CAPACITY)
+        resources.replace(
+            create = { construct(VoxelRenderMode.CUBES) },
+            release = { it.release() },
+        )
         val maximum = telemetry.snapshot().getValue("ownedBufferBytes") as Int
         assertEquals(CoverageRendererLimits.maximumActiveRendererBytes, maximum)
         val boundaryTelemetry = RendererTelemetry()
@@ -326,13 +346,12 @@ internal object M0dT5ReceiptCampaign {
             )
         }.isFailure
         assertTrue(limitPlusOneRejected)
-        ledger.releaseCubeResources("active")
-        ledger.installPersistentCoverageState(
-            VisibilityGridRendererState(CoverageRendererLimits.CENTROID_CAPACITY),
+        resources.replace(
+            create = { construct(VoxelRenderMode.CENTROIDS) },
+            release = { it.release() },
         )
-        ledger.updateSnapshotHandoff(VoxelRenderMode.CENTROIDS)
-        ledger.installPointResources("active", CoverageRendererLimits.CENTROID_CAPACITY)
         assertEquals(maximum, telemetry.snapshot().getValue("peakOwnedBufferBytes"))
+        resources.clear()
         return buildJsonObject {
             put("maximumActiveRendererBytes", maximum)
             put("rendererOwnedBufferLimitBytes", RendererTelemetry.RENDERER_ALLOCATION_LIMIT_BYTES)

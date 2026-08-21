@@ -132,6 +132,7 @@ internal class SceneViewHost(
     private val frameCadenceTracker = FrameCadenceTracker()
     private val rendererTelemetry = RendererTelemetry()
     private val rendererAllocationLedger = CoverageRendererAllocationLedger(rendererTelemetry)
+    private val coverageResourceFactory = CoverageRendererResourceFactory()
     private var disposed = false
     // SceneView dispatches session updates on its render callback while the
     // platform channel pauses from the Android main thread. A volatile gate
@@ -807,11 +808,9 @@ internal class SceneViewHost(
         generation: Long,
     ): CoverageMeshAttachment {
         val resources = remember(engine) {
-            CoveragePointMeshResources(
-                engine,
-                CoverageRendererLimits.RAW_POINT_CAPACITY,
-                telemetry,
-                "coverage-points",
+            coverageResourceFactory.replace(
+                create = { CoveragePointMeshResources(engine, CoverageRendererLimits.RAW_POINT_CAPACITY, telemetry, "coverage-points") },
+                release = CoverageVoxelMeshResources::destroy,
             )
         }
         val material = remember(materialLoader) {
@@ -855,11 +854,9 @@ internal class SceneViewHost(
         generation: Long,
     ): CoverageMeshAttachment {
         val resources = remember(engine) {
-            CoveragePointMeshResources(
-                engine,
-                CoverageRendererLimits.CENTROID_CAPACITY,
-                telemetry,
-                "coverage-centroids",
+            coverageResourceFactory.replace(
+                create = { CoveragePointMeshResources(engine, CoverageRendererLimits.CENTROID_CAPACITY, telemetry, "coverage-centroids") },
+                release = CoverageVoxelMeshResources::destroy,
             )
         }
         val material = remember(materialLoader) {
@@ -907,12 +904,9 @@ internal class SceneViewHost(
             coverage.voxelSizeMeters,
             coverage.cubeSizeFactor,
         ) {
-            CoverageCubeMeshResources(
-                engine,
-                CoverageRendererLimits.CUBE_CAPACITY,
-                coverage.voxelSizeMeters * coverage.cubeSizeFactor,
-                telemetry,
-                "coverage-cubes",
+            coverageResourceFactory.replace(
+                create = { CoverageCubeMeshResources(engine, CoverageRendererLimits.CUBE_CAPACITY, coverage.voxelSizeMeters * coverage.cubeSizeFactor, telemetry, "coverage-cubes") },
+                release = CoverageVoxelMeshResources::destroy,
             )
         }
         val material = remember(materialLoader) {
