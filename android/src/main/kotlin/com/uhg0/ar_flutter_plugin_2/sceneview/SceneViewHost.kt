@@ -128,6 +128,7 @@ internal class SceneViewHost(
     private val cameraStreamRef = AtomicReference<ARCameraStream?>()
     private val frameCadenceTracker = FrameCadenceTracker()
     private val rendererTelemetry = RendererTelemetry()
+    private val rendererAllocationLedger = CoverageRendererAllocationLedger(rendererTelemetry)
     private var disposed = false
     private var rendererPaused = false
     private val replaySettledTextureResize: Runnable = Runnable {
@@ -531,20 +532,11 @@ internal class SceneViewHost(
             coverageSnapshotRef.set(null)
             coverageMeshRef.get()?.updateCoverage(null)
             coverageRenderConfig.value = null
-            rendererTelemetry.removeOwner("coverage-selection-state")
-            rendererTelemetry.removeOwner("coverage-auxiliary-state")
-            rendererTelemetry.removeOwner("coverage-snapshot-handoff")
+            rendererAllocationLedger.clearCoverageState()
             return
         }
 
-        rendererTelemetry.setOwnedBufferBytes(
-            "coverage-selection-state",
-            CoverageRendererLimits.NATIVE_SELECTION_BYTES,
-        )
-        rendererTelemetry.setOwnedBufferBytes(
-            "coverage-auxiliary-state",
-            CoverageRendererLimits.AUXILIARY_BYTES,
-        )
+        rendererAllocationLedger.installPersistentCoverageState()
         coverageSnapshotRef.set(snapshot)
         val current = coverageRenderConfig.value
         val requiresReplacement = current == null ||
@@ -563,10 +555,7 @@ internal class SceneViewHost(
         } else {
             coverageMeshRef.get()?.updateCoverage(snapshot, config.voxelRenderMode)
         }
-        rendererTelemetry.setOwnedBufferBytes(
-            "coverage-snapshot-handoff",
-            CoverageRendererLimits.snapshotHandoffBytes(config.voxelRenderMode),
-        )
+        rendererAllocationLedger.updateSnapshotHandoff(config.voxelRenderMode)
     }
 
     fun updateRawPointCloud(snapshot: CoveragePointRenderSnapshot?) {

@@ -69,15 +69,16 @@ internal class CoverageCubeMeshResources(
     )
     private var indexStaging: java.nio.IntBuffer? = null
     private var outlineIndexStaging: java.nio.IntBuffer? = null
+    private val allocationLedger = telemetry?.let(::CoverageRendererAllocationLedger)
     private var lastRevision = Long.MIN_VALUE
     private var destroyed = false
     private val presentationSelector = CoveragePresentationSelector(capacity)
 
     init {
-        // This exact per-cube buffer ledger is 736 bytes: 128 bytes vertex
-        // GPU data, 240 bytes triangle/outline indices, 128 bytes retained
-        // upload staging, and 240 bytes initial index staging.
-        telemetry?.setOwnedBufferBytes(telemetryOwner, capacity * OWNED_BYTES_PER_VOXEL)
+        // The two direct index buffers remain live until their independent
+        // Filament callbacks. Account for them as startup owners rather than
+        // folding a transient allocation into the steady mesh owner.
+        allocationLedger?.installCubeResources(telemetryOwner, capacity)
         val indices = ByteBuffer.allocateDirect(indexCapacity * Int.SIZE_BYTES)
             .order(ByteOrder.nativeOrder())
             .asIntBuffer()
@@ -93,7 +94,10 @@ internal class CoverageCubeMeshResources(
             0,
             indexCapacity,
             Handler(Looper.getMainLooper()),
-        ) { indexStaging = null }
+        ) {
+            indexStaging = null
+            allocationLedger?.completeCubeTriangleStartup(telemetryOwner)
+        }
 
         val outlineIndices = ByteBuffer
             .allocateDirect(outlineIndexCapacity * Int.SIZE_BYTES)
@@ -113,7 +117,10 @@ internal class CoverageCubeMeshResources(
             0,
             outlineIndexCapacity,
             Handler(Looper.getMainLooper()),
-        ) { outlineIndexStaging = null }
+        ) {
+            outlineIndexStaging = null
+            allocationLedger?.completeCubeOutlineStartup(telemetryOwner)
+        }
     }
 
     override fun update(
@@ -175,7 +182,7 @@ internal class CoverageCubeMeshResources(
         uploadCoordinator.destroy()
         indexStaging = null
         outlineIndexStaging = null
-        telemetry?.removeOwner(telemetryOwner)
+        allocationLedger?.releaseCubeResources(telemetryOwner)
         engine.destroyVertexBuffer(vertexBuffer)
         engine.destroyIndexBuffer(indexBuffer)
         engine.destroyIndexBuffer(outlineIndexBuffer)
@@ -190,7 +197,14 @@ internal class CoverageCubeMeshResources(
         const val INDICES_PER_VOXEL = 36
         const val OUTLINE_INDICES_PER_VOXEL = 24
         const val OUTLINE_PRIMITIVE_INDEX = 1
-        const val OWNED_BYTES_PER_VOXEL = 736
+        const val STEADY_OWNED_BYTES_PER_VOXEL = 496
+        const val TRIANGLE_INDEX_STAGING_BYTES_PER_VOXEL = INDICES_PER_VOXEL * Int.SIZE_BYTES
+        const val OUTLINE_INDEX_STAGING_BYTES_PER_VOXEL =
+            OUTLINE_INDICES_PER_VOXEL * Int.SIZE_BYTES
+        const val PEAK_OWNED_BYTES_PER_VOXEL =
+            STEADY_OWNED_BYTES_PER_VOXEL +
+                TRIANGLE_INDEX_STAGING_BYTES_PER_VOXEL +
+                OUTLINE_INDEX_STAGING_BYTES_PER_VOXEL
 
         // Two triangles per cube face, using the eight corners in the order:
         // (-,-,-), (+,-,-), (+,+,-), (-,+,-), (-,-,+), (+,-,+), (+,+,+), (-,+,+).

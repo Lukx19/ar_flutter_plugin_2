@@ -3,11 +3,13 @@ package com.uhg0.ar_flutter_plugin_2.m0
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan
+import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageCubeMeshResources
 import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePointMeshResources
 import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePointUploadCoordinator
 import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePointVertexUploader
 import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationSelector
+import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageRendererAllocationLedger
 import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageRendererLimits
 import com.uhg0.ar_flutter_plugin_2.sceneview.RendererTelemetry
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.LongRowIndex
@@ -294,27 +296,31 @@ internal object M0dT5ReceiptCampaign {
 
     private fun exerciseOwnedBufferLedger(): JsonObject {
         val telemetry = RendererTelemetry()
-        telemetry.setOwnedBufferBytes("selection", CoverageRendererLimits.NATIVE_SELECTION_BYTES)
-        telemetry.setOwnedBufferBytes("auxiliary", CoverageRendererLimits.AUXILIARY_BYTES)
-        telemetry.setOwnedBufferBytes("snapshot-handoff", CoverageRendererLimits.CUBE_SNAPSHOT_HANDOFF_BYTES)
-        telemetry.setOwnedBufferBytes(
-            "active",
-            CoverageRendererLimits.CUBE_CAPACITY * CoverageCubeMeshResources.OWNED_BYTES_PER_VOXEL,
-        )
+        val ledger = CoverageRendererAllocationLedger(telemetry)
+        ledger.installPersistentCoverageState()
+        ledger.updateSnapshotHandoff(VoxelRenderMode.CUBES)
+        ledger.installCubeResources("active", CoverageRendererLimits.CUBE_CAPACITY)
         val maximum = telemetry.snapshot().getValue("ownedBufferBytes") as Int
-        assertEquals(7_486_208, maximum)
+        assertEquals(CoverageRendererLimits.maximumActiveRendererBytes, maximum)
+        val boundaryTelemetry = RendererTelemetry()
+        val boundaryLedger = CoverageRendererAllocationLedger(boundaryTelemetry)
+        boundaryLedger.installPersistentCoverageState()
+        boundaryLedger.updateSnapshotHandoff(VoxelRenderMode.CUBES)
+        boundaryLedger.installCubeResources("active", CoverageRendererLimits.CUBE_CAPACITY)
+        boundaryTelemetry.setOwnedBufferBytes(
+            "exact-cap-reservation",
+            RendererTelemetry.RENDERER_ALLOCATION_LIMIT_BYTES - maximum,
+        )
         val limitPlusOneRejected = runCatching {
-            RendererTelemetry().setOwnedBufferBytes(
+            boundaryTelemetry.setOwnedBufferBytes(
                 "limit-plus-one",
-                RendererTelemetry.RENDERER_ALLOCATION_LIMIT_BYTES + 1,
+                1,
             )
         }.isFailure
         assertTrue(limitPlusOneRejected)
-        telemetry.removeOwner("active")
-        telemetry.setOwnedBufferBytes(
-            "active",
-            CoverageRendererLimits.CENTROID_CAPACITY * CoveragePointMeshResources.OWNED_BYTES_PER_ROW,
-        )
+        ledger.releaseCubeResources("active")
+        ledger.updateSnapshotHandoff(VoxelRenderMode.CENTROIDS)
+        ledger.installPointResources("active", CoverageRendererLimits.CENTROID_CAPACITY)
         assertEquals(maximum, telemetry.snapshot().getValue("peakOwnedBufferBytes"))
         return buildJsonObject {
             put("maximumActiveRendererBytes", maximum)
@@ -367,7 +373,13 @@ internal object M0dT5ReceiptCampaign {
             add(assertion("ordinary-frame-upload-ceiling", uploads.getValue("maximumFrameUploadBytes"), JsonPrimitive(65_536), "atMost"))
             add(assertion("point-upload-offsets", uploads.getValue("pointPositionOffsets"), listOf(0, 49_152).toJson()))
             add(assertion("cube-upload-offsets", uploads.getValue("cubePositionOffsets"), listOf(0, 49_152).toJson()))
-            add(assertion("maximum-active-ledger", ledger.getValue("maximumActiveRendererBytes"), JsonPrimitive(7_486_208)))
+            add(
+                assertion(
+                    "maximum-active-ledger",
+                    ledger.getValue("maximumActiveRendererBytes"),
+                    JsonPrimitive(CoverageRendererLimits.maximumActiveRendererBytes),
+                ),
+            )
             add(assertion("limit-plus-one-rejected", ledger.getValue("limitPlusOneRejected"), JsonPrimitive(true)))
             add(assertion("upload-completion-nonzero", callbacks.getValue("completedUploadCount"), JsonPrimitive(0), "greaterThan"))
             add(assertion("no-late-callbacks", callbacks.getValue("completionCountAfterDestroyAndLateCallbacks"), JsonPrimitive(1)))

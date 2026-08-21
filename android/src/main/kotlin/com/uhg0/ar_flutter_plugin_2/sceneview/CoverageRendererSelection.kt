@@ -4,6 +4,7 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan
 import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
+import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.DirtyRowQueue
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.LongRowIndex
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.SelectedKeyMaxHeap
@@ -40,31 +41,134 @@ internal object CoverageRendererLimits {
     const val CENTROID_SNAPSHOT_HANDOFF_BYTES =
         SEMANTIC_SNAPSHOT_BYTES + SEMANTIC_SNAPSHOT_BYTES * 2
 
-    // Point resources own 36 bytes per row; cube resources own 736 bytes per
-    // row. Keeping all three dormant mode resources under this bound makes a
-    // replacement safe even while Compose retires the previous node.
-    val allModeOwnedBufferBytes: Int =
-        RAW_POINT_CAPACITY * CoveragePointMeshResources.OWNED_BYTES_PER_ROW +
-            CENTROID_CAPACITY * CoveragePointMeshResources.OWNED_BYTES_PER_ROW +
-            CUBE_CAPACITY * CoverageCubeMeshResources.OWNED_BYTES_PER_VOXEL
+    /**
+     * The three mode resources are deliberately lazy and mutually exclusive.
+     * These are the peak bytes of the one active production resource, including
+     * its direct startup-index staging until Filament consumes it.
+     */
+    fun resourcePeakBytes(mode: VoxelRenderMode): Int =
+        when (mode) {
+            VoxelRenderMode.POINTS ->
+                RAW_POINT_CAPACITY * CoveragePointMeshResources.PEAK_OWNED_BYTES_PER_ROW
+            VoxelRenderMode.CENTROIDS ->
+                CENTROID_CAPACITY * CoveragePointMeshResources.PEAK_OWNED_BYTES_PER_ROW
+            VoxelRenderMode.CUBES ->
+                CUBE_CAPACITY * CoverageCubeMeshResources.PEAK_OWNED_BYTES_PER_VOXEL
+        }
 
-    val maximumActiveRendererBytes: Int =
-        CUBE_CAPACITY * CoverageCubeMeshResources.OWNED_BYTES_PER_VOXEL +
-            NATIVE_SELECTION_BYTES + AUXILIARY_BYTES + CUBE_SNAPSHOT_HANDOFF_BYTES
+    fun activeRendererPeakBytes(mode: VoxelRenderMode): Int =
+        resourcePeakBytes(mode) +
+            NATIVE_SELECTION_BYTES +
+            AUXILIARY_BYTES +
+            snapshotHandoffBytes(mode)
+
+    val maximumActiveRendererBytes: Int = VoxelRenderMode.entries.maxOf(::activeRendererPeakBytes)
 
     init {
-        check(allModeOwnedBufferBytes <= SHARED_OWNED_BUFFER_LIMIT_BYTES)
         check(maximumActiveRendererBytes <= SHARED_OWNED_BUFFER_LIMIT_BYTES)
     }
 
-    fun snapshotHandoffBytes(mode: com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode): Int =
+    fun snapshotHandoffBytes(mode: VoxelRenderMode): Int =
         when (mode) {
-            com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CUBES ->
+            VoxelRenderMode.CUBES ->
                 CUBE_SNAPSHOT_HANDOFF_BYTES
-            com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.POINTS,
-            com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS ->
+            VoxelRenderMode.POINTS,
+            VoxelRenderMode.CENTROIDS ->
                 CENTROID_SNAPSHOT_HANDOFF_BYTES
         }
+}
+
+/**
+ * Production-owned renderer allocation ledger. Host state, active mesh buffers
+ * and the startup index buffers all reserve against one telemetry instance.
+ * The mesh constructors call the same methods as the T5 campaign, so receipts
+ * exercise the actual ownership model rather than reconstructing a formula.
+ */
+internal class CoverageRendererAllocationLedger(
+    private val telemetry: RendererTelemetry,
+) {
+    fun installPersistentCoverageState() {
+        telemetry.setOwnedBufferBytes(
+            SELECTION_OWNER,
+            CoverageRendererLimits.NATIVE_SELECTION_BYTES,
+        )
+        telemetry.setOwnedBufferBytes(
+            AUXILIARY_OWNER,
+            CoverageRendererLimits.AUXILIARY_BYTES,
+        )
+    }
+
+    fun updateSnapshotHandoff(mode: VoxelRenderMode) {
+        telemetry.setOwnedBufferBytes(
+            SNAPSHOT_HANDOFF_OWNER,
+            CoverageRendererLimits.snapshotHandoffBytes(mode),
+        )
+    }
+
+    fun clearCoverageState() {
+        telemetry.removeOwner(SELECTION_OWNER)
+        telemetry.removeOwner(AUXILIARY_OWNER)
+        telemetry.removeOwner(SNAPSHOT_HANDOFF_OWNER)
+    }
+
+    fun installPointResources(owner: String, capacity: Int) {
+        telemetry.setOwnedBufferBytes(
+            owner,
+            capacity * CoveragePointMeshResources.STEADY_OWNED_BYTES_PER_ROW,
+        )
+        telemetry.setOwnedBufferBytes(
+            pointStartupOwner(owner),
+            capacity * CoveragePointMeshResources.STARTUP_INDEX_STAGING_BYTES_PER_ROW,
+        )
+    }
+
+    fun completePointStartup(owner: String) {
+        telemetry.removeOwner(pointStartupOwner(owner))
+    }
+
+    fun releasePointResources(owner: String) {
+        completePointStartup(owner)
+        telemetry.removeOwner(owner)
+    }
+
+    fun installCubeResources(owner: String, capacity: Int) {
+        telemetry.setOwnedBufferBytes(
+            owner,
+            capacity * CoverageCubeMeshResources.STEADY_OWNED_BYTES_PER_VOXEL,
+        )
+        telemetry.setOwnedBufferBytes(
+            cubeTriangleStartupOwner(owner),
+            capacity * CoverageCubeMeshResources.TRIANGLE_INDEX_STAGING_BYTES_PER_VOXEL,
+        )
+        telemetry.setOwnedBufferBytes(
+            cubeOutlineStartupOwner(owner),
+            capacity * CoverageCubeMeshResources.OUTLINE_INDEX_STAGING_BYTES_PER_VOXEL,
+        )
+    }
+
+    fun completeCubeTriangleStartup(owner: String) {
+        telemetry.removeOwner(cubeTriangleStartupOwner(owner))
+    }
+
+    fun completeCubeOutlineStartup(owner: String) {
+        telemetry.removeOwner(cubeOutlineStartupOwner(owner))
+    }
+
+    fun releaseCubeResources(owner: String) {
+        completeCubeTriangleStartup(owner)
+        completeCubeOutlineStartup(owner)
+        telemetry.removeOwner(owner)
+    }
+
+    private fun pointStartupOwner(owner: String) = "$owner-startup-index"
+    private fun cubeTriangleStartupOwner(owner: String) = "$owner-startup-triangle-index"
+    private fun cubeOutlineStartupOwner(owner: String) = "$owner-startup-outline-index"
+
+    private companion object {
+        const val SELECTION_OWNER = "coverage-selection-state"
+        const val AUXILIARY_OWNER = "coverage-auxiliary-state"
+        const val SNAPSHOT_HANDOFF_OWNER = "coverage-snapshot-handoff"
+    }
 }
 
 /**

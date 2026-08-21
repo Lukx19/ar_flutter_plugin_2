@@ -52,16 +52,16 @@ internal class CoveragePointMeshResources(
         onUploadCallback = { telemetry?.recordUploadCallback() },
         onUploadCompleted = { elapsedNanos -> telemetry?.recordUploadCompletion(elapsedNanos) },
     )
+    private val allocationLedger = telemetry?.let(::CoverageRendererAllocationLedger)
     private var indexStaging: java.nio.IntBuffer? = null
 
     override val primitiveType: RenderableManager.PrimitiveType =
         RenderableManager.PrimitiveType.POINTS
 
     init {
-        // Position/color GPU buffers, index buffer, and retained direct upload
-        // staging are renderer-owned. The transient index staging is excluded
-        // here because it is released after the initial upload callback.
-        telemetry?.setOwnedBufferBytes(telemetryOwner, capacity * OWNED_BYTES_PER_ROW)
+        // The direct index staging remains live until Filament invokes this
+        // upload callback, so it is separately charged for the startup peak.
+        allocationLedger?.installPointResources(telemetryOwner, capacity)
         val indices = ByteBuffer.allocateDirect(capacity * Int.SIZE_BYTES)
             .order(ByteOrder.nativeOrder())
             .asIntBuffer()
@@ -74,7 +74,10 @@ internal class CoveragePointMeshResources(
             0,
             capacity,
             Handler(Looper.getMainLooper()),
-        ) { indexStaging = null }
+        ) {
+            indexStaging = null
+            allocationLedger?.completePointStartup(telemetryOwner)
+        }
     }
 
     override fun update(
@@ -128,7 +131,7 @@ internal class CoveragePointMeshResources(
         destroyed = true
         uploadCoordinator.destroy()
         indexStaging = null
-        telemetry?.removeOwner(telemetryOwner)
+        allocationLedger?.releasePointResources(telemetryOwner)
         engine.destroyVertexBuffer(vertexBuffer)
         engine.destroyIndexBuffer(indexBuffer)
     }
@@ -149,9 +152,12 @@ internal class CoveragePointMeshResources(
         const val COLOR_BUFFER_INDEX = 1
         const val POSITION_COMPONENTS = 3
         const val COLOR_COMPONENTS = 4
-        const val OWNED_BYTES_PER_ROW =
+        const val STEADY_OWNED_BYTES_PER_ROW =
             POSITION_COMPONENTS * Float.SIZE_BYTES + COLOR_COMPONENTS +
                 Int.SIZE_BYTES + POSITION_COMPONENTS * Float.SIZE_BYTES + COLOR_COMPONENTS
+        const val STARTUP_INDEX_STAGING_BYTES_PER_ROW = Int.SIZE_BYTES
+        const val PEAK_OWNED_BYTES_PER_ROW =
+            STEADY_OWNED_BYTES_PER_ROW + STARTUP_INDEX_STAGING_BYTES_PER_ROW
 
         // VertexBuffer.setBufferAt sizes a typed FloatBuffer in float elements,
         // while the color upload below uses a raw ByteBuffer and therefore uses
