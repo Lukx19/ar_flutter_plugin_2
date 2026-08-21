@@ -219,6 +219,53 @@ class ARVisibilityGridManager {
     return ARVisibilityGridVisibilityRevision.fromMap(result);
   }
 
+  /// Arms one debug-build-only native background request seam.
+  ///
+  /// [method] must be `pullGridDelta`, `applyVisibility`, or
+  /// `getVisibilityRevision`; [delay] must be between zero and 30 seconds.
+  /// When [neverReply] is true, only `cancelBackgroundRequest` can complete the
+  /// original request. Throws [PlatformException] in release builds or for an
+  /// invalid method/argument map.
+  Future<void> configureDebugBackgroundRequest({
+    required String method,
+    Duration delay = Duration.zero,
+    bool neverReply = false,
+  }) async {
+    _ensureActive();
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      'configureDebugBackgroundRequest',
+      <String, Object>{
+        'method': method,
+        'delayMs': delay.inMilliseconds,
+        'neverReply': neverReply,
+      },
+    );
+    if (result?['armed'] != true) {
+      throw const FormatException(
+        'Native background request test seam was not armed.',
+      );
+    }
+  }
+
+  /// Reads the debug seam's ordered native trace and pending-request count.
+  ///
+  /// Throws [PlatformException] outside a debuggable Android build and
+  /// [FormatException] when the response does not match `{trace, pendingCount}`.
+  Future<Map<Object?, Object?>> getDebugBackgroundRequestTrace() async {
+    _ensureActive();
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      'getDebugBackgroundRequestTrace',
+    );
+    if (result == null ||
+        result['trace'] is! List ||
+        result['pendingCount'] is! num) {
+      throw const FormatException(
+        'Invalid native background request test trace.',
+      );
+    }
+    return result;
+  }
+
   /// Reads current health and diagnostics without waiting for geometry.
   Future<ARVisibilityGridHealthSnapshot> getHealth() async {
     _ensureActive();
@@ -536,6 +583,11 @@ final class ARVisibilityGridBackgroundRequest<T> {
 /// A client is isolate-local and keeps monotonically increasing request IDs.
 /// The native endpoint retains each original result until either the operation
 /// or an explicit cancellation completes it, while suppressing late replies.
+/// Request methods add a non-empty `backgroundRequestId` string to their normal
+/// v1 argument map. Cancellation sends `{version, backgroundRequestId}` and
+/// requires `{acknowledged: true, cancelled: bool}`; malformed or missing
+/// responses throw [FormatException], and native operation errors remain
+/// [PlatformException]s on [ARVisibilityGridBackgroundRequest.result].
 final class ARVisibilityGridBackgroundChannel {
   ARVisibilityGridBackgroundChannel._(this._channel, this._requestPrefix);
 

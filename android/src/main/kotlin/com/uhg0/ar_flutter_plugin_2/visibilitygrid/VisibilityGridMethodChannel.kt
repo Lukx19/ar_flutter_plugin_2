@@ -41,6 +41,13 @@ class VisibilityGridMethodChannel(
         )
     private val lifecycleGuard = VisibilityGridLifecycleGuard()
     private val backgroundRequests = CancellableBackgroundRequestRegistry()
+    private data class DebugBackgroundRequestSeam(
+        val method: String,
+        val delayMs: Long,
+        val neverReply: Boolean,
+    )
+    @Volatile private var debugBackgroundRequestSeam: DebugBackgroundRequestSeam? = null
+    private val debugBackgroundRequestTrace = mutableListOf<String>()
     @Volatile private var grid: NativeVisibilityGrid? = null
     private var renderer: VisibilityGridRendererState? = null
     @Volatile private var rendererConfig: PointCloudNativeConfig? = null
@@ -120,6 +127,8 @@ class VisibilityGridMethodChannel(
                 "getVisibilityRevision" ->
                     backgroundCall(call, result, ::getVisibilityRevision)
                 "cancelBackgroundRequest" -> cancelBackgroundRequest(call, result)
+                "configureDebugBackgroundRequest" -> configureDebugBackgroundRequest(call, result)
+                "getDebugBackgroundRequestTrace" -> getDebugBackgroundRequestTrace(result)
                 "checkpointBarrier" -> checkpointBarrier(call, result)
                 "releaseCheckpoint" -> releaseCheckpoint(call, result)
                 "setPointsEnabled" -> setPointsEnabled(call, result)
@@ -340,6 +349,27 @@ class VisibilityGridMethodChannel(
         operation: (MethodCall, MethodChannel.Result) -> Unit,
     ) {
         val target = backgroundResult(call, result)
+        val seam = debugBackgroundRequestSeam
+        if (isDebuggable && seam?.method == call.method) {
+            debugBackgroundRequestSeam = null
+            synchronized(debugBackgroundRequestTrace) {
+                debugBackgroundRequestTrace += "accepted:${call.method}"
+            }
+            if (seam.neverReply) return
+            main.postDelayed(
+                { executeBackgroundOperation(call, target, operation) },
+                seam.delayMs,
+            )
+            return
+        }
+        executeBackgroundOperation(call, target, operation)
+    }
+
+    private fun executeBackgroundOperation(
+        call: MethodCall,
+        target: MethodChannel.Result,
+        operation: (MethodCall, MethodChannel.Result) -> Unit,
+    ) {
         try {
             operation(call, target)
         } catch (error: VisibilityGridMethodException) {
@@ -357,12 +387,55 @@ class VisibilityGridMethodChannel(
         val requestId = call.argument<String>("backgroundRequestId")
             ?.takeIf(String::isNotBlank)
             ?: throw IllegalArgumentException("backgroundRequestId must be non-empty")
+        synchronized(debugBackgroundRequestTrace) {
+            debugBackgroundRequestTrace += "cancel-requested:$requestId"
+        }
         val cancelled = backgroundRequests.cancel(requestId)
+        if (cancelled) {
+            synchronized(debugBackgroundRequestTrace) {
+                debugBackgroundRequestTrace += "original-completed:$requestId"
+            }
+        }
         // cancel() synchronously completes the original result before this ACK.
+        synchronized(debugBackgroundRequestTrace) {
+            debugBackgroundRequestTrace += "cancel-ack:$requestId"
+        }
         result.success(
             mapOf(
                 "acknowledged" to true,
                 "cancelled" to cancelled,
+            ),
+        )
+    }
+
+    private fun configureDebugBackgroundRequest(
+        call: MethodCall,
+        result: MethodChannel.Result,
+    ) {
+        require(isDebuggable) { "Background request test seam is debug-only" }
+        val method = call.argument<String>("method")
+            ?.takeIf { it in setOf("pullGridDelta", "applyVisibility", "getVisibilityRevision") }
+            ?: throw IllegalArgumentException("method must name one background operation")
+        val delayMs = call.argument<Number>("delayMs")?.toLong() ?: 0L
+        require(delayMs in 0L..30_000L) { "delayMs must be between 0 and 30000" }
+        val neverReply = call.argument<Boolean>("neverReply") ?: false
+        synchronized(debugBackgroundRequestTrace) {
+            debugBackgroundRequestTrace.clear()
+            debugBackgroundRequestTrace += "armed:$method"
+        }
+        debugBackgroundRequestSeam = DebugBackgroundRequestSeam(method, delayMs, neverReply)
+        result.success(mapOf("armed" to true))
+    }
+
+    private fun getDebugBackgroundRequestTrace(result: MethodChannel.Result) {
+        require(isDebuggable) { "Background request test seam is debug-only" }
+        val trace = synchronized(debugBackgroundRequestTrace) {
+            debugBackgroundRequestTrace.toList()
+        }
+        result.success(
+            mapOf(
+                "trace" to trace,
+                "pendingCount" to backgroundRequests.pendingCount,
             ),
         )
     }
