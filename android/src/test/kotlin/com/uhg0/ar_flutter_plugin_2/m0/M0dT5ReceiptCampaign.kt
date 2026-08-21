@@ -39,8 +39,7 @@ internal object M0dT5ReceiptCampaign {
         "M0dExecutableReceiptTest.T5 native renderer campaign emits an immutable executable receipt"
 
     fun execute() {
-        val sourceLock = fixture("m0d_source_pins_v1.json")
-        val source = sourceLock["source"]?.jsonObject ?: sourceLock
+        val source = explicitSourceLock()
         val corpus = corpusDescriptor()
         val canonical = canonicalPopulations()
         val selection = exerciseCanonicalSelection()
@@ -490,6 +489,44 @@ internal object M0dT5ReceiptCampaign {
 
     private fun fixture(fileName: String): JsonObject =
         Json.parseToJsonElement(resourceBytes(fileName).decodeToString()).jsonObject
+
+    /**
+     * The source pins are deliberately not a test resource.  A checked-in
+     * resource can name the commit that already contains the receipt runner,
+     * which is self-referential and cannot reproduce a clean pinned checkout.
+     * The parent runner supplies an immutable lock file explicitly instead.
+     */
+    internal fun explicitSourceLock(
+        configuredPath: String? = System.getProperty("m0d.source.lock")
+            ?: System.getenv("M0D_SOURCE_LOCK"),
+    ): JsonObject {
+        require(!configuredPath.isNullOrBlank()) {
+            "M0d T5 requires explicit -Dm0d.source.lock=<absolute lock path>."
+        }
+        val lockFile = File(configuredPath)
+        require(lockFile.isAbsolute && lockFile.isFile) {
+            "M0d T5 source lock must be an existing absolute file."
+        }
+        val declaredLock = Json.parseToJsonElement(lockFile.readText()).jsonObject
+        // The runner accepts either the minimal source-lock object or the
+        // checked external evidence lock that contains it.  In both forms the
+        // returned receipt carries only the exact source triple.
+        val lock = declaredLock["source"]?.jsonObject ?: declaredLock
+        require(lock.keys == setOf("format", "parentCommit", "pluginCommit")) {
+            "M0d T5 source lock has unexpected fields."
+        }
+        require(lock["format"]?.jsonPrimitive?.content == "proposal08-m0d-source-pins-v1") {
+            "M0d T5 source lock format is invalid."
+        }
+        val commit = Regex("^[0-9a-f]{40}$")
+        require(commit.matches(lock["parentCommit"]?.jsonPrimitive?.content.orEmpty())) {
+            "M0d T5 source lock parentCommit must be an exact 40-hex commit."
+        }
+        require(commit.matches(lock["pluginCommit"]?.jsonPrimitive?.content.orEmpty())) {
+            "M0d T5 source lock pluginCommit must be an exact 40-hex commit."
+        }
+        return lock
+    }
 
     private fun resourceBytes(fileName: String): ByteArray =
         requireNotNull(javaClass.classLoader?.getResourceAsStream(fileName)).readBytes()
