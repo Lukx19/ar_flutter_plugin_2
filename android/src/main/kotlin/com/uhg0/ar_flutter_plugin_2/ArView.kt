@@ -45,6 +45,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.TimeoutCancellationException
 import java.util.concurrent.Executors
 
 /** SceneView 4.21.2 platform-view implementation. Flutter channels remain unchanged. */
@@ -78,6 +80,8 @@ internal class ArView(
     private var shutdownPrepared = false
     private var disposed = false
     private var coverageRendererMounted = false
+    private var resumeGeneration = 0L
+    private var pendingResume: Pair<Long, MethodChannel.Result>? = null
     private val pendingCloudOperations = mutableSetOf<() -> Unit>()
 
     private val sceneHost = SceneViewHost(
@@ -197,6 +201,13 @@ internal class ArView(
     override fun dispose() {
         if (disposed) return
         disposed = true
+        resumeGeneration++
+        pendingResume?.second?.error(
+            "SESSION_RESUME_CANCELLED",
+            "AR view was disposed before Session.resume completed",
+            null,
+        )
+        pendingResume = null
         poseBatchDispatcher.clear()
         prepareForDispose()
         sessionChannel.setMethodCallHandler(null)
@@ -275,10 +286,7 @@ internal class ArView(
                 }
                 "enableCamera", "resumeSession" -> {
                     sessionPausedByFlutter = false
-                    sceneHost.resume()
-                    visibilityGridChannel.resume()
-                    captureSession.onSessionResumed()
-                    result.success(null)
+                    resumeSessionBounded(result)
                 }
                 "dispose" -> {
                     dispose()
@@ -288,6 +296,38 @@ internal class ArView(
             }
         } catch (error: Exception) {
             result.error("SESSION_ERROR", error.message, null)
+        }
+    }
+
+    private fun resumeSessionBounded(result: MethodChannel.Result) {
+        val generation = ++resumeGeneration
+        pendingResume?.second?.error(
+            "SESSION_RESUME_SUPERSEDED",
+            "A newer resume request replaced this request",
+            null,
+        )
+        pendingResume = generation to result
+        scope.launch {
+            val failure = runCatching {
+                withTimeout(5_000) {
+                    withContext(Dispatchers.Default) { sceneHost.resume() }
+                }
+            }.exceptionOrNull()
+            if (disposed || pendingResume?.first != generation) return@launch
+            val reply = pendingResume?.second ?: return@launch
+            pendingResume = null
+            if (failure == null) {
+                visibilityGridChannel.resume()
+                captureSession.onSessionResumed()
+                reply.success(null)
+            } else {
+                val code = if (failure is TimeoutCancellationException) {
+                    "SESSION_RESUME_TIMEOUT"
+                } else {
+                    "SESSION_RESUME_FAILED"
+                }
+                reply.error(code, failure.message ?: "Session.resume failed", null)
+            }
         }
     }
 
