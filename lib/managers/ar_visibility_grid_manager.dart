@@ -274,6 +274,29 @@ class ARVisibilityGridManager {
     });
   }
 
+  /// Waits for the native Compose mesh requested by the latest mode change.
+  ///
+  /// This is a lifecycle fence, not a frame-delay heuristic: it completes
+  /// only after SceneView reports that an actual renderer mesh mounted.
+  Future<void> awaitRendererMounted() async {
+    _ensureActive();
+    final mounted = await _channel.invokeMethod<bool>('awaitRendererMounted');
+    if (mounted != true) {
+      throw StateError('Native visibility-grid renderer did not mount.');
+    }
+  }
+
+  /// Waits until SceneView reports disposal of the active native mesh.
+  Future<void> awaitRendererUnmounted() async {
+    _ensureActive();
+    final unmounted = await _channel.invokeMethod<bool>(
+      'awaitRendererUnmounted',
+    );
+    if (unmounted != true) {
+      throw StateError('Native visibility-grid renderer did not unmount.');
+    }
+  }
+
   /// Stops the exact active group generation.
   Future<void> stopGrid({
     required String groupId,

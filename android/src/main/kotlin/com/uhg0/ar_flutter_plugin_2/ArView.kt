@@ -160,6 +160,9 @@ internal class ArView(
 
     private fun setCoverageRendererMounted(mounted: Boolean) {
         coverageRendererMounted = mounted
+        if (::visibilityGridChannel.isInitialized) {
+            visibilityGridChannel.setRendererMounted(mounted)
+        }
     }
 
     private val lifecycleObserver = object : DefaultLifecycleObserver {

@@ -50,6 +50,12 @@ class VisibilityGridMethodChannel(
     @Volatile private var paused = false
     @Volatile private var checkpointBarrierActive = false
     private var pendingCheckpointResult: MethodChannel.Result? = null
+    // Compose owns actual mesh disposal and mounting. Keep its lifecycle
+    // distinct from a requested config mutation so callers can fence a mode
+    // replacement without guessing a frame delay.
+    private var rendererMounted = false
+    private var pendingRendererMountResult: MethodChannel.Result? = null
+    private var pendingRendererUnmountResult: MethodChannel.Result? = null
     private val sensorHandoff = LatestSensorHandoff<FeatureWork, DepthWork>()
     private var featureConfidenceMinimum = 0.30
     private var maxFeaturesPerObservation = 2_000
@@ -103,6 +109,8 @@ class VisibilityGridMethodChannel(
                 "releaseCheckpoint" -> releaseCheckpoint(call, result)
                 "setPointsEnabled" -> setPointsEnabled(call, result)
                 "setVoxelRenderMode" -> setVoxelRenderMode(call, result)
+                "awaitRendererMounted" -> awaitRendererMounted(result)
+                "awaitRendererUnmounted" -> awaitRendererUnmounted(result)
                 "stopGrid" -> {
                     requireIdentity(call)
                     synchronized(this) { sensorHandoff.clear() }
@@ -246,6 +254,8 @@ class VisibilityGridMethodChannel(
 
     fun dispose() {
         var checkpointResult: MethodChannel.Result? = null
+        var rendererMountResult: MethodChannel.Result? = null
+        var rendererUnmountResult: MethodChannel.Result? = null
         var oldRenderer: VisibilityGridRendererState? = null
         synchronized(this) {
             if (disposed) return
@@ -254,6 +264,11 @@ class VisibilityGridMethodChannel(
             healthHeartbeatGeneration++
             checkpointResult = pendingCheckpointResult
             pendingCheckpointResult = null
+            rendererMountResult = pendingRendererMountResult
+            pendingRendererMountResult = null
+            rendererUnmountResult = pendingRendererUnmountResult
+            pendingRendererUnmountResult = null
+            rendererMounted = false
             sensorHandoff.clear()
             frameCadence.reset()
             oldRenderer = renderer
@@ -266,6 +281,16 @@ class VisibilityGridMethodChannel(
         checkpointResult?.error(
             "VG_NOT_INITIALIZED",
             "Visibility grid was disposed during checkpoint",
+            null,
+        )
+        rendererMountResult?.error(
+            "VG_NOT_INITIALIZED",
+            "Visibility grid was disposed before renderer mount",
+            null,
+        )
+        rendererUnmountResult?.error(
+            "VG_NOT_INITIALIZED",
+            "Visibility grid was disposed before renderer unmount",
             null,
         )
         executor.shutdownNow()
@@ -901,6 +926,45 @@ class VisibilityGridMethodChannel(
         if (mode != VoxelRenderMode.POINTS) clearRawPoints()
         publishRenderer()
         result.success(true)
+    }
+
+    /** Called by the SceneView Compose effect after an actual mesh transition. */
+    fun setRendererMounted(mounted: Boolean) {
+        val pending = synchronized(this) {
+            rendererMounted = mounted
+            if (mounted) {
+                pendingRendererMountResult.also { pendingRendererMountResult = null }
+            } else {
+                pendingRendererUnmountResult.also { pendingRendererUnmountResult = null }
+            }
+        }
+        pending?.success(true)
+    }
+
+    private fun awaitRendererMounted(result: MethodChannel.Result) {
+        synchronized(this) {
+            if (rendererMounted) {
+                result.success(true)
+                return
+            }
+            check(pendingRendererMountResult == null) {
+                "Renderer mount fence is already pending"
+            }
+            pendingRendererMountResult = result
+        }
+    }
+
+    private fun awaitRendererUnmounted(result: MethodChannel.Result) {
+        synchronized(this) {
+            if (!rendererMounted) {
+                result.success(true)
+                return
+            }
+            check(pendingRendererUnmountResult == null) {
+                "Renderer unmount fence is already pending"
+            }
+            pendingRendererUnmountResult = result
+        }
     }
 
     private fun publishRenderer() {
