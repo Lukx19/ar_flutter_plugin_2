@@ -79,6 +79,8 @@ internal class ArView(
     private var sessionPausedByFlutter = false
     private var shutdownPrepared = false
     private var disposed = false
+    private var disposeCompleted = false
+    private val disposeCompletionCallbacks = mutableListOf<() -> Unit>()
     private var coverageRendererMounted = false
     private val pendingCloudOperations = mutableSetOf<() -> Unit>()
 
@@ -207,7 +209,18 @@ internal class ArView(
 
     override fun getView(): View = root
 
-    override fun dispose() {
+    override fun dispose() = dispose(null)
+
+    /**
+     * Serializes the Dart dispose acknowledgement with any abandoned resume.
+     * A late native resume can still succeed after its Dart timeout; callers
+     * that need a disposal boundary must not proceed until that resume has
+     * been paused and the host has released its resources.
+     */
+    private fun dispose(onCompleted: (() -> Unit)?) {
+        if (onCompleted != null) {
+            if (disposeCompleted) onCompleted() else disposeCompletionCallbacks += onCompleted
+        }
         if (disposed) return
         disposed = true
         sceneHost.blockFutureResumes()
@@ -228,6 +241,9 @@ internal class ArView(
         pendingCloudOperations.toList().forEach { it() }
         pendingCloudOperations.clear()
         sceneHost.dispose()
+        disposeCompleted = true
+        disposeCompletionCallbacks.toList().forEach { it() }
+        disposeCompletionCallbacks.clear()
         scope.cancel()
     }
 
@@ -295,8 +311,7 @@ internal class ArView(
                     resumeSessionBounded(result)
                 }
                 "dispose" -> {
-                    dispose()
-                    result.success(null)
+                    dispose { result.success(null) }
                 }
                 else -> result.notImplemented()
             }
