@@ -78,7 +78,6 @@ internal class CoverageCubeMeshResources(
     private var retainedSnapshotUploadRequired = true
     private var destroyed = false
     @Volatile private var onUploadPageReleased: () -> Unit = {}
-    private val presentationSelector = CoveragePresentationSelector(capacity)
 
     init {
         // The two direct index buffers remain live until their independent
@@ -135,7 +134,9 @@ internal class CoverageCubeMeshResources(
         materialInstance: MaterialInstance,
         pointSizePx: Float,
     ) {
-        val presentation = presentationSelector.select(snapshot)
+        // The native visibility renderer already admits the active mode's
+        // bounded stable rows. Keep this mesh as an upload-only consumer.
+        val presentation = snapshot
         check(presentation.capacity == capacity)
         check(presentation.count in 0..capacity)
         check(presentation.positions.size == presentation.count * POSITION_COMPONENTS)

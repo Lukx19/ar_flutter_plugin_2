@@ -400,7 +400,7 @@ class VisibilityGridMethodChannel(
             clearRawPoints()
                 renderer =
                     VisibilityGridRendererState(
-                    capacity = VisibilityGridRendererState.CENTROID_PRESENTATION_CAPACITY,
+                    capacity = VisibilityGridRendererState.presentationCapacity(renderMode),
                     defaultColor = defaultColor,
                 ).also {
                     it.setEnabled(enabled)
@@ -408,7 +408,7 @@ class VisibilityGridMethodChannel(
                 }
             rendererConfig =
                 PointCloudNativeConfig(
-                    renderCapacity = VisibilityGridRendererState.CENTROID_PRESENTATION_CAPACITY,
+                    renderCapacity = VisibilityGridRendererState.presentationCapacity(renderMode),
                     defaultColor = defaultColor,
                     pointSizePx = pointSizePx,
                     enabled = enabled,
@@ -526,7 +526,7 @@ class VisibilityGridMethodChannel(
                             removalKeys = it.removalKeys.toLongArray(),
                             selectedKeysForResetOrReplacement = {
                                 active.selectedRenderKeys(
-                                    VisibilityGridRendererState.CENTROID_PRESENTATION_CAPACITY,
+                                    checkNotNull(renderer).capacity,
                                 )
                             },
                         ) == true,
@@ -563,7 +563,7 @@ class VisibilityGridMethodChannel(
                 removalKeys = delta.removalKeys.toLongArray(),
                 selectedKeysForResetOrReplacement = {
                     requireGrid().selectedRenderKeys(
-                        VisibilityGridRendererState.CENTROID_PRESENTATION_CAPACITY,
+                        requireNotNull(renderer).capacity,
                     )
                 },
             ),
@@ -590,6 +590,9 @@ class VisibilityGridMethodChannel(
                 reset = true,
                 upsertKeys = snapshot.upsertKeys.toLongArray(),
                 removalKeys = snapshot.removalKeys.toLongArray(),
+                selectedKeysForResetOrReplacement = {
+                    requireGrid().selectedRenderKeys(requireNotNull(renderer).capacity)
+                },
             ),
         )
         lastEmittedGeometryRevision = snapshot.geometryRevision
@@ -781,7 +784,7 @@ class VisibilityGridMethodChannel(
                                         fullSnapshot = context.grid::snapshot,
                                         selectedRenderKeys = {
                                             context.grid.selectedRenderKeys(
-                                                VisibilityGridRendererState.CENTROID_PRESENTATION_CAPACITY,
+                                                context.renderer.capacity,
                                             )
                                         },
                                     )
@@ -920,8 +923,27 @@ class VisibilityGridMethodChannel(
 
     private fun setVoxelRenderMode(call: MethodCall, result: MethodChannel.Result) {
         val mode = VoxelRenderMode.fromWire(call.requiredString("mode"))
-        requireNotNull(renderer).setRenderMode(mode)
-        rendererConfig = requireNotNull(rendererConfig).copy(voxelRenderMode = mode)
+        val current = requireNotNull(renderer)
+        val currentConfig = requireNotNull(rendererConfig)
+        if (currentConfig.voxelRenderMode != mode) {
+            val retained = current.snapshot()
+            val replacement = VisibilityGridRendererState(
+                capacity = VisibilityGridRendererState.presentationCapacity(mode),
+                defaultColor = currentConfig.defaultColor,
+            ).also {
+                it.setEnabled(currentConfig.enabled)
+                it.setRenderMode(mode)
+            }
+            group?.let { activeGroup ->
+                replacement.rehydrate(activeGroup, retained)
+            }
+            current.dispose()
+            renderer = replacement
+        }
+        rendererConfig = currentConfig.copy(
+            renderCapacity = VisibilityGridRendererState.presentationCapacity(mode),
+            voxelRenderMode = mode,
+        )
         frameCadence.reset()
         if (mode != VoxelRenderMode.POINTS) clearRawPoints()
         publishRenderer()

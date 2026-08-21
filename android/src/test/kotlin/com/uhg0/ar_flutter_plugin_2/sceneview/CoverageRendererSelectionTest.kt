@@ -15,7 +15,7 @@ class CoverageRendererSelectionTest {
         assertEquals(2_000, CoverageRendererLimits.RAW_POINT_CAPACITY)
         assertEquals(20_000, CoverageRendererLimits.CENTROID_CAPACITY)
         assertEquals(8_000, CoverageRendererLimits.CUBE_CAPACITY)
-        assertEquals(8_382_208, CoverageRendererLimits.maximumActiveRendererBytes)
+        assertEquals(7_963_200, CoverageRendererLimits.maximumActiveRendererBytes)
         com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.entries.forEach { mode ->
             assertTrue(
                 "$mode startup peak must fit the shared renderer cap",
@@ -29,7 +29,7 @@ class CoverageRendererSelectionTest {
     fun `production maximum cube resources reserve every owner and reject exact limit plus one`() {
         val telemetry = RendererTelemetry()
         val ledger = CoverageRendererAllocationLedger(telemetry)
-        ledger.installPersistentCoverageState()
+        ledger.installPersistentCoverageState(com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CUBES)
         ledger.updateSnapshotHandoff(com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CUBES)
         ledger.installCubeResources("cubes", CoverageRendererLimits.CUBE_CAPACITY)
         assertEquals(
@@ -51,10 +51,15 @@ class CoverageRendererSelectionTest {
     fun `replacement fence releases actual cube startup owners before installing centroid startup`() {
         val telemetry = RendererTelemetry()
         val ledger = CoverageRendererAllocationLedger(telemetry)
-        ledger.installPersistentCoverageState()
+        ledger.installPersistentCoverageState(
+            com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CUBES,
+        )
         ledger.updateSnapshotHandoff(com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CUBES)
         ledger.installCubeResources("active", CoverageRendererLimits.CUBE_CAPACITY)
         ledger.releaseCubeResources("active")
+        ledger.installPersistentCoverageState(
+            com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS,
+        )
         ledger.updateSnapshotHandoff(com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS)
         ledger.installPointResources("active", CoverageRendererLimits.CENTROID_CAPACITY)
 
@@ -74,7 +79,9 @@ class CoverageRendererSelectionTest {
     fun `point startup index staging is retained only until its production completion owner is released`() {
         val telemetry = RendererTelemetry()
         val ledger = CoverageRendererAllocationLedger(telemetry)
-        ledger.installPersistentCoverageState()
+        ledger.installPersistentCoverageState(
+            com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS,
+        )
         ledger.updateSnapshotHandoff(com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS)
         ledger.installPointResources("centroids", CoverageRendererLimits.CENTROID_CAPACITY)
 

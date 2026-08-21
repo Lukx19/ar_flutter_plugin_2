@@ -81,9 +81,17 @@ internal class LongRowIndex(capacity: Int) {
         return mixed.toInt() and mask
     }
 
-    private companion object {
+    companion object {
         const val EMPTY = 0
         const val OCCUPIED = 1
+
+        /** Bytes retained by the three primitive backing arrays. */
+        fun ownedStorageBytes(capacity: Int): Int {
+            require(capacity > 0)
+            var tableSize = 1
+            while (tableSize < capacity * 2) tableSize = tableSize shl 1
+            return tableSize * (Long.SIZE_BYTES + Int.SIZE_BYTES + Byte.SIZE_BYTES)
+        }
     }
 }
 
@@ -144,6 +152,13 @@ internal class SelectedKeyMaxHeap(private val capacity: Int) {
             heap[parent] = heap[child]
             heap[child] = value
             parent = child
+        }
+    }
+
+    companion object {
+        fun ownedStorageBytes(capacity: Int): Int {
+            require(capacity > 0)
+            return capacity * 2 * Long.SIZE_BYTES
         }
     }
 }
@@ -207,6 +222,13 @@ internal class DirtyRowQueue(private val capacity: Int) {
             heap[parent] = heap[child]
             heap[child] = value
             parent = child
+        }
+    }
+
+    companion object {
+        fun ownedStorageBytes(capacity: Int): Int {
+            require(capacity > 0)
+            return capacity * (Int.SIZE_BYTES + 1)
         }
     }
 }

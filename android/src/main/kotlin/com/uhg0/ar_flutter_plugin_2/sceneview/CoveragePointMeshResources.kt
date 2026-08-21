@@ -46,7 +46,6 @@ internal class CoveragePointMeshResources(
     private var retainedSnapshotUploadRequired = true
     private var destroyed = false
     @Volatile private var onUploadPageReleased: () -> Unit = {}
-    private val presentationSelector = CoveragePresentationSelector(capacity)
     private val uploadCoordinator = CoveragePointUploadCoordinator(
         capacity = capacity,
         uploader = FilamentCoveragePointVertexUploader(engine, vertexBuffer),
@@ -92,7 +91,10 @@ internal class CoveragePointMeshResources(
         materialInstance: MaterialInstance,
         pointSizePx: Float,
     ) {
-        val presentation = presentationSelector.select(snapshot)
+        // The native visibility renderer already admits the active mode's
+        // bounded stable rows. Re-selecting here would retain a second full
+        // primitive selector and duplicate the presentation hand-off.
+        val presentation = snapshot
         check(presentation.capacity == capacity)
         check(presentation.count in 0..capacity)
         check(presentation.positions.size == presentation.count * POSITION_COMPONENTS)

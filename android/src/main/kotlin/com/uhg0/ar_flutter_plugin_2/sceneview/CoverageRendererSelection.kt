@@ -8,6 +8,7 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.DirtyRowQueue
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.LongRowIndex
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.SelectedKeyMaxHeap
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridRendererState
 
 /** Chapter 17 fixed presentation maxima; semantic-grid capacity is separate. */
 internal object CoverageRendererLimits {
@@ -20,26 +21,13 @@ internal object CoverageRendererLimits {
     const val DEBUG_ROW_CAPACITY = 1_024
     const val SHARED_OWNED_BUFFER_LIMIT_BYTES = 8 * 1024 * 1024
 
-    // Fixed, renderer-owned native selection rows: key, world position,
-    // colour, 16-byte semantic/style cut, and slot/revision bookkeeping. The semantic grid's 100k state
-    // is deliberately not charged here; it belongs to M0b's 16 MiB ledger.
-    const val NATIVE_SELECTION_BYTES_PER_ROW = 48
-    const val NATIVE_SELECTION_BYTES = CENTROID_CAPACITY * NATIVE_SELECTION_BYTES_PER_ROW
     const val AUXILIARY_ROW_BYTES = 16
     const val AUXILIARY_BYTES =
         (WARM_PROXY_CAPACITY + COLD_OVERVIEW_CAPACITY + GLYPH_CAPACITY + DEBUG_ROW_CAPACITY) *
             AUXILIARY_ROW_BYTES
 
-    // A semantic 20k snapshot is retained at the host seam while the active
-    // coordinator may retain both its in-flight and coalesced-next cube
-    // presentation snapshots. These copies are deliberately charged rather
-    // than treated as invisible JVM transients.
-    const val SEMANTIC_SNAPSHOT_BYTES = CENTROID_CAPACITY * 40
-    const val CUBE_PRESENTATION_SNAPSHOT_BYTES = CUBE_CAPACITY * 40
-    const val CUBE_SNAPSHOT_HANDOFF_BYTES =
-        SEMANTIC_SNAPSHOT_BYTES + CUBE_PRESENTATION_SNAPSHOT_BYTES * 2
-    const val CENTROID_SNAPSHOT_HANDOFF_BYTES =
-        SEMANTIC_SNAPSHOT_BYTES + SEMANTIC_SNAPSHOT_BYTES * 2
+    /** key + position + color + style row in one retained snapshot row. */
+    const val SNAPSHOT_ROW_BYTES = 40
 
     /**
      * The three mode resources are deliberately lazy and mutually exclusive.
@@ -56,9 +44,19 @@ internal object CoverageRendererLimits {
                 CUBE_CAPACITY * CoverageCubeMeshResources.PEAK_OWNED_BYTES_PER_VOXEL
         }
 
+    fun presentationCapacity(mode: VoxelRenderMode): Int =
+        VisibilityGridRendererState.presentationCapacity(mode)
+
+    /**
+     * The production visibility renderer is the sole retained selector. Its
+     * state is mode-sized, so cube mode does not silently retain a 20k state.
+     */
+    fun rendererStateBytes(mode: VoxelRenderMode): Int =
+        VisibilityGridRendererState.ownedStorageBytes(presentationCapacity(mode))
+
     fun activeRendererPeakBytes(mode: VoxelRenderMode): Int =
         resourcePeakBytes(mode) +
-            NATIVE_SELECTION_BYTES +
+            rendererStateBytes(mode) +
             AUXILIARY_BYTES +
             snapshotHandoffBytes(mode)
 
@@ -69,13 +67,11 @@ internal object CoverageRendererLimits {
     }
 
     fun snapshotHandoffBytes(mode: VoxelRenderMode): Int =
-        when (mode) {
-            VoxelRenderMode.CUBES ->
-                CUBE_SNAPSHOT_HANDOFF_BYTES
-            VoxelRenderMode.POINTS,
-            VoxelRenderMode.CENTROIDS ->
-                CENTROID_SNAPSHOT_HANDOFF_BYTES
-        }
+        // At most two reset-capable snapshots can be retained across the host
+        // hand-off and upload/coalescing boundary; each holds row arrays plus
+        // its full dirty span. The active uploader references that snapshot,
+        // rather than cloning it again.
+        presentationCapacity(mode) * SNAPSHOT_ROW_BYTES * 4
 }
 
 /**
@@ -87,10 +83,27 @@ internal object CoverageRendererLimits {
 internal class CoverageRendererAllocationLedger(
     private val telemetry: RendererTelemetry,
 ) {
-    fun installPersistentCoverageState() {
+    fun installPersistentCoverageState(mode: VoxelRenderMode) {
+        installPersistentCoverageStateForCapacity(
+            presentationCapacity = CoverageRendererLimits.presentationCapacity(mode),
+        )
+    }
+
+    /** Charges the concrete bounded state received from the native renderer. */
+    fun installPersistentCoverageState(rendererState: VisibilityGridRendererState) {
+        chargePersistentCoverageState(rendererState.ownedStorageBytes)
+    }
+
+    fun installPersistentCoverageStateForCapacity(presentationCapacity: Int) {
+        chargePersistentCoverageState(
+            VisibilityGridRendererState.ownedStorageBytes(presentationCapacity),
+        )
+    }
+
+    private fun chargePersistentCoverageState(rendererStateBytes: Int) {
         telemetry.setOwnedBufferBytes(
-            SELECTION_OWNER,
-            CoverageRendererLimits.NATIVE_SELECTION_BYTES,
+            RENDERER_STATE_OWNER,
+            rendererStateBytes,
         )
         telemetry.setOwnedBufferBytes(
             AUXILIARY_OWNER,
@@ -106,7 +119,7 @@ internal class CoverageRendererAllocationLedger(
     }
 
     fun clearCoverageState() {
-        telemetry.removeOwner(SELECTION_OWNER)
+        telemetry.removeOwner(RENDERER_STATE_OWNER)
         telemetry.removeOwner(AUXILIARY_OWNER)
         telemetry.removeOwner(SNAPSHOT_HANDOFF_OWNER)
     }
@@ -165,7 +178,7 @@ internal class CoverageRendererAllocationLedger(
     private fun cubeOutlineStartupOwner(owner: String) = "$owner-startup-outline-index"
 
     private companion object {
-        const val SELECTION_OWNER = "coverage-selection-state"
+        const val RENDERER_STATE_OWNER = "coverage-renderer-state"
         const val AUXILIARY_OWNER = "coverage-auxiliary-state"
         const val SNAPSHOT_HANDOFF_OWNER = "coverage-snapshot-handoff"
     }

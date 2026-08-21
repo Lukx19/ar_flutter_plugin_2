@@ -23,6 +23,34 @@ class VisibilityGridRendererState(
     companion object {
         /** Chapter 17 M0d maximum for clean centroid presentation rows. */
         const val CENTROID_PRESENTATION_CAPACITY = 20_000
+
+        fun presentationCapacity(mode: VoxelRenderMode): Int =
+            when (mode) {
+                VoxelRenderMode.POINTS -> 2_000
+                VoxelRenderMode.CENTROIDS -> CENTROID_PRESENTATION_CAPACITY
+                VoxelRenderMode.CUBES -> 8_000
+            }
+
+        /**
+         * Fixed primitive backing storage retained by one renderer state.
+         * This deliberately excludes semantic-grid ownership and transient
+         * snapshot hand-off buffers, which have distinct owners in the native
+         * renderer ledger.
+         */
+        fun ownedStorageBytes(capacity: Int): Int {
+            require(capacity > 0)
+            return capacity * (
+                Long.SIZE_BYTES +
+                    POSITION_COMPONENTS * Float.SIZE_BYTES +
+                    Int.SIZE_BYTES +
+                    COVERAGE_RENDERER_STYLE_ROW_BYTES
+                ) +
+                LongRowIndex.ownedStorageBytes(capacity) +
+                SelectedKeyMaxHeap.ownedStorageBytes(capacity) +
+                DirtyRowQueue.ownedStorageBytes(capacity)
+        }
+
+        private const val POSITION_COMPONENTS = 3
     }
 
     init {
@@ -62,6 +90,10 @@ class VisibilityGridRendererState(
     val ignoredDeletedVisibilityKeys: Long
         @Synchronized get() = ignoredVisibilityKeyCount
 
+    /** Concrete primitive storage retained by this production state. */
+    val ownedStorageBytes: Int
+        get() = ownedStorageBytes(capacity)
+
     @Synchronized
     fun startGroup(
         config: VisibilityGridGroupConfig,
@@ -80,6 +112,41 @@ class VisibilityGridRendererState(
         this.visibilityRevision = visibilityRevision
         ignoredVisibilityKeyCount = 0
         restoredKeys.forEach(::admitCandidate)
+        dirtyRows.addRange(count)
+        resetUpload = true
+        renderRevision++
+    }
+
+    /**
+     * Rebuilds one mode-specific renderer state from a retained render cut.
+     * The semantic grid remains authoritative; this only preserves the exact
+     * style rows while a mesh mode releases its old bounded state.
+     */
+    @Synchronized
+    fun rehydrate(
+        config: VisibilityGridGroupConfig,
+        snapshot: CoveragePointRenderSnapshot,
+    ) {
+        val update = requireNotNull(snapshot.update) { "Retained renderer snapshot needs an update" }
+        require(snapshot.count in 0..snapshot.capacity)
+        require(snapshot.keys.size == snapshot.count)
+        require(snapshot.styleRows.size == snapshot.count * COVERAGE_RENDERER_STYLE_ROW_BYTES)
+        startGroup(
+            config = config,
+            geometryRevision = update.geometryRevision,
+            visibilityRevision = update.visibilityRevision,
+            restoredKeys = snapshot.keys,
+        )
+        snapshot.keys.indices.forEach { source ->
+            val row = rowsByKey[snapshot.keys[source]] ?: return@forEach
+            val styleOffset = source * COVERAGE_RENDERER_STYLE_ROW_BYTES
+            val encoded = snapshot.styleRows.copyOfRange(
+                styleOffset,
+                styleOffset + COVERAGE_RENDERER_STYLE_ROW_BYTES,
+            )
+            encoded.copyInto(styleRows, row * COVERAGE_RENDERER_STYLE_ROW_BYTES)
+            colors[row] = CoverageRendererStyleRowV1.decode(encoded).packedColor()
+        }
         dirtyRows.addRange(count)
         resetUpload = true
         renderRevision++

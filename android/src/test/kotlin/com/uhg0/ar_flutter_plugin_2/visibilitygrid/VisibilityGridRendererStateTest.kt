@@ -16,6 +16,26 @@ import org.junit.Test
 
 class VisibilityGridRendererStateTest {
     @Test
+    fun `renderer state exposes its complete primitive storage ownership`() {
+        val centroid = VisibilityGridRendererState(
+            VisibilityGridRendererState.CENTROID_PRESENTATION_CAPACITY,
+        )
+        val cubes = VisibilityGridRendererState(8_000)
+
+        // 20k rows (800,000), 65,536-slot key index (851,968), heap
+        // (320,000), and dirty queue (100,000). These are retained arrays,
+        // not a ledger estimate that may omit a second selector/state.
+        assertEquals(2_071_968, centroid.ownedStorageBytes)
+        assertEquals(
+            8_000 * 40 +
+                LongRowIndex.ownedStorageBytes(8_000) +
+                SelectedKeyMaxHeap.ownedStorageBytes(8_000) +
+                DirtyRowQueue.ownedStorageBytes(8_000),
+            cubes.ownedStorageBytes,
+        )
+    }
+
+    @Test
     fun `removal compacts both modes and immediately reuses capacity`() {
         val state = VisibilityGridRendererState(capacity = 2)
         state.startGroup(group(2), geometryRevision = 0, restoredKeys = longArrayOf())
@@ -241,6 +261,36 @@ class VisibilityGridRendererStateTest {
         assertEquals(1, update.spans.single().positions.size / 3)
         assertEquals(1, state.currentGeometryRevision)
         assertEquals(0, state.currentVisibilityRevision)
+    }
+
+    @Test
+    fun `mode-sized replacement retains the lowest rows and their style cut`() {
+        val keys = longArrayOf(
+            packVisibilityGridKey(1, 0, 0),
+            packVisibilityGridKey(3, 0, 0),
+            packVisibilityGridKey(5, 0, 0),
+            packVisibilityGridKey(7, 0, 0),
+        )
+        val centroid = VisibilityGridRendererState(capacity = 4)
+        centroid.startGroup(group(4), geometryRevision = 3, restoredKeys = keys)
+        val complete = CoverageRendererStyleRowV1(
+            coverage = CoverageRendererCoverage.COMPLETE,
+        )
+        assertTrue(centroid.applyVisibility(3, 1, keys, styles(complete, complete, complete, complete)))
+        val retained = centroid.snapshot()
+
+        val cubes = VisibilityGridRendererState(capacity = 2)
+        cubes.rehydrate(group(4), retained)
+        val rehydrated = cubes.snapshot()
+
+        assertArrayEquals(keys.copyOf(2), rehydrated.keys)
+        assertEquals(2, rehydrated.count)
+        assertTrue(rehydrated.update!!.reset)
+        assertEquals(1, cubes.currentVisibilityRevision)
+        assertEquals(
+            CoverageRendererCoverage.COMPLETE,
+            CoverageRendererStyleRowV1.decode(rehydrated.styleRows).coverage,
+        )
     }
 
     @Test

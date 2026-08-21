@@ -561,7 +561,7 @@ internal class SceneViewHost(
             return
         }
 
-        rendererAllocationLedger.installPersistentCoverageState()
+        rendererAllocationLedger.installPersistentCoverageStateForCapacity(snapshot.capacity)
         coverageSnapshotRef.set(snapshot)
         val current = coverageRenderConfig.value
         val requiresReplacement = current == null ||
