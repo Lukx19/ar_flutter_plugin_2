@@ -12,6 +12,39 @@ import org.junit.Test
 
 class CoveragePointUploadCoordinatorTest {
     @Test
+    fun `retained replacement reset waits for a subsequent renderer frame`() {
+        val uploader = FakeUploader()
+        val completions = mutableListOf<Long>()
+        var resetSchedules = 0
+        val coordinator = CoveragePointUploadCoordinator(
+            capacity = 2,
+            uploader = uploader,
+            onResourceResetScheduled = { resetSchedules++ },
+            onUploadCompleted = completions::add,
+        )
+        val retained = snapshot(7, 7f, withEmptyUpdate = true)
+
+        // A frame can race between registering the replacement binding and
+        // queuing its retained reset. That earlier frame must not become a
+        // reusable token which submits work outside a later renderer frame.
+        coordinator.onRendererFrame()
+        coordinator.submitForResourceGeneration(retained)
+        assertEquals(1, resetSchedules)
+        assertTrue(uploader.positionSubmissions.isEmpty())
+        assertTrue(uploader.colorSubmissions.isEmpty())
+
+        coordinator.onRendererFrame()
+        assertEquals(1, uploader.positionSubmissions.size)
+        assertEquals(1, uploader.colorSubmissions.size)
+        uploader.completeAll()
+        coordinator.onRendererFrame()
+
+        assertEquals(1, uploader.positionSubmissions.size)
+        assertEquals(1, uploader.colorSubmissions.size)
+        assertEquals(1, completions.size)
+    }
+
+    @Test
     fun `only the attached current generation rehydrates a retained cut`() {
         val generationGate = CoverageMeshGenerationGate()
         val oldGeneration = generationGate.reserve()
@@ -24,13 +57,14 @@ class CoveragePointUploadCoordinatorTest {
         val replacementCoordinator = CoveragePointUploadCoordinator(2, replacementUploader)
         val retained = snapshot(7, 7f, withEmptyUpdate = true)
 
-        assertFalse(generationGate.acceptsAttached(oldGeneration))
-        if (generationGate.acceptsAttached(oldGeneration)) {
-            oldCoordinator.submitForResourceGeneration(retained)
-        }
-        if (generationGate.acceptsAttached(replacementGeneration)) {
+        // The current binding attaches first. A delayed outgoing Compose
+        // effect must still be unable to replace it afterwards.
+        assertTrue(generationGate.attachIfCurrent(replacementGeneration) {
             replacementCoordinator.submitForResourceGeneration(retained)
-        }
+        })
+        assertFalse(generationGate.attachIfCurrent(oldGeneration) {
+            oldCoordinator.submitForResourceGeneration(retained)
+        })
         oldCoordinator.onRendererFrame()
         replacementCoordinator.onRendererFrame()
         oldUploader.completeAll()

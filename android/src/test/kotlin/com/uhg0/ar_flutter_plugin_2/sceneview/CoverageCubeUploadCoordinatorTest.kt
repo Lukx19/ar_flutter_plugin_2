@@ -10,6 +10,32 @@ import org.junit.Test
 
 class CoverageCubeUploadCoordinatorTest {
     @Test
+    fun `retained cube reset waits for a subsequent renderer frame`() {
+        val uploader = FakeCubeUploader()
+        var resetSchedules = 0
+        val coordinator = CoverageCubeMeshResources.CoverageCubeUploadCoordinator(
+            capacity = 1,
+            halfSize = 0.5f,
+            uploader = uploader,
+            onResourceResetScheduled = { resetSchedules++ },
+        )
+
+        coordinator.onRendererFrame()
+        coordinator.submitForResourceGeneration(
+            cubeSnapshot(1, floatArrayOf(1f, 1f, 1f)),
+        )
+
+        assertEquals(1, resetSchedules)
+        assertTrue(uploader.positionSubmissions.isEmpty())
+        assertTrue(uploader.colorSubmissions.isEmpty())
+
+        coordinator.onRendererFrame()
+
+        assertEquals(1, uploader.positionSubmissions.size)
+        assertEquals(1, uploader.colorSubmissions.size)
+    }
+
+    @Test
     fun `one voxel expands to eight colored cube vertices`() {
         val uploader = FakeCubeUploader()
         val coordinator = CoverageCubeMeshResources.CoverageCubeUploadCoordinator(

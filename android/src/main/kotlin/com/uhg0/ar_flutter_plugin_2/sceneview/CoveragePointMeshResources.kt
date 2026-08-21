@@ -50,6 +50,7 @@ internal class CoveragePointMeshResources(
         capacity = capacity,
         uploader = FilamentCoveragePointVertexUploader(engine, vertexBuffer),
         onUploadSubmitted = { bytes -> telemetry?.recordUpload(bytes) },
+        onResourceResetScheduled = { telemetry?.recordResourceResetScheduled() },
         onUploadCallback = { telemetry?.recordUploadCallback() },
         onUploadCompleted = { elapsedNanos -> telemetry?.recordUploadCompletion(elapsedNanos) },
     )
@@ -210,6 +211,7 @@ internal class CoveragePointUploadCoordinator(
     capacity: Int,
     private val uploader: CoveragePointVertexUploader,
     private val onUploadSubmitted: (Int) -> Unit = {},
+    private val onResourceResetScheduled: () -> Unit = {},
     private val onUploadCallback: () -> Unit = {},
     private val onUploadCompleted: (Long) -> Unit = {},
     private val clockNanos: () -> Long = System::nanoTime,
@@ -224,10 +226,6 @@ internal class CoveragePointUploadCoordinator(
     private var activeUploadStartedNanos = 0L
     private var activeSnapshot: CoveragePointRenderSnapshot? = null
     private val pendingRanges = ArrayDeque<UploadRange>()
-    // A page is work for an actual renderer frame. Construction and data
-    // callbacks never create an implicit frame budget.
-    private var frameAvailable = false
-
     fun submit(snapshot: CoveragePointRenderSnapshot) {
         if (destroyed) return
         pendingSnapshot =
@@ -242,17 +240,18 @@ internal class CoveragePointUploadCoordinator(
         // current range. Once its two callbacks return, a newer revision
         // supersedes every remaining chunk from the old snapshot.
         if (uploadBusy) pendingRanges.clear()
-        drain()
     }
 
     /** Rehydrates a new Filament resource generation from the retained cut. */
     fun submitForResourceGeneration(snapshot: CoveragePointRenderSnapshot) {
+        if (destroyed) return
+        onResourceResetScheduled()
         submit(snapshot.copy(update = snapshot.update?.copy(reset = true)))
     }
 
     fun stagingBuffers(): CoveragePointUploadBuffers = buffers
 
-    fun onRendererFrame() { frameAvailable = true; drain() }
+    fun onRendererFrame() = drain()
 
     fun destroy() {
         destroyed = true
@@ -262,7 +261,7 @@ internal class CoveragePointUploadCoordinator(
     }
 
     private fun drain() {
-        if (destroyed || uploadBusy || !frameAvailable) return
+        if (destroyed || uploadBusy) return
         if (pendingRanges.isEmpty()) {
             val snapshot = pendingSnapshot ?: return
             pendingSnapshot = null
@@ -282,7 +281,6 @@ internal class CoveragePointUploadCoordinator(
         }
         val snapshot = checkNotNull(activeSnapshot)
         val range = pendingRanges.removeFirstOrNull() ?: return
-        frameAvailable = false
         val startSlot = range.startSlot
         val endSlot = range.endSlotExclusive
         buffers.writeRange(snapshot.positions, snapshot.colors, startSlot, endSlot)

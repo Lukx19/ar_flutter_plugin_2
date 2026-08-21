@@ -929,13 +929,15 @@ internal class SceneViewHost(
         }
         DisposableEffect(binding) {
             // NodeLifecycle's attach effect is registered before this nested
-            // content effect. Register the binding with the frame callback,
-            // then request the retained reset for this exact resource
-            // generation; a stale outgoing composition cannot revive it.
-            coverageMeshRef.set(binding)
+            // content effect. Queue the retained reset for this exact resource
+            // generation, then publish its frame binding; a stale outgoing
+            // composition cannot revive or replace it.
             binding.updateCoverage(snapshot, coverage.voxelRenderMode)
             binding.updateRawPoints(rawSnapshot)
-            if (binding.attachAfterNodeLifecycle()) {
+            if (binding.attachAfterNodeLifecycle {
+                    coverageMeshRef.set(binding)
+                }
+            ) {
                 onCoverageRendererMounted(true)
             }
             onDispose {
@@ -1108,7 +1110,8 @@ internal class SceneViewHost(
     ) {
         private var latestCoverageSnapshot: CoveragePointRenderSnapshot? = null
         private var latestRawPointSnapshot: CoveragePointRenderSnapshot? = null
-        private var disposed = false
+        @Volatile private var attached = false
+        @Volatile private var disposed = false
 
         fun setNode(value: Node) {
             target.node = value
@@ -1125,29 +1128,34 @@ internal class SceneViewHost(
         ) {
             if (disposed || requestedMode != mode) return
             latestCoverageSnapshot = snapshot
-            if (mode != VoxelRenderMode.POINTS) updateActiveTarget()
+            if (attached && mode != VoxelRenderMode.POINTS) updateActiveTarget()
         }
 
         fun updateRawPoints(snapshot: CoveragePointRenderSnapshot?) {
             if (disposed) return
             latestRawPointSnapshot = snapshot
-            if (mode == VoxelRenderMode.POINTS) updateActiveTarget()
+            if (attached && mode == VoxelRenderMode.POINTS) updateActiveTarget()
         }
 
         fun onRendererFrame() {
-            if (!disposed) target.resources.onRendererFrame()
+            if (attached && !disposed) target.resources.onRendererFrame()
         }
 
         /**
          * Runs from the content of SceneView's [NodeLifecycle], whose own
          * DisposableEffect has already attached the node. The binding is then
-         * registered for the next frame before queuing its retained reset.
+         * prepared before it is registered for a subsequent renderer frame.
          */
-        fun attachAfterNodeLifecycle(): Boolean {
-            if (disposed || !currentGeneration.acceptsAttached(generation)) return false
-            target.resources.requireRetainedSnapshotUpload()
-            updateActiveTarget()
-            return true
+        fun attachAfterNodeLifecycle(registerForFrames: () -> Unit): Boolean {
+            if (disposed) return false
+            return currentGeneration.attachIfCurrent(generation) {
+                attached = true
+                target.resources.requireRetainedSnapshotUpload()
+                updateActiveTarget()
+                // Publish the binding only after its retained reset is queued.
+                // The coordinator will admit that page on a later real frame.
+                registerForFrames()
+            }
         }
 
         private fun updateActiveTarget() {
@@ -1172,6 +1180,7 @@ internal class SceneViewHost(
 
         fun dispose() {
             disposed = true
+            attached = false
             target.node = null
             latestCoverageSnapshot = null
             latestRawPointSnapshot = null
@@ -1181,6 +1190,7 @@ internal class SceneViewHost(
         fun disposeForReplacement() {
             if (disposed) return
             disposed = true
+            attached = false
             target.node?.destroy()
             target.node = null
             latestCoverageSnapshot = null

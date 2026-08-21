@@ -64,6 +64,7 @@ internal class CoverageCubeMeshResources(
         halfSize = halfSize,
         uploader = FilamentCoverageCubeVertexUploader(engine, vertexBuffer),
         onUploadSubmitted = { bytes -> telemetry?.recordUpload(bytes) },
+        onResourceResetScheduled = { telemetry?.recordResourceResetScheduled() },
         onUploadCallback = { telemetry?.recordUploadCallback() },
         onUploadCompleted = { elapsedNanos -> telemetry?.recordUploadCompletion(elapsedNanos) },
     )
@@ -267,6 +268,7 @@ internal class CoverageCubeMeshResources(
         private val halfSize: Float,
         private val uploader: CoverageCubeVertexUploader,
         private val onUploadSubmitted: (Int) -> Unit = {},
+        private val onResourceResetScheduled: () -> Unit = {},
         private val onUploadCallback: () -> Unit = {},
         private val onUploadCompleted: (Long) -> Unit = {},
         private val clockNanos: () -> Long = System::nanoTime,
@@ -289,10 +291,6 @@ internal class CoverageCubeMeshResources(
         // coalesced ordinary revision can retain its exact dirty spans.
         private var hasUploadedSnapshot = false
         private var activeFullUpload = false
-        // A page is work for an actual renderer frame. Construction and data
-        // callbacks never create an implicit frame budget.
-        private var frameAvailable = false
-
         fun submit(snapshot: CoveragePointRenderSnapshot) {
             if (destroyed) return
             pendingSnapshot =
@@ -303,13 +301,14 @@ internal class CoverageCubeMeshResources(
                     snapshot.copy(update = snapshot.update.copy(reset = true))
                 } else {
                     snapshot
-                }
+            }
             if (uploadBusy) pendingRanges.clear()
-            drain()
         }
 
         /** Rehydrates a new Filament resource generation from the retained cut. */
         fun submitForResourceGeneration(snapshot: CoveragePointRenderSnapshot) {
+            if (destroyed) return
+            onResourceResetScheduled()
             submit(snapshot.copy(update = snapshot.update?.copy(reset = true)))
         }
 
@@ -322,12 +321,11 @@ internal class CoverageCubeMeshResources(
         }
 
         fun onRendererFrame() {
-            frameAvailable = true
             drain()
         }
 
         private fun drain() {
-            if (destroyed || uploadBusy || !frameAvailable) return
+            if (destroyed || uploadBusy) return
             if (pendingRanges.isEmpty()) {
                 val snapshot = pendingSnapshot ?: return
                 pendingSnapshot = null
@@ -347,7 +345,6 @@ internal class CoverageCubeMeshResources(
             }
             val snapshot = checkNotNull(activeSnapshot)
             val range = pendingRanges.removeFirstOrNull() ?: return
-            frameAvailable = false
             writeRange(snapshot, range.startSlot, range.endSlotExclusive)
             uploadBusy = true
             consumedCallbackMask = 0

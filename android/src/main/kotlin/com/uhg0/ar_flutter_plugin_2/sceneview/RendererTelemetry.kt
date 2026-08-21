@@ -1,5 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.sceneview
 
+import java.util.concurrent.atomic.AtomicInteger
+
 /**
  * Bounded native renderer accounting exposed by the Android platform-view
  * seam. This counts the buffers and upload calls owned by this renderer; it
@@ -10,6 +12,8 @@ internal class RendererTelemetry {
     private var currentFrameUploadBytes = 0
     private var peakFrameUploadBytes = 0
     private var peakOwnedBufferBytes = 0
+    private val resourceResetScheduledCount = AtomicInteger()
+    private val uploadPageSubmissionCount = AtomicInteger()
     private var uploadCallbackCount = 0
     private var completedUploadCount = 0
     private var totalUploadCompletionNanos = 0L
@@ -50,6 +54,11 @@ internal class RendererTelemetry {
         }
         currentFrameUploadBytes = nextFrameBytes
         peakFrameUploadBytes = maxOf(peakFrameUploadBytes, currentFrameUploadBytes)
+        uploadPageSubmissionCount.incrementAndGet()
+    }
+
+    fun recordResourceResetScheduled() {
+        resourceResetScheduledCount.incrementAndGet()
     }
 
     fun recordUploadCallback() {
@@ -77,6 +86,8 @@ internal class RendererTelemetry {
         "peakOwnedBufferBytes" to peakOwnedBufferBytes,
         "currentUpdateUploadBytes" to currentFrameUploadBytes,
         "peakUpdateUploadBytes" to peakFrameUploadBytes,
+        "resourceResetScheduledCount" to resourceResetScheduledCount.get(),
+        "uploadPageSubmissionCount" to uploadPageSubmissionCount.get(),
         "uploadCallbackCount" to uploadCallbackCount,
         "completedUploadCount" to completedUploadCount,
         "meanUploadCompletionNanos" to if (completedUploadCount == 0) {
