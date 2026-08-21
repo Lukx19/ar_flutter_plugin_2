@@ -267,6 +267,10 @@ class ARVisibilityGridManager {
   }
 
   /// Disarms the debug request seam and clears its retained trace.
+  ///
+  /// Throws [StateError] after this manager is disposed, propagates
+  /// [PlatformException] when the native invocation fails, and throws
+  /// [FormatException] when native code returns a malformed acknowledgement.
   Future<void> disarmDebugBackgroundRequest() async {
     _ensureActive();
     final result = await _channel.invokeMapMethod<Object?, Object?>(
