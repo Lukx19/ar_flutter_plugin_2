@@ -139,6 +139,7 @@ internal class SceneViewHost(
     private val sceneSessionGeneration = sceneSessionGenerationCounter.incrementAndGet()
     private val ownsSceneSession = mutableStateOf(false)
     private var disposed = false
+    @Volatile private var futureResumesBlocked = false
     // SceneView dispatches session updates on its render callback while the
     // platform channel pauses from the Android main thread. A volatile gate
     // prevents a stale read from admitting extra upload frames after pause.
@@ -626,8 +627,14 @@ internal class SceneViewHost(
 
     fun resume() {
         checkNotDisposed()
+        check(!futureResumesBlocked) { "SceneView host is shutting down" }
         activeSession?.resume()
         rendererPaused = false
+    }
+
+    /** Prevents new resume calls while a late in-flight ARCore resume drains. */
+    fun blockFutureResumes() {
+        futureResumesBlocked = true
     }
 
     fun pause() {
@@ -664,6 +671,7 @@ internal class SceneViewHost(
     fun dispose() {
         if (!ownership.onDispose()) return
         disposed = true
+        futureResumesBlocked = true
         cancelCoverageUploadFrame()
         composeView.removeCallbacks(replaySettledTextureResize)
         nodes.clear()

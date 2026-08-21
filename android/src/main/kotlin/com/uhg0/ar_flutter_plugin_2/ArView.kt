@@ -188,9 +188,7 @@ internal class ArView(
         }
 
         override fun onResume(owner: LifecycleOwner) {
-            sceneHost.resume()
-            visibilityGridChannel.resume()
-            if (!sessionPausedByFlutter) captureSession.onSessionResumed()
+            if (!disposed) resumeLifecycleBounded()
         }
     }
 
@@ -212,7 +210,11 @@ internal class ArView(
     override fun dispose() {
         if (disposed) return
         disposed = true
-        resumeCoordinator.dispose(ResumeTerminal.CANCELLED)
+        sceneHost.blockFutureResumes()
+        resumeCoordinator.dispose(ResumeTerminal.CANCELLED, ::disposeAfterResumeDrained)
+    }
+
+    private fun disposeAfterResumeDrained() {
         poseBatchDispatcher.clear()
         prepareForDispose()
         sessionChannel.setMethodCallHandler(null)
@@ -304,43 +306,64 @@ internal class ArView(
     }
 
     private fun resumeSessionBounded(result: MethodChannel.Result) {
+        resumeBounded(clearFlutterPause = true) { terminal ->
+            when (terminal) {
+                ResumeTerminal.SUCCESS -> result.success(null)
+                ResumeTerminal.SUPERSEDED -> result.error(
+                    "SESSION_RESUME_SUPERSEDED",
+                    "A newer resume request replaced this request",
+                    null,
+                )
+                ResumeTerminal.CANCELLED -> result.error(
+                    "SESSION_RESUME_CANCELLED",
+                    "AR view was disposed before Session.resume completed",
+                    null,
+                )
+                ResumeTerminal.TIMEOUT -> result.error(
+                    "SESSION_RESUME_TIMEOUT",
+                    "Session.resume exceeded the 5000ms native bound",
+                    null,
+                )
+                ResumeTerminal.FAILED -> result.error(
+                    "SESSION_RESUME_FAILED",
+                    "Session.resume failed",
+                    null,
+                )
+            }
+        }
+    }
+
+    private fun resumeLifecycleBounded() {
+        resumeBounded(clearFlutterPause = false) {
+            // Lifecycle callbacks have no Dart reply to settle.
+        }
+    }
+
+    private fun resumeBounded(
+        clearFlutterPause: Boolean,
+        onTerminal: (ResumeTerminal) -> Unit,
+    ) {
         resumeCoordinator.begin(
             timeoutMillis = 5_000,
             next = { terminal ->
                 when (terminal) {
                     ResumeTerminal.SUCCESS -> {
-                        sessionPausedByFlutter = false
-                        visibilityGridChannel.resume()
-                        captureSession.onSessionResumed()
-                        result.success(null)
+                        if (!disposed) {
+                            if (clearFlutterPause) sessionPausedByFlutter = false
+                            visibilityGridChannel.resume()
+                            if (!sessionPausedByFlutter) captureSession.onSessionResumed()
+                        }
                     }
-                    ResumeTerminal.SUPERSEDED -> result.error(
-                        "SESSION_RESUME_SUPERSEDED",
-                        "A newer resume request replaced this request",
-                        null,
-                    )
-                    ResumeTerminal.CANCELLED -> result.error(
-                        "SESSION_RESUME_CANCELLED",
-                        "AR view was disposed before Session.resume completed",
-                        null,
-                    )
-                    ResumeTerminal.TIMEOUT -> result.error(
-                        "SESSION_RESUME_TIMEOUT",
-                        "Session.resume exceeded the 5000ms native bound",
-                        null,
-                    )
-                    ResumeTerminal.FAILED -> result.error(
-                        "SESSION_RESUME_FAILED",
-                        "Session.resume failed",
-                        null,
-                    )
+                    else -> Unit
                 }
+                onTerminal(terminal)
             },
             superseded = ResumeTerminal.SUPERSEDED,
             timedOut = ResumeTerminal.TIMEOUT,
             failed = ResumeTerminal.FAILED,
             succeeded = ResumeTerminal.SUCCESS,
             operation = { sceneHost.resume() },
+            rollbackLateSuccess = { sceneHost.pause() },
         )
     }
 

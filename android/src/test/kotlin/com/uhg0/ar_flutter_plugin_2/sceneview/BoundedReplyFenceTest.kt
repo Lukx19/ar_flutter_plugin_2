@@ -6,10 +6,11 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class BoundedReplyFenceTest {
-    @Test fun `production operation coordinator fences late success after timeout and disposal`() {
+    @Test fun `production coordinator serializes late resumes and rolls each one back`() {
         val operations = mutableListOf<() -> Unit>()
         val deadlines = mutableListOf<() -> Unit>()
         val terminals = mutableListOf<String>()
+        val effects = mutableListOf<String>()
         val coordinator = BoundedOperationCoordinator<String>(
             launchOperation = operations::add,
             scheduleDeadline = { _, deadline -> deadlines += deadline },
@@ -22,12 +23,10 @@ class BoundedReplyFenceTest {
             timedOut = "timeout",
             failed = "failed",
             succeeded = "success",
-            operation = {},
+            operation = { effects += "resume-1" },
+            rollbackLateSuccess = { effects += "pause-1" },
         )
         deadlines.single().invoke()
-        operations.single().invoke()
-        assertEquals(listOf("timeout"), terminals)
-
         coordinator.begin(
             timeoutMillis = 1,
             next = terminals::add,
@@ -35,11 +34,42 @@ class BoundedReplyFenceTest {
             timedOut = "timeout",
             failed = "failed",
             succeeded = "success",
-            operation = {},
+            operation = { effects += "resume-2" },
+            rollbackLateSuccess = { effects += "pause-2" },
         )
-        coordinator.dispose("cancelled")
+        assertEquals(1, operations.size)
+        operations.single().invoke()
+        assertEquals(listOf("resume-1", "pause-1"), effects)
+        assertEquals(2, operations.size)
         operations.last().invoke()
-        assertEquals(listOf("timeout", "cancelled"), terminals)
+        assertEquals(listOf("resume-1", "pause-1", "resume-2"), effects)
+        assertEquals(listOf("timeout", "success"), terminals)
+    }
+
+    @Test fun `production coordinator drains late resume rollback before host disposal`() {
+        val operations = mutableListOf<() -> Unit>()
+        val deadlines = mutableListOf<() -> Unit>()
+        val effects = mutableListOf<String>()
+        val coordinator = BoundedOperationCoordinator<String>(
+            launchOperation = operations::add,
+            scheduleDeadline = { _, deadline -> deadlines += deadline },
+            dispatchTerminal = { terminal -> terminal() },
+        )
+        coordinator.begin(
+            timeoutMillis = 1,
+            next = {},
+            superseded = "superseded",
+            timedOut = "timeout",
+            failed = "failed",
+            succeeded = "success",
+            operation = { effects += "resume" },
+            rollbackLateSuccess = { effects += "pause" },
+        )
+        deadlines.single().invoke()
+        coordinator.dispose("cancelled") { effects += "dispose" }
+        assertEquals(emptyList<String>(), effects)
+        operations.single().invoke()
+        assertEquals(listOf("resume", "pause", "dispose"), effects)
     }
     @Test fun `success replies exactly once`() {
         val values = mutableListOf<String>(); val fence = BoundedReplyFence<String>()
