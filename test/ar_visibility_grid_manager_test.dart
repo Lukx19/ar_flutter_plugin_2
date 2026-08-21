@@ -223,6 +223,27 @@ void main() {
     );
     await manager.dispose();
   });
+
+  test('renderer mount fences are bounded when native does not reply',
+      () async {
+    final manager = ARVisibilityGridManager(
+      91,
+      channel: channel,
+      rendererFenceTimeout: Duration.zero,
+    );
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      calls.add(call);
+      if (call.method == 'awaitRendererMounted') {
+        return Completer<Object?>().future;
+      }
+      return true;
+    });
+
+    await expectLater(
+        manager.awaitRendererMounted(), throwsA(isA<TimeoutException>()));
+    await manager.dispose();
+  });
 }
 
 Map<String, Object> _health() => const <String, Object>{

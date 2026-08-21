@@ -7,14 +7,19 @@ import '../models/ar_visibility_grid.dart';
 
 /// Strict Dart endpoint for the per-view `visibility_grid_wire_v1` channel.
 class ARVisibilityGridManager {
-  ARVisibilityGridManager(int viewId, {MethodChannel? channel})
-      : viewId = viewId,
+  ARVisibilityGridManager(
+    int viewId, {
+    MethodChannel? channel,
+    Duration rendererFenceTimeout = const Duration(seconds: 45),
+  })  : viewId = viewId,
+        _rendererFenceTimeout = rendererFenceTimeout,
         _channel = channel ?? MethodChannel('arpointcloud_$viewId') {
     _channel.setMethodCallHandler(_handleNativeCall);
   }
 
   final MethodChannel _channel;
   final int viewId;
+  final Duration _rendererFenceTimeout;
   final StreamController<ARVisibilityGridDelta> _deltas =
       StreamController<ARVisibilityGridDelta>.broadcast(sync: true);
   final StreamController<ARVisibilityGridDeltaSummary> _summaries =
@@ -277,21 +282,27 @@ class ARVisibilityGridManager {
   /// Waits for the native Compose mesh requested by the latest mode change.
   ///
   /// This is a lifecycle fence, not a frame-delay heuristic: it completes
-  /// only after SceneView reports that an actual renderer mesh mounted.
+  /// only after SceneView reports that an actual renderer mesh mounted. The
+  /// wait is bounded so a stopped PlatformView cannot strand its Dart owner.
   Future<void> awaitRendererMounted() async {
     _ensureActive();
-    final mounted = await _channel.invokeMethod<bool>('awaitRendererMounted');
+    final mounted = await _channel
+        .invokeMethod<bool>('awaitRendererMounted')
+        .timeout(_rendererFenceTimeout);
     if (mounted != true) {
       throw StateError('Native visibility-grid renderer did not mount.');
     }
   }
 
   /// Waits until SceneView reports disposal of the active native mesh.
+  ///
+  /// The wait is bounded so teardown can release the owning PlatformView even
+  /// when a Compose disposal callback is lost.
   Future<void> awaitRendererUnmounted() async {
     _ensureActive();
-    final unmounted = await _channel.invokeMethod<bool>(
-      'awaitRendererUnmounted',
-    );
+    final unmounted = await _channel
+        .invokeMethod<bool>('awaitRendererUnmounted')
+        .timeout(_rendererFenceTimeout);
     if (unmounted != true) {
       throw StateError('Native visibility-grid renderer did not unmount.');
     }

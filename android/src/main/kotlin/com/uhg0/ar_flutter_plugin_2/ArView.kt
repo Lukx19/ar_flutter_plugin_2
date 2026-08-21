@@ -173,10 +173,10 @@ internal class ArView(
         },
     )
 
-    private fun setCoverageRendererMounted(mounted: Boolean) {
+    private fun setCoverageRendererMounted(mounted: Boolean, generation: Long) {
         coverageRendererMounted = mounted
         if (::visibilityGridChannel.isInitialized) {
-            visibilityGridChannel.setRendererMounted(mounted)
+            visibilityGridChannel.setRendererMounted(mounted, generation)
         }
     }
 

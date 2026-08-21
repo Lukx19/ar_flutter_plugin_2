@@ -86,7 +86,7 @@ internal class SceneViewHost(
     private val onSessionCreated: (Session) -> Unit = {},
     private val onSessionUpdated: (Session, Frame) -> Unit = { _, _ -> },
     private val onTrackingFailureChanged: (String?) -> Unit = {},
-    private val onCoverageRendererMounted: (Boolean) -> Unit = {},
+    private val onCoverageRendererMounted: (Boolean, Long) -> Unit = { _, _ -> },
     private val onTouch: (MotionEvent, List<PluginHitResult>) -> Unit = { _, _ -> },
     private val onNodeGesture: (String, String, PluginTransform?) -> Unit = { _, _, _ -> },
 ) : SceneViewCaptureHost {
@@ -435,6 +435,7 @@ internal class SceneViewHost(
                         coverage.voxelSizeMeters,
                         coverage.cubeSizeFactor,
                         coverage.pointSizePx,
+                        coverage.rendererGeneration,
                     ) {
                         if (coverage.enabled) {
                             when (coverage.voxelRenderMode) {
@@ -570,7 +571,8 @@ internal class SceneViewHost(
             current.enabled != config.enabled ||
             current.voxelRenderMode != config.voxelRenderMode ||
             current.voxelSizeMeters != config.voxelSizeMeters ||
-            current.cubeSizeFactor != config.cubeSizeFactor
+            current.cubeSizeFactor != config.cubeSizeFactor ||
+            current.rendererGeneration != config.rendererGeneration
         if (requiresReplacement) {
             // Compose can briefly retain an outgoing node during a key change.
             // Destroy its renderer-owned buffers before installing the next
@@ -967,7 +969,7 @@ internal class SceneViewHost(
         snapshot: CoveragePointRenderSnapshot?,
         rawSnapshot: CoveragePointRenderSnapshot?,
         coverageMeshRef: AtomicReference<CoveragePointMeshBinding?>,
-        onCoverageRendererMounted: (Boolean) -> Unit,
+        onCoverageRendererMounted: (Boolean, Long) -> Unit,
     ) {
         SideEffect {
             binding.updateCoverage(snapshot, coverage.voxelRenderMode)
@@ -984,12 +986,14 @@ internal class SceneViewHost(
                     coverageMeshRef.set(binding)
                 }
             ) {
-                onCoverageRendererMounted(true)
+                onCoverageRendererMounted(true, coverage.rendererGeneration)
             }
             onDispose {
                 val wasCurrent = coverageMeshRef.compareAndSet(binding, null)
                 binding.dispose()
-                if (wasCurrent) onCoverageRendererMounted(false)
+                if (wasCurrent) {
+                    onCoverageRendererMounted(false, coverage.rendererGeneration)
+                }
             }
         }
     }

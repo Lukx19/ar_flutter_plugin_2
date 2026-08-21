@@ -319,6 +319,8 @@ data class PointCloudNativeConfig(
     val voxelRenderMode: VoxelRenderMode = VoxelRenderMode.POINTS,
     val voxelSizeMeters: Float = 0.1f,
     val cubeSizeFactor: Float = 1f,
+    /** Identifies one requested Compose renderer resource generation. */
+    val rendererGeneration: Long = 0L,
 ) {
     init {
         require(wireVersion == POINT_CLOUD_WIRE_VERSION)
@@ -329,6 +331,7 @@ data class PointCloudNativeConfig(
         require(minConfidence in 0f..1f)
         require(voxelSizeMeters.isFinite() && voxelSizeMeters > 0f)
         require(cubeSizeFactor.isFinite() && cubeSizeFactor in 0.1f..1f)
+        require(rendererGeneration >= 0L)
     }
 }
 

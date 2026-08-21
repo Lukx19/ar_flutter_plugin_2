@@ -50,12 +50,19 @@ class VisibilityGridMethodChannel(
     @Volatile private var paused = false
     @Volatile private var checkpointBarrierActive = false
     private var pendingCheckpointResult: MethodChannel.Result? = null
-    // Compose owns actual mesh disposal and mounting. Keep its lifecycle
-    // distinct from a requested config mutation so callers can fence a mode
-    // replacement without guessing a frame delay.
-    private var rendererMounted = false
-    private var pendingRendererMountResult: MethodChannel.Result? = null
-    private var pendingRendererUnmountResult: MethodChannel.Result? = null
+    // Compose owns actual mesh disposal and mounting. Its callbacks carry the
+    // requested renderer generation so an outgoing PlatformView composition
+    // cannot satisfy a replacement fence.
+    private val rendererLifecycle = VisibilityGridRendererLifecycle()
+    private data class PendingRendererFence(
+        val generation: Long,
+        val result: MethodChannel.Result,
+        val mount: Boolean,
+    )
+    private var pendingRendererMount: PendingRendererFence? = null
+    private var pendingRendererUnmount: PendingRendererFence? = null
+    private var rendererMountTimeout: Runnable? = null
+    private var rendererUnmountTimeout: Runnable? = null
     private val sensorHandoff = LatestSensorHandoff<FeatureWork, DepthWork>()
     private var featureConfidenceMinimum = 0.30
     private var maxFeaturesPerObservation = 2_000
@@ -273,11 +280,15 @@ class VisibilityGridMethodChannel(
             healthHeartbeatGeneration++
             checkpointResult = pendingCheckpointResult
             pendingCheckpointResult = null
-            rendererMountResult = pendingRendererMountResult
-            pendingRendererMountResult = null
-            rendererUnmountResult = pendingRendererUnmountResult
-            pendingRendererUnmountResult = null
-            rendererMounted = false
+            rendererMountResult = pendingRendererMount?.result
+            pendingRendererMount = null
+            rendererUnmountResult = pendingRendererUnmount?.result
+            pendingRendererUnmount = null
+            rendererMountTimeout?.let(main::removeCallbacks)
+            rendererMountTimeout = null
+            rendererUnmountTimeout?.let(main::removeCallbacks)
+            rendererUnmountTimeout = null
+            rendererLifecycle.clear()
             sensorHandoff.clear()
             frameCadence.reset()
             oldRenderer = renderer
@@ -407,6 +418,7 @@ class VisibilityGridMethodChannel(
             renderer?.dispose()
             renderer = null
             rendererConfig = null
+            rendererLifecycle.clear()
             render(null, null)
             clearRawPoints()
                 renderer =
@@ -425,6 +437,7 @@ class VisibilityGridMethodChannel(
                     enabled = enabled,
                     voxelRenderMode = renderMode,
                     cubeSizeFactor = cubeSizeFactor,
+                    rendererGeneration = rendererLifecycle.requestReplacement(),
                 )
             group = null
             visibilityRevision = 0
@@ -925,7 +938,10 @@ class VisibilityGridMethodChannel(
             call.argument<Boolean>("enabled")
                 ?: throw IllegalArgumentException("enabled is required")
         requireNotNull(renderer).setEnabled(enabled)
-        rendererConfig = requireNotNull(rendererConfig).copy(enabled = enabled)
+        rendererConfig = requireNotNull(rendererConfig).copy(
+            enabled = enabled,
+            rendererGeneration = rendererLifecycle.requestReplacement(),
+        )
         frameCadence.reset()
         if (!enabled) clearRawPoints()
         publishRenderer()
@@ -958,6 +974,7 @@ class VisibilityGridMethodChannel(
         rendererConfig = currentConfig.copy(
             renderCapacity = VisibilityGridRendererState.presentationCapacity(mode),
             voxelRenderMode = mode,
+            rendererGeneration = rendererLifecycle.requestReplacement(),
         )
         frameCadence.reset()
         if (mode != VoxelRenderMode.POINTS) clearRawPoints()
@@ -966,13 +983,31 @@ class VisibilityGridMethodChannel(
     }
 
     /** Called by the SceneView Compose effect after an actual mesh transition. */
-    fun setRendererMounted(mounted: Boolean) {
+    fun setRendererMounted(mounted: Boolean, generation: Long) {
         val pending = synchronized(this) {
-            rendererMounted = mounted
+            val accepted =
+                if (mounted) {
+                    rendererLifecycle.markMounted(generation)
+                } else {
+                    rendererLifecycle.markUnmounted(generation)
+                }
+            if (!accepted) return
             if (mounted) {
-                pendingRendererMountResult.also { pendingRendererMountResult = null }
+                pendingRendererMount
+                    ?.takeIf { it.generation == generation }
+                    ?.also {
+                        pendingRendererMount = null
+                        rendererMountTimeout?.let(main::removeCallbacks)
+                        rendererMountTimeout = null
+                    }
             } else {
-                pendingRendererUnmountResult.also { pendingRendererUnmountResult = null }
+                pendingRendererUnmount
+                    ?.takeIf { it.generation == generation }
+                    ?.also {
+                        pendingRendererUnmount = null
+                        rendererUnmountTimeout?.let(main::removeCallbacks)
+                        rendererUnmountTimeout = null
+                    }
             }
         }
         // A mode or enabled-state replacement installs a fresh Compose mesh.
@@ -981,33 +1016,59 @@ class VisibilityGridMethodChannel(
         // observes the renderer as ready. Without this, a replacement can
         // report mounted while an active AR frame has nothing queued to upload.
         if (mounted) publishRenderer()
-        pending?.success(true)
+        pending?.result?.success(true)
     }
 
     private fun awaitRendererMounted(result: MethodChannel.Result) {
         synchronized(this) {
-            if (rendererMounted) {
+            val generation = rendererLifecycle.requestedGeneration()
+            if (rendererLifecycle.mountedGeneration() == generation) {
                 result.success(true)
                 return
             }
-            check(pendingRendererMountResult == null) {
+            check(pendingRendererMount == null) {
                 "Renderer mount fence is already pending"
             }
-            pendingRendererMountResult = result
+            pendingRendererMount = PendingRendererFence(generation, result, mount = true)
+            rendererMountTimeout = rendererFenceTimeout(generation, mount = true)
+                .also { main.postDelayed(it, RENDERER_FENCE_TIMEOUT_MS) }
         }
     }
 
     private fun awaitRendererUnmounted(result: MethodChannel.Result) {
         synchronized(this) {
-            if (!rendererMounted) {
+            val generation = rendererLifecycle.mountedGeneration()
+            if (generation == null) {
                 result.success(true)
                 return
             }
-            check(pendingRendererUnmountResult == null) {
+            check(pendingRendererUnmount == null) {
                 "Renderer unmount fence is already pending"
             }
-            pendingRendererUnmountResult = result
+            pendingRendererUnmount = PendingRendererFence(generation, result, mount = false)
+            rendererUnmountTimeout = rendererFenceTimeout(generation, mount = false)
+                .also { main.postDelayed(it, RENDERER_FENCE_TIMEOUT_MS) }
         }
+    }
+
+    private fun rendererFenceTimeout(generation: Long, mount: Boolean): Runnable = Runnable {
+        val pending = synchronized(this) {
+            val candidate = if (mount) pendingRendererMount else pendingRendererUnmount
+            if (candidate?.generation != generation) return@Runnable
+            if (mount) {
+                pendingRendererMount = null
+                rendererMountTimeout = null
+            } else {
+                pendingRendererUnmount = null
+                rendererUnmountTimeout = null
+            }
+            candidate
+        }
+        pending.result.error(
+            "VG_RENDERER_FENCE_TIMEOUT",
+            "Renderer ${if (mount) "mount" else "unmount"} fence timed out for generation $generation",
+            null,
+        )
     }
 
     private fun publishRenderer() {
@@ -1380,6 +1441,7 @@ data class VisibilityGridRuntimeCapabilities(
 }
 
 private const val HEALTH_HEARTBEAT_INTERVAL_MS = 1_000L
+private const val RENDERER_FENCE_TIMEOUT_MS = 30_000L
 
 internal class VisibilityGridMethodException(
     val code: String,
