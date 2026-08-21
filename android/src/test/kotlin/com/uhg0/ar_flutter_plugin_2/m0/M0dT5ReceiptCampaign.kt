@@ -322,8 +322,10 @@ internal object M0dT5ReceiptCampaign {
             CoverageRendererLimits.rendererStateBytes(VoxelRenderMode.CUBES),
             cubeState.ownedStorageBytes,
         )
-        resources.replace(
-            create = { construct(VoxelRenderMode.CUBES) },
+        resources.replaceCube(
+            CoverageRendererLimits.CUBE_CAPACITY,
+            "active",
+            create = { _, _, _ -> construct(VoxelRenderMode.CUBES) },
             release = { it.release() },
         )
         val maximum = telemetry.snapshot().getValue("ownedBufferBytes") as Int
@@ -346,8 +348,11 @@ internal object M0dT5ReceiptCampaign {
             )
         }.isFailure
         assertTrue(limitPlusOneRejected)
-        resources.replace(
-            create = { construct(VoxelRenderMode.CENTROIDS) },
+        resources.replacePoint(
+            VoxelRenderMode.CENTROIDS,
+            CoverageRendererLimits.CENTROID_CAPACITY,
+            "active",
+            create = { _, _, _ -> construct(VoxelRenderMode.CENTROIDS) },
             release = { it.release() },
         )
         assertEquals(maximum, telemetry.snapshot().getValue("peakOwnedBufferBytes"))

@@ -13,19 +13,32 @@ class CoverageRendererSelectionTest {
     @Test
     fun `production resource factory releases the old generation before creating replacement`() {
         val events = mutableListOf<String>()
+        val modes = mutableListOf<com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode>()
         val factory = CoverageRendererResourceFactory()
-        factory.replace(
-            create = { "cube".also { events += "create:$it" } },
+        factory.replaceCube(
+            8_000,
+            "cubes",
+            create = { mode, capacity, owner -> "cube".also { events += "create:$it:$mode:$capacity:$owner"; modes += mode } },
             release = { value: String -> events += "release:$value" },
         )
-        factory.replace(
-            create = { "centroid".also { events += "create:$it" } },
+        factory.replacePoint(
+            com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS,
+            20_000,
+            "centroids",
+            create = { mode, capacity, owner -> "centroid".also { events += "create:$it:$mode:$capacity:$owner"; modes += mode } },
             release = { value: String -> events += "release:$value" },
         )
         factory.clear()
         assertEquals(
-            listOf("create:cube", "release:cube", "create:centroid", "release:centroid"),
+            listOf("create:cube:CUBES:8000:cubes", "release:cube", "create:centroid:CENTROIDS:20000:centroids", "release:centroid"),
             events,
+        )
+        assertEquals(
+            listOf(
+                com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CUBES,
+                com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS,
+            ),
+            modes,
         )
     }
 

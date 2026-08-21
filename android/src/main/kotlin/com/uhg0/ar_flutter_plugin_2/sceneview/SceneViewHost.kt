@@ -808,8 +808,11 @@ internal class SceneViewHost(
         generation: Long,
     ): CoverageMeshAttachment {
         val resources = remember(engine) {
-            coverageResourceFactory.replace(
-                create = { CoveragePointMeshResources(engine, CoverageRendererLimits.RAW_POINT_CAPACITY, telemetry, "coverage-points") },
+            coverageResourceFactory.replacePoint(
+                VoxelRenderMode.POINTS,
+                CoverageRendererLimits.RAW_POINT_CAPACITY,
+                "coverage-points",
+                create = { _, capacity, owner -> CoveragePointMeshResources(engine, capacity, telemetry, owner) },
                 release = CoverageVoxelMeshResources::destroy,
             )
         }
@@ -854,8 +857,11 @@ internal class SceneViewHost(
         generation: Long,
     ): CoverageMeshAttachment {
         val resources = remember(engine) {
-            coverageResourceFactory.replace(
-                create = { CoveragePointMeshResources(engine, CoverageRendererLimits.CENTROID_CAPACITY, telemetry, "coverage-centroids") },
+            coverageResourceFactory.replacePoint(
+                VoxelRenderMode.CENTROIDS,
+                CoverageRendererLimits.CENTROID_CAPACITY,
+                "coverage-centroids",
+                create = { _, capacity, owner -> CoveragePointMeshResources(engine, capacity, telemetry, owner) },
                 release = CoverageVoxelMeshResources::destroy,
             )
         }
@@ -904,8 +910,10 @@ internal class SceneViewHost(
             coverage.voxelSizeMeters,
             coverage.cubeSizeFactor,
         ) {
-            coverageResourceFactory.replace(
-                create = { CoverageCubeMeshResources(engine, CoverageRendererLimits.CUBE_CAPACITY, coverage.voxelSizeMeters * coverage.cubeSizeFactor, telemetry, "coverage-cubes") },
+            coverageResourceFactory.replaceCube(
+                CoverageRendererLimits.CUBE_CAPACITY,
+                "coverage-cubes",
+                create = { _, capacity, owner -> CoverageCubeMeshResources(engine, capacity, coverage.voxelSizeMeters * coverage.cubeSizeFactor, telemetry, owner) },
                 release = CoverageVoxelMeshResources::destroy,
             )
         }
