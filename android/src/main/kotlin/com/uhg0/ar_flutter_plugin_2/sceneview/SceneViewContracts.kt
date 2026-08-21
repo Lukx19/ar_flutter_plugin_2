@@ -228,3 +228,30 @@ internal class SharedCameraSceneLifecycleGate(sharedCameraRequested: Boolean) {
         resumeAllowed = true
     }
 }
+
+/** Exactly-once terminal reply fence for a bounded, replaceable native operation. */
+internal class BoundedReplyFence<T> {
+    private var generation = 0L
+    private var reply: ((T) -> Unit)? = null
+
+    fun begin(next: (T) -> Unit, superseded: T): Long {
+        reply?.invoke(superseded)
+        generation++
+        reply = next
+        return generation
+    }
+
+    fun settle(token: Long, terminal: T): Boolean {
+        if (token != generation) return false
+        val current = reply ?: return false
+        reply = null
+        current(terminal)
+        return true
+    }
+
+    fun dispose(cancelled: T) {
+        generation++
+        reply?.invoke(cancelled)
+        reply = null
+    }
+}
