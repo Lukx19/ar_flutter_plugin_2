@@ -402,6 +402,10 @@ internal class CoverageCubeMeshResources(
             ) {
                 consumed(uploadId, COLOR_CALLBACK)
             }
+            // Submit the paired position/color page as one bounded unit. The
+            // direct buffers remain owned until Filament delivers both real
+            // consumption callbacks.
+            uploader.flush()
         }
 
         private fun writeRange(
@@ -532,6 +536,8 @@ internal class CoverageCubeMeshResources(
             byteCount: Int,
             onConsumed: () -> Unit,
         )
+
+        fun flush() = Unit
     }
 
     private class FilamentCoverageCubeVertexUploader(
@@ -572,6 +578,10 @@ internal class CoverageCubeMeshResources(
                 callbackHandler,
                 Runnable(onConsumed),
             )
+        }
+
+        override fun flush() {
+            engine.flush()
         }
     }
 }

@@ -12,6 +12,23 @@ import org.junit.Test
 
 class CoveragePointUploadCoordinatorTest {
     @Test
+    fun `each bounded page explicitly flushes after both point buffers are queued`() {
+        val uploader = FakeUploader()
+        val coordinator = CoveragePointUploadCoordinator(capacity = 2, uploader = uploader)
+
+        coordinator.submit(snapshot(1, 1f))
+        coordinator.onRendererFrame()
+
+        // Filament's ownership callbacks are dispatched only after queued
+        // commands are submitted to the driver. The frame scheduler owns the
+        // page boundary; it must also explicitly flush that boundary.
+        assertEquals(1, uploader.flushCount)
+        uploader.completeAll()
+        coordinator.onRendererFrame()
+        assertEquals(1, uploader.flushCount)
+    }
+
+    @Test
     fun `retained reset and checkpoint pages retain separate origins`() {
         val uploader = FakeUploader()
         val submittedOrigins = mutableListOf<RendererUploadPageOrigin>()
@@ -312,6 +329,7 @@ private class FakeUploader : CoveragePointVertexUploader {
     val pendingCallbacks = mutableListOf<() -> Unit>()
     val positionOffsets = mutableListOf<Int>()
     val colorOffsets = mutableListOf<Int>()
+    var flushCount = 0
 
     override fun uploadPositions(
         buffer: FloatBuffer,
@@ -337,6 +355,10 @@ private class FakeUploader : CoveragePointVertexUploader {
         buffer.duplicate().get(copy)
         colorSubmissions += copy
         pendingCallbacks += onConsumed
+    }
+
+    override fun flush() {
+        flushCount++
     }
 
     fun completeNext() {
