@@ -6,10 +6,41 @@ import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CoveragePointUploadCoordinatorTest {
+    @Test
+    fun `only the attached current generation rehydrates a retained cut`() {
+        val generationGate = CoverageMeshGenerationGate()
+        val oldGeneration = generationGate.reserve()
+        // The outgoing composition requests rehydration before NodeLifecycle
+        // attaches it. A replacement is reserved before that attach runs.
+        val replacementGeneration = generationGate.reserve()
+        val oldUploader = FakeUploader()
+        val replacementUploader = FakeUploader()
+        val oldCoordinator = CoveragePointUploadCoordinator(2, oldUploader)
+        val replacementCoordinator = CoveragePointUploadCoordinator(2, replacementUploader)
+        val retained = snapshot(7, 7f, withEmptyUpdate = true)
+
+        assertFalse(generationGate.acceptsAttached(oldGeneration))
+        if (generationGate.acceptsAttached(oldGeneration)) {
+            oldCoordinator.submitForResourceGeneration(retained)
+        }
+        if (generationGate.acceptsAttached(replacementGeneration)) {
+            replacementCoordinator.submitForResourceGeneration(retained)
+        }
+        oldCoordinator.onRendererFrame()
+        replacementCoordinator.onRendererFrame()
+        oldUploader.completeAll()
+        replacementUploader.completeAll()
+
+        assertTrue(oldUploader.positionSubmissions.isEmpty())
+        assertEquals(1, replacementUploader.positionSubmissions.size)
+        assertEquals(1, replacementUploader.colorSubmissions.size)
+    }
+
     @Test
     fun `busy slot preserves A bytes and coalesces pending updates`() {
         val uploader = FakeUploader()

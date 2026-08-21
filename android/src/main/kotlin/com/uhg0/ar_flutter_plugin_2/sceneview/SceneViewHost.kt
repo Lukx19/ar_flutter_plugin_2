@@ -118,6 +118,8 @@ internal class SceneViewHost(
     private val coverageSnapshotRef = AtomicReference<CoveragePointRenderSnapshot?>()
     private val rawPointSnapshotRef = AtomicReference<CoveragePointRenderSnapshot?>()
     private val coverageMeshRef = AtomicReference<CoveragePointMeshBinding?>()
+    /** Monotonic key that prevents an outgoing Compose attach from rehydrating a new mesh. */
+    private val coverageResourceGeneration = CoverageMeshGenerationGate()
     private val sharedCameraLifecycleGate = SharedCameraSceneLifecycleGate(
         Session.Feature.SHARED_CAMERA in sessionFeatures,
     )
@@ -427,15 +429,27 @@ internal class SceneViewHost(
                     ) {
                         if (coverage.enabled) {
                             when (coverage.voxelRenderMode) {
-                                VoxelRenderMode.POINTS -> NodeLifecycle(
-                                    CoverageActivePointNode(engine, materialLoader, rendererTelemetry, coverage, coverageSnapshotRef.get(), rawPointSnapshotRef.get(), coverageMeshRef, onCoverageRendererMounted),
-                                ) {}
-                                VoxelRenderMode.CENTROIDS -> NodeLifecycle(
-                                    CoverageActiveCentroidNode(engine, materialLoader, rendererTelemetry, coverage, coverageSnapshotRef.get(), rawPointSnapshotRef.get(), coverageMeshRef, onCoverageRendererMounted),
-                                ) {}
-                                VoxelRenderMode.CUBES -> NodeLifecycle(
-                                    CoverageActiveCubeNode(engine, materialLoader, rendererTelemetry, coverage, coverageSnapshotRef.get(), rawPointSnapshotRef.get(), coverageMeshRef, onCoverageRendererMounted),
-                                ) {}
+                                VoxelRenderMode.POINTS -> {
+                                    val generation = remember { coverageResourceGeneration.reserve() }
+                                    val active = CoverageActivePointNode(engine, materialLoader, rendererTelemetry, coverage, generation)
+                                    NodeLifecycle(active.node) {
+                                        CoverageActiveBindingEffect(active.binding, coverage, coverageSnapshotRef.get(), rawPointSnapshotRef.get(), coverageMeshRef, onCoverageRendererMounted)
+                                    }
+                                }
+                                VoxelRenderMode.CENTROIDS -> {
+                                    val generation = remember { coverageResourceGeneration.reserve() }
+                                    val active = CoverageActiveCentroidNode(engine, materialLoader, rendererTelemetry, coverage, generation)
+                                    NodeLifecycle(active.node) {
+                                        CoverageActiveBindingEffect(active.binding, coverage, coverageSnapshotRef.get(), rawPointSnapshotRef.get(), coverageMeshRef, onCoverageRendererMounted)
+                                    }
+                                }
+                                VoxelRenderMode.CUBES -> {
+                                    val generation = remember { coverageResourceGeneration.reserve() }
+                                    val active = CoverageActiveCubeNode(engine, materialLoader, rendererTelemetry, coverage, generation)
+                                    NodeLifecycle(active.node) {
+                                        CoverageActiveBindingEffect(active.binding, coverage, coverageSnapshotRef.get(), rawPointSnapshotRef.get(), coverageMeshRef, onCoverageRendererMounted)
+                                    }
+                                }
                             }
                         }
                     }
@@ -752,11 +766,8 @@ internal class SceneViewHost(
         materialLoader: MaterialLoader,
         telemetry: RendererTelemetry,
         coverage: PointCloudNativeConfig,
-        snapshot: CoveragePointRenderSnapshot?,
-        rawSnapshot: CoveragePointRenderSnapshot?,
-        coverageMeshRef: AtomicReference<CoveragePointMeshBinding?>,
-        onCoverageRendererMounted: (Boolean) -> Unit,
-    ): Node {
+        generation: Long,
+    ): CoverageMeshAttachment {
         val resources = remember(engine) {
             CoveragePointMeshResources(
                 engine,
@@ -776,16 +787,10 @@ internal class SceneViewHost(
                 mode = VoxelRenderMode.POINTS,
                 target = CoverageMeshTarget(resources, materialInstance),
                 pointSizePx = coverage.pointSizePx,
+                generation = generation,
+                currentGeneration = coverageResourceGeneration,
             )
         }
-        CoverageActiveBindingEffect(
-            binding,
-            coverage,
-            snapshot,
-            rawSnapshot,
-            coverageMeshRef,
-            onCoverageRendererMounted,
-        )
         val node = remember(engine, resources, material, materialInstance) {
             CoverageOwnedMeshNode(
                 engine,
@@ -798,7 +803,7 @@ internal class SceneViewHost(
                 materialLoader.destroyMaterial(material)
             }.also(binding::setNode)
         }
-        return node
+        return CoverageMeshAttachment(node, binding)
     }
 
     @Composable
@@ -807,11 +812,8 @@ internal class SceneViewHost(
         materialLoader: MaterialLoader,
         telemetry: RendererTelemetry,
         coverage: PointCloudNativeConfig,
-        snapshot: CoveragePointRenderSnapshot?,
-        rawSnapshot: CoveragePointRenderSnapshot?,
-        coverageMeshRef: AtomicReference<CoveragePointMeshBinding?>,
-        onCoverageRendererMounted: (Boolean) -> Unit,
-    ): Node {
+        generation: Long,
+    ): CoverageMeshAttachment {
         val resources = remember(engine) {
             CoveragePointMeshResources(
                 engine,
@@ -831,16 +833,10 @@ internal class SceneViewHost(
                 mode = VoxelRenderMode.CENTROIDS,
                 target = CoverageMeshTarget(resources, materialInstance),
                 pointSizePx = coverage.pointSizePx,
+                generation = generation,
+                currentGeneration = coverageResourceGeneration,
             )
         }
-        CoverageActiveBindingEffect(
-            binding,
-            coverage,
-            snapshot,
-            rawSnapshot,
-            coverageMeshRef,
-            onCoverageRendererMounted,
-        )
         val node = remember(engine, resources, material, materialInstance) {
             CoverageOwnedMeshNode(
                 engine,
@@ -853,7 +849,7 @@ internal class SceneViewHost(
                 materialLoader.destroyMaterial(material)
             }.also(binding::setNode)
         }
-        return node
+        return CoverageMeshAttachment(node, binding)
     }
 
     @Composable
@@ -862,11 +858,8 @@ internal class SceneViewHost(
         materialLoader: MaterialLoader,
         telemetry: RendererTelemetry,
         coverage: PointCloudNativeConfig,
-        snapshot: CoveragePointRenderSnapshot?,
-        rawSnapshot: CoveragePointRenderSnapshot?,
-        coverageMeshRef: AtomicReference<CoveragePointMeshBinding?>,
-        onCoverageRendererMounted: (Boolean) -> Unit,
-    ): Node {
+        generation: Long,
+    ): CoverageMeshAttachment {
         val resources = remember(
             engine,
             coverage.voxelSizeMeters,
@@ -894,16 +887,10 @@ internal class SceneViewHost(
                 mode = VoxelRenderMode.CUBES,
                 target = CoverageMeshTarget(resources, materialInstance),
                 pointSizePx = coverage.pointSizePx,
+                generation = generation,
+                currentGeneration = coverageResourceGeneration,
             )
         }
-        CoverageActiveBindingEffect(
-            binding,
-            coverage,
-            snapshot,
-            rawSnapshot,
-            coverageMeshRef,
-            onCoverageRendererMounted,
-        )
         val node = remember(
             engine,
             resources,
@@ -924,7 +911,7 @@ internal class SceneViewHost(
                 materialLoader.destroyMaterial(material)
             }.also(binding::setNode)
         }
-        return node
+        return CoverageMeshAttachment(node, binding)
     }
 
     @Composable
@@ -941,11 +928,16 @@ internal class SceneViewHost(
             binding.updateRawPoints(rawSnapshot)
         }
         DisposableEffect(binding) {
+            // NodeLifecycle's attach effect is registered before this nested
+            // content effect. Register the binding with the frame callback,
+            // then request the retained reset for this exact resource
+            // generation; a stale outgoing composition cannot revive it.
             coverageMeshRef.set(binding)
             binding.updateCoverage(snapshot, coverage.voxelRenderMode)
             binding.updateRawPoints(rawSnapshot)
-            binding.rehydrateRetainedCoverageAfterMount()
-            onCoverageRendererMounted(true)
+            if (binding.attachAfterNodeLifecycle()) {
+                onCoverageRendererMounted(true)
+            }
             onDispose {
                 val wasCurrent = coverageMeshRef.compareAndSet(binding, null)
                 binding.dispose()
@@ -1101,11 +1093,18 @@ internal class SceneViewHost(
         var node: Node? = null
     }
 
+    private data class CoverageMeshAttachment(
+        val node: Node,
+        val binding: CoveragePointMeshBinding,
+    )
+
     /** Owns exactly one active presentation mesh; replacements are fenced first. */
     private class CoveragePointMeshBinding(
         private val mode: VoxelRenderMode,
         private val target: CoverageMeshTarget,
         private val pointSizePx: Float,
+        private val generation: Long,
+        private val currentGeneration: CoverageMeshGenerationGate,
     ) {
         private var latestCoverageSnapshot: CoveragePointRenderSnapshot? = null
         private var latestRawPointSnapshot: CoveragePointRenderSnapshot? = null
@@ -1139,10 +1138,16 @@ internal class SceneViewHost(
             if (!disposed) target.resources.onRendererFrame()
         }
 
-        fun rehydrateRetainedCoverageAfterMount() {
-            if (disposed || mode == VoxelRenderMode.POINTS) return
+        /**
+         * Runs from the content of SceneView's [NodeLifecycle], whose own
+         * DisposableEffect has already attached the node. The binding is then
+         * registered for the next frame before queuing its retained reset.
+         */
+        fun attachAfterNodeLifecycle(): Boolean {
+            if (disposed || !currentGeneration.acceptsAttached(generation)) return false
             target.resources.requireRetainedSnapshotUpload()
             updateActiveTarget()
+            return true
         }
 
         private fun updateActiveTarget() {
