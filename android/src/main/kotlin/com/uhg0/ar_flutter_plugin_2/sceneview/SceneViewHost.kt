@@ -561,7 +561,6 @@ internal class SceneViewHost(
             return
         }
 
-        rendererAllocationLedger.installPersistentCoverageStateForCapacity(snapshot.capacity)
         coverageSnapshotRef.set(snapshot)
         val current = coverageRenderConfig.value
         val requiresReplacement = current == null ||
@@ -576,11 +575,23 @@ internal class SceneViewHost(
             // Destroy its renderer-owned buffers before installing the next
             // mode so a same-mode cube recreation cannot double the ledger.
             coverageMeshRef.get()?.disposeForReplacement()
+            // Do not let Compose observe the new resource mode until every
+            // ledger owner has the new capacity. In particular a centroid
+            // snapshot hand-off is 20k rows; replacing a cube while it is
+            // still charged would produce a real transient over the shared
+            // cap even though each active mode fits on its own.
+            rendererAllocationLedger.installPersistentCoverageStateForCapacity(
+                snapshot.capacity,
+            )
+            rendererAllocationLedger.updateSnapshotHandoff(config.voxelRenderMode)
             coverageRenderConfig.value = config
         } else {
+            rendererAllocationLedger.installPersistentCoverageStateForCapacity(
+                snapshot.capacity,
+            )
+            rendererAllocationLedger.updateSnapshotHandoff(config.voxelRenderMode)
             coverageMeshRef.get()?.updateCoverage(snapshot, config.voxelRenderMode)
         }
-        rendererAllocationLedger.updateSnapshotHandoff(config.voxelRenderMode)
     }
 
     fun updateRawPointCloud(snapshot: CoveragePointRenderSnapshot?) {
