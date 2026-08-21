@@ -150,7 +150,14 @@ class CoveragePointUploadCoordinatorTest {
         val oldUploader = FakeUploader()
         val replacementUploader = FakeUploader()
         val oldCoordinator = CoveragePointUploadCoordinator(2, oldUploader)
-        val replacementCoordinator = CoveragePointUploadCoordinator(2, replacementUploader)
+        val replacementCallbackOrigins = mutableListOf<RendererUploadPageOrigin>()
+        val replacementCompletionOrigins = mutableListOf<RendererUploadPageOrigin>()
+        val replacementCoordinator = CoveragePointUploadCoordinator(
+            capacity = 2,
+            uploader = replacementUploader,
+            onUploadCallbackAttributed = replacementCallbackOrigins::add,
+            onUploadCompletedAttributed = { _, origin -> replacementCompletionOrigins += origin },
+        )
         val retained = snapshot(7, 7f, withEmptyUpdate = true)
 
         // The current binding attaches first. A delayed outgoing Compose
@@ -169,6 +176,20 @@ class CoveragePointUploadCoordinatorTest {
         assertTrue(oldUploader.positionSubmissions.isEmpty())
         assertEquals(1, replacementUploader.positionSubmissions.size)
         assertEquals(1, replacementUploader.colorSubmissions.size)
+        // A recreated centroid resource owns one paired point page: position
+        // and color each release once, then the page completes once. The
+        // completion can be synchronous with a caller's start acknowledgement.
+        assertEquals(
+            listOf(
+                RendererUploadPageOrigin.RESOURCE_GENERATION_RESET,
+                RendererUploadPageOrigin.RESOURCE_GENERATION_RESET,
+            ),
+            replacementCallbackOrigins,
+        )
+        assertEquals(
+            listOf(RendererUploadPageOrigin.RESOURCE_GENERATION_RESET),
+            replacementCompletionOrigins,
+        )
     }
 
     @Test
