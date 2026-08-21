@@ -938,6 +938,12 @@ class VisibilityGridMethodChannel(
                 pendingRendererUnmountResult.also { pendingRendererUnmountResult = null }
             }
         }
+        // A mode or enabled-state replacement installs a fresh Compose mesh.
+        // Re-publish only after that mesh has crossed its mount fence so its
+        // new upload coordinator receives the retained snapshot before Dart
+        // observes the renderer as ready. Without this, a replacement can
+        // report mounted while an active AR frame has nothing queued to upload.
+        if (mounted) publishRenderer()
         pending?.success(true)
     }
 
