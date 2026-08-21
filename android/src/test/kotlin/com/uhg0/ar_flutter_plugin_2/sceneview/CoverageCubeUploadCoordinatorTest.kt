@@ -28,7 +28,7 @@ class CoverageCubeUploadCoordinatorTest {
     }
 
     @Test
-    fun `each bounded page explicitly flushes after both cube buffers are queued`() {
+    fun `each bounded page completes its driver submission fence after both cube buffers are queued`() {
         val uploader = FakeCubeUploader()
         val coordinator = CoverageCubeMeshResources.CoverageCubeUploadCoordinator(
             capacity = 1,
@@ -39,10 +39,10 @@ class CoverageCubeUploadCoordinatorTest {
         coordinator.submit(cubeSnapshot(1, floatArrayOf(1f, 1f, 1f)))
         coordinator.onRendererFrame()
 
-        assertEquals(1, uploader.flushCount)
+        assertEquals(1, uploader.submissionFenceCount)
         uploader.completeAll()
         coordinator.onRendererFrame()
-        assertEquals(1, uploader.flushCount)
+        assertEquals(1, uploader.submissionFenceCount)
     }
 
     @Test
@@ -345,7 +345,7 @@ private class FakeCubeUploader : CoverageCubeMeshResources.CoverageCubeVertexUpl
     val colorSubmissions = mutableListOf<ByteArray>()
     val positionElementCounts = mutableListOf<Int>()
     val colorByteCounts = mutableListOf<Int>()
-    var flushCount = 0
+    var submissionFenceCount = 0
     val positionOffsets = mutableListOf<Int>()
     val colorOffsets = mutableListOf<Int>()
     private val pendingCallbacks = mutableListOf<() -> Unit>()
@@ -378,8 +378,8 @@ private class FakeCubeUploader : CoverageCubeMeshResources.CoverageCubeVertexUpl
         pendingCallbacks += onConsumed
     }
 
-    override fun flush() {
-        flushCount++
+    override fun completeSubmissionFence() {
+        submissionFenceCount++
     }
 
     fun completeAll() {

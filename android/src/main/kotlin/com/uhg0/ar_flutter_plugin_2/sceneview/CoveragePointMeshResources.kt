@@ -215,8 +215,13 @@ internal interface CoveragePointVertexUploader {
         onConsumed: () -> Unit,
     )
 
-    /** Submits this page's paired position/color updates to Filament. */
-    fun flush() = Unit
+    /**
+     * Completes submission of this bounded paired page to Filament's command
+     * stream. The ownership callbacks remain the only release/completion
+     * signal; this fence merely guarantees the driver has consumed the queued
+     * transfer commands instead of waiting on an incidental later draw.
+     */
+    fun completeSubmissionFence() = Unit
 }
 
 internal class CoveragePointUploadCoordinator(
@@ -348,10 +353,10 @@ internal class CoveragePointUploadCoordinator(
             startSlot * CoveragePointMeshResources.COLOR_COMPONENTS,
             (endSlot - startSlot) * CoveragePointMeshResources.COLOR_COMPONENTS,
         ) { consumed(uploadId, COLOR_CALLBACK) }
-        // setBufferAt queues transfer work. Flush the two-buffer page once so
-        // Filament can release the direct staging buffers through its actual
-        // callbacks even when the next scene draw is deferred by the host.
-        uploader.flush()
+        // setBufferAt queues transfer work. Complete this <=64KiB paired page
+        // so Filament can dispatch its actual ownership callbacks without
+        // depending on an incidental later scene draw.
+        uploader.completeSubmissionFence()
     }
 
     private fun consumed(uploadId: Long, callbackBit: Int) {
@@ -452,7 +457,7 @@ private class FilamentCoveragePointVertexUploader(
         )
     }
 
-    override fun flush() {
-        engine.flush()
+    override fun completeSubmissionFence() {
+        engine.flushAndWait()
     }
 }
