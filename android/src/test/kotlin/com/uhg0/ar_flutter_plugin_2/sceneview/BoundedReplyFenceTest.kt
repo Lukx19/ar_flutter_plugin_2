@@ -110,11 +110,11 @@ class BoundedReplyFenceTest {
         )
         assertEquals(1, operations.size)
         operations.single().invoke()
-        assertEquals(listOf("resume-1", "pause", "rollback-1"), effects)
+        assertEquals(listOf("pause", "resume-1", "rollback-1"), effects)
         assertEquals(2, operations.size)
         operations.last().invoke()
         assertEquals(
-            listOf("resume-1", "pause", "rollback-1", "resume-2"),
+            listOf("pause", "resume-1", "rollback-1", "resume-2"),
             effects,
         )
         assertEquals(listOf("superseded", "success"), terminals)
