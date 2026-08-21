@@ -514,6 +514,141 @@ final class ARVisibilityGridBackgroundWorker {
   }
 }
 
+/// One cancellable platform request issued from the background coverage
+/// isolate. Cancellation completes only after native code has acknowledged
+/// that it completed the original MethodChannel result exactly once.
+final class ARVisibilityGridBackgroundRequest<T> {
+  const ARVisibilityGridBackgroundRequest._({
+    required this.requestId,
+    required this.result,
+    required Future<bool> Function() cancel,
+  }) : _cancel = cancel;
+
+  final String requestId;
+  final Future<T> result;
+  final Future<bool> Function() _cancel;
+
+  Future<bool> cancel() => _cancel();
+}
+
+/// Production request/ack protocol used by a background-isolate grid owner.
+///
+/// A client is isolate-local and keeps monotonically increasing request IDs.
+/// The native endpoint retains each original result until either the operation
+/// or an explicit cancellation completes it, while suppressing late replies.
+final class ARVisibilityGridBackgroundChannel {
+  ARVisibilityGridBackgroundChannel._(this._channel, this._requestPrefix);
+
+  /// Connects this background isolate to one platform view.
+  factory ARVisibilityGridBackgroundChannel.connect({
+    required ui.RootIsolateToken rootIsolateToken,
+    required int viewId,
+  }) {
+    BackgroundIsolateBinaryMessenger.ensureInitialized(rootIsolateToken);
+    return ARVisibilityGridBackgroundChannel._(
+      MethodChannel(
+        'arpointcloud_$viewId',
+        const StandardMethodCodec(),
+        BackgroundIsolateBinaryMessenger.instance,
+      ),
+      'view-$viewId',
+    );
+  }
+
+  /// Injects the real MethodChannel seam for host tests.
+  factory ARVisibilityGridBackgroundChannel.forTesting(MethodChannel channel) =>
+      ARVisibilityGridBackgroundChannel._(channel, 'test');
+
+  final MethodChannel _channel;
+  final String _requestPrefix;
+  int _nextRequest = 0;
+
+  ARVisibilityGridBackgroundRequest<ARVisibilityGridDelta> pullDelta({
+    required String groupId,
+    required int groupGeneration,
+    required int sessionGeneration,
+  }) =>
+      _request<ARVisibilityGridDelta>(
+        method: 'pullGridDelta',
+        arguments: <String, Object>{
+          'version': visibilityGridWireVersion,
+          'groupId': groupId,
+          'groupGeneration': groupGeneration,
+          'sessionGeneration': sessionGeneration,
+        },
+        decode: (value) => ARVisibilityGridDelta.fromMap(value),
+        missingMessage: 'Missing worker-pulled visibility delta.',
+      );
+
+  ARVisibilityGridBackgroundRequest<bool> applyVisibility(
+    ARVisibilityGridVisibilityPatch patch,
+  ) =>
+      _request<bool>(
+        method: 'applyVisibility',
+        arguments: patch.toMap(),
+        decode: (value) => value['applied'] == true,
+        missingMessage: 'Missing worker visibility application receipt.',
+      );
+
+  ARVisibilityGridBackgroundRequest<ARVisibilityGridVisibilityRevision>
+      getAppliedVisibilityRevision({
+    required String groupId,
+    required int groupGeneration,
+    required int sessionGeneration,
+  }) =>
+          _request<ARVisibilityGridVisibilityRevision>(
+            method: 'getVisibilityRevision',
+            arguments: <String, Object>{
+              'version': visibilityGridWireVersion,
+              'groupId': groupId,
+              'groupGeneration': groupGeneration,
+              'sessionGeneration': sessionGeneration,
+            },
+            decode: ARVisibilityGridVisibilityRevision.fromMap,
+            missingMessage: 'Missing visibility-grid revision receipt.',
+          );
+
+  ARVisibilityGridBackgroundRequest<T> _request<T>({
+    required String method,
+    required Map<String, Object> arguments,
+    required T Function(Map<Object?, Object?> value) decode,
+    required String missingMessage,
+  }) {
+    final requestId = '$_requestPrefix-${++_nextRequest}';
+    final result = _channel.invokeMapMethod<Object?, Object?>(
+      method,
+      <String, Object>{
+        ...arguments,
+        'backgroundRequestId': requestId,
+      },
+    ).then<T>((value) {
+      if (value == null) throw FormatException(missingMessage);
+      return decode(value);
+    });
+    return ARVisibilityGridBackgroundRequest<T>._(
+      requestId: requestId,
+      result: result,
+      cancel: () => _cancel(requestId),
+    );
+  }
+
+  Future<bool> _cancel(String requestId) async {
+    final response = await _channel.invokeMapMethod<Object?, Object?>(
+      'cancelBackgroundRequest',
+      <String, Object>{
+        'version': visibilityGridWireVersion,
+        'backgroundRequestId': requestId,
+      },
+    );
+    if (response?['acknowledged'] != true) {
+      throw const FormatException(
+        'Native visibility-grid cancellation was not acknowledged.',
+      );
+    }
+    return response?['cancelled'] == true;
+  }
+}
+
 Map<Object?, Object?> _map(Object? value) {
   if (value is! Map) {
     throw const FormatException('Expected visibility-grid map payload.');

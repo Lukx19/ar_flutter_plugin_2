@@ -40,6 +40,7 @@ class VisibilityGridMethodChannel(
             drainOne = ::drainOneSensorBatch,
         )
     private val lifecycleGuard = VisibilityGridLifecycleGuard()
+    private val backgroundRequests = CancellableBackgroundRequestRegistry()
     @Volatile private var grid: NativeVisibilityGrid? = null
     private var renderer: VisibilityGridRendererState? = null
     @Volatile private var rendererConfig: PointCloudNativeConfig? = null
@@ -103,7 +104,7 @@ class VisibilityGridMethodChannel(
                 "init" -> initialize(call, result)
                 "startGrid" -> startGrid(call, result)
                 "startGridSummary" -> startGrid(call, result, summaryOnly = true)
-                "pullGridDelta" -> pullGridDelta(call, result)
+                "pullGridDelta" -> backgroundCall(call, result, ::pullGridDelta)
                 "ackGeometry" -> result.success(
                     mapOf("accepted" to requireGrid().ackGeometry(call.geometryAck())),
                 )
@@ -115,8 +116,10 @@ class VisibilityGridMethodChannel(
                             ?: throw IllegalStateException("Visibility group is not started"),
                     )
                 }
-                "applyVisibility" -> applyVisibility(call, result)
-                "getVisibilityRevision" -> getVisibilityRevision(call, result)
+                "applyVisibility" -> backgroundCall(call, result, ::applyVisibility)
+                "getVisibilityRevision" ->
+                    backgroundCall(call, result, ::getVisibilityRevision)
+                "cancelBackgroundRequest" -> cancelBackgroundRequest(call, result)
                 "checkpointBarrier" -> checkpointBarrier(call, result)
                 "releaseCheckpoint" -> releaseCheckpoint(call, result)
                 "setPointsEnabled" -> setPointsEnabled(call, result)
@@ -315,11 +318,53 @@ class VisibilityGridMethodChannel(
             "Visibility grid was disposed before renderer unmount",
             null,
         )
+        backgroundRequests.cancelAll()
         executor.shutdownNow()
         channel.setMethodCallHandler(null)
         oldRenderer?.dispose()
         render(null, null)
         clearRawPoints()
+    }
+
+    private fun backgroundResult(
+        call: MethodCall,
+        result: MethodChannel.Result,
+    ): MethodChannel.Result {
+        val requestId = call.argument<String>("backgroundRequestId") ?: return result
+        return backgroundRequests.register(requestId, result)
+    }
+
+    private fun backgroundCall(
+        call: MethodCall,
+        result: MethodChannel.Result,
+        operation: (MethodCall, MethodChannel.Result) -> Unit,
+    ) {
+        val target = backgroundResult(call, result)
+        try {
+            operation(call, target)
+        } catch (error: VisibilityGridMethodException) {
+            target.error(error.code, error.message, null)
+        } catch (error: IllegalArgumentException) {
+            target.error("VG_PROTOCOL_INVALID", error.message, null)
+        } catch (error: IllegalStateException) {
+            target.error("VG_NOT_INITIALIZED", error.message, null)
+        } catch (error: Exception) {
+            target.error("VG_INTERNAL", error.message, null)
+        }
+    }
+
+    private fun cancelBackgroundRequest(call: MethodCall, result: MethodChannel.Result) {
+        val requestId = call.argument<String>("backgroundRequestId")
+            ?.takeIf(String::isNotBlank)
+            ?: throw IllegalArgumentException("backgroundRequestId must be non-empty")
+        val cancelled = backgroundRequests.cancel(requestId)
+        // cancel() synchronously completes the original result before this ACK.
+        result.success(
+            mapOf(
+                "acknowledged" to true,
+                "cancelled" to cancelled,
+            ),
+        )
     }
 
     private fun handleM0aControl(call: MethodCall, result: MethodChannel.Result) {
