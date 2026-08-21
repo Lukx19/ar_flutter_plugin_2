@@ -258,3 +258,34 @@ internal class BoundedReplyFence<T> {
         reply = null
     }
 }
+
+/** Production coordinator for a blocking operation with an independent deadline. */
+internal class BoundedOperationCoordinator<T>(
+    private val launchOperation: ((() -> Unit) -> Unit),
+    private val scheduleDeadline: (Long, () -> Unit) -> Unit,
+    private val dispatchTerminal: ((() -> Unit) -> Unit),
+) {
+    private val fence = BoundedReplyFence<T>()
+
+    fun begin(
+        timeoutMillis: Long,
+        next: (T) -> Unit,
+        superseded: T,
+        timedOut: T,
+        failed: T,
+        succeeded: T,
+        operation: () -> Unit,
+    ): Long {
+        val token = fence.begin(next, superseded)
+        scheduleDeadline(timeoutMillis) {
+            dispatchTerminal { fence.settle(token, timedOut) }
+        }
+        launchOperation {
+            val terminal = if (runCatching(operation).isSuccess) succeeded else failed
+            dispatchTerminal { fence.settle(token, terminal) }
+        }
+        return token
+    }
+
+    fun dispose(cancelled: T) = fence.dispose(cancelled)
+}

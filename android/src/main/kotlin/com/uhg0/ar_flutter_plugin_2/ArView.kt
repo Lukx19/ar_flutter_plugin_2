@@ -26,7 +26,7 @@ import com.uhg0.ar_flutter_plugin_2.sceneview.PluginNodeSource
 import com.uhg0.ar_flutter_plugin_2.sceneview.PluginSessionConfig
 import com.uhg0.ar_flutter_plugin_2.sceneview.PluginTransform
 import com.uhg0.ar_flutter_plugin_2.sceneview.SceneViewHost
-import com.uhg0.ar_flutter_plugin_2.sceneview.BoundedReplyFence
+import com.uhg0.ar_flutter_plugin_2.sceneview.BoundedOperationCoordinator
 import com.uhg0.ar_flutter_plugin_2.sceneview.decompose
 import com.uhg0.ar_flutter_plugin_2.sceneview.resolveNodeUri
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridMethodChannel
@@ -80,7 +80,6 @@ internal class ArView(
     private var shutdownPrepared = false
     private var disposed = false
     private var coverageRendererMounted = false
-    private val resumeReplyFence = BoundedReplyFence<ResumeTerminal>()
     private val pendingCloudOperations = mutableSetOf<() -> Unit>()
 
     private enum class ResumeTerminal {
@@ -90,6 +89,11 @@ internal class ArView(
         TIMEOUT,
         FAILED,
     }
+    private val resumeCoordinator = BoundedOperationCoordinator<ResumeTerminal>(
+        launchOperation = { operation -> scope.launch(Dispatchers.Default) { operation() } },
+        scheduleDeadline = { delayMillis, operation -> scope.launch { delay(delayMillis); operation() } },
+        dispatchTerminal = { operation -> scope.launch { operation() } },
+    )
 
     private val sceneHost = SceneViewHost(
         context = context,
@@ -208,7 +212,7 @@ internal class ArView(
     override fun dispose() {
         if (disposed) return
         disposed = true
-        resumeReplyFence.dispose(ResumeTerminal.CANCELLED)
+        resumeCoordinator.dispose(ResumeTerminal.CANCELLED)
         poseBatchDispatcher.clear()
         prepareForDispose()
         sessionChannel.setMethodCallHandler(null)
@@ -300,7 +304,8 @@ internal class ArView(
     }
 
     private fun resumeSessionBounded(result: MethodChannel.Result) {
-        val generation = resumeReplyFence.begin(
+        resumeCoordinator.begin(
+            timeoutMillis = 5_000,
             next = { terminal ->
                 when (terminal) {
                     ResumeTerminal.SUCCESS -> {
@@ -332,24 +337,11 @@ internal class ArView(
                 }
             },
             superseded = ResumeTerminal.SUPERSEDED,
+            timedOut = ResumeTerminal.TIMEOUT,
+            failed = ResumeTerminal.FAILED,
+            succeeded = ResumeTerminal.SUCCESS,
+            operation = { sceneHost.resume() },
         )
-        // SceneViewHost.resume is a blocking Android call. A coroutine timeout
-        // around it cannot fire while the caller is blocked, so schedule the
-        // deadline independently on the view lifecycle scope.
-        scope.launch {
-            delay(5_000)
-            resumeReplyFence.settle(generation, ResumeTerminal.TIMEOUT)
-        }
-        scope.launch(Dispatchers.Default) {
-            val terminal = if (runCatching { sceneHost.resume() }.isSuccess) {
-                ResumeTerminal.SUCCESS
-            } else {
-                ResumeTerminal.FAILED
-            }
-            // MethodChannel and renderer state stay on the view scope; the
-            // synchronized fence rejects timeout/dispose/superseded completions.
-            scope.launch { resumeReplyFence.settle(generation, terminal) }
-        }
     }
 
     @Suppress("UNCHECKED_CAST")
