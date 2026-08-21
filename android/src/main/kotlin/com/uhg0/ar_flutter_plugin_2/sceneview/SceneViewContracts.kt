@@ -293,21 +293,25 @@ internal class BoundedOperationCoordinator<T>(
         operation: () -> Unit,
         rollbackLateSuccess: () -> Unit,
     ): Long {
-        val token = fence.begin(next, superseded)
-        val pending = Operation(
-            token = token,
-            timedOut = timedOut,
-            failed = failed,
-            succeeded = succeeded,
-            operation = operation,
-            rollbackLateSuccess = rollbackLateSuccess,
-        )
+        lateinit var pending: Operation<T>
         var start: Operation<T>? = null
         synchronized(lock) {
+            // This admission check and fence registration must be one critical
+            // section. Otherwise a begin racing a completed dispose can retain
+            // a callback after disposal has already emitted SESSION_ERROR.
             check(!disposed) { "Operation coordinator is disposed" }
+            val token = fence.begin(next, superseded)
+            pending = Operation(
+                token = token,
+                timedOut = timedOut,
+                failed = failed,
+                succeeded = succeeded,
+                operation = operation,
+                rollbackLateSuccess = rollbackLateSuccess,
+            )
             // A not-yet-started request has no native side effect. Replace it
-            // outright; BoundedReplyFence has already returned its terminal
-            // reply as superseded.
+            // outright; BoundedReplyFence has returned its terminal reply as
+            // superseded while this coordinator is still open.
             queued?.abandonedBeforeStart = true
             if (running == null) {
                 running = pending
@@ -318,7 +322,7 @@ internal class BoundedOperationCoordinator<T>(
         }
         scheduleDeadline(timeoutMillis) {
             dispatchTerminal {
-                fence.settle(token, timedOut)
+                fence.settle(pending.token, timedOut)
                 synchronized(lock) {
                     if (queued === pending) {
                         pending.abandonedBeforeStart = true
@@ -328,7 +332,7 @@ internal class BoundedOperationCoordinator<T>(
             }
         }
         start?.let(::launch)
-        return token
+        return pending.token
     }
 
     /**
@@ -336,7 +340,6 @@ internal class BoundedOperationCoordinator<T>(
      * operation has returned and a late successful resume has been rolled back.
      */
     fun dispose(cancelled: T, onDrained: () -> Unit) {
-        fence.dispose(cancelled)
         var drainNow = false
         synchronized(lock) {
             if (disposed) return
@@ -347,6 +350,9 @@ internal class BoundedOperationCoordinator<T>(
             drainNow = running == null
             if (drainNow) onDisposedDrained = null
         }
+        // No begin can install a reply after disposed was set under lock.
+        // Fence the one already admitted reply exactly once outside that lock.
+        fence.dispose(cancelled)
         if (drainNow) onDrained()
     }
 
