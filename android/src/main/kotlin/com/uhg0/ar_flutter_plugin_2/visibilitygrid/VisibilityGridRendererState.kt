@@ -169,6 +169,9 @@ class VisibilityGridRendererState(
                 index * COVERAGE_RENDERER_STYLE_ROW_BYTES,
             )
         }
+        if (!CoverageRendererStyleRowV1.hasCoherentGenerations(decoded.asIterable())) {
+            return false
+        }
         patchKeys.indices.forEach { index ->
             val row = rowsByKey[patchKeys[index]] ?: return@forEach
             val current = styleAt(row)

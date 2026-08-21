@@ -455,6 +455,50 @@ void main() {
       );
     });
 
+    test('rejects a mixed semantic style cut while retaining row residency', () {
+      final active = ARCoverageRendererStyleRowV1(
+        semanticGeneration: 8,
+        styleGeneration: 3,
+        residency: ARCoverageRendererResidency.activeL0,
+      );
+      final warm = ARCoverageRendererStyleRowV1(
+        semanticGeneration: 8,
+        styleGeneration: 3,
+        residency: ARCoverageRendererResidency.warmL1,
+      );
+      expect(
+        () => ARVisibilityGridVisibilityPatch(
+          groupId: 'group-1',
+          groupGeneration: 7,
+          sessionGeneration: 11,
+          geometryRevision: 4,
+          visibilityRevision: 9,
+          keys: Int64List.fromList(<int>[10, 20]),
+          styles: <ARCoverageRendererStyleRowV1>[active, warm],
+        ),
+        returnsNormally,
+      );
+      expect(
+        () => ARVisibilityGridVisibilityPatch(
+          groupId: 'group-1',
+          groupGeneration: 7,
+          sessionGeneration: 11,
+          geometryRevision: 4,
+          visibilityRevision: 9,
+          keys: Int64List.fromList(<int>[10, 20]),
+          styles: <ARCoverageRendererStyleRowV1>[
+            active,
+            ARCoverageRendererStyleRowV1(
+              semanticGeneration: 7,
+              styleGeneration: 4,
+              residency: ARCoverageRendererResidency.warmL1,
+            ),
+          ],
+        ),
+        throwsArgumentError,
+      );
+    });
+
     test('rejects duplicate visibility keys', () {
       expect(
         () => ARVisibilityGridVisibilityPatch(

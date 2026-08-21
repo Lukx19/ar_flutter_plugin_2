@@ -88,6 +88,23 @@ class M0dRendererCorpusTest {
                 assertEquals(COVERAGE_RENDERER_MAX_STYLE_PATCH_ROWS + 1, testCase.int("overflowRows"))
                 return
             }
+            "coherent-cut" -> {
+                val rows = testCase.getValue("rows").jsonArray.map { element ->
+                    val row = element.jsonObject
+                    CoverageRendererStyleRowV1(
+                        semanticGeneration = row.int("semanticGeneration").toLong(),
+                        styleGeneration = row.int("styleGeneration").toLong(),
+                        residency = CoverageRendererResidency.entries.first {
+                            it.name.toWire() == row.getValue("residency").jsonPrimitive.content
+                        },
+                    )
+                }
+                assertEquals(
+                    testCase.getValue("expected").jsonObject.getValue("accepted").jsonPrimitive.boolean,
+                    CoverageRendererStyleRowV1.hasCoherentGenerations(rows),
+                )
+                return
+            }
         }
         val expected = testCase.getValue("expected").jsonObject
         when (kind) {

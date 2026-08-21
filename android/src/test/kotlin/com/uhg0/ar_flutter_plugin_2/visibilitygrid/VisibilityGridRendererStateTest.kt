@@ -5,6 +5,7 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererCoverage
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererCut
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererGlyph
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererResidency
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import org.junit.Assert.assertArrayEquals
@@ -121,6 +122,37 @@ class VisibilityGridRendererStateTest {
                 2,
                 longArrayOf(key),
                 styles(complete.copy(styleGeneration = 2)),
+            ),
+        )
+    }
+
+    @Test
+    fun `renderer rejects mixed geometry semantic style and residency cuts`() {
+        val state = VisibilityGridRendererState(capacity = 2)
+        val first = packVisibilityGridKey(0, 0, 0)
+        val second = packVisibilityGridKey(1, 0, 0)
+        state.startGroup(group(2), geometryRevision = 4, restoredKeys = longArrayOf(first, second))
+        val current = CoverageRendererStyleRowV1(
+            semanticGeneration = 8,
+            styleGeneration = 3,
+            residency = CoverageRendererResidency.ACTIVE_L0,
+        )
+
+        assertFalse(state.applyVisibility(3, 1, longArrayOf(first), styles(current)))
+        assertFalse(
+            state.applyVisibility(
+                4,
+                1,
+                longArrayOf(first, second),
+                styles(current, current.copy(residency = CoverageRendererResidency.WARM_L1, styleGeneration = 4)),
+            ),
+        )
+        assertTrue(
+            state.applyVisibility(
+                4,
+                1,
+                longArrayOf(first, second),
+                styles(current, current.copy(residency = CoverageRendererResidency.WARM_L1)),
             ),
         )
     }

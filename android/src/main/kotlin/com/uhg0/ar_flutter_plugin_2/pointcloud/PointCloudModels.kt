@@ -196,6 +196,24 @@ data class CoverageRendererStyleRowV1(
     }
 
     companion object {
+        /** A renderer packet may contain many rows, but only one committed cut. */
+        fun hasCoherentGenerations(rows: Iterable<CoverageRendererStyleRowV1>): Boolean {
+            var semanticGeneration: Long? = null
+            var styleGeneration: Long? = null
+            rows.forEach { row ->
+                if (semanticGeneration == null) {
+                    semanticGeneration = row.semanticGeneration
+                    styleGeneration = row.styleGeneration
+                } else if (
+                    row.semanticGeneration != semanticGeneration ||
+                    row.styleGeneration != styleGeneration
+                ) {
+                    return false
+                }
+            }
+            return true
+        }
+
         fun decode(bytes: ByteArray, offset: Int = 0): CoverageRendererStyleRowV1 {
             require(offset >= 0 && bytes.size - offset >= COVERAGE_RENDERER_STYLE_ROW_BYTES)
             val data = ByteBuffer.wrap(bytes, offset, COVERAGE_RENDERER_STYLE_ROW_BYTES)

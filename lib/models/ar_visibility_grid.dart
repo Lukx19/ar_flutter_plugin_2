@@ -565,6 +565,25 @@ final class ARCoverageRendererStyleRowV1 {
   final ARCoverageRendererAge age;
   final ARCoverageRendererSourceHealth sourceHealth;
 
+  /// True when a packet's rows name one committed semantic/style cut.
+  ///
+  /// Residency is intentionally per-row presentation state within that cut,
+  /// not a separately publishable snapshot.
+  static bool hasCoherentGenerations(
+    Iterable<ARCoverageRendererStyleRowV1> rows,
+  ) {
+    int? semantic;
+    int? style;
+    for (final row in rows) {
+      semantic ??= row.semanticGeneration;
+      style ??= row.styleGeneration;
+      if (row.semanticGeneration != semantic || row.styleGeneration != style) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   Uint8List encode() {
     final bytes = Uint8List(coverageRendererStyleRowV1Bytes);
     final data = ByteData.sublistView(bytes);
@@ -696,6 +715,9 @@ class ARVisibilityGridVisibilityPatch {
         keys.length != this.styles.length ||
         _hasDuplicates(keys)) {
       throw ArgumentError('Invalid visibility-grid visibility patch.');
+    }
+    if (!ARCoverageRendererStyleRowV1.hasCoherentGenerations(this.styles)) {
+      throw ArgumentError('Visibility patch contains mixed renderer cuts.');
     }
   }
 
