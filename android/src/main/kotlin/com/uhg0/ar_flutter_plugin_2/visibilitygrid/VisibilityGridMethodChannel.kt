@@ -938,6 +938,11 @@ class VisibilityGridMethodChannel(
         val currentConfig = requireNotNull(rendererConfig)
         if (currentConfig.voxelRenderMode != mode) {
             val retained = current.snapshot()
+            // The retained cut is plain bounded data. Release the old renderer
+            // and its selector/dirty-state ownership before constructing the
+            // replacement so a mode change never temporarily keeps two
+            // production renderer states alive outside the shared 8 MiB ledger.
+            current.dispose()
             val replacement = VisibilityGridRendererState(
                 capacity = VisibilityGridRendererState.presentationCapacity(mode),
                 defaultColor = currentConfig.defaultColor,
@@ -948,7 +953,6 @@ class VisibilityGridMethodChannel(
             group?.let { activeGroup ->
                 replacement.rehydrate(activeGroup, retained)
             }
-            current.dispose()
             renderer = replacement
         }
         rendererConfig = currentConfig.copy(
