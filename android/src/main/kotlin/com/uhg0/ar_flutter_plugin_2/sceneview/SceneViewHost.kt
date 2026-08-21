@@ -72,6 +72,7 @@ import io.github.sceneview.rememberModelLoader
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.sqrt
 import kotlin.math.asin
 import kotlin.math.atan2
@@ -133,6 +134,10 @@ internal class SceneViewHost(
     private val rendererTelemetry = RendererTelemetry()
     private val rendererAllocationLedger = CoverageRendererAllocationLedger(rendererTelemetry)
     private val coverageResourceFactory = CoverageRendererResourceFactory()
+    // A PlatformView replacement must not overlap the outgoing Compose-owned
+    // ARCore/Filament session. See [SceneViewSessionLease].
+    private val sceneSessionGeneration = sceneSessionGenerationCounter.incrementAndGet()
+    private val ownsSceneSession = mutableStateOf(false)
     private var disposed = false
     // SceneView dispatches session updates on its render callback while the
     // platform channel pauses from the Android main thread. A volatile gate
@@ -242,6 +247,23 @@ internal class SceneViewHost(
         setViewTreeViewModelStoreOwner(viewModelStoreOwner)
         setViewTreeSavedStateRegistryOwner(savedStateRegistryOwner)
         setContent {
+            DisposableEffect(sceneSessionGeneration) {
+                sceneSessionLease.request(sceneSessionGeneration) {
+                    if (disposed) {
+                        sceneSessionLease.releaseOrCancel(sceneSessionGeneration)
+                    } else {
+                        ownsSceneSession.value = true
+                    }
+                }
+                onDispose {
+                    // Compose disposes nested ARSceneView effects before this
+                    // host effect, so releasing here hands off only after the
+                    // outgoing ARCore and Filament resources are gone.
+                    sceneSessionLease.releaseOrCancel(sceneSessionGeneration)
+                }
+            }
+            if (!ownsSceneSession.value) return@setContent
+
             val engine = rememberEngine()
             val modelLoader = rememberModelLoader(engine)
             val materialLoader = rememberMaterialLoader(engine)
@@ -1264,6 +1286,9 @@ internal class SceneViewHost(
     }
 
     private companion object {
+        val sceneSessionLease = SceneViewSessionLease()
+        val sceneSessionGenerationCounter = AtomicLong()
+
         fun defaultConfig() = PluginSessionConfig(
             showPlanes = true,
             showFeaturePoints = false,
