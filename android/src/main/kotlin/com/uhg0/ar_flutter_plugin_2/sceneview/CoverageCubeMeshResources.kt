@@ -261,6 +261,10 @@ internal class CoverageCubeMeshResources(
         private var activeUploadStartedNanos = 0L
         private var activeSnapshot: CoveragePointRenderSnapshot? = null
         private val pendingRanges = ArrayDeque<UploadRange>()
+        // A completed reset establishes the mesh baseline. Afterwards a
+        // coalesced ordinary revision can retain its exact dirty spans.
+        private var hasUploadedSnapshot = false
+        private var activeFullUpload = false
         // A page is work for an actual renderer frame. Construction and data
         // callbacks never create an implicit frame budget.
         private var frameAvailable = false
@@ -268,7 +272,10 @@ internal class CoverageCubeMeshResources(
         fun submit(snapshot: CoveragePointRenderSnapshot) {
             if (destroyed) return
             pendingSnapshot =
-                if ((uploadBusy || pendingRanges.isNotEmpty()) && snapshot.update?.reset == false) {
+                if (!hasUploadedSnapshot &&
+                    (uploadBusy || pendingRanges.isNotEmpty() || pendingSnapshot != null) &&
+                    snapshot.update?.reset == false
+                ) {
                     snapshot.copy(update = snapshot.update.copy(reset = true))
                 } else {
                     snapshot
@@ -282,6 +289,7 @@ internal class CoverageCubeMeshResources(
             pendingSnapshot = null
             activeSnapshot = null
             pendingRanges.clear()
+            activeFullUpload = false
         }
 
         fun onRendererFrame() {
@@ -294,8 +302,19 @@ internal class CoverageCubeMeshResources(
             if (pendingRanges.isEmpty()) {
                 val snapshot = pendingSnapshot ?: return
                 pendingSnapshot = null
+                val update = snapshot.update
+                val fullUpload = !hasUploadedSnapshot || update == null || update.reset
+                val spans = update?.spans.orEmpty()
+                if (!fullUpload && spans.isEmpty()) return
                 activeSnapshot = snapshot
-                pendingRanges.addAll(uploadRanges(snapshot.count))
+                activeFullUpload = fullUpload
+                pendingRanges.addAll(
+                    uploadRanges(
+                        count = snapshot.count,
+                        fullUpload = fullUpload,
+                        spans = spans,
+                    ),
+                )
             }
             val snapshot = checkNotNull(activeSnapshot)
             val range = pendingRanges.removeFirstOrNull() ?: return
@@ -392,18 +411,37 @@ internal class CoverageCubeMeshResources(
             if (consumedCallbackMask == BOTH_CALLBACKS) {
                 onUploadCompleted((clockNanos() - activeUploadStartedNanos).coerceAtLeast(0L))
                 uploadBusy = false
-                if (pendingRanges.isEmpty()) activeSnapshot = null
+                if (pendingRanges.isEmpty()) {
+                    if (activeFullUpload) hasUploadedSnapshot = true
+                    activeSnapshot = null
+                }
                 // A completed callback only releases the page. The next page
                 // is admitted by a distinct rendered frame.
             }
         }
 
-        private fun uploadRanges(count: Int): List<UploadRange> = buildList {
-            var start = 0
-            while (start < count) {
-                val end = minOf(start + MAX_VOXELS_PER_UPLOAD, count)
-                add(UploadRange(start, end))
-                start = end
+        private fun uploadRanges(
+            count: Int,
+            fullUpload: Boolean,
+            spans: List<com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan>,
+        ): List<UploadRange> {
+            val sourceRanges =
+                if (fullUpload) {
+                    listOf(UploadRange(0, count))
+                } else {
+                    spans.map { span ->
+                        UploadRange(span.startSlot, span.startSlot + span.colors.size)
+                    }
+                }
+            return buildList {
+                sourceRanges.forEach { range ->
+                    var start = range.startSlot
+                    while (start < range.endSlotExclusive) {
+                        val end = minOf(start + MAX_VOXELS_PER_UPLOAD, range.endSlotExclusive)
+                        add(UploadRange(start, end))
+                        start = end
+                    }
+                }
             }
         }
 

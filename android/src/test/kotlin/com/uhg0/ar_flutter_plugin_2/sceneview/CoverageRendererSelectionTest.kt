@@ -158,15 +158,15 @@ class CoverageRendererSelectionTest {
     }
 
     @Test
-    fun `new lower identity replaces only by an explicit reset`() {
-        val selector = CoveragePresentationSelector(2)
+    fun `new lower identity replaces one full selector slot without moving retained slots`() {
+        val selector = CoveragePresentationSelector(3)
         selector.select(
             CoveragePointRenderSnapshot(
                 revision = 1,
                 enabled = true,
-                capacity = 3,
+                capacity = 4,
                 count = 3,
-                keys = longArrayOf(30, 10, 20),
+                keys = longArrayOf(30, 20, 40),
                 positions = FloatArray(9),
                 colors = IntArray(3),
             ),
@@ -178,7 +178,7 @@ class CoverageRendererSelectionTest {
                 enabled = true,
                 capacity = 4,
                 count = 4,
-                keys = longArrayOf(30, 10, 20, 5),
+                keys = longArrayOf(30, 20, 40, 10),
                 positions = FloatArray(12),
                 colors = IntArray(4),
                 update = com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate(
@@ -198,7 +198,14 @@ class CoverageRendererSelectionTest {
             ),
         )
 
-        assertArrayEquals(longArrayOf(5, 10), bounded.keys)
-        assertTrue(checkNotNull(bounded.update).reset)
+        // 20 and 30 retain their presentation destinations. The largest
+        // selected key (40) is evicted and its slot is deterministically
+        // reused by the newly admitted lower key (10).
+        assertArrayEquals(longArrayOf(20, 30, 10), bounded.keys)
+        val update = checkNotNull(bounded.update)
+        assertEquals(false, update.reset)
+        assertEquals(1, update.spans.size)
+        assertEquals(2, update.spans.single().startSlot)
+        assertEquals(1, update.spans.single().colors.size)
     }
 }

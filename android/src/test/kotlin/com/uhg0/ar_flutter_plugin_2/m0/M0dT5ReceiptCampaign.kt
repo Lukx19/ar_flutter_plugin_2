@@ -10,6 +10,7 @@ import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePointVertexUploader
 import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationSelector
 import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageRendererLimits
 import com.uhg0.ar_flutter_plugin_2.sceneview.RendererTelemetry
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.LongRowIndex
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.FloatBuffer
@@ -192,16 +193,27 @@ internal object M0dT5ReceiptCampaign {
                 ),
             ),
         )
-        val retained = initial.keys.toSet().intersect(final.keys.toSet()).size
-        val replacedRows = initial.count - retained
-        val churnFraction = replacedRows.toDouble() / initial.count
-        assertEquals(1, replacedRows)
+        val initialDestinations = LongRowIndex(initial.count)
+        initial.keys.forEachIndexed { destination, key -> initialDestinations[key] = destination }
+        var retainedSlotMoves = 0
+        var changedDestinations = 0
+        final.keys.forEachIndexed { destination, key ->
+            if (initial.keys[destination] != key) changedDestinations++
+            val priorDestination = initialDestinations[key]
+            if (priorDestination != null && priorDestination != destination) retainedSlotMoves++
+        }
+        val churnFraction = changedDestinations.toDouble() / initial.count
+        assertEquals(1, changedDestinations)
+        assertEquals(0, retainedSlotMoves)
         assertTrue(churnFraction < 0.02)
-        assertEquals(0L, final.keys.first())
-        assertEquals(19_999L, final.keys.last())
+        assertEquals(1L, final.keys.first())
+        assertEquals(0L, final.keys.last())
+        assertFalse(checkNotNull(final.update).reset)
+        assertEquals(19_999, final.update.spans.single().startSlot)
         return buildJsonObject {
             put("finalSemanticRows", finalKeys.size)
-            put("replacedRows", replacedRows)
+            put("changedDestinationRows", changedDestinations)
+            put("retainedSlotMoves", retainedSlotMoves)
             put("churnPartsPerMillion", (churnFraction * 1_000_000).toInt())
             put("churnLimitPartsPerMillion", 20_000)
             put("replacementReset", checkNotNull(final.update).reset)

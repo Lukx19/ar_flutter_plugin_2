@@ -79,6 +79,33 @@ class CoverageCubeUploadCoordinatorTest {
     }
 
     @Test
+    fun `queued incremental cube update keeps its one dirty destination`() {
+        val uploader = FakeCubeUploader()
+        val coordinator = CoverageCubeMeshResources.CoverageCubeUploadCoordinator(
+            capacity = 2,
+            halfSize = 0.5f,
+            uploader = uploader,
+        )
+
+        coordinator.submit(twoCubeSnapshot(1, 1f))
+        coordinator.onRendererFrame()
+        uploader.completeAll()
+
+        coordinator.submit(twoCubeSnapshot(2, 2f, dirtySecondCube = true))
+        coordinator.onRendererFrame()
+        coordinator.submit(twoCubeSnapshot(3, 3f, dirtySecondCube = true))
+        uploader.completeAll()
+        coordinator.onRendererFrame()
+
+        // The retained baseline makes this a one-row update, even after a
+        // busy callback coalesces it. A reset would submit both cubes at
+        // destination zero instead.
+        assertEquals(listOf(0, 8 * 3 * Float.SIZE_BYTES, 8 * 3 * Float.SIZE_BYTES), uploader.positionOffsets)
+        assertEquals(8 * 3, uploader.positionSubmissions.last().size)
+        assertEquals(2.5f, uploader.positionSubmissions.last().first(), 0f)
+    }
+
+    @Test
     fun `cube corners follow the visibility grid rotation`() {
         val uploader = FakeCubeUploader()
         val coordinator = CoverageCubeMeshResources.CoverageCubeUploadCoordinator(
@@ -272,4 +299,40 @@ private fun cubeSnapshot(
     positions = position,
     colors = intArrayOf(color),
     gridRotationWorld = gridRotationWorld,
+)
+
+private fun twoCubeSnapshot(
+    revision: Long,
+    secondCubePosition: Float,
+    dirtySecondCube: Boolean = false,
+): CoveragePointRenderSnapshot = CoveragePointRenderSnapshot(
+    revision = revision,
+    enabled = true,
+    capacity = 2,
+    count = 2,
+    keys = longArrayOf(1, 2),
+    positions = floatArrayOf(1f, 1f, 1f, secondCubePosition, secondCubePosition, secondCubePosition),
+    colors = intArrayOf(0xFF445566.toInt(), 0xFF445566.toInt()),
+    update = if (dirtySecondCube) {
+        com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate(
+            geometryRevision = revision,
+            visibilityRevision = revision,
+            enabled = true,
+            count = 2,
+            spans = listOf(
+                com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan(
+                    startSlot = 1,
+                    positions = floatArrayOf(
+                        secondCubePosition,
+                        secondCubePosition,
+                        secondCubePosition,
+                    ),
+                    colors = intArrayOf(0xFF445566.toInt()),
+                ),
+            ),
+            reset = false,
+        )
+    } else {
+        null
+    },
 )

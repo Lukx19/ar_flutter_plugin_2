@@ -3,6 +3,9 @@ package com.uhg0.ar_flutter_plugin_2.sceneview
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.DirtyRowQueue
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.LongRowIndex
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.SelectedKeyMaxHeap
 
 /** Chapter 17 fixed presentation maxima; semantic-grid capacity is separate. */
 internal object CoverageRendererLimits {
@@ -66,25 +69,32 @@ internal object CoverageRendererLimits {
 /**
  * Persistent, bounded presentation selector. It performs a complete source
  * pass only when its identity basis changes (initial mount, a resync, or a
- * source-slot rewrite). Ordinary changes are translated through the retained
- * source-slot-to-presentation-slot table, avoiding a 20k sort and an 8k reset
- * for every revision.
+ * source-slot rewrite). Ordinary changes are translated through retained
+ * primitive source/key-to-presentation-slot tables, avoiding a 20k sort and
+ * an 8k reset for every revision.
  *
  * The policy is deterministic: keep the lowest identities, with source-slot
  * order as the tie-breaker. New candidates can replace the current largest
- * identity; an identity replacement resets only because presentation slots
- * deliberately changed. Otherwise identities and slots remain stable.
+ * identity. A replacement reuses the evicted row's destination, so every
+ * retained row preserves its GPU destination and only the replacement row is
+ * dirty.
  */
 internal class CoveragePresentationSelector(
     private val presentationCapacity: Int,
 ) {
-    private val selectedSourceSlots = IntArray(presentationCapacity)
+    private val selectedSourceSlots = IntArray(presentationCapacity) { -1 }
+    private val selectedKeys = LongArray(presentationCapacity)
+    private val selectedPositions =
+        FloatArray(presentationCapacity * CoveragePointMeshResources.POSITION_COMPONENTS)
+    private val selectedColors = IntArray(presentationCapacity)
+    private val selectedKeyToDestination = LongRowIndex(presentationCapacity)
+    private val selectedKeyMaxHeap = SelectedKeyMaxHeap(presentationCapacity)
+    private val freeDestinations = IntArray(presentationCapacity) { presentationCapacity - it - 1 }
+    private var freeDestinationCount = presentationCapacity
+    private val dirtyDestinations = DirtyRowQueue(presentationCapacity)
     private var selectedCount = 0
     private var sourceCount = 0
     private var sourceSlotToDestination = IntArray(0)
-    private var selectedKeys = LongArray(0)
-    private var selectedPositions = FloatArray(0)
-    private var selectedColors = IntArray(0)
     private var initialized = false
 
     init {
@@ -100,11 +110,14 @@ internal class CoveragePresentationSelector(
             return presentation(snapshot, reset = true, spans = fullSpan())
         }
 
-        val membershipChanged = acceptNewCandidates(snapshot)
-        if (membershipChanged) {
-            rebuildSelectedRows(snapshot)
+        val membershipDirtyDestinations = acceptNewCandidates(snapshot)
+        if (membershipDirtyDestinations.isNotEmpty()) {
             sourceCount = snapshot.count
-            return presentation(snapshot, reset = true, spans = fullSpan())
+            return presentation(
+                snapshot,
+                reset = false,
+                spans = dirtySpans(membershipDirtyDestinations),
+            )
         }
 
         sourceCount = snapshot.count
@@ -125,6 +138,14 @@ internal class CoveragePresentationSelector(
     }
 
     private fun initialize(snapshot: CoveragePointRenderSnapshot) {
+        selectedKeyToDestination.clear()
+        selectedKeyMaxHeap.clear()
+        sourceSlotToDestination.fill(-1)
+        freeDestinationCount = presentationCapacity
+        for (destination in freeDestinations.indices) {
+            freeDestinations[destination] = presentationCapacity - destination - 1
+            selectedSourceSlots[destination] = -1
+        }
         selectedCount = minOf(snapshot.count, presentationCapacity)
         val heap = IntArray(selectedCount)
         var heapSize = 0
@@ -138,51 +159,57 @@ internal class CoveragePresentationSelector(
                 siftDown(heap, 0, heapSize, snapshot.keys)
             }
         }
+        val selectedSources = IntArray(selectedCount)
         for (destination in selectedCount - 1 downTo 0) {
-            selectedSourceSlots[destination] = heap[0]
+            selectedSources[destination] = heap[0]
             heap[0] = heap[--heapSize]
             if (heapSize > 0) siftDown(heap, 0, heapSize, snapshot.keys)
         }
-        rebuildSlotMap()
-        rebuildSelectedRows(snapshot)
+        selectedCount = 0
+        selectedSources.forEach { source -> assignSourceToFreeDestination(snapshot, source) }
         sourceCount = snapshot.count
         initialized = true
     }
 
-    private fun acceptNewCandidates(snapshot: CoveragePointRenderSnapshot): Boolean {
-        var changed = false
+    private fun acceptNewCandidates(snapshot: CoveragePointRenderSnapshot): IntArray {
+        dirtyDestinations.clear()
         for (source in sourceCount until snapshot.count) {
             if (selectedCount < presentationCapacity) {
-                insertSelected(source, snapshot.keys)
-                changed = true
-            } else if (selectedCount > 0 &&
-                compareSource(source, selectedSourceSlots[selectedCount - 1], snapshot.keys) < 0
-            ) {
-                selectedSourceSlots[selectedCount - 1] = source
-                siftSelectedLeft(selectedCount - 1, snapshot.keys)
-                changed = true
+                val destination = assignSourceToFreeDestination(snapshot, source)
+                dirtyDestinations.add(destination)
+            } else if (selectedCount > 0) {
+                val largestKey = selectedKeyMaxHeap.largest(selectedKeyToDestination::containsKey)
+                if (largestKey != null && snapshot.keys[source] < largestKey) {
+                    val destination = checkNotNull(selectedKeyToDestination.remove(largestKey))
+                    val evictedSource = selectedSourceSlots[destination]
+                    sourceSlotToDestination[evictedSource] = -1
+                    selectedSourceSlots[destination] = source
+                    selectedKeys[destination] = snapshot.keys[source]
+                    selectedKeyToDestination[snapshot.keys[source]] = destination
+                    selectedKeyMaxHeap.add(snapshot.keys[source], selectedKeyToDestination::containsKey)
+                    sourceSlotToDestination[source] = destination
+                    copySourceRow(snapshot, source, destination)
+                    dirtyDestinations.add(destination)
+                }
             }
         }
-        if (changed) rebuildSlotMap()
-        return changed
+        return dirtyDestinations.drainActive(selectedCount)
     }
 
-    private fun insertSelected(source: Int, keys: LongArray) {
-        var destination = selectedCount++
+    private fun assignSourceToFreeDestination(
+        snapshot: CoveragePointRenderSnapshot,
+        source: Int,
+    ): Int {
+        check(freeDestinationCount > 0)
+        val destination = freeDestinations[--freeDestinationCount]
         selectedSourceSlots[destination] = source
-        siftSelectedLeft(destination, keys)
-    }
-
-    private fun siftSelectedLeft(start: Int, keys: LongArray) {
-        var destination = start
-        while (destination > 0 &&
-            compareSource(selectedSourceSlots[destination], selectedSourceSlots[destination - 1], keys) < 0
-        ) {
-            val previous = selectedSourceSlots[destination - 1]
-            selectedSourceSlots[destination - 1] = selectedSourceSlots[destination]
-            selectedSourceSlots[destination] = previous
-            destination--
-        }
+        selectedKeys[destination] = snapshot.keys[source]
+        selectedKeyToDestination[snapshot.keys[source]] = destination
+        selectedKeyMaxHeap.add(snapshot.keys[source], selectedKeyToDestination::containsKey)
+        sourceSlotToDestination[source] = destination
+        copySourceRow(snapshot, source, destination)
+        selectedCount++
+        return destination
     }
 
     private fun applyDirtySpans(
@@ -229,9 +256,6 @@ internal class CoveragePresentationSelector(
         }
 
     private fun rebuildSelectedRows(snapshot: CoveragePointRenderSnapshot) {
-        selectedKeys = LongArray(selectedCount)
-        selectedPositions = FloatArray(selectedCount * CoveragePointMeshResources.POSITION_COMPONENTS)
-        selectedColors = IntArray(selectedCount)
         for (destination in 0 until selectedCount) {
             val source = selectedSourceSlots[destination]
             selectedKeys[destination] = snapshot.keys[source]
@@ -249,13 +273,6 @@ internal class CoveragePresentationSelector(
         selectedColors[destination] = snapshot.colors[source]
     }
 
-    private fun rebuildSlotMap() {
-        sourceSlotToDestination.fill(-1)
-        for (destination in 0 until selectedCount) {
-            sourceSlotToDestination[selectedSourceSlots[destination]] = destination
-        }
-    }
-
     private fun presentation(
         source: CoveragePointRenderSnapshot,
         reset: Boolean,
@@ -263,9 +280,11 @@ internal class CoveragePresentationSelector(
     ): CoveragePointRenderSnapshot = source.copy(
         capacity = presentationCapacity,
         count = selectedCount,
-        keys = selectedKeys.copyOf(),
-        positions = selectedPositions.copyOf(),
-        colors = selectedColors.copyOf(),
+        keys = selectedKeys.copyOf(selectedCount),
+        positions = selectedPositions.copyOf(
+            selectedCount * CoveragePointMeshResources.POSITION_COMPONENTS,
+        ),
+        colors = selectedColors.copyOf(selectedCount),
         update = CoveragePointRenderUpdate(
             geometryRevision = source.update?.geometryRevision ?: source.revision,
             visibilityRevision = source.update?.visibilityRevision ?: source.revision,
@@ -278,8 +297,44 @@ internal class CoveragePresentationSelector(
 
     private fun fullSpan(): List<CoveragePointSpan> =
         if (selectedCount == 0) emptyList() else {
-            listOf(CoveragePointSpan(0, selectedPositions.copyOf(), selectedColors.copyOf()))
+            listOf(
+                CoveragePointSpan(
+                    0,
+                    selectedPositions.copyOf(
+                        selectedCount * CoveragePointMeshResources.POSITION_COMPONENTS,
+                    ),
+                    selectedColors.copyOf(selectedCount),
+                ),
+            )
         }
+
+    private fun dirtySpans(destinations: IntArray): List<CoveragePointSpan> {
+        if (destinations.isEmpty()) return emptyList()
+        val spans = ArrayList<CoveragePointSpan>()
+        var first = destinations[0]
+        var previous = first
+        fun appendSpan(start: Int, endInclusive: Int) {
+            val endExclusive = endInclusive + 1
+            spans += CoveragePointSpan(
+                startSlot = start,
+                positions = selectedPositions.copyOfRange(
+                    start * CoveragePointMeshResources.POSITION_COMPONENTS,
+                    endExclusive * CoveragePointMeshResources.POSITION_COMPONENTS,
+                ),
+                colors = selectedColors.copyOfRange(start, endExclusive),
+            )
+        }
+        for (index in 1 until destinations.size) {
+            val destination = destinations[index]
+            if (destination != previous + 1) {
+                appendSpan(first, previous)
+                first = destination
+            }
+            previous = destination
+        }
+        appendSpan(first, previous)
+        return spans
+    }
 
     private fun ensureSourceCapacity(sourceCapacity: Int) {
         if (sourceSlotToDestination.size >= sourceCapacity) return
