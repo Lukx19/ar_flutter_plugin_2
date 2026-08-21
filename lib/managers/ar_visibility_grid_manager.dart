@@ -266,6 +266,24 @@ class ARVisibilityGridManager {
     return result;
   }
 
+  /// Disarms the debug request seam and clears its retained trace.
+  Future<void> disarmDebugBackgroundRequest() async {
+    _ensureActive();
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      'disarmDebugBackgroundRequest',
+    );
+    if (result == null ||
+        result.keys
+            .toSet()
+            .difference(const <Object?>{'disarmed'}).isNotEmpty ||
+        result.length != 1 ||
+        result['disarmed'] is! bool ||
+        result['disarmed'] != true) {
+      throw const FormatException(
+          'Native background request seam was not disarmed.');
+    }
+  }
+
   /// Reads current health and diagnostics without waiting for geometry.
   Future<ARVisibilityGridHealthSnapshot> getHealth() async {
     _ensureActive();
@@ -692,12 +710,19 @@ final class ARVisibilityGridBackgroundChannel {
         'backgroundRequestId': requestId,
       },
     );
-    if (response?['acknowledged'] != true) {
+    if (response == null ||
+        response.length != 2 ||
+        response.keys.toSet().difference(
+          const <Object?>{'acknowledged', 'cancelled'},
+        ).isNotEmpty ||
+        response['acknowledged'] is! bool ||
+        response['cancelled'] is! bool ||
+        response['acknowledged'] != true) {
       throw const FormatException(
-        'Native visibility-grid cancellation was not acknowledged.',
+        'Native visibility-grid cancellation response is invalid.',
       );
     }
-    return response?['cancelled'] == true;
+    return response['cancelled']! as bool;
   }
 }
 

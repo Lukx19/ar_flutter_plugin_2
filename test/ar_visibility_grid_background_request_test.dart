@@ -104,4 +104,24 @@ void main() {
 
     await expectLater(request.cancel(), throwsFormatException);
   });
+
+  for (final response in <Map<String, Object?>>[
+    <String, Object?>{'acknowledged': true},
+    <String, Object?>{'acknowledged': true, 'cancelled': 1},
+    <String, Object?>{'acknowledged': true, 'cancelled': true, 'extra': true},
+  ]) {
+    test('rejects malformed cancellation response $response', () async {
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        if (call.method == 'pullGridDelta') return Completer<Object?>().future;
+        return response;
+      });
+      final request =
+          ARVisibilityGridBackgroundChannel.forTesting(channel).pullDelta(
+        groupId: 'group',
+        groupGeneration: 2,
+        sessionGeneration: 3,
+      );
+      await expectLater(request.cancel(), throwsFormatException);
+    });
+  }
 }
