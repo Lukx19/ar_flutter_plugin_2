@@ -527,6 +527,24 @@ class VisibilityGridMethodChannel(
                 "VG_NO_PENDING_DELTA",
                 "No retained visibility-grid delta is available",
             )
+        // The background coverage worker owns this hand-off. Apply the
+        // retained geometry before returning it so neither the root isolate
+        // nor a later visibility patch needs to rebuild semantic rows.
+        check(
+            requireNotNull(renderer).applyGeometry(
+                revision = delta.geometryRevision,
+                reset = delta.reset,
+                upsertKeys = delta.upsertKeys.toLongArray(),
+                removalKeys = delta.removalKeys.toLongArray(),
+                selectedKeysForResetOrReplacement = {
+                    requireGrid().selectedRenderKeys(
+                        VisibilityGridRendererState.CENTROID_PRESENTATION_CAPACITY,
+                    )
+                },
+            ),
+        )
+        lastEmittedGeometryRevision = delta.geometryRevision
+        runCatching(::publishRenderer).onFailure(::emitRendererError)
         result.success(deltaWireMap(delta))
     }
 

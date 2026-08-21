@@ -404,6 +404,27 @@ final class ARVisibilityGridBackgroundWorker {
     }
     return ARVisibilityGridDelta.fromMap(result);
   }
+
+  /// Applies a worker-owned color patch directly from the background isolate.
+  /// The UI isolate receives only its bounded revision result; it never
+  /// materializes ordinary semantic keys or colors.
+  static Future<bool> applyVisibility({
+    required ui.RootIsolateToken rootIsolateToken,
+    required int viewId,
+    required ARVisibilityGridVisibilityPatch patch,
+  }) async {
+    BackgroundIsolateBinaryMessenger.ensureInitialized(rootIsolateToken);
+    final channel = MethodChannel(
+      'arpointcloud_$viewId',
+      const StandardMethodCodec(),
+      BackgroundIsolateBinaryMessenger.instance,
+    );
+    final result = await channel.invokeMapMethod<Object?, Object?>(
+      'applyVisibility',
+      patch.toMap(),
+    );
+    return result?['applied'] == true;
+  }
 }
 
 Map<Object?, Object?> _map(Object? value) {
