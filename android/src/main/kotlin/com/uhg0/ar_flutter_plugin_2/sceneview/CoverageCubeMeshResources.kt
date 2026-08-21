@@ -71,6 +71,7 @@ internal class CoverageCubeMeshResources(
     private var outlineIndexStaging: java.nio.IntBuffer? = null
     private val allocationLedger = telemetry?.let(::CoverageRendererAllocationLedger)
     private var lastRevision = Long.MIN_VALUE
+    private var retainedSnapshotUploadRequired = true
     private var destroyed = false
     private val presentationSelector = CoveragePresentationSelector(capacity)
 
@@ -134,11 +135,16 @@ internal class CoverageCubeMeshResources(
         check(presentation.count in 0..capacity)
         check(presentation.positions.size == presentation.count * POSITION_COMPONENTS)
         check(presentation.colors.size == presentation.count)
-        if (presentation.revision != lastRevision) {
+        if (presentation.revision != lastRevision || retainedSnapshotUploadRequired) {
             if (presentation.count > 0) {
-                uploadCoordinator.submit(presentation)
+                if (retainedSnapshotUploadRequired) {
+                    uploadCoordinator.submitForResourceGeneration(presentation)
+                } else {
+                    uploadCoordinator.submit(presentation)
+                }
             }
             lastRevision = presentation.revision
+            retainedSnapshotUploadRequired = false
         }
         setDrawCount(
             node,
@@ -150,6 +156,10 @@ internal class CoverageCubeMeshResources(
     override fun hide(node: Node) {
         setDrawCount(node, 0)
         node.isVisible = false
+    }
+
+    override fun requireRetainedSnapshotUpload() {
+        retainedSnapshotUploadRequired = true
     }
 
     override fun onRendererFrame() = uploadCoordinator.onRendererFrame()
@@ -296,6 +306,11 @@ internal class CoverageCubeMeshResources(
                 }
             if (uploadBusy) pendingRanges.clear()
             drain()
+        }
+
+        /** Rehydrates a new Filament resource generation from the retained cut. */
+        fun submitForResourceGeneration(snapshot: CoveragePointRenderSnapshot) {
+            submit(snapshot.copy(update = snapshot.update?.copy(reset = true)))
         }
 
         fun destroy() {

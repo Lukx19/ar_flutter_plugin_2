@@ -24,6 +24,9 @@ internal interface CoverageVoxelMeshResources {
     /** Removes this mesh from the next draw without destroying retained buffers. */
     fun hide(node: Node)
 
+    /** Queues a full retained-snapshot upload for this resource generation. */
+    fun requireRetainedSnapshotUpload()
+
     fun onRendererFrame()
 
     fun destroy()

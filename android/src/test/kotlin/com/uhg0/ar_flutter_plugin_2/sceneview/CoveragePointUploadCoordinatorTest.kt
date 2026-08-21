@@ -90,6 +90,35 @@ class CoveragePointUploadCoordinatorTest {
     }
 
     @Test
+    fun `same retained cut rehydrates a replacement resource and fences old callbacks`() {
+        val uploader = FakeUploader()
+        val retained = snapshot(1, 1f, withEmptyUpdate = true)
+        val oldCompletions = mutableListOf<Long>()
+        val old = CoveragePointUploadCoordinator(
+            capacity = 2,
+            uploader = uploader,
+            onUploadCompleted = oldCompletions::add,
+        )
+        old.submit(retained)
+        old.onRendererFrame()
+        old.destroy()
+
+        val newCompletions = mutableListOf<Long>()
+        val replacement = CoveragePointUploadCoordinator(
+            capacity = 2,
+            uploader = uploader,
+            onUploadCompleted = newCompletions::add,
+        )
+        replacement.submitForResourceGeneration(retained)
+        replacement.onRendererFrame()
+        uploader.completeAll()
+
+        assertEquals(2, uploader.positionSubmissions.size)
+        assertEquals(emptyList<Long>(), oldCompletions)
+        assertEquals(1, newCompletions.size)
+    }
+
+    @Test
     fun `replacing a pending partial update uploads the latest complete state`() {
         val uploader = FakeUploader()
         val coordinator = CoveragePointUploadCoordinator(2, uploader)

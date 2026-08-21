@@ -944,6 +944,7 @@ internal class SceneViewHost(
             coverageMeshRef.set(binding)
             binding.updateCoverage(snapshot, coverage.voxelRenderMode)
             binding.updateRawPoints(rawSnapshot)
+            binding.rehydrateRetainedCoverageAfterMount()
             onCoverageRendererMounted(true)
             onDispose {
                 val wasCurrent = coverageMeshRef.compareAndSet(binding, null)
@@ -1136,6 +1137,12 @@ internal class SceneViewHost(
 
         fun onRendererFrame() {
             if (!disposed) target.resources.onRendererFrame()
+        }
+
+        fun rehydrateRetainedCoverageAfterMount() {
+            if (disposed || mode == VoxelRenderMode.POINTS) return
+            target.resources.requireRetainedSnapshotUpload()
+            updateActiveTarget()
         }
 
         private fun updateActiveTarget() {
