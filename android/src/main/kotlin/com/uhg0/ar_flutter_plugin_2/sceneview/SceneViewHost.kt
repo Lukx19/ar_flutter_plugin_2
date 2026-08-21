@@ -7,6 +7,7 @@ import android.os.Looper
 import android.util.Log
 import android.util.Base64
 import android.view.MotionEvent
+import android.view.Choreographer
 import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
@@ -136,6 +137,13 @@ internal class SceneViewHost(
     // platform channel pauses from the Android main thread. A volatile gate
     // prevents a stale read from admitting extra upload frames after pause.
     @Volatile private var rendererPaused = false
+    private val rendererPageFrameScheduler by lazy {
+        RendererPageFrameScheduler { work ->
+            composeView.post {
+                Choreographer.getInstance().postFrameCallback { work() }
+            }
+        }
+    }
     private val replaySettledTextureResize: Runnable = Runnable {
         if (disposed) return@Runnable
         val textureView = composeView.findTextureView() ?: return@Runnable
@@ -596,12 +604,31 @@ internal class SceneViewHost(
     fun rendererPerformanceSnapshot(): Map<String, Any> =
         frameCadenceTracker.snapshot() + rendererTelemetry.snapshot()
 
+    /**
+     * Callback completion is a fence, not permission to upload inline. Resume
+     * the active resource on a distinct Android render frame and fence stale
+     * replacement callbacks by binding identity.
+     */
+    private fun requestCoverageUploadFrame(binding: CoveragePointMeshBinding) {
+        rendererPageFrameScheduler.request {
+            if (disposed || rendererPaused || coverageMeshRef.get() !== binding) return@request
+            rendererTelemetry.beginRendererFrame()
+            binding.onRendererFrame()
+            frameCadenceTracker.record(System.nanoTime())
+        }
+    }
+
+    private fun cancelCoverageUploadFrame() {
+        rendererPageFrameScheduler.cancel()
+    }
+
     fun visibilityGridDepthMode(): Config.DepthMode =
         visibilityGridDepthModeCache.current()
 
     fun dispose() {
         if (!ownership.onDispose()) return
         disposed = true
+        cancelCoverageUploadFrame()
         composeView.removeCallbacks(replaySettledTextureResize)
         nodes.clear()
         anchors.values.forEach { it.anchor.detach() }
@@ -789,6 +816,8 @@ internal class SceneViewHost(
                 pointSizePx = coverage.pointSizePx,
                 generation = generation,
                 currentGeneration = coverageResourceGeneration,
+                requestRendererFrame = ::requestCoverageUploadFrame,
+                cancelRendererFrame = ::cancelCoverageUploadFrame,
             )
         }
         val node = remember(engine, resources, material, materialInstance) {
@@ -835,6 +864,8 @@ internal class SceneViewHost(
                 pointSizePx = coverage.pointSizePx,
                 generation = generation,
                 currentGeneration = coverageResourceGeneration,
+                requestRendererFrame = ::requestCoverageUploadFrame,
+                cancelRendererFrame = ::cancelCoverageUploadFrame,
             )
         }
         val node = remember(engine, resources, material, materialInstance) {
@@ -889,6 +920,8 @@ internal class SceneViewHost(
                 pointSizePx = coverage.pointSizePx,
                 generation = generation,
                 currentGeneration = coverageResourceGeneration,
+                requestRendererFrame = ::requestCoverageUploadFrame,
+                cancelRendererFrame = ::cancelCoverageUploadFrame,
             )
         }
         val node = remember(
@@ -1107,11 +1140,17 @@ internal class SceneViewHost(
         private val pointSizePx: Float,
         private val generation: Long,
         private val currentGeneration: CoverageMeshGenerationGate,
+        private val requestRendererFrame: (CoveragePointMeshBinding) -> Unit,
+        private val cancelRendererFrame: () -> Unit,
     ) {
         private var latestCoverageSnapshot: CoveragePointRenderSnapshot? = null
         private var latestRawPointSnapshot: CoveragePointRenderSnapshot? = null
         @Volatile private var attached = false
         @Volatile private var disposed = false
+
+        init {
+            target.resources.setOnUploadPageReleased { requestRendererFrame(this) }
+        }
 
         fun setNode(value: Node) {
             target.node = value
@@ -1181,6 +1220,8 @@ internal class SceneViewHost(
         fun dispose() {
             disposed = true
             attached = false
+            cancelRendererFrame()
+            target.resources.setOnUploadPageReleased {}
             target.node = null
             latestCoverageSnapshot = null
             latestRawPointSnapshot = null
@@ -1191,6 +1232,8 @@ internal class SceneViewHost(
             if (disposed) return
             disposed = true
             attached = false
+            cancelRendererFrame()
+            target.resources.setOnUploadPageReleased {}
             target.node?.destroy()
             target.node = null
             latestCoverageSnapshot = null

@@ -69,6 +69,7 @@ internal class CoverageCubeMeshResources(
         onUploadCompletedAttributed = { elapsedNanos, origin ->
             telemetry?.recordUploadCompletion(elapsedNanos, origin)
         },
+        onUploadPageReleased = { onUploadPageReleased() },
     )
     private var indexStaging: java.nio.IntBuffer? = null
     private var outlineIndexStaging: java.nio.IntBuffer? = null
@@ -76,6 +77,7 @@ internal class CoverageCubeMeshResources(
     private var lastRevision = Long.MIN_VALUE
     private var retainedSnapshotUploadRequired = true
     private var destroyed = false
+    @Volatile private var onUploadPageReleased: () -> Unit = {}
     private val presentationSelector = CoveragePresentationSelector(capacity)
 
     init {
@@ -167,6 +169,10 @@ internal class CoverageCubeMeshResources(
 
     override fun onRendererFrame() = uploadCoordinator.onRendererFrame()
 
+    override fun setOnUploadPageReleased(listener: () -> Unit) {
+        onUploadPageReleased = listener
+    }
+
     private fun setDrawCount(node: Node, voxelCount: Int) {
         val instance = engine.renderableManager.getInstance(node.entity)
         engine.renderableManager.setGeometryAt(
@@ -192,6 +198,7 @@ internal class CoverageCubeMeshResources(
     override fun destroy() {
         if (destroyed) return
         destroyed = true
+        onUploadPageReleased = {}
         uploadCoordinator.destroy()
         indexStaging = null
         outlineIndexStaging = null
@@ -276,6 +283,7 @@ internal class CoverageCubeMeshResources(
         private val onUploadCallbackAttributed: (RendererUploadPageOrigin) -> Unit = {},
         private val onUploadCompleted: (Long) -> Unit = {},
         private val onUploadCompletedAttributed: (Long, RendererUploadPageOrigin) -> Unit = { _, _ -> },
+        private val onUploadPageReleased: () -> Unit = {},
         private val clockNanos: () -> Long = System::nanoTime,
     ) {
         private val positionBuffer = ByteBuffer.allocateDirect(
@@ -480,6 +488,7 @@ internal class CoverageCubeMeshResources(
                     if (activeFullUpload) hasUploadedSnapshot = true
                     activeSnapshot = null
                 }
+                onUploadPageReleased()
                 // A completed callback only releases the page. The next page
                 // is admitted by a distinct rendered frame.
             }

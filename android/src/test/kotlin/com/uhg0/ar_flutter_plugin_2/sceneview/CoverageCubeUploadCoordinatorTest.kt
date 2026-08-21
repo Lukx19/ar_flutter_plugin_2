@@ -10,6 +10,24 @@ import org.junit.Test
 
 class CoverageCubeUploadCoordinatorTest {
     @Test
+    fun `cube driver completion requests one later renderer frame`() {
+        val uploader = FakeCubeUploader()
+        var releasedPages = 0
+        val coordinator = CoverageCubeMeshResources.CoverageCubeUploadCoordinator(
+            capacity = 1,
+            halfSize = 0.5f,
+            uploader = uploader,
+            onUploadPageReleased = { releasedPages++ },
+        )
+
+        coordinator.submit(cubeSnapshot(1, floatArrayOf(1f, 1f, 1f)))
+        coordinator.onRendererFrame()
+        uploader.completeAll()
+
+        assertEquals(1, releasedPages)
+    }
+
+    @Test
     fun `each bounded page explicitly flushes after both cube buffers are queued`() {
         val uploader = FakeCubeUploader()
         val coordinator = CoverageCubeMeshResources.CoverageCubeUploadCoordinator(

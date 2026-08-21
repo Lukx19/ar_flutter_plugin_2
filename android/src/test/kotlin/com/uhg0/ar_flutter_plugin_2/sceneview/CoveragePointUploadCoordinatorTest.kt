@@ -12,6 +12,23 @@ import org.junit.Test
 
 class CoveragePointUploadCoordinatorTest {
     @Test
+    fun `driver completion requests one later renderer frame`() {
+        val uploader = FakeUploader()
+        var releasedPages = 0
+        val coordinator = CoveragePointUploadCoordinator(
+            capacity = 2,
+            uploader = uploader,
+            onUploadPageReleased = { releasedPages++ },
+        )
+
+        coordinator.submit(snapshot(1, 1f))
+        coordinator.onRendererFrame()
+        uploader.completeAll()
+
+        assertEquals(1, releasedPages)
+    }
+
+    @Test
     fun `each bounded page explicitly flushes after both point buffers are queued`() {
         val uploader = FakeUploader()
         val coordinator = CoveragePointUploadCoordinator(capacity = 2, uploader = uploader)

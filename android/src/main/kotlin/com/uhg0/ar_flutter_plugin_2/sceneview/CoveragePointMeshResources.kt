@@ -45,6 +45,7 @@ internal class CoveragePointMeshResources(
     private var lastRevision = Long.MIN_VALUE
     private var retainedSnapshotUploadRequired = true
     private var destroyed = false
+    @Volatile private var onUploadPageReleased: () -> Unit = {}
     private val presentationSelector = CoveragePresentationSelector(capacity)
     private val uploadCoordinator = CoveragePointUploadCoordinator(
         capacity = capacity,
@@ -55,6 +56,7 @@ internal class CoveragePointMeshResources(
         onUploadCompletedAttributed = { elapsedNanos, origin ->
             telemetry?.recordUploadCompletion(elapsedNanos, origin)
         },
+        onUploadPageReleased = { onUploadPageReleased() },
     )
     private val allocationLedger = telemetry?.let(::CoverageRendererAllocationLedger)
     private var indexStaging: java.nio.IntBuffer? = null
@@ -125,6 +127,10 @@ internal class CoveragePointMeshResources(
 
     override fun onRendererFrame() = uploadCoordinator.onRendererFrame()
 
+    override fun setOnUploadPageReleased(listener: () -> Unit) {
+        onUploadPageReleased = listener
+    }
+
     private fun setDrawCount(node: Node, count: Int) {
         val renderableManager = engine.renderableManager
         val instance = renderableManager.getInstance(node.entity)
@@ -142,6 +148,7 @@ internal class CoveragePointMeshResources(
     override fun destroy() {
         if (destroyed) return
         destroyed = true
+        onUploadPageReleased = {}
         uploadCoordinator.destroy()
         indexStaging = null
         allocationLedger?.releasePointResources(telemetryOwner)
@@ -222,6 +229,7 @@ internal class CoveragePointUploadCoordinator(
     private val onUploadCallbackAttributed: (RendererUploadPageOrigin) -> Unit = {},
     private val onUploadCompleted: (Long) -> Unit = {},
     private val onUploadCompletedAttributed: (Long, RendererUploadPageOrigin) -> Unit = { _, _ -> },
+    private val onUploadPageReleased: () -> Unit = {},
     private val clockNanos: () -> Long = System::nanoTime,
 ) {
     private val buffers = CoveragePointUploadBuffers(capacity)
@@ -361,6 +369,7 @@ internal class CoveragePointUploadCoordinator(
             )
             uploadBusy = false
             if (pendingRanges.isEmpty()) activeSnapshot = null
+            onUploadPageReleased()
             // The next page is admitted only by onRendererFrame.
         }
     }

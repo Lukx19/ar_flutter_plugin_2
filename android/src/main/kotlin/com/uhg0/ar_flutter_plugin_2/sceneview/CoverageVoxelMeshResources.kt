@@ -29,5 +29,8 @@ internal interface CoverageVoxelMeshResources {
 
     fun onRendererFrame()
 
+    /** Invoked only after both native buffer-consumption callbacks release a page. */
+    fun setOnUploadPageReleased(listener: () -> Unit)
+
     fun destroy()
 }
