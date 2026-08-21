@@ -10,6 +10,47 @@ import org.junit.Test
 
 class CoverageCubeUploadCoordinatorTest {
     @Test
+    fun `cube reset and checkpoint callbacks retain their page origins`() {
+        val uploader = FakeCubeUploader()
+        val submittedOrigins = mutableListOf<RendererUploadPageOrigin>()
+        val callbackOrigins = mutableListOf<RendererUploadPageOrigin>()
+        val completionOrigins = mutableListOf<RendererUploadPageOrigin>()
+        val coordinator = CoverageCubeMeshResources.CoverageCubeUploadCoordinator(
+            capacity = 1,
+            halfSize = 0.5f,
+            uploader = uploader,
+            onUploadAttributed = { _, origin -> submittedOrigins += origin },
+            onUploadCallbackAttributed = callbackOrigins::add,
+            onUploadCompletedAttributed = { _, origin -> completionOrigins += origin },
+        )
+
+        coordinator.submitForResourceGeneration(cubeSnapshot(7, floatArrayOf(7f, 7f, 7f)))
+        coordinator.submit(cubeSnapshot(8, floatArrayOf(8f, 8f, 8f)))
+        coordinator.onRendererFrame()
+        uploader.completeAll()
+        coordinator.onRendererFrame()
+        uploader.completeAll()
+
+        assertEquals(
+            listOf(
+                RendererUploadPageOrigin.RESOURCE_GENERATION_RESET,
+                RendererUploadPageOrigin.ORDINARY,
+            ),
+            submittedOrigins,
+        )
+        assertEquals(
+            listOf(
+                RendererUploadPageOrigin.RESOURCE_GENERATION_RESET,
+                RendererUploadPageOrigin.RESOURCE_GENERATION_RESET,
+                RendererUploadPageOrigin.ORDINARY,
+                RendererUploadPageOrigin.ORDINARY,
+            ),
+            callbackOrigins,
+        )
+        assertEquals(submittedOrigins, completionOrigins)
+    }
+
+    @Test
     fun `retained cube reset waits for a subsequent renderer frame`() {
         val uploader = FakeCubeUploader()
         var resetSchedules = 0

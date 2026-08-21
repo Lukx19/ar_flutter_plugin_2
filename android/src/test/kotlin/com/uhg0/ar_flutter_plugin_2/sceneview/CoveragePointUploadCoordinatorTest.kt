@@ -12,6 +12,48 @@ import org.junit.Test
 
 class CoveragePointUploadCoordinatorTest {
     @Test
+    fun `retained reset and checkpoint pages retain separate origins`() {
+        val uploader = FakeUploader()
+        val submittedOrigins = mutableListOf<RendererUploadPageOrigin>()
+        val callbackOrigins = mutableListOf<RendererUploadPageOrigin>()
+        val completionOrigins = mutableListOf<RendererUploadPageOrigin>()
+        val coordinator = CoveragePointUploadCoordinator(
+            capacity = 2,
+            uploader = uploader,
+            onUploadAttributed = { _, origin -> submittedOrigins += origin },
+            onUploadCallbackAttributed = callbackOrigins::add,
+            onUploadCompletedAttributed = { _, origin -> completionOrigins += origin },
+        )
+
+        coordinator.submitForResourceGeneration(snapshot(7, 7f, withEmptyUpdate = true))
+        // A checkpoint may republish geometry in the same device measurement
+        // window. It is an ordinary page, not a second replacement reset.
+        coordinator.submit(snapshot(8, 8f, withEmptyUpdate = true))
+        coordinator.onRendererFrame()
+        uploader.completeAll()
+        coordinator.onRendererFrame()
+        uploader.completeAll()
+
+        assertEquals(
+            listOf(
+                RendererUploadPageOrigin.RESOURCE_GENERATION_RESET,
+                RendererUploadPageOrigin.ORDINARY,
+            ),
+            submittedOrigins,
+        )
+        assertEquals(
+            listOf(
+                RendererUploadPageOrigin.RESOURCE_GENERATION_RESET,
+                RendererUploadPageOrigin.RESOURCE_GENERATION_RESET,
+                RendererUploadPageOrigin.ORDINARY,
+                RendererUploadPageOrigin.ORDINARY,
+            ),
+            callbackOrigins,
+        )
+        assertEquals(submittedOrigins, completionOrigins)
+    }
+
+    @Test
     fun `retained replacement reset waits for a subsequent renderer frame`() {
         val uploader = FakeUploader()
         val completions = mutableListOf<Long>()

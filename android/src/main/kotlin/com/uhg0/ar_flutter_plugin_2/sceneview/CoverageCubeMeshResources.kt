@@ -63,10 +63,12 @@ internal class CoverageCubeMeshResources(
         capacity = capacity,
         halfSize = halfSize,
         uploader = FilamentCoverageCubeVertexUploader(engine, vertexBuffer),
-        onUploadSubmitted = { bytes -> telemetry?.recordUpload(bytes) },
+        onUploadAttributed = { bytes, origin -> telemetry?.recordUpload(bytes, origin) },
         onResourceResetScheduled = { telemetry?.recordResourceResetScheduled() },
-        onUploadCallback = { telemetry?.recordUploadCallback() },
-        onUploadCompleted = { elapsedNanos -> telemetry?.recordUploadCompletion(elapsedNanos) },
+        onUploadCallbackAttributed = { origin -> telemetry?.recordUploadCallback(origin) },
+        onUploadCompletedAttributed = { elapsedNanos, origin ->
+            telemetry?.recordUploadCompletion(elapsedNanos, origin)
+        },
     )
     private var indexStaging: java.nio.IntBuffer? = null
     private var outlineIndexStaging: java.nio.IntBuffer? = null
@@ -268,9 +270,12 @@ internal class CoverageCubeMeshResources(
         private val halfSize: Float,
         private val uploader: CoverageCubeVertexUploader,
         private val onUploadSubmitted: (Int) -> Unit = {},
+        private val onUploadAttributed: (Int, RendererUploadPageOrigin) -> Unit = { _, _ -> },
         private val onResourceResetScheduled: () -> Unit = {},
         private val onUploadCallback: () -> Unit = {},
+        private val onUploadCallbackAttributed: (RendererUploadPageOrigin) -> Unit = {},
         private val onUploadCompleted: (Long) -> Unit = {},
+        private val onUploadCompletedAttributed: (Long, RendererUploadPageOrigin) -> Unit = { _, _ -> },
         private val clockNanos: () -> Long = System::nanoTime,
     ) {
         private val positionBuffer = ByteBuffer.allocateDirect(
@@ -279,29 +284,48 @@ internal class CoverageCubeMeshResources(
         private val colorBuffer = ByteBuffer.allocateDirect(
             capacity * VERTICES_PER_VOXEL * COLOR_COMPONENTS,
         ).order(ByteOrder.nativeOrder())
-        private var pendingSnapshot: CoveragePointRenderSnapshot? = null
+        private data class PendingUpload(
+            val snapshot: CoveragePointRenderSnapshot,
+            val origin: RendererUploadPageOrigin,
+        )
+
+        private val pendingUploads = ArrayDeque<PendingUpload>()
         private var uploadBusy = false
         private var consumedCallbackMask = 0
         private var activeUploadId = 0L
         private var destroyed = false
         private var activeUploadStartedNanos = 0L
         private var activeSnapshot: CoveragePointRenderSnapshot? = null
+        private var activeOrigin = RendererUploadPageOrigin.ORDINARY
         private val pendingRanges = ArrayDeque<UploadRange>()
         // A completed reset establishes the mesh baseline. Afterwards a
         // coalesced ordinary revision can retain its exact dirty spans.
         private var hasUploadedSnapshot = false
         private var activeFullUpload = false
         fun submit(snapshot: CoveragePointRenderSnapshot) {
+            enqueue(snapshot, RendererUploadPageOrigin.ORDINARY)
+        }
+
+        private fun enqueue(
+            snapshot: CoveragePointRenderSnapshot,
+            origin: RendererUploadPageOrigin,
+        ) {
             if (destroyed) return
-            pendingSnapshot =
+            val normalized =
                 if (!hasUploadedSnapshot &&
-                    (uploadBusy || pendingRanges.isNotEmpty() || pendingSnapshot != null) &&
+                    (uploadBusy || pendingRanges.isNotEmpty() || pendingUploads.isNotEmpty()) &&
                     snapshot.update?.reset == false
                 ) {
                     snapshot.copy(update = snapshot.update.copy(reset = true))
                 } else {
                     snapshot
+                }
+            if (origin == RendererUploadPageOrigin.ORDINARY &&
+                pendingUploads.lastOrNull()?.origin == RendererUploadPageOrigin.ORDINARY
+            ) {
+                pendingUploads.removeLast()
             }
+            pendingUploads.addLast(PendingUpload(normalized, origin))
             if (uploadBusy) pendingRanges.clear()
         }
 
@@ -309,12 +333,15 @@ internal class CoverageCubeMeshResources(
         fun submitForResourceGeneration(snapshot: CoveragePointRenderSnapshot) {
             if (destroyed) return
             onResourceResetScheduled()
-            submit(snapshot.copy(update = snapshot.update?.copy(reset = true)))
+            enqueue(
+                snapshot.copy(update = snapshot.update?.copy(reset = true)),
+                RendererUploadPageOrigin.RESOURCE_GENERATION_RESET,
+            )
         }
 
         fun destroy() {
             destroyed = true
-            pendingSnapshot = null
+            pendingUploads.clear()
             activeSnapshot = null
             pendingRanges.clear()
             activeFullUpload = false
@@ -327,14 +354,15 @@ internal class CoverageCubeMeshResources(
         private fun drain() {
             if (destroyed || uploadBusy) return
             if (pendingRanges.isEmpty()) {
-                val snapshot = pendingSnapshot ?: return
-                pendingSnapshot = null
+                val pending = pendingUploads.removeFirstOrNull() ?: return
+                val snapshot = pending.snapshot
                 val update = snapshot.update
                 val fullUpload = !hasUploadedSnapshot || update == null || update.reset
                 val spans = update?.spans.orEmpty()
                 if (!fullUpload && spans.isEmpty()) return
                 activeSnapshot = snapshot
                 activeFullUpload = fullUpload
+                activeOrigin = pending.origin
                 pendingRanges.addAll(
                     uploadRanges(
                         count = snapshot.count,
@@ -355,6 +383,10 @@ internal class CoverageCubeMeshResources(
                 (range.endSlotExclusive - range.startSlot) * VERTICES_PER_VOXEL
             onUploadSubmitted(
                 vertexCount * (POSITION_COMPONENTS * Float.SIZE_BYTES + COLOR_COMPONENTS),
+            )
+            onUploadAttributed(
+                vertexCount * (POSITION_COMPONENTS * Float.SIZE_BYTES + COLOR_COMPONENTS),
+                activeOrigin,
             )
             uploader.uploadPositions(
                 positionBuffer,
@@ -433,9 +465,12 @@ internal class CoverageCubeMeshResources(
             if (destroyed || !uploadBusy || uploadId != activeUploadId) return
             if (consumedCallbackMask and callbackBit != 0) return
             onUploadCallback()
+            onUploadCallbackAttributed(activeOrigin)
             consumedCallbackMask = consumedCallbackMask or callbackBit
             if (consumedCallbackMask == BOTH_CALLBACKS) {
-                onUploadCompleted((clockNanos() - activeUploadStartedNanos).coerceAtLeast(0L))
+                val elapsedNanos = (clockNanos() - activeUploadStartedNanos).coerceAtLeast(0L)
+                onUploadCompleted(elapsedNanos)
+                onUploadCompletedAttributed(elapsedNanos, activeOrigin)
                 uploadBusy = false
                 if (pendingRanges.isEmpty()) {
                     if (activeFullUpload) hasUploadedSnapshot = true
