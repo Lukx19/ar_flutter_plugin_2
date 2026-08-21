@@ -59,6 +59,10 @@ class VisibilityGridMethodChannel(
     private val sensorHandoff = LatestSensorHandoff<FeatureWork, DepthWork>()
     private var featureConfidenceMinimum = 0.30
     private var maxFeaturesPerObservation = 2_000
+    // Debug synthetic input is supplied through the protocol; it must not
+    // concurrently acquire Image-backed ARCore sensor data on the render
+    // callback. That would race native Session teardown.
+    @Volatile private var syntheticSource = false
     @Volatile private var lastEmittedGeometryRevision = -1L
     @Volatile private var lastEmittedHealth: Map<String, String>? = null
     private var coalescedFeatureObservations = 0L
@@ -149,7 +153,12 @@ class VisibilityGridMethodChannel(
 
     fun onFrame(frame: Frame) {
         if (paused || checkpointBarrierActive) return
-        if (!shouldAcquireVisibilityFeatures(frame.camera.trackingState)) {
+        if (
+            !shouldAcquireVisibilitySensorWork(
+                trackingState = frame.camera.trackingState,
+                syntheticSource = syntheticSource,
+            )
+        ) {
             rawPointRenderHandoff.clear()
             main.post(::clearRawPoints)
             frameCadence.reset()
@@ -274,6 +283,7 @@ class VisibilityGridMethodChannel(
             oldRenderer = renderer
             renderer = null
             rendererConfig = null
+            syntheticSource = false
             grid = null
             group = null
             checkpointBarrierActive = false
@@ -388,6 +398,7 @@ class VisibilityGridMethodChannel(
         synchronized(this) {
             lifecycleGuard.advance()
             healthHeartbeatGeneration++
+            syntheticSource = synthetic
             cancelPendingCheckpoint("Visibility grid reinitialized during checkpoint")
             sensorHandoff.clear()
             frameCadence.reset()
@@ -1242,6 +1253,12 @@ class VisibilityGridMethodChannel(
 
 internal fun shouldAcquireVisibilityFeatures(trackingState: TrackingState): Boolean =
     trackingState == TrackingState.TRACKING
+
+/** Synthetic debug input owns its samples, so ARCore image acquisition stays off. */
+internal fun shouldAcquireVisibilitySensorWork(
+    trackingState: TrackingState,
+    syntheticSource: Boolean,
+): Boolean = !syntheticSource && shouldAcquireVisibilityFeatures(trackingState)
 
 private class VisibilityGridChannelLatencySamples(
     private val capacity: Int = 256,
