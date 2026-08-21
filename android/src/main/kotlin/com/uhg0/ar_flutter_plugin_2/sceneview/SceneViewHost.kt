@@ -1234,7 +1234,12 @@ internal class SceneViewHost(
             attached = false
             cancelRendererFrame()
             target.resources.setOnUploadPageReleased {}
-            target.node?.destroy()
+            // Compose may have already detached the outgoing node before its
+            // nested DisposableEffect clears this binding.  The resources are
+            // still real (and ledger-charged) in that interval, so clear them
+            // synchronously before the next mode allocates.  A later node
+            // destroy is safe because every resource destroy is idempotent.
+            disposeCoverageResourcesForReplacement(target.node, target.resources)
             target.node = null
             latestCoverageSnapshot = null
             latestRawPointSnapshot = null

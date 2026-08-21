@@ -34,3 +34,19 @@ internal interface CoverageVoxelMeshResources {
 
     fun destroy()
 }
+
+/**
+ * Releases the outgoing resource before a mutually-exclusive mode can create
+ * its replacement. Compose may have detached the Node before the binding's
+ * disposal callback runs; that must not defer a ledger-charged resource.
+ */
+internal fun disposeCoverageResourcesForReplacement(
+    node: Node?,
+    resources: CoverageVoxelMeshResources,
+) {
+    if (node != null) {
+        node.destroy()
+    } else {
+        resources.destroy()
+    }
+}
