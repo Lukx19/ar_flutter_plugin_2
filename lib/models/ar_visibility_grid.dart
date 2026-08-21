@@ -757,6 +757,36 @@ class ARVisibilityGridVisibilityPatch {
       };
 }
 
+/// Authoritative native revision receipt for an indeterminate visibility call.
+///
+/// A caller must query this record after losing an `applyVisibility` reply
+/// before it decides whether the immutable patch was applied or can be retried.
+class ARVisibilityGridVisibilityRevision {
+  const ARVisibilityGridVisibilityRevision({
+    required this.geometryRevision,
+    required this.visibilityRevision,
+  });
+
+  factory ARVisibilityGridVisibilityRevision.fromMap(
+      Map<Object?, Object?> map) {
+    final geometryRevision = map['geometryRevision'];
+    final visibilityRevision = map['visibilityRevision'];
+    if (geometryRevision is! num ||
+        visibilityRevision is! num ||
+        geometryRevision < 0 ||
+        visibilityRevision < 0) {
+      throw const FormatException('Invalid visibility-grid revision receipt.');
+    }
+    return ARVisibilityGridVisibilityRevision(
+      geometryRevision: geometryRevision.toInt(),
+      visibilityRevision: visibilityRevision.toInt(),
+    );
+  }
+
+  final int geometryRevision;
+  final int visibilityRevision;
+}
+
 /// Current health of each native visibility-grid component.
 class ARVisibilityGridSourceHealth {
   const ARVisibilityGridSourceHealth({

@@ -196,6 +196,29 @@ class ARVisibilityGridManager {
     return result?['applied'] == true;
   }
 
+  /// Reads the native renderer's authoritative revision pair. Use this after
+  /// an unknown apply outcome; it is deliberately separate from a retry.
+  Future<ARVisibilityGridVisibilityRevision> getAppliedVisibilityRevision({
+    required String groupId,
+    required int groupGeneration,
+    required int sessionGeneration,
+  }) async {
+    _ensureActive();
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      'getVisibilityRevision',
+      <String, Object>{
+        'version': visibilityGridWireVersion,
+        'groupId': groupId,
+        'groupGeneration': groupGeneration,
+        'sessionGeneration': sessionGeneration,
+      },
+    );
+    if (result == null) {
+      throw const FormatException('Missing visibility-grid revision receipt.');
+    }
+    return ARVisibilityGridVisibilityRevision.fromMap(result);
+  }
+
   /// Reads current health and diagnostics without waiting for geometry.
   Future<ARVisibilityGridHealthSnapshot> getHealth() async {
     _ensureActive();
@@ -458,6 +481,36 @@ final class ARVisibilityGridBackgroundWorker {
       patch.toMap(),
     );
     return result?['applied'] == true;
+  }
+
+  /// Background-isolate equivalent of [getAppliedVisibilityRevision].
+  static Future<ARVisibilityGridVisibilityRevision>
+      getAppliedVisibilityRevision({
+    required ui.RootIsolateToken rootIsolateToken,
+    required int viewId,
+    required String groupId,
+    required int groupGeneration,
+    required int sessionGeneration,
+  }) async {
+    BackgroundIsolateBinaryMessenger.ensureInitialized(rootIsolateToken);
+    final channel = MethodChannel(
+      'arpointcloud_$viewId',
+      const StandardMethodCodec(),
+      BackgroundIsolateBinaryMessenger.instance,
+    );
+    final result = await channel.invokeMapMethod<Object?, Object?>(
+      'getVisibilityRevision',
+      <String, Object>{
+        'version': visibilityGridWireVersion,
+        'groupId': groupId,
+        'groupGeneration': groupGeneration,
+        'sessionGeneration': sessionGeneration,
+      },
+    );
+    if (result == null) {
+      throw const FormatException('Missing visibility-grid revision receipt.');
+    }
+    return ARVisibilityGridVisibilityRevision.fromMap(result);
   }
 }
 

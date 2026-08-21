@@ -62,6 +62,10 @@ void main() {
         'checkpointBarrier' => _delta(revision: 8, reset: true),
         'releaseCheckpoint' => <String, Object>{'released': true},
         'applyVisibility' => <String, Object>{'applied': true},
+        'getVisibilityRevision' => <String, Object>{
+            'geometryRevision': 7,
+            'visibilityRevision': 3,
+          },
         'getHealth' => <String, Object>{
             'version': visibilityGridWireVersion,
             'sourceHealth': _health(),
@@ -165,6 +169,28 @@ void main() {
       'releaseCheckpoint',
       'dispose',
     ]);
+  });
+
+  test('queries the authoritative native visibility revision receipt',
+      () async {
+    final manager = ARVisibilityGridManager(91);
+    final receipt = await manager.getAppliedVisibilityRevision(
+      groupId: 'group',
+      groupGeneration: 3,
+      sessionGeneration: 4,
+    );
+
+    expect(receipt.geometryRevision, 7);
+    expect(receipt.visibilityRevision, 3);
+    final call = calls.singleWhere(
+      (call) => call.method == 'getVisibilityRevision',
+    );
+    expect(call.arguments, <String, Object>{
+      'version': visibilityGridWireVersion,
+      'groupId': 'group',
+      'groupGeneration': 3,
+      'sessionGeneration': 4,
+    });
   });
 
   test('malformed callback is rejected atomically', () async {

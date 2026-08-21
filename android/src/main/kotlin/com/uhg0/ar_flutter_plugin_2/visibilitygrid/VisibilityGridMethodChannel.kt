@@ -116,6 +116,7 @@ class VisibilityGridMethodChannel(
                     )
                 }
                 "applyVisibility" -> applyVisibility(call, result)
+                "getVisibilityRevision" -> getVisibilityRevision(call, result)
                 "checkpointBarrier" -> checkpointBarrier(call, result)
                 "releaseCheckpoint" -> releaseCheckpoint(call, result)
                 "setPointsEnabled" -> setPointsEnabled(call, result)
@@ -661,6 +662,17 @@ class VisibilityGridMethodChannel(
             mapOf(
                 "applied" to true,
                 "geometryRevision" to geometryRevision,
+                "visibilityRevision" to visibilityRevision,
+            ),
+        )
+    }
+
+    private fun getVisibilityRevision(call: MethodCall, result: MethodChannel.Result) {
+        requireIdentity(call)
+        val snapshot = requireGrid().snapshot()
+        result.success(
+            mapOf(
+                "geometryRevision" to snapshot.geometryRevision,
                 "visibilityRevision" to visibilityRevision,
             ),
         )
