@@ -206,6 +206,7 @@ void main() {
     await manager.pause();
     expect(manager.sessionState, ARSessionState.paused);
     await manager.dispose();
+    await manager.dispose();
     await subscription.cancel();
 
     expect(
