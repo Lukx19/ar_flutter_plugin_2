@@ -44,10 +44,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
-import kotlinx.coroutines.TimeoutCancellationException
 import java.util.concurrent.Executors
 
 /** SceneView 4.21.2 platform-view implementation. Flutter channels remain unchanged. */
@@ -334,22 +333,22 @@ internal class ArView(
             },
             superseded = ResumeTerminal.SUPERSEDED,
         )
+        // SceneViewHost.resume is a blocking Android call. A coroutine timeout
+        // around it cannot fire while the caller is blocked, so schedule the
+        // deadline independently on the view lifecycle scope.
         scope.launch {
-            val failure = runCatching {
-                withTimeout(5_000) {
-                    withContext(Dispatchers.Default) { sceneHost.resume() }
-                }
-            }.exceptionOrNull()
-            if (failure == null) {
-                resumeReplyFence.settle(generation, ResumeTerminal.SUCCESS)
+            delay(5_000)
+            resumeReplyFence.settle(generation, ResumeTerminal.TIMEOUT)
+        }
+        scope.launch(Dispatchers.Default) {
+            val terminal = if (runCatching { sceneHost.resume() }.isSuccess) {
+                ResumeTerminal.SUCCESS
             } else {
-                val terminal = if (failure is TimeoutCancellationException) {
-                    ResumeTerminal.TIMEOUT
-                } else {
-                    ResumeTerminal.FAILED
-                }
-                resumeReplyFence.settle(generation, terminal)
+                ResumeTerminal.FAILED
             }
+            // MethodChannel and renderer state stay on the view scope; the
+            // synchronized fence rejects timeout/dispose/superseded completions.
+            scope.launch { resumeReplyFence.settle(generation, terminal) }
         }
     }
 

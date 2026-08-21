@@ -234,6 +234,7 @@ internal class BoundedReplyFence<T> {
     private var generation = 0L
     private var reply: ((T) -> Unit)? = null
 
+    @Synchronized
     fun begin(next: (T) -> Unit, superseded: T): Long {
         reply?.invoke(superseded)
         generation++
@@ -241,6 +242,7 @@ internal class BoundedReplyFence<T> {
         return generation
     }
 
+    @Synchronized
     fun settle(token: Long, terminal: T): Boolean {
         if (token != generation) return false
         val current = reply ?: return false
@@ -249,6 +251,7 @@ internal class BoundedReplyFence<T> {
         return true
     }
 
+    @Synchronized
     fun dispose(cancelled: T) {
         generation++
         reply?.invoke(cancelled)
