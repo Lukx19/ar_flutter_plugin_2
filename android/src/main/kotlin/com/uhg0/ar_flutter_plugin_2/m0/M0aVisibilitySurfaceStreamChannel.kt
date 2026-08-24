@@ -62,6 +62,7 @@ class M0aVisibilitySurfaceStreamChannel(
     private val beforeWorkerProcessing: (() -> Unit)? = null,
     private val controlLifecycle: M0aControlLifecycle? = null,
     private val onExecutorOperation: ((String) -> Unit)? = null,
+    private val bindingQualifier: ByteArray? = null,
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val channel = BasicMessageChannel<ByteBuffer>(
@@ -191,12 +192,18 @@ class M0aVisibilitySurfaceStreamChannel(
             })
         }
         channel.setMessageHandler { message, reply ->
-            val bytes = message?.let { buffer ->
+            val transportBytes = message?.let { buffer ->
                 val copy = ByteArray(buffer.remaining())
                 buffer.slice().get(copy)
                 copy
             }
+            if (transportBytes == null) {
+                reply.reply(null)
+                return@setMessageHandler
+            }
+            val bytes = authenticatedPayload(transportBytes)
             if (bytes == null) {
+                telemetry.rejected()
                 reply.reply(null)
                 return@setMessageHandler
             }
@@ -206,11 +213,11 @@ class M0aVisibilitySurfaceStreamChannel(
                 telemetry.rejected()
                 val rejected = backpressureResponse(bytes)
                 telemetry.allocated(rejected.remaining())
-                reply.reply(rejected)
+                reply.reply(qualify(rejected))
                 return@setMessageHandler
             }
             telemetry.queued()
-            val pendingReply = PendingReply(reply) {
+            val pendingReply = PendingReply(reply, ::qualify) {
                 outstandingInvocation.set(false)
             }
             val timeoutHandle = timeoutScheduler.schedule(workerTimeoutMillis) {
@@ -365,12 +372,9 @@ class M0aVisibilitySurfaceStreamChannel(
                         timeoutHandle.cancel()
                         if (response != null) {
                             telemetry.allocated(response.size)
-                            reply.reply(response.let {
-                                // Flutter's Android messenger passes position() as the
-                                // JNI message length, so leave the reply positioned after
-                                // the bytes rather than flipping it to zero.
-                                ByteBuffer.allocateDirect(it.size).apply { put(it) }
-                            })
+                            // Flutter's Android messenger passes position() as the JNI
+                            // message length; qualify() leaves it after the bytes.
+                            reply.reply(qualify(response))
                         }
                     } catch (_: Exception) {
                         abandonForWorkerLoss(pendingReply, bytes)
@@ -384,6 +388,31 @@ class M0aVisibilitySurfaceStreamChannel(
                 timeoutHandle.cancel()
                 abandonForWorkerLoss(pendingReply, bytes)
             }
+        }
+    }
+
+    private fun authenticatedPayload(bytes: ByteArray): ByteArray? {
+        val qualifier = bindingQualifier ?: return bytes
+        if (bytes.size < qualifier.size ||
+            !bytes.copyOfRange(0, qualifier.size).contentEquals(qualifier)) return null
+        return bytes.copyOfRange(qualifier.size, bytes.size)
+    }
+
+    private fun qualify(buffer: ByteBuffer): ByteBuffer {
+        val qualifier = bindingQualifier ?: return buffer
+        val payload = ByteArray(buffer.position())
+        buffer.duplicate().apply { flip(); get(payload) }
+        return ByteBuffer.allocateDirect(qualifier.size + payload.size).apply {
+            put(qualifier)
+            put(payload)
+        }
+    }
+
+    private fun qualify(bytes: ByteArray): ByteBuffer {
+        val qualifier = bindingQualifier
+        return ByteBuffer.allocateDirect((qualifier?.size ?: 0) + bytes.size).apply {
+            if (qualifier != null) put(qualifier)
+            put(bytes)
         }
     }
 
@@ -577,6 +606,7 @@ class M0aVisibilitySurfaceStreamChannel(
 
     private class PendingReply(
         private val callback: BasicMessageChannel.Reply<ByteBuffer>,
+        private val qualify: (ByteBuffer) -> ByteBuffer,
         private val onClaimed: () -> Unit,
     ) {
         private val claimed = AtomicBoolean(false)
@@ -588,7 +618,7 @@ class M0aVisibilitySurfaceStreamChannel(
         }
 
         fun reply(buffer: ByteBuffer) {
-            callback.reply(buffer)
+            callback.reply(qualify(buffer))
         }
     }
 

@@ -99,7 +99,25 @@ final class ARVisibilityGridV2WorkerBinding {
 
   final MethodChannel _controlChannel;
   final BasicMessageChannel<ByteData?> _streamChannel;
+  Uint8List? _bindingQualifier;
   bool _closed = false;
+
+  /// Claims the native binding tokens returned by `bindingSnapshot`.
+  /// Throws [StateError] when either token is not a 16-byte [Uint8List].
+  void bindSnapshot(Map<Object?, Object?> snapshot) {
+    Uint8List token(String key) {
+      final value = snapshot[key];
+      if (value is! Uint8List || value.length != 16) {
+        throw StateError('V2 $key must be exactly 16 bytes.');
+      }
+      return value;
+    }
+
+    _bindingQualifier = Uint8List.fromList(<int>[
+      ...token('nativeStreamToken'),
+      ...token('workerBindingToken'),
+    ]);
+  }
 
   /// Sends START through the worker-owned control channel.
   /// Throws [StateError] when closed or for a non-byte response, and
@@ -129,12 +147,14 @@ final class ARVisibilityGridV2WorkerBinding {
   /// Throws [PlatformException] or [MissingPluginException] on channel failure.
   Future<Uint8List> _control(_V2Control operation, Uint8List request) async {
     _ensureOpen();
-    final response =
-        await _controlChannel.invokeMethod<Object?>(operation.method, request);
+    final response = await _controlChannel.invokeMethod<Object?>(
+      operation.method,
+      _qualify(request),
+    );
     if (response is! Uint8List) {
       throw StateError('V2 control returned a non-byte response.');
     }
-    return Uint8List.fromList(response);
+    return _authenticate(response);
   }
 
   /// Exchanges one binary stream envelope and returns its binary response.
@@ -142,27 +162,33 @@ final class ARVisibilityGridV2WorkerBinding {
   /// [PlatformException] or [MissingPluginException] on channel failure.
   Future<Uint8List> exchange(Uint8List request) async {
     _ensureOpen();
-    final response = await _streamChannel.send(ByteData.sublistView(request));
+    final response = await _streamChannel.send(
+      ByteData.sublistView(_qualify(request)),
+    );
     if (response == null) {
       throw StateError('V2 stream returned no response.');
     }
-    return Uint8List.fromList(
+    return _authenticate(Uint8List.fromList(
       response.buffer.asUint8List(
         response.offsetInBytes,
         response.lengthInBytes,
       ),
-    );
+    ));
   }
 
-  /// Reads bounded scalar binding telemetry on the same native executor as
+  /// Invokes native `bindingSnapshot` and reads bounded scalar telemetry on
+  /// the same native executor as
   /// control and exchange operations. No surface payload bytes are returned.
   /// The no-argument call returns a scalar [Map] snapshot.
   ///
-  /// The map contains `bindingGeneration`, `streamToken`, `acceptedControls`,
-  /// `initialTransactionQueued`, `disposed`, `closedResources`, the complete
-  /// group epoch, `arSessionIdentity`, `viewInstanceId`, `viewGeneration`,
-  /// `nativeStreamToken`, `workerBindingToken`, `lifecycleSequence`,
-  /// `operationGeneration`, and `executorTrace`.
+  /// Exact keys/types: `bindingGeneration`, `streamToken`, `acceptedControls`,
+  /// `closedResources`, `sessionGeneration`, `groupGeneration`,
+  /// `coverageEpoch`, `viewId`, `viewGeneration`, `lifecycleSequence`, and
+  /// `operationGeneration` are [int]; `initialTransactionQueued` and
+  /// `disposed` are [bool]; `controlRequestId`, `sessionId`, and
+  /// `captureGroupId` are nullable [String]; `arSessionIdentity`,
+  /// `viewInstanceId`, `nativeStreamToken`, and `workerBindingToken` are
+  /// 16-byte [Uint8List]; `executorTrace` is `List<String>`.
   /// Throws [StateError] for a closed binding or non-map result and propagates
   /// [PlatformException] or [MissingPluginException] on channel failure.
   Future<Map<Object?, Object?>> snapshot() async {
@@ -200,6 +226,7 @@ final class ARVisibilityGridV2WorkerBinding {
     try {
       final response = await _controlChannel.invokeMethod<Object?>(
         'disposeBinding',
+        _requireQualifier(),
       );
       if (response is! Map) {
         throw StateError('V2 binding returned no teardown receipt.');
@@ -212,6 +239,28 @@ final class ARVisibilityGridV2WorkerBinding {
 
   void _ensureOpen() {
     if (_closed) throw StateError('V2 worker binding is closed.');
+  }
+
+  Uint8List _requireQualifier() =>
+      _bindingQualifier ??
+      (throw StateError('V2 worker binding has not claimed native tokens.'));
+
+  Uint8List _qualify(Uint8List payload) => Uint8List.fromList(<int>[
+        ..._requireQualifier(),
+        ...payload,
+      ]);
+
+  Uint8List _authenticate(Uint8List response) {
+    final qualifier = _requireQualifier();
+    if (response.length < qualifier.length) {
+      throw StateError('V2 response omitted its binding qualifier.');
+    }
+    for (var index = 0; index < qualifier.length; index++) {
+      if (response[index] != qualifier[index]) {
+        throw StateError('V2 response used a stale binding qualifier.');
+      }
+    }
+    return Uint8List.fromList(response.sublist(qualifier.length));
   }
 }
 

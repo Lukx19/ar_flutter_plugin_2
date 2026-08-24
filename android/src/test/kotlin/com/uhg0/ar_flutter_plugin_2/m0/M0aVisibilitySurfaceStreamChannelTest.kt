@@ -18,6 +18,32 @@ import org.junit.Test
 
 class M0aVisibilitySurfaceStreamChannelTest {
     @Test
+    fun `binding qualifier rejects stale token before stream admission`() {
+        val messenger = TestMessenger(88)
+        val qualifier = ByteArray(32) { (it + 1).toByte() }
+        val binding = M0aVisibilitySurfaceStreamChannel(
+            messenger,
+            88,
+            bindingQualifier = qualifier,
+        )
+        val packet = request(sequence = 1, token = 88)
+
+        assertNull(messenger.tryExchange(packet))
+        val stale = qualifier.copyOf().also { it[0] = 99 } + packet
+        assertNull(messenger.tryExchange(stale))
+        assertEquals(0L, binding.transportInstrumentation.snapshot().acceptedRequests)
+
+        val qualifiedResponse = messenger.exchange(qualifier + packet)
+        assertArrayEquals(qualifier, qualifiedResponse.copyOfRange(0, qualifier.size))
+        val response = M0aPacketCodec.decodeResponse(
+            qualifiedResponse.copyOfRange(qualifier.size, qualifiedResponse.size),
+        )
+        assertEquals(1L, response.requestSequence)
+        assertEquals(1L, binding.transportInstrumentation.snapshot().acceptedRequests)
+        binding.dispose()
+    }
+
+    @Test
     fun `packet codec validates all portable ordinals and response envelope fields`() {
         val base = M0aPacketCodec.encodeRequest(
             M0aPacketCodec.Request(

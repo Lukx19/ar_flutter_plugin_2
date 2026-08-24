@@ -44,10 +44,10 @@ class VisibilityGridV2Binding(
         messenger,
         "visibility_grid_v2_control_$viewId",
     )
-    @Volatile private var streamChannel = newStreamChannel()
-    @Volatile private var currentBindingGeneration = bindingGenerationSeed
     private var nativeStreamToken = newOpaqueToken()
     private var workerBindingToken = newOpaqueToken()
+    @Volatile private var streamChannel = newStreamChannel()
+    @Volatile private var currentBindingGeneration = bindingGenerationSeed
     private val arSessionIdentity = newOpaqueToken()
     private val viewInstanceId = newOpaqueToken()
     private var initialTransactionQueued = false
@@ -75,6 +75,7 @@ class VisibilityGridV2Binding(
         shutdownWorkerOnDispose = false,
         controlLifecycle = lifecycle,
         onExecutorOperation = ::recordExecutorOperation,
+        bindingQualifier = bindingQualifier(),
     )
 
     init {
@@ -146,6 +147,10 @@ class VisibilityGridV2Binding(
             return
         }
         if (call.method == "disposeBinding") {
+            if (!qualifierMatches(call.arguments as? ByteArray)) {
+                result.error("VG_STREAM_BINDING_ABANDONED", "V2 binding token mismatch", null)
+                return
+            }
             try {
                 executor.execute {
                     recordExecutorOperation("control:dispose_binding")
@@ -164,7 +169,7 @@ class VisibilityGridV2Binding(
             "stop" -> M0aControlOperation.STOP
             else -> null
         }
-        val bytes = call.arguments as? ByteArray
+        val bytes = authenticatedPayload(call.arguments as? ByteArray)
         if (operation == null || bytes == null) {
             result.error("VG_PROTOCOL_INVALID", "V2 control requires one Uint8List", null)
             return
@@ -196,7 +201,7 @@ class VisibilityGridV2Binding(
                         queueInitialTransaction()
                     }
                     acceptedControls++
-                    response
+                    qualify(response)
                 }
                 main.post {
                     outcome.fold(
@@ -242,10 +247,10 @@ class VisibilityGridV2Binding(
         lifecycleSequence = nextLifecycleSequence.incrementAndGet()
         val teardownReceipt = snapshot()
         lifecycle = newLifecycle()
-        streamChannel = newStreamChannel()
         currentBindingGeneration = nextBindingGeneration.incrementAndGet()
         nativeStreamToken = newOpaqueToken()
         workerBindingToken = newOpaqueToken()
+        streamChannel = newStreamChannel()
         initialTransactionQueued = false
         acceptedControls = 0L
         activeControlRequestId = null
@@ -283,6 +288,20 @@ class VisibilityGridV2Binding(
     private fun recordClosedResource() {
         closedResources++
     }
+
+    private fun bindingQualifier(): ByteArray = nativeStreamToken + workerBindingToken
+
+    private fun qualifierMatches(bytes: ByteArray?): Boolean =
+        bytes != null && bytes.contentEquals(bindingQualifier())
+
+    private fun authenticatedPayload(bytes: ByteArray?): ByteArray? {
+        val qualifier = bindingQualifier()
+        if (bytes == null || bytes.size < qualifier.size ||
+            !bytes.copyOfRange(0, qualifier.size).contentEquals(qualifier)) return null
+        return bytes.copyOfRange(qualifier.size, bytes.size)
+    }
+
+    private fun qualify(bytes: ByteArray): ByteArray = bindingQualifier() + bytes
 
     private fun M0aUuid.hex(): String = bytes.joinToString("") { byte ->
         "%02x".format(byte.toInt() and 0xff)
