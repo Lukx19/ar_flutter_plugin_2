@@ -18,6 +18,8 @@ import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.ArrayDeque
+import java.nio.ByteBuffer
+import java.util.UUID
 
 /**
  * Production owner for one immutable V2 platform-view binding generation.
@@ -43,6 +45,8 @@ class VisibilityGridV2Binding(
     )
     @Volatile private var streamChannel = newStreamChannel()
     @Volatile private var currentBindingGeneration = bindingGenerationSeed
+    private var nativeStreamToken = newOpaqueToken()
+    private var workerBindingToken = newOpaqueToken()
     private var initialTransactionQueued = false
     private var acceptedControls = 0L
     private var closedResources = 0L
@@ -53,6 +57,8 @@ class VisibilityGridV2Binding(
     private var activeGroupGeneration = 0L
     private var activeCoverageEpoch = 0L
     private var executorOrdinal = 0L
+    private var lifecycleSequence = nextLifecycleSequence.incrementAndGet()
+    private var operationGeneration = 0L
     private val executorTrace = ArrayDeque<String>()
 
     private fun newLifecycle() = M0aControlLifecycle(
@@ -85,6 +91,12 @@ class VisibilityGridV2Binding(
         val sessionGeneration: Long,
         val groupGeneration: Long,
         val coverageEpoch: Long,
+        val nativeStreamToken: ByteArray,
+        val workerBindingToken: ByteArray,
+        val viewId: Int,
+        val viewGeneration: Long,
+        val lifecycleSequence: Long,
+        val operationGeneration: Long,
         val executorTrace: List<String>,
     )
 
@@ -102,6 +114,12 @@ class VisibilityGridV2Binding(
         sessionGeneration = activeSessionGeneration,
         groupGeneration = activeGroupGeneration,
         coverageEpoch = activeCoverageEpoch,
+        nativeStreamToken = nativeStreamToken.copyOf(),
+        workerBindingToken = workerBindingToken.copyOf(),
+        viewId = viewId,
+        viewGeneration = currentBindingGeneration,
+        lifecycleSequence = lifecycleSequence,
+        operationGeneration = operationGeneration,
         executorTrace = executorTrace.toList(),
     )
 
@@ -126,6 +144,13 @@ class VisibilityGridV2Binding(
                                 "sessionGeneration" to snapshot.sessionGeneration,
                                 "groupGeneration" to snapshot.groupGeneration,
                                 "coverageEpoch" to snapshot.coverageEpoch,
+                                "nativeStreamToken" to snapshot.nativeStreamToken,
+                                "workerBindingToken" to snapshot.workerBindingToken,
+                                "viewId" to snapshot.viewId,
+                                "viewGeneration" to snapshot.viewGeneration,
+                                "lifecycleSequence" to snapshot.lifecycleSequence,
+                                "operationGeneration" to snapshot.operationGeneration,
+                                "rootIsolateSurfaceBytes" to 0L,
                                 "executorTrace" to snapshot.executorTrace,
                             ),
                         )
@@ -229,6 +254,10 @@ class VisibilityGridV2Binding(
         lifecycle = newLifecycle()
         streamChannel = newStreamChannel()
         currentBindingGeneration = nextBindingGeneration.incrementAndGet()
+        nativeStreamToken = newOpaqueToken()
+        workerBindingToken = newOpaqueToken()
+        lifecycleSequence = nextLifecycleSequence.incrementAndGet()
+        operationGeneration = 0L
         initialTransactionQueued = false
         acceptedControls = 0L
         activeControlRequestId = null
@@ -246,6 +275,8 @@ class VisibilityGridV2Binding(
     @Synchronized
     private fun recordExecutorOperation(kind: String) {
         executorOrdinal++
+        operationGeneration++
+        lifecycleSequence = nextLifecycleSequence.incrementAndGet()
         if (executorTrace.size == MAX_EXECUTOR_TRACE) executorTrace.removeFirst()
         executorTrace.addLast("$executorOrdinal:$kind")
     }
@@ -272,6 +303,15 @@ class VisibilityGridV2Binding(
 
     private companion object {
         val nextBindingGeneration = AtomicLong()
+        val nextLifecycleSequence = AtomicLong()
         const val MAX_EXECUTOR_TRACE = 16
+
+        fun newOpaqueToken(): ByteArray {
+            val uuid = UUID.randomUUID()
+            return ByteBuffer.allocate(16)
+                .putLong(uuid.mostSignificantBits)
+                .putLong(uuid.leastSignificantBits)
+                .array()
+        }
     }
 }
