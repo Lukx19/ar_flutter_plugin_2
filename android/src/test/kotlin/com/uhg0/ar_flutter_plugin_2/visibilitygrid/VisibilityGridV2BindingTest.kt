@@ -410,6 +410,82 @@ class VisibilityGridV2BindingTest {
     }
 
     @Test
+    fun `abandon winner publishes replacement before replaying pending dispose receipt`() {
+        val messenger = MethodTestMessenger()
+        val executor = Executors.newSingleThreadExecutor()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 95,
+            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            executor = executor,
+            postToMain = { task -> task() },
+        )
+        try {
+            executor.execute {
+                entered.countDown()
+                release.await()
+            }
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+
+            val original = binding.snapshot()
+            val qualifier = original.nativeStreamToken + original.workerBindingToken
+            val channelName = "visibility_grid_v2_control_95"
+            val channel = MethodChannel(messenger, channelName)
+            var replacementPublishedAtDisposeReply = false
+            val disposed = RecordingResult {
+                replacementPublishedAtDisposeReply = messenger.hasHandler(channelName)
+            }
+            channel.invokeMethod("disposeBinding", qualifier, disposed)
+
+            val abandoned = RecordingResult()
+            channel.invokeMethod("abandonBinding", qualifier, abandoned)
+            assertEquals(1, abandoned.successCount)
+            assertEquals(1, disposed.successCount)
+            assertTrue(replacementPublishedAtDisposeReply)
+            assertReceiptEqual(abandoned.successValue, disposed.successValue)
+
+            val replacementResult = RecordingResult()
+            channel.invokeMethod("bindingSnapshot", null, replacementResult)
+            assertTrue(replacementResult.completed.await(2, TimeUnit.SECONDS))
+            val replacement = replacementResult.successValue as Map<*, *>
+
+            val repeated = RecordingResult()
+            channel.invokeMethod("abandonBinding", qualifier, repeated)
+            assertEquals(1, repeated.successCount)
+            assertReceiptEqual(abandoned.successValue, repeated.successValue)
+
+            val unrelated = RecordingResult()
+            channel.invokeMethod("abandonBinding", ByteArray(32) { 0x5a }, unrelated)
+            assertEquals(1, unrelated.errorCount)
+            assertEquals("VG_STREAM_BINDING_ABANDONED", unrelated.errorCode)
+
+            val after = RecordingResult()
+            channel.invokeMethod("bindingSnapshot", null, after)
+            assertTrue(after.completed.await(2, TimeUnit.SECONDS))
+            val afterSnapshot = after.successValue as Map<*, *>
+            assertEquals(replacement["bindingGeneration"], afterSnapshot["bindingGeneration"])
+            assertEquals(replacement["streamToken"], afterSnapshot["streamToken"])
+            assertEquals(replacement["closedResources"], afterSnapshot["closedResources"])
+            assertEquals(replacement["disposed"], afterSnapshot["disposed"])
+            assertEquals(replacement["lifecycleSequence"], afterSnapshot["lifecycleSequence"])
+            assertEquals(replacement["operationGeneration"], afterSnapshot["operationGeneration"])
+            assertArrayEquals(
+                replacement["nativeStreamToken"] as ByteArray,
+                afterSnapshot["nativeStreamToken"] as ByteArray,
+            )
+            assertArrayEquals(
+                replacement["workerBindingToken"] as ByteArray,
+                afterSnapshot["workerBindingToken"] as ByteArray,
+            )
+        } finally {
+            release.countDown()
+            binding.dispose()
+        }
+    }
+
+    @Test
     fun `real receipt query rejects inexact and out of range numbers before lookup`() {
         val authority = M0aCommittedBaselineAuthority()
         val messenger = MethodTestMessenger()
@@ -591,7 +667,9 @@ class VisibilityGridV2BindingTest {
     }
 }
 
-private class RecordingResult : MethodChannel.Result {
+private class RecordingResult(
+    private val onSuccess: (() -> Unit)? = null,
+) : MethodChannel.Result {
     val completed = CountDownLatch(1)
     var successCount = 0
     var errorCount = 0
@@ -601,6 +679,7 @@ private class RecordingResult : MethodChannel.Result {
     override fun success(result: Any?) {
         successCount++
         successValue = result
+        onSuccess?.invoke()
         completed.countDown()
     }
 
@@ -654,5 +733,9 @@ private class MethodTestMessenger : BinaryMessenger {
         synchronized(handlers) {
             if (handler == null) handlers.remove(channel) else handlers[channel] = handler
         }
+    }
+
+    fun hasHandler(channel: String): Boolean = synchronized(handlers) {
+        handlers.containsKey(channel)
     }
 }

@@ -259,6 +259,11 @@ class VisibilityGridV2Binding internal constructor(
             try {
                 beforeAbandonCleanup?.invoke()
                 val outcome = cleanupBinding(admission, abandonStream = true)
+                // The winning abandon constructs and publishes the replacement
+                // before any accepted serial-dispose reply can escape. A worker
+                // observing that reply can therefore bind immediately without
+                // passing through a transient handler-free state.
+                if (outcome.wonCleanup) completePendingCleanup(outcome.receipt)
                 result.success(outcome.receipt)
             } catch (error: Exception) {
                 result.error("VG_STREAM_BINDING_ABANDONED", error.message, null)
@@ -507,7 +512,6 @@ class VisibilityGridV2Binding internal constructor(
         }
         closeBindingResources(abandonStream = true)
         val teardownReceipt = snapshot().toMap()
-        completePendingCleanup(teardownReceipt)
         val retainedGroupCut = recoveryGroupCut ?: RecoveryGroupCut(
             sessionId = activeSessionId,
             captureGroupId = activeCaptureGroupId,
@@ -682,7 +686,10 @@ class VisibilityGridV2Binding internal constructor(
 
     private data class BindingAdmission(val identity: BindingIdentity)
 
-    internal data class CleanupOutcome(val receipt: Map<String, Any?>)
+    internal data class CleanupOutcome(
+        val receipt: Map<String, Any?>,
+        val wonCleanup: Boolean,
+    )
 
     internal class CleanupAuthority {
         private val lock = Any()
@@ -708,12 +715,12 @@ class VisibilityGridV2Binding internal constructor(
             winner: () -> Map<String, Any?>,
         ): CleanupOutcome? = synchronized(lock) {
             terminals.firstOrNull { it.first == identity }?.let {
-                return@synchronized CleanupOutcome(it.second)
+                return@synchronized CleanupOutcome(it.second, wonCleanup = false)
             }
             if (current != identity) return@synchronized null
             val receipt = winner()
             terminals += identity to receipt
-            CleanupOutcome(receipt)
+            CleanupOutcome(receipt, wonCleanup = true)
         }
     }
 
