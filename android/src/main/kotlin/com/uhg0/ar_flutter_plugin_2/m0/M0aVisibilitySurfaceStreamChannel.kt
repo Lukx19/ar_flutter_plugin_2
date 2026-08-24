@@ -93,9 +93,9 @@ class M0aVisibilitySurfaceStreamChannel(
     private val transactionReceiver = M0aStructuralTransactionReceiverV1()
     private val telemetry = M0aTransportInstrumentation()
     private val structuralFrames = ArrayDeque<M0aTransactionFrameV1>()
-    private var committedBaseline =
+    @Volatile private var committedBaseline =
         controlLifecycle?.committedBaseline() ?: M0aCommittedBaselineV1.ZERO
-    private var queuedTransactionBaseline: M0aCommittedBaselineV1? = null
+    @Volatile private var queuedTransactionBaseline: M0aCommittedBaselineV1? = null
 
     /** The bounded begin/chunk/commit seam owned by this binding. */
     val structuralTransactionReceiver: M0aStructuralTransactionReceiverV1
@@ -114,10 +114,12 @@ class M0aVisibilitySurfaceStreamChannel(
         require(frames.isNotEmpty()) { "A structural transaction cannot be empty" }
         synchronized(this) {
             check(!disposed.get() && !bindingAbandoned.get()) { "Binding is abandoned" }
-            check(structuralFrames.isEmpty()) { "A structural transaction is already queued" }
             validateStructuralTransaction(frames)
-            frames.forEach { structuralFrames.addLast(it) }
-            telemetry.retainedStructuralStaging(structuralPayloadBytes())
+            synchronized(structuralFrames) {
+                check(structuralFrames.isEmpty()) { "A structural transaction is already queued" }
+                frames.forEach { structuralFrames.addLast(it) }
+                telemetry.retainedStructuralStaging(structuralPayloadBytes())
+            }
             val begin = (frames.first() as M0aTransactionBeginFrameV1).value
             queuedTransactionBaseline = committedBaseline.copy(
                 transactionId = begin.transactionId,
@@ -281,15 +283,19 @@ class M0aVisibilitySurfaceStreamChannel(
                                                 !isValidResyncRequest(request)) {
                                                 throw BindingError(TRANSACTION_STATE_ERROR_ID)
                                             }
-                                            if (structuralFrames.peekFirst() is M0aTransactionCommitFrameV1) {
+                                            val hasCommitFrame = synchronized(structuralFrames) {
+                                                structuralFrames.peekFirst() is M0aTransactionCommitFrameV1
+                                            }
+                                            if (hasCommitFrame) {
                                                 beforeAuthorityPublication?.invoke()
                                             }
                                             val encoded = synchronized(publicationFence) {
                                                 if (disposed.get() || bindingAbandoned.get()) {
                                                     throw BindingError(STREAM_BINDING_ABANDONED_ERROR_ID)
                                                 }
-                                                val publishesCommit =
+                                                val publishesCommit = synchronized(structuralFrames) {
                                                     structuralFrames.peekFirst() is M0aTransactionCommitFrameV1
+                                                }
                                                 if (publishesCommit) {
                                                     afterAuthorityPublicationFenceAcquired?.invoke()
                                                 }
@@ -456,16 +462,7 @@ class M0aVisibilitySurfaceStreamChannel(
                 pendingReply.reply(workerLostResponse(pendingReply.requestBytes))
             }
         }
-        lastRequest = null
-        lastResponse = null
-        resyncPending = false
-        lastSequence = null
-        nextExpectedSequence = 1L
-        synchronized(this) {
-            structuralFrames.clear()
-            queuedTransactionBaseline = null
-        }
-        telemetry.clearRetained()
+        clearPreparedStaging()
         controlLifecycle?.abandon()
         transactionReceiver.stop()
         clearMessageHandler()
@@ -490,6 +487,7 @@ class M0aVisibilitySurfaceStreamChannel(
         claim.pendingReply?.let { pendingReply ->
             pendingReply.reply(workerAbandonedResponse(pendingReply.requestBytes))
         }
+        clearPreparedStaging()
         transactionReceiver.abandon()
         controlLifecycle?.abandon()
         clearMessageHandler()
@@ -508,6 +506,7 @@ class M0aVisibilitySurfaceStreamChannel(
         if (!claim.won) return
         onAbandonedRequest?.invoke(M0aPacketCodec.decodeRequest(bytes), pendingCommitBaseline())
         telemetry.timedOut()
+        clearPreparedStaging()
         transactionReceiver.abandon()
         controlLifecycle?.abandon()
         clearMessageHandler()
@@ -529,6 +528,7 @@ class M0aVisibilitySurfaceStreamChannel(
             onAbandonedRequest?.invoke(M0aPacketCodec.decodeRequest(bytes), pendingCommitBaseline())
         }
         telemetry.workerLost()
+        clearPreparedStaging()
         transactionReceiver.abandon()
         controlLifecycle?.abandon()
         clearMessageHandler()
@@ -566,9 +566,24 @@ class M0aVisibilitySurfaceStreamChannel(
         }
     }
 
-    private fun pendingCommitBaseline(): M0aCommittedBaselineV1 = synchronized(this) {
-        queuedTransactionBaseline ?: committedBaseline
+    private fun clearPreparedStaging() {
+        lastRequest = null
+        lastResponse = null
+        resyncPending = false
+        lastSequence = null
+        nextExpectedSequence = 1L
+        // The publication fence has already won. Do not reacquire the worker
+        // monitor here: a stalled worker may still hold it while waiting for
+        // its late continuation to be fenced.
+        synchronized(structuralFrames) {
+            structuralFrames.clear()
+        }
+        queuedTransactionBaseline = null
+        telemetry.clearRetained()
     }
+
+    private fun pendingCommitBaseline(): M0aCommittedBaselineV1 =
+        queuedTransactionBaseline ?: committedBaseline
 
     private data class AbandonClaim(
         val won: Boolean,
@@ -620,36 +635,38 @@ class M0aVisibilitySurfaceStreamChannel(
 
     private fun nextStructuralResponse(request: M0aPacketCodec.Request): M0aPacketCodec.Response {
         synchronized(this) {
-            val frame = structuralFrames.peekFirst()
-                ?: return M0aPacketCodec.noChanges(
+            synchronized(structuralFrames) {
+                val frame = structuralFrames.peekFirst()
+                    ?: return M0aPacketCodec.noChanges(
+                        streamToken = request.streamToken,
+                        requestSequence = request.requestSequence,
+                        nextExpectedRequestSequence = request.requestSequence + 1,
+                        transactionId = committedBaseline.transactionId,
+                        targetGeometryRevision = committedBaseline.geometryRevision,
+                        targetLineageRevision = committedBaseline.lineageRevision,
+                        acceptedStyleRevision = committedBaseline.styleRevision,
+                    )
+                val response = M0aTransactionResponseCodecV1.encodeFrame(
+                    frame = frame,
                     streamToken = request.streamToken,
                     requestSequence = request.requestSequence,
                     nextExpectedRequestSequence = request.requestSequence + 1,
-                    transactionId = committedBaseline.transactionId,
-                    targetGeometryRevision = committedBaseline.geometryRevision,
-                    targetLineageRevision = committedBaseline.lineageRevision,
-                    acceptedStyleRevision = committedBaseline.styleRevision,
-                )
-            val response = M0aTransactionResponseCodecV1.encodeFrame(
-                frame = frame,
-                streamToken = request.streamToken,
-                requestSequence = request.requestSequence,
-                nextExpectedRequestSequence = request.requestSequence + 1,
-            ).copy(acceptedStyleRevision = committedBaseline.styleRevision)
-            // The caller encodes this response under the negotiated ceiling
-            // before returning. Only then is the producer advanced.
-            val encoded = M0aPacketCodec.encodeResponse(response, request.maximumResponseBytes)
-            check(encoded.isNotEmpty())
-            structuralFrames.removeFirst()
-            telemetry.retainedStructuralStaging(structuralPayloadBytes())
-            if (frame is M0aTransactionCommitFrameV1) {
-                committedBaseline = queuedTransactionBaseline
-                    ?.copy(styleRevision = committedBaseline.styleRevision)
-                    ?: error("COMMIT has no queued transaction baseline")
-                queuedTransactionBaseline = null
-                controlLifecycle?.setCommittedBaseline(committedBaseline)
+                ).copy(acceptedStyleRevision = committedBaseline.styleRevision)
+                // The caller encodes this response under the negotiated ceiling
+                // before returning. Only then is the producer advanced.
+                val encoded = M0aPacketCodec.encodeResponse(response, request.maximumResponseBytes)
+                check(encoded.isNotEmpty())
+                structuralFrames.removeFirst()
+                telemetry.retainedStructuralStaging(structuralPayloadBytes())
+                if (frame is M0aTransactionCommitFrameV1) {
+                    committedBaseline = queuedTransactionBaseline
+                        ?.copy(styleRevision = committedBaseline.styleRevision)
+                        ?: error("COMMIT has no queued transaction baseline")
+                    queuedTransactionBaseline = null
+                    controlLifecycle?.setCommittedBaseline(committedBaseline)
+                }
+                return response
             }
-            return response
         }
     }
 
@@ -680,10 +697,12 @@ class M0aVisibilitySurfaceStreamChannel(
         ) == begin.payloadChecksum)
     }
 
-    private fun structuralPayloadBytes(): Int = structuralFrames.sumOf { frame ->
-        when (frame) {
-            is M0aTransactionChunkFrameV1 -> frame.value.bytes.size
-            else -> 0
+    private fun structuralPayloadBytes(): Int = synchronized(structuralFrames) {
+        structuralFrames.sumOf { frame ->
+            when (frame) {
+                is M0aTransactionChunkFrameV1 -> frame.value.bytes.size
+                else -> 0
+            }
         }
     }
 

@@ -777,6 +777,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
         assertTrue(enteredPublication.await(2, TimeUnit.SECONDS))
 
         binding.abandon()
+        assertEquals(0L, binding.transportInstrumentation.snapshot().retainedAllocationBytes)
         assertTrue(commitCompleted.await(2, TimeUnit.SECONDS))
         releasePublication.countDown()
         executor.shutdown()

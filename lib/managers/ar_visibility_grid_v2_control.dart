@@ -13,6 +13,9 @@ enum ARVisibilityGridV2CommitDecision { commit, abandon }
 /// The binding tokens identify the old runtime binding whose response was
 /// lost. The manager adds its current binding qualifier privately when it
 /// sends the query, so a stale control object cannot query a replacement.
+/// UUID fields are 32 hexadecimal characters, tokens are 16 bytes, and all
+/// scalar revisions/sequences are non-negative integers. The native ledger
+/// retains at most eight exact receipts.
 final class ARVisibilityGridV2CommitReceiptQuery {
   const ARVisibilityGridV2CommitReceiptQuery({
     required this.controlRequestId,
@@ -59,6 +62,9 @@ final class ARVisibilityGridV2CommitReceiptQuery {
 }
 
 /// Complete native baseline returned by an exact COMMIT receipt query.
+///
+/// It contains only the bounded scalar/revision and identity fields needed by
+/// a later reattachment owner; it never contains structural surface bytes.
 final class ARVisibilityGridV2CommittedBaseline {
   const ARVisibilityGridV2CommittedBaseline({
     required this.transactionId,
@@ -138,6 +144,11 @@ final class ARVisibilityGridV2CommittedBaseline {
 }
 
 /// Read-only outcome and scalar evidence for one exact COMMIT attempt.
+///
+/// Tokens are 16 bytes, identity strings are bounded, scalar fields are
+/// non-negative integers, the baseline has the fixed fields above, and
+/// [rootIsolateSurfaceBytes] must be zero. [fromMap] rejects mismatched
+/// COMMIT baselines and non-zero abandon baselines with [StateError].
 final class ARVisibilityGridV2CommitReceipt {
   const ARVisibilityGridV2CommitReceipt({
     required this.decision,
@@ -350,9 +361,11 @@ final class ARVisibilityGridV2Control {
   /// The connection-time qualifier of this control is added privately. The
   /// bounded result is either the authoritative committed baseline or an
   /// explicit zero abandon decision; it never mutates lifecycle or cursors.
-  /// Throws [PlatformException] for a stale/malformed qualification and
-  /// [StateError] for a malformed scalar response. The result contains zero
-  /// ordinary root-isolate surface bytes.
+  /// A teardown receipt is cleanup evidence only and is never treated as the
+  /// outcome authority. Throws [PlatformException] or
+  /// [MissingPluginException] for channel failure/stale qualification and
+  /// [StateError] for malformed scalar identity, bounds, or root evidence.
+  /// The result contains zero ordinary root-isolate surface bytes.
   Future<ARVisibilityGridV2CommitReceipt> queryCommitReceipt(
     ARVisibilityGridV2CommitReceiptQuery query,
   ) async {
@@ -582,8 +595,10 @@ final class ARVisibilityGridV2WorkerBinding {
   /// The query is read-only and identity-qualified by both this fresh
   /// binding's private qualifier and [query]'s old binding tokens. It returns
   /// the exact COMMIT baseline or an abandon-wins zero baseline, with no
-  /// ordinary surface payload. Stale/mismatched qualification is reported as
-  /// [PlatformException]; malformed scalar replies throw [StateError].
+  /// ordinary surface payload. A teardown receipt is cleanup evidence only;
+  /// it is not outcome authority. Stale/mismatched qualification or channel
+  /// failure is reported as [PlatformException] or
+  /// [MissingPluginException]; malformed scalar replies throw [StateError].
   Future<ARVisibilityGridV2CommitReceipt> queryCommitReceipt(
     ARVisibilityGridV2CommitReceiptQuery query,
   ) async {
