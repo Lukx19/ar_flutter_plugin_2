@@ -245,6 +245,45 @@ void main() {
       );
     }
   });
+
+  test('non-debuggable recovery control surfaces PlatformException', () async {
+    const channel = MethodChannel('visibility_grid_v2_control_91');
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'configureDebugV2CommitPublicationStall') {
+        throw PlatformException(
+          code: 'VG_PROTOCOL_INVALID',
+          message: 'V2 recovery seam is debug-only',
+        );
+      }
+      throw PlatformException(code: 'unsupported');
+    });
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null),
+    );
+    final control = ARVisibilityGridV2Control(
+      91,
+      channel: channel,
+      initialBindingSnapshot: <Object?, Object?>{
+        'nativeStreamToken': Uint8List(16),
+        'workerBindingToken': Uint8List(16),
+      },
+    );
+
+    await expectLater(
+      control.configureDebugV2CommitPublicationStall(),
+      throwsA(
+        isA<PlatformException>()
+            .having((error) => error.code, 'code', 'VG_PROTOCOL_INVALID')
+            .having(
+              (error) => error.message,
+              'message',
+              'V2 recovery seam is debug-only',
+            ),
+      ),
+    );
+  });
 }
 
 Map<String, Object?> _receiptMap({

@@ -569,17 +569,15 @@ final class ARVisibilityGridV2Control {
   ///
   /// Returns `true` only when native accepted the bounded scalar arm request.
   /// Throws [PlatformException] or [MissingPluginException] when the endpoint
-  /// is unavailable, and [StateError] for a malformed native response or when
-  /// the build is not debuggable. This method is not a production capability.
+  /// is unavailable or the build is not debuggable, and [StateError] for a
+  /// malformed native response. This method is not a production capability.
   Future<bool> configureDebugV2ExchangeStall() async {
     await _bindingReady;
-    final raw = await _channel.invokeMethod<Object?>(
+    return _armV2DebugControl(
+      _channel,
       'configureDebugV2ExchangeStall',
+      'V2 debug stall returned an invalid arm receipt.',
     );
-    if (raw is! Map || raw['armed'] is! bool) {
-      throw StateError('V2 debug stall returned an invalid arm receipt.');
-    }
-    return raw['armed']! as bool;
   }
 
   /// Arms the debug-only COMMIT-publication stall used by the Android T6
@@ -590,15 +588,11 @@ final class ARVisibilityGridV2Control {
   /// failures as [configureDebugV2ExchangeStall].
   Future<bool> configureDebugV2CommitPublicationStall() async {
     await _bindingReady;
-    final raw = await _channel.invokeMethod<Object?>(
+    return _armV2DebugControl(
+      _channel,
       'configureDebugV2CommitPublicationStall',
+      'V2 debug COMMIT stall returned an invalid arm receipt.',
     );
-    if (raw is! Map || raw['armed'] is! bool) {
-      throw StateError(
-        'V2 debug COMMIT stall returned an invalid arm receipt.',
-      );
-    }
-    return raw['armed']! as bool;
   }
 
   /// Reads the bounded debug recovery trace from native.
@@ -609,20 +603,7 @@ final class ARVisibilityGridV2Control {
   /// native trace data. This method is not a production capability.
   Future<List<String>> getDebugV2RecoveryTrace() async {
     await _bindingReady;
-    final raw = await _channel.invokeMethod<Object?>(
-      'getDebugV2RecoveryTrace',
-    );
-    if (raw is! Map || raw['trace'] is! List) {
-      throw StateError('V2 debug recovery trace is malformed.');
-    }
-    final entries = (raw['trace']! as List).toList(growable: false);
-    if (entries.length > 64 ||
-        entries.any((entry) {
-          return entry is! String || entry.length > 1024;
-        })) {
-      throw StateError('V2 debug recovery trace exceeds its bounds.');
-    }
-    return entries.cast<String>();
+    return _readV2DebugRecoveryTrace(_channel);
   }
 
   /// Reconciles an outcome-unknown COMMIT against native's exact receipt.
@@ -728,6 +709,31 @@ final class ARVisibilityGridV2Control {
       // Disposal remains qualified when a V2 native snapshot is available.
     }
   }
+}
+
+Future<bool> _armV2DebugControl(
+  MethodChannel channel,
+  String method,
+  String malformedMessage,
+) async {
+  final raw = await channel.invokeMethod<Object?>(method);
+  if (raw is! Map || raw['armed'] is! bool) {
+    throw StateError(malformedMessage);
+  }
+  return raw['armed']! as bool;
+}
+
+Future<List<String>> _readV2DebugRecoveryTrace(MethodChannel channel) async {
+  final raw = await channel.invokeMethod<Object?>('getDebugV2RecoveryTrace');
+  if (raw is! Map || raw['trace'] is! List) {
+    throw StateError('V2 debug recovery trace is malformed.');
+  }
+  final entries = (raw['trace']! as List).toList(growable: false);
+  if (entries.length > 64 ||
+      entries.any((entry) => entry is! String || entry.length > 1024)) {
+    throw StateError('V2 debug recovery trace exceeds its bounds.');
+  }
+  return entries.cast<String>();
 }
 
 Uint8List _qualifierFromSnapshot(Map<Object?, Object?> snapshot) {
@@ -859,17 +865,15 @@ final class ARVisibilityGridV2WorkerBinding {
 
   /// Arms the debug-only first-exchange stall used by the Android T6
   /// recovery tracer. Throws [PlatformException] or
-  /// [MissingPluginException] when unavailable and [StateError] for a
-  /// malformed arm receipt or a non-debuggable build.
+  /// [MissingPluginException] when unavailable or non-debuggable and
+  /// [StateError] for a malformed arm receipt.
   Future<bool> configureDebugV2ExchangeStall() async {
     _ensureOpen();
-    final raw = await _controlChannel.invokeMethod<Object?>(
+    return _armV2DebugControl(
+      _controlChannel,
       'configureDebugV2ExchangeStall',
+      'V2 debug stall returned an invalid arm receipt.',
     );
-    if (raw is! Map || raw['armed'] is! bool) {
-      throw StateError('V2 debug stall returned an invalid arm receipt.');
-    }
-    return raw['armed']! as bool;
   }
 
   /// Arms the debug-only COMMIT-publication stall used by the Android T6
@@ -877,15 +881,11 @@ final class ARVisibilityGridV2WorkerBinding {
   /// and before its platform reply is delivered.
   Future<bool> configureDebugV2CommitPublicationStall() async {
     _ensureOpen();
-    final raw = await _controlChannel.invokeMethod<Object?>(
+    return _armV2DebugControl(
+      _controlChannel,
       'configureDebugV2CommitPublicationStall',
+      'V2 debug COMMIT stall returned an invalid arm receipt.',
     );
-    if (raw is! Map || raw['armed'] is! bool) {
-      throw StateError(
-        'V2 debug COMMIT stall returned an invalid arm receipt.',
-      );
-    }
-    return raw['armed']! as bool;
   }
 
   /// Reads the bounded debug recovery trace from native. At most 64 scalar
@@ -894,20 +894,7 @@ final class ARVisibilityGridV2WorkerBinding {
   /// documented unavailable/malformed cases. This is not a product API.
   Future<List<String>> getDebugV2RecoveryTrace() async {
     _ensureOpen();
-    final raw = await _controlChannel.invokeMethod<Object?>(
-      'getDebugV2RecoveryTrace',
-    );
-    if (raw is! Map || raw['trace'] is! List) {
-      throw StateError('V2 debug recovery trace is malformed.');
-    }
-    final entries = (raw['trace']! as List).toList(growable: false);
-    if (entries.length > 64 ||
-        entries.any((entry) {
-          return entry is! String || entry.length > 1024;
-        })) {
-      throw StateError('V2 debug recovery trace exceeds its bounds.');
-    }
-    return entries.cast<String>();
+    return _readV2DebugRecoveryTrace(_controlChannel);
   }
 
   /// Queries the bounded native receipt for one outcome-unknown COMMIT.

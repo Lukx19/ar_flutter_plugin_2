@@ -23,6 +23,26 @@ import org.junit.Test
 
 class VisibilityGridV2BindingTest {
     @Test
+    fun `debug recovery trace is bounded and the recovery gate disarms`() {
+        val seam = VisibilityGridV2DebugRecoverySeam()
+        seam.arm()
+        repeat(80) { seam.acceptedCut(startRequest()) }
+        val bounded = seam.snapshot()["trace"] as List<*>
+        assertEquals(64, bounded.size)
+
+        val stalled = Executors.newSingleThreadExecutor()
+        val continuation = stalled.submit {
+            seam.beforeExchange()
+            seam.oldContinuationFenced()
+        }
+        seam.releaseAbandonedExchange()
+        continuation.get(2, TimeUnit.SECONDS)
+        stalled.shutdownNow()
+
+        assertEquals(true, seam.armCommitPublication()["armed"])
+    }
+
+    @Test
     fun `exact receipt query reports commit winner and rejects stale replay qualification`() {
         val messenger = MethodTestMessenger()
         val binding = VisibilityGridV2Binding(

@@ -698,6 +698,10 @@ private fun parseUuid(value: String): M0aUuid {
 }
 
 internal class VisibilityGridV2DebugRecoverySeam {
+    companion object {
+        private const val MAX_TRACE_ENTRIES = 64
+    }
+
     private val lock = Any()
     private val trace = mutableListOf<String>()
     private var exchangeGate: CountDownLatch? = null
@@ -709,7 +713,7 @@ internal class VisibilityGridV2DebugRecoverySeam {
         check(exchangeGate == null) { "V2 recovery seam is already armed" }
         trace.clear()
         commitPublicationStall = false
-        trace += "armed:first-exchange"
+        appendTrace("armed:first-exchange")
         exchangeGate = CountDownLatch(1)
         oldContinuation = CountDownLatch(1)
         stallClaimed = false
@@ -720,7 +724,7 @@ internal class VisibilityGridV2DebugRecoverySeam {
         check(exchangeGate == null) { "V2 recovery seam is already armed" }
         trace.clear()
         commitPublicationStall = true
-        trace += "armed:commit-publication"
+        appendTrace("armed:commit-publication")
         exchangeGate = CountDownLatch(1)
         oldContinuation = CountDownLatch(1)
         stallClaimed = false
@@ -733,7 +737,7 @@ internal class VisibilityGridV2DebugRecoverySeam {
             val candidate = exchangeGate
             if (candidate == null || stallClaimed) return
             stallClaimed = true
-            trace += "stalled:first-exchange"
+            appendTrace("stalled:first-exchange")
             candidate
         }
         var interrupted = false
@@ -752,7 +756,7 @@ internal class VisibilityGridV2DebugRecoverySeam {
         val gate = synchronized(lock) {
             if (!commitPublicationStall || exchangeGate == null || stallClaimed) return
             stallClaimed = true
-            trace += "stalled:commit-publication"
+            appendTrace("stalled:commit-publication")
             checkNotNull(exchangeGate)
         }
         var interrupted = false
@@ -769,39 +773,53 @@ internal class VisibilityGridV2DebugRecoverySeam {
     }
 
     fun commitPublished() = synchronized(lock) {
-        if (commitPublicationStall) trace += "commit-published"
+        if (commitPublicationStall) appendTrace("commit-published")
     }
 
     fun acceptedCut(request: M0aControlRequest) = synchronized(lock) {
-        if (exchangeGate != null) trace += "accepted-cut:${request.cutIdentity()}"
+        if (exchangeGate != null) appendTrace("accepted-cut:${request.cutIdentity()}")
     }
 
     fun replacementSeeded(cut: VisibilityGridV2Binding.RecoveryGroupCut) = synchronized(lock) {
-        if (exchangeGate != null) trace += "replacement-seeded:${cut.cutIdentity()}"
+        if (exchangeGate != null) appendTrace("replacement-seeded:${cut.cutIdentity()}")
     }
 
     fun releaseAbandonedExchange() {
         val (gate, continuation) = synchronized(lock) {
             val activeGate = exchangeGate ?: return
-            trace += "abandon-won"
+            appendTrace("abandon-won")
             activeGate to checkNotNull(oldContinuation)
         }
         gate.countDown()
-        check(continuation.await(2, TimeUnit.SECONDS)) {
-            "Abandoned V2 exchange did not reach its publication fence"
+        try {
+            check(continuation.await(2, TimeUnit.SECONDS)) {
+                "Abandoned V2 exchange did not reach its publication fence"
+            }
+        } finally {
+            synchronized(lock) {
+                exchangeGate = null
+                oldContinuation = null
+                stallClaimed = false
+                commitPublicationStall = false
+            }
         }
     }
 
     fun oldContinuationFenced() {
         synchronized(lock) {
             if (exchangeGate == null) return
-            trace += "late-old-completion-fenced"
+            appendTrace("late-old-completion-fenced")
             oldContinuation?.countDown()
         }
     }
 
     fun snapshot(): Map<String, Any> = synchronized(lock) {
         mapOf("trace" to trace.toList())
+    }
+
+    private fun appendTrace(entry: String) {
+        if (trace.size == MAX_TRACE_ENTRIES) trace.removeAt(0)
+        trace += entry
     }
 
     private fun M0aControlRequest.cutIdentity(): String =
