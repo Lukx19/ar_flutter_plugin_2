@@ -815,11 +815,17 @@ Map<Object?, Object?> _teardownReceipt(Object? raw) {
     'callbackCountAfter',
     'executorCountBefore',
     'executorCountAfter',
+    'timeoutSchedulerCountBefore',
+    'timeoutSchedulerCountAfter',
+    'ownedResourceCountBefore',
+    'ownedResourceCountAfter',
   ];
   const balanceKeys = <String>[
     'handlerBalance',
     'callbackBalance',
     'executorBalance',
+    'timeoutSchedulerBalance',
+    'ownedResourceBalance',
   ];
   final hasBalances =
       <String>[...beforeAfterKeys, ...balanceKeys].any(receipt.containsKey);
@@ -839,7 +845,13 @@ Map<Object?, Object?> _teardownReceipt(Object? raw) {
     for (final key in beforeAfterKeys) {
       exact(key, nonNegative: true);
     }
-    for (final kind in const <String>['handler', 'callback', 'executor']) {
+    for (final kind in const <String>[
+      'handler',
+      'callback',
+      'executor',
+      'timeoutScheduler',
+      'ownedResource',
+    ]) {
       final before = exact('${kind}CountBefore', nonNegative: true);
       final after = exact('${kind}CountAfter', nonNegative: true);
       final balance = exact('${kind}Balance', nonNegative: false);
@@ -876,11 +888,13 @@ final class ARVisibilityGridV2WorkerBinding {
   /// The control channel accepts `start`, `beginCheckpoint`,
   /// `releaseCheckpoint`, and `stop`; each method takes one [Uint8List] and
   /// returns one [Uint8List]. Public `dispose` takes no argument and supplies
-  /// its claimed qualifier internally. Hidden `bindingSnapshot` takes no
-  /// argument and returns the scalar identity map. `disposeBinding` receives
-  /// a nullable exact 32-byte qualifier and returns a teardown map. The
-  /// independent `abandonBinding` uses the same qualifier and returns the old
-  /// binding's teardown map while installing a fresh identity. The stream
+  /// its claimed qualifier internally. Hidden `claimBindingLease` receives the
+  /// connection's 16-byte Dart cleanup lease, atomically binds it to the native
+  /// current identity, and returns the scalar snapshot. Hidden
+  /// `bindingSnapshot` remains a no-argument telemetry query. `disposeBinding`
+  /// and independent `abandonBinding` receive that exact 16-byte lease; both
+  /// replay only its bounded old terminal, while a winning abandon installs a
+  /// fresh identity. The stream
   /// channel accepts one binary [ByteData] envelope and returns one binary
   /// [ByteData] envelope, or null when the native side has no response.
   ///
@@ -1168,7 +1182,9 @@ final class ARVisibilityGridV2WorkerBinding {
 
   /// Disposes the native binding and reads the post-disposal scalar snapshot
   /// before fencing this Dart object. The snapshot includes closed-resource
-  /// and lifecycle evidence for teardown receipts.
+  /// and lifecycle evidence for teardown receipts. Handler, callback, serial
+  /// executor, timeout-scheduler, and aggregate owned-resource fields are
+  /// state-derived `Before`/`After` counts; each `Balance` is `After - Before`.
   /// Throws [PlatformException] or [MissingPluginException] on channel failure,
   /// and [StateError] when no qualifier has been claimed or native omits the
   /// teardown map/`closedResources`.

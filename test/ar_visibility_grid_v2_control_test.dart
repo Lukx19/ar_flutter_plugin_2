@@ -512,6 +512,54 @@ void main() {
     });
     await expectLater(capture, throwsStateError);
   });
+
+  test('cleanup receipt rejects incoherent lifecycle ledger deltas', () async {
+    const controlChannel = MethodChannel('visibility_grid_v2_control_94');
+    const streamChannel = BasicMessageChannel<ByteData?>(
+      'visibility_surface_stream_94',
+      BinaryCodec(),
+    );
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(controlChannel, (call) async {
+      if (call.method == 'claimBindingLease') {
+        return <String, Object?>{
+          'nativeStreamToken': Uint8List(16),
+          'workerBindingToken': Uint8List(16),
+        };
+      }
+      if (call.method == 'disposeBinding') {
+        return <String, Object?>{
+          'closedResources': 3,
+          'closedResourcesBefore': 0,
+          'closedResourcesAfter': 3,
+          for (final kind in <String>[
+            'handler',
+            'callback',
+            'executor',
+            'timeoutScheduler',
+            'ownedResource',
+          ]) ...<String, Object?>{
+            '${kind}CountBefore': 1,
+            '${kind}CountAfter': 1,
+            '${kind}Balance': kind == 'callback' ? 1 : 0,
+          },
+        };
+      }
+      throw PlatformException(code: 'unsupported');
+    });
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(controlChannel, null),
+    );
+    final binding = ARVisibilityGridV2WorkerBinding.connect(
+      rootIsolateToken: ServicesBinding.rootIsolateToken!,
+      viewId: 94,
+      controlChannel: controlChannel,
+      streamChannel: streamChannel,
+    );
+    await binding.captureCleanupAuthority();
+    await expectLater(binding.disposeAndSnapshot(), throwsStateError);
+  });
 }
 
 Map<String, Object?> _receiptMap({

@@ -83,6 +83,8 @@ class M0aVisibilitySurfaceStreamChannel(
         BinaryCodec.INSTANCE,
     )
     private val disposed = AtomicBoolean(false)
+    private val handlersInstalled = AtomicBoolean(true)
+    private val timeoutSchedulerActive = AtomicBoolean(true)
     private val outstandingInvocation = AtomicBoolean(false)
     @Volatile private var activePendingReply: PendingReply? = null
     @Volatile private var lastSequence: Long? = null
@@ -106,6 +108,19 @@ class M0aVisibilitySurfaceStreamChannel(
     /** Numeric telemetry for this packed binding; no surface arrays are exposed. */
     val transportInstrumentation: M0aTransportInstrumentation
         get() = telemetry
+
+    internal data class LifecycleResources(
+        val handlerCount: Long,
+        val timeoutSchedulerCount: Long,
+        val pendingReplyCount: Long,
+    )
+
+    /** State-derived resources owned by this stream at the observation cut. */
+    internal fun lifecycleResources() = LifecycleResources(
+        handlerCount = if (handlersInstalled.get()) 2L else 0L,
+        timeoutSchedulerCount = if (timeoutSchedulerActive.get()) 1L else 0L,
+        pendingReplyCount = if (activePendingReply != null) 1L else 0L,
+    )
 
     /**
      * Queues one bounded structural transaction for worker-pull delivery.
@@ -475,7 +490,7 @@ class M0aVisibilitySurfaceStreamChannel(
         if (shutdownWorkerOnDispose && workerExecutor is java.util.concurrent.ExecutorService) {
             workerExecutor.shutdownNow()
         }
-        timeoutScheduler.shutdown()
+        shutdownTimeoutScheduler()
     }
 
     /** Independently fences an admitted invocation without marking this
@@ -500,7 +515,7 @@ class M0aVisibilitySurfaceStreamChannel(
         if (shutdownWorkerOnDispose && workerExecutor is java.util.concurrent.ExecutorService) {
             workerExecutor.shutdownNow()
         }
-        timeoutScheduler.shutdown()
+        shutdownTimeoutScheduler()
     }
 
     private fun abandonForTimeout(pendingReply: PendingReply, bytes: ByteArray) {
@@ -519,7 +534,7 @@ class M0aVisibilitySurfaceStreamChannel(
         if (shutdownWorkerOnDispose && workerExecutor is java.util.concurrent.ExecutorService) {
             workerExecutor.shutdownNow()
         }
-        timeoutScheduler.shutdown()
+        shutdownTimeoutScheduler()
         pendingReply.reply(workerAbandonedResponse(bytes))
     }
 
@@ -541,7 +556,7 @@ class M0aVisibilitySurfaceStreamChannel(
         if (shutdownWorkerOnDispose && workerExecutor is java.util.concurrent.ExecutorService) {
             workerExecutor.shutdownNow()
         }
-        timeoutScheduler.shutdown()
+        shutdownTimeoutScheduler()
         if (ownsReply) pendingReply.reply(workerLostResponse(bytes))
     }
 
@@ -549,6 +564,7 @@ class M0aVisibilitySurfaceStreamChannel(
         val clear = {
             channel.setMessageHandler(null)
             metricsChannel.setMessageHandler(null)
+            handlersInstalled.set(false)
         }
         if (Looper.myLooper() == Looper.getMainLooper()) {
             clear()
@@ -570,6 +586,10 @@ class M0aVisibilitySurfaceStreamChannel(
                 throw IllegalStateException("Interrupted clearing binding handler.", error)
             }
         }
+    }
+
+    private fun shutdownTimeoutScheduler() {
+        if (timeoutSchedulerActive.compareAndSet(true, false)) timeoutScheduler.shutdown()
     }
 
     private fun clearPreparedStaging() {

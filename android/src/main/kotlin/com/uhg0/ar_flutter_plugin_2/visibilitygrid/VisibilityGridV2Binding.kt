@@ -64,6 +64,7 @@ class VisibilityGridV2Binding internal constructor(
 ) {
     private val main = Handler(Looper.getMainLooper())
     private val disposed = AtomicBoolean(false)
+    private val controlHandlerInstalled = AtomicBoolean(true)
     @Volatile private var lifecycle = newLifecycle()
     private val controlChannel = MethodChannel(
         messenger,
@@ -509,8 +510,8 @@ class VisibilityGridV2Binding internal constructor(
      */
     @Synchronized
     private fun replaceBinding(): Map<String, Any?> {
+        val resourcesBefore = lifecycleResources()
         val closedBefore = closedResources
-        val callbacksBefore = pendingControlResults.size.toLong()
         recordExecutorOperation("control:dispose_binding")
         streamChannel.dispose()
         recordClosedResource()
@@ -519,8 +520,8 @@ class VisibilityGridV2Binding internal constructor(
         lifecycleSequence = nextLifecycleSequence.incrementAndGet()
         val teardownReceipt = snapshot().toMap().withCleanupBalances(
             closedBefore = closedBefore,
-            callbacksBefore = callbacksBefore,
-            callbacksAfter = pendingControlResults.size.toLong(),
+            before = resourcesBefore,
+            after = lifecycleResources(),
         )
         lifecycle = newLifecycle()
         currentBindingGeneration = nextBindingGeneration.incrementAndGet()
@@ -557,8 +558,8 @@ class VisibilityGridV2Binding internal constructor(
      * recovery or deliver an old reply into the replacement.
      */
     private fun abandonAndReplace(): Map<String, Any?> {
+        val resourcesBefore = lifecycleResources()
         val closedBefore = closedResources
-        val callbacksBefore = pendingControlResults.size.toLong()
         synchronized(publicationFence) {
             check(disposed.compareAndSet(false, true)) { "V2 binding is already abandoned" }
         }
@@ -600,8 +601,8 @@ class VisibilityGridV2Binding internal constructor(
         )
         return oldSnapshot.withCleanupBalances(
             closedBefore = closedBefore,
-            callbacksBefore = callbacksBefore,
-            callbacksAfter = pendingControlResults.size.toLong(),
+            before = resourcesBefore,
+            after = checkNotNull(replacementBinding).lifecycleResources(),
         )
     }
 
@@ -642,6 +643,7 @@ class VisibilityGridV2Binding internal constructor(
 
     private fun closeBindingResources(abandonStream: Boolean = false) {
         controlChannel.setMethodCallHandler(null)
+        controlHandlerInstalled.set(false)
         recordClosedResource()
         if (abandonStream) {
             streamChannel.abandon()
@@ -712,21 +714,48 @@ class VisibilityGridV2Binding internal constructor(
 
     private fun Map<String, Any?>.withCleanupBalances(
         closedBefore: Long,
-        callbacksBefore: Long,
-        callbacksAfter: Long,
+        before: LifecycleResources,
+        after: LifecycleResources,
     ): Map<String, Any?> = this + mapOf(
         "closedResourcesBefore" to closedBefore,
         "closedResourcesAfter" to closedResources,
-        "handlerCountBefore" to 1L,
-        "handlerCountAfter" to 1L,
-        "handlerBalance" to 0L,
-        "callbackCountBefore" to callbacksBefore,
-        "callbackCountAfter" to callbacksAfter,
-        "callbackBalance" to callbacksAfter - callbacksBefore,
-        "executorCountBefore" to 1L,
-        "executorCountAfter" to 1L,
-        "executorBalance" to 0L,
+        "handlerCountBefore" to before.handlerCount,
+        "handlerCountAfter" to after.handlerCount,
+        "handlerBalance" to after.handlerCount - before.handlerCount,
+        "callbackCountBefore" to before.callbackCount,
+        "callbackCountAfter" to after.callbackCount,
+        "callbackBalance" to after.callbackCount - before.callbackCount,
+        "executorCountBefore" to before.executorCount,
+        "executorCountAfter" to after.executorCount,
+        "executorBalance" to after.executorCount - before.executorCount,
+        "timeoutSchedulerCountBefore" to before.timeoutSchedulerCount,
+        "timeoutSchedulerCountAfter" to after.timeoutSchedulerCount,
+        "timeoutSchedulerBalance" to after.timeoutSchedulerCount - before.timeoutSchedulerCount,
+        "ownedResourceCountBefore" to before.ownedResourceCount,
+        "ownedResourceCountAfter" to after.ownedResourceCount,
+        "ownedResourceBalance" to after.ownedResourceCount - before.ownedResourceCount,
     )
+
+    private data class LifecycleResources(
+        val handlerCount: Long,
+        val executorCount: Long,
+        val timeoutSchedulerCount: Long,
+        val callbackCount: Long,
+    ) {
+        val ownedResourceCount: Long
+            get() = handlerCount + executorCount + timeoutSchedulerCount
+    }
+
+    private fun lifecycleResources(): LifecycleResources {
+        val stream = streamChannel.lifecycleResources()
+        val executorCount = if (executor.isShutdown) 0L else 1L
+        return LifecycleResources(
+            handlerCount = (if (controlHandlerInstalled.get()) 1L else 0L) + stream.handlerCount,
+            executorCount = executorCount,
+            timeoutSchedulerCount = stream.timeoutSchedulerCount,
+            callbackCount = pendingControlResults.size.toLong() + stream.pendingReplyCount,
+        )
+    }
 
     private class BindingAbandonedException : IllegalStateException("V2 binding is abandoned")
 
