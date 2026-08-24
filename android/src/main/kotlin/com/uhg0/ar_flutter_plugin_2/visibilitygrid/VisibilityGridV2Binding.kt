@@ -28,29 +28,21 @@ import java.util.ArrayDeque
  * binding is considered established.
  */
 class VisibilityGridV2Binding(
-    messenger: BinaryMessenger,
-    viewId: Int,
-    committedBaselineAuthority: M0aCommittedBaselineAuthority,
-    val bindingGeneration: Long = nextBindingGeneration.incrementAndGet(),
+    private val messenger: BinaryMessenger,
+    private val viewId: Int,
+    private val committedBaselineAuthority: M0aCommittedBaselineAuthority,
+    private val bindingGenerationSeed: Long = nextBindingGeneration.incrementAndGet(),
     private val executor: ExecutorService = Executors.newSingleThreadExecutor(),
 ) {
     private val main = Handler(Looper.getMainLooper())
     private val disposed = AtomicBoolean(false)
-    private val lifecycle = M0aControlLifecycle(
-        committedBaselineAuthority = committedBaselineAuthority,
-    )
+    @Volatile private var lifecycle = newLifecycle()
     private val controlChannel = MethodChannel(
         messenger,
         "visibility_grid_v2_control_$viewId",
     )
-    private val streamChannel = M0aVisibilitySurfaceStreamChannel(
-        messenger = messenger,
-        viewId = viewId,
-        workerExecutor = executor,
-        shutdownWorkerOnDispose = false,
-        controlLifecycle = lifecycle,
-        onExecutorOperation = ::recordExecutorOperation,
-    )
+    @Volatile private var streamChannel = newStreamChannel()
+    @Volatile private var currentBindingGeneration = bindingGenerationSeed
     private var initialTransactionQueued = false
     private var acceptedControls = 0L
     private var closedResources = 0L
@@ -62,6 +54,19 @@ class VisibilityGridV2Binding(
     private var activeCoverageEpoch = 0L
     private var executorOrdinal = 0L
     private val executorTrace = ArrayDeque<String>()
+
+    private fun newLifecycle() = M0aControlLifecycle(
+        committedBaselineAuthority = committedBaselineAuthority,
+    )
+
+    private fun newStreamChannel() = M0aVisibilitySurfaceStreamChannel(
+        messenger = messenger,
+        viewId = viewId,
+        workerExecutor = executor,
+        shutdownWorkerOnDispose = false,
+        controlLifecycle = lifecycle,
+        onExecutorOperation = ::recordExecutorOperation,
+    )
 
     init {
         controlChannel.setMethodCallHandler(::onControlCall)
@@ -85,7 +90,7 @@ class VisibilityGridV2Binding(
 
     @Synchronized
     fun snapshot(): Snapshot = Snapshot(
-        bindingGeneration = bindingGeneration,
+        bindingGeneration = currentBindingGeneration,
         streamToken = lifecycle.streamToken(),
         acceptedControls = acceptedControls,
         initialTransactionQueued = initialTransactionQueued,
@@ -135,7 +140,7 @@ class VisibilityGridV2Binding(
             try {
                 executor.execute {
                     recordExecutorOperation("control:dispose_binding")
-                    lifecycle.abandon()
+                    replaceBinding()
                     main.post { result.success(true) }
                 }
             } catch (_: RejectedExecutionException) {
@@ -209,6 +214,33 @@ class VisibilityGridV2Binding(
             ),
         )
         initialTransactionQueued = true
+    }
+
+    /**
+     * Fences one worker binding and creates a fresh binding on the same view.
+     *
+     * The old stream is disposed before the new lifecycle is published. Since
+     * this runs on the shared executor, no old exchange can race the new START.
+     */
+    private fun replaceBinding() {
+        check(!disposed.get()) { "V2 binding is disposed" }
+        streamChannel.dispose()
+        recordClosedResource()
+        lifecycle = newLifecycle()
+        streamChannel = newStreamChannel()
+        currentBindingGeneration = nextBindingGeneration.incrementAndGet()
+        initialTransactionQueued = false
+        acceptedControls = 0L
+        activeControlRequestId = null
+        activeSessionId = null
+        activeCaptureGroupId = null
+        activeSessionGeneration = 0L
+        activeGroupGeneration = 0L
+        activeCoverageEpoch = 0L
+        synchronized(this) {
+            executorOrdinal = 0L
+            executorTrace.clear()
+        }
     }
 
     @Synchronized

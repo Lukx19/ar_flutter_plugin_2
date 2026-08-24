@@ -114,6 +114,20 @@ final class ARVisibilityGridV2WorkerBinding {
 
   void close() => _closed = true;
 
+  /// Fences this worker's native binding before the worker isolate exits.
+  ///
+  /// The Android owner replaces the per-view stream/control lifecycle after
+  /// this call, so a subsequent group can negotiate a new binding generation
+  /// without reusing the old stream token or transaction cursor.
+  Future<void> dispose() async {
+    if (_closed) return;
+    try {
+      await _controlChannel.invokeMethod<Object?>('disposeBinding');
+    } finally {
+      _closed = true;
+    }
+  }
+
   void _ensureOpen() {
     if (_closed) throw StateError('V2 worker binding is closed.');
   }
