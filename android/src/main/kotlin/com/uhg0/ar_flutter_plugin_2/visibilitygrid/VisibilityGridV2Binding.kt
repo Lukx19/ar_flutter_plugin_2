@@ -19,6 +19,7 @@ import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.nio.ByteBuffer
+import java.math.BigDecimal
 import java.util.ArrayDeque
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -602,8 +603,52 @@ class VisibilityGridV2Binding internal constructor(
 private fun Map<*, *>.requiredString(key: String): String =
     this[key] as? String ?: error("V2 receipt field $key is not a string")
 
-private fun Map<*, *>.requiredLong(key: String): Long =
-    (this[key] as? Number)?.toLong() ?: error("V2 receipt field $key is not numeric")
+private fun Map<*, *>.requiredLong(key: String): Long {
+    val value = this[key] as? Number
+        ?: error("V2 receipt field $key is not numeric")
+    return value.toExactLong(key)
+}
+
+/**
+ * Admits only an exact, finite, integral signed-64-bit platform number.
+ *
+ * Flutter's standard codec normally delivers Dart ints as Long, but a caller
+ * can still send Double/Float values over the MethodChannel. Converting those
+ * with Number.toLong() would truncate fractions and saturate non-finite or
+ * out-of-range values, changing the receipt identity before qualification.
+ */
+private fun Number.toExactLong(key: String): Long = when (this) {
+    is Long -> this
+    is Int -> toLong()
+    is Short -> toLong()
+    is Byte -> toLong()
+    is Double -> toExactFloatingLong(key)
+    is Float -> toDouble().toExactFloatingLong(key)
+    else -> {
+        val decimal = try {
+            BigDecimal(toString())
+        } catch (_: NumberFormatException) {
+            error("V2 receipt field $key is not an exact integer")
+        }
+        try {
+            decimal.longValueExact()
+        } catch (_: ArithmeticException) {
+            error("V2 receipt field $key is not an exact signed-64-bit integer")
+        }
+    }
+}
+
+private fun Double.toExactFloatingLong(key: String): Long {
+    // 2^63 is exactly representable as a Double but is one past Long.MAX_VALUE.
+    val signed64ExclusiveUpperBound = 9.223372036854776E18
+    if (!isFinite() || this % 1.0 != 0.0 ||
+        this < -signed64ExclusiveUpperBound ||
+        this >= signed64ExclusiveUpperBound
+    ) {
+        error("V2 receipt field $key is not an exact signed-64-bit integer")
+    }
+    return toLong()
+}
 
 private fun Map<*, *>.requiredToken(key: String): ByteArray {
     val value = this[key] as? ByteArray ?: error("V2 receipt field $key is not bytes")

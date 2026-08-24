@@ -1,6 +1,8 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
 import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineAuthority
+import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineScopeV1
+import com.uhg0.ar_flutter_plugin_2.m0.M0aCommitReceiptQueryV1
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlCodec
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlOperation
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlRequest
@@ -185,6 +187,138 @@ class VisibilityGridV2BindingTest {
 
         binding.dispose()
     }
+
+    @Test
+    fun `real receipt query rejects inexact and out of range numbers before lookup`() {
+        val authority = M0aCommittedBaselineAuthority()
+        val messenger = MethodTestMessenger()
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 86,
+            committedBaselineAuthority = authority,
+            postToMain = { task -> task() },
+        )
+        val snapshot = binding.snapshot()
+        val channel = MethodChannel(messenger, "visibility_grid_v2_control_86")
+        val validQuery = M0aCommitReceiptQueryV1(
+            controlRequestId = uuid(1),
+            scope = M0aCommittedBaselineScopeV1(
+                sessionId = uuid(20),
+                captureGroupId = uuid(40),
+                sessionGeneration = 0,
+                groupGeneration = 0,
+            ),
+            nativeStreamToken = snapshot.nativeStreamToken,
+            workerBindingToken = snapshot.workerBindingToken,
+            streamToken = 1,
+            requestSequence = 1,
+            transactionId = 1,
+            targetGeometryRevision = 0,
+            targetLineageRevision = 0,
+        )
+        authority.publishAbandon(validQuery)
+
+        fun query(overrides: Map<String, Any?> = emptyMap()): RecordingResult {
+            val result = RecordingResult()
+            channel.invokeMethod(
+                "queryCommitReceipt",
+                validQuery.toChannelMap() + overrides + mapOf(
+                    "currentBindingQualifier" to
+                        snapshot.nativeStreamToken + snapshot.workerBindingToken,
+                ),
+                result,
+            )
+            assertTrue(result.completed.await(2, TimeUnit.SECONDS))
+            return result
+        }
+
+        listOf(
+            "targetGeometryRevision" to 1.5,
+            "targetGeometryRevision" to Double.NaN,
+            "targetGeometryRevision" to Double.POSITIVE_INFINITY,
+            "targetGeometryRevision" to -9.223372036854778E18,
+            "targetGeometryRevision" to 9.223372036854778E18,
+        ).forEach { (field, value) ->
+            val rejected = query(mapOf(field to value))
+            assertEquals(0, rejected.successCount)
+            assertEquals(1, rejected.errorCount)
+            assertEquals("VG_PROTOCOL_INVALID", rejected.errorCode)
+        }
+
+        // The invalid attempts above did not alter or consume the exact receipt.
+        val valid = query()
+        assertEquals(1, valid.successCount)
+        assertEquals("abandon", (valid.successValue as Map<*, *>) ["decision"])
+        binding.dispose()
+    }
+
+    @Test
+    fun `real receipt query preserves signed 64 bit boundary values`() {
+        val authority = M0aCommittedBaselineAuthority()
+        val messenger = MethodTestMessenger()
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 87,
+            committedBaselineAuthority = authority,
+            postToMain = { task -> task() },
+        )
+        val snapshot = binding.snapshot()
+        val maximum = Long.MAX_VALUE
+        val query = M0aCommitReceiptQueryV1(
+            controlRequestId = uuid(2),
+            scope = M0aCommittedBaselineScopeV1(
+                sessionId = uuid(21),
+                captureGroupId = uuid(41),
+                sessionGeneration = maximum,
+                groupGeneration = maximum,
+            ),
+            nativeStreamToken = snapshot.nativeStreamToken,
+            workerBindingToken = snapshot.workerBindingToken,
+            streamToken = maximum,
+            requestSequence = maximum,
+            transactionId = maximum,
+            targetGeometryRevision = maximum,
+            targetLineageRevision = maximum,
+        )
+        authority.publishAbandon(query)
+
+        val result = RecordingResult()
+        MethodChannel(messenger, "visibility_grid_v2_control_87").invokeMethod(
+            "queryCommitReceipt",
+            query.toChannelMap() + mapOf(
+                "currentBindingQualifier" to
+                    snapshot.nativeStreamToken + snapshot.workerBindingToken,
+            ),
+            result,
+        )
+        assertTrue(result.completed.await(2, TimeUnit.SECONDS))
+        assertEquals(1, result.successCount)
+        val response = result.successValue as Map<*, *>
+        assertEquals(maximum, response["streamToken"])
+        assertEquals(maximum, response["requestSequence"])
+        assertEquals(maximum, response["transactionId"])
+        assertEquals(maximum, response["targetGeometryRevision"])
+        assertEquals(maximum, response["targetLineageRevision"])
+        val scope = response["sessionGeneration"]
+        assertEquals(maximum, scope)
+        assertEquals(maximum, response["groupGeneration"])
+        binding.dispose()
+    }
+
+    private fun M0aCommitReceiptQueryV1.toChannelMap(): Map<String, Any> = mapOf(
+        "controlRequestId" to controlRequestId.hex(),
+        "sessionId" to scope.sessionId.hex(),
+        "captureGroupId" to scope.captureGroupId.hex(),
+        "sessionGeneration" to scope.sessionGeneration,
+        "groupGeneration" to scope.groupGeneration,
+        "nativeStreamToken" to nativeStreamToken,
+        "workerBindingToken" to workerBindingToken,
+        "streamToken" to streamToken,
+        "requestSequence" to requestSequence,
+        "transactionId" to transactionId,
+        "targetGeometryRevision" to targetGeometryRevision,
+        "targetLineageRevision" to targetLineageRevision,
+    )
 
     private fun startRequest() = M0aControlRequest(
         operation = M0aControlOperation.START,
