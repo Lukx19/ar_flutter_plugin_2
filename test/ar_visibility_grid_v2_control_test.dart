@@ -428,10 +428,17 @@ void main() {
       var snapshots = 0;
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
           .setMockMethodCallHandler(controlChannel, (call) async {
+        if (call.method == 'claimBindingLease') {
+          snapshots++;
+          return <String, Object?>{
+            'nativeStreamToken': nativeToken,
+            'workerBindingToken': workerToken,
+          };
+        }
         if (call.method == 'bindingSnapshot') {
           snapshots++;
           return <String, Object?>{
-            'nativeStreamToken': snapshots == 1 ? nativeToken : Uint8List(15),
+            'nativeStreamToken': Uint8List(15),
             'workerBindingToken': workerToken,
           };
         }
@@ -459,9 +466,52 @@ void main() {
       expect(() => binding.bindSnapshot(malformed), throwsStateError);
       expect((await binding.disposeAndSnapshot())['closedResources'], 3);
       expect(snapshots, 2);
-      expect(cleanupQualifier, <int>[...nativeToken, ...workerToken]);
+      expect(cleanupQualifier, hasLength(16));
     },
   );
+
+  test('stalled lease reply still supplies exact native cleanup handle',
+      () async {
+    const controlChannel = MethodChannel('visibility_grid_v2_control_93');
+    const streamChannel = BasicMessageChannel<ByteData?>(
+      'visibility_surface_stream_93',
+      BinaryCodec(),
+    );
+    final claimReply = Completer<Object?>();
+    Uint8List? claimedLease;
+    Uint8List? abandonedLease;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(controlChannel, (call) async {
+      if (call.method == 'claimBindingLease') {
+        claimedLease = Uint8List.fromList(call.arguments! as Uint8List);
+        return claimReply.future;
+      }
+      if (call.method == 'abandonBinding') {
+        abandonedLease = Uint8List.fromList(call.arguments! as Uint8List);
+        return <String, Object?>{'closedResources': 3};
+      }
+      throw PlatformException(code: 'unsupported');
+    });
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(controlChannel, null),
+    );
+    final binding = ARVisibilityGridV2WorkerBinding.connect(
+      rootIsolateToken: ServicesBinding.rootIsolateToken!,
+      viewId: 93,
+      controlChannel: controlChannel,
+      streamChannel: streamChannel,
+    );
+    final capture = binding.captureCleanupAuthority();
+    await Future<void>.delayed(Duration.zero);
+    expect((await binding.abandonAndSnapshot())['closedResources'], 3);
+    expect(abandonedLease, orderedEquals(claimedLease!));
+    claimReply.complete(<String, Object?>{
+      'nativeStreamToken': Uint8List(15),
+      'workerBindingToken': Uint8List(16),
+    });
+    await expectLater(capture, throwsStateError);
+  });
 }
 
 Map<String, Object?> _receiptMap({

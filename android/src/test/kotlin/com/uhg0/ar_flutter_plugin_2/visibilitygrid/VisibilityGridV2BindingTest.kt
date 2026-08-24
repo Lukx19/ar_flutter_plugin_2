@@ -25,6 +25,91 @@ import org.junit.Test
 
 class VisibilityGridV2BindingTest {
     @Test
+    fun `cleanup lease and terminal histories remain bounded`() {
+        val authority = VisibilityGridV2Binding.CleanupAuthority()
+        val leases = mutableListOf<ByteArray>()
+        repeat(12) { index ->
+            val identity = VisibilityGridV2Binding.BindingIdentity(
+                generation = index.toLong() + 1,
+                qualifier = ByteArray(32) { (index + it).toByte() },
+            )
+            val lease = ByteArray(16) { (index * 17 + it).toByte() }
+            leases += lease
+            authority.publishCurrent(identity)
+            assertTrue(authority.claimLease(lease, identity))
+            val admitted = checkNotNull(authority.admit(lease))
+            checkNotNull(authority.claim(admitted) { mapOf("closedResources" to 3L) })
+            authority.release(admitted)
+        }
+        assertEquals(8, authority.retainedLeaseCount())
+        assertEquals(8, authority.retainedTerminalCount())
+        assertEquals(null, authority.admit(leases.first()))
+        val newest = checkNotNull(authority.admit(leases.last()))
+        authority.release(newest)
+    }
+
+    @Test
+    fun `stalled initial lease claim abandons exact binding and cannot rotate replacement`() {
+        val messenger = MethodTestMessenger()
+        val executor = Executors.newSingleThreadExecutor()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        executor.execute {
+            entered.countDown()
+            try {
+                release.await()
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
+        assertTrue(entered.await(2, TimeUnit.SECONDS))
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 1201,
+            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            executor = executor,
+            postToMain = { task -> task() },
+        )
+        val channel = MethodChannel(messenger, "visibility_grid_v2_control_1201")
+        val lease = ByteArray(16) { (it + 7).toByte() }
+        val claim = RecordingResult()
+        channel.invokeMethod("claimBindingLease", lease, claim)
+        assertEquals(0, claim.successCount)
+
+        val abandon = RecordingResult()
+        channel.invokeMethod("abandonBinding", lease, abandon)
+        assertEquals(1, abandon.successCount)
+        val receipt = abandon.successValue as Map<*, *>
+        assertEquals(3L, receipt["closedResources"])
+        assertEquals(0L, receipt["handlerBalance"])
+        assertEquals(0L, receipt["executorBalance"])
+        assertEquals(1, claim.errorCount)
+        assertEquals("VG_STREAM_BINDING_ABANDONED", claim.errorCode)
+
+        val beforeResult = RecordingResult()
+        channel.invokeMethod("bindingSnapshot", null, beforeResult)
+        assertTrue(beforeResult.completed.await(2, TimeUnit.SECONDS))
+        val before = beforeResult.successValue as Map<*, *>
+        release.countDown()
+        Thread.yield()
+        assertEquals(0, claim.successCount)
+        val stale = RecordingResult()
+        channel.invokeMethod("abandonBinding", lease, stale)
+        assertEquals(1, stale.successCount)
+        val afterResult = RecordingResult()
+        channel.invokeMethod("bindingSnapshot", null, afterResult)
+        assertTrue(afterResult.completed.await(2, TimeUnit.SECONDS))
+        val after = afterResult.successValue as Map<*, *>
+        assertEquals(before["bindingGeneration"], after["bindingGeneration"])
+        assertEquals(before["closedResources"], after["closedResources"])
+        assertArrayEquals(
+            before["nativeStreamToken"] as ByteArray,
+            after["nativeStreamToken"] as ByteArray,
+        )
+        binding.dispose()
+    }
+
+    @Test
     fun `restored START stall spans two exact abandon fences then disarms`() {
         val seam = VisibilityGridV2DebugRecoverySeam()
         assertEquals(true, seam.armRestoredStart()["armed"])

@@ -230,6 +230,32 @@ class VisibilityGridV2Binding internal constructor(
             }
             return
         }
+        if (call.method == "claimBindingLease") {
+            val lease = call.arguments as? ByteArray
+            val identity = currentIdentity()
+            if (lease == null || lease.size != CLEANUP_LEASE_BYTES ||
+                !cleanupAuthority.claimLease(lease, identity)
+            ) {
+                result.error("VG_STREAM_BINDING_ABANDONED", "V2 cleanup lease claim rejected", null)
+                return
+            }
+            val pending = PendingControlResult(result) { pendingControlResults.remove(it) }
+            pendingControlResults.add(pending)
+            try {
+                executor.execute {
+                    recordExecutorOperation("control:claim_binding_lease")
+                    val snapshot = snapshot()
+                    post {
+                        if (pending.tryClaim()) pending.result.success(snapshot.toMap())
+                    }
+                }
+            } catch (_: RejectedExecutionException) {
+                if (pending.tryClaim()) {
+                    result.error("VG_NOT_INITIALIZED", "V2 binding executor is closed", null)
+                }
+            }
+            return
+        }
         if (call.method == "disposeBinding") {
             val admission = admitCleanupBinding(call.arguments as? ByteArray)
             if (admission == null) {
@@ -483,13 +509,19 @@ class VisibilityGridV2Binding internal constructor(
      */
     @Synchronized
     private fun replaceBinding(): Map<String, Any?> {
+        val closedBefore = closedResources
+        val callbacksBefore = pendingControlResults.size.toLong()
         recordExecutorOperation("control:dispose_binding")
         streamChannel.dispose()
         recordClosedResource()
         lifecycle.abandon()
         operationGeneration++
         lifecycleSequence = nextLifecycleSequence.incrementAndGet()
-        val teardownReceipt = snapshot().toMap()
+        val teardownReceipt = snapshot().toMap().withCleanupBalances(
+            closedBefore = closedBefore,
+            callbacksBefore = callbacksBefore,
+            callbacksAfter = pendingControlResults.size.toLong(),
+        )
         lifecycle = newLifecycle()
         currentBindingGeneration = nextBindingGeneration.incrementAndGet()
         nativeStreamToken = newOpaqueToken()
@@ -525,6 +557,8 @@ class VisibilityGridV2Binding internal constructor(
      * recovery or deliver an old reply into the replacement.
      */
     private fun abandonAndReplace(): Map<String, Any?> {
+        val closedBefore = closedResources
+        val callbacksBefore = pendingControlResults.size.toLong()
         synchronized(publicationFence) {
             check(disposed.compareAndSet(false, true)) { "V2 binding is already abandoned" }
         }
@@ -538,7 +572,7 @@ class VisibilityGridV2Binding internal constructor(
             }
         }
         closeBindingResources(abandonStream = true)
-        val teardownReceipt = snapshot().toMap()
+        val oldSnapshot = snapshot().toMap()
         val retainedGroupCut = recoveryGroupCut ?: RecoveryGroupCut(
             sessionId = activeSessionId,
             captureGroupId = activeCaptureGroupId,
@@ -564,7 +598,11 @@ class VisibilityGridV2Binding internal constructor(
             debugRecoverySeam = debugRecoverySeam,
             cleanupAuthority = cleanupAuthority,
         )
-        return teardownReceipt
+        return oldSnapshot.withCleanupBalances(
+            closedBefore = closedBefore,
+            callbacksBefore = callbacksBefore,
+            callbacksAfter = pendingControlResults.size.toLong(),
+        )
     }
 
     private fun cleanupBinding(
@@ -672,6 +710,24 @@ class VisibilityGridV2Binding internal constructor(
         "executorTrace" to executorTrace,
     )
 
+    private fun Map<String, Any?>.withCleanupBalances(
+        closedBefore: Long,
+        callbacksBefore: Long,
+        callbacksAfter: Long,
+    ): Map<String, Any?> = this + mapOf(
+        "closedResourcesBefore" to closedBefore,
+        "closedResourcesAfter" to closedResources,
+        "handlerCountBefore" to 1L,
+        "handlerCountAfter" to 1L,
+        "handlerBalance" to 0L,
+        "callbackCountBefore" to callbacksBefore,
+        "callbackCountAfter" to callbacksAfter,
+        "callbackBalance" to callbacksAfter - callbacksBefore,
+        "executorCountBefore" to 1L,
+        "executorCountAfter" to 1L,
+        "executorBalance" to 0L,
+    )
+
     private class BindingAbandonedException : IllegalStateException("V2 binding is abandoned")
 
     private class StaleReceiptException : IllegalStateException()
@@ -761,14 +817,27 @@ class VisibilityGridV2Binding internal constructor(
         private var current: BindingIdentity? = null
         private val terminals = mutableListOf<Pair<BindingIdentity, Map<String, Any?>>>()
         private val activeAdmissions = mutableMapOf<BindingIdentity, Int>()
+        private val leases = mutableListOf<Pair<ByteArray, BindingIdentity>>()
 
         fun publishCurrent(identity: BindingIdentity) = synchronized(lock) {
             current = identity
         }
 
+        fun claimLease(lease: ByteArray, identity: BindingIdentity): Boolean = synchronized(lock) {
+            if (lease.size != CLEANUP_LEASE_BYTES || current != identity) return@synchronized false
+            leases.firstOrNull { it.first.contentEquals(lease) }?.let {
+                return@synchronized it.second == identity
+            }
+            if (leases.any { it.second == identity }) return@synchronized false
+            leases += lease.copyOf() to identity
+            trimLeases()
+            true
+        }
+
         fun admit(bytes: ByteArray?): BindingIdentity? = synchronized(lock) {
             if (bytes == null) return@synchronized null
-            val identity = current?.takeIf { it.qualifier.contentEquals(bytes) }
+            val identity = leases.firstOrNull { it.first.contentEquals(bytes) }?.second
+                ?: current?.takeIf { it.qualifier.contentEquals(bytes) }
                 ?: terminals.firstOrNull { it.first.qualifier.contentEquals(bytes) }?.first
                 ?: return@synchronized null
             activeAdmissions[identity] = (activeAdmissions[identity] ?: 0) + 1
@@ -779,6 +848,7 @@ class VisibilityGridV2Binding internal constructor(
             val count = activeAdmissions[identity] ?: return@synchronized
             if (count == 1) activeAdmissions.remove(identity) else activeAdmissions[identity] = count - 1
             trimTerminals()
+            trimLeases()
         }
 
         fun receiptFor(identity: BindingIdentity): Map<String, Any?>? = synchronized(lock) {
@@ -796,7 +866,18 @@ class VisibilityGridV2Binding internal constructor(
             val receipt = winner()
             terminals += identity to receipt
             trimTerminals()
+            trimLeases()
             CleanupOutcome(receipt, wonCleanup = true)
+        }
+
+        private fun trimLeases() {
+            while (leases.size > MAX_RETAINED_CLEANUP_LEASES) {
+                val eviction = leases.indexOfFirst { (_, identity) ->
+                    identity != current && activeAdmissions[identity] == null
+                }
+                if (eviction < 0) return
+                leases.removeAt(eviction)
+            }
         }
 
         /**
@@ -813,6 +894,7 @@ class VisibilityGridV2Binding internal constructor(
         }
 
         internal fun retainedTerminalCount(): Int = synchronized(lock) { terminals.size }
+        internal fun retainedLeaseCount(): Int = synchronized(lock) { leases.size }
     }
 
     private companion object {
@@ -821,6 +903,8 @@ class VisibilityGridV2Binding internal constructor(
         val nextLifecycleSequence = AtomicLong()
         const val MAX_EXECUTOR_TRACE = 16
         internal const val MAX_RETAINED_CLEANUP_TERMINALS = 8
+        internal const val MAX_RETAINED_CLEANUP_LEASES = 8
+        internal const val CLEANUP_LEASE_BYTES = 16
 
         fun newOpaqueToken(): ByteArray {
             val uuid = UUID.randomUUID()

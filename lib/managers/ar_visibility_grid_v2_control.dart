@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 import 'dart:ui' as ui;
 
 import 'package:flutter/services.dart';
@@ -805,6 +806,53 @@ Map<Object?, Object?> _teardownReceipt(Object? raw) {
   if (receipt['closedResources'] is! num) {
     throw StateError('V2 teardown receipt omitted closed resources.');
   }
+  const beforeAfterKeys = <String>[
+    'closedResourcesBefore',
+    'closedResourcesAfter',
+    'handlerCountBefore',
+    'handlerCountAfter',
+    'callbackCountBefore',
+    'callbackCountAfter',
+    'executorCountBefore',
+    'executorCountAfter',
+  ];
+  const balanceKeys = <String>[
+    'handlerBalance',
+    'callbackBalance',
+    'executorBalance',
+  ];
+  final hasBalances =
+      <String>[...beforeAfterKeys, ...balanceKeys].any(receipt.containsKey);
+  if (hasBalances) {
+    int exact(String key, {required bool nonNegative}) {
+      final value = receipt[key];
+      if (value is! num ||
+          !value.isFinite ||
+          value != value.truncate() ||
+          value.abs() > 0x7fffffffffffffff ||
+          (nonNegative && value < 0)) {
+        throw StateError('V2 teardown receipt field $key is invalid.');
+      }
+      return value.toInt();
+    }
+
+    for (final key in beforeAfterKeys) {
+      exact(key, nonNegative: true);
+    }
+    for (final kind in const <String>['handler', 'callback', 'executor']) {
+      final before = exact('${kind}CountBefore', nonNegative: true);
+      final after = exact('${kind}CountAfter', nonNegative: true);
+      final balance = exact('${kind}Balance', nonNegative: false);
+      if (balance != after - before) {
+        throw StateError(
+            'V2 teardown receipt field ${kind}Balance is incoherent.');
+      }
+    }
+    if (exact('closedResourcesAfter', nonNegative: true) !=
+        (receipt['closedResources'] as num).toInt()) {
+      throw StateError('V2 teardown closed-resource totals are incoherent.');
+    }
+  }
   return receipt;
 }
 
@@ -817,11 +865,13 @@ final class ARVisibilityGridV2WorkerBinding {
   ARVisibilityGridV2WorkerBinding._({
     required MethodChannel controlChannel,
     required BasicMessageChannel<ByteData?> streamChannel,
+    required Uint8List cleanupLease,
   })  : _controlChannel = controlChannel,
-        _streamChannel = streamChannel;
+        _streamChannel = streamChannel,
+        _cleanupLease = cleanupLease;
 
-  /// Creates a worker binding using Flutter's background messenger and
-  /// privately captures its exact cleanup qualifier before returning it.
+  /// Creates a worker binding using Flutter's background messenger with a
+  /// fresh Dart-owned cleanup lease available before any native reply.
   ///
   /// The control channel accepts `start`, `beginCheckpoint`,
   /// `releaseCheckpoint`, and `stop`; each method takes one [Uint8List] and
@@ -834,13 +884,12 @@ final class ARVisibilityGridV2WorkerBinding {
   /// channel accepts one binary [ByteData] envelope and returns one binary
   /// [ByteData] envelope, or null when the native side has no response.
   ///
-  /// The connection-time `bindingSnapshot` is not the caller-visible startup
-  /// snapshot. It establishes immutable cleanup authority first, so a later
-  /// snapshot deadline or malformed/replacement qualifier can still dispose
-  /// or abandon this exact connection. [PlatformException] and
-  /// [MissingPluginException] from connection capture propagate; malformed
-  /// token fields throw [StateError]. The optional channels are a host-test
-  /// transport seam and must be supplied together.
+  /// [captureCleanupAuthority] atomically claims that lease against the native
+  /// current identity before its snapshot reply is queued. Thus a stalled or
+  /// malformed claim reply can still dispose or abandon the claimed attempt,
+  /// while a delayed old cleanup only replays its bounded terminal and cannot
+  /// rotate a replacement. The optional channels are a host-test transport
+  /// seam and must be supplied together.
   factory ARVisibilityGridV2WorkerBinding.connect({
     required ui.RootIsolateToken rootIsolateToken,
     required int viewId,
@@ -867,26 +916,44 @@ final class ARVisibilityGridV2WorkerBinding {
     return ARVisibilityGridV2WorkerBinding._(
       controlChannel: controlChannel,
       streamChannel: streamChannel!,
+      cleanupLease: Uint8List.fromList(
+        List<int>.generate(16, (_) => Random.secure().nextInt(256)),
+      ),
     );
   }
 
-  /// Captures this connection's immutable native cleanup qualifier.
+  /// Atomically claims this connection's immutable native cleanup lease.
   ///
   /// Callers must attach [close], [disposeAndSnapshot], and
   /// [abandonAndSnapshot] to their attempt owner before awaiting this method.
-  /// Once it completes, later worker-visible snapshot failures cannot replace
-  /// the qualifier used by either teardown path.
+  /// Native owns the claim before the returned snapshot reply is queued, so
+  /// cleanup remains available even when this Future deadlines or its reply is
+  /// malformed. [PlatformException] and [MissingPluginException] propagate;
+  /// malformed token fields throw [StateError].
   Future<void> captureCleanupAuthority() async {
-    bindSnapshot(await snapshot());
+    final response = await _controlChannel.invokeMethod<Object?>(
+      'claimBindingLease',
+      _cleanupLease,
+    );
+    if (response is! Map) {
+      throw StateError('V2 binding lease claim returned a non-map snapshot.');
+    }
+    bindSnapshot(Map<Object?, Object?>.from(response));
   }
 
   final MethodChannel _controlChannel;
   final BasicMessageChannel<ByteData?> _streamChannel;
+  final Uint8List _cleanupLease;
   Uint8List? _bindingQualifier;
   bool _closed = false;
   bool _abandoned = false;
   Future<Map<Object?, Object?>>? _disposeFuture;
   Future<Map<Object?, Object?>>? _abandonFuture;
+
+  /// Stable sendable identity for this connection-owned cleanup lease.
+  String get cleanupLeaseIdentity => _cleanupLease
+      .map((byte) => byte.toRadixString(16).padLeft(2, '0'))
+      .join();
 
   /// Claims the native binding tokens returned by `bindingSnapshot`.
   /// The first valid snapshot owns this Dart binding for its lifetime. Reusing
@@ -1112,7 +1179,7 @@ final class ARVisibilityGridV2WorkerBinding {
       try {
         final response = await _controlChannel.invokeMethod<Object?>(
           'disposeBinding',
-          _requireQualifier(),
+          _cleanupLease,
         );
         return _teardownReceipt(response);
       } finally {
@@ -1137,7 +1204,7 @@ final class ARVisibilityGridV2WorkerBinding {
       try {
         final response = await _controlChannel.invokeMethod<Object?>(
           'abandonBinding',
-          _requireQualifier(),
+          _cleanupLease,
         );
         return _teardownReceipt(response);
       } finally {
