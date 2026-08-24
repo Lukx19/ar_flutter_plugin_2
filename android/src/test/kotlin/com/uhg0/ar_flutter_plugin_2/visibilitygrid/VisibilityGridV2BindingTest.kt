@@ -486,6 +486,115 @@ class VisibilityGridV2BindingTest {
     }
 
     @Test
+    fun `Q1 abandon completes only Q1 pending cleanup while delayed Q0 keeps its receipt`() {
+        val messenger = MethodTestMessenger()
+        val executor = Executors.newSingleThreadExecutor()
+        val posted = CountDownLatch(1)
+        val queuedPosts = ArrayDeque<() -> Unit>()
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 96,
+            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            executor = executor,
+            postToMain = { task ->
+                synchronized(queuedPosts) { queuedPosts.addLast(task) }
+                posted.countDown()
+            },
+        )
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        try {
+            val channel = MethodChannel(messenger, "visibility_grid_v2_control_96")
+            val q0 = binding.snapshot()
+            val q0Qualifier = q0.nativeStreamToken + q0.workerBindingToken
+            val q0Dispose = RecordingResult()
+            channel.invokeMethod("disposeBinding", q0Qualifier, q0Dispose)
+            assertTrue(posted.await(2, TimeUnit.SECONDS))
+
+            val q1 = binding.snapshot()
+            val q1Qualifier = q1.nativeStreamToken + q1.workerBindingToken
+            executor.execute {
+                entered.countDown()
+                release.await()
+            }
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            val q1Dispose = RecordingResult()
+            channel.invokeMethod("disposeBinding", q1Qualifier, q1Dispose)
+
+            val q1Abandon = RecordingResult()
+            channel.invokeMethod("abandonBinding", q1Qualifier, q1Abandon)
+            assertEquals(1, q1Abandon.successCount)
+            assertEquals(1, q1Dispose.successCount)
+            assertEquals(0, q0Dispose.successCount)
+            assertReceiptEqual(q1Abandon.successValue, q1Dispose.successValue)
+            assertEquals(q1.bindingGeneration, (q1Abandon.successValue as Map<*, *>)["bindingGeneration"])
+
+            release.countDown()
+            synchronized(queuedPosts) {
+                while (queuedPosts.isNotEmpty()) queuedPosts.removeFirst().invoke()
+            }
+            assertEquals(1, q0Dispose.successCount)
+            assertEquals(q0.bindingGeneration, (q0Dispose.successValue as Map<*, *>)["bindingGeneration"])
+            assertNotEquals(
+                (q0Dispose.successValue as Map<*, *>)["bindingGeneration"],
+                (q1Dispose.successValue as Map<*, *>)["bindingGeneration"],
+            )
+        } finally {
+            release.countDown()
+            binding.dispose()
+        }
+    }
+
+    @Test
+    fun `cleanup terminal history is bounded and evicted qualifier is canonically stale`() {
+        val messenger = MethodTestMessenger()
+        val authority = VisibilityGridV2Binding.CleanupAuthority()
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 97,
+            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            postToMain = { task -> task() },
+            cleanupAuthority = authority,
+        )
+        try {
+            val channel = MethodChannel(messenger, "visibility_grid_v2_control_97")
+            val disposedQualifiers = mutableListOf<ByteArray>()
+            repeat(12) {
+                val current = binding.snapshot()
+                val qualifier = current.nativeStreamToken + current.workerBindingToken
+                disposedQualifiers += qualifier
+                val disposed = RecordingResult()
+                channel.invokeMethod("disposeBinding", qualifier, disposed)
+                assertTrue(disposed.completed.await(2, TimeUnit.SECONDS))
+                assertEquals(1, disposed.successCount)
+            }
+
+            assertEquals(8, authority.retainedTerminalCount())
+            val beforeStale = binding.snapshot()
+            val evicted = RecordingResult()
+            channel.invokeMethod("abandonBinding", disposedQualifiers.first(), evicted)
+            assertEquals(1, evicted.errorCount)
+            assertEquals("VG_STREAM_BINDING_ABANDONED", evicted.errorCode)
+
+            val retained = RecordingResult()
+            channel.invokeMethod("abandonBinding", disposedQualifiers.last(), retained)
+            assertEquals(1, retained.successCount)
+            assertEquals(
+                beforeStale.bindingGeneration - 1,
+                (retained.successValue as Map<*, *>)["bindingGeneration"],
+            )
+            val after = binding.snapshot()
+            assertEquals(beforeStale.bindingGeneration, after.bindingGeneration)
+            assertArrayEquals(beforeStale.nativeStreamToken, after.nativeStreamToken)
+            assertArrayEquals(beforeStale.workerBindingToken, after.workerBindingToken)
+            assertEquals(beforeStale.closedResources, after.closedResources)
+            assertEquals(beforeStale.operationGeneration, after.operationGeneration)
+        } finally {
+            binding.dispose()
+        }
+    }
+
+    @Test
     fun `real receipt query rejects inexact and out of range numbers before lookup`() {
         val authority = M0aCommittedBaselineAuthority()
         val messenger = MethodTestMessenger()

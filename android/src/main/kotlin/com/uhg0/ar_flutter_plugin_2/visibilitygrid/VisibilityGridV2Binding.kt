@@ -227,11 +227,17 @@ class VisibilityGridV2Binding internal constructor(
                 result.error("VG_STREAM_BINDING_ABANDONED", "V2 binding token mismatch", null)
                 return
             }
-            val pending = PendingCleanupResult(result) { pendingCleanupResults.remove(it) }
+            val pending = PendingCleanupResult(admission.identity, result) {
+                pendingCleanupResults.remove(it)
+            }
             pendingCleanupResults.add(pending)
             try {
                 executor.execute {
-                    val outcome = runCatching { cleanupBinding(admission, abandonStream = false) }
+                    val outcome = try {
+                        runCatching { cleanupBinding(admission, abandonStream = false) }
+                    } finally {
+                        cleanupAuthority.release(admission.identity)
+                    }
                     post {
                         if (!pending.tryClaim()) return@post
                         outcome.fold(
@@ -242,6 +248,7 @@ class VisibilityGridV2Binding internal constructor(
                 }
             } catch (_: RejectedExecutionException) {
                 val receipt = cleanupAuthority.receiptFor(admission.identity)
+                cleanupAuthority.release(admission.identity)
                 if (receipt != null && pending.tryClaim()) {
                     result.success(receipt)
                 } else if (pending.tryClaim()) {
@@ -263,10 +270,14 @@ class VisibilityGridV2Binding internal constructor(
                 // before any accepted serial-dispose reply can escape. A worker
                 // observing that reply can therefore bind immediately without
                 // passing through a transient handler-free state.
-                if (outcome.wonCleanup) completePendingCleanup(outcome.receipt)
+                if (outcome.wonCleanup) {
+                    completePendingCleanup(admission.identity, outcome.receipt)
+                }
                 result.success(outcome.receipt)
             } catch (error: Exception) {
                 result.error("VG_STREAM_BINDING_ABANDONED", error.message, null)
+            } finally {
+                cleanupAuthority.release(admission.identity)
             }
             return
         }
@@ -551,9 +562,14 @@ class VisibilityGridV2Binding internal constructor(
         return outcome
     }
 
-    private fun completePendingCleanup(receipt: Map<String, Any?>) {
+    private fun completePendingCleanup(
+        identity: BindingIdentity,
+        receipt: Map<String, Any?>,
+    ) {
         pendingCleanupResults.toList().forEach { pending ->
-            if (pending.tryClaim()) pending.result.success(receipt)
+            if (pending.identity == identity && pending.tryClaim()) {
+                pending.result.success(receipt)
+            }
         }
     }
 
@@ -661,6 +677,7 @@ class VisibilityGridV2Binding internal constructor(
     }
 
     private class PendingCleanupResult(
+        val identity: BindingIdentity,
         val result: MethodChannel.Result,
         private val onClaimed: (PendingCleanupResult) -> Unit,
     ) {
@@ -695,6 +712,7 @@ class VisibilityGridV2Binding internal constructor(
         private val lock = Any()
         private var current: BindingIdentity? = null
         private val terminals = mutableListOf<Pair<BindingIdentity, Map<String, Any?>>>()
+        private val activeAdmissions = mutableMapOf<BindingIdentity, Int>()
 
         fun publishCurrent(identity: BindingIdentity) = synchronized(lock) {
             current = identity
@@ -702,8 +720,17 @@ class VisibilityGridV2Binding internal constructor(
 
         fun admit(bytes: ByteArray?): BindingIdentity? = synchronized(lock) {
             if (bytes == null) return@synchronized null
-            current?.takeIf { it.qualifier.contentEquals(bytes) }?.let { return@synchronized it }
-            terminals.firstOrNull { it.first.qualifier.contentEquals(bytes) }?.first
+            val identity = current?.takeIf { it.qualifier.contentEquals(bytes) }
+                ?: terminals.firstOrNull { it.first.qualifier.contentEquals(bytes) }?.first
+                ?: return@synchronized null
+            activeAdmissions[identity] = (activeAdmissions[identity] ?: 0) + 1
+            identity
+        }
+
+        fun release(identity: BindingIdentity) = synchronized(lock) {
+            val count = activeAdmissions[identity] ?: return@synchronized
+            if (count == 1) activeAdmissions.remove(identity) else activeAdmissions[identity] = count - 1
+            trimTerminals()
         }
 
         fun receiptFor(identity: BindingIdentity): Map<String, Any?>? = synchronized(lock) {
@@ -720,8 +747,24 @@ class VisibilityGridV2Binding internal constructor(
             if (current != identity) return@synchronized null
             val receipt = winner()
             terminals += identity to receipt
+            trimTerminals()
             CleanupOutcome(receipt, wonCleanup = true)
         }
+
+        /**
+         * Retains at most [MAX_RETAINED_CLEANUP_TERMINALS] unpinned recent
+         * terminals. An admitted cleanup pins its exact identity until claim
+         * completion; release immediately restores the fixed history bound.
+         */
+        private fun trimTerminals() {
+            while (terminals.size > MAX_RETAINED_CLEANUP_TERMINALS) {
+                val eviction = terminals.indexOfFirst { activeAdmissions[it.first] == null }
+                if (eviction < 0) return
+                terminals.removeAt(eviction)
+            }
+        }
+
+        internal fun retainedTerminalCount(): Int = synchronized(lock) { terminals.size }
     }
 
     private companion object {
@@ -729,6 +772,7 @@ class VisibilityGridV2Binding internal constructor(
         val nextViewGeneration = AtomicLong()
         val nextLifecycleSequence = AtomicLong()
         const val MAX_EXECUTOR_TRACE = 16
+        internal const val MAX_RETAINED_CLEANUP_TERMINALS = 8
 
         fun newOpaqueToken(): ByteArray {
             val uuid = UUID.randomUUID()
