@@ -300,7 +300,7 @@ class VisibilityGridV2Binding(
      */
     private fun abandonAndReplace(): Snapshot {
         check(disposed.compareAndSet(false, true)) { "V2 binding is already abandoned" }
-        closeBindingResources()
+        closeBindingResources(abandonStream = true)
         val teardownReceipt = snapshot()
         replacementBinding = VisibilityGridV2Binding(
             messenger = messenger,
@@ -310,10 +310,10 @@ class VisibilityGridV2Binding(
         return teardownReceipt
     }
 
-    private fun closeBindingResources() {
+    private fun closeBindingResources(abandonStream: Boolean = false) {
         controlChannel.setMethodCallHandler(null)
         recordClosedResource()
-        streamChannel.dispose()
+        if (abandonStream) streamChannel.abandon() else streamChannel.dispose()
         recordClosedResource()
         lifecycle.abandon()
         executor.shutdownNow()

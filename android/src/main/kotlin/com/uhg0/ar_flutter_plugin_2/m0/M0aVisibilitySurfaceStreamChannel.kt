@@ -77,6 +77,7 @@ class M0aVisibilitySurfaceStreamChannel(
     )
     private val disposed = AtomicBoolean(false)
     private val outstandingInvocation = AtomicBoolean(false)
+    @Volatile private var activePendingReply: PendingReply? = null
     @Volatile private var lastSequence: Long? = null
     @Volatile private var nextExpectedSequence = 1L
     @Volatile private var lastRequest: ByteArray? = null
@@ -217,9 +218,11 @@ class M0aVisibilitySurfaceStreamChannel(
                 return@setMessageHandler
             }
             telemetry.queued()
-            val pendingReply = PendingReply(reply, ::qualify) {
+            val pendingReply = PendingReply(bytes, reply, ::qualify) {
                 outstandingInvocation.set(false)
+                activePendingReply = null
             }
+            activePendingReply = pendingReply
             val timeoutHandle = timeoutScheduler.schedule(workerTimeoutMillis) {
                 abandonForTimeout(pendingReply, bytes)
             }
@@ -419,6 +422,11 @@ class M0aVisibilitySurfaceStreamChannel(
     fun dispose() {
         if (!disposed.compareAndSet(false, true)) return
         bindingAbandoned.set(true)
+        activePendingReply?.let { pendingReply ->
+            if (pendingReply.tryClaim()) {
+                pendingReply.reply(workerLostResponse(pendingReply.requestBytes))
+            }
+        }
         lastRequest = null
         lastResponse = null
         resyncPending = false
@@ -431,6 +439,25 @@ class M0aVisibilitySurfaceStreamChannel(
         telemetry.clearRetained()
         controlLifecycle?.abandon()
         transactionReceiver.stop()
+        clearMessageHandler()
+        if (shutdownWorkerOnDispose && workerExecutor is java.util.concurrent.ExecutorService) {
+            workerExecutor.shutdownNow()
+        }
+        timeoutScheduler.shutdown()
+    }
+
+    /** Independently fences an admitted invocation without marking this
+     * stream as normally disposed; the owner may install a fresh binding. */
+    fun abandon() {
+        if (disposed.get()) return
+        if (!bindingAbandoned.compareAndSet(false, true)) return
+        activePendingReply?.let { pendingReply ->
+            if (pendingReply.tryClaim()) {
+                pendingReply.reply(workerAbandonedResponse(pendingReply.requestBytes))
+            }
+        }
+        transactionReceiver.abandon()
+        controlLifecycle?.abandon()
         clearMessageHandler()
         if (shutdownWorkerOnDispose && workerExecutor is java.util.concurrent.ExecutorService) {
             workerExecutor.shutdownNow()
@@ -605,6 +632,7 @@ class M0aVisibilitySurfaceStreamChannel(
     }
 
     private class PendingReply(
+        val requestBytes: ByteArray,
         private val callback: BasicMessageChannel.Reply<ByteBuffer>,
         private val qualify: (ByteBuffer) -> ByteBuffer,
         private val onClaimed: () -> Unit,
