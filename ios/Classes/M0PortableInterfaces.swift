@@ -74,13 +74,88 @@ struct VisibilityGridV2StartDescriptor {
     let minimumMinor: UInt16
     let maximumMinor: UInt16
     let persistenceSchema: UInt16
+    let selectedProfile: UInt8
+    let restoreRequested: Bool
     let requiredCapabilities: UInt64
     let desiredCapabilities: UInt64
+    let requestedOrdinaryResponseBytes: UInt32
+    let requestedCatchUpResponseBytes: UInt32
+    let requestedDiagnosticBytes: UInt16
+    let requestedRegionCommandLimit: UInt16
+    let voxelSizeMicrometres: UInt32
+    let requestedModelCapacity: UInt32
+    let requestedPendingObservationCapacity: UInt32
+    let groupFrameConvention: UInt16
+    let matrixConvention: UInt16
+    let directionConvention: UInt16
+    let normalEncoding: UInt16
     let groupFromWorldColumnMajor: [Double]
     let worldFromGroupColumnMajor: [Double]
-    let restoredRevisionVector: [UInt64]
+    let restoredEvidenceRevision: UInt64
+    let restoredGeometryRevision: UInt64
+    let restoredLineageRevision: UInt64
+    let restoredCaptureRevision: UInt64
+    let restoredCoverageRevision: UInt64
+    let restoredProducedStyleRevision: UInt64
+    let restoredAcceptedStyleRevision: UInt64
+    let restoredRegionManifestRevision: UInt64
+    let restoredSchemaRootRevision: UInt64
+    let restoredNextSurfaceIDHighWater: UInt64
     let schemaRootSHA256: Data
     let manifestRootSHA256: Data
+}
+
+/// Shape-only coherent accepted START configuration.
+struct VisibilityGridV2StartResultDescriptor {
+    let selectedMinor: UInt16
+    let persistenceSchema: UInt16
+    let selectedProfile: UInt8
+    let configuredDepthMode: UInt8
+    let acceptedCapabilities: UInt64
+    let supportedCapabilities: UInt64
+    let acceptedModelCapacity: UInt32
+    let acceptedPendingObservationCapacity: UInt32
+    let residentRegionCount: UInt32
+    let regionSurfaceSoftLimit: UInt32
+    let regionDirectoryCacheBytes: UInt32
+    let cleanPointRenderBudget: UInt32
+    let cleanCubeRenderBudget: UInt32
+    let warmProxyRenderBudget: UInt32
+    let coldRegionRenderBudget: UInt32
+    let rawPointRenderBudget: UInt32
+    let ordinaryResponseBytes: UInt32
+    let catchUpResponseBytes: UInt32
+    let regionCommandLimit: UInt16
+    let directionBinCount: UInt16
+    let regionEdgeMillimetres: UInt32
+    let pageEdgeMillimetres: UInt32
+    let acceptedEvidenceRevision: UInt64
+    let acceptedGeometryRevision: UInt64
+    let acceptedLineageRevision: UInt64
+    let acceptedCaptureRevision: UInt64
+    let acceptedCoverageRevision: UInt64
+    let acceptedProducedStyleRevision: UInt64
+    let acceptedStyleRevision: UInt64
+    let acceptedRegionManifestRevision: UInt64
+    let acceptedSchemaRootRevision: UInt64
+    let acceptedNextSurfaceIDHighWater: UInt64
+    let nextExchangeRequestSequence: UInt64
+    let nativeTransactionID: UInt64
+}
+
+/// Shape-only complete lifecycle cut used to qualify callbacks and admission.
+struct VisibilityGridV2LifecycleCutV1 {
+    let sessionID: UUID
+    let sessionGeneration: UInt64
+    let captureGroupID: UUID
+    let groupGeneration: UInt64
+    let arSessionIdentity: UUID
+    let viewInstanceID: UUID
+    let viewGeneration: UInt64
+    let nativeStreamToken: UUID
+    let workerBindingToken: UUID
+    let lifecycleSequence: UInt64
+    let operationGeneration: UInt64
 }
 
 /// Shape-only DTO for a future native response handoff.

@@ -185,6 +185,14 @@ class M0aControlLifecycleTest {
         assertEquals(0x107L, result.getLong(8))
         assertEquals(12345, result.getInt(24))
         assertEquals(23456, result.getInt(28))
+        assertEquals(3, result.getInt(32))
+        assertEquals(100_000, result.getInt(36))
+        assertEquals(1024 * 1024, result.getInt(40))
+        assertEquals(20_000, result.getInt(44))
+        assertEquals(8_000, result.getInt(48))
+        assertEquals(4_096, result.getInt(52))
+        assertEquals(512, result.getInt(56))
+        assertEquals(2_000, result.getInt(60))
         assertEquals(8192, result.getInt(64))
         assertEquals(32768, result.getInt(68))
         assertEquals(5, result.getShort(72).toInt())
@@ -194,7 +202,7 @@ class M0aControlLifecycleTest {
         )
         val digest = MessageDigest.getInstance("SHA-256").digest(response.payload)
             .joinToString("") { "%02x".format(it.toInt() and 0xff) }
-        assertEquals("cd708be10b2af6f51f6beab2b4fde2d7eeb6034b8ec48f360accf102bfdd7138", digest)
+        assertEquals("c380108a95972701c99ea4a3e07676c3bec054bb96cf8123f8ea1c874d1ffb12", digest)
     }
 
     @Test

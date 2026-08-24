@@ -9,6 +9,14 @@ object M0aStartResultCodecV2 {
     private const val persistenceSchema = 5
     private const val acceptedModelCapacity = 100_000
     private const val acceptedPendingObservationCapacity = 200_000
+    private const val residentRegionCount = 3
+    private const val regionSurfaceSoftLimit = 100_000
+    private const val regionDirectoryCacheBytes = 1024 * 1024
+    private const val cleanPointRenderBudget = 20_000
+    private const val cleanCubeRenderBudget = 8_000
+    private const val warmProxyRenderBudget = 4_096
+    private const val coldRegionRenderBudget = 512
+    private const val rawPointRenderBudget = 2_000
     private const val ordinaryResponseBytes = 16 * 1024
     private const val catchUpResponseBytes = 64 * 1024
     private const val regionCommandLimit = 8
@@ -35,14 +43,14 @@ object M0aStartResultCodecV2 {
         data.putLong(16, M0aStartRequestCodecV2.supportedCapabilities)
         data.putInt(24, if (configuration.requestedModelCapacity == 0) acceptedModelCapacity else configuration.requestedModelCapacity)
         data.putInt(28, if (configuration.requestedPendingObservationCapacity == 0) acceptedPendingObservationCapacity else configuration.requestedPendingObservationCapacity)
-        data.putInt(32, 0)
-        data.putInt(36, 0)
-        data.putInt(40, 0)
-        data.putInt(44, 0)
-        data.putInt(48, 0)
-        data.putInt(52, 0)
-        data.putInt(56, 0)
-        data.putInt(60, 0)
+        data.putInt(32, residentRegionCount)
+        data.putInt(36, regionSurfaceSoftLimit)
+        data.putInt(40, regionDirectoryCacheBytes)
+        data.putInt(44, cleanPointRenderBudget)
+        data.putInt(48, cleanCubeRenderBudget)
+        data.putInt(52, warmProxyRenderBudget)
+        data.putInt(56, coldRegionRenderBudget)
+        data.putInt(60, rawPointRenderBudget)
         data.putInt(64, configuration.requestedOrdinaryResponseBytes)
         data.putInt(68, configuration.requestedCatchUpResponseBytes)
         data.putShort(72, configuration.requestedRegionCommandLimit.toShort())

@@ -34,6 +34,7 @@ class VisibilityGridV2Binding(
     private val viewId: Int,
     private val committedBaselineAuthority: M0aCommittedBaselineAuthority,
     private val bindingGenerationSeed: Long = nextBindingGeneration.incrementAndGet(),
+    private val viewGeneration: Long = nextViewGeneration.incrementAndGet(),
     private val executor: ExecutorService = Executors.newSingleThreadExecutor(),
 ) {
     private val main = Handler(Looper.getMainLooper())
@@ -47,6 +48,8 @@ class VisibilityGridV2Binding(
     @Volatile private var currentBindingGeneration = bindingGenerationSeed
     private var nativeStreamToken = newOpaqueToken()
     private var workerBindingToken = newOpaqueToken()
+    private val arSessionIdentity = newOpaqueToken()
+    private val viewInstanceId = newOpaqueToken()
     private var initialTransactionQueued = false
     private var acceptedControls = 0L
     private var closedResources = 0L
@@ -59,11 +62,6 @@ class VisibilityGridV2Binding(
     private var executorOrdinal = 0L
     private var lifecycleSequence = nextLifecycleSequence.incrementAndGet()
     private var operationGeneration = 0L
-    // This binding never owns a root-isolate surface. Keep the measured count
-    // in the native snapshot rather than manufacturing a Dart-side constant;
-    // a future owned surface route can increment this counter on the same
-    // serial executor.
-    private var rootIsolateSurfaceBytes = 0L
     private val executorTrace = ArrayDeque<String>()
 
     private fun newLifecycle() = M0aControlLifecycle(
@@ -98,11 +96,12 @@ class VisibilityGridV2Binding(
         val coverageEpoch: Long,
         val nativeStreamToken: ByteArray,
         val workerBindingToken: ByteArray,
+        val arSessionIdentity: ByteArray,
+        val viewInstanceId: ByteArray,
         val viewId: Int,
         val viewGeneration: Long,
         val lifecycleSequence: Long,
         val operationGeneration: Long,
-        val rootIsolateSurfaceBytes: Long,
         val executorTrace: List<String>,
     )
 
@@ -122,11 +121,12 @@ class VisibilityGridV2Binding(
         coverageEpoch = activeCoverageEpoch,
         nativeStreamToken = nativeStreamToken.copyOf(),
         workerBindingToken = workerBindingToken.copyOf(),
+        arSessionIdentity = arSessionIdentity.copyOf(),
+        viewInstanceId = viewInstanceId.copyOf(),
         viewId = viewId,
-        viewGeneration = currentBindingGeneration,
+        viewGeneration = viewGeneration,
         lifecycleSequence = lifecycleSequence,
         operationGeneration = operationGeneration,
-        rootIsolateSurfaceBytes = rootIsolateSurfaceBytes,
         executorTrace = executorTrace.toList(),
     )
 
@@ -137,30 +137,7 @@ class VisibilityGridV2Binding(
                     recordExecutorOperation("control:binding_snapshot")
                     val snapshot = snapshot()
                     main.post {
-                        result.success(
-                            mapOf(
-                                "bindingGeneration" to snapshot.bindingGeneration,
-                                "streamToken" to snapshot.streamToken,
-                                "acceptedControls" to snapshot.acceptedControls,
-                                "initialTransactionQueued" to snapshot.initialTransactionQueued,
-                                "disposed" to snapshot.disposed,
-                                "closedResources" to snapshot.closedResources,
-                                "controlRequestId" to snapshot.controlRequestId?.hex(),
-                                "sessionId" to snapshot.sessionId?.hex(),
-                                "captureGroupId" to snapshot.captureGroupId?.hex(),
-                                "sessionGeneration" to snapshot.sessionGeneration,
-                                "groupGeneration" to snapshot.groupGeneration,
-                                "coverageEpoch" to snapshot.coverageEpoch,
-                                "nativeStreamToken" to snapshot.nativeStreamToken,
-                                "workerBindingToken" to snapshot.workerBindingToken,
-                                "viewId" to snapshot.viewId,
-                                "viewGeneration" to snapshot.viewGeneration,
-                                "lifecycleSequence" to snapshot.lifecycleSequence,
-                                "operationGeneration" to snapshot.operationGeneration,
-                                "rootIsolateSurfaceBytes" to snapshot.rootIsolateSurfaceBytes,
-                                "executorTrace" to snapshot.executorTrace,
-                            ),
-                        )
+                        result.success(snapshot.toMap())
                     }
                 }
             } catch (_: RejectedExecutionException) {
@@ -172,8 +149,8 @@ class VisibilityGridV2Binding(
             try {
                 executor.execute {
                     recordExecutorOperation("control:dispose_binding")
-                    replaceBinding()
-                    main.post { result.success(true) }
+                    val teardownReceipt = replaceBinding()
+                    main.post { result.success(teardownReceipt.toMap()) }
                 }
             } catch (_: RejectedExecutionException) {
                 result.error("VG_NOT_INITIALIZED", "V2 binding executor is closed", null)
@@ -208,6 +185,8 @@ class VisibilityGridV2Binding(
                         wasIdle && operation == M0aControlOperation.START &&
                         decoded.outcome == 0
                     ) {
+                        operationGeneration++
+                        lifecycleSequence = nextLifecycleSequence.incrementAndGet()
                         activeControlRequestId = request.controlRequestId
                         activeSessionId = request.sessionId
                         activeCaptureGroupId = request.captureGroupId
@@ -254,18 +233,19 @@ class VisibilityGridV2Binding(
      * The old stream is disposed before the new lifecycle is published. Since
      * this runs on the shared executor, no old exchange can race the new START.
      */
-    private fun replaceBinding() {
+    private fun replaceBinding(): Snapshot {
         check(!disposed.get()) { "V2 binding is disposed" }
         streamChannel.dispose()
         recordClosedResource()
+        lifecycle.abandon()
+        operationGeneration++
+        lifecycleSequence = nextLifecycleSequence.incrementAndGet()
+        val teardownReceipt = snapshot()
         lifecycle = newLifecycle()
         streamChannel = newStreamChannel()
         currentBindingGeneration = nextBindingGeneration.incrementAndGet()
         nativeStreamToken = newOpaqueToken()
         workerBindingToken = newOpaqueToken()
-        lifecycleSequence = nextLifecycleSequence.incrementAndGet()
-        operationGeneration = 0L
-        rootIsolateSurfaceBytes = 0L
         initialTransactionQueued = false
         acceptedControls = 0L
         activeControlRequestId = null
@@ -278,13 +258,12 @@ class VisibilityGridV2Binding(
             executorOrdinal = 0L
             executorTrace.clear()
         }
+        return teardownReceipt
     }
 
     @Synchronized
     private fun recordExecutorOperation(kind: String) {
         executorOrdinal++
-        operationGeneration++
-        lifecycleSequence = nextLifecycleSequence.incrementAndGet()
         if (executorTrace.size == MAX_EXECUTOR_TRACE) executorTrace.removeFirst()
         executorTrace.addLast("$executorOrdinal:$kind")
     }
@@ -309,8 +288,33 @@ class VisibilityGridV2Binding(
         "%02x".format(byte.toInt() and 0xff)
     }
 
+    private fun Snapshot.toMap(): Map<String, Any?> = mapOf(
+        "bindingGeneration" to bindingGeneration,
+        "streamToken" to streamToken,
+        "acceptedControls" to acceptedControls,
+        "initialTransactionQueued" to initialTransactionQueued,
+        "disposed" to disposed,
+        "closedResources" to closedResources,
+        "controlRequestId" to controlRequestId?.hex(),
+        "sessionId" to sessionId?.hex(),
+        "captureGroupId" to captureGroupId?.hex(),
+        "sessionGeneration" to sessionGeneration,
+        "groupGeneration" to groupGeneration,
+        "coverageEpoch" to coverageEpoch,
+        "nativeStreamToken" to nativeStreamToken,
+        "workerBindingToken" to workerBindingToken,
+        "arSessionIdentity" to arSessionIdentity,
+        "viewInstanceId" to viewInstanceId,
+        "viewId" to viewId,
+        "viewGeneration" to viewGeneration,
+        "lifecycleSequence" to lifecycleSequence,
+        "operationGeneration" to operationGeneration,
+        "executorTrace" to executorTrace,
+    )
+
     private companion object {
         val nextBindingGeneration = AtomicLong()
+        val nextViewGeneration = AtomicLong()
         val nextLifecycleSequence = AtomicLong()
         const val MAX_EXECUTOR_TRACE = 16
 

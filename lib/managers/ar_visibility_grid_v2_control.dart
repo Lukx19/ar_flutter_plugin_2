@@ -17,17 +17,29 @@ final class ARVisibilityGridV2Control {
   final MethodChannel _channel;
 
   /// Sends a byte-only `start` request and returns the byte-only response.
+  ///
+  /// Throws [PlatformException] or [MissingPluginException] when the platform
+  /// channel fails, and [StateError] when native returns a non-byte response.
   Future<Uint8List> start(Uint8List request) => _invoke('start', request);
 
   /// Sends a byte-only `beginCheckpoint` request and returns its response.
+  ///
+  /// Throws [PlatformException] or [MissingPluginException] when the platform
+  /// channel fails, and [StateError] when native returns a non-byte response.
   Future<Uint8List> beginCheckpoint(Uint8List request) =>
       _invoke('beginCheckpoint', request);
 
   /// Sends a byte-only `releaseCheckpoint` request and returns its response.
+  ///
+  /// Throws [PlatformException] or [MissingPluginException] when the platform
+  /// channel fails, and [StateError] when native returns a non-byte response.
   Future<Uint8List> releaseCheckpoint(Uint8List request) =>
       _invoke('releaseCheckpoint', request);
 
   /// Sends a byte-only `stop` request and returns its response.
+  ///
+  /// Throws [PlatformException] or [MissingPluginException] when the platform
+  /// channel fails, and [StateError] when native returns a non-byte response.
   Future<Uint8List> stop(Uint8List request) => _invoke('stop', request);
 
   Future<Uint8List> _invoke(String method, Uint8List request) async {
@@ -41,6 +53,8 @@ final class ARVisibilityGridV2Control {
   /// Fences only the V2 binding while leaving the shared V1 point-cloud/
   /// visibility channel alive for the owning platform view's normal teardown.
   /// This no-argument call returns the native dispose result.
+  /// Throws [PlatformException] or [MissingPluginException] when the platform
+  /// channel cannot apply the fence.
   Future<void> dispose() => _channel.invokeMethod<void>('disposeBinding');
 }
 
@@ -87,13 +101,36 @@ final class ARVisibilityGridV2WorkerBinding {
   final BasicMessageChannel<ByteData?> _streamChannel;
   bool _closed = false;
 
-  /// Invokes one of the four byte-only control methods listed on [connect].
-  /// Throws [StateError] when the response is not byte data or this binding is
-  /// closed.
-  Future<Uint8List> control(String method, Uint8List request) async {
+  /// Sends START through the worker-owned control channel.
+  /// Throws [StateError] when closed or for a non-byte response, and
+  /// propagates [PlatformException] or [MissingPluginException].
+  Future<Uint8List> start(Uint8List request) =>
+      _control(_V2Control.start, request);
+
+  /// Begins a checkpoint through the worker-owned control channel.
+  /// Throws [StateError] when closed or for a non-byte response, and
+  /// propagates [PlatformException] or [MissingPluginException].
+  Future<Uint8List> beginCheckpoint(Uint8List request) =>
+      _control(_V2Control.beginCheckpoint, request);
+
+  /// Releases a checkpoint through the worker-owned control channel.
+  /// Throws [StateError] when closed or for a non-byte response, and
+  /// propagates [PlatformException] or [MissingPluginException].
+  Future<Uint8List> releaseCheckpoint(Uint8List request) =>
+      _control(_V2Control.releaseCheckpoint, request);
+
+  /// Stops the worker-owned native stream.
+  /// Throws [StateError] when closed or for a non-byte response, and
+  /// propagates [PlatformException] or [MissingPluginException].
+  Future<Uint8List> stop(Uint8List request) =>
+      _control(_V2Control.stop, request);
+
+  /// Throws [StateError] if closed or native returns a non-byte response.
+  /// Throws [PlatformException] or [MissingPluginException] on channel failure.
+  Future<Uint8List> _control(_V2Control operation, Uint8List request) async {
     _ensureOpen();
     final response =
-        await _controlChannel.invokeMethod<Object?>(method, request);
+        await _controlChannel.invokeMethod<Object?>(operation.method, request);
     if (response is! Uint8List) {
       throw StateError('V2 control returned a non-byte response.');
     }
@@ -101,7 +138,8 @@ final class ARVisibilityGridV2WorkerBinding {
   }
 
   /// Exchanges one binary stream envelope and returns its binary response.
-  /// Throws [StateError] when the binding is closed or no response arrives.
+  /// Throws [StateError] when closed or no response arrives, and propagates
+  /// [PlatformException] or [MissingPluginException] on channel failure.
   Future<Uint8List> exchange(Uint8List request) async {
     _ensureOpen();
     final response = await _streamChannel.send(ByteData.sublistView(request));
@@ -119,6 +157,14 @@ final class ARVisibilityGridV2WorkerBinding {
   /// Reads bounded scalar binding telemetry on the same native executor as
   /// control and exchange operations. No surface payload bytes are returned.
   /// The no-argument call returns a scalar [Map] snapshot.
+  ///
+  /// The map contains `bindingGeneration`, `streamToken`, `acceptedControls`,
+  /// `initialTransactionQueued`, `disposed`, `closedResources`, the complete
+  /// group epoch, `arSessionIdentity`, `viewInstanceId`, `viewGeneration`,
+  /// `nativeStreamToken`, `workerBindingToken`, `lifecycleSequence`,
+  /// `operationGeneration`, and `executorTrace`.
+  /// Throws [StateError] for a closed binding or non-map result and propagates
+  /// [PlatformException] or [MissingPluginException] on channel failure.
   Future<Map<Object?, Object?>> snapshot() async {
     _ensureOpen();
     final response = await _controlChannel.invokeMethod<Object?>(
@@ -138,6 +184,8 @@ final class ARVisibilityGridV2WorkerBinding {
   /// The Android owner replaces the per-view stream/control lifecycle after
   /// this call, so a subsequent group can negotiate a new binding generation
   /// without reusing the old stream token or transaction cursor.
+  /// Throws [PlatformException], [MissingPluginException], or [StateError] if
+  /// the native fence or its post-fence snapshot cannot be observed.
   Future<void> dispose() async {
     await disposeAndSnapshot();
   }
@@ -145,12 +193,18 @@ final class ARVisibilityGridV2WorkerBinding {
   /// Disposes the native binding and reads the post-disposal scalar snapshot
   /// before fencing this Dart object. The snapshot includes closed-resource
   /// and lifecycle evidence for teardown receipts.
+  /// Throws [PlatformException], [MissingPluginException], or [StateError] if
+  /// native disposal or the required snapshot fails.
   Future<Map<Object?, Object?>> disposeAndSnapshot() async {
     if (_closed) return const <Object?, Object?>{};
     try {
-      await _controlChannel.invokeMethod<Object?>('disposeBinding');
-      final snapshot = await this.snapshot();
-      return snapshot;
+      final response = await _controlChannel.invokeMethod<Object?>(
+        'disposeBinding',
+      );
+      if (response is! Map) {
+        throw StateError('V2 binding returned no teardown receipt.');
+      }
+      return Map<Object?, Object?>.from(response);
     } finally {
       _closed = true;
     }
@@ -159,4 +213,14 @@ final class ARVisibilityGridV2WorkerBinding {
   void _ensureOpen() {
     if (_closed) throw StateError('V2 worker binding is closed.');
   }
+}
+
+enum _V2Control {
+  start('start'),
+  beginCheckpoint('beginCheckpoint'),
+  releaseCheckpoint('releaseCheckpoint'),
+  stop('stop');
+
+  const _V2Control(this.method);
+  final String method;
 }
