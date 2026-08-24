@@ -676,6 +676,7 @@ class VisibilityGridV2Binding internal constructor(
         }
         recordClosedResource()
         lifecycle.abandon()
+        if (!abandonStream) terminatePendingCleanupResults()
         executor.shutdownNow()
         recordClosedResource()
     }
@@ -691,6 +692,30 @@ class VisibilityGridV2Binding internal constructor(
                 pending.result.error(
                     "VG_STREAM_BINDING_ABANDONED",
                     "V2 binding was abandoned before control publication",
+                    null,
+                )
+            }
+        }
+    }
+
+    /**
+     * Ordinary lifecycle disposal owns the same callback terminal fence as
+     * abandon-driven executor shutdown. Claim every admitted cleanup before
+     * shutdownNow can discard its runnable. A cleanup whose winner already
+     * published replays that exact receipt; all other queued work receives the
+     * canonical binding-abandoned terminal. PendingCleanupResult.tryClaim also
+     * releases the admission lease and removes the registration exactly once.
+     */
+    private fun terminatePendingCleanupResults() {
+        pendingCleanupResults.toList().forEach { pending ->
+            val receipt = cleanupAuthority.receiptFor(pending.identity)
+            if (!pending.tryClaim()) return@forEach
+            if (receipt != null) {
+                pending.result.success(receipt)
+            } else {
+                pending.result.error(
+                    "VG_STREAM_BINDING_ABANDONED",
+                    "V2 binding was abandoned before cleanup publication",
                     null,
                 )
             }
@@ -968,6 +993,9 @@ class VisibilityGridV2Binding internal constructor(
 
         internal fun retainedTerminalCount(): Int = synchronized(lock) { terminals.size }
         internal fun retainedLeaseCount(): Int = synchronized(lock) { leases.size }
+        internal fun activeAdmissionCount(): Int = synchronized(lock) {
+            activeAdmissions.values.sum()
+        }
     }
 
     private companion object {

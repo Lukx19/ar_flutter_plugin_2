@@ -167,6 +167,111 @@ class VisibilityGridV2BindingTest {
     }
 
     @Test
+    fun `lifecycle dispose drains queued cleanup and releases its admission once`() {
+        val messenger = MethodTestMessenger()
+        val executor = Executors.newSingleThreadExecutor()
+        val authority = VisibilityGridV2Binding.CleanupAuthority()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        executor.execute {
+            entered.countDown()
+            try {
+                while (!release.await(10, TimeUnit.MILLISECONDS)) {
+                    // Keep the admitted cleanup queued behind an explicit cut.
+                }
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
+        assertTrue(entered.await(2, TimeUnit.SECONDS))
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 1203,
+            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            executor = executor,
+            postToMain = { task -> task() },
+            cleanupAuthority = authority,
+        )
+        try {
+            val current = binding.snapshot()
+            val cleanup = RecordingResult()
+            MethodChannel(messenger, "visibility_grid_v2_control_1203").invokeMethod(
+                "disposeBinding",
+                current.nativeStreamToken + current.workerBindingToken,
+                cleanup,
+            )
+            assertEquals(1, authority.activeAdmissionCount())
+
+            binding.dispose()
+
+            assertTrue(cleanup.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(0, cleanup.successCount)
+            assertEquals(1, cleanup.errorCount)
+            assertEquals("VG_STREAM_BINDING_ABANDONED", cleanup.errorCode)
+            assertEquals(0, authority.activeAdmissionCount())
+
+            release.countDown()
+            assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS))
+            assertEquals(1, cleanup.successCount + cleanup.errorCount)
+            assertEquals(0, authority.activeAdmissionCount())
+        } finally {
+            release.countDown()
+            binding.dispose()
+        }
+    }
+
+    @Test
+    fun `lifecycle dispose replays retained cleanup terminal before executor shutdown`() {
+        val messenger = MethodTestMessenger()
+        val authority = VisibilityGridV2Binding.CleanupAuthority()
+        val posted = CountDownLatch(1)
+        val queuedPosts = ArrayDeque<() -> Unit>()
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 1204,
+            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            postToMain = { task ->
+                synchronized(queuedPosts) { queuedPosts.addLast(task) }
+                posted.countDown()
+            },
+            cleanupAuthority = authority,
+        )
+        try {
+            val original = binding.snapshot()
+            val cleanup = RecordingResult()
+            MethodChannel(messenger, "visibility_grid_v2_control_1204").invokeMethod(
+                "disposeBinding",
+                original.nativeStreamToken + original.workerBindingToken,
+                cleanup,
+            )
+            assertTrue(posted.await(2, TimeUnit.SECONDS))
+            assertEquals(0, cleanup.successCount)
+            assertEquals(0, authority.activeAdmissionCount())
+            assertEquals(1, authority.retainedTerminalCount())
+
+            binding.dispose()
+
+            assertTrue(cleanup.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(1, cleanup.successCount)
+            assertEquals(0, cleanup.errorCount)
+            val receipt = cleanup.successValue as Map<*, *>
+            assertEquals(original.bindingGeneration, receipt["bindingGeneration"])
+            assertEquals(0L, receipt["callbackCountBefore"])
+            assertEquals(0L, receipt["callbackCountAfter"])
+            assertEquals(0L, receipt["callbackBalance"])
+            assertEquals(0, authority.activeAdmissionCount())
+
+            synchronized(queuedPosts) {
+                while (queuedPosts.isNotEmpty()) queuedPosts.removeFirst().invoke()
+            }
+            assertEquals(1, cleanup.successCount + cleanup.errorCount)
+            assertEquals(0, authority.activeAdmissionCount())
+        } finally {
+            binding.dispose()
+        }
+    }
+
+    @Test
     fun `restored START stall spans two exact abandon fences then disarms`() {
         val seam = VisibilityGridV2DebugRecoverySeam()
         assertEquals(true, seam.armRestoredStart()["armed"])
@@ -548,6 +653,9 @@ class VisibilityGridV2BindingTest {
             assertEquals(original.bindingGeneration, receipt["bindingGeneration"])
             assertEquals(1L, receipt["closedResources"])
             assertEquals(false, receipt["disposed"])
+            assertEquals(0L, receipt["callbackCountBefore"])
+            assertEquals(0L, receipt["callbackCountAfter"])
+            assertEquals(0L, receipt["callbackBalance"])
 
             val replacementAfter = binding.snapshot()
             assertEquals(replacementBefore.bindingGeneration, replacementAfter.bindingGeneration)
