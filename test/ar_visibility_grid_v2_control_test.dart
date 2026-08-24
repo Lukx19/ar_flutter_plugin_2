@@ -411,6 +411,57 @@ void main() {
       ),
     );
   });
+
+  test(
+    'worker connection captures cleanup qualifier before visible snapshot rejection',
+    () async {
+      const controlChannel = MethodChannel('visibility_grid_v2_control_92');
+      const streamChannel = BasicMessageChannel<ByteData?>(
+        'visibility_surface_stream_92',
+        BinaryCodec(),
+      );
+      final nativeToken = Uint8List.fromList(List<int>.generate(16, (i) => i));
+      final workerToken = Uint8List.fromList(
+        List<int>.generate(16, (i) => i + 16),
+      );
+      Uint8List? cleanupQualifier;
+      var snapshots = 0;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(controlChannel, (call) async {
+        if (call.method == 'bindingSnapshot') {
+          snapshots++;
+          return <String, Object?>{
+            'nativeStreamToken': snapshots == 1 ? nativeToken : Uint8List(15),
+            'workerBindingToken': workerToken,
+          };
+        }
+        if (call.method == 'disposeBinding') {
+          cleanupQualifier = Uint8List.fromList(call.arguments! as Uint8List);
+          return <String, Object?>{'closedResources': 3};
+        }
+        throw PlatformException(code: 'unsupported');
+      });
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(controlChannel, null),
+      );
+
+      final token = ServicesBinding.rootIsolateToken;
+      expect(token, isNotNull);
+      final binding = ARVisibilityGridV2WorkerBinding.connect(
+        rootIsolateToken: token!,
+        viewId: 92,
+        controlChannel: controlChannel,
+        streamChannel: streamChannel,
+      );
+      await binding.captureCleanupAuthority();
+      final malformed = await binding.snapshot();
+      expect(() => binding.bindSnapshot(malformed), throwsStateError);
+      expect((await binding.disposeAndSnapshot())['closedResources'], 3);
+      expect(snapshots, 2);
+      expect(cleanupQualifier, <int>[...nativeToken, ...workerToken]);
+    },
+  );
 }
 
 Map<String, Object?> _receiptMap({

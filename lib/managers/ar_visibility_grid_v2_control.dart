@@ -820,7 +820,8 @@ final class ARVisibilityGridV2WorkerBinding {
   })  : _controlChannel = controlChannel,
         _streamChannel = streamChannel;
 
-  /// Creates a worker binding using Flutter's background messenger.
+  /// Creates a worker binding using Flutter's background messenger and
+  /// privately captures its exact cleanup qualifier before returning it.
   ///
   /// The control channel accepts `start`, `beginCheckpoint`,
   /// `releaseCheckpoint`, and `stop`; each method takes one [Uint8List] and
@@ -832,24 +833,51 @@ final class ARVisibilityGridV2WorkerBinding {
   /// binding's teardown map while installing a fresh identity. The stream
   /// channel accepts one binary [ByteData] envelope and returns one binary
   /// [ByteData] envelope, or null when the native side has no response.
+  ///
+  /// The connection-time `bindingSnapshot` is not the caller-visible startup
+  /// snapshot. It establishes immutable cleanup authority first, so a later
+  /// snapshot deadline or malformed/replacement qualifier can still dispose
+  /// or abandon this exact connection. [PlatformException] and
+  /// [MissingPluginException] from connection capture propagate; malformed
+  /// token fields throw [StateError]. The optional channels are a host-test
+  /// transport seam and must be supplied together.
   factory ARVisibilityGridV2WorkerBinding.connect({
     required ui.RootIsolateToken rootIsolateToken,
     required int viewId,
+    MethodChannel? controlChannel,
+    BasicMessageChannel<ByteData?>? streamChannel,
   }) {
-    BackgroundIsolateBinaryMessenger.ensureInitialized(rootIsolateToken);
-    final messenger = BackgroundIsolateBinaryMessenger.instance;
-    return ARVisibilityGridV2WorkerBinding._(
-      controlChannel: MethodChannel(
+    if ((controlChannel == null) != (streamChannel == null)) {
+      throw ArgumentError('Worker binding test channels must be paired.');
+    }
+    if (controlChannel == null) {
+      BackgroundIsolateBinaryMessenger.ensureInitialized(rootIsolateToken);
+      final messenger = BackgroundIsolateBinaryMessenger.instance;
+      controlChannel = MethodChannel(
         'visibility_grid_v2_control_$viewId',
         const StandardMethodCodec(),
         messenger,
-      ),
-      streamChannel: BasicMessageChannel<ByteData?>(
+      );
+      streamChannel = BasicMessageChannel<ByteData?>(
         'visibility_surface_stream_$viewId',
         const BinaryCodec(),
         binaryMessenger: messenger,
-      ),
+      );
+    }
+    return ARVisibilityGridV2WorkerBinding._(
+      controlChannel: controlChannel,
+      streamChannel: streamChannel!,
     );
+  }
+
+  /// Captures this connection's immutable native cleanup qualifier.
+  ///
+  /// Callers must attach [close], [disposeAndSnapshot], and
+  /// [abandonAndSnapshot] to their attempt owner before awaiting this method.
+  /// Once it completes, later worker-visible snapshot failures cannot replace
+  /// the qualifier used by either teardown path.
+  Future<void> captureCleanupAuthority() async {
+    bindSnapshot(await snapshot());
   }
 
   final MethodChannel _controlChannel;
