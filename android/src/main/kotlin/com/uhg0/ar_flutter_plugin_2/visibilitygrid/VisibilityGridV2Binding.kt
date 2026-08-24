@@ -63,6 +63,7 @@ class VisibilityGridV2Binding(
     private var lifecycleSequence = nextLifecycleSequence.incrementAndGet()
     private var operationGeneration = 0L
     private val executorTrace = ArrayDeque<String>()
+    @Volatile private var replacementBinding: VisibilityGridV2Binding? = null
 
     private fun newLifecycle() = M0aControlLifecycle(
         committedBaselineAuthority = committedBaselineAuthority,
@@ -159,6 +160,19 @@ class VisibilityGridV2Binding(
                 }
             } catch (_: RejectedExecutionException) {
                 result.error("VG_NOT_INITIALIZED", "V2 binding executor is closed", null)
+            }
+            return
+        }
+        if (call.method == "abandonBinding") {
+            if (!qualifierMatches(call.arguments as? ByteArray)) {
+                result.error("VG_STREAM_BINDING_ABANDONED", "V2 binding token mismatch", null)
+                return
+            }
+            try {
+                val teardownReceipt = abandonAndReplace()
+                result.success(teardownReceipt.toMap())
+            } catch (error: Exception) {
+                result.error("VG_STREAM_BINDING_ABANDONED", error.message, null)
             }
             return
         }
@@ -274,13 +288,35 @@ class VisibilityGridV2Binding(
     }
 
     fun dispose() {
-        if (!disposed.compareAndSet(false, true)) return
+        if (disposed.compareAndSet(false, true)) closeBindingResources()
+        replacementBinding?.dispose()
+    }
+
+    /**
+     * Immediately abandons this binding without entering the serial
+     * executor. It clears the old channel and installs a new binding object
+     * on the same view, so a stalled executor cannot block fresh identity
+     * recovery or deliver an old reply into the replacement.
+     */
+    private fun abandonAndReplace(): Snapshot {
+        check(disposed.compareAndSet(false, true)) { "V2 binding is already abandoned" }
+        closeBindingResources()
+        val teardownReceipt = snapshot()
+        replacementBinding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = viewId,
+            committedBaselineAuthority = committedBaselineAuthority,
+        )
+        return teardownReceipt
+    }
+
+    private fun closeBindingResources() {
         controlChannel.setMethodCallHandler(null)
         recordClosedResource()
         streamChannel.dispose()
         recordClosedResource()
         lifecycle.abandon()
-        executor.shutdown()
+        executor.shutdownNow()
         recordClosedResource()
     }
 

@@ -11,23 +11,52 @@ import 'ar_visibility_surface_stream.dart';
 /// Each invocation is one VGC2 request and returns one VGD2 response. The V1
 /// visibility-grid manager remains the compatibility product path.
 final class ARVisibilityGridV2Control {
+  /// Creates a control and immediately starts one hidden connection-time
+  /// `bindingSnapshot` invocation. The snapshot's two 16-byte tokens are
+  /// owned for this control's lifetime; disposal never snapshots replacement
+  /// state. [initialBindingSnapshot] is the deterministic host/fake seam.
   ARVisibilityGridV2Control(
     int viewId, {
     MethodChannel? channel,
+    Map<Object?, Object?>? initialBindingSnapshot,
   }) : _channel =
-            channel ?? MethodChannel('visibility_grid_v2_control_$viewId');
+            channel ?? MethodChannel('visibility_grid_v2_control_$viewId') {
+    _bindingReady = initialBindingSnapshot == null
+        ? _captureBindingAtConnection()
+        : Future<void>(() {
+            bindSnapshot(initialBindingSnapshot);
+          });
+  }
+
+  /// Connects to a V2 endpoint and captures its binding identity before the
+  /// control is handed to callers. A later native replacement cannot change
+  /// the qualifier owned by this object.
+  static Future<ARVisibilityGridV2Control> connect(
+    int viewId, {
+    MethodChannel? channel,
+  }) async {
+    final control = ARVisibilityGridV2Control(viewId, channel: channel);
+    await control.bindingReady;
+    return control;
+  }
 
   final MethodChannel _channel;
+  late final Future<void> _bindingReady;
   Uint8List? _bindingQualifier;
+  Map<Object?, Object?>? _disposeReceipt;
   bool _closed = false;
+
+  /// Completes after the connection-time native identity snapshot has been
+  /// captured (or an optional compatibility endpoint has declined it).
+  Future<void> get bindingReady => _bindingReady;
 
   /// Sends a byte-only `start` request and returns the byte-only response.
   ///
   /// Throws [PlatformException] or [MissingPluginException] when the platform
   /// channel fails, and [StateError] when native returns a non-byte response.
   Future<Uint8List> start(Uint8List request) async {
+    await _bindingReady;
     final response = await _invoke('start', request);
-    await _claimBindingSnapshotIfAvailable();
     return response;
   }
 
@@ -61,52 +90,58 @@ final class ARVisibilityGridV2Control {
 
   /// Fences only the V2 binding while leaving the shared V1 point-cloud/
   /// visibility channel alive for the owning platform view's normal teardown.
-  /// This no-argument call supplies the claimed qualifier internally and
-  /// returns the native dispose result.
+  /// This no-argument call supplies the connection-time qualifier internally
+  /// and returns the native teardown receipt map.
+  /// Native receives either null or the exact 32-byte concatenation of the
+  /// owned `nativeStreamToken` and `workerBindingToken`; the public method
+  /// remains argument-free. The returned map includes `closedResources`.
   /// Throws [PlatformException] or [MissingPluginException] when the platform
   /// channel cannot apply the fence.
-  /// Claims the opaque native binding tokens from [snapshot] for the next
-  /// argument-free [dispose] call. The tokens remain an internal transport
-  /// detail; callers still use the public no-argument lifecycle method.
   ///
-  /// Throws [StateError] when either token is not a 16-byte byte list.
+  /// The first claim wins; a replacement claim is rejected. Throws [StateError]
+  /// when either token is not a 16-byte byte list.
   void bindSnapshot(Map<Object?, Object?> snapshot) {
-    Uint8List token(String key) {
-      final value = snapshot[key];
-      if (value is! Uint8List || value.length != 16) {
-        throw StateError('V2 $key must be exactly 16 bytes.');
+    final qualifier = _qualifierFromSnapshot(snapshot);
+    final existing = _bindingQualifier;
+    if (existing != null) {
+      if (!_bytesEqual(existing, qualifier)) {
+        throw StateError('V2 binding qualifier cannot be replaced.');
       }
-      return value;
+      return;
     }
-
-    _bindingQualifier = Uint8List.fromList(<int>[
-      ...token('nativeStreamToken'),
-      ...token('workerBindingToken'),
-    ]);
+    _bindingQualifier = qualifier;
   }
 
   /// Fences only the currently claimed V2 binding.
   ///
-  /// The public API is intentionally argument-free. When [bindSnapshot] has
-  /// claimed a binding, its qualifier is supplied internally so a stale
-  /// control object cannot dispose a replacement. An unclaimed object still
-  /// sends a null argument and lets the native endpoint reject the request;
-  /// it must not guess a replacement identity.
+  /// The public API is intentionally argument-free. Its connection-time
+  /// qualifier is supplied internally so a stale control object cannot
+  /// dispose a replacement. An endpoint without the optional snapshot seam
+  /// sends a null argument and lets native reject the request; it must not
+  /// guess a replacement identity.
   ///
   /// Throws [PlatformException] or [MissingPluginException] when the platform
   /// channel cannot apply the fence.
-  Future<void> dispose() async {
-    if (_closed) return;
+  Future<Map<Object?, Object?>> dispose() async {
+    if (_closed) {
+      return _disposeReceipt ??
+          (throw StateError('V2 control has no teardown receipt.'));
+    }
     try {
-      await _claimBindingSnapshotIfAvailable();
-      await _channel.invokeMethod<void>('disposeBinding', _bindingQualifier);
+      await _bindingReady;
+      final raw = await _channel.invokeMethod<Object?>(
+        'disposeBinding',
+        _bindingQualifier,
+      );
+      final receipt = _teardownReceipt(raw);
+      _disposeReceipt = receipt;
+      return receipt;
     } finally {
       _closed = true;
     }
   }
 
-  Future<void> _claimBindingSnapshotIfAvailable() async {
-    if (_bindingQualifier != null) return;
+  Future<void> _captureBindingAtConnection() async {
     try {
       final raw = await _channel.invokeMethod<Object?>('bindingSnapshot');
       if (raw is Map) {
@@ -117,6 +152,40 @@ final class ARVisibilityGridV2Control {
       // Disposal remains qualified when a V2 native snapshot is available.
     }
   }
+}
+
+Uint8List _qualifierFromSnapshot(Map<Object?, Object?> snapshot) {
+  Uint8List token(String key) {
+    final value = snapshot[key];
+    if (value is! Uint8List || value.length != 16) {
+      throw StateError('V2 $key must be exactly 16 bytes.');
+    }
+    return value;
+  }
+
+  return Uint8List.fromList(<int>[
+    ...token('nativeStreamToken'),
+    ...token('workerBindingToken'),
+  ]);
+}
+
+bool _bytesEqual(Uint8List left, Uint8List right) {
+  if (left.length != right.length) return false;
+  for (var index = 0; index < left.length; index++) {
+    if (left[index] != right[index]) return false;
+  }
+  return true;
+}
+
+Map<Object?, Object?> _teardownReceipt(Object? raw) {
+  if (raw is! Map) {
+    throw StateError('V2 binding returned no teardown receipt.');
+  }
+  final receipt = Map<Object?, Object?>.from(raw);
+  if (receipt['closedResources'] is! num) {
+    throw StateError('V2 teardown receipt omitted closed resources.');
+  }
+  return receipt;
 }
 
 /// Background-isolate owner for one production V2 control/stream binding.
@@ -136,7 +205,11 @@ final class ARVisibilityGridV2WorkerBinding {
   /// The control channel accepts `start`, `beginCheckpoint`,
   /// `releaseCheckpoint`, and `stop`; each method takes one [Uint8List] and
   /// returns one [Uint8List]. Public `dispose` takes no argument and supplies
-  /// its claimed qualifier internally. The stream
+  /// its claimed qualifier internally. Hidden `bindingSnapshot` takes no
+  /// argument and returns the scalar identity map. `disposeBinding` receives
+  /// a nullable exact 32-byte qualifier and returns a teardown map. The
+  /// independent `abandonBinding` uses the same qualifier and returns the old
+  /// binding's teardown map while installing a fresh identity. The stream
   /// channel accepts one binary [ByteData] envelope and returns one binary
   /// [ByteData] envelope, or null when the native side has no response.
   factory ARVisibilityGridV2WorkerBinding.connect({
@@ -165,22 +238,20 @@ final class ARVisibilityGridV2WorkerBinding {
   bool _closed = false;
   bool _abandoned = false;
   Future<Map<Object?, Object?>>? _disposeFuture;
+  Future<Map<Object?, Object?>>? _abandonFuture;
 
   /// Claims the native binding tokens returned by `bindingSnapshot`.
   /// Throws [StateError] when either token is not a 16-byte [Uint8List].
   void bindSnapshot(Map<Object?, Object?> snapshot) {
-    Uint8List token(String key) {
-      final value = snapshot[key];
-      if (value is! Uint8List || value.length != 16) {
-        throw StateError('V2 $key must be exactly 16 bytes.');
+    final qualifier = _qualifierFromSnapshot(snapshot);
+    final existing = _bindingQualifier;
+    if (existing != null) {
+      if (!_bytesEqual(existing, qualifier)) {
+        throw StateError('V2 binding qualifier cannot be replaced.');
       }
-      return value;
+      return;
     }
-
-    _bindingQualifier = Uint8List.fromList(<int>[
-      ...token('nativeStreamToken'),
-      ...token('workerBindingToken'),
-    ]);
+    _bindingQualifier = qualifier;
   }
 
   /// Sends START through the worker-owned control channel.
@@ -308,15 +379,35 @@ final class ARVisibilityGridV2WorkerBinding {
           'disposeBinding',
           _requireQualifier(),
         );
-        if (response is! Map) {
-          throw StateError('V2 binding returned no teardown receipt.');
-        }
-        return Map<Object?, Object?>.from(response);
+        return _teardownReceipt(response);
       } finally {
         _closed = true;
       }
     }();
     _disposeFuture = future;
+    return future;
+  }
+
+  /// Uses the independent native abandon/fence path when the serial dispose
+  /// call is stalled behind an admitted invocation. Native returns the old
+  /// binding's teardown receipt and installs a fresh identity on the channel;
+  /// this object is permanently closed afterward.
+  Future<Map<Object?, Object?>> abandonAndSnapshot() async {
+    final existing = _abandonFuture;
+    if (existing != null) return existing;
+    final future = () async {
+      try {
+        final response = await _controlChannel.invokeMethod<Object?>(
+          'abandonBinding',
+          _requireQualifier(),
+        );
+        return _teardownReceipt(response);
+      } finally {
+        _closed = true;
+        _abandoned = true;
+      }
+    }();
+    _abandonFuture = future;
     return future;
   }
 
