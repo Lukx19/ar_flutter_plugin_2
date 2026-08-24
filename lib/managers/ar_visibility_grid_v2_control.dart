@@ -6,7 +6,13 @@ import 'package:flutter/services.dart';
 import 'ar_visibility_surface_stream.dart';
 
 /// The winner of one identity-qualified, outcome-unknown COMMIT attempt.
-enum ARVisibilityGridV2CommitDecision { commit, abandon }
+enum ARVisibilityGridV2CommitDecision {
+  /// Native committed the exact queried transaction.
+  commit,
+
+  /// Native fenced the attempt before COMMIT publication.
+  abandon,
+}
 
 /// Exact bounded qualification for a COMMIT receipt query.
 ///
@@ -17,6 +23,7 @@ enum ARVisibilityGridV2CommitDecision { commit, abandon }
 /// scalar revisions/sequences are non-negative integers. The native ledger
 /// retains at most eight exact receipts.
 final class ARVisibilityGridV2CommitReceiptQuery {
+  /// Creates the complete bounded identity for one receipt query.
   const ARVisibilityGridV2CommitReceiptQuery({
     required this.controlRequestId,
     required this.sessionId,
@@ -32,19 +39,43 @@ final class ARVisibilityGridV2CommitReceiptQuery {
     required this.targetLineageRevision,
   });
 
+  /// UUID of the old START control request, encoded as 32 hex characters.
   final String controlRequestId;
+
+  /// UUID of the capture session, encoded as 32 hex characters.
   final String sessionId;
+
+  /// UUID of the capture group, encoded as 32 hex characters.
   final String captureGroupId;
+
+  /// Session generation of the old binding.
   final int sessionGeneration;
+
+  /// Group generation of the old binding.
   final int groupGeneration;
+
+  /// Native stream identity token from the old binding.
   final Uint8List nativeStreamToken;
+
+  /// Worker binding identity token from the old binding.
   final Uint8List workerBindingToken;
+
+  /// Stream token used by the lost COMMIT request.
   final int streamToken;
+
+  /// Exact request sequence used by the lost COMMIT request.
   final int requestSequence;
+
+  /// Transaction targeted by the lost COMMIT request.
   final int transactionId;
+
+  /// Geometry revision targeted by the lost COMMIT request.
   final int targetGeometryRevision;
+
+  /// Lineage revision targeted by the lost COMMIT request.
   final int targetLineageRevision;
 
+  /// Encodes this bounded identity for the platform channel.
   Map<String, Object?> toMap() => <String, Object?>{
         'controlRequestId': controlRequestId,
         'sessionId': sessionId,
@@ -66,6 +97,7 @@ final class ARVisibilityGridV2CommitReceiptQuery {
 /// It contains only the bounded scalar/revision and identity fields needed by
 /// a later reattachment owner; it never contains structural surface bytes.
 final class ARVisibilityGridV2CommittedBaseline {
+  /// Creates a complete scalar/revision baseline for later reattachment.
   const ARVisibilityGridV2CommittedBaseline({
     required this.transactionId,
     required this.geometryRevision,
@@ -88,26 +120,64 @@ final class ARVisibilityGridV2CommittedBaseline {
     required this.worldFromGroupIdentity,
   });
 
+  /// Committed transaction identity.
   final int transactionId;
+
+  /// Committed geometry revision.
   final int geometryRevision;
+
+  /// Committed lineage revision.
   final int lineageRevision;
+
+  /// Committed style revision.
   final int styleRevision;
+
+  /// Committed evidence revision.
   final int evidenceRevision;
+
+  /// Committed capture revision.
   final int captureRevision;
+
+  /// Committed coverage revision.
   final int coverageRevision;
+
+  /// Produced-style revision included in the baseline.
   final int producedStyleRevision;
+
+  /// Region-manifest revision included in the baseline.
   final int regionManifestRevision;
+
+  /// Schema-root revision included in the baseline.
   final int schemaRootRevision;
+
+  /// Highest committed surface identifier.
   final int nextSurfaceIdHighWater;
+
+  /// Bounded schema-root identity string.
   final String schemaRootHashIdentity;
+
+  /// Bounded manifest-root identity string.
   final String manifestRootHashIdentity;
+
+  /// Group-frame convention identifier.
   final int groupFrameConvention;
+
+  /// Matrix convention identifier.
   final int matrixConvention;
+
+  /// Direction convention identifier.
   final int directionConvention;
+
+  /// Normal encoding identifier.
   final int normalEncoding;
+
+  /// Group-from-world transform identity.
   final String groupFromWorldIdentity;
+
+  /// World-from-group transform identity.
   final String worldFromGroupIdentity;
 
+  /// Decodes and validates a bounded native baseline map.
   static ARVisibilityGridV2CommittedBaseline fromMap(Object? raw) {
     if (raw is! Map) throw StateError('V2 receipt omitted its baseline.');
     final map = Map<Object?, Object?>.from(raw);
@@ -150,6 +220,7 @@ final class ARVisibilityGridV2CommittedBaseline {
 /// [rootIsolateSurfaceBytes] must be zero. [fromMap] rejects mismatched
 /// COMMIT baselines and non-zero abandon baselines with [StateError].
 final class ARVisibilityGridV2CommitReceipt {
+  /// Creates validated scalar evidence for one exact COMMIT query.
   const ARVisibilityGridV2CommitReceipt({
     required this.decision,
     required this.controlRequestId,
@@ -168,25 +239,55 @@ final class ARVisibilityGridV2CommitReceipt {
     required this.rootIsolateSurfaceBytes,
   });
 
+  /// Whether native won the COMMIT publication fence.
   final ARVisibilityGridV2CommitDecision decision;
+
+  /// UUID of the old START control request.
   final String controlRequestId;
+
+  /// UUID of the capture session.
   final String sessionId;
+
+  /// UUID of the capture group.
   final String captureGroupId;
+
+  /// Session generation of the queried binding.
   final int sessionGeneration;
+
+  /// Group generation of the queried binding.
   final int groupGeneration;
+
+  /// Native stream identity token of the queried binding.
   final Uint8List nativeStreamToken;
+
+  /// Worker binding identity token of the queried binding.
   final Uint8List workerBindingToken;
+
+  /// Stream token of the queried COMMIT.
   final int streamToken;
+
+  /// Request sequence of the queried COMMIT.
   final int requestSequence;
+
+  /// Transaction identity of the queried COMMIT.
   final int transactionId;
+
+  /// Target geometry revision of the queried COMMIT.
   final int targetGeometryRevision;
+
+  /// Target lineage revision of the queried COMMIT.
   final int targetLineageRevision;
+
+  /// Scalar committed baseline, or the canonical zero abandon baseline.
   final ARVisibilityGridV2CommittedBaseline baseline;
+
+  /// Root-isolate structural payload bytes; always zero.
   final int rootIsolateSurfaceBytes;
 
+  /// Whether [decision] is [ARVisibilityGridV2CommitDecision.commit].
   bool get committed => decision == ARVisibilityGridV2CommitDecision.commit;
 
-  /// Whether this receipt is the exact identity that was queried.
+  /// Whether this receipt exactly matches [query].
   bool matchesQuery(ARVisibilityGridV2CommitReceiptQuery query) =>
       controlRequestId == query.controlRequestId &&
       sessionId == query.sessionId &&
@@ -201,6 +302,7 @@ final class ARVisibilityGridV2CommitReceipt {
       targetGeometryRevision == query.targetGeometryRevision &&
       targetLineageRevision == query.targetLineageRevision;
 
+  /// Decodes and validates bounded native receipt evidence.
   static ARVisibilityGridV2CommitReceipt fromMap(Object? raw) {
     if (raw is! Map) throw StateError('V2 receipt was not a map.');
     final map = Map<Object?, Object?>.from(raw);
