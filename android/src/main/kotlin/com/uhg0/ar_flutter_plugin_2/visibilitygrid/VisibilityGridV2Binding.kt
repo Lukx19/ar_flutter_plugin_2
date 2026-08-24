@@ -17,9 +17,11 @@ import java.nio.ByteBuffer
 import java.util.ArrayDeque
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -31,7 +33,7 @@ import java.util.concurrent.atomic.AtomicLong
  * worker must validate BEGIN/COMMIT and publish an exact ACK before the
  * binding is considered established.
  */
-class VisibilityGridV2Binding(
+class VisibilityGridV2Binding internal constructor(
     private val messenger: BinaryMessenger,
     private val viewId: Int,
     private val committedBaselineAuthority: M0aCommittedBaselineAuthority,
@@ -47,6 +49,9 @@ class VisibilityGridV2Binding(
     private val activeSessionGenerationSeed: Long = 0L,
     private val activeGroupGenerationSeed: Long = 0L,
     private val activeCoverageEpochSeed: Long = 0L,
+    private val isDebuggable: Boolean = false,
+    private val debugRecoverySeam: VisibilityGridV2DebugRecoverySeam =
+        VisibilityGridV2DebugRecoverySeam(),
 ) {
     private val main = Handler(Looper.getMainLooper())
     private val disposed = AtomicBoolean(false)
@@ -89,6 +94,8 @@ class VisibilityGridV2Binding(
         controlLifecycle = lifecycle,
         onExecutorOperation = ::recordExecutorOperation,
         bindingQualifier = bindingQualifier(),
+        beforeWorkerProcessing = debugRecoverySeam::beforeExchange,
+        onAbandonedContinuation = debugRecoverySeam::oldContinuationFenced,
     )
 
     init {
@@ -145,6 +152,22 @@ class VisibilityGridV2Binding(
     )
 
     private fun onControlCall(call: MethodCall, result: MethodChannel.Result) {
+        if (call.method == "configureDebugV2ExchangeStall") {
+            if (!isDebuggable) {
+                result.error("VG_PROTOCOL_INVALID", "V2 recovery seam is debug-only", null)
+            } else {
+                result.success(debugRecoverySeam.arm())
+            }
+            return
+        }
+        if (call.method == "getDebugV2RecoveryTrace") {
+            if (!isDebuggable) {
+                result.error("VG_PROTOCOL_INVALID", "V2 recovery seam is debug-only", null)
+            } else {
+                result.success(debugRecoverySeam.snapshot())
+            }
+            return
+        }
         if (call.method == "bindingSnapshot") {
             try {
                 executor.execute {
@@ -221,6 +244,7 @@ class VisibilityGridV2Binding(
                         decoded.outcome == 0
                     ) {
                         recoveryGroupCut = RecoveryGroupCut.from(request)
+                        debugRecoverySeam.acceptedCut(request)
                     }
                     beforeControlPublication?.invoke()
                     synchronized(publicationFence) {
@@ -365,6 +389,7 @@ class VisibilityGridV2Binding(
             groupGeneration = activeGroupGeneration,
             coverageEpoch = activeCoverageEpoch,
         )
+        debugRecoverySeam.replacementSeeded(retainedGroupCut)
         replacementBinding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = viewId,
@@ -378,6 +403,8 @@ class VisibilityGridV2Binding(
             activeSessionGenerationSeed = retainedGroupCut.sessionGeneration,
             activeGroupGenerationSeed = retainedGroupCut.groupGeneration,
             activeCoverageEpochSeed = retainedGroupCut.coverageEpoch,
+            isDebuggable = isDebuggable,
+            debugRecoverySeam = debugRecoverySeam,
         )
         return teardownReceipt
     }
@@ -385,7 +412,12 @@ class VisibilityGridV2Binding(
     private fun closeBindingResources(abandonStream: Boolean = false) {
         controlChannel.setMethodCallHandler(null)
         recordClosedResource()
-        if (abandonStream) streamChannel.abandon() else streamChannel.dispose()
+        if (abandonStream) {
+            streamChannel.abandon()
+            debugRecoverySeam.releaseAbandonedExchange()
+        } else {
+            streamChannel.dispose()
+        }
         recordClosedResource()
         lifecycle.abandon()
         executor.shutdownNow()
@@ -441,7 +473,7 @@ class VisibilityGridV2Binding(
 
     private class BindingAbandonedException : IllegalStateException("V2 binding is abandoned")
 
-    private data class RecoveryGroupCut(
+    internal data class RecoveryGroupCut(
         val sessionId: M0aUuid?,
         val captureGroupId: M0aUuid?,
         val sessionGeneration: Long,
@@ -485,5 +517,87 @@ class VisibilityGridV2Binding(
                 .putLong(uuid.leastSignificantBits)
                 .array()
         }
+    }
+}
+
+internal class VisibilityGridV2DebugRecoverySeam {
+    private val lock = Any()
+    private val trace = mutableListOf<String>()
+    private var exchangeGate: CountDownLatch? = null
+    private var oldContinuation: CountDownLatch? = null
+    private var stallClaimed = false
+
+    fun arm(): Map<String, Any> = synchronized(lock) {
+        check(exchangeGate == null) { "V2 recovery seam is already armed" }
+        trace.clear()
+        trace += "armed:first-exchange"
+        exchangeGate = CountDownLatch(1)
+        oldContinuation = CountDownLatch(1)
+        stallClaimed = false
+        mapOf("armed" to true)
+    }
+
+    fun beforeExchange() {
+        val gate = synchronized(lock) {
+            val candidate = exchangeGate
+            if (candidate == null || stallClaimed) return
+            stallClaimed = true
+            trace += "stalled:first-exchange"
+            candidate
+        }
+        var interrupted = false
+        while (true) {
+            try {
+                gate.await()
+                break
+            } catch (_: InterruptedException) {
+                interrupted = true
+            }
+        }
+        if (interrupted) Thread.currentThread().interrupt()
+    }
+
+    fun acceptedCut(request: M0aControlRequest) = synchronized(lock) {
+        if (exchangeGate != null) trace += "accepted-cut:${request.cutIdentity()}"
+    }
+
+    fun replacementSeeded(cut: VisibilityGridV2Binding.RecoveryGroupCut) = synchronized(lock) {
+        if (exchangeGate != null) trace += "replacement-seeded:${cut.cutIdentity()}"
+    }
+
+    fun releaseAbandonedExchange() {
+        val (gate, continuation) = synchronized(lock) {
+            val activeGate = exchangeGate ?: return
+            trace += "abandon-won"
+            activeGate to checkNotNull(oldContinuation)
+        }
+        gate.countDown()
+        check(continuation.await(2, TimeUnit.SECONDS)) {
+            "Abandoned V2 exchange did not reach its publication fence"
+        }
+    }
+
+    fun oldContinuationFenced() {
+        synchronized(lock) {
+            if (exchangeGate == null) return
+            trace += "late-old-completion-fenced"
+            oldContinuation?.countDown()
+        }
+    }
+
+    fun snapshot(): Map<String, Any> = synchronized(lock) {
+        mapOf("trace" to trace.toList())
+    }
+
+    private fun M0aControlRequest.cutIdentity(): String =
+        "${sessionId.hex()}:${captureGroupId.hex()}:" +
+            "$sessionGeneration:$groupGeneration:$coverageEpoch"
+
+    private fun VisibilityGridV2Binding.RecoveryGroupCut.cutIdentity(): String =
+        "${sessionId?.hex()}:${captureGroupId?.hex()}:" +
+            "$sessionGeneration:$groupGeneration:$coverageEpoch"
+
+    private fun M0aUuid.hex(): String = bytes.joinToString("") { byte ->
+        "%02x".format(byte.toInt() and 0xff)
     }
 }

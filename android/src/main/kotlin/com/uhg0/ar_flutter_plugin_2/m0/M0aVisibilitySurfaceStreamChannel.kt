@@ -64,6 +64,8 @@ class M0aVisibilitySurfaceStreamChannel(
     private val onExecutorOperation: ((String) -> Unit)? = null,
     private val bindingQualifier: ByteArray? = null,
     private val beforeAuthorityPublication: (() -> Unit)? = null,
+    private val afterAuthorityPublicationFenceAcquired: (() -> Unit)? = null,
+    private val onAbandonedContinuation: (() -> Unit)? = null,
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val channel = BasicMessageChannel<ByteBuffer>(
@@ -232,6 +234,7 @@ class M0aVisibilitySurfaceStreamChannel(
                 workerExecutor.execute {
                     telemetry.dequeued()
                     try {
+                        var publicationClaimedReply = false
                         val response = synchronized(this) {
                             onExecutorOperation?.invoke("exchange")
                             beforeWorkerProcessing?.invoke()
@@ -242,6 +245,7 @@ class M0aVisibilitySurfaceStreamChannel(
                                     null
                                 }
                             } else if (bindingAbandoned.get()) {
+                                onAbandonedContinuation?.invoke()
                                 null
                             } else {
                                 var decodedRequest: M0aPacketCodec.Request? = null
@@ -282,11 +286,16 @@ class M0aVisibilitySurfaceStreamChannel(
                                                 if (disposed.get() || bindingAbandoned.get()) {
                                                     throw BindingError(STREAM_BINDING_ABANDONED_ERROR_ID)
                                                 }
+                                                val publishesCommit =
+                                                    structuralFrames.peekFirst() is M0aTransactionCommitFrameV1
+                                                if (publishesCommit) {
+                                                    afterAuthorityPublicationFenceAcquired?.invoke()
+                                                }
                                                 controlLifecycle?.let {
                                                     committedBaseline = it.committedBaseline()
                                                 }
                                                 val requiresResync = requiresResync(request)
-                                                M0aPacketCodec.encodeResponse(
+                                                val publicationBytes = M0aPacketCodec.encodeResponse(
                                                     when {
                                                     resyncPending -> {
                                                         if (transactionReceiver.state ==
@@ -330,6 +339,13 @@ class M0aVisibilitySurfaceStreamChannel(
                                                     },
                                                     request.maximumResponseBytes,
                                                 )
+                                                if (publishesCommit && !pendingReply.tryClaim()) {
+                                                    throw BindingError(STREAM_BINDING_ABANDONED_ERROR_ID)
+                                                }
+                                                if (publishesCommit) {
+                                                    publicationClaimedReply = true
+                                                }
+                                                publicationBytes
                                             }
                                             lastSequence = request.requestSequence
                                             nextExpectedSequence = request.requestSequence + 1
@@ -379,7 +395,7 @@ class M0aVisibilitySurfaceStreamChannel(
                                     )
                                 }
                                 telemetry.allocated(encoded.size)
-                                if (pendingReply.tryClaim()) encoded else null
+                                if (publicationClaimedReply || pendingReply.tryClaim()) encoded else null
                             }
                         }
                         timeoutHandle.cancel()
@@ -460,11 +476,10 @@ class M0aVisibilitySurfaceStreamChannel(
      * stream as normally disposed; the owner may install a fresh binding. */
     fun abandon() {
         if (disposed.get()) return
-        if (!claimAbandonFence()) return
-        activePendingReply?.let { pendingReply ->
-            if (pendingReply.tryClaim()) {
-                pendingReply.reply(workerAbandonedResponse(pendingReply.requestBytes))
-            }
+        val claim = claimAbandonFence(activePendingReply)
+        if (!claim.won) return
+        claim.pendingReply?.let { pendingReply ->
+            pendingReply.reply(workerAbandonedResponse(pendingReply.requestBytes))
         }
         transactionReceiver.abandon()
         controlLifecycle?.abandon()
@@ -476,16 +491,13 @@ class M0aVisibilitySurfaceStreamChannel(
     }
 
     private fun abandonForTimeout(pendingReply: PendingReply, bytes: ByteArray) {
-        if (!pendingReply.tryClaim()) return
-        telemetry.timedOut()
         if (disposed.get()) {
-            pendingReply.reply(workerLostResponse(bytes))
+            if (pendingReply.tryClaim()) pendingReply.reply(workerLostResponse(bytes))
             return
         }
-        if (!claimAbandonFence()) {
-            pendingReply.reply(workerLostResponse(bytes))
-            return
-        }
+        val claim = claimAbandonFence(pendingReply)
+        if (!claim.won) return
+        telemetry.timedOut()
         transactionReceiver.abandon()
         controlLifecycle?.abandon()
         clearMessageHandler()
@@ -497,10 +509,11 @@ class M0aVisibilitySurfaceStreamChannel(
     }
 
     private fun abandonForWorkerLoss(pendingReply: PendingReply, bytes: ByteArray) {
-        val ownsReply = pendingReply.tryClaim()
-        if (!claimAbandonFence()) {
-            if (ownsReply) pendingReply.reply(workerLostResponse(bytes))
-            return
+        val ownsReply = synchronized(publicationFence) {
+            if (bindingAbandoned.get()) return
+            val claimed = pendingReply.tryClaim()
+            bindingAbandoned.set(true)
+            claimed
         }
         telemetry.workerLost()
         transactionReceiver.abandon()
@@ -540,8 +553,20 @@ class M0aVisibilitySurfaceStreamChannel(
         }
     }
 
-    private fun claimAbandonFence(): Boolean = synchronized(publicationFence) {
-        bindingAbandoned.compareAndSet(false, true)
+    private data class AbandonClaim(
+        val won: Boolean,
+        val pendingReply: PendingReply?,
+    )
+
+    private fun claimAbandonFence(pendingReply: PendingReply?): AbandonClaim =
+        synchronized(publicationFence) {
+            if (bindingAbandoned.get() ||
+                (pendingReply != null && !pendingReply.tryClaim())
+            ) {
+                return@synchronized AbandonClaim(false, null)
+            }
+            bindingAbandoned.set(true)
+            AbandonClaim(true, pendingReply)
     }
 
     private fun isValidResyncRequest(request: M0aPacketCodec.Request): Boolean {

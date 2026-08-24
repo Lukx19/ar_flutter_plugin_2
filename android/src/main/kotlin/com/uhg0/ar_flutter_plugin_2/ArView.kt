@@ -114,6 +114,7 @@ internal class ArView(
         messenger = messenger,
         viewId = id,
         committedBaselineAuthority = m0aCommittedBaselineAuthority,
+        isDebuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0,
     )
 
     init {

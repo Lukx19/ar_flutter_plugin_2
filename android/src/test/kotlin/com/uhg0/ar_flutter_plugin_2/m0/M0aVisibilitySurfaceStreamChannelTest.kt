@@ -786,6 +786,85 @@ class M0aVisibilitySurfaceStreamChannelTest {
         assertEquals(142, terminal.errorId)
         assertEquals(M0aCommittedBaselineV1.ZERO, authority.snapshot(scope))
         assertEquals(M0aCommittedBaselineV1.ZERO, lifecycle.committedBaseline())
+
+        val recoveredLifecycle = M0aControlLifecycle(committedBaselineAuthority = authority)
+        val recoveredStart = controlRequest(M0aControlOperation.START, 0, 92)
+        val recoveredResponse = M0aControlCodec.decodeResponse(
+            recoveredLifecycle.handle(
+                recoveredStart,
+                M0aControlCodec.encodeRequest(recoveredStart),
+            ),
+        )
+        val recoveredResult = ByteBuffer.wrap(recoveredResponse.payload).order(ByteOrder.LITTLE_ENDIAN)
+        assertEquals(0L, recoveredResult.getLong(96))
+        assertEquals(0L, recoveredResult.getLong(104))
+        assertEquals(0L, recoveredResponse.nativeTransactionId)
+        assertEquals(M0aCommittedBaselineV1.ZERO, recoveredLifecycle.committedBaseline())
+    }
+
+    @Test
+    fun `COMMIT publication claims its reply before a racing abandon`() {
+        val authority = M0aCommittedBaselineAuthority()
+        val lifecycle = M0aControlLifecycle(committedBaselineAuthority = authority)
+        val start = controlRequest(M0aControlOperation.START, 0, 93)
+        lifecycle.handle(start, M0aControlCodec.encodeRequest(start))
+        val scope = M0aCommittedBaselineScopeV1.from(start)
+        val messenger = TestMessenger(93)
+        val enteredFence = CountDownLatch(1)
+        val releaseFence = CountDownLatch(1)
+        val abandonStarted = CountDownLatch(1)
+        val executor = Executors.newSingleThreadExecutor()
+        val binding = M0aVisibilitySurfaceStreamChannel(
+            messenger = messenger,
+            viewId = 93,
+            workerExecutor = executor,
+            shutdownWorkerOnDispose = false,
+            controlLifecycle = lifecycle,
+            afterAuthorityPublicationFenceAcquired = {
+                enteredFence.countDown()
+                check(releaseFence.await(2, TimeUnit.SECONDS))
+            },
+        )
+        binding.queueStructuralTransaction(
+            M0aStructuralTransactionProducerV1.produce(
+                transactionId = 1,
+                baseGeometryRevision = 0,
+                targetGeometryRevision = 1,
+                targetLineageRevision = 1,
+                bytes = byteArrayOf(),
+            ),
+        )
+        assertEquals(2, M0aPacketCodec.decodeResponse(messenger.exchange(request(1, 1))).messageKind)
+        val commitBytes = arrayOfNulls<ByteArray>(1)
+        val commitCompleted = CountDownLatch(1)
+        messenger.send(
+            "visibility_surface_stream_93",
+            ByteBuffer.wrap(request(2, 1)),
+        ) { response ->
+            commitBytes[0] = response?.let { buffer ->
+                ByteArray(buffer.remaining()).also { buffer.slice().get(it) }
+            }
+            commitCompleted.countDown()
+        }
+        assertTrue(enteredFence.await(2, TimeUnit.SECONDS))
+        val abandonThread = Thread {
+            abandonStarted.countDown()
+            binding.abandon()
+        }
+        abandonThread.start()
+        assertTrue(abandonStarted.await(2, TimeUnit.SECONDS))
+        releaseFence.countDown()
+        assertTrue(commitCompleted.await(2, TimeUnit.SECONDS))
+        abandonThread.join(2_000)
+        assertTrue(!abandonThread.isAlive)
+
+        val commit = M0aPacketCodec.decodeResponse(commitBytes[0]!!)
+        assertEquals(4, commit.messageKind)
+        assertEquals(0, commit.errorId)
+        assertEquals(1L, authority.snapshot(scope).transactionId)
+        assertEquals(1L, lifecycle.committedBaseline().transactionId)
+        executor.shutdown()
+        assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS))
     }
 
     private fun request(

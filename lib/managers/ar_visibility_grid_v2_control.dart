@@ -30,6 +30,10 @@ final class ARVisibilityGridV2Control {
   /// Connects to a V2 endpoint and captures its binding identity before the
   /// control is handed to callers. A later native replacement cannot change
   /// the qualifier owned by this object.
+  ///
+  /// Propagates [PlatformException] when native rejects or cannot complete the
+  /// connection-time snapshot. Throws [StateError] when native returns a map
+  /// whose binding tokens are missing or are not exactly 16 bytes.
   static Future<ARVisibilityGridV2Control> connect(
     int viewId, {
     MethodChannel? channel,
@@ -47,6 +51,8 @@ final class ARVisibilityGridV2Control {
 
   /// Completes after the connection-time native identity snapshot has been
   /// captured (or an optional compatibility endpoint has declined it).
+  /// Propagates [PlatformException] from the snapshot call and throws
+  /// [StateError] for malformed native binding tokens.
   Future<void> get bindingReady => _bindingReady;
 
   /// Sends a byte-only `start` request and returns the byte-only response.
@@ -114,7 +120,13 @@ final class ARVisibilityGridV2Control {
   /// guess a replacement identity.
   ///
   /// Throws [PlatformException] or [MissingPluginException] when the platform
-  /// channel cannot apply the fence.
+  /// channel cannot apply the fence. Throws [StateError] when an already closed
+  /// control has no cached receipt, when binding-token capture failed, or when
+  /// native returns a non-map receipt or omits numeric `closedResources`.
+  ///
+  /// Returns the native teardown map. It contains the old binding's scalar
+  /// identity and lifecycle fields plus numeric `closedResources`; it never
+  /// contains structural surface payloads.
   Future<Map<Object?, Object?>> dispose() async {
     if (_closed) {
       return _disposeReceipt ??
