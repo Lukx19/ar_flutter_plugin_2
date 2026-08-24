@@ -149,6 +149,25 @@ class M0aControlLifecycleTest {
     }
 
     @Test
+    fun `revision one restores canonical empty wire roots without changing authority`() {
+        val baseline = M0aCommittedBaselineV1(1, 1, 1, 0)
+        val payload = startPayload {
+            put(7, 1)
+            putLong(64, 1L)
+            putLong(72, 1L)
+        }
+        val lifecycle = M0aControlLifecycle(initialCommittedBaseline = baseline)
+        val start = request(M0aControlOperation.START, 0, 11).copy(payload = payload)
+
+        val response = M0aControlCodec.decodeResponse(
+            lifecycle.handle(start, M0aControlCodec.encodeRequest(start)),
+        )
+
+        assertEquals(0, response.outcome)
+        assertEquals(baseline, lifecycle.committedBaseline())
+    }
+
+    @Test
     fun `start retains one complete cut with non-default configuration`() {
         val lifecycle = M0aControlLifecycle(
             initialCommittedBaseline = M0aCommittedBaselineV1(

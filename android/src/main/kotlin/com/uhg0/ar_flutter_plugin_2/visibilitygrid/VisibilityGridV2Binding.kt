@@ -105,7 +105,9 @@ class VisibilityGridV2Binding internal constructor(
             activeReceiptQuery(request, baseline)?.let { query ->
                 committedBaselineAuthority.publishCommit(query, baseline)
             }
+            debugRecoverySeam.commitPublished()
         },
+        afterCommitPublication = debugRecoverySeam::afterCommitPublication,
         onAbandonedRequest = { request, targetBaseline ->
             activeReceiptQuery(request, targetBaseline)?.let { query ->
                 committedBaselineAuthority.publishAbandon(query)
@@ -176,6 +178,14 @@ class VisibilityGridV2Binding internal constructor(
             }
             return
         }
+        if (call.method == "configureDebugV2CommitPublicationStall") {
+            if (!isDebuggable) {
+                result.error("VG_PROTOCOL_INVALID", "V2 recovery seam is debug-only", null)
+            } else {
+                result.success(debugRecoverySeam.armCommitPublication())
+            }
+            return
+        }
         if (call.method == "getDebugV2RecoveryTrace") {
             if (!isDebuggable) {
                 result.error("VG_PROTOCOL_INVALID", "V2 recovery seam is debug-only", null)
@@ -206,8 +216,19 @@ class VisibilityGridV2Binding internal constructor(
             try {
                 executor.execute {
                     recordExecutorOperation("control:dispose_binding")
-                    val teardownReceipt = replaceBinding()
-                    main.post { result.success(teardownReceipt.toMap()) }
+                    val outcome = runCatching { replaceBinding() }
+                    main.post {
+                        outcome.fold(
+                            onSuccess = { result.success(it.toMap()) },
+                            onFailure = {
+                                result.error(
+                                    "VG_STREAM_BINDING_ABANDONED",
+                                    it.message,
+                                    null,
+                                )
+                            },
+                        )
+                    }
                 }
             } catch (_: RejectedExecutionException) {
                 result.error("VG_NOT_INITIALIZED", "V2 binding executor is closed", null)
@@ -281,7 +302,14 @@ class VisibilityGridV2Binding internal constructor(
                             activeSessionGeneration = request.sessionGeneration
                             activeGroupGeneration = request.groupGeneration
                             activeCoverageEpoch = request.coverageEpoch
-                            queueInitialTransaction()
+                            if (lifecycle.committedBaseline() == M0aCommittedBaselineV1.ZERO) {
+                                queueInitialTransaction()
+                            } else {
+                                // A restored authoritative cut already contains
+                                // the committed transaction. Mark startup as
+                                // established without replaying transaction 1.
+                                initialTransactionQueued = true
+                            }
                         }
                         acceptedControls++
                         qualify(response)
@@ -405,7 +433,12 @@ class VisibilityGridV2Binding internal constructor(
      * this runs on the shared executor, no old exchange can race the new START.
      */
     private fun replaceBinding(): Snapshot {
-        check(!disposed.get()) { "V2 binding is disposed" }
+        // A qualified serial dispose can already be queued when the bounded
+        // recovery path independently abandons this generation. Once that
+        // abandon wins, its replacement owns the channel and this late task
+        // is cleanup-only: return the old terminal snapshot without touching
+        // the replacement or throwing on the executor thread.
+        if (disposed.get()) return snapshot()
         streamChannel.dispose()
         recordClosedResource()
         lifecycle.abandon()
@@ -670,10 +703,12 @@ internal class VisibilityGridV2DebugRecoverySeam {
     private var exchangeGate: CountDownLatch? = null
     private var oldContinuation: CountDownLatch? = null
     private var stallClaimed = false
+    private var commitPublicationStall = false
 
     fun arm(): Map<String, Any> = synchronized(lock) {
         check(exchangeGate == null) { "V2 recovery seam is already armed" }
         trace.clear()
+        commitPublicationStall = false
         trace += "armed:first-exchange"
         exchangeGate = CountDownLatch(1)
         oldContinuation = CountDownLatch(1)
@@ -681,7 +716,19 @@ internal class VisibilityGridV2DebugRecoverySeam {
         mapOf("armed" to true)
     }
 
+    fun armCommitPublication(): Map<String, Any> = synchronized(lock) {
+        check(exchangeGate == null) { "V2 recovery seam is already armed" }
+        trace.clear()
+        commitPublicationStall = true
+        trace += "armed:commit-publication"
+        exchangeGate = CountDownLatch(1)
+        oldContinuation = CountDownLatch(1)
+        stallClaimed = false
+        mapOf("armed" to true)
+    }
+
     fun beforeExchange() {
+        if (synchronized(lock) { commitPublicationStall }) return
         val gate = synchronized(lock) {
             val candidate = exchangeGate
             if (candidate == null || stallClaimed) return
@@ -699,6 +746,30 @@ internal class VisibilityGridV2DebugRecoverySeam {
             }
         }
         if (interrupted) Thread.currentThread().interrupt()
+    }
+
+    fun afterCommitPublication() {
+        val gate = synchronized(lock) {
+            if (!commitPublicationStall || exchangeGate == null || stallClaimed) return
+            stallClaimed = true
+            trace += "stalled:commit-publication"
+            checkNotNull(exchangeGate)
+        }
+        var interrupted = false
+        while (true) {
+            try {
+                gate.await()
+                break
+            } catch (_: InterruptedException) {
+                interrupted = true
+            }
+        }
+        if (interrupted) Thread.currentThread().interrupt()
+        oldContinuationFenced()
+    }
+
+    fun commitPublished() = synchronized(lock) {
+        if (commitPublicationStall) trace += "commit-published"
     }
 
     fun acceptedCut(request: M0aControlRequest) = synchronized(lock) {

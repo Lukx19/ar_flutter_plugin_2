@@ -14,6 +14,11 @@ internal fun m0aMatrixIdentity(data: ByteBuffer, offset: Int): String =
 internal fun m0aHashIdentity(bytes: ByteArray): String =
     bytes.joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
 
+private val M0A_EMPTY_HASH_WIRE_IDENTITY = "00".repeat(32)
+
+private fun String.asRestoredHashWireIdentity(): String =
+    if (isEmpty()) M0A_EMPTY_HASH_WIRE_IDENTITY else this
+
 /** Strict decoder for the canonical Chapter 13 StartRequestV2 payload. */
 object M0aStartRequestCodecV2 {
     const val byteLength = 464
@@ -52,8 +57,10 @@ object M0aStartRequestCodecV2 {
                 (restoredRevisions.indices.any { index ->
                     restoredRevisions[index] != baseline.resultRevisionCut()[index]
                 } ||
-                    schemaRootHashIdentity != baseline.schemaRootHashIdentity ||
-                    manifestRootHashIdentity != baseline.manifestRootHashIdentity ||
+                    schemaRootHashIdentity !=
+                    baseline.schemaRootHashIdentity.asRestoredHashWireIdentity() ||
+                    manifestRootHashIdentity !=
+                    baseline.manifestRootHashIdentity.asRestoredHashWireIdentity() ||
                     groupFrameConvention != baseline.groupFrameConvention ||
                     matrixConvention != baseline.matrixConvention ||
                     directionConvention != baseline.directionConvention ||
@@ -104,7 +111,15 @@ object M0aStartRequestCodecV2 {
         val manifestHash = bytes.copyOfRange(424, 456)
         val restoreRequested = flags and 1 != 0
         if (restoreRequested) {
-            require(schemaHash.any { it.toInt() != 0 } && manifestHash.any { it.toInt() != 0 })
+            // M1's first committed transaction has no content-root hashes.
+            // A restored request may therefore carry the exact canonical
+            // empty identities, or two complete non-empty roots; mixed or
+            // partial roots remain invalid.
+            val emptyRoots = schemaHash.all { it.toInt() == 0 } &&
+                manifestHash.all { it.toInt() == 0 }
+            val completeRoots = schemaHash.any { it.toInt() != 0 } &&
+                manifestHash.any { it.toInt() != 0 }
+            require(emptyRoots || completeRoots)
         } else {
             require(revisions.all { it == 0L })
             require(schemaHash.all { it.toInt() == 0 } && manifestHash.all { it.toInt() == 0 })

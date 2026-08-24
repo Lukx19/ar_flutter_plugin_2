@@ -65,6 +65,7 @@ class M0aVisibilitySurfaceStreamChannel(
     private val bindingQualifier: ByteArray? = null,
     private val beforeAuthorityPublication: (() -> Unit)? = null,
     private val afterAuthorityPublicationFenceAcquired: (() -> Unit)? = null,
+    private val afterCommitPublication: (() -> Unit)? = null,
     private val onCommitPublished: ((M0aPacketCodec.Request, M0aCommittedBaselineV1) -> Unit)? = null,
     private val onAbandonedRequest: ((M0aPacketCodec.Request, M0aCommittedBaselineV1) -> Unit)? = null,
     private val onAbandonedContinuation: (() -> Unit)? = null,
@@ -239,6 +240,7 @@ class M0aVisibilitySurfaceStreamChannel(
                     telemetry.dequeued()
                     try {
                         var publicationClaimedReply = false
+                        var commitPublicationStalled = false
                         val response = synchronized(this) {
                             onExecutorOperation?.invoke("exchange")
                             beforeWorkerProcessing?.invoke()
@@ -353,6 +355,7 @@ class M0aVisibilitySurfaceStreamChannel(
                                                     }
                                                     publicationClaimedReply = true
                                                     onCommitPublished?.invoke(request, committedBaseline)
+                                                    commitPublicationStalled = true
                                                 }
                                                 publicationBytes
                                             }
@@ -407,6 +410,7 @@ class M0aVisibilitySurfaceStreamChannel(
                                 if (publicationClaimedReply || pendingReply.tryClaim()) encoded else null
                             }
                         }
+                        if (commitPublicationStalled) afterCommitPublication?.invoke()
                         timeoutHandle.cancel()
                         if (response != null) {
                             telemetry.allocated(response.size)
