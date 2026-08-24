@@ -708,6 +708,8 @@ internal class VisibilityGridV2DebugRecoverySeam {
     private var oldContinuation: CountDownLatch? = null
     private var stallClaimed = false
     private var commitPublicationStall = false
+    private var recoveryTraceActive = false
+    private var replacementSeeded = false
 
     fun arm(): Map<String, Any> = synchronized(lock) {
         check(exchangeGate == null) { "V2 recovery seam is already armed" }
@@ -717,6 +719,8 @@ internal class VisibilityGridV2DebugRecoverySeam {
         exchangeGate = CountDownLatch(1)
         oldContinuation = CountDownLatch(1)
         stallClaimed = false
+        recoveryTraceActive = true
+        replacementSeeded = false
         mapOf("armed" to true)
     }
 
@@ -728,6 +732,8 @@ internal class VisibilityGridV2DebugRecoverySeam {
         exchangeGate = CountDownLatch(1)
         oldContinuation = CountDownLatch(1)
         stallClaimed = false
+        recoveryTraceActive = true
+        replacementSeeded = false
         mapOf("armed" to true)
     }
 
@@ -777,11 +783,17 @@ internal class VisibilityGridV2DebugRecoverySeam {
     }
 
     fun acceptedCut(request: M0aControlRequest) = synchronized(lock) {
-        if (exchangeGate != null) appendTrace("accepted-cut:${request.cutIdentity()}")
+        if (recoveryTraceActive) {
+            appendTrace("accepted-cut:${request.cutIdentity()}")
+            if (replacementSeeded) recoveryTraceActive = false
+        }
     }
 
     fun replacementSeeded(cut: VisibilityGridV2Binding.RecoveryGroupCut) = synchronized(lock) {
-        if (exchangeGate != null) appendTrace("replacement-seeded:${cut.cutIdentity()}")
+        if (recoveryTraceActive) {
+            appendTrace("replacement-seeded:${cut.cutIdentity()}")
+            replacementSeeded = true
+        }
     }
 
     fun releaseAbandonedExchange() {

@@ -39,6 +39,13 @@ class VisibilityGridV2BindingTest {
         continuation.get(2, TimeUnit.SECONDS)
         stalled.shutdownNow()
 
+        val cut = VisibilityGridV2Binding.RecoveryGroupCut.from(startRequest())
+        seam.replacementSeeded(cut)
+        seam.acceptedCut(startRequest())
+        val completedTrace = seam.snapshot()["trace"] as List<*>
+        seam.acceptedCut(startRequest())
+        assertEquals(completedTrace, seam.snapshot()["trace"])
+
         assertEquals(true, seam.armCommitPublication()["armed"])
     }
 
