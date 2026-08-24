@@ -595,6 +595,97 @@ class VisibilityGridV2BindingTest {
     }
 
     @Test
+    fun `repeated abandon winners release discarded dispose leases and keep history bounded`() {
+        val messenger = MethodTestMessenger()
+        val authority = VisibilityGridV2Binding.CleanupAuthority()
+        val qualifiers = mutableListOf<ByteArray>()
+        val receipts = mutableListOf<Any?>()
+        var finalBinding: VisibilityGridV2Binding? = null
+        var finalChannel: MethodChannel? = null
+
+        try {
+            repeat(12) { generation ->
+                val executor = Executors.newSingleThreadExecutor()
+                val entered = CountDownLatch(1)
+                val release = CountDownLatch(1)
+                executor.execute {
+                    entered.countDown()
+                    release.await()
+                }
+                assertTrue(entered.await(2, TimeUnit.SECONDS))
+
+                val viewId = 980 + generation
+                val binding = VisibilityGridV2Binding(
+                    messenger = messenger,
+                    viewId = viewId,
+                    committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+                    executor = executor,
+                    postToMain = { task -> task() },
+                    cleanupAuthority = authority,
+                )
+                val channel = MethodChannel(messenger, "visibility_grid_v2_control_$viewId")
+                val original = binding.snapshot()
+                val qualifier = original.nativeStreamToken + original.workerBindingToken
+                qualifiers += qualifier
+
+                val queuedDispose = RecordingResult()
+                channel.invokeMethod("disposeBinding", qualifier, queuedDispose)
+                val abandon = RecordingResult()
+                channel.invokeMethod("abandonBinding", qualifier, abandon)
+                assertEquals(1, abandon.successCount)
+                assertEquals(1, queuedDispose.successCount)
+                assertReceiptEqual(abandon.successValue, queuedDispose.successValue)
+                receipts += abandon.successValue
+                release.countDown()
+
+                if (generation == 11) {
+                    finalBinding = binding
+                    finalChannel = channel
+                } else {
+                    binding.dispose()
+                }
+            }
+
+            assertEquals(8, authority.retainedTerminalCount())
+            val channel = checkNotNull(finalChannel)
+            val beforeResult = RecordingResult()
+            channel.invokeMethod("bindingSnapshot", null, beforeResult)
+            assertTrue(beforeResult.completed.await(2, TimeUnit.SECONDS))
+            val before = beforeResult.successValue as Map<*, *>
+
+            val ancient = RecordingResult()
+            channel.invokeMethod("abandonBinding", qualifiers.first(), ancient)
+            assertEquals(1, ancient.errorCount)
+            assertEquals("VG_STREAM_BINDING_ABANDONED", ancient.errorCode)
+
+            val currentTerminal = RecordingResult()
+            channel.invokeMethod("abandonBinding", qualifiers.last(), currentTerminal)
+            assertEquals(1, currentTerminal.successCount)
+            assertReceiptEqual(receipts.last(), currentTerminal.successValue)
+
+            val afterResult = RecordingResult()
+            channel.invokeMethod("bindingSnapshot", null, afterResult)
+            assertTrue(afterResult.completed.await(2, TimeUnit.SECONDS))
+            val after = afterResult.successValue as Map<*, *>
+            assertEquals(before["bindingGeneration"], after["bindingGeneration"])
+            assertEquals(before["lifecycleSequence"], after["lifecycleSequence"])
+            assertEquals(before["operationGeneration"], after["operationGeneration"])
+            assertEquals(before["closedResources"], after["closedResources"])
+            assertArrayEquals(
+                before["nativeStreamToken"] as ByteArray,
+                after["nativeStreamToken"] as ByteArray,
+            )
+            assertArrayEquals(
+                before["workerBindingToken"] as ByteArray,
+                after["workerBindingToken"] as ByteArray,
+            )
+            assertEquals(8, authority.retainedTerminalCount())
+        } finally {
+            finalBinding?.dispose()
+        }
+    }
+
+    @Test
     fun `real receipt query rejects inexact and out of range numbers before lookup`() {
         val authority = M0aCommittedBaselineAuthority()
         val messenger = MethodTestMessenger()

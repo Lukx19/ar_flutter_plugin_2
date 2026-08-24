@@ -227,7 +227,7 @@ class VisibilityGridV2Binding internal constructor(
                 result.error("VG_STREAM_BINDING_ABANDONED", "V2 binding token mismatch", null)
                 return
             }
-            val pending = PendingCleanupResult(admission.identity, result) {
+            val pending = PendingCleanupResult(admission.lease, result) {
                 pendingCleanupResults.remove(it)
             }
             pendingCleanupResults.add(pending)
@@ -236,7 +236,7 @@ class VisibilityGridV2Binding internal constructor(
                     val outcome = try {
                         runCatching { cleanupBinding(admission, abandonStream = false) }
                     } finally {
-                        cleanupAuthority.release(admission.identity)
+                        admission.lease.release()
                     }
                     post {
                         if (!pending.tryClaim()) return@post
@@ -248,7 +248,7 @@ class VisibilityGridV2Binding internal constructor(
                 }
             } catch (_: RejectedExecutionException) {
                 val receipt = cleanupAuthority.receiptFor(admission.identity)
-                cleanupAuthority.release(admission.identity)
+                admission.lease.release()
                 if (receipt != null && pending.tryClaim()) {
                     result.success(receipt)
                 } else if (pending.tryClaim()) {
@@ -277,7 +277,7 @@ class VisibilityGridV2Binding internal constructor(
             } catch (error: Exception) {
                 result.error("VG_STREAM_BINDING_ABANDONED", error.message, null)
             } finally {
-                cleanupAuthority.release(admission.identity)
+                admission.lease.release()
             }
             return
         }
@@ -596,7 +596,9 @@ class VisibilityGridV2Binding internal constructor(
     private fun bindingQualifier(): ByteArray = nativeStreamToken + workerBindingToken
 
     private fun admitCleanupBinding(bytes: ByteArray?): BindingAdmission? =
-        cleanupAuthority.admit(bytes)?.let { identity -> BindingAdmission(identity) }
+        cleanupAuthority.admit(bytes)?.let { identity ->
+            BindingAdmission(CleanupAdmissionLease(cleanupAuthority, identity))
+        }
 
     private fun qualifierMatches(bytes: ByteArray?): Boolean =
         bytes != null && bytes.contentEquals(bindingQualifier())
@@ -677,15 +679,19 @@ class VisibilityGridV2Binding internal constructor(
     }
 
     private class PendingCleanupResult(
-        val identity: BindingIdentity,
+        private val admissionLease: CleanupAdmissionLease,
         val result: MethodChannel.Result,
         private val onClaimed: (PendingCleanupResult) -> Unit,
     ) {
         private val claimed = AtomicBoolean(false)
+        val identity: BindingIdentity get() = admissionLease.identity
 
         fun tryClaim(): Boolean {
             val ownsResult = claimed.compareAndSet(false, true)
-            if (ownsResult) onClaimed(this)
+            if (ownsResult) {
+                admissionLease.release()
+                onClaimed(this)
+            }
             return ownsResult
         }
     }
@@ -701,7 +707,20 @@ class VisibilityGridV2Binding internal constructor(
         override fun hashCode(): Int = 31 * generation.hashCode() + qualifier.contentHashCode()
     }
 
-    private data class BindingAdmission(val identity: BindingIdentity)
+    private data class BindingAdmission(val lease: CleanupAdmissionLease) {
+        val identity: BindingIdentity get() = lease.identity
+    }
+
+    private class CleanupAdmissionLease(
+        private val authority: CleanupAuthority,
+        val identity: BindingIdentity,
+    ) {
+        private val released = AtomicBoolean(false)
+
+        fun release() {
+            if (released.compareAndSet(false, true)) authority.release(identity)
+        }
+    }
 
     internal data class CleanupOutcome(
         val receipt: Map<String, Any?>,
