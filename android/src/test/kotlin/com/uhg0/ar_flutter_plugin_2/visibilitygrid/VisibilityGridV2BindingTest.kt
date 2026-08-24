@@ -15,6 +15,7 @@ import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -486,7 +487,7 @@ class VisibilityGridV2BindingTest {
     }
 
     @Test
-    fun `Q1 abandon completes only Q1 pending cleanup while delayed Q0 keeps its receipt`() {
+    fun `Q1 abandon drains delayed Q0 with own receipt while completing Q1 cleanup`() {
         val messenger = MethodTestMessenger()
         val executor = Executors.newSingleThreadExecutor()
         val posted = CountDownLatch(1)
@@ -525,16 +526,16 @@ class VisibilityGridV2BindingTest {
             channel.invokeMethod("abandonBinding", q1Qualifier, q1Abandon)
             assertEquals(1, q1Abandon.successCount)
             assertEquals(1, q1Dispose.successCount)
-            assertEquals(0, q0Dispose.successCount)
+            assertEquals(1, q0Dispose.successCount)
             assertReceiptEqual(q1Abandon.successValue, q1Dispose.successValue)
             assertEquals(q1.bindingGeneration, (q1Abandon.successValue as Map<*, *>)["bindingGeneration"])
+            assertEquals(q0.bindingGeneration, (q0Dispose.successValue as Map<*, *>)["bindingGeneration"])
 
             release.countDown()
             synchronized(queuedPosts) {
                 while (queuedPosts.isNotEmpty()) queuedPosts.removeFirst().invoke()
             }
             assertEquals(1, q0Dispose.successCount)
-            assertEquals(q0.bindingGeneration, (q0Dispose.successValue as Map<*, *>)["bindingGeneration"])
             assertNotEquals(
                 (q0Dispose.successValue as Map<*, *>)["bindingGeneration"],
                 (q1Dispose.successValue as Map<*, *>)["bindingGeneration"],
@@ -662,6 +663,133 @@ class VisibilityGridV2BindingTest {
             channel.invokeMethod("abandonBinding", qualifiers.last(), currentTerminal)
             assertEquals(1, currentTerminal.successCount)
             assertReceiptEqual(receipts.last(), currentTerminal.successValue)
+
+            val afterResult = RecordingResult()
+            channel.invokeMethod("bindingSnapshot", null, afterResult)
+            assertTrue(afterResult.completed.await(2, TimeUnit.SECONDS))
+            val after = afterResult.successValue as Map<*, *>
+            assertEquals(before["bindingGeneration"], after["bindingGeneration"])
+            assertEquals(before["lifecycleSequence"], after["lifecycleSequence"])
+            assertEquals(before["operationGeneration"], after["operationGeneration"])
+            assertEquals(before["closedResources"], after["closedResources"])
+            assertArrayEquals(
+                before["nativeStreamToken"] as ByteArray,
+                after["nativeStreamToken"] as ByteArray,
+            )
+            assertArrayEquals(
+                before["workerBindingToken"] as ByteArray,
+                after["workerBindingToken"] as ByteArray,
+            )
+            assertEquals(8, authority.retainedTerminalCount())
+        } finally {
+            finalBinding?.dispose()
+        }
+    }
+
+    @Test
+    fun `Q1 abandon drains both Q0 disposes with Q0 receipt across bounded history`() {
+        val messenger = MethodTestMessenger()
+        val authority = VisibilityGridV2Binding.CleanupAuthority()
+        val ancientQualifiers = mutableListOf<ByteArray>()
+        var newestQ1Qualifier: ByteArray? = null
+        var newestQ1Receipt: Any? = null
+        var finalBinding: VisibilityGridV2Binding? = null
+        var finalChannel: MethodChannel? = null
+        var finalDelayPosts: AtomicBoolean? = null
+
+        try {
+            repeat(12) { iteration ->
+                val executor = Executors.newSingleThreadExecutor()
+                val initialEntered = CountDownLatch(1)
+                val releaseInitial = CountDownLatch(1)
+                val interposedEntered = CountDownLatch(1)
+                val releaseInterposed = CountDownLatch(1)
+                val delayedPosts = ArrayDeque<() -> Unit>()
+                val delayPosts = AtomicBoolean(true)
+                executor.execute {
+                    initialEntered.countDown()
+                    releaseInitial.await()
+                }
+                assertTrue(initialEntered.await(2, TimeUnit.SECONDS))
+
+                val viewId = 1100 + iteration
+                val binding = VisibilityGridV2Binding(
+                    messenger = messenger,
+                    viewId = viewId,
+                    committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+                    executor = executor,
+                    postToMain = { task ->
+                        if (delayPosts.get()) delayedPosts.addLast(task) else task()
+                    },
+                    cleanupAuthority = authority,
+                )
+                val channel = MethodChannel(messenger, "visibility_grid_v2_control_$viewId")
+                val q0 = binding.snapshot()
+                val q0Qualifier = q0.nativeStreamToken + q0.workerBindingToken
+                ancientQualifiers += q0Qualifier
+
+                val firstQ0 = RecordingResult()
+                val secondQ0 = RecordingResult()
+                channel.invokeMethod("disposeBinding", q0Qualifier, firstQ0)
+                executor.execute {
+                    interposedEntered.countDown()
+                    releaseInterposed.await()
+                }
+                channel.invokeMethod("disposeBinding", q0Qualifier, secondQ0)
+
+                releaseInitial.countDown()
+                assertTrue(interposedEntered.await(2, TimeUnit.SECONDS))
+                val q1 = binding.snapshot()
+                val q1Qualifier = q1.nativeStreamToken + q1.workerBindingToken
+                val q1Abandon = RecordingResult()
+                channel.invokeMethod("abandonBinding", q1Qualifier, q1Abandon)
+                assertEquals(1, q1Abandon.successCount)
+                assertEquals(1, firstQ0.successCount)
+                assertEquals(1, secondQ0.successCount)
+                assertReceiptEqual(firstQ0.successValue, secondQ0.successValue)
+                assertEquals(
+                    q0.bindingGeneration,
+                    (firstQ0.successValue as Map<*, *>)["bindingGeneration"],
+                )
+                assertEquals(
+                    q1.bindingGeneration,
+                    (q1Abandon.successValue as Map<*, *>)["bindingGeneration"],
+                )
+                assertNotEquals(
+                    (firstQ0.successValue as Map<*, *>)["bindingGeneration"],
+                    (q1Abandon.successValue as Map<*, *>)["bindingGeneration"],
+                )
+                releaseInterposed.countDown()
+                delayPosts.set(false)
+
+                newestQ1Qualifier = q1Qualifier
+                newestQ1Receipt = q1Abandon.successValue
+                if (iteration == 11) {
+                    finalBinding = binding
+                    finalChannel = channel
+                    finalDelayPosts = delayPosts
+                } else {
+                    binding.dispose()
+                }
+            }
+
+            assertEquals(8, authority.retainedTerminalCount())
+            val channel = checkNotNull(finalChannel)
+            checkNotNull(finalDelayPosts).set(false)
+            val beforeResult = RecordingResult()
+            channel.invokeMethod("bindingSnapshot", null, beforeResult)
+            assertTrue(beforeResult.completed.await(2, TimeUnit.SECONDS))
+            val before = beforeResult.successValue as Map<*, *>
+
+            val ancient = RecordingResult()
+            channel.invokeMethod("abandonBinding", ancientQualifiers.first(), ancient)
+            assertEquals(1, ancient.errorCount)
+            assertEquals("VG_STREAM_BINDING_ABANDONED", ancient.errorCode)
+
+            val replay = RecordingResult()
+            channel.invokeMethod("abandonBinding", checkNotNull(newestQ1Qualifier), replay)
+            assertEquals(1, replay.successCount)
+            assertReceiptEqual(newestQ1Receipt, replay.successValue)
 
             val afterResult = RecordingResult()
             channel.invokeMethod("bindingSnapshot", null, afterResult)

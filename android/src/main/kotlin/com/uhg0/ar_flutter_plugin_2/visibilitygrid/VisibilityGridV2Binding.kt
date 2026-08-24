@@ -271,7 +271,7 @@ class VisibilityGridV2Binding internal constructor(
                 // observing that reply can therefore bind immediately without
                 // passing through a transient handler-free state.
                 if (outcome.wonCleanup) {
-                    completePendingCleanup(admission.identity, outcome.receipt)
+                    drainPendingCleanup(admission.identity, outcome.receipt)
                 }
                 result.success(outcome.receipt)
             } catch (error: Exception) {
@@ -562,13 +562,26 @@ class VisibilityGridV2Binding internal constructor(
         return outcome
     }
 
-    private fun completePendingCleanup(
-        identity: BindingIdentity,
-        receipt: Map<String, Any?>,
+    private fun drainPendingCleanup(
+        winnerIdentity: BindingIdentity,
+        winnerReceipt: Map<String, Any?>,
     ) {
         pendingCleanupResults.toList().forEach { pending ->
-            if (pending.identity == identity && pending.tryClaim()) {
-                pending.result.success(receipt)
+            val receipt = if (pending.identity == winnerIdentity) {
+                winnerReceipt
+            } else {
+                cleanupAuthority.receiptFor(pending.identity)
+            }
+            if (pending.tryClaim()) {
+                if (receipt != null) {
+                    pending.result.success(receipt)
+                } else {
+                    pending.result.error(
+                        "VG_STREAM_BINDING_ABANDONED",
+                        "V2 binding token mismatch",
+                        null,
+                    )
+                }
             }
         }
     }
