@@ -274,21 +274,137 @@ class VisibilityGridV2BindingTest {
 
             releaseStaleDispose.countDown()
             assertTrue(second.completed.await(5, TimeUnit.SECONDS))
-            assertEquals(0, second.successCount)
-            assertEquals(1, second.errorCount)
-            assertEquals("VG_STREAM_BINDING_ABANDONED", second.errorCode)
+            assertEquals(1, second.successCount)
+            assertEquals(0, second.errorCount)
+            assertReceiptEqual(first.successValue, second.successValue)
 
             val afterStale = binding.snapshot()
             assertEquals(replacement.bindingGeneration, afterStale.bindingGeneration)
             assertArrayEquals(replacement.nativeStreamToken, afterStale.nativeStreamToken)
             assertArrayEquals(replacement.workerBindingToken, afterStale.workerBindingToken)
             assertEquals(replacement.closedResources, afterStale.closedResources)
-            assertEquals(1, afterStale.executorTrace.count {
+            assertEquals(0, afterStale.executorTrace.count {
                 it.endsWith(":control:dispose_binding")
             })
         } finally {
             release.countDown()
             releaseStaleDispose.countDown()
+            binding.dispose()
+        }
+    }
+
+    @Test
+    fun `dispose rotation before reply lets abandon replay the exact old receipt`() {
+        val messenger = MethodTestMessenger()
+        val posted = CountDownLatch(1)
+        val queuedPosts = ArrayDeque<() -> Unit>()
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 93,
+            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            postToMain = { task ->
+                synchronized(queuedPosts) { queuedPosts.addLast(task) }
+                posted.countDown()
+            },
+        )
+        try {
+            val original = binding.snapshot()
+            val qualifier = original.nativeStreamToken + original.workerBindingToken
+            val channel = MethodChannel(messenger, "visibility_grid_v2_control_93")
+            val disposed = RecordingResult()
+            channel.invokeMethod("disposeBinding", qualifier, disposed)
+            assertTrue(posted.await(2, TimeUnit.SECONDS))
+
+            val replacementBefore = binding.snapshot()
+            val abandoned = RecordingResult()
+            channel.invokeMethod("abandonBinding", qualifier, abandoned)
+            assertEquals(1, abandoned.successCount)
+            assertEquals(0, abandoned.errorCount)
+            assertEquals(0, disposed.successCount)
+
+            synchronized(queuedPosts) {
+                while (queuedPosts.isNotEmpty()) queuedPosts.removeFirst().invoke()
+            }
+            assertEquals(1, disposed.successCount)
+            assertEquals(0, disposed.errorCount)
+            assertReceiptEqual(disposed.successValue, abandoned.successValue)
+            val receipt = disposed.successValue as Map<*, *>
+            assertEquals(original.bindingGeneration, receipt["bindingGeneration"])
+            assertEquals(1L, receipt["closedResources"])
+            assertEquals(false, receipt["disposed"])
+
+            val replacementAfter = binding.snapshot()
+            assertEquals(replacementBefore.bindingGeneration, replacementAfter.bindingGeneration)
+            assertArrayEquals(replacementBefore.nativeStreamToken, replacementAfter.nativeStreamToken)
+            assertArrayEquals(replacementBefore.workerBindingToken, replacementAfter.workerBindingToken)
+            assertEquals(replacementBefore.closedResources, replacementAfter.closedResources)
+            assertEquals(replacementBefore.operationGeneration, replacementAfter.operationGeneration)
+        } finally {
+            binding.dispose()
+        }
+    }
+
+    @Test
+    fun `abandon precheck before dispose rotation replays the old receipt`() {
+        val messenger = MethodTestMessenger()
+        val executor = Executors.newSingleThreadExecutor()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val abandonAdmitted = CountDownLatch(1)
+        val releaseAbandon = CountDownLatch(1)
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 94,
+            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            executor = executor,
+            postToMain = { task -> task() },
+            beforeAbandonCleanup = {
+                abandonAdmitted.countDown()
+                releaseAbandon.await(2, TimeUnit.SECONDS)
+            },
+        )
+        val abandonCaller = Executors.newSingleThreadExecutor()
+        try {
+            executor.execute {
+                entered.countDown()
+                release.await(2, TimeUnit.SECONDS)
+            }
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+
+            val original = binding.snapshot()
+            val qualifier = original.nativeStreamToken + original.workerBindingToken
+            val channel = MethodChannel(messenger, "visibility_grid_v2_control_94")
+            val disposed = RecordingResult()
+            channel.invokeMethod("disposeBinding", qualifier, disposed)
+
+            val abandoned = RecordingResult()
+            abandonCaller.execute {
+                channel.invokeMethod("abandonBinding", qualifier, abandoned)
+            }
+            assertTrue(abandonAdmitted.await(2, TimeUnit.SECONDS))
+
+            release.countDown()
+            assertTrue(disposed.completed.await(5, TimeUnit.SECONDS))
+            assertEquals(1, disposed.successCount)
+            assertEquals(0, disposed.errorCount)
+            val replacement = binding.snapshot()
+
+            releaseAbandon.countDown()
+            assertTrue(abandoned.completed.await(5, TimeUnit.SECONDS))
+            assertEquals(1, abandoned.successCount)
+            assertEquals(0, abandoned.errorCount)
+            assertReceiptEqual(disposed.successValue, abandoned.successValue)
+
+            val after = binding.snapshot()
+            assertEquals(replacement.bindingGeneration, after.bindingGeneration)
+            assertArrayEquals(replacement.nativeStreamToken, after.nativeStreamToken)
+            assertArrayEquals(replacement.workerBindingToken, after.workerBindingToken)
+            assertEquals(replacement.closedResources, after.closedResources)
+            assertEquals(replacement.operationGeneration, after.operationGeneration)
+        } finally {
+            release.countDown()
+            releaseAbandon.countDown()
+            abandonCaller.shutdownNow()
             binding.dispose()
         }
     }
@@ -453,6 +569,25 @@ class VisibilityGridV2BindingTest {
         assertTrue(bytes.size >= qualifier.size)
         assertArrayEquals(qualifier, bytes.copyOfRange(0, qualifier.size))
         return bytes.copyOfRange(qualifier.size, bytes.size)
+    }
+
+    private fun assertReceiptEqual(left: Any?, right: Any?) {
+        val expected = left as Map<*, *>
+        val actual = right as Map<*, *>
+        assertEquals(expected["bindingGeneration"], actual["bindingGeneration"])
+        assertEquals(expected["streamToken"], actual["streamToken"])
+        assertEquals(expected["closedResources"], actual["closedResources"])
+        assertEquals(expected["disposed"], actual["disposed"])
+        assertEquals(expected["operationGeneration"], actual["operationGeneration"])
+        assertArrayEquals(
+            expected["nativeStreamToken"] as ByteArray,
+            actual["nativeStreamToken"] as ByteArray,
+        )
+        assertArrayEquals(
+            expected["workerBindingToken"] as ByteArray,
+            actual["workerBindingToken"] as ByteArray,
+        )
+        assertEquals(expected["executorTrace"], actual["executorTrace"])
     }
 }
 

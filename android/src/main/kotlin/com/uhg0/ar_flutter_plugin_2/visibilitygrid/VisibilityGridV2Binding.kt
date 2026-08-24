@@ -58,6 +58,8 @@ class VisibilityGridV2Binding internal constructor(
     private val isDebuggable: Boolean = false,
     private val debugRecoverySeam: VisibilityGridV2DebugRecoverySeam =
         VisibilityGridV2DebugRecoverySeam(),
+    private val cleanupAuthority: CleanupAuthority = CleanupAuthority(),
+    internal val beforeAbandonCleanup: (() -> Unit)? = null,
 ) {
     private val main = Handler(Looper.getMainLooper())
     private val disposed = AtomicBoolean(false)
@@ -85,6 +87,7 @@ class VisibilityGridV2Binding internal constructor(
     private val executorTrace = ArrayDeque<String>()
     private val publicationFence = Any()
     private val pendingControlResults = ConcurrentHashMap.newKeySet<PendingControlResult>()
+    private val pendingCleanupResults = ConcurrentHashMap.newKeySet<PendingCleanupResult>()
     @Volatile private var recoveryGroupCut: RecoveryGroupCut? = null
     @Volatile private var replacementBinding: VisibilityGridV2Binding? = null
 
@@ -118,6 +121,7 @@ class VisibilityGridV2Binding internal constructor(
     )
 
     init {
+        cleanupAuthority.publishCurrent(currentIdentity())
         controlChannel.setMethodCallHandler(::onControlCall)
     }
 
@@ -218,44 +222,44 @@ class VisibilityGridV2Binding internal constructor(
             return
         }
         if (call.method == "disposeBinding") {
-            val admission = admitCurrentBinding(call.arguments as? ByteArray)
+            val admission = admitCleanupBinding(call.arguments as? ByteArray)
+            if (admission == null) {
+                result.error("VG_STREAM_BINDING_ABANDONED", "V2 binding token mismatch", null)
+                return
+            }
+            val pending = PendingCleanupResult(result) { pendingCleanupResults.remove(it) }
+            pendingCleanupResults.add(pending)
+            try {
+                executor.execute {
+                    val outcome = runCatching { cleanupBinding(admission, abandonStream = false) }
+                    post {
+                        if (!pending.tryClaim()) return@post
+                        outcome.fold(
+                            onSuccess = { pending.result.success(it.receipt) },
+                            onFailure = { pending.result.error("VG_STREAM_BINDING_ABANDONED", it.message, null) },
+                        )
+                    }
+                }
+            } catch (_: RejectedExecutionException) {
+                val receipt = cleanupAuthority.receiptFor(admission.identity)
+                if (receipt != null && pending.tryClaim()) {
+                    result.success(receipt)
+                } else if (pending.tryClaim()) {
+                    result.error("VG_NOT_INITIALIZED", "V2 binding executor is closed", null)
+                }
+            }
+            return
+        }
+        if (call.method == "abandonBinding") {
+            val admission = admitCleanupBinding(call.arguments as? ByteArray)
             if (admission == null) {
                 result.error("VG_STREAM_BINDING_ABANDONED", "V2 binding token mismatch", null)
                 return
             }
             try {
-                executor.execute {
-                    recordExecutorOperation("control:dispose_binding")
-                    val outcome = runCatching {
-                        checkCurrentBinding(admission.generation, admission.qualifier)
-                        replaceBinding()
-                    }
-                    post {
-                        outcome.fold(
-                            onSuccess = { result.success(it.toMap()) },
-                            onFailure = {
-                                result.error(
-                                    "VG_STREAM_BINDING_ABANDONED",
-                                    it.message,
-                                    null,
-                                )
-                            },
-                        )
-                    }
-                }
-            } catch (_: RejectedExecutionException) {
-                result.error("VG_NOT_INITIALIZED", "V2 binding executor is closed", null)
-            }
-            return
-        }
-        if (call.method == "abandonBinding") {
-            if (!qualifierMatches(call.arguments as? ByteArray)) {
-                result.error("VG_STREAM_BINDING_ABANDONED", "V2 binding token mismatch", null)
-                return
-            }
-            try {
-                val teardownReceipt = abandonAndReplace()
-                result.success(teardownReceipt.toMap())
+                beforeAbandonCleanup?.invoke()
+                val outcome = cleanupBinding(admission, abandonStream = true)
+                result.success(outcome.receipt)
             } catch (error: Exception) {
                 result.error("VG_STREAM_BINDING_ABANDONED", error.message, null)
             }
@@ -446,19 +450,14 @@ class VisibilityGridV2Binding internal constructor(
      * this runs on the shared executor, no old exchange can race the new START.
      */
     @Synchronized
-    private fun replaceBinding(): Snapshot {
-        // A qualified serial dispose can already be queued when the bounded
-        // recovery path independently abandons this generation. Once that
-        // abandon wins, its replacement owns the channel and this late task
-        // is cleanup-only: return the old terminal snapshot without touching
-        // the replacement or throwing on the executor thread.
-        if (disposed.get()) return snapshot()
+    private fun replaceBinding(): Map<String, Any?> {
+        recordExecutorOperation("control:dispose_binding")
         streamChannel.dispose()
         recordClosedResource()
         lifecycle.abandon()
         operationGeneration++
         lifecycleSequence = nextLifecycleSequence.incrementAndGet()
-        val teardownReceipt = snapshot()
+        val teardownReceipt = snapshot().toMap()
         lifecycle = newLifecycle()
         currentBindingGeneration = nextBindingGeneration.incrementAndGet()
         nativeStreamToken = newOpaqueToken()
@@ -471,6 +470,7 @@ class VisibilityGridV2Binding internal constructor(
             executorOrdinal = 0L
             executorTrace.clear()
         }
+        cleanupAuthority.publishCurrent(currentIdentity())
         return teardownReceipt
     }
 
@@ -492,7 +492,7 @@ class VisibilityGridV2Binding internal constructor(
      * on the same view, so a stalled executor cannot block fresh identity
      * recovery or deliver an old reply into the replacement.
      */
-    private fun abandonAndReplace(): Snapshot {
+    private fun abandonAndReplace(): Map<String, Any?> {
         synchronized(publicationFence) {
             check(disposed.compareAndSet(false, true)) { "V2 binding is already abandoned" }
         }
@@ -506,7 +506,8 @@ class VisibilityGridV2Binding internal constructor(
             }
         }
         closeBindingResources(abandonStream = true)
-        val teardownReceipt = snapshot()
+        val teardownReceipt = snapshot().toMap()
+        completePendingCleanup(teardownReceipt)
         val retainedGroupCut = recoveryGroupCut ?: RecoveryGroupCut(
             sessionId = activeSessionId,
             captureGroupId = activeCaptureGroupId,
@@ -530,8 +531,26 @@ class VisibilityGridV2Binding internal constructor(
             activeCoverageEpochSeed = retainedGroupCut.coverageEpoch,
             isDebuggable = isDebuggable,
             debugRecoverySeam = debugRecoverySeam,
+            cleanupAuthority = cleanupAuthority,
         )
         return teardownReceipt
+    }
+
+    private fun cleanupBinding(
+        admission: BindingAdmission,
+        abandonStream: Boolean,
+    ): CleanupOutcome {
+        val outcome = cleanupAuthority.claim(admission.identity) {
+            val receipt = if (abandonStream) abandonAndReplace() else replaceBinding()
+            receipt
+        } ?: throw BindingAbandonedException()
+        return outcome
+    }
+
+    private fun completePendingCleanup(receipt: Map<String, Any?>) {
+        pendingCleanupResults.toList().forEach { pending ->
+            if (pending.tryClaim()) pending.result.success(receipt)
+        }
     }
 
     private fun closeBindingResources(abandonStream: Boolean = false) {
@@ -556,17 +575,8 @@ class VisibilityGridV2Binding internal constructor(
 
     private fun bindingQualifier(): ByteArray = nativeStreamToken + workerBindingToken
 
-    private data class BindingAdmission(
-        val generation: Long,
-        val qualifier: ByteArray,
-    )
-
-    @Synchronized
-    private fun admitCurrentBinding(bytes: ByteArray?): BindingAdmission? {
-        val qualifier = bindingQualifier()
-        if (bytes == null || !bytes.contentEquals(qualifier)) return null
-        return BindingAdmission(currentBindingGeneration, qualifier)
-    }
+    private fun admitCleanupBinding(bytes: ByteArray?): BindingAdmission? =
+        cleanupAuthority.admit(bytes)?.let { identity -> BindingAdmission(identity) }
 
     private fun qualifierMatches(bytes: ByteArray?): Boolean =
         bytes != null && bytes.contentEquals(bindingQualifier())
@@ -579,6 +589,9 @@ class VisibilityGridV2Binding internal constructor(
     }
 
     private fun qualify(bytes: ByteArray): ByteArray = bindingQualifier() + bytes
+
+    private fun currentIdentity(): BindingIdentity =
+        BindingIdentity(currentBindingGeneration, bindingQualifier())
 
     private fun M0aUuid.hex(): String = bytes.joinToString("") { byte ->
         "%02x".format(byte.toInt() and 0xff)
@@ -640,6 +653,67 @@ class VisibilityGridV2Binding internal constructor(
             val ownsResult = claimed.compareAndSet(false, true)
             if (ownsResult) onClaimed(this)
             return ownsResult
+        }
+    }
+
+    private class PendingCleanupResult(
+        val result: MethodChannel.Result,
+        private val onClaimed: (PendingCleanupResult) -> Unit,
+    ) {
+        private val claimed = AtomicBoolean(false)
+
+        fun tryClaim(): Boolean {
+            val ownsResult = claimed.compareAndSet(false, true)
+            if (ownsResult) onClaimed(this)
+            return ownsResult
+        }
+    }
+
+    internal data class BindingIdentity(
+        val generation: Long,
+        val qualifier: ByteArray,
+    ) {
+        override fun equals(other: Any?): Boolean =
+            other is BindingIdentity && generation == other.generation &&
+                qualifier.contentEquals(other.qualifier)
+
+        override fun hashCode(): Int = 31 * generation.hashCode() + qualifier.contentHashCode()
+    }
+
+    private data class BindingAdmission(val identity: BindingIdentity)
+
+    internal data class CleanupOutcome(val receipt: Map<String, Any?>)
+
+    internal class CleanupAuthority {
+        private val lock = Any()
+        private var current: BindingIdentity? = null
+        private val terminals = mutableListOf<Pair<BindingIdentity, Map<String, Any?>>>()
+
+        fun publishCurrent(identity: BindingIdentity) = synchronized(lock) {
+            current = identity
+        }
+
+        fun admit(bytes: ByteArray?): BindingIdentity? = synchronized(lock) {
+            if (bytes == null) return@synchronized null
+            current?.takeIf { it.qualifier.contentEquals(bytes) }?.let { return@synchronized it }
+            terminals.firstOrNull { it.first.qualifier.contentEquals(bytes) }?.first
+        }
+
+        fun receiptFor(identity: BindingIdentity): Map<String, Any?>? = synchronized(lock) {
+            terminals.firstOrNull { it.first == identity }?.second
+        }
+
+        fun claim(
+            identity: BindingIdentity,
+            winner: () -> Map<String, Any?>,
+        ): CleanupOutcome? = synchronized(lock) {
+            terminals.firstOrNull { it.first == identity }?.let {
+                return@synchronized CleanupOutcome(it.second)
+            }
+            if (current != identity) return@synchronized null
+            val receipt = winner()
+            terminals += identity to receipt
+            CleanupOutcome(receipt)
         }
     }
 
