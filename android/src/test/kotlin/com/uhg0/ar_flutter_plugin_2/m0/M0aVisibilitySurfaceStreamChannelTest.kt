@@ -888,6 +888,163 @@ class M0aVisibilitySurfaceStreamChannelTest {
     }
 
     @Test
+    fun `known COMMIT baseline survives queued ACK deadline, wrong restore is rejected, and no duplicate authority effect`() {
+        val authority = M0aCommittedBaselineAuthority()
+        val lifecycle = M0aControlLifecycle(
+            committedBaselineAuthority = authority,
+        )
+        val start = controlRequest(M0aControlOperation.START, 0, 97)
+        val startResponse = M0aControlCodec.decodeResponse(
+            lifecycle.handle(start, M0aControlCodec.encodeRequest(start)),
+        )
+        val streamToken = startResponse.streamToken
+        val scope = M0aCommittedBaselineScopeV1.from(start)
+        val expectedBaseline = M0aCommittedBaselineV1(1, 1, 1, 0)
+        val messenger = TestMessenger(97)
+        val executor = Executors.newSingleThreadExecutor()
+        val scheduler = HoldingTimeoutScheduler()
+        val enteredAcknowledgement = CountDownLatch(1)
+        val releaseAcknowledgement = CountDownLatch(1)
+        val commitPublications = AtomicInteger(0)
+        val binding = M0aVisibilitySurfaceStreamChannel(
+            messenger = messenger,
+            viewId = 97,
+            workerExecutor = executor,
+            shutdownWorkerOnDispose = false,
+            timeoutScheduler = scheduler,
+            controlLifecycle = lifecycle,
+            beforeRequestProcessing = { request ->
+                if (request.requestSequence == 3L) {
+                    enteredAcknowledgement.countDown()
+                    check(releaseAcknowledgement.await(2, TimeUnit.SECONDS))
+                }
+            },
+            onCommitPublished = { _, baseline ->
+                assertEquals(expectedBaseline, baseline)
+                commitPublications.incrementAndGet()
+            },
+        )
+        binding.queueStructuralTransaction(
+            M0aStructuralTransactionProducerV1.produce(
+                transactionId = 1,
+                baseGeometryRevision = 0,
+                targetGeometryRevision = 1,
+                targetLineageRevision = 1,
+                bytes = byteArrayOf(),
+            ),
+        )
+
+        assertEquals(2, M0aPacketCodec.decodeResponse(
+            messenger.exchange(request(1, streamToken)),
+        ).messageKind)
+        assertEquals(4, M0aPacketCodec.decodeResponse(
+            messenger.exchange(request(2, streamToken)),
+        ).messageKind)
+        assertEquals(expectedBaseline, authority.snapshot(scope))
+        assertEquals(1, commitPublications.get())
+
+        val acknowledgementReply = arrayOfNulls<ByteArray>(1)
+        val acknowledgementCompleted = CountDownLatch(1)
+        messenger.send(
+            "visibility_surface_stream_97",
+            ByteBuffer.wrap(
+                request(
+                    sequence = 3,
+                    token = streamToken,
+                    acknowledgedTransaction = 1,
+                    acknowledgedGeometry = 1,
+                    acknowledgedLineage = 1,
+                ),
+            ),
+        ) { response ->
+            acknowledgementReply[0] = response?.let { buffer ->
+                ByteArray(buffer.remaining()).also { buffer.slice().get(it) }
+            }
+            acknowledgementCompleted.countDown()
+        }
+        assertTrue(enteredAcknowledgement.await(2, TimeUnit.SECONDS))
+        scheduler.fireNext()
+        assertTrue(acknowledgementCompleted.await(2, TimeUnit.SECONDS))
+        val deadline = M0aPacketCodec.decodeResponse(acknowledgementReply[0]!!)
+        assertEquals(142, deadline.errorId)
+        assertEquals(expectedBaseline, authority.snapshot(scope))
+        releaseAcknowledgement.countDown()
+        executor.shutdown()
+        assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS))
+        binding.dispose()
+
+        val wrongRestore = M0aControlLifecycle(
+            committedBaselineAuthority = authority,
+        )
+        val wrongResponse = M0aControlCodec.decodeResponse(
+            wrongRestore.handle(
+                controlRequest(
+                    M0aControlOperation.START,
+                    0,
+                    98,
+                    payload = restoredPayload(),
+                ),
+                M0aControlCodec.encodeRequest(
+                    controlRequest(
+                        M0aControlOperation.START,
+                        0,
+                        98,
+                        payload = restoredPayload(),
+                    ),
+                ),
+            ),
+        )
+        assertEquals(1, wrongResponse.outcome)
+        assertEquals(58, wrongResponse.errorId)
+
+        val restoredLifecycle = M0aControlLifecycle(
+            committedBaselineAuthority = authority,
+        )
+        val restoredStart = controlRequest(
+            M0aControlOperation.START,
+            0,
+            99,
+            payload = restoredPayload(geometry = 1, lineage = 1),
+        )
+        val restoredResponse = M0aControlCodec.decodeResponse(
+            restoredLifecycle.handle(
+                restoredStart,
+                M0aControlCodec.encodeRequest(restoredStart),
+            ),
+        )
+        assertEquals(0, restoredResponse.outcome)
+        val restoredResult = ByteBuffer.wrap(restoredResponse.payload)
+            .order(ByteOrder.LITTLE_ENDIAN)
+        assertEquals(1L, restoredResult.getLong(96))
+        assertEquals(1L, restoredResult.getLong(104))
+        assertEquals(expectedBaseline, restoredLifecycle.committedBaseline())
+
+        val restoredBinding = M0aVisibilitySurfaceStreamChannel(
+            messenger = messenger,
+            viewId = 97,
+            controlLifecycle = restoredLifecycle,
+        )
+        val restored = M0aPacketCodec.decodeResponse(
+            messenger.exchange(
+                request(
+                    sequence = 1,
+                    token = restoredResponse.streamToken,
+                    acknowledgedTransaction = 1,
+                    acknowledgedGeometry = 1,
+                    acknowledgedLineage = 1,
+                ),
+            ),
+        )
+        assertEquals(0, restored.messageKind)
+        assertEquals(1L, restored.transactionId)
+        assertEquals(1L, restored.targetGeometryRevision)
+        assertEquals(1L, restored.targetLineageRevision)
+        assertEquals(1, commitPublications.get())
+        assertEquals(expectedBaseline, authority.snapshot(scope))
+        restoredBinding.dispose()
+    }
+
+    @Test
     fun `receipt query distinguishes abandon winner without mutating baseline`() {
         val authority = M0aCommittedBaselineAuthority()
         val scope = M0aCommittedBaselineScopeV1(
@@ -949,6 +1106,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
         operation: M0aControlOperation,
         streamToken: Long,
         seed: Int,
+        payload: ByteArray? = null,
     ): M0aControlRequest = M0aControlRequest(
         operation = operation,
         flags = 0,
@@ -959,12 +1117,20 @@ class M0aVisibilitySurfaceStreamChannelTest {
         groupGeneration = 1,
         coverageEpoch = 1,
         streamToken = streamToken,
-        payload = if (operation == M0aControlOperation.START) {
+        payload = payload ?: if (operation == M0aControlOperation.START) {
             M0aStartRequestCodecV2.defaultPayload()
-        } else {
-            byteArrayOf()
-        },
+        } else byteArrayOf(),
     )
+
+    private fun restoredPayload(
+        geometry: Long = 0,
+        lineage: Long = 0,
+    ): ByteArray = M0aStartRequestCodecV2.defaultPayload().also { bytes ->
+        val data = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+        data.put(7, 1)
+        data.putLong(64, geometry)
+        data.putLong(72, lineage)
+    }
 
     private fun uuid(seed: Int): M0aUuid {
         val bytes = ByteArray(16) { (seed + it).toByte() }

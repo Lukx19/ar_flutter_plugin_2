@@ -595,6 +595,22 @@ final class ARVisibilityGridV2Control {
     );
   }
 
+  /// Arms the debug-only exchange-3 ACK stall used by the Android T6
+  /// known-COMMIT recovery tracer. Native waits after decoding request
+  /// sequence 3, which is the exact post-COMMIT acknowledgement pull.
+  ///
+  /// Throws the same bounded channel/response failures as
+  /// [configureDebugV2ExchangeStall]. This method is not a production
+  /// capability.
+  Future<bool> configureDebugV2AcknowledgementStall() async {
+    await _bindingReady;
+    return _armV2DebugControl(
+      _channel,
+      'configureDebugV2AckStall',
+      'V2 debug ACK stall returned an invalid arm receipt.',
+    );
+  }
+
   /// Reads the bounded debug recovery trace from native.
   ///
   /// Each entry is a scalar trace label of at most 1024 characters and at
@@ -885,6 +901,18 @@ final class ARVisibilityGridV2WorkerBinding {
       _controlChannel,
       'configureDebugV2CommitPublicationStall',
       'V2 debug COMMIT stall returned an invalid arm receipt.',
+    );
+  }
+
+  /// Arms the debug-only exchange-3 ACK stall used by the Android T6
+  /// known-COMMIT recovery tracer. The native latch is taken after request
+  /// sequence 3 is decoded and before its response can be published.
+  Future<bool> configureDebugV2AcknowledgementStall() async {
+    _ensureOpen();
+    return _armV2DebugControl(
+      _controlChannel,
+      'configureDebugV2AckStall',
+      'V2 debug ACK stall returned an invalid arm receipt.',
     );
   }
 

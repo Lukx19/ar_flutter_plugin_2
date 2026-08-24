@@ -250,7 +250,8 @@ void main() {
     const channel = MethodChannel('visibility_grid_v2_control_91');
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (call) async {
-      if (call.method == 'configureDebugV2CommitPublicationStall') {
+      if (call.method == 'configureDebugV2CommitPublicationStall' ||
+          call.method == 'configureDebugV2AckStall') {
         throw PlatformException(
           code: 'VG_PROTOCOL_INVALID',
           message: 'V2 recovery seam is debug-only',
@@ -273,6 +274,18 @@ void main() {
 
     await expectLater(
       control.configureDebugV2CommitPublicationStall(),
+      throwsA(
+        isA<PlatformException>()
+            .having((error) => error.code, 'code', 'VG_PROTOCOL_INVALID')
+            .having(
+              (error) => error.message,
+              'message',
+              'V2 recovery seam is debug-only',
+            ),
+      ),
+    );
+    await expectLater(
+      control.configureDebugV2AcknowledgementStall(),
       throwsA(
         isA<PlatformException>()
             .having((error) => error.code, 'code', 'VG_PROTOCOL_INVALID')

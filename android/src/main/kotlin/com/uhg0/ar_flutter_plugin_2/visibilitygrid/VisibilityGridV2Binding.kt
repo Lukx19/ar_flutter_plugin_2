@@ -101,6 +101,7 @@ class VisibilityGridV2Binding internal constructor(
         onExecutorOperation = ::recordExecutorOperation,
         bindingQualifier = bindingQualifier(),
         beforeWorkerProcessing = debugRecoverySeam::beforeExchange,
+        beforeRequestProcessing = debugRecoverySeam::beforeRequest,
         onCommitPublished = { request, baseline ->
             activeReceiptQuery(request, baseline)?.let { query ->
                 committedBaselineAuthority.publishCommit(query, baseline)
@@ -183,6 +184,14 @@ class VisibilityGridV2Binding internal constructor(
                 result.error("VG_PROTOCOL_INVALID", "V2 recovery seam is debug-only", null)
             } else {
                 result.success(debugRecoverySeam.armCommitPublication())
+            }
+            return
+        }
+        if (call.method == "configureDebugV2AckStall") {
+            if (!isDebuggable) {
+                result.error("VG_PROTOCOL_INVALID", "V2 recovery seam is debug-only", null)
+            } else {
+                result.success(debugRecoverySeam.armAcknowledgement())
             }
             return
         }
@@ -708,6 +717,7 @@ internal class VisibilityGridV2DebugRecoverySeam {
     private var oldContinuation: CountDownLatch? = null
     private var stallClaimed = false
     private var commitPublicationStall = false
+    private var acknowledgementStall = false
     private var recoveryTraceActive = false
     private var replacementSeeded = false
 
@@ -715,6 +725,7 @@ internal class VisibilityGridV2DebugRecoverySeam {
         check(exchangeGate == null) { "V2 recovery seam is already armed" }
         trace.clear()
         commitPublicationStall = false
+        acknowledgementStall = false
         appendTrace("armed:first-exchange")
         exchangeGate = CountDownLatch(1)
         oldContinuation = CountDownLatch(1)
@@ -728,6 +739,7 @@ internal class VisibilityGridV2DebugRecoverySeam {
         check(exchangeGate == null) { "V2 recovery seam is already armed" }
         trace.clear()
         commitPublicationStall = true
+        acknowledgementStall = false
         appendTrace("armed:commit-publication")
         exchangeGate = CountDownLatch(1)
         oldContinuation = CountDownLatch(1)
@@ -737,8 +749,22 @@ internal class VisibilityGridV2DebugRecoverySeam {
         mapOf("armed" to true)
     }
 
+    fun armAcknowledgement(): Map<String, Any> = synchronized(lock) {
+        check(exchangeGate == null) { "V2 recovery seam is already armed" }
+        trace.clear()
+        commitPublicationStall = false
+        acknowledgementStall = true
+        appendTrace("armed:acknowledgement")
+        exchangeGate = CountDownLatch(1)
+        oldContinuation = CountDownLatch(1)
+        stallClaimed = false
+        recoveryTraceActive = true
+        replacementSeeded = false
+        mapOf("armed" to true)
+    }
+
     fun beforeExchange() {
-        if (synchronized(lock) { commitPublicationStall }) return
+        if (synchronized(lock) { commitPublicationStall || acknowledgementStall }) return
         val gate = synchronized(lock) {
             val candidate = exchangeGate
             if (candidate == null || stallClaimed) return
@@ -756,6 +782,30 @@ internal class VisibilityGridV2DebugRecoverySeam {
             }
         }
         if (interrupted) Thread.currentThread().interrupt()
+    }
+
+    fun beforeRequest(request: M0aPacketCodec.Request) {
+        val shouldStall = synchronized(lock) {
+            acknowledgementStall && request.requestSequence == 3L && !stallClaimed
+        }
+        if (!shouldStall) return
+        val gate = synchronized(lock) {
+            if (!acknowledgementStall || stallClaimed) return
+            stallClaimed = true
+            appendTrace("stalled:acknowledgement")
+            checkNotNull(exchangeGate)
+        }
+        var interrupted = false
+        while (true) {
+            try {
+                gate.await()
+                break
+            } catch (_: InterruptedException) {
+                interrupted = true
+            }
+        }
+        if (interrupted) Thread.currentThread().interrupt()
+        oldContinuationFenced()
     }
 
     fun afterCommitPublication() {
@@ -779,7 +829,7 @@ internal class VisibilityGridV2DebugRecoverySeam {
     }
 
     fun commitPublished() = synchronized(lock) {
-        if (commitPublicationStall) appendTrace("commit-published")
+        if (commitPublicationStall || acknowledgementStall) appendTrace("commit-published")
     }
 
     fun acceptedCut(request: M0aControlRequest) = synchronized(lock) {
@@ -813,6 +863,7 @@ internal class VisibilityGridV2DebugRecoverySeam {
                 oldContinuation = null
                 stallClaimed = false
                 commitPublicationStall = false
+                acknowledgementStall = false
             }
         }
     }

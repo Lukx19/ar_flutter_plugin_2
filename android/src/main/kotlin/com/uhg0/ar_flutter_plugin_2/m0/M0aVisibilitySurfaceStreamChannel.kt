@@ -60,6 +60,7 @@ class M0aVisibilitySurfaceStreamChannel(
     private val workerTimeoutMillis: Long = DEFAULT_WORKER_TIMEOUT_MILLIS,
     private val timeoutScheduler: M0aTimeoutScheduler = M0aTimeoutScheduler.real(),
     private val beforeWorkerProcessing: (() -> Unit)? = null,
+    private val beforeRequestProcessing: ((M0aPacketCodec.Request) -> Unit)? = null,
     private val controlLifecycle: M0aControlLifecycle? = null,
     private val onExecutorOperation: ((String) -> Unit)? = null,
     private val bindingQualifier: ByteArray? = null,
@@ -258,6 +259,7 @@ class M0aVisibilitySurfaceStreamChannel(
                                 val encoded = try {
                                     val request = M0aPacketCodec.decodeRequest(bytes)
                                     decodedRequest = request
+                                    beforeRequestProcessing?.invoke(request)
                                     controlLifecycle?.streamTokenError(request.streamToken)?.let {
                                         throw BindingError(it)
                                     }
