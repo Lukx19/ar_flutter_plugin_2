@@ -6,20 +6,22 @@ import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineAuthority
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlCodec
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlLifecycle
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlOperation
+import com.uhg0.ar_flutter_plugin_2.m0.M0aControlRequest
 import com.uhg0.ar_flutter_plugin_2.m0.M0aUuid
 import com.uhg0.ar_flutter_plugin_2.m0.M0aStructuralTransactionProducerV1
 import com.uhg0.ar_flutter_plugin_2.m0.M0aVisibilitySurfaceStreamChannel
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+import java.nio.ByteBuffer
+import java.util.ArrayDeque
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
-import java.util.ArrayDeque
-import java.nio.ByteBuffer
-import java.util.UUID
 
 /**
  * Production owner for one immutable V2 platform-view binding generation.
@@ -36,6 +38,15 @@ class VisibilityGridV2Binding(
     private val bindingGenerationSeed: Long = nextBindingGeneration.incrementAndGet(),
     private val viewGeneration: Long = nextViewGeneration.incrementAndGet(),
     private val executor: ExecutorService = Executors.newSingleThreadExecutor(),
+    private val arSessionIdentity: ByteArray = newOpaqueToken(),
+    private val viewInstanceId: ByteArray = newOpaqueToken(),
+    private val postToMain: ((() -> Unit) -> Unit)? = null,
+    private val beforeControlPublication: (() -> Unit)? = null,
+    private val activeSessionIdSeed: M0aUuid? = null,
+    private val activeCaptureGroupIdSeed: M0aUuid? = null,
+    private val activeSessionGenerationSeed: Long = 0L,
+    private val activeGroupGenerationSeed: Long = 0L,
+    private val activeCoverageEpochSeed: Long = 0L,
 ) {
     private val main = Handler(Looper.getMainLooper())
     private val disposed = AtomicBoolean(false)
@@ -48,21 +59,22 @@ class VisibilityGridV2Binding(
     private var workerBindingToken = newOpaqueToken()
     @Volatile private var streamChannel = newStreamChannel()
     @Volatile private var currentBindingGeneration = bindingGenerationSeed
-    private val arSessionIdentity = newOpaqueToken()
-    private val viewInstanceId = newOpaqueToken()
     private var initialTransactionQueued = false
     private var acceptedControls = 0L
     private var closedResources = 0L
     private var activeControlRequestId: M0aUuid? = null
-    private var activeSessionId: M0aUuid? = null
-    private var activeCaptureGroupId: M0aUuid? = null
-    private var activeSessionGeneration = 0L
-    private var activeGroupGeneration = 0L
-    private var activeCoverageEpoch = 0L
+    private var activeSessionId: M0aUuid? = activeSessionIdSeed
+    private var activeCaptureGroupId: M0aUuid? = activeCaptureGroupIdSeed
+    private var activeSessionGeneration = activeSessionGenerationSeed
+    private var activeGroupGeneration = activeGroupGenerationSeed
+    private var activeCoverageEpoch = activeCoverageEpochSeed
     private var executorOrdinal = 0L
     private var lifecycleSequence = nextLifecycleSequence.incrementAndGet()
     private var operationGeneration = 0L
     private val executorTrace = ArrayDeque<String>()
+    private val publicationFence = Any()
+    private val pendingControlResults = ConcurrentHashMap.newKeySet<PendingControlResult>()
+    @Volatile private var recoveryGroupCut: RecoveryGroupCut? = null
     @Volatile private var replacementBinding: VisibilityGridV2Binding? = null
 
     private fun newLifecycle() = M0aControlLifecycle(
@@ -138,7 +150,7 @@ class VisibilityGridV2Binding(
                 executor.execute {
                     recordExecutorOperation("control:binding_snapshot")
                     val snapshot = snapshot()
-                    main.post {
+                    post {
                         result.success(snapshot.toMap())
                     }
                 }
@@ -188,10 +200,14 @@ class VisibilityGridV2Binding(
             result.error("VG_PROTOCOL_INVALID", "V2 control requires one Uint8List", null)
             return
         }
+        val admittedGeneration = currentBindingGeneration
+        val admittedQualifier = bindingQualifier()
+        val pending = PendingControlResult(result) { pendingControlResults.remove(it) }
+        pendingControlResults.add(pending)
         try {
             executor.execute {
                 val outcome = runCatching {
-                    check(!disposed.get()) { "V2 binding is disposed" }
+                    checkCurrentBinding(admittedGeneration, admittedQualifier)
                     val request = M0aControlCodec.decodeRequest(bytes)
                     recordExecutorOperation("control:${operation.name.lowercase()}")
                     require(request.operation == operation) {
@@ -204,30 +220,64 @@ class VisibilityGridV2Binding(
                         wasIdle && operation == M0aControlOperation.START &&
                         decoded.outcome == 0
                     ) {
-                        operationGeneration++
-                        lifecycleSequence = nextLifecycleSequence.incrementAndGet()
-                        activeControlRequestId = request.controlRequestId
-                        activeSessionId = request.sessionId
-                        activeCaptureGroupId = request.captureGroupId
-                        activeSessionGeneration = request.sessionGeneration
-                        activeGroupGeneration = request.groupGeneration
-                        activeCoverageEpoch = request.coverageEpoch
-                        queueInitialTransaction()
+                        recoveryGroupCut = RecoveryGroupCut.from(request)
                     }
-                    acceptedControls++
-                    qualify(response)
+                    beforeControlPublication?.invoke()
+                    synchronized(publicationFence) {
+                        checkCurrentBinding(admittedGeneration, admittedQualifier)
+                        if (
+                            wasIdle && operation == M0aControlOperation.START &&
+                            decoded.outcome == 0
+                        ) {
+                            operationGeneration++
+                            lifecycleSequence = nextLifecycleSequence.incrementAndGet()
+                            activeControlRequestId = request.controlRequestId
+                            activeSessionId = request.sessionId
+                            activeCaptureGroupId = request.captureGroupId
+                            activeSessionGeneration = request.sessionGeneration
+                            activeGroupGeneration = request.groupGeneration
+                            activeCoverageEpoch = request.coverageEpoch
+                            queueInitialTransaction()
+                        }
+                        acceptedControls++
+                        qualify(response)
+                    }
                 }
-                main.post {
-                    outcome.fold(
-                        onSuccess = result::success,
-                        onFailure = {
-                            result.error("VG_PROTOCOL_INVALID", it.message, null)
-                        },
-                    )
+                post {
+                    if (pending.tryClaim()) {
+                        outcome.fold(
+                            onSuccess = pending.result::success,
+                            onFailure = {
+                                val code = if (it is BindingAbandonedException) {
+                                    "VG_STREAM_BINDING_ABANDONED"
+                                } else {
+                                    "VG_PROTOCOL_INVALID"
+                                }
+                                pending.result.error(code, it.message, null)
+                            },
+                        )
+                    }
                 }
             }
         } catch (_: RejectedExecutionException) {
-            result.error("VG_NOT_INITIALIZED", "V2 binding executor is closed", null)
+            if (pending.tryClaim()) {
+                pending.result.error("VG_NOT_INITIALIZED", "V2 binding executor is closed", null)
+            }
+        }
+    }
+
+    private fun post(task: () -> Unit) {
+        val injected = postToMain
+        if (injected != null) injected(task) else main.post(task)
+    }
+
+    private fun checkCurrentBinding(generation: Long, qualifier: ByteArray) {
+        if (
+            disposed.get() ||
+            generation != currentBindingGeneration ||
+            !qualifier.contentEquals(bindingQualifier())
+        ) {
+            throw BindingAbandonedException()
         }
     }
 
@@ -268,11 +318,6 @@ class VisibilityGridV2Binding(
         initialTransactionQueued = false
         acceptedControls = 0L
         activeControlRequestId = null
-        activeSessionId = null
-        activeCaptureGroupId = null
-        activeSessionGeneration = 0L
-        activeGroupGeneration = 0L
-        activeCoverageEpoch = 0L
         synchronized(this) {
             executorOrdinal = 0L
             executorTrace.clear()
@@ -299,13 +344,40 @@ class VisibilityGridV2Binding(
      * recovery or deliver an old reply into the replacement.
      */
     private fun abandonAndReplace(): Snapshot {
-        check(disposed.compareAndSet(false, true)) { "V2 binding is already abandoned" }
+        synchronized(publicationFence) {
+            check(disposed.compareAndSet(false, true)) { "V2 binding is already abandoned" }
+        }
+        pendingControlResults.toList().forEach { pending ->
+            if (pending.tryClaim()) {
+                pending.result.error(
+                    "VG_STREAM_BINDING_ABANDONED",
+                    "V2 binding was abandoned before control publication",
+                    null,
+                )
+            }
+        }
         closeBindingResources(abandonStream = true)
         val teardownReceipt = snapshot()
+        val retainedGroupCut = recoveryGroupCut ?: RecoveryGroupCut(
+            sessionId = activeSessionId,
+            captureGroupId = activeCaptureGroupId,
+            sessionGeneration = activeSessionGeneration,
+            groupGeneration = activeGroupGeneration,
+            coverageEpoch = activeCoverageEpoch,
+        )
         replacementBinding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = viewId,
             committedBaselineAuthority = committedBaselineAuthority,
+            viewGeneration = viewGeneration,
+            arSessionIdentity = arSessionIdentity,
+            viewInstanceId = viewInstanceId,
+            postToMain = postToMain,
+            activeSessionIdSeed = retainedGroupCut.sessionId,
+            activeCaptureGroupIdSeed = retainedGroupCut.captureGroupId,
+            activeSessionGenerationSeed = retainedGroupCut.sessionGeneration,
+            activeGroupGenerationSeed = retainedGroupCut.groupGeneration,
+            activeCoverageEpochSeed = retainedGroupCut.coverageEpoch,
         )
         return teardownReceipt
     }
@@ -366,6 +438,39 @@ class VisibilityGridV2Binding(
         "operationGeneration" to operationGeneration,
         "executorTrace" to executorTrace,
     )
+
+    private class BindingAbandonedException : IllegalStateException("V2 binding is abandoned")
+
+    private data class RecoveryGroupCut(
+        val sessionId: M0aUuid?,
+        val captureGroupId: M0aUuid?,
+        val sessionGeneration: Long,
+        val groupGeneration: Long,
+        val coverageEpoch: Long,
+    ) {
+        companion object {
+            fun from(request: M0aControlRequest) = RecoveryGroupCut(
+                sessionId = request.sessionId,
+                captureGroupId = request.captureGroupId,
+                sessionGeneration = request.sessionGeneration,
+                groupGeneration = request.groupGeneration,
+                coverageEpoch = request.coverageEpoch,
+            )
+        }
+    }
+
+    private class PendingControlResult(
+        val result: MethodChannel.Result,
+        private val onClaimed: (PendingControlResult) -> Unit,
+    ) {
+        private val claimed = AtomicBoolean(false)
+
+        fun tryClaim(): Boolean {
+            val ownsResult = claimed.compareAndSet(false, true)
+            if (ownsResult) onClaimed(this)
+            return ownsResult
+        }
+    }
 
     private companion object {
         val nextBindingGeneration = AtomicLong()

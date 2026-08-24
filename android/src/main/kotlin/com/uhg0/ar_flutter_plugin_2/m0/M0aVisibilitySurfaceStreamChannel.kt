@@ -63,6 +63,7 @@ class M0aVisibilitySurfaceStreamChannel(
     private val controlLifecycle: M0aControlLifecycle? = null,
     private val onExecutorOperation: ((String) -> Unit)? = null,
     private val bindingQualifier: ByteArray? = null,
+    private val beforeAuthorityPublication: (() -> Unit)? = null,
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val channel = BasicMessageChannel<ByteBuffer>(
@@ -84,6 +85,7 @@ class M0aVisibilitySurfaceStreamChannel(
     @Volatile private var lastResponse: ByteArray? = null
     @Volatile private var resyncPending = false
     private val bindingAbandoned = AtomicBoolean(false)
+    private val publicationFence = Any()
     private val transactionReceiver = M0aStructuralTransactionReceiverV1()
     private val telemetry = M0aTransportInstrumentation()
     private val structuralFrames = ArrayDeque<M0aTransactionFrameV1>()
@@ -273,12 +275,19 @@ class M0aVisibilitySurfaceStreamChannel(
                                                 !isValidResyncRequest(request)) {
                                                 throw BindingError(TRANSACTION_STATE_ERROR_ID)
                                             }
-                                            controlLifecycle?.let {
-                                                committedBaseline = it.committedBaseline()
+                                            if (structuralFrames.peekFirst() is M0aTransactionCommitFrameV1) {
+                                                beforeAuthorityPublication?.invoke()
                                             }
-                                            val requiresResync = requiresResync(request)
-                                            val encoded = M0aPacketCodec.encodeResponse(
-                                                when {
+                                            val encoded = synchronized(publicationFence) {
+                                                if (disposed.get() || bindingAbandoned.get()) {
+                                                    throw BindingError(STREAM_BINDING_ABANDONED_ERROR_ID)
+                                                }
+                                                controlLifecycle?.let {
+                                                    committedBaseline = it.committedBaseline()
+                                                }
+                                                val requiresResync = requiresResync(request)
+                                                M0aPacketCodec.encodeResponse(
+                                                    when {
                                                     resyncPending -> {
                                                         if (transactionReceiver.state ==
                                                             M0aStructuralTransactionState.RESYNC_PENDING) {
@@ -318,9 +327,10 @@ class M0aVisibilitySurfaceStreamChannel(
                                                         }
                                                         nextStructuralResponse(request)
                                                     }
-                                                },
-                                                request.maximumResponseBytes,
-                                            )
+                                                    },
+                                                    request.maximumResponseBytes,
+                                                )
+                                            }
                                             lastSequence = request.requestSequence
                                             nextExpectedSequence = request.requestSequence + 1
                                             lastRequest = bytes.copyOf()
@@ -421,7 +431,7 @@ class M0aVisibilitySurfaceStreamChannel(
 
     fun dispose() {
         if (!disposed.compareAndSet(false, true)) return
-        bindingAbandoned.set(true)
+        synchronized(publicationFence) { bindingAbandoned.set(true) }
         activePendingReply?.let { pendingReply ->
             if (pendingReply.tryClaim()) {
                 pendingReply.reply(workerLostResponse(pendingReply.requestBytes))
@@ -450,7 +460,7 @@ class M0aVisibilitySurfaceStreamChannel(
      * stream as normally disposed; the owner may install a fresh binding. */
     fun abandon() {
         if (disposed.get()) return
-        if (!bindingAbandoned.compareAndSet(false, true)) return
+        if (!claimAbandonFence()) return
         activePendingReply?.let { pendingReply ->
             if (pendingReply.tryClaim()) {
                 pendingReply.reply(workerAbandonedResponse(pendingReply.requestBytes))
@@ -472,7 +482,7 @@ class M0aVisibilitySurfaceStreamChannel(
             pendingReply.reply(workerLostResponse(bytes))
             return
         }
-        if (!bindingAbandoned.compareAndSet(false, true)) {
+        if (!claimAbandonFence()) {
             pendingReply.reply(workerLostResponse(bytes))
             return
         }
@@ -488,7 +498,7 @@ class M0aVisibilitySurfaceStreamChannel(
 
     private fun abandonForWorkerLoss(pendingReply: PendingReply, bytes: ByteArray) {
         val ownsReply = pendingReply.tryClaim()
-        if (!bindingAbandoned.compareAndSet(false, true)) {
+        if (!claimAbandonFence()) {
             if (ownsReply) pendingReply.reply(workerLostResponse(bytes))
             return
         }
@@ -528,6 +538,10 @@ class M0aVisibilitySurfaceStreamChannel(
                 throw IllegalStateException("Interrupted clearing binding handler.", error)
             }
         }
+    }
+
+    private fun claimAbandonFence(): Boolean = synchronized(publicationFence) {
+        bindingAbandoned.compareAndSet(false, true)
     }
 
     private fun isValidResyncRequest(request: M0aPacketCodec.Request): Boolean {

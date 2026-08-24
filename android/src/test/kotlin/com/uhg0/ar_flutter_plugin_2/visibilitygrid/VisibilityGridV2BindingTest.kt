@@ -1,0 +1,157 @@
+package com.uhg0.ar_flutter_plugin_2.visibilitygrid
+
+import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineAuthority
+import com.uhg0.ar_flutter_plugin_2.m0.M0aControlCodec
+import com.uhg0.ar_flutter_plugin_2.m0.M0aControlOperation
+import com.uhg0.ar_flutter_plugin_2.m0.M0aControlRequest
+import com.uhg0.ar_flutter_plugin_2.m0.M0aStartRequestCodecV2
+import com.uhg0.ar_flutter_plugin_2.m0.M0aUuid
+import io.flutter.plugin.common.BinaryMessenger
+import io.flutter.plugin.common.MethodChannel
+import java.nio.ByteBuffer
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class VisibilityGridV2BindingTest {
+    @Test
+    fun `abandon fences delayed START publication and preserves the view and group cut`() {
+        val messenger = MethodTestMessenger()
+        val enteredPublication = CountDownLatch(1)
+        val releasePublication = CountDownLatch(1)
+        val executor = Executors.newSingleThreadExecutor()
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 79,
+            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            executor = executor,
+            postToMain = { task -> task() },
+            beforeControlPublication = {
+                enteredPublication.countDown()
+                while (!releasePublication.await(10, TimeUnit.MILLISECONDS)) {
+                    // Deliberately ignore executor interruption so the test can
+                    // release the exact late native continuation.
+                }
+            },
+        )
+        val original = binding.snapshot()
+        val qualifier = original.nativeStreamToken + original.workerBindingToken
+        val channel = MethodChannel(messenger, "visibility_grid_v2_control_79")
+        val start = RecordingResult()
+
+        channel.invokeMethod("start", qualifier + M0aControlCodec.encodeRequest(startRequest()), start)
+        assertTrue(enteredPublication.await(2, TimeUnit.SECONDS))
+
+        val abandoned = RecordingResult()
+        channel.invokeMethod("abandonBinding", qualifier, abandoned)
+        assertTrue(abandoned.completed.await(2, TimeUnit.SECONDS))
+        assertEquals(1, abandoned.successCount)
+        assertTrue(start.completed.await(2, TimeUnit.SECONDS))
+        assertEquals("VG_STREAM_BINDING_ABANDONED", start.errorCode)
+
+        releasePublication.countDown()
+        executor.awaitTermination(2, TimeUnit.SECONDS)
+        assertEquals(0, start.successCount)
+        assertEquals(1, start.errorCount)
+
+        val replacement = RecordingResult()
+        channel.invokeMethod("bindingSnapshot", null, replacement)
+        assertTrue(replacement.completed.await(2, TimeUnit.SECONDS))
+        val snapshot = replacement.successValue as Map<*, *>
+        assertNotEquals(original.bindingGeneration, snapshot["bindingGeneration"])
+        assertArrayEquals(original.arSessionIdentity, snapshot["arSessionIdentity"] as ByteArray)
+        assertArrayEquals(original.viewInstanceId, snapshot["viewInstanceId"] as ByteArray)
+        assertEquals(original.viewGeneration, snapshot["viewGeneration"])
+        assertEquals(uuid(20).hex(), snapshot["sessionId"])
+        assertEquals(uuid(40).hex(), snapshot["captureGroupId"])
+        assertEquals(3L, snapshot["sessionGeneration"])
+        assertEquals(4L, snapshot["groupGeneration"])
+        assertEquals(5L, snapshot["coverageEpoch"])
+        assertEquals(0L, snapshot["acceptedControls"])
+        assertEquals(false, snapshot["initialTransactionQueued"])
+
+        binding.dispose()
+    }
+
+    private fun startRequest() = M0aControlRequest(
+        operation = M0aControlOperation.START,
+        flags = 0,
+        controlRequestId = uuid(1),
+        sessionId = uuid(20),
+        captureGroupId = uuid(40),
+        sessionGeneration = 3,
+        groupGeneration = 4,
+        coverageEpoch = 5,
+        streamToken = 0,
+        payload = M0aStartRequestCodecV2.defaultPayload(),
+    )
+
+    private fun uuid(seed: Int): M0aUuid {
+        val bytes = ByteArray(16) { (seed + it).toByte() }
+        bytes[6] = 0x40
+        bytes[8] = 0x80.toByte()
+        return M0aUuid(bytes)
+    }
+
+    private fun M0aUuid.hex(): String = bytes.joinToString("") { byte ->
+        "%02x".format(byte.toInt() and 0xff)
+    }
+}
+
+private class RecordingResult : MethodChannel.Result {
+    val completed = CountDownLatch(1)
+    var successCount = 0
+    var errorCount = 0
+    var successValue: Any? = null
+    var errorCode: String? = null
+
+    override fun success(result: Any?) {
+        successCount++
+        successValue = result
+        completed.countDown()
+    }
+
+    override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) {
+        errorCount++
+        this.errorCode = errorCode
+        completed.countDown()
+    }
+
+    override fun notImplemented() {
+        completed.countDown()
+    }
+}
+
+private class MethodTestMessenger : BinaryMessenger {
+    private val handlers = mutableMapOf<String, BinaryMessenger.BinaryMessageHandler>()
+
+    override fun send(channel: String, message: ByteBuffer?) = send(channel, message, null)
+
+    override fun send(channel: String, message: ByteBuffer?, callback: BinaryMessenger.BinaryReply?) {
+        val handler = handlers[channel]
+        if (handler == null) {
+            callback?.reply(null)
+        } else {
+            val inbound = message?.duplicate()?.apply {
+                if (position() > 0) flip()
+            }
+            handler.onMessage(inbound) { reply ->
+                val outbound = reply?.duplicate()?.apply {
+                    if (position() > 0) flip()
+                }
+                callback?.reply(outbound)
+            }
+        }
+    }
+
+    override fun setMessageHandler(channel: String, handler: BinaryMessenger.BinaryMessageHandler?) {
+        synchronized(handlers) {
+            if (handler == null) handlers.remove(channel) else handlers[channel] = handler
+        }
+    }
+}

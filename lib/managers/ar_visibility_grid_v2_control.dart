@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:ui' as ui;
-import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
 
@@ -88,18 +87,12 @@ final class ARVisibilityGridV2Control {
     return Uint8List.fromList(response);
   }
 
-  /// Fences only the V2 binding while leaving the shared V1 point-cloud/
-  /// visibility channel alive for the owning platform view's normal teardown.
-  /// This no-argument call supplies the connection-time qualifier internally
-  /// and returns the native teardown receipt map.
-  /// Native receives either null or the exact 32-byte concatenation of the
-  /// owned `nativeStreamToken` and `workerBindingToken`; the public method
-  /// remains argument-free. The returned map includes `closedResources`.
-  /// Throws [PlatformException] or [MissingPluginException] when the platform
-  /// channel cannot apply the fence.
+  /// Claims the connection-time native binding tokens used by [dispose].
   ///
-  /// The first claim wins; a replacement claim is rejected. Throws [StateError]
-  /// when either token is not a 16-byte byte list.
+  /// The first valid snapshot wins for this control's lifetime. Reusing the
+  /// same qualifier is idempotent; a different replacement snapshot throws
+  /// [StateError]. Either token being absent or not a 16-byte [Uint8List] also
+  /// throws [StateError].
   void bindSnapshot(Map<Object?, Object?> snapshot) {
     final qualifier = _qualifierFromSnapshot(snapshot);
     final existing = _bindingQualifier;
@@ -241,7 +234,10 @@ final class ARVisibilityGridV2WorkerBinding {
   Future<Map<Object?, Object?>>? _abandonFuture;
 
   /// Claims the native binding tokens returned by `bindingSnapshot`.
-  /// Throws [StateError] when either token is not a 16-byte [Uint8List].
+  /// The first valid snapshot owns this Dart binding for its lifetime. Reusing
+  /// the same qualifier is idempotent; a different later qualifier throws
+  /// [StateError]. Either token being absent or not a 16-byte [Uint8List] also
+  /// throws [StateError].
   void bindSnapshot(Map<Object?, Object?> snapshot) {
     final qualifier = _qualifierFromSnapshot(snapshot);
     final existing = _bindingQualifier;
@@ -293,8 +289,10 @@ final class ARVisibilityGridV2WorkerBinding {
   }
 
   /// Exchanges one binary stream envelope and returns its binary response.
-  /// Throws [StateError] when closed or no response arrives, and propagates
-  /// [PlatformException] or [MissingPluginException] on channel failure.
+  /// Throws [ARVisibilitySurfaceStreamUnknownOutcome] when the bounded exchange
+  /// times out. Throws [StateError] when closed, native returns no response, or
+  /// the response qualifier is absent/stale. Propagates [PlatformException] or
+  /// [MissingPluginException] on other channel failures.
   Future<Uint8List> exchange(
     Uint8List request, {
     Duration? timeout,
@@ -359,8 +357,9 @@ final class ARVisibilityGridV2WorkerBinding {
   /// The Android owner replaces the per-view stream/control lifecycle after
   /// this call, so a subsequent group can negotiate a new binding generation
   /// without reusing the old stream token or transaction cursor.
-  /// Throws [PlatformException], [MissingPluginException], or [StateError] if
-  /// the native fence or its post-fence snapshot cannot be observed.
+  /// Throws [PlatformException] or [MissingPluginException] when the channel
+  /// cannot deliver the qualified fence, and [StateError] when no qualifier
+  /// has been claimed or native omits the teardown map/`closedResources`.
   Future<void> dispose() async {
     await disposeAndSnapshot();
   }
@@ -368,8 +367,9 @@ final class ARVisibilityGridV2WorkerBinding {
   /// Disposes the native binding and reads the post-disposal scalar snapshot
   /// before fencing this Dart object. The snapshot includes closed-resource
   /// and lifecycle evidence for teardown receipts.
-  /// Throws [PlatformException], [MissingPluginException], or [StateError] if
-  /// native disposal or the required snapshot fails.
+  /// Throws [PlatformException] or [MissingPluginException] on channel failure,
+  /// and [StateError] when no qualifier has been claimed or native omits the
+  /// teardown map/`closedResources`.
   Future<Map<Object?, Object?>> disposeAndSnapshot() async {
     final existing = _disposeFuture;
     if (existing != null) return existing;
@@ -391,7 +391,10 @@ final class ARVisibilityGridV2WorkerBinding {
   /// Uses the independent native abandon/fence path when the serial dispose
   /// call is stalled behind an admitted invocation. Native returns the old
   /// binding's teardown receipt and installs a fresh identity on the channel;
-  /// this object is permanently closed afterward.
+  /// this object is permanently closed afterward. Throws [PlatformException]
+  /// or [MissingPluginException] on channel failure, and [StateError] when no
+  /// qualifier has been claimed or native omits the teardown map/
+  /// `closedResources`.
   Future<Map<Object?, Object?>> abandonAndSnapshot() async {
     final existing = _abandonFuture;
     if (existing != null) return existing;

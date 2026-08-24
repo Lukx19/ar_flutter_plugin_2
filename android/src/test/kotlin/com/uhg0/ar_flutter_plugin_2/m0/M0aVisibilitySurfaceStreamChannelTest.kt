@@ -728,6 +728,66 @@ class M0aVisibilitySurfaceStreamChannelTest {
         binding.dispose()
     }
 
+    @Test
+    fun `abandon fences a late COMMIT before shared baseline publication`() {
+        val authority = M0aCommittedBaselineAuthority()
+        val lifecycle = M0aControlLifecycle(committedBaselineAuthority = authority)
+        val start = controlRequest(M0aControlOperation.START, 0, 91)
+        lifecycle.handle(start, M0aControlCodec.encodeRequest(start))
+        val scope = M0aCommittedBaselineScopeV1.from(start)
+        val messenger = TestMessenger(91)
+        val enteredPublication = CountDownLatch(1)
+        val releasePublication = CountDownLatch(1)
+        val executor = Executors.newSingleThreadExecutor()
+        val binding = M0aVisibilitySurfaceStreamChannel(
+            messenger = messenger,
+            viewId = 91,
+            workerExecutor = executor,
+            shutdownWorkerOnDispose = false,
+            controlLifecycle = lifecycle,
+            beforeAuthorityPublication = {
+                enteredPublication.countDown()
+                while (!releasePublication.await(10, TimeUnit.MILLISECONDS)) {
+                    // Preserve the delayed continuation until the test releases it.
+                }
+            },
+        )
+        binding.queueStructuralTransaction(
+            M0aStructuralTransactionProducerV1.produce(
+                transactionId = 1,
+                baseGeometryRevision = 0,
+                targetGeometryRevision = 1,
+                targetLineageRevision = 1,
+                bytes = byteArrayOf(),
+            ),
+        )
+        val begin = M0aPacketCodec.decodeResponse(messenger.exchange(request(1, 1)))
+        assertEquals(2, begin.messageKind)
+        val commitBytes = arrayOfNulls<ByteArray>(1)
+        val commitCompleted = CountDownLatch(1)
+        messenger.send(
+            "visibility_surface_stream_91",
+            ByteBuffer.wrap(request(2, 1)),
+        ) { response ->
+            commitBytes[0] = response?.let { buffer ->
+                ByteArray(buffer.remaining()).also { buffer.slice().get(it) }
+            }
+            commitCompleted.countDown()
+        }
+        assertTrue(enteredPublication.await(2, TimeUnit.SECONDS))
+
+        binding.abandon()
+        assertTrue(commitCompleted.await(2, TimeUnit.SECONDS))
+        releasePublication.countDown()
+        executor.shutdown()
+        assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS))
+
+        val terminal = M0aPacketCodec.decodeResponse(commitBytes[0]!!)
+        assertEquals(142, terminal.errorId)
+        assertEquals(M0aCommittedBaselineV1.ZERO, authority.snapshot(scope))
+        assertEquals(M0aCommittedBaselineV1.ZERO, lifecycle.committedBaseline())
+    }
+
     private fun request(
         sequence: Long,
         token: Long,
