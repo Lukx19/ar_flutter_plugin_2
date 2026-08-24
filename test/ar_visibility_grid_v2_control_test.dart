@@ -82,6 +82,94 @@ void main() {
     expect(receipt['closedResources'], 3);
     expect(receipt['disposed'], false);
   });
+
+  test('public receipt query returns bounded commit baseline and qualifier',
+      () async {
+    const channel = MethodChannel('visibility_grid_v2_control_83');
+    final currentQualifier = Uint8List.fromList(
+      List<int>.generate(32, (index) => index + 1),
+    );
+    final oldNative = Uint8List.fromList(List<int>.generate(16, (i) => i + 33));
+    final oldWorker = Uint8List.fromList(List<int>.generate(16, (i) => i + 49));
+    Uint8List? observedCurrentQualifier;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      expect(call.method, 'queryCommitReceipt');
+      final arguments = Map<Object?, Object?>.from(call.arguments! as Map);
+      observedCurrentQualifier =
+          arguments['currentBindingQualifier'] as Uint8List;
+      return <String, Object?>{
+        'decision': 'commit',
+        'controlRequestId': '0102030405064708890a0b0c0d0e0f10',
+        'sessionId': '1112131415164718991a1b1c1d1e1f20',
+        'captureGroupId': '2122232425264728a92a2b2c2d2e2f30',
+        'sessionGeneration': 3,
+        'groupGeneration': 4,
+        'nativeStreamToken': oldNative,
+        'workerBindingToken': oldWorker,
+        'streamToken': 7,
+        'requestSequence': 2,
+        'transactionId': 1,
+        'targetGeometryRevision': 1,
+        'targetLineageRevision': 1,
+        'rootIsolateSurfaceBytes': 0,
+        'baseline': <String, Object?>{
+          'transactionId': 1,
+          'geometryRevision': 1,
+          'lineageRevision': 1,
+          'styleRevision': 0,
+          'evidenceRevision': 0,
+          'captureRevision': 0,
+          'coverageRevision': 0,
+          'producedStyleRevision': 0,
+          'regionManifestRevision': 0,
+          'schemaRootRevision': 0,
+          'nextSurfaceIdHighWater': 0,
+          'schemaRootHashIdentity': '',
+          'manifestRootHashIdentity': '',
+          'groupFrameConvention': 1,
+          'matrixConvention': 1,
+          'directionConvention': 1,
+          'normalEncoding': 1,
+          'groupFromWorldIdentity': 'identity',
+          'worldFromGroupIdentity': 'identity',
+        },
+      };
+    });
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null),
+    );
+
+    final control = ARVisibilityGridV2Control(
+      83,
+      channel: channel,
+      initialBindingSnapshot: <Object?, Object?>{
+        'nativeStreamToken': currentQualifier.sublist(0, 16),
+        'workerBindingToken': currentQualifier.sublist(16),
+      },
+    );
+    final receipt = await control.queryCommitReceipt(
+      ARVisibilityGridV2CommitReceiptQuery(
+        controlRequestId: '0102030405064708890a0b0c0d0e0f10',
+        sessionId: '1112131415164718991a1b1c1d1e1f20',
+        captureGroupId: '2122232425264728a92a2b2c2d2e2f30',
+        sessionGeneration: 3,
+        groupGeneration: 4,
+        nativeStreamToken: oldNative,
+        workerBindingToken: oldWorker,
+        streamToken: 7,
+        requestSequence: 2,
+        transactionId: 1,
+        targetGeometryRevision: 1,
+        targetLineageRevision: 1,
+      ),
+    );
+    expect(receipt.committed, isTrue);
+    expect(receipt.baseline.geometryRevision, 1);
+    expect(receipt.rootIsolateSurfaceBytes, 0);
+    expect(observedCurrentQualifier, currentQualifier);
+  });
 }
 
 bool _sameBytes(List<int> left, List<int> right) {

@@ -4,6 +4,7 @@ import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineAuthority
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlCodec
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlOperation
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlRequest
+import com.uhg0.ar_flutter_plugin_2.m0.M0aPacketCodec
 import com.uhg0.ar_flutter_plugin_2.m0.M0aStartRequestCodecV2
 import com.uhg0.ar_flutter_plugin_2.m0.M0aUuid
 import io.flutter.plugin.common.BinaryMessenger
@@ -19,6 +20,113 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VisibilityGridV2BindingTest {
+    @Test
+    fun `exact receipt query reports commit winner and rejects stale replay qualification`() {
+        val messenger = MethodTestMessenger()
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 83,
+            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            postToMain = { task -> task() },
+        )
+        val channel = MethodChannel(messenger, "visibility_grid_v2_control_83")
+        val original = binding.snapshot()
+        val qualifier = original.nativeStreamToken + original.workerBindingToken
+        val start = RecordingResult()
+        channel.invokeMethod(
+            "start",
+            qualifier + M0aControlCodec.encodeRequest(startRequest()),
+            start,
+        )
+        assertTrue(start.completed.await(2, TimeUnit.SECONDS))
+        val startResponse = M0aControlCodec.decodeResponse(
+            stripQualifier(start.successValue as ByteArray, qualifier),
+        )
+        val streamToken = startResponse.streamToken
+
+        fun exchange(sequence: Long): M0aPacketCodec.Response {
+            val response = RecordingBinaryReply()
+            messenger.send(
+                "visibility_surface_stream_83",
+                ByteBuffer.wrap(
+                    qualifier + M0aPacketCodec.encodeRequest(
+                        M0aPacketCodec.Request(
+                            requestFlags = 0,
+                            streamToken = streamToken,
+                            acknowledgedTransactionId = 0,
+                            acknowledgedGeometryRevision = 0,
+                            acknowledgedLineageRevision = 0,
+                            nextStyleRevision = 0,
+                            maximumResponseBytes = 4096,
+                            styleRecords = emptyList(),
+                            commandBytes = byteArrayOf(),
+                            requestSequence = sequence,
+                        ),
+                    ),
+                ),
+                response,
+            )
+            assertTrue(response.completed.await(2, TimeUnit.SECONDS))
+            return M0aPacketCodec.decodeResponse(stripQualifier(response.bytes!!, qualifier))
+        }
+
+        assertEquals(2, exchange(1).messageKind)
+        assertEquals(4, exchange(2).messageKind)
+
+        fun query(targetGeometry: Long = 1): RecordingResult {
+            val result = RecordingResult()
+            channel.invokeMethod(
+                "queryCommitReceipt",
+                mapOf(
+                    "currentBindingQualifier" to qualifier,
+                    "controlRequestId" to startRequest().controlRequestId.hex(),
+                    "sessionId" to startRequest().sessionId.hex(),
+                    "captureGroupId" to startRequest().captureGroupId.hex(),
+                    "sessionGeneration" to 3L,
+                    "groupGeneration" to 4L,
+                    "nativeStreamToken" to qualifier.copyOfRange(0, 16),
+                    "workerBindingToken" to qualifier.copyOfRange(16, 32),
+                    "streamToken" to streamToken,
+                    "requestSequence" to 2L,
+                    "transactionId" to 1L,
+                    "targetGeometryRevision" to targetGeometry,
+                    "targetLineageRevision" to 1L,
+                ),
+                result,
+            )
+            assertTrue(result.completed.await(2, TimeUnit.SECONDS))
+            return result
+        }
+
+        val first = query()
+        assertEquals(1, first.successCount)
+        val firstMap = first.successValue as Map<*, *>
+        assertEquals("commit", firstMap["decision"])
+        assertEquals(0L, firstMap["rootIsolateSurfaceBytes"])
+        val baseline = firstMap["baseline"] as Map<*, *>
+        assertEquals(1L, baseline["transactionId"])
+        assertEquals(1L, baseline["geometryRevision"])
+        assertEquals(1L, baseline["lineageRevision"])
+
+        val replay = query()
+        assertEquals(1, replay.successCount)
+        val replayMap = replay.successValue as Map<*, *>
+        assertEquals(firstMap["decision"], replayMap["decision"])
+        assertEquals(firstMap["transactionId"], replayMap["transactionId"])
+        assertEquals(firstMap["baseline"], replayMap["baseline"])
+        assertArrayEquals(
+            firstMap["nativeStreamToken"] as ByteArray,
+            replayMap["nativeStreamToken"] as ByteArray,
+        )
+
+        val stale = query(targetGeometry = 2)
+        assertEquals(1, stale.errorCount)
+        assertEquals("VG_STALE_RECEIPT", stale.errorCode)
+        assertEquals(1L, binding.snapshot().streamToken)
+        assertEquals(false, binding.snapshot().disposed)
+        binding.dispose()
+    }
+
     @Test
     fun `abandon fences delayed START publication and preserves the view and group cut`() {
         val messenger = MethodTestMessenger()
@@ -101,6 +209,12 @@ class VisibilityGridV2BindingTest {
     private fun M0aUuid.hex(): String = bytes.joinToString("") { byte ->
         "%02x".format(byte.toInt() and 0xff)
     }
+
+    private fun stripQualifier(bytes: ByteArray, qualifier: ByteArray): ByteArray {
+        assertTrue(bytes.size >= qualifier.size)
+        assertArrayEquals(qualifier, bytes.copyOfRange(0, qualifier.size))
+        return bytes.copyOfRange(qualifier.size, bytes.size)
+    }
 }
 
 private class RecordingResult : MethodChannel.Result {
@@ -123,6 +237,19 @@ private class RecordingResult : MethodChannel.Result {
     }
 
     override fun notImplemented() {
+        completed.countDown()
+    }
+}
+
+private class RecordingBinaryReply : BinaryMessenger.BinaryReply {
+    val completed = CountDownLatch(1)
+    var bytes: ByteArray? = null
+
+    override fun reply(reply: ByteBuffer?) {
+        bytes = reply?.duplicate()?.let { buffer ->
+            if (buffer.position() > 0) buffer.flip()
+            ByteArray(buffer.remaining()).also { buffer.get(it) }
+        }
         completed.countDown()
     }
 }

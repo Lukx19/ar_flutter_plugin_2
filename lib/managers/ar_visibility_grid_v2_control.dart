@@ -5,6 +5,265 @@ import 'package:flutter/services.dart';
 
 import 'ar_visibility_surface_stream.dart';
 
+/// The winner of one identity-qualified, outcome-unknown COMMIT attempt.
+enum ARVisibilityGridV2CommitDecision { commit, abandon }
+
+/// Exact bounded qualification for a COMMIT receipt query.
+///
+/// The binding tokens identify the old runtime binding whose response was
+/// lost. The manager adds its current binding qualifier privately when it
+/// sends the query, so a stale control object cannot query a replacement.
+final class ARVisibilityGridV2CommitReceiptQuery {
+  const ARVisibilityGridV2CommitReceiptQuery({
+    required this.controlRequestId,
+    required this.sessionId,
+    required this.captureGroupId,
+    required this.sessionGeneration,
+    required this.groupGeneration,
+    required this.nativeStreamToken,
+    required this.workerBindingToken,
+    required this.streamToken,
+    required this.requestSequence,
+    required this.transactionId,
+    required this.targetGeometryRevision,
+    required this.targetLineageRevision,
+  });
+
+  final String controlRequestId;
+  final String sessionId;
+  final String captureGroupId;
+  final int sessionGeneration;
+  final int groupGeneration;
+  final Uint8List nativeStreamToken;
+  final Uint8List workerBindingToken;
+  final int streamToken;
+  final int requestSequence;
+  final int transactionId;
+  final int targetGeometryRevision;
+  final int targetLineageRevision;
+
+  Map<String, Object?> toMap() => <String, Object?>{
+        'controlRequestId': controlRequestId,
+        'sessionId': sessionId,
+        'captureGroupId': captureGroupId,
+        'sessionGeneration': sessionGeneration,
+        'groupGeneration': groupGeneration,
+        'nativeStreamToken': Uint8List.fromList(nativeStreamToken),
+        'workerBindingToken': Uint8List.fromList(workerBindingToken),
+        'streamToken': streamToken,
+        'requestSequence': requestSequence,
+        'transactionId': transactionId,
+        'targetGeometryRevision': targetGeometryRevision,
+        'targetLineageRevision': targetLineageRevision,
+      };
+}
+
+/// Complete native baseline returned by an exact COMMIT receipt query.
+final class ARVisibilityGridV2CommittedBaseline {
+  const ARVisibilityGridV2CommittedBaseline({
+    required this.transactionId,
+    required this.geometryRevision,
+    required this.lineageRevision,
+    required this.styleRevision,
+    required this.evidenceRevision,
+    required this.captureRevision,
+    required this.coverageRevision,
+    required this.producedStyleRevision,
+    required this.regionManifestRevision,
+    required this.schemaRootRevision,
+    required this.nextSurfaceIdHighWater,
+    required this.schemaRootHashIdentity,
+    required this.manifestRootHashIdentity,
+    required this.groupFrameConvention,
+    required this.matrixConvention,
+    required this.directionConvention,
+    required this.normalEncoding,
+    required this.groupFromWorldIdentity,
+    required this.worldFromGroupIdentity,
+  });
+
+  final int transactionId;
+  final int geometryRevision;
+  final int lineageRevision;
+  final int styleRevision;
+  final int evidenceRevision;
+  final int captureRevision;
+  final int coverageRevision;
+  final int producedStyleRevision;
+  final int regionManifestRevision;
+  final int schemaRootRevision;
+  final int nextSurfaceIdHighWater;
+  final String schemaRootHashIdentity;
+  final String manifestRootHashIdentity;
+  final int groupFrameConvention;
+  final int matrixConvention;
+  final int directionConvention;
+  final int normalEncoding;
+  final String groupFromWorldIdentity;
+  final String worldFromGroupIdentity;
+
+  static ARVisibilityGridV2CommittedBaseline fromMap(Object? raw) {
+    if (raw is! Map) throw StateError('V2 receipt omitted its baseline.');
+    final map = Map<Object?, Object?>.from(raw);
+    String string(String key) {
+      final value = map[key];
+      if (value is! String || value.length > 1024) {
+        throw StateError('V2 receipt baseline field $key is invalid.');
+      }
+      return value;
+    }
+
+    return ARVisibilityGridV2CommittedBaseline(
+      transactionId: _receiptInt(map, 'transactionId'),
+      geometryRevision: _receiptInt(map, 'geometryRevision'),
+      lineageRevision: _receiptInt(map, 'lineageRevision'),
+      styleRevision: _receiptInt(map, 'styleRevision'),
+      evidenceRevision: _receiptInt(map, 'evidenceRevision'),
+      captureRevision: _receiptInt(map, 'captureRevision'),
+      coverageRevision: _receiptInt(map, 'coverageRevision'),
+      producedStyleRevision: _receiptInt(map, 'producedStyleRevision'),
+      regionManifestRevision: _receiptInt(map, 'regionManifestRevision'),
+      schemaRootRevision: _receiptInt(map, 'schemaRootRevision'),
+      nextSurfaceIdHighWater: _receiptInt(map, 'nextSurfaceIdHighWater'),
+      schemaRootHashIdentity: string('schemaRootHashIdentity'),
+      manifestRootHashIdentity: string('manifestRootHashIdentity'),
+      groupFrameConvention: _receiptInt(map, 'groupFrameConvention'),
+      matrixConvention: _receiptInt(map, 'matrixConvention'),
+      directionConvention: _receiptInt(map, 'directionConvention'),
+      normalEncoding: _receiptInt(map, 'normalEncoding'),
+      groupFromWorldIdentity: string('groupFromWorldIdentity'),
+      worldFromGroupIdentity: string('worldFromGroupIdentity'),
+    );
+  }
+}
+
+/// Read-only outcome and scalar evidence for one exact COMMIT attempt.
+final class ARVisibilityGridV2CommitReceipt {
+  const ARVisibilityGridV2CommitReceipt({
+    required this.decision,
+    required this.controlRequestId,
+    required this.sessionId,
+    required this.captureGroupId,
+    required this.sessionGeneration,
+    required this.groupGeneration,
+    required this.nativeStreamToken,
+    required this.workerBindingToken,
+    required this.streamToken,
+    required this.requestSequence,
+    required this.transactionId,
+    required this.targetGeometryRevision,
+    required this.targetLineageRevision,
+    required this.baseline,
+    required this.rootIsolateSurfaceBytes,
+  });
+
+  final ARVisibilityGridV2CommitDecision decision;
+  final String controlRequestId;
+  final String sessionId;
+  final String captureGroupId;
+  final int sessionGeneration;
+  final int groupGeneration;
+  final Uint8List nativeStreamToken;
+  final Uint8List workerBindingToken;
+  final int streamToken;
+  final int requestSequence;
+  final int transactionId;
+  final int targetGeometryRevision;
+  final int targetLineageRevision;
+  final ARVisibilityGridV2CommittedBaseline baseline;
+  final int rootIsolateSurfaceBytes;
+
+  bool get committed => decision == ARVisibilityGridV2CommitDecision.commit;
+
+  /// Whether this receipt is the exact identity that was queried.
+  bool matchesQuery(ARVisibilityGridV2CommitReceiptQuery query) =>
+      controlRequestId == query.controlRequestId &&
+      sessionId == query.sessionId &&
+      captureGroupId == query.captureGroupId &&
+      sessionGeneration == query.sessionGeneration &&
+      groupGeneration == query.groupGeneration &&
+      _bytesEqual(nativeStreamToken, query.nativeStreamToken) &&
+      _bytesEqual(workerBindingToken, query.workerBindingToken) &&
+      streamToken == query.streamToken &&
+      requestSequence == query.requestSequence &&
+      transactionId == query.transactionId &&
+      targetGeometryRevision == query.targetGeometryRevision &&
+      targetLineageRevision == query.targetLineageRevision;
+
+  static ARVisibilityGridV2CommitReceipt fromMap(Object? raw) {
+    if (raw is! Map) throw StateError('V2 receipt was not a map.');
+    final map = Map<Object?, Object?>.from(raw);
+    final decision = switch (map['decision']) {
+      'commit' => ARVisibilityGridV2CommitDecision.commit,
+      'abandon' => ARVisibilityGridV2CommitDecision.abandon,
+      _ => throw StateError('V2 receipt decision is invalid.'),
+    };
+    String string(String key) {
+      final value = map[key];
+      if (value is! String || value.length > 128) {
+        throw StateError('V2 receipt field $key is invalid.');
+      }
+      return value;
+    }
+
+    Uint8List token(String key) {
+      final value = map[key];
+      if (value is! Uint8List || value.length != 16) {
+        throw StateError('V2 receipt token $key is invalid.');
+      }
+      return Uint8List.fromList(value);
+    }
+
+    final rootBytes = _receiptInt(map, 'rootIsolateSurfaceBytes');
+    if (rootBytes != 0) {
+      throw StateError('V2 receipt exposed ordinary root-isolate bytes.');
+    }
+    final receipt = ARVisibilityGridV2CommitReceipt(
+      decision: decision,
+      controlRequestId: string('controlRequestId'),
+      sessionId: string('sessionId'),
+      captureGroupId: string('captureGroupId'),
+      sessionGeneration: _receiptInt(map, 'sessionGeneration'),
+      groupGeneration: _receiptInt(map, 'groupGeneration'),
+      nativeStreamToken: token('nativeStreamToken'),
+      workerBindingToken: token('workerBindingToken'),
+      streamToken: _receiptInt(map, 'streamToken'),
+      requestSequence: _receiptInt(map, 'requestSequence'),
+      transactionId: _receiptInt(map, 'transactionId'),
+      targetGeometryRevision: _receiptInt(map, 'targetGeometryRevision'),
+      targetLineageRevision: _receiptInt(map, 'targetLineageRevision'),
+      baseline: ARVisibilityGridV2CommittedBaseline.fromMap(map['baseline']),
+      rootIsolateSurfaceBytes: rootBytes,
+    );
+    if (receipt.committed &&
+        (receipt.baseline.transactionId != receipt.transactionId ||
+            receipt.baseline.geometryRevision !=
+                receipt.targetGeometryRevision ||
+            receipt.baseline.lineageRevision !=
+                receipt.targetLineageRevision)) {
+      throw StateError('V2 COMMIT receipt baseline does not match its query.');
+    }
+    if (!receipt.committed &&
+        (receipt.baseline.transactionId != 0 ||
+            receipt.baseline.geometryRevision != 0 ||
+            receipt.baseline.lineageRevision != 0)) {
+      throw StateError('V2 abandon receipt exposed a committed baseline.');
+    }
+    return receipt;
+  }
+}
+
+int _receiptInt(Map<Object?, Object?> map, String key) {
+  final value = map[key];
+  if (value is! num ||
+      !value.isFinite ||
+      value < 0 ||
+      value != value.truncate()) {
+    throw StateError('V2 receipt field $key is invalid.');
+  }
+  return value.toInt();
+}
+
 /// Packed debug control endpoint for the Proposal 08 M0a reference seam.
 ///
 /// Each invocation is one VGC2 request and returns one VGD2 response. The V1
@@ -84,6 +343,38 @@ final class ARVisibilityGridV2Control {
   /// Throws [PlatformException] or [MissingPluginException] when the platform
   /// channel fails, and [StateError] when native returns a non-byte response.
   Future<Uint8List> stop(Uint8List request) => _invoke('stop', request);
+
+  /// Reconciles an outcome-unknown COMMIT against native's exact receipt.
+  ///
+  /// [query] must identify the old binding and accepted group/control cut.
+  /// The connection-time qualifier of this control is added privately. The
+  /// bounded result is either the authoritative committed baseline or an
+  /// explicit zero abandon decision; it never mutates lifecycle or cursors.
+  /// Throws [PlatformException] for a stale/malformed qualification and
+  /// [StateError] for a malformed scalar response. The result contains zero
+  /// ordinary root-isolate surface bytes.
+  Future<ARVisibilityGridV2CommitReceipt> queryCommitReceipt(
+    ARVisibilityGridV2CommitReceiptQuery query,
+  ) async {
+    if (_closed) throw StateError('V2 control is closed.');
+    await _bindingReady;
+    final qualifier = _bindingQualifier;
+    if (qualifier == null) {
+      throw StateError('V2 control has not claimed native tokens.');
+    }
+    final response = await _channel.invokeMethod<Object?>(
+      'queryCommitReceipt',
+      <String, Object?>{
+        ...query.toMap(),
+        'currentBindingQualifier': Uint8List.fromList(qualifier),
+      },
+    );
+    final receipt = ARVisibilityGridV2CommitReceipt.fromMap(response);
+    if (!receipt.matchesQuery(query)) {
+      throw StateError('V2 receipt identity does not match its query.');
+    }
+    return receipt;
+  }
 
   Future<Uint8List> _invoke(String method, Uint8List request) async {
     final response = await _channel.invokeMethod<Object?>(method, request);
@@ -285,6 +576,31 @@ final class ARVisibilityGridV2WorkerBinding {
   /// propagates [PlatformException] or [MissingPluginException].
   Future<Uint8List> stop(Uint8List request) =>
       _control(_V2Control.stop, request);
+
+  /// Queries the bounded native receipt for one outcome-unknown COMMIT.
+  ///
+  /// The query is read-only and identity-qualified by both this fresh
+  /// binding's private qualifier and [query]'s old binding tokens. It returns
+  /// the exact COMMIT baseline or an abandon-wins zero baseline, with no
+  /// ordinary surface payload. Stale/mismatched qualification is reported as
+  /// [PlatformException]; malformed scalar replies throw [StateError].
+  Future<ARVisibilityGridV2CommitReceipt> queryCommitReceipt(
+    ARVisibilityGridV2CommitReceiptQuery query,
+  ) async {
+    _ensureOpen();
+    final response = await _controlChannel.invokeMethod<Object?>(
+      'queryCommitReceipt',
+      <String, Object?>{
+        ...query.toMap(),
+        'currentBindingQualifier': _requireQualifier(),
+      },
+    );
+    final receipt = ARVisibilityGridV2CommitReceipt.fromMap(response);
+    if (!receipt.matchesQuery(query)) {
+      throw StateError('V2 receipt identity does not match its query.');
+    }
+    return receipt;
+  }
 
   /// Throws [StateError] if closed or native returns a non-byte response.
   /// Throws [PlatformException] or [MissingPluginException] on channel failure.

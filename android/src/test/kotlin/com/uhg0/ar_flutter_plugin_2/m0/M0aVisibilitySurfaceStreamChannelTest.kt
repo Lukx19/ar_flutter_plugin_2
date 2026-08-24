@@ -867,6 +867,40 @@ class M0aVisibilitySurfaceStreamChannelTest {
         assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS))
     }
 
+    @Test
+    fun `receipt query distinguishes abandon winner without mutating baseline`() {
+        val authority = M0aCommittedBaselineAuthority()
+        val scope = M0aCommittedBaselineScopeV1(
+            sessionId = uuid(94),
+            captureGroupId = uuid(95),
+            sessionGeneration = 3,
+            groupGeneration = 4,
+        )
+        val query = M0aCommitReceiptQueryV1(
+            controlRequestId = uuid(96),
+            scope = scope,
+            nativeStreamToken = ByteArray(16) { (it + 1).toByte() },
+            workerBindingToken = ByteArray(16) { (it + 17).toByte() },
+            streamToken = 7,
+            requestSequence = 2,
+            transactionId = 1,
+            targetGeometryRevision = 1,
+            targetLineageRevision = 1,
+        )
+        val before = authority.snapshot(scope)
+        authority.publishAbandon(query)
+
+        val first = checkNotNull(authority.queryReceipt(query))
+        val replay = checkNotNull(authority.queryReceipt(query))
+        assertEquals(false, first.committed)
+        assertEquals(M0aCommittedBaselineV1.ZERO, first.baseline)
+        assertEquals(first, replay)
+        assertEquals(before, authority.snapshot(scope))
+
+        val stale = query.copy(targetGeometryRevision = 2)
+        assertEquals(null, authority.queryReceipt(stale))
+    }
+
     private fun request(
         sequence: Long,
         token: Long,

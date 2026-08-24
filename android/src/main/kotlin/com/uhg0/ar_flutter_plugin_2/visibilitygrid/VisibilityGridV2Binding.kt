@@ -3,10 +3,15 @@ package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 import android.os.Handler
 import android.os.Looper
 import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineAuthority
+import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineScopeV1
+import com.uhg0.ar_flutter_plugin_2.m0.M0aCommitReceiptQueryV1
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlCodec
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlLifecycle
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlOperation
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlRequest
+import com.uhg0.ar_flutter_plugin_2.m0.M0aPacketCodec
+import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineV1
+import com.uhg0.ar_flutter_plugin_2.m0.toMap
 import com.uhg0.ar_flutter_plugin_2.m0.M0aUuid
 import com.uhg0.ar_flutter_plugin_2.m0.M0aStructuralTransactionProducerV1
 import com.uhg0.ar_flutter_plugin_2.m0.M0aVisibilitySurfaceStreamChannel
@@ -95,6 +100,16 @@ class VisibilityGridV2Binding internal constructor(
         onExecutorOperation = ::recordExecutorOperation,
         bindingQualifier = bindingQualifier(),
         beforeWorkerProcessing = debugRecoverySeam::beforeExchange,
+        onCommitPublished = { request, baseline ->
+            activeReceiptQuery(request, baseline)?.let { query ->
+                committedBaselineAuthority.publishCommit(query, baseline)
+            }
+        },
+        onAbandonedRequest = { request, targetBaseline ->
+            activeReceiptQuery(request, targetBaseline)?.let { query ->
+                committedBaselineAuthority.publishAbandon(query)
+            }
+        },
         onAbandonedContinuation = debugRecoverySeam::oldContinuationFenced,
     )
 
@@ -211,6 +226,10 @@ class VisibilityGridV2Binding internal constructor(
             }
             return
         }
+        if (call.method == "queryCommitReceipt") {
+            queryCommitReceipt(call, result)
+            return
+        }
         val operation = when (call.method) {
             "start" -> M0aControlOperation.START
             "beginCheckpoint" -> M0aControlOperation.BEGIN_CHECKPOINT
@@ -303,6 +322,64 @@ class VisibilityGridV2Binding internal constructor(
         ) {
             throw BindingAbandonedException()
         }
+    }
+
+    private fun queryCommitReceipt(call: MethodCall, result: MethodChannel.Result) {
+        val arguments = call.arguments as? Map<*, *>
+        if (arguments == null || !qualifierMatches(arguments["currentBindingQualifier"] as? ByteArray)) {
+            result.error("VG_STREAM_BINDING_ABANDONED", "V2 binding token mismatch", null)
+            return
+        }
+        try {
+            val query = M0aCommitReceiptQueryV1(
+                controlRequestId = parseUuid(arguments.requiredString("controlRequestId")),
+                scope = M0aCommittedBaselineScopeV1(
+                    sessionId = parseUuid(arguments.requiredString("sessionId")),
+                    captureGroupId = parseUuid(arguments.requiredString("captureGroupId")),
+                    sessionGeneration = arguments.requiredLong("sessionGeneration"),
+                    groupGeneration = arguments.requiredLong("groupGeneration"),
+                ),
+                nativeStreamToken = arguments.requiredToken("nativeStreamToken"),
+                workerBindingToken = arguments.requiredToken("workerBindingToken"),
+                streamToken = arguments.requiredLong("streamToken"),
+                requestSequence = arguments.requiredLong("requestSequence"),
+                transactionId = arguments.requiredLong("transactionId"),
+                targetGeometryRevision = arguments.requiredLong("targetGeometryRevision"),
+                targetLineageRevision = arguments.requiredLong("targetLineageRevision"),
+            )
+            val receipt = committedBaselineAuthority.queryReceipt(query)
+                ?: throw StaleReceiptException()
+            result.success(receipt.toMap())
+        } catch (_: StaleReceiptException) {
+            result.error("VG_STALE_RECEIPT", "V2 receipt qualification is stale", null)
+        } catch (error: Exception) {
+            result.error("VG_PROTOCOL_INVALID", error.message, null)
+        }
+    }
+
+    private fun activeReceiptQuery(
+        request: M0aPacketCodec.Request,
+        targetBaseline: M0aCommittedBaselineV1,
+    ): M0aCommitReceiptQueryV1? {
+        val controlRequestId = activeControlRequestId ?: return null
+        val sessionId = activeSessionId ?: return null
+        val captureGroupId = activeCaptureGroupId ?: return null
+        return M0aCommitReceiptQueryV1(
+            controlRequestId = controlRequestId,
+            scope = M0aCommittedBaselineScopeV1(
+                sessionId = sessionId,
+                captureGroupId = captureGroupId,
+                sessionGeneration = activeSessionGeneration,
+                groupGeneration = activeGroupGeneration,
+            ),
+            nativeStreamToken = nativeStreamToken.copyOf(),
+            workerBindingToken = workerBindingToken.copyOf(),
+            streamToken = request.streamToken,
+            requestSequence = request.requestSequence,
+            transactionId = targetBaseline.transactionId,
+            targetGeometryRevision = targetBaseline.geometryRevision,
+            targetLineageRevision = targetBaseline.lineageRevision,
+        )
     }
 
     @Synchronized
@@ -473,6 +550,8 @@ class VisibilityGridV2Binding internal constructor(
 
     private class BindingAbandonedException : IllegalStateException("V2 binding is abandoned")
 
+    private class StaleReceiptException : IllegalStateException()
+
     internal data class RecoveryGroupCut(
         val sessionId: M0aUuid?,
         val captureGroupId: M0aUuid?,
@@ -518,6 +597,26 @@ class VisibilityGridV2Binding internal constructor(
                 .array()
         }
     }
+}
+
+private fun Map<*, *>.requiredString(key: String): String =
+    this[key] as? String ?: error("V2 receipt field $key is not a string")
+
+private fun Map<*, *>.requiredLong(key: String): Long =
+    (this[key] as? Number)?.toLong() ?: error("V2 receipt field $key is not numeric")
+
+private fun Map<*, *>.requiredToken(key: String): ByteArray {
+    val value = this[key] as? ByteArray ?: error("V2 receipt field $key is not bytes")
+    require(value.size == 16) { "V2 receipt field $key must be 16 bytes" }
+    return value.copyOf()
+}
+
+private fun parseUuid(value: String): M0aUuid {
+    require(value.length == 32) { "V2 receipt UUID must be 32 hex characters" }
+    val bytes = ByteArray(16) { index ->
+        value.substring(index * 2, index * 2 + 2).toInt(16).toByte()
+    }
+    return M0aUuid(bytes)
 }
 
 internal class VisibilityGridV2DebugRecoverySeam {

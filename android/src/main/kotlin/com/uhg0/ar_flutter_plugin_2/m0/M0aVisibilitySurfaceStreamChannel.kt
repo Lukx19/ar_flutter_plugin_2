@@ -65,6 +65,8 @@ class M0aVisibilitySurfaceStreamChannel(
     private val bindingQualifier: ByteArray? = null,
     private val beforeAuthorityPublication: (() -> Unit)? = null,
     private val afterAuthorityPublicationFenceAcquired: (() -> Unit)? = null,
+    private val onCommitPublished: ((M0aPacketCodec.Request, M0aCommittedBaselineV1) -> Unit)? = null,
+    private val onAbandonedRequest: ((M0aPacketCodec.Request, M0aCommittedBaselineV1) -> Unit)? = null,
     private val onAbandonedContinuation: (() -> Unit)? = null,
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -344,6 +346,7 @@ class M0aVisibilitySurfaceStreamChannel(
                                                 }
                                                 if (publishesCommit) {
                                                     publicationClaimedReply = true
+                                                    onCommitPublished?.invoke(request, committedBaseline)
                                                 }
                                                 publicationBytes
                                             }
@@ -479,6 +482,12 @@ class M0aVisibilitySurfaceStreamChannel(
         val claim = claimAbandonFence(activePendingReply)
         if (!claim.won) return
         claim.pendingReply?.let { pendingReply ->
+            onAbandonedRequest?.invoke(
+                M0aPacketCodec.decodeRequest(pendingReply.requestBytes),
+                pendingCommitBaseline(),
+            )
+        }
+        claim.pendingReply?.let { pendingReply ->
             pendingReply.reply(workerAbandonedResponse(pendingReply.requestBytes))
         }
         transactionReceiver.abandon()
@@ -497,6 +506,7 @@ class M0aVisibilitySurfaceStreamChannel(
         }
         val claim = claimAbandonFence(pendingReply)
         if (!claim.won) return
+        onAbandonedRequest?.invoke(M0aPacketCodec.decodeRequest(bytes), pendingCommitBaseline())
         telemetry.timedOut()
         transactionReceiver.abandon()
         controlLifecycle?.abandon()
@@ -514,6 +524,9 @@ class M0aVisibilitySurfaceStreamChannel(
             val claimed = pendingReply.tryClaim()
             bindingAbandoned.set(true)
             claimed
+        }
+        if (ownsReply) {
+            onAbandonedRequest?.invoke(M0aPacketCodec.decodeRequest(bytes), pendingCommitBaseline())
         }
         telemetry.workerLost()
         transactionReceiver.abandon()
@@ -551,6 +564,10 @@ class M0aVisibilitySurfaceStreamChannel(
                 throw IllegalStateException("Interrupted clearing binding handler.", error)
             }
         }
+    }
+
+    private fun pendingCommitBaseline(): M0aCommittedBaselineV1 = synchronized(this) {
+        queuedTransactionBaseline ?: committedBaseline
     }
 
     private data class AbandonClaim(
