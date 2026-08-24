@@ -59,6 +59,11 @@ class VisibilityGridV2Binding(
     private var executorOrdinal = 0L
     private var lifecycleSequence = nextLifecycleSequence.incrementAndGet()
     private var operationGeneration = 0L
+    // This binding never owns a root-isolate surface. Keep the measured count
+    // in the native snapshot rather than manufacturing a Dart-side constant;
+    // a future owned surface route can increment this counter on the same
+    // serial executor.
+    private var rootIsolateSurfaceBytes = 0L
     private val executorTrace = ArrayDeque<String>()
 
     private fun newLifecycle() = M0aControlLifecycle(
@@ -97,6 +102,7 @@ class VisibilityGridV2Binding(
         val viewGeneration: Long,
         val lifecycleSequence: Long,
         val operationGeneration: Long,
+        val rootIsolateSurfaceBytes: Long,
         val executorTrace: List<String>,
     )
 
@@ -120,6 +126,7 @@ class VisibilityGridV2Binding(
         viewGeneration = currentBindingGeneration,
         lifecycleSequence = lifecycleSequence,
         operationGeneration = operationGeneration,
+        rootIsolateSurfaceBytes = rootIsolateSurfaceBytes,
         executorTrace = executorTrace.toList(),
     )
 
@@ -150,7 +157,7 @@ class VisibilityGridV2Binding(
                                 "viewGeneration" to snapshot.viewGeneration,
                                 "lifecycleSequence" to snapshot.lifecycleSequence,
                                 "operationGeneration" to snapshot.operationGeneration,
-                                "rootIsolateSurfaceBytes" to 0L,
+                                "rootIsolateSurfaceBytes" to snapshot.rootIsolateSurfaceBytes,
                                 "executorTrace" to snapshot.executorTrace,
                             ),
                         )
@@ -258,6 +265,7 @@ class VisibilityGridV2Binding(
         workerBindingToken = newOpaqueToken()
         lifecycleSequence = nextLifecycleSequence.incrementAndGet()
         operationGeneration = 0L
+        rootIsolateSurfaceBytes = 0L
         initialTransactionQueued = false
         acceptedControls = 0L
         activeControlRequestId = null
