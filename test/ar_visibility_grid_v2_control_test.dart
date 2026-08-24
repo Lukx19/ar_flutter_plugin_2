@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'dart:typed_data';
+
 import 'package:ar_flutter_plugin_2/managers/ar_visibility_grid_v2_control.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -79,6 +82,104 @@ void main() {
     expect(disposalQualifier, currentQualifier);
     expect(receipt['closedResources'], 3);
     expect(receipt['disposed'], false);
+  });
+
+  test('concurrent public dispose calls share one native rotation', () async {
+    const channel = MethodChannel('visibility_grid_v2_control_43');
+    final invocationEntered = Completer<void>();
+    final completion = Completer<Object?>();
+    var invocationCount = 0;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      expect(call.method, 'disposeBinding');
+      invocationCount++;
+      if (!invocationEntered.isCompleted) invocationEntered.complete();
+      return completion.future;
+    });
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null),
+    );
+
+    final control = ARVisibilityGridV2Control(
+      43,
+      channel: channel,
+      initialBindingSnapshot: <Object?, Object?>{
+        'nativeStreamToken': Uint8List(16),
+        'workerBindingToken': Uint8List.fromList(
+          List<int>.filled(16, 1),
+        ),
+      },
+    );
+    final first = control.dispose();
+    final second = control.dispose();
+
+    expect(identical(first, second), isTrue);
+    await invocationEntered.future;
+    expect(invocationCount, 1);
+
+    completion.complete(<String, Object?>{
+      'closedResources': 2,
+      'bindingGeneration': 7,
+      'nativeStreamToken': Uint8List(16),
+    });
+    final firstReceipt = await first;
+    final secondReceipt = await second;
+    expect(identical(firstReceipt, secondReceipt), isTrue);
+    expect(firstReceipt['closedResources'], 2);
+    expect(firstReceipt['bindingGeneration'], 7);
+  });
+
+  test('concurrent public dispose calls share one native failure', () async {
+    const channel = MethodChannel('visibility_grid_v2_control_44');
+    final invocationEntered = Completer<void>();
+    var invocationCount = 0;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      expect(call.method, 'disposeBinding');
+      invocationCount++;
+      if (!invocationEntered.isCompleted) invocationEntered.complete();
+      throw PlatformException(
+        code: 'VG_STREAM_BINDING_ABANDONED',
+        message: 'V2 binding token mismatch',
+      );
+    });
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null),
+    );
+
+    final control = ARVisibilityGridV2Control(
+      44,
+      channel: channel,
+      initialBindingSnapshot: <Object?, Object?>{
+        'nativeStreamToken': Uint8List(16),
+        'workerBindingToken': Uint8List.fromList(
+          List<int>.filled(16, 1),
+        ),
+      },
+    );
+    final first = control.dispose();
+    final second = control.dispose();
+    expect(identical(first, second), isTrue);
+    await invocationEntered.future;
+
+    Future<void> expectFailure(Future<Map<Object?, Object?>> operation) async {
+      await expectLater(
+        operation,
+        throwsA(
+          isA<PlatformException>().having(
+            (error) => error.code,
+            'code',
+            'VG_STREAM_BINDING_ABANDONED',
+          ),
+        ),
+      );
+    }
+
+    await expectFailure(first);
+    await expectFailure(second);
+    expect(invocationCount, 1);
   });
 
   test('public receipt query returns bounded commit baseline and qualifier',

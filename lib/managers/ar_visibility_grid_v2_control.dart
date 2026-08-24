@@ -526,6 +526,7 @@ final class ARVisibilityGridV2Control {
   late final Future<void> _bindingReady;
   Uint8List? _bindingQualifier;
   Map<Object?, Object?>? _disposeReceipt;
+  Future<Map<Object?, Object?>>? _disposeFuture;
   bool _closed = false;
 
   /// Completes after the connection-time native identity snapshot has been
@@ -695,7 +696,17 @@ final class ARVisibilityGridV2Control {
   /// Returns the native teardown map. It contains the old binding's scalar
   /// identity and lifecycle fields plus numeric `closedResources`; it never
   /// contains structural surface payloads.
-  Future<Map<Object?, Object?>> dispose() async {
+  /// Concurrent calls for this control share one terminal Future, receipt, or
+  /// channel failure and issue at most one native disposal request.
+  Future<Map<Object?, Object?>> dispose() {
+    final existing = _disposeFuture;
+    if (existing != null) return existing;
+    final future = _disposeOwnedBinding();
+    _disposeFuture = future;
+    return future;
+  }
+
+  Future<Map<Object?, Object?>> _disposeOwnedBinding() async {
     if (_closed) {
       return _disposeReceipt ??
           (throw StateError('V2 control has no teardown receipt.'));

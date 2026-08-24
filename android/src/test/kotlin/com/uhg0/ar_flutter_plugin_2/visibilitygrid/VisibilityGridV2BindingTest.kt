@@ -216,6 +216,67 @@ class VisibilityGridV2BindingTest {
     }
 
     @Test
+    fun `queued stale dispose cannot rotate replacement`() {
+        val messenger = MethodTestMessenger()
+        val executor = Executors.newSingleThreadExecutor()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 92,
+            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            executor = executor,
+            postToMain = { task -> task() },
+        )
+        try {
+            executor.execute {
+                entered.countDown()
+                release.await()
+            }
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+
+            val original = binding.snapshot()
+            val qualifier = original.nativeStreamToken + original.workerBindingToken
+            val channel = MethodChannel(messenger, "visibility_grid_v2_control_92")
+            val first = RecordingResult()
+            val second = RecordingResult()
+            channel.invokeMethod("disposeBinding", qualifier, first)
+            channel.invokeMethod("disposeBinding", qualifier, second)
+
+            release.countDown()
+            assertTrue(first.completed.await(5, TimeUnit.SECONDS))
+            assertTrue(second.completed.await(5, TimeUnit.SECONDS))
+            assertEquals(1, first.successCount)
+            assertEquals(0, first.errorCount)
+            assertEquals(0, second.successCount)
+            assertEquals(1, second.errorCount)
+            assertEquals("VG_STREAM_BINDING_ABANDONED", second.errorCode)
+
+            val teardown = first.successValue as Map<*, *>
+            assertEquals(original.bindingGeneration, teardown["bindingGeneration"])
+            assertEquals(1L, teardown["closedResources"])
+            assertEquals(false, teardown["disposed"])
+
+            val current = RecordingResult()
+            channel.invokeMethod("bindingSnapshot", null, current)
+            assertTrue(current.completed.await(2, TimeUnit.SECONDS))
+            val replacement = current.successValue as Map<*, *>
+            assertNotEquals(original.bindingGeneration, replacement["bindingGeneration"])
+            assertNotEquals(original.nativeStreamToken, replacement["nativeStreamToken"])
+            assertNotEquals(original.workerBindingToken, replacement["workerBindingToken"])
+            assertEquals(original.viewGeneration, replacement["viewGeneration"])
+            assertArrayEquals(original.arSessionIdentity, replacement["arSessionIdentity"] as ByteArray)
+            assertArrayEquals(original.viewInstanceId, replacement["viewInstanceId"] as ByteArray)
+            assertEquals(0L, replacement["acceptedControls"])
+            assertEquals(false, replacement["disposed"])
+            assertEquals(1L, replacement["closedResources"])
+        } finally {
+            release.countDown()
+            binding.dispose()
+        }
+    }
+
+    @Test
     fun `real receipt query rejects inexact and out of range numbers before lookup`() {
         val authority = M0aCommittedBaselineAuthority()
         val messenger = MethodTestMessenger()

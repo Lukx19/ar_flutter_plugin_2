@@ -222,11 +222,16 @@ class VisibilityGridV2Binding internal constructor(
                 result.error("VG_STREAM_BINDING_ABANDONED", "V2 binding token mismatch", null)
                 return
             }
+            val admittedGeneration = currentBindingGeneration
+            val admittedQualifier = bindingQualifier()
             try {
                 executor.execute {
                     recordExecutorOperation("control:dispose_binding")
-                    val outcome = runCatching { replaceBinding() }
-                    main.post {
+                    val outcome = runCatching {
+                        checkCurrentBinding(admittedGeneration, admittedQualifier)
+                        replaceBinding()
+                    }
+                    post {
                         outcome.fold(
                             onSuccess = { result.success(it.toMap()) },
                             onFailure = {
