@@ -20,24 +20,33 @@ enum ARVisibilityGridV2CommitDecision {
 /// lost. The manager adds its current binding qualifier privately when it
 /// sends the query, so a stale control object cannot query a replacement.
 /// UUID fields are 32 hexadecimal characters, tokens are 16 bytes, and all
-/// scalar revisions/sequences are non-negative integers. The native ledger
-/// retains at most eight exact receipts.
+/// scalars fit a signed 64-bit platform integer. Stream token, request
+/// sequence, and transaction ID are positive; generations and target
+/// revisions are non-negative. The native ledger retains at most eight exact
+/// receipts.
 final class ARVisibilityGridV2CommitReceiptQuery {
-  /// Creates the complete bounded identity for one receipt query.
-  const ARVisibilityGridV2CommitReceiptQuery({
+  /// Creates and validates the complete bounded identity for one query.
+  ///
+  /// Throws [ArgumentError] for a malformed UUID, a token that is not exactly
+  /// 16 bytes, a non-positive stream/request/transaction identity, or a
+  /// generation/revision outside the non-negative signed 64-bit range.
+  ARVisibilityGridV2CommitReceiptQuery({
     required this.controlRequestId,
     required this.sessionId,
     required this.captureGroupId,
     required this.sessionGeneration,
     required this.groupGeneration,
-    required this.nativeStreamToken,
-    required this.workerBindingToken,
+    required Uint8List nativeStreamToken,
+    required Uint8List workerBindingToken,
     required this.streamToken,
     required this.requestSequence,
     required this.transactionId,
     required this.targetGeometryRevision,
     required this.targetLineageRevision,
-  });
+  })  : nativeStreamToken = Uint8List.fromList(nativeStreamToken),
+        workerBindingToken = Uint8List.fromList(workerBindingToken) {
+    _validate();
+  }
 
   /// UUID of the old START control request, encoded as 32 hex characters.
   final String controlRequestId;
@@ -76,20 +85,72 @@ final class ARVisibilityGridV2CommitReceiptQuery {
   final int targetLineageRevision;
 
   /// Encodes this bounded identity for the platform channel.
-  Map<String, Object?> toMap() => <String, Object?>{
-        'controlRequestId': controlRequestId,
-        'sessionId': sessionId,
-        'captureGroupId': captureGroupId,
-        'sessionGeneration': sessionGeneration,
-        'groupGeneration': groupGeneration,
-        'nativeStreamToken': Uint8List.fromList(nativeStreamToken),
-        'workerBindingToken': Uint8List.fromList(workerBindingToken),
-        'streamToken': streamToken,
-        'requestSequence': requestSequence,
-        'transactionId': transactionId,
-        'targetGeometryRevision': targetGeometryRevision,
-        'targetLineageRevision': targetLineageRevision,
-      };
+  ///
+  /// Revalidates mutable token fields and throws [ArgumentError] if callers
+  /// changed either token to an invalid length after construction.
+  Map<String, Object?> toMap() {
+    _validate();
+    return <String, Object?>{
+      'controlRequestId': controlRequestId,
+      'sessionId': sessionId,
+      'captureGroupId': captureGroupId,
+      'sessionGeneration': sessionGeneration,
+      'groupGeneration': groupGeneration,
+      'nativeStreamToken': Uint8List.fromList(nativeStreamToken),
+      'workerBindingToken': Uint8List.fromList(workerBindingToken),
+      'streamToken': streamToken,
+      'requestSequence': requestSequence,
+      'transactionId': transactionId,
+      'targetGeometryRevision': targetGeometryRevision,
+      'targetLineageRevision': targetLineageRevision,
+    };
+  }
+
+  void _validate() {
+    for (final entry in <String, String>{
+      'controlRequestId': controlRequestId,
+      'sessionId': sessionId,
+      'captureGroupId': captureGroupId,
+    }.entries) {
+      if (!_uuidHex.hasMatch(entry.value)) {
+        throw ArgumentError.value(
+          entry.value,
+          entry.key,
+          'Must be exactly 32 hexadecimal characters.',
+        );
+      }
+    }
+    _queryToken(nativeStreamToken, 'nativeStreamToken');
+    _queryToken(workerBindingToken, 'workerBindingToken');
+    _queryInt(sessionGeneration, 'sessionGeneration');
+    _queryInt(groupGeneration, 'groupGeneration');
+    _queryInt(streamToken, 'streamToken', positive: true);
+    _queryInt(requestSequence, 'requestSequence', positive: true);
+    _queryInt(transactionId, 'transactionId', positive: true);
+    _queryInt(targetGeometryRevision, 'targetGeometryRevision');
+    _queryInt(targetLineageRevision, 'targetLineageRevision');
+  }
+}
+
+final RegExp _uuidHex = RegExp(r'^[0-9a-fA-F]{32}$');
+const int _maximumPlatformInt = 0x7fffffffffffffff;
+
+void _queryToken(Uint8List value, String name) {
+  if (value.length != 16) {
+    throw ArgumentError.value(value, name, 'Must be exactly 16 bytes.');
+  }
+}
+
+void _queryInt(int value, String name, {bool positive = false}) {
+  if (value > _maximumPlatformInt || (positive ? value <= 0 : value < 0)) {
+    throw ArgumentError.value(
+      value,
+      name,
+      positive
+          ? 'Must be a positive signed 64-bit integer.'
+          : 'Must be a non-negative signed 64-bit integer.',
+    );
+  }
 }
 
 /// Complete native baseline returned by an exact COMMIT receipt query.
@@ -178,6 +239,9 @@ final class ARVisibilityGridV2CommittedBaseline {
   final String worldFromGroupIdentity;
 
   /// Decodes and validates a bounded native baseline map.
+  ///
+  /// Throws [StateError] when a field is missing, has the wrong type, exceeds
+  /// its documented bound, or a scalar is outside signed 64-bit range.
   static ARVisibilityGridV2CommittedBaseline fromMap(Object? raw) {
     if (raw is! Map) throw StateError('V2 receipt omitted its baseline.');
     final map = Map<Object?, Object?>.from(raw);
@@ -211,7 +275,32 @@ final class ARVisibilityGridV2CommittedBaseline {
       worldFromGroupIdentity: string('worldFromGroupIdentity'),
     );
   }
+
+  bool get _isCanonicalZero =>
+      transactionId == 0 &&
+      geometryRevision == 0 &&
+      lineageRevision == 0 &&
+      styleRevision == 0 &&
+      evidenceRevision == 0 &&
+      captureRevision == 0 &&
+      coverageRevision == 0 &&
+      producedStyleRevision == 0 &&
+      regionManifestRevision == 0 &&
+      schemaRootRevision == 0 &&
+      nextSurfaceIdHighWater == 0 &&
+      schemaRootHashIdentity.isEmpty &&
+      manifestRootHashIdentity.isEmpty &&
+      groupFrameConvention == 1 &&
+      matrixConvention == 1 &&
+      directionConvention == 1 &&
+      normalEncoding == 1 &&
+      groupFromWorldIdentity == _identityMatrixIdentity &&
+      worldFromGroupIdentity == _identityMatrixIdentity;
 }
+
+const String _identityMatrixIdentity =
+    '3ff0000000000000,0,0,0,0,3ff0000000000000,0,0,0,0,'
+    '3ff0000000000000,0,0,0,0,3ff0000000000000';
 
 /// Read-only outcome and scalar evidence for one exact COMMIT attempt.
 ///
@@ -220,8 +309,7 @@ final class ARVisibilityGridV2CommittedBaseline {
 /// [rootIsolateSurfaceBytes] must be zero. [fromMap] rejects mismatched
 /// COMMIT baselines and non-zero abandon baselines with [StateError].
 final class ARVisibilityGridV2CommitReceipt {
-  /// Creates validated scalar evidence for one exact COMMIT query.
-  const ARVisibilityGridV2CommitReceipt({
+  const ARVisibilityGridV2CommitReceipt._({
     required this.decision,
     required this.controlRequestId,
     required this.sessionId,
@@ -303,6 +391,10 @@ final class ARVisibilityGridV2CommitReceipt {
       targetLineageRevision == query.targetLineageRevision;
 
   /// Decodes and validates bounded native receipt evidence.
+  ///
+  /// Throws [StateError] for malformed identity, scalar bounds, a non-zero
+  /// root payload count, a mismatched COMMIT baseline, or any abandon baseline
+  /// that differs from native's complete canonical zero value.
   static ARVisibilityGridV2CommitReceipt fromMap(Object? raw) {
     if (raw is! Map) throw StateError('V2 receipt was not a map.');
     final map = Map<Object?, Object?>.from(raw);
@@ -313,7 +405,7 @@ final class ARVisibilityGridV2CommitReceipt {
     };
     String string(String key) {
       final value = map[key];
-      if (value is! String || value.length > 128) {
+      if (value is! String || !_uuidHex.hasMatch(value)) {
         throw StateError('V2 receipt field $key is invalid.');
       }
       return value;
@@ -331,7 +423,7 @@ final class ARVisibilityGridV2CommitReceipt {
     if (rootBytes != 0) {
       throw StateError('V2 receipt exposed ordinary root-isolate bytes.');
     }
-    final receipt = ARVisibilityGridV2CommitReceipt(
+    final receipt = ARVisibilityGridV2CommitReceipt._(
       decision: decision,
       controlRequestId: string('controlRequestId'),
       sessionId: string('sessionId'),
@@ -340,9 +432,9 @@ final class ARVisibilityGridV2CommitReceipt {
       groupGeneration: _receiptInt(map, 'groupGeneration'),
       nativeStreamToken: token('nativeStreamToken'),
       workerBindingToken: token('workerBindingToken'),
-      streamToken: _receiptInt(map, 'streamToken'),
-      requestSequence: _receiptInt(map, 'requestSequence'),
-      transactionId: _receiptInt(map, 'transactionId'),
+      streamToken: _receiptPositiveInt(map, 'streamToken'),
+      requestSequence: _receiptPositiveInt(map, 'requestSequence'),
+      transactionId: _receiptPositiveInt(map, 'transactionId'),
       targetGeometryRevision: _receiptInt(map, 'targetGeometryRevision'),
       targetLineageRevision: _receiptInt(map, 'targetLineageRevision'),
       baseline: ARVisibilityGridV2CommittedBaseline.fromMap(map['baseline']),
@@ -356,10 +448,7 @@ final class ARVisibilityGridV2CommitReceipt {
                 receipt.targetLineageRevision)) {
       throw StateError('V2 COMMIT receipt baseline does not match its query.');
     }
-    if (!receipt.committed &&
-        (receipt.baseline.transactionId != 0 ||
-            receipt.baseline.geometryRevision != 0 ||
-            receipt.baseline.lineageRevision != 0)) {
+    if (!receipt.committed && !receipt.baseline._isCanonicalZero) {
       throw StateError('V2 abandon receipt exposed a committed baseline.');
     }
     return receipt;
@@ -371,10 +460,28 @@ int _receiptInt(Map<Object?, Object?> map, String key) {
   if (value is! num ||
       !value.isFinite ||
       value < 0 ||
+      value > _maximumPlatformInt ||
       value != value.truncate()) {
     throw StateError('V2 receipt field $key is invalid.');
   }
   return value.toInt();
+}
+
+int _receiptPositiveInt(Map<Object?, Object?> map, String key) {
+  final value = _receiptInt(map, key);
+  if (value == 0) throw StateError('V2 receipt field $key is invalid.');
+  return value;
+}
+
+ARVisibilityGridV2CommitReceipt _exactCommitReceipt(
+  Object? response,
+  ARVisibilityGridV2CommitReceiptQuery query,
+) {
+  final receipt = ARVisibilityGridV2CommitReceipt.fromMap(response);
+  if (!receipt.matchesQuery(query)) {
+    throw StateError('V2 receipt identity does not match its query.');
+  }
+  return receipt;
 }
 
 /// Packed debug control endpoint for the Proposal 08 M0a reference seam.
@@ -466,7 +573,8 @@ final class ARVisibilityGridV2Control {
   /// A teardown receipt is cleanup evidence only and is never treated as the
   /// outcome authority. Throws [PlatformException] or
   /// [MissingPluginException] for channel failure/stale qualification and
-  /// [StateError] for malformed scalar identity, bounds, or root evidence.
+  /// [ArgumentError] before invocation for malformed query identity/bounds,
+  /// and [StateError] for malformed scalar identity, bounds, or root evidence.
   /// The result contains zero ordinary root-isolate surface bytes.
   Future<ARVisibilityGridV2CommitReceipt> queryCommitReceipt(
     ARVisibilityGridV2CommitReceiptQuery query,
@@ -484,11 +592,7 @@ final class ARVisibilityGridV2Control {
         'currentBindingQualifier': Uint8List.fromList(qualifier),
       },
     );
-    final receipt = ARVisibilityGridV2CommitReceipt.fromMap(response);
-    if (!receipt.matchesQuery(query)) {
-      throw StateError('V2 receipt identity does not match its query.');
-    }
-    return receipt;
+    return _exactCommitReceipt(response, query);
   }
 
   Future<Uint8List> _invoke(String method, Uint8List request) async {
@@ -700,7 +804,8 @@ final class ARVisibilityGridV2WorkerBinding {
   /// ordinary surface payload. A teardown receipt is cleanup evidence only;
   /// it is not outcome authority. Stale/mismatched qualification or channel
   /// failure is reported as [PlatformException] or
-  /// [MissingPluginException]; malformed scalar replies throw [StateError].
+  /// [MissingPluginException]; malformed query fields throw [ArgumentError]
+  /// before invocation, and malformed scalar replies throw [StateError].
   Future<ARVisibilityGridV2CommitReceipt> queryCommitReceipt(
     ARVisibilityGridV2CommitReceiptQuery query,
   ) async {
@@ -712,11 +817,7 @@ final class ARVisibilityGridV2WorkerBinding {
         'currentBindingQualifier': _requireQualifier(),
       },
     );
-    final receipt = ARVisibilityGridV2CommitReceipt.fromMap(response);
-    if (!receipt.matchesQuery(query)) {
-      throw StateError('V2 receipt identity does not match its query.');
-    }
-    return receipt;
+    return _exactCommitReceipt(response, query);
   }
 
   /// Throws [StateError] if closed or native returns a non-byte response.

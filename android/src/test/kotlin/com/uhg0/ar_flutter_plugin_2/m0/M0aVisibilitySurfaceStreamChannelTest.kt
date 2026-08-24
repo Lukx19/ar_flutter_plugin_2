@@ -729,7 +729,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
     }
 
     @Test
-    fun `abandon fences a late COMMIT before shared baseline publication`() {
+    fun `abandon fence query reports zero and late COMMIT has no authority`() {
         val authority = M0aCommittedBaselineAuthority()
         val lifecycle = M0aControlLifecycle(committedBaselineAuthority = authority)
         val start = controlRequest(M0aControlOperation.START, 0, 91)
@@ -739,6 +739,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
         val enteredPublication = CountDownLatch(1)
         val releasePublication = CountDownLatch(1)
         val executor = Executors.newSingleThreadExecutor()
+        lateinit var abandonedQuery: M0aCommitReceiptQueryV1
         val binding = M0aVisibilitySurfaceStreamChannel(
             messenger = messenger,
             viewId = 91,
@@ -750,6 +751,20 @@ class M0aVisibilitySurfaceStreamChannelTest {
                 while (!releasePublication.await(10, TimeUnit.MILLISECONDS)) {
                     // Preserve the delayed continuation until the test releases it.
                 }
+            },
+            onAbandonedRequest = { request, targetBaseline ->
+                abandonedQuery = M0aCommitReceiptQueryV1(
+                    controlRequestId = start.controlRequestId,
+                    scope = scope,
+                    nativeStreamToken = ByteArray(16) { (it + 1).toByte() },
+                    workerBindingToken = ByteArray(16) { (it + 17).toByte() },
+                    streamToken = request.streamToken,
+                    requestSequence = request.requestSequence,
+                    transactionId = targetBaseline.transactionId,
+                    targetGeometryRevision = targetBaseline.geometryRevision,
+                    targetLineageRevision = targetBaseline.lineageRevision,
+                )
+                authority.publishAbandon(abandonedQuery)
             },
         )
         binding.queueStructuralTransaction(
@@ -787,6 +802,10 @@ class M0aVisibilitySurfaceStreamChannelTest {
         assertEquals(142, terminal.errorId)
         assertEquals(M0aCommittedBaselineV1.ZERO, authority.snapshot(scope))
         assertEquals(M0aCommittedBaselineV1.ZERO, lifecycle.committedBaseline())
+        val receipt = checkNotNull(authority.queryReceipt(abandonedQuery))
+        assertEquals(false, receipt.committed)
+        assertEquals(M0aCommittedBaselineV1.ZERO, receipt.baseline)
+        assertEquals(receipt, authority.queryReceipt(abandonedQuery))
 
         val recoveredLifecycle = M0aControlLifecycle(committedBaselineAuthority = authority)
         val recoveredStart = controlRequest(M0aControlOperation.START, 0, 92)

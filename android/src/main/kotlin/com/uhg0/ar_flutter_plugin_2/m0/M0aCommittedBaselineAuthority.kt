@@ -16,6 +16,10 @@ data class M0aCommittedBaselineScopeV1(
     val sessionGeneration: Long,
     val groupGeneration: Long,
 ) {
+    init {
+        require(sessionGeneration >= 0 && groupGeneration >= 0)
+    }
+
     companion object {
         fun from(request: M0aControlRequest): M0aCommittedBaselineScopeV1 =
             M0aCommittedBaselineScopeV1(
