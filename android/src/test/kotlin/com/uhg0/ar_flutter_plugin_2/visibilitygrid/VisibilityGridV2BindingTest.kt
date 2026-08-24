@@ -25,6 +25,69 @@ import org.junit.Test
 
 class VisibilityGridV2BindingTest {
     @Test
+    fun `restored START stall spans two exact abandon fences then disarms`() {
+        val seam = VisibilityGridV2DebugRecoverySeam()
+        assertEquals(true, seam.armRestoredStart()["armed"])
+        seam.acceptedCut(startRequest())
+        seam.commitPublished()
+
+        val acknowledgement = Executors.newSingleThreadExecutor()
+        val acknowledgementContinuation = acknowledgement.submit {
+            seam.beforeRequest(
+                M0aPacketCodec.Request(
+                    requestFlags = 0,
+                    streamToken = 1,
+                    acknowledgedTransactionId = 1,
+                    acknowledgedGeometryRevision = 1,
+                    acknowledgedLineageRevision = 1,
+                    nextStyleRevision = 0,
+                    maximumResponseBytes = 4096,
+                    styleRecords = emptyList(),
+                    commandBytes = byteArrayOf(),
+                    requestSequence = 3,
+                ),
+            )
+        }
+        seam.releaseAbandonedExchange()
+        acknowledgementContinuation.get(2, TimeUnit.SECONDS)
+        acknowledgement.shutdownNow()
+
+        val restoredRequest = startRequest().copy(
+            payload = M0aStartRequestCodecV2.defaultPayload().also { it[7] = 1 },
+        )
+        val cut = VisibilityGridV2Binding.RecoveryGroupCut.from(restoredRequest)
+        seam.replacementSeeded(cut)
+        seam.acceptedCut(restoredRequest)
+        val restoredStart = Executors.newSingleThreadExecutor()
+        val restoredContinuation = restoredStart.submit {
+            seam.afterRestoredStartQualification(restoredRequest)
+        }
+        seam.releaseAbandonedExchange()
+        restoredContinuation.get(2, TimeUnit.SECONDS)
+        restoredStart.shutdownNow()
+
+        seam.replacementSeeded(cut)
+        seam.acceptedCut(restoredRequest)
+        val trace = seam.snapshot()["trace"] as List<*>
+        assertTrue(
+            trace.containsAll(
+                listOf(
+                    "armed:restored-start",
+                    "commit-published",
+                    "stalled:acknowledgement",
+                    "stalled:restored-start",
+                ),
+            ),
+        )
+        assertEquals(2, trace.count { it == "abandon-won" })
+        assertEquals(2, trace.count { it == "late-old-completion-fenced" })
+        assertEquals(2, trace.count { it == "replacement-seeded:${cut.cutIdentityForTest()}" })
+        val completedTrace = trace.toList()
+        seam.acceptedCut(restoredRequest)
+        assertEquals(completedTrace, seam.snapshot()["trace"])
+    }
+
+    @Test
     fun `debug recovery trace is bounded and the recovery gate disarms`() {
         val seam = VisibilityGridV2DebugRecoverySeam()
         seam.arm()
@@ -968,6 +1031,10 @@ class VisibilityGridV2BindingTest {
     private fun M0aUuid.hex(): String = bytes.joinToString("") { byte ->
         "%02x".format(byte.toInt() and 0xff)
     }
+
+    private fun VisibilityGridV2Binding.RecoveryGroupCut.cutIdentityForTest(): String =
+        "${sessionId?.hex()}:${captureGroupId?.hex()}:" +
+            "$sessionGeneration:$groupGeneration:$coverageEpoch"
 
     private fun stripQualifier(bytes: ByteArray, qualifier: ByteArray): ByteArray {
         assertTrue(bytes.size >= qualifier.size)

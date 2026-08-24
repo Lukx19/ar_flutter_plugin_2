@@ -14,6 +14,7 @@ import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineV1
 import com.uhg0.ar_flutter_plugin_2.m0.toMap
 import com.uhg0.ar_flutter_plugin_2.m0.M0aUuid
 import com.uhg0.ar_flutter_plugin_2.m0.M0aStructuralTransactionProducerV1
+import com.uhg0.ar_flutter_plugin_2.m0.M0aStartRequestCodecV2
 import com.uhg0.ar_flutter_plugin_2.m0.M0aVisibilitySurfaceStreamChannel
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
@@ -199,6 +200,14 @@ class VisibilityGridV2Binding internal constructor(
             }
             return
         }
+        if (call.method == "configureDebugV2RestoredStartStall") {
+            if (!isDebuggable) {
+                result.error("VG_PROTOCOL_INVALID", "V2 recovery seam is debug-only", null)
+            } else {
+                result.success(debugRecoverySeam.armRestoredStart())
+            }
+            return
+        }
         if (call.method == "getDebugV2RecoveryTrace") {
             if (!isDebuggable) {
                 result.error("VG_PROTOCOL_INVALID", "V2 recovery seam is debug-only", null)
@@ -227,6 +236,7 @@ class VisibilityGridV2Binding internal constructor(
                 result.error("VG_STREAM_BINDING_ABANDONED", "V2 binding token mismatch", null)
                 return
             }
+            debugRecoverySeam.cleanupAdmitted("dispose", admission.identity)
             val pending = PendingCleanupResult(admission.lease, result) {
                 pendingCleanupResults.remove(it)
             }
@@ -241,7 +251,10 @@ class VisibilityGridV2Binding internal constructor(
                     post {
                         if (!pending.tryClaim()) return@post
                         outcome.fold(
-                            onSuccess = { pending.result.success(it.receipt) },
+                            onSuccess = {
+                                debugRecoverySeam.cleanupTerminal("dispose", admission.identity, it)
+                                pending.result.success(it.receipt)
+                            },
                             onFailure = { pending.result.error("VG_STREAM_BINDING_ABANDONED", it.message, null) },
                         )
                     }
@@ -263,9 +276,11 @@ class VisibilityGridV2Binding internal constructor(
                 result.error("VG_STREAM_BINDING_ABANDONED", "V2 binding token mismatch", null)
                 return
             }
+            debugRecoverySeam.cleanupAdmitted("abandon", admission.identity)
             try {
                 beforeAbandonCleanup?.invoke()
                 val outcome = cleanupBinding(admission, abandonStream = true)
+                debugRecoverySeam.cleanupTerminal("abandon", admission.identity, outcome)
                 // The winning abandon constructs and publishes the replacement
                 // before any accepted serial-dispose reply can escape. A worker
                 // observing that reply can therefore bind immediately without
@@ -320,6 +335,7 @@ class VisibilityGridV2Binding internal constructor(
                         recoveryGroupCut = RecoveryGroupCut.from(request)
                         debugRecoverySeam.acceptedCut(request)
                     }
+                    debugRecoverySeam.afterRestoredStartQualification(request)
                     beforeControlPublication?.invoke()
                     synchronized(publicationFence) {
                         checkCurrentBinding(admittedGeneration, admittedQualifier)
@@ -892,6 +908,8 @@ internal class VisibilityGridV2DebugRecoverySeam {
     private var stallClaimed = false
     private var commitPublicationStall = false
     private var acknowledgementStall = false
+    private var restoredStartStall = false
+    private var restoredStartPhase = false
     private var recoveryTraceActive = false
     private var replacementSeeded = false
 
@@ -900,6 +918,8 @@ internal class VisibilityGridV2DebugRecoverySeam {
         trace.clear()
         commitPublicationStall = false
         acknowledgementStall = false
+        restoredStartStall = false
+        restoredStartPhase = false
         appendTrace("armed:first-exchange")
         exchangeGate = CountDownLatch(1)
         oldContinuation = CountDownLatch(1)
@@ -914,6 +934,8 @@ internal class VisibilityGridV2DebugRecoverySeam {
         trace.clear()
         commitPublicationStall = true
         acknowledgementStall = false
+        restoredStartStall = false
+        restoredStartPhase = false
         appendTrace("armed:commit-publication")
         exchangeGate = CountDownLatch(1)
         oldContinuation = CountDownLatch(1)
@@ -928,7 +950,25 @@ internal class VisibilityGridV2DebugRecoverySeam {
         trace.clear()
         commitPublicationStall = false
         acknowledgementStall = true
+        restoredStartStall = false
+        restoredStartPhase = false
         appendTrace("armed:acknowledgement")
+        exchangeGate = CountDownLatch(1)
+        oldContinuation = CountDownLatch(1)
+        stallClaimed = false
+        recoveryTraceActive = true
+        replacementSeeded = false
+        mapOf("armed" to true)
+    }
+
+    fun armRestoredStart(): Map<String, Any> = synchronized(lock) {
+        check(exchangeGate == null) { "V2 recovery seam is already armed" }
+        trace.clear()
+        commitPublicationStall = false
+        acknowledgementStall = true
+        restoredStartStall = true
+        restoredStartPhase = false
+        appendTrace("armed:restored-start")
         exchangeGate = CountDownLatch(1)
         oldContinuation = CountDownLatch(1)
         stallClaimed = false
@@ -1002,6 +1042,29 @@ internal class VisibilityGridV2DebugRecoverySeam {
         oldContinuationFenced()
     }
 
+    fun afterRestoredStartQualification(request: M0aControlRequest) {
+        val restored = request.operation == M0aControlOperation.START &&
+            M0aStartRequestCodecV2.decode(request.payload).restoreRequested
+        if (!restored) return
+        val gate = synchronized(lock) {
+            if (!restoredStartStall || !restoredStartPhase || stallClaimed) return
+            stallClaimed = true
+            appendTrace("stalled:restored-start")
+            checkNotNull(exchangeGate)
+        }
+        var interrupted = false
+        while (true) {
+            try {
+                gate.await()
+                break
+            } catch (_: InterruptedException) {
+                interrupted = true
+            }
+        }
+        if (interrupted) Thread.currentThread().interrupt()
+        oldContinuationFenced()
+    }
+
     fun commitPublished() = synchronized(lock) {
         if (commitPublicationStall || acknowledgementStall) appendTrace("commit-published")
     }
@@ -1009,7 +1072,12 @@ internal class VisibilityGridV2DebugRecoverySeam {
     fun acceptedCut(request: M0aControlRequest) = synchronized(lock) {
         if (recoveryTraceActive) {
             appendTrace("accepted-cut:${request.cutIdentity()}")
-            if (replacementSeeded) recoveryTraceActive = false
+            val start = M0aStartRequestCodecV2.decode(request.payload)
+            appendTrace(
+                "accepted-start:restore=${start.restoreRequested}:" +
+                    "geometry=${start.restoredRevisions[1]}:lineage=${start.restoredRevisions[2]}",
+            )
+            if (replacementSeeded && !restoredStartStall) recoveryTraceActive = false
         }
     }
 
@@ -1017,6 +1085,29 @@ internal class VisibilityGridV2DebugRecoverySeam {
         if (recoveryTraceActive) {
             appendTrace("replacement-seeded:${cut.cutIdentity()}")
             replacementSeeded = true
+        }
+    }
+
+    fun cleanupAdmitted(
+        kind: String,
+        identity: VisibilityGridV2Binding.BindingIdentity,
+    ) = synchronized(lock) {
+        if (recoveryTraceActive) {
+            appendTrace("cleanup-admitted:$kind:${identity.traceIdentity()}")
+        }
+    }
+
+    fun cleanupTerminal(
+        kind: String,
+        identity: VisibilityGridV2Binding.BindingIdentity,
+        outcome: VisibilityGridV2Binding.CleanupOutcome,
+    ) = synchronized(lock) {
+        if (recoveryTraceActive) {
+            val winner = if (outcome.wonCleanup) "winner" else "replay"
+            val resources = outcome.receipt["closedResources"]
+            appendTrace(
+                "cleanup-terminal:$kind:$winner:${identity.traceIdentity()}:resources=$resources",
+            )
         }
     }
 
@@ -1033,11 +1124,21 @@ internal class VisibilityGridV2DebugRecoverySeam {
             }
         } finally {
             synchronized(lock) {
-                exchangeGate = null
-                oldContinuation = null
-                stallClaimed = false
-                commitPublicationStall = false
-                acknowledgementStall = false
+                if (restoredStartStall && !restoredStartPhase) {
+                    exchangeGate = CountDownLatch(1)
+                    oldContinuation = CountDownLatch(1)
+                    stallClaimed = false
+                    acknowledgementStall = false
+                    restoredStartPhase = true
+                } else {
+                    exchangeGate = null
+                    oldContinuation = null
+                    stallClaimed = false
+                    commitPublicationStall = false
+                    acknowledgementStall = false
+                    restoredStartStall = false
+                    restoredStartPhase = false
+                }
             }
         }
     }
@@ -1062,6 +1163,9 @@ internal class VisibilityGridV2DebugRecoverySeam {
     private fun M0aControlRequest.cutIdentity(): String =
         "${sessionId.hex()}:${captureGroupId.hex()}:" +
             "$sessionGeneration:$groupGeneration:$coverageEpoch"
+
+    private fun VisibilityGridV2Binding.BindingIdentity.traceIdentity(): String =
+        "$generation:${qualifier.joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }}"
 
     private fun VisibilityGridV2Binding.RecoveryGroupCut.cutIdentity(): String =
         "${sessionId?.hex()}:${captureGroupId?.hex()}:" +

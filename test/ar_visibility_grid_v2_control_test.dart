@@ -352,7 +352,8 @@ void main() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (call) async {
       if (call.method == 'configureDebugV2CommitPublicationStall' ||
-          call.method == 'configureDebugV2AckStall') {
+          call.method == 'configureDebugV2AckStall' ||
+          call.method == 'configureDebugV2RestoredStartStall') {
         throw PlatformException(
           code: 'VG_PROTOCOL_INVALID',
           message: 'V2 recovery seam is debug-only',
@@ -387,6 +388,18 @@ void main() {
     );
     await expectLater(
       control.configureDebugV2AcknowledgementStall(),
+      throwsA(
+        isA<PlatformException>()
+            .having((error) => error.code, 'code', 'VG_PROTOCOL_INVALID')
+            .having(
+              (error) => error.message,
+              'message',
+              'V2 recovery seam is debug-only',
+            ),
+      ),
+    );
+    await expectLater(
+      control.configureDebugV2RestoredStartStall(),
       throwsA(
         isA<PlatformException>()
             .having((error) => error.code, 'code', 'VG_PROTOCOL_INVALID')

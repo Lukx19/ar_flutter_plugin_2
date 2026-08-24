@@ -612,6 +612,17 @@ final class ARVisibilityGridV2Control {
     );
   }
 
+  /// Arms the debug-only composite recovery cut that first deadlines the
+  /// known-COMMIT acknowledgement and then deadlines the restored START.
+  Future<bool> configureDebugV2RestoredStartStall() async {
+    await _bindingReady;
+    return _armV2DebugControl(
+      _channel,
+      'configureDebugV2RestoredStartStall',
+      'V2 debug restored START stall returned an invalid arm receipt.',
+    );
+  }
+
   /// Reads the bounded debug recovery trace from native.
   ///
   /// Each entry is a scalar trace label of at most 1024 characters and at
@@ -924,6 +935,16 @@ final class ARVisibilityGridV2WorkerBinding {
       _controlChannel,
       'configureDebugV2AckStall',
       'V2 debug ACK stall returned an invalid arm receipt.',
+    );
+  }
+
+  /// Arms the debug-only known-COMMIT then restored-START recovery cut.
+  Future<bool> configureDebugV2RestoredStartStall() async {
+    _ensureOpen();
+    return _armV2DebugControl(
+      _controlChannel,
+      'configureDebugV2RestoredStartStall',
+      'V2 debug restored START stall returned an invalid arm receipt.',
     );
   }
 
