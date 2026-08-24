@@ -120,6 +120,53 @@ class VisibilityGridV2BindingTest {
     }
 
     @Test
+    fun `queued binding snapshot is claimed once when executor shuts down`() {
+        val messenger = MethodTestMessenger()
+        val executor = Executors.newSingleThreadExecutor()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        executor.execute {
+            entered.countDown()
+            try {
+                while (!release.await(10, TimeUnit.MILLISECONDS)) {
+                    // Keep the queued snapshot behind an explicit executor cut.
+                }
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
+        assertTrue(entered.await(2, TimeUnit.SECONDS))
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 1202,
+            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            executor = executor,
+            postToMain = { task -> task() },
+        )
+        try {
+            val result = RecordingResult()
+            MethodChannel(messenger, "visibility_grid_v2_control_1202")
+                .invokeMethod("bindingSnapshot", null, result)
+            assertEquals(0, result.successCount)
+            assertEquals(0, result.errorCount)
+
+            binding.dispose()
+
+            assertTrue(result.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(0, result.successCount)
+            assertEquals(1, result.errorCount)
+            assertEquals("VG_STREAM_BINDING_ABANDONED", result.errorCode)
+
+            release.countDown()
+            assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS))
+            assertEquals(1, result.successCount + result.errorCount)
+        } finally {
+            release.countDown()
+            binding.dispose()
+        }
+    }
+
+    @Test
     fun `restored START stall spans two exact abandon fences then disarms`() {
         val seam = VisibilityGridV2DebugRecoverySeam()
         assertEquals(true, seam.armRestoredStart()["armed"])
@@ -650,6 +697,91 @@ class VisibilityGridV2BindingTest {
             )
         } finally {
             release.countDown()
+            binding.dispose()
+        }
+    }
+
+    @Test
+    fun `Q1 abandon drains queued snapshots and cleanup callbacks with exact self exclusion`() {
+        val messenger = MethodTestMessenger()
+        val executor = Executors.newSingleThreadExecutor()
+        val initialEntered = CountDownLatch(1)
+        val releaseInitial = CountDownLatch(1)
+        val posted = CountDownLatch(3)
+        val queuedPosts = ArrayDeque<() -> Unit>()
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 951,
+            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            executor = executor,
+            postToMain = { task ->
+                synchronized(queuedPosts) { queuedPosts.addLast(task) }
+                posted.countDown()
+            },
+        )
+        val channel = MethodChannel(messenger, "visibility_grid_v2_control_951")
+        try {
+            executor.execute {
+                initialEntered.countDown()
+                releaseInitial.await()
+            }
+            assertTrue(initialEntered.await(2, TimeUnit.SECONDS))
+
+            val q0 = binding.snapshot()
+            val q0Qualifier = q0.nativeStreamToken + q0.workerBindingToken
+            val snapshot = RecordingResult()
+            val firstDispose = RecordingResult()
+            val secondDispose = RecordingResult()
+            channel.invokeMethod("bindingSnapshot", null, snapshot)
+            channel.invokeMethod("disposeBinding", q0Qualifier, firstDispose)
+            channel.invokeMethod("disposeBinding", q0Qualifier, secondDispose)
+
+            releaseInitial.countDown()
+            assertTrue(posted.await(2, TimeUnit.SECONDS))
+            val q1 = binding.snapshot()
+            assertNotEquals(q0.bindingGeneration, q1.bindingGeneration)
+
+            val interposedEntered = CountDownLatch(1)
+            val releaseInterposed = CountDownLatch(1)
+            executor.execute {
+                interposedEntered.countDown()
+                releaseInterposed.await()
+            }
+            assertTrue(interposedEntered.await(2, TimeUnit.SECONDS))
+
+            val q1Dispose = RecordingResult()
+            channel.invokeMethod("disposeBinding", q1.nativeStreamToken + q1.workerBindingToken, q1Dispose)
+            val q1Abandon = RecordingResult()
+            channel.invokeMethod("abandonBinding", q1.nativeStreamToken + q1.workerBindingToken, q1Abandon)
+
+            assertEquals(1, q1Abandon.successCount)
+            val q1Receipt = q1Abandon.successValue as Map<*, *>
+            assertEquals(4L, q1Receipt["callbackCountBefore"])
+            assertEquals(0L, q1Receipt["callbackCountAfter"])
+            assertEquals(-4L, q1Receipt["callbackBalance"])
+
+            assertTrue(snapshot.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(0, snapshot.successCount)
+            assertEquals(1, snapshot.errorCount)
+            assertEquals("VG_STREAM_BINDING_ABANDONED", snapshot.errorCode)
+            assertEquals(1, firstDispose.successCount)
+            assertEquals(1, secondDispose.successCount)
+            assertEquals(1, q1Dispose.successCount)
+            assertReceiptEqual(firstDispose.successValue, secondDispose.successValue)
+            assertReceiptEqual(q1Abandon.successValue, q1Dispose.successValue)
+
+            releaseInterposed.countDown()
+            executor.shutdownNow()
+            assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS))
+            synchronized(queuedPosts) {
+                while (queuedPosts.isNotEmpty()) queuedPosts.removeFirst().invoke()
+            }
+            assertEquals(1, snapshot.successCount + snapshot.errorCount)
+            assertEquals(1, firstDispose.successCount + firstDispose.errorCount)
+            assertEquals(1, secondDispose.successCount + secondDispose.errorCount)
+            assertEquals(1, q1Dispose.successCount + q1Dispose.errorCount)
+        } finally {
+            releaseInitial.countDown()
             binding.dispose()
         }
     }

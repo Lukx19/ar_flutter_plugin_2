@@ -218,16 +218,20 @@ class VisibilityGridV2Binding internal constructor(
             return
         }
         if (call.method == "bindingSnapshot") {
+            val pending = PendingControlResult(result) { pendingControlResults.remove(it) }
+            pendingControlResults.add(pending)
             try {
                 executor.execute {
                     recordExecutorOperation("control:binding_snapshot")
                     val snapshot = snapshot()
                     post {
-                        result.success(snapshot.toMap())
+                        if (pending.tryClaim()) pending.result.success(snapshot.toMap())
                     }
                 }
             } catch (_: RejectedExecutionException) {
-                result.error("VG_NOT_INITIALIZED", "V2 binding executor is closed", null)
+                if (pending.tryClaim()) {
+                    result.error("VG_NOT_INITIALIZED", "V2 binding executor is closed", null)
+                }
             }
             return
         }
@@ -271,7 +275,13 @@ class VisibilityGridV2Binding internal constructor(
             try {
                 executor.execute {
                     val outcome = try {
-                        runCatching { cleanupBinding(admission, abandonStream = false) }
+                        runCatching {
+                            cleanupBinding(
+                                admission,
+                                abandonStream = false,
+                                currentCleanup = pending,
+                            )
+                        }
                     } finally {
                         admission.lease.release()
                     }
@@ -304,20 +314,30 @@ class VisibilityGridV2Binding internal constructor(
                 return
             }
             debugRecoverySeam.cleanupAdmitted("abandon", admission.identity)
+            val pending = PendingCleanupResult(admission.lease, result) {
+                pendingCleanupResults.remove(it)
+            }
+            pendingCleanupResults.add(pending)
             try {
                 beforeAbandonCleanup?.invoke()
-                val outcome = cleanupBinding(admission, abandonStream = true)
+                val outcome = cleanupBinding(
+                    admission,
+                    abandonStream = true,
+                    currentCleanup = pending,
+                )
                 debugRecoverySeam.cleanupTerminal("abandon", admission.identity, outcome)
                 // The winning abandon constructs and publishes the replacement
                 // before any accepted serial-dispose reply can escape. A worker
                 // observing that reply can therefore bind immediately without
                 // passing through a transient handler-free state.
                 if (outcome.wonCleanup) {
-                    drainPendingCleanup(admission.identity, outcome.receipt)
+                    drainPendingCleanup(admission.identity, outcome.receipt, pending)
                 }
-                result.success(outcome.receipt)
+                if (pending.tryClaim()) pending.result.success(outcome.receipt)
             } catch (error: Exception) {
-                result.error("VG_STREAM_BINDING_ABANDONED", error.message, null)
+                if (pending.tryClaim()) {
+                    pending.result.error("VG_STREAM_BINDING_ABANDONED", error.message, null)
+                }
             } finally {
                 admission.lease.release()
             }
@@ -509,8 +529,10 @@ class VisibilityGridV2Binding internal constructor(
      * this runs on the shared executor, no old exchange can race the new START.
      */
     @Synchronized
-    private fun replaceBinding(): Map<String, Any?> {
-        val resourcesBefore = lifecycleResources()
+    private fun replaceBinding(
+        currentCleanup: PendingCleanupResult? = null,
+    ): Map<String, Any?> {
+        val resourcesBefore = lifecycleResources(excludedCleanup = currentCleanup)
         val closedBefore = closedResources
         recordExecutorOperation("control:dispose_binding")
         streamChannel.dispose()
@@ -521,7 +543,7 @@ class VisibilityGridV2Binding internal constructor(
         val teardownReceipt = snapshot().toMap().withCleanupBalances(
             closedBefore = closedBefore,
             before = resourcesBefore,
-            after = lifecycleResources(),
+            after = lifecycleResources(excludedCleanup = currentCleanup),
         )
         lifecycle = newLifecycle()
         currentBindingGeneration = nextBindingGeneration.incrementAndGet()
@@ -557,20 +579,13 @@ class VisibilityGridV2Binding internal constructor(
      * on the same view, so a stalled executor cannot block fresh identity
      * recovery or deliver an old reply into the replacement.
      */
-    private fun abandonAndReplace(): Map<String, Any?> {
-        val resourcesBefore = lifecycleResources()
+    private fun abandonAndReplace(
+        currentCleanup: PendingCleanupResult? = null,
+    ): Map<String, Any?> {
+        val resourcesBefore = lifecycleResources(excludedCleanup = currentCleanup)
         val closedBefore = closedResources
         synchronized(publicationFence) {
             check(disposed.compareAndSet(false, true)) { "V2 binding is already abandoned" }
-        }
-        pendingControlResults.toList().forEach { pending ->
-            if (pending.tryClaim()) {
-                pending.result.error(
-                    "VG_STREAM_BINDING_ABANDONED",
-                    "V2 binding was abandoned before control publication",
-                    null,
-                )
-            }
         }
         closeBindingResources(abandonStream = true)
         val oldSnapshot = snapshot().toMap()
@@ -609,9 +624,14 @@ class VisibilityGridV2Binding internal constructor(
     private fun cleanupBinding(
         admission: BindingAdmission,
         abandonStream: Boolean,
+        currentCleanup: PendingCleanupResult? = null,
     ): CleanupOutcome {
         val outcome = cleanupAuthority.claim(admission.identity) {
-            val receipt = if (abandonStream) abandonAndReplace() else replaceBinding()
+            val receipt = if (abandonStream) {
+                abandonAndReplace(currentCleanup)
+            } else {
+                replaceBinding(currentCleanup)
+            }
             receipt
         } ?: throw BindingAbandonedException()
         return outcome
@@ -620,8 +640,10 @@ class VisibilityGridV2Binding internal constructor(
     private fun drainPendingCleanup(
         winnerIdentity: BindingIdentity,
         winnerReceipt: Map<String, Any?>,
+        excludedCleanup: PendingCleanupResult? = null,
     ) {
         pendingCleanupResults.toList().forEach { pending ->
+            if (pending === excludedCleanup) return@forEach
             val receipt = if (pending.identity == winnerIdentity) {
                 winnerReceipt
             } else {
@@ -642,6 +664,7 @@ class VisibilityGridV2Binding internal constructor(
     }
 
     private fun closeBindingResources(abandonStream: Boolean = false) {
+        terminatePendingControlResults()
         controlChannel.setMethodCallHandler(null)
         controlHandlerInstalled.set(false)
         recordClosedResource()
@@ -655,6 +678,23 @@ class VisibilityGridV2Binding internal constructor(
         lifecycle.abandon()
         executor.shutdownNow()
         recordClosedResource()
+    }
+
+    /**
+     * Executor shutdown is also a terminal callback fence. A task removed by
+     * shutdownNow cannot reach its main-thread delivery closure, so claim its
+     * result here while the binding is still the authoritative owner.
+     */
+    private fun terminatePendingControlResults() {
+        pendingControlResults.toList().forEach { pending ->
+            if (pending.tryClaim()) {
+                pending.result.error(
+                    "VG_STREAM_BINDING_ABANDONED",
+                    "V2 binding was abandoned before control publication",
+                    null,
+                )
+            }
+        }
     }
 
     @Synchronized
@@ -746,14 +786,18 @@ class VisibilityGridV2Binding internal constructor(
             get() = handlerCount + executorCount + timeoutSchedulerCount
     }
 
-    private fun lifecycleResources(): LifecycleResources {
+    private fun lifecycleResources(
+        excludedCleanup: PendingCleanupResult? = null,
+    ): LifecycleResources {
         val stream = streamChannel.lifecycleResources()
         val executorCount = if (executor.isShutdown) 0L else 1L
         return LifecycleResources(
             handlerCount = (if (controlHandlerInstalled.get()) 1L else 0L) + stream.handlerCount,
             executorCount = executorCount,
             timeoutSchedulerCount = stream.timeoutSchedulerCount,
-            callbackCount = pendingControlResults.size.toLong() + stream.pendingReplyCount,
+            callbackCount = pendingControlResults.size.toLong() +
+                stream.pendingReplyCount +
+                pendingCleanupResults.count { it !== excludedCleanup },
         )
     }
 
