@@ -218,17 +218,16 @@ class VisibilityGridV2Binding internal constructor(
             return
         }
         if (call.method == "disposeBinding") {
-            if (!qualifierMatches(call.arguments as? ByteArray)) {
+            val admission = admitCurrentBinding(call.arguments as? ByteArray)
+            if (admission == null) {
                 result.error("VG_STREAM_BINDING_ABANDONED", "V2 binding token mismatch", null)
                 return
             }
-            val admittedGeneration = currentBindingGeneration
-            val admittedQualifier = bindingQualifier()
             try {
                 executor.execute {
                     recordExecutorOperation("control:dispose_binding")
                     val outcome = runCatching {
-                        checkCurrentBinding(admittedGeneration, admittedQualifier)
+                        checkCurrentBinding(admission.generation, admission.qualifier)
                         replaceBinding()
                     }
                     post {
@@ -446,6 +445,7 @@ class VisibilityGridV2Binding internal constructor(
      * The old stream is disposed before the new lifecycle is published. Since
      * this runs on the shared executor, no old exchange can race the new START.
      */
+    @Synchronized
     private fun replaceBinding(): Snapshot {
         // A qualified serial dispose can already be queued when the bounded
         // recovery path independently abandons this generation. Once that
@@ -555,6 +555,18 @@ class VisibilityGridV2Binding internal constructor(
     }
 
     private fun bindingQualifier(): ByteArray = nativeStreamToken + workerBindingToken
+
+    private data class BindingAdmission(
+        val generation: Long,
+        val qualifier: ByteArray,
+    )
+
+    @Synchronized
+    private fun admitCurrentBinding(bytes: ByteArray?): BindingAdmission? {
+        val qualifier = bindingQualifier()
+        if (bytes == null || !bytes.contentEquals(qualifier)) return null
+        return BindingAdmission(currentBindingGeneration, qualifier)
+    }
 
     private fun qualifierMatches(bytes: ByteArray?): Boolean =
         bytes != null && bytes.contentEquals(bindingQualifier())

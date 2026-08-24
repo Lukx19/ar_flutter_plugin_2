@@ -17,6 +17,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -221,6 +222,8 @@ class VisibilityGridV2BindingTest {
         val executor = Executors.newSingleThreadExecutor()
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
+        val replacementInstalled = CountDownLatch(1)
+        val releaseStaleDispose = CountDownLatch(1)
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 92,
@@ -241,37 +244,51 @@ class VisibilityGridV2BindingTest {
             val first = RecordingResult()
             val second = RecordingResult()
             channel.invokeMethod("disposeBinding", qualifier, first)
+            executor.execute {
+                replacementInstalled.countDown()
+                releaseStaleDispose.await()
+            }
             channel.invokeMethod("disposeBinding", qualifier, second)
 
             release.countDown()
             assertTrue(first.completed.await(5, TimeUnit.SECONDS))
-            assertTrue(second.completed.await(5, TimeUnit.SECONDS))
+            assertTrue(replacementInstalled.await(5, TimeUnit.SECONDS))
             assertEquals(1, first.successCount)
             assertEquals(0, first.errorCount)
-            assertEquals(0, second.successCount)
-            assertEquals(1, second.errorCount)
-            assertEquals("VG_STREAM_BINDING_ABANDONED", second.errorCode)
 
             val teardown = first.successValue as Map<*, *>
             assertEquals(original.bindingGeneration, teardown["bindingGeneration"])
             assertEquals(1L, teardown["closedResources"])
             assertEquals(false, teardown["disposed"])
 
-            val current = RecordingResult()
-            channel.invokeMethod("bindingSnapshot", null, current)
-            assertTrue(current.completed.await(2, TimeUnit.SECONDS))
-            val replacement = current.successValue as Map<*, *>
-            assertNotEquals(original.bindingGeneration, replacement["bindingGeneration"])
-            assertNotEquals(original.nativeStreamToken, replacement["nativeStreamToken"])
-            assertNotEquals(original.workerBindingToken, replacement["workerBindingToken"])
-            assertEquals(original.viewGeneration, replacement["viewGeneration"])
-            assertArrayEquals(original.arSessionIdentity, replacement["arSessionIdentity"] as ByteArray)
-            assertArrayEquals(original.viewInstanceId, replacement["viewInstanceId"] as ByteArray)
-            assertEquals(0L, replacement["acceptedControls"])
-            assertEquals(false, replacement["disposed"])
-            assertEquals(1L, replacement["closedResources"])
+            val replacement = binding.snapshot()
+            assertNotEquals(original.bindingGeneration, replacement.bindingGeneration)
+            assertFalse(original.nativeStreamToken.contentEquals(replacement.nativeStreamToken))
+            assertFalse(original.workerBindingToken.contentEquals(replacement.workerBindingToken))
+            assertEquals(original.viewGeneration, replacement.viewGeneration)
+            assertArrayEquals(original.arSessionIdentity, replacement.arSessionIdentity)
+            assertArrayEquals(original.viewInstanceId, replacement.viewInstanceId)
+            assertEquals(0L, replacement.acceptedControls)
+            assertEquals(false, replacement.disposed)
+            assertEquals(1L, replacement.closedResources)
+
+            releaseStaleDispose.countDown()
+            assertTrue(second.completed.await(5, TimeUnit.SECONDS))
+            assertEquals(0, second.successCount)
+            assertEquals(1, second.errorCount)
+            assertEquals("VG_STREAM_BINDING_ABANDONED", second.errorCode)
+
+            val afterStale = binding.snapshot()
+            assertEquals(replacement.bindingGeneration, afterStale.bindingGeneration)
+            assertArrayEquals(replacement.nativeStreamToken, afterStale.nativeStreamToken)
+            assertArrayEquals(replacement.workerBindingToken, afterStale.workerBindingToken)
+            assertEquals(replacement.closedResources, afterStale.closedResources)
+            assertEquals(1, afterStale.executorTrace.count {
+                it.endsWith(":control:dispose_binding")
+            })
         } finally {
             release.countDown()
+            releaseStaleDispose.countDown()
             binding.dispose()
         }
     }
