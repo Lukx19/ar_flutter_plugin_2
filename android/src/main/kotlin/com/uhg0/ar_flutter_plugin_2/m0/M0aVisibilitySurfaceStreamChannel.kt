@@ -341,10 +341,10 @@ class M0aVisibilitySurfaceStreamChannel(
                                                     },
                                                     request.maximumResponseBytes,
                                                 )
-                                                if (publishesCommit && !pendingReply.tryClaim()) {
-                                                    throw BindingError(STREAM_BINDING_ABANDONED_ERROR_ID)
-                                                }
                                                 if (publishesCommit) {
+                                                    if (!pendingReply.tryClaim()) {
+                                                        throw BindingError(STREAM_BINDING_ABANDONED_ERROR_ID)
+                                                    }
                                                     publicationClaimedReply = true
                                                     onCommitPublished?.invoke(request, committedBaseline)
                                                 }
