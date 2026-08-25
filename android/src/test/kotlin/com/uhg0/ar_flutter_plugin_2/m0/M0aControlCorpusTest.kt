@@ -59,6 +59,55 @@ class M0aControlCorpusTest {
         )
         assertEquals(response.int("length"), responseBytes.size)
         assertEquals(response.string("sha256"), sha256(responseBytes))
+
+        val malformed = root.getValue("malformedControlErrorResponse").jsonObject
+        val detail = malformed.getValue("detail").jsonObject
+        val errorDetail = M0aControlCodec.encodeErrorDetail(
+            M0aErrorDetail(
+                errorId = malformed.int("errorId"),
+                scope = detail.int("scope"),
+                disposition = detail.int("disposition"),
+                validationPhase = detail.int("validationPhase"),
+                recoveryAction = detail.int("recoveryAction"),
+                fieldId = detail.int("fieldId"),
+                authorityKind = detail.int("authorityKind"),
+                diagnosticBytes = 0,
+                geometryRevision = detail.long("geometryRevision"),
+                lineageRevision = detail.long("lineageRevision"),
+                captureRevision = detail.long("captureRevision"),
+                coverageRevision = detail.long("coverageRevision"),
+                acceptedStyleRevision = detail.long("acceptedStyleRevision"),
+                regionManifestRevision = detail.long("regionManifestRevision"),
+                nextSurfaceIdHighWater = detail.long("nextSurfaceIdHighWater"),
+                expectedValue = detail.long("expectedValue"),
+                observedValue = detail.long("observedValue"),
+                schemaRootRevision = detail.long("schemaRootRevision"),
+            ),
+        )
+        val errorBytes = M0aControlCodec.encodeResponse(
+            M0aControlResponse(
+                operation = M0aControlOperation.START,
+                outcome = malformed.int("outcome"),
+                resultFlags = malformed.int("resultFlags"),
+                errorId = malformed.int("errorId"),
+                controlRequestId = M0aUuid(hex(malformed.string("controlRequestId"))),
+                sessionId = M0aUuid(hex(common.string("sessionId"))),
+                captureGroupId = M0aUuid(hex(common.string("captureGroupId"))),
+                sessionGeneration = common.long("sessionGeneration"),
+                groupGeneration = common.long("groupGeneration"),
+                coverageEpoch = common.long("coverageEpoch"),
+                streamToken = malformed.long("streamToken"),
+                nextExchangeRequestSequence = malformed.long("nextExchangeRequestSequence"),
+                nativeTransactionId = malformed.long("nativeTransactionId"),
+                payload = errorDetail,
+            ),
+            M0aControlCodec.hardCeilingBytes,
+        )
+        assertEquals(malformed.int("length"), errorBytes.size)
+        assertEquals(malformed.string("sha256"), sha256(errorBytes))
+        val decodedError = M0aControlCodec.decodeResponse(errorBytes)
+        assertEquals(6, decodedError.errorId)
+        assertEquals(0, M0aControlCodec.decodeErrorDetail(decodedError.payload).disposition)
     }
 
     private fun fixture(): JsonObject = Json.parseToJsonElement(

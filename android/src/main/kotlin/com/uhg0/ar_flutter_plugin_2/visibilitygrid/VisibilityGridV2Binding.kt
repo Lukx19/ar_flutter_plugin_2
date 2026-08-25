@@ -9,6 +9,7 @@ import com.uhg0.ar_flutter_plugin_2.m0.M0aControlCodec
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlLifecycle
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlOperation
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlRequest
+import com.uhg0.ar_flutter_plugin_2.m0.M0aControlValidationFailure
 import com.uhg0.ar_flutter_plugin_2.m0.M0aPacketCodec
 import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineV1
 import com.uhg0.ar_flutter_plugin_2.m0.toMap
@@ -367,48 +368,74 @@ class VisibilityGridV2Binding internal constructor(
             executor.execute {
                 val outcome = runCatching {
                     checkCurrentBinding(admittedGeneration, admittedQualifier)
-                    val request = M0aControlCodec.decodeRequest(bytes)
                     recordExecutorOperation("control:${operation.name.lowercase()}")
-                    require(request.operation == operation) {
-                        "Control method and operation differ"
-                    }
-                    val wasIdle = lifecycle.state() == M0aControlLifecycle.State.IDLE
-                    val response = lifecycle.handle(request, bytes)
-                    val decoded = M0aControlCodec.decodeResponse(response)
-                    if (
-                        wasIdle && operation == M0aControlOperation.START &&
-                        decoded.outcome == 0
+                    val correlated = M0aControlCodec.decodeCorrelatedRequest(bytes, operation)
+                    val request = correlated.request
+                    val framingFailure = correlated.failure
+                    val payloadFailure = if (
+                        framingFailure == null && operation == M0aControlOperation.START
                     ) {
-                        recoveryGroupCut = RecoveryGroupCut.from(request)
-                        debugRecoverySeam.acceptedCut(request)
+                        runCatching { M0aStartRequestCodecV2.decode(request.payload) }
+                            .exceptionOrNull()
+                            ?.let {
+                                M0aControlValidationFailure(
+                                    errorId = 6,
+                                    validationPhase = 6,
+                                    fieldId = 15,
+                                    expectedValue = M0aStartRequestCodecV2.byteLength.toLong(),
+                                    observedValue = request.payload.size.toLong(),
+                                )
+                            }
+                    } else {
+                        null
                     }
-                    debugRecoverySeam.afterRestoredStartQualification(request)
-                    beforeControlPublication?.invoke()
-                    synchronized(publicationFence) {
-                        checkCurrentBinding(admittedGeneration, admittedQualifier)
+                    val malformed = framingFailure ?: payloadFailure
+                    if (malformed != null) {
+                        val response = lifecycle.malformed(request, malformed)
+                        beforeControlPublication?.invoke()
+                        synchronized(publicationFence) {
+                            checkCurrentBinding(admittedGeneration, admittedQualifier)
+                            qualify(response)
+                        }
+                    } else {
+                        val wasIdle = lifecycle.state() == M0aControlLifecycle.State.IDLE
+                        val response = lifecycle.handle(request, bytes)
+                        val decoded = M0aControlCodec.decodeResponse(response)
                         if (
                             wasIdle && operation == M0aControlOperation.START &&
                             decoded.outcome == 0
                         ) {
-                            operationGeneration++
-                            lifecycleSequence = nextLifecycleSequence.incrementAndGet()
-                            activeControlRequestId = request.controlRequestId
-                            activeSessionId = request.sessionId
-                            activeCaptureGroupId = request.captureGroupId
-                            activeSessionGeneration = request.sessionGeneration
-                            activeGroupGeneration = request.groupGeneration
-                            activeCoverageEpoch = request.coverageEpoch
-                            if (lifecycle.committedBaseline() == M0aCommittedBaselineV1.ZERO) {
-                                queueInitialTransaction()
-                            } else {
-                                // A restored authoritative cut already contains
-                                // the committed transaction. Mark startup as
-                                // established without replaying transaction 1.
-                                initialTransactionQueued = true
-                            }
+                            recoveryGroupCut = RecoveryGroupCut.from(request)
+                            debugRecoverySeam.acceptedCut(request)
                         }
-                        acceptedControls++
-                        qualify(response)
+                        debugRecoverySeam.afterRestoredStartQualification(request)
+                        beforeControlPublication?.invoke()
+                        synchronized(publicationFence) {
+                            checkCurrentBinding(admittedGeneration, admittedQualifier)
+                            if (
+                                wasIdle && operation == M0aControlOperation.START &&
+                                decoded.outcome == 0
+                            ) {
+                                operationGeneration++
+                                lifecycleSequence = nextLifecycleSequence.incrementAndGet()
+                                activeControlRequestId = request.controlRequestId
+                                activeSessionId = request.sessionId
+                                activeCaptureGroupId = request.captureGroupId
+                                activeSessionGeneration = request.sessionGeneration
+                                activeGroupGeneration = request.groupGeneration
+                                activeCoverageEpoch = request.coverageEpoch
+                                if (lifecycle.committedBaseline() == M0aCommittedBaselineV1.ZERO) {
+                                    queueInitialTransaction()
+                                } else {
+                                    // A restored authoritative cut already contains
+                                    // the committed transaction. Mark startup as
+                                    // established without replaying transaction 1.
+                                    initialTransactionQueued = true
+                                }
+                            }
+                            acceptedControls++
+                            qualify(response)
+                        }
                     }
                 }
                 post {

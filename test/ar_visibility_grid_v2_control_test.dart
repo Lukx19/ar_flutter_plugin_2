@@ -787,6 +787,57 @@ void main() {
     await binding.captureCleanupAuthority();
     await expectLater(binding.disposeAndSnapshot(), throwsStateError);
   });
+
+  test('public byte seam returns authenticated canonical control error bytes',
+      () async {
+    const controlChannel = MethodChannel('visibility_grid_v2_control_95');
+    const streamChannel = BasicMessageChannel<ByteData?>(
+      'visibility_surface_stream_95',
+      BinaryCodec(),
+    );
+    final nativeToken = Uint8List.fromList(List<int>.generate(16, (i) => i));
+    final workerToken =
+        Uint8List.fromList(List<int>.generate(16, (i) => i + 16));
+    final qualifier = Uint8List.fromList(<int>[...nativeToken, ...workerToken]);
+    final canonicalError = Uint8List.fromList(<int>[
+      0x56,
+      0x47,
+      0x44,
+      0x32,
+      ...List<int>.generate(220, (index) => (index * 17) & 0xff),
+    ]);
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(controlChannel, (call) async {
+      if (call.method == 'claimBindingLease') {
+        return <String, Object?>{
+          'nativeStreamToken': nativeToken,
+          'workerBindingToken': workerToken,
+        };
+      }
+      if (call.method == 'start') {
+        final qualified = call.arguments! as Uint8List;
+        expect(qualified.sublist(0, 32), orderedEquals(qualifier));
+        expect(qualified.sublist(32), orderedEquals(<int>[1, 2, 3]));
+        return Uint8List.fromList(<int>[...qualifier, ...canonicalError]);
+      }
+      throw PlatformException(code: 'unsupported');
+    });
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(controlChannel, null),
+    );
+    final binding = ARVisibilityGridV2WorkerBinding.connect(
+      rootIsolateToken: ServicesBinding.rootIsolateToken!,
+      viewId: 95,
+      controlChannel: controlChannel,
+      streamChannel: streamChannel,
+    );
+    await binding.captureCleanupAuthority();
+
+    final response = await binding.start(Uint8List.fromList(<int>[1, 2, 3]));
+
+    expect(response, orderedEquals(canonicalError));
+  });
 }
 
 Map<String, Object?> _receiptMap({

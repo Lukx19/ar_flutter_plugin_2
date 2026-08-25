@@ -105,6 +105,21 @@ data class M0aErrorDetail(
     val schemaRootRevision: Long,
 )
 
+/** A fully readable control identity plus its first canonical pre-accept failure. */
+data class M0aCorrelatedControlDecode(
+    val request: M0aControlRequest,
+    val failure: M0aControlValidationFailure? = null,
+)
+
+/** Stable ErrorDetailV2 fields for a control failure before receipt acceptance. */
+data class M0aControlValidationFailure(
+    val errorId: Int,
+    val validationPhase: Int,
+    val fieldId: Int,
+    val expectedValue: Long,
+    val observedValue: Long,
+)
+
 object M0aControlCodec {
     const val requestHeaderBytes = 104
     const val responseHeaderBytes = 128
@@ -162,6 +177,96 @@ object M0aControlCodec {
         )
         validateRequest(request)
         return request
+    }
+
+    /**
+     * Decodes a request for the authenticated Android binding seam.
+     *
+     * A canonical failure is returned only after the complete correlation
+     * identity is trustworthy. Short headers, malformed UUID identities, and
+     * non-portable correlation ordinals still throw so the transport cannot
+     * invent a peer receipt. No receipt or lifecycle state is touched here.
+     */
+    fun decodeCorrelatedRequest(
+        packet: ByteArray,
+        methodOperation: M0aControlOperation,
+    ): M0aCorrelatedControlDecode {
+        require(packet.size >= requestHeaderBytes) { "Control correlation header is unreadable" }
+        val data = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
+        val request = M0aControlRequest(
+            operation = methodOperation,
+            flags = data.get(7).toInt() and 0xff,
+            controlRequestId = M0aUuid(packet.copyOfRange(16, 32)),
+            sessionId = M0aUuid(packet.copyOfRange(32, 48)),
+            captureGroupId = M0aUuid(packet.copyOfRange(48, 64)),
+            sessionGeneration = data.getLong(64),
+            groupGeneration = data.getLong(72),
+            coverageEpoch = data.getLong(80),
+            streamToken = data.getLong(88),
+            // Correlation is extracted before framing proof. Do not copy an
+            // untrusted payload until the hard ceiling and exact lengths pass.
+            payload = byteArrayOf(),
+        )
+        validateCorrelation(request)
+
+        fun failure(
+            errorId: Int,
+            phase: Int,
+            fieldId: Int,
+            expected: Long,
+            observed: Long,
+        ) = M0aCorrelatedControlDecode(
+            request,
+            M0aControlValidationFailure(errorId, phase, fieldId, expected, observed),
+        )
+
+        val expectedMagic = 0x32434756L
+        val observedMagic = data.getInt(0).toLong() and 0xffff_ffffL
+        if (!packet.magicIs("VGC2")) {
+            return failure(6, 1, 1, expectedMagic, observedMagic)
+        }
+        val major = data.getShort(4).toInt() and 0xffff
+        if (major != 2) return failure(1, 1, 2, 2, major.toLong())
+        val headerBytes = data.getShort(8).toInt() and 0xffff
+        if (headerBytes != requestHeaderBytes) {
+            return failure(6, 1, 2, requestHeaderBytes.toLong(), headerBytes.toLong())
+        }
+
+        val declaredPacketBytes = data.getInt(12).toLong() and 0xffff_ffffL
+        if (packet.size > hardCeilingBytes) {
+            return failure(5, 2, 3, hardCeilingBytes.toLong(), packet.size.toLong())
+        }
+        if (declaredPacketBytes != packet.size.toLong()) {
+            return failure(6, 2, 3, declaredPacketBytes, packet.size.toLong())
+        }
+        val declaredPayloadBytes = data.getShort(10).toInt() and 0xffff
+        val actualPayloadBytes = packet.size - requestHeaderBytes
+        if (declaredPayloadBytes != actualPayloadBytes) {
+            return failure(6, 2, 3, declaredPayloadBytes.toLong(), actualPayloadBytes.toLong())
+        }
+        val expectedCrc = crc32(packet, 96).toLong() and 0xffff_ffffL
+        val observedCrc = data.getInt(96).toLong() and 0xffff_ffffL
+        if (observedCrc != expectedCrc) {
+            return failure(6, 2, 4, expectedCrc, observedCrc)
+        }
+        val reserved = data.getInt(100).toLong() and 0xffff_ffffL
+        if (reserved != 0L) return failure(6, 2, 5, 0, reserved)
+
+        val wireOperation = data.get(6).toInt() and 0xff
+        if (wireOperation !in 1..4 || wireOperation != methodOperation.wireValue) {
+            return failure(6, 3, 16, methodOperation.wireValue.toLong(), wireOperation.toLong())
+        }
+        if (request.flags and 0xfe != 0) {
+            return failure(6, 3, 5, 1, request.flags.toLong())
+        }
+        val streamTokenValid = request.streamToken >= 0 &&
+            ((methodOperation == M0aControlOperation.START) == (request.streamToken == 0L))
+        if (!streamTokenValid) {
+            val expected = if (methodOperation == M0aControlOperation.START) 0L else 1L
+            return failure(36, 3, 7, expected, request.streamToken)
+        }
+
+        return M0aCorrelatedControlDecode(decodeRequest(packet))
     }
 
     fun encodeResponse(response: M0aControlResponse, maximumBytes: Int): ByteArray {
@@ -287,6 +392,13 @@ object M0aControlCodec {
         require((request.operation == M0aControlOperation.START) == (request.streamToken == 0L))
     }
 
+    private fun validateCorrelation(request: M0aControlRequest) {
+        validateOrdinal(request.sessionGeneration, "sessionGeneration")
+        validateOrdinal(request.groupGeneration, "groupGeneration")
+        validateOrdinal(request.coverageEpoch, "coverageEpoch")
+        require(request.streamToken >= 0) { "streamToken is outside PortableOrdinal" }
+    }
+
     private fun validateResponse(response: M0aControlResponse) {
         require(response.outcome in 0..1 && response.resultFlags in 0..0x1f)
         require(
@@ -303,7 +415,7 @@ object M0aControlCodec {
     private fun validateOrdinal(value: Long, name: String) = require(value in 1..Long.MAX_VALUE) { "$name is outside PortableOrdinal" }
     private fun ByteArray.magic(value: String) = value.toByteArray(Charsets.US_ASCII).copyInto(this)
     private fun ByteArray.magicIs(value: String): Boolean = value.toByteArray(Charsets.US_ASCII).contentEquals(copyOfRange(0, 4))
-    private fun crc32(bytes: ByteArray, zeroOffset: Int): Int {
+    internal fun crc32(bytes: ByteArray, zeroOffset: Int): Int {
         var crc = -1
         bytes.forEachIndexed { index, original ->
             val byte = if (index in zeroOffset until zeroOffset + 4) 0 else original.toInt() and 0xff

@@ -25,6 +25,203 @@ import org.junit.Test
 
 class VisibilityGridV2BindingTest {
     @Test
+    fun `exact qualified malformed control returns canonical correlated bytes with no effect`() {
+        val authority = M0aCommittedBaselineAuthority()
+        val request = startRequest()
+        val scope = M0aCommittedBaselineScopeV1.from(request)
+        val baseline = com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineV1(
+            transactionId = 9,
+            geometryRevision = 10,
+            lineageRevision = 11,
+            styleRevision = 12,
+            captureRevision = 13,
+            coverageRevision = 14,
+            regionManifestRevision = 15,
+            schemaRootRevision = 16,
+            nextSurfaceIdHighWater = 17,
+        )
+        authority.publish(scope, baseline)
+        val messenger = MethodTestMessenger()
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 1200,
+            committedBaselineAuthority = authority,
+            postToMain = { task -> task() },
+        )
+        try {
+            val before = binding.snapshot()
+            val qualifier = before.nativeStreamToken + before.workerBindingToken
+            val malformed = M0aControlCodec.encodeRequest(request).also { bytes ->
+                bytes[96] = (bytes[96].toInt() xor 0x01).toByte()
+            }
+            val result = RecordingResult()
+            MethodChannel(messenger, "visibility_grid_v2_control_1200").invokeMethod(
+                "start",
+                qualifier + malformed,
+                result,
+            )
+            assertTrue(result.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(1, result.successCount)
+            val response = M0aControlCodec.decodeResponse(
+                stripQualifier(result.successValue as ByteArray, qualifier),
+            )
+            assertEquals(M0aControlOperation.START, response.operation)
+            assertEquals(1, response.outcome)
+            assertEquals(0, response.resultFlags)
+            assertEquals(6, response.errorId)
+            assertEquals(request.controlRequestId, response.controlRequestId)
+            assertEquals(request.sessionId, response.sessionId)
+            assertEquals(request.captureGroupId, response.captureGroupId)
+            assertEquals(request.sessionGeneration, response.sessionGeneration)
+            assertEquals(request.groupGeneration, response.groupGeneration)
+            assertEquals(request.coverageEpoch, response.coverageEpoch)
+            assertEquals(0, response.streamToken)
+            assertEquals(0, response.nextExchangeRequestSequence)
+            assertEquals(9, response.nativeTransactionId)
+            val detail = M0aControlCodec.decodeErrorDetail(response.payload)
+            assertEquals(6, detail.errorId)
+            assertEquals(0, detail.disposition)
+            assertEquals(2, detail.validationPhase)
+            assertEquals(5, detail.recoveryAction)
+            assertEquals(4, detail.fieldId)
+            assertEquals(10, detail.geometryRevision)
+            assertEquals(11, detail.lineageRevision)
+            assertEquals(13, detail.captureRevision)
+            assertEquals(14, detail.coverageRevision)
+            assertEquals(12, detail.acceptedStyleRevision)
+            assertEquals(15, detail.regionManifestRevision)
+            assertEquals(17, detail.nextSurfaceIdHighWater)
+            assertEquals(16, detail.schemaRootRevision)
+
+            val afterMalformed = binding.snapshot()
+            assertEquals(before.acceptedControls, afterMalformed.acceptedControls)
+            assertEquals(before.operationGeneration, afterMalformed.operationGeneration)
+            assertEquals(before.lifecycleSequence, afterMalformed.lifecycleSequence)
+            assertEquals(before.initialTransactionQueued, afterMalformed.initialTransactionQueued)
+            assertEquals(before.streamToken, afterMalformed.streamToken)
+            assertEquals(baseline, authority.snapshot(scope))
+
+            val malformedPayload = RecordingResult()
+            val shortStart = request.copy(payload = request.payload.copyOf(request.payload.size - 1))
+            MethodChannel(messenger, "visibility_grid_v2_control_1200").invokeMethod(
+                "start",
+                qualifier + M0aControlCodec.encodeRequest(shortStart),
+                malformedPayload,
+            )
+            assertTrue(malformedPayload.completed.await(2, TimeUnit.SECONDS))
+            val payloadError = M0aControlCodec.decodeResponse(
+                stripQualifier(malformedPayload.successValue as ByteArray, qualifier),
+            )
+            val payloadDetail = M0aControlCodec.decodeErrorDetail(payloadError.payload)
+            assertEquals(6, payloadError.errorId)
+            assertEquals(6, payloadDetail.validationPhase)
+            assertEquals(15, payloadDetail.fieldId)
+            assertEquals(M0aStartRequestCodecV2.byteLength.toLong(), payloadDetail.expectedValue)
+            assertEquals(shortStart.payload.size.toLong(), payloadDetail.observedValue)
+            assertEquals(0, binding.snapshot().acceptedControls)
+            assertEquals(baseline, authority.snapshot(scope))
+
+            val corrected = RecordingResult()
+            MethodChannel(messenger, "visibility_grid_v2_control_1200").invokeMethod(
+                "start",
+                qualifier + M0aControlCodec.encodeRequest(request),
+                corrected,
+            )
+            assertTrue(corrected.completed.await(2, TimeUnit.SECONDS))
+            val correctedResponse = M0aControlCodec.decodeResponse(
+                stripQualifier(corrected.successValue as ByteArray, qualifier),
+            )
+            assertEquals(0, correctedResponse.outcome)
+            assertEquals(1, correctedResponse.streamToken)
+            assertEquals(1, binding.snapshot().acceptedControls)
+            assertEquals(baseline, authority.snapshot(scope))
+        } finally {
+            binding.dispose()
+        }
+    }
+
+    @Test
+    fun `wrong qualifier and unreadable correlation remain platform failures`() {
+        val messenger = MethodTestMessenger()
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 1199,
+            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            postToMain = { task -> task() },
+        )
+        try {
+            val snapshot = binding.snapshot()
+            val qualifier = snapshot.nativeStreamToken + snapshot.workerBindingToken
+            val request = M0aControlCodec.encodeRequest(startRequest())
+
+            val wrong = qualifier.copyOf().also { it[0] = (it[0].toInt() xor 1).toByte() }
+            val stale = RecordingResult()
+            MethodChannel(messenger, "visibility_grid_v2_control_1199").invokeMethod(
+                "start",
+                wrong + request,
+                stale,
+            )
+            assertEquals(1, stale.errorCount)
+            assertEquals("VG_PROTOCOL_INVALID", stale.errorCode)
+
+            val anonymous = RecordingResult()
+            MethodChannel(messenger, "visibility_grid_v2_control_1199").invokeMethod(
+                "start",
+                qualifier + ByteArray(M0aControlCodec.requestHeaderBytes - 1),
+                anonymous,
+            )
+            assertTrue(anonymous.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(1, anonymous.errorCount)
+            assertEquals("VG_PROTOCOL_INVALID", anonymous.errorCode)
+            assertEquals(0, binding.snapshot().acceptedControls)
+        } finally {
+            binding.dispose()
+        }
+    }
+
+    @Test
+    fun `malformed control publication loses cleanly to binding replacement`() {
+        val messenger = MethodTestMessenger()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 1198,
+            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            postToMain = { task -> task() },
+            beforeControlPublication = {
+                entered.countDown()
+                release.await()
+            },
+        )
+        try {
+            val snapshot = binding.snapshot()
+            val qualifier = snapshot.nativeStreamToken + snapshot.workerBindingToken
+            val malformed = M0aControlCodec.encodeRequest(startRequest()).also { bytes ->
+                bytes[96] = (bytes[96].toInt() xor 1).toByte()
+            }
+            val control = RecordingResult()
+            val channel = MethodChannel(messenger, "visibility_grid_v2_control_1198")
+            channel.invokeMethod("start", qualifier + malformed, control)
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+
+            val abandon = RecordingResult()
+            channel.invokeMethod("abandonBinding", qualifier, abandon)
+            assertEquals(1, abandon.successCount)
+            release.countDown()
+            assertTrue(control.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(0, control.successCount)
+            assertEquals(1, control.errorCount)
+            assertEquals("VG_STREAM_BINDING_ABANDONED", control.errorCode)
+            assertEquals(1, control.successCount + control.errorCount)
+            assertEquals(0, binding.snapshot().acceptedControls)
+        } finally {
+            release.countDown()
+            binding.dispose()
+        }
+    }
+
+    @Test
     fun `cleanup lease and terminal histories remain bounded`() {
         val authority = VisibilityGridV2Binding.CleanupAuthority()
         val leases = mutableListOf<ByteArray>()

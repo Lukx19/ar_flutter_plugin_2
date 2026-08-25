@@ -186,6 +186,70 @@ class M0aControlLifecycle(
 
     fun cachedResponseBytes(): Int = receipts.sumOf { it.response.size }
 
+    /**
+     * Freezes a canonical non-consumed control error without recording a
+     * receipt or changing lifecycle, cursor, group, or committed authority.
+     */
+    @Synchronized
+    fun malformed(
+        request: M0aControlRequest,
+        failure: M0aControlValidationFailure,
+    ): ByteArray {
+        val active = state == State.ACTIVE
+        val requestedBaseline = if (active) {
+            M0aCommittedBaselineV1.ZERO
+        } else {
+            committedBaselineAuthority?.snapshot(M0aCommittedBaselineScopeV1.from(request))
+                ?: M0aCommittedBaselineV1.ZERO
+        }
+        val baseline = if (active || requestedBaseline == M0aCommittedBaselineV1.ZERO) {
+            committedBaseline
+        } else {
+            requestedBaseline
+        }
+        val detail = M0aControlCodec.encodeErrorDetail(
+            M0aErrorDetail(
+                errorId = failure.errorId,
+                scope = 0,
+                disposition = 0,
+                validationPhase = failure.validationPhase,
+                recoveryAction = 5,
+                fieldId = failure.fieldId,
+                authorityKind = 1,
+                diagnosticBytes = 0,
+                geometryRevision = baseline.geometryRevision,
+                lineageRevision = baseline.lineageRevision,
+                captureRevision = baseline.captureRevision,
+                coverageRevision = baseline.coverageRevision,
+                acceptedStyleRevision = baseline.styleRevision,
+                regionManifestRevision = baseline.regionManifestRevision,
+                nextSurfaceIdHighWater = baseline.nextSurfaceIdHighWater,
+                expectedValue = failure.expectedValue,
+                observedValue = failure.observedValue,
+                schemaRootRevision = baseline.schemaRootRevision,
+            ),
+        )
+        return M0aControlCodec.encodeResponse(
+            M0aControlResponse(
+                operation = request.operation,
+                outcome = 1,
+                resultFlags = 0,
+                errorId = failure.errorId,
+                controlRequestId = request.controlRequestId,
+                sessionId = request.sessionId,
+                captureGroupId = request.captureGroupId,
+                sessionGeneration = request.sessionGeneration,
+                groupGeneration = request.groupGeneration,
+                coverageEpoch = request.coverageEpoch,
+                streamToken = if (active) activeStreamToken else 0,
+                nextExchangeRequestSequence = if (active) 1 else 0,
+                nativeTransactionId = baseline.transactionId,
+                payload = detail,
+            ),
+            maximumResponseBytes,
+        )
+    }
+
     /** Handles one already-decoded request and returns a packed VGD2 receipt. */
     @Synchronized
     fun handle(request: M0aControlRequest, encodedRequest: ByteArray): ByteArray {

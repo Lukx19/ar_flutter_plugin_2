@@ -9,6 +9,37 @@ import java.security.MessageDigest
 
 class M0aControlLifecycleTest {
     @Test
+    fun `canonical malformed error records no receipt and corrected control remains legal`() {
+        val lifecycle = M0aControlLifecycle()
+        val start = request(M0aControlOperation.START, 0, 71)
+        val errorBytes = lifecycle.malformed(
+            start,
+            M0aControlValidationFailure(
+                errorId = 6,
+                validationPhase = 2,
+                fieldId = 4,
+                expectedValue = 11,
+                observedValue = 12,
+            ),
+        )
+        val error = M0aControlCodec.decodeResponse(errorBytes)
+        val detail = M0aControlCodec.decodeErrorDetail(error.payload)
+        assertEquals(1, error.outcome)
+        assertEquals(0, error.resultFlags)
+        assertEquals(0, detail.disposition)
+        assertEquals(5, detail.recoveryAction)
+        assertEquals(M0aControlLifecycle.State.IDLE, lifecycle.state())
+        assertEquals(0, lifecycle.cachedRequestBytes())
+        assertEquals(0, lifecycle.cachedResponseBytes())
+
+        val corrected = M0aControlCodec.decodeResponse(
+            lifecycle.handle(start, M0aControlCodec.encodeRequest(start)),
+        )
+        assertEquals(0, corrected.outcome)
+        assertEquals(M0aControlLifecycle.State.ACTIVE, lifecycle.state())
+    }
+
+    @Test
     fun `control lifecycle allocates fresh token and exact replay`() {
         val lifecycle = M0aControlLifecycle()
         val start = request(M0aControlOperation.START, 0, 1)
