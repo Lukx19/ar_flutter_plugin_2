@@ -269,7 +269,12 @@ class M0aControlLifecycle(
             M0aControlOperation.RELEASE_CHECKPOINT -> checkpoint(request)
             M0aControlOperation.STOP -> stop(request)
         }
-        return cache(encodedRequest, response)
+        val decoded = M0aControlCodec.decodeResponse(response)
+        return if (decoded.outcome == 0 || errorPolicy(decoded.errorId).recordReceipt) {
+            cache(encodedRequest, response)
+        } else {
+            response
+        }
     }
 
     private fun start(request: M0aControlRequest): ByteArray {
@@ -361,14 +366,15 @@ class M0aControlLifecycle(
         )
 
     private fun error(request: M0aControlRequest, errorId: Int): ByteArray {
+        val policy = errorPolicy(errorId)
         val detail = M0aControlCodec.encodeErrorDetail(
             M0aErrorDetail(
                 errorId = errorId,
                 scope = 0,
-                disposition = 1,
-                validationPhase = 8,
-                recoveryAction = 0,
-                fieldId = 0,
+                disposition = policy.disposition,
+                validationPhase = policy.validationPhase,
+                recoveryAction = policy.recoveryAction,
+                fieldId = policy.fieldId,
                 authorityKind = 1,
                 diagnosticBytes = 0,
                 geometryRevision = committedBaseline.geometryRevision,
@@ -387,7 +393,7 @@ class M0aControlLifecycle(
             M0aControlResponse(
                 operation = request.operation,
                 outcome = 1,
-                resultFlags = 0,
+                resultFlags = policy.resultFlags,
                 errorId = errorId,
                 controlRequestId = request.controlRequestId,
                 sessionId = request.sessionId,
@@ -404,6 +410,31 @@ class M0aControlLifecycle(
         )
     }
 
+    private fun errorPolicy(errorId: Int): ErrorPolicy = when (errorId) {
+        M0aControlError.UNSUPPORTED_WIRE_VERSION -> ErrorPolicy(0, 6, 5, 2)
+        M0aControlError.STREAM_TOKEN_STALE -> ErrorPolicy(
+            disposition = 2,
+            validationPhase = 4,
+            recoveryAction = 4,
+            fieldId = 7,
+            resultFlags = M0aControlError.RESULT_BINDING_INVALID,
+        )
+        M0aControlError.REQUEST_REPLAY_CONFLICT -> ErrorPolicy(0, 5, 4, 8)
+        M0aControlError.REQUIRED_CAPABILITY_UNSUPPORTED -> ErrorPolicy(0, 6, 5, 17)
+        M0aControlError.LIFECYCLE_STATE_INVALID -> ErrorPolicy(0, 7, 5, 0)
+        M0aControlError.CUT_INCOMPATIBLE -> ErrorPolicy(0, 6, 8, 20)
+        else -> error("No canonical lifecycle error policy for $errorId")
+    }
+
+    private data class ErrorPolicy(
+        val disposition: Int,
+        val validationPhase: Int,
+        val recoveryAction: Int,
+        val fieldId: Int,
+        val resultFlags: Int = 0,
+        val recordReceipt: Boolean = false,
+    )
+
     private fun cache(request: ByteArray?, response: ByteArray): ByteArray {
         if (request != null) {
             receipts += Receipt(
@@ -417,6 +448,7 @@ class M0aControlLifecycle(
     }
 
     private object M0aControlError {
+        const val RESULT_BINDING_INVALID = 1 shl 2
         const val UNSUPPORTED_WIRE_VERSION = 1
         const val REQUIRED_CAPABILITY_UNSUPPORTED = 46
         const val CUT_INCOMPATIBLE = 58

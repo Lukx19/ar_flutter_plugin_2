@@ -110,8 +110,21 @@ class M0aControlLifecycleTest {
         assertEquals(M0aControlCodec.errorDetailBytes, capabilityResponse.payload.size)
         val capabilityDetail = M0aControlCodec.decodeErrorDetail(capabilityResponse.payload)
         assertEquals(capabilityResponse.errorId, capabilityDetail.errorId)
-        assertEquals(1, capabilityDetail.disposition)
-        assertEquals(8, capabilityDetail.validationPhase)
+        assertEquals(0, capabilityDetail.disposition)
+        assertEquals(6, capabilityDetail.validationPhase)
+        assertEquals(5, capabilityDetail.recoveryAction)
+        assertEquals(17, capabilityDetail.fieldId)
+        assertEquals(0, capabilityResponse.resultFlags)
+        assertEquals(0, capabilityLifecycle.cachedRequestBytes())
+
+        val correctedRequired = required.copy(payload = M0aStartRequestCodecV2.defaultPayload())
+        val correctedCapabilityResponse = M0aControlCodec.decodeResponse(
+            capabilityLifecycle.handle(
+                correctedRequired,
+                M0aControlCodec.encodeRequest(correctedRequired),
+            ),
+        )
+        assertEquals(0, correctedCapabilityResponse.outcome)
 
         val minorLifecycle = M0aControlLifecycle()
         val minor = request(M0aControlOperation.START, 0, 4).copy(
@@ -125,6 +138,69 @@ class M0aControlLifecycleTest {
         )
         assertEquals(1, minorResponse.outcome)
         assertEquals(1, minorResponse.errorId)
+        val minorDetail = M0aControlCodec.decodeErrorDetail(minorResponse.payload)
+        assertEquals(0, minorDetail.disposition)
+        assertEquals(6, minorDetail.validationPhase)
+        assertEquals(5, minorDetail.recoveryAction)
+        assertEquals(2, minorDetail.fieldId)
+        assertEquals(0, minorResponse.resultFlags)
+        assertEquals(0, minorLifecycle.cachedRequestBytes())
+
+        val correctedMinor = minor.copy(payload = M0aStartRequestCodecV2.defaultPayload())
+        assertEquals(
+            0,
+            M0aControlCodec.decodeResponse(
+                minorLifecycle.handle(correctedMinor, M0aControlCodec.encodeRequest(correctedMinor)),
+            ).outcome,
+        )
+    }
+
+    @Test
+    fun `lifecycle and stale-token errors carry canonical retry fencing and receipt policy`() {
+        val idle = M0aControlLifecycle()
+        val premature = request(M0aControlOperation.BEGIN_CHECKPOINT, 1, 81)
+        val prematureResponse = M0aControlCodec.decodeResponse(
+            idle.handle(premature, M0aControlCodec.encodeRequest(premature)),
+        )
+        val prematureDetail = M0aControlCodec.decodeErrorDetail(prematureResponse.payload)
+        assertEquals(48, prematureResponse.errorId)
+        assertEquals(0, prematureResponse.resultFlags)
+        assertEquals(0, prematureDetail.disposition)
+        assertEquals(7, prematureDetail.validationPhase)
+        assertEquals(5, prematureDetail.recoveryAction)
+        assertEquals(0, idle.cachedRequestBytes())
+
+        val corrected = premature.copy(
+            operation = M0aControlOperation.START,
+            streamToken = 0,
+            payload = M0aStartRequestCodecV2.defaultPayload(),
+        )
+        assertEquals(
+            0,
+            M0aControlCodec.decodeResponse(
+                idle.handle(corrected, M0aControlCodec.encodeRequest(corrected)),
+            ).outcome,
+        )
+
+        val active = M0aControlLifecycle()
+        val start = request(M0aControlOperation.START, 0, 82)
+        val startBytes = M0aControlCodec.encodeRequest(start)
+        active.handle(start, startBytes)
+        val cachedBeforeStale = active.cachedRequestBytes()
+        val stale = request(M0aControlOperation.BEGIN_CHECKPOINT, 2, 83)
+        val staleBytes = M0aControlCodec.encodeRequest(stale)
+        val staleResponseBytes = active.handle(stale, staleBytes)
+        val staleResponse = M0aControlCodec.decodeResponse(staleResponseBytes)
+        val staleDetail = M0aControlCodec.decodeErrorDetail(staleResponse.payload)
+        assertEquals(4, staleResponse.errorId)
+        assertEquals(4, staleResponse.resultFlags)
+        assertEquals(0, staleResponse.resultFlags and 1)
+        assertEquals(2, staleDetail.disposition)
+        assertEquals(4, staleDetail.validationPhase)
+        assertEquals(4, staleDetail.recoveryAction)
+        assertEquals(7, staleDetail.fieldId)
+        assertEquals(cachedBeforeStale, active.cachedRequestBytes())
+        assertArrayEquals(staleResponseBytes, active.handle(stale, staleBytes))
     }
 
     @Test

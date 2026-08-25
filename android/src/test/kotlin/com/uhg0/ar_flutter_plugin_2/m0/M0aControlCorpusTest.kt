@@ -5,6 +5,7 @@ import java.nio.ByteOrder
 import java.security.MessageDigest
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -69,6 +70,12 @@ class M0aControlCorpusTest {
         assertEquals(2, validation.int("startRestoreSchemaErrorId"))
         assertEquals(36, validation.int("nonFiniteMatrixErrorId"))
         assertEquals(M0aControlCodec.errorDetailBytes, validation.int("errorDetailBytes"))
+        assertEquals(true, validation.getValue("everyErrorRequiresDetail").jsonPrimitive.boolean)
+        val lifecyclePolicies = validation.getValue("lifecycleErrorPolicies").jsonObject
+        assertEquals(listOf(0, 6, 5, 0), lifecyclePolicies.policy(1))
+        assertEquals(listOf(2, 4, 4, 4), lifecyclePolicies.policy(4))
+        assertEquals(listOf(0, 6, 5, 0), lifecyclePolicies.policy(46))
+        assertEquals(listOf(0, 7, 5, 0), lifecyclePolicies.policy(48))
         root.getValue("requests").jsonArray.forEach { raw ->
             val spec = raw.jsonObject
             val request = M0aControlRequest(
@@ -220,6 +227,14 @@ class M0aControlCorpusTest {
     private fun JsonObject.int(key: String): Int = getValue(key).jsonPrimitive.int
     private fun JsonObject.long(key: String): Long = getValue(key).jsonPrimitive.long
     private fun JsonObject.string(key: String): String = getValue(key).jsonPrimitive.content
+    private fun JsonObject.policy(errorId: Int): List<Int> = getValue(errorId.toString()).jsonObject.let {
+        listOf(
+            it.int("disposition"),
+            it.int("validationPhase"),
+            it.int("recoveryAction"),
+            it.int("resultFlags"),
+        )
+    }
 
     private fun hex(value: String): ByteArray = ByteArray(value.length / 2) { index ->
         value.substring(index * 2, index * 2 + 2).toInt(16).toByte()
