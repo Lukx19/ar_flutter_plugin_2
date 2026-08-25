@@ -9,7 +9,6 @@ import com.uhg0.ar_flutter_plugin_2.m0.M0aControlCodec
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlLifecycle
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlOperation
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlRequest
-import com.uhg0.ar_flutter_plugin_2.m0.M0aControlValidationFailure
 import com.uhg0.ar_flutter_plugin_2.m0.M0aPacketCodec
 import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineV1
 import com.uhg0.ar_flutter_plugin_2.m0.toMap
@@ -51,6 +50,7 @@ class VisibilityGridV2Binding internal constructor(
     private val arSessionIdentity: ByteArray = newOpaqueToken(),
     private val viewInstanceId: ByteArray = newOpaqueToken(),
     private val postToMain: ((() -> Unit) -> Unit)? = null,
+    private val beforeControlAdmission: (() -> Unit)? = null,
     private val beforeControlPublication: (() -> Unit)? = null,
     private val activeSessionIdSeed: M0aUuid? = null,
     private val activeCaptureGroupIdSeed: M0aUuid? = null,
@@ -355,51 +355,35 @@ class VisibilityGridV2Binding internal constructor(
             "stop" -> M0aControlOperation.STOP
             else -> null
         }
-        val bytes = authenticatedPayload(call.arguments as? ByteArray)
-        if (operation == null || bytes == null) {
+        val admission = operation?.let { admitControl(call.arguments as? ByteArray) }
+        if (operation == null || admission == null) {
             result.error("VG_PROTOCOL_INVALID", "V2 control requires one Uint8List", null)
             return
         }
-        val admittedGeneration = currentBindingGeneration
-        val admittedQualifier = bindingQualifier()
         val pending = PendingControlResult(result) { pendingControlResults.remove(it) }
         pendingControlResults.add(pending)
         try {
             executor.execute {
                 val outcome = runCatching {
-                    checkCurrentBinding(admittedGeneration, admittedQualifier)
+                    checkCurrentBinding(admission.generation, admission.qualifier)
                     recordExecutorOperation("control:${operation.name.lowercase()}")
-                    val correlated = M0aControlCodec.decodeCorrelatedRequest(bytes, operation)
+                    val correlated = M0aControlCodec.decodeCorrelatedRequest(admission.payload, operation)
                     val request = correlated.request
                     val framingFailure = correlated.failure
-                    val payloadFailure = if (
-                        framingFailure == null && operation == M0aControlOperation.START
-                    ) {
-                        runCatching { M0aStartRequestCodecV2.decode(request.payload) }
-                            .exceptionOrNull()
-                            ?.let {
-                                M0aControlValidationFailure(
-                                    errorId = 6,
-                                    validationPhase = 6,
-                                    fieldId = 15,
-                                    expectedValue = M0aStartRequestCodecV2.byteLength.toLong(),
-                                    observedValue = request.payload.size.toLong(),
-                                )
-                            }
-                    } else {
-                        null
-                    }
+                    val payloadFailure = if (framingFailure == null) {
+                        M0aControlCodec.validateControlPayload(request)
+                    } else null
                     val malformed = framingFailure ?: payloadFailure
                     if (malformed != null) {
                         val response = lifecycle.malformed(request, malformed)
                         beforeControlPublication?.invoke()
                         synchronized(publicationFence) {
-                            checkCurrentBinding(admittedGeneration, admittedQualifier)
+                            checkCurrentBinding(admission.generation, admission.qualifier)
                             qualify(response)
                         }
                     } else {
                         val wasIdle = lifecycle.state() == M0aControlLifecycle.State.IDLE
-                        val response = lifecycle.handle(request, bytes)
+                        val response = lifecycle.handle(request, admission.payload)
                         val decoded = M0aControlCodec.decodeResponse(response)
                         if (
                             wasIdle && operation == M0aControlOperation.START &&
@@ -411,7 +395,7 @@ class VisibilityGridV2Binding internal constructor(
                         debugRecoverySeam.afterRestoredStartQualification(request)
                         beforeControlPublication?.invoke()
                         synchronized(publicationFence) {
-                            checkCurrentBinding(admittedGeneration, admittedQualifier)
+                            checkCurrentBinding(admission.generation, admission.qualifier)
                             if (
                                 wasIdle && operation == M0aControlOperation.START &&
                                 decoded.outcome == 0
@@ -572,11 +556,13 @@ class VisibilityGridV2Binding internal constructor(
             before = resourcesBefore,
             after = lifecycleResources(excludedCleanup = currentCleanup),
         )
-        lifecycle = newLifecycle()
-        currentBindingGeneration = nextBindingGeneration.incrementAndGet()
-        nativeStreamToken = newOpaqueToken()
-        workerBindingToken = newOpaqueToken()
-        streamChannel = newStreamChannel()
+        synchronized(publicationFence) {
+            lifecycle = newLifecycle()
+            currentBindingGeneration = nextBindingGeneration.incrementAndGet()
+            nativeStreamToken = newOpaqueToken()
+            workerBindingToken = newOpaqueToken()
+            streamChannel = newStreamChannel()
+        }
         initialTransactionQueued = false
         acceptedControls = 0L
         activeControlRequestId = null
@@ -764,11 +750,17 @@ class VisibilityGridV2Binding internal constructor(
     private fun qualifierMatches(bytes: ByteArray?): Boolean =
         bytes != null && bytes.contentEquals(bindingQualifier())
 
-    private fun authenticatedPayload(bytes: ByteArray?): ByteArray? {
+    private fun admitControl(bytes: ByteArray?): ControlAdmission? = synchronized(publicationFence) {
+        beforeControlAdmission?.invoke()
         val qualifier = bindingQualifier()
-        if (bytes == null || bytes.size < qualifier.size ||
-            !bytes.copyOfRange(0, qualifier.size).contentEquals(qualifier)) return null
-        return bytes.copyOfRange(qualifier.size, bytes.size)
+        if (disposed.get() || bytes == null || bytes.size < qualifier.size ||
+            !bytes.copyOfRange(0, qualifier.size).contentEquals(qualifier)
+        ) return@synchronized null
+        ControlAdmission(
+            generation = currentBindingGeneration,
+            qualifier = qualifier,
+            payload = bytes.copyOfRange(qualifier.size, bytes.size),
+        )
     }
 
     private fun qualify(bytes: ByteArray): ByteArray = bindingQualifier() + bytes
@@ -920,6 +912,12 @@ class VisibilityGridV2Binding internal constructor(
     private data class BindingAdmission(val lease: CleanupAdmissionLease) {
         val identity: BindingIdentity get() = lease.identity
     }
+
+    private data class ControlAdmission(
+        val generation: Long,
+        val qualifier: ByteArray,
+        val payload: ByteArray,
+    )
 
     private class CleanupAdmissionLease(
         private val authority: CleanupAuthority,

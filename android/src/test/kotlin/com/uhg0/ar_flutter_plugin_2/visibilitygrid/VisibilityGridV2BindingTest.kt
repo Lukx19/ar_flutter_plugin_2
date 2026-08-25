@@ -114,8 +114,8 @@ class VisibilityGridV2BindingTest {
             )
             val payloadDetail = M0aControlCodec.decodeErrorDetail(payloadError.payload)
             assertEquals(6, payloadError.errorId)
-            assertEquals(6, payloadDetail.validationPhase)
-            assertEquals(15, payloadDetail.fieldId)
+            assertEquals(2, payloadDetail.validationPhase)
+            assertEquals(3, payloadDetail.fieldId)
             assertEquals(M0aStartRequestCodecV2.byteLength.toLong(), payloadDetail.expectedValue)
             assertEquals(shortStart.payload.size.toLong(), payloadDetail.observedValue)
             assertEquals(0, binding.snapshot().acceptedControls)
@@ -135,6 +135,90 @@ class VisibilityGridV2BindingTest {
             assertEquals(1, correctedResponse.streamToken)
             assertEquals(1, binding.snapshot().acceptedControls)
             assertEquals(baseline, authority.snapshot(scope))
+        } finally {
+            binding.dispose()
+        }
+    }
+
+    @Test
+    fun `malformed non START payloads are not admitted and corrected same IDs remain legal`() {
+        val messenger = MethodTestMessenger()
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 1201,
+            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            postToMain = { task -> task() },
+        )
+        try {
+            val channel = MethodChannel(messenger, "visibility_grid_v2_control_1201")
+            val initial = binding.snapshot()
+            val qualifier = initial.nativeStreamToken + initial.workerBindingToken
+
+            fun invoke(method: String, request: M0aControlRequest): com.uhg0.ar_flutter_plugin_2.m0.M0aControlResponse {
+                val result = RecordingResult()
+                channel.invokeMethod(method, qualifier + M0aControlCodec.encodeRequest(request), result)
+                assertTrue(result.completed.await(2, TimeUnit.SECONDS))
+                assertEquals(1, result.successCount)
+                return M0aControlCodec.decodeResponse(
+                    stripQualifier(result.successValue as ByteArray, qualifier),
+                )
+            }
+
+            val started = invoke("start", startRequest())
+            assertEquals(0, started.outcome)
+            val streamToken = started.streamToken
+            val begin = ByteArray(112).also { bytes ->
+                val data = ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                data.putInt(96, 4096)
+                data.putLong(104, 1)
+            }
+            val release = ByteArray(72).also { bytes ->
+                ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN).putLong(0, 1)
+            }
+            val stop = ByteArray(88).also { bytes ->
+                val data = ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                data.put(0, 2)
+                data.put(1, 1)
+                data.putLong(8, 1)
+            }
+            val operations = listOf(
+                Triple("beginCheckpoint", M0aControlOperation.BEGIN_CHECKPOINT, begin),
+                Triple("releaseCheckpoint", M0aControlOperation.RELEASE_CHECKPOINT, release),
+                Triple("stop", M0aControlOperation.STOP, stop),
+            )
+            operations.forEachIndexed { index, (method, operation, payload) ->
+                val request = startRequest().copy(
+                    operation = operation,
+                    controlRequestId = uuid(70 + index * 3),
+                    streamToken = streamToken,
+                    payload = payload,
+                )
+                val malformedPayload = payload.copyOf().also { bytes ->
+                    when (operation) {
+                        M0aControlOperation.BEGIN_CHECKPOINT ->
+                            ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN).putInt(96, 0)
+                        M0aControlOperation.RELEASE_CHECKPOINT -> bytes[8] = 1
+                        M0aControlOperation.STOP -> bytes[1] = 0
+                        M0aControlOperation.START -> error("unreachable")
+                    }
+                }
+                val before = binding.snapshot()
+                val malformed = invoke(method, request.copy(payload = malformedPayload))
+                assertEquals(1, malformed.outcome)
+                val detail = M0aControlCodec.decodeErrorDetail(malformed.payload)
+                assertEquals(0, detail.disposition)
+                assertEquals(5, detail.recoveryAction)
+                assertTrue(detail.validationPhase in 1..7)
+                val after = binding.snapshot()
+                assertEquals(before.acceptedControls, after.acceptedControls)
+                assertEquals(before.operationGeneration, after.operationGeneration)
+                assertEquals(before.lifecycleSequence, after.lifecycleSequence)
+                assertEquals(before.streamToken, after.streamToken)
+
+                val corrected = invoke(method, request)
+                assertEquals(0, corrected.outcome)
+                assertEquals(before.acceptedControls + 1, binding.snapshot().acceptedControls)
+            }
         } finally {
             binding.dispose()
         }
@@ -217,6 +301,93 @@ class VisibilityGridV2BindingTest {
             assertEquals(0, binding.snapshot().acceptedControls)
         } finally {
             release.countDown()
+            binding.dispose()
+        }
+    }
+
+    @Test
+    fun `qualifier authentication and generation admission are atomic against replacement`() {
+        val messenger = MethodTestMessenger()
+        val admissionEntered = CountDownLatch(1)
+        val releaseAdmission = CountDownLatch(1)
+        val workerEntered = CountDownLatch(1)
+        val releaseWorker = CountDownLatch(1)
+        val worker = Executors.newSingleThreadExecutor()
+        worker.execute {
+            workerEntered.countDown()
+            try {
+                releaseWorker.await()
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
+        assertTrue(workerEntered.await(2, TimeUnit.SECONDS))
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 1197,
+            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            executor = worker,
+            postToMain = { task -> task() },
+            beforeControlAdmission = {
+                admissionEntered.countDown()
+                releaseAdmission.await()
+            },
+        )
+        val callers = Executors.newFixedThreadPool(2)
+        try {
+            val channel = MethodChannel(messenger, "visibility_grid_v2_control_1197")
+            val oldSnapshot = binding.snapshot()
+            val oldQualifier = oldSnapshot.nativeStreamToken + oldSnapshot.workerBindingToken
+            val oldControl = RecordingResult()
+            val controlCall = callers.submit {
+                channel.invokeMethod(
+                    "start",
+                    oldQualifier + M0aControlCodec.encodeRequest(startRequest()),
+                    oldControl,
+                )
+            }
+            assertTrue(admissionEntered.await(2, TimeUnit.SECONDS))
+
+            val abandon = RecordingResult()
+            val abandonCall = callers.submit {
+                channel.invokeMethod("abandonBinding", oldQualifier, abandon)
+            }
+            releaseAdmission.countDown()
+            controlCall.get(2, TimeUnit.SECONDS)
+            abandonCall.get(2, TimeUnit.SECONDS)
+            assertTrue(oldControl.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(0, oldControl.successCount)
+            assertEquals("VG_STREAM_BINDING_ABANDONED", oldControl.errorCode)
+            assertEquals(1, abandon.successCount)
+
+            val replacementSnapshot = RecordingResult()
+            channel.invokeMethod("bindingSnapshot", null, replacementSnapshot)
+            assertTrue(replacementSnapshot.completed.await(2, TimeUnit.SECONDS))
+            val replacement = replacementSnapshot.successValue as Map<*, *>
+            val newQualifier = (replacement["nativeStreamToken"] as ByteArray) +
+                (replacement["workerBindingToken"] as ByteArray)
+            assertFalse(oldQualifier.contentEquals(newQualifier))
+
+            val stale = RecordingResult()
+            channel.invokeMethod(
+                "start",
+                oldQualifier + M0aControlCodec.encodeRequest(startRequest()),
+                stale,
+            )
+            assertEquals(1, stale.errorCount)
+            val corrected = RecordingResult()
+            channel.invokeMethod(
+                "start",
+                newQualifier + M0aControlCodec.encodeRequest(startRequest()),
+                corrected,
+            )
+            assertTrue(corrected.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(1, corrected.successCount)
+        } finally {
+            releaseAdmission.countDown()
+            releaseWorker.countDown()
+            callers.shutdownNow()
+            worker.shutdownNow()
             binding.dispose()
         }
     }

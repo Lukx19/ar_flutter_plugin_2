@@ -1,5 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.m0
 
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.security.MessageDigest
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -10,9 +12,36 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class M0aControlCorpusTest {
+    @Test
+    fun `START payload failures retain stable phase field and evidence identity`() {
+        val valid = M0aStartRequestCodecV2.defaultPayload()
+        val cases = listOf(
+            valid.copyOf().also { ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putShort(4, 6.toShort()) } to
+                M0aControlValidationFailure(1, 4, 2, 5, 6),
+            valid.copyOf().also { it[7] = 2 } to
+                M0aControlValidationFailure(6, 3, 5, 1, 2),
+            valid.copyOf().also { ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putInt(24, 0) } to
+                M0aControlValidationFailure(36, 4, 20, 4096, 0),
+            valid.copyOf().also { ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putShort(48, 2.toShort()) } to
+                M0aControlValidationFailure(6, 5, 21, 1, 2),
+            valid.copyOf().also {
+                ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putDouble(136, Double.NaN)
+            } to M0aControlValidationFailure(6, 5, 21, 0, Double.NaN.toRawBits()),
+            valid.copyOf().also { it[392] = 1 } to
+                M0aControlValidationFailure(6, 6, 22, 0, 2),
+            valid.copyOf().also { it[456] = 1 } to
+                M0aControlValidationFailure(6, 7, 5, 0, 1),
+        )
+        cases.forEach { (payload, expected) ->
+            assertEquals(expected, M0aControlCodec.validateControlPayload(startRequest(payload)))
+        }
+        assertEquals(null, M0aControlCodec.validateControlPayload(startRequest(valid)))
+    }
+
     @Test
     fun `Kotlin control envelopes match the locked Dart corpus`() {
         val root = fixture()
@@ -35,6 +64,12 @@ class M0aControlCorpusTest {
             assertEquals(spec.int("length"), bytes.size)
             assertEquals(spec.string("sha256"), sha256(bytes))
             assertArrayEquals(bytes, M0aControlCodec.encodeRequest(M0aControlCodec.decodeRequest(bytes)))
+            assertEquals(null, M0aControlCodec.validateControlPayload(request))
+            val truncated = M0aControlCodec.validateControlPayload(
+                request.copy(payload = request.payload.copyOf(request.payload.size - 1)),
+            )
+            assertEquals(2, truncated?.validationPhase)
+            assertEquals(3, truncated?.fieldId)
         }
 
         val response = root.getValue("startResponse").jsonObject
@@ -108,12 +143,49 @@ class M0aControlCorpusTest {
         val decodedError = M0aControlCodec.decodeResponse(errorBytes)
         assertEquals(6, decodedError.errorId)
         assertEquals(0, M0aControlCodec.decodeErrorDetail(decodedError.payload).disposition)
+
+        val mismatchedErrorId = errorBytes.copyOf().also { bytes ->
+            bytes[M0aControlCodec.responseHeaderBytes] = 5
+            ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).putInt(
+                120,
+                M0aControlCodec.crc32(bytes, 120),
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            M0aControlCodec.decodeResponse(mismatchedErrorId)
+        }
+        val mismatchedDiagnosticLength = errorBytes.copyOf().also { bytes ->
+            ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).putShort(
+                M0aControlCodec.responseHeaderBytes + 10,
+                1.toShort(),
+            )
+            ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).putInt(
+                120,
+                M0aControlCodec.crc32(bytes, 120),
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            M0aControlCodec.decodeResponse(mismatchedDiagnosticLength)
+        }
     }
 
     private fun fixture(): JsonObject = Json.parseToJsonElement(
         requireNotNull(javaClass.classLoader?.getResourceAsStream("m0a_control_corpus_v1.json"))
             .bufferedReader().use { it.readText() },
     ).jsonObject
+
+    private fun startRequest(payload: ByteArray) = M0aControlRequest(
+        operation = M0aControlOperation.START,
+        flags = 0,
+        controlRequestId = M0aUuid(hex("102132435465467798a9bacbdcedfe0f")),
+        sessionId = M0aUuid(hex("2031425364754677a8b9cadbdcedfe1f")),
+        captureGroupId = M0aUuid(hex("3041526374854677a8b9cadbdcedfe2f")),
+        sessionGeneration = 1,
+        groupGeneration = 1,
+        coverageEpoch = 1,
+        streamToken = 0,
+        payload = payload,
+    )
 
     private fun JsonObject.int(key: String): Int = getValue(key).jsonPrimitive.int
     private fun JsonObject.long(key: String): Long = getValue(key).jsonPrimitive.long
