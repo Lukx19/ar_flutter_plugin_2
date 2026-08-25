@@ -37,7 +37,7 @@ final class ARVisibilitySurfaceStream {
   final BasicMessageChannel<ByteData?> _channel;
   bool _closed = false;
   bool _abandoned = false;
-  Future<void>? _inFlight;
+  Future<void> _tail = Future<void>.value();
 
   /// Sends one packed request. A second request waits for the first, keeping
   /// one outstanding binding invocation as required by chapter 8.
@@ -45,23 +45,23 @@ final class ARVisibilitySurfaceStream {
     Uint8List request, {
     Duration? timeout,
   }) async {
-    _ensureOpen();
     final attempt = ARVisibilitySurfaceStreamAttempt(request);
-    final previous = _inFlight;
-    if (previous != null) await previous;
-    final operation = _exchangeNow(attempt.requestBytes);
-    final completion = operation.then<void>((_) {});
-    _inFlight = completion;
+    _ensureOpen();
+    final previous = _tail;
+    final turn = Completer<void>();
+    _tail = turn.future;
     try {
+      await previous;
+      _ensureOpen();
+      final operation = _exchangeNow(attempt.requestBytes);
       final response =
           timeout == null ? await operation : await operation.timeout(timeout);
       return response;
     } on TimeoutException {
       _abandoned = true;
-      _inFlight = null;
       throw const ARVisibilitySurfaceStreamUnknownOutcome();
     } finally {
-      if (identical(_inFlight, completion)) _inFlight = null;
+      turn.complete();
     }
   }
 
@@ -76,13 +76,11 @@ final class ARVisibilitySurfaceStream {
   Future<void> dispose() async {
     _closed = true;
     _abandoned = true;
-    final inFlight = _inFlight;
-    // Marking the binding abandoned fences new calls, but an invocation that
-    // was already accepted still owns a native reply. Wait for that reply so
-    // platform-view teardown cannot race the serial worker. A timed-out
-    // attempt clears `_inFlight`, so disposal remains bounded after the
-    // unknown-outcome fence.
-    if (inFlight != null) await inFlight;
+    // Marking the binding abandoned fences queued calls. The tail completes
+    // after the accepted invocation has replied, or immediately after its
+    // timeout made the outcome unknown, so teardown cannot start parallel
+    // same-binding work and remains bounded after abandonment.
+    await _tail;
   }
 
   void _ensureOpen() {

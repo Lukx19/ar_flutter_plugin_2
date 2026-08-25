@@ -70,7 +70,13 @@ class M0aVisibilitySurfaceStreamChannel(
     private val onCommitPublished: ((M0aPacketCodec.Request, M0aCommittedBaselineV1) -> Unit)? = null,
     private val onAbandonedRequest: ((M0aPacketCodec.Request, M0aCommittedBaselineV1) -> Unit)? = null,
     private val onAbandonedContinuation: (() -> Unit)? = null,
+    initialNextExpectedSequence: Long = 1L,
 ) {
+    init {
+        require(initialNextExpectedSequence in 1..Long.MAX_VALUE) {
+            "initialNextExpectedSequence is outside PortableOrdinal"
+        }
+    }
     private val mainHandler = Handler(Looper.getMainLooper())
     private val channel = BasicMessageChannel<ByteBuffer>(
         messenger,
@@ -88,7 +94,7 @@ class M0aVisibilitySurfaceStreamChannel(
     private val outstandingInvocation = AtomicBoolean(false)
     @Volatile private var activePendingReply: PendingReply? = null
     @Volatile private var lastSequence: Long? = null
-    @Volatile private var nextExpectedSequence = 1L
+    @Volatile private var nextExpectedSequence = initialNextExpectedSequence
     @Volatile private var lastRequest: ByteArray? = null
     @Volatile private var lastResponse: ByteArray? = null
     @Volatile private var resyncPending = false
@@ -297,6 +303,10 @@ class M0aVisibilitySurfaceStreamChannel(
                                             !isValidResyncRequest(request) -> {
                                             throw BindingError(TRANSACTION_STATE_ERROR_ID)
                                         }
+                                        request.requestSequence == Long.MAX_VALUE &&
+                                            !isValidTerminalDrain(request) -> {
+                                            throw BindingError(STREAM_ROLLOVER_REQUIRED_ERROR_ID)
+                                        }
                                         else -> {
                                             if (request.requestFlags and RESYNC_REQUEST_FLAG != 0 &&
                                                 !isValidResyncRequest(request)) {
@@ -324,6 +334,16 @@ class M0aVisibilitySurfaceStreamChannel(
                                                 val requiresResync = requiresResync(request)
                                                 val publicationBytes = M0aPacketCodec.encodeResponse(
                                                     when {
+                                                    isValidTerminalDrain(request) -> {
+                                                        M0aPacketCodec.rolloverRequired(
+                                                            streamToken = request.streamToken,
+                                                            requestSequence = request.requestSequence,
+                                                            transactionId = committedBaseline.transactionId,
+                                                            targetGeometryRevision = committedBaseline.geometryRevision,
+                                                            targetLineageRevision = committedBaseline.lineageRevision,
+                                                            acceptedStyleRevision = committedBaseline.styleRevision,
+                                                        )
+                                                    }
                                                     resyncPending -> {
                                                         if (transactionReceiver.state ==
                                                             M0aStructuralTransactionState.RESYNC_PENDING) {
@@ -377,7 +397,11 @@ class M0aVisibilitySurfaceStreamChannel(
                                                 publicationBytes
                                             }
                                             lastSequence = request.requestSequence
-                                            nextExpectedSequence = request.requestSequence + 1
+                                            nextExpectedSequence = if (request.requestSequence == Long.MAX_VALUE) {
+                                                Long.MAX_VALUE
+                                            } else {
+                                                request.requestSequence + 1
+                                            }
                                             lastRequest = bytes.copyOf()
                                             lastResponse = encoded.copyOf()
                                             telemetry.allocated(bytes.size + encoded.size)
@@ -639,6 +663,17 @@ class M0aVisibilitySurfaceStreamChannel(
             payload.lastCommittedLineageRevision == request.acknowledgedLineageRevision
     }
 
+    private fun isValidTerminalDrain(request: M0aPacketCodec.Request): Boolean =
+        request.requestSequence == Long.MAX_VALUE &&
+            request.requestFlags == TERMINAL_DRAIN_REQUEST_FLAG &&
+            request.styleRecords.isEmpty() &&
+            request.commandBytes.isEmpty() &&
+            request.nextStyleRevision == committedBaseline.styleRevision &&
+            request.acknowledgedTransactionId == committedBaseline.transactionId &&
+            request.acknowledgedGeometryRevision == committedBaseline.geometryRevision &&
+            request.acknowledgedLineageRevision == committedBaseline.lineageRevision &&
+            synchronized(structuralFrames) { structuralFrames.isEmpty() }
+
     private fun requiresResync(request: M0aPacketCodec.Request): Boolean {
         val structuralAcknowledgement =
             (request.acknowledgedTransactionId != 0L ||
@@ -702,7 +737,17 @@ class M0aVisibilitySurfaceStreamChannel(
             ?: error("Structural transaction must begin with BEGIN")
         val commit = (frames.lastOrNull() as? M0aTransactionCommitFrameV1)?.value
             ?: error("Structural transaction must end with COMMIT")
-        require(begin.transactionId > 0 && commit.transactionId == begin.transactionId)
+        require(committedBaseline.transactionId < Long.MAX_VALUE) {
+            "Native transaction allocation requires binding rollover"
+        }
+        require(
+            begin.transactionId == committedBaseline.transactionId + 1 &&
+                begin.baseGeometryRevision == committedBaseline.geometryRevision &&
+                begin.targetGeometryRevision > begin.baseGeometryRevision &&
+                begin.targetLineageRevision > 0 &&
+                begin.targetLineageRevision >= committedBaseline.lineageRevision &&
+                commit.transactionId == begin.transactionId,
+        ) { "Structural transaction does not advance the committed cursor" }
         require(frames.size == begin.chunkCount + 2)
         require(begin.totalBytes in 0..M0aPacketCodec.requestCeilingBytes)
         require(begin.chunkCount in 0..0xffff)
@@ -817,7 +862,9 @@ class M0aVisibilitySurfaceStreamChannel(
         const val STALE_SEQUENCE_ERROR_ID = 31
         const val SEQUENCE_GAP_ERROR_ID = 32
         const val TRANSACTION_STATE_ERROR_ID = 34
+        const val STREAM_ROLLOVER_REQUIRED_ERROR_ID = 35
         const val RESYNC_REQUEST_FLAG = 1 shl 2
+        const val TERMINAL_DRAIN_REQUEST_FLAG = 1 shl 5
         const val STREAM_BINDING_ABANDONED_ERROR_ID = 142
         const val WORKER_BINDING_LOST_ERROR_ID = 144
         const val DEFAULT_WORKER_TIMEOUT_MILLIS = 2_000L

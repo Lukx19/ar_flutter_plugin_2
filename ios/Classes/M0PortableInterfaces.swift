@@ -43,6 +43,10 @@ enum M0PortableInterfaceConstants {
     static let controlResponseHeaderBytes = 128
     static let startRequestBytes = 464
     static let startResultBytes = 184
+    static let portableOrdinalMaximum = UInt64(Int64.max)
+    static let terminalDrainRequestFlag: UInt16 = 1 << 5
+    static let requestConsumedResultFlag: UInt16 = 1
+    static let rolloverRequiredResultFlag: UInt16 = 1 << 2
 }
 
 /// Shape-only immutable group and runtime-binding identity.
@@ -162,9 +166,34 @@ struct VisibilityGridV2LifecycleCutV1 {
 struct M0PortableResponseDescriptor {
     let streamToken: UInt64
     let requestSequence: UInt64
+    let nextExpectedRequestSequence: UInt64
+    let resultFlags: UInt16
     let transactionID: UInt64
     let geometryRevision: UInt64
     let lineageRevision: UInt64
+    let payload: Data
+}
+
+/// Shape-only immutable exchange attempt retained for exact replay.
+struct VisibilityGridV2ExchangeAttemptDescriptor {
+    let binding: VisibilityGridV2BindingIdentity
+    let requestSequence: UInt64
+    let requestBytes: Data
+    let responseBytes: Data?
+    let terminalDrain: Bool
+}
+
+/// Shape-only structural staging frame. Validation and publication remain
+/// deferred with the executable iOS adapter.
+struct VisibilityGridV2StructuralFrameDescriptor {
+    let kind: UInt8
+    let transactionID: UInt64
+    let baseGeometryRevision: UInt64
+    let targetGeometryRevision: UInt64
+    let targetLineageRevision: UInt64
+    let chunkIndex: UInt16
+    let chunkCount: UInt16
+    let payloadCRC32: UInt32
     let payload: Data
 }
 

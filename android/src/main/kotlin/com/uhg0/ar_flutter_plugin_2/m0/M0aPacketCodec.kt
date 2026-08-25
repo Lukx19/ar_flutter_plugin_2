@@ -259,10 +259,11 @@ object M0aPacketCodec {
         targetGeometryRevision: Long = 0,
         targetLineageRevision: Long = 0,
         acceptedStyleRevision: Long = 0,
+        resultFlags: Int = 0,
     ): Response = Response(
         messageKind = noChangesMessageKind,
         responseFlags = 0,
-        resultFlags = 0,
+        resultFlags = resultFlags,
         errorId = 0,
         requestSequence = requestSequence,
         streamToken = streamToken,
@@ -271,6 +272,25 @@ object M0aPacketCodec {
         targetGeometryRevision = targetGeometryRevision,
         targetLineageRevision = targetLineageRevision,
         acceptedStyleRevision = acceptedStyleRevision,
+    )
+
+    /** Consumed terminal drain. The maximum sequence remains replayable. */
+    fun rolloverRequired(
+        streamToken: Long,
+        requestSequence: Long,
+        transactionId: Long,
+        targetGeometryRevision: Long,
+        targetLineageRevision: Long,
+        acceptedStyleRevision: Long,
+    ): Response = noChanges(
+        streamToken = streamToken,
+        requestSequence = requestSequence,
+        nextExpectedRequestSequence = requestSequence,
+        transactionId = transactionId,
+        targetGeometryRevision = targetGeometryRevision,
+        targetLineageRevision = targetLineageRevision,
+        acceptedStyleRevision = acceptedStyleRevision,
+        resultFlags = REQUEST_CONSUMED_RESULT_FLAG or ROLLOVER_REQUIRED_RESULT_FLAG,
     )
 
     /** A bounded response instructing the worker to rebuild its acknowledgement baseline. */
@@ -353,6 +373,9 @@ object M0aPacketCodec {
         require(response.regionResultCount in 0..0xffff)
         require(response.diagnostic.size <= 1024) { "Response diagnostic exceeds 1 KiB" }
     }
+
+    private const val REQUEST_CONSUMED_RESULT_FLAG = 1
+    private const val ROLLOVER_REQUIRED_RESULT_FLAG = 1 shl 2
 
     private fun ByteArray.writeMagic(value: String) {
         value.toByteArray(Charsets.US_ASCII).copyInto(this)

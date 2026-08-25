@@ -217,10 +217,10 @@ class M0aVisibilitySurfaceStreamChannelTest {
         val messenger = TestMessenger(27)
         val binding = M0aVisibilitySurfaceStreamChannel(messenger, 27)
         val frames = M0aStructuralTransactionProducerV1.produce(
-            transactionId = 3,
-            baseGeometryRevision = 4,
-            targetGeometryRevision = 5,
-            targetLineageRevision = 6,
+            transactionId = 1,
+            baseGeometryRevision = 0,
+            targetGeometryRevision = 1,
+            targetLineageRevision = 1,
             bytes = byteArrayOf(1, 2, 3, 4, 5),
             maximumChunkBytes = 1024,
         )
@@ -342,10 +342,10 @@ class M0aVisibilitySurfaceStreamChannelTest {
         val binding = M0aVisibilitySurfaceStreamChannel(messenger, 29)
         binding.queueStructuralTransaction(
             M0aStructuralTransactionProducerV1.produce(
-                transactionId = 3,
-                baseGeometryRevision = 4,
-                targetGeometryRevision = 5,
-                targetLineageRevision = 6,
+                transactionId = 1,
+                baseGeometryRevision = 0,
+                targetGeometryRevision = 1,
+                targetLineageRevision = 1,
                 bytes = byteArrayOf(1),
             ),
         )
@@ -357,9 +357,9 @@ class M0aVisibilitySurfaceStreamChannelTest {
                 request(
                     sequence = 4,
                     token = 29,
-                    acknowledgedTransaction = 3,
-                    acknowledgedGeometry = 5,
-                    acknowledgedLineage = 6,
+                    acknowledgedTransaction = 1,
+                    acknowledgedGeometry = 1,
+                    acknowledgedLineage = 1,
                 ),
             ),
         )
@@ -369,9 +369,9 @@ class M0aVisibilitySurfaceStreamChannelTest {
                 request(
                     sequence = 5,
                     token = 29,
-                    acknowledgedTransaction = 3,
-                    acknowledgedGeometry = 5,
-                    acknowledgedLineage = 7,
+                    acknowledgedTransaction = 1,
+                    acknowledgedGeometry = 1,
+                    acknowledgedLineage = 2,
                 ),
             ),
         )
@@ -729,6 +729,49 @@ class M0aVisibilitySurfaceStreamChannelTest {
     }
 
     @Test
+    fun `maximum sequence requires terminal drain and replays without wrap`() {
+        val messenger = TestMessenger(117)
+        val binding = M0aVisibilitySurfaceStreamChannel(
+            messenger,
+            117,
+            initialNextExpectedSequence = Long.MAX_VALUE,
+        )
+
+        val ordinary = request(sequence = Long.MAX_VALUE, token = 117)
+        val rejected = M0aPacketCodec.decodeResponse(messenger.exchange(ordinary))
+        assertEquals(35, rejected.errorId)
+        assertEquals(0, rejected.resultFlags)
+        assertEquals(Long.MAX_VALUE, rejected.nextExpectedRequestSequence)
+        assertEquals(0L, binding.transportInstrumentation.snapshot().acceptedRequests)
+
+        val terminal = request(
+            sequence = Long.MAX_VALUE,
+            token = 117,
+            requestFlags = 1 shl 5,
+        )
+        val firstBytes = messenger.exchange(terminal)
+        val first = M0aPacketCodec.decodeResponse(firstBytes)
+        assertEquals(0, first.messageKind)
+        assertEquals(5, first.resultFlags)
+        assertEquals(Long.MAX_VALUE, first.nextExpectedRequestSequence)
+        assertArrayEquals(firstBytes, messenger.exchange(terminal))
+        assertEquals(1L, binding.transportInstrumentation.snapshot().acceptedRequests)
+        assertEquals(1L, binding.transportInstrumentation.snapshot().replayedRequests)
+
+        val conflict = M0aPacketCodec.decodeResponse(
+            messenger.exchange(
+                request(
+                    sequence = Long.MAX_VALUE,
+                    token = 117,
+                    requestFlags = (1 shl 5) or 1,
+                ),
+            ),
+        )
+        assertEquals(30, conflict.errorId)
+        binding.dispose()
+    }
+
+    @Test
     fun `abandon fence query reports zero and late COMMIT has no authority`() {
         val authority = M0aCommittedBaselineAuthority()
         val lifecycle = M0aControlLifecycle(committedBaselineAuthority = authority)
@@ -1081,6 +1124,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
     private fun request(
         sequence: Long,
         token: Long,
+        requestFlags: Int = 0,
         acknowledgedTransaction: Long = 0,
         acknowledgedGeometry: Long = 0,
         acknowledgedLineage: Long = 0,
@@ -1089,7 +1133,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
     ): ByteArray =
         M0aPacketCodec.encodeRequest(
             M0aPacketCodec.Request(
-                requestFlags = 0,
+                requestFlags = requestFlags,
                 streamToken = token,
                 acknowledgedTransactionId = acknowledgedTransaction,
                 acknowledgedGeometryRevision = acknowledgedGeometry,

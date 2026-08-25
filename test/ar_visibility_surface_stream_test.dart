@@ -28,7 +28,8 @@ void main() {
     channel.setMockMessageHandler(null);
   });
 
-  test('timeout fences the binding and preserves an immutable attempt', () async {
+  test('timeout fences the binding and preserves an immutable attempt',
+      () async {
     final pending = Completer<ByteData?>();
     final channel = BasicMessageChannel<ByteData?>(
       'visibility_surface_stream_timeout',
@@ -49,7 +50,8 @@ void main() {
       channel: channel,
     );
     await expectLater(
-      stream.exchange(Uint8List.fromList(<int>[4]), timeout: const Duration(milliseconds: 1)),
+      stream.exchange(Uint8List.fromList(<int>[4]),
+          timeout: const Duration(milliseconds: 1)),
       throwsA(isA<ARVisibilitySurfaceStreamUnknownOutcome>()),
     );
     expect(
@@ -83,6 +85,42 @@ void main() {
     await dispose;
     expect(disposed, isTrue);
 
+    channel.setMockMessageHandler(null);
+  });
+
+  test('concurrent callers enter the platform channel one at a time', () async {
+    final firstReply = Completer<ByteData?>();
+    final firstEntered = Completer<void>();
+    var active = 0;
+    var peakActive = 0;
+    var calls = 0;
+    final channel = BasicMessageChannel<ByteData?>(
+      'visibility_surface_stream_serial',
+      const BinaryCodec(),
+    );
+    channel.setMockMessageHandler((_) async {
+      calls++;
+      active++;
+      if (active > peakActive) peakActive = active;
+      if (calls == 1) {
+        firstEntered.complete();
+        await firstReply.future;
+      }
+      active--;
+      return ByteData.sublistView(Uint8List.fromList(<int>[calls]));
+    });
+
+    final stream = ARVisibilitySurfaceStream(0, channel: channel);
+    final first = stream.exchange(Uint8List.fromList(<int>[1]));
+    final second = stream.exchange(Uint8List.fromList(<int>[2]));
+    await firstEntered.future;
+    expect(calls, 1);
+    firstReply.complete(ByteData.sublistView(Uint8List.fromList(<int>[1])));
+    expect(await first, orderedEquals(<int>[1]));
+    expect(await second, orderedEquals(<int>[2]));
+    expect(peakActive, 1);
+
+    await stream.dispose();
     channel.setMockMessageHandler(null);
   });
 }
