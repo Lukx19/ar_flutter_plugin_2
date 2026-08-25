@@ -233,6 +233,22 @@ class VisibilityGridV2Binding internal constructor(
                     nextSurfaceIdHighWater = 17,
                     schemaRootRevision = 18,
                 )
+                val terminal = M0aPacketCodec.decodeResponse(
+                    M0aPacketCodec.encodeResponse(
+                        M0aPacketCodec.rolloverRequired(
+                            streamToken = 1,
+                            requestSequence = Long.MAX_VALUE,
+                            transactionId = old.transactionId,
+                            targetGeometryRevision = old.geometryRevision,
+                            targetLineageRevision = old.lineageRevision,
+                            acceptedStyleRevision = old.styleRevision,
+                        ),
+                        M0aPacketCodec.responseMinimumBytes,
+                    ),
+                )
+                check(terminal.resultFlags == 5 &&
+                    terminal.nextExpectedRequestSequence == Long.MAX_VALUE &&
+                    terminal.transactionId == Long.MAX_VALUE)
                 val fresh = M0aCommittedBaselineV1.forFreshBinding(old)
                 val next = M0aStructuralTransactionProducerV1.produce(
                     transactionId = 1,
@@ -245,6 +261,8 @@ class VisibilityGridV2Binding internal constructor(
                 result.success(mapOf(
                     "oldTransactionId" to old.transactionId,
                     "oldRequestSequence" to Long.MAX_VALUE,
+                    "terminalResultFlags" to terminal.resultFlags,
+                    "terminalNextExpectedRequestSequence" to terminal.nextExpectedRequestSequence,
                     "freshTransactionId" to fresh.transactionId,
                     "freshRequestSequence" to 1L,
                     "nextTransactionId" to 1L,
