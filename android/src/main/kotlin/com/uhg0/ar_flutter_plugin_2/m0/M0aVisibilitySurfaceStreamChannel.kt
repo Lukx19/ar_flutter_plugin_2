@@ -214,6 +214,14 @@ class M0aVisibilitySurfaceStreamChannel(
         }
     }
 
+    /** Restores semantic authority into a fresh binding-scoped transaction domain. */
+    fun setFreshBindingBaseline(value: M0aCommittedBaselineV1) {
+        synchronized(this) {
+            committedBaseline = M0aCommittedBaselineV1.forFreshBinding(value)
+            controlLifecycle?.setCommittedBaseline(committedBaseline)
+        }
+    }
+
     private class BindingError(val errorId: Int) : IllegalArgumentException()
 
     init {
@@ -423,9 +431,12 @@ class M0aVisibilitySurfaceStreamChannel(
                                         streamError(
                                             streamToken = token,
                                             requestSequence = sequence,
-                                            nextExpectedRequestSequence = nextExpectedSequence,
-                                        errorId = error.errorId,
-                                    ),
+                                            nextExpectedRequestSequence =
+                                                M0aPacketCodec.nextSequenceForPolicy(
+                                                    error.errorId, sequence, nextExpectedSequence,
+                                                ),
+                                            errorId = error.errorId,
+                                        ),
                                         M0aPacketCodec.responseMinimumBytes,
                                     )
                                 } catch (_: Exception) {

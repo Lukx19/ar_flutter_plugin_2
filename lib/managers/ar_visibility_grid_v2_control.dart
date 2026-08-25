@@ -637,6 +637,17 @@ final class ARVisibilityGridV2Control {
     return _readV2DebugRecoveryTrace(_channel);
   }
 
+  /// Executes the bounded debug-only Issue 98 MAX-drain/fresh-cursor seam.
+  Future<Map<Object?, Object?>> runDebugV2Issue98Handoff() async {
+    await _bindingReady;
+    final raw =
+        await _channel.invokeMethod<Object?>('runDebugV2Issue98Handoff');
+    if (raw is! Map) {
+      throw StateError('V2 Issue 98 handoff returned an invalid receipt.');
+    }
+    return Map<Object?, Object?>.from(raw);
+  }
+
   /// Reconciles an outcome-unknown COMMIT against native's exact receipt.
   ///
   /// [query] must identify the old binding and accepted group/control cut.

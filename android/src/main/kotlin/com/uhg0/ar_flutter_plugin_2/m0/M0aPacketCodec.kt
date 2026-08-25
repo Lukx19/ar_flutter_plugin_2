@@ -30,20 +30,39 @@ object M0aPacketCodec {
         val disposition: Int,
         val validationPhase: Int,
         val recoveryAction: Int,
+        val sequenceDisposition: SequenceDisposition,
     )
 
+    enum class SequenceDisposition { UNCHANGED, ADJACENT, BINDING_INVALID }
+
     fun errorPolicy(errorId: Int): ErrorPolicy = when (errorId) {
-        6 -> ErrorPolicy(0, 0, 2, 0)
-        8 -> ErrorPolicy(9, 1, 8, 3)
-        30 -> ErrorPolicy(0, 0, 5, 4)
-        31 -> ErrorPolicy(0, 0, 5, 1)
-        32 -> ErrorPolicy(0, 0, 5, 0)
-        34 -> ErrorPolicy(0, 0, 7, 3)
-        35 -> ErrorPolicy(0, 0, 5, 4)
-        142 -> ErrorPolicy(2, 2, 8, 4)
-        144 -> ErrorPolicy(2, 2, 9, 4)
-        else -> ErrorPolicy(0, 0, 5, 0)
+        4 -> ErrorPolicy(2, 2, 4, 4, SequenceDisposition.BINDING_INVALID)
+        6 -> ErrorPolicy(0, 0, 2, 0, SequenceDisposition.UNCHANGED)
+        8 -> ErrorPolicy(9, 1, 8, 3, SequenceDisposition.ADJACENT)
+        30 -> ErrorPolicy(0, 0, 5, 4, SequenceDisposition.UNCHANGED)
+        31 -> ErrorPolicy(0, 0, 5, 1, SequenceDisposition.UNCHANGED)
+        32 -> ErrorPolicy(0, 0, 5, 0, SequenceDisposition.UNCHANGED)
+        34 -> ErrorPolicy(0, 0, 7, 3, SequenceDisposition.UNCHANGED)
+        35 -> ErrorPolicy(0, 0, 5, 4, SequenceDisposition.UNCHANGED)
+        48 -> ErrorPolicy(0, 0, 7, 0, SequenceDisposition.UNCHANGED)
+        142 -> ErrorPolicy(2, 2, 8, 4, SequenceDisposition.BINDING_INVALID)
+        144 -> ErrorPolicy(2, 2, 9, 4, SequenceDisposition.BINDING_INVALID)
+        else -> ErrorPolicy(0, 0, 5, 0, SequenceDisposition.UNCHANGED)
     }
+
+    fun nextSequenceForPolicy(
+        errorId: Int,
+        requestSequence: Long,
+        currentExpectedSequence: Long = requestSequence,
+    ): Long =
+        when (errorPolicy(errorId).sequenceDisposition) {
+            SequenceDisposition.UNCHANGED -> currentExpectedSequence
+            SequenceDisposition.ADJACENT -> {
+                require(requestSequence < Long.MAX_VALUE) { "Consumed error cannot advance MAX" }
+                requestSequence + 1
+            }
+            SequenceDisposition.BINDING_INVALID -> 0
+        }
 
     data class Request(
         val requestFlags: Int,
@@ -346,16 +365,21 @@ object M0aPacketCodec {
         errorId: Int = 1,
         authority: ErrorAuthority = ErrorAuthority(),
         diagnostic: ByteArray = byteArrayOf(),
+        expectedValue: Long = nextExpectedRequestSequence,
+        observedValue: Long = requestSequence,
     ): Response {
         val policy = errorPolicy(errorId)
+        val canonicalNextSequence = nextSequenceForPolicy(
+            errorId, requestSequence, nextExpectedRequestSequence,
+        )
         val detail = M0aControlCodec.encodeErrorDetail(M0aErrorDetail(
             errorId, 1, policy.disposition, policy.validationPhase,
             policy.recoveryAction, 0, 1, diagnostic.size,
             authority.geometryRevision, authority.lineageRevision,
             authority.captureRevision, authority.coverageRevision,
             authority.acceptedStyleRevision, authority.regionManifestRevision,
-            authority.nextSurfaceIdHighWater, nextExpectedRequestSequence,
-            requestSequence, authority.schemaRootRevision,
+            authority.nextSurfaceIdHighWater, expectedValue,
+            observedValue, authority.schemaRootRevision,
         ))
         return Response(
         messageKind = 255,
@@ -364,7 +388,7 @@ object M0aPacketCodec {
         errorId = errorId,
         requestSequence = requestSequence,
         streamToken = streamToken,
-        nextExpectedRequestSequence = nextExpectedRequestSequence,
+        nextExpectedRequestSequence = canonicalNextSequence,
         targetGeometryRevision = authority.geometryRevision,
         targetLineageRevision = authority.lineageRevision,
         acceptedStyleRevision = authority.acceptedStyleRevision,
@@ -419,6 +443,15 @@ object M0aPacketCodec {
                 detail.lineageRevision == response.targetLineageRevision &&
                 detail.acceptedStyleRevision == response.acceptedStyleRevision) {
                 "VGS2 error evidence disagrees with canonical policy or authority"
+            }
+            require(response.nextExpectedRequestSequence == when (policy.sequenceDisposition) {
+                SequenceDisposition.UNCHANGED -> detail.expectedValue
+                SequenceDisposition.ADJACENT -> nextSequenceForPolicy(
+                    response.errorId, response.requestSequence,
+                )
+                SequenceDisposition.BINDING_INVALID -> 0
+            }) {
+                "VGS2 error sequence disagrees with canonical policy"
             }
         } else {
             require(response.errorId == 0) { "Non-error response has a non-zero error ID" }

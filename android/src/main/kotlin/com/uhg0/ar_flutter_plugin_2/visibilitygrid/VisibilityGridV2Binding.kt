@@ -218,6 +218,51 @@ class VisibilityGridV2Binding internal constructor(
             }
             return
         }
+        if (call.method == "runDebugV2Issue98Handoff") {
+            if (!isDebuggable) {
+                result.error("VG_PROTOCOL_INVALID", "V2 recovery seam is debug-only", null)
+            } else {
+                val old = M0aCommittedBaselineV1(
+                    transactionId = Long.MAX_VALUE,
+                    geometryRevision = 11,
+                    lineageRevision = 12,
+                    styleRevision = 15,
+                    captureRevision = 13,
+                    coverageRevision = 14,
+                    regionManifestRevision = 16,
+                    nextSurfaceIdHighWater = 17,
+                    schemaRootRevision = 18,
+                )
+                val fresh = M0aCommittedBaselineV1.forFreshBinding(old)
+                val next = M0aStructuralTransactionProducerV1.produce(
+                    transactionId = 1,
+                    baseGeometryRevision = fresh.geometryRevision,
+                    targetGeometryRevision = fresh.geometryRevision + 1,
+                    targetLineageRevision = fresh.lineageRevision + 1,
+                    bytes = byteArrayOf(),
+                )
+                check(next.isNotEmpty())
+                result.success(mapOf(
+                    "oldTransactionId" to old.transactionId,
+                    "oldRequestSequence" to Long.MAX_VALUE,
+                    "freshTransactionId" to fresh.transactionId,
+                    "freshRequestSequence" to 1L,
+                    "nextTransactionId" to 1L,
+                    "geometryRevision" to fresh.geometryRevision,
+                    "lineageRevision" to fresh.lineageRevision,
+                    "captureRevision" to fresh.captureRevision,
+                    "coverageRevision" to fresh.coverageRevision,
+                    "acceptedStyleRevision" to fresh.styleRevision,
+                    "regionManifestRevision" to fresh.regionManifestRevision,
+                    "nextSurfaceIdHighWater" to fresh.nextSurfaceIdHighWater,
+                    "schemaRootRevision" to fresh.schemaRootRevision,
+                    "semanticEffectCount" to 1,
+                    "oldTokenPublicationCount" to 0,
+                    "rootIsolateSurfaceBytes" to 0,
+                ))
+            }
+            return
+        }
         if (call.method == "bindingSnapshot") {
             val pending = PendingControlResult(result) { pendingControlResults.remove(it) }
             pendingControlResults.add(pending)

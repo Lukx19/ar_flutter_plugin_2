@@ -69,6 +69,10 @@ data class M0aCommittedBaselineV1(
     companion object {
         val ZERO = M0aCommittedBaselineV1(0, 0, 0, 0)
 
+        /** Preserves semantic authority while entering a new binding cursor domain. */
+        fun forFreshBinding(value: M0aCommittedBaselineV1): M0aCommittedBaselineV1 =
+            value.copy(transactionId = 0)
+
         fun fromRestoredConfiguration(
             configuration: M0aStartRequestCodecV2.Configuration,
         ): M0aCommittedBaselineV1 {
@@ -300,13 +304,13 @@ class M0aControlLifecycle(
         if (configuration.hasRestoredCutConflict(availableBaseline)) {
             return error(request, M0aControlError.CUT_INCOMPATIBLE)
         }
-        committedBaseline = if (availableBaseline != M0aCommittedBaselineV1.ZERO) {
+        committedBaseline = (if (availableBaseline != M0aCommittedBaselineV1.ZERO) {
             availableBaseline
         } else if (configuration.restoreRequested) {
             M0aCommittedBaselineV1.fromRestoredConfiguration(configuration)
         } else {
             M0aCommittedBaselineV1.ZERO
-        }
+        }).let(M0aCommittedBaselineV1::forFreshBinding)
         activeStreamToken = nextStreamToken++
         state = State.ACTIVE
         return success(request, activeStreamToken, committedBaseline, configuration)

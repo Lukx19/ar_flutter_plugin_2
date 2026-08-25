@@ -184,7 +184,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
         )
         assertEquals(255, rejected.messageKind)
         assertEquals(8, rejected.errorId)
-        assertEquals(1L, rejected.nextExpectedRequestSequence)
+        assertEquals(3L, rejected.nextExpectedRequestSequence)
         assertEquals(1, binding.transportInstrumentation.snapshot().peakQueueDepth)
 
         executor.runQueued()
@@ -285,7 +285,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
                 request(
                     sequence = 1,
                     token = 1,
-                    acknowledgedTransaction = 9,
+                    acknowledgedTransaction = 0,
                     acknowledgedGeometry = 10,
                     acknowledgedLineage = 11,
                     styleRevision = 12,
@@ -293,7 +293,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
             ),
         )
         assertEquals(0, response.messageKind)
-        assertEquals(9L, response.transactionId)
+        assertEquals(0L, response.transactionId)
         assertEquals(10L, response.targetGeometryRevision)
         assertEquals(11L, response.targetLineageRevision)
         assertEquals(12L, response.acceptedStyleRevision)
@@ -777,7 +777,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
     }
 
     @Test
-    fun `transaction MAX commits then terminal drain and fresh binding preserve semantics`() {
+    fun `Issue 98 terminal drain fresh binding resets transaction cursor and preserves semantic authority`() {
         val messenger = TestMessenger(118)
         val binding = M0aVisibilitySurfaceStreamChannel(
             messenger, 118, initialNextExpectedSequence = Long.MAX_VALUE - 2,
@@ -823,7 +823,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
 
         val freshMessenger = TestMessenger(119)
         val fresh = M0aVisibilitySurfaceStreamChannel(freshMessenger, 119)
-        fresh.setCommittedBaseline(
+        fresh.setFreshBindingBaseline(M0aCommittedBaselineV1(
             transactionId = Long.MAX_VALUE,
             geometryRevision = 11,
             lineageRevision = 21,
@@ -833,15 +833,19 @@ class M0aVisibilitySurfaceStreamChannelTest {
             regionManifestRevision = 60,
             schemaRootRevision = 70,
             nextSurfaceIdHighWater = 80,
-        )
+        ))
+        fresh.queueStructuralTransaction(M0aStructuralTransactionProducerV1.produce(
+            transactionId = 1, baseGeometryRevision = 11,
+            targetGeometryRevision = 12, targetLineageRevision = 22, bytes = byteArrayOf(),
+        ))
         val recovered = M0aPacketCodec.decodeResponse(freshMessenger.exchange(request(
-            1, 119, acknowledgedTransaction = Long.MAX_VALUE,
+            1, 119, acknowledgedTransaction = 0,
             acknowledgedGeometry = 11, acknowledgedLineage = 21, styleRevision = 30,
         )))
-        assertEquals(0, recovered.messageKind)
-        assertEquals(Long.MAX_VALUE, recovered.transactionId)
-        assertEquals(11, recovered.targetGeometryRevision)
-        assertEquals(21, recovered.targetLineageRevision)
+        assertEquals(2, recovered.messageKind)
+        assertEquals(1, recovered.transactionId)
+        assertEquals(12, recovered.targetGeometryRevision)
+        assertEquals(22, recovered.targetLineageRevision)
         assertEquals(30, recovered.acceptedStyleRevision)
         fresh.dispose()
     }
@@ -854,8 +858,11 @@ class M0aVisibilitySurfaceStreamChannelTest {
             regionManifestRevision = 16, nextSurfaceIdHighWater = 17,
             schemaRootRevision = 18,
         )
-        listOf(6, 8, 30, 31, 32, 34, 35, 142, 144).forEach { id ->
-            val response = M0aPacketCodec.error(7, 9, 9, id, authority)
+        listOf(4, 6, 8, 30, 31, 32, 34, 35, 48, 142, 144).forEach { id ->
+            val response = M0aPacketCodec.error(
+                7, 9, M0aPacketCodec.nextSequenceForPolicy(id, 9), id, authority,
+                expectedValue = 9, observedValue = 9,
+            )
             val decoded = M0aPacketCodec.decodeResponse(
                 M0aPacketCodec.encodeResponse(response, 4096),
             )
@@ -869,7 +876,14 @@ class M0aVisibilitySurfaceStreamChannelTest {
             assertEquals(policy.recoveryAction, detail.recoveryAction)
             assertEquals(11L, detail.geometryRevision)
             assertEquals(12L, detail.lineageRevision)
+            assertEquals(13L, detail.captureRevision)
+            assertEquals(14L, detail.coverageRevision)
             assertEquals(15L, detail.acceptedStyleRevision)
+            assertEquals(16L, detail.regionManifestRevision)
+            assertEquals(17L, detail.nextSurfaceIdHighWater)
+            assertEquals(18L, detail.schemaRootRevision)
+            assertEquals(9L, detail.expectedValue)
+            assertEquals(9L, detail.observedValue)
         }
         val canonical = M0aPacketCodec.error(7, 9, 9, 35, authority)
         val detail = M0aControlCodec.decodeErrorDetail(canonical.payload)
@@ -1178,7 +1192,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
             .order(ByteOrder.LITTLE_ENDIAN)
         assertEquals(1L, restoredResult.getLong(96))
         assertEquals(1L, restoredResult.getLong(104))
-        assertEquals(expectedBaseline, restoredLifecycle.committedBaseline())
+        assertEquals(expectedBaseline.copy(transactionId = 0), restoredLifecycle.committedBaseline())
 
         val restoredBinding = M0aVisibilitySurfaceStreamChannel(
             messenger = messenger,
@@ -1190,14 +1204,14 @@ class M0aVisibilitySurfaceStreamChannelTest {
                 request(
                     sequence = 1,
                     token = restoredResponse.streamToken,
-                    acknowledgedTransaction = 1,
+                    acknowledgedTransaction = 0,
                     acknowledgedGeometry = 1,
                     acknowledgedLineage = 1,
                 ),
             ),
         )
         assertEquals(0, restored.messageKind)
-        assertEquals(1L, restored.transactionId)
+        assertEquals(0L, restored.transactionId)
         assertEquals(1L, restored.targetGeometryRevision)
         assertEquals(1L, restored.targetLineageRevision)
         assertEquals(1, commitPublications.get())
