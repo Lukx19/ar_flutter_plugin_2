@@ -1229,10 +1229,12 @@ final class ARVisibilityGridV2WorkerBinding {
   /// Uses the independent native abandon/fence path when the serial dispose
   /// call is stalled behind an admitted invocation. Native returns the old
   /// binding's teardown receipt and installs a fresh identity on the channel;
-  /// this object is permanently closed afterward. Throws [PlatformException]
-  /// or [MissingPluginException] on channel failure, and [StateError] when no
-  /// qualifier has been claimed or native omits the teardown map/
-  /// `closedResources`.
+  /// this object is permanently closed afterward. The argument-free method
+  /// internally sends this worker's same claimed 16-byte cleanup lease. Native
+  /// stale/unclaimed rejection is a [PlatformException] and leaves the
+  /// replacement generation, tokens, lifecycle, callbacks, and resources
+  /// unchanged. [StateError] is reserved for malformed or contradictory
+  /// teardown evidence, including missing or incoherent closure/ledger fields.
   Future<Map<Object?, Object?>> abandonAndSnapshot() async {
     final existing = _abandonFuture;
     if (existing != null) return existing;

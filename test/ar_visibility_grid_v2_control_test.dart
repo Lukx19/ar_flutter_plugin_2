@@ -582,6 +582,164 @@ void main() {
     expect(replacement['workerBindingToken'], orderedEquals(replacementWorker));
   });
 
+  test(
+      'worker stale dispose rejection preserves replacement generation and resources',
+      () async {
+    const controlChannel = MethodChannel('visibility_grid_v2_control_96');
+    const streamChannel = BasicMessageChannel<ByteData?>(
+      'visibility_surface_stream_96',
+      BinaryCodec(),
+    );
+    final replacementNative = Uint8List.fromList(
+      List<int>.generate(16, (index) => index + 70),
+    );
+    final replacementWorker = Uint8List.fromList(
+      List<int>.generate(16, (index) => index + 86),
+    );
+    final replacement = <String, Object?>{
+      'bindingGeneration': 27,
+      'nativeStreamToken': replacementNative,
+      'workerBindingToken': replacementWorker,
+      'lifecycleSequence': 19,
+      'callbackCount': 4,
+      'closedResources': 5,
+      'disposed': false,
+    };
+    var disposeCalls = 0;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(controlChannel, (call) async {
+      if (call.method == 'claimBindingLease') {
+        return <String, Object?>{
+          'nativeStreamToken': Uint8List(16),
+          'workerBindingToken': Uint8List.fromList(List<int>.filled(16, 1)),
+        };
+      }
+      if (call.method == 'disposeBinding') {
+        disposeCalls++;
+        expect(call.arguments, isA<Uint8List>());
+        expect((call.arguments! as Uint8List), hasLength(16));
+        throw PlatformException(
+          code: 'VG_STREAM_BINDING_ABANDONED',
+          message: 'V2 binding token mismatch',
+        );
+      }
+      if (call.method == 'bindingSnapshot') return replacement;
+      throw PlatformException(code: 'unsupported');
+    });
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(controlChannel, null),
+    );
+
+    final binding = ARVisibilityGridV2WorkerBinding.connect(
+      rootIsolateToken: ServicesBinding.rootIsolateToken!,
+      viewId: 96,
+      controlChannel: controlChannel,
+      streamChannel: streamChannel,
+    );
+    await binding.captureCleanupAuthority();
+    await expectLater(
+      binding.disposeAndSnapshot(),
+      throwsA(
+        isA<PlatformException>().having(
+          (error) => error.code,
+          'code',
+          'VG_STREAM_BINDING_ABANDONED',
+        ),
+      ),
+    );
+    final after = Map<Object?, Object?>.from(
+      (await controlChannel.invokeMethod<Object?>('bindingSnapshot'))! as Map,
+    );
+    expect(disposeCalls, 1);
+    expect(after['bindingGeneration'], replacement['bindingGeneration']);
+    expect(after['nativeStreamToken'], orderedEquals(replacementNative));
+    expect(after['workerBindingToken'], orderedEquals(replacementWorker));
+    expect(after['lifecycleSequence'], replacement['lifecycleSequence']);
+    expect(after['callbackCount'], replacement['callbackCount']);
+    expect(after['closedResources'], replacement['closedResources']);
+    expect(after['disposed'], replacement['disposed']);
+  });
+
+  test(
+      'worker stale abandon rejection preserves replacement generation and resources',
+      () async {
+    const controlChannel = MethodChannel('visibility_grid_v2_control_97');
+    const streamChannel = BasicMessageChannel<ByteData?>(
+      'visibility_surface_stream_97',
+      BinaryCodec(),
+    );
+    final replacementNative = Uint8List.fromList(
+      List<int>.generate(16, (index) => index + 100),
+    );
+    final replacementWorker = Uint8List.fromList(
+      List<int>.generate(16, (index) => index + 116),
+    );
+    final replacement = <String, Object?>{
+      'bindingGeneration': 31,
+      'nativeStreamToken': replacementNative,
+      'workerBindingToken': replacementWorker,
+      'lifecycleSequence': 23,
+      'callbackCount': 6,
+      'closedResources': 7,
+      'disposed': false,
+    };
+    var abandonCalls = 0;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(controlChannel, (call) async {
+      if (call.method == 'claimBindingLease') {
+        return <String, Object?>{
+          'nativeStreamToken': Uint8List(16),
+          'workerBindingToken': Uint8List.fromList(List<int>.filled(16, 1)),
+        };
+      }
+      if (call.method == 'abandonBinding') {
+        abandonCalls++;
+        expect(call.arguments, isA<Uint8List>());
+        expect((call.arguments! as Uint8List), hasLength(16));
+        throw PlatformException(
+          code: 'VG_STREAM_BINDING_ABANDONED',
+          message: 'V2 binding token mismatch',
+        );
+      }
+      if (call.method == 'bindingSnapshot') return replacement;
+      throw PlatformException(code: 'unsupported');
+    });
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(controlChannel, null),
+    );
+
+    final binding = ARVisibilityGridV2WorkerBinding.connect(
+      rootIsolateToken: ServicesBinding.rootIsolateToken!,
+      viewId: 97,
+      controlChannel: controlChannel,
+      streamChannel: streamChannel,
+    );
+    await binding.captureCleanupAuthority();
+    await expectLater(
+      binding.abandonAndSnapshot(),
+      throwsA(
+        isA<PlatformException>().having(
+          (error) => error.code,
+          'code',
+          'VG_STREAM_BINDING_ABANDONED',
+        ),
+      ),
+    );
+    final after = Map<Object?, Object?>.from(
+      (await controlChannel.invokeMethod<Object?>('bindingSnapshot'))! as Map,
+    );
+    expect(abandonCalls, 1);
+    expect(after['bindingGeneration'], replacement['bindingGeneration']);
+    expect(after['nativeStreamToken'], orderedEquals(replacementNative));
+    expect(after['workerBindingToken'], orderedEquals(replacementWorker));
+    expect(after['lifecycleSequence'], replacement['lifecycleSequence']);
+    expect(after['callbackCount'], replacement['callbackCount']);
+    expect(after['closedResources'], replacement['closedResources']);
+    expect(after['disposed'], replacement['disposed']);
+  });
+
   test('malformed teardown evidence is a local StateError', () async {
     const controlChannel = MethodChannel('visibility_grid_v2_control_94');
     const streamChannel = BasicMessageChannel<ByteData?>(
