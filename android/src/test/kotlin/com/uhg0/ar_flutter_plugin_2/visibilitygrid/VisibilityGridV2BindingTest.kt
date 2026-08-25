@@ -203,17 +203,43 @@ class VisibilityGridV2BindingTest {
                     }
                 }
                 val before = binding.snapshot()
-                val malformed = invoke(method, request.copy(payload = malformedPayload))
-                assertEquals(1, malformed.outcome)
-                val detail = M0aControlCodec.decodeErrorDetail(malformed.payload)
-                assertEquals(0, detail.disposition)
-                assertEquals(5, detail.recoveryAction)
-                assertTrue(detail.validationPhase in 1..7)
-                val after = binding.snapshot()
-                assertEquals(before.acceptedControls, after.acceptedControls)
-                assertEquals(before.operationGeneration, after.operationGeneration)
-                assertEquals(before.lifecycleSequence, after.lifecycleSequence)
-                assertEquals(before.streamToken, after.streamToken)
+                val malformedPayloads = if (operation == M0aControlOperation.STOP) {
+                    listOf(
+                        payload.copyOf().also { it[0] = 0 },
+                        payload.copyOf().also {
+                            ByteBuffer.wrap(it).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                                .putShort(2, 1.toShort())
+                        },
+                        malformedPayload,
+                    )
+                } else listOf(malformedPayload)
+                malformedPayloads.forEachIndexed { malformedIndex, candidate ->
+                    val malformed = invoke(method, request.copy(payload = candidate))
+                    assertEquals(1, malformed.outcome)
+                    val detail = M0aControlCodec.decodeErrorDetail(malformed.payload)
+                    assertEquals(0, detail.disposition)
+                    assertEquals(5, detail.recoveryAction)
+                    assertTrue(detail.validationPhase in 1..7)
+                    if (operation == M0aControlOperation.STOP && malformedIndex < 2) {
+                        assertEquals(3, detail.validationPhase)
+                        assertEquals(if (malformedIndex == 0) 16 else 5, detail.fieldId)
+                    }
+                    val after = binding.snapshot()
+                    assertEquals(before.acceptedControls, after.acceptedControls)
+                    assertEquals(before.operationGeneration, after.operationGeneration)
+                    assertEquals(before.lifecycleSequence, after.lifecycleSequence)
+                    assertEquals(before.initialTransactionQueued, after.initialTransactionQueued)
+                    assertEquals(before.streamToken, after.streamToken)
+                    assertEquals(before.closedResources, after.closedResources)
+                    assertEquals(before.controlRequestId, after.controlRequestId)
+                    assertEquals(before.sessionId, after.sessionId)
+                    assertEquals(before.captureGroupId, after.captureGroupId)
+                    assertEquals(before.sessionGeneration, after.sessionGeneration)
+                    assertEquals(before.groupGeneration, after.groupGeneration)
+                    assertEquals(before.coverageEpoch, after.coverageEpoch)
+                    assertArrayEquals(before.nativeStreamToken, after.nativeStreamToken)
+                    assertArrayEquals(before.workerBindingToken, after.workerBindingToken)
+                }
 
                 val corrected = invoke(method, request)
                 assertEquals(0, corrected.outcome)

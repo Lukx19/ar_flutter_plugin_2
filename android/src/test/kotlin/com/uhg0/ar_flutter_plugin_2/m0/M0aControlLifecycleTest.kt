@@ -107,6 +107,11 @@ class M0aControlLifecycleTest {
         )
         assertEquals(1, capabilityResponse.outcome)
         assertEquals(46, capabilityResponse.errorId)
+        assertEquals(M0aControlCodec.errorDetailBytes, capabilityResponse.payload.size)
+        val capabilityDetail = M0aControlCodec.decodeErrorDetail(capabilityResponse.payload)
+        assertEquals(capabilityResponse.errorId, capabilityDetail.errorId)
+        assertEquals(1, capabilityDetail.disposition)
+        assertEquals(8, capabilityDetail.validationPhase)
 
         val minorLifecycle = M0aControlLifecycle()
         val minor = request(M0aControlOperation.START, 0, 4).copy(

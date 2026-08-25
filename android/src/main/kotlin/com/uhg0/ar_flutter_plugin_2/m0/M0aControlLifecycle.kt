@@ -360,8 +360,30 @@ class M0aControlLifecycle(
             maximumResponseBytes,
         )
 
-    private fun error(request: M0aControlRequest, errorId: Int): ByteArray =
-        M0aControlCodec.encodeResponse(
+    private fun error(request: M0aControlRequest, errorId: Int): ByteArray {
+        val detail = M0aControlCodec.encodeErrorDetail(
+            M0aErrorDetail(
+                errorId = errorId,
+                scope = 0,
+                disposition = 1,
+                validationPhase = 8,
+                recoveryAction = 0,
+                fieldId = 0,
+                authorityKind = 1,
+                diagnosticBytes = 0,
+                geometryRevision = committedBaseline.geometryRevision,
+                lineageRevision = committedBaseline.lineageRevision,
+                captureRevision = committedBaseline.captureRevision,
+                coverageRevision = committedBaseline.coverageRevision,
+                acceptedStyleRevision = committedBaseline.styleRevision,
+                regionManifestRevision = committedBaseline.regionManifestRevision,
+                nextSurfaceIdHighWater = committedBaseline.nextSurfaceIdHighWater,
+                expectedValue = 0,
+                observedValue = 0,
+                schemaRootRevision = committedBaseline.schemaRootRevision,
+            ),
+        )
+        return M0aControlCodec.encodeResponse(
             M0aControlResponse(
                 operation = request.operation,
                 outcome = 1,
@@ -376,9 +398,11 @@ class M0aControlLifecycle(
                 streamToken = request.streamToken,
                 nextExchangeRequestSequence = 1,
                 nativeTransactionId = 0,
+                payload = detail,
             ),
             maximumResponseBytes,
         )
+    }
 
     private fun cache(request: ByteArray?, response: ByteArray): ByteArray {
         if (request != null) {

@@ -334,9 +334,9 @@ object M0aControlCodec {
             diagnostic = packet.copyOfRange(split, packet.size),
         ).also { response ->
             validateResponse(response)
-            if (response.outcome == 1 && response.payload.isNotEmpty()) {
+            if (response.outcome == 1) {
                 require(response.payload.size == errorDetailBytes) {
-                    "Error response payload must be one ErrorDetailV2"
+                    "Every error response must carry one ErrorDetailV2"
                 }
                 val detail = decodeErrorDetail(response.payload)
                 require(detail.errorId == response.errorId) {
@@ -358,74 +358,11 @@ object M0aControlCodec {
             M0aControlOperation.STOP -> validateStopPayload(request.payload)
         }
 
-    private fun validateStartPayload(bytes: ByteArray): M0aControlValidationFailure? {
-        fun invalid(error: Int, phase: Int, field: Int, expected: Long, observed: Long) =
-            M0aControlValidationFailure(error, phase, field, expected, observed)
-        if (bytes.size != M0aStartRequestCodecV2.byteLength) {
-            return invalid(6, 2, 3, M0aStartRequestCodecV2.byteLength.toLong(), bytes.size.toLong())
+    private fun validateStartPayload(bytes: ByteArray): M0aControlValidationFailure? =
+        when (val detailed = M0aStartRequestCodecV2.decodeDetailed(bytes)) {
+            is M0aStartRequestCodecV2.DetailedDecode.Valid -> null
+            is M0aStartRequestCodecV2.DetailedDecode.Invalid -> detailed.failure
         }
-        val data = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-        val schema = data.getShort(4).toInt() and 0xffff
-        if (schema != 5) return invalid(1, 4, 2, 5, schema.toLong())
-        val minimumMinor = data.getShort(0).toInt() and 0xffff
-        val maximumMinor = data.getShort(2).toInt() and 0xffff
-        if (maximumMinor < minimumMinor) return invalid(36, 4, 20, minimumMinor.toLong(), maximumMinor.toLong())
-        val profile = data.get(6).toInt() and 0xff
-        if (profile > 2) return invalid(6, 3, 5, 2, profile.toLong())
-        val flags = data.get(7).toInt() and 0xff
-        if (flags and 0xfe != 0) return invalid(6, 3, 5, 1, flags.toLong())
-        for (offset in intArrayOf(8, 16)) {
-            val value = data.getLong(offset)
-            if (value < 0) return invalid(36, 4, 17, Long.MAX_VALUE, value)
-        }
-        val ordinary = data.getInt(24).toLong() and 0xffff_ffffL
-        val catchUp = data.getInt(28).toLong() and 0xffff_ffffL
-        val diagnostic = data.getShort(32).toInt() and 0xffff
-        val regionLimit = data.getShort(34).toInt() and 0xffff
-        val voxel = data.getInt(36).toLong() and 0xffff_ffffL
-        val modelCapacity = data.getInt(40).toLong() and 0xffff_ffffL
-        val pendingCapacity = data.getInt(44).toLong() and 0xffff_ffffL
-        if (ordinary !in 4096..16384) return invalid(36, 4, 20, 4096, ordinary)
-        if (catchUp !in ordinary..65536) return invalid(36, 4, 20, ordinary, catchUp)
-        if (diagnostic > 1024) return invalid(36, 4, 20, 1024, diagnostic.toLong())
-        if (regionLimit !in 1..8) return invalid(36, 4, 20, 8, regionLimit.toLong())
-        if (voxel == 0L || 1_000_000L % voxel != 0L || 3_000_000L % voxel != 0L) {
-            return invalid(36, 4, 20, 1_000_000, voxel)
-        }
-        if (modelCapacity > 100_000) return invalid(36, 4, 20, 100_000, modelCapacity)
-        if (pendingCapacity > 200_000) return invalid(36, 4, 20, 200_000, pendingCapacity)
-        for (offset in intArrayOf(48, 50, 52, 54)) {
-            val convention = data.getShort(offset).toInt() and 0xffff
-            if (convention != 1) return invalid(6, 5, 21, 1, convention.toLong())
-        }
-        repeat(10) { index ->
-            val revision = data.getLong(56 + index * 8)
-            if (revision < 0) return invalid(36, 4, 20, Long.MAX_VALUE, revision)
-        }
-        for (matrixOffset in intArrayOf(136, 264)) {
-            repeat(16) { index ->
-                val value = data.getDouble(matrixOffset + index * 8)
-                if (!value.isFinite()) return invalid(6, 5, 21, 0, value.toRawBits())
-            }
-        }
-        val restoreRequested = flags and 1 != 0
-        val revisionsEmpty = (0 until 10).all { data.getLong(56 + it * 8) == 0L }
-        val schemaEmpty = bytes.copyOfRange(392, 424).all { it.toInt() == 0 }
-        val manifestEmpty = bytes.copyOfRange(424, 456).all { it.toInt() == 0 }
-        val hashState = if (schemaEmpty && manifestEmpty) 0L else if (!schemaEmpty && !manifestEmpty) 1L else 2L
-        if (restoreRequested && hashState == 2L) return invalid(6, 6, 22, 1, hashState)
-        if (!restoreRequested && (!revisionsEmpty || hashState != 0L)) {
-            return invalid(6, 6, 22, 0, if (!revisionsEmpty) 3 else hashState)
-        }
-        val reservedIndex = (456 until M0aStartRequestCodecV2.byteLength)
-            .firstOrNull { bytes[it].toInt() != 0 }
-        if (reservedIndex != null) {
-            return invalid(6, 7, 5, 0, bytes[reservedIndex].toLong() and 0xff)
-        }
-        // Keep the strict decoder authoritative; this call must now be infallible.
-        M0aStartRequestCodecV2.decode(bytes)
-        return null
-    }
 
     private fun validateBeginCheckpointPayload(bytes: ByteArray): M0aControlValidationFailure? {
         if (bytes.size != 112) return payloadLengthFailure(112, bytes.size)
@@ -463,8 +400,12 @@ object M0aControlCodec {
     private fun validateStopPayload(bytes: ByteArray): M0aControlValidationFailure? {
         if (bytes.size != 88) return payloadLengthFailure(88, bytes.size)
         val data = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+        val reason = data.get(0).toInt() and 0xff
+        if (reason !in 1..3) return M0aControlValidationFailure(6, 3, 16, 3, reason.toLong())
         val mode = data.get(1).toInt() and 0xff
-        if (mode > 2) return reservedFailure(mode.toLong())
+        if (mode > 2) return M0aControlValidationFailure(6, 3, 16, 2, mode.toLong())
+        val flags = data.getShort(2).toInt() and 0xffff
+        if (flags != 0) return M0aControlValidationFailure(6, 3, 5, 0, flags.toLong())
         val reserved = data.getInt(4).toLong() and 0xffff_ffffL
         if (reserved != 0L) return reservedFailure(reserved)
         val drainBudget = data.getLong(8)

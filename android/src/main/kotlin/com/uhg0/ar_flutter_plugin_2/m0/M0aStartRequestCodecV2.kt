@@ -69,20 +69,45 @@ object M0aStartRequestCodecV2 {
                     worldFromGroupIdentity != baseline.worldFromGroupIdentity)
     }
 
-    fun decode(bytes: ByteArray): Configuration {
-        require(bytes.size == byteLength) { "Start request payload must be exactly 464 bytes" }
+    sealed interface DetailedDecode {
+        data class Valid(val configuration: Configuration) : DetailedDecode
+        data class Invalid(val failure: M0aControlValidationFailure) : DetailedDecode
+    }
+
+    class ValidationException(val failure: M0aControlValidationFailure) :
+        IllegalArgumentException("Invalid StartRequestV2 payload: $failure")
+
+    fun decode(bytes: ByteArray): Configuration = when (val detailed = decodeDetailed(bytes)) {
+        is DetailedDecode.Valid -> detailed.configuration
+        is DetailedDecode.Invalid -> throw ValidationException(detailed.failure)
+    }
+
+    /** Authoritative START payload decoder with stable pre-admission error evidence. */
+    fun decodeDetailed(bytes: ByteArray): DetailedDecode {
+        fun invalid(error: Int, phase: Int, field: Int, expected: Long, observed: Long) =
+            DetailedDecode.Invalid(
+                M0aControlValidationFailure(error, phase, field, expected, observed),
+            )
+        if (bytes.size != byteLength) return invalid(6, 2, 3, byteLength.toLong(), bytes.size.toLong())
         val data = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-        require(data.getShort(4).toInt() and 0xffff == 5) { "Unsupported persistence schema" }
         val minimumMinor = data.getShort(0).toInt() and 0xffff
         val maximumMinor = data.getShort(2).toInt() and 0xffff
-        require(maximumMinor >= minimumMinor)
         val flags = data.get(7).toInt() and 0xff
-        require(flags and 0xfe == 0)
         val profile = data.get(6).toInt() and 0xff
-        require(profile <= 2)
+        if (profile > 2) return invalid(6, 3, 5, 2, profile.toLong())
+        if (flags and 0xfe != 0) return invalid(6, 3, 5, 1, flags.toLong())
+        val restoreRequested = flags and 1 != 0
+        val persistenceSchema = data.getShort(4).toInt() and 0xffff
+        if (persistenceSchema != 5) {
+            return invalid(if (restoreRequested) 2 else 1, 4, 2, 5, persistenceSchema.toLong())
+        }
+        if (maximumMinor < minimumMinor) {
+            return invalid(36, 4, 20, minimumMinor.toLong(), maximumMinor.toLong())
+        }
         val requiredCapabilities = data.getLong(8)
         val desiredCapabilities = data.getLong(16)
-        require(requiredCapabilities >= 0 && desiredCapabilities >= 0)
+        if (requiredCapabilities < 0) return invalid(36, 4, 17, Long.MAX_VALUE, requiredCapabilities)
+        if (desiredCapabilities < 0) return invalid(36, 4, 17, Long.MAX_VALUE, desiredCapabilities)
         val ordinary = data.getInt(24)
         val catchUp = data.getInt(28)
         val diagnostic = data.getShort(32).toInt() and 0xffff
@@ -94,38 +119,57 @@ object M0aStartRequestCodecV2 {
         val matrixConvention = data.getShort(50).toInt() and 0xffff
         val directionConvention = data.getShort(52).toInt() and 0xffff
         val normalEncoding = data.getShort(54).toInt() and 0xffff
-        require(ordinary in 4096..16384)
-        require(catchUp in ordinary..65536)
-        require(diagnostic <= 1024 && regionLimit in 1..8)
-        require(voxel > 0 && 1_000_000 % voxel == 0 && 3_000_000 % voxel == 0)
-        require(modelCapacity in 0..100_000 && pendingCapacity in 0..200_000)
-        require(groupFrameConvention == 1)
-        require(matrixConvention == 1)
-        require(directionConvention == 1)
-        require(normalEncoding == 1)
+        if (ordinary !in 4096..16384) return invalid(36, 4, 20, 4096, ordinary.toLong())
+        if (catchUp !in ordinary..65536) return invalid(36, 4, 20, ordinary.toLong(), catchUp.toLong())
+        if (diagnostic > 1024) return invalid(36, 4, 20, 1024, diagnostic.toLong())
+        if (regionLimit !in 1..8) return invalid(36, 4, 20, 8, regionLimit.toLong())
+        if (voxel <= 0 || 1_000_000 % voxel != 0 || 3_000_000 % voxel != 0) {
+            return invalid(36, 4, 20, 1_000_000, voxel.toLong())
+        }
+        if (modelCapacity !in 0..100_000) return invalid(36, 4, 20, 100_000, modelCapacity.toLong())
+        if (pendingCapacity !in 0..200_000) return invalid(36, 4, 20, 200_000, pendingCapacity.toLong())
+        for (convention in intArrayOf(
+            groupFrameConvention,
+            matrixConvention,
+            directionConvention,
+            normalEncoding,
+        )) {
+            if (convention != 1) return invalid(6, 5, 21, 1, convention.toLong())
+        }
         val revisions = LongArray(10) { index -> data.getLong(56 + index * 8) }
-        require(revisions.all { it >= 0 })
-        validateMatrix(data, 136)
-        validateMatrix(data, 264)
+        revisions.firstOrNull { it < 0 }?.let { revision ->
+            return invalid(36, 4, 20, Long.MAX_VALUE, revision)
+        }
+        for (matrixOffset in intArrayOf(136, 264)) {
+            repeat(16) { index ->
+                val value = data.getDouble(matrixOffset + index * 8)
+                if (!value.isFinite()) {
+                    return invalid(36, 5, 21, 0, value.toRawBits())
+                }
+            }
+        }
         val schemaHash = bytes.copyOfRange(392, 424)
         val manifestHash = bytes.copyOfRange(424, 456)
-        val restoreRequested = flags and 1 != 0
+        val schemaEmpty = schemaHash.all { it.toInt() == 0 }
+        val manifestEmpty = manifestHash.all { it.toInt() == 0 }
+        val hashState = if (schemaEmpty && manifestEmpty) 0L
+        else if (!schemaEmpty && !manifestEmpty) 1L else 2L
         if (restoreRequested) {
             // M1's first committed transaction has no content-root hashes.
             // A restored request may therefore carry the exact canonical
             // empty identities, or two complete non-empty roots; mixed or
             // partial roots remain invalid.
-            val emptyRoots = schemaHash.all { it.toInt() == 0 } &&
-                manifestHash.all { it.toInt() == 0 }
-            val completeRoots = schemaHash.any { it.toInt() != 0 } &&
-                manifestHash.any { it.toInt() != 0 }
-            require(emptyRoots || completeRoots)
+            if (hashState == 2L) return invalid(6, 6, 22, 1, hashState)
         } else {
-            require(revisions.all { it == 0L })
-            require(schemaHash.all { it.toInt() == 0 } && manifestHash.all { it.toInt() == 0 })
+            if (revisions.any { it != 0L } || hashState != 0L) {
+                return invalid(6, 6, 22, 0, if (revisions.any { it != 0L }) 3 else hashState)
+            }
         }
-        require(bytes.copyOfRange(456, byteLength).all { it.toInt() == 0 })
-        return Configuration(
+        val reservedIndex = (456 until byteLength).firstOrNull { bytes[it].toInt() != 0 }
+        if (reservedIndex != null) {
+            return invalid(6, 7, 5, 0, bytes[reservedIndex].toLong() and 0xff)
+        }
+        return DetailedDecode.Valid(Configuration(
             minimumMinor,
             maximumMinor,
             5,
@@ -149,7 +193,7 @@ object M0aStartRequestCodecV2 {
             m0aMatrixIdentity(data, 136),
             m0aMatrixIdentity(data, 264),
             revisions,
-        )
+        ))
     }
 
     /** Valid empty-group request used by the JVM reference corpus. */
@@ -183,7 +227,4 @@ object M0aStartRequestCodecV2 {
         data.putDouble(384, 1.0)
     }
 
-    private fun validateMatrix(data: ByteBuffer, offset: Int) {
-        repeat(16) { index -> require(data.getDouble(offset + index * 8).isFinite()) }
-    }
 }

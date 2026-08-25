@@ -22,6 +22,10 @@ class M0aControlCorpusTest {
         val cases = listOf(
             valid.copyOf().also { ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putShort(4, 6.toShort()) } to
                 M0aControlValidationFailure(1, 4, 2, 5, 6),
+            valid.copyOf().also {
+                it[7] = 1
+                ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putShort(4, 6.toShort())
+            } to M0aControlValidationFailure(2, 4, 2, 5, 6),
             valid.copyOf().also { it[7] = 2 } to
                 M0aControlValidationFailure(6, 3, 5, 1, 2),
             valid.copyOf().also { ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putInt(24, 0) } to
@@ -30,7 +34,7 @@ class M0aControlCorpusTest {
                 M0aControlValidationFailure(6, 5, 21, 1, 2),
             valid.copyOf().also {
                 ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putDouble(136, Double.NaN)
-            } to M0aControlValidationFailure(6, 5, 21, 0, Double.NaN.toRawBits()),
+            } to M0aControlValidationFailure(36, 5, 21, 0, Double.NaN.toRawBits()),
             valid.copyOf().also { it[392] = 1 } to
                 M0aControlValidationFailure(6, 6, 22, 0, 2),
             valid.copyOf().also { it[456] = 1 } to
@@ -38,14 +42,33 @@ class M0aControlCorpusTest {
         )
         cases.forEach { (payload, expected) ->
             assertEquals(expected, M0aControlCodec.validateControlPayload(startRequest(payload)))
+            val detailed = M0aStartRequestCodecV2.decodeDetailed(payload)
+            assertEquals(
+                expected,
+                (detailed as M0aStartRequestCodecV2.DetailedDecode.Invalid).failure,
+            )
+            val strict = assertThrows(M0aStartRequestCodecV2.ValidationException::class.java) {
+                M0aStartRequestCodecV2.decode(payload)
+            }
+            assertEquals(expected, strict.failure)
         }
         assertEquals(null, M0aControlCodec.validateControlPayload(startRequest(valid)))
+        val detailedValid = (M0aStartRequestCodecV2.decodeDetailed(valid) as
+            M0aStartRequestCodecV2.DetailedDecode.Valid).configuration
+        assertEquals(M0aStartRequestCodecV2.decode(valid).persistenceSchema, detailedValid.persistenceSchema)
     }
 
     @Test
     fun `Kotlin control envelopes match the locked Dart corpus`() {
         val root = fixture()
         val common = root.getValue("common").jsonObject
+        val validation = root.getValue("validationRules").jsonObject
+        assertEquals(listOf(1, 2, 3), validation.getValue("stopReasons").jsonArray.map { it.jsonPrimitive.int })
+        assertEquals(0, validation.int("stopFlagsMask"))
+        assertEquals(1, validation.int("startNewSchemaErrorId"))
+        assertEquals(2, validation.int("startRestoreSchemaErrorId"))
+        assertEquals(36, validation.int("nonFiniteMatrixErrorId"))
+        assertEquals(M0aControlCodec.errorDetailBytes, validation.int("errorDetailBytes"))
         root.getValue("requests").jsonArray.forEach { raw ->
             val spec = raw.jsonObject
             val request = M0aControlRequest(
@@ -166,6 +189,13 @@ class M0aControlCorpusTest {
         }
         assertThrows(IllegalArgumentException::class.java) {
             M0aControlCodec.decodeResponse(mismatchedDiagnosticLength)
+        }
+        val emptyError = M0aControlCodec.encodeResponse(
+            decodedError.copy(payload = byteArrayOf()),
+            M0aControlCodec.hardCeilingBytes,
+        )
+        assertThrows(IllegalArgumentException::class.java) {
+            M0aControlCodec.decodeResponse(emptyError)
         }
     }
 
