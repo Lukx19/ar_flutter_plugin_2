@@ -14,6 +14,37 @@ object M0aPacketCodec {
     const val styleRecordBytes = 8
     const val noChangesMessageKind = 0
 
+    data class ErrorAuthority(
+        val geometryRevision: Long = 0,
+        val lineageRevision: Long = 0,
+        val captureRevision: Long = 0,
+        val coverageRevision: Long = 0,
+        val acceptedStyleRevision: Long = 0,
+        val regionManifestRevision: Long = 0,
+        val nextSurfaceIdHighWater: Long = 0,
+        val schemaRootRevision: Long = 0,
+    )
+
+    data class ErrorPolicy(
+        val resultFlags: Int,
+        val disposition: Int,
+        val validationPhase: Int,
+        val recoveryAction: Int,
+    )
+
+    fun errorPolicy(errorId: Int): ErrorPolicy = when (errorId) {
+        6 -> ErrorPolicy(0, 0, 2, 0)
+        8 -> ErrorPolicy(9, 1, 8, 3)
+        30 -> ErrorPolicy(0, 0, 5, 4)
+        31 -> ErrorPolicy(0, 0, 5, 1)
+        32 -> ErrorPolicy(0, 0, 5, 0)
+        34 -> ErrorPolicy(0, 0, 7, 3)
+        35 -> ErrorPolicy(0, 0, 5, 4)
+        142 -> ErrorPolicy(2, 2, 8, 4)
+        144 -> ErrorPolicy(2, 2, 9, 4)
+        else -> ErrorPolicy(0, 0, 5, 0)
+    }
+
     data class Request(
         val requestFlags: Int,
         val streamToken: Long,
@@ -313,15 +344,34 @@ object M0aPacketCodec {
         requestSequence: Long,
         nextExpectedRequestSequence: Long,
         errorId: Int = 1,
-    ): Response = Response(
+        authority: ErrorAuthority = ErrorAuthority(),
+        diagnostic: ByteArray = byteArrayOf(),
+    ): Response {
+        val policy = errorPolicy(errorId)
+        val detail = M0aControlCodec.encodeErrorDetail(M0aErrorDetail(
+            errorId, 1, policy.disposition, policy.validationPhase,
+            policy.recoveryAction, 0, 1, diagnostic.size,
+            authority.geometryRevision, authority.lineageRevision,
+            authority.captureRevision, authority.coverageRevision,
+            authority.acceptedStyleRevision, authority.regionManifestRevision,
+            authority.nextSurfaceIdHighWater, nextExpectedRequestSequence,
+            requestSequence, authority.schemaRootRevision,
+        ))
+        return Response(
         messageKind = 255,
         responseFlags = 0,
-        resultFlags = 0,
+        resultFlags = policy.resultFlags,
         errorId = errorId,
         requestSequence = requestSequence,
         streamToken = streamToken,
         nextExpectedRequestSequence = nextExpectedRequestSequence,
-    )
+        targetGeometryRevision = authority.geometryRevision,
+        targetLineageRevision = authority.lineageRevision,
+        acceptedStyleRevision = authority.acceptedStyleRevision,
+        payload = detail,
+        diagnostic = diagnostic,
+        )
+    }
 
     /** CRC-32 for transaction payloads, shared by all VGS2 body codecs. */
     internal fun crc32Payload(bytes: ByteArray): Long {
@@ -354,6 +404,22 @@ object M0aPacketCodec {
         }
         if (response.messageKind == 255) {
             require(response.errorId in 1..150) { "Error response has no stable error ID" }
+            require(response.payload.size == M0aControlCodec.errorDetailBytes) {
+                "VGS2 error omitted its exact 96-byte ErrorDetailV2"
+            }
+            val detail = M0aControlCodec.decodeErrorDetail(response.payload)
+            val policy = errorPolicy(response.errorId)
+            require(detail.errorId == response.errorId &&
+                detail.diagnosticBytes == response.diagnostic.size && detail.scope == 1 &&
+                detail.disposition == policy.disposition &&
+                detail.validationPhase == policy.validationPhase &&
+                detail.recoveryAction == policy.recoveryAction &&
+                response.resultFlags == policy.resultFlags &&
+                detail.geometryRevision == response.targetGeometryRevision &&
+                detail.lineageRevision == response.targetLineageRevision &&
+                detail.acceptedStyleRevision == response.acceptedStyleRevision) {
+                "VGS2 error evidence disagrees with canonical policy or authority"
+            }
         } else {
             require(response.errorId == 0) { "Non-error response has a non-zero error ID" }
         }

@@ -742,6 +742,11 @@ class M0aVisibilitySurfaceStreamChannelTest {
         assertEquals(35, rejected.errorId)
         assertEquals(0, rejected.resultFlags)
         assertEquals(Long.MAX_VALUE, rejected.nextExpectedRequestSequence)
+        val detail = M0aControlCodec.decodeErrorDetail(rejected.payload)
+        assertEquals(96, rejected.payload.size)
+        assertEquals(35, detail.errorId)
+        assertEquals(5, detail.validationPhase)
+        assertEquals(4, detail.recoveryAction)
         assertEquals(0L, binding.transportInstrumentation.snapshot().acceptedRequests)
 
         val terminal = request(
@@ -769,6 +774,119 @@ class M0aVisibilitySurfaceStreamChannelTest {
         )
         assertEquals(30, conflict.errorId)
         binding.dispose()
+    }
+
+    @Test
+    fun `transaction MAX commits then terminal drain and fresh binding preserve semantics`() {
+        val messenger = TestMessenger(118)
+        val binding = M0aVisibilitySurfaceStreamChannel(
+            messenger, 118, initialNextExpectedSequence = Long.MAX_VALUE - 2,
+        )
+        binding.setCommittedBaseline(
+            transactionId = Long.MAX_VALUE - 1,
+            geometryRevision = 10,
+            lineageRevision = 20,
+            styleRevision = 30,
+            captureRevision = 40,
+            coverageRevision = 50,
+            regionManifestRevision = 60,
+            schemaRootRevision = 70,
+            nextSurfaceIdHighWater = 80,
+        )
+        binding.queueStructuralTransaction(M0aStructuralTransactionProducerV1.produce(
+            transactionId = Long.MAX_VALUE,
+            baseGeometryRevision = 10,
+            targetGeometryRevision = 11,
+            targetLineageRevision = 21,
+            bytes = byteArrayOf(),
+        ))
+        val begin = M0aPacketCodec.decodeResponse(messenger.exchange(request(
+            Long.MAX_VALUE - 2, 118, acknowledgedTransaction = Long.MAX_VALUE - 1,
+            acknowledgedGeometry = 10, acknowledgedLineage = 20, styleRevision = 30,
+        )))
+        assertEquals(2, begin.messageKind)
+        assertEquals(Long.MAX_VALUE, begin.transactionId)
+        val commit = M0aPacketCodec.decodeResponse(messenger.exchange(request(
+            Long.MAX_VALUE - 1, 118, acknowledgedTransaction = Long.MAX_VALUE - 1,
+            acknowledgedGeometry = 10, acknowledgedLineage = 20, styleRevision = 30,
+        )))
+        assertEquals(4, commit.messageKind)
+        assertEquals(Long.MAX_VALUE, commit.transactionId)
+        val terminal = M0aPacketCodec.decodeResponse(messenger.exchange(request(
+            Long.MAX_VALUE, 118, requestFlags = 1 shl 5,
+            acknowledgedTransaction = Long.MAX_VALUE,
+            acknowledgedGeometry = 11, acknowledgedLineage = 21, styleRevision = 30,
+        )))
+        assertEquals(5, terminal.resultFlags)
+        assertEquals(Long.MAX_VALUE, terminal.transactionId)
+        binding.dispose()
+
+        val freshMessenger = TestMessenger(119)
+        val fresh = M0aVisibilitySurfaceStreamChannel(freshMessenger, 119)
+        fresh.setCommittedBaseline(
+            transactionId = Long.MAX_VALUE,
+            geometryRevision = 11,
+            lineageRevision = 21,
+            styleRevision = 30,
+            captureRevision = 40,
+            coverageRevision = 50,
+            regionManifestRevision = 60,
+            schemaRootRevision = 70,
+            nextSurfaceIdHighWater = 80,
+        )
+        val recovered = M0aPacketCodec.decodeResponse(freshMessenger.exchange(request(
+            1, 119, acknowledgedTransaction = Long.MAX_VALUE,
+            acknowledgedGeometry = 11, acknowledgedLineage = 21, styleRevision = 30,
+        )))
+        assertEquals(0, recovered.messageKind)
+        assertEquals(Long.MAX_VALUE, recovered.transactionId)
+        assertEquals(11, recovered.targetGeometryRevision)
+        assertEquals(21, recovered.targetLineageRevision)
+        assertEquals(30, recovered.acceptedStyleRevision)
+        fresh.dispose()
+    }
+
+    @Test
+    fun `VGS2 errors enforce canonical policy detail and preserved authority`() {
+        val authority = M0aPacketCodec.ErrorAuthority(
+            geometryRevision = 11, lineageRevision = 12, captureRevision = 13,
+            coverageRevision = 14, acceptedStyleRevision = 15,
+            regionManifestRevision = 16, nextSurfaceIdHighWater = 17,
+            schemaRootRevision = 18,
+        )
+        listOf(6, 8, 30, 31, 32, 34, 35, 142, 144).forEach { id ->
+            val response = M0aPacketCodec.error(7, 9, 9, id, authority)
+            val decoded = M0aPacketCodec.decodeResponse(
+                M0aPacketCodec.encodeResponse(response, 4096),
+            )
+            val detail = M0aControlCodec.decodeErrorDetail(decoded.payload)
+            val policy = M0aPacketCodec.errorPolicy(id)
+            assertEquals(96, decoded.payload.size)
+            assertEquals(id, detail.errorId)
+            assertEquals(policy.resultFlags, decoded.resultFlags)
+            assertEquals(policy.disposition, detail.disposition)
+            assertEquals(policy.validationPhase, detail.validationPhase)
+            assertEquals(policy.recoveryAction, detail.recoveryAction)
+            assertEquals(11L, detail.geometryRevision)
+            assertEquals(12L, detail.lineageRevision)
+            assertEquals(15L, detail.acceptedStyleRevision)
+        }
+        val canonical = M0aPacketCodec.error(7, 9, 9, 35, authority)
+        val detail = M0aControlCodec.decodeErrorDetail(canonical.payload)
+        assertThrows(IllegalArgumentException::class.java) {
+            M0aPacketCodec.encodeResponse(canonical.copy(errorId = 34), 4096)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            M0aPacketCodec.encodeResponse(canonical.copy(diagnostic = byteArrayOf(1)), 4096)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            M0aPacketCodec.encodeResponse(canonical.copy(payload = M0aControlCodec.encodeErrorDetail(
+                detail.copy(disposition = 1),
+            )), 4096)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            M0aPacketCodec.encodeResponse(canonical.copy(targetGeometryRevision = 10), 4096)
+        }
     }
 
     @Test

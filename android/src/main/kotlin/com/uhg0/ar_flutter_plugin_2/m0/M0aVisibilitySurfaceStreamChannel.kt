@@ -420,7 +420,7 @@ class M0aVisibilitySurfaceStreamChannel(
                                     }
                                     val token = decodedRequest?.streamToken ?: 0
                                     M0aPacketCodec.encodeResponse(
-                                        M0aPacketCodec.error(
+                                        streamError(
                                             streamToken = token,
                                             requestSequence = sequence,
                                             nextExpectedRequestSequence = nextExpectedSequence,
@@ -438,7 +438,7 @@ class M0aVisibilitySurfaceStreamChannel(
                                     }
                                     val token = decodedRequest?.streamToken ?: 0
                                     M0aPacketCodec.encodeResponse(
-                                        M0aPacketCodec.error(
+                                        streamError(
                                             streamToken = token,
                                             requestSequence = sequence,
                                             nextExpectedRequestSequence = nextExpectedSequence,
@@ -804,7 +804,7 @@ class M0aVisibilitySurfaceStreamChannel(
         }
         val token = runCatching { M0aPacketCodec.decodeRequest(bytes).streamToken }.getOrDefault(0)
         val encoded = M0aPacketCodec.encodeResponse(
-            M0aPacketCodec.error(
+            streamError(
                 streamToken = token,
                 requestSequence = sequence,
                 nextExpectedRequestSequence = nextExpectedSequence,
@@ -820,7 +820,7 @@ class M0aVisibilitySurfaceStreamChannel(
         val sequence = request?.requestSequence ?: 0
         val token = request?.streamToken ?: 0
         val encoded = M0aPacketCodec.encodeResponse(
-            M0aPacketCodec.error(
+            streamError(
                 streamToken = token,
                 requestSequence = sequence,
                 nextExpectedRequestSequence = nextExpectedSequence,
@@ -844,7 +844,7 @@ class M0aVisibilitySurfaceStreamChannel(
         }
         val token = runCatching { M0aPacketCodec.decodeRequest(bytes).streamToken }.getOrDefault(0)
         val encoded = M0aPacketCodec.encodeResponse(
-            M0aPacketCodec.error(
+            streamError(
                 streamToken = token,
                 requestSequence = sequence,
                 nextExpectedRequestSequence = nextExpectedSequence,
@@ -853,6 +853,31 @@ class M0aVisibilitySurfaceStreamChannel(
             M0aPacketCodec.responseMinimumBytes,
         )
         return encoded
+    }
+
+    private fun streamError(
+        streamToken: Long,
+        requestSequence: Long,
+        nextExpectedRequestSequence: Long,
+        errorId: Int,
+    ): M0aPacketCodec.Response {
+        val baseline = committedBaseline
+        return M0aPacketCodec.error(
+            streamToken = streamToken,
+            requestSequence = requestSequence,
+            nextExpectedRequestSequence = nextExpectedRequestSequence,
+            errorId = errorId,
+            authority = M0aPacketCodec.ErrorAuthority(
+                geometryRevision = baseline.geometryRevision,
+                lineageRevision = baseline.lineageRevision,
+                captureRevision = baseline.captureRevision,
+                coverageRevision = baseline.coverageRevision,
+                acceptedStyleRevision = baseline.styleRevision,
+                regionManifestRevision = baseline.regionManifestRevision,
+                nextSurfaceIdHighWater = baseline.nextSurfaceIdHighWater,
+                schemaRootRevision = baseline.schemaRootRevision,
+            ),
+        )
     }
 
     private companion object {
