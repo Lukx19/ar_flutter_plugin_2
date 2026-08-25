@@ -164,7 +164,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
     }
 
     @Test
-    fun `binding rejects a second outstanding invocation without queue growth`() {
+    fun `queued backpressure consumes and caches exactly once before advertised resync succeeds`() {
         val messenger = TestMessenger(34)
         val executor = HoldingExecutor()
         val binding = M0aVisibilitySurfaceStreamChannel(
@@ -179,16 +179,74 @@ class M0aVisibilitySurfaceStreamChannelTest {
             ByteBuffer.wrap(request(sequence = 1, token = 34)),
         ) { firstCompleted.countDown() }
 
-        val rejected = M0aPacketCodec.decodeResponse(
-            messenger.exchange(request(sequence = 2, token = 34)),
-        )
+        val rejectedBytes = arrayOfNulls<ByteArray>(1)
+        val rejectedCompleted = CountDownLatch(1)
+        val second = request(sequence = 2, token = 34)
+        messenger.send(
+            "visibility_surface_stream_34",
+            ByteBuffer.wrap(second),
+        ) { response ->
+            rejectedBytes[0] = response?.let { buffer ->
+                ByteArray(buffer.remaining()).also { buffer.slice().get(it) }
+            }
+            rejectedCompleted.countDown()
+        }
+
+        executor.runNext()
+        assertTrue(firstCompleted.await(2, TimeUnit.SECONDS))
+        executor.runNext()
+        assertTrue(rejectedCompleted.await(2, TimeUnit.SECONDS))
+        val rejected = M0aPacketCodec.decodeResponse(rejectedBytes[0]!!)
         assertEquals(255, rejected.messageKind)
         assertEquals(8, rejected.errorId)
+        assertEquals(9, rejected.resultFlags)
         assertEquals(3L, rejected.nextExpectedRequestSequence)
-        assertEquals(1, binding.transportInstrumentation.snapshot().peakQueueDepth)
+        assertEquals(2, binding.transportInstrumentation.snapshot().peakQueueDepth)
+        val replayBytes = arrayOfNulls<ByteArray>(1)
+        val replayCompleted = CountDownLatch(1)
+        messenger.send("visibility_surface_stream_34", ByteBuffer.wrap(second)) { response ->
+            replayBytes[0] = response?.let { buffer ->
+                ByteArray(buffer.remaining()).also { buffer.slice().get(it) }
+            }
+            replayCompleted.countDown()
+        }
+        executor.runNext()
+        assertTrue(replayCompleted.await(2, TimeUnit.SECONDS))
+        assertArrayEquals(rejectedBytes[0], replayBytes[0])
 
-        executor.runQueued()
-        assertTrue(firstCompleted.await(2, TimeUnit.SECONDS))
+        val resync = M0aPacketCodec.Request(
+            requestFlags = 1 shl 2,
+            streamToken = 34,
+            acknowledgedTransactionId = 0,
+            acknowledgedGeometryRevision = 0,
+            acknowledgedLineageRevision = 0,
+            nextStyleRevision = 0,
+            maximumResponseBytes = 4096,
+            styleRecords = emptyList(),
+            commandBytes = M0aResyncCommandV1(
+                M0aResyncPayloadV1(0, 0, 0, 1, M0aResyncReason.INVALID_TRANSACTION_ORDER),
+            ).encode(),
+            requestSequence = 3,
+        )
+        val recoveredBytes = arrayOfNulls<ByteArray>(1)
+        val recoveredCompleted = CountDownLatch(1)
+        messenger.send(
+            "visibility_surface_stream_34",
+            ByteBuffer.wrap(M0aPacketCodec.encodeRequest(resync)),
+        ) { response ->
+            recoveredBytes[0] = response?.let { buffer ->
+                ByteArray(buffer.remaining()).also { buffer.slice().get(it) }
+            }
+            recoveredCompleted.countDown()
+        }
+        executor.runNext()
+        assertTrue(recoveredCompleted.await(2, TimeUnit.SECONDS))
+        val recovered = M0aPacketCodec.decodeResponse(recoveredBytes[0]!!)
+        assertEquals(0, recovered.messageKind)
+        assertEquals(3, recovered.requestSequence)
+        assertEquals(4, recovered.nextExpectedRequestSequence)
+        assertEquals(3L, binding.transportInstrumentation.snapshot().acceptedRequests)
+
         binding.dispose()
     }
 
@@ -860,7 +918,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
         )
         listOf(4, 6, 8, 30, 31, 32, 34, 35, 48, 142, 144).forEach { id ->
             val response = M0aPacketCodec.error(
-                7, 9, M0aPacketCodec.nextSequenceForPolicy(id, 9), id, authority,
+                7, 9, 9, id, authority,
                 expectedValue = 9, observedValue = 9,
             )
             val decoded = M0aPacketCodec.decodeResponse(
@@ -874,6 +932,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
             assertEquals(policy.disposition, detail.disposition)
             assertEquals(policy.validationPhase, detail.validationPhase)
             assertEquals(policy.recoveryAction, detail.recoveryAction)
+            assertEquals(policy.fieldId, detail.fieldId)
             assertEquals(11L, detail.geometryRevision)
             assertEquals(12L, detail.lineageRevision)
             assertEquals(13L, detail.captureRevision)
@@ -884,6 +943,8 @@ class M0aVisibilitySurfaceStreamChannelTest {
             assertEquals(18L, detail.schemaRootRevision)
             assertEquals(9L, detail.expectedValue)
             assertEquals(9L, detail.observedValue)
+            assertEquals(M0aPacketCodec.nextSequenceForPolicy(id, 9, 9),
+                decoded.nextExpectedRequestSequence)
         }
         val canonical = M0aPacketCodec.error(7, 9, 9, 35, authority)
         val detail = M0aControlCodec.decodeErrorDetail(canonical.payload)
@@ -1342,15 +1403,17 @@ class M0aVisibilitySurfaceStreamChannelTest {
 }
 
 private class HoldingExecutor : Executor {
-    private var queued: Runnable? = null
+    private val queued = ArrayDeque<Runnable>()
 
     override fun execute(command: Runnable) {
-        queued = command
+        queued.addLast(command)
     }
 
     fun runQueued() {
-        checkNotNull(queued).run()
+        while (queued.isNotEmpty()) queued.removeFirst().run()
     }
+
+    fun runNext() = queued.removeFirst().run()
 }
 
 private class HoldingTimeoutScheduler : M0aTimeoutScheduler {

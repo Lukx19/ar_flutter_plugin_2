@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:math';
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import 'ar_visibility_surface_stream.dart';
@@ -474,6 +475,125 @@ int _receiptPositiveInt(Map<Object?, Object?> map, String key) {
   return value;
 }
 
+/// Validated scalar evidence from the debug-only Issue 98 binding handoff.
+@immutable
+final class ARVisibilityGridV2Issue98HandoffReceipt {
+  const ARVisibilityGridV2Issue98HandoffReceipt._({
+    required this.oldTransactionId,
+    required this.oldRequestSequence,
+    required this.terminalResultFlags,
+    required this.terminalNextExpectedRequestSequence,
+    required this.freshTransactionId,
+    required this.freshRequestSequence,
+    required this.nextTransactionId,
+    required this.geometryRevision,
+    required this.lineageRevision,
+    required this.captureRevision,
+    required this.coverageRevision,
+    required this.acceptedStyleRevision,
+    required this.regionManifestRevision,
+    required this.nextSurfaceIdHighWater,
+    required this.schemaRootRevision,
+    required this.semanticEffectCount,
+    required this.oldTokenPublicationCount,
+    required this.rootIsolateSurfaceBytes,
+    required this.oldClosedResources,
+    required this.freshActiveResources,
+  });
+
+  final int oldTransactionId;
+  final int oldRequestSequence;
+  final int terminalResultFlags;
+  final int terminalNextExpectedRequestSequence;
+  final int freshTransactionId;
+  final int freshRequestSequence;
+  final int nextTransactionId;
+  final int geometryRevision;
+  final int lineageRevision;
+  final int captureRevision;
+  final int coverageRevision;
+  final int acceptedStyleRevision;
+  final int regionManifestRevision;
+  final int nextSurfaceIdHighWater;
+  final int schemaRootRevision;
+  final int semanticEffectCount;
+  final int oldTokenPublicationCount;
+  final int rootIsolateSurfaceBytes;
+  final int oldClosedResources;
+  final int freshActiveResources;
+
+  static ARVisibilityGridV2Issue98HandoffReceipt fromMap(Object? raw) {
+    if (raw is! Map) throw StateError('V2 Issue 98 receipt was not a map.');
+    final map = Map<Object?, Object?>.from(raw);
+    const keys = <String>{
+      'oldTransactionId',
+      'oldRequestSequence',
+      'terminalResultFlags',
+      'terminalNextExpectedRequestSequence',
+      'freshTransactionId',
+      'freshRequestSequence',
+      'nextTransactionId',
+      'geometryRevision',
+      'lineageRevision',
+      'captureRevision',
+      'coverageRevision',
+      'acceptedStyleRevision',
+      'regionManifestRevision',
+      'nextSurfaceIdHighWater',
+      'schemaRootRevision',
+      'semanticEffectCount',
+      'oldTokenPublicationCount',
+      'rootIsolateSurfaceBytes',
+      'oldClosedResources',
+      'freshActiveResources',
+    };
+    if (map.keys.any((key) => key is! String || !keys.contains(key)) ||
+        keys.any((key) => !map.containsKey(key))) {
+      throw StateError('V2 Issue 98 receipt fields are incomplete or unknown.');
+    }
+    final receipt = ARVisibilityGridV2Issue98HandoffReceipt._(
+      oldTransactionId: _receiptInt(map, 'oldTransactionId'),
+      oldRequestSequence: _receiptInt(map, 'oldRequestSequence'),
+      terminalResultFlags: _receiptInt(map, 'terminalResultFlags'),
+      terminalNextExpectedRequestSequence: _receiptInt(
+        map,
+        'terminalNextExpectedRequestSequence',
+      ),
+      freshTransactionId: _receiptInt(map, 'freshTransactionId'),
+      freshRequestSequence: _receiptInt(map, 'freshRequestSequence'),
+      nextTransactionId: _receiptInt(map, 'nextTransactionId'),
+      geometryRevision: _receiptInt(map, 'geometryRevision'),
+      lineageRevision: _receiptInt(map, 'lineageRevision'),
+      captureRevision: _receiptInt(map, 'captureRevision'),
+      coverageRevision: _receiptInt(map, 'coverageRevision'),
+      acceptedStyleRevision: _receiptInt(map, 'acceptedStyleRevision'),
+      regionManifestRevision: _receiptInt(map, 'regionManifestRevision'),
+      nextSurfaceIdHighWater: _receiptInt(map, 'nextSurfaceIdHighWater'),
+      schemaRootRevision: _receiptInt(map, 'schemaRootRevision'),
+      semanticEffectCount: _receiptInt(map, 'semanticEffectCount'),
+      oldTokenPublicationCount: _receiptInt(map, 'oldTokenPublicationCount'),
+      rootIsolateSurfaceBytes: _receiptInt(map, 'rootIsolateSurfaceBytes'),
+      oldClosedResources: _receiptInt(map, 'oldClosedResources'),
+      freshActiveResources: _receiptInt(map, 'freshActiveResources'),
+    );
+    if (receipt.oldTransactionId != _maximumPlatformInt ||
+        receipt.oldRequestSequence != _maximumPlatformInt ||
+        receipt.terminalResultFlags != 5 ||
+        receipt.terminalNextExpectedRequestSequence != _maximumPlatformInt ||
+        receipt.freshTransactionId != 0 ||
+        receipt.freshRequestSequence != 1 ||
+        receipt.nextTransactionId != 1 ||
+        receipt.semanticEffectCount != 1 ||
+        receipt.oldTokenPublicationCount != 0 ||
+        receipt.rootIsolateSurfaceBytes != 0 ||
+        receipt.oldClosedResources <= 0 ||
+        receipt.freshActiveResources <= 0) {
+      throw StateError('V2 Issue 98 receipt invariants are invalid.');
+    }
+    return receipt;
+  }
+}
+
 ARVisibilityGridV2CommitReceipt _exactCommitReceipt(
   Object? response,
   ARVisibilityGridV2CommitReceiptQuery query,
@@ -638,14 +758,16 @@ final class ARVisibilityGridV2Control {
   }
 
   /// Executes the bounded debug-only Issue 98 MAX-drain/fresh-cursor seam.
-  Future<Map<Object?, Object?>> runDebugV2Issue98Handoff() async {
+  ///
+  /// Throws [PlatformException] when native rejects the debug request,
+  /// [MissingPluginException] when the endpoint is unavailable, and
+  /// [StateError] when native returns malformed or inconsistent evidence.
+  Future<ARVisibilityGridV2Issue98HandoffReceipt>
+      runDebugV2Issue98Handoff() async {
     await _bindingReady;
     final raw =
         await _channel.invokeMethod<Object?>('runDebugV2Issue98Handoff');
-    if (raw is! Map) {
-      throw StateError('V2 Issue 98 handoff returned an invalid receipt.');
-    }
-    return Map<Object?, Object?>.from(raw);
+    return ARVisibilityGridV2Issue98HandoffReceipt.fromMap(raw);
   }
 
   /// Reconciles an outcome-unknown COMMIT against native's exact receipt.

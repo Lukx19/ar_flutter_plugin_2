@@ -92,6 +92,7 @@ class M0aVisibilitySurfaceStreamChannel(
     private val handlersInstalled = AtomicBoolean(true)
     private val timeoutSchedulerActive = AtomicBoolean(true)
     private val outstandingInvocation = AtomicBoolean(false)
+    private val queuedBackpressure = AtomicBoolean(false)
     @Volatile private var activePendingReply: PendingReply? = null
     @Volatile private var lastSequence: Long? = null
     @Volatile private var nextExpectedSequence = initialNextExpectedSequence
@@ -251,14 +252,23 @@ class M0aVisibilitySurfaceStreamChannel(
             telemetry.allocated(bytes.size)
             if (!outstandingInvocation.compareAndSet(false, true)) {
                 telemetry.rejected()
-                val rejected = backpressureResponse(bytes)
-                telemetry.allocated(rejected.remaining())
-                reply.reply(qualify(rejected))
+                if (!queuedBackpressure.compareAndSet(false, true)) {
+                    reply.reply(null)
+                    return@setMessageHandler
+                }
+                telemetry.queued()
+                try {
+                    workerExecutor.execute { processQueuedBackpressure(bytes, reply) }
+                } catch (_: RejectedExecutionException) {
+                    queuedBackpressure.set(false)
+                    outstandingInvocation.set(false)
+                    reply.reply(null)
+                }
                 return@setMessageHandler
             }
             telemetry.queued()
             val pendingReply = PendingReply(bytes, reply, ::qualify) {
-                outstandingInvocation.set(false)
+                if (!queuedBackpressure.get()) outstandingInvocation.set(false)
                 activePendingReply = null
             }
             activePendingReply = pendingReply
@@ -431,10 +441,7 @@ class M0aVisibilitySurfaceStreamChannel(
                                         streamError(
                                             streamToken = token,
                                             requestSequence = sequence,
-                                            nextExpectedRequestSequence =
-                                                M0aPacketCodec.nextSequenceForPolicy(
-                                                    error.errorId, sequence, nextExpectedSequence,
-                                                ),
+                                            nextExpectedRequestSequence = nextExpectedSequence,
                                             errorId = error.errorId,
                                         ),
                                         M0aPacketCodec.responseMinimumBytes,
@@ -826,20 +833,49 @@ class M0aVisibilitySurfaceStreamChannel(
         return ByteBuffer.allocateDirect(encoded.size).apply { put(encoded) }
     }
 
-    private fun backpressureResponse(bytes: ByteArray): ByteBuffer {
-        val request = runCatching { M0aPacketCodec.decodeRequest(bytes) }.getOrNull()
-        val sequence = request?.requestSequence ?: 0
-        val token = request?.streamToken ?: 0
-        val encoded = M0aPacketCodec.encodeResponse(
-            streamError(
-                streamToken = token,
-                requestSequence = sequence,
-                nextExpectedRequestSequence = nextExpectedSequence,
-                errorId = STREAM_BACKPRESSURE_ERROR_ID,
-            ),
-            M0aPacketCodec.responseMinimumBytes,
-        )
-        return ByteBuffer.allocateDirect(encoded.size).apply { put(encoded) }
+    /** Serializes the consumed ID8 transition behind the invocation that caused pressure. */
+    private fun processQueuedBackpressure(
+        bytes: ByteArray,
+        reply: BasicMessageChannel.Reply<ByteBuffer>,
+    ) {
+        telemetry.dequeued()
+        try {
+            val encoded = synchronized(this) {
+                check(!disposed.get() && !bindingAbandoned.get()) {
+                    "Queued backpressure request belongs to an abandoned binding"
+                }
+                val request = M0aPacketCodec.decodeRequest(bytes)
+                controlLifecycle?.streamTokenError(request.streamToken)?.let { throw BindingError(it) }
+                require(request.requestSequence == nextExpectedSequence) {
+                    "Queued backpressure request must advertise the next sequence"
+                }
+                val response = M0aPacketCodec.encodeResponse(
+                    streamError(
+                        streamToken = request.streamToken,
+                        requestSequence = request.requestSequence,
+                        nextExpectedRequestSequence = nextExpectedSequence,
+                        errorId = STREAM_BACKPRESSURE_ERROR_ID,
+                    ),
+                    M0aPacketCodec.responseMinimumBytes,
+                )
+                resyncPending = true
+                lastSequence = request.requestSequence
+                nextExpectedSequence = request.requestSequence + 1
+                lastRequest = bytes.copyOf()
+                lastResponse = response.copyOf()
+                telemetry.retainedReplayCache(bytes.size, response.size)
+                telemetry.accepted(bytes.size, response.size)
+                response
+            }
+            telemetry.allocated(bytes.size + encoded.size)
+            reply.reply(qualify(encoded))
+        } catch (_: Exception) {
+            reply.reply(null)
+        } finally {
+            queuedBackpressure.set(false)
+            outstandingInvocation.set(false)
+            telemetry.completed()
+        }
     }
 
     private fun workerLostResponse(bytes: ByteArray): ByteBuffer {

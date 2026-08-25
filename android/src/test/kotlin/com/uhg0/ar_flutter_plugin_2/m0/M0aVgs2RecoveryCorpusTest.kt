@@ -20,6 +20,7 @@ class M0aVgs2RecoveryCorpusTest {
         val source = fixture().decodeToString()
         listOf(
             source.replaceFirst("\"observedValue\":40", "\"observedValue\":41"),
+            source.replaceFirst("\"fieldId\":4", "\"fieldId\":9"),
             source.replaceFirst("\"scope\":1", "\"unknown\":0,\"scope\":1"),
             source.replaceFirst("\"scope\":1,", ""),
         ).forEach { mutation ->

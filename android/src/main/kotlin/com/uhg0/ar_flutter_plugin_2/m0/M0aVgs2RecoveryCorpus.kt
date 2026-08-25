@@ -11,12 +11,12 @@ import kotlinx.serialization.json.long
 
 /** Strict executable lock for the canonical Issue 98 VGS2 recovery policies. */
 object M0aVgs2RecoveryCorpus {
-    const val SHA256 = "8305129c73b74d2709ea038b78ea27d99097b9fed824cb45da5aa8d41811857c"
+    const val SHA256 = "356d614ffa5861a367ed7358315d5b01832798eb5e52bbb42f1527bcd3d3b2bb"
     private val policyIds = setOf(4, 8, 48, 142, 144)
     private val rootKeys = setOf("format", "policies", "freshBinding")
     private val policyKeys = setOf(
         "errorId", "resultFlags", "disposition", "validationPhase", "recoveryAction",
-        "sequenceDisposition", "requestSequence", "nextExpectedRequestSequence", "scope",
+        "fieldId", "sequenceDisposition", "requestSequence", "nextExpectedRequestSequence", "scope",
         "authorityKind", "diagnosticBytes", "geometryRevision", "lineageRevision",
         "captureRevision", "coverageRevision", "acceptedStyleRevision",
         "regionManifestRevision", "nextSurfaceIdHighWater", "schemaRootRevision",
@@ -54,6 +54,7 @@ object M0aVgs2RecoveryCorpus {
         require(policy.disposition == row.int("disposition"))
         require(policy.validationPhase == row.int("validationPhase"))
         require(policy.recoveryAction == row.int("recoveryAction"))
+        require(policy.fieldId == row.int("fieldId"))
         require(policy.sequenceDisposition.name.lowercase().replace("_", "") ==
             row.string("sequenceDisposition").lowercase())
         val authority = M0aPacketCodec.ErrorAuthority(
@@ -68,7 +69,7 @@ object M0aVgs2RecoveryCorpus {
         val response = M0aPacketCodec.decodeResponse(M0aPacketCodec.encodeResponse(
             M0aPacketCodec.error(
                 streamToken = 7, requestSequence = requestSequence,
-                nextExpectedRequestSequence = row.long("nextExpectedRequestSequence"),
+                nextExpectedRequestSequence = row.long("expectedValue"),
                 errorId = id, authority = authority,
                 expectedValue = row.long("expectedValue"), observedValue = row.long("observedValue"),
             ), 4096,
@@ -77,6 +78,7 @@ object M0aVgs2RecoveryCorpus {
         require(response.resultFlags == row.int("resultFlags"))
         require(response.nextExpectedRequestSequence == row.long("nextExpectedRequestSequence"))
         require(detail.scope == row.int("scope") && detail.authorityKind == row.int("authorityKind"))
+        require(detail.fieldId == row.int("fieldId"))
         require(detail.diagnosticBytes == row.int("diagnosticBytes"))
         require(detail.geometryRevision == authority.geometryRevision)
         require(detail.lineageRevision == authority.lineageRevision)
@@ -99,7 +101,7 @@ object M0aVgs2RecoveryCorpus {
             schemaRootRevision = row.long("schemaRootRevision"),
             nextSurfaceIdHighWater = row.long("nextSurfaceIdHighWater"),
         )
-        val fresh = old.copy(transactionId = 0)
+        val fresh = M0aCommittedBaselineV1.forFreshBinding(old)
         require(fresh.transactionId == row.long("freshTransactionId"))
         require(row.long("freshRequestSequence") == 1L && row.long("nextTransactionId") == 1L)
         require(fresh.copy(transactionId = 1).transactionId == row.long("nextTransactionId"))

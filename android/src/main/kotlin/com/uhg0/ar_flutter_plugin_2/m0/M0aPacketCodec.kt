@@ -30,24 +30,25 @@ object M0aPacketCodec {
         val disposition: Int,
         val validationPhase: Int,
         val recoveryAction: Int,
+        val fieldId: Int,
         val sequenceDisposition: SequenceDisposition,
     )
 
     enum class SequenceDisposition { UNCHANGED, ADJACENT, BINDING_INVALID }
 
     fun errorPolicy(errorId: Int): ErrorPolicy = when (errorId) {
-        4 -> ErrorPolicy(2, 2, 4, 4, SequenceDisposition.BINDING_INVALID)
-        6 -> ErrorPolicy(0, 0, 2, 0, SequenceDisposition.UNCHANGED)
-        8 -> ErrorPolicy(9, 1, 8, 3, SequenceDisposition.ADJACENT)
-        30 -> ErrorPolicy(0, 0, 5, 4, SequenceDisposition.UNCHANGED)
-        31 -> ErrorPolicy(0, 0, 5, 1, SequenceDisposition.UNCHANGED)
-        32 -> ErrorPolicy(0, 0, 5, 0, SequenceDisposition.UNCHANGED)
-        34 -> ErrorPolicy(0, 0, 7, 3, SequenceDisposition.UNCHANGED)
-        35 -> ErrorPolicy(0, 0, 5, 4, SequenceDisposition.UNCHANGED)
-        48 -> ErrorPolicy(0, 0, 7, 0, SequenceDisposition.UNCHANGED)
-        142 -> ErrorPolicy(2, 2, 8, 4, SequenceDisposition.BINDING_INVALID)
-        144 -> ErrorPolicy(2, 2, 9, 4, SequenceDisposition.BINDING_INVALID)
-        else -> ErrorPolicy(0, 0, 5, 0, SequenceDisposition.UNCHANGED)
+        4 -> ErrorPolicy(2, 2, 4, 4, 4, SequenceDisposition.BINDING_INVALID)
+        6 -> ErrorPolicy(0, 0, 2, 0, 0, SequenceDisposition.UNCHANGED)
+        8 -> ErrorPolicy(9, 1, 8, 3, 9, SequenceDisposition.ADJACENT)
+        30 -> ErrorPolicy(0, 0, 5, 4, 9, SequenceDisposition.UNCHANGED)
+        31 -> ErrorPolicy(0, 0, 5, 1, 9, SequenceDisposition.UNCHANGED)
+        32 -> ErrorPolicy(0, 0, 5, 0, 9, SequenceDisposition.UNCHANGED)
+        34 -> ErrorPolicy(0, 0, 7, 3, 9, SequenceDisposition.UNCHANGED)
+        35 -> ErrorPolicy(0, 0, 5, 4, 9, SequenceDisposition.UNCHANGED)
+        48 -> ErrorPolicy(0, 0, 7, 0, 0, SequenceDisposition.UNCHANGED)
+        142 -> ErrorPolicy(2, 2, 8, 4, 0, SequenceDisposition.BINDING_INVALID)
+        144 -> ErrorPolicy(2, 2, 9, 4, 0, SequenceDisposition.BINDING_INVALID)
+        else -> ErrorPolicy(0, 0, 5, 0, 0, SequenceDisposition.UNCHANGED)
     }
 
     fun nextSequenceForPolicy(
@@ -374,7 +375,7 @@ object M0aPacketCodec {
         )
         val detail = M0aControlCodec.encodeErrorDetail(M0aErrorDetail(
             errorId, 1, policy.disposition, policy.validationPhase,
-            policy.recoveryAction, 0, 1, diagnostic.size,
+            policy.recoveryAction, policy.fieldId, 1, diagnostic.size,
             authority.geometryRevision, authority.lineageRevision,
             authority.captureRevision, authority.coverageRevision,
             authority.acceptedStyleRevision, authority.regionManifestRevision,
@@ -438,6 +439,7 @@ object M0aPacketCodec {
                 detail.disposition == policy.disposition &&
                 detail.validationPhase == policy.validationPhase &&
                 detail.recoveryAction == policy.recoveryAction &&
+                detail.fieldId == policy.fieldId &&
                 response.resultFlags == policy.resultFlags &&
                 detail.geometryRevision == response.targetGeometryRevision &&
                 detail.lineageRevision == response.targetLineageRevision &&
@@ -446,9 +448,7 @@ object M0aPacketCodec {
             }
             require(response.nextExpectedRequestSequence == when (policy.sequenceDisposition) {
                 SequenceDisposition.UNCHANGED -> detail.expectedValue
-                SequenceDisposition.ADJACENT -> nextSequenceForPolicy(
-                    response.errorId, response.requestSequence,
-                )
+                SequenceDisposition.ADJACENT -> response.requestSequence + 1
                 SequenceDisposition.BINDING_INVALID -> 0
             }) {
                 "VGS2 error sequence disagrees with canonical policy"

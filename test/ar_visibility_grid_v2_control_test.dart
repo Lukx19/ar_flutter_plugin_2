@@ -8,6 +8,54 @@ import 'package:flutter_test/flutter_test.dart';
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  test('Issue 98 handoff returns a validated immutable typed receipt',
+      () async {
+    const channel = MethodChannel('visibility_grid_v2_control_98');
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      if (call.method != 'runDebugV2Issue98Handoff') return null;
+      return <String, Object>{
+        'oldTransactionId': 0x7fffffffffffffff,
+        'oldRequestSequence': 0x7fffffffffffffff,
+        'terminalResultFlags': 5,
+        'terminalNextExpectedRequestSequence': 0x7fffffffffffffff,
+        'freshTransactionId': 0,
+        'freshRequestSequence': 1,
+        'nextTransactionId': 1,
+        'geometryRevision': 11,
+        'lineageRevision': 12,
+        'captureRevision': 13,
+        'coverageRevision': 14,
+        'acceptedStyleRevision': 15,
+        'regionManifestRevision': 16,
+        'nextSurfaceIdHighWater': 17,
+        'schemaRootRevision': 18,
+        'semanticEffectCount': 1,
+        'oldTokenPublicationCount': 0,
+        'rootIsolateSurfaceBytes': 0,
+        'oldClosedResources': 3,
+        'freshActiveResources': 3,
+      };
+    });
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null),
+    );
+    final control = ARVisibilityGridV2Control(
+      98,
+      initialBindingSnapshot: <Object?, Object?>{
+        'nativeStreamToken': Uint8List(16),
+        'workerBindingToken': Uint8List(16),
+      },
+    );
+    final receipt = await control.runDebugV2Issue98Handoff();
+    expect(receipt, isA<ARVisibilityGridV2Issue98HandoffReceipt>());
+    expect(receipt.nextTransactionId, 1);
+    expect(receipt.semanticEffectCount, 1);
+    expect(receipt.oldTokenPublicationCount, 0);
+    expect(receipt.rootIsolateSurfaceBytes, 0);
+  });
+
   test(
       'connection-owned disposal rejects stale replacement and returns receipt',
       () async {

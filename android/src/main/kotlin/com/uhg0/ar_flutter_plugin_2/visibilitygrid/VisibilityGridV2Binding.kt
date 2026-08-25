@@ -16,6 +16,7 @@ import com.uhg0.ar_flutter_plugin_2.m0.M0aUuid
 import com.uhg0.ar_flutter_plugin_2.m0.M0aStructuralTransactionProducerV1
 import com.uhg0.ar_flutter_plugin_2.m0.M0aStartRequestCodecV2
 import com.uhg0.ar_flutter_plugin_2.m0.M0aVisibilitySurfaceStreamChannel
+import com.uhg0.ar_flutter_plugin_2.m0.M0aIssue98HandoffRunner
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -222,62 +223,7 @@ class VisibilityGridV2Binding internal constructor(
             if (!isDebuggable) {
                 result.error("VG_PROTOCOL_INVALID", "V2 recovery seam is debug-only", null)
             } else {
-                val old = M0aCommittedBaselineV1(
-                    transactionId = Long.MAX_VALUE,
-                    geometryRevision = 11,
-                    lineageRevision = 12,
-                    styleRevision = 15,
-                    captureRevision = 13,
-                    coverageRevision = 14,
-                    regionManifestRevision = 16,
-                    nextSurfaceIdHighWater = 17,
-                    schemaRootRevision = 18,
-                )
-                val terminal = M0aPacketCodec.decodeResponse(
-                    M0aPacketCodec.encodeResponse(
-                        M0aPacketCodec.rolloverRequired(
-                            streamToken = 1,
-                            requestSequence = Long.MAX_VALUE,
-                            transactionId = old.transactionId,
-                            targetGeometryRevision = old.geometryRevision,
-                            targetLineageRevision = old.lineageRevision,
-                            acceptedStyleRevision = old.styleRevision,
-                        ),
-                        M0aPacketCodec.responseMinimumBytes,
-                    ),
-                )
-                check(terminal.resultFlags == 5 &&
-                    terminal.nextExpectedRequestSequence == Long.MAX_VALUE &&
-                    terminal.transactionId == Long.MAX_VALUE)
-                val fresh = M0aCommittedBaselineV1.forFreshBinding(old)
-                val next = M0aStructuralTransactionProducerV1.produce(
-                    transactionId = 1,
-                    baseGeometryRevision = fresh.geometryRevision,
-                    targetGeometryRevision = fresh.geometryRevision + 1,
-                    targetLineageRevision = fresh.lineageRevision + 1,
-                    bytes = byteArrayOf(),
-                )
-                check(next.isNotEmpty())
-                result.success(mapOf(
-                    "oldTransactionId" to old.transactionId,
-                    "oldRequestSequence" to Long.MAX_VALUE,
-                    "terminalResultFlags" to terminal.resultFlags,
-                    "terminalNextExpectedRequestSequence" to terminal.nextExpectedRequestSequence,
-                    "freshTransactionId" to fresh.transactionId,
-                    "freshRequestSequence" to 1L,
-                    "nextTransactionId" to 1L,
-                    "geometryRevision" to fresh.geometryRevision,
-                    "lineageRevision" to fresh.lineageRevision,
-                    "captureRevision" to fresh.captureRevision,
-                    "coverageRevision" to fresh.coverageRevision,
-                    "acceptedStyleRevision" to fresh.styleRevision,
-                    "regionManifestRevision" to fresh.regionManifestRevision,
-                    "nextSurfaceIdHighWater" to fresh.nextSurfaceIdHighWater,
-                    "schemaRootRevision" to fresh.schemaRootRevision,
-                    "semanticEffectCount" to 1,
-                    "oldTokenPublicationCount" to 0,
-                    "rootIsolateSurfaceBytes" to 0,
-                ))
+                result.success(M0aIssue98HandoffRunner.run().toMap())
             }
             return
         }
