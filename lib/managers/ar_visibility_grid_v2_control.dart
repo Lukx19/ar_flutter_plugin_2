@@ -490,10 +490,12 @@ ARVisibilityGridV2CommitReceipt _exactCommitReceipt(
 /// Each invocation is one VGC2 request and returns one VGD2 response. The V1
 /// visibility-grid manager remains the compatibility product path.
 final class ARVisibilityGridV2Control {
-  /// Creates a control and immediately starts one hidden connection-time
-  /// `bindingSnapshot` invocation. The snapshot's two 16-byte tokens are
-  /// owned for this control's lifetime; disposal never snapshots replacement
-  /// state. [initialBindingSnapshot] is the deterministic host/fake seam.
+  /// Creates a compatibility control and immediately starts one hidden
+  /// connection-time `bindingSnapshot` invocation. The snapshot's two
+  /// 16-byte tokens are owned for this control's lifetime; disposal never
+  /// snapshots replacement state. [initialBindingSnapshot] is the
+  /// deterministic host/fake seam. The worker API below has the stronger
+  /// connection-owned cleanup-lease contract used by production workers.
   ARVisibilityGridV2Control(
     int viewId, {
     MethodChannel? channel,
@@ -692,18 +694,21 @@ final class ARVisibilityGridV2Control {
     _bindingQualifier = qualifier;
   }
 
-  /// Fences only the currently claimed V2 binding.
+  /// Fences only the currently claimed compatibility V2 binding.
   ///
   /// The public API is intentionally argument-free. Its connection-time
   /// qualifier is supplied internally so a stale control object cannot
   /// dispose a replacement. An endpoint without the optional snapshot seam
   /// sends a null argument and lets native reject the request; it must not
-  /// guess a replacement identity.
+  /// guess a replacement identity. This compatibility seam is distinct from
+  /// the worker cleanup lease: worker `dispose` and `abandonAndSnapshot`
+  /// always send their same claimed 16-byte connection lease.
   ///
   /// Throws [PlatformException] or [MissingPluginException] when the platform
-  /// channel cannot apply the fence. Throws [StateError] when an already closed
-  /// control has no cached receipt, when binding-token capture failed, or when
-  /// native returns a non-map receipt or omits numeric `closedResources`.
+  /// channel cannot apply the fence, including stale or unclaimed native
+  /// authority. Throws [StateError] only when binding-token capture or the
+  /// teardown receipt is malformed or internally contradictory, including a
+  /// missing/non-numeric `closedResources` field.
   ///
   /// Returns the native teardown map. It contains the old binding's scalar
   /// identity and lifecycle fields plus numeric `closedResources`; it never
@@ -882,28 +887,34 @@ final class ARVisibilityGridV2WorkerBinding {
         _streamChannel = streamChannel,
         _cleanupLease = cleanupLease;
 
-  /// Creates a worker binding using Flutter's background messenger with a
-  /// fresh Dart-owned cleanup lease available before any native reply.
+  /// Creates a worker binding using Flutter's background messenger with one
+  /// fresh, connection-owned 16-byte Dart cleanup lease available before any
+  /// native reply. The lease is never replaced by a later binding generation.
   ///
   /// The control channel accepts `start`, `beginCheckpoint`,
   /// `releaseCheckpoint`, and `stop`; each method takes one [Uint8List] and
   /// returns one [Uint8List]. Public `dispose` takes no argument and supplies
-  /// its claimed qualifier internally. Hidden `claimBindingLease` receives the
-  /// connection's 16-byte Dart cleanup lease, atomically binds it to the native
-  /// current identity, and returns the scalar snapshot. Hidden
-  /// `bindingSnapshot` remains a no-argument telemetry query. `disposeBinding`
-  /// and independent `abandonBinding` receive that exact 16-byte lease; both
-  /// replay only its bounded old terminal, while a winning abandon installs a
-  /// fresh identity. The stream
+  /// its claimed lease internally. Hidden `claimBindingLease` receives exactly
+  /// the connection's 16-byte Dart cleanup lease, atomically binds it to the
+  /// exact current native binding identity, and returns that binding's bounded
+  /// scalar snapshot only after the claim is owned. Hidden `bindingSnapshot`
+  /// remains a no-argument telemetry query. `disposeBinding` and independent
+  /// `abandonBinding` receive that exact same 16-byte lease; both replay only
+  /// its bounded old terminal, while a winning abandon installs a fresh
+  /// identity. The stream
   /// channel accepts one binary [ByteData] envelope and returns one binary
   /// [ByteData] envelope, or null when the native side has no response.
   ///
-  /// [captureCleanupAuthority] atomically claims that lease against the native
-  /// current identity before its snapshot reply is queued. Thus a stalled or
-  /// malformed claim reply can still dispose or abandon the claimed attempt,
-  /// while a delayed old cleanup only replays its bounded terminal and cannot
-  /// rotate a replacement. The optional channels are a host-test transport
-  /// seam and must be supplied together.
+  /// [captureCleanupAuthority] atomically claims that lease against the exact
+  /// native current identity before its scalar snapshot reply is queued. The
+  /// attempt owner must retain its [close], [disposeAndSnapshot], and
+  /// [abandonAndSnapshot] callbacks before awaiting the claim response. Thus a
+  /// stalled or malformed claim reply still leaves native cleanup reachable
+  /// for that exact attempt, while a delayed old cleanup only replays its
+  /// bounded terminal and cannot mutate or rotate a replacement. Native
+  /// stale/unclaimed rejection is a [PlatformException] terminal, not a local
+  /// [StateError]. The optional channels are a host-test transport seam and
+  /// must be supplied together.
   factory ARVisibilityGridV2WorkerBinding.connect({
     required ui.RootIsolateToken rootIsolateToken,
     required int viewId,
@@ -936,14 +947,17 @@ final class ARVisibilityGridV2WorkerBinding {
     );
   }
 
-  /// Atomically claims this connection's immutable native cleanup lease.
+  /// Atomically claims this connection's immutable 16-byte native cleanup
+  /// lease with `claimBindingLease`.
   ///
   /// Callers must attach [close], [disposeAndSnapshot], and
   /// [abandonAndSnapshot] to their attempt owner before awaiting this method.
-  /// Native owns the claim before the returned snapshot reply is queued, so
-  /// cleanup remains available even when this Future deadlines or its reply is
-  /// malformed. [PlatformException] and [MissingPluginException] propagate;
-  /// malformed token fields throw [StateError].
+  /// The request is exactly the fresh connection lease, and native owns that
+  /// lease against the exact current binding before the bounded scalar snapshot
+  /// reply is queued. Cleanup therefore remains available even when this
+  /// Future stalls or its reply is malformed. Native stale/unclaimed
+  /// rejection propagates as [PlatformException] (as does channel failure);
+  /// [StateError] is reserved for a malformed claim snapshot.
   Future<void> captureCleanupAuthority() async {
     final response = await _controlChannel.invokeMethod<Object?>(
       'claimBindingLease',
@@ -969,7 +983,8 @@ final class ARVisibilityGridV2WorkerBinding {
       .map((byte) => byte.toRadixString(16).padLeft(2, '0'))
       .join();
 
-  /// Claims the native binding tokens returned by `bindingSnapshot`.
+  /// Claims the bounded native binding snapshot returned by
+  /// `claimBindingLease` or `bindingSnapshot`.
   /// The first valid snapshot owns this Dart binding for its lifetime. Reusing
   /// the same qualifier is idempotent; a different later qualifier throws
   /// [StateError]. Either token being absent or not a 16-byte [Uint8List] also
@@ -1173,9 +1188,11 @@ final class ARVisibilityGridV2WorkerBinding {
   /// The Android owner replaces the per-view stream/control lifecycle after
   /// this call, so a subsequent group can negotiate a new binding generation
   /// without reusing the old stream token or transaction cursor.
-  /// Throws [PlatformException] or [MissingPluginException] when the channel
-  /// cannot deliver the qualified fence, and [StateError] when no qualifier
-  /// has been claimed or native omits the teardown map/`closedResources`.
+  /// The no-argument method internally sends this worker's same claimed
+  /// 16-byte cleanup lease. Native stale/unclaimed rejection is a
+  /// [PlatformException] and leaves any replacement generation, tokens,
+  /// callbacks, lifecycle, and resources unchanged. [StateError] is reserved
+  /// for malformed or contradictory teardown evidence.
   Future<void> dispose() async {
     await disposeAndSnapshot();
   }
@@ -1185,9 +1202,12 @@ final class ARVisibilityGridV2WorkerBinding {
   /// and lifecycle evidence for teardown receipts. Handler, callback, serial
   /// executor, timeout-scheduler, and aggregate owned-resource fields are
   /// state-derived `Before`/`After` counts; each `Balance` is `After - Before`.
-  /// Throws [PlatformException] or [MissingPluginException] on channel failure,
-  /// and [StateError] when no qualifier has been claimed or native omits the
-  /// teardown map/`closedResources`.
+  /// The no-argument method internally sends this worker's same claimed
+  /// 16-byte cleanup lease. Native stale/unclaimed rejection is a
+  /// [PlatformException] and leaves any replacement generation, tokens,
+  /// callbacks, lifecycle, and resources unchanged. [StateError] is reserved
+  /// for malformed or contradictory teardown evidence, including missing or
+  /// incoherent closure/ledger fields.
   Future<Map<Object?, Object?>> disposeAndSnapshot() async {
     final existing = _disposeFuture;
     if (existing != null) return existing;

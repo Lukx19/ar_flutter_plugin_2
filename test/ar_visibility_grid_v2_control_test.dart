@@ -413,7 +413,7 @@ void main() {
   });
 
   test(
-    'worker connection captures cleanup qualifier before visible snapshot rejection',
+    'worker claim sends an exact lease before visible snapshot rejection',
     () async {
       const controlChannel = MethodChannel('visibility_grid_v2_control_92');
       const streamChannel = BasicMessageChannel<ByteData?>(
@@ -424,12 +424,14 @@ void main() {
       final workerToken = Uint8List.fromList(
         List<int>.generate(16, (i) => i + 16),
       );
-      Uint8List? cleanupQualifier;
+      Uint8List? claimLease;
+      Uint8List? cleanupLease;
       var snapshots = 0;
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
           .setMockMethodCallHandler(controlChannel, (call) async {
         if (call.method == 'claimBindingLease') {
           snapshots++;
+          claimLease = Uint8List.fromList(call.arguments! as Uint8List);
           return <String, Object?>{
             'nativeStreamToken': nativeToken,
             'workerBindingToken': workerToken,
@@ -443,7 +445,7 @@ void main() {
           };
         }
         if (call.method == 'disposeBinding') {
-          cleanupQualifier = Uint8List.fromList(call.arguments! as Uint8List);
+          cleanupLease = Uint8List.fromList(call.arguments! as Uint8List);
           return <String, Object?>{'closedResources': 3};
         }
         throw PlatformException(code: 'unsupported');
@@ -466,11 +468,12 @@ void main() {
       expect(() => binding.bindSnapshot(malformed), throwsStateError);
       expect((await binding.disposeAndSnapshot())['closedResources'], 3);
       expect(snapshots, 2);
-      expect(cleanupQualifier, hasLength(16));
+      expect(claimLease, hasLength(16));
+      expect(cleanupLease, orderedEquals(claimLease!));
     },
   );
 
-  test('stalled lease reply still supplies exact native cleanup handle',
+  test('stalled claim retains callbacks and reuses the exact lease for abandon',
       () async {
     const controlChannel = MethodChannel('visibility_grid_v2_control_93');
     const streamChannel = BasicMessageChannel<ByteData?>(
@@ -484,6 +487,7 @@ void main() {
         .setMockMethodCallHandler(controlChannel, (call) async {
       if (call.method == 'claimBindingLease') {
         claimedLease = Uint8List.fromList(call.arguments! as Uint8List);
+        expect(claimedLease, hasLength(16));
         return claimReply.future;
       }
       if (call.method == 'abandonBinding') {
@@ -503,8 +507,10 @@ void main() {
       streamChannel: streamChannel,
     );
     final capture = binding.captureCleanupAuthority();
-    await Future<void>.delayed(Duration.zero);
-    expect((await binding.abandonAndSnapshot())['closedResources'], 3);
+    // Retain the independent cleanup callback before awaiting the claim
+    // response. Native owns the lease before that response is queued.
+    final abandon = binding.abandonAndSnapshot();
+    expect((await abandon)['closedResources'], 3);
     expect(abandonedLease, orderedEquals(claimedLease!));
     claimReply.complete(<String, Object?>{
       'nativeStreamToken': Uint8List(15),
@@ -513,7 +519,70 @@ void main() {
     await expectLater(capture, throwsStateError);
   });
 
-  test('cleanup receipt rejects incoherent lifecycle ledger deltas', () async {
+  test(
+      'native unclaimed rejection is a PlatformException without replacement mutation',
+      () async {
+    const controlChannel = MethodChannel('visibility_grid_v2_control_95');
+    const streamChannel = BasicMessageChannel<ByteData?>(
+      'visibility_surface_stream_95',
+      BinaryCodec(),
+    );
+    final replacementNative = Uint8List.fromList(
+      List<int>.generate(16, (index) => index + 40),
+    );
+    final replacementWorker = Uint8List.fromList(
+      List<int>.generate(16, (index) => index + 56),
+    );
+    var claimAttempts = 0;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(controlChannel, (call) async {
+      if (call.method == 'claimBindingLease') {
+        claimAttempts++;
+        expect(call.arguments, isA<Uint8List>());
+        expect((call.arguments! as Uint8List), hasLength(16));
+        throw PlatformException(
+          code: 'VG_STREAM_BINDING_ABANDONED',
+          message: 'V2 cleanup lease claim rejected',
+        );
+      }
+      if (call.method == 'bindingSnapshot') {
+        return <String, Object?>{
+          'bindingGeneration': 17,
+          'nativeStreamToken': replacementNative,
+          'workerBindingToken': replacementWorker,
+        };
+      }
+      throw PlatformException(code: 'unsupported');
+    });
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(controlChannel, null),
+    );
+
+    final binding = ARVisibilityGridV2WorkerBinding.connect(
+      rootIsolateToken: ServicesBinding.rootIsolateToken!,
+      viewId: 95,
+      controlChannel: controlChannel,
+      streamChannel: streamChannel,
+    );
+    await expectLater(
+      binding.captureCleanupAuthority(),
+      throwsA(
+        isA<PlatformException>().having(
+          (error) => error.code,
+          'code',
+          'VG_STREAM_BINDING_ABANDONED',
+        ),
+      ),
+    );
+    final replacement = await binding.snapshot();
+    expect(claimAttempts, 1);
+    expect(replacement['bindingGeneration'], 17);
+    expect(replacement['nativeStreamToken'], orderedEquals(replacementNative));
+    expect(replacement['workerBindingToken'], orderedEquals(replacementWorker));
+  });
+
+  test('malformed teardown evidence is a local StateError', () async {
     const controlChannel = MethodChannel('visibility_grid_v2_control_94');
     const streamChannel = BasicMessageChannel<ByteData?>(
       'visibility_surface_stream_94',
