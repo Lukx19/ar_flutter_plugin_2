@@ -956,8 +956,9 @@ final class ARVisibilityGridV2WorkerBinding {
   /// lease against the exact current binding before the bounded scalar snapshot
   /// reply is queued. Cleanup therefore remains available even when this
   /// Future stalls or its reply is malformed. Native stale/unclaimed
-  /// rejection propagates as [PlatformException] (as does channel failure);
-  /// [StateError] is reserved for a malformed claim snapshot.
+  /// rejection propagates as [PlatformException]; an unavailable channel
+  /// propagates [MissingPluginException]. [StateError] is reserved for a
+  /// malformed claim snapshot.
   Future<void> captureCleanupAuthority() async {
     final response = await _controlChannel.invokeMethod<Object?>(
       'claimBindingLease',
@@ -1191,8 +1192,9 @@ final class ARVisibilityGridV2WorkerBinding {
   /// The no-argument method internally sends this worker's same claimed
   /// 16-byte cleanup lease. Native stale/unclaimed rejection is a
   /// [PlatformException] and leaves any replacement generation, tokens,
-  /// callbacks, lifecycle, and resources unchanged. [StateError] is reserved
-  /// for malformed or contradictory teardown evidence.
+  /// callbacks, lifecycle, and resources unchanged. An unavailable channel
+  /// propagates [MissingPluginException]. [StateError] is reserved for
+  /// malformed or contradictory teardown evidence.
   Future<void> dispose() async {
     await disposeAndSnapshot();
   }
@@ -1205,8 +1207,9 @@ final class ARVisibilityGridV2WorkerBinding {
   /// The no-argument method internally sends this worker's same claimed
   /// 16-byte cleanup lease. Native stale/unclaimed rejection is a
   /// [PlatformException] and leaves any replacement generation, tokens,
-  /// callbacks, lifecycle, and resources unchanged. [StateError] is reserved
-  /// for malformed or contradictory teardown evidence, including missing or
+  /// callbacks, lifecycle, and resources unchanged. An unavailable channel
+  /// propagates [MissingPluginException]. [StateError] is reserved for
+  /// malformed or contradictory teardown evidence, including missing or
   /// incoherent closure/ledger fields.
   Future<Map<Object?, Object?>> disposeAndSnapshot() async {
     final existing = _disposeFuture;
@@ -1233,8 +1236,9 @@ final class ARVisibilityGridV2WorkerBinding {
   /// internally sends this worker's same claimed 16-byte cleanup lease. Native
   /// stale/unclaimed rejection is a [PlatformException] and leaves the
   /// replacement generation, tokens, lifecycle, callbacks, and resources
-  /// unchanged. [StateError] is reserved for malformed or contradictory
-  /// teardown evidence, including missing or incoherent closure/ledger fields.
+  /// unchanged. An unavailable channel propagates [MissingPluginException].
+  /// [StateError] is reserved for malformed or contradictory teardown
+  /// evidence, including missing or incoherent closure/ledger fields.
   Future<Map<Object?, Object?>> abandonAndSnapshot() async {
     final existing = _abandonFuture;
     if (existing != null) return existing;
