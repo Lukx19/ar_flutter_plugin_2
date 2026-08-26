@@ -5,9 +5,6 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.nio.charset.StandardCharsets
-import java.nio.file.AtomicMoveNotSupportedException
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 import java.security.DigestInputStream
 import java.security.MessageDigest
 import java.util.Properties
@@ -25,22 +22,24 @@ class DurableSessionStoreV2(
     private val root: File,
     private val budget: StorageBudgetCoordinatorV2,
     private val faults: DurableStoreFaultInjectorV2 = DurableStoreFaultInjectorV2 { },
+    directorySync: DirectorySyncV2 = AndroidDirectorySyncV2,
 ) : CaptureCommitPort {
-    private val sessionRoot = File(root, "sessions")
     private val mutex = Any()
-    private val files = SafeFilesystemV2(root, faults)
+    private val files = SafeFilesystemV2(root, faults, directorySync)
+    private val sessionRoot = files.child("sessions")
 
-    init { require(root.exists() || root.mkdirs()) { "Cannot create schema-5 store" }; require(sessionRoot.exists() || sessionRoot.mkdirs()) }
+    init { files.ensureDirectory(sessionRoot) }
 
     override fun acceptBeforeExposure(attempt: CaptureAcceptedAttempt): CaptureReceipt = synchronized(mutex) {
         val location = location(attempt.identity)
         tombstone(location)?.let { throw DurableStoreConflictV2("Session is tombstoned") }
         receipt(location, attempt.identity)?.let { prior ->
-            if (prior.requestHash == acceptedHash(attempt)) return@synchronized prior
+            val accepted = acceptedFile(location, attempt.identity).takeIf(files::isFile)?.let(::readProperties)
+            if (accepted?.getProperty("acceptedHash") == acceptedHash(attempt)) return@synchronized prior
             throw DurableStoreConflictV2("Changed replay conflicts with durable identity")
         }
         val accepted = acceptedFile(location, attempt.identity)
-        if (accepted.isFile) {
+        if (files.isFile(accepted)) {
             val existing = readProperties(accepted)
             if (existing.getProperty("acceptedHash") == acceptedHash(attempt)) return@synchronized acceptedReceipt(attempt)
             throw DurableStoreConflictV2("Changed accepted attempt conflicts")
@@ -76,15 +75,14 @@ class DurableSessionStoreV2(
         }
         val reservation = budget.reservation(accepted.getProperty("reservationToken"))
             ?: throw IllegalStateException("Accepted attempt has no live reservation")
-        val staging = File(attemptDirectory(location, request.accepted.identity), "staging")
-        require(staging.mkdirs() || staging.isDirectory)
+        val staging = path(attemptDirectory(location, request.accepted.identity), "staging")
+        files.ensureDirectory(staging)
         var actualBytes = 0L
-        var receiptWritten = false
         try {
             val descriptors = request.components.associateBy { it.kind }
             val staged = streams.sortedBy { it.kind.ordinal }.map { stream ->
                 val descriptor = descriptors.getValue(stream.kind)
-                val file = File(staging, "${stream.kind.name.lowercase()}.part")
+                val file = path(staging, "${stream.kind.name.lowercase()}.part")
                 faults.at(DurableStoreFaultPointV2.COMPONENT_OPEN)
                 val measured = copyAndDigest(stream.input, file)
                 faults.at(DurableStoreFaultPointV2.LENGTH_CHECK)
@@ -94,30 +92,31 @@ class DurableSessionStoreV2(
             }
             check(actualBytes <= reservation.bytes && actualBytes <= request.accepted.profile.maximumComponentBytes) { "Component bytes exceed accepted reservation" }
             val captureId = safe(request.accepted.identity.attemptId)
-            val assets = File(location, "assets/$captureId").also { require(it.mkdirs() || it.isDirectory) }
-            staged.forEach { moveImmutable(it.file, File(assets, "${it.kind.name.lowercase()}.${it.descriptor.sha256.hex()}.blob"), it.descriptor) }
+            val assets = path(location, "assets", captureId).also(files::ensureDirectory)
+            staged.forEach { moveImmutable(it.file, path(assets, "${it.kind.name.lowercase()}.${it.descriptor.sha256.hex()}.blob"), it.descriptor) }
             val prior = selectedRoot(location)
             val revision = (prior?.revision ?: 0L) + 1L
             val rootBytes = rootRecord(request, requestHash, revision, staged, prior)
             val rootHash = sha256(rootBytes).hex()
             faults.at(DurableStoreFaultPointV2.ROOT_WRITE)
-            writeImmutable(File(location, "objects/$rootHash.root"), rootBytes)
+            writeImmutable(path(location, "objects", "$rootHash.root"), rootBytes)
             faults.at(DurableStoreFaultPointV2.ROOT_FILE_SYNC)
             val terminal = CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, request.accepted.identity, requestHash, "committed", captureId, revision, rootHash)
             val committed = CaptureReceipt(request.accepted.identity, CaptureAttemptPhase.COMMITTED_PICTURE, requestHash, receiptHash(requestHash, rootHash), true, terminal)
             // Receipt is durable before, and independently validates, the pointer switch.
             faults.at(DurableStoreFaultPointV2.RECEIPT_WRITE)
             writePropertiesExclusive(receiptFile(location, request.accepted.identity), receiptProperties(committed, rootHash))
-            receiptWritten = true
             faults.at(DurableStoreFaultPointV2.RECEIPT_FILE_SYNC)
             publishPointer(location, RootPointer(revision, rootHash, request.accepted.identity.commitId))
             budget.commit(reservation, actualBytes)
-            deleteTree(staging)
+            deleteTree(staging, DurableStoreFaultPointV2.DELETE_RECLAIM)
             committed
         } catch (error: Throwable) {
             // Once receipt persistence has begun the exact pointer cut is unknown;
             // retain staging and liability for restart/query rather than fabricate abandonment.
-            if (!receiptWritten) deleteTree(staging)
+            if (!files.isFile(receiptFile(location, request.accepted.identity))) {
+                deleteTree(staging, DurableStoreFaultPointV2.DELETE_RECLAIM)
+            }
             throw error
         }
     }
@@ -129,30 +128,40 @@ class DurableSessionStoreV2(
     fun rebaseSameAttempt(request: CaptureCommitRequest): CaptureReceipt = synchronized(mutex) {
         val location = location(request.accepted.identity)
         val file = receiptFile(location, request.accepted.identity)
-        check(file.isFile) { "No durable receipt to rebase" }
+        check(files.isFile(file)) { "No durable receipt to rebase" }
         val values = readProperties(file)
         check(values.getProperty("kind") == CaptureTerminalKind.COMMITTED_PICTURE.name && values.getProperty("requestHash") == requestHash(request)) { "Changed attempt cannot rebase" }
         val rootHash = values.getProperty("rootHash")
         val revision = values.getProperty("revision").toLong()
         check(validRootHash(location, rootHash, revision, 0)) { "Receipt root is incomplete" }
-        publishPointer(location, RootPointer(revision, rootHash, request.accepted.identity.commitId))
+        val selected = selectedRoot(location)
+        if (rootHash !in retainedRootHashes(location)) {
+            check(revision == (selected?.revision ?: 0L) + 1L && rootPrevious(location, rootHash) == selected?.rootHash) {
+                "Unknown receipt cannot rebase over a different root cut"
+            }
+            publishPointer(location, RootPointer(revision, rootHash, request.accepted.identity.commitId))
+        }
         val accepted = readProperties(acceptedFile(location, request.accepted.identity))
         budget.reservation(accepted.getProperty("reservationToken"))?.let { reservation ->
             budget.commit(reservation, request.components.fold(0L) { total, component -> Math.addExact(total, component.byteLength) })
         }
-        deleteTree(File(attemptDirectory(location, request.accepted.identity), "staging"))
+        deleteTree(path(attemptDirectory(location, request.accepted.identity), "staging"), DurableStoreFaultPointV2.DELETE_RECLAIM)
         receipt(location, request.accepted.identity)!!
     }
 
-    override fun queryReceipt(identity: CaptureAttemptIdentity): CaptureReceipt? = synchronized(mutex) { receipt(location(identity), identity) }
+    override fun queryReceipt(identity: CaptureAttemptIdentity): CaptureReceipt? = synchronized(mutex) {
+        val location = location(identity)
+        if (tombstone(location) != null) null else receipt(location, identity)
+    }
 
     override fun abandon(terminal: CaptureTerminal): CaptureReceipt = synchronized(mutex) {
         require(terminal.kind == CaptureTerminalKind.ABANDONED_ATTEMPT)
         val location = location(terminal.identity)
         receipt(location, terminal.identity)?.let { return@synchronized it }
-        val accepted = acceptedFile(location, terminal.identity).takeIf(File::isFile)?.let(::readProperties)
+        val accepted = acceptedFile(location, terminal.identity).takeIf(files::isFile)?.let(::readProperties)
         faults.at(DurableStoreFaultPointV2.ABANDONMENT_CLEANUP)
-        deleteTree(File(attemptDirectory(location, terminal.identity), "staging"))
+        deleteTree(path(attemptDirectory(location, terminal.identity), "staging"), DurableStoreFaultPointV2.ABANDONMENT_CLEANUP)
+        deleteTree(assetDirectory(location, terminal.identity), DurableStoreFaultPointV2.ABANDONMENT_CLEANUP)
         val value = CaptureReceipt(terminal.identity, CaptureAttemptPhase.ABANDONED_ATTEMPT, terminal.canonicalTerminalHash,
             receiptHash(terminal.canonicalTerminalHash, "abandoned"), true, terminal)
         faults.at(DurableStoreFaultPointV2.ABANDONMENT_RECORD)
@@ -163,12 +172,12 @@ class DurableSessionStoreV2(
 
     /** Tombstone-first whole-session deletion fence.  It wins over later callbacks and roots. */
     fun tombstoneSession(sessionId: String) = synchronized(mutex) {
-        val directory = File(sessionRoot, safe(sessionId))
-        require(directory.exists() || directory.mkdirs())
+        val directory = files.child("sessions", safe(sessionId))
+        files.ensureDirectory(directory)
         faults.at(DurableStoreFaultPointV2.TOMBSTONE_RECORD)
-        writeExclusive(File(directory, "tombstone"), "deleted\n".toByteArray())
+        writeExclusive(path(directory, "tombstone"), "deleted\n".toByteArray(), DurableStoreFaultPointV2.TOMBSTONE_RECORD)
         faults.at(DurableStoreFaultPointV2.TOMBSTONE_DIRECTORY_SYNC)
-        directory.walkTopDown().filter { it.name == "accepted.properties" }.forEach { file ->
+        files.walk(directory).filter { it.name == "accepted.properties" }.forEach { file ->
             readProperties(file).getProperty("reservationToken")?.let { budget.reservation(it)?.let(budget::release) }
         }
     }
@@ -176,25 +185,53 @@ class DurableSessionStoreV2(
     /** Reconciles prepared staging and ensures only receipt/pointer backed results are visible. */
     fun recover() = synchronized(mutex) {
         faults.at(DurableStoreFaultPointV2.RECOVERY)
-        sessionRoot.listFiles()?.filter(File::isDirectory)?.forEach { session ->
-            session.walkTopDown().filter { it.name == "staging" }.forEach(::deleteTree)
-            session.walkTopDown().filter { it.name == "accepted.properties" }.forEach { accepted ->
-                val attempt = accepted.parentFile
-                if (!File(attempt, "receipt.properties").isFile) readProperties(accepted).getProperty("reservationToken")?.let { budget.reservation(it)?.let(budget::release) }
+        files.list(sessionRoot).filter(File::isDirectory).forEach { session ->
+            files.walk(session).filter { it.name == "accepted.properties" }.forEach { accepted ->
+                val attempt = requireNotNull(accepted.parentFile)
+                val receipt = path(attempt, "receipt.properties")
+                val acceptedValues = readProperties(accepted)
+                if (!files.isFile(receipt)) {
+                    val abandoned = Properties().apply {
+                        setProperty("kind", CaptureTerminalKind.ABANDONED_ATTEMPT.name)
+                        setProperty("requestHash", acceptedValues.getProperty("acceptedHash"))
+                        setProperty("receiptHash", receiptHash(acceptedValues.getProperty("acceptedHash"), "abandoned"))
+                        setProperty("rootHash", "abandoned")
+                        setProperty("reason", "recovered-proven-absent")
+                    }
+                    writePropertiesExclusive(receipt, abandoned, DurableStoreFaultPointV2.ABANDONMENT_RECORD)
+                    deleteTree(path(attempt, "staging"), DurableStoreFaultPointV2.ABANDONMENT_CLEANUP)
+                    acceptedValues.getProperty("attemptId")?.let { deleteTree(path(session, "assets", safe(it)), DurableStoreFaultPointV2.ABANDONMENT_CLEANUP) }
+                    acceptedValues.getProperty("reservationToken")?.let { budget.reservation(it)?.let(budget::release) }
+                } else {
+                    val receiptValues = readProperties(receipt)
+                    if (receiptValues.getProperty("kind") == CaptureTerminalKind.COMMITTED_PICTURE.name &&
+                        receiptValues.getProperty("rootHash") in retainedRootHashes(session)) {
+                        acceptedValues.getProperty("reservationToken")?.let { token ->
+                            budget.reservation(token)?.let { reservation ->
+                                budget.commit(reservation, committedComponentBytes(session, receiptValues.getProperty("rootHash")))
+                            }
+                        }
+                        deleteTree(path(attempt, "staging"), DurableStoreFaultPointV2.DELETE_RECLAIM)
+                    }
+                    // A committed receipt outside the retained graph is unknown:
+                    // staging and liability remain for exact query/rebase.
+                }
             }
         }
     }
 
-    private fun location(identity: CaptureAttemptIdentity): File = File(sessionRoot, safe(identity.lifecycleCut.sessionId)).also { it.mkdirs() }
-    private fun attemptDirectory(location: File, identity: CaptureAttemptIdentity): File = File(File(location, "attempts"), safe(identity.commitId)).also { it.mkdirs() }
-    private fun tombstone(location: File): File? = generateSequence(location) { it.parentFile }.firstOrNull { File(it, "tombstone").isFile }
-    private fun acceptedFile(location: File, identity: CaptureAttemptIdentity) = File(attemptDirectory(location, identity), "accepted.properties")
-    private fun receiptFile(location: File, identity: CaptureAttemptIdentity) = File(attemptDirectory(location, identity), "receipt.properties")
-    private fun receipt(location: File, fallbackIdentity: CaptureAttemptIdentity? = null): CaptureReceipt? {
-        val file = fallbackIdentity?.let { receiptFile(location, it) } ?: return null; if (!file.isFile) return null
-        val value = readProperties(file); val identity = fallbackIdentity ?: return null
+    private fun location(identity: CaptureAttemptIdentity): File = files.child("sessions", safe(identity.lifecycleCut.sessionId)).also(files::ensureDirectory)
+    private fun attemptDirectory(location: File, identity: CaptureAttemptIdentity): File =
+        path(location, "attempts", safe(identity.commitId)).also(files::ensureDirectory)
+    private fun tombstone(location: File): File? = path(location, "tombstone").takeIf(files::isFile)
+    private fun acceptedFile(location: File, identity: CaptureAttemptIdentity) = path(attemptDirectory(location, identity), "accepted.properties")
+    private fun receiptFile(location: File, identity: CaptureAttemptIdentity) = path(attemptDirectory(location, identity), "receipt.properties")
+    private fun assetDirectory(location: File, identity: CaptureAttemptIdentity) = path(location, "assets", safe(identity.attemptId))
+    private fun receipt(location: File, identity: CaptureAttemptIdentity): CaptureReceipt? {
+        val file = receiptFile(location, identity); if (!files.isFile(file)) return null
+        val value = readProperties(file)
         val kind = value.getProperty("kind") ?: return null
-        if (kind == CaptureTerminalKind.COMMITTED_PICTURE.name && selectedRoot(location)?.rootHash != value.getProperty("rootHash")) return null
+        if (kind == CaptureTerminalKind.COMMITTED_PICTURE.name && value.getProperty("rootHash") !in retainedRootHashes(location)) return null
         val terminal = if (kind == CaptureTerminalKind.COMMITTED_PICTURE.name) CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, identity, value.getProperty("requestHash"), "committed", value.getProperty("captureId"), value.getProperty("revision").toLong(), value.getProperty("rootHash"))
         else CaptureTerminal(CaptureTerminalKind.ABANDONED_ATTEMPT, identity, value.getProperty("requestHash"), value.getProperty("reason", "abandoned"))
         return CaptureReceipt(identity, if (terminal.kind == CaptureTerminalKind.COMMITTED_PICTURE) CaptureAttemptPhase.COMMITTED_PICTURE else CaptureAttemptPhase.ABANDONED_ATTEMPT, value.getProperty("requestHash"), value.getProperty("receiptHash"), true, terminal)
@@ -207,7 +244,7 @@ class DurableSessionStoreV2(
     private fun rootRecord(request: CaptureCommitRequest, requestHash: String, revision: Long, staged: List<Staged>, prior: RootPointer?) = buildString { append("schema=5\nrevision=$revision\nrequest=$requestHash\nprevious=${prior?.rootHash ?: "-"}\nsecondPrevious=${prior?.previousHash ?: "-"}\n"); staged.sortedBy { it.kind.ordinal }.forEach { append("component=${it.kind}:${it.descriptor.byteLength}:${it.descriptor.sha256.hex()}\n") } }.toByteArray(StandardCharsets.UTF_8)
     private fun receiptProperties(receipt: CaptureReceipt, rootHash: String) = Properties().apply { setProperty("kind", receipt.terminal!!.kind.name); setProperty("requestHash", receipt.requestHash); setProperty("receiptHash", receipt.receiptHash); setProperty("rootHash", rootHash); setProperty("reason", receipt.terminal.reason); receipt.terminal.captureId?.let { setProperty("captureId", it) }; receipt.terminal.captureRevision?.let { setProperty("revision", it.toString()) } }
     private fun selectedRoot(location: File): RootPointer? = listOf("root-A.ptr", "root-B.ptr").mapNotNull { file ->
-        File(location, file).takeIf(File::isFile)?.readLines()?.takeIf { it.size == 3 }?.let {
+        path(location, file).takeIf(files::isFile)?.let(files::readLines)?.takeIf { it.size == 3 }?.let {
             RootPointer(it[0].toLongOrNull() ?: return@let null, it[1], it[2], if (file == "root-A.ptr") "A" else "B", rootPrevious(location, it[1]))
         }
     }.let { raw ->
@@ -217,43 +254,47 @@ class DurableSessionStoreV2(
         candidates.groupBy { it.revision }.values.forEach { same -> if (same.map { it.rootHash }.toSet().size > 1) throw DurableStoreConflictV2("Schema-5 root fork") }
         candidates.maxByOrNull { it.revision }
     }
-    private fun rootPrevious(location: File, hash: String): String? = File(location, "objects/$hash.root").takeIf(File::isFile)?.readLines()?.firstOrNull { it.startsWith("previous=") }?.removePrefix("previous=")?.takeUnless { it == "-" }
+    private fun rootPrevious(location: File, hash: String): String? = path(location, "objects", "$hash.root").takeIf(files::isFile)?.let(files::readLines)?.firstOrNull { it.startsWith("previous=") }?.removePrefix("previous=")?.takeUnless { it == "-" }
     private fun validRoot(location: File, pointer: RootPointer): Boolean {
         return validRootHash(location, pointer.rootHash, pointer.revision, 0)
     }
     private fun validRootHash(location: File, hash: String, revision: Long, depth: Int): Boolean {
         if (depth > 2 || !hash.matches(Regex("[0-9a-f]{64}"))) return false
-        val file = File(location, "objects/$hash.root")
-        if (!file.isFile || sha256(file.readBytes()).hex() != hash) return false
-        val values = file.readLines().associate { it.substringBefore('=') to it.substringAfter('=', "") }
+        val file = path(location, "objects", "$hash.root")
+        if (!files.isFile(file) || sha256(files.readBytes(file)).hex() != hash) return false
+        val values = files.readLines(file).associate { it.substringBefore('=') to it.substringAfter('=', "") }
         if (values["schema"] != "5" || values["revision"]?.toLongOrNull() != revision || values["request"]?.matches(Regex("[0-9a-f]{64}")) != true) return false
         val previous = values["previous"]
         val second = values["secondPrevious"]
+        if (depth == 2) return true
         if (revision == 1L) return previous == "-" && second == "-"
         if (previous == null || previous == "-" || !validRootHash(location, previous, revision - 1, depth + 1)) return false
-        return revision < 3 || second != null && second != "-" && validRootHash(location, second, revision - 2, depth + 2)
+        if (depth == 0 && revision >= 3 && second != rootPrevious(location, previous)) return false
+        return true
     }
-    private fun publishPointer(location: File, pointer: RootPointer) { val old = selectedRoot(location); val target = File(location, if (old?.slot == "A") "root-B.ptr" else "root-A.ptr"); faults.at(DurableStoreFaultPointV2.POINTER_SLOT_REPLACE); writeAtomic(target, "${pointer.revision}\n${pointer.rootHash}\n${pointer.commitId}\n".toByteArray()) }
-    private fun moveImmutable(from: File, target: File, descriptor: CaptureComponentDescriptor) { if (target.exists()) { check(target.length() == descriptor.byteLength && sha256(target.readBytes()).hex() == descriptor.sha256.hex()) { "Immutable asset conflict" }; from.delete(); return }; files.moveSameDirectory(from, target) }
-    private fun copyAndDigest(input: InputStream, output: File): Pair<Long, ByteArray> { val digest = MessageDigest.getInstance("SHA-256"); var length = 0L; faults.at(DurableStoreFaultPointV2.PART_CREATE); DigestInputStream(input, digest).use { source -> FileOutputStream(output).use { destination -> val buffer = ByteArray(64 * 1024); while (true) { val read = source.read(buffer); if (read < 0) break; faults.at(DurableStoreFaultPointV2.PART_WRITE); destination.write(buffer, 0, read); length = Math.addExact(length, read.toLong()) }; faults.at(DurableStoreFaultPointV2.PART_FILE_SYNC); destination.fd.sync() } }; faults.at(DurableStoreFaultPointV2.PART_HASH); syncDirectory(output.parentFile); return length to digest.digest() }
-    private fun writePropertiesExclusive(file: File, properties: Properties) = writeExclusive(file, buildString { properties.stringPropertyNames().sorted().forEach { append(it).append('=').append(properties.getProperty(it)).append('\n') } }.toByteArray())
-    private fun readProperties(file: File) = Properties().apply { FileInputStream(file).use(::load) }
-    private fun writeExclusive(file: File, bytes: ByteArray) {
-        file.parentFile?.mkdirs()
-        check(!file.exists()) { "Immutable durable record already exists" }
-        FileOutputStream(file, false).use { it.write(bytes); it.fd.sync() }
-        syncDirectory(file.parentFile)
-    }
+    private fun publishPointer(location: File, pointer: RootPointer) { val old = selectedRoot(location); val target = path(location, if (old?.slot == "A") "root-B.ptr" else "root-A.ptr"); writeAtomic(target, "${pointer.revision}\n${pointer.rootHash}\n${pointer.commitId}\n".toByteArray()) }
+    private fun moveImmutable(from: File, target: File, descriptor: CaptureComponentDescriptor) { if (files.isFile(target)) { check(target.length() == descriptor.byteLength && sha256(files.readBytes(target)).hex() == descriptor.sha256.hex()) { "Immutable asset conflict" }; files.delete(from, DurableStoreFaultPointV2.DELETE_RECLAIM); return }; files.moveSameDirectory(from, target) }
+    private fun copyAndDigest(input: InputStream, output: File): Pair<Long, ByteArray> { val digest = MessageDigest.getInstance("SHA-256"); var length = 0L; faults.at(DurableStoreFaultPointV2.PART_CREATE); DigestInputStream(input, digest).use { source -> FileOutputStream(output).use { destination -> val buffer = ByteArray(64 * 1024); while (true) { val read = source.read(buffer); if (read < 0) break; faults.at(DurableStoreFaultPointV2.PART_WRITE); destination.write(buffer, 0, read); length = Math.addExact(length, read.toLong()) }; faults.at(DurableStoreFaultPointV2.PART_FILE_SYNC); destination.fd.sync() } }; faults.at(DurableStoreFaultPointV2.PART_HASH); files.syncDirectory(requireNotNull(output.parentFile), DurableStoreFaultPointV2.PART_FILE_SYNC); return length to digest.digest() }
+    private fun writePropertiesExclusive(file: File, properties: Properties, point: DurableStoreFaultPointV2 = DurableStoreFaultPointV2.ACCEPTED_RECORD) = writeExclusive(file, buildString { properties.stringPropertyNames().sorted().forEach { append(it).append('=').append(properties.getProperty(it)).append('\n') } }.toByteArray(), point)
+    private fun readProperties(file: File) = Properties().apply { files.readBytes(file).inputStream().use(::load) }
+    private fun writeExclusive(file: File, bytes: ByteArray, point: DurableStoreFaultPointV2 = DurableStoreFaultPointV2.ACCEPTED_RECORD) = files.writeExclusive(file, bytes, point)
     private fun writeImmutable(file: File, bytes: ByteArray) {
-        if (file.isFile) {
-            check(file.length() == bytes.size.toLong() && sha256(file.readBytes()).contentEquals(sha256(bytes))) { "Immutable durable object conflict" }
-            return
-        }
-        writeExclusive(file, bytes)
+        files.writeImmutable(file, bytes, DurableStoreFaultPointV2.ROOT_WRITE)
     }
     private fun writeAtomic(file: File, bytes: ByteArray) { files.atomicReplace(file, bytes, DurableStoreFaultPointV2.POINTER_SLOT_REPLACE) }
-    private fun deleteTree(file: File) { if (!file.exists()) return; file.walkBottomUp().forEach { if (!it.delete()) error("Cannot delete staging") }; syncDirectory(file.parentFile ?: root) }
-    private fun syncDirectory(directory: File) { FileOutputStream(File(directory, ".sync")).use { it.fd.sync() }; File(directory, ".sync").delete() }
+    private fun deleteTree(file: File, point: DurableStoreFaultPointV2) { files.deleteTree(file, point) }
+    private fun retainedRootHashes(location: File): Set<String> {
+        val selected = selectedRoot(location) ?: return emptySet()
+        return buildSet {
+            var hash: String? = selected.rootHash
+            repeat(3) { hash?.let(::add); hash = hash?.let { rootPrevious(location, it) } }
+        }
+    }
+    private fun committedComponentBytes(location: File, rootHash: String): Long = files.readLines(path(location, "objects", "$rootHash.root"))
+        .filter { it.startsWith("component=") }
+        .fold(0L) { total, line -> Math.addExact(total, line.substringAfter(':').substringBefore(':').toLong()) }
+    private fun relative(file: File): Array<String> = root.absoluteFile.toPath().normalize().relativize(file.absoluteFile.toPath().normalize()).map { it.toString() }.toList().toTypedArray()
+    private fun path(base: File, vararg names: String): File = files.child(*(relative(base) + names))
     private fun safe(value: String) = sha256(value.toByteArray()).hex()
     private fun sha256(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes)
     private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }

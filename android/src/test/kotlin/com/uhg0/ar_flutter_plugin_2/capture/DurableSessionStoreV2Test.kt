@@ -5,9 +5,11 @@ import java.io.File
 import java.security.MessageDigest
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class DurableSessionStoreV2Test {
@@ -37,7 +39,7 @@ class DurableSessionStoreV2Test {
         val root = directory(); val store = DurableSessionStoreV2(File(root, "store"), budget(root))
         val first = request("commit-2", "attempt-2", jpeg = "jpeg".toByteArray())
         store.acceptBeforeExposure(first.accepted)
-        try { store.commitStreamed(first, streams("changed".toByteArray())) } catch (_: IllegalStateException) { }
+        assertThrows(IllegalStateException::class.java) { store.commitStreamed(first, streams("changed".toByteArray())) }
         val abandoned = store.abandon(CaptureTerminal(CaptureTerminalKind.ABANDONED_ATTEMPT, first.accepted.identity, "failed", "component-failure"))
         assertEquals(CaptureAttemptPhase.ABANDONED_ATTEMPT, abandoned.phase)
         assertEquals(abandoned.receiptHash, store.abandon(CaptureTerminal(CaptureTerminalKind.ABANDONED_ATTEMPT, first.accepted.identity, "changed", "late")).receiptHash)
@@ -52,34 +54,123 @@ class DurableSessionStoreV2Test {
         val request = request("commit-4", "attempt-4", jpeg = "jpeg".toByteArray())
         store.acceptBeforeExposure(request.accepted)
         store.tombstoneSession(request.accepted.identity.lifecycleCut.sessionId)
-        try { store.commitStreamed(request, streams("jpeg".toByteArray())); throw AssertionError("expected tombstone fence") }
-        catch (_: DurableStoreConflictV2) { }
+        assertThrows(DurableStoreConflictV2::class.java) { store.commitStreamed(request, streams("jpeg".toByteArray())) }
         assertNull(store.queryReceipt(request.accepted.identity))
     }
 
-    @Test fun `generated durable fault matrix mutates every storage cut and preserves a terminal classification`() {
+    @Test fun `generated durable fault matrix asserts exact classification cleanup release and later success at every cut`() {
         assertEquals(21, DurableStoreFaultPointV2.entries.size)
         DurableStoreFaultPointV2.entries.forEach { cut ->
             val root = directory()
+            var injected = 0
             val poisoned = DurableSessionStoreV2(File(root, "store"), budget(root), DurableStoreFaultInjectorV2 {
-                if (it == cut) throw IllegalStateException("injected-$cut")
+                if (it == cut) { injected++; throw IllegalStateException("injected-$cut") }
             })
             val request = request("fault-$cut", "attempt-$cut", "jpeg".toByteArray())
-            runCatching { poisoned.acceptBeforeExposure(request.accepted) }
-            runCatching { poisoned.commitStreamed(request, streams("jpeg".toByteArray())) }
-            // A fresh process never trusts a staging filename: it either finds the
-            // durable receipt or can record the metadata-only terminal exactly once.
-            val recovered = DurableSessionStoreV2(File(root, "store"), budget(root))
-            val terminal = recovered.queryReceipt(request.accepted.identity)
-            // Receipt-before-pointer cuts are deliberately UNKNOWN; every other
-            // cut is either a durable commit or is later abandoned explicitly.
-            terminal?.let { assertTrue(it.phase in setOf(CaptureAttemptPhase.COMMITTED_PICTURE, CaptureAttemptPhase.ABANDONED_ATTEMPT)) }
-            val later = request("later-$cut", "later-attempt-$cut", "later".toByteArray())
-            runCatching { recovered.acceptBeforeExposure(later.accepted) }
-            runCatching { recovered.commitStreamed(later, streams("later".toByteArray())) }
-            // Pointer-cut faults may leave the later attempt unknown, but must
-            // never fabricate a third terminal or release its reservation.
-            recovered.queryReceipt(later.accepted.identity)
+            val clean = { DurableSessionStoreV2(File(root, "store"), budget(root)) }
+
+            when (cut) {
+                DurableStoreFaultPointV2.ACCEPTED_RECORD -> {
+                    assertThrows(IllegalStateException::class.java) { poisoned.acceptBeforeExposure(request.accepted) }
+                    assertNull(clean().queryReceipt(request.accepted.identity))
+                    assertEquals(0L, budget(root).reservedBytes())
+                }
+                DurableStoreFaultPointV2.ABANDONMENT_RECORD,
+                DurableStoreFaultPointV2.ABANDONMENT_CLEANUP -> {
+                    poisoned.acceptBeforeExposure(request.accepted)
+                    assertThrows(IllegalStateException::class.java) {
+                        poisoned.abandon(abandonment(request, "injected"))
+                    }
+                    assertNull(clean().queryReceipt(request.accepted.identity))
+                    assertTrue(budget(root).reservedBytes() > 0)
+                    clean().recover()
+                    assertAbandonedAndReleased(root, request)
+                }
+                DurableStoreFaultPointV2.TOMBSTONE_RECORD,
+                DurableStoreFaultPointV2.TOMBSTONE_DIRECTORY_SYNC -> {
+                    poisoned.acceptBeforeExposure(request.accepted)
+                    assertThrows(IllegalStateException::class.java) {
+                        poisoned.tombstoneSession(request.accepted.identity.lifecycleCut.sessionId)
+                    }
+                    clean().recover()
+                    if (cut == DurableStoreFaultPointV2.TOMBSTONE_RECORD) {
+                        assertEquals(CaptureAttemptPhase.ABANDONED_ATTEMPT, clean().queryReceipt(request.accepted.identity)?.phase)
+                    } else {
+                        assertNull(clean().queryReceipt(request.accepted.identity))
+                    }
+                    assertEquals(0L, budget(root).reservedBytes())
+                    assertFalse(hasStagingOrAsset(root, request))
+                }
+                DurableStoreFaultPointV2.RECOVERY -> {
+                    poisoned.acceptBeforeExposure(request.accepted)
+                    assertThrows(IllegalStateException::class.java) {
+                        poisoned.commitStreamed(request, streams("wrong".toByteArray()))
+                    }
+                    assertThrows(IllegalStateException::class.java) { poisoned.recover() }
+                    assertNull(clean().queryReceipt(request.accepted.identity))
+                    assertTrue(budget(root).reservedBytes() > 0)
+                    clean().recover()
+                    assertAbandonedAndReleased(root, request)
+                }
+                else -> {
+                    poisoned.acceptBeforeExposure(request.accepted)
+                    assertThrows(IllegalStateException::class.java) {
+                        poisoned.commitStreamed(request, streams("jpeg".toByteArray()))
+                    }
+                    when (cut) {
+                        DurableStoreFaultPointV2.RECEIPT_FILE_SYNC,
+                        DurableStoreFaultPointV2.POINTER_SLOT_REPLACE -> {
+                            assertNull(clean().queryReceipt(request.accepted.identity))
+                            assertTrue(budget(root).reservedBytes() > 0)
+                            assertTrue(hasStagingOrAsset(root, request))
+                            assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, clean().rebaseSameAttempt(request).phase)
+                        }
+                        DurableStoreFaultPointV2.POINTER_DIRECTORY_SYNC,
+                        DurableStoreFaultPointV2.DELETE_RECLAIM -> {
+                            assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, clean().queryReceipt(request.accepted.identity)?.phase)
+                            clean().recover()
+                        }
+                        else -> {
+                            assertNull(clean().queryReceipt(request.accepted.identity))
+                            assertTrue(budget(root).reservedBytes() > 0)
+                            clean().recover()
+                            assertEquals(CaptureAttemptPhase.ABANDONED_ATTEMPT, clean().queryReceipt(request.accepted.identity)?.phase)
+                        }
+                    }
+                    assertEquals(0L, budget(root).reservedBytes())
+                    assertFalse(hasStaging(root, request))
+                    val committedCut = cut in setOf(
+                        DurableStoreFaultPointV2.RECEIPT_FILE_SYNC,
+                        DurableStoreFaultPointV2.POINTER_SLOT_REPLACE,
+                        DurableStoreFaultPointV2.POINTER_DIRECTORY_SYNC,
+                        DurableStoreFaultPointV2.DELETE_RECLAIM,
+                    )
+                    assertEquals(committedCut, hasAsset(root, request))
+                }
+            }
+            assertTrue("fault cut was not exercised: $cut", injected > 0)
+
+            val recovered = clean()
+            val laterSession = if (cut == DurableStoreFaultPointV2.TOMBSTONE_DIRECTORY_SYNC) "session-after-tombstone" else "session-1"
+            val later = request("later-$cut", "later-attempt-$cut", "later".toByteArray(), laterSession)
+            assertEquals(CaptureAttemptPhase.RESERVED_ACCEPTED, recovered.acceptBeforeExposure(later.accepted).phase)
+            assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, recovered.commitStreamed(later, streams("later".toByteArray())).phase)
+            assertEquals(0L, budget(root).reservedBytes())
+        }
+    }
+
+    @Test fun `historic receipt replay remains exact through current and two retained predecessors`() {
+        val root = directory(); val store = DurableSessionStoreV2(File(root, "store"), budget(root))
+        val requests = (1..4).map { number -> request("historic-$number", "historic-attempt-$number", "jpeg-$number".toByteArray()) }
+        val receipts = requests.mapIndexed { index, value ->
+            store.acceptBeforeExposure(value.accepted)
+            store.commitStreamed(value, streams("jpeg-${index + 1}".toByteArray()))
+        }
+        val restarted = DurableSessionStoreV2(File(root, "store"), budget(root))
+        assertNull(restarted.queryReceipt(requests.first().accepted.identity))
+        requests.drop(1).zip(receipts.drop(1)).forEach { (request, receipt) ->
+            assertEquals(receipt.receiptHash, restarted.queryReceipt(request.accepted.identity)?.receiptHash)
+            assertEquals(receipt.receiptHash, restarted.commitStreamed(request, streams("jpeg-${receipt.terminal!!.captureRevision}".toByteArray())).receiptHash)
         }
     }
 
@@ -105,7 +196,7 @@ class DurableSessionStoreV2Test {
         })
         val request = request("unknown", "unknown-attempt", "jpeg".toByteArray())
         failing.acceptBeforeExposure(request.accepted)
-        runCatching { failing.commitStreamed(request, streams("jpeg".toByteArray())) }
+        assertThrows(IllegalStateException::class.java) { failing.commitStreamed(request, streams("jpeg".toByteArray())) }
         assertNull(failing.queryReceipt(request.accepted.identity))
         assertTrue(quota.reservedBytes() > 0)
         val restarted = DurableSessionStoreV2(File(root, "store"), quota)
@@ -131,8 +222,10 @@ class DurableSessionStoreV2Test {
         prior.writeText("3\n$divergentHash\nbranch\n")
         val fork = request("fork", "fork-attempt", "jpeg".toByteArray())
         fork.accepted // no exposure occurs before store acceptance
-        try { store.acceptBeforeExposure(fork.accepted); store.commitStreamed(fork, streams("jpeg".toByteArray())); throw AssertionError("fork accepted") }
-        catch (_: DurableStoreConflictV2) { }
+        assertThrows(DurableStoreConflictV2::class.java) {
+            store.acceptBeforeExposure(fork.accepted)
+            store.commitStreamed(fork, streams("jpeg".toByteArray()))
+        }
 
         // An orphan with a numerically enormous filename is never scanned.
         File(session, "objects/${"f".repeat(64)}.root").writeText("schema=5\nrevision=999\nrequest=${"b".repeat(64)}\nprevious=-\nsecondPrevious=-\n")
@@ -143,15 +236,35 @@ class DurableSessionStoreV2Test {
         assertEquals(4L, recovered.commitStreamed(after, streams("jpeg".toByteArray())).terminal!!.captureRevision)
     }
 
-    private fun request(commit: String, attempt: String, jpeg: ByteArray): CaptureCommitRequest {
-        val identity = CaptureAttemptIdentity(attempt, commit, 1, CaptureLifecycleCut("session-1", 1, "group-1", 1, "ar-1", "view-1", 1, "binding-1", 1, 1))
+    private fun request(commit: String, attempt: String, jpeg: ByteArray, session: String = "session-1"): CaptureCommitRequest {
+        val identity = CaptureAttemptIdentity(attempt, commit, 1, CaptureLifecycleCut(session, 1, "group-1", 1, "ar-1", "view-1", 1, "binding-1", 1, 1))
         val profile = CaptureComponentProfile("jpeg", setOf(CaptureComponentKind.JPEG), 64, 64)
         val accepted = CaptureAcceptedAttempt(identity, CaptureLane.MANUAL, profile, CaptureReservationLiability(0, 64, 1, 1, 0, true), digest("intent"), digest("accepted"))
         return CaptureCommitRequest(accepted, listOf(CaptureComponentDescriptor(CaptureComponentKind.JPEG, jpeg.size.toLong(), sha(jpeg), "object")), 1, digest("pose"), digest("camera"), digest("validation"), digest("ledger"))
     }
     private fun streams(bytes: ByteArray) = listOf(CaptureComponentStreamV2(CaptureComponentKind.JPEG, ByteArrayInputStream(bytes)))
+    private fun abandonment(request: CaptureCommitRequest, reason: String) = CaptureTerminal(
+        CaptureTerminalKind.ABANDONED_ATTEMPT, request.accepted.identity, "abandoned-${request.accepted.identity.commitId}", reason,
+    )
+    private fun assertAbandonedAndReleased(root: File, request: CaptureCommitRequest) {
+        val recovered = DurableSessionStoreV2(File(root, "store"), budget(root))
+        assertEquals(CaptureAttemptPhase.ABANDONED_ATTEMPT, recovered.queryReceipt(request.accepted.identity)?.phase)
+        assertEquals(0L, budget(root).reservedBytes())
+        assertFalse(hasStagingOrAsset(root, request))
+    }
+    private fun hasStagingOrAsset(root: File, request: CaptureCommitRequest): Boolean {
+        return hasStaging(root, request) || hasAsset(root, request)
+    }
+    private fun hasStaging(root: File, request: CaptureCommitRequest): Boolean {
+        val store = File(root, "store")
+        val attemptHash = sha256Hex(request.accepted.identity.commitId)
+        return store.walkTopDown().any { it.name == "staging" && it.parentFile?.name == attemptHash }
+    }
+    private fun hasAsset(root: File, request: CaptureCommitRequest): Boolean = File(root, "store").walkTopDown()
+        .any { it.name == sha256Hex(request.accepted.identity.attemptId) && it.parentFile?.name == "assets" }
     private fun budget(root: File) = StorageBudgetCoordinatorV2(File(root, "budget"), StorageBudgetPolicyV2(1024 * 1024, 0)) { 1024 * 1024 }
     private fun directory(): File = File.createTempFile("durable-store-v2", "").also { it.delete(); assertTrue(it.mkdirs()); directories += it }
     private fun sha(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).map { it.toInt() and 0xff }
     private fun digest(value: String) = sha(value.toByteArray())
+    private fun sha256Hex(value: String) = MessageDigest.getInstance("SHA-256").digest(value.toByteArray()).joinToString("") { "%02x".format(it) }
 }

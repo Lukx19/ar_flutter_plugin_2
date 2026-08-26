@@ -1,58 +1,53 @@
 package com.uhg0.ar_flutter_plugin_2.capture
 
 import java.io.File
-import java.io.FileOutputStream
-import java.nio.charset.StandardCharsets
-import java.nio.file.AtomicMoveNotSupportedException
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 
-/**
- * Phone-wide, physically-backed V2 byte authority.  It deliberately does not
- * reuse the M0 reference ledger: reservations survive a new store instance and
- * are charged until a commit or verified reclamation releases them.
- */
 data class StorageBudgetPolicyV2(val quotaBytes: Long, val freeSpaceFloorBytes: Long) {
     init { require(quotaBytes >= 0 && freeSpaceFloorBytes >= 0) }
 }
 
-data class StorageBudgetReservationV2(
-    val token: String,
-    val owner: String,
-    val bytes: Long,
-)
+data class StorageBudgetReservationV2(val token: String, val owner: String, val bytes: Long)
 
+/** Process-global, refreshed, physically-backed storage authority. */
 class StorageBudgetCoordinatorV2(
-    private val directory: File,
+    directory: File,
     private val policy: StorageBudgetPolicyV2,
+    directorySync: DirectorySyncV2 = AndroidDirectorySyncV2,
     private val freeBytes: () -> Long = { directory.usableSpace },
 ) {
-    private val ledger = File(directory, "ledger-v2")
-    private val reservationsDirectory = File(directory, "reservations-v2")
+    private val files = SafeFilesystemV2(directory, DurableStoreFaultInjectorV2 { }, directorySync)
+    private val ledger = files.child("ledger-v2")
+    private val reservationsDirectory = files.child("reservations-v2")
     private var committed = 0L
     private val reservations = linkedMapOf<String, StorageBudgetReservationV2>()
 
     init {
-        require(directory.exists() || directory.mkdirs()) { "Cannot create storage budget directory" }
-        require(directory.isDirectory)
-        require(reservationsDirectory.exists() || reservationsDirectory.mkdirs())
-        synchronized(lockFor(directory)) { recoverLocked() }
+        files.ensureDirectory(reservationsDirectory)
+        withAuthority { Unit }
     }
 
-    @Synchronized fun reserve(owner: String, bytes: Long): StorageBudgetReservationV2? = synchronized(lockFor(directory)) {
+    fun reserve(owner: String, bytes: Long): StorageBudgetReservationV2? = withAuthority {
         require(owner.matches(OWNER)) { "Storage reservation owner is non-canonical" }
-        if (bytes <= 0 || !canCharge(bytes)) return@synchronized null
+        if (bytes <= 0 || !canCharge(bytes)) return@withAuthority null
         val token = sha256("$owner:$bytes:${nextTokenLocked()}".toByteArray()).hex()
         val reservation = StorageBudgetReservationV2(token, owner, bytes)
-        writeAtomic(File(reservationsDirectory, "$token.reservation"), "$owner\n$bytes\n".toByteArray())
-        reservations[token] = reservation
-        persistLedgerLocked()
-        reservation
+        val allocation = allocationFile(token)
+        val metadata = metadataFile(token)
+        try {
+            files.allocateExclusive(allocation, bytes)
+            files.writeExclusive(metadata, "$owner\n$bytes\n".toByteArray(), DurableStoreFaultPointV2.ACCEPTED_RECORD)
+            reservations[token] = reservation
+            persistLedgerLocked()
+            reservation
+        } catch (error: Throwable) {
+            if (files.isFile(metadata)) files.delete(metadata, DurableStoreFaultPointV2.DELETE_RECLAIM)
+            if (files.isFile(allocation)) files.delete(allocation, DurableStoreFaultPointV2.DELETE_RECLAIM)
+            throw error
+        }
     }
 
-    /** Converts a still-live reservation into confirmed physical bytes. */
-    @Synchronized fun commit(reservation: StorageBudgetReservationV2, actualBytes: Long) = synchronized(lockFor(directory)) {
+    fun commit(reservation: StorageBudgetReservationV2, actualBytes: Long) = withAuthority {
         val current = requireReservationLocked(reservation)
         require(actualBytes in 0..current.bytes)
         val other = reservedBytesLocked() - current.bytes
@@ -61,47 +56,58 @@ class StorageBudgetCoordinatorV2(
             throw IllegalStateException("Committed bytes would violate the global storage budget")
         }
         committed = Math.addExact(committed, actualBytes)
-        deleteDurably(File(reservationsDirectory, "${current.token}.reservation"))
-        reservations.remove(current.token)
+        deleteReservationLocked(current)
         persistLedgerLocked()
     }
 
-    @Synchronized fun release(reservation: StorageBudgetReservationV2): Boolean = synchronized(lockFor(directory)) {
-        val current = reservations[reservation.token] ?: return@synchronized false
+    fun release(reservation: StorageBudgetReservationV2): Boolean = withAuthority {
+        val current = reservations[reservation.token] ?: return@withAuthority false
         if (current != reservation) throw IllegalStateException("Storage reservation token conflict")
-        deleteDurably(File(reservationsDirectory, "${current.token}.reservation"))
-        reservations.remove(current.token)
+        deleteReservationLocked(current)
         persistLedgerLocked()
         true
     }
 
-    /** Only a caller that has already unlinked and synced physical bytes may reclaim them. */
-    @Synchronized fun reclaimVerified(bytes: Long) = synchronized(lockFor(directory)) {
+    fun reclaimVerified(bytes: Long) = withAuthority {
         require(bytes in 1..committed)
         committed -= bytes
         persistLedgerLocked()
     }
 
-    @Synchronized fun reservation(token: String): StorageBudgetReservationV2? = synchronized(lockFor(directory)) {
-        reservations[token]
+    fun reservation(token: String): StorageBudgetReservationV2? = withAuthority { reservations[token] }
+    fun committedBytes(): Long = withAuthority { committed }
+    fun reservedBytes(): Long = withAuthority { reservedBytesLocked() }
+    fun physicallyAllocatedBytes(token: String): Long = withAuthority {
+        reservations[token]?.let { allocationFile(token).length() } ?: 0L
     }
-    @Synchronized fun committedBytes(): Long = synchronized(lockFor(directory)) { committed }
-    @Synchronized fun reservedBytes(): Long = synchronized(lockFor(directory)) { reservedBytesLocked() }
 
+    private fun <T> withAuthority(block: () -> T): T = synchronized(lockFor(requireNotNull(ledger.parentFile))) {
+        recoverLocked()
+        block()
+    }
+
+    /** Reloaded before every mutation and query so independent instances never use stale state. */
     private fun recoverLocked() {
-        committed = ledger.takeIf(File::isFile)?.readText()?.trim()?.toLongOrNull()
-            ?: 0L
+        committed = if (files.isFile(ledger)) files.readBytes(ledger).toString(Charsets.UTF_8).trim().toLongOrNull()
+            ?: error("Corrupt storage budget ledger") else 0L
         require(committed >= 0) { "Corrupt storage budget ledger" }
         reservations.clear()
-        reservationsDirectory.listFiles()?.sortedBy { it.name }?.forEach { file ->
-            if (!file.name.matches(Regex("[0-9a-f]{64}\\.reservation"))) return@forEach
-            val lines = file.readLines()
+        val metadata = files.list(reservationsDirectory).filter { it.name.matches(Regex("[0-9a-f]{64}\\.reservation")) }
+        metadata.sortedBy(File::getName).forEach { file ->
+            val lines = files.readLines(file)
             require(lines.size == 2 && lines[0].matches(OWNER)) { "Corrupt storage reservation" }
             val bytes = lines[1].toLongOrNull() ?: error("Corrupt storage reservation bytes")
-            require(bytes > 0)
-            reservations[file.name.removeSuffix(".reservation")] =
-                StorageBudgetReservationV2(file.name.removeSuffix(".reservation"), lines[0], bytes)
+            val token = file.name.removeSuffix(".reservation")
+            require(bytes > 0 && files.isFile(allocationFile(token)) && allocationFile(token).length() == bytes) {
+                "Reservation is not physically backed"
+            }
+            reservations[token] = StorageBudgetReservationV2(token, lines[0], bytes)
         }
+        // An allocation without published metadata is not an authority and is reclaimed.
+        val live = reservations.keys
+        files.list(reservationsDirectory).filter { it.name.matches(Regex("[0-9a-f]{64}\\.allocation")) }
+            .filter { it.name.removeSuffix(".allocation") !in live }
+            .forEach { files.delete(it, DurableStoreFaultPointV2.DELETE_RECLAIM) }
         if (committed > policy.quotaBytes || policy.freeSpaceFloorBytes > freeBytes()) {
             throw IllegalStateException("Storage budget cannot open within its physical quota/floor")
         }
@@ -117,18 +123,15 @@ class StorageBudgetCoordinatorV2(
     private fun requireReservationLocked(value: StorageBudgetReservationV2) =
         reservations[value.token]?.also { check(it == value) { "Storage reservation token conflict" } }
             ?: error("Storage reservation is stale or already closed")
-    private fun nextTokenLocked() = "${reservations.size}:${committed}:${System.nanoTime()}"
-    private fun persistLedgerLocked() = writeAtomic(ledger, "$committed\n".toByteArray())
-
-    private fun writeAtomic(target: File, bytes: ByteArray) {
-        val temporary = File(target.parentFile, ".${target.name}.tmp")
-        FileOutputStream(temporary).use { output -> output.write(bytes); output.fd.sync() }
-        try { Files.move(temporary.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING) }
-        catch (_: AtomicMoveNotSupportedException) { throw IllegalStateException("Atomic replace unavailable") }
-        syncDirectory(target.parentFile)
+    private fun deleteReservationLocked(value: StorageBudgetReservationV2) {
+        files.delete(metadataFile(value.token), DurableStoreFaultPointV2.DELETE_RECLAIM)
+        files.delete(allocationFile(value.token), DurableStoreFaultPointV2.DELETE_RECLAIM)
+        reservations.remove(value.token)
     }
-    private fun deleteDurably(file: File) { if (file.exists() && !file.delete()) error("Cannot delete ${file.name}"); syncDirectory(file.parentFile) }
-    private fun syncDirectory(value: File) { FileOutputStream(File(value, ".sync")).use { it.fd.sync() }; File(value, ".sync").delete() }
+    private fun nextTokenLocked() = "${reservations.size}:${committed}:${System.nanoTime()}"
+    private fun persistLedgerLocked() = files.atomicReplace(ledger, "$committed\n".toByteArray(), DurableStoreFaultPointV2.POINTER_SLOT_REPLACE)
+    private fun metadataFile(token: String) = files.child("reservations-v2", "$token.reservation")
+    private fun allocationFile(token: String) = files.child("reservations-v2", "$token.allocation")
     private fun sha256(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes)
     private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
 
