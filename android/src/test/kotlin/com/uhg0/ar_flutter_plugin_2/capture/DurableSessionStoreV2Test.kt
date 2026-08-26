@@ -81,6 +81,21 @@ class DurableSessionStoreV2Test {
         }
     }
 
+    @Test fun `session root retains two predecessors and corrupt current slot falls back without filename selection`() {
+        val root = directory(); val store = DurableSessionStoreV2(File(root, "store"), budget(root))
+        (1..3).forEach { number ->
+            val request = request("root-$number", "root-attempt-$number", "jpeg-$number".toByteArray())
+            store.acceptBeforeExposure(request.accepted)
+            store.commitStreamed(request, streams("jpeg-$number".toByteArray()))
+        }
+        val pointers = File(root, "store/sessions").walkTopDown().filter { it.name.matches(Regex("root-[AB]\\.ptr")) }.toList()
+        val current = pointers.maxBy { it.readLines().first().toLong() }
+        current.writeText("corrupt\n")
+        val fourth = request("root-4", "root-attempt-4", "jpeg-4".toByteArray())
+        store.acceptBeforeExposure(fourth.accepted)
+        assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, store.commitStreamed(fourth, streams("jpeg-4".toByteArray())).phase)
+    }
+
     private fun request(commit: String, attempt: String, jpeg: ByteArray): CaptureCommitRequest {
         val identity = CaptureAttemptIdentity(attempt, commit, 1, CaptureLifecycleCut("session-1", 1, "group-1", 1, "ar-1", "view-1", 1, "binding-1", 1, 1))
         val profile = CaptureComponentProfile("jpeg", setOf(CaptureComponentKind.JPEG), 64, 64)

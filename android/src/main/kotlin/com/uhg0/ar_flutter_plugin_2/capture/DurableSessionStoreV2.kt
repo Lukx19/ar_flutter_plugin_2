@@ -39,7 +39,7 @@ class DurableSessionStoreV2(
             if (prior.requestHash == acceptedHash(attempt)) return@synchronized prior
             throw DurableStoreConflictV2("Changed replay conflicts with durable identity")
         }
-        val accepted = acceptedFile(location)
+        val accepted = acceptedFile(location, attempt.identity)
         if (accepted.isFile) {
             val existing = readProperties(accepted)
             if (existing.getProperty("acceptedHash") == acceptedHash(attempt)) return@synchronized acceptedReceipt(attempt)
@@ -68,7 +68,7 @@ class DurableSessionStoreV2(
             if (prior.requestHash == requestHash) return@synchronized prior
             throw DurableStoreConflictV2("Changed replay conflicts with committed durable identity")
         }
-        val accepted = readProperties(acceptedFile(location))
+        val accepted = readProperties(acceptedFile(location, request.accepted.identity))
         check(accepted.getProperty("acceptedHash") == acceptedHash(request.accepted)) { "Attempt was not durably accepted" }
         check(request.hasCompleteComponentSet) { "Component descriptors are incomplete" }
         check(streams.map { it.kind }.toSet() == request.accepted.profile.requiredComponents && streams.size == streams.map { it.kind }.toSet().size) {
@@ -76,7 +76,7 @@ class DurableSessionStoreV2(
         }
         val reservation = budget.reservation(accepted.getProperty("reservationToken"))
             ?: throw IllegalStateException("Accepted attempt has no live reservation")
-        val staging = File(location, "staging/${safe(request.accepted.identity.commitId)}")
+        val staging = File(attemptDirectory(location, request.accepted.identity), "staging")
         require(staging.mkdirs() || staging.isDirectory)
         var actualBytes = 0L
         try {
@@ -106,7 +106,7 @@ class DurableSessionStoreV2(
             val committed = CaptureReceipt(request.accepted.identity, CaptureAttemptPhase.COMMITTED_PICTURE, requestHash, receiptHash(requestHash, rootHash), true, terminal)
             // Receipt is durable before, and independently validates, the pointer switch.
             faults.at(DurableStoreFaultPointV2.RECEIPT_WRITE)
-            writePropertiesExclusive(receiptFile(location), receiptProperties(committed, rootHash))
+            writePropertiesExclusive(receiptFile(location, request.accepted.identity), receiptProperties(committed, rootHash))
             faults.at(DurableStoreFaultPointV2.RECEIPT_FILE_SYNC)
             publishPointer(location, RootPointer(revision, rootHash, request.accepted.identity.commitId))
             budget.commit(reservation, actualBytes)
@@ -127,13 +127,13 @@ class DurableSessionStoreV2(
         require(terminal.kind == CaptureTerminalKind.ABANDONED_ATTEMPT)
         val location = location(terminal.identity)
         receipt(location, terminal.identity)?.let { return@synchronized it }
-        val accepted = acceptedFile(location).takeIf(File::isFile)?.let(::readProperties)
+        val accepted = acceptedFile(location, terminal.identity).takeIf(File::isFile)?.let(::readProperties)
         faults.at(DurableStoreFaultPointV2.ABANDONMENT_CLEANUP)
-        deleteTree(File(location, "staging/${safe(terminal.identity.commitId)}"))
+        deleteTree(File(attemptDirectory(location, terminal.identity), "staging"))
         val value = CaptureReceipt(terminal.identity, CaptureAttemptPhase.ABANDONED_ATTEMPT, terminal.canonicalTerminalHash,
             receiptHash(terminal.canonicalTerminalHash, "abandoned"), true, terminal)
         faults.at(DurableStoreFaultPointV2.ABANDONMENT_RECORD)
-        writePropertiesExclusive(receiptFile(location), receiptProperties(value, "abandoned"))
+        writePropertiesExclusive(receiptFile(location, terminal.identity), receiptProperties(value, "abandoned"))
         accepted?.getProperty("reservationToken")?.let { budget.reservation(it)?.let(budget::release) }
         value
     }
@@ -157,17 +157,18 @@ class DurableSessionStoreV2(
             session.walkTopDown().filter { it.name == "staging" }.forEach(::deleteTree)
             session.walkTopDown().filter { it.name == "accepted.properties" }.forEach { accepted ->
                 val attempt = accepted.parentFile
-                if (!receiptFile(attempt).isFile) readProperties(accepted).getProperty("reservationToken")?.let { budget.reservation(it)?.let(budget::release) }
+                if (!File(attempt, "receipt.properties").isFile) readProperties(accepted).getProperty("reservationToken")?.let { budget.reservation(it)?.let(budget::release) }
             }
         }
     }
 
-    private fun location(identity: CaptureAttemptIdentity): File = File(File(File(sessionRoot, safe(identity.lifecycleCut.sessionId)), "attempts"), safe(identity.commitId)).also { it.mkdirs() }
+    private fun location(identity: CaptureAttemptIdentity): File = File(sessionRoot, safe(identity.lifecycleCut.sessionId)).also { it.mkdirs() }
+    private fun attemptDirectory(location: File, identity: CaptureAttemptIdentity): File = File(File(location, "attempts"), safe(identity.commitId)).also { it.mkdirs() }
     private fun tombstone(location: File): File? = generateSequence(location) { it.parentFile }.firstOrNull { File(it, "tombstone").isFile }
-    private fun acceptedFile(location: File) = File(location, "accepted.properties")
-    private fun receiptFile(location: File) = File(location, "receipt.properties")
+    private fun acceptedFile(location: File, identity: CaptureAttemptIdentity) = File(attemptDirectory(location, identity), "accepted.properties")
+    private fun receiptFile(location: File, identity: CaptureAttemptIdentity) = File(attemptDirectory(location, identity), "receipt.properties")
     private fun receipt(location: File, fallbackIdentity: CaptureAttemptIdentity? = null): CaptureReceipt? {
-        val file = receiptFile(location); if (!file.isFile) return null
+        val file = fallbackIdentity?.let { receiptFile(location, it) } ?: return null; if (!file.isFile) return null
         val value = readProperties(file); val identity = fallbackIdentity ?: return null
         val kind = value.getProperty("kind") ?: return null
         val terminal = if (kind == CaptureTerminalKind.COMMITTED_PICTURE.name) CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, identity, value.getProperty("requestHash"), "committed", value.getProperty("captureId"), value.getProperty("revision").toLong(), value.getProperty("rootHash"))
@@ -191,10 +192,19 @@ class DurableSessionStoreV2(
     }
     private fun rootPrevious(location: File, hash: String): String? = File(location, "objects/$hash.root").takeIf(File::isFile)?.readLines()?.firstOrNull { it.startsWith("previous=") }?.removePrefix("previous=")?.takeUnless { it == "-" }
     private fun validRoot(location: File, pointer: RootPointer): Boolean {
-        val file = File(location, "objects/${pointer.rootHash}.root")
-        if (!file.isFile || sha256(file.readBytes()).hex() != pointer.rootHash) return false
+        return validRootHash(location, pointer.rootHash, pointer.revision, 0)
+    }
+    private fun validRootHash(location: File, hash: String, revision: Long, depth: Int): Boolean {
+        if (depth > 2 || !hash.matches(Regex("[0-9a-f]{64}"))) return false
+        val file = File(location, "objects/$hash.root")
+        if (!file.isFile || sha256(file.readBytes()).hex() != hash) return false
         val values = file.readLines().associate { it.substringBefore('=') to it.substringAfter('=', "") }
-        return values["schema"] == "5" && values["revision"]?.toLongOrNull() == pointer.revision && values["request"]?.matches(Regex("[0-9a-f]{64}")) == true
+        if (values["schema"] != "5" || values["revision"]?.toLongOrNull() != revision || values["request"]?.matches(Regex("[0-9a-f]{64}")) != true) return false
+        val previous = values["previous"]
+        val second = values["secondPrevious"]
+        if (revision == 1L) return previous == "-" && second == "-"
+        if (previous == null || previous == "-" || !validRootHash(location, previous, revision - 1, depth + 1)) return false
+        return revision < 3 || second != null && second != "-" && validRootHash(location, second, revision - 2, depth + 2)
     }
     private fun publishPointer(location: File, pointer: RootPointer) { val old = selectedRoot(location); val target = File(location, if (old?.slot == "A") "root-B.ptr" else "root-A.ptr"); faults.at(DurableStoreFaultPointV2.POINTER_SLOT_REPLACE); writeAtomic(target, "${pointer.revision}\n${pointer.rootHash}\n${pointer.commitId}\n".toByteArray()) }
     private fun moveImmutable(from: File, target: File, descriptor: CaptureComponentDescriptor) { if (target.exists()) { check(target.length() == descriptor.byteLength && sha256(target.readBytes()).hex() == descriptor.sha256.hex()) { "Immutable asset conflict" }; from.delete(); return }; files.moveSameDirectory(from, target) }
