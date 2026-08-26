@@ -2,12 +2,84 @@ package com.uhg0.ar_flutter_plugin_2.capture
 
 import java.io.File
 import java.io.InputStream
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class NativeCaptureAdapterV2Test {
+    @Test
+    fun `startup recovery runs off caller and fences callbacks after close`() {
+        val caller = Thread.currentThread()
+        val recoveryThread = AtomicReference<Thread>()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val events = mutableListOf<NativeCaptureEventV2>()
+        val dispatcher = NativeCaptureRecoveryDispatcherV2(
+            recover = { active ->
+                recoveryThread.set(Thread.currentThread())
+                entered.countDown()
+                while (active() && !release.await(10, TimeUnit.MILLISECONDS)) {
+                    // Polling the cancellation predicate is the bounded recovery contract.
+                }
+                listOf(
+                    DurableSessionStoreV2.RecoveryProjectionV2(
+                        "recovered-attempt",
+                        CaptureTerminalKind.ABANDONED_ATTEMPT,
+                        reason = "recovered-proven-absent",
+                    ),
+                )
+            },
+            events = events::add,
+        )
+        assertTrue(entered.await(5, TimeUnit.SECONDS))
+        assertFalse(recoveryThread.get() === caller)
+
+        dispatcher.close()
+        release.countDown()
+        assertTrue(dispatcher.awaitTerminationForTest(5, TimeUnit.SECONDS))
+        dispatcher.emitLive(NativeCaptureEventV2(NativeCaptureEventKindV2.ACCEPTED, "late"))
+
+        assertFalse(dispatcher.isReady())
+        assertTrue(events.isEmpty())
+    }
+
+    @Test
+    fun `recovered terminals precede live events`() {
+        val recovered = CountDownLatch(1)
+        val events = mutableListOf<NativeCaptureEventV2>()
+        val dispatcher = NativeCaptureRecoveryDispatcherV2(
+            recover = {
+                listOf(
+                    DurableSessionStoreV2.RecoveryProjectionV2(
+                        "recovered",
+                        CaptureTerminalKind.COMMITTED_PICTURE,
+                        captureId = "capture",
+                        captureRevision = 1,
+                        manifestId = "manifest",
+                        reason = "recovered-committed",
+                    ),
+                )
+            },
+            events = {
+                events += it
+                recovered.countDown()
+            },
+        )
+        assertTrue(recovered.await(5, TimeUnit.SECONDS))
+        assertTrue(dispatcher.isReady())
+        dispatcher.emitLive(NativeCaptureEventV2(NativeCaptureEventKindV2.ACCEPTED, "live"))
+        assertEquals(
+            listOf(NativeCaptureEventKindV2.COMMITTED, NativeCaptureEventKindV2.ACCEPTED),
+            events.map { it.kind },
+        )
+        dispatcher.close()
+        assertTrue(dispatcher.awaitTerminationForTest(5, TimeUnit.SECONDS))
+    }
+
     @Test
     fun `admission is durable before one qualified exposure and complete JPEG commits`() {
         val store = FakeStore()

@@ -46,6 +46,7 @@ class DurableSessionStoreV2(
     private val mutex = Any()
     private val files = SafeFilesystemV2(root, faults, filesystemBackend)
     private val sessionRoot = files.child("sessions")
+    private val recoveryIndex = files.child("recovery-index.properties")
     private val uncertainRootHashes = mutableSetOf<String>()
 
     init {
@@ -79,6 +80,7 @@ class DurableSessionStoreV2(
                 setProperty("commitId", attempt.identity.commitId); setProperty("session", attempt.identity.lifecycleCut.sessionId)
             }
             faults.at(DurableStoreFaultPointV2.ACCEPTED_RECORD)
+            recordRecoveryCandidate(location, requireNotNull(accepted.parentFile))
             writePropertiesExclusive(accepted, data)
             acceptedReceipt(attempt)
         } catch (error: Throwable) { budget.release(reservation); throw error }
@@ -395,20 +397,36 @@ class DurableSessionStoreV2(
         }
     }
 
-    /** Bounded startup projection for the per-view owner after durable repair. */
-    internal fun recoverAndProject(limit: Int = 2): List<RecoveryProjectionV2> = synchronized(mutex) {
+    /**
+     * Bounded startup projection for the per-view owner after durable repair.
+     * The durable index has one spare entry so a crash between indexing and
+     * acceptance cannot evict either of the two prior valid candidates.
+     */
+    internal fun recoverAndProject(
+        limit: Int = 2,
+        shouldContinue: () -> Boolean = { true },
+        onCandidateExamined: () -> Unit = {},
+    ): List<RecoveryProjectionV2> = synchronized(mutex) {
         require(limit in 1..2)
-        recover()
-        files.list(sessionRoot)
-            .filter(File::isDirectory)
-            .flatMap { session ->
-                files.walk(session)
-                    .filter { it.name == "accepted.properties" }
-                    .map { accepted -> session to accepted }
-            }
-            .sortedByDescending { (_, accepted) -> accepted.lastModified() }
-            .take(limit)
-            .map { (session, accepted) ->
+        if (!files.isFile(recoveryIndex) || !shouldContinue()) return@synchronized emptyList()
+        val index = readProperties(recoveryIndex)
+        val count = index.getProperty("count")?.toIntOrNull()?.coerceIn(0, RECOVERY_INDEX_CAPACITY) ?: 0
+        val result = mutableListOf<RecoveryProjectionV2>()
+        val validEntries = mutableListOf<Pair<String, String>>()
+        var examinedSlots = 0
+        for (slot in 0 until count) {
+            if (!shouldContinue() || result.size == limit) break
+            examinedSlots++
+            onCandidateExamined()
+            val sessionHash = index.getProperty("entry.$slot.session") ?: continue
+            val attemptHash = index.getProperty("entry.$slot.attempt") ?: continue
+            if (!sessionHash.matches(SAFE_HASH) || !attemptHash.matches(SAFE_HASH)) continue
+            val session = files.child("sessions", sessionHash)
+            val accepted = path(session, "attempts", attemptHash, "accepted.properties")
+            if (!files.isFile(accepted)) continue
+            validEntries += sessionHash to attemptHash
+            repairAcceptedCandidate(session, accepted)
+            result += run {
                 val acceptedValues = readProperties(accepted)
                 val attemptId = acceptedValues.getProperty("attemptId")
                     ?: throw DurableStoreConflictV2("Recovered acceptance has no attempt identity")
@@ -439,6 +457,82 @@ class DurableSessionStoreV2(
                     }
                 }
             }
+        }
+        if (examinedSlots == count && validEntries.size != count && shouldContinue()) {
+            writeRecoveryIndex(validEntries)
+        }
+        result
+    }
+
+    private fun repairAcceptedCandidate(session: File, accepted: File) {
+        val attempt = requireNotNull(accepted.parentFile)
+        val receipt = path(attempt, "receipt.properties")
+        val acceptedValues = readProperties(accepted)
+        if (!files.isFile(receipt)) {
+            val abandoned = Properties().apply {
+                setProperty("kind", CaptureTerminalKind.ABANDONED_ATTEMPT.name)
+                setProperty("requestHash", acceptedValues.getProperty("acceptedHash"))
+                setProperty("receiptHash", receiptHash(acceptedValues.getProperty("acceptedHash"), "abandoned"))
+                setProperty("rootHash", "abandoned")
+                setProperty("reason", "recovered-proven-absent")
+                setProperty("requestBinding", ABANDONMENT_BINDING_RECOVERED)
+            }
+            writePropertiesExclusive(receipt, abandoned, DurableStoreFaultPointV2.ABANDONMENT_RECORD)
+            deleteTree(path(attempt, "staging"), DurableStoreFaultPointV2.ABANDONMENT_CLEANUP)
+            acceptedValues.getProperty("attemptId")?.let {
+                deleteTree(path(session, "assets", safe(it)), DurableStoreFaultPointV2.ABANDONMENT_CLEANUP)
+            }
+            acceptedValues.getProperty("reservationToken")?.let { budget.reservation(it)?.let(budget::release) }
+            return
+        }
+        val receiptValues = readProperties(receipt)
+        if (receiptValues.getProperty("kind") == CaptureTerminalKind.COMMITTED_PICTURE.name &&
+            receiptValues.getProperty("rootHash") in retainedRootHashes(session)
+        ) {
+            acceptedValues.getProperty("reservationToken")?.let { token ->
+                budget.reservation(token)?.let { reservation ->
+                    budget.commit(reservation, committedComponentBytes(session, receiptValues.getProperty("rootHash")))
+                }
+            }
+            deleteTree(path(attempt, "staging"), DurableStoreFaultPointV2.DELETE_RECLAIM)
+        }
+    }
+
+    private fun recordRecoveryCandidate(session: File, attempt: File) {
+        val sessionHash = session.name
+        val attemptHash = attempt.name
+        val existing = if (files.isFile(recoveryIndex)) readProperties(recoveryIndex) else Properties()
+        val entries = buildList {
+            add(sessionHash to attemptHash)
+            val count = existing.getProperty("count")?.toIntOrNull()?.coerceIn(0, RECOVERY_INDEX_CAPACITY) ?: 0
+            for (slot in 0 until count) {
+                val priorSession = existing.getProperty("entry.$slot.session") ?: continue
+                val priorAttempt = existing.getProperty("entry.$slot.attempt") ?: continue
+                if (priorSession to priorAttempt != sessionHash to attemptHash) add(priorSession to priorAttempt)
+            }
+        }.take(RECOVERY_INDEX_CAPACITY)
+        writeRecoveryIndex(entries)
+    }
+
+    private fun writeRecoveryIndex(entries: List<Pair<String, String>>) {
+        val updated = Properties().apply {
+            setProperty("schema", "bounded-recovery-index-v1")
+            setProperty("count", entries.size.toString())
+            entries.forEachIndexed { slot, (indexedSession, indexedAttempt) ->
+                setProperty("entry.$slot.session", indexedSession)
+                setProperty("entry.$slot.attempt", indexedAttempt)
+            }
+        }
+        files.atomicReplace(
+            recoveryIndex,
+            buildString {
+                updated.stringPropertyNames().sorted().forEach {
+                    append(it).append('=').append(updated.getProperty(it)).append('\n')
+                }
+            }.toByteArray(),
+            null,
+            null,
+        )
     }
 
     private fun location(identity: CaptureAttemptIdentity): File = files.child("sessions", safe(identity.lifecycleCut.sessionId)).also(files::ensureDirectory)
@@ -593,4 +687,8 @@ class DurableSessionStoreV2(
     private fun List<Int>.hex() = joinToString("") { "%02x".format(it) }
     private data class Staged(val kind: CaptureComponentKind, val file: File, val descriptor: CaptureComponentDescriptor)
     private data class RootPointer(val revision: Long, val rootHash: String, val commitId: String, val slot: String = "", val previousHash: String? = null)
+    private companion object {
+        const val RECOVERY_INDEX_CAPACITY = 3
+        val SAFE_HASH = Regex("[0-9a-f]{64}")
+    }
 }

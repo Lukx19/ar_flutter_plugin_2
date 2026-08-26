@@ -348,6 +348,53 @@ class DurableSessionStoreV2Test {
         store.close(); budget.close()
     }
 
+    @Test fun `startup recovery scan work is indexed bounded and cancellable`() {
+        val root = directory()
+        val firstBudget = budget(root)
+        val firstStore = store(root, firstBudget)
+        repeat(12) { ordinal ->
+            firstStore.acceptBeforeExposure(
+                request("bounded-$ordinal", "bounded-attempt-$ordinal", byteArrayOf(ordinal.toByte()), "session-$ordinal").accepted,
+            )
+        }
+        firstStore.close()
+        firstBudget.close()
+        val index = java.util.Properties().apply {
+            File(root, "store/recovery-index.properties").inputStream().use(::load)
+        }
+        assertEquals("3", index.getProperty("count"))
+        repeat(100) { File(root, "store/sessions/junk-$it").mkdirs() }
+
+        var directoryLists = 0
+        val secondBudget = budget(root)
+        val secondStore = DurableSessionStoreV2(
+            File(root, "store"),
+            secondBudget,
+            filesystemBackend = JvmDescriptorFilesystemV2(onList = { directoryLists++ }),
+        )
+        var candidates = 0
+        val projected = secondStore.recoverAndProject(
+            limit = 2,
+            onCandidateExamined = { candidates++ },
+        )
+        assertEquals(2, projected.size)
+        assertEquals(setOf("bounded-attempt-11", "bounded-attempt-10"), projected.map { it.attemptId }.toSet())
+        assertEquals(2, candidates)
+        assertEquals(0, directoryLists)
+
+        var cancelledCandidates = 0
+        assertTrue(
+            secondStore.recoverAndProject(
+                shouldContinue = { false },
+                onCandidateExamined = { cancelledCandidates++ },
+            ).isEmpty(),
+        )
+        assertEquals(0, cancelledCandidates)
+        assertEquals(0, directoryLists)
+        secondStore.close()
+        secondBudget.close()
+    }
+
     private fun request(commit: String, attempt: String, jpeg: ByteArray, session: String = "session-1"): CaptureCommitRequest {
         val identity = CaptureAttemptIdentity(attempt, commit, 1, CaptureLifecycleCut(session, 1, "group-1", 1, "ar-1", "view-1", 1, "binding-1", 1, 1))
         val profile = CaptureComponentProfile("jpeg", setOf(CaptureComponentKind.JPEG), 64, 64)

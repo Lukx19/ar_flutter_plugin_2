@@ -24,6 +24,7 @@ import com.uhg0.ar_flutter_plugin_2.sceneview.SceneViewCaptureHost
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -53,13 +54,16 @@ internal class ArCaptureSession(
     private val poseDataExtractor = PoseDataExtractor()
     private var sharedCameraManager: SharedCameraManager? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val disposed = AtomicBoolean(false)
     // Constructed per view now; #102 only provides a future native admission caller.
     private val nativeCaptureBindingV2 = NativeCaptureBindingV2(
         sceneHost.context,
         captureSafetySignalV2,
         events = { event ->
             mainHandler.post {
-                captureChannel.invokeMethod("onNativeCaptureV2Event", NativeCaptureWireV2.event(event))
+                if (!disposed.get()) {
+                    captureChannel.invokeMethod("onNativeCaptureV2Event", NativeCaptureWireV2.event(event))
+                }
             }
         },
     )
@@ -806,6 +810,7 @@ internal class ArCaptureSession(
 
     fun dispose() {
         // The binding classifies every owner before the manager closes Camera2.
+        disposed.set(true)
         nativeCaptureBindingV2.close()
         byteCache.dispose()
         sharedCameraManager?.let { manager ->

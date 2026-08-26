@@ -135,6 +135,65 @@ internal class SharedCameraManagerExposurePortV2(
     override fun cancelExposure(qualifier: CaptureAttemptQualifierV2) = cancel(qualifier)
 }
 
+/** Off-main startup recovery with close fencing and recovery-before-live ordering. */
+internal class NativeCaptureRecoveryDispatcherV2(
+    private val recover: ((() -> Boolean) -> List<DurableSessionStoreV2.RecoveryProjectionV2>),
+    private val events: (NativeCaptureEventV2) -> Unit,
+    private val executor: java.util.concurrent.ExecutorService = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "capture3d-v2-recovery").apply { isDaemon = true }
+    },
+) : AutoCloseable {
+    private val lock = Any()
+    private var closed = false
+    private var ready = false
+
+    init {
+        executor.execute {
+            val recovered = runCatching { recover(::isActive) }.getOrElse { emptyList() }
+            synchronized(lock) {
+                if (closed) return@execute
+                recovered.forEach { events(it.toNativeEvent()) }
+                ready = true
+            }
+        }
+    }
+
+    fun isReady(): Boolean = synchronized(lock) { ready && !closed }
+
+    fun emitLive(event: NativeCaptureEventV2) = synchronized(lock) {
+        if (!closed) {
+            check(ready) { "Native capture recovery has not completed" }
+            events(event)
+        }
+    }
+
+    private fun isActive(): Boolean = synchronized(lock) {
+        !closed && !Thread.currentThread().isInterrupted
+    }
+
+    override fun close() = synchronized(lock) {
+        if (closed) return@synchronized
+        closed = true
+        executor.shutdownNow()
+    }
+
+    internal fun awaitTerminationForTest(timeout: Long, unit: TimeUnit): Boolean =
+        executor.awaitTermination(timeout, unit)
+
+    private fun DurableSessionStoreV2.RecoveryProjectionV2.toNativeEvent() = NativeCaptureEventV2(
+        kind = when (kind) {
+            CaptureTerminalKind.COMMITTED_PICTURE -> NativeCaptureEventKindV2.COMMITTED
+            CaptureTerminalKind.ABANDONED_ATTEMPT -> NativeCaptureEventKindV2.ABANDONED
+            null -> NativeCaptureEventKindV2.RECOVERING
+        },
+        attemptId = attemptId,
+        captureId = captureId,
+        captureRevision = captureRevision,
+        manifestId = manifestId,
+        reason = reason,
+    )
+}
+
 /** Per-view native owner. #102 may supply intent, but not this binding or its lifecycle. */
 internal class NativeCaptureBindingV2(
     context: Context,
@@ -157,8 +216,12 @@ internal class NativeCaptureBindingV2(
         },
         cancel = { qualifier -> synchronized(lock) { sharedCamera?.cancelAttemptQualifiedExposureV2(qualifier) } },
     )
+    private val recovery = NativeCaptureRecoveryDispatcherV2(
+        recover = { shouldContinue -> store.recoverAndProject(shouldContinue = shouldContinue) },
+        events = events,
+    )
     private val adapter = NativeCaptureAdapterV2(
-        DurableNativeCaptureStorePortV2(store), bridge, safety, nowMs, events,
+        DurableNativeCaptureStorePortV2(store), bridge, safety, nowMs, recovery::emitLive,
     )
     private val deadlineScheduler = Executors.newSingleThreadScheduledExecutor { runnable ->
         Thread(runnable, "capture3d-v2-deadline").apply { isDaemon = true }
@@ -170,25 +233,6 @@ internal class NativeCaptureBindingV2(
             TimeUnit.SECONDS,
         )
     }
-    init {
-        store.recoverAndProject().forEach { recovered ->
-            events(
-                NativeCaptureEventV2(
-                    kind = when (recovered.kind) {
-                        CaptureTerminalKind.COMMITTED_PICTURE -> NativeCaptureEventKindV2.COMMITTED
-                        CaptureTerminalKind.ABANDONED_ATTEMPT -> NativeCaptureEventKindV2.ABANDONED
-                        null -> NativeCaptureEventKindV2.RECOVERING
-                    },
-                    attemptId = recovered.attemptId,
-                    captureId = recovered.captureId,
-                    captureRevision = recovered.captureRevision,
-                    manifestId = recovered.manifestId,
-                    reason = recovered.reason,
-                ),
-            )
-        }
-    }
-
     fun attachSharedCamera(manager: SharedCameraManager) = synchronized(lock) {
         check(!closed) { "NativeCaptureBindingV2 is closed" }
         sharedCamera = manager
@@ -197,7 +241,11 @@ internal class NativeCaptureBindingV2(
         // cache/correlation APIs.
     }
     fun detachSharedCamera(manager: SharedCameraManager) = synchronized(lock) { if (sharedCamera === manager) sharedCamera = null }
-    fun admit(request: CaptureCommitRequest): CaptureReceipt = adapter.admit(request)
+    fun admit(request: CaptureCommitRequest): CaptureReceipt = synchronized(lock) {
+        check(!closed) { "NativeCaptureBindingV2 is closed" }
+        check(recovery.isReady()) { "Native capture recovery is still running" }
+        adapter.admit(request)
+    }
     fun onLifecycle(event: CaptureLifecycleEvent, cut: CaptureLifecycleCut) = adapter.onLifecycle(event, cut)
     fun onLifecycle(event: CaptureLifecycleEvent) = adapter.onLifecycle(event)
     fun onPause() = adapter.onLifecycle(CaptureLifecycleEvent.BACKGROUNDED)
@@ -218,6 +266,7 @@ internal class NativeCaptureBindingV2(
         if (closed) return@synchronized
         closed = true
         deadlineScheduler.shutdownNow()
+        recovery.close()
         adapter.onLifecycle(CaptureLifecycleEvent.VIEW_REPLACED)
         adapter.close()
         sharedCamera = null

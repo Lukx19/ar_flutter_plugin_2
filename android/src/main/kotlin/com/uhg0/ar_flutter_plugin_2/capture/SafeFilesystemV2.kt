@@ -118,6 +118,7 @@ class JvmDescriptorFilesystemV2(
     private val onDirectorySync: (File) -> Unit = { },
     private val beforeComponentOpen: (File) -> Unit = { },
     private val onRootClose: (File) -> Unit = { },
+    private val onList: (File) -> Unit = { },
     private val boundRoot: File? = null,
 ) : DescriptorFilesystemV2 {
     private val lock = Any()
@@ -127,7 +128,7 @@ class JvmDescriptorFilesystemV2(
         check(boundRoot == null) { "JVM descriptor filesystem is already root-bound" }
         if (!Files.exists(root.toPath(), LinkOption.NOFOLLOW_LINKS)) Files.createDirectory(root.toPath())
         check(Files.isDirectory(root.toPath(), LinkOption.NOFOLLOW_LINKS))
-        return JvmDescriptorFilesystemV2(onDirectorySync, beforeComponentOpen, onRootClose, root.canonicalFile)
+        return JvmDescriptorFilesystemV2(onDirectorySync, beforeComponentOpen, onRootClose, onList, root.canonicalFile)
     }
     override fun ensureDirectory(segments: List<String>) = synchronized(lock) {
         var current = root()
@@ -152,7 +153,8 @@ class JvmDescriptorFilesystemV2(
     }
     override fun delete(segments: List<String>) = synchronized(lock) { resolveParent(segments)?.let { Files.deleteIfExists(File(it, segments.last()).toPath()) }; Unit }
     override fun list(segments: List<String>): List<String> = synchronized(lock) {
-        val directory = requireNotNull(resolveDirectory(segments)); Files.newDirectoryStream(directory.toPath()).use { it.map { child -> child.fileName.toString() }.sorted().toList() }
+        val directory = requireNotNull(resolveDirectory(segments)); onList(directory)
+        Files.newDirectoryStream(directory.toPath()).use { it.map { child -> child.fileName.toString() }.sorted().toList() }
     }
     override fun syncDirectory(segments: List<String>) = synchronized(lock) { onDirectorySync(requireNotNull(resolveDirectory(segments)).canonicalFile) }
     private fun openChannel(segments: List<String>, vararg options: StandardOpenOption): FileChannel {
@@ -222,11 +224,16 @@ class SafeFilesystemV2(
     fun writeImmutable(file: File, bytes: ByteArray, point: DurableStoreFaultPointV2) {
         if (isFile(file)) { check(readBytes(file).contentEquals(bytes)); return }; writeExclusive(file, bytes, point)
     }
-    fun atomicReplace(file: File, bytes: ByteArray, replacePoint: DurableStoreFaultPointV2) {
+    fun atomicReplace(
+        file: File,
+        bytes: ByteArray,
+        replacePoint: DurableStoreFaultPointV2?,
+        directorySyncPoint: DurableStoreFaultPointV2? = DurableStoreFaultPointV2.POINTER_DIRECTORY_SYNC,
+    ) {
         prepareParent(file); val parent = parentSegments(file); val temporary = ".${file.name}.part"; backend.delete(parent + temporary)
         backend.createExclusive(parent + temporary).use { it.write(bytes, 0, bytes.size); it.sync() }
-        fault.at(replacePoint); backend.atomicReplace(parent, temporary, file.name)
-        try { fault.at(DurableStoreFaultPointV2.POINTER_DIRECTORY_SYNC); backend.syncDirectory(parent) }
+        replacePoint?.let(fault::at); backend.atomicReplace(parent, temporary, file.name)
+        try { directorySyncPoint?.let(fault::at); backend.syncDirectory(parent) }
         catch (error: Throwable) { throw PointerDirectorySyncUnknownV2(error) }
     }
     fun moveAtomic(from: File, to: File) {

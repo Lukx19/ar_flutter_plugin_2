@@ -543,6 +543,11 @@ class ARCaptureManager {
     );
   }
 
+  /// Transfers post-exposure ownership to durable restart recovery without
+  /// requiring product callers to depend on the frozen intent-contract model.
+  Future<void> notifyNativeCaptureProcessRestartedV2() =>
+      notifyNativeCaptureLifecycleV2(CaptureLifecycleEvent.processRestarted);
+
   @visibleForTesting
   Future<void> debugConfigureNativeCaptureV2({String? fault}) async {
     await _channel.invokeMethod<void>(
