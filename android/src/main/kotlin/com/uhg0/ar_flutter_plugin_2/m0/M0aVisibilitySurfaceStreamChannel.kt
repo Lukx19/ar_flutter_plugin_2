@@ -129,6 +129,45 @@ class M0aVisibilitySurfaceStreamChannel(
         pendingReplyCount = if (activePendingReply != null) 1L else 0L,
     )
 
+    /** Debug-only execution of a terminal drain on this owned stream state. */
+    internal fun executeDebugTerminalDrain(streamToken: Long): M0aPacketCodec.Response {
+        val request = M0aPacketCodec.Request(
+            requestFlags = TERMINAL_DRAIN_REQUEST_FLAG,
+            streamToken = streamToken,
+            acknowledgedTransactionId = committedBaseline.transactionId,
+            acknowledgedGeometryRevision = committedBaseline.geometryRevision,
+            acknowledgedLineageRevision = committedBaseline.lineageRevision,
+            nextStyleRevision = committedBaseline.styleRevision,
+            maximumResponseBytes = M0aPacketCodec.responseMinimumBytes,
+            styleRecords = emptyList(),
+            commandBytes = byteArrayOf(),
+            requestSequence = Long.MAX_VALUE,
+        )
+        val bytes = M0aPacketCodec.encodeRequest(request)
+        return synchronized(this) {
+            check(lastSequence == null && synchronized(structuralFrames) { structuralFrames.isEmpty() })
+            nextExpectedSequence = Long.MAX_VALUE
+            check(isValidTerminalDrain(request))
+            val encoded = M0aPacketCodec.encodeResponse(
+                M0aPacketCodec.rolloverRequired(
+                    streamToken = streamToken,
+                    requestSequence = Long.MAX_VALUE,
+                    transactionId = committedBaseline.transactionId,
+                    targetGeometryRevision = committedBaseline.geometryRevision,
+                    targetLineageRevision = committedBaseline.lineageRevision,
+                    acceptedStyleRevision = committedBaseline.styleRevision,
+                ),
+                request.maximumResponseBytes,
+            )
+            lastSequence = Long.MAX_VALUE
+            lastRequest = bytes
+            lastResponse = encoded
+            telemetry.retainedReplayCache(bytes.size, encoded.size)
+            telemetry.accepted(bytes.size, encoded.size)
+            M0aPacketCodec.decodeResponse(encoded)
+        }
+    }
+
     /**
      * Queues one bounded structural transaction for worker-pull delivery.
      * Frames are consumed only after their response is encoded and accepted;

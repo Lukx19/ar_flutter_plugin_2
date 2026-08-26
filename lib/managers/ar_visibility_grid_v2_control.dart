@@ -501,27 +501,51 @@ final class ARVisibilityGridV2Issue98HandoffReceipt {
     required this.freshActiveResources,
   });
 
+  /// Transaction cursor consumed by the old binding.
   final int oldTransactionId;
+  /// Request cursor consumed by the terminal drain.
   final int oldRequestSequence;
+  /// Canonical terminal result flags.
   final int terminalResultFlags;
+  /// Non-wrapping terminal sequence advertised by native.
   final int terminalNextExpectedRequestSequence;
+  /// Fresh binding transaction cursor before its first publication.
   final int freshTransactionId;
+  /// First request cursor advertised by the replacement.
   final int freshRequestSequence;
+  /// First transaction available to the replacement worker.
   final int nextTransactionId;
+  /// Restored geometry authority before transaction 1.
   final int geometryRevision;
+  /// Restored lineage authority before transaction 1.
   final int lineageRevision;
+  /// Restored capture authority.
   final int captureRevision;
+  /// Restored coverage authority.
   final int coverageRevision;
+  /// Restored accepted-style authority.
   final int acceptedStyleRevision;
+  /// Restored region-manifest authority.
   final int regionManifestRevision;
+  /// Restored surface-ID allocation high-water mark.
   final int nextSurfaceIdHighWater;
+  /// Restored schema-root authority.
   final int schemaRootRevision;
+  /// Effects published during preparation; transaction 1 is worker-owned.
   final int semanticEffectCount;
+  /// Publications accepted from the old token after replacement.
   final int oldTokenPublicationCount;
+  /// Structural bytes observed on the root isolate.
   final int rootIsolateSurfaceBytes;
+  /// Owned resources closed with the old stream.
   final int oldClosedResources;
+  /// Owned resources active on the fresh binding.
   final int freshActiveResources;
 
+  /// Validates the complete bounded native preparation receipt.
+  ///
+  /// Throws [StateError] for missing, unknown, non-integral, out-of-range, or
+  /// mutually inconsistent fields.
   static ARVisibilityGridV2Issue98HandoffReceipt fromMap(Object? raw) {
     if (raw is! Map) throw StateError('V2 Issue 98 receipt was not a map.');
     final map = Map<Object?, Object?>.from(raw);
@@ -583,7 +607,7 @@ final class ARVisibilityGridV2Issue98HandoffReceipt {
         receipt.freshTransactionId != 0 ||
         receipt.freshRequestSequence != 1 ||
         receipt.nextTransactionId != 1 ||
-        receipt.semanticEffectCount != 1 ||
+        receipt.semanticEffectCount != 0 ||
         receipt.oldTokenPublicationCount != 0 ||
         receipt.rootIsolateSurfaceBytes != 0 ||
         receipt.oldClosedResources <= 0 ||

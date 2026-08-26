@@ -30,7 +30,7 @@ void main() {
         'regionManifestRevision': 16,
         'nextSurfaceIdHighWater': 17,
         'schemaRootRevision': 18,
-        'semanticEffectCount': 1,
+        'semanticEffectCount': 0,
         'oldTokenPublicationCount': 0,
         'rootIsolateSurfaceBytes': 0,
         'oldClosedResources': 3,
@@ -51,7 +51,7 @@ void main() {
     final receipt = await control.runDebugV2Issue98Handoff();
     expect(receipt, isA<ARVisibilityGridV2Issue98HandoffReceipt>());
     expect(receipt.nextTransactionId, 1);
-    expect(receipt.semanticEffectCount, 1);
+    expect(receipt.semanticEffectCount, 0);
     expect(receipt.oldTokenPublicationCount, 0);
     expect(receipt.rootIsolateSurfaceBytes, 0);
   });

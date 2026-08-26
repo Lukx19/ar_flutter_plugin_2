@@ -23,6 +23,11 @@ class M0aVgs2RecoveryCorpusTest {
             source.replaceFirst("\"fieldId\":4", "\"fieldId\":9"),
             source.replaceFirst("\"scope\":1", "\"unknown\":0,\"scope\":1"),
             source.replaceFirst("\"scope\":1,", ""),
+            source.replaceFirst(
+                "\"oldRequestSequence\":9223372036854775807",
+                "\"oldRequestSequence\":9223372036854775806",
+            ),
+            source.replaceFirst("\"diagnosticBytes\":0", "\"diagnosticBytes\":1"),
         ).forEach { mutation ->
             val bytes = mutation.encodeToByteArray()
             assertThrows(IllegalArgumentException::class.java) {

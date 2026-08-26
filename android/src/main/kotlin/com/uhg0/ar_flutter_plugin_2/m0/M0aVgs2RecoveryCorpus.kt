@@ -102,11 +102,45 @@ object M0aVgs2RecoveryCorpus {
             nextSurfaceIdHighWater = row.long("nextSurfaceIdHighWater"),
         )
         val fresh = M0aCommittedBaselineV1.forFreshBinding(old)
-        require(fresh.transactionId == row.long("freshTransactionId"))
-        require(row.long("freshRequestSequence") == 1L && row.long("nextTransactionId") == 1L)
-        require(fresh.copy(transactionId = 1).transactionId == row.long("nextTransactionId"))
+        require(row.long("oldRequestSequence") == Long.MAX_VALUE)
+        val request = M0aControlRequest(
+            operation = M0aControlOperation.START,
+            flags = 0,
+            controlRequestId = uuid(1),
+            sessionId = uuid(17),
+            captureGroupId = uuid(33),
+            sessionGeneration = 1,
+            groupGeneration = 1,
+            coverageEpoch = 1,
+            streamToken = 0,
+            payload = M0aStartRequestCodecV2.defaultPayload(),
+        )
+        val lifecycle = M0aControlLifecycle(initialCommittedBaseline = old)
+        val response = M0aControlCodec.decodeResponse(
+            lifecycle.handle(request, M0aControlCodec.encodeRequest(request)),
+        )
+        require(response.outcome == 0)
+        require(response.nativeTransactionId == row.long("freshTransactionId"))
+        require(response.nextExchangeRequestSequence == row.long("freshRequestSequence"))
+        require(lifecycle.committedBaseline() == fresh)
+        val frames = M0aStructuralTransactionProducerV1.produce(
+            transactionId = row.long("nextTransactionId"),
+            baseGeometryRevision = fresh.geometryRevision,
+            targetGeometryRevision = fresh.geometryRevision + 1,
+            targetLineageRevision = fresh.lineageRevision + 1,
+            bytes = byteArrayOf(),
+        )
+        require(frames.first() is M0aTransactionBeginFrameV1)
+        require(frames.last() is M0aTransactionCommitFrameV1)
         require(fresh.copy(transactionId = old.transactionId) == old)
         require(row.int("semanticEffectCount") == 1 && row.int("oldTokenPublicationCount") == 0)
+    }
+
+    private fun uuid(seed: Int): M0aUuid {
+        val bytes = ByteArray(16) { (seed + it).toByte() }
+        bytes[6] = 0x40
+        bytes[8] = 0x80.toByte()
+        return M0aUuid(bytes)
     }
 
     private fun JsonObject.requireExactKeys(expected: Set<String>, label: String) {

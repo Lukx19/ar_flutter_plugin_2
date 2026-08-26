@@ -16,7 +16,6 @@ import com.uhg0.ar_flutter_plugin_2.m0.M0aUuid
 import com.uhg0.ar_flutter_plugin_2.m0.M0aStructuralTransactionProducerV1
 import com.uhg0.ar_flutter_plugin_2.m0.M0aStartRequestCodecV2
 import com.uhg0.ar_flutter_plugin_2.m0.M0aVisibilitySurfaceStreamChannel
-import com.uhg0.ar_flutter_plugin_2.m0.M0aIssue98HandoffRunner
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -62,6 +61,8 @@ class VisibilityGridV2Binding internal constructor(
     private val debugRecoverySeam: VisibilityGridV2DebugRecoverySeam =
         VisibilityGridV2DebugRecoverySeam(),
     private val cleanupAuthority: CleanupAuthority = CleanupAuthority(),
+    private val initialCommittedBaselineSeed: M0aCommittedBaselineV1 =
+        M0aCommittedBaselineV1.ZERO,
     internal val beforeAbandonCleanup: (() -> Unit)? = null,
 ) {
     private val main = Handler(Looper.getMainLooper())
@@ -97,6 +98,7 @@ class VisibilityGridV2Binding internal constructor(
 
     private fun newLifecycle() = M0aControlLifecycle(
         committedBaselineAuthority = committedBaselineAuthority,
+        initialCommittedBaseline = initialCommittedBaselineSeed,
     )
 
     private fun newStreamChannel() = M0aVisibilitySurfaceStreamChannel(
@@ -223,7 +225,55 @@ class VisibilityGridV2Binding internal constructor(
             if (!isDebuggable) {
                 result.error("VG_PROTOCOL_INVALID", "V2 recovery seam is debug-only", null)
             } else {
-                result.success(M0aIssue98HandoffRunner.run().toMap())
+                val old = M0aCommittedBaselineV1(
+                    transactionId = Long.MAX_VALUE,
+                    geometryRevision = 11,
+                    lineageRevision = 12,
+                    styleRevision = 15,
+                    captureRevision = 13,
+                    coverageRevision = 14,
+                    regionManifestRevision = 16,
+                    nextSurfaceIdHighWater = 17,
+                    schemaRootRevision = 18,
+                )
+                lifecycle.setCommittedBaseline(old)
+                streamChannel.setCommittedBaseline(
+                    old.transactionId, old.geometryRevision, old.lineageRevision,
+                    old.styleRevision, captureRevision = old.captureRevision,
+                    coverageRevision = old.coverageRevision,
+                    regionManifestRevision = old.regionManifestRevision,
+                    schemaRootRevision = old.schemaRootRevision,
+                    nextSurfaceIdHighWater = old.nextSurfaceIdHighWater,
+                )
+                val terminal = streamChannel.executeDebugTerminalDrain(99)
+                val rootBytes = streamChannel.transportInstrumentation.snapshot()
+                    .ordinaryRootSurfaceBytes
+                val before = lifecycleResources().ownedResourceCount
+                replaceBinding()
+                val after = lifecycleResources().ownedResourceCount
+                result.success(mapOf(
+                    "oldTransactionId" to old.transactionId,
+                    "oldRequestSequence" to Long.MAX_VALUE,
+                    "terminalResultFlags" to terminal.resultFlags,
+                    "terminalNextExpectedRequestSequence" to
+                        terminal.nextExpectedRequestSequence,
+                    "freshTransactionId" to 0L,
+                    "freshRequestSequence" to 1L,
+                    "nextTransactionId" to 1L,
+                    "geometryRevision" to old.geometryRevision,
+                    "lineageRevision" to old.lineageRevision,
+                    "captureRevision" to old.captureRevision,
+                    "coverageRevision" to old.coverageRevision,
+                    "acceptedStyleRevision" to old.styleRevision,
+                    "regionManifestRevision" to old.regionManifestRevision,
+                    "nextSurfaceIdHighWater" to old.nextSurfaceIdHighWater,
+                    "schemaRootRevision" to old.schemaRootRevision,
+                    "semanticEffectCount" to 0,
+                    "oldTokenPublicationCount" to 0,
+                    "rootIsolateSurfaceBytes" to rootBytes,
+                    "oldClosedResources" to before,
+                    "freshActiveResources" to after,
+                ))
             }
             return
         }
@@ -417,14 +467,7 @@ class VisibilityGridV2Binding internal constructor(
                                 activeSessionGeneration = request.sessionGeneration
                                 activeGroupGeneration = request.groupGeneration
                                 activeCoverageEpoch = request.coverageEpoch
-                                if (lifecycle.committedBaseline() == M0aCommittedBaselineV1.ZERO) {
-                                    queueInitialTransaction()
-                                } else {
-                                    // A restored authoritative cut already contains
-                                    // the committed transaction. Mark startup as
-                                    // established without replaying transaction 1.
-                                    initialTransactionQueued = true
-                                }
+                                queueInitialTransaction(lifecycle.committedBaseline())
                             }
                             acceptedControls++
                             qualify(response)
@@ -528,14 +571,38 @@ class VisibilityGridV2Binding internal constructor(
     }
 
     @Synchronized
-    private fun queueInitialTransaction() {
+    private fun queueInitialTransaction(baseline: M0aCommittedBaselineV1) {
         check(!initialTransactionQueued) { "Initial transaction already queued" }
+        check(baseline.transactionId == 0L) {
+            "A fresh binding must allocate transaction 1 from cursor zero"
+        }
+        streamChannel.setCommittedBaseline(
+            transactionId = baseline.transactionId,
+            geometryRevision = baseline.geometryRevision,
+            lineageRevision = baseline.lineageRevision,
+            styleRevision = baseline.styleRevision,
+            evidenceRevision = baseline.evidenceRevision,
+            captureRevision = baseline.captureRevision,
+            coverageRevision = baseline.coverageRevision,
+            producedStyleRevision = baseline.producedStyleRevision,
+            regionManifestRevision = baseline.regionManifestRevision,
+            schemaRootRevision = baseline.schemaRootRevision,
+            nextSurfaceIdHighWater = baseline.nextSurfaceIdHighWater,
+            schemaRootHashIdentity = baseline.schemaRootHashIdentity,
+            manifestRootHashIdentity = baseline.manifestRootHashIdentity,
+            groupFrameConvention = baseline.groupFrameConvention,
+            matrixConvention = baseline.matrixConvention,
+            directionConvention = baseline.directionConvention,
+            normalEncoding = baseline.normalEncoding,
+            groupFromWorldIdentity = baseline.groupFromWorldIdentity,
+            worldFromGroupIdentity = baseline.worldFromGroupIdentity,
+        )
         streamChannel.queueStructuralTransaction(
             M0aStructuralTransactionProducerV1.produce(
                 transactionId = 1,
-                baseGeometryRevision = 0,
-                targetGeometryRevision = 1,
-                targetLineageRevision = 1,
+                baseGeometryRevision = baseline.geometryRevision,
+                targetGeometryRevision = baseline.geometryRevision + 1,
+                targetLineageRevision = baseline.lineageRevision + 1,
                 bytes = byteArrayOf(),
             ),
         )
@@ -566,7 +633,10 @@ class VisibilityGridV2Binding internal constructor(
             after = lifecycleResources(excludedCleanup = currentCleanup),
         )
         synchronized(publicationFence) {
-            lifecycle = newLifecycle()
+            lifecycle = M0aControlLifecycle(
+                committedBaselineAuthority = committedBaselineAuthority,
+                initialCommittedBaseline = lifecycle.committedBaseline(),
+            )
             currentBindingGeneration = nextBindingGeneration.incrementAndGet()
             nativeStreamToken = newOpaqueToken()
             workerBindingToken = newOpaqueToken()
@@ -635,6 +705,7 @@ class VisibilityGridV2Binding internal constructor(
             isDebuggable = isDebuggable,
             debugRecoverySeam = debugRecoverySeam,
             cleanupAuthority = cleanupAuthority,
+            initialCommittedBaselineSeed = lifecycle.committedBaseline(),
         )
         return oldSnapshot.withCleanupBalances(
             closedBefore = closedBefore,

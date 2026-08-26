@@ -756,6 +756,90 @@ class VisibilityGridV2BindingTest {
     }
 
     @Test
+    fun `Issue 98 debug endpoint replaces the owned stream and its fresh transaction one succeeds`() {
+        val messenger = MethodTestMessenger()
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 98,
+            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            postToMain = { task -> task() },
+            isDebuggable = true,
+        )
+        try {
+            val channel = MethodChannel(messenger, "visibility_grid_v2_control_98")
+            val oldSnapshot = binding.snapshot()
+            val oldQualifier = oldSnapshot.nativeStreamToken + oldSnapshot.workerBindingToken
+            val handoff = RecordingResult()
+            channel.invokeMethod("runDebugV2Issue98Handoff", null, handoff)
+            assertTrue(handoff.completed.await(2, TimeUnit.SECONDS))
+            @Suppress("UNCHECKED_CAST")
+            val receipt = handoff.successValue as Map<String, Any>
+            assertEquals(0, receipt["semanticEffectCount"])
+            assertEquals(0, receipt["oldTokenPublicationCount"])
+
+            val freshSnapshot = binding.snapshot()
+            val qualifier = freshSnapshot.nativeStreamToken + freshSnapshot.workerBindingToken
+            assertFalse(oldQualifier.contentEquals(qualifier))
+            val start = RecordingResult()
+            channel.invokeMethod(
+                "start",
+                qualifier + M0aControlCodec.encodeRequest(startRequest()),
+                start,
+            )
+            assertTrue(start.completed.await(2, TimeUnit.SECONDS))
+            val startResponse = M0aControlCodec.decodeResponse(
+                stripQualifier(start.successValue as ByteArray, qualifier),
+            )
+            assertEquals(0, startResponse.nativeTransactionId)
+            assertEquals(1, startResponse.nextExchangeRequestSequence)
+
+            fun exchange(sequence: Long, acknowledgedTransactionId: Long): M0aPacketCodec.Response {
+                val reply = RecordingBinaryReply()
+                messenger.send(
+                    "visibility_surface_stream_98",
+                    ByteBuffer.wrap(
+                        qualifier + M0aPacketCodec.encodeRequest(
+                            M0aPacketCodec.Request(
+                                requestFlags = 0,
+                                streamToken = startResponse.streamToken,
+                                acknowledgedTransactionId = acknowledgedTransactionId,
+                                acknowledgedGeometryRevision = if (acknowledgedTransactionId == 0L) 11 else 12,
+                                acknowledgedLineageRevision = if (acknowledgedTransactionId == 0L) 12 else 13,
+                                nextStyleRevision = 15,
+                                maximumResponseBytes = 4096,
+                                styleRecords = emptyList(),
+                                commandBytes = byteArrayOf(),
+                                requestSequence = sequence,
+                            ),
+                        ),
+                    ),
+                    reply,
+                )
+                assertTrue(reply.completed.await(2, TimeUnit.SECONDS))
+                return M0aPacketCodec.decodeResponse(stripQualifier(reply.bytes!!, qualifier))
+            }
+            assertEquals(2, exchange(1, 0).messageKind)
+            assertEquals(4, exchange(2, 0).messageKind)
+            val acknowledged = exchange(3, 1)
+            assertEquals(0, acknowledged.messageKind)
+            assertEquals(1, acknowledged.transactionId)
+            assertEquals(12, acknowledged.targetGeometryRevision)
+            assertEquals(13, acknowledged.targetLineageRevision)
+
+            val stale = RecordingBinaryReply()
+            messenger.send(
+                "visibility_surface_stream_98",
+                ByteBuffer.wrap(oldQualifier + ByteArray(M0aPacketCodec.requestHeaderBytes)),
+                stale,
+            )
+            assertTrue(stale.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(null, stale.bytes)
+        } finally {
+            binding.dispose()
+        }
+    }
+
+    @Test
     fun `exact receipt query reports commit winner and rejects stale replay qualification`() {
         val messenger = MethodTestMessenger()
         val binding = VisibilityGridV2Binding(
