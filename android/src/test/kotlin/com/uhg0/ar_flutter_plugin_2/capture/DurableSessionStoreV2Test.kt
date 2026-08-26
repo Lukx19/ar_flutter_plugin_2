@@ -57,6 +57,30 @@ class DurableSessionStoreV2Test {
         assertNull(store.queryReceipt(request.accepted.identity))
     }
 
+    @Test fun `generated durable fault matrix mutates every storage cut and preserves a terminal classification`() {
+        assertEquals(21, DurableStoreFaultPointV2.entries.size)
+        DurableStoreFaultPointV2.entries.forEach { cut ->
+            val root = directory()
+            val poisoned = DurableSessionStoreV2(File(root, "store"), budget(root), DurableStoreFaultInjectorV2 {
+                if (it == cut) throw IllegalStateException("injected-$cut")
+            })
+            val request = request("fault-$cut", "attempt-$cut", "jpeg".toByteArray())
+            runCatching { poisoned.acceptBeforeExposure(request.accepted) }
+            runCatching { poisoned.commitStreamed(request, streams("jpeg".toByteArray())) }
+            // A fresh process never trusts a staging filename: it either finds the
+            // durable receipt or can record the metadata-only terminal exactly once.
+            val recovered = DurableSessionStoreV2(File(root, "store"), budget(root))
+            val terminal = recovered.queryReceipt(request.accepted.identity) ?: run {
+                recovered.abandon(CaptureTerminal(CaptureTerminalKind.ABANDONED_ATTEMPT, request.accepted.identity, "fault-$cut", "injected"))
+            }
+            assertTrue(terminal.phase in setOf(CaptureAttemptPhase.COMMITTED_PICTURE, CaptureAttemptPhase.ABANDONED_ATTEMPT))
+            val later = request("later-$cut", "later-attempt-$cut", "later".toByteArray())
+            runCatching { recovered.acceptBeforeExposure(later.accepted) }
+            runCatching { recovered.commitStreamed(later, streams("later".toByteArray())) }
+            assertNotNull(recovered.queryReceipt(later.accepted.identity))
+        }
+    }
+
     private fun request(commit: String, attempt: String, jpeg: ByteArray): CaptureCommitRequest {
         val identity = CaptureAttemptIdentity(attempt, commit, 1, CaptureLifecycleCut("session-1", 1, "group-1", 1, "ar-1", "view-1", 1, "binding-1", 1, 1))
         val profile = CaptureComponentProfile("jpeg", setOf(CaptureComponentKind.JPEG), 64, 64)
