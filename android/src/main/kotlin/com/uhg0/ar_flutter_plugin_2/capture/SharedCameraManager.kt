@@ -28,9 +28,9 @@ import com.google.ar.core.SharedCamera
 import com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraCapabilityQuerier
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
-import java.io.ByteArrayInputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
@@ -221,7 +221,8 @@ internal class SharedCameraManager(
         ?: requestDirectExposureV2(qualifier, required, callback)
 
     internal fun cancelAttemptQualifiedExposureV2(qualifier: CaptureAttemptQualifierV2) {
-        v2CancelHook?.invoke(qualifier)
+        val hook = v2CancelHook
+        if (hook != null) hook(qualifier) else cancelDirectExposureV2(qualifier)
     }
 
     companion object {
@@ -241,7 +242,20 @@ internal class SharedCameraManager(
     private val startupBarrier = SharedCameraStartupBarrier()
     private val repeatingRequestLifecycle = SharedCameraRepeatingRequestLifecycle()
     private val rawJpegCaptureCorrelator =
-        RawJpegCaptureCorrelator<Image, TotalCaptureResult>(::closeTrackedImage)
+        RawJpegCaptureCorrelator<PendingStillImagePayload, Image, TotalCaptureResult>(
+            PendingStillImagePayload::sensorTimestampNs,
+            {},
+            ::closeTrackedImage,
+        )
+    private val directRawJpegCaptureCorrelator =
+        RawJpegCaptureCorrelator<Image, Image, TotalCaptureResult>(
+            Image::getTimestamp,
+            ::closeTrackedImage,
+            ::closeTrackedImage,
+        )
+    private val directComponentExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "capture3d-v2-component-stream").apply { isDaemon = true }
+    }
     private val captureObservationLock = Any()
     private val captureObservedTimestampsNs = linkedMapOf<Long, Long>()
     private val sharedCameraCaptureCallback =
@@ -388,7 +402,10 @@ internal class SharedCameraManager(
     private val pendingManualCaptureOwner = CaptureAttemptOwner<PendingManualCapture>()
     private val pendingManualCapture: PendingManualCapture?
         get() = pendingManualCaptureOwner.get()
-    private val pendingDirectCaptureOwner = CaptureAttemptOwner<PendingDirectCaptureV2>()
+    private val pendingDirectCaptureOwner =
+        QualifiedCaptureAttemptOwnerV2<PendingDirectCaptureV2, CaptureAttemptQualifierV2>(
+            PendingDirectCaptureV2::qualifier,
+        )
     private val pendingDirectCapture: PendingDirectCaptureV2?
         get() = pendingDirectCaptureOwner.get()
 
@@ -425,8 +442,8 @@ internal class SharedCameraManager(
     /**
      * V2's image owner.  It is intentionally distinct from PendingManualCapture:
      * no ImageCacheManager reservation, image id, or V1 finalization worker can
-     * observe this byte sequence.  The byte array is a short-lived Camera2
-     * decoder buffer and is handed immediately to the adapter-owned stream.
+     * observe this image. Camera2 Images remain owned until the durable store
+     * closes their bounded component streams.
      */
     private data class PendingDirectCaptureV2(
         val qualifier: CaptureAttemptQualifierV2,
@@ -594,6 +611,11 @@ internal class SharedCameraManager(
             callback.onFailure(qualifier, "camera-submit")
             false
         }
+    }
+
+    private fun cancelDirectExposureV2(qualifier: CaptureAttemptQualifierV2) {
+        pendingDirectCaptureOwner.cancel(qualifier) ?: return
+        directRawJpegCaptureCorrelator.clear()
     }
 
     private suspend fun awaitSharedCameraRestartWindow() {
@@ -1117,6 +1139,7 @@ internal class SharedCameraManager(
         // callback on this same handler, preventing timestamp correlation.
         val image = reader.acquireLatestImage() ?: return
         resourceCounters.onImageAcquired()
+        var imageTransferred = false
         try {
             val direct = pendingDirectCapture
             if (pendingManualCapture == null && direct == null) {
@@ -1174,38 +1197,36 @@ internal class SharedCameraManager(
             check(image.format == ImageFormat.JPEG) {
                 "Supported shared-camera capture modes must deliver hardware JPEG"
             }
+            if (direct != null) {
+                if (CaptureComponentKind.DNG in direct.required) {
+                    imageTransferred = true
+                    directRawJpegCaptureCorrelator.onJpeg(image)
+                        ?.let(::handleCorrelatedDirectRawJpegCapture)
+                } else if (pendingDirectCaptureOwner.release(direct)) {
+                    imageTransferred = true
+                    val jpeg = CameraPlaneInputStreamV2(
+                        image.planes.single().buffer,
+                    ) { closeTrackedImage(image) }
+                    try {
+                        direct.callback.onComponents(
+                            SharedCameraComponentSetV2(
+                                direct.qualifier,
+                                listOf(CaptureComponentStreamV2(CaptureComponentKind.JPEG, jpeg)),
+                                exposureTimestampNanoseconds = image.timestamp,
+                            ),
+                        )
+                    } catch (error: Throwable) {
+                        jpeg.close()
+                        throw error
+                    }
+                }
+                return
+            }
             val jpegBytes = readImageBytes(image)
             Log.i(
                 "SharedCameraManager",
                 "Encoded ${jpegBytes.size} bytes in ${System.currentTimeMillis() - encodeStartedAtMs}ms",
             )
-            if (direct != null) {
-                if (CaptureComponentKind.DNG in direct.required) {
-                    handleRawJpegImage(
-                        PendingStillImagePayload(
-                            sensorTimestampNs = image.timestamp,
-                            width = image.width,
-                            height = image.height,
-                            bytes = jpegBytes,
-                            receivedAtMs = System.currentTimeMillis(),
-                        ),
-                    )
-                } else if (pendingDirectCaptureOwner.release(direct)) {
-                    direct.callback.onComponents(
-                        SharedCameraComponentSetV2(
-                            direct.qualifier,
-                            listOf(
-                                CaptureComponentStreamV2(
-                                    CaptureComponentKind.JPEG,
-                                    ByteArrayInputStream(jpegBytes),
-                                ),
-                            ),
-                            exposureTimestampNanoseconds = image.timestamp,
-                        ),
-                    )
-                }
-                return
-            }
             if (config.rawJpeg) {
                 handleRawJpegImage(
                     PendingStillImagePayload(
@@ -1236,7 +1257,7 @@ internal class SharedCameraManager(
                 pending.latch.countDown()
             }
         } finally {
-            closeTrackedImage(image)
+            if (!imageTransferred) closeTrackedImage(image)
         }
     }
 
@@ -1247,8 +1268,13 @@ internal class SharedCameraManager(
             closeTrackedImage(image)
             return
         }
-        rawJpegCaptureCorrelator.onRaw(image.timestamp, image)
-            ?.let(::handleCorrelatedRawJpegCapture)
+        if (pendingDirectCapture != null) {
+            directRawJpegCaptureCorrelator.onRaw(image.timestamp, image)
+                ?.let(::handleCorrelatedDirectRawJpegCapture)
+        } else {
+            rawJpegCaptureCorrelator.onRaw(image.timestamp, image)
+                ?.let(::handleCorrelatedRawJpegCapture)
+        }
     }
 
     private fun handleRawJpegImage(image: PendingStillImagePayload) {
@@ -1260,12 +1286,17 @@ internal class SharedCameraManager(
         sensorTimestampNs: Long,
         result: TotalCaptureResult,
     ) {
-        rawJpegCaptureCorrelator.onResult(sensorTimestampNs, result)
-            ?.let(::handleCorrelatedRawJpegCapture)
+        if (pendingDirectCapture != null) {
+            directRawJpegCaptureCorrelator.onResult(sensorTimestampNs, result)
+                ?.let(::handleCorrelatedDirectRawJpegCapture)
+        } else {
+            rawJpegCaptureCorrelator.onResult(sensorTimestampNs, result)
+                ?.let(::handleCorrelatedRawJpegCapture)
+        }
     }
 
     private fun handleCorrelatedRawJpegCapture(
-        capture: CorrelatedRawJpegCapture<Image, TotalCaptureResult>,
+        capture: CorrelatedRawJpegCapture<PendingStillImagePayload, Image, TotalCaptureResult>,
     ) {
         val jpeg = capture.jpeg
         val rawImage = capture.raw
@@ -1282,30 +1313,6 @@ internal class SharedCameraManager(
             if (closed.compareAndSet(false, true)) closeTrackedImage(rawImage)
         }
         try {
-            if (direct != null) {
-                val sensorTimestampNs =
-                    totalResult.get(CaptureResult.SENSOR_TIMESTAMP) ?: jpeg.sensorTimestampNs
-                val dngBytes = ByteArrayOutputStream().use { output ->
-                    DngCreator(characteristics, totalResult).use { creator ->
-                        creator.writeImage(output, rawImage)
-                    }
-                    output.toByteArray()
-                }
-                closeRaw()
-                if (pendingDirectCaptureOwner.release(direct)) {
-                    direct.callback.onComponents(
-                        SharedCameraComponentSetV2(
-                            direct.qualifier,
-                            listOf(
-                                CaptureComponentStreamV2(CaptureComponentKind.JPEG, ByteArrayInputStream(jpeg.bytes)),
-                                CaptureComponentStreamV2(CaptureComponentKind.DNG, ByteArrayInputStream(dngBytes)),
-                            ),
-                            exposureTimestampNanoseconds = sensorTimestampNs,
-                        ),
-                    )
-                }
-                return
-            }
             val manual = checkNotNull(pending)
             val imageId = generateImageId()
             val sensorTimestampNs =
@@ -1567,6 +1574,7 @@ internal class SharedCameraManager(
 
     private fun clearPendingRawJpegComponents() {
         rawJpegCaptureCorrelator.clear()
+        directRawJpegCaptureCorrelator.clear()
     }
 
     private fun closeTrackedImage(image: Image) {
@@ -1602,6 +1610,61 @@ internal class SharedCameraManager(
             )
         }
         return specs
+    }
+
+    private fun handleCorrelatedDirectRawJpegCapture(
+        capture: CorrelatedRawJpegCapture<Image, Image, TotalCaptureResult>,
+    ) {
+        val direct = pendingDirectCapture
+        val characteristics = activeCameraCharacteristics
+        if (direct == null || characteristics == null || !pendingDirectCaptureOwner.release(direct)) {
+            closeTrackedImage(capture.jpeg)
+            closeTrackedImage(capture.raw)
+            return
+        }
+        val rawClosed = java.util.concurrent.atomic.AtomicBoolean(false)
+        val closeRaw = {
+            if (rawClosed.compareAndSet(false, true)) closeTrackedImage(capture.raw)
+        }
+        val dng = try {
+            BoundedProducerInputStreamV2.start(
+                executor = directComponentExecutor,
+                capacityBytes = 64 * 1024,
+                closeOwner = closeRaw,
+            ) { output ->
+                try {
+                    DngCreator(characteristics, capture.result).use { creator ->
+                        creator.writeImage(output, capture.raw)
+                    }
+                } finally {
+                    closeRaw()
+                }
+            }
+        } catch (error: Throwable) {
+            closeRaw()
+            closeTrackedImage(capture.jpeg)
+            throw error
+        }
+        val jpeg = CameraPlaneInputStreamV2(capture.jpeg.planes.single().buffer) {
+            closeTrackedImage(capture.jpeg)
+        }
+        try {
+            direct.callback.onComponents(
+                SharedCameraComponentSetV2(
+                    direct.qualifier,
+                    listOf(
+                        CaptureComponentStreamV2(CaptureComponentKind.JPEG, jpeg),
+                        CaptureComponentStreamV2(CaptureComponentKind.DNG, dng),
+                    ),
+                    exposureTimestampNanoseconds =
+                        capture.result.get(CaptureResult.SENSOR_TIMESTAMP) ?: capture.jpeg.timestamp,
+                ),
+            )
+        } catch (error: Throwable) {
+            jpeg.close()
+            dng.close()
+            throw error
+        }
     }
 
     private fun guardArCoreStartupStateCallback(
@@ -2007,6 +2070,10 @@ internal class SharedCameraManager(
             pendingManualCaptureOwner.release(pending)
             pending.latch.countDown()
         }
+        pendingDirectCapture?.let { pending ->
+            pendingDirectCaptureOwner.release(pending)
+            directRawJpegCaptureCorrelator.clear()
+        }
         val closingCaptureSession = captureSession
         captureSessionClosed = closingCaptureSession == null
         closingCaptureSession?.close()
@@ -2023,6 +2090,7 @@ internal class SharedCameraManager(
         manualCaptureRequestBuilder = null
 
         if (finalizationWorkersDelegate.isInitialized()) finalizationWorkers.close()
+        directComponentExecutor.shutdownNow()
 
         scheduleBackgroundThreadShutdownWhenClosed()
         // Vendor fallback: close callbacks are expected, but never retain a

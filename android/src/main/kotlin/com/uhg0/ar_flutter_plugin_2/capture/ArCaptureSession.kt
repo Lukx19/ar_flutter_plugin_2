@@ -765,7 +765,21 @@ internal class ArCaptureSession(
                     "malformed" -> callback.onComponents(
                         SharedCameraComponentSetV2(
                             qualifier,
-                            listOf(CaptureComponentStreamV2(CaptureComponentKind.JPEG, ByteArrayInputStream(byteArrayOf(1, 2, 3)))),
+                            listOf(
+                                CaptureComponentStreamV2(CaptureComponentKind.JPEG, ByteArrayInputStream(byteArrayOf(1, 2, 3))),
+                                CaptureComponentStreamV2(CaptureComponentKind.JPEG, ByteArrayInputStream(byteArrayOf(4, 5, 6))),
+                            ),
+                            exposureTimestampNanoseconds = 1L,
+                        ),
+                    )
+                    "store" -> callback.onComponents(
+                        SharedCameraComponentSetV2(
+                            qualifier,
+                            required.sortedBy { it.ordinal }.map { kind ->
+                                CaptureComponentStreamV2(kind, object : java.io.InputStream() {
+                                    override fun read(): Int = throw java.io.IOException("synthetic-store-stream")
+                                })
+                            },
                             exposureTimestampNanoseconds = 1L,
                         ),
                     )

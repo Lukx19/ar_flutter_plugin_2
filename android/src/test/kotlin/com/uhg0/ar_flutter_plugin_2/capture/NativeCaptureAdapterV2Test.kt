@@ -82,24 +82,59 @@ class NativeCaptureAdapterV2Test {
     }
 
     @Test
-    fun `capacity is resolved before durable accept and protected manual evicts waiting automatic`() {
+    fun `one manual and one automatic lane are the complete funded capacity`() {
         val store = FakeStore()
         val camera = FakeExposure()
         val adapter = NativeCaptureAdapterV2(store, camera)
         val running = request(CaptureLane.AUTOMATIC, setOf(CaptureComponentKind.JPEG), ordinal = 1)
-        val waitingAutomatic = request(CaptureLane.AUTOMATIC, setOf(CaptureComponentKind.JPEG), ordinal = 2)
+        val duplicateAutomaticLane = request(CaptureLane.AUTOMATIC, setOf(CaptureComponentKind.JPEG), ordinal = 2)
         val manual = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 3)
         adapter.admit(running)
-        adapter.admit(waitingAutomatic)
+        assertEquals(
+            "lane-capacity-automatic",
+            runCatching { adapter.admit(duplicateAutomaticLane) }.exceptionOrNull()?.message,
+        )
         adapter.admit(manual)
 
-        assertEquals(listOf(running, waitingAutomatic, manual), store.accepted)
-        assertEquals("manual-priority-evicted-automatic", store.terminals.single().terminal?.reason)
+        assertEquals(listOf(running, manual), store.accepted)
+        assertTrue(store.terminals.isEmpty())
         assertEquals(manual.accepted.identity, adapter.waitingIdentityForTest())
 
-        val rejected = request(CaptureLane.AUTOMATIC, setOf(CaptureComponentKind.JPEG), ordinal = 4)
-        assertTrue(runCatching { adapter.admit(rejected) }.exceptionOrNull()?.message == "finalizer-capacity")
-        assertFalse(store.accepted.contains(rejected))
+        val duplicateManualLane = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 4)
+        assertEquals(
+            "lane-capacity-manual",
+            runCatching { adapter.admit(duplicateManualLane) }.exceptionOrNull()?.message,
+        )
+        assertFalse(store.accepted.contains(duplicateManualLane))
+    }
+
+    @Test
+    fun `all reservation liabilities are validated before durable acceptance`() {
+        val baseline = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG, CaptureComponentKind.DNG))
+        val invalidReservations = listOf(
+            baseline.accepted.reservation.copy(memoryBytes = baseline.accepted.profile.maximumWorkingBytes - 1),
+            baseline.accepted.reservation.copy(physicalStoreBytes = baseline.accepted.profile.maximumComponentBytes - 1),
+            baseline.accepted.reservation.copy(componentEntries = 1),
+            baseline.accepted.reservation.copy(terminalEntries = 0),
+            baseline.accepted.reservation.copy(physicallyBacked = false),
+        )
+        invalidReservations.forEach { reservation ->
+            val store = FakeStore()
+            val camera = FakeExposure()
+            val adapter = NativeCaptureAdapterV2(store, camera)
+            val accepted = CaptureAcceptedAttempt(
+                baseline.accepted.identity,
+                baseline.accepted.lane,
+                baseline.accepted.profile,
+                reservation,
+                baseline.accepted.canonicalIntentHash,
+                baseline.accepted.acceptedReceiptHash,
+            )
+            val request = rebuildRequest(baseline, accepted = accepted)
+            assertTrue(runCatching { adapter.admit(request) }.exceptionOrNull() is IllegalArgumentException)
+            assertTrue(store.accepted.isEmpty())
+            assertTrue(camera.requests.isEmpty())
+        }
     }
 
     @Test
@@ -225,13 +260,15 @@ class NativeCaptureAdapterV2Test {
             val first = NativeCaptureAdapterV2(DurableNativeCaptureStorePortV2(durable), firstCamera)
             first.admit(request)
             first.onLifecycle(CaptureLifecycleEvent.BACKGROUNDED)
-            val abandoned = checkNotNull(durable.queryReceipt(request.accepted.identity))
+            assertEquals(null, durable.queryReceipt(request.accepted.identity))
             durable.close()
             durable = DurableSessionStoreV2(File(root, "store"), budget, filesystemBackend = JvmDescriptorFilesystemV2())
+            durable.recover()
+            checkNotNull(durable.queryReceipt(request.accepted.identity))
 
             val replayCamera = FakeExposure()
             val replay = NativeCaptureAdapterV2(DurableNativeCaptureStorePortV2(durable), replayCamera)
-            assertEquals(abandoned.receiptHash, replay.admit(request).receiptHash)
+            assertTrue(runCatching { replay.admit(request) }.exceptionOrNull() is DurableStoreConflictV2)
             assertTrue(replayCamera.requests.isEmpty())
             assertEquals(0, replay.snapshot().running)
             assertEquals(0, replay.snapshot().fundedWaiting)
@@ -287,24 +324,29 @@ class NativeCaptureAdapterV2Test {
     }
 
     @Test
-    fun `ten second automatic deadline abandons and thirty second path queries before abandonment`() {
+    fun `ten seconds presents unknown and thirty seconds durably classifies without a shutter retry`() {
         var clock = 0L
         val store = FakeStore()
         val camera = FakeExposure()
-        val adapter = NativeCaptureAdapterV2(store, camera, nowMs = { clock })
+        val events = mutableListOf<NativeCaptureEventV2>()
+        val adapter = NativeCaptureAdapterV2(store, camera, nowMs = { clock }, events = events::add)
         val automatic = request(CaptureLane.AUTOMATIC, setOf(CaptureComponentKind.JPEG))
         adapter.admit(automatic)
         clock = 10_000L
         adapter.advanceDeadlines()
-        assertEquals("automatic-stall-10s", store.terminals.single().terminal?.reason)
-
-        val manual = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 2)
-        adapter.admit(manual)
-        clock += 30_000L
-        adapter.advanceDeadlines()
-        assertTrue(store.queries.contains(manual.accepted.identity))
-        assertEquals("terminal-fence-30s", store.terminals.last().terminal?.reason)
+        assertTrue(store.terminals.isEmpty())
+        assertEquals(1, camera.requests.size)
+        assertEquals(1, adapter.snapshot().running)
+        assertEquals("terminal-presentation-10s", events.last { it.kind == NativeCaptureEventKindV2.RECOVERING }.reason)
         assertEquals(1L, adapter.snapshot().unknownQueries)
+
+        clock = 30_000L
+        adapter.advanceDeadlines()
+        assertTrue(store.queries.contains(automatic.accepted.identity))
+        assertEquals("terminal-fence-30s", store.terminals.last().terminal?.reason)
+        assertEquals(2L, adapter.snapshot().unknownQueries)
+        assertEquals(1, camera.requests.size)
+        assertEquals(0, adapter.snapshot().running)
     }
 
     @Test
@@ -359,7 +401,7 @@ class NativeCaptureAdapterV2Test {
     }
 
     @Test
-    fun `every lifecycle event fences pre-output ownership and late components close`() {
+    fun `every lifecycle event transfers post-exposure ownership as unknown and late components close`() {
         CaptureLifecycleEvent.entries.forEachIndexed { index, event ->
             val store = FakeStore()
             val camera = FakeExposure()
@@ -375,7 +417,9 @@ class NativeCaptureAdapterV2Test {
                 assertEquals(CaptureTerminalKind.COMMITTED_PICTURE, store.terminals.single().terminal?.kind)
                 return@forEachIndexed
             }
-            assertTrue(store.terminals.isNotEmpty())
+            assertTrue(store.terminals.isEmpty())
+            assertTrue(store.queries.contains(request.accepted.identity))
+            assertTrue(camera.cancellations.contains(qualifier))
             val late = CloseTrackingInputStream(byteArrayOf(1))
             camera.callback!!.onComponents(SharedCameraComponentSetV2(qualifier, listOf(
                 CaptureComponentStreamV2(CaptureComponentKind.JPEG, late),
@@ -396,7 +440,8 @@ class NativeCaptureAdapterV2Test {
         adapter.admit(waiting)
         adapter.onLifecycle(CaptureLifecycleEvent.BACKGROUNDED)
         assertEquals(1, camera.requests.size)
-        assertEquals(2, store.terminals.count { it.terminal?.kind == CaptureTerminalKind.ABANDONED_ATTEMPT })
+        assertEquals(1, store.terminals.count { it.terminal?.kind == CaptureTerminalKind.ABANDONED_ATTEMPT })
+        assertEquals(1, store.queries.size)
         assertEquals(0, adapter.snapshot().running)
         assertEquals(0, adapter.snapshot().fundedWaiting)
     }
@@ -411,7 +456,8 @@ class NativeCaptureAdapterV2Test {
         adapter.admit(automatic)
         adapter.admit(manual)
         adapter.close()
-        assertEquals(2, store.terminals.count { it.terminal?.kind == CaptureTerminalKind.ABANDONED_ATTEMPT })
+        assertEquals(1, store.terminals.count { it.terminal?.kind == CaptureTerminalKind.ABANDONED_ATTEMPT })
+        assertEquals(1, store.queries.size)
         assertEquals(0, adapter.snapshot().running)
         assertEquals(0, adapter.snapshot().fundedWaiting)
 
@@ -431,7 +477,7 @@ class NativeCaptureAdapterV2Test {
             CaptureAttemptIdentity("attempt-$ordinal-${lane.name}", "commit-$ordinal-${lane.name}", ordinal, cut),
             lane,
             CaptureComponentProfile("profile-${kinds.joinToString()}", kinds, 1024, 1024),
-            CaptureReservationLiability(0, 1024, kinds.size.toLong(), 1, 0, true),
+            CaptureReservationLiability(1024, 1024, kinds.size.toLong(), 1, 0, true),
             digest("intent-$ordinal"), digest("accepted-$ordinal"),
         )
         val components = kinds.sortedBy { it.ordinal }.map { kind ->
@@ -443,11 +489,12 @@ class NativeCaptureAdapterV2Test {
 
     private class FakeExposure : SharedCameraExposurePortV2 {
         val requests = mutableListOf<Pair<CaptureAttemptQualifierV2, Set<CaptureComponentKind>>>()
+        val cancellations = mutableListOf<CaptureAttemptQualifierV2>()
         var callback: SharedCameraExposureCallbackV2? = null
         override fun requestExposure(qualifier: CaptureAttemptQualifierV2, required: Set<CaptureComponentKind>, callback: SharedCameraExposureCallbackV2): Boolean {
             requests += qualifier to required; this.callback = callback; return true
         }
-        override fun cancelExposure(qualifier: CaptureAttemptQualifierV2) = Unit
+        override fun cancelExposure(qualifier: CaptureAttemptQualifierV2) { cancellations += qualifier }
         fun components(qualifier: CaptureAttemptQualifierV2, request: CaptureCommitRequest, order: List<CaptureComponentKind>): List<CloseTrackingInputStream> {
             val sources = order.map { CloseTrackingInputStream(bytes(it)) }
             callback!!.onComponents(SharedCameraComponentSetV2(qualifier, order.zip(sources).map { (kind, source) ->

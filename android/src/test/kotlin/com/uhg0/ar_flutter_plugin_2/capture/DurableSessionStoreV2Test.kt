@@ -321,6 +321,33 @@ class DurableSessionStoreV2Test {
         assertThrows(IllegalStateException::class.java) { budget.reservedBytes() }
     }
 
+    @Test fun `startup recovery projects only the two newest exact durable outcomes`() {
+        val root = directory(); val budget = budget(root); val store = store(root, budget)
+        val oldest = request("projection-old", "projection-old-attempt", "old".toByteArray())
+        store.acceptBeforeExposure(oldest.accepted)
+        store.commitStreamed(oldest, streams("old".toByteArray()))
+        Thread.sleep(2)
+        val committed = request("projection-commit", "projection-commit-attempt", "new".toByteArray())
+        store.acceptBeforeExposure(committed.accepted)
+        val committedReceipt = store.commitStreamed(committed, streams("new".toByteArray()))
+        Thread.sleep(2)
+        val acceptedOnly = request("projection-accepted", "projection-accepted-attempt", "lost".toByteArray())
+        store.acceptBeforeExposure(acceptedOnly.accepted)
+
+        val projections = store.recoverAndProject(limit = 2)
+
+        assertEquals(2, projections.size)
+        assertEquals(setOf(committed.accepted.identity.attemptId, acceptedOnly.accepted.identity.attemptId), projections.map { it.attemptId }.toSet())
+        val projectedCommit = projections.single { it.attemptId == committed.accepted.identity.attemptId }
+        assertEquals(CaptureTerminalKind.COMMITTED_PICTURE, projectedCommit.kind)
+        assertEquals(committedReceipt.terminal!!.captureId, projectedCommit.captureId)
+        assertEquals(committedReceipt.terminal!!.manifestId, projectedCommit.manifestId)
+        val projectedAbsent = projections.single { it.attemptId == acceptedOnly.accepted.identity.attemptId }
+        assertEquals(CaptureTerminalKind.ABANDONED_ATTEMPT, projectedAbsent.kind)
+        assertEquals("recovered-proven-absent", projectedAbsent.reason)
+        store.close(); budget.close()
+    }
+
     private fun request(commit: String, attempt: String, jpeg: ByteArray, session: String = "session-1"): CaptureCommitRequest {
         val identity = CaptureAttemptIdentity(attempt, commit, 1, CaptureLifecycleCut(session, 1, "group-1", 1, "ar-1", "view-1", 1, "binding-1", 1, 1))
         val profile = CaptureComponentProfile("jpeg", setOf(CaptureComponentKind.JPEG), 64, 64)

@@ -4,10 +4,14 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CaptureAttemptOwnerTest {
+    private data class Qualified(val id: String)
+
     @Test
     fun `two barrier synchronized callers admit exactly one owner`() {
         val owner = CaptureAttemptOwner<String>()
@@ -32,5 +36,21 @@ class CaptureAttemptOwnerTest {
 
         assertEquals(1, admitted.size)
         assertEquals(admitted.single(), owner.get())
+    }
+
+    @Test
+    fun `exact production cancellation releases owner and permits later success`() {
+        val owner = QualifiedCaptureAttemptOwnerV2<Qualified, String>(Qualified::id)
+        val first = Qualified("first")
+        assertTrue(owner.acquire(first))
+        assertNull(owner.cancel("stale"))
+        assertEquals(first, owner.get())
+        assertEquals(first, owner.cancel("first"))
+        assertNull(owner.get())
+
+        val later = Qualified("later")
+        assertTrue(owner.acquire(later))
+        assertFalse(owner.acquire(Qualified("blocked")))
+        assertEquals(later, owner.get())
     }
 }

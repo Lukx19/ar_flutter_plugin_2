@@ -3,6 +3,8 @@ package com.uhg0.ar_flutter_plugin_2.capture
 import android.content.Context
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityCaptureSafePredicate
 import java.io.InputStream
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -158,6 +160,34 @@ internal class NativeCaptureBindingV2(
     private val adapter = NativeCaptureAdapterV2(
         DurableNativeCaptureStorePortV2(store), bridge, safety, nowMs, events,
     )
+    private val deadlineScheduler = Executors.newSingleThreadScheduledExecutor { runnable ->
+        Thread(runnable, "capture3d-v2-deadline").apply { isDaemon = true }
+    }.apply {
+        scheduleAtFixedRate(
+            { runCatching { adapter.advanceDeadlines() } },
+            1,
+            1,
+            TimeUnit.SECONDS,
+        )
+    }
+    init {
+        store.recoverAndProject().forEach { recovered ->
+            events(
+                NativeCaptureEventV2(
+                    kind = when (recovered.kind) {
+                        CaptureTerminalKind.COMMITTED_PICTURE -> NativeCaptureEventKindV2.COMMITTED
+                        CaptureTerminalKind.ABANDONED_ATTEMPT -> NativeCaptureEventKindV2.ABANDONED
+                        null -> NativeCaptureEventKindV2.RECOVERING
+                    },
+                    attemptId = recovered.attemptId,
+                    captureId = recovered.captureId,
+                    captureRevision = recovered.captureRevision,
+                    manifestId = recovered.manifestId,
+                    reason = recovered.reason,
+                ),
+            )
+        }
+    }
 
     fun attachSharedCamera(manager: SharedCameraManager) = synchronized(lock) {
         check(!closed) { "NativeCaptureBindingV2 is closed" }
@@ -187,6 +217,7 @@ internal class NativeCaptureBindingV2(
     override fun close() = synchronized(lock) {
         if (closed) return@synchronized
         closed = true
+        deadlineScheduler.shutdownNow()
         adapter.onLifecycle(CaptureLifecycleEvent.VIEW_REPLACED)
         adapter.close()
         sharedCamera = null
@@ -285,6 +316,8 @@ internal class NativeCaptureAdapterV2(
         val acceptedReceipt: CaptureReceipt,
         val acceptedAtMs: Long,
         val qualifier: CaptureAttemptQualifierV2,
+        var exposureRequested: Boolean = false,
+        var tenSecondPresented: Boolean = false,
     )
     private val lock = Any()
     private val scheduler = CaptureFinalizerScheduler()
@@ -297,10 +330,13 @@ internal class NativeCaptureAdapterV2(
     fun admit(request: CaptureCommitRequest): CaptureReceipt = synchronized(lock) {
         check(!closed) { "NativeCaptureAdapterV2 is closed" }
         val accepted = request.accepted
-
+        validateReservationLiabilities(accepted)
         work[accepted.identity]?.let { active ->
             if (active.request == request) return@synchronized active.acceptedReceipt
             throw DurableStoreConflictV2("Changed replay conflicts with active capture identity")
+        }
+        check(work.values.none { it.request.accepted.lane == accepted.lane }) {
+            "lane-capacity-${accepted.lane.name.lowercase()}"
         }
         store.replayFenceBeforeExposure(request)?.let { replay ->
             if (replay.terminal != null) return@synchronized replay
@@ -362,11 +398,11 @@ internal class NativeCaptureAdapterV2(
                         value.request.accepted.lane == CaptureLane.AUTOMATIC &&
                         scheduler.running?.identity != value.request.accepted.identity
                     ) abandonLocked(value.request, "automatic-disabled-waiting")
-                    CaptureLifecycleEvent.ROUTE_LEFT -> abandonLocked(value.request, "route-left")
-                    CaptureLifecycleEvent.VIEW_REPLACED -> abandonLocked(value.request, "view-replaced")
-                    CaptureLifecycleEvent.AR_SESSION_REPLACED -> abandonLocked(value.request, "ar-session-replaced")
-                    CaptureLifecycleEvent.BACKGROUNDED -> abandonLocked(value.request, "backgrounded")
-                    CaptureLifecycleEvent.PROCESS_RESTARTED -> queryOrAbandonLocked(value, "process-restarted")
+                    CaptureLifecycleEvent.ROUTE_LEFT -> lifecycleTransferLocked(value, "route-left")
+                    CaptureLifecycleEvent.VIEW_REPLACED -> lifecycleTransferLocked(value, "view-replaced")
+                    CaptureLifecycleEvent.AR_SESSION_REPLACED -> lifecycleTransferLocked(value, "ar-session-replaced")
+                    CaptureLifecycleEvent.BACKGROUNDED -> lifecycleTransferLocked(value, "backgrounded")
+                    CaptureLifecycleEvent.PROCESS_RESTARTED -> lifecycleTransferLocked(value, "process-restarted")
                 }
             }
         } finally {
@@ -386,10 +422,11 @@ internal class NativeCaptureAdapterV2(
         val now = nowMs()
         work.values.toList().forEach { value ->
             val elapsed = now - value.acceptedAtMs
-            if (value.request.accepted.lane == CaptureLane.AUTOMATIC && elapsed >= AUTOMATIC_STALL_MS) {
-                abandonLocked(value.request, "automatic-stall-10s")
-            } else if (elapsed >= TERMINAL_FENCE_MS) {
+            if (elapsed >= TERMINAL_FENCE_MS) {
                 queryOrAbandonLocked(value, "terminal-fence-30s")
+            } else if (elapsed >= AUTOMATIC_STALL_MS && !value.tenSecondPresented) {
+                value.tenSecondPresented = true
+                presentUnknownLocked(value, "terminal-presentation-10s")
             }
         }
     }
@@ -410,7 +447,10 @@ internal class NativeCaptureAdapterV2(
     override fun close() = synchronized(lock) {
         if (closed) return@synchronized
         closed = true
-        work.values.toList().forEach { queryOrAbandonLocked(it, "shutdown") }
+        work.values.toList().forEach { value ->
+            if (value.exposureRequested) transferUnknownLocked(value, "shutdown-transfer")
+            else abandonLocked(value.request, "shutdown-before-exposure")
+        }
     }
 
     private fun startLocked(value: Work) {
@@ -418,6 +458,7 @@ internal class NativeCaptureAdapterV2(
         // Bind before submission: a fake or Camera2 bridge may complete on the
         // same stack. Binding afterwards would resurrect a stale true signal.
         safety.bind(value.qualifier, value.acceptedReceipt)
+        value.exposureRequested = true
         val requested = try {
             exposure.requestExposure(value.qualifier, value.request.accepted.profile.requiredComponents, callback)
         } catch (_: Throwable) {
@@ -430,6 +471,7 @@ internal class NativeCaptureAdapterV2(
             return
         }
         if (!requested) {
+            value.exposureRequested = false
             safety.release(value.qualifier)
             abandonLocked(value.request, "exposure-request-rejected")
             return
@@ -490,6 +532,33 @@ internal class NativeCaptureAdapterV2(
         abandonLocked(value.request, reason)
     }
 
+    private fun presentUnknownLocked(value: Work, reason: String) {
+        events(
+            NativeCaptureEventV2(
+                NativeCaptureEventKindV2.RECOVERING,
+                value.request.accepted.identity.attemptId,
+                reason = reason,
+            ),
+        )
+        counters.unknownQuery()
+        store.queryReceipt(value.request.accepted.identity)?.takeIf { it.terminal != null }
+            ?.let { finishLocked(value, it) }
+    }
+
+    private fun lifecycleTransferLocked(value: Work, reason: String) {
+        if (value.exposureRequested) transferUnknownLocked(value, "$reason-transfer")
+        else abandonLocked(value.request, "$reason-before-exposure")
+    }
+
+    private fun transferUnknownLocked(value: Work, reason: String) {
+        presentUnknownLocked(value, reason)
+        if (work[value.request.accepted.identity] !== value) return
+        exposure.cancelExposure(value.qualifier)
+        safety.release(value.qualifier)
+        work.remove(value.request.accepted.identity)
+        scheduler.release(value.request.accepted.identity)
+    }
+
     private fun abandonLocked(request: CaptureCommitRequest, reason: String): CaptureReceipt {
         val accepted = request.accepted
         val terminal = CaptureTerminal(CaptureTerminalKind.ABANDONED_ATTEMPT, accepted.identity, reason, reason)
@@ -526,6 +595,16 @@ internal class NativeCaptureAdapterV2(
     private fun closeStreams(streams: List<CaptureComponentStreamV2>) {
         streams.forEach { runCatching { it.input.close() } }
         counters.componentsClosed(streams.size)
+    }
+
+    private fun validateReservationLiabilities(accepted: CaptureAcceptedAttempt) {
+        val profile = accepted.profile
+        val reservation = accepted.reservation
+        require(reservation.physicallyBacked) { "reservation-not-physical" }
+        require(reservation.memoryBytes >= profile.maximumWorkingBytes) { "reservation-memory-underfunded" }
+        require(reservation.physicalStoreBytes >= profile.maximumComponentBytes) { "reservation-store-underfunded" }
+        require(reservation.componentEntries == profile.requiredComponents.size.toLong()) { "reservation-component-ledger" }
+        require(reservation.terminalEntries == 1L) { "reservation-terminal-ledger" }
     }
 
     private companion object {

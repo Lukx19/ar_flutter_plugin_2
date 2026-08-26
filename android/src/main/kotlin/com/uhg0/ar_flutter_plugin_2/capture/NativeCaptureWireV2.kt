@@ -52,7 +52,15 @@ internal object NativeCaptureWireV2 {
             reservation = decodeReservation(map.getValue("reservation")),
             canonicalIntentHash = map.digest("canonicalIntentHash"),
             acceptedReceiptHash = map.digest("acceptedReceiptHash"),
-        )
+        ).also { accepted ->
+            val reservation = accepted.reservation
+            val profile = accepted.profile
+            require(reservation.physicallyBacked)
+            require(reservation.memoryBytes >= profile.maximumWorkingBytes)
+            require(reservation.physicalStoreBytes >= profile.maximumComponentBytes)
+            require(reservation.componentEntries == profile.requiredComponents.size.toLong())
+            require(reservation.terminalEntries == 1L)
+        }
     }
 
     private fun decodeIdentity(value: Any?): CaptureAttemptIdentity {

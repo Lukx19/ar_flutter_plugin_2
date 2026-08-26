@@ -35,6 +35,14 @@ class DurableSessionStoreV2(
     private val faults: DurableStoreFaultInjectorV2 = DurableStoreFaultInjectorV2 { },
     filesystemBackend: DescriptorFilesystemV2 = AndroidDescriptorFilesystemV2(),
 ) : CaptureCommitPort, AutoCloseable {
+    internal data class RecoveryProjectionV2(
+        val attemptId: String,
+        val kind: CaptureTerminalKind?,
+        val captureId: String? = null,
+        val captureRevision: Long? = null,
+        val manifestId: String? = null,
+        val reason: String,
+    )
     private val mutex = Any()
     private val files = SafeFilesystemV2(root, faults, filesystemBackend)
     private val sessionRoot = files.child("sessions")
@@ -385,6 +393,52 @@ class DurableSessionStoreV2(
                 }
             }
         }
+    }
+
+    /** Bounded startup projection for the per-view owner after durable repair. */
+    internal fun recoverAndProject(limit: Int = 2): List<RecoveryProjectionV2> = synchronized(mutex) {
+        require(limit in 1..2)
+        recover()
+        files.list(sessionRoot)
+            .filter(File::isDirectory)
+            .flatMap { session ->
+                files.walk(session)
+                    .filter { it.name == "accepted.properties" }
+                    .map { accepted -> session to accepted }
+            }
+            .sortedByDescending { (_, accepted) -> accepted.lastModified() }
+            .take(limit)
+            .map { (session, accepted) ->
+                val acceptedValues = readProperties(accepted)
+                val attemptId = acceptedValues.getProperty("attemptId")
+                    ?: throw DurableStoreConflictV2("Recovered acceptance has no attempt identity")
+                val receiptPath = path(requireNotNull(accepted.parentFile), "receipt.properties")
+                if (!files.isFile(receiptPath)) {
+                    RecoveryProjectionV2(attemptId, null, reason = "recovered-accepted-unknown")
+                } else {
+                    val value = readProperties(receiptPath)
+                    if (value.getProperty("kind") == CaptureTerminalKind.COMMITTED_PICTURE.name &&
+                        value.getProperty("rootHash") in retainedRootHashes(session)
+                    ) {
+                        RecoveryProjectionV2(
+                            attemptId,
+                            CaptureTerminalKind.COMMITTED_PICTURE,
+                            value.getProperty("captureId"),
+                            value.getProperty("revision").toLong(),
+                            value.getProperty("rootHash"),
+                            "recovered-committed",
+                        )
+                    } else if (value.getProperty("kind") == CaptureTerminalKind.ABANDONED_ATTEMPT.name) {
+                        RecoveryProjectionV2(
+                            attemptId,
+                            CaptureTerminalKind.ABANDONED_ATTEMPT,
+                            reason = value.getProperty("reason", "recovered-abandoned"),
+                        )
+                    } else {
+                        RecoveryProjectionV2(attemptId, null, reason = "recovered-receipt-unknown")
+                    }
+                }
+            }
     }
 
     private fun location(identity: CaptureAttemptIdentity): File = files.child("sessions", safe(identity.lifecycleCut.sessionId)).also(files::ensureDirectory)

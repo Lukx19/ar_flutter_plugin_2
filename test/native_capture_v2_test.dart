@@ -47,6 +47,7 @@ void main() {
       'captureId': 'capture',
       'captureRevision': 2,
       'manifestId': 'manifest',
+      'reason': 'committed',
     });
     expect(committed.isTerminal, isTrue);
     expect(committed.captureRevision, 2);
@@ -84,6 +85,38 @@ void main() {
         'wireVersion': nativeCaptureV2WireVersion,
         'kind': 'health',
         'health': _health(exposures: 1.5),
+      }),
+      throwsFormatException,
+    );
+  });
+
+  test('event union enforces exact keys and scalar types per kind', () {
+    expect(
+      () => ARNativeCaptureEventV2.fromMap({
+        'wireVersion': nativeCaptureV2WireVersion,
+        'kind': 'accepted',
+        'attemptId': 'attempt',
+        'reason': 'not-allowed',
+      }),
+      throwsFormatException,
+    );
+    expect(
+      () => ARNativeCaptureEventV2.fromMap({
+        'wireVersion': nativeCaptureV2WireVersion,
+        'kind': 'recovering',
+        'attemptId': 'attempt',
+      }),
+      throwsFormatException,
+    );
+    expect(
+      () => ARNativeCaptureEventV2.fromMap({
+        'wireVersion': nativeCaptureV2WireVersion,
+        'kind': 'committed',
+        'attemptId': 'attempt',
+        'captureId': 'capture',
+        'captureRevision': 1.0,
+        'manifestId': 'manifest',
+        'reason': 'committed',
       }),
       throwsFormatException,
     );

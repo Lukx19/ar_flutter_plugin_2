@@ -18,8 +18,12 @@ class RawJpegCaptureCorrelatorTest {
             )
         assertEquals(6, permutations.size)
         permutations.forEach { order ->
-            val correlator = RawJpegCaptureCorrelator<String, String>({})
-            var completed: CorrelatedRawJpegCapture<String, String>? = null
+            val correlator = RawJpegCaptureCorrelator<PendingStillImagePayload, String, String>(
+                PendingStillImagePayload::sensorTimestampNs,
+                {},
+                {},
+            )
+            var completed: CorrelatedRawJpegCapture<PendingStillImagePayload, String, String>? = null
             order.forEachIndexed { index, component ->
                 val value =
                     when (component) {
@@ -40,7 +44,11 @@ class RawJpegCaptureCorrelatorTest {
     @Test
     fun `clear closes unmatched raw component`() {
         val closed = mutableListOf<String>()
-        val correlator = RawJpegCaptureCorrelator<String, String>(closed::add)
+        val correlator = RawJpegCaptureCorrelator<PendingStillImagePayload, String, String>(
+            PendingStillImagePayload::sensorTimestampNs,
+            {},
+            closed::add,
+        )
         correlator.onRaw(42L, "raw-data")
 
         correlator.clear()
