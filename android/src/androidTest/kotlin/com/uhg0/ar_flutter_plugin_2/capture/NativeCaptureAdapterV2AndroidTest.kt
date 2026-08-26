@@ -3,6 +3,7 @@ package com.uhg0.ar_flutter_plugin_2.capture
 import android.graphics.SurfaceTexture
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import android.view.Surface
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -11,6 +12,7 @@ import io.flutter.plugin.common.MethodChannel
 import java.io.InputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -24,72 +26,111 @@ class NativeCaptureAdapterV2AndroidTest {
     fun perViewBindingDrainsAndFencesLateComponents() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val callbackThread = HandlerThread("native-capture-v2-test").apply { start() }
-        val flutterEngine = FlutterEngine(context)
-        val texture = SurfaceTexture(0)
-        val surface = Surface(texture)
         val signal = CaptureSafetySignalV2()
-        val binding = NativeCaptureBindingV2(context, signal)
-        val manager = SharedCameraManager(
-            context = context,
-            methodChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "native-capture-v2-test"),
-            session = null,
-            cameraTextureIds = { intArrayOf() },
-            prepareSessionResume = {},
-            scenePreviewSurface = surface,
-            configMap = mapOf("resolution" to mapOf("width" to 128, "height" to 128), "format" to "jpeg"),
-        )
-        binding.attachSharedCamera(manager)
         val callbacks = mutableListOf<Pair<CaptureAttemptQualifierV2, SharedCameraExposureCallbackV2>>()
-        binding.installSyntheticExposureHookForTest(request = { qualifier, _, callback ->
-            callbacks += qualifier to callback
-            true
-        })
-        val runId = System.nanoTime().toString()
-
+        var flutterEngine: FlutterEngine? = null
+        var texture: SurfaceTexture? = null
+        var surface: Surface? = null
+        var binding: NativeCaptureBindingV2? = null
+        var manager: SharedCameraManager? = null
+        var mainResourcesClosed = false
         try {
+            onMain {
+                assertTrue(Looper.myLooper() === Looper.getMainLooper())
+                flutterEngine = FlutterEngine(context)
+                texture = SurfaceTexture(0)
+                surface = Surface(checkNotNull(texture))
+                binding = NativeCaptureBindingV2(context, signal)
+                manager = SharedCameraManager(
+                    context = context,
+                    methodChannel = MethodChannel(checkNotNull(flutterEngine).dartExecutor.binaryMessenger, "native-capture-v2-test"),
+                    session = null,
+                    cameraTextureIds = { intArrayOf() },
+                    prepareSessionResume = {},
+                    scenePreviewSurface = checkNotNull(surface),
+                    configMap = mapOf("resolution" to mapOf("width" to 128, "height" to 128), "format" to "jpeg"),
+                )
+                checkNotNull(binding).attachSharedCamera(checkNotNull(manager))
+                checkNotNull(binding).installSyntheticExposureHookForTest(request = { qualifier, _, callback ->
+                    assertTrue(Looper.myLooper() === Looper.getMainLooper())
+                    callbacks += qualifier to callback
+                    true
+                })
+            }
+            val activeBinding = checkNotNull(binding)
+            val activeManager = checkNotNull(manager)
+            val runId = System.nanoTime().toString()
             val paused = request("$runId-paused")
-            binding.admit(paused)
+            onMain { activeBinding.admit(paused) }
             val pausedOwner = callbacks.single()
-            binding.onPause()
-            manager.onArSessionPaused()
-            assertFalse(signal.isCaptureSafe())
-            assertEquals(1L, binding.snapshot().abandoned)
+            val pausedSnapshot = onMainValue {
+                activeBinding.onPause()
+                activeManager.onArSessionPaused()
+                assertFalse(signal.isCaptureSafe())
+                activeBinding.snapshot()
+            }
+            assertEquals(1L, pausedSnapshot.abandoned)
             val lateAfterPause = TrackingInput("jpeg".toByteArray())
             postComponents(callbackThread, pausedOwner, lateAfterPause)
             assertEquals(1, lateAfterPause.closeCalls)
 
             val later = request("$runId-later")
-            binding.admit(later)
+            onMain { activeBinding.admit(later) }
             val laterOwner = callbacks.last()
             val successful = TrackingInput("jpeg".toByteArray())
             postComponents(callbackThread, laterOwner, successful)
             assertEquals(1, successful.closeCalls)
-            assertEquals(1L, binding.snapshot().committed)
-            assertEquals(0, binding.snapshot().running)
-            assertEquals(0, binding.snapshot().fundedWaiting)
+            val laterSnapshot = onMainValue(activeBinding::snapshot)
+            assertEquals(1L, laterSnapshot.committed)
+            assertEquals(0, laterSnapshot.running)
+            assertEquals(0, laterSnapshot.fundedWaiting)
 
             val disposed = request("$runId-disposed")
-            binding.admit(disposed)
+            onMain { activeBinding.admit(disposed) }
             val disposedOwner = callbacks.last()
-            binding.close()
-            manager.cleanup()
-            manager.finishCameraShutdown(1_000L)
-            assertFalse(signal.isCaptureSafe())
+            onMain {
+                activeBinding.close()
+                activeBinding.detachSharedCamera(activeManager)
+                activeManager.cleanup()
+                activeManager.finishCameraShutdown(1_000L)
+                assertFalse(signal.isCaptureSafe())
+                checkNotNull(surface).release()
+                checkNotNull(texture).release()
+                checkNotNull(flutterEngine).destroy()
+                mainResourcesClosed = true
+            }
             val lateAfterDispose = TrackingInput("jpeg".toByteArray())
             postComponents(callbackThread, disposedOwner, lateAfterDispose)
             assertEquals(1, lateAfterDispose.closeCalls)
-            assertEquals(2L, binding.snapshot().lateCallbacks)
-            assertEquals(2L, binding.snapshot().abandoned)
+            val disposedSnapshot = onMainValue(activeBinding::snapshot)
+            assertEquals(2L, disposedSnapshot.lateCallbacks)
+            assertEquals(2L, disposedSnapshot.abandoned)
             // Snapshot is the only outward V2 projection and is scalar metadata.
             assertEquals(0, CaptureResourceSnapshotV2::class.java.declaredFields.count { it.type == ByteArray::class.java })
         } finally {
-            runCatching { binding.close() }
-            surface.release()
-            texture.release()
-            flutterEngine.destroy()
+            if (!mainResourcesClosed) onMain {
+                runCatching { binding?.close() }
+                manager?.let { current -> runCatching { binding?.detachSharedCamera(current) } }
+                runCatching { manager?.cleanup() }
+                runCatching { manager?.finishCameraShutdown(1_000L) }
+                runCatching { surface?.release() }
+                runCatching { texture?.release() }
+                runCatching { flutterEngine?.destroy() }
+                mainResourcesClosed = true
+            }
             callbackThread.quitSafely()
             callbackThread.join(5_000L)
         }
+    }
+
+    private fun onMain(block: () -> Unit) {
+        InstrumentationRegistry.getInstrumentation().runOnMainSync { block() }
+    }
+
+    private fun <T : Any> onMainValue(block: () -> T): T {
+        val value = AtomicReference<T>()
+        onMain { value.set(block()) }
+        return checkNotNull(value.get())
     }
 
     private fun postComponents(
