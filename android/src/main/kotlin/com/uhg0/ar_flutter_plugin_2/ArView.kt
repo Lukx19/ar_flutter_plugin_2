@@ -37,6 +37,7 @@ import com.uhg0.ar_flutter_plugin_2.visibilitygrid.AndroidVisibilityGridRuntime
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.ArCoreVisibilityObservationSource
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityObservationDebugChannel
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityObservationDebugGate
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityCaptureSafePredicate
 import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineAuthority
 import com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraCapabilityQuerier
 import io.flutter.FlutterInjector
@@ -129,6 +130,8 @@ internal class ArView(
     private val visibilityObservationRuntime = AndroidVisibilityGridRuntime(
         ownership = visibilityGridV2Binding::currentObservationOwnership,
         mapper = visibilityObservationMappingAdmission,
+        // #61 will own positive capture-safety proof. M2 must default false.
+        captureSafe = VisibilityCaptureSafePredicate.CONSERVATIVE,
     )
     private val visibilityObservationSource = ArCoreVisibilityObservationSource(
         runtime = visibilityObservationRuntime,

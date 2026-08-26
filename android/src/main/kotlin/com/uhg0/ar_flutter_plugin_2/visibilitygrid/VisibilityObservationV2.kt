@@ -215,7 +215,24 @@ internal interface VisibilityObservationMapper : AutoCloseable {
 
     fun admitDepth(observation: VisibilityDepthObservation)
 
+    /** Fences retained observations before a replacement ownership cut admits. */
+    fun rollover(ownership: VisibilityObservationOwnership) = Unit
+
     fun snapshot(): VisibilityMappingAdmissionHealth = VisibilityMappingAdmissionHealth.empty()
 
     override fun close() = Unit
+}
+
+/**
+ * Proof that reduced-rate map intake cannot interfere with capture.
+ *
+ * M2 cannot establish capture ownership (#61), so production uses the
+ * conservative false implementation until that owner supplies this predicate.
+ */
+internal fun interface VisibilityCaptureSafePredicate {
+    fun isCaptureSafe(): Boolean
+
+    companion object {
+        val CONSERVATIVE = VisibilityCaptureSafePredicate { false }
+    }
 }

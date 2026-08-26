@@ -25,11 +25,14 @@ internal class AndroidVisibilityGridRuntime(
     callbackCopySampleCapacity: Int = 256,
     private val callbackCopyBudgetNs: Long = 2_000_000L,
     private val callbackCopyRecoveryNs: Long = 30_000_000_000L,
+    private val captureSafe: VisibilityCaptureSafePredicate =
+        VisibilityCaptureSafePredicate.CONSERVATIVE,
 ) : AutoCloseable {
     private val lock = Any()
     private val lifecycleLock = ReentrantReadWriteLock()
     private var closed = false
     private var paused = false
+    private var pausedOwnership: VisibilityObservationOwnership? = null
     private var featureLastCopiedTimestampNs = Long.MIN_VALUE
     private var depthLastCopiedTimestampNs = Long.MIN_VALUE
     private var featureLastCopyAttemptTimestampNs = Long.MIN_VALUE
@@ -64,11 +67,15 @@ internal class AndroidVisibilityGridRuntime(
     private var callbackCopyBudgetBreaches = 0L
     private var callbackCopyBudgetRecoveries = 0L
     private var callbackCopyDepthSheds = 0L
+    private var callbackCopyFeatureSheds = 0L
     private var lastCallbackCopyBudgetBreachNs = Long.MIN_VALUE
     private var pausedObservationRejections = 0L
     private var lifecycleDiscardedObservations = 0L
     private var pauseCount = 0L
     private var resumeCount = 0L
+    private var sameCutResumeCount = 0L
+    private var ownershipRolloverCount = 0L
+    private var rolloverDiscardedIngressObservations = 0L
     private var admittedBindingGeneration = 0L
     private var admittedSessionGeneration = 0L
     private var admittedGroupGeneration = 0L
@@ -122,14 +129,23 @@ internal class AndroidVisibilityGridRuntime(
     fun isSyntheticSource(): Boolean = synchronized(lock) { syntheticSource }
 
     fun featureSampleCapacity(): Int = synchronized(lock) {
-        if (callbackCopyBudgetDegraded) 1_000 else V2_FEATURE_SAMPLE_CAPACITY
+        when {
+            !callbackCopyBudgetDegraded -> V2_FEATURE_SAMPLE_CAPACITY
+            isCaptureSafe() -> 1_000
+            else -> 0
+        }
     }
 
     fun shouldCopyFeature(timestampNs: Long): Boolean = synchronized(lock) {
+        if (callbackCopyBudgetDegraded && !isCaptureSafe()) return@synchronized false
         claimCopy(
             timestampNs,
             featureLastCopyAttemptTimestampNs,
-            if (callbackCopyBudgetDegraded) maxOf(featureIntervalNs, 500_000_000L)
+            if (callbackCopyBudgetDegraded && isCaptureSafe()) {
+                maxOf(featureIntervalNs, SEVERE_FEATURE_INTERVAL_NS)
+            } else if (callbackCopyBudgetDegraded) {
+                Long.MAX_VALUE
+            }
             else featureIntervalNs,
         ).also {
             if (it) featureLastCopyAttemptTimestampNs = timestampNs
@@ -153,7 +169,8 @@ internal class AndroidVisibilityGridRuntime(
                 return false
             }
             if (closed || !isStructurallyValid(observation) ||
-                observation.samples.size > featureSampleCapacity()
+                observation.samples.size > featureSampleCapacity() ||
+                (callbackCopyBudgetDegraded && !isCaptureSafe())
             ) {
                 invalidFeatureObservations++
                 return false
@@ -259,17 +276,41 @@ internal class AndroidVisibilityGridRuntime(
         synchronized(lock) {
             if (closed || paused) return
             paused = true
+            pausedOwnership = ownership()
             pauseCount++
         }
         val discarded = featureLane.pauseAndDiscard() + depthLane.pauseAndDiscard()
         synchronized(lock) { lifecycleDiscardedObservations += discarded }
     }
 
-    /** Restores acquisition only while an exact current V2 ownership cut exists. */
-    fun resume(): Boolean = synchronized(lock) {
-        if (closed || ownership() == null) return false
-        if (paused) {
+    /** Resumes the exact paused cut, or fences and rolls over to its replacement. */
+    fun resume(): Boolean = lifecycleLock.write {
+        val current = ownership() ?: return@write false
+        val previous = synchronized(lock) {
+            if (closed) return@write false
+            if (!paused) return@write true
+            pausedOwnership
+        }
+        if (previous == current) {
+            synchronized(lock) { sameCutResumeCount++ }
+        } else {
+            val discarded = featureLane.pauseAndDiscard() + depthLane.pauseAndDiscard()
+            val ingressBefore = mapper.snapshot().residentObservations
+            mapper.rollover(current)
+            synchronized(lock) {
+                lifecycleDiscardedObservations += discarded
+                rolloverDiscardedIngressObservations += ingressBefore
+                ownershipRolloverCount++
+                featureLastCopiedTimestampNs = Long.MIN_VALUE
+                depthLastCopiedTimestampNs = Long.MIN_VALUE
+                featureLastCopyAttemptTimestampNs = Long.MIN_VALUE
+                depthLastCopyAttemptTimestampNs = Long.MIN_VALUE
+                recordOwnership(current)
+            }
+        }
+        synchronized(lock) {
             paused = false
+            pausedOwnership = null
             resumeCount++
         }
         true
@@ -300,19 +341,26 @@ internal class AndroidVisibilityGridRuntime(
             residentPayloadBytes = residentPayloadBytes,
             peakResidentPayloadBytes = peakResidentPayloadBytes,
             callbackCopyP95Ns = callbackCopySamples.p95(),
-            callbackCopyBudgetState = if (callbackCopyBudgetDegraded) {
-                "degradedDepthShedSteadyFeature"
+            callbackCopyBudgetState = if (callbackCopyBudgetDegraded && isCaptureSafe()) {
+                "severeDepthShedCaptureSafeFeature1Hz"
+            } else if (callbackCopyBudgetDegraded) {
+                "severeMapIntakePausedCaptureUnsafe"
             } else {
                 "withinBudget"
             },
             callbackCopyBudgetBreaches = callbackCopyBudgetBreaches,
             callbackCopyBudgetRecoveries = callbackCopyBudgetRecoveries,
             callbackCopyDepthSheds = callbackCopyDepthSheds,
+            callbackCopyFeatureSheds = callbackCopyFeatureSheds,
+            captureSafe = isCaptureSafe(),
             paused = paused,
             pausedObservationRejections = pausedObservationRejections,
             lifecycleDiscardedObservations = lifecycleDiscardedObservations,
             pauseCount = pauseCount,
             resumeCount = resumeCount,
+            sameCutResumeCount = sameCutResumeCount,
+            ownershipRolloverCount = ownershipRolloverCount,
+            rolloverDiscardedIngressObservations = rolloverDiscardedIngressObservations,
             admittedBindingGeneration = admittedBindingGeneration,
             admittedSessionGeneration = admittedSessionGeneration,
             admittedGroupGeneration = admittedGroupGeneration,
@@ -381,6 +429,7 @@ internal class AndroidVisibilityGridRuntime(
             if (!callbackCopyBudgetDegraded) {
                 callbackCopyBudgetDegraded = true
                 callbackCopyDepthSheds++
+                if (!isCaptureSafe()) callbackCopyFeatureSheds++
                 if (depthCapability != VisibilityDepthCapability.UNSUPPORTED) {
                     depthHealth = VisibilitySourceHealth.TRANSIENT_UNAVAILABLE
                 }
@@ -442,6 +491,13 @@ internal class AndroidVisibilityGridRuntime(
     companion object {
         const val TERMINAL_FAILURE_THRESHOLD = 3
         const val CALLBACK_COPY_BUDGET_NS = 2_000_000L
+        const val SEVERE_FEATURE_INTERVAL_NS = 1_000_000_000L
+    }
+
+    private fun isCaptureSafe(): Boolean = try {
+        captureSafe.isCaptureSafe()
+    } catch (_: RuntimeException) {
+        false
     }
 }
 
@@ -473,11 +529,16 @@ internal data class VisibilityObservationHealth(
     val callbackCopyBudgetBreaches: Long,
     val callbackCopyBudgetRecoveries: Long,
     val callbackCopyDepthSheds: Long,
+    val callbackCopyFeatureSheds: Long,
+    val captureSafe: Boolean,
     val paused: Boolean,
     val pausedObservationRejections: Long,
     val lifecycleDiscardedObservations: Long,
     val pauseCount: Long,
     val resumeCount: Long,
+    val sameCutResumeCount: Long,
+    val ownershipRolloverCount: Long,
+    val rolloverDiscardedIngressObservations: Long,
     val admittedBindingGeneration: Long,
     val admittedSessionGeneration: Long,
     val admittedGroupGeneration: Long,
@@ -529,11 +590,16 @@ internal data class VisibilityObservationHealth(
         "callbackCopyBudgetBreaches" to callbackCopyBudgetBreaches,
         "callbackCopyBudgetRecoveries" to callbackCopyBudgetRecoveries,
         "callbackCopyDepthSheds" to callbackCopyDepthSheds,
+        "callbackCopyFeatureSheds" to callbackCopyFeatureSheds,
+        "captureSafe" to captureSafe,
         "paused" to paused,
         "pausedObservationRejections" to pausedObservationRejections,
         "lifecycleDiscardedObservations" to lifecycleDiscardedObservations,
         "pauseCount" to pauseCount,
         "resumeCount" to resumeCount,
+        "sameCutResumeCount" to sameCutResumeCount,
+        "ownershipRolloverCount" to ownershipRolloverCount,
+        "rolloverDiscardedIngressObservations" to rolloverDiscardedIngressObservations,
         "admittedBindingGeneration" to admittedBindingGeneration,
         "admittedSessionGeneration" to admittedSessionGeneration,
         "admittedGroupGeneration" to admittedGroupGeneration,
@@ -559,6 +625,9 @@ internal class AndroidVisibilityGridMappingAdmission(
     private var replacedFeatures = 0L
     private var replacedDepths = 0L
     private var peakResidentBytes = 0L
+    private var rolloverCount = 0L
+    private var rolloverDiscardedObservations = 0L
+    private var rolloverOwnership: VisibilityObservationOwnership? = null
     private var lastReceipt: VisibilityMappingAdmissionReceipt? = null
 
     override fun admitFeature(observation: VisibilityFeatureObservation) {
@@ -587,6 +656,18 @@ internal class AndroidVisibilityGridMappingAdmission(
         }
     }
 
+    override fun rollover(ownership: VisibilityObservationOwnership) = synchronized(lock) {
+        check(this.ownership() == ownership) { "stale V2 mapping rollover" }
+        rolloverDiscardedObservations += (if (feature != null) 1 else 0) +
+            (if (depth != null) 1 else 0)
+        feature = null
+        depth = null
+        lastReceipt = null
+        rolloverOwnership = ownership
+        rolloverCount++
+        Unit
+    }
+
     override fun snapshot(): VisibilityMappingAdmissionHealth = synchronized(lock) {
         VisibilityMappingAdmissionHealth(
             admittedFeatures = admittedFeatures,
@@ -594,7 +675,14 @@ internal class AndroidVisibilityGridMappingAdmission(
             replacedFeatures = replacedFeatures,
             replacedDepths = replacedDepths,
             residentBytes = residentBytes(),
+            residentObservations = (if (feature != null) 1 else 0) +
+                (if (depth != null) 1 else 0),
             peakResidentBytes = peakResidentBytes,
+            rolloverCount = rolloverCount,
+            rolloverDiscardedObservations = rolloverDiscardedObservations,
+            rolloverBindingGeneration = rolloverOwnership?.bindingGeneration ?: 0,
+            rolloverGroupGeneration = rolloverOwnership?.groupGeneration ?: 0,
+            rolloverLifecycleSequence = rolloverOwnership?.lifecycleSequence ?: 0,
             lastReceipt = lastReceipt,
         )
     }
@@ -677,7 +765,13 @@ internal data class VisibilityMappingAdmissionHealth(
     val replacedFeatures: Long,
     val replacedDepths: Long,
     val residentBytes: Long,
+    val residentObservations: Int,
     val peakResidentBytes: Long,
+    val rolloverCount: Long,
+    val rolloverDiscardedObservations: Long,
+    val rolloverBindingGeneration: Long,
+    val rolloverGroupGeneration: Long,
+    val rolloverLifecycleSequence: Long,
     val lastReceipt: VisibilityMappingAdmissionReceipt?,
 ) {
     fun toWireMap(): Map<String, Any> = mapOf(
@@ -686,12 +780,20 @@ internal data class VisibilityMappingAdmissionHealth(
         "replacedFeatures" to replacedFeatures,
         "replacedDepths" to replacedDepths,
         "residentBytes" to residentBytes,
+        "residentObservations" to residentObservations,
         "peakResidentBytes" to peakResidentBytes,
+        "rolloverCount" to rolloverCount,
+        "rolloverDiscardedObservations" to rolloverDiscardedObservations,
+        "rolloverBindingGeneration" to rolloverBindingGeneration,
+        "rolloverGroupGeneration" to rolloverGroupGeneration,
+        "rolloverLifecycleSequence" to rolloverLifecycleSequence,
         "lastReceipt" to (lastReceipt?.toWireMap() ?: emptyMap<String, Any>()),
     )
 
     companion object {
-        fun empty() = VisibilityMappingAdmissionHealth(0, 0, 0, 0, 0, 0, null)
+        fun empty() = VisibilityMappingAdmissionHealth(
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, null,
+        )
     }
 }
 
