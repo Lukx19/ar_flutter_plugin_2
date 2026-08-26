@@ -105,6 +105,14 @@ tasks.withType(Test).configureEach {
 // for deterministic native adapter tests without bundling Flutter into the
 // plugin artifact itself.
 def flutterSdk = providers.gradleProperty('flutter.sdk').orNull ?: System.getenv('FLUTTER_ROOT')
+if (flutterSdk == null) {
+    def localPropertiesFile = rootProject.file('local.properties')
+    if (localPropertiesFile.exists()) {
+        def localProperties = new Properties()
+        localPropertiesFile.withInputStream { localProperties.load(it) }
+        flutterSdk = localProperties.getProperty('flutter.sdk')
+    }
+}
 if (flutterSdk != null) {
     def engineVersion = file("$flutterSdk/bin/cache/engine.stamp").text.trim()
     repositories {
@@ -113,5 +121,10 @@ if (flutterSdk != null) {
     dependencies {
         debugCompileOnly "io.flutter:flutter_embedding_debug:1.0.0-$engineVersion"
         testImplementation "io.flutter:flutter_embedding_debug:1.0.0-$engineVersion"
+        androidTestImplementation "io.flutter:flutter_embedding_debug:1.0.0-$engineVersion"
+        androidTestImplementation "io.flutter:armeabi_v7a_debug:1.0.0-$engineVersion"
+        androidTestImplementation "io.flutter:arm64_v8a_debug:1.0.0-$engineVersion"
+        androidTestImplementation "io.flutter:x86_debug:1.0.0-$engineVersion"
+        androidTestImplementation "io.flutter:x86_64_debug:1.0.0-$engineVersion"
     }
 }
