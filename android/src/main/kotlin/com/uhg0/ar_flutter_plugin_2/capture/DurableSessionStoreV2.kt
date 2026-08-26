@@ -20,13 +20,19 @@ class DurableSessionStoreV2(
     private val budget: StorageBudgetCoordinatorV2,
     private val faults: DurableStoreFaultInjectorV2 = DurableStoreFaultInjectorV2 { },
     filesystemBackend: DescriptorFilesystemV2 = AndroidDescriptorFilesystemV2(),
-) : CaptureCommitPort {
+) : CaptureCommitPort, AutoCloseable {
     private val mutex = Any()
     private val files = SafeFilesystemV2(root, faults, filesystemBackend)
     private val sessionRoot = files.child("sessions")
     private val uncertainRootHashes = mutableSetOf<String>()
 
-    init { files.ensureDirectory(sessionRoot) }
+    init {
+        try { files.ensureDirectory(sessionRoot) }
+        catch (error: Throwable) { files.close(); throw error }
+    }
+
+    /** Closes only this store's owned bound filesystem; the injected budget is borrowed. */
+    override fun close() = synchronized(mutex) { files.close() }
 
     override fun acceptBeforeExposure(attempt: CaptureAcceptedAttempt): CaptureReceipt = synchronized(mutex) {
         val location = location(attempt.identity)

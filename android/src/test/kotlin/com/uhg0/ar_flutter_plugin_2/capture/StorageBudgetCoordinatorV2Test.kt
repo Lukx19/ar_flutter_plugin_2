@@ -97,5 +97,28 @@ class StorageBudgetCoordinatorV2Test {
         assertTrue(!target.exists())
     }
 
+    @Test fun `root ownership closes once across repeated bindings and rejects use after close`() {
+        val root = directory(); val closedRoots = mutableListOf<File>()
+        val borrowedFactory = JvmDescriptorFilesystemV2(onRootClose = { closedRoots += it })
+        repeat(24) { index ->
+            SafeFilesystemV2(root, DurableStoreFaultInjectorV2 { }, borrowedFactory).use { files ->
+                val value = files.child("cycle-$index")
+                files.writeExclusive(value, byteArrayOf(index.toByte()), DurableStoreFaultPointV2.ACCEPTED_RECORD)
+            }
+        }
+        assertEquals(24, closedRoots.size)
+
+        val files = SafeFilesystemV2(root, DurableStoreFaultInjectorV2 { }, borrowedFactory)
+        val existing = files.child("cycle-0")
+        files.close()
+        files.close()
+        assertEquals(25, closedRoots.size)
+        assertThrows(IllegalStateException::class.java) { files.isFile(existing) }
+
+        // SafeFilesystem closes only each independently bound owner, never the injected factory.
+        SafeFilesystemV2(root, DurableStoreFaultInjectorV2 { }, borrowedFactory).close()
+        assertEquals(26, closedRoots.size)
+    }
+
     private fun directory(): File = File.createTempFile("storage-budget-v2", "").also { it.delete(); assertTrue(it.mkdirs()); directories += it }
 }

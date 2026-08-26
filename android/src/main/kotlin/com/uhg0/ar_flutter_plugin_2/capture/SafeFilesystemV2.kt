@@ -12,6 +12,7 @@ import java.nio.file.OpenOption
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 import java.security.MessageDigest
+import java.util.concurrent.atomic.AtomicBoolean
 
 enum class DurableStoreFaultPointV2 {
     ACCEPTED_RECORD, COMPONENT_OPEN, PART_CREATE, PART_WRITE, PART_HASH, LENGTH_CHECK,
@@ -31,7 +32,8 @@ interface DescriptorFileV2 : AutoCloseable {
 }
 
 /** A backend is rebound once to a trusted root; all later operations are root-relative. */
-interface DescriptorFilesystemV2 {
+interface DescriptorFilesystemV2 : AutoCloseable {
+    /** Returns a new backend that exclusively owns the root resource. The receiver remains borrowed. */
     fun bind(root: File): DescriptorFilesystemV2
     fun ensureDirectory(segments: List<String>)
     fun isRegularFile(segments: List<String>): Boolean
@@ -69,42 +71,63 @@ object AndroidDescriptorNativeV2 {
 
 /** Android production backend; no operation re-enters absolute pathname traversal. */
 class AndroidDescriptorFilesystemV2 private constructor(private val rootDescriptor: Long?) : DescriptorFilesystemV2 {
+    private val closed = AtomicBoolean(false)
+    private val lock = Any()
     constructor() : this(null)
-    override fun bind(root: File) = AndroidDescriptorFilesystemV2(AndroidDescriptorNativeV2.nativeOpenRoot(root.absolutePath))
-    private fun root() = requireNotNull(rootDescriptor) { "Descriptor filesystem is not root-bound" }
-    override fun ensureDirectory(segments: List<String>) = AndroidDescriptorNativeV2.nativeEnsureDirectory(root(), segments.toTypedArray())
-    override fun isRegularFile(segments: List<String>) = AndroidDescriptorNativeV2.nativeIsRegular(root(), segments.toTypedArray())
-    override fun isDirectory(segments: List<String>) = AndroidDescriptorNativeV2.nativeIsDirectory(root(), segments.toTypedArray())
-    override fun size(segments: List<String>) = AndroidDescriptorNativeV2.nativeSize(root(), segments.toTypedArray())
+    override fun bind(root: File): DescriptorFilesystemV2 = synchronized(lock) {
+        check(!closed.get()) { "Descriptor filesystem is closed" }
+        check(rootDescriptor == null) { "Descriptor filesystem is already root-bound" }
+        val descriptor = AndroidDescriptorNativeV2.nativeOpenRoot(root.absolutePath)
+        try { AndroidDescriptorFilesystemV2(descriptor) }
+        catch (error: Throwable) { AndroidDescriptorNativeV2.nativeClose(descriptor); throw error }
+    }
+    private fun root(): Long {
+        check(!closed.get()) { "Descriptor filesystem is closed" }
+        return requireNotNull(rootDescriptor) { "Descriptor filesystem is not root-bound" }
+    }
+    private inline fun <T> withRoot(block: (Long) -> T): T = synchronized(lock) { block(root()) }
+    override fun ensureDirectory(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeEnsureDirectory(it, segments.toTypedArray()) }
+    override fun isRegularFile(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeIsRegular(it, segments.toTypedArray()) }
+    override fun isDirectory(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeIsDirectory(it, segments.toTypedArray()) }
+    override fun size(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeSize(it, segments.toTypedArray()) }
     override fun openRead(segments: List<String>): DescriptorFileV2 =
-        AndroidNativeFileV2(AndroidDescriptorNativeV2.nativeOpenRead(root(), segments.toTypedArray()))
+        withRoot { AndroidNativeFileV2(AndroidDescriptorNativeV2.nativeOpenRead(it, segments.toTypedArray())) }
     override fun createExclusive(segments: List<String>): DescriptorFileV2 =
-        AndroidNativeFileV2(AndroidDescriptorNativeV2.nativeCreateExclusive(root(), segments.toTypedArray()))
-    override fun atomicReplace(parent: List<String>, from: String, to: String) = AndroidDescriptorNativeV2.nativeAtomicReplace(root(), parent.toTypedArray(), from, to)
-    override fun atomicMove(fromParent: List<String>, from: String, toParent: List<String>, to: String) = AndroidDescriptorNativeV2.nativeAtomicMove(root(), fromParent.toTypedArray(), from, toParent.toTypedArray(), to)
-    override fun delete(segments: List<String>) = AndroidDescriptorNativeV2.nativeDelete(root(), segments.toTypedArray())
-    override fun list(segments: List<String>) = AndroidDescriptorNativeV2.nativeList(root(), segments.toTypedArray()).toList()
-    override fun syncDirectory(segments: List<String>) = AndroidDescriptorNativeV2.nativeSyncDirectory(root(), segments.toTypedArray())
+        withRoot { AndroidNativeFileV2(AndroidDescriptorNativeV2.nativeCreateExclusive(it, segments.toTypedArray())) }
+    override fun atomicReplace(parent: List<String>, from: String, to: String) = withRoot { AndroidDescriptorNativeV2.nativeAtomicReplace(it, parent.toTypedArray(), from, to) }
+    override fun atomicMove(fromParent: List<String>, from: String, toParent: List<String>, to: String) = withRoot { AndroidDescriptorNativeV2.nativeAtomicMove(it, fromParent.toTypedArray(), from, toParent.toTypedArray(), to) }
+    override fun delete(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeDelete(it, segments.toTypedArray()) }
+    override fun list(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeList(it, segments.toTypedArray()).toList() }
+    override fun syncDirectory(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeSyncDirectory(it, segments.toTypedArray()) }
+    override fun close() = synchronized(lock) {
+        if (closed.compareAndSet(false, true)) rootDescriptor?.let(AndroidDescriptorNativeV2::nativeClose)
+    }
 }
 
 private class AndroidNativeFileV2(private val descriptor: Long) : DescriptorFileV2 {
-    override fun read(bytes: ByteArray, offset: Int, count: Int) = AndroidDescriptorNativeV2.nativeRead(descriptor, bytes, offset, count)
-    override fun write(bytes: ByteArray, offset: Int, count: Int) = AndroidDescriptorNativeV2.nativeWrite(descriptor, bytes, offset, count)
-    override fun sync() = AndroidDescriptorNativeV2.nativeSync(descriptor)
-    override fun close() = AndroidDescriptorNativeV2.nativeClose(descriptor)
+    private val closed = AtomicBoolean(false)
+    private fun openDescriptor(): Long { check(!closed.get()) { "File descriptor is closed" }; return descriptor }
+    override fun read(bytes: ByteArray, offset: Int, count: Int) = AndroidDescriptorNativeV2.nativeRead(openDescriptor(), bytes, offset, count)
+    override fun write(bytes: ByteArray, offset: Int, count: Int) = AndroidDescriptorNativeV2.nativeWrite(openDescriptor(), bytes, offset, count)
+    override fun sync() = AndroidDescriptorNativeV2.nativeSync(openDescriptor())
+    override fun close() { if (closed.compareAndSet(false, true)) AndroidDescriptorNativeV2.nativeClose(descriptor) }
 }
 
 /** JVM model: serialized component-by-component NOFOLLOW checks and exclusive final opens. */
 class JvmDescriptorFilesystemV2(
     private val onDirectorySync: (File) -> Unit = { },
     private val beforeComponentOpen: (File) -> Unit = { },
+    private val onRootClose: (File) -> Unit = { },
     private val boundRoot: File? = null,
 ) : DescriptorFilesystemV2 {
     private val lock = Any()
+    private val closed = AtomicBoolean(false)
     override fun bind(root: File): DescriptorFilesystemV2 {
+        check(!closed.get()) { "JVM descriptor filesystem is closed" }
+        check(boundRoot == null) { "JVM descriptor filesystem is already root-bound" }
         if (!Files.exists(root.toPath(), LinkOption.NOFOLLOW_LINKS)) Files.createDirectory(root.toPath())
         check(Files.isDirectory(root.toPath(), LinkOption.NOFOLLOW_LINKS))
-        return JvmDescriptorFilesystemV2(onDirectorySync, beforeComponentOpen, root.canonicalFile)
+        return JvmDescriptorFilesystemV2(onDirectorySync, beforeComponentOpen, onRootClose, root.canonicalFile)
     }
     override fun ensureDirectory(segments: List<String>) = synchronized(lock) {
         var current = root()
@@ -148,22 +171,31 @@ class JvmDescriptorFilesystemV2(
         }
         return current
     }
-    private fun root() = requireNotNull(boundRoot) { "JVM descriptor filesystem is not root-bound" }
+    private fun root(): File {
+        check(!closed.get()) { "JVM descriptor filesystem is closed" }
+        return requireNotNull(boundRoot) { "JVM descriptor filesystem is not root-bound" }
+    }
+    override fun close() = synchronized(lock) {
+        if (closed.compareAndSet(false, true)) boundRoot?.let(onRootClose)
+    }
 }
 
 private class JvmDescriptorFileV2(private val channel: FileChannel) : DescriptorFileV2 {
-    override fun read(bytes: ByteArray, offset: Int, count: Int) = channel.read(ByteBuffer.wrap(bytes, offset, count))
-    override fun write(bytes: ByteArray, offset: Int, count: Int) { val buffer = ByteBuffer.wrap(bytes, offset, count); while (buffer.hasRemaining()) channel.write(buffer) }
-    override fun sync() = channel.force(true)
-    override fun close() = channel.close()
+    private val closed = AtomicBoolean(false)
+    private fun openChannel(): FileChannel { check(!closed.get()) { "File descriptor is closed" }; return channel }
+    override fun read(bytes: ByteArray, offset: Int, count: Int) = openChannel().read(ByteBuffer.wrap(bytes, offset, count))
+    override fun write(bytes: ByteArray, offset: Int, count: Int) { val buffer = ByteBuffer.wrap(bytes, offset, count); val output = openChannel(); while (buffer.hasRemaining()) output.write(buffer) }
+    override fun sync() = openChannel().force(true)
+    override fun close() { if (closed.compareAndSet(false, true)) channel.close() }
 }
 
 class SafeFilesystemV2(
     root: File,
     private val fault: DurableStoreFaultInjectorV2,
     backend: DescriptorFilesystemV2 = AndroidDescriptorFilesystemV2(),
-) {
+) : AutoCloseable {
     private val rootPath = root.absoluteFile.toPath().normalize()
+    private val closed = AtomicBoolean(false)
     private val backend = backend.bind(rootPath.toFile())
 
     fun child(vararg names: String): File {
@@ -235,5 +267,6 @@ class SafeFilesystemV2(
     }
     private fun requireContained(file: File) { require(file.absoluteFile.toPath().normalize().startsWith(rootPath)) }
     private fun validateSegment(name: String) { require(name.matches(SEGMENT) && name != "." && name != "..") }
+    override fun close() { if (closed.compareAndSet(false, true)) backend.close() }
     companion object { private val SEGMENT = Regex("[A-Za-z0-9._-]{1,160}") }
 }

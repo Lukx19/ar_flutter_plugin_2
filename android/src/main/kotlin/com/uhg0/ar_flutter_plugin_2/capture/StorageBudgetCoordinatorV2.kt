@@ -15,7 +15,7 @@ class StorageBudgetCoordinatorV2(
     private val policy: StorageBudgetPolicyV2,
     filesystemBackend: DescriptorFilesystemV2 = AndroidDescriptorFilesystemV2(),
     private val freeBytes: () -> Long = { directory.usableSpace },
-) {
+) : AutoCloseable {
     private val files = SafeFilesystemV2(directory, DurableStoreFaultInjectorV2 { }, filesystemBackend)
     private val ledger = files.child("ledger-v2")
     private val reservationsDirectory = files.child("reservations-v2")
@@ -23,9 +23,14 @@ class StorageBudgetCoordinatorV2(
     private val reservations = linkedMapOf<String, StorageBudgetReservationV2>()
 
     init {
-        files.ensureDirectory(reservationsDirectory)
-        withAuthority { Unit }
+        try {
+            files.ensureDirectory(reservationsDirectory)
+            withAuthority { Unit }
+        } catch (error: Throwable) { files.close(); throw error }
     }
+
+    /** Closes only the bound filesystem created from the borrowed backend factory. */
+    override fun close() = synchronized(lockFor(requireNotNull(ledger.parentFile))) { files.close() }
 
     fun reserve(owner: String, bytes: Long): StorageBudgetReservationV2? = withAuthority {
         require(owner.matches(OWNER)) { "Storage reservation owner is non-canonical" }

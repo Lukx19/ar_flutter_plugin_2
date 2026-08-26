@@ -291,6 +291,36 @@ class DurableSessionStoreV2Test {
         assertEquals(4L, recovered.commitStreamed(after, streams("jpeg-4".toByteArray())).terminal!!.captureRevision)
     }
 
+    @Test fun `store and budget close owned roots once without closing borrowed collaborators`() {
+        val root = directory(); val closedRoots = mutableListOf<File>()
+        val borrowedFactory = JvmDescriptorFilesystemV2(onRootClose = { closedRoots += it })
+        val budget = StorageBudgetCoordinatorV2(
+            File(root, "budget"), StorageBudgetPolicyV2(1024, 0), borrowedFactory,
+        ) { 1024 }
+        val store = DurableSessionStoreV2(File(root, "store"), budget, filesystemBackend = borrowedFactory)
+
+        store.close()
+        store.close()
+        assertEquals(listOf(File(root, "store").canonicalFile), closedRoots)
+        assertThrows(IllegalStateException::class.java) { store.recover() }
+        assertNotNull(budget.reserve("capture:after-store-close", 1))
+
+        var failedConstructorCloses = 0
+        val failingFactory = JvmDescriptorFilesystemV2(
+            beforeComponentOpen = { throw IllegalStateException("injected initialization failure") },
+            onRootClose = { failedConstructorCloses += 1 },
+        )
+        assertThrows(IllegalStateException::class.java) {
+            DurableSessionStoreV2(File(root, "failing-store"), budget, filesystemBackend = failingFactory)
+        }
+        assertEquals(1, failedConstructorCloses)
+
+        budget.close()
+        budget.close()
+        assertEquals(2, closedRoots.size)
+        assertThrows(IllegalStateException::class.java) { budget.reservedBytes() }
+    }
+
     private fun request(commit: String, attempt: String, jpeg: ByteArray, session: String = "session-1"): CaptureCommitRequest {
         val identity = CaptureAttemptIdentity(attempt, commit, 1, CaptureLifecycleCut(session, 1, "group-1", 1, "ar-1", "view-1", 1, "binding-1", 1, 1))
         val profile = CaptureComponentProfile("jpeg", setOf(CaptureComponentKind.JPEG), 64, 64)
