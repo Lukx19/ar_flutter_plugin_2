@@ -357,6 +357,8 @@ void main() {
     test('all 540 rows execute canonical terminal query and replay outcomes',
         () {
       final outcomeCounts = <CaptureMatrixOutcome, int>{};
+      final lifecycleActions =
+          <CaptureLifecycleEvent, CaptureLifecycleAction>{};
       final accepted = {
         CaptureLane.manual: _accepted(CaptureLane.manual),
         CaptureLane.automatic: _accepted(CaptureLane.automatic, ordinal: 2),
@@ -374,18 +376,36 @@ void main() {
                 '${row.lane}/${row.phase}/${row.fault}/${row.lifecycleEvent}');
         expect(execution.exactReplay, isTrue);
         expect(execution.changedReplayConflict, isTrue);
-        expect(execution.lifecycleFenceNoOp, isTrue);
+        lifecycleActions[row.lifecycleEvent] = execution.lifecycleAction;
         expect(
             execution.lateCallbackNoOp, row.fault == CaptureFault.lateCallback);
-        expect(execution.exposureCount,
-            row.phase == CaptureAttemptPhase.reservedAccepted ? 0 : 1);
+        expect(
+            execution.exposureCount,
+            row.phase == CaptureAttemptPhase.reservedAccepted &&
+                    execution.outcome != CaptureMatrixOutcome.committed
+                ? 0
+                : 1);
         outcomeCounts.update(execution.outcome, (value) => value + 1,
             ifAbsent: () => 1);
       }
       expect(outcomeCounts, {
-        CaptureMatrixOutcome.abandoned: 396,
-        CaptureMatrixOutcome.outcomeUnknown: 108,
-        CaptureMatrixOutcome.committed: 36,
+        CaptureMatrixOutcome.abandoned: 372,
+        CaptureMatrixOutcome.outcomeUnknown: 90,
+        CaptureMatrixOutcome.committed: 78,
+      });
+      expect(lifecycleActions, {
+        CaptureLifecycleEvent.automaticDisabled:
+            CaptureLifecycleAction.automaticIntentSuppressed,
+        CaptureLifecycleEvent.routeLeft:
+            CaptureLifecycleAction.gracefulRouteClassification,
+        CaptureLifecycleEvent.viewReplaced:
+            CaptureLifecycleAction.viewReplacementClassification,
+        CaptureLifecycleEvent.arSessionReplaced:
+            CaptureLifecycleAction.arSessionReplacementClassification,
+        CaptureLifecycleEvent.backgrounded:
+            CaptureLifecycleAction.backgroundClassification,
+        CaptureLifecycleEvent.processRestarted:
+            CaptureLifecycleAction.processReceiptRecovery,
       });
 
       final committed = CaptureFaultLifecycleCase(
@@ -416,6 +436,37 @@ void main() {
                 _component(CaptureComponentKind.jpeg),
                 _component(CaptureComponentKind.dng)
               ])).outcome));
+
+      final lifecycleSensitive = CaptureFaultLifecycleCase(
+          CaptureLane.manual,
+          CaptureAttemptPhase.sensorOutputOwned,
+          CaptureFault.lateCallback,
+          CaptureLifecycleEvent.backgrounded,
+          CaptureMatrixOutcome.committed);
+      final restarted = CaptureFaultLifecycleCase(
+          lifecycleSensitive.lane,
+          lifecycleSensitive.phase,
+          lifecycleSensitive.fault,
+          CaptureLifecycleEvent.processRestarted,
+          CaptureMatrixOutcome.abandoned);
+      final backgroundExecution = CaptureFaultLifecycleMatrix.execute(
+          lifecycleSensitive,
+          attempt,
+          _commit(attempt, [
+            _component(CaptureComponentKind.jpeg),
+            _component(CaptureComponentKind.dng)
+          ]));
+      final restartExecution = CaptureFaultLifecycleMatrix.execute(
+          restarted,
+          attempt,
+          _commit(attempt, [
+            _component(CaptureComponentKind.jpeg),
+            _component(CaptureComponentKind.dng)
+          ]));
+      expect(backgroundExecution.outcome, CaptureMatrixOutcome.committed);
+      expect(restartExecution.outcome, CaptureMatrixOutcome.abandoned);
+      expect(backgroundExecution.lifecycleAction,
+          isNot(restartExecution.lifecycleAction));
     });
   });
 }

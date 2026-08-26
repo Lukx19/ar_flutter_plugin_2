@@ -1,5 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.capture
 
+import java.util.Collections
+
 /** Portable #99 capture contract. This reference owns no camera or durable store. */
 const val CAPTURE_PORTABLE_ORDINAL_MAXIMUM: Long = Long.MAX_VALUE
 const val CAPTURE_PORTABLE_ENTRY_MAXIMUM: Long = Int.MAX_VALUE.toLong()
@@ -7,6 +9,17 @@ const val CAPTURE_COEXISTENCE_BYTES: Long = 128L * 1024L * 1024L
 
 private fun requireDigest(bytes: List<Int>, name: String) {
     require(bytes.size == 32 && bytes.all { it in 0..255 }) { "$name must be exactly 32 unsigned bytes" }
+}
+
+private fun <T> immutableList(values: Collection<T>): List<T> =
+    Collections.unmodifiableList(ArrayList(values))
+
+private fun <T> immutableSet(values: Collection<T>): Set<T> =
+    Collections.unmodifiableSet(LinkedHashSet(values))
+
+private fun immutableDigest(bytes: List<Int>, name: String): List<Int> {
+    requireDigest(bytes, name)
+    return immutableList(bytes)
 }
 
 enum class CaptureLane { MANUAL, AUTOMATIC }
@@ -55,7 +68,7 @@ data class CaptureLifecycleCut(
 }
 
 /** Preflight intent before any attempt identity or exposure exists. */
-data class CaptureIntent(
+class CaptureIntent(
     val lane: CaptureLane,
     val lifecycleCut: CaptureLifecycleCut,
     val profile: CaptureComponentProfile,
@@ -63,9 +76,17 @@ data class CaptureIntent(
     val trackingValid: Boolean,
     val captureHealthy: Boolean,
     val durabilityPreflightValid: Boolean,
-    val canonicalIntentHash: List<Int>,
+    canonicalIntentHash: List<Int>,
 ) {
-    init { requireDigest(canonicalIntentHash, "canonicalIntentHash") }
+    val canonicalIntentHash = immutableDigest(canonicalIntentHash, "canonicalIntentHash")
+
+    override fun equals(other: Any?) = other is CaptureIntent &&
+        listOf(lane, lifecycleCut, profile, selectorValid, trackingValid, captureHealthy,
+            durabilityPreflightValid, canonicalIntentHash) ==
+        listOf(other.lane, other.lifecycleCut, other.profile, other.selectorValid, other.trackingValid,
+            other.captureHealthy, other.durabilityPreflightValid, other.canonicalIntentHash)
+    override fun hashCode() = listOf(lane, lifecycleCut, profile, selectorValid, trackingValid,
+        captureHealthy, durabilityPreflightValid, canonicalIntentHash).hashCode()
 }
 
 /** Fixed pre-group component composition and conservative byte bounds. */
@@ -75,12 +96,17 @@ class CaptureComponentProfile(
     val maximumComponentBytes: Long,
     val maximumWorkingBytes: Long,
 ) {
-    val requiredComponents: Set<CaptureComponentKind> = requiredComponents.toSet()
+    val requiredComponents: Set<CaptureComponentKind> = immutableSet(requiredComponents)
 
     init {
         require(profileId.isNotEmpty() && requiredComponents.isNotEmpty())
         require(maximumComponentBytes > 0 && maximumWorkingBytes > 0)
     }
+
+    override fun equals(other: Any?) = other is CaptureComponentProfile &&
+        profileId == other.profileId && requiredComponents == other.requiredComponents &&
+        maximumComponentBytes == other.maximumComponentBytes && maximumWorkingBytes == other.maximumWorkingBytes
+    override fun hashCode() = listOf(profileId, requiredComponents, maximumComponentBytes, maximumWorkingBytes).hashCode()
 }
 
 /** Complete RAM/store liability physically backed before exposure. */
@@ -110,31 +136,42 @@ data class CaptureAttemptIdentity(
 }
 
 /** Durable accepted record written before the only exposure request. */
-data class CaptureAcceptedAttempt(
+class CaptureAcceptedAttempt(
     val identity: CaptureAttemptIdentity,
     val lane: CaptureLane,
     val profile: CaptureComponentProfile,
     val reservation: CaptureReservationLiability,
-    val canonicalIntentHash: List<Int>,
-    val acceptedReceiptHash: List<Int>,
+    canonicalIntentHash: List<Int>,
+    acceptedReceiptHash: List<Int>,
 ) {
-    init {
-        requireDigest(canonicalIntentHash, "canonicalIntentHash")
-        requireDigest(acceptedReceiptHash, "acceptedReceiptHash")
-    }
+    val canonicalIntentHash = immutableDigest(canonicalIntentHash, "canonicalIntentHash")
+    val acceptedReceiptHash = immutableDigest(acceptedReceiptHash, "acceptedReceiptHash")
+
+    override fun equals(other: Any?) = other is CaptureAcceptedAttempt &&
+        listOf(identity, lane, profile, reservation, canonicalIntentHash, acceptedReceiptHash) ==
+        listOf(other.identity, other.lane, other.profile, other.reservation,
+            other.canonicalIntentHash, other.acceptedReceiptHash)
+    override fun hashCode() =
+        listOf(identity, lane, profile, reservation, canonicalIntentHash, acceptedReceiptHash).hashCode()
 }
 
 /** One streamed component descriptor. Component bytes are intentionally absent. */
-data class CaptureComponentDescriptor(
+class CaptureComponentDescriptor(
     val kind: CaptureComponentKind,
     val byteLength: Long,
-    val sha256: List<Int>,
+    sha256: List<Int>,
     val durableObjectId: String,
 ) {
+    val sha256 = immutableDigest(sha256, "sha256")
+
     init {
         require(byteLength >= 0 && durableObjectId.isNotEmpty())
-        requireDigest(sha256, "sha256")
     }
+
+    override fun equals(other: Any?) = other is CaptureComponentDescriptor &&
+        kind == other.kind && byteLength == other.byteLength && sha256 == other.sha256 &&
+        durableObjectId == other.durableObjectId
+    override fun hashCode() = listOf(kind, byteLength, sha256, durableObjectId).hashCode()
 }
 
 /** Complete typed input to a future DurableSessionStoreV2 implementation. */
@@ -142,21 +179,32 @@ class CaptureCommitRequest(
     val accepted: CaptureAcceptedAttempt,
     components: List<CaptureComponentDescriptor>,
     val exposureTimestampNanoseconds: Long,
-    val poseRecordHash: List<Int>,
-    val cameraModelHash: List<Int>,
-    val validationRecordHash: List<Int>,
-    val ledgerRecordHash: List<Int>,
+    poseRecordHash: List<Int>,
+    cameraModelHash: List<Int>,
+    validationRecordHash: List<Int>,
+    ledgerRecordHash: List<Int>,
 ) {
-    val components: List<CaptureComponentDescriptor> = components.toList()
+    val components: List<CaptureComponentDescriptor> = immutableList(components)
+    val poseRecordHash = immutableDigest(poseRecordHash, "poseRecordHash")
+    val cameraModelHash = immutableDigest(cameraModelHash, "cameraModelHash")
+    val validationRecordHash = immutableDigest(validationRecordHash, "validationRecordHash")
+    val ledgerRecordHash = immutableDigest(ledgerRecordHash, "ledgerRecordHash")
 
     init {
         require(exposureTimestampNanoseconds >= 0)
-        listOf(poseRecordHash, cameraModelHash, validationRecordHash, ledgerRecordHash).forEach { requireDigest(it, "recordHash") }
     }
 
     val hasCompleteComponentSet: Boolean
         get() = components.map { it.kind }.toSet() == accepted.profile.requiredComponents &&
             components.size == accepted.profile.requiredComponents.size
+
+    override fun equals(other: Any?) = other is CaptureCommitRequest &&
+        listOf(accepted, components, exposureTimestampNanoseconds, poseRecordHash, cameraModelHash,
+            validationRecordHash, ledgerRecordHash) ==
+        listOf(other.accepted, other.components, other.exposureTimestampNanoseconds, other.poseRecordHash,
+            other.cameraModelHash, other.validationRecordHash, other.ledgerRecordHash)
+    override fun hashCode() = listOf(accepted, components, exposureTimestampNanoseconds, poseRecordHash,
+        cameraModelHash, validationRecordHash, ledgerRecordHash).hashCode()
 }
 
 data class CaptureTerminal(
@@ -346,13 +394,21 @@ data class CaptureFaultLifecycleCase(
 )
 
 enum class CaptureMatrixOutcome { ABANDONED, OUTCOME_UNKNOWN, COMMITTED }
+enum class CaptureLifecycleAction {
+    AUTOMATIC_INTENT_SUPPRESSED,
+    GRACEFUL_ROUTE_CLASSIFICATION,
+    BACKGROUND_CLASSIFICATION,
+    VIEW_REPLACEMENT_CLASSIFICATION,
+    AR_SESSION_REPLACEMENT_CLASSIFICATION,
+    PROCESS_RECEIPT_RECOVERY,
+}
 data class CaptureMatrixExecution(
     val outcome: CaptureMatrixOutcome,
     val phase: CaptureAttemptPhase,
     val exposureCount: Int,
     val exactReplay: Boolean,
     val changedReplayConflict: Boolean,
-    val lifecycleFenceNoOp: Boolean,
+    val lifecycleAction: CaptureLifecycleAction,
     val lateCallbackNoOp: Boolean,
 )
 
@@ -363,17 +419,48 @@ object CaptureFaultLifecycleMatrix {
             CaptureAttemptPhase.entries.take(5).flatMap { phase ->
                 CaptureFault.entries.flatMap { fault ->
                     CaptureLifecycleEvent.entries.map { event ->
-                        CaptureFaultLifecycleCase(lane, phase, fault, event, expectedOutcome(phase, fault))
+                        CaptureFaultLifecycleCase(lane, phase, fault, event, expectedOutcome(phase, fault, event))
                     }
                 }
             }
         }
 
-    private fun expectedOutcome(phase: CaptureAttemptPhase, fault: CaptureFault): CaptureMatrixOutcome {
+    private fun expectedOutcome(
+        phase: CaptureAttemptPhase,
+        fault: CaptureFault,
+        lifecycleEvent: CaptureLifecycleEvent,
+    ): CaptureMatrixOutcome {
+        if (fault in setOf(CaptureFault.CANCELLATION, CaptureFault.MALFORMED_OUTPUT,
+                CaptureFault.COMPONENT_FAILURE, CaptureFault.STORAGE_FAILURE, CaptureFault.RESERVATION_OVERFLOW)) {
+            return CaptureMatrixOutcome.ABANDONED
+        }
+        if (fault == CaptureFault.LATE_CALLBACK) return lateCallbackOutcome(phase, lifecycleEvent)
         val uncertain = fault in setOf(CaptureFault.TIMEOUT, CaptureFault.ISOLATE_LOSS, CaptureFault.PROCESS_LOSS)
         if (phase == CaptureAttemptPhase.DURABLE_PREPARED && uncertain) return CaptureMatrixOutcome.COMMITTED
+        if (lifecycleEvent == CaptureLifecycleEvent.PROCESS_RESTARTED) return CaptureMatrixOutcome.ABANDONED
         if (phase != CaptureAttemptPhase.RESERVED_ACCEPTED && uncertain) return CaptureMatrixOutcome.OUTCOME_UNKNOWN
         return CaptureMatrixOutcome.ABANDONED
+    }
+
+    private fun lateCallbackOutcome(phase: CaptureAttemptPhase, event: CaptureLifecycleEvent): CaptureMatrixOutcome =
+        when (event) {
+            CaptureLifecycleEvent.AUTOMATIC_DISABLED, CaptureLifecycleEvent.ROUTE_LEFT -> CaptureMatrixOutcome.COMMITTED
+            CaptureLifecycleEvent.BACKGROUNDED -> if (phase == CaptureAttemptPhase.RESERVED_ACCEPTED)
+                CaptureMatrixOutcome.ABANDONED else CaptureMatrixOutcome.COMMITTED
+            CaptureLifecycleEvent.VIEW_REPLACED, CaptureLifecycleEvent.AR_SESSION_REPLACED ->
+                if (phase.ordinal < CaptureAttemptPhase.SENSOR_OUTPUT_OWNED.ordinal)
+                    CaptureMatrixOutcome.ABANDONED else CaptureMatrixOutcome.COMMITTED
+            CaptureLifecycleEvent.PROCESS_RESTARTED -> if (phase == CaptureAttemptPhase.DURABLE_PREPARED)
+                CaptureMatrixOutcome.COMMITTED else CaptureMatrixOutcome.ABANDONED
+        }
+
+    private fun lifecycleAction(event: CaptureLifecycleEvent): CaptureLifecycleAction = when (event) {
+        CaptureLifecycleEvent.AUTOMATIC_DISABLED -> CaptureLifecycleAction.AUTOMATIC_INTENT_SUPPRESSED
+        CaptureLifecycleEvent.ROUTE_LEFT -> CaptureLifecycleAction.GRACEFUL_ROUTE_CLASSIFICATION
+        CaptureLifecycleEvent.BACKGROUNDED -> CaptureLifecycleAction.BACKGROUND_CLASSIFICATION
+        CaptureLifecycleEvent.VIEW_REPLACED -> CaptureLifecycleAction.VIEW_REPLACEMENT_CLASSIFICATION
+        CaptureLifecycleEvent.AR_SESSION_REPLACED -> CaptureLifecycleAction.AR_SESSION_REPLACEMENT_CLASSIFICATION
+        CaptureLifecycleEvent.PROCESS_RESTARTED -> CaptureLifecycleAction.PROCESS_RECEIPT_RECOVERY
     }
 
     fun execute(row: CaptureFaultLifecycleCase, accepted: CaptureAcceptedAttempt, request: CaptureCommitRequest): CaptureMatrixExecution {
@@ -382,11 +469,6 @@ object CaptureFaultLifecycleMatrix {
         if (row.phase.ordinal >= CaptureAttemptPhase.SENSOR_OUTPUT_OWNED.ordinal) machine.ownSensorOutput("output", request.components)
         if (row.phase.ordinal >= CaptureAttemptPhase.VALIDATED.ordinal) machine.validate("validate")
         if (row.phase.ordinal >= CaptureAttemptPhase.DURABLE_PREPARED.ordinal) machine.prepareDurable("prepare", request)
-        val phaseBeforeLifecycle = machine.receipt.phase
-        val exposureBeforeLifecycle = machine.exposureCount
-        val lifecycleFence = machine.lateCallback()
-        val lifecycleFenceNoOp = lifecycleFence.disposition == CaptureTransitionDisposition.REJECTED &&
-            machine.receipt.phase == phaseBeforeLifecycle && machine.exposureCount == exposureBeforeLifecycle
         var lateCallbackNoOp = false
         if (row.fault == CaptureFault.LATE_CALLBACK) {
             val phaseBeforeCallback = machine.receipt.phase
@@ -395,29 +477,39 @@ object CaptureFaultLifecycleMatrix {
             lateCallbackNoOp = callback.disposition == CaptureTransitionDisposition.REJECTED &&
                 machine.receipt.phase == phaseBeforeCallback && machine.exposureCount == exposureBeforeCallback
         }
-        val uncertain = row.fault in setOf(CaptureFault.TIMEOUT, CaptureFault.ISOLATE_LOSS, CaptureFault.PROCESS_LOSS)
-        if (row.phase == CaptureAttemptPhase.DURABLE_PREPARED && uncertain) {
+        val lifecycleAction = lifecycleAction(row.lifecycleEvent)
+        val canonicalOutcome = expectedOutcome(row.phase, row.fault, row.lifecycleEvent)
+        if (canonicalOutcome == CaptureMatrixOutcome.COMMITTED) {
+            advanceToDurable(machine, request)
             machine.commit("terminal", "matrix-capture", 1, "matrix-manifest")
             val exact = machine.commit("terminal", "matrix-capture", 1, "matrix-manifest")
             val changed = machine.commit("changed-terminal", "changed", 2, "changed")
             return CaptureMatrixExecution(CaptureMatrixOutcome.COMMITTED, machine.receipt.phase, machine.exposureCount,
                 exact.disposition == CaptureTransitionDisposition.EXACT_REPLAY, changed.disposition == CaptureTransitionDisposition.CONFLICT,
-                lifecycleFenceNoOp, lateCallbackNoOp)
+                lifecycleAction, lateCallbackNoOp)
         }
-        if (row.phase != CaptureAttemptPhase.RESERVED_ACCEPTED && uncertain) {
+        if (canonicalOutcome == CaptureMatrixOutcome.OUTCOME_UNKNOWN) {
             machine.timeoutUnknown("unknown")
             val exact = machine.timeoutUnknown("unknown")
             val changed = machine.timeoutUnknown("changed-unknown")
             return CaptureMatrixExecution(CaptureMatrixOutcome.OUTCOME_UNKNOWN, machine.receipt.phase, machine.exposureCount,
                 exact.disposition == CaptureTransitionDisposition.EXACT_REPLAY, changed.disposition == CaptureTransitionDisposition.CONFLICT,
-                lifecycleFenceNoOp, lateCallbackNoOp)
+                lifecycleAction, lateCallbackNoOp)
         }
         machine.abandon("terminal", "proven-absent")
         val exact = machine.abandon("terminal", "proven-absent")
         val changed = machine.abandon("changed-terminal", "changed")
         return CaptureMatrixExecution(CaptureMatrixOutcome.ABANDONED, machine.receipt.phase, machine.exposureCount,
             exact.disposition == CaptureTransitionDisposition.EXACT_REPLAY, changed.disposition == CaptureTransitionDisposition.CONFLICT,
-            lifecycleFenceNoOp, lateCallbackNoOp)
+            lifecycleAction, lateCallbackNoOp)
+    }
+
+    private fun advanceToDurable(machine: CaptureAttemptReferenceMachine, request: CaptureCommitRequest) {
+        if (machine.receipt.phase == CaptureAttemptPhase.RESERVED_ACCEPTED) machine.requestExposure("lifecycle-expose")
+        if (machine.receipt.phase == CaptureAttemptPhase.EXPOSURE_REQUESTED)
+            machine.ownSensorOutput("lifecycle-output", request.components)
+        if (machine.receipt.phase == CaptureAttemptPhase.SENSOR_OUTPUT_OWNED) machine.validate("lifecycle-validate")
+        if (machine.receipt.phase == CaptureAttemptPhase.VALIDATED) machine.prepareDurable("lifecycle-prepare", request)
     }
 }
 

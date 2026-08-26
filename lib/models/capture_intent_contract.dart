@@ -899,6 +899,15 @@ final class CaptureFaultLifecycleCase {
 
 enum CaptureMatrixOutcome { abandoned, outcomeUnknown, committed }
 
+enum CaptureLifecycleAction {
+  automaticIntentSuppressed,
+  gracefulRouteClassification,
+  backgroundClassification,
+  viewReplacementClassification,
+  arSessionReplacementClassification,
+  processReceiptRecovery,
+}
+
 final class CaptureMatrixExecution {
   const CaptureMatrixExecution(
       this.outcome,
@@ -906,14 +915,14 @@ final class CaptureMatrixExecution {
       this.exposureCount,
       this.exactReplay,
       this.changedReplayConflict,
-      this.lifecycleFenceNoOp,
+      this.lifecycleAction,
       this.lateCallbackNoOp);
   final CaptureMatrixOutcome outcome;
   final CaptureAttemptPhase phase;
   final int exposureCount;
   final bool exactReplay;
   final bool changedReplayConflict;
-  final bool lifecycleFenceNoOp;
+  final CaptureLifecycleAction lifecycleAction;
   final bool lateCallbackNoOp;
 }
 
@@ -959,22 +968,78 @@ final class CaptureFaultLifecycleMatrix {
               value.index < CaptureAttemptPhase.committedPicture.index))
             for (final fault in CaptureFault.values)
               for (final event in CaptureLifecycleEvent.values)
-                CaptureFaultLifecycleCase(
-                    lane, phase, fault, event, _expectedOutcome(phase, fault)),
+                CaptureFaultLifecycleCase(lane, phase, fault, event,
+                    _expectedOutcome(phase, fault, event)),
       ]);
 
-  static CaptureMatrixOutcome _expectedOutcome(
-      CaptureAttemptPhase phase, CaptureFault fault) {
+  static CaptureMatrixOutcome _expectedOutcome(CaptureAttemptPhase phase,
+      CaptureFault fault, CaptureLifecycleEvent lifecycleEvent) {
+    if (const {
+      CaptureFault.cancellation,
+      CaptureFault.malformedOutput,
+      CaptureFault.componentFailure,
+      CaptureFault.storageFailure,
+      CaptureFault.reservationOverflow,
+    }.contains(fault)) {
+      return CaptureMatrixOutcome.abandoned;
+    }
+    if (fault == CaptureFault.lateCallback) {
+      return _lateCallbackOutcome(phase, lifecycleEvent);
+    }
     final uncertain = const {
       CaptureFault.timeout,
       CaptureFault.isolateLoss,
       CaptureFault.processLoss
     }.contains(fault);
-    if (phase == CaptureAttemptPhase.durablePrepared && uncertain)
+    if (phase == CaptureAttemptPhase.durablePrepared && uncertain) {
       return CaptureMatrixOutcome.committed;
-    if (phase != CaptureAttemptPhase.reservedAccepted && uncertain)
+    }
+    if (lifecycleEvent == CaptureLifecycleEvent.processRestarted) {
+      return CaptureMatrixOutcome.abandoned;
+    }
+    if (phase != CaptureAttemptPhase.reservedAccepted && uncertain) {
       return CaptureMatrixOutcome.outcomeUnknown;
+    }
     return CaptureMatrixOutcome.abandoned;
+  }
+
+  static CaptureMatrixOutcome _lateCallbackOutcome(
+      CaptureAttemptPhase phase, CaptureLifecycleEvent event) {
+    switch (event) {
+      case CaptureLifecycleEvent.automaticDisabled:
+      case CaptureLifecycleEvent.routeLeft:
+        return CaptureMatrixOutcome.committed;
+      case CaptureLifecycleEvent.backgrounded:
+        return phase == CaptureAttemptPhase.reservedAccepted
+            ? CaptureMatrixOutcome.abandoned
+            : CaptureMatrixOutcome.committed;
+      case CaptureLifecycleEvent.viewReplaced:
+      case CaptureLifecycleEvent.arSessionReplaced:
+        return phase.index < CaptureAttemptPhase.sensorOutputOwned.index
+            ? CaptureMatrixOutcome.abandoned
+            : CaptureMatrixOutcome.committed;
+      case CaptureLifecycleEvent.processRestarted:
+        return phase == CaptureAttemptPhase.durablePrepared
+            ? CaptureMatrixOutcome.committed
+            : CaptureMatrixOutcome.abandoned;
+    }
+  }
+
+  static CaptureLifecycleAction _lifecycleAction(CaptureLifecycleEvent event) {
+    switch (event) {
+      case CaptureLifecycleEvent.automaticDisabled:
+        return CaptureLifecycleAction.automaticIntentSuppressed;
+      case CaptureLifecycleEvent.routeLeft:
+        return CaptureLifecycleAction.gracefulRouteClassification;
+      case CaptureLifecycleEvent.backgrounded:
+        return CaptureLifecycleAction.backgroundClassification;
+      case CaptureLifecycleEvent.viewReplaced:
+        return CaptureLifecycleAction.viewReplacementClassification;
+      case CaptureLifecycleEvent.arSessionReplaced:
+        return CaptureLifecycleAction.arSessionReplacementClassification;
+      case CaptureLifecycleEvent.processRestarted:
+        return CaptureLifecycleAction.processReceiptRecovery;
+    }
   }
 
   static CaptureMatrixExecution execute(CaptureFaultLifecycleCase row,
@@ -992,14 +1057,6 @@ final class CaptureFaultLifecycleMatrix {
     if (row.phase.index >= CaptureAttemptPhase.durablePrepared.index) {
       machine.prepareDurable('prepare', request);
     }
-    final phaseBeforeLifecycle = machine.receipt.phase;
-    final exposureBeforeLifecycle = machine.exposureCount;
-    final lifecycleFence =
-        machine.lateCallback('lifecycle:${row.lifecycleEvent.name}');
-    final lifecycleFenceNoOp =
-        lifecycleFence.disposition == CaptureTransitionDisposition.rejected &&
-            machine.receipt.phase == phaseBeforeLifecycle &&
-            machine.exposureCount == exposureBeforeLifecycle;
     var lateCallbackNoOp = false;
     if (row.fault == CaptureFault.lateCallback) {
       final phaseBeforeCallback = machine.receipt.phase;
@@ -1010,12 +1067,11 @@ final class CaptureFaultLifecycleMatrix {
               machine.receipt.phase == phaseBeforeCallback &&
               machine.exposureCount == exposureBeforeCallback;
     }
-    final uncertainFault = const {
-      CaptureFault.timeout,
-      CaptureFault.isolateLoss,
-      CaptureFault.processLoss,
-    }.contains(row.fault);
-    if (row.phase == CaptureAttemptPhase.durablePrepared && uncertainFault) {
+    final lifecycleAction = _lifecycleAction(row.lifecycleEvent);
+    final canonicalOutcome =
+        _expectedOutcome(row.phase, row.fault, row.lifecycleEvent);
+    if (canonicalOutcome == CaptureMatrixOutcome.committed) {
+      _advanceToDurable(machine, request);
       machine.commit('terminal',
           captureId: 'matrix-capture',
           captureRevision: 1,
@@ -1032,10 +1088,10 @@ final class CaptureFaultLifecycleMatrix {
           machine.exposureCount,
           exact.disposition == CaptureTransitionDisposition.exactReplay,
           changed.disposition == CaptureTransitionDisposition.conflict,
-          lifecycleFenceNoOp,
+          lifecycleAction,
           lateCallbackNoOp);
     }
-    if (row.phase != CaptureAttemptPhase.reservedAccepted && uncertainFault) {
+    if (canonicalOutcome == CaptureMatrixOutcome.outcomeUnknown) {
       machine.timeoutUnknown('unknown');
       final exact = machine.timeoutUnknown('unknown');
       final changed = machine.timeoutUnknown('changed-unknown');
@@ -1045,7 +1101,7 @@ final class CaptureFaultLifecycleMatrix {
           machine.exposureCount,
           exact.disposition == CaptureTransitionDisposition.exactReplay,
           changed.disposition == CaptureTransitionDisposition.conflict,
-          lifecycleFenceNoOp,
+          lifecycleAction,
           lateCallbackNoOp);
     }
     machine.abandon('terminal', 'proven-absent');
@@ -1057,8 +1113,24 @@ final class CaptureFaultLifecycleMatrix {
         machine.exposureCount,
         exact.disposition == CaptureTransitionDisposition.exactReplay,
         changed.disposition == CaptureTransitionDisposition.conflict,
-        lifecycleFenceNoOp,
+        lifecycleAction,
         lateCallbackNoOp);
+  }
+
+  static void _advanceToDurable(
+      CaptureAttemptReferenceMachine machine, CaptureCommitRequest request) {
+    if (machine.receipt.phase == CaptureAttemptPhase.reservedAccepted) {
+      machine.requestExposure('lifecycle-expose');
+    }
+    if (machine.receipt.phase == CaptureAttemptPhase.exposureRequested) {
+      machine.ownSensorOutput('lifecycle-output', request.components);
+    }
+    if (machine.receipt.phase == CaptureAttemptPhase.sensorOutputOwned) {
+      machine.validate('lifecycle-validate');
+    }
+    if (machine.receipt.phase == CaptureAttemptPhase.validated) {
+      machine.prepareDurable('lifecycle-prepare', request);
+    }
   }
 }
 

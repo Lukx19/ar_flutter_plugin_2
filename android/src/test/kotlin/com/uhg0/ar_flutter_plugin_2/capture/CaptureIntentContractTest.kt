@@ -78,6 +78,37 @@ class CaptureIntentContractTest {
     }
 
     @Test
+    fun `contract values defensively copy collections and retain structural equality`() {
+        val mutableDigest = digest("intent").toMutableList()
+        val firstIntent = CaptureIntent(CaptureLane.AUTOMATIC, lifecycle(), profile(), true, true, true, true, mutableDigest)
+        val equalIntent = CaptureIntent(CaptureLane.AUTOMATIC, lifecycle(), profile(), true, true, true, true, mutableDigest.toList())
+        val stableHash = firstIntent.hashCode()
+        val machine = CaptureAttemptReferenceMachine(CaptureAcceptedAttempt(
+            CaptureAttemptIdentity("immutable", "immutable-commit", 7, lifecycle()), CaptureLane.AUTOMATIC,
+            profile(), CaptureReservationLiability(10, 10, 2, 1, 0, true), mutableDigest, digest("receipt")))
+        val stableReceipt = machine.receipt.receiptHash
+        mutableDigest[0] = mutableDigest[0] xor 0xff
+        assertEquals(equalIntent, firstIntent)
+        assertEquals(stableHash, firstIntent.hashCode())
+        assertEquals(stableReceipt, machine.receipt.receiptHash)
+        assertFails { (firstIntent.canonicalIntentHash as MutableList<Int>)[0] = 0 }
+
+        val mutableComponents = components().toMutableList()
+        val accepted = accepted()
+        val request = CaptureCommitRequest(accepted, mutableComponents, 10, digest("pose"), digest("camera"),
+            digest("validation"), digest("ledger"))
+        val equalRequest = commit(accepted, components())
+        val requestHash = request.hashCode()
+        mutableComponents.clear()
+        assertEquals(2, request.components.size)
+        assertEquals(equalRequest, request)
+        assertEquals(requestHash, request.hashCode())
+        assertFails { (request.components as MutableList<CaptureComponentDescriptor>).clear() }
+        assertEquals(profile(), profile())
+        assertEquals(profile().hashCode(), profile().hashCode())
+    }
+
+    @Test
     fun `scheduler gives manual running priority and promotes deterministically`() {
         val manual = accepted(CaptureLane.MANUAL, 1)
         val automatic = accepted(CaptureLane.AUTOMATIC, 2)
@@ -97,19 +128,29 @@ class CaptureIntentContractTest {
     fun `all 540 rows execute canonical query terminal and replay outcomes`() {
         val attempts = mapOf(CaptureLane.MANUAL to accepted(CaptureLane.MANUAL, 1), CaptureLane.AUTOMATIC to accepted(CaptureLane.AUTOMATIC, 2))
         val counts = mutableMapOf<CaptureMatrixOutcome, Int>()
+        val lifecycleActions = mutableMapOf<CaptureLifecycleEvent, CaptureLifecycleAction>()
         CaptureFaultLifecycleMatrix.generate().forEach { row ->
             val attempt = requireNotNull(attempts[row.lane])
             val execution = CaptureFaultLifecycleMatrix.execute(row, attempt, commit(attempt, components()))
             assertEquals(row.expectedOutcome, execution.outcome)
             assertTrue(execution.exactReplay)
             assertTrue(execution.changedReplayConflict)
-            assertTrue(execution.lifecycleFenceNoOp)
+            lifecycleActions[row.lifecycleEvent] = execution.lifecycleAction
             assertEquals(row.fault == CaptureFault.LATE_CALLBACK, execution.lateCallbackNoOp)
-            assertEquals(if (row.phase == CaptureAttemptPhase.RESERVED_ACCEPTED) 0 else 1, execution.exposureCount)
+            assertEquals(if (row.phase == CaptureAttemptPhase.RESERVED_ACCEPTED &&
+                execution.outcome != CaptureMatrixOutcome.COMMITTED) 0 else 1, execution.exposureCount)
             counts[execution.outcome] = (counts[execution.outcome] ?: 0) + 1
         }
-        assertEquals(mapOf(CaptureMatrixOutcome.ABANDONED to 396, CaptureMatrixOutcome.OUTCOME_UNKNOWN to 108,
-            CaptureMatrixOutcome.COMMITTED to 36), counts)
+        assertEquals(mapOf(CaptureMatrixOutcome.ABANDONED to 372, CaptureMatrixOutcome.OUTCOME_UNKNOWN to 90,
+            CaptureMatrixOutcome.COMMITTED to 78), counts)
+        assertEquals(mapOf(
+            CaptureLifecycleEvent.AUTOMATIC_DISABLED to CaptureLifecycleAction.AUTOMATIC_INTENT_SUPPRESSED,
+            CaptureLifecycleEvent.ROUTE_LEFT to CaptureLifecycleAction.GRACEFUL_ROUTE_CLASSIFICATION,
+            CaptureLifecycleEvent.VIEW_REPLACED to CaptureLifecycleAction.VIEW_REPLACEMENT_CLASSIFICATION,
+            CaptureLifecycleEvent.AR_SESSION_REPLACED to CaptureLifecycleAction.AR_SESSION_REPLACEMENT_CLASSIFICATION,
+            CaptureLifecycleEvent.BACKGROUNDED to CaptureLifecycleAction.BACKGROUND_CLASSIFICATION,
+            CaptureLifecycleEvent.PROCESS_RESTARTED to CaptureLifecycleAction.PROCESS_RECEIPT_RECOVERY,
+        ), lifecycleActions)
 
         val attempt = requireNotNull(attempts[CaptureLane.MANUAL])
         val committed = CaptureFaultLifecycleCase(CaptureLane.MANUAL, CaptureAttemptPhase.DURABLE_PREPARED,
@@ -117,6 +158,16 @@ class CaptureIntentContractTest {
         val mutated = committed.copy(fault = CaptureFault.COMPONENT_FAILURE, expectedOutcome = CaptureMatrixOutcome.ABANDONED)
         assertFalse(CaptureFaultLifecycleMatrix.execute(committed, attempt, commit(attempt, components())).outcome ==
             CaptureFaultLifecycleMatrix.execute(mutated, attempt, commit(attempt, components())).outcome)
+
+        val background = CaptureFaultLifecycleCase(CaptureLane.MANUAL, CaptureAttemptPhase.SENSOR_OUTPUT_OWNED,
+            CaptureFault.LATE_CALLBACK, CaptureLifecycleEvent.BACKGROUNDED, CaptureMatrixOutcome.COMMITTED)
+        val restarted = background.copy(lifecycleEvent = CaptureLifecycleEvent.PROCESS_RESTARTED,
+            expectedOutcome = CaptureMatrixOutcome.ABANDONED)
+        val backgroundExecution = CaptureFaultLifecycleMatrix.execute(background, attempt, commit(attempt, components()))
+        val restartExecution = CaptureFaultLifecycleMatrix.execute(restarted, attempt, commit(attempt, components()))
+        assertEquals(CaptureMatrixOutcome.COMMITTED, backgroundExecution.outcome)
+        assertEquals(CaptureMatrixOutcome.ABANDONED, restartExecution.outcome)
+        assertFalse(backgroundExecution.lifecycleAction == restartExecution.lifecycleAction)
     }
 
     private fun accepted(storeBytes: Long = 200) = accepted(CaptureLane.MANUAL, 1, storeBytes)
