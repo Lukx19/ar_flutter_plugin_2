@@ -9,6 +9,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.io.File
 import java.io.InputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -25,6 +26,9 @@ class NativeCaptureAdapterV2AndroidTest {
     @Test
     fun perViewBindingDrainsAndFencesLateComponents() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val captureRoot = File(context.filesDir, "capture-v2-native")
+        check(captureRoot.deleteRecursively())
+        assertFalse(captureRoot.exists())
         val callbackThread = HandlerThread("native-capture-v2-test").apply { start() }
         val signal = CaptureSafetySignalV2()
         val callbacks = mutableListOf<Pair<CaptureAttemptQualifierV2, SharedCameraExposureCallbackV2>>()
@@ -41,6 +45,7 @@ class NativeCaptureAdapterV2AndroidTest {
                 texture = SurfaceTexture(0)
                 surface = Surface(checkNotNull(texture))
                 binding = NativeCaptureBindingV2(context, signal)
+                assertTrue(captureRoot.isDirectory)
                 manager = SharedCameraManager(
                     context = context,
                     methodChannel = MethodChannel(checkNotNull(flutterEngine).dartExecutor.binaryMessenger, "native-capture-v2-test"),
@@ -120,6 +125,7 @@ class NativeCaptureAdapterV2AndroidTest {
             }
             callbackThread.quitSafely()
             callbackThread.join(5_000L)
+            check(captureRoot.deleteRecursively())
         }
     }
 

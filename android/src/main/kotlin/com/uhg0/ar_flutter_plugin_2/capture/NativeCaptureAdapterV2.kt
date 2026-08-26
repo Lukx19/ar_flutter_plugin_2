@@ -96,7 +96,7 @@ internal class NativeCaptureBindingV2(
     private val nowMs: () -> Long = System::currentTimeMillis,
 ) : AutoCloseable {
     private val lock = Any()
-    private val root = java.io.File(context.filesDir, "capture-v2-native")
+    private val root = createNativeCaptureRootV2(context)
     private val budget = StorageBudgetCoordinatorV2(
         java.io.File(root, "budget"),
         StorageBudgetPolicyV2((context.filesDir.usableSpace / 2).coerceAtLeast(CAPTURE_COEXISTENCE_BYTES), 0),
@@ -144,6 +144,14 @@ internal class NativeCaptureBindingV2(
         sharedCamera = null
         store.close()
         budget.close()
+    }
+
+    private fun createNativeCaptureRootV2(context: Context): java.io.File {
+        val root = java.io.File(context.filesDir, "capture-v2-native")
+        AndroidDescriptorFilesystemV2().use { unbound ->
+            unbound.bind(root).use { }
+        }
+        return root
     }
 }
 
