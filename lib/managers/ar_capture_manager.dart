@@ -499,10 +499,18 @@ class ARCaptureManager {
   ) async {
     _throwIfDisposed();
     await _ensureInitialized();
-    final value = await _channel.invokeMethod<Map<dynamic, dynamic>>(
-      'admitNativeCaptureV2',
-      admission.toMap(),
-    );
+    final Map<dynamic, dynamic>? value;
+    try {
+      value = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+        'admitNativeCaptureV2',
+        admission.toMap(),
+      );
+    } on PlatformException catch (error) {
+      throw _captureExceptionFromPlatformException(
+        error,
+        operation: 'admit native V2 capture',
+      );
+    }
     if (value == null) {
       throw const ARCaptureException(
         'Native V2 admission result was missing',

@@ -20,7 +20,11 @@ internal object NativeCaptureWireV2 {
 
     fun event(value: NativeCaptureEventV2): Map<String, Any?> = buildMap {
         put("wireVersion", "native_capture_v2")
-        put("kind", value.kind.name.lowercase())
+        put(
+            "kind",
+            if (value.kind == NativeCaptureEventKindV2.RECOVERY_FAILED) "recoveryFailed"
+            else value.kind.name.lowercase(),
+        )
         value.attemptId?.let { put("attemptId", it) }
         value.captureId?.let { put("captureId", it) }
         value.captureRevision?.let { put("captureRevision", it) }

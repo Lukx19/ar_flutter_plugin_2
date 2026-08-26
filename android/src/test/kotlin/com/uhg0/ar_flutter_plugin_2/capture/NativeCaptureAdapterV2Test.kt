@@ -8,6 +8,7 @@ import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class NativeCaptureAdapterV2Test {
@@ -78,6 +79,38 @@ class NativeCaptureAdapterV2Test {
         )
         dispatcher.close()
         assertTrue(dispatcher.awaitTerminationForTest(5, TimeUnit.SECONDS))
+    }
+
+    @Test
+    fun `recovery failure emits bounded diagnostic blocks exposure and remains fenced after close`() {
+        val diagnosed = CountDownLatch(1)
+        val events = mutableListOf<NativeCaptureEventV2>()
+        val dispatcher = NativeCaptureRecoveryDispatcherV2(
+            recover = { throw DurableStoreConflictV2("corrupt /private/path must not escape") },
+            events = {
+                events += it
+                diagnosed.countDown()
+            },
+        )
+        assertTrue(diagnosed.await(5, TimeUnit.SECONDS))
+        assertFalse(dispatcher.isReady())
+
+        var exposures = 0
+        val failure = assertThrows(NativeCaptureRecoveryAdmissionExceptionV2::class.java) {
+            dispatcher.requireAdmissionReady()
+            exposures++
+        }
+        assertEquals("NATIVE_CAPTURE_V2_RECOVERY_FAILED", failure.code)
+        assertEquals(0, exposures)
+        assertEquals(1, events.size)
+        assertEquals(NativeCaptureEventKindV2.RECOVERY_FAILED, events.single().kind)
+        assertEquals("durable-startup-recovery-failed", events.single().reason)
+        assertFalse(events.single().reason!!.contains("private"))
+
+        dispatcher.close()
+        assertTrue(dispatcher.awaitTerminationForTest(5, TimeUnit.SECONDS))
+        dispatcher.emitLive(NativeCaptureEventV2(NativeCaptureEventKindV2.ACCEPTED, "late"))
+        assertEquals(1, events.size)
     }
 
     @Test

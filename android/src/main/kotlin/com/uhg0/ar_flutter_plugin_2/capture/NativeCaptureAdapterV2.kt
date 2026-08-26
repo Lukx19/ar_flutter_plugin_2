@@ -83,7 +83,7 @@ internal data class SharedCameraComponentSetV2(
     val exposureTimestampNanoseconds: Long = 0L,
 )
 
-internal enum class NativeCaptureEventKindV2 { ACCEPTED, FINALIZING, RECOVERING, COMMITTED, ABANDONED, HEALTH }
+internal enum class NativeCaptureEventKindV2 { ACCEPTED, FINALIZING, RECOVERING, RECOVERY_FAILED, COMMITTED, ABANDONED, HEALTH }
 
 /** Strict bounded event: scalar identities/counters only, never paths, descriptors, or bytes. */
 internal data class NativeCaptureEventV2(
@@ -143,37 +143,69 @@ internal class NativeCaptureRecoveryDispatcherV2(
         Thread(runnable, "capture3d-v2-recovery").apply { isDaemon = true }
     },
 ) : AutoCloseable {
+    private enum class State { INITIALIZING, READY, FAILED, CLOSED }
+
     private val lock = Any()
-    private var closed = false
-    private var ready = false
+    private var state = State.INITIALIZING
 
     init {
         executor.execute {
-            val recovered = runCatching { recover(::isActive) }.getOrElse { emptyList() }
+            val recovered = runCatching { recover(::isActive) }
             synchronized(lock) {
-                if (closed) return@execute
-                recovered.forEach { events(it.toNativeEvent()) }
-                ready = true
+                if (state == State.CLOSED) return@execute
+                recovered.fold(
+                    onSuccess = { projections ->
+                        projections.forEach { events(it.toNativeEvent()) }
+                        state = State.READY
+                    },
+                    onFailure = {
+                        state = State.FAILED
+                        events(
+                            NativeCaptureEventV2(
+                                NativeCaptureEventKindV2.RECOVERY_FAILED,
+                                reason = RECOVERY_FAILED_REASON,
+                            ),
+                        )
+                    },
+                )
             }
         }
     }
 
-    fun isReady(): Boolean = synchronized(lock) { ready && !closed }
+    fun isReady(): Boolean = synchronized(lock) { state == State.READY }
+
+    fun requireAdmissionReady() = synchronized(lock) {
+        when (state) {
+            State.READY -> Unit
+            State.INITIALIZING -> throw NativeCaptureRecoveryAdmissionExceptionV2(
+                "NATIVE_CAPTURE_V2_RECOVERY_PENDING",
+                "Native capture recovery is still running.",
+            )
+            State.FAILED -> throw NativeCaptureRecoveryAdmissionExceptionV2(
+                "NATIVE_CAPTURE_V2_RECOVERY_FAILED",
+                "Native capture recovery failed; recreate the capture view before admitting exposure.",
+            )
+            State.CLOSED -> throw NativeCaptureRecoveryAdmissionExceptionV2(
+                "NATIVE_CAPTURE_V2_RECOVERY_CLOSED",
+                "Native capture recovery is closed.",
+            )
+        }
+    }
 
     fun emitLive(event: NativeCaptureEventV2) = synchronized(lock) {
-        if (!closed) {
-            check(ready) { "Native capture recovery has not completed" }
+        if (state != State.CLOSED) {
+            requireAdmissionReady()
             events(event)
         }
     }
 
     private fun isActive(): Boolean = synchronized(lock) {
-        !closed && !Thread.currentThread().isInterrupted
+        state == State.INITIALIZING && !Thread.currentThread().isInterrupted
     }
 
     override fun close() = synchronized(lock) {
-        if (closed) return@synchronized
-        closed = true
+        if (state == State.CLOSED) return@synchronized
+        state = State.CLOSED
         executor.shutdownNow()
     }
 
@@ -192,7 +224,16 @@ internal class NativeCaptureRecoveryDispatcherV2(
         manifestId = manifestId,
         reason = reason,
     )
+
+    private companion object {
+        const val RECOVERY_FAILED_REASON = "durable-startup-recovery-failed"
+    }
 }
+
+internal class NativeCaptureRecoveryAdmissionExceptionV2(
+    val code: String,
+    message: String,
+) : IllegalStateException(message)
 
 /** Per-view native owner. #102 may supply intent, but not this binding or its lifecycle. */
 internal class NativeCaptureBindingV2(
@@ -243,7 +284,7 @@ internal class NativeCaptureBindingV2(
     fun detachSharedCamera(manager: SharedCameraManager) = synchronized(lock) { if (sharedCamera === manager) sharedCamera = null }
     fun admit(request: CaptureCommitRequest): CaptureReceipt = synchronized(lock) {
         check(!closed) { "NativeCaptureBindingV2 is closed" }
-        check(recovery.isReady()) { "Native capture recovery is still running" }
+        recovery.requireAdmissionReady()
         adapter.admit(request)
     }
     fun onLifecycle(event: CaptureLifecycleEvent, cut: CaptureLifecycleCut) = adapter.onLifecycle(event, cut)

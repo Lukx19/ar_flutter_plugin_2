@@ -19,6 +19,7 @@ import com.google.ar.core.exceptions.NotTrackingException
 import com.uhg0.ar_flutter_plugin_2.capture.ArCaptureSession
 import com.uhg0.ar_flutter_plugin_2.capture.CaptureSafetySignalV2
 import com.uhg0.ar_flutter_plugin_2.capture.CaptureSessionException
+import com.uhg0.ar_flutter_plugin_2.capture.NativeCaptureRecoveryAdmissionExceptionV2
 import com.uhg0.ar_flutter_plugin_2.capture.PoseBatchDispatcher
 import com.uhg0.ar_flutter_plugin_2.sceneview.PluginAnchorRecord
 import com.uhg0.ar_flutter_plugin_2.sceneview.PluginHitResult
@@ -638,6 +639,8 @@ internal class ArView(
                 "admitNativeCaptureV2" -> scope.launch(Dispatchers.IO) {
                     try {
                         result.success(captureSession.admitNativeCaptureV2(call.arguments))
+                    } catch (error: NativeCaptureRecoveryAdmissionExceptionV2) {
+                        result.error(error.code, error.message, null)
                     } catch (error: IllegalArgumentException) {
                         result.error("NATIVE_CAPTURE_V2_INVALID", error.message, null)
                     } catch (error: Exception) {

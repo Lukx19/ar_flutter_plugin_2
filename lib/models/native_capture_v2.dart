@@ -70,6 +70,7 @@ enum ARNativeCaptureEventKindV2 {
   accepted,
   finalizing,
   recovering,
+  recoveryFailed,
   committed,
   abandoned,
   health,
@@ -210,6 +211,12 @@ final class ARNativeCaptureEventV2 {
         return ARNativeCaptureEventV2(
           kind: kind,
           attemptId: _nonEmptyString(map, 'attemptId'),
+          reason: _nonEmptyString(map, 'reason'),
+        );
+      case ARNativeCaptureEventKindV2.recoveryFailed:
+        _requireExactKeys(map, const {'wireVersion', 'kind', 'reason'});
+        return ARNativeCaptureEventV2(
+          kind: kind,
           reason: _nonEmptyString(map, 'reason'),
         );
       case ARNativeCaptureEventKindV2.committed:

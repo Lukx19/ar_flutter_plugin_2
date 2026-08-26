@@ -51,6 +51,14 @@ void main() {
     });
     expect(committed.isTerminal, isTrue);
     expect(committed.captureRevision, 2);
+
+    final recoveryFailed = ARNativeCaptureEventV2.fromMap({
+      'wireVersion': nativeCaptureV2WireVersion,
+      'kind': 'recoveryFailed',
+      'reason': 'durable-startup-recovery-failed',
+    });
+    expect(recoveryFailed.kind, ARNativeCaptureEventKindV2.recoveryFailed);
+    expect(recoveryFailed.attemptId, isNull);
   });
 
   test('rejects non-qualified profiles and unbacked reservations', () {
@@ -68,6 +76,15 @@ void main() {
         'wireVersion': nativeCaptureV2WireVersion,
         'kind': 'committed',
         'attemptId': 'attempt',
+      }),
+      throwsFormatException,
+    );
+    expect(
+      () => ARNativeCaptureEventV2.fromMap({
+        'wireVersion': nativeCaptureV2WireVersion,
+        'kind': 'recoveryFailed',
+        'attemptId': 'fabricated-startup-attempt',
+        'reason': 'durable-startup-recovery-failed',
       }),
       throwsFormatException,
     );
