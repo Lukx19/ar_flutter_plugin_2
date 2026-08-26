@@ -28,6 +28,20 @@ class StorageBudgetCoordinatorV2Test {
         assertEquals(0, restarted.committedBytes())
     }
 
+    @Test fun `construction performs no reservation directory scan`() {
+        val root = directory()
+        val reservations = File(root, "reservations-v2").apply { assertTrue(mkdirs()) }
+        repeat(100) { File(reservations, "junk-$it").writeText("not authority") }
+        var lists = 0
+        val coordinator = StorageBudgetCoordinatorV2(
+            root,
+            StorageBudgetPolicyV2(100, 0),
+            JvmDescriptorFilesystemV2(onList = { lists++ }),
+        ) { 100 }
+        assertEquals(0, lists)
+        coordinator.close()
+    }
+
     @Test fun `independent live coordinators refresh one process global ledger before every operation`() {
         val root = directory(); val policy = StorageBudgetPolicyV2(100, 0)
         val first = StorageBudgetCoordinatorV2(root, policy, JvmDescriptorFilesystemV2()) { 100 }

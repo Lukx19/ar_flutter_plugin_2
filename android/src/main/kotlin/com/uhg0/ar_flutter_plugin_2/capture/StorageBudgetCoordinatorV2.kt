@@ -25,7 +25,6 @@ class StorageBudgetCoordinatorV2(
     init {
         try {
             files.ensureDirectory(reservationsDirectory)
-            withAuthority { Unit }
         } catch (error: Throwable) { files.close(); throw error }
     }
 
