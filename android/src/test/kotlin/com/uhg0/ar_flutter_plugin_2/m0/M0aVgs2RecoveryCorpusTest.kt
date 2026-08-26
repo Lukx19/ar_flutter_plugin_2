@@ -37,6 +37,11 @@ class M0aVgs2RecoveryCorpusTest {
                 "\"oldRequestSequence\":9223372036854775807",
                 "\"oldRequestSequence\":9223372036854775806",
             ),
+            source.replaceFirst("\"beginRequestSequence\":1", "\"beginRequestSequence\":4"),
+            source.replaceFirst("\"targetGeometryRevision\":12", "\"targetGeometryRevision\":11"),
+            source.replaceFirst("\"oldTokenAttemptCount\":1", "\"oldTokenAttemptCount\":0"),
+            source.replaceFirst("\"semanticEffectCount\":1", "\"semanticEffectCount\":2"),
+            source.replaceFirst("\"oldTokenPublicationCount\":0", "\"oldTokenPublicationCount\":1"),
             source.replaceFirst("\"diagnosticBytes\":0", "\"diagnosticBytes\":1"),
         ).forEach { mutation ->
             val bytes = mutation.encodeToByteArray()
