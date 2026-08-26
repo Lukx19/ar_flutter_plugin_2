@@ -115,10 +115,9 @@ internal class NativeCaptureBindingV2(
     fun attachSharedCamera(manager: SharedCameraManager) = synchronized(lock) {
         check(!closed) { "NativeCaptureBindingV2 is closed" }
         sharedCamera = manager
-        // The bridge is installed on the production manager now. Until #102
-        // supplies an admitted intent, no request is made; a request without a
-        // native Camera2 component hook fails closed instead of falling back to V1.
-        manager.installAttemptQualifiedExposureHookV2(request = { _, _, _ -> false })
+        // #102's manager-owned direct route is the default. Tests may install
+        // a synthetic hook explicitly below; neither route can consult V1's
+        // cache/correlation APIs.
     }
     fun detachSharedCamera(manager: SharedCameraManager) = synchronized(lock) { if (sharedCamera === manager) sharedCamera = null }
     fun admit(request: CaptureCommitRequest): CaptureReceipt = adapter.admit(request)

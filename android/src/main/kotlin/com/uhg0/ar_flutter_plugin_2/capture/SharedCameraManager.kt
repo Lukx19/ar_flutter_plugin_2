@@ -28,6 +28,7 @@ import com.google.ar.core.SharedCamera
 import com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraCapabilityQuerier
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
+import java.io.ByteArrayInputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -216,7 +217,8 @@ internal class SharedCameraManager(
         qualifier: CaptureAttemptQualifierV2,
         required: Set<CaptureComponentKind>,
         callback: SharedCameraExposureCallbackV2,
-    ): Boolean = v2ExposureHook?.invoke(qualifier, required, callback) ?: false
+    ): Boolean = v2ExposureHook?.invoke(qualifier, required, callback)
+        ?: requestDirectExposureV2(qualifier, required, callback)
 
     internal fun cancelAttemptQualifiedExposureV2(qualifier: CaptureAttemptQualifierV2) {
         v2CancelHook?.invoke(qualifier)
@@ -250,6 +252,11 @@ internal class SharedCameraManager(
                 timestamp: Long,
                 frameNumber: Long,
             ) {
+                val directTag = request.tag as? DirectCaptureTagV2
+                if (directTag != null && pendingDirectCapture?.qualifier == directTag.qualifier) {
+                    recordCaptureObservation(timestamp, System.nanoTime())
+                    return
+                }
                 val pending = pendingManualCapture ?: return
                 val requestTag = request.tag as? ManualCaptureTag ?: return
                 if (requestTag.generation != pending.generation ||
@@ -272,6 +279,12 @@ internal class SharedCameraManager(
                         "SharedCameraManager",
                         "Capture result frame=${result.frameNumber} tag=${request.tag}",
                     )
+                }
+                val directTag = request.tag as? DirectCaptureTagV2
+                if (directTag != null && pendingDirectCapture?.qualifier == directTag.qualifier) {
+                    // The JPEG reader owns the component.  Its callback checks
+                    // the same qualifier before streaming and closes late data.
+                    return
                 }
                 val pending = pendingManualCapture ?: return
                 val requestTag = request.tag as? ManualCaptureTag ?: return
@@ -375,6 +388,9 @@ internal class SharedCameraManager(
     private val pendingManualCaptureOwner = CaptureAttemptOwner<PendingManualCapture>()
     private val pendingManualCapture: PendingManualCapture?
         get() = pendingManualCaptureOwner.get()
+    private val pendingDirectCaptureOwner = CaptureAttemptOwner<PendingDirectCaptureV2>()
+    private val pendingDirectCapture: PendingDirectCaptureV2?
+        get() = pendingDirectCaptureOwner.get()
 
     private fun recordCaptureObservation(sensorTimestampNs: Long, observedTimestampNs: Long) {
         synchronized(captureObservationLock) {
@@ -404,6 +420,18 @@ internal class SharedCameraManager(
         @Volatile var preAlignedPose: PoseDataExtractor.AlignedPose? = null,
         @Volatile var accepted: SharedCaptureAccepted? = null,
         val bracketedCaptures: MutableMap<Int, ExposureBracketMember> = mutableMapOf(),
+    )
+
+    /**
+     * V2's image owner.  It is intentionally distinct from PendingManualCapture:
+     * no ImageCacheManager reservation, image id, or V1 finalization worker can
+     * observe this byte sequence.  The byte array is a short-lived Camera2
+     * decoder buffer and is handed immediately to the adapter-owned stream.
+     */
+    private data class PendingDirectCaptureV2(
+        val qualifier: CaptureAttemptQualifierV2,
+        val required: Set<CaptureComponentKind>,
+        val callback: SharedCameraExposureCallbackV2,
     )
 
     private data class ExposureBracketSpec(
@@ -535,6 +563,36 @@ internal class SharedCameraManager(
             wrappedDeviceStateCallback,
             backgroundHandler,
         )
+    }
+
+    private data class DirectCaptureTagV2(val qualifier: CaptureAttemptQualifierV2)
+
+    private fun requestDirectExposureV2(
+        qualifier: CaptureAttemptQualifierV2,
+        required: Set<CaptureComponentKind>,
+        callback: SharedCameraExposureCallbackV2,
+    ): Boolean {
+        // The first direct production route is deliberately limited to the
+        // hardware-JPEG source.  A JPEG+DNG profile is rejected until the raw
+        // reader can provide both attempt-qualified streams atomically.
+        if (required != setOf(CaptureComponentKind.JPEG) || !isInitialized) return false
+        val pending = PendingDirectCaptureV2(qualifier, required, callback)
+        if (!pendingDirectCaptureOwner.acquire(pending)) return false
+        val activeSession = captureSession
+        val builder = manualCaptureRequestBuilder
+        if (activeSession == null || builder == null || !repeatingRequestLifecycle.isRepeatingActive()) {
+            pendingDirectCaptureOwner.release(pending)
+            return false
+        }
+        return try {
+            builder.setTag(DirectCaptureTagV2(qualifier))
+            activeSession.capture(builder.build(), sharedCameraCaptureCallback, captureCallbackHandler)
+            true
+        } catch (error: Throwable) {
+            pendingDirectCaptureOwner.release(pending)
+            callback.onFailure(qualifier, "camera-submit")
+            false
+        }
     }
 
     private suspend fun awaitSharedCameraRestartWindow() {
@@ -1059,7 +1117,8 @@ internal class SharedCameraManager(
         val image = reader.acquireLatestImage() ?: return
         resourceCounters.onImageAcquired()
         try {
-            if (pendingManualCapture == null) {
+            val direct = pendingDirectCapture
+            if (pendingManualCapture == null && direct == null) {
                 return
             }
             val encodeStartedAtMs = System.currentTimeMillis()
@@ -1119,6 +1178,24 @@ internal class SharedCameraManager(
                 "SharedCameraManager",
                 "Encoded ${jpegBytes.size} bytes in ${System.currentTimeMillis() - encodeStartedAtMs}ms",
             )
+            if (direct != null) {
+                if (direct.required != setOf(CaptureComponentKind.JPEG)) {
+                    direct.callback.onFailure(direct.qualifier, "unsupported-component-set")
+                } else if (pendingDirectCaptureOwner.release(direct)) {
+                    direct.callback.onComponents(
+                        SharedCameraComponentSetV2(
+                            direct.qualifier,
+                            listOf(
+                                CaptureComponentStreamV2(
+                                    CaptureComponentKind.JPEG,
+                                    ByteArrayInputStream(jpegBytes),
+                                ),
+                            ),
+                        ),
+                    )
+                }
+                return
+            }
             if (config.rawJpeg) {
                 handleRawJpegImage(
                     PendingStillImagePayload(
@@ -1139,6 +1216,11 @@ internal class SharedCameraManager(
             )?.let(::handleCorrelatedStillCapture)
         } catch (error: Throwable) {
             Log.e("SharedCameraManager", "Failed to encode shared-camera YUV frame", error)
+            pendingDirectCapture?.let { direct ->
+                if (pendingDirectCaptureOwner.release(direct)) {
+                    direct.callback.onFailure(direct.qualifier, "camera-component")
+                }
+            }
             pendingManualCapture?.let { pending ->
                 pending.error = error
                 pending.latch.countDown()
