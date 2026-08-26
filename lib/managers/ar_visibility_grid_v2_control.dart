@@ -870,6 +870,10 @@ final class ARVisibilityGridV2Control {
   }
 
   /// Sends the registered stale attempt through Flutter's real message channel.
+  ///
+  /// Propagates transport or codec failures from [BasicMessageChannel.send].
+  /// Throws [StateError] if native publishes any response for the stale
+  /// qualifier instead of rejecting it with a null reply.
   Future<void> submitDebugV2Issue98StaleAttempt(
     ARVisibilityGridV2Issue98Preparation preparation,
   ) async {
@@ -888,6 +892,11 @@ final class ARVisibilityGridV2Control {
   }
 
   /// Fetches evidence correlated to the exact prepared stale attempt.
+  ///
+  /// Throws [PlatformException] when native rejects the correlation,
+  /// [MissingPluginException] when the finalize endpoint is unavailable, and
+  /// [StateError] when the returned typed handoff receipt is malformed,
+  /// incomplete, unknown, or violates its cross-field invariants.
   Future<ARVisibilityGridV2Issue98HandoffReceipt> finalizeDebugV2Issue98Handoff(
     ARVisibilityGridV2Issue98Preparation preparation,
   ) async {
