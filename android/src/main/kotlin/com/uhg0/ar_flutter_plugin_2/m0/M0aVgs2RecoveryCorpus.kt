@@ -11,7 +11,7 @@ import kotlinx.serialization.json.long
 
 /** Strict executable lock for the canonical Issue 98 VGS2 recovery policies. */
 object M0aVgs2RecoveryCorpus {
-    const val SHA256 = "356d614ffa5861a367ed7358315d5b01832798eb5e52bbb42f1527bcd3d3b2bb"
+    const val SHA256 = "db429e33aae51abc5c986784c833924fdeb29cb1b0fd6a785551b1a511d88ef5"
     private val policyIds = setOf(4, 8, 48, 142, 144)
     private val rootKeys = setOf("format", "policies", "freshBinding")
     private val policyKeys = setOf(
@@ -24,14 +24,57 @@ object M0aVgs2RecoveryCorpus {
     )
     private val freshKeys = setOf(
         "oldTransactionId", "oldRequestSequence", "freshTransactionId", "freshRequestSequence",
-        "nextTransactionId", "semanticEffectCount", "oldTokenPublicationCount", "geometryRevision",
+        "beginRequestSequence", "commitRequestSequence", "ackRequestSequence", "nextRequestSequence",
+        "nextTransactionId", "targetGeometryRevision", "targetLineageRevision",
+        "oldTokenAttemptCount", "semanticEffectCount", "oldTokenPublicationCount", "geometryRevision",
         "lineageRevision", "captureRevision", "coverageRevision", "acceptedStyleRevision",
         "regionManifestRevision", "nextSurfaceIdHighWater", "schemaRootRevision",
     )
 
     data class Receipt(val policyCases: Int, val freshBindingCases: Int)
 
-    fun run(bytes: ByteArray, expectedSha256: String = SHA256): Receipt {
+    data class FreshBindingExpectation(
+        val oldTransactionId: Long,
+        val oldRequestSequence: Long,
+        val freshTransactionId: Long,
+        val freshRequestSequence: Long,
+        val beginRequestSequence: Long,
+        val commitRequestSequence: Long,
+        val ackRequestSequence: Long,
+        val nextRequestSequence: Long,
+        val nextTransactionId: Long,
+        val targetGeometryRevision: Long,
+        val targetLineageRevision: Long,
+        val oldTokenAttemptCount: Long,
+        val semanticEffectCount: Long,
+        val oldTokenPublicationCount: Long,
+        val authority: M0aCommittedBaselineV1,
+    )
+
+    data class FreshBindingObservation(
+        val freshTransactionId: Long,
+        val freshRequestSequence: Long,
+        val attemptedRequestSequences: List<Long>,
+        val nextRequestSequence: Long,
+        val nextTransactionId: Long,
+        val geometryRevision: Long,
+        val lineageRevision: Long,
+        val captureRevision: Long,
+        val coverageRevision: Long,
+        val acceptedStyleRevision: Long,
+        val regionManifestRevision: Long,
+        val nextSurfaceIdHighWater: Long,
+        val schemaRootRevision: Long,
+        val oldTokenAttemptCount: Long,
+        val semanticEffectCount: Long,
+        val oldTokenPublicationCount: Long,
+    )
+
+    fun run(
+        bytes: ByteArray,
+        expectedSha256: String = SHA256,
+        executeFreshBinding: (FreshBindingExpectation) -> FreshBindingObservation,
+    ): Receipt {
         require(sha256(bytes) == expectedSha256) { "Issue 98 corpus SHA-256 mismatch" }
         val root = Json.parseToJsonElement(bytes.decodeToString()).jsonObject
         root.requireExactKeys(rootKeys, "root")
@@ -42,7 +85,7 @@ object M0aVgs2RecoveryCorpus {
         policies.forEach { executePolicy(it) }
         val fresh = root.getValue("freshBinding").jsonObject
         fresh.requireExactKeys(freshKeys, "freshBinding")
-        executeFreshBinding(fresh)
+        executeFreshBinding(fresh, executeFreshBinding)
         return Receipt(policies.size, 1)
     }
 
@@ -92,7 +135,10 @@ object M0aVgs2RecoveryCorpus {
         require(detail.observedValue == row.long("observedValue"))
     }
 
-    private fun executeFreshBinding(row: JsonObject) {
+    private fun executeFreshBinding(
+        row: JsonObject,
+        execute: (FreshBindingExpectation) -> FreshBindingObservation,
+    ) {
         val old = M0aCommittedBaselineV1(
             row.long("oldTransactionId"), row.long("geometryRevision"), row.long("lineageRevision"),
             row.long("acceptedStyleRevision"), captureRevision = row.long("captureRevision"),
@@ -101,46 +147,46 @@ object M0aVgs2RecoveryCorpus {
             schemaRootRevision = row.long("schemaRootRevision"),
             nextSurfaceIdHighWater = row.long("nextSurfaceIdHighWater"),
         )
-        val fresh = M0aCommittedBaselineV1.forFreshBinding(old)
-        require(row.long("oldRequestSequence") == Long.MAX_VALUE)
-        val request = M0aControlRequest(
-            operation = M0aControlOperation.START,
-            flags = 0,
-            controlRequestId = uuid(1),
-            sessionId = uuid(17),
-            captureGroupId = uuid(33),
-            sessionGeneration = 1,
-            groupGeneration = 1,
-            coverageEpoch = 1,
-            streamToken = 0,
-            payload = M0aStartRequestCodecV2.defaultPayload(),
+        val expectation = FreshBindingExpectation(
+            oldTransactionId = row.long("oldTransactionId"),
+            oldRequestSequence = row.long("oldRequestSequence"),
+            freshTransactionId = row.long("freshTransactionId"),
+            freshRequestSequence = row.long("freshRequestSequence"),
+            beginRequestSequence = row.long("beginRequestSequence"),
+            commitRequestSequence = row.long("commitRequestSequence"),
+            ackRequestSequence = row.long("ackRequestSequence"),
+            nextRequestSequence = row.long("nextRequestSequence"),
+            nextTransactionId = row.long("nextTransactionId"),
+            targetGeometryRevision = row.long("targetGeometryRevision"),
+            targetLineageRevision = row.long("targetLineageRevision"),
+            oldTokenAttemptCount = row.long("oldTokenAttemptCount"),
+            semanticEffectCount = row.long("semanticEffectCount"),
+            oldTokenPublicationCount = row.long("oldTokenPublicationCount"),
+            authority = old,
         )
-        val lifecycle = M0aControlLifecycle(initialCommittedBaseline = old)
-        val response = M0aControlCodec.decodeResponse(
-            lifecycle.handle(request, M0aControlCodec.encodeRequest(request)),
-        )
-        require(response.outcome == 0)
-        require(response.nativeTransactionId == row.long("freshTransactionId"))
-        require(response.nextExchangeRequestSequence == row.long("freshRequestSequence"))
-        require(lifecycle.committedBaseline() == fresh)
-        val frames = M0aStructuralTransactionProducerV1.produce(
-            transactionId = row.long("nextTransactionId"),
-            baseGeometryRevision = fresh.geometryRevision,
-            targetGeometryRevision = fresh.geometryRevision + 1,
-            targetLineageRevision = fresh.lineageRevision + 1,
-            bytes = byteArrayOf(),
-        )
-        require(frames.first() is M0aTransactionBeginFrameV1)
-        require(frames.last() is M0aTransactionCommitFrameV1)
-        require(fresh.copy(transactionId = old.transactionId) == old)
-        require(row.int("semanticEffectCount") == 1 && row.int("oldTokenPublicationCount") == 0)
-    }
-
-    private fun uuid(seed: Int): M0aUuid {
-        val bytes = ByteArray(16) { (seed + it).toByte() }
-        bytes[6] = 0x40
-        bytes[8] = 0x80.toByte()
-        return M0aUuid(bytes)
+        val observed = execute(expectation)
+        require(expectation.oldTransactionId == Long.MAX_VALUE)
+        require(expectation.oldRequestSequence == Long.MAX_VALUE)
+        require(observed.freshTransactionId == expectation.freshTransactionId)
+        require(observed.freshRequestSequence == expectation.freshRequestSequence)
+        require(observed.attemptedRequestSequences == listOf(
+            expectation.beginRequestSequence,
+            expectation.commitRequestSequence,
+            expectation.ackRequestSequence,
+        ))
+        require(observed.nextRequestSequence == expectation.nextRequestSequence)
+        require(observed.nextTransactionId == expectation.nextTransactionId)
+        require(observed.geometryRevision == expectation.targetGeometryRevision)
+        require(observed.lineageRevision == expectation.targetLineageRevision)
+        require(observed.captureRevision == old.captureRevision)
+        require(observed.coverageRevision == old.coverageRevision)
+        require(observed.acceptedStyleRevision == old.styleRevision)
+        require(observed.regionManifestRevision == old.regionManifestRevision)
+        require(observed.nextSurfaceIdHighWater == old.nextSurfaceIdHighWater)
+        require(observed.schemaRootRevision == old.schemaRootRevision)
+        require(observed.oldTokenAttemptCount == expectation.oldTokenAttemptCount)
+        require(observed.semanticEffectCount == expectation.semanticEffectCount)
+        require(observed.oldTokenPublicationCount == expectation.oldTokenPublicationCount)
     }
 
     private fun JsonObject.requireExactKeys(expected: Set<String>, label: String) {

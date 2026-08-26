@@ -774,8 +774,9 @@ class VisibilityGridV2BindingTest {
             assertTrue(handoff.completed.await(2, TimeUnit.SECONDS))
             @Suppress("UNCHECKED_CAST")
             val receipt = handoff.successValue as Map<String, Any>
-            assertEquals(0, receipt["semanticEffectCount"])
-            assertEquals(0, receipt["oldTokenPublicationCount"])
+            assertEquals(1L, receipt["oldTokenAttemptCount"])
+            assertEquals(0L, receipt["semanticEffectCount"])
+            assertEquals(0L, receipt["oldTokenPublicationCount"])
 
             val freshSnapshot = binding.snapshot()
             val qualifier = freshSnapshot.nativeStreamToken + freshSnapshot.workerBindingToken
@@ -1885,7 +1886,7 @@ class VisibilityGridV2BindingTest {
     }
 }
 
-private class RecordingResult(
+internal class RecordingResult(
     private val onSuccess: (() -> Unit)? = null,
 ) : MethodChannel.Result {
     val completed = CountDownLatch(1)
@@ -1912,7 +1913,7 @@ private class RecordingResult(
     }
 }
 
-private class RecordingBinaryReply : BinaryMessenger.BinaryReply {
+internal class RecordingBinaryReply : BinaryMessenger.BinaryReply {
     val completed = CountDownLatch(1)
     var bytes: ByteArray? = null
 
@@ -1925,7 +1926,7 @@ private class RecordingBinaryReply : BinaryMessenger.BinaryReply {
     }
 }
 
-private class MethodTestMessenger : BinaryMessenger {
+internal class MethodTestMessenger : BinaryMessenger {
     private val handlers = mutableMapOf<String, BinaryMessenger.BinaryMessageHandler>()
 
     override fun send(channel: String, message: ByteBuffer?) = send(channel, message, null)

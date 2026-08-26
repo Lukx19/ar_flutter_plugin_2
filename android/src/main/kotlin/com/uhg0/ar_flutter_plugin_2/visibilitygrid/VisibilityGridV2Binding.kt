@@ -248,8 +248,26 @@ class VisibilityGridV2Binding internal constructor(
                 val terminal = streamChannel.executeDebugTerminalDrain(99)
                 val rootBytes = streamChannel.transportInstrumentation.snapshot()
                     .ordinaryRootSurfaceBytes
+                val oldQualifier = bindingQualifier()
                 val before = lifecycleResources().ownedResourceCount
                 replaceBinding()
+                val staleEffectRequest = M0aPacketCodec.encodeRequest(
+                    M0aPacketCodec.Request(
+                        requestFlags = 0,
+                        streamToken = 99,
+                        acknowledgedTransactionId = old.transactionId,
+                        acknowledgedGeometryRevision = old.geometryRevision,
+                        acknowledgedLineageRevision = old.lineageRevision,
+                        nextStyleRevision = old.styleRevision + 1,
+                        maximumResponseBytes = M0aPacketCodec.responseMinimumBytes,
+                        styleRecords = listOf(ByteArray(M0aPacketCodec.styleRecordBytes)),
+                        commandBytes = byteArrayOf(),
+                        requestSequence = 1,
+                    ),
+                )
+                val staleAttempt = streamChannel.executeDebugQualifiedAttempt(
+                    oldQualifier + staleEffectRequest,
+                )
                 val after = lifecycleResources().ownedResourceCount
                 result.success(mapOf(
                     "oldTransactionId" to old.transactionId,
@@ -268,8 +286,9 @@ class VisibilityGridV2Binding internal constructor(
                     "regionManifestRevision" to old.regionManifestRevision,
                     "nextSurfaceIdHighWater" to old.nextSurfaceIdHighWater,
                     "schemaRootRevision" to old.schemaRootRevision,
-                    "semanticEffectCount" to 0,
-                    "oldTokenPublicationCount" to 0,
+                    "oldTokenAttemptCount" to staleAttempt.attemptCount,
+                    "semanticEffectCount" to staleAttempt.semanticEffectCount,
+                    "oldTokenPublicationCount" to staleAttempt.publicationCount,
                     "rootIsolateSurfaceBytes" to rootBytes,
                     "oldClosedResources" to before,
                     "freshActiveResources" to after,

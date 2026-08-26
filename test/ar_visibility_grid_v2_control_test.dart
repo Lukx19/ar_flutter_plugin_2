@@ -1,6 +1,4 @@
 import 'dart:async';
-import 'dart:typed_data';
-
 import 'package:ar_flutter_plugin_2/managers/ar_visibility_grid_v2_control.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -30,6 +28,7 @@ void main() {
         'regionManifestRevision': 16,
         'nextSurfaceIdHighWater': 17,
         'schemaRootRevision': 18,
+        'oldTokenAttemptCount': 1,
         'semanticEffectCount': 0,
         'oldTokenPublicationCount': 0,
         'rootIsolateSurfaceBytes': 0,
@@ -50,6 +49,7 @@ void main() {
     );
     final receipt = await control.runDebugV2Issue98Handoff();
     expect(receipt, isA<ARVisibilityGridV2Issue98HandoffReceipt>());
+    expect(receipt.oldTokenAttemptCount, 1);
     expect(receipt.nextTransactionId, 1);
     expect(receipt.semanticEffectCount, 0);
     expect(receipt.oldTokenPublicationCount, 0);

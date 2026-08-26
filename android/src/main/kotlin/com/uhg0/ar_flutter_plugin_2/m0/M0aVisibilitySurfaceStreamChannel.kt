@@ -168,6 +168,32 @@ class M0aVisibilitySurfaceStreamChannel(
         }
     }
 
+    internal data class DebugQualifiedAttempt(
+        val attemptCount: Long,
+        val semanticEffectCount: Long,
+        val publicationCount: Long,
+    )
+
+    /**
+     * Submits one debug-only transport attempt through the production binding
+     * qualifier fence and reports observed effects rather than expected
+     * constants. The payload is deliberately not decoded when qualification
+     * fails, exactly as for the installed BasicMessageChannel handler.
+     */
+    internal fun executeDebugQualifiedAttempt(transportBytes: ByteArray): DebugQualifiedAttempt {
+        val authorityBefore = synchronized(this) { committedBaseline }
+        val acceptedBefore = telemetry.snapshot().acceptedRequests
+        val authenticated = authenticatedPayload(transportBytes)
+        if (authenticated == null) telemetry.rejected()
+        val authorityAfter = synchronized(this) { committedBaseline }
+        val acceptedAfter = telemetry.snapshot().acceptedRequests
+        return DebugQualifiedAttempt(
+            attemptCount = 1,
+            semanticEffectCount = if (authorityAfter == authorityBefore) 0 else 1,
+            publicationCount = acceptedAfter - acceptedBefore,
+        )
+    }
+
     /**
      * Queues one bounded structural transaction for worker-pull delivery.
      * Frames are consumed only after their response is encoded and accepted;

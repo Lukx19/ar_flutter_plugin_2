@@ -494,6 +494,7 @@ final class ARVisibilityGridV2Issue98HandoffReceipt {
     required this.regionManifestRevision,
     required this.nextSurfaceIdHighWater,
     required this.schemaRootRevision,
+    required this.oldTokenAttemptCount,
     required this.semanticEffectCount,
     required this.oldTokenPublicationCount,
     required this.rootIsolateSurfaceBytes,
@@ -503,42 +504,64 @@ final class ARVisibilityGridV2Issue98HandoffReceipt {
 
   /// Transaction cursor consumed by the old binding.
   final int oldTransactionId;
+
   /// Request cursor consumed by the terminal drain.
   final int oldRequestSequence;
+
   /// Canonical terminal result flags.
   final int terminalResultFlags;
+
   /// Non-wrapping terminal sequence advertised by native.
   final int terminalNextExpectedRequestSequence;
+
   /// Fresh binding transaction cursor before its first publication.
   final int freshTransactionId;
+
   /// First request cursor advertised by the replacement.
   final int freshRequestSequence;
+
   /// First transaction available to the replacement worker.
   final int nextTransactionId;
+
   /// Restored geometry authority before transaction 1.
   final int geometryRevision;
+
   /// Restored lineage authority before transaction 1.
   final int lineageRevision;
+
   /// Restored capture authority.
   final int captureRevision;
+
   /// Restored coverage authority.
   final int coverageRevision;
+
   /// Restored accepted-style authority.
   final int acceptedStyleRevision;
+
   /// Restored region-manifest authority.
   final int regionManifestRevision;
+
   /// Restored surface-ID allocation high-water mark.
   final int nextSurfaceIdHighWater;
+
   /// Restored schema-root authority.
   final int schemaRootRevision;
-  /// Effects published during preparation; transaction 1 is worker-owned.
+
+  /// Effect-bearing attempts submitted with the pre-replacement qualifier.
+  final int oldTokenAttemptCount;
+
+  /// Semantic effects observed from the stale-token attempt.
   final int semanticEffectCount;
+
   /// Publications accepted from the old token after replacement.
   final int oldTokenPublicationCount;
+
   /// Structural bytes observed on the root isolate.
   final int rootIsolateSurfaceBytes;
+
   /// Owned resources closed with the old stream.
   final int oldClosedResources;
+
   /// Owned resources active on the fresh binding.
   final int freshActiveResources;
 
@@ -565,6 +588,7 @@ final class ARVisibilityGridV2Issue98HandoffReceipt {
       'regionManifestRevision',
       'nextSurfaceIdHighWater',
       'schemaRootRevision',
+      'oldTokenAttemptCount',
       'semanticEffectCount',
       'oldTokenPublicationCount',
       'rootIsolateSurfaceBytes',
@@ -594,6 +618,7 @@ final class ARVisibilityGridV2Issue98HandoffReceipt {
       regionManifestRevision: _receiptInt(map, 'regionManifestRevision'),
       nextSurfaceIdHighWater: _receiptInt(map, 'nextSurfaceIdHighWater'),
       schemaRootRevision: _receiptInt(map, 'schemaRootRevision'),
+      oldTokenAttemptCount: _receiptInt(map, 'oldTokenAttemptCount'),
       semanticEffectCount: _receiptInt(map, 'semanticEffectCount'),
       oldTokenPublicationCount: _receiptInt(map, 'oldTokenPublicationCount'),
       rootIsolateSurfaceBytes: _receiptInt(map, 'rootIsolateSurfaceBytes'),
@@ -607,6 +632,7 @@ final class ARVisibilityGridV2Issue98HandoffReceipt {
         receipt.freshTransactionId != 0 ||
         receipt.freshRequestSequence != 1 ||
         receipt.nextTransactionId != 1 ||
+        receipt.oldTokenAttemptCount != 1 ||
         receipt.semanticEffectCount != 0 ||
         receipt.oldTokenPublicationCount != 0 ||
         receipt.rootIsolateSurfaceBytes != 0 ||
