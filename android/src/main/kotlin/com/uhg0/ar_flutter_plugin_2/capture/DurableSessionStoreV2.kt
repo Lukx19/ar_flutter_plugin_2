@@ -79,6 +79,7 @@ class DurableSessionStoreV2(
         val staging = File(attemptDirectory(location, request.accepted.identity), "staging")
         require(staging.mkdirs() || staging.isDirectory)
         var actualBytes = 0L
+        var receiptWritten = false
         try {
             val descriptors = request.components.associateBy { it.kind }
             val staged = streams.sortedBy { it.kind.ordinal }.map { stream ->
@@ -107,19 +108,41 @@ class DurableSessionStoreV2(
             // Receipt is durable before, and independently validates, the pointer switch.
             faults.at(DurableStoreFaultPointV2.RECEIPT_WRITE)
             writePropertiesExclusive(receiptFile(location, request.accepted.identity), receiptProperties(committed, rootHash))
+            receiptWritten = true
             faults.at(DurableStoreFaultPointV2.RECEIPT_FILE_SYNC)
             publishPointer(location, RootPointer(revision, rootHash, request.accepted.identity.commitId))
             budget.commit(reservation, actualBytes)
             deleteTree(staging)
             committed
         } catch (error: Throwable) {
-            deleteTree(staging)
+            // Once receipt persistence has begun the exact pointer cut is unknown;
+            // retain staging and liability for restart/query rather than fabricate abandonment.
+            if (!receiptWritten) deleteTree(staging)
             throw error
         }
     }
 
     override fun prepareCommit(request: CaptureCommitRequest): CaptureReceipt =
         throw UnsupportedOperationException("DurableSessionStoreV2 requires native component streams")
+
+    /** Re-publishes an already hashed/received attempt after an unknown pointer cut; no sensor input is accepted. */
+    fun rebaseSameAttempt(request: CaptureCommitRequest): CaptureReceipt = synchronized(mutex) {
+        val location = location(request.accepted.identity)
+        val file = receiptFile(location, request.accepted.identity)
+        check(file.isFile) { "No durable receipt to rebase" }
+        val values = readProperties(file)
+        check(values.getProperty("kind") == CaptureTerminalKind.COMMITTED_PICTURE.name && values.getProperty("requestHash") == requestHash(request)) { "Changed attempt cannot rebase" }
+        val rootHash = values.getProperty("rootHash")
+        val revision = values.getProperty("revision").toLong()
+        check(validRootHash(location, rootHash, revision, 0)) { "Receipt root is incomplete" }
+        publishPointer(location, RootPointer(revision, rootHash, request.accepted.identity.commitId))
+        val accepted = readProperties(acceptedFile(location, request.accepted.identity))
+        budget.reservation(accepted.getProperty("reservationToken"))?.let { reservation ->
+            budget.commit(reservation, request.components.fold(0L) { total, component -> Math.addExact(total, component.byteLength) })
+        }
+        deleteTree(File(attemptDirectory(location, request.accepted.identity), "staging"))
+        receipt(location, request.accepted.identity)!!
+    }
 
     override fun queryReceipt(identity: CaptureAttemptIdentity): CaptureReceipt? = synchronized(mutex) { receipt(location(identity), identity) }
 
@@ -171,6 +194,7 @@ class DurableSessionStoreV2(
         val file = fallbackIdentity?.let { receiptFile(location, it) } ?: return null; if (!file.isFile) return null
         val value = readProperties(file); val identity = fallbackIdentity ?: return null
         val kind = value.getProperty("kind") ?: return null
+        if (kind == CaptureTerminalKind.COMMITTED_PICTURE.name && selectedRoot(location)?.rootHash != value.getProperty("rootHash")) return null
         val terminal = if (kind == CaptureTerminalKind.COMMITTED_PICTURE.name) CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, identity, value.getProperty("requestHash"), "committed", value.getProperty("captureId"), value.getProperty("revision").toLong(), value.getProperty("rootHash"))
         else CaptureTerminal(CaptureTerminalKind.ABANDONED_ATTEMPT, identity, value.getProperty("requestHash"), value.getProperty("reason", "abandoned"))
         return CaptureReceipt(identity, if (terminal.kind == CaptureTerminalKind.COMMITTED_PICTURE) CaptureAttemptPhase.COMMITTED_PICTURE else CaptureAttemptPhase.ABANDONED_ATTEMPT, value.getProperty("requestHash"), value.getProperty("receiptHash"), true, terminal)

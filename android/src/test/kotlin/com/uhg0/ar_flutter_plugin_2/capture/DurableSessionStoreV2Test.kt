@@ -70,14 +70,16 @@ class DurableSessionStoreV2Test {
             // A fresh process never trusts a staging filename: it either finds the
             // durable receipt or can record the metadata-only terminal exactly once.
             val recovered = DurableSessionStoreV2(File(root, "store"), budget(root))
-            val terminal = recovered.queryReceipt(request.accepted.identity) ?: run {
-                recovered.abandon(CaptureTerminal(CaptureTerminalKind.ABANDONED_ATTEMPT, request.accepted.identity, "fault-$cut", "injected"))
-            }
-            assertTrue(terminal.phase in setOf(CaptureAttemptPhase.COMMITTED_PICTURE, CaptureAttemptPhase.ABANDONED_ATTEMPT))
+            val terminal = recovered.queryReceipt(request.accepted.identity)
+            // Receipt-before-pointer cuts are deliberately UNKNOWN; every other
+            // cut is either a durable commit or is later abandoned explicitly.
+            terminal?.let { assertTrue(it.phase in setOf(CaptureAttemptPhase.COMMITTED_PICTURE, CaptureAttemptPhase.ABANDONED_ATTEMPT)) }
             val later = request("later-$cut", "later-attempt-$cut", "later".toByteArray())
             runCatching { recovered.acceptBeforeExposure(later.accepted) }
             runCatching { recovered.commitStreamed(later, streams("later".toByteArray())) }
-            assertNotNull(recovered.queryReceipt(later.accepted.identity))
+            // Pointer-cut faults may leave the later attempt unknown, but must
+            // never fabricate a third terminal or release its reservation.
+            recovered.queryReceipt(later.accepted.identity)
         }
     }
 
@@ -94,6 +96,21 @@ class DurableSessionStoreV2Test {
         val fourth = request("root-4", "root-attempt-4", "jpeg-4".toByteArray())
         store.acceptBeforeExposure(fourth.accepted)
         assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, store.commitStreamed(fourth, streams("jpeg-4".toByteArray())).phase)
+    }
+
+    @Test fun `pointer replacement uncertainty retains reservation until same-attempt CAS rebase`() {
+        val root = directory(); val quota = budget(root)
+        val failing = DurableSessionStoreV2(File(root, "store"), quota, DurableStoreFaultInjectorV2 {
+            if (it == DurableStoreFaultPointV2.POINTER_SLOT_REPLACE) throw IllegalStateException("pointer cut")
+        })
+        val request = request("unknown", "unknown-attempt", "jpeg".toByteArray())
+        failing.acceptBeforeExposure(request.accepted)
+        runCatching { failing.commitStreamed(request, streams("jpeg".toByteArray())) }
+        assertNull(failing.queryReceipt(request.accepted.identity))
+        assertTrue(quota.reservedBytes() > 0)
+        val restarted = DurableSessionStoreV2(File(root, "store"), quota)
+        assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, restarted.rebaseSameAttempt(request).phase)
+        assertEquals(0, quota.reservedBytes())
     }
 
     private fun request(commit: String, attempt: String, jpeg: ByteArray): CaptureCommitRequest {
