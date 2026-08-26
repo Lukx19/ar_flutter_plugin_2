@@ -357,8 +357,8 @@ void main() {
     test('all 540 rows execute canonical terminal query and replay outcomes',
         () {
       final outcomeCounts = <CaptureMatrixOutcome, int>{};
-      final lifecycleActions =
-          <CaptureLifecycleEvent, CaptureLifecycleAction>{};
+      final lifecycleEffects =
+          <CaptureLifecycleEvent, Set<CaptureLifecycleOwnershipEffect>>{};
       final accepted = {
         CaptureLane.manual: _accepted(CaptureLane.manual),
         CaptureLane.automatic: _accepted(CaptureLane.automatic, ordinal: 2),
@@ -376,7 +376,9 @@ void main() {
                 '${row.lane}/${row.phase}/${row.fault}/${row.lifecycleEvent}');
         expect(execution.exactReplay, isTrue);
         expect(execution.changedReplayConflict, isTrue);
-        lifecycleActions[row.lifecycleEvent] = execution.lifecycleAction;
+        lifecycleEffects
+            .putIfAbsent(row.lifecycleEvent, () => {})
+            .add(execution.ownershipEffect);
         expect(
             execution.lateCallbackNoOp, row.fault == CaptureFault.lateCallback);
         expect(
@@ -385,27 +387,57 @@ void main() {
                     execution.outcome != CaptureMatrixOutcome.committed
                 ? 0
                 : 1);
+        expect(execution.sensorOutputOwnedAtCut,
+            row.phase.index >= CaptureAttemptPhase.sensorOutputOwned.index);
+        final activeOwnerContinues =
+            row.lifecycleEvent == CaptureLifecycleEvent.automaticDisabled &&
+                row.fault == CaptureFault.lateCallback;
+        expect(
+            execution.continuedExposureAfterCut,
+            activeOwnerContinues &&
+                row.phase == CaptureAttemptPhase.reservedAccepted);
+        expect(
+            execution.sensorOutputAcquiredAfterCut,
+            activeOwnerContinues &&
+                row.phase.index < CaptureAttemptPhase.sensorOutputOwned.index);
+        expect(execution.classificationReason,
+            contains(execution.ownershipEffect.name));
         outcomeCounts.update(execution.outcome, (value) => value + 1,
             ifAbsent: () => 1);
       }
       expect(outcomeCounts, {
-        CaptureMatrixOutcome.abandoned: 372,
+        CaptureMatrixOutcome.abandoned: 378,
         CaptureMatrixOutcome.outcomeUnknown: 90,
-        CaptureMatrixOutcome.committed: 78,
+        CaptureMatrixOutcome.committed: 72,
       });
-      expect(lifecycleActions, {
-        CaptureLifecycleEvent.automaticDisabled:
-            CaptureLifecycleAction.automaticIntentSuppressed,
-        CaptureLifecycleEvent.routeLeft:
-            CaptureLifecycleAction.gracefulRouteClassification,
-        CaptureLifecycleEvent.viewReplaced:
-            CaptureLifecycleAction.viewReplacementClassification,
-        CaptureLifecycleEvent.arSessionReplaced:
-            CaptureLifecycleAction.arSessionReplacementClassification,
-        CaptureLifecycleEvent.backgrounded:
-            CaptureLifecycleAction.backgroundClassification,
-        CaptureLifecycleEvent.processRestarted:
-            CaptureLifecycleAction.processReceiptRecovery,
+      expect(lifecycleEffects, {
+        CaptureLifecycleEvent.automaticDisabled: {
+          CaptureLifecycleOwnershipEffect.automaticActiveOwnerContinues
+        },
+        CaptureLifecycleEvent.routeLeft: {
+          CaptureLifecycleOwnershipEffect.routePreOutputClassified,
+          CaptureLifecycleOwnershipEffect.routeOwnedOutputTransferred,
+          CaptureLifecycleOwnershipEffect.routeDurableStoreOwned,
+        },
+        CaptureLifecycleEvent.backgrounded: {
+          CaptureLifecycleOwnershipEffect.backgroundPreOutputClassified,
+          CaptureLifecycleOwnershipEffect.backgroundOwnedOutputFinishing,
+          CaptureLifecycleOwnershipEffect.backgroundDurableStoreOwned,
+        },
+        CaptureLifecycleEvent.viewReplaced: {
+          CaptureLifecycleOwnershipEffect.viewPreOutputFenced,
+          CaptureLifecycleOwnershipEffect.viewOwnedOutputTransferred,
+          CaptureLifecycleOwnershipEffect.viewDurableStoreOwned,
+        },
+        CaptureLifecycleEvent.arSessionReplaced: {
+          CaptureLifecycleOwnershipEffect.arPreOutputGroupFenced,
+          CaptureLifecycleOwnershipEffect.arOwnedOutputFrozenGroup,
+          CaptureLifecycleOwnershipEffect.arDurableOldGroupStoreOwned,
+        },
+        CaptureLifecycleEvent.processRestarted: {
+          CaptureLifecycleOwnershipEffect.processPreDurableAbsent,
+          CaptureLifecycleOwnershipEffect.processDurableReceiptRecovered,
+        },
       });
 
       final committed = CaptureFaultLifecycleCase(
@@ -465,8 +497,90 @@ void main() {
           ]));
       expect(backgroundExecution.outcome, CaptureMatrixOutcome.committed);
       expect(restartExecution.outcome, CaptureMatrixOutcome.abandoned);
-      expect(backgroundExecution.lifecycleAction,
-          isNot(restartExecution.lifecycleAction));
+      expect(backgroundExecution.ownershipEffect,
+          isNot(restartExecution.ownershipEffect));
+
+      CaptureMatrixExecution classify(
+          CaptureLifecycleEvent event, CaptureAttemptPhase phase) {
+        final row = CaptureFaultLifecycleCase(CaptureLane.manual, phase,
+            CaptureFault.lateCallback, event, CaptureMatrixOutcome.abandoned);
+        return CaptureFaultLifecycleMatrix.execute(
+            row,
+            attempt,
+            _commit(attempt, [
+              _component(CaptureComponentKind.jpeg),
+              _component(CaptureComponentKind.dng)
+            ]));
+      }
+
+      final automaticPre = classify(CaptureLifecycleEvent.automaticDisabled,
+          CaptureAttemptPhase.reservedAccepted);
+      final routePre = classify(CaptureLifecycleEvent.routeLeft,
+          CaptureAttemptPhase.reservedAccepted);
+      expect(automaticPre.outcome, CaptureMatrixOutcome.committed);
+      expect(automaticPre.exposureCount, 1);
+      expect(automaticPre.continuedExposureAfterCut, isTrue);
+      expect(automaticPre.sensorOutputAcquiredAfterCut, isTrue);
+      expect(routePre.outcome, CaptureMatrixOutcome.abandoned);
+      expect(routePre.exposureCount, 0);
+      expect(routePre.sensorOutputAcquiredAfterCut, isFalse);
+
+      for (final event in const [
+        CaptureLifecycleEvent.routeLeft,
+        CaptureLifecycleEvent.backgrounded,
+        CaptureLifecycleEvent.viewReplaced,
+        CaptureLifecycleEvent.arSessionReplaced,
+      ]) {
+        final requested =
+            classify(event, CaptureAttemptPhase.exposureRequested);
+        expect(requested.outcome, CaptureMatrixOutcome.abandoned,
+            reason: '$event pre-output terminal');
+        expect(requested.exposureCount, 1);
+        expect(requested.sensorOutputOwnedAtCut, isFalse);
+        expect(requested.sensorOutputAcquiredAfterCut, isFalse);
+        expect(requested.exactReplay, isTrue);
+        expect(requested.changedReplayConflict, isTrue);
+      }
+      final backgroundTimeout = CaptureFaultLifecycleMatrix.execute(
+          const CaptureFaultLifecycleCase(
+              CaptureLane.manual,
+              CaptureAttemptPhase.exposureRequested,
+              CaptureFault.timeout,
+              CaptureLifecycleEvent.backgrounded,
+              CaptureMatrixOutcome.outcomeUnknown),
+          attempt,
+          _commit(attempt, [
+            _component(CaptureComponentKind.jpeg),
+            _component(CaptureComponentKind.dng)
+          ]));
+      expect(backgroundTimeout.outcome, CaptureMatrixOutcome.outcomeUnknown);
+      expect(backgroundTimeout.phase, CaptureAttemptPhase.exposureRequested);
+      expect(backgroundTimeout.classificationReason,
+          contains('query-same-identity'));
+      expect(backgroundTimeout.sensorOutputAcquiredAfterCut, isFalse);
+      expect(backgroundTimeout.exactReplay, isTrue);
+      expect(backgroundTimeout.changedReplayConflict, isTrue);
+
+      final viewOwned = classify(CaptureLifecycleEvent.viewReplaced,
+          CaptureAttemptPhase.sensorOutputOwned);
+      final arOwned = classify(CaptureLifecycleEvent.arSessionReplaced,
+          CaptureAttemptPhase.sensorOutputOwned);
+      expect(viewOwned.outcome, CaptureMatrixOutcome.committed);
+      expect(arOwned.outcome, CaptureMatrixOutcome.committed);
+      expect(viewOwned.ownershipEffect,
+          CaptureLifecycleOwnershipEffect.viewOwnedOutputTransferred);
+      expect(arOwned.ownershipEffect,
+          CaptureLifecycleOwnershipEffect.arOwnedOutputFrozenGroup);
+      expect(
+          viewOwned.classificationReason, isNot(arOwned.classificationReason));
+
+      for (final event in CaptureLifecycleEvent.values) {
+        final durable = classify(event, CaptureAttemptPhase.durablePrepared);
+        expect(durable.outcome, CaptureMatrixOutcome.committed,
+            reason: '$event durable owner');
+        expect(durable.sensorOutputOwnedAtCut, isTrue);
+        expect(durable.sensorOutputAcquiredAfterCut, isFalse);
+      }
     });
   });
 }

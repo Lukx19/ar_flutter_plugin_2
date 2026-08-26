@@ -128,29 +128,43 @@ class CaptureIntentContractTest {
     fun `all 540 rows execute canonical query terminal and replay outcomes`() {
         val attempts = mapOf(CaptureLane.MANUAL to accepted(CaptureLane.MANUAL, 1), CaptureLane.AUTOMATIC to accepted(CaptureLane.AUTOMATIC, 2))
         val counts = mutableMapOf<CaptureMatrixOutcome, Int>()
-        val lifecycleActions = mutableMapOf<CaptureLifecycleEvent, CaptureLifecycleAction>()
+        val lifecycleEffects = mutableMapOf<CaptureLifecycleEvent, MutableSet<CaptureLifecycleOwnershipEffect>>()
         CaptureFaultLifecycleMatrix.generate().forEach { row ->
             val attempt = requireNotNull(attempts[row.lane])
             val execution = CaptureFaultLifecycleMatrix.execute(row, attempt, commit(attempt, components()))
             assertEquals(row.expectedOutcome, execution.outcome)
             assertTrue(execution.exactReplay)
             assertTrue(execution.changedReplayConflict)
-            lifecycleActions[row.lifecycleEvent] = execution.lifecycleAction
+            lifecycleEffects.getOrPut(row.lifecycleEvent) { mutableSetOf() }.add(execution.ownershipEffect)
             assertEquals(row.fault == CaptureFault.LATE_CALLBACK, execution.lateCallbackNoOp)
             assertEquals(if (row.phase == CaptureAttemptPhase.RESERVED_ACCEPTED &&
                 execution.outcome != CaptureMatrixOutcome.COMMITTED) 0 else 1, execution.exposureCount)
+            assertEquals(row.phase.ordinal >= CaptureAttemptPhase.SENSOR_OUTPUT_OWNED.ordinal,
+                execution.sensorOutputOwnedAtCut)
+            val activeOwnerContinues = row.lifecycleEvent == CaptureLifecycleEvent.AUTOMATIC_DISABLED &&
+                row.fault == CaptureFault.LATE_CALLBACK
+            assertEquals(activeOwnerContinues && row.phase == CaptureAttemptPhase.RESERVED_ACCEPTED,
+                execution.continuedExposureAfterCut)
+            assertEquals(activeOwnerContinues && row.phase.ordinal < CaptureAttemptPhase.SENSOR_OUTPUT_OWNED.ordinal,
+                execution.sensorOutputAcquiredAfterCut)
+            assertTrue(execution.classificationReason.contains(execution.ownershipEffect.name))
             counts[execution.outcome] = (counts[execution.outcome] ?: 0) + 1
         }
-        assertEquals(mapOf(CaptureMatrixOutcome.ABANDONED to 372, CaptureMatrixOutcome.OUTCOME_UNKNOWN to 90,
-            CaptureMatrixOutcome.COMMITTED to 78), counts)
+        assertEquals(mapOf(CaptureMatrixOutcome.ABANDONED to 378, CaptureMatrixOutcome.OUTCOME_UNKNOWN to 90,
+            CaptureMatrixOutcome.COMMITTED to 72), counts)
         assertEquals(mapOf(
-            CaptureLifecycleEvent.AUTOMATIC_DISABLED to CaptureLifecycleAction.AUTOMATIC_INTENT_SUPPRESSED,
-            CaptureLifecycleEvent.ROUTE_LEFT to CaptureLifecycleAction.GRACEFUL_ROUTE_CLASSIFICATION,
-            CaptureLifecycleEvent.VIEW_REPLACED to CaptureLifecycleAction.VIEW_REPLACEMENT_CLASSIFICATION,
-            CaptureLifecycleEvent.AR_SESSION_REPLACED to CaptureLifecycleAction.AR_SESSION_REPLACEMENT_CLASSIFICATION,
-            CaptureLifecycleEvent.BACKGROUNDED to CaptureLifecycleAction.BACKGROUND_CLASSIFICATION,
-            CaptureLifecycleEvent.PROCESS_RESTARTED to CaptureLifecycleAction.PROCESS_RECEIPT_RECOVERY,
-        ), lifecycleActions)
+            CaptureLifecycleEvent.AUTOMATIC_DISABLED to setOf(CaptureLifecycleOwnershipEffect.AUTOMATIC_ACTIVE_OWNER_CONTINUES),
+            CaptureLifecycleEvent.ROUTE_LEFT to setOf(CaptureLifecycleOwnershipEffect.ROUTE_PRE_OUTPUT_CLASSIFIED,
+                CaptureLifecycleOwnershipEffect.ROUTE_OWNED_OUTPUT_TRANSFERRED, CaptureLifecycleOwnershipEffect.ROUTE_DURABLE_STORE_OWNED),
+            CaptureLifecycleEvent.BACKGROUNDED to setOf(CaptureLifecycleOwnershipEffect.BACKGROUND_PRE_OUTPUT_CLASSIFIED,
+                CaptureLifecycleOwnershipEffect.BACKGROUND_OWNED_OUTPUT_FINISHING, CaptureLifecycleOwnershipEffect.BACKGROUND_DURABLE_STORE_OWNED),
+            CaptureLifecycleEvent.VIEW_REPLACED to setOf(CaptureLifecycleOwnershipEffect.VIEW_PRE_OUTPUT_FENCED,
+                CaptureLifecycleOwnershipEffect.VIEW_OWNED_OUTPUT_TRANSFERRED, CaptureLifecycleOwnershipEffect.VIEW_DURABLE_STORE_OWNED),
+            CaptureLifecycleEvent.AR_SESSION_REPLACED to setOf(CaptureLifecycleOwnershipEffect.AR_PRE_OUTPUT_GROUP_FENCED,
+                CaptureLifecycleOwnershipEffect.AR_OWNED_OUTPUT_FROZEN_GROUP, CaptureLifecycleOwnershipEffect.AR_DURABLE_OLD_GROUP_STORE_OWNED),
+            CaptureLifecycleEvent.PROCESS_RESTARTED to setOf(CaptureLifecycleOwnershipEffect.PROCESS_PRE_DURABLE_ABSENT,
+                CaptureLifecycleOwnershipEffect.PROCESS_DURABLE_RECEIPT_RECOVERED),
+        ), lifecycleEffects)
 
         val attempt = requireNotNull(attempts[CaptureLane.MANUAL])
         val committed = CaptureFaultLifecycleCase(CaptureLane.MANUAL, CaptureAttemptPhase.DURABLE_PREPARED,
@@ -167,7 +181,52 @@ class CaptureIntentContractTest {
         val restartExecution = CaptureFaultLifecycleMatrix.execute(restarted, attempt, commit(attempt, components()))
         assertEquals(CaptureMatrixOutcome.COMMITTED, backgroundExecution.outcome)
         assertEquals(CaptureMatrixOutcome.ABANDONED, restartExecution.outcome)
-        assertFalse(backgroundExecution.lifecycleAction == restartExecution.lifecycleAction)
+        assertFalse(backgroundExecution.ownershipEffect == restartExecution.ownershipEffect)
+
+        fun classify(event: CaptureLifecycleEvent, phase: CaptureAttemptPhase): CaptureMatrixExecution =
+            CaptureFaultLifecycleMatrix.execute(CaptureFaultLifecycleCase(CaptureLane.MANUAL, phase,
+                CaptureFault.LATE_CALLBACK, event, CaptureMatrixOutcome.ABANDONED), attempt, commit(attempt, components()))
+
+        val automaticPre = classify(CaptureLifecycleEvent.AUTOMATIC_DISABLED, CaptureAttemptPhase.RESERVED_ACCEPTED)
+        val routePre = classify(CaptureLifecycleEvent.ROUTE_LEFT, CaptureAttemptPhase.RESERVED_ACCEPTED)
+        assertEquals(CaptureMatrixOutcome.COMMITTED, automaticPre.outcome)
+        assertEquals(1, automaticPre.exposureCount)
+        assertTrue(automaticPre.continuedExposureAfterCut)
+        assertTrue(automaticPre.sensorOutputAcquiredAfterCut)
+        assertEquals(CaptureMatrixOutcome.ABANDONED, routePre.outcome)
+        assertEquals(0, routePre.exposureCount)
+        assertFalse(routePre.sensorOutputAcquiredAfterCut)
+
+        listOf(CaptureLifecycleEvent.ROUTE_LEFT, CaptureLifecycleEvent.BACKGROUNDED,
+            CaptureLifecycleEvent.VIEW_REPLACED, CaptureLifecycleEvent.AR_SESSION_REPLACED).forEach { event ->
+            val requested = classify(event, CaptureAttemptPhase.EXPOSURE_REQUESTED)
+            assertEquals(CaptureMatrixOutcome.ABANDONED, requested.outcome)
+            assertEquals(1, requested.exposureCount)
+            assertFalse(requested.sensorOutputOwnedAtCut)
+            assertFalse(requested.sensorOutputAcquiredAfterCut)
+            assertTrue(requested.exactReplay)
+            assertTrue(requested.changedReplayConflict)
+        }
+
+        val backgroundTimeout = CaptureFaultLifecycleMatrix.execute(CaptureFaultLifecycleCase(CaptureLane.MANUAL,
+            CaptureAttemptPhase.EXPOSURE_REQUESTED, CaptureFault.TIMEOUT, CaptureLifecycleEvent.BACKGROUNDED,
+            CaptureMatrixOutcome.OUTCOME_UNKNOWN), attempt, commit(attempt, components()))
+        assertEquals(CaptureMatrixOutcome.OUTCOME_UNKNOWN, backgroundTimeout.outcome)
+        assertEquals(CaptureAttemptPhase.EXPOSURE_REQUESTED, backgroundTimeout.phase)
+        assertTrue(backgroundTimeout.classificationReason.contains("query-same-identity"))
+        assertFalse(backgroundTimeout.sensorOutputAcquiredAfterCut)
+
+        val viewOwned = classify(CaptureLifecycleEvent.VIEW_REPLACED, CaptureAttemptPhase.SENSOR_OUTPUT_OWNED)
+        val arOwned = classify(CaptureLifecycleEvent.AR_SESSION_REPLACED, CaptureAttemptPhase.SENSOR_OUTPUT_OWNED)
+        assertEquals(CaptureLifecycleOwnershipEffect.VIEW_OWNED_OUTPUT_TRANSFERRED, viewOwned.ownershipEffect)
+        assertEquals(CaptureLifecycleOwnershipEffect.AR_OWNED_OUTPUT_FROZEN_GROUP, arOwned.ownershipEffect)
+        assertFalse(viewOwned.classificationReason == arOwned.classificationReason)
+        CaptureLifecycleEvent.entries.forEach { event ->
+            val durable = classify(event, CaptureAttemptPhase.DURABLE_PREPARED)
+            assertEquals(CaptureMatrixOutcome.COMMITTED, durable.outcome)
+            assertTrue(durable.sensorOutputOwnedAtCut)
+            assertFalse(durable.sensorOutputAcquiredAfterCut)
+        }
     }
 
     private fun accepted(storeBytes: Long = 200) = accepted(CaptureLane.MANUAL, 1, storeBytes)

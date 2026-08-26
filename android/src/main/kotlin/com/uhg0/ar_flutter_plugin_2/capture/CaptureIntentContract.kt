@@ -324,11 +324,17 @@ class CaptureAttemptReferenceMachine(val accepted: CaptureAcceptedAttempt) {
         return transition(hash, CaptureAttemptPhase.VALIDATED, CaptureAttemptPhase.DURABLE_PREPARED) { retainedImageBytes = 0 }
     }
 
-    fun commit(hash: String, captureId: String, captureRevision: Long, manifestId: String): CaptureTransitionResult {
+    fun commit(
+        hash: String,
+        captureId: String,
+        captureRevision: Long,
+        manifestId: String,
+        reason: String = "committed",
+    ): CaptureTransitionResult {
         if (receipt.phase != CaptureAttemptPhase.DURABLE_PREPARED) return replayOrReject(hash, "commit-before-prepare")
         return terminal(
             hash,
-            CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, accepted.identity, hash, "committed", captureId, captureRevision, manifestId),
+            CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, accepted.identity, hash, reason, captureId, captureRevision, manifestId),
         )
     }
 
@@ -394,13 +400,22 @@ data class CaptureFaultLifecycleCase(
 )
 
 enum class CaptureMatrixOutcome { ABANDONED, OUTCOME_UNKNOWN, COMMITTED }
-enum class CaptureLifecycleAction {
-    AUTOMATIC_INTENT_SUPPRESSED,
-    GRACEFUL_ROUTE_CLASSIFICATION,
-    BACKGROUND_CLASSIFICATION,
-    VIEW_REPLACEMENT_CLASSIFICATION,
-    AR_SESSION_REPLACEMENT_CLASSIFICATION,
-    PROCESS_RECEIPT_RECOVERY,
+enum class CaptureLifecycleOwnershipEffect {
+    AUTOMATIC_ACTIVE_OWNER_CONTINUES,
+    ROUTE_PRE_OUTPUT_CLASSIFIED,
+    ROUTE_OWNED_OUTPUT_TRANSFERRED,
+    ROUTE_DURABLE_STORE_OWNED,
+    BACKGROUND_PRE_OUTPUT_CLASSIFIED,
+    BACKGROUND_OWNED_OUTPUT_FINISHING,
+    BACKGROUND_DURABLE_STORE_OWNED,
+    VIEW_PRE_OUTPUT_FENCED,
+    VIEW_OWNED_OUTPUT_TRANSFERRED,
+    VIEW_DURABLE_STORE_OWNED,
+    AR_PRE_OUTPUT_GROUP_FENCED,
+    AR_OWNED_OUTPUT_FROZEN_GROUP,
+    AR_DURABLE_OLD_GROUP_STORE_OWNED,
+    PROCESS_PRE_DURABLE_ABSENT,
+    PROCESS_DURABLE_RECEIPT_RECOVERED,
 }
 data class CaptureMatrixExecution(
     val outcome: CaptureMatrixOutcome,
@@ -408,8 +423,12 @@ data class CaptureMatrixExecution(
     val exposureCount: Int,
     val exactReplay: Boolean,
     val changedReplayConflict: Boolean,
-    val lifecycleAction: CaptureLifecycleAction,
+    val ownershipEffect: CaptureLifecycleOwnershipEffect,
     val lateCallbackNoOp: Boolean,
+    val sensorOutputOwnedAtCut: Boolean,
+    val continuedExposureAfterCut: Boolean,
+    val sensorOutputAcquiredAfterCut: Boolean,
+    val classificationReason: String,
 )
 
 /** Generated complete 2 x 5 x 9 x 6 lane/fault/lifecycle matrix. */
@@ -444,9 +463,8 @@ object CaptureFaultLifecycleMatrix {
 
     private fun lateCallbackOutcome(phase: CaptureAttemptPhase, event: CaptureLifecycleEvent): CaptureMatrixOutcome =
         when (event) {
-            CaptureLifecycleEvent.AUTOMATIC_DISABLED, CaptureLifecycleEvent.ROUTE_LEFT -> CaptureMatrixOutcome.COMMITTED
-            CaptureLifecycleEvent.BACKGROUNDED -> if (phase == CaptureAttemptPhase.RESERVED_ACCEPTED)
-                CaptureMatrixOutcome.ABANDONED else CaptureMatrixOutcome.COMMITTED
+            CaptureLifecycleEvent.AUTOMATIC_DISABLED -> CaptureMatrixOutcome.COMMITTED
+            CaptureLifecycleEvent.ROUTE_LEFT, CaptureLifecycleEvent.BACKGROUNDED,
             CaptureLifecycleEvent.VIEW_REPLACED, CaptureLifecycleEvent.AR_SESSION_REPLACED ->
                 if (phase.ordinal < CaptureAttemptPhase.SENSOR_OUTPUT_OWNED.ordinal)
                     CaptureMatrixOutcome.ABANDONED else CaptureMatrixOutcome.COMMITTED
@@ -454,13 +472,35 @@ object CaptureFaultLifecycleMatrix {
                 CaptureMatrixOutcome.COMMITTED else CaptureMatrixOutcome.ABANDONED
         }
 
-    private fun lifecycleAction(event: CaptureLifecycleEvent): CaptureLifecycleAction = when (event) {
-        CaptureLifecycleEvent.AUTOMATIC_DISABLED -> CaptureLifecycleAction.AUTOMATIC_INTENT_SUPPRESSED
-        CaptureLifecycleEvent.ROUTE_LEFT -> CaptureLifecycleAction.GRACEFUL_ROUTE_CLASSIFICATION
-        CaptureLifecycleEvent.BACKGROUNDED -> CaptureLifecycleAction.BACKGROUND_CLASSIFICATION
-        CaptureLifecycleEvent.VIEW_REPLACED -> CaptureLifecycleAction.VIEW_REPLACEMENT_CLASSIFICATION
-        CaptureLifecycleEvent.AR_SESSION_REPLACED -> CaptureLifecycleAction.AR_SESSION_REPLACEMENT_CLASSIFICATION
-        CaptureLifecycleEvent.PROCESS_RESTARTED -> CaptureLifecycleAction.PROCESS_RECEIPT_RECOVERY
+    private fun ownershipEffect(
+        event: CaptureLifecycleEvent,
+        phase: CaptureAttemptPhase,
+    ): CaptureLifecycleOwnershipEffect {
+        val preOutput = phase.ordinal < CaptureAttemptPhase.SENSOR_OUTPUT_OWNED.ordinal
+        val durable = phase == CaptureAttemptPhase.DURABLE_PREPARED
+        return when (event) {
+            CaptureLifecycleEvent.AUTOMATIC_DISABLED ->
+                CaptureLifecycleOwnershipEffect.AUTOMATIC_ACTIVE_OWNER_CONTINUES
+            CaptureLifecycleEvent.ROUTE_LEFT -> if (preOutput)
+                CaptureLifecycleOwnershipEffect.ROUTE_PRE_OUTPUT_CLASSIFIED else if (durable)
+                CaptureLifecycleOwnershipEffect.ROUTE_DURABLE_STORE_OWNED else
+                CaptureLifecycleOwnershipEffect.ROUTE_OWNED_OUTPUT_TRANSFERRED
+            CaptureLifecycleEvent.BACKGROUNDED -> if (preOutput)
+                CaptureLifecycleOwnershipEffect.BACKGROUND_PRE_OUTPUT_CLASSIFIED else if (durable)
+                CaptureLifecycleOwnershipEffect.BACKGROUND_DURABLE_STORE_OWNED else
+                CaptureLifecycleOwnershipEffect.BACKGROUND_OWNED_OUTPUT_FINISHING
+            CaptureLifecycleEvent.VIEW_REPLACED -> if (preOutput)
+                CaptureLifecycleOwnershipEffect.VIEW_PRE_OUTPUT_FENCED else if (durable)
+                CaptureLifecycleOwnershipEffect.VIEW_DURABLE_STORE_OWNED else
+                CaptureLifecycleOwnershipEffect.VIEW_OWNED_OUTPUT_TRANSFERRED
+            CaptureLifecycleEvent.AR_SESSION_REPLACED -> if (preOutput)
+                CaptureLifecycleOwnershipEffect.AR_PRE_OUTPUT_GROUP_FENCED else if (durable)
+                CaptureLifecycleOwnershipEffect.AR_DURABLE_OLD_GROUP_STORE_OWNED else
+                CaptureLifecycleOwnershipEffect.AR_OWNED_OUTPUT_FROZEN_GROUP
+            CaptureLifecycleEvent.PROCESS_RESTARTED -> if (durable)
+                CaptureLifecycleOwnershipEffect.PROCESS_DURABLE_RECEIPT_RECOVERED else
+                CaptureLifecycleOwnershipEffect.PROCESS_PRE_DURABLE_ABSENT
+        }
     }
 
     fun execute(row: CaptureFaultLifecycleCase, accepted: CaptureAcceptedAttempt, request: CaptureCommitRequest): CaptureMatrixExecution {
@@ -477,16 +517,18 @@ object CaptureFaultLifecycleMatrix {
             lateCallbackNoOp = callback.disposition == CaptureTransitionDisposition.REJECTED &&
                 machine.receipt.phase == phaseBeforeCallback && machine.exposureCount == exposureBeforeCallback
         }
-        val lifecycleAction = lifecycleAction(row.lifecycleEvent)
+        val ownershipEffect = ownershipEffect(row.lifecycleEvent, row.phase)
+        val sensorOutputOwnedAtCut = row.phase.ordinal >= CaptureAttemptPhase.SENSOR_OUTPUT_OWNED.ordinal
         val canonicalOutcome = expectedOutcome(row.phase, row.fault, row.lifecycleEvent)
         if (canonicalOutcome == CaptureMatrixOutcome.COMMITTED) {
-            advanceToDurable(machine, request)
-            machine.commit("terminal", "matrix-capture", 1, "matrix-manifest")
+            val continuation = continuePreservedOwnership(machine, request, row.lifecycleEvent)
+            machine.commit("terminal", "matrix-capture", 1, "matrix-manifest", "lifecycle:${ownershipEffect.name}")
             val exact = machine.commit("terminal", "matrix-capture", 1, "matrix-manifest")
             val changed = machine.commit("changed-terminal", "changed", 2, "changed")
             return CaptureMatrixExecution(CaptureMatrixOutcome.COMMITTED, machine.receipt.phase, machine.exposureCount,
                 exact.disposition == CaptureTransitionDisposition.EXACT_REPLAY, changed.disposition == CaptureTransitionDisposition.CONFLICT,
-                lifecycleAction, lateCallbackNoOp)
+                ownershipEffect, lateCallbackNoOp, sensorOutputOwnedAtCut, continuation.first, continuation.second,
+                requireNotNull(machine.receipt.terminal).reason)
         }
         if (canonicalOutcome == CaptureMatrixOutcome.OUTCOME_UNKNOWN) {
             machine.timeoutUnknown("unknown")
@@ -494,22 +536,40 @@ object CaptureFaultLifecycleMatrix {
             val changed = machine.timeoutUnknown("changed-unknown")
             return CaptureMatrixExecution(CaptureMatrixOutcome.OUTCOME_UNKNOWN, machine.receipt.phase, machine.exposureCount,
                 exact.disposition == CaptureTransitionDisposition.EXACT_REPLAY, changed.disposition == CaptureTransitionDisposition.CONFLICT,
-                lifecycleAction, lateCallbackNoOp)
+                ownershipEffect, lateCallbackNoOp, sensorOutputOwnedAtCut, false, false,
+                "unknown:${ownershipEffect.name}:query-same-identity")
         }
-        machine.abandon("terminal", "proven-absent")
+        machine.abandon("terminal", "lifecycle:${ownershipEffect.name}:proven-absent")
         val exact = machine.abandon("terminal", "proven-absent")
         val changed = machine.abandon("changed-terminal", "changed")
         return CaptureMatrixExecution(CaptureMatrixOutcome.ABANDONED, machine.receipt.phase, machine.exposureCount,
             exact.disposition == CaptureTransitionDisposition.EXACT_REPLAY, changed.disposition == CaptureTransitionDisposition.CONFLICT,
-            lifecycleAction, lateCallbackNoOp)
+            ownershipEffect, lateCallbackNoOp, sensorOutputOwnedAtCut, false, false,
+            requireNotNull(machine.receipt.terminal).reason)
     }
 
-    private fun advanceToDurable(machine: CaptureAttemptReferenceMachine, request: CaptureCommitRequest) {
-        if (machine.receipt.phase == CaptureAttemptPhase.RESERVED_ACCEPTED) machine.requestExposure("lifecycle-expose")
-        if (machine.receipt.phase == CaptureAttemptPhase.EXPOSURE_REQUESTED)
+    private fun continuePreservedOwnership(
+        machine: CaptureAttemptReferenceMachine,
+        request: CaptureCommitRequest,
+        event: CaptureLifecycleEvent,
+    ): Pair<Boolean, Boolean> {
+        var continuedExposureAfterCut = false
+        var sensorOutputAcquiredAfterCut = false
+        if (machine.receipt.phase == CaptureAttemptPhase.RESERVED_ACCEPTED) {
+            check(event == CaptureLifecycleEvent.AUTOMATIC_DISABLED) { "lifecycle cannot request a new exposure" }
+            machine.requestExposure("lifecycle-expose")
+            continuedExposureAfterCut = true
+        }
+        if (machine.receipt.phase == CaptureAttemptPhase.EXPOSURE_REQUESTED) {
+            check(event == CaptureLifecycleEvent.AUTOMATIC_DISABLED) {
+                "lifecycle cannot fabricate sensor-output ownership"
+            }
             machine.ownSensorOutput("lifecycle-output", request.components)
+            sensorOutputAcquiredAfterCut = true
+        }
         if (machine.receipt.phase == CaptureAttemptPhase.SENSOR_OUTPUT_OWNED) machine.validate("lifecycle-validate")
         if (machine.receipt.phase == CaptureAttemptPhase.VALIDATED) machine.prepareDurable("lifecycle-prepare", request)
+        return Pair(continuedExposureAfterCut, sensorOutputAcquiredAfterCut)
     }
 }
 

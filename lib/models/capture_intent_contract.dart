@@ -780,7 +780,8 @@ final class CaptureAttemptReferenceMachine {
   CaptureTransitionResult commit(String requestHash,
       {required String captureId,
       required int captureRevision,
-      required String manifestId}) {
+      required String manifestId,
+      String reason = 'committed'}) {
     if (_receipt.phase != CaptureAttemptPhase.durablePrepared) {
       return _replayOrReject(requestHash, 'commit-before-durable-prepare');
     }
@@ -788,7 +789,7 @@ final class CaptureAttemptReferenceMachine {
       kind: CaptureTerminalKind.committedPicture,
       identity: accepted.identity,
       canonicalTerminalHash: requestHash,
-      reason: 'committed',
+      reason: reason,
       captureId: captureId,
       captureRevision: captureRevision,
       manifestId: manifestId,
@@ -899,13 +900,22 @@ final class CaptureFaultLifecycleCase {
 
 enum CaptureMatrixOutcome { abandoned, outcomeUnknown, committed }
 
-enum CaptureLifecycleAction {
-  automaticIntentSuppressed,
-  gracefulRouteClassification,
-  backgroundClassification,
-  viewReplacementClassification,
-  arSessionReplacementClassification,
-  processReceiptRecovery,
+enum CaptureLifecycleOwnershipEffect {
+  automaticActiveOwnerContinues,
+  routePreOutputClassified,
+  routeOwnedOutputTransferred,
+  routeDurableStoreOwned,
+  backgroundPreOutputClassified,
+  backgroundOwnedOutputFinishing,
+  backgroundDurableStoreOwned,
+  viewPreOutputFenced,
+  viewOwnedOutputTransferred,
+  viewDurableStoreOwned,
+  arPreOutputGroupFenced,
+  arOwnedOutputFrozenGroup,
+  arDurableOldGroupStoreOwned,
+  processPreDurableAbsent,
+  processDurableReceiptRecovered,
 }
 
 final class CaptureMatrixExecution {
@@ -915,15 +925,23 @@ final class CaptureMatrixExecution {
       this.exposureCount,
       this.exactReplay,
       this.changedReplayConflict,
-      this.lifecycleAction,
-      this.lateCallbackNoOp);
+      this.ownershipEffect,
+      this.lateCallbackNoOp,
+      this.sensorOutputOwnedAtCut,
+      this.continuedExposureAfterCut,
+      this.sensorOutputAcquiredAfterCut,
+      this.classificationReason);
   final CaptureMatrixOutcome outcome;
   final CaptureAttemptPhase phase;
   final int exposureCount;
   final bool exactReplay;
   final bool changedReplayConflict;
-  final CaptureLifecycleAction lifecycleAction;
+  final CaptureLifecycleOwnershipEffect ownershipEffect;
   final bool lateCallbackNoOp;
+  final bool sensorOutputOwnedAtCut;
+  final bool continuedExposureAfterCut;
+  final bool sensorOutputAcquiredAfterCut;
+  final String classificationReason;
 }
 
 /// Canonical legal edges. Every other phase pair is rejected deterministically.
@@ -1007,12 +1025,9 @@ final class CaptureFaultLifecycleMatrix {
       CaptureAttemptPhase phase, CaptureLifecycleEvent event) {
     switch (event) {
       case CaptureLifecycleEvent.automaticDisabled:
-      case CaptureLifecycleEvent.routeLeft:
         return CaptureMatrixOutcome.committed;
+      case CaptureLifecycleEvent.routeLeft:
       case CaptureLifecycleEvent.backgrounded:
-        return phase == CaptureAttemptPhase.reservedAccepted
-            ? CaptureMatrixOutcome.abandoned
-            : CaptureMatrixOutcome.committed;
       case CaptureLifecycleEvent.viewReplaced:
       case CaptureLifecycleEvent.arSessionReplaced:
         return phase.index < CaptureAttemptPhase.sensorOutputOwned.index
@@ -1025,20 +1040,42 @@ final class CaptureFaultLifecycleMatrix {
     }
   }
 
-  static CaptureLifecycleAction _lifecycleAction(CaptureLifecycleEvent event) {
+  static CaptureLifecycleOwnershipEffect _ownershipEffect(
+      CaptureLifecycleEvent event, CaptureAttemptPhase phase) {
+    final preOutput = phase.index < CaptureAttemptPhase.sensorOutputOwned.index;
+    final durable = phase == CaptureAttemptPhase.durablePrepared;
     switch (event) {
       case CaptureLifecycleEvent.automaticDisabled:
-        return CaptureLifecycleAction.automaticIntentSuppressed;
+        return CaptureLifecycleOwnershipEffect.automaticActiveOwnerContinues;
       case CaptureLifecycleEvent.routeLeft:
-        return CaptureLifecycleAction.gracefulRouteClassification;
+        return preOutput
+            ? CaptureLifecycleOwnershipEffect.routePreOutputClassified
+            : durable
+                ? CaptureLifecycleOwnershipEffect.routeDurableStoreOwned
+                : CaptureLifecycleOwnershipEffect.routeOwnedOutputTransferred;
       case CaptureLifecycleEvent.backgrounded:
-        return CaptureLifecycleAction.backgroundClassification;
+        return preOutput
+            ? CaptureLifecycleOwnershipEffect.backgroundPreOutputClassified
+            : durable
+                ? CaptureLifecycleOwnershipEffect.backgroundDurableStoreOwned
+                : CaptureLifecycleOwnershipEffect
+                    .backgroundOwnedOutputFinishing;
       case CaptureLifecycleEvent.viewReplaced:
-        return CaptureLifecycleAction.viewReplacementClassification;
+        return preOutput
+            ? CaptureLifecycleOwnershipEffect.viewPreOutputFenced
+            : durable
+                ? CaptureLifecycleOwnershipEffect.viewDurableStoreOwned
+                : CaptureLifecycleOwnershipEffect.viewOwnedOutputTransferred;
       case CaptureLifecycleEvent.arSessionReplaced:
-        return CaptureLifecycleAction.arSessionReplacementClassification;
+        return preOutput
+            ? CaptureLifecycleOwnershipEffect.arPreOutputGroupFenced
+            : durable
+                ? CaptureLifecycleOwnershipEffect.arDurableOldGroupStoreOwned
+                : CaptureLifecycleOwnershipEffect.arOwnedOutputFrozenGroup;
       case CaptureLifecycleEvent.processRestarted:
-        return CaptureLifecycleAction.processReceiptRecovery;
+        return durable
+            ? CaptureLifecycleOwnershipEffect.processDurableReceiptRecovered
+            : CaptureLifecycleOwnershipEffect.processPreDurableAbsent;
     }
   }
 
@@ -1067,15 +1104,19 @@ final class CaptureFaultLifecycleMatrix {
               machine.receipt.phase == phaseBeforeCallback &&
               machine.exposureCount == exposureBeforeCallback;
     }
-    final lifecycleAction = _lifecycleAction(row.lifecycleEvent);
+    final ownershipEffect = _ownershipEffect(row.lifecycleEvent, row.phase);
+    final sensorOutputOwnedAtCut =
+        row.phase.index >= CaptureAttemptPhase.sensorOutputOwned.index;
     final canonicalOutcome =
         _expectedOutcome(row.phase, row.fault, row.lifecycleEvent);
     if (canonicalOutcome == CaptureMatrixOutcome.committed) {
-      _advanceToDurable(machine, request);
+      final continuation =
+          _continuePreservedOwnership(machine, request, row.lifecycleEvent);
       machine.commit('terminal',
           captureId: 'matrix-capture',
           captureRevision: 1,
-          manifestId: 'matrix-manifest');
+          manifestId: 'matrix-manifest',
+          reason: 'lifecycle:${ownershipEffect.name}');
       final exact = machine.commit('terminal',
           captureId: 'matrix-capture',
           captureRevision: 1,
@@ -1088,8 +1129,12 @@ final class CaptureFaultLifecycleMatrix {
           machine.exposureCount,
           exact.disposition == CaptureTransitionDisposition.exactReplay,
           changed.disposition == CaptureTransitionDisposition.conflict,
-          lifecycleAction,
-          lateCallbackNoOp);
+          ownershipEffect,
+          lateCallbackNoOp,
+          sensorOutputOwnedAtCut,
+          continuation.exposure,
+          continuation.sensorOutput,
+          machine.receipt.terminal!.reason);
     }
     if (canonicalOutcome == CaptureMatrixOutcome.outcomeUnknown) {
       machine.timeoutUnknown('unknown');
@@ -1101,10 +1146,15 @@ final class CaptureFaultLifecycleMatrix {
           machine.exposureCount,
           exact.disposition == CaptureTransitionDisposition.exactReplay,
           changed.disposition == CaptureTransitionDisposition.conflict,
-          lifecycleAction,
-          lateCallbackNoOp);
+          ownershipEffect,
+          lateCallbackNoOp,
+          sensorOutputOwnedAtCut,
+          false,
+          false,
+          'unknown:${ownershipEffect.name}:query-same-identity');
     }
-    machine.abandon('terminal', 'proven-absent');
+    machine.abandon(
+        'terminal', 'lifecycle:${ownershipEffect.name}:proven-absent');
     final exact = machine.abandon('terminal', 'proven-absent');
     final changed = machine.abandon('changed-terminal', 'changed');
     return CaptureMatrixExecution(
@@ -1113,17 +1163,33 @@ final class CaptureFaultLifecycleMatrix {
         machine.exposureCount,
         exact.disposition == CaptureTransitionDisposition.exactReplay,
         changed.disposition == CaptureTransitionDisposition.conflict,
-        lifecycleAction,
-        lateCallbackNoOp);
+        ownershipEffect,
+        lateCallbackNoOp,
+        sensorOutputOwnedAtCut,
+        false,
+        false,
+        machine.receipt.terminal!.reason);
   }
 
-  static void _advanceToDurable(
-      CaptureAttemptReferenceMachine machine, CaptureCommitRequest request) {
+  static ({bool exposure, bool sensorOutput}) _continuePreservedOwnership(
+      CaptureAttemptReferenceMachine machine,
+      CaptureCommitRequest request,
+      CaptureLifecycleEvent event) {
+    var continuedExposureAfterCut = false;
+    var sensorOutputAcquiredAfterCut = false;
     if (machine.receipt.phase == CaptureAttemptPhase.reservedAccepted) {
+      if (event != CaptureLifecycleEvent.automaticDisabled) {
+        throw StateError('lifecycle cannot request a new exposure');
+      }
       machine.requestExposure('lifecycle-expose');
+      continuedExposureAfterCut = true;
     }
     if (machine.receipt.phase == CaptureAttemptPhase.exposureRequested) {
+      if (event != CaptureLifecycleEvent.automaticDisabled) {
+        throw StateError('lifecycle cannot fabricate sensor-output ownership');
+      }
       machine.ownSensorOutput('lifecycle-output', request.components);
+      sensorOutputAcquiredAfterCut = true;
     }
     if (machine.receipt.phase == CaptureAttemptPhase.sensorOutputOwned) {
       machine.validate('lifecycle-validate');
@@ -1131,6 +1197,10 @@ final class CaptureFaultLifecycleMatrix {
     if (machine.receipt.phase == CaptureAttemptPhase.validated) {
       machine.prepareDurable('lifecycle-prepare', request);
     }
+    return (
+      exposure: continuedExposureAfterCut,
+      sensorOutput: sensorOutputAcquiredAfterCut
+    );
   }
 }
 
