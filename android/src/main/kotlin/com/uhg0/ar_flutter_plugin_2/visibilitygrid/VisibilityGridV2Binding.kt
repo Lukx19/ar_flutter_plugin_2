@@ -99,6 +99,7 @@ class VisibilityGridV2Binding internal constructor(
     private val pendingCleanupResults = ConcurrentHashMap.newKeySet<PendingCleanupResult>()
     @Volatile private var recoveryGroupCut: RecoveryGroupCut? = null
     @Volatile private var replacementBinding: VisibilityGridV2Binding? = null
+    @Volatile private var observationRuntime: AndroidVisibilityGridRuntime? = null
 
     private fun newLifecycle() = M0aControlLifecycle(
         committedBaselineAuthority = committedBaselineAuthority,
@@ -184,6 +185,35 @@ class VisibilityGridV2Binding internal constructor(
         operationGeneration = operationGeneration,
         executorTrace = executorTrace.toList(),
     )
+
+    /** Returns the exact active V2 lifecycle cut or null before a qualified START. */
+    internal fun currentObservationOwnership(): VisibilityObservationOwnership? {
+        replacementBinding?.let { return it.currentObservationOwnership() }
+        val current = snapshot()
+        if (current.disposed || !current.initialTransactionQueued) return null
+        val sessionId = current.sessionId ?: return null
+        val captureGroupId = current.captureGroupId ?: return null
+        return VisibilityObservationOwnership(
+            sessionId = sessionId.hex(),
+            sessionGeneration = current.sessionGeneration,
+            captureGroupId = captureGroupId.hex(),
+            groupGeneration = current.groupGeneration,
+            coverageEpoch = current.coverageEpoch,
+            arSessionIdentity = current.arSessionIdentity.hex(),
+            viewInstanceId = current.viewInstanceId.hex(),
+            viewGeneration = current.viewGeneration,
+            nativeStreamToken = current.nativeStreamToken.hex(),
+            workerBindingToken = current.workerBindingToken.hex(),
+            bindingGeneration = current.bindingGeneration,
+            lifecycleSequence = current.lifecycleSequence,
+            operationGeneration = current.operationGeneration,
+        )
+    }
+
+    internal fun attachObservationRuntime(runtime: AndroidVisibilityGridRuntime) {
+        observationRuntime = runtime
+        replacementBinding?.attachObservationRuntime(runtime)
+    }
 
     private fun onControlCall(call: MethodCall, result: MethodChannel.Result) {
         if (call.method == "configureDebugV2ExchangeStall") {
@@ -753,7 +783,9 @@ class VisibilityGridV2Binding internal constructor(
             debugRecoverySeam = debugRecoverySeam,
             cleanupAuthority = cleanupAuthority,
             initialCommittedBaselineSeed = lifecycle.committedBaseline(),
-        )
+        ).also { replacement ->
+            observationRuntime?.let(replacement::attachObservationRuntime)
+        }
         return oldSnapshot.withCleanupBalances(
             closedBefore = closedBefore,
             before = resourcesBefore,
@@ -899,6 +931,10 @@ class VisibilityGridV2Binding internal constructor(
         "%02x".format(byte.toInt() and 0xff)
     }
 
+    private fun ByteArray.hex(): String = joinToString("") { byte ->
+        "%02x".format(byte.toInt() and 0xff)
+    }
+
     private fun Snapshot.toMap(): Map<String, Any?> = mapOf(
         "bindingGeneration" to bindingGeneration,
         "streamToken" to streamToken,
@@ -921,6 +957,7 @@ class VisibilityGridV2Binding internal constructor(
         "lifecycleSequence" to lifecycleSequence,
         "operationGeneration" to operationGeneration,
         "executorTrace" to executorTrace,
+        "sourceHealth" to observationRuntime?.snapshot()?.toWireMap(),
     )
 
     private fun Map<String, Any?>.withCleanupBalances(

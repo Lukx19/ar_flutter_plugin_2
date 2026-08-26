@@ -1438,6 +1438,8 @@ final class ARVisibilityGridV2WorkerBinding {
   /// `captureGroupId` are nullable [String]; `arSessionIdentity`,
   /// `viewInstanceId`, `nativeStreamToken`, and `workerBindingToken` are
   /// 16-byte [Uint8List]; `executorTrace` is `List<String>`.
+  /// `sourceHealth` is either null before the Android acquisition runtime is
+  /// attached or a bounded scalar map. It never contains feature/depth arrays.
   /// Throws [StateError] for a closed binding or non-map result and propagates
   /// [PlatformException] or [MissingPluginException] on channel failure.
   Future<Map<Object?, Object?>> snapshot() async {

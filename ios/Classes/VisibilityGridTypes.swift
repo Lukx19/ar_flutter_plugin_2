@@ -392,6 +392,101 @@ struct DepthObservation {
     let worldFromCameraGL: [Double]
 }
 
+// Proposal 08 M2 declaration-only seam. This Android milestone intentionally
+// provides no ARKit adapter, scheduling, mapping, or lifecycle implementation.
+enum VisibilityObservationSourceV2: String {
+    case arcoreFeature
+    case arcoreRawDepth
+    case syntheticFeature
+    case syntheticDepth
+}
+
+enum VisibilityDepthCapabilityV2: String {
+    case unsupported
+    case rawDepth
+    case automatic
+}
+
+struct VisibilityObservationOwnershipV2 {
+    let sessionId: String
+    let sessionGeneration: Int64
+    let captureGroupId: String
+    let groupGeneration: Int64
+    let coverageEpoch: Int64
+    let arSessionIdentity: String
+    let viewInstanceId: String
+    let viewGeneration: Int64
+    let nativeStreamToken: String
+    let workerBindingToken: String
+    let bindingGeneration: Int64
+    let lifecycleSequence: Int64
+    let operationGeneration: Int64
+}
+
+struct VisibilityCameraIntrinsicsV2 {
+    let imageWidth: Int
+    let imageHeight: Int
+    let fx: Double
+    let fy: Double
+    let cx: Double
+    let cy: Double
+    let cropLeft: Int
+    let cropTop: Int
+    let cropWidth: Int
+    let cropHeight: Int
+}
+
+struct VisibilityObservationFrameV2 {
+    let source: VisibilityObservationSourceV2
+    let frameSequence: Int64
+    let frameTimestampNanoseconds: Int64
+    let sourceTimestampNanoseconds: Int64
+    let cameraIdentity: String
+    let tracking: Bool
+    let imageOrientation: String
+    let worldFromCameraGL: [Double]
+    let intrinsics: VisibilityCameraIntrinsicsV2
+    let depthCapability: VisibilityDepthCapabilityV2
+}
+
+struct VisibilityFeatureSampleV2 {
+    let id: Int32
+    let xWorld: Double
+    let yWorld: Double
+    let zWorld: Double
+    let confidence: Double
+}
+
+struct VisibilityDepthSampleV2 {
+    let x: Int
+    let y: Int
+    let depthMillimeters: Int
+    let confidence: Int
+}
+
+struct VisibilityFeatureObservationV2 {
+    let version: String
+    let ownership: VisibilityObservationOwnershipV2
+    let frame: VisibilityObservationFrameV2
+    let samples: [VisibilityFeatureSampleV2]
+    let sourceRejectedSamples: Int
+    let payloadBytes: Int
+}
+
+struct VisibilityDepthObservationV2 {
+    let version: String
+    let ownership: VisibilityObservationOwnershipV2
+    let frame: VisibilityObservationFrameV2
+    let samples: [VisibilityDepthSampleV2]
+    let sourceRejectedSamples: Int
+    let payloadBytes: Int
+}
+
+protocol VisibilityObservationMapperV2 {
+    func admitFeature(_ observation: VisibilityFeatureObservationV2)
+    func admitDepth(_ observation: VisibilityDepthObservationV2)
+}
+
 struct VisibilityGridDiagnostics {
     var candidateTracks = 0
     var stableTracks = 0

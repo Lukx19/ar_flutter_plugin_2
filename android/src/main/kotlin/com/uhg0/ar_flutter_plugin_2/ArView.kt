@@ -32,6 +32,11 @@ import com.uhg0.ar_flutter_plugin_2.sceneview.resolveNodeUri
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridMethodChannel
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridRuntimeCapabilities
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridV2Binding
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.AndroidVisibilityGridMappingAdmission
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.AndroidVisibilityGridRuntime
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.ArCoreVisibilityObservationSource
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityObservationDebugChannel
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityObservationDebugGate
 import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineAuthority
 import com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraCapabilityQuerier
 import io.flutter.FlutterInjector
@@ -116,8 +121,31 @@ internal class ArView(
         committedBaselineAuthority = m0aCommittedBaselineAuthority,
         isDebuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0,
     )
+    private val visibilityObservationDebugGate = VisibilityObservationDebugGate()
+    private val visibilityObservationRuntime = AndroidVisibilityGridRuntime(
+        ownership = visibilityGridV2Binding::currentObservationOwnership,
+        mapper = AndroidVisibilityGridMappingAdmission(
+            ownership = visibilityGridV2Binding::currentObservationOwnership,
+            onFeature = { visibilityObservationDebugGate.awaitIfArmed() },
+            onDepth = { visibilityObservationDebugGate.awaitIfArmed() },
+        ),
+    )
+    private val visibilityObservationSource = ArCoreVisibilityObservationSource(
+        runtime = visibilityObservationRuntime,
+        ownership = visibilityGridV2Binding::currentObservationOwnership,
+        depthMode = sceneHost::visibilityGridDepthMode,
+    )
+    private val visibilityObservationDebugChannel = VisibilityObservationDebugChannel(
+        messenger = messenger,
+        viewId = id,
+        isDebuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0,
+        runtime = visibilityObservationRuntime,
+        ownership = visibilityGridV2Binding::currentObservationOwnership,
+        gate = visibilityObservationDebugGate,
+    )
 
     init {
+        visibilityGridV2Binding.attachObservationRuntime(visibilityObservationRuntime)
         visibilityGridChannel = VisibilityGridMethodChannel(
             messenger = messenger,
             viewId = id,
@@ -221,6 +249,8 @@ internal class ArView(
         anchorChannel.setMethodCallHandler(null)
         captureChannel.setMethodCallHandler(null)
         visibilityGridChannel.dispose()
+        visibilityObservationDebugChannel.dispose()
+        visibilityObservationRuntime.close()
         visibilityGridV2Binding.dispose()
         lifecycle.removeObserver(lifecycleObserver)
         captureSession.dispose()
@@ -744,6 +774,7 @@ internal class ArView(
     }
 
     private fun onFrame(session: Session, frame: Frame) {
+        visibilityObservationSource.onFrame(frame)
         visibilityGridChannel.onFrame(frame)
         captureSession.buildPoseUpdate(frame)?.let(poseBatchDispatcher::offer)
         frame.getUpdatedTrackables(Plane::class.java).forEach { plane ->

@@ -135,6 +135,15 @@ class VisibilityGridV2BindingTest {
             assertEquals(1, correctedResponse.streamToken)
             assertEquals(1, binding.snapshot().acceptedControls)
             assertEquals(baseline, authority.snapshot(scope))
+            val observationCut = requireNotNull(binding.currentObservationOwnership())
+            assertEquals(request.sessionId.bytes.hex(), observationCut.sessionId)
+            assertEquals(request.captureGroupId.bytes.hex(), observationCut.captureGroupId)
+            assertEquals(request.sessionGeneration, observationCut.sessionGeneration)
+            assertEquals(request.groupGeneration, observationCut.groupGeneration)
+            assertEquals(request.coverageEpoch, observationCut.coverageEpoch)
+            assertEquals(binding.snapshot().bindingGeneration, observationCut.bindingGeneration)
+            assertEquals(binding.snapshot().lifecycleSequence, observationCut.lifecycleSequence)
+            assertEquals(binding.snapshot().operationGeneration, observationCut.operationGeneration)
         } finally {
             binding.dispose()
         }
@@ -1905,6 +1914,10 @@ class VisibilityGridV2BindingTest {
         )
         assertEquals(expected["executorTrace"], actual["executorTrace"])
     }
+}
+
+private fun ByteArray.hex(): String = joinToString("") { byte ->
+    "%02x".format(byte.toInt() and 0xff)
 }
 
 internal class RecordingResult(
