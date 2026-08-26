@@ -14,7 +14,6 @@ import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
 import java.util.ArrayDeque
 
 /** Small seam so lifecycle deadlines are deterministic in the JVM corpus. */
@@ -53,6 +52,28 @@ private class ExecutorTimeoutScheduler(
  * serial worker, and caches the exact response for a duplicate sequence. It
  * intentionally exposes no V1 maps or native surface arrays.
  */
+class M0aDebugTransportProbe(
+    private val expectedBytes: ByteArray,
+    private val authorityBefore: M0aCommittedBaselineV1,
+) {
+    private var ingress = 0L
+    private var rejections = 0L
+    private var publications = 0L
+
+    @Synchronized fun ingress(bytes: ByteArray): Boolean =
+        expectedBytes.contentEquals(bytes).also { if (it) ingress++ }
+
+    @Synchronized fun rejected() { rejections++ }
+    @Synchronized fun published() { publications++ }
+
+    @Synchronized fun receipt(authorityAfter: M0aCommittedBaselineV1) = mapOf(
+        "oldTokenAttemptCount" to ingress,
+        "oldTokenRejectionCount" to rejections,
+        "semanticEffectCount" to if (authorityAfter == authorityBefore) 0L else 1L,
+        "oldTokenPublicationCount" to publications,
+    )
+}
+
 class M0aVisibilitySurfaceStreamChannel(
     messenger: BinaryMessenger,
     viewId: Int,
@@ -72,6 +93,7 @@ class M0aVisibilitySurfaceStreamChannel(
     private val onAbandonedRequest: ((M0aPacketCodec.Request, M0aCommittedBaselineV1) -> Unit)? = null,
     private val onAbandonedContinuation: (() -> Unit)? = null,
     initialNextExpectedSequence: Long = 1L,
+    private val debugTransportProbe: M0aDebugTransportProbe? = null,
 ) {
     init {
         require(initialNextExpectedSequence in 1..Long.MAX_VALUE) {
@@ -104,7 +126,6 @@ class M0aVisibilitySurfaceStreamChannel(
     private val publicationFence = Any()
     private val transactionReceiver = M0aStructuralTransactionReceiverV1()
     private val telemetry = M0aTransportInstrumentation()
-    private val streamHandlerAttempts = AtomicLong()
     private val structuralFrames = ArrayDeque<M0aTransactionFrameV1>()
     @Volatile private var committedBaseline =
         controlLifecycle?.committedBaseline() ?: M0aCommittedBaselineV1.ZERO
@@ -170,40 +191,8 @@ class M0aVisibilitySurfaceStreamChannel(
         }
     }
 
-    internal data class DebugQualifiedAttempt(
-        val attemptCount: Long,
-        val rejectionCount: Long,
-        val semanticEffectCount: Long,
-        val publicationCount: Long,
-    )
-
-    /**
-     * Submits one debug-only transport attempt through the production binding
-     * qualifier fence and reports observed effects rather than expected
-     * constants. The payload is deliberately not decoded when qualification
-     * fails, exactly as for the installed BasicMessageChannel handler.
-     */
-    internal fun submitDebugAttemptThroughInstalledHandler(
-        transportBytes: ByteArray,
-        completed: (DebugQualifiedAttempt) -> Unit,
-    ) {
-        val authorityBefore = synchronized(this) { committedBaseline }
-        val attemptsBefore = streamHandlerAttempts.get()
-        val telemetryBefore = telemetry.snapshot()
-        handleStreamMessage(ByteBuffer.wrap(transportBytes)) { response ->
-            val authorityAfter = synchronized(this) { committedBaseline }
-            val telemetryAfter = telemetry.snapshot()
-            completed(
-                DebugQualifiedAttempt(
-                    attemptCount = streamHandlerAttempts.get() - attemptsBefore,
-                    rejectionCount = telemetryAfter.rejectedRequests -
-                        telemetryBefore.rejectedRequests,
-                    semanticEffectCount = if (authorityAfter == authorityBefore) 0 else 1,
-                    publicationCount = if (response == null) 0 else 1,
-                ),
-            )
-        }
-    }
+    internal fun debugProbeReceipt() =
+        debugTransportProbe?.receipt(synchronized(this) { committedBaseline })
 
     /**
      * Queues one bounded structural transaction for worker-pull delivery.
@@ -324,10 +313,11 @@ class M0aVisibilitySurfaceStreamChannel(
                 reply.reply(null)
                 return
             }
-            streamHandlerAttempts.incrementAndGet()
+            val correlatedDebugAttempt = debugTransportProbe?.ingress(transportBytes) == true
             val bytes = authenticatedPayload(transportBytes)
             if (bytes == null) {
                 telemetry.rejected()
+                if (correlatedDebugAttempt) debugTransportProbe.rejected()
                 reply.reply(null)
                 return
             }
@@ -555,6 +545,7 @@ class M0aVisibilitySurfaceStreamChannel(
                         if (commitPublicationStalled) afterCommitPublication?.invoke()
                         timeoutHandle.cancel()
                         if (response != null) {
+                            if (correlatedDebugAttempt) debugTransportProbe.published()
                             telemetry.allocated(response.size)
                             // Flutter's Android messenger passes position() as the JNI
                             // message length; qualify() leaves it after the bytes.

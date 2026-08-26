@@ -16,6 +16,7 @@ import com.uhg0.ar_flutter_plugin_2.m0.M0aUuid
 import com.uhg0.ar_flutter_plugin_2.m0.M0aStructuralTransactionProducerV1
 import com.uhg0.ar_flutter_plugin_2.m0.M0aStartRequestCodecV2
 import com.uhg0.ar_flutter_plugin_2.m0.M0aVisibilitySurfaceStreamChannel
+import com.uhg0.ar_flutter_plugin_2.m0.M0aDebugTransportProbe
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -75,6 +76,9 @@ class VisibilityGridV2Binding internal constructor(
     )
     private var nativeStreamToken = newOpaqueToken()
     private var workerBindingToken = newOpaqueToken()
+    @Volatile private var issue98Probe: M0aDebugTransportProbe? = null
+    @Volatile private var issue98Correlation: ByteArray? = null
+    @Volatile private var issue98Preparation: Map<String, Any>? = null
     @Volatile private var streamChannel = newStreamChannel()
     @Volatile private var currentBindingGeneration = bindingGenerationSeed
     private var initialTransactionQueued = false
@@ -124,6 +128,7 @@ class VisibilityGridV2Binding internal constructor(
             }
         },
         onAbandonedContinuation = debugRecoverySeam::oldContinuationFenced,
+        debugTransportProbe = issue98Probe,
     )
 
     init {
@@ -221,7 +226,7 @@ class VisibilityGridV2Binding internal constructor(
             }
             return
         }
-        if (call.method == "runDebugV2Issue98Handoff") {
+        if (call.method == "prepareDebugV2Issue98Handoff") {
             if (!isDebuggable) {
                 result.error("VG_PROTOCOL_INVALID", "V2 recovery seam is debug-only", null)
             } else {
@@ -250,7 +255,8 @@ class VisibilityGridV2Binding internal constructor(
                     .ordinaryRootSurfaceBytes
                 val oldQualifier = bindingQualifier()
                 val before = lifecycleResources().ownedResourceCount
-                replaceBinding()
+                val correlation = newOpaqueToken()
+                issue98Correlation = correlation
                 val staleEffectRequest = M0aPacketCodec.encodeRequest(
                     M0aPacketCodec.Request(
                         requestFlags = 0,
@@ -265,11 +271,10 @@ class VisibilityGridV2Binding internal constructor(
                         requestSequence = 1,
                     ),
                 )
-                streamChannel.submitDebugAttemptThroughInstalledHandler(
-                    oldQualifier + staleEffectRequest,
-                ) { staleAttempt ->
-                    val after = lifecycleResources().ownedResourceCount
-                    post { result.success(mapOf(
+                issue98Probe = M0aDebugTransportProbe(oldQualifier + staleEffectRequest, old)
+                replaceBinding()
+                val after = lifecycleResources().ownedResourceCount
+                val preparation = mapOf<String, Any>(
                     "oldTransactionId" to old.transactionId,
                     "oldRequestSequence" to Long.MAX_VALUE,
                     "terminalResultFlags" to terminal.resultFlags,
@@ -286,15 +291,36 @@ class VisibilityGridV2Binding internal constructor(
                     "regionManifestRevision" to old.regionManifestRevision,
                     "nextSurfaceIdHighWater" to old.nextSurfaceIdHighWater,
                     "schemaRootRevision" to old.schemaRootRevision,
-                    "oldTokenAttemptCount" to staleAttempt.attemptCount,
-                    "oldTokenRejectionCount" to staleAttempt.rejectionCount,
-                    "semanticEffectCount" to staleAttempt.semanticEffectCount,
-                    "oldTokenPublicationCount" to staleAttempt.publicationCount,
+                    "correlationId" to correlation,
+                    "oldBindingQualifier" to oldQualifier,
+                    "staleRequestBytes" to staleEffectRequest,
                     "rootIsolateSurfaceBytes" to rootBytes,
                     "oldClosedResources" to before,
                     "freshActiveResources" to after,
-                    )) }
-                }
+                )
+                issue98Preparation = preparation
+                result.success(preparation)
+            }
+            return
+        }
+        if (call.method == "finalizeDebugV2Issue98Handoff") {
+            val correlation = call.arguments as? ByteArray
+            val expected = issue98Correlation
+            val preparation = issue98Preparation
+            val probeReceipt = streamChannel.debugProbeReceipt()
+            if (!isDebuggable || correlation == null || expected == null ||
+                !correlation.contentEquals(expected) || preparation == null || probeReceipt == null
+            ) {
+                result.error("VG_PROTOCOL_INVALID", "Issue 98 attempt is not correlated", null)
+            } else {
+                issue98Correlation = null
+                issue98Preparation = null
+                result.success(
+                    preparation.filterKeys {
+                        it != "correlationId" && it != "oldBindingQualifier" &&
+                            it != "staleRequestBytes"
+                    } + probeReceipt,
+                )
             }
             return
         }

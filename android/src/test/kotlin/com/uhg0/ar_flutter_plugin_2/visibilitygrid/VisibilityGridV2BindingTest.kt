@@ -769,8 +769,28 @@ class VisibilityGridV2BindingTest {
             val channel = MethodChannel(messenger, "visibility_grid_v2_control_98")
             val oldSnapshot = binding.snapshot()
             val oldQualifier = oldSnapshot.nativeStreamToken + oldSnapshot.workerBindingToken
+            val preparation = RecordingResult()
+            channel.invokeMethod("prepareDebugV2Issue98Handoff", null, preparation)
+            assertTrue(preparation.completed.await(2, TimeUnit.SECONDS))
+            @Suppress("UNCHECKED_CAST")
+            val prepared = preparation.successValue as Map<String, Any>
+            val staleReply = RecordingBinaryReply()
+            messenger.send(
+                "visibility_surface_stream_98",
+                ByteBuffer.wrap(
+                    (prepared.getValue("oldBindingQualifier") as ByteArray) +
+                        (prepared.getValue("staleRequestBytes") as ByteArray),
+                ),
+                staleReply,
+            )
+            assertTrue(staleReply.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(null, staleReply.bytes)
             val handoff = RecordingResult()
-            channel.invokeMethod("runDebugV2Issue98Handoff", null, handoff)
+            channel.invokeMethod(
+                "finalizeDebugV2Issue98Handoff",
+                prepared.getValue("correlationId"),
+                handoff,
+            )
             assertTrue(handoff.completed.await(2, TimeUnit.SECONDS))
             @Suppress("UNCHECKED_CAST")
             val receipt = handoff.successValue as Map<String, Any>

@@ -476,6 +476,42 @@ int _receiptPositiveInt(Map<Object?, Object?> map, String key) {
 }
 
 /// Validated scalar evidence from the debug-only Issue 98 binding handoff.
+final class ARVisibilityGridV2Issue98Preparation {
+  ARVisibilityGridV2Issue98Preparation._(
+    this.correlationId,
+    this.oldBindingQualifier,
+    this.staleRequestBytes,
+  );
+
+  /// Opaque native correlation identity for this exact attempt.
+  final Uint8List correlationId;
+
+  /// Qualifier saved from the binding that native replaced.
+  final Uint8List oldBindingQualifier;
+
+  /// Exact effect-bearing request native registered for correlation.
+  final Uint8List staleRequestBytes;
+
+  static ARVisibilityGridV2Issue98Preparation fromMap(Object? raw) {
+    if (raw is! Map) throw StateError('V2 Issue 98 preparation was not a map.');
+    final map = Map<Object?, Object?>.from(raw);
+    Uint8List bytes(String key, int? length) {
+      final value = map[key];
+      if (value is! Uint8List || (length != null && value.length != length)) {
+        throw StateError('V2 Issue 98 preparation field $key is invalid.');
+      }
+      return Uint8List.fromList(value);
+    }
+
+    return ARVisibilityGridV2Issue98Preparation._(
+      bytes('correlationId', 16),
+      bytes('oldBindingQualifier', 32),
+      bytes('staleRequestBytes', null),
+    );
+  }
+}
+
+/// Validated scalar evidence from the debug-only Issue 98 binding handoff.
 @immutable
 final class ARVisibilityGridV2Issue98HandoffReceipt {
   const ARVisibilityGridV2Issue98HandoffReceipt._({
@@ -677,7 +713,8 @@ final class ARVisibilityGridV2Control {
     int viewId, {
     MethodChannel? channel,
     Map<Object?, Object?>? initialBindingSnapshot,
-  }) : _channel =
+  })  : _viewId = viewId,
+        _channel =
             channel ?? MethodChannel('visibility_grid_v2_control_$viewId') {
     _bindingReady = initialBindingSnapshot == null
         ? _captureBindingAtConnection()
@@ -685,6 +722,8 @@ final class ARVisibilityGridV2Control {
             bindSnapshot(initialBindingSnapshot);
           });
   }
+
+  final int _viewId;
 
   /// Connects to a V2 endpoint and captures its binding identity before the
   /// control is handed to callers. A later native replacement cannot change
@@ -814,16 +853,45 @@ final class ARVisibilityGridV2Control {
     return _readV2DebugRecoveryTrace(_channel);
   }
 
-  /// Executes the bounded debug-only Issue 98 MAX-drain/fresh-cursor seam.
+  /// Prepares the bounded debug-only Issue 98 MAX-drain/fresh-cursor seam.
   ///
   /// Throws [PlatformException] when native rejects the debug request,
   /// [MissingPluginException] when the endpoint is unavailable, and
   /// [StateError] when native returns malformed or inconsistent evidence.
-  Future<ARVisibilityGridV2Issue98HandoffReceipt>
-      runDebugV2Issue98Handoff() async {
+  Future<ARVisibilityGridV2Issue98Preparation>
+      prepareDebugV2Issue98Handoff() async {
     await _bindingReady;
     final raw =
-        await _channel.invokeMethod<Object?>('runDebugV2Issue98Handoff');
+        await _channel.invokeMethod<Object?>('prepareDebugV2Issue98Handoff');
+    return ARVisibilityGridV2Issue98Preparation.fromMap(raw);
+  }
+
+  /// Sends the registered stale attempt through Flutter's real message channel.
+  Future<void> submitDebugV2Issue98StaleAttempt(
+    ARVisibilityGridV2Issue98Preparation preparation,
+  ) async {
+    final channel = BasicMessageChannel<ByteData?>(
+      'visibility_surface_stream_$_viewId',
+      const BinaryCodec(),
+    );
+    final bytes = Uint8List.fromList(<int>[
+      ...preparation.oldBindingQualifier,
+      ...preparation.staleRequestBytes,
+    ]);
+    final response = await channel.send(ByteData.sublistView(bytes));
+    if (response != null) {
+      throw StateError('Stale Issue 98 attempt unexpectedly published.');
+    }
+  }
+
+  /// Fetches evidence correlated to the exact prepared stale attempt.
+  Future<ARVisibilityGridV2Issue98HandoffReceipt> finalizeDebugV2Issue98Handoff(
+    ARVisibilityGridV2Issue98Preparation preparation,
+  ) async {
+    final raw = await _channel.invokeMethod<Object?>(
+      'finalizeDebugV2Issue98Handoff',
+      preparation.correlationId,
+    );
     return ARVisibilityGridV2Issue98HandoffReceipt.fromMap(raw);
   }
 

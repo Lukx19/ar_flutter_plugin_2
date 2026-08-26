@@ -11,7 +11,14 @@ void main() {
     const channel = MethodChannel('visibility_grid_v2_control_98');
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (call) async {
-      if (call.method != 'runDebugV2Issue98Handoff') return null;
+      if (call.method == 'prepareDebugV2Issue98Handoff') {
+        return <String, Object>{
+          'correlationId': Uint8List(16),
+          'oldBindingQualifier': Uint8List(32),
+          'staleRequestBytes': Uint8List.fromList(<int>[1, 2, 3]),
+        };
+      }
+      if (call.method != 'finalizeDebugV2Issue98Handoff') return null;
       return <String, Object>{
         'oldTransactionId': 0x7fffffffffffffff,
         'oldRequestSequence': 0x7fffffffffffffff,
@@ -41,6 +48,16 @@ void main() {
       () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
           .setMockMethodCallHandler(channel, null),
     );
+    const stream = BasicMessageChannel<ByteData?>(
+      'visibility_surface_stream_98',
+      BinaryCodec(),
+    );
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMessageHandler(stream.name, (_) async => null);
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMessageHandler(stream.name, null),
+    );
     final control = ARVisibilityGridV2Control(
       98,
       initialBindingSnapshot: <Object?, Object?>{
@@ -48,7 +65,9 @@ void main() {
         'workerBindingToken': Uint8List(16),
       },
     );
-    final receipt = await control.runDebugV2Issue98Handoff();
+    final preparation = await control.prepareDebugV2Issue98Handoff();
+    await control.submitDebugV2Issue98StaleAttempt(preparation);
+    final receipt = await control.finalizeDebugV2Issue98Handoff(preparation);
     expect(receipt, isA<ARVisibilityGridV2Issue98HandoffReceipt>());
     expect(receipt.oldTokenAttemptCount, 1);
     expect(receipt.oldTokenRejectionCount, 1);
