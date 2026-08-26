@@ -5,6 +5,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicLong
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
@@ -12,6 +13,166 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class AndroidVisibilityGridRuntimeTest {
+    @Test
+    fun `pause discards queued copied values and rejects paused callbacks`() {
+        val cut = AtomicReference(ownership())
+        val scheduler = Executors.newSingleThreadScheduledExecutor()
+        val blockerEntered = CountDownLatch(1)
+        val blockerRelease = CountDownLatch(1)
+        scheduler.execute {
+            blockerEntered.countDown()
+            blockerRelease.await(2, TimeUnit.SECONDS)
+        }
+        assertTrue(blockerEntered.await(1, TimeUnit.SECONDS))
+        val runtime = AndroidVisibilityGridRuntime(
+            ownership = cut::get,
+            mapper = AndroidVisibilityGridMappingAdmission(cut::get),
+            scheduler = scheduler,
+            featureIntervalNs = 1,
+            depthIntervalNs = 1,
+            ownsScheduler = true,
+        )
+        try {
+            runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            assertTrue(runtime.offerFeature(feature(cut.get(), 1, 1)))
+            assertTrue(runtime.offerDepth(depth(cut.get(), 2, 2)))
+            runtime.pause()
+            assertFalse(runtime.shouldCopyFeature(3))
+            assertFalse(runtime.shouldCopyDepth(3))
+            assertFalse(runtime.offerFeature(feature(cut.get(), 3, 3)))
+            blockerRelease.countDown()
+            Thread.sleep(25)
+
+            val health = runtime.snapshot()
+            assertTrue(health.paused)
+            assertEquals(0, health.admittedFeatureObservations)
+            assertEquals(0, health.admittedDepthObservations)
+            assertEquals(2, health.lifecycleDiscardedObservations)
+            assertEquals(1, health.pausedObservationRejections)
+            assertEquals(0, health.residentPayloadBytes)
+        } finally {
+            blockerRelease.countDown()
+            runtime.close()
+        }
+    }
+
+    @Test
+    fun `resume requires current cut and replacement admits only the new generation`() {
+        val cut = AtomicReference<VisibilityObservationOwnership?>(ownership())
+        val mapper = AndroidVisibilityGridMappingAdmission(cut::get)
+        val runtime = AndroidVisibilityGridRuntime(
+            ownership = cut::get,
+            mapper = mapper,
+            scheduler = Executors.newScheduledThreadPool(2),
+            featureIntervalNs = 1,
+            depthIntervalNs = 1,
+            ownsScheduler = true,
+        )
+        try {
+            val old = cut.get()!!
+            runtime.pause()
+            cut.set(null)
+            assertFalse(runtime.resume())
+            val replacement = old.copy(
+                bindingGeneration = 2,
+                lifecycleSequence = 2,
+                operationGeneration = 2,
+            )
+            cut.set(replacement)
+            assertTrue(runtime.resume())
+            assertFalse(runtime.offerFeature(feature(old, 2, 1)))
+            assertTrue(runtime.offerFeature(feature(replacement, 3, 2)))
+            await { mapper.snapshot().admittedFeatures == 1L }
+
+            val receipt = mapper.snapshot().lastReceipt!!
+            assertEquals(2, receipt.bindingGeneration)
+            assertEquals(2, receipt.lifecycleSequence)
+            assertEquals(3, receipt.sourceTimestampNs)
+            assertEquals(VisibilityFeatureObservation.FEATURE_FIXED_BYTES + 32, receipt.payloadBytes)
+            assertEquals(1, receipt.sampleCount)
+            assertEquals(1, runtime.snapshot().staleGenerationObservations)
+        } finally {
+            runtime.close()
+        }
+        assertEquals(0, mapper.snapshot().residentBytes)
+    }
+
+    @Test
+    fun `close drains an admitted mapping operation then releases bounded ingress`() {
+        val cut = AtomicReference(ownership())
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val closed = CountDownLatch(1)
+        val mapper = AndroidVisibilityGridMappingAdmission(
+            ownership = cut::get,
+            beforeAdmission = {
+                entered.countDown()
+                release.await(2, TimeUnit.SECONDS)
+            },
+        )
+        val runtime = runtime(cut, mapper)
+        assertTrue(runtime.offerFeature(feature(cut.get(), 1, 1)))
+        assertTrue(entered.await(1, TimeUnit.SECONDS))
+        val closer = Thread {
+            runtime.close()
+            closed.countDown()
+        }.also(Thread::start)
+        assertFalse(closed.await(25, TimeUnit.MILLISECONDS))
+        release.countDown()
+        assertTrue(closed.await(1, TimeUnit.SECONDS))
+        closer.join()
+        assertEquals(0, mapper.snapshot().residentBytes)
+        assertEquals(0, runtime.snapshot().resourceBalance)
+    }
+
+    @Test
+    fun `two millisecond p95 is exact and sheds depth until bounded recovery`() {
+        val cut = AtomicReference(ownership())
+        val clock = AtomicLong(1)
+        val runtime = AndroidVisibilityGridRuntime(
+            ownership = cut::get,
+            mapper = AndroidVisibilityGridMappingAdmission(cut::get),
+            scheduler = Executors.newScheduledThreadPool(2),
+            nanoTime = clock::get,
+            featureIntervalNs = 125_000_000,
+            depthIntervalNs = 250_000_000,
+            ownsScheduler = true,
+            callbackCopySampleCapacity = 4,
+        )
+        try {
+            runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            assertTrue(runtime.offerFeature(feature(cut.get(), 1, 1), 2_000_000))
+            assertEquals("withinBudget", runtime.snapshot().callbackCopyBudgetState)
+            assertTrue(runtime.offerFeature(feature(cut.get(), 2, 2), 2_000_001))
+            var health = runtime.snapshot()
+            assertEquals("degradedDepthShedSteadyFeature", health.callbackCopyBudgetState)
+            assertEquals(1, health.callbackCopyDepthSheds)
+            assertEquals(1_000, runtime.featureSampleCapacity())
+            assertFalse(runtime.shouldCopyDepth(1_000_000_000))
+            assertTrue(runtime.shouldCopyFeature(1_000_000_000))
+            assertFalse(runtime.shouldCopyFeature(1_499_999_999))
+            assertTrue(runtime.shouldCopyFeature(1_500_000_000))
+
+            repeat(4) { index ->
+                assertTrue(
+                    runtime.offerFeature(
+                        feature(cut.get(), 3L + index, 3 + index),
+                        2_000_000,
+                    ),
+                )
+            }
+            clock.addAndGet(30_000_000_000)
+            assertTrue(runtime.offerFeature(feature(cut.get(), 7, 7), 2_000_000))
+            health = runtime.snapshot()
+            assertEquals("withinBudget", health.callbackCopyBudgetState)
+            assertEquals(1, health.callbackCopyBudgetRecoveries)
+            assertEquals(VisibilitySourceHealth.CONFIGURED, health.depthHealth)
+            assertEquals(V2_FEATURE_SAMPLE_CAPACITY, runtime.featureSampleCapacity())
+        } finally {
+            runtime.close()
+        }
+    }
+
     @Test
     fun `copy cadence claims exact independent moving source intervals`() {
         val runtime = AndroidVisibilityGridRuntime(
@@ -165,7 +326,7 @@ class AndroidVisibilityGridRuntimeTest {
             assertEquals(VisibilitySourceHealth.TRANSIENT_UNAVAILABLE, health.featureHealth)
             assertEquals(VisibilitySourceHealth.FAILED, health.depthHealth)
             assertEquals("featureOnly", health.totalGridHealth)
-            assertTrue(health.toWireMap().size <= 40)
+            assertTrue(health.toWireMap().size <= 50)
             assertFalse(health.toWireMap().values.any { it is Collection<*> || it is ByteArray })
         } finally {
             runtime.close()

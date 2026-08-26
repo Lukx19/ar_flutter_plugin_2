@@ -36,7 +36,9 @@ internal class ArCoreVisibilityObservationAdapter(
         ownership: VisibilityObservationOwnership,
         depthCapability: VisibilityDepthCapability,
         frameSequence: Long,
+        maxCopiedSamples: Int = V2_FEATURE_SAMPLE_CAPACITY,
     ): VisibilityFeatureCopyResult {
+        require(maxCopiedSamples in 1..V2_FEATURE_SAMPLE_CAPACITY)
         val pointCloud = try {
             frame.acquirePointCloud().also { resourceAcquired() }
         } catch (_: NotYetAvailableException) {
@@ -54,8 +56,8 @@ internal class ArCoreVisibilityObservationAdapter(
             if (points.remaining() < ids.remaining() * 4) {
                 return VisibilityFeatureCopyResult.Rejected("feature buffers have mismatched lengths")
             }
-            val accepted = ArrayList<VisibilityFeatureSample>(V2_FEATURE_SAMPLE_CAPACITY)
-            val seen = HashSet<Int>(V2_FEATURE_SAMPLE_CAPACITY)
+            val accepted = ArrayList<VisibilityFeatureSample>(maxCopiedSamples)
+            val seen = HashSet<Int>(maxCopiedSamples)
             var rejected = 0
             while (ids.hasRemaining() && points.remaining() >= 4) {
                 val sample = VisibilityFeatureSample(
@@ -66,7 +68,7 @@ internal class ArCoreVisibilityObservationAdapter(
                     confidence = points.get().toDouble(),
                 )
                 if (!sample.isValid() || sample.confidence < minimumFeatureConfidence ||
-                    !seen.add(sample.id) || accepted.size == V2_FEATURE_SAMPLE_CAPACITY
+                    !seen.add(sample.id) || accepted.size == maxCopiedSamples
                 ) {
                     rejected++
                 } else {
@@ -240,7 +242,15 @@ internal class ArCoreVisibilityObservationSource(
         runtime.setDepthCapability(capability)
         if (runtime.shouldCopyFeature(frame.timestamp)) {
             val started = System.nanoTime()
-            when (val result = adapter.copyFeature(frame, cut, capability, sequence)) {
+            when (
+                val result = adapter.copyFeature(
+                    frame,
+                    cut,
+                    capability,
+                    sequence,
+                    runtime.featureSampleCapacity(),
+                )
+            ) {
                 is VisibilityFeatureCopyResult.Observation ->
                     runtime.offerFeature(result.value, System.nanoTime() - started)
                 VisibilityFeatureCopyResult.TransientUnavailable ->

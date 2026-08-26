@@ -67,7 +67,7 @@ internal class VisibilityObservationDebugChannel(
                         else -> error("unknown synthetic depth capability")
                     }
                     source.setDepthCapability(capability)
-                    result.success(runtime.snapshot().toWireMap())
+                    result.success(runtime.snapshotWireMap())
                 }
                 "emitFeature" -> result.success(
                     source.emitFeature(call.requiredTimestamp(), call.argument<Int>("marker") ?: 0),
@@ -85,14 +85,14 @@ internal class VisibilityObservationDebugChannel(
                         "depth" -> runtime.recordDepthStalled()
                         else -> error("source must be feature or depth")
                     }
-                    result.success(runtime.snapshot().toWireMap())
+                    result.success(runtime.snapshotWireMap())
                 }
                 "releaseMappingStall" -> {
                     gate.release()
                     result.success(true)
                 }
                 "snapshot" -> result.success(
-                    runtime.snapshot().toWireMap() + mapOf("mappingStalled" to gate.stalled()),
+                    runtime.snapshotWireMap() + mapOf("mappingStalled" to gate.stalled()),
                 )
                 else -> result.notImplemented()
             }

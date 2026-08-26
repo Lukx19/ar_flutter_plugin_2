@@ -210,8 +210,12 @@ internal class VisibilityDepthObservation(
     }
 }
 
-internal interface VisibilityObservationMapper {
+internal interface VisibilityObservationMapper : AutoCloseable {
     fun admitFeature(observation: VisibilityFeatureObservation)
 
     fun admitDepth(observation: VisibilityDepthObservation)
+
+    fun snapshot(): VisibilityMappingAdmissionHealth = VisibilityMappingAdmissionHealth.empty()
+
+    override fun close() = Unit
 }

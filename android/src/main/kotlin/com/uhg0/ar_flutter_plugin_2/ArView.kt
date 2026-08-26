@@ -122,13 +122,13 @@ internal class ArView(
         isDebuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0,
     )
     private val visibilityObservationDebugGate = VisibilityObservationDebugGate()
+    private val visibilityObservationMappingAdmission = AndroidVisibilityGridMappingAdmission(
+        ownership = visibilityGridV2Binding::currentObservationOwnership,
+        beforeAdmission = visibilityObservationDebugGate::awaitIfArmed,
+    )
     private val visibilityObservationRuntime = AndroidVisibilityGridRuntime(
         ownership = visibilityGridV2Binding::currentObservationOwnership,
-        mapper = AndroidVisibilityGridMappingAdmission(
-            ownership = visibilityGridV2Binding::currentObservationOwnership,
-            onFeature = { visibilityObservationDebugGate.awaitIfArmed() },
-            onDepth = { visibilityObservationDebugGate.awaitIfArmed() },
-        ),
+        mapper = visibilityObservationMappingAdmission,
     )
     private val visibilityObservationSource = ArCoreVisibilityObservationSource(
         runtime = visibilityObservationRuntime,
@@ -198,6 +198,7 @@ internal class ArView(
     private val lifecycleObserver = object : DefaultLifecycleObserver {
         override fun onPause(owner: LifecycleOwner) {
             resumeCoordinator.invalidate(ResumeTerminal.SUPERSEDED)
+            visibilityObservationRuntime.pause()
             visibilityGridChannel.pause()
             captureSession.onSessionPaused()
             sceneHost.pause()
@@ -270,6 +271,7 @@ internal class ArView(
         // Camera2. Its wrapped image/session callbacks retain native Session
         // state until Camera2 shutdown completes.
         sceneHost.pause()
+        visibilityObservationRuntime.pause()
         captureSession.onSessionPaused()
     }
 
@@ -319,6 +321,7 @@ internal class ArView(
                 "disableCamera", "pauseSession" -> {
                     sessionPausedByFlutter = true
                     resumeCoordinator.invalidate(ResumeTerminal.SUPERSEDED)
+                    visibilityObservationRuntime.pause()
                     visibilityGridChannel.pause()
                     captureSession.onSessionPaused()
                     sceneHost.pause()
@@ -383,7 +386,10 @@ internal class ArView(
                         if (!disposed) {
                             if (clearFlutterPause) sessionPausedByFlutter = false
                             visibilityGridChannel.resume()
-                            if (!sessionPausedByFlutter) captureSession.onSessionResumed()
+                            if (!sessionPausedByFlutter) {
+                                visibilityObservationRuntime.resume()
+                                captureSession.onSessionResumed()
+                            }
                         }
                     }
                     else -> Unit

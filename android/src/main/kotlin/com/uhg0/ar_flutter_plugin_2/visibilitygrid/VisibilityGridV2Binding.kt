@@ -957,7 +957,7 @@ class VisibilityGridV2Binding internal constructor(
         "lifecycleSequence" to lifecycleSequence,
         "operationGeneration" to operationGeneration,
         "executorTrace" to executorTrace,
-        "sourceHealth" to observationRuntime?.snapshot()?.toWireMap(),
+        "sourceHealth" to observationRuntime?.snapshotWireMap(),
     )
 
     private fun Map<String, Any?>.withCleanupBalances(
