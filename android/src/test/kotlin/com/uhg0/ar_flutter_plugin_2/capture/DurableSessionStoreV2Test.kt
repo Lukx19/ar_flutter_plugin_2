@@ -113,6 +113,36 @@ class DurableSessionStoreV2Test {
         assertEquals(0, quota.reservedBytes())
     }
 
+    @Test fun `slot fork broken predecessor and high filename are rejected from authority selection`() {
+        val root = directory(); val store = DurableSessionStoreV2(File(root, "store"), budget(root))
+        (1..3).forEach { number ->
+            val request = request("branch-$number", "branch-attempt-$number", "jpeg-$number".toByteArray())
+            store.acceptBeforeExposure(request.accepted); store.commitStreamed(request, streams("jpeg-$number".toByteArray()))
+        }
+        val session = File(root, "store/sessions").walkTopDown().first { it.name == "objects" }.parentFile
+        val pointers = listOf(File(session, "root-A.ptr"), File(session, "root-B.ptr"))
+        val current = pointers.maxBy { it.readLines().first().toLong() }
+        val prior = pointers.minBy { it.readLines().first().toLong() }
+        val root2 = prior.readLines()[1]
+        val root1 = File(session, "objects/$root2.root").readLines().first { it.startsWith("previous=") }.removePrefix("previous=")
+        val divergent = "schema=5\nrevision=3\nrequest=${"a".repeat(64)}\nprevious=$root2\nsecondPrevious=$root1\n".toByteArray()
+        val divergentHash = MessageDigest.getInstance("SHA-256").digest(divergent).joinToString("") { "%02x".format(it) }
+        File(session, "objects/$divergentHash.root").writeBytes(divergent)
+        prior.writeText("3\n$divergentHash\nbranch\n")
+        val fork = request("fork", "fork-attempt", "jpeg".toByteArray())
+        fork.accepted // no exposure occurs before store acceptance
+        try { store.acceptBeforeExposure(fork.accepted); store.commitStreamed(fork, streams("jpeg".toByteArray())); throw AssertionError("fork accepted") }
+        catch (_: DurableStoreConflictV2) { }
+
+        // An orphan with a numerically enormous filename is never scanned.
+        File(session, "objects/${"f".repeat(64)}.root").writeText("schema=5\nrevision=999\nrequest=${"b".repeat(64)}\nprevious=-\nsecondPrevious=-\n")
+        prior.writeText("bad\n")
+        val recovered = DurableSessionStoreV2(File(root, "store"), budget(root))
+        val after = request("after", "after-attempt", "jpeg".toByteArray())
+        recovered.acceptBeforeExposure(after.accepted)
+        assertEquals(4L, recovered.commitStreamed(after, streams("jpeg".toByteArray())).terminal!!.captureRevision)
+    }
+
     private fun request(commit: String, attempt: String, jpeg: ByteArray): CaptureCommitRequest {
         val identity = CaptureAttemptIdentity(attempt, commit, 1, CaptureLifecycleCut("session-1", 1, "group-1", 1, "ar-1", "view-1", 1, "binding-1", 1, 1))
         val profile = CaptureComponentProfile("jpeg", setOf(CaptureComponentKind.JPEG), 64, 64)

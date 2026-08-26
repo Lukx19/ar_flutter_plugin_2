@@ -210,6 +210,9 @@ class DurableSessionStoreV2(
         File(location, file).takeIf(File::isFile)?.readLines()?.takeIf { it.size == 3 }?.let {
             RootPointer(it[0].toLongOrNull() ?: return@let null, it[1], it[2], if (file == "root-A.ptr") "A" else "B", rootPrevious(location, it[1]))
         }
+    }.let { raw ->
+        raw.groupBy { it.revision }.values.forEach { same -> if (same.map { it.rootHash }.toSet().size > 1) throw DurableStoreConflictV2("Schema-5 root fork") }
+        raw
     }.filter { validRoot(location, it) }.let { candidates ->
         candidates.groupBy { it.revision }.values.forEach { same -> if (same.map { it.rootHash }.toSet().size > 1) throw DurableStoreConflictV2("Schema-5 root fork") }
         candidates.maxByOrNull { it.revision }
