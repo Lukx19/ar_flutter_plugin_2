@@ -492,6 +492,9 @@ final class ARVisibilityGridV2Issue98Preparation {
   /// Exact effect-bearing request native registered for correlation.
   final Uint8List staleRequestBytes;
 
+  /// Decodes the bounded native preparation and copies its opaque bytes.
+  ///
+  /// Throws [StateError] when the map or any required byte field is malformed.
   static ARVisibilityGridV2Issue98Preparation fromMap(Object? raw) {
     if (raw is! Map) throw StateError('V2 Issue 98 preparation was not a map.');
     final map = Map<Object?, Object?>.from(raw);
