@@ -775,6 +775,7 @@ class VisibilityGridV2BindingTest {
             @Suppress("UNCHECKED_CAST")
             val receipt = handoff.successValue as Map<String, Any>
             assertEquals(1L, receipt["oldTokenAttemptCount"])
+            assertEquals(1L, receipt["oldTokenRejectionCount"])
             assertEquals(0L, receipt["semanticEffectCount"])
             assertEquals(0L, receipt["oldTokenPublicationCount"])
 

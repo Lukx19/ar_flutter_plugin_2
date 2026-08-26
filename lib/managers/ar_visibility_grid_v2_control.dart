@@ -495,6 +495,7 @@ final class ARVisibilityGridV2Issue98HandoffReceipt {
     required this.nextSurfaceIdHighWater,
     required this.schemaRootRevision,
     required this.oldTokenAttemptCount,
+    required this.oldTokenRejectionCount,
     required this.semanticEffectCount,
     required this.oldTokenPublicationCount,
     required this.rootIsolateSurfaceBytes,
@@ -550,6 +551,9 @@ final class ARVisibilityGridV2Issue98HandoffReceipt {
   /// Effect-bearing attempts submitted with the pre-replacement qualifier.
   final int oldTokenAttemptCount;
 
+  /// Attempts rejected by the installed stream handler's qualifier fence.
+  final int oldTokenRejectionCount;
+
   /// Semantic effects observed from the stale-token attempt.
   final int semanticEffectCount;
 
@@ -589,6 +593,7 @@ final class ARVisibilityGridV2Issue98HandoffReceipt {
       'nextSurfaceIdHighWater',
       'schemaRootRevision',
       'oldTokenAttemptCount',
+      'oldTokenRejectionCount',
       'semanticEffectCount',
       'oldTokenPublicationCount',
       'rootIsolateSurfaceBytes',
@@ -619,6 +624,7 @@ final class ARVisibilityGridV2Issue98HandoffReceipt {
       nextSurfaceIdHighWater: _receiptInt(map, 'nextSurfaceIdHighWater'),
       schemaRootRevision: _receiptInt(map, 'schemaRootRevision'),
       oldTokenAttemptCount: _receiptInt(map, 'oldTokenAttemptCount'),
+      oldTokenRejectionCount: _receiptInt(map, 'oldTokenRejectionCount'),
       semanticEffectCount: _receiptInt(map, 'semanticEffectCount'),
       oldTokenPublicationCount: _receiptInt(map, 'oldTokenPublicationCount'),
       rootIsolateSurfaceBytes: _receiptInt(map, 'rootIsolateSurfaceBytes'),
@@ -633,6 +639,7 @@ final class ARVisibilityGridV2Issue98HandoffReceipt {
         receipt.freshRequestSequence != 1 ||
         receipt.nextTransactionId != 1 ||
         receipt.oldTokenAttemptCount != 1 ||
+        receipt.oldTokenRejectionCount != 1 ||
         receipt.semanticEffectCount != 0 ||
         receipt.oldTokenPublicationCount != 0 ||
         receipt.rootIsolateSurfaceBytes != 0 ||

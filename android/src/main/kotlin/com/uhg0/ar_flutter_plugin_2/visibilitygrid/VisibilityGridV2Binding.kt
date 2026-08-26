@@ -265,11 +265,11 @@ class VisibilityGridV2Binding internal constructor(
                         requestSequence = 1,
                     ),
                 )
-                val staleAttempt = streamChannel.executeDebugQualifiedAttempt(
+                streamChannel.submitDebugAttemptThroughInstalledHandler(
                     oldQualifier + staleEffectRequest,
-                )
-                val after = lifecycleResources().ownedResourceCount
-                result.success(mapOf(
+                ) { staleAttempt ->
+                    val after = lifecycleResources().ownedResourceCount
+                    post { result.success(mapOf(
                     "oldTransactionId" to old.transactionId,
                     "oldRequestSequence" to Long.MAX_VALUE,
                     "terminalResultFlags" to terminal.resultFlags,
@@ -287,12 +287,14 @@ class VisibilityGridV2Binding internal constructor(
                     "nextSurfaceIdHighWater" to old.nextSurfaceIdHighWater,
                     "schemaRootRevision" to old.schemaRootRevision,
                     "oldTokenAttemptCount" to staleAttempt.attemptCount,
+                    "oldTokenRejectionCount" to staleAttempt.rejectionCount,
                     "semanticEffectCount" to staleAttempt.semanticEffectCount,
                     "oldTokenPublicationCount" to staleAttempt.publicationCount,
                     "rootIsolateSurfaceBytes" to rootBytes,
                     "oldClosedResources" to before,
                     "freshActiveResources" to after,
-                ))
+                    )) }
+                }
             }
             return
         }

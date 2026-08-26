@@ -170,6 +170,7 @@ class M0aVisibilitySurfaceStreamChannel(
 
     internal data class DebugQualifiedAttempt(
         val attemptCount: Long,
+        val rejectionCount: Long,
         val semanticEffectCount: Long,
         val publicationCount: Long,
     )
@@ -180,18 +181,27 @@ class M0aVisibilitySurfaceStreamChannel(
      * constants. The payload is deliberately not decoded when qualification
      * fails, exactly as for the installed BasicMessageChannel handler.
      */
-    internal fun executeDebugQualifiedAttempt(transportBytes: ByteArray): DebugQualifiedAttempt {
+    internal fun submitDebugAttemptThroughInstalledHandler(
+        transportBytes: ByteArray,
+        completed: (DebugQualifiedAttempt) -> Unit,
+    ) {
         val authorityBefore = synchronized(this) { committedBaseline }
-        val acceptedBefore = telemetry.snapshot().acceptedRequests
-        val authenticated = authenticatedPayload(transportBytes)
-        if (authenticated == null) telemetry.rejected()
-        val authorityAfter = synchronized(this) { committedBaseline }
-        val acceptedAfter = telemetry.snapshot().acceptedRequests
-        return DebugQualifiedAttempt(
-            attemptCount = 1,
-            semanticEffectCount = if (authorityAfter == authorityBefore) 0 else 1,
-            publicationCount = acceptedAfter - acceptedBefore,
-        )
+        val telemetryBefore = telemetry.snapshot()
+        handleStreamMessage(ByteBuffer.wrap(transportBytes)) { response ->
+            val authorityAfter = synchronized(this) { committedBaseline }
+            val telemetryAfter = telemetry.snapshot()
+            completed(
+                DebugQualifiedAttempt(
+                    attemptCount = telemetryAfter.submittedRequests -
+                        telemetryBefore.submittedRequests +
+                        telemetryAfter.rejectedRequests - telemetryBefore.rejectedRequests,
+                    rejectionCount = telemetryAfter.rejectedRequests -
+                        telemetryBefore.rejectedRequests,
+                    semanticEffectCount = if (authorityAfter == authorityBefore) 0 else 1,
+                    publicationCount = if (response == null) 0 else 1,
+                ),
+            )
+        }
     }
 
     /**
@@ -297,7 +307,13 @@ class M0aVisibilitySurfaceStreamChannel(
                 ByteBuffer.allocateDirect(bytes.size).apply { put(bytes) }
             })
         }
-        channel.setMessageHandler { message, reply ->
+        channel.setMessageHandler(::handleStreamMessage)
+    }
+
+    private fun handleStreamMessage(
+        message: ByteBuffer?,
+        reply: BasicMessageChannel.Reply<ByteBuffer>,
+    ) {
             val transportBytes = message?.let { buffer ->
                 val copy = ByteArray(buffer.remaining())
                 buffer.slice().get(copy)
@@ -305,13 +321,13 @@ class M0aVisibilitySurfaceStreamChannel(
             }
             if (transportBytes == null) {
                 reply.reply(null)
-                return@setMessageHandler
+                return
             }
             val bytes = authenticatedPayload(transportBytes)
             if (bytes == null) {
                 telemetry.rejected()
                 reply.reply(null)
-                return@setMessageHandler
+                return
             }
             telemetry.submitted(bytes.size)
             telemetry.allocated(bytes.size)
@@ -319,7 +335,7 @@ class M0aVisibilitySurfaceStreamChannel(
                 telemetry.rejected()
                 if (!queuedBackpressure.compareAndSet(false, true)) {
                     reply.reply(null)
-                    return@setMessageHandler
+                    return
                 }
                 telemetry.queued()
                 try {
@@ -329,7 +345,7 @@ class M0aVisibilitySurfaceStreamChannel(
                     outstandingInvocation.set(false)
                     reply.reply(null)
                 }
-                return@setMessageHandler
+                return
             }
             telemetry.queued()
             val pendingReply = PendingReply(bytes, reply, ::qualify) {
@@ -554,7 +570,6 @@ class M0aVisibilitySurfaceStreamChannel(
                 timeoutHandle.cancel()
                 abandonForWorkerLoss(pendingReply, bytes)
             }
-        }
     }
 
     private fun authenticatedPayload(bytes: ByteArray): ByteArray? {
