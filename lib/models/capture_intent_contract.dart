@@ -1,7 +1,23 @@
 import 'dart:collection';
 
+/// Shared deep value semantics for immutable contract DTOs.
+mixin CaptureValueEquality {
+  List<Object?> get equalityFields;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other.runtimeType == runtimeType &&
+          other is CaptureValueEquality &&
+          _deepEquals(equalityFields, other.equalityFields);
+
+  @override
+  int get hashCode => Object.hash(runtimeType, _deepHash(equalityFields));
+}
+
 /// Largest portable ordinal. Capture ordinals never wrap or reuse a value.
 const int capturePortableOrdinalMaximum = 0x7fffffffffffffff;
+const int capturePortableEntryMaximum = 0x7fffffff;
 
 /// Fixed coexistence ceiling for one protected manual and one automatic attempt.
 const int captureCoexistenceBytes = 128 * 1024 * 1024;
@@ -57,8 +73,8 @@ enum CaptureLifecycleEvent {
 }
 
 /// Complete immutable identity cut qualifying capture work and late callbacks.
-final class CaptureLifecycleCut {
-  const CaptureLifecycleCut({
+final class CaptureLifecycleCut with CaptureValueEquality {
+  CaptureLifecycleCut({
     required this.sessionId,
     required this.sessionGeneration,
     required this.groupId,
@@ -69,7 +85,21 @@ final class CaptureLifecycleCut {
     required this.bindingToken,
     required this.lifecycleSequence,
     required this.operationGeneration,
-  });
+  }) {
+    for (final value in [
+      sessionGeneration,
+      groupGeneration,
+      viewGeneration,
+      lifecycleSequence,
+      operationGeneration
+    ]) {
+      _requirePortableNonNegative(value, 'lifecycle generation/sequence');
+    }
+    if ([sessionId, groupId, arSessionId, viewId, bindingToken]
+        .any((value) => value.isEmpty)) {
+      throw ArgumentError('Lifecycle identities must be non-empty.');
+    }
+  }
 
   final String sessionId;
   final int sessionGeneration;
@@ -94,11 +124,25 @@ final class CaptureLifecycleCut {
         lifecycleSequence,
         operationGeneration,
       ].join('|');
+
+  @override
+  List<Object?> get equalityFields => [
+        sessionId,
+        sessionGeneration,
+        groupId,
+        groupGeneration,
+        arSessionId,
+        viewId,
+        viewGeneration,
+        bindingToken,
+        lifecycleSequence,
+        operationGeneration
+      ];
 }
 
 /// A user or selector-originated request before any durable identity exists.
-final class CaptureIntent {
-  const CaptureIntent({
+final class CaptureIntent with CaptureValueEquality {
+  CaptureIntent({
     required this.lane,
     required this.lifecycleCut,
     required this.profile,
@@ -106,8 +150,9 @@ final class CaptureIntent {
     required this.trackingValid,
     required this.captureHealthy,
     required this.durabilityPreflightValid,
-    required this.canonicalIntentHash,
-  });
+    required List<int> canonicalIntentHash,
+  }) : canonicalIntentHash =
+            _copyDigest(canonicalIntentHash, 'canonicalIntentHash');
 
   final CaptureLane lane;
   final CaptureLifecycleCut lifecycleCut;
@@ -116,23 +161,38 @@ final class CaptureIntent {
   final bool trackingValid;
   final bool captureHealthy;
   final bool durabilityPreflightValid;
-  final String canonicalIntentHash;
+  final List<int> canonicalIntentHash;
+
+  @override
+  List<Object?> get equalityFields => [
+        lane,
+        lifecycleCut,
+        profile,
+        selectorValid,
+        trackingValid,
+        captureHealthy,
+        durabilityPreflightValid,
+        canonicalIntentHash
+      ];
 }
 
 /// Fixed component composition selected before admission.
-final class CaptureComponentProfile {
+final class CaptureComponentProfile with CaptureValueEquality {
   CaptureComponentProfile({
     required this.profileId,
     required Set<CaptureComponentKind> requiredComponents,
     required this.maximumComponentBytes,
     required this.maximumWorkingBytes,
   }) : requiredComponents = UnmodifiableSetView(Set.of(requiredComponents)) {
-    if (requiredComponents.isEmpty ||
+    if (profileId.isEmpty ||
+        requiredComponents.isEmpty ||
         maximumComponentBytes <= 0 ||
         maximumWorkingBytes <= 0) {
       throw ArgumentError(
           'A capture profile must have positive, bounded components and working bytes.');
     }
+    _requirePortableNonNegative(maximumComponentBytes, 'maximumComponentBytes');
+    _requirePortableNonNegative(maximumWorkingBytes, 'maximumWorkingBytes');
   }
 
   final String profileId;
@@ -142,18 +202,33 @@ final class CaptureComponentProfile {
 
   String get canonicalKey =>
       '$profileId:${requiredComponents.map((e) => e.name).toList()..sort()}:$maximumComponentBytes:$maximumWorkingBytes';
+
+  @override
+  List<Object?> get equalityFields => [
+        profileId,
+        requiredComponents,
+        maximumComponentBytes,
+        maximumWorkingBytes
+      ];
 }
 
 /// Complete pre-exposure RAM and physical-store liability.
-final class CaptureReservationLiability {
-  const CaptureReservationLiability({
+final class CaptureReservationLiability with CaptureValueEquality {
+  CaptureReservationLiability({
     required this.memoryBytes,
     required this.physicalStoreBytes,
     required this.componentEntries,
     required this.terminalEntries,
     required this.rollbackBytes,
     required this.physicallyBacked,
-  });
+  }) {
+    for (final value in [memoryBytes, physicalStoreBytes, rollbackBytes]) {
+      _requirePortableNonNegative(value, 'reservation value');
+    }
+    _requirePortableEntry(componentEntries, 'componentEntries');
+    _requirePortableEntry(terminalEntries, 'terminalEntries');
+    totalStoreLiability;
+  }
 
   final int memoryBytes;
   final int physicalStoreBytes;
@@ -163,16 +238,31 @@ final class CaptureReservationLiability {
   final bool physicallyBacked;
 
   int get totalStoreLiability => _checkedAdd(physicalStoreBytes, rollbackBytes);
+
+  @override
+  List<Object?> get equalityFields => [
+        memoryBytes,
+        physicalStoreBytes,
+        componentEntries,
+        terminalEntries,
+        rollbackBytes,
+        physicallyBacked
+      ];
 }
 
 /// Stable identity allocated only after every preflight gate passes.
-final class CaptureAttemptIdentity {
-  const CaptureAttemptIdentity({
+final class CaptureAttemptIdentity with CaptureValueEquality {
+  CaptureAttemptIdentity({
     required this.attemptId,
     required this.commitId,
     required this.attemptOrdinal,
     required this.lifecycleCut,
-  });
+  }) {
+    if (attemptId.isEmpty || commitId.isEmpty || attemptOrdinal < 1) {
+      throw ArgumentError('Attempt identity fields are invalid.');
+    }
+    _requirePortableNonNegative(attemptOrdinal, 'attemptOrdinal');
+  }
 
   final String attemptId;
   final String commitId;
@@ -181,64 +271,97 @@ final class CaptureAttemptIdentity {
 
   String get canonicalKey =>
       '$attemptId|$commitId|$attemptOrdinal|${lifecycleCut.canonicalKey}';
+
+  @override
+  List<Object?> get equalityFields =>
+      [attemptId, commitId, attemptOrdinal, lifecycleCut];
 }
 
 /// Durable accepted record which must exist before shutter operation.
-final class CaptureAcceptedAttempt {
-  const CaptureAcceptedAttempt({
+final class CaptureAcceptedAttempt with CaptureValueEquality {
+  CaptureAcceptedAttempt({
     required this.identity,
     required this.lane,
     required this.profile,
     required this.reservation,
-    required this.canonicalIntentHash,
-    required this.acceptedReceiptHash,
-  });
+    required List<int> canonicalIntentHash,
+    required List<int> acceptedReceiptHash,
+  })  : canonicalIntentHash =
+            _copyDigest(canonicalIntentHash, 'canonicalIntentHash'),
+        acceptedReceiptHash =
+            _copyDigest(acceptedReceiptHash, 'acceptedReceiptHash');
 
   final CaptureAttemptIdentity identity;
   final CaptureLane lane;
   final CaptureComponentProfile profile;
   final CaptureReservationLiability reservation;
-  final String canonicalIntentHash;
-  final String acceptedReceiptHash;
+  final List<int> canonicalIntentHash;
+  final List<int> acceptedReceiptHash;
+
+  @override
+  List<Object?> get equalityFields => [
+        identity,
+        lane,
+        profile,
+        reservation,
+        canonicalIntentHash,
+        acceptedReceiptHash
+      ];
 }
 
 /// Metadata for one streamed, attempt-owned component. It carries no bytes.
-final class CaptureComponentDescriptor {
-  const CaptureComponentDescriptor({
+final class CaptureComponentDescriptor with CaptureValueEquality {
+  CaptureComponentDescriptor({
     required this.kind,
     required this.byteLength,
-    required this.sha256,
+    required List<int> sha256,
     required this.durableObjectId,
-  });
+  }) : sha256 = _copyDigest(sha256, 'sha256') {
+    _requirePortableNonNegative(byteLength, 'component byteLength');
+    if (durableObjectId.isEmpty)
+      throw ArgumentError('durableObjectId must be non-empty');
+  }
 
   final CaptureComponentKind kind;
   final int byteLength;
-  final String sha256;
+  final List<int> sha256;
   final String durableObjectId;
 
   String get canonicalKey =>
       '${kind.name}|$byteLength|$sha256|$durableObjectId';
+
+  @override
+  List<Object?> get equalityFields =>
+      [kind, byteLength, sha256, durableObjectId];
 }
 
 /// Complete typed native-to-store commit input after validation.
-final class CaptureCommitRequest {
+final class CaptureCommitRequest with CaptureValueEquality {
   CaptureCommitRequest({
     required this.accepted,
     required Iterable<CaptureComponentDescriptor> components,
     required this.exposureTimestampNanoseconds,
-    required this.poseRecordHash,
-    required this.cameraModelHash,
-    required this.validationRecordHash,
-    required this.ledgerRecordHash,
-  }) : components = List.unmodifiable(components);
+    required List<int> poseRecordHash,
+    required List<int> cameraModelHash,
+    required List<int> validationRecordHash,
+    required List<int> ledgerRecordHash,
+  })  : components = List.unmodifiable(components),
+        poseRecordHash = _copyDigest(poseRecordHash, 'poseRecordHash'),
+        cameraModelHash = _copyDigest(cameraModelHash, 'cameraModelHash'),
+        validationRecordHash =
+            _copyDigest(validationRecordHash, 'validationRecordHash'),
+        ledgerRecordHash = _copyDigest(ledgerRecordHash, 'ledgerRecordHash') {
+    _requirePortableNonNegative(
+        exposureTimestampNanoseconds, 'exposureTimestampNanoseconds');
+  }
 
   final CaptureAcceptedAttempt accepted;
   final List<CaptureComponentDescriptor> components;
   final int exposureTimestampNanoseconds;
-  final String poseRecordHash;
-  final String cameraModelHash;
-  final String validationRecordHash;
-  final String ledgerRecordHash;
+  final List<int> poseRecordHash;
+  final List<int> cameraModelHash;
+  final List<int> validationRecordHash;
+  final List<int> ledgerRecordHash;
 
   bool get hasCompleteComponentSet =>
       components.map((value) => value.kind).toSet().length ==
@@ -258,11 +381,22 @@ final class CaptureCommitRequest {
         validationRecordHash,
         ledgerRecordHash,
       ].join('|');
+
+  @override
+  List<Object?> get equalityFields => [
+        accepted,
+        components,
+        exposureTimestampNanoseconds,
+        poseRecordHash,
+        cameraModelHash,
+        validationRecordHash,
+        ledgerRecordHash
+      ];
 }
 
 /// Exactly one durable committed or metadata-only abandoned terminal.
-final class CaptureTerminal {
-  const CaptureTerminal({
+final class CaptureTerminal with CaptureValueEquality {
+  CaptureTerminal({
     required this.kind,
     required this.identity,
     required this.canonicalTerminalHash,
@@ -270,7 +404,21 @@ final class CaptureTerminal {
     this.captureId,
     this.captureRevision,
     this.manifestId,
-  });
+  }) {
+    if (canonicalTerminalHash.isEmpty || reason.isEmpty)
+      throw ArgumentError('Terminal hash and reason must be non-empty.');
+    if (captureRevision != null)
+      _requirePortableNonNegative(captureRevision!, 'captureRevision');
+    if (kind == CaptureTerminalKind.committedPicture &&
+        (captureId == null || captureRevision == null || manifestId == null)) {
+      throw ArgumentError(
+          'Committed terminal requires capture identity, revision, and manifest.');
+    }
+    if (kind == CaptureTerminalKind.abandonedAttempt &&
+        (captureId != null || captureRevision != null || manifestId != null)) {
+      throw ArgumentError('Abandoned terminal must be metadata-only.');
+    }
+  }
 
   final CaptureTerminalKind kind;
   final CaptureAttemptIdentity identity;
@@ -281,10 +429,21 @@ final class CaptureTerminal {
   final String? manifestId;
 
   bool get metadataOnly => kind == CaptureTerminalKind.abandonedAttempt;
+
+  @override
+  List<Object?> get equalityFields => [
+        kind,
+        identity,
+        canonicalTerminalHash,
+        reason,
+        captureId,
+        captureRevision,
+        manifestId
+      ];
 }
 
 /// Durable receipt returned by accept, query, commit, and abandonment APIs.
-final class CaptureReceipt {
+final class CaptureReceipt with CaptureValueEquality {
   const CaptureReceipt({
     required this.identity,
     required this.phase,
@@ -300,6 +459,10 @@ final class CaptureReceipt {
   final String receiptHash;
   final bool durable;
   final CaptureTerminal? terminal;
+
+  @override
+  List<Object?> get equalityFields =>
+      [identity, phase, requestHash, receiptHash, durable, terminal];
 }
 
 /// Frozen storage seam. Issue 99 declares it; later issues implement it.
@@ -338,6 +501,64 @@ final class CaptureAdmissionDecision {
   final CaptureIntentState state;
   final String reason;
   bool get isAccepted => accepted != null;
+}
+
+enum CaptureFinalizerPosition { running, fundedWaiting, rejected }
+
+final class CaptureFinalizerAssignment with CaptureValueEquality {
+  const CaptureFinalizerAssignment(this.attempt, this.position, this.reason);
+  final CaptureAcceptedAttempt attempt;
+  final CaptureFinalizerPosition position;
+  final String reason;
+  @override
+  List<Object?> get equalityFields => [attempt, position, reason];
+}
+
+/// Executable one-running plus one-funded-waiting scheduler reference.
+final class CaptureFinalizerScheduler {
+  CaptureAcceptedAttempt? _running;
+  CaptureAcceptedAttempt? _waiting;
+
+  CaptureAcceptedAttempt? get running => _running;
+  CaptureAcceptedAttempt? get fundedWaiting => _waiting;
+
+  List<CaptureFinalizerAssignment> scheduleReady(
+      Iterable<CaptureAcceptedAttempt> candidates) {
+    final ordered = candidates.toList()
+      ..sort((left, right) => left.lane == right.lane
+          ? left.identity.attemptOrdinal
+              .compareTo(right.identity.attemptOrdinal)
+          : (left.lane == CaptureLane.manual ? -1 : 1));
+    final results = <CaptureFinalizerAssignment>[];
+    for (final attempt in ordered) {
+      if (_running == null) {
+        _running = attempt;
+        results.add(CaptureFinalizerAssignment(
+            attempt, CaptureFinalizerPosition.running, 'running'));
+      } else if (_waiting == null) {
+        _waiting = attempt;
+        results.add(CaptureFinalizerAssignment(
+            attempt, CaptureFinalizerPosition.fundedWaiting, 'funded-waiting'));
+      } else {
+        results.add(CaptureFinalizerAssignment(
+            attempt, CaptureFinalizerPosition.rejected, 'finalizer-capacity'));
+      }
+    }
+    return List.unmodifiable(results);
+  }
+
+  CaptureAcceptedAttempt? release(CaptureAttemptIdentity identity) {
+    if (_running?.identity == identity) {
+      _running = _waiting;
+      _waiting = null;
+      return _running;
+    }
+    if (_waiting?.identity == identity) _waiting = null;
+    return _running;
+  }
+
+  bool ownsExposure(CaptureAttemptIdentity identity) =>
+      _running?.identity == identity;
 }
 
 /// Executable T1 admission oracle; it owns identities but no storage or camera.
@@ -458,8 +679,8 @@ final class CaptureAdmissionReferenceModel {
       profile: intent.profile,
       reservation: liability,
       canonicalIntentHash: intent.canonicalIntentHash,
-      acceptedReceiptHash:
-          'accepted:${identity.canonicalKey}:${liability.totalStoreLiability}',
+      acceptedReceiptHash: _referenceDigest(
+          'accepted:${identity.canonicalKey}:${liability.totalStoreLiability}'),
     );
     _admitted[intent.lane] = accepted;
     return CaptureAdmissionDecision.accepted(accepted);
@@ -487,8 +708,8 @@ final class CaptureAttemptReferenceMachine {
       : _receipt = CaptureReceipt(
           identity: accepted.identity,
           phase: CaptureAttemptPhase.reservedAccepted,
-          requestHash: accepted.acceptedReceiptHash,
-          receiptHash: accepted.acceptedReceiptHash,
+          requestHash: _bytesKey(accepted.acceptedReceiptHash),
+          receiptHash: _bytesKey(accepted.acceptedReceiptHash),
           durable: true,
         );
 
@@ -497,6 +718,7 @@ final class CaptureAttemptReferenceMachine {
   final Map<String, CaptureReceipt> _replay = {};
   final Set<CaptureComponentKind> _ownedComponents = {};
   bool outcomeUnknown = false;
+  String? _unknownRequestHash;
   int exposureCount = 0;
   int retainedImageBytes = 0;
 
@@ -590,7 +812,15 @@ final class CaptureAttemptReferenceMachine {
   CaptureTransitionResult timeoutUnknown(String requestHash) {
     if (isTerminal)
       return _replayOrReject(requestHash, 'terminal-already-published');
+    if (_unknownRequestHash != null) {
+      return _unknownRequestHash == requestHash
+          ? CaptureTransitionResult(CaptureTransitionDisposition.exactReplay,
+              _receipt, 'exact-unknown-replay')
+          : _unchanged(CaptureTransitionDisposition.conflict, requestHash,
+              'changed-unknown-replay');
+    }
     outcomeUnknown = true;
+    _unknownRequestHash = requestHash;
     return _unchanged(CaptureTransitionDisposition.applied, requestHash,
         'outcome-unknown-query-same-identity');
   }
@@ -636,6 +866,7 @@ final class CaptureAttemptReferenceMachine {
     );
     _replay[hash] = _receipt;
     outcomeUnknown = false;
+    _unknownRequestHash = null;
     return CaptureTransitionResult(
         CaptureTransitionDisposition.applied, _receipt, 'terminal');
   }
@@ -658,12 +889,32 @@ final class CaptureAttemptReferenceMachine {
 
 final class CaptureFaultLifecycleCase {
   const CaptureFaultLifecycleCase(this.lane, this.phase, this.fault,
-      this.lifecycleEvent, this.expectedTerminal);
+      this.lifecycleEvent, this.expectedOutcome);
   final CaptureLane lane;
   final CaptureAttemptPhase phase;
   final CaptureFault fault;
   final CaptureLifecycleEvent lifecycleEvent;
-  final CaptureTerminalKind expectedTerminal;
+  final CaptureMatrixOutcome expectedOutcome;
+}
+
+enum CaptureMatrixOutcome { abandoned, outcomeUnknown, committed }
+
+final class CaptureMatrixExecution {
+  const CaptureMatrixExecution(
+      this.outcome,
+      this.phase,
+      this.exposureCount,
+      this.exactReplay,
+      this.changedReplayConflict,
+      this.lifecycleFenceNoOp,
+      this.lateCallbackNoOp);
+  final CaptureMatrixOutcome outcome;
+  final CaptureAttemptPhase phase;
+  final int exposureCount;
+  final bool exactReplay;
+  final bool changedReplayConflict;
+  final bool lifecycleFenceNoOp;
+  final bool lateCallbackNoOp;
 }
 
 /// Canonical legal edges. Every other phase pair is rejected deterministically.
@@ -708,9 +959,107 @@ final class CaptureFaultLifecycleMatrix {
               value.index < CaptureAttemptPhase.committedPicture.index))
             for (final fault in CaptureFault.values)
               for (final event in CaptureLifecycleEvent.values)
-                CaptureFaultLifecycleCase(lane, phase, fault, event,
-                    CaptureTerminalKind.abandonedAttempt),
+                CaptureFaultLifecycleCase(
+                    lane, phase, fault, event, _expectedOutcome(phase, fault)),
       ]);
+
+  static CaptureMatrixOutcome _expectedOutcome(
+      CaptureAttemptPhase phase, CaptureFault fault) {
+    final uncertain = const {
+      CaptureFault.timeout,
+      CaptureFault.isolateLoss,
+      CaptureFault.processLoss
+    }.contains(fault);
+    if (phase == CaptureAttemptPhase.durablePrepared && uncertain)
+      return CaptureMatrixOutcome.committed;
+    if (phase != CaptureAttemptPhase.reservedAccepted && uncertain)
+      return CaptureMatrixOutcome.outcomeUnknown;
+    return CaptureMatrixOutcome.abandoned;
+  }
+
+  static CaptureMatrixExecution execute(CaptureFaultLifecycleCase row,
+      CaptureAcceptedAttempt accepted, CaptureCommitRequest request) {
+    final machine = CaptureAttemptReferenceMachine(accepted);
+    if (row.phase.index >= CaptureAttemptPhase.exposureRequested.index) {
+      machine.requestExposure('expose');
+    }
+    if (row.phase.index >= CaptureAttemptPhase.sensorOutputOwned.index) {
+      machine.ownSensorOutput('output', request.components);
+    }
+    if (row.phase.index >= CaptureAttemptPhase.validated.index) {
+      machine.validate('validate');
+    }
+    if (row.phase.index >= CaptureAttemptPhase.durablePrepared.index) {
+      machine.prepareDurable('prepare', request);
+    }
+    final phaseBeforeLifecycle = machine.receipt.phase;
+    final exposureBeforeLifecycle = machine.exposureCount;
+    final lifecycleFence =
+        machine.lateCallback('lifecycle:${row.lifecycleEvent.name}');
+    final lifecycleFenceNoOp =
+        lifecycleFence.disposition == CaptureTransitionDisposition.rejected &&
+            machine.receipt.phase == phaseBeforeLifecycle &&
+            machine.exposureCount == exposureBeforeLifecycle;
+    var lateCallbackNoOp = false;
+    if (row.fault == CaptureFault.lateCallback) {
+      final phaseBeforeCallback = machine.receipt.phase;
+      final exposureBeforeCallback = machine.exposureCount;
+      final callback = machine.lateCallback('fault:late-callback');
+      lateCallbackNoOp =
+          callback.disposition == CaptureTransitionDisposition.rejected &&
+              machine.receipt.phase == phaseBeforeCallback &&
+              machine.exposureCount == exposureBeforeCallback;
+    }
+    final uncertainFault = const {
+      CaptureFault.timeout,
+      CaptureFault.isolateLoss,
+      CaptureFault.processLoss,
+    }.contains(row.fault);
+    if (row.phase == CaptureAttemptPhase.durablePrepared && uncertainFault) {
+      machine.commit('terminal',
+          captureId: 'matrix-capture',
+          captureRevision: 1,
+          manifestId: 'matrix-manifest');
+      final exact = machine.commit('terminal',
+          captureId: 'matrix-capture',
+          captureRevision: 1,
+          manifestId: 'matrix-manifest');
+      final changed = machine.commit('changed-terminal',
+          captureId: 'changed', captureRevision: 2, manifestId: 'changed');
+      return CaptureMatrixExecution(
+          CaptureMatrixOutcome.committed,
+          machine.receipt.phase,
+          machine.exposureCount,
+          exact.disposition == CaptureTransitionDisposition.exactReplay,
+          changed.disposition == CaptureTransitionDisposition.conflict,
+          lifecycleFenceNoOp,
+          lateCallbackNoOp);
+    }
+    if (row.phase != CaptureAttemptPhase.reservedAccepted && uncertainFault) {
+      machine.timeoutUnknown('unknown');
+      final exact = machine.timeoutUnknown('unknown');
+      final changed = machine.timeoutUnknown('changed-unknown');
+      return CaptureMatrixExecution(
+          CaptureMatrixOutcome.outcomeUnknown,
+          machine.receipt.phase,
+          machine.exposureCount,
+          exact.disposition == CaptureTransitionDisposition.exactReplay,
+          changed.disposition == CaptureTransitionDisposition.conflict,
+          lifecycleFenceNoOp,
+          lateCallbackNoOp);
+    }
+    machine.abandon('terminal', 'proven-absent');
+    final exact = machine.abandon('terminal', 'proven-absent');
+    final changed = machine.abandon('changed-terminal', 'changed');
+    return CaptureMatrixExecution(
+        CaptureMatrixOutcome.abandoned,
+        machine.receipt.phase,
+        machine.exposureCount,
+        exact.disposition == CaptureTransitionDisposition.exactReplay,
+        changed.disposition == CaptureTransitionDisposition.conflict,
+        lifecycleFenceNoOp,
+        lateCallbackNoOp);
+  }
 }
 
 int _checkedAdd(int left, int right) {
@@ -718,4 +1067,60 @@ int _checkedAdd(int left, int right) {
     throw StateError('portable non-negative integer overflow');
   }
   return left + right;
+}
+
+String _bytesKey(List<int> bytes) =>
+    bytes.map((value) => value.toRadixString(16).padLeft(2, '0')).join();
+
+void _requirePortableNonNegative(int value, String name) {
+  if (value < 0 || value > capturePortableOrdinalMaximum) {
+    throw ArgumentError.value(value, name, 'must be in 0..2^63-1');
+  }
+}
+
+void _requirePortableEntry(int value, String name) {
+  if (value < 0 || value > capturePortableEntryMaximum) {
+    throw ArgumentError.value(value, name, 'must be in 0..2^31-1');
+  }
+}
+
+List<int> _copyDigest(List<int> bytes, String name) {
+  if (bytes.length != 32 || bytes.any((value) => value < 0 || value > 255)) {
+    throw ArgumentError.value(bytes, name, 'must be exactly 32 unsigned bytes');
+  }
+  return List.unmodifiable(bytes);
+}
+
+List<int> _referenceDigest(String value) {
+  final source = value.codeUnits;
+  return List<int>.generate(
+      32, (index) => source[index % source.length] ^ index,
+      growable: false);
+}
+
+bool _deepEquals(Object? left, Object? right) {
+  if (identical(left, right)) return true;
+  if (left is Set && right is Set) {
+    return left.length == right.length &&
+        left.every(
+            (value) => right.any((candidate) => _deepEquals(value, candidate)));
+  }
+  if (left is Iterable && right is Iterable) {
+    final a = left.iterator;
+    final b = right.iterator;
+    while (true) {
+      final hasA = a.moveNext();
+      final hasB = b.moveNext();
+      if (hasA != hasB) return false;
+      if (!hasA) return true;
+      if (!_deepEquals(a.current, b.current)) return false;
+    }
+  }
+  return left == right;
+}
+
+int _deepHash(Object? value) {
+  if (value is Set) return Object.hashAllUnordered(value.map(_deepHash));
+  if (value is Iterable) return Object.hashAll(value.map(_deepHash));
+  return value.hashCode;
 }

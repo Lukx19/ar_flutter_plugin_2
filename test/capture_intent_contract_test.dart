@@ -183,10 +183,8 @@ void main() {
           CaptureFault.values.toSet());
       expect(matrix.map((value) => value.lifecycleEvent).toSet(),
           CaptureLifecycleEvent.values.toSet());
-      expect(
-          matrix.every((value) =>
-              value.expectedTerminal == CaptureTerminalKind.abandonedAttempt),
-          isTrue);
+      expect(matrix.map((value) => value.expectedOutcome).toSet(),
+          CaptureMatrixOutcome.values.toSet());
     });
 
     test('transition table rejects every edge outside the canonical graph', () {
@@ -252,13 +250,180 @@ void main() {
         CaptureTerminalKind.committedPicture,
       );
     });
+
+    test('DTO value equality hashes deep lists and copies mutable bytes', () {
+      final bytes = _digest('mutable');
+      final first = CaptureComponentDescriptor(
+          kind: CaptureComponentKind.jpeg,
+          byteLength: 40,
+          sha256: bytes,
+          durableObjectId: 'object');
+      final second = CaptureComponentDescriptor(
+          kind: CaptureComponentKind.jpeg,
+          byteLength: 40,
+          sha256: List<int>.of(bytes),
+          durableObjectId: 'object');
+      expect(first, second);
+      expect(first.hashCode, second.hashCode);
+      bytes[0] ^= 0xff;
+      expect(first, second);
+      expect(
+          _commit(_accepted(CaptureLane.manual), [
+            _component(CaptureComponentKind.jpeg),
+            _component(CaptureComponentKind.dng)
+          ]),
+          _commit(_accepted(CaptureLane.manual), [
+            _component(CaptureComponentKind.jpeg),
+            _component(CaptureComponentKind.dng)
+          ]));
+    });
+
+    test('numeric domains reject negative overflow and malformed digests', () {
+      expect(
+          () => CaptureComponentDescriptor(
+              kind: CaptureComponentKind.jpeg,
+              byteLength: -1,
+              sha256: _digest('x'),
+              durableObjectId: 'x'),
+          throwsArgumentError);
+      expect(
+          () => CaptureReservationLiability(
+              memoryBytes: -1,
+              physicalStoreBytes: 0,
+              componentEntries: 0,
+              terminalEntries: 0,
+              rollbackBytes: 0,
+              physicallyBacked: true),
+          throwsArgumentError);
+      expect(
+          () => CaptureReservationLiability(
+              memoryBytes: 0,
+              physicalStoreBytes: 0,
+              componentEntries: capturePortableEntryMaximum + 1,
+              terminalEntries: 0,
+              rollbackBytes: 0,
+              physicallyBacked: true),
+          throwsArgumentError);
+      expect(
+          () => CaptureAttemptIdentity(
+              attemptId: 'a',
+              commitId: 'c',
+              attemptOrdinal: 0,
+              lifecycleCut: _cut()),
+          throwsArgumentError);
+      expect(
+          () => CaptureLifecycleCut(
+              sessionId: 's',
+              sessionGeneration: -1,
+              groupId: 'g',
+              groupGeneration: 0,
+              arSessionId: 'a',
+              viewId: 'v',
+              viewGeneration: 0,
+              bindingToken: 'b',
+              lifecycleSequence: 0,
+              operationGeneration: 0),
+          throwsArgumentError);
+      expect(
+          () => CaptureComponentDescriptor(
+              kind: CaptureComponentKind.jpeg,
+              byteLength: 1,
+              sha256: [1],
+              durableObjectId: 'x'),
+          throwsArgumentError);
+    });
+
+    test('finalizer scheduler gives manual running priority and promotes once',
+        () {
+      final manual = _accepted(CaptureLane.manual);
+      final automatic = _accepted(CaptureLane.automatic, ordinal: 2);
+      final scheduler = CaptureFinalizerScheduler();
+      final assignments =
+          scheduler.scheduleReady([automatic, manual, automatic]);
+      expect(assignments.map((value) => value.position), [
+        CaptureFinalizerPosition.running,
+        CaptureFinalizerPosition.fundedWaiting,
+        CaptureFinalizerPosition.rejected
+      ]);
+      expect(scheduler.running, manual);
+      expect(scheduler.fundedWaiting, automatic);
+      expect(scheduler.ownsExposure(automatic.identity), isFalse);
+      expect(CaptureAttemptReferenceMachine(automatic).exposureCount, 0);
+      expect(scheduler.release(manual.identity), automatic);
+      expect(scheduler.ownsExposure(automatic.identity), isTrue);
+      expect(scheduler.release(automatic.identity), isNull);
+    });
+
+    test('all 540 rows execute canonical terminal query and replay outcomes',
+        () {
+      final outcomeCounts = <CaptureMatrixOutcome, int>{};
+      final accepted = {
+        CaptureLane.manual: _accepted(CaptureLane.manual),
+        CaptureLane.automatic: _accepted(CaptureLane.automatic, ordinal: 2),
+      };
+      for (final row in CaptureFaultLifecycleMatrix.generate()) {
+        final attempt = accepted[row.lane]!;
+        final request = _commit(attempt, [
+          _component(CaptureComponentKind.jpeg),
+          _component(CaptureComponentKind.dng)
+        ]);
+        final execution =
+            CaptureFaultLifecycleMatrix.execute(row, attempt, request);
+        expect(execution.outcome, row.expectedOutcome,
+            reason:
+                '${row.lane}/${row.phase}/${row.fault}/${row.lifecycleEvent}');
+        expect(execution.exactReplay, isTrue);
+        expect(execution.changedReplayConflict, isTrue);
+        expect(execution.lifecycleFenceNoOp, isTrue);
+        expect(
+            execution.lateCallbackNoOp, row.fault == CaptureFault.lateCallback);
+        expect(execution.exposureCount,
+            row.phase == CaptureAttemptPhase.reservedAccepted ? 0 : 1);
+        outcomeCounts.update(execution.outcome, (value) => value + 1,
+            ifAbsent: () => 1);
+      }
+      expect(outcomeCounts, {
+        CaptureMatrixOutcome.abandoned: 396,
+        CaptureMatrixOutcome.outcomeUnknown: 108,
+        CaptureMatrixOutcome.committed: 36,
+      });
+
+      final committed = CaptureFaultLifecycleCase(
+          CaptureLane.manual,
+          CaptureAttemptPhase.durablePrepared,
+          CaptureFault.timeout,
+          CaptureLifecycleEvent.backgrounded,
+          CaptureMatrixOutcome.committed);
+      final mutated = CaptureFaultLifecycleCase(
+          committed.lane,
+          committed.phase,
+          CaptureFault.componentFailure,
+          committed.lifecycleEvent,
+          CaptureMatrixOutcome.abandoned);
+      final attempt = accepted[CaptureLane.manual]!;
+      expect(
+          CaptureFaultLifecycleMatrix.execute(
+              committed,
+              attempt,
+              _commit(attempt, [
+                _component(CaptureComponentKind.jpeg),
+                _component(CaptureComponentKind.dng)
+              ])).outcome,
+          isNot(CaptureFaultLifecycleMatrix.execute(
+              mutated,
+              attempt,
+              _commit(attempt, [
+                _component(CaptureComponentKind.jpeg),
+                _component(CaptureComponentKind.dng)
+              ])).outcome));
+    });
   });
 }
 
 CaptureIntent _intent(CaptureLane lane, {bool selector = true}) =>
     CaptureIntent(
       lane: lane,
-      lifecycleCut: const CaptureLifecycleCut(
+      lifecycleCut: CaptureLifecycleCut(
         sessionId: 'session',
         sessionGeneration: 1,
         groupId: 'group',
@@ -283,12 +448,52 @@ CaptureIntent _intent(CaptureLane lane, {bool selector = true}) =>
       trackingValid: true,
       captureHealthy: true,
       durabilityPreflightValid: true,
-      canonicalIntentHash: 'intent-${lane.name}',
+      canonicalIntentHash: _digest('intent-${lane.name}'),
     );
 
 CaptureAdmissionReferenceModel _admissionModel() =>
     CaptureAdmissionReferenceModel(
       protectedManualMemoryBytes: 64 * 1024 * 1024,
+    );
+
+CaptureLifecycleCut _cut() => CaptureLifecycleCut(
+      sessionId: 'session',
+      sessionGeneration: 1,
+      groupId: 'group',
+      groupGeneration: 1,
+      arSessionId: 'ar',
+      viewId: 'view',
+      viewGeneration: 1,
+      bindingToken: 'binding',
+      lifecycleSequence: 1,
+      operationGeneration: 1,
+    );
+
+CaptureAcceptedAttempt _accepted(CaptureLane lane, {int ordinal = 1}) =>
+    CaptureAcceptedAttempt(
+      identity: CaptureAttemptIdentity(
+          attemptId: 'attempt-$ordinal',
+          commitId: 'commit-$ordinal',
+          attemptOrdinal: ordinal,
+          lifecycleCut: _cut()),
+      lane: lane,
+      profile: CaptureComponentProfile(
+          profileId: 'raw+jpeg',
+          requiredComponents: const {
+            CaptureComponentKind.jpeg,
+            CaptureComponentKind.dng
+          },
+          maximumComponentBytes: 200,
+          maximumWorkingBytes: 1024),
+      reservation: CaptureReservationLiability(
+          memoryBytes: 1024,
+          physicalStoreBytes: 200,
+          componentEntries: 2,
+          terminalEntries: 1,
+          rollbackBytes: 0,
+          physicallyBacked: true),
+      canonicalIntentHash: _digest('intent-$ordinal'),
+      acceptedReceiptHash: _digest('accepted-$ordinal'),
     );
 
 CaptureReservationLiability _liability(
@@ -307,7 +512,7 @@ CaptureComponentDescriptor _component(CaptureComponentKind kind,
     CaptureComponentDescriptor(
       kind: kind,
       byteLength: bytes,
-      sha256: 'sha-${kind.name}-$bytes',
+      sha256: _digest('sha-${kind.name}-$bytes'),
       durableObjectId: 'object-${kind.name}',
     );
 
@@ -317,8 +522,14 @@ CaptureCommitRequest _commit(CaptureAcceptedAttempt accepted,
       accepted: accepted,
       components: components,
       exposureTimestampNanoseconds: 10,
-      poseRecordHash: 'pose',
-      cameraModelHash: 'camera',
-      validationRecordHash: 'validation',
-      ledgerRecordHash: 'ledger',
+      poseRecordHash: _digest('pose'),
+      cameraModelHash: _digest('camera'),
+      validationRecordHash: _digest('validation'),
+      ledgerRecordHash: _digest('ledger'),
+    );
+
+List<int> _digest(String value) => List<int>.generate(
+      32,
+      (index) => value.codeUnitAt(index % value.length) ^ index,
+      growable: false,
     );

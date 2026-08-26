@@ -10,6 +10,7 @@ protocol CaptureCommitPortInterface {
 
 enum CaptureIntentInterfaceConstants {
     static let portableOrdinalMaximum = UInt64(Int64.max)
+    static let portableEntryMaximum = UInt64(Int32.max)
     static let coexistenceBytes: UInt64 = 128 * 1024 * 1024
     static let maximumAdmittedAttempts = 2
     static let maximumAutomaticAttempts = 1
@@ -20,6 +21,11 @@ enum CaptureIntentInterfaceConstants {
 }
 
 enum CaptureLaneDescriptor { case manual, automatic }
+enum CaptureIntentStateDescriptor {
+    case manualReady, manualWaitingDurability, automaticDisabledByUser
+    case automaticReady, automaticWaitingSelector, automaticWaitingDurability
+    case automaticWaitingCaptureHealth, automaticRecovering
+}
 enum CaptureAttemptPhaseDescriptor { case reservedAccepted, exposureRequested, sensorOutputOwned, validated, durablePrepared, committedPicture, abandonedAttempt }
 enum CaptureComponentKindDescriptor { case jpeg, dng, raw, hdr, sidecar }
 enum CaptureTerminalKindDescriptor { case committedPicture, abandonedAttempt }
@@ -44,11 +50,22 @@ struct CaptureComponentProfileDescriptor {
     let maximumWorkingBytes: UInt64
 }
 
+struct CaptureIntentDescriptor {
+    let lane: CaptureLaneDescriptor
+    let lifecycleCut: CaptureLifecycleCutDescriptor
+    let profile: CaptureComponentProfileDescriptor
+    let selectorValid: Bool
+    let trackingValid: Bool
+    let captureHealthy: Bool
+    let durabilityPreflightValid: Bool
+    let canonicalIntentHash: Data
+}
+
 struct CaptureReservationLiabilityDescriptor {
     let memoryBytes: UInt64
     let physicalStoreBytes: UInt64
-    let componentEntries: UInt32
-    let terminalEntries: UInt32
+    let componentEntries: UInt64
+    let terminalEntries: UInt64
     let rollbackBytes: UInt64
     let physicallyBacked: Bool
 }
