@@ -134,6 +134,30 @@ class NativeCaptureAdapterV2Test {
         }
     }
 
+    @Test
+    fun `shutdown classifies running and funded waiting owners then a later capture succeeds`() {
+        val store = FakeStore()
+        val firstPort = FakeExposure()
+        val adapter = NativeCaptureAdapterV2(store, firstPort)
+        val automatic = request(CaptureLane.AUTOMATIC, setOf(CaptureComponentKind.JPEG), ordinal = 1)
+        val manual = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 2)
+        adapter.admit(automatic)
+        adapter.admit(manual)
+        adapter.close()
+        assertEquals(2, store.terminals.count { it.terminal?.kind == CaptureTerminalKind.ABANDONED_ATTEMPT })
+        assertEquals(0, adapter.snapshot().running)
+        assertEquals(0, adapter.snapshot().fundedWaiting)
+
+        val secondPort = FakeExposure()
+        val later = NativeCaptureAdapterV2(store, secondPort)
+        val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 3)
+        later.admit(request)
+        secondPort.components(secondPort.requests.single().first, request, listOf(CaptureComponentKind.JPEG))
+        assertEquals(CaptureTerminalKind.COMMITTED_PICTURE, store.terminals.last().terminal?.kind)
+        assertEquals(0, later.snapshot().running)
+        assertEquals(0, later.snapshot().fundedWaiting)
+    }
+
     private fun request(lane: CaptureLane, kinds: Set<CaptureComponentKind>, ordinal: Long = 1): CaptureCommitRequest {
         val cut = CaptureLifecycleCut("session", 1, "group", 1, "ar", "view", 1, "binding", 1, 1)
         val accepted = CaptureAcceptedAttempt(
