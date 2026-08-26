@@ -168,6 +168,87 @@ class NativeCaptureAdapterV2Test {
             val restarted = NativeCaptureAdapterV2(DurableNativeCaptureStorePortV2(durable), restartCamera)
             assertEquals(CaptureAttemptPhase.ABANDONED_ATTEMPT, restarted.admit(acceptedOnly).phase)
             assertTrue(restartCamera.requests.isEmpty())
+
+            val later = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 3)
+            val laterCamera = FakeExposure()
+            val laterAdapter = NativeCaptureAdapterV2(DurableNativeCaptureStorePortV2(durable), laterCamera)
+            laterAdapter.admit(later)
+            laterCamera.components(laterCamera.requests.single().first, later, listOf(CaptureComponentKind.JPEG))
+            assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, durable.queryReceipt(later.accepted.identity)?.phase)
+        } finally {
+            durable.close()
+            budget.close()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `real durable abandoned replay binds full request and recovered metadata abandonment rejects replay`() {
+        val root = File.createTempFile("native-abandoned-v2", "").also { it.delete(); assertTrue(it.mkdirs()) }
+        val budget = StorageBudgetCoordinatorV2(
+            File(root, "budget"), StorageBudgetPolicyV2(1024 * 1024, 0), JvmDescriptorFilesystemV2(),
+        ) { 1024 * 1024 }
+        var durable = DurableSessionStoreV2(File(root, "store"), budget, filesystemBackend = JvmDescriptorFilesystemV2())
+        try {
+            val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 10)
+            val firstCamera = FakeExposure()
+            val first = NativeCaptureAdapterV2(DurableNativeCaptureStorePortV2(durable), firstCamera)
+            first.admit(request)
+            first.onLifecycle(CaptureLifecycleEvent.BACKGROUNDED)
+            val abandoned = checkNotNull(durable.queryReceipt(request.accepted.identity))
+            durable.close()
+            durable = DurableSessionStoreV2(File(root, "store"), budget, filesystemBackend = JvmDescriptorFilesystemV2())
+
+            val replayCamera = FakeExposure()
+            val replay = NativeCaptureAdapterV2(DurableNativeCaptureStorePortV2(durable), replayCamera)
+            assertEquals(abandoned.receiptHash, replay.admit(request).receiptHash)
+            assertTrue(replayCamera.requests.isEmpty())
+            assertEquals(0, replay.snapshot().running)
+            assertEquals(0, replay.snapshot().fundedWaiting)
+
+            val changedDescriptor = rebuildRequest(request, components = request.components.map {
+                CaptureComponentDescriptor(it.kind, it.byteLength, digest("different-component"), it.durableObjectId)
+            })
+            val changedObjectId = rebuildRequest(request, components = request.components.map {
+                CaptureComponentDescriptor(it.kind, it.byteLength, it.sha256, "different-object")
+            })
+            val changedTimestamp = rebuildRequest(request, timestamp = request.exposureTimestampNanoseconds + 1)
+            val changedPose = rebuildRequest(request, poseHash = digest("different-pose"))
+            val changedCamera = rebuildRequest(request, cameraHash = digest("different-camera"))
+            val changedValidation = rebuildRequest(request, validationHash = digest("different-validation"))
+            val changedLedger = rebuildRequest(request, ledgerHash = digest("different-ledger"))
+            val changedAccepted = CaptureAcceptedAttempt(
+                request.accepted.identity.copy(attemptOrdinal = request.accepted.identity.attemptOrdinal + 1),
+                request.accepted.lane,
+                request.accepted.profile,
+                request.accepted.reservation.copy(physicalStoreBytes = request.accepted.reservation.physicalStoreBytes + 1),
+                request.accepted.canonicalIntentHash,
+                request.accepted.acceptedReceiptHash,
+            )
+            listOf(
+                changedDescriptor, changedObjectId, changedTimestamp, changedPose, changedCamera,
+                changedValidation, changedLedger, rebuildRequest(request, accepted = changedAccepted),
+            ).forEach { changed ->
+                assertTrue(runCatching { replay.admit(changed) }.exceptionOrNull() is DurableStoreConflictV2)
+            }
+            assertTrue(replayCamera.requests.isEmpty())
+            assertEquals(0, replay.snapshot().running)
+            assertEquals(0, replay.snapshot().fundedWaiting)
+
+            val recoveredRequest = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 11)
+            durable.acceptCaptureBeforeExposure(recoveredRequest)
+            durable.recover()
+            val recoveredCamera = FakeExposure()
+            val recoveredAdapter = NativeCaptureAdapterV2(DurableNativeCaptureStorePortV2(durable), recoveredCamera)
+            assertTrue(runCatching { recoveredAdapter.admit(recoveredRequest) }.exceptionOrNull() is DurableStoreConflictV2)
+            assertTrue(recoveredCamera.requests.isEmpty())
+            assertEquals(0, recoveredAdapter.snapshot().running)
+            assertEquals(0, recoveredAdapter.snapshot().fundedWaiting)
+
+            val later = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 12)
+            recoveredAdapter.admit(later)
+            recoveredCamera.components(recoveredCamera.requests.single().first, later, listOf(CaptureComponentKind.JPEG))
+            assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, durable.queryReceipt(later.accepted.identity)?.phase)
         } finally {
             durable.close()
             budget.close()
@@ -385,7 +466,7 @@ class NativeCaptureAdapterV2Test {
         }
         override fun queryReceipt(identity: CaptureAttemptIdentity): CaptureReceipt? { queries += identity; return terminals.firstOrNull { it.identity == identity } }
         override fun rebaseSameAttempt(request: CaptureCommitRequest): CaptureReceipt = throw IllegalStateException("not prepared")
-        override fun abandon(terminal: CaptureTerminal): CaptureReceipt =
+        override fun abandon(request: CaptureCommitRequest, terminal: CaptureTerminal): CaptureReceipt =
             CaptureReceipt(terminal.identity, CaptureAttemptPhase.ABANDONED_ATTEMPT, terminal.canonicalTerminalHash, "abandoned", true, terminal).also(terminals::add)
     }
 
@@ -403,5 +484,24 @@ class NativeCaptureAdapterV2Test {
         fun bytes(kind: CaptureComponentKind) = "component-$kind".toByteArray()
         fun sha(bytes: ByteArray) = java.security.MessageDigest.getInstance("SHA-256").digest(bytes).map { it.toInt() and 0xff }
         fun digest(value: String) = sha(value.toByteArray())
+
+        fun rebuildRequest(
+            request: CaptureCommitRequest,
+            accepted: CaptureAcceptedAttempt = request.accepted,
+            components: List<CaptureComponentDescriptor> = request.components,
+            timestamp: Long = request.exposureTimestampNanoseconds,
+            poseHash: List<Int> = request.poseRecordHash,
+            cameraHash: List<Int> = request.cameraModelHash,
+            validationHash: List<Int> = request.validationRecordHash,
+            ledgerHash: List<Int> = request.ledgerRecordHash,
+        ) = CaptureCommitRequest(
+            accepted,
+            components,
+            timestamp,
+            poseHash,
+            cameraHash,
+            validationHash,
+            ledgerHash,
+        )
     }
 }

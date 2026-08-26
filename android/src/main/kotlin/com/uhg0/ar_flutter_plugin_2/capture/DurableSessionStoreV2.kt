@@ -2,6 +2,8 @@ package com.uhg0.ar_flutter_plugin_2.capture
 
 import java.io.File
 import java.io.InputStream
+import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.Properties
@@ -9,6 +11,9 @@ import java.util.Properties
 /** A component input owned by native code; it is consumed once and never buffered by the store. */
 data class CaptureComponentStreamV2(val kind: CaptureComponentKind, val input: InputStream)
 class DurableStoreConflictV2(message: String) : IllegalStateException(message)
+private const val ABANDONMENT_BINDING_FULL_REQUEST = "full-request-v1"
+private const val ABANDONMENT_BINDING_METADATA_ONLY = "metadata-only-v1"
+private const val ABANDONMENT_BINDING_RECOVERED = "recovered-proven-absent-v1"
 
 /**
  * Schema-5 capture-store implementation for the frozen #99 port.  V1 files
@@ -70,25 +75,14 @@ class DurableSessionStoreV2(
     internal fun acceptCaptureBeforeExposure(request: CaptureCommitRequest): CaptureReceipt = synchronized(mutex) {
         val location = location(request.accepted.identity)
         tombstone(location)?.let { throw DurableStoreConflictV2("Session is tombstoned") }
-        receipt(location, request.accepted.identity)?.let { prior ->
-            if (prior.requestHash == requestHash(request)) return@synchronized prior
-            throw DurableStoreConflictV2("Changed replay conflicts with durable terminal identity")
-        }
+        replayReceiptBeforeExposure(location, request)?.let { return@synchronized it }
         acceptBeforeExposure(request.accepted)
     }
 
     internal fun replayFenceBeforeExposure(request: CaptureCommitRequest): CaptureReceipt? = synchronized(mutex) {
         val location = location(request.accepted.identity)
         tombstone(location)?.let { throw DurableStoreConflictV2("Session is tombstoned") }
-        receipt(location, request.accepted.identity)?.let { prior ->
-            if (prior.terminal?.kind == CaptureTerminalKind.ABANDONED_ATTEMPT) {
-                val accepted = acceptedFile(location, request.accepted.identity).takeIf(files::isFile)?.let(::readProperties)
-                if (accepted?.getProperty("acceptedHash") == acceptedHash(request.accepted)) return@synchronized prior
-            } else if (prior.requestHash == requestHash(request)) {
-                return@synchronized prior
-            }
-            throw DurableStoreConflictV2("Changed replay conflicts with durable terminal identity")
-        }
+        replayReceiptBeforeExposure(location, request)?.let { return@synchronized it }
         val accepted = acceptedFile(location, request.accepted.identity)
         if (files.isFile(accepted)) {
             val existing = readProperties(accepted)
@@ -195,19 +189,33 @@ class DurableSessionStoreV2(
     }
 
     override fun abandon(terminal: CaptureTerminal): CaptureReceipt = synchronized(mutex) {
+        abandonLocked(terminal, fullRequestHash = null, binding = ABANDONMENT_BINDING_METADATA_ONLY)
+    }
+
+    /** #101 native abandonment binds the terminal to the complete frozen request. */
+    internal fun abandonCapture(request: CaptureCommitRequest, terminal: CaptureTerminal): CaptureReceipt = synchronized(mutex) {
+        require(request.accepted.identity == terminal.identity)
+        abandonLocked(terminal, fullRequestHash = requestHash(request), binding = ABANDONMENT_BINDING_FULL_REQUEST)
+    }
+
+    private fun abandonLocked(terminal: CaptureTerminal, fullRequestHash: String?, binding: String): CaptureReceipt {
         require(terminal.kind == CaptureTerminalKind.ABANDONED_ATTEMPT)
         val location = location(terminal.identity)
-        receipt(location, terminal.identity)?.let { return@synchronized it }
+        receipt(location, terminal.identity)?.let { return it }
         val accepted = acceptedFile(location, terminal.identity).takeIf(files::isFile)?.let(::readProperties)
         faults.at(DurableStoreFaultPointV2.ABANDONMENT_CLEANUP)
         deleteTree(path(attemptDirectory(location, terminal.identity), "staging"), DurableStoreFaultPointV2.ABANDONMENT_CLEANUP)
         deleteTree(assetDirectory(location, terminal.identity), DurableStoreFaultPointV2.ABANDONMENT_CLEANUP)
-        val value = CaptureReceipt(terminal.identity, CaptureAttemptPhase.ABANDONED_ATTEMPT, terminal.canonicalTerminalHash,
-            receiptHash(terminal.canonicalTerminalHash, "abandoned"), true, terminal)
+        val boundHash = fullRequestHash ?: terminal.canonicalTerminalHash
+        val value = CaptureReceipt(terminal.identity, CaptureAttemptPhase.ABANDONED_ATTEMPT, boundHash,
+            receiptHash(boundHash, "abandoned"), true, terminal)
         faults.at(DurableStoreFaultPointV2.ABANDONMENT_RECORD)
-        writePropertiesExclusive(receiptFile(location, terminal.identity), receiptProperties(value, "abandoned"))
+        writePropertiesExclusive(receiptFile(location, terminal.identity), receiptProperties(value, "abandoned").apply {
+            setProperty("requestBinding", binding)
+            fullRequestHash?.let { setProperty("fullRequestHash", it) }
+        })
         accepted?.getProperty("reservationToken")?.let { budget.reservation(it)?.let(budget::release) }
-        value
+        return value
     }
 
     /** Tombstone-first whole-session deletion fence.  It wins over later callbacks and roots. */
@@ -237,6 +245,7 @@ class DurableSessionStoreV2(
                         setProperty("receiptHash", receiptHash(acceptedValues.getProperty("acceptedHash"), "abandoned"))
                         setProperty("rootHash", "abandoned")
                         setProperty("reason", "recovered-proven-absent")
+                        setProperty("requestBinding", ABANDONMENT_BINDING_RECOVERED)
                     }
                     writePropertiesExclusive(receipt, abandoned, DurableStoreFaultPointV2.ABANDONMENT_RECORD)
                     deleteTree(path(attempt, "staging"), DurableStoreFaultPointV2.ABANDONMENT_CLEANUP)
@@ -278,11 +287,72 @@ class DurableSessionStoreV2(
     }
     private fun acceptedReceipt(attempt: CaptureAcceptedAttempt) = CaptureReceipt(attempt.identity, CaptureAttemptPhase.RESERVED_ACCEPTED, acceptedHash(attempt), attempt.acceptedReceiptHash.hex(), true)
     private fun acceptedHash(attempt: CaptureAcceptedAttempt) = sha256("${attempt.identity.commitId}|${attempt.identity.attemptId}|${attempt.reservation.totalStoreLiability}|${attempt.canonicalIntentHash.hex()}".toByteArray()).hex()
-    private fun requestHash(request: CaptureCommitRequest) = sha256(buildString { append(acceptedHash(request.accepted)); append('|').append(request.exposureTimestampNanoseconds); request.components.sortedBy { it.kind.ordinal }.forEach { append('|').append(it.kind).append(':').append(it.byteLength).append(':').append(it.sha256.hex()) } }.toByteArray()).hex()
+    /** Canonical structural hash of every frozen #99 CaptureCommitRequest field. */
+    private fun requestHash(request: CaptureCommitRequest): String {
+        val bytes = ByteArrayOutputStream()
+        DataOutputStream(bytes).use { output ->
+            fun text(value: String) {
+                val encoded = value.toByteArray(StandardCharsets.UTF_8)
+                output.writeInt(encoded.size)
+                output.write(encoded)
+            }
+            fun digest(value: List<Int>) {
+                output.writeInt(value.size)
+                value.forEach(output::writeByte)
+            }
+            val accepted = request.accepted
+            val identity = accepted.identity
+            val cut = identity.lifecycleCut
+            text(identity.attemptId); text(identity.commitId); output.writeLong(identity.attemptOrdinal)
+            text(cut.sessionId); output.writeLong(cut.sessionGeneration); text(cut.groupId)
+            output.writeLong(cut.groupGeneration); text(cut.arSessionId); text(cut.viewId)
+            output.writeLong(cut.viewGeneration); text(cut.bindingToken)
+            output.writeLong(cut.lifecycleSequence); output.writeLong(cut.operationGeneration)
+            output.writeInt(accepted.lane.ordinal)
+            text(accepted.profile.profileId)
+            accepted.profile.requiredComponents.sortedBy { it.ordinal }.also { kinds ->
+                output.writeInt(kinds.size); kinds.forEach { output.writeInt(it.ordinal) }
+            }
+            output.writeLong(accepted.profile.maximumComponentBytes)
+            output.writeLong(accepted.profile.maximumWorkingBytes)
+            output.writeLong(accepted.reservation.memoryBytes)
+            output.writeLong(accepted.reservation.physicalStoreBytes)
+            output.writeLong(accepted.reservation.componentEntries)
+            output.writeLong(accepted.reservation.terminalEntries)
+            output.writeLong(accepted.reservation.rollbackBytes)
+            output.writeBoolean(accepted.reservation.physicallyBacked)
+            digest(accepted.canonicalIntentHash); digest(accepted.acceptedReceiptHash)
+            request.components.sortedBy { it.kind.ordinal }.also { components ->
+                output.writeInt(components.size)
+                components.forEach { component ->
+                    output.writeInt(component.kind.ordinal); output.writeLong(component.byteLength)
+                    digest(component.sha256); text(component.durableObjectId)
+                }
+            }
+            output.writeLong(request.exposureTimestampNanoseconds)
+            digest(request.poseRecordHash); digest(request.cameraModelHash)
+            digest(request.validationRecordHash); digest(request.ledgerRecordHash)
+        }
+        return sha256(bytes.toByteArray()).hex()
+    }
     private fun reservationOwner(identity: CaptureAttemptIdentity) = "capture:${safe(identity.lifecycleCut.sessionId)}:${safe(identity.commitId)}"
     private fun receiptHash(requestHash: String, rootHash: String) = sha256("$requestHash|$rootHash".toByteArray()).hex()
     private fun rootRecord(request: CaptureCommitRequest, requestHash: String, revision: Long, staged: List<Staged>, prior: RootPointer?) = buildString { append("schema=5\nrevision=$revision\nrequest=$requestHash\nprevious=${prior?.rootHash ?: "-"}\nsecondPrevious=${prior?.previousHash ?: "-"}\n"); staged.sortedBy { it.kind.ordinal }.forEach { append("component=${it.kind}:${it.descriptor.byteLength}:${it.descriptor.sha256.hex()}\n") } }.toByteArray(StandardCharsets.UTF_8)
     private fun receiptProperties(receipt: CaptureReceipt, rootHash: String) = Properties().apply { setProperty("kind", receipt.terminal!!.kind.name); setProperty("requestHash", receipt.requestHash); setProperty("receiptHash", receipt.receiptHash); setProperty("rootHash", rootHash); setProperty("reason", receipt.terminal.reason); receipt.terminal.captureId?.let { setProperty("captureId", it) }; receipt.terminal.captureRevision?.let { setProperty("revision", it.toString()) } }
+
+    private fun replayReceiptBeforeExposure(location: File, request: CaptureCommitRequest): CaptureReceipt? {
+        val prior = receipt(location, request.accepted.identity) ?: return null
+        val properties = readProperties(receiptFile(location, request.accepted.identity))
+        if (prior.terminal?.kind == CaptureTerminalKind.ABANDONED_ATTEMPT) {
+            if (properties.getProperty("requestBinding") != ABANDONMENT_BINDING_FULL_REQUEST) {
+                throw DurableStoreConflictV2("Metadata-only abandonment cannot prove exact request replay")
+            }
+            if (properties.getProperty("fullRequestHash") == requestHash(request)) return prior
+            throw DurableStoreConflictV2("Changed replay conflicts with durable abandoned identity")
+        }
+        if (prior.requestHash == requestHash(request)) return prior
+        throw DurableStoreConflictV2("Changed replay conflicts with durable terminal identity")
+    }
     private fun selectedRoot(location: File): RootPointer? = listOf("root-A.ptr", "root-B.ptr").mapNotNull { file ->
         path(location, file).takeIf(files::isFile)?.let(files::readLines)?.takeIf { it.size == 3 }?.let {
             RootPointer(it[0].toLongOrNull() ?: return@let null, it[1], it[2], if (file == "root-A.ptr") "A" else "B", rootPrevious(location, it[1]))

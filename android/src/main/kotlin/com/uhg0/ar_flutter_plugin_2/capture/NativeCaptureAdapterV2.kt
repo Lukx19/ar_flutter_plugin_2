@@ -17,7 +17,7 @@ internal interface NativeCaptureStorePortV2 {
     fun commitStreamed(request: CaptureCommitRequest, streams: List<CaptureComponentStreamV2>): CaptureReceipt
     fun queryReceipt(identity: CaptureAttemptIdentity): CaptureReceipt?
     fun rebaseSameAttempt(request: CaptureCommitRequest): CaptureReceipt
-    fun abandon(terminal: CaptureTerminal): CaptureReceipt
+    fun abandon(request: CaptureCommitRequest, terminal: CaptureTerminal): CaptureReceipt
 }
 
 internal class DurableNativeCaptureStorePortV2(
@@ -29,7 +29,7 @@ internal class DurableNativeCaptureStorePortV2(
         store.commitStreamed(request, streams)
     override fun queryReceipt(identity: CaptureAttemptIdentity) = store.queryReceipt(identity)
     override fun rebaseSameAttempt(request: CaptureCommitRequest) = store.rebaseSameAttempt(request)
-    override fun abandon(terminal: CaptureTerminal) = store.abandon(terminal)
+    override fun abandon(request: CaptureCommitRequest, terminal: CaptureTerminal) = store.abandonCapture(request, terminal)
 }
 
 /** Full immutable callback qualifier; timestamp or generation alone is never sufficient. */
@@ -249,7 +249,7 @@ internal class NativeCaptureAdapterV2(
             if (replay.terminal != null) return@synchronized replay
             // A durable accepted identity from a prior owner is outcome-unknown.
             // Fence it metadata-only; never infer that a second shutter is safe.
-            return@synchronized abandonLocked(accepted, "durable-replay-no-reexposure")
+            return@synchronized abandonLocked(request, "durable-replay-no-reexposure")
         }
 
         // Capacity and protected-manual priority are settled before durable
@@ -258,7 +258,7 @@ internal class NativeCaptureAdapterV2(
         if (scheduler.running != null && scheduler.fundedWaiting != null) {
             val waiting = checkNotNull(scheduler.fundedWaiting)
             if (accepted.lane == CaptureLane.MANUAL && waiting.lane == CaptureLane.AUTOMATIC) {
-                abandonLocked(waiting, "manual-priority-evicted-automatic")
+                abandonLocked(checkNotNull(work[waiting.identity]).request, "manual-priority-evicted-automatic")
             } else {
                 throw IllegalStateException("finalizer-capacity")
             }
@@ -303,11 +303,11 @@ internal class NativeCaptureAdapterV2(
                     CaptureLifecycleEvent.AUTOMATIC_DISABLED -> if (
                         value.request.accepted.lane == CaptureLane.AUTOMATIC &&
                         scheduler.running?.identity != value.request.accepted.identity
-                    ) abandonLocked(value.request.accepted, "automatic-disabled-waiting")
-                    CaptureLifecycleEvent.ROUTE_LEFT -> abandonLocked(value.request.accepted, "route-left")
-                    CaptureLifecycleEvent.VIEW_REPLACED -> abandonLocked(value.request.accepted, "view-replaced")
-                    CaptureLifecycleEvent.AR_SESSION_REPLACED -> abandonLocked(value.request.accepted, "ar-session-replaced")
-                    CaptureLifecycleEvent.BACKGROUNDED -> abandonLocked(value.request.accepted, "backgrounded")
+                    ) abandonLocked(value.request, "automatic-disabled-waiting")
+                    CaptureLifecycleEvent.ROUTE_LEFT -> abandonLocked(value.request, "route-left")
+                    CaptureLifecycleEvent.VIEW_REPLACED -> abandonLocked(value.request, "view-replaced")
+                    CaptureLifecycleEvent.AR_SESSION_REPLACED -> abandonLocked(value.request, "ar-session-replaced")
+                    CaptureLifecycleEvent.BACKGROUNDED -> abandonLocked(value.request, "backgrounded")
                     CaptureLifecycleEvent.PROCESS_RESTARTED -> queryOrAbandonLocked(value, "process-restarted")
                 }
             }
@@ -329,7 +329,7 @@ internal class NativeCaptureAdapterV2(
         work.values.toList().forEach { value ->
             val elapsed = now - value.acceptedAtMs
             if (value.request.accepted.lane == CaptureLane.AUTOMATIC && elapsed >= AUTOMATIC_STALL_MS) {
-                abandonLocked(value.request.accepted, "automatic-stall-10s")
+                abandonLocked(value.request, "automatic-stall-10s")
             } else if (elapsed >= TERMINAL_FENCE_MS) {
                 queryOrAbandonLocked(value, "terminal-fence-30s")
             }
@@ -368,7 +368,7 @@ internal class NativeCaptureAdapterV2(
         }
         if (!requested) {
             safety.release(value.qualifier)
-            abandonLocked(value.request.accepted, "exposure-request-rejected")
+            abandonLocked(value.request, "exposure-request-rejected")
             return
         }
         counters.exposure()
@@ -382,7 +382,7 @@ internal class NativeCaptureAdapterV2(
             }
             val kinds = components.streams.map { it.kind }
             if (kinds.size != kinds.toSet().size || kinds.toSet() != value.request.accepted.profile.requiredComponents) {
-                closeStreams(components.streams); abandonLocked(value.request.accepted, "malformed-component-set"); return@synchronized
+                closeStreams(components.streams); abandonLocked(value.request, "malformed-component-set"); return@synchronized
             }
             val owned = components.streams.map { stream ->
                 CaptureComponentStreamV2(stream.kind, CloseOnceInputStreamV2(stream.input))
@@ -402,7 +402,7 @@ internal class NativeCaptureAdapterV2(
         override fun onFailure(qualifier: CaptureAttemptQualifierV2, reason: String) = synchronized(lock) {
             val value = work[qualifier.identity]
             if (value == null || value.qualifier != qualifier || closed) { counters.lateCallback(); return@synchronized }
-            abandonLocked(value.request.accepted, "camera-$reason")
+            abandonLocked(value.request, "camera-$reason")
         }
     }
 
@@ -412,12 +412,13 @@ internal class NativeCaptureAdapterV2(
         if (receipt?.terminal != null) { finishLocked(value, receipt); return }
         // Rebase only a durable prepared/committed identity; the port rejects changed bytes.
         runCatching { store.rebaseSameAttempt(value.request) }.getOrNull()?.let { finishLocked(value, it); return }
-        abandonLocked(value.request.accepted, reason)
+        abandonLocked(value.request, reason)
     }
 
-    private fun abandonLocked(accepted: CaptureAcceptedAttempt, reason: String): CaptureReceipt {
+    private fun abandonLocked(request: CaptureCommitRequest, reason: String): CaptureReceipt {
+        val accepted = request.accepted
         val terminal = CaptureTerminal(CaptureTerminalKind.ABANDONED_ATTEMPT, accepted.identity, reason, reason)
-        val receipt = store.abandon(terminal)
+        val receipt = store.abandon(request, terminal)
         finishLocked(work[accepted.identity], receipt)
         return receipt
     }
