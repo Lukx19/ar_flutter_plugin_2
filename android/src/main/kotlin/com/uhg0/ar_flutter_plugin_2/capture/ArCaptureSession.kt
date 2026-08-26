@@ -8,9 +8,12 @@ import android.media.Image
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Debug
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
 import android.util.Size
+import java.io.ByteArrayInputStream
 import android.view.Surface
 import com.google.ar.core.TrackingState
 import com.google.android.filament.Stream
@@ -49,8 +52,17 @@ internal class ArCaptureSession(
     private val resourceCounters = CaptureResourceCounters()
     private val poseDataExtractor = PoseDataExtractor()
     private var sharedCameraManager: SharedCameraManager? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
     // Constructed per view now; #102 only provides a future native admission caller.
-    private val nativeCaptureBindingV2 = NativeCaptureBindingV2(sceneHost.context, captureSafetySignalV2)
+    private val nativeCaptureBindingV2 = NativeCaptureBindingV2(
+        sceneHost.context,
+        captureSafetySignalV2,
+        events = { event ->
+            mainHandler.post {
+                captureChannel.invokeMethod("onNativeCaptureV2Event", NativeCaptureWireV2.event(event))
+            }
+        },
+    )
     private var sharedImageCacheManager: ImageCacheManager? = null
     private var highResCaptureEnabled = false
     private var poseSequence = 0L
@@ -704,6 +716,72 @@ internal class ArCaptureSession(
     }
 
     fun prepareNativeCaptureForPause() = nativeCaptureBindingV2.onPause()
+
+    /** Scalar-only V2 admission. Component descriptors and bytes are native post-output authority. */
+    fun admitNativeCaptureV2(arguments: Any?): Map<String, Any?> {
+        val receipt = nativeCaptureBindingV2.admit(NativeCaptureWireV2.decodeAdmission(arguments))
+        return mapOf(
+            "wireVersion" to "native_capture_v2",
+            "attemptId" to receipt.identity.attemptId,
+            "phase" to receipt.phase.name.lowercase(),
+            "durable" to receipt.durable,
+            "terminal" to receipt.terminal?.let { terminal ->
+                NativeCaptureWireV2.event(
+                    NativeCaptureEventV2(
+                        if (terminal.kind == CaptureTerminalKind.COMMITTED_PICTURE) NativeCaptureEventKindV2.COMMITTED else NativeCaptureEventKindV2.ABANDONED,
+                        terminal.identity.attemptId,
+                        terminal.captureId,
+                        terminal.captureRevision,
+                        terminal.manifestId,
+                        terminal.reason,
+                    ),
+                )
+            },
+        )
+    }
+
+    fun nativeCaptureHealthV2(): Map<String, Any?> = NativeCaptureWireV2.event(
+        NativeCaptureEventV2(NativeCaptureEventKindV2.HEALTH, resources = nativeCaptureBindingV2.snapshot()),
+    )
+
+    fun advanceNativeCaptureRecoveryV2() = nativeCaptureBindingV2.advanceRecovery()
+
+    fun notifyNativeCaptureLifecycleV2(event: String) {
+        val parsed = when (event) {
+            "automaticDisabled" -> CaptureLifecycleEvent.AUTOMATIC_DISABLED
+            "routeLeft" -> CaptureLifecycleEvent.ROUTE_LEFT
+            "processRestarted" -> CaptureLifecycleEvent.PROCESS_RESTARTED
+            else -> throw IllegalArgumentException("Unsupported V2 lifecycle event: $event")
+        }
+        nativeCaptureBindingV2.onLifecycle(parsed)
+    }
+
+    fun installDebugNativeCaptureSyntheticV2(fault: String?) {
+        nativeCaptureBindingV2.installSyntheticExposureHookForTest(
+            request = { qualifier, required, callback ->
+                when (fault) {
+                    "camera" -> callback.onFailure(qualifier, "synthetic-camera")
+                    "malformed" -> callback.onComponents(
+                        SharedCameraComponentSetV2(
+                            qualifier,
+                            listOf(CaptureComponentStreamV2(CaptureComponentKind.JPEG, ByteArrayInputStream(byteArrayOf(1, 2, 3)))),
+                            exposureTimestampNanoseconds = 1L,
+                        ),
+                    )
+                    else -> callback.onComponents(
+                        SharedCameraComponentSetV2(
+                            qualifier,
+                            required.sortedBy { it.ordinal }.map { kind ->
+                                CaptureComponentStreamV2(kind, ByteArrayInputStream(byteArrayOf(kind.ordinal.toByte(), 7, 9)))
+                            },
+                            exposureTimestampNanoseconds = 1L,
+                        ),
+                    )
+                }
+                true
+            },
+        )
+    }
 
     fun finishSharedCameraPause() = sharedCameraManager?.onArSessionPaused()
 

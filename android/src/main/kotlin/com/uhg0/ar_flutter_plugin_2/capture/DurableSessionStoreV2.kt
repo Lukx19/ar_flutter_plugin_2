@@ -101,6 +101,27 @@ class DurableSessionStoreV2(
         null
     }
 
+    internal fun replayTemplateFenceBeforeExposure(template: CapturePostOutputTemplateV2): CaptureReceipt? = synchronized(mutex) {
+        val location = location(template.accepted.identity)
+        tombstone(location)?.let { throw DurableStoreConflictV2("Session is tombstoned") }
+        val receiptFile = receiptFile(location, template.accepted.identity)
+        if (files.isFile(receiptFile)) {
+            val properties = readProperties(receiptFile)
+            if (properties.getProperty("templateHash") != templateHash(template)) {
+                throw DurableStoreConflictV2("Changed accepted template conflicts with durable identity")
+            }
+            return@synchronized receipt(location, template.accepted.identity)
+                ?: throw DurableStoreConflictV2("Template receipt is not selected-root authoritative")
+        }
+        val accepted = acceptedFile(location, template.accepted.identity)
+        if (files.isFile(accepted)) {
+            val existing = readProperties(accepted)
+            if (existing.getProperty("acceptedHash") == acceptedHash(template.accepted)) return@synchronized acceptedReceipt(template.accepted)
+            throw DurableStoreConflictV2("Changed template conflicts with durable accepted identity")
+        }
+        null
+    }
+
     /** Streams, hashes and commits the exact descriptor set.  The passed streams close here. */
     fun commitStreamed(request: CaptureCommitRequest, streams: List<CaptureComponentStreamV2>): CaptureReceipt = synchronized(mutex) {
         val location = location(request.accepted.identity)
@@ -219,7 +240,12 @@ class DurableSessionStoreV2(
             val terminal = CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, identity, requestHash, "committed", captureId, revision, rootHash)
             val committed = CaptureReceipt(identity, CaptureAttemptPhase.COMMITTED_PICTURE, requestHash, receiptHash(requestHash, rootHash), true, terminal)
             faults.at(DurableStoreFaultPointV2.RECEIPT_WRITE)
-            writePropertiesExclusive(receiptFile(location, identity), receiptProperties(committed, rootHash))
+            writePropertiesExclusive(
+                receiptFile(location, identity),
+                receiptProperties(committed, rootHash).apply {
+                    setProperty("templateHash", templateHash(template))
+                },
+            )
             faults.at(DurableStoreFaultPointV2.RECEIPT_FILE_SYNC)
             publishPointer(location, RootPointer(revision, rootHash, identity.commitId))
             budget.commit(reservation, actualBytes)
@@ -274,7 +300,22 @@ class DurableSessionStoreV2(
         abandonLocked(terminal, fullRequestHash = requestHash(request), binding = ABANDONMENT_BINDING_FULL_REQUEST)
     }
 
-    private fun abandonLocked(terminal: CaptureTerminal, fullRequestHash: String?, binding: String): CaptureReceipt {
+    internal fun abandonTemplate(template: CapturePostOutputTemplateV2, terminal: CaptureTerminal): CaptureReceipt = synchronized(mutex) {
+        require(template.accepted.identity == terminal.identity)
+        abandonLocked(
+            terminal,
+            fullRequestHash = null,
+            binding = "post-output-template-v2",
+            templateHash = templateHash(template),
+        )
+    }
+
+    private fun abandonLocked(
+        terminal: CaptureTerminal,
+        fullRequestHash: String?,
+        binding: String,
+        templateHash: String? = null,
+    ): CaptureReceipt {
         require(terminal.kind == CaptureTerminalKind.ABANDONED_ATTEMPT)
         val location = location(terminal.identity)
         receipt(location, terminal.identity)?.let { return it }
@@ -289,6 +330,7 @@ class DurableSessionStoreV2(
         writePropertiesExclusive(receiptFile(location, terminal.identity), receiptProperties(value, "abandoned").apply {
             setProperty("requestBinding", binding)
             fullRequestHash?.let { setProperty("fullRequestHash", it) }
+            templateHash?.let { setProperty("templateHash", it) }
         })
         accepted?.getProperty("reservationToken")?.let { budget.reservation(it)?.let(budget::release) }
         return value
@@ -363,6 +405,10 @@ class DurableSessionStoreV2(
     }
     private fun acceptedReceipt(attempt: CaptureAcceptedAttempt) = CaptureReceipt(attempt.identity, CaptureAttemptPhase.RESERVED_ACCEPTED, acceptedHash(attempt), attempt.acceptedReceiptHash.hex(), true)
     private fun acceptedHash(attempt: CaptureAcceptedAttempt) = sha256("${attempt.identity.commitId}|${attempt.identity.attemptId}|${attempt.reservation.totalStoreLiability}|${attempt.canonicalIntentHash.hex()}".toByteArray()).hex()
+
+    private fun templateHash(template: CapturePostOutputTemplateV2) = sha256(
+        "${acceptedHash(template.accepted)}|${template.poseRecordHash.hex()}|${template.cameraModelHash.hex()}|${template.validationRecordHash.hex()}|${template.ledgerRecordHash.hex()}".toByteArray(),
+    ).hex()
     /** Canonical structural hash of every frozen #99 CaptureCommitRequest field. */
     private fun requestHash(request: CaptureCommitRequest): String {
         val bytes = ByteArrayOutputStream()

@@ -183,6 +183,36 @@ class NativeCaptureAdapterV2Test {
     }
 
     @Test
+    fun `accepted template derives JPEG DNG descriptors once and exact replay never reexposes`() {
+        val root = File.createTempFile("native-capture-template-v2", "").also { it.delete(); assertTrue(it.mkdirs()) }
+        val budget = StorageBudgetCoordinatorV2(
+            File(root, "budget"), StorageBudgetPolicyV2(1024 * 1024, 0), JvmDescriptorFilesystemV2(),
+        ) { 1024 * 1024 }
+        val durable = DurableSessionStoreV2(File(root, "store"), budget, filesystemBackend = JvmDescriptorFilesystemV2())
+        try {
+            val described = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG, CaptureComponentKind.DNG))
+            val template = rebuildRequest(described, components = emptyList(), timestamp = 0)
+            val camera = FakeExposure()
+            val adapter = NativeCaptureAdapterV2(DurableNativeCaptureStorePortV2(durable), camera)
+            adapter.admit(template)
+            camera.components(camera.requests.single().first, template, listOf(CaptureComponentKind.DNG, CaptureComponentKind.JPEG))
+            assertEquals(1L, adapter.snapshot().committed)
+            assertEquals(2L, adapter.snapshot().closedComponents)
+
+            val replayCamera = FakeExposure()
+            val replay = NativeCaptureAdapterV2(DurableNativeCaptureStorePortV2(durable), replayCamera)
+            assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, replay.admit(template).phase)
+            assertTrue(replayCamera.requests.isEmpty())
+            val changedTemplate = rebuildRequest(template, poseHash = digest("changed-template"))
+            assertTrue(runCatching { replay.admit(changedTemplate) }.exceptionOrNull() is DurableStoreConflictV2)
+        } finally {
+            durable.close()
+            budget.close()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `real durable abandoned replay binds full request and recovered metadata abandonment rejects replay`() {
         val root = File.createTempFile("native-abandoned-v2", "").also { it.delete(); assertTrue(it.mkdirs()) }
         val budget = StorageBudgetCoordinatorV2(

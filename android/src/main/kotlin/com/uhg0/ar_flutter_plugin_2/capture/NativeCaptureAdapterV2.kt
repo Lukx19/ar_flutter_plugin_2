@@ -15,21 +15,51 @@ internal interface NativeCaptureStorePortV2 {
     fun replayFenceBeforeExposure(request: CaptureCommitRequest): CaptureReceipt?
     fun acceptBeforeExposure(request: CaptureCommitRequest): CaptureReceipt
     fun commitStreamed(request: CaptureCommitRequest, streams: List<CaptureComponentStreamV2>): CaptureReceipt
+    fun commitStreamed(
+        request: CaptureCommitRequest,
+        exposureTimestampNanoseconds: Long,
+        streams: List<CaptureComponentStreamV2>,
+    ): CaptureReceipt = commitStreamed(request, streams)
     fun queryReceipt(identity: CaptureAttemptIdentity): CaptureReceipt?
     fun rebaseSameAttempt(request: CaptureCommitRequest): CaptureReceipt
     fun abandon(request: CaptureCommitRequest, terminal: CaptureTerminal): CaptureReceipt
 }
-
 internal class DurableNativeCaptureStorePortV2(
     private val store: DurableSessionStoreV2,
 ) : NativeCaptureStorePortV2 {
-    override fun replayFenceBeforeExposure(request: CaptureCommitRequest) = store.replayFenceBeforeExposure(request)
+    private fun template(request: CaptureCommitRequest) = CapturePostOutputTemplateV2(
+        request.accepted,
+        request.poseRecordHash,
+        request.cameraModelHash,
+        request.validationRecordHash,
+        request.ledgerRecordHash,
+    )
+    override fun replayFenceBeforeExposure(request: CaptureCommitRequest) =
+        if (request.components.isEmpty()) store.replayTemplateFenceBeforeExposure(template(request))
+        else store.replayFenceBeforeExposure(request)
     override fun acceptBeforeExposure(request: CaptureCommitRequest) = store.acceptCaptureBeforeExposure(request)
     override fun commitStreamed(request: CaptureCommitRequest, streams: List<CaptureComponentStreamV2>) =
+        commitStreamed(request, request.exposureTimestampNanoseconds, streams)
+    override fun commitStreamed(
+        request: CaptureCommitRequest,
+        exposureTimestampNanoseconds: Long,
+        streams: List<CaptureComponentStreamV2>,
+    ) = if (request.components.isEmpty()) {
+        store.commitStreamedFinalized(
+            template(request),
+            exposureTimestampNanoseconds,
+            streams,
+        )
+    } else {
+        // Accepted #101 callers retain their descriptor-qualified regression
+        // seam; production #102 admission cannot populate this collection.
         store.commitStreamed(request, streams)
+    }
     override fun queryReceipt(identity: CaptureAttemptIdentity) = store.queryReceipt(identity)
     override fun rebaseSameAttempt(request: CaptureCommitRequest) = store.rebaseSameAttempt(request)
-    override fun abandon(request: CaptureCommitRequest, terminal: CaptureTerminal) = store.abandonCapture(request, terminal)
+    override fun abandon(request: CaptureCommitRequest, terminal: CaptureTerminal) =
+        if (request.components.isEmpty()) store.abandonTemplate(template(request), terminal)
+        else store.abandonCapture(request, terminal)
 }
 
 /** Full immutable callback qualifier; timestamp or generation alone is never sufficient. */
@@ -48,6 +78,20 @@ internal data class CaptureAttemptQualifierV2(
 internal data class SharedCameraComponentSetV2(
     val qualifier: CaptureAttemptQualifierV2,
     val streams: List<CaptureComponentStreamV2>,
+    val exposureTimestampNanoseconds: Long = 0L,
+)
+
+internal enum class NativeCaptureEventKindV2 { ACCEPTED, FINALIZING, RECOVERING, COMMITTED, ABANDONED, HEALTH }
+
+/** Strict bounded event: scalar identities/counters only, never paths, descriptors, or bytes. */
+internal data class NativeCaptureEventV2(
+    val kind: NativeCaptureEventKindV2,
+    val attemptId: String? = null,
+    val captureId: String? = null,
+    val captureRevision: Long? = null,
+    val manifestId: String? = null,
+    val reason: String? = null,
+    val resources: CaptureResourceSnapshotV2? = null,
 )
 
 internal interface SharedCameraExposureCallbackV2 {
@@ -94,6 +138,7 @@ internal class NativeCaptureBindingV2(
     context: Context,
     private val safety: CaptureSafetySignalV2,
     private val nowMs: () -> Long = System::currentTimeMillis,
+    private val events: (NativeCaptureEventV2) -> Unit = {},
 ) : AutoCloseable {
     private val lock = Any()
     private val root = createNativeCaptureRootV2(context)
@@ -110,7 +155,9 @@ internal class NativeCaptureBindingV2(
         },
         cancel = { qualifier -> synchronized(lock) { sharedCamera?.cancelAttemptQualifiedExposureV2(qualifier) } },
     )
-    private val adapter = NativeCaptureAdapterV2(DurableNativeCaptureStorePortV2(store), bridge, safety, nowMs)
+    private val adapter = NativeCaptureAdapterV2(
+        DurableNativeCaptureStorePortV2(store), bridge, safety, nowMs, events,
+    )
 
     fun attachSharedCamera(manager: SharedCameraManager) = synchronized(lock) {
         check(!closed) { "NativeCaptureBindingV2 is closed" }
@@ -122,9 +169,11 @@ internal class NativeCaptureBindingV2(
     fun detachSharedCamera(manager: SharedCameraManager) = synchronized(lock) { if (sharedCamera === manager) sharedCamera = null }
     fun admit(request: CaptureCommitRequest): CaptureReceipt = adapter.admit(request)
     fun onLifecycle(event: CaptureLifecycleEvent, cut: CaptureLifecycleCut) = adapter.onLifecycle(event, cut)
+    fun onLifecycle(event: CaptureLifecycleEvent) = adapter.onLifecycle(event)
     fun onPause() = adapter.onLifecycle(CaptureLifecycleEvent.BACKGROUNDED)
     fun onViewReplacement() = adapter.onLifecycle(CaptureLifecycleEvent.VIEW_REPLACED)
     fun onArSessionReplacement() = adapter.onLifecycle(CaptureLifecycleEvent.AR_SESSION_REPLACED)
+    fun advanceRecovery() = adapter.advanceDeadlines()
     fun snapshot() = adapter.snapshot()
 
     /** Native instrumentation seam; it is never registered with a Flutter channel. */
@@ -229,6 +278,7 @@ internal class NativeCaptureAdapterV2(
     private val exposure: SharedCameraExposurePortV2,
     private val safety: CaptureSafetySignalV2 = CaptureSafetySignalV2(),
     private val nowMs: () -> Long = System::currentTimeMillis,
+    private val events: (NativeCaptureEventV2) -> Unit = {},
 ) : AutoCloseable {
     private data class Work(
         val request: CaptureCommitRequest,
@@ -287,6 +337,7 @@ internal class NativeCaptureAdapterV2(
         }
         val qualifier = CaptureAttemptQualifierV2(accepted.identity, accepted.identity.lifecycleCut, ++nextExposureGeneration)
         work[accepted.identity] = Work(request, receipt, nowMs(), qualifier)
+        events(NativeCaptureEventV2(NativeCaptureEventKindV2.ACCEPTED, accepted.identity.attemptId))
         if (assignment.position == CaptureFinalizerPosition.RUNNING) startLocked(work.getValue(accepted.identity))
         receipt
     }
@@ -395,7 +446,12 @@ internal class NativeCaptureAdapterV2(
                 CaptureComponentStreamV2(stream.kind, CloseOnceInputStreamV2(stream.input))
             }
             try {
-                val receipt = store.commitStreamed(value.request, owned)
+                events(NativeCaptureEventV2(NativeCaptureEventKindV2.FINALIZING, value.request.accepted.identity.attemptId))
+                val receipt = store.commitStreamed(
+                    value.request,
+                    components.exposureTimestampNanoseconds,
+                    owned,
+                )
                 finishLocked(value, receipt)
             } catch (_: Throwable) {
                 // Store errors after a streaming handoff are an exact identity query, never another request.
@@ -414,6 +470,13 @@ internal class NativeCaptureAdapterV2(
     }
 
     private fun queryOrAbandonLocked(value: Work, reason: String) {
+        events(
+            NativeCaptureEventV2(
+                NativeCaptureEventKindV2.RECOVERING,
+                value.request.accepted.identity.attemptId,
+                reason = reason,
+            ),
+        )
         counters.unknownQuery()
         val receipt = store.queryReceipt(value.request.accepted.identity)
         if (receipt?.terminal != null) { finishLocked(value, receipt); return }
@@ -436,6 +499,22 @@ internal class NativeCaptureAdapterV2(
         work.remove(identity)
         scheduler.release(identity)
         if (receipt.terminal?.kind == CaptureTerminalKind.COMMITTED_PICTURE) counters.committed() else counters.abandoned()
+        val terminal = receipt.terminal
+        events(
+            NativeCaptureEventV2(
+                if (terminal?.kind == CaptureTerminalKind.COMMITTED_PICTURE) {
+                    NativeCaptureEventKindV2.COMMITTED
+                } else {
+                    NativeCaptureEventKindV2.ABANDONED
+                },
+                attemptId = identity.attemptId,
+                captureId = terminal?.captureId,
+                captureRevision = terminal?.captureRevision,
+                manifestId = terminal?.manifestId,
+                reason = terminal?.reason,
+            ),
+        )
+        events(NativeCaptureEventV2(NativeCaptureEventKindV2.HEALTH, resources = snapshot()))
         if (!lifecycleDrain) scheduler.running?.let { next -> work[next.identity]?.let(::startLocked) }
     }
 

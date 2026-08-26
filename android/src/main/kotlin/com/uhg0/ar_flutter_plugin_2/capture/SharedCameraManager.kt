@@ -572,10 +572,11 @@ internal class SharedCameraManager(
         required: Set<CaptureComponentKind>,
         callback: SharedCameraExposureCallbackV2,
     ): Boolean {
-        // The first direct production route is deliberately limited to the
-        // hardware-JPEG source.  A JPEG+DNG profile is rejected until the raw
-        // reader can provide both attempt-qualified streams atomically.
-        if (required != setOf(CaptureComponentKind.JPEG) || !isInitialized) return false
+        val supported = required == setOf(CaptureComponentKind.JPEG) ||
+            required == setOf(CaptureComponentKind.JPEG, CaptureComponentKind.DNG)
+        if (!supported || !isInitialized) return false
+        if (pendingManualCapture != null) return false
+        if ((CaptureComponentKind.DNG in required) != config.rawJpeg) return false
         val pending = PendingDirectCaptureV2(qualifier, required, callback)
         if (!pendingDirectCaptureOwner.acquire(pending)) return false
         val activeSession = captureSession
@@ -1179,8 +1180,16 @@ internal class SharedCameraManager(
                 "Encoded ${jpegBytes.size} bytes in ${System.currentTimeMillis() - encodeStartedAtMs}ms",
             )
             if (direct != null) {
-                if (direct.required != setOf(CaptureComponentKind.JPEG)) {
-                    direct.callback.onFailure(direct.qualifier, "unsupported-component-set")
+                if (CaptureComponentKind.DNG in direct.required) {
+                    handleRawJpegImage(
+                        PendingStillImagePayload(
+                            sensorTimestampNs = image.timestamp,
+                            width = image.width,
+                            height = image.height,
+                            bytes = jpegBytes,
+                            receivedAtMs = System.currentTimeMillis(),
+                        ),
+                    )
                 } else if (pendingDirectCaptureOwner.release(direct)) {
                     direct.callback.onComponents(
                         SharedCameraComponentSetV2(
@@ -1191,6 +1200,7 @@ internal class SharedCameraManager(
                                     ByteArrayInputStream(jpegBytes),
                                 ),
                             ),
+                            exposureTimestampNanoseconds = image.timestamp,
                         ),
                     )
                 }
@@ -1233,7 +1243,7 @@ internal class SharedCameraManager(
     private fun handleRawImageAvailable(reader: ImageReader) {
         val image = reader.acquireNextImage() ?: return
         resourceCounters.onImageAcquired()
-        if (pendingManualCapture == null) {
+        if (pendingManualCapture == null && pendingDirectCapture == null) {
             closeTrackedImage(image)
             return
         }
@@ -1261,8 +1271,9 @@ internal class SharedCameraManager(
         val rawImage = capture.raw
         val totalResult = capture.result
         val pending = pendingManualCapture
+        val direct = pendingDirectCapture
         val characteristics = activeCameraCharacteristics
-        if (pending == null || characteristics == null) {
+        if ((pending == null && direct == null) || characteristics == null) {
             closeTrackedImage(rawImage)
             return
         }
@@ -1271,12 +1282,37 @@ internal class SharedCameraManager(
             if (closed.compareAndSet(false, true)) closeTrackedImage(rawImage)
         }
         try {
+            if (direct != null) {
+                val sensorTimestampNs =
+                    totalResult.get(CaptureResult.SENSOR_TIMESTAMP) ?: jpeg.sensorTimestampNs
+                val dngBytes = ByteArrayOutputStream().use { output ->
+                    DngCreator(characteristics, totalResult).use { creator ->
+                        creator.writeImage(output, rawImage)
+                    }
+                    output.toByteArray()
+                }
+                closeRaw()
+                if (pendingDirectCaptureOwner.release(direct)) {
+                    direct.callback.onComponents(
+                        SharedCameraComponentSetV2(
+                            direct.qualifier,
+                            listOf(
+                                CaptureComponentStreamV2(CaptureComponentKind.JPEG, ByteArrayInputStream(jpeg.bytes)),
+                                CaptureComponentStreamV2(CaptureComponentKind.DNG, ByteArrayInputStream(dngBytes)),
+                            ),
+                            exposureTimestampNanoseconds = sensorTimestampNs,
+                        ),
+                    )
+                }
+                return
+            }
+            val manual = checkNotNull(pending)
             val imageId = generateImageId()
             val sensorTimestampNs =
                 totalResult.get(CaptureResult.SENSOR_TIMESTAMP) ?: jpeg.sensorTimestampNs
-            pending.result =
+            manual.result =
                 SharedCameraCaptureResult(
-                    reservationToken = pending.reservationToken,
+                    reservationToken = manual.reservationToken,
                     imageId = imageId,
                     imageBytes = jpeg.bytes,
                     format = ImageFormat.JPEG,
@@ -1311,12 +1347,17 @@ internal class SharedCameraManager(
                     rawHeight = rawImage.height,
                     primaryAssetName = "jpeg",
                 )
-            pending.latch.countDown()
+            manual.latch.countDown()
         } catch (error: Throwable) {
             closeRaw()
-            imageCacheManager?.releaseReservation(pending.reservationToken)
-            pending.error = error
-            pending.latch.countDown()
+            if (direct != null && pendingDirectCaptureOwner.release(direct)) {
+                direct.callback.onFailure(direct.qualifier, "raw-component")
+            }
+            pending?.let { manual ->
+                imageCacheManager?.releaseReservation(manual.reservationToken)
+                manual.error = error
+                manual.latch.countDown()
+            }
         }
     }
 
@@ -1682,6 +1723,9 @@ internal class SharedCameraManager(
         if (!isInitialized) {
             throw IllegalStateException("SharedCameraManager is not initialized")
         }
+        if (pendingDirectCapture != null) {
+            throw CaptureSessionException("CAPTURE_IN_PROGRESS", "A native V2 capture is in progress")
+        }
         val exposureBracket = if (exposureBracketEnabled) exposureBracketSpecs() else emptyList()
         val reservationToken =
             imageCacheManager?.reserveCaptureSlot()
@@ -1750,6 +1794,9 @@ internal class SharedCameraManager(
             "Two-phase capture is not enabled for this format"
         }
         if (!isInitialized) throw IllegalStateException("SharedCameraManager is not initialized")
+        if (pendingDirectCapture != null) {
+            throw CaptureSessionException("CAPTURE_IN_PROGRESS", "A native V2 capture is in progress")
+        }
         val reservationToken =
             imageCacheManager?.reserveCaptureSlot()
                 ?: throw IllegalStateException("ImageCacheManager is not initialized")

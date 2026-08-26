@@ -15,8 +15,10 @@ import '../models/ar_capture_result.dart';
 import '../models/ar_frame_pose.dart';
 import '../models/camera_resolution.dart';
 import '../models/capture_capacity.dart';
+import '../models/capture_intent_contract.dart';
 import '../models/capture_quality_policy.dart';
 import '../models/image_size.dart';
+import '../models/native_capture_v2.dart';
 import 'ar_session_manager.dart';
 
 /// Available exposure modes
@@ -301,6 +303,8 @@ class ARCaptureManager {
       StreamController.broadcast();
   final StreamController<ProfileApplicationStatus> _profileStatusController =
       StreamController.broadcast();
+  final StreamController<ARNativeCaptureEventV2> _nativeCaptureV2Controller =
+      StreamController.broadcast();
   static const String _profilesKey = 'ar_capture_profiles';
   static const String _profileNotFoundCode = 'PROFILE_NOT_FOUND';
   final ARCaptureConfig _config;
@@ -484,6 +488,72 @@ class ARCaptureManager {
 
   Stream<CaptureCapacity> get captureCapacityStream =>
       _captureCapacityController.stream;
+
+  /// Bounded scalar V2 capture ownership/terminal events. No image data or
+  /// native file paths are representable on this stream.
+  Stream<ARNativeCaptureEventV2> get nativeCaptureV2Events =>
+      _nativeCaptureV2Controller.stream;
+
+  Future<ARNativeCaptureAdmissionResultV2> admitNativeCaptureV2(
+    ARNativeCaptureAdmissionV2 admission,
+  ) async {
+    _throwIfDisposed();
+    await _ensureInitialized();
+    final value = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+      'admitNativeCaptureV2',
+      admission.toMap(),
+    );
+    if (value == null) {
+      throw const ARCaptureException(
+        'Native V2 admission result was missing',
+        code: 'NATIVE_CAPTURE_V2_RESULT_MISSING',
+      );
+    }
+    return ARNativeCaptureAdmissionResultV2.fromMap(_deepCastMap(value));
+  }
+
+  Future<ARNativeCaptureHealthV2> getNativeCaptureHealthV2() async {
+    _throwIfDisposed();
+    final value = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+      'getNativeCaptureHealthV2',
+    );
+    if (value == null) {
+      throw const ARCaptureException(
+        'Native V2 health result was missing',
+        code: 'NATIVE_CAPTURE_V2_HEALTH_MISSING',
+      );
+    }
+    final event = ARNativeCaptureEventV2.fromMap(_deepCastMap(value));
+    return event.health ??
+        (throw const FormatException('Native V2 health payload was missing.'));
+  }
+
+  Future<void> notifyNativeCaptureLifecycleV2(
+    CaptureLifecycleEvent event,
+  ) async {
+    if (event != CaptureLifecycleEvent.automaticDisabled &&
+        event != CaptureLifecycleEvent.routeLeft &&
+        event != CaptureLifecycleEvent.processRestarted) {
+      throw ArgumentError.value(
+          event, 'event', 'Lifecycle event is native-owned.');
+    }
+    await _channel.invokeMethod<void>(
+      'notifyNativeCaptureLifecycleV2',
+      <String, Object?>{'event': event.name},
+    );
+  }
+
+  @visibleForTesting
+  Future<void> debugConfigureNativeCaptureV2({String? fault}) async {
+    await _channel.invokeMethod<void>(
+      'debugNativeCaptureV2Synthetic',
+      <String, Object?>{'fault': fault},
+    );
+  }
+
+  @visibleForTesting
+  Future<void> debugAdvanceNativeCaptureRecoveryV2() =>
+      _channel.invokeMethod<void>('debugNativeCaptureV2AdvanceRecovery');
 
   /// Get camera intrinsics data (unified for both AR tracking and capture)
   Future<ARCameraIntrinsics?> getCameraIntrinsics() async {
@@ -1912,6 +1982,11 @@ class ARCaptureManager {
               CaptureCapacity.fromMap(_deepCastMap(call.arguments));
           _captureCapacityController.add(capacity);
           break;
+        case 'onNativeCaptureV2Event':
+          _nativeCaptureV2Controller.add(
+            ARNativeCaptureEventV2.fromMap(_deepCastMap(call.arguments)),
+          );
+          break;
         case 'onExposureStateChanged':
           final exposureState = CameraExposureState.fromMap(
             _deepCastMap(call.arguments),
@@ -2003,6 +2078,7 @@ class ARCaptureManager {
     _whiteBalanceStateController.close();
     _flashStateController.close();
     _profileStatusController.close();
+    _nativeCaptureV2Controller.close();
   }
 }
 

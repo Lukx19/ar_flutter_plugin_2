@@ -635,6 +635,36 @@ internal class ArView(
                     }
                 }
                 "getCaptureCapacity" -> result.success(captureSession.getCaptureCapacity())
+                "admitNativeCaptureV2" -> scope.launch(Dispatchers.IO) {
+                    try {
+                        result.success(captureSession.admitNativeCaptureV2(call.arguments))
+                    } catch (error: IllegalArgumentException) {
+                        result.error("NATIVE_CAPTURE_V2_INVALID", error.message, null)
+                    } catch (error: Exception) {
+                        result.error("NATIVE_CAPTURE_V2_FAILED", error.message, null)
+                    }
+                }
+                "getNativeCaptureHealthV2" -> result.success(captureSession.nativeCaptureHealthV2())
+                "notifyNativeCaptureLifecycleV2" -> {
+                    captureSession.notifyNativeCaptureLifecycleV2(
+                        call.argument<String>("event") ?: throw IllegalArgumentException("event is required"),
+                    )
+                    result.success(true)
+                }
+                "debugNativeCaptureV2Synthetic" -> {
+                    val debuggable = root.context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+                    if (!debuggable) {
+                        result.error("DEBUG_ONLY", "Synthetic V2 capture is unavailable in release builds", null)
+                    } else {
+                        captureSession.installDebugNativeCaptureSyntheticV2(call.argument<String>("fault"))
+                        result.success(true)
+                    }
+                }
+                "debugNativeCaptureV2AdvanceRecovery" -> {
+                    val debuggable = root.context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+                    if (!debuggable) result.error("DEBUG_ONLY", "Synthetic V2 recovery is unavailable in release builds", null)
+                    else { captureSession.advanceNativeCaptureRecoveryV2(); result.success(true) }
+                }
                 "getPerformanceSnapshot" -> result.success(captureSession.getPerformanceSnapshot())
                 "getCameraIntrinsics" -> result.success(captureSession.getCameraIntrinsics())
                 "getImageData" -> result.success(captureSession.getImageData(
