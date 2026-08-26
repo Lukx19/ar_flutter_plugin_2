@@ -7,6 +7,15 @@ import org.junit.Test
 
 class CaptureIntentContractTest {
     @Test
+    fun `native reservation bounds include durable metadata coexistence and rollback with checked arithmetic`() {
+        val physical = NativeCaptureReservationBoundsV2.physicalBytes(1024, 2)
+        assertTrue(physical > 1024 + NativeCaptureReservationBoundsV2.COEXISTENCE_BYTES)
+        assertEquals(1024 + NativeCaptureReservationBoundsV2.ROLLBACK_METADATA_BYTES,
+            NativeCaptureReservationBoundsV2.rollbackBytes(1024))
+        assertFails { NativeCaptureReservationBoundsV2.physicalBytes(Long.MAX_VALUE, 2) }
+        assertFails { NativeCaptureReservationBoundsV2.rollbackBytes(Long.MAX_VALUE) }
+    }
+    @Test
     fun `accepted record is durable before exactly one exposure and one committed terminal`() {
         val accepted = accepted()
         val machine = CaptureAttemptReferenceMachine(accepted)

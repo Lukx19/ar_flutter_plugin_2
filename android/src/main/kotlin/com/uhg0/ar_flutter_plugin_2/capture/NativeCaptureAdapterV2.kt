@@ -83,7 +83,7 @@ internal data class SharedCameraComponentSetV2(
     val exposureTimestampNanoseconds: Long = 0L,
 )
 
-internal enum class NativeCaptureEventKindV2 { ACCEPTED, FINALIZING, RECOVERING, RECOVERY_FAILED, COMMITTED, ABANDONED, HEALTH }
+internal enum class NativeCaptureEventKindV2 { ACCEPTED, FINALIZING, RECOVERING, RECOVERY_FAILED, READY, COMMITTED, ABANDONED, HEALTH }
 
 /** Strict bounded event: scalar identities/counters only, never paths, descriptors, or bytes. */
 internal data class NativeCaptureEventV2(
@@ -94,6 +94,7 @@ internal data class NativeCaptureEventV2(
     val manifestId: String? = null,
     val reason: String? = null,
     val resources: CaptureResourceSnapshotV2? = null,
+    val recoveryContext: NativeCaptureRecoveryContextV2? = null,
 )
 
 internal interface SharedCameraExposureCallbackV2 {
@@ -147,6 +148,7 @@ internal class NativeCaptureRecoveryDispatcherV2(
 
     private val lock = Any()
     private var state = State.INITIALIZING
+    private val replay = LinkedHashMap<String, NativeCaptureEventV2>()
 
     init {
         executor.execute {
@@ -155,12 +157,13 @@ internal class NativeCaptureRecoveryDispatcherV2(
                 if (state == State.CLOSED) return@execute
                 recovered.fold(
                     onSuccess = { projections ->
-                        projections.forEach { events(it.toNativeEvent()) }
                         state = State.READY
+                        projections.map { it.toNativeEvent() }.forEach(::emitAndRetainLocked)
+                        if (projections.isEmpty()) events(readyEvent())
                     },
                     onFailure = {
                         state = State.FAILED
-                        events(
+                        emitAndRetainLocked(
                             NativeCaptureEventV2(
                                 NativeCaptureEventKindV2.RECOVERY_FAILED,
                                 reason = RECOVERY_FAILED_REASON,
@@ -195,9 +198,37 @@ internal class NativeCaptureRecoveryDispatcherV2(
     fun emitLive(event: NativeCaptureEventV2) = synchronized(lock) {
         if (state != State.CLOSED) {
             requireAdmissionReady()
-            events(event)
+            emitAndRetainLocked(event)
         }
     }
+
+    fun replaySnapshot(): List<NativeCaptureEventV2> = synchronized(lock) {
+        when (state) {
+            State.CLOSED, State.INITIALIZING -> emptyList()
+            State.FAILED -> replay.values.toList()
+            State.READY -> replay.values.toList().ifEmpty { listOf(readyEvent()) }
+        }
+    }
+
+    fun acknowledgeTerminal(attemptId: String) = synchronized(lock) {
+        require(attemptId.isNotEmpty())
+        replay.remove(attemptId)
+        if (state == State.READY && replay.isEmpty()) events(readyEvent())
+    }
+
+    private fun emitAndRetainLocked(event: NativeCaptureEventV2) {
+        when {
+            event.kind == NativeCaptureEventKindV2.RECOVERY_FAILED -> replay["recovery-failed"] = event
+            event.kind == NativeCaptureEventKindV2.COMMITTED || event.kind == NativeCaptureEventKindV2.ABANDONED || event.kind == NativeCaptureEventKindV2.RECOVERING -> {
+                val key = requireNotNull(event.attemptId)
+                replay[key] = event
+                while (replay.size > 2) replay.remove(replay.keys.first())
+            }
+        }
+        events(event)
+    }
+
+    private fun readyEvent() = NativeCaptureEventV2(NativeCaptureEventKindV2.READY, reason = "native-owner-ready")
 
     private fun isActive(): Boolean = synchronized(lock) {
         state == State.INITIALIZING && !Thread.currentThread().isInterrupted
@@ -223,6 +254,7 @@ internal class NativeCaptureRecoveryDispatcherV2(
         captureRevision = captureRevision,
         manifestId = manifestId,
         reason = reason,
+        recoveryContext = recoveryContext,
     )
 
     private companion object {
@@ -293,6 +325,8 @@ internal class NativeCaptureBindingV2(
     fun onViewReplacement() = adapter.onLifecycle(CaptureLifecycleEvent.VIEW_REPLACED)
     fun onArSessionReplacement() = adapter.onLifecycle(CaptureLifecycleEvent.AR_SESSION_REPLACED)
     fun forceRecoveryForDebug() = adapter.forceRecoveryForDebug()
+    fun replayRecovery(): List<NativeCaptureEventV2> = recovery.replaySnapshot()
+    fun acknowledgeTerminal(attemptId: String) = recovery.acknowledgeTerminal(attemptId)
     fun snapshot() = adapter.snapshot()
 
     /** Native instrumentation seam; it is never registered with a Flutter channel. */
@@ -612,6 +646,7 @@ internal class NativeCaptureAdapterV2(
                 NativeCaptureEventKindV2.RECOVERING,
                 value.request.accepted.identity.attemptId,
                 reason = reason,
+                recoveryContext = value.request.recoveryContext,
             ),
         )
         counters.unknownQuery()
@@ -628,6 +663,7 @@ internal class NativeCaptureAdapterV2(
                 NativeCaptureEventKindV2.RECOVERING,
                 value.request.accepted.identity.attemptId,
                 reason = reason,
+                recoveryContext = value.request.recoveryContext,
             ),
         )
         counters.unknownQuery()
@@ -653,11 +689,15 @@ internal class NativeCaptureAdapterV2(
         val accepted = request.accepted
         val terminal = CaptureTerminal(CaptureTerminalKind.ABANDONED_ATTEMPT, accepted.identity, reason, reason)
         val receipt = store.abandon(request, terminal)
-        finishLocked(work[accepted.identity], receipt)
+        finishLocked(work[accepted.identity], receipt, request.recoveryContext)
         return receipt
     }
 
-    private fun finishLocked(value: Work?, receipt: CaptureReceipt) {
+    private fun finishLocked(
+        value: Work?,
+        receipt: CaptureReceipt,
+        recoveryContext: NativeCaptureRecoveryContextV2? = value?.request?.recoveryContext,
+    ) {
         val identity = receipt.identity
         value?.let { exposure.cancelExposure(it.qualifier); safety.release(it.qualifier) }
         work.remove(identity)
@@ -676,6 +716,7 @@ internal class NativeCaptureAdapterV2(
                 captureRevision = terminal?.captureRevision,
                 manifestId = terminal?.manifestId,
                 reason = terminal?.reason,
+                recoveryContext = recoveryContext,
             ),
         )
         events(NativeCaptureEventV2(NativeCaptureEventKindV2.HEALTH, resources = snapshot()))
@@ -692,7 +733,8 @@ internal class NativeCaptureAdapterV2(
         val reservation = accepted.reservation
         require(reservation.physicallyBacked) { "reservation-not-physical" }
         require(reservation.memoryBytes >= profile.maximumWorkingBytes) { "reservation-memory-underfunded" }
-        require(reservation.physicalStoreBytes >= profile.maximumComponentBytes) { "reservation-store-underfunded" }
+        require(reservation.physicalStoreBytes >= NativeCaptureReservationBoundsV2.physicalBytes(profile.maximumComponentBytes, profile.requiredComponents.size)) { "reservation-store-underfunded" }
+        require(reservation.rollbackBytes >= NativeCaptureReservationBoundsV2.rollbackBytes(profile.maximumComponentBytes)) { "reservation-rollback-underfunded" }
         require(reservation.componentEntries == profile.requiredComponents.size.toLong()) { "reservation-component-ledger" }
         require(reservation.terminalEntries == 1L) { "reservation-terminal-ledger" }
     }

@@ -317,6 +317,7 @@ class ARCaptureManager {
       (Platform.isAndroid || Platform.environment.containsKey('FLUTTER_TEST'));
   bool get isEnabled =>
       !_isDisposed && isSupported && _config.enableHighResCapture;
+  bool get isDisposed => _isDisposed;
   ARCaptureConfig get config => _config;
   CaptureInitializationResult? get initializationResult =>
       _initializationResult;
@@ -372,6 +373,11 @@ class ARCaptureManager {
       _initializationResult = CaptureInitializationResult.fromPlatformValue(
         result,
       );
+      // The native owner may have completed bounded startup recovery before
+      // this Dart handler existed. Pull its scalar replay after attachment.
+      for (final event in await replayNativeCaptureRecoveryV2()) {
+        _nativeCaptureV2Controller.add(event);
+      }
 
       debugPrint(
         'ARCaptureManager initialized with config: ${_config.toString()}',
@@ -534,6 +540,31 @@ class ARCaptureManager {
     final event = ARNativeCaptureEventV2.fromMap(_deepCastMap(value));
     return event.health ??
         (throw const FormatException('Native V2 health payload was missing.'));
+  }
+
+  Future<List<ARNativeCaptureEventV2>> replayNativeCaptureRecoveryV2() async {
+    _throwIfDisposed();
+    final value = await _channel
+        .invokeMethod<List<dynamic>>('replayNativeCaptureRecoveryV2');
+    // Older/non-Android backends have no V2 owner and return null. Android V2
+    // must return a bounded list once the channel is present.
+    if (value == null) return const [];
+    if (value.length > 2) {
+      throw const ARCaptureException('Native V2 recovery replay was malformed',
+          code: 'NATIVE_CAPTURE_V2_REPLAY_INVALID');
+    }
+    return value.map((item) {
+      if (item is! Map)
+        throw const FormatException('Recovery replay entries must be maps.');
+      return ARNativeCaptureEventV2.fromMap(_deepCastMap(item));
+    }).toList(growable: false);
+  }
+
+  Future<void> acknowledgeNativeCaptureTerminalV2(String attemptId) async {
+    _throwIfDisposed();
+    if (attemptId.isEmpty) throw ArgumentError.value(attemptId, 'attemptId');
+    await _channel.invokeMethod<bool>(
+        'acknowledgeNativeCaptureTerminalV2', {'attemptId': attemptId});
   }
 
   Future<void> notifyNativeCaptureLifecycleV2(

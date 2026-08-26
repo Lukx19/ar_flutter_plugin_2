@@ -126,6 +126,37 @@ data class CaptureReservationLiability(
     val totalStoreLiability: Long = Math.addExact(physicalStoreBytes, rollbackBytes)
 }
 
+/** Conservative contract bounds for all pre-shutter durable liabilities. */
+object NativeCaptureReservationBoundsV2 {
+    const val ACCEPTED_RECORD_BYTES = 64L * 1024L
+    const val COMPONENT_DESCRIPTOR_BYTES = 16L * 1024L
+    const val SELECTED_ROOT_BYTES = 64L * 1024L
+    const val RECEIPT_BYTES = 32L * 1024L
+    const val ALTERNATING_POINTER_BYTES = 32L * 1024L
+    const val DIRECTORY_SYNC_BYTES = 32L * 1024L
+    const val TERMINAL_METADATA_BYTES = 32L * 1024L
+    const val COEXISTENCE_BYTES = 1024L * 1024L
+    const val ROLLBACK_METADATA_BYTES = 256L * 1024L
+
+    fun physicalBytes(componentBytes: Long, componentCount: Int): Long {
+        require(componentBytes >= 0 && componentCount > 0)
+        return listOf(
+            componentBytes,
+            ACCEPTED_RECORD_BYTES,
+            Math.multiplyExact(COMPONENT_DESCRIPTOR_BYTES, componentCount.toLong()),
+            SELECTED_ROOT_BYTES,
+            RECEIPT_BYTES,
+            ALTERNATING_POINTER_BYTES,
+            DIRECTORY_SYNC_BYTES,
+            TERMINAL_METADATA_BYTES,
+            COEXISTENCE_BYTES,
+        ).fold(0L, Math::addExact)
+    }
+
+    fun rollbackBytes(componentBytes: Long): Long =
+        Math.addExact(componentBytes, ROLLBACK_METADATA_BYTES)
+}
+
 data class CaptureAttemptIdentity(
     val attemptId: String,
     val commitId: String,
@@ -183,6 +214,7 @@ class CaptureCommitRequest(
     cameraModelHash: List<Int>,
     validationRecordHash: List<Int>,
     ledgerRecordHash: List<Int>,
+    val recoveryContext: NativeCaptureRecoveryContextV2? = null,
 ) {
     val components: List<CaptureComponentDescriptor> = immutableList(components)
     val poseRecordHash = immutableDigest(poseRecordHash, "poseRecordHash")
@@ -205,6 +237,34 @@ class CaptureCommitRequest(
             other.cameraModelHash, other.validationRecordHash, other.ledgerRecordHash)
     override fun hashCode() = listOf(accepted, components, exposureTimestampNanoseconds, poseRecordHash,
         cameraModelHash, validationRecordHash, ledgerRecordHash).hashCode()
+}
+
+/** Scalar product context retained with acceptance; it can never contain image bytes or paths. */
+data class NativeCaptureRecoveryContextV2(
+    val sessionId: String,
+    val groupId: String,
+    val groupIndex: Long,
+    val groupGeneration: Long,
+    val trigger: String,
+    val requestedAtMs: Long,
+    val coverageRevision: Long,
+    val timestampMs: Long,
+    val position: List<Double>,
+    val rotation: List<Double>,
+    val viewMatrix: List<Double>,
+    val projectionMatrix: List<Double>,
+    val groupFromWorld: List<Double>,
+    val worldFromGroup: List<Double>,
+) {
+    init {
+        require(sessionId.isNotEmpty() && groupId.isNotEmpty() && trigger.isNotEmpty())
+        require(groupIndex >= 0 && groupGeneration >= 0 && coverageRevision >= 0)
+        require(requestedAtMs >= 0 && timestampMs >= 0)
+        require(position.size == 3 && rotation.size == 4)
+        require(viewMatrix.size == 16 && projectionMatrix.size == 16)
+        require(groupFromWorld.size == 16 && worldFromGroup.size == 16)
+        require(listOf(position, rotation, viewMatrix, projectionMatrix, groupFromWorld, worldFromGroup).flatten().all(Double::isFinite))
+    }
 }
 
 data class CaptureTerminal(

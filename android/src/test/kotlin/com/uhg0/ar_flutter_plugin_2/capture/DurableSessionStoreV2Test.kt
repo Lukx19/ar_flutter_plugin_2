@@ -324,15 +324,15 @@ class DurableSessionStoreV2Test {
     @Test fun `startup recovery projects only the two newest exact durable outcomes`() {
         val root = directory(); val budget = budget(root); val store = store(root, budget)
         val oldest = request("projection-old", "projection-old-attempt", "old".toByteArray())
-        store.acceptBeforeExposure(oldest.accepted)
+        store.acceptCaptureBeforeExposure(oldest)
         store.commitStreamed(oldest, streams("old".toByteArray()))
         Thread.sleep(2)
         val committed = request("projection-commit", "projection-commit-attempt", "new".toByteArray())
-        store.acceptBeforeExposure(committed.accepted)
+        store.acceptCaptureBeforeExposure(committed)
         val committedReceipt = store.commitStreamed(committed, streams("new".toByteArray()))
         Thread.sleep(2)
         val acceptedOnly = request("projection-accepted", "projection-accepted-attempt", "lost".toByteArray())
-        store.acceptBeforeExposure(acceptedOnly.accepted)
+        store.acceptCaptureBeforeExposure(acceptedOnly)
 
         val projections = store.recoverAndProject(limit = 2)
 
@@ -342,6 +342,8 @@ class DurableSessionStoreV2Test {
         assertEquals(CaptureTerminalKind.COMMITTED_PICTURE, projectedCommit.kind)
         assertEquals(committedReceipt.terminal!!.captureId, projectedCommit.captureId)
         assertEquals(committedReceipt.terminal!!.manifestId, projectedCommit.manifestId)
+        assertEquals("session-1", projectedCommit.recoveryContext!!.sessionId)
+        assertEquals(16, projectedCommit.recoveryContext!!.viewMatrix.size)
         val projectedAbsent = projections.single { it.attemptId == acceptedOnly.accepted.identity.attemptId }
         assertEquals(CaptureTerminalKind.ABANDONED_ATTEMPT, projectedAbsent.kind)
         assertEquals("recovered-proven-absent", projectedAbsent.reason)
@@ -399,8 +401,19 @@ class DurableSessionStoreV2Test {
         val identity = CaptureAttemptIdentity(attempt, commit, 1, CaptureLifecycleCut(session, 1, "group-1", 1, "ar-1", "view-1", 1, "binding-1", 1, 1))
         val profile = CaptureComponentProfile("jpeg", setOf(CaptureComponentKind.JPEG), 64, 64)
         val accepted = CaptureAcceptedAttempt(identity, CaptureLane.MANUAL, profile, CaptureReservationLiability(0, 64, 1, 1, 0, true), digest("intent"), digest("accepted"))
-        return CaptureCommitRequest(accepted, listOf(CaptureComponentDescriptor(CaptureComponentKind.JPEG, jpeg.size.toLong(), sha(jpeg), "object")), 1, digest("pose"), digest("camera"), digest("validation"), digest("ledger"))
+        return CaptureCommitRequest(
+            accepted,
+            listOf(CaptureComponentDescriptor(CaptureComponentKind.JPEG, jpeg.size.toLong(), sha(jpeg), "object")),
+            1,
+            digest("pose"), digest("camera"), digest("validation"), digest("ledger"),
+            NativeCaptureRecoveryContextV2(
+                session, "group-1", 0, 1, "manual", 1, 1, 1,
+                listOf(0.0, 0.0, 0.0), listOf(0.0, 0.0, 0.0, 1.0),
+                identityMatrix(), identityMatrix(), identityMatrix(), identityMatrix(),
+            ),
+        )
     }
+    private fun identityMatrix() = List(16) { if (it % 5 == 0) 1.0 else 0.0 }
     private fun streams(bytes: ByteArray) = listOf(CaptureComponentStreamV2(CaptureComponentKind.JPEG, ByteArrayInputStream(bytes)))
     private fun abandonment(request: CaptureCommitRequest, reason: String) = CaptureTerminal(
         CaptureTerminalKind.ABANDONED_ATTEMPT, request.accepted.identity, "abandoned-${request.accepted.identity.commitId}", reason,

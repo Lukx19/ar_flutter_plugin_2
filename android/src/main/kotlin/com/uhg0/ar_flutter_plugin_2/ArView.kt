@@ -648,6 +648,13 @@ internal class ArView(
                     }
                 }
                 "getNativeCaptureHealthV2" -> result.success(captureSession.nativeCaptureHealthV2())
+                "replayNativeCaptureRecoveryV2" -> result.success(captureSession.replayNativeCaptureRecoveryV2())
+                "acknowledgeNativeCaptureTerminalV2" -> {
+                    captureSession.acknowledgeNativeCaptureTerminalV2(
+                        call.argument<String>("attemptId") ?: throw IllegalArgumentException("attemptId is required"),
+                    )
+                    result.success(true)
+                }
                 "notifyNativeCaptureLifecycleV2" -> {
                     captureSession.notifyNativeCaptureLifecycleV2(
                         call.argument<String>("event") ?: throw IllegalArgumentException("event is required"),

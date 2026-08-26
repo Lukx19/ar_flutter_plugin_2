@@ -72,13 +72,18 @@ class NativeCaptureAdapterV2Test {
         )
         assertTrue(recovered.await(5, TimeUnit.SECONDS))
         assertTrue(dispatcher.isReady())
+        assertEquals(listOf("recovered"), dispatcher.replaySnapshot().map { it.attemptId })
         dispatcher.emitLive(NativeCaptureEventV2(NativeCaptureEventKindV2.ACCEPTED, "live"))
         assertEquals(
             listOf(NativeCaptureEventKindV2.COMMITTED, NativeCaptureEventKindV2.ACCEPTED),
             events.map { it.kind },
         )
+        dispatcher.acknowledgeTerminal("recovered")
+        assertEquals(NativeCaptureEventKindV2.READY, events.last().kind)
+        assertEquals(NativeCaptureEventKindV2.READY, dispatcher.replaySnapshot().single().kind)
         dispatcher.close()
         assertTrue(dispatcher.awaitTerminationForTest(5, TimeUnit.SECONDS))
+        assertTrue(dispatcher.replaySnapshot().isEmpty())
     }
 
     @Test
@@ -276,8 +281,8 @@ class NativeCaptureAdapterV2Test {
     fun `real durable store fences exact and changed terminal replay before exposure`() {
         val root = File.createTempFile("native-capture-v2", "").also { it.delete(); assertTrue(it.mkdirs()) }
         val budget = StorageBudgetCoordinatorV2(
-            File(root, "budget"), StorageBudgetPolicyV2(1024 * 1024, 0), JvmDescriptorFilesystemV2(),
-        ) { 1024 * 1024 }
+            File(root, "budget"), StorageBudgetPolicyV2(16L * 1024 * 1024, 0), JvmDescriptorFilesystemV2(),
+        ) { 16L * 1024 * 1024 }
         val durable = DurableSessionStoreV2(File(root, "store"), budget, filesystemBackend = JvmDescriptorFilesystemV2())
         try {
             val firstCamera = FakeExposure()
@@ -326,8 +331,8 @@ class NativeCaptureAdapterV2Test {
     fun `accepted template derives JPEG DNG descriptors once and exact replay never reexposes`() {
         val root = File.createTempFile("native-capture-template-v2", "").also { it.delete(); assertTrue(it.mkdirs()) }
         val budget = StorageBudgetCoordinatorV2(
-            File(root, "budget"), StorageBudgetPolicyV2(1024 * 1024, 0), JvmDescriptorFilesystemV2(),
-        ) { 1024 * 1024 }
+            File(root, "budget"), StorageBudgetPolicyV2(16L * 1024 * 1024, 0), JvmDescriptorFilesystemV2(),
+        ) { 16L * 1024 * 1024 }
         val durable = DurableSessionStoreV2(File(root, "store"), budget, filesystemBackend = JvmDescriptorFilesystemV2())
         try {
             val described = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG, CaptureComponentKind.DNG))
@@ -356,8 +361,8 @@ class NativeCaptureAdapterV2Test {
     fun `real durable abandoned replay binds full request and recovered metadata abandonment rejects replay`() {
         val root = File.createTempFile("native-abandoned-v2", "").also { it.delete(); assertTrue(it.mkdirs()) }
         val budget = StorageBudgetCoordinatorV2(
-            File(root, "budget"), StorageBudgetPolicyV2(1024 * 1024, 0), JvmDescriptorFilesystemV2(),
-        ) { 1024 * 1024 }
+            File(root, "budget"), StorageBudgetPolicyV2(16L * 1024 * 1024, 0), JvmDescriptorFilesystemV2(),
+        ) { 16L * 1024 * 1024 }
         var durable = DurableSessionStoreV2(File(root, "store"), budget, filesystemBackend = JvmDescriptorFilesystemV2())
         try {
             val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 10)
@@ -582,7 +587,14 @@ class NativeCaptureAdapterV2Test {
             CaptureAttemptIdentity("attempt-$ordinal-${lane.name}", "commit-$ordinal-${lane.name}", ordinal, cut),
             lane,
             CaptureComponentProfile("profile-${kinds.joinToString()}", kinds, 1024, 1024),
-            CaptureReservationLiability(1024, 1024, kinds.size.toLong(), 1, 0, true),
+            CaptureReservationLiability(
+                1024,
+                NativeCaptureReservationBoundsV2.physicalBytes(1024, kinds.size),
+                kinds.size.toLong(),
+                1,
+                NativeCaptureReservationBoundsV2.rollbackBytes(1024),
+                true,
+            ),
             digest("intent-$ordinal"), digest("accepted-$ordinal"),
         )
         val components = kinds.sortedBy { it.ordinal }.map { kind ->

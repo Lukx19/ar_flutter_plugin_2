@@ -723,7 +723,8 @@ internal class ArCaptureSession(
 
     /** Scalar-only V2 admission. Component descriptors and bytes are native post-output authority. */
     fun admitNativeCaptureV2(arguments: Any?): Map<String, Any?> {
-        val receipt = nativeCaptureBindingV2.admit(NativeCaptureWireV2.decodeAdmission(arguments))
+        val request = NativeCaptureWireV2.decodeAdmission(arguments)
+        val receipt = nativeCaptureBindingV2.admit(request)
         return mapOf(
             "wireVersion" to "native_capture_v2",
             "attemptId" to receipt.identity.attemptId,
@@ -738,6 +739,7 @@ internal class ArCaptureSession(
                         terminal.captureRevision,
                         terminal.manifestId,
                         terminal.reason,
+                        recoveryContext = request.recoveryContext,
                     ),
                 )
             },
@@ -747,6 +749,13 @@ internal class ArCaptureSession(
     fun nativeCaptureHealthV2(): Map<String, Any?> = NativeCaptureWireV2.event(
         NativeCaptureEventV2(NativeCaptureEventKindV2.HEALTH, resources = nativeCaptureBindingV2.snapshot()),
     )
+
+    fun replayNativeCaptureRecoveryV2(): List<Map<String, Any?>> =
+        nativeCaptureBindingV2.replayRecovery().map(NativeCaptureWireV2::event)
+
+    fun acknowledgeNativeCaptureTerminalV2(attemptId: String) {
+        nativeCaptureBindingV2.acknowledgeTerminal(attemptId)
+    }
 
     fun advanceNativeCaptureRecoveryV2() = nativeCaptureBindingV2.forceRecoveryForDebug()
 

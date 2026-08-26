@@ -42,6 +42,7 @@ class DurableSessionStoreV2(
         val captureRevision: Long? = null,
         val manifestId: String? = null,
         val reason: String,
+        val recoveryContext: NativeCaptureRecoveryContextV2? = null,
     )
     private val mutex = Any()
     private val files = SafeFilesystemV2(root, faults, filesystemBackend)
@@ -57,7 +58,13 @@ class DurableSessionStoreV2(
     /** Closes only this store's owned bound filesystem; the injected budget is borrowed. */
     override fun close() = synchronized(mutex) { files.close() }
 
-    override fun acceptBeforeExposure(attempt: CaptureAcceptedAttempt): CaptureReceipt = synchronized(mutex) {
+    override fun acceptBeforeExposure(attempt: CaptureAcceptedAttempt): CaptureReceipt =
+        acceptBeforeExposureInternal(attempt, null)
+
+    private fun acceptBeforeExposureInternal(
+        attempt: CaptureAcceptedAttempt,
+        recoveryContext: NativeCaptureRecoveryContextV2?,
+    ): CaptureReceipt = synchronized(mutex) {
         val location = location(attempt.identity)
         tombstone(location)?.let { throw DurableStoreConflictV2("Session is tombstoned") }
         receipt(location, attempt.identity)?.let { prior ->
@@ -78,6 +85,7 @@ class DurableSessionStoreV2(
                 setProperty("acceptedHash", acceptedHash(attempt)); setProperty("reservationToken", reservation.token)
                 setProperty("reservationBytes", reservation.bytes.toString()); setProperty("attemptId", attempt.identity.attemptId)
                 setProperty("commitId", attempt.identity.commitId); setProperty("session", attempt.identity.lifecycleCut.sessionId)
+                recoveryContext?.let { putRecoveryContext(it) }
             }
             faults.at(DurableStoreFaultPointV2.ACCEPTED_RECORD)
             recordRecoveryCandidate(location, requireNotNull(accepted.parentFile))
@@ -95,7 +103,7 @@ class DurableSessionStoreV2(
         val location = location(request.accepted.identity)
         tombstone(location)?.let { throw DurableStoreConflictV2("Session is tombstoned") }
         replayReceiptBeforeExposure(location, request)?.let { return@synchronized it }
-        acceptBeforeExposure(request.accepted)
+        acceptBeforeExposureInternal(request.accepted, request.recoveryContext)
     }
 
     internal fun replayFenceBeforeExposure(request: CaptureCommitRequest): CaptureReceipt? = synchronized(mutex) {
@@ -432,7 +440,7 @@ class DurableSessionStoreV2(
                     ?: throw DurableStoreConflictV2("Recovered acceptance has no attempt identity")
                 val receiptPath = path(requireNotNull(accepted.parentFile), "receipt.properties")
                 if (!files.isFile(receiptPath)) {
-                    RecoveryProjectionV2(attemptId, null, reason = "recovered-accepted-unknown")
+                    RecoveryProjectionV2(attemptId, null, reason = "recovered-accepted-unknown", recoveryContext = acceptedValues.recoveryContext())
                 } else {
                     val value = readProperties(receiptPath)
                     if (value.getProperty("kind") == CaptureTerminalKind.COMMITTED_PICTURE.name &&
@@ -445,15 +453,17 @@ class DurableSessionStoreV2(
                             value.getProperty("revision").toLong(),
                             value.getProperty("rootHash"),
                             "recovered-committed",
+                            acceptedValues.recoveryContext(),
                         )
                     } else if (value.getProperty("kind") == CaptureTerminalKind.ABANDONED_ATTEMPT.name) {
                         RecoveryProjectionV2(
                             attemptId,
                             CaptureTerminalKind.ABANDONED_ATTEMPT,
                             reason = value.getProperty("reason", "recovered-abandoned"),
+                            recoveryContext = acceptedValues.recoveryContext(),
                         )
                     } else {
-                        RecoveryProjectionV2(attemptId, null, reason = "recovered-receipt-unknown")
+                        RecoveryProjectionV2(attemptId, null, reason = "recovered-receipt-unknown", recoveryContext = acceptedValues.recoveryContext())
                     }
                 }
             }
@@ -462,6 +472,31 @@ class DurableSessionStoreV2(
             writeRecoveryIndex(validEntries)
         }
         result
+    }
+
+    private fun Properties.putRecoveryContext(value: NativeCaptureRecoveryContextV2) {
+        setProperty("recovery.sessionId", value.sessionId); setProperty("recovery.groupId", value.groupId)
+        setProperty("recovery.groupIndex", value.groupIndex.toString()); setProperty("recovery.groupGeneration", value.groupGeneration.toString())
+        setProperty("recovery.trigger", value.trigger); setProperty("recovery.requestedAtMs", value.requestedAtMs.toString())
+        setProperty("recovery.coverageRevision", value.coverageRevision.toString()); setProperty("recovery.timestampMs", value.timestampMs.toString())
+        setProperty("recovery.position", value.position.joinToString(",")); setProperty("recovery.rotation", value.rotation.joinToString(","))
+        setProperty("recovery.viewMatrix", value.viewMatrix.joinToString(",")); setProperty("recovery.projectionMatrix", value.projectionMatrix.joinToString(","))
+        setProperty("recovery.groupFromWorld", value.groupFromWorld.joinToString(",")); setProperty("recovery.worldFromGroup", value.worldFromGroup.joinToString(","))
+    }
+
+    private fun Properties.recoveryContext(): NativeCaptureRecoveryContextV2? {
+        val sessionId = getProperty("recovery.sessionId") ?: return null
+        fun long(name: String) = getProperty("recovery.$name")?.toLongOrNull()
+            ?: throw DurableStoreConflictV2("Recovered context has invalid $name")
+        fun doubles(name: String, size: Int): List<Double> = getProperty("recovery.$name")?.split(',')?.map(String::toDouble).also {
+            if (it?.size != size) throw DurableStoreConflictV2("Recovered context has invalid $name")
+        }!!
+        return NativeCaptureRecoveryContextV2(
+            sessionId, getProperty("recovery.groupId") ?: throw DurableStoreConflictV2("Recovered context has no group"),
+            long("groupIndex"), long("groupGeneration"), getProperty("recovery.trigger") ?: throw DurableStoreConflictV2("Recovered context has no trigger"),
+            long("requestedAtMs"), long("coverageRevision"), long("timestampMs"), doubles("position", 3), doubles("rotation", 4),
+            doubles("viewMatrix", 16), doubles("projectionMatrix", 16), doubles("groupFromWorld", 16), doubles("worldFromGroup", 16),
+        )
     }
 
     private fun repairAcceptedCandidate(session: File, accepted: File) {

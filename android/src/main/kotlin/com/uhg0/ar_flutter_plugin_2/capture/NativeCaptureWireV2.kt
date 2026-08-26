@@ -4,7 +4,7 @@ package com.uhg0.ar_flutter_plugin_2.capture
 internal object NativeCaptureWireV2 {
     fun decodeAdmission(value: Any?): CaptureCommitRequest {
         val root = value.map("admission")
-        root.exactKeys(setOf("wireVersion", "accepted", "poseRecordHash", "cameraModelHash", "validationRecordHash", "ledgerRecordHash"))
+        root.exactKeys(setOf("wireVersion", "accepted", "poseRecordHash", "cameraModelHash", "validationRecordHash", "ledgerRecordHash", "recoveryContext"))
         require(root.string("wireVersion") == "native_capture_v2")
         val accepted = decodeAccepted(root.getValue("accepted"))
         return CaptureCommitRequest(
@@ -15,6 +15,7 @@ internal object NativeCaptureWireV2 {
             cameraModelHash = root.digest("cameraModelHash"),
             validationRecordHash = root.digest("validationRecordHash"),
             ledgerRecordHash = root.digest("ledgerRecordHash"),
+            recoveryContext = decodeRecoveryContext(root.getValue("recoveryContext")),
         )
     }
 
@@ -30,6 +31,7 @@ internal object NativeCaptureWireV2 {
         value.captureRevision?.let { put("captureRevision", it) }
         value.manifestId?.let { put("manifestId", it) }
         value.reason?.let { put("reason", it) }
+        value.recoveryContext?.let { put("recoveryContext", encodeRecoveryContext(it)) }
         value.resources?.let { resources ->
             put("health", mapOf(
                 "exposures" to resources.exposures,
@@ -46,6 +48,25 @@ internal object NativeCaptureWireV2 {
         }
     }
 
+    private fun decodeRecoveryContext(value: Any?): NativeCaptureRecoveryContextV2 {
+        val map = value.map("recoveryContext")
+        map.exactKeys(setOf("sessionId", "groupId", "groupIndex", "groupGeneration", "trigger", "requestedAtMs", "coverageRevision", "timestampMs", "position", "rotation", "viewMatrix", "projectionMatrix", "groupFromWorld", "worldFromGroup"))
+        return NativeCaptureRecoveryContextV2(
+            map.string("sessionId"), map.string("groupId"), map.long("groupIndex"), map.long("groupGeneration"),
+            map.string("trigger"), map.long("requestedAtMs"), map.long("coverageRevision"), map.long("timestampMs"),
+            map.doubles("position"), map.doubles("rotation"), map.doubles("viewMatrix"), map.doubles("projectionMatrix"),
+            map.doubles("groupFromWorld"), map.doubles("worldFromGroup"),
+        )
+    }
+
+    private fun encodeRecoveryContext(value: NativeCaptureRecoveryContextV2) = mapOf(
+        "sessionId" to value.sessionId, "groupId" to value.groupId, "groupIndex" to value.groupIndex,
+        "groupGeneration" to value.groupGeneration, "trigger" to value.trigger, "requestedAtMs" to value.requestedAtMs,
+        "coverageRevision" to value.coverageRevision, "timestampMs" to value.timestampMs, "position" to value.position,
+        "rotation" to value.rotation, "viewMatrix" to value.viewMatrix, "projectionMatrix" to value.projectionMatrix,
+        "groupFromWorld" to value.groupFromWorld, "worldFromGroup" to value.worldFromGroup,
+    )
+
     private fun decodeAccepted(value: Any?): CaptureAcceptedAttempt {
         val map = value.map("accepted")
         map.exactKeys(setOf("identity", "lane", "profile", "reservation", "canonicalIntentHash", "acceptedReceiptHash"))
@@ -61,7 +82,8 @@ internal object NativeCaptureWireV2 {
             val profile = accepted.profile
             require(reservation.physicallyBacked)
             require(reservation.memoryBytes >= profile.maximumWorkingBytes)
-            require(reservation.physicalStoreBytes >= profile.maximumComponentBytes)
+            require(reservation.physicalStoreBytes >= NativeCaptureReservationBoundsV2.physicalBytes(profile.maximumComponentBytes, profile.requiredComponents.size))
+            require(reservation.rollbackBytes >= NativeCaptureReservationBoundsV2.rollbackBytes(profile.maximumComponentBytes))
             require(reservation.componentEntries == profile.requiredComponents.size.toLong())
             require(reservation.terminalEntries == 1L)
         }
@@ -135,5 +157,8 @@ internal object NativeCaptureWireV2 {
             require(byte in 0..255) { "$name must contain bytes" }
             byte
         }
+            ?: error("$name must be a list")
+    private fun Map<String, Any?>.doubles(name: String): List<Double> =
+        (this[name] as? List<*>)?.map { (it as? Number)?.toDouble() ?: error("$name must contain numbers") }
             ?: error("$name must be a list")
 }

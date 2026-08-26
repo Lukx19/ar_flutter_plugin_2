@@ -15,6 +15,7 @@ void main() {
       'cameraModelHash',
       'validationRecordHash',
       'ledgerRecordHash',
+      'recoveryContext',
     });
     expect(map.toString(), isNot(contains('components')));
     expect(map.toString(), isNot(contains('bytes')));
@@ -48,6 +49,7 @@ void main() {
       'captureRevision': 2,
       'manifestId': 'manifest',
       'reason': 'committed',
+      'recoveryContext': _admission().recoveryContext.toMap(),
     });
     expect(committed.isTerminal, isTrue);
     expect(committed.captureRevision, 2);
@@ -59,6 +61,13 @@ void main() {
     });
     expect(recoveryFailed.kind, ARNativeCaptureEventKindV2.recoveryFailed);
     expect(recoveryFailed.attemptId, isNull);
+
+    final ready = ARNativeCaptureEventV2.fromMap({
+      'wireVersion': nativeCaptureV2WireVersion,
+      'kind': 'ready',
+      'reason': 'native-owner-ready',
+    });
+    expect(ready.kind, ARNativeCaptureEventKindV2.ready);
   });
 
   test('rejects non-qualified profiles and unbacked reservations', () {
@@ -76,6 +85,15 @@ void main() {
         'wireVersion': nativeCaptureV2WireVersion,
         'kind': 'committed',
         'attemptId': 'attempt',
+      }),
+      throwsFormatException,
+    );
+    expect(
+      () => ARNativeCaptureEventV2.fromMap({
+        'wireVersion': nativeCaptureV2WireVersion,
+        'kind': 'ready',
+        'reason': 'native-owner-ready',
+        'attemptId': 'not-allowed',
       }),
       throwsFormatException,
     );
@@ -187,10 +205,13 @@ ARNativeCaptureAdmissionV2 _admission({
       ),
       reservation: CaptureReservationLiability(
         memoryBytes: 128,
-        physicalStoreBytes: 1024,
+        physicalStoreBytes: NativeCaptureReservationBoundsV2.physicalBytes(
+          1024,
+          components.length,
+        ),
         componentEntries: components.length,
         terminalEntries: 1,
-        rollbackBytes: 0,
+        rollbackBytes: NativeCaptureReservationBoundsV2.rollbackBytes(1024),
         physicallyBacked: physicallyBacked,
       ),
       canonicalIntentHash: digest,
@@ -200,5 +221,24 @@ ARNativeCaptureAdmissionV2 _admission({
     cameraModelHash: digest,
     validationRecordHash: digest,
     ledgerRecordHash: digest,
+    recoveryContext: ARNativeCaptureRecoveryContextV2(
+      sessionId: 'session',
+      groupId: 'group',
+      groupIndex: 0,
+      groupGeneration: 1,
+      trigger: 'manual',
+      requestedAtMs: 1,
+      coverageRevision: 0,
+      timestampMs: 1,
+      position: const [0, 0, 0],
+      rotation: const [0, 0, 0, 1],
+      viewMatrix: List<double>.generate(16, (index) => index % 5 == 0 ? 1 : 0),
+      projectionMatrix:
+          List<double>.generate(16, (index) => index % 5 == 0 ? 1 : 0),
+      groupFromWorld:
+          List<double>.generate(16, (index) => index % 5 == 0 ? 1 : 0),
+      worldFromGroup:
+          List<double>.generate(16, (index) => index % 5 == 0 ? 1 : 0),
+    ),
   );
 }
