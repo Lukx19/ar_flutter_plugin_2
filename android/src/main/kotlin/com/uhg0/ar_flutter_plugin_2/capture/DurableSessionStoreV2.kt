@@ -62,6 +62,42 @@ class DurableSessionStoreV2(
         } catch (error: Throwable) { budget.release(reservation); throw error }
     }
 
+    /**
+     * Native admission fence for #101. A terminal identity is checked against
+     * the complete commit request before a scheduler owner or shutter can be
+     * allocated. The frozen public port remains attempt-based for #99 callers.
+     */
+    internal fun acceptCaptureBeforeExposure(request: CaptureCommitRequest): CaptureReceipt = synchronized(mutex) {
+        val location = location(request.accepted.identity)
+        tombstone(location)?.let { throw DurableStoreConflictV2("Session is tombstoned") }
+        receipt(location, request.accepted.identity)?.let { prior ->
+            if (prior.requestHash == requestHash(request)) return@synchronized prior
+            throw DurableStoreConflictV2("Changed replay conflicts with durable terminal identity")
+        }
+        acceptBeforeExposure(request.accepted)
+    }
+
+    internal fun replayFenceBeforeExposure(request: CaptureCommitRequest): CaptureReceipt? = synchronized(mutex) {
+        val location = location(request.accepted.identity)
+        tombstone(location)?.let { throw DurableStoreConflictV2("Session is tombstoned") }
+        receipt(location, request.accepted.identity)?.let { prior ->
+            if (prior.terminal?.kind == CaptureTerminalKind.ABANDONED_ATTEMPT) {
+                val accepted = acceptedFile(location, request.accepted.identity).takeIf(files::isFile)?.let(::readProperties)
+                if (accepted?.getProperty("acceptedHash") == acceptedHash(request.accepted)) return@synchronized prior
+            } else if (prior.requestHash == requestHash(request)) {
+                return@synchronized prior
+            }
+            throw DurableStoreConflictV2("Changed replay conflicts with durable terminal identity")
+        }
+        val accepted = acceptedFile(location, request.accepted.identity)
+        if (files.isFile(accepted)) {
+            val existing = readProperties(accepted)
+            if (existing.getProperty("acceptedHash") == acceptedHash(request.accepted)) return@synchronized acceptedReceipt(request.accepted)
+            throw DurableStoreConflictV2("Changed replay conflicts with durable accepted identity")
+        }
+        null
+    }
+
     /** Streams, hashes and commits the exact descriptor set.  The passed streams close here. */
     fun commitStreamed(request: CaptureCommitRequest, streams: List<CaptureComponentStreamV2>): CaptureReceipt = synchronized(mutex) {
         val location = location(request.accepted.identity)

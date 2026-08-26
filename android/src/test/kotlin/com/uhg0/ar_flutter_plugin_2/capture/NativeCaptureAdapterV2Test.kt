@@ -1,5 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.capture
 
+import java.io.File
 import java.io.InputStream
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -81,6 +82,100 @@ class NativeCaptureAdapterV2Test {
     }
 
     @Test
+    fun `capacity is resolved before durable accept and protected manual evicts waiting automatic`() {
+        val store = FakeStore()
+        val camera = FakeExposure()
+        val adapter = NativeCaptureAdapterV2(store, camera)
+        val running = request(CaptureLane.AUTOMATIC, setOf(CaptureComponentKind.JPEG), ordinal = 1)
+        val waitingAutomatic = request(CaptureLane.AUTOMATIC, setOf(CaptureComponentKind.JPEG), ordinal = 2)
+        val manual = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 3)
+        adapter.admit(running)
+        adapter.admit(waitingAutomatic)
+        adapter.admit(manual)
+
+        assertEquals(listOf(running, waitingAutomatic, manual), store.accepted)
+        assertEquals("manual-priority-evicted-automatic", store.terminals.single().terminal?.reason)
+        assertEquals(manual.accepted.identity, adapter.waitingIdentityForTest())
+
+        val rejected = request(CaptureLane.AUTOMATIC, setOf(CaptureComponentKind.JPEG), ordinal = 4)
+        assertTrue(runCatching { adapter.admit(rejected) }.exceptionOrNull()?.message == "finalizer-capacity")
+        assertFalse(store.accepted.contains(rejected))
+    }
+
+    @Test
+    fun `active and durable terminal replay never schedule or re-expose`() {
+        val store = FakeStore()
+        val camera = FakeExposure()
+        val adapter = NativeCaptureAdapterV2(store, camera)
+        val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG))
+        val accepted = adapter.admit(request)
+        assertEquals(accepted, adapter.admit(request))
+        assertEquals(1, camera.requests.size)
+
+        val changed = CaptureCommitRequest(
+            request.accepted,
+            request.components.map { component ->
+                CaptureComponentDescriptor(component.kind, component.byteLength, component.sha256, "changed-${component.durableObjectId}")
+            },
+            request.exposureTimestampNanoseconds,
+            request.poseRecordHash,
+            request.cameraModelHash,
+            request.validationRecordHash,
+            request.ledgerRecordHash,
+        )
+        assertTrue(runCatching { adapter.admit(changed) }.exceptionOrNull() is DurableStoreConflictV2)
+        camera.components(camera.requests.single().first, request, listOf(CaptureComponentKind.JPEG))
+        val terminal = store.terminals.single()
+        assertEquals(terminal, adapter.admit(request))
+        assertEquals(1, camera.requests.size)
+        assertTrue(runCatching { adapter.admit(changed) }.exceptionOrNull() is DurableStoreConflictV2)
+        assertEquals(1, camera.requests.size)
+    }
+
+    @Test
+    fun `real durable store fences exact and changed terminal replay before exposure`() {
+        val root = File.createTempFile("native-capture-v2", "").also { it.delete(); assertTrue(it.mkdirs()) }
+        val budget = StorageBudgetCoordinatorV2(
+            File(root, "budget"), StorageBudgetPolicyV2(1024 * 1024, 0), JvmDescriptorFilesystemV2(),
+        ) { 1024 * 1024 }
+        val durable = DurableSessionStoreV2(File(root, "store"), budget, filesystemBackend = JvmDescriptorFilesystemV2())
+        try {
+            val firstCamera = FakeExposure()
+            val first = NativeCaptureAdapterV2(DurableNativeCaptureStorePortV2(durable), firstCamera)
+            val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG))
+            first.admit(request)
+            firstCamera.components(firstCamera.requests.single().first, request, listOf(CaptureComponentKind.JPEG))
+
+            val replayCamera = FakeExposure()
+            val replay = NativeCaptureAdapterV2(DurableNativeCaptureStorePortV2(durable), replayCamera)
+            assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, replay.admit(request).phase)
+            assertTrue(replayCamera.requests.isEmpty())
+            val changed = CaptureCommitRequest(
+                request.accepted,
+                request.components.map { CaptureComponentDescriptor(it.kind, it.byteLength, digest("changed"), it.durableObjectId) },
+                request.exposureTimestampNanoseconds,
+                request.poseRecordHash,
+                request.cameraModelHash,
+                request.validationRecordHash,
+                request.ledgerRecordHash,
+            )
+            assertTrue(runCatching { replay.admit(changed) }.exceptionOrNull() is DurableStoreConflictV2)
+            assertTrue(replayCamera.requests.isEmpty())
+
+            val acceptedOnly = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 2)
+            durable.acceptCaptureBeforeExposure(acceptedOnly)
+            val restartCamera = FakeExposure()
+            val restarted = NativeCaptureAdapterV2(DurableNativeCaptureStorePortV2(durable), restartCamera)
+            assertEquals(CaptureAttemptPhase.ABANDONED_ATTEMPT, restarted.admit(acceptedOnly).phase)
+            assertTrue(restartCamera.requests.isEmpty())
+        } finally {
+            durable.close()
+            budget.close()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `ten second automatic deadline abandons and thirty second path queries before abandonment`() {
         var clock = 0L
         val store = FakeStore()
@@ -114,6 +209,45 @@ class NativeCaptureAdapterV2Test {
     }
 
     @Test
+    fun `synchronous component callback cannot resurrect capture safety`() {
+        val store = FakeStore()
+        val signal = CaptureSafetySignalV2()
+        val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG))
+        val camera = object : SharedCameraExposurePortV2 {
+            override fun requestExposure(
+                qualifier: CaptureAttemptQualifierV2,
+                required: Set<CaptureComponentKind>,
+                callback: SharedCameraExposureCallbackV2,
+            ): Boolean {
+                callback.onComponents(SharedCameraComponentSetV2(qualifier, listOf(
+                    CaptureComponentStreamV2(CaptureComponentKind.JPEG, CloseTrackingInputStream(bytes(CaptureComponentKind.JPEG))),
+                )))
+                return true
+            }
+            override fun cancelExposure(qualifier: CaptureAttemptQualifierV2) = Unit
+        }
+        val adapter = NativeCaptureAdapterV2(store, camera, signal)
+        adapter.admit(request)
+        assertFalse(signal.isCaptureSafe())
+        assertEquals(1L, adapter.snapshot().committed)
+    }
+
+    @Test
+    fun `store rejection before and during consumption closes every component exactly once`() {
+        listOf(0, 1).forEach { readsBeforeThrow ->
+            val store = FakeStore().apply { failCommitAfterReads = readsBeforeThrow }
+            val camera = FakeExposure()
+            val adapter = NativeCaptureAdapterV2(store, camera)
+            val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG, CaptureComponentKind.DNG))
+            adapter.admit(request)
+            val inputs = camera.components(camera.requests.single().first, request, listOf(CaptureComponentKind.JPEG, CaptureComponentKind.DNG))
+            assertTrue(inputs.all { it.closeCalls == 1 })
+            assertEquals(2L, adapter.snapshot().closedComponents)
+            assertEquals(CaptureTerminalKind.ABANDONED_ATTEMPT, store.terminals.single().terminal?.kind)
+        }
+    }
+
+    @Test
     fun `every lifecycle event fences pre-output ownership and late components close`() {
         CaptureLifecycleEvent.entries.forEachIndexed { index, event ->
             val store = FakeStore()
@@ -124,6 +258,12 @@ class NativeCaptureAdapterV2Test {
             adapter.admit(request)
             val qualifier = camera.requests.single().first
             adapter.onLifecycle(event, request.accepted.identity.lifecycleCut)
+            if (event == CaptureLifecycleEvent.AUTOMATIC_DISABLED) {
+                assertTrue(store.terminals.isEmpty())
+                camera.components(qualifier, request, listOf(CaptureComponentKind.JPEG))
+                assertEquals(CaptureTerminalKind.COMMITTED_PICTURE, store.terminals.single().terminal?.kind)
+                return@forEachIndexed
+            }
             assertTrue(store.terminals.isNotEmpty())
             val late = CloseTrackingInputStream(byteArrayOf(1))
             camera.callback!!.onComponents(SharedCameraComponentSetV2(qualifier, listOf(
@@ -132,6 +272,22 @@ class NativeCaptureAdapterV2Test {
             assertTrue(late.closed)
             assertEquals(1L, adapter.snapshot().lateCallbacks)
         }
+    }
+
+    @Test
+    fun `pause drains running and waiting without promoting a second exposure`() {
+        val store = FakeStore()
+        val camera = FakeExposure()
+        val adapter = NativeCaptureAdapterV2(store, camera)
+        val running = request(CaptureLane.AUTOMATIC, setOf(CaptureComponentKind.JPEG), ordinal = 1)
+        val waiting = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 2)
+        adapter.admit(running)
+        adapter.admit(waiting)
+        adapter.onLifecycle(CaptureLifecycleEvent.BACKGROUNDED)
+        assertEquals(1, camera.requests.size)
+        assertEquals(2, store.terminals.count { it.terminal?.kind == CaptureTerminalKind.ABANDONED_ATTEMPT })
+        assertEquals(0, adapter.snapshot().running)
+        assertEquals(0, adapter.snapshot().fundedWaiting)
     }
 
     @Test
@@ -191,14 +347,38 @@ class NativeCaptureAdapterV2Test {
     }
 
     private class FakeStore : NativeCaptureStorePortV2 {
-        val accepted = mutableListOf<CaptureAcceptedAttempt>()
+        val accepted = mutableListOf<CaptureCommitRequest>()
         val terminals = mutableListOf<CaptureReceipt>()
         val queries = mutableListOf<CaptureAttemptIdentity>()
-        override fun acceptBeforeExposure(attempt: CaptureAcceptedAttempt): CaptureReceipt {
-            accepted += attempt
-            return CaptureReceipt(attempt.identity, CaptureAttemptPhase.RESERVED_ACCEPTED, "accepted", "accepted", true)
+        var failCommitAfterReads: Int? = null
+        override fun replayFenceBeforeExposure(request: CaptureCommitRequest): CaptureReceipt? {
+            terminals.firstOrNull { it.identity == request.accepted.identity }?.let { prior ->
+                if (accepted.first { it.accepted.identity == request.accepted.identity } == request) return prior
+                throw DurableStoreConflictV2("changed terminal replay")
+            }
+            accepted.firstOrNull { it.accepted.identity == request.accepted.identity }?.let { prior ->
+                if (prior == request) return CaptureReceipt(request.accepted.identity, CaptureAttemptPhase.RESERVED_ACCEPTED, "accepted", "accepted", true)
+                throw DurableStoreConflictV2("changed durable accepted replay")
+            }
+            return null
+        }
+        override fun acceptBeforeExposure(request: CaptureCommitRequest): CaptureReceipt {
+            terminals.firstOrNull { it.identity == request.accepted.identity }?.let { prior ->
+                if (accepted.first { it.accepted.identity == request.accepted.identity } == request) return prior
+                throw DurableStoreConflictV2("changed terminal replay")
+            }
+            accepted.firstOrNull { it.accepted.identity == request.accepted.identity }?.let { prior ->
+                if (prior == request) return CaptureReceipt(request.accepted.identity, CaptureAttemptPhase.RESERVED_ACCEPTED, "accepted", "accepted", true)
+                throw DurableStoreConflictV2("changed active replay")
+            }
+            accepted += request
+            return CaptureReceipt(request.accepted.identity, CaptureAttemptPhase.RESERVED_ACCEPTED, "accepted", "accepted", true)
         }
         override fun commitStreamed(request: CaptureCommitRequest, streams: List<CaptureComponentStreamV2>): CaptureReceipt {
+            failCommitAfterReads?.let { reads ->
+                repeat(reads) { streams.first().input.read() }
+                throw DurableStoreConflictV2("injected store rejection")
+            }
             streams.forEach { it.input.use { source -> while (source.read() >= 0) {} } }
             val terminal = CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, request.accepted.identity, "commit", "committed", "capture", 1, "root")
             return CaptureReceipt(request.accepted.identity, CaptureAttemptPhase.COMMITTED_PICTURE, "commit", "receipt", true, terminal).also(terminals::add)
@@ -213,8 +393,10 @@ class NativeCaptureAdapterV2Test {
         private var index = 0
         var closed = false
             private set
+        var closeCalls = 0
+            private set
         override fun read(): Int = if (index == values.size) -1 else values[index++].toInt()
-        override fun close() { closed = true }
+        override fun close() { closeCalls++; closed = true }
     }
 
     private companion object {

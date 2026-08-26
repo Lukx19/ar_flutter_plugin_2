@@ -278,10 +278,13 @@ internal class ArView(
         // ARCore's SharedCamera sample pauses the Session before closing
         // Camera2. Its wrapped image/session callbacks retain native Session
         // state until Camera2 shutdown completes.
+        // Fence/drain V2 before ARCore pause, then preserve the required
+        // ARCore-pause-before-Camera2 shutdown order for SharedCamera.
+        captureSession.prepareNativeCaptureForPause()
         sceneHost.pause()
         visibilityObservationRuntime.pause()
         captureSafetySignalV2.invalidateAll()
-        captureSession.onSessionPaused()
+        captureSession.finishSharedCameraPause()
     }
 
     private fun onSessionCall(call: MethodCall, result: MethodChannel.Result) {

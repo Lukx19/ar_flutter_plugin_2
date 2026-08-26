@@ -699,15 +699,20 @@ internal class ArCaptureSession(
     }
 
     fun onSessionPaused() {
-        nativeCaptureBindingV2.onPauseOrDispose()
-        sharedCameraManager?.onArSessionPaused()
+        prepareNativeCaptureForPause()
+        finishSharedCameraPause()
     }
+
+    fun prepareNativeCaptureForPause() = nativeCaptureBindingV2.onPause()
+
+    fun finishSharedCameraPause() = sharedCameraManager?.onArSessionPaused()
 
     fun onSessionResumed() {
         sharedCameraManager?.onArSessionResumed()
     }
 
     fun dispose() {
+        // The binding classifies every owner before the manager closes Camera2.
         nativeCaptureBindingV2.close()
         byteCache.dispose()
         sharedCameraManager?.let { manager ->
