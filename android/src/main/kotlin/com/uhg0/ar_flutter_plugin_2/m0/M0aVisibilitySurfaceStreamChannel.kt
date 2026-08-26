@@ -14,6 +14,7 @@ import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.ArrayDeque
 
 /** Small seam so lifecycle deadlines are deterministic in the JVM corpus. */
@@ -103,6 +104,7 @@ class M0aVisibilitySurfaceStreamChannel(
     private val publicationFence = Any()
     private val transactionReceiver = M0aStructuralTransactionReceiverV1()
     private val telemetry = M0aTransportInstrumentation()
+    private val streamHandlerAttempts = AtomicLong()
     private val structuralFrames = ArrayDeque<M0aTransactionFrameV1>()
     @Volatile private var committedBaseline =
         controlLifecycle?.committedBaseline() ?: M0aCommittedBaselineV1.ZERO
@@ -186,15 +188,14 @@ class M0aVisibilitySurfaceStreamChannel(
         completed: (DebugQualifiedAttempt) -> Unit,
     ) {
         val authorityBefore = synchronized(this) { committedBaseline }
+        val attemptsBefore = streamHandlerAttempts.get()
         val telemetryBefore = telemetry.snapshot()
         handleStreamMessage(ByteBuffer.wrap(transportBytes)) { response ->
             val authorityAfter = synchronized(this) { committedBaseline }
             val telemetryAfter = telemetry.snapshot()
             completed(
                 DebugQualifiedAttempt(
-                    attemptCount = telemetryAfter.submittedRequests -
-                        telemetryBefore.submittedRequests +
-                        telemetryAfter.rejectedRequests - telemetryBefore.rejectedRequests,
+                    attemptCount = streamHandlerAttempts.get() - attemptsBefore,
                     rejectionCount = telemetryAfter.rejectedRequests -
                         telemetryBefore.rejectedRequests,
                     semanticEffectCount = if (authorityAfter == authorityBefore) 0 else 1,
@@ -323,6 +324,7 @@ class M0aVisibilitySurfaceStreamChannel(
                 reply.reply(null)
                 return
             }
+            streamHandlerAttempts.incrementAndGet()
             val bytes = authenticatedPayload(transportBytes)
             if (bytes == null) {
                 telemetry.rejected()
