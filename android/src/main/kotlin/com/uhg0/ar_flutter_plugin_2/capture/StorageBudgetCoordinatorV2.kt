@@ -13,10 +13,10 @@ data class StorageBudgetReservationV2(val token: String, val owner: String, val 
 class StorageBudgetCoordinatorV2(
     directory: File,
     private val policy: StorageBudgetPolicyV2,
-    directorySync: DirectorySyncV2 = AndroidDirectorySyncV2,
+    filesystemBackend: DescriptorFilesystemV2 = AndroidDescriptorFilesystemV2,
     private val freeBytes: () -> Long = { directory.usableSpace },
 ) {
-    private val files = SafeFilesystemV2(directory, DurableStoreFaultInjectorV2 { }, directorySync)
+    private val files = SafeFilesystemV2(directory, DurableStoreFaultInjectorV2 { }, filesystemBackend)
     private val ledger = files.child("ledger-v2")
     private val reservationsDirectory = files.child("reservations-v2")
     private var committed = 0L
@@ -78,7 +78,7 @@ class StorageBudgetCoordinatorV2(
     fun committedBytes(): Long = withAuthority { committed }
     fun reservedBytes(): Long = withAuthority { reservedBytesLocked() }
     fun physicallyAllocatedBytes(token: String): Long = withAuthority {
-        reservations[token]?.let { allocationFile(token).length() } ?: 0L
+        reservations[token]?.let { files.length(allocationFile(token)) } ?: 0L
     }
 
     private fun <T> withAuthority(block: () -> T): T = synchronized(lockFor(requireNotNull(ledger.parentFile))) {
@@ -98,7 +98,7 @@ class StorageBudgetCoordinatorV2(
             require(lines.size == 2 && lines[0].matches(OWNER)) { "Corrupt storage reservation" }
             val bytes = lines[1].toLongOrNull() ?: error("Corrupt storage reservation bytes")
             val token = file.name.removeSuffix(".reservation")
-            require(bytes > 0 && files.isFile(allocationFile(token)) && allocationFile(token).length() == bytes) {
+            require(bytes > 0 && files.isFile(allocationFile(token)) && files.length(allocationFile(token)) == bytes) {
                 "Reservation is not physically backed"
             }
             reservations[token] = StorageBudgetReservationV2(token, lines[0], bytes)

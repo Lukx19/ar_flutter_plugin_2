@@ -1,11 +1,8 @@
 package com.uhg0.ar_flutter_plugin_2.capture
 
 import java.io.File
-import java.io.FileInputStream
-import java.io.FileOutputStream
 import java.io.InputStream
 import java.nio.charset.StandardCharsets
-import java.security.DigestInputStream
 import java.security.MessageDigest
 import java.util.Properties
 
@@ -22,11 +19,12 @@ class DurableSessionStoreV2(
     private val root: File,
     private val budget: StorageBudgetCoordinatorV2,
     private val faults: DurableStoreFaultInjectorV2 = DurableStoreFaultInjectorV2 { },
-    directorySync: DirectorySyncV2 = AndroidDirectorySyncV2,
+    filesystemBackend: DescriptorFilesystemV2 = AndroidDescriptorFilesystemV2,
 ) : CaptureCommitPort {
     private val mutex = Any()
-    private val files = SafeFilesystemV2(root, faults, directorySync)
+    private val files = SafeFilesystemV2(root, faults, filesystemBackend)
     private val sessionRoot = files.child("sessions")
+    private val uncertainRootHashes = mutableSetOf<String>()
 
     init { files.ensureDirectory(sessionRoot) }
 
@@ -84,7 +82,7 @@ class DurableSessionStoreV2(
                 val descriptor = descriptors.getValue(stream.kind)
                 val file = path(staging, "${stream.kind.name.lowercase()}.part")
                 faults.at(DurableStoreFaultPointV2.COMPONENT_OPEN)
-                val measured = copyAndDigest(stream.input, file)
+                val measured = files.streamExclusive(file, stream.input)
                 faults.at(DurableStoreFaultPointV2.LENGTH_CHECK)
                 check(measured.first == descriptor.byteLength && measured.second.hex() == descriptor.sha256.hex()) { "Component length/hash mismatch" }
                 actualBytes = Math.addExact(actualBytes, measured.first)
@@ -247,10 +245,7 @@ class DurableSessionStoreV2(
         path(location, file).takeIf(files::isFile)?.let(files::readLines)?.takeIf { it.size == 3 }?.let {
             RootPointer(it[0].toLongOrNull() ?: return@let null, it[1], it[2], if (file == "root-A.ptr") "A" else "B", rootPrevious(location, it[1]))
         }
-    }.let { raw ->
-        raw.groupBy { it.revision }.values.forEach { same -> if (same.map { it.rootHash }.toSet().size > 1) throw DurableStoreConflictV2("Schema-5 root fork") }
-        raw
-    }.filter { validRoot(location, it) }.let { candidates ->
+    }.filter { it.rootHash !in uncertainRootHashes && validRoot(location, it) }.let { candidates ->
         candidates.groupBy { it.revision }.values.forEach { same -> if (same.map { it.rootHash }.toSet().size > 1) throw DurableStoreConflictV2("Schema-5 root fork") }
         candidates.maxByOrNull { it.revision }
     }
@@ -261,7 +256,7 @@ class DurableSessionStoreV2(
     private fun validRootHash(location: File, hash: String, revision: Long, depth: Int): Boolean {
         if (depth > 2 || !hash.matches(Regex("[0-9a-f]{64}"))) return false
         val file = path(location, "objects", "$hash.root")
-        if (!files.isFile(file) || sha256(files.readBytes(file)).hex() != hash) return false
+        if (!files.isFile(file) || files.digestAndLength(file).second.hex() != hash) return false
         val values = files.readLines(file).associate { it.substringBefore('=') to it.substringAfter('=', "") }
         if (values["schema"] != "5" || values["revision"]?.toLongOrNull() != revision || values["request"]?.matches(Regex("[0-9a-f]{64}")) != true) return false
         val previous = values["previous"]
@@ -272,9 +267,18 @@ class DurableSessionStoreV2(
         if (depth == 0 && revision >= 3 && second != rootPrevious(location, previous)) return false
         return true
     }
-    private fun publishPointer(location: File, pointer: RootPointer) { val old = selectedRoot(location); val target = path(location, if (old?.slot == "A") "root-B.ptr" else "root-A.ptr"); writeAtomic(target, "${pointer.revision}\n${pointer.rootHash}\n${pointer.commitId}\n".toByteArray()) }
-    private fun moveImmutable(from: File, target: File, descriptor: CaptureComponentDescriptor) { if (files.isFile(target)) { check(target.length() == descriptor.byteLength && sha256(files.readBytes(target)).hex() == descriptor.sha256.hex()) { "Immutable asset conflict" }; files.delete(from, DurableStoreFaultPointV2.DELETE_RECLAIM); return }; files.moveSameDirectory(from, target) }
-    private fun copyAndDigest(input: InputStream, output: File): Pair<Long, ByteArray> { val digest = MessageDigest.getInstance("SHA-256"); var length = 0L; faults.at(DurableStoreFaultPointV2.PART_CREATE); DigestInputStream(input, digest).use { source -> FileOutputStream(output).use { destination -> val buffer = ByteArray(64 * 1024); while (true) { val read = source.read(buffer); if (read < 0) break; faults.at(DurableStoreFaultPointV2.PART_WRITE); destination.write(buffer, 0, read); length = Math.addExact(length, read.toLong()) }; faults.at(DurableStoreFaultPointV2.PART_FILE_SYNC); destination.fd.sync() } }; faults.at(DurableStoreFaultPointV2.PART_HASH); files.syncDirectory(requireNotNull(output.parentFile), DurableStoreFaultPointV2.PART_FILE_SYNC); return length to digest.digest() }
+    private fun publishPointer(location: File, pointer: RootPointer) {
+        val old = selectedRoot(location)
+        val target = path(location, if (old?.slot == "A") "root-B.ptr" else "root-A.ptr")
+        try {
+            writeAtomic(target, "${pointer.revision}\n${pointer.rootHash}\n${pointer.commitId}\n".toByteArray())
+            uncertainRootHashes.remove(pointer.rootHash)
+        } catch (error: PointerDirectorySyncUnknownV2) {
+            uncertainRootHashes += pointer.rootHash
+            throw error
+        }
+    }
+    private fun moveImmutable(from: File, target: File, descriptor: CaptureComponentDescriptor) { if (files.isFile(target)) { val measured = files.digestAndLength(target); check(measured.first == descriptor.byteLength && measured.second.hex() == descriptor.sha256.hex()) { "Immutable asset conflict" }; files.delete(from, DurableStoreFaultPointV2.DELETE_RECLAIM); return }; files.moveAtomic(from, target) }
     private fun writePropertiesExclusive(file: File, properties: Properties, point: DurableStoreFaultPointV2 = DurableStoreFaultPointV2.ACCEPTED_RECORD) = writeExclusive(file, buildString { properties.stringPropertyNames().sorted().forEach { append(it).append('=').append(properties.getProperty(it)).append('\n') } }.toByteArray(), point)
     private fun readProperties(file: File) = Properties().apply { files.readBytes(file).inputStream().use(::load) }
     private fun writeExclusive(file: File, bytes: ByteArray, point: DurableStoreFaultPointV2 = DurableStoreFaultPointV2.ACCEPTED_RECORD) = files.writeExclusive(file, bytes, point)
