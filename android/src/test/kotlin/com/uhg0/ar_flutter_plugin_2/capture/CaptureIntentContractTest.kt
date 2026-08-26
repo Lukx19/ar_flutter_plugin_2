@@ -46,7 +46,8 @@ class CaptureIntentContractTest {
     @Test
     fun `generated matrix covers every preterminal fault and lifecycle cut`() {
         val matrix = CaptureFaultLifecycleMatrix.generate()
-        assertEquals(5 * CaptureFault.entries.size * CaptureLifecycleEvent.entries.size, matrix.size)
+        assertEquals(CaptureLane.entries.size * 5 * CaptureFault.entries.size * CaptureLifecycleEvent.entries.size, matrix.size)
+        assertEquals(CaptureLane.entries.toSet(), matrix.map { it.lane }.toSet())
         assertEquals(CaptureAttemptPhase.entries.take(5).toSet(), matrix.map { it.phase }.toSet())
         assertEquals(CaptureFault.entries.toSet(), matrix.map { it.fault }.toSet())
         assertEquals(CaptureLifecycleEvent.entries.toSet(), matrix.map { it.lifecycleEvent }.toSet())

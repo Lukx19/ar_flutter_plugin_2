@@ -246,19 +246,22 @@ class CaptureAttemptReferenceMachine(val accepted: CaptureAcceptedAttempt) {
 }
 
 data class CaptureFaultLifecycleCase(
+    val lane: CaptureLane,
     val phase: CaptureAttemptPhase,
     val fault: CaptureFault,
     val lifecycleEvent: CaptureLifecycleEvent,
     val expectedTerminal: CaptureTerminalKind,
 )
 
-/** Generated complete 5 x 9 x 6 pre-terminal fault/lifecycle matrix. */
+/** Generated complete 2 x 5 x 9 x 6 lane/fault/lifecycle matrix. */
 object CaptureFaultLifecycleMatrix {
     fun generate(): List<CaptureFaultLifecycleCase> =
-        CaptureAttemptPhase.entries.take(5).flatMap { phase ->
-            CaptureFault.entries.flatMap { fault ->
-                CaptureLifecycleEvent.entries.map { event ->
-                    CaptureFaultLifecycleCase(phase, fault, event, CaptureTerminalKind.ABANDONED_ATTEMPT)
+        CaptureLane.entries.flatMap { lane ->
+            CaptureAttemptPhase.entries.take(5).flatMap { phase ->
+                CaptureFault.entries.flatMap { fault ->
+                    CaptureLifecycleEvent.entries.map { event ->
+                        CaptureFaultLifecycleCase(lane, phase, fault, event, CaptureTerminalKind.ABANDONED_ATTEMPT)
+                    }
                 }
             }
         }

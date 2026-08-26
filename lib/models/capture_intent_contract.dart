@@ -657,8 +657,9 @@ final class CaptureAttemptReferenceMachine {
 }
 
 final class CaptureFaultLifecycleCase {
-  const CaptureFaultLifecycleCase(
-      this.phase, this.fault, this.lifecycleEvent, this.expectedTerminal);
+  const CaptureFaultLifecycleCase(this.lane, this.phase, this.fault,
+      this.lifecycleEvent, this.expectedTerminal);
+  final CaptureLane lane;
   final CaptureAttemptPhase phase;
   final CaptureFault fault;
   final CaptureLifecycleEvent lifecycleEvent;
@@ -702,12 +703,13 @@ abstract final class CaptureAttemptTransitionTable {
 /// Generates the complete #99 accepted-to-terminal fault/lifecycle cross-product.
 final class CaptureFaultLifecycleMatrix {
   static List<CaptureFaultLifecycleCase> generate() => List.unmodifiable([
-        for (final phase in CaptureAttemptPhase.values.where((value) =>
-            value.index < CaptureAttemptPhase.committedPicture.index))
-          for (final fault in CaptureFault.values)
-            for (final event in CaptureLifecycleEvent.values)
-              CaptureFaultLifecycleCase(
-                  phase, fault, event, CaptureTerminalKind.abandonedAttempt),
+        for (final lane in CaptureLane.values)
+          for (final phase in CaptureAttemptPhase.values.where((value) =>
+              value.index < CaptureAttemptPhase.committedPicture.index))
+            for (final fault in CaptureFault.values)
+              for (final event in CaptureLifecycleEvent.values)
+                CaptureFaultLifecycleCase(lane, phase, fault, event,
+                    CaptureTerminalKind.abandonedAttempt),
       ]);
 }
 

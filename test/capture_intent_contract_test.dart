@@ -171,11 +171,14 @@ void main() {
       final matrix = CaptureFaultLifecycleMatrix.generate();
       expect(
           matrix,
-          hasLength(5 *
+          hasLength(CaptureLane.values.length *
+              5 *
               CaptureFault.values.length *
               CaptureLifecycleEvent.values.length));
       expect(matrix.map((value) => value.phase).toSet(),
           CaptureAttemptPhase.values.take(5).toSet());
+      expect(matrix.map((value) => value.lane).toSet(),
+          CaptureLane.values.toSet());
       expect(matrix.map((value) => value.fault).toSet(),
           CaptureFault.values.toSet());
       expect(matrix.map((value) => value.lifecycleEvent).toSet(),
