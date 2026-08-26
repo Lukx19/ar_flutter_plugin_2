@@ -19,6 +19,7 @@ pubspec.lock
 
 # Android related
 android/.gradle/
+android/.cxx/
 android/local.properties
 android/app/build/
 android/build/

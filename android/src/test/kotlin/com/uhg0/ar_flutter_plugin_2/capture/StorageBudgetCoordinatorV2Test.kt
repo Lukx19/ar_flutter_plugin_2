@@ -62,7 +62,7 @@ class StorageBudgetCoordinatorV2Test {
 
     @Test fun `JVM descriptor fake refuses replacement between containment and exclusive open`() {
         val root = directory(); var replaced = false
-        val backend = JvmDescriptorFilesystemV2(beforeDescriptorOpen = { file ->
+        val backend = JvmDescriptorFilesystemV2(beforeComponentOpen = { file ->
             if (!replaced && file.name == "accepted.properties") {
                 replaced = true
                 Files.write(file.toPath(), "attacker".toByteArray())
@@ -74,6 +74,27 @@ class StorageBudgetCoordinatorV2Test {
             files.writeExclusive(accepted, "authority".toByteArray(), DurableStoreFaultPointV2.ACCEPTED_RECORD)
         }
         assertEquals("attacker", String(Files.readAllBytes(accepted.toPath())))
+    }
+
+    @Test fun `JVM descriptor fake refuses an intermediate component replacement`() {
+        val root = directory(); var armed = false; var replaced = false
+        val backend = JvmDescriptorFilesystemV2(beforeComponentOpen = { component ->
+            if (armed && !replaced && component.name == "attempts") {
+                replaced = true
+                component.deleteRecursively()
+                Files.write(component.toPath(), "intermediate attacker".toByteArray())
+            }
+        })
+        val files = SafeFilesystemV2(root, DurableStoreFaultInjectorV2 { }, backend)
+        val target = files.child("sessions", "session", "attempts", "attempt", "accepted.properties")
+        files.ensureDirectory(requireNotNull(target.parentFile))
+        armed = true
+        assertThrows(IllegalStateException::class.java) {
+            files.writeExclusive(target, "authority".toByteArray(), DurableStoreFaultPointV2.ACCEPTED_RECORD)
+        }
+        assertTrue(replaced)
+        assertEquals("intermediate attacker", File(root, "sessions/session/attempts").readText())
+        assertTrue(!target.exists())
     }
 
     private fun directory(): File = File.createTempFile("storage-budget-v2", "").also { it.delete(); assertTrue(it.mkdirs()); directories += it }

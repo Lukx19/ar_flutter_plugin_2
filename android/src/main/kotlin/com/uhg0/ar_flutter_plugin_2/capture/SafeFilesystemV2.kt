@@ -1,17 +1,14 @@
 package com.uhg0.ar_flutter_plugin_2.capture
 
-import android.system.ErrnoException
-import android.system.Os
-import android.system.OsConstants
 import java.io.ByteArrayOutputStream
 import java.io.File
-import java.io.FileDescriptor
 import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.LinkOption
+import java.nio.file.OpenOption
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 import java.security.MessageDigest
@@ -33,272 +30,210 @@ interface DescriptorFileV2 : AutoCloseable {
     fun sync()
 }
 
-/** All production file content is accessed through no-follow descriptors. */
+/** A backend is rebound once to a trusted root; all later operations are root-relative. */
 interface DescriptorFilesystemV2 {
-    fun ensureDirectory(directory: File)
-    fun isRegularFile(file: File): Boolean
-    fun isDirectory(directory: File): Boolean
-    fun size(file: File): Long
-    fun openRead(file: File): DescriptorFileV2
-    fun createExclusive(file: File): DescriptorFileV2
-    fun atomicReplace(from: File, to: File)
-    fun atomicMove(from: File, to: File)
-    fun delete(file: File)
-    fun list(directory: File): List<File>
-    fun syncDirectory(directory: File)
+    fun bind(root: File): DescriptorFilesystemV2
+    fun ensureDirectory(segments: List<String>)
+    fun isRegularFile(segments: List<String>): Boolean
+    fun isDirectory(segments: List<String>): Boolean
+    fun size(segments: List<String>): Long
+    fun openRead(segments: List<String>): DescriptorFileV2
+    fun createExclusive(segments: List<String>): DescriptorFileV2
+    fun atomicReplace(parent: List<String>, from: String, to: String)
+    fun atomicMove(fromParent: List<String>, from: String, toParent: List<String>, to: String)
+    fun delete(segments: List<String>)
+    fun list(segments: List<String>): List<String>
+    fun syncDirectory(segments: List<String>)
 }
 
-/** Android production backend: O_NOFOLLOW/O_CLOEXEC descriptors plus fd fsync/stat. */
-object AndroidDescriptorFilesystemV2 : DescriptorFilesystemV2 {
-    private const val FILE_MODE = 384 // 0600
-    private const val DIRECTORY_MODE = 448 // 0700
-
-    override fun ensureDirectory(directory: File) {
-        if (!directory.exists()) {
-            try { Os.mkdir(directory.absolutePath, DIRECTORY_MODE) }
-            catch (error: ErrnoException) { if (error.errno != OsConstants.EEXIST) throw error }
-        }
-        val descriptor = Os.open(directory.absolutePath, readFlags(), 0)
-        try { check(OsConstants.S_ISDIR(Os.fstat(descriptor).st_mode)) { "Durable directory is not a directory" } }
-        finally { Os.close(descriptor) }
-    }
-
-    override fun isRegularFile(file: File): Boolean = try {
-        val descriptor = Os.open(file.absolutePath, readFlags(), 0)
-        try { OsConstants.S_ISREG(Os.fstat(descriptor).st_mode) } finally { Os.close(descriptor) }
-    } catch (error: ErrnoException) {
-        if (error.errno == OsConstants.ENOENT || error.errno == OsConstants.ELOOP) false else throw error
-    }
-    override fun isDirectory(directory: File): Boolean = try {
-        val descriptor = Os.open(directory.absolutePath, readFlags(), 0)
-        try { OsConstants.S_ISDIR(Os.fstat(descriptor).st_mode) } finally { Os.close(descriptor) }
-    } catch (error: ErrnoException) {
-        if (error.errno == OsConstants.ENOENT || error.errno == OsConstants.ELOOP) false else throw error
-    }
-    override fun size(file: File): Long {
-        val descriptor = Os.open(file.absolutePath, readFlags(), 0)
-        try { val stat = Os.fstat(descriptor); check(OsConstants.S_ISREG(stat.st_mode)); return stat.st_size }
-        finally { Os.close(descriptor) }
-    }
-
-    override fun openRead(file: File): DescriptorFileV2 = AndroidDescriptorFileV2(Os.open(file.absolutePath, readFlags(), 0))
-
-    override fun createExclusive(file: File): DescriptorFileV2 = AndroidDescriptorFileV2(
-        Os.open(file.absolutePath, OsConstants.O_WRONLY or OsConstants.O_CREAT or OsConstants.O_EXCL or
-            OsConstants.O_NOFOLLOW or OsConstants.O_CLOEXEC, FILE_MODE),
-    )
-
-    override fun atomicReplace(from: File, to: File) = Os.rename(from.absolutePath, to.absolutePath)
-    override fun atomicMove(from: File, to: File) = Os.rename(from.absolutePath, to.absolutePath)
-    override fun delete(file: File) {
-        try { Os.remove(file.absolutePath) }
-        catch (error: ErrnoException) { if (error.errno != OsConstants.ENOENT) throw error }
-    }
-    override fun list(directory: File): List<File> = directory.list()?.sorted()?.map { File(directory, it) } ?: emptyList()
-    override fun syncDirectory(directory: File) {
-        val descriptor = Os.open(directory.absolutePath, readFlags(), 0)
-        try { check(OsConstants.S_ISDIR(Os.fstat(descriptor).st_mode)); Os.fsync(descriptor) }
-        finally { Os.close(descriptor) }
-    }
-    private fun readFlags() = OsConstants.O_RDONLY or OsConstants.O_NOFOLLOW or OsConstants.O_CLOEXEC
+/** JNI bridge to openat/mkdirat/renameat/unlinkat rooted at one O_DIRECTORY fd. */
+object AndroidDescriptorNativeV2 {
+    init { System.loadLibrary("capture3d_safe_fs_v2") }
+    external fun nativeOpenRoot(path: String): Long
+    external fun nativeClose(descriptor: Long)
+    external fun nativeEnsureDirectory(root: Long, segments: Array<String>)
+    external fun nativeIsRegular(root: Long, segments: Array<String>): Boolean
+    external fun nativeIsDirectory(root: Long, segments: Array<String>): Boolean
+    external fun nativeSize(root: Long, segments: Array<String>): Long
+    external fun nativeOpenRead(root: Long, segments: Array<String>): Long
+    external fun nativeCreateExclusive(root: Long, segments: Array<String>): Long
+    external fun nativeRead(descriptor: Long, bytes: ByteArray, offset: Int, count: Int): Int
+    external fun nativeWrite(descriptor: Long, bytes: ByteArray, offset: Int, count: Int)
+    external fun nativeSync(descriptor: Long)
+    external fun nativeAtomicReplace(root: Long, parent: Array<String>, from: String, to: String)
+    external fun nativeAtomicMove(root: Long, fromParent: Array<String>, from: String, toParent: Array<String>, to: String)
+    external fun nativeDelete(root: Long, segments: Array<String>)
+    external fun nativeList(root: Long, segments: Array<String>): Array<String>
+    external fun nativeSyncDirectory(root: Long, segments: Array<String>)
 }
 
-private class AndroidDescriptorFileV2(private val descriptor: FileDescriptor) : DescriptorFileV2 {
-    override fun read(bytes: ByteArray, offset: Int, count: Int): Int = Os.read(descriptor, bytes, offset, count)
-    override fun write(bytes: ByteArray, offset: Int, count: Int) {
-        var written = 0
-        while (written < count) written += Os.write(descriptor, bytes, offset + written, count - written)
-    }
-    override fun sync() = Os.fsync(descriptor)
-    override fun close() = Os.close(descriptor)
+/** Android production backend; no operation re-enters absolute pathname traversal. */
+class AndroidDescriptorFilesystemV2 private constructor(private val rootDescriptor: Long?) : DescriptorFilesystemV2 {
+    constructor() : this(null)
+    override fun bind(root: File) = AndroidDescriptorFilesystemV2(AndroidDescriptorNativeV2.nativeOpenRoot(root.absolutePath))
+    private fun root() = requireNotNull(rootDescriptor) { "Descriptor filesystem is not root-bound" }
+    override fun ensureDirectory(segments: List<String>) = AndroidDescriptorNativeV2.nativeEnsureDirectory(root(), segments.toTypedArray())
+    override fun isRegularFile(segments: List<String>) = AndroidDescriptorNativeV2.nativeIsRegular(root(), segments.toTypedArray())
+    override fun isDirectory(segments: List<String>) = AndroidDescriptorNativeV2.nativeIsDirectory(root(), segments.toTypedArray())
+    override fun size(segments: List<String>) = AndroidDescriptorNativeV2.nativeSize(root(), segments.toTypedArray())
+    override fun openRead(segments: List<String>): DescriptorFileV2 =
+        AndroidNativeFileV2(AndroidDescriptorNativeV2.nativeOpenRead(root(), segments.toTypedArray()))
+    override fun createExclusive(segments: List<String>): DescriptorFileV2 =
+        AndroidNativeFileV2(AndroidDescriptorNativeV2.nativeCreateExclusive(root(), segments.toTypedArray()))
+    override fun atomicReplace(parent: List<String>, from: String, to: String) = AndroidDescriptorNativeV2.nativeAtomicReplace(root(), parent.toTypedArray(), from, to)
+    override fun atomicMove(fromParent: List<String>, from: String, toParent: List<String>, to: String) = AndroidDescriptorNativeV2.nativeAtomicMove(root(), fromParent.toTypedArray(), from, toParent.toTypedArray(), to)
+    override fun delete(segments: List<String>) = AndroidDescriptorNativeV2.nativeDelete(root(), segments.toTypedArray())
+    override fun list(segments: List<String>) = AndroidDescriptorNativeV2.nativeList(root(), segments.toTypedArray()).toList()
+    override fun syncDirectory(segments: List<String>) = AndroidDescriptorNativeV2.nativeSyncDirectory(root(), segments.toTypedArray())
 }
 
-/** Deterministic JVM fake with the same exclusive/no-follow descriptor contract. */
+private class AndroidNativeFileV2(private val descriptor: Long) : DescriptorFileV2 {
+    override fun read(bytes: ByteArray, offset: Int, count: Int) = AndroidDescriptorNativeV2.nativeRead(descriptor, bytes, offset, count)
+    override fun write(bytes: ByteArray, offset: Int, count: Int) = AndroidDescriptorNativeV2.nativeWrite(descriptor, bytes, offset, count)
+    override fun sync() = AndroidDescriptorNativeV2.nativeSync(descriptor)
+    override fun close() = AndroidDescriptorNativeV2.nativeClose(descriptor)
+}
+
+/** JVM model: serialized component-by-component NOFOLLOW checks and exclusive final opens. */
 class JvmDescriptorFilesystemV2(
     private val onDirectorySync: (File) -> Unit = { },
-    private val beforeDescriptorOpen: (File) -> Unit = { },
+    private val beforeComponentOpen: (File) -> Unit = { },
+    private val boundRoot: File? = null,
 ) : DescriptorFilesystemV2 {
-    override fun ensureDirectory(directory: File) {
-        if (!Files.exists(directory.toPath(), LinkOption.NOFOLLOW_LINKS)) Files.createDirectory(directory.toPath())
-        check(Files.isDirectory(directory.toPath(), LinkOption.NOFOLLOW_LINKS)) { "Durable directory is not a directory" }
+    private val lock = Any()
+    override fun bind(root: File): DescriptorFilesystemV2 {
+        if (!Files.exists(root.toPath(), LinkOption.NOFOLLOW_LINKS)) Files.createDirectory(root.toPath())
+        check(Files.isDirectory(root.toPath(), LinkOption.NOFOLLOW_LINKS))
+        return JvmDescriptorFilesystemV2(onDirectorySync, beforeComponentOpen, root.canonicalFile)
     }
-    override fun isRegularFile(file: File): Boolean = Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS)
-    override fun isDirectory(directory: File): Boolean = Files.isDirectory(directory.toPath(), LinkOption.NOFOLLOW_LINKS)
-    override fun size(file: File): Long = FileChannel.open(
-        file.also(beforeDescriptorOpen).toPath(), StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS,
-    ).use(FileChannel::size)
-    override fun openRead(file: File): DescriptorFileV2 = JvmDescriptorFileV2(
-        FileChannel.open(file.also(beforeDescriptorOpen).toPath(), StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS),
-    )
-    override fun createExclusive(file: File): DescriptorFileV2 = JvmDescriptorFileV2(
-        FileChannel.open(file.also(beforeDescriptorOpen).toPath(), StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW, LinkOption.NOFOLLOW_LINKS),
-    )
-    override fun atomicReplace(from: File, to: File) {
-        try { Files.move(from.toPath(), to.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING) }
-        catch (_: AtomicMoveNotSupportedException) { throw IllegalStateException("Atomic replacement unavailable") }
+    override fun ensureDirectory(segments: List<String>) = synchronized(lock) {
+        var current = root()
+        segments.forEach { segment ->
+            current = File(current, segment); beforeComponentOpen(current)
+            if (!Files.exists(current.toPath(), LinkOption.NOFOLLOW_LINKS)) Files.createDirectory(current.toPath())
+            check(Files.isDirectory(current.toPath(), LinkOption.NOFOLLOW_LINKS)) { "Intermediate durable component is not a no-follow directory" }
+        }
     }
-    override fun atomicMove(from: File, to: File) {
-        try { Files.move(from.toPath(), to.toPath(), StandardCopyOption.ATOMIC_MOVE) }
-        catch (_: AtomicMoveNotSupportedException) { throw IllegalStateException("Atomic move unavailable") }
+    override fun isRegularFile(segments: List<String>) = synchronized(lock) { resolveParent(segments)?.let { Files.isRegularFile(File(it, segments.last()).toPath(), LinkOption.NOFOLLOW_LINKS) } ?: false }
+    override fun isDirectory(segments: List<String>) = synchronized(lock) { resolveDirectory(segments) != null }
+    override fun size(segments: List<String>) = synchronized(lock) { openChannel(segments, StandardOpenOption.READ).use(FileChannel::size) }
+    override fun openRead(segments: List<String>): DescriptorFileV2 = synchronized(lock) { JvmDescriptorFileV2(openChannel(segments, StandardOpenOption.READ)) }
+    override fun createExclusive(segments: List<String>): DescriptorFileV2 = synchronized(lock) { JvmDescriptorFileV2(openChannel(segments, StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW)) }
+    override fun atomicReplace(parent: List<String>, from: String, to: String) = synchronized(lock) {
+        val directory = requireNotNull(resolveDirectory(parent)); Files.move(File(directory, from).toPath(), File(directory, to).toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING); Unit
     }
-    override fun delete(file: File) { Files.deleteIfExists(file.toPath()) }
-    override fun list(directory: File): List<File> = Files.newDirectoryStream(directory.toPath()).use { stream ->
-        stream.map { it.toFile() }.sortedBy(File::getName).toList()
+    override fun atomicMove(fromParent: List<String>, from: String, toParent: List<String>, to: String) = synchronized(lock) {
+        val source = requireNotNull(resolveDirectory(fromParent)); val target = requireNotNull(resolveDirectory(toParent))
+        try { Files.move(File(source, from).toPath(), File(target, to).toPath(), StandardCopyOption.ATOMIC_MOVE) }
+        catch (_: AtomicMoveNotSupportedException) { throw IllegalStateException("Atomic move unavailable") }; Unit
     }
-    override fun syncDirectory(directory: File) { onDirectorySync(directory.canonicalFile) }
+    override fun delete(segments: List<String>) = synchronized(lock) { resolveParent(segments)?.let { Files.deleteIfExists(File(it, segments.last()).toPath()) }; Unit }
+    override fun list(segments: List<String>): List<String> = synchronized(lock) {
+        val directory = requireNotNull(resolveDirectory(segments)); Files.newDirectoryStream(directory.toPath()).use { it.map { child -> child.fileName.toString() }.sorted().toList() }
+    }
+    override fun syncDirectory(segments: List<String>) = synchronized(lock) { onDirectorySync(requireNotNull(resolveDirectory(segments)).canonicalFile) }
+    private fun openChannel(segments: List<String>, vararg options: StandardOpenOption): FileChannel {
+        val parent = requireNotNull(resolveParent(segments)); val final = File(parent, segments.last()); beforeComponentOpen(final)
+        val openOptions: Array<OpenOption> =
+            (options.map { it as OpenOption } + LinkOption.NOFOLLOW_LINKS).toTypedArray()
+        return FileChannel.open(final.toPath(), *openOptions)
+    }
+    private fun resolveParent(segments: List<String>) = if (segments.isEmpty()) null else resolveDirectory(segments.dropLast(1))
+    private fun resolveDirectory(segments: List<String>): File? {
+        var current = root()
+        segments.forEach { segment ->
+            val next = File(current, segment); beforeComponentOpen(next)
+            if (!Files.isDirectory(next.toPath(), LinkOption.NOFOLLOW_LINKS)) return null
+            current = next
+        }
+        return current
+    }
+    private fun root() = requireNotNull(boundRoot) { "JVM descriptor filesystem is not root-bound" }
 }
 
 private class JvmDescriptorFileV2(private val channel: FileChannel) : DescriptorFileV2 {
-    override fun read(bytes: ByteArray, offset: Int, count: Int): Int = channel.read(ByteBuffer.wrap(bytes, offset, count))
-    override fun write(bytes: ByteArray, offset: Int, count: Int) {
-        val buffer = ByteBuffer.wrap(bytes, offset, count)
-        while (buffer.hasRemaining()) channel.write(buffer)
-    }
+    override fun read(bytes: ByteArray, offset: Int, count: Int) = channel.read(ByteBuffer.wrap(bytes, offset, count))
+    override fun write(bytes: ByteArray, offset: Int, count: Int) { val buffer = ByteBuffer.wrap(bytes, offset, count); while (buffer.hasRemaining()) channel.write(buffer) }
     override fun sync() = channel.force(true)
     override fun close() = channel.close()
 }
 
-/** Canonical contained path construction plus descriptor-only durable operations. */
 class SafeFilesystemV2(
     root: File,
     private val fault: DurableStoreFaultInjectorV2,
-    private val backend: DescriptorFilesystemV2 = AndroidDescriptorFilesystemV2,
+    backend: DescriptorFilesystemV2 = AndroidDescriptorFilesystemV2(),
 ) {
     private val rootPath = root.absoluteFile.toPath().normalize()
-
-    init {
-        backend.ensureDirectory(rootPath.toFile())
-    }
+    private val backend = backend.bind(rootPath.toFile())
 
     fun child(vararg names: String): File {
-        var result = rootPath.toFile()
-        names.forEach { name ->
-            require(name.matches(SEGMENT) && name != "." && name != "..") { "Unsafe durable path segment" }
-            result = File(result, name)
-        }
-        requireContained(result)
-        return result
+        names.forEach(::validateSegment)
+        return rootPath.resolve(names.joinToString(File.separator)).normalize().toFile().also(::requireContained)
     }
-
-    fun ensureDirectory(directory: File) {
-        requireContained(directory)
-        val missing = generateSequence(directory) { it.parentFile }
-            .takeWhile { it.absoluteFile.toPath().normalize().startsWith(rootPath) }
-            .toList().asReversed()
-        missing.forEach(backend::ensureDirectory)
-    }
-
-    fun isFile(file: File): Boolean { requireContained(file); return backend.isRegularFile(file) }
-    fun length(file: File): Long { requireContained(file); return backend.size(file) }
+    fun ensureDirectory(directory: File) = backend.ensureDirectory(relative(directory))
+    fun isFile(file: File) = backend.isRegularFile(relative(file))
+    fun length(file: File) = backend.size(relative(file))
     fun readBytes(file: File): ByteArray {
-        requireContained(file)
-        val output = ByteArrayOutputStream()
-        backend.openRead(file).use { descriptor ->
+        val output = ByteArrayOutputStream(); backend.openRead(relative(file)).use { descriptor ->
             val buffer = ByteArray(64 * 1024)
-            while (true) { val read = descriptor.read(buffer, 0, buffer.size); if (read < 0) break; if (read == 0) continue; output.write(buffer, 0, read) }
-        }
-        return output.toByteArray()
+            while (true) { val read = descriptor.read(buffer, 0, buffer.size); if (read < 0) break; if (read > 0) output.write(buffer, 0, read) }
+        }; return output.toByteArray()
     }
-    fun readLines(file: File): List<String> = readBytes(file).toString(Charsets.UTF_8).lines().dropLastWhile(String::isEmpty)
-    fun list(directory: File): List<File> {
-        requireContained(directory)
-        check(backend.isDirectory(directory)) { "Durable listing target is not a no-follow directory" }
-        return backend.list(directory).onEach(::requireContained)
-    }
+    fun readLines(file: File) = readBytes(file).toString(Charsets.UTF_8).lines().dropLastWhile(String::isEmpty)
+    fun list(directory: File): List<File> = backend.list(relative(directory)).map { name -> validateSegment(name); File(directory, name).also(::requireContained) }
     fun walk(directory: File): Sequence<File> = sequence {
-        requireContained(directory); yield(directory)
-        if (backend.isDirectory(directory)) for (child in list(directory)) {
-            yield(child); if (backend.isDirectory(child)) yieldAll(walk(child).drop(1))
-        }
+        yield(directory); if (backend.isDirectory(relative(directory))) for (child in list(directory)) { yield(child); if (backend.isDirectory(relative(child))) yieldAll(walk(child).drop(1)) }
     }
-
     fun writeExclusive(file: File, bytes: ByteArray, point: DurableStoreFaultPointV2) {
-        prepareParent(file); fault.at(point)
-        backend.createExclusive(file).use { descriptor -> descriptor.write(bytes, 0, bytes.size); descriptor.sync() }
-        backend.syncDirectory(parent(file))
+        prepareParent(file); fault.at(point); backend.createExclusive(relative(file)).use { it.write(bytes, 0, bytes.size); it.sync() }; syncParent(file)
     }
-
     fun writeImmutable(file: File, bytes: ByteArray, point: DurableStoreFaultPointV2) {
-        if (isFile(file)) { check(readBytes(file).contentEquals(bytes)) { "Immutable durable object conflict" }; return }
-        writeExclusive(file, bytes, point)
+        if (isFile(file)) { check(readBytes(file).contentEquals(bytes)); return }; writeExclusive(file, bytes, point)
     }
-
     fun atomicReplace(file: File, bytes: ByteArray, replacePoint: DurableStoreFaultPointV2) {
-        prepareParent(file)
-        val temporary = childRelative(parent(file), ".${file.name}.part")
-        backend.delete(temporary)
-        backend.createExclusive(temporary).use { descriptor -> descriptor.write(bytes, 0, bytes.size); descriptor.sync() }
-        fault.at(replacePoint)
-        backend.atomicReplace(temporary, file)
-        // A crash/fault here is UNKNOWN: rename visibility is not durability.
-        try {
-            fault.at(DurableStoreFaultPointV2.POINTER_DIRECTORY_SYNC)
-            backend.syncDirectory(parent(file))
-        } catch (error: Throwable) {
-            throw PointerDirectorySyncUnknownV2(error)
-        }
+        prepareParent(file); val parent = parentSegments(file); val temporary = ".${file.name}.part"; backend.delete(parent + temporary)
+        backend.createExclusive(parent + temporary).use { it.write(bytes, 0, bytes.size); it.sync() }
+        fault.at(replacePoint); backend.atomicReplace(parent, temporary, file.name)
+        try { fault.at(DurableStoreFaultPointV2.POINTER_DIRECTORY_SYNC); backend.syncDirectory(parent) }
+        catch (error: Throwable) { throw PointerDirectorySyncUnknownV2(error) }
     }
-
     fun moveAtomic(from: File, to: File) {
-        requireContained(from); prepareParent(to)
-        fault.at(DurableStoreFaultPointV2.ASSET_RENAME)
-        backend.atomicMove(from, to)
-        fault.at(DurableStoreFaultPointV2.ASSET_DIRECTORY_SYNC)
-        backend.syncDirectory(parent(to))
+        prepareParent(to); fault.at(DurableStoreFaultPointV2.ASSET_RENAME)
+        backend.atomicMove(parentSegments(from), from.name, parentSegments(to), to.name)
+        fault.at(DurableStoreFaultPointV2.ASSET_DIRECTORY_SYNC); backend.syncDirectory(parentSegments(to))
     }
-
     fun streamExclusive(file: File, input: InputStream): Pair<Long, ByteArray> {
-        prepareParent(file); fault.at(DurableStoreFaultPointV2.PART_CREATE)
-        val digest = MessageDigest.getInstance("SHA-256")
-        var length = 0L
-        input.use { source -> backend.createExclusive(file).use { descriptor ->
-            val buffer = ByteArray(64 * 1024)
-            while (true) {
-                val read = source.read(buffer); if (read < 0) break
-                fault.at(DurableStoreFaultPointV2.PART_WRITE)
-                descriptor.write(buffer, 0, read); digest.update(buffer, 0, read); length = Math.addExact(length, read.toLong())
-            }
+        prepareParent(file); fault.at(DurableStoreFaultPointV2.PART_CREATE); val digest = MessageDigest.getInstance("SHA-256"); var length = 0L
+        input.use { source -> backend.createExclusive(relative(file)).use { descriptor ->
+            val buffer = ByteArray(64 * 1024); while (true) { val read = source.read(buffer); if (read < 0) break; fault.at(DurableStoreFaultPointV2.PART_WRITE); descriptor.write(buffer, 0, read); digest.update(buffer, 0, read); length = Math.addExact(length, read.toLong()) }
             fault.at(DurableStoreFaultPointV2.PART_FILE_SYNC); descriptor.sync()
-        } }
-        fault.at(DurableStoreFaultPointV2.PART_HASH)
-        backend.syncDirectory(parent(file))
-        return length to digest.digest()
+        } }; fault.at(DurableStoreFaultPointV2.PART_HASH); backend.syncDirectory(parentSegments(file)); return length to digest.digest()
     }
-
     fun digestAndLength(file: File): Pair<Long, ByteArray> {
-        requireContained(file); val digest = MessageDigest.getInstance("SHA-256"); var length = 0L
-        backend.openRead(file).use { descriptor ->
-            val buffer = ByteArray(64 * 1024)
-            while (true) { val read = descriptor.read(buffer, 0, buffer.size); if (read < 0) break; if (read == 0) continue; digest.update(buffer, 0, read); length = Math.addExact(length, read.toLong()) }
-        }
-        return length to digest.digest()
+        val digest = MessageDigest.getInstance("SHA-256"); var length = 0L; backend.openRead(relative(file)).use { descriptor ->
+            val buffer = ByteArray(64 * 1024); while (true) { val read = descriptor.read(buffer, 0, buffer.size); if (read < 0) break; if (read > 0) { digest.update(buffer, 0, read); length = Math.addExact(length, read.toLong()) } }
+        }; return length to digest.digest()
     }
-
     fun allocateExclusive(file: File, bytes: Long) {
-        require(bytes > 0); prepareParent(file); val buffer = ByteArray(64 * 1024)
-        backend.createExclusive(file).use { descriptor ->
-            var remaining = bytes
-            while (remaining > 0) { val count = minOf(buffer.size.toLong(), remaining).toInt(); descriptor.write(buffer, 0, count); remaining -= count }
-            descriptor.sync()
-        }
-        check(length(file) == bytes) { "Physical reservation allocation incomplete" }
-        backend.syncDirectory(parent(file))
+        require(bytes > 0); prepareParent(file); val buffer = ByteArray(64 * 1024); backend.createExclusive(relative(file)).use { descriptor ->
+            var remaining = bytes; while (remaining > 0) { val count = minOf(buffer.size.toLong(), remaining).toInt(); descriptor.write(buffer, 0, count); remaining -= count }; descriptor.sync()
+        }; check(length(file) == bytes); syncParent(file)
     }
-
-    fun delete(file: File, point: DurableStoreFaultPointV2) {
-        requireContained(file); fault.at(point); backend.delete(file); backend.syncDirectory(parent(file))
-    }
+    fun delete(file: File, point: DurableStoreFaultPointV2) { fault.at(point); backend.delete(relative(file)); backend.syncDirectory(parentSegments(file)) }
     fun deleteTree(directory: File, point: DurableStoreFaultPointV2) {
-        requireContained(directory); fault.at(point)
-        walk(directory).toList().asReversed().forEach(backend::delete)
-        directory.parentFile?.let(backend::syncDirectory)
+        fault.at(point); if (!backend.isDirectory(relative(directory))) { backend.delete(relative(directory)); return }
+        walk(directory).toList().asReversed().forEach { backend.delete(relative(it)) }; directory.parentFile?.let { backend.syncDirectory(relative(it)) }
     }
-
-    private fun prepareParent(file: File) { requireContained(file); ensureDirectory(parent(file)) }
-    private fun parent(file: File) = requireNotNull(file.parentFile) { "Durable root has no parent" }
-    private fun childRelative(parent: File, name: String): File = File(parent, name).also(::requireContained)
-    private fun requireContained(file: File) {
-        require(file.absoluteFile.toPath().normalize().startsWith(rootPath)) { "Durable file escapes root" }
+    private fun prepareParent(file: File) { requireContained(file); backend.ensureDirectory(parentSegments(file)) }
+    private fun syncParent(file: File) = backend.syncDirectory(parentSegments(file))
+    private fun parentSegments(file: File) = relative(requireNotNull(file.parentFile))
+    private fun relative(file: File): List<String> {
+        requireContained(file)
+        val path = rootPath.relativize(file.absoluteFile.toPath().normalize())
+        if (path.toString().isEmpty()) return emptyList()
+        return path.map { it.toString() }.toList().onEach(::validateSegment)
     }
+    private fun requireContained(file: File) { require(file.absoluteFile.toPath().normalize().startsWith(rootPath)) }
+    private fun validateSegment(name: String) { require(name.matches(SEGMENT) && name != "." && name != "..") }
     companion object { private val SEGMENT = Regex("[A-Za-z0-9._-]{1,160}") }
 }

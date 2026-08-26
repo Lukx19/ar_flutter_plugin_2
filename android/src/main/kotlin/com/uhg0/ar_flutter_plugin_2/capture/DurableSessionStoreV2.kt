@@ -19,7 +19,7 @@ class DurableSessionStoreV2(
     private val root: File,
     private val budget: StorageBudgetCoordinatorV2,
     private val faults: DurableStoreFaultInjectorV2 = DurableStoreFaultInjectorV2 { },
-    filesystemBackend: DescriptorFilesystemV2 = AndroidDescriptorFilesystemV2,
+    filesystemBackend: DescriptorFilesystemV2 = AndroidDescriptorFilesystemV2(),
 ) : CaptureCommitPort {
     private val mutex = Any()
     private val files = SafeFilesystemV2(root, faults, filesystemBackend)

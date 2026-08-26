@@ -13,7 +13,7 @@ data class StorageBudgetReservationV2(val token: String, val owner: String, val 
 class StorageBudgetCoordinatorV2(
     directory: File,
     private val policy: StorageBudgetPolicyV2,
-    filesystemBackend: DescriptorFilesystemV2 = AndroidDescriptorFilesystemV2,
+    filesystemBackend: DescriptorFilesystemV2 = AndroidDescriptorFilesystemV2(),
     private val freeBytes: () -> Long = { directory.usableSpace },
 ) {
     private val files = SafeFilesystemV2(directory, DurableStoreFaultInjectorV2 { }, filesystemBackend)
