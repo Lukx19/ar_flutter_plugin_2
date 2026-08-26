@@ -173,7 +173,7 @@ internal class NativeCaptureBindingV2(
     fun onPause() = adapter.onLifecycle(CaptureLifecycleEvent.BACKGROUNDED)
     fun onViewReplacement() = adapter.onLifecycle(CaptureLifecycleEvent.VIEW_REPLACED)
     fun onArSessionReplacement() = adapter.onLifecycle(CaptureLifecycleEvent.AR_SESSION_REPLACED)
-    fun advanceRecovery() = adapter.advanceDeadlines()
+    fun forceRecoveryForDebug() = adapter.forceRecoveryForDebug()
     fun snapshot() = adapter.snapshot()
 
     /** Native instrumentation seam; it is never registered with a Flutter channel. */
@@ -392,6 +392,11 @@ internal class NativeCaptureAdapterV2(
                 queryOrAbandonLocked(value, "terminal-fence-30s")
             }
         }
+    }
+
+    /** Debug-only platform-view selector seam; production recovery uses deadlines. */
+    internal fun forceRecoveryForDebug() = synchronized(lock) {
+        work.values.toList().forEach { queryOrAbandonLocked(it, "debug-terminal-query") }
     }
 
     fun snapshot(): CaptureResourceSnapshotV2 = synchronized(lock) {

@@ -744,7 +744,7 @@ internal class ArCaptureSession(
         NativeCaptureEventV2(NativeCaptureEventKindV2.HEALTH, resources = nativeCaptureBindingV2.snapshot()),
     )
 
-    fun advanceNativeCaptureRecoveryV2() = nativeCaptureBindingV2.advanceRecovery()
+    fun advanceNativeCaptureRecoveryV2() = nativeCaptureBindingV2.forceRecoveryForDebug()
 
     fun notifyNativeCaptureLifecycleV2(event: String) {
         val parsed = when (event) {
@@ -761,6 +761,7 @@ internal class ArCaptureSession(
             request = { qualifier, required, callback ->
                 when (fault) {
                     "camera" -> callback.onFailure(qualifier, "synthetic-camera")
+                    "hang" -> Unit
                     "malformed" -> callback.onComponents(
                         SharedCameraComponentSetV2(
                             qualifier,
