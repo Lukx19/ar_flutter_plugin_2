@@ -8,6 +8,16 @@ protocol CaptureCommitPortInterface {
     func abandon(_ terminal: CaptureTerminalDescriptor) async throws -> CaptureReceiptDescriptor
 }
 
+/// Declaration-only #101 native capture parity seam.  No Swift exposure,
+/// streaming, filesystem, or lifecycle implementation is provided.
+protocol SharedCameraExposurePortV2Interface {
+    func requestExposure(
+        qualifier: CaptureAttemptQualifierV2Descriptor,
+        requiredComponents: [CaptureComponentKindDescriptor]
+    ) async throws
+    func cancelExposure(_ qualifier: CaptureAttemptQualifierV2Descriptor)
+}
+
 enum CaptureIntentInterfaceConstants {
     static let portableOrdinalMaximum = UInt64(Int64.max)
     static let portableEntryMaximum = UInt64(Int32.max)
@@ -75,6 +85,17 @@ struct CaptureAttemptIdentityDescriptor {
     let commitID: UUID
     let attemptOrdinal: UInt64
     let lifecycleCut: CaptureLifecycleCutDescriptor
+}
+
+struct CaptureAttemptQualifierV2Descriptor {
+    let identity: CaptureAttemptIdentityDescriptor
+    let lifecycleCut: CaptureLifecycleCutDescriptor
+    let exposureGeneration: UInt64
+}
+
+struct CaptureSafetySignalV2Descriptor {
+    let requiresExactLiveOwnerStoreAndCutBinding: Bool
+    let failsClosedWithoutBinding: Bool
 }
 
 struct CaptureAcceptedAttemptDescriptor {

@@ -37,6 +37,7 @@ internal class ArCaptureSession(
     private val onObservedControlStateChanged: (ArCaptureSession) -> Unit = {},
     private val onCaptureAccepted: (Map<String, Any?>) -> Unit = {},
     private val onCaptureFinalized: (Map<String, Any?>) -> Unit = {},
+    private val captureSafetySignalV2: CaptureSafetySignalV2 = CaptureSafetySignalV2(),
 ) {
     companion object {
         private const val TrackingPoseReadyTimeoutMs = 2_000L
@@ -48,6 +49,8 @@ internal class ArCaptureSession(
     private val resourceCounters = CaptureResourceCounters()
     private val poseDataExtractor = PoseDataExtractor()
     private var sharedCameraManager: SharedCameraManager? = null
+    // Constructed per view now; #102 only provides a future native admission caller.
+    private val nativeCaptureBindingV2 = NativeCaptureBindingV2(sceneHost.context, captureSafetySignalV2)
     private var sharedImageCacheManager: ImageCacheManager? = null
     private var highResCaptureEnabled = false
     private var poseSequence = 0L
@@ -214,6 +217,7 @@ internal class ArCaptureSession(
                 try {
                     manager.initialize(imageCacheManager)
                     sharedCameraManager = manager
+                    nativeCaptureBindingV2.attachSharedCamera(manager)
                     break
                 } catch (error: Exception) {
                     startupError = error
@@ -695,6 +699,7 @@ internal class ArCaptureSession(
     }
 
     fun onSessionPaused() {
+        nativeCaptureBindingV2.onPauseOrDispose()
         sharedCameraManager?.onArSessionPaused()
     }
 
@@ -703,8 +708,10 @@ internal class ArCaptureSession(
     }
 
     fun dispose() {
+        nativeCaptureBindingV2.close()
         byteCache.dispose()
         sharedCameraManager?.let { manager ->
+            nativeCaptureBindingV2.detachSharedCamera(manager)
             manager.cleanup()
             manager.finishCameraShutdown(1_000L)
         }

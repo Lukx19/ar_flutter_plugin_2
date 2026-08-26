@@ -202,6 +202,26 @@ internal class SharedCameraManager(
     private val onCaptureFinalizationFailed: (String, Throwable) -> Unit = { _, _ -> },
     private val resourceCounters: CaptureResourceCounters = CaptureResourceCounters(),
 ) {
+    // Additive V2 hook. V1 ImageCacheManager/correlation ownership is never
+    // consulted by this route; a per-view #101 binding installs the Camera2 hook.
+    private var v2ExposureHook: ((CaptureAttemptQualifierV2, Set<CaptureComponentKind>, SharedCameraExposureCallbackV2) -> Boolean)? = null
+    private var v2CancelHook: ((CaptureAttemptQualifierV2) -> Unit)? = null
+
+    internal fun installAttemptQualifiedExposureHookV2(
+        request: (CaptureAttemptQualifierV2, Set<CaptureComponentKind>, SharedCameraExposureCallbackV2) -> Boolean,
+        cancel: (CaptureAttemptQualifierV2) -> Unit = {},
+    ) { v2ExposureHook = request; v2CancelHook = cancel }
+
+    internal fun requestAttemptQualifiedExposureV2(
+        qualifier: CaptureAttemptQualifierV2,
+        required: Set<CaptureComponentKind>,
+        callback: SharedCameraExposureCallbackV2,
+    ): Boolean = v2ExposureHook?.invoke(qualifier, required, callback) ?: false
+
+    internal fun cancelAttemptQualifiedExposureV2(qualifier: CaptureAttemptQualifierV2) {
+        v2CancelHook?.invoke(qualifier)
+    }
+
     companion object {
         private const val VendorCameraDrainWindowMs = 3_500L
         private const val ShutdownCompletionPollMs = 50L

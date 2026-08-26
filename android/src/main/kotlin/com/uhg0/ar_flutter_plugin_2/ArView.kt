@@ -17,6 +17,7 @@ import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.NotTrackingException
 import com.uhg0.ar_flutter_plugin_2.capture.ArCaptureSession
+import com.uhg0.ar_flutter_plugin_2.capture.CaptureSafetySignalV2
 import com.uhg0.ar_flutter_plugin_2.capture.CaptureSessionException
 import com.uhg0.ar_flutter_plugin_2.capture.PoseBatchDispatcher
 import com.uhg0.ar_flutter_plugin_2.sceneview.PluginAnchorRecord
@@ -123,6 +124,9 @@ internal class ArView(
         isDebuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0,
     )
     private val visibilityObservationDebugGate = VisibilityObservationDebugGate()
+    // #101 owns this native proof only.  It remains false until an internal
+    // V2 capture owner binds one exact durable attempt/cut; Dart cannot enable it.
+    private val captureSafetySignalV2 = CaptureSafetySignalV2()
     private val visibilityObservationMappingAdmission = AndroidVisibilityGridMappingAdmission(
         ownership = visibilityGridV2Binding::currentObservationOwnership,
         beforeAdmission = visibilityObservationDebugGate::awaitIfArmed,
@@ -130,8 +134,7 @@ internal class ArView(
     private val visibilityObservationRuntime = AndroidVisibilityGridRuntime(
         ownership = visibilityGridV2Binding::currentObservationOwnership,
         mapper = visibilityObservationMappingAdmission,
-        // #61 will own positive capture-safety proof. M2 must default false.
-        captureSafe = VisibilityCaptureSafePredicate.CONSERVATIVE,
+        captureSafe = captureSafetySignalV2,
     )
     private val visibilityObservationSource = ArCoreVisibilityObservationSource(
         runtime = visibilityObservationRuntime,
@@ -189,6 +192,7 @@ internal class ArView(
         onCaptureFinalized = { value ->
             scope.launch { captureChannel.invokeMethod("onCaptureFinalized", value) }
         },
+        captureSafetySignalV2 = captureSafetySignalV2,
     )
 
     private fun setCoverageRendererMounted(mounted: Boolean, generation: Long) {
@@ -202,6 +206,7 @@ internal class ArView(
         override fun onPause(owner: LifecycleOwner) {
             resumeCoordinator.invalidate(ResumeTerminal.SUPERSEDED)
             visibilityObservationRuntime.pause()
+            captureSafetySignalV2.invalidateLifecycleForViewPause()
             visibilityGridChannel.pause()
             captureSession.onSessionPaused()
             sceneHost.pause()
@@ -275,6 +280,7 @@ internal class ArView(
         // state until Camera2 shutdown completes.
         sceneHost.pause()
         visibilityObservationRuntime.pause()
+        captureSafetySignalV2.invalidateAll()
         captureSession.onSessionPaused()
     }
 
