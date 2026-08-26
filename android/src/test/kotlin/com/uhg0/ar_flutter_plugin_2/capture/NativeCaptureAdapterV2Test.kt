@@ -3,7 +3,9 @@ package com.uhg0.ar_flutter_plugin_2.capture
 import java.io.File
 import java.io.InputStream
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -511,6 +513,111 @@ class NativeCaptureAdapterV2Test {
     }
 
     @Test
+    fun `streaming store io does not hold adapter state ownership`() {
+        val store = FakeStore().apply {
+            commitEntered = CountDownLatch(1)
+            commitRelease = CountDownLatch(1)
+        }
+        val camera = FakeExposure()
+        val adapter = NativeCaptureAdapterV2(store, camera)
+        val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG))
+        adapter.admit(request)
+        val executor = Executors.newFixedThreadPool(3)
+        try {
+            val commit = executor.submit {
+                camera.components(
+                    camera.requests.single().first,
+                    request,
+                    listOf(CaptureComponentKind.JPEG),
+                )
+            }
+            assertTrue(store.commitEntered!!.await(5, TimeUnit.SECONDS))
+
+            assertEquals(
+                1,
+                executor.submit(java.util.concurrent.Callable { adapter.snapshot().running })
+                    .get(500, TimeUnit.MILLISECONDS),
+            )
+            executor.submit {
+                adapter.onLifecycle(
+                    CaptureLifecycleEvent.BACKGROUNDED,
+                    request.accepted.identity.lifecycleCut,
+                )
+            }.get(500, TimeUnit.MILLISECONDS)
+
+            store.commitRelease!!.countDown()
+            commit.get(5, TimeUnit.SECONDS)
+        } finally {
+            store.commitRelease?.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `lifecycle cut during durable acceptance returns promptly and prevents exposure`() {
+        val store = FakeStore().apply {
+            acceptEntered = CountDownLatch(1)
+            acceptRelease = CountDownLatch(1)
+        }
+        val camera = FakeExposure()
+        val adapter = NativeCaptureAdapterV2(store, camera)
+        val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG))
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val admission = executor.submit(java.util.concurrent.Callable { adapter.admit(request) })
+            assertTrue(store.acceptEntered!!.await(5, TimeUnit.SECONDS))
+
+            executor.submit {
+                adapter.onLifecycle(
+                    CaptureLifecycleEvent.BACKGROUNDED,
+                    request.accepted.identity.lifecycleCut,
+                )
+            }.get(500, TimeUnit.MILLISECONDS)
+
+            store.acceptRelease!!.countDown()
+            assertEquals(CaptureTerminalKind.ABANDONED_ATTEMPT, admission.get(5, TimeUnit.SECONDS).terminal?.kind)
+            assertTrue(camera.requests.isEmpty())
+            assertEquals(0, adapter.snapshot().running)
+        } finally {
+            store.acceptRelease?.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `close waits for transferred store ownership and fences later callbacks`() {
+        val store = FakeStore().apply {
+            commitEntered = CountDownLatch(1)
+            commitRelease = CountDownLatch(1)
+        }
+        val camera = FakeExposure()
+        val adapter = NativeCaptureAdapterV2(store, camera)
+        val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG))
+        adapter.admit(request)
+        val qualifier = camera.requests.single().first
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val commit = executor.submit {
+                camera.components(qualifier, request, listOf(CaptureComponentKind.JPEG))
+            }
+            assertTrue(store.commitEntered!!.await(5, TimeUnit.SECONDS))
+            val close = executor.submit { adapter.close() }
+            assertThrows(TimeoutException::class.java) { close.get(100, TimeUnit.MILLISECONDS) }
+
+            store.commitRelease!!.countDown()
+            commit.get(5, TimeUnit.SECONDS)
+            close.get(5, TimeUnit.SECONDS)
+
+            val late = camera.components(qualifier, request, listOf(CaptureComponentKind.JPEG))
+            assertEquals(1, late.single().closeCalls)
+            assertEquals(1L, adapter.snapshot().lateCallbacks)
+        } finally {
+            store.commitRelease?.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
     fun `every lifecycle event transfers post-exposure ownership as unknown and late components close`() {
         CaptureLifecycleEvent.entries.forEachIndexed { index, event ->
             val store = FakeStore()
@@ -626,6 +733,10 @@ class NativeCaptureAdapterV2Test {
         val terminals = mutableListOf<CaptureReceipt>()
         val queries = mutableListOf<CaptureAttemptIdentity>()
         var failCommitAfterReads: Int? = null
+        var acceptEntered: CountDownLatch? = null
+        var acceptRelease: CountDownLatch? = null
+        var commitEntered: CountDownLatch? = null
+        var commitRelease: CountDownLatch? = null
         override fun replayFenceBeforeExposure(request: CaptureCommitRequest): CaptureReceipt? {
             terminals.firstOrNull { it.identity == request.accepted.identity }?.let { prior ->
                 if (accepted.first { it.accepted.identity == request.accepted.identity } == request) return prior
@@ -638,6 +749,8 @@ class NativeCaptureAdapterV2Test {
             return null
         }
         override fun acceptBeforeExposure(request: CaptureCommitRequest): CaptureReceipt {
+            acceptEntered?.countDown()
+            acceptRelease?.await(5, TimeUnit.SECONDS)
             terminals.firstOrNull { it.identity == request.accepted.identity }?.let { prior ->
                 if (accepted.first { it.accepted.identity == request.accepted.identity } == request) return prior
                 throw DurableStoreConflictV2("changed terminal replay")
@@ -650,6 +763,8 @@ class NativeCaptureAdapterV2Test {
             return CaptureReceipt(request.accepted.identity, CaptureAttemptPhase.RESERVED_ACCEPTED, "accepted", "accepted", true)
         }
         override fun commitStreamed(request: CaptureCommitRequest, streams: List<CaptureComponentStreamV2>): CaptureReceipt {
+            commitEntered?.countDown()
+            commitRelease?.await(5, TimeUnit.SECONDS)
             failCommitAfterReads?.let { reads ->
                 repeat(reads) { streams.first().input.read() }
                 throw DurableStoreConflictV2("injected store rejection")

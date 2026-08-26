@@ -7,6 +7,8 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 /**
  * The native-only #101 store boundary.  Its component inputs are transferred
@@ -285,9 +287,13 @@ internal class NativeCaptureBindingV2(
     private var closed = false
     private val bridge = SharedCameraManagerExposurePortV2(
         request = { qualifier, required, callback ->
-            synchronized(lock) { sharedCamera?.requestAttemptQualifiedExposureV2(qualifier, required, callback) ?: false }
+            val manager = synchronized(lock) { if (closed) null else sharedCamera }
+            manager?.requestAttemptQualifiedExposureV2(qualifier, required, callback) ?: false
         },
-        cancel = { qualifier -> synchronized(lock) { sharedCamera?.cancelAttemptQualifiedExposureV2(qualifier) } },
+        cancel = { qualifier ->
+            val manager = synchronized(lock) { sharedCamera }
+            manager?.cancelAttemptQualifiedExposureV2(qualifier)
+        },
     )
     private val recovery = NativeCaptureRecoveryDispatcherV2(
         recover = { shouldContinue -> store.recoverAndProject(shouldContinue = shouldContinue) },
@@ -314,10 +320,12 @@ internal class NativeCaptureBindingV2(
         // cache/correlation APIs.
     }
     fun detachSharedCamera(manager: SharedCameraManager) = synchronized(lock) { if (sharedCamera === manager) sharedCamera = null }
-    fun admit(request: CaptureCommitRequest): CaptureReceipt = synchronized(lock) {
-        check(!closed) { "NativeCaptureBindingV2 is closed" }
-        recovery.requireAdmissionReady()
-        adapter.admit(request)
+    fun admit(request: CaptureCommitRequest): CaptureReceipt {
+        synchronized(lock) {
+            check(!closed) { "NativeCaptureBindingV2 is closed" }
+            recovery.requireAdmissionReady()
+        }
+        return adapter.admit(request)
     }
     fun onLifecycle(event: CaptureLifecycleEvent, cut: CaptureLifecycleCut) = adapter.onLifecycle(event, cut)
     fun onLifecycle(event: CaptureLifecycleEvent) = adapter.onLifecycle(event)
@@ -337,14 +345,16 @@ internal class NativeCaptureBindingV2(
         cancel: (CaptureAttemptQualifierV2) -> Unit = {},
     ) = synchronized(lock) { sharedCamera?.installAttemptQualifiedExposureHookV2(request, cancel) }
 
-    override fun close() = synchronized(lock) {
-        if (closed) return@synchronized
-        closed = true
+    override fun close() {
+        synchronized(lock) {
+            if (closed) return
+            closed = true
+        }
         deadlineScheduler.shutdownNow()
         recovery.close()
         adapter.onLifecycle(CaptureLifecycleEvent.VIEW_REPLACED)
         adapter.close()
-        sharedCamera = null
+        synchronized(lock) { sharedCamera = null }
         store.close()
         budget.close()
     }
@@ -443,31 +453,38 @@ internal class NativeCaptureAdapterV2(
         var exposureRequested: Boolean = false,
         var tenSecondPresented: Boolean = false,
     )
-    private val lock = Any()
+    private val lock = ReentrantLock(true)
+    private val storeIdle = lock.newCondition()
+    private val admissionLock = ReentrantLock(true)
     private val scheduler = CaptureFinalizerScheduler()
     private val counters = CaptureResourceCountersV2()
     private val work = linkedMapOf<CaptureAttemptIdentity, Work>()
     private var closed = false
+    private var closing = false
+    private var storeOperations = 0
     private var lifecycleDrain = false
+    private var lifecycleGeneration = 0L
     private var nextExposureGeneration = 0L
 
-    fun admit(request: CaptureCommitRequest): CaptureReceipt = synchronized(lock) {
-        check(!closed) { "NativeCaptureAdapterV2 is closed" }
+    fun admit(request: CaptureCommitRequest): CaptureReceipt = admissionLock.withLock { lock.withLock {
+        check(!closed && !closing) { "NativeCaptureAdapterV2 is closed" }
+        val admissionLifecycleGeneration = lifecycleGeneration
         val accepted = request.accepted
         validateReservationLiabilities(accepted)
         work[accepted.identity]?.let { active ->
-            if (active.request == request) return@synchronized active.acceptedReceipt
+            if (active.request == request) return@withLock active.acceptedReceipt
             throw DurableStoreConflictV2("Changed replay conflicts with active capture identity")
         }
         check(work.values.none { it.request.accepted.lane == accepted.lane }) {
             "lane-capacity-${accepted.lane.name.lowercase()}"
         }
-        store.replayFenceBeforeExposure(request)?.let { replay ->
-            if (replay.terminal != null) return@synchronized replay
+        storeCallLocked { store.replayFenceBeforeExposure(request) }?.let { replay ->
+            if (replay.terminal != null) return@withLock replay
             // A durable accepted identity from a prior owner is outcome-unknown.
             // Fence it metadata-only; never infer that a second shutter is safe.
-            return@synchronized abandonLocked(request, "durable-replay-no-reexposure")
+            return@withLock abandonLocked(request, "durable-replay-no-reexposure")
         }
+        check(lifecycleGeneration == admissionLifecycleGeneration && !closing) { "lifecycle-cut-during-admission" }
 
         // Capacity and protected-manual priority are settled before durable
         // acceptance. A waiting automatic owner is optional and yields to a
@@ -484,33 +501,46 @@ internal class NativeCaptureAdapterV2(
         check(assignment.position != CaptureFinalizerPosition.REJECTED) { "finalizer-capacity" }
 
         val receipt = try {
-            store.acceptBeforeExposure(request)
+            storeCallLocked { store.acceptBeforeExposure(request) }
         } catch (error: Throwable) {
             scheduler.release(accepted.identity)
             scheduler.running?.let { next -> work[next.identity]?.let(::startLocked) }
             throw error
         }
+        if (lifecycleGeneration != admissionLifecycleGeneration || closing) {
+            scheduler.release(accepted.identity)
+            val terminal = CaptureTerminal(
+                CaptureTerminalKind.ABANDONED_ATTEMPT,
+                accepted.identity,
+                "lifecycle-cut-during-admission",
+                "lifecycle-cut-during-admission",
+            )
+            val abandoned = storeCallLocked { store.abandon(request, terminal) }
+            finishLocked(null, abandoned, request.recoveryContext)
+            return@withLock abandoned
+        }
         if (receipt.terminal != null) {
             scheduler.release(accepted.identity)
             scheduler.running?.let { next -> work[next.identity]?.let(::startLocked) }
-            return@synchronized receipt
+            return@withLock receipt
         }
         val qualifier = CaptureAttemptQualifierV2(accepted.identity, accepted.identity.lifecycleCut, ++nextExposureGeneration)
         work[accepted.identity] = Work(request, receipt, nowMs(), qualifier)
-        events(NativeCaptureEventV2(NativeCaptureEventKindV2.ACCEPTED, accepted.identity.attemptId))
+        emitLocked(NativeCaptureEventV2(NativeCaptureEventKindV2.ACCEPTED, accepted.identity.attemptId))
         if (assignment.position == CaptureFinalizerPosition.RUNNING) startLocked(work.getValue(accepted.identity))
         receipt
-    }
+    } }
 
-    fun onLifecycle(event: CaptureLifecycleEvent, cut: CaptureLifecycleCut) = synchronized(lock) {
+    fun onLifecycle(event: CaptureLifecycleEvent, cut: CaptureLifecycleCut) = lock.withLock {
         drainLifecycleLocked(event, setOf(cut))
     }
 
-    fun onLifecycle(event: CaptureLifecycleEvent) = synchronized(lock) {
+    fun onLifecycle(event: CaptureLifecycleEvent) = lock.withLock {
         drainLifecycleLocked(event, work.values.map { it.qualifier.lifecycleCut }.toSet())
     }
 
     private fun drainLifecycleLocked(event: CaptureLifecycleEvent, cuts: Set<CaptureLifecycleCut>) {
+        lifecycleGeneration += 1
         val runningBefore = scheduler.running?.identity
         lifecycleDrain = true
         try {
@@ -542,7 +572,7 @@ internal class NativeCaptureAdapterV2(
     }
 
     /** 10 s stops stalled automatic ownership; 30 s queries/rebases exactly once without a shutter retry. */
-    fun advanceDeadlines() = synchronized(lock) {
+    fun advanceDeadlines() = lock.withLock {
         val now = nowMs()
         work.values.toList().forEach { value ->
             val elapsed = now - value.acceptedAtMs
@@ -556,25 +586,29 @@ internal class NativeCaptureAdapterV2(
     }
 
     /** Debug-only platform-view selector seam; production recovery uses deadlines. */
-    internal fun forceRecoveryForDebug() = synchronized(lock) {
+    internal fun forceRecoveryForDebug() = lock.withLock {
         work.values.toList().forEach { queryOrAbandonLocked(it, "debug-terminal-query") }
     }
 
-    fun snapshot(): CaptureResourceSnapshotV2 = synchronized(lock) {
+    fun snapshot(): CaptureResourceSnapshotV2 = lock.withLock {
         counters.snapshot(if (scheduler.running == null) 0 else 1, if (scheduler.fundedWaiting == null) 0 else 1)
     }
 
-    internal fun waitingIdentityForTest(): CaptureAttemptIdentity? = synchronized(lock) {
+    internal fun waitingIdentityForTest(): CaptureAttemptIdentity? = lock.withLock {
         scheduler.fundedWaiting?.identity
     }
 
-    override fun close() = synchronized(lock) {
-        if (closed) return@synchronized
+    override fun close() = lock.withLock {
+        if (closed || closing) return@withLock
+        closing = true
+        lifecycleGeneration += 1
+        while (storeOperations != 0) storeIdle.await()
         closed = true
         work.values.toList().forEach { value ->
             if (value.exposureRequested) transferUnknownLocked(value, "shutdown-transfer")
             else abandonLocked(value.request, "shutdown-before-exposure")
         }
+        closing = false
     }
 
     private fun startLocked(value: Work) {
@@ -584,7 +618,9 @@ internal class NativeCaptureAdapterV2(
         safety.bind(value.qualifier, value.acceptedReceipt)
         value.exposureRequested = true
         val requested = try {
-            exposure.requestExposure(value.qualifier, value.request.accepted.profile.requiredComponents, callback)
+            externalCallLocked {
+                exposure.requestExposure(value.qualifier, value.request.accepted.profile.requiredComponents, callback)
+            }
         } catch (_: Throwable) {
             safety.release(value.qualifier)
             false
@@ -604,44 +640,54 @@ internal class NativeCaptureAdapterV2(
     }
 
     private val callback = object : SharedCameraExposureCallbackV2 {
-        override fun onComponents(components: SharedCameraComponentSetV2) = synchronized(lock) {
-            val value = work[components.qualifier.identity]
-            if (value == null || value.qualifier != components.qualifier || scheduler.running?.identity != components.qualifier.identity || closed) {
-                closeStreams(components.streams); counters.lateCallback(); return@synchronized
+        override fun onComponents(components: SharedCameraComponentSetV2) {
+            val ownedWork = lock.withLock {
+                val value = work[components.qualifier.identity]
+                if (value == null || value.qualifier != components.qualifier || scheduler.running?.identity != components.qualifier.identity || closed) {
+                    closeStreams(components.streams); counters.lateCallback(); return
+                }
+                val kinds = components.streams.map { it.kind }
+                if (kinds.size != kinds.toSet().size || kinds.toSet() != value.request.accepted.profile.requiredComponents) {
+                    closeStreams(components.streams); abandonLocked(value.request, "malformed-component-set"); return
+                }
+                val owned = components.streams.map { stream ->
+                    CaptureComponentStreamV2(stream.kind, CloseOnceInputStreamV2(stream.input))
+                }
+                beginStoreOperationLocked()
+                emitLocked(NativeCaptureEventV2(NativeCaptureEventKindV2.FINALIZING, value.request.accepted.identity.attemptId))
+                value to owned
             }
-            val kinds = components.streams.map { it.kind }
-            if (kinds.size != kinds.toSet().size || kinds.toSet() != value.request.accepted.profile.requiredComponents) {
-                closeStreams(components.streams); abandonLocked(value.request, "malformed-component-set"); return@synchronized
-            }
-            val owned = components.streams.map { stream ->
-                CaptureComponentStreamV2(stream.kind, CloseOnceInputStreamV2(stream.input))
-            }
+            val (value, owned) = ownedWork
             try {
-                events(NativeCaptureEventV2(NativeCaptureEventKindV2.FINALIZING, value.request.accepted.identity.attemptId))
                 val receipt = store.commitStreamed(
                     value.request,
                     components.exposureTimestampNanoseconds,
                     owned,
                 )
-                finishLocked(value, receipt)
+                lock.withLock {
+                    if (work[value.request.accepted.identity] === value) finishLocked(value, receipt)
+                }
             } catch (_: Throwable) {
                 // Store errors after a streaming handoff are an exact identity query, never another request.
-                queryOrAbandonLocked(value, "store-unknown")
+                lock.withLock {
+                    if (work[value.request.accepted.identity] === value) queryOrAbandonLocked(value, "store-unknown")
+                }
             } finally {
                 owned.forEach { runCatching { it.input.close() } }
                 counters.componentsClosed(owned.size)
+                lock.withLock { endStoreOperationLocked() }
             }
         }
 
-        override fun onFailure(qualifier: CaptureAttemptQualifierV2, reason: String) = synchronized(lock) {
+        override fun onFailure(qualifier: CaptureAttemptQualifierV2, reason: String) = lock.withLock {
             val value = work[qualifier.identity]
-            if (value == null || value.qualifier != qualifier || closed) { counters.lateCallback(); return@synchronized }
+            if (value == null || value.qualifier != qualifier || closed) { counters.lateCallback(); return@withLock }
             abandonLocked(value.request, "camera-$reason")
         }
     }
 
     private fun queryOrAbandonLocked(value: Work, reason: String) {
-        events(
+        emitLocked(
             NativeCaptureEventV2(
                 NativeCaptureEventKindV2.RECOVERING,
                 value.request.accepted.identity.attemptId,
@@ -650,15 +696,20 @@ internal class NativeCaptureAdapterV2(
             ),
         )
         counters.unknownQuery()
-        val receipt = store.queryReceipt(value.request.accepted.identity)
+        val receipt = storeCallLocked { store.queryReceipt(value.request.accepted.identity) }
+        if (work[value.request.accepted.identity] !== value) return
         if (receipt?.terminal != null) { finishLocked(value, receipt); return }
         // Rebase only a durable prepared/committed identity; the port rejects changed bytes.
-        runCatching { store.rebaseSameAttempt(value.request) }.getOrNull()?.let { finishLocked(value, it); return }
+        runCatching { storeCallLocked { store.rebaseSameAttempt(value.request) } }.getOrNull()?.let {
+            if (work[value.request.accepted.identity] === value) finishLocked(value, it)
+            return
+        }
+        if (work[value.request.accepted.identity] !== value) return
         abandonLocked(value.request, reason)
     }
 
     private fun presentUnknownLocked(value: Work, reason: String) {
-        events(
+        emitLocked(
             NativeCaptureEventV2(
                 NativeCaptureEventKindV2.RECOVERING,
                 value.request.accepted.identity.attemptId,
@@ -667,8 +718,10 @@ internal class NativeCaptureAdapterV2(
             ),
         )
         counters.unknownQuery()
-        store.queryReceipt(value.request.accepted.identity)?.takeIf { it.terminal != null }
-            ?.let { finishLocked(value, it) }
+        storeCallLocked { store.queryReceipt(value.request.accepted.identity) }?.takeIf { it.terminal != null }
+            ?.let { receipt ->
+                if (work[value.request.accepted.identity] === value) finishLocked(value, receipt)
+            }
     }
 
     private fun lifecycleTransferLocked(value: Work, reason: String) {
@@ -679,16 +732,16 @@ internal class NativeCaptureAdapterV2(
     private fun transferUnknownLocked(value: Work, reason: String) {
         presentUnknownLocked(value, reason)
         if (work[value.request.accepted.identity] !== value) return
-        exposure.cancelExposure(value.qualifier)
         safety.release(value.qualifier)
         work.remove(value.request.accepted.identity)
         scheduler.release(value.request.accepted.identity)
+        externalCallLocked { exposure.cancelExposure(value.qualifier) }
     }
 
     private fun abandonLocked(request: CaptureCommitRequest, reason: String): CaptureReceipt {
         val accepted = request.accepted
         val terminal = CaptureTerminal(CaptureTerminalKind.ABANDONED_ATTEMPT, accepted.identity, reason, reason)
-        val receipt = store.abandon(request, terminal)
+        val receipt = storeCallLocked { store.abandon(request, terminal) }
         finishLocked(work[accepted.identity], receipt, request.recoveryContext)
         return receipt
     }
@@ -699,12 +752,13 @@ internal class NativeCaptureAdapterV2(
         recoveryContext: NativeCaptureRecoveryContextV2? = value?.request?.recoveryContext,
     ) {
         val identity = receipt.identity
-        value?.let { exposure.cancelExposure(it.qualifier); safety.release(it.qualifier) }
         work.remove(identity)
         scheduler.release(identity)
+        value?.let { safety.release(it.qualifier) }
+        value?.let { externalCallLocked { exposure.cancelExposure(it.qualifier) } }
         if (receipt.terminal?.kind == CaptureTerminalKind.COMMITTED_PICTURE) counters.committed() else counters.abandoned()
         val terminal = receipt.terminal
-        events(
+        emitLocked(
             NativeCaptureEventV2(
                 if (terminal?.kind == CaptureTerminalKind.COMMITTED_PICTURE) {
                     NativeCaptureEventKindV2.COMMITTED
@@ -719,13 +773,49 @@ internal class NativeCaptureAdapterV2(
                 recoveryContext = recoveryContext,
             ),
         )
-        events(NativeCaptureEventV2(NativeCaptureEventKindV2.HEALTH, resources = snapshot()))
+        emitLocked(NativeCaptureEventV2(NativeCaptureEventKindV2.HEALTH, resources = snapshot()))
         if (!lifecycleDrain) scheduler.running?.let { next -> work[next.identity]?.let(::startLocked) }
     }
 
     private fun closeStreams(streams: List<CaptureComponentStreamV2>) {
         streams.forEach { runCatching { it.input.close() } }
         counters.componentsClosed(streams.size)
+    }
+
+    private inline fun <T> storeCallLocked(block: () -> T): T {
+        check(lock.isHeldByCurrentThread)
+        beginStoreOperationLocked()
+        return try {
+            externalCallLocked(block)
+        } finally {
+            endStoreOperationLocked()
+        }
+    }
+
+    private fun beginStoreOperationLocked() {
+        check(lock.isHeldByCurrentThread)
+        storeOperations += 1
+    }
+
+    private fun endStoreOperationLocked() {
+        check(lock.isHeldByCurrentThread)
+        storeOperations -= 1
+        check(storeOperations >= 0)
+        if (storeOperations == 0) storeIdle.signalAll()
+    }
+
+    private inline fun <T> externalCallLocked(block: () -> T): T {
+        check(lock.isHeldByCurrentThread && lock.holdCount == 1)
+        lock.unlock()
+        return try {
+            block()
+        } finally {
+            lock.lock()
+        }
+    }
+
+    private fun emitLocked(event: NativeCaptureEventV2) {
+        externalCallLocked { events(event) }
     }
 
     private fun validateReservationLiabilities(accepted: CaptureAcceptedAttempt) {
