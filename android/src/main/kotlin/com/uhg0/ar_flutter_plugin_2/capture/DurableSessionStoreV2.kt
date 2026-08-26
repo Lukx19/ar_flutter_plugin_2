@@ -15,6 +15,15 @@ private const val ABANDONMENT_BINDING_FULL_REQUEST = "full-request-v1"
 private const val ABANDONMENT_BINDING_METADATA_ONLY = "metadata-only-v1"
 private const val ABANDONMENT_BINDING_RECOVERED = "recovered-proven-absent-v1"
 
+/** Immutable non-image fields frozen at durable acceptance; descriptors arrive after shutter. */
+internal data class CapturePostOutputTemplateV2(
+    val accepted: CaptureAcceptedAttempt,
+    val poseRecordHash: List<Int>,
+    val cameraModelHash: List<Int>,
+    val validationRecordHash: List<Int>,
+    val ledgerRecordHash: List<Int>,
+)
+
 /**
  * Schema-5 capture-store implementation for the frozen #99 port.  V1 files
  * are not inspected or modified.  Every durable record is immutable and the
@@ -151,6 +160,73 @@ class DurableSessionStoreV2(
             if (!files.isFile(receiptFile(location, request.accepted.identity))) {
                 deleteTree(staging, DurableStoreFaultPointV2.DELETE_RECLAIM)
             }
+            throw error
+        }
+    }
+
+    /**
+     * The direct Camera2 path: accepted identity and reservation already exist,
+     * then the store consumes each sole native stream once into staging while
+     * calculating its descriptor.  No descriptor placeholder or replayable
+     * image payload exists outside this method.
+     */
+    internal fun commitStreamedFinalized(
+        template: CapturePostOutputTemplateV2,
+        exposureTimestampNanoseconds: Long,
+        streams: List<CaptureComponentStreamV2>,
+    ): CaptureReceipt = synchronized(mutex) {
+        val identity = template.accepted.identity
+        val location = location(identity)
+        tombstone(location)?.let { throw DurableStoreConflictV2("Session is tombstoned") }
+        receipt(location, identity)?.let { return@synchronized it }
+        val accepted = readProperties(acceptedFile(location, identity))
+        check(accepted.getProperty("acceptedHash") == acceptedHash(template.accepted)) { "Attempt was not durably accepted" }
+        check(streams.map { it.kind }.toSet() == template.accepted.profile.requiredComponents && streams.size == streams.map { it.kind }.toSet().size) {
+            "Stream component set is incomplete or duplicated"
+        }
+        val reservation = budget.reservation(accepted.getProperty("reservationToken"))
+            ?: throw IllegalStateException("Accepted attempt has no live reservation")
+        val staging = path(attemptDirectory(location, identity), "staging")
+        files.ensureDirectory(staging)
+        var actualBytes = 0L
+        try {
+            val staged = streams.sortedBy { it.kind.ordinal }.map { stream ->
+                val file = path(staging, "${stream.kind.name.lowercase()}.part")
+                faults.at(DurableStoreFaultPointV2.COMPONENT_OPEN)
+                val measured = files.streamExclusive(file, stream.input)
+                faults.at(DurableStoreFaultPointV2.LENGTH_CHECK)
+                actualBytes = Math.addExact(actualBytes, measured.first)
+                val hash = measured.second.map { it.toInt() and 0xff }
+                val descriptor = CaptureComponentDescriptor(stream.kind, measured.first, hash, measured.second.hex())
+                Staged(stream.kind, file, descriptor)
+            }
+            check(actualBytes <= reservation.bytes && actualBytes <= template.accepted.profile.maximumComponentBytes) { "Component bytes exceed accepted reservation" }
+            val request = CaptureCommitRequest(
+                template.accepted, staged.map { it.descriptor }, exposureTimestampNanoseconds,
+                template.poseRecordHash, template.cameraModelHash, template.validationRecordHash, template.ledgerRecordHash,
+            )
+            val requestHash = requestHash(request)
+            val captureId = safe(identity.attemptId)
+            val assets = path(location, "assets", captureId).also(files::ensureDirectory)
+            staged.forEach { moveImmutable(it.file, path(assets, "${it.kind.name.lowercase()}.${it.descriptor.sha256.hex()}.blob"), it.descriptor) }
+            val prior = selectedRoot(location)
+            val revision = (prior?.revision ?: 0L) + 1L
+            val rootBytes = rootRecord(request, requestHash, revision, staged, prior)
+            val rootHash = sha256(rootBytes).hex()
+            faults.at(DurableStoreFaultPointV2.ROOT_WRITE)
+            writeImmutable(path(location, "objects", "$rootHash.root"), rootBytes)
+            faults.at(DurableStoreFaultPointV2.ROOT_FILE_SYNC)
+            val terminal = CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, identity, requestHash, "committed", captureId, revision, rootHash)
+            val committed = CaptureReceipt(identity, CaptureAttemptPhase.COMMITTED_PICTURE, requestHash, receiptHash(requestHash, rootHash), true, terminal)
+            faults.at(DurableStoreFaultPointV2.RECEIPT_WRITE)
+            writePropertiesExclusive(receiptFile(location, identity), receiptProperties(committed, rootHash))
+            faults.at(DurableStoreFaultPointV2.RECEIPT_FILE_SYNC)
+            publishPointer(location, RootPointer(revision, rootHash, identity.commitId))
+            budget.commit(reservation, actualBytes)
+            deleteTree(staging, DurableStoreFaultPointV2.DELETE_RECLAIM)
+            committed
+        } catch (error: Throwable) {
+            if (!files.isFile(receiptFile(location, identity))) deleteTree(staging, DurableStoreFaultPointV2.DELETE_RECLAIM)
             throw error
         }
     }
