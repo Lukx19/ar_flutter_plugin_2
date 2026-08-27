@@ -659,19 +659,21 @@ class VisibilityGridMethodChannel(
                 ).also {
                     lastEmittedGeometryRevision = it.geometryRevision
                     lastEmittedHealth = currentHealth(it.diagnostics)
-                    check(
-                        renderer?.applyGeometry(
-                            revision = it.geometryRevision,
-                            reset = true,
-                            upsertKeys = it.upsertKeys.toLongArray(),
-                            removalKeys = it.removalKeys.toLongArray(),
-                            selectedKeysForResetOrReplacement = {
-                                active.selectedRenderKeys(
-                                    checkNotNull(renderer).capacity,
-                                )
-                            },
-                        ) == true,
-                    )
+                    if (VisibilityGridInitialHandoffPolicy.applyOnStart(summaryOnly)) {
+                        check(
+                            renderer?.applyGeometry(
+                                revision = it.geometryRevision,
+                                reset = true,
+                                upsertKeys = it.upsertKeys.toLongArray(),
+                                removalKeys = it.removalKeys.toLongArray(),
+                                selectedKeysForResetOrReplacement = {
+                                    active.selectedRenderKeys(
+                                        checkNotNull(renderer).capacity,
+                                    )
+                                },
+                            ) == true,
+                        )
+                    }
                 }
             }
         publishRenderer()
