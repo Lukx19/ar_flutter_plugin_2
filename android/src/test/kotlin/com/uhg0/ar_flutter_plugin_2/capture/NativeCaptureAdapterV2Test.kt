@@ -569,6 +569,111 @@ class NativeCaptureAdapterV2Test {
     }
 
     @Test
+    fun `synchronous submit failure returning false is terminal before exposure`() {
+        val store = FakeStore()
+        val events = mutableListOf<NativeCaptureEventV2>()
+        var requests = 0
+        var acceptedCallback: SharedCameraExposureCallbackV2? = null
+        var acceptedQualifier: CaptureAttemptQualifierV2? = null
+        val camera = object : SharedCameraExposurePortV2 {
+            override fun requestExposure(
+                qualifier: CaptureAttemptQualifierV2,
+                required: Set<CaptureComponentKind>,
+                callback: SharedCameraExposureCallbackV2,
+            ): Boolean {
+                requests += 1
+                if (requests == 1) {
+                    callback.onFailure(qualifier, "camera-submit")
+                    return false
+                }
+                acceptedCallback = callback
+                acceptedQualifier = qualifier
+                return true
+            }
+
+            override fun cancelExposure(qualifier: CaptureAttemptQualifierV2) = Unit
+        }
+        val adapter = NativeCaptureAdapterV2(store, camera, events = events::add)
+        val rejected = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 1)
+        adapter.admit(rejected)
+
+        var health = adapter.snapshot()
+        assertEquals(0L, health.exposures)
+        assertEquals(0L, health.committed)
+        assertEquals(0L, health.abandoned)
+        assertEquals(0L, health.unknownQueries)
+        assertEquals(0, health.running)
+        assertEquals(1, events.count { it.kind == NativeCaptureEventKindV2.ABANDONED })
+
+        val later = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 2)
+        adapter.admit(later)
+        acceptedCallback!!.onComponents(
+            SharedCameraComponentSetV2(
+                acceptedQualifier!!,
+                listOf(
+                    CaptureComponentStreamV2(
+                        CaptureComponentKind.JPEG,
+                        CloseTrackingInputStream(bytes(CaptureComponentKind.JPEG)),
+                    ),
+                ),
+            ),
+        )
+        health = adapter.snapshot()
+        assertEquals(1L, health.exposures)
+        assertEquals(1L, health.committed)
+        assertEquals(0L, health.abandoned)
+        assertEquals(0L, health.unknownQueries)
+    }
+
+    @Test
+    fun `funded waiting deadline abandons before exposure without unknown liability`() {
+        var clock = 0L
+        val store = FakeStore()
+        val camera = FakeExposure()
+        val events = mutableListOf<NativeCaptureEventV2>()
+        val adapter = NativeCaptureAdapterV2(store, camera, nowMs = { clock }, events = events::add)
+        val running = request(CaptureLane.AUTOMATIC, setOf(CaptureComponentKind.JPEG), ordinal = 1)
+        val waiting = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 2)
+        adapter.admit(running)
+        adapter.admit(waiting)
+
+        clock = 10_000L
+        adapter.advanceDeadlines()
+        var health = adapter.snapshot()
+        assertEquals(1L, health.exposures)
+        assertEquals(0L, health.committed)
+        assertEquals(0L, health.abandoned)
+        assertEquals(1L, health.unknownQueries)
+        assertEquals(1, health.running)
+        assertEquals(0, health.fundedWaiting)
+        assertTrue(
+            events.none {
+                it.kind == NativeCaptureEventKindV2.RECOVERING &&
+                    it.attemptId == waiting.accepted.identity.attemptId
+            },
+        )
+        assertEquals(
+            1,
+            events.count {
+                it.kind == NativeCaptureEventKindV2.ABANDONED &&
+                    it.attemptId == waiting.accepted.identity.attemptId
+            },
+        )
+
+        camera.components(camera.requests.first().first, running, listOf(CaptureComponentKind.JPEG))
+        val later = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 3)
+        adapter.admit(later)
+        camera.components(camera.requests.last().first, later, listOf(CaptureComponentKind.JPEG))
+        health = adapter.snapshot()
+        assertEquals(2L, health.exposures)
+        assertEquals(2L, health.committed)
+        assertEquals(0L, health.abandoned)
+        assertEquals(0L, health.unknownQueries)
+        assertEquals(0, health.running)
+        assertEquals(0, health.fundedWaiting)
+    }
+
+    @Test
     fun `safety signal is fail closed and invalidated with the exact lifecycle cut`() {
         val signal = CaptureSafetySignalV2()
         assertFalse(signal.isCaptureSafe())

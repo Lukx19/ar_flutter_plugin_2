@@ -464,6 +464,8 @@ internal class NativeCaptureAdapterV2(
         val qualifier: CaptureAttemptQualifierV2,
         var exposureRequested: Boolean = false,
         var exposureCounted: Boolean = false,
+        var submissionInFlight: Boolean = false,
+        var submissionFailure: String? = null,
         var tenSecondPresented: Boolean = false,
         var terminalClaimed: Boolean = false,
     )
@@ -590,6 +592,16 @@ internal class NativeCaptureAdapterV2(
         val now = nowMs()
         work.values.toList().forEach { value ->
             val elapsed = now - value.acceptedAtMs
+            if (!value.exposureRequested) {
+                if (elapsed >= AUTOMATIC_STALL_MS) {
+                    abandonLocked(value.request, "funded-waiting-timeout-before-exposure")
+                }
+                return@forEach
+            }
+            // The SharedCamera submission call runs without this lock. Its
+            // Boolean result, not a synchronous failure callback, establishes
+            // whether Camera2 accepted exposure ownership.
+            if (!value.exposureCounted) return@forEach
             if (elapsed >= TERMINAL_FENCE_MS) {
                 queryOrAbandonLocked(value, "terminal-fence-30s")
             } else if (elapsed >= AUTOMATIC_STALL_MS && !value.tenSecondPresented) {
@@ -601,7 +613,12 @@ internal class NativeCaptureAdapterV2(
 
     /** Debug-only platform-view selector seam; production recovery uses deadlines. */
     internal fun forceRecoveryForDebug() = lock.withLock {
-        work.values.toList().forEach { queryOrAbandonLocked(it, "debug-terminal-query") }
+        work.values.toList().forEach { value ->
+            when {
+                value.exposureCounted -> queryOrAbandonLocked(value, "debug-terminal-query")
+                !value.exposureRequested -> abandonLocked(value.request, "debug-before-exposure")
+            }
+        }
     }
 
     fun snapshot(): CaptureResourceSnapshotV2 = lock.withLock {
@@ -619,7 +636,7 @@ internal class NativeCaptureAdapterV2(
         while (storeOperations != 0) storeIdle.await()
         closed = true
         work.values.toList().forEach { value ->
-            if (value.exposureRequested) transferUnknownLocked(value, "shutdown-transfer")
+            if (value.exposureCounted) transferUnknownLocked(value, "shutdown-transfer")
             else abandonLocked(value.request, "shutdown-before-exposure")
         }
         closing = false
@@ -631,6 +648,7 @@ internal class NativeCaptureAdapterV2(
         // same stack. Binding afterwards would resurrect a stale true signal.
         safety.bind(value.qualifier, value.acceptedReceipt)
         value.exposureRequested = true
+        value.submissionInFlight = true
         val requested = try {
             externalCallLocked {
                 exposure.requestExposure(value.qualifier, value.request.accepted.profile.requiredComponents, callback)
@@ -643,13 +661,22 @@ internal class NativeCaptureAdapterV2(
         if (work[value.request.accepted.identity] !== value) {
             return
         }
+        value.submissionInFlight = false
+        val submissionFailure = value.submissionFailure
+        value.submissionFailure = null
         if (!requested) {
             value.exposureRequested = false
             safety.release(value.qualifier)
-            abandonLocked(value.request, "exposure-request-rejected")
+            abandonLocked(
+                value.request,
+                submissionFailure?.let { "camera-$it" } ?: "exposure-request-rejected",
+            )
             return
         }
         countExposureLocked(value)
+        if (submissionFailure != null) {
+            abandonLocked(value.request, "camera-$submissionFailure")
+        }
     }
 
     private val callback = object : SharedCameraExposureCallbackV2 {
@@ -696,7 +723,10 @@ internal class NativeCaptureAdapterV2(
         override fun onFailure(qualifier: CaptureAttemptQualifierV2, reason: String) = lock.withLock {
             val value = work[qualifier.identity]
             if (value == null || value.qualifier != qualifier || closed) { counters.lateCallback(); return@withLock }
-            countExposureLocked(value)
+            if (value.submissionInFlight) {
+                value.submissionFailure = reason
+                return@withLock
+            }
             abandonLocked(value.request, "camera-$reason")
         }
     }
@@ -740,7 +770,7 @@ internal class NativeCaptureAdapterV2(
     }
 
     private fun lifecycleTransferLocked(value: Work, reason: String) {
-        if (value.exposureRequested) transferUnknownLocked(value, "$reason-transfer")
+        if (value.exposureCounted) transferUnknownLocked(value, "$reason-transfer")
         else abandonLocked(value.request, "$reason-before-exposure")
     }
 
