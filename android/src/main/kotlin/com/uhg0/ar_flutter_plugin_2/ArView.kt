@@ -904,6 +904,8 @@ internal class ArView(
                 }
                 else -> result.notImplemented()
             }
+        } catch (error: NativeCaptureRecoveryAdmissionExceptionV2) {
+            result.error(error.code, error.message, null)
         } catch (error: CaptureSessionException) {
             result.error(error.code, error.message, null)
         } catch (error: Exception) {

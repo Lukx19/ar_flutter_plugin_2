@@ -267,10 +267,15 @@ internal class NativeCaptureRecoveryDispatcherV2(
     }
 }
 
-internal class NativeCaptureRecoveryAdmissionExceptionV2(
+internal open class NativeCaptureRecoveryAdmissionExceptionV2(
     val code: String,
     message: String,
 ) : IllegalStateException(message)
+
+internal class NativeCaptureDurableRootPendingV2 : NativeCaptureRecoveryAdmissionExceptionV2(
+    "NATIVE_CAPTURE_V2_ROOT_PENDING",
+    "The previous capture view still owns the durable root; retry after its shutdown completes.",
+)
 
 /** One-shot async preparation whose success or failure is replayed to every later disposer. */
 internal class ReplayableShutdownPreparationV2 {
@@ -323,11 +328,59 @@ internal class NativeCaptureDurableRootLeaseV2 private constructor(
         fun acquire(root: java.io.File): NativeCaptureDurableRootLeaseV2 {
             val key = root.canonicalFile.path
             synchronized(activeRoots) {
-                check(activeRoots.add(key)) { "Native capture durable root is still owned by a closing view" }
+                if (!activeRoots.add(key)) throw NativeCaptureDurableRootPendingV2()
             }
             return NativeCaptureDurableRootLeaseV2(key)
         }
     }
+}
+
+/** Retries durable handles before releasing the exclusive root authority. */
+internal class NativeCaptureDurableRootCloserV2(
+    private val closeStore: () -> Unit,
+    private val closeBudget: () -> Unit,
+    private val releaseLease: () -> Unit,
+    private val onClosed: () -> Unit = {},
+    private val retryDelayMillis: Long = 250L,
+    private val retryWorker: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { runnable ->
+        Thread(runnable, "capture3d-v2-root-close-retry").apply { isDaemon = true }
+    },
+) {
+    private val lock = Any()
+    private var storeClosed = false
+    private var budgetClosed = false
+    private var closed = false
+    private var retryScheduled = false
+
+    fun close(): Unit = synchronized(lock) {
+        if (closed) return@synchronized
+        var failure: Throwable? = null
+        if (!storeClosed) {
+            runCatching(closeStore).onSuccess { storeClosed = true }.onFailure { failure = it }
+        }
+        if (!budgetClosed) {
+            runCatching(closeBudget).onSuccess { budgetClosed = true }.onFailure { if (failure == null) failure = it }
+        }
+        if (storeClosed && budgetClosed) {
+            releaseLease()
+            closed = true
+            onClosed()
+            retryWorker.shutdownNow()
+        } else if (!retryScheduled) {
+            retryScheduled = true
+            retryWorker.schedule(
+                {
+                    synchronized(lock) { retryScheduled = false }
+                    runCatching<Unit> { close() }
+                },
+                retryDelayMillis,
+                TimeUnit.MILLISECONDS,
+            )
+        }
+        failure?.let { throw it }
+    }
+
+    fun isClosed(): Boolean = synchronized(lock) { closed }
 }
 
 /**
@@ -407,13 +460,25 @@ internal class NativeCaptureBindingV2(
     private val events: (NativeCaptureEventV2) -> Unit = {},
 ) : AutoCloseable {
     private val lock = Any()
-    private val rootResources = createNativeCaptureRootResourcesV2(context)
-    private val rootAuthority = rootResources.authority
-    private val budget = rootResources.budget
-    private val store = rootResources.store
+    private val rootResourcesDelegate = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        createNativeCaptureRootResourcesV2(context)
+    }
+    private val rootResources by rootResourcesDelegate
+    private val rootAuthority get() = rootResources.authority
+    private val budget get() = rootResources.budget
+    private val store get() = rootResources.store
     private var sharedCamera: SharedCameraManager? = null
     private var closed = false
     private var resourcesClosed = false
+    private val durableRootCloserDelegate = lazy {
+        NativeCaptureDurableRootCloserV2(
+            closeStore = store::close,
+            closeBudget = budget::close,
+            releaseLease = rootAuthority::close,
+            onClosed = { synchronized(lock) { resourcesClosed = true } },
+        )
+    }
+    private val durableRootCloser by durableRootCloserDelegate
     private val bridge = SharedCameraManagerExposurePortV2(
         request = { qualifier, required, callback ->
             val manager = synchronized(lock) { if (closed) null else sharedCamera }
@@ -424,23 +489,32 @@ internal class NativeCaptureBindingV2(
             manager?.cancelAttemptQualifiedExposureV2(qualifier)
         },
     )
-    private val recovery = NativeCaptureRecoveryDispatcherV2(
-        recover = { shouldContinue -> store.recoverAndProject(shouldContinue = shouldContinue) },
-        events = events,
-    )
-    private val adapter = NativeCaptureAdapterV2(
-        DurableNativeCaptureStorePortV2(store), bridge, safety, nowMs, recovery::emitLive,
-    )
-    private val deadlineScheduler = Executors.newSingleThreadScheduledExecutor { runnable ->
-        Thread(runnable, "capture3d-v2-deadline").apply { isDaemon = true }
-    }.apply {
-        scheduleAtFixedRate(
-            { runCatching { adapter.advanceDeadlines() } },
-            1,
-            1,
-            TimeUnit.SECONDS,
+    private val recoveryDelegate = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        NativeCaptureRecoveryDispatcherV2(
+            recover = { shouldContinue -> store.recoverAndProject(shouldContinue = shouldContinue) },
+            events = events,
         )
     }
+    private val recovery by recoveryDelegate
+    private val adapterDelegate = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        NativeCaptureAdapterV2(
+            DurableNativeCaptureStorePortV2(store), bridge, safety, nowMs, recovery::emitLive,
+        )
+    }
+    private val adapter by adapterDelegate
+    private val deadlineSchedulerDelegate = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        Executors.newSingleThreadScheduledExecutor { runnable ->
+            Thread(runnable, "capture3d-v2-deadline").apply { isDaemon = true }
+        }.apply {
+            scheduleAtFixedRate(
+                { runCatching { adapter.advanceDeadlines() } },
+                1,
+                1,
+                TimeUnit.SECONDS,
+            )
+        }
+    }
+    private val deadlineScheduler by deadlineSchedulerDelegate
     fun attachSharedCamera(manager: SharedCameraManager) = synchronized(lock) {
         check(!closed) { "NativeCaptureBindingV2 is closed" }
         sharedCamera = manager
@@ -488,16 +562,19 @@ internal class NativeCaptureBindingV2(
         fun attempt(operation: () -> Unit) {
             runCatching(operation).onFailure { if (closeFailure == null) closeFailure = it }
         }
-        attempt { deadlineScheduler.shutdownNow() }
-        attempt { recovery.close() }
-        attempt { adapter.onLifecycle(CaptureLifecycleEvent.VIEW_REPLACED) }
-        attempt { adapter.close() }
+        if (deadlineSchedulerDelegate.isInitialized()) attempt { deadlineScheduler.shutdownNow() }
+        if (recoveryDelegate.isInitialized()) attempt { recovery.close() }
+        if (adapterDelegate.isInitialized()) {
+            attempt { adapter.onLifecycle(CaptureLifecycleEvent.VIEW_REPLACED) }
+            attempt { adapter.close() }
+        }
         val manager = synchronized(lock) { sharedCamera.also { sharedCamera = null } }
         attempt { manager?.clearAttemptQualifiedExposureHookV2() }
-        attempt { store.close() }
-        attempt { budget.close() }
-        attempt { rootAuthority.close() }
-        synchronized(lock) { resourcesClosed = true }
+        if (rootResourcesDelegate.isInitialized()) {
+            attempt { closeDurableResources() }
+        } else {
+            synchronized(lock) { resourcesClosed = true }
+        }
         closeFailure?.let { throw it }
     }
 
@@ -507,10 +584,15 @@ internal class NativeCaptureBindingV2(
             if (resourcesClosed) return
             closed = true
         }
-        deadlineScheduler.shutdownNow()
-        recovery.close()
-        adapter.forceCloseForDeadline()
+        if (deadlineSchedulerDelegate.isInitialized()) deadlineScheduler.shutdownNow()
+        if (recoveryDelegate.isInitialized()) recovery.close()
+        if (adapterDelegate.isInitialized()) adapter.forceCloseForDeadline()
         synchronized(lock) { sharedCamera }?.clearAttemptQualifiedExposureHookV2()
+    }
+
+    private fun closeDurableResources() {
+        durableRootCloser.close()
+        synchronized(lock) { resourcesClosed = durableRootCloser.isClosed() }
     }
 
     private class NativeCaptureRootAuthorityV2(
@@ -559,6 +641,7 @@ internal class NativeCaptureBindingV2(
             throw error
         }
     }
+
 }
 
 /**

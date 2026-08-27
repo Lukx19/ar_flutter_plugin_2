@@ -236,6 +236,64 @@ class NativeCaptureAdapterV2Test {
     }
 
     @Test
+    fun `durable close failure retains root lease until retry proves every handle closed`() {
+        val root = java.nio.file.Files.createTempDirectory("capture-v2-close-retry-").toFile()
+        val lease = NativeCaptureDurableRootLeaseV2.acquire(root)
+        val storeAttempts = java.util.concurrent.atomic.AtomicInteger()
+        val budgetAttempts = java.util.concurrent.atomic.AtomicInteger()
+        val closed = CountDownLatch(1)
+        val closer = NativeCaptureDurableRootCloserV2(
+            closeStore = {
+                if (storeAttempts.incrementAndGet() == 1) throw java.io.IOException("store-close-failed")
+            },
+            closeBudget = {
+                if (budgetAttempts.incrementAndGet() == 1) throw java.io.IOException("budget-close-failed")
+            },
+            releaseLease = lease::close,
+            onClosed = { closed.countDown() },
+            retryDelayMillis = 50,
+        )
+        try {
+            assertThrows(java.io.IOException::class.java) { closer.close() }
+            assertThrows(NativeCaptureDurableRootPendingV2::class.java) {
+                NativeCaptureDurableRootLeaseV2.acquire(root)
+            }
+
+            assertTrue(closed.await(2, TimeUnit.SECONDS))
+            assertTrue(closer.isClosed())
+            assertEquals(2, storeAttempts.get())
+            assertEquals(2, budgetAttempts.get())
+            NativeCaptureDurableRootLeaseV2.acquire(root).close()
+        } finally {
+            lease.close()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `replacement construction stays lazy and retries root acquisition after normal old close`() {
+        val root = java.nio.file.Files.createTempDirectory("capture-v2-lazy-remount-").toFile()
+        val old = NativeCaptureDurableRootLeaseV2.acquire(root)
+        val replacementDelegate = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+            NativeCaptureDurableRootLeaseV2.acquire(root)
+        }
+        try {
+            assertFalse("constructing replacement must not acquire the durable root", replacementDelegate.isInitialized())
+            assertThrows(NativeCaptureDurableRootPendingV2::class.java) { replacementDelegate.value }
+            assertFalse("failed lazy acquisition must remain retryable", replacementDelegate.isInitialized())
+
+            old.close()
+            val replacement = replacementDelegate.value
+            assertTrue(replacementDelegate.isInitialized())
+            replacement.close()
+            NativeCaptureDurableRootLeaseV2.acquire(root).close()
+        } finally {
+            old.close()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `startup recovery runs off caller and fences callbacks after close`() {
         val caller = Thread.currentThread()
         val recoveryThread = AtomicReference<Thread>()
