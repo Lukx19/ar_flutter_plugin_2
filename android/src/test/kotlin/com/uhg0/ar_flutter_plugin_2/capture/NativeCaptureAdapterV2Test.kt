@@ -673,6 +673,124 @@ class NativeCaptureAdapterV2Test {
     }
 
     @Test
+    fun `synthetic camera malformed store and committed sequence counts four accepted exposures`() {
+        val root = File.createTempFile("native-synthetic-sequence-v2", "").also {
+            it.delete()
+            assertTrue(it.mkdirs())
+        }
+        val budget = StorageBudgetCoordinatorV2(
+            File(root, "budget"),
+            StorageBudgetPolicyV2(16L * 1024 * 1024, 0),
+            JvmDescriptorFilesystemV2(),
+        ) { 16L * 1024 * 1024 }
+        val durable = DurableSessionStoreV2(
+            File(root, "store"),
+            budget,
+            filesystemBackend = JvmDescriptorFilesystemV2(),
+        )
+        val hook = AttemptQualifiedExposureHookV2()
+        val camera = object : SharedCameraExposurePortV2 {
+            override fun requestExposure(
+                qualifier: CaptureAttemptQualifierV2,
+                required: Set<CaptureComponentKind>,
+                callback: SharedCameraExposureCallbackV2,
+            ): Boolean {
+                return hook.request(qualifier, required, callback) ?: false
+            }
+            override fun cancelExposure(qualifier: CaptureAttemptQualifierV2) {
+                hook.cancel(qualifier)
+            }
+        }
+        fun install(mode: String) {
+            hook.install(request = { qualifier, required, callback ->
+                when (mode) {
+                    "camera" -> callback.onFailure(qualifier, "synthetic-camera")
+                    "malformed" -> callback.onComponents(
+                        SharedCameraComponentSetV2(
+                            qualifier,
+                            listOf(
+                                CaptureComponentStreamV2(CaptureComponentKind.JPEG, CloseTrackingInputStream(byteArrayOf(1))),
+                                CaptureComponentStreamV2(CaptureComponentKind.JPEG, CloseTrackingInputStream(byteArrayOf(2))),
+                            ),
+                        ),
+                    )
+                    "store" -> callback.onComponents(
+                        SharedCameraComponentSetV2(
+                            qualifier,
+                            required.map { kind ->
+                                CaptureComponentStreamV2(kind, object : InputStream() {
+                                    override fun read(): Int = throw java.io.IOException("synthetic-store-stream")
+                                })
+                            },
+                        ),
+                    )
+                    else -> callback.onComponents(
+                        SharedCameraComponentSetV2(
+                            qualifier,
+                            required.map { kind ->
+                                CaptureComponentStreamV2(kind, CloseTrackingInputStream(bytes(kind)))
+                            },
+                        ),
+                    )
+                }
+                true
+            }, cancel = {})
+        }
+        val recoveryReady = CountDownLatch(1)
+        val dispatcher = NativeCaptureRecoveryDispatcherV2(
+            recover = { emptyList() },
+            events = { if (it.kind == NativeCaptureEventKindV2.READY) recoveryReady.countDown() },
+        )
+        assertTrue(recoveryReady.await(5, TimeUnit.SECONDS))
+        val adapter = NativeCaptureAdapterV2(
+            DurableNativeCaptureStorePortV2(durable),
+            camera,
+            events = dispatcher::emitLive,
+        )
+        val admissionExecutor = Executors.newSingleThreadExecutor()
+        fun template(lane: CaptureLane, ordinal: Long): CaptureCommitRequest {
+            val described = request(lane, setOf(CaptureComponentKind.JPEG), ordinal = ordinal)
+            return rebuildRequest(described, components = emptyList(), timestamp = 0)
+        }
+        fun admit(lane: CaptureLane, ordinal: Long) {
+            admissionExecutor.submit<CaptureReceipt> { adapter.admit(template(lane, ordinal)) }
+                .get(5, TimeUnit.SECONDS)
+        }
+        try {
+            install("camera")
+            admit(CaptureLane.MANUAL, 1)
+            dispatcher.acknowledgeTerminal(dispatcher.replaySnapshot().single().attemptId!!)
+            install("malformed")
+            admit(CaptureLane.AUTOMATIC, 2)
+            dispatcher.acknowledgeTerminal(dispatcher.replaySnapshot().single().attemptId!!)
+            install("store")
+            admit(CaptureLane.AUTOMATIC, 3)
+            dispatcher.acknowledgeTerminal(dispatcher.replaySnapshot().single().attemptId!!)
+            install("committed")
+            admit(CaptureLane.AUTOMATIC, 4)
+            val committedReplay = dispatcher.replaySnapshot().single()
+            repeat(3) { assertEquals(committedReplay, dispatcher.replaySnapshot().single()) }
+
+            val health = adapter.snapshot()
+            assertEquals(4L, health.exposures)
+            assertEquals(1L, health.committed)
+            assertEquals(3L, health.abandoned)
+            assertEquals(0L, health.unknownQueries)
+            assertEquals(0, health.running)
+            assertEquals(0, health.fundedWaiting)
+            dispatcher.acknowledgeTerminal(committedReplay.attemptId!!)
+        } finally {
+            admissionExecutor.shutdownNow()
+            adapter.close()
+            dispatcher.close()
+            assertTrue(dispatcher.awaitTerminationForTest(5, TimeUnit.SECONDS))
+            durable.close()
+            budget.close()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `funded waiting deadline abandons before exposure without unknown liability`() {
         var clock = 0L
         val store = FakeStore()

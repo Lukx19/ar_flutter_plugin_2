@@ -32,6 +32,7 @@ import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -152,6 +153,43 @@ data class ExposureBracketMember(
         }
 }
 
+/** Atomically publishes the debug-only exposure route across platform and admission threads. */
+internal class AttemptQualifiedExposureHookV2 {
+    private data class Route(
+        val request: (
+            CaptureAttemptQualifierV2,
+            Set<CaptureComponentKind>,
+            SharedCameraExposureCallbackV2,
+        ) -> Boolean,
+        val cancel: (CaptureAttemptQualifierV2) -> Unit,
+    )
+
+    private val route = AtomicReference<Route?>()
+
+    fun install(
+        request: (
+            CaptureAttemptQualifierV2,
+            Set<CaptureComponentKind>,
+            SharedCameraExposureCallbackV2,
+        ) -> Boolean,
+        cancel: (CaptureAttemptQualifierV2) -> Unit,
+    ) {
+        route.set(Route(request, cancel))
+    }
+
+    fun request(
+        qualifier: CaptureAttemptQualifierV2,
+        required: Set<CaptureComponentKind>,
+        callback: SharedCameraExposureCallbackV2,
+    ): Boolean? = route.get()?.request?.invoke(qualifier, required, callback)
+
+    fun cancel(qualifier: CaptureAttemptQualifierV2): Boolean {
+        val installed = route.get() ?: return false
+        installed.cancel(qualifier)
+        return true
+    }
+}
+
 /**
  * The ordinary shared-camera JPEG path receives hardware-encoded bytes. Its
  * material wait is shutter request to correlated image delivery; it does not
@@ -205,24 +243,22 @@ internal class SharedCameraManager(
 ) {
     // Additive V2 hook. V1 ImageCacheManager/correlation ownership is never
     // consulted by this route; a per-view #101 binding installs the Camera2 hook.
-    private var v2ExposureHook: ((CaptureAttemptQualifierV2, Set<CaptureComponentKind>, SharedCameraExposureCallbackV2) -> Boolean)? = null
-    private var v2CancelHook: ((CaptureAttemptQualifierV2) -> Unit)? = null
+    private val v2ExposureHook = AttemptQualifiedExposureHookV2()
 
     internal fun installAttemptQualifiedExposureHookV2(
         request: (CaptureAttemptQualifierV2, Set<CaptureComponentKind>, SharedCameraExposureCallbackV2) -> Boolean,
         cancel: (CaptureAttemptQualifierV2) -> Unit = {},
-    ) { v2ExposureHook = request; v2CancelHook = cancel }
+    ) = v2ExposureHook.install(request, cancel)
 
     internal fun requestAttemptQualifiedExposureV2(
         qualifier: CaptureAttemptQualifierV2,
         required: Set<CaptureComponentKind>,
         callback: SharedCameraExposureCallbackV2,
-    ): Boolean = v2ExposureHook?.invoke(qualifier, required, callback)
+    ): Boolean = v2ExposureHook.request(qualifier, required, callback)
         ?: requestDirectExposureV2(qualifier, required, callback)
 
     internal fun cancelAttemptQualifiedExposureV2(qualifier: CaptureAttemptQualifierV2) {
-        val hook = v2CancelHook
-        if (hook != null) hook(qualifier) else cancelDirectExposureV2(qualifier)
+        if (!v2ExposureHook.cancel(qualifier)) cancelDirectExposureV2(qualifier)
     }
 
     companion object {
