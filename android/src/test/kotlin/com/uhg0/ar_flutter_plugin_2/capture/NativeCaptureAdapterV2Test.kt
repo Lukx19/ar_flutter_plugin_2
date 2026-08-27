@@ -626,6 +626,53 @@ class NativeCaptureAdapterV2Test {
     }
 
     @Test
+    fun `synchronous components followed by false stay pre-exposure and close exactly once`() {
+        val store = FakeStore()
+        val events = mutableListOf<NativeCaptureEventV2>()
+        val inputs = mutableListOf<CloseTrackingInputStream>()
+        var result = false
+        val camera = object : SharedCameraExposurePortV2 {
+            override fun requestExposure(
+                qualifier: CaptureAttemptQualifierV2,
+                required: Set<CaptureComponentKind>,
+                callback: SharedCameraExposureCallbackV2,
+            ): Boolean {
+                val input = CloseTrackingInputStream(bytes(CaptureComponentKind.JPEG)).also(inputs::add)
+                callback.onComponents(
+                    SharedCameraComponentSetV2(
+                        qualifier,
+                        listOf(CaptureComponentStreamV2(CaptureComponentKind.JPEG, input)),
+                    ),
+                )
+                return result
+            }
+            override fun cancelExposure(qualifier: CaptureAttemptQualifierV2) = Unit
+        }
+        val adapter = NativeCaptureAdapterV2(store, camera, events = events::add)
+        val rejected = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 1)
+        adapter.admit(rejected)
+
+        var health = adapter.snapshot()
+        assertEquals(0L, health.exposures)
+        assertEquals(0L, health.committed)
+        assertEquals(0L, health.abandoned)
+        assertEquals(0L, health.unknownQueries)
+        assertEquals(1, inputs.single().closeCalls)
+        assertEquals(1, store.terminals.count { it.identity == rejected.accepted.identity })
+        assertEquals(0, events.count { it.kind == NativeCaptureEventKindV2.COMMITTED })
+
+        result = true
+        val later = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 2)
+        adapter.admit(later)
+        health = adapter.snapshot()
+        assertEquals(1L, health.exposures)
+        assertEquals(1L, health.committed)
+        assertEquals(0L, health.abandoned)
+        assertEquals(0L, health.unknownQueries)
+        assertEquals(1, inputs.last().closeCalls)
+    }
+
+    @Test
     fun `funded waiting deadline abandons before exposure without unknown liability`() {
         var clock = 0L
         val store = FakeStore()
@@ -731,7 +778,8 @@ class NativeCaptureAdapterV2Test {
             commitRelease = CountDownLatch(1)
         }
         val camera = FakeExposure()
-        val adapter = NativeCaptureAdapterV2(store, camera)
+        val events = mutableListOf<NativeCaptureEventV2>()
+        val adapter = NativeCaptureAdapterV2(store, camera, events = events::add)
         val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG))
         adapter.admit(request)
         val executor = Executors.newFixedThreadPool(3)
@@ -759,10 +807,46 @@ class NativeCaptureAdapterV2Test {
 
             store.commitRelease!!.countDown()
             commit.get(5, TimeUnit.SECONDS)
+            assertEquals(1L, adapter.snapshot().exposures)
+            assertEquals(1L, adapter.snapshot().unknownQueries)
+            assertEquals(0L, adapter.snapshot().committed)
+            assertTrue(events.none { it.kind == NativeCaptureEventKindV2.COMMITTED })
         } finally {
             store.commitRelease?.countDown()
             executor.shutdownNow()
         }
+    }
+
+    @Test
+    fun `lifecycle cut during finalizing event prevents store handoff and terminal publication`() {
+        val store = FakeStore()
+        val camera = FakeExposure()
+        val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG))
+        lateinit var adapter: NativeCaptureAdapterV2
+        val events = mutableListOf<NativeCaptureEventV2>()
+        adapter = NativeCaptureAdapterV2(store, camera, events = { event ->
+            events += event
+            if (event.kind == NativeCaptureEventKindV2.FINALIZING) {
+                adapter.onLifecycle(
+                    CaptureLifecycleEvent.BACKGROUNDED,
+                    request.accepted.identity.lifecycleCut,
+                )
+            }
+        })
+        adapter.admit(request)
+        val inputs = camera.components(
+            camera.requests.single().first,
+            request,
+            listOf(CaptureComponentKind.JPEG),
+        )
+
+        assertEquals(1, inputs.single().closeCalls)
+        assertTrue(store.terminals.isEmpty())
+        assertEquals(listOf(request.accepted.identity), store.queries)
+        assertEquals(1L, adapter.snapshot().exposures)
+        assertEquals(1L, adapter.snapshot().unknownQueries)
+        assertEquals(0L, adapter.snapshot().committed)
+        assertTrue(events.none { it.kind == NativeCaptureEventKindV2.COMMITTED })
     }
 
     @Test
@@ -803,7 +887,8 @@ class NativeCaptureAdapterV2Test {
             commitRelease = CountDownLatch(1)
         }
         val camera = FakeExposure()
-        val adapter = NativeCaptureAdapterV2(store, camera)
+        val events = mutableListOf<NativeCaptureEventV2>()
+        val adapter = NativeCaptureAdapterV2(store, camera, events = events::add)
         val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG))
         adapter.admit(request)
         val qualifier = camera.requests.single().first
@@ -819,6 +904,10 @@ class NativeCaptureAdapterV2Test {
             store.commitRelease!!.countDown()
             commit.get(5, TimeUnit.SECONDS)
             close.get(5, TimeUnit.SECONDS)
+            assertEquals(1L, adapter.snapshot().exposures)
+            assertEquals(1L, adapter.snapshot().unknownQueries)
+            assertEquals(0L, adapter.snapshot().committed)
+            assertTrue(events.none { it.kind == NativeCaptureEventKindV2.COMMITTED })
 
             val late = camera.components(qualifier, request, listOf(CaptureComponentKind.JPEG))
             assertEquals(1, late.single().closeCalls)
@@ -832,7 +921,7 @@ class NativeCaptureAdapterV2Test {
     @Test
     fun `lifecycle retains an in-flight accepted submission as exposed unknown`() {
         val store = FakeStore()
-        val camera = BlockingExposure(result = true)
+        val camera = BlockingExposure(result = true, componentsBeforeResult = true)
         val events = mutableListOf<NativeCaptureEventV2>()
         val adapter = NativeCaptureAdapterV2(store, camera, events = events::add)
         val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG))
@@ -860,6 +949,8 @@ class NativeCaptureAdapterV2Test {
             assertEquals(0, health.running)
             assertEquals(1, store.queries.count { it == request.accepted.identity })
             assertEquals(listOf(camera.qualifier), camera.cancellations)
+            assertEquals(1, camera.synchronousInput!!.closeCalls)
+            assertTrue(store.terminals.isEmpty())
             assertEquals(
                 1,
                 events.count {
@@ -880,7 +971,7 @@ class NativeCaptureAdapterV2Test {
     @Test
     fun `close waits for an in-flight accepted submission then drains and fences it`() {
         val store = FakeStore()
-        val camera = BlockingExposure(result = true)
+        val camera = BlockingExposure(result = true, componentsBeforeResult = true)
         val events = mutableListOf<NativeCaptureEventV2>()
         val adapter = NativeCaptureAdapterV2(store, camera, events = events::add)
         val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG))
@@ -903,6 +994,8 @@ class NativeCaptureAdapterV2Test {
             assertEquals(0, health.running)
             assertEquals(1, store.queries.count { it == request.accepted.identity })
             assertEquals(listOf(camera.qualifier), camera.cancellations)
+            assertEquals(1, camera.synchronousInput!!.closeCalls)
+            assertTrue(store.terminals.isEmpty())
             val eventCountAfterClose = events.size
             val late = camera.components(request)
             assertTrue(late.closed)
@@ -918,7 +1011,7 @@ class NativeCaptureAdapterV2Test {
     fun `lifecycle and close keep rejected in-flight submissions pre-exposure`() {
         listOf(false, true).forEachIndexed { index, closeAdapter ->
             val store = FakeStore()
-            val camera = BlockingExposure(result = false)
+            val camera = BlockingExposure(result = false, componentsBeforeResult = true)
             val adapter = NativeCaptureAdapterV2(store, camera)
             val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = (index + 1).toLong())
             val executor = Executors.newFixedThreadPool(2)
@@ -953,6 +1046,7 @@ class NativeCaptureAdapterV2Test {
                 assertEquals(0, health.running)
                 assertEquals(0, store.queries.size)
                 assertEquals(1, store.terminals.count { it.identity == request.accepted.identity })
+                assertEquals(1, camera.synchronousInput!!.closeCalls)
             } finally {
                 camera.release.countDown()
                 executor.shutdownNow()
@@ -1071,13 +1165,18 @@ class NativeCaptureAdapterV2Test {
         }
     }
 
-    private class BlockingExposure(private val result: Boolean) : SharedCameraExposurePortV2 {
+    private class BlockingExposure(
+        private val result: Boolean,
+        private val componentsBeforeResult: Boolean = false,
+    ) : SharedCameraExposurePortV2 {
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
         lateinit var qualifier: CaptureAttemptQualifierV2
             private set
         private lateinit var callback: SharedCameraExposureCallbackV2
         val cancellations = mutableListOf<CaptureAttemptQualifierV2>()
+        var synchronousInput: CloseTrackingInputStream? = null
+            private set
         override fun requestExposure(
             qualifier: CaptureAttemptQualifierV2,
             required: Set<CaptureComponentKind>,
@@ -1085,6 +1184,16 @@ class NativeCaptureAdapterV2Test {
         ): Boolean {
             this.qualifier = qualifier
             this.callback = callback
+            if (componentsBeforeResult) {
+                val input = CloseTrackingInputStream(bytes(CaptureComponentKind.JPEG))
+                synchronousInput = input
+                callback.onComponents(
+                    SharedCameraComponentSetV2(
+                        qualifier,
+                        listOf(CaptureComponentStreamV2(CaptureComponentKind.JPEG, input)),
+                    ),
+                )
+            }
             entered.countDown()
             release.await(5, TimeUnit.SECONDS)
             return result

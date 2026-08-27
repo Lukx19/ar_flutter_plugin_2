@@ -468,6 +468,8 @@ internal class NativeCaptureAdapterV2(
         var submissionResultResolved: Boolean = false,
         var submissionFailure: String? = null,
         var pendingLifecycleReason: String? = null,
+        var componentsClaimed: Boolean = false,
+        var pendingComponents: SharedCameraComponentSetV2? = null,
         var tenSecondPresented: Boolean = false,
         var terminalClaimed: Boolean = false,
     )
@@ -675,6 +677,7 @@ internal class NativeCaptureAdapterV2(
             val pendingLifecycleReason = value.pendingLifecycleReason
             value.pendingLifecycleReason = null
             if (!requested) {
+                discardPendingComponentsLocked(value)
                 value.exposureRequested = false
                 safety.release(value.qualifier)
                 abandonLocked(
@@ -687,9 +690,23 @@ internal class NativeCaptureAdapterV2(
             }
             countExposureLocked(value)
             when {
-                submissionFailure != null -> abandonLocked(value.request, "camera-$submissionFailure")
-                pendingLifecycleReason != null -> transferUnknownLocked(value, "$pendingLifecycleReason-transfer")
-                closing -> transferUnknownLocked(value, "shutdown-transfer")
+                submissionFailure != null -> {
+                    discardPendingComponentsLocked(value)
+                    abandonLocked(value.request, "camera-$submissionFailure")
+                }
+                pendingLifecycleReason != null -> {
+                    discardPendingComponentsLocked(value)
+                    transferUnknownLocked(value, "$pendingLifecycleReason-transfer")
+                }
+                closing -> {
+                    discardPendingComponentsLocked(value)
+                    transferUnknownLocked(value, "shutdown-transfer")
+                }
+                value.pendingComponents != null -> {
+                    val components = checkNotNull(value.pendingComponents)
+                    value.pendingComponents = null
+                    processComponentsLocked(value, components)
+                }
             }
         } finally {
             value.submissionInFlight = false
@@ -701,44 +718,38 @@ internal class NativeCaptureAdapterV2(
     }
 
     private val callback = object : SharedCameraExposureCallbackV2 {
-        override fun onComponents(components: SharedCameraComponentSetV2) {
-            val ownedWork = lock.withLock {
-                val value = work[components.qualifier.identity]
-                if (value == null || value.qualifier != components.qualifier || scheduler.running?.identity != components.qualifier.identity || closed) {
-                    closeStreams(components.streams); counters.lateCallback(); return
+        override fun onComponents(components: SharedCameraComponentSetV2) = lock.withLock {
+            val value = work[components.qualifier.identity]
+            if (
+                value == null || value.qualifier != components.qualifier ||
+                scheduler.running?.identity != components.qualifier.identity || closed || closing ||
+                value.pendingLifecycleReason != null || value.componentsClaimed
+            ) {
+                closeStreams(components.streams)
+                counters.lateCallback()
+                return@withLock
+            }
+            value.componentsClaimed = true
+            if (components.streams.size > value.request.accepted.profile.requiredComponents.size) {
+                closeStreams(components.streams)
+                if (value.submissionInFlight && !value.submissionResultResolved) {
+                    value.submissionFailure = "malformed-component-set"
+                } else {
+                    countExposureLocked(value)
+                    abandonLocked(value.request, "malformed-component-set")
                 }
-                countExposureLocked(value)
-                val kinds = components.streams.map { it.kind }
-                if (kinds.size != kinds.toSet().size || kinds.toSet() != value.request.accepted.profile.requiredComponents) {
-                    closeStreams(components.streams); abandonLocked(value.request, "malformed-component-set"); return
-                }
-                val owned = components.streams.map { stream ->
+                return@withLock
+            }
+            val owned = components.copy(
+                streams = components.streams.map { stream ->
                     CaptureComponentStreamV2(stream.kind, CloseOnceInputStreamV2(stream.input))
-                }
-                beginStoreOperationLocked()
-                emitLocked(NativeCaptureEventV2(NativeCaptureEventKindV2.FINALIZING, value.request.accepted.identity.attemptId))
-                value to owned
+                },
+            )
+            if (value.submissionInFlight && !value.submissionResultResolved) {
+                value.pendingComponents = owned
+                return@withLock
             }
-            val (value, owned) = ownedWork
-            try {
-                val receipt = store.commitStreamed(
-                    value.request,
-                    components.exposureTimestampNanoseconds,
-                    owned,
-                )
-                lock.withLock {
-                    if (work[value.request.accepted.identity] === value) finishLocked(value, receipt)
-                }
-            } catch (_: Throwable) {
-                // Store errors after a streaming handoff are an exact identity query, never another request.
-                lock.withLock {
-                    if (work[value.request.accepted.identity] === value) queryOrAbandonLocked(value, "store-unknown")
-                }
-            } finally {
-                owned.forEach { runCatching { it.input.close() } }
-                counters.componentsClosed(owned.size)
-                lock.withLock { endStoreOperationLocked() }
-            }
+            processComponentsLocked(value, owned)
         }
 
         override fun onFailure(qualifier: CaptureAttemptQualifierV2, reason: String) = lock.withLock {
@@ -750,6 +761,59 @@ internal class NativeCaptureAdapterV2(
             }
             abandonLocked(value.request, "camera-$reason")
         }
+    }
+
+    private fun processComponentsLocked(value: Work, components: SharedCameraComponentSetV2) {
+        check(lock.isHeldByCurrentThread)
+        countExposureLocked(value)
+        val kinds = components.streams.map { it.kind }
+        if (kinds.size != kinds.toSet().size || kinds.toSet() != value.request.accepted.profile.requiredComponents) {
+            closeStreams(components.streams)
+            abandonLocked(value.request, "malformed-component-set")
+            return
+        }
+        beginStoreOperationLocked()
+        emitLocked(NativeCaptureEventV2(NativeCaptureEventKindV2.FINALIZING, value.request.accepted.identity.attemptId))
+        if (
+            work[value.request.accepted.identity] !== value ||
+            value.pendingLifecycleReason != null || closing
+        ) {
+            if (work[value.request.accepted.identity] === value) {
+                transferUnknownLocked(value, "${value.pendingLifecycleReason ?: "shutdown"}-transfer")
+            }
+            closeStreams(components.streams)
+            endStoreOperationLocked()
+            return
+        }
+        var receipt: CaptureReceipt? = null
+        var storeFailed = false
+        try {
+            receipt = externalCallLocked {
+                store.commitStreamed(
+                    value.request,
+                    components.exposureTimestampNanoseconds,
+                    components.streams,
+                )
+            }
+        } catch (_: Throwable) {
+            storeFailed = true
+        } finally {
+            closeStreams(components.streams)
+            endStoreOperationLocked()
+        }
+        if (work[value.request.accepted.identity] !== value) return
+        val cutReason = value.pendingLifecycleReason
+        when {
+            cutReason != null -> transferUnknownLocked(value, "$cutReason-transfer")
+            closing -> transferUnknownLocked(value, "shutdown-transfer")
+            storeFailed -> queryOrAbandonLocked(value, "store-unknown")
+            else -> finishLocked(value, checkNotNull(receipt))
+        }
+    }
+
+    private fun discardPendingComponentsLocked(value: Work) {
+        value.pendingComponents?.let { closeStreams(it.streams) }
+        value.pendingComponents = null
     }
 
     private fun queryOrAbandonLocked(value: Work, reason: String) {
@@ -800,7 +864,19 @@ internal class NativeCaptureAdapterV2(
     }
 
     private fun transferUnknownLocked(value: Work, reason: String) {
-        presentUnknownLocked(value, reason)
+        emitLocked(
+            NativeCaptureEventV2(
+                NativeCaptureEventKindV2.RECOVERING,
+                value.request.accepted.identity.attemptId,
+                reason = reason,
+                recoveryContext = value.request.recoveryContext,
+            ),
+        )
+        counters.unknownQuery(value.request.accepted.identity)
+        // A lifecycle owner cut transfers authority to durable recovery even
+        // if a concurrent store handoff has just reached a terminal. Projecting
+        // that terminal on the closing view would publish after the cut.
+        storeCallLocked { store.queryReceipt(value.request.accepted.identity) }
         if (work[value.request.accepted.identity] !== value) return
         safety.release(value.qualifier)
         work.remove(value.request.accepted.identity)
