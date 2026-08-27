@@ -1166,6 +1166,65 @@ class NativeCaptureAdapterV2Test {
     }
 
     @Test
+    fun `automatic disable cannot fence concurrent manual durable acceptance`() {
+        val store = FakeStore().apply {
+            acceptEntered = CountDownLatch(1)
+            acceptRelease = CountDownLatch(1)
+        }
+        val camera = FakeExposure()
+        val adapter = NativeCaptureAdapterV2(store, camera)
+        val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG))
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val admission = executor.submit(java.util.concurrent.Callable { adapter.admit(request) })
+            assertTrue(store.acceptEntered!!.await(5, TimeUnit.SECONDS))
+
+            executor.submit {
+                adapter.onLifecycle(CaptureLifecycleEvent.AUTOMATIC_DISABLED)
+            }.get(500, TimeUnit.MILLISECONDS)
+
+            store.acceptRelease!!.countDown()
+            assertEquals(CaptureAttemptPhase.RESERVED_ACCEPTED, admission.get(5, TimeUnit.SECONDS).phase)
+            assertEquals(1, camera.requests.size)
+            assertEquals(1, adapter.snapshot().running)
+        } finally {
+            store.acceptRelease?.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `automatic disable fences concurrent automatic durable acceptance`() {
+        val store = FakeStore().apply {
+            acceptEntered = CountDownLatch(1)
+            acceptRelease = CountDownLatch(1)
+        }
+        val camera = FakeExposure()
+        val adapter = NativeCaptureAdapterV2(store, camera)
+        val request = request(CaptureLane.AUTOMATIC, setOf(CaptureComponentKind.JPEG))
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val admission = executor.submit(java.util.concurrent.Callable { adapter.admit(request) })
+            assertTrue(store.acceptEntered!!.await(5, TimeUnit.SECONDS))
+
+            executor.submit {
+                adapter.onLifecycle(CaptureLifecycleEvent.AUTOMATIC_DISABLED)
+            }.get(500, TimeUnit.MILLISECONDS)
+
+            store.acceptRelease!!.countDown()
+            assertEquals(
+                CaptureTerminalKind.ABANDONED_ATTEMPT,
+                admission.get(5, TimeUnit.SECONDS).terminal?.kind,
+            )
+            assertTrue(camera.requests.isEmpty())
+            assertEquals(0, adapter.snapshot().running)
+        } finally {
+            store.acceptRelease?.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
     fun `close waits for transferred store ownership and fences later callbacks`() {
         val store = FakeStore().apply {
             commitEntered = CountDownLatch(1)

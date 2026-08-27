@@ -493,12 +493,18 @@ internal class NativeCaptureAdapterV2(
     private var submissionOperations = 0
     private var lifecycleDrain = false
     private var lifecycleGeneration = 0L
+    private var automaticLifecycleGeneration = 0L
     private var nextExposureGeneration = 0L
 
     fun admit(request: CaptureCommitRequest): CaptureReceipt = admissionLock.withLock { lock.withLock {
         check(!closed && !closing) { "NativeCaptureAdapterV2 is closed" }
         val admissionLifecycleGeneration = lifecycleGeneration
+        val admissionAutomaticLifecycleGeneration = automaticLifecycleGeneration
         val accepted = request.accepted
+        fun lifecycleCutDuringAdmission(): Boolean =
+            lifecycleGeneration != admissionLifecycleGeneration ||
+                (accepted.lane == CaptureLane.AUTOMATIC &&
+                    automaticLifecycleGeneration != admissionAutomaticLifecycleGeneration)
         validateReservationLiabilities(accepted)
         work[accepted.identity]?.let { active ->
             if (active.request == request) return@withLock active.acceptedReceipt
@@ -513,7 +519,7 @@ internal class NativeCaptureAdapterV2(
             // Fence it metadata-only; never infer that a second shutter is safe.
             return@withLock abandonLocked(request, "durable-replay-no-reexposure")
         }
-        check(lifecycleGeneration == admissionLifecycleGeneration && !closing) { "lifecycle-cut-during-admission" }
+        check(!lifecycleCutDuringAdmission() && !closing) { "lifecycle-cut-during-admission" }
 
         // Capacity and protected-manual priority are settled before durable
         // acceptance. A waiting automatic owner is optional and yields to a
@@ -536,7 +542,7 @@ internal class NativeCaptureAdapterV2(
             scheduler.running?.let { next -> work[next.identity]?.let(::startLocked) }
             throw error
         }
-        if (lifecycleGeneration != admissionLifecycleGeneration || closing) {
+        if (lifecycleCutDuringAdmission() || closing) {
             scheduler.release(accepted.identity)
             val terminal = CaptureTerminal(
                 CaptureTerminalKind.ABANDONED_ATTEMPT,
@@ -569,7 +575,11 @@ internal class NativeCaptureAdapterV2(
     }
 
     private fun drainLifecycleLocked(event: CaptureLifecycleEvent, cuts: Set<CaptureLifecycleCut>) {
-        lifecycleGeneration += 1
+        if (event == CaptureLifecycleEvent.AUTOMATIC_DISABLED) {
+            automaticLifecycleGeneration += 1
+        } else {
+            lifecycleGeneration += 1
+        }
         val runningBefore = scheduler.running?.identity
         lifecycleDrain = true
         try {
