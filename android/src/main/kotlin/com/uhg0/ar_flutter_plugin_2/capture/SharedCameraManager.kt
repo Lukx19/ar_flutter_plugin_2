@@ -32,7 +32,6 @@ import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -164,7 +163,10 @@ internal class AttemptQualifiedExposureHookV2 {
         val cancel: (CaptureAttemptQualifierV2) -> Unit,
     )
 
-    private val route = AtomicReference<Route?>()
+    private val lock = Any()
+    private var current: Route? = null
+    private val owners = linkedMapOf<CaptureAttemptQualifierV2, Route>()
+    private val retired = linkedSetOf<CaptureAttemptQualifierV2>()
 
     fun install(
         request: (
@@ -174,19 +176,56 @@ internal class AttemptQualifiedExposureHookV2 {
         ) -> Boolean,
         cancel: (CaptureAttemptQualifierV2) -> Unit,
     ) {
-        route.set(Route(request, cancel))
+        synchronized(lock) { current = Route(request, cancel) }
     }
 
     fun request(
         qualifier: CaptureAttemptQualifierV2,
         required: Set<CaptureComponentKind>,
         callback: SharedCameraExposureCallbackV2,
-    ): Boolean? = route.get()?.request?.invoke(qualifier, required, callback)
+    ): Boolean? {
+        val installed = synchronized(lock) {
+            val selected = current ?: return null
+            check(owners.size < MAX_ACTIVE_OWNERS || qualifier in owners) {
+                "synthetic-exposure-owner-capacity"
+            }
+            check(owners.putIfAbsent(qualifier, selected) == null) {
+                "synthetic-exposure-owner-duplicate"
+            }
+            retired.remove(qualifier)
+            selected
+        }
+        return installed.request(qualifier, required, callback)
+    }
 
     fun cancel(qualifier: CaptureAttemptQualifierV2): Boolean {
-        val installed = route.get() ?: return false
+        val installed = synchronized(lock) {
+            owners.remove(qualifier)?.also {
+                retired += qualifier
+                while (retired.size > MAX_RETIRED_OWNERS) retired.remove(retired.first())
+            } ?: return qualifier in retired || current != null
+        }
         installed.cancel(qualifier)
         return true
+    }
+
+    fun clear() {
+        val active = synchronized(lock) {
+            current = null
+            owners.toList().also { entries ->
+                owners.clear()
+                entries.forEach { (qualifier, _) -> retired += qualifier }
+                while (retired.size > MAX_RETIRED_OWNERS) retired.remove(retired.first())
+            }
+        }
+        active.forEach { (qualifier, installed) -> installed.cancel(qualifier) }
+    }
+
+    internal fun activeOwnersForTest(): Int = synchronized(lock) { owners.size }
+
+    private companion object {
+        const val MAX_ACTIVE_OWNERS = 2
+        const val MAX_RETIRED_OWNERS = 4
     }
 }
 
@@ -260,6 +299,8 @@ internal class SharedCameraManager(
     internal fun cancelAttemptQualifiedExposureV2(qualifier: CaptureAttemptQualifierV2) {
         if (!v2ExposureHook.cancel(qualifier)) cancelDirectExposureV2(qualifier)
     }
+
+    internal fun clearAttemptQualifiedExposureHookV2() = v2ExposureHook.clear()
 
     companion object {
         private const val VendorCameraDrainWindowMs = 3_500L
@@ -2092,6 +2133,7 @@ internal class SharedCameraManager(
     }
 
     fun cleanup() {
+        v2ExposureHook.clear()
         if (processShutdownGeneration == null) {
             processShutdownGeneration = processRestartGate.markShutdownStarted()
         }

@@ -37,6 +37,7 @@ class NativeCaptureAdapterV2AndroidTest {
         var surface: Surface? = null
         var binding: NativeCaptureBindingV2? = null
         var manager: SharedCameraManager? = null
+        var syntheticCancels = 0
         var mainResourcesClosed = false
         try {
             onMain {
@@ -56,11 +57,16 @@ class NativeCaptureAdapterV2AndroidTest {
                     configMap = mapOf("resolution" to mapOf("width" to 128, "height" to 128), "format" to "jpeg"),
                 )
                 checkNotNull(binding).attachSharedCamera(checkNotNull(manager))
-                checkNotNull(binding).installSyntheticExposureHookForTest(request = { qualifier, _, callback ->
-                    assertTrue(Looper.myLooper() === Looper.getMainLooper())
-                    callbacks += qualifier to callback
-                    true
-                })
+                assertTrue(
+                    checkNotNull(binding).installSyntheticExposureHookForTest(
+                        request = { qualifier, _, callback ->
+                            assertTrue(Looper.myLooper() === Looper.getMainLooper())
+                            callbacks += qualifier to callback
+                            true
+                        },
+                        cancel = { syntheticCancels += 1 },
+                    ),
+                )
             }
             val activeBinding = checkNotNull(binding)
             val activeManager = checkNotNull(manager)
@@ -95,6 +101,11 @@ class NativeCaptureAdapterV2AndroidTest {
             val disposedOwner = callbacks.last()
             onMain {
                 activeBinding.close()
+                assertFalse(
+                    activeBinding.installSyntheticExposureHookForTest(
+                        request = { _, _, _ -> true },
+                    ),
+                )
                 activeBinding.detachSharedCamera(activeManager)
                 activeManager.cleanup()
                 activeManager.finishCameraShutdown(1_000L)
@@ -110,6 +121,7 @@ class NativeCaptureAdapterV2AndroidTest {
             val disposedSnapshot = onMainValue(activeBinding::snapshot)
             assertEquals(2L, disposedSnapshot.lateCallbacks)
             assertEquals(2L, disposedSnapshot.abandoned)
+            assertEquals(3, syntheticCancels)
             // Snapshot is the only outward V2 projection and is scalar metadata.
             assertEquals(0, CaptureResourceSnapshotV2::class.java.declaredFields.count { it.type == ByteArray::class.java })
         } finally {

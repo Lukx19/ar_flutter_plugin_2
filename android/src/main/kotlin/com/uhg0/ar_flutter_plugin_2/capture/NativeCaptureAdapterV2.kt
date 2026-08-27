@@ -343,7 +343,12 @@ internal class NativeCaptureBindingV2(
     internal fun installSyntheticExposureHookForTest(
         request: (CaptureAttemptQualifierV2, Set<CaptureComponentKind>, SharedCameraExposureCallbackV2) -> Boolean,
         cancel: (CaptureAttemptQualifierV2) -> Unit = {},
-    ) = synchronized(lock) { sharedCamera?.installAttemptQualifiedExposureHookV2(request, cancel) }
+    ): Boolean = synchronized(lock) {
+        if (closed) return@synchronized false
+        val manager = sharedCamera ?: return@synchronized false
+        manager.installAttemptQualifiedExposureHookV2(request, cancel)
+        true
+    }
 
     override fun close() {
         synchronized(lock) {
@@ -354,7 +359,8 @@ internal class NativeCaptureBindingV2(
         recovery.close()
         adapter.onLifecycle(CaptureLifecycleEvent.VIEW_REPLACED)
         adapter.close()
-        synchronized(lock) { sharedCamera = null }
+        val manager = synchronized(lock) { sharedCamera.also { sharedCamera = null } }
+        manager?.clearAttemptQualifiedExposureHookV2()
         store.close()
         budget.close()
     }

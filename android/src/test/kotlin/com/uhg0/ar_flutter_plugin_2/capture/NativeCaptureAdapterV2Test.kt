@@ -3,6 +3,7 @@ package com.uhg0.ar_flutter_plugin_2.capture
 import java.io.File
 import java.io.InputStream
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
@@ -673,6 +674,101 @@ class NativeCaptureAdapterV2Test {
     }
 
     @Test
+    fun `concurrent route install and request observes complete route or no route`() {
+        val executor = Executors.newFixedThreadPool(2)
+        val callback = object : SharedCameraExposureCallbackV2 {
+            override fun onComponents(components: SharedCameraComponentSetV2) = Unit
+            override fun onFailure(qualifier: CaptureAttemptQualifierV2, reason: String) = Unit
+        }
+        try {
+            repeat(100) { index ->
+                val hook = AttemptQualifiedExposureHookV2()
+                val barrier = CyclicBarrier(3)
+                val cancelled = mutableListOf<Int>()
+                val described = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 100L + index)
+                val qualifier = CaptureAttemptQualifierV2(
+                    described.accepted.identity,
+                    described.accepted.identity.lifecycleCut,
+                    1,
+                )
+                val installer = executor.submit {
+                    barrier.await(5, TimeUnit.SECONDS)
+                    hook.install(request = { _, _, _ -> true }, cancel = { cancelled += index })
+                }
+                val requester = executor.submit<Boolean?> {
+                    barrier.await(5, TimeUnit.SECONDS)
+                    hook.request(qualifier, setOf(CaptureComponentKind.JPEG), callback)
+                }
+                barrier.await(5, TimeUnit.SECONDS)
+                installer.get(5, TimeUnit.SECONDS)
+                val result = requester.get(5, TimeUnit.SECONDS)
+                if (result == true) assertTrue(hook.cancel(qualifier))
+                assertTrue(result == null || result)
+                assertEquals(if (result == true) listOf(index) else emptyList(), cancelled)
+                assertEquals(0, hook.activeOwnersForTest())
+                hook.clear()
+            }
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `route replacement cancels the exact in-flight owner without leaking`() {
+        val hook = AttemptQualifiedExposureHookV2()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val cancelled = mutableListOf<String>()
+        val described = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 90)
+        val qualifier = CaptureAttemptQualifierV2(
+            described.accepted.identity,
+            described.accepted.identity.lifecycleCut,
+            1,
+        )
+        val callback = object : SharedCameraExposureCallbackV2 {
+            override fun onComponents(components: SharedCameraComponentSetV2) = Unit
+            override fun onFailure(qualifier: CaptureAttemptQualifierV2, reason: String) = Unit
+        }
+        hook.install(
+            request = { _, _, _ ->
+                entered.countDown()
+                assertTrue(release.await(5, TimeUnit.SECONDS))
+                true
+            },
+            cancel = { cancelled += "A" },
+        )
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val accepted = executor.submit<Boolean?> {
+                hook.request(qualifier, setOf(CaptureComponentKind.JPEG), callback)
+            }
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            hook.install(request = { _, _, _ -> false }, cancel = { cancelled += "B" })
+            release.countDown()
+            assertEquals(true, accepted.get(5, TimeUnit.SECONDS))
+
+            assertTrue(hook.cancel(qualifier))
+            assertEquals(listOf("A"), cancelled)
+            assertEquals(0, hook.activeOwnersForTest())
+            assertTrue(hook.cancel(qualifier))
+            assertEquals(listOf("A"), cancelled)
+
+            val second = qualifier.copy(exposureGeneration = 2)
+            assertEquals(false, hook.request(second, setOf(CaptureComponentKind.JPEG), callback))
+            assertEquals(1, hook.activeOwnersForTest())
+            hook.clear()
+            assertEquals(listOf("A", "B"), cancelled)
+            assertEquals(0, hook.activeOwnersForTest())
+            assertTrue(hook.cancel(second))
+            assertEquals(listOf("A", "B"), cancelled)
+        } finally {
+            release.countDown()
+            hook.clear()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
     fun `synthetic camera malformed store and committed sequence counts four accepted exposures`() {
         val root = File.createTempFile("native-synthetic-sequence-v2", "").also {
             it.delete()
@@ -689,6 +785,7 @@ class NativeCaptureAdapterV2Test {
             filesystemBackend = JvmDescriptorFilesystemV2(),
         )
         val hook = AttemptQualifiedExposureHookV2()
+        val cancelledModes = mutableListOf<String>()
         val camera = object : SharedCameraExposurePortV2 {
             override fun requestExposure(
                 qualifier: CaptureAttemptQualifierV2,
@@ -734,7 +831,7 @@ class NativeCaptureAdapterV2Test {
                     )
                 }
                 true
-            }, cancel = {})
+            }, cancel = { cancelledModes += mode })
         }
         val recoveryReady = CountDownLatch(1)
         val dispatcher = NativeCaptureRecoveryDispatcherV2(
@@ -778,6 +875,8 @@ class NativeCaptureAdapterV2Test {
             assertEquals(0L, health.unknownQueries)
             assertEquals(0, health.running)
             assertEquals(0, health.fundedWaiting)
+            assertEquals(listOf("camera", "malformed", "store", "committed"), cancelledModes)
+            assertEquals(0, hook.activeOwnersForTest())
             dispatcher.acknowledgeTerminal(committedReplay.attemptId!!)
         } finally {
             admissionExecutor.shutdownNow()
