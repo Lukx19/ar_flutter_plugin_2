@@ -641,6 +641,7 @@ internal class NativeCaptureAdapterV2(
         lifecycleGeneration += 1
         work.values.filter { it.submissionInFlight }.forEach {
             if (it.pendingLifecycleReason == null) it.pendingLifecycleReason = "shutdown"
+            discardPendingComponentsLocked(it)
         }
         while (submissionOperations != 0) submissionIdle.await()
         while (storeOperations != 0) storeIdle.await()
@@ -660,22 +661,37 @@ internal class NativeCaptureAdapterV2(
         value.exposureRequested = true
         value.submissionInFlight = true
         submissionOperations += 1
-        val requested = try {
-            externalCallLocked {
-                exposure.requestExposure(value.qualifier, value.request.accepted.profile.requiredComponents, callback)
-            }
-        } catch (_: Throwable) {
-            safety.release(value.qualifier)
-            false
-        }
+        var requested = false
+        var propagatedSubmissionFailure: Throwable? = null
         try {
+            try {
+                requested = externalCallLocked {
+                    exposure.requestExposure(value.qualifier, value.request.accepted.profile.requiredComponents, callback)
+                }
+            } catch (error: Exception) {
+                if (error is java.util.concurrent.CancellationException) {
+                    propagatedSubmissionFailure = error
+                }
+            } catch (error: Error) {
+                propagatedSubmissionFailure = error
+            }
             // A legal fake/Camera2 bridge may have completed synchronously.
-            if (work[value.request.accepted.identity] !== value) return
+            if (work[value.request.accepted.identity] !== value) {
+                propagatedSubmissionFailure?.let { throw it }
+                return
+            }
             value.submissionResultResolved = true
             val submissionFailure = value.submissionFailure
             value.submissionFailure = null
             val pendingLifecycleReason = value.pendingLifecycleReason
             value.pendingLifecycleReason = null
+            propagatedSubmissionFailure?.let { failure ->
+                discardPendingComponentsLocked(value)
+                value.exposureRequested = false
+                safety.release(value.qualifier)
+                abandonLocked(value.request, "submission-interrupted-before-result")
+                throw failure
+            }
             if (!requested) {
                 discardPendingComponentsLocked(value)
                 value.exposureRequested = false
@@ -690,10 +706,6 @@ internal class NativeCaptureAdapterV2(
             }
             countExposureLocked(value)
             when {
-                submissionFailure != null -> {
-                    discardPendingComponentsLocked(value)
-                    abandonLocked(value.request, "camera-$submissionFailure")
-                }
                 pendingLifecycleReason != null -> {
                     discardPendingComponentsLocked(value)
                     transferUnknownLocked(value, "$pendingLifecycleReason-transfer")
@@ -701,6 +713,10 @@ internal class NativeCaptureAdapterV2(
                 closing -> {
                     discardPendingComponentsLocked(value)
                     transferUnknownLocked(value, "shutdown-transfer")
+                }
+                submissionFailure != null -> {
+                    discardPendingComponentsLocked(value)
+                    abandonLocked(value.request, "camera-$submissionFailure")
                 }
                 value.pendingComponents != null -> {
                     val components = checkNotNull(value.pendingComponents)
@@ -754,7 +770,13 @@ internal class NativeCaptureAdapterV2(
 
         override fun onFailure(qualifier: CaptureAttemptQualifierV2, reason: String) = lock.withLock {
             val value = work[qualifier.identity]
-            if (value == null || value.qualifier != qualifier || closed) { counters.lateCallback(); return@withLock }
+            if (
+                value == null || value.qualifier != qualifier || closed || closing ||
+                value.pendingLifecycleReason != null
+            ) {
+                counters.lateCallback()
+                return@withLock
+            }
             if (value.submissionInFlight && !value.submissionResultResolved) {
                 value.submissionFailure = reason
                 return@withLock
@@ -787,6 +809,7 @@ internal class NativeCaptureAdapterV2(
         }
         var receipt: CaptureReceipt? = null
         var storeFailed = false
+        var propagatedStoreFailure: Throwable? = null
         try {
             receipt = externalCallLocked {
                 store.commitStreamed(
@@ -795,20 +818,31 @@ internal class NativeCaptureAdapterV2(
                     components.streams,
                 )
             }
-        } catch (_: Throwable) {
-            storeFailed = true
+        } catch (error: Exception) {
+            if (error is java.util.concurrent.CancellationException) {
+                propagatedStoreFailure = error
+            } else {
+                storeFailed = true
+            }
+        } catch (error: Error) {
+            propagatedStoreFailure = error
         } finally {
             closeStreams(components.streams)
             endStoreOperationLocked()
         }
-        if (work[value.request.accepted.identity] !== value) return
+        if (work[value.request.accepted.identity] !== value) {
+            propagatedStoreFailure?.let { throw it }
+            return
+        }
         val cutReason = value.pendingLifecycleReason
         when {
             cutReason != null -> transferUnknownLocked(value, "$cutReason-transfer")
             closing -> transferUnknownLocked(value, "shutdown-transfer")
+            propagatedStoreFailure != null -> queryOrAbandonLocked(value, "store-interrupted")
             storeFailed -> queryOrAbandonLocked(value, "store-unknown")
             else -> finishLocked(value, checkNotNull(receipt))
         }
+        propagatedStoreFailure?.let { throw it }
     }
 
     private fun discardPendingComponentsLocked(value: Work) {
@@ -857,6 +891,7 @@ internal class NativeCaptureAdapterV2(
     private fun lifecycleTransferLocked(value: Work, reason: String) {
         if (value.submissionInFlight) {
             if (value.pendingLifecycleReason == null) value.pendingLifecycleReason = reason
+            discardPendingComponentsLocked(value)
             return
         }
         if (value.exposureCounted) transferUnknownLocked(value, "$reason-transfer")
