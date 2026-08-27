@@ -880,9 +880,14 @@ internal class NativeCaptureAdapterV2(
             if (work[value.request.accepted.identity] === value) finishLocked(value, it)
             return
         }
-        if (work[value.request.accepted.identity] !== value) return
+        if (work[value.request.accepted.identity] !== value) {
+            propagatedRebaseFailure?.let { throw it }
+            return
+        }
         propagatedRebaseFailure?.let { failure ->
-            abandonLocked(value.request, "rebase-interrupted")
+            if (value.pendingLifecycleReason == null && !closing) {
+                abandonLocked(value.request, "rebase-interrupted")
+            }
             throw failure
         }
         abandonLocked(value.request, reason)

@@ -1182,6 +1182,47 @@ class NativeCaptureAdapterV2Test {
     }
 
     @Test
+    fun `lifecycle transfer cannot swallow blocked rebase cancellation or error`() {
+        listOf<Throwable>(java.util.concurrent.CancellationException("cancel"), AssertionError("fatal")).forEachIndexed { index, failure ->
+            val store = FakeStore().apply {
+                failCommitAfterReads = 0
+                rebaseFailure = failure
+                rebaseEntered = CountDownLatch(1)
+                rebaseRelease = CountDownLatch(1)
+                serializeCommitAndQuery = true
+            }
+            val camera = FakeExposure()
+            val events = mutableListOf<NativeCaptureEventV2>()
+            val adapter = NativeCaptureAdapterV2(store, camera, events = events::add)
+            val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = (index + 10).toLong())
+            adapter.admit(request)
+            val executor = Executors.newFixedThreadPool(2)
+            try {
+                val callback = executor.submit {
+                    camera.components(camera.requests.single().first, request, listOf(CaptureComponentKind.JPEG))
+                }
+                assertTrue(store.rebaseEntered!!.await(5, TimeUnit.SECONDS))
+                val lifecycle = executor.submit {
+                    adapter.onLifecycle(CaptureLifecycleEvent.BACKGROUNDED, request.accepted.identity.lifecycleCut)
+                }
+                assertThrows(TimeoutException::class.java) { lifecycle.get(100, TimeUnit.MILLISECONDS) }
+                store.rebaseRelease!!.countDown()
+                val thrown = assertThrows(java.util.concurrent.ExecutionException::class.java) {
+                    callback.get(5, TimeUnit.SECONDS)
+                }
+                assertEquals(failure.javaClass, thrown.cause!!.javaClass)
+                lifecycle.get(5, TimeUnit.SECONDS)
+                assertEquals(0, adapter.snapshot().running)
+                assertTrue(store.terminals.isEmpty())
+                assertTrue(events.none { it.kind == NativeCaptureEventKindV2.ABANDONED || it.kind == NativeCaptureEventKindV2.COMMITTED })
+            } finally {
+                store.rebaseRelease?.countDown()
+                executor.shutdownNow()
+            }
+        }
+    }
+
+    @Test
     fun `every lifecycle event transfers post-exposure ownership as unknown and late components close`() {
         CaptureLifecycleEvent.entries.forEachIndexed { index, event ->
             val store = FakeStore()
@@ -1351,6 +1392,8 @@ class NativeCaptureAdapterV2Test {
         var failCommitAfterReads: Int? = null
         var commitFailure: Throwable? = null
         var rebaseFailure: Throwable? = null
+        var rebaseEntered: CountDownLatch? = null
+        var rebaseRelease: CountDownLatch? = null
         var acceptEntered: CountDownLatch? = null
         var acceptRelease: CountDownLatch? = null
         var commitEntered: CountDownLatch? = null
@@ -1408,6 +1451,12 @@ class NativeCaptureAdapterV2Test {
             return terminals.firstOrNull { it.identity == identity }
         }
         override fun rebaseSameAttempt(request: CaptureCommitRequest): CaptureReceipt {
+            return if (serializeCommitAndQuery) synchronized(storeMutex) { rebaseBody() }
+            else rebaseBody()
+        }
+        private fun rebaseBody(): CaptureReceipt {
+            rebaseEntered?.countDown()
+            rebaseRelease?.await(5, TimeUnit.SECONDS)
             rebaseFailure?.let { throw it }
             throw IllegalStateException("not prepared")
         }
