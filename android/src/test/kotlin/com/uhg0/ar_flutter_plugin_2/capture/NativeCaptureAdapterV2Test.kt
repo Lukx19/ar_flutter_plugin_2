@@ -1,5 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.capture
 
+import android.content.ContextWrapper
 import java.io.File
 import java.io.InputStream
 import java.util.concurrent.CountDownLatch
@@ -16,6 +17,44 @@ import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class NativeCaptureAdapterV2Test {
+    @Test
+    fun `close before first use guards every late lazy entry without acquiring root`() {
+        val files = java.nio.file.Files.createTempDirectory("capture-v2-close-before-use-").toFile()
+        val context = object : ContextWrapper(null) {
+            override fun getFilesDir(): File = files
+        }
+        val safety = CaptureSafetySignalV2()
+        val binding = NativeCaptureBindingV2(context, safety)
+        val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG))
+        try {
+            binding.close()
+
+            binding.onPause()
+            binding.onLifecycle(CaptureLifecycleEvent.ROUTE_LEFT)
+            binding.onLifecycle(CaptureLifecycleEvent.ROUTE_LEFT, request.accepted.identity.lifecycleCut)
+            assertFalse(safety.isCaptureSafe())
+
+            listOf<() -> Any?>(
+                { binding.snapshot() },
+                { binding.replayRecovery() },
+                { binding.acknowledgeTerminal("late") },
+                { binding.admit(request) },
+                { binding.forceRecoveryForDebug() },
+                { binding.syntheticAdapterForTest() },
+            ).forEach { late ->
+                val error = assertThrows(NativeCaptureBindingClosedV2::class.java) { late() }
+                assertEquals("NATIVE_CAPTURE_V2_RECOVERY_CLOSED", error.code)
+            }
+
+            val root = File(files, "capture-v2-native")
+            NativeCaptureDurableRootLeaseV2.acquire(root).close()
+            assertFalse(root.exists())
+        } finally {
+            binding.close()
+            files.deleteRecursively()
+        }
+    }
+
     @Test
     fun `normal close wins before deadline and never executes fallback`() {
         val main = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "test-main") }

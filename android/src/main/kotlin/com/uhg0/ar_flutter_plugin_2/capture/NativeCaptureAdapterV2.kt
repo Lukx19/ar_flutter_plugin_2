@@ -277,6 +277,11 @@ internal class NativeCaptureDurableRootPendingV2 : NativeCaptureRecoveryAdmissio
     "The previous capture view still owns the durable root; retry after its shutdown completes.",
 )
 
+internal class NativeCaptureBindingClosedV2 : NativeCaptureRecoveryAdmissionExceptionV2(
+    "NATIVE_CAPTURE_V2_RECOVERY_CLOSED",
+    "Native capture binding is closed.",
+)
+
 /** One-shot async preparation whose success or failure is replayed to every later disposer. */
 internal class ReplayableShutdownPreparationV2 {
     private val lock = Any()
@@ -490,6 +495,9 @@ internal class NativeCaptureBindingV2(
         },
     )
     private val recoveryDelegate = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        // Acquire the root inside the binding gate, before recovery can escape
+        // onto its worker and race close-before-first-use.
+        rootResources
         NativeCaptureRecoveryDispatcherV2(
             recover = { shouldContinue -> store.recoverAndProject(shouldContinue = shouldContinue) },
             events = events,
@@ -516,7 +524,7 @@ internal class NativeCaptureBindingV2(
     }
     private val deadlineScheduler by deadlineSchedulerDelegate
     fun attachSharedCamera(manager: SharedCameraManager) = synchronized(lock) {
-        check(!closed) { "NativeCaptureBindingV2 is closed" }
+        if (closed) throw NativeCaptureBindingClosedV2()
         sharedCamera = manager
         // #102's manager-owned direct route is the default. Tests may install
         // a synthetic hook explicitly below; neither route can consult V1's
@@ -524,24 +532,32 @@ internal class NativeCaptureBindingV2(
     }
     fun detachSharedCamera(manager: SharedCameraManager) = synchronized(lock) { if (sharedCamera === manager) sharedCamera = null }
     fun admit(request: CaptureCommitRequest): CaptureReceipt {
-        synchronized(lock) {
-            check(!closed) { "NativeCaptureBindingV2 is closed" }
-            recovery.requireAdmissionReady()
-        }
-        return adapter.admit(request)
+        val (activeAdapter, activeRecovery) = durableOwnersForOperation()
+        activeRecovery.requireAdmissionReady()
+        return activeAdapter.admit(request)
     }
-    fun onLifecycle(event: CaptureLifecycleEvent, cut: CaptureLifecycleCut) = adapter.onLifecycle(event, cut)
-    fun onLifecycle(event: CaptureLifecycleEvent) = adapter.onLifecycle(event)
-    fun onPause() = adapter.onLifecycle(CaptureLifecycleEvent.BACKGROUNDED)
-    fun onViewReplacement() = adapter.onLifecycle(CaptureLifecycleEvent.VIEW_REPLACED)
-    fun onArSessionReplacement() = adapter.onLifecycle(CaptureLifecycleEvent.AR_SESSION_REPLACED)
-    fun forceRecoveryForDebug() = adapter.forceRecoveryForDebug()
-    fun replayRecovery(): List<NativeCaptureEventV2> = recovery.replaySnapshot()
-    fun acknowledgeTerminal(attemptId: String) = recovery.acknowledgeTerminal(attemptId)
-    fun snapshot() = adapter.snapshot()
+    fun onLifecycle(event: CaptureLifecycleEvent, cut: CaptureLifecycleCut) {
+        adapterForLifecycleOrNull()?.onLifecycle(event, cut)
+    }
+    fun onLifecycle(event: CaptureLifecycleEvent) {
+        adapterForLifecycleOrNull()?.onLifecycle(event)
+    }
+    fun onPause() {
+        adapterForLifecycleOrNull()?.onLifecycle(CaptureLifecycleEvent.BACKGROUNDED)
+    }
+    fun onViewReplacement() {
+        adapterForLifecycleOrNull()?.onLifecycle(CaptureLifecycleEvent.VIEW_REPLACED)
+    }
+    fun onArSessionReplacement() {
+        adapterForLifecycleOrNull()?.onLifecycle(CaptureLifecycleEvent.AR_SESSION_REPLACED)
+    }
+    fun forceRecoveryForDebug() = adapterForOperation().forceRecoveryForDebug()
+    fun replayRecovery(): List<NativeCaptureEventV2> = recoveryForOperation().replaySnapshot()
+    fun acknowledgeTerminal(attemptId: String) = recoveryForOperation().acknowledgeTerminal(attemptId)
+    fun snapshot() = adapterForOperation().snapshot()
 
     /** Native instrumentation seam; it is never registered with a Flutter channel. */
-    internal fun syntheticAdapterForTest(): NativeCaptureAdapterV2 = adapter
+    internal fun syntheticAdapterForTest(): NativeCaptureAdapterV2 = adapterForOperation()
 
     internal fun installSyntheticExposureHookForTest(
         request: (CaptureAttemptQualifierV2, Set<CaptureComponentKind>, SharedCameraExposureCallbackV2) -> Boolean,
@@ -551,6 +567,31 @@ internal class NativeCaptureBindingV2(
         val manager = sharedCamera ?: return@synchronized false
         manager.installAttemptQualifiedExposureHookV2(request, cancel)
         true
+    }
+
+    private fun durableOwnersForOperation(): Pair<NativeCaptureAdapterV2, NativeCaptureRecoveryDispatcherV2> =
+        synchronized(lock) {
+            if (closed) throw NativeCaptureBindingClosedV2()
+            // Initialize every lazy durable dependency while close is excluded.
+            deadlineScheduler
+            adapter to recovery
+        }
+
+    private fun adapterForOperation(): NativeCaptureAdapterV2 = durableOwnersForOperation().first
+
+    private fun recoveryForOperation(): NativeCaptureRecoveryDispatcherV2 = synchronized(lock) {
+        if (closed) throw NativeCaptureBindingClosedV2()
+        recovery
+    }
+
+    private fun adapterForLifecycleOrNull(): NativeCaptureAdapterV2? = synchronized(lock) {
+        if (closed) {
+            safety.invalidateAll()
+            null
+        } else {
+            deadlineScheduler
+            adapter
+        }
     }
 
     override fun close() {
