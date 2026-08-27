@@ -17,6 +17,46 @@ import org.junit.Test
 
 class NativeCaptureAdapterV2Test {
     @Test
+    fun `normal close wins before deadline and never executes fallback`() {
+        val main = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "test-main") }
+        val owner = NativeCaptureSerialOwnerV2(main)
+        val completed = CountDownLatch(1)
+        val fallback = CountDownLatch(1)
+        try {
+            assertTrue(owner.close(
+                timeoutMillis = 200,
+                operation = {},
+                timeoutOperation = { fallback.countDown() },
+                completion = { completed.countDown() },
+            ))
+            assertTrue(completed.await(2, TimeUnit.SECONDS))
+            assertFalse(fallback.await(400, TimeUnit.MILLISECONDS))
+        } finally {
+            main.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `worker close failure claims winner then runs fallback exactly once`() {
+        val main = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "test-main") }
+        val owner = NativeCaptureSerialOwnerV2(main)
+        val completed = CountDownLatch(1)
+        val fallbackCalls = java.util.concurrent.atomic.AtomicInteger()
+        try {
+            assertTrue(owner.close(
+                timeoutMillis = 500,
+                operation = { throw IllegalStateException("close-failed") },
+                timeoutOperation = { fallbackCalls.incrementAndGet() },
+                completion = { result -> assertTrue(result.isSuccess); completed.countDown() },
+            ))
+            assertTrue(completed.await(2, TimeUnit.SECONDS))
+            assertEquals(1, fallbackCalls.get())
+        } finally {
+            main.shutdownNow()
+        }
+    }
+
+    @Test
     fun `never releasing submission has responsive main bounded close and fenced late callback`() {
         val main = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "test-main") }
         val owner = NativeCaptureSerialOwnerV2(main)
@@ -141,6 +181,58 @@ class NativeCaptureAdapterV2Test {
 
         assertEquals(failure, first.single().exceptionOrNull())
         assertEquals(failure, second.single().exceptionOrNull())
+    }
+
+    @Test
+    fun `deadline acknowledgement retains root lease until old store worker terminates`() {
+        val root = java.nio.file.Files.createTempDirectory("capture-v2-root-lease-").toFile()
+        val oldLease = NativeCaptureDurableRootLeaseV2.acquire(root)
+        val main = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "test-main") }
+        val owner = NativeCaptureSerialOwnerV2(main)
+        val storeEntered = CountDownLatch(1)
+        val storeRelease = CountDownLatch(1)
+        val closeAcknowledged = CountDownLatch(1)
+        val mutations = java.util.Collections.synchronizedList(mutableListOf<String>())
+        try {
+            assertTrue(owner.submit(
+                operation = {
+                    storeEntered.countDown()
+                    storeRelease.await()
+                    mutations += "old-late-commit"
+                },
+                completion = {},
+            ))
+            assertTrue(storeEntered.await(5, TimeUnit.SECONDS))
+            assertTrue(owner.close(
+                timeoutMillis = 100,
+                operation = { oldLease.close() },
+                timeoutOperation = { /* UI teardown wins; durable-root authority deliberately remains old. */ },
+                completion = { closeAcknowledged.countDown() },
+            ))
+            assertTrue(closeAcknowledged.await(2, TimeUnit.SECONDS))
+
+            assertThrows(IllegalStateException::class.java) {
+                NativeCaptureDurableRootLeaseV2.acquire(root)
+            }
+            assertTrue(mutations.isEmpty())
+
+            storeRelease.countDown()
+            assertTrue(owner.awaitTerminationForTest(5, TimeUnit.SECONDS))
+            val replacement = NativeCaptureDurableRootLeaseV2.acquire(root)
+            try {
+                mutations += "replacement-recovery-after-old"
+            } finally {
+                replacement.close()
+            }
+            assertEquals(listOf("old-late-commit", "replacement-recovery-after-old"), mutations)
+
+            NativeCaptureDurableRootLeaseV2.acquire(root).close()
+        } finally {
+            storeRelease.countDown()
+            oldLease.close()
+            main.shutdownNow()
+            root.deleteRecursively()
+        }
     }
 
     @Test

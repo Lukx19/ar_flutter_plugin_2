@@ -301,6 +301,36 @@ internal class ReplayableShutdownPreparationV2 {
 }
 
 /**
+ * Process-local exclusive authority for one durable capture root. A timed-out
+ * view may release UI/Camera2 resources, but replacement recovery cannot open
+ * this root until the old durable worker has actually terminated and closed it.
+ */
+internal class NativeCaptureDurableRootLeaseV2 private constructor(
+    private val key: String,
+) : AutoCloseable {
+    private val released = AtomicBoolean(false)
+
+    override fun close() {
+        if (!released.compareAndSet(false, true)) return
+        synchronized(activeRoots) {
+            check(activeRoots.remove(key)) { "Native capture durable root lease was not active" }
+        }
+    }
+
+    companion object {
+        private val activeRoots = mutableSetOf<String>()
+
+        fun acquire(root: java.io.File): NativeCaptureDurableRootLeaseV2 {
+            val key = root.canonicalFile.path
+            synchronized(activeRoots) {
+                check(activeRoots.add(key)) { "Native capture durable root is still owned by a closing view" }
+            }
+            return NativeCaptureDurableRootLeaseV2(key)
+        }
+    }
+}
+
+/**
  * One bounded durable worker per platform view. Calls return after ownership of
  * the operation has transferred to the worker; completions are dispatched on
  * the supplied owner (Android's main looper in production). FIFO execution is
@@ -333,8 +363,9 @@ internal class NativeCaptureSerialOwnerV2(
             val settled = AtomicBoolean(false)
             deadlineWorker.schedule(
                 {
+                    if (!settled.compareAndSet(false, true)) return@schedule
                     val result = runCatching(timeoutOperation)
-                    if (settled.compareAndSet(false, true)) completionExecutor.execute { completion(result) }
+                    completionExecutor.execute { completion(result) }
                     deadlineWorker.shutdown()
                 },
                 timeoutMillis,
@@ -342,8 +373,10 @@ internal class NativeCaptureSerialOwnerV2(
             )
             worker.execute {
                 val operationResult = runCatching(operation)
-                val result = if (operationResult.isSuccess) operationResult else runCatching(timeoutOperation)
-                if (settled.compareAndSet(false, true)) completionExecutor.execute { completion(result) }
+                if (settled.compareAndSet(false, true)) {
+                    val result = if (operationResult.isSuccess) operationResult else runCatching(timeoutOperation)
+                    completionExecutor.execute { completion(result) }
+                }
                 deadlineWorker.shutdownNow()
                 worker.shutdown()
             }
@@ -374,12 +407,10 @@ internal class NativeCaptureBindingV2(
     private val events: (NativeCaptureEventV2) -> Unit = {},
 ) : AutoCloseable {
     private val lock = Any()
-    private val root = createNativeCaptureRootV2(context)
-    private val budget = StorageBudgetCoordinatorV2(
-        java.io.File(root, "budget"),
-        StorageBudgetPolicyV2((context.filesDir.usableSpace / 2).coerceAtLeast(CAPTURE_COEXISTENCE_BYTES), 0),
-    )
-    private val store = DurableSessionStoreV2(java.io.File(root, "store"), budget)
+    private val rootResources = createNativeCaptureRootResourcesV2(context)
+    private val rootAuthority = rootResources.authority
+    private val budget = rootResources.budget
+    private val store = rootResources.store
     private var sharedCamera: SharedCameraManager? = null
     private var closed = false
     private var resourcesClosed = false
@@ -453,32 +484,80 @@ internal class NativeCaptureBindingV2(
             if (resourcesClosed) return
             closed = true
         }
-        deadlineScheduler.shutdownNow()
-        recovery.close()
-        adapter.onLifecycle(CaptureLifecycleEvent.VIEW_REPLACED)
-        adapter.close()
+        var closeFailure: Throwable? = null
+        fun attempt(operation: () -> Unit) {
+            runCatching(operation).onFailure { if (closeFailure == null) closeFailure = it }
+        }
+        attempt { deadlineScheduler.shutdownNow() }
+        attempt { recovery.close() }
+        attempt { adapter.onLifecycle(CaptureLifecycleEvent.VIEW_REPLACED) }
+        attempt { adapter.close() }
         val manager = synchronized(lock) { sharedCamera.also { sharedCamera = null } }
-        manager?.clearAttemptQualifiedExposureHookV2()
-        store.close()
-        budget.close()
+        attempt { manager?.clearAttemptQualifiedExposureHookV2() }
+        attempt { store.close() }
+        attempt { budget.close() }
+        attempt { rootAuthority.close() }
         synchronized(lock) { resourcesClosed = true }
+        closeFailure?.let { throw it }
     }
 
     /** Safe non-blocking half-close for the serial owner's shutdown deadline. */
     internal fun forceCloseForDeadline() {
-        synchronized(lock) { closed = true }
+        synchronized(lock) {
+            if (resourcesClosed) return
+            closed = true
+        }
         deadlineScheduler.shutdownNow()
         recovery.close()
         adapter.forceCloseForDeadline()
         synchronized(lock) { sharedCamera }?.clearAttemptQualifiedExposureHookV2()
     }
 
-    private fun createNativeCaptureRootV2(context: Context): java.io.File {
-        val root = java.io.File(context.filesDir, "capture-v2-native")
-        AndroidDescriptorFilesystemV2().use { unbound ->
-            unbound.bind(root).use { }
+    private class NativeCaptureRootAuthorityV2(
+        val root: java.io.File,
+        private val lease: NativeCaptureDurableRootLeaseV2,
+    ) : AutoCloseable {
+        override fun close() = lease.close()
+    }
+
+    private class NativeCaptureRootResourcesV2(
+        val authority: NativeCaptureRootAuthorityV2,
+        val budget: StorageBudgetCoordinatorV2,
+        val store: DurableSessionStoreV2,
+    )
+
+    private fun createNativeCaptureRootResourcesV2(context: Context): NativeCaptureRootResourcesV2 {
+        val authority = acquireNativeCaptureRootV2(context)
+        var budget: StorageBudgetCoordinatorV2? = null
+        try {
+            budget = StorageBudgetCoordinatorV2(
+                java.io.File(authority.root, "budget"),
+                StorageBudgetPolicyV2(
+                    (context.filesDir.usableSpace / 2).coerceAtLeast(CAPTURE_COEXISTENCE_BYTES),
+                    0,
+                ),
+            )
+            val store = DurableSessionStoreV2(java.io.File(authority.root, "store"), budget)
+            return NativeCaptureRootResourcesV2(authority, budget, store)
+        } catch (error: Throwable) {
+            runCatching { budget?.close() }
+            authority.close()
+            throw error
         }
-        return root
+    }
+
+    private fun acquireNativeCaptureRootV2(context: Context): NativeCaptureRootAuthorityV2 {
+        val root = java.io.File(context.filesDir, "capture-v2-native")
+        val lease = NativeCaptureDurableRootLeaseV2.acquire(root)
+        try {
+            AndroidDescriptorFilesystemV2().use { unbound ->
+                unbound.bind(root).use { }
+            }
+            return NativeCaptureRootAuthorityV2(root, lease)
+        } catch (error: Throwable) {
+            lease.close()
+            throw error
+        }
     }
 }
 
