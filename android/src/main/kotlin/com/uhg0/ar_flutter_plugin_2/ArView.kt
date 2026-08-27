@@ -22,6 +22,7 @@ import com.uhg0.ar_flutter_plugin_2.capture.CaptureSafetySignalV2
 import com.uhg0.ar_flutter_plugin_2.capture.CaptureSessionException
 import com.uhg0.ar_flutter_plugin_2.capture.NativeCaptureRecoveryAdmissionExceptionV2
 import com.uhg0.ar_flutter_plugin_2.capture.PoseBatchDispatcher
+import com.uhg0.ar_flutter_plugin_2.capture.ReplayableShutdownPreparationV2
 import com.uhg0.ar_flutter_plugin_2.sceneview.PluginAnchorRecord
 import com.uhg0.ar_flutter_plugin_2.sceneview.PluginHitResult
 import com.uhg0.ar_flutter_plugin_2.sceneview.PluginNodeRecord
@@ -84,9 +85,7 @@ internal class ArView(
     private val detectedPlanes = mutableSetOf<Plane>()
     private var sessionConfig = defaultSessionConfig()
     private var sessionPausedByFlutter = false
-    private var shutdownPrepared = false
-    private var shutdownPrepareCompleted = false
-    private val shutdownPrepareCallbacks = mutableListOf<(Result<Unit>) -> Unit>()
+    private val shutdownPreparation = ReplayableShutdownPreparationV2()
     private var capturePauseOperations = 0
     private val afterCapturePauseCallbacks = mutableListOf<() -> Unit>()
     private var disposed = false
@@ -262,7 +261,11 @@ internal class ArView(
         prepareForDispose { result ->
             if (result.isFailure) {
                 Log.e("ArView", "Native capture disposal fence failed", result.exceptionOrNull())
-                return@prepareForDispose
+                // Fail closed and preserve ARCore-pause-before-Camera2 cleanup.
+                captureSafetySignalV2.invalidateAll()
+                sceneHost.pause()
+                visibilityObservationRuntime.pause()
+                captureSession.finishSharedCameraPause()
             }
             disposeAfterPauseFence()
         }
@@ -281,7 +284,6 @@ internal class ArView(
         if (!captureSession.dispose { result ->
                 if (result.isFailure) {
                     Log.e("ArView", "Native capture durable close failed", result.exceptionOrNull())
-                    return@dispose
                 }
                 disposeAfterCaptureClosed()
             }
@@ -301,22 +303,14 @@ internal class ArView(
     }
 
     private fun prepareForDispose(onCompleted: (Result<Unit>) -> Unit) {
-        if (shutdownPrepareCompleted) {
-            onCompleted(Result.success(Unit))
-            return
-        }
-        shutdownPrepareCallbacks += onCompleted
-        if (shutdownPrepared) return
-        shutdownPrepared = true
+        if (!shutdownPreparation.request(onCompleted)) return
         // ARCore's SharedCamera sample pauses the Session before closing
         // Camera2. Its wrapped image/session callbacks retain native Session
         // state until Camera2 shutdown completes.
         // Fence/drain V2 before ARCore pause, then preserve the required
         // ARCore-pause-before-Camera2 shutdown order for SharedCamera.
         prepareCapturePause { result ->
-            if (result.isSuccess) shutdownPrepareCompleted = true
-            shutdownPrepareCallbacks.toList().forEach { it(result) }
-            shutdownPrepareCallbacks.clear()
+            shutdownPreparation.complete(result)
         }
     }
 

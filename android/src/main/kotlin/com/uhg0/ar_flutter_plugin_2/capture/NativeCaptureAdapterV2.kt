@@ -6,6 +6,7 @@ import java.io.InputStream
 import java.util.concurrent.Executor
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -271,6 +272,34 @@ internal class NativeCaptureRecoveryAdmissionExceptionV2(
     message: String,
 ) : IllegalStateException(message)
 
+/** One-shot async preparation whose success or failure is replayed to every later disposer. */
+internal class ReplayableShutdownPreparationV2 {
+    private val lock = Any()
+    private var started = false
+    private var result: Result<Unit>? = null
+    private val callbacks = mutableListOf<(Result<Unit>) -> Unit>()
+
+    fun request(callback: (Result<Unit>) -> Unit): Boolean = synchronized(lock) {
+        result?.let {
+            callback(it)
+            return@synchronized false
+        }
+        callbacks += callback
+        if (started) return@synchronized false
+        started = true
+        true
+    }
+
+    fun complete(completed: Result<Unit>) {
+        val pending = synchronized(lock) {
+            if (result != null) return
+            result = completed
+            callbacks.toList().also { callbacks.clear() }
+        }
+        pending.forEach { it(completed) }
+    }
+}
+
 /**
  * One bounded durable worker per platform view. Calls return after ownership of
  * the operation has transferred to the worker; completions are dispatched on
@@ -282,41 +311,55 @@ internal class NativeCaptureSerialOwnerV2(
     private val worker: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "capture3d-v2-durable").apply { isDaemon = true }
     },
+    private val deadlineWorker: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { runnable ->
+        Thread(runnable, "capture3d-v2-close-deadline").apply { isDaemon = true }
+    },
 ) {
     private val lock = Any()
     private var closing = false
 
     fun <T> submit(operation: () -> T, completion: (Result<T>) -> Unit): Boolean =
-        enqueue(closeAfter = false, operation, completion)
+        enqueue(operation, completion)
 
-    fun <T> close(operation: () -> T, completion: (Result<T>) -> Unit): Boolean =
+    fun close(
+        timeoutMillis: Long,
+        operation: () -> Unit,
+        timeoutOperation: () -> Unit,
+        completion: (Result<Unit>) -> Unit,
+    ): Boolean =
         synchronized(lock) {
             if (closing) return@synchronized false
             closing = true
-            enqueueLocked(closeAfter = true, operation, completion)
+            val settled = AtomicBoolean(false)
+            deadlineWorker.schedule(
+                {
+                    val result = runCatching(timeoutOperation)
+                    if (settled.compareAndSet(false, true)) completionExecutor.execute { completion(result) }
+                    deadlineWorker.shutdown()
+                },
+                timeoutMillis,
+                TimeUnit.MILLISECONDS,
+            )
+            worker.execute {
+                val operationResult = runCatching(operation)
+                val result = if (operationResult.isSuccess) operationResult else runCatching(timeoutOperation)
+                if (settled.compareAndSet(false, true)) completionExecutor.execute { completion(result) }
+                deadlineWorker.shutdownNow()
+                worker.shutdown()
+            }
             true
         }
 
     private fun <T> enqueue(
-        closeAfter: Boolean,
         operation: () -> T,
         completion: (Result<T>) -> Unit,
     ): Boolean = synchronized(lock) {
         if (closing) return@synchronized false
-        enqueueLocked(closeAfter, operation, completion)
-        true
-    }
-
-    private fun <T> enqueueLocked(
-        closeAfter: Boolean,
-        operation: () -> T,
-        completion: (Result<T>) -> Unit,
-    ) {
         worker.execute {
             val result = runCatching(operation)
-            if (closeAfter) worker.shutdown()
             completionExecutor.execute { completion(result) }
         }
+        true
     }
 
     internal fun awaitTerminationForTest(timeout: Long, unit: TimeUnit): Boolean =
@@ -339,6 +382,7 @@ internal class NativeCaptureBindingV2(
     private val store = DurableSessionStoreV2(java.io.File(root, "store"), budget)
     private var sharedCamera: SharedCameraManager? = null
     private var closed = false
+    private var resourcesClosed = false
     private val bridge = SharedCameraManagerExposurePortV2(
         request = { qualifier, required, callback ->
             val manager = synchronized(lock) { if (closed) null else sharedCamera }
@@ -406,7 +450,7 @@ internal class NativeCaptureBindingV2(
 
     override fun close() {
         synchronized(lock) {
-            if (closed) return
+            if (resourcesClosed) return
             closed = true
         }
         deadlineScheduler.shutdownNow()
@@ -417,6 +461,16 @@ internal class NativeCaptureBindingV2(
         manager?.clearAttemptQualifiedExposureHookV2()
         store.close()
         budget.close()
+        synchronized(lock) { resourcesClosed = true }
+    }
+
+    /** Safe non-blocking half-close for the serial owner's shutdown deadline. */
+    internal fun forceCloseForDeadline() {
+        synchronized(lock) { closed = true }
+        deadlineScheduler.shutdownNow()
+        recovery.close()
+        adapter.forceCloseForDeadline()
+        synchronized(lock) { sharedCamera }?.clearAttemptQualifiedExposureHookV2()
     }
 
     private fun createNativeCaptureRootV2(context: Context): java.io.File {
@@ -531,6 +585,7 @@ internal class NativeCaptureAdapterV2(
         var lifecycleTransferInProgress: Boolean = false,
         var componentsClaimed: Boolean = false,
         var pendingComponents: SharedCameraComponentSetV2? = null,
+        var inFlightStoreComponents: SharedCameraComponentSetV2? = null,
         var tenSecondPresented: Boolean = false,
         var terminalClaimed: Boolean = false,
     )
@@ -724,6 +779,41 @@ internal class NativeCaptureAdapterV2(
         closing = false
     }
 
+    /**
+     * Deadline fallback used only after the owning serial close could not run or
+     * finish. It performs no external/store call: every durable accepted owner
+     * transfers to restart recovery, safety fails closed, and late components
+     * are rejected before platform teardown is allowed to continue.
+     */
+    internal fun forceCloseForDeadline() = lock.withLock {
+        if (closed) return@withLock
+        closing = true
+        closed = true
+        lifecycleGeneration += 1
+        safety.invalidateAll()
+        work.values.toList().forEach { value ->
+            if (value.pendingLifecycleReason == null) value.pendingLifecycleReason = "shutdown-deadline"
+            discardPendingComponentsLocked(value)
+            value.inFlightStoreComponents?.let {
+                closeStreams(it.streams)
+                value.inFlightStoreComponents = null
+            }
+            counters.unknownQuery(value.request.accepted.identity)
+            emitLocked(
+                NativeCaptureEventV2(
+                    NativeCaptureEventKindV2.RECOVERING,
+                    value.request.accepted.identity.attemptId,
+                    reason = "shutdown-deadline-transfer",
+                    recoveryContext = value.request.recoveryContext,
+                ),
+            )
+            safety.release(value.qualifier)
+            work.remove(value.request.accepted.identity)
+            scheduler.release(value.request.accepted.identity)
+        }
+        closing = false
+    }
+
     private fun startLocked(value: Work) {
         if (closed || value.exposureRequested || scheduler.running?.identity != value.request.accepted.identity) return
         // Bind before submission: a fake or Camera2 bridge may complete on the
@@ -881,6 +971,7 @@ internal class NativeCaptureAdapterV2(
         var receipt: CaptureReceipt? = null
         var storeFailed = false
         var propagatedStoreFailure: Throwable? = null
+        value.inFlightStoreComponents = components
         try {
             receipt = externalCallLocked {
                 store.commitStreamed(
@@ -899,6 +990,7 @@ internal class NativeCaptureAdapterV2(
             propagatedStoreFailure = error
         } finally {
             closeStreams(components.streams)
+            value.inFlightStoreComponents = null
             endStoreOperationLocked()
         }
         if (work[value.request.accepted.identity] !== value) {

@@ -17,22 +17,22 @@ import org.junit.Test
 
 class NativeCaptureAdapterV2Test {
     @Test
-    fun `blocked submission leaves main responsive and lifecycle completion ordered`() {
+    fun `never releasing submission has responsive main bounded close and fenced late callback`() {
         val main = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "test-main") }
         val owner = NativeCaptureSerialOwnerV2(main)
         val exposure = BlockingExposure(result = true)
-        val adapter = NativeCaptureAdapterV2(FakeStore(), exposure)
+        val safety = CaptureSafetySignalV2()
+        val adapter = NativeCaptureAdapterV2(FakeStore(), exposure, safety)
         val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG))
         val mainReturned = CountDownLatch(1)
         val mainResponsive = CountDownLatch(1)
         val lifecycleCompleted = CountDownLatch(1)
         val closeCompleted = CountDownLatch(1)
-        val completions = java.util.Collections.synchronizedList(mutableListOf<String>())
         try {
             main.execute {
                 assertTrue(owner.submit(
                     operation = { adapter.admit(request) },
-                    completion = { completions += "admission" },
+                    completion = {},
                 ))
                 mainReturned.countDown()
             }
@@ -43,26 +43,30 @@ class NativeCaptureAdapterV2Test {
 
             assertTrue(owner.submit(
                 operation = { adapter.onLifecycle(CaptureLifecycleEvent.BACKGROUNDED) },
-                completion = { completions += "lifecycle"; lifecycleCompleted.countDown() },
+                completion = { lifecycleCompleted.countDown() },
             ))
             assertTrue(owner.close(
+                timeoutMillis = 100,
                 operation = { adapter.close() },
-                completion = { completions += "close"; closeCompleted.countDown() },
+                timeoutOperation = { adapter.forceCloseForDeadline() },
+                completion = { closeCompleted.countDown() },
             ))
             assertFalse(lifecycleCompleted.await(100, TimeUnit.MILLISECONDS))
-            exposure.release.countDown()
-            assertTrue(lifecycleCompleted.await(5, TimeUnit.SECONDS))
-            assertTrue(closeCompleted.await(5, TimeUnit.SECONDS))
-            assertEquals(listOf("admission", "lifecycle", "close"), completions)
+            assertTrue("bounded close must settle without releasing submission", closeCompleted.await(2, TimeUnit.SECONDS))
+            assertFalse(safety.isCaptureSafe())
+            val late = exposure.components(request)
+            assertTrue(late.closed)
+            assertEquals(1L, adapter.snapshot().lateCallbacks)
             assertEquals(0, adapter.snapshot().running)
         } finally {
             exposure.release.countDown()
+            owner.awaitTerminationForTest(5, TimeUnit.SECONDS)
             main.shutdownNow()
         }
     }
 
     @Test
-    fun `blocked store leaves main responsive and close waits for durable ownership`() {
+    fun `never releasing store has responsive main and bounded ownership transfer`() {
         val main = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "test-main") }
         val owner = NativeCaptureSerialOwnerV2(main)
         val store = FakeStore().apply {
@@ -76,11 +80,17 @@ class NativeCaptureAdapterV2Test {
         val mainReturned = CountDownLatch(1)
         val mainResponsive = CountDownLatch(1)
         val closeCompleted = CountDownLatch(1)
+        val input = CloseTrackingInputStream(bytes(CaptureComponentKind.JPEG))
         try {
             main.execute {
                 assertTrue(owner.submit(
                     operation = {
-                        camera.components(camera.requests.single().first, request, listOf(CaptureComponentKind.JPEG))
+                        camera.callback!!.onComponents(
+                            SharedCameraComponentSetV2(
+                                camera.requests.single().first,
+                                listOf(CaptureComponentStreamV2(CaptureComponentKind.JPEG, input)),
+                            ),
+                        )
                     },
                     completion = {},
                 ))
@@ -92,19 +102,45 @@ class NativeCaptureAdapterV2Test {
             assertTrue("main must remain schedulable while durable store is blocked", mainResponsive.await(1, TimeUnit.SECONDS))
 
             assertTrue(owner.close(
+                timeoutMillis = 100,
                 operation = { adapter.close() },
+                timeoutOperation = { adapter.forceCloseForDeadline() },
                 completion = { closeCompleted.countDown() },
             ))
-            assertFalse("close must not return before store ownership is settled", closeCompleted.await(100, TimeUnit.MILLISECONDS))
-            store.commitRelease!!.countDown()
-            assertTrue(closeCompleted.await(5, TimeUnit.SECONDS))
-            assertTrue(owner.awaitTerminationForTest(5, TimeUnit.SECONDS))
-            assertEquals(CaptureTerminalKind.COMMITTED_PICTURE, store.terminals.single().terminal?.kind)
+            assertTrue("bounded close must settle without releasing store", closeCompleted.await(2, TimeUnit.SECONDS))
+            assertTrue("deadline transfer must close the store-owned component", input.closed)
+            assertTrue(store.terminals.isEmpty())
+            assertEquals(1L, adapter.snapshot().unknownQueries)
             assertEquals(0, adapter.snapshot().running)
+            val late = CloseTrackingInputStream(bytes(CaptureComponentKind.JPEG))
+            camera.callback!!.onComponents(
+                SharedCameraComponentSetV2(
+                    camera.requests.single().first,
+                    listOf(CaptureComponentStreamV2(CaptureComponentKind.JPEG, late)),
+                ),
+            )
+            assertTrue(late.closed)
+            assertEquals(1L, adapter.snapshot().lateCallbacks)
         } finally {
             store.commitRelease?.countDown()
+            owner.awaitTerminationForTest(5, TimeUnit.SECONDS)
             main.shutdownNow()
         }
+    }
+
+    @Test
+    fun `failed shutdown preparation is replayed instead of stranding later disposers`() {
+        val preparation = ReplayableShutdownPreparationV2()
+        val failure = IllegalStateException("durable-pause-failed")
+        val first = mutableListOf<Result<Unit>>()
+        val second = mutableListOf<Result<Unit>>()
+
+        assertTrue(preparation.request(first::add))
+        preparation.complete(Result.failure(failure))
+        assertFalse(preparation.request(second::add))
+
+        assertEquals(failure, first.single().exceptionOrNull())
+        assertEquals(failure, second.single().exceptionOrNull())
     }
 
     @Test

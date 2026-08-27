@@ -46,6 +46,7 @@ internal class ArCaptureSession(
 ) {
     companion object {
         private const val TrackingPoseReadyTimeoutMs = 2_000L
+        private const val NativeCaptureCloseTimeoutMs = 1_000L
     }
 
     private var config: CaptureConfig? = null
@@ -853,13 +854,12 @@ internal class ArCaptureSession(
         // The binding classifies every owner before the manager closes Camera2.
         disposed.set(true)
         val accepted = nativeCaptureSerialOwnerV2.close(
+            timeoutMillis = NativeCaptureCloseTimeoutMs,
             operation = { nativeCaptureBindingV2.close() },
+            timeoutOperation = { nativeCaptureBindingV2.forceCloseForDeadline() },
         ) { durableResult ->
-            val completed = if (durableResult.isFailure) {
-                durableResult
-            } else {
-                runCatching { disposeMainResources() }
-            }
+            val cleanupResult = runCatching { disposeMainResources() }
+            val completed = durableResult.exceptionOrNull()?.let(Result.Companion::failure) ?: cleanupResult
             disposeResult = completed
             disposeCallbacks.toList().forEach { it(completed) }
             disposeCallbacks.clear()
