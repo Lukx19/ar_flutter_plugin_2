@@ -769,8 +769,11 @@ internal class ArCaptureSession(
         nativeCaptureBindingV2.onLifecycle(parsed)
     }
 
-    fun installDebugNativeCaptureSyntheticV2(fault: String?) {
-        nativeCaptureBindingV2.installSyntheticExposureHookForTest(
+    fun installDebugNativeCaptureSyntheticV2(fault: String?): Boolean {
+        require(fault == null || fault in setOf("camera", "hang", "malformed", "store")) {
+            "Unsupported synthetic V2 capture fault"
+        }
+        return nativeCaptureBindingV2.installSyntheticExposureHookForTest(
             request = { qualifier, required, callback ->
                 when (fault) {
                     "camera" -> callback.onFailure(qualifier, "synthetic-camera")

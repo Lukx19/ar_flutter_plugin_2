@@ -45,6 +45,7 @@ void main() {
   String? initializeErrorCode;
   String? initializeErrorMessage;
   dynamic initializeCaptureResponse;
+  bool debugSyntheticRouteInstalled = true;
 
   setUp(() {
     ARCaptureManager.debugIsSupportedOverride = true;
@@ -63,6 +64,7 @@ void main() {
     initializeErrorCode = null;
     initializeErrorMessage = null;
     initializeCaptureResponse = <String, dynamic>{'mode': 'sharedCamera'};
+    debugSyntheticRouteInstalled = true;
     SharedPreferences.setMockInitialValues(<String, Object>{});
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(captureChannel, (call) async {
@@ -408,10 +410,44 @@ void main() {
             'isFlashReady': true,
             'flashStatus': 'ready',
           };
+        case 'debugNativeCaptureV2Synthetic':
+          return debugSyntheticRouteInstalled;
         default:
           return null;
       }
     });
+  });
+
+  test('debug V2 route fails closed when native binding rejects install',
+      () async {
+    final sessionManager = ARSessionManager(
+      42,
+      _FakeBuildContext(),
+      PlaneDetectionConfig.horizontal,
+    );
+    final captureManager = ARCaptureManager(
+      sessionManager,
+      captureConfig,
+      _FakeBuildContext(),
+    );
+
+    await captureManager.debugConfigureNativeCaptureV2(fault: 'store');
+    expect(
+      methodCalls.last.arguments,
+      <String, Object?>{'fault': 'store'},
+    );
+
+    debugSyntheticRouteInstalled = false;
+    await expectLater(
+      captureManager.debugConfigureNativeCaptureV2(fault: 'malformed'),
+      throwsA(
+        isA<ARCaptureException>().having(
+          (error) => error.code,
+          'code',
+          'NATIVE_CAPTURE_V2_DEBUG_ROUTE_UNAVAILABLE',
+        ),
+      ),
+    );
   });
 
   tearDown(() {

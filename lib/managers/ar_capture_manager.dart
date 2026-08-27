@@ -589,10 +589,16 @@ class ARCaptureManager {
 
   @visibleForTesting
   Future<void> debugConfigureNativeCaptureV2({String? fault}) async {
-    await _channel.invokeMethod<void>(
+    final installed = await _channel.invokeMethod<bool>(
       'debugNativeCaptureV2Synthetic',
       <String, Object?>{'fault': fault},
     );
+    if (installed != true) {
+      throw const ARCaptureException(
+        'The native V2 synthetic exposure route was not installed.',
+        code: 'NATIVE_CAPTURE_V2_DEBUG_ROUTE_UNAVAILABLE',
+      );
+    }
   }
 
   @visibleForTesting

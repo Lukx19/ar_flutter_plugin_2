@@ -9,7 +9,9 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.io.ByteArrayInputStream
 import java.io.File
+import java.io.IOException
 import java.io.InputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -23,6 +25,77 @@ import org.junit.runner.RunWith
 /** Synthetic only: production binding/manager/Looper lifecycle, not Camera2 hardware. */
 @RunWith(AndroidJUnit4::class)
 class NativeCaptureAdapterV2AndroidTest {
+    @Test
+    fun bindingAndSharedManagerKeepProductionFaultHealthPerAcceptedExposure() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val captureRoot = File(context.filesDir, "capture-v2-native")
+        check(captureRoot.deleteRecursively())
+        var flutterEngine: FlutterEngine? = null
+        var texture: SurfaceTexture? = null
+        var surface: Surface? = null
+        var binding: NativeCaptureBindingV2? = null
+        var manager: SharedCameraManager? = null
+        try {
+            onMain {
+                flutterEngine = FlutterEngine(context)
+                texture = SurfaceTexture(0)
+                surface = Surface(checkNotNull(texture))
+                binding = NativeCaptureBindingV2(context, CaptureSafetySignalV2())
+                manager = testManager(context, checkNotNull(flutterEngine), checkNotNull(surface))
+                checkNotNull(binding).attachSharedCamera(checkNotNull(manager))
+            }
+            val activeBinding = checkNotNull(binding)
+            val runId = System.nanoTime().toString()
+            val faults = listOf("camera", "malformed", "store", "valid")
+            faults.forEachIndexed { index, fault ->
+                onMain {
+                    assertTrue(activeBinding.installSyntheticExposureHookForTest(
+                        request = { qualifier, required, callback ->
+                            when (fault) {
+                                "camera" -> callback.onFailure(qualifier, "synthetic-camera")
+                                "malformed" -> callback.onComponents(SharedCameraComponentSetV2(
+                                    qualifier,
+                                    listOf(
+                                        CaptureComponentStreamV2(CaptureComponentKind.JPEG, ByteArrayInputStream(byteArrayOf(1))),
+                                        CaptureComponentStreamV2(CaptureComponentKind.JPEG, ByteArrayInputStream(byteArrayOf(2))),
+                                    ),
+                                ))
+                                "store" -> callback.onComponents(SharedCameraComponentSetV2(
+                                    qualifier,
+                                    required.map { kind -> CaptureComponentStreamV2(kind, object : InputStream() {
+                                        override fun read(): Int = throw IOException("synthetic-store-stream")
+                                    }) },
+                                ))
+                                else -> callback.onComponents(SharedCameraComponentSetV2(
+                                    qualifier,
+                                    required.map { kind -> CaptureComponentStreamV2(kind, ByteArrayInputStream(byteArrayOf(7, 9))) },
+                                ))
+                            }
+                            true
+                        },
+                    ))
+                    activeBinding.admit(productionRequest("$runId-$fault"))
+                }
+                val snapshot = onMainValue(activeBinding::snapshot)
+                assertEquals((index + 1).toLong(), snapshot.exposures)
+                assertEquals(if (fault == "valid") 1L else 0L, snapshot.committed)
+                assertEquals(if (fault == "valid") 3L else (index + 1).toLong(), snapshot.abandoned)
+                assertEquals(0L, snapshot.unknownQueries)
+            }
+        } finally {
+            onMain {
+                runCatching { binding?.close() }
+                manager?.let { current -> runCatching { binding?.detachSharedCamera(current) } }
+                runCatching { manager?.cleanup() }
+                runCatching { manager?.finishCameraShutdown(1_000L) }
+                runCatching { surface?.release() }
+                runCatching { texture?.release() }
+                runCatching { flutterEngine?.destroy() }
+            }
+            check(captureRoot.deleteRecursively())
+        }
+    }
+
     @Test
     fun perViewBindingDrainsAndFencesLateComponents() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
@@ -181,6 +254,38 @@ class NativeCaptureAdapterV2AndroidTest {
             digest("p"), digest("c"), digest("v"), digest("l"),
         )
     }
+
+    private fun productionRequest(suffix: String): CaptureCommitRequest {
+        val cut = CaptureLifecycleCut("session-$suffix", 1, "group", 1, "ar", "view", 1, "binding", 1, 1)
+        val maximumBytes = 128L
+        val workingBytes = 4_096L
+        val accepted = CaptureAcceptedAttempt(
+            CaptureAttemptIdentity("attempt-$suffix", "commit-$suffix", 1, cut), CaptureLane.AUTOMATIC,
+            CaptureComponentProfile("native-jpeg-v2", setOf(CaptureComponentKind.JPEG), maximumBytes, workingBytes),
+            CaptureReservationLiability(
+                workingBytes,
+                NativeCaptureReservationBoundsV2.physicalBytes(maximumBytes, 1),
+                1,
+                1,
+                NativeCaptureReservationBoundsV2.rollbackBytes(maximumBytes),
+                true,
+            ),
+            digest("intent-$suffix"), digest("accepted-$suffix"),
+        )
+        return CaptureCommitRequest(
+            accepted, emptyList(), 1, digest("p"), digest("c"), digest("v"), digest("l"),
+        )
+    }
+
+    private fun testManager(context: android.content.Context, engine: FlutterEngine, surface: Surface) = SharedCameraManager(
+        context = context,
+        methodChannel = MethodChannel(engine.dartExecutor.binaryMessenger, "native-capture-v2-sequence-test"),
+        session = null,
+        cameraTextureIds = { intArrayOf() },
+        prepareSessionResume = {},
+        scenePreviewSurface = surface,
+        configMap = mapOf("resolution" to mapOf("width" to 128, "height" to 128), "format" to "jpeg"),
+    )
 
     private class TrackingInput(private val bytes: ByteArray) : InputStream() {
         private var offset = 0

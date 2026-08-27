@@ -666,8 +666,11 @@ internal class ArView(
                     if (!debuggable) {
                         result.error("DEBUG_ONLY", "Synthetic V2 capture is unavailable in release builds", null)
                     } else {
-                        captureSession.installDebugNativeCaptureSyntheticV2(call.argument<String>("fault"))
-                        result.success(true)
+                        result.success(
+                            captureSession.installDebugNativeCaptureSyntheticV2(
+                                call.argument<String>("fault"),
+                            ),
+                        )
                     }
                 }
                 "debugNativeCaptureV2AdvanceRecovery" -> {
