@@ -305,6 +305,8 @@ class ARCaptureManager {
       StreamController.broadcast();
   final StreamController<ARNativeCaptureEventV2> _nativeCaptureV2Controller =
       StreamController.broadcast();
+  final Map<String, String> _nativeCaptureV2TerminalLedger = {};
+  static const int _nativeCaptureV2TerminalLedgerCapacity = 8;
   static const String _profilesKey = 'ar_capture_profiles';
   static const String _profileNotFoundCode = 'PROFILE_NOT_FOUND';
   final ARCaptureConfig _config;
@@ -376,7 +378,7 @@ class ARCaptureManager {
       // The native owner may have completed bounded startup recovery before
       // this Dart handler existed. Pull its scalar replay after attachment.
       for (final event in await replayNativeCaptureRecoveryV2()) {
-        _nativeCaptureV2Controller.add(event);
+        _publishNativeCaptureV2Event(event);
       }
 
       debugPrint(
@@ -523,7 +525,14 @@ class ARCaptureManager {
         code: 'NATIVE_CAPTURE_V2_RESULT_MISSING',
       );
     }
-    return ARNativeCaptureAdmissionResultV2.fromMap(_deepCastMap(value));
+    final result = ARNativeCaptureAdmissionResultV2.fromMap(
+      _deepCastMap(value),
+    );
+    final terminal = result.terminal;
+    if (terminal != null) {
+      _publishNativeCaptureV2Event(terminal);
+    }
+    return result;
   }
 
   Future<ARNativeCaptureHealthV2> getNativeCaptureHealthV2() async {
@@ -2033,7 +2042,7 @@ class ARCaptureManager {
           _captureCapacityController.add(capacity);
           break;
         case 'onNativeCaptureV2Event':
-          _nativeCaptureV2Controller.add(
+          _publishNativeCaptureV2Event(
             ARNativeCaptureEventV2.fromMap(_deepCastMap(call.arguments)),
           );
           break;
@@ -2071,6 +2080,39 @@ class ARCaptureManager {
     } catch (e) {
       debugPrint('Error handling platform call: $e');
     }
+  }
+
+  void _publishNativeCaptureV2Event(ARNativeCaptureEventV2 event) {
+    final attemptId = event.attemptId;
+    if (!event.isTerminal || attemptId == null) {
+      _nativeCaptureV2Controller.add(event);
+      return;
+    }
+    final signature = jsonEncode(<String, Object?>{
+      'kind': event.kind.name,
+      'captureId': event.captureId,
+      'captureRevision': event.captureRevision,
+      'manifestId': event.manifestId,
+      'reason': event.reason,
+      'recoveryContext': event.recoveryContext?.toMap(),
+    });
+    final existing = _nativeCaptureV2TerminalLedger[attemptId];
+    if (existing != null) {
+      if (existing != signature) {
+        _nativeCaptureV2Controller.addError(
+          StateError('Conflicting native V2 terminal for $attemptId.'),
+        );
+      }
+      return;
+    }
+    _nativeCaptureV2TerminalLedger[attemptId] = signature;
+    if (_nativeCaptureV2TerminalLedger.length >
+        _nativeCaptureV2TerminalLedgerCapacity) {
+      _nativeCaptureV2TerminalLedger.remove(
+        _nativeCaptureV2TerminalLedger.keys.first,
+      );
+    }
+    _nativeCaptureV2Controller.add(event);
   }
 
   // Deprecated runtime resolution methods with helpful error messages
