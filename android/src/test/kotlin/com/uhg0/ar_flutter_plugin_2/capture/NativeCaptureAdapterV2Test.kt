@@ -674,6 +674,58 @@ class NativeCaptureAdapterV2Test {
     }
 
     @Test
+    fun `future synthetic route does not swallow cancellation of a direct owner`() {
+        data class DirectOwner(val qualifier: CaptureAttemptQualifierV2)
+
+        val hook = AttemptQualifiedExposureHookV2()
+        val direct = QualifiedCaptureAttemptOwnerV2<DirectOwner, CaptureAttemptQualifierV2>(DirectOwner::qualifier)
+        val callback = object : SharedCameraExposureCallbackV2 {
+            override fun onComponents(components: SharedCameraComponentSetV2) = Unit
+            override fun onFailure(qualifier: CaptureAttemptQualifierV2, reason: String) = Unit
+        }
+        var directCorrelatorClears = 0
+        val syntheticCancels = mutableListOf<String>()
+        fun qualifier(ordinal: Long, generation: Long): CaptureAttemptQualifierV2 {
+            val accepted = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal).accepted
+            return CaptureAttemptQualifierV2(accepted.identity, accepted.identity.lifecycleCut, generation)
+        }
+        fun cancel(qualifier: CaptureAttemptQualifierV2) {
+            if (!hook.cancel(qualifier) && direct.cancel(qualifier) != null) {
+                directCorrelatorClears += 1
+            }
+        }
+
+        val directQualifier = qualifier(200, 1)
+        assertTrue(direct.acquire(DirectOwner(directQualifier)))
+        hook.install(request = { _, _, _ -> true }, cancel = { syntheticCancels += "B" })
+        cancel(directQualifier)
+        assertEquals(null, direct.get())
+        assertEquals(1, directCorrelatorClears)
+        assertTrue(syntheticCancels.isEmpty())
+
+        hook.clear()
+        val laterDirectQualifier = qualifier(201, 2)
+        val laterDirect = DirectOwner(laterDirectQualifier)
+        assertTrue(direct.acquire(laterDirect))
+        assertTrue(direct.release(laterDirect))
+
+        hook.install(request = { _, _, _ -> true }, cancel = { syntheticCancels += "B" })
+        val syntheticQualifier = qualifier(202, 3)
+        assertEquals(
+            true,
+            hook.request(syntheticQualifier, setOf(CaptureComponentKind.JPEG), callback),
+        )
+        cancel(syntheticQualifier)
+        assertEquals(listOf("B"), syntheticCancels)
+        hook.install(request = { _, _, _ -> true }, cancel = { syntheticCancels += "C" })
+        cancel(syntheticQualifier)
+        assertEquals(listOf("B"), syntheticCancels)
+        assertEquals(1, directCorrelatorClears)
+        assertEquals(0, hook.activeOwnersForTest())
+        hook.clear()
+    }
+
+    @Test
     fun `concurrent route install and request observes complete route or no route`() {
         val executor = Executors.newFixedThreadPool(2)
         val callback = object : SharedCameraExposureCallbackV2 {

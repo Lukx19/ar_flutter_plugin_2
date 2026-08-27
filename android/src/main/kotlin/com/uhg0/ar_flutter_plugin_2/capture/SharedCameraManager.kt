@@ -203,7 +203,7 @@ internal class AttemptQualifiedExposureHookV2 {
             owners.remove(qualifier)?.also {
                 retired += qualifier
                 while (retired.size > MAX_RETIRED_OWNERS) retired.remove(retired.first())
-            } ?: return qualifier in retired || current != null
+            } ?: return qualifier in retired
         }
         installed.cancel(qualifier)
         return true
