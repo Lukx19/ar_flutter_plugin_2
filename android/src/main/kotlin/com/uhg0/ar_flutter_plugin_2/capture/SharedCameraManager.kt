@@ -317,6 +317,7 @@ internal class SharedCameraManager(
     private val stillCaptureCorrelator = PendingStillCaptureCorrelator(timeoutMs = 30_000L)
     private val processedFrameCorrelator = ProcessedFrameCorrelator<PackedYuv420>()
     private val startupBarrier = SharedCameraStartupBarrier()
+    private val sessionCallbackFence = SharedCameraSessionCallbackFence()
     private val repeatingRequestLifecycle = SharedCameraRepeatingRequestLifecycle()
     private val rawJpegCaptureCorrelator =
         RawJpegCaptureCorrelator<PendingStillImagePayload, Image, TotalCaptureResult>(
@@ -473,6 +474,7 @@ internal class SharedCameraManager(
     @Volatile
     private var cameraCloseLatch = CountDownLatch(1)
     private var processShutdownGeneration: Long? = null
+    private var sessionCallbackGeneration = 0L
 
     private var isInitialized = false
     private val requestGeneration = CaptureRequestGeneration()
@@ -962,7 +964,10 @@ internal class SharedCameraManager(
             val wrappedSessionStateCallback =
                 sharedCamera.createARSessionStateCallback(sessionStateCallback, backgroundHandler)
             val guardedSessionStateCallback =
-                guardArCoreStartupStateCallback(wrappedSessionStateCallback)
+                guardArCoreStartupStateCallback(
+                    wrappedSessionStateCallback,
+                    sessionCallbackGeneration,
+                )
             cameraDevice.createCaptureSession(
                 sessionSurfaces,
                 guardedSessionStateCallback,
@@ -1746,15 +1751,16 @@ internal class SharedCameraManager(
 
     private fun guardArCoreStartupStateCallback(
         callback: CameraCaptureSession.StateCallback,
+        generation: Long,
     ): CameraCaptureSession.StateCallback =
         object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(session: CameraCaptureSession) =
-                forwardArCoreStartupCallback("configured", session) {
+                forwardArCoreSessionCallback("configured", session, generation) {
                     callback.onConfigured(session)
                 }
 
             override fun onConfigureFailed(session: CameraCaptureSession) =
-                forwardArCoreStartupCallback("configureFailed", session) {
+                forwardArCoreSessionCallback("configureFailed", session, generation) {
                     callback.onConfigureFailed(session)
                     failSharedCameraConfiguration(
                         session = session,
@@ -1763,34 +1769,58 @@ internal class SharedCameraManager(
                     )
                 }
 
-            override fun onReady(session: CameraCaptureSession) = callback.onReady(session)
+            override fun onReady(session: CameraCaptureSession) =
+                forwardArCoreSessionCallback("ready", session, generation) {
+                    callback.onReady(session)
+                }
 
-            override fun onActive(session: CameraCaptureSession) = callback.onActive(session)
+            override fun onActive(session: CameraCaptureSession) =
+                forwardArCoreSessionCallback("active", session, generation) {
+                    callback.onActive(session)
+                }
 
             override fun onCaptureQueueEmpty(session: CameraCaptureSession) =
-                callback.onCaptureQueueEmpty(session)
+                forwardArCoreSessionCallback("queueEmpty", session, generation) {
+                    callback.onCaptureQueueEmpty(session)
+                }
 
-            override fun onClosed(session: CameraCaptureSession) = callback.onClosed(session)
+            override fun onClosed(session: CameraCaptureSession) =
+                forwardArCoreSessionCallback("closed", session, generation, terminal = true) {
+                    callback.onClosed(session)
+                }
 
             override fun onSurfacePrepared(session: CameraCaptureSession, surface: Surface) =
-                callback.onSurfacePrepared(session, surface)
+                forwardArCoreSessionCallback("surfacePrepared", session, generation) {
+                    callback.onSurfacePrepared(session, surface)
+                }
         }
 
-    private inline fun forwardArCoreStartupCallback(
+    private fun forwardArCoreSessionCallback(
         stage: String,
         session: CameraCaptureSession,
+        generation: Long,
+        terminal: Boolean = false,
         callback: () -> Unit,
     ) {
         SharedCameraCallbackGuard.run(
             onFailure = { error ->
-                failSharedCameraConfiguration(
-                    session = session,
-                    stage = stage,
-                    cause = error,
-                )
+                if (cleanupRequested) {
+                    Log.w("SharedCameraManager", "Ignored ARCore callback failure during $stage teardown", error)
+                } else {
+                    failSharedCameraConfiguration(
+                        session = session,
+                        stage = stage,
+                        cause = error,
+                    )
+                }
             },
-            callback = callback,
-        )
+        ) {
+            if (terminal) {
+                sessionCallbackFence.runTerminal(generation, callback)
+            } else {
+                sessionCallbackFence.runActive(generation, callback)
+            }
+        }
     }
 
     private fun failSharedCameraConfiguration(
@@ -2138,6 +2168,7 @@ internal class SharedCameraManager(
             processShutdownGeneration = processRestartGate.markShutdownStarted()
         }
         cleanupRequested = true
+        sessionCallbackFence.beginShutdown(sessionCallbackGeneration)
         pendingManualCapture?.let { pending ->
             pending.error = CaptureSessionException(
                 code = "CAPTURE_DISPOSED",
@@ -2202,6 +2233,7 @@ internal class SharedCameraManager(
                 )
             }
         } finally {
+            sessionCallbackFence.finishShutdown(sessionCallbackGeneration)
             processShutdownGeneration?.let { generation ->
                 processRestartGate.markShutdownCompleted(
                     generation = generation,
@@ -2863,6 +2895,7 @@ internal class SharedCameraManager(
         } ?: config.resolution
 
     private fun startBackgroundThread() {
+        sessionCallbackGeneration = sessionCallbackFence.open()
         cleanupRequested = false
         captureSessionClosed = false
         cameraDeviceClosed = false
