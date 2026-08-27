@@ -465,12 +465,15 @@ internal class NativeCaptureAdapterV2(
         var exposureRequested: Boolean = false,
         var exposureCounted: Boolean = false,
         var submissionInFlight: Boolean = false,
+        var submissionResultResolved: Boolean = false,
         var submissionFailure: String? = null,
+        var pendingLifecycleReason: String? = null,
         var tenSecondPresented: Boolean = false,
         var terminalClaimed: Boolean = false,
     )
     private val lock = ReentrantLock(true)
     private val storeIdle = lock.newCondition()
+    private val submissionIdle = lock.newCondition()
     private val admissionLock = ReentrantLock(true)
     private val scheduler = CaptureFinalizerScheduler()
     private val counters = CaptureResourceCountersV2()
@@ -478,6 +481,7 @@ internal class NativeCaptureAdapterV2(
     private var closed = false
     private var closing = false
     private var storeOperations = 0
+    private var submissionOperations = 0
     private var lifecycleDrain = false
     private var lifecycleGeneration = 0L
     private var nextExposureGeneration = 0L
@@ -633,6 +637,10 @@ internal class NativeCaptureAdapterV2(
         if (closed || closing) return@withLock
         closing = true
         lifecycleGeneration += 1
+        work.values.filter { it.submissionInFlight }.forEach {
+            if (it.pendingLifecycleReason == null) it.pendingLifecycleReason = "shutdown"
+        }
+        while (submissionOperations != 0) submissionIdle.await()
         while (storeOperations != 0) storeIdle.await()
         closed = true
         work.values.toList().forEach { value ->
@@ -649,6 +657,7 @@ internal class NativeCaptureAdapterV2(
         safety.bind(value.qualifier, value.acceptedReceipt)
         value.exposureRequested = true
         value.submissionInFlight = true
+        submissionOperations += 1
         val requested = try {
             externalCallLocked {
                 exposure.requestExposure(value.qualifier, value.request.accepted.profile.requiredComponents, callback)
@@ -657,25 +666,37 @@ internal class NativeCaptureAdapterV2(
             safety.release(value.qualifier)
             false
         }
-        // A legal fake/Camera2 bridge may have completed synchronously.
-        if (work[value.request.accepted.identity] !== value) {
-            return
-        }
-        value.submissionInFlight = false
-        val submissionFailure = value.submissionFailure
-        value.submissionFailure = null
-        if (!requested) {
-            value.exposureRequested = false
-            safety.release(value.qualifier)
-            abandonLocked(
-                value.request,
-                submissionFailure?.let { "camera-$it" } ?: "exposure-request-rejected",
-            )
-            return
-        }
-        countExposureLocked(value)
-        if (submissionFailure != null) {
-            abandonLocked(value.request, "camera-$submissionFailure")
+        try {
+            // A legal fake/Camera2 bridge may have completed synchronously.
+            if (work[value.request.accepted.identity] !== value) return
+            value.submissionResultResolved = true
+            val submissionFailure = value.submissionFailure
+            value.submissionFailure = null
+            val pendingLifecycleReason = value.pendingLifecycleReason
+            value.pendingLifecycleReason = null
+            if (!requested) {
+                value.exposureRequested = false
+                safety.release(value.qualifier)
+                abandonLocked(
+                    value.request,
+                    submissionFailure?.let { "camera-$it" }
+                        ?: pendingLifecycleReason?.let { "$it-before-exposure" }
+                        ?: "exposure-request-rejected",
+                )
+                return
+            }
+            countExposureLocked(value)
+            when {
+                submissionFailure != null -> abandonLocked(value.request, "camera-$submissionFailure")
+                pendingLifecycleReason != null -> transferUnknownLocked(value, "$pendingLifecycleReason-transfer")
+                closing -> transferUnknownLocked(value, "shutdown-transfer")
+            }
+        } finally {
+            value.submissionInFlight = false
+            value.submissionResultResolved = false
+            submissionOperations -= 1
+            check(submissionOperations >= 0)
+            if (submissionOperations == 0) submissionIdle.signalAll()
         }
     }
 
@@ -723,7 +744,7 @@ internal class NativeCaptureAdapterV2(
         override fun onFailure(qualifier: CaptureAttemptQualifierV2, reason: String) = lock.withLock {
             val value = work[qualifier.identity]
             if (value == null || value.qualifier != qualifier || closed) { counters.lateCallback(); return@withLock }
-            if (value.submissionInFlight) {
+            if (value.submissionInFlight && !value.submissionResultResolved) {
                 value.submissionFailure = reason
                 return@withLock
             }
@@ -770,6 +791,10 @@ internal class NativeCaptureAdapterV2(
     }
 
     private fun lifecycleTransferLocked(value: Work, reason: String) {
+        if (value.submissionInFlight) {
+            if (value.pendingLifecycleReason == null) value.pendingLifecycleReason = reason
+            return
+        }
         if (value.exposureCounted) transferUnknownLocked(value, "$reason-transfer")
         else abandonLocked(value.request, "$reason-before-exposure")
     }
