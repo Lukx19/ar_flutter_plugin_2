@@ -353,6 +353,9 @@ final class ARNativeCaptureHealthV2 {
   final int closedComponents;
   final int committed;
   final int abandoned;
+
+  /// Number of unique exposed attempts whose durable outcome is still unknown.
+  /// Re-querying one attempt does not increase this liability.
   final int unknownQueries;
   final int running;
   final int fundedWaiting;

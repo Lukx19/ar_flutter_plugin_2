@@ -6,6 +6,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -456,9 +457,115 @@ class NativeCaptureAdapterV2Test {
         adapter.advanceDeadlines()
         assertTrue(store.queries.contains(automatic.accepted.identity))
         assertEquals("terminal-fence-30s", store.terminals.last().terminal?.reason)
-        assertEquals(2L, adapter.snapshot().unknownQueries)
+        assertEquals(0L, adapter.snapshot().unknownQueries)
         assertEquals(1, camera.requests.size)
         assertEquals(0, adapter.snapshot().running)
+    }
+
+    @Test
+    fun `terminal persistence racing exact query counts one exposure terminal and clears unknown`() {
+        var clock = 0L
+        val store = FakeStore().apply {
+            abandonEntered = CountDownLatch(1)
+            abandonRelease = CountDownLatch(1)
+        }
+        val camera = FakeExposure()
+        val events = mutableListOf<NativeCaptureEventV2>()
+        val adapter = NativeCaptureAdapterV2(store, camera, nowMs = { clock }, events = events::add)
+        val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG))
+        adapter.admit(request)
+        val qualifier = camera.requests.single().first
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val producer = executor.submit {
+                camera.callback!!.onFailure(qualifier, "synthetic-camera")
+            }
+            assertTrue(store.abandonEntered!!.await(5, TimeUnit.SECONDS))
+
+            clock = 30_000L
+            adapter.advanceDeadlines()
+            store.abandonRelease!!.countDown()
+            producer.get(5, TimeUnit.SECONDS)
+
+            val health = adapter.snapshot()
+            assertEquals(1L, health.exposures)
+            assertEquals(0L, health.committed)
+            assertEquals(1L, health.abandoned)
+            assertEquals(0L, health.unknownQueries)
+            assertEquals(
+                1,
+                events.count {
+                    it.kind == NativeCaptureEventKindV2.ABANDONED &&
+                        it.attemptId == request.accepted.identity.attemptId
+                },
+            )
+        } finally {
+            store.abandonRelease!!.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `three abandoned and one committed remain exact across recovery queries`() {
+        val store = FakeStore()
+        val camera = FakeExposure()
+        val events = mutableListOf<NativeCaptureEventV2>()
+        val startupReady = CountDownLatch(1)
+        val dispatcher = NativeCaptureRecoveryDispatcherV2(
+            recover = { emptyList() },
+            events = {
+                events += it
+                if (it.kind == NativeCaptureEventKindV2.READY) startupReady.countDown()
+            },
+        )
+        assertTrue(startupReady.await(5, TimeUnit.SECONDS))
+        events.clear()
+        val adapter = NativeCaptureAdapterV2(store, camera, events = dispatcher::emitLive)
+
+        val cameraFailure = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 1)
+        adapter.admit(cameraFailure)
+        camera.callback!!.onFailure(camera.requests.last().first, "synthetic-camera")
+        dispatcher.acknowledgeTerminal(cameraFailure.accepted.identity.attemptId)
+
+        val malformed = request(CaptureLane.AUTOMATIC, setOf(CaptureComponentKind.JPEG), ordinal = 2)
+        adapter.admit(malformed)
+        camera.components(
+            camera.requests.last().first,
+            malformed,
+            listOf(CaptureComponentKind.JPEG, CaptureComponentKind.JPEG),
+        )
+        dispatcher.acknowledgeTerminal(malformed.accepted.identity.attemptId)
+
+        store.failCommitAfterReads = 0
+        val storeFailure = request(CaptureLane.AUTOMATIC, setOf(CaptureComponentKind.JPEG), ordinal = 3)
+        adapter.admit(storeFailure)
+        camera.components(camera.requests.last().first, storeFailure, listOf(CaptureComponentKind.JPEG))
+        store.failCommitAfterReads = null
+        dispatcher.acknowledgeTerminal(storeFailure.accepted.identity.attemptId)
+
+        val committed = request(CaptureLane.AUTOMATIC, setOf(CaptureComponentKind.JPEG), ordinal = 4)
+        adapter.admit(committed)
+        camera.components(camera.requests.last().first, committed, listOf(CaptureComponentKind.JPEG))
+        repeat(5) {
+            adapter.forceRecoveryForDebug()
+            val replay = dispatcher.replaySnapshot()
+            assertEquals(1, replay.size)
+            assertEquals(NativeCaptureEventKindV2.COMMITTED, replay.single().kind)
+            assertEquals(committed.accepted.identity.attemptId, replay.single().attemptId)
+        }
+
+        val health = adapter.snapshot()
+        assertEquals(4L, health.exposures)
+        assertEquals(1L, health.committed)
+        assertEquals(3L, health.abandoned)
+        assertEquals(0L, health.unknownQueries)
+        assertEquals(1, events.count { it.kind == NativeCaptureEventKindV2.COMMITTED })
+        assertEquals(3, events.count { it.kind == NativeCaptureEventKindV2.ABANDONED })
+        dispatcher.acknowledgeTerminal(committed.accepted.identity.attemptId)
+        assertEquals(NativeCaptureEventKindV2.READY, dispatcher.replaySnapshot().single().kind)
+        assertEquals(health, adapter.snapshot())
+        dispatcher.close()
+        assertTrue(dispatcher.awaitTerminationForTest(5, TimeUnit.SECONDS))
     }
 
     @Test
@@ -737,6 +844,9 @@ class NativeCaptureAdapterV2Test {
         var acceptRelease: CountDownLatch? = null
         var commitEntered: CountDownLatch? = null
         var commitRelease: CountDownLatch? = null
+        var abandonEntered: CountDownLatch? = null
+        var abandonRelease: CountDownLatch? = null
+        private val firstAbandonBlocked = AtomicBoolean(false)
         override fun replayFenceBeforeExposure(request: CaptureCommitRequest): CaptureReceipt? {
             terminals.firstOrNull { it.identity == request.accepted.identity }?.let { prior ->
                 if (accepted.first { it.accepted.identity == request.accepted.identity } == request) return prior
@@ -775,8 +885,15 @@ class NativeCaptureAdapterV2Test {
         }
         override fun queryReceipt(identity: CaptureAttemptIdentity): CaptureReceipt? { queries += identity; return terminals.firstOrNull { it.identity == identity } }
         override fun rebaseSameAttempt(request: CaptureCommitRequest): CaptureReceipt = throw IllegalStateException("not prepared")
-        override fun abandon(request: CaptureCommitRequest, terminal: CaptureTerminal): CaptureReceipt =
-            CaptureReceipt(terminal.identity, CaptureAttemptPhase.ABANDONED_ATTEMPT, terminal.canonicalTerminalHash, "abandoned", true, terminal).also(terminals::add)
+        override fun abandon(request: CaptureCommitRequest, terminal: CaptureTerminal): CaptureReceipt {
+            val receipt = CaptureReceipt(terminal.identity, CaptureAttemptPhase.ABANDONED_ATTEMPT, terminal.canonicalTerminalHash, "abandoned", true, terminal)
+                .also(terminals::add)
+            if (abandonEntered != null && firstAbandonBlocked.compareAndSet(false, true)) {
+                abandonEntered!!.countDown()
+                abandonRelease!!.await(5, TimeUnit.SECONDS)
+            }
+            return receipt
+        }
     }
 
     private class CloseTrackingInputStream(private val values: ByteArray) : InputStream() {

@@ -368,7 +368,11 @@ internal class NativeCaptureBindingV2(
     }
 }
 
-/** Bounded scalar observability only; no component lengths, bytes, or paths escape this owner. */
+/**
+ * Bounded scalar observability only; no component lengths, bytes, or paths escape this owner.
+ * Terminal counters are exact unique exposed attempts. unknownQueries is the current number of
+ * unique exposed attempts with unresolved durable outcomes, never a cumulative query-call count.
+ */
 internal data class CaptureResourceSnapshotV2(
     val exposures: Long,
     val lateCallbacks: Long,
@@ -381,22 +385,30 @@ internal data class CaptureResourceSnapshotV2(
 )
 
 internal class CaptureResourceCountersV2 {
+    private val lock = Any()
     private val exposures = AtomicLong()
     private val lateCallbacks = AtomicLong()
     private val closedComponents = AtomicLong()
     private val committed = AtomicLong()
     private val abandoned = AtomicLong()
-    private val unknownQueries = AtomicLong()
+    private val unknownAttempts = linkedSetOf<CaptureAttemptIdentity>()
     fun exposure() = exposures.incrementAndGet()
     fun lateCallback() = lateCallbacks.incrementAndGet()
     fun componentsClosed(count: Int) = closedComponents.addAndGet(count.toLong())
     fun committed() = committed.incrementAndGet()
     fun abandoned() = abandoned.incrementAndGet()
-    fun unknownQuery() = unknownQueries.incrementAndGet()
-    fun snapshot(running: Int, waiting: Int) = CaptureResourceSnapshotV2(
-        exposures.get(), lateCallbacks.get(), closedComponents.get(), committed.get(), abandoned.get(),
-        unknownQueries.get(), running, waiting,
-    )
+    fun unknownQuery(identity: CaptureAttemptIdentity) = synchronized(lock) {
+        unknownAttempts += identity
+    }
+    fun terminalResolved(identity: CaptureAttemptIdentity) = synchronized(lock) {
+        unknownAttempts -= identity
+    }
+    fun snapshot(running: Int, waiting: Int) = synchronized(lock) {
+        CaptureResourceSnapshotV2(
+            exposures.get(), lateCallbacks.get(), closedComponents.get(), committed.get(), abandoned.get(),
+            unknownAttempts.size.toLong(), running, waiting,
+        )
+    }
 }
 
 /**
@@ -451,7 +463,9 @@ internal class NativeCaptureAdapterV2(
         val acceptedAtMs: Long,
         val qualifier: CaptureAttemptQualifierV2,
         var exposureRequested: Boolean = false,
+        var exposureCounted: Boolean = false,
         var tenSecondPresented: Boolean = false,
+        var terminalClaimed: Boolean = false,
     )
     private val lock = ReentrantLock(true)
     private val storeIdle = lock.newCondition()
@@ -612,7 +626,7 @@ internal class NativeCaptureAdapterV2(
     }
 
     private fun startLocked(value: Work) {
-        if (closed || scheduler.running?.identity != value.request.accepted.identity) return
+        if (closed || value.exposureRequested || scheduler.running?.identity != value.request.accepted.identity) return
         // Bind before submission: a fake or Camera2 bridge may complete on the
         // same stack. Binding afterwards would resurrect a stale true signal.
         safety.bind(value.qualifier, value.acceptedReceipt)
@@ -627,7 +641,6 @@ internal class NativeCaptureAdapterV2(
         }
         // A legal fake/Camera2 bridge may have completed synchronously.
         if (work[value.request.accepted.identity] !== value) {
-            if (requested) counters.exposure()
             return
         }
         if (!requested) {
@@ -636,7 +649,7 @@ internal class NativeCaptureAdapterV2(
             abandonLocked(value.request, "exposure-request-rejected")
             return
         }
-        counters.exposure()
+        countExposureLocked(value)
     }
 
     private val callback = object : SharedCameraExposureCallbackV2 {
@@ -646,6 +659,7 @@ internal class NativeCaptureAdapterV2(
                 if (value == null || value.qualifier != components.qualifier || scheduler.running?.identity != components.qualifier.identity || closed) {
                     closeStreams(components.streams); counters.lateCallback(); return
                 }
+                countExposureLocked(value)
                 val kinds = components.streams.map { it.kind }
                 if (kinds.size != kinds.toSet().size || kinds.toSet() != value.request.accepted.profile.requiredComponents) {
                     closeStreams(components.streams); abandonLocked(value.request, "malformed-component-set"); return
@@ -682,6 +696,7 @@ internal class NativeCaptureAdapterV2(
         override fun onFailure(qualifier: CaptureAttemptQualifierV2, reason: String) = lock.withLock {
             val value = work[qualifier.identity]
             if (value == null || value.qualifier != qualifier || closed) { counters.lateCallback(); return@withLock }
+            countExposureLocked(value)
             abandonLocked(value.request, "camera-$reason")
         }
     }
@@ -695,7 +710,7 @@ internal class NativeCaptureAdapterV2(
                 recoveryContext = value.request.recoveryContext,
             ),
         )
-        counters.unknownQuery()
+        counters.unknownQuery(value.request.accepted.identity)
         val receipt = storeCallLocked { store.queryReceipt(value.request.accepted.identity) }
         if (work[value.request.accepted.identity] !== value) return
         if (receipt?.terminal != null) { finishLocked(value, receipt); return }
@@ -717,7 +732,7 @@ internal class NativeCaptureAdapterV2(
                 recoveryContext = value.request.recoveryContext,
             ),
         )
-        counters.unknownQuery()
+        counters.unknownQuery(value.request.accepted.identity)
         storeCallLocked { store.queryReceipt(value.request.accepted.identity) }?.takeIf { it.terminal != null }
             ?.let { receipt ->
                 if (work[value.request.accepted.identity] === value) finishLocked(value, receipt)
@@ -740,9 +755,10 @@ internal class NativeCaptureAdapterV2(
 
     private fun abandonLocked(request: CaptureCommitRequest, reason: String): CaptureReceipt {
         val accepted = request.accepted
+        val value = work[accepted.identity]
         val terminal = CaptureTerminal(CaptureTerminalKind.ABANDONED_ATTEMPT, accepted.identity, reason, reason)
         val receipt = storeCallLocked { store.abandon(request, terminal) }
-        finishLocked(work[accepted.identity], receipt, request.recoveryContext)
+        finishLocked(value, receipt, request.recoveryContext)
         return receipt
     }
 
@@ -752,29 +768,45 @@ internal class NativeCaptureAdapterV2(
         recoveryContext: NativeCaptureRecoveryContextV2? = value?.request?.recoveryContext,
     ) {
         val identity = receipt.identity
+        val terminal = checkNotNull(receipt.terminal) { "A finished capture requires durable terminal authority" }
+        if (value != null) {
+            if (value.terminalClaimed || work[identity] !== value) return
+            value.terminalClaimed = true
+        }
         work.remove(identity)
         scheduler.release(identity)
         value?.let { safety.release(it.qualifier) }
         value?.let { externalCallLocked { exposure.cancelExposure(it.qualifier) } }
-        if (receipt.terminal?.kind == CaptureTerminalKind.COMMITTED_PICTURE) counters.committed() else counters.abandoned()
-        val terminal = receipt.terminal
+        if (value != null) {
+            counters.terminalResolved(identity)
+            if (value.exposureCounted) {
+                if (terminal.kind == CaptureTerminalKind.COMMITTED_PICTURE) counters.committed() else counters.abandoned()
+            }
+        }
         emitLocked(
             NativeCaptureEventV2(
-                if (terminal?.kind == CaptureTerminalKind.COMMITTED_PICTURE) {
+                if (terminal.kind == CaptureTerminalKind.COMMITTED_PICTURE) {
                     NativeCaptureEventKindV2.COMMITTED
                 } else {
                     NativeCaptureEventKindV2.ABANDONED
                 },
                 attemptId = identity.attemptId,
-                captureId = terminal?.captureId,
-                captureRevision = terminal?.captureRevision,
-                manifestId = terminal?.manifestId,
-                reason = terminal?.reason,
+                captureId = terminal.captureId,
+                captureRevision = terminal.captureRevision,
+                manifestId = terminal.manifestId,
+                reason = terminal.reason,
                 recoveryContext = recoveryContext,
             ),
         )
         emitLocked(NativeCaptureEventV2(NativeCaptureEventKindV2.HEALTH, resources = snapshot()))
         if (!lifecycleDrain) scheduler.running?.let { next -> work[next.identity]?.let(::startLocked) }
+    }
+
+    private fun countExposureLocked(value: Work) {
+        if (!value.exposureCounted) {
+            value.exposureCounted = true
+            counters.exposure()
+        }
     }
 
     private fun closeStreams(streams: List<CaptureComponentStreamV2>) {
