@@ -3,6 +3,8 @@ package com.uhg0.ar_flutter_plugin_2.capture
 import android.content.Context
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityCaptureSafePredicate
 import java.io.InputStream
+import java.util.concurrent.Executor
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -268,6 +270,58 @@ internal class NativeCaptureRecoveryAdmissionExceptionV2(
     val code: String,
     message: String,
 ) : IllegalStateException(message)
+
+/**
+ * One bounded durable worker per platform view. Calls return after ownership of
+ * the operation has transferred to the worker; completions are dispatched on
+ * the supplied owner (Android's main looper in production). FIFO execution is
+ * the lifecycle ordering fence between admission, lifecycle cuts, and close.
+ */
+internal class NativeCaptureSerialOwnerV2(
+    private val completionExecutor: Executor,
+    private val worker: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "capture3d-v2-durable").apply { isDaemon = true }
+    },
+) {
+    private val lock = Any()
+    private var closing = false
+
+    fun <T> submit(operation: () -> T, completion: (Result<T>) -> Unit): Boolean =
+        enqueue(closeAfter = false, operation, completion)
+
+    fun <T> close(operation: () -> T, completion: (Result<T>) -> Unit): Boolean =
+        synchronized(lock) {
+            if (closing) return@synchronized false
+            closing = true
+            enqueueLocked(closeAfter = true, operation, completion)
+            true
+        }
+
+    private fun <T> enqueue(
+        closeAfter: Boolean,
+        operation: () -> T,
+        completion: (Result<T>) -> Unit,
+    ): Boolean = synchronized(lock) {
+        if (closing) return@synchronized false
+        enqueueLocked(closeAfter, operation, completion)
+        true
+    }
+
+    private fun <T> enqueueLocked(
+        closeAfter: Boolean,
+        operation: () -> T,
+        completion: (Result<T>) -> Unit,
+    ) {
+        worker.execute {
+            val result = runCatching(operation)
+            if (closeAfter) worker.shutdown()
+            completionExecutor.execute { completion(result) }
+        }
+    }
+
+    internal fun awaitTerminationForTest(timeout: Long, unit: TimeUnit): Boolean =
+        worker.awaitTermination(timeout, unit)
+}
 
 /** Per-view native owner. #102 may supply intent, but not this binding or its lifecycle. */
 internal class NativeCaptureBindingV2(

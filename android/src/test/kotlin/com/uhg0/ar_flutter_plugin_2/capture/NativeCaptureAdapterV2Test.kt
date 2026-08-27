@@ -17,6 +17,97 @@ import org.junit.Test
 
 class NativeCaptureAdapterV2Test {
     @Test
+    fun `blocked submission leaves main responsive and lifecycle completion ordered`() {
+        val main = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "test-main") }
+        val owner = NativeCaptureSerialOwnerV2(main)
+        val exposure = BlockingExposure(result = true)
+        val adapter = NativeCaptureAdapterV2(FakeStore(), exposure)
+        val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG))
+        val mainReturned = CountDownLatch(1)
+        val mainResponsive = CountDownLatch(1)
+        val lifecycleCompleted = CountDownLatch(1)
+        val closeCompleted = CountDownLatch(1)
+        val completions = java.util.Collections.synchronizedList(mutableListOf<String>())
+        try {
+            main.execute {
+                assertTrue(owner.submit(
+                    operation = { adapter.admit(request) },
+                    completion = { completions += "admission" },
+                ))
+                mainReturned.countDown()
+            }
+            assertTrue(mainReturned.await(1, TimeUnit.SECONDS))
+            assertTrue(exposure.entered.await(5, TimeUnit.SECONDS))
+            main.execute { mainResponsive.countDown() }
+            assertTrue("main must remain schedulable while Camera2 submission is blocked", mainResponsive.await(1, TimeUnit.SECONDS))
+
+            assertTrue(owner.submit(
+                operation = { adapter.onLifecycle(CaptureLifecycleEvent.BACKGROUNDED) },
+                completion = { completions += "lifecycle"; lifecycleCompleted.countDown() },
+            ))
+            assertTrue(owner.close(
+                operation = { adapter.close() },
+                completion = { completions += "close"; closeCompleted.countDown() },
+            ))
+            assertFalse(lifecycleCompleted.await(100, TimeUnit.MILLISECONDS))
+            exposure.release.countDown()
+            assertTrue(lifecycleCompleted.await(5, TimeUnit.SECONDS))
+            assertTrue(closeCompleted.await(5, TimeUnit.SECONDS))
+            assertEquals(listOf("admission", "lifecycle", "close"), completions)
+            assertEquals(0, adapter.snapshot().running)
+        } finally {
+            exposure.release.countDown()
+            main.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `blocked store leaves main responsive and close waits for durable ownership`() {
+        val main = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "test-main") }
+        val owner = NativeCaptureSerialOwnerV2(main)
+        val store = FakeStore().apply {
+            commitEntered = CountDownLatch(1)
+            commitRelease = CountDownLatch(1)
+        }
+        val camera = FakeExposure()
+        val adapter = NativeCaptureAdapterV2(store, camera)
+        val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG))
+        adapter.admit(request)
+        val mainReturned = CountDownLatch(1)
+        val mainResponsive = CountDownLatch(1)
+        val closeCompleted = CountDownLatch(1)
+        try {
+            main.execute {
+                assertTrue(owner.submit(
+                    operation = {
+                        camera.components(camera.requests.single().first, request, listOf(CaptureComponentKind.JPEG))
+                    },
+                    completion = {},
+                ))
+                mainReturned.countDown()
+            }
+            assertTrue(mainReturned.await(1, TimeUnit.SECONDS))
+            assertTrue(store.commitEntered!!.await(5, TimeUnit.SECONDS))
+            main.execute { mainResponsive.countDown() }
+            assertTrue("main must remain schedulable while durable store is blocked", mainResponsive.await(1, TimeUnit.SECONDS))
+
+            assertTrue(owner.close(
+                operation = { adapter.close() },
+                completion = { closeCompleted.countDown() },
+            ))
+            assertFalse("close must not return before store ownership is settled", closeCompleted.await(100, TimeUnit.MILLISECONDS))
+            store.commitRelease!!.countDown()
+            assertTrue(closeCompleted.await(5, TimeUnit.SECONDS))
+            assertTrue(owner.awaitTerminationForTest(5, TimeUnit.SECONDS))
+            assertEquals(CaptureTerminalKind.COMMITTED_PICTURE, store.terminals.single().terminal?.kind)
+            assertEquals(0, adapter.snapshot().running)
+        } finally {
+            store.commitRelease?.countDown()
+            main.shutdownNow()
+        }
+    }
+
+    @Test
     fun `startup recovery runs off caller and fences callbacks after close`() {
         val caller = Thread.currentThread()
         val recoveryThread = AtomicReference<Thread>()

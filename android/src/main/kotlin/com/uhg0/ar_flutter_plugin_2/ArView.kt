@@ -3,6 +3,7 @@ package com.uhg0.ar_flutter_plugin_2
 import android.app.Activity
 import android.content.Context
 import android.content.pm.ApplicationInfo
+import android.util.Log
 import android.view.MotionEvent
 import android.view.View
 import android.widget.FrameLayout
@@ -84,6 +85,10 @@ internal class ArView(
     private var sessionConfig = defaultSessionConfig()
     private var sessionPausedByFlutter = false
     private var shutdownPrepared = false
+    private var shutdownPrepareCompleted = false
+    private val shutdownPrepareCallbacks = mutableListOf<(Result<Unit>) -> Unit>()
+    private var capturePauseOperations = 0
+    private val afterCapturePauseCallbacks = mutableListOf<() -> Unit>()
     private var disposed = false
     private var disposeCompleted = false
     private val disposeCompletionCallbacks = mutableListOf<() -> Unit>()
@@ -209,8 +214,9 @@ internal class ArView(
             visibilityObservationRuntime.pause()
             captureSafetySignalV2.invalidateLifecycleForViewPause()
             visibilityGridChannel.pause()
-            captureSession.onSessionPaused()
-            sceneHost.pause()
+            prepareCapturePause { result ->
+                result.onFailure { error -> Log.e("ArView", "Native capture pause fence failed", error) }
+            }
         }
 
         override fun onResume(owner: LifecycleOwner) {
@@ -253,7 +259,16 @@ internal class ArView(
 
     private fun disposeAfterResumeDrained() {
         poseBatchDispatcher.clear()
-        prepareForDispose()
+        prepareForDispose { result ->
+            if (result.isFailure) {
+                Log.e("ArView", "Native capture disposal fence failed", result.exceptionOrNull())
+                return@prepareForDispose
+            }
+            disposeAfterPauseFence()
+        }
+    }
+
+    private fun disposeAfterPauseFence() {
         sessionChannel.setMethodCallHandler(null)
         objectChannel.setMethodCallHandler(null)
         anchorChannel.setMethodCallHandler(null)
@@ -263,7 +278,19 @@ internal class ArView(
         visibilityObservationRuntime.close()
         visibilityGridV2Binding.dispose()
         lifecycle.removeObserver(lifecycleObserver)
-        captureSession.dispose()
+        if (!captureSession.dispose { result ->
+                if (result.isFailure) {
+                    Log.e("ArView", "Native capture durable close failed", result.exceptionOrNull())
+                    return@dispose
+                }
+                disposeAfterCaptureClosed()
+            }
+        ) {
+            return
+        }
+    }
+
+    private fun disposeAfterCaptureClosed() {
         pendingCloudOperations.toList().forEach { it() }
         pendingCloudOperations.clear()
         sceneHost.dispose()
@@ -273,7 +300,12 @@ internal class ArView(
         scope.cancel()
     }
 
-    private fun prepareForDispose() {
+    private fun prepareForDispose(onCompleted: (Result<Unit>) -> Unit) {
+        if (shutdownPrepareCompleted) {
+            onCompleted(Result.success(Unit))
+            return
+        }
+        shutdownPrepareCallbacks += onCompleted
         if (shutdownPrepared) return
         shutdownPrepared = true
         // ARCore's SharedCamera sample pauses the Session before closing
@@ -281,11 +313,37 @@ internal class ArView(
         // state until Camera2 shutdown completes.
         // Fence/drain V2 before ARCore pause, then preserve the required
         // ARCore-pause-before-Camera2 shutdown order for SharedCamera.
-        captureSession.prepareNativeCaptureForPause()
-        sceneHost.pause()
-        visibilityObservationRuntime.pause()
-        captureSafetySignalV2.invalidateAll()
-        captureSession.finishSharedCameraPause()
+        prepareCapturePause { result ->
+            if (result.isSuccess) shutdownPrepareCompleted = true
+            shutdownPrepareCallbacks.toList().forEach { it(result) }
+            shutdownPrepareCallbacks.clear()
+        }
+    }
+
+    private fun prepareCapturePause(onCompleted: (Result<Unit>) -> Unit) {
+        capturePauseOperations += 1
+        if (!captureSession.prepareNativeCaptureForPause { result ->
+                if (result.isSuccess) {
+                    sceneHost.pause()
+                    visibilityObservationRuntime.pause()
+                    captureSafetySignalV2.invalidateAll()
+                    captureSession.finishSharedCameraPause()
+                }
+                onCompleted(result)
+                capturePauseOperations -= 1
+                if (capturePauseOperations == 0) {
+                    afterCapturePauseCallbacks.toList().forEach { it() }
+                    afterCapturePauseCallbacks.clear()
+                }
+            }
+        ) {
+            capturePauseOperations -= 1
+            onCompleted(Result.failure(IllegalStateException("Native capture durable owner is closing")))
+        }
+    }
+
+    private fun runAfterCapturePause(operation: () -> Unit) {
+        if (capturePauseOperations == 0) operation() else afterCapturePauseCallbacks += operation
     }
 
     private fun onSessionCall(call: MethodCall, result: MethodChannel.Result) {
@@ -336,9 +394,12 @@ internal class ArView(
                     resumeCoordinator.invalidate(ResumeTerminal.SUPERSEDED)
                     visibilityObservationRuntime.pause()
                     visibilityGridChannel.pause()
-                    captureSession.onSessionPaused()
-                    sceneHost.pause()
-                    result.success(null)
+                    prepareCapturePause { pauseResult ->
+                        pauseResult.fold(
+                            onSuccess = { result.success(null) },
+                            onFailure = { result.error("SESSION_PAUSE_FAILED", it.message, null) },
+                        )
+                    }
                 }
                 "enableCamera", "resumeSession" -> {
                     resumeSessionBounded(result)
@@ -354,36 +415,40 @@ internal class ArView(
     }
 
     private fun resumeSessionBounded(result: MethodChannel.Result) {
-        resumeBounded(clearFlutterPause = true) { terminal ->
-            when (terminal) {
-                ResumeTerminal.SUCCESS -> result.success(null)
-                ResumeTerminal.SUPERSEDED -> result.error(
-                    "SESSION_RESUME_SUPERSEDED",
-                    "A newer resume request replaced this request",
-                    null,
-                )
-                ResumeTerminal.CANCELLED -> result.error(
-                    "SESSION_RESUME_CANCELLED",
-                    "AR view was disposed before Session.resume completed",
-                    null,
-                )
-                ResumeTerminal.TIMEOUT -> result.error(
-                    "SESSION_RESUME_TIMEOUT",
-                    "Session.resume exceeded the 5000ms native bound",
-                    null,
-                )
-                ResumeTerminal.FAILED -> result.error(
-                    "SESSION_RESUME_FAILED",
-                    "Session.resume failed",
-                    null,
-                )
+        runAfterCapturePause {
+            resumeBounded(clearFlutterPause = true) { terminal ->
+                when (terminal) {
+                    ResumeTerminal.SUCCESS -> result.success(null)
+                    ResumeTerminal.SUPERSEDED -> result.error(
+                        "SESSION_RESUME_SUPERSEDED",
+                        "A newer resume request replaced this request",
+                        null,
+                    )
+                    ResumeTerminal.CANCELLED -> result.error(
+                        "SESSION_RESUME_CANCELLED",
+                        "AR view was disposed before Session.resume completed",
+                        null,
+                    )
+                    ResumeTerminal.TIMEOUT -> result.error(
+                        "SESSION_RESUME_TIMEOUT",
+                        "Session.resume exceeded the 5000ms native bound",
+                        null,
+                    )
+                    ResumeTerminal.FAILED -> result.error(
+                        "SESSION_RESUME_FAILED",
+                        "Session.resume failed",
+                        null,
+                    )
+                }
             }
         }
     }
 
     private fun resumeLifecycleBounded() {
-        resumeBounded(clearFlutterPause = false) {
-            // Lifecycle callbacks have no Dart reply to settle.
+        runAfterCapturePause {
+            resumeBounded(clearFlutterPause = false) {
+                // Lifecycle callbacks have no Dart reply to settle.
+            }
         }
     }
 
@@ -636,16 +701,20 @@ internal class ArView(
                     }
                 }
                 "getCaptureCapacity" -> result.success(captureSession.getCaptureCapacity())
-                "admitNativeCaptureV2" -> scope.launch(Dispatchers.IO) {
-                    try {
-                        result.success(captureSession.admitNativeCaptureV2(call.arguments))
-                    } catch (error: NativeCaptureRecoveryAdmissionExceptionV2) {
-                        result.error(error.code, error.message, null)
-                    } catch (error: IllegalArgumentException) {
-                        result.error("NATIVE_CAPTURE_V2_INVALID", error.message, null)
-                    } catch (error: Exception) {
-                        result.error("NATIVE_CAPTURE_V2_FAILED", error.message, null)
+                "admitNativeCaptureV2" -> {
+                    val accepted = captureSession.admitNativeCaptureV2(call.arguments) { admissionResult ->
+                        admissionResult.fold(
+                            onSuccess = result::success,
+                            onFailure = { error ->
+                                when (error) {
+                                    is NativeCaptureRecoveryAdmissionExceptionV2 -> result.error(error.code, error.message, null)
+                                    is IllegalArgumentException -> result.error("NATIVE_CAPTURE_V2_INVALID", error.message, null)
+                                    else -> result.error("NATIVE_CAPTURE_V2_FAILED", error.message, null)
+                                }
+                            },
+                        )
                     }
+                    if (!accepted) result.error("NATIVE_CAPTURE_V2_CLOSED", "Native capture durable owner is closing", null)
                 }
                 "getNativeCaptureHealthV2" -> result.success(captureSession.nativeCaptureHealthV2())
                 "replayNativeCaptureRecoveryV2" -> result.success(captureSession.replayNativeCaptureRecoveryV2())
@@ -656,10 +725,15 @@ internal class ArView(
                     result.success(true)
                 }
                 "notifyNativeCaptureLifecycleV2" -> {
-                    captureSession.notifyNativeCaptureLifecycleV2(
+                    val accepted = captureSession.notifyNativeCaptureLifecycleV2(
                         call.argument<String>("event") ?: throw IllegalArgumentException("event is required"),
-                    )
-                    result.success(true)
+                    ) { lifecycleResult ->
+                        lifecycleResult.fold(
+                            onSuccess = { result.success(true) },
+                            onFailure = { result.error("NATIVE_CAPTURE_V2_FAILED", it.message, null) },
+                        )
+                    }
+                    if (!accepted) result.error("NATIVE_CAPTURE_V2_CLOSED", "Native capture durable owner is closing", null)
                 }
                 "debugNativeCaptureV2Synthetic" -> {
                     val debuggable = root.context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
@@ -821,9 +895,18 @@ internal class ArView(
                     call.argument<String>("imageId") ?: throw IllegalArgumentException("imageId is required"),
                 ))
                 "dispose" -> {
-                    prepareForDispose()
-                    captureSession.dispose()
-                    result.success(null)
+                    prepareForDispose { pauseResult ->
+                        if (pauseResult.isFailure) {
+                            result.error("CAPTURE_DISPOSE_FAILED", pauseResult.exceptionOrNull()?.message, null)
+                            return@prepareForDispose
+                        }
+                        captureSession.dispose { closeResult ->
+                            closeResult.fold(
+                                onSuccess = { result.success(null) },
+                                onFailure = { result.error("CAPTURE_DISPOSE_FAILED", it.message, null) },
+                            )
+                        }
+                    }
                 }
                 else -> result.notImplemented()
             }

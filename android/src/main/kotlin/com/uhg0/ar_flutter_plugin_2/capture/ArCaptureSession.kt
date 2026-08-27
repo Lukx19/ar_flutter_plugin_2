@@ -24,6 +24,7 @@ import com.uhg0.ar_flutter_plugin_2.sceneview.SceneViewCaptureHost
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -55,6 +56,12 @@ internal class ArCaptureSession(
     private var sharedCameraManager: SharedCameraManager? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private val disposed = AtomicBoolean(false)
+    private var disposeStarted = false
+    private var disposeResult: Result<Unit>? = null
+    private val disposeCallbacks = mutableListOf<(Result<Unit>) -> Unit>()
+    private val nativeCaptureSerialOwnerV2 = NativeCaptureSerialOwnerV2(
+        completionExecutor = Executor { command -> mainHandler.post(command) },
+    )
     // Constructed per view now; #102 only provides a future native admission caller.
     private val nativeCaptureBindingV2 = NativeCaptureBindingV2(
         sceneHost.context,
@@ -714,37 +721,46 @@ internal class ArCaptureSession(
         )
     }
 
-    fun onSessionPaused() {
-        prepareNativeCaptureForPause()
-        finishSharedCameraPause()
-    }
-
-    fun prepareNativeCaptureForPause() = nativeCaptureBindingV2.onPause()
+    fun prepareNativeCaptureForPause(onCompleted: (Result<Unit>) -> Unit): Boolean =
+        nativeCaptureSerialOwnerV2.submit(
+            operation = { nativeCaptureBindingV2.onPause() },
+            completion = onCompleted,
+        )
 
     /** Scalar-only V2 admission. Component descriptors and bytes are native post-output authority. */
-    fun admitNativeCaptureV2(arguments: Any?): Map<String, Any?> {
-        val request = NativeCaptureWireV2.decodeAdmission(arguments)
-        val receipt = nativeCaptureBindingV2.admit(request)
-        return mapOf(
-            "wireVersion" to "native_capture_v2",
-            "attemptId" to receipt.identity.attemptId,
-            "phase" to receipt.phase.name.lowercase(),
-            "durable" to receipt.durable,
-            "terminal" to receipt.terminal?.let { terminal ->
-                NativeCaptureWireV2.event(
-                    NativeCaptureEventV2(
-                        if (terminal.kind == CaptureTerminalKind.COMMITTED_PICTURE) NativeCaptureEventKindV2.COMMITTED else NativeCaptureEventKindV2.ABANDONED,
-                        terminal.identity.attemptId,
-                        terminal.captureId,
-                        terminal.captureRevision,
-                        terminal.manifestId,
-                        terminal.reason,
-                        recoveryContext = request.recoveryContext,
-                    ),
-                )
-            },
-        )
-    }
+    fun admitNativeCaptureV2(
+        arguments: Any?,
+        onCompleted: (Result<Map<String, Any?>>) -> Unit,
+    ): Boolean = nativeCaptureSerialOwnerV2.submit(
+        operation = {
+            val request = NativeCaptureWireV2.decodeAdmission(arguments)
+            val receipt = nativeCaptureBindingV2.admit(request)
+            mapOf(
+                "wireVersion" to "native_capture_v2",
+                "attemptId" to receipt.identity.attemptId,
+                "phase" to receipt.phase.name.lowercase(),
+                "durable" to receipt.durable,
+                "terminal" to receipt.terminal?.let { terminal ->
+                    NativeCaptureWireV2.event(
+                        NativeCaptureEventV2(
+                            if (terminal.kind == CaptureTerminalKind.COMMITTED_PICTURE) {
+                                NativeCaptureEventKindV2.COMMITTED
+                            } else {
+                                NativeCaptureEventKindV2.ABANDONED
+                            },
+                            terminal.identity.attemptId,
+                            terminal.captureId,
+                            terminal.captureRevision,
+                            terminal.manifestId,
+                            terminal.reason,
+                            recoveryContext = request.recoveryContext,
+                        ),
+                    )
+                },
+            )
+        },
+        completion = onCompleted,
+    )
 
     fun nativeCaptureHealthV2(): Map<String, Any?> = NativeCaptureWireV2.event(
         NativeCaptureEventV2(NativeCaptureEventKindV2.HEALTH, resources = nativeCaptureBindingV2.snapshot()),
@@ -759,14 +775,20 @@ internal class ArCaptureSession(
 
     fun advanceNativeCaptureRecoveryV2() = nativeCaptureBindingV2.forceRecoveryForDebug()
 
-    fun notifyNativeCaptureLifecycleV2(event: String) {
+    fun notifyNativeCaptureLifecycleV2(
+        event: String,
+        onCompleted: (Result<Unit>) -> Unit,
+    ): Boolean {
         val parsed = when (event) {
             "automaticDisabled" -> CaptureLifecycleEvent.AUTOMATIC_DISABLED
             "routeLeft" -> CaptureLifecycleEvent.ROUTE_LEFT
             "processRestarted" -> CaptureLifecycleEvent.PROCESS_RESTARTED
             else -> throw IllegalArgumentException("Unsupported V2 lifecycle event: $event")
         }
-        nativeCaptureBindingV2.onLifecycle(parsed)
+        return nativeCaptureSerialOwnerV2.submit(
+            operation = { nativeCaptureBindingV2.onLifecycle(parsed) },
+            completion = onCompleted,
+        )
     }
 
     fun installDebugNativeCaptureSyntheticV2(fault: String?): Boolean {
@@ -820,10 +842,38 @@ internal class ArCaptureSession(
         sharedCameraManager?.onArSessionResumed()
     }
 
-    fun dispose() {
+    fun dispose(onCompleted: (Result<Unit>) -> Unit): Boolean {
+        disposeResult?.let {
+            onCompleted(it)
+            return true
+        }
+        disposeCallbacks += onCompleted
+        if (disposeStarted) return true
+        disposeStarted = true
         // The binding classifies every owner before the manager closes Camera2.
         disposed.set(true)
-        nativeCaptureBindingV2.close()
+        val accepted = nativeCaptureSerialOwnerV2.close(
+            operation = { nativeCaptureBindingV2.close() },
+        ) { durableResult ->
+            val completed = if (durableResult.isFailure) {
+                durableResult
+            } else {
+                runCatching { disposeMainResources() }
+            }
+            disposeResult = completed
+            disposeCallbacks.toList().forEach { it(completed) }
+            disposeCallbacks.clear()
+        }
+        if (!accepted) {
+            val failed = Result.failure<Unit>(IllegalStateException("Native capture durable owner is already closing"))
+            disposeResult = failed
+            disposeCallbacks.toList().forEach { it(failed) }
+            disposeCallbacks.clear()
+        }
+        return accepted
+    }
+
+    private fun disposeMainResources() {
         byteCache.dispose()
         sharedCameraManager?.let { manager ->
             nativeCaptureBindingV2.detachSharedCamera(manager)
