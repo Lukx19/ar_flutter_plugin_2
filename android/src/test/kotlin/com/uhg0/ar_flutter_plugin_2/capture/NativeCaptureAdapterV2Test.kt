@@ -776,6 +776,7 @@ class NativeCaptureAdapterV2Test {
         val store = FakeStore().apply {
             commitEntered = CountDownLatch(1)
             commitRelease = CountDownLatch(1)
+            serializeCommitAndQuery = true
         }
         val camera = FakeExposure()
         val events = mutableListOf<NativeCaptureEventV2>()
@@ -798,15 +799,17 @@ class NativeCaptureAdapterV2Test {
                 executor.submit(java.util.concurrent.Callable { adapter.snapshot().running })
                     .get(500, TimeUnit.MILLISECONDS),
             )
-            executor.submit {
+            val lifecycle = executor.submit {
                 adapter.onLifecycle(
                     CaptureLifecycleEvent.BACKGROUNDED,
                     request.accepted.identity.lifecycleCut,
                 )
-            }.get(500, TimeUnit.MILLISECONDS)
+            }
+            assertThrows(TimeoutException::class.java) { lifecycle.get(100, TimeUnit.MILLISECONDS) }
 
             store.commitRelease!!.countDown()
             commit.get(5, TimeUnit.SECONDS)
+            lifecycle.get(5, TimeUnit.SECONDS)
             assertEquals(1L, adapter.snapshot().exposures)
             assertEquals(1L, adapter.snapshot().unknownQueries)
             assertEquals(0L, adapter.snapshot().committed)
@@ -862,7 +865,8 @@ class NativeCaptureAdapterV2Test {
             acceptRelease = CountDownLatch(1)
         }
         val camera = FakeExposure()
-        val adapter = NativeCaptureAdapterV2(store, camera)
+        val events = mutableListOf<NativeCaptureEventV2>()
+        val adapter = NativeCaptureAdapterV2(store, camera, events = events::add)
         val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG))
         val executor = Executors.newFixedThreadPool(2)
         try {
@@ -877,9 +881,15 @@ class NativeCaptureAdapterV2Test {
             }.get(500, TimeUnit.MILLISECONDS)
 
             store.acceptRelease!!.countDown()
-            assertEquals(CaptureTerminalKind.ABANDONED_ATTEMPT, admission.get(5, TimeUnit.SECONDS).terminal?.kind)
+            val abandoned = admission.get(5, TimeUnit.SECONDS)
+            assertEquals(CaptureTerminalKind.ABANDONED_ATTEMPT, abandoned.terminal?.kind)
             assertTrue(camera.requests.isEmpty())
             assertEquals(0, adapter.snapshot().running)
+            assertTrue(events.isEmpty())
+            val recoveredCamera = FakeExposure()
+            val recoveredAdapter = NativeCaptureAdapterV2(store, recoveredCamera)
+            assertEquals(abandoned, recoveredAdapter.admit(request))
+            assertTrue(recoveredCamera.requests.isEmpty())
         } finally {
             store.acceptRelease?.countDown()
             executor.shutdownNow()
@@ -1154,6 +1164,21 @@ class NativeCaptureAdapterV2Test {
             assertEquals(0, adapter.snapshot().running)
             assertEquals(1L, adapter.snapshot().exposures)
         }
+
+        listOf<Throwable>(java.util.concurrent.CancellationException("cancel"), AssertionError("fatal")).forEachIndexed { index, failure ->
+            val store = FakeStore().apply {
+                failCommitAfterReads = 0
+                rebaseFailure = failure
+            }
+            val camera = FakeExposure()
+            val adapter = NativeCaptureAdapterV2(store, camera)
+            val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = (index + 5).toLong())
+            adapter.admit(request)
+            assertThrows(failure.javaClass) {
+                camera.components(camera.requests.single().first, request, listOf(CaptureComponentKind.JPEG))
+            }
+            assertEquals(0, adapter.snapshot().running)
+        }
     }
 
     @Test
@@ -1325,10 +1350,12 @@ class NativeCaptureAdapterV2Test {
         val queries = mutableListOf<CaptureAttemptIdentity>()
         var failCommitAfterReads: Int? = null
         var commitFailure: Throwable? = null
+        var rebaseFailure: Throwable? = null
         var acceptEntered: CountDownLatch? = null
         var acceptRelease: CountDownLatch? = null
         var commitEntered: CountDownLatch? = null
         var commitRelease: CountDownLatch? = null
+        var serializeCommitAndQuery: Boolean = false
         var abandonEntered: CountDownLatch? = null
         var abandonRelease: CountDownLatch? = null
         private val firstAbandonBlocked = AtomicBoolean(false)
@@ -1357,7 +1384,11 @@ class NativeCaptureAdapterV2Test {
             accepted += request
             return CaptureReceipt(request.accepted.identity, CaptureAttemptPhase.RESERVED_ACCEPTED, "accepted", "accepted", true)
         }
-        override fun commitStreamed(request: CaptureCommitRequest, streams: List<CaptureComponentStreamV2>): CaptureReceipt {
+        private val storeMutex = Any()
+        override fun commitStreamed(request: CaptureCommitRequest, streams: List<CaptureComponentStreamV2>): CaptureReceipt =
+            if (serializeCommitAndQuery) synchronized(storeMutex) { commitBody(request, streams) }
+            else commitBody(request, streams)
+        private fun commitBody(request: CaptureCommitRequest, streams: List<CaptureComponentStreamV2>): CaptureReceipt {
             commitEntered?.countDown()
             commitRelease?.await(5, TimeUnit.SECONDS)
             commitFailure?.let { throw it }
@@ -1369,8 +1400,17 @@ class NativeCaptureAdapterV2Test {
             val terminal = CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, request.accepted.identity, "commit", "committed", "capture", 1, "root")
             return CaptureReceipt(request.accepted.identity, CaptureAttemptPhase.COMMITTED_PICTURE, "commit", "receipt", true, terminal).also(terminals::add)
         }
-        override fun queryReceipt(identity: CaptureAttemptIdentity): CaptureReceipt? { queries += identity; return terminals.firstOrNull { it.identity == identity } }
-        override fun rebaseSameAttempt(request: CaptureCommitRequest): CaptureReceipt = throw IllegalStateException("not prepared")
+        override fun queryReceipt(identity: CaptureAttemptIdentity): CaptureReceipt? =
+            if (serializeCommitAndQuery) synchronized(storeMutex) { queryBody(identity) }
+            else queryBody(identity)
+        private fun queryBody(identity: CaptureAttemptIdentity): CaptureReceipt? {
+            queries += identity
+            return terminals.firstOrNull { it.identity == identity }
+        }
+        override fun rebaseSameAttempt(request: CaptureCommitRequest): CaptureReceipt {
+            rebaseFailure?.let { throw it }
+            throw IllegalStateException("not prepared")
+        }
         override fun abandon(request: CaptureCommitRequest, terminal: CaptureTerminal): CaptureReceipt {
             val receipt = CaptureReceipt(terminal.identity, CaptureAttemptPhase.ABANDONED_ATTEMPT, terminal.canonicalTerminalHash, "abandoned", true, terminal)
                 .also(terminals::add)

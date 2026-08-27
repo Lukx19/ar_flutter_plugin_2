@@ -468,6 +468,7 @@ internal class NativeCaptureAdapterV2(
         var submissionResultResolved: Boolean = false,
         var submissionFailure: String? = null,
         var pendingLifecycleReason: String? = null,
+        var lifecycleTransferInProgress: Boolean = false,
         var componentsClaimed: Boolean = false,
         var pendingComponents: SharedCameraComponentSetV2? = null,
         var tenSecondPresented: Boolean = false,
@@ -538,7 +539,7 @@ internal class NativeCaptureAdapterV2(
                 "lifecycle-cut-during-admission",
             )
             val abandoned = storeCallLocked { store.abandon(request, terminal) }
-            finishLocked(null, abandoned, request.recoveryContext)
+            scheduler.running?.let { next -> work[next.identity]?.let(::startLocked) }
             return@withLock abandoned
         }
         if (receipt.terminal != null) {
@@ -836,6 +837,7 @@ internal class NativeCaptureAdapterV2(
         }
         val cutReason = value.pendingLifecycleReason
         when {
+            cutReason != null && value.lifecycleTransferInProgress -> Unit
             cutReason != null -> transferUnknownLocked(value, "$cutReason-transfer")
             closing -> transferUnknownLocked(value, "shutdown-transfer")
             propagatedStoreFailure != null -> queryOrAbandonLocked(value, "store-interrupted")
@@ -864,11 +866,25 @@ internal class NativeCaptureAdapterV2(
         if (work[value.request.accepted.identity] !== value) return
         if (receipt?.terminal != null) { finishLocked(value, receipt); return }
         // Rebase only a durable prepared/committed identity; the port rejects changed bytes.
-        runCatching { storeCallLocked { store.rebaseSameAttempt(value.request) } }.getOrNull()?.let {
+        var propagatedRebaseFailure: Throwable? = null
+        val rebased = try {
+            storeCallLocked { store.rebaseSameAttempt(value.request) }
+        } catch (error: Exception) {
+            if (error is java.util.concurrent.CancellationException) propagatedRebaseFailure = error
+            null
+        } catch (error: Error) {
+            propagatedRebaseFailure = error
+            null
+        }
+        rebased?.let {
             if (work[value.request.accepted.identity] === value) finishLocked(value, it)
             return
         }
         if (work[value.request.accepted.identity] !== value) return
+        propagatedRebaseFailure?.let { failure ->
+            abandonLocked(value.request, "rebase-interrupted")
+            throw failure
+        }
         abandonLocked(value.request, reason)
     }
 
@@ -894,11 +910,17 @@ internal class NativeCaptureAdapterV2(
             discardPendingComponentsLocked(value)
             return
         }
-        if (value.exposureCounted) transferUnknownLocked(value, "$reason-transfer")
+        if (value.exposureCounted) {
+            if (value.pendingLifecycleReason == null) value.pendingLifecycleReason = reason
+            transferUnknownLocked(value, "$reason-transfer")
+        }
         else abandonLocked(value.request, "$reason-before-exposure")
     }
 
     private fun transferUnknownLocked(value: Work, reason: String) {
+        if (value.lifecycleTransferInProgress) return
+        value.lifecycleTransferInProgress = true
+        try {
         emitLocked(
             NativeCaptureEventV2(
                 NativeCaptureEventKindV2.RECOVERING,
@@ -917,6 +939,9 @@ internal class NativeCaptureAdapterV2(
         work.remove(value.request.accepted.identity)
         scheduler.release(value.request.accepted.identity)
         externalCallLocked { exposure.cancelExposure(value.qualifier) }
+        } finally {
+            value.lifecycleTransferInProgress = false
+        }
     }
 
     private fun abandonLocked(request: CaptureCommitRequest, reason: String): CaptureReceipt {
