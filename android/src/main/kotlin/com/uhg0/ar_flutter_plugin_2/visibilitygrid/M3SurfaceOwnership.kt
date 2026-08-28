@@ -622,61 +622,6 @@ internal enum class M3SurfaceOwnershipFault {
     AFTER_ROOT_DIRECTORY_SYNC,
 }
 
-/**
- * Read-only normalized view of a validated v1-v5 authority.
- *
- * The legacy owner keeps its object graph private.  This is deliberately the
- * only extraction seam used by the v6 migration: it gives a streaming reader
- * canonical value records after the legacy ledger and snapshot have passed the
- * existing fork/corruption checks, but grants no mutation or active-root
- * selection authority.
- */
-internal data class M3LegacyCanonicalState(
-    val group: M3SurfaceGroup,
-    val nextHighWater: Long,
-    val rows: List<M3SurfaceOwner>,
-    val supports: Map<Long, LongArray>,
-    val sources: List<M3ImmutableSourceSupport>,
-    val lineage: List<M3LineageEdge>,
-    val geometryRevision: Long,
-    val lineageRevision: Long,
-    val baseline: M3CommittedEmptyBaseline?,
-    val sourceHash: ByteArray,
-)
-
-/** Decoder-only bridge for v1-v5.  It never writes or selects legacy files. */
-internal object M3SurfaceOwnershipLegacyCodec {
-    fun readValidated(
-        group: M3SurfaceGroup,
-        directory: File,
-        configuration: M3SurfaceOwnershipConfiguration,
-    ): M3LegacyCanonicalState {
-        val store = M3FileSurfaceOwnershipStore(directory, group, null)
-        val restored = store.restore(configuration)
-        val prefix = sha256(group.value.encodeToByteArray()).hex()
-        val snapshot = File(directory, "m3-surface-$prefix.snapshot")
-        val ledger = File(directory, "m3-surface-$prefix.ledger")
-        // The source identity covers both authority files.  It is an input to
-        // the candidate only; the migration never changes either file.
-        val sourceHash = sha256(
-            (if (ledger.exists()) ledger.readBytes() else ByteArray(0)) +
-                (if (snapshot.exists()) snapshot.readBytes() else ByteArray(0)),
-        )
-        return M3LegacyCanonicalState(
-            group = group,
-            nextHighWater = restored.nextHighWater,
-            rows = restored.rows.sortedBy { it.id.value },
-            supports = restored.supports.toSortedMap().mapValues { it.value.copyOf() },
-            sources = restored.sourceRecords.sortedBy { it.id.value }.map { it.toReceiptSupport() },
-            lineage = restored.lineageEdges.sortedWith(compareBy({ it.source.value }, { it.target.value })),
-            geometryRevision = restored.geometryRevision,
-            lineageRevision = restored.lineageRevision,
-            baseline = restored.seededEmptyBaseline,
-            sourceHash = sourceHash,
-        )
-    }
-}
-
 private data class M3Location(val region: M3StorageRegion, val page: Int)
 private data class M3Reservation(val revision: Long, val start: Long, val endExclusive: Long, val groupHash: ByteArray, val commandHash: ByteArray, val fingerprint: ByteArray, val previousHash: ByteArray) { val recordHash: ByteArray get() = sha256(bytesWithoutHash())
     fun bytesWithoutHash(): ByteArray = ByteArrayOutputStream().use { output -> DataOutputStream(output).use { data -> data.writeInt(0x4d33524c); data.writeInt(1); data.writeLong(revision); data.writeLong(start); data.writeLong(endExclusive); data.write(groupHash); data.write(commandHash); data.write(fingerprint); data.write(previousHash); output.toByteArray() } }
