@@ -124,17 +124,23 @@ internal class M3FeatureFusionKernel(
                 // staged by this batch.  Retained arrays remain the sole complete
                 // candidate-A state; scanning them here would make a one-voxel
                 // refinement proportional to the live population.
-                val delta = ArrayList<M3FeatureFusionCandidate>(updatesByKey.size)
+                val delta = ArrayList<M3FeatureFusionChange>(updatesByKey.size)
                 updatesByKey.values.forEach { projected ->
-                    if (projected.isActive) delta += candidate(projected)
+                    val wasActive = !projected.isNew && active[projected.slot]
+                    when {
+                        projected.isActive && (!wasActive || hasMaterialChange(projected)) ->
+                            delta += M3FeatureFusionChange.Upsert(candidate(projected))
+                        wasActive && !projected.isActive ->
+                            delta += M3FeatureFusionChange.Removal(projected.key.x, projected.key.y, projected.key.z)
+                    }
                 }
-                delta.sortWith(compareBy<M3FeatureFusionCandidate> { it.x }.thenBy { it.y }.thenBy { it.z })
+                delta.sortWith(compareBy<M3FeatureFusionChange> { it.x }.thenBy { it.y }.thenBy { it.z })
                 val result = M3FeatureFusionResult.Accepted(
                     Collections.unmodifiableList(delta),
                     receipt(projectedSurfaceCount, nextAssociations),
                     M3FeatureFusionWorkReceipt(
                         distinctTouchedVoxelCount = updatesByKey.size,
-                        returnedCandidateCount = delta.size,
+                        emittedEventCount = delta.size,
                     ),
                 )
                 Staging.Accepted(
@@ -154,6 +160,19 @@ internal class M3FeatureFusionKernel(
         normalOctant(surface.key),
         surface.observationCount,
     )
+
+    /** Within-band observation count is retained evidence, not canonical material state. */
+    private fun hasMaterialChange(surface: ProjectedSurface): Boolean =
+        normalOctant(surface.key) != normalOctant(
+            VoxelKey(surfaceX[surface.slot], surfaceY[surface.slot], surfaceZ[surface.slot]),
+        ) || confidenceBand(surface.observationCount) != confidenceBand(observationCounts[surface.slot])
+
+    private fun confidenceBand(observationCount: Int): Int = when (observationCount.coerceIn(0, 255)) {
+        0 -> 0
+        in 1 until 64 -> 1
+        in 64 until 192 -> 64
+        else -> 192
+    }
 
     private fun insertAt(slot: Int, key: VoxelKey) {
         check(slot == surfaceCount && surfaceCount < SURFACE_CAPACITY)
@@ -278,11 +297,11 @@ internal data class M3FeatureFusionEvidence(val xMeters: Double, val yMeters: Do
 internal sealed interface M3FeatureFusionResult {
     /**
      * A deterministic, immutable delta for this admitted batch.  It contains
-     * only touched voxels which are active after the batch: newly active rows
-     * and active rows whose exact candidate-A evidence was refined.
+     * only touched voxels whose canonical candidate-A state changed: upserts
+     * for activation/material refinement and removals for deactivation.
      */
     data class Accepted(
-        val delta: List<M3FeatureFusionCandidate>,
+        val delta: List<M3FeatureFusionChange>,
         val receipt: M3FeatureFusionResourceReceipt,
         val work: M3FeatureFusionWorkReceipt,
     ) : M3FeatureFusionResult
@@ -290,9 +309,22 @@ internal sealed interface M3FeatureFusionResult {
 }
 
 internal data class M3FeatureFusionCandidate(val x: Int, val y: Int, val z: Int, val weight: Int, val normalOctant: Int, val observationCount: Int)
+internal sealed interface M3FeatureFusionChange {
+    val x: Int
+    val y: Int
+    val z: Int
+
+    data class Upsert(val candidate: M3FeatureFusionCandidate) : M3FeatureFusionChange {
+        override val x: Int get() = candidate.x
+        override val y: Int get() = candidate.y
+        override val z: Int get() = candidate.z
+    }
+
+    data class Removal(override val x: Int, override val y: Int, override val z: Int) : M3FeatureFusionChange
+}
 internal data class M3FeatureFusionResourceReceipt(val surfaceCount: Int, val associationCount: Int, val assignedTupleShareBytes: Int)
 /** Scalar-only receipt for bounded output work; it never exposes retained rows. */
-internal data class M3FeatureFusionWorkReceipt(val distinctTouchedVoxelCount: Int, val returnedCandidateCount: Int)
+internal data class M3FeatureFusionWorkReceipt(val distinctTouchedVoxelCount: Int, val emittedEventCount: Int)
 
 internal enum class M3FeatureFusionRefusal {
     STALE_BATCH,

@@ -22,7 +22,7 @@ class M3FeatureFusionKernelTest {
     fun `candidate A bytes match the immutable fusion lock and reject B and C`() {
         val root = fixture("m0b_fusion_vector_v1.json")
         val observations = root.getValue("observations").jsonArray.map(::fusionEvidence)
-        val actual = canonical(accepted(kernel(), batch(1, observations)).delta)
+        val actual = canonical(upserts(accepted(kernel(), batch(1, observations))))
         val expected = root.getValue("expected").jsonObject
         val candidateA = canonicalExpected(expected.getValue("A").jsonArray)
         val candidateB = canonicalExpected(expected.getValue("B").jsonArray)
@@ -56,8 +56,8 @@ class M3FeatureFusionKernelTest {
             val expectedKeys = oracle.getValue("scenes").jsonArray
                 .first { it.jsonObject.string("name") == scene.string("name") }.jsonObject
                 .getValue("expectedSurfaceKeys").jsonArray.map { key -> key.jsonArray.joinToString(",") { it.jsonPrimitive.content } }.sorted()
-            val first = accepted(kernel(), batch(1, observations)).delta
-            val second = accepted(kernel(), batch(1, observations.reversed())).delta
+            val first = upserts(accepted(kernel(), batch(1, observations)))
+            val second = upserts(accepted(kernel(), batch(1, observations.reversed())))
             assertArrayEquals(scene.string("name"), canonical(first), canonical(second))
             assertEquals(scene.string("name"), expectedKeys, first.map { "${it.x},${it.y},${it.z}" }.sorted())
         }
@@ -106,10 +106,12 @@ class M3FeatureFusionKernelTest {
         assertEquals(M3FeatureFusionRefusal.SURFACE_CAPACITY, refusal.reason)
         assertEquals(full.receipt, refusal.receipt)
 
-        val later = accepted(kernel, batch(2, listOf(evidence(0, 0, 0, 1, 100_001))))
+        val retryEvidence = listOf(evidence(0, 0, 0, 1, 100_001)) +
+            List(62) { index -> evidence(0, 0, 0, 0, 100_002 + index) }
+        val later = accepted(kernel, batch(2, retryEvidence))
         assertEquals(100_000, later.receipt.surfaceCount)
-        assertEquals(100_001, later.receipt.associationCount)
-        assertEquals(3, later.delta.first { it.x == 0 }.weight)
+        assertEquals(100_063, later.receipt.associationCount)
+        assertEquals(3, upserts(later).first { it.x == 0 }.weight)
     }
 
     @Test
@@ -190,6 +192,8 @@ class M3FeatureFusionKernelTest {
     private fun kernel() = M3FeatureFusionKernel()
     private fun accepted(kernel: M3FeatureFusionKernel, batch: M3FeatureFusionBatch) =
         kernel.accept(batch) as M3FeatureFusionResult.Accepted
+    private fun upserts(result: M3FeatureFusionResult.Accepted) =
+        result.delta.mapNotNull { (it as? M3FeatureFusionChange.Upsert)?.candidate }
 
     private fun assertAtomicRefusal(
         reason: M3FeatureFusionRefusal,
