@@ -273,12 +273,17 @@ internal class AndroidVisibilityGridRuntime(
 
     /** Rejects new callbacks and discards copied-but-uncommitted lane values. */
     fun pause() {
-        synchronized(lock) {
-            if (closed || paused) return
+        val claimed = synchronized(lock) {
+            if (closed || paused) return@synchronized false
             paused = true
             pausedOwnership = ownership()
             pauseCount++
+            true
         }
+        if (!claimed) return
+        // Mapper invalidation happens before lane drain so a callback which
+        // already crossed deliverFeature cannot commit behind the pause cut.
+        mapper.pause()
         val discarded = featureLane.pauseAndDiscard() + depthLane.pauseAndDiscard()
         synchronized(lock) { lifecycleDiscardedObservations += discarded }
     }
@@ -309,6 +314,9 @@ internal class AndroidVisibilityGridRuntime(
             }
         }
         synchronized(lock) {
+            // Keep runtime ingress paused until the mapper has reopened its
+            // revalidated cut; otherwise a callback can fall into the gap.
+            mapper.resume()
             paused = false
             pausedOwnership = null
             resumeCount++

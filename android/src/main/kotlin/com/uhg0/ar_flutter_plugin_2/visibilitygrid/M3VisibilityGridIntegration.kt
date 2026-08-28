@@ -3,10 +3,14 @@ package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 import com.uhg0.ar_flutter_plugin_2.m0.M0aCurrentDeltaReceiptV1
 import com.uhg0.ar_flutter_plugin_2.m0.M0aCurrentDeltaSelectorV1
 import com.uhg0.ar_flutter_plugin_2.m0.M0aCurrentDeltaSourceV1
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
+import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
+import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * One group-local M3 module behind the M2 mapper seam.
@@ -26,7 +30,10 @@ internal class M3VisibilityGridIntegration(
     private val ownsExecutor: Boolean = true,
 ) : VisibilityObservationMapper {
     private val lock = Any()
+    private val publicationGate = Any()
     @Volatile private var closed = false
+    @Volatile private var paused = false
+    private val admissionEpoch = AtomicLong(0)
     private var active = 0
     private var cut: VisibilityObservationOwnership? = null
     private var baseline: M3CommittedEmptyBaseline? = null
@@ -35,6 +42,7 @@ internal class M3VisibilityGridIntegration(
     private var batchSequence = 0L
     private var nextTransactionId = 0L
     private var pending: M0aCurrentDeltaSelectorV1? = null
+    private var unpublished: M3CanonicalTransactionResult.Accepted? = null
     private val retainedDelta = M3ExactCurrentDeltaSource()
     private val knownVoxels = hashSetOf<M3Voxel>()
     @Volatile private var committed = 0L
@@ -48,6 +56,7 @@ internal class M3VisibilityGridIntegration(
 
     override fun admitFeature(observation: VisibilityFeatureObservation) = mutate(observation.ownership) {
         beforeAdmission()
+        if (isFenced(observation.ownership)) return@mutate
         if (pending != null) {
             rejected++
             receipt = receipt.copy(status = "awaitingExactAck", rejected = rejected)
@@ -75,6 +84,7 @@ internal class M3VisibilityGridIntegration(
             receipt = receipt.copy(status = "kernelRefused", rejected = rejected)
             return@mutate
         }
+        if (isFenced(observation.ownership)) return@mutate
         val targets = accepted.candidates.filter { M3Voxel(it.x, it.y, it.z) !in knownVoxels }
         if (targets.isEmpty()) return@mutate
         val surfaceOwner = requireNotNull(owner)
@@ -94,18 +104,24 @@ internal class M3VisibilityGridIntegration(
                 )
             },
         )
-        val result = surfaceOwner.transact(command) as? M3CanonicalTransactionResult.Accepted ?: run {
-            rejected++
-            receipt = receipt.copy(status = "canonicalRefused", rejected = rejected)
-            return@mutate
+        synchronized(publicationGate) {
+            if (isFenced(observation.ownership)) return@mutate
+            val result = surfaceOwner.transact(command) as? M3CanonicalTransactionResult.Accepted ?: run {
+                rejected++
+                receipt = receipt.copy(status = "canonicalRefused", rejected = rejected)
+                return@mutate
+            }
+            if (isFenced(observation.ownership)) {
+                // Binding replacement is independent of the lifecycle gate.
+                // Keep the durable result private rather than publishing it
+                // through a stale view.
+                fenced++
+                unpublished = result
+                receipt = receipt.copy(status = "publicationDeferred", fenced = fenced)
+                return@mutate
+            }
+            publishCommittedCreate(observation.ownership, result)
         }
-        if (closed || ownership() != observation.ownership) {
-            // The owner was fenced before a publication cut.  Never allow an
-            // old view to queue a receipt through a replacement binding.
-            fenced++
-            return@mutate
-        }
-        publishCommittedCreate(observation.ownership, result)
     }
 
     /** #63 owns depth semantics; this feature-only integration refuses it. */
@@ -117,7 +133,37 @@ internal class M3VisibilityGridIntegration(
         }
     }
 
+    override fun pause() {
+        synchronized(publicationGate) {
+            paused = true
+            admissionEpoch.incrementAndGet()
+        }
+        drain()
+    }
+
+    override fun resume() {
+        synchronized(publicationGate) {
+            if (closed) return
+            paused = false
+            admissionEpoch.incrementAndGet()
+        }
+        val expected = ownership() ?: return
+        val retained = unpublished ?: return
+        executor.submit {
+            synchronized(publicationGate) {
+                if (!isFenced(expected) && pending == null && unpublished === retained) {
+                    unpublished = null
+                    publishCommittedCreate(expected, retained)
+                }
+            }
+        }.get()
+    }
+
     override fun rollover(ownership: VisibilityObservationOwnership) {
+        synchronized(publicationGate) {
+            paused = true
+            admissionEpoch.incrementAndGet()
+        }
         drain()
         synchronized(lock) {
             if (closed || this.ownership() != ownership) return
@@ -126,6 +172,7 @@ internal class M3VisibilityGridIntegration(
             baseline = null
             receipt = M3VisibilityGridIntegrationReceipt.empty()
         }
+        renderer.clear()
     }
 
     override fun snapshot(): VisibilityMappingAdmissionHealth = synchronized(lock) {
@@ -149,14 +196,21 @@ internal class M3VisibilityGridIntegration(
     fun integrationReceipt(): M3VisibilityGridIntegrationReceipt = synchronized(lock) { receipt }
 
     override fun close() {
-        synchronized(lock) { if (closed) return; closed = true }
+        synchronized(publicationGate) {
+            if (closed) return
+            closed = true
+            paused = true
+            admissionEpoch.incrementAndGet()
+        }
         drain()
         synchronized(lock) { closeOwner() }
+        renderer.close()
         if (ownsExecutor) executor.shutdownNow()
     }
 
     private fun mutate(expected: VisibilityObservationOwnership, work: () -> Unit) {
-        if (ownership() != expected) {
+        val epoch = admissionEpoch.get()
+        if (paused || ownership() != expected) {
             synchronized(lock) { fenced++ }
             return
         }
@@ -164,7 +218,10 @@ internal class M3VisibilityGridIntegration(
             synchronized(lock) { active++ }
             try {
                 synchronized(lock) {
-                    if (closed || ownership() != expected) { fenced++; return@submit }
+                    if (closed || paused || admissionEpoch.get() != epoch || ownership() != expected) {
+                        fenced++
+                        return@submit
+                    }
                 }
                 work()
             } finally {
@@ -172,6 +229,9 @@ internal class M3VisibilityGridIntegration(
             }
         }.get()
     }
+
+    private fun isFenced(expected: VisibilityObservationOwnership): Boolean =
+        closed || paused || ownership() != expected
 
     private fun ensureOpened(expected: VisibilityObservationOwnership): M3CommittedEmptyBaseline? {
         if (cut == expected) return baseline
@@ -236,7 +296,7 @@ internal class M3VisibilityGridIntegration(
         }
         // Renderer and worker name the same durable cut. This callback never
         // enters Flutter and cannot expose ordinary row bytes.
-        renderer.project(canonical, result.targets)
+        renderer.project(expected, canonical, result.targets)
         knownVoxels += result.targets.map { it.voxel }
         committed++
         receipt = M3VisibilityGridIntegrationReceipt(
@@ -268,14 +328,84 @@ internal class M3VisibilityGridIntegration(
         owner = null
         kernel = null
         knownVoxels.clear()
+        unpublished = null
     }
 
     private fun drain() { executor.submit {}.get(2, TimeUnit.SECONDS) }
 }
 
-internal fun interface M3CommittedRendererProjection {
-    fun project(receipt: M3CanonicalTransactionReceipt, rows: List<M3SurfaceOwner>)
-    companion object { val NONE = M3CommittedRendererProjection { _, _ -> } }
+internal interface M3CommittedRendererProjection : AutoCloseable {
+    fun project(
+        ownership: VisibilityObservationOwnership,
+        receipt: M3CanonicalTransactionReceipt,
+        rows: List<M3SurfaceOwner>,
+    )
+    fun clear() = Unit
+    override fun close() = Unit
+    companion object {
+        val NONE = object : M3CommittedRendererProjection {
+            override fun project(
+                ownership: VisibilityObservationOwnership,
+                receipt: M3CanonicalTransactionReceipt,
+                rows: List<M3SurfaceOwner>,
+            ) = Unit
+        }
+    }
+}
+
+/** Dedicated V2 adapter over the existing bounded native renderer state. */
+internal class M3NativeRendererProjection(
+    private val render: (CoveragePointRenderSnapshot?, PointCloudNativeConfig?) -> Unit,
+    capacity: Int = VisibilityGridRendererState.CENTROID_PRESENTATION_CAPACITY,
+) : M3CommittedRendererProjection {
+    private val state = VisibilityGridRendererState(capacity)
+    private val config = PointCloudNativeConfig(
+        renderCapacity = capacity,
+        voxelRenderMode = VoxelRenderMode.CENTROIDS,
+        voxelSizeMeters = 0.1f,
+    )
+    private var closed = false
+
+    @Synchronized
+    override fun project(
+        ownership: VisibilityObservationOwnership,
+        receipt: M3CanonicalTransactionReceipt,
+        rows: List<M3SurfaceOwner>,
+    ) {
+        check(!closed)
+        require(rows.all { it.group.value == ownership.captureGroupId })
+        val keys = rows.map { packVisibilityGridKey(it.voxel.x, it.voxel.y, it.voxel.z) }.toLongArray()
+        state.startGroup(
+            config = VisibilityGridGroupConfig(
+                groupId = ownership.captureGroupId,
+                groupGeneration = ownership.groupGeneration,
+                sessionGeneration = ownership.sessionGeneration,
+                voxelSizeMeters = 0.1,
+                capacity = 100_000,
+                groupFromWorldGl = identityVisibilityGridTransform(),
+                restoredGeometryRevision = receipt.geometryRevision,
+                restoredKeys = keys,
+            ),
+            geometryRevision = receipt.geometryRevision,
+            restoredKeys = keys,
+        )
+        render(state.snapshot(), config)
+    }
+
+    @Synchronized
+    override fun clear() {
+        if (closed) return
+        state.stopGroup()
+        render(null, null)
+    }
+
+    @Synchronized
+    override fun close() {
+        if (closed) return
+        closed = true
+        state.dispose()
+        render(null, null)
+    }
 }
 
 /** Typed scalar test receipt; ordinary feature/surface payload bytes are absent. */

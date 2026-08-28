@@ -38,6 +38,7 @@ import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridMethodChannel
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridRuntimeCapabilities
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridV2Binding
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.M3VisibilityGridIntegration
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.M3NativeRendererProjection
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.AndroidVisibilityGridRuntime
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.ArCoreVisibilityObservationSource
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityObservationDebugChannel
@@ -137,6 +138,7 @@ internal class ArView(
         binding = visibilityGridV2Binding,
         ownership = visibilityGridV2Binding::currentObservationOwnership,
         directory = File(context.filesDir, "visibility-grid-m3"),
+        renderer = M3NativeRendererProjection(sceneHost::updateCoverageRenderer),
         beforeAdmission = visibilityObservationDebugGate::awaitIfArmed,
     )
     private val visibilityObservationRuntime = AndroidVisibilityGridRuntime(

@@ -215,6 +215,12 @@ internal interface VisibilityObservationMapper : AutoCloseable {
 
     fun admitDepth(observation: VisibilityDepthObservation)
 
+    /** Invalidates admitted-but-not-committed work before a lifecycle pause. */
+    fun pause() = Unit
+
+    /** Reopens admission only after the runtime has revalidated its ownership cut. */
+    fun resume() = Unit
+
     /** Fences retained observations before a replacement ownership cut admits. */
     fun rollover(ownership: VisibilityObservationOwnership) = Unit
 
