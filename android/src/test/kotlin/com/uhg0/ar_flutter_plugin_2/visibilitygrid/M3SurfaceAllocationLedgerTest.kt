@@ -59,7 +59,7 @@ class M3SurfaceAllocationLedgerTest {
             val ledger = exhaustedDirectory.resolve("m3-surface-${sha256(group.value.encodeToByteArray()).hex()}.ledger")
             ledger.writeBytes(reservationFixture(group, endExclusive = 0x1_0000_0001L))
             val refusal = M3SurfaceOwnership.open(group, exhaustedDirectory) as M3SurfaceOwnershipOpenResult.Refused
-            assertEquals(M3SurfaceOwnershipRestoreRefusal.EXHAUSTED, refusal.reason)
+            assertEquals(M3SurfaceOwnershipRestoreRefusal.CORRUPT, refusal.reason)
         } finally { exhaustedDirectory.deleteRecursively() }
 
         val maximumDirectory = Files.createTempDirectory("m3-maximum-").toFile()
@@ -91,7 +91,22 @@ class M3SurfaceAllocationLedgerTest {
         } finally { directory.deleteRecursively() }
     }
 
-    private fun command(id: String, voxel: M3Voxel) = M3SurfaceOwnershipCommand(id, listOf(M3SurfaceCandidate(voxel = voxel, normalX = 0.0, normalY = 0.0, normalZ = 1.0, confidence = 0.75)))
+    @Test
+    fun `snapshot declared counts are bounded before materialization`() {
+        val configuration = M3SurfaceOwnershipConfiguration(surfaceCapacity = 1, receiptCapacity = 1)
+        listOf(2 to 0, 0 to 2).forEachIndexed { index, (rowCount, receiptCount) ->
+            val directory = Files.createTempDirectory("m3-bounded-$index-").toFile()
+            try {
+                val group = M3SurfaceGroup("bounded-$index")
+                val snapshot = directory.resolve("m3-surface-${sha256(group.value.encodeToByteArray()).hex()}.snapshot")
+                snapshot.writeBytes(snapshotCountFixture(rowCount, receiptCount))
+                val refusal = M3SurfaceOwnership.open(group, directory, configuration) as M3SurfaceOwnershipOpenResult.Refused
+                assertEquals(M3SurfaceOwnershipRestoreRefusal.CORRUPT, refusal.reason)
+            } finally { directory.deleteRecursively() }
+        }
+    }
+
+    private fun command(id: String, voxel: M3Voxel) = M3SurfaceOwnershipCommand(id, listOf(M3SurfaceCandidate(null, voxel, 0, 0, 192)))
     private fun reservationFixture(group: M3SurfaceGroup, endExclusive: Long): ByteArray {
         val body = ByteArrayOutputStream().use { output ->
             DataOutputStream(output).use { data ->
@@ -104,6 +119,19 @@ class M3SurfaceAllocationLedgerTest {
                 data.write(ByteArray(32))
                 data.write(ByteArray(32))
                 data.write(ByteArray(32))
+            }
+            output.toByteArray()
+        }
+        return body + sha256(body)
+    }
+    private fun snapshotCountFixture(rowCount: Int, receiptCount: Int): ByteArray {
+        val body = ByteArrayOutputStream().use { output ->
+            DataOutputStream(output).use { data ->
+                data.writeInt(0x4d33534f)
+                data.writeInt(1)
+                data.writeLong(1)
+                data.writeInt(rowCount)
+                if (rowCount == 0) data.writeInt(receiptCount)
             }
             output.toByteArray()
         }
