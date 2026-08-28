@@ -102,10 +102,14 @@ class M3FeatureFusionDeltaTest {
 
         val through191 = accepted(kernel, batch(4, List(127) { evidence(9, 0, 0, 2, it + 65, confidenceQ15 = 512) }))
         assertTrue(through191.delta.isEmpty())
-        val oneNinetyTwo = accepted(kernel, batch(5, listOf(evidence(9, 0, 0, 2, 192, confidenceQ15 = 512))))
-        assertEquals(listOf(192), upserts(oneNinetyTwo).flatMap { it.normalCandidates }.map { it.normalConfidence })
+        // Exact estimator formula: roundTiesEven(n * 128 * 255 / 32768).
+        // Therefore n=192 remains confidence 191 and n=193 crosses to 192.
+        val observation192 = accepted(kernel, batch(5, listOf(evidence(9, 0, 0, 2, 192, confidenceQ15 = 512))))
+        assertTrue(observation192.delta.isEmpty())
+        val observation193 = accepted(kernel, batch(6, listOf(evidence(9, 0, 0, 2, 193, confidenceQ15 = 512))))
+        assertEquals(listOf(192), upserts(observation193).flatMap { it.normalCandidates }.map { it.normalConfidence })
 
-        val throughAndPastSaturation = accepted(kernel, batch(6, List(64) { evidence(9, 0, 0, 2, it + 193, confidenceQ15 = 512) }))
+        val throughAndPastSaturation = accepted(kernel, batch(7, List(63) { evidence(9, 0, 0, 2, it + 194, confidenceQ15 = 512) }))
         assertTrue(throughAndPastSaturation.delta.isEmpty())
     }
 
