@@ -70,12 +70,20 @@ internal class M3VisibilityGridIntegration(
             receipt = receipt.copy(status = "featureConflictDeferred", rejected = rejected)
             return@mutate
         }
+        // This adapter is the only M2-to-M3 conversion point.  It creates
+        // fixed camera/sample evidence before the kernel can mutate anything.
+        val normalEvidence = (M3FeatureNormalEvidence.from(observation) as? M3FeatureNormalEvidence.Conversion.Accepted)
+            ?: run {
+                rejected++
+                receipt = receipt.copy(status = "normalEvidenceRefused", rejected = rejected)
+                return@mutate
+            }
         val fused = requireNotNull(kernel).accept(
             M3FeatureFusionBatch(
                 sequence = ++batchSequence,
                 timestampNs = observation.frame.sourceTimestampNs,
-                observations = observation.samples.map {
-                    M3FeatureFusionEvidence(it.xWorld, it.yWorld, it.zWorld, 2, it.id)
+                observations = observation.samples.zip(normalEvidence.evidence).map { (sample, normal) ->
+                    M3FeatureFusionEvidence(sample.xWorld, sample.yWorld, sample.zWorld, 2, sample.id, normal)
                 },
             ),
         )
@@ -96,13 +104,17 @@ internal class M3VisibilityGridIntegration(
             expectedGeometryRevision = base.geometryRevision,
             expectedLineageRevision = base.lineageRevision,
             sourceIds = emptyList(),
-            targets = targets.map {
+            targets = targets.mapNotNull { candidate ->
+                // #111 owns the identity decision for a second opposing face;
+                // the current #62 CREATE consumes only the primary hypothesis.
+                candidate.normalCandidates.firstOrNull { it.face == M3FeatureNormalFace.PRIMARY }?.let {
                 M3CanonicalTarget(
-                    voxel = M3Voxel(it.x, it.y, it.z),
-                    normalOctX = if (it.normalOctant and 2 == 0) -1 else 1,
-                    normalOctY = if (it.normalOctant and 1 == 0) -1 else 1,
-                    normalConfidence = it.observationCount.coerceIn(0, 255),
+                    voxel = M3Voxel(candidate.x, candidate.y, candidate.z),
+                    normalOctX = it.normalOctX,
+                    normalOctY = it.normalOctY,
+                    normalConfidence = it.normalConfidence,
                 )
+                }
             },
         )
         synchronized(publicationGate) {

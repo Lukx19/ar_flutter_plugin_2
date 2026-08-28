@@ -111,7 +111,7 @@ class M3FeatureFusionKernelTest {
         val later = accepted(kernel, batch(2, retryEvidence))
         assertEquals(100_000, later.receipt.surfaceCount)
         assertEquals(100_063, later.receipt.associationCount)
-        assertEquals(3, upserts(later).first { it.x == 0 }.weight)
+        assertTrue(upserts(later).isEmpty()) // 64 -> 128 stays in C12's reliable band.
     }
 
     @Test
@@ -176,7 +176,7 @@ class M3FeatureFusionKernelTest {
         // retained kernel state. GraphLayout measures the active JVM object model.
         val layout = GraphLayout.parseInstance(kernel)
         val retainedBytes = layout.totalSize()
-        val primitivePayloadBytes = 5_548_576L
+        val primitivePayloadBytes = 7_548_576L
         val overheadBytes = retainedBytes - primitivePayloadBytes
         val implementationBytes = requireNotNull(
             javaClass.classLoader?.getResourceAsStream(
@@ -186,7 +186,7 @@ class M3FeatureFusionKernelTest {
         println("M3_RETAINED_ALLOCATION_RECEIPT implementationClassSha256=${sha256(implementationBytes)} retainedBytes=$retainedBytes primitivePayloadBytes=$primitivePayloadBytes objectAndArrayOverheadBytes=$overheadBytes assignedTupleShareBytes=${outcome.receipt.assignedTupleShareBytes}")
         assertTrue("JVM graph measurement must include headers/alignment", overheadBytes > 0)
         assertTrue(retainedBytes <= outcome.receipt.assignedTupleShareBytes)
-        assertEquals(16 * 1024 * 1024, outcome.receipt.assignedTupleShareBytes)
+        assertEquals(7_549_000, outcome.receipt.assignedTupleShareBytes)
     }
 
     private fun kernel() = M3FeatureFusionKernel()
@@ -205,7 +205,8 @@ class M3FeatureFusionKernelTest {
     }
     private fun batch(sequence: Long, observations: List<M3FeatureFusionEvidence>) = M3FeatureFusionBatch(sequence, sequence, observations)
     private fun evidence(x: Int, y: Int, z: Int, weight: Int, supportId: Int) =
-        M3FeatureFusionEvidence(x * 0.1 + 0.02, y * 0.1 + 0.02, z * 0.1 + 0.02, weight, supportId)
+        M3FeatureFusionEvidence(x * 0.1 + 0.02, y * 0.1 + 0.02, z * 0.1 + 0.02, weight, supportId,
+            M3FeatureNormalEvidence(x, y, z, x * 100 + 20, y * 100 + 20, z * 100 + 20, x * 100 + 1_020, y * 100 + 20, z * 100 + 20, 32_767))
 
     private fun fusionEvidence(raw: kotlinx.serialization.json.JsonElement): M3FeatureFusionEvidence {
         val row = raw.jsonObject

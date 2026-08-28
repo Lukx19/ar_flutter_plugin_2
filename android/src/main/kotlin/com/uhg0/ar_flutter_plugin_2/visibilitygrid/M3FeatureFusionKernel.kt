@@ -43,6 +43,11 @@ internal class M3FeatureFusionKernel(
             accumulatedWeights[update.slot] = update.weight
             observationCounts[update.slot] = update.observationCount
             active[update.slot] = update.isActive
+            axisXQ13[update.slot] = update.axisXQ13
+            axisYQ13[update.slot] = update.axisYQ13
+            axisZQ13[update.slot] = update.axisZQ13
+            positiveSupportQ13[update.slot] = update.positiveSupportQ13
+            negativeSupportQ13[update.slot] = update.negativeSupportQ13
         }
         lastSequence = batch.sequence
         lastTimestampNs = batch.timestampNs
@@ -58,6 +63,9 @@ internal class M3FeatureFusionKernel(
         }
         return operations.allocate(M3AllocationCut.NORMALIZATION) {
             val normalized = ArrayList<NormalizedEvidence>(batch.observations.size)
+            // Batch-local only: exhaustive encoding remains exact while repeated
+            // rays do not pay its 65,025-code search repeatedly.
+            val octCodes = HashMap<DirectionKey, Pair<Int, Int>>()
             batch.observations.forEach { evidence ->
                 if (evidence.signedWeight !in -EVIDENCE_SATURATION..EVIDENCE_SATURATION) {
                     return@allocate Normalization.Refused(M3FeatureFusionRefusal.INVALID_EVIDENCE_WEIGHT)
@@ -68,20 +76,46 @@ internal class M3FeatureFusionKernel(
                     ?: return@allocate Normalization.Refused(quantizationRefusal(evidence.yMeters))
                 val z = quantize(evidence.zMeters)
                     ?: return@allocate Normalization.Refused(quantizationRefusal(evidence.zMeters))
-                normalized += NormalizedEvidence(VoxelKey(x, y, z), evidence.signedWeight, evidence.supportId)
+                val normal = evidence.normalEvidence
+                    ?: return@allocate Normalization.Refused(M3FeatureFusionRefusal.INVALID_NORMAL_EVIDENCE)
+                if (normal.voxelX != x || normal.voxelY != y || normal.voxelZ != z ||
+                    normal.confidenceQ15 !in 0..32_767 ||
+                    (normal.sampleXmm == normal.cameraXmm && normal.sampleYmm == normal.cameraYmm && normal.sampleZmm == normal.cameraZmm)
+                ) return@allocate Normalization.Refused(M3FeatureFusionRefusal.INVALID_NORMAL_EVIDENCE)
+                val direction = M3NormalMath.normalizeQ15(
+                    normal.cameraXmm.toLong() - normal.sampleXmm,
+                    normal.cameraYmm.toLong() - normal.sampleYmm,
+                    normal.cameraZmm.toLong() - normal.sampleZmm,
+                ) ?: return@allocate Normalization.Refused(M3FeatureFusionRefusal.INVALID_NORMAL_EVIDENCE)
+                val negated = M3NormalMath.negated(direction)
+                val codes = octCodes.getOrPut(DirectionKey(direction[0], direction[1], direction[2])) {
+                    M3NormalMath.encodeOct(direction) to M3NormalMath.encodeOct(negated)
+                }
+                val directCode = codes.first
+                val oppositeCode = codes.second
+                val canonicalDirection = if (directCode <= oppositeCode) direction else negated
+                normalized += NormalizedEvidence(
+                    VoxelKey(x, y, z), evidence.signedWeight, evidence.supportId, canonicalDirection,
+                    directCode <= oppositeCode, M3NormalMath.confidenceQ13(normal.confidenceQ15),
+                )
             }
             normalized.sortWith(
                 compareBy<NormalizedEvidence> { it.key.x }
                     .thenBy { it.key.y }
                     .thenBy { it.key.z }
                     .thenBy { it.supportId }
-                    .thenBy { it.signedWeight },
+                    .thenBy { it.signedWeight }
+                    .thenBy { it.axisDirectionQ15[0] }
+                    .thenBy { it.axisDirectionQ15[1] }
+                    .thenBy { it.axisDirectionQ15[2] }
+                    .thenBy { it.positiveSide }
+                    .thenBy { it.supportQ13 },
             )
             Normalization.Accepted(normalized)
         }
     }
 
-    private fun stage(evidence: List<NormalizedEvidence>, batch: M3FeatureFusionBatch): Staging =
+    private fun stage(evidence: List<NormalizedEvidence>, batch: M3FeatureFusionBatch): Staging = try {
         operations.allocate(M3AllocationCut.PREFLIGHT) {
             val nextAssociations = addOrRefuse(associationCount, evidence.size)
                 ?: return@allocate Staging.Refused(M3FeatureFusionRefusal.CHECKED_ARITHMETIC)
@@ -97,14 +131,15 @@ internal class M3FeatureFusionKernel(
                 if (projected == null) {
                     val existing = findSlot(item.key)
                     if (existing >= 0) {
-                        projected = ProjectedSurface(existing, item.key, accumulatedWeights[existing], observationCounts[existing], active[existing], false)
+                        projected = ProjectedSurface(existing, item.key, accumulatedWeights[existing], observationCounts[existing], active[existing], false,
+                            axisXQ13[existing], axisYQ13[existing], axisZQ13[existing], positiveSupportQ13[existing], negativeSupportQ13[existing])
                     } else {
                         val next = addOrRefuse(projectedSurfaceCount, 1)
                             ?: return@allocate Staging.Refused(M3FeatureFusionRefusal.CHECKED_ARITHMETIC)
                         if (next > SURFACE_CAPACITY) {
                             return@allocate Staging.Refused(M3FeatureFusionRefusal.SURFACE_CAPACITY)
                         }
-                        projected = ProjectedSurface(projectedSurfaceCount, item.key, 0, 0, false, true)
+                        projected = ProjectedSurface(projectedSurfaceCount, item.key, 0, 0, false, true, 0, 0, 0, 0, 0)
                         projectedSurfaceCount = next
                     }
                 }
@@ -114,7 +149,8 @@ internal class M3FeatureFusionKernel(
                     ?: return@allocate Staging.Refused(M3FeatureFusionRefusal.CHECKED_ARITHMETIC)
                 val weight = sum.coerceIn(-EVIDENCE_SATURATION, EVIDENCE_SATURATION)
                 val threshold = if (projected.isActive) DEACTIVATION_THRESHOLD else OCCUPANCY_THRESHOLD
-                val updated = projected.copy(weight = weight, observationCount = count, isActive = weight >= threshold)
+                val normal = if (item.signedWeight > 0 && item.supportQ13 > 0) projected.addNormal(item) else projected
+                val updated = normal.copy(weight = weight, observationCount = count, isActive = weight >= threshold)
                 updatesByKey[item.key] = updated
                 associations += ProjectedAssociation(updated.slot, item.signedWeight, item.supportId)
             }
@@ -125,11 +161,15 @@ internal class M3FeatureFusionKernel(
                 // candidate-A state; scanning them here would make a one-voxel
                 // refinement proportional to the live population.
                 val delta = ArrayList<M3FeatureFusionChange>(updatesByKey.size)
+                // Batch-local only. Capacity campaigns commonly share an exact
+                // accumulated axis; exhaustively encode each distinct Q15 axis
+                // once without retaining an estimator cache in kernel state.
+                val axisOctCodes = HashMap<DirectionKey, Pair<Int, Int>>()
                 updatesByKey.values.forEach { projected ->
                     val wasActive = !projected.isNew && active[projected.slot]
                     when {
-                        projected.isActive && (!wasActive || hasMaterialChange(projected)) ->
-                            delta += M3FeatureFusionChange.Upsert(candidate(projected))
+                        projected.isActive && (!wasActive || hasMaterialChange(projected, axisOctCodes)) ->
+                            delta += M3FeatureFusionChange.Upsert(candidate(projected, axisOctCodes))
                         wasActive && !projected.isActive ->
                             delta += M3FeatureFusionChange.Removal(projected.key.x, projected.key.y, projected.key.z)
                     }
@@ -151,23 +191,32 @@ internal class M3FeatureFusionKernel(
                 )
             }
         }
+    } catch (_: ArithmeticException) {
+        Staging.Refused(M3FeatureFusionRefusal.CHECKED_ARITHMETIC)
+    }
 
-    private fun candidate(surface: ProjectedSurface) = M3FeatureFusionCandidate(
+    private fun candidate(surface: ProjectedSurface, axisOctCodes: MutableMap<DirectionKey, Pair<Int, Int>>) = M3FeatureFusionCandidate(
         surface.key.x,
         surface.key.y,
         surface.key.z,
         surface.weight,
-        normalOctant(surface.key),
         surface.observationCount,
+        hypotheses(surface, axisOctCodes),
     )
 
-    /** Within-band observation count is retained evidence, not canonical material state. */
-    private fun hasMaterialChange(surface: ProjectedSurface): Boolean =
-        normalOctant(surface.key) != normalOctant(
-            VoxelKey(surfaceX[surface.slot], surfaceY[surface.slot], surfaceZ[surface.slot]),
-        ) || confidenceBand(surface.observationCount) != confidenceBand(observationCounts[surface.slot])
+    /** Within-band confidence is retained evidence, not canonical material state. */
+    private fun hasMaterialChange(surface: ProjectedSurface, axisOctCodes: MutableMap<DirectionKey, Pair<Int, Int>>): Boolean {
+        val previous = ProjectedSurface(surface.slot, surface.key, accumulatedWeights[surface.slot], observationCounts[surface.slot], active[surface.slot], false,
+            axisXQ13[surface.slot], axisYQ13[surface.slot], axisZQ13[surface.slot], positiveSupportQ13[surface.slot], negativeSupportQ13[surface.slot])
+        val before = hypotheses(previous, axisOctCodes)
+        val after = hypotheses(surface, axisOctCodes)
+        return before.size != after.size || before.zip(after).any { (old, new) ->
+            old.face != new.face || old.normalOctX != new.normalOctX || old.normalOctY != new.normalOctY ||
+                confidenceBand(old.normalConfidence) != confidenceBand(new.normalConfidence)
+        }
+    }
 
-    private fun confidenceBand(observationCount: Int): Int = when (observationCount.coerceIn(0, 255)) {
+    private fun confidenceBand(confidence: Int): Int = when (confidence.coerceIn(0, 255)) {
         0 -> 0
         in 1 until 64 -> 1
         in 64 until 192 -> 64
@@ -223,13 +272,64 @@ internal class M3FeatureFusionKernel(
         return value and HASH_MASK
     }
 
-    private fun normalOctant(key: VoxelKey): Int =
-        ((key.x.compareTo(0) shl 2) or (key.y.compareTo(0) shl 1) or key.z.compareTo(0)) and 7
+    /**
+     * C12's exact equal-side rule is intentionally stronger than the ticket's
+     * later two-face shorthand: a tie publishes one lexicographically-minimum
+     * unknown normal (confidence 0), rather than two falsely oriented faces.
+     */
+    private fun hypotheses(
+        surface: ProjectedSurface,
+        axisOctCodes: MutableMap<DirectionKey, Pair<Int, Int>>,
+    ): List<M3FeatureNormalCandidate> {
+        val axis = M3NormalMath.normalizeQ15(surface.axisXQ13.toLong(), surface.axisYQ13.toLong(), surface.axisZQ13.toLong())
+            ?: return emptyList()
+        val codes = axisOctCodes.getOrPut(DirectionKey(axis[0], axis[1], axis[2])) {
+            M3NormalMath.encodeOct(axis) to M3NormalMath.encodeOct(M3NormalMath.negated(axis))
+        }
+        val axisCode = codes.first
+        val opposite = codes.second
+        val positive = surface.positiveSupportQ13
+        val negative = surface.negativeSupportQ13
+        if (positive == negative) {
+            val chosen = minOf(axisCode, opposite)
+            return listOf(M3FeatureNormalCandidate(surface.key.x, surface.key.y, surface.key.z, M3FeatureNormalFace.PRIMARY,
+                (chosen ushr 8).toByte().toInt(), chosen.toByte().toInt(), 0))
+        }
+        fun confidence(support: Int) = (M3NormalMath.roundTiesEven(support.toLong() * 255L, 4L * 8192L)).coerceIn(0L, 255L).toInt()
+        val positiveConfidence = confidence(positive)
+        val negativeConfidence = confidence(negative)
+        val bothReliable = positiveConfidence >= 64 && negativeConfidence >= 64
+        val primaryPositive = positive > negative
+        val primaryCode = if (primaryPositive) axisCode else opposite
+        val primaryConfidence = if (bothReliable) maxOf(positiveConfidence, negativeConfidence) else confidence(kotlin.math.abs(positive - negative))
+        val primary = M3FeatureNormalCandidate(surface.key.x, surface.key.y, surface.key.z, M3FeatureNormalFace.PRIMARY,
+            (primaryCode ushr 8).toByte().toInt(), primaryCode.toByte().toInt(), primaryConfidence)
+        if (!bothReliable) return listOf(primary)
+        val opposingCode = if (primaryPositive) opposite else axisCode
+        return listOf(primary, M3FeatureNormalCandidate(surface.key.x, surface.key.y, surface.key.z, M3FeatureNormalFace.OPPOSING,
+            (opposingCode ushr 8).toByte().toInt(), opposingCode.toByte().toInt(), minOf(positiveConfidence, negativeConfidence)))
+            .sortedBy { ((it.normalOctX and 0xff) shl 8) or (it.normalOctY and 0xff) }
+    }
 
     private data class VoxelKey(val x: Int, val y: Int, val z: Int)
-    private data class NormalizedEvidence(val key: VoxelKey, val signedWeight: Int, val supportId: Int)
+    private data class DirectionKey(val x: Int, val y: Int, val z: Int)
+    private data class NormalizedEvidence(val key: VoxelKey, val signedWeight: Int, val supportId: Int, val axisDirectionQ15: IntArray, val positiveSide: Boolean, val supportQ13: Int)
     private data class ProjectedAssociation(val slot: Int, val weight: Int, val supportId: Int)
-    private data class ProjectedSurface(val slot: Int, val key: VoxelKey, val weight: Int, val observationCount: Int, val isActive: Boolean, val isNew: Boolean)
+    private data class ProjectedSurface(
+        val slot: Int, val key: VoxelKey, val weight: Int, val observationCount: Int, val isActive: Boolean, val isNew: Boolean,
+        val axisXQ13: Int, val axisYQ13: Int, val axisZQ13: Int, val positiveSupportQ13: Int, val negativeSupportQ13: Int,
+    ) {
+        fun addNormal(evidence: NormalizedEvidence): ProjectedSurface {
+            fun contribution(component: Int) = Math.toIntExact(M3NormalMath.roundTiesEven(component.toLong() * evidence.supportQ13, 32_767L))
+            return copy(
+                axisXQ13 = Math.addExact(axisXQ13, contribution(evidence.axisDirectionQ15[0])),
+                axisYQ13 = Math.addExact(axisYQ13, contribution(evidence.axisDirectionQ15[1])),
+                axisZQ13 = Math.addExact(axisZQ13, contribution(evidence.axisDirectionQ15[2])),
+                positiveSupportQ13 = if (evidence.positiveSide) Math.addExact(positiveSupportQ13, evidence.supportQ13) else positiveSupportQ13,
+                negativeSupportQ13 = if (evidence.positiveSide) negativeSupportQ13 else Math.addExact(negativeSupportQ13, evidence.supportQ13),
+            )
+        }
+    }
     private sealed interface Normalization {
         data class Accepted(val evidence: List<NormalizedEvidence>) : Normalization
         data class Refused(val reason: M3FeatureFusionRefusal) : Normalization
@@ -250,6 +350,12 @@ internal class M3FeatureFusionKernel(
     private val accumulatedWeights = IntArray(SURFACE_CAPACITY)
     private val observationCounts = IntArray(SURFACE_CAPACITY)
     private val active = BooleanArray(SURFACE_CAPACITY)
+    // #113's only retained directional state: five fixed primitive arrays.
+    private val axisXQ13 = IntArray(SURFACE_CAPACITY)
+    private val axisYQ13 = IntArray(SURFACE_CAPACITY)
+    private val axisZQ13 = IntArray(SURFACE_CAPACITY)
+    private val positiveSupportQ13 = IntArray(SURFACE_CAPACITY)
+    private val negativeSupportQ13 = IntArray(SURFACE_CAPACITY)
     private val evidenceWeights = IntArray(ASSOCIATION_CAPACITY)
     private val evidenceSupportIds = IntArray(ASSOCIATION_CAPACITY)
     private val associationSlots = IntArray(ASSOCIATION_CAPACITY)
@@ -264,7 +370,7 @@ internal class M3FeatureFusionKernel(
         const val ASSOCIATION_CAPACITY = 200_000
         const val HASH_SLOTS = 262_144
         const val HASH_MASK = HASH_SLOTS - 1
-        const val M3_TUPLE_SHARE_BYTES = 16 * 1024 * 1024
+        const val M3_TUPLE_SHARE_BYTES = 7_549_000
         const val OCCUPANCY_THRESHOLD = 2
         const val DEACTIVATION_THRESHOLD = 1
         const val EVIDENCE_SATURATION = 127
@@ -292,7 +398,10 @@ internal class M3FeatureFusionBatch(val sequence: Long, val timestampNs: Long, o
     val observations: List<M3FeatureFusionEvidence> = observations.toList()
 }
 
-internal data class M3FeatureFusionEvidence(val xMeters: Double, val yMeters: Double, val zMeters: Double, val signedWeight: Int, val supportId: Int)
+internal data class M3FeatureFusionEvidence(
+    val xMeters: Double, val yMeters: Double, val zMeters: Double, val signedWeight: Int, val supportId: Int,
+    val normalEvidence: M3FeatureNormalEvidence? = null,
+)
 
 internal sealed interface M3FeatureFusionResult {
     /**
@@ -308,7 +417,24 @@ internal sealed interface M3FeatureFusionResult {
     data class Refused(val reason: M3FeatureFusionRefusal, val receipt: M3FeatureFusionResourceReceipt) : M3FeatureFusionResult
 }
 
-internal data class M3FeatureFusionCandidate(val x: Int, val y: Int, val z: Int, val weight: Int, val normalOctant: Int, val observationCount: Int)
+internal enum class M3FeatureNormalFace { PRIMARY, OPPOSING }
+internal data class M3FeatureNormalCandidate(
+    val x: Int, val y: Int, val z: Int, val face: M3FeatureNormalFace,
+    val normalOctX: Int, val normalOctY: Int, val normalConfidence: Int,
+)
+internal data class M3FeatureFusionCandidate(
+    val x: Int, val y: Int, val z: Int, val weight: Int, val observationCount: Int,
+    val normalCandidates: List<M3FeatureNormalCandidate>,
+) {
+    /** Compatibility-only diagnostic for the immutable M0 candidate-A oracle. */
+    val normalOctant: Int get() = ((x.compareTo(0) shl 2) or (y.compareTo(0) shl 1) or z.compareTo(0)) and 7
+
+    @Suppress("unused")
+    constructor(x: Int, y: Int, z: Int, weight: Int, normalOctantDiagnostic: Int, observationCount: Int) :
+        this(x, y, z, weight, observationCount, emptyList()) {
+        require(normalOctantDiagnostic in 0..7)
+    }
+}
 internal sealed interface M3FeatureFusionChange {
     val x: Int
     val y: Int
@@ -331,6 +457,7 @@ internal enum class M3FeatureFusionRefusal {
     NON_FINITE_COORDINATE,
     COORDINATE_OUT_OF_RANGE,
     INVALID_EVIDENCE_WEIGHT,
+    INVALID_NORMAL_EVIDENCE,
     CHECKED_ARITHMETIC,
     SURFACE_CAPACITY,
     ASSOCIATION_CAPACITY,

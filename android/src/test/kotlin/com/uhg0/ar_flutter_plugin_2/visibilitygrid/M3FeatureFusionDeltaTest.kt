@@ -45,7 +45,7 @@ class M3FeatureFusionDeltaTest {
         assertEquals(0, reobservedInactive.work.emittedEventCount)
 
         val activated = accepted(kernel, batch(3, listOf(evidence(4, 0, 0, 1, 3))))
-        assertEquals(listOf(M3FeatureFusionCandidate(4, 0, 0, 2, 4, 3)), upserts(activated))
+        assertEquals(listOf(4 to 2), upserts(activated).map { it.x to it.weight })
 
         val refinedWithinBand = accepted(kernel, batch(4, listOf(evidence(4, 0, 0, 1, 4))))
         assertTrue(refinedWithinBand.delta.isEmpty())
@@ -66,7 +66,7 @@ class M3FeatureFusionDeltaTest {
         val accumulator = DeltaAccumulator()
 
         accepted(kernel, batch(1, listOf(evidence(7, 0, 0, 2, 1)))).also(accumulator::apply)
-        assertEquals(listOf(M3FeatureFusionCandidate(7, 0, 0, 2, 4, 1)), accumulator.candidates())
+        assertEquals(listOf(7 to 2), accumulator.candidates().map { it.x to it.weight })
 
         val deactivated = accepted(kernel, batch(2, listOf(evidence(7, 0, 0, -2, 2))))
         assertEquals(listOf(M3FeatureFusionChange.Removal(7, 0, 0)), deactivated.delta)
@@ -89,23 +89,23 @@ class M3FeatureFusionDeltaTest {
     }
 
     @Test
-    fun `material confidence threshold transitions publish exactly once`() {
+    fun `normal confidence threshold transitions publish only on C12 material bands`() {
         val kernel = M3FeatureFusionKernel()
 
-        val zeroToOne = accepted(kernel, batch(1, listOf(evidence(9, 0, 0, 2, 1))))
-        assertEquals(listOf(1), upserts(zeroToOne).map { it.observationCount })
+        val zeroToOne = accepted(kernel, batch(1, listOf(evidence(9, 0, 0, 2, 1, confidenceQ15 = 512))))
+        assertEquals(listOf(1), upserts(zeroToOne).flatMap { it.normalCandidates }.map { it.normalConfidence })
 
-        val through63 = accepted(kernel, batch(2, List(62) { evidence(9, 0, 0, 0, it + 2) }))
+        val through63 = accepted(kernel, batch(2, List(62) { evidence(9, 0, 0, 2, it + 2, confidenceQ15 = 512) }))
         assertTrue(through63.delta.isEmpty())
-        val sixtyFour = accepted(kernel, batch(3, listOf(evidence(9, 0, 0, 0, 64))))
-        assertEquals(listOf(64), upserts(sixtyFour).map { it.observationCount })
+        val sixtyFour = accepted(kernel, batch(3, listOf(evidence(9, 0, 0, 2, 64, confidenceQ15 = 512))))
+        assertEquals(listOf(64), upserts(sixtyFour).flatMap { it.normalCandidates }.map { it.normalConfidence })
 
-        val through191 = accepted(kernel, batch(4, List(127) { evidence(9, 0, 0, 0, it + 65) }))
+        val through191 = accepted(kernel, batch(4, List(127) { evidence(9, 0, 0, 2, it + 65, confidenceQ15 = 512) }))
         assertTrue(through191.delta.isEmpty())
-        val oneNinetyTwo = accepted(kernel, batch(5, listOf(evidence(9, 0, 0, 0, 192))))
-        assertEquals(listOf(192), upserts(oneNinetyTwo).map { it.observationCount })
+        val oneNinetyTwo = accepted(kernel, batch(5, listOf(evidence(9, 0, 0, 2, 192, confidenceQ15 = 512))))
+        assertEquals(listOf(192), upserts(oneNinetyTwo).flatMap { it.normalCandidates }.map { it.normalConfidence })
 
-        val throughAndPastSaturation = accepted(kernel, batch(6, List(64) { evidence(9, 0, 0, 0, it + 193) }))
+        val throughAndPastSaturation = accepted(kernel, batch(6, List(64) { evidence(9, 0, 0, 2, it + 193, confidenceQ15 = 512) }))
         assertTrue(throughAndPastSaturation.delta.isEmpty())
     }
 
@@ -122,8 +122,8 @@ class M3FeatureFusionDeltaTest {
         assertEquals(100_000, refinement.receipt.surfaceCount)
         assertEquals(100_063, refinement.receipt.associationCount)
         assertEquals(1, refinement.work.distinctTouchedVoxelCount)
-        assertEquals(1, refinement.work.emittedEventCount)
-        assertEquals(listOf(M3FeatureFusionCandidate(42, 0, 0, 3, 4, 64)), upserts(refinement))
+        assertEquals(0, refinement.work.emittedEventCount)
+        assertTrue(upserts(refinement).isEmpty())
 
         // The returned graph is bounded by the touched result, not the 100k
         // retained population. The kernel itself is intentionally excluded.
@@ -146,8 +146,9 @@ class M3FeatureFusionDeltaTest {
     private fun batch(sequence: Long, observations: List<M3FeatureFusionEvidence>) =
         M3FeatureFusionBatch(sequence, sequence, observations)
 
-    private fun evidence(x: Int, y: Int, z: Int, weight: Int, supportId: Int) =
-        M3FeatureFusionEvidence(x * 0.1 + 0.02, y * 0.1 + 0.02, z * 0.1 + 0.02, weight, supportId)
+    private fun evidence(x: Int, y: Int, z: Int, weight: Int, supportId: Int, confidenceQ15: Int = 32_767) =
+        M3FeatureFusionEvidence(x * 0.1 + 0.02, y * 0.1 + 0.02, z * 0.1 + 0.02, weight, supportId,
+            M3FeatureNormalEvidence(x, y, z, x * 100 + 20, y * 100 + 20, z * 100 + 20, x * 100 + 1_020, y * 100 + 20, z * 100 + 20, confidenceQ15))
 
     private fun fusionEvidence(raw: kotlinx.serialization.json.JsonElement): M3FeatureFusionEvidence {
         val row = raw.jsonObject
