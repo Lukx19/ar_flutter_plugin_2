@@ -3,7 +3,6 @@ package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetCoordinatorV2
 import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetReservationV2
 import java.io.File
-import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.nio.channels.FileChannel
 import java.nio.file.Files
@@ -217,20 +216,84 @@ internal enum class M3CompactCanonicalMigrationFault {
 internal interface M3CanonicalStorageBudget {
     fun reserve(bytes: Long): Any?
 
+    fun reserveCandidate(
+        staging: File,
+        target: File,
+        fileBytes: Map<String, Long>,
+        maximumPhysicalBytes: Long,
+    ): Any? {
+        val token = reserve(maximumPhysicalBytes) ?: return null
+        require(staging.mkdirs())
+        fileBytes.forEach { (name, bytes) ->
+            RandomAccessFile(File(staging, name), "rw").use { file ->
+                file.setLength(bytes)
+                if (bytes > 0) {
+                    val zero = ByteArray(65_536)
+                    var offset = 0L
+                    while (offset < bytes) {
+                        val count = minOf(zero.size.toLong(), bytes - offset).toInt()
+                        file.write(zero, 0, count); offset += count
+                    }
+                    file.fd.sync()
+                }
+            }
+        }
+        return token
+    }
+
+    fun verifyCandidate(token: Any, candidate: File): Long = allocatedBytes(candidate)
+
+    fun publishCandidate(token: Any, staging: File, target: File) {
+        Files.move(staging.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE)
+    }
+
+    fun reconcilePublishedCandidate(target: File) = Unit
+
+    fun releaseCandidate(token: Any, staging: File) {
+        if (staging.exists()) staging.deleteRecursively()
+        release(token)
+    }
+
     fun commit(token: Any, actualBytes: Long)
 
     fun release(token: Any)
 
-    fun allocatedBytes(path: File): Long = m3PhysicalAllocatedTreeBytes(path)
+    fun allocatedBytes(path: File): Long = m3PhysicalAllocatedTreeBytes(path, allocationUnitBytes(path))
 
-    fun allocationUnitBytes(path: File): Long =
-        Files.getFileStore(path.toPath()).blockSize.coerceAtLeast(1L)
+    fun allocationUnitBytes(path: File): Long {
+        require(!System.getProperty("os.name").orEmpty().startsWith("Windows", true)) {
+            "Windows allocation units require an authoritative injected storage budget"
+        }
+        return Files.getFileStore(path.toPath()).blockSize.coerceAtLeast(1L)
+    }
 }
 
 internal class M3CoordinatorStorageBudget(private val coordinator: StorageBudgetCoordinatorV2) :
     M3CanonicalStorageBudget {
     override fun reserve(bytes: Long): Any? =
         coordinator.reserve("m3:canonical:v6-migration", bytes)
+
+    override fun reserveCandidate(
+        staging: File,
+        target: File,
+        fileBytes: Map<String, Long>,
+        maximumPhysicalBytes: Long,
+    ): Any? = coordinator.reserveCandidate(
+        "m3:canonical:v6-migration", staging, target, fileBytes, maximumPhysicalBytes,
+    )
+
+    override fun verifyCandidate(token: Any, candidate: File) =
+        coordinator.verifyCandidate(token as StorageBudgetReservationV2, candidate)
+
+    override fun publishCandidate(token: Any, staging: File, target: File) =
+        coordinator.publishCandidate(token as StorageBudgetReservationV2, staging, target)
+
+    override fun reconcilePublishedCandidate(target: File) =
+        coordinator.reconcilePublishedCandidate(target)
+
+    override fun releaseCandidate(token: Any, staging: File) {
+        coordinator.releaseCandidate(token as StorageBudgetReservationV2, staging)
+    }
 
     override fun commit(token: Any, actualBytes: Long) =
         coordinator.commit(token as StorageBudgetReservationV2, actualBytes)
@@ -582,25 +645,21 @@ private constructor(
             var staging: File? = null
             var published = false
             try {
+                val target = candidateDirectory(directory, group)
+                val existing = if (target.exists()) {
+                    budget.reconcilePublishedCandidate(target)
+                    inspectExistingCandidate(group, directory, budget, configuration)
+                        ?: return M3CompactCanonicalMigrationResult.Refused(
+                            M3CompactCanonicalRefusal.CORRUPT
+                        )
+                } else null
                 val legacy =
                     M3SurfaceOwnershipLegacyCodec.readValidated(group, directory, configuration)
                 validateLegacyForV6(legacy, configuration)
-                val target = candidateDirectory(directory, group)
-                if (target.exists()) {
-                    val opened = openV6(group, directory, budget, configuration)
-                    val store =
-                        (opened as? M3CompactCanonicalOpenResult.Opened)?.store
-                            ?: return M3CompactCanonicalMigrationResult.Refused(
-                                M3CompactCanonicalRefusal.CORRUPT
-                            )
+                if (existing != null) {
                     return if (
-                        store.cut.sourceHash == M3CanonicalReceiptBytes(legacy.sourceHash)
-                    )
-                        M3CompactCanonicalMigrationResult.Prepared(
-                            store.cut,
-                            target,
-                            store.allocatedStorageReceipt(),
-                        )
+                        existing.cut.sourceHash == M3CanonicalReceiptBytes(legacy.sourceHash)
+                    ) existing
                     else
                         M3CompactCanonicalMigrationResult.Refused(
                             M3CompactCanonicalRefusal.IDENTITY_CONFLICT
@@ -613,30 +672,30 @@ private constructor(
                         pageCount.toLong(),
                         M3CanonicalPageCache.PAGE_BYTES.toLong(),
                     )
-                val directoryWorstCaseBytes = 44L + pageCount * 59L
+                val files = linkedMapOf(
+                    PAGES_FILE to pageBytes,
+                    RESIDENT_FILE to M3CompactCanonicalFormat.residentFileBytes(legacy),
+                    DIRECTORY_FILE to M3CompactCanonicalFormat.directoryFileBytes(pageCount),
+                    ROOT_FILE to M3CompactCanonicalFormat.rootFileBytes(legacy),
+                )
                 val unit = budget.allocationUnitBytes(directory)
-                val worst = listOf(
-                    residentFileBytes(legacy),
-                    pageBytes,
-                    directoryWorstCaseBytes,
-                    1_024L,
-                    1L,
-                ).fold(0L) { total, logical ->
+                // Candidate directory plus reservation metadata, ledger replacement, and their
+                // parent-directory entries are charged conservatively in addition to exact files.
+                val worst = (files.values + listOf(1L, 1L, 1L, 1L)).fold(0L) { total, logical ->
                     Math.addExact(total, roundPhysical(logical, unit))
                 }
-                reservation =
-                    budget.reserve(worst)
-                        ?: return M3CompactCanonicalMigrationResult.Refused(
-                            M3CompactCanonicalRefusal.QUOTA_REFUSED
-                        )
                 staging =
                     File(
                         directory,
                         "${target.name}.staging-${Thread.currentThread().id}-${System.nanoTime()}",
                     )
-                require(staging.mkdirs())
+                reservation = budget.reserveCandidate(staging, target, files, worst)
+                    ?: return M3CompactCanonicalMigrationResult.Refused(
+                        M3CompactCanonicalRefusal.QUOTA_REFUSED
+                    )
                 if (fault == M3CompactCanonicalMigrationFault.BEFORE_PAGE_WRITE) error("fault")
                 val entries = writePages(legacy, File(staging, PAGES_FILE), fault)
+                budget.verifyCandidate(requireNotNull(reservation), staging)
                 if (fault == M3CompactCanonicalMigrationFault.AFTER_PAGE_SYNC) error("fault")
                 val residentHash =
                     M3CompactCanonicalFormat.writeResident(
@@ -644,6 +703,7 @@ private constructor(
                         legacy,
                         fault,
                     )
+                budget.verifyCandidate(requireNotNull(reservation), staging)
                 if (fault == M3CompactCanonicalMigrationFault.AFTER_RESIDENT_SYNC) error("fault")
                 if (fault == M3CompactCanonicalMigrationFault.BEFORE_DIRECTORY_WRITE) error("fault")
                 val directoryHash =
@@ -652,9 +712,10 @@ private constructor(
                         entries,
                         fault,
                     )
+                budget.verifyCandidate(requireNotNull(reservation), staging)
                 if (fault == M3CompactCanonicalMigrationFault.AFTER_DIRECTORY_SYNC) error("fault")
                 if (fault == M3CompactCanonicalMigrationFault.BEFORE_ROOT_WRITE) error("fault")
-                M3CompactCanonicalFormat.writeRoot(
+                val rootHash = M3CompactCanonicalFormat.writeRoot(
                     File(staging, ROOT_FILE),
                     legacy,
                     residentHash,
@@ -662,12 +723,13 @@ private constructor(
                     entries.size,
                     fault,
                 )
+                budget.verifyCandidate(requireNotNull(reservation), staging)
                 if (fault == M3CompactCanonicalMigrationFault.AFTER_ROOT_SYNC) error("fault")
                 if (fault == M3CompactCanonicalMigrationFault.BEFORE_STAGING_SYNC) error("fault")
                 syncDirectory(staging)
                 if (fault == M3CompactCanonicalMigrationFault.AFTER_STAGING_SYNC) error("fault")
                 if (fault == M3CompactCanonicalMigrationFault.BEFORE_RENAME) error("fault")
-                Files.move(staging.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE)
+                budget.publishCandidate(requireNotNull(reservation), staging, target)
                 published = true
                 if (fault == M3CompactCanonicalMigrationFault.AFTER_RENAME) error("fault")
                 syncDirectory(directory)
@@ -675,42 +737,66 @@ private constructor(
                 val actual = budget.allocatedBytes(target)
                 budget.commit(requireNotNull(reservation), actual)
                 reservation = null
-                val opened =
-                    openV6(group, directory, budget, configuration)
-                        as? M3CompactCanonicalOpenResult.Opened
-                        ?: error("published v6 invalid")
                 return M3CompactCanonicalMigrationResult.Prepared(
-                    opened.store.cut,
+                    cutFromLegacy(legacy, rootHash),
                     target,
-                    opened.store.allocatedStorageReceipt(),
+                    physicalStorageReceipt(budget, target),
                 )
             } catch (_: M3RestoreFailure) {
                 return M3CompactCanonicalMigrationResult.Refused(M3CompactCanonicalRefusal.CORRUPT)
             } catch (_: IllegalArgumentException) {
                 return M3CompactCanonicalMigrationResult.Refused(M3CompactCanonicalRefusal.CAPACITY)
             } catch (_: Exception) {
-                if (!published) staging?.deleteRecursively()
                 return M3CompactCanonicalMigrationResult.Refused(
                     M3CompactCanonicalRefusal.DURABILITY_FAILURE
                 )
             } finally {
                 reservation?.let { token ->
                     try {
-                        if (published) {
-                            val target = candidateDirectory(directory, group)
+                        val target = candidateDirectory(directory, group)
+                        if (published || target.isDirectory) {
                             val actual = budget.allocatedBytes(target)
                             budget.commit(token, actual)
-                        } else budget.release(token)
+                        } else staging?.let { budget.releaseCandidate(token, it) } ?: budget.release(token)
                     } catch (_: Exception) {}
                 }
             }
         }
 
+        /** The v6 graph is closed before legacy arrays and cursor closures are constructed. */
+        private fun inspectExistingCandidate(
+            group: M3SurfaceGroup,
+            directory: File,
+            budget: M3CanonicalStorageBudget,
+            configuration: M3SurfaceOwnershipConfiguration,
+        ): M3CompactCanonicalMigrationResult.Prepared? {
+            val opened = openV6(group, directory, budget, configuration)
+                as? M3CompactCanonicalOpenResult.Opened ?: return null
+            return opened.store.use { store ->
+                M3CompactCanonicalMigrationResult.Prepared(
+                    store.cut, candidateDirectory(directory, group), store.allocatedStorageReceipt(),
+                )
+            }
+        }
+
+        private fun cutFromLegacy(legacy: M3LegacyCanonicalState, rootHash: ByteArray) =
+            M3CompactCanonicalCut(
+                legacy.group,
+                PROFILE,
+                legacy.geometryRevision,
+                legacy.lineageRevision,
+                legacy.nextHighWater,
+                legacy.resident.rows,
+                legacy.sourceCount,
+                legacy.supportCount,
+                legacy.lineageCount,
+                legacy.baseline,
+                M3CanonicalReceiptBytes(rootHash),
+                M3CanonicalReceiptBytes(legacy.sourceHash),
+            )
+
         private fun pageCount(records: Int): Int =
             if (records == 0) 0 else (records - 1) / M3CanonicalPageCache.MAX_RECORDS + 1
-
-        private fun residentFileBytes(legacy: M3LegacyCanonicalState): Long =
-            12L + legacy.resident.rows * 19L + 4L + legacy.lineageCount * 8L + 32L
 
         private fun physicalStorageReceipt(
             budget: M3CanonicalStorageBudget,
@@ -743,7 +829,8 @@ private constructor(
                     pageCount(legacy.sourceCount) + pageCount(legacy.supportCount)
                 )
             var ordinal = 0
-            FileOutputStream(file).use { output ->
+            RandomAccessFile(file, "rw").use { output ->
+                output.seek(0)
                 fun append(
                     kind: M3CanonicalPageKind,
                     records: Int,
@@ -813,6 +900,7 @@ private constructor(
                 flushSupportPage()
                 if (fault == M3CompactCanonicalMigrationFault.BEFORE_PAGE_SYNC) error("fault")
                 output.fd.sync()
+                require(output.filePointer == output.length()) { "preallocated pages size mismatch" }
             }
             return entries
         }
@@ -1021,13 +1109,14 @@ internal fun IntArray.sortIndices(count: Int, compare: (Int, Int) -> Int) {
 
 private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
 
-private fun m3PhysicalAllocatedTreeBytes(path: File): Long {
+private fun m3PhysicalAllocatedTreeBytes(path: File, allocationUnit: Long): Long {
     fun allocated(file: File): Long {
-        val unix = try {
+        val windows = System.getProperty("os.name").orEmpty().startsWith("Windows", true)
+        val unix = if (windows) null else try {
             (Files.getAttribute(file.toPath(), "unix:blocks") as Number).toLong() * 512L
         } catch (_: Exception) { null }
         if (unix != null) return unix
-        val unit = Files.getFileStore(file.toPath()).blockSize.coerceAtLeast(1L)
+        val unit = allocationUnit.also { require(it > 0) }
         val logical = if (file.isDirectory) unit else file.length()
         return if (logical == 0L) 0L
         else Math.multiplyExact((logical - 1L) / unit + 1L, unit)

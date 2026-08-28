@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <string>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 #include <vector>
 #include <algorithm>
@@ -85,7 +86,23 @@ jlong allocated_size_of(JNIEnv* env, jobject, jlong root, jobjectArray path) {
         int result = fstatat(parent, parts.back().c_str(), &value, AT_SYMLINK_NOFOLLOW); close(parent);
         if (result < 0) { fail(env, "fstatat allocated size"); return -1; }
     }
-    return static_cast<jlong>(value.st_blocks) * 512L;
+    return static_cast<jlong>(value.st_blocks);
+}
+
+jlong allocation_unit_of(JNIEnv* env, jobject, jlong root, jobjectArray path) {
+    auto parts = strings(env, path);
+    int fd = static_cast<int>(root);
+    int owned = -1;
+    if (!parts.empty()) {
+        int parent = parent_at(env, root, parts, false); if (parent < 0) return -1;
+        owned = openat(parent, parts.back().c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC); close(parent);
+        if (owned < 0) { fail(env, "openat allocation unit"); return -1; }
+        fd = owned;
+    }
+    struct statvfs value{};
+    if (fstatvfs(fd, &value) < 0) { fail(env, "fstatvfs allocation unit"); if (owned >= 0) close(owned); return -1; }
+    if (owned >= 0) close(owned);
+    return static_cast<jlong>(value.f_frsize > 0 ? value.f_frsize : value.f_bsize);
 }
 
 jlong open_relative(JNIEnv* env, int root, jobjectArray path, int flags, bool create_parents) {
@@ -139,7 +156,8 @@ JNINativeMethod methods[] = {
     {"nativeOpenRoot", "(Ljava/lang/String;)J", reinterpret_cast<void*>(open_root)}, {"nativeClose", "(J)V", reinterpret_cast<void*>(close_fd)},
     {"nativeEnsureDirectory", "(J[Ljava/lang/String;)V", reinterpret_cast<void*>(ensure_dir)}, {"nativeIsRegular", "(J[Ljava/lang/String;)Z", reinterpret_cast<void*>(is_regular)},
     {"nativeIsDirectory", "(J[Ljava/lang/String;)Z", reinterpret_cast<void*>(is_directory)}, {"nativeSize", "(J[Ljava/lang/String;)J", reinterpret_cast<void*>(size_of)},
-    {"nativeAllocatedSize", "(J[Ljava/lang/String;)J", reinterpret_cast<void*>(allocated_size_of)},
+    {"nativeAllocatedBlocks", "(J[Ljava/lang/String;)J", reinterpret_cast<void*>(allocated_size_of)},
+    {"nativeAllocationUnit", "(J[Ljava/lang/String;)J", reinterpret_cast<void*>(allocation_unit_of)},
     {"nativeOpenRead", "(J[Ljava/lang/String;)J", reinterpret_cast<void*>(open_read)}, {"nativeCreateExclusive", "(J[Ljava/lang/String;)J", reinterpret_cast<void*>(create_exclusive)},
     {"nativeRead", "(J[BII)I", reinterpret_cast<void*>(read_fd)}, {"nativeWrite", "(J[BII)V", reinterpret_cast<void*>(write_fd)}, {"nativeSync", "(J)V", reinterpret_cast<void*>(sync_fd)},
     {"nativeAtomicReplace", "(J[Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V", reinterpret_cast<void*>(atomic_replace)},

@@ -56,7 +56,6 @@ internal object M3SurfaceOwnershipLegacyCodec {
             val ledger = File(directory, "m3-surface-$prefix.ledger")
             val ledgerHigh = validateLedger(ledger, group)
             if (!snapshot.exists()) {
-                require(ledgerHigh == 1L)
                 return emptyState(group, ledger, snapshot, ledgerHigh, configuration)
             }
             verifySnapshotChecksum(snapshot)
@@ -337,8 +336,9 @@ internal object M3SurfaceOwnershipLegacyCodec {
         }
         val supportCursor: ((Long, M3PagedSource) -> Unit) -> Unit = { visitor ->
             if (version == 1) {
-                repeat(rowCount) { index ->
-                    val id = unsigned(rowIds[index])
+                repeat(rowCount) { order ->
+                    val slot = idOrder[order]
+                    val id = unsigned(rowIds[slot])
                     visitor(id, requireNotNull(rowSource(snapshot, rowOffsets, resident, id)))
                 }
             } else {
@@ -529,6 +529,12 @@ internal object M3SurfaceOwnershipLegacyCodec {
                 val receiptHigh = data.readLong(); val receiptLive = data.readInt()
                 require(receiptGeometry in 0..geometryRevision && receiptLineage in 0..lineageRevision &&
                     receiptHigh in 1..nextHigh && receiptLive in 0..configuration.surfaceCapacity)
+                if (version == 2) {
+                    val bytes = inlineCanonicalReceiptBytes(
+                        group.value, command, targetCount, removedCount, edgeCount,
+                    )
+                    journalBytes = Math.addExact(journalBytes, 68L + bytes)
+                }
                 if (version >= 3) {
                     val supports = M3FieldDigest()
                     val supportCount = bounded(data.readInt(), 0, configuration.lineageCapacity)
@@ -554,6 +560,38 @@ internal object M3SurfaceOwnershipLegacyCodec {
         }
         require(journalBytes <= configuration.changeJournalByteCapacity)
         return count
+    }
+
+    /** Canonical journal bytes reconstructed by the accepted v2 writer (support count is zero). */
+    private fun inlineCanonicalReceiptBytes(
+        group: String,
+        command: String,
+        targetCount: Int,
+        removedCount: Int,
+        edgeCount: Int,
+    ): Long {
+        var bytes = 8L + modifiedUtfBytes(group) + modifiedUtfBytes(command)
+        bytes = Math.addExact(bytes, 4L + 3L * 8L + 4L + 4L)
+        bytes = Math.addExact(
+            bytes,
+            Math.multiplyExact(targetCount.toLong(), 8L + modifiedUtfBytes(group) + 9L * 4L + 32L),
+        )
+        bytes = Math.addExact(bytes, 4L + removedCount * 8L)
+        bytes = Math.addExact(bytes, 4L + edgeCount * 16L)
+        return Math.addExact(bytes, 4L)
+    }
+
+    private fun modifiedUtfBytes(value: String): Long {
+        var bytes = 0L
+        value.forEach { character ->
+            bytes += when (character.code) {
+                in 0x0001..0x007f -> 1L
+                in 0x0000..0x07ff -> 2L
+                else -> 3L
+            }
+        }
+        require(bytes <= 65_535L)
+        return bytes + 2L
     }
 
     private fun validateCanonicalReceipt(

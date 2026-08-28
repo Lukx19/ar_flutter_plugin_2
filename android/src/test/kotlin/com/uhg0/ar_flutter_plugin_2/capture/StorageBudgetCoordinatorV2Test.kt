@@ -15,18 +15,82 @@ class StorageBudgetCoordinatorV2Test {
 
     @Test fun `physically persisted reservations serialize global quota and survive a new coordinator`() {
         val root = directory(); val policy = StorageBudgetPolicyV2(100, 10)
-        val first = StorageBudgetCoordinatorV2(root, policy, JvmDescriptorFilesystemV2()) { 100 }
+        val first = StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 100 }
         val token = first.reserve("capture:session:one", 80)!!
         assertEquals(80L, token.bytes)
         assertTrue(first.physicallyAllocatedBytes(token.token) >= token.bytes)
         assertNull(first.reserve("capture:session:two", 11))
 
-        val restarted = StorageBudgetCoordinatorV2(root, policy, JvmDescriptorFilesystemV2()) { 100 }
+        val restarted = StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 100 }
         assertEquals(80, restarted.reservedBytes())
         restarted.commit(token, 60)
         assertEquals(60, restarted.committedBytes())
         restarted.reclaimVerified(60)
         assertEquals(0, restarted.committedBytes())
+    }
+
+    @Test fun `candidate tree is the sole physical backing through publication and crash recovery`() {
+        val root = directory()
+        val policy = StorageBudgetPolicyV2(1_000_000, 0)
+        val coordinator = StorageBudgetCoordinatorV2(
+            root, policy, physicalFilesystem(),
+        ) { 10_000_000 }
+        val staging = File(root, "candidate.staging-1")
+        val target = File(root, "candidate-v6")
+        val reservation = coordinator.reserveCandidate(
+            "m3:canonical:v6-migration", staging, target,
+            mapOf("root.v6" to 4096L, "pages.v6" to 8192L), 64_000L,
+        )!!
+        assertTrue(staging.isDirectory)
+        assertTrue(!File(root, "reservations-v2/${reservation.token}.allocation").exists())
+        val staged = coordinator.verifyCandidate(reservation, staging)
+        assertTrue(reservation.bytes >= staged + 3L * 4_096L)
+        coordinator.publishCandidate(reservation, staging, target)
+        assertEquals(staged, coordinator.verifyCandidate(reservation, target))
+
+        // Independently encode the durable COMMITTING cut: target renamed, ledger still old.
+        File(root, "reservations-v2/${reservation.token}.reservation").writeText(
+            "${reservation.owner}\n${reservation.bytes}\n${staging.name}\n${target.name}\nCOMMITTING:$staged:0\n"
+        )
+        StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 10_000_000 }.use {
+            assertEquals(staged, it.committedBytes())
+            assertEquals(0L, it.reservedBytes())
+            assertTrue(target.isDirectory)
+        }
+    }
+
+    @Test fun `candidate allocation rechecks free floor after every physical file cut`() {
+        val root = directory()
+        var checks = 0
+        val coordinator = StorageBudgetCoordinatorV2(
+            root, StorageBudgetPolicyV2(1_000_000, 10_000), physicalFilesystem(),
+        ) { if (++checks < 4) 1_000_000 else 9_999 }
+        val staging = File(root, "m3-canonical-v6-${"a".repeat(64)}.staging-1-1")
+        assertThrows(IllegalArgumentException::class.java) {
+            coordinator.reserveCandidate(
+                "m3:canonical:v6-migration", staging, File(root, "candidate-v6"),
+                mapOf("one" to 4096L, "two" to 4096L), 64_000L,
+            )
+        }
+        assertTrue(!staging.exists())
+        assertTrue(File(root, "reservations-v2").listFiles().orEmpty().isEmpty())
+    }
+
+    @Test fun `host and Android allocation seams report authoritative units`() {
+        assertEquals(4_096L, androidPhysicalBytesFromStatBlocks(8))
+        assertThrows(ArithmeticException::class.java) {
+            androidPhysicalBytesFromStatBlocks(Long.MAX_VALUE)
+        }
+        val root = directory()
+        SafeFilesystemV2(root, DurableStoreFaultInjectorV2 { }, physicalFilesystem()).use {
+            val file = it.child("tiny")
+            it.writeExclusive(file, byteArrayOf(1), DurableStoreFaultPointV2.ACCEPTED_RECORD)
+            val unit = it.allocationUnit(file)
+            if (System.getProperty("os.name").orEmpty().startsWith("Windows", true)) {
+                assertEquals(4_096L, unit)
+                assertEquals(4_096L, it.allocatedLength(file))
+            } else assertEquals(4_096L, unit)
+        }
     }
 
     @Test fun `construction performs no reservation directory scan`() {
@@ -37,7 +101,7 @@ class StorageBudgetCoordinatorV2Test {
         val coordinator = StorageBudgetCoordinatorV2(
             root,
             StorageBudgetPolicyV2(100, 0),
-            JvmDescriptorFilesystemV2(onList = { lists++ }),
+            JvmDescriptorFilesystemV2(onList = { lists++ }, authoritativeAllocationUnit = { 4_096L }),
         ) { 100 }
         assertEquals(0, lists)
         coordinator.close()
@@ -45,8 +109,8 @@ class StorageBudgetCoordinatorV2Test {
 
     @Test fun `independent live coordinators refresh one process global ledger before every operation`() {
         val root = directory(); val policy = StorageBudgetPolicyV2(100, 0)
-        val first = StorageBudgetCoordinatorV2(root, policy, JvmDescriptorFilesystemV2()) { 100 }
-        val second = StorageBudgetCoordinatorV2(root, policy, JvmDescriptorFilesystemV2()) { 100 }
+        val first = StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 100 }
+        val second = StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 100 }
         val one = first.reserve("capture:session:one", 60)!!
         assertEquals(60L, second.reservedBytes())
         assertNull(second.reserve("capture:session:two", 41))
@@ -56,7 +120,7 @@ class StorageBudgetCoordinatorV2Test {
     }
 
     @Test fun `release is idempotent and cannot free a changed token`() {
-        val coordinator = StorageBudgetCoordinatorV2(directory(), StorageBudgetPolicyV2(100, 0), JvmDescriptorFilesystemV2()) { 100 }
+        val coordinator = StorageBudgetCoordinatorV2(directory(), StorageBudgetPolicyV2(100, 0), physicalFilesystem()) { 100 }
         val reservation = coordinator.reserve("capture:session:one", 20)!!
         assertTrue(coordinator.release(reservation))
         assertTrue(!coordinator.release(reservation))
@@ -134,6 +198,9 @@ class StorageBudgetCoordinatorV2Test {
         SafeFilesystemV2(root, DurableStoreFaultInjectorV2 { }, borrowedFactory).close()
         assertEquals(26, closedRoots.size)
     }
+
+    private fun physicalFilesystem() =
+        JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L })
 
     private fun directory(): File = File.createTempFile("storage-budget-v2", "").also { it.delete(); assertTrue(it.mkdirs()); directories += it }
 }

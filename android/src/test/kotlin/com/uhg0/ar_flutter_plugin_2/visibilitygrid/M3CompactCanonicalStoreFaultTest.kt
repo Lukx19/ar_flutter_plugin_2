@@ -40,6 +40,8 @@ class M3CompactCanonicalStoreFaultTest {
                             error("must not commit")
 
                         override fun release(token: Any) = error("must not release")
+
+                        override fun allocationUnitBytes(path: File) = 4_096L
                     },
                 )
             assertEquals(
@@ -188,6 +190,8 @@ class M3CompactCanonicalStoreFaultTest {
             override fun commit(token: Any, actualBytes: Long) = Unit
 
             override fun release(token: Any) = Unit
+
+            override fun allocationUnitBytes(path: File) = 4_096L
         }
 
     private fun flip(file: File) {

@@ -41,6 +41,8 @@ interface DescriptorFilesystemV2 : AutoCloseable {
     fun size(segments: List<String>): Long
     /** Physical filesystem blocks retained by this file or directory. */
     fun allocatedSize(segments: List<String>): Long
+    /** Allocation unit used by the filesystem containing this rooted path. */
+    fun allocationUnit(segments: List<String>): Long = 4_096L
     fun openRead(segments: List<String>): DescriptorFileV2
     fun createExclusive(segments: List<String>): DescriptorFileV2
     fun atomicReplace(parent: List<String>, from: String, to: String)
@@ -59,7 +61,8 @@ object AndroidDescriptorNativeV2 {
     external fun nativeIsRegular(root: Long, segments: Array<String>): Boolean
     external fun nativeIsDirectory(root: Long, segments: Array<String>): Boolean
     external fun nativeSize(root: Long, segments: Array<String>): Long
-    external fun nativeAllocatedSize(root: Long, segments: Array<String>): Long
+    external fun nativeAllocatedBlocks(root: Long, segments: Array<String>): Long
+    external fun nativeAllocationUnit(root: Long, segments: Array<String>): Long
     external fun nativeOpenRead(root: Long, segments: Array<String>): Long
     external fun nativeCreateExclusive(root: Long, segments: Array<String>): Long
     external fun nativeRead(descriptor: Long, bytes: ByteArray, offset: Int, count: Int): Int
@@ -94,7 +97,12 @@ class AndroidDescriptorFilesystemV2 private constructor(private val rootDescript
     override fun isDirectory(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeIsDirectory(it, segments.toTypedArray()) }
     override fun size(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeSize(it, segments.toTypedArray()) }
     override fun allocatedSize(segments: List<String>) = withRoot {
-        AndroidDescriptorNativeV2.nativeAllocatedSize(it, segments.toTypedArray())
+        androidPhysicalBytesFromStatBlocks(
+            AndroidDescriptorNativeV2.nativeAllocatedBlocks(it, segments.toTypedArray())
+        )
+    }
+    override fun allocationUnit(segments: List<String>) = withRoot {
+        AndroidDescriptorNativeV2.nativeAllocationUnit(it, segments.toTypedArray())
     }
     override fun openRead(segments: List<String>): DescriptorFileV2 =
         withRoot { AndroidNativeFileV2(AndroidDescriptorNativeV2.nativeOpenRead(it, segments.toTypedArray())) }
@@ -108,6 +116,12 @@ class AndroidDescriptorFilesystemV2 private constructor(private val rootDescript
     override fun close() = synchronized(lock) {
         if (closed.compareAndSet(false, true)) rootDescriptor?.let(AndroidDescriptorNativeV2::nativeClose)
     }
+}
+
+/** Android stat.st_blocks is defined in 512-byte units regardless of filesystem block size. */
+internal fun androidPhysicalBytesFromStatBlocks(blocks: Long): Long {
+    require(blocks >= 0)
+    return Math.multiplyExact(blocks, 512L)
 }
 
 private class AndroidNativeFileV2(private val descriptor: Long) : DescriptorFileV2 {
@@ -126,6 +140,7 @@ class JvmDescriptorFilesystemV2(
     private val onRootClose: (File) -> Unit = { },
     private val onList: (File) -> Unit = { },
     private val boundRoot: File? = null,
+    private val authoritativeAllocationUnit: ((File) -> Long)? = null,
 ) : DescriptorFilesystemV2 {
     private val lock = Any()
     private val closed = AtomicBoolean(false)
@@ -134,7 +149,10 @@ class JvmDescriptorFilesystemV2(
         check(boundRoot == null) { "JVM descriptor filesystem is already root-bound" }
         if (!Files.exists(root.toPath(), LinkOption.NOFOLLOW_LINKS)) Files.createDirectory(root.toPath())
         check(Files.isDirectory(root.toPath(), LinkOption.NOFOLLOW_LINKS))
-        return JvmDescriptorFilesystemV2(onDirectorySync, beforeComponentOpen, onRootClose, onList, root.canonicalFile)
+        return JvmDescriptorFilesystemV2(
+            onDirectorySync, beforeComponentOpen, onRootClose, onList, root.canonicalFile,
+            authoritativeAllocationUnit,
+        )
     }
     override fun ensureDirectory(segments: List<String>) = synchronized(lock) {
         var current = root()
@@ -149,16 +167,31 @@ class JvmDescriptorFilesystemV2(
     override fun size(segments: List<String>) = synchronized(lock) { openChannel(segments, StandardOpenOption.READ).use(FileChannel::size) }
     override fun allocatedSize(segments: List<String>) = synchronized(lock) {
         val file = requireNotNull(resolveExisting(segments))
-        val unixBlocks = try {
+        val windows = System.getProperty("os.name").orEmpty().startsWith("Windows", true)
+        val unixBlocks = if (windows) null else try {
             (Files.getAttribute(file.toPath(), "unix:blocks", LinkOption.NOFOLLOW_LINKS) as Number)
                 .toLong() * 512L
         } catch (_: Exception) { null }
         unixBlocks ?: run {
-            val block = Files.getFileStore(file.toPath()).blockSize.coerceAtLeast(1L)
+            val block = allocationUnitFor(file, windows)
             val logical = if (Files.isDirectory(file.toPath(), LinkOption.NOFOLLOW_LINKS)) block
                 else Files.size(file.toPath())
             if (logical == 0L) 0L else Math.multiplyExact((logical - 1L) / block + 1L, block)
         }
+    }
+    override fun allocationUnit(segments: List<String>) = synchronized(lock) {
+        val file = requireNotNull(resolveExisting(segments))
+        allocationUnitFor(
+            file,
+            System.getProperty("os.name").orEmpty().startsWith("Windows", true),
+        )
+    }
+    private fun allocationUnitFor(file: File, windows: Boolean): Long {
+        authoritativeAllocationUnit?.invoke(file)?.let { return it.also { unit -> require(unit > 0) } }
+        require(!windows) {
+            "Windows allocation units require an authoritative injected filesystem probe"
+        }
+        return Files.getFileStore(file.toPath()).blockSize.coerceAtLeast(1L)
     }
     override fun openRead(segments: List<String>): DescriptorFileV2 = synchronized(lock) { JvmDescriptorFileV2(openChannel(segments, StandardOpenOption.READ)) }
     override fun createExclusive(segments: List<String>): DescriptorFileV2 = synchronized(lock) { JvmDescriptorFileV2(openChannel(segments, StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW)) }
@@ -231,8 +264,10 @@ class SafeFilesystemV2(
     }
     fun ensureDirectory(directory: File) = backend.ensureDirectory(relative(directory))
     fun isFile(file: File) = backend.isRegularFile(relative(file))
+    fun isDirectory(file: File) = backend.isDirectory(relative(file))
     fun length(file: File) = backend.size(relative(file))
     fun allocatedLength(file: File) = backend.allocatedSize(relative(file))
+    fun allocationUnit(file: File) = backend.allocationUnit(relative(file))
     fun allocatedTreeBytes(directory: File): Long =
         walk(directory).fold(0L) { total, file -> Math.addExact(total, allocatedLength(file)) }
     fun readBytes(file: File): ByteArray {

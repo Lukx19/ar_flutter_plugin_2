@@ -5,6 +5,7 @@ import java.io.DataOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.io.FilterInputStream
 import java.io.InputStream
 import java.security.MessageDigest
@@ -135,6 +136,20 @@ internal object M3CompactCanonicalFormat {
     private const val RESIDENT_MAGIC = 0x4d335253
     private const val DIRECTORY_MAGIC = 0x4d334436
     private const val CHECKSUM_BYTES = 32L
+
+    fun residentFileBytes(legacy: M3LegacyCanonicalState): Long =
+        12L + legacy.resident.rows * 19L + 4L + legacy.lineageCount * 8L + CHECKSUM_BYTES
+
+    fun directoryFileBytes(pageCount: Int): Long = 12L + pageCount * 59L + CHECKSUM_BYTES
+
+    fun rootFileBytes(legacy: M3LegacyCanonicalState): Long {
+        var bytes = 8L + utfBytes(legacy.group.value) + utfBytes(PROFILE)
+        bytes += 5L * 4L + 3L * 8L + 5L * 4L + 1L + 3L * 32L + CHECKSUM_BYTES
+        legacy.baseline?.let {
+            bytes += utfBytes(it.bindingIdentity) + utfBytes(it.groupIdentity) + 3L * 8L
+        }
+        return bytes
+    }
 
     fun writeResident(
         file: File,
@@ -355,7 +370,9 @@ internal object M3CompactCanonicalFormat {
         body: (DataOutputStream) -> Unit,
     ) {
         val digest = MessageDigest.getInstance("SHA-256")
-        FileOutputStream(file).use { output ->
+        RandomAccessFile(file, "rw").use { random ->
+            random.seek(0)
+            val output = FileOutputStream(random.fd)
             val digestOutput = DigestOutputStream(output, digest)
             val data = DataOutputStream(digestOutput)
             body(data)
@@ -366,7 +383,22 @@ internal object M3CompactCanonicalFormat {
             output.flush()
             if (failBeforeSync) error("fault")
             output.fd.sync()
+            require(output.channel.position() == random.length()) { "preallocated file size mismatch" }
         }
+    }
+
+    /** Exact byte count used by DataOutputStream.writeUTF, including its two-byte length prefix. */
+    private fun utfBytes(value: String): Long {
+        var bytes = 0
+        value.forEach { character ->
+            bytes += when (character.code) {
+                in 0x0001..0x007f -> 1
+                in 0x0000..0x07ff -> 2
+                else -> 3
+            }
+        }
+        require(bytes <= 65_535)
+        return bytes + 2L
     }
 
     private fun verifyChecksum(file: File) {

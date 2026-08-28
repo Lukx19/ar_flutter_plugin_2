@@ -41,6 +41,32 @@ class M3CanonicalStoreMigrationTest {
     }
 
     @Test
+    fun `independent v2 reconstructed journal accepts exact configured maximum and rejects one byte less`() {
+        val command = "v2-" + "x".repeat(60_000)
+        val group = M3SurfaceGroup("v2-journal-boundary")
+        val canonicalBytes = 8 + modifiedUtfSize(group.value) + modifiedUtfSize(command) +
+            4 + 3 * 8 + 4 + 4 + 4 + 4 + 4
+        val exactJournal = 68 + canonicalBytes
+        listOf(exactJournal to true, exactJournal - 1 to false).forEach { (capacity, accepted) ->
+            val directory = Files.createTempDirectory("m3-v2-journal-$accepted").toFile()
+            try {
+                writeV2JournalFixture(directory, group, command)
+                val configuration = M3SurfaceOwnershipConfiguration(changeJournalByteCapacity = capacity)
+                val result = M3CompactCanonicalStore.prepareV6SiblingMigration(
+                    group, directory, acceptingBudget(), configuration,
+                )
+                if (accepted) assertTrue(result is M3CompactCanonicalMigrationResult.Prepared)
+                else assertEquals(
+                    M3CompactCanonicalRefusal.CORRUPT,
+                    (result as M3CompactCanonicalMigrationResult.Refused).reason,
+                )
+            } finally {
+                directory.deleteRecursively()
+            }
+        }
+    }
+
+    @Test
     fun `real budget adapter commits authoritative allocated blocks including candidate directory`() {
         val directory = Files.createTempDirectory("m3-physical-budget").toFile()
         try {
@@ -49,16 +75,17 @@ class M3CanonicalStoreMigrationTest {
             StorageBudgetCoordinatorV2(
                     directory,
                     StorageBudgetPolicyV2(64L * 1024 * 1024, 0),
-                    JvmDescriptorFilesystemV2(),
+                    JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L }),
                 ) { 128L * 1024 * 1024 }
                 .use { coordinator ->
                     val budget = M3CoordinatorStorageBudget(coordinator)
-                    val prepared =
-                        M3CompactCanonicalStore.prepareV6SiblingMigration(
+                    val result = M3CompactCanonicalStore.prepareV6SiblingMigration(
                             group,
                             directory,
                             budget,
-                        ) as M3CompactCanonicalMigrationResult.Prepared
+                        )
+                    assertTrue(result.toString(), result is M3CompactCanonicalMigrationResult.Prepared)
+                    val prepared = result as M3CompactCanonicalMigrationResult.Prepared
                     val authoritative =
                         coordinator.physicallyAllocatedTreeBytes(prepared.candidateDirectory)
                     assertEquals(authoritative, prepared.storage.allocatedBytes)
@@ -107,6 +134,33 @@ class M3CanonicalStoreMigrationTest {
                 assertEquals(1, read.delivered)
                 assertEquals(id, support.single().source.id.value)
             }
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `independent unsorted v1 rows emit unsigned id ordered sources and support`() {
+        val directory = Files.createTempDirectory("m3-unsorted-v1").toFile()
+        try {
+            val group = M3SurfaceGroup("unsorted-v1")
+            writeUnsortedV1Fixture(directory, group)
+            val prepared = M3CompactCanonicalStore.prepareV6SiblingMigration(
+                group, directory, acceptingBudget(),
+            ) as M3CompactCanonicalMigrationResult.Prepared
+            val store = (M3CompactCanonicalStore.openV6(group, directory, acceptingBudget())
+                as M3CompactCanonicalOpenResult.Opened).store
+            listOf(1L, 2L).forEach { id ->
+                val support = mutableListOf<M3PagedSupport>()
+                val read = store.visitSourceSupport(M3SurfaceId(id), null) {
+                    support += it; true
+                } as M3SourceSupportRead.Complete
+                assertEquals(1, read.delivered)
+                assertEquals(id, support.single().source.id.value)
+                assertEquals((id + 7).toByte(), support.single().source.allocationFingerprint.toByteArray()[7])
+            }
+            assertEquals(2, prepared.cut.sourceCount)
+            store.close()
         } finally {
             directory.deleteRecursively()
         }
@@ -162,6 +216,30 @@ class M3CanonicalStoreMigrationTest {
     }
 
     @Test
+    fun `missing snapshot migrates durable burned reservations without id reuse`() {
+        listOf(10L, 0x1_0000_0000L).forEach { ledgerHigh ->
+            val directory = Files.createTempDirectory("m3-ledger-only").toFile()
+            try {
+                val group = M3SurfaceGroup("ledger-only-$ledgerHigh")
+                val prefix = sha256(group.value.encodeToByteArray()).hex()
+                writeLedger(directory.resolve("m3-surface-$prefix.ledger"), group, ledgerHigh)
+                val prepared = M3CompactCanonicalStore.prepareV6SiblingMigration(
+                    group, directory, acceptingBudget(),
+                ) as M3CompactCanonicalMigrationResult.Prepared
+                assertEquals(ledgerHigh, prepared.cut.nextSurfaceIdHighWater)
+                assertEquals(0, prepared.cut.liveSurfaceCount)
+                val store = (M3CompactCanonicalStore.openV6(group, directory, acceptingBudget())
+                    as M3CompactCanonicalOpenResult.Opened).store
+                assertEquals(ledgerHigh, store.cut.nextSurfaceIdHighWater)
+                assertEquals(null, store.findById(M3SurfaceId(1)))
+                store.close()
+            } finally {
+                directory.deleteRecursively()
+            }
+        }
+    }
+
+    @Test
     fun `independent v1 through v5 fixtures migrate with defined compatibility defaults`() {
         for (version in 1..5) {
             val directory = Files.createTempDirectory("m3-v$version").toFile()
@@ -193,6 +271,9 @@ class M3CanonicalStoreMigrationTest {
         try {
             val group = M3SurfaceGroup("compact-maximum")
             writeMaximumV3Fixture(directory, group)
+            val migrationBytes = measureMigrationGraph(group, directory)
+            assertTrue("migration graph bytes=$migrationBytes", migrationBytes <= 15_728_640L)
+            println("M3_MAX_MIGRATION_MEMORY=constructedBytes=$migrationBytes owners=kernel,legacyResidentColumns,idOrder,voxelOrder,pageOrder,rowOffsets,supportOffsets,lineageColumns,sourceAndSupportCursorClosures,maxDirectoryColumns,256SourcePageObjects,16384PageBuffer,65536CodecScratch")
             val prepared =
                 M3CompactCanonicalStore.prepareV6SiblingMigration(
                     group,
@@ -312,11 +393,17 @@ class M3CanonicalStoreMigrationTest {
                 owner.close()
                 val prefix = sha256(group.value.encodeToByteArray()).hex()
                 val before = directory.resolve("m3-surface-$prefix.snapshot").readBytes()
+                val coordinator = StorageBudgetCoordinatorV2(
+                    directory,
+                    StorageBudgetPolicyV2(64L * 1024 * 1024, 0),
+                    JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L }),
+                ) { 128L * 1024 * 1024 }
+                val budget = M3CoordinatorStorageBudget(coordinator)
                 val result =
                     M3CompactCanonicalStore.prepareV6SiblingMigration(
                         group,
                         directory,
-                        acceptingBudget(),
+                        budget,
                         fault = fault,
                     )
                 assertEquals(
@@ -331,15 +418,25 @@ class M3CanonicalStoreMigrationTest {
                 val published =
                     fault == M3CompactCanonicalMigrationFault.AFTER_RENAME ||
                         fault == M3CompactCanonicalMigrationFault.AFTER_PARENT_SYNC
+                assertTrue(
+                    directory.resolve("reservations-v2").listFiles().orEmpty()
+                        .none { it.name.endsWith(".allocation") }
+                )
+                assertEquals(0L, coordinator.reservedBytes())
                 assertEquals(
                     published,
                     directory.listFiles().orEmpty().any { it.name.startsWith("m3-canonical-v6-") },
                 )
                 if (published)
                     assertTrue(
-                        M3CompactCanonicalStore.openV6(group, directory, acceptingBudget())
+                        coordinator.committedBytes() ==
+                            coordinator.physicallyAllocatedTreeBytes(
+                                directory.listFiles().single { it.name.startsWith("m3-canonical-v6-") }
+                            ) && M3CompactCanonicalStore.openV6(group, directory, budget)
                             is M3CompactCanonicalOpenResult.Opened
                     )
+                else assertEquals(0L, coordinator.committedBytes())
+                coordinator.close()
                 assertTrue(
                     M3SurfaceOwnership.open(group, directory) is M3SurfaceOwnershipOpenResult.Opened
                 )
@@ -374,7 +471,31 @@ class M3CanonicalStoreMigrationTest {
             override fun commit(token: Any, actualBytes: Long) = Unit
 
             override fun release(token: Any) = Unit
+
+            override fun allocationUnitBytes(path: File) = 4_096L
         }
+
+    private fun measureMigrationGraph(group: M3SurfaceGroup, directory: File): Long {
+        System.setProperty("jol.magicFieldOffset", "true")
+        val legacy = M3SurfaceOwnershipLegacyCodec.readValidated(
+            group, directory, M3SurfaceOwnershipConfiguration(),
+        )
+        val kernel = M3FeatureFusionKernel()
+        assertTrue(kernel.accept(M3FeatureFusionBatch(1, 1, emptyList())) is M3FeatureFusionResult.Accepted)
+        val directoryColumns = M3CompactDirectory(2_344)
+        val sourcePage = ArrayList<M3PagedSource>(M3CanonicalPageCache.MAX_RECORDS)
+        repeat(M3CanonicalPageCache.MAX_RECORDS) { index ->
+            sourcePage += M3PagedSource(
+                M3SurfaceId(index + 1L), M3Voxel(index, 0, 0), 0x1234, 197,
+                M3CanonicalReceiptBytes(ByteArray(32) { (index + it).toByte() }),
+            )
+        }
+        val pageBuffer = ByteArray(M3CanonicalPageCache.PAGE_BYTES)
+        val codecScratch = ByteArray(65_536)
+        return GraphLayout.parseInstance(
+            kernel, legacy, directoryColumns, sourcePage, pageBuffer, codecScratch,
+        ).totalSize()
+    }
 
     /** A test-only v3 encoder independent of every v6 production encoder. */
     private fun writeMaximumV3Fixture(directory: File, group: M3SurfaceGroup) {
@@ -521,6 +642,20 @@ class M3CanonicalStoreMigrationTest {
         }
     }
 
+    private fun writeUnsortedV1Fixture(directory: File, group: M3SurfaceGroup) {
+        val prefix = sha256(group.value.encodeToByteArray()).hex()
+        writeLedger(directory.resolve("m3-surface-$prefix.ledger"), group, 3)
+        writeSnapshot(directory.resolve("m3-surface-$prefix.snapshot")) { out ->
+            out.writeInt(0x4d33534f)
+            out.writeInt(1)
+            out.writeLong(3)
+            out.writeInt(2)
+            writeOwner(out, group, 2, 2, ByteArray(32) { index -> (2 + index).toByte() })
+            writeOwner(out, group, 1, 1, ByteArray(32) { index -> (1 + index).toByte() })
+            out.writeInt(0)
+        }
+    }
+
     private fun writeDuplicateReceiptV5Fixture(
         directory: File,
         group: M3SurfaceGroup,
@@ -594,6 +729,33 @@ class M3CanonicalStoreMigrationTest {
             out.writeInt(0); out.writeInt(0); out.writeInt(0)
             out.writeLong(0); out.writeLong(0); out.writeLong(1); out.writeInt(0)
             out.writeInt(0); out.writeInt(canonical.size); out.write(canonical)
+        }
+    }
+
+    private fun writeV2JournalFixture(
+        directory: File,
+        group: M3SurfaceGroup,
+        command: String,
+    ) {
+        val prefix = sha256(group.value.encodeToByteArray()).hex()
+        writeLedger(directory.resolve("m3-surface-$prefix.ledger"), group, 1)
+        writeSnapshot(directory.resolve("m3-surface-$prefix.snapshot")) { out ->
+            out.writeInt(0x4d33534f); out.writeInt(2); out.writeLong(1); out.writeInt(0)
+            out.writeInt(0); out.writeLong(0); out.writeLong(0)
+            out.writeInt(0); out.writeInt(0)
+            out.writeInt(1)
+            out.write(ByteArray(32) { 0x31 }); out.write(ByteArray(32) { 0x32 })
+            out.writeUTF(command); out.writeInt(M3CanonicalOperation.RELOCATION.ordinal)
+            out.writeInt(0); out.writeInt(0); out.writeInt(0)
+            out.writeLong(0); out.writeLong(0); out.writeLong(1); out.writeInt(0)
+        }
+    }
+
+    private fun modifiedUtfSize(value: String): Int = 2 + value.sumOf { character ->
+        when (character.code) {
+            in 0x0001..0x007f -> 1
+            in 0x0000..0x07ff -> 2
+            else -> 3
         }
     }
 

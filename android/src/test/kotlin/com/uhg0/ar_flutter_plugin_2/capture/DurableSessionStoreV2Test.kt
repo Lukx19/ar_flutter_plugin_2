@@ -293,7 +293,9 @@ class DurableSessionStoreV2Test {
 
     @Test fun `store and budget close owned roots once without closing borrowed collaborators`() {
         val root = directory(); val closedRoots = mutableListOf<File>()
-        val borrowedFactory = JvmDescriptorFilesystemV2(onRootClose = { closedRoots += it })
+        val borrowedFactory = JvmDescriptorFilesystemV2(
+            onRootClose = { closedRoots += it }, authoritativeAllocationUnit = { 4_096L },
+        )
         val budget = StorageBudgetCoordinatorV2(
             File(root, "budget"), StorageBudgetPolicyV2(1024, 0), borrowedFactory,
         ) { 1024 }
@@ -437,7 +439,8 @@ class DurableSessionStoreV2Test {
     private fun store(root: File, budget: StorageBudgetCoordinatorV2, faults: DurableStoreFaultInjectorV2 = DurableStoreFaultInjectorV2 { }) =
         DurableSessionStoreV2(File(root, "store"), budget, faults, JvmDescriptorFilesystemV2())
     private fun budget(root: File) = StorageBudgetCoordinatorV2(
-        File(root, "budget"), StorageBudgetPolicyV2(1024 * 1024, 0), JvmDescriptorFilesystemV2(),
+        File(root, "budget"), StorageBudgetPolicyV2(1024 * 1024, 0),
+        JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L }),
     ) { 1024 * 1024 }
     private fun directory(): File = File.createTempFile("durable-store-v2", "").also { it.delete(); assertTrue(it.mkdirs()); directories += it }
     private fun sha(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).map { it.toInt() and 0xff }

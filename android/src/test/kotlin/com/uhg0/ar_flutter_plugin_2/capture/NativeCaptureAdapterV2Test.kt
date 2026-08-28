@@ -601,7 +601,7 @@ class NativeCaptureAdapterV2Test {
     fun `real durable store fences exact and changed terminal replay before exposure`() {
         val root = File.createTempFile("native-capture-v2", "").also { it.delete(); assertTrue(it.mkdirs()) }
         val budget = StorageBudgetCoordinatorV2(
-            File(root, "budget"), StorageBudgetPolicyV2(16L * 1024 * 1024, 0), JvmDescriptorFilesystemV2(),
+            File(root, "budget"), StorageBudgetPolicyV2(16L * 1024 * 1024, 0), JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L }),
         ) { 16L * 1024 * 1024 }
         val durable = DurableSessionStoreV2(File(root, "store"), budget, filesystemBackend = JvmDescriptorFilesystemV2())
         try {
@@ -651,7 +651,7 @@ class NativeCaptureAdapterV2Test {
     fun `accepted template derives JPEG DNG descriptors once and exact replay never reexposes`() {
         val root = File.createTempFile("native-capture-template-v2", "").also { it.delete(); assertTrue(it.mkdirs()) }
         val budget = StorageBudgetCoordinatorV2(
-            File(root, "budget"), StorageBudgetPolicyV2(16L * 1024 * 1024, 0), JvmDescriptorFilesystemV2(),
+            File(root, "budget"), StorageBudgetPolicyV2(16L * 1024 * 1024, 0), JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L }),
         ) { 16L * 1024 * 1024 }
         val durable = DurableSessionStoreV2(File(root, "store"), budget, filesystemBackend = JvmDescriptorFilesystemV2())
         try {
@@ -681,7 +681,7 @@ class NativeCaptureAdapterV2Test {
     fun `real durable abandoned replay binds full request and recovered metadata abandonment rejects replay`() {
         val root = File.createTempFile("native-abandoned-v2", "").also { it.delete(); assertTrue(it.mkdirs()) }
         val budget = StorageBudgetCoordinatorV2(
-            File(root, "budget"), StorageBudgetPolicyV2(16L * 1024 * 1024, 0), JvmDescriptorFilesystemV2(),
+            File(root, "budget"), StorageBudgetPolicyV2(16L * 1024 * 1024, 0), JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L }),
         ) { 16L * 1024 * 1024 }
         var durable = DurableSessionStoreV2(File(root, "store"), budget, filesystemBackend = JvmDescriptorFilesystemV2())
         try {
@@ -1145,7 +1145,7 @@ class NativeCaptureAdapterV2Test {
         val budget = StorageBudgetCoordinatorV2(
             File(root, "budget"),
             StorageBudgetPolicyV2(16L * 1024 * 1024, 0),
-            JvmDescriptorFilesystemV2(),
+            JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L }),
         ) { 16L * 1024 * 1024 }
         val durable = DurableSessionStoreV2(
             File(root, "store"),

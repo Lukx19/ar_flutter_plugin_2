@@ -1,5 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
+import java.io.File
 import java.nio.file.Files
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -177,5 +178,7 @@ class M3CompactCanonicalStoreTest {
             override fun commit(token: Any, actualBytes: Long) = Unit
 
             override fun release(token: Any) = Unit
+
+            override fun allocationUnitBytes(path: File) = 4_096L
         }
 }
