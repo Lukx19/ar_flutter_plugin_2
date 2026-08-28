@@ -87,7 +87,7 @@ class M3CompactCanonicalStoreFaultTest {
                     acceptingBudget(),
                 ) as M3CompactCanonicalMigrationResult.Prepared
             val store =
-                (M3CompactCanonicalStore.openV6(group, directory)
+                (M3CompactCanonicalStore.openV6(group, directory, acceptingBudget())
                         as M3CompactCanonicalOpenResult.Opened)
                     .store
             var calls = 0
@@ -159,7 +159,7 @@ class M3CompactCanonicalStoreFaultTest {
                     ) as M3CompactCanonicalMigrationResult.Prepared
                 if (damaged == "sources.v6.pages") {
                     val store =
-                        (M3CompactCanonicalStore.openV6(group, directory)
+                        (M3CompactCanonicalStore.openV6(group, directory, acceptingBudget())
                                 as M3CompactCanonicalOpenResult.Opened)
                             .store
                     flip(prepared.candidateDirectory.resolve(damaged))
@@ -171,7 +171,7 @@ class M3CompactCanonicalStoreFaultTest {
                 } else {
                     flip(prepared.candidateDirectory.resolve(damaged))
                     assertTrue(
-                        M3CompactCanonicalStore.openV6(group, directory)
+                        M3CompactCanonicalStore.openV6(group, directory, acceptingBudget())
                             is M3CompactCanonicalOpenResult.Refused
                     )
                 }

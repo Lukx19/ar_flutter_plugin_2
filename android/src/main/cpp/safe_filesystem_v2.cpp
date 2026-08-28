@@ -75,6 +75,19 @@ jlong size_of(JNIEnv* env, jobject, jlong root, jobjectArray path) {
     close(fd); return value.st_size;
 }
 
+jlong allocated_size_of(JNIEnv* env, jobject, jlong root, jobjectArray path) {
+    auto parts = strings(env, path);
+    struct stat value{};
+    if (parts.empty()) {
+        if (fstat(static_cast<int>(root), &value) < 0) { fail(env, "fstat allocated root"); return -1; }
+    } else {
+        int parent = parent_at(env, root, parts, false); if (parent < 0) return -1;
+        int result = fstatat(parent, parts.back().c_str(), &value, AT_SYMLINK_NOFOLLOW); close(parent);
+        if (result < 0) { fail(env, "fstatat allocated size"); return -1; }
+    }
+    return static_cast<jlong>(value.st_blocks) * 512L;
+}
+
 jlong open_relative(JNIEnv* env, int root, jobjectArray path, int flags, bool create_parents) {
     auto parts = strings(env, path); int parent = parent_at(env, root, parts, create_parents); if (parent < 0) return -1;
     int fd = openat(parent, parts.back().c_str(), flags | O_NOFOLLOW | O_CLOEXEC, 0600); close(parent);
@@ -126,6 +139,7 @@ JNINativeMethod methods[] = {
     {"nativeOpenRoot", "(Ljava/lang/String;)J", reinterpret_cast<void*>(open_root)}, {"nativeClose", "(J)V", reinterpret_cast<void*>(close_fd)},
     {"nativeEnsureDirectory", "(J[Ljava/lang/String;)V", reinterpret_cast<void*>(ensure_dir)}, {"nativeIsRegular", "(J[Ljava/lang/String;)Z", reinterpret_cast<void*>(is_regular)},
     {"nativeIsDirectory", "(J[Ljava/lang/String;)Z", reinterpret_cast<void*>(is_directory)}, {"nativeSize", "(J[Ljava/lang/String;)J", reinterpret_cast<void*>(size_of)},
+    {"nativeAllocatedSize", "(J[Ljava/lang/String;)J", reinterpret_cast<void*>(allocated_size_of)},
     {"nativeOpenRead", "(J[Ljava/lang/String;)J", reinterpret_cast<void*>(open_read)}, {"nativeCreateExclusive", "(J[Ljava/lang/String;)J", reinterpret_cast<void*>(create_exclusive)},
     {"nativeRead", "(J[BII)I", reinterpret_cast<void*>(read_fd)}, {"nativeWrite", "(J[BII)V", reinterpret_cast<void*>(write_fd)}, {"nativeSync", "(J)V", reinterpret_cast<void*>(sync_fd)},
     {"nativeAtomicReplace", "(J[Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V", reinterpret_cast<void*>(atomic_replace)},

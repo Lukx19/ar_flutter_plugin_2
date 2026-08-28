@@ -81,12 +81,12 @@ class M3CompactCanonicalStoreTest {
                     acceptingBudget(),
                 )
             assertTrue(
-                "$prepared files=${directory.walkTopDown().map { it.name }.toList()} open=${M3CompactCanonicalStore.openV6(group, directory)}",
+                "$prepared files=${directory.walkTopDown().map { it.name }.toList()} open=${M3CompactCanonicalStore.openV6(group, directory, acceptingBudget())}",
                 prepared is M3CompactCanonicalMigrationResult.Prepared,
             )
             val cut = (prepared as M3CompactCanonicalMigrationResult.Prepared).cut
             val store =
-                (M3CompactCanonicalStore.openV6(group, directory)
+                (M3CompactCanonicalStore.openV6(group, directory, acceptingBudget())
                         as M3CompactCanonicalOpenResult.Opened)
                     .store
             assertEquals(cut, store.cut)
@@ -101,7 +101,11 @@ class M3CompactCanonicalStoreTest {
             assertNull(store.findByVoxel(M3Voxel(99, 0, 0)))
             val first = store.readPage(M3StorageRegion(-1, 0, 0), 2, 0, 1)
             assertEquals(1, first.rows.size)
+            assertEquals(1, first.inspectedRows)
             assertTrue(first.rows.single().id.value > 0)
+            val empty = store.readPage(M3StorageRegion(Int.MAX_VALUE, 0, 0), 0, 0, 1)
+            assertTrue(empty.rows.isEmpty())
+            assertEquals(0, empty.inspectedRows)
             val sources = mutableListOf<M3PagedSupport>()
             val support =
                 store.visitSourceSupport(seeded.owners.first().id, null) {
@@ -126,7 +130,7 @@ class M3CompactCanonicalStoreTest {
             legacy.close()
             M3CompactCanonicalStore.prepareV6SiblingMigration(group, directory, acceptingBudget())
             val receipt =
-                ((M3CompactCanonicalStore.openV6(group, directory)
+                ((M3CompactCanonicalStore.openV6(group, directory, acceptingBudget())
                             as M3CompactCanonicalOpenResult.Opened)
                         .store)
                     .retainedMemoryReceipt()

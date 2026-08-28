@@ -98,6 +98,7 @@ internal class M3CanonicalPageCache(private val file: File) : AutoCloseable {
         }
 
     fun retainedPayloadBytes() = CACHE_PAGES.toLong() * PAGE_BYTES
+    fun residentPageCount() = synchronized(this) { pages.size }
 
     companion object {
         const val PAGE_BYTES = 16_384

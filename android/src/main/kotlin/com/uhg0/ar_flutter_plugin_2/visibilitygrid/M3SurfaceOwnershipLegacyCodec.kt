@@ -1,6 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
 import java.io.DataInputStream
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FilterInputStream
@@ -56,7 +57,7 @@ internal object M3SurfaceOwnershipLegacyCodec {
             val ledgerHigh = validateLedger(ledger, group)
             if (!snapshot.exists()) {
                 require(ledgerHigh == 1L)
-                return emptyState(group, ledger, snapshot, configuration)
+                return emptyState(group, ledger, snapshot, ledgerHigh, configuration)
             }
             verifySnapshotChecksum(snapshot)
             decodeSnapshot(snapshot, ledger, group, ledgerHigh, configuration)
@@ -79,10 +80,14 @@ internal object M3SurfaceOwnershipLegacyCodec {
         var lineageRevision = 0L
         var supportEntries = 0
         var supportRecords = 0
-        var supportOffset = 0L
         var sourceCount = 0
         var sourceOffset = 0L
+        var sourcesSorted = true
         var baseline: M3CommittedEmptyBaseline? = null
+        var ownershipReceiptOffset = 0L
+        var ownershipReceiptCount = 0
+        var canonicalReceiptOffset = 0L
+        var canonicalReceiptCount = 0
         val rowIds = IntArray(configuration.surfaceCapacity)
         val rowX = IntArray(configuration.surfaceCapacity)
         val rowY = IntArray(configuration.surfaceCapacity)
@@ -90,8 +95,12 @@ internal object M3SurfaceOwnershipLegacyCodec {
         val rowNormal = ShortArray(configuration.surfaceCapacity)
         val rowConfidence = ByteArray(configuration.surfaceCapacity)
         val rowOffsets = LongArray(configuration.surfaceCapacity)
+        val supportOffsets = LongArray(configuration.surfaceCapacity) { -1L }
         val lineageSource = IntArray(configuration.lineageCapacity)
         val lineageTarget = IntArray(configuration.lineageCapacity)
+        val idOrder = IntArray(configuration.surfaceCapacity) { it }
+        val voxelOrder = IntArray(configuration.surfaceCapacity) { it }
+        val pageOrder = IntArray(configuration.surfaceCapacity) { it }
         var rowCount = 0
         var lineageCount = 0
 
@@ -124,7 +133,6 @@ internal object M3SurfaceOwnershipLegacyCodec {
                 )
                 val location = m3CompactLocation(configuration, M3Voxel(x, y, z))
                 require(location != null && location.region == region && location.page == page)
-                require(index == 0 || unsignedCompare(unsigned(rowIds[index - 1]), id) < 0)
                 require(fingerprint.size == 32)
                 rowIds[index] = id.toInt()
                 rowX[index] = x
@@ -133,11 +141,39 @@ internal object M3SurfaceOwnershipLegacyCodec {
                 rowNormal[index] = normal.toShort()
                 rowConfidence[index] = confidence.toByte()
             }
-            val receiptCount = bounded(data.readInt(), 0, configuration.receiptCapacity)
-            repeat(receiptCount) {
+            idOrder.sortIndices(rowCount) { a, b ->
+                unsignedCompare(unsigned(rowIds[a]), unsigned(rowIds[b]))
+            }
+            voxelOrder.sortIndices(rowCount) { a, b ->
+                compareVoxel(rowX[a], rowY[a], rowZ[a], rowX[b], rowY[b], rowZ[b])
+            }
+            pageOrder.sortIndices(rowCount) { a, b ->
+                compareLocationThenVoxel(configuration, rowX, rowY, rowZ, a, b)
+            }
+            repeat(rowCount - 1) { index ->
+                require(
+                    unsignedCompare(
+                        unsigned(rowIds[idOrder[index]]),
+                        unsigned(rowIds[idOrder[index + 1]]),
+                    ) < 0
+                )
+                val left = voxelOrder[index]
+                val right = voxelOrder[index + 1]
+                require(
+                    compareVoxel(
+                        rowX[left], rowY[left], rowZ[left],
+                        rowX[right], rowY[right], rowZ[right],
+                    ) < 0
+                )
+            }
+            ownershipReceiptOffset = counted.position
+            ownershipReceiptCount = bounded(data.readInt(), 0, configuration.receiptCapacity)
+            repeat(ownershipReceiptCount) {
                 data.skipFully(64)
                 val owners = bounded(data.readInt(), 0, configuration.surfaceCapacity)
-                repeat(owners) { require(rowIndex(rowIds, rowCount, data.readLong()) >= 0) }
+                repeat(owners) {
+                    require(rowIndex(rowIds, idOrder, rowCount, data.readLong()) >= 0)
+                }
                 val receiptHigh = data.readLong()
                 val live = data.readInt()
                 val resultRows = data.readInt()
@@ -155,14 +191,13 @@ internal object M3SurfaceOwnershipLegacyCodec {
                 lineageRevision = data.readLong()
                 require(geometry >= 0 && lineageRevision >= 0)
                 supportEntries = bounded(data.readInt(), 0, configuration.surfaceCapacity)
-                supportOffset = counted.position
-                var previousTarget = 0L
                 repeat(supportEntries) { entry ->
+                    val entryOffset = counted.position
                     val target = data.readLong()
                     val count = bounded(data.readInt(), 1, configuration.lineageCapacity)
-                    require(rowIndex(rowIds, rowCount, target) >= 0)
-                    require(entry == 0 || unsignedCompare(previousTarget, target) < 0)
-                    previousTarget = target
+                    val targetSlot = rowIndex(rowIds, idOrder, rowCount, target)
+                    require(targetSlot >= 0 && supportOffsets[targetSlot] < 0)
+                    supportOffsets[targetSlot] = entryOffset
                     var previousSource = 0L
                     repeat(count) { index ->
                         val source = data.readLong()
@@ -172,7 +207,7 @@ internal object M3SurfaceOwnershipLegacyCodec {
                     }
                     supportRecords = Math.addExact(supportRecords, count)
                 }
-                require(supportEntries == rowCount)
+                require(supportEntries == rowCount && (0 until rowCount).all { supportOffsets[it] >= 0 })
                 require(
                     supportRecords <= configuration.surfaceCapacity + configuration.lineageCapacity
                 )
@@ -188,7 +223,8 @@ internal object M3SurfaceOwnershipLegacyCodec {
                     repeat(sourceCount) { index ->
                         val source = readSource(data)
                         require(source.id.value in 1 until ledgerHigh)
-                        require(index == 0 || unsignedCompare(previous, source.id.value) < 0)
+                        if (index > 0 && unsignedCompare(previous, source.id.value) >= 0)
+                            sourcesSorted = false
                         previous = source.id.value
                     }
                 } else {
@@ -211,7 +247,8 @@ internal object M3SurfaceOwnershipLegacyCodec {
                     lineageSource[index] = source.toInt()
                     lineageTarget[index] = target.toInt()
                 }
-                skipCanonicalReceipts(
+                canonicalReceiptOffset = counted.position
+                canonicalReceiptCount = skipCanonicalReceipts(
                     data,
                     version,
                     configuration,
@@ -236,20 +273,19 @@ internal object M3SurfaceOwnershipLegacyCodec {
             }
         }
 
-        val pageOrder = IntArray(configuration.surfaceCapacity) { it }
-        pageOrder.sortIndices(rowCount) { a, b ->
-            compareVoxel(rowX[a], rowY[a], rowZ[a], rowX[b], rowY[b], rowZ[b])
+        validateUniqueHashes(ownershipReceiptCount) { visitor ->
+            scanOwnershipReceiptHashes(snapshot, ownershipReceiptOffset, configuration, visitor)
         }
-        repeat(rowCount - 1) { index ->
-            val left = pageOrder[index]
-            val right = pageOrder[index + 1]
-            require(
-                compareVoxel(
-                    rowX[left], rowY[left], rowZ[left],
-                    rowX[right], rowY[right], rowZ[right],
-                ) < 0
+        if (version >= 2) validateUniqueHashes(canonicalReceiptCount) { visitor ->
+            scanCanonicalReceiptHashes(
+                snapshot,
+                canonicalReceiptOffset,
+                version,
+                configuration,
+                visitor,
             )
         }
+
         val resident =
             M3CompactResident(
                 rowCount,
@@ -259,19 +295,45 @@ internal object M3SurfaceOwnershipLegacyCodec {
                 rowZ,
                 rowNormal,
                 rowConfidence,
+                idOrder,
+                voxelOrder,
                 pageOrder,
                 lineageSource,
                 lineageTarget,
             )
         val explicitSources = version >= 3
         val finalSourceOffset = sourceOffset
-        val finalSupportOffset = supportOffset
         val finalSourceCount = sourceCount
-        val finalSupportEntries = supportEntries
+        val finalSourcesSorted = sourcesSorted
         val sourceLookup: (Long) -> M3PagedSource? = { id ->
             if (explicitSources)
-                sourceAt(snapshot, finalSourceOffset, finalSourceCount, id)
+                if (finalSourcesSorted)
+                    sourceAt(snapshot, finalSourceOffset, finalSourceCount, id)
+                else sourceLinear(snapshot, finalSourceOffset, finalSourceCount, id)
             else rowSource(snapshot, rowOffsets, resident, id)
+        }
+        val sourceCursor: ((M3PagedSource) -> Unit) -> Unit = { visitor ->
+            if (explicitSources) {
+                if (finalSourcesSorted) {
+                    at(snapshot, finalSourceOffset).use { data ->
+                        repeat(finalSourceCount) { visitor(readSource(data)) }
+                    }
+                } else visitSourcesSorted(
+                    snapshot,
+                    finalSourceOffset,
+                    finalSourceCount,
+                    visitor,
+                )
+            } else {
+                repeat(rowCount) { order ->
+                    val slot = idOrder[order]
+                    visitor(
+                        requireNotNull(
+                            rowSource(snapshot, rowOffsets, resident, unsigned(rowIds[slot]))
+                        )
+                    )
+                }
+            }
         }
         val supportCursor: ((Long, M3PagedSource) -> Unit) -> Unit = { visitor ->
             if (version == 1) {
@@ -280,18 +342,29 @@ internal object M3SurfaceOwnershipLegacyCodec {
                     visitor(id, requireNotNull(rowSource(snapshot, rowOffsets, resident, id)))
                 }
             } else {
-                RandomAccessFile(snapshot, "r").use { sourceReader ->
-                    var cachedSourceIndex = -1
-                    var cachedSource: M3PagedSource? = null
-                    at(snapshot, finalSupportOffset).use { data ->
-                        repeat(finalSupportEntries) {
+                RandomAccessFile(snapshot, "r").use { supportReader ->
+                    RandomAccessFile(snapshot, "r").use { sourceReader ->
+                        var cachedSourceIndex = -1
+                        var cachedSource: M3PagedSource? = null
+                        repeat(rowCount) { targetOrder ->
+                            val targetSlot = idOrder[targetOrder]
+                            supportReader.seek(supportOffsets[targetSlot])
+                            val data = supportReader.dataInput()
                             val target = data.readLong()
+                            require(target == unsigned(rowIds[targetSlot]))
                             val count = data.readInt()
                             repeat(count) {
                                 val sourceId = data.readLong()
                                 val source =
                                     if (explicitSources) {
-                                        if (cachedSource?.id?.value == sourceId) cachedSource
+                                        if (!finalSourcesSorted)
+                                            sourceLinear(
+                                                sourceReader,
+                                                finalSourceOffset,
+                                                finalSourceCount,
+                                                sourceId,
+                                            )
+                                        else if (cachedSource?.id?.value == sourceId) cachedSource
                                         else {
                                             var sourceIndex = -1
                                             val adjacent = cachedSourceIndex + 1
@@ -331,26 +404,12 @@ internal object M3SurfaceOwnershipLegacyCodec {
                 }
             }
         }
-        // A second pass binds every support ID to exact source authority before any v6 write.
+        // Independent passes prove unique source identity and bind every support before v6 writes.
+        sourceCursor { }
         supportCursor { _, _ -> }
-        val sourceCursor: ((M3PagedSource) -> Unit) -> Unit = { visitor ->
-            if (explicitSources) {
-                at(snapshot, finalSourceOffset).use { data ->
-                    repeat(finalSourceCount) { visitor(readSource(data)) }
-                }
-            } else {
-                repeat(rowCount) {
-                    visitor(
-                        requireNotNull(
-                            rowSource(snapshot, rowOffsets, resident, unsigned(rowIds[it]))
-                        )
-                    )
-                }
-            }
-        }
         return M3LegacyCanonicalState(
             group,
-            nextHigh,
+            ledgerHigh,
             resident,
             sourceCount,
             if (version == 1) rowCount else supportRecords,
@@ -421,7 +480,7 @@ internal object M3SurfaceOwnershipLegacyCodec {
         nextHigh: Long,
         geometryRevision: Long,
         lineageRevision: Long,
-    ) {
+    ): Int {
         val count = bounded(data.readInt(), 0, configuration.transactionCapacity)
         var journalBytes = 0L
         repeat(count) {
@@ -439,23 +498,62 @@ internal object M3SurfaceOwnershipLegacyCodec {
                     lineageRevision,
                 )
             } else {
-                data.readUTF()
-                bounded(data.readInt(), 0, M3CanonicalOperation.entries.lastIndex)
-                skipOwners(data, bounded(data.readInt(), 0, configuration.surfaceCapacity))
-                data.skipFully(bounded(data.readInt(), 0, configuration.surfaceCapacity) * 8)
-                data.skipFully(bounded(data.readInt(), 0, configuration.lineageCapacity) * 16)
-                data.skipFully(28)
+                val command = data.readUTF().also { require(it.isNotEmpty()) }
+                val kind = bounded(data.readInt(), 0, M3CanonicalOperation.entries.lastIndex)
+                val targets = M3FieldDigest()
+                val targetCount = bounded(data.readInt(), 0, configuration.surfaceCapacity)
+                repeat(targetCount) {
+                    val id = data.readLong(); val ownerGroup = data.readUTF()
+                    val voxel = M3Voxel(data.readInt(), data.readInt(), data.readInt())
+                    val region = M3StorageRegion(data.readInt(), data.readInt(), data.readInt())
+                    val page = data.readInt(); val normal = data.readInt(); val confidence = data.readInt()
+                    val fingerprint = ByteArray(32).also(data::readFully)
+                    require(id in 1 until nextHigh && ownerGroup == group.value)
+                    require(m3CompactLocation(configuration, voxel) == M3CompactLocation(region, page))
+                    require(normal in 0..0xffff && confidence in 0..255 &&
+                        (normal ushr 8) != 0x80 && (normal and 0xff) != 0x80)
+                    targets.long(id); targets.ints(voxel.x, voxel.y, voxel.z, region.x, region.y,
+                        region.z, page, normal, confidence); targets.bytes(fingerprint)
+                }
+                val removed = M3FieldDigest()
+                val removedCount = bounded(data.readInt(), 0, configuration.surfaceCapacity)
+                repeat(removedCount) { data.readLong().also { require(it in 1 until nextHigh); removed.long(it) } }
+                val edges = M3FieldDigest()
+                val edgeCount = bounded(data.readInt(), 0, configuration.lineageCapacity)
+                repeat(edgeCount) {
+                    val source = data.readLong(); val target = data.readLong()
+                    require(source in 1 until nextHigh && target in 1 until nextHigh)
+                    edges.long(source); edges.long(target)
+                }
+                val receiptGeometry = data.readLong(); val receiptLineage = data.readLong()
+                val receiptHigh = data.readLong(); val receiptLive = data.readInt()
+                require(receiptGeometry in 0..geometryRevision && receiptLineage in 0..lineageRevision &&
+                    receiptHigh in 1..nextHigh && receiptLive in 0..configuration.surfaceCapacity)
                 if (version >= 3) {
-                    repeat(bounded(data.readInt(), 0, configuration.lineageCapacity)) {
-                        readSource(data)
+                    val supports = M3FieldDigest()
+                    val supportCount = bounded(data.readInt(), 0, configuration.lineageCapacity)
+                    repeat(supportCount) {
+                        val source = readSource(data).also { require(it.id.value in 1 until nextHigh) }
+                        supports.long(source.id.value)
+                        supports.ints(source.voxel.x, source.voxel.y, source.voxel.z,
+                            source.packedNormal, source.normalConfidence)
+                        supports.bytes(source.allocationFingerprint.toByteArray())
                     }
-                    data.skipFully(
-                        bounded(data.readInt(), 0, configuration.changeJournalByteCapacity)
+                    val bytes = bounded(data.readInt(), 0, configuration.changeJournalByteCapacity)
+                    journalBytes = Math.addExact(journalBytes, 68L + bytes)
+                    validateCanonicalReceipt(
+                        data, bytes, configuration, group, nextHigh, geometryRevision,
+                        lineageRevision,
+                        M3InlineCanonicalReceipt(command, kind, receiptGeometry, receiptLineage,
+                            receiptHigh, receiptLive, targetCount, targets.finish(), removedCount,
+                            removed.finish(), edgeCount, edges.finish(), supportCount,
+                            supports.finish()),
                     )
                 }
             }
         }
         require(journalBytes <= configuration.changeJournalByteCapacity)
+        return count
     }
 
     private fun validateCanonicalReceipt(
@@ -466,12 +564,13 @@ internal object M3SurfaceOwnershipLegacyCodec {
         nextHigh: Long,
         geometryRevision: Long,
         lineageRevision: Long,
+        expected: M3InlineCanonicalReceipt? = null,
     ) {
         val body = DataInputStream(M3LegacyLimitedInputStream(source, bytes.toLong()))
         require(body.readInt() == 0x4d334352 && body.readInt() == 1)
         require(body.readUTF() == group.value)
-        require(body.readUTF().isNotEmpty())
-        bounded(body.readInt(), 0, M3CanonicalOperation.entries.lastIndex)
+        val command = body.readUTF().also { require(it.isNotEmpty()) }
+        val kind = bounded(body.readInt(), 0, M3CanonicalOperation.entries.lastIndex)
         val geometry = body.readLong()
         val lineage = body.readLong()
         val high = body.readLong()
@@ -480,8 +579,10 @@ internal object M3SurfaceOwnershipLegacyCodec {
                 lineage in 0..lineageRevision &&
                 high in 1..nextHigh
         )
-        bounded(body.readInt(), 0, configuration.surfaceCapacity)
-        repeat(bounded(body.readInt(), 0, configuration.surfaceCapacity)) {
+        val live = bounded(body.readInt(), 0, configuration.surfaceCapacity)
+        val targets = M3FieldDigest()
+        val targetCount = bounded(body.readInt(), 0, configuration.surfaceCapacity)
+        repeat(targetCount) {
             val id = body.readLong()
             require(id in 1 until nextHigh && body.readUTF() == group.value)
             val voxel = M3Voxel(body.readInt(), body.readInt(), body.readInt())
@@ -496,19 +597,40 @@ internal object M3SurfaceOwnershipLegacyCodec {
                     (normal ushr 8) != 0x80 &&
                     (normal and 0xff) != 0x80
             )
-            body.skipFully(32)
+            val fingerprint = ByteArray(32).also(body::readFully)
+            targets.long(id); targets.ints(voxel.x, voxel.y, voxel.z, region.x, region.y,
+                region.z, page, normal, confidence); targets.bytes(fingerprint)
         }
-        repeat(bounded(body.readInt(), 0, configuration.surfaceCapacity)) {
-            require(body.readLong() in 1 until nextHigh)
+        val removed = M3FieldDigest()
+        val removedCount = bounded(body.readInt(), 0, configuration.surfaceCapacity)
+        repeat(removedCount) {
+            body.readLong().also { require(it in 1 until nextHigh); removed.long(it) }
         }
-        repeat(bounded(body.readInt(), 0, configuration.lineageCapacity)) {
-            require(body.readLong() in 1 until nextHigh)
-            require(body.readLong() in 1 until nextHigh)
+        val edges = M3FieldDigest()
+        val edgeCount = bounded(body.readInt(), 0, configuration.lineageCapacity)
+        repeat(edgeCount) {
+            val edgeSource = body.readLong(); val edgeTarget = body.readLong()
+            require(edgeSource in 1 until nextHigh && edgeTarget in 1 until nextHigh)
+            edges.long(edgeSource); edges.long(edgeTarget)
         }
-        repeat(bounded(body.readInt(), 0, configuration.lineageCapacity)) {
-            readSource(body).also { require(it.id.value in 1 until nextHigh) }
+        val supports = M3FieldDigest()
+        val supportCount = bounded(body.readInt(), 0, configuration.lineageCapacity)
+        repeat(supportCount) {
+            val support = readSource(body).also { require(it.id.value in 1 until nextHigh) }
+            supports.long(support.id.value)
+            supports.ints(support.voxel.x, support.voxel.y, support.voxel.z,
+                support.packedNormal, support.normalConfidence)
+            supports.bytes(support.allocationFingerprint.toByteArray())
         }
         require(body.read() == -1)
+        expected?.let {
+            require(command == it.command && kind == it.kind && geometry == it.geometry &&
+                lineage == it.lineage && high == it.high && live == it.live &&
+                targetCount == it.targetCount && targets.finish().contentEquals(it.targetDigest) &&
+                removedCount == it.removedCount && removed.finish().contentEquals(it.removedDigest) &&
+                edgeCount == it.edgeCount && edges.finish().contentEquals(it.edgeDigest) &&
+                supportCount == it.supportCount && supports.finish().contentEquals(it.supportDigest))
+        }
     }
 
     private fun skipOwners(data: DataInputStream, count: Int) {
@@ -517,6 +639,109 @@ internal object M3SurfaceOwnershipLegacyCodec {
             data.readUTF()
             data.skipFully(9 * 4 + 32)
         }
+    }
+
+    private fun scanOwnershipReceiptHashes(
+        file: File,
+        offset: Long,
+        configuration: M3SurfaceOwnershipConfiguration,
+        visitor: (ByteArray) -> Unit,
+    ) {
+        at(file, offset).use { data ->
+            repeat(bounded(data.readInt(), 0, configuration.receiptCapacity)) {
+                visitor(ByteArray(32).also(data::readFully))
+                data.skipFully(32)
+                val ownerCount = bounded(data.readInt(), 0, configuration.surfaceCapacity)
+                data.skipFully(ownerCount * 8)
+                data.skipFully(20)
+            }
+        }
+    }
+
+    private fun scanCanonicalReceiptHashes(
+        file: File,
+        offset: Long,
+        version: Int,
+        configuration: M3SurfaceOwnershipConfiguration,
+        visitor: (ByteArray) -> Unit,
+    ) {
+        at(file, offset).use { data ->
+            repeat(bounded(data.readInt(), 0, configuration.transactionCapacity)) {
+                visitor(ByteArray(32).also(data::readFully))
+                data.skipFully(32)
+                if (version >= 4) {
+                    data.skipFully(
+                        bounded(data.readInt(), 0, configuration.changeJournalByteCapacity)
+                    )
+                } else {
+                    data.readUTF()
+                    bounded(data.readInt(), 0, M3CanonicalOperation.entries.lastIndex)
+                    skipOwners(data, bounded(data.readInt(), 0, configuration.surfaceCapacity))
+                    data.skipFully(bounded(data.readInt(), 0, configuration.surfaceCapacity) * 8)
+                    data.skipFully(bounded(data.readInt(), 0, configuration.lineageCapacity) * 16)
+                    data.skipFully(28)
+                    if (version >= 3) {
+                        repeat(bounded(data.readInt(), 0, configuration.lineageCapacity)) {
+                            readSource(data)
+                        }
+                        data.skipFully(
+                            bounded(data.readInt(), 0, configuration.changeJournalByteCapacity)
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /** Exact duplicate rejection for bounded streaming hash scans. */
+    private fun validateUniqueHashes(
+        count: Int,
+        scan: (((ByteArray) -> Unit) -> Unit),
+    ) {
+        fun matches(hash: ByteArray, prefix: ByteArray, depth: Int): Boolean {
+            repeat(depth) { if (hash[it] != prefix[it]) return false }
+            return true
+        }
+        fun comparePacked(bytes: ByteArray, left: Int, right: Int): Int {
+            repeat(32) { offset ->
+                val compared = (bytes[left * 32 + offset].toInt() and 0xff)
+                    .compareTo(bytes[right * 32 + offset].toInt() and 0xff)
+                if (compared != 0) return compared
+            }
+            return 0
+        }
+        fun validatePrefix(prefix: ByteArray, depth: Int, matchingCount: Int) {
+            if (matchingCount <= HASH_SORT_BUCKET_RECORDS) {
+                val records = ByteArray(matchingCount * 32)
+                var stored = 0
+                scan { hash ->
+                    if (matches(hash, prefix, depth)) hash.copyInto(records, stored++ * 32)
+                }
+                require(stored == matchingCount)
+                val order = IntArray(matchingCount) { it }
+                order.sortIndices(matchingCount) { left, right -> comparePacked(records, left, right) }
+                repeat(matchingCount - 1) { index ->
+                    require(comparePacked(records, order[index], order[index + 1]) < 0)
+                }
+                return
+            }
+            require(depth < 32)
+            val buckets = IntArray(256)
+            scan { hash ->
+                if (matches(hash, prefix, depth)) {
+                    val next = hash[depth].toInt() and 0xff
+                    buckets[next] = Math.addExact(buckets[next], 1)
+                }
+            }
+            buckets.forEachIndexed { next, bucketCount ->
+                if (bucketCount > 0) {
+                    val child = prefix.copyOf()
+                    child[depth] = next.toByte()
+                    validatePrefix(child, depth + 1, bucketCount)
+                }
+            }
+        }
+        if (count > 0) validatePrefix(ByteArray(32), 0, count)
     }
 
     private fun readSource(data: DataInputStream): M3PagedSource {
@@ -545,6 +770,104 @@ internal object M3SurfaceOwnershipLegacyCodec {
         RandomAccessFile(file, "r").use { reader ->
             return sourceAt(reader, offset, count, id)
         }
+    }
+
+    private fun sourceLinear(file: File, offset: Long, count: Int, id: Long): M3PagedSource? {
+        RandomAccessFile(file, "r").use { reader ->
+            return sourceLinear(reader, offset, count, id)
+        }
+    }
+
+    private fun sourceLinear(
+        reader: RandomAccessFile,
+        offset: Long,
+        count: Int,
+        id: Long,
+    ): M3PagedSource? {
+        repeat(count) { index ->
+            val recordOffset = offset + index * SOURCE_RECORD_BYTES
+            reader.seek(recordOffset)
+            if (reader.readLong() == id) {
+                reader.seek(recordOffset)
+                return readSource(reader.dataInput())
+            }
+        }
+        return null
+    }
+
+    /** Emits arbitrary serialized source order as exact unsigned ID order within fixed scratch. */
+    private fun visitSourcesSorted(
+        file: File,
+        offset: Long,
+        count: Int,
+        visitor: (M3PagedSource) -> Unit,
+    ) {
+        val scratchRecord = ByteArray(SOURCE_RECORD_BYTES.toInt())
+        fun matches(id: Long, prefix: Long, depth: Int): Boolean =
+            depth == 0 || (id ushr (32 - depth * 8)) == prefix
+
+        fun emitBucket(prefix: Long, depth: Int, matchingCount: Int) {
+            require(matchingCount in 1..SOURCE_SORT_BUCKET_RECORDS)
+            val records = ByteArray(matchingCount * SOURCE_RECORD_BYTES.toInt())
+            var written = 0
+            RandomAccessFile(file, "r").use { reader ->
+                reader.seek(offset)
+                repeat(count) {
+                    reader.readFully(scratchRecord)
+                    if (matches(packedLong(scratchRecord, 0), prefix, depth)) {
+                        scratchRecord.copyInto(records, written * SOURCE_RECORD_BYTES.toInt())
+                        written++
+                    }
+                }
+            }
+            require(written == matchingCount)
+            val order = IntArray(matchingCount) { it }
+            order.sortIndices(matchingCount) { left, right ->
+                unsignedCompare(
+                    packedLong(records, left * SOURCE_RECORD_BYTES.toInt()),
+                    packedLong(records, right * SOURCE_RECORD_BYTES.toInt()),
+                )
+            }
+            repeat(matchingCount) { index ->
+                if (index > 0) require(
+                    unsignedCompare(
+                        packedLong(records, order[index - 1] * SOURCE_RECORD_BYTES.toInt()),
+                        packedLong(records, order[index] * SOURCE_RECORD_BYTES.toInt()),
+                    ) < 0
+                )
+                val start = order[index] * SOURCE_RECORD_BYTES.toInt()
+                visitor(
+                    readSource(
+                        DataInputStream(
+                            ByteArrayInputStream(records, start, SOURCE_RECORD_BYTES.toInt())
+                        )
+                    )
+                )
+            }
+        }
+
+        fun visitPrefix(prefix: Long, depth: Int, matchingCount: Int) {
+            if (matchingCount <= SOURCE_SORT_BUCKET_RECORDS) {
+                emitBucket(prefix, depth, matchingCount)
+                return
+            }
+            require(depth < 4)
+            val buckets = IntArray(256)
+            RandomAccessFile(file, "r").use { reader ->
+                repeat(count) { index ->
+                    reader.seek(offset + index * SOURCE_RECORD_BYTES)
+                    val id = reader.readLong()
+                    if (matches(id, prefix, depth)) {
+                        val next = ((id ushr (24 - depth * 8)) and 0xff).toInt()
+                        buckets[next] = Math.addExact(buckets[next], 1)
+                    }
+                }
+            }
+            buckets.forEachIndexed { next, bucketCount ->
+                if (bucketCount > 0) visitPrefix((prefix shl 8) or next.toLong(), depth + 1, bucketCount)
+            }
+        }
+        if (count > 0) visitPrefix(0, 0, count)
     }
 
     private fun sourceAt(
@@ -587,7 +910,7 @@ internal object M3SurfaceOwnershipLegacyCodec {
         resident: M3CompactResident,
         id: Long,
     ): M3PagedSource? {
-        val index = rowIndex(resident.rowId, resident.rows, id)
+        val index = rowIndex(resident.rowId, resident.idOrder, resident.rows, id)
         if (index < 0) return null
         at(file, offsets[index]).use { data ->
             val rowId = data.readLong()
@@ -608,15 +931,16 @@ internal object M3SurfaceOwnershipLegacyCodec {
         }
     }
 
-    private fun rowIndex(ids: IntArray, count: Int, id: Long): Int {
+    private fun rowIndex(ids: IntArray, order: IntArray, count: Int, id: Long): Int {
         var low = 0
         var high = count - 1
         while (low <= high) {
             val middle = (low + high) ushr 1
-            when (unsignedCompare(unsigned(ids[middle]), id)) {
+            val slot = order[middle]
+            when (unsignedCompare(unsigned(ids[slot]), id)) {
                 in Int.MIN_VALUE until 0 -> low = middle + 1
                 in 1..Int.MAX_VALUE -> high = middle - 1
-                else -> return middle
+                else -> return slot
             }
         }
         return -1
@@ -626,11 +950,12 @@ internal object M3SurfaceOwnershipLegacyCodec {
         group: M3SurfaceGroup,
         ledger: File,
         snapshot: File,
+        ledgerHigh: Long,
         configuration: M3SurfaceOwnershipConfiguration,
     ) =
         M3LegacyCanonicalState(
             group,
-            1,
+            ledgerHigh,
             M3CompactResident(
                 0,
                 IntArray(configuration.surfaceCapacity),
@@ -639,6 +964,8 @@ internal object M3SurfaceOwnershipLegacyCodec {
                 IntArray(configuration.surfaceCapacity),
                 ShortArray(configuration.surfaceCapacity),
                 ByteArray(configuration.surfaceCapacity),
+                IntArray(configuration.surfaceCapacity),
+                IntArray(configuration.surfaceCapacity),
                 IntArray(configuration.surfaceCapacity),
                 IntArray(configuration.lineageCapacity),
                 IntArray(configuration.lineageCapacity),
@@ -702,6 +1029,51 @@ internal object M3SurfaceOwnershipLegacyCodec {
         require(value in minimum..maximum)
         return value
     }
+
+    private fun packedLong(bytes: ByteArray, offset: Int): Long {
+        var value = 0L
+        repeat(8) { value = (value shl 8) or (bytes[offset + it].toLong() and 0xff) }
+        return value
+    }
+
+    private const val SOURCE_SORT_BUCKET_RECORDS = 900
+    private const val HASH_SORT_BUCKET_RECORDS = 800
+}
+
+private data class M3InlineCanonicalReceipt(
+    val command: String,
+    val kind: Int,
+    val geometry: Long,
+    val lineage: Long,
+    val high: Long,
+    val live: Int,
+    val targetCount: Int,
+    val targetDigest: ByteArray,
+    val removedCount: Int,
+    val removedDigest: ByteArray,
+    val edgeCount: Int,
+    val edgeDigest: ByteArray,
+    val supportCount: Int,
+    val supportDigest: ByteArray,
+)
+
+/** Small rolling semantic receipt digest; retained scratch is one hash state plus eight bytes. */
+private class M3FieldDigest {
+    private val digest = MessageDigest.getInstance("SHA-256")
+    private val scratch = ByteArray(8)
+
+    fun long(value: Long) {
+        repeat(8) { offset -> scratch[offset] = (value ushr (56 - offset * 8)).toByte() }
+        digest.update(scratch)
+    }
+
+    fun ints(vararg values: Int) = values.forEach { value ->
+        repeat(4) { offset -> scratch[offset] = (value ushr (24 - offset * 8)).toByte() }
+        digest.update(scratch, 0, 4)
+    }
+
+    fun bytes(value: ByteArray) = digest.update(value)
+    fun finish(): ByteArray = digest.digest()
 }
 
 private class M3CountingInputStream(input: InputStream) : FilterInputStream(input) {

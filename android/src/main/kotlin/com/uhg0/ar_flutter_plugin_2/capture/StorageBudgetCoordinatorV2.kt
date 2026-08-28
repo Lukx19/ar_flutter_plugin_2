@@ -82,7 +82,13 @@ class StorageBudgetCoordinatorV2(
     fun committedBytes(): Long = withAuthority { committed }
     fun reservedBytes(): Long = withAuthority { reservedBytesLocked() }
     fun physicallyAllocatedBytes(token: String): Long = withAuthority {
-        reservations[token]?.let { files.length(allocationFile(token)) } ?: 0L
+        reservations[token]?.let { files.allocatedLength(allocationFile(token)) } ?: 0L
+    }
+    fun physicallyAllocatedTreeBytes(directory: File): Long = withAuthority {
+        files.allocatedTreeBytes(directory)
+    }
+    fun allocationUnitBytes(path: File): Long = withAuthority {
+        java.nio.file.Files.getFileStore(path.toPath()).blockSize.coerceAtLeast(1L)
     }
 
     private fun <T> withAuthority(block: () -> T): T = synchronized(lockFor(requireNotNull(ledger.parentFile))) {

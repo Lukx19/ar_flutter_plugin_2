@@ -33,6 +33,8 @@ internal data class M3CompactResident(
     val rowZ: IntArray,
     val rowNormal: ShortArray,
     val rowConfidence: ByteArray,
+    val idOrder: IntArray,
+    val voxelOrder: IntArray,
     val pageOrder: IntArray,
     val lineageSource: IntArray,
     val lineageTarget: IntArray,
@@ -80,6 +82,50 @@ internal class M3CompactDirectory(capacity: Int) {
             offset.size * 8L + length.size * 4L + count.size * 2L + hash.size
 }
 
+/** Compact `(region,page) -> sorted row range` index; no sparse query scans live capacity. */
+internal class M3CompactPageRanges(capacity: Int) {
+    val regionX = IntArray(capacity)
+    val regionY = IntArray(capacity)
+    val regionZ = IntArray(capacity)
+    val page = ByteArray(capacity)
+    val start = IntArray(capacity)
+    val count = IntArray(capacity)
+    var size = 0
+        private set
+
+    fun append(location: M3CompactLocation, first: Int, rows: Int) {
+        require(size < regionX.size && rows > 0)
+        val index = size++
+        regionX[index] = location.region.x
+        regionY[index] = location.region.y
+        regionZ[index] = location.region.z
+        page[index] = location.page.toByte()
+        start[index] = first
+        count[index] = rows
+    }
+
+    fun find(region: M3StorageRegion, targetPage: Int): Int {
+        var low = 0
+        var high = size - 1
+        while (low <= high) {
+            val middle = (low + high) ushr 1
+            val compared = compareLocation(
+                regionX[middle], regionY[middle], regionZ[middle], page[middle].toInt(),
+                region.x, region.y, region.z, targetPage,
+            )
+            when {
+                compared < 0 -> low = middle + 1
+                compared > 0 -> high = middle - 1
+                else -> return middle
+            }
+        }
+        return -1
+    }
+
+    val retainedBytes: Long
+        get() = regionX.size * 21L
+}
+
 /** Streaming v6 root/resident/directory codec. Scratch never exceeds [SCRATCH_BYTES]. */
 internal object M3CompactCanonicalFormat {
     const val PROFILE = "android-v2-fixed-8g64-v1"
@@ -103,7 +149,8 @@ internal object M3CompactCanonicalFormat {
             out.writeInt(RESIDENT_MAGIC)
             out.writeInt(VERSION)
             out.writeInt(legacy.resident.rows)
-            repeat(legacy.resident.rows) { index ->
+            repeat(legacy.resident.rows) { order ->
+                val index = legacy.resident.idOrder[order]
                 out.writeInt(legacy.resident.rowId[index])
                 out.writeInt(legacy.resident.rowX[index])
                 out.writeInt(legacy.resident.rowY[index])
@@ -144,15 +191,17 @@ internal object M3CompactCanonicalFormat {
                 require(m3CompactLocation(configuration, M3Voxel(x[index], y[index], z[index])) != null)
             }
             val pageOrder = IntArray(configuration.surfaceCapacity) { it }
+            val idOrder = IntArray(configuration.surfaceCapacity) { it }
+            val voxelOrder = IntArray(configuration.surfaceCapacity) { it }
+            voxelOrder.sortIndices(rows) { a, b ->
+                compareVoxel(x[a], y[a], z[a], x[b], y[b], z[b])
+            }
             pageOrder.sortIndices(rows) { a, b ->
-                compareVoxel(
-                    x[a], y[a], z[a],
-                    x[b], y[b], z[b],
-                )
+                compareLocationThenVoxel(configuration, x, y, z, a, b)
             }
             repeat(rows - 1) { index ->
-                val left = pageOrder[index]
-                val right = pageOrder[index + 1]
+                val left = voxelOrder[index]
+                val right = voxelOrder[index + 1]
                 require(compareVoxel(x[left], y[left], z[left], x[right], y[right], z[right]) < 0)
             }
             val lineage = bounded(input.readInt(), configuration.lineageCapacity)
@@ -169,7 +218,8 @@ internal object M3CompactCanonicalFormat {
             }
             require(input.read() == -1)
             return M3CompactResident(
-                rows, ids, x, y, z, normals, confidence, pageOrder, sources, targets,
+                rows, ids, x, y, z, normals, confidence, idOrder, voxelOrder, pageOrder,
+                sources, targets,
             )
         }
     }

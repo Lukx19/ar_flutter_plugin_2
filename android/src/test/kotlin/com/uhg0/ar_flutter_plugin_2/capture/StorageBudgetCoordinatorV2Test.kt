@@ -17,7 +17,8 @@ class StorageBudgetCoordinatorV2Test {
         val root = directory(); val policy = StorageBudgetPolicyV2(100, 10)
         val first = StorageBudgetCoordinatorV2(root, policy, JvmDescriptorFilesystemV2()) { 100 }
         val token = first.reserve("capture:session:one", 80)!!
-        assertEquals(80L, first.physicallyAllocatedBytes(token.token))
+        assertEquals(80L, token.bytes)
+        assertTrue(first.physicallyAllocatedBytes(token.token) >= token.bytes)
         assertNull(first.reserve("capture:session:two", 11))
 
         val restarted = StorageBudgetCoordinatorV2(root, policy, JvmDescriptorFilesystemV2()) { 100 }

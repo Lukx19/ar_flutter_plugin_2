@@ -84,7 +84,11 @@ internal data class M3CompactSurface(
     val normalConfidence: Int,
 )
 
-internal data class M3CompactPage(val rows: List<M3CompactSurface>, val nextCursor: Int?)
+internal data class M3CompactPage(
+    val rows: List<M3CompactSurface>,
+    val nextCursor: Int?,
+    val inspectedRows: Int,
+)
 
 internal data class M3SourceSupportCursor(
     val rootHash: M3CanonicalReceiptBytes,
@@ -108,10 +112,13 @@ internal data class M3CompactRetainedMemoryReceipt(
     val kernelBytes: Long,
     val rowColumnsBytes: Long,
     val idOrderBytes: Long,
+    val voxelOrderBytes: Long,
     val pageOrderBytes: Long,
+    val pageRangeBytes: Long,
     val lineageColumnsBytes: Long,
     val directoryColumnsBytes: Long,
     val cachePayloadBytes: Long,
+    val cacheResidentPages: Int,
     val cacheMetadataBytes: Long,
     val scalarAndObjectBytes: Long,
     val migrationOpenScratchBytes: Long,
@@ -120,7 +127,9 @@ internal data class M3CompactRetainedMemoryReceipt(
         get() =
             rowColumnsBytes +
                 idOrderBytes +
+                voxelOrderBytes +
                 pageOrderBytes +
+                pageRangeBytes +
                 lineageColumnsBytes +
                 directoryColumnsBytes +
                 cachePayloadBytes +
@@ -148,9 +157,10 @@ internal data class M3CompactStorageReceipt(
     val residentBytes: Long,
     val directoryBytes: Long,
     val pageBytes: Long,
+    val filesystemBytes: Long,
 ) {
     val allocatedBytes
-        get() = rootBytes + residentBytes + directoryBytes + pageBytes
+        get() = rootBytes + residentBytes + directoryBytes + pageBytes + filesystemBytes
 }
 
 internal sealed interface M3CompactCanonicalOpenResult {
@@ -210,6 +220,11 @@ internal interface M3CanonicalStorageBudget {
     fun commit(token: Any, actualBytes: Long)
 
     fun release(token: Any)
+
+    fun allocatedBytes(path: File): Long = m3PhysicalAllocatedTreeBytes(path)
+
+    fun allocationUnitBytes(path: File): Long =
+        Files.getFileStore(path.toPath()).blockSize.coerceAtLeast(1L)
 }
 
 internal class M3CoordinatorStorageBudget(private val coordinator: StorageBudgetCoordinatorV2) :
@@ -223,6 +238,10 @@ internal class M3CoordinatorStorageBudget(private val coordinator: StorageBudget
     override fun release(token: Any) {
         coordinator.release(token as StorageBudgetReservationV2)
     }
+
+    override fun allocatedBytes(path: File) = coordinator.physicallyAllocatedTreeBytes(path)
+
+    override fun allocationUnitBytes(path: File) = coordinator.allocationUnitBytes(path)
 }
 
 internal class M3CompactCanonicalStore
@@ -238,7 +257,9 @@ private constructor(
     private val rowNormal: ShortArray,
     private val rowConfidence: ByteArray,
     private val idOrder: IntArray,
+    private val voxelOrder: IntArray,
     private val pageOrder: IntArray,
+    private val pageRanges: M3CompactPageRanges,
     private val lineageSource: IntArray,
     private val lineageTarget: IntArray,
     private val directory: M3CompactDirectory,
@@ -270,7 +291,7 @@ private constructor(
         var high = rowCount - 1
         while (low <= high) {
             val mid = (low + high) ushr 1
-            val slot = pageOrder[mid]
+            val slot = voxelOrder[mid]
             when (
                 val c = compareVoxel(rowX[slot], rowY[slot], rowZ[slot], voxel.x, voxel.y, voxel.z)
             ) {
@@ -289,16 +310,18 @@ private constructor(
         limit: Int,
     ): M3CompactPage {
         if (closed || page !in 0..26 || cursor !in 0..rowCount || limit !in 1..MAX_PAGE_READ)
-            return M3CompactPage(emptyList(), null)
-        val rows = ArrayList<M3CompactSurface>(minOf(limit, 64))
-        var index = cursor
-        while (index < rowCount && rows.size < limit) {
-            val slot = pageOrder[index++]
-            val location =
-                m3CompactLocation(configuration, M3Voxel(rowX[slot], rowY[slot], rowZ[slot]))
-            if (location?.region == region && location.page == page) rows += row(slot)
+            return M3CompactPage(emptyList(), null, 0)
+        val range = pageRanges.find(region, page)
+        if (range < 0) return M3CompactPage(emptyList(), null, 0)
+        val rangeCount = pageRanges.count[range]
+        if (cursor > rangeCount) return M3CompactPage(emptyList(), null, 0)
+        val delivered = minOf(limit, rangeCount - cursor)
+        val rows = ArrayList<M3CompactSurface>(delivered)
+        repeat(delivered) { offset ->
+            rows += row(pageOrder[pageRanges.start[range] + cursor + offset])
         }
-        return M3CompactPage(rows, if (index < rowCount) index else null)
+        val next = cursor + delivered
+        return M3CompactPage(rows, if (next < rangeCount) next else null, delivered)
     }
 
     override fun readSourceById(id: M3SurfaceId): M3CanonicalPageRead<M3PagedSource?> {
@@ -392,10 +415,13 @@ private constructor(
             KERNEL_RETAINED_BYTES,
             rowId.size * 19L,
             idOrder.size * 4L,
+            voxelOrder.size * 4L,
             pageOrder.size * 4L,
+            pageRanges.retainedBytes,
             lineageSource.size * 8L,
             directory.retainedBytes,
             cache.retainedPayloadBytes(),
+            cache.residentPageCount(),
             CACHE_METADATA_BYTES,
             SCALAR_AND_OBJECT_BYTES,
             SCRATCH_BYTES,
@@ -455,6 +481,7 @@ private constructor(
         fun openV6(
             group: M3SurfaceGroup,
             directory: File,
+            budget: M3CanonicalStorageBudget,
             configuration: M3SurfaceOwnershipConfiguration = M3SurfaceOwnershipConfiguration(),
         ): M3CompactCanonicalOpenResult =
             try {
@@ -531,12 +558,7 @@ private constructor(
                         root,
                         resident,
                         entries,
-                        M3CompactStorageReceipt(
-                            rootFile.length(),
-                            residentFile.length(),
-                            directoryFile.length(),
-                            pages.length(),
-                        ),
+                        physicalStorageReceipt(budget, candidate),
                     )
                 )
             } catch (_: IllegalArgumentException) {
@@ -565,7 +587,7 @@ private constructor(
                 validateLegacyForV6(legacy, configuration)
                 val target = candidateDirectory(directory, group)
                 if (target.exists()) {
-                    val opened = openV6(group, directory, configuration)
+                    val opened = openV6(group, directory, budget, configuration)
                     val store =
                         (opened as? M3CompactCanonicalOpenResult.Opened)?.store
                             ?: return M3CompactCanonicalMigrationResult.Refused(
@@ -592,11 +614,16 @@ private constructor(
                         M3CanonicalPageCache.PAGE_BYTES.toLong(),
                     )
                 val directoryWorstCaseBytes = 44L + pageCount * 59L
-                val worst =
-                    Math.addExact(
-                        Math.addExact(residentFileBytes(legacy), pageBytes),
-                        directoryWorstCaseBytes + 1_024L + 16_384L,
-                    )
+                val unit = budget.allocationUnitBytes(directory)
+                val worst = listOf(
+                    residentFileBytes(legacy),
+                    pageBytes,
+                    directoryWorstCaseBytes,
+                    1_024L,
+                    1L,
+                ).fold(0L) { total, logical ->
+                    Math.addExact(total, roundPhysical(logical, unit))
+                }
                 reservation =
                     budget.reserve(worst)
                         ?: return M3CompactCanonicalMigrationResult.Refused(
@@ -645,11 +672,12 @@ private constructor(
                 if (fault == M3CompactCanonicalMigrationFault.AFTER_RENAME) error("fault")
                 syncDirectory(directory)
                 if (fault == M3CompactCanonicalMigrationFault.AFTER_PARENT_SYNC) error("fault")
-                val actual = target.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+                val actual = budget.allocatedBytes(target)
                 budget.commit(requireNotNull(reservation), actual)
                 reservation = null
                 val opened =
-                    openV6(group, directory, configuration) as? M3CompactCanonicalOpenResult.Opened
+                    openV6(group, directory, budget, configuration)
+                        as? M3CompactCanonicalOpenResult.Opened
                         ?: error("published v6 invalid")
                 return M3CompactCanonicalMigrationResult.Prepared(
                     opened.store.cut,
@@ -670,8 +698,7 @@ private constructor(
                     try {
                         if (published) {
                             val target = candidateDirectory(directory, group)
-                            val actual =
-                                target.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+                            val actual = budget.allocatedBytes(target)
                             budget.commit(token, actual)
                         } else budget.release(token)
                     } catch (_: Exception) {}
@@ -684,6 +711,26 @@ private constructor(
 
         private fun residentFileBytes(legacy: M3LegacyCanonicalState): Long =
             12L + legacy.resident.rows * 19L + 4L + legacy.lineageCount * 8L + 32L
+
+        private fun physicalStorageReceipt(
+            budget: M3CanonicalStorageBudget,
+            candidate: File,
+        ): M3CompactStorageReceipt {
+            val root = budget.allocatedBytes(File(candidate, ROOT_FILE))
+            val resident = budget.allocatedBytes(File(candidate, RESIDENT_FILE))
+            val directory = budget.allocatedBytes(File(candidate, DIRECTORY_FILE))
+            val pages = budget.allocatedBytes(File(candidate, PAGES_FILE))
+            val tree = budget.allocatedBytes(candidate)
+            val files = Math.addExact(Math.addExact(root, resident), Math.addExact(directory, pages))
+            require(tree >= files)
+            return M3CompactStorageReceipt(root, resident, directory, pages, tree - files)
+        }
+
+        private fun roundPhysical(logical: Long, unit: Long): Long {
+            require(logical >= 0 && unit > 0)
+            return if (logical == 0L) 0L
+            else Math.multiplyExact((logical - 1L) / unit + 1L, unit)
+        }
 
         /** Writes one fixed page at a time; the historical corpus is never assembled in RAM. */
         private fun writePages(
@@ -780,7 +827,7 @@ private constructor(
             entries: M3CompactDirectory,
             storage: M3CompactStorageReceipt,
         ): M3CompactCanonicalStore {
-            val idOrder = IntArray(configuration.surfaceCapacity) { it }
+            val pageRanges = buildPageRanges(configuration, resident)
             val cut =
                 M3CompactCanonicalCut(
                     group,
@@ -807,8 +854,10 @@ private constructor(
                 resident.rowZ,
                 resident.rowNormal,
                 resident.rowConfidence,
-                idOrder,
+                resident.idOrder,
+                resident.voxelOrder,
                 resident.pageOrder,
+                pageRanges,
                 resident.lineageSource,
                 resident.lineageTarget,
                 entries,
@@ -886,6 +935,66 @@ internal fun compareVoxel(ax: Int, ay: Int, az: Int, bx: Int, by: Int, bz: Int) 
         else -> az.compareTo(bz)
     }
 
+internal fun compareLocation(
+    ax: Int, ay: Int, az: Int, ap: Int,
+    bx: Int, by: Int, bz: Int, bp: Int,
+) = when {
+    ax != bx -> ax.compareTo(bx)
+    ay != by -> ay.compareTo(by)
+    az != bz -> az.compareTo(bz)
+    else -> ap.compareTo(bp)
+}
+
+internal fun compareLocationThenVoxel(
+    configuration: M3SurfaceOwnershipConfiguration,
+    x: IntArray,
+    y: IntArray,
+    z: IntArray,
+    left: Int,
+    right: Int,
+): Int {
+    val a = requireNotNull(m3CompactLocation(configuration, M3Voxel(x[left], y[left], z[left])))
+    val b = requireNotNull(m3CompactLocation(configuration, M3Voxel(x[right], y[right], z[right])))
+    val location = compareLocation(
+        a.region.x, a.region.y, a.region.z, a.page,
+        b.region.x, b.region.y, b.region.z, b.page,
+    )
+    return if (location != 0) location
+    else compareVoxel(x[left], y[left], z[left], x[right], y[right], z[right])
+}
+
+private fun buildPageRanges(
+    configuration: M3SurfaceOwnershipConfiguration,
+    resident: M3CompactResident,
+): M3CompactPageRanges {
+    val ranges = M3CompactPageRanges(configuration.surfaceCapacity)
+    var start = 0
+    while (start < resident.rows) {
+        val slot = resident.pageOrder[start]
+        val location = requireNotNull(
+            m3CompactLocation(
+                configuration,
+                M3Voxel(resident.rowX[slot], resident.rowY[slot], resident.rowZ[slot]),
+            )
+        )
+        var end = start + 1
+        while (end < resident.rows) {
+            val next = resident.pageOrder[end]
+            val nextLocation = requireNotNull(
+                m3CompactLocation(
+                    configuration,
+                    M3Voxel(resident.rowX[next], resident.rowY[next], resident.rowZ[next]),
+                )
+            )
+            if (nextLocation != location) break
+            end++
+        }
+        ranges.append(location, start, end - start)
+        start = end
+    }
+    return ranges
+}
+
 internal fun IntArray.sortIndices(count: Int, compare: (Int, Int) -> Int) {
     fun sift(rootStart: Int, endExclusive: Int) {
         var root = rootStart
@@ -911,6 +1020,21 @@ internal fun IntArray.sortIndices(count: Int, compare: (Int, Int) -> Int) {
 }
 
 private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
+
+private fun m3PhysicalAllocatedTreeBytes(path: File): Long {
+    fun allocated(file: File): Long {
+        val unix = try {
+            (Files.getAttribute(file.toPath(), "unix:blocks") as Number).toLong() * 512L
+        } catch (_: Exception) { null }
+        if (unix != null) return unix
+        val unit = Files.getFileStore(file.toPath()).blockSize.coerceAtLeast(1L)
+        val logical = if (file.isDirectory) unit else file.length()
+        return if (logical == 0L) 0L
+        else Math.multiplyExact((logical - 1L) / unit + 1L, unit)
+    }
+    if (!path.isDirectory) return allocated(path)
+    return path.walkTopDown().fold(0L) { total, file -> Math.addExact(total, allocated(file)) }
+}
 
 private fun M3CompactDirectory.sourcePageCount(): Int {
     var count = 0

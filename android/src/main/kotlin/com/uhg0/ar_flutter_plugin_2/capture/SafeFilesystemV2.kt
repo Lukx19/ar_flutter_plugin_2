@@ -39,6 +39,8 @@ interface DescriptorFilesystemV2 : AutoCloseable {
     fun isRegularFile(segments: List<String>): Boolean
     fun isDirectory(segments: List<String>): Boolean
     fun size(segments: List<String>): Long
+    /** Physical filesystem blocks retained by this file or directory. */
+    fun allocatedSize(segments: List<String>): Long
     fun openRead(segments: List<String>): DescriptorFileV2
     fun createExclusive(segments: List<String>): DescriptorFileV2
     fun atomicReplace(parent: List<String>, from: String, to: String)
@@ -57,6 +59,7 @@ object AndroidDescriptorNativeV2 {
     external fun nativeIsRegular(root: Long, segments: Array<String>): Boolean
     external fun nativeIsDirectory(root: Long, segments: Array<String>): Boolean
     external fun nativeSize(root: Long, segments: Array<String>): Long
+    external fun nativeAllocatedSize(root: Long, segments: Array<String>): Long
     external fun nativeOpenRead(root: Long, segments: Array<String>): Long
     external fun nativeCreateExclusive(root: Long, segments: Array<String>): Long
     external fun nativeRead(descriptor: Long, bytes: ByteArray, offset: Int, count: Int): Int
@@ -90,6 +93,9 @@ class AndroidDescriptorFilesystemV2 private constructor(private val rootDescript
     override fun isRegularFile(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeIsRegular(it, segments.toTypedArray()) }
     override fun isDirectory(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeIsDirectory(it, segments.toTypedArray()) }
     override fun size(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeSize(it, segments.toTypedArray()) }
+    override fun allocatedSize(segments: List<String>) = withRoot {
+        AndroidDescriptorNativeV2.nativeAllocatedSize(it, segments.toTypedArray())
+    }
     override fun openRead(segments: List<String>): DescriptorFileV2 =
         withRoot { AndroidNativeFileV2(AndroidDescriptorNativeV2.nativeOpenRead(it, segments.toTypedArray())) }
     override fun createExclusive(segments: List<String>): DescriptorFileV2 =
@@ -141,6 +147,19 @@ class JvmDescriptorFilesystemV2(
     override fun isRegularFile(segments: List<String>) = synchronized(lock) { resolveParent(segments)?.let { Files.isRegularFile(File(it, segments.last()).toPath(), LinkOption.NOFOLLOW_LINKS) } ?: false }
     override fun isDirectory(segments: List<String>) = synchronized(lock) { resolveDirectory(segments) != null }
     override fun size(segments: List<String>) = synchronized(lock) { openChannel(segments, StandardOpenOption.READ).use(FileChannel::size) }
+    override fun allocatedSize(segments: List<String>) = synchronized(lock) {
+        val file = requireNotNull(resolveExisting(segments))
+        val unixBlocks = try {
+            (Files.getAttribute(file.toPath(), "unix:blocks", LinkOption.NOFOLLOW_LINKS) as Number)
+                .toLong() * 512L
+        } catch (_: Exception) { null }
+        unixBlocks ?: run {
+            val block = Files.getFileStore(file.toPath()).blockSize.coerceAtLeast(1L)
+            val logical = if (Files.isDirectory(file.toPath(), LinkOption.NOFOLLOW_LINKS)) block
+                else Files.size(file.toPath())
+            if (logical == 0L) 0L else Math.multiplyExact((logical - 1L) / block + 1L, block)
+        }
+    }
     override fun openRead(segments: List<String>): DescriptorFileV2 = synchronized(lock) { JvmDescriptorFileV2(openChannel(segments, StandardOpenOption.READ)) }
     override fun createExclusive(segments: List<String>): DescriptorFileV2 = synchronized(lock) { JvmDescriptorFileV2(openChannel(segments, StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW)) }
     override fun atomicReplace(parent: List<String>, from: String, to: String) = synchronized(lock) {
@@ -164,6 +183,12 @@ class JvmDescriptorFilesystemV2(
         return FileChannel.open(final.toPath(), *openOptions)
     }
     private fun resolveParent(segments: List<String>) = if (segments.isEmpty()) null else resolveDirectory(segments.dropLast(1))
+    private fun resolveExisting(segments: List<String>): File? {
+        if (segments.isEmpty()) return root()
+        val parent = resolveParent(segments) ?: return null
+        val value = File(parent, segments.last())
+        return value.takeIf { Files.exists(it.toPath(), LinkOption.NOFOLLOW_LINKS) }
+    }
     private fun resolveDirectory(segments: List<String>): File? {
         var current = root()
         segments.forEach { segment ->
@@ -207,6 +232,9 @@ class SafeFilesystemV2(
     fun ensureDirectory(directory: File) = backend.ensureDirectory(relative(directory))
     fun isFile(file: File) = backend.isRegularFile(relative(file))
     fun length(file: File) = backend.size(relative(file))
+    fun allocatedLength(file: File) = backend.allocatedSize(relative(file))
+    fun allocatedTreeBytes(directory: File): Long =
+        walk(directory).fold(0L) { total, file -> Math.addExact(total, allocatedLength(file)) }
     fun readBytes(file: File): ByteArray {
         val output = ByteArrayOutputStream(); backend.openRead(relative(file)).use { descriptor ->
             val buffer = ByteArray(64 * 1024)
