@@ -22,6 +22,8 @@ internal class CoverageCubeMeshResources(
     private val engine: Engine,
     override val capacity: Int,
     voxelSizeMeters: Float,
+    private val telemetry: RendererTelemetry? = null,
+    private val telemetryOwner: String = "coverage-cubes",
 ) : CoverageVoxelMeshResources {
     private val halfSize = voxelSizeMeters / 2f
     private val vertexCapacity = capacity * VERTICES_PER_VOXEL
@@ -61,13 +63,30 @@ internal class CoverageCubeMeshResources(
         capacity = capacity,
         halfSize = halfSize,
         uploader = FilamentCoverageCubeVertexUploader(engine, vertexBuffer),
+        onUploadAttributed = { bytes, origin -> telemetry?.recordUpload(bytes, origin) },
+        onResourceResetScheduled = { telemetry?.recordResourceResetScheduled() },
+        onUploadCallbackAttributed = { origin -> telemetry?.recordUploadCallback(origin) },
+        onUploadCompletedAttributed = { elapsedNanos, origin ->
+            telemetry?.recordUploadCompletion(elapsedNanos, origin)
+        },
+        onDestroyedUploadCallback = {
+            telemetry?.recordFencedDestroyedUploadCallback()
+        },
+        onUploadPageReleased = { onUploadPageReleased() },
     )
     private var indexStaging: java.nio.IntBuffer? = null
     private var outlineIndexStaging: java.nio.IntBuffer? = null
+    private val allocationLedger = telemetry?.let(::CoverageRendererAllocationLedger)
     private var lastRevision = Long.MIN_VALUE
+    private var retainedSnapshotUploadRequired = true
     private var destroyed = false
+    @Volatile private var onUploadPageReleased: () -> Unit = {}
 
     init {
+        // The two direct index buffers remain live until their independent
+        // Filament callbacks. Account for them as startup owners rather than
+        // folding a transient allocation into the steady mesh owner.
+        allocationLedger?.installCubeResources(telemetryOwner, capacity)
         val indices = ByteBuffer.allocateDirect(indexCapacity * Int.SIZE_BYTES)
             .order(ByteOrder.nativeOrder())
             .asIntBuffer()
@@ -83,7 +102,10 @@ internal class CoverageCubeMeshResources(
             0,
             indexCapacity,
             Handler(Looper.getMainLooper()),
-        ) { indexStaging = null }
+        ) {
+            indexStaging = null
+            allocationLedger?.completeCubeTriangleStartup(telemetryOwner)
+        }
 
         val outlineIndices = ByteBuffer
             .allocateDirect(outlineIndexCapacity * Int.SIZE_BYTES)
@@ -103,7 +125,10 @@ internal class CoverageCubeMeshResources(
             0,
             outlineIndexCapacity,
             Handler(Looper.getMainLooper()),
-        ) { outlineIndexStaging = null }
+        ) {
+            outlineIndexStaging = null
+            allocationLedger?.completeCubeOutlineStartup(telemetryOwner)
+        }
     }
 
     override fun update(
@@ -112,26 +137,44 @@ internal class CoverageCubeMeshResources(
         materialInstance: MaterialInstance,
         pointSizePx: Float,
     ) {
-        check(snapshot.capacity == capacity)
-        check(snapshot.count in 0..capacity)
-        check(snapshot.positions.size == snapshot.count * POSITION_COMPONENTS)
-        check(snapshot.colors.size == snapshot.count)
-        if (snapshot.revision != lastRevision) {
-            if (snapshot.count > 0) {
-                uploadCoordinator.submit(snapshot)
+        // The native visibility renderer already admits the active mode's
+        // bounded stable rows. Keep this mesh as an upload-only consumer.
+        val presentation = snapshot
+        check(presentation.capacity == capacity)
+        check(presentation.count in 0..capacity)
+        check(presentation.positions.size == presentation.count * POSITION_COMPONENTS)
+        check(presentation.colors.size == presentation.count)
+        if (presentation.revision != lastRevision || retainedSnapshotUploadRequired) {
+            if (presentation.count > 0) {
+                if (retainedSnapshotUploadRequired) {
+                    uploadCoordinator.submitForResourceGeneration(presentation)
+                } else {
+                    uploadCoordinator.submit(presentation)
+                }
             }
-            lastRevision = snapshot.revision
+            lastRevision = presentation.revision
+            retainedSnapshotUploadRequired = false
         }
         setDrawCount(
             node,
-            if (snapshot.enabled) snapshot.count else 0,
+            if (presentation.enabled) presentation.count else 0,
         )
-        node.isVisible = snapshot.enabled && snapshot.count > 0
+        node.isVisible = presentation.enabled && presentation.count > 0
     }
 
     override fun hide(node: Node) {
         setDrawCount(node, 0)
         node.isVisible = false
+    }
+
+    override fun requireRetainedSnapshotUpload() {
+        retainedSnapshotUploadRequired = true
+    }
+
+    override fun onRendererFrame() = uploadCoordinator.onRendererFrame()
+
+    override fun setOnUploadPageReleased(listener: () -> Unit) {
+        onUploadPageReleased = listener
     }
 
     private fun setDrawCount(node: Node, voxelCount: Int) {
@@ -159,9 +202,11 @@ internal class CoverageCubeMeshResources(
     override fun destroy() {
         if (destroyed) return
         destroyed = true
+        onUploadPageReleased = {}
         uploadCoordinator.destroy()
         indexStaging = null
         outlineIndexStaging = null
+        allocationLedger?.releaseCubeResources(telemetryOwner)
         engine.destroyVertexBuffer(vertexBuffer)
         engine.destroyIndexBuffer(indexBuffer)
         engine.destroyIndexBuffer(outlineIndexBuffer)
@@ -176,6 +221,14 @@ internal class CoverageCubeMeshResources(
         const val INDICES_PER_VOXEL = 36
         const val OUTLINE_INDICES_PER_VOXEL = 24
         const val OUTLINE_PRIMITIVE_INDEX = 1
+        const val STEADY_OWNED_BYTES_PER_VOXEL = 496
+        const val TRIANGLE_INDEX_STAGING_BYTES_PER_VOXEL = INDICES_PER_VOXEL * Int.SIZE_BYTES
+        const val OUTLINE_INDEX_STAGING_BYTES_PER_VOXEL =
+            OUTLINE_INDICES_PER_VOXEL * Int.SIZE_BYTES
+        const val PEAK_OWNED_BYTES_PER_VOXEL =
+            STEADY_OWNED_BYTES_PER_VOXEL +
+                TRIANGLE_INDEX_STAGING_BYTES_PER_VOXEL +
+                OUTLINE_INDEX_STAGING_BYTES_PER_VOXEL
 
         // Two triangles per cube face, using the eight corners in the order:
         // (-,-,-), (+,-,-), (+,+,-), (-,+,-), (-,-,+), (+,-,+), (+,+,+), (-,+,+).
@@ -227,6 +280,16 @@ internal class CoverageCubeMeshResources(
         capacity: Int,
         private val halfSize: Float,
         private val uploader: CoverageCubeVertexUploader,
+        private val onUploadSubmitted: (Int) -> Unit = {},
+        private val onUploadAttributed: (Int, RendererUploadPageOrigin) -> Unit = { _, _ -> },
+        private val onResourceResetScheduled: () -> Unit = {},
+        private val onUploadCallback: () -> Unit = {},
+        private val onUploadCallbackAttributed: (RendererUploadPageOrigin) -> Unit = {},
+        private val onUploadCompleted: (Long) -> Unit = {},
+        private val onUploadCompletedAttributed: (Long, RendererUploadPageOrigin) -> Unit = { _, _ -> },
+        private val onDestroyedUploadCallback: () -> Unit = {},
+        private val onUploadPageReleased: () -> Unit = {},
+        private val clockNanos: () -> Long = System::nanoTime,
     ) {
         private val positionBuffer = ByteBuffer.allocateDirect(
             capacity * VERTICES_PER_VOXEL * POSITION_COMPONENTS * Float.SIZE_BYTES,
@@ -234,44 +297,147 @@ internal class CoverageCubeMeshResources(
         private val colorBuffer = ByteBuffer.allocateDirect(
             capacity * VERTICES_PER_VOXEL * COLOR_COMPONENTS,
         ).order(ByteOrder.nativeOrder())
-        private var pendingSnapshot: CoveragePointRenderSnapshot? = null
+        private data class PendingUpload(
+            val snapshot: CoveragePointRenderSnapshot,
+            val origin: RendererUploadPageOrigin,
+        )
+
+        private val pendingUploads = ArrayDeque<PendingUpload>()
         private var uploadBusy = false
         private var consumedCallbackMask = 0
         private var activeUploadId = 0L
         private var destroyed = false
-
+        private var activeUploadStartedNanos = 0L
+        private var activeSnapshot: CoveragePointRenderSnapshot? = null
+        private var activeOrigin = RendererUploadPageOrigin.ORDINARY
+        private val pendingRanges = ArrayDeque<UploadRange>()
+        // A completed reset establishes the mesh baseline. Afterwards a
+        // coalesced ordinary revision can retain its exact dirty spans.
+        private var hasUploadedSnapshot = false
+        private var activeFullUpload = false
         fun submit(snapshot: CoveragePointRenderSnapshot) {
+            enqueue(snapshot, RendererUploadPageOrigin.ORDINARY)
+        }
+
+        private fun enqueue(
+            snapshot: CoveragePointRenderSnapshot,
+            origin: RendererUploadPageOrigin,
+        ) {
             if (destroyed) return
-            pendingSnapshot = snapshot
-            drain()
+            val normalized =
+                if (!hasUploadedSnapshot &&
+                    (uploadBusy || pendingRanges.isNotEmpty() || pendingUploads.isNotEmpty()) &&
+                    snapshot.update?.reset == false
+                ) {
+                    snapshot.copy(update = snapshot.update.copy(reset = true))
+                } else {
+                    snapshot
+                }
+            if (origin == RendererUploadPageOrigin.ORDINARY &&
+                pendingUploads.lastOrNull()?.origin == RendererUploadPageOrigin.ORDINARY
+            ) {
+                pendingUploads.removeLast()
+            }
+            pendingUploads.addLast(PendingUpload(normalized, origin))
+            if (uploadBusy) pendingRanges.clear()
+        }
+
+        /** Rehydrates a new Filament resource generation from the retained cut. */
+        fun submitForResourceGeneration(snapshot: CoveragePointRenderSnapshot) {
+            if (destroyed) return
+            onResourceResetScheduled()
+            enqueue(
+                snapshot.copy(update = snapshot.update?.copy(reset = true)),
+                RendererUploadPageOrigin.RESOURCE_GENERATION_RESET,
+            )
         }
 
         fun destroy() {
             destroyed = true
-            pendingSnapshot = null
+            pendingUploads.clear()
+            activeSnapshot = null
+            pendingRanges.clear()
+            activeFullUpload = false
+        }
+
+        fun onRendererFrame() {
+            drain()
         }
 
         private fun drain() {
             if (destroyed || uploadBusy) return
-            val snapshot = pendingSnapshot ?: return
-            pendingSnapshot = null
-            write(snapshot)
+            if (pendingRanges.isEmpty()) {
+                val pending = pendingUploads.removeFirstOrNull() ?: return
+                val snapshot = pending.snapshot
+                val update = snapshot.update
+                val fullUpload = !hasUploadedSnapshot || update == null || update.reset
+                val spans = update?.spans.orEmpty()
+                if (!fullUpload && spans.isEmpty()) return
+                activeSnapshot = snapshot
+                activeFullUpload = fullUpload
+                activeOrigin = pending.origin
+                pendingRanges.addAll(
+                    uploadRanges(
+                        count = snapshot.count,
+                        fullUpload = fullUpload,
+                        spans = spans,
+                    ),
+                )
+            }
+            val snapshot = checkNotNull(activeSnapshot)
+            val range = pendingRanges.removeFirstOrNull() ?: return
+            writeRange(snapshot, range.startSlot, range.endSlotExclusive)
             uploadBusy = true
             consumedCallbackMask = 0
+            activeUploadStartedNanos = clockNanos()
             val uploadId = ++activeUploadId
-            val vertexCount = snapshot.count * VERTICES_PER_VOXEL
-            uploader.uploadPositions(positionBuffer, vertexCount * POSITION_COMPONENTS) {
+            val startVertex = range.startSlot * VERTICES_PER_VOXEL
+            val vertexCount =
+                (range.endSlotExclusive - range.startSlot) * VERTICES_PER_VOXEL
+            onUploadSubmitted(
+                vertexCount * (POSITION_COMPONENTS * Float.SIZE_BYTES + COLOR_COMPONENTS),
+            )
+            onUploadAttributed(
+                vertexCount * (POSITION_COMPONENTS * Float.SIZE_BYTES + COLOR_COMPONENTS),
+                activeOrigin,
+            )
+            uploader.uploadPositions(
+                positionBuffer,
+                startVertex * POSITION_COMPONENTS * Float.SIZE_BYTES,
+                vertexCount * POSITION_COMPONENTS,
+            ) {
                 consumed(uploadId, POSITION_CALLBACK)
             }
-            uploader.uploadColors(colorBuffer, vertexCount * COLOR_COMPONENTS) {
+            uploader.uploadColors(
+                colorBuffer,
+                startVertex * COLOR_COMPONENTS,
+                vertexCount * COLOR_COMPONENTS,
+            ) {
                 consumed(uploadId, COLOR_CALLBACK)
             }
+            // Submit the paired position/color page as one bounded unit. The
+            // direct buffers remain owned until Filament delivers both real
+            // consumption callbacks.
+            uploader.completeSubmissionFence()
         }
 
-        private fun write(snapshot: CoveragePointRenderSnapshot) {
-            positionBuffer.clear()
-            colorBuffer.clear()
-            for (voxel in 0 until snapshot.count) {
+        private fun writeRange(
+            snapshot: CoveragePointRenderSnapshot,
+            startSlot: Int,
+            endSlotExclusive: Int,
+        ) {
+            val firstPosition = startSlot * VERTICES_PER_VOXEL * POSITION_COMPONENTS
+            val lastPosition =
+                endSlotExclusive * VERTICES_PER_VOXEL * POSITION_COMPONENTS
+            val positionTarget = positionBuffer.duplicate()
+            positionTarget.clear()
+            positionTarget.position(firstPosition)
+            val firstColor = startSlot * VERTICES_PER_VOXEL * COLOR_COMPONENTS
+            val lastColor = endSlotExclusive * VERTICES_PER_VOXEL * COLOR_COMPONENTS
+            val colorTarget = colorBuffer.duplicate()
+            colorTarget.clear()
+            colorTarget.position(firstColor)
+            for (voxel in startSlot until endSlotExclusive) {
                 val sourceOffset = voxel * POSITION_COMPONENTS
                 val x = snapshot.positions[sourceOffset]
                 val y = snapshot.positions[sourceOffset + 1]
@@ -283,42 +449,92 @@ internal class CoverageCubeMeshResources(
                     val localX = CUBE_CORNERS[cornerOffset] * halfSize
                     val localY = CUBE_CORNERS[cornerOffset + 1] * halfSize
                     val localZ = CUBE_CORNERS[cornerOffset + 2] * halfSize
-                    positionBuffer.put(
+                    positionTarget.put(
                         x + rotation[0] * localX +
                             rotation[3] * localY +
                             rotation[6] * localZ,
                     )
-                    positionBuffer.put(
+                    positionTarget.put(
                         y + rotation[1] * localX +
                             rotation[4] * localY +
                             rotation[7] * localZ,
                     )
-                    positionBuffer.put(
+                    positionTarget.put(
                         z + rotation[2] * localX +
                             rotation[5] * localY +
                             rotation[8] * localZ,
                     )
-                    colorBuffer.put((color shr 16 and 0xFF).toByte())
-                    colorBuffer.put((color shr 8 and 0xFF).toByte())
-                    colorBuffer.put((color and 0xFF).toByte())
-                    colorBuffer.put((color ushr 24 and 0xFF).toByte())
+                    colorTarget.put((color shr 16 and 0xFF).toByte())
+                    colorTarget.put((color shr 8 and 0xFF).toByte())
+                    colorTarget.put((color and 0xFF).toByte())
+                    colorTarget.put((color ushr 24 and 0xFF).toByte())
                 }
             }
-            positionBuffer.flip()
-            colorBuffer.flip()
+            positionBuffer.clear()
+            positionBuffer.position(firstPosition)
+            positionBuffer.limit(lastPosition)
+            colorBuffer.clear()
+            colorBuffer.position(firstColor)
+            colorBuffer.limit(lastColor)
         }
 
         private fun consumed(uploadId: Long, callbackBit: Int) {
-            if (destroyed || !uploadBusy || uploadId != activeUploadId) return
+            if (destroyed) {
+                onDestroyedUploadCallback()
+                return
+            }
+            if (!uploadBusy || uploadId != activeUploadId) return
             if (consumedCallbackMask and callbackBit != 0) return
+            onUploadCallback()
+            onUploadCallbackAttributed(activeOrigin)
             consumedCallbackMask = consumedCallbackMask or callbackBit
             if (consumedCallbackMask == BOTH_CALLBACKS) {
+                val elapsedNanos = (clockNanos() - activeUploadStartedNanos).coerceAtLeast(0L)
+                onUploadCompleted(elapsedNanos)
+                onUploadCompletedAttributed(elapsedNanos, activeOrigin)
                 uploadBusy = false
-                drain()
+                if (pendingRanges.isEmpty()) {
+                    if (activeFullUpload) hasUploadedSnapshot = true
+                    activeSnapshot = null
+                }
+                onUploadPageReleased()
+                // A completed callback only releases the page. The next page
+                // is admitted by a distinct rendered frame.
             }
         }
 
+        private fun uploadRanges(
+            count: Int,
+            fullUpload: Boolean,
+            spans: List<com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan>,
+        ): List<UploadRange> {
+            val sourceRanges =
+                if (fullUpload) {
+                    listOf(UploadRange(0, count))
+                } else {
+                    spans.map { span ->
+                        UploadRange(span.startSlot, span.startSlot + span.colors.size)
+                    }
+                }
+            return buildList {
+                sourceRanges.forEach { range ->
+                    var start = range.startSlot
+                    while (start < range.endSlotExclusive) {
+                        val end = minOf(start + MAX_VOXELS_PER_UPLOAD, range.endSlotExclusive)
+                        add(UploadRange(start, end))
+                        start = end
+                    }
+                }
+            }
+        }
+
+        private data class UploadRange(val startSlot: Int, val endSlotExclusive: Int)
+
         private companion object {
+            const val MAX_VOXELS_PER_UPLOAD =
+                RendererTelemetry.ORDINARY_UPLOAD_LIMIT_BYTES /
+                    (VERTICES_PER_VOXEL *
+                        (POSITION_COMPONENTS * Float.SIZE_BYTES + COLOR_COMPONENTS))
             const val POSITION_CALLBACK = 1
             const val COLOR_CALLBACK = 2
             const val BOTH_CALLBACKS = POSITION_CALLBACK or COLOR_CALLBACK
@@ -326,8 +542,21 @@ internal class CoverageCubeMeshResources(
     }
 
     internal interface CoverageCubeVertexUploader {
-        fun uploadPositions(buffer: FloatBuffer, elementCount: Int, onConsumed: () -> Unit)
-        fun uploadColors(buffer: ByteBuffer, byteCount: Int, onConsumed: () -> Unit)
+        fun uploadPositions(
+            buffer: FloatBuffer,
+            destOffsetBytes: Int,
+            elementCount: Int,
+            onConsumed: () -> Unit,
+        )
+        fun uploadColors(
+            buffer: ByteBuffer,
+            destOffsetBytes: Int,
+            byteCount: Int,
+            onConsumed: () -> Unit,
+        )
+
+        /** Completes this bounded paired page's driver submission. */
+        fun completeSubmissionFence() = Unit
     }
 
     private class FilamentCoverageCubeVertexUploader(
@@ -338,6 +567,7 @@ internal class CoverageCubeMeshResources(
 
         override fun uploadPositions(
             buffer: FloatBuffer,
+            destOffsetBytes: Int,
             elementCount: Int,
             onConsumed: () -> Unit,
         ) {
@@ -345,7 +575,7 @@ internal class CoverageCubeMeshResources(
                 engine,
                 POSITION_BUFFER_INDEX,
                 buffer,
-                0,
+                destOffsetBytes,
                 elementCount,
                 callbackHandler,
                 Runnable(onConsumed),
@@ -354,6 +584,7 @@ internal class CoverageCubeMeshResources(
 
         override fun uploadColors(
             buffer: ByteBuffer,
+            destOffsetBytes: Int,
             byteCount: Int,
             onConsumed: () -> Unit,
         ) {
@@ -361,11 +592,15 @@ internal class CoverageCubeMeshResources(
                 engine,
                 COLOR_BUFFER_INDEX,
                 buffer,
-                0,
+                destOffsetBytes,
                 byteCount,
                 callbackHandler,
                 Runnable(onConsumed),
             )
+        }
+
+        override fun completeSubmissionFence() {
+            engine.flushAndWait()
         }
     }
 }

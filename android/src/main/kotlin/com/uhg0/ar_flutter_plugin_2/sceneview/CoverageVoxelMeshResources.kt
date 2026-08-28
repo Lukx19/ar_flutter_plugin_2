@@ -24,5 +24,29 @@ internal interface CoverageVoxelMeshResources {
     /** Removes this mesh from the next draw without destroying retained buffers. */
     fun hide(node: Node)
 
+    /** Queues a full retained-snapshot upload for this resource generation. */
+    fun requireRetainedSnapshotUpload()
+
+    fun onRendererFrame()
+
+    /** Invoked only after both native buffer-consumption callbacks release a page. */
+    fun setOnUploadPageReleased(listener: () -> Unit)
+
     fun destroy()
+}
+
+/**
+ * Releases the outgoing resource before a mutually-exclusive mode can create
+ * its replacement. Compose may have detached the Node before the binding's
+ * disposal callback runs; that must not defer a ledger-charged resource.
+ */
+internal fun disposeCoverageResourcesForReplacement(
+    node: Node?,
+    resources: CoverageVoxelMeshResources,
+) {
+    if (node != null) {
+        node.destroy()
+    } else {
+        resources.destroy()
+    }
 }

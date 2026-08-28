@@ -8,9 +8,12 @@ import android.media.Image
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Debug
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
 import android.util.Size
+import java.io.ByteArrayInputStream
 import android.view.Surface
 import com.google.ar.core.TrackingState
 import com.google.android.filament.Stream
@@ -21,6 +24,8 @@ import com.uhg0.ar_flutter_plugin_2.sceneview.SceneViewCaptureHost
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.concurrent.Executor
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -37,9 +42,11 @@ internal class ArCaptureSession(
     private val onObservedControlStateChanged: (ArCaptureSession) -> Unit = {},
     private val onCaptureAccepted: (Map<String, Any?>) -> Unit = {},
     private val onCaptureFinalized: (Map<String, Any?>) -> Unit = {},
+    private val captureSafetySignalV2: CaptureSafetySignalV2 = CaptureSafetySignalV2(),
 ) {
     companion object {
         private const val TrackingPoseReadyTimeoutMs = 2_000L
+        private const val NativeCaptureCloseTimeoutMs = 1_000L
     }
 
     private var config: CaptureConfig? = null
@@ -48,6 +55,26 @@ internal class ArCaptureSession(
     private val resourceCounters = CaptureResourceCounters()
     private val poseDataExtractor = PoseDataExtractor()
     private var sharedCameraManager: SharedCameraManager? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val disposed = AtomicBoolean(false)
+    private var disposeStarted = false
+    private var disposeResult: Result<Unit>? = null
+    private val disposeCallbacks = mutableListOf<(Result<Unit>) -> Unit>()
+    private val nativeCaptureSerialOwnerV2 = NativeCaptureSerialOwnerV2(
+        completionExecutor = Executor { command -> mainHandler.post(command) },
+    )
+    // Constructed per view now; #102 only provides a future native admission caller.
+    private val nativeCaptureBindingV2 = NativeCaptureBindingV2(
+        sceneHost.context,
+        captureSafetySignalV2,
+        events = { event ->
+            mainHandler.post {
+                if (!disposed.get()) {
+                    captureChannel.invokeMethod("onNativeCaptureV2Event", NativeCaptureWireV2.event(event))
+                }
+            }
+        },
+    )
     private var sharedImageCacheManager: ImageCacheManager? = null
     private var highResCaptureEnabled = false
     private var poseSequence = 0L
@@ -214,6 +241,7 @@ internal class ArCaptureSession(
                 try {
                     manager.initialize(imageCacheManager)
                     sharedCameraManager = manager
+                    nativeCaptureBindingV2.attachSharedCamera(manager)
                     break
                 } catch (error: Exception) {
                     startupError = error
@@ -694,17 +722,161 @@ internal class ArCaptureSession(
         )
     }
 
-    fun onSessionPaused() {
-        sharedCameraManager?.onArSessionPaused()
+    fun prepareNativeCaptureForPause(onCompleted: (Result<Unit>) -> Unit): Boolean =
+        nativeCaptureSerialOwnerV2.submit(
+            operation = { nativeCaptureBindingV2.onPause() },
+            completion = onCompleted,
+        )
+
+    /** Scalar-only V2 admission. Component descriptors and bytes are native post-output authority. */
+    fun admitNativeCaptureV2(
+        arguments: Any?,
+        onCompleted: (Result<Map<String, Any?>>) -> Unit,
+    ): Boolean = nativeCaptureSerialOwnerV2.submit(
+        operation = {
+            val request = NativeCaptureWireV2.decodeAdmission(arguments)
+            val receipt = nativeCaptureBindingV2.admit(request)
+            mapOf(
+                "wireVersion" to "native_capture_v2",
+                "attemptId" to receipt.identity.attemptId,
+                "phase" to receipt.phase.name.lowercase(),
+                "durable" to receipt.durable,
+                "terminal" to receipt.terminal?.let { terminal ->
+                    NativeCaptureWireV2.event(
+                        NativeCaptureEventV2(
+                            if (terminal.kind == CaptureTerminalKind.COMMITTED_PICTURE) {
+                                NativeCaptureEventKindV2.COMMITTED
+                            } else {
+                                NativeCaptureEventKindV2.ABANDONED
+                            },
+                            terminal.identity.attemptId,
+                            terminal.captureId,
+                            terminal.captureRevision,
+                            terminal.manifestId,
+                            terminal.reason,
+                            recoveryContext = request.recoveryContext,
+                        ),
+                    )
+                },
+            )
+        },
+        completion = onCompleted,
+    )
+
+    fun nativeCaptureHealthV2(): Map<String, Any?> = NativeCaptureWireV2.event(
+        NativeCaptureEventV2(NativeCaptureEventKindV2.HEALTH, resources = nativeCaptureBindingV2.snapshot()),
+    )
+
+    fun replayNativeCaptureRecoveryV2(): List<Map<String, Any?>> =
+        nativeCaptureBindingV2.replayRecovery().map(NativeCaptureWireV2::event)
+
+    fun acknowledgeNativeCaptureTerminalV2(attemptId: String) {
+        nativeCaptureBindingV2.acknowledgeTerminal(attemptId)
     }
+
+    fun advanceNativeCaptureRecoveryV2() = nativeCaptureBindingV2.forceRecoveryForDebug()
+
+    fun notifyNativeCaptureLifecycleV2(
+        event: String,
+        onCompleted: (Result<Unit>) -> Unit,
+    ): Boolean {
+        val parsed = when (event) {
+            "automaticDisabled" -> CaptureLifecycleEvent.AUTOMATIC_DISABLED
+            "routeLeft" -> CaptureLifecycleEvent.ROUTE_LEFT
+            "processRestarted" -> CaptureLifecycleEvent.PROCESS_RESTARTED
+            else -> throw IllegalArgumentException("Unsupported V2 lifecycle event: $event")
+        }
+        return nativeCaptureSerialOwnerV2.submit(
+            operation = { nativeCaptureBindingV2.onLifecycle(parsed) },
+            completion = onCompleted,
+        )
+    }
+
+    fun installDebugNativeCaptureSyntheticV2(fault: String?): Boolean {
+        require(fault == null || fault in setOf("camera", "hang", "malformed", "store")) {
+            "Unsupported synthetic V2 capture fault"
+        }
+        return nativeCaptureBindingV2.installSyntheticExposureHookForTest(
+            request = { qualifier, required, callback ->
+                when (fault) {
+                    "camera" -> callback.onFailure(qualifier, "synthetic-camera")
+                    "hang" -> Unit
+                    "malformed" -> callback.onComponents(
+                        SharedCameraComponentSetV2(
+                            qualifier,
+                            listOf(
+                                CaptureComponentStreamV2(CaptureComponentKind.JPEG, ByteArrayInputStream(byteArrayOf(1, 2, 3))),
+                                CaptureComponentStreamV2(CaptureComponentKind.JPEG, ByteArrayInputStream(byteArrayOf(4, 5, 6))),
+                            ),
+                            exposureTimestampNanoseconds = 1L,
+                        ),
+                    )
+                    "store" -> callback.onComponents(
+                        SharedCameraComponentSetV2(
+                            qualifier,
+                            required.sortedBy { it.ordinal }.map { kind ->
+                                CaptureComponentStreamV2(kind, object : java.io.InputStream() {
+                                    override fun read(): Int = throw java.io.IOException("synthetic-store-stream")
+                                })
+                            },
+                            exposureTimestampNanoseconds = 1L,
+                        ),
+                    )
+                    else -> callback.onComponents(
+                        SharedCameraComponentSetV2(
+                            qualifier,
+                            required.sortedBy { it.ordinal }.map { kind ->
+                                CaptureComponentStreamV2(kind, ByteArrayInputStream(byteArrayOf(kind.ordinal.toByte(), 7, 9)))
+                            },
+                            exposureTimestampNanoseconds = 1L,
+                        ),
+                    )
+                }
+                true
+            },
+        )
+    }
+
+    fun finishSharedCameraPause() = sharedCameraManager?.onArSessionPaused()
 
     fun onSessionResumed() {
         sharedCameraManager?.onArSessionResumed()
     }
 
-    fun dispose() {
+    fun dispose(onCompleted: (Result<Unit>) -> Unit): Boolean {
+        disposeResult?.let {
+            onCompleted(it)
+            return true
+        }
+        disposeCallbacks += onCompleted
+        if (disposeStarted) return true
+        disposeStarted = true
+        // The binding classifies every owner before the manager closes Camera2.
+        disposed.set(true)
+        val accepted = nativeCaptureSerialOwnerV2.close(
+            timeoutMillis = NativeCaptureCloseTimeoutMs,
+            operation = { nativeCaptureBindingV2.close() },
+            timeoutOperation = { nativeCaptureBindingV2.forceCloseForDeadline() },
+        ) { durableResult ->
+            val cleanupResult = runCatching { disposeMainResources() }
+            val completed = durableResult.exceptionOrNull()?.let(Result.Companion::failure) ?: cleanupResult
+            disposeResult = completed
+            disposeCallbacks.toList().forEach { it(completed) }
+            disposeCallbacks.clear()
+        }
+        if (!accepted) {
+            val failed = Result.failure<Unit>(IllegalStateException("Native capture durable owner is already closing"))
+            disposeResult = failed
+            disposeCallbacks.toList().forEach { it(failed) }
+            disposeCallbacks.clear()
+        }
+        return accepted
+    }
+
+    private fun disposeMainResources() {
         byteCache.dispose()
         sharedCameraManager?.let { manager ->
+            nativeCaptureBindingV2.detachSharedCamera(manager)
             manager.cleanup()
             manager.finishCameraShutdown(1_000L)
         }

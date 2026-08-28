@@ -277,6 +277,67 @@
         "removalKeys": []
       },
       "acknowledgedGeometryRevision": 8
+    },
+    {
+      "name": "synthetic_arcore_arkit_sensor_frames",
+      "pointCloudWireVersion": "pointcloud_wire_v4",
+      "pointClouds": {
+        "arcore": {
+          "sequence": 41,
+          "timestampNs": 3000000000,
+          "ids": [7, 8, 9],
+          "points": [
+            0.02, 0.02, -0.5, 0.95,
+            0.12, 0.02, -0.5, 0.25,
+            0.22, 0.02, -0.5, 0.80
+          ],
+          "minimumConfidence": 0.5,
+          "expectedAcceptedIds": [7, 9]
+        },
+        "arkit": {
+          "sequence": 42,
+          "timestampNs": 3000000100,
+          "identifiers": [101, 102, 103],
+          "points": [
+            0.02, 0.02, -0.5,
+            0.12, 0.02, -0.5,
+            0.22, 0.02, -0.5
+          ],
+          "defaultConfidence": 1.0,
+          "expectedNormalizedIds": [101, 102, 103]
+        }
+      },
+      "depthMaps": {
+        "arcoreRaw": {
+          "orientation": "landscapeRight",
+          "unit": "millimeters",
+          "width": 4,
+          "height": 3,
+          "depthMillimeters": [
+            1000, 0, 1200, 900,
+            1000, 1050, 0, 900,
+            800, 1000, 1100, 0
+          ],
+          "confidence": [
+            255, 0, 200, 127,
+            255, 180, 0, 255,
+            128, 64, 255, 255
+          ],
+          "minimumConfidence": 128,
+          "expectedValidPixelCount": 7
+        },
+        "arkitScene": {
+          "orientation": "portrait",
+          "unit": "meters",
+          "width": 3,
+          "height": 2,
+          "depthMeters": [0.5, 0.0, 1.2, 0.6, 0.8, 0.0],
+          "confidence": ["high", "low", "medium", "medium", "high", "low"],
+          "minimumConfidence": "medium",
+          "expectedValidPixelCount": 4,
+          "expectedOrientedDimensions": [2, 3]
+        }
+      }
     }
   ]
 }

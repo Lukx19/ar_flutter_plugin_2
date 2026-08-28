@@ -15,6 +15,22 @@ class VisibilityGridRawPointRenderTest {
     }
 
     @Test
+    fun `debug synthetic source never acquires ARCore image backed sensor work`() {
+        assertTrue(
+            !shouldAcquireVisibilitySensorWork(
+                trackingState = TrackingState.TRACKING,
+                syntheticSource = true,
+            ),
+        )
+        assertTrue(
+            shouldAcquireVisibilitySensorWork(
+                trackingState = TrackingState.TRACKING,
+                syntheticSource = false,
+            ),
+        )
+    }
+
+    @Test
     fun `accepted feature observations remain available to native raw point rendering`() {
         val observation =
             FeatureObservation(

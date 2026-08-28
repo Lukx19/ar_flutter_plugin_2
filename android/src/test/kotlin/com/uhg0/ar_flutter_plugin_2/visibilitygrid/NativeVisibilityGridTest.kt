@@ -2,10 +2,29 @@ package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
 import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudSample
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class NativeVisibilityGridTest {
+    @Test
+    fun `bounded render selection is ordered without copying the semantic population`() {
+        val grid = NativeVisibilityGrid(VisibilityGridFeatureConfig(stableVoxelCapacity = 100_000))
+        val first = packVisibilityGridKey(1, 0, 0)
+        val second = packVisibilityGridKey(2, 0, 0)
+        val third = packVisibilityGridKey(3, 0, 0)
+        grid.startGroup(
+            group().copy(
+                capacity = 100_000,
+                restoredGeometryRevision = 1,
+                restoredKeys = longArrayOf(third, first, second),
+            ),
+        )
+
+        assertArrayEquals(longArrayOf(first, second), grid.selectedRenderKeys(2))
+        assertEquals(3, grid.snapshot().stableKeys.size)
+    }
+
     @Test
     fun `stable same-id jitter contributes exactly one voxel`() {
         val grid = newGrid()
@@ -170,10 +189,14 @@ class NativeVisibilityGridTest {
         assertEquals(1, first.geometryRevision)
         assertEquals(listOf(packVisibilityGridKey(0, 0, 0)), first.upsertKeys)
         assertTrue(first.removalKeys.isEmpty())
+        // Worker-pull reads this retained value; publication cannot advance
+        // semantic state until that exact revision is acknowledged.
+        assertEquals(first, grid.inFlightGeometryDelta())
         assertEquals(first, grid.takeGeometryDelta(nowNs = 0))
         assertTrue(!grid.ackGeometry(ack(1, groupId = "wrong-group")))
         assertEquals(first, grid.takeGeometryDelta(nowNs = 0))
         assertTrue(grid.ackGeometry(ack(1)))
+        assertEquals(null, grid.inFlightGeometryDelta())
 
         grid.observe(feature(1, 0.200, 0.020, 0.020))
         grid.observe(feature(2, 0.020, 0.020, 0.020))

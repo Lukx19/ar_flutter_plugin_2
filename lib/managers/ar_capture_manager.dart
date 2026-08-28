@@ -15,8 +15,10 @@ import '../models/ar_capture_result.dart';
 import '../models/ar_frame_pose.dart';
 import '../models/camera_resolution.dart';
 import '../models/capture_capacity.dart';
+import '../models/capture_intent_contract.dart';
 import '../models/capture_quality_policy.dart';
 import '../models/image_size.dart';
+import '../models/native_capture_v2.dart';
 import 'ar_session_manager.dart';
 
 /// Available exposure modes
@@ -301,6 +303,10 @@ class ARCaptureManager {
       StreamController.broadcast();
   final StreamController<ProfileApplicationStatus> _profileStatusController =
       StreamController.broadcast();
+  final StreamController<ARNativeCaptureEventV2> _nativeCaptureV2Controller =
+      StreamController.broadcast();
+  final Map<String, String> _nativeCaptureV2TerminalLedger = {};
+  static const int _nativeCaptureV2TerminalLedgerCapacity = 8;
   static const String _profilesKey = 'ar_capture_profiles';
   static const String _profileNotFoundCode = 'PROFILE_NOT_FOUND';
   final ARCaptureConfig _config;
@@ -313,6 +319,7 @@ class ARCaptureManager {
       (Platform.isAndroid || Platform.environment.containsKey('FLUTTER_TEST'));
   bool get isEnabled =>
       !_isDisposed && isSupported && _config.enableHighResCapture;
+  bool get isDisposed => _isDisposed;
   ARCaptureConfig get config => _config;
   CaptureInitializationResult? get initializationResult =>
       _initializationResult;
@@ -368,6 +375,11 @@ class ARCaptureManager {
       _initializationResult = CaptureInitializationResult.fromPlatformValue(
         result,
       );
+      // The native owner may have completed bounded startup recovery before
+      // this Dart handler existed. Pull its scalar replay after attachment.
+      for (final event in await replayNativeCaptureRecoveryV2()) {
+        _publishNativeCaptureV2Event(event);
+      }
 
       debugPrint(
         'ARCaptureManager initialized with config: ${_config.toString()}',
@@ -484,6 +496,123 @@ class ARCaptureManager {
 
   Stream<CaptureCapacity> get captureCapacityStream =>
       _captureCapacityController.stream;
+
+  /// Bounded scalar V2 capture ownership/terminal events. No image data or
+  /// native file paths are representable on this stream.
+  Stream<ARNativeCaptureEventV2> get nativeCaptureV2Events =>
+      _nativeCaptureV2Controller.stream;
+
+  Future<ARNativeCaptureAdmissionResultV2> admitNativeCaptureV2(
+    ARNativeCaptureAdmissionV2 admission,
+  ) async {
+    _throwIfDisposed();
+    await _ensureInitialized();
+    final Map<dynamic, dynamic>? value;
+    try {
+      value = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+        'admitNativeCaptureV2',
+        admission.toMap(),
+      );
+    } on PlatformException catch (error) {
+      throw _captureExceptionFromPlatformException(
+        error,
+        operation: 'admit native V2 capture',
+      );
+    }
+    if (value == null) {
+      throw const ARCaptureException(
+        'Native V2 admission result was missing',
+        code: 'NATIVE_CAPTURE_V2_RESULT_MISSING',
+      );
+    }
+    final result = ARNativeCaptureAdmissionResultV2.fromMap(
+      _deepCastMap(value),
+    );
+    final terminal = result.terminal;
+    if (terminal != null) {
+      _publishNativeCaptureV2Event(terminal);
+    }
+    return result;
+  }
+
+  Future<ARNativeCaptureHealthV2> getNativeCaptureHealthV2() async {
+    _throwIfDisposed();
+    final value = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+      'getNativeCaptureHealthV2',
+    );
+    if (value == null) {
+      throw const ARCaptureException(
+        'Native V2 health result was missing',
+        code: 'NATIVE_CAPTURE_V2_HEALTH_MISSING',
+      );
+    }
+    final event = ARNativeCaptureEventV2.fromMap(_deepCastMap(value));
+    return event.health ??
+        (throw const FormatException('Native V2 health payload was missing.'));
+  }
+
+  Future<List<ARNativeCaptureEventV2>> replayNativeCaptureRecoveryV2() async {
+    _throwIfDisposed();
+    final value = await _channel
+        .invokeMethod<List<dynamic>>('replayNativeCaptureRecoveryV2');
+    // Older/non-Android backends have no V2 owner and return null. Android V2
+    // must return a bounded list once the channel is present.
+    if (value == null) return const [];
+    if (value.length > 2) {
+      throw const ARCaptureException('Native V2 recovery replay was malformed',
+          code: 'NATIVE_CAPTURE_V2_REPLAY_INVALID');
+    }
+    return value.map((item) {
+      if (item is! Map)
+        throw const FormatException('Recovery replay entries must be maps.');
+      return ARNativeCaptureEventV2.fromMap(_deepCastMap(item));
+    }).toList(growable: false);
+  }
+
+  Future<void> acknowledgeNativeCaptureTerminalV2(String attemptId) async {
+    _throwIfDisposed();
+    if (attemptId.isEmpty) throw ArgumentError.value(attemptId, 'attemptId');
+    await _channel.invokeMethod<bool>(
+        'acknowledgeNativeCaptureTerminalV2', {'attemptId': attemptId});
+  }
+
+  Future<void> notifyNativeCaptureLifecycleV2(
+    CaptureLifecycleEvent event,
+  ) async {
+    if (event != CaptureLifecycleEvent.automaticDisabled &&
+        event != CaptureLifecycleEvent.routeLeft &&
+        event != CaptureLifecycleEvent.processRestarted) {
+      throw ArgumentError.value(
+          event, 'event', 'Lifecycle event is native-owned.');
+    }
+    await _channel.invokeMethod<void>(
+      'notifyNativeCaptureLifecycleV2',
+      <String, Object?>{'event': event.name},
+    );
+  }
+
+  /// Transfers post-exposure ownership to durable restart recovery without
+  /// requiring product callers to depend on the frozen intent-contract model.
+  Future<void> notifyNativeCaptureProcessRestartedV2() =>
+      notifyNativeCaptureLifecycleV2(CaptureLifecycleEvent.processRestarted);
+
+  @visibleForTesting
+  Future<void> debugConfigureNativeCaptureV2({String? fault}) async {
+    final installed = await _channel.invokeMethod<bool>(
+      'debugNativeCaptureV2Synthetic',
+      <String, Object?>{'fault': fault},
+    );
+    if (installed != true) {
+      throw const ARCaptureException(
+        'The native V2 synthetic exposure route was not installed.',
+        code: 'NATIVE_CAPTURE_V2_DEBUG_ROUTE_UNAVAILABLE',
+      );
+    }
+  }
+
+  @visibleForTesting
+  Future<void> debugAdvanceNativeCaptureRecoveryV2() =>
+      _channel.invokeMethod<void>('debugNativeCaptureV2AdvanceRecovery');
 
   /// Get camera intrinsics data (unified for both AR tracking and capture)
   Future<ARCameraIntrinsics?> getCameraIntrinsics() async {
@@ -1912,6 +2041,11 @@ class ARCaptureManager {
               CaptureCapacity.fromMap(_deepCastMap(call.arguments));
           _captureCapacityController.add(capacity);
           break;
+        case 'onNativeCaptureV2Event':
+          _publishNativeCaptureV2Event(
+            ARNativeCaptureEventV2.fromMap(_deepCastMap(call.arguments)),
+          );
+          break;
         case 'onExposureStateChanged':
           final exposureState = CameraExposureState.fromMap(
             _deepCastMap(call.arguments),
@@ -1946,6 +2080,39 @@ class ARCaptureManager {
     } catch (e) {
       debugPrint('Error handling platform call: $e');
     }
+  }
+
+  void _publishNativeCaptureV2Event(ARNativeCaptureEventV2 event) {
+    final attemptId = event.attemptId;
+    if (!event.isTerminal || attemptId == null) {
+      _nativeCaptureV2Controller.add(event);
+      return;
+    }
+    final signature = jsonEncode(<String, Object?>{
+      'kind': event.kind.name,
+      'captureId': event.captureId,
+      'captureRevision': event.captureRevision,
+      'manifestId': event.manifestId,
+      'reason': event.reason,
+      'recoveryContext': event.recoveryContext?.toMap(),
+    });
+    final existing = _nativeCaptureV2TerminalLedger[attemptId];
+    if (existing != null) {
+      if (existing != signature) {
+        _nativeCaptureV2Controller.addError(
+          StateError('Conflicting native V2 terminal for $attemptId.'),
+        );
+      }
+      return;
+    }
+    _nativeCaptureV2TerminalLedger[attemptId] = signature;
+    if (_nativeCaptureV2TerminalLedger.length >
+        _nativeCaptureV2TerminalLedgerCapacity) {
+      _nativeCaptureV2TerminalLedger.remove(
+        _nativeCaptureV2TerminalLedger.keys.first,
+      );
+    }
+    _nativeCaptureV2Controller.add(event);
   }
 
   // Deprecated runtime resolution methods with helpful error messages
@@ -2003,6 +2170,7 @@ class ARCaptureManager {
     _whiteBalanceStateController.close();
     _flashStateController.close();
     _profileStatusController.close();
+    _nativeCaptureV2Controller.close();
   }
 }
 

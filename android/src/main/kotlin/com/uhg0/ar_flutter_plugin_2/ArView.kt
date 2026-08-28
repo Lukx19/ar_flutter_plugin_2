@@ -3,6 +3,7 @@ package com.uhg0.ar_flutter_plugin_2
 import android.app.Activity
 import android.content.Context
 import android.content.pm.ApplicationInfo
+import android.util.Log
 import android.view.MotionEvent
 import android.view.View
 import android.widget.FrameLayout
@@ -17,8 +18,11 @@ import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.NotTrackingException
 import com.uhg0.ar_flutter_plugin_2.capture.ArCaptureSession
+import com.uhg0.ar_flutter_plugin_2.capture.CaptureSafetySignalV2
 import com.uhg0.ar_flutter_plugin_2.capture.CaptureSessionException
+import com.uhg0.ar_flutter_plugin_2.capture.NativeCaptureRecoveryAdmissionExceptionV2
 import com.uhg0.ar_flutter_plugin_2.capture.PoseBatchDispatcher
+import com.uhg0.ar_flutter_plugin_2.capture.ReplayableShutdownPreparationV2
 import com.uhg0.ar_flutter_plugin_2.sceneview.PluginAnchorRecord
 import com.uhg0.ar_flutter_plugin_2.sceneview.PluginHitResult
 import com.uhg0.ar_flutter_plugin_2.sceneview.PluginNodeRecord
@@ -26,10 +30,19 @@ import com.uhg0.ar_flutter_plugin_2.sceneview.PluginNodeSource
 import com.uhg0.ar_flutter_plugin_2.sceneview.PluginSessionConfig
 import com.uhg0.ar_flutter_plugin_2.sceneview.PluginTransform
 import com.uhg0.ar_flutter_plugin_2.sceneview.SceneViewHost
+import com.uhg0.ar_flutter_plugin_2.sceneview.BoundedOperationCoordinator
 import com.uhg0.ar_flutter_plugin_2.sceneview.decompose
 import com.uhg0.ar_flutter_plugin_2.sceneview.resolveNodeUri
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridMethodChannel
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridRuntimeCapabilities
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridV2Binding
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.AndroidVisibilityGridMappingAdmission
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.AndroidVisibilityGridRuntime
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.ArCoreVisibilityObservationSource
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityObservationDebugChannel
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityObservationDebugGate
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityCaptureSafePredicate
+import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineAuthority
 import com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraCapabilityQuerier
 import io.flutter.FlutterInjector
 import io.flutter.plugin.common.BinaryMessenger
@@ -40,6 +53,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -52,6 +66,7 @@ internal class ArView(
     id: Int,
     initialSessionFeatures: Set<Session.Feature> = emptySet(),
     requestedRearCameraId: String? = null,
+    m0aCommittedBaselineAuthority: M0aCommittedBaselineAuthority,
 ) : PlatformView {
     private val root = FrameLayout(context)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -70,10 +85,27 @@ internal class ArView(
     private val detectedPlanes = mutableSetOf<Plane>()
     private var sessionConfig = defaultSessionConfig()
     private var sessionPausedByFlutter = false
-    private var shutdownPrepared = false
+    private val shutdownPreparation = ReplayableShutdownPreparationV2()
+    private var capturePauseOperations = 0
+    private val afterCapturePauseCallbacks = mutableListOf<() -> Unit>()
     private var disposed = false
+    private var disposeCompleted = false
+    private val disposeCompletionCallbacks = mutableListOf<() -> Unit>()
     private var coverageRendererMounted = false
     private val pendingCloudOperations = mutableSetOf<() -> Unit>()
+
+    private enum class ResumeTerminal {
+        SUCCESS,
+        SUPERSEDED,
+        CANCELLED,
+        TIMEOUT,
+        FAILED,
+    }
+    private val resumeCoordinator = BoundedOperationCoordinator<ResumeTerminal>(
+        launchOperation = { operation -> scope.launch(Dispatchers.Default) { operation() } },
+        scheduleDeadline = { delayMillis, operation -> scope.launch { delay(delayMillis); operation() } },
+        dispatchTerminal = { operation -> scope.launch { operation() } },
+    )
 
     private val sceneHost = SceneViewHost(
         context = context,
@@ -90,8 +122,41 @@ internal class ArView(
         onNodeGesture = ::onNodeGesture,
     )
     private lateinit var visibilityGridChannel: VisibilityGridMethodChannel
+    private val visibilityGridV2Binding = VisibilityGridV2Binding(
+        messenger = messenger,
+        viewId = id,
+        committedBaselineAuthority = m0aCommittedBaselineAuthority,
+        isDebuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0,
+    )
+    private val visibilityObservationDebugGate = VisibilityObservationDebugGate()
+    // #101 owns this native proof only.  It remains false until an internal
+    // V2 capture owner binds one exact durable attempt/cut; Dart cannot enable it.
+    private val captureSafetySignalV2 = CaptureSafetySignalV2()
+    private val visibilityObservationMappingAdmission = AndroidVisibilityGridMappingAdmission(
+        ownership = visibilityGridV2Binding::currentObservationOwnership,
+        beforeAdmission = visibilityObservationDebugGate::awaitIfArmed,
+    )
+    private val visibilityObservationRuntime = AndroidVisibilityGridRuntime(
+        ownership = visibilityGridV2Binding::currentObservationOwnership,
+        mapper = visibilityObservationMappingAdmission,
+        captureSafe = captureSafetySignalV2,
+    )
+    private val visibilityObservationSource = ArCoreVisibilityObservationSource(
+        runtime = visibilityObservationRuntime,
+        ownership = visibilityGridV2Binding::currentObservationOwnership,
+        depthMode = sceneHost::visibilityGridDepthMode,
+    )
+    private val visibilityObservationDebugChannel = VisibilityObservationDebugChannel(
+        messenger = messenger,
+        viewId = id,
+        isDebuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0,
+        runtime = visibilityObservationRuntime,
+        ownership = visibilityGridV2Binding::currentObservationOwnership,
+        gate = visibilityObservationDebugGate,
+    )
 
     init {
+        visibilityGridV2Binding.attachObservationRuntime(visibilityObservationRuntime)
         visibilityGridChannel = VisibilityGridMethodChannel(
             messenger = messenger,
             viewId = id,
@@ -132,23 +197,29 @@ internal class ArView(
         onCaptureFinalized = { value ->
             scope.launch { captureChannel.invokeMethod("onCaptureFinalized", value) }
         },
+        captureSafetySignalV2 = captureSafetySignalV2,
     )
 
-    private fun setCoverageRendererMounted(mounted: Boolean) {
+    private fun setCoverageRendererMounted(mounted: Boolean, generation: Long) {
         coverageRendererMounted = mounted
+        if (::visibilityGridChannel.isInitialized) {
+            visibilityGridChannel.setRendererMounted(mounted, generation)
+        }
     }
 
     private val lifecycleObserver = object : DefaultLifecycleObserver {
         override fun onPause(owner: LifecycleOwner) {
+            resumeCoordinator.invalidate(ResumeTerminal.SUPERSEDED)
+            visibilityObservationRuntime.pause()
+            captureSafetySignalV2.invalidateLifecycleForViewPause()
             visibilityGridChannel.pause()
-            captureSession.onSessionPaused()
-            sceneHost.pause()
+            prepareCapturePause { result ->
+                result.onFailure { error -> Log.e("ArView", "Native capture pause fence failed", error) }
+            }
         }
 
         override fun onResume(owner: LifecycleOwner) {
-            sceneHost.resume()
-            visibilityGridChannel.resume()
-            if (!sessionPausedByFlutter) captureSession.onSessionResumed()
+            if (!disposed) resumeLifecycleBounded()
         }
     }
 
@@ -167,32 +238,106 @@ internal class ArView(
 
     override fun getView(): View = root
 
-    override fun dispose() {
+    override fun dispose() = dispose(null)
+
+    /**
+     * Serializes the Dart dispose acknowledgement with any abandoned resume.
+     * A late native resume can still succeed after its Dart timeout; callers
+     * that need a disposal boundary must not proceed until that resume has
+     * been paused and the host has released its resources.
+     */
+    private fun dispose(onCompleted: (() -> Unit)?) {
+        if (onCompleted != null) {
+            if (disposeCompleted) onCompleted() else disposeCompletionCallbacks += onCompleted
+        }
         if (disposed) return
         disposed = true
+        sceneHost.blockFutureResumes()
+        resumeCoordinator.dispose(ResumeTerminal.CANCELLED, ::disposeAfterResumeDrained)
+    }
+
+    private fun disposeAfterResumeDrained() {
         poseBatchDispatcher.clear()
-        prepareForDispose()
+        prepareForDispose { result ->
+            if (result.isFailure) {
+                Log.e("ArView", "Native capture disposal fence failed", result.exceptionOrNull())
+                // Fail closed and preserve ARCore-pause-before-Camera2 cleanup.
+                captureSafetySignalV2.invalidateAll()
+                sceneHost.pause()
+                visibilityObservationRuntime.pause()
+                captureSession.finishSharedCameraPause()
+            }
+            disposeAfterPauseFence()
+        }
+    }
+
+    private fun disposeAfterPauseFence() {
         sessionChannel.setMethodCallHandler(null)
         objectChannel.setMethodCallHandler(null)
         anchorChannel.setMethodCallHandler(null)
         captureChannel.setMethodCallHandler(null)
         visibilityGridChannel.dispose()
+        visibilityObservationDebugChannel.dispose()
+        visibilityObservationRuntime.close()
+        visibilityGridV2Binding.dispose()
         lifecycle.removeObserver(lifecycleObserver)
-        captureSession.dispose()
+        if (!captureSession.dispose { result ->
+                if (result.isFailure) {
+                    Log.e("ArView", "Native capture durable close failed", result.exceptionOrNull())
+                }
+                disposeAfterCaptureClosed()
+            }
+        ) {
+            return
+        }
+    }
+
+    private fun disposeAfterCaptureClosed() {
         pendingCloudOperations.toList().forEach { it() }
         pendingCloudOperations.clear()
         sceneHost.dispose()
+        disposeCompleted = true
+        disposeCompletionCallbacks.toList().forEach { it() }
+        disposeCompletionCallbacks.clear()
         scope.cancel()
     }
 
-    private fun prepareForDispose() {
-        if (shutdownPrepared) return
-        shutdownPrepared = true
+    private fun prepareForDispose(onCompleted: (Result<Unit>) -> Unit) {
+        if (!shutdownPreparation.request(onCompleted)) return
         // ARCore's SharedCamera sample pauses the Session before closing
         // Camera2. Its wrapped image/session callbacks retain native Session
         // state until Camera2 shutdown completes.
-        sceneHost.pause()
-        captureSession.onSessionPaused()
+        // Fence/drain V2 before ARCore pause, then preserve the required
+        // ARCore-pause-before-Camera2 shutdown order for SharedCamera.
+        prepareCapturePause { result ->
+            shutdownPreparation.complete(result)
+        }
+    }
+
+    private fun prepareCapturePause(onCompleted: (Result<Unit>) -> Unit) {
+        capturePauseOperations += 1
+        if (!captureSession.prepareNativeCaptureForPause { result ->
+                if (result.isSuccess) {
+                    sceneHost.pause()
+                    visibilityObservationRuntime.pause()
+                    captureSafetySignalV2.invalidateAll()
+                    captureSession.finishSharedCameraPause()
+                }
+                onCompleted(result)
+                capturePauseOperations -= 1
+                if (capturePauseOperations == 0) {
+                    afterCapturePauseCallbacks.toList().forEach { it() }
+                    afterCapturePauseCallbacks.clear()
+                }
+            }
+        ) {
+            capturePauseOperations -= 1
+            onCompleted(Result.failure(IllegalStateException("Native capture durable owner is closing")))
+        }
+    }
+
+    private fun runAfterCapturePause(operation: () -> Unit) {
+        if (capturePauseOperations == 0) operation() else afterCapturePauseCallbacks += operation
     }
 
     private fun onSessionCall(call: MethodCall, result: MethodChannel.Result) {
@@ -234,29 +379,102 @@ internal class ArView(
                         result.error("SNAPSHOT_ERROR", it.message, null)
                     }
                 }
-                "disableCamera" -> {
+                // Keep the legacy explicit camera controls and the
+                // ARSessionManager lifecycle names on one native seam. The
+                // Dart manager uses pauseSession/resumeSession, while older
+                // callers use disableCamera/enableCamera.
+                "disableCamera", "pauseSession" -> {
                     sessionPausedByFlutter = true
+                    resumeCoordinator.invalidate(ResumeTerminal.SUPERSEDED)
+                    visibilityObservationRuntime.pause()
                     visibilityGridChannel.pause()
-                    captureSession.onSessionPaused()
-                    sceneHost.pause()
-                    result.success(null)
+                    prepareCapturePause { pauseResult ->
+                        pauseResult.fold(
+                            onSuccess = { result.success(null) },
+                            onFailure = { result.error("SESSION_PAUSE_FAILED", it.message, null) },
+                        )
+                    }
                 }
-                "enableCamera" -> {
-                    sessionPausedByFlutter = false
-                    sceneHost.resume()
-                    visibilityGridChannel.resume()
-                    captureSession.onSessionResumed()
-                    result.success(null)
+                "enableCamera", "resumeSession" -> {
+                    resumeSessionBounded(result)
                 }
                 "dispose" -> {
-                    dispose()
-                    result.success(null)
+                    dispose { result.success(null) }
                 }
                 else -> result.notImplemented()
             }
         } catch (error: Exception) {
             result.error("SESSION_ERROR", error.message, null)
         }
+    }
+
+    private fun resumeSessionBounded(result: MethodChannel.Result) {
+        runAfterCapturePause {
+            resumeBounded(clearFlutterPause = true) { terminal ->
+                when (terminal) {
+                    ResumeTerminal.SUCCESS -> result.success(null)
+                    ResumeTerminal.SUPERSEDED -> result.error(
+                        "SESSION_RESUME_SUPERSEDED",
+                        "A newer resume request replaced this request",
+                        null,
+                    )
+                    ResumeTerminal.CANCELLED -> result.error(
+                        "SESSION_RESUME_CANCELLED",
+                        "AR view was disposed before Session.resume completed",
+                        null,
+                    )
+                    ResumeTerminal.TIMEOUT -> result.error(
+                        "SESSION_RESUME_TIMEOUT",
+                        "Session.resume exceeded the 5000ms native bound",
+                        null,
+                    )
+                    ResumeTerminal.FAILED -> result.error(
+                        "SESSION_RESUME_FAILED",
+                        "Session.resume failed",
+                        null,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun resumeLifecycleBounded() {
+        runAfterCapturePause {
+            resumeBounded(clearFlutterPause = false) {
+                // Lifecycle callbacks have no Dart reply to settle.
+            }
+        }
+    }
+
+    private fun resumeBounded(
+        clearFlutterPause: Boolean,
+        onTerminal: (ResumeTerminal) -> Unit,
+    ) {
+        resumeCoordinator.begin(
+            timeoutMillis = 5_000,
+            next = { terminal ->
+                when (terminal) {
+                    ResumeTerminal.SUCCESS -> {
+                        if (!disposed) {
+                            if (clearFlutterPause) sessionPausedByFlutter = false
+                            visibilityGridChannel.resume()
+                            if (!sessionPausedByFlutter) {
+                                visibilityObservationRuntime.resume()
+                                captureSession.onSessionResumed()
+                            }
+                        }
+                    }
+                    else -> Unit
+                }
+                onTerminal(terminal)
+            },
+            superseded = ResumeTerminal.SUPERSEDED,
+            timedOut = ResumeTerminal.TIMEOUT,
+            failed = ResumeTerminal.FAILED,
+            succeeded = ResumeTerminal.SUCCESS,
+            operation = { sceneHost.resume() },
+            rollbackLateSuccess = { sceneHost.pause() },
+        )
     }
 
     @Suppress("UNCHECKED_CAST")
@@ -477,6 +695,57 @@ internal class ArView(
                     }
                 }
                 "getCaptureCapacity" -> result.success(captureSession.getCaptureCapacity())
+                "admitNativeCaptureV2" -> {
+                    val accepted = captureSession.admitNativeCaptureV2(call.arguments) { admissionResult ->
+                        admissionResult.fold(
+                            onSuccess = result::success,
+                            onFailure = { error ->
+                                when (error) {
+                                    is NativeCaptureRecoveryAdmissionExceptionV2 -> result.error(error.code, error.message, null)
+                                    is IllegalArgumentException -> result.error("NATIVE_CAPTURE_V2_INVALID", error.message, null)
+                                    else -> result.error("NATIVE_CAPTURE_V2_FAILED", error.message, null)
+                                }
+                            },
+                        )
+                    }
+                    if (!accepted) result.error("NATIVE_CAPTURE_V2_CLOSED", "Native capture durable owner is closing", null)
+                }
+                "getNativeCaptureHealthV2" -> result.success(captureSession.nativeCaptureHealthV2())
+                "replayNativeCaptureRecoveryV2" -> result.success(captureSession.replayNativeCaptureRecoveryV2())
+                "acknowledgeNativeCaptureTerminalV2" -> {
+                    captureSession.acknowledgeNativeCaptureTerminalV2(
+                        call.argument<String>("attemptId") ?: throw IllegalArgumentException("attemptId is required"),
+                    )
+                    result.success(true)
+                }
+                "notifyNativeCaptureLifecycleV2" -> {
+                    val accepted = captureSession.notifyNativeCaptureLifecycleV2(
+                        call.argument<String>("event") ?: throw IllegalArgumentException("event is required"),
+                    ) { lifecycleResult ->
+                        lifecycleResult.fold(
+                            onSuccess = { result.success(true) },
+                            onFailure = { result.error("NATIVE_CAPTURE_V2_FAILED", it.message, null) },
+                        )
+                    }
+                    if (!accepted) result.error("NATIVE_CAPTURE_V2_CLOSED", "Native capture durable owner is closing", null)
+                }
+                "debugNativeCaptureV2Synthetic" -> {
+                    val debuggable = root.context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+                    if (!debuggable) {
+                        result.error("DEBUG_ONLY", "Synthetic V2 capture is unavailable in release builds", null)
+                    } else {
+                        result.success(
+                            captureSession.installDebugNativeCaptureSyntheticV2(
+                                call.argument<String>("fault"),
+                            ),
+                        )
+                    }
+                }
+                "debugNativeCaptureV2AdvanceRecovery" -> {
+                    val debuggable = root.context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+                    if (!debuggable) result.error("DEBUG_ONLY", "Synthetic V2 recovery is unavailable in release builds", null)
+                    else { captureSession.advanceNativeCaptureRecoveryV2(); result.success(true) }
+                }
                 "getPerformanceSnapshot" -> result.success(captureSession.getPerformanceSnapshot())
                 "getCameraIntrinsics" -> result.success(captureSession.getCameraIntrinsics())
                 "getImageData" -> result.success(captureSession.getImageData(
@@ -620,12 +889,23 @@ internal class ArView(
                     call.argument<String>("imageId") ?: throw IllegalArgumentException("imageId is required"),
                 ))
                 "dispose" -> {
-                    prepareForDispose()
-                    captureSession.dispose()
-                    result.success(null)
+                    prepareForDispose { pauseResult ->
+                        if (pauseResult.isFailure) {
+                            result.error("CAPTURE_DISPOSE_FAILED", pauseResult.exceptionOrNull()?.message, null)
+                            return@prepareForDispose
+                        }
+                        captureSession.dispose { closeResult ->
+                            closeResult.fold(
+                                onSuccess = { result.success(null) },
+                                onFailure = { result.error("CAPTURE_DISPOSE_FAILED", it.message, null) },
+                            )
+                        }
+                    }
                 }
                 else -> result.notImplemented()
             }
+        } catch (error: NativeCaptureRecoveryAdmissionExceptionV2) {
+            result.error(error.code, error.message, null)
         } catch (error: CaptureSessionException) {
             result.error(error.code, error.message, null)
         } catch (error: Exception) {
@@ -634,6 +914,7 @@ internal class ArView(
     }
 
     private fun onFrame(session: Session, frame: Frame) {
+        visibilityObservationSource.onFrame(frame)
         visibilityGridChannel.onFrame(frame)
         captureSession.buildPoseUpdate(frame)?.let(poseBatchDispatcher::offer)
         frame.getUpdatedTrackables(Plane::class.java).forEach { plane ->

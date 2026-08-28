@@ -28,6 +28,36 @@ class RawDepthCopySourceTest {
     }
 
     @Test
+    fun `resource telemetry balances partial and complete paired acquisition`() {
+        var acquired = 0
+        var closed = 0
+        val complete = RawDepthCopySource(
+            acquirer = FakePairedAcquirer(
+                FakeRawDepthImage(4, 3, 1_000),
+                FakeRawDepthImage(4, 3, 255),
+            ),
+            onResourceAcquired = { acquired++ },
+            onResourceClosed = { closed++ },
+        )
+        assertTrue(complete.acquire(metadata()) is DepthAcquisitionResult.Observation)
+        assertEquals(2, acquired)
+        assertEquals(2, closed)
+
+        val partial = RawDepthCopySource(
+            acquirer = FakePairedAcquirer(
+                FakeRawDepthImage(4, 3, 1_000),
+                null,
+                IllegalStateException("confidence failed"),
+            ),
+            onResourceAcquired = { acquired++ },
+            onResourceClosed = { closed++ },
+        )
+        assertTrue(partial.acquire(metadata()) is DepthAcquisitionResult.Failure)
+        assertEquals(3, acquired)
+        assertEquals(3, closed)
+    }
+
+    @Test
     fun `depth image is closed when confidence acquisition fails`() {
         val depth = FakeRawDepthImage(width = 4, height = 3, value = 1_000)
         val source =

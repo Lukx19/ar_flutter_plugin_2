@@ -1,0 +1,424 @@
+package com.uhg0.ar_flutter_plugin_2.m0
+
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.double
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import java.security.MessageDigest
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class M0bQualityCorpusTest {
+    @Test
+    fun `synthetic quality corpus measures A B and C against one oracle`() {
+        val root = fixture()
+        val gates = root.getValue("gates").jsonObject
+        val baseline = root.double("proposal07BaselineRecall")
+        val measurements = candidateMeasurements(root)
+
+        assertEquals(0.0, measurements.getValue("A").first, 0.000001)
+        assertEquals(0.0, measurements.getValue("B").first, 0.000001)
+        assertTrue(
+            measurements.getValue("C").first > gates.double("falseSheetResidualMax"),
+        )
+        measurements.values.forEach { (_, recall, retention) ->
+            assertTrue((recall - baseline) * 100.0 >= gates.double("recallDeltaPpMin"))
+            assertTrue(retention >= gates.double("faceRetentionMin"))
+        }
+        assertEquals(12_800_000, 64 * 100_000 + 24 * 200_000 + 16 * 100_000)
+        val comparisons = gates.int("affectedSurfaceCount") * gates.int("pictureCount")
+        assertTrue((comparisons + 499) / 500 < gates.int("replayP95MillisecondsMaxExclusive"))
+        assertTrue((comparisons + 199) / 200 <= gates.int("replayMaximumMilliseconds"))
+    }
+
+    @Test
+    fun `locked quality stage is hash-bound and passes synthetic quality gates`() {
+        val manifest = fixture("m0b_reference_corpus_v1.json")
+        val stages = manifest
+            .getValue("syntheticQualityCorpus").jsonObject
+            .getValue("stageCorpora").jsonObject
+        val sceneNames = mutableMapOf<String, Set<String>>()
+        stages.forEach { (stage, descriptorElement) ->
+            val descriptor = descriptorElement.jsonObject
+            val fileName = descriptor.getValue("file").jsonPrimitive.content
+            val bytes = resourceBytes(fileName)
+            assertEquals(
+                descriptor.getValue("sha256").jsonPrimitive.content,
+                sha256(bytes),
+            )
+            val root = Json.parseToJsonElement(bytes.decodeToString()).jsonObject
+            assertEquals(stage, root.getValue("stage").jsonPrimitive.content)
+            assertSyntheticSensorFrames(root)
+            sceneNames[stage] = root.getValue("scenes").jsonArray
+                .map { it.jsonObject.getValue("name").jsonPrimitive.content }
+                .toSet()
+        }
+        assertTrue(sceneNames.getValue("train").intersect(sceneNames.getValue("validation")).isEmpty())
+        assertTrue(sceneNames.getValue("train").intersect(sceneNames.getValue("lockedAcceptance")).isEmpty())
+        assertTrue(sceneNames.getValue("validation").intersect(sceneNames.getValue("lockedAcceptance")).isEmpty())
+
+        val locked = Json.parseToJsonElement(
+            resourceBytes("m0b_quality_locked_v1.json").decodeToString(),
+        ).jsonObject
+        assertEquals(
+            19,
+            locked.getValue("stages").jsonObject
+                .getValue("lockedAcceptance").jsonObject
+                .int("materializedObservationCount"),
+        )
+        val measurements = candidateMeasurements(locked)
+        assertEquals(0.0, measurements.getValue("A").first, 0.000001)
+        assertEquals(0.0, measurements.getValue("B").first, 0.000001)
+        assertTrue(
+            measurements.getValue("C").first >
+                locked.getValue("gates").jsonObject.double("falseSheetResidualMax"),
+        )
+        assertTrue(measurements.values.all { it.second >= 0.93 })
+        assertTrue(measurements.values.all { it.third >= 0.90 })
+    }
+
+    @Test
+    fun `locked synthetic selection keeps first passing order without promotion`() {
+        val root = Json.parseToJsonElement(
+            resourceBytes("m0b_quality_locked_v1.json").decodeToString(),
+        ).jsonObject
+        val gates = root.getValue("gates").jsonObject
+        val baseline = root.double("proposal07BaselineRecall")
+        val measurements = candidateMeasurements(root)
+        val memoryBytes = 64 * gates.int("surfaceCapacity") +
+            24 * gates.int("associationCount") +
+            16 * gates.int("surfaceCapacity")
+        val comparisons = gates.int("pictureCount") * gates.int("affectedSurfaceCount")
+        fun passes(candidate: String): Boolean {
+            val (falseResidual, recall, retention) = measurements.getValue(candidate)
+            return falseResidual <= gates.double("falseSheetResidualMax") &&
+                (recall - baseline) * 100.0 >= gates.double("recallDeltaPpMin") &&
+                retention >= gates.double("faceRetentionMin") &&
+                memoryBytes <= gates.int("memoryBudgetBytes") &&
+                (comparisons + 499) / 500 < gates.int("replayP95MillisecondsMaxExclusive") &&
+                (comparisons + 199) / 200 <= gates.int("replayMaximumMilliseconds")
+        }
+
+        fun failures(candidate: String): List<String> {
+            val (falseResidual, recall, retention) = measurements.getValue(candidate)
+            return buildList {
+                if (falseResidual > gates.double("falseSheetResidualMax")) add("false-sheet-residual")
+                if ((recall - baseline) * 100.0 < gates.double("recallDeltaPpMin")) add("recall-delta")
+                if (retention < gates.double("faceRetentionMin")) add("face-retention")
+                if (memoryBytes > gates.int("memoryBudgetBytes")) add("memory-budget")
+                if ((comparisons + 499) / 500 >= gates.int("replayP95MillisecondsMaxExclusive")) add("replay-p95")
+                if ((comparisons + 199) / 200 > gates.int("replayMaximumMilliseconds")) add("replay-maximum")
+            }
+        }
+
+        assertTrue(passes("A"))
+        assertTrue(passes("B"))
+        assertTrue(!passes("C"))
+        val selection = root.getValue("selectionCampaign").jsonObject
+        val expectedFailures = selection.getValue("expectedGateFailures").jsonObject
+        listOf("A", "B", "C").forEach { candidate ->
+            assertEquals(
+                expectedFailures.getValue(candidate).jsonArray.map { it.jsonPrimitive.content },
+                failures(candidate),
+            )
+        }
+        assertEquals(
+            selection.getValue("candidateOrder").jsonArray.map { it.jsonPrimitive.content },
+            listOf("A", "B", "C"),
+        )
+        assertEquals(
+            selection.getValue("expectedFirstPassingCandidate").jsonPrimitive.content,
+            listOf("A", "B", "C").firstOrNull(::passes),
+        )
+        assertEquals(
+            selection.getValue("promotedCandidate").jsonPrimitive.contentOrNull,
+            null,
+        )
+        assertEquals(
+            selection.getValue("promotionBlockers").jsonArray.map { it.jsonPrimitive.content },
+            listOf(
+                "native-allocation-measurement",
+                "native-cpu-work-measurement",
+                "native-wall-clock-replay-measurement",
+                "lineage-guidance-cross-language-decision-equality",
+                "native-100000-surface-200000-association-resource-campaign",
+            ),
+        )
+    }
+
+    @Test
+    fun `synthetic population reaches the exact bounded association seam`() {
+        val resource = fixture("m0b_quality_locked_v1.json").getValue("resourceCampaign").jsonObject
+        val surfaceCapacity = resource.int("surfaceCapacity")
+        val associationCount = resource.int("associationCount")
+        val observations = sequence {
+            repeat(associationCount) { index ->
+                yield(
+                    M0VoxelObservation(
+                        x = index % surfaceCapacity,
+                        y = 0,
+                        z = 0,
+                        signedWeight = 1,
+                        supportId = index,
+                    ),
+                )
+            }
+        }.asIterable()
+        val result = M0SignedOccupancyKernel(
+            capacity = surfaceCapacity,
+            maxObservations = associationCount,
+        ).fuse(observations)
+        assertEquals(resource.int("expectedOverflowObservationCount"), result.overflowObservationCount)
+        assertEquals(resource.int("expectedSurfaceCount"), result.surfaces.size)
+
+        val overBudget = sequence {
+            repeat(associationCount + 1) { index ->
+                yield(M0VoxelObservation(index % surfaceCapacity, 0, 1, 1, index))
+            }
+        }.asIterable()
+        assertEquals(
+            1,
+            M0SignedOccupancyKernel(maxObservations = associationCount)
+                .fuse(overBudget)
+                .overflowObservationCount,
+        )
+        val memoryBytes = 64 * surfaceCapacity + 24 * associationCount + 16 * surfaceCapacity
+        assertEquals(resource.int("expectedMemoryBytes"), memoryBytes)
+        assertTrue(memoryBytes <= resource.int("memoryBudgetBytes"))
+        val comparisons = resource.int("pictureCount") * resource.int("affectedSurfaceCount")
+        assertEquals(resource.int("expectedReplaySemanticComparisons"), comparisons)
+        assertEquals(resource.int("expectedReplayP95Milliseconds"), (comparisons + 499) / 500)
+        assertEquals(resource.int("expectedReplayMaximumMilliseconds"), (comparisons + 199) / 200)
+        assertEquals(resource.int("expectedCpuWorkUnits"), associationCount + result.surfaces.size)
+    }
+
+    private fun expandedKeys(surfaces: List<M0CanonicalSurface>): Set<M0VoxelKey> =
+        buildSet {
+            surfaces.forEach { surface ->
+                repeat(surface.extentU) { u ->
+                    repeat(surface.extentV) { v ->
+                        add(
+                            when (surface.planeAxis) {
+                                2 -> M0VoxelKey(surface.key.x + u, surface.key.y + v, surface.key.z)
+                                1 -> M0VoxelKey(surface.key.x + u, surface.key.y, surface.key.z + v)
+                                0 -> M0VoxelKey(surface.key.x, surface.key.y + u, surface.key.z + v)
+                                else -> surface.key
+                            },
+                        )
+                    }
+                }
+            }
+        }
+
+    private fun assertExpectedOutput(expected: JsonObject, actual: M0FusionResult) {
+        assertEquals(expected.int("overflowObservationCount"), actual.overflowObservationCount)
+        val expectedSurfaces = expected.getValue("surfaces").jsonArray
+        assertEquals(expectedSurfaces.size, actual.surfaces.size)
+        expectedSurfaces.forEachIndexed { index, element ->
+            val expectedSurface = element.jsonObject
+            val surface = actual.surfaces[index]
+            val key = expectedSurface.getValue("key").jsonArray.map { it.jsonPrimitive.int }
+            assertEquals(expectedSurface.int("surfaceId").toLong(), surface.surfaceId)
+            assertEquals(M0VoxelKey(key[0], key[1], key[2]), surface.key)
+            assertEquals(expectedSurface.int("weight"), surface.weight)
+            assertEquals(expectedSurface.int("normalOctant"), surface.normalOctant)
+            assertEquals(expectedSurface.int("extentU"), surface.extentU)
+            assertEquals(expectedSurface.int("extentV"), surface.extentV)
+            assertEquals(expectedSurface.int("planeAxis"), surface.planeAxis)
+            assertEquals(
+                expectedSurface.getValue("lineageIds").jsonArray.map { it.jsonPrimitive.int },
+                surface.lineageIds,
+            )
+            assertEquals(expectedSurface.int("observationCount"), surface.observationCount)
+        }
+    }
+
+    private fun assertSyntheticSensorFrames(root: JsonObject) {
+        val frames = root.getValue("sensorFrames").jsonObject
+        val pointCloud = frames.getValue("arcorePointCloud").jsonObject
+        val pointIds = pointCloud.getValue("pointIds").jsonArray.map { it.jsonPrimitive.int }
+        val points = pointCloud.getValue("pointsMeters").jsonArray.map { row ->
+            row.jsonArray.map { it.jsonPrimitive.double }
+        }
+        val confidence = pointCloud.getValue("confidence").jsonArray.map { it.jsonPrimitive.double }
+        val minimumConfidence = pointCloud.double("minimumConfidence")
+        val metersToVoxel = pointCloud.double("metersToVoxel")
+        val origin = pointCloud.getValue("voxelOrigin").jsonArray.map { it.jsonPrimitive.int }
+        assertEquals(points.size, pointIds.size)
+        assertEquals(points.size, confidence.size)
+        val acceptedIndices = points.indices.filter { confidence[it] >= minimumConfidence }
+        assertEquals(
+            pointCloud.getValue("expectedAcceptedPointIds").jsonArray.map { it.jsonPrimitive.int },
+            acceptedIndices.map { pointIds[it] },
+        )
+        assertEquals(
+            pointCloud.getValue("expectedVoxelKeys").jsonArray.map { row ->
+                val key = row.jsonArray.map { it.jsonPrimitive.int }
+                M0VoxelKey(key[0], key[1], key[2])
+            },
+            acceptedIndices.map { index ->
+                val point = points[index]
+                M0VoxelKey(
+                    origin[0] + kotlin.math.round(point[0] * metersToVoxel).toInt(),
+                    origin[1] + kotlin.math.round(point[1] * metersToVoxel).toInt(),
+                    origin[2] + kotlin.math.round(point[2] * metersToVoxel).toInt(),
+                )
+            },
+        )
+
+        val depthMap = frames.getValue("arkitDepthMap").jsonObject
+        val width = depthMap.int("width")
+        val height = depthMap.int("height")
+        val depths = depthMap.getValue("depthMeters").jsonArray.map { it.jsonPrimitive.double }
+        val depthConfidence = depthMap.getValue("confidence").jsonArray.map { it.jsonPrimitive.content }
+        val ranks = mapOf("none" to 0, "low" to 1, "medium" to 2, "high" to 3)
+        val minimumDepthConfidence = ranks.getValue(depthMap.getValue("minimumConfidence").jsonPrimitive.content)
+        assertEquals(width * height, depths.size)
+        assertEquals(depths.size, depthConfidence.size)
+        assertEquals(
+            depthMap.int("expectedValidPixelCount"),
+            depths.indices.count { depths[it] > 0.0 && ranks.getValue(depthConfidence[it]) >= minimumDepthConfidence },
+        )
+        assertEquals(
+            depthMap.getValue("projectedVoxelKeys").jsonArray.size,
+            depths.size,
+        )
+        assertEquals(
+            listOf(height, width),
+            depthMap.getValue("expectedOrientedDimensions").jsonArray.map { it.jsonPrimitive.int },
+        )
+    }
+
+    private fun sensorObservations(root: JsonObject): List<M0VoxelObservation> {
+        val frames = root["sensorFrames"]?.jsonObject ?: return emptyList()
+        val pointCloud = frames.getValue("arcorePointCloud").jsonObject
+        val pointIds = pointCloud.getValue("pointIds").jsonArray.map { it.jsonPrimitive.int }
+        val points = pointCloud.getValue("pointsMeters").jsonArray.map { row ->
+            row.jsonArray.map { it.jsonPrimitive.double }
+        }
+        val confidence = pointCloud.getValue("confidence").jsonArray.map { it.jsonPrimitive.double }
+        val minimumConfidence = pointCloud.double("minimumConfidence")
+        val metersToVoxel = pointCloud.double("metersToVoxel")
+        val origin = pointCloud.getValue("voxelOrigin").jsonArray.map { it.jsonPrimitive.int }
+        val pointWeight = pointCloud.int("observationWeight")
+        val observations = points.indices
+            .filter { confidence[it] >= minimumConfidence }
+            .map { index ->
+                val point = points[index]
+                M0VoxelObservation(
+                    origin[0] + kotlin.math.round(point[0] * metersToVoxel).toInt(),
+                    origin[1] + kotlin.math.round(point[1] * metersToVoxel).toInt(),
+                    origin[2] + kotlin.math.round(point[2] * metersToVoxel).toInt(),
+                    pointWeight,
+                    pointIds[index],
+                )
+            }
+            .toMutableList()
+
+        val depthMap = frames.getValue("arkitDepthMap").jsonObject
+        val depths = depthMap.getValue("depthMeters").jsonArray.map { it.jsonPrimitive.double }
+        val depthConfidence = depthMap.getValue("confidence").jsonArray.map { it.jsonPrimitive.content }
+        val projected = depthMap.getValue("projectedVoxelKeys").jsonArray.map { row ->
+            row.jsonArray.map { it.jsonPrimitive.int }
+        }
+        val ranks = mapOf("none" to 0, "low" to 1, "medium" to 2, "high" to 3)
+        val minimumDepthConfidence = ranks.getValue(depthMap.getValue("minimumConfidence").jsonPrimitive.content)
+        val depthWeight = depthMap.int("observationWeight")
+        val supportIdBase = depthMap.int("supportIdBase")
+        depths.indices
+            .filter { depths[it] > 0.0 && ranks.getValue(depthConfidence[it]) >= minimumDepthConfidence }
+            .forEach { index ->
+                val key = projected[index]
+                observations += M0VoxelObservation(
+                    key[0], key[1], key[2], depthWeight, supportIdBase + index,
+                )
+            }
+        return observations
+    }
+
+    private fun candidateMeasurements(root: JsonObject): Map<String, Triple<Double, Double, Double>> {
+        val scenes = root.getValue("scenes").jsonArray.map { it.jsonObject }
+        val observations = scenes.flatMap { scene ->
+            scene.getValue("observations").jsonArray.map { value ->
+                val row = value.jsonObject
+                val key = row.getValue("key").jsonArray.map { it.jsonPrimitive.int }
+                M0VoxelObservation(key[0], key[1], key[2], row.int("signedWeight"), row.int("supportId"))
+            }
+        } + sensorObservations(root)
+        val expected = scenes.flatMap { keys(it.getValue("expectedSurfaceKeys")) }.toSet()
+        val phantom = scenes.flatMap { keys(it.getValue("phantomKeys")) }.toSet()
+        val protected = scenes.flatMap { keys(it.getValue("protectedKeys")) }.toSet()
+        val gates = root.getValue("gates").jsonObject
+        val factories = listOf(
+            "A" to { M0SignedOccupancyKernel() },
+            "B" to { M0PlanarConsolidationKernel() },
+            "C" to { M0BoundedTsdfKernel() },
+        )
+        return factories.associate { (candidate, factory) ->
+            val first = factory().fuse(observations)
+            val repeat = factory().fuse(observations)
+            assertEquals(candidate, first.surfaces, repeat.surfaces)
+            root["expectedCandidateOutputs"]?.jsonObject?.let { expected ->
+                assertExpectedOutput(expected.getValue(candidate).jsonObject, first)
+            }
+            val output = expandedKeys(first.surfaces)
+            val falseResidual = if (phantom.isEmpty()) 0.0
+            else output.intersect(phantom).size.toDouble() / phantom.size
+            val recall = if (expected.isEmpty()) 1.0
+            else output.intersect(expected).size.toDouble() / expected.size
+            val retention = if (protected.isEmpty()) 1.0
+            else output.intersect(protected).size.toDouble() / protected.size
+            assertTrue(candidate, falseThickness(output, phantom) <= gates.double("p95ThicknessOverVoxelMax"))
+            candidate to Triple(falseResidual, recall, retention)
+        }
+    }
+
+    private fun keys(value: kotlinx.serialization.json.JsonElement): List<M0VoxelKey> =
+        value.jsonArray.map { row ->
+            val key = row.jsonArray.map { it.jsonPrimitive.int }
+            M0VoxelKey(key[0], key[1], key[2])
+        }
+
+    private fun falseThickness(
+        output: Set<M0VoxelKey>,
+        phantom: Set<M0VoxelKey>,
+    ): Int = output.intersect(phantom)
+        .groupBy { it.x to it.y }
+        .values
+        .maxOfOrNull { column ->
+            val values = column.map { it.z }.sorted()
+            var longest = if (values.isEmpty()) 0 else 1
+            var current = longest
+            for (index in 1 until values.size) {
+                if (values[index] == values[index - 1] + 1) {
+                    current++
+                    longest = maxOf(longest, current)
+                } else {
+                    current = 1
+                }
+            }
+            longest
+        } ?: 0
+
+    private fun fixture(fileName: String = "m0b_quality_corpus_v1.json"): JsonObject =
+        Json.parseToJsonElement(
+            resourceBytes(fileName).decodeToString(),
+        ).jsonObject
+
+    private fun resourceBytes(fileName: String): ByteArray =
+        requireNotNull(javaClass.classLoader?.getResourceAsStream(fileName)).readBytes()
+
+    private fun sha256(bytes: ByteArray): String = MessageDigest
+        .getInstance("SHA-256")
+        .digest(bytes)
+        .joinToString("") { byte -> "%02x".format(byte) }
+
+    private fun JsonObject.int(key: String): Int = getValue(key).jsonPrimitive.int
+
+    private fun JsonObject.double(key: String): Double = getValue(key).jsonPrimitive.double
+}

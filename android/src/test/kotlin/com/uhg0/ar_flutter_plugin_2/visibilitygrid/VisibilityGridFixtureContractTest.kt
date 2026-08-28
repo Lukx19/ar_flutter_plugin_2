@@ -4,12 +4,151 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudSample
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VisibilityGridFixtureContractTest {
+    @Test
+    fun `synthetic ARCore and ARKit-shaped sensor frames share the native seam`() {
+        val fixture = loadFixture()
+        val sensor =
+            fixture.getValue("scenarios").jsonArray
+                .map { it.jsonObject }
+                .single {
+                    it.getValue("name").jsonPrimitive.content ==
+                        "synthetic_arcore_arkit_sensor_frames"
+                }
+        assertEquals(
+            "pointcloud_wire_v4",
+            sensor.getValue("pointCloudWireVersion").jsonPrimitive.content,
+        )
+
+        val pointClouds = sensor.getValue("pointClouds").jsonObject
+        val arCore = pointClouds.getValue("arcore").jsonObject
+        val arCoreIds =
+            arCore.getValue("ids").jsonArray.map { it.jsonPrimitive.content.toInt() }
+        val arCoreValues =
+            arCore.getValue("points").jsonArray.map { it.jsonPrimitive.content.toFloat() }
+        var arCoreSample: PointCloudSample? =
+            PointCloudSample(
+                sequence = arCore.getValue("sequence").jsonPrimitive.content.toLong(),
+                timestampNs = arCore.getValue("timestampNs").jsonPrimitive.content.toLong(),
+                ids = arCoreIds.toIntArray(),
+                points = arCoreValues.toFloatArray(),
+            )
+        val arCoreGrid = featureGrid()
+        val arCoreSource =
+            ArCoreFeatureObservationSource(
+                acquire = { arCoreSample.also { arCoreSample = null } },
+                groupGeneration = { 1 },
+                sessionGeneration = { 1 },
+                minimumConfidence =
+                    arCore.getValue("minimumConfidence").jsonPrimitive.content.toDouble(),
+            )
+        assertTrue(arCoreGrid.consumeNext(arCoreSource))
+        assertEquals(
+            listOf(packKey(listOf(0, 0, -5)), packKey(listOf(2, 0, -5))),
+            arCoreGrid.snapshot().stableKeys,
+        )
+        assertEquals(
+            arCore.getValue("expectedAcceptedIds").jsonArray
+                .map { it.jsonPrimitive.content.toInt() }
+                .size
+                .toLong(),
+            arCoreGrid.snapshot().diagnostics.acceptedSamples,
+        )
+
+        val arKit = pointClouds.getValue("arkit").jsonObject
+        val arKitIds =
+            arKit.getValue("identifiers").jsonArray.map { it.jsonPrimitive.content.toInt() }
+        val arKitValues =
+            arKit.getValue("points").jsonArray.map { it.jsonPrimitive.content.toDouble() }
+        val arKitConfidence =
+            arKit.getValue("defaultConfidence").jsonPrimitive.content.toDouble()
+        val arKitGrid = featureGrid()
+        val arKitSamples =
+            arKitIds.mapIndexed { index, id ->
+                FeatureSample(
+                    id = id,
+                    xWorld = arKitValues[index * 3],
+                    yWorld = arKitValues[index * 3 + 1],
+                    zWorld = arKitValues[index * 3 + 2],
+                    confidence = arKitConfidence,
+                )
+            }
+        assertTrue(
+            arKitGrid.consumeNext(
+                SyntheticFeatureObservationSource(
+                    listOf(
+                        FeatureObservation(
+                            timestampNs =
+                                arKit.getValue("timestampNs").jsonPrimitive.content.toLong(),
+                            groupGeneration = 1,
+                            sessionGeneration = 1,
+                            samples = arKitSamples,
+                        ),
+                    ),
+                ),
+            ),
+        )
+        assertEquals(
+            listOf(
+                packKey(listOf(0, 0, -5)),
+                packKey(listOf(1, 0, -5)),
+                packKey(listOf(2, 0, -5)),
+            ),
+            arKitGrid.snapshot().stableKeys,
+        )
+
+        val depthMaps = sensor.getValue("depthMaps").jsonObject
+        val arCoreDepth = depthMaps.getValue("arcoreRaw").jsonObject
+        val depthValues =
+            arCoreDepth.getValue("depthMillimeters").jsonArray
+                .map { it.jsonPrimitive.content.toInt() }
+        val confidenceValues =
+            arCoreDepth.getValue("confidence").jsonArray
+                .map { it.jsonPrimitive.content.toInt() }
+        val depthGrid =
+            NativeVisibilityGrid(
+                VisibilityGridFeatureConfig(candidateSamples = 1, candidateSpanNs = 0),
+                VisibilityGridDepthConfig(
+                    confidenceMinimum =
+                        arCoreDepth.getValue("minimumConfidence").jsonPrimitive.content.toInt(),
+                ),
+            )
+        depthGrid.startGroup(group().copy(capacity = 100))
+        val depthResult =
+            depthGrid.observeDepth(
+                DepthObservation(
+                    timestampNs = 3_000_000_000,
+                    groupGeneration = 1,
+                    sessionGeneration = 1,
+                    tracking = true,
+                    width = arCoreDepth.getValue("width").jsonPrimitive.content.toInt(),
+                    height = arCoreDepth.getValue("height").jsonPrimitive.content.toInt(),
+                    samples =
+                        depthValues.mapIndexed { index, value ->
+                            DepthPixelSample(
+                                x = index % 4,
+                                y = index / 4,
+                                depthMillimeters = value,
+                                confidence = confidenceValues[index],
+                            )
+                        },
+                    intrinsics = DepthIntrinsics(100.0, 100.0, 1.5, 1.0),
+                    worldFromCameraGl = identityVisibilityGridTransform(),
+                ),
+            )
+        assertEquals(
+            arCoreDepth.getValue("expectedValidPixelCount").jsonPrimitive.content.toInt(),
+            depthResult.acceptedPixels,
+        )
+        assertEquals(12 - depthResult.acceptedPixels, depthResult.rejectedPixels)
+    }
+
     @Test
     fun `shared synthetic wall meets the quality threshold in Kotlin`() {
         val fixture = loadFixture()
@@ -151,6 +290,7 @@ class VisibilityGridFixtureContractTest {
         assertTrue("depth_safe_band_and_multiview_carving" in names)
         assertTrue("ios_scene_depth_orientation_and_fallback" in names)
         assertTrue("source_health_and_resource_closure" in names)
+        assertTrue("synthetic_arcore_arkit_sensor_frames" in names)
         assertTrue("synthetic_quality_certification" in names)
         assertTrue("geometry_revision_and_resync" in names)
 
@@ -568,6 +708,21 @@ class VisibilityGridFixtureContractTest {
 
     private fun kotlinx.serialization.json.JsonObject.int(field: String): Int =
         getValue(field).jsonPrimitive.content.toInt()
+
+    private fun featureGrid(): NativeVisibilityGrid =
+        NativeVisibilityGrid(
+            VisibilityGridFeatureConfig(candidateSamples = 1, candidateSpanNs = 0),
+        ).also { it.startGroup(group()) }
+
+    private fun group(): VisibilityGridGroupConfig =
+        VisibilityGridGroupConfig(
+            groupId = "synthetic-sensor",
+            groupGeneration = 1,
+            sessionGeneration = 1,
+            voxelSizeMeters = 0.1,
+            capacity = 100,
+            groupFromWorldGl = identityVisibilityGridTransform(),
+        )
 
     private fun transformPoint(
         matrix: List<Double>,

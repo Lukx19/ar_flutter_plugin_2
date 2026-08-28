@@ -6,6 +6,9 @@ import com.google.ar.core.Config
 import com.google.ar.core.Frame
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.NotYetAvailableException
+import com.uhg0.ar_flutter_plugin_2.m0.M0aControlCodec
+import com.uhg0.ar_flutter_plugin_2.m0.M0aControlLifecycle
+import com.uhg0.ar_flutter_plugin_2.m0.M0aControlOperation
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
@@ -13,6 +16,8 @@ import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.util.concurrent.Executors
+import java.util.concurrent.Executor
+import java.util.concurrent.ExecutorService
 
 /** Per-view `visibility_grid_wire_v1` endpoint. Raw sensor arrays stay native. */
 class VisibilityGridMethodChannel(
@@ -22,16 +27,27 @@ class VisibilityGridMethodChannel(
     private val runtimeCapabilities: () -> VisibilityGridRuntimeCapabilities,
     private val render: (CoveragePointRenderSnapshot?, PointCloudNativeConfig?) -> Unit,
     private val renderRawPoints: (CoveragePointRenderSnapshot?) -> Unit = {},
+    private val m0aControlLifecycle: M0aControlLifecycle = M0aControlLifecycle(),
+    sharedExecutor: Executor? = null,
 ) : MethodChannel.MethodCallHandler {
     private val channel = MethodChannel(messenger, "arpointcloud_$viewId")
     private val main = Handler(Looper.getMainLooper())
-    private val executor = Executors.newSingleThreadExecutor()
+    private val executor: ExecutorService =
+        (sharedExecutor as? ExecutorService) ?: Executors.newSingleThreadExecutor()
     private val sensorDrainDispatcher =
         FairExecutorDrainDispatcher(
             executor = executor,
             drainOne = ::drainOneSensorBatch,
         )
     private val lifecycleGuard = VisibilityGridLifecycleGuard()
+    private val backgroundRequests = CancellableBackgroundRequestRegistry()
+    private data class DebugBackgroundRequestSeam(
+        val method: String,
+        val delayMs: Long,
+        val neverReply: Boolean,
+    )
+    @Volatile private var debugBackgroundRequestSeam: DebugBackgroundRequestSeam? = null
+    private val debugBackgroundRequestTrace = BoundedDebugTrace(16)
     @Volatile private var grid: NativeVisibilityGrid? = null
     private var renderer: VisibilityGridRendererState? = null
     @Volatile private var rendererConfig: PointCloudNativeConfig? = null
@@ -42,9 +58,26 @@ class VisibilityGridMethodChannel(
     @Volatile private var paused = false
     @Volatile private var checkpointBarrierActive = false
     private var pendingCheckpointResult: MethodChannel.Result? = null
+    // Compose owns actual mesh disposal and mounting. Its callbacks carry the
+    // requested renderer generation so an outgoing PlatformView composition
+    // cannot satisfy a replacement fence.
+    private val rendererLifecycle = VisibilityGridRendererLifecycle()
+    private data class PendingRendererFence(
+        val generation: Long,
+        val result: MethodChannel.Result,
+        val mount: Boolean,
+    )
+    private var pendingRendererMount: PendingRendererFence? = null
+    private var pendingRendererUnmount: PendingRendererFence? = null
+    private var rendererMountTimeout: Runnable? = null
+    private var rendererUnmountTimeout: Runnable? = null
     private val sensorHandoff = LatestSensorHandoff<FeatureWork, DepthWork>()
     private var featureConfidenceMinimum = 0.30
     private var maxFeaturesPerObservation = 2_000
+    // Debug synthetic input is supplied through the protocol; it must not
+    // concurrently acquire Image-backed ARCore sensor data on the render
+    // callback. That would race native Session teardown.
+    @Volatile private var syntheticSource = false
     @Volatile private var lastEmittedGeometryRevision = -1L
     @Volatile private var lastEmittedHealth: Map<String, String>? = null
     private var coalescedFeatureObservations = 0L
@@ -65,42 +98,44 @@ class VisibilityGridMethodChannel(
             result.error("VG_NOT_INITIALIZED", "Visibility grid is disposed", null)
             return
         }
+        if (
+            isDebuggable &&
+            call.method in setOf("start", "beginCheckpoint", "releaseCheckpoint", "stop") &&
+            (call.method != "releaseCheckpoint" || call.arguments is ByteArray)
+        ) {
+            handleM0aControl(call, result)
+            return
+        }
         try {
             when (call.method) {
                 "init" -> initialize(call, result)
                 "startGrid" -> startGrid(call, result)
+                "startGridSummary" -> startGrid(call, result, summaryOnly = true)
+                "pullGridDelta" -> backgroundCall(call, result, ::pullGridDelta)
                 "ackGeometry" -> result.success(
                     mapOf("accepted" to requireGrid().ackGeometry(call.geometryAck())),
                 )
-                "requestSnapshot" -> {
-                    val snapshot = requireGrid().requestSnapshot(call.snapshotRequest())
-                    if (snapshot == null) {
-                        result.error("VG_PROTOCOL_INVALID", "Snapshot identity is invalid", null)
-                    } else {
-                        check(
-                            requireNotNull(renderer).applyGeometry(
-                                revision = snapshot.geometryRevision,
-                                reset = true,
-                                upsertKeys = snapshot.upsertKeys.toLongArray(),
-                                removalKeys = snapshot.removalKeys.toLongArray(),
-                            ),
-                        )
-                        lastEmittedGeometryRevision = snapshot.geometryRevision
-                        publishRenderer()
-                        result.success(deltaWireMap(snapshot))
-                    }
-                }
+                "requestSnapshot" -> requestSnapshot(call, result)
+                "requestSnapshotSummary" -> requestSnapshot(call, result, summaryOnly = true)
                 "getHealth" -> {
                     result.success(
                         healthWireMap()
                             ?: throw IllegalStateException("Visibility group is not started"),
                     )
                 }
-                "applyVisibility" -> applyVisibility(call, result)
+                "applyVisibility" -> backgroundCall(call, result, ::applyVisibility)
+                "getVisibilityRevision" ->
+                    backgroundCall(call, result, ::getVisibilityRevision)
+                "cancelBackgroundRequest" -> cancelBackgroundRequest(call, result)
+                "configureDebugBackgroundRequest" -> configureDebugBackgroundRequest(call, result)
+                "disarmDebugBackgroundRequest" -> disarmDebugBackgroundRequest(result)
+                "getDebugBackgroundRequestTrace" -> getDebugBackgroundRequestTrace(result)
                 "checkpointBarrier" -> checkpointBarrier(call, result)
                 "releaseCheckpoint" -> releaseCheckpoint(call, result)
                 "setPointsEnabled" -> setPointsEnabled(call, result)
                 "setVoxelRenderMode" -> setVoxelRenderMode(call, result)
+                "awaitRendererMounted" -> awaitRendererMounted(result)
+                "awaitRendererUnmounted" -> awaitRendererUnmounted(result)
                 "stopGrid" -> {
                     requireIdentity(call)
                     synchronized(this) { sensorHandoff.clear() }
@@ -120,6 +155,10 @@ class VisibilityGridMethodChannel(
                     dispose()
                     result.success(true)
                 }
+                "disposeM0aBinding" -> {
+                    m0aControlLifecycle.abandon()
+                    result.success(true)
+                }
                 else -> result.notImplemented()
             }
         } catch (error: VisibilityGridMethodException) {
@@ -135,7 +174,12 @@ class VisibilityGridMethodChannel(
 
     fun onFrame(frame: Frame) {
         if (paused || checkpointBarrierActive) return
-        if (!shouldAcquireVisibilityFeatures(frame.camera.trackingState)) {
+        if (
+            !shouldAcquireVisibilitySensorWork(
+                trackingState = frame.camera.trackingState,
+                syntheticSource = syntheticSource,
+            )
+        ) {
             rawPointRenderHandoff.clear()
             main.post(::clearRawPoints)
             frameCadence.reset()
@@ -240,6 +284,8 @@ class VisibilityGridMethodChannel(
 
     fun dispose() {
         var checkpointResult: MethodChannel.Result? = null
+        var rendererMountResult: MethodChannel.Result? = null
+        var rendererUnmountResult: MethodChannel.Result? = null
         var oldRenderer: VisibilityGridRendererState? = null
         synchronized(this) {
             if (disposed) return
@@ -248,25 +294,181 @@ class VisibilityGridMethodChannel(
             healthHeartbeatGeneration++
             checkpointResult = pendingCheckpointResult
             pendingCheckpointResult = null
+            rendererMountResult = pendingRendererMount?.result
+            pendingRendererMount = null
+            rendererUnmountResult = pendingRendererUnmount?.result
+            pendingRendererUnmount = null
+            rendererMountTimeout?.let(main::removeCallbacks)
+            rendererMountTimeout = null
+            rendererUnmountTimeout?.let(main::removeCallbacks)
+            rendererUnmountTimeout = null
+            rendererLifecycle.clear()
             sensorHandoff.clear()
             frameCadence.reset()
             oldRenderer = renderer
             renderer = null
             rendererConfig = null
+            syntheticSource = false
             grid = null
             group = null
             checkpointBarrierActive = false
+            debugBackgroundRequestSeam = null
+            debugBackgroundRequestTrace.clear()
         }
         checkpointResult?.error(
             "VG_NOT_INITIALIZED",
             "Visibility grid was disposed during checkpoint",
             null,
         )
+        rendererMountResult?.error(
+            "VG_NOT_INITIALIZED",
+            "Visibility grid was disposed before renderer mount",
+            null,
+        )
+        rendererUnmountResult?.error(
+            "VG_NOT_INITIALIZED",
+            "Visibility grid was disposed before renderer unmount",
+            null,
+        )
+        backgroundRequests.cancelAll()
         executor.shutdownNow()
         channel.setMethodCallHandler(null)
         oldRenderer?.dispose()
         render(null, null)
         clearRawPoints()
+    }
+
+    private fun backgroundResult(
+        call: MethodCall,
+        result: MethodChannel.Result,
+    ): MethodChannel.Result {
+        val requestId = call.argument<String>("backgroundRequestId") ?: return result
+        return backgroundRequests.register(requestId, result)
+    }
+
+    private fun backgroundCall(
+        call: MethodCall,
+        result: MethodChannel.Result,
+        operation: (MethodCall, MethodChannel.Result) -> Unit,
+    ) {
+        val target = backgroundResult(call, result)
+        val seam = debugBackgroundRequestSeam
+        if (isDebuggable && seam?.method == call.method) {
+            debugBackgroundRequestSeam = null
+            debugBackgroundRequestTrace.record("accepted:${call.method}")
+            if (seam.neverReply) return
+            main.postDelayed(
+                { executeBackgroundOperation(call, target, operation) },
+                seam.delayMs,
+            )
+            return
+        }
+        executeBackgroundOperation(call, target, operation)
+    }
+
+    private fun executeBackgroundOperation(
+        call: MethodCall,
+        target: MethodChannel.Result,
+        operation: (MethodCall, MethodChannel.Result) -> Unit,
+    ) {
+        try {
+            operation(call, target)
+        } catch (error: VisibilityGridMethodException) {
+            target.error(error.code, error.message, null)
+        } catch (error: IllegalArgumentException) {
+            target.error("VG_PROTOCOL_INVALID", error.message, null)
+        } catch (error: IllegalStateException) {
+            target.error("VG_NOT_INITIALIZED", error.message, null)
+        } catch (error: Exception) {
+            target.error("VG_INTERNAL", error.message, null)
+        }
+    }
+
+    private fun cancelBackgroundRequest(call: MethodCall, result: MethodChannel.Result) {
+        val requestId = parseBackgroundCancellationRequest(
+            call.arguments,
+            VISIBILITY_GRID_WIRE_VERSION,
+        )
+        debugBackgroundRequestTrace.record("cancel-requested:$requestId")
+        val cancelled = backgroundRequests.cancel(requestId)
+        if (cancelled) {
+            debugBackgroundRequestTrace.record("original-completed:$requestId")
+        }
+        // cancel() synchronously completes the original result before this ACK.
+        debugBackgroundRequestTrace.record("cancel-ack:$requestId")
+        result.success(
+            mapOf(
+                "acknowledged" to true,
+                "cancelled" to cancelled,
+            ),
+        )
+    }
+
+    private fun configureDebugBackgroundRequest(
+        call: MethodCall,
+        result: MethodChannel.Result,
+    ) {
+        require(isDebuggable) { "Background request test seam is debug-only" }
+        val method = call.argument<String>("method")
+            ?.takeIf { it in setOf("pullGridDelta", "applyVisibility", "getVisibilityRevision") }
+            ?: throw IllegalArgumentException("method must name one background operation")
+        val delayMs = call.argument<Number>("delayMs")?.toLong() ?: 0L
+        require(delayMs in 0L..30_000L) { "delayMs must be between 0 and 30000" }
+        val neverReply = call.argument<Boolean>("neverReply") ?: false
+        debugBackgroundRequestTrace.arm("armed:$method")
+        debugBackgroundRequestSeam = DebugBackgroundRequestSeam(method, delayMs, neverReply)
+        result.success(mapOf("armed" to true))
+    }
+
+    private fun disarmDebugBackgroundRequest(result: MethodChannel.Result) {
+        require(isDebuggable) { "Background request test seam is debug-only" }
+        debugBackgroundRequestSeam = null
+        debugBackgroundRequestTrace.clear()
+        result.success(mapOf("disarmed" to true))
+    }
+
+    private fun getDebugBackgroundRequestTrace(result: MethodChannel.Result) {
+        require(isDebuggable) { "Background request test seam is debug-only" }
+        val trace = debugBackgroundRequestTrace.snapshot()
+        result.success(
+            mapOf(
+                "trace" to trace,
+                "pendingCount" to backgroundRequests.pendingCount,
+            ),
+        )
+    }
+
+    private fun handleM0aControl(call: MethodCall, result: MethodChannel.Result) {
+        val operation = when (call.method) {
+            "start" -> M0aControlOperation.START
+            "beginCheckpoint" -> M0aControlOperation.BEGIN_CHECKPOINT
+            "releaseCheckpoint" -> M0aControlOperation.RELEASE_CHECKPOINT
+            "stop" -> M0aControlOperation.STOP
+            else -> null
+        }
+        val bytes = call.arguments as? ByteArray
+        if (operation == null || bytes == null) {
+            result.error("VG_PROTOCOL_INVALID", "M0a control requires one Uint8List", null)
+            return
+        }
+        executor.execute {
+            try {
+                val response: ByteArray? = synchronized(this) {
+                    if (disposed) return@synchronized null
+                    val request = M0aControlCodec.decodeRequest(bytes)
+                    require(request.operation == operation) { "Control method and operation differ" }
+                    val encoded = m0aControlLifecycle.handle(request, bytes)
+                    encoded
+                }
+                if (response == null) {
+                    result.error("VG_NOT_INITIALIZED", "Visibility grid is disposed", null)
+                } else {
+                    result.success(response)
+                }
+            } catch (error: Exception) {
+                result.error("VG_PROTOCOL_INVALID", error.message, null)
+            }
+        }
     }
 
     fun pause() {
@@ -324,6 +526,7 @@ class VisibilityGridMethodChannel(
         synchronized(this) {
             lifecycleGuard.advance()
             healthHeartbeatGeneration++
+            syntheticSource = synthetic
             cancelPendingCheckpoint("Visibility grid reinitialized during checkpoint")
             sensorHandoff.clear()
             frameCadence.reset()
@@ -332,11 +535,12 @@ class VisibilityGridMethodChannel(
             renderer?.dispose()
             renderer = null
             rendererConfig = null
+            rendererLifecycle.clear()
             render(null, null)
             clearRawPoints()
-            renderer =
-                VisibilityGridRendererState(
-                    capacity = featureConfig.stableVoxelCapacity,
+                renderer =
+                    VisibilityGridRendererState(
+                    capacity = VisibilityGridRendererState.presentationCapacity(renderMode),
                     defaultColor = defaultColor,
                 ).also {
                     it.setEnabled(enabled)
@@ -344,12 +548,13 @@ class VisibilityGridMethodChannel(
                 }
             rendererConfig =
                 PointCloudNativeConfig(
-                    renderCapacity = featureConfig.stableVoxelCapacity,
+                    renderCapacity = VisibilityGridRendererState.presentationCapacity(renderMode),
                     defaultColor = defaultColor,
                     pointSizePx = pointSizePx,
                     enabled = enabled,
                     voxelRenderMode = renderMode,
                     cubeSizeFactor = cubeSizeFactor,
+                    rendererGeneration = rendererLifecycle.requestReplacement(),
                 )
             group = null
             visibilityRevision = 0
@@ -401,7 +606,11 @@ class VisibilityGridMethodChannel(
         )
     }
 
-    private fun startGrid(call: MethodCall, result: MethodChannel.Result) {
+    private fun startGrid(
+        call: MethodCall,
+        result: MethodChannel.Result,
+        summaryOnly: Boolean = false,
+    ) {
         val next =
             VisibilityGridGroupConfig(
                 groupId = call.requiredString("groupId"),
@@ -450,19 +659,90 @@ class VisibilityGridMethodChannel(
                 ).also {
                     lastEmittedGeometryRevision = it.geometryRevision
                     lastEmittedHealth = currentHealth(it.diagnostics)
-                    check(
-                        renderer?.applyGeometry(
-                            revision = it.geometryRevision,
-                            reset = true,
-                            upsertKeys = it.upsertKeys.toLongArray(),
-                            removalKeys = it.removalKeys.toLongArray(),
-                        ) == true,
-                    )
+                    if (VisibilityGridInitialHandoffPolicy.applyOnStart(summaryOnly)) {
+                        check(
+                            renderer?.applyGeometry(
+                                revision = it.geometryRevision,
+                                reset = true,
+                                upsertKeys = it.upsertKeys.toLongArray(),
+                                removalKeys = it.removalKeys.toLongArray(),
+                                selectedKeysForResetOrReplacement = {
+                                    active.selectedRenderKeys(
+                                        checkNotNull(renderer).capacity,
+                                    )
+                                },
+                            ) == true,
+                        )
+                    }
                 }
             }
         publishRenderer()
         restartHealthHeartbeat()
-        result.success(deltaWireMap(snapshot))
+        result.success(
+            if (summaryOnly) deltaSummaryWireMap(snapshot) else deltaWireMap(snapshot),
+        )
+    }
+
+    /**
+     * Background-worker-only semantic hand-off. The ordinary callback names
+     * this retained revision without moving stable keys through the root
+     * isolate. The delta stays retained until the existing ack accepts it.
+     */
+    private fun pullGridDelta(call: MethodCall, result: MethodChannel.Result) {
+        requireIdentity(call)
+        val delta = requireGrid().inFlightGeometryDelta()
+            ?: throw VisibilityGridMethodException(
+                "VG_NO_PENDING_DELTA",
+                "No retained visibility-grid delta is available",
+            )
+        // The background coverage worker owns this hand-off. Apply the
+        // retained geometry before returning it so neither the root isolate
+        // nor a later visibility patch needs to rebuild semantic rows.
+        check(
+            requireNotNull(renderer).applyGeometry(
+                revision = delta.geometryRevision,
+                reset = delta.reset,
+                upsertKeys = delta.upsertKeys.toLongArray(),
+                removalKeys = delta.removalKeys.toLongArray(),
+                selectedKeysForResetOrReplacement = {
+                    requireGrid().selectedRenderKeys(
+                        requireNotNull(renderer).capacity,
+                    )
+                },
+            ),
+        )
+        lastEmittedGeometryRevision = delta.geometryRevision
+        runCatching(::publishRenderer).onFailure(::emitRendererError)
+        result.success(deltaWireMap(delta))
+    }
+
+    /** Explicit recovery reset. Product callers receive only its summary. */
+    private fun requestSnapshot(
+        call: MethodCall,
+        result: MethodChannel.Result,
+        summaryOnly: Boolean = false,
+    ) {
+        val snapshot = requireGrid().requestSnapshot(call.snapshotRequest())
+        if (snapshot == null) {
+            result.error("VG_PROTOCOL_INVALID", "Snapshot identity is invalid", null)
+            return
+        }
+        check(
+            requireNotNull(renderer).applyGeometry(
+                revision = snapshot.geometryRevision,
+                reset = true,
+                upsertKeys = snapshot.upsertKeys.toLongArray(),
+                removalKeys = snapshot.removalKeys.toLongArray(),
+                selectedKeysForResetOrReplacement = {
+                    requireGrid().selectedRenderKeys(requireNotNull(renderer).capacity)
+                },
+            ),
+        )
+        lastEmittedGeometryRevision = snapshot.geometryRevision
+        publishRenderer()
+        result.success(
+            if (summaryOnly) deltaSummaryWireMap(snapshot) else deltaWireMap(snapshot),
+        )
     }
 
     private fun applyVisibility(call: MethodCall, result: MethodChannel.Result) {
@@ -472,9 +752,14 @@ class VisibilityGridMethodChannel(
         val nextVisibilityRevision = call.requiredLong("visibilityRevision")
         val keys = call.argument<LongArray>("keys")
             ?: throw IllegalArgumentException("keys must be Int64List")
-        val colors = call.argument<IntArray>("colors")
-            ?: throw IllegalArgumentException("colors must be Int32List")
-        require(keys.size == colors.size && keys.distinct().size == keys.size)
+        val styles = call.argument<ByteArray>("styles")
+            ?: throw IllegalArgumentException("styles must be Uint8List")
+        require(
+            keys.size <= com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_MAX_STYLE_PATCH_ROWS &&
+                styles.size == keys.size *
+                    com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES &&
+                keys.distinct().size == keys.size,
+        )
         validateVisibilityRevisions(
             namedGeometryRevision = geometryRevision,
             currentGeometryRevision = active.geometryRevision,
@@ -486,7 +771,7 @@ class VisibilityGridMethodChannel(
                 namedGeometryRevision = geometryRevision,
                 nextVisibilityRevision = nextVisibilityRevision,
                 patchKeys = keys,
-                patchColors = colors,
+                patchStyleRows = styles,
             ),
         )
         visibilityRevision = nextVisibilityRevision
@@ -495,6 +780,17 @@ class VisibilityGridMethodChannel(
             mapOf(
                 "applied" to true,
                 "geometryRevision" to geometryRevision,
+                "visibilityRevision" to visibilityRevision,
+            ),
+        )
+    }
+
+    private fun getVisibilityRevision(call: MethodCall, result: MethodChannel.Result) {
+        requireIdentity(call)
+        val snapshot = requireGrid().snapshot()
+        result.success(
+            mapOf(
+                "geometryRevision" to snapshot.geometryRevision,
                 "visibilityRevision" to visibilityRevision,
             ),
         )
@@ -640,6 +936,11 @@ class VisibilityGridMethodChannel(
                                         renderer = context.renderer,
                                         delta = delta,
                                         fullSnapshot = context.grid::snapshot,
+                                        selectedRenderKeys = {
+                                            context.grid.selectedRenderKeys(
+                                                context.renderer.capacity,
+                                            )
+                                        },
                                     )
                                 if (sync == RendererGeometrySyncResult.REJECTED) {
                                     false
@@ -663,8 +964,8 @@ class VisibilityGridMethodChannel(
                             runCatching(::publishRenderer)
                                 .onFailure(::emitRendererError)
                             channel.invokeMethod(
-                                "onGridDelta",
-                                deltaWireMap(delta, context.renderer),
+                                "onGridSummary",
+                                deltaSummaryWireMap(delta, context.renderer),
                             )
                         }
                     }
@@ -767,7 +1068,10 @@ class VisibilityGridMethodChannel(
             call.argument<Boolean>("enabled")
                 ?: throw IllegalArgumentException("enabled is required")
         requireNotNull(renderer).setEnabled(enabled)
-        rendererConfig = requireNotNull(rendererConfig).copy(enabled = enabled)
+        rendererConfig = requireNotNull(rendererConfig).copy(
+            enabled = enabled,
+            rendererGeneration = rendererLifecycle.requestReplacement(),
+        )
         frameCadence.reset()
         if (!enabled) clearRawPoints()
         publishRenderer()
@@ -776,12 +1080,125 @@ class VisibilityGridMethodChannel(
 
     private fun setVoxelRenderMode(call: MethodCall, result: MethodChannel.Result) {
         val mode = VoxelRenderMode.fromWire(call.requiredString("mode"))
-        requireNotNull(renderer).setRenderMode(mode)
-        rendererConfig = requireNotNull(rendererConfig).copy(voxelRenderMode = mode)
+        val current = requireNotNull(renderer)
+        val currentConfig = requireNotNull(rendererConfig)
+        if (currentConfig.voxelRenderMode != mode) {
+            val retained = current.snapshot()
+            // The retained cut is plain bounded data. Release the old renderer
+            // and its selector/dirty-state ownership before constructing the
+            // replacement so a mode change never temporarily keeps two
+            // production renderer states alive outside the shared 8 MiB ledger.
+            current.dispose()
+            val replacement = VisibilityGridRendererState(
+                capacity = VisibilityGridRendererState.presentationCapacity(mode),
+                defaultColor = currentConfig.defaultColor,
+            ).also {
+                it.setEnabled(currentConfig.enabled)
+                it.setRenderMode(mode)
+            }
+            group?.let { activeGroup ->
+                replacement.rehydrate(activeGroup, retained)
+            }
+            renderer = replacement
+        }
+        rendererConfig = currentConfig.copy(
+            renderCapacity = VisibilityGridRendererState.presentationCapacity(mode),
+            voxelRenderMode = mode,
+            rendererGeneration = rendererLifecycle.requestReplacement(),
+        )
         frameCadence.reset()
         if (mode != VoxelRenderMode.POINTS) clearRawPoints()
         publishRenderer()
         result.success(true)
+    }
+
+    /** Called by the SceneView Compose effect after an actual mesh transition. */
+    fun setRendererMounted(mounted: Boolean, generation: Long) {
+        val pending = synchronized(this) {
+            val accepted =
+                if (mounted) {
+                    rendererLifecycle.markMounted(generation)
+                } else {
+                    rendererLifecycle.markUnmounted(generation)
+                }
+            if (!accepted) return
+            if (mounted) {
+                pendingRendererMount
+                    ?.takeIf { it.generation == generation }
+                    ?.also {
+                        pendingRendererMount = null
+                        rendererMountTimeout?.let(main::removeCallbacks)
+                        rendererMountTimeout = null
+                    }
+            } else {
+                pendingRendererUnmount
+                    ?.takeIf { it.generation == generation }
+                    ?.also {
+                        pendingRendererUnmount = null
+                        rendererUnmountTimeout?.let(main::removeCallbacks)
+                        rendererUnmountTimeout = null
+                    }
+            }
+        }
+        // A mode or enabled-state replacement installs a fresh Compose mesh.
+        // Re-publish only after that mesh has crossed its mount fence so its
+        // new upload coordinator receives the retained snapshot before Dart
+        // observes the renderer as ready. Without this, a replacement can
+        // report mounted while an active AR frame has nothing queued to upload.
+        if (mounted) publishRenderer()
+        pending?.result?.success(true)
+    }
+
+    private fun awaitRendererMounted(result: MethodChannel.Result) {
+        synchronized(this) {
+            val generation = rendererLifecycle.requestedGeneration()
+            if (rendererLifecycle.mountedGeneration() == generation) {
+                result.success(true)
+                return
+            }
+            check(pendingRendererMount == null) {
+                "Renderer mount fence is already pending"
+            }
+            pendingRendererMount = PendingRendererFence(generation, result, mount = true)
+            rendererMountTimeout = rendererFenceTimeout(generation, mount = true)
+                .also { main.postDelayed(it, RENDERER_FENCE_TIMEOUT_MS) }
+        }
+    }
+
+    private fun awaitRendererUnmounted(result: MethodChannel.Result) {
+        synchronized(this) {
+            val generation = rendererLifecycle.mountedGeneration()
+            if (generation == null) {
+                result.success(true)
+                return
+            }
+            check(pendingRendererUnmount == null) {
+                "Renderer unmount fence is already pending"
+            }
+            pendingRendererUnmount = PendingRendererFence(generation, result, mount = false)
+            rendererUnmountTimeout = rendererFenceTimeout(generation, mount = false)
+                .also { main.postDelayed(it, RENDERER_FENCE_TIMEOUT_MS) }
+        }
+    }
+
+    private fun rendererFenceTimeout(generation: Long, mount: Boolean): Runnable = Runnable {
+        val pending = synchronized(this) {
+            val candidate = if (mount) pendingRendererMount else pendingRendererUnmount
+            if (candidate?.generation != generation) return@Runnable
+            if (mount) {
+                pendingRendererMount = null
+                rendererMountTimeout = null
+            } else {
+                pendingRendererUnmount = null
+                rendererUnmountTimeout = null
+            }
+            candidate
+        }
+        pending.result.error(
+            "VG_RENDERER_FENCE_TIMEOUT",
+            "Renderer ${if (mount) "mount" else "unmount"} fence timed out for generation $generation",
+            null,
+        )
     }
 
     private fun publishRenderer() {
@@ -953,12 +1370,18 @@ class VisibilityGridMethodChannel(
     ): VisibilityGridDiagnostics =
         synchronized(this) {
             val freeRows = rendererState.freeRowCount
+            val renderedRows = rendererState.capacity - freeRows
             diagnostics.copy(
                 callbackCopyP95Ns = callbackCopySamples.p95(),
                 coalescedFeatureObservations = coalescedFeatureObservations,
                 coalescedDepthObservations = coalescedDepthObservations,
-                rendererRows = rendererState.capacity - freeRows,
-                rendererFreeRows = freeRows,
+                // This wire contract describes the authoritative semantic
+                // grid, whose 100k capacity remains distinct from M0d's 20k
+                // presentation selection. Keep its row/free invariant valid
+                // for Dart while the bounded renderer is ledgered separately.
+                rendererRows = renderedRows,
+                rendererFreeRows =
+                    (diagnostics.stableVoxelCapacity - renderedRows).coerceAtLeast(0),
             )
         }
 
@@ -970,6 +1393,28 @@ class VisibilityGridMethodChannel(
             enrichDiagnostics(delta.diagnostics, it)
         } ?: delta.diagnostics
         return delta.copy(diagnostics = enriched).toWireMap(currentHealth(enriched))
+    }
+
+    /** Fixed-size ordinary callback map: it has no stable-key arrays. */
+    private fun deltaSummaryWireMap(
+        delta: VisibilityGridDelta,
+        rendererState: VisibilityGridRendererState? = renderer,
+    ): Map<String, Any> {
+        val enriched = rendererState?.let {
+            enrichDiagnostics(delta.diagnostics, it)
+        } ?: delta.diagnostics
+        return mapOf(
+            "version" to VISIBILITY_GRID_WIRE_VERSION,
+            "groupId" to delta.groupId,
+            "groupGeneration" to delta.groupGeneration,
+            "sessionGeneration" to delta.sessionGeneration,
+            "baseGeometryRevision" to delta.baseGeometryRevision,
+            "geometryRevision" to delta.geometryRevision,
+            "reset" to delta.reset,
+            "capacity" to delta.capacity,
+            "sourceHealth" to currentHealth(enriched),
+            "diagnostics" to enriched.toWireMap(),
+        )
     }
 
     private fun requireIdentity(call: MethodCall) {
@@ -1001,8 +1446,28 @@ class VisibilityGridMethodChannel(
     }
 }
 
+internal fun parseBackgroundCancellationRequest(arguments: Any?, wireVersion: String): String {
+    val map = arguments as? Map<*, *>
+        ?: throw IllegalArgumentException("cancellation arguments must be a map")
+    require(map.keys == setOf("version", "backgroundRequestId")) {
+        "cancellation argument fields must be exact"
+    }
+    require(map["version"] is String && map["version"] == wireVersion) {
+        "version must equal $wireVersion"
+    }
+    return (map["backgroundRequestId"] as? String)
+        ?.takeIf(String::isNotBlank)
+        ?: throw IllegalArgumentException("backgroundRequestId must be non-empty")
+}
+
 internal fun shouldAcquireVisibilityFeatures(trackingState: TrackingState): Boolean =
     trackingState == TrackingState.TRACKING
+
+/** Synthetic debug input owns its samples, so ARCore image acquisition stays off. */
+internal fun shouldAcquireVisibilitySensorWork(
+    trackingState: TrackingState,
+    syntheticSource: Boolean,
+): Boolean = !syntheticSource && shouldAcquireVisibilityFeatures(trackingState)
 
 private class VisibilityGridChannelLatencySamples(
     private val capacity: Int = 256,
@@ -1120,6 +1585,7 @@ data class VisibilityGridRuntimeCapabilities(
 }
 
 private const val HEALTH_HEARTBEAT_INTERVAL_MS = 1_000L
+private const val RENDERER_FENCE_TIMEOUT_MS = 30_000L
 
 internal class VisibilityGridMethodException(
     val code: String,

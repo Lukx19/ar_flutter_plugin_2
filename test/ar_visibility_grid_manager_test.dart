@@ -47,11 +47,25 @@ void main() {
             'diagnostics': _initialDiagnostics(100, 200),
           },
         'startGrid' => _delta(revision: 1, reset: true),
+        'startGridSummary' => <String, Object>{
+            ..._delta(revision: 1, reset: true),
+          }
+            ..remove('upsertKeys')
+            ..remove('removalKeys'),
         'ackGeometry' => <String, Object>{'accepted': true},
         'requestSnapshot' => _delta(revision: 7, reset: true),
+        'requestSnapshotSummary' => <String, Object>{
+            ..._delta(revision: 7, reset: true),
+          }
+            ..remove('upsertKeys')
+            ..remove('removalKeys'),
         'checkpointBarrier' => _delta(revision: 8, reset: true),
         'releaseCheckpoint' => <String, Object>{'released': true},
         'applyVisibility' => <String, Object>{'applied': true},
+        'getVisibilityRevision' => <String, Object>{
+            'geometryRevision': 7,
+            'visibilityRevision': 3,
+          },
         'getHealth' => <String, Object>{
             'version': visibilityGridWireVersion,
             'sourceHealth': _health(),
@@ -157,6 +171,28 @@ void main() {
     ]);
   });
 
+  test('queries the authoritative native visibility revision receipt',
+      () async {
+    final manager = ARVisibilityGridManager(91);
+    final receipt = await manager.getAppliedVisibilityRevision(
+      groupId: 'group',
+      groupGeneration: 3,
+      sessionGeneration: 4,
+    );
+
+    expect(receipt.geometryRevision, 7);
+    expect(receipt.visibilityRevision, 3);
+    final call = calls.singleWhere(
+      (call) => call.method == 'getVisibilityRevision',
+    );
+    expect(call.arguments, <String, Object>{
+      'version': visibilityGridWireVersion,
+      'groupId': 'group',
+      'groupGeneration': 3,
+      'sessionGeneration': 4,
+    });
+  });
+
   test('malformed callback is rejected atomically', () async {
     final manager = ARVisibilityGridManager(91);
     final errors = <ARVisibilityGridError>[];
@@ -169,6 +205,69 @@ void main() {
       throwsA(isA<PlatformException>()),
     );
     expect(errors.single.code, ARVisibilityGridErrorCode.protocolInvalid);
+    await manager.dispose();
+  });
+
+  test('ordinary summary callbacks contain no semantic surface keys', () async {
+    final manager = ARVisibilityGridManager(91);
+    final received = <ARVisibilityGridDeltaSummary>[];
+    manager.summaries.listen(received.add);
+
+    final started = await manager.startGridSummary(
+      ARVisibilityGridGroupConfig(
+        groupId: 'group',
+        groupGeneration: 3,
+        voxelSizeMeters: 0.1,
+        capacity: 100,
+        worldFromGroupGl: Float64List.fromList(_identity),
+        groupFromWorldGl: Float64List.fromList(_identity),
+      ),
+    );
+    expect(started.geometryRevision, 1);
+
+    final recovered = await manager.requestSnapshotSummary(
+      groupId: 'group',
+      groupGeneration: 3,
+      sessionGeneration: 4,
+      receiverGeometryRevision: 1,
+    );
+    expect(recovered.reset, isTrue);
+    expect(recovered.geometryRevision, 7);
+
+    final summary = <String, Object>{
+      ..._delta(revision: 2),
+    }
+      ..remove('upsertKeys')
+      ..remove('removalKeys');
+    await _platformCall(channel, 'onGridSummary', summary);
+
+    expect(received.single.geometryRevision, 2);
+    expect(received.single.capacity, 100);
+    await expectLater(
+      _platformCall(channel, 'onGridSummary', _delta(revision: 3)),
+      throwsA(isA<PlatformException>()),
+    );
+    await manager.dispose();
+  });
+
+  test('renderer mount fences are bounded when native does not reply',
+      () async {
+    final manager = ARVisibilityGridManager(
+      91,
+      channel: channel,
+      rendererFenceTimeout: Duration.zero,
+    );
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      calls.add(call);
+      if (call.method == 'awaitRendererMounted') {
+        return Completer<Object?>().future;
+      }
+      return true;
+    });
+
+    await expectLater(
+        manager.awaitRendererMounted(), throwsA(isA<TimeoutException>()));
     await manager.dispose();
   });
 }
