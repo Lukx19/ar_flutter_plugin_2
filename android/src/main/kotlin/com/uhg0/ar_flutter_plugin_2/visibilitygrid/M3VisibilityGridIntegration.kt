@@ -85,7 +85,7 @@ internal class M3VisibilityGridIntegration(
             return@mutate
         }
         if (isFenced(observation.ownership)) return@mutate
-        val targets = accepted.candidates.filter { M3Voxel(it.x, it.y, it.z) !in knownVoxels }
+        val targets = accepted.delta.filter { M3Voxel(it.x, it.y, it.z) !in knownVoxels }
         if (targets.isEmpty()) return@mutate
         val surfaceOwner = requireNotNull(owner)
         val base = requireNotNull(baseline)

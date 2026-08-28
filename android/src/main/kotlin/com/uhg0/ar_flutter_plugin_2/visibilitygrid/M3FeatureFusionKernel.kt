@@ -120,28 +120,40 @@ internal class M3FeatureFusionKernel(
             }
 
             operations.allocate(M3AllocationCut.RESULT) {
-                val newBySlot = updatesByKey.values.filter { it.isNew }.associateBy { it.slot }
-                val candidates = ArrayList<M3FeatureFusionCandidate>()
-                repeat(projectedSurfaceCount) { slot ->
-                    val key = if (slot < surfaceCount) VoxelKey(surfaceX[slot], surfaceY[slot], surfaceZ[slot]) else newBySlot.getValue(slot).key
-                    val projected = updatesByKey[key]
-                    if (projected?.isActive ?: active[slot]) {
-                        candidates += M3FeatureFusionCandidate(
-                            key.x, key.y, key.z,
-                            projected?.weight ?: accumulatedWeights[slot],
-                            normalOctant(key),
-                            projected?.observationCount ?: observationCounts[slot],
-                        )
-                    }
+                // The result is deliberately derived only from the distinct voxels
+                // staged by this batch.  Retained arrays remain the sole complete
+                // candidate-A state; scanning them here would make a one-voxel
+                // refinement proportional to the live population.
+                val delta = ArrayList<M3FeatureFusionCandidate>(updatesByKey.size)
+                updatesByKey.values.forEach { projected ->
+                    if (projected.isActive) delta += candidate(projected)
                 }
-                candidates.sortWith(compareBy<M3FeatureFusionCandidate> { it.x }.thenBy { it.y }.thenBy { it.z })
+                delta.sortWith(compareBy<M3FeatureFusionCandidate> { it.x }.thenBy { it.y }.thenBy { it.z })
                 val result = M3FeatureFusionResult.Accepted(
-                    Collections.unmodifiableList(candidates),
+                    Collections.unmodifiableList(delta),
                     receipt(projectedSurfaceCount, nextAssociations),
+                    M3FeatureFusionWorkReceipt(
+                        distinctTouchedVoxelCount = updatesByKey.size,
+                        returnedCandidateCount = delta.size,
+                    ),
                 )
-                Staging.Accepted(updatesByKey.values.toList(), newBySlot.values.toList(), associations, result)
+                Staging.Accepted(
+                    updatesByKey.values.toList(),
+                    updatesByKey.values.filter { it.isNew },
+                    associations,
+                    result,
+                )
             }
         }
+
+    private fun candidate(surface: ProjectedSurface) = M3FeatureFusionCandidate(
+        surface.key.x,
+        surface.key.y,
+        surface.key.z,
+        surface.weight,
+        normalOctant(surface.key),
+        surface.observationCount,
+    )
 
     private fun insertAt(slot: Int, key: VoxelKey) {
         check(slot == surfaceCount && surfaceCount < SURFACE_CAPACITY)
@@ -264,12 +276,23 @@ internal class M3FeatureFusionBatch(val sequence: Long, val timestampNs: Long, o
 internal data class M3FeatureFusionEvidence(val xMeters: Double, val yMeters: Double, val zMeters: Double, val signedWeight: Int, val supportId: Int)
 
 internal sealed interface M3FeatureFusionResult {
-    data class Accepted(val candidates: List<M3FeatureFusionCandidate>, val receipt: M3FeatureFusionResourceReceipt) : M3FeatureFusionResult
+    /**
+     * A deterministic, immutable delta for this admitted batch.  It contains
+     * only touched voxels which are active after the batch: newly active rows
+     * and active rows whose exact candidate-A evidence was refined.
+     */
+    data class Accepted(
+        val delta: List<M3FeatureFusionCandidate>,
+        val receipt: M3FeatureFusionResourceReceipt,
+        val work: M3FeatureFusionWorkReceipt,
+    ) : M3FeatureFusionResult
     data class Refused(val reason: M3FeatureFusionRefusal, val receipt: M3FeatureFusionResourceReceipt) : M3FeatureFusionResult
 }
 
 internal data class M3FeatureFusionCandidate(val x: Int, val y: Int, val z: Int, val weight: Int, val normalOctant: Int, val observationCount: Int)
 internal data class M3FeatureFusionResourceReceipt(val surfaceCount: Int, val associationCount: Int, val assignedTupleShareBytes: Int)
+/** Scalar-only receipt for bounded output work; it never exposes retained rows. */
+internal data class M3FeatureFusionWorkReceipt(val distinctTouchedVoxelCount: Int, val returnedCandidateCount: Int)
 
 internal enum class M3FeatureFusionRefusal {
     STALE_BATCH,

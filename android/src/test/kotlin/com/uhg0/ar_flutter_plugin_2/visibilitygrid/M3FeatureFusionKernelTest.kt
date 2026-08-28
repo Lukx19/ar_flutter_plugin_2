@@ -22,7 +22,7 @@ class M3FeatureFusionKernelTest {
     fun `candidate A bytes match the immutable fusion lock and reject B and C`() {
         val root = fixture("m0b_fusion_vector_v1.json")
         val observations = root.getValue("observations").jsonArray.map(::fusionEvidence)
-        val actual = canonical(accepted(kernel(), batch(1, observations)).candidates)
+        val actual = canonical(accepted(kernel(), batch(1, observations)).delta)
         val expected = root.getValue("expected").jsonObject
         val candidateA = canonicalExpected(expected.getValue("A").jsonArray)
         val candidateB = canonicalExpected(expected.getValue("B").jsonArray)
@@ -56,15 +56,15 @@ class M3FeatureFusionKernelTest {
             val expectedKeys = oracle.getValue("scenes").jsonArray
                 .first { it.jsonObject.string("name") == scene.string("name") }.jsonObject
                 .getValue("expectedSurfaceKeys").jsonArray.map { key -> key.jsonArray.joinToString(",") { it.jsonPrimitive.content } }.sorted()
-            val first = accepted(kernel(), batch(1, observations)).candidates
-            val second = accepted(kernel(), batch(1, observations.reversed())).candidates
+            val first = accepted(kernel(), batch(1, observations)).delta
+            val second = accepted(kernel(), batch(1, observations.reversed())).delta
             assertArrayEquals(scene.string("name"), canonical(first), canonical(second))
             assertEquals(scene.string("name"), expectedKeys, first.map { "${it.x},${it.y},${it.z}" }.sorted())
         }
     }
 
     @Test
-    fun `allocation failures before and after preflight preserve prior receipt and candidates`() {
+    fun `allocation failures before and after preflight preserve prior receipt and next delta`() {
         M3AllocationCut.entries.forEach { cut ->
             val operations = FaultOperations(allocationCut = cut)
             val kernel = M3FeatureFusionKernel(operations)
@@ -75,7 +75,7 @@ class M3FeatureFusionKernelTest {
             assertEquals(cut.name, prior.receipt, refusal.receipt)
 
             val later = accepted(kernel, batch(2, emptyList()))
-            assertEquals(cut.name, prior.candidates, later.candidates)
+            assertTrue(cut.name, later.delta.isEmpty())
             assertEquals(cut.name, prior.receipt, later.receipt)
         }
     }
@@ -90,7 +90,7 @@ class M3FeatureFusionKernelTest {
         assertEquals(M3FeatureFusionRefusal.CHECKED_ARITHMETIC, refusal.reason)
         assertEquals(prior.receipt, refusal.receipt)
         val later = accepted(kernel, batch(2, emptyList()))
-        assertEquals(prior.candidates, later.candidates)
+        assertTrue(later.delta.isEmpty())
         assertEquals(prior.receipt, later.receipt)
     }
 
@@ -109,7 +109,7 @@ class M3FeatureFusionKernelTest {
         val later = accepted(kernel, batch(2, listOf(evidence(0, 0, 0, 1, 100_001))))
         assertEquals(100_000, later.receipt.surfaceCount)
         assertEquals(100_001, later.receipt.associationCount)
-        assertEquals(3, later.candidates.first { it.x == 0 }.weight)
+        assertEquals(3, later.delta.first { it.x == 0 }.weight)
     }
 
     @Test
@@ -130,11 +130,11 @@ class M3FeatureFusionKernelTest {
 
         val retry = accepted(kernel, batch(3, emptyList()))
         assertEquals(full.receipt, retry.receipt)
-        assertEquals(full.candidates, retry.candidates)
+        assertTrue(retry.delta.isEmpty())
     }
 
     @Test
-    fun `nonfinite invalid weight and stale refusals preserve candidates and sequence for retry`() {
+    fun `nonfinite invalid weight and stale refusals preserve state and sequence for retry`() {
         val kernel = kernel()
         var prior = accepted(kernel, batch(1, listOf(evidence(0, 0, 0, 2, 1))))
 
@@ -147,21 +147,21 @@ class M3FeatureFusionKernelTest {
         assertAtomicRefusal(M3FeatureFusionRefusal.NON_FINITE_COORDINATE, prior, nonFinite)
         var retry = accepted(kernel, batch(2, emptyList()))
         assertEquals(prior.receipt, retry.receipt)
-        assertEquals(prior.candidates, retry.candidates)
+        assertTrue(retry.delta.isEmpty())
         prior = retry
 
         val invalidWeight = kernel.accept(batch(3, listOf(evidence(1, 0, 0, 128, 3)))) as M3FeatureFusionResult.Refused
         assertAtomicRefusal(M3FeatureFusionRefusal.INVALID_EVIDENCE_WEIGHT, prior, invalidWeight)
         retry = accepted(kernel, batch(3, emptyList()))
         assertEquals(prior.receipt, retry.receipt)
-        assertEquals(prior.candidates, retry.candidates)
+        assertTrue(retry.delta.isEmpty())
         prior = retry
 
         val stale = kernel.accept(M3FeatureFusionBatch(4, 2, listOf(evidence(1, 0, 0, 2, 4)))) as M3FeatureFusionResult.Refused
         assertAtomicRefusal(M3FeatureFusionRefusal.STALE_BATCH, prior, stale)
         retry = accepted(kernel, M3FeatureFusionBatch(4, 4, emptyList()))
         assertEquals(prior.receipt, retry.receipt)
-        assertEquals(prior.candidates, retry.candidates)
+        assertTrue(retry.delta.isEmpty())
     }
 
     @Test
@@ -198,8 +198,6 @@ class M3FeatureFusionKernelTest {
     ) {
         assertEquals(reason, refusal.reason)
         assertEquals(prior.receipt, refusal.receipt)
-        // A successful same-sequence retry below observes this unchanged list.
-        assertTrue(prior.candidates.isNotEmpty())
     }
     private fun batch(sequence: Long, observations: List<M3FeatureFusionEvidence>) = M3FeatureFusionBatch(sequence, sequence, observations)
     private fun evidence(x: Int, y: Int, z: Int, weight: Int, supportId: Int) =
