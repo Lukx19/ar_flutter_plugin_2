@@ -74,11 +74,14 @@ internal class M3SurfaceOwnership private constructor(
         }
 
         val stagedRows = preparation.rows
-        val accepted = M3SurfaceOwnershipResult.Accepted(stagedRows.toList(), snapshot(stagedRows.size, preparation.newCount))
+        val nextRows = rowsById.toMutableMap()
+        preparation.changedRows.forEach { nextRows[it.id.value] = it }
+        val accepted = M3SurfaceOwnershipResult.Accepted(
+            stagedRows.toList(),
+            M3SurfaceOwnershipReceipt(nextHighWater, nextRows.size, stagedRows.size, preparation.newCount),
+        )
         val receipt = M3StoredReceipt(commandHash, fingerprint, accepted)
         try {
-            val nextRows = rowsById.toMutableMap()
-            preparation.changedRows.forEach { nextRows[it.id.value] = it }
             store.writeSnapshot(M3OwnershipSnapshot(nextHighWater, nextRows.values.toList(), receipts.values.toList() + receipt))
         } catch (_: M3OwnershipFault) {
             return M3SurfaceOwnershipResult.Refused(M3SurfaceOwnershipRefusal.DURABILITY_FAILURE, snapshot())
@@ -256,7 +259,8 @@ private class M3FileSurfaceOwnershipStore(directory: File, private val group: M3
 private fun validate(group: M3SurfaceGroup, configuration: M3SurfaceOwnershipConfiguration, reservations: List<M3Reservation>, snapshot: M3OwnershipSnapshot): M3RestoredOwnership {
     var highWater = 1L; var previous = ByteArray(32); var revision = 0L
     reservations.forEach { record ->
-        if (record.revision != ++revision || record.start != highWater || record.endExclusive !in (record.start + 1)..0x1_0000_0000L || !record.groupHash.contentEquals(group.hash) || !record.previousHash.contentEquals(previous) || record.recordHash.contentEquals(ByteArray(32))) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT)
+        if (record.revision != ++revision || record.start != highWater || record.endExclusive <= record.start || !record.groupHash.contentEquals(group.hash) || !record.previousHash.contentEquals(previous) || record.recordHash.contentEquals(ByteArray(32))) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT)
+        if (record.endExclusive > 0x1_0000_0000L) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.EXHAUSTED)
         highWater = record.endExclusive; previous = record.recordHash
     }
     if (snapshot.nextHighWater !in 1..highWater) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.FORK)
@@ -272,11 +276,70 @@ private fun validate(group: M3SurfaceGroup, configuration: M3SurfaceOwnershipCon
 
 private fun readLedger(file: File): List<M3Reservation> { if (!file.exists()) return emptyList(); val bytes = file.readBytes(); val recordBytes = 4 + 4 + 8 + 8 + 8 + 32 * 5; if (bytes.size % recordBytes != 0) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT); return bytes.asList().chunked(recordBytes).map { decodeReservation(it.toByteArray()) } }
 private fun decodeReservation(bytes: ByteArray): M3Reservation { val data = DataInputStream(ByteArrayInputStream(bytes)); if (data.readInt() != 0x4d33524c || data.readInt() != 1) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT); val record = M3Reservation(data.readLong(), data.readLong(), data.readLong(), ByteArray(32).also(data::readFully), ByteArray(32).also(data::readFully), ByteArray(32).also(data::readFully), ByteArray(32).also(data::readFully)); val hash = ByteArray(32).also(data::readFully); if (!hash.contentEquals(record.recordHash)) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT); return record }
-private fun encodeSnapshot(snapshot: M3OwnershipSnapshot): ByteArray { val body = ByteArrayOutputStream().use { output -> DataOutputStream(output).use { data -> data.writeInt(0x4d33534f); data.writeInt(1); data.writeLong(snapshot.nextHighWater); data.writeInt(snapshot.rows.size); snapshot.rows.forEach { row -> data.writeLong(row.id.value); data.writeUTF(row.group.value); data.writeInt(row.voxel.x); data.writeInt(row.voxel.y); data.writeInt(row.voxel.z); data.writeInt(row.region.x); data.writeInt(row.region.y); data.writeInt(row.region.z); data.writeInt(row.page); data.writeInt(row.packedNormal); data.writeInt(row.confidenceQ15); data.write(row.allocatedBy) }; data.writeInt(snapshot.receipts.size); snapshot.receipts.forEach { receipt -> data.write(receipt.commandHash); data.write(receipt.fingerprint); val accepted = receipt.result; data.writeInt(accepted.owners.size); accepted.owners.forEach { data.writeLong(it.id.value) }; data.writeLong(accepted.receipt.nextSurfaceIdHighWater); data.writeInt(accepted.receipt.liveSurfaceCount); data.writeInt(accepted.receipt.resultRowCount); data.writeInt(accepted.receipt.allocatedCount) }; output.toByteArray() }; return body + sha256(body) }
+private fun encodeSnapshot(snapshot: M3OwnershipSnapshot): ByteArray {
+    val body = ByteArrayOutputStream().use { output ->
+        DataOutputStream(output).use { data ->
+            data.writeInt(0x4d33534f)
+            data.writeInt(1)
+            data.writeLong(snapshot.nextHighWater)
+            data.writeInt(snapshot.rows.size)
+            snapshot.rows.forEach { row ->
+                data.writeLong(row.id.value)
+                data.writeUTF(row.group.value)
+                data.writeInt(row.voxel.x)
+                data.writeInt(row.voxel.y)
+                data.writeInt(row.voxel.z)
+                data.writeInt(row.region.x)
+                data.writeInt(row.region.y)
+                data.writeInt(row.region.z)
+                data.writeInt(row.page)
+                data.writeInt(row.packedNormal)
+                data.writeInt(row.confidenceQ15)
+                data.write(row.allocatedBy)
+            }
+            data.writeInt(snapshot.receipts.size)
+            snapshot.receipts.forEach { receipt ->
+                data.write(receipt.commandHash)
+                data.write(receipt.fingerprint)
+                val accepted = receipt.result
+                data.writeInt(accepted.owners.size)
+                accepted.owners.forEach { data.writeLong(it.id.value) }
+                data.writeLong(accepted.receipt.nextSurfaceIdHighWater)
+                data.writeInt(accepted.receipt.liveSurfaceCount)
+                data.writeInt(accepted.receipt.resultRowCount)
+                data.writeInt(accepted.receipt.allocatedCount)
+            }
+        }
+        output.toByteArray()
+    }
+    return body + sha256(body)
+}
 private fun decodeSnapshot(bytes: ByteArray): M3OwnershipSnapshot = try { if (bytes.size < 32) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT); val body = bytes.copyOfRange(0, bytes.size - 32); if (!sha256(body).contentEquals(bytes.copyOfRange(bytes.size - 32, bytes.size))) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT); DataInputStream(ByteArrayInputStream(body)).use { data -> if (data.readInt() != 0x4d33534f || data.readInt() != 1) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT); val high = data.readLong(); val rows = List(data.readInt()) { M3SurfaceOwner(M3SurfaceId(data.readLong()), M3SurfaceGroup(data.readUTF()), M3Voxel(data.readInt(), data.readInt(), data.readInt()), M3StorageRegion(data.readInt(), data.readInt(), data.readInt()), data.readInt(), data.readInt(), data.readInt(), ByteArray(32).also(data::readFully)) }; val byId = rows.associateBy { it.id.value }; val receipts = List(data.readInt()) { val commandHash = ByteArray(32).also(data::readFully); val fingerprint = ByteArray(32).also(data::readFully); val owners = List(data.readInt()) { byId[data.readLong()] ?: throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT) }; val receipt = M3SurfaceOwnershipReceipt(data.readLong(), data.readInt(), data.readInt(), data.readInt()); M3StoredReceipt(commandHash, fingerprint, M3SurfaceOwnershipResult.Accepted(owners, receipt)) }; if (data.available() != 0) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT); M3OwnershipSnapshot(high, rows, receipts) } } catch (failure: M3RestoreFailure) { throw failure } catch (_: Exception) { throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT) }
 
 private fun rowsById(rows: List<M3SurfaceOwner>, id: Long): M3SurfaceOwner? = rows.firstOrNull { it.id.value == id }
-private fun locationFor(configuration: M3SurfaceOwnershipConfiguration, voxel: M3Voxel): M3Location? { val cellsPerRegion = configuration.regionMicrometers / configuration.voxelMicrometers; val cellsPerPage = configuration.pageMicrometers / configuration.voxelMicrometers; if (cellsPerRegion != cellsPerPage * 3) return null; fun axis(value: Int): Pair<Int, Int> = Math.floorDiv(value, cellsPerRegion) to Math.floorMod(value, cellsPerRegion); val (rx, lx) = axis(voxel.x); val (ry, ly) = axis(voxel.y); val (rz, lz) = axis(voxel.z); val px = lx / cellsPerPage; val py = ly / cellsPerPage; val pz = lz / cellsPerPage; return if (px !in 0..2 || py !in 0..2 || pz !in 0..2) null else M3Location(M3StorageRegion(rx, ry, rz), px + 3 * (py + 3 * pz)) }
+private fun locationFor(
+    configuration: M3SurfaceOwnershipConfiguration,
+    voxel: M3Voxel,
+): M3Location? {
+    val cellsPerRegion = configuration.regionMicrometers / configuration.voxelMicrometers
+    val cellsPerPage = configuration.pageMicrometers / configuration.voxelMicrometers
+    if (cellsPerRegion != cellsPerPage * 3) return null
+
+    fun axis(value: Int): Pair<Int, Int> =
+        Math.floorDiv(value, cellsPerRegion) to Math.floorMod(value, cellsPerRegion)
+
+    val (rx, lx) = axis(voxel.x)
+    val (ry, ly) = axis(voxel.y)
+    val (rz, lz) = axis(voxel.z)
+    val px = lx / cellsPerPage
+    val py = ly / cellsPerPage
+    val pz = lz / cellsPerPage
+    return if (px !in 0..2 || py !in 0..2 || pz !in 0..2) {
+        null
+    } else {
+        M3Location(M3StorageRegion(rx, ry, rz), px + 3 * (py + 3 * pz))
+    }
+}
 
 private fun packNormal(x: Double, y: Double, z: Double, confidence: Double): Pair<Int, Int>? { if (!x.isFinite() || !y.isFinite() || !z.isFinite() || !confidence.isFinite() || confidence !in 0.0..1.0) return null; val length = sqrt(x * x + y * y + z * z); if (length == 0.0) return null; var nx = x / length; var ny = y / length; val nz = z / length; val denominator = abs(nx) + abs(ny) + abs(nz); nx /= denominator; ny /= denominator; if (nz < 0) { val oldX = nx; nx = (1 - abs(ny)) * if (oldX >= 0) 1 else -1; ny = (1 - abs(oldX)) * if (ny >= 0) 1 else -1 }; val qx = (nx * 32767).roundToInt().coerceIn(-32767, 32767); val qy = (ny * 32767).roundToInt().coerceIn(-32767, 32767); return (((qx and 0xffff) shl 16) or (qy and 0xffff)) to (confidence * 32767).roundToInt() }
 private fun sha256(bytes: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(bytes)
