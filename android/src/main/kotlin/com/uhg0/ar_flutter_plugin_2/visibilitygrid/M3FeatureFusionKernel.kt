@@ -41,7 +41,7 @@ internal class M3FeatureFusionKernel(
         while (index < staged.updates.size) {
             val update = staged.updates[index++]
             accumulatedWeights[update.slot] = update.weight
-            observationCounts[update.slot] = update.observationCount
+            observationCounts[update.slot] = encodeObservationState(update.observationCount, update.primarySide)
             active[update.slot] = update.isActive
             axisXQ13[update.slot] = update.axisXQ13
             axisYQ13[update.slot] = update.axisYQ13
@@ -131,15 +131,16 @@ internal class M3FeatureFusionKernel(
                 if (projected == null) {
                     val existing = findSlot(item.key)
                     if (existing >= 0) {
-                        projected = ProjectedSurface(existing, item.key, accumulatedWeights[existing], observationCounts[existing], active[existing], false,
-                            axisXQ13[existing], axisYQ13[existing], axisZQ13[existing], positiveSupportQ13[existing], negativeSupportQ13[existing])
+                        projected = ProjectedSurface(existing, item.key, accumulatedWeights[existing], observationCount(observationCounts[existing]), active[existing], false,
+                            axisXQ13[existing], axisYQ13[existing], axisZQ13[existing], positiveSupportQ13[existing], negativeSupportQ13[existing],
+                            primarySide(observationCounts[existing]))
                     } else {
                         val next = addOrRefuse(projectedSurfaceCount, 1)
                             ?: return@allocate Staging.Refused(M3FeatureFusionRefusal.CHECKED_ARITHMETIC)
                         if (next > SURFACE_CAPACITY) {
                             return@allocate Staging.Refused(M3FeatureFusionRefusal.SURFACE_CAPACITY)
                         }
-                        projected = ProjectedSurface(projectedSurfaceCount, item.key, 0, 0, false, true, 0, 0, 0, 0, 0)
+                        projected = ProjectedSurface(projectedSurfaceCount, item.key, 0, 0, false, true, 0, 0, 0, 0, 0, M3FeaturePrimarySide.NONE)
                         projectedSurfaceCount = next
                     }
                 }
@@ -154,6 +155,9 @@ internal class M3FeatureFusionKernel(
                 updatesByKey[item.key] = updated
                 associations += ProjectedAssociation(updated.slot, item.signedWeight, item.supportId)
             }
+            // Pin only from the complete cumulative state for this admitted
+            // batch. Raw input permutation cannot choose a transient winner.
+            updatesByKey.entries.forEach { entry -> entry.setValue(pinReliablePrimary(entry.value)) }
 
             operations.allocate(M3AllocationCut.RESULT) {
                 // The result is deliberately derived only from the distinct voxels
@@ -206,8 +210,9 @@ internal class M3FeatureFusionKernel(
 
     /** Within-band confidence is retained evidence, not canonical material state. */
     private fun hasMaterialChange(surface: ProjectedSurface, axisOctCodes: MutableMap<DirectionKey, Pair<Int, Int>>): Boolean {
-        val previous = ProjectedSurface(surface.slot, surface.key, accumulatedWeights[surface.slot], observationCounts[surface.slot], active[surface.slot], false,
-            axisXQ13[surface.slot], axisYQ13[surface.slot], axisZQ13[surface.slot], positiveSupportQ13[surface.slot], negativeSupportQ13[surface.slot])
+        val previous = ProjectedSurface(surface.slot, surface.key, accumulatedWeights[surface.slot], observationCount(observationCounts[surface.slot]), active[surface.slot], false,
+            axisXQ13[surface.slot], axisYQ13[surface.slot], axisZQ13[surface.slot], positiveSupportQ13[surface.slot], negativeSupportQ13[surface.slot],
+            primarySide(observationCounts[surface.slot]))
         val before = hypotheses(previous, axisOctCodes)
         val after = hypotheses(surface, axisOctCodes)
         return before.size != after.size || before.zip(after).any { (old, new) ->
@@ -221,6 +226,30 @@ internal class M3FeatureFusionKernel(
         in 1 until 64 -> 1
         in 64 until 192 -> 64
         else -> 192
+    }
+
+    private fun pinReliablePrimary(surface: ProjectedSurface): ProjectedSurface {
+        if (surface.primarySide != M3FeaturePrimarySide.NONE || surface.positiveSupportQ13 == surface.negativeSupportQ13) return surface
+        val positive = normalConfidence(surface.positiveSupportQ13)
+        val negative = normalConfidence(surface.negativeSupportQ13)
+        val dominant = if (surface.positiveSupportQ13 > surface.negativeSupportQ13) {
+            M3FeaturePrimarySide.POSITIVE to positive
+        } else {
+            M3FeaturePrimarySide.NEGATIVE to negative
+        }
+        return if (dominant.second >= 64) surface.copy(primarySide = dominant.first) else surface
+    }
+
+    private fun observationCount(encoded: Int): Int = encoded and OBSERVATION_COUNT_MASK
+    private fun primarySide(encoded: Int): M3FeaturePrimarySide = when (encoded ushr OBSERVATION_PRIMARY_SHIFT) {
+        0 -> M3FeaturePrimarySide.NONE
+        1 -> M3FeaturePrimarySide.POSITIVE
+        2 -> M3FeaturePrimarySide.NEGATIVE
+        else -> error("invalid retained primary-side state")
+    }
+    private fun encodeObservationState(count: Int, side: M3FeaturePrimarySide): Int {
+        require(count in 0..OBSERVATION_COUNT_MASK)
+        return count or (side.code shl OBSERVATION_PRIMARY_SHIFT)
     }
 
     private fun insertAt(slot: Int, key: VoxelKey) {
@@ -295,21 +324,32 @@ internal class M3FeatureFusionKernel(
             return listOf(M3FeatureNormalCandidate(surface.key.x, surface.key.y, surface.key.z, M3FeatureNormalFace.PRIMARY,
                 (chosen ushr 8).toByte().toInt(), chosen.toByte().toInt(), 0))
         }
-        fun confidence(support: Int) = (M3NormalMath.roundTiesEven(support.toLong() * 255L, 4L * 8192L)).coerceIn(0L, 255L).toInt()
-        val positiveConfidence = confidence(positive)
-        val negativeConfidence = confidence(negative)
+        val positiveConfidence = normalConfidence(positive)
+        val negativeConfidence = normalConfidence(negative)
         val bothReliable = positiveConfidence >= 64 && negativeConfidence >= 64
-        val primaryPositive = positive > negative
+        val primaryPositive = when (surface.primarySide) {
+            M3FeaturePrimarySide.POSITIVE -> true
+            M3FeaturePrimarySide.NEGATIVE -> false
+            M3FeaturePrimarySide.NONE -> positive > negative
+        }
         val primaryCode = if (primaryPositive) axisCode else opposite
-        val primaryConfidence = if (bothReliable) maxOf(positiveConfidence, negativeConfidence) else confidence(kotlin.math.abs(positive - negative))
+        val primaryConfidence = if (bothReliable) {
+            if (primaryPositive) positiveConfidence else negativeConfidence
+        } else {
+            normalConfidence(kotlin.math.abs(positive - negative))
+        }
         val primary = M3FeatureNormalCandidate(surface.key.x, surface.key.y, surface.key.z, M3FeatureNormalFace.PRIMARY,
             (primaryCode ushr 8).toByte().toInt(), primaryCode.toByte().toInt(), primaryConfidence)
         if (!bothReliable) return listOf(primary)
         val opposingCode = if (primaryPositive) opposite else axisCode
         return listOf(primary, M3FeatureNormalCandidate(surface.key.x, surface.key.y, surface.key.z, M3FeatureNormalFace.OPPOSING,
-            (opposingCode ushr 8).toByte().toInt(), opposingCode.toByte().toInt(), minOf(positiveConfidence, negativeConfidence)))
+            (opposingCode ushr 8).toByte().toInt(), opposingCode.toByte().toInt(),
+            if (primaryPositive) negativeConfidence else positiveConfidence))
             .sortedBy { ((it.normalOctX and 0xff) shl 8) or (it.normalOctY and 0xff) }
     }
+
+    private fun normalConfidence(support: Int): Int =
+        M3NormalMath.roundTiesEven(support.toLong() * 255L, 4L * 8192L).coerceIn(0L, 255L).toInt()
 
     private data class VoxelKey(val x: Int, val y: Int, val z: Int)
     private data class DirectionKey(val x: Int, val y: Int, val z: Int)
@@ -318,6 +358,7 @@ internal class M3FeatureFusionKernel(
     private data class ProjectedSurface(
         val slot: Int, val key: VoxelKey, val weight: Int, val observationCount: Int, val isActive: Boolean, val isNew: Boolean,
         val axisXQ13: Int, val axisYQ13: Int, val axisZQ13: Int, val positiveSupportQ13: Int, val negativeSupportQ13: Int,
+        val primarySide: M3FeaturePrimarySide,
     ) {
         fun addNormal(evidence: NormalizedEvidence): ProjectedSurface {
             fun contribution(component: Int) = Math.toIntExact(M3NormalMath.roundTiesEven(component.toLong() * evidence.supportQ13, 32_767L))
@@ -374,11 +415,15 @@ internal class M3FeatureFusionKernel(
         const val OCCUPANCY_THRESHOLD = 2
         const val DEACTIVATION_THRESHOLD = 1
         const val EVIDENCE_SATURATION = 127
+        const val OBSERVATION_PRIMARY_SHIFT = 30
+        const val OBSERVATION_COUNT_MASK = (1 shl OBSERVATION_PRIMARY_SHIFT) - 1
         const val VOXEL_METERS = 0.1
         const val VOXEL_MIN = -(1 shl 20).toDouble()
         const val VOXEL_MAX = ((1 shl 20) - 1).toDouble()
     }
 }
+
+private enum class M3FeaturePrimarySide(val code: Int) { NONE(0), POSITIVE(1), NEGATIVE(2) }
 
 /** Internal seam: production and fault-injected adapters stage the same work. */
 internal interface M3KernelOperations {

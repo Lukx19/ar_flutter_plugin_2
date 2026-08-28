@@ -27,7 +27,7 @@ class M3FeatureNormalEvidenceTest {
     @Test
     fun `reliable opposing support becomes two ordered hypotheses and does not flip primary`() {
         val kernel = M3FeatureFusionKernel()
-        val first = accepted(kernel, batch(1, List(4) { evidence(1, it, true) }))
+        val first = accepted(kernel, batch(1, List(2) { evidence(1, it, true) }))
         val primary = upsert(first).normalCandidates.single()
         val originalCode = primary.normalOctX to primary.normalOctY
         assertEquals(M3FeatureNormalFace.PRIMARY, primary.face)
@@ -40,8 +40,11 @@ class M3FeatureNormalEvidenceTest {
         assertTrue(candidates.all { it.normalConfidence >= 64 })
         assertTrue(candidates.any { (it.normalOctX to it.normalOctY) == originalCode })
 
-        val overtaken = accepted(kernel, batch(3, List(4) { evidence(20, it + 6, false) }))
-        assertTrue(upsert(overtaken).normalCandidates.any { (it.normalOctX to it.normalOctY) == originalCode })
+        val overtaken = accepted(kernel, batch(3, List(3) { evidence(20, it + 6, false) }))
+        val overtakenCandidates = upsert(overtaken).normalCandidates
+        assertEquals(originalCode, overtakenCandidates.single { it.face == M3FeatureNormalFace.PRIMARY }.let { it.normalOctX to it.normalOctY })
+        assertTrue(overtakenCandidates.single { it.face == M3FeatureNormalFace.OPPOSING }.normalConfidence >
+            overtakenCandidates.single { it.face == M3FeatureNormalFace.PRIMARY }.normalConfidence)
     }
 
     @Test

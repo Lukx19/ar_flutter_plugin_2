@@ -104,18 +104,7 @@ internal class M3VisibilityGridIntegration(
             expectedGeometryRevision = base.geometryRevision,
             expectedLineageRevision = base.lineageRevision,
             sourceIds = emptyList(),
-            targets = targets.mapNotNull { candidate ->
-                // #111 owns the identity decision for a second opposing face;
-                // the current #62 CREATE consumes only the primary hypothesis.
-                candidate.normalCandidates.firstOrNull { it.face == M3FeatureNormalFace.PRIMARY }?.let {
-                M3CanonicalTarget(
-                    voxel = M3Voxel(candidate.x, candidate.y, candidate.z),
-                    normalOctX = it.normalOctX,
-                    normalOctY = it.normalOctY,
-                    normalConfidence = it.normalConfidence,
-                )
-                }
-            },
+            targets = targets.mapNotNull(M3FeatureFusionCandidate::primaryCanonicalTarget),
         )
         synchronized(publicationGate) {
             if (isFenced(observation.ownership)) return@mutate
@@ -346,6 +335,17 @@ internal class M3VisibilityGridIntegration(
 
     private fun drain() { executor.submit {}.get(2, TimeUnit.SECONDS) }
 }
+
+/** #111 owns creating an ID for OPPOSING; current CREATE consumes pinned PRIMARY only. */
+internal fun M3FeatureFusionCandidate.primaryCanonicalTarget(): M3CanonicalTarget? =
+    normalCandidates.firstOrNull { it.face == M3FeatureNormalFace.PRIMARY }?.let {
+        M3CanonicalTarget(
+            voxel = M3Voxel(x, y, z),
+            normalOctX = it.normalOctX,
+            normalOctY = it.normalOctY,
+            normalConfidence = it.normalConfidence,
+        )
+    }
 
 internal interface M3CommittedRendererProjection : AutoCloseable {
     fun project(

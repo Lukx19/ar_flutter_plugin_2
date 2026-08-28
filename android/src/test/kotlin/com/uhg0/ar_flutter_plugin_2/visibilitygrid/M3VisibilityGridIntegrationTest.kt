@@ -21,6 +21,24 @@ import org.junit.Test
 /** Locks Option A's M1-ACK seeded CREATE cut without a Flutter payload seam. */
 class M3VisibilityGridIntegrationTest {
     @Test
+    fun `canonical integration consumes pinned primary after stronger opposing evidence`() {
+        val kernel = M3FeatureFusionKernel()
+        val first = kernel.accept(M3FeatureFusionBatch(1, 1, List(2) { normalEvidence(it, true) }))
+            as M3FeatureFusionResult.Accepted
+        val firstCandidate = (first.delta.single() as M3FeatureFusionChange.Upsert).candidate
+        val original = firstCandidate.normalCandidates.single { it.face == M3FeatureNormalFace.PRIMARY }
+
+        val later = kernel.accept(M3FeatureFusionBatch(2, 2, List(3) { normalEvidence(it + 10, false) }))
+            as M3FeatureFusionResult.Accepted
+        val laterCandidate = (later.delta.single() as M3FeatureFusionChange.Upsert).candidate
+        val target = requireNotNull(laterCandidate.primaryCanonicalTarget())
+
+        assertEquals(original.normalOctX, target.normalOctX)
+        assertEquals(original.normalOctY, target.normalOctY)
+        assertTrue(laterCandidate.normalCandidates.single { it.face == M3FeatureNormalFace.OPPOSING }.normalConfidence > target.normalConfidence)
+    }
+
+    @Test
     fun `real binding publishes adjacent CREATE with exact replay and same renderer cut`() {
         val directory = Files.createTempDirectory("m3-runtime-integration").toFile()
         val messenger = MethodTestMessenger()
@@ -248,6 +266,14 @@ class M3VisibilityGridIntegrationTest {
             sourceRejectedSamples = 0,
             payloadBytes = VisibilityFeatureObservation.FEATURE_FIXED_BYTES +
                 samples.size * VisibilityFeatureObservation.FEATURE_SAMPLE_BYTES,
+        )
+    }
+
+    private fun normalEvidence(supportId: Int, positive: Boolean): M3FeatureFusionEvidence {
+        val cameraX = if (positive) 1_020 else -980
+        return M3FeatureFusionEvidence(
+            0.02, 0.02, 0.02, 2, supportId,
+            M3FeatureNormalEvidence(0, 0, 0, 20, 20, 20, cameraX, 20, 20, 32_767),
         )
     }
 
