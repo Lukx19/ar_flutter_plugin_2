@@ -152,13 +152,21 @@ internal class M3SurfaceOwnership private constructor(
         prepared.targets.forEach { row -> nextRows[row.id.value] = row; nextVoxels[row.voxel] = row.id.value }
         val nextSupports = supportById.toMutableMap()
         prepared.removedIds.forEach(nextSupports::remove)
-        prepared.targets.forEach { nextSupports[it.id.value] = prepared.sourceSupport.copyOf() }
+        prepared.targets.forEach { target ->
+            nextSupports[target.id.value] = if (command.kind == M3CanonicalOperation.CREATE) {
+                longArrayOf(target.id.value)
+            } else {
+                prepared.sourceSupport.copyOf()
+            }
+        }
         val nextSourceRecords = sourceRecords.toMutableMap()
         prepared.targets.forEach { nextSourceRecords.putIfAbsent(it.id.value, it.toSourceRecord()) }
         val nextEdges = (lineageEdges + prepared.edges)
             .sortedWith(compareBy({ it.source.value }, { it.target.value }))
         val nextGeometryRevision = geometryRevision + 1
-        val nextLineageRevision = lineageRevision + 1
+        // CREATE establishes a root but has no predecessor lineage.  Keep the
+        // revision vector truthful: only the geometry authority advanced.
+        val nextLineageRevision = if (command.kind == M3CanonicalOperation.CREATE) lineageRevision else lineageRevision + 1
         val provisional = M3CanonicalTransactionResult.Accepted(
             targets = prepared.targets,
             receipt = M3CanonicalTransactionReceipt(
@@ -264,25 +272,30 @@ internal class M3SurfaceOwnership private constructor(
     }
 
     private fun prepareCanonical(command: M3CanonicalTransactionCommand, commandHash: ByteArray): M3CanonicalPreparation {
-        if (command.commandId.isBlank() || command.commandId.encodeToByteArray().size > MAX_COMMAND_BYTES ||
-            command.sourceIds.isEmpty() || command.targets.isEmpty()) {
+        if (command.commandId.isBlank() || command.commandId.encodeToByteArray().size > MAX_COMMAND_BYTES || command.targets.isEmpty()) {
             return M3CanonicalPreparation.Refused(M3CanonicalTransactionRefusal.INVALID_COMMAND)
         }
         if (command.expectedGeometryRevision != geometryRevision || command.expectedLineageRevision != lineageRevision) {
             return M3CanonicalPreparation.Refused(M3CanonicalTransactionRefusal.REVISION_CONFLICT)
         }
         val sourceIds = command.sourceIds.map { it.value }
-        if (sourceIds.toSet().size != sourceIds.size || sourceIds.any { it !in rowsById }) {
-            return M3CanonicalPreparation.Refused(M3CanonicalTransactionRefusal.UNKNOWN_IDENTITY)
-        }
         val shapeValid = when (command.kind) {
             M3CanonicalOperation.RELOCATION -> sourceIds.size == 1 && command.targets.size == 1 && command.targets.single().id?.value == sourceIds.single()
             M3CanonicalOperation.MERGE -> sourceIds.size >= 2 && command.targets.size == 1 && command.targets.single().id == null
             M3CanonicalOperation.SPLIT -> sourceIds.size == 1 && command.targets.size >= 2 && command.targets.all { it.id == null }
             M3CanonicalOperation.REPLACEMENT -> command.targets.all { it.id == null }
+            // CREATE is deliberately initial-only.  It is the bootstrap path,
+            // not an alternate mutation route around canonical lineage.
+            M3CanonicalOperation.CREATE -> rowsById.isEmpty() && supportById.isEmpty() && sourceRecords.isEmpty() &&
+                lineageEdges.isEmpty() && transactionReceipts.isEmpty() && geometryRevision == 0L && lineageRevision == 0L &&
+                sourceIds.isEmpty() && command.targets.all { it.id == null }
         }
         if (!shapeValid) return M3CanonicalPreparation.Refused(M3CanonicalTransactionRefusal.INVALID_COMMAND)
-        if (geometryRevision >= configuration.revisionLimit || lineageRevision >= configuration.revisionLimit) {
+        if (sourceIds.toSet().size != sourceIds.size || sourceIds.any { it !in rowsById }) {
+            return M3CanonicalPreparation.Refused(M3CanonicalTransactionRefusal.UNKNOWN_IDENTITY)
+        }
+        if (geometryRevision >= configuration.revisionLimit ||
+            (command.kind != M3CanonicalOperation.CREATE && lineageRevision >= configuration.revisionLimit)) {
             return M3CanonicalPreparation.Refused(M3CanonicalTransactionRefusal.REVISION_EXHAUSTED)
         }
         val allocations = command.targets.count { it.id == null }
@@ -321,7 +334,9 @@ internal class M3SurfaceOwnership private constructor(
             .sortedWith(compareBy({ it.source.value }, { it.target.value }))
         val preview = M3CanonicalTransactionResult.Accepted(targets, M3CanonicalTransactionReceipt(
             command.commandId, command.kind, sourceIds.sorted().map(::M3SurfaceId), edges,
-            geometryRevision + 1, lineageRevision + 1, nextHighWater + allocations, finalCount,
+            geometryRevision + 1,
+            if (command.kind == M3CanonicalOperation.CREATE) lineageRevision else lineageRevision + 1,
+            nextHighWater + allocations, finalCount,
             sourceSupport.map { sourceRecords.getValue(it).toReceiptSupport() },
             M3CanonicalReceiptBytes.EMPTY,
         ))
@@ -474,7 +489,8 @@ internal enum class M3NormalReliabilityBand { UNKNOWN, WEAK, RELIABLE, STRONG }
 internal data class M3SurfaceOwnershipReceipt(val nextSurfaceIdHighWater: Long, val liveSurfaceCount: Int, val resultRowCount: Int, val allocatedCount: Int)
 internal sealed interface M3SurfaceOwnershipResult { data class Accepted(val owners: List<M3SurfaceOwner>, val receipt: M3SurfaceOwnershipReceipt) : M3SurfaceOwnershipResult; data class Refused(val reason: M3SurfaceOwnershipRefusal, val receipt: M3SurfaceOwnershipReceipt) : M3SurfaceOwnershipResult }
 internal enum class M3SurfaceOwnershipRefusal { CLOSED, INVALID_COMMAND, INVALID_OWNERSHIP, INVALID_NORMAL, UNKNOWN_IDENTITY, OWNERSHIP_CONFLICT, CAPACITY, EXHAUSTED, IDENTITY_CONFLICT, DURABILITY_FAILURE }
-internal enum class M3CanonicalOperation { RELOCATION, MERGE, SPLIT, REPLACEMENT }
+/** Existing ordinal values are persisted in canonical receipts; append only. */
+internal enum class M3CanonicalOperation { RELOCATION, MERGE, SPLIT, REPLACEMENT, CREATE }
 internal data class M3CanonicalTarget(
     val id: M3SurfaceId? = null,
     val voxel: M3Voxel,

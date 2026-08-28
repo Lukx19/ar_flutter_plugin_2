@@ -10,6 +10,65 @@ import org.junit.Test
 
 class M3CanonicalTransactionTest {
     @Test
+    fun `create bootstrap is transact only and publishes a mixed revision cut`() {
+        val owner = opened(M3SurfaceOwnership.inMemory(M3SurfaceGroup("create")))
+        val create = create("bootstrap", 0, 1)
+
+        val committed = accepted(owner.transact(create))
+        assertEquals(M3CanonicalOperation.CREATE, committed.receipt.kind)
+        assertEquals(listOf(1L, 2L), committed.targets.map { it.id.value })
+        assertEquals(emptyList<M3SurfaceId>(), committed.receipt.removedSurfaceIds)
+        assertEquals(emptyList<M3LineageEdge>(), committed.receipt.lineageEdges)
+        assertEquals(emptyList<M3ImmutableSourceSupport>(), committed.receipt.sourceSupport)
+        assertTrue(committed.receipt.canonicalBytes.size > 0)
+        assertCut(committed, 1, 0, 3, 2)
+
+        // This first qualified-surface path deliberately crosses only transact;
+        // an integration bootstrap cannot need the legacy apply path to obtain IDs.
+        assertEquals(committed, accepted(owner.transact(create)))
+        assertEquals(committed.receipt.canonicalBytes, accepted(owner.transact(create)).receipt.canonicalBytes)
+        assertEquals(M3CanonicalTransactionRefusal.IDENTITY_CONFLICT,
+            refused(owner.transact(create("bootstrap", 2))).reason)
+
+        val relocated = accepted(owner.transact(command(
+            "after-create", M3CanonicalOperation.RELOCATION, 1, 0, listOf(committed.targets.first().id), target(10, committed.targets.first().id),
+        )))
+        assertCut(relocated, 2, 1, 3, 2)
+        assertEquals(listOf(committed.targets.first().id), relocated.receipt.sourceSupport.map { it.id })
+        assertEquals(listOf(M3Voxel(0, 0, 0)), relocated.receipt.sourceSupport.map { it.voxel })
+    }
+
+    @Test
+    fun `invalid and exhausted create commands retain the empty authority cut`() {
+        fun empty(result: M3CanonicalTransactionResult) = assertEquals(M3CanonicalStateReceipt(0, 0, 1, 0), refused(result).receipt)
+
+        val invalidSources = opened(M3SurfaceOwnership.inMemory(M3SurfaceGroup("create-invalid-sources")))
+        assertEquals(M3CanonicalTransactionRefusal.INVALID_COMMAND,
+            refused(invalidSources.transact(command("sources", M3CanonicalOperation.CREATE, 0, 0, listOf(M3SurfaceId(1)), target(0)))).reason)
+        empty(invalidSources.transact(command("sources-2", M3CanonicalOperation.CREATE, 0, 0, listOf(M3SurfaceId(1)), target(0))))
+
+        val explicitId = opened(M3SurfaceOwnership.inMemory(M3SurfaceGroup("create-explicit-id")))
+        assertEquals(M3CanonicalTransactionRefusal.INVALID_COMMAND,
+            refused(explicitId.transact(command("id", M3CanonicalOperation.CREATE, 0, 0, emptyList(), target(0, M3SurfaceId(1))))).reason)
+        empty(explicitId.transact(command("id-2", M3CanonicalOperation.CREATE, 0, 0, emptyList(), target(0, M3SurfaceId(1)))))
+
+        val capacity = opened(M3SurfaceOwnership.inMemory(M3SurfaceGroup("create-capacity"), M3SurfaceOwnershipConfiguration(surfaceCapacity = 1)))
+        assertEquals(M3CanonicalTransactionRefusal.CAPACITY,
+            refused(capacity.transact(create("capacity", 0, 1))).reason)
+        empty(capacity.transact(create("capacity-retry", 0, 1)))
+
+        val revisions = opened(M3SurfaceOwnership.inMemory(M3SurfaceGroup("create-revision"), M3SurfaceOwnershipConfiguration(revisionLimit = 0)))
+        assertEquals(M3CanonicalTransactionRefusal.REVISION_EXHAUSTED,
+            refused(revisions.transact(create("revision", 0))).reason)
+        empty(revisions.transact(create("revision-retry", 0)))
+
+        val journal = opened(M3SurfaceOwnership.inMemory(M3SurfaceGroup("create-journal"), M3SurfaceOwnershipConfiguration(changeJournalByteCapacity = 1)))
+        assertEquals(M3CanonicalTransactionRefusal.JOURNAL_EXHAUSTED,
+            refused(journal.transact(create("journal", 0))).reason)
+        empty(journal.transact(create("journal-retry", 0)))
+    }
+
+    @Test
     fun `relocate merge split and replace commit exact cuts and immutable support`() {
         val owner = opened(M3SurfaceOwnership.inMemory(M3SurfaceGroup("canonical")))
         val initial = ownership(owner, "seed", 0, 1, 2, 3)
@@ -88,7 +147,11 @@ class M3CanonicalTransactionTest {
     }
 
     private fun command(id: String, kind: M3CanonicalOperation, revision: Long, sources: List<M3SurfaceId>, vararg targets: M3CanonicalTarget) =
-        M3CanonicalTransactionCommand(id, kind, revision, revision, sources, targets.toList())
+        command(id, kind, revision, revision, sources, *targets)
+    private fun command(id: String, kind: M3CanonicalOperation, geometryRevision: Long, lineageRevision: Long, sources: List<M3SurfaceId>, vararg targets: M3CanonicalTarget) =
+        M3CanonicalTransactionCommand(id, kind, geometryRevision, lineageRevision, sources, targets.toList())
+    private fun create(id: String, vararg xs: Int) =
+        command(id, M3CanonicalOperation.CREATE, 0, 0, emptyList(), *xs.map(::target).toTypedArray())
     private fun target(x: Int, id: M3SurfaceId? = null) = M3CanonicalTarget(id, M3Voxel(x, 0, 0), 0, 0, 192)
     private fun candidate(x: Int) = M3SurfaceCandidate(voxel = M3Voxel(x, 0, 0), normalOctX = 0, normalOctY = 0, normalConfidence = 192)
     private fun ownership(owner: M3SurfaceOwnership, id: String, vararg xs: Int) = (owner.apply(M3SurfaceOwnershipCommand(id, xs.map(::candidate))) as M3SurfaceOwnershipResult.Accepted).owners

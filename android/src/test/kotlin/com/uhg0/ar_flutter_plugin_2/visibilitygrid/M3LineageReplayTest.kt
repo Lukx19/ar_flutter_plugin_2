@@ -5,11 +5,28 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class M3LineageReplayTest {
+    @Test
+    fun `create receipt reopens byte identically while preserving legacy operation ordinals`() {
+        val directory = Files.createTempDirectory("m3-create-replay").toFile()
+        val group = M3SurfaceGroup("create-replay")
+        val create = create("bootstrap", 0, 1)
+        val owner = opened(M3SurfaceOwnership.open(group, directory))
+        val committed = accepted(owner.transact(create))
+        owner.close()
+
+        val replay = accepted(opened(M3SurfaceOwnership.open(group, directory)).transact(create))
+        assertEquals(committed, replay)
+        assertEquals(committed.receipt.canonicalBytes, replay.receipt.canonicalBytes)
+        assertEquals(listOf(0, 1, 2, 3, 4), M3CanonicalOperation.entries.map { it.ordinal })
+        assertEquals(M3CanonicalOperation.RELOCATION, M3CanonicalOperation.entries[0])
+        assertEquals(M3CanonicalOperation.REPLACEMENT, M3CanonicalOperation.entries[3])
+        assertEquals(M3CanonicalOperation.CREATE, M3CanonicalOperation.entries[4])
+    }
+
     @Test
     fun `non monotonic transaction order persists one canonically sorted lineage history`() {
         val directory = Files.createTempDirectory("m3-lineage-order").toFile()
@@ -58,7 +75,7 @@ class M3LineageReplayTest {
     }
 
     @Test
-    fun `reservation and private snapshot fault cuts expose complete prior cuts while committed cut remains complete`() {
+    fun `create reservation and snapshot fault cuts expose empty or complete cuts`() {
         val cases = listOf(
             M3SurfaceOwnershipFault.AFTER_RESERVATION_FLUSH to true,
             M3SurfaceOwnershipFault.AFTER_PRIVATE_CANDIDATE to true,
@@ -67,15 +84,11 @@ class M3LineageReplayTest {
             M3SurfaceOwnershipFault.AFTER_ROOT_SWITCH_BEFORE_DIRECTORY_SYNC to false,
             M3SurfaceOwnershipFault.AFTER_ROOT_DIRECTORY_SYNC to false,
         )
-        cases.forEachIndexed { index, (fault, allocates) ->
+        cases.forEachIndexed { index, (fault, _) ->
             val directory = Files.createTempDirectory("m3-fault-$index").toFile()
             val group = M3SurfaceGroup("fault-$index")
-            val seeder = opened(M3SurfaceOwnership.open(group, directory))
-            val source = seed(seeder); seeder.close()
             val owner = opened(M3SurfaceOwnership.open(group, directory, fault = fault))
-            val command = if (allocates) M3CanonicalTransactionCommand("replace", M3CanonicalOperation.REPLACEMENT, 0, 0,
-                listOf(source), listOf(M3CanonicalTarget(voxel = M3Voxel(10, 0, 0), normalOctX = 0, normalOctY = 0, normalConfidence = 192)))
-            else relocate("relocate", source, 10)
+            val command = create("bootstrap", 10)
             val result = owner.transact(command)
             if (fault == M3SurfaceOwnershipFault.AFTER_ROOT_SWITCH_BEFORE_DIRECTORY_SYNC || fault == M3SurfaceOwnershipFault.AFTER_ROOT_DIRECTORY_SYNC) {
                 assertEquals(1, accepted(result).receipt.geometryRevision)
@@ -83,6 +96,8 @@ class M3LineageReplayTest {
                 val refusal = refused(result)
                 assertEquals(M3CanonicalTransactionRefusal.DURABILITY_FAILURE, refusal.reason)
                 assertEquals(0, refusal.receipt.geometryRevision)
+                assertEquals(0, refusal.receipt.lineageRevision)
+                assertEquals(0, refusal.receipt.liveSurfaceCount)
             }
             owner.close()
             val reopened = opened(M3SurfaceOwnership.open(group, directory))
@@ -91,7 +106,8 @@ class M3LineageReplayTest {
             } else {
                 val retry = accepted(reopened.transact(command))
                 assertEquals(1, retry.receipt.geometryRevision)
-                if (allocates) assertNotEquals(2L, retry.targets.single().id.value)
+                assertEquals(0, retry.receipt.lineageRevision)
+                assertTrue(retry.receipt.liveSurfaceCount == 1)
             }
         }
     }
@@ -141,6 +157,10 @@ class M3LineageReplayTest {
     private fun relocate(id: String, source: M3SurfaceId, x: Int, revision: Long = 0) = M3CanonicalTransactionCommand(
         id, M3CanonicalOperation.RELOCATION, revision, revision, listOf(source),
         listOf(M3CanonicalTarget(source, M3Voxel(x, 0, 0), 0, 0, 192)),
+    )
+    private fun create(id: String, vararg xs: Int) = M3CanonicalTransactionCommand(
+        id, M3CanonicalOperation.CREATE, 0, 0, emptyList(),
+        xs.map { M3CanonicalTarget(voxel = M3Voxel(it, 0, 0), normalOctX = 0, normalOctY = 0, normalConfidence = 192) },
     )
     private fun opened(result: M3SurfaceOwnershipOpenResult) = (result as M3SurfaceOwnershipOpenResult.Opened).ownership
     private fun accepted(result: M3CanonicalTransactionResult) = result as M3CanonicalTransactionResult.Accepted
