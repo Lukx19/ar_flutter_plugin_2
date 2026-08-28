@@ -137,8 +137,11 @@ class M0aVisibilitySurfaceStreamChannelTest {
         assertEquals(64 * 1024, telemetry.resourceLimits.catchUpResponseCeilingBytes)
         assertEquals(1024, telemetry.resourceLimits.diagnosticSummaryBytes)
         assertEquals(5, telemetry.resourceLimits.diagnosticSummaryRateHz)
-        assertEquals(18, telemetry.resourceLimits.structuralTransactionFrames)
-        assertEquals(1024, telemetry.resourceLimits.structuralChunkBytes)
+        assertEquals(1_048_576, telemetry.resourceLimits.maxStructuralTransactionBytes)
+        assertEquals(67, telemetry.resourceLimits.structuralTransactionFrames)
+        assertEquals(16_260, telemetry.resourceLimits.structuralChunkBytes)
+        assertEquals(19, telemetry.resourceLimits.catchUpStructuralTransactionFrames)
+        assertEquals(65_412, telemetry.resourceLimits.catchUpStructuralChunkBytes)
         assertTrue(telemetry.allocationBytesObserved > 0)
         assertTrue(telemetry.maximumSingleAllocationBytes <= 64 * 1024)
         assertTrue(telemetry.peakWorkingSetBytes <= 256 * 1024)
@@ -298,6 +301,19 @@ class M0aVisibilitySurfaceStreamChannelTest {
             messenger.exchange(request(sequence = responses.size.toLong(), token = 27)),
         )
         assertEquals(1L, binding.transportInstrumentation.snapshot().replayedRequests)
+        val acknowledgement = M0aPacketCodec.decodeResponse(
+            messenger.exchange(
+                request(
+                    sequence = responses.size.toLong() + 1,
+                    token = 27,
+                    acknowledgedTransaction = 1,
+                    acknowledgedGeometry = 1,
+                    acknowledgedLineage = 1,
+                ),
+            ),
+        )
+        assertEquals(M0aPacketCodec.noChangesMessageKind, acknowledgement.messageKind)
+        assertEquals(1L, acknowledgement.transactionId)
         binding.dispose()
     }
 
@@ -1117,14 +1133,14 @@ class M0aVisibilitySurfaceStreamChannelTest {
         val commit = M0aPacketCodec.decodeResponse(commitBytes[0]!!)
         assertEquals(4, commit.messageKind)
         assertEquals(0, commit.errorId)
-        assertEquals(1L, authority.snapshot(scope).transactionId)
-        assertEquals(1L, lifecycle.committedBaseline().transactionId)
+        assertEquals(0L, authority.snapshot(scope).transactionId)
+        assertEquals(0L, lifecycle.committedBaseline().transactionId)
         executor.shutdown()
         assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS))
     }
 
     @Test
-    fun `known COMMIT baseline survives queued ACK deadline, wrong restore is rejected, and no duplicate authority effect`() {
+    fun `unacknowledged COMMIT deadline retains no authority and no duplicate effect`() {
         val authority = M0aCommittedBaselineAuthority()
         val lifecycle = M0aControlLifecycle(
             committedBaselineAuthority = authority,
@@ -1176,7 +1192,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
         assertEquals(4, M0aPacketCodec.decodeResponse(
             messenger.exchange(request(2, streamToken)),
         ).messageKind)
-        assertEquals(expectedBaseline, authority.snapshot(scope))
+        assertEquals(M0aCommittedBaselineV1.ZERO, authority.snapshot(scope))
         assertEquals(1, commitPublications.get())
 
         val acknowledgementReply = arrayOfNulls<ByteArray>(1)
@@ -1203,17 +1219,17 @@ class M0aVisibilitySurfaceStreamChannelTest {
         assertTrue(acknowledgementCompleted.await(2, TimeUnit.SECONDS))
         val deadline = M0aPacketCodec.decodeResponse(acknowledgementReply[0]!!)
         assertEquals(142, deadline.errorId)
-        assertEquals(expectedBaseline, authority.snapshot(scope))
+        assertEquals(M0aCommittedBaselineV1.ZERO, authority.snapshot(scope))
         releaseAcknowledgement.countDown()
         executor.shutdown()
         assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS))
         binding.dispose()
 
-        val wrongRestore = M0aControlLifecycle(
+        val freshLifecycle = M0aControlLifecycle(
             committedBaselineAuthority = authority,
         )
-        val wrongResponse = M0aControlCodec.decodeResponse(
-            wrongRestore.handle(
+        val freshResponse = M0aControlCodec.decodeResponse(
+            freshLifecycle.handle(
                 controlRequest(
                     M0aControlOperation.START,
                     0,
@@ -1230,54 +1246,9 @@ class M0aVisibilitySurfaceStreamChannelTest {
                 ),
             ),
         )
-        assertEquals(1, wrongResponse.outcome)
-        assertEquals(58, wrongResponse.errorId)
-
-        val restoredLifecycle = M0aControlLifecycle(
-            committedBaselineAuthority = authority,
-        )
-        val restoredStart = controlRequest(
-            M0aControlOperation.START,
-            0,
-            99,
-            payload = restoredPayload(geometry = 1, lineage = 1),
-        )
-        val restoredResponse = M0aControlCodec.decodeResponse(
-            restoredLifecycle.handle(
-                restoredStart,
-                M0aControlCodec.encodeRequest(restoredStart),
-            ),
-        )
-        assertEquals(0, restoredResponse.outcome)
-        val restoredResult = ByteBuffer.wrap(restoredResponse.payload)
-            .order(ByteOrder.LITTLE_ENDIAN)
-        assertEquals(1L, restoredResult.getLong(96))
-        assertEquals(1L, restoredResult.getLong(104))
-        assertEquals(expectedBaseline.copy(transactionId = 0), restoredLifecycle.committedBaseline())
-
-        val restoredBinding = M0aVisibilitySurfaceStreamChannel(
-            messenger = messenger,
-            viewId = 97,
-            controlLifecycle = restoredLifecycle,
-        )
-        val restored = M0aPacketCodec.decodeResponse(
-            messenger.exchange(
-                request(
-                    sequence = 1,
-                    token = restoredResponse.streamToken,
-                    acknowledgedTransaction = 0,
-                    acknowledgedGeometry = 1,
-                    acknowledgedLineage = 1,
-                ),
-            ),
-        )
-        assertEquals(0, restored.messageKind)
-        assertEquals(0L, restored.transactionId)
-        assertEquals(1L, restored.targetGeometryRevision)
-        assertEquals(1L, restored.targetLineageRevision)
+        assertEquals(0, freshResponse.outcome)
         assertEquals(1, commitPublications.get())
-        assertEquals(expectedBaseline, authority.snapshot(scope))
-        restoredBinding.dispose()
+        assertEquals(M0aCommittedBaselineV1.ZERO, authority.snapshot(scope))
     }
 
     @Test

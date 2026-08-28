@@ -11,6 +11,10 @@ object M0aTransactionResponseCodecV1 {
 
     fun payloadChecksum(bytes: ByteArray): Long = M0aPacketCodec.crc32Payload(bytes)
 
+    /** Maximum CHUNK data bytes that still leave room for the VGS2 envelope. */
+    fun chunkPayloadBytesForResponseCeiling(responseCeilingBytes: Int): Int =
+        M0aStructuralTransactionLimits.chunkPayloadBytesForResponseCeiling(responseCeilingBytes)
+
     fun encodeFrame(
         frame: M0aTransactionFrameV1,
         streamToken: Long,
@@ -44,8 +48,8 @@ object M0aTransactionResponseCodecV1 {
                 val value = frame.value
                 require(value.bytes.isNotEmpty()) { "CHUNK must not be empty" }
                 val offset = value.offset ?: value.chunkIndex * chunkStride
-                require(offset in 0..M0aPacketCodec.requestCeilingBytes)
-                require(value.bytes.size <= M0aPacketCodec.requestCeilingBytes)
+                require(offset in 0..M0aStructuralTransactionLimits.MAX_STRUCTURAL_TRANSACTION_BYTES)
+                require(value.bytes.size <= M0aStructuralTransactionLimits.MAX_STRUCTURAL_TRANSACTION_BYTES)
                 require(offset <= Int.MAX_VALUE - value.bytes.size)
                 val body = ByteBuffer.allocate(12 + value.bytes.size)
                     .order(ByteOrder.LITTLE_ENDIAN)
@@ -117,7 +121,9 @@ object M0aTransactionResponseCodecV1 {
                 val length = data.getInt(4)
                 val checksum = data.getInt(8).toLong() and 0xffff_ffffL
                 require(length > 0 && length == response.payload.size - 12)
-                require(offset <= M0aPacketCodec.requestCeilingBytes && offset <= 0xffff_ffffL - length)
+                require(offset <= M0aStructuralTransactionLimits.MAX_STRUCTURAL_TRANSACTION_BYTES &&
+                    offset <= 0xffff_ffffL - length &&
+                    offset + length <= M0aStructuralTransactionLimits.MAX_STRUCTURAL_TRANSACTION_BYTES.toLong())
                 val bytes = response.payload.copyOfRange(12, response.payload.size)
                 require(M0aPacketCodec.crc32Payload(bytes) == checksum) {
                     "CHUNK checksum is invalid"
@@ -139,6 +145,7 @@ object M0aTransactionResponseCodecV1 {
         }
     }
 
-    private const val chunkStride = 1024
+    private val chunkStride: Int
+        get() = M0aStructuralTransactionLimits.ordinaryChunkPayloadBytes
 
 }

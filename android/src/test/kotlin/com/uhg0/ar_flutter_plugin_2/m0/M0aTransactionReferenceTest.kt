@@ -175,8 +175,15 @@ class M0aTransactionReferenceTest {
     }
 
     @Test
-    fun `producer accepts exact request ceiling and rejects one byte over`() {
-        val maximum = ByteArray(M0aPacketCodec.requestCeilingBytes)
+    fun `request ceiling remains distinct from one mebibyte structural transaction ceiling`() {
+        val exactRequest = M0aPacketCodec.encodeRequest(request(commandBytes = ByteArray(16_304)))
+        assertEquals(M0aPacketCodec.requestCeilingBytes, exactRequest.size)
+        assertArrayEquals(exactRequest, M0aPacketCodec.encodeRequest(request(commandBytes = ByteArray(16_304))))
+        assertThrows(IllegalArgumentException::class.java) {
+            M0aPacketCodec.encodeRequest(request(commandBytes = ByteArray(16_305)))
+        }
+
+        val maximum = ByteArray(M0aStructuralTransactionLimits.MAX_STRUCTURAL_TRANSACTION_BYTES)
         val frames = M0aStructuralTransactionProducerV1.produce(
             transactionId = 3,
             baseGeometryRevision = 4,
@@ -184,16 +191,78 @@ class M0aTransactionReferenceTest {
             targetLineageRevision = 6,
             bytes = maximum,
         )
-        assertEquals(18, frames.size)
+        assertEquals(67, frames.size)
+        frames.forEachIndexed { index, frame ->
+            val response = M0aTransactionResponseCodecV1.encodeFrame(
+                frame,
+                streamToken = 9,
+                requestSequence = index.toLong() + 1,
+                nextExpectedRequestSequence = index.toLong() + 2,
+            )
+            assertTrue(M0aPacketCodec.encodeResponse(response, M0aPacketCodec.responseMaximumBytes).size <=
+                M0aPacketCodec.responseMaximumBytes)
+        }
         assertThrows(IllegalArgumentException::class.java) {
             M0aStructuralTransactionProducerV1.produce(
                 transactionId = 3,
                 baseGeometryRevision = 4,
                 targetGeometryRevision = 5,
                 targetLineageRevision = 6,
-                bytes = ByteArray(M0aPacketCodec.requestCeilingBytes + 1),
+                bytes = ByteArray(M0aStructuralTransactionLimits.MAX_STRUCTURAL_TRANSACTION_BYTES + 1),
             )
         }
+    }
+
+    @Test
+    fun `catch up ceiling derives bounded stride and frame count from response envelope`() {
+        assertEquals(16_260, M0aStructuralTransactionLimits.ordinaryChunkPayloadBytes)
+        assertEquals(65_412, M0aStructuralTransactionLimits.catchUpChunkPayloadBytes)
+        assertEquals(67, M0aStructuralTransactionLimits.frameCount(
+            M0aStructuralTransactionLimits.MAX_STRUCTURAL_TRANSACTION_BYTES,
+            M0aPacketCodec.responseMaximumBytes,
+        ))
+        assertEquals(19, M0aStructuralTransactionLimits.frameCount(
+            M0aStructuralTransactionLimits.MAX_STRUCTURAL_TRANSACTION_BYTES,
+            M0aPacketCodec.catchUpMaximumBytes,
+        ))
+        val frames = M0aStructuralTransactionProducerV1.produce(
+            transactionId = 3,
+            baseGeometryRevision = 4,
+            targetGeometryRevision = 5,
+            targetLineageRevision = 6,
+            bytes = ByteArray(M0aStructuralTransactionLimits.MAX_STRUCTURAL_TRANSACTION_BYTES),
+            maximumChunkBytes = M0aStructuralTransactionLimits.catchUpChunkPayloadBytes,
+        )
+        assertEquals(19, frames.size)
+        frames.forEachIndexed { index, frame ->
+            val response = M0aTransactionResponseCodecV1.encodeFrame(
+                frame,
+                streamToken = 9,
+                requestSequence = index.toLong() + 1,
+                nextExpectedRequestSequence = index.toLong() + 2,
+            )
+            assertTrue(M0aPacketCodec.encodeResponse(response, M0aPacketCodec.catchUpMaximumBytes).size <=
+                M0aPacketCodec.catchUpMaximumBytes)
+        }
+    }
+
+    @Test
+    fun `duplicate exact chunk is invisible and changed duplicate is rejected`() {
+        val receiver = M0aStructuralTransactionReceiverV1()
+        val bytes = byteArrayOf(1, 2, 3, 4)
+        receiver.begin(begin(bytes))
+        receiver.acknowledgeBegin(M0aTransactionBeginAcknowledgementV1(7, 11, 12))
+        val first = M0aTransactionChunkV1(7, 0, byteArrayOf(1, 2), 0)
+        receiver.chunk(first)
+        receiver.chunk(first.copy(bytes = first.bytes.copyOf()))
+        assertEquals(2, receiver.stagedBytes)
+        assertThrows(IllegalArgumentException::class.java) {
+            receiver.chunk(M0aTransactionChunkV1(7, 0, byteArrayOf(9, 2), 0))
+        }
+        receiver.chunk(M0aTransactionChunkV1(7, 1, byteArrayOf(3, 4), 2))
+        receiver.commit(M0aTransactionCommitV1(7, checksum(bytes)))
+        receiver.acknowledgeCommit(M0aTransactionAcknowledgementV1(7, 11, 12))
+        assertArrayEquals(bytes, receiver.visibleBytes)
     }
 
     private fun begin(bytes: ByteArray) = M0aTransactionBeginV1(
@@ -204,6 +273,19 @@ class M0aTransactionReferenceTest {
         chunkCount = if (bytes.isEmpty()) 0 else 2,
         totalBytes = bytes.size,
         payloadChecksum = checksum(bytes),
+    )
+
+    private fun request(commandBytes: ByteArray) = M0aPacketCodec.Request(
+        requestFlags = 0,
+        streamToken = 1,
+        acknowledgedTransactionId = 0,
+        acknowledgedGeometryRevision = 0,
+        acknowledgedLineageRevision = 0,
+        nextStyleRevision = 0,
+        maximumResponseBytes = M0aPacketCodec.responseMaximumBytes,
+        styleRecords = emptyList(),
+        commandBytes = commandBytes,
+        requestSequence = 1,
     )
 
     private fun checksum(bytes: ByteArray): Long {
