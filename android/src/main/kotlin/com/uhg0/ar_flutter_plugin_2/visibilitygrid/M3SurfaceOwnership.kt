@@ -419,6 +419,26 @@ internal class M3SurfaceOwnership private constructor(
         private const val MAX_COMMAND_BYTES = 256
         private const val MAX_HIGH_WATER = 0x1_0000_0000L
 
+        /**
+         * Builds, but deliberately does not publish, one dirty canonical plan
+         * over the immutable v6 authority.  #115b owns reservation, WAL/root
+         * writes, current-receipt retention, and activation.
+         */
+        internal fun prepareMutation(
+            view: M3CanonicalStateView,
+            configuration: M3SurfaceOwnershipConfiguration,
+            command: M3FeatureMutationCommand,
+        ): M3CanonicalMutationPreparation =
+            M3MutableCanonicalOverlay.prepare(view, configuration, command)
+
+        /** Structural parity planner for the pre-existing canonical commands. */
+        internal fun prepareMutation(
+            view: M3CanonicalStateView,
+            configuration: M3SurfaceOwnershipConfiguration,
+            command: M3CanonicalTransactionCommand,
+        ): M3CanonicalMutationPreparation =
+            M3MutableCanonicalOverlay.prepare(view, configuration, command)
+
         fun open(
             group: M3SurfaceGroup,
             directory: File,
