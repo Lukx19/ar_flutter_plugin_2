@@ -283,9 +283,8 @@ class M0aVisibilitySurfaceStreamChannelTest {
             targetGeometryRevision = 1,
             targetLineageRevision = 1,
             bytes = byteArrayOf(1, 2, 3, 4, 5),
-            maximumChunkBytes = 1024,
         )
-        binding.queueStructuralTransaction(frames)
+        binding.queueStructuralTransaction(frames, minimumResponseProfile)
 
         val responses = frames.indices.map { index ->
             messenger.exchange(request(sequence = index.toLong() + 1, token = 27))
@@ -314,6 +313,95 @@ class M0aVisibilitySurfaceStreamChannelTest {
         )
         assertEquals(M0aPacketCodec.noChangesMessageKind, acknowledgement.messageKind)
         assertEquals(1L, acknowledgement.transactionId)
+        binding.dispose()
+    }
+
+    @Test
+    fun `lower pull rejects without consuming the fixed queued response profile`() {
+        val messenger = TestMessenger(127)
+        val binding = M0aVisibilitySurfaceStreamChannel(messenger, 127)
+        val profile = M0aTransactionResponseProfileV1.ordinary
+        val frames = M0aStructuralTransactionProducerV1.produce(
+            transactionId = 1,
+            baseGeometryRevision = 0,
+            targetGeometryRevision = 1,
+            targetLineageRevision = 1,
+            bytes = ByteArray(profile.chunkPayloadBytes + 1),
+            responseProfile = profile,
+        )
+        binding.queueStructuralTransaction(frames, profile)
+
+        val rejected = M0aPacketCodec.decodeResponse(
+            messenger.exchange(request(1, 127, maximumResponseBytes = M0aPacketCodec.responseMinimumBytes)),
+        )
+        assertEquals(34, rejected.errorId)
+        assertEquals(1, rejected.nextExpectedRequestSequence)
+
+        val begin = M0aPacketCodec.decodeResponse(
+            messenger.exchange(request(1, 127, maximumResponseBytes = M0aPacketCodec.responseMaximumBytes)),
+        )
+        assertEquals(M0aTransactionResponseCodecV1.beginMessageKind, begin.messageKind)
+        assertEquals(2, begin.chunkCount)
+        val firstChunk = M0aPacketCodec.decodeResponse(
+            messenger.exchange(request(2, 127, maximumResponseBytes = M0aPacketCodec.responseMaximumBytes)),
+        )
+        assertEquals(M0aTransactionResponseCodecV1.chunkMessageKind, firstChunk.messageKind)
+        assertEquals(0, firstChunk.chunkIndex)
+        binding.dispose()
+    }
+
+    @Test
+    fun `current delta source selects and retains only one immutable named receipt until exact ACK`() {
+        data class JournalEntry(
+            val selector: M0aCurrentDeltaSelectorV1,
+            val baseGeometryRevision: Long,
+            val bytes: ByteArray,
+        )
+
+        val selectedBytes = byteArrayOf(41, 42, 43, 44)
+        val journal = listOf(
+            JournalEntry(M0aCurrentDeltaSelectorV1(7, 7, 7), 6, byteArrayOf(11, 12, 13)),
+            JournalEntry(M0aCurrentDeltaSelectorV1(1, 1, 1), 0, selectedBytes),
+            JournalEntry(M0aCurrentDeltaSelectorV1(9, 9, 9), 8, byteArrayOf(91, 92, 93)),
+        )
+        val copied = mutableListOf<M0aCurrentDeltaSelectorV1>()
+        val source = M0aCurrentDeltaSourceV1 { selector ->
+            journal.firstOrNull { it.selector == selector }?.let { entry ->
+                copied += entry.selector
+                M0aCurrentDeltaReceiptV1(entry.selector, entry.baseGeometryRevision, entry.bytes)
+            }
+        }
+        val messenger = TestMessenger(128)
+        val binding = M0aVisibilitySurfaceStreamChannel(messenger, 128)
+        val selected = M0aCurrentDeltaSelectorV1(1, 1, 1)
+        binding.queueCurrentDelta(source, selected, minimumResponseProfile)
+        selectedBytes.fill(99)
+        assertEquals(listOf(selected), copied)
+
+        val beginPacket = messenger.exchange(request(1, 128))
+        val chunkPacket = messenger.exchange(request(2, 128))
+        val commitPacket = messenger.exchange(request(3, 128))
+        val chunk = M0aTransactionResponseCodecV1.decodeFrame(
+            M0aPacketCodec.decodeResponse(chunkPacket),
+        ) as M0aTransactionChunkFrameV1
+        assertArrayEquals(byteArrayOf(41, 42, 43, 44), chunk.value.bytes)
+        assertEquals(1, M0aPacketCodec.decodeResponse(beginPacket).transactionId)
+        assertArrayEquals(commitPacket, messenger.exchange(request(3, 128)))
+        assertTrue(!chunk.value.bytes.contentEquals(journal[0].bytes))
+        assertTrue(!chunk.value.bytes.contentEquals(journal[2].bytes))
+
+        val acknowledged = M0aPacketCodec.decodeResponse(
+            messenger.exchange(
+                request(
+                    sequence = 4,
+                    token = 128,
+                    acknowledgedTransaction = 1,
+                    acknowledgedGeometry = 1,
+                    acknowledgedLineage = 1,
+                ),
+            ),
+        )
+        assertEquals(M0aPacketCodec.noChangesMessageKind, acknowledged.messageKind)
         binding.dispose()
     }
 
@@ -422,6 +510,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
                 targetLineageRevision = 1,
                 bytes = byteArrayOf(1),
             ),
+            minimumResponseProfile,
         )
         messenger.exchange(request(1, 29))
         messenger.exchange(request(2, 29))
@@ -873,7 +962,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
             targetGeometryRevision = 11,
             targetLineageRevision = 21,
             bytes = byteArrayOf(),
-        ))
+        ), minimumResponseProfile)
         val begin = M0aPacketCodec.decodeResponse(messenger.exchange(request(
             Long.MAX_VALUE - 2, 118, acknowledgedTransaction = Long.MAX_VALUE - 1,
             acknowledgedGeometry = 10, acknowledgedLineage = 20, styleRevision = 30,
@@ -911,7 +1000,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
         fresh.queueStructuralTransaction(M0aStructuralTransactionProducerV1.produce(
             transactionId = 1, baseGeometryRevision = 11,
             targetGeometryRevision = 12, targetLineageRevision = 22, bytes = byteArrayOf(),
-        ))
+        ), minimumResponseProfile)
         val recovered = M0aPacketCodec.decodeResponse(freshMessenger.exchange(request(
             1, 119, acknowledgedTransaction = 0,
             acknowledgedGeometry = 11, acknowledgedLineage = 21, styleRevision = 30,
@@ -1027,6 +1116,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
                 targetLineageRevision = 1,
                 bytes = byteArrayOf(),
             ),
+            minimumResponseProfile,
         )
         val begin = M0aPacketCodec.decodeResponse(messenger.exchange(request(1, 1)))
         assertEquals(2, begin.messageKind)
@@ -1105,6 +1195,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
                 targetLineageRevision = 1,
                 bytes = byteArrayOf(),
             ),
+            minimumResponseProfile,
         )
         assertEquals(2, M0aPacketCodec.decodeResponse(messenger.exchange(request(1, 1))).messageKind)
         val commitBytes = arrayOfNulls<ByteArray>(1)
@@ -1184,6 +1275,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
                 targetLineageRevision = 1,
                 bytes = byteArrayOf(),
             ),
+            minimumResponseProfile,
         )
 
         assertEquals(2, M0aPacketCodec.decodeResponse(
@@ -1294,6 +1386,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
         acknowledgedLineage: Long = 0,
         styleRevision: Long = 0,
         styleRecords: List<ByteArray> = emptyList(),
+        maximumResponseBytes: Int = M0aPacketCodec.responseMinimumBytes,
     ): ByteArray =
         M0aPacketCodec.encodeRequest(
             M0aPacketCodec.Request(
@@ -1303,7 +1396,7 @@ class M0aVisibilitySurfaceStreamChannelTest {
                 acknowledgedGeometryRevision = acknowledgedGeometry,
                 acknowledgedLineageRevision = acknowledgedLineage,
                 nextStyleRevision = styleRevision,
-                maximumResponseBytes = 4096,
+                maximumResponseBytes = maximumResponseBytes,
                 styleRecords = styleRecords,
                 commandBytes = byteArrayOf(),
                 requestSequence = sequence,
@@ -1372,6 +1465,9 @@ class M0aVisibilitySurfaceStreamChannelTest {
         return crc xor -1
     }
 }
+
+private val minimumResponseProfile =
+    M0aTransactionResponseProfileV1(M0aPacketCodec.responseMinimumBytes)
 
 private class HoldingExecutor : Executor {
     private val queued = ArrayDeque<Runnable>()

@@ -128,6 +128,7 @@ class M0aVisibilitySurfaceStreamChannel(
     private val telemetry = M0aTransportInstrumentation()
     private val structuralFrames = ArrayDeque<M0aTransactionFrameV1>()
     private var structuralFrameCursor = 0
+    private var queuedResponseProfile: M0aTransactionResponseProfileV1? = null
     @Volatile private var committedBaseline =
         controlLifecycle?.committedBaseline() ?: M0aCommittedBaselineV1.ZERO
     @Volatile private var queuedTransactionBaseline: M0aCommittedBaselineV1? = null
@@ -200,15 +201,19 @@ class M0aVisibilitySurfaceStreamChannel(
      * Frames are consumed only after their response is encoded and accepted;
      * an exact request replay therefore never advances the producer.
      */
-    fun queueStructuralTransaction(frames: List<M0aTransactionFrameV1>) {
+    fun queueStructuralTransaction(
+        frames: List<M0aTransactionFrameV1>,
+        responseProfile: M0aTransactionResponseProfileV1,
+    ) {
         require(frames.isNotEmpty()) { "A structural transaction cannot be empty" }
         synchronized(this) {
             check(!disposed.get() && !bindingAbandoned.get()) { "Binding is abandoned" }
-            validateStructuralTransaction(frames)
+            validateStructuralTransaction(frames, responseProfile)
             synchronized(structuralFrames) {
                 check(structuralFrames.isEmpty()) { "A structural transaction is already queued" }
                 frames.map(::copyStructuralFrame).forEach { structuralFrames.addLast(it) }
                 structuralFrameCursor = 0
+                queuedResponseProfile = responseProfile
                 telemetry.retainedStructuralStaging(structuralPayloadBytes())
             }
             val begin = (frames.first() as M0aTransactionBeginFrameV1).value
@@ -218,6 +223,29 @@ class M0aVisibilitySurfaceStreamChannel(
                 lineageRevision = begin.targetLineageRevision,
             )
         }
+    }
+
+    /** Selects, snapshots, frames, and queues exactly one named current delta. */
+    fun queueCurrentDelta(
+        source: M0aCurrentDeltaSourceV1,
+        selector: M0aCurrentDeltaSelectorV1,
+        responseProfile: M0aTransactionResponseProfileV1,
+    ) {
+        val receipt = requireNotNull(source.selectCurrentDelta(selector)) {
+            "The named current delta is not retained"
+        }
+        require(receipt.selector == selector) { "Current-delta source returned a different receipt" }
+        queueStructuralTransaction(
+            M0aStructuralTransactionProducerV1.produce(
+                transactionId = selector.transactionId,
+                baseGeometryRevision = receipt.baseGeometryRevision,
+                targetGeometryRevision = selector.targetGeometryRevision,
+                targetLineageRevision = selector.targetLineageRevision,
+                bytes = receipt.bytes,
+                responseProfile = responseProfile,
+            ),
+            responseProfile,
+        )
     }
 
     /** Restores the native committed baseline after a worker/binding restart. */
@@ -720,6 +748,7 @@ class M0aVisibilitySurfaceStreamChannel(
         synchronized(structuralFrames) {
             structuralFrames.clear()
             structuralFrameCursor = 0
+            queuedResponseProfile = null
         }
         queuedTransactionBaseline = null
         telemetry.clearRetained()
@@ -814,6 +843,12 @@ class M0aVisibilitySurfaceStreamChannel(
                         targetLineageRevision = committedBaseline.lineageRevision,
                         acceptedStyleRevision = committedBaseline.styleRevision,
                     )
+                val responseProfile = requireNotNull(queuedResponseProfile) {
+                    "Queued structural transaction has no response profile"
+                }
+                if (request.maximumResponseBytes < responseProfile.responseCeilingBytes) {
+                    throw BindingError(TRANSACTION_STATE_ERROR_ID)
+                }
                 val response = M0aTransactionResponseCodecV1.encodeFrame(
                     frame = frame,
                     streamToken = request.streamToken,
@@ -822,7 +857,7 @@ class M0aVisibilitySurfaceStreamChannel(
                 ).copy(acceptedStyleRevision = committedBaseline.styleRevision)
                 // The caller encodes this response under the negotiated ceiling
                 // before returning. Only then is the producer advanced.
-                val encoded = M0aPacketCodec.encodeResponse(response, request.maximumResponseBytes)
+                val encoded = M0aPacketCodec.encodeResponse(response, responseProfile.responseCeilingBytes)
                 check(encoded.isNotEmpty())
                 structuralFrameCursor = Math.addExact(structuralFrameCursor, 1)
                 return response
@@ -830,7 +865,10 @@ class M0aVisibilitySurfaceStreamChannel(
         }
     }
 
-    private fun validateStructuralTransaction(frames: List<M0aTransactionFrameV1>) {
+    private fun validateStructuralTransaction(
+        frames: List<M0aTransactionFrameV1>,
+        responseProfile: M0aTransactionResponseProfileV1,
+    ) {
         val begin = (frames.firstOrNull() as? M0aTransactionBeginFrameV1)?.value
             ?: error("Structural transaction must begin with BEGIN")
         val commit = (frames.lastOrNull() as? M0aTransactionCommitFrameV1)?.value
@@ -846,7 +884,8 @@ class M0aVisibilitySurfaceStreamChannel(
                 begin.targetLineageRevision >= committedBaseline.lineageRevision &&
                 commit.transactionId == begin.transactionId,
         ) { "Structural transaction does not advance the committed cursor" }
-        require(frames.size == Math.addExact(begin.chunkCount, 2))
+        require(frames.size == responseProfile.frameCount(begin.totalBytes))
+        require(begin.chunkCount == responseProfile.chunkCount(begin.totalBytes))
         require(begin.totalBytes in 0..M0aStructuralTransactionLimits.MAX_STRUCTURAL_TRANSACTION_BYTES)
         require(begin.chunkCount in 0..M0aStructuralTransactionLimits.MAX_CHUNK_COUNT)
         var totalBytes = 0
@@ -856,6 +895,10 @@ class M0aVisibilitySurfaceStreamChannel(
             require(chunk.transactionId == begin.transactionId && chunk.chunkIndex == index)
             require(chunk.bytes.isNotEmpty())
             require(chunk.offset == null || chunk.offset == totalBytes)
+            val expectedChunkBytes = minOf(responseProfile.chunkPayloadBytes, begin.totalBytes - totalBytes)
+            require(chunk.bytes.size == expectedChunkBytes) {
+                "CHUNK does not match the queued response profile"
+            }
             totalBytes = Math.addExact(totalBytes, chunk.bytes.size)
             require(totalBytes <= begin.totalBytes)
         }
@@ -893,6 +936,7 @@ class M0aVisibilitySurfaceStreamChannel(
             queuedTransactionBaseline = null
             structuralFrames.clear()
             structuralFrameCursor = 0
+            queuedResponseProfile = null
             telemetry.retainedStructuralStaging(0)
             controlLifecycle?.setCommittedBaseline(committedBaseline)
         }

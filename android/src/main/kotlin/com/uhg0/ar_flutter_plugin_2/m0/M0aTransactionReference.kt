@@ -100,6 +100,40 @@ object M0aStructuralTransactionLimits {
         Math.addExact(chunkCount(totalBytes, responseCeilingBytes), 2)
 }
 
+/** Immutable response framing negotiated before a transaction is queued. */
+data class M0aTransactionResponseProfileV1(
+    val responseCeilingBytes: Int,
+) {
+    val chunkPayloadBytes: Int =
+        M0aStructuralTransactionLimits.chunkPayloadBytesForResponseCeiling(responseCeilingBytes)
+
+    fun chunkCount(totalBytes: Int): Int =
+        M0aStructuralTransactionLimits.chunkCount(totalBytes, responseCeilingBytes)
+
+    fun frameCount(totalBytes: Int): Int =
+        M0aStructuralTransactionLimits.frameCount(totalBytes, responseCeilingBytes)
+
+    companion object {
+        val ordinary = M0aTransactionResponseProfileV1(M0aPacketCodec.responseMaximumBytes)
+        val catchUp = M0aTransactionResponseProfileV1(M0aPacketCodec.catchUpMaximumBytes)
+
+        fun forChunkPayloadBytes(maximumChunkBytes: Int): M0aTransactionResponseProfileV1 {
+            require(maximumChunkBytes in
+                M0aStructuralTransactionLimits.chunkPayloadBytesForResponseCeiling(
+                    M0aPacketCodec.responseMinimumBytes,
+                )..M0aStructuralTransactionLimits.catchUpChunkPayloadBytes) {
+                "maximumChunkBytes is outside the encodable response range"
+            }
+            return M0aTransactionResponseProfileV1(
+                Math.addExact(
+                    Math.addExact(maximumChunkBytes, M0aPacketCodec.responseHeaderBytes),
+                    M0aStructuralTransactionLimits.CHUNK_METADATA_BYTES,
+                ),
+            )
+        }
+    }
+}
+
 object M0aStructuralTransactionProducerV1 {
     fun produce(
         transactionId: Long,
@@ -107,19 +141,13 @@ object M0aStructuralTransactionProducerV1 {
         targetGeometryRevision: Long,
         targetLineageRevision: Long,
         bytes: ByteArray,
-        maximumChunkBytes: Int = M0aStructuralTransactionLimits.ordinaryChunkPayloadBytes,
+        responseProfile: M0aTransactionResponseProfileV1 = M0aTransactionResponseProfileV1.ordinary,
     ): List<M0aTransactionFrameV1> {
-        require(maximumChunkBytes in 1..M0aStructuralTransactionLimits.MAX_CHUNK_COUNT) {
-            "maximumChunkBytes is outside the bounded transaction range"
-        }
         require(bytes.size <= M0aStructuralTransactionLimits.MAX_STRUCTURAL_TRANSACTION_BYTES) {
             "Transaction bytes exceed the structural transaction ceiling"
         }
-        val chunkCount = if (bytes.isEmpty()) 0 else {
-            val count = (bytes.size.toLong() + maximumChunkBytes - 1L) / maximumChunkBytes
-            require(count <= M0aStructuralTransactionLimits.MAX_CHUNK_COUNT) { "CHUNK count exceeds UInt16" }
-            count.toInt()
-        }
+        val maximumChunkBytes = responseProfile.chunkPayloadBytes
+        val chunkCount = responseProfile.chunkCount(bytes.size)
         val checksum = M0aPacketCodec.crc32Payload(bytes)
         val frames = mutableListOf<M0aTransactionFrameV1>(
             M0aTransactionBeginFrameV1(

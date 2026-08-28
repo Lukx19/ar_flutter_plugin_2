@@ -380,7 +380,7 @@ class M0aFaultCorpusTest {
             }
             "begin", "chunk", "commit", "paged-reset", "lineage" -> {
                 val payload = byteArrayOf(1, 2, 3, 4, 5)
-                val frames = M0aStructuralTransactionProducerV1.produce(9, 1, 2, 3, payload, 3)
+                val frames = M0aStructuralTransactionProducerV1.produce(9, 1, 2, 3, payload)
                 val selected = when (family) {
                     "begin" -> listOf(frames.first())
                     "chunk" -> listOf(frames[1])

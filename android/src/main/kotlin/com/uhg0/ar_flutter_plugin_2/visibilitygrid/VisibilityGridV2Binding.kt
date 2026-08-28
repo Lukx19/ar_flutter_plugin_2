@@ -14,6 +14,7 @@ import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineV1
 import com.uhg0.ar_flutter_plugin_2.m0.toMap
 import com.uhg0.ar_flutter_plugin_2.m0.M0aUuid
 import com.uhg0.ar_flutter_plugin_2.m0.M0aStructuralTransactionProducerV1
+import com.uhg0.ar_flutter_plugin_2.m0.M0aTransactionResponseProfileV1
 import com.uhg0.ar_flutter_plugin_2.m0.M0aStartRequestCodecV2
 import com.uhg0.ar_flutter_plugin_2.m0.M0aVisibilitySurfaceStreamChannel
 import com.uhg0.ar_flutter_plugin_2.m0.M0aDebugTransportProbe
@@ -682,6 +683,7 @@ class VisibilityGridV2Binding internal constructor(
                 targetLineageRevision = baseline.lineageRevision + 1,
                 bytes = byteArrayOf(),
             ),
+            M0aTransactionResponseProfileV1.ordinary,
         )
         initialTransactionQueued = true
     }

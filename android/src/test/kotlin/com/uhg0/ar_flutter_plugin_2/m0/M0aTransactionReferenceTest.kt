@@ -73,19 +73,22 @@ class M0aTransactionReferenceTest {
 
     @Test
     fun `producer emits begin ordered chunks and commit frames`() {
+        val profile = M0aTransactionResponseProfileV1(M0aPacketCodec.responseMinimumBytes)
+        val bytes = ByteArray(profile.chunkPayloadBytes + 1) { (it and 0xff).toByte() }
         val frames = M0aStructuralTransactionProducerV1.produce(
             transactionId = 3,
             baseGeometryRevision = 4,
             targetGeometryRevision = 5,
             targetLineageRevision = 6,
-            bytes = byteArrayOf(1, 2, 3, 4, 5),
-            maximumChunkBytes = 2,
+            bytes = bytes,
+            responseProfile = profile,
         )
-        assertEquals(5, frames.size)
+        assertEquals(4, frames.size)
         assertTrue(frames[0] is M0aTransactionBeginFrameV1)
         assertEquals(0, (frames[1] as M0aTransactionChunkFrameV1).value.chunkIndex)
-        assertArrayEquals(byteArrayOf(3, 4), (frames[2] as M0aTransactionChunkFrameV1).value.bytes)
-        assertTrue(frames[4] is M0aTransactionCommitFrameV1)
+        assertEquals(profile.chunkPayloadBytes, (frames[1] as M0aTransactionChunkFrameV1).value.bytes.size)
+        assertArrayEquals(byteArrayOf(bytes.last()), (frames[2] as M0aTransactionChunkFrameV1).value.bytes)
+        assertTrue(frames[3] is M0aTransactionCommitFrameV1)
     }
 
     @Test
@@ -119,7 +122,6 @@ class M0aTransactionReferenceTest {
             targetGeometryRevision = 5,
             targetLineageRevision = 6,
             bytes = byteArrayOf(1, 2, 3, 4, 5),
-            maximumChunkBytes = 1024,
         )
         frames.forEachIndexed { index, frame ->
             val encoded = M0aPacketCodec.encodeResponse(
@@ -215,6 +217,7 @@ class M0aTransactionReferenceTest {
 
     @Test
     fun `catch up ceiling derives bounded stride and frame count from response envelope`() {
+        assertEquals(3_972, M0aTransactionResponseProfileV1(M0aPacketCodec.responseMinimumBytes).chunkPayloadBytes)
         assertEquals(16_260, M0aStructuralTransactionLimits.ordinaryChunkPayloadBytes)
         assertEquals(65_412, M0aStructuralTransactionLimits.catchUpChunkPayloadBytes)
         assertEquals(67, M0aStructuralTransactionLimits.frameCount(
@@ -231,7 +234,7 @@ class M0aTransactionReferenceTest {
             targetGeometryRevision = 5,
             targetLineageRevision = 6,
             bytes = ByteArray(M0aStructuralTransactionLimits.MAX_STRUCTURAL_TRANSACTION_BYTES),
-            maximumChunkBytes = M0aStructuralTransactionLimits.catchUpChunkPayloadBytes,
+            responseProfile = M0aTransactionResponseProfileV1.catchUp,
         )
         assertEquals(19, frames.size)
         frames.forEachIndexed { index, frame ->
@@ -243,6 +246,12 @@ class M0aTransactionReferenceTest {
             )
             assertTrue(M0aPacketCodec.encodeResponse(response, M0aPacketCodec.catchUpMaximumBytes).size <=
                 M0aPacketCodec.catchUpMaximumBytes)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            M0aTransactionResponseProfileV1.forChunkPayloadBytes(65_413)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            M0aTransactionResponseProfileV1.forChunkPayloadBytes(65_535)
         }
     }
 
