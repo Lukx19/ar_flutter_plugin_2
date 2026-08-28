@@ -29,8 +29,10 @@ class M3CanonicalTransactionTest {
 
         val split = accepted(owner.transact(command("split", M3CanonicalOperation.SPLIT, 2, listOf(merged.targets.single().id), target(30), target(31))))
         assertEquals(listOf(6L, 7L), split.targets.map { it.id.value })
-        assertEquals(listOf(2L, 2L, 3L, 3L), split.receipt.lineageEdges.map { it.source.value })
-        assertEquals(listOf(6L, 7L, 6L, 7L), split.receipt.lineageEdges.map { it.target.value })
+        assertEquals(listOf(5L, 5L), split.receipt.lineageEdges.map { it.source.value })
+        assertEquals(listOf(6L, 7L), split.receipt.lineageEdges.map { it.target.value })
+        assertEquals(listOf(initial[1].id, initial[2].id), split.receipt.sourceSupport.map { it.id })
+        assertEquals(listOf(initial[1].voxel, initial[2].voxel), split.receipt.sourceSupport.map { it.voxel })
         assertCut(split, 3, 3, 8, 4)
 
         val replaced = accepted(owner.transact(command("replace", M3CanonicalOperation.REPLACEMENT, 3, listOf(initial[3].id), target(40))))

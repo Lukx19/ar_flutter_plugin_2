@@ -1,8 +1,12 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
 import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class M3LineageReplayTest {
@@ -23,15 +27,19 @@ class M3LineageReplayTest {
         assertEquals(committed, replay)
         assertEquals(committed.receipt.lineageEdges, replay.receipt.lineageEdges)
         assertEquals(1, replay.receipt.lineageEdges.size)
+        assertEquals(committed.receipt.canonicalBytes, replay.receipt.canonicalBytes)
+        assertEquals(committed.receipt.canonicalBytes.toByteArray().toList(), replay.receipt.canonicalBytes.toByteArray().toList())
     }
 
     @Test
     fun `reservation and private snapshot fault cuts expose complete prior cuts while committed cut remains complete`() {
         val cases = listOf(
             M3SurfaceOwnershipFault.AFTER_RESERVATION_FLUSH to true,
-            M3SurfaceOwnershipFault.AFTER_PRIVATE_MUTATION to false,
+            M3SurfaceOwnershipFault.AFTER_PRIVATE_CANDIDATE to false,
             M3SurfaceOwnershipFault.BEFORE_SNAPSHOT_FLUSH to true,
-            M3SurfaceOwnershipFault.AFTER_SNAPSHOT_FLUSH to false,
+            M3SurfaceOwnershipFault.AFTER_SNAPSHOT_FILE_SYNC_BEFORE_ROOT_SWITCH to true,
+            M3SurfaceOwnershipFault.AFTER_ROOT_SWITCH_BEFORE_DIRECTORY_SYNC to false,
+            M3SurfaceOwnershipFault.AFTER_ROOT_DIRECTORY_SYNC to false,
         )
         cases.forEachIndexed { index, (fault, allocates) ->
             val directory = Files.createTempDirectory("m3-fault-$index").toFile()
@@ -43,7 +51,7 @@ class M3LineageReplayTest {
                 listOf(source), listOf(M3CanonicalTarget(voxel = M3Voxel(10, 0, 0), normalOctX = 0, normalOctY = 0, normalConfidence = 192)))
             else relocate("relocate", source, 10)
             val result = owner.transact(command)
-            if (fault == M3SurfaceOwnershipFault.AFTER_SNAPSHOT_FLUSH) {
+            if (fault == M3SurfaceOwnershipFault.AFTER_ROOT_SWITCH_BEFORE_DIRECTORY_SYNC || fault == M3SurfaceOwnershipFault.AFTER_ROOT_DIRECTORY_SYNC) {
                 assertEquals(1, accepted(result).receipt.geometryRevision)
             } else {
                 val refusal = refused(result)
@@ -52,7 +60,7 @@ class M3LineageReplayTest {
             }
             owner.close()
             val reopened = opened(M3SurfaceOwnership.open(group, directory))
-            if (fault == M3SurfaceOwnershipFault.AFTER_SNAPSHOT_FLUSH) {
+            if (fault == M3SurfaceOwnershipFault.AFTER_ROOT_SWITCH_BEFORE_DIRECTORY_SYNC || fault == M3SurfaceOwnershipFault.AFTER_ROOT_DIRECTORY_SYNC) {
                 assertEquals(result, reopened.transact(command))
             } else {
                 val retry = accepted(reopened.transact(command))
@@ -70,6 +78,35 @@ class M3LineageReplayTest {
         val second = refused(receiptOwner.transact(relocate("two", first, 2, revision = 1)))
         assertEquals(M3CanonicalTransactionRefusal.JOURNAL_EXHAUSTED, second.reason)
         assertEquals(1, second.receipt.geometryRevision)
+
+        val measuring = opened(M3SurfaceOwnership.inMemory(M3SurfaceGroup("bytes")))
+        val measuredSource = seed(measuring)
+        val exactSize = accepted(measuring.transact(relocate("bounded", measuredSource, 1))).receipt.canonicalBytes.size
+        assertEquals(239, exactSize)
+        val exact = opened(M3SurfaceOwnership.inMemory(M3SurfaceGroup("bytes"), M3SurfaceOwnershipConfiguration(changeJournalByteCapacity = exactSize)))
+        accepted(exact.transact(relocate("bounded", seed(exact), 1)))
+        val over = opened(M3SurfaceOwnership.inMemory(M3SurfaceGroup("bytes"), M3SurfaceOwnershipConfiguration(changeJournalByteCapacity = exactSize - 1)))
+        assertEquals(M3CanonicalTransactionRefusal.JOURNAL_EXHAUSTED, refused(over.transact(relocate("bounded", seed(over), 1))).reason)
+    }
+
+    @Test
+    fun `apply transact and close share one interface lock under true interleaving`() {
+        val owner = opened(M3SurfaceOwnership.inMemory(M3SurfaceGroup("interleave")))
+        val source = seed(owner)
+        val start = CountDownLatch(1)
+        val executor = Executors.newFixedThreadPool(3)
+        try {
+            val transaction = executor.submit<M3CanonicalTransactionResult> { start.await(); owner.transact(relocate("move", source, 10)) }
+            val apply = executor.submit<M3SurfaceOwnershipResult> { start.await(); owner.apply(M3SurfaceOwnershipCommand("apply", listOf(M3SurfaceCandidate(voxel = M3Voxel(20, 0, 0), normalOctX = 0, normalOctY = 0, normalConfidence = 192)))) }
+            val close = executor.submit<M3SurfaceOwnershipCloseResult> { start.await(); owner.close() }
+            start.countDown()
+            val transactionResult = transaction.get(5, TimeUnit.SECONDS)
+            val applyResult = apply.get(5, TimeUnit.SECONDS)
+            assertEquals(M3SurfaceOwnershipCloseResult.Closed, close.get(5, TimeUnit.SECONDS))
+            assertTrue(transactionResult is M3CanonicalTransactionResult.Accepted || (transactionResult as M3CanonicalTransactionResult.Refused).reason == M3CanonicalTransactionRefusal.CLOSED)
+            assertTrue(applyResult is M3SurfaceOwnershipResult.Accepted || (applyResult as M3SurfaceOwnershipResult.Refused).reason == M3SurfaceOwnershipRefusal.CLOSED)
+            assertEquals(M3CanonicalTransactionRefusal.CLOSED, refused(owner.transact(relocate("after", source, 30))).reason)
+        } finally { executor.shutdownNow(); executor.awaitTermination(5, TimeUnit.SECONDS) }
     }
 
     private fun seed(owner: M3SurfaceOwnership): M3SurfaceId =
