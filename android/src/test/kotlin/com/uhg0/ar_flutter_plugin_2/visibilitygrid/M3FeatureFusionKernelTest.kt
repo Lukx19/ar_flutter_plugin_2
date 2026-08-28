@@ -113,6 +113,58 @@ class M3FeatureFusionKernelTest {
     }
 
     @Test
+    fun `association capacity at two hundred thousand refuses without truncation and permits retry`() {
+        val kernel = kernel()
+        val surfaces = List(100_000) { index -> evidence(index, 0, 0, 2, index) }
+        accepted(kernel, batch(1, surfaces))
+        val full = accepted(
+            kernel,
+            batch(2, surfaces.mapIndexed { index, value -> value.copy(supportId = index + 100_000) }),
+        )
+        assertEquals(100_000, full.receipt.surfaceCount)
+        assertEquals(200_000, full.receipt.associationCount)
+
+        val refusal = kernel.accept(batch(3, listOf(evidence(0, 0, 0, 1, 200_000)))) as M3FeatureFusionResult.Refused
+        assertEquals(M3FeatureFusionRefusal.ASSOCIATION_CAPACITY, refusal.reason)
+        assertEquals(full.receipt, refusal.receipt)
+
+        val retry = accepted(kernel, batch(3, emptyList()))
+        assertEquals(full.receipt, retry.receipt)
+        assertEquals(full.candidates, retry.candidates)
+    }
+
+    @Test
+    fun `nonfinite invalid weight and stale refusals preserve candidates and sequence for retry`() {
+        val kernel = kernel()
+        var prior = accepted(kernel, batch(1, listOf(evidence(0, 0, 0, 2, 1))))
+
+        val nonFiniteBatch = M3FeatureFusionBatch(
+            2,
+            2,
+            listOf(M3FeatureFusionEvidence(Double.NaN, 0.0, 0.0, 1, 2)),
+        )
+        val nonFinite = kernel.accept(nonFiniteBatch) as M3FeatureFusionResult.Refused
+        assertAtomicRefusal(M3FeatureFusionRefusal.NON_FINITE_COORDINATE, prior, nonFinite)
+        var retry = accepted(kernel, batch(2, emptyList()))
+        assertEquals(prior.receipt, retry.receipt)
+        assertEquals(prior.candidates, retry.candidates)
+        prior = retry
+
+        val invalidWeight = kernel.accept(batch(3, listOf(evidence(1, 0, 0, 128, 3)))) as M3FeatureFusionResult.Refused
+        assertAtomicRefusal(M3FeatureFusionRefusal.INVALID_EVIDENCE_WEIGHT, prior, invalidWeight)
+        retry = accepted(kernel, batch(3, emptyList()))
+        assertEquals(prior.receipt, retry.receipt)
+        assertEquals(prior.candidates, retry.candidates)
+        prior = retry
+
+        val stale = kernel.accept(M3FeatureFusionBatch(4, 2, listOf(evidence(1, 0, 0, 2, 4)))) as M3FeatureFusionResult.Refused
+        assertAtomicRefusal(M3FeatureFusionRefusal.STALE_BATCH, prior, stale)
+        retry = accepted(kernel, M3FeatureFusionBatch(4, 4, emptyList()))
+        assertEquals(prior.receipt, retry.receipt)
+        assertEquals(prior.candidates, retry.candidates)
+    }
+
+    @Test
     fun `constructed retained kernel graph fits its assigned M3 tuple share`() {
         val kernel = kernel()
         val outcome = accepted(kernel, batch(1, emptyList()))
@@ -124,7 +176,12 @@ class M3FeatureFusionKernelTest {
         val retainedBytes = layout.totalSize()
         val primitivePayloadBytes = 5_548_576L
         val overheadBytes = retainedBytes - primitivePayloadBytes
-        println("M3_RETAINED_ALLOCATION_RECEIPT retainedBytes=$retainedBytes primitivePayloadBytes=$primitivePayloadBytes objectAndArrayOverheadBytes=$overheadBytes assignedTupleShareBytes=${outcome.receipt.assignedTupleShareBytes}")
+        val implementationBytes = requireNotNull(
+            javaClass.classLoader?.getResourceAsStream(
+                "com/uhg0/ar_flutter_plugin_2/visibilitygrid/M3FeatureFusionKernel.class",
+            ),
+        ).readBytes()
+        println("M3_RETAINED_ALLOCATION_RECEIPT implementationClassSha256=${sha256(implementationBytes)} retainedBytes=$retainedBytes primitivePayloadBytes=$primitivePayloadBytes objectAndArrayOverheadBytes=$overheadBytes assignedTupleShareBytes=${outcome.receipt.assignedTupleShareBytes}")
         assertTrue("JVM graph measurement must include headers/alignment", overheadBytes > 0)
         assertTrue(retainedBytes <= outcome.receipt.assignedTupleShareBytes)
         assertEquals(16 * 1024 * 1024, outcome.receipt.assignedTupleShareBytes)
@@ -133,6 +190,17 @@ class M3FeatureFusionKernelTest {
     private fun kernel() = M3FeatureFusionKernel()
     private fun accepted(kernel: M3FeatureFusionKernel, batch: M3FeatureFusionBatch) =
         kernel.accept(batch) as M3FeatureFusionResult.Accepted
+
+    private fun assertAtomicRefusal(
+        reason: M3FeatureFusionRefusal,
+        prior: M3FeatureFusionResult.Accepted,
+        refusal: M3FeatureFusionResult.Refused,
+    ) {
+        assertEquals(reason, refusal.reason)
+        assertEquals(prior.receipt, refusal.receipt)
+        // A successful same-sequence retry below observes this unchanged list.
+        assertTrue(prior.candidates.isNotEmpty())
+    }
     private fun batch(sequence: Long, observations: List<M3FeatureFusionEvidence>) = M3FeatureFusionBatch(sequence, sequence, observations)
     private fun evidence(x: Int, y: Int, z: Int, weight: Int, supportId: Int) =
         M3FeatureFusionEvidence(x * 0.1 + 0.02, y * 0.1 + 0.02, z * 0.1 + 0.02, weight, supportId)
