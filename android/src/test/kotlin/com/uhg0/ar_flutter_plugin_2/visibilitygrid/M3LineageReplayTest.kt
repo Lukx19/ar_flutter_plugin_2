@@ -11,6 +11,32 @@ import org.junit.Test
 
 class M3LineageReplayTest {
     @Test
+    fun `non monotonic transaction order persists one canonically sorted lineage history`() {
+        val directory = Files.createTempDirectory("m3-lineage-order").toFile()
+        val group = M3SurfaceGroup("lineage-order")
+        val owner = opened(M3SurfaceOwnership.open(group, directory))
+        val sources = (owner.apply(M3SurfaceOwnershipCommand("seed", (0 until 5).map { x ->
+            M3SurfaceCandidate(voxel = M3Voxel(x, 0, 0), normalOctX = 0, normalOctY = 0, normalConfidence = 192)
+        })) as M3SurfaceOwnershipResult.Accepted).owners
+        val order = listOf(1L, 2L, 3L, 5L, 4L)
+        var revision = 0L
+        val receipts = order.mapIndexed { index, id ->
+            accepted(owner.transact(relocate("ordered-$id", sources.single { it.id.value == id }.id, 20 + index, revision++)))
+        }
+        owner.close()
+
+        val reopened = opened(M3SurfaceOwnership.open(group, directory))
+        order.forEachIndexed { index, id ->
+            val replay = accepted(reopened.transact(relocate("ordered-$id", sources.single { it.id.value == id }.id, 20 + index, index.toLong())))
+            assertEquals(receipts[index], replay)
+            assertEquals(receipts[index].receipt.canonicalBytes, replay.receipt.canonicalBytes)
+        }
+        assertEquals(5, receipts.last().receipt.geometryRevision)
+        assertEquals(6, receipts.last().receipt.nextSurfaceIdHighWater)
+        assertEquals(5, receipts.last().receipt.liveSurfaceCount)
+    }
+
+    @Test
     fun `duplicate replay is exact changed replay conflicts and receipt survives reopen`() {
         val directory = Files.createTempDirectory("m3-lineage-replay").toFile()
         val group = M3SurfaceGroup("replay")

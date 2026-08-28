@@ -155,7 +155,8 @@ internal class M3SurfaceOwnership private constructor(
         prepared.targets.forEach { nextSupports[it.id.value] = prepared.sourceSupport.copyOf() }
         val nextSourceRecords = sourceRecords.toMutableMap()
         prepared.targets.forEach { nextSourceRecords.putIfAbsent(it.id.value, it.toSourceRecord()) }
-        val nextEdges = lineageEdges + prepared.edges
+        val nextEdges = (lineageEdges + prepared.edges)
+            .sortedWith(compareBy({ it.source.value }, { it.target.value }))
         val nextGeometryRevision = geometryRevision + 1
         val nextLineageRevision = lineageRevision + 1
         val provisional = M3CanonicalTransactionResult.Accepted(
