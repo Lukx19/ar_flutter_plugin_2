@@ -83,9 +83,10 @@ class M3LineageReplayTest {
         val measuredSource = seed(measuring)
         val exactSize = accepted(measuring.transact(relocate("bounded", measuredSource, 1))).receipt.canonicalBytes.size
         assertEquals(239, exactSize)
-        val exact = opened(M3SurfaceOwnership.inMemory(M3SurfaceGroup("bytes"), M3SurfaceOwnershipConfiguration(changeJournalByteCapacity = exactSize)))
+        val exactEntrySize = exactSize + 68
+        val exact = opened(M3SurfaceOwnership.inMemory(M3SurfaceGroup("bytes"), M3SurfaceOwnershipConfiguration(changeJournalByteCapacity = exactEntrySize)))
         accepted(exact.transact(relocate("bounded", seed(exact), 1)))
-        val over = opened(M3SurfaceOwnership.inMemory(M3SurfaceGroup("bytes"), M3SurfaceOwnershipConfiguration(changeJournalByteCapacity = exactSize - 1)))
+        val over = opened(M3SurfaceOwnership.inMemory(M3SurfaceGroup("bytes"), M3SurfaceOwnershipConfiguration(changeJournalByteCapacity = exactEntrySize - 1)))
         assertEquals(M3CanonicalTransactionRefusal.JOURNAL_EXHAUSTED, refused(over.transact(relocate("bounded", seed(over), 1))).reason)
     }
 

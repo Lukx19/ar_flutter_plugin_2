@@ -326,9 +326,10 @@ internal class M3SurfaceOwnership private constructor(
         ))
         val exactBytes = encodeCanonicalReceipt(group, preview).size.toLong()
         val retainedBytes = transactionReceipts.values.fold(0L) { total, receipt ->
-            checkedAdd(total, receipt.result.receipt.canonicalBytes.size.toLong()) ?: Long.MAX_VALUE
+            checkedAdd(total, canonicalJournalEntryBytes(receipt.result)) ?: Long.MAX_VALUE
         }
-        if (checkedAdd(retainedBytes, exactBytes) == null || retainedBytes + exactBytes > configuration.changeJournalByteCapacity) {
+        val entryBytes = checkedAdd(exactBytes, CANONICAL_JOURNAL_ENVELOPE_BYTES) ?: Long.MAX_VALUE
+        if (checkedAdd(retainedBytes, entryBytes) == null || retainedBytes + entryBytes > configuration.changeJournalByteCapacity) {
             return M3CanonicalPreparation.Refused(M3CanonicalTransactionRefusal.JOURNAL_EXHAUSTED)
         }
         return M3CanonicalPreparation.Accepted(sourceIds.sorted(), targets.sortedBy { it.id.value }, sourceSupport, edges, allocations)
@@ -656,7 +657,7 @@ private fun validate(group: M3SurfaceGroup, configuration: M3SurfaceOwnershipCon
     val canonicalIds = hashSetOf<String>()
     var journalBytes = 0L
     snapshot.transactionReceipts.forEach { receipt ->
-        journalBytes = checkedAdd(journalBytes, receipt.result.receipt.canonicalBytes.size.toLong())
+        journalBytes = checkedAdd(journalBytes, canonicalJournalEntryBytes(receipt.result))
             ?: throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT)
         if (receipt.commandHash.size != 32 || receipt.fingerprint.size != 32 || !canonicalIds.add(receipt.commandHash.hex()) ||
             receipt.result.targets.any { it.group != group || it.id.value !in 1 until highWater ||
@@ -677,7 +678,7 @@ private fun encodeSnapshot(snapshot: M3OwnershipSnapshot): ByteArray {
     val body = ByteArrayOutputStream().use { output ->
         DataOutputStream(output).use { data ->
             data.writeInt(0x4d33534f)
-            data.writeInt(3)
+            data.writeInt(4)
             data.writeLong(snapshot.nextHighWater)
             data.writeInt(snapshot.rows.size)
             snapshot.rows.forEach { row ->
@@ -723,22 +724,6 @@ private fun encodeSnapshot(snapshot: M3OwnershipSnapshot): ByteArray {
             snapshot.transactionReceipts.forEach { stored ->
                 data.write(stored.commandHash); data.write(stored.fingerprint)
                 val result = stored.result
-                data.writeUTF(result.receipt.commandId); data.writeInt(result.receipt.kind.ordinal)
-                data.writeInt(result.targets.size); result.targets.forEach { row ->
-                    data.writeLong(row.id.value); data.writeUTF(row.group.value)
-                    data.writeInt(row.voxel.x); data.writeInt(row.voxel.y); data.writeInt(row.voxel.z)
-                    data.writeInt(row.region.x); data.writeInt(row.region.y); data.writeInt(row.region.z)
-                    data.writeInt(row.page); data.writeInt(row.packedNormal); data.writeInt(row.normalConfidence); data.write(row.allocatedBy)
-                }
-                data.writeInt(result.receipt.removedSurfaceIds.size); result.receipt.removedSurfaceIds.forEach { data.writeLong(it.value) }
-                data.writeInt(result.receipt.lineageEdges.size); result.receipt.lineageEdges.forEach { data.writeLong(it.source.value); data.writeLong(it.target.value) }
-                data.writeLong(result.receipt.geometryRevision); data.writeLong(result.receipt.lineageRevision)
-                data.writeLong(result.receipt.nextSurfaceIdHighWater); data.writeInt(result.receipt.liveSurfaceCount)
-                data.writeInt(result.receipt.sourceSupport.size)
-                result.receipt.sourceSupport.forEach { source ->
-                    data.writeLong(source.id.value); data.writeInt(source.voxel.x); data.writeInt(source.voxel.y); data.writeInt(source.voxel.z)
-                    data.writeInt(source.packedNormal); data.writeInt(source.normalConfidence); data.write(source.allocationFingerprint.toByteArray())
-                }
                 val canonical = result.receipt.canonicalBytes.toByteArray()
                 data.writeInt(canonical.size); data.write(canonical)
             }
@@ -761,7 +746,7 @@ private fun decodeSnapshot(
             throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT)
         }
         val version = data.readInt()
-        if (version !in 1..3) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT)
+        if (version !in 1..4) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT)
         val high = data.readLong()
         val rowCount = boundedCount(data.readInt(), configuration.surfaceCapacity)
         val rows = List(rowCount) {
@@ -811,6 +796,11 @@ private fun decodeSnapshot(
             val canonicalReceipts = List(canonicalCount) {
                 val commandHash = ByteArray(32).also(data::readFully)
                 val fingerprint = ByteArray(32).also(data::readFully)
+                if (version >= 4) {
+                    val size = boundedCount(data.readInt(), configuration.changeJournalByteCapacity)
+                    val canonical = ByteArray(size).also(data::readFully)
+                    M3StoredCanonicalReceipt(commandHash, fingerprint, decodeCanonicalReceipt(canonical, configuration))
+                } else {
                 val commandId = data.readUTF()
                 val kindOrdinal = data.readInt()
                 val kind = M3CanonicalOperation.entries.getOrNull(kindOrdinal) ?: throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT)
@@ -839,6 +829,7 @@ private fun decodeSnapshot(
                     ByteArray(size).also(data::readFully)
                 } else encodeCanonicalReceipt(targets.first().group, provisional)
                 M3StoredCanonicalReceipt(commandHash, fingerprint, provisional.copy(receipt = receiptWithoutBytes.copy(canonicalBytes = M3CanonicalReceiptBytes(canonical))))
+                }
             }
             if (data.available() != 0) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT)
             M3OwnershipSnapshot(high, rows, receipts, supports, sources, edges, canonicalReceipts, geometryRevision, lineageRevision)
@@ -874,6 +865,35 @@ private fun encodeCanonicalReceipt(group: M3SurfaceGroup, result: M3CanonicalTra
         }
         output.toByteArray()
     }
+
+private fun decodeCanonicalReceipt(bytes: ByteArray, configuration: M3SurfaceOwnershipConfiguration): M3CanonicalTransactionResult.Accepted = try {
+    DataInputStream(ByteArrayInputStream(bytes)).use { data ->
+        if (data.readInt() != 0x4d334352 || data.readInt() != 1) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT)
+        val group = M3SurfaceGroup(data.readUTF()); val commandId = data.readUTF()
+        val kind = M3CanonicalOperation.entries.getOrNull(data.readInt()) ?: throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT)
+        val geometry = data.readLong(); val lineage = data.readLong(); val high = data.readLong(); val live = data.readInt()
+        val targetCount = boundedCount(data.readInt(), configuration.surfaceCapacity)
+        val targets = List(targetCount) {
+            M3SurfaceOwner(M3SurfaceId(data.readLong()), M3SurfaceGroup(data.readUTF()),
+                M3Voxel(data.readInt(), data.readInt(), data.readInt()), M3StorageRegion(data.readInt(), data.readInt(), data.readInt()),
+                data.readInt(), data.readInt(), data.readInt(), ByteArray(32).also(data::readFully))
+        }
+        if (targets.any { it.group != group }) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT)
+        val removed = List(boundedCount(data.readInt(), configuration.surfaceCapacity)) { M3SurfaceId(data.readLong()) }
+        val edges = List(boundedCount(data.readInt(), configuration.lineageCapacity)) { M3LineageEdge(M3SurfaceId(data.readLong()), M3SurfaceId(data.readLong())) }
+        val supports = List(boundedCount(data.readInt(), configuration.lineageCapacity)) {
+            M3ImmutableSourceSupport(M3SurfaceId(data.readLong()), M3Voxel(data.readInt(), data.readInt(), data.readInt()),
+                data.readInt(), data.readInt(), M3CanonicalReceiptBytes(ByteArray(32).also(data::readFully)))
+        }
+        if (data.available() != 0) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT)
+        M3CanonicalTransactionResult.Accepted(targets, M3CanonicalTransactionReceipt(commandId, kind, removed, edges,
+            geometry, lineage, high, live, supports, M3CanonicalReceiptBytes(bytes)))
+    }
+} catch (failure: M3RestoreFailure) { throw failure } catch (_: Exception) { throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT) }
+
+private const val CANONICAL_JOURNAL_ENVELOPE_BYTES = 68L
+private fun canonicalJournalEntryBytes(result: M3CanonicalTransactionResult.Accepted): Long =
+    checkedAdd(CANONICAL_JOURNAL_ENVELOPE_BYTES, result.receipt.canonicalBytes.size.toLong()) ?: Long.MAX_VALUE
 
 private fun checkedAdd(left: Long, right: Long): Long? = try { Math.addExact(left, right) } catch (_: ArithmeticException) { null }
 private fun syncOwnershipDirectory(directory: File) {
