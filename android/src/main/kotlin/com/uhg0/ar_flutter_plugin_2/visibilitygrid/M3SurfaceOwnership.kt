@@ -1,0 +1,288 @@
+package com.uhg0.ar_flutter_plugin_2.visibilitygrid
+
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.DataInputStream
+import java.io.DataOutputStream
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
+import kotlin.math.abs
+import kotlin.math.floor
+import kotlin.math.roundToInt
+import kotlin.math.sqrt
+
+/**
+ * Group-local durable owner for M3 surface identities and their storage location.
+ *
+ * Its interface is intentionally limited to [open], [apply], and [close].  The
+ * allocator, durable journal, mutable owner indexes, and persistence adapters
+ * are all implementation details.  An accepted result is visible only after a
+ * flushed append-only reservation and a durable owner snapshot.
+ */
+internal class M3SurfaceOwnership private constructor(
+    private val group: M3SurfaceGroup,
+    private val configuration: M3SurfaceOwnershipConfiguration,
+    private val store: M3SurfaceOwnershipStore,
+    restored: M3RestoredOwnership,
+) {
+    private val rowsById = restored.rows.associateByTo(linkedMapOf()) { it.id.value }
+    private val idByVoxel = restored.rows.associateTo(linkedMapOf()) { it.voxel to it.id.value }
+    private val receipts = restored.receipts.associateByTo(linkedMapOf()) { it.commandHash.hex() }
+    private var nextHighWater = restored.nextHighWater
+    private var closed = false
+
+    /** Applies one complete candidate set atomically, or returns a typed refusal. */
+    fun apply(command: M3SurfaceOwnershipCommand): M3SurfaceOwnershipResult {
+        if (closed) return M3SurfaceOwnershipResult.Refused(M3SurfaceOwnershipRefusal.CLOSED, snapshot())
+        val commandHash = sha256(command.commandId.encodeToByteArray())
+        val fingerprint = command.fingerprint()
+        receipts[commandHash.hex()]?.let { receipt ->
+            return if (receipt.fingerprint.contentEquals(fingerprint)) receipt.result else {
+                M3SurfaceOwnershipResult.Refused(M3SurfaceOwnershipRefusal.IDENTITY_CONFLICT, snapshot())
+            }
+        }
+        val preparation = prepare(command, commandHash)
+        if (preparation is M3Preparation.Refused) return M3SurfaceOwnershipResult.Refused(preparation.reason, snapshot())
+        preparation as M3Preparation.Accepted
+
+        // Reservation is the authority cut. Any error after this point burns its
+        // range; no row becomes visible unless the complete owner snapshot lands.
+        if (preparation.newCount > 0) {
+            val end = checkedEnd(nextHighWater, preparation.newCount)
+                ?: return M3SurfaceOwnershipResult.Refused(M3SurfaceOwnershipRefusal.EXHAUSTED, snapshot())
+            val reservation = M3Reservation(
+                revision = store.lastReservationRevision + 1,
+                start = nextHighWater,
+                endExclusive = end,
+                groupHash = group.hash,
+                commandHash = commandHash,
+                fingerprint = fingerprint,
+                previousHash = store.lastReservationHash,
+            )
+            try {
+                store.appendReservation(reservation)
+            } catch (_: M3OwnershipFault) {
+                nextHighWater = end
+                return M3SurfaceOwnershipResult.Refused(M3SurfaceOwnershipRefusal.DURABILITY_FAILURE, snapshot())
+            }
+            nextHighWater = end
+        }
+
+        val stagedRows = preparation.rows
+        val accepted = M3SurfaceOwnershipResult.Accepted(stagedRows, snapshot(stagedRows.size, preparation.newCount))
+        val receipt = M3StoredReceipt(commandHash, fingerprint, accepted)
+        try {
+            val nextRows = rowsById.toMutableMap()
+            preparation.changedRows.forEach { nextRows[it.id.value] = it }
+            store.writeSnapshot(M3OwnershipSnapshot(nextHighWater, nextRows.values.toList(), receipts.values.toList() + receipt))
+        } catch (_: M3OwnershipFault) {
+            return M3SurfaceOwnershipResult.Refused(M3SurfaceOwnershipRefusal.DURABILITY_FAILURE, snapshot())
+        }
+        preparation.changedRows.forEach { row ->
+            rowsById[row.id.value] = row
+            idByVoxel.entries.removeIf { it.value == row.id.value && it.key != row.voxel }
+            idByVoxel[row.voxel] = row.id.value
+        }
+        receipts[commandHash.hex()] = receipt
+        return accepted
+    }
+
+    /** Idempotently closes the owner; later calls are deterministic refusals. */
+    fun close(): M3SurfaceOwnershipCloseResult {
+        if (closed) return M3SurfaceOwnershipCloseResult.AlreadyClosed
+        closed = true
+        store.close()
+        return M3SurfaceOwnershipCloseResult.Closed
+    }
+
+    private fun prepare(command: M3SurfaceOwnershipCommand, commandHash: ByteArray): M3Preparation {
+        if (command.commandId.isBlank() || command.commandId.encodeToByteArray().size > MAX_COMMAND_BYTES || command.candidates.isEmpty()) {
+            return M3Preparation.Refused(M3SurfaceOwnershipRefusal.INVALID_COMMAND)
+        }
+        val seenIds = hashSetOf<Long>()
+        val seenVoxels = hashSetOf<M3Voxel>()
+        val changed = ArrayList<M3SurfaceOwner>(command.candidates.size)
+        var allocated = 0
+        command.candidates.forEach { candidate ->
+            val ownership = ownershipFor(candidate.voxel) ?: return M3Preparation.Refused(M3SurfaceOwnershipRefusal.INVALID_OWNERSHIP)
+            val packed = packNormal(candidate.normalX, candidate.normalY, candidate.normalZ, candidate.confidence)
+                ?: return M3Preparation.Refused(M3SurfaceOwnershipRefusal.INVALID_NORMAL)
+            val existing = candidate.id?.let { rowsById[it] }
+            if (candidate.id != null && (candidate.id == 0L || existing == null || !seenIds.add(candidate.id))) {
+                return M3Preparation.Refused(M3SurfaceOwnershipRefusal.UNKNOWN_IDENTITY)
+            }
+            if (!seenVoxels.add(candidate.voxel)) return M3Preparation.Refused(M3SurfaceOwnershipRefusal.OWNERSHIP_CONFLICT)
+            val occupied = idByVoxel[candidate.voxel]
+            if (occupied != null && occupied != candidate.id) return M3Preparation.Refused(M3SurfaceOwnershipRefusal.OWNERSHIP_CONFLICT)
+            val id = candidate.id ?: run {
+                allocated++
+                nextHighWater + allocated - 1
+            }
+            changed += M3SurfaceOwner(
+                id = M3SurfaceId(id), group = group, voxel = candidate.voxel,
+                region = ownership.region, page = ownership.page,
+                packedNormal = packed.first, confidenceQ15 = packed.second,
+                allocatedBy = commandHash,
+            )
+        }
+        if (rowsById.size - command.candidates.count { it.id != null } + changed.size > configuration.surfaceCapacity) {
+            return M3Preparation.Refused(M3SurfaceOwnershipRefusal.CAPACITY)
+        }
+        if (checkedEnd(nextHighWater, allocated) == null) return M3Preparation.Refused(M3SurfaceOwnershipRefusal.EXHAUSTED)
+        return M3Preparation.Accepted(changed, allocated)
+    }
+
+    private fun snapshot(resultRows: Int = 0, allocated: Int = 0) = M3SurfaceOwnershipReceipt(
+        nextSurfaceIdHighWater = nextHighWater,
+        liveSurfaceCount = rowsById.size,
+        resultRowCount = resultRows,
+        allocatedCount = allocated,
+    )
+
+    private fun ownershipFor(voxel: M3Voxel): M3Location? {
+        val cellsPerRegion = configuration.regionMicrometers / configuration.voxelMicrometers
+        val cellsPerPage = configuration.pageMicrometers / configuration.voxelMicrometers
+        if (cellsPerRegion != cellsPerPage * 3) return null
+        fun axis(value: Int): Pair<Int, Int> {
+            val region = Math.floorDiv(value, cellsPerRegion)
+            return region to Math.floorMod(value, cellsPerRegion)
+        }
+        val (rx, lx) = axis(voxel.x); val (ry, ly) = axis(voxel.y); val (rz, lz) = axis(voxel.z)
+        val px = lx / cellsPerPage; val py = ly / cellsPerPage; val pz = lz / cellsPerPage
+        if (px !in 0..2 || py !in 0..2 || pz !in 0..2) return null
+        return M3Location(M3StorageRegion(rx, ry, rz), px + 3 * (py + 3 * pz))
+    }
+
+    private fun checkedEnd(start: Long, count: Int): Long? {
+        if (count == 0) return start
+        if (start !in 1..MAX_HIGH_WATER || count < 0) return null
+        val end = start + count.toLong()
+        return end.takeIf { it <= MAX_HIGH_WATER }
+    }
+
+    private sealed interface M3Preparation {
+        data class Accepted(val changedRows: List<M3SurfaceOwner>, val newCount: Int) : M3Preparation { val rows get() = changedRows }
+        data class Refused(val reason: M3SurfaceOwnershipRefusal) : M3Preparation
+    }
+
+    companion object {
+        private const val MAX_COMMAND_BYTES = 256
+        private const val MAX_HIGH_WATER = 0x1_0000_0000L
+
+        fun open(
+            group: M3SurfaceGroup,
+            directory: File,
+            configuration: M3SurfaceOwnershipConfiguration = M3SurfaceOwnershipConfiguration(),
+            fault: M3SurfaceOwnershipFault? = null,
+        ): M3SurfaceOwnershipOpenResult = open(group, configuration, M3FileSurfaceOwnershipStore(directory, group, fault))
+
+        fun inMemory(
+            group: M3SurfaceGroup,
+            configuration: M3SurfaceOwnershipConfiguration = M3SurfaceOwnershipConfiguration(),
+            fault: M3SurfaceOwnershipFault? = null,
+        ): M3SurfaceOwnershipOpenResult = open(group, configuration, M3MemorySurfaceOwnershipStore(group, fault))
+
+        private fun open(group: M3SurfaceGroup, configuration: M3SurfaceOwnershipConfiguration, store: M3SurfaceOwnershipStore): M3SurfaceOwnershipOpenResult {
+            if (!configuration.isValid) return M3SurfaceOwnershipOpenResult.Refused(M3SurfaceOwnershipRestoreRefusal.INVALID_CONFIGURATION)
+            return try {
+                val restored = store.restore()
+                M3SurfaceOwnershipOpenResult.Opened(M3SurfaceOwnership(group, configuration, store, restored))
+            } catch (failure: M3RestoreFailure) {
+                store.close()
+                M3SurfaceOwnershipOpenResult.Refused(failure.reason)
+            }
+        }
+    }
+}
+
+internal data class M3SurfaceGroup(val value: String) {
+    init { require(value.isNotBlank() && value.encodeToByteArray().size <= 128) }
+    internal val hash: ByteArray get() = sha256(value.encodeToByteArray())
+}
+
+internal data class M3SurfaceOwnershipConfiguration(
+    val voxelMicrometers: Int = 100_000,
+    val regionMicrometers: Int = 3_000_000,
+    val pageMicrometers: Int = 1_000_000,
+    val surfaceCapacity: Int = 100_000,
+) { internal val isValid get() = voxelMicrometers > 0 && regionMicrometers > 0 && pageMicrometers > 0 && regionMicrometers % voxelMicrometers == 0 && pageMicrometers % voxelMicrometers == 0 && regionMicrometers == pageMicrometers * 3 && surfaceCapacity > 0 }
+
+internal data class M3SurfaceOwnershipCommand(val commandId: String, val candidates: List<M3SurfaceCandidate>) {
+    internal fun fingerprint(): ByteArray = sha256(buildString {
+        append(commandId).append('|')
+        candidates.forEach { append(it.id).append(':').append(it.voxel).append(':').append(it.normalX).append(':').append(it.normalY).append(':').append(it.normalZ).append(':').append(it.confidence).append(';') }
+    }.encodeToByteArray())
+}
+internal data class M3SurfaceCandidate(val id: Long? = null, val voxel: M3Voxel, val normalX: Double, val normalY: Double, val normalZ: Double, val confidence: Double)
+internal data class M3Voxel(val x: Int, val y: Int, val z: Int)
+internal data class M3SurfaceId(val value: Long) { init { require(value in 1 until 0x1_0000_0000L) } }
+internal data class M3StorageRegion(val x: Int, val y: Int, val z: Int)
+internal data class M3SurfaceOwner(val id: M3SurfaceId, val group: M3SurfaceGroup, val voxel: M3Voxel, val region: M3StorageRegion, val page: Int, val packedNormal: Int, val confidenceQ15: Int, internal val allocatedBy: ByteArray)
+internal data class M3SurfaceOwnershipReceipt(val nextSurfaceIdHighWater: Long, val liveSurfaceCount: Int, val resultRowCount: Int, val allocatedCount: Int)
+internal sealed interface M3SurfaceOwnershipResult { data class Accepted(val owners: List<M3SurfaceOwner>, val receipt: M3SurfaceOwnershipReceipt) : M3SurfaceOwnershipResult; data class Refused(val reason: M3SurfaceOwnershipRefusal, val receipt: M3SurfaceOwnershipReceipt) : M3SurfaceOwnershipResult }
+internal enum class M3SurfaceOwnershipRefusal { CLOSED, INVALID_COMMAND, INVALID_OWNERSHIP, INVALID_NORMAL, UNKNOWN_IDENTITY, OWNERSHIP_CONFLICT, CAPACITY, EXHAUSTED, IDENTITY_CONFLICT, DURABILITY_FAILURE }
+internal sealed interface M3SurfaceOwnershipOpenResult { data class Opened(val ownership: M3SurfaceOwnership) : M3SurfaceOwnershipOpenResult; data class Refused(val reason: M3SurfaceOwnershipRestoreRefusal) : M3SurfaceOwnershipOpenResult }
+internal enum class M3SurfaceOwnershipRestoreRefusal { INVALID_CONFIGURATION, CORRUPT, FORK, EXHAUSTED }
+internal sealed interface M3SurfaceOwnershipCloseResult { data object Closed : M3SurfaceOwnershipCloseResult; data object AlreadyClosed : M3SurfaceOwnershipCloseResult }
+internal enum class M3SurfaceOwnershipFault { AFTER_RESERVATION_FLUSH, BEFORE_SNAPSHOT_FLUSH }
+
+private data class M3Location(val region: M3StorageRegion, val page: Int)
+private data class M3Reservation(val revision: Long, val start: Long, val endExclusive: Long, val groupHash: ByteArray, val commandHash: ByteArray, val fingerprint: ByteArray, val previousHash: ByteArray) { val recordHash: ByteArray get() = sha256(bytesWithoutHash())
+    fun bytesWithoutHash(): ByteArray = ByteArrayOutputStream().use { output -> DataOutputStream(output).use { data -> data.writeInt(0x4d33524c); data.writeInt(1); data.writeLong(revision); data.writeLong(start); data.writeLong(endExclusive); data.write(groupHash); data.write(commandHash); data.write(fingerprint); data.write(previousHash); output.toByteArray() } }
+}
+private data class M3StoredReceipt(val commandHash: ByteArray, val fingerprint: ByteArray, val result: M3SurfaceOwnershipResult.Accepted)
+private data class M3OwnershipSnapshot(val nextHighWater: Long, val rows: List<M3SurfaceOwner>, val receipts: List<M3StoredReceipt>)
+private data class M3RestoredOwnership(val nextHighWater: Long, val rows: List<M3SurfaceOwner>, val receipts: List<M3StoredReceipt>)
+private class M3OwnershipFault : RuntimeException()
+private class M3RestoreFailure(val reason: M3SurfaceOwnershipRestoreRefusal) : RuntimeException()
+
+private interface M3SurfaceOwnershipStore { val lastReservationRevision: Long; val lastReservationHash: ByteArray; fun appendReservation(reservation: M3Reservation); fun writeSnapshot(snapshot: M3OwnershipSnapshot); fun restore(): M3RestoredOwnership; fun close() }
+
+private class M3MemorySurfaceOwnershipStore(private val group: M3SurfaceGroup, private val fault: M3SurfaceOwnershipFault?) : M3SurfaceOwnershipStore {
+    private val reservations = mutableListOf<M3Reservation>(); private var snapshot = M3OwnershipSnapshot(1, emptyList(), emptyList())
+    override val lastReservationRevision get() = reservations.lastOrNull()?.revision ?: 0L
+    override val lastReservationHash get() = reservations.lastOrNull()?.recordHash ?: ByteArray(32)
+    override fun appendReservation(reservation: M3Reservation) { reservations += reservation; if (fault == M3SurfaceOwnershipFault.AFTER_RESERVATION_FLUSH) throw M3OwnershipFault() }
+    override fun writeSnapshot(snapshot: M3OwnershipSnapshot) { if (fault == M3SurfaceOwnershipFault.BEFORE_SNAPSHOT_FLUSH) throw M3OwnershipFault(); this.snapshot = snapshot }
+    override fun restore() = validate(group, reservations, snapshot)
+    override fun close() = Unit
+}
+
+private class M3FileSurfaceOwnershipStore(directory: File, private val group: M3SurfaceGroup, private val fault: M3SurfaceOwnershipFault?) : M3SurfaceOwnershipStore {
+    private val prefix = sha256(group.value.encodeToByteArray()).hex(); private val ledger = File(directory, "m3-surface-$prefix.ledger"); private val snapshot = File(directory, "m3-surface-$prefix.snapshot")
+    private var reservations: List<M3Reservation> = readLedger(ledger)
+    override val lastReservationRevision get() = reservations.lastOrNull()?.revision ?: 0L
+    override val lastReservationHash get() = reservations.lastOrNull()?.recordHash ?: ByteArray(32)
+    init { directory.mkdirs(); if (!directory.isDirectory) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT) }
+    override fun appendReservation(reservation: M3Reservation) { FileOutputStream(ledger, true).use { out -> out.write(reservation.bytesWithoutHash()); out.write(reservation.recordHash); out.fd.sync() }; reservations = reservations + reservation; if (fault == M3SurfaceOwnershipFault.AFTER_RESERVATION_FLUSH) throw M3OwnershipFault() }
+    override fun writeSnapshot(snapshot: M3OwnershipSnapshot) { if (fault == M3SurfaceOwnershipFault.BEFORE_SNAPSHOT_FLUSH) throw M3OwnershipFault(); val bytes = encodeSnapshot(snapshot); val temp = File("${this.snapshot.path}.tmp"); FileOutputStream(temp).use { out -> out.write(bytes); out.fd.sync() }; try { Files.move(temp.toPath(), this.snapshot.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING) } catch (_: AtomicMoveNotSupportedException) { Files.move(temp.toPath(), this.snapshot.toPath(), StandardCopyOption.REPLACE_EXISTING) } }
+    override fun restore(): M3RestoredOwnership = validate(group, reservations, if (snapshot.exists()) decodeSnapshot(snapshot.readBytes()) else M3OwnershipSnapshot(1, emptyList(), emptyList()))
+    override fun close() = Unit
+}
+
+private fun validate(group: M3SurfaceGroup, reservations: List<M3Reservation>, snapshot: M3OwnershipSnapshot): M3RestoredOwnership {
+    var highWater = 1L; var previous = ByteArray(32); var revision = 0L
+    reservations.forEach { record ->
+        if (record.revision != ++revision || record.start != highWater || record.endExclusive !in (record.start + 1)..0x1_0000_0000L || !record.groupHash.contentEquals(group.hash) || !record.previousHash.contentEquals(previous) || record.recordHash.contentEquals(ByteArray(32))) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT)
+        highWater = record.endExclusive; previous = record.recordHash
+    }
+    if (snapshot.nextHighWater !in 1..highWater) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.FORK)
+    if (highWater > 0x1_0000_0000L) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.EXHAUSTED)
+    val ids = hashSetOf<Long>(); val voxels = hashSetOf<M3Voxel>()
+    snapshot.rows.forEach { row -> if (row.group != group || row.id.value !in 1 until highWater || !ids.add(row.id.value) || !voxels.add(row.voxel) || row.page !in 0..26) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT) }
+    return M3RestoredOwnership(highWater, snapshot.rows, snapshot.receipts)
+}
+
+private fun readLedger(file: File): List<M3Reservation> { if (!file.exists()) return emptyList(); val bytes = file.readBytes(); val recordBytes = 4 + 4 + 8 + 8 + 8 + 32 * 5; if (bytes.size % recordBytes != 0) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT); return bytes.asList().chunked(recordBytes).map { decodeReservation(it.toByteArray()) } }
+private fun decodeReservation(bytes: ByteArray): M3Reservation { val data = DataInputStream(ByteArrayInputStream(bytes)); if (data.readInt() != 0x4d33524c || data.readInt() != 1) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT); val record = M3Reservation(data.readLong(), data.readLong(), data.readLong(), ByteArray(32).also(data::readFully), ByteArray(32).also(data::readFully), ByteArray(32).also(data::readFully), ByteArray(32).also(data::readFully)); val hash = ByteArray(32).also(data::readFully); if (!hash.contentEquals(record.recordHash)) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT); return record }
+private fun encodeSnapshot(snapshot: M3OwnershipSnapshot): ByteArray = ByteArrayOutputStream().use { output -> DataOutputStream(output).use { data -> data.writeInt(0x4d33534f); data.writeInt(1); data.writeLong(snapshot.nextHighWater); data.writeInt(snapshot.rows.size); snapshot.rows.forEach { row -> data.writeLong(row.id.value); data.writeUTF(row.group.value); data.writeInt(row.voxel.x); data.writeInt(row.voxel.y); data.writeInt(row.voxel.z); data.writeInt(row.region.x); data.writeInt(row.region.y); data.writeInt(row.region.z); data.writeInt(row.page); data.writeInt(row.packedNormal); data.writeInt(row.confidenceQ15); data.write(row.allocatedBy) }; data.writeInt(snapshot.receipts.size); snapshot.receipts.forEach { receipt -> data.write(receipt.commandHash); data.write(receipt.fingerprint); val accepted = receipt.result; data.writeInt(accepted.owners.size); accepted.owners.forEach { data.writeLong(it.id.value) }; data.writeLong(accepted.receipt.nextSurfaceIdHighWater); data.writeInt(accepted.receipt.liveSurfaceCount); data.writeInt(accepted.receipt.resultRowCount); data.writeInt(accepted.receipt.allocatedCount) }; output.toByteArray() } }
+private fun decodeSnapshot(bytes: ByteArray): M3OwnershipSnapshot = try { DataInputStream(ByteArrayInputStream(bytes)).use { data -> if (data.readInt() != 0x4d33534f || data.readInt() != 1) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT); val high = data.readLong(); val rows = List(data.readInt()) { M3SurfaceOwner(M3SurfaceId(data.readLong()), M3SurfaceGroup(data.readUTF()), M3Voxel(data.readInt(), data.readInt(), data.readInt()), M3StorageRegion(data.readInt(), data.readInt(), data.readInt()), data.readInt(), data.readInt(), data.readInt(), ByteArray(32).also(data::readFully)) }; val byId = rows.associateBy { it.id.value }; val receipts = List(data.readInt()) { val commandHash = ByteArray(32).also(data::readFully); val fingerprint = ByteArray(32).also(data::readFully); val owners = List(data.readInt()) { byId[data.readLong()] ?: throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT) }; val receipt = M3SurfaceOwnershipReceipt(data.readLong(), data.readInt(), data.readInt(), data.readInt()); M3StoredReceipt(commandHash, fingerprint, M3SurfaceOwnershipResult.Accepted(owners, receipt)) }; if (data.available() != 0) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT); M3OwnershipSnapshot(high, rows, receipts) } } catch (failure: M3RestoreFailure) { throw failure } catch (_: Exception) { throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT) }
+
+private fun packNormal(x: Double, y: Double, z: Double, confidence: Double): Pair<Int, Int>? { if (!x.isFinite() || !y.isFinite() || !z.isFinite() || !confidence.isFinite() || confidence !in 0.0..1.0) return null; val length = sqrt(x * x + y * y + z * z); if (length == 0.0) return null; var nx = x / length; var ny = y / length; val nz = z / length; val denominator = abs(nx) + abs(ny) + abs(nz); nx /= denominator; ny /= denominator; if (nz < 0) { val oldX = nx; nx = (1 - abs(ny)) * if (oldX >= 0) 1 else -1; ny = (1 - abs(oldX)) * if (ny >= 0) 1 else -1 }; val qx = (nx * 32767).roundToInt().coerceIn(-32767, 32767); val qy = (ny * 32767).roundToInt().coerceIn(-32767, 32767); return (((qx and 0xffff) shl 16) or (qy and 0xffff)) to (confidence * 32767).roundToInt() }
+private fun sha256(bytes: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(bytes)
+private fun ByteArray.hex(): String = joinToString("") { "%02x".format(it) }
