@@ -107,6 +107,10 @@ internal class M3SurfaceOwnership private constructor(
         if (command.commandId.isBlank() || command.commandId.encodeToByteArray().size > MAX_COMMAND_BYTES || command.candidates.isEmpty()) {
             return M3Preparation.Refused(M3SurfaceOwnershipRefusal.INVALID_COMMAND)
         }
+        val requestedAllocations = command.candidates.count { it.id == null }
+        if (checkedEnd(nextHighWater, requestedAllocations) == null) {
+            return M3Preparation.Refused(M3SurfaceOwnershipRefusal.EXHAUSTED)
+        }
         val seenIds = hashSetOf<Long>()
         val seenVoxels = hashSetOf<M3Voxel>()
         val changed = ArrayList<M3SurfaceOwner>(command.candidates.size)
@@ -136,7 +140,6 @@ internal class M3SurfaceOwnership private constructor(
         if (rowsById.size - command.candidates.count { it.id != null } + changed.size > configuration.surfaceCapacity) {
             return M3Preparation.Refused(M3SurfaceOwnershipRefusal.CAPACITY)
         }
-        if (checkedEnd(nextHighWater, allocated) == null) return M3Preparation.Refused(M3SurfaceOwnershipRefusal.EXHAUSTED)
         return M3Preparation.Accepted(changed, allocated)
     }
 
