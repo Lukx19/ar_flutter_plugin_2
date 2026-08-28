@@ -30,6 +30,14 @@ class M3CanonicalTransactionTest {
         assertEquals(M3CanonicalTransactionRefusal.IDENTITY_CONFLICT,
             refused(owner.transact(create("bootstrap", 2))).reason)
 
+        // Trap the legacy bootstrap path with the same durable command identity.
+        // CREATE owns that identity in the transaction journal, so apply cannot
+        // have run first and cannot be used afterward to mutate the committed cut.
+        val applyTrap = owner.apply(M3SurfaceOwnershipCommand("bootstrap", listOf(candidate(99))))
+        assertEquals(M3SurfaceOwnershipRefusal.IDENTITY_CONFLICT,
+            (applyTrap as M3SurfaceOwnershipResult.Refused).reason)
+        assertEquals(committed, accepted(owner.transact(create)))
+
         val relocated = accepted(owner.transact(command(
             "after-create", M3CanonicalOperation.RELOCATION, 1, 0, listOf(committed.targets.first().id), target(10, committed.targets.first().id),
         )))

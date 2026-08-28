@@ -18,9 +18,12 @@ class M3LineageReplayTest {
         val committed = accepted(owner.transact(create))
         owner.close()
 
-        val replay = accepted(opened(M3SurfaceOwnership.open(group, directory)).transact(create))
+        val reopened = opened(M3SurfaceOwnership.open(group, directory))
+        val replay = accepted(reopened.transact(create))
         assertEquals(committed, replay)
         assertEquals(committed.receipt.canonicalBytes, replay.receipt.canonicalBytes)
+        assertEquals(M3CanonicalTransactionRefusal.IDENTITY_CONFLICT,
+            refused(reopened.transact(create("bootstrap", 2))).reason)
         assertEquals(listOf(0, 1, 2, 3, 4), M3CanonicalOperation.entries.map { it.ordinal })
         assertEquals(M3CanonicalOperation.RELOCATION, M3CanonicalOperation.entries[0])
         assertEquals(M3CanonicalOperation.REPLACEMENT, M3CanonicalOperation.entries[3])
@@ -84,7 +87,7 @@ class M3LineageReplayTest {
             M3SurfaceOwnershipFault.AFTER_ROOT_SWITCH_BEFORE_DIRECTORY_SYNC to false,
             M3SurfaceOwnershipFault.AFTER_ROOT_DIRECTORY_SYNC to false,
         )
-        cases.forEachIndexed { index, (fault, _) ->
+        cases.forEachIndexed { index, (fault, burnsReservation) ->
             val directory = Files.createTempDirectory("m3-fault-$index").toFile()
             val group = M3SurfaceGroup("fault-$index")
             val owner = opened(M3SurfaceOwnership.open(group, directory, fault = fault))
@@ -97,6 +100,7 @@ class M3LineageReplayTest {
                 assertEquals(M3CanonicalTransactionRefusal.DURABILITY_FAILURE, refusal.reason)
                 assertEquals(0, refusal.receipt.geometryRevision)
                 assertEquals(0, refusal.receipt.lineageRevision)
+                assertEquals(2, refusal.receipt.nextSurfaceIdHighWater)
                 assertEquals(0, refusal.receipt.liveSurfaceCount)
             }
             owner.close()
@@ -107,7 +111,10 @@ class M3LineageReplayTest {
                 val retry = accepted(reopened.transact(command))
                 assertEquals(1, retry.receipt.geometryRevision)
                 assertEquals(0, retry.receipt.lineageRevision)
-                assertTrue(retry.receipt.liveSurfaceCount == 1)
+                assertEquals(1, retry.receipt.liveSurfaceCount)
+                assertTrue(burnsReservation)
+                assertEquals(2, retry.targets.single().id.value)
+                assertEquals(3, retry.receipt.nextSurfaceIdHighWater)
             }
         }
     }
