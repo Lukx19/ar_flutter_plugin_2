@@ -117,6 +117,11 @@ class M3CanonicalStoreMigrationTest {
                     acceptingBudget(),
                 ) as M3CompactCanonicalMigrationResult.Prepared
             assertEquals(2, prepared.cut.liveSurfaceCount)
+            val indexReceipt = requireNotNull(prepared.sourceIndex)
+            assertEquals(2, indexReceipt.records)
+            assertEquals(8L, indexReceipt.retainedBytes)
+            assertEquals(4L, indexReceipt.lookups)
+            assertTrue(indexReceipt.maximumLookupIdReads <= 2)
             val store =
                 (M3CompactCanonicalStore.openV6(group, directory, acceptingBudget())
                         as M3CompactCanonicalOpenResult.Opened)
@@ -337,6 +342,44 @@ class M3CanonicalStoreMigrationTest {
     }
 
     @Test
+    fun `maximum unsorted v5 sources use bounded radix index for all 300k support joins`() {
+        val directory = Files.createTempDirectory("m3-compact-maximum-unsorted").toFile()
+        try {
+            val group = M3SurfaceGroup("compact-maximum-unsorted")
+            writeMaximumV3Fixture(directory, group, version = 5, unsortedSources = true)
+            val migrationBytes = measureMigrationGraph(group, directory)
+            assertTrue("unsorted migration graph bytes=$migrationBytes", migrationBytes <= 15_728_640L)
+            val prepared = M3CompactCanonicalStore.prepareV6SiblingMigration(
+                group, directory, acceptingBudget(),
+            ) as M3CompactCanonicalMigrationResult.Prepared
+            val index = requireNotNull(prepared.sourceIndex)
+            assertEquals(300_000, index.records)
+            assertEquals(1_200_000L, index.retainedBytes)
+            assertEquals(600_000L, index.lookups)
+            assertTrue(index.buildIdReads <= 2_700_000L)
+            assertTrue(index.lookupIdReads <= 11_400_000L)
+            assertTrue(index.maximumLookupIdReads <= 19)
+            assertEquals(300_000, prepared.cut.sourceCount)
+            assertEquals(300_000, prepared.cut.supportCount)
+            assertEquals(200_000, prepared.cut.lineageCount)
+            assertEquals(
+                maximumExpectedDigest().toList(),
+                maximumPagesDigest(prepared.candidateDirectory).toList(),
+            )
+            val store = (M3CompactCanonicalStore.openV6(group, directory, acceptingBudget())
+                as M3CompactCanonicalOpenResult.Opened).store
+            listOf(1L, 150_000L, 0x7fff_ffffL, 0x8000_0000L, 0xffff_ffffL).forEach { id ->
+                val source = store.readSourceById(M3SurfaceId(id)) as M3CanonicalPageRead.Complete
+                assertEquals(id, source.value!!.id.value)
+            }
+            store.close()
+            println("M3_MAX_UNSORTED_MIGRATION_MEMORY=constructedBytes=$migrationBytes sourceIndex=$index owners=kernel,legacyColumns,sourceOrdinalRadixIndex,directoryColumns,pageObjects,pageBuffer,codecScratch")
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `valid legacy authority deterministically prepares one non destructive sibling`() {
         val directory = Files.createTempDirectory("m3-compact-migrate").toFile()
         try {
@@ -498,7 +541,13 @@ class M3CanonicalStoreMigrationTest {
     }
 
     /** A test-only v3 encoder independent of every v6 production encoder. */
-    private fun writeMaximumV3Fixture(directory: File, group: M3SurfaceGroup) {
+    private fun writeMaximumV3Fixture(
+        directory: File,
+        group: M3SurfaceGroup,
+        version: Int = 3,
+        unsortedSources: Boolean = false,
+    ) {
+        require(version in 3..5)
         val prefix = sha256(group.value.encodeToByteArray()).hex()
         val ledger = directory.resolve("m3-surface-$prefix.ledger")
         val reservationBody =
@@ -524,7 +573,7 @@ class M3CanonicalStoreMigrationTest {
             val digestOutput = DigestOutputStream(file, digest)
             val out = DataOutputStream(digestOutput)
             out.writeInt(0x4d33534f)
-            out.writeInt(3)
+            out.writeInt(version)
             out.writeLong(0x1_0000_0000L)
             out.writeInt(100_000)
             repeat(100_000) { index ->
@@ -548,10 +597,12 @@ class M3CanonicalStoreMigrationTest {
                 }
             }
             out.writeInt(300_000)
-            for (id in 1L..299_997L) writeSource(out, id)
-            writeSource(out, 0x7fff_ffffL)
-            writeSource(out, 0x8000_0000L)
-            writeSource(out, 0xffff_ffffL)
+            repeat(300_000) { serialized ->
+                val ordinal = if (unsortedSources)
+                    ((serialized.toLong() * 200_003L) % 300_000L).toInt()
+                else serialized
+                writeSource(out, maximumSourceId(ordinal))
+            }
             out.writeInt(200_000)
             repeat(100_000) { sourceIndex ->
                 val source = maximumRowId(sourceIndex)
@@ -561,6 +612,7 @@ class M3CanonicalStoreMigrationTest {
                 out.writeLong(2)
             }
             out.writeInt(0)
+            if (version >= 5) out.writeBoolean(false)
             out.flush()
             digestOutput.on(false)
             file.write(digest.digest())

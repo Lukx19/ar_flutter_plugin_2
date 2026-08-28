@@ -27,6 +27,7 @@ internal class M3LegacyCanonicalState(
     private val sourceCursor: ((M3PagedSource) -> Unit) -> Unit,
     private val supportCursor: ((Long, M3PagedSource) -> Unit) -> Unit,
     private val sourceLookup: (Long) -> M3PagedSource?,
+    private val explicitSourceIndex: M3LegacySourceIndex?,
 ) {
     fun visitSources(visitor: (M3PagedSource) -> Unit) = sourceCursor(visitor)
 
@@ -34,6 +35,133 @@ internal class M3LegacyCanonicalState(
         supportCursor(visitor)
 
     fun sourceById(id: Long): M3PagedSource? = sourceLookup(id)
+
+    fun sourceIndexReceipt(): M3LegacySourceIndexReceipt? = explicitSourceIndex?.receipt()
+}
+
+internal data class M3LegacySourceIndexReceipt(
+    val records: Int,
+    val retainedBytes: Long,
+    val buildIdReads: Long,
+    val lookups: Long,
+    val lookupIdReads: Long,
+    val maximumLookupIdReads: Int,
+)
+
+/** One primitive ordinal column, sorted in-place by unsigned source ID. */
+internal class M3LegacySourceIndex private constructor(
+    private val file: File,
+    private val sourceOffset: Long,
+    private val order: IntArray,
+    private val buildReads: Long,
+) {
+    private var lookups = 0L
+    private var lookupReads = 0L
+    private var maximumLookupReads = 0
+
+    fun find(reader: RandomAccessFile, id: Long): M3PagedSource? {
+        lookups++
+        var probes = 0
+        var low = 0
+        var high = order.lastIndex
+        while (low <= high) {
+            val middle = (low + high) ushr 1
+            val ordinal = order[middle]
+            reader.seek(sourceOffset + ordinal * SOURCE_RECORD_BYTES)
+            val candidate = reader.readLong()
+            probes++
+            when (unsignedCompare(candidate, id)) {
+                in Int.MIN_VALUE until 0 -> low = middle + 1
+                in 1..Int.MAX_VALUE -> high = middle - 1
+                else -> {
+                    recordLookup(probes)
+                    reader.seek(sourceOffset + ordinal * SOURCE_RECORD_BYTES)
+                    return readSourceRecord(reader)
+                }
+            }
+        }
+        recordLookup(probes)
+        return null
+    }
+
+    fun visit(visitor: (M3PagedSource) -> Unit) {
+        RandomAccessFile(file, "r").use { reader ->
+            order.forEach { ordinal ->
+                reader.seek(sourceOffset + ordinal * SOURCE_RECORD_BYTES)
+                visitor(readSourceRecord(reader))
+            }
+        }
+    }
+
+    fun receipt() = M3LegacySourceIndexReceipt(
+        order.size, order.size * 4L, buildReads, lookups, lookupReads, maximumLookupReads,
+    )
+
+    private fun recordLookup(probes: Int) {
+        lookupReads = Math.addExact(lookupReads, probes.toLong())
+        maximumLookupReads = maxOf(maximumLookupReads, probes)
+    }
+
+    companion object {
+        private const val SOURCE_RECORD_BYTES = 60L
+
+        fun build(file: File, sourceOffset: Long, count: Int): M3LegacySourceIndex {
+            val order = IntArray(count) { it }
+            var reads = 0L
+            RandomAccessFile(file, "r").use { reader ->
+                fun idAt(position: Int): Long {
+                    reader.seek(sourceOffset + order[position] * SOURCE_RECORD_BYTES)
+                    reads++
+                    return reader.readLong()
+                }
+
+                fun sort(from: Int, until: Int, shift: Int) {
+                    if (until - from <= 1 || shift < 0) return
+                    val counts = IntArray(256)
+                    for (position in from until until) {
+                        counts[((idAt(position) ushr shift) and 0xff).toInt()]++
+                    }
+                    val starts = IntArray(256)
+                    var cursor = from
+                    repeat(256) { bucket ->
+                        starts[bucket] = cursor
+                        cursor += counts[bucket]
+                    }
+                    val next = starts.copyOf()
+                    repeat(256) { bucket ->
+                        val end = starts[bucket] + counts[bucket]
+                        while (next[bucket] < end) {
+                            val position = next[bucket]
+                            val actual = ((idAt(position) ushr shift) and 0xff).toInt()
+                            if (actual == bucket) next[bucket]++
+                            else {
+                                val target = next[actual]++
+                                val swap = order[position]
+                                order[position] = order[target]
+                                order[target] = swap
+                            }
+                        }
+                    }
+                    if (shift > 0) repeat(256) { bucket ->
+                        val size = counts[bucket]
+                        if (size > 1) sort(starts[bucket], starts[bucket] + size, shift - 8)
+                    }
+                }
+
+                sort(0, count, 24)
+                var previous = 0L
+                repeat(count) { position ->
+                    val id = idAt(position)
+                    require(position == 0 || unsignedCompare(previous, id) < 0)
+                    previous = id
+                }
+            }
+            return M3LegacySourceIndex(file, sourceOffset, order, reads)
+        }
+
+        private fun readSourceRecord(reader: RandomAccessFile): M3PagedSource =
+            M3SurfaceOwnershipLegacyCodec.readSourceRecord(reader)
+    }
 }
 
 /** Bounded, decoder-only bridge for immutable v1-v5 files. */
@@ -304,11 +432,17 @@ internal object M3SurfaceOwnershipLegacyCodec {
         val finalSourceOffset = sourceOffset
         val finalSourceCount = sourceCount
         val finalSourcesSorted = sourcesSorted
+        val explicitSourceIndex =
+            if (explicitSources && !finalSourcesSorted)
+                M3LegacySourceIndex.build(snapshot, finalSourceOffset, finalSourceCount)
+            else null
         val sourceLookup: (Long) -> M3PagedSource? = { id ->
             if (explicitSources)
                 if (finalSourcesSorted)
                     sourceAt(snapshot, finalSourceOffset, finalSourceCount, id)
-                else sourceLinear(snapshot, finalSourceOffset, finalSourceCount, id)
+                else RandomAccessFile(snapshot, "r").use { reader ->
+                    requireNotNull(explicitSourceIndex).find(reader, id)
+                }
             else rowSource(snapshot, rowOffsets, resident, id)
         }
         val sourceCursor: ((M3PagedSource) -> Unit) -> Unit = { visitor ->
@@ -317,12 +451,7 @@ internal object M3SurfaceOwnershipLegacyCodec {
                     at(snapshot, finalSourceOffset).use { data ->
                         repeat(finalSourceCount) { visitor(readSource(data)) }
                     }
-                } else visitSourcesSorted(
-                    snapshot,
-                    finalSourceOffset,
-                    finalSourceCount,
-                    visitor,
-                )
+                } else requireNotNull(explicitSourceIndex).visit(visitor)
             } else {
                 repeat(rowCount) { order ->
                     val slot = idOrder[order]
@@ -358,11 +487,8 @@ internal object M3SurfaceOwnershipLegacyCodec {
                                 val source =
                                     if (explicitSources) {
                                         if (!finalSourcesSorted)
-                                            sourceLinear(
-                                                sourceReader,
-                                                finalSourceOffset,
-                                                finalSourceCount,
-                                                sourceId,
+                                            requireNotNull(explicitSourceIndex).find(
+                                                sourceReader, sourceId,
                                             )
                                         else if (cachedSource?.id?.value == sourceId) cachedSource
                                         else {
@@ -404,8 +530,8 @@ internal object M3SurfaceOwnershipLegacyCodec {
                 }
             }
         }
-        // Independent passes prove unique source identity and bind every support before v6 writes.
-        sourceCursor { }
+        // The sorted stream or primitive index proves unique source identity. This single eager
+        // support pass binds every membership before quota reservation; the later pass writes v6.
         supportCursor { _, _ -> }
         return M3LegacyCanonicalState(
             group,
@@ -421,6 +547,7 @@ internal object M3SurfaceOwnershipLegacyCodec {
             sourceCursor,
             supportCursor,
             sourceLookup,
+            explicitSourceIndex,
         )
     }
 
@@ -810,104 +937,6 @@ internal object M3SurfaceOwnershipLegacyCodec {
         }
     }
 
-    private fun sourceLinear(file: File, offset: Long, count: Int, id: Long): M3PagedSource? {
-        RandomAccessFile(file, "r").use { reader ->
-            return sourceLinear(reader, offset, count, id)
-        }
-    }
-
-    private fun sourceLinear(
-        reader: RandomAccessFile,
-        offset: Long,
-        count: Int,
-        id: Long,
-    ): M3PagedSource? {
-        repeat(count) { index ->
-            val recordOffset = offset + index * SOURCE_RECORD_BYTES
-            reader.seek(recordOffset)
-            if (reader.readLong() == id) {
-                reader.seek(recordOffset)
-                return readSource(reader.dataInput())
-            }
-        }
-        return null
-    }
-
-    /** Emits arbitrary serialized source order as exact unsigned ID order within fixed scratch. */
-    private fun visitSourcesSorted(
-        file: File,
-        offset: Long,
-        count: Int,
-        visitor: (M3PagedSource) -> Unit,
-    ) {
-        val scratchRecord = ByteArray(SOURCE_RECORD_BYTES.toInt())
-        fun matches(id: Long, prefix: Long, depth: Int): Boolean =
-            depth == 0 || (id ushr (32 - depth * 8)) == prefix
-
-        fun emitBucket(prefix: Long, depth: Int, matchingCount: Int) {
-            require(matchingCount in 1..SOURCE_SORT_BUCKET_RECORDS)
-            val records = ByteArray(matchingCount * SOURCE_RECORD_BYTES.toInt())
-            var written = 0
-            RandomAccessFile(file, "r").use { reader ->
-                reader.seek(offset)
-                repeat(count) {
-                    reader.readFully(scratchRecord)
-                    if (matches(packedLong(scratchRecord, 0), prefix, depth)) {
-                        scratchRecord.copyInto(records, written * SOURCE_RECORD_BYTES.toInt())
-                        written++
-                    }
-                }
-            }
-            require(written == matchingCount)
-            val order = IntArray(matchingCount) { it }
-            order.sortIndices(matchingCount) { left, right ->
-                unsignedCompare(
-                    packedLong(records, left * SOURCE_RECORD_BYTES.toInt()),
-                    packedLong(records, right * SOURCE_RECORD_BYTES.toInt()),
-                )
-            }
-            repeat(matchingCount) { index ->
-                if (index > 0) require(
-                    unsignedCompare(
-                        packedLong(records, order[index - 1] * SOURCE_RECORD_BYTES.toInt()),
-                        packedLong(records, order[index] * SOURCE_RECORD_BYTES.toInt()),
-                    ) < 0
-                )
-                val start = order[index] * SOURCE_RECORD_BYTES.toInt()
-                visitor(
-                    readSource(
-                        DataInputStream(
-                            ByteArrayInputStream(records, start, SOURCE_RECORD_BYTES.toInt())
-                        )
-                    )
-                )
-            }
-        }
-
-        fun visitPrefix(prefix: Long, depth: Int, matchingCount: Int) {
-            if (matchingCount <= SOURCE_SORT_BUCKET_RECORDS) {
-                emitBucket(prefix, depth, matchingCount)
-                return
-            }
-            require(depth < 4)
-            val buckets = IntArray(256)
-            RandomAccessFile(file, "r").use { reader ->
-                repeat(count) { index ->
-                    reader.seek(offset + index * SOURCE_RECORD_BYTES)
-                    val id = reader.readLong()
-                    if (matches(id, prefix, depth)) {
-                        val next = ((id ushr (24 - depth * 8)) and 0xff).toInt()
-                        buckets[next] = Math.addExact(buckets[next], 1)
-                    }
-                }
-            }
-            buckets.forEachIndexed { next, bucketCount ->
-                if (bucketCount > 0) visitPrefix((prefix shl 8) or next.toLong(), depth + 1, bucketCount)
-            }
-        }
-        if (count > 0) visitPrefix(0, 0, count)
-    }
-
     private fun sourceAt(
         reader: RandomAccessFile,
         offset: Long,
@@ -919,6 +948,9 @@ internal object M3SurfaceOwnershipLegacyCodec {
         reader.seek(offset + index * SOURCE_RECORD_BYTES)
         return readSource(reader.dataInput())
     }
+
+    internal fun readSourceRecord(reader: RandomAccessFile): M3PagedSource =
+        readSource(reader.dataInput())
 
     private fun sourceIndex(
         reader: RandomAccessFile,
@@ -1018,6 +1050,7 @@ internal object M3SurfaceOwnershipLegacyCodec {
             {},
             {},
             { null },
+            null,
         )
 
     private fun authorityHash(vararg files: File): ByteArray {
@@ -1074,7 +1107,6 @@ internal object M3SurfaceOwnershipLegacyCodec {
         return value
     }
 
-    private const val SOURCE_SORT_BUCKET_RECORDS = 900
     private const val HASH_SORT_BUCKET_RECORDS = 800
 }
 

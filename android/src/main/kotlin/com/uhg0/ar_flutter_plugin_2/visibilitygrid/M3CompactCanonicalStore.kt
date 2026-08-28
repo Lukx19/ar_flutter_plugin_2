@@ -173,6 +173,7 @@ internal sealed interface M3CompactCanonicalMigrationResult {
         val cut: M3CompactCanonicalCut,
         val candidateDirectory: File,
         val storage: M3CompactStorageReceipt,
+        val sourceIndex: M3LegacySourceIndexReceipt? = null,
     ) : M3CompactCanonicalMigrationResult
 
     data class Refused(val reason: M3CompactCanonicalRefusal) : M3CompactCanonicalMigrationResult
@@ -741,6 +742,7 @@ private constructor(
                     cutFromLegacy(legacy, rootHash),
                     target,
                     physicalStorageReceipt(budget, target),
+                    legacy.sourceIndexReceipt(),
                 )
             } catch (_: M3RestoreFailure) {
                 return M3CompactCanonicalMigrationResult.Refused(M3CompactCanonicalRefusal.CORRUPT)
