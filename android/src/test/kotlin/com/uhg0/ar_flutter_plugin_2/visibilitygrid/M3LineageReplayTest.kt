@@ -35,7 +35,7 @@ class M3LineageReplayTest {
     fun `reservation and private snapshot fault cuts expose complete prior cuts while committed cut remains complete`() {
         val cases = listOf(
             M3SurfaceOwnershipFault.AFTER_RESERVATION_FLUSH to true,
-            M3SurfaceOwnershipFault.AFTER_PRIVATE_CANDIDATE to false,
+            M3SurfaceOwnershipFault.AFTER_PRIVATE_CANDIDATE to true,
             M3SurfaceOwnershipFault.BEFORE_SNAPSHOT_FLUSH to true,
             M3SurfaceOwnershipFault.AFTER_SNAPSHOT_FILE_SYNC_BEFORE_ROOT_SWITCH to true,
             M3SurfaceOwnershipFault.AFTER_ROOT_SWITCH_BEFORE_DIRECTORY_SYNC to false,
