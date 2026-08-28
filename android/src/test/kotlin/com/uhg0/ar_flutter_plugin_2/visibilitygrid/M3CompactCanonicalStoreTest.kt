@@ -1,0 +1,61 @@
+package com.uhg0.ar_flutter_plugin_2.visibilitygrid
+
+import java.nio.file.Files
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class M3CompactCanonicalStoreTest {
+    @Test
+    fun `v6 opens exact canonical rows by id voxel and bounded page`() {
+        val directory = Files.createTempDirectory("m3-compact-view").toFile()
+        try {
+            val group = M3SurfaceGroup("compact-view")
+            val legacy = opened(M3SurfaceOwnership.open(group, directory))
+            val seeded = accepted(legacy.apply(M3SurfaceOwnershipCommand("seed", listOf(candidate(-1), candidate(0), candidate(31)))))
+            accepted(legacy.transact(M3CanonicalTransactionCommand("move", M3CanonicalOperation.RELOCATION, 0, 0, listOf(seeded.owners.first().id), listOf(M3CanonicalTarget(seeded.owners.first().id, M3Voxel(-2, 0, 0), 1, 2, 193)))))
+            legacy.close()
+
+            val prepared = M3CompactCanonicalStore.prepareV6SiblingMigration(group, directory)
+            val cut = (prepared as M3CompactCanonicalMigrationResult.Prepared).cut
+            val store = (M3CompactCanonicalStore.openV6(group, directory) as M3CompactCanonicalOpenResult.Opened).store
+            assertEquals(cut, store.cut)
+            assertEquals(M3Voxel(-2, 0, 0), requireNotNull(store.findById(seeded.owners.first().id)).voxel)
+            assertEquals(seeded.owners[1].id, requireNotNull(store.findByVoxel(M3Voxel(0, 0, 0))).id)
+            assertNull(store.findByVoxel(M3Voxel(99, 0, 0)))
+            val first = store.readPage(M3StorageRegion(-1, 0, 0), 2, 0, 1)
+            assertEquals(1, first.rows.size)
+            assertTrue(first.rows.single().id.value > 0)
+            val sources = mutableListOf<M3CompactSource>()
+            assertEquals(1, store.visitSourceSupport(seeded.owners.first().id) { sources += it; true })
+            assertEquals(seeded.owners.first().id, sources.single().id)
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test
+    fun `receipt includes every retained owner and reserves issue 115 journal`() {
+        val directory = Files.createTempDirectory("m3-compact-memory").toFile()
+        try {
+            val group = M3SurfaceGroup("compact-memory")
+            val legacy = opened(M3SurfaceOwnership.open(group, directory))
+            accepted(legacy.apply(M3SurfaceOwnershipCommand("seed", listOf(candidate(0)))))
+            legacy.close()
+            M3CompactCanonicalStore.prepareV6SiblingMigration(group, directory)
+            val receipt = ((M3CompactCanonicalStore.openV6(group, directory) as M3CompactCanonicalOpenResult.Opened).store).retainedMemoryReceipt()
+            assertEquals(7_548_936L, receipt.kernelBytes)
+            assertTrue(receipt.rowColumnsBytes > 0 && receipt.idOrderBytes > 0 && receipt.pageOrderBytes > 0)
+            assertTrue(receipt.sourceColumnsBytes > 0 && receipt.lineageColumnsBytes > 0 && receipt.directoryBytes > 0)
+            assertTrue(receipt.withinIssue114Budget)
+            assertTrue(receipt.preservesIssue115Reserve)
+            assertEquals(1_048_576L, receipt.journalReserveBytes)
+        } finally { directory.deleteRecursively() }
+    }
+
+    private fun candidate(x: Int) = M3SurfaceCandidate(voxel = M3Voxel(x, 0, 0), normalOctX = 0, normalOctY = 0, normalConfidence = 192)
+    private fun opened(result: M3SurfaceOwnershipOpenResult) = (result as M3SurfaceOwnershipOpenResult.Opened).ownership
+    private fun accepted(result: M3SurfaceOwnershipResult) = result as M3SurfaceOwnershipResult.Accepted
+    private fun accepted(result: M3CanonicalTransactionResult) = result as M3CanonicalTransactionResult.Accepted
+}
