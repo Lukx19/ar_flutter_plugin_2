@@ -170,7 +170,11 @@ internal class M3SurfaceOwnership private constructor(
             directory: File,
             configuration: M3SurfaceOwnershipConfiguration = M3SurfaceOwnershipConfiguration(),
             fault: M3SurfaceOwnershipFault? = null,
-        ): M3SurfaceOwnershipOpenResult = open(group, configuration, M3FileSurfaceOwnershipStore(directory, group, fault))
+        ): M3SurfaceOwnershipOpenResult = try {
+            open(group, configuration, M3FileSurfaceOwnershipStore(directory, group, fault))
+        } catch (failure: M3RestoreFailure) {
+            M3SurfaceOwnershipOpenResult.Refused(failure.reason)
+        }
 
         fun inMemory(
             group: M3SurfaceGroup,
