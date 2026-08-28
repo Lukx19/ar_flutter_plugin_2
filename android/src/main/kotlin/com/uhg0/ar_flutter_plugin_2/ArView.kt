@@ -7,6 +7,7 @@ import android.util.Log
 import android.view.MotionEvent
 import android.view.View
 import android.widget.FrameLayout
+import java.io.File
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
@@ -36,7 +37,7 @@ import com.uhg0.ar_flutter_plugin_2.sceneview.resolveNodeUri
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridMethodChannel
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridRuntimeCapabilities
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridV2Binding
-import com.uhg0.ar_flutter_plugin_2.visibilitygrid.AndroidVisibilityGridMappingAdmission
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.M3VisibilityGridIntegration
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.AndroidVisibilityGridRuntime
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.ArCoreVisibilityObservationSource
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityObservationDebugChannel
@@ -132,8 +133,10 @@ internal class ArView(
     // #101 owns this native proof only.  It remains false until an internal
     // V2 capture owner binds one exact durable attempt/cut; Dart cannot enable it.
     private val captureSafetySignalV2 = CaptureSafetySignalV2()
-    private val visibilityObservationMappingAdmission = AndroidVisibilityGridMappingAdmission(
+    private val visibilityObservationMappingAdmission = M3VisibilityGridIntegration(
+        binding = visibilityGridV2Binding,
         ownership = visibilityGridV2Binding::currentObservationOwnership,
+        directory = File(context.filesDir, "visibility-grid-m3"),
         beforeAdmission = visibilityObservationDebugGate::awaitIfArmed,
     )
     private val visibilityObservationRuntime = AndroidVisibilityGridRuntime(

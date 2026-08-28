@@ -8,6 +8,7 @@ import com.uhg0.ar_flutter_plugin_2.m0.M0aControlOperation
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlRequest
 import com.uhg0.ar_flutter_plugin_2.m0.M0aPacketCodec
 import com.uhg0.ar_flutter_plugin_2.m0.M0aStartRequestCodecV2
+import com.uhg0.ar_flutter_plugin_2.m0.M0aTransactionResponseProfileV1
 import com.uhg0.ar_flutter_plugin_2.m0.M0aUuid
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodChannel
@@ -135,15 +136,10 @@ class VisibilityGridV2BindingTest {
             assertEquals(1, correctedResponse.streamToken)
             assertEquals(1, binding.snapshot().acceptedControls)
             assertEquals(baseline, authority.snapshot(scope))
-            val observationCut = requireNotNull(binding.currentObservationOwnership())
-            assertEquals(request.sessionId.bytes.hex(), observationCut.sessionId)
-            assertEquals(request.captureGroupId.bytes.hex(), observationCut.captureGroupId)
-            assertEquals(request.sessionGeneration, observationCut.sessionGeneration)
-            assertEquals(request.groupGeneration, observationCut.groupGeneration)
-            assertEquals(request.coverageEpoch, observationCut.coverageEpoch)
-            assertEquals(binding.snapshot().bindingGeneration, observationCut.bindingGeneration)
-            assertEquals(binding.snapshot().lifecycleSequence, observationCut.lifecycleSequence)
-            assertEquals(binding.snapshot().operationGeneration, observationCut.operationGeneration)
+            // M2 must not consume the bootstrap transaction slot.  The exact
+            // g1/l1 acknowledgement is the only admission cut for M3.
+            assertEquals(null, binding.currentObservationOwnership())
+
         } finally {
             binding.dispose()
         }
@@ -691,7 +687,7 @@ class VisibilityGridV2BindingTest {
                     acknowledgedGeometryRevision = 1,
                     acknowledgedLineageRevision = 1,
                     nextStyleRevision = 0,
-                    maximumResponseBytes = 4096,
+                    maximumResponseBytes = M0aTransactionResponseProfileV1.ordinary.responseCeilingBytes,
                     styleRecords = emptyList(),
                     commandBytes = byteArrayOf(),
                     requestSequence = 3,
@@ -837,7 +833,7 @@ class VisibilityGridV2BindingTest {
                                 acknowledgedGeometryRevision = if (acknowledgedTransactionId == 0L) 11 else 12,
                                 acknowledgedLineageRevision = if (acknowledgedTransactionId == 0L) 12 else 13,
                                 nextStyleRevision = 15,
-                                maximumResponseBytes = 4096,
+                                maximumResponseBytes = M0aTransactionResponseProfileV1.ordinary.responseCeilingBytes,
                                 styleRecords = emptyList(),
                                 commandBytes = byteArrayOf(),
                                 requestSequence = sequence,
@@ -856,6 +852,12 @@ class VisibilityGridV2BindingTest {
             assertEquals(1, acknowledged.transactionId)
             assertEquals(12, acknowledged.targetGeometryRevision)
             assertEquals(13, acknowledged.targetLineageRevision)
+            val observationCut = requireNotNull(binding.currentObservationOwnership())
+            val emptyBaseline = requireNotNull(binding.m3CommittedEmptyBaseline())
+            assertEquals(1, emptyBaseline.transactionId)
+            assertEquals(12, emptyBaseline.geometryRevision)
+            assertEquals(13, emptyBaseline.lineageRevision)
+            assertEquals(observationCut.captureGroupId, emptyBaseline.groupIdentity)
 
             val stale = RecordingBinaryReply()
             messenger.send(
@@ -907,7 +909,7 @@ class VisibilityGridV2BindingTest {
                             acknowledgedGeometryRevision = 0,
                             acknowledgedLineageRevision = 0,
                             nextStyleRevision = 0,
-                            maximumResponseBytes = 4096,
+                            maximumResponseBytes = M0aTransactionResponseProfileV1.ordinary.responseCeilingBytes,
                             styleRecords = emptyList(),
                             commandBytes = byteArrayOf(),
                             requestSequence = sequence,

@@ -18,6 +18,8 @@ import com.uhg0.ar_flutter_plugin_2.m0.M0aTransactionResponseProfileV1
 import com.uhg0.ar_flutter_plugin_2.m0.M0aStartRequestCodecV2
 import com.uhg0.ar_flutter_plugin_2.m0.M0aVisibilitySurfaceStreamChannel
 import com.uhg0.ar_flutter_plugin_2.m0.M0aDebugTransportProbe
+import com.uhg0.ar_flutter_plugin_2.m0.M0aCurrentDeltaSelectorV1
+import com.uhg0.ar_flutter_plugin_2.m0.M0aCurrentDeltaSourceV1
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -83,6 +85,9 @@ class VisibilityGridV2Binding internal constructor(
     @Volatile private var streamChannel = newStreamChannel()
     @Volatile private var currentBindingGeneration = bindingGenerationSeed
     private var initialTransactionQueued = false
+    @Volatile private var acknowledgedEmptyBaseline: M3CommittedEmptyBaseline? = null
+    @Volatile private var expectedEmptyBootstrap: M0aCurrentDeltaSelectorV1? = null
+    @Volatile private var m3AcknowledgementListener: ((M0aCurrentDeltaSelectorV1) -> Unit)? = null
     private var acceptedControls = 0L
     private var closedResources = 0L
     private var activeControlRequestId: M0aUuid? = null
@@ -130,6 +135,7 @@ class VisibilityGridV2Binding internal constructor(
             }
         },
         onAbandonedContinuation = debugRecoverySeam::oldContinuationFenced,
+        onStructuralTransactionAcknowledged = ::onStructuralTransactionAcknowledged,
         debugTransportProbe = issue98Probe,
     )
 
@@ -191,7 +197,8 @@ class VisibilityGridV2Binding internal constructor(
     internal fun currentObservationOwnership(): VisibilityObservationOwnership? {
         replacementBinding?.let { return it.currentObservationOwnership() }
         val current = snapshot()
-        if (current.disposed || !current.initialTransactionQueued) return null
+        val baseline = acknowledgedEmptyBaseline
+        if (current.disposed || !current.initialTransactionQueued || baseline == null) return null
         val sessionId = current.sessionId ?: return null
         val captureGroupId = current.captureGroupId ?: return null
         return VisibilityObservationOwnership(
@@ -214,6 +221,62 @@ class VisibilityGridV2Binding internal constructor(
     internal fun attachObservationRuntime(runtime: AndroidVisibilityGridRuntime) {
         observationRuntime = runtime
         replacementBinding?.attachObservationRuntime(runtime)
+    }
+
+    /** The narrow seeded-baseline seam; null until M1's exact bootstrap ACK. */
+    @Synchronized
+    internal fun m3CommittedEmptyBaseline(): M3CommittedEmptyBaseline? {
+        replacementBinding?.let { return it.m3CommittedEmptyBaseline() }
+        return acknowledgedEmptyBaseline?.takeIf { !disposed.get() }
+    }
+
+    @Synchronized
+    internal fun attachM3AcknowledgementListener(
+        listener: (M0aCurrentDeltaSelectorV1) -> Unit,
+    ) {
+        check(m3AcknowledgementListener == null) { "M3 acknowledgement listener already attached" }
+        m3AcknowledgementListener = listener
+    }
+
+    /** Queues exactly one receipt after the ACK opened M3's adjacent slot. */
+    @Synchronized
+    internal fun queueCommittedCurrentDelta(
+        source: M0aCurrentDeltaSourceV1,
+        selector: M0aCurrentDeltaSelectorV1,
+    ) {
+        replacementBinding?.let { return it.queueCommittedCurrentDelta(source, selector) }
+        val baseline = requireNotNull(acknowledgedEmptyBaseline) { "M1 bootstrap is not acknowledged" }
+        check(currentObservationOwnership() != null) { "V2 observation cut is unavailable" }
+        check(
+            selector.transactionId == baseline.transactionId + 1 &&
+                selector.targetGeometryRevision == baseline.geometryRevision + 1 &&
+                selector.targetLineageRevision == baseline.lineageRevision
+        ) { "Feature-only M3 delta is not adjacent to the acknowledged empty baseline" }
+        streamChannel.queueCurrentDelta(source, selector, M0aTransactionResponseProfileV1.ordinary)
+    }
+
+    @Synchronized
+    private fun onStructuralTransactionAcknowledged(baseline: M0aCommittedBaselineV1) {
+        if (disposed.get()) return
+        val selector = M0aCurrentDeltaSelectorV1(
+            baseline.transactionId,
+            baseline.geometryRevision,
+            baseline.lineageRevision,
+        )
+        if (acknowledgedEmptyBaseline == null && initialTransactionQueued && selector == expectedEmptyBootstrap) {
+            val cut = snapshot()
+            val session = cut.sessionId ?: return
+            val group = cut.captureGroupId ?: return
+            acknowledgedEmptyBaseline = M3CommittedEmptyBaseline(
+                bindingIdentity = "${session.hex()}:${group.hex()}:${cut.bindingGeneration}:${cut.lifecycleSequence}",
+                groupIdentity = group.hex(),
+                transactionId = baseline.transactionId,
+                geometryRevision = baseline.geometryRevision,
+                lineageRevision = baseline.lineageRevision,
+            )
+            return
+        }
+        m3AcknowledgementListener?.invoke(selector)
     }
 
     private fun onControlCall(call: MethodCall, result: MethodChannel.Result) {
@@ -685,6 +748,11 @@ class VisibilityGridV2Binding internal constructor(
             ),
             M0aTransactionResponseProfileV1.ordinary,
         )
+        expectedEmptyBootstrap = M0aCurrentDeltaSelectorV1(
+            transactionId = 1,
+            targetGeometryRevision = baseline.geometryRevision + 1,
+            targetLineageRevision = baseline.lineageRevision + 1,
+        )
         initialTransactionQueued = true
     }
 
@@ -722,6 +790,8 @@ class VisibilityGridV2Binding internal constructor(
             streamChannel = newStreamChannel()
         }
         initialTransactionQueued = false
+        expectedEmptyBootstrap = null
+        acknowledgedEmptyBaseline = null
         acceptedControls = 0L
         activeControlRequestId = null
         synchronized(this) {
@@ -787,6 +857,7 @@ class VisibilityGridV2Binding internal constructor(
             initialCommittedBaselineSeed = lifecycle.committedBaseline(),
         ).also { replacement ->
             observationRuntime?.let(replacement::attachObservationRuntime)
+            m3AcknowledgementListener?.let(replacement::attachM3AcknowledgementListener)
         }
         return oldSnapshot.withCleanupBalances(
             closedBefore = closedBefore,

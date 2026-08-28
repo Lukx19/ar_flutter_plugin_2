@@ -94,6 +94,7 @@ class M0aVisibilitySurfaceStreamChannel(
     private val onAbandonedContinuation: (() -> Unit)? = null,
     initialNextExpectedSequence: Long = 1L,
     private val debugTransportProbe: M0aDebugTransportProbe? = null,
+    private val onStructuralTransactionAcknowledged: ((M0aCommittedBaselineV1) -> Unit)? = null,
 ) {
     init {
         require(initialNextExpectedSequence in 1..Long.MAX_VALUE) {
@@ -384,6 +385,7 @@ class M0aVisibilitySurfaceStreamChannel(
                     try {
                         var publicationClaimedReply = false
                         var commitPublicationStalled = false
+                        var acknowledgedStructuralBaseline: M0aCommittedBaselineV1? = null
                         val response = synchronized(this) {
                             onExecutorOperation?.invoke("exchange")
                             beforeWorkerProcessing?.invoke()
@@ -450,7 +452,8 @@ class M0aVisibilitySurfaceStreamChannel(
                                                 }
                                                 val requiresResync = requiresResync(request)
                                                 if (!requiresResync) {
-                                                    acknowledgePendingStructuralTransaction(request)
+                                                    acknowledgedStructuralBaseline =
+                                                        acknowledgePendingStructuralTransaction(request)
                                                 }
                                                 val publicationBytes = M0aPacketCodec.encodeResponse(
                                                     when {
@@ -570,6 +573,11 @@ class M0aVisibilitySurfaceStreamChannel(
                                 telemetry.allocated(encoded.size)
                                 if (publicationClaimedReply || pendingReply.tryClaim()) encoded else null
                             }
+                        }
+                        // Do not cross into the binding while holding the stream
+                        // monitor. Publication takes the opposite lock order.
+                        acknowledgedStructuralBaseline?.let {
+                            onStructuralTransactionAcknowledged?.invoke(it)
                         }
                         if (commitPublicationStalled) afterCommitPublication?.invoke()
                         timeoutHandle.cancel()
@@ -923,14 +931,16 @@ class M0aVisibilitySurfaceStreamChannel(
     }
 
     /** Releases the sole retained transaction only after Dart proves its full cut. */
-    private fun acknowledgePendingStructuralTransaction(request: M0aPacketCodec.Request) {
+    private fun acknowledgePendingStructuralTransaction(
+        request: M0aPacketCodec.Request,
+    ): M0aCommittedBaselineV1? {
         synchronized(structuralFrames) {
-            val pending = queuedTransactionBaseline ?: return
+            val pending = queuedTransactionBaseline ?: return null
             if (structuralFrameCursor != structuralFrames.size ||
                 request.acknowledgedTransactionId != pending.transactionId ||
                 request.acknowledgedGeometryRevision != pending.geometryRevision ||
                 request.acknowledgedLineageRevision != pending.lineageRevision) {
-                return
+                return null
             }
             committedBaseline = pending.copy(styleRevision = committedBaseline.styleRevision)
             queuedTransactionBaseline = null
@@ -939,6 +949,7 @@ class M0aVisibilitySurfaceStreamChannel(
             queuedResponseProfile = null
             telemetry.retainedStructuralStaging(0)
             controlLifecycle?.setCommittedBaseline(committedBaseline)
+            return committedBaseline
         }
     }
 
