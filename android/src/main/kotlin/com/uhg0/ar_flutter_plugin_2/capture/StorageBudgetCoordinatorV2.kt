@@ -139,6 +139,22 @@ class StorageBudgetCoordinatorV2(
         commitCandidateLocked(current, actual)
     }
 
+    /** Reopen-only resolution for one known target: commit a rename or reclaim its private staging. */
+    fun reconcileCandidate(target: File) = withAuthority {
+        val current = reservations.values.singleOrNull { it.targetName == target.name } ?: return@withAuthority
+        val staging = files.child(requireNotNull(current.stagingName))
+        when {
+            files.isDirectory(target) -> commitCandidateLocked(current, files.allocatedTreeBytes(target))
+            files.isDirectory(staging) -> {
+                files.delete(metadataFile(current.token), DurableStoreFaultPointV2.DELETE_RECLAIM)
+                reservations.remove(current.token)
+                persistLedgerLocked()
+                files.deleteTree(staging, DurableStoreFaultPointV2.DELETE_RECLAIM)
+            }
+            else -> error("Candidate reservation has no physical backing")
+        }
+    }
+
     fun releaseCandidate(reservation: StorageBudgetReservationV2, staging: File): Boolean = withAuthority {
         val current = reservations[reservation.token] ?: return@withAuthority false
         require(current == reservation && current.stagingName == staging.name)

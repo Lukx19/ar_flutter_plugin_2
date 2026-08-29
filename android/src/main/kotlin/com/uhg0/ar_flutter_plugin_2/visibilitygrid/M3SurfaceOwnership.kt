@@ -643,9 +643,7 @@ internal enum class M3SurfaceOwnershipFault {
 }
 
 private data class M3Location(val region: M3StorageRegion, val page: Int)
-private data class M3Reservation(val revision: Long, val start: Long, val endExclusive: Long, val groupHash: ByteArray, val commandHash: ByteArray, val fingerprint: ByteArray, val previousHash: ByteArray) { val recordHash: ByteArray get() = sha256(bytesWithoutHash())
-    fun bytesWithoutHash(): ByteArray = ByteArrayOutputStream().use { output -> DataOutputStream(output).use { data -> data.writeInt(0x4d33524c); data.writeInt(1); data.writeLong(revision); data.writeLong(start); data.writeLong(endExclusive); data.write(groupHash); data.write(commandHash); data.write(fingerprint); data.write(previousHash); output.toByteArray() } }
-}
+private typealias M3Reservation = M3AllocationRecord
 private data class M3StoredReceipt(val commandHash: ByteArray, val fingerprint: ByteArray, val result: M3SurfaceOwnershipResult.Accepted)
 private data class M3StoredCanonicalReceipt(val commandHash: ByteArray, val fingerprint: ByteArray, val result: M3CanonicalTransactionResult.Accepted)
 private data class M3SourceSupportRecord(
@@ -697,7 +695,7 @@ private class M3FileSurfaceOwnershipStore(directory: File, private val group: M3
     override val lastReservationRevision get() = reservations.lastOrNull()?.revision ?: 0L
     override val lastReservationHash get() = reservations.lastOrNull()?.recordHash ?: ByteArray(32)
     init { directory.mkdirs(); if (!directory.isDirectory) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT) }
-    override fun appendReservation(reservation: M3Reservation) { FileOutputStream(ledger, true).use { out -> out.write(reservation.bytesWithoutHash()); out.write(reservation.recordHash); out.fd.sync() }; reservations = reservations + reservation; if (fault == M3SurfaceOwnershipFault.AFTER_RESERVATION_FLUSH) throw M3OwnershipFault() }
+    override fun appendReservation(reservation: M3Reservation) { M3SurfaceAllocationAuthority.appendLegacy(ledger, reservation); reservations = reservations + reservation; if (fault == M3SurfaceOwnershipFault.AFTER_RESERVATION_FLUSH) throw M3OwnershipFault() }
     override fun writeSnapshot(snapshot: M3OwnershipSnapshot) {
         if (fault == M3SurfaceOwnershipFault.BEFORE_SNAPSHOT_FLUSH) throw M3OwnershipFault()
         val bytes = encodeSnapshot(snapshot)
@@ -727,12 +725,12 @@ private fun validate(group: M3SurfaceGroup, configuration: M3SurfaceOwnershipCon
     if (snapshot.seededEmptyBaseline != null && snapshot.seededEmptyBaseline != configuration.seededEmptyBaseline) {
         throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.FORK)
     }
-    var highWater = 1L; var previous = ByteArray(32); var revision = 0L
-    reservations.forEach { record ->
-        if (record.revision != ++revision || record.start != highWater || record.endExclusive <= record.start || !record.groupHash.contentEquals(group.hash) || !record.previousHash.contentEquals(previous) || record.recordHash.contentEquals(ByteArray(32))) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT)
-        if (record.endExclusive > 0x1_0000_0000L) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT)
-        highWater = record.endExclusive; previous = record.recordHash
+    val allocation = try {
+        M3SurfaceAllocationAuthority.validate(group, reservations)
+    } catch (_: Exception) {
+        throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT)
     }
+    val highWater = allocation.highWater
     if (snapshot.nextHighWater !in 1..highWater) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.FORK)
     if (highWater > 0x1_0000_0000L) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT)
     if (snapshot.rows.size > configuration.surfaceCapacity || snapshot.receipts.size > configuration.receiptCapacity ||
@@ -777,8 +775,15 @@ private fun validate(group: M3SurfaceGroup, configuration: M3SurfaceOwnershipCon
         snapshot.transactionReceipts, snapshot.geometryRevision, snapshot.lineageRevision, snapshot.seededEmptyBaseline)
 }
 
-private fun readLedger(file: File): List<M3Reservation> { if (!file.exists()) return emptyList(); val bytes = file.readBytes(); val recordBytes = 4 + 4 + 8 + 8 + 8 + 32 * 5; if (bytes.size % recordBytes != 0) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT); return bytes.asList().chunked(recordBytes).map { decodeReservation(it.toByteArray()) } }
-private fun decodeReservation(bytes: ByteArray): M3Reservation { val data = DataInputStream(ByteArrayInputStream(bytes)); if (data.readInt() != 0x4d33524c || data.readInt() != 1) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT); val record = M3Reservation(data.readLong(), data.readLong(), data.readLong(), ByteArray(32).also(data::readFully), ByteArray(32).also(data::readFully), ByteArray(32).also(data::readFully), ByteArray(32).also(data::readFully)); val hash = ByteArray(32).also(data::readFully); if (!hash.contentEquals(record.recordHash)) throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT); return record }
+private fun readLedger(file: File): List<M3Reservation> = try {
+    if (!file.exists()) emptyList() else {
+        val bytes = file.readBytes()
+        require(bytes.size % M3AllocationRecord.ENCODED_BYTES == 0)
+        bytes.asList().chunked(M3AllocationRecord.ENCODED_BYTES).map { M3AllocationRecord.decode(it.toByteArray()) }
+    }
+} catch (_: Exception) {
+    throw M3RestoreFailure(M3SurfaceOwnershipRestoreRefusal.CORRUPT)
+}
 private fun encodeSnapshot(snapshot: M3OwnershipSnapshot): ByteArray {
     val body = ByteArrayOutputStream().use { output ->
         DataOutputStream(output).use { data ->

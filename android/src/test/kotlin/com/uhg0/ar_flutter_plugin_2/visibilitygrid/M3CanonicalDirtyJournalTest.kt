@@ -1,5 +1,8 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
+import com.uhg0.ar_flutter_plugin_2.capture.JvmDescriptorFilesystemV2
+import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetCoordinatorV2
+import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetPolicyV2
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.file.Files
@@ -18,7 +21,8 @@ class M3CanonicalDirtyJournalTest {
             val view = view("complete", rows = 0)
             val plan = prepared(view, add("complete"))
             val authorityRootBefore = view.cut.rootHash.toByteArray()
-            val journal = opened(M3CanonicalDirtyJournal.open(view, directory, budget()))
+            val fixture = budgetFixture(directory)
+            val journal = opened(M3CanonicalDirtyJournal.open(view, directory, fixture.budget))
             val flushed = journal.flush(plan) as M3CanonicalDirtyJournalFlushResult.Prepared
 
             assertEquals(plan.sourceCut, flushed.intent.sourceCut)
@@ -32,26 +36,78 @@ class M3CanonicalDirtyJournalTest {
             val reopened = journal.reopen() as M3CanonicalDirtyJournalReopenResult.Complete
             assertEquals(flushed.intent.walHash, reopened.intent.walHash)
             assertTrue(reopened.intent.storage.totalAllocatedBytes > 0)
+            assertTrue(fixture.budget.actuals.zip(fixture.budget.requests).all { (actual, requested) -> actual in 1..requested })
+            assertEquals(flushed.intent.storage.totalAllocatedBytes, fixture.coordinator.committedBytes())
+            assertEquals(0L, fixture.coordinator.reservedBytes())
+
+            // The same real adapter refuses at the exact quota and free-floor inequalities.
+            val requested = requireNotNull(fixture.budget.requests.firstOrNull())
+            listOf(false, true).forEachIndexed { index, floorCase ->
+                val refusedDirectory = Files.createTempDirectory("m3-dirty-budget-$index").toFile()
+                try {
+                    val refusalFixture = if (floorCase) budgetFixture(
+                        refusedDirectory, quota = requested, floor = 4_096L, free = requested + 4_095L,
+                    ) else budgetFixture(refusedDirectory, quota = requested - 1L)
+                    val refusedView = view("budget-$index", rows = 0)
+                    val result = opened(M3CanonicalDirtyJournal.open(refusedView, refusedDirectory, refusalFixture.budget))
+                        .flush(prepared(refusedView, add("budget-$index")))
+                    assertEquals(M3CanonicalDirtyJournalRefusal.DURABILITY_FAILURE,
+                        (result as M3CanonicalDirtyJournalFlushResult.Refused).reason)
+                    assertEquals(0L, refusalFixture.coordinator.committedBytes())
+                    assertEquals(0L, refusalFixture.coordinator.reservedBytes())
+                } finally { refusedDirectory.deleteRecursively() }
+            }
+
+            val orphanDirectory = Files.createTempDirectory("m3-dirty-orphan").toFile()
+            try {
+                val orphanView = view("orphan", rows = 0)
+                val orphanFixture = budgetFixture(orphanDirectory)
+                val base = "m3-canonical-v6-${orphanView.cut.group.hash.hex()}"
+                val staging = File(orphanDirectory, "$base.staging-allocation-orphan")
+                val target = File(orphanDirectory, "$base.allocation-1")
+                assertTrue(orphanFixture.coordinator.reserveCandidate(
+                    "m3:canonical:v6-migration", staging, target,
+                    mapOf("allocation-record.bin" to M3AllocationRecord.ENCODED_BYTES.toLong()), 20_480L,
+                ) != null)
+                assertTrue(staging.isDirectory)
+                assertTrue(M3CanonicalDirtyJournal.open(orphanView, orphanDirectory, orphanFixture.budget)
+                    is M3CanonicalDirtyJournalOpenResult.Opened)
+                assertEquals(0L, orphanFixture.coordinator.reservedBytes())
+                assertFalse(staging.exists())
+            } finally { orphanDirectory.deleteRecursively() }
         } finally { directory.deleteRecursively() }
     }
 
     @Test
-    fun `every post reservation fault preserves the burned high water without publishing a root`() {
-        val faults = M3CanonicalDirtyJournalFault.entries - M3CanonicalDirtyJournalFault.BEFORE_RESERVATION
-        faults.forEach { fault ->
+    fun `every physical cut has its own recovery state and allocation authority outcome`() {
+        M3CanonicalDirtyJournalFault.entries.forEach { fault ->
             val directory = Files.createTempDirectory("m3-dirty-fault-${fault.name}").toFile()
             try {
                 val view = view("fault-${fault.name}", rows = 0)
-                val result = opened(M3CanonicalDirtyJournal.open(view, directory, budget())).flush(prepared(view, add("fault")), fault)
-                assertTrue(result is M3CanonicalDirtyJournalFlushResult.Prepared || result is M3CanonicalDirtyJournalFlushResult.Refused)
-                val reopened = opened(M3CanonicalDirtyJournal.open(view, directory, budget())).reopen()
+                val storage = budgetFixture(directory).budget
+                val result = opened(M3CanonicalDirtyJournal.open(view, directory, storage)).flush(prepared(view, add("fault")), fault)
+                assertTrue(result is M3CanonicalDirtyJournalFlushResult.Refused)
+                val recovery = budgetFixture(directory)
+                val reopened = opened(M3CanonicalDirtyJournal.open(view, directory, recovery.budget)).reopen()
                 assertFalse(reopened is M3CanonicalDirtyJournalReopenResult.Refused && reopened.reason == M3CanonicalDirtyJournalRefusal.CORRUPT_LEDGER)
                 val high = when (reopened) {
                     is M3CanonicalDirtyJournalReopenResult.None -> reopened.burnedHighWater
                     is M3CanonicalDirtyJournalReopenResult.Complete -> reopened.intent.targetHighWater
                     is M3CanonicalDirtyJournalReopenResult.Refused -> reopened.burnedHighWater
                 }
-                assertEquals(2L, high)
+                val allocationPublished = fault.ordinal >= M3CanonicalDirtyJournalFault.AFTER_ALLOCATION_PUBLISH.ordinal
+                assertEquals(if (allocationPublished) 2L else 1L, high)
+                val intentPublished = fault.ordinal >= M3CanonicalDirtyJournalFault.AFTER_INTENT_PUBLISH.ordinal &&
+                    fault != M3CanonicalDirtyJournalFault.DURING_WAL_WRITE
+                assertEquals(intentPublished, reopened is M3CanonicalDirtyJournalReopenResult.Complete)
+                assertEquals(0L, recovery.coordinator.reservedBytes())
+                assertTrue(directory.listFiles().orEmpty().none { it.name.contains(".staging-") })
+                if (allocationPublished && fault.ordinal <= M3CanonicalDirtyJournalFault.AFTER_ALLOCATION_BUDGET_COMMIT.ordinal) {
+                    val switched = TestView(
+                        view.cut.copy(rootHash = M3CanonicalReceiptBytes(sha256("switched".encodeToByteArray()))), 0, 0,
+                    )
+                    assertTrue(M3CanonicalDirtyJournal.open(switched, directory, recovery.budget) is M3CanonicalDirtyJournalOpenResult.Opened)
+                }
                 assertEquals(0, view.mutations)
             } finally { directory.deleteRecursively() }
         }
@@ -63,12 +119,12 @@ class M3CanonicalDirtyJournalTest {
             val directory = Files.createTempDirectory("m3-dirty-corrupt-$index").toFile()
             try {
                 val view = view("corrupt-$index", rows = 0)
-                val journal = opened(M3CanonicalDirtyJournal.open(view, directory, budget()))
+                val journal = opened(M3CanonicalDirtyJournal.open(view, directory, budget(directory)))
                 val intent = (journal.flush(prepared(view, add("corrupt"))) as M3CanonicalDirtyJournalFlushResult.Prepared).intent.file
                 if (truncate) intent.writeBytes(intent.readBytes().copyOf(13))
                 else intent.writeBytes(intent.readBytes().also { it[17] = (it[17].toInt() xor 0x55).toByte() })
 
-                val reopened = opened(M3CanonicalDirtyJournal.open(view, directory, budget())).reopen()
+                val reopened = opened(M3CanonicalDirtyJournal.open(view, directory, budget(directory))).reopen()
                     as M3CanonicalDirtyJournalReopenResult.Refused
                 assertEquals(M3CanonicalDirtyJournalRefusal.CORRUPT_INTENT, reopened.reason)
                 assertEquals(2L, reopened.burnedHighWater)
@@ -84,13 +140,19 @@ class M3CanonicalDirtyJournalTest {
         try {
             val empty = view("empty", rows = 1, high = 2)
             val emptyPlan = prepared(empty, refine("empty", M3SurfaceId(1)))
-            val emptyIntent = opened(M3CanonicalDirtyJournal.open(empty, emptyDirectory, budget())).flush(emptyPlan)
+            val emptyIntent = opened(M3CanonicalDirtyJournal.open(empty, emptyDirectory, budget(emptyDirectory))).flush(emptyPlan)
                 as M3CanonicalDirtyJournalFlushResult.Prepared
             assertEquals(2L, emptyIntent.intent.targetHighWater)
 
+            val zeroOne = M3AllocationRecord(1, 2, 2, empty.cut.group.hash, sha256("z1".encodeToByteArray()), sha256("f1".encodeToByteArray()), ByteArray(32))
+            val zeroTwo = M3AllocationRecord(2, 2, 2, empty.cut.group.hash, sha256("z2".encodeToByteArray()), sha256("f2".encodeToByteArray()), zeroOne.recordHash)
+            val zeroChain = M3SurfaceAllocationAuthority.validate(empty.cut.group, listOf(zeroTwo, zeroOne), 2)
+            assertEquals(2L, zeroChain.highWater)
+            assertEquals(2L, zeroChain.lastRevision)
+
             val maximum = view("maximum", rows = 0, high = 0xffff_ffffL)
             val maximumPlan = prepared(maximum, add("maximum"))
-            val maximumIntent = opened(M3CanonicalDirtyJournal.open(maximum, maximumDirectory, budget())).flush(maximumPlan)
+            val maximumIntent = opened(M3CanonicalDirtyJournal.open(maximum, maximumDirectory, budget(maximumDirectory))).flush(maximumPlan)
                 as M3CanonicalDirtyJournalFlushResult.Prepared
             assertEquals(0x1_0000_0000L, maximumIntent.intent.targetHighWater)
         } finally { emptyDirectory.deleteRecursively(); maximumDirectory.deleteRecursively() }
@@ -105,8 +167,10 @@ class M3CanonicalDirtyJournalTest {
             val large = view("large", rows = 100_000)
             val smallPlan = prepared(small, refine("same", M3SurfaceId(1)))
             val largePlan = prepared(large, refine("same", M3SurfaceId(1)))
-            val smallIntent = (opened(M3CanonicalDirtyJournal.open(small, smallDirectory, budget())).flush(smallPlan) as M3CanonicalDirtyJournalFlushResult.Prepared).intent
-            val largeIntent = (opened(M3CanonicalDirtyJournal.open(large, largeDirectory, budget())).flush(largePlan) as M3CanonicalDirtyJournalFlushResult.Prepared).intent
+            val smallFixture = budgetFixture(smallDirectory)
+            val largeFixture = budgetFixture(largeDirectory)
+            val smallIntent = (opened(M3CanonicalDirtyJournal.open(small, smallDirectory, smallFixture.budget)).flush(smallPlan) as M3CanonicalDirtyJournalFlushResult.Prepared).intent
+            val largeIntent = (opened(M3CanonicalDirtyJournal.open(large, largeDirectory, largeFixture.budget)).flush(largePlan) as M3CanonicalDirtyJournalFlushResult.Prepared).intent
             assertEquals(smallPlan.work.walBytes, largePlan.work.walBytes)
             assertEquals(smallIntent.walLength, largeIntent.walLength)
             assertEquals(smallIntent.storage.ledgerAllocatedBytes, largeIntent.storage.ledgerAllocatedBytes)
@@ -117,6 +181,8 @@ class M3CanonicalDirtyJournalTest {
                 "M3_CANONICAL_DIRTY_JOURNAL_RECEIPT wal=${largeIntent.walLength} " +
                     "ledgerAllocated=${largeIntent.storage.ledgerAllocatedBytes} " +
                     "intentAllocated=${largeIntent.storage.intentAllocatedBytes} " +
+                    "candidateRequests=${largeFixture.budget.requests.joinToString(",")} " +
+                    "candidateActuals=${largeFixture.budget.actuals.distinct().joinToString(",")} " +
                     "writerScratch=${M3CanonicalDirtyJournal.WRITER_SCRATCH_BYTES} " +
                     "reserve=${M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES}",
             )
@@ -134,16 +200,20 @@ class M3CanonicalDirtyJournalTest {
             )
             val plan = (M3SurfaceOwnership.prepareMutation(view, M3SurfaceOwnershipConfiguration(), command)
                 as M3CanonicalMutationPreparation.Prepared).mutation
-            val intent = (opened(M3CanonicalDirtyJournal.open(view, directory, budget())).flush(plan)
+            val fixture = budgetFixture(directory)
+            val intent = (opened(M3CanonicalDirtyJournal.open(view, directory, fixture.budget)).flush(plan)
                 as M3CanonicalDirtyJournalFlushResult.Prepared).intent
             assertEquals(8_192, plan.work.dirtySupportRecords)
             assertTrue(plan.work.constructionPeakBytes <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
             assertTrue(intent.file.length() <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
             assertTrue(plan.work.retainedPlanBytes + M3CanonicalDirtyJournal.WRITER_SCRATCH_BYTES <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
+            assertTrue(fixture.budget.requests.all { it <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES })
             println(
                 "M3_CANONICAL_DIRTY_JOURNAL_MAX wal=${plan.work.walBytes} current=${plan.work.currentBytes} " +
                     "planRetained=${plan.work.retainedPlanBytes} planPeak=${plan.work.constructionPeakBytes} " +
                     "intentLogical=${intent.file.length()} writerScratch=${M3CanonicalDirtyJournal.WRITER_SCRATCH_BYTES} " +
+                    "candidateRequests=${fixture.budget.requests.joinToString(",")} " +
+                    "candidateActuals=${fixture.budget.actuals.distinct().joinToString(",")} " +
                     "reserve=${M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES}",
             )
         } finally { directory.deleteRecursively() }
@@ -156,12 +226,33 @@ class M3CanonicalDirtyJournalTest {
         (M3SurfaceOwnership.prepareMutation(view, M3SurfaceOwnershipConfiguration(), command) as M3CanonicalMutationPreparation.Prepared).mutation
     private fun wal(plan: M3PreparedCanonicalMutation) = ByteArrayOutputStream().also(plan::writeWalTo).toByteArray()
     private fun sha256(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes)
+    private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
     private fun opened(result: M3CanonicalDirtyJournalOpenResult) = (result as M3CanonicalDirtyJournalOpenResult.Opened).journal
-    private fun budget() = object : M3CanonicalStorageBudget {
-        override fun reserve(bytes: Long): Any = bytes
-        override fun commit(token: Any, actualBytes: Long) = Unit
-        override fun release(token: Any) = Unit
-        override fun allocationUnitBytes(path: File) = 4_096L
+    private fun budget(directory: File): M3CanonicalStorageBudget = budgetFixture(directory).budget
+    private fun budgetFixture(
+        directory: File,
+        quota: Long = 8L * 1024 * 1024,
+        floor: Long = 4_096L,
+        free: Long = 16L * 1024 * 1024,
+    ): BudgetFixture {
+        val coordinator = StorageBudgetCoordinatorV2(
+            directory,
+            StorageBudgetPolicyV2(quota, floor),
+            JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L }),
+            freeBytes = { free },
+        )
+        return BudgetFixture(coordinator, RecordingBudget(M3CoordinatorStorageBudget(coordinator)))
+    }
+
+    private data class BudgetFixture(val coordinator: StorageBudgetCoordinatorV2, val budget: RecordingBudget)
+    private class RecordingBudget(private val delegate: M3CanonicalStorageBudget) : M3CanonicalStorageBudget by delegate {
+        val requests = mutableListOf<Long>()
+        val actuals = mutableListOf<Long>()
+        override fun reserveCandidate(staging: File, target: File, fileBytes: Map<String, Long>, maximumPhysicalBytes: Long): Any? {
+            requests += maximumPhysicalBytes
+            return delegate.reserveCandidate(staging, target, fileBytes, maximumPhysicalBytes)
+        }
+        override fun verifyCandidate(token: Any, candidate: File): Long = delegate.verifyCandidate(token, candidate).also { actuals += it }
     }
 
     private fun view(identity: String, rows: Int, high: Long = rows + 1L, sourceCount: Int = rows, supportCount: Int = rows): TestView {

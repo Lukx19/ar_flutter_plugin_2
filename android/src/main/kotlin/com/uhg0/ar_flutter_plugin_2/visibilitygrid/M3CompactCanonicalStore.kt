@@ -269,6 +269,9 @@ internal interface M3CanonicalStorageBudget {
 
     fun reconcilePublishedCandidate(target: File) = Unit
 
+    /** Resolves either side of an interrupted candidate publication for this exact target. */
+    fun reconcileCandidate(target: File) = reconcilePublishedCandidate(target)
+
     fun releaseCandidate(token: Any, staging: File) {
         if (staging.exists()) staging.deleteRecursively()
         release(token)
@@ -310,6 +313,8 @@ internal class M3CoordinatorStorageBudget(private val coordinator: StorageBudget
 
     override fun reconcilePublishedCandidate(target: File) =
         coordinator.reconcilePublishedCandidate(target)
+
+    override fun reconcileCandidate(target: File) = coordinator.reconcileCandidate(target)
 
     override fun releaseCandidate(token: Any, staging: File) {
         coordinator.releaseCandidate(token as StorageBudgetReservationV2, staging)

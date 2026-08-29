@@ -32,6 +32,8 @@ internal class M3CanonicalDirtyJournal private constructor(
     private val directory: File,
     private val budget: M3CanonicalStorageBudget,
     private var burnedHighWater: Long,
+    private var lastAllocationRevision: Long,
+    private var lastAllocationHash: ByteArray,
 ) : AutoCloseable {
     private var closed = false
 
@@ -45,32 +47,26 @@ internal class M3CanonicalDirtyJournal private constructor(
             return refused(M3CanonicalDirtyJournalRefusal.INTENT_EXISTS)
         if (!matchesAuthority(plan.sourceCut) || !validRange(plan))
             return refused(M3CanonicalDirtyJournalRefusal.STALE_OR_INVALID_PLAN)
-        if (fault == M3CanonicalDirtyJournalFault.BEFORE_RESERVATION)
-            return refused(M3CanonicalDirtyJournalRefusal.DURABILITY_FAILURE)
-
-        val ledger = M3DirtyAllocationLedger(
-            group, authority, burnedHighWater, plan.targetHighWater,
-            plan.commandHash, plan.commandFingerprint,
+        val allocation = M3AllocationRecord(
+            revision = lastAllocationRevision + 1,
+            start = burnedHighWater,
+            endExclusive = plan.targetHighWater,
+            groupHash = group.hash,
+            commandHash = plan.commandHash.toByteArray(),
+            fingerprint = plan.commandFingerprint.toByteArray(),
+            previousHash = lastAllocationHash,
         )
-        val ledgerTarget = File(directory, "allocation-${ledger.endExclusive}.m3")
-        if (ledgerTarget.exists()) return refused(M3CanonicalDirtyJournalRefusal.CORRUPT_LEDGER)
-
-        // This candidate *is* the reservation backing.  It is promoted before
-        // intent encoding, so every later failure retains the burned range.
+        val ledgerTarget = allocationTarget(allocation.revision)
         val ledgerResult = publishCandidate(
             ledgerTarget,
-            mapOf(LEDGER_FILE to ledger.encodedBytes.toLong()),
+            mapOf(ALLOCATION_RECORD_FILE to M3AllocationRecord.ENCODED_BYTES.toLong()),
+            fault,
+            CandidateKind.ALLOCATION,
         ) { staged ->
-            writeFullySynced(File(staged, LEDGER_FILE), ledger.encoded)
+            FileOutputStream(File(staged, ALLOCATION_RECORD_FILE)).use { it.write(allocation.encoded()) }
         }
-        if (!ledgerResult) return refused(M3CanonicalDirtyJournalRefusal.DURABILITY_FAILURE)
-        burnedHighWater = ledger.endExclusive
-        if (fault in setOf(
-                M3CanonicalDirtyJournalFault.AFTER_LEDGER_RESERVATION,
-                M3CanonicalDirtyJournalFault.BEFORE_LEDGER_WRITE,
-                M3CanonicalDirtyJournalFault.AFTER_LEDGER_SYNC,
-                M3CanonicalDirtyJournalFault.AFTER_LEDGER_PUBLISH,
-            ))
+        refreshAllocationAuthority()
+        if (!ledgerResult)
             return refused(M3CanonicalDirtyJournalRefusal.DURABILITY_FAILURE)
 
         val intentTarget = File(directory, INTENT_DIRECTORY)
@@ -79,20 +75,15 @@ internal class M3CanonicalDirtyJournal private constructor(
         val logicalBytes = header.encodedBytes(plan.work.walBytes)
         if (logicalBytes > M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
             return refused(M3CanonicalDirtyJournalRefusal.INTENT_TOO_LARGE)
-        if (fault == M3CanonicalDirtyJournalFault.AFTER_INTENT_RESERVATION)
-            return refused(M3CanonicalDirtyJournalRefusal.DURABILITY_FAILURE)
-
         val intentResult = publishCandidate(
             intentTarget,
             mapOf(INTENT_FILE to logicalBytes),
+            fault,
+            CandidateKind.INTENT,
         ) { staged ->
-            if (fault == M3CanonicalDirtyJournalFault.BEFORE_INTENT_WRITE) error("fault")
             writeIntent(File(staged, INTENT_FILE), plan, header, fault)
-            if (fault == M3CanonicalDirtyJournalFault.AFTER_INTENT_SYNC) error("fault")
         }
         if (!intentResult) return refused(M3CanonicalDirtyJournalRefusal.DURABILITY_FAILURE)
-        if (fault == M3CanonicalDirtyJournalFault.AFTER_INTENT_PUBLISH)
-            return refused(M3CanonicalDirtyJournalRefusal.DURABILITY_FAILURE)
         return M3CanonicalDirtyJournalFlushResult.Prepared(
             M3PreparedIntent(File(intentTarget, INTENT_FILE), header, physicalReceipt()),
         )
@@ -101,6 +92,12 @@ internal class M3CanonicalDirtyJournal private constructor(
     @Synchronized
     fun reopen(): M3CanonicalDirtyJournalReopenResult {
         if (closed) return M3CanonicalDirtyJournalReopenResult.Refused(M3CanonicalDirtyJournalRefusal.CLOSED, burnedHighWater)
+        try {
+            refreshAllocationAuthority()
+            budget.reconcileCandidate(intentTarget())
+        } catch (_: Exception) {
+            return M3CanonicalDirtyJournalReopenResult.Refused(M3CanonicalDirtyJournalRefusal.CORRUPT_LEDGER, burnedHighWater)
+        }
         val intent = File(directory, "$INTENT_DIRECTORY/$INTENT_FILE")
         if (!intent.exists()) return M3CanonicalDirtyJournalReopenResult.None(burnedHighWater)
         return try {
@@ -128,7 +125,7 @@ internal class M3CanonicalDirtyJournal private constructor(
         M3CanonicalDirtyJournalFlushResult.Refused(reason, burnedHighWater, physicalReceipt())
 
     private fun physicalReceipt(): M3CanonicalDirtyJournalStorageReceipt {
-        val ledger = directory.listFiles { file -> file.name.startsWith("allocation-") && file.name.endsWith(".m3") }
+        val ledger = directory.listFiles { file -> file.isDirectory && file.name.startsWith("${candidateBase()}.allocation-") }
             .orEmpty().sumOf { budget.allocatedBytes(it) }
         val intent = File(directory, INTENT_DIRECTORY).takeIf(File::exists)?.let(budget::allocatedBytes) ?: 0L
         return M3CanonicalDirtyJournalStorageReceipt(ledger, intent, Math.addExact(ledger, intent))
@@ -138,24 +135,46 @@ internal class M3CanonicalDirtyJournal private constructor(
     private fun publishCandidate(
         target: File,
         files: Map<String, Long>,
+        fault: M3CanonicalDirtyJournalFault?,
+        kind: CandidateKind,
         writer: (File) -> Unit,
     ): Boolean {
         var token: Any? = null
         var staging: File? = null
         var published = false
         try {
-            staging = File(directory, ".${target.name}.staging-${Thread.currentThread().name.hashCode()}-${System.nanoTime()}")
+            inject(fault, kind.beforeReservation)
+            staging = File(directory, "${candidateBase()}.staging-${kind.name.lowercase()}-${System.nanoTime()}")
             val unit = budget.allocationUnitBytes(directory)
-            val worst = files.values.fold(0L) { total, bytes -> Math.addExact(total, roundPhysical(bytes, unit)) }
+            // File blocks plus staging directory, reservation metadata, budget-ledger replacement,
+            // and parent-directory entry are all reserved before the first write.
+            val worst = (files.values + listOf(1L, 1L, 1L, 1L)).fold(0L) { total, bytes ->
+                Math.addExact(total, roundPhysical(bytes, unit))
+            }
             token = budget.reserveCandidate(staging, target, files, worst) ?: return false
+            inject(fault, kind.afterReservation)
+            budget.verifyCandidate(requireNotNull(token), staging)
+            inject(fault, kind.beforeWrite)
             writer(staging)
+            inject(fault, kind.afterWrite)
+            budget.verifyCandidate(requireNotNull(token), staging)
+            inject(fault, kind.beforeFsync)
+            syncCandidateFiles(staging, files.keys)
+            inject(fault, kind.afterFsync)
             budget.verifyCandidate(requireNotNull(token), staging)
             syncDirectory(staging)
+            inject(fault, kind.beforePublish)
             budget.publishCandidate(requireNotNull(token), staging, target)
             published = true
+            inject(fault, kind.afterPublish)
+            budget.verifyCandidate(requireNotNull(token), target)
+            inject(fault, kind.beforeParentSync)
             syncDirectory(directory)
+            inject(fault, kind.afterParentSync)
+            inject(fault, kind.beforeBudgetCommit)
             budget.commit(requireNotNull(token), budget.allocatedBytes(target))
             token = null
+            inject(fault, kind.afterBudgetCommit)
             return true
         } catch (_: Exception) {
             return false
@@ -187,7 +206,6 @@ internal class M3CanonicalDirtyJournal private constructor(
             val checksum = digest.digest()
             require(checksum.size == HASH_BYTES)
             raw.write(checksum)
-            raw.fd.sync()
         }
         require(file.length() <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
     }
@@ -196,8 +214,7 @@ internal class M3CanonicalDirtyJournal private constructor(
         private const val UINT32_HIGH_WATER = 0x1_0000_0000L
         private const val HASH_BYTES = 32
         internal const val WRITER_SCRATCH_BYTES = 65_536
-        private const val LEDGER_FILE = "ledger.bin"
-        private const val INTENT_DIRECTORY = "intent.m3"
+        private const val ALLOCATION_RECORD_FILE = "allocation-record.bin"
         private const val INTENT_FILE = "intent.bin"
 
         fun open(
@@ -212,17 +229,10 @@ internal class M3CanonicalDirtyJournal private constructor(
             budget: M3CanonicalStorageBudget,
         ): M3CanonicalDirtyJournalOpenResult = try {
             require(directory.exists() || directory.mkdirs())
-            val ledgers = directory.listFiles { file -> file.name.startsWith("allocation-") && file.name.endsWith(".m3") }
-                .orEmpty().sortedBy { it.name }
-            var high = authority.nextSurfaceIdHighWater
-            for (file in ledgers) {
-                val ledger = M3DirtyAllocationLedger.read(File(file, LEDGER_FILE))
-                require(ledger.groupHash.contentEquals(authority.group.hash))
-                require(ledger.authorityRootHash == authority.rootHash)
-                require(ledger.start == high && ledger.endExclusive in high..UINT32_HIGH_WATER)
-                high = ledger.endExclusive
-            }
-            M3CanonicalDirtyJournalOpenResult.Opened(M3CanonicalDirtyJournal(authority.group, authority, directory, budget, high))
+            val journal = M3CanonicalDirtyJournal(authority.group, authority, directory, budget, 1L, 0L, ByteArray(32))
+            journal.refreshAllocationAuthority()
+            require(authority.nextSurfaceIdHighWater <= journal.burnedHighWater)
+            M3CanonicalDirtyJournalOpenResult.Opened(journal)
         } catch (_: Exception) {
             M3CanonicalDirtyJournalOpenResult.Refused(M3CanonicalDirtyJournalRefusal.CORRUPT_LEDGER)
         }
@@ -237,9 +247,75 @@ internal class M3CanonicalDirtyJournal private constructor(
                 FileChannel.open(directory.toPath(), StandardOpenOption.READ).use { it.force(true) }
         }
 
-        private fun writeFullySynced(file: File, bytes: ByteArray) {
-            FileOutputStream(file).use { output -> output.write(bytes); output.fd.sync() }
+    }
+
+    private fun candidateBase() = "m3-canonical-v6-${group.hash.hex()}"
+    private fun allocationTarget(revision: Long) = File(directory, "${candidateBase()}.allocation-$revision")
+    private fun intentTarget() = File(directory, "${candidateBase()}.intent")
+    private val INTENT_DIRECTORY get() = intentTarget().name
+
+    private fun refreshAllocationAuthority() {
+        val legacy = M3SurfaceAllocationAuthority.readLegacy(directory, group)
+        val candidates = directory.listFiles { file ->
+            file.isDirectory && file.name.startsWith("${candidateBase()}.allocation-")
+        }.orEmpty()
+        candidates.forEach(budget::reconcilePublishedCandidate)
+        val records = candidates.filter(File::exists).map { candidate ->
+            M3AllocationRecord.decode(File(candidate, ALLOCATION_RECORD_FILE).readBytes())
         }
+        val initialHighWater = if (legacy.isEmpty()) authority.nextSurfaceIdHighWater else 1L
+        var chain = M3SurfaceAllocationAuthority.validate(group, legacy + records, initialHighWater)
+        // There can be only one sequential allocation publication in flight. If it never renamed,
+        // its exact next-revision target identifies and reclaims the private reservation.
+        budget.reconcileCandidate(allocationTarget(chain.lastRevision + 1L))
+        chain = M3SurfaceAllocationAuthority.validate(group, legacy + records, initialHighWater)
+        if (legacy.isNotEmpty()) require(
+            chain.records.any { it.endExclusive == authority.nextSurfaceIdHighWater } ||
+                authority.nextSurfaceIdHighWater == 1L,
+        )
+        burnedHighWater = chain.highWater
+        lastAllocationRevision = chain.lastRevision
+        lastAllocationHash = chain.lastHash
+    }
+
+    private fun syncCandidateFiles(candidate: File, names: Set<String>) {
+        names.forEach { name -> FileOutputStream(File(candidate, name), true).use { it.fd.sync() } }
+    }
+
+    private fun inject(requested: M3CanonicalDirtyJournalFault?, point: M3CanonicalDirtyJournalFault) {
+        if (requested == point) error("fault:$point")
+    }
+
+    private enum class CandidateKind(
+        val beforeReservation: M3CanonicalDirtyJournalFault,
+        val afterReservation: M3CanonicalDirtyJournalFault,
+        val beforeWrite: M3CanonicalDirtyJournalFault,
+        val afterWrite: M3CanonicalDirtyJournalFault,
+        val beforeFsync: M3CanonicalDirtyJournalFault,
+        val afterFsync: M3CanonicalDirtyJournalFault,
+        val beforePublish: M3CanonicalDirtyJournalFault,
+        val afterPublish: M3CanonicalDirtyJournalFault,
+        val beforeParentSync: M3CanonicalDirtyJournalFault,
+        val afterParentSync: M3CanonicalDirtyJournalFault,
+        val beforeBudgetCommit: M3CanonicalDirtyJournalFault,
+        val afterBudgetCommit: M3CanonicalDirtyJournalFault,
+    ) {
+        ALLOCATION(
+            M3CanonicalDirtyJournalFault.BEFORE_ALLOCATION_RESERVATION, M3CanonicalDirtyJournalFault.AFTER_ALLOCATION_RESERVATION,
+            M3CanonicalDirtyJournalFault.BEFORE_ALLOCATION_WRITE, M3CanonicalDirtyJournalFault.AFTER_ALLOCATION_WRITE,
+            M3CanonicalDirtyJournalFault.BEFORE_ALLOCATION_FSYNC, M3CanonicalDirtyJournalFault.AFTER_ALLOCATION_FSYNC,
+            M3CanonicalDirtyJournalFault.BEFORE_ALLOCATION_PUBLISH, M3CanonicalDirtyJournalFault.AFTER_ALLOCATION_PUBLISH,
+            M3CanonicalDirtyJournalFault.BEFORE_ALLOCATION_PARENT_SYNC, M3CanonicalDirtyJournalFault.AFTER_ALLOCATION_PARENT_SYNC,
+            M3CanonicalDirtyJournalFault.BEFORE_ALLOCATION_BUDGET_COMMIT, M3CanonicalDirtyJournalFault.AFTER_ALLOCATION_BUDGET_COMMIT,
+        ),
+        INTENT(
+            M3CanonicalDirtyJournalFault.BEFORE_INTENT_RESERVATION, M3CanonicalDirtyJournalFault.AFTER_INTENT_RESERVATION,
+            M3CanonicalDirtyJournalFault.BEFORE_INTENT_WRITE, M3CanonicalDirtyJournalFault.AFTER_INTENT_WRITE,
+            M3CanonicalDirtyJournalFault.BEFORE_INTENT_FSYNC, M3CanonicalDirtyJournalFault.AFTER_INTENT_FSYNC,
+            M3CanonicalDirtyJournalFault.BEFORE_INTENT_PUBLISH, M3CanonicalDirtyJournalFault.AFTER_INTENT_PUBLISH,
+            M3CanonicalDirtyJournalFault.BEFORE_INTENT_PARENT_SYNC, M3CanonicalDirtyJournalFault.AFTER_INTENT_PARENT_SYNC,
+            M3CanonicalDirtyJournalFault.BEFORE_INTENT_BUDGET_COMMIT, M3CanonicalDirtyJournalFault.AFTER_INTENT_BUDGET_COMMIT,
+        ),
     }
 }
 
@@ -268,8 +344,19 @@ internal enum class M3CanonicalDirtyJournalRefusal {
 }
 
 internal enum class M3CanonicalDirtyJournalFault {
-    BEFORE_RESERVATION, AFTER_LEDGER_RESERVATION, BEFORE_LEDGER_WRITE, AFTER_LEDGER_SYNC, AFTER_LEDGER_PUBLISH,
-    AFTER_INTENT_RESERVATION, BEFORE_INTENT_WRITE, DURING_WAL_WRITE, AFTER_INTENT_SYNC, AFTER_INTENT_PUBLISH,
+    BEFORE_ALLOCATION_RESERVATION, AFTER_ALLOCATION_RESERVATION,
+    BEFORE_ALLOCATION_WRITE, AFTER_ALLOCATION_WRITE,
+    BEFORE_ALLOCATION_FSYNC, AFTER_ALLOCATION_FSYNC,
+    BEFORE_ALLOCATION_PUBLISH, AFTER_ALLOCATION_PUBLISH,
+    BEFORE_ALLOCATION_PARENT_SYNC, AFTER_ALLOCATION_PARENT_SYNC,
+    BEFORE_ALLOCATION_BUDGET_COMMIT, AFTER_ALLOCATION_BUDGET_COMMIT,
+    BEFORE_INTENT_RESERVATION, AFTER_INTENT_RESERVATION,
+    BEFORE_INTENT_WRITE, AFTER_INTENT_WRITE,
+    BEFORE_INTENT_FSYNC, AFTER_INTENT_FSYNC,
+    BEFORE_INTENT_PUBLISH, AFTER_INTENT_PUBLISH,
+    BEFORE_INTENT_PARENT_SYNC, AFTER_INTENT_PARENT_SYNC,
+    BEFORE_INTENT_BUDGET_COMMIT, AFTER_INTENT_BUDGET_COMMIT,
+    DURING_WAL_WRITE,
 }
 
 internal data class M3CanonicalDirtyJournalStorageReceipt(
@@ -292,49 +379,6 @@ internal class M3PreparedIntent internal constructor(
     val currentHash get() = header.currentHash
 
     fun openWal(): InputStream = BoundedInputStream(BufferedInputStream(FileInputStream(file), M3CanonicalDirtyJournal.WRITER_SCRATCH_BYTES), header.walOffset, header.walLength)
-}
-
-private class M3DirtyAllocationLedger(
-    group: M3SurfaceGroup,
-    authority: M3CompactCanonicalCut,
-    val start: Long,
-    val endExclusive: Long,
-    commandHash: M3CanonicalReceiptBytes,
-    commandFingerprint: M3CanonicalReceiptBytes,
-) {
-    val groupHash = group.hash
-    val authorityRootHash = authority.rootHash
-    private val command = commandHash
-    private val fingerprint = commandFingerprint
-    val encoded: ByteArray by lazy {
-        val body = java.io.ByteArrayOutputStream().use { bytes ->
-            DataOutputStream(bytes).use { out ->
-                out.writeInt(LEDGER_MAGIC); out.writeInt(VERSION); out.write(groupHash); out.write(authorityRootHash.toByteArray())
-                out.writeLong(start); out.writeLong(endExclusive); out.write(command.toByteArray()); out.write(fingerprint.toByteArray())
-            }
-            bytes.toByteArray()
-        }
-        body + sha256(body)
-    }
-    val encodedBytes get() = encoded.size
-
-    companion object {
-        private const val LEDGER_MAGIC = 0x4d33444c
-        private const val VERSION = 1
-        fun read(file: File): M3DirtyAllocationLedger {
-            val bytes = file.readBytes(); require(bytes.size == 4 + 4 + 32 + 32 + 8 + 8 + 32 + 32 + 32)
-            require(sha256(bytes.copyOfRange(0, bytes.size - 32)).contentEquals(bytes.copyOfRange(bytes.size - 32, bytes.size)))
-            DataInputStream(bytes.inputStream()).use { input ->
-                require(input.readInt() == LEDGER_MAGIC && input.readInt() == VERSION)
-                val groupHash = input.readNBytes(32); val root = input.readNBytes(32); val start = input.readLong(); val end = input.readLong()
-                val command = input.readNBytes(32); val fingerprint = input.readNBytes(32)
-                return M3DirtyAllocationLedger(M3SurfaceGroup("restored"), M3CompactCanonicalCut(M3SurfaceGroup("restored"), "", 0, 0, 1, 0, 0, 0, 0, null, M3CanonicalReceiptBytes(root), M3CanonicalReceiptBytes.EMPTY), start, end, M3CanonicalReceiptBytes(command), M3CanonicalReceiptBytes(fingerprint)).also {
-                    groupHash.copyInto(it.groupHash)
-                }
-            }
-        }
-        private fun sha256(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes)
-    }
 }
 
 internal data class M3DirtyIntentHeader(
@@ -429,7 +473,17 @@ internal data class M3DirtyIntentHeader(
 private class FaultingOutputStream(private val delegate: OutputStream, private val fault: M3CanonicalDirtyJournalFault?) : OutputStream() {
     var count = 0L; private var fired = false
     override fun write(value: Int) { write(byteArrayOf(value.toByte())) }
-    override fun write(bytes: ByteArray, offset: Int, length: Int) { if (fault == M3CanonicalDirtyJournalFault.DURING_WAL_WRITE && !fired && count > 0) { fired = true; error("fault") }; delegate.write(bytes, offset, length); count += length }
+    override fun write(bytes: ByteArray, offset: Int, length: Int) {
+        if (fault == M3CanonicalDirtyJournalFault.DURING_WAL_WRITE && !fired && length > 0) {
+            fired = true
+            val partial = maxOf(1, length / 2)
+            delegate.write(bytes, offset, partial)
+            count += partial
+            error("fault")
+        }
+        delegate.write(bytes, offset, length)
+        count += length
+    }
 }
 private object NullOutputStream : OutputStream() { override fun write(value: Int) = Unit; override fun write(bytes: ByteArray, offset: Int, length: Int) = Unit }
 private class CountingOutputStream : OutputStream() { var count = 0L; override fun write(value: Int) { count++ }; override fun write(bytes: ByteArray, offset: Int, length: Int) { count += length } }
@@ -440,3 +494,4 @@ private class BoundedInputStream(delegate: InputStream, skip: Long, private var 
     override fun read(bytes: ByteArray, offset: Int, length: Int): Int { if (remaining == 0L) return -1; val count = source.read(bytes, offset, minOf(length.toLong(), remaining).toInt()); if (count > 0) remaining -= count; return count }
     override fun close() = source.close()
 }
+private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
