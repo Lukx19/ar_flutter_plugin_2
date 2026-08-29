@@ -129,7 +129,10 @@ internal class M3PreparedIntentStreamingVisitor(
                     repeat(rows) {
                         val record = record(input, output)
                         require(record.id > 0 && unsignedAfter(record.id, previousRow)); previousRow = record.id
-                        if (record.id >= header.sourceCut.nextSurfaceIdHighWater) newRows++
+                        if (record.id >= header.sourceCut.nextSurfaceIdHighWater) {
+                            require(record.id == allocatedId(header.sourceCut.nextSurfaceIdHighWater, newRows))
+                            newRows++
+                        }
                         if (!call { visitor.onDirtyRow(record.id, record.x, record.y, record.z, record.normal, record.confidence, record.f0, record.f1, record.f2, record.f3) }) return stoppedOrClosed()
                     }
                     val removed = count(input, output, 100_000)
@@ -156,9 +159,9 @@ internal class M3PreparedIntentStreamingVisitor(
                     }
                     val sources = count(input, output, 100_000)
                     var previousSource = 0L
-                    repeat(sources) {
+                    repeat(sources) { sourceOrdinal ->
                         val record = record(input, output)
-                        require(record.id >= header.sourceCut.nextSurfaceIdHighWater && unsignedAfter(record.id, previousSource)); previousSource = record.id
+                        require(record.id == allocatedId(header.sourceCut.nextSurfaceIdHighWater, sourceOrdinal) && unsignedAfter(record.id, previousSource)); previousSource = record.id
                         if (!call { visitor.onDirtySource(record.id, record.x, record.y, record.z, record.normal, record.confidence, record.f0, record.f1, record.f2, record.f3) }) return stoppedOrClosed()
                     }
                     val lineage = count(input, output, 200_000)
@@ -170,7 +173,7 @@ internal class M3PreparedIntentStreamingVisitor(
                         if (!call { visitor.onDirtyLineage(source, target) }) return stoppedOrClosed()
                     }
                     require(input.read() == -1)
-                    require(newRows == sources && header.targetHighWater == header.sourceCut.nextSurfaceIdHighWater + newRows)
+                    require(newRows == sources && header.targetHighWater == allocationEnd(header.sourceCut.nextSurfaceIdHighWater, newRows))
                     require(validCardinality(kind, header, rows, removed, removedSupports, supports, sources, lineage))
                     output.flush()
                     val receipt = M3PreparedIntentCurrentReceipt(counter.count, M3CanonicalReceiptBytes(digest.digest()))
@@ -225,6 +228,12 @@ internal class M3PreparedIntentStreamingVisitor(
         return Record(id, x, y, z, normal, confidence, f0, f1, f2, f3)
     }
     private fun call(block: () -> Boolean) = !isClosed() && try { block() } catch (_: Exception) { throw M3PreparedIntentVisitorFailure }
+    private fun allocatedId(highWater: Long, ordinal: Int): Long = try {
+        Math.addExact(highWater, ordinal.toLong()).also { require(it in 1 until UINT32_END) }
+    } catch (_: ArithmeticException) { throw IllegalArgumentException("allocation range overflow") }
+    private fun allocationEnd(highWater: Long, count: Int): Long = try {
+        Math.addExact(highWater, count.toLong()).also { require(it in 1..UINT32_END) }
+    } catch (_: ArithmeticException) { throw IllegalArgumentException("allocation range overflow") }
     private fun stoppedOrClosed() = if (isClosed()) refused(M3PreparedIntentVisitRefusal.CLOSED) else M3PreparedIntentVisitResult.Stopped
     private fun refused(reason: M3PreparedIntentVisitRefusal) = M3PreparedIntentVisitResult.Refused(reason)
     private fun unsignedAfter(value: Long, previous: Long) = previous == 0L || java.lang.Long.compareUnsigned(value, previous) > 0

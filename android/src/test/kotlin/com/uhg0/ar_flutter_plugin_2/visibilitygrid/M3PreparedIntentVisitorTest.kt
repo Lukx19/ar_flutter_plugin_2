@@ -114,6 +114,12 @@ class M3PreparedIntentVisitorTest {
     }
 
     @Test
+    fun `rechecksummed row gap and dirty source mismatch cannot complete an allocation range`() {
+        allocationRangeFault("row-gap") { it.rewriteRowId(2) }
+        allocationRangeFault("source-mismatch") { it.rewriteSourceId(2) }
+    }
+
+    @Test
     fun `all seven mutation kinds round trip exact typed records order and target cut`() {
         val empty = scenarioView("all-kinds-empty")
         val rows = listOf(scenarioSurface(1, 0), scenarioSurface(2, 1), scenarioSurface(3, 2), scenarioSurface(4, 3))
@@ -263,6 +269,20 @@ class M3PreparedIntentVisitorTest {
         val directory = Files.createTempDirectory("m3-intent-corpus-$name-").toFile()
         try {
             val prepared = intent(directory, view(name, 1), name)
+            mutate(RechecksummedIntentFixture(prepared))
+            val visitor = CountingVisitor()
+            assertEquals(name, M3PreparedIntentVisitRefusal.CORRUPT_INTENT,
+                (prepared.visit(visitor) as M3PreparedIntentVisitResult.Refused).reason)
+            assertEquals(name, 0, visitor.terminals)
+        } finally { directory.deleteRecursively() }
+    }
+
+    private fun allocationRangeFault(name: String, mutate: (RechecksummedIntentFixture) -> Unit) {
+        val directory = Files.createTempDirectory("m3-intent-allocation-$name-").toFile()
+        try {
+            val view = scenarioView("allocation-$name")
+            val plan = prepare(view, M3FeatureMutationCommand(name, 0, 0, scenarioTarget(0)))
+            val prepared = intent(directory, view, plan)
             mutate(RechecksummedIntentFixture(prepared))
             val visitor = CountingVisitor()
             assertEquals(name, M3PreparedIntentVisitRefusal.CORRUPT_INTENT,
@@ -534,6 +554,23 @@ class M3PreparedIntentVisitorTest {
             )
         }
 
+        fun rewriteRowId(changedId: Long) = rewriteRecordId(layout.rowStart, changedId)
+        fun rewriteSourceId(changedId: Long) = rewriteRecordId(layout.sourceStart, changedId)
+
+        private fun rewriteRecordId(offset: Int, changedId: Long) {
+            val changed = wal.copyOf()
+            ByteBuffer.wrap(changed).putLong(offset, changedId)
+            val current = currentFrom(changed)
+            rewrite(
+                header.copy(
+                    walHash = M3CanonicalReceiptBytes(digest(changed)),
+                    currentHash = M3CanonicalReceiptBytes(digest(current)),
+                    walOffset = 0,
+                ),
+                changed,
+            )
+        }
+
         fun downgradeBodyToLegacyV1() {
             val positions = layout
             require(ByteBuffer.wrap(wal).getInt(4) == 2)
@@ -579,6 +616,7 @@ class M3PreparedIntentVisitorTest {
             val rowCount: Int,
             val rowStart: Int,
             val removedSupportCount: Int,
+            val sourceStart: Int,
         ) {
             companion object {
                 fun read(wal: ByteArray): WalLayout {
@@ -594,13 +632,18 @@ class M3PreparedIntentVisitorTest {
                     val rowStart = rowCount + 4
                     val removedCount = rowStart + rows * ROW_BYTES
                     val removed = buffer.getInt(removedCount)
-                    return WalLayout(kind, targetSupport, rowCount, rowStart, removedCount + 4 + removed * 8)
+                    val removedSupportCount = removedCount + 4 + removed * 8
+                    val supportCount = removedSupportCount + 4
+                    val supports = buffer.getInt(supportCount)
+                    val sourceCount = supportCount + 4 + supports * SUPPORT_BYTES
+                    return WalLayout(kind, targetSupport, rowCount, rowStart, removedSupportCount, sourceCount + 4)
                 }
             }
         }
 
         companion object {
             private const val ROW_BYTES = 60
+            private const val SUPPORT_BYTES = 68
             private const val CURRENT_MAGIC = 0x4d334350
             private fun digest(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes)
             private fun currentFrom(wal: ByteArray) = wal.copyOf().also { ByteBuffer.wrap(it).putInt(0, CURRENT_MAGIC) }
