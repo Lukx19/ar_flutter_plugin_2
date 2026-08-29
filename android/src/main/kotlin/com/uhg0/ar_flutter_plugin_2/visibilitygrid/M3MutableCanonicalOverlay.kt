@@ -20,6 +20,10 @@ internal class M3MutableCanonicalOverlay private constructor(
     private var pageFaults = 0
     private var bytesRead = 0
     private var directLookups = 0
+    private var targetDeepCopies = 0
+    private var targetSetInsertions = 0
+    private var ownerConstructions = 0
+    private var removalGraphAllocations = 0
 
     private fun state() = M3CanonicalStateReceipt(
         view.cut.geometryRevision,
@@ -29,7 +33,16 @@ internal class M3MutableCanonicalOverlay private constructor(
     )
 
     private fun refuse(reason: M3CanonicalMutationRefusal) =
-        M3CanonicalMutationPreparation.Refused(reason, state())
+        M3CanonicalMutationPreparation.Refused(
+            reason,
+            state(),
+            M3CanonicalMutationPreflightWork(
+                targetDeepCopies,
+                targetSetInsertions,
+                ownerConstructions,
+                removalGraphAllocations,
+            ),
+        )
 
     private fun prepareFeature(command: M3FeatureMutationCommand): M3CanonicalMutationPreparation {
         if (!validCommandId(command.commandId) ||
@@ -105,11 +118,21 @@ internal class M3MutableCanonicalOverlay private constructor(
         val minimumStaging = encodedRecordBytes(targetCardinality, sourceCardinality, 0, 0, minimumEdges, input.commandId)
             ?: return refuse(M3CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
         if (!journalFits(minimumStaging)) return refuse(M3CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
+        val scalarAllocations = input.targets.count { it.id == null }
+        val supportLimit = maximumSupportRecords(
+            targetCardinality, sourceCardinality, scalarAllocations, minimumEdges, input.commandId,
+        ) ?: return refuse(M3CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
 
         // Freeze caller-owned lists and values only after scalar cardinality admission.
         val command = input.copy(
-            sourceIds = input.sourceIds.map { M3SurfaceId(it.value) },
-            targets = input.targets.map { it.copy(id = it.id?.let { id -> M3SurfaceId(id.value) }, voxel = it.voxel.copy()) },
+            sourceIds = input.sourceIds.map {
+                removalGraphAllocations++
+                M3SurfaceId(it.value)
+            },
+            targets = input.targets.map {
+                targetDeepCopies++
+                it.copy(id = it.id?.let { id -> M3SurfaceId(id.value) }, voxel = it.voxel.copy())
+            },
         )
         val sources = command.sourceIds
         if (sources.map { it.value }.toSet().size != sources.size) return refuse(M3CanonicalMutationRefusal.UNKNOWN_IDENTITY)
@@ -133,7 +156,9 @@ internal class M3MutableCanonicalOverlay private constructor(
         val seenVoxels = HashSet<M3Voxel>()
         for (target in command.targets) {
             val location = m3CompactLocation(configuration, target.voxel) ?: return refuse(M3CanonicalMutationRefusal.INVALID_OWNERSHIP)
-            if (packed(target) == null || !seenVoxels.add(target.voxel)) return refuse(if (packed(target) == null) M3CanonicalMutationRefusal.INVALID_NORMAL else M3CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
+            if (packed(target) == null) return refuse(M3CanonicalMutationRefusal.INVALID_NORMAL)
+            if (!seenVoxels.add(target.voxel)) return refuse(M3CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
+            targetSetInsertions++
             if (target.id != null && target.id !in vacated) return refuse(M3CanonicalMutationRefusal.UNKNOWN_IDENTITY)
             directLookups++
             val occupied = view.findByVoxel(target.voxel)
@@ -141,7 +166,7 @@ internal class M3MutableCanonicalOverlay private constructor(
             // Keep this local calculation visible: planner must validate every dirty index target.
             check(location.page in 0..26)
         }
-        val allocations = command.targets.count { it.id == null }
+        val allocations = scalarAllocations
         val high = checkedHighWater(view.cut.nextSurfaceIdHighWater, allocations) ?: return refuse(M3CanonicalMutationRefusal.EXHAUSTED)
         val finalRowsLong = view.cut.liveSurfaceCount.toLong() - sources.size.toLong() + command.targets.size.toLong()
         if (finalRowsLong !in 0..configuration.surfaceCapacity.toLong()) return refuse(M3CanonicalMutationRefusal.CAPACITY)
@@ -149,11 +174,7 @@ internal class M3MutableCanonicalOverlay private constructor(
         val finalSourceCount = view.cut.sourceCount.toLong() + allocations.toLong()
         if (finalSourceCount > sourceCapacity() || finalSourceCount > Int.MAX_VALUE) return refuse(M3CanonicalMutationRefusal.LINEAGE_EXHAUSTED)
 
-        val edgeCardinality = checkedProduct(sources.size, command.targets.size)
-            ?: return refuse(M3CanonicalMutationRefusal.LINEAGE_EXHAUSTED)
-        val supportLimit = maximumSupportRecords(
-            command.targets.size, sources.size, allocations, edgeCardinality, command.commandId,
-        ) ?: return refuse(M3CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
+        val edgeCardinality = minimumEdges
         val sourceSupport = M3BoundedSupportAccumulator(supportLimit)
         var removedSupports = 0L
         for (source in sources) {
@@ -197,7 +218,9 @@ internal class M3MutableCanonicalOverlay private constructor(
             val provenance = if (target.id == null) commandHash else
                 readAllocationFingerprint(id)
                     ?: return refuse(M3CanonicalMutationRefusal.SOURCE_READ_FAILURE)
-            M3SurfaceOwner(id, view.cut.group, target.voxel, location.region, location.page, normal.first, normal.second, provenance)
+            M3SurfaceOwner(id, view.cut.group, target.voxel, location.region, location.page, normal.first, normal.second, provenance).also {
+                ownerConstructions++
+            }
         }.sortedBy { it.id.value }
         if (view.cut.lineageCount.toLong() + edgeCardinality > configuration.lineageCapacity) return refuse(M3CanonicalMutationRefusal.LINEAGE_EXHAUSTED)
         val finalSupportLong = view.cut.supportCount.toLong() - removedSupports + dirtySupportCardinality
@@ -346,6 +369,7 @@ internal class M3MutableCanonicalOverlay private constructor(
         commandId: String,
     ): Int? {
         if (targets <= 0) return 0
+        if (!supportConstructionFits(targets, removed, 0)) return null
         val fixedEncoded = encodedRecordBytes(targets, removed, 0, dirtySources.toLong(), edges, commandId) ?: return null
         val journalLimit = minOf(M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES, configuration.changeJournalByteCapacity.toLong())
         if (fixedEncoded > journalLimit) return null
@@ -360,10 +384,23 @@ internal class M3MutableCanonicalOverlay private constructor(
     }
 
     private fun supportConstructionFits(rows: Int, removed: Int, supports: Int): Boolean {
-        val hashBytes = supportHashBytes(supports)
-        val peak = PLAN_FIXED_OWNER_BYTES + WRITER_SCRATCH_BYTES + PLANNING_PAGE_SCRATCH_BYTES +
-            rows.toLong() * ROW_CONSTRUCTION_BYTES_PER_RECORD + removed.toLong() * REMOVED_CONSTRUCTION_BYTES_PER_RECORD +
-            supportConstructionArrayBytes(supports) + hashBytes
+        val peak = try {
+            Math.addExact(
+                Math.addExact(
+                    Math.addExact(PLAN_FIXED_OWNER_BYTES, WRITER_SCRATCH_BYTES),
+                    PLANNING_PAGE_SCRATCH_BYTES,
+                ),
+                Math.addExact(
+                    Math.addExact(
+                        Math.multiplyExact(rows.toLong(), ROW_CONSTRUCTION_BYTES_PER_RECORD),
+                        Math.multiplyExact(removed.toLong(), REMOVED_CONSTRUCTION_BYTES_PER_RECORD),
+                    ),
+                    Math.addExact(supportConstructionArrayBytes(supports), supportHashBytes(supports)),
+                ),
+            )
+        } catch (_: ArithmeticException) {
+            return false
+        }
         return peak <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES
     }
 
@@ -400,8 +437,8 @@ internal class M3MutableCanonicalOverlay private constructor(
         internal const val PLAN_FIXED_OWNER_BYTES = 8_192L
         // One decoded 16 KiB source page plus bounded record/object decode overhead.
         internal const val PLANNING_PAGE_SCRATCH_BYTES = 65_536L
-        private const val ROW_CONSTRUCTION_BYTES_PER_RECORD = 256L
-        private const val REMOVED_CONSTRUCTION_BYTES_PER_RECORD = 40L
+        internal const val ROW_CONSTRUCTION_BYTES_PER_RECORD = 256L
+        internal const val REMOVED_CONSTRUCTION_BYTES_PER_RECORD = 40L
 
         fun prepare(view: M3CanonicalStateView, configuration: M3SurfaceOwnershipConfiguration, command: M3FeatureMutationCommand) =
             M3MutableCanonicalOverlay(view, configuration).prepareFeature(command)
@@ -409,7 +446,29 @@ internal class M3MutableCanonicalOverlay private constructor(
         fun prepare(view: M3CanonicalStateView, configuration: M3SurfaceOwnershipConfiguration, command: M3CanonicalTransactionCommand) =
             M3MutableCanonicalOverlay(view, configuration).prepareStructural(command)
 
-        private fun validCommandId(value: String) = value.isNotBlank() && value.encodeToByteArray().size <= MAX_COMMAND_BYTES
+        private fun validCommandId(value: String) = value.isNotBlank() && utf8Length(value) <= MAX_COMMAND_BYTES
+
+        /** Allocation-free equivalent of the JDK UTF-8 encoder length for admission. */
+        private fun utf8Length(value: String): Int {
+            var bytes = 0
+            var index = 0
+            while (index < value.length) {
+                val character = value[index]
+                bytes += when {
+                    character.code < 0x80 -> 1
+                    character.code < 0x800 -> 2
+                    character.isHighSurrogate() && index + 1 < value.length && value[index + 1].isLowSurrogate() -> {
+                        index++
+                        4
+                    }
+                    character.isSurrogate() -> 1 // malformed UTF-16 is replaced with '?' by the JDK encoder
+                    else -> 3
+                }
+                if (bytes > MAX_COMMAND_BYTES) return bytes
+                index++
+            }
+            return bytes
+        }
     }
 }
 
@@ -763,8 +822,19 @@ private class M3BoundedSupportAccumulator(val limit: Int) {
 internal sealed interface M3CanonicalMutationPreparation {
     data class Prepared(val mutation: M3PreparedCanonicalMutation) : M3CanonicalMutationPreparation
     data class NoOp(val receipt: M3CanonicalStateReceipt) : M3CanonicalMutationPreparation
-    data class Refused(val reason: M3CanonicalMutationRefusal, val receipt: M3CanonicalStateReceipt) : M3CanonicalMutationPreparation
+    data class Refused(
+        val reason: M3CanonicalMutationRefusal,
+        val receipt: M3CanonicalStateReceipt,
+        val preflightWork: M3CanonicalMutationPreflightWork = M3CanonicalMutationPreflightWork(),
+    ) : M3CanonicalMutationPreparation
 }
+
+internal data class M3CanonicalMutationPreflightWork(
+    val targetDeepCopies: Int = 0,
+    val targetSetInsertions: Int = 0,
+    val ownerConstructions: Int = 0,
+    val removalGraphAllocations: Int = 0,
+)
 
 internal enum class M3CanonicalMutationRefusal {
     INVALID_COMMAND, INVALID_OWNERSHIP, INVALID_NORMAL, UNKNOWN_IDENTITY, OWNERSHIP_CONFLICT,

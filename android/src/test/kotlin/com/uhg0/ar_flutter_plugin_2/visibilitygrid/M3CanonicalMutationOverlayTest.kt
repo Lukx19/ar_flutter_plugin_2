@@ -144,6 +144,53 @@ class M3CanonicalMutationOverlayTest {
     }
 
     @Test
+    fun `zero-support construction peak refuses before copying or materializing command graphs`() {
+        fun zeroSupportPeak(rows: Int, removed: Int) =
+            M3MutableCanonicalOverlay.PLAN_FIXED_OWNER_BYTES + M3MutableCanonicalOverlay.WRITER_SCRATCH_BYTES +
+                M3MutableCanonicalOverlay.PLANNING_PAGE_SCRATCH_BYTES +
+                rows * M3MutableCanonicalOverlay.ROW_CONSTRUCTION_BYTES_PER_RECORD +
+                removed * M3MutableCanonicalOverlay.REMOVED_CONSTRUCTION_BYTES_PER_RECORD + 4L
+        fun assertScalarOnly(refused: M3CanonicalMutationPreparation.Refused, authorityReads: Int) {
+            assertEquals(M3CanonicalMutationRefusal.JOURNAL_EXHAUSTED, refused.reason)
+            assertEquals(M3CanonicalMutationPreflightWork(), refused.preflightWork)
+            assertEquals(0, authorityReads)
+        }
+
+        val createView = ScalarPreflightView(0)
+        assertTrue(zeroSupportPeak(rows = 5_000, removed = 0) > M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
+        val create = M3SurfaceOwnership.prepareMutation(
+            createView,
+            configuration(),
+            canonical(
+                "zero-support-large-create",
+                M3CanonicalOperation.CREATE,
+                0,
+                0,
+                emptyList(),
+                *Array(5_000) { target(it) },
+            ),
+        ) as M3CanonicalMutationPreparation.Refused
+        assertScalarOnly(create, createView.authorityReads)
+
+        val removalCount = 25_000
+        val removalView = ScalarPreflightView(removalCount)
+        assertTrue(zeroSupportPeak(rows = 1, removed = removalCount) > M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
+        val removal = M3SurfaceOwnership.prepareMutation(
+            removalView,
+            configuration(surfaceCapacity = 100_000, lineageCapacity = 100_000),
+            M3CanonicalTransactionCommand(
+                "zero-support-large-removal",
+                M3CanonicalOperation.REPLACEMENT,
+                0,
+                0,
+                List(removalCount) { M3SurfaceId(it + 1L) },
+                listOf(target(removalCount + 1)),
+            ),
+        ) as M3CanonicalMutationPreparation.Refused
+        assertScalarOnly(removal, removalView.authorityReads)
+    }
+
+    @Test
     fun `journal-derived support cap accepts its maximum and stops high support at the next record`() {
         val probe = prepared(M3SurfaceOwnership.prepareMutation(
             view(
@@ -367,6 +414,44 @@ class M3CanonicalMutationOverlayTest {
             }
             val next = if (index < total) M3SourceSupportCursor(root, target, index, 0) else null
             return M3SourceSupportRead.Complete(delivered, next, 1, 16_384)
+        }
+        override fun retainedMemoryReceipt() = error("not used")
+        override fun allocatedStorageReceipt() = error("not used")
+        override fun close() = Unit
+    }
+
+    private inner class ScalarPreflightView(private val live: Int) : M3CanonicalStateView {
+        private val root = M3CanonicalReceiptBytes(ByteArray(32) { 11 })
+        var authorityReads = 0
+        override val cut = M3CompactCanonicalCut(
+            M3SurfaceGroup("scalar-preflight"), M3CompactCanonicalStore.PROFILE, 0, 0,
+            live.toLong() + 1L, live, live, live, 0, null, root,
+            M3CanonicalReceiptBytes(ByteArray(32) { 12 }),
+        )
+        override fun findById(id: M3SurfaceId): M3CompactSurface? {
+            authorityReads++
+            return if (id.value in 1..live.toLong()) surface(id.value, (id.value - 1).toInt()) else null
+        }
+        override fun findByVoxel(voxel: M3Voxel): M3CompactSurface? {
+            authorityReads++
+            return null
+        }
+        override fun readPage(region: M3StorageRegion, page: Int, cursor: Int, limit: Int): M3CompactPage {
+            authorityReads++
+            return M3CompactPage(emptyList(), null, 0)
+        }
+        override fun readSourceById(id: M3SurfaceId): M3CanonicalPageRead<M3PagedSource> {
+            authorityReads++
+            return M3CanonicalPageRead.Complete(source(id.value, (id.value - 1).toInt()), 1, 16_384)
+        }
+        override fun visitSourceSupport(
+            target: M3SurfaceId,
+            cursor: M3SourceSupportCursor?,
+            sink: (M3PagedSupport) -> Boolean,
+        ): M3SourceSupportRead {
+            authorityReads++
+            sink(M3PagedSupport(target, source(target.value, (target.value - 1).toInt())))
+            return M3SourceSupportRead.Complete(1, null, 1, 16_384)
         }
         override fun retainedMemoryReceipt() = error("not used")
         override fun allocatedStorageReceipt() = error("not used")
