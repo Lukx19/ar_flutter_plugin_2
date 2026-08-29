@@ -24,17 +24,18 @@ class M3CanonicalDirtyJournalTest {
             val fixture = budgetFixture(directory)
             val journal = opened(M3CanonicalDirtyJournal.open(view, directory, fixture.budget))
             val flushed = journal.flush(plan) as M3CanonicalDirtyJournalFlushResult.Prepared
+            val flushedIdentity = identity(flushed.intent)
 
-            assertEquals(plan.sourceCut, flushed.intent.sourceCut)
-            assertEquals(plan.targetHighWater, flushed.intent.targetHighWater)
+            assertEquals(plan.sourceCut, flushedIdentity.sourceCut)
+            assertEquals(plan.targetHighWater, flushedIdentity.targetHighWater)
             assertTrue(flushed.intent.file.isFile)
             assertTrue(flushed.intent.file.length() <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
-            assertEquals(plan.work.walBytes.toLong(), flushed.intent.walLength)
-            assertEquals(sha256(wal(plan)).toList(), flushed.intent.walHash.toByteArray().toList())
+            assertEquals(plan.work.walBytes.toLong(), flushedIdentity.walReceipt.length)
+            assertEquals(sha256(wal(plan)).toList(), flushedIdentity.walReceipt.hash.toByteArray().toList())
             assertEquals(0, view.mutations)
             assertArrayEquals(authorityRootBefore, view.cut.rootHash.toByteArray())
             val reopened = journal.reopen() as M3CanonicalDirtyJournalReopenResult.Complete
-            assertEquals(flushed.intent.walHash, reopened.intent.walHash)
+            assertEquals(flushedIdentity.walReceipt, identity(reopened.intent).walReceipt)
             assertTrue(reopened.intent.storage.totalAllocatedBytes > 0)
             assertTrue(fixture.budget.actuals.zip(fixture.budget.requests).all { (actual, requested) -> actual in 1..requested })
             assertEquals(flushed.intent.storage.totalAllocatedBytes, fixture.coordinator.committedBytes())
@@ -92,7 +93,7 @@ class M3CanonicalDirtyJournalTest {
                 assertFalse(reopened is M3CanonicalDirtyJournalReopenResult.Refused && reopened.reason == M3CanonicalDirtyJournalRefusal.CORRUPT_LEDGER)
                 val high = when (reopened) {
                     is M3CanonicalDirtyJournalReopenResult.None -> reopened.burnedHighWater
-                    is M3CanonicalDirtyJournalReopenResult.Complete -> reopened.intent.targetHighWater
+                    is M3CanonicalDirtyJournalReopenResult.Complete -> identity(reopened.intent).targetHighWater
                     is M3CanonicalDirtyJournalReopenResult.Refused -> reopened.burnedHighWater
                 }
                 val allocationPublished = fault.ordinal >= M3CanonicalDirtyJournalFault.AFTER_ALLOCATION_PUBLISH.ordinal
@@ -142,7 +143,7 @@ class M3CanonicalDirtyJournalTest {
             val emptyPlan = prepared(empty, refine("empty", M3SurfaceId(1)))
             val emptyIntent = opened(M3CanonicalDirtyJournal.open(empty, emptyDirectory, budget(emptyDirectory))).flush(emptyPlan)
                 as M3CanonicalDirtyJournalFlushResult.Prepared
-            assertEquals(2L, emptyIntent.intent.targetHighWater)
+            assertEquals(2L, identity(emptyIntent.intent).targetHighWater)
 
             val zeroOne = M3AllocationRecord(1, 2, 2, empty.cut.group.hash, sha256("z1".encodeToByteArray()), sha256("f1".encodeToByteArray()), ByteArray(32))
             val zeroTwo = M3AllocationRecord(2, 2, 2, empty.cut.group.hash, sha256("z2".encodeToByteArray()), sha256("f2".encodeToByteArray()), zeroOne.recordHash)
@@ -154,7 +155,7 @@ class M3CanonicalDirtyJournalTest {
             val maximumPlan = prepared(maximum, add("maximum"))
             val maximumIntent = opened(M3CanonicalDirtyJournal.open(maximum, maximumDirectory, budget(maximumDirectory))).flush(maximumPlan)
                 as M3CanonicalDirtyJournalFlushResult.Prepared
-            assertEquals(0x1_0000_0000L, maximumIntent.intent.targetHighWater)
+            assertEquals(0x1_0000_0000L, identity(maximumIntent.intent).targetHighWater)
         } finally { emptyDirectory.deleteRecursively(); maximumDirectory.deleteRecursively() }
     }
 
@@ -172,13 +173,13 @@ class M3CanonicalDirtyJournalTest {
             val smallIntent = (opened(M3CanonicalDirtyJournal.open(small, smallDirectory, smallFixture.budget)).flush(smallPlan) as M3CanonicalDirtyJournalFlushResult.Prepared).intent
             val largeIntent = (opened(M3CanonicalDirtyJournal.open(large, largeDirectory, largeFixture.budget)).flush(largePlan) as M3CanonicalDirtyJournalFlushResult.Prepared).intent
             assertEquals(smallPlan.work.walBytes, largePlan.work.walBytes)
-            assertEquals(smallIntent.walLength, largeIntent.walLength)
+            assertEquals(identity(smallIntent).walReceipt.length, identity(largeIntent).walReceipt.length)
             assertEquals(smallIntent.storage.ledgerAllocatedBytes, largeIntent.storage.ledgerAllocatedBytes)
             assertEquals(smallIntent.storage.intentAllocatedBytes, largeIntent.storage.intentAllocatedBytes)
             assertEquals(65_536, M3CanonicalDirtyJournal.WRITER_SCRATCH_BYTES)
             assertTrue(largeIntent.file.length() <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
             println(
-                "M3_CANONICAL_DIRTY_JOURNAL_RECEIPT wal=${largeIntent.walLength} " +
+                "M3_CANONICAL_DIRTY_JOURNAL_RECEIPT wal=${identity(largeIntent).walReceipt.length} " +
                     "ledgerAllocated=${largeIntent.storage.ledgerAllocatedBytes} " +
                     "intentAllocated=${largeIntent.storage.intentAllocatedBytes} " +
                     "candidateRequests=${largeFixture.budget.requests.joinToString(",")} " +
@@ -226,6 +227,8 @@ class M3CanonicalDirtyJournalTest {
         (M3SurfaceOwnership.prepareMutation(view, M3SurfaceOwnershipConfiguration(), command) as M3CanonicalMutationPreparation.Prepared).mutation
     private fun wal(plan: M3PreparedCanonicalMutation) = ByteArrayOutputStream().also(plan::writeWalTo).toByteArray()
     private fun sha256(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes)
+    private fun identity(intent: M3PreparedIntent) =
+        (intent.identity() as M3PreparedIntentIdentityResult.Complete).identity
     private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
     private fun opened(result: M3CanonicalDirtyJournalOpenResult) = (result as M3CanonicalDirtyJournalOpenResult.Opened).journal
     private fun budget(directory: File): M3CanonicalStorageBudget = budgetFixture(directory).budget

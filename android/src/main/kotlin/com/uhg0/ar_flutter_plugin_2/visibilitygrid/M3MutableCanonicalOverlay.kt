@@ -258,6 +258,14 @@ internal class M3MutableCanonicalOverlay private constructor(
         val dirtySourceRecords = rows.count { it.id.value >= view.cut.nextSurfaceIdHighWater }
         val dirtyLineageRecords = checkedProduct(removed.size, rows.size)
             ?: return refuse(M3CanonicalMutationRefusal.LINEAGE_EXHAUSTED)
+        val removedSupportRecords = try {
+            Math.addExact(
+                Math.subtractExact(view.cut.supportCount.toLong(), supportCount.toLong()),
+                dirtySupportRecords,
+            )
+        } catch (_: ArithmeticException) { return refuse(M3CanonicalMutationRefusal.LINEAGE_EXHAUSTED) }
+        if (removedSupportRecords !in 0..view.cut.supportCount.toLong())
+            return refuse(M3CanonicalMutationRefusal.LINEAGE_EXHAUSTED)
         val encodedBytes = encodedRecordBytes(
             rows.size, removed.size, dirtySupportRecords, dirtySourceRecords.toLong(),
             dirtyLineageRecords, commandId,
@@ -289,7 +297,7 @@ internal class M3MutableCanonicalOverlay private constructor(
         return M3CanonicalMutationPreparation.Prepared(M3PreparedCanonicalMutation(
             view.cut, M3CanonicalReceiptBytes(overlayHash(commandId.encodeToByteArray())),
             M3CanonicalReceiptBytes(fingerprint), commandId, kind, rowTable, removedIds,
-            supports, supportMode, high, live, sourceCount, supportCount, lineageCount,
+            supports, supportMode, removedSupportRecords.toIntExact(), high, live, sourceCount, supportCount, lineageCount,
             geometry, lineage, work,
         ))
     }
@@ -354,7 +362,7 @@ internal class M3MutableCanonicalOverlay private constructor(
     private fun encodedRecordBytes(rows: Int, removed: Int, supports: Long, sources: Long, edges: Long, commandId: String): Long? =
         try {
             val commandBytes = modifiedUtf8Length(commandId)
-            val one = Math.addExact(170L + commandBytes, Math.addExact(
+            val one = Math.addExact(174L + commandBytes, Math.addExact(
                 Math.addExact(Math.multiplyExact(rows.toLong(), 60L), Math.multiplyExact(removed.toLong(), 8L)),
                 Math.addExact(Math.multiplyExact(supports, 68L), Math.addExact(Math.multiplyExact(sources, 60L), Math.multiplyExact(edges, 16L))),
             ))
@@ -535,6 +543,7 @@ internal class M3PreparedCanonicalMutation(
     private val removedIds: LongArray,
     private val supports: M3PreparedSourceTable,
     private val supportMode: M3PreparedSupportMode,
+    val removedSupportRecords: Int,
     val targetHighWater: Long,
     val targetLiveSurfaceCount: Int,
     val targetSourceCount: Int,
@@ -590,7 +599,7 @@ internal class M3PreparedCanonicalMutation(
 
     private fun writeTo(output: java.io.OutputStream, magic: Int) {
         val out = DataOutputStream(output)
-        out.writeInt(magic); out.writeInt(1); out.write(sourceCut.rootHash.toByteArray())
+        out.writeInt(magic); out.writeInt(BODY_VERSION); out.write(sourceCut.rootHash.toByteArray())
         out.writeUTF(commandId); out.writeInt(kind.ordinal)
         out.write(commandHash.toByteArray()); out.write(commandFingerprint.toByteArray())
         out.writeLong(targetHighWater); out.writeInt(targetLiveSurfaceCount)
@@ -598,6 +607,7 @@ internal class M3PreparedCanonicalMutation(
         out.writeLong(targetGeometryRevision); out.writeLong(targetLineageRevision)
         out.writeInt(rows.size); rows.writeRecords(out)
         out.writeInt(removedIds.size); removedIds.forEach(out::writeLong)
+        out.writeInt(removedSupportRecords)
         out.writeInt(work.dirtySupportRecords)
         when (supportMode) {
             M3PreparedSupportMode.NONE -> Unit
@@ -613,6 +623,7 @@ internal class M3PreparedCanonicalMutation(
     companion object {
         private const val WAL_MAGIC = 0x4d33574c
         private const val CURRENT_MAGIC = 0x4d334350
+        private const val BODY_VERSION = 2
     }
 }
 

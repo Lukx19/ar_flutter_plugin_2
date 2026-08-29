@@ -525,15 +525,16 @@ class M3CanonicalStoreMigrationTest {
         val before = store.readWorkReceipt()
         val visited = intent.visit(visitor) as M3PreparedIntentVisitResult.Complete
         val work = store.readWorkReceipt() - before
+        val identity = (intent.identity() as M3PreparedIntentIdentityResult.Complete).identity
         assertEquals(1, visitor.rows); assertEquals(1, visitor.terminal)
         assertEquals(expectedWal.size.toLong(), plan.mutation.work.walBytes.toLong())
-        assertEquals(expectedWal.size.toLong(), intent.walLength)
+        assertEquals(expectedWal.size.toLong(), identity.walReceipt.length)
         assertEquals(expectedCurrent.size.toLong(), plan.mutation.work.currentBytes.toLong())
-        assertEquals(expectedCurrent.size.toLong(), intent.currentLength)
-        assertEquals(intent.currentLength, visited.currentReceipt.length)
-        assertEquals(M3CanonicalReceiptBytes(sha256(expectedWal)), intent.walHash)
-        assertEquals(M3CanonicalReceiptBytes(sha256(expectedCurrent)), intent.currentHash)
-        assertEquals(intent.currentHash, visited.currentReceipt.hash)
+        assertEquals(expectedCurrent.size.toLong(), identity.expectedCurrentReceipt.length)
+        assertEquals(identity.expectedCurrentReceipt.length, visited.currentReceipt.length)
+        assertEquals(M3CanonicalReceiptBytes(sha256(expectedWal)), identity.walReceipt.hash)
+        assertEquals(M3CanonicalReceiptBytes(sha256(expectedCurrent)), identity.expectedCurrentReceipt.hash)
+        assertEquals(identity.expectedCurrentReceipt.hash, visited.currentReceipt.hash)
         assertEquals(M3CanonicalReadWork.ZERO, work)
     }
 

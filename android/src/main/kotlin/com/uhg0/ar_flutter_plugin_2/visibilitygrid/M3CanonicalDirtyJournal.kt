@@ -85,7 +85,7 @@ internal class M3CanonicalDirtyJournal private constructor(
         }
         if (!intentResult) return refused(M3CanonicalDirtyJournalRefusal.DURABILITY_FAILURE)
         return M3CanonicalDirtyJournalFlushResult.Prepared(
-            M3PreparedIntent(File(intentTarget, INTENT_FILE), header, physicalReceipt()),
+            M3PreparedIntent(File(intentTarget, INTENT_FILE), physicalReceipt()),
         )
     }
 
@@ -104,7 +104,7 @@ internal class M3CanonicalDirtyJournal private constructor(
             val header = M3DirtyIntentHeader.read(intent)
             if (!header.matches(authority) || header.targetHighWater > burnedHighWater)
                 M3CanonicalDirtyJournalReopenResult.Refused(M3CanonicalDirtyJournalRefusal.CORRUPT_INTENT, burnedHighWater)
-            else M3CanonicalDirtyJournalReopenResult.Complete(M3PreparedIntent(intent, header, physicalReceipt()))
+            else M3CanonicalDirtyJournalReopenResult.Complete(M3PreparedIntent(intent, physicalReceipt()))
         } catch (_: Exception) {
             // Never try to infer semantic data from a damaged pre-root file.
             M3CanonicalDirtyJournalReopenResult.Refused(M3CanonicalDirtyJournalRefusal.CORRUPT_INTENT, burnedHighWater)
@@ -368,29 +368,19 @@ internal data class M3CanonicalDirtyJournalStorageReceipt(
 /** File-backed only: callers can stream the exact WAL but cannot receive its bytes as a graph. */
 internal class M3PreparedIntent internal constructor(
     val file: File,
-    private val header: M3DirtyIntentHeader,
     val storage: M3CanonicalDirtyJournalStorageReceipt,
 ) : AutoCloseable {
     @Volatile private var closed = false
-    val sourceCut get() = header.sourceCut
-    val targetHighWater get() = header.targetHighWater
-    val walLength get() = header.walLength
-    val walHash get() = header.walHash
-    val currentLength get() = header.currentLength
-    val currentHash get() = header.currentHash
 
     /**
-     * Reopens the durable envelope before returning its identity.  The cached
-     * header is deliberately not authority after a restart (or after a caller
-     * hands this handle to another owner).
+     * Fully validates the durable envelope and exact current re-encoding before
+     * returning its identity. No plan-derived header state survives this seam.
      */
     @Synchronized
-    fun identity(): M3PreparedIntentIdentityResult = if (closed) {
-        M3PreparedIntentIdentityResult.Refused(M3PreparedIntentVisitRefusal.CLOSED)
-    } else try {
-        M3PreparedIntentIdentityResult.Complete(M3PreparedIntentIdentity.from(M3DirtyIntentHeader.read(file)))
-    } catch (_: Exception) {
-        M3PreparedIntentIdentityResult.Refused(M3PreparedIntentVisitRefusal.CORRUPT_INTENT)
+    fun identity(): M3PreparedIntentIdentityResult = when (val result = visit(M3PreparedIntentVisitor.NONE)) {
+        is M3PreparedIntentVisitResult.Complete -> M3PreparedIntentIdentityResult.Complete(result.identity)
+        is M3PreparedIntentVisitResult.Stopped -> M3PreparedIntentIdentityResult.Refused(M3PreparedIntentVisitRefusal.VISITOR_FAILURE)
+        is M3PreparedIntentVisitResult.Refused -> M3PreparedIntentIdentityResult.Refused(result.reason)
     }
 
     /** Streams and re-encodes the current record.  It never returns decoded records. */
