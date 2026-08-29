@@ -238,6 +238,8 @@ internal class M3CanonicalCowGeneration private constructor(
                 java.lang.Long.compareUnsigned(target.value, entry.minimumKey) >= 0 &&
                 java.lang.Long.compareUnsigned(target.value, entry.maximumKey) <= 0
         }
+        if (cursor != null && (cursor.offset < 0 || candidates.none { it.index == cursor.ordinal }))
+            return M3SourceSupportRead.Refused(M3CompactCanonicalRefusal.STALE_CURSOR)
         if (candidates.isEmpty()) return M3SourceSupportRead.Complete(0, null, 0, 0)
         val startEntry = cursor?.ordinal ?: candidates.first().index
         var skip = cursor?.offset ?: 0
@@ -257,6 +259,8 @@ internal class M3CanonicalCowGeneration private constructor(
                 true
             }
             if (!valid) return M3SourceSupportRead.Refused(M3CompactCanonicalRefusal.CORRUPT)
+            if (cursor != null && entryIndex == startEntry && skip >= matchingOffset)
+                return M3SourceSupportRead.Refused(M3CompactCanonicalRefusal.STALE_CURSOR)
             if (stopped) return M3SourceSupportRead.Complete(delivered, M3SourceSupportCursor(rootHash, target, entryIndex, resumeOffset), candidates.size, candidates.size * PAGE_BYTES)
         }
         return M3SourceSupportRead.Complete(delivered, null, candidates.size, candidates.size * PAGE_BYTES)
@@ -268,6 +272,11 @@ internal class M3CanonicalCowGeneration private constructor(
         /** Fixed visitor scratch plus one page for every writer kind. */
         val FIXED_PHASE_BYTES = M3PreparedIntentVisitorResources.STREAMING_SCRATCH_BYTES +
             M3CowFragmentKind.entries.size * PAGE_BYTES.toLong()
+        /** Writer maps/instances, receipts, list backing arrays and transient root metadata. */
+        internal const val PHASE_OBJECT_OVERHEAD_BYTES = 65_536L
+        internal const val SORT_SCRATCH_BYTES = 16_384L
+        internal fun phasePeakBytes(directoryEntries: Int) = FIXED_PHASE_BYTES + SORT_SCRATCH_BYTES +
+            PHASE_OBJECT_OVERHEAD_BYTES + 64L + directoryEntries * 128L
         internal const val PAGE_MAGIC = 0x4d334350
         private const val ROOT_FILE = "root.m3cow"
         private const val DIRECTORY_FILE = "directory.m3cow"
@@ -300,7 +309,7 @@ internal class M3CanonicalCowGeneration private constructor(
             val expectedNames = entries.mapTo(mutableSetOf()) { it.file } + setOf(ROOT_FILE, DIRECTORY_FILE, CURRENT_UNACKED_FILE)
             require(directory.listFiles().orEmpty().mapTo(mutableSetOf()) { it.name } == expectedNames)
             val storage = M3CowStorageReceipt(
-                directory.listFiles().orEmpty().sumOf { allocated(it) }, entries.size, FIXED_PHASE_BYTES + 64L + entries.size * 128L,
+                directory.listFiles().orEmpty().sumOf { allocated(it) }, entries.size, phasePeakBytes(entries.size),
             )
             require(storage.phasePeakBytes <= DIRECTORY_LIMIT_BYTES)
             M3CanonicalCowGeneration(directory, root, entries, storage).also { generation ->
@@ -701,17 +710,17 @@ private class M3CowOverlay(private val base: M3CanonicalStateView, private val d
     private fun visitLineageOpen(source: M3SurfaceId, cursor: M3LineageCursor?, sink: (M3LineageEdge) -> Boolean): M3LineageRead {
         if (cursor != null && (cursor.rootHash != cut.rootHash || cursor.source != source || cursor.offset < 0))
             return M3LineageRead.Refused(M3CompactCanonicalRefusal.STALE_CURSOR)
-        if (delta.has(M3CowFragmentKind.LINEAGE, source.value)) {
-            var matching = 0; var delivered = 0; var resume: Int? = null
-            val valid = delta.visit(M3CowFragmentKind.LINEAGE, source.value) { record ->
-                if (record is M3CowRecord.Lineage && record.source == source.value) {
-                    if (matching++ >= (cursor?.offset ?: 0) && resume == null) {
-                        if (sink(M3LineageEdge(source, M3SurfaceId(record.target)))) delivered++ else resume = matching - 1
-                    }
+        var matching = 0; var delivered = 0; var resume: Int? = null
+        val validLineage = delta.visit(M3CowFragmentKind.LINEAGE, source.value) { record ->
+            if (record is M3CowRecord.Lineage && record.source == source.value) {
+                if (matching++ >= (cursor?.offset ?: 0) && resume == null) {
+                    if (sink(M3LineageEdge(source, M3SurfaceId(record.target)))) delivered++ else resume = matching - 1
                 }
-                true
             }
-            if (!valid) return M3LineageRead.Refused(M3CompactCanonicalRefusal.CORRUPT)
+            true
+        }
+        if (!validLineage) return M3LineageRead.Refused(M3CompactCanonicalRefusal.CORRUPT)
+        if (matching > 0) {
             return M3LineageRead.Complete(delivered, resume?.let { M3LineageCursor(cut.rootHash, source, it) })
         }
         var tombstoned = false

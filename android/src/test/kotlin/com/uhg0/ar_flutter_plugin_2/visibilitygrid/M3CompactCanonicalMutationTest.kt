@@ -424,6 +424,9 @@ class M3CompactCanonicalMutationTest {
             val largePlan = (preparation(admitted) as M3CanonicalMutationPreparation.Prepared).mutation
             val largeIntent = flush(largeBase, largePlan, File(directory, "dirty-large-intent"))
             val large = stage(largeBase, largeIntent, File(directory, "dirty-large-generation"))
+            val phase = large.storageReceipt()
+            assertEquals(M3CanonicalCowGeneration.phasePeakBytes(large.root.manifest.size), phase.phasePeakBytes)
+            assertTrue("maximum admitted dirty phase=$phase", phase.phasePeakBytes <= 1_048_576L)
             fun receipt(base: TestView, generation: M3CanonicalCowGeneration): M3CowReadWork {
                 val before = generation.readWorkReceipt()
                 assertEquals(M3SurfaceId(1), generation.overlay(base).findByVoxel(lookupVoxel)?.id)
@@ -436,6 +439,53 @@ class M3CompactCanonicalMutationTest {
             assertEquals(smallWork, largeWork)
             assertEquals(4, largeWork.pages)
             assertTrue(largeWork.records <= 2_200)
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test
+    fun `non-adjacent lineage records do not shadow untouched base identity`() {
+        val directory = Files.createTempDirectory("m3-cow-lineage-membership").toFile()
+        try {
+            val base = view(
+                "lineage-membership",
+                (1L..4L).map { row(it, M3Voxel(it.toInt(), 0, 0)) },
+                lineage = listOf(M3LineageEdge(M3SurfaceId(3), M3SurfaceId(99))),
+            )
+            val command = M3CanonicalTransactionCommand(
+                "merge-non-adjacent", M3CanonicalOperation.MERGE, 0, 0,
+                listOf(M3SurfaceId(2), M3SurfaceId(4)), listOf(target(null, M3Voxel(20, 0, 0))),
+            )
+            val generation = stage(base, intent(base, command, File(directory, "intent")), File(directory, "generation"))
+            val actual = mutableListOf<M3LineageEdge>()
+            val read = generation.overlay(base).visitLineage(M3SurfaceId(3), null) { actual += it; true }
+            assertTrue(read is M3LineageRead.Complete)
+            assertEquals(listOf(M3LineageEdge(M3SurfaceId(3), M3SurfaceId(99))), actual)
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test
+    fun `same-root support cursor rejects malformed candidate ordinal and matching offset`() {
+        val directory = Files.createTempDirectory("m3-cow-support-cursor").toFile()
+        try {
+            val base = view("support-cursor", emptyList())
+            val generation = stage(
+                base,
+                intent(base, M3FeatureMutationCommand("support-cursor", 0, 0, target(null, M3Voxel(0, 0, 0))), File(directory, "intent")),
+                File(directory, "generation"),
+            )
+            val overlay = generation.overlay(base)
+            val target = M3SurfaceId(1)
+            val stopped = overlay.visitSourceSupport(target, null) { false } as M3SourceSupportRead.Complete
+            val valid = requireNotNull(stopped.nextCursor)
+            fun refusal(cursor: M3SourceSupportCursor) = overlay.visitSourceSupport(target, cursor) { true } as M3SourceSupportRead.Refused
+            assertEquals(M3CompactCanonicalRefusal.STALE_CURSOR, refusal(valid.copy(ordinal = Int.MAX_VALUE)).reason)
+            assertEquals(M3CompactCanonicalRefusal.STALE_CURSOR, refusal(valid.copy(ordinal = -1)).reason)
+            assertEquals(M3CompactCanonicalRefusal.STALE_CURSOR, refusal(valid.copy(offset = -1)).reason)
+            assertEquals(M3CompactCanonicalRefusal.STALE_CURSOR, refusal(valid.copy(offset = 2)).reason)
+            val delivered = mutableListOf<Long>()
+            val resumed = overlay.visitSourceSupport(target, valid) { delivered += it.source.id.value; true }
+            assertTrue(resumed is M3SourceSupportRead.Complete)
+            assertEquals(listOf(1L), delivered)
         } finally { directory.deleteRecursively() }
     }
 

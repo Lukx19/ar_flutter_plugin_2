@@ -27,16 +27,14 @@ internal class M3CanonicalMutableStore private constructor(
         val identity = (intent.identity() as? M3PreparedIntentIdentityResult.Complete)?.identity
             ?: return refused(M3CanonicalCowRefusal.INVALID_INTENT)
         if (identity.sourceCut != baseView.cut) return refused(M3CanonicalCowRefusal.STALE_BASE)
-        val preflight = M3CowStreamingWriter.dryRun(intent, baseView)
+        // Collapse dry-run metadata to scalars in this expression scope. Its
+        // manifest graph is unreachable before the real writer constructs one.
+        val preflight = M3CowStreamingWriter.dryRun(intent, baseView)?.let { M3CowPreflight.from(identity, it) }
             ?: return refused(M3CanonicalCowRefusal.INVALID_INTENT)
-        if (preflight.phasePeakBytes > M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES || preflight.entries.sumOf { it.encodedBytes() } > M3CanonicalCowGeneration.DIRECTORY_LIMIT_BYTES)
+        if (preflight.phasePeakBytes > M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES ||
+            preflight.directoryFileBytes > M3CanonicalCowGeneration.DIRECTORY_LIMIT_BYTES ||
+            preflight.rootFileBytes > M3CanonicalCowGeneration.DIRECTORY_LIMIT_BYTES)
             return refused(M3CanonicalCowRefusal.PHASE_OR_DIRECTORY_LIMIT)
-        val placeholderRoot = M3MutableSemanticRoot(
-            identity.sourceCut, identity.commandId, identity.kind, identity.commandHash, identity.commandFingerprint,
-            identity.targetHighWater, identity.targetLive, identity.targetSource, identity.targetSupport,
-            identity.targetLineage, identity.targetGeometry, identity.targetLineageRevision,
-            preflight.current, preflight.entries,
-        )
         val target = commandDirectory(identity)
         val deterministicStaging = File(parent, ".${target.name}.staging")
         try { budget.reconcileCandidate(target) } catch (_: Exception) {
@@ -61,8 +59,8 @@ internal class M3CanonicalMutableStore private constructor(
             preflight.pageCounts.forEach { (kind, pages) -> if (pages > 0) files[kind.file] = pages.toLong() * M3CanonicalCowGeneration.PAGE_BYTES }
             files.putAll(preflight.temporaryFiles)
             files[M3CanonicalCowGeneration.CURRENT_UNACKED_FILE] = preflight.current.length
-            files["root.m3cow"] = placeholderRoot.encodedBytes()
-            files["directory.m3cow"] = M3CowDirectoryEntry.encodedFileBytes(preflight.entries)
+            files["root.m3cow"] = preflight.rootFileBytes
+            files["directory.m3cow"] = preflight.directoryFileBytes
             val unit = budget.allocationUnitBytes(parent)
             // Candidate files plus staging/target directory entries, reservation
             // ledger replacement, and rollback/coexistence metadata.
@@ -174,6 +172,34 @@ private data class M3CowWriteReceipt(
     val pageCounts: Map<M3CowFragmentKind, Int>, val temporaryFiles: Map<String, Long>, val phasePeakBytes: Long,
 )
 
+private data class M3CowPreflight(
+    val current: M3PreparedIntentCurrentReceipt,
+    val pageCounts: Map<M3CowFragmentKind, Int>,
+    val temporaryFiles: Map<String, Long>,
+    val phasePeakBytes: Long,
+    val directoryFileBytes: Long,
+    val rootFileBytes: Long,
+) {
+    companion object {
+        fun from(identity: M3PreparedIntentIdentity, receipt: M3CowWriteReceipt): M3CowPreflight {
+            val root = M3MutableSemanticRoot(
+                identity.sourceCut, identity.commandId, identity.kind, identity.commandHash, identity.commandFingerprint,
+                identity.targetHighWater, identity.targetLive, identity.targetSource, identity.targetSupport,
+                identity.targetLineage, identity.targetGeometry, identity.targetLineageRevision,
+                receipt.current, receipt.entries,
+            )
+            return M3CowPreflight(
+                receipt.current,
+                receipt.pageCounts,
+                receipt.temporaryFiles,
+                receipt.phasePeakBytes,
+                M3CowDirectoryEntry.encodedFileBytes(receipt.entries),
+                root.encodedBytes(),
+            )
+        }
+    }
+}
+
 /** Uses only #121's scalar callbacks.  A fragment page is the largest retained write state. */
 private class M3CowStreamingWriter private constructor(private val directory: File?, private val base: M3CanonicalStateView, private val fault: M3CanonicalCowFault?) : M3PreparedIntentVisitor {
     private val writers: Map<M3CowFragmentKind, M3CowRecordWriter> = M3CowFragmentKind.entries.associateWith { kind ->
@@ -237,8 +263,13 @@ private class M3CowStreamingWriter private constructor(private val directory: Fi
             }
             entries += written
         }
-        val directoryObjects = 64L + entries.size * 128L
-        return M3CowWriteReceipt(entries, current, writers.mapValues { it.value.pages }, writers.values.flatMap { it.temporaryFiles().entries }.associate { it.toPair() }, M3CanonicalCowGeneration.FIXED_PHASE_BYTES + M3CowSortedPageWriter.SORT_SCRATCH_BYTES + directoryObjects)
+        return M3CowWriteReceipt(
+            entries,
+            current,
+            writers.mapValues { it.value.pages },
+            writers.values.flatMap { it.temporaryFiles().entries }.associate { it.toPair() },
+            M3CanonicalCowGeneration.phasePeakBytes(entries.size),
+        )
     }
     companion object {
         fun dryRun(intent: M3PreparedIntent, base: M3CanonicalStateView): M3CowWriteReceipt? { val writer = M3CowStreamingWriter(null, base, null); return if (intent.visit(writer) is M3PreparedIntentVisitResult.Complete) writer.finish() else null }
@@ -393,7 +424,6 @@ private class M3CowSortedPageWriter(
     }
     private fun bucket(bytes: ByteArray, byteIndex: Int): Int =
         (bytes[byteIndex].toInt() and 0xff) xor if (byteIndex == 8 || byteIndex == 12 || byteIndex == 16) 0x80 else 0
-    companion object { const val SORT_SCRATCH_BYTES = 16_384L }
 }
 
 private fun M3MutableSemanticRoot.matches(identity: M3PreparedIntentIdentity, current: M3PreparedIntentCurrentReceipt) =
