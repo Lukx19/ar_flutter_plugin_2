@@ -38,6 +38,8 @@ internal interface M3PreparedIntentVisitor {
 
 internal data class M3PreparedIntentIdentity(
     val sourceCut: M3CompactCanonicalCut,
+    val commandId: String,
+    val kind: M3PreparedMutationKind,
     val commandHash: M3CanonicalReceiptBytes,
     val commandFingerprint: M3CanonicalReceiptBytes,
     val targetHighWater: Long,
@@ -51,8 +53,8 @@ internal data class M3PreparedIntentIdentity(
     val expectedCurrentReceipt: M3PreparedIntentCurrentReceipt,
 ) {
     companion object {
-        fun from(header: M3DirtyIntentHeader) = M3PreparedIntentIdentity(
-            header.sourceCut, header.commandHash, header.commandFingerprint, header.targetHighWater,
+        fun from(header: M3DirtyIntentHeader, commandId: String, kind: M3PreparedMutationKind) = M3PreparedIntentIdentity(
+            header.sourceCut, commandId, kind, header.commandHash, header.commandFingerprint, header.targetHighWater,
             header.targetLive, header.targetSource, header.targetSupport, header.targetLineage,
             header.targetGeometry, header.targetLineageRevision,
             M3PreparedIntentWalReceipt(header.walLength, header.walHash),
@@ -98,8 +100,6 @@ internal class M3PreparedIntentStreamingVisitor(
     fun visit(visitor: M3PreparedIntentVisitor): M3PreparedIntentVisitResult {
         if (isClosed()) return refused(M3PreparedIntentVisitRefusal.CLOSED)
         val header = try { M3DirtyIntentHeader.read(file) } catch (_: Exception) { return refused(M3PreparedIntentVisitRefusal.CORRUPT_INTENT) }
-        val identity = M3PreparedIntentIdentity.from(header)
-        if (!call { visitor.onHeader(identity) }) return stoppedOrClosed()
         return try {
             FileInputStream(file).use { raw ->
                 DataInputStream(BufferedInputStream(M3BoundedInputStream(raw, header.walOffset, header.walLength), M3PreparedIntentVisitorResources.STREAMING_SCRATCH_BYTES)).use { input ->
@@ -110,8 +110,10 @@ internal class M3PreparedIntentStreamingVisitor(
                     val bodyVersion = input.readInt(); require(bodyVersion in LEGACY_BODY_VERSION..BODY_VERSION)
                     output.writeInt(CURRENT_MAGIC); output.writeInt(bodyVersion)
                     copyHash(input, output, header.sourceCut.rootHash)
-                    val command = input.readUTF(); require(command.isNotBlank() && modifiedUtf8Length(command) <= 256); output.writeUTF(command)
-                    val kind = input.readInt(); require(kind in M3PreparedMutationKind.entries.indices); output.writeInt(kind)
+                    val command = readCommand(input); output.writeUTF(command)
+                    val kindOrdinal = input.readInt(); require(kindOrdinal in M3PreparedMutationKind.entries.indices); output.writeInt(kindOrdinal)
+                    val kind = M3PreparedMutationKind.entries[kindOrdinal]
+                    val identity = M3PreparedIntentIdentity.from(header, command, kind)
                     copyHash(input, output, header.commandHash); copyHash(input, output, header.commandFingerprint)
                     require(input.readLong().also(output::writeLong) == header.targetHighWater)
                     require(input.readInt().also(output::writeInt) == header.targetLive)
@@ -120,6 +122,7 @@ internal class M3PreparedIntentStreamingVisitor(
                     require(input.readInt().also(output::writeInt) == header.targetLineage)
                     require(input.readLong().also(output::writeLong) == header.targetGeometry)
                     require(input.readLong().also(output::writeLong) == header.targetLineageRevision)
+                    if (!call { visitor.onHeader(identity) }) return stoppedOrClosed()
                     val rows = count(input, output, 100_000)
                     var previousRow = 0L
                     var newRows = 0
@@ -137,7 +140,7 @@ internal class M3PreparedIntentStreamingVisitor(
                         if (!call { visitor.onRemovedId(id) }) return stoppedOrClosed()
                     }
                     val removedSupports = if (bodyVersion >= BODY_VERSION) count(input, output, 300_000) else {
-                        if (M3PreparedMutationKind.entries[kind] !in LEGACY_DERIVABLE_KINDS)
+                        if (kind !in LEGACY_DERIVABLE_KINDS)
                             return refused(M3PreparedIntentVisitRefusal.UNVERIFIABLE_LEGACY_STRUCTURAL_CARDINALITY)
                         0
                     }
@@ -183,14 +186,14 @@ internal class M3PreparedIntentStreamingVisitor(
         }
     }
 
-    private fun validCardinality(kind: Int, header: M3DirtyIntentHeader, rows: Int, removed: Int, removedSupports: Int, supports: Int, sources: Int, lineage: Int): Boolean {
+    private fun validCardinality(kind: M3PreparedMutationKind, header: M3DirtyIntentHeader, rows: Int, removed: Int, removedSupports: Int, supports: Int, sources: Int, lineage: Int): Boolean {
         if (header.targetSource != header.sourceCut.sourceCount + sources) return false
         if (header.targetLive !in (header.sourceCut.liveSurfaceCount - removed)..(header.sourceCut.liveSurfaceCount - removed + rows)) return false
         val expectedSupport = try {
             Math.addExact(Math.subtractExact(header.sourceCut.supportCount.toLong(), removedSupports.toLong()), supports.toLong())
         } catch (_: ArithmeticException) { return false }
         if (expectedSupport != header.targetSupport.toLong()) return false
-        return when (M3PreparedMutationKind.entries[kind]) {
+        return when (kind) {
             M3PreparedMutationKind.FEATURE_ADD -> rows == 1 && removed == 0 && supports == 1 && sources == 1 && lineage == 0 && header.targetLive == header.sourceCut.liveSurfaceCount + 1 && header.targetSupport == header.sourceCut.supportCount + 1 && header.targetLineage == header.sourceCut.lineageCount
             M3PreparedMutationKind.FEATURE_REFINE -> rows == 1 && removed == 0 && supports == 0 && sources == 0 && lineage == 0 && header.targetLive == header.sourceCut.liveSurfaceCount && header.targetSupport == header.sourceCut.supportCount && header.targetLineage == header.sourceCut.lineageCount
             M3PreparedMutationKind.CREATE -> header.sourceCut.liveSurfaceCount == 0 && header.sourceCut.sourceCount == 0 && header.sourceCut.supportCount == 0 && header.sourceCut.lineageCount == 0 && removed == 0 && rows > 0 && supports == rows && sources == rows && lineage == 0 && header.targetLive == rows && header.targetSupport == rows && header.targetLineage == 0
@@ -199,6 +202,15 @@ internal class M3PreparedIntentStreamingVisitor(
     }
 
     private fun count(input: DataInputStream, output: java.io.DataOutputStream, limit: Int): Int = input.readInt().also { require(it in 0..limit); output.writeInt(it) }
+    private fun readCommand(input: DataInputStream): String {
+        input.mark(2)
+        val encodedBytes = input.readUnsignedShort()
+        require(encodedBytes in 1..MAX_COMMAND_BYTES && input.markSupported())
+        input.reset()
+        return input.readUTF().also { command ->
+            require(command.isNotBlank() && modifiedUtf8Length(command) == encodedBytes.toLong())
+        }
+    }
     private fun copyHash(input: DataInputStream, output: java.io.DataOutputStream, expected: M3CanonicalReceiptBytes) {
         val first = input.readLong(); val second = input.readLong(); val third = input.readLong(); val fourth = input.readLong()
         require(expected.matchesWords(first, second, third, fourth))
@@ -223,6 +235,7 @@ internal class M3PreparedIntentStreamingVisitor(
         const val CURRENT_MAGIC = 0x4d334350
         const val LEGACY_BODY_VERSION = 1
         const val BODY_VERSION = 2
+        const val MAX_COMMAND_BYTES = 256
         const val UINT32_END = 0x1_0000_0000L
         val LEGACY_DERIVABLE_KINDS = setOf(
             M3PreparedMutationKind.FEATURE_ADD,

@@ -91,6 +91,8 @@ class M3PreparedIntentVisitorTest {
         structuralFault("header-profile") { it.rewriteHeader { header ->
             header.copy(sourceCut = header.sourceCut.copy(profile = "invalid-profile"))
         } }
+        structuralFault("blank-command-id") { it.rewriteCommand("     ") }
+        structuralFault("oversized-command-id") { it.rewriteCommand("a".repeat(257)) }
         structuralFault("declared-count") { it.rewriteHeader { header -> header.copy(targetLive = 100_001) } }
         structuralFault("target-support-cardinality") { it.rewriteTargetSupport(it.headerTargetSupport + 1) }
         structuralFault("wal-capacity") { it.putWalInt(it.layout.rowCount, 100_001) }
@@ -138,6 +140,8 @@ class M3PreparedIntentVisitorTest {
                 val result = prepared.visit(visitor) as M3PreparedIntentVisitResult.Complete
                 assertEquals(plan.kind.name, expected, visitor.snapshot())
                 assertEquals(plan.kind.name, expected.identity, result.identity)
+                assertEquals(plan.kind.name, plan.commandId, result.identity.commandId)
+                assertEquals(plan.kind.name, plan.kind, result.identity.kind)
                 assertEquals(plan.kind.name, expected.terminal, result.currentReceipt)
             } finally { directory.deleteRecursively() }
         }
@@ -156,6 +160,31 @@ class M3PreparedIntentVisitorTest {
             val after = (prepared.identity() as M3PreparedIntentIdentityResult.Complete).identity
             assertEquals(changedHash, after.sourceCut.sourceHash)
             assertTrue(before.sourceCut.sourceHash != after.sourceCut.sourceHash)
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test
+    fun `rechecksummed structural ordinal substitution changes the observed durable kind`() {
+        val directory = Files.createTempDirectory("m3-intent-kind-substitution-").toFile()
+        try {
+            val row = scenarioSurface(1, 0)
+            val source = scenarioSource(1, 0)
+            val active = scenarioView(
+                "kind-substitution", listOf(row), high = 2, sources = listOf(source),
+                supports = mapOf(1L to listOf(source)),
+            )
+            val plan = prepare(active, scenarioCommand(
+                "kind-substitution", M3CanonicalOperation.RELOCATION, 0, 0,
+                listOf(M3SurfaceId(1)), scenarioTarget(10, M3SurfaceId(1)),
+            ))
+            val prepared = intent(directory, active, plan)
+            val before = (prepared.identity() as M3PreparedIntentIdentityResult.Complete).identity
+            assertEquals(M3PreparedMutationKind.RELOCATION, before.kind)
+            RechecksummedIntentFixture(prepared).rewriteKind(M3PreparedMutationKind.REPLACEMENT)
+            val after = (prepared.identity() as M3PreparedIntentIdentityResult.Complete).identity
+            assertEquals("kind-substitution", after.commandId)
+            assertEquals(M3PreparedMutationKind.REPLACEMENT, after.kind)
+            assertTrue(before != after)
         } finally { directory.deleteRecursively() }
     }
 
@@ -326,7 +355,7 @@ class M3PreparedIntentVisitorTest {
                 val wal = ByteArrayOutputStream().also(plan::writeWalTo).toByteArray()
                 val current = ByteArrayOutputStream().also(plan::writeCurrentTo).toByteArray()
                 val identity = M3PreparedIntentIdentity(
-                    plan.sourceCut, plan.commandHash, plan.commandFingerprint, plan.targetHighWater,
+                    plan.sourceCut, plan.commandId, plan.kind, plan.commandHash, plan.commandFingerprint, plan.targetHighWater,
                     plan.targetLiveSurfaceCount, plan.targetSourceCount, plan.targetSupportCount,
                     plan.targetLineageCount, plan.targetGeometryRevision, plan.targetLineageRevision,
                     M3PreparedIntentWalReceipt(wal.size.toLong(), M3CanonicalReceiptBytes(digest(wal))),
@@ -467,6 +496,44 @@ class M3PreparedIntentVisitorTest {
             )
         }
 
+        fun rewriteKind(changedKind: M3PreparedMutationKind) {
+            val changed = wal.copyOf()
+            ByteBuffer.wrap(changed).putInt(layout.kind, changedKind.ordinal)
+            val current = currentFrom(changed)
+            rewrite(
+                header.copy(
+                    walHash = M3CanonicalReceiptBytes(digest(changed)),
+                    currentHash = M3CanonicalReceiptBytes(digest(current)),
+                    walOffset = 0,
+                ),
+                changed,
+            )
+        }
+
+        fun rewriteCommand(changedCommand: String) {
+            val encoded = ByteArrayOutputStream().also { bytes ->
+                DataOutputStream(bytes).use { it.writeUTF(changedCommand) }
+            }.toByteArray()
+            val commandOffset = 8 + 32
+            val originalBytes = 2 + (ByteBuffer.wrap(wal).getShort(commandOffset).toInt() and 0xffff)
+            val changed = ByteArrayOutputStream().also { output ->
+                output.write(wal, 0, commandOffset)
+                output.write(encoded)
+                output.write(wal, commandOffset + originalBytes, wal.size - commandOffset - originalBytes)
+            }.toByteArray()
+            val current = currentFrom(changed)
+            rewrite(
+                header.copy(
+                    walLength = changed.size.toLong(),
+                    walHash = M3CanonicalReceiptBytes(digest(changed)),
+                    currentLength = current.size.toLong(),
+                    currentHash = M3CanonicalReceiptBytes(digest(current)),
+                    walOffset = 0,
+                ),
+                changed,
+            )
+        }
+
         fun downgradeBodyToLegacyV1() {
             val positions = layout
             require(ByteBuffer.wrap(wal).getInt(4) == 2)
@@ -507,6 +574,7 @@ class M3PreparedIntentVisitorTest {
         }
 
         data class WalLayout(
+            val kind: Int,
             val targetSupport: Int,
             val rowCount: Int,
             val rowStart: Int,
@@ -518,6 +586,7 @@ class M3PreparedIntentVisitorTest {
                     var cursor = 8 + 32
                     val commandBytes = buffer.getShort(cursor).toInt() and 0xffff
                     cursor += 2 + commandBytes
+                    val kind = cursor
                     val targetSupport = cursor + 4 + 32 + 32 + 8 + 4 + 4
                     cursor += 4 + 32 + 32 + 8 + (4 * 4) + 8 + 8
                     val rowCount = cursor
@@ -525,7 +594,7 @@ class M3PreparedIntentVisitorTest {
                     val rowStart = rowCount + 4
                     val removedCount = rowStart + rows * ROW_BYTES
                     val removed = buffer.getInt(removedCount)
-                    return WalLayout(targetSupport, rowCount, rowStart, removedCount + 4 + removed * 8)
+                    return WalLayout(kind, targetSupport, rowCount, rowStart, removedCount + 4 + removed * 8)
                 }
             }
         }
