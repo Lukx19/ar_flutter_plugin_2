@@ -25,12 +25,14 @@ class StorageBudgetCoordinatorV2(
     private val files = SafeFilesystemV2(directory, DurableStoreFaultInjectorV2 { }, filesystemBackend)
     private val ledger = files.child("ledger-v2")
     private val reservationsDirectory = files.child("reservations-v2")
+    private val reclaimsDirectory = files.child("reclaims-v2")
     private var committed = 0L
     private val reservations = linkedMapOf<String, StorageBudgetReservationV2>()
 
     init {
         try {
             files.ensureDirectory(reservationsDirectory)
+            files.ensureDirectory(reclaimsDirectory)
         } catch (error: Throwable) { files.close(); throw error }
     }
 
@@ -198,6 +200,28 @@ class StorageBudgetCoordinatorV2(
         persistLedgerLocked()
     }
 
+    /**
+     * Deletes one exact committed M3 private generation before releasing its charge. A durable
+     * marker lets recovery finish either half without ever exposing an uncharged tree.
+     */
+    fun reclaimCommittedCandidate(candidate: File): Long = withAuthority {
+        require(candidate.parentFile == ledger.parentFile && candidate.name.matches(COMMITTED_M3_CANDIDATE))
+        val actual = files.allocatedTreeBytes(candidate)
+        require(actual in 1..committed)
+        val previous = committed
+        val marker = reclaimFile(candidate.name)
+        files.atomicReplace(
+            marker,
+            "${candidate.name}\n$actual\n$previous\n".toByteArray(),
+            DurableStoreFaultPointV2.POINTER_SLOT_REPLACE,
+        )
+        files.deleteTree(candidate, DurableStoreFaultPointV2.DELETE_RECLAIM)
+        committed = previous - actual
+        persistLedgerLocked()
+        files.delete(marker, DurableStoreFaultPointV2.DELETE_RECLAIM)
+        actual
+    }
+
     fun reservation(token: String): StorageBudgetReservationV2? = withAuthority { reservations[token] }
     fun committedBytes(): Long = withAuthority { committed }
     fun reservedBytes(): Long = withAuthority { reservedBytesLocked() }
@@ -221,6 +245,30 @@ class StorageBudgetCoordinatorV2(
         committed = if (files.isFile(ledger)) files.readBytes(ledger).toString(Charsets.UTF_8).trim().toLongOrNull()
             ?: error("Corrupt storage budget ledger") else 0L
         require(committed >= 0) { "Corrupt storage budget ledger" }
+        files.list(reclaimsDirectory)
+            .filter { it.name.matches(Regex("[0-9a-f]{64}\\.reclaim")) }
+            .sortedBy(File::getName)
+            .forEach { marker ->
+                val lines = files.readLines(marker)
+                require(lines.size == 3 && lines[0].matches(COMMITTED_M3_CANDIDATE)) { "Corrupt committed reclaim" }
+                val bytes = lines[1].toLongOrNull() ?: error("Corrupt committed reclaim bytes")
+                val previous = lines[2].toLongOrNull() ?: error("Corrupt committed reclaim revision")
+                require(bytes > 0 && previous >= bytes && committed in setOf(previous, previous - bytes))
+                val candidate = files.child(lines[0])
+                if (files.isDirectory(candidate)) {
+                    require(committed == previous) { "Committed reclaim target reappeared after ledger release" }
+                    require(files.allocatedTreeBytes(candidate) == bytes)
+                    files.deleteTree(candidate, DurableStoreFaultPointV2.DELETE_RECLAIM)
+                }
+                if (committed == previous) {
+                    committed = previous - bytes
+                    persistLedgerLocked()
+                }
+                files.delete(marker, DurableStoreFaultPointV2.DELETE_RECLAIM)
+            }
+        files.list(reclaimsDirectory)
+            .filter { it.name.matches(Regex("\\.[0-9a-f]{64}\\.reclaim\\.part")) }
+            .forEach { files.delete(it, DurableStoreFaultPointV2.DELETE_RECLAIM) }
         reservations.clear()
         val metadata = files.list(reservationsDirectory).filter { it.name.matches(Regex("[0-9a-f]{64}\\.reservation")) }
         metadata.sortedBy(File::getName).forEach { file ->
@@ -310,12 +358,17 @@ class StorageBudgetCoordinatorV2(
     private fun persistLedgerLocked() = files.atomicReplace(ledger, "$committed\n".toByteArray(), DurableStoreFaultPointV2.POINTER_SLOT_REPLACE)
     private fun metadataFile(token: String) = files.child("reservations-v2", "$token.reservation")
     private fun allocationFile(token: String) = files.child("reservations-v2", "$token.allocation")
+    private fun reclaimFile(candidateName: String) = files.child(
+        "reclaims-v2",
+        "${sha256(candidateName.toByteArray()).hex()}.reclaim",
+    )
     private fun sha256(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes)
     private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
 
     companion object {
         private val OWNER = Regex("[A-Za-z0-9._:-]{1,160}")
         private val CANDIDATE = Regex("[A-Za-z0-9._-]{1,160}")
+        private val COMMITTED_M3_CANDIDATE = Regex("m3-cow-command-[0-9a-f]{64}")
         /** Exact private-candidate namespaces whose uncharged trees startup recovery may delete. */
         private val STAGING = Regex(
             "(?:m3-canonical-v6-[0-9a-f]{64}\\.staging-[A-Za-z0-9._-]{1,64}|" +

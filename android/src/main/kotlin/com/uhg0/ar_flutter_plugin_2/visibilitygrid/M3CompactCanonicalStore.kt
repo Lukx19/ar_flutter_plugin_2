@@ -298,6 +298,13 @@ internal interface M3CanonicalStorageBudget {
 
     fun release(token: Any)
 
+    /** Durably removes one previously committed private candidate and its exact charge. */
+    fun reclaimCommittedCandidate(candidate: File): Long {
+        val actual = allocatedBytes(candidate)
+        require(actual > 0L && candidate.deleteRecursively())
+        return actual
+    }
+
     fun allocatedBytes(path: File): Long = m3PhysicalAllocatedTreeBytes(path, allocationUnitBytes(path))
 
     fun allocationUnitBytes(path: File): Long {
@@ -343,6 +350,9 @@ internal class M3CoordinatorStorageBudget(private val coordinator: StorageBudget
     override fun release(token: Any) {
         coordinator.release(token as StorageBudgetReservationV2)
     }
+
+    override fun reclaimCommittedCandidate(candidate: File) =
+        coordinator.reclaimCommittedCandidate(candidate)
 
     override fun allocatedBytes(path: File) = coordinator.physicallyAllocatedTreeBytes(path)
 

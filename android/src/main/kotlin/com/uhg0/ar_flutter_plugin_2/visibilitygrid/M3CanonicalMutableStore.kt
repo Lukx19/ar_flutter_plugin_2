@@ -123,6 +123,31 @@ internal class M3CanonicalMutableStore private constructor(
         }
     }
 
+    /** #123's private publication seam. The immutable v6 generation remains separate. */
+    @Synchronized
+    fun publish(
+        generation: M3CanonicalCowGeneration,
+        generationZero: M3CanonicalStateView,
+        fault: M3CanonicalSelectorFault? = null,
+    ): M3CanonicalPublishResult {
+        if (closed) return M3CanonicalPublishResult.Refused(M3CanonicalSelectorRefusal.CLOSED)
+        return M3PrivateRootSelector(parent, budget).publish(generation, generationZero, fault)
+    }
+
+    /** Reopens exactly the selected private cut, or generation zero only if no selector exists. */
+    @Synchronized
+    fun reopen(generationZero: M3CanonicalStateView): M3CanonicalReopenResult {
+        if (closed) return M3CanonicalReopenResult.Refused(M3CanonicalSelectorRefusal.CLOSED)
+        return M3PrivateRootSelector(parent, budget).reopen(generationZero)
+    }
+
+    /** Process-recovery lookup; changed bytes under one command identity fail closed. */
+    @Synchronized
+    fun lookupCommit(query: M3CanonicalCommitQuery, generationZero: M3CanonicalStateView): M3CanonicalCommitLookup {
+        if (closed) return M3CanonicalCommitLookup.Refused(M3CanonicalSelectorRefusal.CLOSED)
+        return M3PrivateRootSelector(parent, budget).lookup(query, generationZero)
+    }
+
     @Synchronized
     override fun close() { closed = true }
     private fun refused(reason: M3CanonicalCowRefusal) = M3CanonicalCowStageResult.Refused(reason, M3CowStorageReceipt(0, 0, M3CanonicalCowGeneration.FIXED_PHASE_BYTES))
