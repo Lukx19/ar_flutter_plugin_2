@@ -253,6 +253,24 @@ internal enum class M3CompactCanonicalMigrationFault {
 internal interface M3CanonicalStorageBudget {
     fun reserve(bytes: Long): Any?
 
+    fun reservePointerPublication(
+        publicationId: String,
+        slot: Int,
+        rootBeforeBytes: Long,
+        slotBeforeBytes: Long,
+        selectorBeforeBytes: Long,
+        commitBytes: Long,
+        maximumPhysicalBytes: Long,
+    ): Any? = reserve(maximumPhysicalBytes)
+
+    fun pointerPublications(): List<M3CanonicalPointerReservation> = emptyList()
+
+    fun commitPointerPublication(reservation: M3CanonicalPointerReservation) =
+        commit(reservation.token, reservation.commitBytes)
+
+    fun releasePointerPublication(reservation: M3CanonicalPointerReservation) =
+        release(reservation.token)
+
     fun reserveCandidate(
         staging: File,
         target: File,
@@ -315,10 +333,52 @@ internal interface M3CanonicalStorageBudget {
     }
 }
 
+internal data class M3CanonicalPointerReservation(
+    val token: Any,
+    val publicationId: String,
+    val slot: Int,
+    val rootBeforeBytes: Long,
+    val slotBeforeBytes: Long,
+    val selectorBeforeBytes: Long,
+    val commitBytes: Long,
+)
+
 internal class M3CoordinatorStorageBudget(private val coordinator: StorageBudgetCoordinatorV2) :
     M3CanonicalStorageBudget {
     override fun reserve(bytes: Long): Any? =
         coordinator.reserve("m3:canonical:v6-migration", bytes)
+
+    override fun reservePointerPublication(
+        publicationId: String,
+        slot: Int,
+        rootBeforeBytes: Long,
+        slotBeforeBytes: Long,
+        selectorBeforeBytes: Long,
+        commitBytes: Long,
+        maximumPhysicalBytes: Long,
+    ): Any? = coordinator.reservePointerPublication(
+        "m3:canonical:selector", publicationId, slot, rootBeforeBytes, slotBeforeBytes,
+        selectorBeforeBytes, commitBytes, maximumPhysicalBytes,
+    )
+
+    override fun pointerPublications() = coordinator.pointerPublications().map { reservation ->
+        M3CanonicalPointerReservation(
+            reservation,
+            requireNotNull(reservation.pointerPublicationId),
+            requireNotNull(reservation.pointerSlot),
+            requireNotNull(reservation.pointerRootBeforeBytes),
+            requireNotNull(reservation.pointerSlotBeforeBytes),
+            requireNotNull(reservation.pointerSelectorBeforeBytes),
+            requireNotNull(reservation.pointerCommitBytes),
+        )
+    }
+
+    override fun commitPointerPublication(reservation: M3CanonicalPointerReservation) =
+        coordinator.commitPointerPublication(reservation.token as StorageBudgetReservationV2)
+
+    override fun releasePointerPublication(reservation: M3CanonicalPointerReservation) {
+        coordinator.release(reservation.token as StorageBudgetReservationV2)
+    }
 
     override fun reserveCandidate(
         staging: File,

@@ -9,6 +9,7 @@ import java.security.MessageDigest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -36,7 +37,10 @@ class M3CanonicalMutableStoreFaultTest {
 
     @Test
     fun `every selector cut reopens exactly old or new and post switch never reverts`() {
-        M3CanonicalSelectorFault.entries.forEach { fault ->
+        M3CanonicalSelectorFault.entries.filterNot {
+            it == M3CanonicalSelectorFault.PROCESS_CRASH_BEFORE_SELECTOR_SWITCH ||
+                it == M3CanonicalSelectorFault.PROCESS_CRASH_AFTER_SELECTOR_SWITCH
+        }.forEach { fault ->
             val directory = Files.createTempDirectory("m3-selector-${fault.name}").toFile()
             try {
                 val base = EmptyView("fault-${fault.name}")
@@ -234,6 +238,64 @@ class M3CanonicalMutableStoreFaultTest {
             reopened.commit.close(); reopenedStore.close(); reopenedCoordinator.close()
         } finally { directory.deleteRecursively() }
     }
+
+    @Test
+    fun `hard process crash reservation reopens old or new and reconciles idempotently`() {
+        listOf(
+            M3CanonicalSelectorFault.PROCESS_CRASH_BEFORE_SELECTOR_SWITCH to false,
+            M3CanonicalSelectorFault.PROCESS_CRASH_AFTER_SELECTOR_SWITCH to true,
+        ).forEach { (fault, selectedAfterCrash) ->
+            val directory = Files.createTempDirectory("m3-selector-hard-crash-${fault.name}").toFile()
+            try {
+                val parent = File(directory, "authority").also { assertTrue(it.mkdirs()) }
+                fun coordinator() = StorageBudgetCoordinatorV2(
+                    parent,
+                    StorageBudgetPolicyV2(64L * 1024 * 1024, 4_096L),
+                    JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L }),
+                    freeBytes = { 128L * 1024 * 1024 },
+                )
+                val base = EmptyView("hard-crash-${fault.name}")
+                val firstCoordinator = coordinator()
+                val firstStore = requireNotNull(M3CanonicalMutableStore.open(parent, M3CoordinatorStorageBudget(firstCoordinator)))
+                val firstGeneration = prepared(firstStore.stage(intent(base, "first", File(directory, "intent-first")), base)).generation
+                val firstCommit = (firstStore.publish(firstGeneration, base) as M3CanonicalPublishResult.Committed).commit
+                val oldRoot = firstCommit.view.cut.rootHash
+                val generation = prepared(firstStore.stage(intent(firstCommit.view, "hard-crash", File(directory, "intent")), firstCommit.view)).generation
+                val newRoot = generation.root.targetCut().rootHash
+                firstCommit.close()
+                assertThrows(M3CanonicalSimulatedProcessCrash::class.java) {
+                    firstStore.publish(generation, base, fault)
+                }
+                assertTrue(firstCoordinator.reservedBytes() > 0L)
+                firstCoordinator.close()
+
+                val reopenedCoordinator = coordinator()
+                val reopenedStore = requireNotNull(M3CanonicalMutableStore.open(parent, M3CoordinatorStorageBudget(reopenedCoordinator)))
+                val reopened = reopenedStore.reopen(base) as M3CanonicalReopenResult.Selected
+                assertEquals(if (selectedAfterCrash) 2 else 1, reopened.commit.view.cut.liveSurfaceCount)
+                assertEquals(if (selectedAfterCrash) newRoot else oldRoot, reopened.commit.view.cut.rootHash)
+                assertEquals(reopened.commit.receipt.selectedAuthorityBytes, reopenedCoordinator.committedBytes())
+                reopened.commit.close()
+                assertEquals(0L, reopenedCoordinator.reservedBytes())
+                assertEquals(reopenedCoordinator.committedBytes(), authorityPhysicalBytes(parent, reopenedCoordinator))
+                val committed = reopenedCoordinator.committedBytes()
+                val repeated = reopenedStore.reopen(base) as M3CanonicalReopenResult.Selected
+                assertEquals(if (selectedAfterCrash) newRoot else oldRoot, repeated.commit.view.cut.rootHash)
+                repeated.commit.close()
+                assertEquals(0L, reopenedCoordinator.reservedBytes())
+                assertEquals(committed, reopenedCoordinator.committedBytes())
+                assertEquals(committed, authorityPhysicalBytes(parent, reopenedCoordinator))
+                reopenedStore.close(); reopenedCoordinator.close()
+            } finally { directory.deleteRecursively() }
+        }
+    }
+
+    private fun authorityPhysicalBytes(parent: File, coordinator: StorageBudgetCoordinatorV2): Long =
+        parent.listFiles().orEmpty().filter { file ->
+            file.name.matches(Regex("m3-cow-command-[0-9a-f]{64}")) ||
+                file.name.matches(Regex("m3-selector-root-[0-9a-f]{64}\\.root")) ||
+                file.name in setOf("m3-root-selector", "m3-root-A.slot", "m3-root-B.slot")
+        }.sumOf(coordinator::physicallyAllocatedTreeBytes)
 
     private fun prepared(result: M3CanonicalCowStageResult) = result as M3CanonicalCowStageResult.Prepared
     private fun intent(base: M3CanonicalStateView, commandId: String, directory: File): M3PreparedIntent {

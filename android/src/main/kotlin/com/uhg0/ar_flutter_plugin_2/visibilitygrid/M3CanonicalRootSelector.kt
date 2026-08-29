@@ -24,6 +24,9 @@ internal class M3PrivateRootSelector(
 ) {
     init { require(maximumGenerations in 1..MAX_GENERATIONS) }
     fun reopen(generationZero: M3CanonicalStateView): M3CanonicalReopenResult = withParentLock {
+        try { recoverPointerPublications() } catch (_: Exception) {
+            return M3CanonicalReopenResult.Refused(M3CanonicalSelectorRefusal.DURABILITY_FAILURE)
+        }
         reopenLocked(generationZero, cleanupUnreachable = true)
     }
 
@@ -32,7 +35,10 @@ internal class M3PrivateRootSelector(
         cleanupUnreachable: Boolean,
     ): M3CanonicalReopenResult {
         val selectorFile = File(parent, SELECTOR_FILE)
-        if (!selectorFile.exists()) return M3CanonicalReopenResult.GenerationZero(generationZero)
+        if (!selectorFile.exists()) {
+            if (cleanupUnreachable) try { cleanup(emptyList()) } catch (_: Exception) { }
+            return M3CanonicalReopenResult.GenerationZero(generationZero)
+        }
         val selector = Selector.read(selectorFile)
             ?: return M3CanonicalReopenResult.Refused(M3CanonicalSelectorRefusal.CORRUPT_SELECTED_ROOT)
         val slot = Slot.read(File(parent, slotName(selector.slot)))
@@ -45,6 +51,9 @@ internal class M3PrivateRootSelector(
     }
 
     fun lookup(query: M3CanonicalCommitQuery, generationZero: M3CanonicalStateView): M3CanonicalCommitLookup = withParentLock {
+        try { recoverPointerPublications() } catch (_: Exception) {
+            return M3CanonicalCommitLookup.Refused(M3CanonicalSelectorRefusal.DURABILITY_FAILURE)
+        }
         val selected = reopenLocked(generationZero, cleanupUnreachable = true)
         if (selected is M3CanonicalReopenResult.Refused) return M3CanonicalCommitLookup.Refused(selected.reason)
         if (selected is M3CanonicalReopenResult.GenerationZero) return M3CanonicalCommitLookup.Absent
@@ -64,6 +73,9 @@ internal class M3PrivateRootSelector(
         generationZero: M3CanonicalStateView,
         fault: M3CanonicalSelectorFault?,
     ): M3CanonicalPublishResult = withParentLock {
+        try { recoverPointerPublications() } catch (_: Exception) {
+            return M3CanonicalPublishResult.Refused(M3CanonicalSelectorRefusal.DURABILITY_FAILURE)
+        }
         val generationIdentity = M3CowGenerationIdentity.from(generation.root)
         val reopened = reopenLocked(generationZero, cleanupUnreachable = false)
         if (reopened is M3CanonicalReopenResult.Refused) return M3CanonicalPublishResult.Refused(reopened.reason)
@@ -133,6 +145,9 @@ internal class M3PrivateRootSelector(
             Math.addExact(oldGenerationBytes, newGenerationBytes),
             Math.addExact(oldAuthorityBytes, Math.multiplyExact(reservationMaximum, 2L)),
         )
+        val commitBytes = Math.max(0L, round(rootBytes.size.toLong(), unit) - rootBefore) +
+            Math.max(0L, round(Slot.BYTES.toLong(), unit) - slotBefore) +
+            Math.max(0L, round(Selector.BYTES.toLong(), unit) - selectorBefore)
         val receipt = M3CanonicalPublicationReceipt(
             pointerBytes = rootBytes.size.toLong() + Slot.BYTES + Selector.BYTES,
             hashOperations = 3,
@@ -149,7 +164,10 @@ internal class M3PrivateRootSelector(
         var selected: M3CanonicalPublishedCommit? = null
         try {
             inject(fault, M3CanonicalSelectorFault.BEFORE_RESERVATION)
-            token = budget.reserve(reservationMaximum) ?: run { prior?.close(); return M3CanonicalPublishResult.Refused(M3CanonicalSelectorRefusal.QUOTA_REFUSED) }
+            token = budget.reservePointerPublication(
+                rootHash.toByteArray().hex(), inactive, rootBefore, slotBefore, selectorBefore,
+                commitBytes, reservationMaximum,
+            ) ?: run { prior?.close(); return M3CanonicalPublishResult.Refused(M3CanonicalSelectorRefusal.QUOTA_REFUSED) }
             inject(fault, M3CanonicalSelectorFault.AFTER_RESERVATION)
             inject(fault, M3CanonicalSelectorFault.BEFORE_ROOT_OBJECT_WRITE)
             if (!rootTarget.exists()) writeImmutable(rootTarget, rootBytes, fault == M3CanonicalSelectorFault.DURING_ROOT_OBJECT_WRITE)
@@ -158,15 +176,18 @@ internal class M3PrivateRootSelector(
             inject(fault, M3CanonicalSelectorFault.BEFORE_INACTIVE_SLOT_WRITE)
             atomicReplace(slotTarget, slot.bytes(), fault == M3CanonicalSelectorFault.DURING_INACTIVE_SLOT_WRITE)
             inject(fault, M3CanonicalSelectorFault.AFTER_INACTIVE_SLOT_SYNC)
+            inject(fault, M3CanonicalSelectorFault.PROCESS_CRASH_BEFORE_SELECTOR_SWITCH)
             inject(fault, M3CanonicalSelectorFault.BEFORE_SELECTOR_SWITCH)
             atomicReplace(selectorTarget, selector.bytes(), fault == M3CanonicalSelectorFault.DURING_SELECTOR_WRITE)
             switched = true
             inject(fault, M3CanonicalSelectorFault.AFTER_SELECTOR_SWITCH)
+            inject(fault, M3CanonicalSelectorFault.PROCESS_CRASH_AFTER_SELECTOR_SWITCH)
             inject(fault, M3CanonicalSelectorFault.BEFORE_PARENT_SYNC)
             sync(parent)
             inject(fault, M3CanonicalSelectorFault.AFTER_PARENT_SYNC)
             val actual = incrementalBytes(rootTarget, rootBefore) + incrementalBytes(slotTarget, slotBefore) +
                 incrementalBytes(selectorTarget, selectorBefore)
+            require(actual == commitBytes)
             inject(fault, M3CanonicalSelectorFault.BEFORE_BUDGET_COMMIT)
             budget.commit(requireNotNull(token), actual); token = null
             inject(fault, M3CanonicalSelectorFault.AFTER_BUDGET_COMMIT)
@@ -195,7 +216,7 @@ internal class M3PrivateRootSelector(
             return if (switched) M3CanonicalPublishResult.UnknownAfterSwitch(receipt)
             else M3CanonicalPublishResult.Refused(M3CanonicalSelectorRefusal.DURABILITY_FAILURE)
         } finally {
-            token?.let { reservation ->
+            if (!fault.isProcessCrash()) token?.let { reservation ->
                 try {
                     if (switched) {
                         val actual = incrementalBytes(rootTarget, rootBefore) + incrementalBytes(slotTarget, slotBefore) +
@@ -209,6 +230,36 @@ internal class M3PrivateRootSelector(
                 } catch (_: Exception) { }
             }
             parent.listFiles().orEmpty().filter { it.name.endsWith(".part") }.forEach(File::delete)
+        }
+    }
+
+    private fun recoverPointerPublications() {
+        val selector = Selector.read(File(parent, SELECTOR_FILE))
+        val selectedId = selector?.let { value ->
+            Slot.read(File(parent, slotName(value.slot)))
+                ?.takeIf { it.revision == value.revision && it.rootHash == value.rootHash }
+                ?.let { value.rootHash.toByteArray().hex() }
+        }
+        budget.pointerPublications().forEach { reservation ->
+            val rootHash = receiptFromHex(reservation.publicationId)
+            val root = rootFile(rootHash)
+            val slot = File(parent, slotName(reservation.slot))
+            val selectorFile = File(parent, SELECTOR_FILE)
+            if (reservation.publicationId == selectedId) {
+                require(PublishedRoot.read(root, rootHash) != null)
+                val actual = incrementalBytes(root, reservation.rootBeforeBytes) +
+                    incrementalBytes(slot, reservation.slotBeforeBytes) +
+                    incrementalBytes(selectorFile, reservation.selectorBeforeBytes)
+                require(actual == reservation.commitBytes)
+                sync(parent)
+                budget.commitPointerPublication(reservation)
+            } else {
+                if (reservation.rootBeforeBytes == 0L && root.exists()) require(root.delete())
+                if (reservation.slotBeforeBytes == 0L && slot.exists() && selector?.slot != reservation.slot) require(slot.delete())
+                parent.listFiles().orEmpty().filter { it.name.endsWith(".part") }.forEach(File::delete)
+                sync(parent)
+                budget.releasePointerPublication(reservation)
+            }
         }
     }
 
@@ -298,13 +349,21 @@ internal class M3PrivateRootSelector(
         if (partial) error("injected selector write")
         Files.move(temporary.toPath(), file.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
     }
-    private fun inject(requested: M3CanonicalSelectorFault?, point: M3CanonicalSelectorFault) { if (requested == point) error("fault:$point") }
+    private fun inject(requested: M3CanonicalSelectorFault?, point: M3CanonicalSelectorFault) {
+        if (requested == point) {
+            if (point.isProcessCrash()) throw M3CanonicalSimulatedProcessCrash(point)
+            error("fault:$point")
+        }
+    }
     private fun rootFile(hash: M3CanonicalReceiptBytes) = File(parent, "m3-selector-root-${hash.toByteArray().hex()}.root")
     private fun incrementalBytes(file: File, before: Long) =
         Math.max(0L, (file.takeIf(File::exists)?.let(budget::allocatedBytes) ?: 0L) - before)
     private fun slotName(slot: Int) = if (slot == 0) SLOT_A else SLOT_B
     private fun rootHashFromName(name: String): M3CanonicalReceiptBytes? = name.removePrefix("m3-selector-root-").removeSuffix(".root")
         .takeIf { it.length == 64 }?.chunked(2)?.map { it.toIntOrNull(16)?.toByte() ?: return null }?.toByteArray()?.let(::M3CanonicalReceiptBytes)
+    private fun receiptFromHex(value: String) = M3CanonicalReceiptBytes(
+        value.chunked(2).map { it.toInt(16).toByte() }.toByteArray(),
+    )
 
     companion object {
         private const val SELECTOR_FILE = "m3-root-selector"
@@ -403,7 +462,12 @@ internal enum class M3CanonicalSelectorFault {
     BEFORE_INACTIVE_SLOT_WRITE, DURING_INACTIVE_SLOT_WRITE, AFTER_INACTIVE_SLOT_SYNC,
     BEFORE_SELECTOR_SWITCH, DURING_SELECTOR_WRITE, AFTER_SELECTOR_SWITCH,
     BEFORE_PARENT_SYNC, AFTER_PARENT_SYNC, BEFORE_BUDGET_COMMIT, AFTER_BUDGET_COMMIT, BEFORE_CLEANUP, AFTER_CLEANUP,
+    PROCESS_CRASH_BEFORE_SELECTOR_SWITCH, PROCESS_CRASH_AFTER_SELECTOR_SWITCH,
 }
+
+internal class M3CanonicalSimulatedProcessCrash(point: M3CanonicalSelectorFault) : Error("process-crash:$point")
+private fun M3CanonicalSelectorFault?.isProcessCrash() = this == M3CanonicalSelectorFault.PROCESS_CRASH_BEFORE_SELECTOR_SWITCH ||
+    this == M3CanonicalSelectorFault.PROCESS_CRASH_AFTER_SELECTOR_SWITCH
 
 internal data class PublishedRoot(
     val revision: Long,

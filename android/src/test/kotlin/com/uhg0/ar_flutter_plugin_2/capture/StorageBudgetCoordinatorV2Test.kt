@@ -76,6 +76,30 @@ class StorageBudgetCoordinatorV2Test {
         assertTrue(File(root, "reservations-v2").listFiles().orEmpty().isEmpty())
     }
 
+    @Test fun `pointer committing record completes exactly once across process reopen`() {
+        val root = directory(); val policy = StorageBudgetPolicyV2(1_000_000, 0)
+        val first = StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 10_000_000 }
+        val reservation = first.reservePointerPublication(
+            "m3:canonical:selector", "a".repeat(64), 1,
+            rootBeforeBytes = 0L, slotBeforeBytes = 4_096L, selectorBeforeBytes = 4_096L,
+            commitBytes = 4_096L, maximumPhysicalBytes = 32_768L,
+        )!!
+        val metadata = File(root, "reservations-v2/${reservation.token}.reservation")
+        metadata.appendText("COMMITTING:4096:0\n")
+        first.close()
+
+        StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 10_000_000 }.use { restarted ->
+            assertEquals(4_096L, restarted.committedBytes())
+            assertEquals(0L, restarted.reservedBytes())
+            assertTrue(!metadata.exists())
+            assertTrue(!File(root, "reservations-v2/${reservation.token}.allocation").exists())
+        }
+        StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 10_000_000 }.use { repeated ->
+            assertEquals(4_096L, repeated.committedBytes())
+            assertEquals(0L, repeated.reservedBytes())
+        }
+    }
+
     @Test fun `host and Android allocation seams report authoritative units`() {
         assertEquals(4_096L, androidPhysicalBytesFromStatBlocks(8))
         assertThrows(ArithmeticException::class.java) {
