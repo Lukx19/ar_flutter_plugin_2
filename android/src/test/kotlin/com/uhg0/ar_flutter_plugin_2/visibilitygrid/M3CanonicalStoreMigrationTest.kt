@@ -264,6 +264,7 @@ class M3CanonicalStoreMigrationTest {
                 assertEquals(1, prepared.cut.liveSurfaceCount)
                 assertEquals(M3SurfaceId(1), store.findById(M3SurfaceId(1))!!.id)
                 assertEquals(null, prepared.cut.seededEmptyBaseline)
+                assertGenuinePreparedIntentVisitor(store, directory, "migrated-small")
             } finally {
                 directory.deleteRecursively()
             }
@@ -297,6 +298,7 @@ class M3CanonicalStoreMigrationTest {
                 assertTrue(read.pageFaults in 0..1)
             }
             assertEquals(100_000, prepared.cut.liveSurfaceCount)
+            assertGenuinePreparedIntentVisitor(store, directory, "migrated-maximum")
             assertEquals(200_000, prepared.cut.lineageCount)
             assertEquals(300_000, prepared.cut.supportCount)
             assertEquals(
@@ -496,6 +498,44 @@ class M3CanonicalStoreMigrationTest {
             normalOctY = 0,
             normalConfidence = 192,
         )
+
+    /** #121 consumes the real #114 reader; this deliberately avoids a synthetic state view. */
+    private fun assertGenuinePreparedIntentVisitor(store: M3CanonicalStateView, directory: File, command: String) {
+        val row = requireNotNull(store.findById(M3SurfaceId(1)))
+        val plan = M3SurfaceOwnership.prepareMutation(
+            store,
+            M3SurfaceOwnershipConfiguration(),
+            M3FeatureMutationCommand(command, store.cut.geometryRevision, store.cut.lineageRevision,
+                M3CanonicalTarget(row.id, row.voxel, 1, 0, 191)),
+        ) as M3CanonicalMutationPreparation.Prepared
+        val journal = (M3CanonicalDirtyJournal.open(store, directory, acceptingBudget()) as M3CanonicalDirtyJournalOpenResult.Opened).journal
+        val intent = (journal.flush(plan.mutation) as M3CanonicalDirtyJournalFlushResult.Prepared).intent
+        val expectedWal = java.io.ByteArrayOutputStream().also(plan.mutation::writeWalTo).toByteArray()
+        val expectedCurrent = java.io.ByteArrayOutputStream().also(plan.mutation::writeCurrentTo).toByteArray()
+        val visitor = object : M3PreparedIntentVisitor {
+            var rows = 0; var terminal = 0
+            override fun onHeader(identity: M3PreparedIntentIdentity) = true
+            override fun onDirtyRow(id: Long, x: Int, y: Int, z: Int, packedNormal: Int, confidence: Int, fingerprint0: Long, fingerprint1: Long, fingerprint2: Long, fingerprint3: Long) = true.also { rows++ }
+            override fun onRemovedId(id: Long) = true
+            override fun onDirtySupport(targetId: Long, sourceId: Long, x: Int, y: Int, z: Int, packedNormal: Int, confidence: Int, fingerprint0: Long, fingerprint1: Long, fingerprint2: Long, fingerprint3: Long) = true
+            override fun onDirtySource(id: Long, x: Int, y: Int, z: Int, packedNormal: Int, confidence: Int, fingerprint0: Long, fingerprint1: Long, fingerprint2: Long, fingerprint3: Long) = true
+            override fun onDirtyLineage(sourceId: Long, targetId: Long) = true
+            override fun onTerminal(currentReceipt: M3PreparedIntentCurrentReceipt) = true.also { terminal++ }
+        }
+        val before = store.readWorkReceipt()
+        val visited = intent.visit(visitor) as M3PreparedIntentVisitResult.Complete
+        val work = store.readWorkReceipt() - before
+        assertEquals(1, visitor.rows); assertEquals(1, visitor.terminal)
+        assertEquals(expectedWal.size.toLong(), plan.mutation.work.walBytes.toLong())
+        assertEquals(expectedWal.size.toLong(), intent.walLength)
+        assertEquals(expectedCurrent.size.toLong(), plan.mutation.work.currentBytes.toLong())
+        assertEquals(expectedCurrent.size.toLong(), intent.currentLength)
+        assertEquals(intent.currentLength, visited.currentReceipt.length)
+        assertEquals(M3CanonicalReceiptBytes(sha256(expectedWal)), intent.walHash)
+        assertEquals(M3CanonicalReceiptBytes(sha256(expectedCurrent)), intent.currentHash)
+        assertEquals(intent.currentHash, visited.currentReceipt.hash)
+        assertEquals(M3CanonicalReadWork.ZERO, work)
+    }
 
     private fun sha256(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes)
 

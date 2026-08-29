@@ -370,7 +370,8 @@ internal class M3PreparedIntent internal constructor(
     val file: File,
     private val header: M3DirtyIntentHeader,
     val storage: M3CanonicalDirtyJournalStorageReceipt,
-) {
+) : AutoCloseable {
+    @Volatile private var closed = false
     val sourceCut get() = header.sourceCut
     val targetHighWater get() = header.targetHighWater
     val walLength get() = header.walLength
@@ -378,7 +379,35 @@ internal class M3PreparedIntent internal constructor(
     val currentLength get() = header.currentLength
     val currentHash get() = header.currentHash
 
-    fun openWal(): InputStream = BoundedInputStream(BufferedInputStream(FileInputStream(file), M3CanonicalDirtyJournal.WRITER_SCRATCH_BYTES), header.walOffset, header.walLength)
+    /**
+     * Reopens the durable envelope before returning its identity.  The cached
+     * header is deliberately not authority after a restart (or after a caller
+     * hands this handle to another owner).
+     */
+    @Synchronized
+    fun identity(): M3PreparedIntentIdentityResult = if (closed) {
+        M3PreparedIntentIdentityResult.Refused(M3PreparedIntentVisitRefusal.CLOSED)
+    } else try {
+        M3PreparedIntentIdentityResult.Complete(M3PreparedIntentIdentity.from(M3DirtyIntentHeader.read(file)))
+    } catch (_: Exception) {
+        M3PreparedIntentIdentityResult.Refused(M3PreparedIntentVisitRefusal.CORRUPT_INTENT)
+    }
+
+    /** Streams and re-encodes the current record.  It never returns decoded records. */
+    @Synchronized
+    fun currentReceipt(): M3PreparedIntentCurrentReceiptResult = when (val result = visit(M3PreparedIntentVisitor.NONE)) {
+        is M3PreparedIntentVisitResult.Complete -> M3PreparedIntentCurrentReceiptResult.Complete(result.currentReceipt)
+        is M3PreparedIntentVisitResult.Stopped -> M3PreparedIntentCurrentReceiptResult.Stopped
+        is M3PreparedIntentVisitResult.Refused -> M3PreparedIntentCurrentReceiptResult.Refused(result.reason)
+    }
+
+    @Synchronized
+    fun visit(visitor: M3PreparedIntentVisitor): M3PreparedIntentVisitResult =
+        M3PreparedIntentStreamingVisitor(file, ::isClosed).visit(visitor)
+
+    @Synchronized
+    override fun close() { closed = true }
+    private fun isClosed() = closed
 }
 
 internal data class M3DirtyIntentHeader(
@@ -428,10 +457,10 @@ internal data class M3DirtyIntentHeader(
             return prototype.copy(walOffset = offset)
         }
         fun read(file: File): M3DirtyIntentHeader {
-            require(file.length() >= 32)
+            require(file.length() in 32..M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES.toLong())
             FileInputStream(file).use { raw ->
                 val digest = MessageDigest.getInstance("SHA-256")
-                val bounded = BoundedInputStream(raw, 0, file.length() - 32)
+                val bounded = M3BoundedInputStream(raw, 0, file.length() - 32)
                 val hashed = DigestInputStream(bounded, digest)
                 val input = DataInputStream(BufferedInputStream(hashed, M3CanonicalDirtyJournal.WRITER_SCRATCH_BYTES))
                     require(input.readInt() == INTENT_MAGIC && input.readInt() == VERSION)
@@ -445,14 +474,42 @@ internal data class M3DirtyIntentHeader(
                     val command = M3CanonicalReceiptBytes(input.readNBytes(32)); val fingerprint = M3CanonicalReceiptBytes(input.readNBytes(32))
                     val targetHigh = input.readLong(); val targetLive = input.readInt(); val targetSource = input.readInt(); val targetSupport = input.readInt(); val targetEdges = input.readInt()
                     val targetGeometry = input.readLong(); val targetLineage = input.readLong(); val walLength = input.readLong(); val walHash = M3CanonicalReceiptBytes(input.readNBytes(32)); val currentLength = input.readLong(); val currentHash = M3CanonicalReceiptBytes(input.readNBytes(32))
+                    val prototype = M3DirtyIntentHeader(M3CompactCanonicalCut(group, profile, geometry, lineage, high, live, source, support, edges, baseline, root, sourceHash), command, fingerprint, targetHigh, targetLive, targetSource, targetSupport, targetEdges, targetGeometry, targetLineage, walLength, walHash, currentLength, currentHash, 0)
+                    prototype.requireValid()
                     val offset = file.length() - 32 - walLength
-                    require(offset >= 0 && input.available().toLong() >= walLength)
-                    val walDigest = MessageDigest.getInstance("SHA-256"); var remaining = walLength; val scratch = ByteArray(M3CanonicalDirtyJournal.WRITER_SCRATCH_BYTES)
-                    while (remaining > 0) { val count = input.read(scratch, 0, minOf(scratch.size.toLong(), remaining).toInt()); require(count > 0); walDigest.update(scratch, 0, count); remaining -= count }
+                    require(offset == countingHeader(prototype))
+                    val walDigest = MessageDigest.getInstance("SHA-256"); var remaining = walLength
+                    // BufferedInputStream is the sole streaming scratch.  Do not add a
+                    // second WAL-sized byte array while checking the pre-root envelope.
+                    while (remaining > 0) {
+                        val value = input.read()
+                        require(value >= 0)
+                        walDigest.update(value.toByte())
+                        remaining--
+                    }
                     require(walDigest.digest().contentEquals(walHash.toByteArray()))
-                    val expected = digest.digest(); val trailer = raw.readNBytes(32); require(trailer.contentEquals(expected))
-                    return M3DirtyIntentHeader(M3CompactCanonicalCut(group, profile, geometry, lineage, high, live, source, support, edges, baseline, root, sourceHash), command, fingerprint, targetHigh, targetLive, targetSource, targetSupport, targetEdges, targetGeometry, targetLineage, walLength, walHash, currentLength, currentHash, offset)
+                    require(input.read() == -1)
+                    val expected = digest.digest(); val trailer = raw.readNBytes(32); require(trailer.contentEquals(expected) && raw.read() == -1)
+                    return prototype.copy(walOffset = offset)
             }
+        }
+
+        private fun M3DirtyIntentHeader.requireValid() {
+            fun hash(value: M3CanonicalReceiptBytes) = require(value.size == 32)
+            fun count(value: Int, maximum: Int) = require(value in 0..maximum)
+            require(sourceCut.profile == M3CompactCanonicalStore.PROFILE)
+            require(sourceCut.nextSurfaceIdHighWater in 1..0x1_0000_0000L)
+            require(targetHighWater in sourceCut.nextSurfaceIdHighWater..0x1_0000_0000L)
+            count(sourceCut.liveSurfaceCount, 100_000); count(targetLive, 100_000)
+            count(sourceCut.sourceCount, 300_000); count(targetSource, 300_000)
+            count(sourceCut.supportCount, 300_000); count(targetSupport, 300_000)
+            count(sourceCut.lineageCount, 200_000); count(targetLineage, 200_000)
+            require(sourceCut.geometryRevision >= 0 && sourceCut.lineageRevision >= 0)
+            require(targetGeometry >= sourceCut.geometryRevision && targetLineageRevision >= sourceCut.lineageRevision)
+            require(walLength in 1..M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES.toLong())
+            require(currentLength in 1..M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES.toLong())
+            hash(sourceCut.rootHash); hash(sourceCut.sourceHash); hash(commandHash); hash(commandFingerprint)
+            hash(walHash); hash(currentHash)
         }
         private fun countingHeader(header: M3DirtyIntentHeader): Long {
             val counter = CountingOutputStream(); DataOutputStream(counter).use { header.writeWithoutChecksum(it) }; return counter.count
@@ -487,7 +544,7 @@ private class FaultingOutputStream(private val delegate: OutputStream, private v
 }
 private object NullOutputStream : OutputStream() { override fun write(value: Int) = Unit; override fun write(bytes: ByteArray, offset: Int, length: Int) = Unit }
 private class CountingOutputStream : OutputStream() { var count = 0L; override fun write(value: Int) { count++ }; override fun write(bytes: ByteArray, offset: Int, length: Int) { count += length } }
-private class BoundedInputStream(delegate: InputStream, skip: Long, private var remaining: Long) : InputStream() {
+internal class M3BoundedInputStream(delegate: InputStream, skip: Long, private var remaining: Long) : InputStream() {
     private val source = delegate
     init { var left = skip; while (left > 0) { val skipped = source.skip(left); require(skipped > 0); left -= skipped } }
     override fun read(): Int = if (remaining == 0L) -1 else source.read().also { if (it >= 0) remaining-- }

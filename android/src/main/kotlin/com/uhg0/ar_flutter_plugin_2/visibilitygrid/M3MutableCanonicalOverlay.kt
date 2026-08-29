@@ -845,7 +845,7 @@ internal enum class M3CanonicalMutationRefusal {
 private fun Long.toIntExact(): Int = try { Math.toIntExact(this) } catch (_: ArithmeticException) { Int.MAX_VALUE }
 
 /** DataOutputStream.writeUTF payload length without allocating its encoded form. */
-private fun modifiedUtf8Length(value: String): Long {
+internal fun modifiedUtf8Length(value: String): Long {
     var bytes = 0L
     value.forEach { character ->
         bytes += when (character.code) {

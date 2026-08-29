@@ -617,6 +617,14 @@ internal class M3CanonicalReceiptBytes(bytes: ByteArray) {
     private val value = bytes.copyOf()
     val size: Int get() = value.size
     fun toByteArray(): ByteArray = value.copyOf()
+    /** Fixed-size scalar comparison for streaming codecs; it never exposes the backing bytes. */
+    internal fun matchesWords(first: Long, second: Long, third: Long, fourth: Long): Boolean {
+        if (value.size != 32) return false
+        fun word(offset: Int) = (0 until 8).fold(0L) { result, index ->
+            (result shl 8) or (value[offset + index].toLong() and 0xffL)
+        }
+        return word(0) == first && word(8) == second && word(16) == third && word(24) == fourth
+    }
     override fun equals(other: Any?): Boolean = other is M3CanonicalReceiptBytes && value.contentEquals(other.value)
     override fun hashCode(): Int = value.contentHashCode()
     companion object { val EMPTY = M3CanonicalReceiptBytes(ByteArray(0)) }

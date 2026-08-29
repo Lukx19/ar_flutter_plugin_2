@@ -29,7 +29,7 @@ class M3CanonicalDirtyJournalTest {
             assertEquals(plan.targetHighWater, flushed.intent.targetHighWater)
             assertTrue(flushed.intent.file.isFile)
             assertTrue(flushed.intent.file.length() <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
-            assertEquals(plan.work.walBytes.toLong(), flushed.intent.openWal().use { it.copyTo(ByteArrayOutputStream()) })
+            assertEquals(plan.work.walBytes.toLong(), flushed.intent.walLength)
             assertEquals(sha256(wal(plan)).toList(), flushed.intent.walHash.toByteArray().toList())
             assertEquals(0, view.mutations)
             assertArrayEquals(authorityRootBefore, view.cut.rootHash.toByteArray())
