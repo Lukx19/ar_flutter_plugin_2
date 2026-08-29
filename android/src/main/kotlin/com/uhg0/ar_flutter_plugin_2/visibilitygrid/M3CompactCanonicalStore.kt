@@ -26,6 +26,12 @@ internal interface M3CanonicalStateView : AutoCloseable {
         sink: (M3PagedSupport) -> Boolean,
     ): M3SourceSupportRead
 
+    fun visitLineage(
+        source: M3SurfaceId,
+        cursor: M3LineageCursor?,
+        sink: (M3LineageEdge) -> Boolean,
+    ): M3LineageRead = M3LineageRead.Complete(0, null)
+
     fun retainedMemoryReceipt(): M3CompactRetainedMemoryReceipt
 
     fun allocatedStorageReceipt(): M3CompactStorageReceipt
@@ -124,6 +130,17 @@ internal sealed interface M3SourceSupportRead {
     ) : M3SourceSupportRead
 
     data class Refused(val reason: M3CompactCanonicalRefusal) : M3SourceSupportRead
+}
+
+internal data class M3LineageCursor(
+    val rootHash: M3CanonicalReceiptBytes,
+    val source: M3SurfaceId,
+    val offset: Int,
+)
+
+internal sealed interface M3LineageRead {
+    data class Complete(val delivered: Int, val nextCursor: M3LineageCursor?) : M3LineageRead
+    data class Refused(val reason: M3CompactCanonicalRefusal) : M3LineageRead
 }
 
 internal data class M3CompactRetainedMemoryReceipt(
@@ -510,6 +527,32 @@ private constructor(
                 M3SourceSupportRead.Complete(delivered, next, page.pageFaults, page.bytesRead)
             }
         }
+    }
+
+    override fun visitLineage(
+        source: M3SurfaceId,
+        cursor: M3LineageCursor?,
+        sink: (M3LineageEdge) -> Boolean,
+    ): M3LineageRead {
+        if (closed) return M3LineageRead.Refused(M3CompactCanonicalRefusal.CLOSED)
+        if (cursor != null && (cursor.rootHash != cut.rootHash || cursor.source != source || cursor.offset < 0))
+            return M3LineageRead.Refused(M3CompactCanonicalRefusal.STALE_CURSOR)
+        var low = 0
+        var high = lineageSource.size
+        while (low < high) {
+            val middle = (low + high) ushr 1
+            if (unsignedCompare(unsigned(lineageSource[middle]), source.value) < 0) low = middle + 1 else high = middle
+        }
+        var matching = 0
+        var delivered = 0
+        for (index in low until lineageSource.size) {
+            if (unsigned(lineageSource[index]) != source.value) break
+            if (matching++ < (cursor?.offset ?: 0)) continue
+            if (!sink(M3LineageEdge(source, M3SurfaceId(unsigned(lineageTarget[index])))))
+                return M3LineageRead.Complete(delivered, M3LineageCursor(cut.rootHash, source, matching - 1))
+            delivered++
+        }
+        return M3LineageRead.Complete(delivered, null)
     }
 
     override fun retainedMemoryReceipt() =

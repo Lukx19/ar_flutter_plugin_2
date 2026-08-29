@@ -97,14 +97,17 @@ internal class M3PreparedIntentStreamingVisitor(
     private val file: File,
     private val isClosed: () -> Boolean,
 ) {
-    fun visit(visitor: M3PreparedIntentVisitor): M3PreparedIntentVisitResult {
+    fun visit(
+        visitor: M3PreparedIntentVisitor,
+        validatedCurrentOutput: OutputStream? = null,
+    ): M3PreparedIntentVisitResult {
         if (isClosed()) return refused(M3PreparedIntentVisitRefusal.CLOSED)
         val header = try { M3DirtyIntentHeader.read(file) } catch (_: Exception) { return refused(M3PreparedIntentVisitRefusal.CORRUPT_INTENT) }
         return try {
             FileInputStream(file).use { raw ->
                 DataInputStream(BufferedInputStream(M3BoundedInputStream(raw, header.walOffset, header.walLength), M3PreparedIntentVisitorResources.STREAMING_SCRATCH_BYTES)).use { input ->
                     val digest = MessageDigest.getInstance("SHA-256")
-                    val counter = M3CountingOutputStream()
+                    val counter = M3CountingOutputStream(validatedCurrentOutput)
                     val output = java.io.DataOutputStream(DigestOutputStream(counter, digest))
                     require(input.readInt() == WAL_MAGIC)
                     val bodyVersion = input.readInt(); require(bodyVersion in LEGACY_BODY_VERSION..BODY_VERSION)
@@ -256,8 +259,8 @@ internal class M3PreparedIntentStreamingVisitor(
 
 private object M3PreparedIntentVisitorFailure : RuntimeException()
 
-private class M3CountingOutputStream : OutputStream() {
+private class M3CountingOutputStream(private val delegate: OutputStream? = null) : OutputStream() {
     var count = 0L
-    override fun write(value: Int) { count++ }
-    override fun write(bytes: ByteArray, offset: Int, length: Int) { count += length }
+    override fun write(value: Int) { delegate?.write(value); count++ }
+    override fun write(bytes: ByteArray, offset: Int, length: Int) { delegate?.write(bytes, offset, length); count += length }
 }

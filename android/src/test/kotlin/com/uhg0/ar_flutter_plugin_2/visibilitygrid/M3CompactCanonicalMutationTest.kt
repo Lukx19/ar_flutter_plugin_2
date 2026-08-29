@@ -1,0 +1,272 @@
+package com.uhg0.ar_flutter_plugin_2.visibilitygrid
+
+import com.uhg0.ar_flutter_plugin_2.capture.JvmDescriptorFilesystemV2
+import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetCoordinatorV2
+import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetPolicyV2
+import java.io.File
+import java.io.DataOutputStream
+import java.io.FileOutputStream
+import java.nio.file.Files
+import java.security.DigestOutputStream
+import java.security.MessageDigest
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class M3CompactCanonicalMutationTest {
+    @Test
+    fun `physical reservation reconciles every candidate file and changed command bytes conflict`() {
+        val directory = Files.createTempDirectory("m3-cow-physical").toFile()
+        try {
+            val base = view("physical", emptyList())
+            val firstIntent = intent(base, M3FeatureMutationCommand("same-command", 0, 0, target(null, M3Voxel(0, 0, 0))), File(directory, "intent-a"))
+            val generationParent = File(directory, "generations").also { assertTrue(it.mkdirs()) }
+            StorageBudgetCoordinatorV2(
+                generationParent, StorageBudgetPolicyV2(64L * 1024 * 1024, 0),
+                JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L }),
+                freeBytes = { 128L * 1024 * 1024 },
+            ).use { coordinator ->
+                val budget = M3CoordinatorStorageBudget(coordinator)
+                val store = requireNotNull(M3CanonicalMutableStore.open(generationParent, budget))
+                val prepared = prepared(store.stage(firstIntent, base))
+                val physical = coordinator.physicallyAllocatedTreeBytes(prepared.generation.directory)
+                assertEquals(physical, prepared.generation.storageReceipt().allocatedBytes)
+                assertEquals(physical, coordinator.committedBytes())
+                assertEquals(0L, coordinator.reservedBytes())
+                prepared.generation.root.manifest.groupBy { it.file }.forEach { (name, entries) ->
+                    assertEquals(entries.size.toLong() * M3CanonicalCowGeneration.PAGE_BYTES, File(prepared.generation.directory, name).length())
+                }
+
+                val changedIntent = intent(base, M3FeatureMutationCommand("same-command", 0, 0, target(null, M3Voxel(1, 0, 0))), File(directory, "intent-b"))
+                val conflict = store.stage(changedIntent, base) as M3CanonicalCowStageResult.Refused
+                assertEquals(M3CanonicalCowRefusal.IDENTITY_CONFLICT, conflict.reason)
+                assertEquals(physical, coordinator.committedBytes())
+
+                val page = File(prepared.generation.directory, prepared.generation.root.manifest.first().file)
+                java.io.RandomAccessFile(page, "rw").use { file ->
+                    file.seek(20)
+                    val original = file.read()
+                    file.seek(20)
+                    file.write(original xor 0x55)
+                    file.fd.sync()
+                }
+                val corrupt = store.stage(firstIntent, base) as M3CanonicalCowStageResult.Refused
+                assertEquals(M3CanonicalCowRefusal.CORRUPT_GENERATION, corrupt.reason)
+                assertEquals(0L, coordinator.reservedBytes())
+            }
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test
+    fun `complete private generation contains all semantic kinds exact current and tombstones`() {
+        val directory = Files.createTempDirectory("m3-cow-complete").toFile()
+        try {
+            val empty = view("cow-add", emptyList())
+            val add = M3FeatureMutationCommand("add", 0, 0, target(null, M3Voxel(0, 0, 0)))
+            val addIntent = intent(empty, add, File(directory, "add-intent"))
+            val budget = RecordingBudget()
+            val store = requireNotNull(M3CanonicalMutableStore.open(File(directory, "generations"), budget))
+            val added = prepared(store.stage(addIntent, empty))
+            val addKinds = added.generation.root.manifest.mapTo(mutableSetOf()) { it.kind }
+            assertTrue(addKinds.containsAll(setOf(
+                M3CowFragmentKind.ROW, M3CowFragmentKind.ID_INDEX, M3CowFragmentKind.VOXEL_INDEX,
+                M3CowFragmentKind.PAGE_INDEX, M3CowFragmentKind.SOURCE, M3CowFragmentKind.SUPPORT,
+            )))
+            val addedView = added.generation.overlay(empty)
+            val row = addedView.findById(M3SurfaceId(1)); assertNotNull(row); row!!
+            assertEquals(M3Voxel(0, 0, 0), row.voxel)
+            assertNotNull((addedView.readSourceById(M3SurfaceId(1)) as M3CanonicalPageRead.Complete).value)
+            val support = mutableListOf<M3PagedSupport>()
+            assertTrue(addedView.visitSourceSupport(M3SurfaceId(1), null) { support += it; true } is M3SourceSupportRead.Complete)
+            assertEquals(listOf(1L), support.map { it.source.id.value })
+            val location = requireNotNull(m3CompactLocation(M3SurfaceOwnershipConfiguration(), M3Voxel(0, 0, 0)))
+            val cowPage = added.generation.readPage(empty, location.region, location.page, null, 1) as M3CowPageRead.Complete
+            assertEquals(listOf(1L), cowPage.rows.map { it.id.value })
+            val stalePage = added.generation.readPage(empty, location.region, location.page,
+                M3CowPageCursor(M3CanonicalReceiptBytes(ByteArray(32)), location.region, location.page, 0), 1)
+            assertEquals(M3CompactCanonicalRefusal.STALE_CURSOR, (stalePage as M3CowPageRead.Refused).reason)
+            assertEquals(added.generation.root.current.length, File(added.generation.directory, M3CanonicalCowGeneration.CURRENT_UNACKED_FILE).length())
+            assertTrue(added.generation.storageReceipt().phasePeakBytes <= 1_048_576L)
+            assertTrue(budget.requests.single() >= budget.actuals.maxOrNull()!!)
+
+            val replay = store.stage(addIntent, empty) as M3CanonicalCowStageResult.Prepared
+            assertTrue(replay.reused)
+            assertEquals(added.generation.directory, replay.generation.directory)
+
+            val baseRow = row(1, M3Voxel(0, 0, 0))
+            val base = view("cow-relocate", listOf(baseRow))
+            val baseRootBefore = base.cut.rootHash
+            val relocation = M3CanonicalTransactionCommand(
+                "relocate", M3CanonicalOperation.RELOCATION, 0, 0, listOf(M3SurfaceId(1)),
+                listOf(target(M3SurfaceId(1), M3Voxel(2, 0, 0))),
+            )
+            val relocationIntent = intent(base, relocation, File(directory, "relocate-intent"))
+            val relocated = prepared(store.stage(relocationIntent, base))
+            val kinds = relocated.generation.root.manifest.mapTo(mutableSetOf()) { it.kind }
+            assertTrue(kinds.contains(M3CowFragmentKind.LINEAGE))
+            assertTrue(kinds.containsAll(setOf(
+                M3CowFragmentKind.ID_TOMBSTONE, M3CowFragmentKind.VOXEL_TOMBSTONE,
+                M3CowFragmentKind.PAGE_TOMBSTONE, M3CowFragmentKind.SUPPORT_TOMBSTONE,
+                M3CowFragmentKind.LINEAGE_TOMBSTONE,
+            )))
+            val relocatedView = relocated.generation.overlay(base)
+            assertEquals(M3Voxel(2, 0, 0), relocatedView.findById(M3SurfaceId(1))?.voxel)
+            assertNull(relocatedView.findByVoxel(M3Voxel(0, 0, 0)))
+            assertEquals(M3SurfaceId(1), relocatedView.findByVoxel(M3Voxel(2, 0, 0))?.id)
+            assertNotNull((relocatedView.readSourceById(M3SurfaceId(1)) as M3CanonicalPageRead.Complete).value)
+            val lineage = mutableListOf<M3LineageEdge>()
+            val lineageRead = relocatedView.visitLineage(M3SurfaceId(1), null) { lineage += it; true }
+            assertEquals(1, (lineageRead as M3LineageRead.Complete).delivered)
+            assertEquals(listOf(M3LineageEdge(M3SurfaceId(1), M3SurfaceId(1))), lineage)
+            assertEquals(baseRootBefore, base.cut.rootHash)
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test
+    fun `small and 100k real v6 cuts stage identical one-row dirty work without dense reads`() {
+        val directory = Files.createTempDirectory("m3-cow-scale").toFile()
+        try {
+            val small = realV6("scale-small", 1, File(directory, "small-v6"))
+            val large = realV6("scale-large", 100_000, File(directory, "large-v6"))
+            val command = { name: String -> M3FeatureMutationCommand(name, 0, 0, target(M3SurfaceId(1), M3Voxel(0, 0, 0), 191)) }
+            val smallIntent = intent(small, command("same"), File(directory, "small-intent"))
+            val largeIntent = intent(large, command("same"), File(directory, "large-intent"))
+            val smallBefore = small.readWorkReceipt(); val largeBefore = large.readWorkReceipt()
+            val smallGeneration = stage(small, smallIntent, File(directory, "small"))
+            val largeGeneration = stage(large, largeIntent, File(directory, "large"))
+            fun signature(generation: M3CanonicalCowGeneration) = generation.root.manifest.map { Triple(it.kind, it.count, it.hash.toList()) }
+            assertEquals(signature(smallGeneration), signature(largeGeneration))
+            val smallWork = small.readWorkReceipt() - smallBefore; val largeWork = large.readWorkReceipt() - largeBefore
+            assertEquals(smallWork.directLookups, largeWork.directLookups)
+            assertEquals(smallWork.pageReads, largeWork.pageReads)
+            assertTrue("large inspected=${largeWork.inspectedRows}", largeWork.inspectedRows < 64)
+            assertEquals(0, smallWork.pageReads)
+            assertEquals(0, largeWork.pageReads)
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test
+    fun `every stage cut leaves old authority and later yields complete or reusable generation`() {
+        M3CanonicalCowFault.entries.forEach { fault ->
+            val directory = Files.createTempDirectory("m3-cow-fault-${fault.name}").toFile()
+            try {
+                val base = view("fault-${fault.name}", emptyList())
+                val intent = intent(base, M3FeatureMutationCommand("fault", 0, 0, target(null, M3Voxel(0, 0, 0))), File(directory, "intent"))
+                val parent = File(directory, "generations")
+                val first = requireNotNull(M3CanonicalMutableStore.open(parent, RecordingBudget())).stage(intent, base, fault)
+                assertTrue("$fault returned $first", first is M3CanonicalCowStageResult.Refused)
+                assertEquals(0, base.cut.liveSurfaceCount)
+                val recovered = requireNotNull(M3CanonicalMutableStore.open(parent, RecordingBudget())).stage(intent, base)
+                assertTrue(recovered is M3CanonicalCowStageResult.Prepared)
+                val prepared = recovered as M3CanonicalCowStageResult.Prepared
+                assertEquals(1, prepared.generation.overlay(base).cut.liveSurfaceCount)
+                assertTrue(parent.listFiles().orEmpty().none { it.name.endsWith(".staging") })
+            } finally { directory.deleteRecursively() }
+        }
+    }
+
+    private fun stage(base: M3CanonicalStateView, intent: M3PreparedIntent, parent: File) =
+        prepared(requireNotNull(M3CanonicalMutableStore.open(parent, RecordingBudget())).stage(intent, base)).generation
+
+    private fun prepared(result: M3CanonicalCowStageResult): M3CanonicalCowStageResult.Prepared =
+        result as? M3CanonicalCowStageResult.Prepared ?: error("stage refused: $result")
+
+    private fun intent(view: M3CanonicalStateView, command: M3FeatureMutationCommand, directory: File): M3PreparedIntent {
+        val plan = (M3SurfaceOwnership.prepareMutation(view, M3SurfaceOwnershipConfiguration(), command) as M3CanonicalMutationPreparation.Prepared).mutation
+        return flush(view, plan, directory)
+    }
+
+    private fun intent(view: TestView, command: M3CanonicalTransactionCommand, directory: File): M3PreparedIntent {
+        val plan = (M3SurfaceOwnership.prepareMutation(view, M3SurfaceOwnershipConfiguration(), command) as M3CanonicalMutationPreparation.Prepared).mutation
+        return flush(view, plan, directory)
+    }
+
+    private fun flush(view: M3CanonicalStateView, plan: M3PreparedCanonicalMutation, directory: File): M3PreparedIntent {
+        val journal = (M3CanonicalDirtyJournal.open(view, directory, RecordingBudget()) as M3CanonicalDirtyJournalOpenResult.Opened).journal
+        return (journal.flush(plan) as M3CanonicalDirtyJournalFlushResult.Prepared).intent
+    }
+
+    private fun target(id: M3SurfaceId?, voxel: M3Voxel, confidence: Int = 192) = M3CanonicalTarget(id, voxel, 0, 0, confidence)
+    private fun row(id: Long, voxel: M3Voxel) = M3CompactSurface(M3SurfaceId(id), voxel, 0, 192)
+    private fun hash(text: String) = M3CanonicalReceiptBytes(MessageDigest.getInstance("SHA-256").digest(text.encodeToByteArray()))
+
+    private fun realV6(name: String, count: Int, directory: File): M3CompactCanonicalStore {
+        assertTrue(directory.mkdirs())
+        val group = M3SurfaceGroup(name)
+        val prefix = MessageDigest.getInstance("SHA-256").digest(group.value.encodeToByteArray()).joinToString("") { "%02x".format(it) }
+        val ledgerBody = java.io.ByteArrayOutputStream().use { raw ->
+            DataOutputStream(raw).use { out ->
+                out.writeInt(0x4d33524c); out.writeInt(1); out.writeLong(1); out.writeLong(1); out.writeLong(count + 1L)
+                out.write(group.hash); out.write(ByteArray(32) { 1 }); out.write(ByteArray(32) { 2 }); out.write(ByteArray(32))
+            }
+            raw.toByteArray()
+        }
+        File(directory, "m3-surface-$prefix.ledger").writeBytes(ledgerBody + MessageDigest.getInstance("SHA-256").digest(ledgerBody))
+        val snapshot = File(directory, "m3-surface-$prefix.snapshot")
+        val digest = MessageDigest.getInstance("SHA-256")
+        FileOutputStream(snapshot).use { raw ->
+            val hashed = DigestOutputStream(raw, digest); val out = DataOutputStream(hashed)
+            out.writeInt(0x4d33534f); out.writeInt(5); out.writeLong(count + 1L); out.writeInt(count)
+            repeat(count) { index ->
+                val id = index + 1L; val fingerprint = ByteArray(32) { byte -> (id + byte).toByte() }
+                out.writeLong(id); out.writeUTF(group.value); out.writeInt(index); out.writeInt(0); out.writeInt(0)
+                out.writeInt(Math.floorDiv(index, 30)); out.writeInt(0); out.writeInt(0); out.writeInt(Math.floorMod(index, 30) / 10)
+                out.writeInt(0); out.writeInt(192); out.write(fingerprint)
+            }
+            out.writeInt(0); out.writeLong(0); out.writeLong(0); out.writeInt(count)
+            repeat(count) { index -> out.writeLong(index + 1L); out.writeInt(1); out.writeLong(index + 1L) }
+            out.writeInt(count)
+            repeat(count) { index ->
+                val id = index + 1L; out.writeLong(id); out.writeInt(index); out.writeInt(0); out.writeInt(0); out.writeInt(0); out.writeInt(192)
+                out.write(ByteArray(32) { byte -> (id + byte).toByte() })
+            }
+            out.writeInt(0); out.writeInt(0); out.writeBoolean(false); out.flush(); hashed.on(false); raw.write(digest.digest())
+        }
+        val budget = RecordingBudget()
+        val prepared = M3CompactCanonicalStore.prepareV6SiblingMigration(group, directory, budget)
+        assertTrue(prepared.toString(), prepared is M3CompactCanonicalMigrationResult.Prepared)
+        return (M3CompactCanonicalStore.openV6(group, directory, budget) as M3CompactCanonicalOpenResult.Opened).store
+    }
+
+    private fun view(name: String, rows: List<M3CompactSurface>, declaredRows: Int = rows.size): TestView {
+        val cut = M3CompactCanonicalCut(M3SurfaceGroup(name), M3CompactCanonicalStore.PROFILE, 0, 0, declaredRows + 1L,
+            declaredRows, declaredRows, declaredRows, 0, null, hash("root-$name"), hash("source-$name"))
+        return TestView(cut, rows)
+    }
+
+    private class TestView(override val cut: M3CompactCanonicalCut, private val rows: List<M3CompactSurface>) : M3CanonicalStateView {
+        var lookups = 0
+        var pageScans = 0
+        override fun findById(id: M3SurfaceId): M3CompactSurface? { lookups++; return rows.firstOrNull { it.id == id } }
+        override fun findByVoxel(voxel: M3Voxel): M3CompactSurface? { lookups++; return rows.firstOrNull { it.voxel == voxel } }
+        override fun readPage(region: M3StorageRegion, page: Int, cursor: Int, limit: Int): M3CompactPage { pageScans++; return M3CompactPage(emptyList(), null, 0) }
+        override fun readSourceById(id: M3SurfaceId): M3CanonicalPageRead<M3PagedSource?> = M3CanonicalPageRead.Complete(rows.firstOrNull { it.id == id }?.let {
+            M3PagedSource(it.id, it.voxel, it.packedNormal, it.normalConfidence, M3CanonicalReceiptBytes(ByteArray(32)))
+        }, 0, 0)
+        override fun visitSourceSupport(target: M3SurfaceId, cursor: M3SourceSupportCursor?, sink: (M3PagedSupport) -> Boolean): M3SourceSupportRead {
+            val source = rows.firstOrNull { it.id == target }
+            val delivered = if (source != null && sink(M3PagedSupport(target, M3PagedSource(source.id, source.voxel, source.packedNormal, source.normalConfidence, M3CanonicalReceiptBytes(ByteArray(32)))))) 1 else 0
+            return M3SourceSupportRead.Complete(delivered, null, 0, 0)
+        }
+        override fun retainedMemoryReceipt() = error("unused")
+        override fun allocatedStorageReceipt() = error("unused")
+        override fun close() = Unit
+    }
+
+    private class RecordingBudget : M3CanonicalStorageBudget {
+        val requests = mutableListOf<Long>()
+        val actuals = mutableListOf<Long>()
+        override fun reserve(bytes: Long): Any = bytes
+        override fun reserveCandidate(staging: File, target: File, fileBytes: Map<String, Long>, maximumPhysicalBytes: Long): Any? {
+            requests += maximumPhysicalBytes
+            return super.reserveCandidate(staging, target, fileBytes, maximumPhysicalBytes)
+        }
+        override fun verifyCandidate(token: Any, candidate: File): Long = allocatedBytes(candidate).also { actuals += it }
+        override fun commit(token: Any, actualBytes: Long) { actuals += actualBytes }
+        override fun release(token: Any) = Unit
+        override fun allocationUnitBytes(path: File) = 4_096L
+    }
+}

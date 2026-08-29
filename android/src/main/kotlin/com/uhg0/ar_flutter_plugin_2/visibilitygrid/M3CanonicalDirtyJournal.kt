@@ -395,6 +395,18 @@ internal class M3PreparedIntent internal constructor(
     fun visit(visitor: M3PreparedIntentVisitor): M3PreparedIntentVisitResult =
         M3PreparedIntentStreamingVisitor(file, ::isClosed).visit(visitor)
 
+    /**
+     * Streams the byte-exact validated current record while visiting the same
+     * scalar handoff. The caller owns [output]; no current-sized byte array is
+     * ever materialized.
+     */
+    @Synchronized
+    internal fun visitCurrent(
+        visitor: M3PreparedIntentVisitor,
+        output: OutputStream,
+    ): M3PreparedIntentVisitResult =
+        M3PreparedIntentStreamingVisitor(file, ::isClosed).visit(visitor, output)
+
     @Synchronized
     override fun close() { closed = true }
     private fun isClosed() = closed
