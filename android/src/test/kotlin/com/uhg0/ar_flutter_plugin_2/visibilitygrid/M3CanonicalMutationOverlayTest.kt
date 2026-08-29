@@ -5,8 +5,46 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.openjdk.jol.info.GraphLayout
+import java.nio.file.Files
+import java.security.MessageDigest
+import java.util.Collections
 
 class M3CanonicalMutationOverlayTest {
+    @Test
+    fun `C12 confidence bands allocation provenance and normal orientation define material refinement`() {
+        val provenance = ByteArray(32) { (it + 7).toByte() }
+        val reliable = view(
+            rows = listOf(surface(1, 0, confidence = 191)), high = 2,
+            sources = listOf(source(1, 0, confidence = 191, fingerprint = provenance)),
+        )
+        val boundary = prepared(M3SurfaceOwnership.prepareMutation(
+            reliable, configuration(), feature("band-boundary", 0, 0, target(0, M3SurfaceId(1), confidence = 192)),
+        ))
+        assertEquals(192, boundary.dirtyRows.single().normalConfidence)
+        assertArrayEquals(provenance, boundary.dirtyRows.single().allocatedBy)
+
+        val strong = view(
+            rows = listOf(surface(1, 0, confidence = 192)), high = 2,
+            sources = listOf(source(1, 0, confidence = 192, fingerprint = provenance)),
+        )
+        assertTrue(M3SurfaceOwnership.prepareMutation(
+            strong, configuration(), feature("same-strong-band", 0, 0, target(0, M3SurfaceId(1), confidence = 193)),
+        ) is M3CanonicalMutationPreparation.NoOp)
+        val direction = prepared(M3SurfaceOwnership.prepareMutation(
+            strong, configuration(), feature("normal-change", 0, 0, target(0, M3SurfaceId(1), confidence = 193, normalX = 1)),
+        ))
+        assertTrue(direction.dirtyRows.single().packedNormal != 0)
+        assertArrayEquals(provenance, direction.dirtyRows.single().allocatedBy)
+
+        val add = prepared(M3SurfaceOwnership.prepareMutation(
+            view(), configuration(), feature("new-allocation", 0, 0, target(0)),
+        ))
+        assertArrayEquals(
+            MessageDigest.getInstance("SHA-256").digest("new-allocation".encodeToByteArray()),
+            add.dirtyRows.single().allocatedBy,
+        )
+    }
+
     @Test
     fun `feature add refine and reobservation prepare stable dirty plans without mutating the view`() {
         val empty = view()
@@ -22,11 +60,12 @@ class M3CanonicalMutationOverlayTest {
         assertEquals(0, empty.mutations)
 
         val active = view(rows = listOf(surface(1, 0)), geometry = 1, high = 2, sources = listOf(source(1, 0)), supports = mapOf(1L to listOf(source(1, 0))))
-        val refine = prepared(M3SurfaceOwnership.prepareMutation(active, configuration(), feature("refine", 1, 0, target(0, M3SurfaceId(1), confidence = 193))))
+        val refine = prepared(M3SurfaceOwnership.prepareMutation(active, configuration(), feature("refine", 1, 0, target(0, M3SurfaceId(1), confidence = 191))))
         assertEquals(M3PreparedMutationKind.FEATURE_REFINE, refine.kind)
         assertEquals(1L, refine.dirtyRows.single().id.value)
         assertEquals(2, refine.targetGeometryRevision); assertEquals(0, refine.targetLineageRevision)
         assertTrue(refine.dirtySupport.isEmpty()); assertTrue(refine.dirtyLineage.isEmpty())
+        assertArrayEquals(source(1, 0).allocationFingerprint.toByteArray(), refine.dirtyRows.single().allocatedBy)
 
         val noOp = M3SurfaceOwnership.prepareMutation(active, configuration(), feature("same", 1, 0, target(0, M3SurfaceId(1))))
         assertEquals(M3CanonicalMutationPreparation.NoOp(M3CanonicalStateReceipt(1, 0, 2, 1)), noOp)
@@ -39,6 +78,8 @@ class M3CanonicalMutationOverlayTest {
         assertEquals(listOf(1L, 2L), create.dirtyRows.map { it.id.value })
         assertEquals(2, create.dirtySupport.size); assertTrue(create.dirtyLineage.isEmpty())
         assertEquals(1, create.targetGeometryRevision); assertEquals(0, create.targetLineageRevision)
+        val createAllocation = MessageDigest.getInstance("SHA-256").digest("create".encodeToByteArray())
+        create.dirtyRows.forEach { assertArrayEquals(createAllocation, it.allocatedBy) }
 
         val sourceRows = listOf(surface(1, 0), surface(2, 1), surface(3, 2), surface(4, 3))
         val evidence = sourceRows.associate { it.id.value to listOf(source(it.id.value, it.voxel.x)) }
@@ -47,6 +88,7 @@ class M3CanonicalMutationOverlayTest {
         assertEquals(listOf(1L), relocate.dirtyRows.map { it.id.value })
         assertEquals(listOf(M3LineageEdge(M3SurfaceId(1), M3SurfaceId(1))), relocate.dirtyLineage)
         assertEquals(listOf(1L), relocate.dirtySupport.map { it.source.id.value })
+        assertArrayEquals(source(1, 0).allocationFingerprint.toByteArray(), relocate.dirtyRows.single().allocatedBy)
 
         val merge = prepared(M3SurfaceOwnership.prepareMutation(base, configuration(), canonical("merge", M3CanonicalOperation.MERGE, 7, 5, listOf(M3SurfaceId(2), M3SurfaceId(3)), target(20))))
         assertEquals(5L, merge.dirtyRows.single().id.value)
@@ -69,11 +111,77 @@ class M3CanonicalMutationOverlayTest {
         assertEquals(M3CanonicalMutationRefusal.REVISION_CONFLICT, refusal(M3SurfaceOwnership.prepareMutation(base, configuration(), feature("stale", 1, 0, target(0, M3SurfaceId(1))))).reason)
         assertEquals(M3CanonicalMutationRefusal.CAPACITY, refusal(M3SurfaceOwnership.prepareMutation(base, configuration(surfaceCapacity = 1), feature("capacity", 0, 0, target(2)))).reason)
         assertEquals(M3CanonicalMutationRefusal.LINEAGE_EXHAUSTED, refusal(M3SurfaceOwnership.prepareMutation(base, configuration(lineageCapacity = 1), canonical("lineage", M3CanonicalOperation.SPLIT, 0, 0, listOf(M3SurfaceId(1)), target(2), target(3)))).reason)
-        assertEquals(M3CanonicalMutationRefusal.JOURNAL_EXHAUSTED, refusal(M3SurfaceOwnership.prepareMutation(base, configuration(changeJournalByteCapacity = 1), feature("journal", 0, 0, target(0, M3SurfaceId(1), confidence = 193)))).reason)
+        assertEquals(M3CanonicalMutationRefusal.JOURNAL_EXHAUSTED, refusal(M3SurfaceOwnership.prepareMutation(base, configuration(changeJournalByteCapacity = 1), feature("journal", 0, 0, target(0, M3SurfaceId(1), confidence = 191)))).reason)
         val exhausted = view(high = 0x1_0000_0000L)
         assertEquals(M3CanonicalMutationRefusal.EXHAUSTED, refusal(M3SurfaceOwnership.prepareMutation(exhausted, configuration(), feature("exhausted", 0, 0, target(0)))).reason)
         assertEquals(M3CanonicalStateReceipt(0, 0, 2, 1), refusal(M3SurfaceOwnership.prepareMutation(base, configuration(), feature("unknown", 0, 0, target(0, M3SurfaceId(9))))).receipt)
         assertEquals(0, base.mutations)
+    }
+
+    @Test
+    fun `huge split and merge cardinalities refuse before support payload reads or Cartesian allocation`() {
+        val splitView = view(rows = listOf(surface(1, 0)), high = 2, liveCount = 1)
+        val hugeTargets = Collections.nCopies(100_000, target(2))
+        val split = M3SurfaceOwnership.prepareMutation(
+            splitView,
+            configuration(surfaceCapacity = 200_000, lineageCapacity = 200_000),
+            M3CanonicalTransactionCommand("huge-split", M3CanonicalOperation.SPLIT, 0, 0, listOf(M3SurfaceId(1)), hugeTargets),
+        ) as M3CanonicalMutationPreparation.Refused
+        assertEquals(M3CanonicalMutationRefusal.JOURNAL_EXHAUSTED, split.reason)
+        assertEquals(0, splitView.supportVisits)
+
+        val mergeSources = Collections.nCopies(100_000, M3SurfaceId(1))
+        val mergeView = view(liveCount = 100_000, high = 100_001)
+        val merge = M3SurfaceOwnership.prepareMutation(
+            mergeView,
+            configuration(surfaceCapacity = 200_000, lineageCapacity = 200_000),
+            M3CanonicalTransactionCommand("huge-merge", M3CanonicalOperation.MERGE, 0, 0, mergeSources, listOf(target(2))),
+        ) as M3CanonicalMutationPreparation.Refused
+        assertEquals(M3CanonicalMutationRefusal.JOURNAL_EXHAUSTED, merge.reason)
+        assertEquals(0, mergeView.supportVisits)
+    }
+
+    @Test
+    fun `prepared plans own deep immutable values and cannot diverge from frozen bytes`() {
+        val targets = mutableListOf(target(0), target(1))
+        val command = M3CanonicalTransactionCommand("immutable", M3CanonicalOperation.CREATE, 0, 0, emptyList(), targets)
+        val plan = prepared(M3SurfaceOwnership.prepareMutation(view(), configuration(), command))
+        val frozenWal = plan.walBytes.toByteArray()
+        val frozenFingerprint = plan.dirtyRows.first().allocatedBy.copyOf()
+        targets.clear()
+        plan.dirtyRows.first().allocatedBy.fill(0x55)
+        plan.walBytes.toByteArray().fill(0x66)
+        assertEquals(2, plan.dirtyRows.size)
+        assertArrayEquals(frozenFingerprint, plan.dirtyRows.first().allocatedBy)
+        assertArrayEquals(frozenWal, plan.walBytes.toByteArray())
+    }
+
+    @Test
+    fun `production paged v6 one-row plans remain bounded at small and one hundred thousand authority`() {
+        val smallDirectory = Files.createTempDirectory("m3-overlay-real-small").toFile()
+        val largeDirectory = Files.createTempDirectory("m3-overlay-real-100k").toFile()
+        try {
+            val small = productionV6(smallDirectory, "real-small", 1)
+            val large = productionV6(largeDirectory, "real-large", 100_000)
+            small.use { smallStore -> large.use { largeStore ->
+                val one = prepared(M3SurfaceOwnership.prepareMutation(
+                    smallStore, configuration(), feature("real-dirty", 0, 0, target(0, M3SurfaceId(1), confidence = 191)),
+                ))
+                val hundredK = prepared(M3SurfaceOwnership.prepareMutation(
+                    largeStore, configuration(), feature("real-dirty", 0, 0, target(49_999, M3SurfaceId(50_000), confidence = 191)),
+                ))
+                assertEquals(one.work.dirtyRows, hundredK.work.dirtyRows)
+                assertEquals(one.work.directLookupCount, hundredK.work.directLookupCount)
+                assertEquals(one.work.authorityDirectLookups, hundredK.work.authorityDirectLookups)
+                assertEquals(one.work.authorityPageReads, hundredK.work.authorityPageReads)
+                assertEquals(one.work.authorityInspectedRows, hundredK.work.authorityInspectedRows)
+                assertEquals(one.work.authorityBytesRead, hundredK.work.authorityBytesRead)
+                assertTrue(hundredK.work.authorityInspectedRows <= 4)
+                println("M3_V6_DIRTY_PROPORTIONAL small=${one.work} hundredK=${hundredK.work}")
+            } }
+        } finally {
+            smallDirectory.deleteRecursively(); largeDirectory.deleteRecursively()
+        }
     }
 
     @Test
@@ -83,8 +191,8 @@ class M3CanonicalMutationOverlayTest {
         val largeSources = ArrayList<M3PagedSource>(100_000)
         repeat(100_000) { index -> largeRows += surface(index + 1L, index); largeSources += source(index + 1L, index) }
         val large = view(rows = largeRows, high = 100_001, sources = largeSources, supports = mapOf(43L to listOf(source(43, 42))))
-        val one = prepared(M3SurfaceOwnership.prepareMutation(small, configuration(), feature("same-dirty", 0, 0, target(0, M3SurfaceId(1), confidence = 193))))
-        val hundredK = prepared(M3SurfaceOwnership.prepareMutation(large, configuration(), feature("same-dirty", 0, 0, target(42, M3SurfaceId(43), confidence = 193))))
+        val one = prepared(M3SurfaceOwnership.prepareMutation(small, configuration(), feature("same-dirty", 0, 0, target(0, M3SurfaceId(1), confidence = 191))))
+        val hundredK = prepared(M3SurfaceOwnership.prepareMutation(large, configuration(), feature("same-dirty", 0, 0, target(42, M3SurfaceId(43), confidence = 191))))
         assertEquals(one.work.dirtyRows, hundredK.work.dirtyRows)
         assertEquals(one.work.dirtyIdIndexRecords, hundredK.work.dirtyIdIndexRecords)
         assertEquals(one.work.dirtyVoxelIndexRecords, hundredK.work.dirtyVoxelIndexRecords)
@@ -107,29 +215,52 @@ class M3CanonicalMutationOverlayTest {
         M3SurfaceOwnershipConfiguration(surfaceCapacity = surfaceCapacity, lineageCapacity = lineageCapacity, changeJournalByteCapacity = changeJournalByteCapacity)
     private fun feature(id: String, geometry: Long, lineage: Long, target: M3CanonicalTarget) = M3FeatureMutationCommand(id, geometry, lineage, target)
     private fun canonical(id: String, kind: M3CanonicalOperation, geometry: Long, lineage: Long, source: List<M3SurfaceId>, vararg targets: M3CanonicalTarget) = M3CanonicalTransactionCommand(id, kind, geometry, lineage, source, targets.toList())
-    private fun target(x: Int, id: M3SurfaceId? = null, confidence: Int = 192) = M3CanonicalTarget(id, M3Voxel(x, 0, 0), 0, 0, confidence)
-    private fun surface(id: Long, x: Int) = M3CompactSurface(M3SurfaceId(id), M3Voxel(x, 0, 0), 0, 192)
-    private fun source(id: Long, x: Int) = M3PagedSource(M3SurfaceId(id), M3Voxel(x, 0, 0), 0, 192, M3CanonicalReceiptBytes(ByteArray(32) { id.toByte() }))
+    private fun target(x: Int, id: M3SurfaceId? = null, confidence: Int = 192, normalX: Int = 0, normalY: Int = 0) = M3CanonicalTarget(id, M3Voxel(x, 0, 0), normalX, normalY, confidence)
+    private fun surface(id: Long, x: Int, confidence: Int = 192) = M3CompactSurface(M3SurfaceId(id), M3Voxel(x, 0, 0), 0, confidence)
+    private fun source(id: Long, x: Int, confidence: Int = 192, fingerprint: ByteArray = ByteArray(32) { id.toByte() }) = M3PagedSource(M3SurfaceId(id), M3Voxel(x, 0, 0), 0, confidence, M3CanonicalReceiptBytes(fingerprint))
     private fun prepared(value: M3CanonicalMutationPreparation) = (value as M3CanonicalMutationPreparation.Prepared).mutation
 
     private fun view(
         rows: List<M3CompactSurface> = emptyList(), geometry: Long = 0, lineage: Long = 0, high: Long = 1,
-        sources: List<M3PagedSource> = emptyList(), supports: Map<Long, List<M3PagedSource>> = emptyMap(),
-    ) = TestView(rows, geometry, lineage, high, sources, supports)
+        sources: List<M3PagedSource> = emptyList(), supports: Map<Long, List<M3PagedSource>> = emptyMap(), liveCount: Int = rows.size,
+    ) = TestView(rows, geometry, lineage, high, sources, supports, liveCount)
+
+    private fun productionV6(directory: java.io.File, identity: String, count: Int): M3CompactCanonicalStore {
+        val group = M3SurfaceGroup(identity)
+        val config = configuration(changeJournalByteCapacity = 64 * 1024 * 1024)
+        val legacy = (M3SurfaceOwnership.open(group, directory, config) as M3SurfaceOwnershipOpenResult.Opened).ownership
+        val result = legacy.apply(M3SurfaceOwnershipCommand(
+            "seed-$identity",
+            List(count) { index -> M3SurfaceCandidate(voxel = M3Voxel(index, 0, 0), normalOctX = 0, normalOctY = 0, normalConfidence = 192) },
+        ))
+        assertTrue(result.toString(), result is M3SurfaceOwnershipResult.Accepted)
+        legacy.close()
+        val budget = object : M3CanonicalStorageBudget {
+            override fun reserve(bytes: Long): Any = bytes
+            override fun commit(token: Any, actualBytes: Long) = Unit
+            override fun release(token: Any) = Unit
+            override fun allocationUnitBytes(path: java.io.File) = 4_096L
+        }
+        val migration = M3CompactCanonicalStore.prepareV6SiblingMigration(group, directory, budget, config)
+        assertTrue(migration.toString(), migration is M3CompactCanonicalMigrationResult.Prepared)
+        return (M3CompactCanonicalStore.openV6(group, directory, budget, config) as M3CompactCanonicalOpenResult.Opened).store
+    }
 
     private class TestView(
         rows: List<M3CompactSurface>, geometry: Long, lineage: Long, high: Long,
-        sources: List<M3PagedSource>, private val supports: Map<Long, List<M3PagedSource>>,
+        sources: List<M3PagedSource>, private val supports: Map<Long, List<M3PagedSource>>, liveCount: Int,
     ) : M3CanonicalStateView {
         private val ids = rows.associateBy { it.id }; private val voxels = rows.associateBy { it.voxel }
         private val sourceIds = sources.associateBy { it.id }
         var mutations = 0
-        override val cut = M3CompactCanonicalCut(M3SurfaceGroup("overlay"), M3CompactCanonicalStore.PROFILE, geometry, lineage, high, rows.size, sources.size, supports.values.sumOf { it.size }, 0, null, M3CanonicalReceiptBytes(ByteArray(32) { 7 }), M3CanonicalReceiptBytes(ByteArray(32) { 8 }))
+        var supportVisits = 0
+        override val cut = M3CompactCanonicalCut(M3SurfaceGroup("overlay"), M3CompactCanonicalStore.PROFILE, geometry, lineage, high, liveCount, sources.size, supports.values.sumOf { it.size }, 0, null, M3CanonicalReceiptBytes(ByteArray(32) { 7 }), M3CanonicalReceiptBytes(ByteArray(32) { 8 }))
         override fun findById(id: M3SurfaceId) = ids[id]
         override fun findByVoxel(voxel: M3Voxel) = voxels[voxel]
         override fun readPage(region: M3StorageRegion, page: Int, cursor: Int, limit: Int) = M3CompactPage(emptyList(), null, 0)
         override fun readSourceById(id: M3SurfaceId) = M3CanonicalPageRead.Complete(sourceIds[id], 0, 0)
         override fun visitSourceSupport(target: M3SurfaceId, cursor: M3SourceSupportCursor?, sink: (M3PagedSupport) -> Boolean): M3SourceSupportRead {
+            supportVisits++
             if (cursor != null) return M3SourceSupportRead.Complete(0, null, 0, 0)
             var delivered = 0; supports[target.value].orEmpty().forEach { if (sink(M3PagedSupport(target, it))) delivered++ }
             return M3SourceSupportRead.Complete(delivered, null, 0, 0)

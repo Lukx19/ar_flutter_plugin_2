@@ -29,6 +29,25 @@ internal interface M3CanonicalStateView : AutoCloseable {
     fun retainedMemoryReceipt(): M3CompactRetainedMemoryReceipt
 
     fun allocatedStorageReceipt(): M3CompactStorageReceipt
+
+    /** Monotonic bounded-reader work, used to prove dirty planning is independent of live N. */
+    fun readWorkReceipt(): M3CanonicalReadWork = M3CanonicalReadWork.ZERO
+}
+
+internal data class M3CanonicalReadWork(
+    val directLookups: Long,
+    val pageReads: Long,
+    val inspectedRows: Long,
+    val bytesRead: Long,
+) {
+    operator fun minus(previous: M3CanonicalReadWork) = M3CanonicalReadWork(
+        directLookups - previous.directLookups,
+        pageReads - previous.pageReads,
+        inspectedRows - previous.inspectedRows,
+        bytesRead - previous.bytesRead,
+    )
+
+    companion object { val ZERO = M3CanonicalReadWork(0, 0, 0, 0) }
 }
 
 internal data class M3CompactCanonicalCut(
@@ -332,12 +351,18 @@ private constructor(
 ) : M3CanonicalStateView {
     private val cache = M3CanonicalPageCache(File(rootDirectory, PAGES_FILE))
     @Volatile private var closed = false
+    private var directLookupWork = 0L
+    private var pageReadWork = 0L
+    private var inspectedRowWork = 0L
+    private var byteReadWork = 0L
 
     override fun findById(id: M3SurfaceId): M3CompactSurface? {
+        directLookupWork++
         if (closed || id.value !in 1..UINT32_MAX) return null
         var low = 0
         var high = rowCount - 1
         while (low <= high) {
+            inspectedRowWork++
             val mid = (low + high) ushr 1
             val slot = idOrder[mid]
             when (val c = unsignedCompare(unsigned(rowId[slot]), id.value)) {
@@ -350,10 +375,12 @@ private constructor(
     }
 
     override fun findByVoxel(voxel: M3Voxel): M3CompactSurface? {
+        directLookupWork++
         if (closed) return null
         var low = 0
         var high = rowCount - 1
         while (low <= high) {
+            inspectedRowWork++
             val mid = (low + high) ushr 1
             val slot = voxelOrder[mid]
             when (
@@ -373,6 +400,7 @@ private constructor(
         cursor: Int,
         limit: Int,
     ): M3CompactPage {
+        pageReadWork++
         if (closed || page !in 0..26 || cursor !in 0..rowCount || limit !in 1..MAX_PAGE_READ)
             return M3CompactPage(emptyList(), null, 0)
         val range = pageRanges.find(region, page)
@@ -382,6 +410,7 @@ private constructor(
         val delivered = minOf(limit, rangeCount - cursor)
         val rows = ArrayList<M3CompactSurface>(delivered)
         repeat(delivered) { offset ->
+            inspectedRowWork++
             rows += row(pageOrder[pageRanges.start[range] + cursor + offset])
         }
         val next = cursor + delivered
@@ -389,6 +418,7 @@ private constructor(
     }
 
     override fun readSourceById(id: M3SurfaceId): M3CanonicalPageRead<M3PagedSource?> {
+        pageReadWork++
         if (closed) return M3CanonicalPageRead.Refused(M3CompactCanonicalRefusal.CLOSED)
         val entryIndex =
             findDirectory(M3CanonicalPageKind.SOURCE, id.value)
@@ -396,6 +426,7 @@ private constructor(
         return when (val page = cache.read(entryIndex, entry(entryIndex))) {
             is M3CanonicalPageRead.Refused -> page
             is M3CanonicalPageRead.Complete -> {
+                byteReadWork += page.bytesRead
                 val value =
                     try {
                         M3CanonicalPageCache.decodeSources(page.value)
@@ -413,6 +444,7 @@ private constructor(
         cursor: M3SourceSupportCursor?,
         sink: (M3PagedSupport) -> Boolean,
     ): M3SourceSupportRead {
+        pageReadWork++
         if (closed) return M3SourceSupportRead.Refused(M3CompactCanonicalRefusal.CLOSED)
         if (
             cursor != null &&
@@ -436,6 +468,7 @@ private constructor(
         return when (val page = cache.read(entryIndex, entry(entryIndex))) {
             is M3CanonicalPageRead.Refused -> M3SourceSupportRead.Refused(page.reason)
             is M3CanonicalPageRead.Complete -> {
+                byteReadWork += page.bytesRead
                 val records =
                     try {
                         M3CanonicalPageCache.decodeSupports(page.value)
@@ -492,6 +525,13 @@ private constructor(
         )
 
     override fun allocatedStorageReceipt() = storageReceipt
+
+    override fun readWorkReceipt() = M3CanonicalReadWork(
+        directLookupWork,
+        pageReadWork,
+        inspectedRowWork,
+        byteReadWork,
+    )
 
     override fun close() {
         closed = true
