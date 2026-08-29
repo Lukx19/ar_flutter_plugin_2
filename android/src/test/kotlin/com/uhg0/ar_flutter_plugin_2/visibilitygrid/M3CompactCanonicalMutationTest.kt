@@ -4,12 +4,17 @@ import com.uhg0.ar_flutter_plugin_2.capture.JvmDescriptorFilesystemV2
 import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetCoordinatorV2
 import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetPolicyV2
 import java.io.File
+import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.io.FileOutputStream
 import java.nio.file.Files
 import java.security.DigestOutputStream
 import java.security.MessageDigest
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -17,6 +22,148 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class M3CompactCanonicalMutationTest {
+    @Test
+    fun `all seven mutation kinds persist exact complete private semantics`() {
+        val directory = Files.createTempDirectory("m3-cow-seven-kinds").toFile()
+        try {
+            val activeRows = listOf(
+                row(1, M3Voxel(0, 0, 0)), row(2, M3Voxel(1, 0, 0)),
+                row(3, M3Voxel(2, 0, 0)), row(4, M3Voxel(3, 0, 0)),
+            )
+            data class Scenario(
+                val name: String,
+                val kind: M3PreparedMutationKind,
+                val base: TestView,
+                val command: Any,
+                val expected: Map<Long, M3Voxel>,
+                val removed: Set<Long>,
+                val support: Map<Long, List<Long>>,
+                val lineage: Map<Long, List<Long>>,
+                val expectedKinds: Set<M3CowFragmentKind>,
+            )
+            val rowKinds = setOf(M3CowFragmentKind.ROW, M3CowFragmentKind.ID_INDEX, M3CowFragmentKind.VOXEL_INDEX, M3CowFragmentKind.PAGE_INDEX)
+            val evidenceKinds = setOf(M3CowFragmentKind.SOURCE, M3CowFragmentKind.SUPPORT)
+            val tombstoneKinds = setOf(M3CowFragmentKind.ID_TOMBSTONE, M3CowFragmentKind.VOXEL_TOMBSTONE, M3CowFragmentKind.PAGE_TOMBSTONE, M3CowFragmentKind.SUPPORT_TOMBSTONE, M3CowFragmentKind.LINEAGE_TOMBSTONE)
+            val relocationKinds = rowKinds + setOf(M3CowFragmentKind.SUPPORT, M3CowFragmentKind.LINEAGE) + tombstoneKinds
+            val replacementKinds = rowKinds + evidenceKinds + setOf(M3CowFragmentKind.LINEAGE) + tombstoneKinds
+            fun active(name: String) = view(name, activeRows)
+            val scenarios = listOf(
+                Scenario("feature-add", M3PreparedMutationKind.FEATURE_ADD, view("feature-add", emptyList()),
+                    M3FeatureMutationCommand("feature-add", 0, 0, target(null, M3Voxel(10, 0, 0))),
+                    mapOf(1L to M3Voxel(10, 0, 0)), emptySet(), mapOf(1L to listOf(1L)), emptyMap(), rowKinds + evidenceKinds),
+                Scenario("feature-refine", M3PreparedMutationKind.FEATURE_REFINE, view("feature-refine", listOf(row(1, M3Voxel(0, 0, 0)))),
+                    M3FeatureMutationCommand("feature-refine", 0, 0, target(M3SurfaceId(1), M3Voxel(0, 0, 0), 191)),
+                    mapOf(1L to M3Voxel(0, 0, 0)), emptySet(), mapOf(1L to listOf(1L)), emptyMap(), rowKinds),
+                Scenario("create", M3PreparedMutationKind.CREATE, view("create", emptyList()),
+                    M3CanonicalTransactionCommand("create", M3CanonicalOperation.CREATE, 0, 0, emptyList(), listOf(target(null, M3Voxel(10, 0, 0)), target(null, M3Voxel(11, 0, 0)))),
+                    mapOf(1L to M3Voxel(10, 0, 0), 2L to M3Voxel(11, 0, 0)), emptySet(), mapOf(1L to listOf(1L), 2L to listOf(2L)), emptyMap(), rowKinds + evidenceKinds),
+                Scenario("relocation", M3PreparedMutationKind.RELOCATION, active("relocation"),
+                    M3CanonicalTransactionCommand("relocation", M3CanonicalOperation.RELOCATION, 0, 0, listOf(M3SurfaceId(1)), listOf(target(M3SurfaceId(1), M3Voxel(10, 0, 0)))),
+                    mapOf(1L to M3Voxel(10, 0, 0), 2L to M3Voxel(1, 0, 0), 3L to M3Voxel(2, 0, 0), 4L to M3Voxel(3, 0, 0)), emptySet(), mapOf(1L to listOf(1L), 2L to listOf(2L), 3L to listOf(3L), 4L to listOf(4L)), mapOf(1L to listOf(1L)), relocationKinds),
+                Scenario("merge", M3PreparedMutationKind.MERGE, active("merge"),
+                    M3CanonicalTransactionCommand("merge", M3CanonicalOperation.MERGE, 0, 0, listOf(M3SurfaceId(2), M3SurfaceId(3)), listOf(target(null, M3Voxel(20, 0, 0)))),
+                    mapOf(1L to M3Voxel(0, 0, 0), 4L to M3Voxel(3, 0, 0), 5L to M3Voxel(20, 0, 0)), setOf(2L, 3L), mapOf(1L to listOf(1L), 4L to listOf(4L), 5L to listOf(2L, 3L)), mapOf(2L to listOf(5L), 3L to listOf(5L)), replacementKinds),
+                Scenario("split", M3PreparedMutationKind.SPLIT, active("split"),
+                    M3CanonicalTransactionCommand("split", M3CanonicalOperation.SPLIT, 0, 0, listOf(M3SurfaceId(4)), listOf(target(null, M3Voxel(30, 0, 0)), target(null, M3Voxel(31, 0, 0)))),
+                    mapOf(1L to M3Voxel(0, 0, 0), 2L to M3Voxel(1, 0, 0), 3L to M3Voxel(2, 0, 0), 5L to M3Voxel(30, 0, 0), 6L to M3Voxel(31, 0, 0)), setOf(4L), mapOf(1L to listOf(1L), 2L to listOf(2L), 3L to listOf(3L), 5L to listOf(4L), 6L to listOf(4L)), mapOf(4L to listOf(5L, 6L)), replacementKinds),
+                Scenario("replacement", M3PreparedMutationKind.REPLACEMENT, active("replacement"),
+                    M3CanonicalTransactionCommand("replacement", M3CanonicalOperation.REPLACEMENT, 0, 0, listOf(M3SurfaceId(1)), listOf(target(null, M3Voxel(40, 0, 0)))),
+                    mapOf(2L to M3Voxel(1, 0, 0), 3L to M3Voxel(2, 0, 0), 4L to M3Voxel(3, 0, 0), 5L to M3Voxel(40, 0, 0)), setOf(1L), mapOf(2L to listOf(2L), 3L to listOf(3L), 4L to listOf(4L), 5L to listOf(1L)), mapOf(1L to listOf(5L)), replacementKinds),
+            )
+            scenarios.forEach { scenario ->
+                val intent = when (val command = scenario.command) {
+                    is M3FeatureMutationCommand -> intent(scenario.base, command, File(directory, "${scenario.name}-intent"))
+                    is M3CanonicalTransactionCommand -> intent(scenario.base, command, File(directory, "${scenario.name}-intent"))
+                    else -> error("unknown command")
+                }
+                val exactCurrent = ByteArrayOutputStream().also { output ->
+                    assertTrue(intent.visitCurrent(M3PreparedIntentVisitor.NONE, output) is M3PreparedIntentVisitResult.Complete)
+                }.toByteArray()
+                val generation = stage(scenario.base, intent, File(directory, "${scenario.name}-generations"))
+                assertEquals(scenario.kind, generation.root.commandKind)
+                assertEquals(scenario.name, scenario.expectedKinds, generation.root.manifest.mapTo(mutableSetOf()) { it.kind })
+                assertArrayEquals(exactCurrent, File(generation.directory, M3CanonicalCowGeneration.CURRENT_UNACKED_FILE).readBytes())
+                val overlay = generation.overlay(scenario.base)
+                scenario.expected.forEach { (id, voxel) ->
+                    assertEquals("${scenario.name} id=$id", voxel, overlay.findById(M3SurfaceId(id))?.voxel)
+                    assertEquals("${scenario.name} voxel=$voxel", id, overlay.findByVoxel(voxel)?.id?.value)
+                    assertNotNull("${scenario.name} source=$id", (overlay.readSourceById(M3SurfaceId(id)) as M3CanonicalPageRead.Complete).value)
+                    val location = requireNotNull(m3CompactLocation(M3SurfaceOwnershipConfiguration(), voxel))
+                    assertTrue("${scenario.name} page=$id", overlay.readPage(location.region, location.page, 0, 512).rows.any { it.id.value == id && it.voxel == voxel })
+                }
+                scenario.removed.forEach { id ->
+                    assertNull("${scenario.name} removed=$id", overlay.findById(M3SurfaceId(id)))
+                    assertNotNull("${scenario.name} historical source=$id", (overlay.readSourceById(M3SurfaceId(id)) as M3CanonicalPageRead.Complete).value)
+                    val removedSupport = mutableListOf<Long>()
+                    assertTrue(overlay.visitSourceSupport(M3SurfaceId(id), null) { removedSupport += it.source.id.value; true } is M3SourceSupportRead.Complete)
+                    assertTrue("${scenario.name} removed support=$id", removedSupport.isEmpty())
+                }
+                scenario.base.rowsSnapshot().filter { old -> scenario.expected[old.id.value] != old.voxel }.forEach { old ->
+                    assertNull("${scenario.name} old voxel=${old.voxel}", overlay.findByVoxel(old.voxel))
+                    val location = requireNotNull(m3CompactLocation(M3SurfaceOwnershipConfiguration(), old.voxel))
+                    assertTrue("${scenario.name} old page=${old.id.value}", overlay.readPage(location.region, location.page, 0, 512).rows.none { it.id == old.id && it.voxel == old.voxel })
+                }
+                scenario.support.forEach { (targetId, expectedSources) ->
+                    val actual = mutableListOf<Long>()
+                    assertTrue(overlay.visitSourceSupport(M3SurfaceId(targetId), null) { actual += it.source.id.value; true } is M3SourceSupportRead.Complete)
+                    assertEquals("${scenario.name} support=$targetId", expectedSources, actual)
+                }
+                (scenario.base.rowsSnapshot().map { it.id.value } + scenario.expected.keys + scenario.lineage.keys).distinct().forEach { sourceId ->
+                    val actual = mutableListOf<Long>()
+                    assertTrue(overlay.visitLineage(M3SurfaceId(sourceId), null) { actual += it.target.value; true } is M3LineageRead.Complete)
+                    assertEquals("${scenario.name} lineage=$sourceId", scenario.lineage[sourceId].orEmpty(), actual)
+                }
+                assertEquals(scenario.expected.size, overlay.cut.liveSurfaceCount)
+            }
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test
+    fun `existing overlay fails closed after generation close without base fallback`() {
+        val directory = Files.createTempDirectory("m3-cow-close").toFile()
+        try {
+            val base = view("close", listOf(row(1, M3Voxel(0, 0, 0)), row(2, M3Voxel(1, 0, 0))))
+            val preparedIntent = intent(
+                base,
+                M3FeatureMutationCommand("close", 0, 0, target(M3SurfaceId(1), M3Voxel(0, 0, 0), 191)),
+                File(directory, "intent"),
+            )
+            val generation = stage(base, preparedIntent, File(directory, "generations"))
+            val overlay = generation.overlay(base)
+            assertNotNull(overlay.findById(M3SurfaceId(2)))
+            val location = requireNotNull(m3CompactLocation(M3SurfaceOwnershipConfiguration(), M3Voxel(1, 0, 0)))
+            assertTrue(overlay.readPage(location.region, location.page, 0, 10).rows.isNotEmpty())
+
+            val enteredBaseFallback = CountDownLatch(1)
+            val releaseBaseFallback = CountDownLatch(1)
+            val closeReturned = CountDownLatch(1)
+            val concurrentRead = AtomicReference<M3CompactSurface?>()
+            base.beforeFindById = { id ->
+                if (id == M3SurfaceId(2)) {
+                    enteredBaseFallback.countDown()
+                    assertTrue(releaseBaseFallback.await(5, TimeUnit.SECONDS))
+                }
+            }
+            val reader = Thread { concurrentRead.set(overlay.findById(M3SurfaceId(2))) }.also { it.start() }
+            assertTrue(enteredBaseFallback.await(5, TimeUnit.SECONDS))
+            val closer = Thread { generation.close(); closeReturned.countDown() }.also { it.start() }
+            assertFalse("close crossed an in-flight generation read", closeReturned.await(100, TimeUnit.MILLISECONDS))
+            releaseBaseFallback.countDown()
+            reader.join(5_000); closer.join(5_000)
+            assertFalse(reader.isAlive); assertFalse(closer.isAlive)
+            assertNotNull(concurrentRead.get())
+            assertEquals(0L, closeReturned.count)
+
+            assertNull(overlay.findById(M3SurfaceId(2)))
+            assertNull(overlay.findByVoxel(M3Voxel(1, 0, 0)))
+            assertTrue(overlay.readPage(location.region, location.page, 0, 10).rows.isEmpty())
+            assertEquals(M3CompactCanonicalRefusal.CLOSED, (overlay.readSourceById(M3SurfaceId(2)) as M3CanonicalPageRead.Refused).reason)
+            assertEquals(M3CompactCanonicalRefusal.CLOSED, (overlay.visitSourceSupport(M3SurfaceId(2), null) { true } as M3SourceSupportRead.Refused).reason)
+            assertEquals(M3CompactCanonicalRefusal.CLOSED, (overlay.visitLineage(M3SurfaceId(2), null) { true } as M3LineageRead.Refused).reason)
+            assertEquals(M3CompactCanonicalRefusal.CLOSED, (generation.readPage(base, location.region, location.page, null, 10) as M3CowPageRead.Refused).reason)
+        } finally { directory.deleteRecursively() }
+    }
+
     @Test
     fun `physical reservation reconciles every candidate file and changed command bytes conflict`() {
         val directory = Files.createTempDirectory("m3-cow-physical").toFile()
@@ -231,18 +378,34 @@ class M3CompactCanonicalMutationTest {
         return (M3CompactCanonicalStore.openV6(group, directory, budget) as M3CompactCanonicalOpenResult.Opened).store
     }
 
-    private fun view(name: String, rows: List<M3CompactSurface>, declaredRows: Int = rows.size): TestView {
+    private fun view(
+        name: String,
+        rows: List<M3CompactSurface>,
+        declaredRows: Int = rows.size,
+        lineage: List<M3LineageEdge> = emptyList(),
+    ): TestView {
         val cut = M3CompactCanonicalCut(M3SurfaceGroup(name), M3CompactCanonicalStore.PROFILE, 0, 0, declaredRows + 1L,
-            declaredRows, declaredRows, declaredRows, 0, null, hash("root-$name"), hash("source-$name"))
-        return TestView(cut, rows)
+            declaredRows, declaredRows, declaredRows, lineage.size, null, hash("root-$name"), hash("source-$name"))
+        return TestView(cut, rows, lineage)
     }
 
-    private class TestView(override val cut: M3CompactCanonicalCut, private val rows: List<M3CompactSurface>) : M3CanonicalStateView {
+    private class TestView(
+        override val cut: M3CompactCanonicalCut,
+        private val rows: List<M3CompactSurface>,
+        private val lineage: List<M3LineageEdge>,
+    ) : M3CanonicalStateView {
         var lookups = 0
         var pageScans = 0
-        override fun findById(id: M3SurfaceId): M3CompactSurface? { lookups++; return rows.firstOrNull { it.id == id } }
+        var beforeFindById: ((M3SurfaceId) -> Unit)? = null
+        fun rowsSnapshot() = rows.toList()
+        override fun findById(id: M3SurfaceId): M3CompactSurface? { beforeFindById?.invoke(id); lookups++; return rows.firstOrNull { it.id == id } }
         override fun findByVoxel(voxel: M3Voxel): M3CompactSurface? { lookups++; return rows.firstOrNull { it.voxel == voxel } }
-        override fun readPage(region: M3StorageRegion, page: Int, cursor: Int, limit: Int): M3CompactPage { pageScans++; return M3CompactPage(emptyList(), null, 0) }
+        override fun readPage(region: M3StorageRegion, page: Int, cursor: Int, limit: Int): M3CompactPage {
+            pageScans++
+            val matching = rows.filter { row -> m3CompactLocation(M3SurfaceOwnershipConfiguration(), row.voxel)?.let { it.region == region && it.page == page } == true }
+            val end = minOf(matching.size, cursor + limit)
+            return M3CompactPage(if (cursor <= matching.size) matching.subList(cursor, end) else emptyList(), if (end < matching.size) end else null, matching.size)
+        }
         override fun readSourceById(id: M3SurfaceId): M3CanonicalPageRead<M3PagedSource?> = M3CanonicalPageRead.Complete(rows.firstOrNull { it.id == id }?.let {
             M3PagedSource(it.id, it.voxel, it.packedNormal, it.normalConfidence, M3CanonicalReceiptBytes(ByteArray(32)))
         }, 0, 0)
@@ -250,6 +413,12 @@ class M3CompactCanonicalMutationTest {
             val source = rows.firstOrNull { it.id == target }
             val delivered = if (source != null && sink(M3PagedSupport(target, M3PagedSource(source.id, source.voxel, source.packedNormal, source.normalConfidence, M3CanonicalReceiptBytes(ByteArray(32)))))) 1 else 0
             return M3SourceSupportRead.Complete(delivered, null, 0, 0)
+        }
+        override fun visitLineage(source: M3SurfaceId, cursor: M3LineageCursor?, sink: (M3LineageEdge) -> Boolean): M3LineageRead {
+            val matches = lineage.filter { it.source == source }
+            var delivered = 0
+            matches.drop(cursor?.offset ?: 0).forEach { if (!sink(it)) return M3LineageRead.Complete(delivered, M3LineageCursor(cut.rootHash, source, delivered)); delivered++ }
+            return M3LineageRead.Complete(delivered, null)
         }
         override fun retainedMemoryReceipt() = error("unused")
         override fun allocatedStorageReceipt() = error("unused")

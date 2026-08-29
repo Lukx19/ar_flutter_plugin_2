@@ -23,20 +23,31 @@ internal class M3CanonicalCowGeneration private constructor(
 ) : AutoCloseable {
     private var closed = false
 
+    @Synchronized
     override fun close() { closed = true }
 
+    @Synchronized
     fun storageReceipt() = storage
-    internal fun withAllocatedStorage(bytes: Long) = M3CanonicalCowGeneration(
-        directory, root, entries, storage.copy(allocatedBytes = bytes),
-    )
+    @Synchronized
+    internal fun withAllocatedStorage(bytes: Long): M3CanonicalCowGeneration {
+        check(!closed)
+        return M3CanonicalCowGeneration(directory, root, entries, storage.copy(allocatedBytes = bytes))
+    }
+
+    /** Holds the generation lifecycle lock across a complete overlay operation. */
+    @Synchronized
+    internal fun <T> readOr(closedResult: T, operation: () -> T): T =
+        if (closed) closedResult else operation()
 
     /** Private lookup view.  It has no publication capability. */
+    @Synchronized
     fun overlay(base: M3CanonicalStateView): M3CanonicalStateView {
         require(!closed && base.cut == root.baseCut)
         return M3CowOverlay(base, this)
     }
 
     /** Root-bound private page cursor; #114's public cursor contract is unchanged. */
+    @Synchronized
     fun readPage(
         base: M3CanonicalStateView,
         region: M3StorageRegion,
@@ -52,6 +63,7 @@ internal class M3CanonicalCowGeneration private constructor(
         return M3CowPageRead.Complete(result.rows, result.nextCursor?.let { M3CowPageCursor(target.rootHash, region, page, it) }, result.inspectedRows)
     }
 
+    @Synchronized
     private fun records(kind: M3CowFragmentKind, sink: (M3CowRecord) -> Boolean): Boolean {
         if (closed) return false
         return entries.asSequence().filter { it.kind == kind }.all { entry ->
@@ -60,6 +72,7 @@ internal class M3CanonicalCowGeneration private constructor(
         }
     }
 
+    @Synchronized
     private fun records(kind: M3CowFragmentKind, key: Long, sink: (M3CowRecord) -> Boolean): Boolean {
         if (closed) return false
         return entries.asSequence().filter { it.kind == kind && java.lang.Long.compareUnsigned(key, it.minimumKey) >= 0 && java.lang.Long.compareUnsigned(key, it.maximumKey) <= 0 }
@@ -111,10 +124,12 @@ internal class M3CanonicalCowGeneration private constructor(
 
     internal fun visit(kind: M3CowFragmentKind, sink: (M3CowRecord) -> Boolean) = records(kind, sink)
     internal fun visit(kind: M3CowFragmentKind, key: Long, sink: (M3CowRecord) -> Boolean) = records(kind, key, sink)
-    internal fun has(kind: M3CowFragmentKind, key: Long) = entries.any {
+    @Synchronized
+    internal fun has(kind: M3CowFragmentKind, key: Long) = !closed && entries.any {
         it.kind == kind && java.lang.Long.compareUnsigned(key, it.minimumKey) >= 0 && java.lang.Long.compareUnsigned(key, it.maximumKey) <= 0
     }
 
+    @Synchronized
     internal fun visitSupport(
         rootHash: M3CanonicalReceiptBytes,
         target: M3SurfaceId,
@@ -391,19 +406,23 @@ internal sealed interface M3CowPageRead {
 
 private class M3CowOverlay(private val base: M3CanonicalStateView, private val delta: M3CanonicalCowGeneration) : M3CanonicalStateView {
     override val cut get() = delta.root.targetCut()
-    override fun findById(id: M3SurfaceId): M3CompactSurface? {
+    override fun findById(id: M3SurfaceId): M3CompactSurface? = delta.readOr(null) { findByIdOpen(id) }
+    private fun findByIdOpen(id: M3SurfaceId): M3CompactSurface? {
         var row: M3CompactSurface? = null; if (!delta.visit(M3CowFragmentKind.ROW, id.value) { record -> if (record is M3CowRecord.Row && record.value.id == id.value) row = record.value.surface(); true }) return null
         if (row != null) return row
         var removed = false; if (!delta.visit(M3CowFragmentKind.ID_TOMBSTONE, id.value) { record -> if (record is M3CowRecord.Tombstone && record.key == id.value) removed = true; true }) return null
         return if (removed) null else base.findById(id)
     }
-    override fun findByVoxel(voxel: M3Voxel): M3CompactSurface? {
+    override fun findByVoxel(voxel: M3Voxel): M3CompactSurface? = delta.readOr(null) { findByVoxelOpen(voxel) }
+    private fun findByVoxelOpen(voxel: M3Voxel): M3CompactSurface? {
         var dirty: M3CompactSurface? = null; if (!delta.visit(M3CowFragmentKind.ROW) { record -> if (record is M3CowRecord.Row && record.value.surface().voxel == voxel) dirty = record.value.surface(); true }) return null
         if (dirty != null) return dirty
         val old = base.findByVoxel(voxel) ?: return null
-        return findById(old.id)?.takeIf { it.voxel == voxel }
+        return findByIdOpen(old.id)?.takeIf { it.voxel == voxel }
     }
-    override fun readPage(region: M3StorageRegion, page: Int, cursor: Int, limit: Int): M3CompactPage {
+    override fun readPage(region: M3StorageRegion, page: Int, cursor: Int, limit: Int): M3CompactPage =
+        delta.readOr(M3CompactPage(emptyList(), null, 0)) { readPageOpen(region, page, cursor, limit) }
+    private fun readPageOpen(region: M3StorageRegion, page: Int, cursor: Int, limit: Int): M3CompactPage {
         if (limit !in 1..512 || cursor < 0 || page !in 0..26) return M3CompactPage(emptyList(), null, 0)
         // The base page is the only base population touched.  A dirty row wins
         // by id and an old location is suppressed by findById's tombstone path.
@@ -412,7 +431,7 @@ private class M3CowOverlay(private val base: M3CanonicalStateView, private val d
         while (true) {
             val basePage = base.readPage(region, page, baseCursor, 512)
             basePage.rows.forEach { row ->
-                val visible = findById(row.id)
+                val visible = findByIdOpen(row.id)
                 if (visible != null && visible.voxel == row.voxel) merged += visible
             }
             baseCursor = basePage.nextCursor ?: break
@@ -431,7 +450,9 @@ private class M3CowOverlay(private val base: M3CanonicalStateView, private val d
         val pageRows = merged.subList(cursor, end).toList()
         return M3CompactPage(pageRows, if (end < merged.size) end else null, merged.size)
     }
-    override fun readSourceById(id: M3SurfaceId): M3CanonicalPageRead<M3PagedSource?> {
+    override fun readSourceById(id: M3SurfaceId): M3CanonicalPageRead<M3PagedSource?> =
+        delta.readOr(M3CanonicalPageRead.Refused(M3CompactCanonicalRefusal.CLOSED)) { readSourceByIdOpen(id) }
+    private fun readSourceByIdOpen(id: M3SurfaceId): M3CanonicalPageRead<M3PagedSource?> {
         var value: M3PagedSource? = null; val ok = delta.visit(M3CowFragmentKind.SOURCE, id.value) { record -> if (record is M3CowRecord.Source && record.value.id == id.value) value = record.value.source(); true }
         if (!ok) return M3CanonicalPageRead.Refused(M3CompactCanonicalRefusal.CORRUPT)
         if (value != null) return M3CanonicalPageRead.Complete(value, 0, 0)
@@ -439,7 +460,9 @@ private class M3CowOverlay(private val base: M3CanonicalStateView, private val d
         // a live row never tombstones its source identity.
         return base.readSourceById(id)
     }
-    override fun visitSourceSupport(target: M3SurfaceId, cursor: M3SourceSupportCursor?, sink: (M3PagedSupport) -> Boolean): M3SourceSupportRead {
+    override fun visitSourceSupport(target: M3SurfaceId, cursor: M3SourceSupportCursor?, sink: (M3PagedSupport) -> Boolean): M3SourceSupportRead =
+        delta.readOr(M3SourceSupportRead.Refused(M3CompactCanonicalRefusal.CLOSED)) { visitSourceSupportOpen(target, cursor, sink) }
+    private fun visitSourceSupportOpen(target: M3SurfaceId, cursor: M3SourceSupportCursor?, sink: (M3PagedSupport) -> Boolean): M3SourceSupportRead {
         if (cursor != null && (cursor.rootHash != cut.rootHash || cursor.target != target)) return M3SourceSupportRead.Refused(M3CompactCanonicalRefusal.STALE_CURSOR)
         if (delta.has(M3CowFragmentKind.SUPPORT, target.value)) return delta.visitSupport(cut.rootHash, target, cursor, sink)
         var removed = false; delta.visit(M3CowFragmentKind.SUPPORT_TOMBSTONE, target.value) { record -> if (record is M3CowRecord.Tombstone && record.key == target.value) removed = true; true }
@@ -450,7 +473,9 @@ private class M3CowOverlay(private val base: M3CanonicalStateView, private val d
             is M3SourceSupportRead.Complete -> read.copy(nextCursor = read.nextCursor?.copy(rootHash = cut.rootHash))
         }
     }
-    override fun visitLineage(source: M3SurfaceId, cursor: M3LineageCursor?, sink: (M3LineageEdge) -> Boolean): M3LineageRead {
+    override fun visitLineage(source: M3SurfaceId, cursor: M3LineageCursor?, sink: (M3LineageEdge) -> Boolean): M3LineageRead =
+        delta.readOr(M3LineageRead.Refused(M3CompactCanonicalRefusal.CLOSED)) { visitLineageOpen(source, cursor, sink) }
+    private fun visitLineageOpen(source: M3SurfaceId, cursor: M3LineageCursor?, sink: (M3LineageEdge) -> Boolean): M3LineageRead {
         if (cursor != null && (cursor.rootHash != cut.rootHash || cursor.source != source || cursor.offset < 0))
             return M3LineageRead.Refused(M3CompactCanonicalRefusal.STALE_CURSOR)
         if (delta.has(M3CowFragmentKind.LINEAGE, source.value)) {
@@ -478,9 +503,12 @@ private class M3CowOverlay(private val base: M3CanonicalStateView, private val d
             is M3LineageRead.Complete -> read.copy(nextCursor = read.nextCursor?.copy(rootHash = cut.rootHash))
         }
     }
-    override fun retainedMemoryReceipt() = base.retainedMemoryReceipt()
-    override fun allocatedStorageReceipt() = base.allocatedStorageReceipt()
-    override fun readWorkReceipt() = base.readWorkReceipt()
+    override fun retainedMemoryReceipt() = delta.readOr<M3CompactRetainedMemoryReceipt?>(null) { base.retainedMemoryReceipt() }
+        ?: error("COW generation is closed")
+    override fun allocatedStorageReceipt() = delta.readOr<M3CompactStorageReceipt?>(null) { base.allocatedStorageReceipt() }
+        ?: error("COW generation is closed")
+    override fun readWorkReceipt() = delta.readOr<M3CanonicalReadWork?>(null) { base.readWorkReceipt() }
+        ?: error("COW generation is closed")
     override fun close() = Unit
 }
 

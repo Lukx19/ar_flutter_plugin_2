@@ -316,7 +316,11 @@ class StorageBudgetCoordinatorV2(
     companion object {
         private val OWNER = Regex("[A-Za-z0-9._:-]{1,160}")
         private val CANDIDATE = Regex("[A-Za-z0-9._-]{1,160}")
-        private val STAGING = Regex("m3-canonical-v6-[0-9a-f]{64}\\.staging-[A-Za-z0-9._-]{1,64}")
+        /** Exact private-candidate namespaces whose uncharged trees startup recovery may delete. */
+        private val STAGING = Regex(
+            "(?:m3-canonical-v6-[0-9a-f]{64}\\.staging-[A-Za-z0-9._-]{1,64}|" +
+                "\\.m3-cow-command-[0-9a-f]{64}\\.staging)",
+        )
         private val locks = mutableMapOf<String, Any>()
         private fun lockFor(directory: File): Any = synchronized(locks) {
             locks.getOrPut(directory.absoluteFile.toPath().normalize().toString()) { Any() }
