@@ -233,7 +233,7 @@ class M3CompactCanonicalMutationTest {
             val cowPage = added.generation.readPage(empty, location.region, location.page, null, 1) as M3CowPageRead.Complete
             assertEquals(listOf(1L), cowPage.rows.map { it.id.value })
             val stalePage = added.generation.readPage(empty, location.region, location.page,
-                M3CowPageCursor(M3CanonicalReceiptBytes(ByteArray(32)), location.region, location.page, 0), 1)
+                M3CowPageCursor(M3CanonicalReceiptBytes(ByteArray(32)), location.region, location.page, 0, 0, 0), 1)
             assertEquals(M3CompactCanonicalRefusal.STALE_CURSOR, (stalePage as M3CowPageRead.Refused).reason)
             assertEquals(added.generation.root.current.length, File(added.generation.directory, M3CanonicalCowGeneration.CURRENT_UNACKED_FILE).length())
             assertTrue(added.generation.storageReceipt().phasePeakBytes <= 1_048_576L)
@@ -292,6 +292,150 @@ class M3CompactCanonicalMutationTest {
             assertTrue("large inspected=${largeWork.inspectedRows}", largeWork.inspectedRows < 64)
             assertEquals(0, smallWork.pageReads)
             assertEquals(0, largeWork.pageReads)
+
+            val voxel = M3Voxel(0, 0, 0)
+            val location = requireNotNull(m3CompactLocation(M3SurfaceOwnershipConfiguration(), voxel))
+            fun queryReceipt(generation: M3CanonicalCowGeneration, base: M3CanonicalStateView): M3CowReadWork {
+                val before = generation.readWorkReceipt()
+                assertEquals(M3SurfaceId(1), generation.overlay(base).findByVoxel(voxel)?.id)
+                val page = generation.readPage(base, location.region, location.page, null, 1) as M3CowPageRead.Complete
+                assertEquals(listOf(1L), page.rows.map { it.id.value })
+                return generation.readWorkReceipt() - before
+            }
+            assertEquals(queryReceipt(smallGeneration, small), queryReceipt(largeGeneration, large))
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test
+    fun `same-page dirty and tombstone indexes stream across radix windows in canonical order`() {
+        val directory = Files.createTempDirectory("m3-cow-dense-page").toFile()
+        try {
+            val count = 700
+            fun voxel(index: Int) = M3Voxel(index / 100, (index / 10) % 10, index % 10)
+            val location = requireNotNull(m3CompactLocation(M3SurfaceOwnershipConfiguration(), voxel(0)))
+
+            val empty = view("dense-create", emptyList())
+            val createTargets = (0 until count).reversed().map { target(null, voxel(it)) }
+            val create = M3CanonicalTransactionCommand(
+                "dense-create", M3CanonicalOperation.CREATE, 0, 0, emptyList(), createTargets,
+            )
+            val created = stage(empty, intent(empty, create, File(directory, "create-intent")), File(directory, "create-generation"))
+            val actual = mutableListOf<M3CompactSurface>()
+            var cursor: M3CowPageCursor? = null
+            do {
+                val before = created.readWorkReceipt()
+                val read = created.readPage(empty, location.region, location.page, cursor, 73) as M3CowPageRead.Complete
+                actual += read.rows
+                cursor = read.nextCursor
+                val work = created.readWorkReceipt() - before
+                assertTrue("unbounded dense dirty pages=$work", work.pages <= 75)
+                assertTrue("unbounded dense dirty records=$work", work.records <= 21_000)
+            } while (cursor != null)
+            assertEquals(count, actual.size)
+            assertEquals(count, actual.map { it.id }.toSet().size)
+            assertEquals((0 until count).map(::voxel), actual.map { it.voxel })
+
+            val indexEntry = created.root.manifest.first { it.kind == M3CowFragmentKind.PAGE_INDEX }
+            java.io.RandomAccessFile(File(created.directory, indexEntry.file), "rw").use { file ->
+                file.seek(indexEntry.page.toLong() * M3CanonicalCowGeneration.PAGE_BYTES + 100)
+                val original = file.read()
+                file.seek(indexEntry.page.toLong() * M3CanonicalCowGeneration.PAGE_BYTES + 100)
+                file.write(original xor 0x5a)
+                file.fd.sync()
+            }
+            assertEquals(
+                M3CompactCanonicalRefusal.CORRUPT,
+                (created.readPage(empty, location.region, location.page, null, 73) as M3CowPageRead.Refused).reason,
+            )
+
+            val baseRows = (0 until count).map { row(it + 1L, voxel(it)) }
+            val base = view("dense-remove", baseRows)
+            val replacement = M3CanonicalTransactionCommand(
+                "dense-remove", M3CanonicalOperation.REPLACEMENT, 0, 0,
+                baseRows.map { it.id }, listOf(target(null, M3Voxel(20, 0, 0))),
+            )
+            val removed = stage(base, intent(base, replacement, File(directory, "remove-intent")), File(directory, "remove-generation"))
+            cursor = null
+            var windows = 0
+            do {
+                val before = removed.readWorkReceipt()
+                val read = removed.readPage(base, location.region, location.page, cursor, 73) as M3CowPageRead.Complete
+                assertTrue(read.rows.isEmpty())
+                cursor = read.nextCursor
+                windows++
+                val work = removed.readWorkReceipt() - before
+                assertTrue("unbounded dense tombstone pages=$work", work.pages <= 1)
+                assertTrue("unbounded dense tombstone records=$work", work.records <= 818)
+            } while (cursor != null)
+            assertEquals(2, windows)
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test
+    fun `lookup and page receipts stay equal from one full index page to large dirty generation`() {
+        val directory = Files.createTempDirectory("m3-cow-dirty-scale").toFile()
+        try {
+            val configuration = M3SurfaceOwnershipConfiguration()
+            val requested = requireNotNull(m3CompactLocation(configuration, M3Voxel(0, 0, 0)))
+            val requestedPageKey = M3CanonicalCowGeneration.pageKey(requested.region, requested.page)
+            val common = (0 until 1_000).map { M3Voxel(it / 100, (it / 10) % 10, it % 10) }
+                .sortedWith { a, b -> java.lang.Long.compareUnsigned(
+                    M3CanonicalCowGeneration.voxelKey(a.x, a.y, a.z),
+                    M3CanonicalCowGeneration.voxelKey(b.x, b.y, b.z),
+                ) }
+                .take(M3CowFragmentKind.VOXEL_INDEX.recordsPerPage)
+            val lookupVoxel = common.minWith { a, b -> compareVoxel(a.x, a.y, a.z, b.x, b.y, b.z) }
+            val commonTargets = (listOf(lookupVoxel) + common.filter { it != lookupVoxel }).map { target(null, it) }
+            val voxelThreshold = common.maxOfWith(
+                Comparator { a, b -> java.lang.Long.compareUnsigned(a, b) },
+            ) { M3CanonicalCowGeneration.voxelKey(it.x, it.y, it.z) }
+            val fillers = ArrayList<M3CanonicalTarget>()
+            var candidate = 0
+            while (fillers.size < 5_182) {
+                val value = M3Voxel(10 + candidate / 100, (candidate / 10) % 10, candidate % 10)
+                candidate++
+                val location = requireNotNull(m3CompactLocation(configuration, value))
+                if (java.lang.Long.compareUnsigned(M3CanonicalCowGeneration.pageKey(location.region, location.page), requestedPageKey) <= 0) continue
+                if (java.lang.Long.compareUnsigned(M3CanonicalCowGeneration.voxelKey(value.x, value.y, value.z), voxelThreshold) <= 0) continue
+                fillers += target(null, value)
+            }
+
+            fun generation(name: String, targets: List<M3CanonicalTarget>): Pair<TestView, M3CanonicalCowGeneration> {
+                val base = view(name, emptyList())
+                val command = M3CanonicalTransactionCommand(name, M3CanonicalOperation.CREATE, 0, 0, emptyList(), targets)
+                return base to stage(base, intent(base, command, File(directory, "$name-intent")), File(directory, "$name-generation"))
+            }
+            val (smallBase, small) = generation("dirty-small", commonTargets)
+            val largeBase = view("dirty-large", emptyList())
+            val candidates = commonTargets + fillers
+            fun preparation(count: Int) = M3SurfaceOwnership.prepareMutation(
+                largeBase,
+                configuration,
+                M3CanonicalTransactionCommand("dirty-large", M3CanonicalOperation.CREATE, 0, 0, emptyList(), candidates.take(count)),
+            )
+            assertTrue(preparation(candidates.size) is M3CanonicalMutationPreparation.Refused)
+            var admitted = commonTargets.size
+            var refused = candidates.size
+            while (refused - admitted > 1) {
+                val middle = admitted + (refused - admitted) / 2
+                if (preparation(middle) is M3CanonicalMutationPreparation.Prepared) admitted = middle else refused = middle
+            }
+            assertTrue(admitted > commonTargets.size)
+            val largePlan = (preparation(admitted) as M3CanonicalMutationPreparation.Prepared).mutation
+            val largeIntent = flush(largeBase, largePlan, File(directory, "dirty-large-intent"))
+            val large = stage(largeBase, largeIntent, File(directory, "dirty-large-generation"))
+            fun receipt(base: TestView, generation: M3CanonicalCowGeneration): M3CowReadWork {
+                val before = generation.readWorkReceipt()
+                assertEquals(M3SurfaceId(1), generation.overlay(base).findByVoxel(lookupVoxel)?.id)
+                val page = generation.readPage(base, requested.region, requested.page, null, 1) as M3CowPageRead.Complete
+                assertEquals(listOf(lookupVoxel), page.rows.map { it.voxel })
+                return generation.readWorkReceipt() - before
+            }
+            val smallWork = receipt(smallBase, small)
+            val largeWork = receipt(largeBase, large)
+            assertEquals(smallWork, largeWork)
+            assertEquals(4, largeWork.pages)
+            assertTrue(largeWork.records <= 2_200)
         } finally { directory.deleteRecursively() }
     }
 
@@ -307,7 +451,7 @@ class M3CompactCanonicalMutationTest {
                 assertTrue("$fault returned $first", first is M3CanonicalCowStageResult.Refused)
                 assertEquals(0, base.cut.liveSurfaceCount)
                 val recovered = requireNotNull(M3CanonicalMutableStore.open(parent, RecordingBudget())).stage(intent, base)
-                assertTrue(recovered is M3CanonicalCowStageResult.Prepared)
+                assertTrue("$fault recovery returned $recovered", recovered is M3CanonicalCowStageResult.Prepared)
                 val prepared = recovered as M3CanonicalCowStageResult.Prepared
                 assertEquals(1, prepared.generation.overlay(base).cut.liveSurfaceCount)
                 assertTrue(parent.listFiles().orEmpty().none { it.name.endsWith(".staging") })

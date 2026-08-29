@@ -31,13 +31,12 @@ internal class M3CanonicalMutableStore private constructor(
             ?: return refused(M3CanonicalCowRefusal.INVALID_INTENT)
         if (preflight.phasePeakBytes > M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES || preflight.entries.sumOf { it.encodedBytes() } > M3CanonicalCowGeneration.DIRECTORY_LIMIT_BYTES)
             return refused(M3CanonicalCowRefusal.PHASE_OR_DIRECTORY_LIMIT)
-        val root = M3MutableSemanticRoot(
+        val placeholderRoot = M3MutableSemanticRoot(
             identity.sourceCut, identity.commandId, identity.kind, identity.commandHash, identity.commandFingerprint,
             identity.targetHighWater, identity.targetLive, identity.targetSource, identity.targetSupport,
             identity.targetLineage, identity.targetGeometry, identity.targetLineageRevision,
             preflight.current, preflight.entries,
         )
-        val generationIdentity = M3CowGenerationIdentity.from(root)
         val target = commandDirectory(identity)
         val deterministicStaging = File(parent, ".${target.name}.staging")
         try { budget.reconcileCandidate(target) } catch (_: Exception) {
@@ -45,11 +44,10 @@ internal class M3CanonicalMutableStore private constructor(
         }
         if (!target.exists() && deterministicStaging.exists() && !deterministicStaging.deleteRecursively())
             return refused(M3CanonicalCowRefusal.DURABILITY_FAILURE)
-        M3CanonicalCowGeneration.open(target, generationIdentity)?.let { existing ->
-            return M3CanonicalCowStageResult.Prepared(existing.withAllocatedStorage(budget.allocatedBytes(target)), reused = true)
-        }
         if (target.exists()) {
             val existing = M3CanonicalCowGeneration.open(target)
+            if (existing != null && existing.root.matches(identity, preflight.current))
+                return M3CanonicalCowStageResult.Prepared(existing.withAllocatedStorage(budget.allocatedBytes(target)), reused = true)
             return refused(if (existing != null && existing.root.commandId == identity.commandId && existing.root.commandKind == identity.kind) M3CanonicalCowRefusal.IDENTITY_CONFLICT else M3CanonicalCowRefusal.CORRUPT_GENERATION)
         }
 
@@ -61,8 +59,9 @@ internal class M3CanonicalMutableStore private constructor(
             staging = deterministicStaging
             val files = linkedMapOf<String, Long>()
             preflight.pageCounts.forEach { (kind, pages) -> if (pages > 0) files[kind.file] = pages.toLong() * M3CanonicalCowGeneration.PAGE_BYTES }
+            files.putAll(preflight.temporaryFiles)
             files[M3CanonicalCowGeneration.CURRENT_UNACKED_FILE] = preflight.current.length
-            files["root.m3cow"] = root.encodedBytes()
+            files["root.m3cow"] = placeholderRoot.encodedBytes()
             files["directory.m3cow"] = M3CowDirectoryEntry.encodedFileBytes(preflight.entries)
             val unit = budget.allocationUnitBytes(parent)
             // Candidate files plus staging/target directory entries, reservation
@@ -74,7 +73,14 @@ internal class M3CanonicalMutableStore private constructor(
             inject(fault, M3CanonicalCowFault.BEFORE_FRAGMENT_WRITE)
             val currentFile = File(staging, M3CanonicalCowGeneration.CURRENT_UNACKED_FILE)
             val written = M3CowStreamingWriter.write(intent, baseView, staging, currentFile, fault) ?: return refused(M3CanonicalCowRefusal.INVALID_INTENT)
-            if (!M3CanonicalCowGeneration.sameManifest(written.entries, preflight.entries) || written.current != preflight.current) return refused(M3CanonicalCowRefusal.CORRUPT_GENERATION)
+            if (written.pageCounts != preflight.pageCounts || written.current != preflight.current) return refused(M3CanonicalCowRefusal.CORRUPT_GENERATION)
+            val root = M3MutableSemanticRoot(
+                identity.sourceCut, identity.commandId, identity.kind, identity.commandHash, identity.commandFingerprint,
+                identity.targetHighWater, identity.targetLive, identity.targetSource, identity.targetSupport,
+                identity.targetLineage, identity.targetGeometry, identity.targetLineageRevision,
+                written.current, written.entries,
+            )
+            val generationIdentity = M3CowGenerationIdentity.from(root)
             inject(fault, M3CanonicalCowFault.AFTER_FRAGMENT_WRITE)
             verifyCurrent(currentFile, preflight.current)
             budget.verifyCandidate(token, staging)
@@ -165,12 +171,14 @@ internal enum class M3CanonicalCowFault {
 
 private data class M3CowWriteReceipt(
     val entries: List<M3CowDirectoryEntry>, val current: M3PreparedIntentCurrentReceipt,
-    val pageCounts: Map<M3CowFragmentKind, Int>, val phasePeakBytes: Long,
+    val pageCounts: Map<M3CowFragmentKind, Int>, val temporaryFiles: Map<String, Long>, val phasePeakBytes: Long,
 )
 
 /** Uses only #121's scalar callbacks.  A fragment page is the largest retained write state. */
 private class M3CowStreamingWriter private constructor(private val directory: File?, private val base: M3CanonicalStateView, private val fault: M3CanonicalCowFault?) : M3PreparedIntentVisitor {
-    private val writers = M3CowFragmentKind.entries.associateWith { kind -> M3CowPageWriter(directory, kind, fault) }
+    private val writers: Map<M3CowFragmentKind, M3CowRecordWriter> = M3CowFragmentKind.entries.associateWith { kind ->
+        if (kind in SORTED_KINDS) M3CowSortedPageWriter(directory, kind, fault) else M3CowPageWriter(directory, kind, fault)
+    }
     private var identity: M3PreparedIntentIdentity? = null
     private var terminal: M3PreparedIntentCurrentReceipt? = null
     private var previousSource: M3CowRow? = null
@@ -180,18 +188,21 @@ private class M3CowStreamingWriter private constructor(private val directory: Fi
         val idIndex = writers.getValue(M3CowFragmentKind.ID_INDEX).record(id) { it.writeLong(id) }
         val voxelKey = voxelKey(x, y, z)
         val voxel = writers.getValue(M3CowFragmentKind.VOXEL_INDEX).record(voxelKey) { out -> out.writeInt(x); out.writeInt(y); out.writeInt(z); out.writeLong(id) }
-        val page = writers.getValue(M3CowFragmentKind.PAGE_INDEX).record(voxelKey) { out -> out.writeInt(x); out.writeInt(y); out.writeInt(z); out.writeLong(id) }
+        val location = m3CompactLocation(M3SurfaceOwnershipConfiguration(), M3Voxel(x, y, z)) ?: return false
+        val page = writers.getValue(M3CowFragmentKind.PAGE_INDEX).record(pageKey(location.region, location.page)) { out -> out.writeInt(x); out.writeInt(y); out.writeInt(z); out.writeLong(id) }
         val old = base.findById(M3SurfaceId(id))
         val moved = old != null && old.voxel != M3Voxel(x, y, z)
         val voxelTombstone = !moved || writers.getValue(M3CowFragmentKind.VOXEL_TOMBSTONE).record(voxelKey(old.voxel.x, old.voxel.y, old.voxel.z)) { out -> out.writeInt(old.voxel.x); out.writeInt(old.voxel.y); out.writeInt(old.voxel.z); out.writeLong(id) }
-        val pageTombstone = !moved || writers.getValue(M3CowFragmentKind.PAGE_TOMBSTONE).record(voxelKey(old.voxel.x, old.voxel.y, old.voxel.z)) { out -> out.writeInt(old.voxel.x); out.writeInt(old.voxel.y); out.writeInt(old.voxel.z); out.writeLong(id) }
+        val oldLocation = old?.let { m3CompactLocation(M3SurfaceOwnershipConfiguration(), it.voxel) }
+        val pageTombstone = !moved || oldLocation != null && writers.getValue(M3CowFragmentKind.PAGE_TOMBSTONE).record(pageKey(oldLocation.region, oldLocation.page)) { out -> out.writeInt(old.voxel.x); out.writeInt(old.voxel.y); out.writeInt(old.voxel.z); out.writeLong(id) }
         return row && idIndex && voxel && page && voxelTombstone && pageTombstone
     }
     override fun onRemovedId(id: Long): Boolean {
         val removed = writers.getValue(M3CowFragmentKind.ID_TOMBSTONE).record(id) { it.writeLong(id) }
         val old = base.findById(M3SurfaceId(id)) ?: return false
         val voxelTombstone = writers.getValue(M3CowFragmentKind.VOXEL_TOMBSTONE).record(voxelKey(old.voxel.x, old.voxel.y, old.voxel.z)) { out -> out.writeInt(old.voxel.x); out.writeInt(old.voxel.y); out.writeInt(old.voxel.z); out.writeLong(id) }
-        val pageTombstone = writers.getValue(M3CowFragmentKind.PAGE_TOMBSTONE).record(voxelKey(old.voxel.x, old.voxel.y, old.voxel.z)) { out -> out.writeInt(old.voxel.x); out.writeInt(old.voxel.y); out.writeInt(old.voxel.z); out.writeLong(id) }
+        val oldLocation = m3CompactLocation(M3SurfaceOwnershipConfiguration(), old.voxel) ?: return false
+        val pageTombstone = writers.getValue(M3CowFragmentKind.PAGE_TOMBSTONE).record(pageKey(oldLocation.region, oldLocation.page)) { out -> out.writeInt(old.voxel.x); out.writeInt(old.voxel.y); out.writeInt(old.voxel.z); out.writeLong(id) }
         val supportTombstone = writers.getValue(M3CowFragmentKind.SUPPORT_TOMBSTONE).record(id) { it.writeLong(id) }
         val lineageTombstone = writers.getValue(M3CowFragmentKind.LINEAGE_TOMBSTONE).record(id) { out -> out.writeLong(id); out.writeLong(0L) }
         return removed && voxelTombstone && pageTombstone && supportTombstone && lineageTombstone
@@ -217,9 +228,17 @@ private class M3CowStreamingWriter private constructor(private val directory: Fi
     override fun onDirtyLineage(sourceId: Long, targetId: Long) = writers.getValue(M3CowFragmentKind.LINEAGE).record(sourceId) { out -> out.writeLong(sourceId); out.writeLong(targetId) }
     override fun onTerminal(currentReceipt: M3PreparedIntentCurrentReceipt): Boolean { terminal = currentReceipt; return true }
     fun finish(): M3CowWriteReceipt? {
-        val current = terminal ?: return null; val entries = writers.values.flatMap { it.finish() ?: return null }
+        val current = terminal ?: run { writers.values.forEach(M3CowRecordWriter::abort); return null }
+        val entries = ArrayList<M3CowDirectoryEntry>()
+        for (writer in writers.values) {
+            val written = writer.finish() ?: run {
+                writers.values.forEach(M3CowRecordWriter::abort)
+                return null
+            }
+            entries += written
+        }
         val directoryObjects = 64L + entries.size * 128L
-        return M3CowWriteReceipt(entries, current, writers.mapValues { it.value.pages }, M3CanonicalCowGeneration.FIXED_PHASE_BYTES + directoryObjects)
+        return M3CowWriteReceipt(entries, current, writers.mapValues { it.value.pages }, writers.values.flatMap { it.temporaryFiles().entries }.associate { it.toPair() }, M3CanonicalCowGeneration.FIXED_PHASE_BYTES + M3CowSortedPageWriter.SORT_SCRATCH_BYTES + directoryObjects)
     }
     companion object {
         fun dryRun(intent: M3PreparedIntent, base: M3CanonicalStateView): M3CowWriteReceipt? { val writer = M3CowStreamingWriter(null, base, null); return if (intent.visit(writer) is M3PreparedIntentVisitResult.Complete) writer.finish() else null }
@@ -228,27 +247,48 @@ private class M3CowStreamingWriter private constructor(private val directory: Fi
             return FileOutputStream(current, false).use { output ->
                 val result = intent.visitCurrent(writer, output)
                 output.fd.sync()
-                if (result is M3PreparedIntentVisitResult.Complete) writer.finish() else null
+                if (result is M3PreparedIntentVisitResult.Complete) writer.finish() else {
+                    writer.writers.values.forEach(M3CowRecordWriter::abort)
+                    null
+                }
             }
         }
         private fun row(out: DataOutputStream, id: Long, x: Int, y: Int, z: Int, normal: Int, confidence: Int, f0: Long, f1: Long, f2: Long, f3: Long) { out.writeLong(id); out.writeInt(x); out.writeInt(y); out.writeInt(z); out.writeInt(normal); out.writeInt(confidence); out.writeLong(f0); out.writeLong(f1); out.writeLong(f2); out.writeLong(f3) }
         private fun voxelKey(x: Int, y: Int, z: Int) = M3CanonicalCowGeneration.voxelKey(x, y, z)
+        private fun pageKey(region: M3StorageRegion, page: Int) = M3CanonicalCowGeneration.pageKey(region, page)
+        private val SORTED_KINDS = setOf(M3CowFragmentKind.VOXEL_INDEX, M3CowFragmentKind.PAGE_INDEX, M3CowFragmentKind.VOXEL_TOMBSTONE, M3CowFragmentKind.PAGE_TOMBSTONE)
     }
 }
 
-private class M3CowPageWriter(private val directory: File?, val kind: M3CowFragmentKind, private val fault: M3CanonicalCowFault?) {
+private interface M3CowRecordWriter {
+    val kind: M3CowFragmentKind
+    val pages: Int
+    fun record(key: Long, write: (DataOutputStream) -> Unit): Boolean
+    fun finish(): List<M3CowDirectoryEntry>?
+    fun abort() = Unit
+    fun temporaryFiles(): Map<String, Long> = emptyMap()
+}
+
+private class M3CowPageWriter(private val directory: File?, override val kind: M3CowFragmentKind, private val fault: M3CanonicalCowFault?) : M3CowRecordWriter {
     private var bytes = ByteArray(M3CanonicalCowGeneration.PAGE_BYTES); private var count = 0; private var position = 12
-    private val entries = ArrayList<M3CowDirectoryEntry>(); var pages = 0; private var failed = false; private var minimum = Long.MAX_VALUE; private var maximum = Long.MIN_VALUE
-    fun record(key: Long, write: (DataOutputStream) -> Unit): Boolean {
+    private val entries = ArrayList<M3CowDirectoryEntry>(); override var pages = 0; private var failed = false; private var minimum = Long.MAX_VALUE; private var maximum = Long.MIN_VALUE
+    override fun record(key: Long, write: (DataOutputStream) -> Unit): Boolean {
         if (failed) return false
         if (count == kind.recordsPerPage) flush()
         return try {
             // Record encoding is fixed-size; encode directly into the owned 16 KiB page.
             val stream = object : java.io.OutputStream() { override fun write(value: Int) { bytes[position++] = value.toByte() }; override fun write(value: ByteArray, offset: Int, length: Int) { value.copyInto(bytes, position, offset, offset + length); position += length } }
-            DataOutputStream(stream).use { write(it) }; require(position == 12 + (count + 1) * kind.recordBytes); minimum = minOf(minimum, key); maximum = maxOf(maximum, key); count++; true
+            DataOutputStream(stream).use { write(it) }
+            require(position == 12 + (count + 1) * kind.recordBytes)
+            if (count == 0) { minimum = key; maximum = key }
+            else {
+                if (java.lang.Long.compareUnsigned(key, minimum) < 0) minimum = key
+                if (java.lang.Long.compareUnsigned(key, maximum) > 0) maximum = key
+            }
+            count++; true
         } catch (_: Exception) { failed = true; false }
     }
-    fun finish(): List<M3CowDirectoryEntry>? { if (failed) return null; if (count > 0) flush(); return if (failed) null else entries }
+    override fun finish(): List<M3CowDirectoryEntry>? { if (failed) return null; if (count > 0) flush(); return if (failed) null else entries }
     private fun flush() {
         if (count == 0 || failed) return
         try {
@@ -267,3 +307,98 @@ private class M3CowPageWriter(private val directory: File?, val kind: M3CowFragm
         } catch (_: Exception) { failed = true }
     }
 }
+
+/** Stable external radix sort: two pre-reserved spools, fixed counters, and one fragment page. */
+private class M3CowSortedPageWriter(
+    private val directory: File?, override val kind: M3CowFragmentKind, private val fault: M3CanonicalCowFault?,
+) : M3CowRecordWriter {
+    private val recordBytes = 8 + kind.recordBytes
+    private val spoolAName = "${kind.file}.sort-a"
+    private val spoolBName = "${kind.file}.sort-b"
+    private val spoolA = directory?.let { File(it, spoolAName) }
+    private val spoolB = directory?.let { File(it, spoolBName) }
+    private var output = spoolA?.let { java.io.RandomAccessFile(it, "rw").also { file -> file.setLength(0) } }
+    private var records = 0
+    private var failed = false
+    override val pages get() = if (records == 0) 0 else (records - 1) / kind.recordsPerPage + 1
+    override fun record(key: Long, write: (DataOutputStream) -> Unit): Boolean = try {
+        if (failed) return false
+        val payload = ByteArray(kind.recordBytes)
+        val sink = object : java.io.OutputStream() {
+            var position = 0
+            override fun write(value: Int) { payload[position++] = value.toByte() }
+            override fun write(value: ByteArray, offset: Int, length: Int) { value.copyInto(payload, position, offset, offset + length); position += length }
+        }
+        DataOutputStream(sink).use(write)
+        require(sink.position == payload.size)
+        output?.run { writeLong(key); write(payload) }
+        records++
+        true
+    } catch (_: Exception) { failed = true; false }
+    override fun temporaryFiles(): Map<String, Long> {
+        if (records == 0) return emptyMap()
+        val bytes = records.toLong() * recordBytes
+        return mapOf(spoolAName to bytes, spoolBName to bytes)
+    }
+    override fun abort() {
+        try { output?.close() } catch (_: Exception) { }
+        output = null
+    }
+    override fun finish(): List<M3CowDirectoryEntry>? {
+        if (failed) return null
+        if (directory == null) return List(pages) { page ->
+            val count = minOf(kind.recordsPerPage, records - page * kind.recordsPerPage)
+            M3CowDirectoryEntry(kind, page, 0, 0, page.toLong() * M3CanonicalCowGeneration.PAGE_BYTES, M3CanonicalCowGeneration.PAGE_BYTES, count, ByteArray(32))
+        }
+        return try {
+            output?.fd?.sync(); output?.close(); output = null
+            val byteOrder = (27 downTo 20) + (19 downTo 16) + (15 downTo 12) + (11 downTo 8) + (7 downTo 0)
+            byteOrder.forEachIndexed { pass, byteIndex ->
+                val input = if (pass % 2 == 0) requireNotNull(spoolA) else requireNotNull(spoolB)
+                val target = if (pass % 2 == 0) requireNotNull(spoolB) else requireNotNull(spoolA)
+                radixPass(input, target, byteIndex)
+            }
+            val pageWriter = M3CowPageWriter(directory, kind, fault)
+            java.io.RandomAccessFile(requireNotNull(spoolA), "r").use { sorted ->
+                repeat(records) {
+                    val key = sorted.readLong(); val payload = ByteArray(kind.recordBytes).also(sorted::readFully)
+                    require(pageWriter.record(key) { it.write(payload) })
+                }
+            }
+            val entries = pageWriter.finish() ?: return null
+            require(spoolA.delete() && requireNotNull(spoolB).delete())
+            entries
+        } catch (_: Exception) { failed = true; null }
+    }
+    private fun radixPass(inputFile: File, outputFile: File, byteIndex: Int) {
+        val counts = LongArray(256)
+        java.io.RandomAccessFile(inputFile, "r").use { input ->
+            val bytes = ByteArray(recordBytes)
+            repeat(records) { input.readFully(bytes); counts[bucket(bytes, byteIndex)]++ }
+        }
+        val offsets = LongArray(256); var next = 0L
+        counts.indices.forEach { bucket -> offsets[bucket] = next; next += counts[bucket] * recordBytes }
+        java.io.RandomAccessFile(inputFile, "r").use { input ->
+            java.io.RandomAccessFile(outputFile, "rw").use { out ->
+                out.setLength(records.toLong() * recordBytes)
+                val bytes = ByteArray(recordBytes)
+                repeat(records) {
+                    input.readFully(bytes)
+                    val bucket = bucket(bytes, byteIndex)
+                    out.seek(offsets[bucket]); out.write(bytes); offsets[bucket] += recordBytes
+                }
+                out.fd.sync()
+            }
+        }
+    }
+    private fun bucket(bytes: ByteArray, byteIndex: Int): Int =
+        (bytes[byteIndex].toInt() and 0xff) xor if (byteIndex == 8 || byteIndex == 12 || byteIndex == 16) 0x80 else 0
+    companion object { const val SORT_SCRATCH_BYTES = 16_384L }
+}
+
+private fun M3MutableSemanticRoot.matches(identity: M3PreparedIntentIdentity, current: M3PreparedIntentCurrentReceipt) =
+    baseCut == identity.sourceCut && commandId == identity.commandId && commandKind == identity.kind &&
+        commandHash == identity.commandHash && commandFingerprint == identity.commandFingerprint &&
+        targetHighWater == identity.targetHighWater && targetLive == identity.targetLive && targetSource == identity.targetSource &&
+        targetSupport == identity.targetSupport && targetLineage == identity.targetLineage && targetGeometry == identity.targetGeometry &&
+        targetLineageRevision == identity.targetLineageRevision && this.current == current

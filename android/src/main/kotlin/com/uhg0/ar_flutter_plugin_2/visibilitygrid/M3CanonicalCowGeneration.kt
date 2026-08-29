@@ -22,12 +22,18 @@ internal class M3CanonicalCowGeneration private constructor(
     private val storage: M3CowStorageReceipt,
 ) : AutoCloseable {
     private var closed = false
+    private var cowPagesRead = 0L
+    private var cowRecordsInspected = 0L
+    private var cowHashesValidated = 0L
 
     @Synchronized
     override fun close() { closed = true }
 
     @Synchronized
     fun storageReceipt() = storage
+
+    @Synchronized
+    fun readWorkReceipt() = M3CowReadWork(cowPagesRead, cowRecordsInspected, cowHashesValidated)
     @Synchronized
     internal fun withAllocatedStorage(bytes: Long): M3CanonicalCowGeneration {
         check(!closed)
@@ -59,8 +65,10 @@ internal class M3CanonicalCowGeneration private constructor(
         val target = root.targetCut()
         if (cursor != null && (cursor.rootHash != target.rootHash || cursor.region != region || cursor.page != page))
             return M3CowPageRead.Refused(M3CompactCanonicalRefusal.STALE_CURSOR)
-        val result = M3CowOverlay(base, this).readPage(region, page, cursor?.offset ?: 0, limit)
-        return M3CowPageRead.Complete(result.rows, result.nextCursor?.let { M3CowPageCursor(target.rootHash, region, page, it) }, result.inspectedRows)
+        val state = cursor ?: M3CowPageCursor(target.rootHash, region, page, 0, 0, 0)
+        val result = M3CowOverlay(base, this).readPageWindow(region, page, state, limit)
+            ?: return M3CowPageRead.Refused(M3CompactCanonicalRefusal.CORRUPT)
+        return M3CowPageRead.Complete(result.rows, result.nextCursor, result.inspectedRows)
     }
 
     @Synchronized
@@ -81,6 +89,9 @@ internal class M3CanonicalCowGeneration private constructor(
 
     private fun readPage(file: File, entry: M3CowDirectoryEntry, sink: (M3CowRecord) -> Boolean): Boolean {
         if (!file.isFile || file.length() < (entry.page.toLong() + 1) * PAGE_BYTES) return false
+        cowPagesRead++
+        cowHashesValidated++
+        cowRecordsInspected += entry.count
         val bytes = ByteArray(PAGE_BYTES)
         RandomAccessReader(file, entry.page.toLong() * PAGE_BYTES).use { input -> input.readFully(bytes) }
         if (!sha(bytes).contentEquals(entry.hash)) return false
@@ -101,20 +112,53 @@ internal class M3CanonicalCowGeneration private constructor(
                 M3CowFragmentKind.VOXEL_TOMBSTONE, M3CowFragmentKind.PAGE_TOMBSTONE -> M3CowRecord.Tombstone(0, input.readInt(), input.readInt(), input.readInt(), input.readLong())
                 M3CowFragmentKind.LINEAGE_TOMBSTONE -> M3CowRecord.Lineage(input.readLong(), input.readLong())
             }
-            val key = when (record) {
-                is M3CowRecord.Row -> record.value.id
-                is M3CowRecord.Source -> record.value.id
-                is M3CowRecord.Support -> record.target
-                is M3CowRecord.Lineage -> record.source
-                is M3CowRecord.Index -> if (entry.kind == M3CowFragmentKind.ID_INDEX) record.key else voxelKey(record.x, record.y, record.z)
-                is M3CowRecord.Tombstone -> if (entry.kind == M3CowFragmentKind.ID_TOMBSTONE || entry.kind == M3CowFragmentKind.SUPPORT_TOMBSTONE) record.key else voxelKey(record.x, record.y, record.z)
+            val key = recordKey(entry.kind, record) ?: return false
+            if (it == 0) { minimum = key; maximum = key }
+            else {
+                if (java.lang.Long.compareUnsigned(key, minimum) < 0) minimum = key
+                if (java.lang.Long.compareUnsigned(key, maximum) > 0) maximum = key
             }
-            minimum = minOf(minimum, key); maximum = maxOf(maximum, key)
             if (keepGoing) keepGoing = sink(record)
         }
         if (minimum != entry.minimumKey || maximum != entry.maximumKey) return false
         while (input.available() > 0) if (input.readUnsignedByte() != 0) return false
         return keepGoing
+    }
+
+    private fun recordKey(kind: M3CowFragmentKind, record: M3CowRecord): Long? = when (record) {
+                is M3CowRecord.Row -> record.value.id
+                is M3CowRecord.Source -> record.value.id
+                is M3CowRecord.Support -> record.target
+                is M3CowRecord.Lineage -> record.source
+                is M3CowRecord.Index -> when (kind) {
+                    M3CowFragmentKind.ID_INDEX -> record.key
+                    M3CowFragmentKind.PAGE_INDEX -> record.location()?.let { pageKey(it.region, it.page) }
+                    else -> voxelKey(record.x, record.y, record.z)
+                }
+                is M3CowRecord.Tombstone -> when (kind) {
+                    M3CowFragmentKind.ID_TOMBSTONE, M3CowFragmentKind.SUPPORT_TOMBSTONE -> record.key
+                    M3CowFragmentKind.PAGE_TOMBSTONE -> record.location()?.let { pageKey(it.region, it.page) }
+                    else -> voxelKey(record.x, record.y, record.z)
+                }
+            }
+
+    private fun compareSortedIndex(kind: M3CowFragmentKind, left: M3CowRecord, right: M3CowRecord): Int {
+        val key = java.lang.Long.compareUnsigned(requireNotNull(recordKey(kind, left)), requireNotNull(recordKey(kind, right)))
+        if (key != 0) return key
+        fun x(record: M3CowRecord) = when (record) {
+            is M3CowRecord.Index -> record.x
+            is M3CowRecord.Tombstone -> record.x
+            else -> error("non-index record")
+        }
+        fun y(record: M3CowRecord) = when (record) { is M3CowRecord.Index -> record.y; is M3CowRecord.Tombstone -> record.y; else -> error("non-index record") }
+        fun z(record: M3CowRecord) = when (record) { is M3CowRecord.Index -> record.z; is M3CowRecord.Tombstone -> record.z; else -> error("non-index record") }
+        fun id(record: M3CowRecord) = when (record) {
+            is M3CowRecord.Index -> record.id
+            is M3CowRecord.Tombstone -> record.id
+            else -> error("non-index record")
+        }
+        val voxel = compareVoxel(x(left), y(left), z(left), x(right), y(right), z(right))
+        return if (voxel != 0) voxel else java.lang.Long.compareUnsigned(id(left), id(right))
     }
 
     private fun readRecord(input: DataInputStream) = M3CowRow(
@@ -127,6 +171,59 @@ internal class M3CanonicalCowGeneration private constructor(
     @Synchronized
     internal fun has(kind: M3CowFragmentKind, key: Long) = !closed && entries.any {
         it.kind == kind && java.lang.Long.compareUnsigned(key, it.minimumKey) >= 0 && java.lang.Long.compareUnsigned(key, it.maximumKey) <= 0
+    }
+
+    @Synchronized
+    internal fun indexes(kind: M3CowFragmentKind, key: Long): M3CowLookup<M3CowRecord.Index> {
+        val values = ArrayList<M3CowRecord.Index>()
+        val valid = records(kind, key) { record -> if (record is M3CowRecord.Index) values += record; true }
+        return if (valid) M3CowLookup.Complete(values) else M3CowLookup.Refused
+    }
+
+    @Synchronized
+    internal fun indexWindow(kind: M3CowFragmentKind, key: Long, offset: Int, limit: Int): M3CowWindow<M3CowRecord.Index> =
+        window(kind, key, offset, limit) { it as? M3CowRecord.Index }
+
+    @Synchronized
+    internal fun tombstoneWindow(kind: M3CowFragmentKind, key: Long, offset: Int, limit: Int): M3CowWindow<M3CowRecord.Tombstone> =
+        window(kind, key, offset, limit) { it as? M3CowRecord.Tombstone }
+
+    private fun <T> window(kind: M3CowFragmentKind, key: Long, offset: Int, limit: Int, cast: (M3CowRecord) -> T?): M3CowWindow<T> {
+        if (closed || offset < 0 || limit !in 1..512) return M3CowWindow.Refused
+        val values = ArrayList<T>(limit + 1)
+        var ordinal = 0
+        val candidates = entries.filter { it.kind == kind && java.lang.Long.compareUnsigned(key, it.minimumKey) >= 0 && java.lang.Long.compareUnsigned(key, it.maximumKey) <= 0 }
+        for (entry in candidates) {
+            if (entry.minimumKey == key && entry.maximumKey == key && ordinal + entry.count <= offset) {
+                ordinal += entry.count
+                continue
+            }
+            val valid = readPage(File(directory, entry.file), entry) { record ->
+                val value = cast(record)
+                if (value != null && recordKey(kind, record) == key) {
+                    if (ordinal++ >= offset && values.size <= limit) values += value
+                }
+                true
+            }
+            if (!valid) return M3CowWindow.Refused
+            if (values.size > limit) break
+        }
+        val hasNext = values.size > limit
+        return M3CowWindow.Complete(if (hasNext) values.subList(0, limit).toList() else values, if (hasNext) offset + limit else null)
+    }
+
+    @Synchronized
+    internal fun tombstones(kind: M3CowFragmentKind, key: Long): M3CowLookup<M3CowRecord.Tombstone> {
+        val values = ArrayList<M3CowRecord.Tombstone>()
+        val valid = records(kind, key) { record -> if (record is M3CowRecord.Tombstone) values += record; true }
+        return if (valid) M3CowLookup.Complete(values) else M3CowLookup.Refused
+    }
+
+    @Synchronized
+    internal fun row(id: Long): M3CowLookup<M3CowRow> {
+        var value: M3CowRow? = null
+        val valid = records(M3CowFragmentKind.ROW, id) { record -> if (record is M3CowRecord.Row && record.value.id == id) value = record.value; true }
+        return if (valid) M3CowLookup.Complete(listOfNotNull(value)) else M3CowLookup.Refused
     }
 
     @Synchronized
@@ -207,14 +304,33 @@ internal class M3CanonicalCowGeneration private constructor(
             )
             require(storage.phasePeakBytes <= DIRECTORY_LIMIT_BYTES)
             M3CanonicalCowGeneration(directory, root, entries, storage).also { generation ->
-                M3CowFragmentKind.entries.forEach { kind -> require(generation.records(kind) { true }) }
+                val sortedKinds = setOf(
+                    M3CowFragmentKind.VOXEL_INDEX, M3CowFragmentKind.PAGE_INDEX,
+                    M3CowFragmentKind.VOXEL_TOMBSTONE, M3CowFragmentKind.PAGE_TOMBSTONE,
+                )
+                M3CowFragmentKind.entries.forEach { kind ->
+                    var previous: M3CowRecord? = null
+                    require(generation.records(kind) { record ->
+                        val ordered = kind !in sortedKinds || previous?.let { generation.compareSortedIndex(kind, it, record) <= 0 } != false
+                        previous = record
+                        ordered
+                    }) { "invalid fragment $kind" }
+                }
             }
         } catch (_: Exception) { null }
 
         internal fun rootFile(directory: File) = File(directory, ROOT_FILE)
         internal fun directoryFile(directory: File) = File(directory, DIRECTORY_FILE)
         internal fun sha(bytes: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(bytes)
-        internal fun voxelKey(x: Int, y: Int, z: Int) = (x.toLong() shl 32) xor ((y.toLong() and 0xffffL) shl 16) xor (z.toLong() and 0xffffL)
+        internal fun voxelKey(x: Int, y: Int, z: Int) = digestKey(x, y, z, 0x564f5845)
+        internal fun pageKey(region: M3StorageRegion, page: Int) = digestKey(region.x, region.y, region.z, page)
+        private fun digestKey(a: Int, b: Int, c: Int, d: Int): Long {
+            var value = -0x340d631b7bdddcdbL
+            listOf(a, b, c, d).forEach { part ->
+                repeat(4) { byte -> value = (value xor ((part ushr (byte * 8)) and 0xff).toLong()) * 0x100000001b3L }
+            }
+            return value
+        }
         private fun validateCurrent(file: File, expected: M3PreparedIntentCurrentReceipt): Boolean = try {
             if (!file.isFile || file.length() != expected.length) return false
             val digest = MessageDigest.getInstance("SHA-256")
@@ -265,6 +381,18 @@ internal sealed interface M3CowRecord {
     data class Index(val key: Long, val x: Int, val y: Int, val z: Int, val id: Long) : M3CowRecord
 }
 
+private fun M3CowRecord.Index.location() = m3CompactLocation(M3SurfaceOwnershipConfiguration(), M3Voxel(x, y, z))
+private fun M3CowRecord.Tombstone.location() = m3CompactLocation(M3SurfaceOwnershipConfiguration(), M3Voxel(x, y, z))
+
+internal sealed interface M3CowLookup<out T> {
+    data class Complete<T>(val values: List<T>) : M3CowLookup<T>
+    data object Refused : M3CowLookup<Nothing>
+}
+internal sealed interface M3CowWindow<out T> {
+    data class Complete<T>(val values: List<T>, val nextOffset: Int?) : M3CowWindow<T>
+    data object Refused : M3CowWindow<Nothing>
+}
+
 internal data class M3CowDirectoryEntry(val kind: M3CowFragmentKind, val page: Int, val minimumKey: Long, val maximumKey: Long, val offset: Long, val length: Int, val count: Int, val hash: ByteArray) {
     val file get() = kind.file
     fun encodedBytes() = 1 + 4 + 8 + 8 + 8 + 4 + 4 + 32
@@ -283,7 +411,7 @@ internal data class M3CowDirectoryEntry(val kind: M3CowFragmentKind, val page: I
                     val wire = input.readUnsignedByte()
                     val kind = requireNotNull(M3CowFragmentKind.entries.firstOrNull { item -> item.wire == wire }) { "unknown directory kind $wire" }
                     val page = input.readInt(); val minimum = input.readLong(); val maximum = input.readLong(); val offset = input.readLong(); val length = input.readInt(); val records = input.readInt(); val hash = ByteArray(32).also(input::readFully)
-                    require(minimum <= maximum && offset == page.toLong() * M3CanonicalCowGeneration.PAGE_BYTES && length == M3CanonicalCowGeneration.PAGE_BYTES)
+                    require(java.lang.Long.compareUnsigned(minimum, maximum) <= 0 && offset == page.toLong() * M3CanonicalCowGeneration.PAGE_BYTES && length == M3CanonicalCowGeneration.PAGE_BYTES)
                     M3CowDirectoryEntry(kind, page, minimum, maximum, offset, length, records, hash)
                 }.also { require(input.read() == -1) }
             }
@@ -398,10 +526,30 @@ internal data class M3CowGenerationIdentity(val hash: M3CanonicalReceiptBytes) {
 }
 
 internal data class M3CowStorageReceipt(val allocatedBytes: Long, val directoryEntries: Int, val phasePeakBytes: Long)
-internal data class M3CowPageCursor(val rootHash: M3CanonicalReceiptBytes, val region: M3StorageRegion, val page: Int, val offset: Int)
+internal data class M3CowReadWork(val pages: Long, val records: Long, val hashes: Long) {
+    operator fun minus(other: M3CowReadWork) = M3CowReadWork(pages - other.pages, records - other.records, hashes - other.hashes)
+}
+internal data class M3CowPageCursor(
+    val rootHash: M3CanonicalReceiptBytes,
+    val region: M3StorageRegion,
+    val page: Int,
+    val baseCursor: Int,
+    val indexOffset: Int,
+    val tombstoneOffset: Int,
+)
+internal data class M3CowMergeWindow(val rows: List<M3CompactSurface>, val nextCursor: M3CowPageCursor?, val inspectedRows: Int)
 internal sealed interface M3CowPageRead {
     data class Complete(val rows: List<M3CompactSurface>, val nextCursor: M3CowPageCursor?, val inspectedRows: Int) : M3CowPageRead
     data class Refused(val reason: M3CompactCanonicalRefusal) : M3CowPageRead
+}
+
+private val SURFACE_ORDER = compareBy<M3CompactSurface> { it.voxel.x }
+    .thenBy { it.voxel.y }.thenBy { it.voxel.z }.thenBy { it.id.value }
+private fun compareSurfaceKey(ax: Int, ay: Int, az: Int, aid: Long, bx: Int, by: Int, bz: Int, bid: Long): Int = when {
+    ax != bx -> ax.compareTo(bx)
+    ay != by -> ay.compareTo(by)
+    az != bz -> az.compareTo(bz)
+    else -> aid.compareTo(bid)
 }
 
 private class M3CowOverlay(private val base: M3CanonicalStateView, private val delta: M3CanonicalCowGeneration) : M3CanonicalStateView {
@@ -415,40 +563,115 @@ private class M3CowOverlay(private val base: M3CanonicalStateView, private val d
     }
     override fun findByVoxel(voxel: M3Voxel): M3CompactSurface? = delta.readOr(null) { findByVoxelOpen(voxel) }
     private fun findByVoxelOpen(voxel: M3Voxel): M3CompactSurface? {
-        var dirty: M3CompactSurface? = null; if (!delta.visit(M3CowFragmentKind.ROW) { record -> if (record is M3CowRecord.Row && record.value.surface().voxel == voxel) dirty = record.value.surface(); true }) return null
-        if (dirty != null) return dirty
+        val key = M3CanonicalCowGeneration.voxelKey(voxel.x, voxel.y, voxel.z)
+        val indexes = when (val read = delta.indexes(M3CowFragmentKind.VOXEL_INDEX, key)) {
+            is M3CowLookup.Complete -> read.values
+            M3CowLookup.Refused -> return null
+        }
+        indexes.filter { it.x == voxel.x && it.y == voxel.y && it.z == voxel.z }.forEach { index ->
+            val row = when (val read = delta.row(index.id)) {
+                is M3CowLookup.Complete -> read.values.singleOrNull()?.surface()
+                M3CowLookup.Refused -> return null
+            }
+            if (row?.voxel == voxel) return row
+        }
+        val tombstones = when (val read = delta.tombstones(M3CowFragmentKind.VOXEL_TOMBSTONE, key)) {
+            is M3CowLookup.Complete -> read.values
+            M3CowLookup.Refused -> return null
+        }
         val old = base.findByVoxel(voxel) ?: return null
+        if (tombstones.any { it.id == old.id.value && it.x == voxel.x && it.y == voxel.y && it.z == voxel.z }) return null
         return findByIdOpen(old.id)?.takeIf { it.voxel == voxel }
     }
     override fun readPage(region: M3StorageRegion, page: Int, cursor: Int, limit: Int): M3CompactPage =
-        delta.readOr(M3CompactPage(emptyList(), null, 0)) { readPageOpen(region, page, cursor, limit) }
-    private fun readPageOpen(region: M3StorageRegion, page: Int, cursor: Int, limit: Int): M3CompactPage {
+        delta.readOr(M3CompactPage(emptyList(), null, 0)) { readLegacyPage(region, page, cursor, limit) }
+    private fun readLegacyPage(region: M3StorageRegion, page: Int, cursor: Int, limit: Int): M3CompactPage {
         if (limit !in 1..512 || cursor < 0 || page !in 0..26) return M3CompactPage(emptyList(), null, 0)
-        // The base page is the only base population touched.  A dirty row wins
-        // by id and an old location is suppressed by findById's tombstone path.
-        val merged = ArrayList<M3CompactSurface>()
-        var baseCursor = 0
+        var state = M3CowPageCursor(cut.rootHash, region, page, 0, 0, 0)
+        var skipped = 0
         while (true) {
-            val basePage = base.readPage(region, page, baseCursor, 512)
-            basePage.rows.forEach { row ->
-                val visible = findByIdOpen(row.id)
-                if (visible != null && visible.voxel == row.voxel) merged += visible
+            val window = readPageWindowOpen(region, page, state, minOf(512, maxOf(limit, cursor - skipped)))
+                ?: return M3CompactPage(emptyList(), null, 0)
+            if (skipped + window.rows.size > cursor || window.nextCursor == null) {
+                val start = (cursor - skipped).coerceIn(0, window.rows.size)
+                val rows = window.rows.drop(start).take(limit)
+                return M3CompactPage(rows, if (window.nextCursor != null || start + rows.size < window.rows.size) cursor + rows.size else null, window.inspectedRows)
             }
-            baseCursor = basePage.nextCursor ?: break
+            skipped += window.rows.size
+            state = window.nextCursor
         }
-        delta.visit(M3CowFragmentKind.ROW) { record ->
-            if (record is M3CowRecord.Row) {
-                val row = record.value.surface()
-                val location = m3CompactLocation(M3SurfaceOwnershipConfiguration(), row.voxel)
-                if (location?.region == region && location.page == page && merged.none { it.id == row.id }) merged += row
+    }
+    internal fun readPageWindow(region: M3StorageRegion, page: Int, cursor: M3CowPageCursor, limit: Int): M3CowMergeWindow? =
+        delta.readOr<M3CowMergeWindow?>(null) { readPageWindowOpen(region, page, cursor, limit) }
+    private fun readPageWindowOpen(region: M3StorageRegion, page: Int, cursor: M3CowPageCursor, limit: Int): M3CowMergeWindow? {
+        if (limit !in 1..512 || page !in 0..26) return M3CowMergeWindow(emptyList(), null, 0)
+        val key = M3CanonicalCowGeneration.pageKey(region, page)
+        // Resolving an index record requires a keyed ROW-page validation, so
+        // never resolve more dirty rows than this caller can emit. Tombstones
+        // remain a fixed metadata-only window because they can all suppress
+        // base rows without producing output.
+        val indexWindow = when (val read = delta.indexWindow(M3CowFragmentKind.PAGE_INDEX, key, cursor.indexOffset, limit)) {
+            is M3CowWindow.Complete -> read
+            M3CowWindow.Refused -> return null
+        }
+        val tombstoneWindow = when (val read = delta.tombstoneWindow(M3CowFragmentKind.PAGE_TOMBSTONE, key, cursor.tombstoneOffset, 512)) {
+            is M3CowWindow.Complete -> read
+            M3CowWindow.Refused -> return null
+        }
+        val requested = M3CompactLocation(region, page)
+        data class DirtyRecord(val rawOffset: Int, val surface: M3CompactSurface)
+        data class TombstoneRecord(val rawOffset: Int, val value: M3CowRecord.Tombstone)
+        val dirty = ArrayList<DirtyRecord>(indexWindow.values.size)
+        indexWindow.values.forEachIndexed { rawOffset, index ->
+            if (index.location() != requested) return@forEachIndexed
+            val row = when (val read = delta.row(index.id)) {
+                is M3CowLookup.Complete -> read.values.singleOrNull()?.surface() ?: return null
+                M3CowLookup.Refused -> return null
             }
-            true
+            if (m3CompactLocation(M3SurfaceOwnershipConfiguration(), row.voxel) != requested) return null
+            dirty += DirtyRecord(rawOffset, row)
         }
-        merged.sortWith(compareBy<M3CompactSurface> { it.voxel.x }.thenBy { it.voxel.y }.thenBy { it.voxel.z }.thenBy { it.id.value })
-        if (cursor > merged.size) return M3CompactPage(emptyList(), null, merged.size)
-        val end = minOf(merged.size, cursor + limit)
-        val pageRows = merged.subList(cursor, end).toList()
-        return M3CompactPage(pageRows, if (end < merged.size) end else null, merged.size)
+        val tombstones = tombstoneWindow.values.mapIndexedNotNull { rawOffset, value ->
+            TombstoneRecord(rawOffset, value).takeIf { value.location() == requested }
+        }
+        val basePage = base.readPage(region, page, cursor.baseCursor, 512)
+        val rows = ArrayList<M3CompactSurface>(limit)
+        var baseIndex = 0; var dirtyIndex = 0; var tombstoneIndex = 0
+        fun compare(row: M3CompactSurface, tombstone: M3CowRecord.Tombstone) =
+            compareSurfaceKey(row.voxel.x, row.voxel.y, row.voxel.z, row.id.value, tombstone.x, tombstone.y, tombstone.z, tombstone.id)
+        while (rows.size < limit) {
+            val baseRow = basePage.rows.getOrNull(baseIndex)
+            val dirtyRow = dirty.getOrNull(dirtyIndex)?.surface
+            val tombstone = tombstones.getOrNull(tombstoneIndex)?.value
+            if (baseRow == null && dirtyRow == null && tombstone == null) break
+            val smallest = listOfNotNull(baseRow, dirtyRow).minWithOrNull(SURFACE_ORDER)
+            if (tombstone != null && (smallest == null || compare(smallest, tombstone) >= 0)) {
+                val matchesBase = baseRow != null && compare(baseRow, tombstone) == 0
+                if (matchesBase) baseIndex++
+                tombstoneIndex++
+                continue
+            }
+            if (baseRow != null && dirtyRow != null && SURFACE_ORDER.compare(baseRow, dirtyRow) == 0) {
+                rows += dirtyRow; baseIndex++; dirtyIndex++
+            } else if (dirtyRow != null && (baseRow == null || SURFACE_ORDER.compare(dirtyRow, baseRow) < 0)) {
+                rows += dirtyRow; dirtyIndex++
+            } else if (baseRow != null) {
+                rows += baseRow; baseIndex++
+            }
+        }
+        val hasNext = baseIndex < basePage.rows.size || dirtyIndex < dirty.size || tombstoneIndex < tombstones.size ||
+            basePage.nextCursor != null || indexWindow.nextOffset != null || tombstoneWindow.nextOffset != null
+        fun nextRawOffset(consumed: Int, values: List<Int>, windowSize: Int, current: Int): Int =
+            if (consumed < values.size) current + values[consumed] else current + windowSize
+        val next = if (hasNext) M3CowPageCursor(
+            cut.rootHash,
+            region,
+            page,
+            cursor.baseCursor + baseIndex,
+            nextRawOffset(dirtyIndex, dirty.map { it.rawOffset }, indexWindow.values.size, cursor.indexOffset),
+            nextRawOffset(tombstoneIndex, tombstones.map { it.rawOffset }, tombstoneWindow.values.size, cursor.tombstoneOffset),
+        ) else null
+        return M3CowMergeWindow(rows, next, basePage.inspectedRows + indexWindow.values.size + tombstoneWindow.values.size)
     }
     override fun readSourceById(id: M3SurfaceId): M3CanonicalPageRead<M3PagedSource?> =
         delta.readOr(M3CanonicalPageRead.Refused(M3CompactCanonicalRefusal.CLOSED)) { readSourceByIdOpen(id) }
