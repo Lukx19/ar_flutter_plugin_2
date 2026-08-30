@@ -303,6 +303,44 @@ class StorageBudgetCoordinatorV2(
     }
 
     /**
+     * Applies one identity-bound reclaim exactly once. The DONE marker deliberately remains until
+     * the owning journal has durably advanced, so a crash after the ledger cut cannot double debit.
+     */
+    fun reclaimVerifiedOnce(reclaimId: String, bytes: Long) = withAuthority {
+        require(reclaimId.matches(RECLAIM_ID) && bytes > 0L)
+        val marker = verifiedReclaimFile(reclaimId)
+        if (files.isFile(marker)) {
+            val lines = files.readLines(marker)
+            require(lines.size == 4 && lines[0] == "DONE" && lines[1] == reclaimId && lines[2].toLongOrNull() == bytes)
+            return@withAuthority
+        }
+        require(bytes <= committed)
+        val previous = committed
+        files.atomicReplace(
+            marker,
+            "PENDING\n$reclaimId\n$bytes\n$previous\n".toByteArray(),
+            DurableStoreFaultPointV2.POINTER_SLOT_REPLACE,
+        )
+        committed = previous - bytes
+        persistLedgerLocked()
+        files.atomicReplace(
+            marker,
+            "DONE\n$reclaimId\n$bytes\n$previous\n".toByteArray(),
+            DurableStoreFaultPointV2.POINTER_SLOT_REPLACE,
+        )
+    }
+
+    fun forgetVerifiedReclaim(reclaimId: String) = withAuthority {
+        require(reclaimId.matches(RECLAIM_ID))
+        val marker = verifiedReclaimFile(reclaimId)
+        if (files.isFile(marker)) {
+            val lines = files.readLines(marker)
+            require(lines.size == 4 && lines[0] == "DONE" && lines[1] == reclaimId)
+            files.delete(marker, DurableStoreFaultPointV2.DELETE_RECLAIM)
+        }
+    }
+
+    /**
      * Deletes one exact committed M3 private generation before releasing its charge. A durable
      * marker lets recovery finish either half without ever exposing an uncharged tree.
      */
@@ -347,6 +385,30 @@ class StorageBudgetCoordinatorV2(
         committed = if (files.isFile(ledger)) files.readBytes(ledger).toString(Charsets.UTF_8).trim().toLongOrNull()
             ?: error("Corrupt storage budget ledger") else 0L
         require(committed >= 0) { "Corrupt storage budget ledger" }
+        files.list(reclaimsDirectory)
+            .filter { it.name.matches(Regex("verified-[0-9a-f]{64}\\.reclaim")) }
+            .sortedBy(File::getName)
+            .forEach { marker ->
+                val lines = files.readLines(marker)
+                require(lines.size == 4 && lines[0] in setOf("PENDING", "DONE") && lines[1].matches(RECLAIM_ID)) {
+                    "Corrupt verified reclaim"
+                }
+                val bytes = lines[2].toLongOrNull() ?: error("Corrupt verified reclaim bytes")
+                val previous = lines[3].toLongOrNull() ?: error("Corrupt verified reclaim revision")
+                require(bytes > 0 && previous >= bytes)
+                if (lines[0] == "PENDING") {
+                    require(committed in setOf(previous, previous - bytes))
+                    if (committed == previous) {
+                        committed = previous - bytes
+                        persistLedgerLocked()
+                    }
+                    files.atomicReplace(
+                        marker,
+                        "DONE\n${lines[1]}\n$bytes\n$previous\n".toByteArray(),
+                        DurableStoreFaultPointV2.POINTER_SLOT_REPLACE,
+                    )
+                }
+            }
         files.list(reclaimsDirectory)
             .filter { it.name.matches(Regex("[0-9a-f]{64}\\.reclaim")) }
             .sortedBy(File::getName)
@@ -514,6 +576,8 @@ class StorageBudgetCoordinatorV2(
         "reclaims-v2",
         "${sha256(candidateName.toByteArray()).hex()}.reclaim",
     )
+    private fun verifiedReclaimFile(reclaimId: String) =
+        files.child("reclaims-v2", "verified-$reclaimId.reclaim")
     private fun sha256(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes)
     private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
 
@@ -521,6 +585,7 @@ class StorageBudgetCoordinatorV2(
         private val OWNER = Regex("[A-Za-z0-9._:-]{1,160}")
         private val CANDIDATE = Regex("[A-Za-z0-9._-]{1,160}")
         private val POINTER_PUBLICATION = Regex("[0-9a-f]{64}")
+        private val RECLAIM_ID = Regex("[0-9a-f]{64}")
         private val COMMITTED_M3_CANDIDATE = Regex("m3-cow-command-[0-9a-f]{64}")
         /** Exact private-candidate namespaces whose uncharged trees startup recovery may delete. */
         private val STAGING = Regex(

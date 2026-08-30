@@ -285,7 +285,11 @@ internal class M3CanonicalCowGeneration private constructor(
         internal fun generationDirectory(parent: File, identity: M3CowGenerationIdentity) =
             File(parent, "m3-cow-${identity.hash.toByteArray().hex()}")
 
-        internal fun open(directory: File, expected: M3CowGenerationIdentity? = null): M3CanonicalCowGeneration? = try {
+        internal fun open(
+            directory: File,
+            expected: M3CowGenerationIdentity? = null,
+            acknowledgedCurrent: M3PreparedIntentCurrentReceipt? = null,
+        ): M3CanonicalCowGeneration? = try {
             val rootFile = File(directory, ROOT_FILE)
             require(rootFile.length() <= DIRECTORY_LIMIT_BYTES && File(directory, DIRECTORY_FILE).length() <= DIRECTORY_LIMIT_BYTES)
             val root = M3MutableSemanticRoot.read(rootFile) ?: return null
@@ -293,7 +297,11 @@ internal class M3CanonicalCowGeneration private constructor(
             require(M3CowDirectoryEntry.matches(File(directory, DIRECTORY_FILE), entries))
             require(entries.sumOf { it.encodedBytes() } <= DIRECTORY_LIMIT_BYTES)
             require(64L + entries.size * 128L <= DIRECTORY_LIMIT_BYTES)
-            require(validateCurrent(File(directory, CURRENT_UNACKED_FILE), root.current))
+            val currentFile = File(directory, CURRENT_UNACKED_FILE)
+            require(
+                validateCurrent(currentFile, root.current) ||
+                    (!currentFile.exists() && acknowledgedCurrent == root.current)
+            )
             val identity = M3CowGenerationIdentity.from(root)
             require(expected == null || expected == identity)
             require(entries == entries.sortedWith(compareBy<M3CowDirectoryEntry> { it.kind.wire }.thenBy { it.page }))
@@ -306,7 +314,8 @@ internal class M3CanonicalCowGeneration private constructor(
                 require(pages.indices.all { index -> pages[index].page == index })
                 require(File(directory, kind.file).length() == pages.size.toLong() * PAGE_BYTES)
             }
-            val expectedNames = entries.mapTo(mutableSetOf()) { it.file } + setOf(ROOT_FILE, DIRECTORY_FILE, CURRENT_UNACKED_FILE)
+            val expectedNames = entries.mapTo(mutableSetOf()) { it.file } + setOf(ROOT_FILE, DIRECTORY_FILE) +
+                if (currentFile.exists()) setOf(CURRENT_UNACKED_FILE) else emptySet()
             require(directory.listFiles().orEmpty().mapTo(mutableSetOf()) { it.name } == expectedNames)
             val storage = M3CowStorageReceipt(
                 directory.listFiles().orEmpty().sumOf { allocated(it) }, entries.size, phasePeakBytes(entries.size),

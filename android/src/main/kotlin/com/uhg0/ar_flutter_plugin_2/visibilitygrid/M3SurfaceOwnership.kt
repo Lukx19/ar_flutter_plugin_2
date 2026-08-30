@@ -27,7 +27,9 @@ internal class M3SurfaceOwnership private constructor(
     private val configuration: M3SurfaceOwnershipConfiguration,
     private val store: M3SurfaceOwnershipStore?,
     restored: M3RestoredOwnership,
-    private val activation: M3CanonicalActivationState? = null,
+    private var activation: M3CanonicalActivationState? = null,
+    private val v6Parent: File? = null,
+    private val v6Budget: M3CanonicalStorageBudget? = null,
 ) {
     private var legacyLeaseRelease: (() -> Unit)? = null
     private val rowsById = restored.rows.associateByTo(linkedMapOf()) { it.id.value }
@@ -237,6 +239,45 @@ internal class M3SurfaceOwnership private constructor(
 
     /** Bounded activation state; its receipt source streams from the selected immutable file. */
     internal fun activationState(): M3CanonicalActivationState? = if (closed) null else activation
+
+    /**
+     * The only canonical-owner ACK seam.  It is deliberately not connected to a
+     * runtime callback: callers name the immutable command hash and the exact
+     * geometry/lineage cut they consumed.
+     */
+    @Synchronized
+    internal fun acknowledgeCanonicalCurrent(
+        acknowledgement: M3CanonicalAcknowledgement,
+        fault: M3CanonicalAcknowledgementFault? = null,
+    ): M3CanonicalAcknowledgementResult {
+        if (closed) return M3CanonicalAcknowledgementResult.NoOp(M3CanonicalAcknowledgementNoOp.CLOSED)
+        val parent = v6Parent ?: return M3CanonicalAcknowledgementResult.NoOp(M3CanonicalAcknowledgementNoOp.NO_CURRENT)
+        val budget = v6Budget ?: return M3CanonicalAcknowledgementResult.NoOp(M3CanonicalAcknowledgementNoOp.NO_CURRENT)
+        return M3CanonicalActivationSelector.acknowledge(group, parent, budget, acknowledgement, fault).also { result ->
+            when (result) {
+                is M3CanonicalAcknowledgementResult.Acknowledged,
+                is M3CanonicalAcknowledgementResult.Idempotent -> {
+                    val reopened = M3CanonicalActivationSelector.reopen(group, parent, budget)
+                    if (reopened is M3CanonicalActivationResult.Active) activation = reopened.state
+                }
+                is M3CanonicalAcknowledgementResult.NoOp -> Unit
+            }
+        }
+    }
+
+    /** Admits exactly one adjacent #117 plan only from this owner's durable ACK state. */
+    @Synchronized
+    internal fun commitAdjacentCanonicalMutation(
+        plan: M3PreparedCanonicalMutation,
+        faults: M3CanonicalCommitFaults = M3CanonicalCommitFaults(),
+    ): M3CanonicalAdjacentCommitResult {
+        if (closed) return M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.NO_ACTIVE_AUTHORITY)
+        val parent = v6Parent ?: return M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.NO_ACTIVE_AUTHORITY)
+        val budget = v6Budget ?: return M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.NO_ACTIVE_AUTHORITY)
+        return M3CanonicalActivationSelector.commitAdjacent(group, parent, budget, plan, faults).also { result ->
+            if (result is M3CanonicalAdjacentCommitResult.Committed) activation = result.state
+        }
+    }
 
     /** Idempotently closes the owner; later calls are deterministic refusals. */
     @Synchronized
@@ -500,7 +541,7 @@ internal class M3SurfaceOwnership private constructor(
             return M3CanonicalActivationSelector.withGroupLock(directory, group) {
                 when (val activation = M3CanonicalActivationSelector.reopen(group, directory, budget)) {
                     M3CanonicalActivationResult.Legacy -> open(group, directory, configuration)
-                    is M3CanonicalActivationResult.Active -> openedV6(group, configuration, activation.state)
+                    is M3CanonicalActivationResult.Active -> openedV6(group, directory, budget, configuration, activation.state)
                     M3CanonicalActivationResult.UnknownAfterSwitch -> M3SurfaceOwnershipOpenResult.Refused(M3SurfaceOwnershipRestoreRefusal.DURABILITY_FAILURE)
                     is M3CanonicalActivationResult.Refused -> M3SurfaceOwnershipOpenResult.Refused(
                         if (activation.reason == M3CanonicalActivationSelectorRefusal.FORKED_SELECTOR)
@@ -525,7 +566,7 @@ internal class M3SurfaceOwnership private constructor(
             if (!configuration.isValid) return M3SurfaceOwnershipOpenResult.Refused(M3SurfaceOwnershipRestoreRefusal.INVALID_CONFIGURATION)
             return M3CanonicalActivationSelector.withGroupLock(directory, group) {
                 when (val activation = M3CanonicalActivationSelector.activate(group, directory, budget, plan, fault)) {
-                    is M3CanonicalActivationResult.Active -> openedV6(group, configuration, activation.state)
+                    is M3CanonicalActivationResult.Active -> openedV6(group, directory, budget, configuration, activation.state)
                     M3CanonicalActivationResult.Legacy,
                     M3CanonicalActivationResult.UnknownAfterSwitch -> M3SurfaceOwnershipOpenResult.Refused(M3SurfaceOwnershipRestoreRefusal.DURABILITY_FAILURE)
                     is M3CanonicalActivationResult.Refused -> M3SurfaceOwnershipOpenResult.Refused(
@@ -547,10 +588,12 @@ internal class M3SurfaceOwnership private constructor(
 
         private fun openedV6(
             group: M3SurfaceGroup,
+            parent: File,
+            budget: M3CanonicalStorageBudget,
             configuration: M3SurfaceOwnershipConfiguration,
             activation: M3CanonicalActivationState,
         ) = M3SurfaceOwnershipOpenResult.Opened(
-            M3SurfaceOwnership(group, configuration, null, activeRestored(activation.cut), activation),
+            M3SurfaceOwnership(group, configuration, null, activeRestored(activation.cut), activation, parent, budget),
         )
 
         fun inMemory(

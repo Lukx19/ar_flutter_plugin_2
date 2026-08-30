@@ -343,6 +343,12 @@ internal interface M3CanonicalStorageBudget {
 
     fun release(token: Any)
 
+    /** Begins or replays one identity-bound committed-byte reclaim exactly once. */
+    fun reclaimCommittedBytesOnce(reclaimId: String, bytes: Long) = Unit
+
+    /** Forgets an exact reclaim only after its owner journal durably records completion. */
+    fun forgetCommittedReclaim(reclaimId: String) = Unit
+
     /** Durably removes one previously committed private candidate and its exact charge. */
     fun reclaimCommittedCandidate(candidate: File): Long {
         val actual = allocatedBytes(candidate)
@@ -490,6 +496,12 @@ internal class M3CoordinatorStorageBudget(private val coordinator: StorageBudget
     override fun release(token: Any) {
         coordinator.release(token as StorageBudgetReservationV2)
     }
+
+    override fun reclaimCommittedBytesOnce(reclaimId: String, bytes: Long) =
+        coordinator.reclaimVerifiedOnce(reclaimId, bytes)
+
+    override fun forgetCommittedReclaim(reclaimId: String) =
+        coordinator.forgetVerifiedReclaim(reclaimId)
 
     override fun reclaimCommittedCandidate(candidate: File) =
         coordinator.reclaimCommittedCandidate(candidate)

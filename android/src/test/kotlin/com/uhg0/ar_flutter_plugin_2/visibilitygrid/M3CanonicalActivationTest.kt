@@ -126,6 +126,7 @@ class M3CanonicalActivationTest {
                     assertTrue(files.none { it.name.endsWith(".attempt") })
                     assertTrue(files.any { it.name.endsWith(".selector") })
                 }
+                else -> Unit
             }
             receipt += stage to physical
         }

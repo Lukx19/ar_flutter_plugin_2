@@ -132,6 +132,24 @@ internal class M3CanonicalDirtyJournal private constructor(
         }
     }
 
+    /** Releases only the exact consumed intent after its selected current has been ACKed. */
+    @Synchronized
+    fun reclaimAcknowledgedIntent(receipt: M3PreparedIntentCurrentReceipt): Boolean {
+        if (closed) return false
+        val target = intentTarget()
+        if (!target.exists()) return true
+        return try {
+            budget.reconcileCandidate(target)
+            val header = M3DirtyIntentHeader.read(File(target, INTENT_FILE))
+            require(header.currentLength == receipt.length && header.currentHash == receipt.hash)
+            require(header.targetHighWater == authority.nextSurfaceIdHighWater &&
+                header.targetLive == authority.liveSurfaceCount && header.targetSource == authority.sourceCount &&
+                header.targetSupport == authority.supportCount && header.targetLineage == authority.lineageCount &&
+                header.targetGeometry == authority.geometryRevision && header.targetLineageRevision == authority.lineageRevision)
+            budget.reclaimCommittedCandidate(target) > 0L
+        } catch (_: Exception) { false }
+    }
+
     @Synchronized
     override fun close() { closed = true }
 

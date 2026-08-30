@@ -10,6 +10,23 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class StorageBudgetCoordinatorV2Test {
+    @Test fun `identity bound verified reclaim is exact once across coordinator restart`() {
+        val root = directory(); val policy = StorageBudgetPolicyV2(64 * 1024, 0)
+        val id = "ab".repeat(32)
+        StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 1_000_000 }.use { first ->
+            val reservation = requireNotNull(first.reserve("m3:canonical:test", 4_096))
+            first.commit(reservation, 4_096)
+            first.reclaimVerifiedOnce(id, 4_096)
+            assertEquals(0L, first.committedBytes())
+        }
+        StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 1_000_000 }.use { reopened ->
+            reopened.reclaimVerifiedOnce(id, 4_096)
+            assertEquals(0L, reopened.committedBytes())
+            reopened.forgetVerifiedReclaim(id)
+            assertTrue(!File(root, "reclaims-v2/verified-$id.reclaim").exists())
+        }
+    }
+
     @Test fun `deterministic candidate target admits one durable winner across coordinators`() {
         val root = directory(); val policy = StorageBudgetPolicyV2(1_000_000, 0)
         val first = StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 10_000_000 }

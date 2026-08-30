@@ -23,16 +23,20 @@ internal class M3PrivateRootSelector(
     private val maximumGenerations: Int = MAX_GENERATIONS,
 ) {
     init { require(maximumGenerations in 1..MAX_GENERATIONS) }
-    fun reopen(generationZero: M3CanonicalStateView): M3CanonicalReopenResult = withParentLock {
+    fun reopen(
+        generationZero: M3CanonicalStateView,
+        acknowledgedCurrent: M3PreparedIntentCurrentReceipt? = null,
+    ): M3CanonicalReopenResult = withParentLock {
         try { recoverPointerPublications() } catch (_: Exception) {
             return M3CanonicalReopenResult.Refused(M3CanonicalSelectorRefusal.DURABILITY_FAILURE)
         }
-        reopenLocked(generationZero, cleanupUnreachable = true)
+        reopenLocked(generationZero, cleanupUnreachable = true, acknowledgedCurrent)
     }
 
     private fun reopenLocked(
         generationZero: M3CanonicalStateView,
         cleanupUnreachable: Boolean,
+        acknowledgedCurrent: M3PreparedIntentCurrentReceipt? = null,
     ): M3CanonicalReopenResult {
         val selectorFile = File(parent, SELECTOR_FILE)
         if (!selectorFile.exists()) {
@@ -44,7 +48,7 @@ internal class M3PrivateRootSelector(
         val slot = Slot.read(File(parent, slotName(selector.slot)))
             ?.takeIf { it.revision == selector.revision && it.rootHash == selector.rootHash }
             ?: return M3CanonicalReopenResult.Refused(M3CanonicalSelectorRefusal.CORRUPT_SELECTED_ROOT)
-        val commit = buildCommit(selector.rootHash, generationZero)
+        val commit = buildCommit(selector.rootHash, generationZero, acknowledgedCurrent)
             ?: return M3CanonicalReopenResult.Refused(M3CanonicalSelectorRefusal.CORRUPT_SELECTED_ROOT)
         if (cleanupUnreachable) try { cleanup(commit.roots) } catch (_: Exception) { }
         return M3CanonicalReopenResult.Selected(commit)
@@ -72,12 +76,13 @@ internal class M3PrivateRootSelector(
         generation: M3CanonicalCowGeneration,
         generationZero: M3CanonicalStateView,
         fault: M3CanonicalSelectorFault?,
+        acknowledgedCurrent: M3PreparedIntentCurrentReceipt? = null,
     ): M3CanonicalPublishResult = withParentLock {
         try { recoverPointerPublications() } catch (_: Exception) {
             return M3CanonicalPublishResult.Refused(M3CanonicalSelectorRefusal.DURABILITY_FAILURE)
         }
         val generationIdentity = M3CowGenerationIdentity.from(generation.root)
-        val reopened = reopenLocked(generationZero, cleanupUnreachable = false)
+        val reopened = reopenLocked(generationZero, cleanupUnreachable = false, acknowledgedCurrent)
         if (reopened is M3CanonicalReopenResult.Refused) return M3CanonicalPublishResult.Refused(reopened.reason)
         val prior = (reopened as? M3CanonicalReopenResult.Selected)?.commit
         val roots = prior?.roots.orEmpty()
@@ -263,7 +268,11 @@ internal class M3PrivateRootSelector(
         }
     }
 
-    private fun buildCommit(selectedHash: M3CanonicalReceiptBytes, generationZero: M3CanonicalStateView): M3CanonicalPublishedCommit? {
+    private fun buildCommit(
+        selectedHash: M3CanonicalReceiptBytes,
+        generationZero: M3CanonicalStateView,
+        acknowledgedCurrent: M3PreparedIntentCurrentReceipt? = null,
+    ): M3CanonicalPublishedCommit? {
         val newestFirst = ArrayList<PublishedRoot>()
         val seen = HashSet<M3CanonicalReceiptBytes>()
         val generations = ArrayList<M3CanonicalCowGeneration>()
@@ -280,7 +289,12 @@ internal class M3PrivateRootSelector(
                 require(root.revision == generations.size + 1L && root.baseRootHash == view.cut.rootHash)
                 val directory = File(parent, root.generationDirectory)
                 require(requireNotNull(directory.parentFile).canonicalFile == parent.canonicalFile && GENERATION_NAME.matches(directory.name))
-                val generation = requireNotNull(M3CanonicalCowGeneration.open(directory, M3CowGenerationIdentity(root.generationHash)))
+                // Every non-newest root crossed this owner-only selector only after its exact
+                // current was ACKed; its root-embedded receipt remains the durable validator.
+                // The newest root may omit its payload only when activation supplies that exact
+                // retained receipt during the crossed-selector repair window.
+                val missingAllowed = if (root != roots.last()) root.current else acknowledgedCurrent
+                val generation = requireNotNull(M3CanonicalCowGeneration.open(directory, M3CowGenerationIdentity(root.generationHash), missingAllowed))
                 try {
                     require(root.matches(generation.root) && generation.root.baseCut == view.cut)
                     generations += generation

@@ -13,8 +13,12 @@ internal interface M3CanonicalCommitStore : AutoCloseable {
         plan: M3PreparedCanonicalMutation,
         generationZero: M3CanonicalStateView,
         faults: M3CanonicalCommitFaults = M3CanonicalCommitFaults(),
+        acknowledgedCurrent: M3PreparedIntentCurrentReceipt? = null,
     ): M3CanonicalCommitResult
-    fun reopen(generationZero: M3CanonicalStateView): M3CanonicalReopenResult
+    fun reopen(
+        generationZero: M3CanonicalStateView,
+        acknowledgedCurrent: M3PreparedIntentCurrentReceipt? = null,
+    ): M3CanonicalReopenResult
     fun lookupCommit(query: M3CanonicalCommitQuery, generationZero: M3CanonicalStateView): M3CanonicalCommitLookup
 
     companion object {
@@ -141,26 +145,31 @@ private class M3CanonicalMutableStore(
         plan: M3PreparedCanonicalMutation,
         generationZero: M3CanonicalStateView,
         faults: M3CanonicalCommitFaults,
+        acknowledgedCurrent: M3PreparedIntentCurrentReceipt?,
     ): M3CanonicalCommitResult {
         if (closed) return M3CanonicalCommitResult.Refused(M3CanonicalCommitRefusal.CLOSED)
         var selected: M3CanonicalPublishedCommit? = null
         var intent: M3PreparedIntent? = null
         var generation: M3CanonicalCowGeneration? = null
         try {
-            val current = when (val reopened = M3PrivateRootSelector(parent, budget).reopen(generationZero)) {
+            val current = when (val reopened = M3PrivateRootSelector(parent, budget).reopen(generationZero, acknowledgedCurrent)) {
                 is M3CanonicalReopenResult.GenerationZero -> generationZero
                 is M3CanonicalReopenResult.Selected -> {
                     selected = reopened.commit
                     val newest = reopened.commit.roots.lastOrNull()
                         ?: return M3CanonicalCommitResult.Refused(M3CanonicalCommitRefusal.SELECTOR_REFUSED)
-                    val current = try { currentReceipt(plan) } catch (_: Exception) {
-                        return M3CanonicalCommitResult.Refused(M3CanonicalCommitRefusal.INVALID_INTENT)
+                    if (acknowledgedCurrent != null && newest.current == acknowledgedCurrent) {
+                        reopened.commit.view
+                    } else {
+                        val current = try { currentReceipt(plan) } catch (_: Exception) {
+                            return M3CanonicalCommitResult.Refused(M3CanonicalCommitRefusal.INVALID_INTENT)
+                        }
+                        if (newest.matches(plan, current)) {
+                            selected = null
+                            return M3CanonicalCommitResult.Committed(reopened.commit, replayed = true)
+                        }
+                        return M3CanonicalCommitResult.Refused(M3CanonicalCommitRefusal.CURRENT_PENDING)
                     }
-                    if (newest.matches(plan, current)) {
-                        selected = null
-                        return M3CanonicalCommitResult.Committed(reopened.commit, replayed = true)
-                    }
-                    return M3CanonicalCommitResult.Refused(M3CanonicalCommitRefusal.CURRENT_PENDING)
                 }
                 is M3CanonicalReopenResult.Refused -> return M3CanonicalCommitResult.Refused(
                     M3CanonicalCommitRefusal.SELECTOR_REFUSED, selectorReason = reopened.reason,
@@ -175,6 +184,9 @@ private class M3CanonicalMutableStore(
                 )
             }
             try {
+                if (selected != null && acknowledgedCurrent != null && !journal.reclaimAcknowledgedIntent(acknowledgedCurrent))
+                    return M3CanonicalCommitResult.Refused(M3CanonicalCommitRefusal.JOURNAL_REFUSED,
+                        journalReason = M3CanonicalDirtyJournalRefusal.CORRUPT_INTENT)
                 intent = when (val durable = journal.reopen()) {
                     is M3CanonicalDirtyJournalReopenResult.Complete -> durable.intent
                     is M3CanonicalDirtyJournalReopenResult.None -> when (val flushed = journal.flush(plan, faults.journal)) {
@@ -201,7 +213,7 @@ private class M3CanonicalMutableStore(
                         cowReason = staged.reason,
                     )
                 }
-                return when (val published = publish(requireNotNull(generation), generationZero, faults.selector)) {
+                return when (val published = publish(requireNotNull(generation), generationZero, faults.selector, acknowledgedCurrent)) {
                     is M3CanonicalPublishResult.Committed -> M3CanonicalCommitResult.Committed(published.commit, published.replayed)
                     is M3CanonicalPublishResult.UnknownAfterSwitch -> M3CanonicalCommitResult.UnknownAfterSwitch(published.receipt)
                     is M3CanonicalPublishResult.Refused -> M3CanonicalCommitResult.Refused(
@@ -222,16 +234,20 @@ private class M3CanonicalMutableStore(
         generation: M3CanonicalCowGeneration,
         generationZero: M3CanonicalStateView,
         fault: M3CanonicalSelectorFault? = null,
+        acknowledgedCurrent: M3PreparedIntentCurrentReceipt? = null,
     ): M3CanonicalPublishResult {
         if (closed) return M3CanonicalPublishResult.Refused(M3CanonicalSelectorRefusal.CLOSED)
-        return M3PrivateRootSelector(parent, budget).publish(generation, generationZero, fault)
+        return M3PrivateRootSelector(parent, budget).publish(generation, generationZero, fault, acknowledgedCurrent)
     }
 
     /** Reopens exactly the selected private cut, or generation zero only if no selector exists. */
     @Synchronized
-    override fun reopen(generationZero: M3CanonicalStateView): M3CanonicalReopenResult {
+    override fun reopen(
+        generationZero: M3CanonicalStateView,
+        acknowledgedCurrent: M3PreparedIntentCurrentReceipt?,
+    ): M3CanonicalReopenResult {
         if (closed) return M3CanonicalReopenResult.Refused(M3CanonicalSelectorRefusal.CLOSED)
-        return M3PrivateRootSelector(parent, budget).reopen(generationZero)
+        return M3PrivateRootSelector(parent, budget).reopen(generationZero, acknowledgedCurrent)
     }
 
     /** Process-recovery lookup; changed bytes under one command identity fail closed. */
@@ -288,6 +304,7 @@ internal data class M3CanonicalCommitFaults(
     val journal: M3CanonicalDirtyJournalFault? = null,
     val cow: M3CanonicalCowFault? = null,
     val selector: M3CanonicalSelectorFault? = null,
+    val adjacent: M3CanonicalAdjacentFault? = null,
 )
 
 internal sealed interface M3CanonicalCommitResult {
