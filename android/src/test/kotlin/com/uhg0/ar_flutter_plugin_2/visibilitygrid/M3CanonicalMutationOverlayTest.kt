@@ -354,6 +354,8 @@ class M3CanonicalMutationOverlayTest {
         legacy.close()
         val budget = object : M3CanonicalStorageBudget {
             override fun reserve(bytes: Long): Any = bytes
+            override fun reserveCandidateExclusive(staging: java.io.File, target: java.io.File, fileBytes: Map<String, Long>, maximumPhysicalBytes: Long) =
+                M3CanonicalCandidateReservation.QuotaRefused
             override fun commit(token: Any, actualBytes: Long) = Unit
             override fun release(token: Any) = Unit
             override fun allocationUnitBytes(path: java.io.File) = 4_096L

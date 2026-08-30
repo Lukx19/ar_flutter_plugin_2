@@ -35,6 +35,8 @@ class M3CompactCanonicalStoreFaultTest {
                     directory,
                     object : M3CanonicalStorageBudget {
                         override fun reserve(bytes: Long): Any? = null
+                        override fun reserveCandidateExclusive(staging: File, target: File, fileBytes: Map<String, Long>, maximumPhysicalBytes: Long) =
+                            M3CanonicalCandidateReservation.QuotaRefused
 
                         override fun commit(token: Any, actualBytes: Long) =
                             error("must not commit")
@@ -186,6 +188,8 @@ class M3CompactCanonicalStoreFaultTest {
     private fun acceptingBudget() =
         object : M3CanonicalStorageBudget {
             override fun reserve(bytes: Long): Any = bytes
+            override fun reserveCandidateExclusive(staging: File, target: File, fileBytes: Map<String, Long>, maximumPhysicalBytes: Long) =
+                M3CanonicalCandidateReservation.QuotaRefused
 
             override fun commit(token: Any, actualBytes: Long) = Unit
 

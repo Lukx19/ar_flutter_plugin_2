@@ -649,17 +649,17 @@ class M3CompactCanonicalMutationTest {
         override fun close() = Unit
     }
 
-    private class RecordingBudget : M3CanonicalStorageBudget {
+    private class RecordingBudget : M3ExclusiveFakeStorageBudget() {
         val requests = mutableListOf<Long>()
         val actuals = mutableListOf<Long>()
-        override fun reserve(bytes: Long): Any = bytes
+        override fun reserveBytes(bytes: Long): Any = bytes
         override fun reserveCandidate(staging: File, target: File, fileBytes: Map<String, Long>, maximumPhysicalBytes: Long): Any? {
             requests += maximumPhysicalBytes
             return super.reserveCandidate(staging, target, fileBytes, maximumPhysicalBytes)
         }
         override fun verifyCandidate(token: Any, candidate: File): Long = allocatedBytes(candidate).also { actuals += it }
-        override fun commit(token: Any, actualBytes: Long) { actuals += actualBytes }
-        override fun release(token: Any) = Unit
+        override fun commitBytes(token: Any, actualBytes: Long) { actuals += actualBytes }
+        override fun releaseBytes(token: Any) = Unit
         override fun allocationUnitBytes(path: File) = 4_096L
     }
 }

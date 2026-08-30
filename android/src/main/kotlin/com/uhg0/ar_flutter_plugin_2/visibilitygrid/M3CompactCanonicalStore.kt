@@ -302,9 +302,7 @@ internal interface M3CanonicalStorageBudget {
         target: File,
         fileBytes: Map<String, Long>,
         maximumPhysicalBytes: Long,
-    ): M3CanonicalCandidateReservation = reserveCandidate(
-        staging, target, fileBytes, maximumPhysicalBytes,
-    )?.let(M3CanonicalCandidateReservation::Reserved) ?: M3CanonicalCandidateReservation.QuotaRefused
+    ): M3CanonicalCandidateReservation
 
     fun verifyCandidate(token: Any, candidate: File): Long = allocatedBytes(candidate)
 
