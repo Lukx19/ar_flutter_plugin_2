@@ -86,7 +86,7 @@ private object M3CanonicalResidentOwnershipRegistry {
 }
 
 /** Small opaque plan capability; its exact authority remains outside the plan object graph. */
-internal class M3CanonicalAuthorityLease internal constructor(internal val token: Any = Any())
+internal class M3CanonicalAuthorityLease internal constructor()
 
 internal enum class M3CanonicalAuthorityLeaseRefusal {
     UNBOUND, STALE, GROUP_MISMATCH, DIRECTORY_MISMATCH, OWNER_MISMATCH,
@@ -102,15 +102,24 @@ internal object M3CanonicalAuthorityLeaseRegistry {
         val store: M3CompactCanonicalStore,
         val group: M3SurfaceGroup,
         val parentKey: String,
-        var owner: Any? = null,
+        val owner: Any,
+        val onRelease: () -> Unit,
     )
-    private val entries = java.util.IdentityHashMap<Any, Entry>()
+    private val entries = java.util.IdentityHashMap<M3CanonicalAuthorityLease, Entry>()
 
-    @Synchronized fun acquire(authority: M3CanonicalStateView, owner: Any): M3CanonicalAuthorityLease {
+    internal fun acquire(
+        authority: M3CanonicalStateView,
+        owner: Any,
+        onRelease: () -> Unit = {},
+    ): M3CanonicalAuthorityLease {
         val lease = M3CanonicalAuthorityLease()
         val store = authority.generationZeroAuthority as? M3CompactCanonicalStore ?: return lease
         store.retainAuthority()
-        check(entries.put(lease.token, Entry(store, store.cut.group, store.authorityParentKey(), owner)) == null)
+        synchronized(this) {
+            check(entries.put(
+                lease, Entry(store, store.cut.group, store.authorityParentKey(), owner, onRelease),
+            ) == null)
+        }
         return lease
     }
 
@@ -120,25 +129,36 @@ internal object M3CanonicalAuthorityLeaseRegistry {
         parent: File,
         owner: Any,
     ): M3CanonicalAuthorityLeaseResolution {
-        val entry = entries[lease.token]
+        val entry = entries[lease]
             ?: return M3CanonicalAuthorityLeaseResolution.Refused(M3CanonicalAuthorityLeaseRefusal.STALE)
         if (entry.group != group)
             return M3CanonicalAuthorityLeaseResolution.Refused(M3CanonicalAuthorityLeaseRefusal.GROUP_MISMATCH)
         if (entry.parentKey != parent.absoluteFile.toPath().normalize().toString())
             return M3CanonicalAuthorityLeaseResolution.Refused(M3CanonicalAuthorityLeaseRefusal.DIRECTORY_MISMATCH)
-        if (entry.owner != null && entry.owner !== owner)
+        if (entry.owner !== owner)
             return M3CanonicalAuthorityLeaseResolution.Refused(M3CanonicalAuthorityLeaseRefusal.OWNER_MISMATCH)
-        entry.owner = owner
         return M3CanonicalAuthorityLeaseResolution.Resolved(entry.store)
     }
 
-    @Synchronized fun release(lease: M3CanonicalAuthorityLease): Boolean {
-        val entry = entries.remove(lease.token) ?: return false
-        entry.store.close()
+    internal fun release(lease: M3CanonicalAuthorityLease): Boolean {
+        val entry = synchronized(this) { entries.remove(lease) } ?: return false
+        try {
+            entry.store.close()
+        } finally {
+            entry.onRelease()
+        }
         return true
     }
 
     @Synchronized internal fun activeLeaseCount() = entries.size
+    @Synchronized internal fun activeResidentStoreCount(): Int {
+        val stores = java.util.Collections.newSetFromMap(
+            java.util.IdentityHashMap<M3CompactCanonicalStore, Boolean>(),
+        )
+        entries.values.forEach { stores.add(it.store) }
+        return stores.size
+    }
+    @Synchronized internal fun isActive(lease: M3CanonicalAuthorityLease) = entries.containsKey(lease)
 }
 
 internal data class M3CompactCanonicalCut(

@@ -17,9 +17,18 @@ class M3CanonicalAcknowledgementTest {
             val otherOwner = Any()
             val lease = M3CanonicalAuthorityLeaseRegistry.acquire(base, owner)
             base.close()
-            assertTrue(M3CanonicalAuthorityLeaseRegistry.resolve(
-                M3CanonicalAuthorityLease(), fixture.group, fixture.directory, owner,
-            ) is M3CanonicalAuthorityLeaseResolution.Refused)
+            val forged = M3CanonicalAuthorityLease()
+            val forgedClone = M3CanonicalAuthorityLease()
+            assertTrue(forged !== forgedClone)
+            assertTrue(M3CanonicalAuthorityLease::class.java.declaredFields.none { it.name == "token" })
+            listOf(forged, forgedClone).forEach { fake ->
+                assertEquals(
+                    M3CanonicalAuthorityLeaseRefusal.STALE,
+                    (M3CanonicalAuthorityLeaseRegistry.resolve(
+                        fake, fixture.group, fixture.directory, owner,
+                    ) as M3CanonicalAuthorityLeaseResolution.Refused).reason,
+                )
+            }
             assertEquals(
                 M3CanonicalAuthorityLeaseRefusal.GROUP_MISMATCH,
                 (M3CanonicalAuthorityLeaseRegistry.resolve(
@@ -57,6 +66,77 @@ class M3CanonicalAcknowledgementTest {
             )
             assertEquals(0, M3CanonicalAuthorityLeaseRegistry.activeLeaseCount())
         } finally { fixture.directory.deleteRecursively() }
+    }
+
+    @Test
+    fun `owner close discards a fresh READY adjacent plan and releases its exact store`() {
+        val fixture = activated("ready-close")
+        try {
+            val plan = adjacentPlan(fixture, requireNotNull(fixture.owner.activationState()))
+            assertEquals(1, M3CanonicalAuthorityLeaseRegistry.activeLeaseCount())
+            assertEquals(1, M3CanonicalAuthorityLeaseRegistry.activeResidentStoreCount())
+
+            assertEquals(M3SurfaceOwnershipCloseResult.Closed, fixture.owner.close())
+
+            assertEquals(M3PreparedMutationLifecycle.DISCARDED, plan.lifecycle())
+            assertEquals(0, M3CanonicalAuthorityLeaseRegistry.activeLeaseCount())
+            assertEquals(0, M3CanonicalAuthorityLeaseRegistry.activeResidentStoreCount())
+        } finally { fixture.directory.deleteRecursively() }
+    }
+
+    @Test
+    fun `one outstanding adjacent plan bounds repeated preparation and permits future admission`() {
+        val fixture = activated("one-outstanding")
+        try {
+            val state = requireNotNull(fixture.owner.activationState())
+            val first = adjacentPreparation(fixture, state, 2) as M3CanonicalMutationPreparation.Prepared
+            val busy = adjacentPreparation(fixture, state, 3) as M3CanonicalMutationPreparation.Refused
+            assertEquals(M3CanonicalMutationRefusal.ADJACENT_BUSY, busy.reason)
+            assertEquals(1, M3CanonicalAuthorityLeaseRegistry.activeLeaseCount())
+            assertEquals(1, M3CanonicalAuthorityLeaseRegistry.activeResidentStoreCount())
+
+            assertEquals(M3PreparedMutationDiscardResult.Discarded, first.mutation.discard())
+            assertEquals(0, M3CanonicalAuthorityLeaseRegistry.activeLeaseCount())
+            val future = adjacentPreparation(fixture, state, 4) as M3CanonicalMutationPreparation.Prepared
+            assertEquals(1, M3CanonicalAuthorityLeaseRegistry.activeLeaseCount())
+            future.mutation.discard()
+            assertEquals(0, M3CanonicalAuthorityLeaseRegistry.activeLeaseCount())
+        } finally {
+            fixture.owner.close()
+            fixture.directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `concurrent adjacent preparation admits one bound plan and refuses the rest busy`() {
+        val fixture = activated("concurrent-bind")
+        try {
+            val state = requireNotNull(fixture.owner.activationState())
+            val results = java.util.Collections.synchronizedList(
+                mutableListOf<M3CanonicalMutationPreparation>(),
+            )
+            val start = java.util.concurrent.CountDownLatch(1)
+            val threads = List(12) { index -> Thread {
+                start.await()
+                results += adjacentPreparation(fixture, state, index + 2)
+            }.also(Thread::start) }
+            start.countDown(); threads.forEach(Thread::join)
+
+            assertEquals(1, results.count { it is M3CanonicalMutationPreparation.Prepared })
+            assertEquals(11, results.count {
+                it is M3CanonicalMutationPreparation.Refused &&
+                    it.reason == M3CanonicalMutationRefusal.ADJACENT_BUSY
+            })
+            assertEquals(1, M3CanonicalAuthorityLeaseRegistry.activeLeaseCount())
+            assertEquals(1, M3CanonicalAuthorityLeaseRegistry.activeResidentStoreCount())
+            (results.single { it is M3CanonicalMutationPreparation.Prepared }
+                as M3CanonicalMutationPreparation.Prepared).mutation.discard()
+            assertEquals(0, M3CanonicalAuthorityLeaseRegistry.activeLeaseCount())
+            assertEquals(0, M3CanonicalAuthorityLeaseRegistry.activeResidentStoreCount())
+        } finally {
+            fixture.owner.close()
+            fixture.directory.deleteRecursively()
+        }
     }
 
     @Test
@@ -430,19 +510,22 @@ class M3CanonicalAcknowledgementTest {
 
     private fun candidate(x: Int) = M3SurfaceCandidate(null, M3Voxel(x, 0, 0), 0, 0, 192)
     private fun adjacentPlan(fixture: Fixture, state: M3CanonicalActivationState, targetX: Int = 2) =
+        (adjacentPreparation(fixture, state, targetX) as M3CanonicalMutationPreparation.Prepared).mutation
+
+    private fun adjacentPreparation(fixture: Fixture, state: M3CanonicalActivationState, targetX: Int) =
         (M3CompactCanonicalStore.openV6(fixture.group, fixture.directory, fixture.budget)
             as M3CompactCanonicalOpenResult.Opened).store.use { base ->
             val current = (state.current as? M3CanonicalActivationCurrent.Receipt)?.identity
             val store = requireNotNull(M3CanonicalCommitStore.open(fixture.directory, fixture.budget))
             store.use {
                 val selected = store.reopen(base, current?.let { M3PreparedIntentCurrentReceipt(it.canonicalLength, it.canonicalHash) })
-                fun prepare(view: M3CanonicalStateView) = (fixture.owner.prepareAdjacentMutation(
+                fun prepare(view: M3CanonicalStateView) = fixture.owner.prepareAdjacentMutation(
                     view, M3CanonicalTransactionCommand(
                         "adjacent-${state.cut.geometryRevision}", M3CanonicalOperation.RELOCATION,
                         state.cut.geometryRevision, state.cut.lineageRevision, listOf(fixture.id),
                         listOf(M3CanonicalTarget(fixture.id, M3Voxel(targetX, 0, 0), 0, 0, 192)),
                     ),
-                ) as M3CanonicalMutationPreparation.Prepared).mutation
+                )
                 when (selected) {
                     is M3CanonicalReopenResult.GenerationZero -> prepare(selected.view)
                     is M3CanonicalReopenResult.Selected -> selected.commit.use { prepare(it.view) }

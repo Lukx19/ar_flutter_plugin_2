@@ -44,7 +44,7 @@ internal class M3SurfaceOwnership private constructor(
     private var lineageRevision = restored.lineageRevision
     private var closed = false
     private val adjacentOwnerCapability = Any()
-    private val retryableAdjacentPlans = java.util.Collections.newSetFromMap(
+    private val outstandingAdjacentPlans = java.util.Collections.newSetFromMap(
         java.util.IdentityHashMap<M3PreparedCanonicalMutation, Boolean>(),
     )
 
@@ -286,7 +286,6 @@ internal class M3SurfaceOwnership private constructor(
             return M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.NO_ACTIVE_AUTHORITY)
         }
         if (plan.lifecycle() != M3PreparedMutationLifecycle.READY) {
-            retryableAdjacentPlans.remove(plan)
             plan.discard()
             return M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.PLAN_DISCARDED)
         }
@@ -295,7 +294,6 @@ internal class M3SurfaceOwnership private constructor(
         )) {
             is M3CanonicalAuthorityLeaseResolution.Resolved -> resolution.store
             is M3CanonicalAuthorityLeaseResolution.Refused -> {
-                retryableAdjacentPlans.remove(plan)
                 plan.discard()
                 return M3CanonicalAdjacentCommitResult.Refused(
                     M3CanonicalAdjacentCommitRefusal.INVALID_AUTHORITY_LEASE,
@@ -307,20 +305,17 @@ internal class M3SurfaceOwnership private constructor(
                 when (result) {
                     is M3CanonicalAdjacentCommitResult.Committed -> {
                         check(plan.consume())
-                        retryableAdjacentPlans.remove(plan)
                         activation = result.state
                     }
                     is M3CanonicalAdjacentCommitResult.Refused -> when (result.disposition) {
-                        M3PreparedMutationDisposition.RETRYABLE -> retryableAdjacentPlans += plan
+                        M3PreparedMutationDisposition.RETRYABLE -> Unit
                         M3PreparedMutationDisposition.TERMINAL -> {
-                            retryableAdjacentPlans.remove(plan)
                             plan.discard()
                         }
                     }
                 }
             }
         } catch (failure: Throwable) {
-            retryableAdjacentPlans.remove(plan)
             plan.discard()
             throw failure
         }
@@ -352,14 +347,31 @@ internal class M3SurfaceOwnership private constructor(
             M3CanonicalStateReceipt(geometryRevision, lineageRevision, nextHighWater, rowsById.size),
         )
         val prepared = preparation as? M3CanonicalMutationPreparation.Prepared ?: return preparation
-        if (!prepared.mutation.bindAuthority(view, adjacentOwnerCapability)) {
+        if (synchronized(outstandingAdjacentPlans) { outstandingAdjacentPlans.isNotEmpty() }) {
+            prepared.mutation.discard()
+            return M3CanonicalMutationPreparation.Refused(
+                M3CanonicalMutationRefusal.ADJACENT_BUSY,
+                M3CanonicalStateReceipt(geometryRevision, lineageRevision, nextHighWater, rowsById.size),
+            )
+        }
+        val mutation = prepared.mutation
+        if (!mutation.bindAuthority(view, adjacentOwnerCapability) { releaseAdjacentPlan(mutation) }) {
             prepared.mutation.discard()
             return M3CanonicalMutationPreparation.Refused(
                 M3CanonicalMutationRefusal.INVALID_OWNERSHIP,
                 M3CanonicalStateReceipt(geometryRevision, lineageRevision, nextHighWater, rowsById.size),
             )
         }
+        synchronized(outstandingAdjacentPlans) {
+            check(outstandingAdjacentPlans.add(mutation))
+        }
         return prepared
+    }
+
+    private fun releaseAdjacentPlan(plan: M3PreparedCanonicalMutation) {
+        synchronized(outstandingAdjacentPlans) {
+            outstandingAdjacentPlans.remove(plan)
+        }
     }
 
     /** Idempotently closes the owner; later calls are deterministic refusals. */
@@ -368,8 +380,10 @@ internal class M3SurfaceOwnership private constructor(
         if (closed) return M3SurfaceOwnershipCloseResult.AlreadyClosed
         closed = true
         try {
-            retryableAdjacentPlans.forEach(M3PreparedCanonicalMutation::discard)
-            retryableAdjacentPlans.clear()
+            val abandoned = synchronized(outstandingAdjacentPlans) {
+                outstandingAdjacentPlans.toList().also { outstandingAdjacentPlans.clear() }
+            }
+            abandoned.forEach(M3PreparedCanonicalMutation::discard)
             store?.close()
         } finally {
             legacyLeaseRelease?.invoke()

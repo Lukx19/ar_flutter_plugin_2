@@ -562,12 +562,16 @@ internal class M3PreparedCanonicalMutation(
 
     @Synchronized internal fun lifecycle() = lifecycle
 
-    @Synchronized internal fun bindAuthority(view: M3CanonicalStateView, owner: Any): Boolean {
+    @Synchronized internal fun bindAuthority(
+        view: M3CanonicalStateView,
+        owner: Any,
+        onRelease: () -> Unit,
+    ): Boolean {
         if (lifecycle != M3PreparedMutationLifecycle.READY ||
-            M3CanonicalAuthorityLeaseRegistry.release(authorityLease)
+            M3CanonicalAuthorityLeaseRegistry.isActive(authorityLease)
         ) return false
-        authorityLease = M3CanonicalAuthorityLeaseRegistry.acquire(view, owner)
-        return true
+        authorityLease = M3CanonicalAuthorityLeaseRegistry.acquire(view, owner, onRelease)
+        return M3CanonicalAuthorityLeaseRegistry.isActive(authorityLease)
     }
 
     @Synchronized internal fun consume(): Boolean {
@@ -894,7 +898,7 @@ internal data class M3CanonicalMutationPreflightWork(
 internal enum class M3CanonicalMutationRefusal {
     INVALID_COMMAND, INVALID_OWNERSHIP, INVALID_NORMAL, UNKNOWN_IDENTITY, OWNERSHIP_CONFLICT,
     CAPACITY, EXHAUSTED, REVISION_CONFLICT, REVISION_EXHAUSTED, LINEAGE_EXHAUSTED,
-    JOURNAL_EXHAUSTED, SOURCE_READ_FAILURE,
+    JOURNAL_EXHAUSTED, SOURCE_READ_FAILURE, ADJACENT_BUSY,
 }
 
 private fun Long.toIntExact(): Int = try { Math.toIntExact(this) } catch (_: ArithmeticException) { Int.MAX_VALUE }
