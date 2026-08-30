@@ -26,12 +26,14 @@ class M3CanonicalCurrentReceiptTest {
             assertTrue("activation=$activation", activation is M3CanonicalActivationResult.Active)
             val reservationsAfterActivation = budget.reservations
             val receipt = plan.current as M3CanonicalActivationCurrent.Receipt
-            val changed = plan.copy(current = M3CanonicalActivationCurrent.Receipt(
-                receipt.identity.copy(canonicalHash = M3CanonicalReceiptBytes(ByteArray(32) { 3 })), receipt.source,
-            ))
-            val unrelated = plan.copy(current = M3CanonicalActivationCurrent.Receipt(
-                receipt.identity.copy(commandHash = M3CanonicalReceiptBytes(ByteArray(32) { 4 })), receipt.source,
-            ))
+            val changed = M3CanonicalActivation.Plan(plan.legacySourceHash, plan.siblingCut,
+                M3CanonicalActivationCurrent.Receipt(
+                    receipt.identity.copy(canonicalHash = M3CanonicalReceiptBytes(ByteArray(32) { 3 })), receipt.source,
+                ), plan.receipt)
+            val unrelated = M3CanonicalActivation.Plan(plan.legacySourceHash, plan.siblingCut,
+                M3CanonicalActivationCurrent.Receipt(
+                    receipt.identity.copy(commandHash = M3CanonicalReceiptBytes(ByteArray(32) { 4 })), receipt.source,
+                ), plan.receipt)
 
             assertEquals(M3CanonicalActivationSelectorRefusal.CHANGED_CURRENT,
                 (M3SurfaceOwnership.activateV6(group, directory, budget, changed) as M3CanonicalActivationResult.Refused).reason)

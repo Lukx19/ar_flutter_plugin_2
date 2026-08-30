@@ -20,6 +20,38 @@ import java.security.MessageDigest
  * reinterpret receipt history.
  */
 internal object M3CanonicalActivation {
+    private val PREPARATION_AUTHORITY = Any()
+    /**
+     * Opaque preparation capability. The binding retains the exact objects selected by [prepare],
+     * in addition to their values, so copying a cut/current or substituting a source cannot create
+     * another valid activation request.
+     */
+    internal class Plan internal constructor(
+        internal val legacySourceHash: M3CanonicalReceiptBytes,
+        internal val siblingCut: M3CompactCanonicalCut,
+        internal val current: M3CanonicalActivationCurrent,
+        internal val receipt: M3CanonicalActivationPreparationReceipt,
+        private val preparationAuthority: Any? = null,
+    ) {
+        private val binding = Binding(legacySourceHash, siblingCut, current)
+
+        internal fun isExactlyBound() =
+            preparationAuthority === PREPARATION_AUTHORITY &&
+                binding.legacySourceHash === legacySourceHash &&
+                binding.siblingCut === siblingCut &&
+                binding.current === current &&
+                (current !is M3CanonicalActivationCurrent.Receipt ||
+                    binding.currentSource === current.source)
+
+        private class Binding(
+            val legacySourceHash: M3CanonicalReceiptBytes,
+            val siblingCut: M3CompactCanonicalCut,
+            val current: M3CanonicalActivationCurrent,
+        ) {
+            val currentSource = (current as? M3CanonicalActivationCurrent.Receipt)?.source
+        }
+    }
+
     fun prepare(
         group: M3SurfaceGroup,
         directory: File,
@@ -81,9 +113,10 @@ internal object M3CanonicalActivation {
             )
         } ?: M3CanonicalActivationCurrent.None
         M3CanonicalActivationPreparation.Prepared(
-            M3CanonicalActivationPlan(
+            Plan(
                 M3CanonicalReceiptBytes(legacy.sourceHash), cut, current,
                 M3CanonicalActivationPreparationReceipt(scanned, matching, 512),
+                PREPARATION_AUTHORITY,
             )
         )
     } catch (_: M3RestoreFailure) {
@@ -106,12 +139,7 @@ internal object M3CanonicalActivation {
             cut.sourceHash == M3CanonicalReceiptBytes(legacy.sourceHash)
 }
 
-internal data class M3CanonicalActivationPlan(
-    val legacySourceHash: M3CanonicalReceiptBytes,
-    val siblingCut: M3CompactCanonicalCut,
-    val current: M3CanonicalActivationCurrent,
-    val receipt: M3CanonicalActivationPreparationReceipt,
-)
+internal typealias M3CanonicalActivationPlan = M3CanonicalActivation.Plan
 
 internal data class M3CanonicalActivationPreparationReceipt(
     val scannedReceipts: Long,
@@ -185,18 +213,23 @@ internal object M3CanonicalActivationSelector {
         budget: M3CanonicalStorageBudget,
         plan: M3CanonicalActivationPlan,
         fault: M3CanonicalActivationFault? = null,
-    ): M3CanonicalActivationResult = withLock(parent, group) {
+    ): M3CanonicalActivationResult = withGroupLock(parent, group) {
+        if (legacyLeaseCount(parent, group) != 0) {
+            return@withGroupLock M3CanonicalActivationResult.Refused(
+                M3CanonicalActivationSelectorRefusal.LEGACY_OWNER_ACTIVE,
+            )
+        }
         val existing = reopenLocked(group, parent, budget)
         when (existing) {
-            is M3CanonicalActivationResult.Active -> return@withLock replay(existing.state, plan)
-            is M3CanonicalActivationResult.Refused -> return@withLock existing
+            is M3CanonicalActivationResult.Active -> return@withGroupLock replay(existing.state, plan)
+            is M3CanonicalActivationResult.Refused -> return@withGroupLock existing
             M3CanonicalActivationResult.Legacy -> Unit
-            M3CanonicalActivationResult.UnknownAfterSwitch -> return@withLock M3CanonicalActivationResult.Refused(
+            M3CanonicalActivationResult.UnknownAfterSwitch -> return@withGroupLock M3CanonicalActivationResult.Refused(
                 M3CanonicalActivationSelectorRefusal.DURABILITY_FAILURE,
             )
         }
         if (!validPlan(group, parent, budget, plan)) {
-            return@withLock M3CanonicalActivationResult.Refused(M3CanonicalActivationSelectorRefusal.INVALID_PLAN)
+            return@withGroupLock M3CanonicalActivationResult.Refused(M3CanonicalActivationSelectorRefusal.INVALID_PLAN)
         }
 
         val root = ActivationRoot(
@@ -210,7 +243,7 @@ internal object M3CanonicalActivationSelector {
         val slotTarget = slotFile(parent, group, 0)
         val selectorTarget = selectorFile(parent, group)
         val unit = try { budget.allocationUnitBytes(parent) } catch (_: Exception) {
-            return@withLock M3CanonicalActivationResult.Refused(M3CanonicalActivationSelectorRefusal.DURABILITY_FAILURE)
+            return@withGroupLock M3CanonicalActivationResult.Refused(M3CanonicalActivationSelectorRefusal.DURABILITY_FAILURE)
         }
         val maximum = listOf(
             rootBytes.size.toLong(), ActivationSlot.BYTES.toLong(), ActivationSelector.BYTES.toLong(),
@@ -221,7 +254,7 @@ internal object M3CanonicalActivationSelector {
         try {
             inject(fault, M3CanonicalActivationFault.BEFORE_RESERVATION)
             reservation = budget.reserve(maximum)
-                ?: return@withLock M3CanonicalActivationResult.Refused(M3CanonicalActivationSelectorRefusal.QUOTA_REFUSED)
+                ?: return@withGroupLock M3CanonicalActivationResult.Refused(M3CanonicalActivationSelectorRefusal.QUOTA_REFUSED)
             inject(fault, M3CanonicalActivationFault.AFTER_RESERVATION)
             if (currentTarget != null) {
                 inject(fault, M3CanonicalActivationFault.BEFORE_CURRENT_WRITE)
@@ -235,6 +268,12 @@ internal object M3CanonicalActivationSelector {
             inject(fault, M3CanonicalActivationFault.BEFORE_SLOT_WRITE)
             atomicReplace(slotTarget, slot.bytes(), fault == M3CanonicalActivationFault.DURING_SLOT_WRITE)
             inject(fault, M3CanonicalActivationFault.AFTER_SLOT_SYNC)
+            // Persist every prerequisite target name before the selector is allowed to name it.
+            // Android/Linux opens and fsyncs the directory. The Windows host adapter cannot open
+            // directory descriptors, and reports that limitation through the ordered test receipt.
+            inject(fault, M3CanonicalActivationFault.BEFORE_PREREQUISITE_PARENT_SYNC)
+            sync(parent, M3CanonicalActivationSyncStage.PREREQUISITES)
+            inject(fault, M3CanonicalActivationFault.AFTER_PREREQUISITE_PARENT_SYNC)
             inject(fault, M3CanonicalActivationFault.BEFORE_SELECTOR_SWITCH)
             atomicReplace(
                 selectorTarget,
@@ -244,7 +283,7 @@ internal object M3CanonicalActivationSelector {
             switched = true
             inject(fault, M3CanonicalActivationFault.AFTER_SELECTOR_SWITCH)
             inject(fault, M3CanonicalActivationFault.BEFORE_PARENT_SYNC)
-            sync(parent)
+            sync(parent, M3CanonicalActivationSyncStage.SELECTOR)
             inject(fault, M3CanonicalActivationFault.AFTER_PARENT_SYNC)
             val actual = allocatedActivationBytes(parent, group, budget)
             inject(fault, M3CanonicalActivationFault.BEFORE_BUDGET_COMMIT)
@@ -273,7 +312,39 @@ internal object M3CanonicalActivationSelector {
         group: M3SurfaceGroup,
         parent: File,
         budget: M3CanonicalStorageBudget,
-    ): M3CanonicalActivationResult = withLock(parent, group) { reopenLocked(group, parent, budget) }
+    ): M3CanonicalActivationResult = withGroupLock(parent, group) { reopenLocked(group, parent, budget) }
+
+    /** Shared selector/restore lock used by every directory-backed ownership opener. */
+    internal fun <T> withGroupLock(parent: File, group: M3SurfaceGroup, block: () -> T): T {
+        val key = parent.absoluteFile.toPath().normalize().toString() + ':' + group.value
+        val lock = synchronized(locks) { locks.getOrPut(key) { Any() } }
+        return synchronized(lock, block)
+    }
+
+    /** Registers a live writable legacy owner. Must be called while [withGroupLock] is held. */
+    internal fun acquireLegacyLease(parent: File, group: M3SurfaceGroup): () -> Unit {
+        val key = lockKey(parent, group)
+        check(!selectorFile(parent, group).exists())
+        synchronized(legacyLeases) { legacyLeases[key] = (legacyLeases[key] ?: 0) + 1 }
+        var released = false
+        return {
+            withGroupLock(parent, group) {
+                if (!released) {
+                    released = true
+                    synchronized(legacyLeases) {
+                        val remaining = requireNotNull(legacyLeases[key]) - 1
+                        if (remaining == 0) legacyLeases.remove(key) else legacyLeases[key] = remaining
+                    }
+                }
+            }
+        }
+    }
+
+    private fun legacyLeaseCount(parent: File, group: M3SurfaceGroup) =
+        synchronized(legacyLeases) { legacyLeases[lockKey(parent, group)] ?: 0 }
+
+    private fun lockKey(parent: File, group: M3SurfaceGroup) =
+        parent.absoluteFile.toPath().normalize().toString() + ':' + group.value
 
     /** A legacy-only caller must never step around a durable v6 authority. */
     fun hasDurableSelector(group: M3SurfaceGroup, parent: File): Boolean = selectorFile(parent, group).exists()
@@ -342,6 +413,7 @@ internal object M3CanonicalActivationSelector {
         budget: M3CanonicalStorageBudget,
         plan: M3CanonicalActivationPlan,
     ): Boolean {
+        if (!plan.isExactlyBound()) return false
         if (plan.siblingCut.group != group || plan.legacySourceHash != plan.siblingCut.sourceHash) return false
         val opened = M3CompactCanonicalStore.openV6(group, parent, budget)
             as? M3CompactCanonicalOpenResult.Opened ?: return false
@@ -427,16 +499,24 @@ internal object M3CanonicalActivationSelector {
     private fun slotFile(parent: File, group: M3SurfaceGroup, slot: Int) = File(parent, "m3-activation-${group.hash.hex()}-$slot.slot")
     private fun selectorFile(parent: File, group: M3SurfaceGroup) = File(parent, "m3-activation-${group.hash.hex()}.selector")
     private fun inject(fault: M3CanonicalActivationFault?, point: M3CanonicalActivationFault) { if (fault == point) throw IllegalStateException("fault:$point") }
-    private fun sync(parent: File) { if (!System.getProperty("os.name").orEmpty().startsWith("Windows", true)) FileChannel.open(parent.toPath(), StandardOpenOption.READ).use { it.force(true) } }
+    private fun sync(parent: File, stage: M3CanonicalActivationSyncStage) {
+        val physical = !System.getProperty("os.name").orEmpty().startsWith("Windows", true)
+        if (physical) FileChannel.open(parent.toPath(), StandardOpenOption.READ).use { it.force(true) }
+        M3CanonicalActivationTestHooks.onDirectorySync?.invoke(stage, physical)
+    }
     private fun round(bytes: Long, unit: Long) = if (bytes == 0L) 0L else Math.multiplyExact((bytes - 1L) / unit + 1L, unit)
     private fun digest(bytes: ByteArray) = M3CanonicalReceiptBytes(MessageDigest.getInstance("SHA-256").digest(bytes))
     private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
     private val locks = mutableMapOf<String, Any>()
-    private fun <T> withLock(parent: File, group: M3SurfaceGroup, block: () -> T): T {
-        val key = parent.absoluteFile.toPath().normalize().toString() + ':' + group.value
-        val lock = synchronized(locks) { locks.getOrPut(key) { Any() } }
-        return synchronized(lock, block)
-    }
+    private val legacyLeases = mutableMapOf<String, Int>()
+}
+
+internal enum class M3CanonicalActivationSyncStage { PREREQUISITES, SELECTOR }
+internal object M3CanonicalActivationTestHooks {
+    /** Test-only observation after the requested physical sync has completed. */
+    @Volatile var onDirectorySync: ((M3CanonicalActivationSyncStage, Boolean) -> Unit)? = null
+    /** Test-only latch point while selector absence and legacy restoration share the group lock. */
+    @Volatile var afterLegacySelection: (() -> Unit)? = null
 }
 
 internal data class M3CanonicalActivationState(
@@ -451,10 +531,11 @@ internal sealed interface M3CanonicalActivationResult {
     data object UnknownAfterSwitch : M3CanonicalActivationResult
     data class Refused(val reason: M3CanonicalActivationSelectorRefusal) : M3CanonicalActivationResult
 }
-internal enum class M3CanonicalActivationSelectorRefusal { INVALID_PLAN, QUOTA_REFUSED, CURRENT_PENDING, CHANGED_CURRENT, CORRUPT_SELECTOR, FORKED_SELECTOR, CORRUPT_V6, CORRUPT_CURRENT, DURABILITY_FAILURE }
+internal enum class M3CanonicalActivationSelectorRefusal { INVALID_PLAN, LEGACY_OWNER_ACTIVE, QUOTA_REFUSED, CURRENT_PENDING, CHANGED_CURRENT, CORRUPT_SELECTOR, FORKED_SELECTOR, CORRUPT_V6, CORRUPT_CURRENT, DURABILITY_FAILURE }
 internal enum class M3CanonicalActivationFault {
     BEFORE_RESERVATION, AFTER_RESERVATION, BEFORE_CURRENT_WRITE, DURING_CURRENT_WRITE, AFTER_CURRENT_SYNC,
     BEFORE_ROOT_WRITE, DURING_ROOT_WRITE, AFTER_ROOT_SYNC, BEFORE_SLOT_WRITE, DURING_SLOT_WRITE, AFTER_SLOT_SYNC,
+    BEFORE_PREREQUISITE_PARENT_SYNC, AFTER_PREREQUISITE_PARENT_SYNC,
     BEFORE_SELECTOR_SWITCH, DURING_SELECTOR_WRITE, AFTER_SELECTOR_SWITCH, BEFORE_PARENT_SYNC, AFTER_PARENT_SYNC,
     BEFORE_BUDGET_COMMIT, AFTER_BUDGET_COMMIT, BEFORE_CLEANUP, AFTER_CLEANUP,
 }

@@ -29,6 +29,7 @@ internal class M3SurfaceOwnership private constructor(
     restored: M3RestoredOwnership,
     private val activation: M3CanonicalActivationState? = null,
 ) {
+    private var legacyLeaseRelease: (() -> Unit)? = null
     private val rowsById = restored.rows.associateByTo(linkedMapOf()) { it.id.value }
     private val idByVoxel = restored.rows.associateTo(linkedMapOf()) { it.voxel to it.id.value }
     private val receipts = restored.receipts.associateByTo(linkedMapOf()) { it.commandHash.hex() }
@@ -242,8 +243,19 @@ internal class M3SurfaceOwnership private constructor(
     fun close(): M3SurfaceOwnershipCloseResult {
         if (closed) return M3SurfaceOwnershipCloseResult.AlreadyClosed
         closed = true
-        store?.close()
+        try {
+            store?.close()
+        } finally {
+            legacyLeaseRelease?.invoke()
+            legacyLeaseRelease = null
+        }
         return M3SurfaceOwnershipCloseResult.Closed
+    }
+
+    /** Attached atomically by the directory opener before this legacy owner is returned. */
+    internal fun attachLegacyLease(release: () -> Unit) {
+        check(!closed && activation == null && legacyLeaseRelease == null)
+        legacyLeaseRelease = release
     }
 
     private fun prepare(command: M3SurfaceOwnershipCommand, commandHash: ByteArray): M3Preparation {
@@ -455,16 +467,23 @@ internal class M3SurfaceOwnership private constructor(
             directory: File,
             configuration: M3SurfaceOwnershipConfiguration = M3SurfaceOwnershipConfiguration(),
             fault: M3SurfaceOwnershipFault? = null,
-        ): M3SurfaceOwnershipOpenResult = try {
+        ): M3SurfaceOwnershipOpenResult = M3CanonicalActivationSelector.withGroupLock(directory, group) { try {
             // This overload has no v6 storage budget.  Once the durable selector exists it may
             // not reinterpret legacy history; the budget-aware overload below is the only route.
             if (M3CanonicalActivationSelector.hasDurableSelector(group, directory)) {
-                return M3SurfaceOwnershipOpenResult.Refused(M3SurfaceOwnershipRestoreRefusal.CORRUPT)
+                return@withGroupLock M3SurfaceOwnershipOpenResult.Refused(M3SurfaceOwnershipRestoreRefusal.CORRUPT)
             }
-            open(group, configuration, M3FileSurfaceOwnershipStore(directory, group, fault))
+            M3CanonicalActivationTestHooks.afterLegacySelection?.invoke()
+            open(group, configuration, M3FileSurfaceOwnershipStore(directory, group, fault)).also { result ->
+                if (result is M3SurfaceOwnershipOpenResult.Opened) {
+                    result.ownership.attachLegacyLease(
+                        M3CanonicalActivationSelector.acquireLegacyLease(directory, group),
+                    )
+                }
+            }
         } catch (failure: M3RestoreFailure) {
             M3SurfaceOwnershipOpenResult.Refused(failure.reason)
-        }
+        } }
 
         /**
          * Opens group-local v6 authority when the durable activation selector exists.  Its active
@@ -478,14 +497,16 @@ internal class M3SurfaceOwnership private constructor(
             configuration: M3SurfaceOwnershipConfiguration = M3SurfaceOwnershipConfiguration(),
         ): M3SurfaceOwnershipOpenResult {
             if (!configuration.isValid) return M3SurfaceOwnershipOpenResult.Refused(M3SurfaceOwnershipRestoreRefusal.INVALID_CONFIGURATION)
-            return when (val activation = M3CanonicalActivationSelector.reopen(group, directory, budget)) {
-                M3CanonicalActivationResult.Legacy -> open(group, directory, configuration)
-                is M3CanonicalActivationResult.Active -> openedV6(group, configuration, activation.state)
-                M3CanonicalActivationResult.UnknownAfterSwitch -> M3SurfaceOwnershipOpenResult.Refused(M3SurfaceOwnershipRestoreRefusal.DURABILITY_FAILURE)
-                is M3CanonicalActivationResult.Refused -> M3SurfaceOwnershipOpenResult.Refused(
-                    if (activation.reason == M3CanonicalActivationSelectorRefusal.FORKED_SELECTOR)
-                        M3SurfaceOwnershipRestoreRefusal.FORK else M3SurfaceOwnershipRestoreRefusal.CORRUPT,
-                )
+            return M3CanonicalActivationSelector.withGroupLock(directory, group) {
+                when (val activation = M3CanonicalActivationSelector.reopen(group, directory, budget)) {
+                    M3CanonicalActivationResult.Legacy -> open(group, directory, configuration)
+                    is M3CanonicalActivationResult.Active -> openedV6(group, configuration, activation.state)
+                    M3CanonicalActivationResult.UnknownAfterSwitch -> M3SurfaceOwnershipOpenResult.Refused(M3SurfaceOwnershipRestoreRefusal.DURABILITY_FAILURE)
+                    is M3CanonicalActivationResult.Refused -> M3SurfaceOwnershipOpenResult.Refused(
+                        if (activation.reason == M3CanonicalActivationSelectorRefusal.FORKED_SELECTOR)
+                            M3SurfaceOwnershipRestoreRefusal.FORK else M3SurfaceOwnershipRestoreRefusal.CORRUPT,
+                    )
+                }
             }
         }
 
@@ -502,14 +523,16 @@ internal class M3SurfaceOwnership private constructor(
             fault: M3CanonicalActivationFault? = null,
         ): M3SurfaceOwnershipOpenResult {
             if (!configuration.isValid) return M3SurfaceOwnershipOpenResult.Refused(M3SurfaceOwnershipRestoreRefusal.INVALID_CONFIGURATION)
-            return when (val activation = M3CanonicalActivationSelector.activate(group, directory, budget, plan, fault)) {
-                is M3CanonicalActivationResult.Active -> openedV6(group, configuration, activation.state)
-                M3CanonicalActivationResult.Legacy,
-                M3CanonicalActivationResult.UnknownAfterSwitch -> M3SurfaceOwnershipOpenResult.Refused(M3SurfaceOwnershipRestoreRefusal.DURABILITY_FAILURE)
-                is M3CanonicalActivationResult.Refused -> M3SurfaceOwnershipOpenResult.Refused(
-                    if (activation.reason == M3CanonicalActivationSelectorRefusal.FORKED_SELECTOR)
-                        M3SurfaceOwnershipRestoreRefusal.FORK else M3SurfaceOwnershipRestoreRefusal.CORRUPT,
-                )
+            return M3CanonicalActivationSelector.withGroupLock(directory, group) {
+                when (val activation = M3CanonicalActivationSelector.activate(group, directory, budget, plan, fault)) {
+                    is M3CanonicalActivationResult.Active -> openedV6(group, configuration, activation.state)
+                    M3CanonicalActivationResult.Legacy,
+                    M3CanonicalActivationResult.UnknownAfterSwitch -> M3SurfaceOwnershipOpenResult.Refused(M3SurfaceOwnershipRestoreRefusal.DURABILITY_FAILURE)
+                    is M3CanonicalActivationResult.Refused -> M3SurfaceOwnershipOpenResult.Refused(
+                        if (activation.reason == M3CanonicalActivationSelectorRefusal.FORKED_SELECTOR)
+                            M3SurfaceOwnershipRestoreRefusal.FORK else M3SurfaceOwnershipRestoreRefusal.CORRUPT,
+                    )
+                }
             }
         }
 
