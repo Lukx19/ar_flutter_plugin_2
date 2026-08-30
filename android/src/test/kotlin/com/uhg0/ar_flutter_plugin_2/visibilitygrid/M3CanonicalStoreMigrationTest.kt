@@ -582,13 +582,15 @@ class M3CanonicalStoreMigrationTest {
     }
 
     /** A test-only v3 encoder independent of every v6 production encoder. */
-    private fun writeMaximumV3Fixture(
+    internal fun writeMaximumV3Fixture(
         directory: File,
         group: M3SurfaceGroup,
         version: Int = 3,
         unsortedSources: Boolean = false,
+        includeCanonicalCurrent: Boolean = false,
     ) {
         require(version in 3..5)
+        require(!includeCanonicalCurrent || version >= 4)
         val prefix = sha256(group.value.encodeToByteArray()).hex()
         val ledger = directory.resolve("m3-surface-$prefix.ledger")
         val reservationBody =
@@ -652,13 +654,31 @@ class M3CanonicalStoreMigrationTest {
                 out.writeLong(source)
                 out.writeLong(2)
             }
-            out.writeInt(0)
+            if (includeCanonicalCurrent) {
+                val canonical = maximumCanonicalReceipt(group)
+                out.writeInt(1)
+                out.write(ByteArray(32) { 0x61 })
+                out.write(ByteArray(32) { 0x62 })
+                out.writeInt(canonical.size)
+                out.write(canonical)
+            } else out.writeInt(0)
             if (version >= 5) out.writeBoolean(false)
             out.flush()
             digestOutput.on(false)
             file.write(digest.digest())
         }
     }
+
+    private fun maximumCanonicalReceipt(group: M3SurfaceGroup) =
+        java.io.ByteArrayOutputStream().use { raw ->
+            DataOutputStream(raw).use { out ->
+                out.writeInt(0x4d334352); out.writeInt(1); out.writeUTF(group.value)
+                out.writeUTF("maximum-current"); out.writeInt(M3CanonicalOperation.RELOCATION.ordinal)
+                out.writeLong(4); out.writeLong(3); out.writeLong(0x1_0000_0000L); out.writeInt(100_000)
+                repeat(4) { out.writeInt(0) }
+            }
+            raw.toByteArray()
+        }
 
     private fun writeMinimalFixture(directory: File, group: M3SurfaceGroup, version: Int) {
         val prefix = sha256(group.value.encodeToByteArray()).hex()
