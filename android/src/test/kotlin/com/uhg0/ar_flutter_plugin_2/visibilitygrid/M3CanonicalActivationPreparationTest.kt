@@ -196,6 +196,53 @@ class M3CanonicalActivationPreparationTest {
         }
     }
 
+    @Test
+    fun `individually valid legacy and sibling with different authority yield mismatch unchanged`() {
+        val legacyDirectory = Files.createTempDirectory("m3-activation-mismatch-legacy").toFile()
+        val siblingDirectory = Files.createTempDirectory("m3-activation-mismatch-sibling").toFile()
+        try {
+            val group = M3SurfaceGroup("activation-mismatch")
+            opened(M3SurfaceOwnership.open(group, legacyDirectory)).close()
+            val legacyMigration = migrated(group, legacyDirectory)
+
+            val siblingOwner = opened(M3SurfaceOwnership.open(group, siblingDirectory))
+            accepted(siblingOwner.apply(M3SurfaceOwnershipCommand("seed", listOf(candidate(0)))))
+            siblingOwner.close()
+            val differentMigration = migrated(group, siblingDirectory)
+
+            legacyMigration.candidateDirectory.deleteRecursively()
+            assertTrue(differentMigration.candidateDirectory.copyRecursively(
+                legacyMigration.candidateDirectory,
+            ))
+            assertEquals(0, M3SurfaceOwnershipLegacyCodec.readValidated(
+                group, legacyDirectory, M3SurfaceOwnershipConfiguration(),
+            ).resident.rows)
+            val validSibling = M3CompactCanonicalStore.openV6(
+                group, legacyDirectory, budget(),
+            ) as M3CompactCanonicalOpenResult.Opened
+            assertEquals(1, validSibling.store.cut.liveSurfaceCount)
+            validSibling.store.close()
+            val legacyBefore = legacyFiles(legacyDirectory)
+                .mapValues { it.value.readBytes().toList() }
+            val siblingBefore = fileBytes(legacyMigration.candidateDirectory)
+
+            val result = M3CanonicalActivation.prepare(group, legacyDirectory, budget())
+
+            assertEquals(
+                M3CanonicalActivationRefusal.SIBLING_MISMATCH,
+                (result as M3CanonicalActivationPreparation.Refused).reason,
+            )
+            assertEquals(
+                legacyBefore,
+                legacyFiles(legacyDirectory).mapValues { it.value.readBytes().toList() },
+            )
+            assertEquals(siblingBefore, fileBytes(legacyMigration.candidateDirectory))
+        } finally {
+            legacyDirectory.deleteRecursively()
+            siblingDirectory.deleteRecursively()
+        }
+    }
+
     private fun migrated(group: M3SurfaceGroup, directory: File):
         M3CompactCanonicalMigrationResult.Prepared {
         val result = M3CompactCanonicalStore.prepareV6SiblingMigration(group, directory, budget())
