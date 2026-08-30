@@ -95,6 +95,9 @@ dependencies {
 // T5's receipt lock is execution provenance, not a bundled fixture. Forward
 // it to the forked unit-test JVM only when a parent runner supplies it.
 tasks.withType(Test).configureEach {
+    // JOL reads this during its first VM singleton initialization. Per-test setup is too late
+    // and makes aggregate results depend on class order.
+    systemProperty 'jol.magicFieldOffset', 'true'
     def m0dSourceLock = System.getProperty('m0d.source.lock') ?: System.getenv('M0D_SOURCE_LOCK')
     if (m0dSourceLock != null && !m0dSourceLock.trim().isEmpty()) {
         systemProperty 'm0d.source.lock', m0dSourceLock

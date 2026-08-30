@@ -85,6 +85,62 @@ private object M3CanonicalResidentOwnershipRegistry {
     }
 }
 
+/** Small opaque plan capability; its exact authority remains outside the plan object graph. */
+internal class M3CanonicalAuthorityLease internal constructor(internal val token: Any = Any())
+
+internal enum class M3CanonicalAuthorityLeaseRefusal {
+    UNBOUND, STALE, GROUP_MISMATCH, DIRECTORY_MISMATCH, OWNER_MISMATCH,
+}
+internal sealed interface M3CanonicalAuthorityLeaseResolution {
+    data class Resolved(val store: M3CompactCanonicalStore) : M3CanonicalAuthorityLeaseResolution
+    data class Refused(val reason: M3CanonicalAuthorityLeaseRefusal) : M3CanonicalAuthorityLeaseResolution
+}
+
+/** Process-local exact authority table. Every entry owns one store reference and is erased once. */
+internal object M3CanonicalAuthorityLeaseRegistry {
+    private data class Entry(
+        val store: M3CompactCanonicalStore,
+        val group: M3SurfaceGroup,
+        val parentKey: String,
+        var owner: Any? = null,
+    )
+    private val entries = java.util.IdentityHashMap<Any, Entry>()
+
+    @Synchronized fun acquire(authority: M3CanonicalStateView, owner: Any): M3CanonicalAuthorityLease {
+        val lease = M3CanonicalAuthorityLease()
+        val store = authority.generationZeroAuthority as? M3CompactCanonicalStore ?: return lease
+        store.retainAuthority()
+        check(entries.put(lease.token, Entry(store, store.cut.group, store.authorityParentKey(), owner)) == null)
+        return lease
+    }
+
+    @Synchronized fun resolve(
+        lease: M3CanonicalAuthorityLease,
+        group: M3SurfaceGroup,
+        parent: File,
+        owner: Any,
+    ): M3CanonicalAuthorityLeaseResolution {
+        val entry = entries[lease.token]
+            ?: return M3CanonicalAuthorityLeaseResolution.Refused(M3CanonicalAuthorityLeaseRefusal.STALE)
+        if (entry.group != group)
+            return M3CanonicalAuthorityLeaseResolution.Refused(M3CanonicalAuthorityLeaseRefusal.GROUP_MISMATCH)
+        if (entry.parentKey != parent.absoluteFile.toPath().normalize().toString())
+            return M3CanonicalAuthorityLeaseResolution.Refused(M3CanonicalAuthorityLeaseRefusal.DIRECTORY_MISMATCH)
+        if (entry.owner != null && entry.owner !== owner)
+            return M3CanonicalAuthorityLeaseResolution.Refused(M3CanonicalAuthorityLeaseRefusal.OWNER_MISMATCH)
+        entry.owner = owner
+        return M3CanonicalAuthorityLeaseResolution.Resolved(entry.store)
+    }
+
+    @Synchronized fun release(lease: M3CanonicalAuthorityLease): Boolean {
+        val entry = entries.remove(lease.token) ?: return false
+        entry.store.close()
+        return true
+    }
+
+    @Synchronized internal fun activeLeaseCount() = entries.size
+}
+
 internal data class M3CompactCanonicalCut(
     val group: M3SurfaceGroup,
     val profile: String,
@@ -579,6 +635,9 @@ private constructor(
 
     internal fun residentOwnership(): M3CanonicalResidentOwnership =
         M3CanonicalResidentOwnershipRegistry.snapshot(residentOwnershipKey)
+
+    internal fun authorityParentKey() = requireNotNull(rootDirectory.parentFile)
+        .absoluteFile.toPath().normalize().toString()
 
     /** Keeps this exact mapped authority resident while a prepared plan crosses its caller scope. */
     @Synchronized internal fun retainAuthority(): M3CompactCanonicalStore {

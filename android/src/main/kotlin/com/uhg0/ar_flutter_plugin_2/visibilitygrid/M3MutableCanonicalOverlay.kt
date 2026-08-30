@@ -295,8 +295,7 @@ internal class M3MutableCanonicalOverlay private constructor(
             supports.constructionArrayPeakBytes, rowConstructionBytes, removedConstructionBytes,
         )
         return M3CanonicalMutationPreparation.Prepared(M3PreparedCanonicalMutation(
-            (view.generationZeroAuthority as? M3CompactCanonicalStore)?.retainAuthority()
-                ?: view.generationZeroAuthority,
+            M3CanonicalAuthorityLease(),
             view.cut, M3CanonicalReceiptBytes(overlayHash(commandId.encodeToByteArray())),
             M3CanonicalReceiptBytes(fingerprint), commandId, kind, rowTable, removedIds,
             supports, supportMode, removedSupportRecords.toIntExact(), high, live, sourceCount, supportCount, lineageCount,
@@ -536,8 +535,8 @@ internal data class M3CanonicalMutationWork(
 )
 
 internal class M3PreparedCanonicalMutation(
-    /** Exact live generation-zero authority used to prepare this immutable mutation. */
-    internal val sourceAuthority: M3CanonicalStateView,
+    /** Opaque capability; the retained authority is deliberately outside this bounded graph. */
+    internal var authorityLease: M3CanonicalAuthorityLease,
     val sourceCut: M3CompactCanonicalCut,
     val commandHash: M3CanonicalReceiptBytes,
     val commandFingerprint: M3CanonicalReceiptBytes,
@@ -563,6 +562,14 @@ internal class M3PreparedCanonicalMutation(
 
     @Synchronized internal fun lifecycle() = lifecycle
 
+    @Synchronized internal fun bindAuthority(view: M3CanonicalStateView, owner: Any): Boolean {
+        if (lifecycle != M3PreparedMutationLifecycle.READY ||
+            M3CanonicalAuthorityLeaseRegistry.release(authorityLease)
+        ) return false
+        authorityLease = M3CanonicalAuthorityLeaseRegistry.acquire(view, owner)
+        return true
+    }
+
     @Synchronized internal fun consume(): Boolean {
         if (lifecycle != M3PreparedMutationLifecycle.READY) return false
         lifecycle = M3PreparedMutationLifecycle.CONSUMED
@@ -583,7 +590,7 @@ internal class M3PreparedCanonicalMutation(
     override fun close() { discard() }
 
     private fun releaseSourceAuthority() {
-            if (sourceAuthority is M3CompactCanonicalStore) sourceAuthority.close()
+        M3CanonicalAuthorityLeaseRegistry.release(authorityLease)
     }
 
     fun visitDirtyRows(sink: (M3PreparedRow) -> Boolean) = rows.visit(sink)

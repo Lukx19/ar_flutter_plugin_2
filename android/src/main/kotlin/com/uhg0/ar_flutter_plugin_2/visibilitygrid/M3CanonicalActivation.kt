@@ -493,12 +493,11 @@ internal object M3CanonicalActivationSelector {
         parent: File,
         budget: M3CanonicalStorageBudget,
         plan: M3PreparedCanonicalMutation,
+        boundBase: M3CompactCanonicalStore,
         faults: M3CanonicalCommitFaults = M3CanonicalCommitFaults(),
     ): M3CanonicalAdjacentCommitResult = withGroupLock(parent, group) {
         if (plan.lifecycle() != M3PreparedMutationLifecycle.READY)
             return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.PLAN_DISCARDED)
-        val boundBase = plan.sourceAuthority as? M3CompactCanonicalStore
-            ?: return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.STALE_CUT)
         if (boundBase.cut.group != group || boundBase.cut.profile != M3CompactCanonicalStore.PROFILE)
             return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.STALE_CUT)
         if (!reconcileReclaimsLocked(group, parent, budget) || !reconcileAttemptsLocked(group, parent, budget) || !reconcileAcknowledgementsLocked(group, parent, budget) ||
@@ -1341,7 +1340,7 @@ internal sealed interface M3CanonicalAdjacentCommitResult {
 }
 internal enum class M3CanonicalAdjacentCommitRefusal {
     NO_ACTIVE_AUTHORITY, CURRENT_UNACKNOWLEDGED, STALE_CUT, COMMIT_REFUSED, DURABILITY_FAILURE,
-    DUPLICATE_RESIDENT_AUTHORITY, PLAN_DISCARDED,
+    DUPLICATE_RESIDENT_AUTHORITY, PLAN_DISCARDED, INVALID_AUTHORITY_LEASE,
 }
 internal enum class M3PreparedMutationDisposition { RETRYABLE, TERMINAL }
 internal enum class M3CanonicalAdjacentFault {

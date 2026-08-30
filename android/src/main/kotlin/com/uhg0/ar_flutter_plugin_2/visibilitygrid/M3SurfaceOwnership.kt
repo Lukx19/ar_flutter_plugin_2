@@ -43,6 +43,7 @@ internal class M3SurfaceOwnership private constructor(
     private var geometryRevision = restored.geometryRevision
     private var lineageRevision = restored.lineageRevision
     private var closed = false
+    private val adjacentOwnerCapability = Any()
     private val retryableAdjacentPlans = java.util.Collections.newSetFromMap(
         java.util.IdentityHashMap<M3PreparedCanonicalMutation, Boolean>(),
     )
@@ -284,8 +285,25 @@ internal class M3SurfaceOwnership private constructor(
             plan.discard()
             return M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.NO_ACTIVE_AUTHORITY)
         }
+        if (plan.lifecycle() != M3PreparedMutationLifecycle.READY) {
+            retryableAdjacentPlans.remove(plan)
+            plan.discard()
+            return M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.PLAN_DISCARDED)
+        }
+        val boundBase = when (val resolution = M3CanonicalAuthorityLeaseRegistry.resolve(
+            plan.authorityLease, group, parent, adjacentOwnerCapability,
+        )) {
+            is M3CanonicalAuthorityLeaseResolution.Resolved -> resolution.store
+            is M3CanonicalAuthorityLeaseResolution.Refused -> {
+                retryableAdjacentPlans.remove(plan)
+                plan.discard()
+                return M3CanonicalAdjacentCommitResult.Refused(
+                    M3CanonicalAdjacentCommitRefusal.INVALID_AUTHORITY_LEASE,
+                )
+            }
+        }
         return try {
-            M3CanonicalActivationSelector.commitAdjacent(group, parent, budget, plan, faults).also { result ->
+            M3CanonicalActivationSelector.commitAdjacent(group, parent, budget, plan, boundBase, faults).also { result ->
                 when (result) {
                     is M3CanonicalAdjacentCommitResult.Committed -> {
                         check(plan.consume())
@@ -306,6 +324,42 @@ internal class M3SurfaceOwnership private constructor(
             plan.discard()
             throw failure
         }
+    }
+
+    /** Owner-issued preparation binds one small exact authority lease for adjacent admission. */
+    @Synchronized
+    internal fun prepareAdjacentMutation(
+        view: M3CanonicalStateView,
+        command: M3FeatureMutationCommand,
+    ): M3CanonicalMutationPreparation = bindAdjacentPreparation(
+        M3MutableCanonicalOverlay.prepare(view, configuration, command), view,
+    )
+
+    @Synchronized
+    internal fun prepareAdjacentMutation(
+        view: M3CanonicalStateView,
+        command: M3CanonicalTransactionCommand,
+    ): M3CanonicalMutationPreparation = bindAdjacentPreparation(
+        M3MutableCanonicalOverlay.prepare(view, configuration, command), view,
+    )
+
+    private fun bindAdjacentPreparation(
+        preparation: M3CanonicalMutationPreparation,
+        view: M3CanonicalStateView,
+    ): M3CanonicalMutationPreparation {
+        if (closed || activation == null) return M3CanonicalMutationPreparation.Refused(
+            M3CanonicalMutationRefusal.INVALID_OWNERSHIP,
+            M3CanonicalStateReceipt(geometryRevision, lineageRevision, nextHighWater, rowsById.size),
+        )
+        val prepared = preparation as? M3CanonicalMutationPreparation.Prepared ?: return preparation
+        if (!prepared.mutation.bindAuthority(view, adjacentOwnerCapability)) {
+            prepared.mutation.discard()
+            return M3CanonicalMutationPreparation.Refused(
+                M3CanonicalMutationRefusal.INVALID_OWNERSHIP,
+                M3CanonicalStateReceipt(geometryRevision, lineageRevision, nextHighWater, rowsById.size),
+            )
+        }
+        return prepared
     }
 
     /** Idempotently closes the owner; later calls are deterministic refusals. */

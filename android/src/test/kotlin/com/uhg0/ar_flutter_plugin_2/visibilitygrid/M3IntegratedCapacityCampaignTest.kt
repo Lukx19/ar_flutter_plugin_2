@@ -13,7 +13,6 @@ import org.openjdk.jol.info.GraphLayout
 class M3IntegratedCapacityCampaignTest {
     @Test
     fun `constructed maximum profile survives ACK adjacent coexistence within fixed limits`() {
-        System.setProperty("jol.magicFieldOffset", "true")
         val directory = Files.createTempDirectory("m3-integrated-maximum").toFile()
         try {
             val group = M3SurfaceGroup("integrated-maximum")
@@ -59,8 +58,8 @@ class M3IntegratedCapacityCampaignTest {
                             ),
                         ) is M3CanonicalAcknowledgementResult.Acknowledged)
 
-                        val mutation = (M3SurfaceOwnership.prepareMutation(
-                            base, M3SurfaceOwnershipConfiguration(),
+                        val mutation = (owner.prepareAdjacentMutation(
+                            base,
                             M3FeatureMutationCommand(
                                 "maximum-adjacent",
                                 before.cut.geometryRevision,

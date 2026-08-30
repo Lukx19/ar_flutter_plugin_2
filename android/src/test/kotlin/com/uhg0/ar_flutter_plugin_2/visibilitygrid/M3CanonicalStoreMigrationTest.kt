@@ -560,7 +560,6 @@ class M3CanonicalStoreMigrationTest {
         }
 
     private fun measureMigrationGraph(group: M3SurfaceGroup, directory: File): Long {
-        System.setProperty("jol.magicFieldOffset", "true")
         val legacy = M3SurfaceOwnershipLegacyCodec.readValidated(
             group, directory, M3SurfaceOwnershipConfiguration(),
         )

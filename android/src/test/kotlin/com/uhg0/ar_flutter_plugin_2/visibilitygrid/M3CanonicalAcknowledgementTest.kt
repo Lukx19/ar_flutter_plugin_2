@@ -8,15 +8,66 @@ import org.junit.Test
 
 class M3CanonicalAcknowledgementTest {
     @Test
+    fun `opaque authority lease rejects forgery staleness cross scope and concurrent cross owner use`() {
+        val fixture = activated("lease-scope")
+        try {
+            val base = (M3CompactCanonicalStore.openV6(fixture.group, fixture.directory, fixture.budget)
+                as M3CompactCanonicalOpenResult.Opened).store
+            val owner = Any()
+            val otherOwner = Any()
+            val lease = M3CanonicalAuthorityLeaseRegistry.acquire(base, owner)
+            base.close()
+            assertTrue(M3CanonicalAuthorityLeaseRegistry.resolve(
+                M3CanonicalAuthorityLease(), fixture.group, fixture.directory, owner,
+            ) is M3CanonicalAuthorityLeaseResolution.Refused)
+            assertEquals(
+                M3CanonicalAuthorityLeaseRefusal.GROUP_MISMATCH,
+                (M3CanonicalAuthorityLeaseRegistry.resolve(
+                    lease, M3SurfaceGroup("wrong-group"), fixture.directory, owner,
+                ) as M3CanonicalAuthorityLeaseResolution.Refused).reason,
+            )
+            assertEquals(
+                M3CanonicalAuthorityLeaseRefusal.DIRECTORY_MISMATCH,
+                (M3CanonicalAuthorityLeaseRegistry.resolve(
+                    lease, fixture.group, File(fixture.directory, "wrong-directory"), owner,
+                ) as M3CanonicalAuthorityLeaseResolution.Refused).reason,
+            )
+
+            val results = java.util.Collections.synchronizedList(mutableListOf<M3CanonicalAuthorityLeaseResolution>())
+            val start = java.util.concurrent.CountDownLatch(1)
+            val threads = List(16) { index -> Thread {
+                start.await()
+                results += M3CanonicalAuthorityLeaseRegistry.resolve(
+                    lease, fixture.group, fixture.directory, if (index % 2 == 0) owner else otherOwner,
+                )
+            }.also(Thread::start) }
+            start.countDown(); threads.forEach(Thread::join)
+            assertEquals(8, results.count { it is M3CanonicalAuthorityLeaseResolution.Resolved })
+            assertEquals(8, results.count {
+                it is M3CanonicalAuthorityLeaseResolution.Refused &&
+                    it.reason == M3CanonicalAuthorityLeaseRefusal.OWNER_MISMATCH
+            })
+            assertTrue(M3CanonicalAuthorityLeaseRegistry.release(lease))
+            assertTrue(!M3CanonicalAuthorityLeaseRegistry.release(lease))
+            assertEquals(
+                M3CanonicalAuthorityLeaseRefusal.STALE,
+                (M3CanonicalAuthorityLeaseRegistry.resolve(
+                    lease, fixture.group, fixture.directory, owner,
+                ) as M3CanonicalAuthorityLeaseResolution.Refused).reason,
+            )
+            assertEquals(0, M3CanonicalAuthorityLeaseRegistry.activeLeaseCount())
+        } finally { fixture.directory.deleteRecursively() }
+    }
+
+    @Test
     fun `abandoned prepared authority discards exactly once and fails closed on reuse`() {
         val fixture = activated("discarded-plan")
         try {
             val plan = adjacentPlan(fixture, requireNotNull(fixture.owner.activationState()))
-            val authority = plan.sourceAuthority as M3CompactCanonicalStore
-            assertEquals(1, authority.residentOwnership().liveStoreCount)
+            assertEquals(1, M3CanonicalAuthorityLeaseRegistry.activeLeaseCount())
             assertEquals(M3PreparedMutationDiscardResult.Discarded, plan.discard())
             assertEquals(M3PreparedMutationDiscardResult.AlreadyDiscarded, plan.discard())
-            assertEquals(0, authority.residentOwnership().liveStoreCount)
+            assertEquals(0, M3CanonicalAuthorityLeaseRegistry.activeLeaseCount())
             val refused = fixture.owner.commitAdjacentCanonicalMutation(plan) as M3CanonicalAdjacentCommitResult.Refused
             assertEquals(M3CanonicalAdjacentCommitRefusal.PLAN_DISCARDED, refused.reason)
             assertEquals(M3PreparedMutationDisposition.TERMINAL, refused.disposition)
@@ -28,14 +79,14 @@ class M3CanonicalAcknowledgementTest {
         val fixture = activated("retryable-close")
         try {
             val plan = adjacentPlan(fixture, requireNotNull(fixture.owner.activationState()))
-            val authority = plan.sourceAuthority as M3CompactCanonicalStore
+            assertEquals(1, M3CanonicalAuthorityLeaseRegistry.activeLeaseCount())
             val refused = fixture.owner.commitAdjacentCanonicalMutation(plan) as M3CanonicalAdjacentCommitResult.Refused
             assertEquals(M3CanonicalAdjacentCommitRefusal.CURRENT_UNACKNOWLEDGED, refused.reason)
             assertEquals(M3PreparedMutationDisposition.RETRYABLE, refused.disposition)
             assertEquals(M3PreparedMutationLifecycle.READY, plan.lifecycle())
             fixture.owner.close()
             assertEquals(M3PreparedMutationLifecycle.DISCARDED, plan.lifecycle())
-            assertEquals(0, authority.residentOwnership().liveStoreCount)
+            assertEquals(0, M3CanonicalAuthorityLeaseRegistry.activeLeaseCount())
         } finally { fixture.directory.deleteRecursively() }
     }
 
@@ -49,13 +100,13 @@ class M3CanonicalAcknowledgementTest {
                 M3CanonicalAcknowledgement(current.identity.commandHash, initial.cut.geometryRevision, initial.cut.lineageRevision),
             )
             val failedPlan = adjacentPlan(fixture, initial)
-            val authority = failedPlan.sourceAuthority as M3CompactCanonicalStore
+            assertEquals(1, M3CanonicalAuthorityLeaseRegistry.activeLeaseCount())
             val refused = fixture.owner.commitAdjacentCanonicalMutation(
                 failedPlan, M3CanonicalCommitFaults(cow = M3CanonicalCowFault.BEFORE_RESERVATION),
             ) as M3CanonicalAdjacentCommitResult.Refused
             assertEquals(M3PreparedMutationDisposition.TERMINAL, refused.disposition)
             assertEquals(M3PreparedMutationLifecycle.DISCARDED, failedPlan.lifecycle())
-            assertEquals(0, authority.residentOwnership().liveStoreCount)
+            assertEquals(0, M3CanonicalAuthorityLeaseRegistry.activeLeaseCount())
 
             val fresh = adjacentPlan(fixture, initial)
             assertTrue(fixture.owner.commitAdjacentCanonicalMutation(fresh) is M3CanonicalAdjacentCommitResult.Committed)
@@ -78,7 +129,7 @@ class M3CanonicalAcknowledgementTest {
                     M3CanonicalAcknowledgement(current.identity.commandHash, initial.cut.geometryRevision, initial.cut.lineageRevision),
                 )
                 val plan = adjacentPlan(fixture, initial)
-                val authority = plan.sourceAuthority as M3CompactCanonicalStore
+                assertEquals(1, M3CanonicalAuthorityLeaseRegistry.activeLeaseCount())
                 M3CanonicalActivationTestHooks.onAdjacentOwnership = { observation ->
                     if (observation.stage == failedStage) error("terminal-$failedStage")
                 }
@@ -87,7 +138,7 @@ class M3CanonicalAcknowledgementTest {
                 } finally { M3CanonicalActivationTestHooks.onAdjacentOwnership = null }
                 assertEquals(M3PreparedMutationDisposition.TERMINAL, refused.disposition)
                 assertEquals(M3PreparedMutationLifecycle.DISCARDED, plan.lifecycle())
-                assertEquals(0, authority.residentOwnership().liveStoreCount)
+                assertEquals(0, M3CanonicalAuthorityLeaseRegistry.activeLeaseCount())
             } finally {
                 M3CanonicalActivationTestHooks.onAdjacentOwnership = null
                 fixture.directory.deleteRecursively()
@@ -113,7 +164,7 @@ class M3CanonicalAcknowledgementTest {
                     throw AssertionError("expected private selector process cut")
                 } catch (_: M3CanonicalSimulatedProcessCrash) { }
                 assertEquals(M3PreparedMutationLifecycle.DISCARDED, plan.lifecycle())
-                assertEquals(0, (plan.sourceAuthority as M3CompactCanonicalStore).residentOwnership().liveStoreCount)
+                assertEquals(0, M3CanonicalAuthorityLeaseRegistry.activeLeaseCount())
                 fixture.owner.close()
                 val transaction = File(fixture.directory, "m3-activation-${fixture.group.hash.joinToString("") { "%02x".format(it) }}-adjacent.transaction")
                 val original = transaction.readBytes()
@@ -194,7 +245,7 @@ class M3CanonicalAcknowledgementTest {
                 val committedBefore = fixture.budget.committedBytes
                 val physicalBefore = fixture.budget.allocatedBytes(fixture.directory)
                 val plan = adjacentPlan(fixture, initial)
-                val authority = plan.sourceAuthority as M3CompactCanonicalStore
+                assertEquals(1, M3CanonicalAuthorityLeaseRegistry.activeLeaseCount())
                 try {
                     fixture.owner.commitAdjacentCanonicalMutation(
                         plan, M3CanonicalCommitFaults(adjacent = fault),
@@ -202,7 +253,7 @@ class M3CanonicalAcknowledgementTest {
                     throw AssertionError("expected adjacent process crash")
                 } catch (_: M3CanonicalAdjacentProcessCrash) { }
                 assertEquals(M3PreparedMutationLifecycle.DISCARDED, plan.lifecycle())
-                assertEquals(0, authority.residentOwnership().liveStoreCount)
+                assertEquals(0, M3CanonicalAuthorityLeaseRegistry.activeLeaseCount())
                 fixture.owner.close()
                 val reopened = opened(M3SurfaceOwnership.open(fixture.group, fixture.directory, fixture.budget))
                 assertEquals(initial.cut.geometryRevision + 1, requireNotNull(reopened.activationState()).cut.geometryRevision)
@@ -245,7 +296,7 @@ class M3CanonicalAcknowledgementTest {
                 M3CanonicalAcknowledgement(current.identity.commandHash, initial.cut.geometryRevision, initial.cut.lineageRevision),
             )
             val plan = adjacentPlan(fixture, initial)
-            val authority = plan.sourceAuthority as M3CompactCanonicalStore
+            assertEquals(1, M3CanonicalAuthorityLeaseRegistry.activeLeaseCount())
             try {
                 fixture.owner.commitAdjacentCanonicalMutation(
                     plan,
@@ -256,7 +307,7 @@ class M3CanonicalAcknowledgementTest {
                 // Reopen owns the durable forward repair.
             }
             assertEquals(M3PreparedMutationLifecycle.DISCARDED, plan.lifecycle())
-            assertEquals(0, authority.residentOwnership().liveStoreCount)
+            assertEquals(0, M3CanonicalAuthorityLeaseRegistry.activeLeaseCount())
             fixture.owner.close()
             val reopened = opened(M3SurfaceOwnership.open(fixture.group, fixture.directory, fixture.budget))
             val repaired = requireNotNull(reopened.activationState())
@@ -385,8 +436,8 @@ class M3CanonicalAcknowledgementTest {
             val store = requireNotNull(M3CanonicalCommitStore.open(fixture.directory, fixture.budget))
             store.use {
                 val selected = store.reopen(base, current?.let { M3PreparedIntentCurrentReceipt(it.canonicalLength, it.canonicalHash) })
-                fun prepare(view: M3CanonicalStateView) = (M3SurfaceOwnership.prepareMutation(
-                    view, M3SurfaceOwnershipConfiguration(), M3CanonicalTransactionCommand(
+                fun prepare(view: M3CanonicalStateView) = (fixture.owner.prepareAdjacentMutation(
+                    view, M3CanonicalTransactionCommand(
                         "adjacent-${state.cut.geometryRevision}", M3CanonicalOperation.RELOCATION,
                         state.cut.geometryRevision, state.cut.lineageRevision, listOf(fixture.id),
                         listOf(M3CanonicalTarget(fixture.id, M3Voxel(targetX, 0, 0), 0, 0, 192)),
