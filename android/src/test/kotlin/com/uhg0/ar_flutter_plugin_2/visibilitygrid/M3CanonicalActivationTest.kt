@@ -1,5 +1,8 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
+import com.uhg0.ar_flutter_plugin_2.capture.JvmDescriptorFilesystemV2
+import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetCoordinatorV2
+import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetPolicyV2
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.file.Files
@@ -108,6 +111,10 @@ class M3CanonicalActivationTest {
         M3CanonicalActivationTestHooks.onDirectorySync = { stage, physical ->
             val files = directory.listFiles().orEmpty()
             when (stage) {
+                M3CanonicalActivationSyncStage.ATTEMPT -> {
+                    assertTrue(files.any { it.name.endsWith(".attempt") })
+                    assertTrue(files.none { it.name.endsWith(".selector") })
+                }
                 M3CanonicalActivationSyncStage.PREREQUISITES -> {
                     assertTrue(files.none { it.name.endsWith(".selector") })
                     assertTrue(files.any { it.name.endsWith(".root") })
@@ -115,6 +122,10 @@ class M3CanonicalActivationTest {
                 }
                 M3CanonicalActivationSyncStage.SELECTOR ->
                     assertTrue(files.any { it.name.endsWith(".selector") })
+                M3CanonicalActivationSyncStage.RECOVERY -> {
+                    assertTrue(files.none { it.name.endsWith(".attempt") })
+                    assertTrue(files.any { it.name.endsWith(".selector") })
+                }
             }
             receipt += stage to physical
         }
@@ -125,8 +136,10 @@ class M3CanonicalActivationTest {
         }
         val physical = !System.getProperty("os.name").orEmpty().startsWith("Windows", true)
         assertEquals(listOf(
+            M3CanonicalActivationSyncStage.ATTEMPT to physical,
             M3CanonicalActivationSyncStage.PREREQUISITES to physical,
             M3CanonicalActivationSyncStage.SELECTOR to physical,
+            M3CanonicalActivationSyncStage.RECOVERY to physical,
         ), receipt)
         assertTrue(M3CanonicalActivationSelector.reopen(group, directory, budget) is M3CanonicalActivationResult.Active)
     }
@@ -160,7 +173,7 @@ class M3CanonicalActivationTest {
 
     @Test
     fun `selector faults reopen old legacy or complete active v6`() {
-        M3CanonicalActivationFault.entries.forEach { fault -> fixture { group, directory ->
+        M3CanonicalActivationFault.entries.filterNot { it.isProcessCrashForTest() }.forEach { fault -> fixture { group, directory ->
             opened(M3SurfaceOwnership.open(group, directory)).close()
             M3CompactCanonicalStore.prepareV6SiblingMigration(group, directory, budget())
             val plan = prepared(M3CanonicalActivation.prepare(group, directory, budget()))
@@ -174,6 +187,89 @@ class M3CanonicalActivationTest {
                 is M3CanonicalActivationResult.Refused -> throw AssertionError("fault $fault refused ${reopened.reason}")
             }
         } }
+    }
+
+    @Test
+    fun `every caught pre-selector fault reclaims named attempt and liability before legacy reopen`() {
+        val faults = listOf(
+            M3CanonicalActivationFault.BEFORE_RESERVATION,
+            M3CanonicalActivationFault.AFTER_RESERVATION,
+            M3CanonicalActivationFault.AFTER_ATTEMPT_SYNC,
+            M3CanonicalActivationFault.BEFORE_CURRENT_WRITE,
+            M3CanonicalActivationFault.DURING_CURRENT_WRITE,
+            M3CanonicalActivationFault.AFTER_CURRENT_SYNC,
+            M3CanonicalActivationFault.BEFORE_ROOT_WRITE,
+            M3CanonicalActivationFault.DURING_ROOT_WRITE,
+            M3CanonicalActivationFault.AFTER_ROOT_SYNC,
+            M3CanonicalActivationFault.BEFORE_SLOT_WRITE,
+            M3CanonicalActivationFault.DURING_SLOT_WRITE,
+            M3CanonicalActivationFault.AFTER_SLOT_SYNC,
+            M3CanonicalActivationFault.BEFORE_PREREQUISITE_PARENT_SYNC,
+            M3CanonicalActivationFault.AFTER_PREREQUISITE_PARENT_SYNC,
+            M3CanonicalActivationFault.BEFORE_SELECTOR_SWITCH,
+            M3CanonicalActivationFault.DURING_SELECTOR_WRITE,
+        )
+        faults.forEach { fault -> fixture { group, directory ->
+            val legacy = opened(M3SurfaceOwnership.open(group, directory))
+            val id = accepted(legacy.apply(M3SurfaceOwnershipCommand("seed", listOf(candidate(0))))).owners.single().id
+            accepted(legacy.transact(relocate("current", id, 1))); legacy.close()
+            val budget = CountingBudget()
+            M3CompactCanonicalStore.prepareV6SiblingMigration(group, directory, budget)
+            val plan = prepared(M3CanonicalActivation.prepare(group, directory, budget))
+            val accountingBefore = budget.liabilitySnapshot()
+
+            M3SurfaceOwnership.activateV6(group, directory, budget, plan, fault)
+
+            assertTrue("$fault legacy", M3CanonicalActivationSelector.reopen(group, directory, budget) is M3CanonicalActivationResult.Legacy)
+            assertTrue("$fault no named activation artifacts", activationArtifacts(directory).isEmpty())
+            assertEquals("$fault no liability", accountingBefore, budget.liabilitySnapshot())
+            assertTrue("$fault idempotent reopen", M3CanonicalActivationSelector.reopen(group, directory, budget) is M3CanonicalActivationResult.Legacy)
+            assertTrue("$fault later activates", M3SurfaceOwnership.activateV6(group, directory, budget, plan) is M3CanonicalActivationResult.Active)
+        } }
+    }
+
+    @Test
+    fun `hard crash before selector is reclaimed by durable coordinator reopen`() = fixture { group, directory ->
+        val legacy = opened(M3SurfaceOwnership.open(group, directory))
+        val id = accepted(legacy.apply(M3SurfaceOwnershipCommand("seed", listOf(candidate(0))))).owners.single().id
+        accepted(legacy.transact(relocate("current", id, 1))); legacy.close()
+        var committedBefore = 0L
+        StorageBudgetCoordinatorV2(
+            directory, StorageBudgetPolicyV2(64L * 1024 * 1024, 0),
+            JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L }),
+        ) { 128L * 1024 * 1024 }.use { coordinator ->
+            val budget = M3CoordinatorStorageBudget(coordinator)
+            M3CompactCanonicalStore.prepareV6SiblingMigration(group, directory, budget)
+            val plan = prepared(M3CanonicalActivation.prepare(group, directory, budget))
+            committedBefore = coordinator.committedBytes()
+            try {
+                M3SurfaceOwnership.activateV6(
+                    group, directory, budget, plan,
+                    M3CanonicalActivationFault.PROCESS_CRASH_AFTER_PREREQUISITE_SYNC,
+                )
+                throw AssertionError("hard crash was not injected")
+            } catch (crash: M3CanonicalActivationProcessCrash) {
+                assertEquals(M3CanonicalActivationFault.PROCESS_CRASH_AFTER_PREREQUISITE_SYNC, crash.point)
+            }
+            assertTrue(coordinator.reservedBytes() > 0L)
+            assertTrue(activationArtifacts(directory).isNotEmpty())
+        }
+        StorageBudgetCoordinatorV2(
+            directory, StorageBudgetPolicyV2(64L * 1024 * 1024, 0),
+            JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L }),
+        ) { 128L * 1024 * 1024 }.use { coordinator ->
+            val budget = M3CoordinatorStorageBudget(coordinator)
+            assertTrue(M3CanonicalActivationSelector.reopen(group, directory, budget) is M3CanonicalActivationResult.Legacy)
+            assertEquals(0L, coordinator.reservedBytes())
+            assertEquals(committedBefore, coordinator.committedBytes())
+            assertTrue(activationArtifacts(directory).isEmpty())
+            assertTrue(File(directory, "reservations-v2").listFiles().orEmpty().none {
+                it.name.endsWith(".reservation") || it.name.endsWith(".allocation")
+            })
+            assertTrue(M3CanonicalActivationSelector.reopen(group, directory, budget) is M3CanonicalActivationResult.Legacy)
+            val plan = prepared(M3CanonicalActivation.prepare(group, directory, budget))
+            assertTrue(M3SurfaceOwnership.activateV6(group, directory, budget, plan) is M3CanonicalActivationResult.Active)
+        }
     }
 
     @Test
@@ -200,15 +296,24 @@ class M3CanonicalActivationTest {
         override fun allocationUnitBytes(path: File) = 4_096L
     }
     private class CountingBudget : M3CanonicalStorageBudget {
+        private data class Token(val bytes: Long)
         var reserves = 0; var commits = 0; var releases = 0
-        override fun reserve(bytes: Long): Any = bytes.also { reserves++ }
+        var reservedLiability = 0L; var committedLiability = 0L
+        override fun reserve(bytes: Long): Any = Token(bytes).also { reserves++; reservedLiability += bytes }
         override fun reserveCandidateExclusive(staging: File, target: File, fileBytes: Map<String, Long>, maximumPhysicalBytes: Long) =
             M3CanonicalCandidateReservation.QuotaRefused
-        override fun commit(token: Any, actualBytes: Long) { commits++ }
-        override fun release(token: Any) { releases++ }
+        override fun commit(token: Any, actualBytes: Long) {
+            commits++; reservedLiability -= (token as Token).bytes; committedLiability += actualBytes
+        }
+        override fun release(token: Any) { releases++; reservedLiability -= (token as Token).bytes }
         override fun allocationUnitBytes(path: File) = 4_096L
-        fun snapshot() = Triple(reserves, commits, releases)
+        fun snapshot() = listOf(reserves.toLong(), commits.toLong(), releases.toLong(), reservedLiability, committedLiability)
+        fun liabilitySnapshot() = reservedLiability to committedLiability
     }
+    private fun activationArtifacts(directory: File) = directory.listFiles().orEmpty()
+        .filter { it.name.startsWith("m3-activation-") }
+    private fun M3CanonicalActivationFault?.isProcessCrashForTest() =
+        this == M3CanonicalActivationFault.PROCESS_CRASH_AFTER_PREREQUISITE_SYNC
     private fun fileTree(directory: File) = directory.walkTopDown().filter(File::isFile)
         .associate { it.relativeTo(directory).path to it.readBytes().toList() }
     private fun candidate(x: Int) = M3SurfaceCandidate(null, M3Voxel(x, 0, 0), 0, 0, 192)

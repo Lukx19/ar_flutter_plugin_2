@@ -219,6 +219,11 @@ internal object M3CanonicalActivationSelector {
                 M3CanonicalActivationSelectorRefusal.LEGACY_OWNER_ACTIVE,
             )
         }
+        if (!reconcileAttemptsLocked(group, parent, budget)) {
+            return@withGroupLock M3CanonicalActivationResult.Refused(
+                M3CanonicalActivationSelectorRefusal.DURABILITY_FAILURE,
+            )
+        }
         val existing = reopenLocked(group, parent, budget)
         when (existing) {
             is M3CanonicalActivationResult.Active -> return@withGroupLock replay(existing.state, plan)
@@ -242,20 +247,50 @@ internal object M3CanonicalActivationSelector {
         val currentTarget = currentFile(parent, group, plan.current)
         val slotTarget = slotFile(parent, group, 0)
         val selectorTarget = selectorFile(parent, group)
+        if (slotTarget.exists() || selectorTarget.exists()) {
+            return@withGroupLock M3CanonicalActivationResult.Refused(
+                M3CanonicalActivationSelectorRefusal.DURABILITY_FAILURE,
+            )
+        }
         val unit = try { budget.allocationUnitBytes(parent) } catch (_: Exception) {
             return@withGroupLock M3CanonicalActivationResult.Refused(M3CanonicalActivationSelectorRefusal.DURABILITY_FAILURE)
         }
-        val maximum = listOf(
+        val attempt = ActivationAttempt(
+            group.hash.hex(),
+            rootTarget.name,
+            currentTarget?.name,
+            slotTarget.name,
+            rootTarget.exists(),
+            currentTarget?.exists() == true,
+        )
+        val attemptBytes = attempt.bytes()
+        val attemptId = digest(attemptBytes)
+        val attemptTarget = attemptFile(parent, group, attemptId)
+        val commitBytes = listOf(
             rootBytes.size.toLong(), ActivationSlot.BYTES.toLong(), ActivationSelector.BYTES.toLong(),
-            currentLength(plan.current), 1L, 1L, 1L,
+            currentLength(plan.current),
         ).fold(0L) { total, bytes -> Math.addExact(total, round(bytes, unit)) }
+        val maximum = listOf(attemptBytes.size.toLong(), 1L, 1L, 1L).fold(commitBytes) { total, bytes ->
+            Math.addExact(total, round(bytes, unit))
+        }
         var reservation: Any? = null
         var switched = false
         try {
             inject(fault, M3CanonicalActivationFault.BEFORE_RESERVATION)
-            reservation = budget.reserve(maximum)
+            reservation = budget.reserveActivationAttempt(
+                group.hash.hex(),
+                attemptId.toByteArray().hex(),
+                if (rootTarget.exists()) budget.allocatedBytes(rootTarget) else 0L,
+                0L,
+                0L,
+                commitBytes,
+                maximum,
+            )
                 ?: return@withGroupLock M3CanonicalActivationResult.Refused(M3CanonicalActivationSelectorRefusal.QUOTA_REFUSED)
             inject(fault, M3CanonicalActivationFault.AFTER_RESERVATION)
+            writeAttempt(attemptTarget, attemptBytes)
+            sync(parent, M3CanonicalActivationSyncStage.ATTEMPT)
+            inject(fault, M3CanonicalActivationFault.AFTER_ATTEMPT_SYNC)
             if (currentTarget != null) {
                 inject(fault, M3CanonicalActivationFault.BEFORE_CURRENT_WRITE)
                 writeCurrent(currentTarget, plan.current as M3CanonicalActivationCurrent.Receipt, fault)
@@ -274,6 +309,7 @@ internal object M3CanonicalActivationSelector {
             inject(fault, M3CanonicalActivationFault.BEFORE_PREREQUISITE_PARENT_SYNC)
             sync(parent, M3CanonicalActivationSyncStage.PREREQUISITES)
             inject(fault, M3CanonicalActivationFault.AFTER_PREREQUISITE_PARENT_SYNC)
+            inject(fault, M3CanonicalActivationFault.PROCESS_CRASH_AFTER_PREREQUISITE_SYNC)
             inject(fault, M3CanonicalActivationFault.BEFORE_SELECTOR_SWITCH)
             atomicReplace(
                 selectorTarget,
@@ -285,11 +321,16 @@ internal object M3CanonicalActivationSelector {
             inject(fault, M3CanonicalActivationFault.BEFORE_PARENT_SYNC)
             sync(parent, M3CanonicalActivationSyncStage.SELECTOR)
             inject(fault, M3CanonicalActivationFault.AFTER_PARENT_SYNC)
-            val actual = allocatedActivationBytes(parent, group, budget)
+            val actual = selectedActivationBytes(
+                rootTarget, currentTarget, slotTarget, selectorTarget, budget,
+            )
+            require(actual == commitBytes)
             inject(fault, M3CanonicalActivationFault.BEFORE_BUDGET_COMMIT)
             budget.commit(requireNotNull(reservation), actual)
             reservation = null
             inject(fault, M3CanonicalActivationFault.AFTER_BUDGET_COMMIT)
+            require(attemptTarget.delete())
+            sync(parent, M3CanonicalActivationSyncStage.RECOVERY)
             inject(fault, M3CanonicalActivationFault.BEFORE_CLEANUP)
             cleanupLegacyCandidates(parent, group)
             inject(fault, M3CanonicalActivationFault.AFTER_CLEANUP)
@@ -298,13 +339,20 @@ internal object M3CanonicalActivationSelector {
             if (switched) M3CanonicalActivationResult.UnknownAfterSwitch
             else M3CanonicalActivationResult.Refused(M3CanonicalActivationSelectorRefusal.DURABILITY_FAILURE)
         } finally {
-            reservation?.let { token ->
+            if (!fault.isProcessCrash()) reservation?.let { token ->
                 try {
-                    if (switched) budget.commit(token, allocatedActivationBytes(parent, group, budget))
-                    else budget.release(token)
+                    if (switched) {
+                        budget.commit(token, selectedActivationBytes(
+                            rootTarget, currentTarget, slotTarget, selectorTarget, budget,
+                        ))
+                    } else {
+                        cleanupAttempt(parent, group, attempt, attemptTarget, emptySet())
+                        sync(parent, M3CanonicalActivationSyncStage.RECOVERY)
+                        budget.release(token)
+                    }
                 } catch (_: Exception) { }
             }
-            if (!switched) cleanupLegacyCandidates(parent, group)
+            if (!switched && !fault.isProcessCrash()) cleanupLegacyCandidates(parent, group)
         }
     }
 
@@ -312,7 +360,13 @@ internal object M3CanonicalActivationSelector {
         group: M3SurfaceGroup,
         parent: File,
         budget: M3CanonicalStorageBudget,
-    ): M3CanonicalActivationResult = withGroupLock(parent, group) { reopenLocked(group, parent, budget) }
+    ): M3CanonicalActivationResult = withGroupLock(parent, group) {
+        if (!reconcileAttemptsLocked(group, parent, budget)) {
+            M3CanonicalActivationResult.Refused(M3CanonicalActivationSelectorRefusal.DURABILITY_FAILURE)
+        } else {
+            reopenLocked(group, parent, budget)
+        }
+    }
 
     /** Shared selector/restore lock used by every directory-backed ownership opener. */
     internal fun <T> withGroupLock(parent: File, group: M3SurfaceGroup, block: () -> T): T {
@@ -347,7 +401,103 @@ internal object M3CanonicalActivationSelector {
         parent.absoluteFile.toPath().normalize().toString() + ':' + group.value
 
     /** A legacy-only caller must never step around a durable v6 authority. */
-    fun hasDurableSelector(group: M3SurfaceGroup, parent: File): Boolean = selectorFile(parent, group).exists()
+    fun hasDurableSelector(group: M3SurfaceGroup, parent: File): Boolean =
+        selectorFile(parent, group).exists() || parent.listFiles().orEmpty().any {
+            it.name.startsWith("m3-activation-${group.hash.hex()}-attempt-") && it.name.endsWith(".attempt")
+        }
+
+    /** Reconciles durable attempts before authority selection; release always follows deletion fsync. */
+    private fun reconcileAttemptsLocked(
+        group: M3SurfaceGroup,
+        parent: File,
+        budget: M3CanonicalStorageBudget,
+    ): Boolean = try {
+        val prefix = "m3-activation-${group.hash.hex()}-attempt-"
+        val reservations = budget.activationAttempts(group.hash.hex())
+        val liveIds = reservations.mapTo(hashSetOf()) { it.publicationId }
+        for (reservation in reservations) {
+            val target = attemptFile(parent, group, M3CanonicalReceiptBytes(hex(reservation.publicationId)))
+            if (!target.exists()) {
+                // Reservation landed before its manifest; therefore no named activation artifact
+                // could have been written by this attempt.
+                budget.releaseActivationAttempt(reservation)
+                continue
+            }
+            val attempt = ActivationAttempt.read(target, reservation.publicationId, group.hash.hex())
+                ?: return false
+            val reachable = selectedReachableNames(parent, group) ?: return false
+            if (attempt.rootName in reachable) {
+                budget.commitActivationAttempt(reservation)
+                require(target.delete())
+                sync(parent, M3CanonicalActivationSyncStage.RECOVERY)
+            } else {
+                cleanupAttempt(parent, group, attempt, target, reachable)
+                sync(parent, M3CanonicalActivationSyncStage.RECOVERY)
+                budget.releaseActivationAttempt(reservation)
+            }
+        }
+        // A crash after commit but before manifest deletion leaves no reservation. Its manifest is
+        // still sufficient to preserve reachable authority and remove itself idempotently.
+        parent.listFiles().orEmpty()
+            .filter { it.name.startsWith(prefix) && it.name.endsWith(".attempt") }
+            .forEach { target ->
+                val id = target.name.removePrefix(prefix).removeSuffix(".attempt")
+                if (id !in liveIds) {
+                    val attempt = ActivationAttempt.read(target, id, group.hash.hex()) ?: return false
+                    cleanupAttempt(parent, group, attempt, target, selectedReachableNames(parent, group) ?: return false)
+                    sync(parent, M3CanonicalActivationSyncStage.RECOVERY)
+                }
+            }
+        true
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun selectedReachableNames(parent: File, group: M3SurfaceGroup): Set<String>? {
+        val selectorTarget = selectorFile(parent, group)
+        if (!selectorTarget.exists()) return emptySet()
+        val selector = ActivationSelector.read(selectorTarget) ?: return null
+        val slotTarget = slotFile(parent, group, selector.slot)
+        val slot = ActivationSlot.read(slotTarget)
+            ?.takeIf { it.revision == selector.revision && it.rootHash == selector.rootHash }
+            ?: return null
+        val rootTarget = rootFile(parent, group, selector.rootHash)
+        val root = ActivationRoot.read(rootTarget, selector.rootHash) ?: return null
+        val names = linkedSetOf(selectorTarget.name, slotTarget.name, rootTarget.name)
+        root.current?.let {
+            val current = currentFile(parent, group, it)
+            if (!verifyCurrent(current, it.identity)) return null
+            names += current.name
+        }
+        return names
+    }
+
+    private fun cleanupAttempt(
+        parent: File,
+        group: M3SurfaceGroup,
+        attempt: ActivationAttempt,
+        attemptTarget: File,
+        reachable: Set<String>,
+    ) {
+        require(attempt.groupHash == group.hash.hex())
+        val created = buildList {
+            if (attempt.rootCreated) add(attempt.rootName)
+            if (attempt.currentCreated) attempt.currentName?.let(::add)
+            add(attempt.slotName)
+        }
+        val prefix = "m3-activation-${group.hash.hex()}"
+        created.filter { it !in reachable }.forEach { name ->
+            require(name.startsWith(prefix) && '/' !in name && '\\' !in name)
+            val target = File(parent, name)
+            require(!target.exists() || target.delete())
+            val part = File(parent, ".$name.part")
+            require(!part.exists() || part.delete())
+        }
+        val selectorPart = File(parent, ".${selectorFile(parent, group).name}.part")
+        require(!selectorPart.exists() || selectorPart.delete())
+        require(!attemptTarget.exists() || attemptTarget.delete())
+        cleanupLegacyCandidates(parent, group)
+    }
 
     private fun reopenLocked(
         group: M3SurfaceGroup,
@@ -477,6 +627,12 @@ internal object M3CanonicalActivationSelector {
         if (partial) throw IllegalStateException("fault")
         Files.move(temporary.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE)
     }
+    private fun writeAttempt(target: File, bytes: ByteArray) {
+        require(!target.exists())
+        val temporary = File(target.parentFile, ".${target.name}.part")
+        FileOutputStream(temporary, false).use { output -> output.write(bytes); output.fd.sync() }
+        Files.move(temporary.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE)
+    }
     private fun atomicReplace(target: File, bytes: ByteArray, partial: Boolean) {
         val temporary = File(target.parentFile, ".${target.name}.part")
         FileOutputStream(temporary, false).use { output -> output.write(if (partial) bytes.copyOf(bytes.size / 2) else bytes); output.fd.sync() }
@@ -487,8 +643,13 @@ internal object M3CanonicalActivationSelector {
         val prefix = "m3-activation-${group.hash.hex()}"
         parent.listFiles().orEmpty().filter { it.name.startsWith(".$prefix") && it.name.endsWith(".part") }.forEach(File::delete)
     }
-    private fun allocatedActivationBytes(parent: File, group: M3SurfaceGroup, budget: M3CanonicalStorageBudget) =
-        parent.listFiles().orEmpty().filter { it.name.startsWith("m3-activation-${group.hash.hex()}") }.sumOf(budget::allocatedBytes)
+    private fun selectedActivationBytes(
+        root: File,
+        current: File?,
+        slot: File,
+        selector: File,
+        budget: M3CanonicalStorageBudget,
+    ) = listOfNotNull(root, current, slot, selector).sumOf(budget::allocatedBytes)
     private fun currentLength(current: M3CanonicalActivationCurrent) = (current as? M3CanonicalActivationCurrent.Receipt)?.identity?.canonicalLength ?: 0L
     private fun currentFile(parent: File, group: M3SurfaceGroup, current: M3CanonicalActivationCurrent): File? =
         (current as? M3CanonicalActivationCurrent.Receipt)?.let { currentFile(parent, group, CurrentRecord(it.identity)) }
@@ -498,7 +659,14 @@ internal object M3CanonicalActivationSelector {
         File(parent, "m3-activation-${group.hash.hex()}-root-${hash.toByteArray().hex()}.root")
     private fun slotFile(parent: File, group: M3SurfaceGroup, slot: Int) = File(parent, "m3-activation-${group.hash.hex()}-$slot.slot")
     private fun selectorFile(parent: File, group: M3SurfaceGroup) = File(parent, "m3-activation-${group.hash.hex()}.selector")
-    private fun inject(fault: M3CanonicalActivationFault?, point: M3CanonicalActivationFault) { if (fault == point) throw IllegalStateException("fault:$point") }
+    private fun attemptFile(parent: File, group: M3SurfaceGroup, id: M3CanonicalReceiptBytes) =
+        File(parent, "m3-activation-${group.hash.hex()}-attempt-${id.toByteArray().hex()}.attempt")
+    private fun inject(fault: M3CanonicalActivationFault?, point: M3CanonicalActivationFault) {
+        if (fault == point) {
+            if (point.isProcessCrash()) throw M3CanonicalActivationProcessCrash(point)
+            throw IllegalStateException("fault:$point")
+        }
+    }
     private fun sync(parent: File, stage: M3CanonicalActivationSyncStage) {
         val physical = !System.getProperty("os.name").orEmpty().startsWith("Windows", true)
         if (physical) FileChannel.open(parent.toPath(), StandardOpenOption.READ).use { it.force(true) }
@@ -506,12 +674,13 @@ internal object M3CanonicalActivationSelector {
     }
     private fun round(bytes: Long, unit: Long) = if (bytes == 0L) 0L else Math.multiplyExact((bytes - 1L) / unit + 1L, unit)
     private fun digest(bytes: ByteArray) = M3CanonicalReceiptBytes(MessageDigest.getInstance("SHA-256").digest(bytes))
+    private fun hex(value: String) = value.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
     private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
     private val locks = mutableMapOf<String, Any>()
     private val legacyLeases = mutableMapOf<String, Int>()
 }
 
-internal enum class M3CanonicalActivationSyncStage { PREREQUISITES, SELECTOR }
+internal enum class M3CanonicalActivationSyncStage { ATTEMPT, PREREQUISITES, SELECTOR, RECOVERY }
 internal object M3CanonicalActivationTestHooks {
     /** Test-only observation after the requested physical sync has completed. */
     @Volatile var onDirectorySync: ((M3CanonicalActivationSyncStage, Boolean) -> Unit)? = null
@@ -534,10 +703,55 @@ internal sealed interface M3CanonicalActivationResult {
 internal enum class M3CanonicalActivationSelectorRefusal { INVALID_PLAN, LEGACY_OWNER_ACTIVE, QUOTA_REFUSED, CURRENT_PENDING, CHANGED_CURRENT, CORRUPT_SELECTOR, FORKED_SELECTOR, CORRUPT_V6, CORRUPT_CURRENT, DURABILITY_FAILURE }
 internal enum class M3CanonicalActivationFault {
     BEFORE_RESERVATION, AFTER_RESERVATION, BEFORE_CURRENT_WRITE, DURING_CURRENT_WRITE, AFTER_CURRENT_SYNC,
+    AFTER_ATTEMPT_SYNC,
     BEFORE_ROOT_WRITE, DURING_ROOT_WRITE, AFTER_ROOT_SYNC, BEFORE_SLOT_WRITE, DURING_SLOT_WRITE, AFTER_SLOT_SYNC,
     BEFORE_PREREQUISITE_PARENT_SYNC, AFTER_PREREQUISITE_PARENT_SYNC,
+    PROCESS_CRASH_AFTER_PREREQUISITE_SYNC,
     BEFORE_SELECTOR_SWITCH, DURING_SELECTOR_WRITE, AFTER_SELECTOR_SWITCH, BEFORE_PARENT_SYNC, AFTER_PARENT_SYNC,
     BEFORE_BUDGET_COMMIT, AFTER_BUDGET_COMMIT, BEFORE_CLEANUP, AFTER_CLEANUP,
+}
+
+internal class M3CanonicalActivationProcessCrash(val point: M3CanonicalActivationFault) : Error(point.name)
+private fun M3CanonicalActivationFault?.isProcessCrash() =
+    this == M3CanonicalActivationFault.PROCESS_CRASH_AFTER_PREREQUISITE_SYNC
+
+private data class ActivationAttempt(
+    val groupHash: String,
+    val rootName: String,
+    val currentName: String?,
+    val slotName: String,
+    val rootPreexisted: Boolean,
+    val currentPreexisted: Boolean,
+) {
+    val rootCreated get() = !rootPreexisted
+    val currentCreated get() = currentName != null && !currentPreexisted
+
+    fun bytes(): ByteArray = ByteArrayOutputStream().use { raw ->
+        DataOutputStream(raw).use { output ->
+            output.writeInt(MAGIC); output.writeInt(1)
+            output.writeUTF(groupHash); output.writeUTF(rootName)
+            output.writeBoolean(currentName != null); currentName?.let(output::writeUTF)
+            output.writeUTF(slotName); output.writeBoolean(rootPreexisted); output.writeBoolean(currentPreexisted)
+        }
+        raw.toByteArray()
+    }
+
+    companion object {
+        private const val MAGIC = 0x4d334141
+        fun read(file: File, expectedId: String, expectedGroupHash: String): ActivationAttempt? = try {
+            val bytes = file.readBytes()
+            val actualId = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+            require(actualId == expectedId)
+            DataInputStream(ByteArrayInputStream(bytes)).use { input ->
+                require(input.readInt() == MAGIC && input.readInt() == 1)
+                val groupHash = input.readUTF(); val root = input.readUTF()
+                val current = if (input.readBoolean()) input.readUTF() else null
+                val slot = input.readUTF(); val rootBefore = input.readBoolean(); val currentBefore = input.readBoolean()
+                require(input.available() == 0 && groupHash == expectedGroupHash)
+                ActivationAttempt(groupHash, root, current, slot, rootBefore, currentBefore)
+            }
+        } catch (_: Exception) { null }
+    }
 }
 
 private data class CurrentRecord(val identity: M3CanonicalCurrentIdentity)

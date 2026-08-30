@@ -272,6 +272,25 @@ internal interface M3CanonicalStorageBudget {
     fun releasePointerPublication(reservation: M3CanonicalPointerReservation) =
         release(reservation.token)
 
+    /** Durable reservation namespace for a recoverable one-time activation attempt. */
+    fun reserveActivationAttempt(
+        groupId: String,
+        attemptId: String,
+        rootBeforeBytes: Long,
+        slotBeforeBytes: Long,
+        selectorBeforeBytes: Long,
+        commitBytes: Long,
+        maximumPhysicalBytes: Long,
+    ): Any? = reserve(maximumPhysicalBytes)
+
+    fun activationAttempts(groupId: String): List<M3CanonicalPointerReservation> = emptyList()
+
+    fun commitActivationAttempt(reservation: M3CanonicalPointerReservation) =
+        commit(reservation.token, reservation.commitBytes)
+
+    fun releaseActivationAttempt(reservation: M3CanonicalPointerReservation) =
+        release(reservation.token)
+
     fun reserveCandidate(
         staging: File,
         target: File,
@@ -391,6 +410,40 @@ internal class M3CoordinatorStorageBudget(private val coordinator: StorageBudget
         coordinator.commitPointerPublication(reservation.token as StorageBudgetReservationV2)
 
     override fun releasePointerPublication(reservation: M3CanonicalPointerReservation) {
+        coordinator.release(reservation.token as StorageBudgetReservationV2)
+    }
+
+    override fun reserveActivationAttempt(
+        groupId: String,
+        attemptId: String,
+        rootBeforeBytes: Long,
+        slotBeforeBytes: Long,
+        selectorBeforeBytes: Long,
+        commitBytes: Long,
+        maximumPhysicalBytes: Long,
+    ): Any? = coordinator.reservePointerPublication(
+        "m3:canonical:activation:$groupId", attemptId, 0, rootBeforeBytes, slotBeforeBytes,
+        selectorBeforeBytes, commitBytes, maximumPhysicalBytes,
+    )
+
+    override fun activationAttempts(groupId: String) = coordinator.pointerPublications()
+        .filter { it.owner == "m3:canonical:activation:$groupId" }
+        .map { reservation ->
+            M3CanonicalPointerReservation(
+                reservation,
+                requireNotNull(reservation.pointerPublicationId),
+                requireNotNull(reservation.pointerSlot),
+                requireNotNull(reservation.pointerRootBeforeBytes),
+                requireNotNull(reservation.pointerSlotBeforeBytes),
+                requireNotNull(reservation.pointerSelectorBeforeBytes),
+                requireNotNull(reservation.pointerCommitBytes),
+            )
+        }
+
+    override fun commitActivationAttempt(reservation: M3CanonicalPointerReservation) =
+        coordinator.commitPointerPublication(reservation.token as StorageBudgetReservationV2)
+
+    override fun releaseActivationAttempt(reservation: M3CanonicalPointerReservation) {
         coordinator.release(reservation.token as StorageBudgetReservationV2)
     }
 
