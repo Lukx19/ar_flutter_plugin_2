@@ -25,8 +25,9 @@ import java.security.MessageDigest
 internal class M3SurfaceOwnership private constructor(
     private val group: M3SurfaceGroup,
     private val configuration: M3SurfaceOwnershipConfiguration,
-    private val store: M3SurfaceOwnershipStore,
+    private val store: M3SurfaceOwnershipStore?,
     restored: M3RestoredOwnership,
+    private val activation: M3CanonicalActivationState? = null,
 ) {
     private val rowsById = restored.rows.associateByTo(linkedMapOf()) { it.id.value }
     private val idByVoxel = restored.rows.associateTo(linkedMapOf()) { it.voxel to it.id.value }
@@ -44,6 +45,10 @@ internal class M3SurfaceOwnership private constructor(
     @Synchronized
     fun apply(command: M3SurfaceOwnershipCommand): M3SurfaceOwnershipResult {
         if (closed) return M3SurfaceOwnershipResult.Refused(M3SurfaceOwnershipRefusal.CLOSED, snapshot())
+        // #125 makes v6 the sole owner after the switch.  #126 owns the next mutation, so this
+        // legacy mutation entry point cannot manufacture a second authority in the interim.
+        if (activation != null) return M3SurfaceOwnershipResult.Refused(M3SurfaceOwnershipRefusal.DURABILITY_FAILURE, snapshot())
+        val store = requireNotNull(store)
         val commandHash = sha256(command.commandId.encodeToByteArray())
         val fingerprint = command.fingerprint()
         receipts[commandHash.hex()]?.let { receipt ->
@@ -117,6 +122,8 @@ internal class M3SurfaceOwnership private constructor(
     @Synchronized
     fun transact(command: M3CanonicalTransactionCommand): M3CanonicalTransactionResult {
         if (closed) return canonicalRefusal(M3CanonicalTransactionRefusal.CLOSED)
+        if (activation != null) return canonicalRefusal(M3CanonicalTransactionRefusal.DURABILITY_FAILURE)
+        val store = requireNotNull(store)
         val commandHash = sha256(command.commandId.encodeToByteArray())
         val fingerprint = command.fingerprint()
         transactionReceipts[commandHash.hex()]?.let { stored ->
@@ -223,15 +230,19 @@ internal class M3SurfaceOwnership private constructor(
     @Synchronized
     internal fun currentCanonicalTransaction(): M3CanonicalTransactionResult.Accepted? {
         if (closed) return null
+        if (activation != null) return null
         return transactionReceipts.values.lastOrNull()?.result
     }
+
+    /** Bounded activation state; its receipt source streams from the selected immutable file. */
+    internal fun activationState(): M3CanonicalActivationState? = if (closed) null else activation
 
     /** Idempotently closes the owner; later calls are deterministic refusals. */
     @Synchronized
     fun close(): M3SurfaceOwnershipCloseResult {
         if (closed) return M3SurfaceOwnershipCloseResult.AlreadyClosed
         closed = true
-        store.close()
+        store?.close()
         return M3SurfaceOwnershipCloseResult.Closed
     }
 
@@ -445,10 +456,79 @@ internal class M3SurfaceOwnership private constructor(
             configuration: M3SurfaceOwnershipConfiguration = M3SurfaceOwnershipConfiguration(),
             fault: M3SurfaceOwnershipFault? = null,
         ): M3SurfaceOwnershipOpenResult = try {
+            // This overload has no v6 storage budget.  Once the durable selector exists it may
+            // not reinterpret legacy history; the budget-aware overload below is the only route.
+            if (M3CanonicalActivationSelector.hasDurableSelector(group, directory)) {
+                return M3SurfaceOwnershipOpenResult.Refused(M3SurfaceOwnershipRestoreRefusal.CORRUPT)
+            }
             open(group, configuration, M3FileSurfaceOwnershipStore(directory, group, fault))
         } catch (failure: M3RestoreFailure) {
             M3SurfaceOwnershipOpenResult.Refused(failure.reason)
         }
+
+        /**
+         * Opens group-local v6 authority when the durable activation selector exists.  Its active
+         * branch reads no legacy receipts and never reruns sibling migration; absence leaves the
+         * established legacy opening path unchanged.
+         */
+        fun open(
+            group: M3SurfaceGroup,
+            directory: File,
+            budget: M3CanonicalStorageBudget,
+            configuration: M3SurfaceOwnershipConfiguration = M3SurfaceOwnershipConfiguration(),
+        ): M3SurfaceOwnershipOpenResult {
+            if (!configuration.isValid) return M3SurfaceOwnershipOpenResult.Refused(M3SurfaceOwnershipRestoreRefusal.INVALID_CONFIGURATION)
+            return when (val activation = M3CanonicalActivationSelector.reopen(group, directory, budget)) {
+                M3CanonicalActivationResult.Legacy -> open(group, directory, configuration)
+                is M3CanonicalActivationResult.Active -> openedV6(group, configuration, activation.state)
+                M3CanonicalActivationResult.UnknownAfterSwitch -> M3SurfaceOwnershipOpenResult.Refused(M3SurfaceOwnershipRestoreRefusal.DURABILITY_FAILURE)
+                is M3CanonicalActivationResult.Refused -> M3SurfaceOwnershipOpenResult.Refused(
+                    if (activation.reason == M3CanonicalActivationSelectorRefusal.FORKED_SELECTOR)
+                        M3SurfaceOwnershipRestoreRefusal.FORK else M3SurfaceOwnershipRestoreRefusal.CORRUPT,
+                )
+            }
+        }
+
+        /**
+         * The terminal owner entry point: an existing selector opens v6, while an absent selector
+         * consumes exactly the immutable #124 plan and publishes the switch before exposing it.
+         */
+        fun open(
+            group: M3SurfaceGroup,
+            directory: File,
+            budget: M3CanonicalStorageBudget,
+            plan: M3CanonicalActivationPlan,
+            configuration: M3SurfaceOwnershipConfiguration = M3SurfaceOwnershipConfiguration(),
+            fault: M3CanonicalActivationFault? = null,
+        ): M3SurfaceOwnershipOpenResult {
+            if (!configuration.isValid) return M3SurfaceOwnershipOpenResult.Refused(M3SurfaceOwnershipRestoreRefusal.INVALID_CONFIGURATION)
+            return when (val activation = M3CanonicalActivationSelector.activate(group, directory, budget, plan, fault)) {
+                is M3CanonicalActivationResult.Active -> openedV6(group, configuration, activation.state)
+                M3CanonicalActivationResult.Legacy,
+                M3CanonicalActivationResult.UnknownAfterSwitch -> M3SurfaceOwnershipOpenResult.Refused(M3SurfaceOwnershipRestoreRefusal.DURABILITY_FAILURE)
+                is M3CanonicalActivationResult.Refused -> M3SurfaceOwnershipOpenResult.Refused(
+                    if (activation.reason == M3CanonicalActivationSelectorRefusal.FORKED_SELECTOR)
+                        M3SurfaceOwnershipRestoreRefusal.FORK else M3SurfaceOwnershipRestoreRefusal.CORRUPT,
+                )
+            }
+        }
+
+        /** Consumes only the exact immutable #124 plan; it never scans legacy evidence itself. */
+        fun activateV6(
+            group: M3SurfaceGroup,
+            directory: File,
+            budget: M3CanonicalStorageBudget,
+            plan: M3CanonicalActivationPlan,
+            fault: M3CanonicalActivationFault? = null,
+        ): M3CanonicalActivationResult = M3CanonicalActivationSelector.activate(group, directory, budget, plan, fault)
+
+        private fun openedV6(
+            group: M3SurfaceGroup,
+            configuration: M3SurfaceOwnershipConfiguration,
+            activation: M3CanonicalActivationState,
+        ) = M3SurfaceOwnershipOpenResult.Opened(
+            M3SurfaceOwnership(group, configuration, null, activeRestored(activation.cut), activation),
+        )
 
         fun inMemory(
             group: M3SurfaceGroup,
@@ -498,6 +578,11 @@ internal class M3SurfaceOwnership private constructor(
                 M3SurfaceOwnershipOpenResult.Refused(failure.reason)
             }
         }
+
+        private fun activeRestored(cut: M3CompactCanonicalCut) = M3RestoredOwnership(
+            cut.nextSurfaceIdHighWater, emptyList(), emptyList(), emptyMap(), emptyList(), emptyList(),
+            emptyList(), cut.geometryRevision, cut.lineageRevision, cut.seededEmptyBaseline,
+        )
     }
 }
 
