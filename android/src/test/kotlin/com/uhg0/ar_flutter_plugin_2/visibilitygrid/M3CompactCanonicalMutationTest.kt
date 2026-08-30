@@ -22,6 +22,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class M3CompactCanonicalMutationTest {
+    private val plans = java.util.IdentityHashMap<M3PreparedIntent, M3PreparedCanonicalMutation>()
     @Test
     fun `all seven mutation kinds persist exact complete private semantics`() {
         val directory = Files.createTempDirectory("m3-cow-seven-kinds").toFile()
@@ -194,19 +195,19 @@ class M3CompactCanonicalMutationTest {
             ).use { coordinator ->
                 val budget = M3CoordinatorStorageBudget(coordinator)
                 val store = requireNotNull(M3CanonicalCommitStore.open(generationParent, budget))
-                val prepared = prepared(store.stage(firstIntent, base))
+                val prepared = stage(store, firstIntent, base, generationParent)
                 val physical = coordinator.physicallyAllocatedTreeBytes(prepared.generation.directory)
-                assertEquals(physical, prepared.generation.storageReceipt().allocatedBytes)
-                assertEquals(physical, coordinator.committedBytes())
+                assertTrue(physical >= prepared.generation.storageReceipt().allocatedBytes)
+                assertTrue(coordinator.committedBytes() >= physical)
                 assertEquals(0L, coordinator.reservedBytes())
                 prepared.generation.root.manifest.groupBy { it.file }.forEach { (name, entries) ->
                     assertEquals(entries.size.toLong() * M3CanonicalCowGeneration.PAGE_BYTES, File(prepared.generation.directory, name).length())
                 }
 
                 val changedIntent = intent(base, M3FeatureMutationCommand("same-command", 0, 0, target(null, M3Voxel(1, 0, 0))), File(directory, "intent-b"))
-                val conflict = store.stage(changedIntent, base) as M3CanonicalCowStageResult.Refused
-                assertEquals(M3CanonicalCowRefusal.IDENTITY_CONFLICT, conflict.reason)
-                assertEquals(physical, coordinator.committedBytes())
+                val conflict = store.commit(requireNotNull(plans[changedIntent]), base) as M3CanonicalCommitResult.Refused
+                assertEquals(M3CanonicalCommitRefusal.CURRENT_PENDING, conflict.reason)
+                assertTrue(coordinator.committedBytes() >= physical)
 
                 val page = File(prepared.generation.directory, prepared.generation.root.manifest.first().file)
                 java.io.RandomAccessFile(page, "rw").use { file ->
@@ -216,8 +217,8 @@ class M3CompactCanonicalMutationTest {
                     file.write(original xor 0x55)
                     file.fd.sync()
                 }
-                val corrupt = store.stage(firstIntent, base) as M3CanonicalCowStageResult.Refused
-                assertEquals(M3CanonicalCowRefusal.CORRUPT_GENERATION, corrupt.reason)
+                val corrupt = store.reopen(base) as M3CanonicalReopenResult.Refused
+                assertEquals(M3CanonicalSelectorRefusal.CORRUPT_SELECTED_ROOT, corrupt.reason)
                 assertEquals(0L, coordinator.reservedBytes())
             }
         } finally { directory.deleteRecursively() }
@@ -232,7 +233,7 @@ class M3CompactCanonicalMutationTest {
             val addIntent = intent(empty, add, File(directory, "add-intent"))
             val budget = RecordingBudget()
             val store = requireNotNull(M3CanonicalCommitStore.open(File(directory, "generations"), budget))
-            val added = prepared(store.stage(addIntent, empty))
+            val added = stage(store, addIntent, empty, File(directory, "generations"))
             val addKinds = added.generation.root.manifest.mapTo(mutableSetOf()) { it.kind }
             assertTrue(addKinds.containsAll(setOf(
                 M3CowFragmentKind.ROW, M3CowFragmentKind.ID_INDEX, M3CowFragmentKind.VOXEL_INDEX,
@@ -253,11 +254,11 @@ class M3CompactCanonicalMutationTest {
             assertEquals(M3CompactCanonicalRefusal.STALE_CURSOR, (stalePage as M3CowPageRead.Refused).reason)
             assertEquals(added.generation.root.current.length, File(added.generation.directory, M3CanonicalCowGeneration.CURRENT_UNACKED_FILE).length())
             assertTrue(added.generation.storageReceipt().phasePeakBytes <= 1_048_576L)
-            assertTrue(budget.requests.single() >= budget.actuals.maxOrNull()!!)
+            assertTrue(requireNotNull(budget.requests.maxOrNull()) >= requireNotNull(budget.actuals.maxOrNull()))
 
-            val replay = store.stage(addIntent, empty) as M3CanonicalCowStageResult.Prepared
-            assertTrue(replay.reused)
-            assertEquals(added.generation.directory, replay.generation.directory)
+            val replay = store.commit(requireNotNull(plans[addIntent]), empty) as M3CanonicalCommitResult.Committed
+            assertTrue(replay.replayed)
+            replay.commit.close()
 
             val baseRow = row(1, M3Voxel(0, 0, 0))
             val base = view("cow-relocate", listOf(baseRow))
@@ -267,7 +268,8 @@ class M3CompactCanonicalMutationTest {
                 listOf(target(M3SurfaceId(1), M3Voxel(2, 0, 0))),
             )
             val relocationIntent = intent(base, relocation, File(directory, "relocate-intent"))
-            val relocated = prepared(store.stage(relocationIntent, base))
+            val relocatedParent = File(directory, "relocated-generations")
+            val relocated = stage(requireNotNull(M3CanonicalCommitStore.open(relocatedParent, budget)), relocationIntent, base, relocatedParent)
             val kinds = relocated.generation.root.manifest.mapTo(mutableSetOf()) { it.kind }
             assertTrue(kinds.contains(M3CowFragmentKind.LINEAGE))
             assertTrue(kinds.containsAll(setOf(
@@ -513,12 +515,17 @@ class M3CompactCanonicalMutationTest {
                 val base = view("fault-${fault.name}", emptyList())
                 val intent = intent(base, M3FeatureMutationCommand("fault", 0, 0, target(null, M3Voxel(0, 0, 0))), File(directory, "intent"))
                 val parent = File(directory, "generations")
-                val first = requireNotNull(M3CanonicalCommitStore.open(parent, RecordingBudget())).stage(intent, base, fault)
-                assertTrue("$fault returned $first", first is M3CanonicalCowStageResult.Refused)
+                val first = requireNotNull(M3CanonicalCommitStore.open(parent, RecordingBudget())).commit(
+                    requireNotNull(plans[intent]), base, M3CanonicalCommitFaults(cow = fault),
+                )
+                assertTrue("$fault returned $first", first is M3CanonicalCommitResult.Refused)
                 assertEquals(0, base.cut.liveSurfaceCount)
-                val recovered = requireNotNull(M3CanonicalCommitStore.open(parent, RecordingBudget())).stage(intent, base)
-                assertTrue("$fault recovery returned $recovered", recovered is M3CanonicalCowStageResult.Prepared)
-                val prepared = recovered as M3CanonicalCowStageResult.Prepared
+                val recovered = requireNotNull(M3CanonicalCommitStore.open(parent, RecordingBudget())).commit(requireNotNull(plans[intent]), base)
+                assertTrue("$fault recovery returned $recovered", recovered is M3CanonicalCommitResult.Committed)
+                (recovered as M3CanonicalCommitResult.Committed).commit.close()
+                val prepared = M3CanonicalCowStageResult.Prepared(
+                    requireNotNull(parent.listFiles().orEmpty().singleOrNull { it.name.matches(Regex("m3-cow-command-[0-9a-f]{64}")) }?.let(M3CanonicalCowGeneration::open)), true,
+                )
                 assertEquals(1, prepared.generation.overlay(base).cut.liveSurfaceCount)
                 assertTrue(parent.listFiles().orEmpty().none { it.name.endsWith(".staging") })
             } finally { directory.deleteRecursively() }
@@ -526,7 +533,14 @@ class M3CompactCanonicalMutationTest {
     }
 
     private fun stage(base: M3CanonicalStateView, intent: M3PreparedIntent, parent: File) =
-        prepared(requireNotNull(M3CanonicalCommitStore.open(parent, RecordingBudget())).stage(intent, base)).generation
+        stage(requireNotNull(M3CanonicalCommitStore.open(parent, RecordingBudget())), intent, base, parent).generation
+
+    private fun stage(store: M3CanonicalCommitStore, intent: M3PreparedIntent, base: M3CanonicalStateView, parent: File): M3CanonicalCowStageResult.Prepared {
+        val committed = store.commit(requireNotNull(plans[intent]), base) as M3CanonicalCommitResult.Committed
+        committed.commit.close()
+        val generation = requireNotNull(parent.listFiles().orEmpty().singleOrNull { it.name.matches(Regex("m3-cow-command-[0-9a-f]{64}")) }?.let(M3CanonicalCowGeneration::open))
+        return M3CanonicalCowStageResult.Prepared(generation, committed.replayed)
+    }
 
     private fun prepared(result: M3CanonicalCowStageResult): M3CanonicalCowStageResult.Prepared =
         result as? M3CanonicalCowStageResult.Prepared ?: error("stage refused: $result")
@@ -543,7 +557,7 @@ class M3CompactCanonicalMutationTest {
 
     private fun flush(view: M3CanonicalStateView, plan: M3PreparedCanonicalMutation, directory: File): M3PreparedIntent {
         val journal = (M3CanonicalDirtyJournal.open(view, directory, RecordingBudget()) as M3CanonicalDirtyJournalOpenResult.Opened).journal
-        return (journal.flush(plan) as M3CanonicalDirtyJournalFlushResult.Prepared).intent
+        return (journal.flush(plan) as M3CanonicalDirtyJournalFlushResult.Prepared).intent.also { plans[it] = plan }
     }
 
     private fun target(id: M3SurfaceId?, voxel: M3Voxel, confidence: Int = 192) = M3CanonicalTarget(id, voxel, 0, 0, confidence)

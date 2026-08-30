@@ -4,6 +4,7 @@ import java.io.DataOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.OutputStream
 import java.security.MessageDigest
 
 /** The only production seam from a prepared mutation to current private authority. */
@@ -150,11 +151,16 @@ private class M3CanonicalMutableStore(
                 is M3CanonicalReopenResult.GenerationZero -> generationZero
                 is M3CanonicalReopenResult.Selected -> {
                     selected = reopened.commit
-                    when (plan.sourceCut) {
-                        generationZero.cut -> generationZero
-                        reopened.commit.view.cut -> reopened.commit.view
-                        else -> return M3CanonicalCommitResult.Refused(M3CanonicalCommitRefusal.STALE_BASE)
+                    val newest = reopened.commit.roots.lastOrNull()
+                        ?: return M3CanonicalCommitResult.Refused(M3CanonicalCommitRefusal.SELECTOR_REFUSED)
+                    val current = try { currentReceipt(plan) } catch (_: Exception) {
+                        return M3CanonicalCommitResult.Refused(M3CanonicalCommitRefusal.INVALID_INTENT)
                     }
+                    if (newest.matches(plan, current)) {
+                        selected = null
+                        return M3CanonicalCommitResult.Committed(reopened.commit, replayed = true)
+                    }
+                    return M3CanonicalCommitResult.Refused(M3CanonicalCommitRefusal.CURRENT_PENDING)
                 }
                 is M3CanonicalReopenResult.Refused -> return M3CanonicalCommitResult.Refused(
                     M3CanonicalCommitRefusal.SELECTOR_REFUSED, selectorReason = reopened.reason,
@@ -261,6 +267,20 @@ private class M3CanonicalMutableStore(
             }
             require(M3CanonicalReceiptBytes(digest.digest()) == expected.hash)
         }
+
+        private fun currentReceipt(plan: M3PreparedCanonicalMutation): M3PreparedIntentCurrentReceipt {
+            val digest = MessageDigest.getInstance("SHA-256")
+            var length = 0L
+            plan.writeCurrentTo(object : OutputStream() {
+                override fun write(value: Int) {
+                    digest.update(value.toByte()); length = Math.addExact(length, 1L)
+                }
+                override fun write(bytes: ByteArray, offset: Int, count: Int) {
+                    digest.update(bytes, offset, count); length = Math.addExact(length, count.toLong())
+                }
+            })
+            return M3PreparedIntentCurrentReceipt(length, M3CanonicalReceiptBytes(digest.digest()))
+        }
     }
 }
 
@@ -282,8 +302,12 @@ internal sealed interface M3CanonicalCommitResult {
 }
 
 internal enum class M3CanonicalCommitRefusal {
-    CLOSED, STALE_BASE, INVALID_INTENT, IDENTITY_CONFLICT, JOURNAL_REFUSED, COW_REFUSED, SELECTOR_REFUSED,
+    CLOSED, STALE_BASE, CURRENT_PENDING, INVALID_INTENT, IDENTITY_CONFLICT, JOURNAL_REFUSED, COW_REFUSED, SELECTOR_REFUSED,
 }
+
+private fun PublishedRoot.matches(plan: M3PreparedCanonicalMutation, current: M3PreparedIntentCurrentReceipt) =
+    isCommand(plan.commandId) && commandKind == plan.kind && commandHash == plan.commandHash &&
+        commandFingerprint == plan.commandFingerprint && baseRootHash == plan.sourceCut.rootHash && this.current == current
 
 private fun M3PreparedIntentIdentity.matches(plan: M3PreparedCanonicalMutation) =
     sourceCut == plan.sourceCut && commandHash == plan.commandHash && commandFingerprint == plan.commandFingerprint &&

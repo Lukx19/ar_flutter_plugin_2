@@ -12,6 +12,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class M3CanonicalCowDurabilityTest {
+    private val plans = java.util.IdentityHashMap<M3PreparedIntent, M3PreparedCanonicalMutation>()
     @Test
     fun `every durable cut reconciles through a new real coordinator and process store`() {
         M3CanonicalCowFault.entries.forEach { fault ->
@@ -27,18 +28,20 @@ class M3CanonicalCowDurabilityTest {
                         override fun release(token: Any) = Unit
                     }
                     val firstStore = requireNotNull(M3CanonicalCommitStore.open(parent, processDeath))
-                    val first = firstStore.stage(preparedIntent, base, fault)
-                    assertTrue("$fault returned $first", first is M3CanonicalCowStageResult.Refused)
+                    val first = firstStore.commit(requireNotNull(plans[preparedIntent]), base, M3CanonicalCommitFaults(cow = fault))
+                    assertTrue("$fault returned $first", first is M3CanonicalCommitResult.Refused)
                     firstStore.close()
                 }
 
                 coordinator(parent).use { reopenedCoordinator ->
                     val reopenedStore = requireNotNull(M3CanonicalCommitStore.open(parent, M3CoordinatorStorageBudget(reopenedCoordinator)))
-                    val recovered = reopenedStore.stage(preparedIntent, base)
-                    assertTrue("$fault recovery returned $recovered", recovered is M3CanonicalCowStageResult.Prepared)
-                    val generation = (recovered as M3CanonicalCowStageResult.Prepared).generation
+                    val recovered = reopenedStore.commit(requireNotNull(plans[preparedIntent]), base)
+                    assertTrue("$fault recovery returned $recovered", recovered is M3CanonicalCommitResult.Committed)
+                    (recovered as M3CanonicalCommitResult.Committed).commit.close()
+                    val generation = requireNotNull(parent.listFiles().orEmpty().singleOrNull { it.name.matches(Regex("m3-cow-command-[0-9a-f]{64}")) }?.let(M3CanonicalCowGeneration::open))
                     val physical = reopenedCoordinator.physicallyAllocatedTreeBytes(generation.directory)
-                    assertEquals("$fault physical commit", physical, reopenedCoordinator.committedBytes())
+                    assertTrue("$fault generation is charged", reopenedCoordinator.committedBytes() >= physical)
+                    assertEquals("$fault full authority", authorityPhysicalBytes(parent, reopenedCoordinator), reopenedCoordinator.committedBytes())
                     assertEquals("$fault outstanding reservation", 0L, reopenedCoordinator.reservedBytes())
                     assertTrue("$fault exact reopen", M3CanonicalCowGeneration.open(generation.directory) != null)
                     reopenedStore.close()
@@ -71,11 +74,13 @@ class M3CanonicalCowDurabilityTest {
             val unrelatedIntent = intent(unrelatedBase, "different-command", File(directory, "unrelated-intent"))
             coordinator(parent).use { reopened ->
                 val store = requireNotNull(M3CanonicalCommitStore.open(parent, M3CoordinatorStorageBudget(reopened)))
-                val result = store.stage(unrelatedIntent, unrelatedBase)
-                assertTrue(result.toString(), result is M3CanonicalCowStageResult.Prepared)
+                val result = store.commit(requireNotNull(plans[unrelatedIntent]), unrelatedBase)
+                assertTrue(result.toString(), result is M3CanonicalCommitResult.Committed)
+                (result as M3CanonicalCommitResult.Committed).commit.close()
                 assertFalse("uncharged COW orphan survived unrelated startup", staging.exists())
-                val generation = (result as M3CanonicalCowStageResult.Prepared).generation
-                assertEquals(reopened.physicallyAllocatedTreeBytes(generation.directory), reopened.committedBytes())
+                val generation = requireNotNull(parent.listFiles().orEmpty().singleOrNull { it.name.matches(Regex("m3-cow-command-[0-9a-f]{64}")) }?.let(M3CanonicalCowGeneration::open))
+                assertTrue(reopened.committedBytes() >= reopened.physicallyAllocatedTreeBytes(generation.directory))
+                assertEquals(authorityPhysicalBytes(parent, reopened), reopened.committedBytes())
                 assertEquals(0L, reopened.reservedBytes())
             }
         } finally { directory.deleteRecursively() }
@@ -88,6 +93,16 @@ class M3CanonicalCowDurabilityTest {
         freeBytes = { 128L * 1024 * 1024 },
     )
 
+    private fun authorityPhysicalBytes(parent: File, coordinator: StorageBudgetCoordinatorV2): Long =
+        parent.listFiles().orEmpty().filter { file ->
+            file.isDirectory && (file.name.matches(Regex("m3-cow-command-[0-9a-f]{64}")) ||
+                file.name.matches(Regex("m3-canonical-v6-[0-9a-f]{64}\\.(?:allocation-[0-9]+|intent)"))) ||
+                file.isFile && (file.name.matches(Regex("m3-selector-root-[0-9a-f]{64}\\.root")) ||
+                    file.name in setOf("m3-root-selector", "m3-root-A.slot", "m3-root-B.slot"))
+        }.sumOf { file -> if (file.isDirectory) coordinator.physicallyAllocatedTreeBytes(file) else round(file.length(), 4_096L) }
+
+    private fun round(bytes: Long, unit: Long) = if (bytes == 0L) 0L else ((bytes - 1L) / unit + 1L) * unit
+
     private fun intent(base: M3CanonicalStateView, commandId: String, directory: File): M3PreparedIntent {
         val command = M3FeatureMutationCommand(commandId, 0, 0, M3CanonicalTarget(null, M3Voxel(0, 0, 0), 0, 0, 192))
         val plan = (M3SurfaceOwnership.prepareMutation(
@@ -96,7 +111,7 @@ class M3CanonicalCowDurabilityTest {
         val journal = (M3CanonicalDirtyJournal.open(
             base, directory, UnlimitedBudget,
         ) as M3CanonicalDirtyJournalOpenResult.Opened).journal
-        return (journal.flush(plan) as M3CanonicalDirtyJournalFlushResult.Prepared).intent
+        return (journal.flush(plan) as M3CanonicalDirtyJournalFlushResult.Prepared).intent.also { plans[it] = plan }
     }
 
     private object UnlimitedBudget : M3CanonicalStorageBudget {
