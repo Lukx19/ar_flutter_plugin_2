@@ -10,6 +10,30 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class StorageBudgetCoordinatorV2Test {
+    @Test fun `deterministic candidate target admits one durable winner across coordinators`() {
+        val root = directory(); val policy = StorageBudgetPolicyV2(1_000_000, 0)
+        val first = StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 10_000_000 }
+        val second = StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 10_000_000 }
+        val target = File(root, "deterministic-target")
+        val winner = first.reserveCandidateExclusive(
+            "winner", File(root, "winner-staging"), target, mapOf("payload" to 1L), 16_384L,
+        ) as StorageBudgetCandidateReservationV2.Reserved
+        assertTrue(second.reserveCandidateExclusive(
+            "loser", File(root, "loser-staging"), target, mapOf("payload" to 1L), 16_384L,
+        ) is StorageBudgetCandidateReservationV2.TargetReserved)
+        second.close()
+
+        StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 10_000_000 }.use { reopened ->
+            assertTrue(reopened.reserveCandidateExclusive(
+                "reopened-loser", File(root, "reopened-loser-staging"), target,
+                mapOf("payload" to 1L), 16_384L,
+            ) is StorageBudgetCandidateReservationV2.TargetReserved)
+        }
+        assertTrue(first.releaseCandidate(winner.reservation, File(root, "winner-staging")))
+        assertEquals(0L, first.reservedBytes())
+        first.close()
+    }
+
     private val directories = mutableListOf<File>()
     @After fun cleanUp() { directories.forEach { it.deleteRecursively() } }
 

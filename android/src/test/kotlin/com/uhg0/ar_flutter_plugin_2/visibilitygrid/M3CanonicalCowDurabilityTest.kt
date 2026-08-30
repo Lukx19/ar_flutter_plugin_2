@@ -26,14 +26,14 @@ class M3CanonicalCowDurabilityTest {
                         override fun releaseCandidate(token: Any, staging: File) = Unit
                         override fun release(token: Any) = Unit
                     }
-                    val firstStore = requireNotNull(M3CanonicalMutableStore.open(parent, processDeath))
+                    val firstStore = requireNotNull(M3CanonicalCommitStore.open(parent, processDeath))
                     val first = firstStore.stage(preparedIntent, base, fault)
                     assertTrue("$fault returned $first", first is M3CanonicalCowStageResult.Refused)
                     firstStore.close()
                 }
 
                 coordinator(parent).use { reopenedCoordinator ->
-                    val reopenedStore = requireNotNull(M3CanonicalMutableStore.open(parent, M3CoordinatorStorageBudget(reopenedCoordinator)))
+                    val reopenedStore = requireNotNull(M3CanonicalCommitStore.open(parent, M3CoordinatorStorageBudget(reopenedCoordinator)))
                     val recovered = reopenedStore.stage(preparedIntent, base)
                     assertTrue("$fault recovery returned $recovered", recovered is M3CanonicalCowStageResult.Prepared)
                     val generation = (recovered as M3CanonicalCowStageResult.Prepared).generation
@@ -70,7 +70,7 @@ class M3CanonicalCowDurabilityTest {
             val unrelatedBase = EmptyView("unrelated")
             val unrelatedIntent = intent(unrelatedBase, "different-command", File(directory, "unrelated-intent"))
             coordinator(parent).use { reopened ->
-                val store = requireNotNull(M3CanonicalMutableStore.open(parent, M3CoordinatorStorageBudget(reopened)))
+                val store = requireNotNull(M3CanonicalCommitStore.open(parent, M3CoordinatorStorageBudget(reopened)))
                 val result = store.stage(unrelatedIntent, unrelatedBase)
                 assertTrue(result.toString(), result is M3CanonicalCowStageResult.Prepared)
                 assertFalse("uncharged COW orphan survived unrelated startup", staging.exists())

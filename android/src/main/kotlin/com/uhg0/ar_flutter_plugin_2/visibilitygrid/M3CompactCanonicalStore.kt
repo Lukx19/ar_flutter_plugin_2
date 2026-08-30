@@ -1,6 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
 import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetCoordinatorV2
+import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetCandidateReservationV2
 import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetReservationV2
 import java.io.File
 import java.io.RandomAccessFile
@@ -296,6 +297,15 @@ internal interface M3CanonicalStorageBudget {
         return token
     }
 
+    fun reserveCandidateExclusive(
+        staging: File,
+        target: File,
+        fileBytes: Map<String, Long>,
+        maximumPhysicalBytes: Long,
+    ): M3CanonicalCandidateReservation = reserveCandidate(
+        staging, target, fileBytes, maximumPhysicalBytes,
+    )?.let(M3CanonicalCandidateReservation::Reserved) ?: M3CanonicalCandidateReservation.QuotaRefused
+
     fun verifyCandidate(token: Any, candidate: File): Long = allocatedBytes(candidate)
 
     fun publishCandidate(token: Any, staging: File, target: File) {
@@ -331,6 +341,12 @@ internal interface M3CanonicalStorageBudget {
         }
         return Files.getFileStore(path.toPath()).blockSize.coerceAtLeast(1L)
     }
+}
+
+internal sealed interface M3CanonicalCandidateReservation {
+    data class Reserved(val token: Any) : M3CanonicalCandidateReservation
+    data object TargetReserved : M3CanonicalCandidateReservation
+    data object QuotaRefused : M3CanonicalCandidateReservation
 }
 
 internal data class M3CanonicalPointerReservation(
@@ -388,6 +404,19 @@ internal class M3CoordinatorStorageBudget(private val coordinator: StorageBudget
     ): Any? = coordinator.reserveCandidate(
         "m3:canonical:v6-migration", staging, target, fileBytes, maximumPhysicalBytes,
     )
+
+    override fun reserveCandidateExclusive(
+        staging: File,
+        target: File,
+        fileBytes: Map<String, Long>,
+        maximumPhysicalBytes: Long,
+    ): M3CanonicalCandidateReservation = when (val result = coordinator.reserveCandidateExclusive(
+        "m3:canonical:v6-migration", staging, target, fileBytes, maximumPhysicalBytes,
+    )) {
+        is StorageBudgetCandidateReservationV2.Reserved -> M3CanonicalCandidateReservation.Reserved(result.reservation)
+        StorageBudgetCandidateReservationV2.TargetReserved -> M3CanonicalCandidateReservation.TargetReserved
+        StorageBudgetCandidateReservationV2.QuotaRefused -> M3CanonicalCandidateReservation.QuotaRefused
+    }
 
     override fun verifyCandidate(token: Any, candidate: File) =
         coordinator.verifyCandidate(token as StorageBudgetReservationV2, candidate)

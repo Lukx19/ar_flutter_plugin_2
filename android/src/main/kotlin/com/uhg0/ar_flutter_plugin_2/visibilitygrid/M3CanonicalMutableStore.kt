@@ -6,19 +6,31 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.security.MessageDigest
 
-/**
- * #122's deep module.  Its single interface stages a verified intent into one
- * immutable COW generation.  There is intentionally no activate/select/ack
- * method here: a successful result is still private, unreferenced evidence.
- */
-internal class M3CanonicalMutableStore private constructor(
+/** The only production seam from a prepared mutation to current private authority. */
+internal interface M3CanonicalCommitStore : AutoCloseable {
+    fun commit(
+        plan: M3PreparedCanonicalMutation,
+        generationZero: M3CanonicalStateView,
+        faults: M3CanonicalCommitFaults = M3CanonicalCommitFaults(),
+    ): M3CanonicalCommitResult
+    fun reopen(generationZero: M3CanonicalStateView): M3CanonicalReopenResult
+    fun lookupCommit(query: M3CanonicalCommitQuery, generationZero: M3CanonicalStateView): M3CanonicalCommitLookup
+
+    companion object {
+        fun open(parent: File, budget: M3CanonicalStorageBudget): M3CanonicalCommitStore? = try {
+            require(parent.exists() || parent.mkdirs()); M3CanonicalMutableStore(parent, budget)
+        } catch (_: Exception) { null }
+    }
+}
+
+private class M3CanonicalMutableStore(
     private val parent: File,
     private val budget: M3CanonicalStorageBudget,
-) : AutoCloseable {
+) : M3CanonicalCommitStore {
     private var closed = false
 
     @Synchronized
-    fun stage(
+    private fun stage(
         intent: M3PreparedIntent,
         baseView: M3CanonicalStateView,
         fault: M3CanonicalCowFault? = null,
@@ -123,9 +135,84 @@ internal class M3CanonicalMutableStore private constructor(
         }
     }
 
+    @Synchronized
+    override fun commit(
+        plan: M3PreparedCanonicalMutation,
+        generationZero: M3CanonicalStateView,
+        faults: M3CanonicalCommitFaults,
+    ): M3CanonicalCommitResult {
+        if (closed) return M3CanonicalCommitResult.Refused(M3CanonicalCommitRefusal.CLOSED)
+        var selected: M3CanonicalPublishedCommit? = null
+        var intent: M3PreparedIntent? = null
+        var generation: M3CanonicalCowGeneration? = null
+        try {
+            val current = when (val reopened = M3PrivateRootSelector(parent, budget).reopen(generationZero)) {
+                is M3CanonicalReopenResult.GenerationZero -> generationZero
+                is M3CanonicalReopenResult.Selected -> {
+                    selected = reopened.commit
+                    when (plan.sourceCut) {
+                        generationZero.cut -> generationZero
+                        reopened.commit.view.cut -> reopened.commit.view
+                        else -> return M3CanonicalCommitResult.Refused(M3CanonicalCommitRefusal.STALE_BASE)
+                    }
+                }
+                is M3CanonicalReopenResult.Refused -> return M3CanonicalCommitResult.Refused(
+                    M3CanonicalCommitRefusal.SELECTOR_REFUSED, selectorReason = reopened.reason,
+                )
+            }
+            if (plan.sourceCut != current.cut)
+                return M3CanonicalCommitResult.Refused(M3CanonicalCommitRefusal.STALE_BASE)
+            val journal = when (val opened = M3CanonicalDirtyJournal.open(current, parent, budget)) {
+                is M3CanonicalDirtyJournalOpenResult.Opened -> opened.journal
+                is M3CanonicalDirtyJournalOpenResult.Refused -> return M3CanonicalCommitResult.Refused(
+                    M3CanonicalCommitRefusal.JOURNAL_REFUSED, journalReason = opened.reason,
+                )
+            }
+            try {
+                intent = when (val durable = journal.reopen()) {
+                    is M3CanonicalDirtyJournalReopenResult.Complete -> durable.intent
+                    is M3CanonicalDirtyJournalReopenResult.None -> when (val flushed = journal.flush(plan, faults.journal)) {
+                        is M3CanonicalDirtyJournalFlushResult.Prepared -> flushed.intent
+                        is M3CanonicalDirtyJournalFlushResult.Refused -> return M3CanonicalCommitResult.Refused(
+                            M3CanonicalCommitRefusal.JOURNAL_REFUSED, journalReason = flushed.reason,
+                        )
+                    }
+                    is M3CanonicalDirtyJournalReopenResult.Refused -> return M3CanonicalCommitResult.Refused(
+                        M3CanonicalCommitRefusal.JOURNAL_REFUSED, journalReason = durable.reason,
+                    )
+                }
+                val identity = (requireNotNull(intent).identity() as? M3PreparedIntentIdentityResult.Complete)?.identity
+                    ?: return M3CanonicalCommitResult.Refused(M3CanonicalCommitRefusal.INVALID_INTENT)
+                if (!identity.matches(plan)) return M3CanonicalCommitResult.Refused(
+                    if (identity.commandId == plan.commandId && identity.kind == plan.kind)
+                        M3CanonicalCommitRefusal.IDENTITY_CONFLICT else M3CanonicalCommitRefusal.STALE_BASE,
+                )
+                when (val staged = stage(requireNotNull(intent), current, faults.cow)) {
+                    is M3CanonicalCowStageResult.Prepared -> generation = staged.generation
+                    is M3CanonicalCowStageResult.Refused -> return M3CanonicalCommitResult.Refused(
+                        if (staged.reason == M3CanonicalCowRefusal.IDENTITY_CONFLICT) M3CanonicalCommitRefusal.IDENTITY_CONFLICT
+                        else M3CanonicalCommitRefusal.COW_REFUSED,
+                        cowReason = staged.reason,
+                    )
+                }
+                return when (val published = publish(requireNotNull(generation), generationZero, faults.selector)) {
+                    is M3CanonicalPublishResult.Committed -> M3CanonicalCommitResult.Committed(published.commit, published.replayed)
+                    is M3CanonicalPublishResult.UnknownAfterSwitch -> M3CanonicalCommitResult.UnknownAfterSwitch(published.receipt)
+                    is M3CanonicalPublishResult.Refused -> M3CanonicalCommitResult.Refused(
+                        if (published.reason == M3CanonicalSelectorRefusal.IDENTITY_CONFLICT) M3CanonicalCommitRefusal.IDENTITY_CONFLICT
+                        else M3CanonicalCommitRefusal.SELECTOR_REFUSED,
+                        selectorReason = published.reason,
+                    )
+                }
+            } finally { journal.close() }
+        } finally {
+            generation?.close(); intent?.close(); selected?.close()
+        }
+    }
+
     /** #123's private publication seam. The immutable v6 generation remains separate. */
     @Synchronized
-    fun publish(
+    private fun publish(
         generation: M3CanonicalCowGeneration,
         generationZero: M3CanonicalStateView,
         fault: M3CanonicalSelectorFault? = null,
@@ -136,14 +223,14 @@ internal class M3CanonicalMutableStore private constructor(
 
     /** Reopens exactly the selected private cut, or generation zero only if no selector exists. */
     @Synchronized
-    fun reopen(generationZero: M3CanonicalStateView): M3CanonicalReopenResult {
+    override fun reopen(generationZero: M3CanonicalStateView): M3CanonicalReopenResult {
         if (closed) return M3CanonicalReopenResult.Refused(M3CanonicalSelectorRefusal.CLOSED)
         return M3PrivateRootSelector(parent, budget).reopen(generationZero)
     }
 
     /** Process-recovery lookup; changed bytes under one command identity fail closed. */
     @Synchronized
-    fun lookupCommit(query: M3CanonicalCommitQuery, generationZero: M3CanonicalStateView): M3CanonicalCommitLookup {
+    override fun lookupCommit(query: M3CanonicalCommitQuery, generationZero: M3CanonicalStateView): M3CanonicalCommitLookup {
         if (closed) return M3CanonicalCommitLookup.Refused(M3CanonicalSelectorRefusal.CLOSED)
         return M3PrivateRootSelector(parent, budget).lookup(query, generationZero)
     }
@@ -164,9 +251,6 @@ internal class M3CanonicalMutableStore private constructor(
     }
 
     companion object {
-        fun open(parent: File, budget: M3CanonicalStorageBudget): M3CanonicalMutableStore? = try {
-            require(parent.exists() || parent.mkdirs()); M3CanonicalMutableStore(parent, budget)
-        } catch (_: Exception) { null }
         private fun round(bytes: Long, unit: Long) = if (bytes == 0L) 0L else Math.multiplyExact((bytes - 1L) / unit + 1L, unit)
         private fun verifyCurrent(file: File, expected: M3PreparedIntentCurrentReceipt) {
             require(file.length() == expected.length)
@@ -179,6 +263,34 @@ internal class M3CanonicalMutableStore private constructor(
         }
     }
 }
+
+internal data class M3CanonicalCommitFaults(
+    val journal: M3CanonicalDirtyJournalFault? = null,
+    val cow: M3CanonicalCowFault? = null,
+    val selector: M3CanonicalSelectorFault? = null,
+)
+
+internal sealed interface M3CanonicalCommitResult {
+    data class Committed(val commit: M3CanonicalPublishedCommit, val replayed: Boolean) : M3CanonicalCommitResult
+    data class UnknownAfterSwitch(val receipt: M3CanonicalPublicationReceipt) : M3CanonicalCommitResult
+    data class Refused(
+        val reason: M3CanonicalCommitRefusal,
+        val journalReason: M3CanonicalDirtyJournalRefusal? = null,
+        val cowReason: M3CanonicalCowRefusal? = null,
+        val selectorReason: M3CanonicalSelectorRefusal? = null,
+    ) : M3CanonicalCommitResult
+}
+
+internal enum class M3CanonicalCommitRefusal {
+    CLOSED, STALE_BASE, INVALID_INTENT, IDENTITY_CONFLICT, JOURNAL_REFUSED, COW_REFUSED, SELECTOR_REFUSED,
+}
+
+private fun M3PreparedIntentIdentity.matches(plan: M3PreparedCanonicalMutation) =
+    sourceCut == plan.sourceCut && commandHash == plan.commandHash && commandFingerprint == plan.commandFingerprint &&
+        commandId == plan.commandId && kind == plan.kind && targetHighWater == plan.targetHighWater &&
+        targetLive == plan.targetLiveSurfaceCount && targetSource == plan.targetSourceCount &&
+        targetSupport == plan.targetSupportCount && targetLineage == plan.targetLineageCount &&
+        targetGeometry == plan.targetGeometryRevision && targetLineageRevision == plan.targetLineageRevision
 
 internal sealed interface M3CanonicalCowStageResult {
     data class Prepared(val generation: M3CanonicalCowGeneration, val reused: Boolean) : M3CanonicalCowStageResult

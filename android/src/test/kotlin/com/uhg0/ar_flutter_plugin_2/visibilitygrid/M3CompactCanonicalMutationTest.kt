@@ -71,6 +71,15 @@ class M3CompactCanonicalMutationTest {
                     mapOf(2L to M3Voxel(1, 0, 0), 3L to M3Voxel(2, 0, 0), 4L to M3Voxel(3, 0, 0), 5L to M3Voxel(40, 0, 0)), setOf(1L), mapOf(2L to listOf(2L), 3L to listOf(3L), 4L to listOf(4L), 5L to listOf(1L)), mapOf(1L to listOf(5L)), replacementKinds),
             )
             scenarios.forEach { scenario ->
+                val plan = when (val command = scenario.command) {
+                    is M3FeatureMutationCommand -> M3SurfaceOwnership.prepareMutation(
+                        scenario.base, M3SurfaceOwnershipConfiguration(), command,
+                    )
+                    is M3CanonicalTransactionCommand -> M3SurfaceOwnership.prepareMutation(
+                        scenario.base, M3SurfaceOwnershipConfiguration(), command,
+                    )
+                    else -> error("unknown command")
+                }.let { (it as M3CanonicalMutationPreparation.Prepared).mutation }
                 val intent = when (val command = scenario.command) {
                     is M3FeatureMutationCommand -> intent(scenario.base, command, File(directory, "${scenario.name}-intent"))
                     is M3CanonicalTransactionCommand -> intent(scenario.base, command, File(directory, "${scenario.name}-intent"))
@@ -84,6 +93,13 @@ class M3CompactCanonicalMutationTest {
                 assertEquals(scenario.name, scenario.expectedKinds, generation.root.manifest.mapTo(mutableSetOf()) { it.kind })
                 assertArrayEquals(exactCurrent, File(generation.directory, M3CanonicalCowGeneration.CURRENT_UNACKED_FILE).readBytes())
                 val overlay = generation.overlay(scenario.base)
+                val commitOwner = requireNotNull(M3CanonicalCommitStore.open(
+                    File(directory, "${scenario.name}-commit"), RecordingBudget(),
+                ))
+                val committed = commitOwner.commit(plan, scenario.base) as M3CanonicalCommitResult.Committed
+                assertEquals(scenario.kind, committed.commit.roots.last().commandKind)
+                assertEquals(scenario.expected.size, committed.commit.view.cut.liveSurfaceCount)
+                committed.commit.close(); commitOwner.close()
                 scenario.expected.forEach { (id, voxel) ->
                     assertEquals("${scenario.name} id=$id", voxel, overlay.findById(M3SurfaceId(id))?.voxel)
                     assertEquals("${scenario.name} voxel=$voxel", id, overlay.findByVoxel(voxel)?.id?.value)
@@ -177,7 +193,7 @@ class M3CompactCanonicalMutationTest {
                 freeBytes = { 128L * 1024 * 1024 },
             ).use { coordinator ->
                 val budget = M3CoordinatorStorageBudget(coordinator)
-                val store = requireNotNull(M3CanonicalMutableStore.open(generationParent, budget))
+                val store = requireNotNull(M3CanonicalCommitStore.open(generationParent, budget))
                 val prepared = prepared(store.stage(firstIntent, base))
                 val physical = coordinator.physicallyAllocatedTreeBytes(prepared.generation.directory)
                 assertEquals(physical, prepared.generation.storageReceipt().allocatedBytes)
@@ -215,7 +231,7 @@ class M3CompactCanonicalMutationTest {
             val add = M3FeatureMutationCommand("add", 0, 0, target(null, M3Voxel(0, 0, 0)))
             val addIntent = intent(empty, add, File(directory, "add-intent"))
             val budget = RecordingBudget()
-            val store = requireNotNull(M3CanonicalMutableStore.open(File(directory, "generations"), budget))
+            val store = requireNotNull(M3CanonicalCommitStore.open(File(directory, "generations"), budget))
             val added = prepared(store.stage(addIntent, empty))
             val addKinds = added.generation.root.manifest.mapTo(mutableSetOf()) { it.kind }
             assertTrue(addKinds.containsAll(setOf(
@@ -497,10 +513,10 @@ class M3CompactCanonicalMutationTest {
                 val base = view("fault-${fault.name}", emptyList())
                 val intent = intent(base, M3FeatureMutationCommand("fault", 0, 0, target(null, M3Voxel(0, 0, 0))), File(directory, "intent"))
                 val parent = File(directory, "generations")
-                val first = requireNotNull(M3CanonicalMutableStore.open(parent, RecordingBudget())).stage(intent, base, fault)
+                val first = requireNotNull(M3CanonicalCommitStore.open(parent, RecordingBudget())).stage(intent, base, fault)
                 assertTrue("$fault returned $first", first is M3CanonicalCowStageResult.Refused)
                 assertEquals(0, base.cut.liveSurfaceCount)
-                val recovered = requireNotNull(M3CanonicalMutableStore.open(parent, RecordingBudget())).stage(intent, base)
+                val recovered = requireNotNull(M3CanonicalCommitStore.open(parent, RecordingBudget())).stage(intent, base)
                 assertTrue("$fault recovery returned $recovered", recovered is M3CanonicalCowStageResult.Prepared)
                 val prepared = recovered as M3CanonicalCowStageResult.Prepared
                 assertEquals(1, prepared.generation.overlay(base).cut.liveSurfaceCount)
@@ -510,7 +526,7 @@ class M3CompactCanonicalMutationTest {
     }
 
     private fun stage(base: M3CanonicalStateView, intent: M3PreparedIntent, parent: File) =
-        prepared(requireNotNull(M3CanonicalMutableStore.open(parent, RecordingBudget())).stage(intent, base)).generation
+        prepared(requireNotNull(M3CanonicalCommitStore.open(parent, RecordingBudget())).stage(intent, base)).generation
 
     private fun prepared(result: M3CanonicalCowStageResult): M3CanonicalCowStageResult.Prepared =
         result as? M3CanonicalCowStageResult.Prepared ?: error("stage refused: $result")

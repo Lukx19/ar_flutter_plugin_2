@@ -15,12 +15,59 @@ import org.junit.Test
 
 class M3CanonicalMutableStoreFaultTest {
     @Test
+    fun `commit owner enforces durable burn replay conflict and old new process cuts`() {
+        listOf(
+            M3CanonicalSelectorFault.PROCESS_CRASH_BEFORE_SELECTOR_SWITCH to false,
+            M3CanonicalSelectorFault.PROCESS_CRASH_AFTER_SELECTOR_SWITCH to true,
+        ).forEach { (fault, selectedAfterCrash) ->
+            val directory = Files.createTempDirectory("m3-commit-owner-${fault.name}-").toFile()
+            try {
+                val base = EmptyView("commit-owner-${fault.name}")
+                fun coordinator() = StorageBudgetCoordinatorV2(
+                    directory, StorageBudgetPolicyV2(64L * 1024 * 1024, 0),
+                    JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L }),
+                    freeBytes = { 128L * 1024 * 1024 },
+                )
+                val plan = plan(base, "owned", 0)
+                val firstCoordinator = coordinator()
+                val owner = requireNotNull(M3CanonicalCommitStore.open(directory, M3CoordinatorStorageBudget(firstCoordinator)))
+                assertThrows(M3CanonicalSimulatedProcessCrash::class.java) {
+                    owner.commit(plan, base, M3CanonicalCommitFaults(selector = fault))
+                }
+                assertTrue(firstCoordinator.reservedBytes() > 0L)
+                firstCoordinator.close()
+
+                val reopenedCoordinator = coordinator()
+                val reopenedOwner = requireNotNull(M3CanonicalCommitStore.open(directory, M3CoordinatorStorageBudget(reopenedCoordinator)))
+                val reopened = reopenedOwner.reopen(base)
+                assertEquals(selectedAfterCrash, reopened is M3CanonicalReopenResult.Selected)
+                if (reopened is M3CanonicalReopenResult.Selected) reopened.commit.close()
+                assertEquals(0L, reopenedCoordinator.reservedBytes())
+                assertEquals(reopenedCoordinator.committedBytes(), allAuthorityPhysicalBytes(directory, reopenedCoordinator))
+
+                val completed = reopenedOwner.commit(plan, base) as M3CanonicalCommitResult.Committed
+                val expectedRoot = completed.commit.view.cut.rootHash
+                completed.commit.close()
+                val replay = reopenedOwner.commit(plan, base) as M3CanonicalCommitResult.Committed
+                assertTrue(replay.replayed)
+                assertEquals(expectedRoot, replay.commit.view.cut.rootHash)
+                replay.commit.close()
+                val conflict = reopenedOwner.commit(plan(base, "owned", 1), base) as M3CanonicalCommitResult.Refused
+                assertEquals(M3CanonicalCommitRefusal.IDENTITY_CONFLICT, conflict.reason)
+                assertEquals(0L, reopenedCoordinator.reservedBytes())
+                assertEquals(reopenedCoordinator.committedBytes(), allAuthorityPhysicalBytes(directory, reopenedCoordinator))
+                reopenedOwner.close(); reopenedCoordinator.close()
+            } finally { directory.deleteRecursively() }
+        }
+    }
+
+    @Test
     fun `generation zero is used only without a selector and selected corruption never falls back`() {
         val directory = Files.createTempDirectory("m3-selector-corrupt").toFile()
         try {
             val base = EmptyView("corrupt")
             val budget = RecordingBudget()
-            val store = requireNotNull(M3CanonicalMutableStore.open(File(directory, "generations"), budget))
+            val store = requireNotNull(M3CanonicalCommitStore.open(File(directory, "generations"), budget))
             assertTrue(store.reopen(base) is M3CanonicalReopenResult.GenerationZero)
             val generation = prepared(store.stage(intent(base, "create", File(directory, "intent")), base)).generation
             val published = store.publish(generation, base)
@@ -46,10 +93,10 @@ class M3CanonicalMutableStoreFaultTest {
                 val base = EmptyView("fault-${fault.name}")
                 val parent = File(directory, "generations")
                 val budget = RecordingBudget()
-                val store = requireNotNull(M3CanonicalMutableStore.open(parent, budget))
+                val store = requireNotNull(M3CanonicalCommitStore.open(parent, budget))
                 val generation = prepared(store.stage(intent(base, "create", File(directory, "intent")), base)).generation
                 val result = store.publish(generation, base, fault)
-                val reopenedStore = requireNotNull(M3CanonicalMutableStore.open(parent, budget))
+                val reopenedStore = requireNotNull(M3CanonicalCommitStore.open(parent, budget))
                 when (result) {
                     is M3CanonicalPublishResult.UnknownAfterSwitch -> {
                         val reopened = reopenedStore.reopen(base) as M3CanonicalReopenResult.Selected
@@ -77,7 +124,7 @@ class M3CanonicalMutableStoreFaultTest {
         try {
             val parent = File(directory, "generations")
             val base = EmptyView("chain")
-            val store = requireNotNull(M3CanonicalMutableStore.open(parent, RecordingBudget()))
+            val store = requireNotNull(M3CanonicalCommitStore.open(parent, RecordingBudget()))
             val first = prepared(store.stage(intent(base, "first", File(directory, "intent-1")), base)).generation
             val firstCommit = (store.publish(first, base) as M3CanonicalPublishResult.Committed).commit
             assertEquals(2L, firstCommit.view.cut.nextSurfaceIdHighWater)
@@ -108,7 +155,7 @@ class M3CanonicalMutableStoreFaultTest {
             fun publish(name: String, declared: Int): M3CanonicalPublicationReceipt {
                 val root = File(directory, name)
                 val base = EmptyView(name, declared)
-                val store = requireNotNull(M3CanonicalMutableStore.open(root, RecordingBudget()))
+                val store = requireNotNull(M3CanonicalCommitStore.open(root, RecordingBudget()))
                 val selected = prepared(store.stage(intent(base, "command", File(directory, "$name-intent")), base)).generation
                 val orphanBase = EmptyView("$name-orphan", declared)
                 val orphan = prepared(store.stage(intent(orphanBase, "orphan", File(directory, "$name-orphan-intent")), orphanBase)).generation
@@ -139,7 +186,7 @@ class M3CanonicalMutableStoreFaultTest {
         try {
             val parent = File(directory, "generations")
             val base = EmptyView("codecs")
-            val store = requireNotNull(M3CanonicalMutableStore.open(parent, RecordingBudget()))
+            val store = requireNotNull(M3CanonicalCommitStore.open(parent, RecordingBudget()))
             val generation = prepared(store.stage(intent(base, "codec", File(directory, "intent")), base)).generation
             val result = store.publish(generation, base) as M3CanonicalPublishResult.Committed
             result.commit.close()
@@ -168,7 +215,7 @@ class M3CanonicalMutableStoreFaultTest {
         try {
             val parent = File(directory, "generations")
             val base = EmptyView("lookup")
-            val store = requireNotNull(M3CanonicalMutableStore.open(parent, RecordingBudget()))
+            val store = requireNotNull(M3CanonicalCommitStore.open(parent, RecordingBudget()))
             val generation = prepared(store.stage(intent(base, "lookup-command", File(directory, "intent")), base)).generation
             val query = M3CanonicalCommitQuery.from(generation)
             assertTrue(store.publish(generation, base, M3CanonicalSelectorFault.AFTER_SELECTOR_SWITCH) is M3CanonicalPublishResult.UnknownAfterSwitch)
@@ -191,7 +238,7 @@ class M3CanonicalMutableStoreFaultTest {
             val parent = File(directory, "generations")
             val base = EmptyView("limit")
             val budget = RecordingBudget()
-            val store = requireNotNull(M3CanonicalMutableStore.open(parent, budget))
+            val store = requireNotNull(M3CanonicalCommitStore.open(parent, budget))
             val selector = M3PrivateRootSelector(parent, budget, maximumGenerations = 1)
             val first = prepared(store.stage(intent(base, "first", File(directory, "intent-1")), base)).generation
             val firstCommit = (selector.publish(first, base, null) as M3CanonicalPublishResult.Committed).commit
@@ -216,7 +263,7 @@ class M3CanonicalMutableStoreFaultTest {
             )
             val base = EmptyView("budget")
             val firstCoordinator = coordinator()
-            val store = requireNotNull(M3CanonicalMutableStore.open(parent, M3CoordinatorStorageBudget(firstCoordinator)))
+            val store = requireNotNull(M3CanonicalCommitStore.open(parent, M3CoordinatorStorageBudget(firstCoordinator)))
             val selected = prepared(store.stage(intent(base, "selected", File(directory, "intent-selected")), base)).generation
             val orphanBase = EmptyView("orphan")
             val orphan = prepared(store.stage(intent(orphanBase, "orphan", File(directory, "intent-orphan")), orphanBase)).generation
@@ -230,7 +277,7 @@ class M3CanonicalMutableStoreFaultTest {
             published.commit.close(); store.close(); firstCoordinator.close()
 
             val reopenedCoordinator = coordinator()
-            val reopenedStore = requireNotNull(M3CanonicalMutableStore.open(parent, M3CoordinatorStorageBudget(reopenedCoordinator)))
+            val reopenedStore = requireNotNull(M3CanonicalCommitStore.open(parent, M3CoordinatorStorageBudget(reopenedCoordinator)))
             val reopened = reopenedStore.reopen(base) as M3CanonicalReopenResult.Selected
             assertEquals(1, reopened.commit.view.cut.liveSurfaceCount)
             assertEquals(reopened.commit.receipt.selectedAuthorityBytes, reopenedCoordinator.committedBytes())
@@ -256,7 +303,7 @@ class M3CanonicalMutableStoreFaultTest {
                 )
                 val base = EmptyView("hard-crash-${fault.name}")
                 val firstCoordinator = coordinator()
-                val firstStore = requireNotNull(M3CanonicalMutableStore.open(parent, M3CoordinatorStorageBudget(firstCoordinator)))
+                val firstStore = requireNotNull(M3CanonicalCommitStore.open(parent, M3CoordinatorStorageBudget(firstCoordinator)))
                 val firstGeneration = prepared(firstStore.stage(intent(base, "first", File(directory, "intent-first")), base)).generation
                 val firstCommit = (firstStore.publish(firstGeneration, base) as M3CanonicalPublishResult.Committed).commit
                 val oldRoot = firstCommit.view.cut.rootHash
@@ -270,7 +317,7 @@ class M3CanonicalMutableStoreFaultTest {
                 firstCoordinator.close()
 
                 val reopenedCoordinator = coordinator()
-                val reopenedStore = requireNotNull(M3CanonicalMutableStore.open(parent, M3CoordinatorStorageBudget(reopenedCoordinator)))
+                val reopenedStore = requireNotNull(M3CanonicalCommitStore.open(parent, M3CoordinatorStorageBudget(reopenedCoordinator)))
                 val reopened = reopenedStore.reopen(base) as M3CanonicalReopenResult.Selected
                 assertEquals(if (selectedAfterCrash) 2 else 1, reopened.commit.view.cut.liveSurfaceCount)
                 assertEquals(if (selectedAfterCrash) newRoot else oldRoot, reopened.commit.view.cut.rootHash)
@@ -296,6 +343,28 @@ class M3CanonicalMutableStoreFaultTest {
                 file.name.matches(Regex("m3-selector-root-[0-9a-f]{64}\\.root")) ||
                 file.name in setOf("m3-root-selector", "m3-root-A.slot", "m3-root-B.slot")
         }.sumOf(coordinator::physicallyAllocatedTreeBytes)
+
+    private fun allAuthorityPhysicalBytes(parent: File, coordinator: StorageBudgetCoordinatorV2): Long =
+        parent.listFiles().orEmpty().filter { file -> file.isDirectory && (
+            file.name.matches(Regex("m3-cow-command-[0-9a-f]{64}")) ||
+                file.name.matches(Regex("m3-canonical-v6-[0-9a-f]{64}\\.(?:allocation-[0-9]+|intent)"))
+            ) || file.isFile && (
+            file.name.matches(Regex("m3-selector-root-[0-9a-f]{64}\\.root")) ||
+                file.name in setOf("m3-root-selector", "m3-root-A.slot", "m3-root-B.slot")
+            )
+        }.sumOf { file -> if (file.isDirectory) coordinator.physicallyAllocatedTreeBytes(file) else
+            roundPhysical(file.length(), 4_096L) }
+
+    private fun roundPhysical(bytes: Long, unit: Long) = if (bytes == 0L) 0L else ((bytes - 1L) / unit + 1L) * unit
+
+    private fun plan(base: M3CanonicalStateView, commandId: String, x: Int): M3PreparedCanonicalMutation {
+        val command = M3FeatureMutationCommand(
+            commandId, base.cut.geometryRevision, base.cut.lineageRevision,
+            M3CanonicalTarget(null, M3Voxel(x, 0, 0), 0, 0, 192),
+        )
+        return (M3SurfaceOwnership.prepareMutation(base, M3SurfaceOwnershipConfiguration(), command)
+            as M3CanonicalMutationPreparation.Prepared).mutation
+    }
 
     private fun prepared(result: M3CanonicalCowStageResult) = result as M3CanonicalCowStageResult.Prepared
     private fun intent(base: M3CanonicalStateView, commandId: String, directory: File): M3PreparedIntent {
