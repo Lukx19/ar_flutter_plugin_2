@@ -8,6 +8,94 @@ import org.junit.Test
 
 class M3CanonicalAcknowledgementTest {
     @Test
+    fun `abandoned prepared authority discards exactly once and fails closed on reuse`() {
+        val fixture = activated("discarded-plan")
+        try {
+            val plan = adjacentPlan(fixture, requireNotNull(fixture.owner.activationState()))
+            val authority = plan.sourceAuthority as M3CompactCanonicalStore
+            assertEquals(1, authority.residentOwnership().liveStoreCount)
+            assertEquals(M3PreparedMutationDiscardResult.Discarded, plan.discard())
+            assertEquals(M3PreparedMutationDiscardResult.AlreadyDiscarded, plan.discard())
+            assertEquals(0, authority.residentOwnership().liveStoreCount)
+            val refused = fixture.owner.commitAdjacentCanonicalMutation(plan) as M3CanonicalAdjacentCommitResult.Refused
+            assertEquals(M3CanonicalAdjacentCommitRefusal.PLAN_DISCARDED, refused.reason)
+            assertEquals(M3PreparedMutationDisposition.TERMINAL, refused.disposition)
+        } finally { fixture.directory.deleteRecursively() }
+    }
+
+    @Test
+    fun `owner close releases an explicitly retryable pre ACK plan`() {
+        val fixture = activated("retryable-close")
+        try {
+            val plan = adjacentPlan(fixture, requireNotNull(fixture.owner.activationState()))
+            val authority = plan.sourceAuthority as M3CompactCanonicalStore
+            val refused = fixture.owner.commitAdjacentCanonicalMutation(plan) as M3CanonicalAdjacentCommitResult.Refused
+            assertEquals(M3CanonicalAdjacentCommitRefusal.CURRENT_UNACKNOWLEDGED, refused.reason)
+            assertEquals(M3PreparedMutationDisposition.RETRYABLE, refused.disposition)
+            assertEquals(M3PreparedMutationLifecycle.READY, plan.lifecycle())
+            fixture.owner.close()
+            assertEquals(M3PreparedMutationLifecycle.DISCARDED, plan.lifecycle())
+            assertEquals(0, authority.residentOwnership().liveStoreCount)
+        } finally { fixture.directory.deleteRecursively() }
+    }
+
+    @Test
+    fun `terminal commit refusal discards authority and a fresh plan can admit`() {
+        val fixture = activated("terminal-commit")
+        try {
+            val initial = requireNotNull(fixture.owner.activationState())
+            val current = initial.current as M3CanonicalActivationCurrent.Receipt
+            fixture.owner.acknowledgeCanonicalCurrent(
+                M3CanonicalAcknowledgement(current.identity.commandHash, initial.cut.geometryRevision, initial.cut.lineageRevision),
+            )
+            val failedPlan = adjacentPlan(fixture, initial)
+            val authority = failedPlan.sourceAuthority as M3CompactCanonicalStore
+            val refused = fixture.owner.commitAdjacentCanonicalMutation(
+                failedPlan, M3CanonicalCommitFaults(cow = M3CanonicalCowFault.BEFORE_RESERVATION),
+            ) as M3CanonicalAdjacentCommitResult.Refused
+            assertEquals(M3PreparedMutationDisposition.TERMINAL, refused.disposition)
+            assertEquals(M3PreparedMutationLifecycle.DISCARDED, failedPlan.lifecycle())
+            assertEquals(0, authority.residentOwnership().liveStoreCount)
+
+            val fresh = adjacentPlan(fixture, initial)
+            assertTrue(fixture.owner.commitAdjacentCanonicalMutation(fresh) is M3CanonicalAdjacentCommitResult.Committed)
+            assertEquals(M3PreparedMutationLifecycle.CONSUMED, fresh.lifecycle())
+        } finally { fixture.directory.deleteRecursively() }
+    }
+
+    @Test
+    fun `commit reconcile and reopen exceptions discard their exact authority`() {
+        listOf(
+            M3CanonicalAdjacentOwnershipStage.COMMIT,
+            M3CanonicalAdjacentOwnershipStage.RECONCILE,
+            M3CanonicalAdjacentOwnershipStage.REOPEN,
+        ).forEach { failedStage ->
+            val fixture = activated("terminal-stage-${failedStage.name.lowercase()}")
+            try {
+                val initial = requireNotNull(fixture.owner.activationState())
+                val current = initial.current as M3CanonicalActivationCurrent.Receipt
+                fixture.owner.acknowledgeCanonicalCurrent(
+                    M3CanonicalAcknowledgement(current.identity.commandHash, initial.cut.geometryRevision, initial.cut.lineageRevision),
+                )
+                val plan = adjacentPlan(fixture, initial)
+                val authority = plan.sourceAuthority as M3CompactCanonicalStore
+                M3CanonicalActivationTestHooks.onAdjacentOwnership = { observation ->
+                    if (observation.stage == failedStage) error("terminal-$failedStage")
+                }
+                val refused = try {
+                    fixture.owner.commitAdjacentCanonicalMutation(plan) as M3CanonicalAdjacentCommitResult.Refused
+                } finally { M3CanonicalActivationTestHooks.onAdjacentOwnership = null }
+                assertEquals(M3PreparedMutationDisposition.TERMINAL, refused.disposition)
+                assertEquals(M3PreparedMutationLifecycle.DISCARDED, plan.lifecycle())
+                assertEquals(0, authority.residentOwnership().liveStoreCount)
+            } finally {
+                M3CanonicalActivationTestHooks.onAdjacentOwnership = null
+                fixture.directory.deleteRecursively()
+            }
+        }
+    }
+
+    @Test
     fun `oversized truncated and checksum corrupt adjacent manifests fail closed`() {
         listOf("oversized", "truncated", "checksum").forEach { corruption ->
             val fixture = activated("adjacent-manifest-$corruption")
@@ -24,6 +112,8 @@ class M3CanonicalAcknowledgementTest {
                     )
                     throw AssertionError("expected private selector process cut")
                 } catch (_: M3CanonicalSimulatedProcessCrash) { }
+                assertEquals(M3PreparedMutationLifecycle.DISCARDED, plan.lifecycle())
+                assertEquals(0, (plan.sourceAuthority as M3CompactCanonicalStore).residentOwnership().liveStoreCount)
                 fixture.owner.close()
                 val transaction = File(fixture.directory, "m3-activation-${fixture.group.hash.joinToString("") { "%02x".format(it) }}-adjacent.transaction")
                 val original = transaction.readBytes()
@@ -103,12 +193,16 @@ class M3CanonicalAcknowledgementTest {
                 )
                 val committedBefore = fixture.budget.committedBytes
                 val physicalBefore = fixture.budget.allocatedBytes(fixture.directory)
+                val plan = adjacentPlan(fixture, initial)
+                val authority = plan.sourceAuthority as M3CompactCanonicalStore
                 try {
                     fixture.owner.commitAdjacentCanonicalMutation(
-                        adjacentPlan(fixture, initial), M3CanonicalCommitFaults(adjacent = fault),
+                        plan, M3CanonicalCommitFaults(adjacent = fault),
                     )
                     throw AssertionError("expected adjacent process crash")
                 } catch (_: M3CanonicalAdjacentProcessCrash) { }
+                assertEquals(M3PreparedMutationLifecycle.DISCARDED, plan.lifecycle())
+                assertEquals(0, authority.residentOwnership().liveStoreCount)
                 fixture.owner.close()
                 val reopened = opened(M3SurfaceOwnership.open(fixture.group, fixture.directory, fixture.budget))
                 assertEquals(initial.cut.geometryRevision + 1, requireNotNull(reopened.activationState()).cut.geometryRevision)
@@ -150,15 +244,19 @@ class M3CanonicalAcknowledgementTest {
             fixture.owner.acknowledgeCanonicalCurrent(
                 M3CanonicalAcknowledgement(current.identity.commandHash, initial.cut.geometryRevision, initial.cut.lineageRevision),
             )
+            val plan = adjacentPlan(fixture, initial)
+            val authority = plan.sourceAuthority as M3CompactCanonicalStore
             try {
                 fixture.owner.commitAdjacentCanonicalMutation(
-                    adjacentPlan(fixture, initial),
+                    plan,
                     M3CanonicalCommitFaults(selector = M3CanonicalSelectorFault.PROCESS_CRASH_AFTER_SELECTOR_SWITCH),
                 )
                 throw AssertionError("expected simulated process crash")
             } catch (_: M3CanonicalSimulatedProcessCrash) {
                 // Reopen owns the durable forward repair.
             }
+            assertEquals(M3PreparedMutationLifecycle.DISCARDED, plan.lifecycle())
+            assertEquals(0, authority.residentOwnership().liveStoreCount)
             fixture.owner.close()
             val reopened = opened(M3SurfaceOwnership.open(fixture.group, fixture.directory, fixture.budget))
             val repaired = requireNotNull(reopened.activationState())
@@ -177,16 +275,18 @@ class M3CanonicalAcknowledgementTest {
 
             val blocked = fixture.owner.commitAdjacentCanonicalMutation(plan) as M3CanonicalAdjacentCommitResult.Refused
             assertEquals(M3CanonicalAdjacentCommitRefusal.CURRENT_UNACKNOWLEDGED, blocked.reason)
+            assertEquals(M3PreparedMutationDisposition.RETRYABLE, blocked.disposition)
             val current = initial.current as M3CanonicalActivationCurrent.Receipt
             fixture.owner.acknowledgeCanonicalCurrent(
                 M3CanonicalAcknowledgement(current.identity.commandHash, initial.cut.geometryRevision, initial.cut.lineageRevision),
             )
             val committed = fixture.owner.commitAdjacentCanonicalMutation(plan) as M3CanonicalAdjacentCommitResult.Committed
+            assertEquals(M3PreparedMutationLifecycle.CONSUMED, plan.lifecycle())
             assertEquals(initial.cut.geometryRevision + 1, committed.state.cut.geometryRevision)
             assertTrue(committed.state.current is M3CanonicalActivationCurrent.Receipt)
             assertEquals(M3CanonicalCurrentState.Unacknowledged((committed.state.current as M3CanonicalActivationCurrent.Receipt).identity), committed.state.currentState)
             val duplicate = fixture.owner.commitAdjacentCanonicalMutation(plan) as M3CanonicalAdjacentCommitResult.Refused
-            assertEquals(M3CanonicalAdjacentCommitRefusal.CURRENT_UNACKNOWLEDGED, duplicate.reason)
+            assertEquals(M3CanonicalAdjacentCommitRefusal.PLAN_DISCARDED, duplicate.reason)
 
             fixture.owner.close()
             val reopened = opened(M3SurfaceOwnership.open(fixture.group, fixture.directory, fixture.budget))

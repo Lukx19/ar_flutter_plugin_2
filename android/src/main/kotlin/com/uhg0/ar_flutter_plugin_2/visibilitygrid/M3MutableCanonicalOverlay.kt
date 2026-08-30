@@ -556,16 +556,34 @@ internal class M3PreparedCanonicalMutation(
     val targetGeometryRevision: Long,
     val targetLineageRevision: Long,
     val work: M3CanonicalMutationWork,
-) {
-    private var sourceAuthorityReleased = false
+) : AutoCloseable {
+    private var lifecycle = M3PreparedMutationLifecycle.READY
     val dirtyRowCount get() = rows.size
     val removedSurfaceCount get() = removedIds.size
 
-    @Synchronized internal fun releaseSourceAuthority() {
-        if (!sourceAuthorityReleased) {
-            sourceAuthorityReleased = true
-            if (sourceAuthority is M3CompactCanonicalStore) sourceAuthority.close()
+    @Synchronized internal fun lifecycle() = lifecycle
+
+    @Synchronized internal fun consume(): Boolean {
+        if (lifecycle != M3PreparedMutationLifecycle.READY) return false
+        lifecycle = M3PreparedMutationLifecycle.CONSUMED
+        releaseSourceAuthority()
+        return true
+    }
+
+    @Synchronized internal fun discard(): M3PreparedMutationDiscardResult = when (lifecycle) {
+        M3PreparedMutationLifecycle.READY -> {
+            lifecycle = M3PreparedMutationLifecycle.DISCARDED
+            releaseSourceAuthority()
+            M3PreparedMutationDiscardResult.Discarded
         }
+        M3PreparedMutationLifecycle.DISCARDED -> M3PreparedMutationDiscardResult.AlreadyDiscarded
+        M3PreparedMutationLifecycle.CONSUMED -> M3PreparedMutationDiscardResult.AlreadyConsumed
+    }
+
+    override fun close() { discard() }
+
+    private fun releaseSourceAuthority() {
+            if (sourceAuthority is M3CompactCanonicalStore) sourceAuthority.close()
     }
 
     fun visitDirtyRows(sink: (M3PreparedRow) -> Boolean) = rows.visit(sink)
@@ -637,6 +655,13 @@ internal class M3PreparedCanonicalMutation(
         private const val CURRENT_MAGIC = 0x4d334350
         private const val BODY_VERSION = 2
     }
+}
+
+internal enum class M3PreparedMutationLifecycle { READY, CONSUMED, DISCARDED }
+internal sealed interface M3PreparedMutationDiscardResult {
+    data object Discarded : M3PreparedMutationDiscardResult
+    data object AlreadyDiscarded : M3PreparedMutationDiscardResult
+    data object AlreadyConsumed : M3PreparedMutationDiscardResult
 }
 
 internal data class M3PreparedRow(

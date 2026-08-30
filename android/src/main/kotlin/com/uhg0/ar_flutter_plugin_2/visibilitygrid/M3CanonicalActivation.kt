@@ -495,27 +495,35 @@ internal object M3CanonicalActivationSelector {
         plan: M3PreparedCanonicalMutation,
         faults: M3CanonicalCommitFaults = M3CanonicalCommitFaults(),
     ): M3CanonicalAdjacentCommitResult = withGroupLock(parent, group) {
+        if (plan.lifecycle() != M3PreparedMutationLifecycle.READY)
+            return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.PLAN_DISCARDED)
         val boundBase = plan.sourceAuthority as? M3CompactCanonicalStore
-            ?: return@withGroupLock M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.STALE_CUT)
+            ?: return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.STALE_CUT)
         if (boundBase.cut.group != group || boundBase.cut.profile != M3CompactCanonicalStore.PROFILE)
-            return@withGroupLock M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.STALE_CUT)
+            return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.STALE_CUT)
         if (!reconcileReclaimsLocked(group, parent, budget) || !reconcileAttemptsLocked(group, parent, budget) || !reconcileAcknowledgementsLocked(group, parent, budget) ||
             !reconcileAdjacentTransactionsLocked(group, parent, budget, boundBase = boundBase))
-            return@withGroupLock M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
+            return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
         val selector = ActivationSelector.read(selectorFile(parent, group))
-            ?: return@withGroupLock M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.NO_ACTIVE_AUTHORITY)
+            ?: return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.NO_ACTIVE_AUTHORITY)
         val root = ActivationRoot.read(rootFile(parent, group, selector.rootHash), selector.rootHash)
-            ?: return@withGroupLock M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
+            ?: return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
         val acknowledged = when (val current = root.current) {
             null -> null
             is CurrentRecord.Acknowledged -> current.identity
             is CurrentRecord.Unacknowledged ->
-                return@withGroupLock M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.CURRENT_UNACKNOWLEDGED)
+                return@withGroupLock adjacentRefusal(
+                    M3CanonicalAdjacentCommitRefusal.CURRENT_UNACKNOWLEDGED,
+                    M3PreparedMutationDisposition.RETRYABLE,
+                )
         }
         if (plan.sourceCut != root.cut)
-            return@withGroupLock M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.STALE_CUT)
+            return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.STALE_CUT)
         if (!observeAdjacentOwnership(boundBase, M3CanonicalAdjacentOwnershipStage.ADMISSION, plan))
-            return@withGroupLock M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
+            return@withGroupLock adjacentRefusal(
+                M3CanonicalAdjacentCommitRefusal.DUPLICATE_RESIDENT_AUTHORITY,
+                M3PreparedMutationDisposition.RETRYABLE,
+            )
         val attempt = AdjacentTransaction(
             group.hash.hex(), selector.rootHash, plan.sourceCut.rootHash, plan.commandHash,
             plan.commandFingerprint, acknowledged,
@@ -527,16 +535,14 @@ internal object M3CanonicalActivationSelector {
             else require(AdjacentTransaction.read(target, group.hash.hex()) == attempt)
             sync(parent, M3CanonicalActivationSyncStage.ADJACENT_INTENT)
             if (!observeAdjacentOwnership(boundBase, M3CanonicalAdjacentOwnershipStage.COMMIT, plan))
-                return@withGroupLock M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
+                return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
             val store = M3CanonicalCommitStore.open(parent, budget)
-                ?: return@withGroupLock M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
+                ?: return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
             store.use {
                 when (val committed = store.commit(plan, boundBase, faults, acknowledged?.toIntentReceipt())) {
                     is M3CanonicalCommitResult.Refused -> {
                         require(target.delete()); sync(parent, M3CanonicalActivationSyncStage.RECOVERY)
-                        return@withGroupLock M3CanonicalAdjacentCommitResult.Refused(
-                            M3CanonicalAdjacentCommitRefusal.COMMIT_REFUSED, committed,
-                        )
+                        return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.COMMIT_REFUSED, commit = committed)
                     }
                     is M3CanonicalCommitResult.Committed,
                     is M3CanonicalCommitResult.UnknownAfterSwitch -> Unit
@@ -544,17 +550,22 @@ internal object M3CanonicalActivationSelector {
             }
             if (!observeAdjacentOwnership(boundBase, M3CanonicalAdjacentOwnershipStage.RECONCILE, plan) ||
                 !reconcileAdjacentTransactionsLocked(group, parent, budget, faults.adjacent, boundBase))
-                return@withGroupLock M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
+                return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
             if (!observeAdjacentOwnership(boundBase, M3CanonicalAdjacentOwnershipStage.REOPEN, plan))
-                return@withGroupLock M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
+                return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
             val active = reopenLocked(group, parent, budget, boundBase) as? M3CanonicalActivationResult.Active
-                ?: return@withGroupLock M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
-            plan.releaseSourceAuthority()
+                ?: return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
             M3CanonicalAdjacentCommitResult.Committed(active.state)
         } catch (_: Exception) {
-            M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
+            adjacentRefusal(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
         }
     }
+
+    private fun adjacentRefusal(
+        reason: M3CanonicalAdjacentCommitRefusal,
+        disposition: M3PreparedMutationDisposition = M3PreparedMutationDisposition.TERMINAL,
+        commit: M3CanonicalCommitResult.Refused? = null,
+    ) = M3CanonicalAdjacentCommitResult.Refused(reason, commit, disposition)
 
     /** A prepared adjacent mutation borrows exactly one live compact authority until completion. */
     private fun observeAdjacentOwnership(
@@ -1325,11 +1336,14 @@ internal sealed interface M3CanonicalAdjacentCommitResult {
     data class Refused(
         val reason: M3CanonicalAdjacentCommitRefusal,
         val commit: M3CanonicalCommitResult.Refused? = null,
+        val disposition: M3PreparedMutationDisposition = M3PreparedMutationDisposition.TERMINAL,
     ) : M3CanonicalAdjacentCommitResult
 }
 internal enum class M3CanonicalAdjacentCommitRefusal {
     NO_ACTIVE_AUTHORITY, CURRENT_UNACKNOWLEDGED, STALE_CUT, COMMIT_REFUSED, DURABILITY_FAILURE,
+    DUPLICATE_RESIDENT_AUTHORITY, PLAN_DISCARDED,
 }
+internal enum class M3PreparedMutationDisposition { RETRYABLE, TERMINAL }
 internal enum class M3CanonicalAdjacentFault {
     PROCESS_CRASH_BEFORE_SELECTOR_SWITCH,
     PROCESS_CRASH_AFTER_SELECTOR_SWITCH,

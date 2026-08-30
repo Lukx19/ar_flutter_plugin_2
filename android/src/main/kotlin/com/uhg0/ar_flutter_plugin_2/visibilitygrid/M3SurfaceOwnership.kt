@@ -43,6 +43,9 @@ internal class M3SurfaceOwnership private constructor(
     private var geometryRevision = restored.geometryRevision
     private var lineageRevision = restored.lineageRevision
     private var closed = false
+    private val retryableAdjacentPlans = java.util.Collections.newSetFromMap(
+        java.util.IdentityHashMap<M3PreparedCanonicalMutation, Boolean>(),
+    )
 
     /** Applies one complete candidate set atomically, or returns a typed refusal. */
     @Synchronized
@@ -271,11 +274,37 @@ internal class M3SurfaceOwnership private constructor(
         plan: M3PreparedCanonicalMutation,
         faults: M3CanonicalCommitFaults = M3CanonicalCommitFaults(),
     ): M3CanonicalAdjacentCommitResult {
-        if (closed) return M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.NO_ACTIVE_AUTHORITY)
-        val parent = v6Parent ?: return M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.NO_ACTIVE_AUTHORITY)
-        val budget = v6Budget ?: return M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.NO_ACTIVE_AUTHORITY)
-        return M3CanonicalActivationSelector.commitAdjacent(group, parent, budget, plan, faults).also { result ->
-            if (result is M3CanonicalAdjacentCommitResult.Committed) activation = result.state
+        if (closed) {
+            plan.discard()
+            return M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.NO_ACTIVE_AUTHORITY)
+        }
+        val parent = v6Parent
+        val budget = v6Budget
+        if (parent == null || budget == null) {
+            plan.discard()
+            return M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.NO_ACTIVE_AUTHORITY)
+        }
+        return try {
+            M3CanonicalActivationSelector.commitAdjacent(group, parent, budget, plan, faults).also { result ->
+                when (result) {
+                    is M3CanonicalAdjacentCommitResult.Committed -> {
+                        check(plan.consume())
+                        retryableAdjacentPlans.remove(plan)
+                        activation = result.state
+                    }
+                    is M3CanonicalAdjacentCommitResult.Refused -> when (result.disposition) {
+                        M3PreparedMutationDisposition.RETRYABLE -> retryableAdjacentPlans += plan
+                        M3PreparedMutationDisposition.TERMINAL -> {
+                            retryableAdjacentPlans.remove(plan)
+                            plan.discard()
+                        }
+                    }
+                }
+            }
+        } catch (failure: Throwable) {
+            retryableAdjacentPlans.remove(plan)
+            plan.discard()
+            throw failure
         }
     }
 
@@ -285,6 +314,8 @@ internal class M3SurfaceOwnership private constructor(
         if (closed) return M3SurfaceOwnershipCloseResult.AlreadyClosed
         closed = true
         try {
+            retryableAdjacentPlans.forEach(M3PreparedCanonicalMutation::discard)
+            retryableAdjacentPlans.clear()
             store?.close()
         } finally {
             legacyLeaseRelease?.invoke()

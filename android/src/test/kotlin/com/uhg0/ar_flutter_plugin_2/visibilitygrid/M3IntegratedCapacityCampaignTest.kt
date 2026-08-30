@@ -78,12 +78,15 @@ class M3IntegratedCapacityCampaignTest {
                             try {
                                 val refused = owner.commitAdjacentCanonicalMutation(mutation)
                                     as M3CanonicalAdjacentCommitResult.Refused
-                                assertEquals(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE, refused.reason)
+                                assertEquals(M3CanonicalAdjacentCommitRefusal.DUPLICATE_RESIDENT_AUTHORITY, refused.reason)
+                                assertEquals(M3PreparedMutationDisposition.RETRYABLE, refused.disposition)
+                                assertEquals(M3PreparedMutationLifecycle.READY, mutation.lifecycle())
                                 assertEquals(2, ownership.single().liveStoreCount)
                                 assertEquals(memory.residentTotalBytes * 2, ownership.single().liveStoreBytes)
                             } finally { duplicate.close() }
                             ownership.clear()
                             assertTrue(owner.commitAdjacentCanonicalMutation(mutation) is M3CanonicalAdjacentCommitResult.Committed)
+                            assertEquals(M3PreparedMutationLifecycle.CONSUMED, mutation.lifecycle())
                         } finally { M3CanonicalActivationTestHooks.onAdjacentOwnership = null }
                         assertEquals(M3CanonicalAdjacentOwnershipStage.entries.toSet(), ownership.map { it.stage }.toSet())
                         assertTrue(ownership.all { it.liveStoreCount == 1 && it.liveStoreBytes == memory.residentTotalBytes })
