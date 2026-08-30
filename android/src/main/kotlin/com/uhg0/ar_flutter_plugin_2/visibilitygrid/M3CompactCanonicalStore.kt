@@ -12,6 +12,8 @@ import java.nio.file.StandardOpenOption
 
 internal interface M3CanonicalStateView : AutoCloseable {
     val cut: M3CompactCanonicalCut
+    /** Exact compact authority borrowed by any overlays composing this view. */
+    val generationZeroAuthority: M3CanonicalStateView get() = this
 
     fun findById(id: M3SurfaceId): M3CompactSurface?
 
@@ -55,6 +57,32 @@ internal data class M3CanonicalReadWork(
     )
 
     companion object { val ZERO = M3CanonicalReadWork(0, 0, 0, 0) }
+}
+
+/** Scalar-only observation of live compact authorities for one physical group directory. */
+internal data class M3CanonicalResidentOwnership(
+    val liveStoreCount: Int,
+    val retainedBytes: Long,
+)
+
+private object M3CanonicalResidentOwnershipRegistry {
+    private val owners = mutableMapOf<String, java.util.IdentityHashMap<Any, Long>>()
+
+    @Synchronized fun acquire(key: String, owner: Any, retainedBytes: Long) {
+        require(retainedBytes >= 0)
+        require(owners.getOrPut(key) { java.util.IdentityHashMap() }.put(owner, retainedBytes) == null)
+    }
+
+    @Synchronized fun release(key: String, owner: Any) {
+        val group = owners[key] ?: return
+        group.remove(owner)
+        if (group.isEmpty()) owners.remove(key)
+    }
+
+    @Synchronized fun snapshot(key: String): M3CanonicalResidentOwnership {
+        val group = owners[key]
+        return M3CanonicalResidentOwnership(group?.size ?: 0, group?.values?.sum() ?: 0L)
+    }
 }
 
 internal data class M3CompactCanonicalCut(
@@ -533,12 +561,31 @@ private constructor(
     private val sourceDirectoryCount: Int,
     private val storageReceipt: M3CompactStorageReceipt,
 ) : M3CanonicalStateView {
+    private val residentOwnershipKey = rootDirectory.absoluteFile.toPath().normalize().toString() + ':' + cut.group.value
+    private val residentOwnershipIdentity = Any()
     private val cache = M3CanonicalPageCache(File(rootDirectory, PAGES_FILE))
     @Volatile private var closed = false
+    private var authorityReferences = 1
     private var directLookupWork = 0L
     private var pageReadWork = 0L
     private var inspectedRowWork = 0L
     private var byteReadWork = 0L
+
+    init {
+        M3CanonicalResidentOwnershipRegistry.acquire(
+            residentOwnershipKey, residentOwnershipIdentity, retainedMemoryReceipt().residentTotalBytes,
+        )
+    }
+
+    internal fun residentOwnership(): M3CanonicalResidentOwnership =
+        M3CanonicalResidentOwnershipRegistry.snapshot(residentOwnershipKey)
+
+    /** Keeps this exact mapped authority resident while a prepared plan crosses its caller scope. */
+    @Synchronized internal fun retainAuthority(): M3CompactCanonicalStore {
+        check(!closed)
+        authorityReferences = Math.addExact(authorityReferences, 1)
+        return this
+    }
 
     override fun findById(id: M3SurfaceId): M3CompactSurface? {
         directLookupWork++
@@ -743,9 +790,12 @@ private constructor(
         byteReadWork,
     )
 
-    override fun close() {
-        closed = true
-        cache.close()
+    @Synchronized override fun close() {
+        if (!closed && --authorityReferences == 0) {
+            closed = true
+            cache.close()
+            M3CanonicalResidentOwnershipRegistry.release(residentOwnershipKey, residentOwnershipIdentity)
+        }
     }
 
     private fun row(slot: Int) =

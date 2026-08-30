@@ -571,6 +571,7 @@ private fun compareSurfaceKey(ax: Int, ay: Int, az: Int, aid: Long, bx: Int, by:
 }
 
 private class M3CowOverlay(private val base: M3CanonicalStateView, private val delta: M3CanonicalCowGeneration) : M3CanonicalStateView {
+    override val generationZeroAuthority: M3CanonicalStateView get() = base.generationZeroAuthority
     override val cut get() = delta.root.targetCut()
     override fun findById(id: M3SurfaceId): M3CompactSurface? = delta.readOr(null) { findByIdOpen(id) }
     private fun findByIdOpen(id: M3SurfaceId): M3CompactSurface? {

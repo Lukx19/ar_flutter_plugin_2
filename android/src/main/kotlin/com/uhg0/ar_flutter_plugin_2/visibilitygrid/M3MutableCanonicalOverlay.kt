@@ -295,6 +295,8 @@ internal class M3MutableCanonicalOverlay private constructor(
             supports.constructionArrayPeakBytes, rowConstructionBytes, removedConstructionBytes,
         )
         return M3CanonicalMutationPreparation.Prepared(M3PreparedCanonicalMutation(
+            (view.generationZeroAuthority as? M3CompactCanonicalStore)?.retainAuthority()
+                ?: view.generationZeroAuthority,
             view.cut, M3CanonicalReceiptBytes(overlayHash(commandId.encodeToByteArray())),
             M3CanonicalReceiptBytes(fingerprint), commandId, kind, rowTable, removedIds,
             supports, supportMode, removedSupportRecords.toIntExact(), high, live, sourceCount, supportCount, lineageCount,
@@ -534,6 +536,8 @@ internal data class M3CanonicalMutationWork(
 )
 
 internal class M3PreparedCanonicalMutation(
+    /** Exact live generation-zero authority used to prepare this immutable mutation. */
+    internal val sourceAuthority: M3CanonicalStateView,
     val sourceCut: M3CompactCanonicalCut,
     val commandHash: M3CanonicalReceiptBytes,
     val commandFingerprint: M3CanonicalReceiptBytes,
@@ -553,8 +557,16 @@ internal class M3PreparedCanonicalMutation(
     val targetLineageRevision: Long,
     val work: M3CanonicalMutationWork,
 ) {
+    private var sourceAuthorityReleased = false
     val dirtyRowCount get() = rows.size
     val removedSurfaceCount get() = removedIds.size
+
+    @Synchronized internal fun releaseSourceAuthority() {
+        if (!sourceAuthorityReleased) {
+            sourceAuthorityReleased = true
+            if (sourceAuthority is M3CompactCanonicalStore) sourceAuthority.close()
+        }
+    }
 
     fun visitDirtyRows(sink: (M3PreparedRow) -> Boolean) = rows.visit(sink)
 

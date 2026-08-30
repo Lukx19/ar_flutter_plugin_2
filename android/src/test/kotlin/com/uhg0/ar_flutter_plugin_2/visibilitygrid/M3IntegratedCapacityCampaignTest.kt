@@ -37,6 +37,9 @@ class M3IntegratedCapacityCampaignTest {
                     assertEquals(300_000, migrated.cut.supportCount)
                     val memory = base.retainedMemoryReceipt()
                     val storage = base.allocatedStorageReceipt()
+                    val commitReopenOwnerBytes = requireNotNull(M3CanonicalCommitStore.open(directory, budget)).use {
+                        GraphLayout.parseInstance(it).totalSize()
+                    }
                     assertEquals(14_565_056L, memory.residentTotalBytes)
                     assertTrue(storage.directoryBytes <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
 
@@ -65,7 +68,25 @@ class M3IntegratedCapacityCampaignTest {
                                 M3CanonicalTarget(M3SurfaceId(1), M3Voxel(0, 0, 0), 0x13, 0x34, 197),
                             ),
                         ) as M3CanonicalMutationPreparation.Prepared).mutation
-                        assertTrue(owner.commitAdjacentCanonicalMutation(mutation) is M3CanonicalAdjacentCommitResult.Committed)
+                        val ownership = mutableListOf<M3CanonicalAdjacentOwnershipObservation>()
+                        M3CanonicalActivationTestHooks.onAdjacentOwnership = ownership::add
+                        try {
+                            // The production seam itself must reject a second maximum-resident
+                            // authority; closing a test fixture is not the ownership invariant.
+                            val duplicate = (M3CompactCanonicalStore.openV6(group, directory, budget)
+                                as M3CompactCanonicalOpenResult.Opened).store
+                            try {
+                                val refused = owner.commitAdjacentCanonicalMutation(mutation)
+                                    as M3CanonicalAdjacentCommitResult.Refused
+                                assertEquals(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE, refused.reason)
+                                assertEquals(2, ownership.single().liveStoreCount)
+                                assertEquals(memory.residentTotalBytes * 2, ownership.single().liveStoreBytes)
+                            } finally { duplicate.close() }
+                            ownership.clear()
+                            assertTrue(owner.commitAdjacentCanonicalMutation(mutation) is M3CanonicalAdjacentCommitResult.Committed)
+                        } finally { M3CanonicalActivationTestHooks.onAdjacentOwnership = null }
+                        assertEquals(M3CanonicalAdjacentOwnershipStage.entries.toSet(), ownership.map { it.stage }.toSet())
+                        assertTrue(ownership.all { it.liveStoreCount == 1 && it.liveStoreBytes == memory.residentTotalBytes })
                         val after = requireNotNull(owner.activationState())
                         val next = after.current as M3CanonicalActivationCurrent.Receipt
                         assertEquals(100_000, after.cut.liveSurfaceCount)
@@ -76,17 +97,20 @@ class M3IntegratedCapacityCampaignTest {
                         val intentBytes = directory.listFiles().orEmpty()
                             .filter { it.isDirectory && it.name.endsWith(".intent") }
                             .sumOf(budget::allocatedBytes)
+                        val instrumentedPhaseBytes = ownership.maxOf { observation -> maxOf(
+                            observation.retainedPlanBytes + observation.writerScratchBytes,
+                            observation.constructionPeakBytes,
+                        ) }
                         val sharedPhaseBytes = maxOf(
                             selected.identity.canonicalLength,
                             next.identity.canonicalLength,
-                            mutation.work.constructionPeakBytes,
-                            Math.addExact(mutation.work.retainedPlanBytes, mutation.work.writerScratchBytes),
+                            instrumentedPhaseBytes,
                             intentBytes,
                         )
                         val ownerBytes = GraphLayout.parseInstance(owner, before, after).totalSize()
                         val completePeakBytes = Math.addExact(
                             memory.residentTotalBytes,
-                            Math.addExact(ownerBytes, sharedPhaseBytes),
+                            Math.addExact(ownerBytes, Math.addExact(commitReopenOwnerBytes, sharedPhaseBytes)),
                         )
                         assertTrue("shared phase=$sharedPhaseBytes", sharedPhaseBytes <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
                         assertTrue("complete peak=$completePeakBytes", completePeakBytes <= M3CompactCanonicalStore.C17_TOTAL_BYTES)
@@ -105,7 +129,9 @@ class M3IntegratedCapacityCampaignTest {
                         assertEquals(chargedPhysicalBytes, coordinator.committedBytes())
                         println(
                             "M3_INTEGRATED_MAXIMUM=resident=${memory.residentTotalBytes} " +
-                                "owner=$ownerBytes sharedPhase=$sharedPhaseBytes completePeak=$completePeakBytes " +
+                                "liveStores=${ownership.maxOf { it.liveStoreCount }} owner=$ownerBytes " +
+                                "commitReopenOwner=$commitReopenOwnerBytes " +
+                                "sharedPhase=$sharedPhaseBytes completePeak=$completePeakBytes " +
                                 "directory=${storage.directoryBytes} committed=${coordinator.committedBytes()} " +
                                 "chargedPhysical=$chargedPhysicalBytes",
                         )
