@@ -172,19 +172,19 @@ class M3CanonicalStoreMigrationTest {
     }
 
     @Test
-    fun `duplicate legacy ownership and canonical command hashes are corrupt`() {
+    fun `duplicate ownership hashes are corrupt while canonical duplicates remain readable`() {
         listOf(true, false).forEach { ownership ->
             val directory = Files.createTempDirectory("m3-duplicate-receipt").toFile()
             try {
                 val group = M3SurfaceGroup("duplicate-${if (ownership) "ownership" else "canonical"}")
                 writeDuplicateReceiptV5Fixture(directory, group, ownership)
-                val refused =
-                    M3CompactCanonicalStore.prepareV6SiblingMigration(
-                        group,
-                        directory,
-                        acceptingBudget(),
-                    ) as M3CompactCanonicalMigrationResult.Refused
-                assertEquals(M3CompactCanonicalRefusal.CORRUPT, refused.reason)
+                val result = M3CompactCanonicalStore.prepareV6SiblingMigration(
+                    group, directory, acceptingBudget(),
+                )
+                if (ownership) assertEquals(
+                    M3CompactCanonicalRefusal.CORRUPT,
+                    (result as M3CompactCanonicalMigrationResult.Refused).reason,
+                ) else assertTrue(result is M3CompactCanonicalMigrationResult.Prepared)
             } finally {
                 directory.deleteRecursively()
             }

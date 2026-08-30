@@ -426,15 +426,9 @@ internal object M3SurfaceOwnershipLegacyCodec {
         validateUniqueHashes(ownershipReceiptCount) { visitor ->
             scanOwnershipReceiptHashes(snapshot, ownershipReceiptOffset, configuration, visitor)
         }
-        if (version >= 2) validateUniqueHashes(canonicalReceiptCount) { visitor ->
-            scanCanonicalReceiptHashes(
-                snapshot,
-                canonicalReceiptOffset,
-                version,
-                configuration,
-                visitor,
-            )
-        }
+        // Canonical command hashes are selected by activation preparation. Exact duplicates are
+        // legal there, while changed bytes, forks, and ambiguity receive typed refusals.
+        // Ownership receipt hashes remain unique because they have no such selection layer.
 
         val resident =
             M3CompactResident(
