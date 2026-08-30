@@ -28,6 +28,7 @@ internal class M3LegacyCanonicalState(
     private val supportCursor: ((Long, M3PagedSource) -> Unit) -> Unit,
     private val sourceLookup: (Long) -> M3PagedSource?,
     private val explicitSourceIndex: M3LegacySourceIndex?,
+    private val canonicalReceiptCursor: ((M3LegacyCanonicalReceipt) -> Unit) -> Unit,
 ) {
     fun visitSources(visitor: (M3PagedSource) -> Unit) = sourceCursor(visitor)
 
@@ -37,6 +38,28 @@ internal class M3LegacyCanonicalState(
     fun sourceById(id: Long): M3PagedSource? = sourceLookup(id)
 
     fun sourceIndexReceipt(): M3LegacySourceIndexReceipt? = explicitSourceIndex?.receipt()
+
+    /** Reopens immutable legacy receipt evidence one entry at a time. */
+    fun visitCanonicalReceipts(visitor: (M3LegacyCanonicalReceipt) -> Unit) =
+        canonicalReceiptCursor(visitor)
+}
+
+/**
+ * One validated legacy receipt.  The bytes are deliberately available only as a stream: callers
+ * can retain a selected current receipt, but cannot accidentally materialize receipt history.
+ */
+internal class M3LegacyCanonicalReceipt(
+    val commandHash: M3CanonicalReceiptBytes,
+    val commandFingerprint: M3CanonicalReceiptBytes,
+    val geometryRevision: Long,
+    val lineageRevision: Long,
+    val nextHighWater: Long,
+    val liveSurfaceCount: Int,
+    val canonicalLength: Long,
+    val canonicalHash: M3CanonicalReceiptBytes,
+    private val copyCanonicalTo: (java.io.OutputStream) -> Unit,
+) {
+    fun writeCanonicalTo(output: java.io.OutputStream) = copyCanonicalTo(output)
 }
 
 internal data class M3LegacySourceIndexReceipt(
@@ -533,6 +556,19 @@ internal object M3SurfaceOwnershipLegacyCodec {
         // The sorted stream or primitive index proves unique source identity. This single eager
         // support pass binds every membership before quota reservation; the later pass writes v6.
         supportCursor { _, _ -> }
+        val canonicalReceiptCursor: ((M3LegacyCanonicalReceipt) -> Unit) -> Unit = { visitor ->
+            when (version) {
+                2 -> scanV2CanonicalReceipts(snapshot, canonicalReceiptOffset, configuration, group, visitor)
+                3 -> scanV3CanonicalReceipts(
+                    snapshot, canonicalReceiptOffset, configuration, group, nextHigh, geometry,
+                    lineageRevision, visitor,
+                )
+                in 4..5 -> scanStoredCanonicalReceipts(
+                    snapshot, canonicalReceiptOffset, configuration, group, nextHigh, geometry,
+                    lineageRevision, visitor,
+                )
+            }
+        }
         return M3LegacyCanonicalState(
             group,
             ledgerHigh,
@@ -548,6 +584,7 @@ internal object M3SurfaceOwnershipLegacyCodec {
             supportCursor,
             sourceLookup,
             explicitSourceIndex,
+            canonicalReceiptCursor,
         )
     }
 
@@ -730,7 +767,7 @@ internal object M3SurfaceOwnershipLegacyCodec {
         geometryRevision: Long,
         lineageRevision: Long,
         expected: M3InlineCanonicalReceipt? = null,
-    ) {
+    ): M3CanonicalReceiptHeader {
         val body = DataInputStream(M3LegacyLimitedInputStream(source, bytes.toLong()))
         require(body.readInt() == 0x4d334352 && body.readInt() == 1)
         require(body.readUTF() == group.value)
@@ -796,6 +833,7 @@ internal object M3SurfaceOwnershipLegacyCodec {
                 edgeCount == it.edgeCount && edges.finish().contentEquals(it.edgeDigest) &&
                 supportCount == it.supportCount && supports.finish().contentEquals(it.supportDigest))
         }
+        return M3CanonicalReceiptHeader(geometry, lineage, high, live)
     }
 
     private fun skipOwners(data: DataInputStream, count: Int) {
@@ -856,6 +894,229 @@ internal object M3SurfaceOwnershipLegacyCodec {
                 }
             }
         }
+    }
+
+    /** v4/v5 retain canonical bodies inline, so selection can retain only a re-openable range. */
+    private fun scanStoredCanonicalReceipts(
+        file: File,
+        offset: Long,
+        configuration: M3SurfaceOwnershipConfiguration,
+        group: M3SurfaceGroup,
+        nextHigh: Long,
+        geometryRevision: Long,
+        lineageRevision: Long,
+        visitor: (M3LegacyCanonicalReceipt) -> Unit,
+    ) {
+        FileInputStream(file).use { input ->
+            input.channel.position(offset)
+            val data = DataInputStream(input)
+            repeat(bounded(data.readInt(), 0, configuration.transactionCapacity)) {
+                val commandHash = M3CanonicalReceiptBytes(ByteArray(32).also(data::readFully))
+                val fingerprint = M3CanonicalReceiptBytes(ByteArray(32).also(data::readFully))
+                val length = bounded(data.readInt(), 0, configuration.changeJournalByteCapacity)
+                val bodyOffset = input.channel.position()
+                val digest = MessageDigest.getInstance("SHA-256")
+                val body = DataInputStream(java.security.DigestInputStream(
+                    M3LegacyLimitedInputStream(input, length.toLong()), digest,
+                ))
+                val header = validateCanonicalReceipt(
+                    body, length, configuration, group, nextHigh, geometryRevision, lineageRevision,
+                )
+                require(input.channel.position() == bodyOffset + length)
+                val canonicalHash = M3CanonicalReceiptBytes(digest.digest())
+                visitor(
+                    M3LegacyCanonicalReceipt(
+                        commandHash, fingerprint, header.geometry, header.lineage, header.high,
+                        header.live, length.toLong(), canonicalHash,
+                    ) { output ->
+                        FileInputStream(file).use { source ->
+                            source.channel.position(bodyOffset)
+                            val buffer = ByteArray(16_384)
+                            var remaining = length
+                            val copied = MessageDigest.getInstance("SHA-256")
+                            while (remaining > 0) {
+                                val read = source.read(buffer, 0, minOf(buffer.size, remaining))
+                                require(read > 0)
+                                copied.update(buffer, 0, read)
+                                output.write(buffer, 0, read)
+                                remaining -= read
+                            }
+                            require(M3CanonicalReceiptBytes(copied.digest()) == canonicalHash)
+                        }
+                    },
+                )
+            }
+        }
+    }
+
+    private fun scanV3CanonicalReceipts(
+        file: File,
+        offset: Long,
+        configuration: M3SurfaceOwnershipConfiguration,
+        group: M3SurfaceGroup,
+        nextHigh: Long,
+        geometryRevision: Long,
+        lineageRevision: Long,
+        visitor: (M3LegacyCanonicalReceipt) -> Unit,
+    ) {
+        FileInputStream(file).use { input ->
+            input.channel.position(offset)
+            val data = DataInputStream(input)
+            repeat(bounded(data.readInt(), 0, configuration.transactionCapacity)) {
+                val commandHash = M3CanonicalReceiptBytes(ByteArray(32).also(data::readFully))
+                val fingerprint = M3CanonicalReceiptBytes(ByteArray(32).also(data::readFully))
+                val header = skipInlineReceipt(data, configuration, group, nextHigh)
+                val supportCount = bounded(data.readInt(), 0, configuration.lineageCapacity)
+                repeat(supportCount) { readSource(data) }
+                val length = bounded(data.readInt(), 0, configuration.changeJournalByteCapacity)
+                val bodyOffset = input.channel.position()
+                val digest = MessageDigest.getInstance("SHA-256")
+                val body = DataInputStream(java.security.DigestInputStream(
+                    M3LegacyLimitedInputStream(input, length.toLong()), digest,
+                ))
+                val verified = validateCanonicalReceipt(
+                    body, length, configuration, group, nextHigh, geometryRevision, lineageRevision,
+                )
+                require(verified == header)
+                val canonicalHash = M3CanonicalReceiptBytes(digest.digest())
+                visitor(fileReceipt(file, commandHash, fingerprint, header, bodyOffset, length, canonicalHash))
+            }
+        }
+    }
+
+    private fun scanV2CanonicalReceipts(
+        file: File,
+        offset: Long,
+        configuration: M3SurfaceOwnershipConfiguration,
+        group: M3SurfaceGroup,
+        visitor: (M3LegacyCanonicalReceipt) -> Unit,
+    ) {
+        FileInputStream(file).use { input ->
+            input.channel.position(offset)
+            val data = DataInputStream(input)
+            repeat(bounded(data.readInt(), 0, configuration.transactionCapacity)) {
+                val recordOffset = input.channel.position()
+                val commandHash = M3CanonicalReceiptBytes(ByteArray(32).also(data::readFully))
+                val fingerprint = M3CanonicalReceiptBytes(ByteArray(32).also(data::readFully))
+                val header = skipInlineReceipt(data, configuration, group, Long.MAX_VALUE)
+                val digest = MessageDigest.getInstance("SHA-256")
+                val length = copyV2CanonicalReceipt(file, recordOffset, group, configuration, output = java.security.DigestOutputStream(
+                    java.io.OutputStream.nullOutputStream(), digest,
+                ))
+                val canonicalHash = M3CanonicalReceiptBytes(digest.digest())
+                visitor(
+                    M3LegacyCanonicalReceipt(
+                        commandHash, fingerprint, header.geometry, header.lineage, header.high,
+                        header.live, length, canonicalHash,
+                    ) { output ->
+                        val copied = MessageDigest.getInstance("SHA-256")
+                        val actual = copyV2CanonicalReceipt(file, recordOffset, group, configuration,
+                            java.security.DigestOutputStream(output, copied))
+                        require(actual == length && M3CanonicalReceiptBytes(copied.digest()) == canonicalHash)
+                    },
+                )
+            }
+        }
+    }
+
+    private fun fileReceipt(
+        file: File,
+        commandHash: M3CanonicalReceiptBytes,
+        fingerprint: M3CanonicalReceiptBytes,
+        header: M3CanonicalReceiptHeader,
+        bodyOffset: Long,
+        length: Int,
+        canonicalHash: M3CanonicalReceiptBytes,
+    ) = M3LegacyCanonicalReceipt(
+        commandHash, fingerprint, header.geometry, header.lineage, header.high, header.live,
+        length.toLong(), canonicalHash,
+    ) { output ->
+        FileInputStream(file).use { source ->
+            source.channel.position(bodyOffset)
+            val buffer = ByteArray(16_384)
+            var remaining = length
+            val copied = MessageDigest.getInstance("SHA-256")
+            while (remaining > 0) {
+                val read = source.read(buffer, 0, minOf(buffer.size, remaining))
+                require(read > 0)
+                copied.update(buffer, 0, read); output.write(buffer, 0, read); remaining -= read
+            }
+            require(M3CanonicalReceiptBytes(copied.digest()) == canonicalHash)
+        }
+    }
+
+    /** Reads the v2/v3 expanded fields without retaining targets, lineage, or support history. */
+    private fun skipInlineReceipt(
+        data: DataInputStream,
+        configuration: M3SurfaceOwnershipConfiguration,
+        group: M3SurfaceGroup,
+        maximumHigh: Long,
+    ): M3CanonicalReceiptHeader {
+        data.readUTF().also { require(it.isNotEmpty()) }
+        bounded(data.readInt(), 0, M3CanonicalOperation.entries.lastIndex)
+        val targetCount = bounded(data.readInt(), 0, configuration.surfaceCapacity)
+        repeat(targetCount) { skipOwner(data, group) }
+        repeat(bounded(data.readInt(), 0, configuration.surfaceCapacity)) { data.readLong() }
+        repeat(bounded(data.readInt(), 0, configuration.lineageCapacity)) { data.readLong(); data.readLong() }
+        val geometry = data.readLong()
+        val lineage = data.readLong()
+        val high = data.readLong()
+        val live = bounded(data.readInt(), 0, configuration.surfaceCapacity)
+        require(geometry >= 0 && lineage >= 0 && high in 1..maximumHigh)
+        return M3CanonicalReceiptHeader(geometry, lineage, high, live)
+    }
+
+    private fun skipOwner(data: DataInputStream, group: M3SurfaceGroup) {
+        data.readLong()
+        require(data.readUTF() == group.value)
+        data.skipFully(9 * 4 + 32)
+    }
+
+    /** Reconstructs v2's canonical body directly into the caller stream; no intermediate body exists. */
+    private fun copyV2CanonicalReceipt(
+        file: File,
+        recordOffset: Long,
+        group: M3SurfaceGroup,
+        configuration: M3SurfaceOwnershipConfiguration,
+        output: java.io.OutputStream,
+    ): Long {
+        val counting = object : java.io.FilterOutputStream(output) {
+            var count = 0L
+            override fun write(value: Int) { out.write(value); count++ }
+            override fun write(bytes: ByteArray, offset: Int, length: Int) {
+                out.write(bytes, offset, length); count += length
+            }
+        }
+        val header = FileInputStream(file).use { headerInput ->
+            headerInput.channel.position(recordOffset)
+            val headerData = DataInputStream(headerInput)
+            headerData.skipFully(64)
+            skipInlineReceipt(headerData, configuration, group, Long.MAX_VALUE)
+        }
+        FileInputStream(file).use { input ->
+            input.channel.position(recordOffset)
+            val source = DataInputStream(input)
+            source.skipFully(64)
+            val out = java.io.DataOutputStream(counting)
+            out.writeInt(0x4d334352); out.writeInt(1); out.writeUTF(group.value)
+            val command = source.readUTF(); out.writeUTF(command)
+            out.writeInt(source.readInt())
+            val targets = source.readInt()
+            out.writeLong(header.geometry); out.writeLong(header.lineage)
+            out.writeLong(header.high); out.writeInt(header.live); out.writeInt(targets)
+            repeat(targets) {
+                out.writeLong(source.readLong()); out.writeUTF(source.readUTF())
+                repeat(9) { out.writeInt(source.readInt()) }
+                val fingerprint = ByteArray(32).also(source::readFully); out.write(fingerprint)
+            }
+            val removed = source.readInt(); out.writeInt(removed)
+            repeat(removed) { out.writeLong(source.readLong()) }
+            val edges = source.readInt(); out.writeInt(edges)
+            repeat(edges) { out.writeLong(source.readLong()); out.writeLong(source.readLong()) }
+            out.writeInt(0) // v2 has no immutable support list
+            out.flush()
+        }
+        return counting.count
     }
 
     /** Exact duplicate rejection for bounded streaming hash scans. */
@@ -1051,6 +1312,7 @@ internal object M3SurfaceOwnershipLegacyCodec {
             {},
             { null },
             null,
+            {},
         )
 
     private fun authorityHash(vararg files: File): ByteArray {
@@ -1125,6 +1387,13 @@ private data class M3InlineCanonicalReceipt(
     val edgeDigest: ByteArray,
     val supportCount: Int,
     val supportDigest: ByteArray,
+)
+
+private data class M3CanonicalReceiptHeader(
+    val geometry: Long,
+    val lineage: Long,
+    val high: Long,
+    val live: Int,
 )
 
 /** Small rolling semantic receipt digest; retained scratch is one hash state plus eight bytes. */
