@@ -18,6 +18,7 @@ class M0aCurrentDeltaReceiptV1(
     val selector: M0aCurrentDeltaSelectorV1,
     val baseGeometryRevision: Long,
     bytes: ByteArray,
+    commandHash: ByteArray,
 ) {
     init {
         require(baseGeometryRevision >= 0 && baseGeometryRevision < selector.targetGeometryRevision) {
@@ -26,12 +27,23 @@ class M0aCurrentDeltaReceiptV1(
         require(bytes.size <= M0aStructuralTransactionLimits.MAX_STRUCTURAL_TRANSACTION_BYTES) {
             "Current delta exceeds the structural transaction ceiling"
         }
+        require(commandHash.size == COMMAND_HASH_BYTES) {
+            "Current delta command hash is not SHA-256"
+        }
     }
 
     private val immutableBytes = bytes.copyOf()
+    private val immutableCommandHash = commandHash.copyOf()
 
     /** A defensive copy; journal-owned storage never crosses the seam. */
     val bytes: ByteArray get() = immutableBytes.copyOf()
+
+    /** Immutable command identity for retry-conflict qualification. */
+    val commandHash: ByteArray get() = immutableCommandHash.copyOf()
+
+    private companion object {
+        const val COMMAND_HASH_BYTES = 32
+    }
 }
 
 /**

@@ -87,6 +87,14 @@ class VisibilityGridV2Binding internal constructor(
     private var initialTransactionQueued = false
     @Volatile private var acknowledgedEmptyBaseline: M3CommittedEmptyBaseline? = null
     @Volatile private var expectedEmptyBootstrap: M0aCurrentDeltaSelectorV1? = null
+    /**
+     * The one acknowledged M3 cut and, while its successor is in flight, the
+     * one bounded current delta retained by the stream. This deliberately
+     * retains only scalar identity and a command digest: BEGIN/CHUNK/COMMIT
+     * own the sole canonical-byte copy.
+     */
+    @Volatile private var acknowledgedM3Cut: M0aCurrentDeltaSelectorV1? = null
+    @Volatile private var pendingM3Cut: M3CurrentDeltaCut? = null
     @Volatile private var m3AcknowledgementListener: ((M0aCurrentDeltaSelectorV1) -> Unit)? = null
     private var acceptedControls = 0L
     private var closedResources = 0L
@@ -238,21 +246,63 @@ class VisibilityGridV2Binding internal constructor(
         m3AcknowledgementListener = listener
     }
 
-    /** Queues exactly one receipt after the ACK opened M3's adjacent slot. */
+    /**
+     * Queues the exact adjacent durable receipt, or proves an in-flight retry
+     * is byte-identical without disturbing the stream's current transaction.
+     */
     @Synchronized
     internal fun queueCommittedCurrentDelta(
         source: M0aCurrentDeltaSourceV1,
         selector: M0aCurrentDeltaSelectorV1,
     ) {
-        replacementBinding?.let { return it.queueCommittedCurrentDelta(source, selector) }
-        val baseline = requireNotNull(acknowledgedEmptyBaseline) { "M1 bootstrap is not acknowledged" }
-        check(currentObservationOwnership() != null) { "V2 observation cut is unavailable" }
-        check(
-            selector.transactionId == baseline.transactionId + 1 &&
-                selector.targetGeometryRevision == baseline.geometryRevision + 1 &&
-                selector.targetLineageRevision == baseline.lineageRevision
-        ) { "Feature-only M3 delta is not adjacent to the acknowledged empty baseline" }
-        streamChannel.queueCurrentDelta(source, selector, M0aTransactionResponseProfileV1.ordinary)
+        check(!disposed.get() && replacementBinding == null) { "V2 binding is not current" }
+        check(lifecycle.state() == M0aControlLifecycle.State.ACTIVE) {
+            "V2 observation cut is unavailable"
+        }
+        check(streamChannel.canQueueStructuralTransaction()) {
+            "V2 stream requires binding rollover"
+        }
+        val acknowledged = requireNotNull(acknowledgedM3Cut) {
+            "M1 bootstrap is not acknowledged"
+        }
+        val receipt = requireNotNull(source.selectCurrentDelta(selector)) {
+            "The named current delta is not retained"
+        }
+        check(receipt.selector == selector) { "Current-delta source returned a different receipt" }
+        val bytes = receipt.bytes
+        val candidate = M3CurrentDeltaCut(
+            selector = selector,
+            baseGeometryRevision = receipt.baseGeometryRevision,
+            commandHash = receipt.commandHash,
+        )
+        pendingM3Cut?.let { pending ->
+            check(pending.matches(candidate) &&
+                streamChannel.hasExactQueuedCurrentDelta(
+                    selector,
+                    receipt.baseGeometryRevision,
+                    bytes,
+                )
+            ) { "M3 current delta replay is not byte-exact" }
+            return
+        }
+        check(selector.transactionId == nextPortableOrdinal(acknowledged.transactionId)) {
+            "M3 current delta is not the next transaction"
+        }
+        check(receipt.baseGeometryRevision == acknowledged.targetGeometryRevision) {
+            "M3 current delta does not start at the acknowledged geometry cut"
+        }
+        check(selector.targetGeometryRevision == nextPortableOrdinal(acknowledged.targetGeometryRevision)) {
+            "M3 current delta is not the next geometry cut"
+        }
+        check(selector.targetLineageRevision >= acknowledged.targetLineageRevision) {
+            "M3 current delta regresses lineage"
+        }
+        streamChannel.queueCurrentDelta(
+            M0aCurrentDeltaSourceV1 { requested -> receipt.takeIf { requested == selector } },
+            selector,
+            M0aTransactionResponseProfileV1.ordinary,
+        )
+        pendingM3Cut = candidate
     }
 
     @Synchronized
@@ -274,8 +324,13 @@ class VisibilityGridV2Binding internal constructor(
                 geometryRevision = baseline.geometryRevision,
                 lineageRevision = baseline.lineageRevision,
             )
+            acknowledgedM3Cut = selector
             return
         }
+        val pending = pendingM3Cut ?: return
+        if (pending.selector != selector) return
+        pendingM3Cut = null
+        acknowledgedM3Cut = selector
         m3AcknowledgementListener?.invoke(selector)
     }
 
@@ -792,6 +847,8 @@ class VisibilityGridV2Binding internal constructor(
         initialTransactionQueued = false
         expectedEmptyBootstrap = null
         acknowledgedEmptyBaseline = null
+        acknowledgedM3Cut = null
+        pendingM3Cut = null
         acceptedControls = 0L
         activeControlRequestId = null
         synchronized(this) {
@@ -1085,6 +1142,22 @@ class VisibilityGridV2Binding internal constructor(
     private class BindingAbandonedException : IllegalStateException("V2 binding is abandoned")
 
     private class StaleReceiptException : IllegalStateException()
+
+    private data class M3CurrentDeltaCut(
+        val selector: M0aCurrentDeltaSelectorV1,
+        val baseGeometryRevision: Long,
+        val commandHash: ByteArray,
+    ) {
+        fun matches(other: M3CurrentDeltaCut): Boolean =
+            selector == other.selector &&
+                baseGeometryRevision == other.baseGeometryRevision &&
+                commandHash.contentEquals(other.commandHash)
+    }
+
+    private fun nextPortableOrdinal(value: Long): Long {
+        check(value < Long.MAX_VALUE) { "M3 current delta requires binding rollover" }
+        return value + 1
+    }
 
     internal data class RecoveryGroupCut(
         val sessionId: M0aUuid?,

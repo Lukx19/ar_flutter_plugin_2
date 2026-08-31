@@ -6,6 +6,9 @@ import com.uhg0.ar_flutter_plugin_2.m0.M0aCommitReceiptQueryV1
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlCodec
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlOperation
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlRequest
+import com.uhg0.ar_flutter_plugin_2.m0.M0aCurrentDeltaReceiptV1
+import com.uhg0.ar_flutter_plugin_2.m0.M0aCurrentDeltaSelectorV1
+import com.uhg0.ar_flutter_plugin_2.m0.M0aCurrentDeltaSourceV1
 import com.uhg0.ar_flutter_plugin_2.m0.M0aPacketCodec
 import com.uhg0.ar_flutter_plugin_2.m0.M0aStartRequestCodecV2
 import com.uhg0.ar_flutter_plugin_2.m0.M0aTransactionResponseProfileV1
@@ -867,6 +870,175 @@ class VisibilityGridV2BindingTest {
             )
             assertTrue(stale.completed.await(2, TimeUnit.SECONDS))
             assertEquals(null, stale.bytes)
+        } finally {
+            binding.dispose()
+        }
+    }
+
+    @Test
+    fun `M3 chained current delta accepts only exact acknowledged successors`() {
+        val messenger = MethodTestMessenger()
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 127,
+            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            postToMain = { task -> task() },
+        )
+        try {
+            val snapshot = binding.snapshot()
+            val qualifier = snapshot.nativeStreamToken + snapshot.workerBindingToken
+            val start = RecordingResult()
+            MethodChannel(messenger, "visibility_grid_v2_control_127").invokeMethod(
+                "start",
+                qualifier + M0aControlCodec.encodeRequest(startRequest()),
+                start,
+            )
+            assertTrue(start.completed.await(2, TimeUnit.SECONDS))
+            val streamToken = M0aControlCodec.decodeResponse(
+                stripQualifier(start.successValue as ByteArray, qualifier),
+            ).streamToken
+
+            fun exchange(
+                sequence: Long,
+                transaction: Long,
+                geometry: Long,
+                lineage: Long,
+            ): ByteArray {
+                val reply = RecordingBinaryReply()
+                messenger.send(
+                    "visibility_surface_stream_127",
+                    ByteBuffer.wrap(
+                        qualifier + M0aPacketCodec.encodeRequest(
+                            M0aPacketCodec.Request(
+                                requestFlags = 0,
+                                streamToken = streamToken,
+                                acknowledgedTransactionId = transaction,
+                                acknowledgedGeometryRevision = geometry,
+                                acknowledgedLineageRevision = lineage,
+                                nextStyleRevision = 0,
+                                maximumResponseBytes =
+                                    M0aTransactionResponseProfileV1.ordinary.responseCeilingBytes,
+                                styleRecords = emptyList(),
+                                commandBytes = byteArrayOf(),
+                                requestSequence = sequence,
+                            ),
+                        ),
+                    ),
+                    reply,
+                )
+                assertTrue(reply.completed.await(2, TimeUnit.SECONDS))
+                return stripQualifier(reply.bytes!!, qualifier)
+            }
+
+            // The empty M1 transaction is the first acknowledged current cut.
+            assertEquals(2, M0aPacketCodec.decodeResponse(exchange(1, 0, 0, 0)).messageKind)
+            assertEquals(4, M0aPacketCodec.decodeResponse(exchange(2, 0, 0, 0)).messageKind)
+            assertEquals(0, M0aPacketCodec.decodeResponse(exchange(3, 1, 1, 1)).messageKind)
+            assertEquals(1L, requireNotNull(binding.m3CommittedEmptyBaseline()).transactionId)
+
+            fun source(
+                selector: M0aCurrentDeltaSelectorV1,
+                baseGeometry: Long,
+                bytes: ByteArray,
+                commandHash: ByteArray = ByteArray(32) { bytes.sum().toByte() },
+            ) = M0aCurrentDeltaSourceV1 { requested ->
+                M0aCurrentDeltaReceiptV1(selector, baseGeometry, bytes, commandHash)
+                    .takeIf { requested == selector }
+            }
+
+            val create = M0aCurrentDeltaSelectorV1(2, 2, 1)
+            val createBytes = byteArrayOf(2, 7, 1)
+            val createCommandHash = ByteArray(32) { 2 }
+            binding.queueCommittedCurrentDelta(
+                source(create, 1, createBytes, createCommandHash),
+                create,
+            )
+            // The same durable receipt is an idempotent retry, not a second queue.
+            binding.queueCommittedCurrentDelta(
+                source(create, 1, createBytes, createCommandHash),
+                create,
+            )
+
+            fun refused(block: () -> Unit) {
+                val failure = runCatching(block).exceptionOrNull()
+                assertTrue(failure is IllegalStateException)
+            }
+
+            refused {
+                binding.queueCommittedCurrentDelta(
+                    source(create, 1, byteArrayOf(9), createCommandHash),
+                    create,
+                )
+            }
+            refused {
+                binding.queueCommittedCurrentDelta(
+                    source(create, 1, createBytes, ByteArray(32) { 9 }),
+                    create,
+                )
+            }
+            refused {
+                binding.queueCommittedCurrentDelta(
+                    source(M0aCurrentDeltaSelectorV1(2, 2, 2), 1, createBytes),
+                    M0aCurrentDeltaSelectorV1(2, 2, 2),
+                )
+            }
+            refused {
+                binding.queueCommittedCurrentDelta(
+                    source(M0aCurrentDeltaSelectorV1(3, 3, 1), 2, byteArrayOf(3)),
+                    M0aCurrentDeltaSelectorV1(3, 3, 1),
+                )
+            }
+            refused {
+                binding.queueCommittedCurrentDelta(
+                    source(M0aCurrentDeltaSelectorV1(1, 1, 1), 0, byteArrayOf(1)),
+                    M0aCurrentDeltaSelectorV1(1, 1, 1),
+                )
+            }
+
+            val beginCreate = exchange(4, 1, 1, 1)
+            assertArrayEquals(beginCreate, exchange(4, 1, 1, 1))
+            assertEquals(2L, M0aPacketCodec.decodeResponse(beginCreate).transactionId)
+            assertEquals(3, M0aPacketCodec.decodeResponse(exchange(5, 1, 1, 1)).messageKind)
+            assertEquals(4, M0aPacketCodec.decodeResponse(exchange(6, 1, 1, 1)).messageKind)
+            assertEquals(0, M0aPacketCodec.decodeResponse(exchange(7, 2, 2, 1)).messageKind)
+
+            val refine = M0aCurrentDeltaSelectorV1(3, 3, 2)
+            binding.queueCommittedCurrentDelta(source(refine, 2, byteArrayOf(3, 4)), refine)
+            val beginRefine = M0aPacketCodec.decodeResponse(exchange(8, 2, 2, 1))
+            assertEquals(2, beginRefine.messageKind)
+            assertEquals(3L, beginRefine.transactionId)
+            assertEquals(3L, beginRefine.targetGeometryRevision)
+            assertEquals(2L, beginRefine.targetLineageRevision)
+            assertEquals(3, M0aPacketCodec.decodeResponse(exchange(9, 2, 2, 1)).messageKind)
+            assertEquals(4, M0aPacketCodec.decodeResponse(exchange(10, 2, 2, 1)).messageKind)
+            assertEquals(0, M0aPacketCodec.decodeResponse(exchange(11, 3, 3, 2)).messageKind)
+
+            val stopPayload = ByteArray(88).also { bytes ->
+                ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN).apply {
+                    put(0, 2)
+                    put(1, 1)
+                    putLong(8, 1)
+                }
+            }
+            val stopped = RecordingResult()
+            MethodChannel(messenger, "visibility_grid_v2_control_127").invokeMethod(
+                "stop",
+                qualifier + M0aControlCodec.encodeRequest(
+                    startRequest().copy(
+                        operation = M0aControlOperation.STOP,
+                        controlRequestId = uuid(90),
+                        streamToken = streamToken,
+                        payload = stopPayload,
+                    ),
+                ),
+                stopped,
+            )
+            assertTrue(stopped.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(1, stopped.successCount)
+            refused {
+                val successor = M0aCurrentDeltaSelectorV1(4, 4, 2)
+                binding.queueCommittedCurrentDelta(source(successor, 3, byteArrayOf(4)), successor)
+            }
         } finally {
             binding.dispose()
         }

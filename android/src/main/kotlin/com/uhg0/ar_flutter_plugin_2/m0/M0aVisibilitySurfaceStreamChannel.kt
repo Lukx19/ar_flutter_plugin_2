@@ -198,6 +198,46 @@ class M0aVisibilitySurfaceStreamChannel(
         debugTransportProbe?.receipt(synchronized(this) { committedBaseline })
 
     /**
+     * A binding-side admission guard: terminal drain consumes the portable
+     * request sequence, so a later transaction must wait for a fresh binding.
+     */
+    internal fun canQueueStructuralTransaction(): Boolean = synchronized(this) {
+        !disposed.get() && !bindingAbandoned.get() &&
+            lastSequence != Long.MAX_VALUE && nextExpectedSequence != Long.MAX_VALUE
+    }
+
+    /**
+     * Compares an in-flight retry against the sole stream-owned current bytes
+     * without making another payload copy or exposing frame storage.
+     */
+    internal fun hasExactQueuedCurrentDelta(
+        selector: M0aCurrentDeltaSelectorV1,
+        baseGeometryRevision: Long,
+        bytes: ByteArray,
+    ): Boolean = synchronized(structuralFrames) {
+        val begin = (structuralFrames.firstOrNull() as? M0aTransactionBeginFrameV1)?.value
+            ?: return@synchronized false
+        if (begin.transactionId != selector.transactionId ||
+            begin.baseGeometryRevision != baseGeometryRevision ||
+            begin.targetGeometryRevision != selector.targetGeometryRevision ||
+            begin.targetLineageRevision != selector.targetLineageRevision ||
+            begin.totalBytes != bytes.size
+        ) return@synchronized false
+        var offset = 0
+        structuralFrames.drop(1).dropLast(1).forEach { frame ->
+            val chunk = (frame as? M0aTransactionChunkFrameV1)?.value
+                ?: return@synchronized false
+            if (offset + chunk.bytes.size > bytes.size ||
+                chunk.bytes.indices.any { index -> bytes[offset + index] != chunk.bytes[index] }
+            ) {
+                return@synchronized false
+            }
+            offset += chunk.bytes.size
+        }
+        offset == bytes.size
+    }
+
+    /**
      * Queues one bounded structural transaction for worker-pull delivery.
      * Frames are consumed only after their response is encoded and accepted;
      * an exact request replay therefore never advances the producer.

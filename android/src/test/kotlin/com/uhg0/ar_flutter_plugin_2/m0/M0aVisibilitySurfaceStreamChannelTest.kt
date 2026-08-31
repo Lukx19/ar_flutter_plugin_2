@@ -368,7 +368,12 @@ class M0aVisibilitySurfaceStreamChannelTest {
         val source = M0aCurrentDeltaSourceV1 { selector ->
             journal.firstOrNull { it.selector == selector }?.let { entry ->
                 copied += entry.selector
-                M0aCurrentDeltaReceiptV1(entry.selector, entry.baseGeometryRevision, entry.bytes)
+                M0aCurrentDeltaReceiptV1(
+                    entry.selector,
+                    entry.baseGeometryRevision,
+                    entry.bytes,
+                    ByteArray(32) { entry.selector.transactionId.toByte() },
+                )
             }
         }
         val messenger = TestMessenger(128)
@@ -402,6 +407,18 @@ class M0aVisibilitySurfaceStreamChannelTest {
             ),
         )
         assertEquals(M0aPacketCodec.noChangesMessageKind, acknowledged.messageKind)
+        binding.dispose()
+    }
+
+    @Test
+    fun `terminal drain refuses a new current delta before stream staging`() {
+        val messenger = TestMessenger(129)
+        val binding = M0aVisibilitySurfaceStreamChannel(messenger, 129)
+        val terminal = binding.executeDebugTerminalDrain(129)
+
+        assertEquals(M0aPacketCodec.noChangesMessageKind, terminal.messageKind)
+        assertEquals(5, terminal.resultFlags)
+        assertTrue(!binding.canQueueStructuralTransaction())
         binding.dispose()
     }
 

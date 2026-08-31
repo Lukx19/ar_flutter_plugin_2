@@ -7,6 +7,7 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import java.io.File
+import java.security.MessageDigest
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -282,6 +283,7 @@ internal class M3VisibilityGridIntegration(
                 selector,
                 canonical.geometryRevision - 1,
                 canonical.canonicalBytes.toByteArray(),
+                MessageDigest.getInstance("SHA-256").digest(canonical.commandId.encodeToByteArray()),
             ),
         )
         pending = selector
