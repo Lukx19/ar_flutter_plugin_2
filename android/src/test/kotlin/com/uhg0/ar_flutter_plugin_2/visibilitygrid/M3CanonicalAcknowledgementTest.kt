@@ -9,6 +9,47 @@ import org.junit.Test
 
 class M3CanonicalAcknowledgementTest {
     @Test
+    fun `feature batch becomes one exact adjacent current and survives replay before ACK`() {
+        val fixture = activated("feature-batch-current")
+        try {
+            val before = requireNotNull(fixture.owner.activationState())
+            val current = before.current as M3CanonicalActivationCurrent.Receipt
+            assertTrue(fixture.owner.acknowledgeCanonicalCurrent(
+                M3CanonicalAcknowledgement(current.identity.commandHash, before.cut.geometryRevision, before.cut.lineageRevision),
+            ) is M3CanonicalAcknowledgementResult.Acknowledged)
+            val plan = withAdjacentView(fixture, before) { view ->
+                (fixture.owner.prepareAdjacentMutation(view, M3CanonicalFeatureBatchCommand(
+                    "feature-batch-${before.cut.geometryRevision}", before.cut.geometryRevision, before.cut.lineageRevision,
+                    listOf(
+                        M3FeatureFusionChange.Upsert(M3FeatureFusionCandidate(1, 0, 0, 2, 1,
+                            listOf(M3FeatureNormalCandidate(1, 0, 0, M3FeatureNormalFace.PRIMARY, 0, 0, 191)))),
+                        M3FeatureFusionChange.Upsert(M3FeatureFusionCandidate(2, 0, 0, 2, 1,
+                            listOf(M3FeatureNormalCandidate(2, 0, 0, M3FeatureNormalFace.PRIMARY, 0, 0, 191)))),
+                        M3FeatureFusionChange.Removal(3, 0, 0),
+                    ),
+                )) as M3CanonicalMutationPreparation.Prepared).mutation
+            }
+            val committed = fixture.owner.commitAdjacentCanonicalMutation(plan) as M3CanonicalAdjacentCommitResult.Committed
+            val published = committed.state.current as M3CanonicalActivationCurrent.Receipt
+            assertEquals(before.cut.geometryRevision + 1, committed.state.cut.geometryRevision)
+            assertEquals(before.cut.lineageRevision, committed.state.cut.lineageRevision)
+            assertEquals(2, committed.state.cut.liveSurfaceCount)
+            fixture.owner.close()
+            val replayedOwner = opened(M3SurfaceOwnership.open(fixture.group, fixture.directory, fixture.budget))
+            val replayed = requireNotNull(replayedOwner.activationState())
+            assertEquals(committed.state.cut, replayed.cut)
+            assertEquals(published.identity, (replayed.current as M3CanonicalActivationCurrent.Receipt).identity)
+            assertTrue(replayedOwner.acknowledgeCanonicalCurrent(
+                M3CanonicalAcknowledgement(published.identity.commandHash, replayed.cut.geometryRevision, replayed.cut.lineageRevision),
+            ) is M3CanonicalAcknowledgementResult.Acknowledged)
+            replayedOwner.close()
+        } finally {
+            fixture.owner.close()
+            fixture.directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `ACK publication linearizes query and adjacent prepare with its durable selector`() {
         val fixture = activated("ack-linearized-readers")
         try {

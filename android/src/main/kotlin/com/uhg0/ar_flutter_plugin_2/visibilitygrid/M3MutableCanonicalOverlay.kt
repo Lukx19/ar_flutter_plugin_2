@@ -102,6 +102,96 @@ internal class M3MutableCanonicalOverlay private constructor(
         )
     }
 
+    /**
+     * Plans one ordered kernel delta as one adjacent canonical transaction.
+     *
+     * Removal remains deliberately represented at this seam, but is a durable
+     * canonical retention/no-op: M3 has no structural removal semantics yet.
+     * It therefore never deletes an owner, support, source, or lineage row.
+     */
+    private fun prepareFeatureBatch(command: M3CanonicalFeatureBatchCommand): M3CanonicalMutationPreparation {
+        if (!validCommandId(command.commandId) ||
+            command.expectedGeometryRevision != view.cut.geometryRevision ||
+            command.expectedLineageRevision != view.cut.lineageRevision
+        ) return refuse(if (!validCommandId(command.commandId)) M3CanonicalMutationRefusal.INVALID_COMMAND else M3CanonicalMutationRefusal.REVISION_CONFLICT)
+
+        if (command.changes.size > configuration.surfaceCapacity) return refuse(M3CanonicalMutationRefusal.CAPACITY)
+        val upserts = ArrayList<M3CanonicalTarget>(command.changes.size)
+        val seenVoxels = HashSet<M3Voxel>()
+        for (change in command.changes) {
+            val voxel = M3Voxel(change.x, change.y, change.z)
+            if (!seenVoxels.add(voxel)) return refuse(M3CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
+            targetSetInsertions++
+            when (change) {
+                is M3FeatureFusionChange.Removal -> Unit
+                is M3FeatureFusionChange.Upsert -> {
+                    val primary = change.candidate.primaryCanonicalTarget()
+                        ?: return refuse(M3CanonicalMutationRefusal.INVALID_NORMAL)
+                    // A candidate is self-describing; accepting a mismatched
+                    // primary would make the kernel delta non-canonical.
+                    if (primary.voxel != voxel) return refuse(M3CanonicalMutationRefusal.INVALID_COMMAND)
+                    targetDeepCopies++
+                    upserts += primary.copy(voxel = primary.voxel.copy())
+                }
+            }
+        }
+        // This is intentional, observable policy, not caller-side filtering.
+        // A removal-only (or empty) kernel delta publishes no current receipt.
+        if (upserts.isEmpty()) return M3CanonicalMutationPreparation.NoOp(state())
+        if (view.cut.geometryRevision >= configuration.revisionLimit) return refuse(M3CanonicalMutationRefusal.REVISION_EXHAUSTED)
+
+        val material = ArrayList<M3CanonicalTarget>(upserts.size)
+        var allocations = 0
+        for (target in upserts) {
+            val location = m3CompactLocation(configuration, target.voxel)
+                ?: return refuse(M3CanonicalMutationRefusal.INVALID_OWNERSHIP)
+            val normal = packed(target) ?: return refuse(M3CanonicalMutationRefusal.INVALID_NORMAL)
+            directLookups++
+            val existing = view.findByVoxel(target.voxel)
+            if (existing == null) {
+                allocations++
+                material += target
+            } else if (existing.packedNormal != normal.first ||
+                reliabilityBand(existing.normalConfidence) != reliabilityBand(normal.second)
+            ) {
+                material += target.copy(id = existing.id)
+            }
+            check(location.page in 0..26)
+        }
+        if (material.isEmpty()) return M3CanonicalMutationPreparation.NoOp(state())
+        val high = checkedHighWater(view.cut.nextSurfaceIdHighWater, allocations)
+            ?: return refuse(M3CanonicalMutationRefusal.EXHAUSTED)
+        val finalLive = view.cut.liveSurfaceCount.toLong() + allocations.toLong()
+        if (finalLive > configuration.surfaceCapacity || finalLive > Int.MAX_VALUE) return refuse(M3CanonicalMutationRefusal.CAPACITY)
+        val finalSources = view.cut.sourceCount.toLong() + allocations.toLong()
+        if (finalSources > sourceCapacity() || finalSources > Int.MAX_VALUE) return refuse(M3CanonicalMutationRefusal.LINEAGE_EXHAUSTED)
+        val finalSupport = view.cut.supportCount.toLong() + allocations.toLong()
+        if (finalSupport > sourceCapacity() || finalSupport > Int.MAX_VALUE) return refuse(M3CanonicalMutationRefusal.LINEAGE_EXHAUSTED)
+        val estimatedBytes = encodedRecordBytes(material.size, 0, allocations.toLong(), allocations.toLong(), 0, command.commandId)
+            ?: return refuse(M3CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
+        if (!journalFits(estimatedBytes)) return refuse(M3CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
+
+        var next = view.cut.nextSurfaceIdHighWater
+        val commandHash = overlayHash(command.commandId.encodeToByteArray())
+        val rows = material.sortedWith(compareBy<M3CanonicalTarget> { it.voxel.x }
+            .thenBy { it.voxel.y }.thenBy { it.voxel.z }).map { target ->
+            val id = target.id ?: M3SurfaceId(next++)
+            val location = requireNotNull(m3CompactLocation(configuration, target.voxel))
+            val normal = requireNotNull(packed(target))
+            val provenance = if (target.id == null) commandHash else readAllocationFingerprint(id)
+                ?: return refuse(M3CanonicalMutationRefusal.SOURCE_READ_FAILURE)
+            M3SurfaceOwner(id, view.cut.group, target.voxel, location.region, location.page, normal.first, normal.second, provenance).also {
+                ownerConstructions++
+            }
+        }.sortedBy { it.id.value }
+        return finish(
+            command.commandId, M3PreparedMutationKind.FEATURE_BATCH, command.fingerprint(), rows, emptyList(),
+            M3PreparedSourceTable.EMPTY, M3PreparedSupportMode.NEW_ONLY, high, finalLive.toInt(),
+            finalSources.toInt(), finalSupport.toInt(), view.cut.lineageCount,
+            view.cut.geometryRevision + 1, view.cut.lineageRevision,
+        )
+    }
+
     private fun prepareStructural(input: M3CanonicalTransactionCommand): M3CanonicalMutationPreparation {
         if (!validCommandId(input.commandId) || input.targets.isEmpty()) return refuse(M3CanonicalMutationRefusal.INVALID_COMMAND)
         if (input.expectedGeometryRevision != view.cut.geometryRevision || input.expectedLineageRevision != view.cut.lineageRevision) return refuse(M3CanonicalMutationRefusal.REVISION_CONFLICT)
@@ -252,6 +342,7 @@ internal class M3MutableCanonicalOverlay private constructor(
         val dirtySupportRecords = when (supportMode) {
             M3PreparedSupportMode.NONE -> 0L
             M3PreparedSupportMode.SELF -> rows.size.toLong()
+            M3PreparedSupportMode.NEW_ONLY -> rows.count { it.id.value >= view.cut.nextSurfaceIdHighWater }.toLong()
             M3PreparedSupportMode.CARTESIAN -> checkedProduct(supports.size, rows.size)
                 ?: return refuse(M3CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
         }
@@ -455,6 +546,9 @@ internal class M3MutableCanonicalOverlay private constructor(
         fun prepare(view: M3CanonicalStateView, configuration: M3SurfaceOwnershipConfiguration, command: M3CanonicalTransactionCommand) =
             M3MutableCanonicalOverlay(view, configuration).prepareStructural(command)
 
+        fun prepare(view: M3CanonicalStateView, configuration: M3SurfaceOwnershipConfiguration, command: M3CanonicalFeatureBatchCommand) =
+            M3MutableCanonicalOverlay(view, configuration).prepareFeatureBatch(command)
+
         private fun validCommandId(value: String) = value.isNotBlank() && utf8Length(value) <= MAX_COMMAND_BYTES
 
         /** Allocation-free equivalent of the JDK UTF-8 encoder length for admission. */
@@ -494,13 +588,33 @@ internal data class M3FeatureMutationCommand(
     }.encodeToByteArray())
 }
 
+/** Private bridge from one immutable kernel delta to one canonical v6 plan. */
+internal data class M3CanonicalFeatureBatchCommand(
+    val commandId: String,
+    val expectedGeometryRevision: Long,
+    val expectedLineageRevision: Long,
+    val changes: List<M3FeatureFusionChange>,
+) {
+    internal fun fingerprint(): ByteArray = overlayHash(buildString {
+        append(commandId).append('|').append(expectedGeometryRevision).append('|').append(expectedLineageRevision).append('|')
+        changes.forEach { change -> when (change) {
+            is M3FeatureFusionChange.Removal -> append('R').append(':').append(change.x).append(':').append(change.y).append(':').append(change.z)
+            is M3FeatureFusionChange.Upsert -> {
+                val primary = change.candidate.primaryCanonicalTarget()
+                append('U').append(':').append(change.x).append(':').append(change.y).append(':').append(change.z).append(':')
+                append(primary?.normalOctX).append(':').append(primary?.normalOctY).append(':').append(primary?.normalConfidence)
+            }
+        }.append(';') }
+    }.encodeToByteArray())
+}
+
 internal enum class M3PreparedMutationKind {
-    FEATURE_ADD, FEATURE_REFINE, CREATE, RELOCATION, MERGE, SPLIT, REPLACEMENT;
+    FEATURE_ADD, FEATURE_REFINE, CREATE, RELOCATION, MERGE, SPLIT, REPLACEMENT, FEATURE_BATCH;
     companion object { fun from(value: M3CanonicalOperation) = entries.first { it.name == value.name } }
 }
 
 internal data class M3PreparedSupport(val target: M3SurfaceId, val source: M3ImmutableSourceSupport)
-internal enum class M3PreparedSupportMode { NONE, SELF, CARTESIAN }
+internal enum class M3PreparedSupportMode { NONE, SELF, NEW_ONLY, CARTESIAN }
 
 internal data class M3CanonicalMutationWork(
     val dirtyRows: Int,
@@ -646,6 +760,9 @@ internal class M3PreparedCanonicalMutation(
             M3PreparedSupportMode.SELF -> rows.visit { row ->
                 sink(M3PreparedSupport(row.id, row.toSupport()))
             }
+            M3PreparedSupportMode.NEW_ONLY -> rows.visit { row ->
+                if (row.id.value < sourceCut.nextSurfaceIdHighWater) true else sink(M3PreparedSupport(row.id, row.toSupport()))
+            }
             M3PreparedSupportMode.CARTESIAN -> rows.visit { row ->
                 var keepGoing = true
                 supports.visit { source ->
@@ -690,6 +807,7 @@ internal class M3PreparedCanonicalMutation(
         when (supportMode) {
             M3PreparedSupportMode.NONE -> Unit
             M3PreparedSupportMode.SELF -> rows.writeSelfSupport(out)
+            M3PreparedSupportMode.NEW_ONLY -> rows.writeNewSelfSupport(out, sourceCut.nextSurfaceIdHighWater)
             M3PreparedSupportMode.CARTESIAN -> rows.writeCartesianSupport(out, supports)
         }
         out.writeInt(work.dirtySourceRecords); rows.writeNewSources(out, sourceCut.nextSurfaceIdHighWater)
@@ -749,6 +867,12 @@ internal class M3PreparedRowTable private constructor(
 
     fun writeSelfSupport(out: DataOutputStream) {
         for (index in ids.indices) { out.writeLong(ids[index]); writeSource(out, index) }
+    }
+
+    fun writeNewSelfSupport(out: DataOutputStream, highWater: Long) {
+        for (index in ids.indices) if (ids[index] >= highWater) {
+            out.writeLong(ids[index]); writeSource(out, index)
+        }
     }
 
     fun writeCartesianSupport(out: DataOutputStream, supports: M3PreparedSourceTable) {

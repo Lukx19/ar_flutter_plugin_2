@@ -202,6 +202,10 @@ internal class M3PreparedIntentStreamingVisitor(
         return when (kind) {
             M3PreparedMutationKind.FEATURE_ADD -> rows == 1 && removed == 0 && supports == 1 && sources == 1 && lineage == 0 && header.targetLive == header.sourceCut.liveSurfaceCount + 1 && header.targetSupport == header.sourceCut.supportCount + 1 && header.targetLineage == header.sourceCut.lineageCount
             M3PreparedMutationKind.FEATURE_REFINE -> rows == 1 && removed == 0 && supports == 0 && sources == 0 && lineage == 0 && header.targetLive == header.sourceCut.liveSurfaceCount && header.targetSupport == header.sourceCut.supportCount && header.targetLineage == header.sourceCut.lineageCount
+            M3PreparedMutationKind.FEATURE_BATCH -> rows > 0 && removed == 0 && lineage == 0 &&
+                supports == sources && header.targetLive == header.sourceCut.liveSurfaceCount + sources &&
+                header.targetSupport == header.sourceCut.supportCount + sources &&
+                header.targetLineage == header.sourceCut.lineageCount
             M3PreparedMutationKind.CREATE -> header.sourceCut.liveSurfaceCount == 0 && header.sourceCut.sourceCount == 0 && header.sourceCut.supportCount == 0 && header.sourceCut.lineageCount == 0 && removed == 0 && rows > 0 && supports == rows && sources == rows && lineage == 0 && header.targetLive == rows && header.targetSupport == rows && header.targetLineage == 0
             else -> rows > 0 && removed > 0 && lineage.toLong() == rows.toLong() * removed.toLong() && header.targetLive == header.sourceCut.liveSurfaceCount - removed + rows && header.targetLineage == header.sourceCut.lineageCount + lineage
         }

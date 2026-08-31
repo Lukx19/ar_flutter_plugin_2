@@ -354,6 +354,15 @@ internal class M3SurfaceOwnership private constructor(
         M3MutableCanonicalOverlay.prepare(view, configuration, command), view,
     )
 
+    /** Private #128 seam: one kernel delta batch plans one adjacent v6 commit. */
+    @Synchronized
+    internal fun prepareAdjacentMutation(
+        view: M3CanonicalStateView,
+        command: M3CanonicalFeatureBatchCommand,
+    ): M3CanonicalMutationPreparation = bindAdjacentPreparation(
+        M3MutableCanonicalOverlay.prepare(view, configuration, command), view,
+    )
+
     private fun bindAdjacentPreparation(
         preparation: M3CanonicalMutationPreparation,
         view: M3CanonicalStateView,
