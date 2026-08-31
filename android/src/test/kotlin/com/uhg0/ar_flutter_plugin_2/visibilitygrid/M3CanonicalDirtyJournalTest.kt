@@ -20,6 +20,43 @@ import org.junit.Test
 
 class M3CanonicalDirtyJournalTest {
     @Test
+    fun `allocation checkpoint remains valid when a later authority advances past its prefix`() {
+        val group = M3SurfaceGroup("checkpoint-prefix")
+        val record = M3AllocationRecord(
+            revision = 1,
+            start = 1,
+            endExclusive = 1_201,
+            groupHash = group.hash,
+            commandHash = sha256("command".encodeToByteArray()),
+            fingerprint = sha256("fingerprint".encodeToByteArray()),
+            previousHash = ByteArray(32),
+        )
+        val storedAtFirstCut = M3AllocationCheckpoint.from(
+            M3AllocationChain(
+                records = emptyList(),
+                highWater = record.endExclusive,
+                lastRevision = record.revision,
+                lastHash = record.recordHash,
+                history = M3AllocationHistoryReceipt(1, M3AllocationRecord.ENCODED_BYTES.toLong(), M3SurfaceAllocationAuthority.HISTORY_PHASE_PEAK_BYTES),
+                authorityHighWaterSeen = true,
+            ),
+        )
+        val reopenedForLaterCut = M3SurfaceAllocationAuthority.continueStreaming(
+            M3AllocationChain(
+                emptyList(), 1, 0, ByteArray(32),
+                M3AllocationHistoryReceipt(0, 0, M3SurfaceAllocationAuthority.HISTORY_PHASE_PEAK_BYTES),
+                authorityHighWaterSeen = false,
+            ),
+            group,
+            record,
+            authorityHighWater = 2_401,
+        )
+
+        assertFalse(reopenedForLaterCut.authorityHighWaterSeen)
+        assertTrue(storedAtFirstCut.matchesHistoryPrefix(reopenedForLaterCut))
+    }
+
+    @Test
     fun `two independent journals admit one target winner and loser reopens exact intent`() {
         val directory = Files.createTempDirectory("m3-dirty-target-collision-").toFile()
         val executor = Executors.newSingleThreadExecutor()

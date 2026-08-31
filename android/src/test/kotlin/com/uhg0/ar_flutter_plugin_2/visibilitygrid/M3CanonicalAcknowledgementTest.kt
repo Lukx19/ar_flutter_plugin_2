@@ -707,7 +707,12 @@ class M3CanonicalAcknowledgementTest {
             assertEquals(initial.cut.geometryRevision + 1, repaired.cut.geometryRevision)
             assertTrue(repaired.current is M3CanonicalActivationCurrent.Receipt)
             assertTrue(fixture.directory.listFiles().orEmpty().none { it.name.endsWith(".transaction") })
-        } finally { fixture.directory.deleteRecursively() }
+            reopened.close()
+            val again = opened(M3SurfaceOwnership.open(fixture.group, fixture.directory, fixture.budget))
+            again.close()
+        } finally {
+            fixture.directory.deleteRecursively()
+        }
     }
 
     @Test

@@ -92,18 +92,23 @@ internal enum class M3CanonicalAuthorityLeaseRefusal {
     UNBOUND, STALE, GROUP_MISMATCH, DIRECTORY_MISMATCH, OWNER_MISMATCH,
 }
 internal sealed interface M3CanonicalAuthorityLeaseResolution {
-    data class Resolved(val store: M3CompactCanonicalStore) : M3CanonicalAuthorityLeaseResolution
+    data class Resolved(
+        val authority: M3CanonicalStateView,
+        val published: M3CanonicalPublishedCommit?,
+    ) : M3CanonicalAuthorityLeaseResolution
     data class Refused(val reason: M3CanonicalAuthorityLeaseRefusal) : M3CanonicalAuthorityLeaseResolution
 }
 
 /** Process-local exact authority table. Every entry owns one store reference and is erased once. */
 internal object M3CanonicalAuthorityLeaseRegistry {
     private data class Entry(
-        val store: M3CompactCanonicalStore,
+        val authority: M3CanonicalStateView,
         val group: M3SurfaceGroup,
         val parentKey: String,
         val owner: Any,
+        val releaseAuthority: () -> Unit,
         val onRelease: () -> Unit,
+        var published: M3CanonicalPublishedCommit? = null,
     )
     private val entries = java.util.IdentityHashMap<M3CanonicalAuthorityLease, Entry>()
 
@@ -113,11 +118,17 @@ internal object M3CanonicalAuthorityLeaseRegistry {
         onRelease: () -> Unit = {},
     ): M3CanonicalAuthorityLease {
         val lease = M3CanonicalAuthorityLease()
-        val store = authority.generationZeroAuthority as? M3CompactCanonicalStore ?: return lease
-        store.retainAuthority()
+        val root = authority.generationZeroAuthority
+        val identity = when (root) {
+            is M3CompactCanonicalStore -> Triple(root.cut.group, root.authorityParentKey(), { root.close() })
+            is M3ScalarCanonicalAuthority -> Triple(root.cut.group, root.authorityParentKey, { })
+            else -> return lease
+        }
+        if (root is M3CompactCanonicalStore) root.retainAuthority()
+        val boundAuthority = if (root is M3CompactCanonicalStore) root else authority
         synchronized(this) {
             check(entries.put(
-                lease, Entry(store, store.cut.group, store.authorityParentKey(), owner, onRelease),
+                lease, Entry(boundAuthority, identity.first, identity.second, owner, identity.third, onRelease),
             ) == null)
         }
         return lease
@@ -137,13 +148,22 @@ internal object M3CanonicalAuthorityLeaseRegistry {
             return M3CanonicalAuthorityLeaseResolution.Refused(M3CanonicalAuthorityLeaseRefusal.DIRECTORY_MISMATCH)
         if (entry.owner !== owner)
             return M3CanonicalAuthorityLeaseResolution.Refused(M3CanonicalAuthorityLeaseRefusal.OWNER_MISMATCH)
-        return M3CanonicalAuthorityLeaseResolution.Resolved(entry.store)
+        return M3CanonicalAuthorityLeaseResolution.Resolved(entry.authority, entry.published)
+    }
+
+    @Synchronized fun attachPublished(
+        lease: M3CanonicalAuthorityLease,
+        published: M3CanonicalPublishedCommit,
+    ): Boolean {
+        val entry = entries[lease] ?: return false
+        entry.published = published
+        return true
     }
 
     internal fun release(lease: M3CanonicalAuthorityLease): Boolean {
         val entry = synchronized(this) { entries.remove(lease) } ?: return false
         try {
-            entry.store.close()
+            entry.releaseAuthority()
         } finally {
             entry.onRelease()
         }
@@ -155,10 +175,16 @@ internal object M3CanonicalAuthorityLeaseRegistry {
         val stores = java.util.Collections.newSetFromMap(
             java.util.IdentityHashMap<M3CompactCanonicalStore, Boolean>(),
         )
-        entries.values.forEach { stores.add(it.store) }
+            entries.values.mapNotNull { it.authority.generationZeroAuthority as? M3CompactCanonicalStore }
+                .forEach(stores::add)
         return stores.size
     }
     @Synchronized internal fun isActive(lease: M3CanonicalAuthorityLease) = entries.containsKey(lease)
+}
+
+/** Scalar authority identity; it deliberately owns no complete canonical store. */
+internal interface M3ScalarCanonicalAuthority : M3CanonicalStateView {
+    val authorityParentKey: String
 }
 
 internal data class M3CompactCanonicalCut(
@@ -921,7 +947,7 @@ private constructor(
         const val C17_TOTAL_BYTES = 16_777_216L
         const val JOURNAL_RESERVE_BYTES = 1_048_576L
         const val ISSUE_114_BUDGET_BYTES = C17_TOTAL_BYTES - JOURNAL_RESERVE_BYTES
-        const val KERNEL_RETAINED_BYTES = 7_548_936L
+        const val KERNEL_RETAINED_BYTES = 7_589_936L
         const val PROFILE = M3CompactCanonicalFormat.PROFILE
         private const val UINT32_MAX = 0xffff_ffffL
         private const val SCALAR_AND_OBJECT_BYTES = 8_192L

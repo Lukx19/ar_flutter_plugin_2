@@ -135,7 +135,7 @@ class M3CompactCanonicalStoreTest {
                             as M3CompactCanonicalOpenResult.Opened)
                         .store)
                     .retainedMemoryReceipt()
-            assertEquals(7_548_936L, receipt.kernelBytes)
+            assertEquals(7_589_936L, receipt.kernelBytes)
             assertTrue(
                 receipt.rowColumnsBytes > 0 &&
                     receipt.idOrderBytes > 0 &&

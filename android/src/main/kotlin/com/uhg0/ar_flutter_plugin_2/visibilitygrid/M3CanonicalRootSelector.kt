@@ -77,20 +77,24 @@ internal class M3PrivateRootSelector(
         generationZero: M3CanonicalStateView,
         fault: M3CanonicalSelectorFault?,
         acknowledgedCurrent: M3PreparedIntentCurrentReceipt? = null,
+        authenticatedPrior: M3CanonicalPublishedCommit? = null,
     ): M3CanonicalPublishResult = withParentLock {
         try { recoverPointerPublications() } catch (_: Exception) {
             return M3CanonicalPublishResult.Refused(M3CanonicalSelectorRefusal.DURABILITY_FAILURE)
         }
         val generationIdentity = M3CowGenerationIdentity.from(generation.root)
-        val reopened = reopenLocked(generationZero, cleanupUnreachable = false, acknowledgedCurrent)
-        if (reopened is M3CanonicalReopenResult.Refused) return M3CanonicalPublishResult.Refused(reopened.reason)
-        val prior = (reopened as? M3CanonicalReopenResult.Selected)?.commit
+        val priorFromDisk = if (authenticatedPrior == null) {
+            val reopened = reopenLocked(generationZero, cleanupUnreachable = false, acknowledgedCurrent)
+            if (reopened is M3CanonicalReopenResult.Refused) return M3CanonicalPublishResult.Refused(reopened.reason)
+            (reopened as? M3CanonicalReopenResult.Selected)?.commit
+        } else null
+        val prior = authenticatedPrior ?: priorFromDisk
         val roots = prior?.roots.orEmpty()
         val sameCommand = roots.indexOfFirst { it.isCommand(generation.root.commandId) }
         if (sameCommand >= 0) {
             val existing = roots[sameCommand]
             if (existing.generationHash != generationIdentity.hash) {
-                prior?.close()
+                priorFromDisk?.close()
                 return M3CanonicalPublishResult.Refused(M3CanonicalSelectorRefusal.IDENTITY_CONFLICT)
             }
             val replay = requireNotNull(prior).prefix(sameCommand + 1)
@@ -99,31 +103,44 @@ internal class M3PrivateRootSelector(
         }
         val sourceCut = prior?.view?.cut ?: generationZero.cut
         if (generation.root.baseCut != sourceCut) {
-            prior?.close()
+            priorFromDisk?.close()
             return M3CanonicalPublishResult.Refused(M3CanonicalSelectorRefusal.STALE_BASE)
         }
-        val validated = M3CanonicalCowGeneration.open(generation.directory, generationIdentity)
+        val validated = if (authenticatedPrior != null) generation else
+            M3CanonicalCowGeneration.open(generation.directory, generationIdentity)
         if (validated == null) {
-            prior?.close()
+            priorFromDisk?.close()
             return M3CanonicalPublishResult.Refused(M3CanonicalSelectorRefusal.CORRUPT_GENERATION)
         }
-        validated.close()
+        if (authenticatedPrior == null) validated.close()
         val ownedDirectory = try {
             generation.directory.parentFile?.canonicalFile == parent.canonicalFile &&
                 GENERATION_NAME.matches(generation.directory.name)
         } catch (_: Exception) { false }
         if (!ownedDirectory) {
-            prior?.close()
+            priorFromDisk?.close()
             return M3CanonicalPublishResult.Refused(M3CanonicalSelectorRefusal.CORRUPT_GENERATION)
         }
 
         val oldSelector = Selector.read(File(parent, SELECTOR_FILE))
+        if (authenticatedPrior != null) {
+            val priorRoot = authenticatedPrior.roots.lastOrNull()
+            val slot = oldSelector?.let { selectorValue ->
+                Slot.read(File(parent, slotName(selectorValue.slot)))?.takeIf {
+                    it.revision == selectorValue.revision && it.rootHash == selectorValue.rootHash
+                }
+            }
+            if (priorRoot == null || oldSelector == null || slot == null ||
+                oldSelector.rootHash != priorRoot.objectHash() ||
+                acknowledgedCurrent != authenticatedPrior.current
+            ) return M3CanonicalPublishResult.Refused(M3CanonicalSelectorRefusal.CORRUPT_SELECTED_ROOT)
+        }
         val revision = try { Math.addExact(oldSelector?.revision ?: 0L, 1L) } catch (_: ArithmeticException) {
-            prior?.close()
+            priorFromDisk?.close()
             return M3CanonicalPublishResult.Refused(M3CanonicalSelectorRefusal.REVISION_OVERFLOW)
         }
         if (revision > maximumGenerations) {
-            prior?.close()
+            priorFromDisk?.close()
             return M3CanonicalPublishResult.Refused(M3CanonicalSelectorRefusal.ANCESTRY_LIMIT)
         }
         val root = PublishedRoot.from(revision, oldSelector?.rootHash, generation)
@@ -141,9 +158,14 @@ internal class M3PrivateRootSelector(
         val unit = budget.allocationUnitBytes(parent)
         val reservationMaximum = listOf(rootBytes.size.toLong(), rootBytes.size.toLong(), Slot.BYTES.toLong(), Slot.BYTES.toLong(), Selector.BYTES.toLong(), Selector.BYTES.toLong(), 1L, 1L)
             .fold(0L) { total, bytes -> Math.addExact(total, round(bytes, unit)) }
-        val oldGenerationBytes = roots.sumOf { budget.allocatedBytes(File(parent, it.generationDirectory)) }
+        val scalarPrior = authenticatedPrior?.takeIf { it.scalar }
+        val oldGenerationBytes = scalarPrior?.receipt?.let { receipt ->
+            Math.addExact(receipt.oldGenerationBytes, receipt.newGenerationBytes)
+        } ?: roots.sumOf { budget.allocatedBytes(File(parent, it.generationDirectory)) }
         val newGenerationBytes = budget.allocatedBytes(generation.directory)
-        val oldAuthorityBytes = parent.listFiles().orEmpty().filter {
+        val oldAuthorityBytes = scalarPrior?.receipt?.let {
+            Math.addExact(Math.addExact(it.rootObjectBytes, it.rootSlotBytes), it.selectorBytes)
+        } ?: parent.listFiles().orEmpty().filter {
             it.name in setOf(SELECTOR_FILE, SLOT_A, SLOT_B) || ROOT_NAME.matches(it.name)
         }.sumOf(budget::allocatedBytes)
         val maximum = Math.addExact(
@@ -157,7 +179,7 @@ internal class M3PrivateRootSelector(
             pointerBytes = rootBytes.size.toLong() + Slot.BYTES + Selector.BYTES,
             hashOperations = 3,
             rootOperations = 3,
-            phasePeakBytes = phasePeakBytes(roots.size + 1),
+            phasePeakBytes = phasePeakBytes(if (scalarPrior != null) 2 else roots.size + 1),
             maximumPhysicalBytes = maximum,
             committedPhysicalBytes = 0,
             oldGenerationBytes = oldGenerationBytes,
@@ -172,7 +194,7 @@ internal class M3PrivateRootSelector(
             token = budget.reservePointerPublication(
                 rootHash.toByteArray().hex(), inactive, rootBefore, slotBefore, selectorBefore,
                 commitBytes, reservationMaximum,
-            ) ?: run { prior?.close(); return M3CanonicalPublishResult.Refused(M3CanonicalSelectorRefusal.QUOTA_REFUSED) }
+            ) ?: run { priorFromDisk?.close(); return M3CanonicalPublishResult.Refused(M3CanonicalSelectorRefusal.QUOTA_REFUSED) }
             inject(fault, M3CanonicalSelectorFault.AFTER_RESERVATION)
             inject(fault, M3CanonicalSelectorFault.BEFORE_ROOT_OBJECT_WRITE)
             if (!rootTarget.exists()) writeImmutable(rootTarget, rootBytes, fault == M3CanonicalSelectorFault.DURING_ROOT_OBJECT_WRITE)
@@ -196,15 +218,20 @@ internal class M3PrivateRootSelector(
             inject(fault, M3CanonicalSelectorFault.BEFORE_BUDGET_COMMIT)
             budget.commit(requireNotNull(token), actual); token = null
             inject(fault, M3CanonicalSelectorFault.AFTER_BUDGET_COMMIT)
-            selected = requireNotNull(buildCommit(rootHash, generationZero)) { "selected root failed validation" }
-            prior?.close()
+            selected = if (authenticatedPrior != null) {
+                authenticatedPrior.advance(root, validated, receipt)
+            } else requireNotNull(buildCommit(rootHash, generationZero)) { "selected root failed validation" }
+            priorFromDisk?.close()
             inject(fault, M3CanonicalSelectorFault.BEFORE_CLEANUP)
-            val reclaimed = cleanup(requireNotNull(selected).roots)
+            val reclaimed = if (scalarPrior != null) 0L else cleanup(requireNotNull(selected).roots)
             inject(fault, M3CanonicalSelectorFault.AFTER_CLEANUP)
-            val rootsPhysical = requireNotNull(selected).roots.sumOf { budget.allocatedBytes(rootFile(it.objectHash())) }
+            val rootsPhysical = if (scalarPrior != null) {
+                Math.addExact(scalarPrior.receipt.rootObjectBytes, budget.allocatedBytes(rootTarget))
+            } else requireNotNull(selected).roots.sumOf { budget.allocatedBytes(rootFile(it.objectHash())) }
             val slotsPhysical = listOf(File(parent, SLOT_A), File(parent, SLOT_B)).filter(File::exists).sumOf(budget::allocatedBytes)
             val selectorPhysical = budget.allocatedBytes(selectorTarget)
-            val selectedGenerations = requireNotNull(selected).roots.sumOf { budget.allocatedBytes(File(parent, it.generationDirectory)) }
+            val selectedGenerations = if (scalarPrior != null) Math.addExact(oldGenerationBytes, newGenerationBytes)
+                else requireNotNull(selected).roots.sumOf { budget.allocatedBytes(File(parent, it.generationDirectory)) }
             val committed = requireNotNull(selected).withReceipt(receipt.copy(
                 committedPhysicalBytes = actual,
                 rootObjectBytes = rootsPhysical,
@@ -216,7 +243,8 @@ internal class M3PrivateRootSelector(
             selected.close(); selected = null
             return M3CanonicalPublishResult.Committed(committed, replayed = false)
         } catch (_: Exception) {
-            prior?.close()
+            priorFromDisk?.close()
+            if (authenticatedPrior != null && !switched) validated.close()
             selected?.close(); selected = null
             return if (switched) M3CanonicalPublishResult.UnknownAfterSwitch(receipt)
             else M3CanonicalPublishResult.Refused(M3CanonicalSelectorRefusal.DURABILITY_FAILURE)
@@ -433,13 +461,15 @@ internal data class M3CanonicalPublicationReceipt(
 
 internal class M3CanonicalPublishedCommit internal constructor(
     private val generationZero: M3CanonicalStateView,
-    val view: M3CanonicalStateView,
+    var view: M3CanonicalStateView,
     val current: M3PreparedIntentCurrentReceipt,
-    internal val roots: List<PublishedRoot>,
+    internal var roots: List<PublishedRoot>,
     private val generations: MutableList<M3CanonicalCowGeneration>,
     val receipt: M3CanonicalPublicationReceipt,
 ) : AutoCloseable {
     private var closed = false
+    internal var scalar = false
+        private set
     @Synchronized override fun close() { if (!closed) { closed = true; generations.forEach(M3CanonicalCowGeneration::close); generations.clear() } }
     internal fun prefix(size: Int): M3CanonicalPublishedCommit {
         require(size in 1..roots.size)
@@ -452,7 +482,49 @@ internal class M3CanonicalPublishedCommit internal constructor(
         val transferred = generations.toMutableList()
         generations.clear()
         return M3CanonicalPublishedCommit(generationZero, view, current, roots, transferred, value)
+            .also { it.scalar = scalar }
     }
+    /** Drops verified historical generations after a named cold recovery. */
+    internal fun collapseToScalar(scalarView: M3CanonicalStateView): M3CanonicalPublishedCommit {
+        check(!closed && scalarView.cut == view.cut && scalarView.generationZeroAuthority === generationZero)
+        generations.forEach(M3CanonicalCowGeneration::close)
+        generations.clear()
+        roots = listOf(roots.last())
+        view = scalarView
+        scalar = true
+        return this
+    }
+    /** Detaches a scalar successor with no reference to the cold complete authority. */
+    internal fun detachScalar(scalarView: M3CanonicalStateView): M3CanonicalPublishedCommit {
+        check(!closed && scalarView.cut == view.cut)
+        generations.forEach(M3CanonicalCowGeneration::close)
+        generations.clear()
+        closed = true
+        return M3CanonicalPublishedCommit(
+            scalarView, scalarView, current, listOf(roots.last()), mutableListOf(), receipt,
+        ).also { it.scalar = true }
+    }
+    /** Transfers the one live composed authority to its exact adjacent successor. */
+    internal fun advance(
+        root: PublishedRoot,
+        generation: M3CanonicalCowGeneration,
+        value: M3CanonicalPublicationReceipt,
+    ): M3CanonicalPublishedCommit {
+        check(!closed && root.baseRootHash == view.cut.rootHash && generation.root.baseCut == view.cut)
+        val transferred = generations.toMutableList()
+        generations.clear()
+        val successorView = generation.overlay(view)
+        transferred += generation
+        closed = true
+        return M3CanonicalPublishedCommit(
+            generationZero, successorView, root.current,
+            if (scalar) listOf(roots.last(), root) else roots + root,
+            transferred, value,
+        ).also { it.scalar = scalar }
+    }
+
+    internal fun retainedProofBytes(): Long = 512L + roots.size * 512L +
+        generations.sumOf { 256L + it.root.manifest.size * 128L }
 }
 
 internal sealed interface M3CanonicalPublishResult {

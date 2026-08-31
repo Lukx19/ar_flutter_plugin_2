@@ -14,6 +14,7 @@ internal interface M3CanonicalCommitStore : AutoCloseable {
         generationZero: M3CanonicalStateView,
         faults: M3CanonicalCommitFaults = M3CanonicalCommitFaults(),
         acknowledgedCurrent: M3PreparedIntentCurrentReceipt? = null,
+        authenticatedPrior: M3CanonicalPublishedCommit? = null,
     ): M3CanonicalCommitResult
     fun reopen(
         generationZero: M3CanonicalStateView,
@@ -146,13 +147,14 @@ private class M3CanonicalMutableStore(
         generationZero: M3CanonicalStateView,
         faults: M3CanonicalCommitFaults,
         acknowledgedCurrent: M3PreparedIntentCurrentReceipt?,
+        authenticatedPrior: M3CanonicalPublishedCommit?,
     ): M3CanonicalCommitResult {
         if (closed) return M3CanonicalCommitResult.Refused(M3CanonicalCommitRefusal.CLOSED)
         var selected: M3CanonicalPublishedCommit? = null
         var intent: M3PreparedIntent? = null
         var generation: M3CanonicalCowGeneration? = null
         try {
-            val current = when (val reopened = M3PrivateRootSelector(parent, budget).reopen(generationZero, acknowledgedCurrent)) {
+            val current = authenticatedPrior?.view ?: when (val reopened = M3PrivateRootSelector(parent, budget).reopen(generationZero, acknowledgedCurrent)) {
                 is M3CanonicalReopenResult.GenerationZero -> generationZero
                 is M3CanonicalReopenResult.Selected -> {
                     selected = reopened.commit
@@ -184,7 +186,9 @@ private class M3CanonicalMutableStore(
                 )
             }
             try {
-                if (selected != null && acknowledgedCurrent != null && !journal.reclaimAcknowledgedIntent(acknowledgedCurrent))
+                if ((selected != null || authenticatedPrior != null) && acknowledgedCurrent != null &&
+                    !journal.reclaimAcknowledgedIntent(acknowledgedCurrent)
+                )
                     return M3CanonicalCommitResult.Refused(M3CanonicalCommitRefusal.JOURNAL_REFUSED,
                         journalReason = M3CanonicalDirtyJournalRefusal.CORRUPT_INTENT)
                 intent = when (val durable = journal.reopen()) {
@@ -213,8 +217,14 @@ private class M3CanonicalMutableStore(
                         cowReason = staged.reason,
                     )
                 }
-                return when (val published = publish(requireNotNull(generation), generationZero, faults.selector, acknowledgedCurrent)) {
-                    is M3CanonicalPublishResult.Committed -> M3CanonicalCommitResult.Committed(published.commit, published.replayed)
+                return when (val published = publish(
+                    requireNotNull(generation), generationZero, faults.selector,
+                    acknowledgedCurrent, authenticatedPrior,
+                )) {
+                    is M3CanonicalPublishResult.Committed -> {
+                        if (authenticatedPrior != null) generation = null // successor owns the transferred generation
+                        M3CanonicalCommitResult.Committed(published.commit, published.replayed)
+                    }
                     is M3CanonicalPublishResult.UnknownAfterSwitch -> M3CanonicalCommitResult.UnknownAfterSwitch(published.receipt)
                     is M3CanonicalPublishResult.Refused -> M3CanonicalCommitResult.Refused(
                         if (published.reason == M3CanonicalSelectorRefusal.IDENTITY_CONFLICT) M3CanonicalCommitRefusal.IDENTITY_CONFLICT
@@ -235,9 +245,12 @@ private class M3CanonicalMutableStore(
         generationZero: M3CanonicalStateView,
         fault: M3CanonicalSelectorFault? = null,
         acknowledgedCurrent: M3PreparedIntentCurrentReceipt? = null,
+        authenticatedPrior: M3CanonicalPublishedCommit? = null,
     ): M3CanonicalPublishResult {
         if (closed) return M3CanonicalPublishResult.Refused(M3CanonicalSelectorRefusal.CLOSED)
-        return M3PrivateRootSelector(parent, budget).publish(generation, generationZero, fault, acknowledgedCurrent)
+        return M3PrivateRootSelector(parent, budget).publish(
+            generation, generationZero, fault, acknowledgedCurrent, authenticatedPrior,
+        )
     }
 
     /** Reopens exactly the selected private cut, or generation zero only if no selector exists. */

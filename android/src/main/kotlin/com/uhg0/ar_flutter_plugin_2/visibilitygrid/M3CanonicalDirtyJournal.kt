@@ -337,7 +337,7 @@ internal class M3CanonicalDirtyJournal private constructor(
             val checkpointFile = File(candidate, ALLOCATION_CHECKPOINT_FILE)
             if (checkpointFile.exists()) {
                 val checkpoint = checkpointFile.readFixed(M3AllocationCheckpoint.ENCODED_BYTES)
-                require(checkpoint.contentEquals(M3AllocationCheckpoint.from(chain).encoded()))
+                require(M3AllocationCheckpoint.decode(checkpoint).matchesHistoryPrefix(chain))
             }
         }
         val prefix = "${candidateBase()}.allocation-"

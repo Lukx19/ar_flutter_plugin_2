@@ -2,6 +2,7 @@ package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
 import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineAuthority
 import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineScopeV1
+import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineV1
 import com.uhg0.ar_flutter_plugin_2.m0.M0aCommitReceiptQueryV1
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlCodec
 import com.uhg0.ar_flutter_plugin_2.m0.M0aControlOperation
@@ -24,10 +25,104 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VisibilityGridV2BindingTest {
+    @Test
+    fun `lifecycle allocator requires positive strictly increasing values`() {
+        assertThrows(IllegalArgumentException::class.java) {
+            VisibilityGridV2Binding(
+                MethodTestMessenger(), 2128, M0aCommittedBaselineAuthority(),
+                lifecycleSequenceAllocator = { 0 }, postToMain = { it() },
+            )
+        }
+        val messenger = MethodTestMessenger()
+        val repeated = VisibilityGridV2Binding(
+            messenger, 2129, M0aCommittedBaselineAuthority(),
+            lifecycleSequenceAllocator = { 1 }, postToMain = { it() },
+        )
+        try {
+            val snapshot = repeated.snapshot()
+            val result = RecordingResult()
+            MethodChannel(messenger, "visibility_grid_v2_control_2129").invokeMethod(
+                "start",
+                snapshot.nativeStreamToken + snapshot.workerBindingToken +
+                    M0aControlCodec.encodeRequest(startRequest()),
+                result,
+            )
+            assertTrue(result.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(1, result.errorCount)
+            assertTrue(result.errorMessage?.contains("strictly increasing") == true)
+        } finally { repeated.dispose() }
+    }
+
+    @Test
+    fun `authority authenticated restart preserves semantic cut and allocates adjacent transaction one`() {
+        assertThrows(IllegalArgumentException::class.java) { M3CommittedEmptyBaseline("binding", "group", -1, 85, 1) }
+        assertThrows(IllegalArgumentException::class.java) { M3CommittedEmptyBaseline("binding", "group", 0, 0, 1) }
+        assertThrows(IllegalArgumentException::class.java) { M3CommittedEmptyBaseline("binding", "group", 0, 85, 0) }
+        val messenger = MethodTestMessenger()
+        val authority = M0aCommittedBaselineAuthority()
+        val request = startRequest()
+        authority.publish(
+            M0aCommittedBaselineScopeV1.from(request),
+            M0aCommittedBaselineV1(transactionId = 84, geometryRevision = 85, lineageRevision = 1, styleRevision = 0),
+        )
+        val binding = VisibilityGridV2Binding(messenger, 2127, authority, postToMain = { it() })
+        try {
+            val snapshot = binding.snapshot()
+            val qualifier = snapshot.nativeStreamToken + snapshot.workerBindingToken
+            val start = RecordingResult()
+            MethodChannel(messenger, "visibility_grid_v2_control_2127").invokeMethod(
+                "start", qualifier + M0aControlCodec.encodeRequest(request), start,
+            )
+            assertTrue(start.completed.await(2, TimeUnit.SECONDS))
+            assertEquals("start error=${start.errorCode}:${start.errorMessage}", 1, start.successCount)
+            val stream = M0aControlCodec.decodeResponse(stripQualifier(start.successValue as ByteArray, qualifier))
+
+            fun exchange(sequence: Long, transaction: Long, geometry: Long): M0aPacketCodec.Response {
+                val reply = RecordingBinaryReply()
+                messenger.send(
+                    "visibility_surface_stream_2127",
+                    ByteBuffer.wrap(qualifier + M0aPacketCodec.encodeRequest(M0aPacketCodec.Request(
+                        0, stream.streamToken, transaction, geometry, 1, 0,
+                        M0aTransactionResponseProfileV1.ordinary.responseCeilingBytes,
+                        emptyList(), byteArrayOf(), sequence,
+                    ))),
+                    reply,
+                )
+                assertTrue(reply.completed.await(2, TimeUnit.SECONDS))
+                return M0aPacketCodec.decodeResponse(stripQualifier(requireNotNull(reply.bytes), qualifier))
+            }
+
+            val unchanged = exchange(1, 0, 85)
+            assertEquals(0, unchanged.messageKind)
+            assertEquals(0, unchanged.transactionId)
+            assertEquals(85, unchanged.targetGeometryRevision)
+            assertEquals(1, unchanged.targetLineageRevision)
+            assertEquals(M3CommittedEmptyBaseline(
+                requireNotNull(binding.m3CommittedEmptyBaseline()).bindingIdentity,
+                request.captureGroupId.hex(), 0, 85, 1,
+            ), binding.m3CommittedEmptyBaseline())
+
+            val selector = M0aCurrentDeltaSelectorV1(1, 86, 1)
+            val bytes = byteArrayOf(1, 8, 6)
+            binding.queueCommittedCurrentDelta(
+                M0aCurrentDeltaSourceV1 { selected ->
+                    M0aCurrentDeltaReceiptV1(selector, 85, bytes, ByteArray(32) { 7 }).takeIf { selected == selector }
+                },
+                selector,
+            )
+            val begin = exchange(2, 0, 85)
+            assertEquals(2, begin.messageKind)
+            assertEquals(1, begin.transactionId)
+            assertEquals(85, begin.baseGeometryRevision)
+            assertEquals(86, begin.targetGeometryRevision)
+        } finally { binding.dispose() }
+    }
+
     @Test
     fun `exact qualified malformed control returns canonical correlated bytes with no effect`() {
         val authority = M0aCommittedBaselineAuthority()
@@ -139,9 +234,9 @@ class VisibilityGridV2BindingTest {
             assertEquals(1, correctedResponse.streamToken)
             assertEquals(1, binding.snapshot().acceptedControls)
             assertEquals(baseline, authority.snapshot(scope))
-            // M2 must not consume the bootstrap transaction slot.  The exact
-            // g1/l1 acknowledgement is the only admission cut for M3.
-            assertEquals(null, binding.currentObservationOwnership())
+            // The authority-authenticated restored cut is ready at binding-local
+            // transaction zero without consuming a synthetic geometry revision.
+            assertTrue(binding.currentObservationOwnership() != null)
 
         } finally {
             binding.dispose()
@@ -817,6 +912,7 @@ class VisibilityGridV2BindingTest {
                 start,
             )
             assertTrue(start.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(start.errorMessage, 0, start.errorCount)
             val startResponse = M0aControlCodec.decodeResponse(
                 stripQualifier(start.successValue as ByteArray, qualifier),
             )
@@ -848,19 +944,32 @@ class VisibilityGridV2BindingTest {
                 assertTrue(reply.completed.await(2, TimeUnit.SECONDS))
                 return M0aPacketCodec.decodeResponse(stripQualifier(reply.bytes!!, qualifier))
             }
-            assertEquals(2, exchange(1, 0).messageKind)
-            assertEquals(4, exchange(2, 0).messageKind)
-            val acknowledged = exchange(3, 1)
-            assertEquals(0, acknowledged.messageKind)
-            assertEquals(1, acknowledged.transactionId)
-            assertEquals(12, acknowledged.targetGeometryRevision)
-            assertEquals(13, acknowledged.targetLineageRevision)
+            val restored = exchange(1, 0)
+            assertEquals(0, restored.messageKind)
+            assertEquals(0, restored.transactionId)
+            assertEquals(11, restored.targetGeometryRevision)
+            assertEquals(12, restored.targetLineageRevision)
             val observationCut = requireNotNull(binding.currentObservationOwnership())
             val emptyBaseline = requireNotNull(binding.m3CommittedEmptyBaseline())
-            assertEquals(1, emptyBaseline.transactionId)
-            assertEquals(12, emptyBaseline.geometryRevision)
-            assertEquals(13, emptyBaseline.lineageRevision)
+            assertEquals(0, emptyBaseline.transactionId)
+            assertEquals(11, emptyBaseline.geometryRevision)
+            assertEquals(12, emptyBaseline.lineageRevision)
             assertEquals(observationCut.captureGroupId, emptyBaseline.groupIdentity)
+
+            val selector = M0aCurrentDeltaSelectorV1(1, 12, 12)
+            binding.queueCommittedCurrentDelta(
+                M0aCurrentDeltaSourceV1 { selected ->
+                    M0aCurrentDeltaReceiptV1(selector, 11, byteArrayOf(9), ByteArray(32) { 8 })
+                        .takeIf { selected == selector }
+                },
+                selector,
+            )
+            val adjacent = exchange(2, 0)
+            assertEquals(2, adjacent.messageKind)
+            assertEquals(1, adjacent.transactionId)
+            assertEquals(11, adjacent.baseGeometryRevision)
+            assertEquals(12, adjacent.targetGeometryRevision)
+            assertEquals(12, adjacent.targetLineageRevision)
 
             val stale = RecordingBinaryReply()
             messenger.send(
@@ -873,6 +982,53 @@ class VisibilityGridV2BindingTest {
         } finally {
             binding.dispose()
         }
+    }
+
+    @Test
+    fun `Issue 98 debug handoff rejects a mismatched correlated baseline`() {
+        val messenger = MethodTestMessenger()
+        val binding = VisibilityGridV2Binding(
+            messenger, 981, M0aCommittedBaselineAuthority(), postToMain = { it() }, isDebuggable = true,
+        )
+        try {
+            val channel = MethodChannel(messenger, "visibility_grid_v2_control_981")
+            val preparation = RecordingResult()
+            channel.invokeMethod("prepareDebugV2Issue98Handoff", null, preparation)
+            assertTrue(preparation.completed.await(2, TimeUnit.SECONDS))
+            @Suppress("UNCHECKED_CAST")
+            val prepared = preparation.successValue as Map<String, Any>
+            val stale = RecordingBinaryReply()
+            messenger.send(
+                "visibility_surface_stream_981",
+                ByteBuffer.wrap(
+                    (prepared.getValue("oldBindingQualifier") as ByteArray) +
+                        (prepared.getValue("staleRequestBytes") as ByteArray),
+                ),
+                stale,
+            )
+            assertTrue(stale.completed.await(2, TimeUnit.SECONDS))
+            val handoff = RecordingResult()
+            channel.invokeMethod("finalizeDebugV2Issue98Handoff", prepared.getValue("correlationId"), handoff)
+            assertTrue(handoff.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(1, handoff.successCount)
+
+            binding.javaClass.getDeclaredField("issue98RestoredBaseline").also {
+                it.isAccessible = true
+                it.set(binding, M0aCommittedBaselineV1(0, 99, 12, 15))
+            }
+            val snapshot = binding.snapshot()
+            val start = RecordingResult()
+            channel.invokeMethod(
+                "start",
+                snapshot.nativeStreamToken + snapshot.workerBindingToken +
+                    M0aControlCodec.encodeRequest(startRequest()),
+                start,
+            )
+            assertTrue(start.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(1, start.errorCount)
+            assertTrue(start.errorMessage?.contains("not correlated") == true)
+            assertEquals(null, binding.currentObservationOwnership())
+        } finally { binding.dispose() }
     }
 
     @Test
@@ -2102,6 +2258,7 @@ internal class RecordingResult(
     var errorCount = 0
     var successValue: Any? = null
     var errorCode: String? = null
+    var errorMessage: String? = null
 
     override fun success(result: Any?) {
         successCount++
@@ -2113,6 +2270,7 @@ internal class RecordingResult(
     override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) {
         errorCount++
         this.errorCode = errorCode
+        this.errorMessage = errorMessage
         completed.countDown()
     }
 

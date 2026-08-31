@@ -334,6 +334,9 @@ internal class M3CanonicalCowGeneration private constructor(
                         ordered
                     }) { "invalid fragment $kind" }
                 }
+                M3CanonicalCowGenerationTestHooks.onVerifiedOpen?.invoke(
+                    M3CanonicalCowVerifiedOpen(entries.size, root.current.length),
+                )
             }
         } catch (_: Exception) { null }
 
@@ -370,6 +373,21 @@ internal class M3CanonicalCowGeneration private constructor(
     }
 }
 
+/** Disabled-by-default scalar test observation; it retains no opened generation or payload. */
+internal object M3CanonicalCowGenerationTestHooks {
+    @Volatile var onVerifiedOpen: ((M3CanonicalCowVerifiedOpen) -> Unit)? = null
+}
+
+internal data class M3CanonicalCowVerifiedOpen(
+    val verifiedPages: Int,
+    val currentChecksumBytes: Long,
+)
+
+/**
+ * Process-local proof cache scoped to one live runtime resource lease. COW
+ * directories are immutable after publication; startup/recovery still enters
+ * through a cold lease and performs the complete verification above once.
+ */
 internal enum class M3CowFragmentKind(val wire: Int, val file: String, val recordBytes: Int) {
     ROW(1, "rows.pages", 60), ID_INDEX(2, "id-index.pages", 8),
     VOXEL_INDEX(3, "voxel-index.pages", 20), PAGE_INDEX(4, "page-index.pages", 20),

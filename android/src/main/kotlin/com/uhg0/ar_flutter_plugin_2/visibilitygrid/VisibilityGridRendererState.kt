@@ -8,6 +8,24 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import com.uhg0.ar_flutter_plugin_2.pointcloud.identityGridRotation
 
+/** Minimal immutable geometry retained after a group config's keys are consumed. */
+internal class M3RendererGroupGeometry private constructor(
+    val voxelSizeMeters: Double,
+    val worldFromGroupGl: DoubleArray,
+) {
+    val portableBytes: Long get() = OBJECT_BYTES + TRANSFORM_BYTES
+
+    companion object {
+        private const val OBJECT_BYTES = 24L
+        private const val TRANSFORM_BYTES = 144L
+
+        fun from(config: VisibilityGridGroupConfig) = M3RendererGroupGeometry(
+            voxelSizeMeters = config.voxelSizeMeters,
+            worldFromGroupGl = config.worldFromGroupGl.copyOf(),
+        )
+    }
+}
+
 /**
  * Dense, bounded renderer-row selection over authoritative native grid geometry.
  *
@@ -64,7 +82,7 @@ class VisibilityGridRendererState(
     private val rowsByKey = LongRowIndex(capacity)
     private val selectedKeys = SelectedKeyMaxHeap(capacity)
     private val dirtyRows = DirtyRowQueue(capacity)
-    private var group: VisibilityGridGroupConfig? = null
+    private var group: M3RendererGroupGeometry? = null
     private var count = 0
     private var renderRevision = 0L
     private var geometryRevision = 0L
@@ -94,6 +112,9 @@ class VisibilityGridRendererState(
     val ownedStorageBytes: Int
         get() = ownedStorageBytes(capacity)
 
+    internal val retainedGroupGeometryBytes: Long
+        @Synchronized get() = group?.portableBytes ?: 0L
+
     @Synchronized
     fun startGroup(
         config: VisibilityGridGroupConfig,
@@ -106,7 +127,10 @@ class VisibilityGridRendererState(
         require(restoredKeys.size <= config.capacity)
         require(restoredKeys.toSet().size == restoredKeys.size)
         clearRows()
-        group = config
+        // restoredKeys are consumed into the renderer's fixed primitive arrays
+        // below. Retain only the geometry needed for later row projection, not
+        // the caller's full config (which can own another 20k-key copy).
+        group = M3RendererGroupGeometry.from(config)
         this.geometryRevision = geometryRevision
         require(visibilityRevision >= 0)
         this.visibilityRevision = visibilityRevision
@@ -417,7 +441,14 @@ class VisibilityGridRendererState(
     private fun dirtySpans(): List<CoveragePointSpan> {
         val activeRows = dirtyRows.drainActive(count)
         if (activeRows.isEmpty()) return emptyList()
-        val spans = mutableListOf<CoveragePointSpan>()
+        var spanCount = 1
+        for (index in 1 until activeRows.size) {
+            if (activeRows[index] != activeRows[index - 1] + 1) spanCount++
+        }
+        // SceneViewHost retains this list across the handoff boundary. Give its
+        // backing array the exact retained span count so its portable ownership
+        // receipt does not depend on ArrayList's geometric growth history.
+        val spans = ArrayList<CoveragePointSpan>(spanCount)
         var cursor = 0
         while (cursor < activeRows.size) {
             val start = activeRows[cursor]
@@ -483,4 +514,55 @@ class VisibilityGridRendererState(
         }
         return true
     }
+}
+
+/** One snapshot retained across the explicit SceneViewHost handoff boundary. */
+internal data class M3RendererSnapshotOwnershipReceipt(
+    val snapshotObjectBytes: Long,
+    val primaryArrayBytes: Long,
+    val updateObjectBytes: Long,
+    val spanListBytes: Long,
+    val spanObjectAndArrayBytes: Long,
+) {
+    val portableBytes: Long get() = snapshotObjectBytes + primaryArrayBytes + updateObjectBytes +
+        spanListBytes + spanObjectAndArrayBytes
+
+    companion object {
+        private fun alignedArray(payload: Long) = ((16L + payload + 7L) / 8L) * 8L
+        private fun listBytes(count: Int) = if (count == 0) 0L else 24L + alignedArray(count * 4L)
+        private fun arrays(rows: Int) = alignedArray(rows * Long.SIZE_BYTES.toLong()) +
+            alignedArray(rows * 3L * Float.SIZE_BYTES) + alignedArray(rows * Int.SIZE_BYTES.toLong()) +
+            alignedArray(rows * COVERAGE_RENDERER_STYLE_ROW_BYTES.toLong()) + alignedArray(9L * Float.SIZE_BYTES)
+        private fun span(rows: Int) = 32L + alignedArray(rows * 3L * Float.SIZE_BYTES) +
+            alignedArray(rows * Int.SIZE_BYTES.toLong()) +
+            alignedArray(rows * COVERAGE_RENDERER_STYLE_ROW_BYTES.toLong())
+
+        fun fullResync(rows: Int) = M3RendererSnapshotOwnershipReceipt(
+            56L, arrays(rows), 40L, listBytes(if (rows == 0) 0 else 1),
+            if (rows == 0) 0L else span(rows),
+        )
+
+        /** Worst legal sparse dirty set: alternating rows, one row per span. */
+        fun maximumSparse(rows: Int): M3RendererSnapshotOwnershipReceipt {
+            val spans = (rows + 1) / 2
+            return M3RendererSnapshotOwnershipReceipt(
+                56L, arrays(rows), 40L, listBytes(spans), spans * span(1),
+            )
+        }
+    }
+}
+
+internal fun CoveragePointRenderSnapshot.m3OwnershipReceipt(): M3RendererSnapshotOwnershipReceipt {
+    val spans = update?.spans.orEmpty()
+    fun alignedArray(payload: Long) = ((16L + payload + 7L) / 8L) * 8L
+    val primary = alignedArray(keys.size * Long.SIZE_BYTES.toLong()) +
+        alignedArray(positions.size * Float.SIZE_BYTES.toLong()) +
+        alignedArray(colors.size * Int.SIZE_BYTES.toLong()) + alignedArray(styleRows.size.toLong()) +
+        alignedArray(gridRotationWorld.size * Float.SIZE_BYTES.toLong())
+    val list = if (spans.isEmpty()) 0L else 24L + alignedArray(spans.size * 4L)
+    val spanBytes = spans.sumOf { span ->
+        32L + alignedArray(span.positions.size * Float.SIZE_BYTES.toLong()) +
+            alignedArray(span.colors.size * Int.SIZE_BYTES.toLong()) + alignedArray(span.styleRows.size.toLong())
+    }
+    return M3RendererSnapshotOwnershipReceipt(56L, primary, if (update == null) 0L else 40L, list, spanBytes)
 }

@@ -7,8 +7,9 @@ import kotlin.math.floor
 internal class M3FeatureFusionKernel(
     private val operations: M3KernelOperations = JvmM3KernelOperations,
 ) {
-    /** Applies one immutable batch, or refuses it without changing retained state. */
-    fun accept(batch: M3FeatureFusionBatch): M3FeatureFusionResult {
+    /** Stages one immutable batch without changing retained state. */
+    internal fun prepare(batch: M3FeatureFusionBatch): M3FeatureFusionResult {
+        check(pending == null) { "a prepared kernel batch is already outstanding" }
         val staged = try {
             when (val normalization = normalize(batch)) {
                 is Normalization.Refused -> return refused(normalization.reason)
@@ -22,7 +23,97 @@ internal class M3FeatureFusionKernel(
         if (staged is Staging.Refused) return refused(staged.reason)
         staged as Staging.Accepted
 
-        // Every allocation, checked calculation, and result construction has
+        pending = PendingApplication(staged, batch.sequence, batch.timestampNs)
+        return staged.result
+    }
+
+    /** Compatibility admission: prepare and atomically apply without canonical correlation. */
+    fun accept(batch: M3FeatureFusionBatch): M3FeatureFusionResult {
+        val result = prepare(batch)
+        if (result is M3FeatureFusionResult.Accepted) {
+            check(prepareCanonicalApplication(emptyList()))
+            applyPrepared()
+        }
+        return result
+    }
+
+    /** Discards an uncommitted batch after any v6 prepare/commit refusal. */
+    internal fun discardPrepared() {
+        pending = null
+    }
+
+    /**
+     * Validates and copies every post-commit write before durability is attempted.
+     * A successful call makes [applyPrepared] allocation-free and infallible under
+     * the integration's single mutation lane.
+     */
+    internal fun prepareCanonicalApplication(assignments: List<M3FeatureCanonicalAssignment>): Boolean {
+        val prepared = pending ?: return false
+        if (prepared.assignments != null) return false
+        val staged = prepared.staged
+        val seenSlots = HashSet<Int>()
+        val copied = ArrayList<M3FeatureCanonicalAssignment>(assignments.size)
+        val newBySlot = staged.newSurfaces.associateBy { it.slot }
+        for (assignment in assignments) {
+            val slot = assignment.kernelSlot
+            if (assignment.allocationFingerprint.size != HASH_BYTES ||
+                assignment.packedNormal !in 0..0xffff || assignment.normalConfidence !in 0..255 ||
+                assignment.x !in VOXEL_COORDINATE_MIN..VOXEL_COORDINATE_MAX ||
+                assignment.y !in VOXEL_COORDINATE_MIN..VOXEL_COORDINATE_MAX ||
+                assignment.z !in VOXEL_COORDINATE_MIN..VOXEL_COORDINATE_MAX
+            ) return false
+            val expectedKey = if (slot < surfaceCount) {
+                if (slot < 0) return false
+                surfaceKeys[slot]
+            } else {
+                val projected = newBySlot[slot] ?: return false
+                packVisibilityGridKey(projected.key.x, projected.key.y, projected.key.z)
+            }
+            if (slot >= staged.result.receipt.surfaceCount || !seenSlots.add(slot) ||
+                expectedKey != packVisibilityGridKey(assignment.x, assignment.y, assignment.z)
+            ) return false
+            val retained = if (slot < surfaceCount) canonicalIds[slot] else 0
+            if (retained != 0 && (retained != assignment.id.value.toInt() ||
+                    canonicalCorrelation(slot)?.allocationFingerprint != assignment.allocationFingerprint)
+            ) return false
+            copied += assignment
+        }
+        val sortedNew = copied.filter { (if (it.kernelSlot < surfaceCount) canonicalIds[it.kernelSlot] else 0) == 0 }
+            .sortedWith { left, right -> java.lang.Integer.compareUnsigned(left.id.value.toInt(), right.id.value.toInt()) }
+        var extendLast = false
+        if (sortedNew.isNotEmpty()) {
+            val firstId = sortedNew.first().id.value
+            val lastId = sortedNew.last().id.value
+            val priorFingerprint = if (allocationRangeCount == 0) null else {
+                val offset = (allocationRangeCount - 1) * HASH_BYTES
+                M3CanonicalReceiptBytes(allocationFingerprints.copyOfRange(offset, offset + HASH_BYTES))
+            }
+            extendLast = allocationRangeCount > 0 &&
+                (allocationRangeEnds[allocationRangeCount - 1].toLong() and UINT32_MASK) + 1L == firstId &&
+                priorFingerprint == sortedNew.first().allocationFingerprint
+            if (lastId - firstId + 1L != sortedNew.size.toLong() ||
+                sortedNew.any { it.allocationFingerprint != sortedNew.first().allocationFingerprint } ||
+                (!extendLast && allocationRangeCount >= MAX_ALLOCATION_RANGES) ||
+                (allocationRangeCount > 0 && java.lang.Integer.compareUnsigned(
+                    allocationRangeEnds[allocationRangeCount - 1], firstId.toInt(),
+                ) >= 0)
+            ) return false
+        }
+        prepared.assignments = copied
+        prepared.sortedNewAssignments = sortedNew
+        prepared.extendLastRange = extendLast
+        prepared.newRangeFingerprint = sortedNew.firstOrNull()?.allocationFingerprint?.toByteArray()
+        return true
+    }
+
+    /** Applies only primitive writes that were completely preflighted above. */
+    internal fun applyPrepared(): M3FeatureFusionResult.Accepted {
+        val prepared = requireNotNull(pending) { "no prepared kernel batch" }
+        val assignments = requireNotNull(prepared.assignments) { "kernel application was not preflighted" }
+        val staged = prepared.staged
+
+        // Every allocation, checked calculation, result construction and
+        // canonical-correlation validation has
         // succeeded. The remainder writes only preallocated primitive storage.
         var index = 0
         while (index < staged.newSurfaces.size) {
@@ -40,7 +131,7 @@ internal class M3FeatureFusionKernel(
         index = 0
         while (index < staged.updates.size) {
             val update = staged.updates[index++]
-            accumulatedWeights[update.slot] = update.weight
+            accumulatedWeights[update.slot] = withWeight(accumulatedWeights[update.slot], update.weight)
             observationCounts[update.slot] = encodeObservationState(update.observationCount, update.primarySide)
             active[update.slot] = update.isActive
             axisXQ13[update.slot] = update.axisXQ13
@@ -49,8 +140,29 @@ internal class M3FeatureFusionKernel(
             positiveSupportQ13[update.slot] = update.positiveSupportQ13
             negativeSupportQ13[update.slot] = update.negativeSupportQ13
         }
-        lastSequence = batch.sequence
-        lastTimestampNs = batch.timestampNs
+        for (assignment in prepared.sortedNewAssignments) {
+            canonicalIds[assignment.kernelSlot] = assignment.id.value.toInt()
+        }
+        for (assignment in assignments) {
+            accumulatedWeights[assignment.kernelSlot] = encodeWeightAndCanonical(
+                retainedWeight(assignment.kernelSlot), assignment.packedNormal, assignment.normalConfidence,
+            )
+        }
+        if (prepared.sortedNewAssignments.isNotEmpty()) {
+            if (prepared.extendLastRange) {
+                allocationRangeEnds[allocationRangeCount - 1] = prepared.sortedNewAssignments.last().id.value.toInt()
+            } else {
+                allocationRangeStarts[allocationRangeCount] = prepared.sortedNewAssignments.first().id.value.toInt()
+                allocationRangeEnds[allocationRangeCount] = prepared.sortedNewAssignments.last().id.value.toInt()
+                requireNotNull(prepared.newRangeFingerprint).copyInto(
+                    allocationFingerprints, allocationRangeCount * HASH_BYTES,
+                )
+                allocationRangeCount++
+            }
+        }
+        lastSequence = prepared.sequence
+        lastTimestampNs = prepared.timestampNs
+        pending = null
         return staged.result
     }
 
@@ -131,7 +243,7 @@ internal class M3FeatureFusionKernel(
                 if (projected == null) {
                     val existing = findSlot(item.key)
                     if (existing >= 0) {
-                        projected = ProjectedSurface(existing, item.key, accumulatedWeights[existing], observationCount(observationCounts[existing]), active[existing], false,
+                        projected = ProjectedSurface(existing, item.key, retainedWeight(existing), observationCount(observationCounts[existing]), active[existing], false,
                             axisXQ13[existing], axisYQ13[existing], axisZQ13[existing], positiveSupportQ13[existing], negativeSupportQ13[existing],
                             primarySide(observationCounts[existing]))
                     } else {
@@ -173,7 +285,11 @@ internal class M3FeatureFusionKernel(
                     val wasActive = !projected.isNew && active[projected.slot]
                     when {
                         projected.isActive && (!wasActive || hasMaterialChange(projected, axisOctCodes)) ->
-                            delta += M3FeatureFusionChange.Upsert(candidate(projected, axisOctCodes))
+                            delta += M3FeatureFusionChange.Upsert(
+                                candidate(projected, axisOctCodes),
+                                projected.slot,
+                                canonicalCorrelation(projected.slot),
+                            )
                         wasActive && !projected.isActive ->
                             delta += M3FeatureFusionChange.Removal(projected.key.x, projected.key.y, projected.key.z)
                     }
@@ -257,23 +373,158 @@ internal class M3FeatureFusionKernel(
         var bucket = hash(key)
         while (hashSlots[bucket] != 0) bucket = (bucket + 1) and HASH_MASK
         hashSlots[bucket] = slot + 1
-        surfaceX[slot] = key.x
-        surfaceY[slot] = key.y
-        surfaceZ[slot] = key.z
+        surfaceKeys[slot] = packVisibilityGridKey(key.x, key.y, key.z)
         surfaceCount++
     }
 
     private fun findSlot(key: VoxelKey): Int {
+        val packed = packVisibilityGridKey(key.x, key.y, key.z)
         var bucket = hash(key)
         repeat(HASH_SLOTS) {
             val encoded = hashSlots[bucket]
             if (encoded == 0) return -1
             val slot = encoded - 1
-            if (surfaceX[slot] == key.x && surfaceY[slot] == key.y && surfaceZ[slot] == key.z) return slot
+            if (surfaceKeys[slot] == packed) return slot
             bucket = (bucket + 1) and HASH_MASK
         }
         return -1
     }
+
+    /**
+     * Installs durable canonical identities only after their adjacent commit
+     * has succeeded. Validation is complete before retained state is touched,
+     * so a refusal cannot leave a partially correlated kernel.
+     */
+    @Synchronized
+    internal fun assignCanonicalCorrelations(assignments: List<M3FeatureCanonicalAssignment>): Boolean {
+        if (assignments.isEmpty()) return true
+        val sortedNew = ArrayList<M3FeatureCanonicalAssignment>()
+        val seenSlots = HashSet<Int>()
+        for (assignment in assignments) {
+            val slot = assignment.kernelSlot
+            if (slot !in 0 until surfaceCount || !seenSlots.add(slot) ||
+                surfaceKeys[slot] != packVisibilityGridKey(assignment.x, assignment.y, assignment.z)
+            ) return false
+            val encoded = assignment.id.value.toInt()
+            val retained = canonicalIds[slot]
+            if (retained == 0) {
+                sortedNew += assignment
+            } else if (retained != encoded ||
+                canonicalCorrelation(slot)?.allocationFingerprint != assignment.allocationFingerprint
+            ) return false
+        }
+        sortedNew.sortWith { left, right ->
+            java.lang.Integer.compareUnsigned(left.id.value.toInt(), right.id.value.toInt())
+        }
+        var extendLast = false
+        if (sortedNew.isNotEmpty()) {
+            val firstId = sortedNew.first().id.value
+            val lastId = sortedNew.last().id.value
+            val priorFingerprint = if (allocationRangeCount == 0) null else {
+                val offset = (allocationRangeCount - 1) * HASH_BYTES
+                M3CanonicalReceiptBytes(allocationFingerprints.copyOfRange(offset, offset + HASH_BYTES))
+            }
+            extendLast = allocationRangeCount > 0 &&
+                (allocationRangeEnds[allocationRangeCount - 1].toLong() and UINT32_MASK) + 1L == firstId &&
+                priorFingerprint == sortedNew.first().allocationFingerprint
+            if (lastId - firstId + 1L != sortedNew.size.toLong() ||
+                sortedNew.any { it.allocationFingerprint != sortedNew.first().allocationFingerprint } ||
+                (!extendLast && allocationRangeCount >= MAX_ALLOCATION_RANGES) ||
+                (allocationRangeCount > 0 &&
+                    java.lang.Integer.compareUnsigned(
+                        allocationRangeEnds[allocationRangeCount - 1],
+                        firstId.toInt(),
+                    ) >= 0)
+            ) return false
+        }
+        for (assignment in sortedNew) {
+            canonicalIds[assignment.kernelSlot] = assignment.id.value.toInt()
+        }
+        for (assignment in assignments) {
+            accumulatedWeights[assignment.kernelSlot] = encodeWeightAndCanonical(
+                retainedWeight(assignment.kernelSlot), assignment.packedNormal, assignment.normalConfidence,
+            )
+        }
+        if (sortedNew.isNotEmpty()) {
+            if (extendLast) allocationRangeEnds[allocationRangeCount - 1] = sortedNew.last().id.value.toInt()
+            else {
+                allocationRangeStarts[allocationRangeCount] = sortedNew.first().id.value.toInt()
+                allocationRangeEnds[allocationRangeCount] = sortedNew.last().id.value.toInt()
+                sortedNew.first().allocationFingerprint.toByteArray().copyInto(
+                    allocationFingerprints,
+                    allocationRangeCount * HASH_BYTES,
+                )
+                allocationRangeCount++
+            }
+        }
+        return true
+    }
+
+    /** Hydrates one cold-recovery row before ordinary admissions resume. */
+    internal fun hydrateCanonicalSurface(row: M3CompactSurface, fingerprint: M3CanonicalReceiptBytes): Boolean {
+        if (row.id.value !in 1..UINT32_MASK || fingerprint.size != HASH_BYTES) return false
+        val key = VoxelKey(row.voxel.x, row.voxel.y, row.voxel.z)
+        if (findSlot(key) >= 0 || surfaceCount >= SURFACE_CAPACITY) return false
+        val octX = (row.packedNormal ushr 8).toByte().toInt()
+        val octY = row.packedNormal.toByte().toInt()
+        val decoded = M3NormalMath.decodeOct(octX, octY) ?: return false
+        val slot = surfaceCount
+        insertAt(slot, key)
+        accumulatedWeights[slot] = encodeWeightAndCanonical(
+            OCCUPANCY_THRESHOLD, row.packedNormal, row.normalConfidence,
+        )
+        observationCounts[slot] = encodeObservationState(0, M3FeaturePrimarySide.POSITIVE)
+        active[slot] = true
+        // Only the canonical octant survives restart. Seed a deterministic
+        // bounded prior strong enough that replaying one retained sample cannot
+        // manufacture a different octant from quantization noise.
+        axisXQ13[slot] = Math.multiplyExact(decoded[0], HYDRATED_AXIS_SCALE)
+        axisYQ13[slot] = Math.multiplyExact(decoded[1], HYDRATED_AXIS_SCALE)
+        axisZQ13[slot] = Math.multiplyExact(decoded[2], HYDRATED_AXIS_SCALE)
+        positiveSupportQ13[slot] = M3NormalMath.roundTiesEven(
+            row.normalConfidence.toLong() * 4L * 8192L, 255L,
+        ).toInt()
+        negativeSupportQ13[slot] = 0
+        return assignCanonicalCorrelations(listOf(
+            M3FeatureCanonicalAssignment(
+                slot, row.voxel.x, row.voxel.y, row.voxel.z, row.id, fingerprint,
+                row.packedNormal, row.normalConfidence,
+            ),
+        ))
+    }
+
+    internal fun canonicalCorrelation(kernelSlot: Int): M3FeatureCanonicalCorrelation? {
+        if (kernelSlot !in 0 until surfaceCount) return null
+        val encodedId = canonicalIds[kernelSlot]
+        if (encodedId == 0) return null
+        var low = 0
+        var high = allocationRangeCount - 1
+        while (low <= high) {
+            val mid = (low + high) ushr 1
+            when {
+                java.lang.Integer.compareUnsigned(encodedId, allocationRangeStarts[mid]) < 0 -> high = mid - 1
+                java.lang.Integer.compareUnsigned(encodedId, allocationRangeEnds[mid]) > 0 -> low = mid + 1
+                else -> {
+                    val offset = mid * HASH_BYTES
+                    return M3FeatureCanonicalCorrelation(
+                        M3SurfaceId(encodedId.toLong() and UINT32_MASK),
+                        M3CanonicalReceiptBytes(allocationFingerprints.copyOfRange(offset, offset + HASH_BYTES)),
+                        retainedPackedNormal(kernelSlot),
+                        retainedConfidence(kernelSlot),
+                    )
+                }
+            }
+        }
+        return null
+    }
+
+    private fun retainedWeight(slot: Int) = accumulatedWeights[slot].toByte().toInt()
+    private fun withWeight(encoded: Int, weight: Int) = (encoded and -0x100) or (weight and 0xff)
+    private fun retainedPackedNormal(slot: Int) = (accumulatedWeights[slot] ushr 8) and 0xffff
+    private fun retainedConfidence(slot: Int): Int = (accumulatedWeights[slot] ushr 24) and 0xff
+    private fun encodeWeightAndCanonical(weight: Int, packedNormal: Int, confidence: Int) =
+        (weight and 0xff) or ((packedNormal and 0xffff) shl 8) or
+            ((confidence.also { require(it in 0..255) } and 0xff) shl 24)
 
     private fun quantize(meters: Double): Int? {
         if (!meters.isFinite()) return null
@@ -292,6 +543,7 @@ internal class M3FeatureFusionKernel(
     }
 
     private fun refused(reason: M3FeatureFusionRefusal) = M3FeatureFusionResult.Refused(reason, receipt())
+    internal fun resourceReceipt(): M3FeatureFusionResourceReceipt = receipt()
     private fun receipt(surfaces: Int = surfaceCount, associations: Int = associationCount) =
         M3FeatureFusionResourceReceipt(surfaces, associations, M3_TUPLE_SHARE_BYTES)
 
@@ -384,10 +636,25 @@ internal class M3FeatureFusionKernel(
         ) : Staging
         data class Refused(val reason: M3FeatureFusionRefusal) : Staging
     }
+    private class PendingApplication(
+        val staged: Staging.Accepted,
+        val sequence: Long,
+        val timestampNs: Long,
+    ) {
+        var assignments: List<M3FeatureCanonicalAssignment>? = null
+        var sortedNewAssignments: List<M3FeatureCanonicalAssignment> = emptyList()
+        var extendLastRange: Boolean = false
+        var newRangeFingerprint: ByteArray? = null
+    }
 
-    private val surfaceX = IntArray(SURFACE_CAPACITY)
-    private val surfaceY = IntArray(SURFACE_CAPACITY)
-    private val surfaceZ = IntArray(SURFACE_CAPACITY)
+    // The normalized voxel domain is exactly three signed 21-bit coordinates.
+    // Sharing the renderer's canonical packing frees one primitive column for
+    // the exact uint32 canonical identity without growing the tuple payload.
+    private val surfaceKeys = LongArray(SURFACE_CAPACITY)
+    private val canonicalIds = IntArray(SURFACE_CAPACITY)
+    private val allocationRangeStarts = IntArray(MAX_ALLOCATION_RANGES)
+    private val allocationRangeEnds = IntArray(MAX_ALLOCATION_RANGES)
+    private val allocationFingerprints = ByteArray(MAX_ALLOCATION_RANGES * HASH_BYTES)
     private val accumulatedWeights = IntArray(SURFACE_CAPACITY)
     private val observationCounts = IntArray(SURFACE_CAPACITY)
     private val active = BooleanArray(SURFACE_CAPACITY)
@@ -403,15 +670,21 @@ internal class M3FeatureFusionKernel(
     private val hashSlots = IntArray(HASH_SLOTS)
     private var surfaceCount = 0
     private var associationCount = 0
+    private var allocationRangeCount = 0
     private var lastSequence = Long.MIN_VALUE
     private var lastTimestampNs = Long.MIN_VALUE
+    private var pending: PendingApplication? = null
 
     private companion object {
         const val SURFACE_CAPACITY = 100_000
         const val ASSOCIATION_CAPACITY = 200_000
         const val HASH_SLOTS = 262_144
         const val HASH_MASK = HASH_SLOTS - 1
-        const val M3_TUPLE_SHARE_BYTES = 7_549_000
+        const val M3_TUPLE_SHARE_BYTES = 7_589_960
+        const val MAX_ALLOCATION_RANGES = 1_024
+        const val HASH_BYTES = 32
+        const val UINT32_MASK = 0xffff_ffffL
+        const val HYDRATED_AXIS_SCALE = 1_024
         const val OCCUPANCY_THRESHOLD = 2
         const val DEACTIVATION_THRESHOLD = 1
         const val EVIDENCE_SATURATION = 127
@@ -485,7 +758,11 @@ internal sealed interface M3FeatureFusionChange {
     val y: Int
     val z: Int
 
-    data class Upsert(val candidate: M3FeatureFusionCandidate) : M3FeatureFusionChange {
+    data class Upsert(
+        val candidate: M3FeatureFusionCandidate,
+        internal val kernelSlot: Int = -1,
+        internal val canonicalCorrelation: M3FeatureCanonicalCorrelation? = null,
+    ) : M3FeatureFusionChange {
         override val x: Int get() = candidate.x
         override val y: Int get() = candidate.y
         override val z: Int get() = candidate.z
@@ -493,6 +770,22 @@ internal sealed interface M3FeatureFusionChange {
 
     data class Removal(override val x: Int, override val y: Int, override val z: Int) : M3FeatureFusionChange
 }
+internal data class M3FeatureCanonicalCorrelation(
+    val id: M3SurfaceId,
+    val allocationFingerprint: M3CanonicalReceiptBytes,
+    val packedNormal: Int,
+    val normalConfidence: Int,
+)
+internal data class M3FeatureCanonicalAssignment(
+    val kernelSlot: Int,
+    val x: Int,
+    val y: Int,
+    val z: Int,
+    val id: M3SurfaceId,
+    val allocationFingerprint: M3CanonicalReceiptBytes,
+    val packedNormal: Int = 0,
+    val normalConfidence: Int = 0,
+)
 internal data class M3FeatureFusionResourceReceipt(val surfaceCount: Int, val associationCount: Int, val assignedTupleShareBytes: Int)
 /** Scalar-only receipt for bounded output work; it never exposes retained rows. */
 internal data class M3FeatureFusionWorkReceipt(val distinctTouchedVoxelCount: Int, val emittedEventCount: Int)

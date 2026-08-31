@@ -167,6 +167,92 @@ class M3FeatureFusionKernelTest {
     }
 
     @Test
+    fun `packed signed voxel boundaries and uint32 canonical ranges round trip exactly`() {
+        val boundaries = listOf(
+            intArrayOf(VOXEL_COORDINATE_MIN, VOXEL_COORDINATE_MIN, VOXEL_COORDINATE_MIN),
+            intArrayOf(VOXEL_COORDINATE_MAX, VOXEL_COORDINATE_MAX, VOXEL_COORDINATE_MAX),
+            intArrayOf(VOXEL_COORDINATE_MIN, 0, VOXEL_COORDINATE_MAX),
+        )
+        boundaries.forEach { expected ->
+            assertArrayEquals(expected, unpackVisibilityGridKey(packVisibilityGridKey(expected[0], expected[1], expected[2])))
+        }
+
+        val kernel = kernel()
+        val accepted = accepted(kernel, batch(1, listOf(evidence(0, 0, 0, 2, 1), evidence(1, 0, 0, 2, 2))))
+        val changes = accepted.delta.map { it as M3FeatureFusionChange.Upsert }
+        val firstFingerprint = M3CanonicalReceiptBytes(ByteArray(32) { 0x11 })
+        val lastFingerprint = M3CanonicalReceiptBytes(ByteArray(32) { 0x7f })
+        assertTrue(kernel.assignCanonicalCorrelations(listOf(changes[0].assignment(M3SurfaceId(1), firstFingerprint))))
+        assertTrue(kernel.assignCanonicalCorrelations(listOf(changes[1].assignment(M3SurfaceId(0xffff_ffffL), lastFingerprint))))
+        assertEquals(M3SurfaceId(1), kernel.canonicalCorrelation(changes[0].kernelSlot)?.id)
+        assertEquals(firstFingerprint, kernel.canonicalCorrelation(changes[0].kernelSlot)?.allocationFingerprint)
+        assertEquals(M3SurfaceId(0xffff_ffffL), kernel.canonicalCorrelation(changes[1].kernelSlot)?.id)
+        assertEquals(lastFingerprint, kernel.canonicalCorrelation(changes[1].kernelSlot)?.allocationFingerprint)
+
+        val before = kernel.canonicalCorrelation(changes[0].kernelSlot)
+        assertFalse(kernel.assignCanonicalCorrelations(listOf(changes[0].assignment(M3SurfaceId(2), firstFingerprint))))
+        assertEquals(before, kernel.canonicalCorrelation(changes[0].kernelSlot))
+    }
+
+    @Test
+    fun `hydrated canonical row retains an identical observation without a material delta`() {
+        val sample = evidence(7, 0, 0, 2, 1)
+        val candidate = upserts(accepted(kernel(), batch(1, listOf(sample)))).single()
+        val target = requireNotNull(candidate.primaryCanonicalTarget())
+        val packed = ((target.normalOctX and 0xff) shl 8) or (target.normalOctY and 0xff)
+        val recovered = kernel()
+        assertTrue(recovered.hydrateCanonicalSurface(
+            M3CompactSurface(M3SurfaceId(1), target.voxel, packed, target.normalConfidence),
+            M3CanonicalReceiptBytes(ByteArray(32) { 3 }),
+        ))
+        assertTrue(accepted(recovered, batch(1, listOf(sample))).delta.isEmpty())
+    }
+
+    @Test
+    fun `discarded prepared new and existing refinements retry without retained mutation`() {
+        val kernel = kernel()
+        val newBatch = batch(1, listOf(evidence(0, 0, 0, 2, 1)))
+        val stagedNew = kernel.prepare(newBatch) as M3FeatureFusionResult.Accepted
+        assertEquals(0, kernel.resourceReceipt().surfaceCount)
+        assertEquals(0, kernel.resourceReceipt().associationCount)
+        kernel.discardPrepared()
+
+        val retriedNew = kernel.prepare(newBatch) as M3FeatureFusionResult.Accepted
+        assertEquals(stagedNew.delta, retriedNew.delta)
+        assertTrue(kernel.prepareCanonicalApplication(emptyList()))
+        kernel.applyPrepared()
+        assertEquals(1, kernel.resourceReceipt().surfaceCount)
+        assertEquals(1, kernel.resourceReceipt().associationCount)
+
+        val refinement = batch(2, listOf(evidence(0, 0, 0, 1, 2)))
+        val stagedRefinement = kernel.prepare(refinement) as M3FeatureFusionResult.Accepted
+        kernel.discardPrepared()
+        assertEquals(1, kernel.resourceReceipt().associationCount)
+        val retriedRefinement = kernel.prepare(refinement) as M3FeatureFusionResult.Accepted
+        assertEquals(stagedRefinement.delta, retriedRefinement.delta)
+        assertTrue(kernel.prepareCanonicalApplication(emptyList()))
+        kernel.applyPrepared()
+        assertEquals(2, kernel.resourceReceipt().associationCount)
+    }
+
+    @Test
+    fun `hydrated canonical confidence retains every uint8 boundary exactly`() {
+        val fingerprint = M3CanonicalReceiptBytes(ByteArray(32) { 0x4d })
+        val target = requireNotNull(
+            upserts(accepted(kernel(), batch(1, listOf(evidence(0, 0, 0, 2, 1))))).single().primaryCanonicalTarget(),
+        )
+        val packedNormal = ((target.normalOctX and 0xff) shl 8) or (target.normalOctY and 0xff)
+        listOf(0, 1, 63, 64, 191, 192, 255).forEachIndexed { index, confidence ->
+            val kernel = kernel()
+            assertTrue(kernel.hydrateCanonicalSurface(
+                M3CompactSurface(M3SurfaceId(1), M3Voxel(index, 0, 0), packedNormal, confidence),
+                fingerprint,
+            ))
+            assertEquals(confidence, kernel.canonicalCorrelation(0)?.normalConfidence)
+        }
+    }
+
+    @Test
     fun `constructed retained kernel graph fits its assigned M3 tuple share`() {
         val kernel = kernel()
         val outcome = accepted(kernel, batch(1, emptyList()))
@@ -176,7 +262,7 @@ class M3FeatureFusionKernelTest {
         // retained kernel state. GraphLayout measures the active JVM object model.
         val layout = GraphLayout.parseInstance(kernel)
         val retainedBytes = layout.totalSize()
-        val primitivePayloadBytes = 7_548_576L
+        val primitivePayloadBytes = 7_589_536L
         val overheadBytes = retainedBytes - primitivePayloadBytes
         val implementationBytes = requireNotNull(
             javaClass.classLoader?.getResourceAsStream(
@@ -186,7 +272,7 @@ class M3FeatureFusionKernelTest {
         println("M3_RETAINED_ALLOCATION_RECEIPT implementationClassSha256=${sha256(implementationBytes)} retainedBytes=$retainedBytes primitivePayloadBytes=$primitivePayloadBytes objectAndArrayOverheadBytes=$overheadBytes assignedTupleShareBytes=${outcome.receipt.assignedTupleShareBytes}")
         assertTrue("JVM graph measurement must include headers/alignment", overheadBytes > 0)
         assertTrue(retainedBytes <= outcome.receipt.assignedTupleShareBytes)
-        assertEquals(7_549_000, outcome.receipt.assignedTupleShareBytes)
+        assertEquals(7_589_960, outcome.receipt.assignedTupleShareBytes)
     }
 
     private fun kernel() = M3FeatureFusionKernel()
@@ -194,6 +280,9 @@ class M3FeatureFusionKernelTest {
         kernel.accept(batch) as M3FeatureFusionResult.Accepted
     private fun upserts(result: M3FeatureFusionResult.Accepted) =
         result.delta.mapNotNull { (it as? M3FeatureFusionChange.Upsert)?.candidate }
+
+    private fun M3FeatureFusionChange.Upsert.assignment(id: M3SurfaceId, fingerprint: M3CanonicalReceiptBytes) =
+        M3FeatureCanonicalAssignment(kernelSlot, x, y, z, id, fingerprint)
 
     private fun assertAtomicRefusal(
         reason: M3FeatureFusionRefusal,

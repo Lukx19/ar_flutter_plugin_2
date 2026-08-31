@@ -13,8 +13,41 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.openjdk.jol.info.GraphLayout
 
 class VisibilityGridRendererStateTest {
+    @Test
+    fun `renderer retains only exact group geometry after consuming restored keys`() {
+        val keys = LongArray(100) { packVisibilityGridKey(it, 0, 0) }
+        val config = group(keys.size).copy(restoredGeometryRevision = 1, restoredKeys = keys)
+        val geometry = M3RendererGroupGeometry.from(config)
+        assertEquals(168L, geometry.portableBytes)
+        assertEquals(GraphLayout.parseInstance(geometry).totalSize(), geometry.portableBytes)
+
+        val state = VisibilityGridRendererState(keys.size)
+        state.startGroup(config, geometryRevision = 1, restoredKeys = keys)
+        assertEquals(geometry.portableBytes, state.retainedGroupGeometryBytes)
+        assertTrue(GraphLayout.parseInstance(config).totalSize() > state.retainedGroupGeometryBytes)
+    }
+
+    @Test
+    fun `snapshot ownership receipt matches isolated full and sparse host handoffs`() {
+        val rows = 100
+        val keys = LongArray(rows) { packVisibilityGridKey(it, 0, 0) }
+        val state = VisibilityGridRendererState(rows)
+        state.startGroup(group(rows), geometryRevision = 1, restoredKeys = keys)
+        val full = state.snapshot()
+        assertEquals(GraphLayout.parseInstance(full).totalSize(), full.m3OwnershipReceipt().portableBytes)
+        assertEquals(M3RendererSnapshotOwnershipReceipt.fullResync(rows), full.m3OwnershipReceipt())
+
+        val sparseKeys = keys.filterIndexed { index, _ -> index % 2 == 0 }.toLongArray()
+        val style = CoverageRendererStyleRowV1(semanticGeneration = 1, styleGeneration = 1)
+        assertTrue(state.applyVisibility(1, 1, sparseKeys, styles(*Array(sparseKeys.size) { style })))
+        val sparse = state.snapshot()
+        assertEquals(GraphLayout.parseInstance(sparse).totalSize(), sparse.m3OwnershipReceipt().portableBytes)
+        assertEquals(M3RendererSnapshotOwnershipReceipt.maximumSparse(rows), sparse.m3OwnershipReceipt())
+    }
+
     @Test
     fun `renderer state exposes its complete primitive storage ownership`() {
         val centroid = VisibilityGridRendererState(
@@ -22,10 +55,10 @@ class VisibilityGridRendererStateTest {
         )
         val cubes = VisibilityGridRendererState(8_000)
 
-        // 20k rows (800,000), 65,536-slot key index (851,968), heap
+        // 20k rows (800,000), 32,768-slot key index (425,984), heap
         // (320,000), and dirty queue (100,000). These are retained arrays,
         // not a ledger estimate that may omit a second selector/state.
-        assertEquals(2_071_968, centroid.ownedStorageBytes)
+        assertEquals(1_645_984, centroid.ownedStorageBytes)
         assertEquals(
             8_000 * 40 +
                 LongRowIndex.ownedStorageBytes(8_000) +
@@ -33,6 +66,32 @@ class VisibilityGridRendererStateTest {
                 DirtyRowQueue.ownedStorageBytes(8_000),
             cubes.ownedStorageBytes,
         )
+    }
+
+    @Test
+    fun `long row index terminates collided probes above half load`() {
+        val index = LongRowIndex(capacity = 40)
+        val slot = LongRowIndex::class.java.getDeclaredMethod("slot", Long::class.javaPrimitiveType)
+            .also { it.isAccessible = true }
+        val keys = mutableListOf<Long>()
+        var candidate = 0L
+        while (keys.size < 40) {
+            if ((slot.invoke(index, candidate) as Int) < 32) keys += candidate
+            candidate++
+        }
+        val tableSize = LongRowIndex::class.java.getDeclaredField("keys")
+            .also { it.isAccessible = true }
+            .get(index).let { it as LongArray }.size
+        assertEquals(64, tableSize)
+        assertTrue(keys.size * 2 > tableSize)
+        assertTrue(keys.map { slot.invoke(index, it) as Int }.distinct().size < keys.size)
+
+        keys.forEachIndexed { row, key -> index[key] = row }
+        keys.forEachIndexed { row, key -> assertEquals(row, index[key]) }
+        assertEquals(null, index[candidate])
+        assertEquals(20, index.remove(keys[20]))
+        index[candidate] = 20
+        assertEquals(20, index[candidate])
     }
 
     @Test

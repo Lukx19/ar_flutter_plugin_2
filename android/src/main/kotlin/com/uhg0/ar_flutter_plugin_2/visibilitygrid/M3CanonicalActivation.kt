@@ -406,6 +406,16 @@ internal object M3CanonicalActivationSelector {
         }
     }
 
+    /** Revalidates only activation/current credentials for an owned composed cut. */
+    fun reopenAuthenticatedCurrent(
+        group: M3SurfaceGroup,
+        parent: File,
+        budget: M3CanonicalStorageBudget,
+        cut: M3CompactCanonicalCut,
+    ): M3CanonicalActivationResult = withGroupLock(parent, group) {
+        reopenLocked(group, parent, budget, authenticatedCut = cut)
+    }
+
     /**
      * Publishes an ACK-only activation root.  The semantic cut is copied
      * byte-for-byte; only the retained-current ownership changes.  The second
@@ -417,6 +427,7 @@ internal object M3CanonicalActivationSelector {
         budget: M3CanonicalStorageBudget,
         acknowledgement: M3CanonicalAcknowledgement,
         fault: M3CanonicalAcknowledgementFault? = null,
+        authenticatedCut: M3CompactCanonicalCut? = null,
     ): M3CanonicalAcknowledgementResult = withGroupLock(parent, group) {
         if (!reconcileReclaimsLocked(group, parent, budget) || !reconcileAttemptsLocked(group, parent, budget) || !reconcileAcknowledgementsLocked(group, parent, budget) ||
             !reconcileAdjacentTransactionsLocked(group, parent, budget)) {
@@ -427,6 +438,8 @@ internal object M3CanonicalActivationSelector {
             ?: return@withGroupLock M3CanonicalAcknowledgementResult.NoOp(M3CanonicalAcknowledgementNoOp.NO_CURRENT)
         val oldRoot = ActivationRoot.read(rootFile(parent, group, selector.rootHash), selector.rootHash)
             ?: return@withGroupLock M3CanonicalAcknowledgementResult.NoOp(M3CanonicalAcknowledgementNoOp.DURABILITY_FAILURE)
+        if (authenticatedCut != null && authenticatedCut != oldRoot.cut)
+            return@withGroupLock M3CanonicalAcknowledgementResult.NoOp(M3CanonicalAcknowledgementNoOp.DURABILITY_FAILURE)
         val expected = oldRoot.current
             ?: return@withGroupLock M3CanonicalAcknowledgementResult.NoOp(M3CanonicalAcknowledgementNoOp.NO_CURRENT)
         if (oldRoot.cut.geometryRevision != acknowledgement.geometryRevision ||
@@ -435,7 +448,7 @@ internal object M3CanonicalActivationSelector {
         if (expected.identity.commandHash != acknowledgement.commandHash)
             return@withGroupLock M3CanonicalAcknowledgementResult.NoOp(M3CanonicalAcknowledgementNoOp.COMMAND_MISMATCH)
         if (expected is CurrentRecord.Acknowledged) {
-            val rawReopened = reopenLocked(group, parent, budget)
+            val rawReopened = reopenLocked(group, parent, budget, authenticatedCut = authenticatedCut)
             val reopened = rawReopened as? M3CanonicalActivationResult.Active
                 ?: error("ack reopen failed: $rawReopened")
             return@withGroupLock M3CanonicalAcknowledgementResult.Idempotent(reopened.state)
@@ -508,7 +521,7 @@ internal object M3CanonicalActivationSelector {
             require(!attemptTarget.exists() || attemptTarget.delete())
             sync(parent, M3CanonicalActivationSyncStage.RECOVERY)
             inject(fault, M3CanonicalAcknowledgementFault.AFTER_CLEANUP)
-            val reopened = reopenLocked(group, parent, budget) as? M3CanonicalActivationResult.Active
+            val reopened = reopenLocked(group, parent, budget, authenticatedCut = authenticatedCut) as? M3CanonicalActivationResult.Active
                 ?: return@withGroupLock M3CanonicalAcknowledgementResult.NoOp(M3CanonicalAcknowledgementNoOp.DURABILITY_FAILURE)
             M3CanonicalAcknowledgementResult.Acknowledged(reopened.state)
         } catch (failure: Exception) {
@@ -529,8 +542,9 @@ internal object M3CanonicalActivationSelector {
         parent: File,
         budget: M3CanonicalStorageBudget,
         plan: M3PreparedCanonicalMutation,
-        boundBase: M3CompactCanonicalStore,
+        boundBase: M3CanonicalStateView,
         faults: M3CanonicalCommitFaults = M3CanonicalCommitFaults(),
+        authenticatedPrior: M3CanonicalPublishedCommit? = null,
     ): M3CanonicalAdjacentCommitResult = withGroupLock(parent, group) {
         if (plan.lifecycle() != M3PreparedMutationLifecycle.IN_FLIGHT)
             return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.PLAN_DISCARDED)
@@ -573,24 +587,31 @@ internal object M3CanonicalActivationSelector {
                 return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
             val store = M3CanonicalCommitStore.open(parent, budget)
                 ?: return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
+            var successor: M3CanonicalPublishedCommit? = null
             store.use {
-                when (val committed = store.commit(plan, boundBase, faults, acknowledged?.toIntentReceipt())) {
+                when (val committed = store.commit(
+                    plan, boundBase, faults, acknowledged?.toIntentReceipt(), authenticatedPrior,
+                )) {
                     is M3CanonicalCommitResult.Refused -> {
                         require(target.delete()); sync(parent, M3CanonicalActivationSyncStage.RECOVERY)
                         return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.COMMIT_REFUSED, commit = committed)
                     }
-                    is M3CanonicalCommitResult.Committed,
+                    is M3CanonicalCommitResult.Committed -> successor = committed.commit
                     is M3CanonicalCommitResult.UnknownAfterSwitch -> Unit
                 }
             }
             if (!observeAdjacentOwnership(boundBase, M3CanonicalAdjacentOwnershipStage.RECONCILE, plan) ||
-                !reconcileAdjacentTransactionsLocked(group, parent, budget, faults.adjacent, boundBase))
+                !reconcileAdjacentTransactionsLocked(
+                    group, parent, budget, faults.adjacent, boundBase, successor,
+                ))
                 return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
             if (!observeAdjacentOwnership(boundBase, M3CanonicalAdjacentOwnershipStage.REOPEN, plan))
                 return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
-            val active = reopenLocked(group, parent, budget, boundBase) as? M3CanonicalActivationResult.Active
+            val active = reopenLocked(
+                group, parent, budget, boundBase, successor?.view?.cut,
+            ) as? M3CanonicalActivationResult.Active
                 ?: return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
-            M3CanonicalAdjacentCommitResult.Committed(active.state)
+            M3CanonicalAdjacentCommitResult.Committed(active.state, successor)
         } catch (_: Exception) {
             adjacentRefusal(M3CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
         }
@@ -604,18 +625,21 @@ internal object M3CanonicalActivationSelector {
 
     /** A prepared adjacent mutation borrows exactly one live compact authority until completion. */
     private fun observeAdjacentOwnership(
-        base: M3CompactCanonicalStore,
+        base: M3CanonicalStateView,
         stage: M3CanonicalAdjacentOwnershipStage,
         plan: M3PreparedCanonicalMutation,
     ): Boolean {
-        val resident = base.residentOwnership()
+        val resident = (base.generationZeroAuthority as? M3CompactCanonicalStore)?.residentOwnership()
+            ?: M3CanonicalResidentOwnership(0, 0L)
         val observation = M3CanonicalAdjacentOwnershipObservation(
             stage, resident.liveStoreCount, resident.retainedBytes,
             plan.work.retainedPlanBytes, plan.work.writerScratchBytes,
             plan.work.constructionPeakBytes,
         )
         M3CanonicalActivationTestHooks.onAdjacentOwnership?.invoke(observation)
-        return resident.liveStoreCount == 1 && resident.retainedBytes == base.retainedMemoryReceipt().residentTotalBytes
+        return if (base.generationZeroAuthority is M3ScalarCanonicalAuthority) {
+            resident.liveStoreCount == 0 && resident.retainedBytes == 0L
+        } else resident.liveStoreCount == 1 && resident.retainedBytes == base.retainedMemoryReceipt().residentTotalBytes
     }
 
     /** Shared selector/restore lock used by every directory-backed ownership opener. */
@@ -840,6 +864,7 @@ internal object M3CanonicalActivationSelector {
         budget: M3CanonicalStorageBudget,
         fault: M3CanonicalAdjacentFault? = null,
         boundBase: M3CanonicalStateView? = null,
+        publishedSuccessor: M3CanonicalPublishedCommit? = null,
     ): Boolean = try {
         val target = adjacentAttemptFile(parent, group)
         if (!target.exists()) return true
@@ -885,34 +910,39 @@ internal object M3CanonicalActivationSelector {
             if (attempt.acknowledged == null) activationRoot.current == null
             else activationRoot.current is CurrentRecord.Acknowledged && activationRoot.current.identity == attempt.acknowledged
         )
-        val generationZero = boundBase ?: (M3CompactCanonicalStore.openV6(group, parent, budget) as? M3CompactCanonicalOpenResult.Opened)?.store ?: return false
-        try {
-            val base = generationZero
-            val store = M3CanonicalCommitStore.open(parent, budget) ?: return false
-            store.use {
-                when (val reopened = store.reopen(base, attempt.acknowledged?.toIntentReceipt())) {
-                    is M3CanonicalReopenResult.GenerationZero -> {
-                        require(target.delete()); sync(parent, M3CanonicalActivationSyncStage.RECOVERY); return true
-                    }
-                    is M3CanonicalReopenResult.Refused -> return false
-                    is M3CanonicalReopenResult.Selected -> reopened.commit.use { commit ->
-                        val published = commit.roots.lastOrNull() ?: return false
-                        require(published.baseRootHash == attempt.sourceRootHash &&
-                            published.commandHash == attempt.commandHash &&
-                            published.commandFingerprint == attempt.commandFingerprint &&
-                            commit.view.cut.rootHash == published.targetRootHash)
-                        val identity = M3CanonicalCurrentIdentity(
-                            published.commandHash, published.commandFingerprint,
-                            published.current.length, published.current.hash,
-                        )
-                        require(identity.canonicalLength <= M3CanonicalActivationResources.MAX_CURRENT_BYTES)
-                        val sourceFile = File(File(parent, published.generationDirectory), M3CanonicalCowGeneration.CURRENT_UNACKED_FILE)
-                        require(sourceFile.exists())
-                        publishAdjacentRoot(group, parent, budget, activationSelector, commit.view.cut, identity, sourceFile, fault)
+        fun publish(commit: M3CanonicalPublishedCommit): Boolean {
+            val published = commit.roots.lastOrNull() ?: return false
+            require(published.baseRootHash == attempt.sourceRootHash &&
+                published.commandHash == attempt.commandHash &&
+                published.commandFingerprint == attempt.commandFingerprint &&
+                commit.view.cut.rootHash == published.targetRootHash)
+            val identity = M3CanonicalCurrentIdentity(
+                published.commandHash, published.commandFingerprint,
+                published.current.length, published.current.hash,
+            )
+            require(identity.canonicalLength <= M3CanonicalActivationResources.MAX_CURRENT_BYTES)
+            val sourceFile = File(File(parent, published.generationDirectory), M3CanonicalCowGeneration.CURRENT_UNACKED_FILE)
+            require(sourceFile.exists())
+            publishAdjacentRoot(group, parent, budget, activationSelector, commit.view.cut, identity, sourceFile, fault)
+            return true
+        }
+        if (publishedSuccessor != null) {
+            if (!publish(publishedSuccessor)) return false
+        } else {
+            val generationZero = boundBase ?: (M3CompactCanonicalStore.openV6(group, parent, budget) as? M3CompactCanonicalOpenResult.Opened)?.store ?: return false
+            try {
+                val store = M3CanonicalCommitStore.open(parent, budget) ?: return false
+                store.use {
+                    when (val reopened = store.reopen(generationZero, attempt.acknowledged?.toIntentReceipt())) {
+                        is M3CanonicalReopenResult.GenerationZero -> {
+                            require(target.delete()); sync(parent, M3CanonicalActivationSyncStage.RECOVERY); return true
+                        }
+                        is M3CanonicalReopenResult.Refused -> return false
+                        is M3CanonicalReopenResult.Selected -> reopened.commit.use { if (!publish(it)) return false }
                     }
                 }
-            }
-        } finally { if (boundBase == null) generationZero.close() }
+            } finally { if (boundBase == null) generationZero.close() }
+        }
         require(target.delete()); sync(parent, M3CanonicalActivationSyncStage.RECOVERY)
         true
     } catch (_: Exception) { false }
@@ -989,6 +1019,7 @@ internal object M3CanonicalActivationSelector {
         parent: File,
         budget: M3CanonicalStorageBudget,
         boundBase: M3CanonicalStateView? = null,
+        authenticatedCut: M3CompactCanonicalCut? = null,
     ): M3CanonicalActivationResult {
         val selectorFile = selectorFile(parent, group)
         if (!selectorFile.exists()) return M3CanonicalActivationResult.Legacy
@@ -1002,24 +1033,26 @@ internal object M3CanonicalActivationSelector {
         if (root.cut.group != group || root.cut.profile != M3CompactCanonicalStore.PROFILE) {
             return M3CanonicalActivationResult.Refused(M3CanonicalActivationSelectorRefusal.FORKED_SELECTOR)
         }
-        val base = boundBase ?: (M3CompactCanonicalStore.openV6(group, parent, budget)
-            as? M3CompactCanonicalOpenResult.Opened)?.store
-            ?: return M3CanonicalActivationResult.Refused(M3CanonicalActivationSelectorRefusal.CORRUPT_V6)
-        val v6Cut = try {
+        val base = if (authenticatedCut == null) {
+            boundBase ?: (M3CompactCanonicalStore.openV6(group, parent, budget)
+                as? M3CompactCanonicalOpenResult.Opened)?.store
+                ?: return M3CanonicalActivationResult.Refused(M3CanonicalActivationSelectorRefusal.CORRUPT_V6)
+        } else boundBase
+        val v6Cut = authenticatedCut ?: try {
             val store = M3CanonicalCommitStore.open(parent, budget)
                 ?: return M3CanonicalActivationResult.Refused(M3CanonicalActivationSelectorRefusal.CORRUPT_V6)
             store.use {
                 // Activation owns the exact retained payload after supersession, so the
                 // duplicate embedded COW payload may already have been reclaimed.
                 val retained = root.current?.identity?.toIntentReceipt()
-                when (val selected = store.reopen(base, retained)) {
+                when (val selected = store.reopen(requireNotNull(base), retained)) {
                     is M3CanonicalReopenResult.GenerationZero -> selected.view.cut
                     is M3CanonicalReopenResult.Selected -> selected.commit.use { it.view.cut }
                     is M3CanonicalReopenResult.Refused ->
                         return M3CanonicalActivationResult.Refused(M3CanonicalActivationSelectorRefusal.CORRUPT_V6)
                 }
             }
-        } finally { if (boundBase == null) base.close() }
+        } finally { if (boundBase == null) base?.close() }
         if (v6Cut != root.cut) return M3CanonicalActivationResult.Refused(M3CanonicalActivationSelectorRefusal.FORKED_SELECTOR)
         val current = (root.current as? CurrentRecord.Unacknowledged)?.let { record ->
             val file = currentFile(parent, group, record)
@@ -1367,7 +1400,10 @@ internal sealed interface M3CanonicalAcknowledgementResult {
 }
 
 internal sealed interface M3CanonicalAdjacentCommitResult {
-    data class Committed(val state: M3CanonicalActivationState) : M3CanonicalAdjacentCommitResult
+    data class Committed(
+        val state: M3CanonicalActivationState,
+        internal val successor: M3CanonicalPublishedCommit? = null,
+    ) : M3CanonicalAdjacentCommitResult
     data class Refused(
         val reason: M3CanonicalAdjacentCommitRefusal,
         val commit: M3CanonicalCommitResult.Refused? = null,

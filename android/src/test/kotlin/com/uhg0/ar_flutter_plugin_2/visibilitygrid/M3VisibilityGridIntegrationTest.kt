@@ -7,6 +7,8 @@ import com.uhg0.ar_flutter_plugin_2.m0.M0aControlRequest
 import com.uhg0.ar_flutter_plugin_2.m0.M0aPacketCodec
 import com.uhg0.ar_flutter_plugin_2.m0.M0aStartRequestCodecV2
 import com.uhg0.ar_flutter_plugin_2.m0.M0aTransactionResponseProfileV1
+import com.uhg0.ar_flutter_plugin_2.m0.M0aTransactionChunkFrameV1
+import com.uhg0.ar_flutter_plugin_2.m0.M0aTransactionResponseCodecV1
 import com.uhg0.ar_flutter_plugin_2.m0.M0aUuid
 import com.uhg0.ar_flutter_plugin_2.capture.JvmDescriptorFilesystemV2
 import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetCoordinatorV2
@@ -26,6 +28,43 @@ import org.junit.Test
 
 /** Locks Option A's M1-ACK seeded CREATE cut without a Flutter payload seam. */
 class M3VisibilityGridIntegrationTest {
+    @Test
+    fun `renderer rebuild publishes one exact snapshot after all pages`() {
+        val rendered = mutableListOf<com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot>()
+        val projection = M3NativeRendererProjection(render = { snapshot, _ -> snapshot?.let(rendered::add) })
+        val cut = rendererOwnership()
+
+        projection.beginRebuild(cut, 9, 3)
+        projection.appendRebuildPage(cut, 9, 3, listOf(M3Voxel(1, 0, 0), M3Voxel(2, 0, 0)))
+        assertTrue(rendered.isEmpty())
+        projection.appendRebuildPage(cut, 9, 3, listOf(M3Voxel(3, 0, 0)))
+        assertTrue(rendered.isEmpty())
+        projection.finishRebuild(cut, 9, 3)
+
+        assertEquals(1, rendered.size)
+        assertEquals(3, rendered.single().count)
+        assertEquals(9L, rendered.single().update?.geometryRevision)
+    }
+
+    @Test
+    fun `renderer single page rebuild publishes once and aborted epoch publishes nothing`() {
+        val rendered = mutableListOf<com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot>()
+        val projection = M3NativeRendererProjection(render = { snapshot, _ -> snapshot?.let(rendered::add) })
+        val first = rendererOwnership()
+        val replacement = first.copy(coverageEpoch = 2, operationGeneration = 2)
+
+        projection.beginRebuild(first, 4, 1)
+        projection.appendRebuildPage(first, 4, 1, listOf(M3Voxel(1, 0, 0)))
+        projection.abortRebuild()
+        assertTrue(rendered.isEmpty())
+
+        projection.beginRebuild(replacement, 5, 1)
+        projection.appendRebuildPage(replacement, 5, 1, listOf(M3Voxel(2, 0, 0)))
+        projection.finishRebuild(replacement, 5, 1)
+        assertEquals(1, rendered.size)
+        assertEquals(5L, rendered.single().update?.geometryRevision)
+    }
+
     @Test
     fun `canonical integration consumes pinned primary after stronger opposing evidence`() {
         val kernel = M3FeatureFusionKernel()
@@ -97,6 +136,114 @@ class M3VisibilityGridIntegrationTest {
     }
 
     @Test
+    fun `canonical commit refusal leaves new and refined kernel batches retryable`() {
+        val directory = Files.createTempDirectory("m3-runtime-kernel-retry").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val binding = VisibilityGridV2Binding(messenger, 2116, M0aCommittedBaselineAuthority(), postToMain = { it() })
+        var refuseNext = true
+        val integration = M3VisibilityGridIntegration(
+            binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = resources(directory, coordinator),
+            commitCanonical = { runtime, mutation ->
+                if (refuseNext) {
+                    refuseNext = false
+                    runtime.commitAdjacent(
+                        mutation,
+                        M3CanonicalCommitFaults(journal = M3CanonicalDirtyJournalFault.BEFORE_ALLOCATION_RESERVATION),
+                    )
+                } else runtime.commitAdjacent(mutation)
+            },
+        )
+        try {
+            val stream = start(binding, messenger, 2116)
+            exchange(messenger, 2116, stream, 1, 0, 0, 0)
+            exchange(messenger, 2116, stream, 2, 0, 0, 0)
+            exchange(messenger, 2116, stream, 3, 1, 1, 1)
+            val cut = requireNotNull(binding.currentObservationOwnership())
+
+            integration.admitFeature(feature(cut, 10))
+            assertEquals("canonicalCommitRefused", integration.integrationReceipt().status)
+            var kernel = privateField<M3FeatureFusionKernel>(integration, "kernel")
+            assertEquals(0, kernel.resourceReceipt().surfaceCount)
+            assertEquals(0, kernel.resourceReceipt().associationCount)
+
+            integration.admitFeature(feature(cut, 11))
+            assertEquals("pendingAck", integration.integrationReceipt().status)
+            assertEquals(1, kernel.resourceReceipt().surfaceCount)
+            assertEquals(1, kernel.resourceReceipt().associationCount)
+            exchange(messenger, 2116, stream, 4, 1, 1, 1)
+            exchange(messenger, 2116, stream, 5, 1, 1, 1)
+            exchange(messenger, 2116, stream, 6, 1, 1, 1)
+            exchange(messenger, 2116, stream, 7, 2, 2, 1)
+            await { integration.integrationReceipt().status == "acknowledged" }
+
+            refuseNext = true
+            integration.admitFeature(feature(cut, 12, cameraX = 1.0))
+            assertEquals("batchCommitRefused", integration.integrationReceipt().status)
+            assertEquals(1, kernel.resourceReceipt().associationCount)
+            integration.admitFeature(feature(cut, 13, cameraX = 1.0))
+            assertEquals("pendingAck", integration.integrationReceipt().status)
+            assertEquals(2, kernel.resourceReceipt().associationCount)
+        } finally {
+            integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `queue throws before or after exact install retry ACK and admit a later batch`() {
+        listOf(false, true).forEachIndexed { index, throwAfterQueue ->
+            val directory = Files.createTempDirectory("m3-runtime-queue-retry-$index").toFile()
+            val coordinator = budget(directory)
+            val messenger = MethodTestMessenger()
+            val viewId = 2120 + index
+            val binding = VisibilityGridV2Binding(messenger, viewId, M0aCommittedBaselineAuthority(), postToMain = { it() })
+            var armed = true
+            val integration = M3VisibilityGridIntegration(
+                binding, binding::currentObservationOwnership, directory,
+                resourcesForGroup = resources(directory, coordinator),
+                queueCurrent = { activeBinding, source, selector ->
+                    if (armed) {
+                        armed = false
+                        if (throwAfterQueue) activeBinding.queueCommittedCurrentDelta(source, selector)
+                        throw IllegalStateException("injected queue boundary")
+                    }
+                    activeBinding.queueCommittedCurrentDelta(source, selector)
+                },
+            )
+            try {
+                val stream = start(binding, messenger, viewId)
+                exchange(messenger, viewId, stream, 1, 0, 0, 0)
+                exchange(messenger, viewId, stream, 2, 0, 0, 0)
+                exchange(messenger, viewId, stream, 3, 1, 1, 1)
+                val cut = requireNotNull(binding.currentObservationOwnership())
+
+                integration.admitFeature(feature(cut, 10))
+                assertEquals("publicationRetryPending", integration.integrationReceipt().status)
+                val kernel = privateField<M3FeatureFusionKernel>(integration, "kernel")
+                assertEquals(1, kernel.resourceReceipt().surfaceCount)
+                assertEquals(1, kernel.resourceReceipt().associationCount)
+                integration.admitFeature(feature(cut, 11, 0.32))
+                assertEquals("awaitingExactAck", integration.integrationReceipt().status)
+                assertEquals(1, kernel.resourceReceipt().surfaceCount)
+                assertEquals(1, kernel.resourceReceipt().associationCount)
+
+                exchange(messenger, viewId, stream, 4, 1, 1, 1)
+                exchange(messenger, viewId, stream, 5, 1, 1, 1)
+                exchange(messenger, viewId, stream, 6, 1, 1, 1)
+                exchange(messenger, viewId, stream, 7, 2, 2, 1)
+                await { integration.integrationReceipt().status == "acknowledged" }
+                integration.admitFeature(feature(cut, 12, 0.32))
+                assertEquals("pendingAck", integration.integrationReceipt().status)
+                assertEquals(2, kernel.resourceReceipt().surfaceCount)
+                assertEquals(2, kernel.resourceReceipt().associationCount)
+            } finally {
+                integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+            }
+        }
+    }
+
+    @Test
     fun `acknowledged initial CREATE admits the next material kernel batch through v6`() {
         val directory = Files.createTempDirectory("m3-runtime-next-batch").toFile()
         val coordinator = budget(directory)
@@ -117,13 +264,16 @@ class M3VisibilityGridIntegrationTest {
             exchange(messenger, 2108, stream, 2, 0, 0, 0)
             exchange(messenger, 2108, stream, 3, 1, 1, 1)
             val cut = requireNotNull(binding.currentObservationOwnership())
+            val baselineAccounting = chargedPhysical(directory, coordinator) to coordinator.committedBytes()
 
             integration.admitFeature(feature(cut, 10, 0.12))
+            val createPendingAccounting = chargedPhysical(directory, coordinator) to coordinator.committedBytes()
             exchange(messenger, 2108, stream, 4, 1, 1, 1)
             exchange(messenger, 2108, stream, 5, 1, 1, 1)
             exchange(messenger, 2108, stream, 6, 1, 1, 1)
             exchange(messenger, 2108, stream, 7, 2, 2, 1)
             await { integration.integrationReceipt().status == "acknowledged" }
+            val createAccounting = chargedPhysical(directory, coordinator) to coordinator.committedBytes()
 
             integration.admitFeature(feature(cut, 11, 0.32))
             val later = integration.integrationReceipt()
@@ -151,6 +301,56 @@ class M3VisibilityGridIntegrationTest {
                 current.identity.canonicalHash.toByteArray(),
                 MessageDigest.getInstance("SHA-256").digest(currentBytes),
             )
+            val chargedPhysicalBytes = chargedPhysical(directory, coordinator)
+            assertEquals(
+                "multi-generation ledger equals physical baseline=$baselineAccounting createPending=$createPendingAccounting create=$createAccounting",
+                chargedPhysicalBytes,
+                coordinator.committedBytes(),
+            )
+        } finally {
+            integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `empty accepted refinement does not borrow v6 or scan durable history`() {
+        val directory = Files.createTempDirectory("m3-runtime-empty-delta").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val binding = VisibilityGridV2Binding(messenger, 2110, M0aCommittedBaselineAuthority(), postToMain = { it() })
+        val integration = M3VisibilityGridIntegration(
+            binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = resources(directory, coordinator),
+        )
+        try {
+            val stream = start(binding, messenger, 2110)
+            exchange(messenger, 2110, stream, 1, 0, 0, 0)
+            exchange(messenger, 2110, stream, 2, 0, 0, 0)
+            exchange(messenger, 2110, stream, 3, 1, 1, 1)
+            val cut = requireNotNull(binding.currentObservationOwnership())
+            integration.admitFeature(feature(cut, 10, 0.12))
+            exchange(messenger, 2110, stream, 4, 1, 1, 1)
+            exchange(messenger, 2110, stream, 5, 1, 1, 1)
+            exchange(messenger, 2110, stream, 6, 1, 1, 1)
+            exchange(messenger, 2110, stream, 7, 2, 2, 1)
+            await { integration.integrationReceipt().status == "acknowledged" }
+
+            val groupDirectory = File(
+                directory,
+                "visibility-grid-m3-runtime/${cut.captureGroupId}",
+            )
+            val selector = requireNotNull(groupDirectory.listFiles()).single { it.name.endsWith(".selector") }
+            assertTrue(selector.delete())
+            val committedBefore = coordinator.committedBytes()
+
+            // The second equal observation changes retained kernel confidence
+            // inside the same canonical band, so its material delta is empty.
+            // A v6/current/coordinator borrow would now fail on the missing
+            // selector; the early no-op path remains independent of durability.
+            integration.admitFeature(feature(cut, 11, 0.12))
+            assertEquals("nonMaterialRetained", integration.integrationReceipt().status)
+            assertEquals(committedBefore, coordinator.committedBytes())
+            assertEquals(0, exchange(messenger, 2110, stream, 8, 2, 2, 1).first.messageKind)
         } finally {
             integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
         }
@@ -166,6 +366,7 @@ class M3VisibilityGridIntegrationTest {
             firstBinding, firstBinding::currentObservationOwnership, directory,
             resourcesForGroup = resources(directory, coordinator),
         )
+        lateinit var expectedCurrentHash: ByteArray
         try {
             val firstStream = start(firstBinding, messenger, 2109)
             exchange(messenger, 2109, firstStream, 1, 0, 0, 0)
@@ -173,6 +374,9 @@ class M3VisibilityGridIntegrationTest {
             exchange(messenger, 2109, firstStream, 3, 1, 1, 1)
             first.admitFeature(feature(requireNotNull(firstBinding.currentObservationOwnership()), 10, 0.12))
             assertEquals("pendingAck", first.integrationReceipt().status)
+            expectedCurrentHash = ((requireNotNull(privateField<M3CanonicalRuntimeResources>(first, "resources"))
+                .owner().activationState()?.current) as M3CanonicalActivationCurrent.Receipt)
+                .identity.canonicalHash.toByteArray()
         } finally {
             first.close(); firstBinding.dispose()
         }
@@ -196,10 +400,21 @@ class M3VisibilityGridIntegrationTest {
             assertTrue(replayRendered.isNotEmpty())
             assertEquals(1, replayRendered.last().count)
             assertEquals(2L, replayRendered.last().update?.geometryRevision)
-            exchange(messenger, 2109, stream, 4, 1, 1, 1)
-            exchange(messenger, 2109, stream, 5, 1, 1, 1)
-            exchange(messenger, 2109, stream, 6, 1, 1, 1)
-            exchange(messenger, 2109, stream, 7, 2, 2, 1)
+            var sequence = 4L
+            val begin = exchange(messenger, 2109, stream, sequence++, 1, 1, 1).first
+            assertEquals(2, begin.messageKind)
+            assertEquals(1, begin.baseGeometryRevision)
+            assertEquals(2, begin.targetGeometryRevision)
+            val replayed = ByteArrayOutputStream()
+            repeat(begin.chunkCount) { index ->
+                val chunk = exchange(messenger, 2109, stream, sequence++, 1, 1, 1).first
+                assertEquals(3, chunk.messageKind)
+                assertEquals(index, chunk.chunkIndex)
+                replayed.write((M0aTransactionResponseCodecV1.decodeFrame(chunk) as M0aTransactionChunkFrameV1).value.bytes)
+            }
+            assertEquals(4, exchange(messenger, 2109, stream, sequence++, 1, 1, 1).first.messageKind)
+            assertArrayEquals(expectedCurrentHash, MessageDigest.getInstance("SHA-256").digest(replayed.toByteArray()))
+            assertEquals(0, exchange(messenger, 2109, stream, sequence, 2, 2, 1).first.messageKind)
             await { replacement.integrationReceipt().status == "acknowledged" }
 
             replacement.admitFeature(feature(cut, 12, 0.32))
@@ -482,16 +697,18 @@ class M3VisibilityGridIntegrationTest {
         cut: VisibilityObservationOwnership,
         timestamp: Long,
         x: Double = 0.12,
+        cameraX: Double = 0.0,
     ): VisibilityFeatureObservation {
         val samples = VisibilityFeatureObservation.copySamples(
             listOf(VisibilityFeatureSample(7, x, 0.02, 0.02, 1.0)),
         )
+        val pose = identityVisibilityGridTransform().also { it[12] = cameraX }
         return VisibilityFeatureObservation(
             ownership = cut,
             frame = VisibilityObservationFrame(
                 VisibilityObservationSource.SYNTHETIC_FEATURE, timestamp, timestamp, timestamp,
                 "synthetic-camera", true, "landscape_right_x_right_y_down_v1",
-                VisibilityCameraPose.copyOf(identityVisibilityGridTransform()),
+                VisibilityCameraPose.copyOf(pose),
                 VisibilityCameraIntrinsics(16, 12, 10.0, 10.0, 8.0, 6.0),
                 VisibilityDepthCapability.UNSUPPORTED,
             ),
@@ -509,6 +726,14 @@ class M3VisibilityGridIntegrationTest {
             M3FeatureNormalEvidence(0, 0, 0, 20, 20, 20, cameraX, 20, 20, 32_767),
         )
     }
+
+    private fun rendererOwnership() = VisibilityObservationOwnership(
+        sessionId = "01".repeat(16), sessionGeneration = 1,
+        captureGroupId = "02".repeat(16), groupGeneration = 1, coverageEpoch = 1,
+        arSessionIdentity = "03".repeat(16), viewInstanceId = "04".repeat(16), viewGeneration = 1,
+        nativeStreamToken = "05".repeat(16), workerBindingToken = "06".repeat(16),
+        bindingGeneration = 1, lifecycleSequence = 1, operationGeneration = 1,
+    )
 
     private fun startRequest() = M0aControlRequest(
         M0aControlOperation.START, 0, uuid(1), uuid(20), uuid(40), 3, 4, 5, 0,
@@ -536,6 +761,15 @@ class M3VisibilityGridIntegrationTest {
         StorageBudgetPolicyV2(64L * 1024L * 1024L, 0),
         JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L }),
     ) { 128L * 1024L * 1024L }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun <T> privateField(owner: Any, name: String): T = owner.javaClass.getDeclaredField(name)
+        .also { it.isAccessible = true }.get(owner) as T
+
+    private fun chargedPhysical(directory: File, coordinator: StorageBudgetCoordinatorV2) =
+        File(directory, "visibility-grid-m3-runtime").listFiles().orEmpty()
+            .filter { it.isDirectory && it.name !in setOf("reservations-v2", "reclaims-v2") }
+            .sumOf { group -> group.listFiles().orEmpty().sumOf(M3CoordinatorStorageBudget(coordinator)::allocatedBytes) }
 
     private fun resources(
         directory: File,

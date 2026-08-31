@@ -29,6 +29,10 @@ internal class M3VisibilityGridIntegration(
     private val directory: File,
     private val resourcesForGroup: (M3SurfaceGroup) -> M3CanonicalRuntimeResources,
     private val renderer: M3CommittedRendererProjection = M3CommittedRendererProjection.NONE,
+    private val commitCanonical: (M3CanonicalRuntimeResources, M3PreparedCanonicalMutation) -> M3CanonicalAdjacentCommitResult =
+        { runtime, mutation -> runtime.commitAdjacent(mutation) },
+    private val queueCurrent: (VisibilityGridV2Binding, M0aCurrentDeltaSourceV1, M0aCurrentDeltaSelectorV1) -> M3CurrentDeltaQueueResult =
+        { activeBinding, source, selector -> activeBinding.queueCommittedCurrentDelta(source, selector) },
     private val beforeAdmission: () -> Unit = {},
     private val afterLifecycleFence: () -> Unit = {},
     private val executor: ExecutorService = Executors.newSingleThreadExecutor(),
@@ -48,6 +52,7 @@ internal class M3VisibilityGridIntegration(
     private var batchSequence = 0L
     private var nextTransactionId = 0L
     private var pending: M0aCurrentDeltaSelectorV1? = null
+    private var pendingQueued = false
     private var pendingCanonicalAcknowledgement: M3CanonicalAcknowledgement? = null
     private val retainedDelta = M3ExactCurrentDeltaSource()
     @Volatile private var committed = 0L
@@ -62,12 +67,22 @@ internal class M3VisibilityGridIntegration(
     override fun admitFeature(observation: VisibilityFeatureObservation) = mutate(observation.ownership) {
         if (isFenced(observation.ownership)) return@mutate
         if (pending != null) {
+            if (!pendingQueued && !retryPendingQueue()) {
+                rejected++
+                receipt = receipt.copy(rejected = rejected)
+                return@mutate
+            }
             rejected++
             receipt = receipt.copy(status = "awaitingExactAck", rejected = rejected)
             return@mutate
         }
         ensureOpened(observation.ownership) ?: return@mutate
         if (pending != null) {
+            if (!pendingQueued && !retryPendingQueue()) {
+                rejected++
+                receipt = receipt.copy(rejected = rejected)
+                return@mutate
+            }
             rejected++
             receipt = receipt.copy(status = "awaitingExactAck", rejected = rejected)
             return@mutate
@@ -80,7 +95,7 @@ internal class M3VisibilityGridIntegration(
                 receipt = receipt.copy(status = "normalEvidenceRefused", rejected = rejected)
                 return@mutate
             }
-        val fused = requireNotNull(kernel).accept(
+        val fused = requireNotNull(kernel).prepare(
             M3FeatureFusionBatch(
                 sequence = ++batchSequence,
                 timestampNs = observation.frame.sourceTimestampNs,
@@ -94,7 +109,10 @@ internal class M3VisibilityGridIntegration(
             receipt = receipt.copy(status = "kernelRefused", rejected = rejected)
             return@mutate
         }
-        if (isFenced(observation.ownership)) return@mutate
+        if (isFenced(observation.ownership)) {
+            requireNotNull(kernel).discardPrepared()
+            return@mutate
+        }
         val state = requireNotNull(owner).activationState()
         if (state?.current == M3CanonicalActivationCurrent.None &&
             state.cut.liveSurfaceCount == 0
@@ -166,6 +184,19 @@ internal class M3VisibilityGridIntegration(
     }
 
     fun integrationReceipt(): M3VisibilityGridIntegrationReceipt = synchronized(lock) { receipt }
+
+    /** Portable scalar owners only; kernel/renderer arrays and phase buffers are named separately. */
+    internal fun portableOwnerMemoryReceipt(): M3RuntimeOwnerMemoryReceipt = synchronized(lock) {
+        M3RuntimeOwnerMemoryReceipt(
+            integrationObjectBytes = 144,
+            integrationReceiptBytes = 104,
+            retainedDeltaOwnerBytes = 16,
+            runtimeOwnerBytes = resources?.portableOwnerBytes() ?: 0,
+            bindingOwnerBytes = binding.m3PortableOwnerBytes(),
+            coordinatorOwnerBytes = resources?.portableCoordinatorOwnerBytes() ?: 0,
+            rendererOwnerBytes = renderer.portableOwnerBytes(),
+        )
+    }
 
     override fun close() {
         synchronized(publicationGate) {
@@ -250,6 +281,8 @@ internal class M3VisibilityGridIntegration(
         val targets = changes.mapNotNull { (it as? M3FeatureFusionChange.Upsert)?.candidate }
             .mapNotNull(M3FeatureFusionCandidate::primaryCanonicalTarget)
         if (targets.isEmpty()) {
+            check(requireNotNull(kernel).prepareCanonicalApplication(emptyList()))
+            requireNotNull(kernel).applyPrepared()
             receipt = receipt.copy(status = "nonMaterialRetained")
             return
         }
@@ -264,23 +297,33 @@ internal class M3VisibilityGridIntegration(
                 targets = targets,
             ))
         } ?: run {
+            requireNotNull(kernel).discardPrepared()
             rejected++
             receipt = receipt.copy(status = "v6ReadRefused", rejected = rejected)
             return
         }
         val prepared = preparation as? M3CanonicalMutationPreparation.Prepared ?: run {
+            requireNotNull(kernel).discardPrepared()
             rejected++
             receipt = receipt.copy(status = "canonicalRefused", rejected = rejected)
             return
         }
         val voxels = ArrayList<M3Voxel>(prepared.mutation.dirtyRowCount)
-        prepared.mutation.visitDirtyRows { row -> voxels += row.voxel; true }
-        val state = (activeOwner.commitAdjacentCanonicalMutation(prepared.mutation)
+        val assignments = canonicalAssignments(changes, prepared.mutation, voxels)
+        if (!requireNotNull(kernel).prepareCanonicalApplication(assignments)) {
+            requireNotNull(kernel).discardPrepared()
+            rejected++
+            receipt = receipt.copy(status = "kernelApplyRefused", rejected = rejected)
+            return
+        }
+        val state = (commitCanonical(requireNotNull(resources), prepared.mutation)
             as? M3CanonicalAdjacentCommitResult.Committed)?.state ?: run {
+            requireNotNull(kernel).discardPrepared()
             rejected++
             receipt = receipt.copy(status = "canonicalCommitRefused", rejected = rejected)
             return
         }
+        requireNotNull(kernel).applyPrepared()
         publishV6Current(expected, state, voxels)
     }
 
@@ -288,8 +331,17 @@ internal class M3VisibilityGridIntegration(
         expected: VisibilityObservationOwnership,
         changes: List<M3FeatureFusionChange>,
     ) {
+        // An accepted kernel batch with no material delta needs no canonical
+        // authority at all. In particular, do not turn a no-op refinement into
+        // an O(history) selector/coordinator recovery scan.
+        if (changes.isEmpty()) {
+            check(requireNotNull(kernel).prepareCanonicalApplication(emptyList()))
+            requireNotNull(kernel).applyPrepared()
+            receipt = receipt.copy(status = "nonMaterialRetained")
+            return
+        }
         val activeOwner = requireNotNull(owner)
-        val preparation = requireNotNull(resources).withCurrent {
+        val preparation = requireNotNull(resources).withCorrelatedCurrent(changes) {
             activeOwner.prepareAdjacentMutation(
                 it,
                 M3CanonicalFeatureBatchCommand(
@@ -300,33 +352,72 @@ internal class M3VisibilityGridIntegration(
                 ),
             )
         } ?: run {
+            requireNotNull(kernel).discardPrepared()
             rejected++
             receipt = receipt.copy(status = "v6ReadRefused", rejected = rejected)
             return
         }
         val prepared = preparation as? M3CanonicalMutationPreparation.Prepared ?: run {
             if (preparation is M3CanonicalMutationPreparation.NoOp) {
+                check(requireNotNull(kernel).prepareCanonicalApplication(emptyList()))
+                requireNotNull(kernel).applyPrepared()
                 receipt = receipt.copy(status = "nonMaterialRetained")
             } else {
+                requireNotNull(kernel).discardPrepared()
                 rejected++
                 receipt = receipt.copy(status = "batchRefused", rejected = rejected)
             }
             return
         }
         val voxels = ArrayList<M3Voxel>(prepared.mutation.dirtyRowCount)
-        prepared.mutation.visitDirtyRows { row -> voxels += row.voxel; true }
-        val committedState = (activeOwner.commitAdjacentCanonicalMutation(prepared.mutation)
+        val assignments = canonicalAssignments(changes, prepared.mutation, voxels)
+        if (!requireNotNull(kernel).prepareCanonicalApplication(assignments)) {
+            requireNotNull(kernel).discardPrepared()
+            rejected++
+            receipt = receipt.copy(status = "kernelApplyRefused", rejected = rejected)
+            return
+        }
+        val committedState = (commitCanonical(requireNotNull(resources), prepared.mutation)
             as? M3CanonicalAdjacentCommitResult.Committed)?.state ?: run {
+            requireNotNull(kernel).discardPrepared()
             rejected++
             receipt = receipt.copy(status = "batchCommitRefused", rejected = rejected)
             return
         }
+        requireNotNull(kernel).applyPrepared()
         if (isFenced(expected)) {
             fenced++
             receipt = receipt.copy(status = "publicationDeferred", fenced = fenced)
             return
         }
         publishV6Current(expected, committedState, voxels)
+    }
+
+    private fun canonicalAssignments(
+        changes: List<M3FeatureFusionChange>,
+        mutation: M3PreparedCanonicalMutation,
+        voxels: MutableList<M3Voxel>,
+    ): List<M3FeatureCanonicalAssignment> {
+        val slots = HashMap<M3Voxel, Int>()
+        changes.forEach { change ->
+            val upsert = change as? M3FeatureFusionChange.Upsert ?: return@forEach
+            check(upsert.kernelSlot >= 0)
+            slots[M3Voxel(upsert.x, upsert.y, upsert.z)] = upsert.kernelSlot
+        }
+        val assignments = ArrayList<M3FeatureCanonicalAssignment>(mutation.dirtyRowCount)
+        check(mutation.visitDirtyRows { row ->
+            val slot = slots[row.voxel] ?: return@visitDirtyRows false
+            voxels += row.voxel
+            assignments += M3FeatureCanonicalAssignment(
+                slot, row.voxel.x, row.voxel.y, row.voxel.z, row.id, row.allocationFingerprint,
+                row.packedNormal, row.normalConfidence,
+            )
+            true
+        })
+        check(assignments.size == slots.size) {
+            "prepared canonical mutation did not name every staged kernel upsert"
+        }
+        return assignments
     }
 
     private fun publishV6Current(
@@ -368,17 +459,7 @@ internal class M3VisibilityGridIntegration(
             state.cut.lineageRevision,
         )
         pending = selector
-        try {
-            binding.queueCommittedCurrentDelta(retainedDelta, selector)
-        } catch (_: IllegalStateException) {
-            fenced++
-            receipt = receipt.copy(status = "publicationFenced", fenced = fenced)
-            return
-        } catch (_: IllegalArgumentException) {
-            fenced++
-            receipt = receipt.copy(status = "publicationFenced", fenced = fenced)
-            return
-        }
+        pendingQueued = false
         // Renderer and worker name the same durable cut. This callback never
         // enters Flutter and cannot expose ordinary row bytes.
         val rendererRows = if (rendererAlreadyCurrent) renderer.currentRowCount()
@@ -390,6 +471,26 @@ internal class M3VisibilityGridIntegration(
             state.cut.lineageRevision, canonicalBytes.size, rendererRows,
             committed, rejected, fenced, canonicalOperation(canonicalBytes),
         )
+        retryPendingQueue()
+    }
+
+    /** Idempotently correlates the already-retained durable current to V2. */
+    private fun retryPendingQueue(): Boolean {
+        val selector = pending ?: return true
+        return try {
+            queueCurrent(binding, retainedDelta, selector)
+            pendingQueued = true
+            receipt = receipt.copy(status = "pendingAck")
+            true
+        } catch (_: IllegalStateException) {
+            pendingQueued = false
+            receipt = receipt.copy(status = "publicationRetryPending")
+            false
+        } catch (_: IllegalArgumentException) {
+            pendingQueued = false
+            receipt = receipt.copy(status = "publicationRetryPending")
+            false
+        }
     }
 
     private fun rebuildCanonicalRenderer(
@@ -397,23 +498,25 @@ internal class M3VisibilityGridIntegration(
         state: M3CanonicalActivationState,
     ) {
         renderer.beginRebuild(expected, state.cut.geometryRevision, state.cut.lineageRevision)
+        var finished = false
+        try {
         val maximumRows = renderer.maximumRows
-        if (maximumRows == 0) return
-        var cursor = 0L
-        var rebuilt = 0
-        while (true) {
-            if (isFenced(expected)) return
-            val page = requireNotNull(resources).readRendererPage(
-                cursor, minOf(512, maximumRows - rebuilt),
-            ) ?: run {
-                rejected++
-                receipt = receipt.copy(status = "rebuildRefused", rejected = rejected)
-                return
-            }
+        val rebuilt = requireNotNull(resources).rebuildAndHydrate(requireNotNull(kernel), maximumRows) { page ->
+            if (isFenced(expected)) throw M3RendererRebuildFenced()
             renderer.appendRebuildPage(expected, page.cut.geometryRevision, page.cut.lineageRevision, page.voxels)
-            rebuilt += page.voxels.size
-            if (rebuilt >= maximumRows) return
-            cursor = page.nextCursor ?: return
+        } ?: run {
+            rejected++
+            receipt = receipt.copy(status = "rebuildRefused", rejected = rejected)
+            return
+        }
+        if (rebuilt != state.cut || isFenced(expected)) return
+        renderer.finishRebuild(expected, state.cut.geometryRevision, state.cut.lineageRevision)
+        finished = true
+        return
+        } catch (_: M3RendererRebuildFenced) {
+            return
+        } finally {
+            if (!finished) renderer.abortRebuild()
         }
     }
 
@@ -422,7 +525,7 @@ internal class M3VisibilityGridIntegration(
         runCatching {
             executor.submit {
                 synchronized(lock) {
-                    if (pending != selector || closed) return@synchronized
+                    if (pending != selector || !pendingQueued || closed) return@synchronized
                     val acknowledgement = requireNotNull(pendingCanonicalAcknowledgement)
                     when (val result = requireNotNull(owner).acknowledgeCanonicalCurrent(acknowledgement)) {
                         is M3CanonicalAcknowledgementResult.Acknowledged,
@@ -434,6 +537,7 @@ internal class M3VisibilityGridIntegration(
                     }
                     retainedDelta.acknowledge(selector)
                     pending = null
+                    pendingQueued = false
                     pendingCanonicalAcknowledgement = null
                     receipt = receipt.copy(status = "acknowledged")
                 }
@@ -444,6 +548,7 @@ internal class M3VisibilityGridIntegration(
     private fun closeOwner() {
         retainedDelta.clear()
         pending = null
+        pendingQueued = false
         resources?.close() ?: owner?.close()
         resources = null
         owner = null
@@ -453,6 +558,21 @@ internal class M3VisibilityGridIntegration(
 
     private fun drain() { executor.submit {}.get(2, TimeUnit.SECONDS) }
 }
+
+internal data class M3RuntimeOwnerMemoryReceipt(
+    val integrationObjectBytes: Long,
+    val integrationReceiptBytes: Long,
+    val retainedDeltaOwnerBytes: Long,
+    val runtimeOwnerBytes: Long,
+    val bindingOwnerBytes: Long,
+    val coordinatorOwnerBytes: Long,
+    val rendererOwnerBytes: Long,
+) {
+    val portableBytes: Long get() = integrationObjectBytes + integrationReceiptBytes + retainedDeltaOwnerBytes +
+        runtimeOwnerBytes + bindingOwnerBytes + coordinatorOwnerBytes + rendererOwnerBytes
+}
+
+private class M3RendererRebuildFenced : RuntimeException()
 
 /** #111 owns creating an ID for OPPOSING; current CREATE consumes pinned PRIMARY only. */
 internal fun M3FeatureFusionCandidate.primaryCanonicalTarget(): M3CanonicalTarget? =
@@ -474,6 +594,7 @@ internal interface M3CommittedRendererProjection : AutoCloseable {
         voxels: List<M3Voxel>,
     ): Int
     fun currentRowCount(): Int = 0
+    fun portableOwnerBytes(): Long = 0
     fun beginRebuild(
         ownership: VisibilityObservationOwnership,
         geometryRevision: Long,
@@ -485,6 +606,12 @@ internal interface M3CommittedRendererProjection : AutoCloseable {
         lineageRevision: Long,
         voxels: List<M3Voxel>,
     ) = Unit
+    fun finishRebuild(
+        ownership: VisibilityObservationOwnership,
+        geometryRevision: Long,
+        lineageRevision: Long,
+    ) = Unit
+    fun abortRebuild() = Unit
     fun clear() = Unit
     override fun close() = Unit
     companion object {
@@ -513,7 +640,12 @@ internal class M3NativeRendererProjection(
     private var closed = false
     private var rebuildKeys = LongArray(capacity)
     private var rebuildCount = 0
+    private var rebuildOwnership: VisibilityObservationOwnership? = null
+    private var rebuildGeometryRevision = 0L
+    private var rebuildLineageRevision = 0L
     override val maximumRows: Int get() = state.capacity
+    override fun portableOwnerBytes(): Long =
+        56L + 96L + 64L + state.retainedGroupGeometryBytes // projection, state, native config, group geometry
 
     @Synchronized
     override fun project(
@@ -542,6 +674,9 @@ internal class M3NativeRendererProjection(
     ) {
         check(!closed)
         rebuildCount = 0
+        rebuildOwnership = ownership
+        rebuildGeometryRevision = geometryRevision
+        rebuildLineageRevision = lineageRevision
     }
 
     @Synchronized
@@ -552,8 +687,29 @@ internal class M3NativeRendererProjection(
         voxels: List<M3Voxel>,
     ) {
         check(!closed)
+        check(rebuildOwnership == ownership && rebuildGeometryRevision == geometryRevision &&
+            rebuildLineageRevision == lineageRevision
+        ) { "Renderer rebuild page does not name the active canonical cut" }
         appendKeys(voxels)
+    }
+
+    @Synchronized
+    override fun finishRebuild(
+        ownership: VisibilityObservationOwnership,
+        geometryRevision: Long,
+        lineageRevision: Long,
+    ) {
+        check(!closed)
+        check(rebuildOwnership == ownership && rebuildGeometryRevision == geometryRevision &&
+            rebuildLineageRevision == lineageRevision
+        ) { "Renderer rebuild finish does not name the active canonical cut" }
         renderKeys(ownership, geometryRevision)
+        discardRebuild()
+    }
+
+    @Synchronized
+    override fun abortRebuild() {
+        discardRebuild()
     }
 
     private fun appendKeys(voxels: List<M3Voxel>) {
@@ -586,6 +742,7 @@ internal class M3NativeRendererProjection(
     @Synchronized
     override fun clear() {
         if (closed) return
+        discardRebuild()
         state.stopGroup()
         render(null, null)
     }
@@ -594,8 +751,16 @@ internal class M3NativeRendererProjection(
     override fun close() {
         if (closed) return
         closed = true
+        discardRebuild()
         state.dispose()
         render(null, null)
+    }
+
+    private fun discardRebuild() {
+        rebuildCount = 0
+        rebuildOwnership = null
+        rebuildGeometryRevision = 0
+        rebuildLineageRevision = 0
     }
 }
 

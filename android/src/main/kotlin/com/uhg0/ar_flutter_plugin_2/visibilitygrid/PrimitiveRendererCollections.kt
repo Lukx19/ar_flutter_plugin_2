@@ -11,7 +11,10 @@ internal class LongRowIndex(capacity: Int) {
     init {
         require(capacity > 0)
         var tableSize = 1
-        while (tableSize < capacity * 2) tableSize = tableSize shl 1
+        // Open addressing needs one EMPTY sentinel so a missing-key probe terminates.
+        // The next power of two strictly above capacity preserves that invariant
+        // without retaining a second full table's worth of presentation rows.
+        while (tableSize <= capacity) tableSize = tableSize shl 1
         mask = tableSize - 1
         keys = LongArray(tableSize)
         values = IntArray(tableSize)
@@ -89,7 +92,7 @@ internal class LongRowIndex(capacity: Int) {
         fun ownedStorageBytes(capacity: Int): Int {
             require(capacity > 0)
             var tableSize = 1
-            while (tableSize < capacity * 2) tableSize = tableSize shl 1
+            while (tableSize <= capacity) tableSize = tableSize shl 1
             return tableSize * (Long.SIZE_BYTES + Int.SIZE_BYTES + Byte.SIZE_BYTES)
         }
     }

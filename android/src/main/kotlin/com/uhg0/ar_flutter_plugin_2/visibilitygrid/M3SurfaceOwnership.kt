@@ -258,13 +258,13 @@ internal class M3SurfaceOwnership private constructor(
         if (closed) return M3CanonicalAcknowledgementResult.NoOp(M3CanonicalAcknowledgementNoOp.CLOSED)
         val parent = v6Parent ?: return M3CanonicalAcknowledgementResult.NoOp(M3CanonicalAcknowledgementNoOp.NO_CURRENT)
         val budget = v6Budget ?: return M3CanonicalAcknowledgementResult.NoOp(M3CanonicalAcknowledgementNoOp.NO_CURRENT)
-        return M3CanonicalActivationSelector.acknowledge(group, parent, budget, acknowledgement, fault).also { result ->
+        val authenticatedCut = activation?.cut
+        return M3CanonicalActivationSelector.acknowledge(
+            group, parent, budget, acknowledgement, fault, authenticatedCut,
+        ).also { result ->
             when (result) {
-                is M3CanonicalAcknowledgementResult.Acknowledged,
-                is M3CanonicalAcknowledgementResult.Idempotent -> {
-                    val reopened = M3CanonicalActivationSelector.reopen(group, parent, budget)
-                    if (reopened is M3CanonicalActivationResult.Active) activation = reopened.state
-                }
+                is M3CanonicalAcknowledgementResult.Acknowledged -> activation = result.state
+                is M3CanonicalAcknowledgementResult.Idempotent -> activation = result.state
                 is M3CanonicalAcknowledgementResult.NoOp -> Unit
             }
         }
@@ -301,10 +301,10 @@ internal class M3SurfaceOwnership private constructor(
                 )
             }
         }
-        val boundBase = when (val resolution = M3CanonicalAuthorityLeaseRegistry.resolve(
+        val authority = when (val resolution = M3CanonicalAuthorityLeaseRegistry.resolve(
             plan.authorityLease, group, parent, adjacentOwnerCapability,
         )) {
-            is M3CanonicalAuthorityLeaseResolution.Resolved -> resolution.store
+            is M3CanonicalAuthorityLeaseResolution.Resolved -> resolution
             is M3CanonicalAuthorityLeaseResolution.Refused -> {
                 plan.finish(M3PreparedMutationFinish.TERMINAL)
                 return M3CanonicalAdjacentCommitResult.Refused(
@@ -312,9 +312,10 @@ internal class M3SurfaceOwnership private constructor(
                 )
             }
         }
+        val boundBase = authority.authority
         return try {
             when (val result = M3CanonicalActivationSelector.commitAdjacent(
-                group, parent, budget, plan, boundBase, faults,
+                group, parent, budget, plan, boundBase, faults, authority.published,
             )) {
                 is M3CanonicalAdjacentCommitResult.Committed -> {
                     check(plan.finish(M3PreparedMutationFinish.SUCCESS) == M3PreparedMutationLifecycle.CONSUMED)
@@ -795,7 +796,11 @@ internal data class M3SurfaceOwnershipConfiguration(
     val seededEmptyBaseline: M3CommittedEmptyBaseline? = null,
 ) { internal val isValid get() = voxelMicrometers > 0 && regionMicrometers > 0 && pageMicrometers > 0 && regionMicrometers % voxelMicrometers == 0 && pageMicrometers % voxelMicrometers == 0 && regionMicrometers == pageMicrometers * 3 && surfaceCapacity > 0 && receiptCapacity > 0 && transactionCapacity > 0 && lineageCapacity > 0 && changeJournalByteCapacity > 0 && revisionLimit >= 0 && (seededEmptyBaseline == null || seededEmptyBaseline.geometryRevision <= revisionLimit && seededEmptyBaseline.lineageRevision <= revisionLimit) }
 
-/** Empty M3 baseline derived only after M1's exact bootstrap acknowledgement. */
+/**
+ * Empty M3 baseline derived only after an exact bootstrap acknowledgement.
+ * Transaction zero is the binding-local cursor for an authority-authenticated
+ * restored cut; fresh ZERO bootstrap and all public material selectors remain positive.
+ */
 @ConsistentCopyVisibility
 internal data class M3CommittedEmptyBaseline internal constructor(
     val bindingIdentity: String,
@@ -807,7 +812,7 @@ internal data class M3CommittedEmptyBaseline internal constructor(
     init {
         require(bindingIdentity.isNotBlank() && bindingIdentity.length <= 256)
         require(groupIdentity.isNotBlank() && groupIdentity.encodeToByteArray().size <= 128)
-        require(transactionId > 0 && geometryRevision > 0 && lineageRevision > 0)
+        require(transactionId >= 0 && geometryRevision > 0 && lineageRevision > 0)
     }
 }
 

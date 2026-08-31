@@ -84,6 +84,17 @@ internal data class M3AllocationCheckpoint(
     val history: M3AllocationHistoryReceipt,
     val authorityHighWaterSeen: Boolean,
 ) {
+    /**
+     * A checkpoint authenticates its allocation-history prefix. Whether that
+     * prefix happened to contain the authority high-water is reopen-local: a
+     * later adjacent cut can legitimately advance beyond an older prefix.
+     */
+    fun matchesHistoryPrefix(chain: M3AllocationChain): Boolean =
+        revision == chain.lastRevision &&
+            highWater == chain.highWater &&
+            lastHash.contentEquals(chain.lastHash) &&
+            history == chain.history
+
     fun encoded(): ByteArray {
         val body = ByteArrayOutputStream().use { output ->
             DataOutputStream(output).use { data ->

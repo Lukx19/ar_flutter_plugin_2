@@ -36,6 +36,8 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
+internal enum class M3CurrentDeltaQueueResult { QUEUED, ALREADY_QUEUED, RECOVERED_EXACT_QUEUE }
+
 /**
  * Production owner for one immutable V2 platform-view binding generation.
  *
@@ -49,6 +51,7 @@ class VisibilityGridV2Binding internal constructor(
     private val viewId: Int,
     private val committedBaselineAuthority: M0aCommittedBaselineAuthority,
     private val bindingGenerationSeed: Long = nextBindingGeneration.incrementAndGet(),
+    private val lifecycleSequenceAllocator: () -> Long = { nextLifecycleSequence.incrementAndGet() },
     private val viewGeneration: Long = nextViewGeneration.incrementAndGet(),
     private val executor: ExecutorService = Executors.newSingleThreadExecutor(),
     private val arSessionIdentity: ByteArray = newOpaqueToken(),
@@ -82,6 +85,8 @@ class VisibilityGridV2Binding internal constructor(
     @Volatile private var issue98Probe: M0aDebugTransportProbe? = null
     @Volatile private var issue98Correlation: ByteArray? = null
     @Volatile private var issue98Preparation: Map<String, Any>? = null
+    @Volatile private var issue98RestoredBaseline: M0aCommittedBaselineV1? = null
+    @Volatile private var issue98AuthorityArmed = false
     @Volatile private var streamChannel = newStreamChannel()
     @Volatile private var currentBindingGeneration = bindingGenerationSeed
     private var initialTransactionQueued = false
@@ -93,7 +98,7 @@ class VisibilityGridV2Binding internal constructor(
      * retains only scalar identity and a command digest: BEGIN/CHUNK/COMMIT
      * own the sole canonical-byte copy.
      */
-    @Volatile private var acknowledgedM3Cut: M0aCurrentDeltaSelectorV1? = null
+    @Volatile private var acknowledgedM3Cut: M3AcknowledgedCut? = null
     @Volatile private var pendingM3Cut: M3CurrentDeltaCut? = null
     @Volatile private var m3AcknowledgementListener: ((M0aCurrentDeltaSelectorV1) -> Unit)? = null
     private var acceptedControls = 0L
@@ -105,7 +110,8 @@ class VisibilityGridV2Binding internal constructor(
     private var activeGroupGeneration = activeGroupGenerationSeed
     private var activeCoverageEpoch = activeCoverageEpochSeed
     private var executorOrdinal = 0L
-    private var lifecycleSequence = nextLifecycleSequence.incrementAndGet()
+    private var lastAllocatedLifecycleSequence = 0L
+    private var lifecycleSequence = allocateLifecycleSequence()
     private var operationGeneration = 0L
     private val executorTrace = ArrayDeque<String>()
     private val publicationFence = Any()
@@ -201,6 +207,25 @@ class VisibilityGridV2Binding internal constructor(
         executorTrace = executorTrace.toList(),
     )
 
+    /** Exact assigned portable layout for the live binding/stream scalar owners. */
+    @Synchronized internal fun m3PortableOwnerBytes(): Long {
+        val transportPayload = streamChannel.transportInstrumentation.snapshot().retainedAllocationBytes
+        val identityPayload = arSessionIdentity.size + viewInstanceId.size + nativeStreamToken.size +
+            workerBindingToken.size + (issue98Correlation?.size ?: 0) +
+            listOfNotNull(activeControlRequestId, activeSessionId, activeCaptureGroupId).size * 16
+        val tracePayload = executorTrace.sumOf { it.encodeToByteArray().size }
+        return 312L + // VisibilityGridV2Binding
+            176L + 112L + // stream channel + transport instrumentation
+            56L + 24L + 24L + // control lifecycle, metrics and receipt
+            312L + // Method/Basic channels, handlers and codecs
+            24L + 32L + 40L + 48L + 40L + // binding nested scalar owners
+            34L * 16L + // bounded atomic/counter wrappers across binding/stream/telemetry
+            13L * 40L + // stream callbacks/method references owned by this binding
+            7L * 32L + // bounded deques/maps/sets and their empty envelopes
+            16L + // executor capability (thread infrastructure is platform-managed, not retained payload)
+            identityPayload + tracePayload + transportPayload
+    }
+
     /** Returns the exact active V2 lifecycle cut or null before a qualified START. */
     internal fun currentObservationOwnership(): VisibilityObservationOwnership? {
         replacementBinding?.let { return it.currentObservationOwnership() }
@@ -254,13 +279,10 @@ class VisibilityGridV2Binding internal constructor(
     internal fun queueCommittedCurrentDelta(
         source: M0aCurrentDeltaSourceV1,
         selector: M0aCurrentDeltaSelectorV1,
-    ) {
+    ): M3CurrentDeltaQueueResult {
         check(!disposed.get() && replacementBinding == null) { "V2 binding is not current" }
         check(lifecycle.state() == M0aControlLifecycle.State.ACTIVE) {
             "V2 observation cut is unavailable"
-        }
-        check(streamChannel.canQueueStructuralTransaction()) {
-            "V2 stream requires binding rollover"
         }
         val acknowledged = requireNotNull(acknowledgedM3Cut) {
             "M1 bootstrap is not acknowledged"
@@ -283,7 +305,7 @@ class VisibilityGridV2Binding internal constructor(
                     bytes,
                 )
             ) { "M3 current delta replay is not byte-exact" }
-            return
+            return M3CurrentDeltaQueueResult.ALREADY_QUEUED
         }
         check(selector.transactionId == nextPortableOrdinal(acknowledged.transactionId)) {
             "M3 current delta is not the next transaction"
@@ -297,12 +319,22 @@ class VisibilityGridV2Binding internal constructor(
         check(selector.targetLineageRevision >= acknowledged.targetLineageRevision) {
             "M3 current delta regresses lineage"
         }
+        // A prior call may have thrown after the stream atomically installed
+        // the exact frames but before this binding recorded its scalar cut.
+        if (streamChannel.hasExactQueuedCurrentDelta(selector, receipt.baseGeometryRevision, bytes)) {
+            pendingM3Cut = candidate
+            return M3CurrentDeltaQueueResult.RECOVERED_EXACT_QUEUE
+        }
+        check(streamChannel.canQueueStructuralTransaction()) {
+            "V2 stream requires binding rollover"
+        }
         streamChannel.queueCurrentDelta(
             M0aCurrentDeltaSourceV1 { requested -> receipt.takeIf { requested == selector } },
             selector,
             M0aTransactionResponseProfileV1.ordinary,
         )
         pendingM3Cut = candidate
+        return M3CurrentDeltaQueueResult.QUEUED
     }
 
     @Synchronized
@@ -324,13 +356,13 @@ class VisibilityGridV2Binding internal constructor(
                 geometryRevision = baseline.geometryRevision,
                 lineageRevision = baseline.lineageRevision,
             )
-            acknowledgedM3Cut = selector
+            acknowledgedM3Cut = M3AcknowledgedCut.from(selector)
             return
         }
         val pending = pendingM3Cut ?: return
         if (pending.selector != selector) return
         pendingM3Cut = null
-        acknowledgedM3Cut = selector
+        acknowledgedM3Cut = M3AcknowledgedCut.from(selector)
         m3AcknowledgementListener?.invoke(selector)
     }
 
@@ -421,6 +453,8 @@ class VisibilityGridV2Binding internal constructor(
                     ),
                 )
                 issue98Probe = M0aDebugTransportProbe(oldQualifier + staleEffectRequest, old)
+                issue98RestoredBaseline = old
+                issue98AuthorityArmed = false
                 replaceBinding()
                 val after = lifecycleResources().ownedResourceCount
                 val preparation = mapOf<String, Any>(
@@ -464,6 +498,7 @@ class VisibilityGridV2Binding internal constructor(
             } else {
                 issue98Correlation = null
                 issue98Preparation = null
+                issue98AuthorityArmed = true
                 result.success(
                     preparation.filterKeys {
                         it != "correlationId" && it != "oldBindingQualifier" &&
@@ -656,7 +691,7 @@ class VisibilityGridV2Binding internal constructor(
                                 decoded.outcome == 0
                             ) {
                                 operationGeneration++
-                                lifecycleSequence = nextLifecycleSequence.incrementAndGet()
+                                lifecycleSequence = allocateLifecycleSequence()
                                 activeControlRequestId = request.controlRequestId
                                 activeSessionId = request.sessionId
                                 activeCaptureGroupId = request.captureGroupId
@@ -793,6 +828,45 @@ class VisibilityGridV2Binding internal constructor(
             groupFromWorldIdentity = baseline.groupFromWorldIdentity,
             worldFromGroupIdentity = baseline.worldFromGroupIdentity,
         )
+        if (baseline != M0aCommittedBaselineV1.ZERO) {
+            val session = requireNotNull(activeSessionId)
+            val group = requireNotNull(activeCaptureGroupId)
+            val scope = M0aCommittedBaselineScopeV1(
+                session, group, activeSessionGeneration, activeGroupGeneration,
+            )
+            issue98RestoredBaseline?.let { debugBaseline ->
+                val exactFreshBaseline = M0aCommittedBaselineV1.forFreshBinding(debugBaseline) == baseline
+                check(isDebuggable && issue98AuthorityArmed && exactFreshBaseline) {
+                    "Debug restored baseline is not correlated to this replacement " +
+                        "(debuggable=$isDebuggable armed=$issue98AuthorityArmed exact=$exactFreshBaseline)"
+                }
+                check(committedBaselineAuthority.snapshot(scope) == M0aCommittedBaselineV1.ZERO) {
+                    "Debug replacement scope already has a different authority"
+                }
+                committedBaselineAuthority.publish(scope, debugBaseline)
+                issue98RestoredBaseline = null
+                issue98AuthorityArmed = false
+            }
+            val authoritative = committedBaselineAuthority.snapshot(scope)
+            check(authoritative != M0aCommittedBaselineV1.ZERO &&
+                M0aCommittedBaselineV1.forFreshBinding(authoritative) == baseline
+            ) { "Restored M3 baseline is not authenticated by the capture-group authority" }
+            val selector = M3AcknowledgedCut(
+                transactionId = 0,
+                targetGeometryRevision = baseline.geometryRevision,
+                targetLineageRevision = baseline.lineageRevision,
+            )
+            acknowledgedEmptyBaseline = M3CommittedEmptyBaseline(
+                bindingIdentity = "${session.hex()}:${group.hex()}:$currentBindingGeneration:$lifecycleSequence",
+                groupIdentity = group.hex(),
+                transactionId = selector.transactionId,
+                geometryRevision = selector.targetGeometryRevision,
+                lineageRevision = selector.targetLineageRevision,
+            )
+            acknowledgedM3Cut = selector
+            initialTransactionQueued = true
+            return
+        }
         streamChannel.queueStructuralTransaction(
             M0aStructuralTransactionProducerV1.produce(
                 transactionId = 1,
@@ -828,7 +902,7 @@ class VisibilityGridV2Binding internal constructor(
         recordClosedResource()
         lifecycle.abandon()
         operationGeneration++
-        lifecycleSequence = nextLifecycleSequence.incrementAndGet()
+        lifecycleSequence = allocateLifecycleSequence()
         val teardownReceipt = snapshot().toMap().withCleanupBalances(
             closedBefore = closedBefore,
             before = resourcesBefore,
@@ -866,6 +940,16 @@ class VisibilityGridV2Binding internal constructor(
         executorTrace.addLast("$executorOrdinal:$kind")
     }
 
+    @Synchronized
+    private fun allocateLifecycleSequence(): Long {
+        val allocated = lifecycleSequenceAllocator()
+        require(allocated > 0 && allocated > lastAllocatedLifecycleSequence) {
+            "Lifecycle allocator must return positive strictly increasing values"
+        }
+        lastAllocatedLifecycleSequence = allocated
+        return allocated
+    }
+
     fun dispose() {
         if (disposed.compareAndSet(false, true)) closeBindingResources()
         replacementBinding?.dispose()
@@ -899,6 +983,7 @@ class VisibilityGridV2Binding internal constructor(
             messenger = messenger,
             viewId = viewId,
             committedBaselineAuthority = committedBaselineAuthority,
+            lifecycleSequenceAllocator = lifecycleSequenceAllocator,
             viewGeneration = viewGeneration,
             arSessionIdentity = arSessionIdentity,
             viewInstanceId = viewInstanceId,
@@ -1152,6 +1237,21 @@ class VisibilityGridV2Binding internal constructor(
             selector == other.selector &&
                 baseGeometryRevision == other.baseGeometryRevision &&
                 commandHash.contentEquals(other.commandHash)
+    }
+
+    /** Binding-local acknowledged cursor; fresh binding transaction zero is valid here. */
+    private data class M3AcknowledgedCut(
+        val transactionId: Long,
+        val targetGeometryRevision: Long,
+        val targetLineageRevision: Long,
+    ) {
+        init { require(transactionId >= 0 && targetGeometryRevision > 0 && targetLineageRevision > 0) }
+
+        companion object {
+            fun from(selector: M0aCurrentDeltaSelectorV1) = M3AcknowledgedCut(
+                selector.transactionId, selector.targetGeometryRevision, selector.targetLineageRevision,
+            )
+        }
     }
 
     private fun nextPortableOrdinal(value: Long): Long {
