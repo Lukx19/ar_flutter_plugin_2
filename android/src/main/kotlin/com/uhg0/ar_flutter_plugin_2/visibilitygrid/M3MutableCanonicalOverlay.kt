@@ -109,22 +109,23 @@ internal class M3MutableCanonicalOverlay private constructor(
      * canonical retention/no-op: M3 has no structural removal semantics yet.
      * It therefore never deletes an owner, support, source, or lineage row.
      */
-    private fun prepareFeatureBatch(command: M3CanonicalFeatureBatchCommand): M3CanonicalMutationPreparation {
-        if (!validCommandId(command.commandId) ||
-            command.expectedGeometryRevision != view.cut.geometryRevision ||
-            command.expectedLineageRevision != view.cut.lineageRevision
-        ) return refuse(if (!validCommandId(command.commandId)) M3CanonicalMutationRefusal.INVALID_COMMAND else M3CanonicalMutationRefusal.REVISION_CONFLICT)
-
-        if (command.changes.size > configuration.surfaceCapacity) return refuse(M3CanonicalMutationRefusal.CAPACITY)
-        val upserts = ArrayList<M3CanonicalTarget>(command.changes.size)
+    private fun prepareFeatureBatch(
+        command: M3CanonicalFeatureBatchCommand,
+        preflight: M3CanonicalFeatureBatchPreflightReceipt,
+    ): M3CanonicalMutationPreparation {
+        // Removal has no structural effect at this seam. A scalar-only first
+        // pass therefore admits an arbitrarily large removal-only durable
+        // no-op, while bounding every collection owned by an effective batch.
+        if (preflight.upserts == 0) return M3CanonicalMutationPreparation.NoOp(state())
+        val upserts = ArrayList<M3CanonicalTarget>(preflight.upserts)
         val seenVoxels = HashSet<M3Voxel>()
         for (change in command.changes) {
-            val voxel = M3Voxel(change.x, change.y, change.z)
-            if (!seenVoxels.add(voxel)) return refuse(M3CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-            targetSetInsertions++
             when (change) {
                 is M3FeatureFusionChange.Removal -> Unit
                 is M3FeatureFusionChange.Upsert -> {
+                    val voxel = M3Voxel(change.x, change.y, change.z)
+                    if (!seenVoxels.add(voxel)) return refuse(M3CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
+                    targetSetInsertions++
                     val primary = change.candidate.primaryCanonicalTarget()
                         ?: return refuse(M3CanonicalMutationRefusal.INVALID_NORMAL)
                     // A candidate is self-describing; accepting a mismatched
@@ -135,9 +136,11 @@ internal class M3MutableCanonicalOverlay private constructor(
                 }
             }
         }
-        // This is intentional, observable policy, not caller-side filtering.
-        // A removal-only (or empty) kernel delta publishes no current receipt.
-        if (upserts.isEmpty()) return M3CanonicalMutationPreparation.NoOp(state())
+        // Duplicate removals remain no-op, but a removal of an upsert voxel is
+        // a typed conflict without inserting any removal into the bounded set.
+        for (change in command.changes) if (change is M3FeatureFusionChange.Removal &&
+            M3Voxel(change.x, change.y, change.z) in seenVoxels
+        ) return refuse(M3CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
         if (view.cut.geometryRevision >= configuration.revisionLimit) return refuse(M3CanonicalMutationRefusal.REVISION_EXHAUSTED)
 
         val material = ArrayList<M3CanonicalTarget>(upserts.size)
@@ -546,8 +549,82 @@ internal class M3MutableCanonicalOverlay private constructor(
         fun prepare(view: M3CanonicalStateView, configuration: M3SurfaceOwnershipConfiguration, command: M3CanonicalTransactionCommand) =
             M3MutableCanonicalOverlay(view, configuration).prepareStructural(command)
 
-        fun prepare(view: M3CanonicalStateView, configuration: M3SurfaceOwnershipConfiguration, command: M3CanonicalFeatureBatchCommand) =
-            M3MutableCanonicalOverlay(view, configuration).prepareFeatureBatch(command)
+        fun prepare(
+            view: M3CanonicalStateView,
+            configuration: M3SurfaceOwnershipConfiguration,
+            command: M3CanonicalFeatureBatchCommand,
+        ): M3CanonicalMutationPreparation {
+            if (!validCommandId(command.commandId)) return featureBatchRefusal(
+                view.cut, M3CanonicalMutationRefusal.INVALID_COMMAND,
+            )
+            if (command.expectedGeometryRevision != view.cut.geometryRevision ||
+                command.expectedLineageRevision != view.cut.lineageRevision
+            ) return featureBatchRefusal(view.cut, M3CanonicalMutationRefusal.REVISION_CONFLICT)
+            val budget = featureBatchBudget(configuration, command.commandId)
+            var upserts = 0
+            for (change in command.changes) if (change is M3FeatureFusionChange.Upsert) {
+                upserts++
+                if (upserts > configuration.surfaceCapacity) return featureBatchRefusal(
+                    view.cut, M3CanonicalMutationRefusal.CAPACITY, budget.copy(upserts = upserts),
+                )
+                if (upserts > budget.maximumUpserts) return featureBatchRefusal(
+                    view.cut, M3CanonicalMutationRefusal.JOURNAL_EXHAUSTED, budget.copy(upserts = upserts),
+                )
+            }
+            val accepted = budget.copy(upserts = upserts)
+            if (upserts == 0) return M3CanonicalMutationPreparation.NoOp(
+                M3CanonicalStateReceipt(
+                    view.cut.geometryRevision, view.cut.lineageRevision,
+                    view.cut.nextSurfaceIdHighWater, view.cut.liveSurfaceCount,
+                ),
+            )
+            return M3MutableCanonicalOverlay(view, configuration).prepareFeatureBatch(command, accepted)
+        }
+
+        internal fun featureBatchBudget(
+            configuration: M3SurfaceOwnershipConfiguration,
+            commandId: String,
+        ): M3CanonicalFeatureBatchPreflightReceipt {
+            val reserve = M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES
+            val journalLimit = minOf(reserve, configuration.changeJournalByteCapacity.toLong())
+            val encodedFixed = 174L + modifiedUtf8Length(commandId)
+            val journalAndCurrentMaximum = boundedRecordMaximum(journalLimit, encodedFixed, 188L)
+            val sharedMaximum = boundedRecordMaximum(
+                reserve, PLAN_FIXED_OWNER_BYTES + WRITER_SCRATCH_BYTES, 60L,
+            )
+            val constructionMaximum = boundedRecordMaximum(
+                reserve,
+                PLAN_FIXED_OWNER_BYTES + WRITER_SCRATCH_BYTES + PLANNING_PAGE_SCRATCH_BYTES,
+                ROW_CONSTRUCTION_BYTES_PER_RECORD,
+            )
+            return M3CanonicalFeatureBatchPreflightReceipt(
+                upserts = 0,
+                maximumUpserts = minOf(journalAndCurrentMaximum, sharedMaximum, constructionMaximum),
+                journalAndCurrentMaximum = journalAndCurrentMaximum,
+                sharedMaximum = sharedMaximum,
+                constructionMaximum = constructionMaximum,
+            )
+        }
+
+        internal fun boundedRecordMaximum(limit: Long, fixed: Long, perRecord: Long): Int {
+            if (limit < fixed || perRecord <= 0L) return 0
+            return minOf((limit - fixed) / perRecord, Int.MAX_VALUE.toLong()).toInt()
+        }
+
+        private fun featureBatchRefusal(
+            cut: M3CompactCanonicalCut,
+            reason: M3CanonicalMutationRefusal,
+            preflight: M3CanonicalFeatureBatchPreflightReceipt = M3CanonicalFeatureBatchPreflightReceipt(),
+        ) = M3CanonicalMutationPreparation.Refused(
+            reason,
+            M3CanonicalStateReceipt(
+                cut.geometryRevision, cut.lineageRevision, cut.nextSurfaceIdHighWater, cut.liveSurfaceCount,
+            ),
+            M3CanonicalMutationPreflightWork(
+                featureBatchUpserts = preflight.upserts,
+                featureBatchMaximumUpserts = preflight.maximumUpserts,
+            ),
+        )
 
         private fun validCommandId(value: String) = value.isNotBlank() && utf8Length(value) <= MAX_COMMAND_BYTES
 
@@ -595,18 +672,34 @@ internal data class M3CanonicalFeatureBatchCommand(
     val expectedLineageRevision: Long,
     val changes: List<M3FeatureFusionChange>,
 ) {
-    internal fun fingerprint(): ByteArray = overlayHash(buildString {
-        append(commandId).append('|').append(expectedGeometryRevision).append('|').append(expectedLineageRevision).append('|')
-        changes.forEach { change -> when (change) {
-            is M3FeatureFusionChange.Removal -> append('R').append(':').append(change.x).append(':').append(change.y).append(':').append(change.z)
-            is M3FeatureFusionChange.Upsert -> {
-                val primary = change.candidate.primaryCanonicalTarget()
-                append('U').append(':').append(change.x).append(':').append(change.y).append(':').append(change.z).append(':')
-                append(primary?.normalOctX).append(':').append(primary?.normalOctY).append(':').append(primary?.normalConfidence)
+    internal fun fingerprint(): ByteArray {
+        val digest = MessageDigest.getInstance("SHA-256")
+        fun token(value: Any?) { digest.update(value.toString().encodeToByteArray()) }
+        token(commandId); token('|'); token(expectedGeometryRevision); token('|'); token(expectedLineageRevision); token('|')
+        changes.forEach { change ->
+            when (change) {
+                is M3FeatureFusionChange.Removal -> {
+                    token('R'); token(':'); token(change.x); token(':'); token(change.y); token(':'); token(change.z)
+                }
+                is M3FeatureFusionChange.Upsert -> {
+                    val primary = change.candidate.primaryCanonicalTarget()
+                    token('U'); token(':'); token(change.x); token(':'); token(change.y); token(':'); token(change.z); token(':')
+                    token(primary?.normalOctX); token(':'); token(primary?.normalOctY); token(':'); token(primary?.normalConfidence)
+                }
             }
-        }.append(';') }
-    }.encodeToByteArray())
+            token(';')
+        }
+        return digest.digest()
+    }
 }
+
+internal data class M3CanonicalFeatureBatchPreflightReceipt(
+    val upserts: Int = 0,
+    val maximumUpserts: Int = 0,
+    val journalAndCurrentMaximum: Int = 0,
+    val sharedMaximum: Int = 0,
+    val constructionMaximum: Int = 0,
+)
 
 internal enum class M3PreparedMutationKind {
     FEATURE_ADD, FEATURE_REFINE, CREATE, RELOCATION, MERGE, SPLIT, REPLACEMENT, FEATURE_BATCH;
@@ -1058,6 +1151,8 @@ internal data class M3CanonicalMutationPreflightWork(
     val targetSetInsertions: Int = 0,
     val ownerConstructions: Int = 0,
     val removalGraphAllocations: Int = 0,
+    val featureBatchUpserts: Int = 0,
+    val featureBatchMaximumUpserts: Int = 0,
 )
 
 internal enum class M3CanonicalMutationRefusal {

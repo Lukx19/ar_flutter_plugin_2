@@ -120,7 +120,7 @@ class M3PreparedIntentVisitorTest {
     }
 
     @Test
-    fun `all seven mutation kinds round trip exact typed records order and target cut`() {
+    fun `all eight mutation kinds round trip exact typed records order and target cut`() {
         val empty = scenarioView("all-kinds-empty")
         val rows = listOf(scenarioSurface(1, 0), scenarioSurface(2, 1), scenarioSurface(3, 2), scenarioSurface(4, 3))
         val sources = rows.map { scenarioSource(it.id.value, it.voxel.x) }
@@ -134,6 +134,13 @@ class M3PreparedIntentVisitorTest {
             active to prepare(active, scenarioCommand("merge", M3CanonicalOperation.MERGE, 7, 5, listOf(M3SurfaceId(2), M3SurfaceId(3)), scenarioTarget(20))),
             active to prepare(active, scenarioCommand("split", M3CanonicalOperation.SPLIT, 7, 5, listOf(M3SurfaceId(4)), scenarioTarget(30), scenarioTarget(31))),
             active to prepare(active, scenarioCommand("replacement", M3CanonicalOperation.REPLACEMENT, 7, 5, listOf(M3SurfaceId(1)), scenarioTarget(40))),
+            empty to prepare(empty, M3CanonicalFeatureBatchCommand(
+                "feature-batch", 0, 0,
+                listOf(M3FeatureFusionChange.Upsert(M3FeatureFusionCandidate(
+                    50, 0, 0, 2, 1,
+                    listOf(M3FeatureNormalCandidate(50, 0, 0, M3FeatureNormalFace.PRIMARY, 0, 0, 191)),
+                ))),
+            )),
         )
         assertEquals(M3PreparedMutationKind.entries, cases.map { it.second.kind })
 
@@ -295,6 +302,7 @@ class M3PreparedIntentVisitorTest {
         val result = when (command) {
             is M3FeatureMutationCommand -> M3SurfaceOwnership.prepareMutation(view, M3SurfaceOwnershipConfiguration(), command)
             is M3CanonicalTransactionCommand -> M3SurfaceOwnership.prepareMutation(view, M3SurfaceOwnershipConfiguration(), command)
+            is M3CanonicalFeatureBatchCommand -> M3MutableCanonicalOverlay.prepare(view, M3SurfaceOwnershipConfiguration(), command)
             else -> error("unsupported command")
         }
         return (result as M3CanonicalMutationPreparation.Prepared).mutation
