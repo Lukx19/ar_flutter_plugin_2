@@ -557,6 +557,7 @@ internal class M3PreparedCanonicalMutation(
     val work: M3CanonicalMutationWork,
 ) : AutoCloseable {
     private var lifecycle = M3PreparedMutationLifecycle.READY
+    private var discardPending = false
     val dirtyRowCount get() = rows.size
     val removedSurfaceCount get() = removedIds.size
 
@@ -574,21 +575,57 @@ internal class M3PreparedCanonicalMutation(
         return M3CanonicalAuthorityLeaseRegistry.isActive(authorityLease)
     }
 
-    @Synchronized internal fun consume(): Boolean {
-        if (lifecycle != M3PreparedMutationLifecycle.READY) return false
-        lifecycle = M3PreparedMutationLifecycle.CONSUMED
-        releaseSourceAuthority()
-        return true
+    @Synchronized internal fun claim(): M3PreparedMutationClaimResult = when (lifecycle) {
+        M3PreparedMutationLifecycle.READY -> {
+            lifecycle = M3PreparedMutationLifecycle.IN_FLIGHT
+            M3PreparedMutationClaimResult.Claimed
+        }
+        M3PreparedMutationLifecycle.IN_FLIGHT -> M3PreparedMutationClaimResult.AlreadyInFlight
+        M3PreparedMutationLifecycle.CONSUMED,
+        M3PreparedMutationLifecycle.DISCARDED -> M3PreparedMutationClaimResult.Terminal
     }
 
-    @Synchronized internal fun discard(): M3PreparedMutationDiscardResult = when (lifecycle) {
-        M3PreparedMutationLifecycle.READY -> {
-            lifecycle = M3PreparedMutationLifecycle.DISCARDED
-            releaseSourceAuthority()
-            M3PreparedMutationDiscardResult.Discarded
+    internal fun finish(result: M3PreparedMutationFinish): M3PreparedMutationLifecycle {
+        var release = false
+        val finished = synchronized(this) {
+            check(lifecycle == M3PreparedMutationLifecycle.IN_FLIGHT)
+            lifecycle = when (result) {
+                M3PreparedMutationFinish.SUCCESS -> M3PreparedMutationLifecycle.CONSUMED
+                M3PreparedMutationFinish.TERMINAL -> M3PreparedMutationLifecycle.DISCARDED
+                M3PreparedMutationFinish.RETRYABLE -> if (discardPending) {
+                    M3PreparedMutationLifecycle.DISCARDED
+                } else {
+                    M3PreparedMutationLifecycle.READY
+                }
+            }
+            release = lifecycle != M3PreparedMutationLifecycle.READY
+            lifecycle
         }
-        M3PreparedMutationLifecycle.DISCARDED -> M3PreparedMutationDiscardResult.AlreadyDiscarded
-        M3PreparedMutationLifecycle.CONSUMED -> M3PreparedMutationDiscardResult.AlreadyConsumed
+        if (release) releaseSourceAuthority()
+        return finished
+    }
+
+    internal fun discard(): M3PreparedMutationDiscardResult {
+        var release = false
+        val result = synchronized(this) {
+            when (lifecycle) {
+                M3PreparedMutationLifecycle.READY -> {
+                    lifecycle = M3PreparedMutationLifecycle.DISCARDED
+                    release = true
+                    M3PreparedMutationDiscardResult.Discarded
+                }
+                M3PreparedMutationLifecycle.IN_FLIGHT -> if (discardPending) {
+                    M3PreparedMutationDiscardResult.AlreadyPending
+                } else {
+                    discardPending = true
+                    M3PreparedMutationDiscardResult.Deferred
+                }
+                M3PreparedMutationLifecycle.DISCARDED -> M3PreparedMutationDiscardResult.AlreadyDiscarded
+                M3PreparedMutationLifecycle.CONSUMED -> M3PreparedMutationDiscardResult.AlreadyConsumed
+            }
+        }
+        if (release) releaseSourceAuthority()
+        return result
     }
 
     override fun close() { discard() }
@@ -668,9 +705,13 @@ internal class M3PreparedCanonicalMutation(
     }
 }
 
-internal enum class M3PreparedMutationLifecycle { READY, CONSUMED, DISCARDED }
+internal enum class M3PreparedMutationLifecycle { READY, IN_FLIGHT, CONSUMED, DISCARDED }
+internal enum class M3PreparedMutationClaimResult { Claimed, AlreadyInFlight, Terminal }
+internal enum class M3PreparedMutationFinish { SUCCESS, RETRYABLE, TERMINAL }
 internal sealed interface M3PreparedMutationDiscardResult {
     data object Discarded : M3PreparedMutationDiscardResult
+    data object Deferred : M3PreparedMutationDiscardResult
+    data object AlreadyPending : M3PreparedMutationDiscardResult
     data object AlreadyDiscarded : M3PreparedMutationDiscardResult
     data object AlreadyConsumed : M3PreparedMutationDiscardResult
 }

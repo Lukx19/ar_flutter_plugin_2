@@ -270,53 +270,68 @@ internal class M3SurfaceOwnership private constructor(
     }
 
     /** Admits exactly one adjacent #117 plan only from this owner's durable ACK state. */
-    @Synchronized
     internal fun commitAdjacentCanonicalMutation(
         plan: M3PreparedCanonicalMutation,
         faults: M3CanonicalCommitFaults = M3CanonicalCommitFaults(),
     ): M3CanonicalAdjacentCommitResult {
-        if (closed) {
-            plan.discard()
-            return M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.NO_ACTIVE_AUTHORITY)
-        }
-        val parent = v6Parent
-        val budget = v6Budget
-        if (parent == null || budget == null) {
-            plan.discard()
-            return M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.NO_ACTIVE_AUTHORITY)
-        }
-        if (plan.lifecycle() != M3PreparedMutationLifecycle.READY) {
-            plan.discard()
-            return M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.PLAN_DISCARDED)
+        val parent: File
+        val budget: M3CanonicalStorageBudget
+        synchronized(this) {
+            if (closed) {
+                plan.discard()
+                return M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.NO_ACTIVE_AUTHORITY)
+            }
+            parent = v6Parent ?: run {
+                plan.discard()
+                return M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.NO_ACTIVE_AUTHORITY)
+            }
+            budget = v6Budget ?: run {
+                plan.discard()
+                return M3CanonicalAdjacentCommitResult.Refused(M3CanonicalAdjacentCommitRefusal.NO_ACTIVE_AUTHORITY)
+            }
+            when (plan.claim()) {
+                M3PreparedMutationClaimResult.Claimed -> Unit
+                M3PreparedMutationClaimResult.AlreadyInFlight -> return M3CanonicalAdjacentCommitResult.Refused(
+                    M3CanonicalAdjacentCommitRefusal.PLAN_IN_FLIGHT,
+                    disposition = M3PreparedMutationDisposition.RETRYABLE,
+                )
+                M3PreparedMutationClaimResult.Terminal -> return M3CanonicalAdjacentCommitResult.Refused(
+                    M3CanonicalAdjacentCommitRefusal.PLAN_DISCARDED,
+                )
+            }
         }
         val boundBase = when (val resolution = M3CanonicalAuthorityLeaseRegistry.resolve(
             plan.authorityLease, group, parent, adjacentOwnerCapability,
         )) {
             is M3CanonicalAuthorityLeaseResolution.Resolved -> resolution.store
             is M3CanonicalAuthorityLeaseResolution.Refused -> {
-                plan.discard()
+                plan.finish(M3PreparedMutationFinish.TERMINAL)
                 return M3CanonicalAdjacentCommitResult.Refused(
                     M3CanonicalAdjacentCommitRefusal.INVALID_AUTHORITY_LEASE,
                 )
             }
         }
         return try {
-            M3CanonicalActivationSelector.commitAdjacent(group, parent, budget, plan, boundBase, faults).also { result ->
-                when (result) {
-                    is M3CanonicalAdjacentCommitResult.Committed -> {
-                        check(plan.consume())
-                        activation = result.state
-                    }
-                    is M3CanonicalAdjacentCommitResult.Refused -> when (result.disposition) {
-                        M3PreparedMutationDisposition.RETRYABLE -> Unit
-                        M3PreparedMutationDisposition.TERMINAL -> {
-                            plan.discard()
-                        }
-                    }
+            when (val result = M3CanonicalActivationSelector.commitAdjacent(
+                group, parent, budget, plan, boundBase, faults,
+            )) {
+                is M3CanonicalAdjacentCommitResult.Committed -> {
+                    check(plan.finish(M3PreparedMutationFinish.SUCCESS) == M3PreparedMutationLifecycle.CONSUMED)
+                    synchronized(this) { activation = result.state }
+                    result
+                }
+                is M3CanonicalAdjacentCommitResult.Refused -> {
+                    val finished = plan.finish(when (result.disposition) {
+                        M3PreparedMutationDisposition.RETRYABLE -> M3PreparedMutationFinish.RETRYABLE
+                        M3PreparedMutationDisposition.TERMINAL -> M3PreparedMutationFinish.TERMINAL
+                    })
+                    if (result.disposition == M3PreparedMutationDisposition.RETRYABLE &&
+                        finished == M3PreparedMutationLifecycle.DISCARDED
+                    ) result.copy(disposition = M3PreparedMutationDisposition.TERMINAL) else result
                 }
             }
         } catch (failure: Throwable) {
-            plan.discard()
+            plan.finish(M3PreparedMutationFinish.TERMINAL)
             throw failure
         }
     }

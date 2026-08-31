@@ -496,7 +496,7 @@ internal object M3CanonicalActivationSelector {
         boundBase: M3CompactCanonicalStore,
         faults: M3CanonicalCommitFaults = M3CanonicalCommitFaults(),
     ): M3CanonicalAdjacentCommitResult = withGroupLock(parent, group) {
-        if (plan.lifecycle() != M3PreparedMutationLifecycle.READY)
+        if (plan.lifecycle() != M3PreparedMutationLifecycle.IN_FLIGHT)
             return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.PLAN_DISCARDED)
         if (boundBase.cut.group != group || boundBase.cut.profile != M3CompactCanonicalStore.PROFILE)
             return@withGroupLock adjacentRefusal(M3CanonicalAdjacentCommitRefusal.STALE_CUT)
@@ -1340,7 +1340,7 @@ internal sealed interface M3CanonicalAdjacentCommitResult {
 }
 internal enum class M3CanonicalAdjacentCommitRefusal {
     NO_ACTIVE_AUTHORITY, CURRENT_UNACKNOWLEDGED, STALE_CUT, COMMIT_REFUSED, DURABILITY_FAILURE,
-    DUPLICATE_RESIDENT_AUTHORITY, PLAN_DISCARDED, INVALID_AUTHORITY_LEASE,
+    DUPLICATE_RESIDENT_AUTHORITY, PLAN_DISCARDED, PLAN_IN_FLIGHT, INVALID_AUTHORITY_LEASE,
 }
 internal enum class M3PreparedMutationDisposition { RETRYABLE, TERMINAL }
 internal enum class M3CanonicalAdjacentFault {
