@@ -125,6 +125,42 @@ internal object M3CanonicalActivation {
         M3CanonicalActivationPreparation.Refused(M3CanonicalActivationRefusal.LEGACY_INVALID)
     }
 
+    /** Opaque activation plan for a directly-created empty v6 authority. */
+    fun prepareEmptyV6(
+        group: M3SurfaceGroup,
+        directory: File,
+        budget: M3CanonicalStorageBudget,
+        baseline: M3CommittedEmptyBaseline,
+        configuration: M3SurfaceOwnershipConfiguration = M3SurfaceOwnershipConfiguration(
+            seededEmptyBaseline = baseline,
+        ),
+    ): M3CanonicalActivationPreparation = try {
+        if (baseline.groupIdentity != group.value || configuration.seededEmptyBaseline != baseline) {
+            return M3CanonicalActivationPreparation.Refused(M3CanonicalActivationRefusal.SIBLING_MISMATCH)
+        }
+        val opened = M3CompactCanonicalStore.openV6(group, directory, budget, configuration)
+        val sibling = (opened as? M3CompactCanonicalOpenResult.Opened)?.store
+            ?: return M3CanonicalActivationPreparation.Refused(M3CanonicalActivationRefusal.SIBLING_INVALID)
+        val cut = sibling.use { it.cut }
+        if (
+            cut.group != group || cut.geometryRevision != baseline.geometryRevision ||
+            cut.lineageRevision != baseline.lineageRevision || cut.nextSurfaceIdHighWater != 1L ||
+            cut.liveSurfaceCount != 0 || cut.sourceCount != 0 || cut.supportCount != 0 ||
+            cut.lineageCount != 0 || cut.seededEmptyBaseline != baseline
+        ) return M3CanonicalActivationPreparation.Refused(M3CanonicalActivationRefusal.SIBLING_MISMATCH)
+        M3CanonicalActivationPreparation.Prepared(
+            Plan(
+                cut.sourceHash,
+                cut,
+                M3CanonicalActivationCurrent.None,
+                M3CanonicalActivationPreparationReceipt(0, 0, 512),
+                PREPARATION_AUTHORITY,
+            ),
+        )
+    } catch (_: Exception) {
+        M3CanonicalActivationPreparation.Refused(M3CanonicalActivationRefusal.SIBLING_INVALID)
+    }
+
     private fun matchesLegacy(legacy: M3LegacyCanonicalState, cut: M3CompactCanonicalCut) =
         cut.group == legacy.group &&
             cut.profile == M3CompactCanonicalStore.PROFILE &&

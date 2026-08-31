@@ -12,9 +12,11 @@ import com.uhg0.ar_flutter_plugin_2.capture.JvmDescriptorFilesystemV2
 import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetCoordinatorV2
 import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetPolicyV2
 import io.flutter.plugin.common.MethodChannel
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.file.Files
+import java.security.MessageDigest
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertArrayEquals
@@ -69,9 +71,11 @@ class M3VisibilityGridIntegrationTest {
             assertEquals(2, staged.transactionId)
             assertEquals(2, staged.geometryRevision)
             assertEquals(1, staged.lineageRevision)
-            assertEquals(1, rendered.size)
-            assertEquals(2L, rendered.single().update?.geometryRevision)
-            assertEquals(staged.rendererRows, rendered.single().count)
+            assertEquals("CREATE", staged.canonicalOperation)
+            assertTrue(staged.canonicalBytes > 0)
+            assertEquals(2, rendered.size)
+            assertEquals(2L, rendered.last().update?.geometryRevision)
+            assertEquals(staged.rendererRows, rendered.last().count)
 
             val first = exchange(messenger, 2106, stream, 4, 1, 1, 1)
             val replay = exchange(messenger, 2106, stream, 4, 1, 1, 1)
@@ -99,9 +103,12 @@ class M3VisibilityGridIntegrationTest {
         val messenger = MethodTestMessenger()
         val binding = VisibilityGridV2Binding(messenger, 2108, M0aCommittedBaselineAuthority(), postToMain = { it() })
         val rendered = mutableListOf<com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot>()
+        var activeResources: M3CanonicalRuntimeResources? = null
         val integration = M3VisibilityGridIntegration(
             binding, binding::currentObservationOwnership, directory,
-            resourcesForGroup = resources(directory, coordinator),
+            resourcesForGroup = { group ->
+                M3CanonicalRuntimeResources.open(directory, group, coordinator).also { activeResources = it }
+            },
             renderer = M3NativeRendererProjection(render = { snapshot, _ -> snapshot?.let(rendered::add) }),
         )
         try {
@@ -124,10 +131,26 @@ class M3VisibilityGridIntegrationTest {
             assertEquals(3, later.transactionId)
             assertEquals(3, later.geometryRevision)
             assertEquals(1, later.lineageRevision)
+            assertEquals("FEATURE_BATCH", later.canonicalOperation)
             assertEquals(2, later.committed)
-            assertEquals(2, rendered.size)
+            assertEquals(3, rendered.size)
             assertEquals(later.geometryRevision, rendered.last().update?.geometryRevision)
             assertEquals(later.rendererRows, rendered.last().count)
+            val canonical = requireNotNull(activeResources).readRendererPage(0, 512)
+            assertEquals(later.geometryRevision, canonical?.cut?.geometryRevision)
+            assertArrayEquals(
+                canonical?.voxels?.map { packVisibilityGridKey(it.x, it.y, it.z) }?.toLongArray(),
+                rendered.last().keys,
+            )
+            val current = requireNotNull(activeResources.owner().activationState()?.current)
+                as M3CanonicalActivationCurrent.Receipt
+            val currentBytes = ByteArrayOutputStream().use { output ->
+                current.source.writeTo(output); output.toByteArray()
+            }
+            assertArrayEquals(
+                current.identity.canonicalHash.toByteArray(),
+                MessageDigest.getInstance("SHA-256").digest(currentBytes),
+            )
         } finally {
             integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
         }
@@ -155,9 +178,11 @@ class M3VisibilityGridIntegrationTest {
         }
 
         val replacementBinding = VisibilityGridV2Binding(messenger, 2109, M0aCommittedBaselineAuthority(), postToMain = { it() })
+        val replayRendered = mutableListOf<com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot>()
         val replacement = M3VisibilityGridIntegration(
             replacementBinding, replacementBinding::currentObservationOwnership, directory,
             resourcesForGroup = resources(directory, coordinator),
+            renderer = M3NativeRendererProjection(render = { snapshot, _ -> snapshot?.let(replayRendered::add) }),
         )
         try {
             val stream = start(replacementBinding, messenger, 2109)
@@ -168,6 +193,9 @@ class M3VisibilityGridIntegrationTest {
 
             replacement.admitFeature(feature(cut, 11, 0.32))
             assertEquals("awaitingExactAck", replacement.integrationReceipt().status)
+            assertTrue(replayRendered.isNotEmpty())
+            assertEquals(1, replayRendered.last().count)
+            assertEquals(2L, replayRendered.last().update?.geometryRevision)
             exchange(messenger, 2109, stream, 4, 1, 1, 1)
             exchange(messenger, 2109, stream, 5, 1, 1, 1)
             exchange(messenger, 2109, stream, 6, 1, 1, 1)
@@ -190,10 +218,12 @@ class M3VisibilityGridIntegrationTest {
         val binding = VisibilityGridV2Binding(messenger, 2107, M0aCommittedBaselineAuthority(), postToMain = { it() })
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
+        val fenced = CountDownLatch(1)
         val integration = M3VisibilityGridIntegration(
             binding, binding::currentObservationOwnership, directory,
             resourcesForGroup = resources(directory, coordinator),
             beforeAdmission = { entered.countDown(); release.await(2, TimeUnit.SECONDS) },
+            afterLifecycleFence = { fenced.countDown() },
         )
         try {
             val stream = start(binding, messenger, 2107)
@@ -204,9 +234,10 @@ class M3VisibilityGridIntegrationTest {
             val admitted = Thread { integration.admitFeature(feature(cut, 11)) }.apply { start() }
             assertTrue(entered.await(2, TimeUnit.SECONDS))
             val pausing = Thread(integration::pause).apply { start() }
+            assertTrue(fenced.await(2, TimeUnit.SECONDS))
             release.countDown()
             admitted.join(2_000); pausing.join(2_000)
-            assertEquals("seeded", integration.integrationReceipt().status)
+            assertEquals("idle", integration.integrationReceipt().status)
             assertEquals(0, exchange(messenger, 2107, stream, 4, 1, 1, 1).first.messageKind)
 
             integration.resume()
@@ -220,6 +251,63 @@ class M3VisibilityGridIntegrationTest {
             assertEquals(beforeClose, integration.integrationReceipt())
         } finally {
             integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `lifecycle fences worker between precheck and publication gate without deadlock`() {
+        listOf("pause", "rollover", "replacement", "close").forEachIndexed { index, action ->
+            val directory = Files.createTempDirectory("m3-runtime-barrier-$action").toFile()
+            val coordinator = budget(directory)
+            val messenger = MethodTestMessenger()
+            val viewId = 2200 + index
+            val binding = VisibilityGridV2Binding(
+                messenger, viewId, M0aCommittedBaselineAuthority(), postToMain = { it() },
+            )
+            var current: VisibilityObservationOwnership? = null
+            val entered = CountDownLatch(1)
+            val release = CountDownLatch(1)
+            val lifecycleFenced = CountDownLatch(1)
+            val integration = M3VisibilityGridIntegration(
+                binding,
+                ownership = { current ?: binding.currentObservationOwnership() },
+                directory = directory,
+                resourcesForGroup = resources(directory, coordinator),
+                beforeAdmission = { entered.countDown(); release.await(2, TimeUnit.SECONDS) },
+                afterLifecycleFence = { lifecycleFenced.countDown() },
+            )
+            try {
+                val stream = start(binding, messenger, viewId)
+                exchange(messenger, viewId, stream, 1, 0, 0, 0)
+                exchange(messenger, viewId, stream, 2, 0, 0, 0)
+                exchange(messenger, viewId, stream, 3, 1, 1, 1)
+                val cut = requireNotNull(binding.currentObservationOwnership())
+                current = cut
+                val worker = Thread { integration.admitFeature(feature(cut, 100 + index.toLong())) }.apply { start() }
+                assertTrue("$action worker did not reach barrier", entered.await(2, TimeUnit.SECONDS))
+                val lifecycle = Thread {
+                    when (action) {
+                        "pause" -> integration.pause()
+                        "rollover" -> integration.rollover(cut)
+                        "replacement" -> {
+                            val replacement = cut.copy(bindingGeneration = cut.bindingGeneration + 1)
+                            current = replacement
+                            integration.rollover(replacement)
+                        }
+                        else -> integration.close()
+                    }
+                }.apply { start() }
+                assertTrue("$action did not publish its fence", lifecycleFenced.await(2, TimeUnit.SECONDS))
+                release.countDown()
+                worker.join(2_000); lifecycle.join(2_000)
+                assertTrue("$action worker deadlocked", !worker.isAlive)
+                assertTrue("$action lifecycle deadlocked", !lifecycle.isAlive)
+                assertEquals("$action published stale state", 0L, integration.integrationReceipt().committed)
+                assertEquals(0, exchange(messenger, viewId, stream, 4, 1, 1, 1).first.messageKind)
+            } finally {
+                release.countDown()
+                integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+            }
         }
     }
 
@@ -244,6 +332,45 @@ class M3VisibilityGridIntegrationTest {
         assertEquals(1, result.receipt.lineageRevision)
         assertTrue(result.receipt.lineageEdges.isEmpty())
         assertEquals(1, result.targets.size)
+    }
+
+    @Test
+    fun `runtime resources activate direct empty v6 roots inside isolated group directories`() {
+        val root = Files.createTempDirectory("m3-runtime-groups").toFile()
+        val coordinator = budget(root)
+        val groups = listOf("a".repeat(32), "b".repeat(32))
+        try {
+            groups.forEachIndexed { index, value ->
+                val group = M3SurfaceGroup(value)
+                M3CanonicalRuntimeResources.open(root, group, coordinator).use { resources ->
+                    val expected = File(root, "visibility-grid-m3-runtime/$value")
+                        .absoluteFile.toPath().normalize().toFile()
+                    assertEquals(expected, resources.directory)
+                    assertEquals(expected, resources.groupDirectory)
+                    val baseline = M3CommittedEmptyBaseline("binding-$index", value, 1, 1, 1)
+                    val opened = resources.openInitial(baseline) as M3SurfaceOwnershipOpenResult.Opened
+                    val state = requireNotNull(opened.ownership.activationState())
+                    assertEquals(baseline, state.cut.seededEmptyBaseline)
+                    assertEquals(0, state.cut.liveSurfaceCount)
+                    assertTrue(state.currentState is M3CanonicalCurrentState.None)
+                    assertTrue(expected.walkTopDown().filter(File::isFile).all { file ->
+                        file.absoluteFile.toPath().normalize().startsWith(expected.toPath())
+                    })
+                    assertTrue(expected.listFiles().orEmpty().none { it.name.contains("ownership") })
+                }
+            }
+            val shared = File(root, "visibility-grid-m3-runtime")
+            val m3Authority = shared.walkTopDown().filter(File::isFile).filter {
+                it.name.startsWith("m3-") || it.name.endsWith(".selector") || it.name.endsWith(".slot")
+            }.toList()
+            assertTrue(m3Authority.isNotEmpty())
+            assertTrue(m3Authority.all { file -> groups.any { value ->
+                file.absoluteFile.toPath().normalize().startsWith(File(shared, value).toPath())
+            } })
+            assertTrue(coordinator.committedBytes() > 0)
+        } finally {
+            coordinator.close(); root.deleteRecursively()
+        }
     }
 
     @Test

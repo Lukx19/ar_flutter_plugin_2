@@ -1028,6 +1028,65 @@ private constructor(
             budget: M3CanonicalStorageBudget,
             configuration: M3SurfaceOwnershipConfiguration = M3SurfaceOwnershipConfiguration(),
             fault: M3CompactCanonicalMigrationFault? = null,
+        ): M3CompactCanonicalMigrationResult = prepareV6Candidate(
+            group, directory, budget, configuration, fault,
+        ) { M3SurfaceOwnershipLegacyCodec.readValidated(group, directory, configuration) }
+
+        /**
+         * Creates the canonical empty v6 authority directly under the budgeted root.
+         * No legacy snapshot, receipt journal, allocator, or writable fallback exists.
+         */
+        fun prepareEmptyV6Bootstrap(
+            group: M3SurfaceGroup,
+            directory: File,
+            budget: M3CanonicalStorageBudget,
+            baseline: M3CommittedEmptyBaseline,
+            configuration: M3SurfaceOwnershipConfiguration = M3SurfaceOwnershipConfiguration(
+                seededEmptyBaseline = baseline,
+            ),
+            fault: M3CompactCanonicalMigrationFault? = null,
+        ): M3CompactCanonicalMigrationResult {
+            if (baseline.groupIdentity != group.value || configuration.seededEmptyBaseline != baseline) {
+                return M3CompactCanonicalMigrationResult.Refused(M3CompactCanonicalRefusal.IDENTITY_CONFLICT)
+            }
+            val sourceHash = m3PageSha256(
+                listOf(
+                    "m3-empty-v6-v1", group.value, baseline.bindingIdentity,
+                    baseline.groupIdentity, baseline.transactionId.toString(),
+                    baseline.geometryRevision.toString(), baseline.lineageRevision.toString(),
+                ).joinToString(":").encodeToByteArray(),
+            )
+            val empty = M3LegacyCanonicalState(
+                group = group,
+                nextHighWater = 1,
+                resident = M3CompactResident(
+                    0, IntArray(0), IntArray(0), IntArray(0), IntArray(0),
+                    ShortArray(0), ByteArray(0), IntArray(0), IntArray(0), IntArray(0),
+                    IntArray(0), IntArray(0),
+                ),
+                sourceCount = 0,
+                supportCount = 0,
+                lineageCount = 0,
+                geometryRevision = baseline.geometryRevision,
+                lineageRevision = baseline.lineageRevision,
+                baseline = baseline,
+                sourceHash = sourceHash,
+                sourceCursor = { _ -> },
+                supportCursor = { _ -> },
+                sourceLookup = { null },
+                explicitSourceIndex = null,
+                canonicalReceiptCursor = { _ -> },
+            )
+            return prepareV6Candidate(group, directory, budget, configuration, fault) { empty }
+        }
+
+        private fun prepareV6Candidate(
+            group: M3SurfaceGroup,
+            directory: File,
+            budget: M3CanonicalStorageBudget,
+            configuration: M3SurfaceOwnershipConfiguration,
+            fault: M3CompactCanonicalMigrationFault?,
+            state: () -> M3LegacyCanonicalState,
         ): M3CompactCanonicalMigrationResult {
             if (!configuration.isValid)
                 return M3CompactCanonicalMigrationResult.Refused(
@@ -1045,8 +1104,7 @@ private constructor(
                             M3CompactCanonicalRefusal.CORRUPT
                         )
                 } else null
-                val legacy =
-                    M3SurfaceOwnershipLegacyCodec.readValidated(group, directory, configuration)
+                val legacy = state()
                 validateLegacyForV6(legacy, configuration)
                 if (existing != null) {
                     return if (

@@ -157,16 +157,17 @@ class StorageBudgetCoordinatorV2(
         maximumPhysicalBytes: Long,
     ): StorageBudgetCandidateReservationV2 = withAuthority {
         require(owner.matches(OWNER)) { "Storage reservation owner is non-canonical" }
-        require(staging.parentFile == ledger.parentFile && target.parentFile == ledger.parentFile)
+        val stagingPath = candidateRelativePath(staging)
+        val targetPath = candidateRelativePath(target)
         require(staging.name.matches(CANDIDATE) && target.name.matches(CANDIDATE))
         require(fileBytes.isNotEmpty() && fileBytes.keys.all { it.matches(CANDIDATE) })
         require(fileBytes.values.all { it >= 0L } && maximumPhysicalBytes > 0L)
-        if (reservations.values.any { it.targetName == target.name })
+        if (reservations.values.any { it.targetName == targetPath })
             return@withAuthority StorageBudgetCandidateReservationV2.TargetReserved
         if (!canCharge(maximumPhysicalBytes)) return@withAuthority StorageBudgetCandidateReservationV2.QuotaRefused
         val token = sha256("$owner:$maximumPhysicalBytes:${nextTokenLocked()}".toByteArray()).hex()
         val reservation = StorageBudgetReservationV2(
-            token, owner, maximumPhysicalBytes, staging.name, target.name,
+            token, owner, maximumPhysicalBytes, stagingPath, targetPath,
         )
         val metadata = metadataFile(token)
         try {
@@ -186,7 +187,7 @@ class StorageBudgetCoordinatorV2(
             require(freeBytes() >= policy.freeSpaceFloorBytes) { "Candidate violates free-space floor" }
             files.writeExclusive(
                 metadata,
-                "$owner\n$maximumPhysicalBytes\n${staging.name}\n${target.name}\n".toByteArray(),
+                "$owner\n$maximumPhysicalBytes\n$stagingPath\n$targetPath\n".toByteArray(),
                 DurableStoreFaultPointV2.ACCEPTED_RECORD,
             )
             require(freeBytes() >= policy.freeSpaceFloorBytes)
@@ -208,7 +209,7 @@ class StorageBudgetCoordinatorV2(
 
     fun verifyCandidate(reservation: StorageBudgetReservationV2, candidate: File): Long = withAuthority {
         val current = requireReservationLocked(reservation)
-        require(current.stagingName != null && candidate.name in setOf(current.stagingName, current.targetName))
+        require(current.stagingName != null && candidateRelativePath(candidate) in setOf(current.stagingName, current.targetName))
         val actual = files.allocatedTreeBytes(candidate)
         require(actual in 1..current.bytes)
         require(freeBytes() >= policy.freeSpaceFloorBytes) { "Candidate violates free-space floor" }
@@ -217,7 +218,7 @@ class StorageBudgetCoordinatorV2(
 
     fun publishCandidate(reservation: StorageBudgetReservationV2, staging: File, target: File) = withAuthority {
         val current = requireReservationLocked(reservation)
-        require(current.stagingName == staging.name && current.targetName == target.name)
+        require(current.stagingName == candidateRelativePath(staging) && current.targetName == candidateRelativePath(target))
         val before = files.allocatedTreeBytes(staging)
         require(before in 1..current.bytes && freeBytes() >= policy.freeSpaceFloorBytes)
         files.moveAtomic(staging, target)
@@ -227,7 +228,7 @@ class StorageBudgetCoordinatorV2(
 
     /** Completes a publication cut left after the durable rename but before the explicit commit. */
     fun reconcilePublishedCandidate(target: File) = withAuthority {
-        val current = reservations.values.singleOrNull { it.targetName == target.name } ?: return@withAuthority
+        val current = reservations.values.singleOrNull { it.targetName == candidateRelativePath(target) } ?: return@withAuthority
         require(files.isDirectory(target) && current.stagingName != null)
         val actual = files.allocatedTreeBytes(target)
         commitCandidateLocked(current, actual)
@@ -235,8 +236,8 @@ class StorageBudgetCoordinatorV2(
 
     /** Reopen-only resolution for one known target: commit a rename or reclaim its private staging. */
     fun reconcileCandidate(target: File) = withAuthority {
-        val current = reservations.values.singleOrNull { it.targetName == target.name } ?: return@withAuthority
-        val staging = files.child(requireNotNull(current.stagingName))
+        val current = reservations.values.singleOrNull { it.targetName == candidateRelativePath(target) } ?: return@withAuthority
+        val staging = candidateFile(requireNotNull(current.stagingName))
         when {
             files.isDirectory(target) -> commitCandidateLocked(current, files.allocatedTreeBytes(target))
             current.token in liveCandidateTokens -> Unit
@@ -254,7 +255,7 @@ class StorageBudgetCoordinatorV2(
 
     fun releaseCandidate(reservation: StorageBudgetReservationV2, staging: File): Boolean = withAuthority {
         val current = reservations[reservation.token] ?: return@withAuthority false
-        require(current == reservation && current.stagingName == staging.name)
+        require(current == reservation && current.stagingName == candidateRelativePath(staging))
         // Remove authority first. A crash can then leave only an uncharged staging orphan, which
         // recovery reclaims under this same global lock before another reservation is admitted.
         files.delete(metadataFile(current.token), DurableStoreFaultPointV2.DELETE_RECLAIM)
@@ -345,14 +346,15 @@ class StorageBudgetCoordinatorV2(
      * marker lets recovery finish either half without ever exposing an uncharged tree.
      */
     fun reclaimCommittedCandidate(candidate: File): Long = withAuthority {
-        require(candidate.parentFile == ledger.parentFile && candidate.name.matches(COMMITTED_M3_CANDIDATE))
+        val candidatePath = candidateRelativePath(candidate)
+        require(candidate.name.matches(COMMITTED_M3_CANDIDATE))
         val actual = files.allocatedTreeBytes(candidate)
         require(actual in 1..committed)
         val previous = committed
-        val marker = reclaimFile(candidate.name)
+        val marker = reclaimFile(candidatePath)
         files.atomicReplace(
             marker,
-            "${candidate.name}\n$actual\n$previous\n".toByteArray(),
+            "$candidatePath\n$actual\n$previous\n".toByteArray(),
             DurableStoreFaultPointV2.POINTER_SLOT_REPLACE,
         )
         files.deleteTree(candidate, DurableStoreFaultPointV2.DELETE_RECLAIM)
@@ -414,11 +416,11 @@ class StorageBudgetCoordinatorV2(
             .sortedBy(File::getName)
             .forEach { marker ->
                 val lines = files.readLines(marker)
-                require(lines.size == 3 && lines[0].matches(COMMITTED_M3_CANDIDATE)) { "Corrupt committed reclaim" }
+                require(lines.size == 3 && lines[0].matches(COMMITTED_M3_CANDIDATE_PATH)) { "Corrupt committed reclaim" }
                 val bytes = lines[1].toLongOrNull() ?: error("Corrupt committed reclaim bytes")
                 val previous = lines[2].toLongOrNull() ?: error("Corrupt committed reclaim revision")
                 require(bytes > 0 && previous >= bytes && committed in setOf(previous, previous - bytes))
-                val candidate = files.child(lines[0])
+                val candidate = candidateFile(lines[0])
                 if (files.isDirectory(candidate)) {
                     require(committed == previous) { "Committed reclaim target reappeared after ledger release" }
                     require(files.allocatedTreeBytes(candidate) == bytes)
@@ -473,8 +475,8 @@ class StorageBudgetCoordinatorV2(
                     if (files.isFile(allocationFile(token))) files.delete(allocationFile(token), DurableStoreFaultPointV2.DELETE_RECLAIM)
                 } else reservations[token] = reservation
             } else {
-                require(lines[2].matches(CANDIDATE) && lines[3].matches(CANDIDATE))
-                val staging = files.child(lines[2]); val target = files.child(lines[3])
+                require(lines[2].matches(CANDIDATE_PATH) && lines[3].matches(CANDIDATE_PATH))
+                val staging = candidateFile(lines[2]); val target = candidateFile(lines[3])
                 val backing = when {
                     files.isDirectory(target) -> target
                     files.isDirectory(staging) -> staging
@@ -513,6 +515,16 @@ class StorageBudgetCoordinatorV2(
         files.list(requireNotNull(ledger.parentFile))
             .filter { it.name.matches(STAGING) && it.name !in liveStaging && files.isDirectory(it) }
             .forEach { files.deleteTree(it, DurableStoreFaultPointV2.DELETE_RECLAIM) }
+        files.list(requireNotNull(ledger.parentFile))
+            .filter { it.name.matches(GROUP_DIRECTORY) && files.isDirectory(it) }
+            .forEach { group ->
+                files.list(group)
+                    .filter { child ->
+                        child.name.matches(STAGING) &&
+                            "${group.name}/${child.name}" !in liveStaging && files.isDirectory(child)
+                    }
+                    .forEach { files.deleteTree(it, DurableStoreFaultPointV2.DELETE_RECLAIM) }
+            }
         if (committed > policy.quotaBytes || policy.freeSpaceFloorBytes > freeBytes()) {
             throw IllegalStateException("Storage budget cannot open within its physical quota/floor")
         }
@@ -581,12 +593,36 @@ class StorageBudgetCoordinatorV2(
     private fun sha256(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes)
     private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
 
+    private fun candidateRelativePath(candidate: File): String {
+        val root = requireNotNull(ledger.parentFile).absoluteFile.toPath().normalize()
+        val path = candidate.absoluteFile.toPath().normalize()
+        require(path.startsWith(root)) { "Candidate escapes storage root" }
+        val relative = root.relativize(path)
+        require(relative.nameCount in 1..2)
+        val segments = (0 until relative.nameCount).map { relative.getName(it).toString() }
+        require(segments.all { it.matches(CANDIDATE) })
+        if (segments.size == 2) require(segments.first().matches(GROUP_DIRECTORY))
+        return segments.joinToString("/")
+    }
+
+    private fun candidateFile(relative: String): File {
+        require(relative.matches(CANDIDATE_PATH))
+        return files.child(*relative.split('/').toTypedArray())
+    }
+
     companion object {
         private val OWNER = Regex("[A-Za-z0-9._:-]{1,160}")
         private val CANDIDATE = Regex("[A-Za-z0-9._-]{1,160}")
+        private val GROUP_DIRECTORY = Regex("[0-9a-f]{32}")
+        private val CANDIDATE_PATH = Regex("(?:[0-9a-f]{32}/)?[A-Za-z0-9._-]{1,160}")
         private val POINTER_PUBLICATION = Regex("[0-9a-f]{64}")
         private val RECLAIM_ID = Regex("[0-9a-f]{64}")
-        private val COMMITTED_M3_CANDIDATE = Regex("m3-cow-command-[0-9a-f]{64}")
+        private val COMMITTED_M3_CANDIDATE = Regex(
+            "(?:m3-cow-command-[0-9a-f]{64}|m3-canonical-v6-[0-9a-f]{64}\\.intent)",
+        )
+        private val COMMITTED_M3_CANDIDATE_PATH = Regex(
+            "(?:[0-9a-f]{32}/)?(?:m3-cow-command-[0-9a-f]{64}|m3-canonical-v6-[0-9a-f]{64}\\.intent)",
+        )
         /** Exact private-candidate namespaces whose uncharged trees startup recovery may delete. */
         private val STAGING = Regex(
             "(?:m3-canonical-v6-[0-9a-f]{64}\\.staging-[A-Za-z0-9._-]{1,64}|" +

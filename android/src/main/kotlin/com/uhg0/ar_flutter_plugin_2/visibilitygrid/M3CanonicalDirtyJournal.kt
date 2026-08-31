@@ -315,7 +315,9 @@ internal class M3CanonicalDirtyJournal private constructor(
 
     private fun refreshAllocationAuthority() {
         val legacyFile = M3SurfaceAllocationAuthority.legacyFile(directory, group)
-        val initialHighWater = if (!legacyFile.exists() || legacyFile.length() == 0L) authority.nextSurfaceIdHighWater else 1L
+        val initialHighWater = if (authority.seededEmptyBaseline != null) 1L
+            else if (!legacyFile.exists() || legacyFile.length() == 0L) authority.nextSurfaceIdHighWater
+            else 1L
         var chain = M3SurfaceAllocationAuthority.streamLegacy(
             directory, group, initialHighWater, authority.nextSurfaceIdHighWater,
         )

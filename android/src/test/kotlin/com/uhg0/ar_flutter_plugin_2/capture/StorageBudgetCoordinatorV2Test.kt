@@ -51,6 +51,59 @@ class StorageBudgetCoordinatorV2Test {
         first.close()
     }
 
+    @Test fun `group scoped candidates share one ledger and recover without crossing groups`() {
+        val root = directory(); val policy = StorageBudgetPolicyV2(1_000_000, 0)
+        val groupA = File(root, "a".repeat(32)).apply { assertTrue(mkdirs()) }
+        val groupB = File(root, "b".repeat(32)).apply { assertTrue(mkdirs()) }
+        val first = StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 10_000_000 }
+        val aStaging = File(groupA, "candidate-a.staging")
+        val aTarget = File(groupA, "candidate-a")
+        val a = requireNotNull(first.reserveCandidate(
+            "m3:canonical:v6-migration", aStaging, aTarget, mapOf("root" to 1L), 16_384L,
+        ))
+        first.publishCandidate(a, aStaging, aTarget)
+        val chargedA = first.verifyCandidate(a, aTarget)
+        first.commit(a, chargedA)
+
+        val orphan = File(groupB, "m3-canonical-v6-${"d".repeat(64)}.staging-1-1")
+        val b = requireNotNull(first.reserveCandidate(
+            "m3:canonical:v6-migration", orphan, File(groupB, "candidate-b"),
+            mapOf("root" to 1L), 16_384L,
+        ))
+        val metadata = File(root, "reservations-v2/${b.token}.reservation")
+        assertTrue(metadata.delete())
+        first.close()
+
+        StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 10_000_000 }.use { reopened ->
+            assertEquals(chargedA, reopened.committedBytes())
+            assertTrue(aTarget.isDirectory)
+            assertTrue(!orphan.exists())
+            assertTrue(groupA.listFiles().orEmpty().all { it.parentFile == groupA })
+            assertTrue(groupB.listFiles().orEmpty().all { it.parentFile == groupB })
+        }
+    }
+
+    @Test fun `group candidate authority refuses traversal and deeper targets`() {
+        val root = directory(); val coordinator = StorageBudgetCoordinatorV2(
+            root, StorageBudgetPolicyV2(1_000_000, 0), physicalFilesystem(),
+        ) { 10_000_000 }
+        val group = File(root, "c".repeat(32)).apply { assertTrue(mkdirs()) }
+        val deeper = File(group, "nested").apply { assertTrue(mkdirs()) }
+        assertThrows(IllegalArgumentException::class.java) {
+            coordinator.reserveCandidate(
+                "m3:canonical:v6-migration", File(deeper, "staging"), File(deeper, "target"),
+                mapOf("root" to 1L), 16_384L,
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            coordinator.reserveCandidate(
+                "m3:canonical:v6-migration", File(root.parentFile, "escape-staging"),
+                File(root.parentFile, "escape-target"), mapOf("root" to 1L), 16_384L,
+            )
+        }
+        coordinator.close()
+    }
+
     private val directories = mutableListOf<File>()
     @After fun cleanUp() { directories.forEach { it.deleteRecursively() } }
 
