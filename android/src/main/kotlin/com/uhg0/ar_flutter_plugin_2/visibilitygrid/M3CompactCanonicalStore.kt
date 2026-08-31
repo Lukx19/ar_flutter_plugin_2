@@ -727,6 +727,18 @@ private constructor(
         return M3CompactPage(rows, if (next < rangeCount) next else null, delivered)
     }
 
+    /** Bounded id-ordered renderer rebuild page; it never exposes the resident backing arrays. */
+    internal fun readRendererPage(cursor: Int, limit: Int): M3CompactPage {
+        if (closed || cursor !in 0..rowCount || limit !in 1..MAX_PAGE_READ) {
+            return M3CompactPage(emptyList(), null, 0)
+        }
+        val delivered = minOf(limit, rowCount - cursor)
+        val rows = ArrayList<M3CompactSurface>(delivered)
+        repeat(delivered) { offset -> rows += row(idOrder[cursor + offset]) }
+        val next = cursor + delivered
+        return M3CompactPage(rows, if (next < rowCount) next else null, delivered)
+    }
+
     override fun readSourceById(id: M3SurfaceId): M3CanonicalPageRead<M3PagedSource?> {
         pageReadWork++
         if (closed) return M3CanonicalPageRead.Refused(M3CompactCanonicalRefusal.CLOSED)

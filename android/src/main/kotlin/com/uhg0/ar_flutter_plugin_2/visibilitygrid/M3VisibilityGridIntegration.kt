@@ -6,8 +6,8 @@ import com.uhg0.ar_flutter_plugin_2.m0.M0aCurrentDeltaSourceV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
+import java.io.ByteArrayOutputStream
 import java.io.File
-import java.security.MessageDigest
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -25,6 +25,7 @@ internal class M3VisibilityGridIntegration(
     private val binding: VisibilityGridV2Binding,
     private val ownership: () -> VisibilityObservationOwnership?,
     private val directory: File,
+    private val resourcesForGroup: (M3SurfaceGroup) -> M3CanonicalRuntimeResources,
     private val renderer: M3CommittedRendererProjection = M3CommittedRendererProjection.NONE,
     private val beforeAdmission: () -> Unit = {},
     private val executor: ExecutorService = Executors.newSingleThreadExecutor(),
@@ -40,12 +41,13 @@ internal class M3VisibilityGridIntegration(
     private var baseline: M3CommittedEmptyBaseline? = null
     private var kernel: M3FeatureFusionKernel? = null
     private var owner: M3SurfaceOwnership? = null
+    private var resources: M3CanonicalRuntimeResources? = null
     private var batchSequence = 0L
     private var nextTransactionId = 0L
     private var pending: M0aCurrentDeltaSelectorV1? = null
+    private var pendingCanonicalAcknowledgement: M3CanonicalAcknowledgement? = null
     private var unpublished: M3CanonicalTransactionResult.Accepted? = null
     private val retainedDelta = M3ExactCurrentDeltaSource()
-    private val knownVoxels = hashSetOf<M3Voxel>()
     @Volatile private var committed = 0L
     @Volatile private var rejected = 0L
     @Volatile private var fenced = 0L
@@ -64,11 +66,9 @@ internal class M3VisibilityGridIntegration(
             return@mutate
         }
         ensureOpened(observation.ownership) ?: return@mutate
-        if (committed > 0L) {
-            // #63 owns relocation/conflict semantics. Feature-only #62 may
-            // publish the initial qualified CREATE and nothing beyond it.
+        if (pending != null) {
             rejected++
-            receipt = receipt.copy(status = "featureConflictDeferred", rejected = rejected)
+            receipt = receipt.copy(status = "awaitingExactAck", rejected = rejected)
             return@mutate
         }
         // This adapter is the only M2-to-M3 conversion point.  It creates
@@ -94,36 +94,13 @@ internal class M3VisibilityGridIntegration(
             return@mutate
         }
         if (isFenced(observation.ownership)) return@mutate
-        val targets = accepted.delta.mapNotNull { (it as? M3FeatureFusionChange.Upsert)?.candidate }
-            .filter { M3Voxel(it.x, it.y, it.z) !in knownVoxels }
-        if (targets.isEmpty()) return@mutate
-        val surfaceOwner = requireNotNull(owner)
-        val base = requireNotNull(baseline)
-        val command = M3CanonicalTransactionCommand(
-            commandId = "${observation.ownership.bindingGeneration}:${observation.ownership.lifecycleSequence}:${batchSequence}",
-            kind = M3CanonicalOperation.CREATE,
-            expectedGeometryRevision = base.geometryRevision,
-            expectedLineageRevision = base.lineageRevision,
-            sourceIds = emptyList(),
-            targets = targets.mapNotNull(M3FeatureFusionCandidate::primaryCanonicalTarget),
-        )
         synchronized(publicationGate) {
             if (isFenced(observation.ownership)) return@mutate
-            val result = surfaceOwner.transact(command) as? M3CanonicalTransactionResult.Accepted ?: run {
-                rejected++
-                receipt = receipt.copy(status = "canonicalRefused", rejected = rejected)
-                return@mutate
+            if (requireNotNull(owner).activationState() == null) {
+                publishInitialCreate(observation.ownership, accepted.delta)
+            } else {
+                publishMaterialBatch(observation.ownership, accepted.delta)
             }
-            if (isFenced(observation.ownership)) {
-                // Binding replacement is independent of the lifecycle gate.
-                // Keep the durable result private rather than publishing it
-                // through a stale view.
-                fenced++
-                unpublished = result
-                receipt = receipt.copy(status = "publicationDeferred", fenced = fenced)
-                return@mutate
-            }
-            publishCommittedCreate(observation.ownership, result)
         }
     }
 
@@ -156,7 +133,7 @@ internal class M3VisibilityGridIntegration(
             synchronized(publicationGate) {
                 if (!isFenced(expected) && pending == null && unpublished === retained) {
                     unpublished = null
-                    publishCommittedCreate(expected, retained)
+                    publishDeferredInitialCreate(expected, retained)
                 }
             }
         }.get()
@@ -240,51 +217,174 @@ internal class M3VisibilityGridIntegration(
         if (cut == expected) return baseline
         val seeded = binding.m3CommittedEmptyBaseline() ?: run { fenced++; return null }
         if (ownership() != expected) { fenced++; return null }
-        val opened = M3SurfaceOwnership.open(
-            group = M3SurfaceGroup(expected.captureGroupId),
-            directory = directory,
-            configuration = M3SurfaceOwnershipConfiguration(seededEmptyBaseline = seeded),
-        ) as? M3SurfaceOwnershipOpenResult.Opened ?: run { rejected++; return null }
+        val group = M3SurfaceGroup(expected.captureGroupId)
+        val runtimeResources = resourcesForGroup(group)
+        val opened = if (M3CanonicalActivationSelector.hasDurableSelector(group, runtimeResources.directory)) {
+            runtimeResources.reopen()
+        } else {
+            runtimeResources.openInitial(seeded)
+        } as? M3SurfaceOwnershipOpenResult.Opened ?: run {
+            runtimeResources.close()
+            rejected++
+            return null
+        }
+        resources = runtimeResources
         owner = opened.ownership
         kernel = M3FeatureFusionKernel()
         cut = expected
         baseline = seeded
         nextTransactionId = seeded.transactionId + 1
         batchSequence = 0
-        knownVoxels.clear()
         receipt = M3VisibilityGridIntegrationReceipt.seeded(expected, seeded)
-        opened.ownership.currentCanonicalTransaction()?.let { restored ->
-            if (restored.receipt.kind != M3CanonicalOperation.CREATE ||
-                restored.receipt.geometryRevision != seeded.geometryRevision + 1 ||
-                restored.receipt.lineageRevision != seeded.lineageRevision
-            ) {
-                rejected++
-                receipt = receipt.copy(status = "restoreFork", rejected = rejected)
-                return null
+        // A restart may have a selected unacknowledged v6 current. It is replayed
+        // through the same bounded V2 receipt path before a later batch is admitted.
+        opened.ownership.activationState()?.let { state ->
+            if (state.currentState is M3CanonicalCurrentState.Unacknowledged) {
+                publishV6Current(expected, state, emptyList())
+            } else if (state.currentState is M3CanonicalCurrentState.Acknowledged) {
+                rebuildAcknowledgedRenderer(expected, state)
             }
-            publishCommittedCreate(expected, restored)
-            return null
         }
         return seeded
     }
 
-    private fun publishCommittedCreate(
+    private fun publishInitialCreate(
+        expected: VisibilityObservationOwnership,
+        changes: List<M3FeatureFusionChange>,
+    ) {
+        val targets = changes.mapNotNull { (it as? M3FeatureFusionChange.Upsert)?.candidate }
+            .mapNotNull(M3FeatureFusionCandidate::primaryCanonicalTarget)
+        if (targets.isEmpty()) {
+            receipt = receipt.copy(status = "nonMaterialRetained")
+            return
+        }
+        val base = requireNotNull(baseline)
+        val result = requireNotNull(owner).transact(
+            M3CanonicalTransactionCommand(
+                commandId = "${expected.bindingGeneration}:${expected.lifecycleSequence}:${batchSequence}",
+                kind = M3CanonicalOperation.CREATE,
+                expectedGeometryRevision = base.geometryRevision,
+                expectedLineageRevision = base.lineageRevision,
+                sourceIds = emptyList(),
+                targets = targets,
+            ),
+        ) as? M3CanonicalTransactionResult.Accepted ?: run {
+            rejected++
+            receipt = receipt.copy(status = "canonicalRefused", rejected = rejected)
+            return
+        }
+        if (isFenced(expected)) {
+            fenced++
+            unpublished = result
+            receipt = receipt.copy(status = "publicationDeferred", fenced = fenced)
+            return
+        }
+        publishDeferredInitialCreate(expected, result)
+    }
+
+    private fun publishDeferredInitialCreate(
         expected: VisibilityObservationOwnership,
         result: M3CanonicalTransactionResult.Accepted,
     ) {
-        val canonical = result.receipt
+        val base = requireNotNull(baseline)
+        val activated = requireNotNull(resources).activateInitialCreate(base) as? M3SurfaceOwnershipOpenResult.Opened
+            ?: run {
+                rejected++
+                receipt = receipt.copy(status = "activationRefused", rejected = rejected)
+                return
+            }
+        owner = activated.ownership
+        val state = requireNotNull(owner).activationState() ?: run {
+            rejected++
+            receipt = receipt.copy(status = "activationRefused", rejected = rejected)
+            return
+        }
+        publishV6Current(expected, state, result.targets.map { it.voxel })
+    }
+
+    private fun publishMaterialBatch(
+        expected: VisibilityObservationOwnership,
+        changes: List<M3FeatureFusionChange>,
+    ) {
+        val activeOwner = requireNotNull(owner)
+        val view = (requireNotNull(resources).openCurrent() as? M3CompactCanonicalOpenResult.Opened)?.store
+            ?: run {
+                rejected++
+                receipt = receipt.copy(status = "v6ReadRefused", rejected = rejected)
+                return
+            }
+        val preparation = view.use {
+            activeOwner.prepareAdjacentMutation(
+                it,
+                M3CanonicalFeatureBatchCommand(
+                    commandId = "${expected.bindingGeneration}:${expected.lifecycleSequence}:${batchSequence}",
+                    expectedGeometryRevision = it.cut.geometryRevision,
+                    expectedLineageRevision = it.cut.lineageRevision,
+                    changes = changes,
+                ),
+            )
+        }
+        val prepared = preparation as? M3CanonicalMutationPreparation.Prepared ?: run {
+            if (preparation is M3CanonicalMutationPreparation.NoOp) {
+                receipt = receipt.copy(status = "nonMaterialRetained")
+            } else {
+                rejected++
+                receipt = receipt.copy(status = "batchRefused", rejected = rejected)
+            }
+            return
+        }
+        val voxels = ArrayList<M3Voxel>(prepared.mutation.dirtyRowCount)
+        prepared.mutation.visitDirtyRows { row -> voxels += row.voxel; true }
+        val committedState = (activeOwner.commitAdjacentCanonicalMutation(prepared.mutation)
+            as? M3CanonicalAdjacentCommitResult.Committed)?.state ?: run {
+            rejected++
+            receipt = receipt.copy(status = "batchCommitRefused", rejected = rejected)
+            return
+        }
+        if (isFenced(expected)) {
+            fenced++
+            receipt = receipt.copy(status = "publicationDeferred", fenced = fenced)
+            return
+        }
+        publishV6Current(expected, committedState, voxels)
+    }
+
+    private fun publishV6Current(
+        expected: VisibilityObservationOwnership,
+        state: M3CanonicalActivationState,
+        voxels: List<M3Voxel>,
+    ) {
+        val current = state.current as? M3CanonicalActivationCurrent.Receipt ?: run {
+            rejected++
+            receipt = receipt.copy(status = "currentMissing", rejected = rejected)
+            return
+        }
+        val canonicalBytes = ByteArrayOutputStream().use { output ->
+            current.source.writeTo(output)
+            output.toByteArray()
+        }
+        if (canonicalBytes.size.toLong() != current.identity.canonicalLength) {
+            rejected++
+            receipt = receipt.copy(status = "currentCorrupt", rejected = rejected)
+            return
+        }
         val selector = M0aCurrentDeltaSelectorV1(
             transactionId = nextTransactionId++,
-            targetGeometryRevision = canonical.geometryRevision,
-            targetLineageRevision = canonical.lineageRevision,
+            targetGeometryRevision = state.cut.geometryRevision,
+            targetLineageRevision = state.cut.lineageRevision,
         )
         retainedDelta.retain(
             M0aCurrentDeltaReceiptV1(
                 selector,
-                canonical.geometryRevision - 1,
-                canonical.canonicalBytes.toByteArray(),
-                MessageDigest.getInstance("SHA-256").digest(canonical.commandId.encodeToByteArray()),
+                state.cut.geometryRevision - 1,
+                canonicalBytes,
+                current.identity.commandHash.toByteArray(),
             ),
+        )
+        pendingCanonicalAcknowledgement = M3CanonicalAcknowledgement(
+            current.identity.commandHash,
+            state.cut.geometryRevision,
+            state.cut.lineageRevision,
         )
         pending = selector
         try {
@@ -300,15 +400,32 @@ internal class M3VisibilityGridIntegration(
         }
         // Renderer and worker name the same durable cut. This callback never
         // enters Flutter and cannot expose ordinary row bytes.
-        renderer.project(expected, canonical, result.targets)
-        knownVoxels += result.targets.map { it.voxel }
+        renderer.project(expected, state.cut.geometryRevision, state.cut.lineageRevision, voxels)
         committed++
         receipt = M3VisibilityGridIntegrationReceipt(
             "pendingAck", expected.bindingGeneration, expected.sessionGeneration,
-            expected.groupGeneration, selector.transactionId, canonical.geometryRevision,
-            canonical.lineageRevision, canonical.canonicalBytes.size, result.targets.size,
+            expected.groupGeneration, selector.transactionId, state.cut.geometryRevision,
+            state.cut.lineageRevision, canonicalBytes.size, voxels.size,
             committed, rejected, fenced,
         )
+    }
+
+    private fun rebuildAcknowledgedRenderer(
+        expected: VisibilityObservationOwnership,
+        state: M3CanonicalActivationState,
+    ) {
+        renderer.beginRebuild(expected, state.cut.geometryRevision, state.cut.lineageRevision)
+        var cursor = 0
+        while (true) {
+            if (isFenced(expected)) return
+            val page = requireNotNull(resources).readRendererPage(cursor) ?: run {
+                rejected++
+                receipt = receipt.copy(status = "rebuildRefused", rejected = rejected)
+                return
+            }
+            renderer.appendRebuildPage(expected, page.cut.geometryRevision, page.cut.lineageRevision, page.voxels)
+            cursor = page.nextCursor ?: return
+        }
     }
 
     private fun acknowledge(selector: M0aCurrentDeltaSelectorV1) {
@@ -317,8 +434,18 @@ internal class M3VisibilityGridIntegration(
             executor.submit {
                 synchronized(lock) {
                     if (pending != selector || closed) return@synchronized
+                    val acknowledgement = requireNotNull(pendingCanonicalAcknowledgement)
+                    when (val result = requireNotNull(owner).acknowledgeCanonicalCurrent(acknowledgement)) {
+                        is M3CanonicalAcknowledgementResult.Acknowledged,
+                        is M3CanonicalAcknowledgementResult.Idempotent -> Unit
+                        is M3CanonicalAcknowledgementResult.NoOp -> {
+                            receipt = receipt.copy(status = "ack${result.reason.name}")
+                            return@synchronized
+                        }
+                    }
                     retainedDelta.acknowledge(selector)
                     pending = null
+                    pendingCanonicalAcknowledgement = null
                     receipt = receipt.copy(status = "acknowledged")
                 }
             }
@@ -328,10 +455,11 @@ internal class M3VisibilityGridIntegration(
     private fun closeOwner() {
         retainedDelta.clear()
         pending = null
-        owner?.close()
+        resources?.close() ?: owner?.close()
+        resources = null
         owner = null
         kernel = null
-        knownVoxels.clear()
+        pendingCanonicalAcknowledgement = null
         unpublished = null
     }
 
@@ -352,17 +480,30 @@ internal fun M3FeatureFusionCandidate.primaryCanonicalTarget(): M3CanonicalTarge
 internal interface M3CommittedRendererProjection : AutoCloseable {
     fun project(
         ownership: VisibilityObservationOwnership,
-        receipt: M3CanonicalTransactionReceipt,
-        rows: List<M3SurfaceOwner>,
+        geometryRevision: Long,
+        lineageRevision: Long,
+        voxels: List<M3Voxel>,
     )
+    fun beginRebuild(
+        ownership: VisibilityObservationOwnership,
+        geometryRevision: Long,
+        lineageRevision: Long,
+    ) = Unit
+    fun appendRebuildPage(
+        ownership: VisibilityObservationOwnership,
+        geometryRevision: Long,
+        lineageRevision: Long,
+        voxels: List<M3Voxel>,
+    ) = Unit
     fun clear() = Unit
     override fun close() = Unit
     companion object {
         val NONE = object : M3CommittedRendererProjection {
             override fun project(
                 ownership: VisibilityObservationOwnership,
-                receipt: M3CanonicalTransactionReceipt,
-                rows: List<M3SurfaceOwner>,
+                geometryRevision: Long,
+                lineageRevision: Long,
+                voxels: List<M3Voxel>,
             ) = Unit
         }
     }
@@ -380,16 +521,54 @@ internal class M3NativeRendererProjection(
         voxelSizeMeters = 0.1f,
     )
     private var closed = false
+    private var rebuildKeys = LongArray(capacity)
+    private var rebuildCount = 0
 
     @Synchronized
     override fun project(
         ownership: VisibilityObservationOwnership,
-        receipt: M3CanonicalTransactionReceipt,
-        rows: List<M3SurfaceOwner>,
+        geometryRevision: Long,
+        lineageRevision: Long,
+        voxels: List<M3Voxel>,
     ) {
         check(!closed)
-        require(rows.all { it.group.value == ownership.captureGroupId })
-        val keys = rows.map { packVisibilityGridKey(it.voxel.x, it.voxel.y, it.voxel.z) }.toLongArray()
+        rebuildCount = 0
+        appendKeys(voxels)
+        renderKeys(ownership, geometryRevision)
+    }
+
+    @Synchronized
+    override fun beginRebuild(
+        ownership: VisibilityObservationOwnership,
+        geometryRevision: Long,
+        lineageRevision: Long,
+    ) {
+        check(!closed)
+        rebuildCount = 0
+    }
+
+    @Synchronized
+    override fun appendRebuildPage(
+        ownership: VisibilityObservationOwnership,
+        geometryRevision: Long,
+        lineageRevision: Long,
+        voxels: List<M3Voxel>,
+    ) {
+        check(!closed)
+        appendKeys(voxels)
+        renderKeys(ownership, geometryRevision)
+    }
+
+    private fun appendKeys(voxels: List<M3Voxel>) {
+        require(rebuildCount + voxels.size <= rebuildKeys.size)
+        voxels.forEach { rebuildKeys[rebuildCount++] = packVisibilityGridKey(it.x, it.y, it.z) }
+    }
+
+    private fun renderKeys(
+        ownership: VisibilityObservationOwnership,
+        geometryRevision: Long,
+    ) {
+        val keys = rebuildKeys.copyOf(rebuildCount)
         state.startGroup(
             config = VisibilityGridGroupConfig(
                 groupId = ownership.captureGroupId,
@@ -398,10 +577,10 @@ internal class M3NativeRendererProjection(
                 voxelSizeMeters = 0.1,
                 capacity = 100_000,
                 groupFromWorldGl = identityVisibilityGridTransform(),
-                restoredGeometryRevision = receipt.geometryRevision,
+                restoredGeometryRevision = geometryRevision,
                 restoredKeys = keys,
             ),
-            geometryRevision = receipt.geometryRevision,
+            geometryRevision = geometryRevision,
             restoredKeys = keys,
         )
         render(state.snapshot(), config)

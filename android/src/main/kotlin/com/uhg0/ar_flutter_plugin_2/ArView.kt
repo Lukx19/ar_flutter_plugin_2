@@ -24,6 +24,8 @@ import com.uhg0.ar_flutter_plugin_2.capture.CaptureSessionException
 import com.uhg0.ar_flutter_plugin_2.capture.NativeCaptureRecoveryAdmissionExceptionV2
 import com.uhg0.ar_flutter_plugin_2.capture.PoseBatchDispatcher
 import com.uhg0.ar_flutter_plugin_2.capture.ReplayableShutdownPreparationV2
+import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetCoordinatorV2
+import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetPolicyV2
 import com.uhg0.ar_flutter_plugin_2.sceneview.PluginAnchorRecord
 import com.uhg0.ar_flutter_plugin_2.sceneview.PluginHitResult
 import com.uhg0.ar_flutter_plugin_2.sceneview.PluginNodeRecord
@@ -39,6 +41,7 @@ import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridRuntimeCapabili
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridV2Binding
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.M3VisibilityGridIntegration
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.M3NativeRendererProjection
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.M3CanonicalRuntimeResources
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.AndroidVisibilityGridRuntime
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.ArCoreVisibilityObservationSource
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityObservationDebugChannel
@@ -134,10 +137,19 @@ internal class ArView(
     // #101 owns this native proof only.  It remains false until an internal
     // V2 capture owner binds one exact durable attempt/cut; Dart cannot enable it.
     private val captureSafetySignalV2 = CaptureSafetySignalV2()
+    // One physical accounting root is shared across successive group-owned M3 resources.
+    // Each resource borrows this coordinator and releases its owner before a replacement opens.
+    private val visibilityM3BudgetCoordinator = StorageBudgetCoordinatorV2(
+        File(context.filesDir, "visibility-grid-m3-runtime"),
+        StorageBudgetPolicyV2(64L * 1024L * 1024L, 0),
+    )
     private val visibilityObservationMappingAdmission = M3VisibilityGridIntegration(
         binding = visibilityGridV2Binding,
         ownership = visibilityGridV2Binding::currentObservationOwnership,
-        directory = File(context.filesDir, "visibility-grid-m3"),
+        directory = context.filesDir,
+        resourcesForGroup = { group ->
+            M3CanonicalRuntimeResources.open(context.filesDir, group, visibilityM3BudgetCoordinator)
+        },
         renderer = M3NativeRendererProjection(sceneHost::updateCoverageRenderer),
         beforeAdmission = visibilityObservationDebugGate::awaitIfArmed,
     )
@@ -284,6 +296,7 @@ internal class ArView(
         visibilityGridChannel.dispose()
         visibilityObservationDebugChannel.dispose()
         visibilityObservationRuntime.close()
+        visibilityM3BudgetCoordinator.close()
         visibilityGridV2Binding.dispose()
         lifecycle.removeObserver(lifecycleObserver)
         if (!captureSession.dispose { result ->
