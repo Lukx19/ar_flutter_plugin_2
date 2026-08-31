@@ -389,14 +389,7 @@ internal object M3CompactCanonicalFormat {
 
     /** Exact byte count used by DataOutputStream.writeUTF, including its two-byte length prefix. */
     private fun utfBytes(value: String): Long {
-        var bytes = 0
-        value.forEach { character ->
-            bytes += when (character.code) {
-                in 0x0001..0x007f -> 1
-                in 0x0000..0x07ff -> 2
-                else -> 3
-            }
-        }
+        val bytes = modifiedUtf8Length(value)
         require(bytes <= 65_535)
         return bytes + 2L
     }

@@ -533,7 +533,6 @@ internal class M3MutableCanonicalOverlay private constructor(
 
     companion object {
         private const val UINT32_END = 0x1_0000_0000L
-        private const val MAX_COMMAND_BYTES = 256
         // #117 gets one 16 KiB codec page, one 16 KiB checksum page, and 32 KiB of
         // bounded framing/index workspace. It must stream records and may not borrow plan ownership.
         internal const val WRITER_SCRATCH_BYTES = 65_536L
@@ -626,29 +625,7 @@ internal class M3MutableCanonicalOverlay private constructor(
             ),
         )
 
-        private fun validCommandId(value: String) = value.isNotBlank() && utf8Length(value) <= MAX_COMMAND_BYTES
-
-        /** Allocation-free equivalent of the JDK UTF-8 encoder length for admission. */
-        private fun utf8Length(value: String): Int {
-            var bytes = 0
-            var index = 0
-            while (index < value.length) {
-                val character = value[index]
-                bytes += when {
-                    character.code < 0x80 -> 1
-                    character.code < 0x800 -> 2
-                    character.isHighSurrogate() && index + 1 < value.length && value[index + 1].isLowSurrogate() -> {
-                        index++
-                        4
-                    }
-                    character.isSurrogate() -> 1 // malformed UTF-16 is replaced with '?' by the JDK encoder
-                    else -> 3
-                }
-                if (bytes > MAX_COMMAND_BYTES) return bytes
-                index++
-            }
-            return bytes
-        }
+        private fun validCommandId(value: String) = validM3CommandId(value)
     }
 }
 
@@ -1163,17 +1140,22 @@ internal enum class M3CanonicalMutationRefusal {
 
 private fun Long.toIntExact(): Int = try { Math.toIntExact(this) } catch (_: ArithmeticException) { Int.MAX_VALUE }
 
-/** DataOutputStream.writeUTF payload length without allocating its encoded form. */
+internal const val M3_COMMAND_MODIFIED_UTF_BYTES = 256L
+
+/** Exact DataOutputStream.writeUTF payload length without allocating its encoded form. */
 internal fun modifiedUtf8Length(value: String): Long {
     var bytes = 0L
     value.forEach { character ->
-        bytes += when (character.code) {
-            in 1..0x7f -> 1
-            in 0x80..0x7ff -> 2
-            else -> 3
-        }
+        bytes = Math.addExact(bytes, when (character.code) {
+            in 1..0x7f -> 1L
+            in 0..0x7ff -> 2L
+            else -> 3L
+        })
     }
     return bytes
 }
+
+internal fun validM3CommandId(value: String): Boolean =
+    value.isNotBlank() && modifiedUtf8Length(value) in 1..M3_COMMAND_MODIFIED_UTF_BYTES
 
 private fun overlayHash(bytes: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(bytes)

@@ -512,7 +512,7 @@ internal data class M3MutableSemanticRoot(
                     val wire = input.readUnsignedByte(); val kind = requireNotNull(M3CowFragmentKind.entries.firstOrNull { it.wire == wire }) { "unknown root kind $wire" }; val page = input.readInt(); val minimum = input.readLong(); val maximum = input.readLong(); val offset = input.readLong(); val length = input.readInt(); val records = input.readInt(); val hash = ByteArray(32).also(input::readFully); M3CowDirectoryEntry(kind, page, minimum, maximum, offset, length, records, hash)
                 }
                 require(input.read() == -1 && profile == M3CompactCanonicalStore.PROFILE && targetHigh >= high && targetLive in 0..100_000 && targetSource in 0..300_000 && targetSupport in 0..300_000 && targetLineage in 0..200_000 && targetGeometry >= geometry && targetLineageRevision >= lineage)
-                require(commandId.isNotBlank() && modifiedUtf8Length(commandId) <= 256)
+                require(validM3CommandId(commandId))
                 M3MutableSemanticRoot(M3CompactCanonicalCut(group, profile, geometry, lineage, high, live, sources, supports, edges, baseline, root, source), commandId, M3PreparedMutationKind.entries[kindOrdinal], command, fingerprint, targetHigh, targetLive, targetSource, targetSupport, targetLineage, targetGeometry, targetLineageRevision, current, manifest)
             }
         } catch (_: Exception) { null }

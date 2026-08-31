@@ -215,10 +215,10 @@ internal class M3PreparedIntentStreamingVisitor(
     private fun readCommand(input: DataInputStream): String {
         input.mark(2)
         val encodedBytes = input.readUnsignedShort()
-        require(encodedBytes in 1..MAX_COMMAND_BYTES && input.markSupported())
+        require(encodedBytes.toLong() in 1..M3_COMMAND_MODIFIED_UTF_BYTES && input.markSupported())
         input.reset()
         return input.readUTF().also { command ->
-            require(command.isNotBlank() && modifiedUtf8Length(command) == encodedBytes.toLong())
+            require(validM3CommandId(command) && modifiedUtf8Length(command) == encodedBytes.toLong())
         }
     }
     private fun copyHash(input: DataInputStream, output: java.io.DataOutputStream, expected: M3CanonicalReceiptBytes) {
@@ -251,7 +251,6 @@ internal class M3PreparedIntentStreamingVisitor(
         const val CURRENT_MAGIC = 0x4d334350
         const val LEGACY_BODY_VERSION = 1
         const val BODY_VERSION = 2
-        const val MAX_COMMAND_BYTES = 256
         const val UINT32_END = 0x1_0000_0000L
         val LEGACY_DERIVABLE_KINDS = setOf(
             M3PreparedMutationKind.FEATURE_ADD,

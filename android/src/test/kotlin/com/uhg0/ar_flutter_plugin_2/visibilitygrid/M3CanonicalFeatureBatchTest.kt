@@ -8,6 +8,43 @@ import org.junit.Test
 
 class M3CanonicalFeatureBatchTest {
     @Test
+    fun `modified UTF command boundary is shared by admission and budget before owned work`() {
+        val nulValid = "\u0000".repeat(128)
+        val nulInvalid = "\u0000".repeat(129)
+        val surrogateValid = "\ud800".repeat(85)
+        val surrogateInvalid = "\ud800".repeat(86)
+        val asciiValid = "a".repeat(256)
+        val asciiInvalid = "a".repeat(257)
+        assertEquals(listOf(256L, 258L, 255L, 258L, 256L, 257L), listOf(
+            nulValid, nulInvalid, surrogateValid, surrogateInvalid, asciiValid, asciiInvalid,
+        ).map(::modifiedUtf8Length))
+        assertEquals(3_552, M3MutableCanonicalOverlay.featureBatchBudget(configuration(), "limit").maximumUpserts)
+
+        listOf(nulValid, surrogateValid, asciiValid).forEach { commandId ->
+            assertTrue(validM3CommandId(commandId))
+            val view = view(rows = emptyList(), high = 1)
+            val plan = prepared(M3MutableCanonicalOverlay.prepare(
+                view, configuration(), M3CanonicalFeatureBatchCommand(commandId, 0, 0, listOf(upsert(1))),
+            ))
+            assertEquals(modifiedUtf8Length(commandId), plan.commandId.let(::modifiedUtf8Length))
+            assertEquals(2, view.authoritySnapshots) // before and after accepted authority work
+            plan.discard()
+        }
+
+        listOf("", nulInvalid, surrogateInvalid, asciiInvalid).forEach { commandId ->
+            assertTrue(!validM3CommandId(commandId))
+            val view = view(rows = emptyList(), high = 1)
+            val refused = M3MutableCanonicalOverlay.prepare(
+                view, configuration(), M3CanonicalFeatureBatchCommand(commandId, 0, 0, listOf(upsert(1))),
+            ) as M3CanonicalMutationPreparation.Refused
+            assertEquals(M3CanonicalMutationRefusal.INVALID_COMMAND, refused.reason)
+            assertEquals(M3CanonicalMutationPreflightWork(), refused.preflightWork)
+            assertEquals(0, view.authoritySnapshots)
+            assertEquals(0, view.authorityReads)
+        }
+    }
+
+    @Test
     fun `scalar worst case preflight rejects max plus one before owned work or authority`() {
         val budget = M3MutableCanonicalOverlay.featureBatchBudget(configuration(), "limit")
         assertEquals(5_576, budget.journalAndCurrentMaximum)

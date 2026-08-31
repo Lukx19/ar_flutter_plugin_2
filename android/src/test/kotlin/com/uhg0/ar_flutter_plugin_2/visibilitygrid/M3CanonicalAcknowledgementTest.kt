@@ -11,6 +11,7 @@ class M3CanonicalAcknowledgementTest {
     @Test
     fun `feature batch becomes one exact adjacent current and survives replay before ACK`() {
         val fixture = activated("feature-batch-current")
+        val boundaryCommandId = "\u0000".repeat(128)
         try {
             val before = requireNotNull(fixture.owner.activationState())
             val current = before.current as M3CanonicalActivationCurrent.Receipt
@@ -19,7 +20,7 @@ class M3CanonicalAcknowledgementTest {
             ) is M3CanonicalAcknowledgementResult.Acknowledged)
             val plan = withAdjacentView(fixture, before) { view ->
                 (fixture.owner.prepareAdjacentMutation(view, M3CanonicalFeatureBatchCommand(
-                    "feature-batch-${before.cut.geometryRevision}", before.cut.geometryRevision, before.cut.lineageRevision,
+                    boundaryCommandId, before.cut.geometryRevision, before.cut.lineageRevision,
                     listOf(
                         M3FeatureFusionChange.Upsert(M3FeatureFusionCandidate(1, 0, 0, 2, 1,
                             listOf(M3FeatureNormalCandidate(1, 0, 0, M3FeatureNormalFace.PRIMARY, 0, 0, 191)))),
