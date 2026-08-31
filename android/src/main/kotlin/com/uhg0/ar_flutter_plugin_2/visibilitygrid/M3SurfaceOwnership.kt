@@ -241,7 +241,8 @@ internal class M3SurfaceOwnership private constructor(
         return transactionReceipts.values.lastOrNull()?.result
     }
 
-    /** Bounded activation state; its receipt source streams from the selected immutable file. */
+    /** Bounded activation state; all activation/closed access linearizes on this owner monitor. */
+    @Synchronized
     internal fun activationState(): M3CanonicalActivationState? = if (closed) null else activation
 
     /**
@@ -408,6 +409,7 @@ internal class M3SurfaceOwnership private constructor(
     }
 
     /** Attached atomically by the directory opener before this legacy owner is returned. */
+    @Synchronized
     internal fun attachLegacyLease(release: () -> Unit) {
         check(!closed && activation == null && legacyLeaseRelease == null)
         legacyLeaseRelease = release

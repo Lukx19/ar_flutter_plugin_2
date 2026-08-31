@@ -114,6 +114,11 @@ class M3IntegratedCapacityCampaignTest {
                             memory.residentTotalBytes,
                             Math.addExact(ownerBytes, Math.addExact(commitReopenOwnerBytes, sharedPhaseBytes)),
                         )
+                        assertEquals(
+                            "accepted integrated maximum complete-peak receipt changed",
+                            EXPECTED_INTEGRATED_COMPLETE_PEAK_BYTES,
+                            completePeakBytes,
+                        )
                         assertTrue("shared phase=$sharedPhaseBytes", sharedPhaseBytes <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
                         assertTrue("complete peak=$completePeakBytes", completePeakBytes <= M3CompactCanonicalStore.C17_TOTAL_BYTES)
 
@@ -141,5 +146,9 @@ class M3IntegratedCapacityCampaignTest {
                 } finally { base.close() }
             }
         } finally { directory.deleteRecursively() }
+    }
+
+    private companion object {
+        const val EXPECTED_INTEGRATED_COMPLETE_PEAK_BYTES = 14_712_664L
     }
 }

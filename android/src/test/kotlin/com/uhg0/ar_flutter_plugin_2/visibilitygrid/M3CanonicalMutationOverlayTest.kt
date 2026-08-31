@@ -223,6 +223,11 @@ class M3CanonicalMutationOverlayTest {
             maximum.work.constructionPeakBytes,
         )
         val planGraph = GraphLayout.parseInstance(maximum).totalSize()
+        assertEquals(
+            "accepted maximum prepared-plan graph receipt changed",
+            EXPECTED_MAX_PLAN_GRAPH_BYTES,
+            planGraph,
+        )
         assertTrue(planGraph + maximum.work.writerScratchBytes <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
         val sink = CountingOutputStream()
         maximum.writeWalTo(sink)
@@ -314,6 +319,11 @@ class M3CanonicalMutationOverlayTest {
         assertEquals(0, small.mutations); assertEquals(0, large.mutations)
         assertArrayEquals(current(one).copyOfRange(0, 8), current(hundredK).copyOfRange(0, 8))
         val planBytes = GraphLayout.parseInstance(hundredK).totalSize()
+        assertEquals(
+            "accepted one-row prepared-plan graph receipt changed",
+            EXPECTED_ONE_ROW_PLAN_GRAPH_BYTES,
+            planBytes,
+        )
         println(
             "M3_CANONICAL_MUTATION_OVERLAY_DIRTY_WORK " +
                 "smallRows=${one.work.dirtyRows} largeRows=${hundredK.work.dirtyRows} " +
@@ -331,6 +341,11 @@ class M3CanonicalMutationOverlayTest {
     private fun surface(id: Long, x: Int, confidence: Int = 192) = M3CompactSurface(M3SurfaceId(id), M3Voxel(x, 0, 0), 0, confidence)
     private fun source(id: Long, x: Int, confidence: Int = 192, fingerprint: ByteArray = ByteArray(32) { id.toByte() }) = M3PagedSource(M3SurfaceId(id), M3Voxel(x, 0, 0), 0, confidence, M3CanonicalReceiptBytes(fingerprint))
     private fun prepared(value: M3CanonicalMutationPreparation) = (value as M3CanonicalMutationPreparation.Prepared).mutation
+
+    private companion object {
+        const val EXPECTED_ONE_ROW_PLAN_GRAPH_BYTES = 1_464L
+        const val EXPECTED_MAX_PLAN_GRAPH_BYTES = 493_008L
+    }
     private fun rows(plan: M3PreparedCanonicalMutation) = mutableListOf<M3PreparedRow>().also { values -> plan.visitDirtyRows { values += it; true } }
     private fun support(plan: M3PreparedCanonicalMutation) = mutableListOf<M3PreparedSupport>().also { values -> plan.visitDirtySupport { values += it; true } }
     private fun lineage(plan: M3PreparedCanonicalMutation) = mutableListOf<M3LineageEdge>().also { values -> plan.visitDirtyLineage { values += it; true } }

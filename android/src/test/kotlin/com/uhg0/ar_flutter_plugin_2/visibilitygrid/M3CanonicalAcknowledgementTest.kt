@@ -9,6 +9,110 @@ import org.junit.Test
 
 class M3CanonicalAcknowledgementTest {
     @Test
+    fun `ACK publication linearizes query and adjacent prepare with its durable selector`() {
+        val fixture = activated("ack-linearized-readers")
+        try {
+            val before = requireNotNull(fixture.owner.activationState())
+            val current = before.current as M3CanonicalActivationCurrent.Receipt
+            withAdjacentView(fixture, before) { view ->
+                val durable = java.util.concurrent.CountDownLatch(1)
+                val publish = java.util.concurrent.CountDownLatch(1)
+                val ackResult = java.util.concurrent.atomic.AtomicReference<M3CanonicalAcknowledgementResult>()
+                val queryResult = java.util.concurrent.atomic.AtomicReference<M3CanonicalActivationState?>()
+                val prepareResult = java.util.concurrent.atomic.AtomicReference<M3CanonicalMutationPreparation>()
+                M3CanonicalActivationTestHooks.onDirectorySync = { stage, _ ->
+                    if (stage == M3CanonicalActivationSyncStage.ACK_SELECTOR) {
+                        durable.countDown()
+                        assertTrue(publish.await(10, java.util.concurrent.TimeUnit.SECONDS))
+                    }
+                }
+                val ack = Thread {
+                    ackResult.set(fixture.owner.acknowledgeCanonicalCurrent(
+                        M3CanonicalAcknowledgement(
+                            current.identity.commandHash,
+                            before.cut.geometryRevision,
+                            before.cut.lineageRevision,
+                        ),
+                    ))
+                }.also(Thread::start)
+                assertTrue(durable.await(10, java.util.concurrent.TimeUnit.SECONDS))
+                val query = Thread { queryResult.set(fixture.owner.activationState()) }.also(Thread::start)
+                val prepare = Thread {
+                    prepareResult.set(fixture.owner.prepareAdjacentMutation(
+                        view, adjacentCommand(fixture, before, 2),
+                    ))
+                }.also(Thread::start)
+                Thread.sleep(200)
+                assertTrue("query crossed ACK publication", query.isAlive)
+                assertTrue("prepare crossed ACK publication", prepare.isAlive)
+                publish.countDown()
+                listOf(ack, query, prepare).forEach { it.join(10_000) }
+                assertTrue(listOf(ack, query, prepare).none(Thread::isAlive))
+                assertTrue(ackResult.get() is M3CanonicalAcknowledgementResult.Acknowledged)
+                assertTrue(requireNotNull(queryResult.get()).currentState is M3CanonicalCurrentState.Acknowledged)
+                val plan = (prepareResult.get() as M3CanonicalMutationPreparation.Prepared).mutation
+                assertTrue(fixture.owner.commitAdjacentCanonicalMutation(plan) is M3CanonicalAdjacentCommitResult.Committed)
+                assertEquals(M3PreparedMutationLifecycle.CONSUMED, plan.lifecycle())
+                val prefix = "m3-activation-${fixture.group.hash.joinToString("") { "%02x".format(it) }}-current-"
+                assertEquals(1, fixture.directory.listFiles().orEmpty().count {
+                    it.name.startsWith(prefix) && it.name.endsWith(".receipt")
+                })
+            }
+        } finally {
+            M3CanonicalActivationTestHooks.onDirectorySync = null
+            fixture.owner.close()
+            fixture.directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `close linearizes after durable ACK publication and hides the final snapshot`() {
+        val fixture = activated("ack-linearized-close")
+        try {
+            val before = requireNotNull(fixture.owner.activationState())
+            val current = before.current as M3CanonicalActivationCurrent.Receipt
+            val durable = java.util.concurrent.CountDownLatch(1)
+            val publish = java.util.concurrent.CountDownLatch(1)
+            val ackResult = java.util.concurrent.atomic.AtomicReference<M3CanonicalAcknowledgementResult>()
+            M3CanonicalActivationTestHooks.onDirectorySync = { stage, _ ->
+                if (stage == M3CanonicalActivationSyncStage.ACK_SELECTOR) {
+                    durable.countDown()
+                    assertTrue(publish.await(10, java.util.concurrent.TimeUnit.SECONDS))
+                }
+            }
+            val ack = Thread {
+                ackResult.set(fixture.owner.acknowledgeCanonicalCurrent(
+                    M3CanonicalAcknowledgement(
+                        current.identity.commandHash,
+                        before.cut.geometryRevision,
+                        before.cut.lineageRevision,
+                    ),
+                ))
+            }.also(Thread::start)
+            assertTrue(durable.await(10, java.util.concurrent.TimeUnit.SECONDS))
+            val close = Thread { fixture.owner.close() }.also(Thread::start)
+            Thread.sleep(200)
+            assertTrue("close crossed ACK publication", close.isAlive)
+            publish.countDown()
+            ack.join(10_000); close.join(10_000)
+            assertFalse("ACK deadlocked", ack.isAlive)
+            assertFalse("close deadlocked", close.isAlive)
+            assertTrue(ackResult.get() is M3CanonicalAcknowledgementResult.Acknowledged)
+            assertEquals(null, fixture.owner.activationState())
+            assertTrue(fixture.owner.acknowledgeCanonicalCurrent(
+                M3CanonicalAcknowledgement(
+                    current.identity.commandHash,
+                    before.cut.geometryRevision,
+                    before.cut.lineageRevision,
+                ),
+            ) is M3CanonicalAcknowledgementResult.NoOp)
+        } finally {
+            M3CanonicalActivationTestHooks.onDirectorySync = null
+            fixture.owner.close()
+            fixture.directory.deleteRecursively()
+        }
+    }
+    @Test
     fun `discard and owner close defer across every durable adjacent stage`() {
         listOf("discard", "owner-close").forEach { action ->
             listOf(
@@ -692,11 +796,7 @@ class M3CanonicalAcknowledgementTest {
             store.use {
                 val selected = store.reopen(base, current?.let { M3PreparedIntentCurrentReceipt(it.canonicalLength, it.canonicalHash) })
                 fun prepare(view: M3CanonicalStateView) = owner.prepareAdjacentMutation(
-                    view, M3CanonicalTransactionCommand(
-                        "adjacent-${state.cut.geometryRevision}", M3CanonicalOperation.RELOCATION,
-                        state.cut.geometryRevision, state.cut.lineageRevision, listOf(fixture.id),
-                        listOf(M3CanonicalTarget(fixture.id, M3Voxel(targetX, 0, 0), 0, 0, 192)),
-                    ),
+                    view, adjacentCommand(fixture, state, targetX),
                 )
                 when (selected) {
                     is M3CanonicalReopenResult.GenerationZero -> prepare(selected.view)
@@ -705,6 +805,31 @@ class M3CanonicalAcknowledgementTest {
                 }
             }
         }
+
+    private fun adjacentCommand(fixture: Fixture, state: M3CanonicalActivationState, targetX: Int) =
+        M3CanonicalTransactionCommand(
+            "adjacent-${state.cut.geometryRevision}", M3CanonicalOperation.RELOCATION,
+            state.cut.geometryRevision, state.cut.lineageRevision, listOf(fixture.id),
+            listOf(M3CanonicalTarget(fixture.id, M3Voxel(targetX, 0, 0), 0, 0, 192)),
+        )
+
+    private inline fun <T> withAdjacentView(
+        fixture: Fixture,
+        state: M3CanonicalActivationState,
+        block: (M3CanonicalStateView) -> T,
+    ): T = (M3CompactCanonicalStore.openV6(fixture.group, fixture.directory, fixture.budget)
+        as M3CompactCanonicalOpenResult.Opened).store.use { base ->
+        val current = (state.current as? M3CanonicalActivationCurrent.Receipt)?.identity
+        requireNotNull(M3CanonicalCommitStore.open(fixture.directory, fixture.budget)).use { store ->
+            when (val selected = store.reopen(
+                base, current?.let { M3PreparedIntentCurrentReceipt(it.canonicalLength, it.canonicalHash) },
+            )) {
+                is M3CanonicalReopenResult.GenerationZero -> block(selected.view)
+                is M3CanonicalReopenResult.Selected -> selected.commit.use { block(it.view) }
+                is M3CanonicalReopenResult.Refused -> error("reopen refused: $selected")
+            }
+        }
+    }
     private fun opened(result: M3SurfaceOwnershipOpenResult) = (result as M3SurfaceOwnershipOpenResult.Opened).ownership
     private data class Fixture(val directory: File, val group: M3SurfaceGroup, val budget: CountingBudget, val id: M3SurfaceId, val owner: M3SurfaceOwnership)
     private class CountingBudget : M3ExclusiveFakeStorageBudget() {
