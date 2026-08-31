@@ -95,6 +95,8 @@ class M3IntegratedCapacityCampaignTest {
                         assertEquals(200_000, after.cut.lineageCount)
                         assertEquals(300_000, after.cut.sourceCount)
                         assertEquals(300_000, after.cut.supportCount)
+                        assertEquals(EXPECTED_MODELED_RESIDENT_BYTES, memory.residentTotalBytes)
+                        assertEquals(1, ownership.maxOf { it.liveStoreCount })
 
                         val intentBytes = directory.listFiles().orEmpty()
                             .filter { it.isDirectory && it.name.endsWith(".intent") }
@@ -114,11 +116,9 @@ class M3IntegratedCapacityCampaignTest {
                             memory.residentTotalBytes,
                             Math.addExact(ownerBytes, Math.addExact(commitReopenOwnerBytes, sharedPhaseBytes)),
                         )
-                        assertEquals(
-                            "accepted integrated maximum complete-peak receipt changed",
-                            EXPECTED_INTEGRATED_COMPLETE_PEAK_BYTES,
-                            completePeakBytes,
-                        )
+                        // JOL owner graphs are diagnostic; modeled receipts and portable ceilings are normative.
+                        assertEquals(EXPECTED_SHARED_PHASE_BYTES, sharedPhaseBytes)
+                        assertEquals(EXPECTED_DIRECTORY_BYTES, storage.directoryBytes)
                         assertTrue("shared phase=$sharedPhaseBytes", sharedPhaseBytes <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
                         assertTrue("complete peak=$completePeakBytes", completePeakBytes <= M3CompactCanonicalStore.C17_TOTAL_BYTES)
 
@@ -133,6 +133,8 @@ class M3IntegratedCapacityCampaignTest {
                             !entry.name.startsWith("m3-surface-") &&
                                 entry.name !in setOf("ledger-v2", "reservations-v2", "reclaims-v2")
                         }.sumOf(budget::allocatedBytes)
+                        assertEquals(EXPECTED_COMMITTED_PHYSICAL_BYTES, chargedPhysicalBytes)
+                        assertEquals(EXPECTED_COMMITTED_PHYSICAL_BYTES, coordinator.committedBytes())
                         assertEquals(chargedPhysicalBytes, coordinator.committedBytes())
                         println(
                             "M3_INTEGRATED_MAXIMUM=resident=${memory.residentTotalBytes} " +
@@ -149,6 +151,9 @@ class M3IntegratedCapacityCampaignTest {
     }
 
     private companion object {
-        const val EXPECTED_INTEGRATED_COMPLETE_PEAK_BYTES = 14_712_664L
+        const val EXPECTED_MODELED_RESIDENT_BYTES = 14_565_056L
+        const val EXPECTED_SHARED_PHASE_BYTES = 139_520L
+        const val EXPECTED_DIRECTORY_BYTES = 139_264L
+        const val EXPECTED_COMMITTED_PHYSICAL_BYTES = 42_188_800L
     }
 }

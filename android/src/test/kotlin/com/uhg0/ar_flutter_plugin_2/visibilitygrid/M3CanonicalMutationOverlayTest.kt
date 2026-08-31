@@ -210,6 +210,10 @@ class M3CanonicalMutationOverlayTest {
         ))
         assertEquals(limit, maximum.work.dirtySupportRecords)
         assertEquals(limit, maximumView.attemptedRecords)
+        assertEquals(EXPECTED_MAX_ENCODED_BYTES, maximum.work.walBytes)
+        assertEquals(EXPECTED_MAX_RETAINED_BYTES, maximum.work.retainedPlanBytes)
+        assertEquals(EXPECTED_WRITER_SCRATCH_BYTES, maximum.work.writerScratchBytes)
+        assertEquals(EXPECTED_MAX_CONSTRUCTION_PEAK_BYTES, maximum.work.constructionPeakBytes)
         assertTrue(maximum.work.constructionPeakBytes <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
         assertEquals(
             maximum.work.fixedOwnerBytes + maximum.work.rowArrayBytes + maximum.work.removedArrayBytes +
@@ -223,15 +227,14 @@ class M3CanonicalMutationOverlayTest {
             maximum.work.constructionPeakBytes,
         )
         val planGraph = GraphLayout.parseInstance(maximum).totalSize()
-        assertEquals(
-            "accepted maximum prepared-plan graph receipt changed",
-            EXPECTED_MAX_PLAN_GRAPH_BYTES,
-            planGraph,
-        )
+        // JOL is diagnostic across JVM layouts; modeled/encoded receipts above are normative.
         assertTrue(planGraph + maximum.work.writerScratchBytes <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
         val sink = CountingOutputStream()
         maximum.writeWalTo(sink)
-        assertEquals(maximum.work.walBytes.toLong(), sink.bytes)
+        assertEquals(EXPECTED_MAX_ENCODED_BYTES.toLong(), sink.bytes)
+        val currentSink = CountingOutputStream()
+        maximum.writeCurrentTo(currentSink)
+        assertEquals(EXPECTED_MAX_ENCODED_BYTES.toLong(), currentSink.bytes)
         println(
             "M3_MAX_PREPARED_PLAN limit=$limit encoded=${maximum.work.walBytes} planGraph=$planGraph " +
                 "rowArrays=${maximum.work.rowArrayBytes} removedArrays=${maximum.work.removedArrayBytes} " +
@@ -293,6 +296,17 @@ class M3CanonicalMutationOverlayTest {
                 assertEquals(one.work.authorityPageReads, hundredK.work.authorityPageReads)
                 assertEquals(one.work.authorityInspectedRows, hundredK.work.authorityInspectedRows)
                 assertEquals(one.work.authorityBytesRead, hundredK.work.authorityBytesRead)
+                assertEquals(1, hundredK.work.dirtyRows)
+                assertEquals(1, hundredK.work.dirtyIdIndexRecords)
+                assertEquals(1, hundredK.work.dirtyVoxelIndexRecords)
+                assertEquals(2, hundredK.work.directLookupCount)
+                assertEquals(1, hundredK.work.sourcePageFaults)
+                assertEquals(2, hundredK.work.authorityDirectLookups)
+                assertEquals(1, hundredK.work.authorityPageReads)
+                assertEquals(2, hundredK.work.authorityInspectedRows)
+                assertEquals(EXPECTED_ONE_ROW_ENCODED_BYTES, hundredK.work.walBytes)
+                assertEquals(EXPECTED_ONE_ROW_ENCODED_BYTES, hundredK.work.currentBytes)
+                assertEquals(EXPECTED_ONE_ROW_STAGING_BYTES, hundredK.work.stagingBytes)
                 assertTrue(hundredK.work.authorityInspectedRows <= 4)
                 println("M3_V6_DIRTY_PROPORTIONAL small=${one.work} hundredK=${hundredK.work}")
             } }
@@ -318,12 +332,10 @@ class M3CanonicalMutationOverlayTest {
         assertEquals(one.work.stagingBytes, hundredK.work.stagingBytes)
         assertEquals(0, small.mutations); assertEquals(0, large.mutations)
         assertArrayEquals(current(one).copyOfRange(0, 8), current(hundredK).copyOfRange(0, 8))
+        assertEquals(EXPECTED_ONE_ROW_ENCODED_BYTES, wal(hundredK).size)
+        assertEquals(EXPECTED_ONE_ROW_ENCODED_BYTES, current(hundredK).size)
+        assertEquals(EXPECTED_ONE_ROW_STAGING_BYTES, hundredK.work.stagingBytes)
         val planBytes = GraphLayout.parseInstance(hundredK).totalSize()
-        assertEquals(
-            "accepted one-row prepared-plan graph receipt changed",
-            EXPECTED_ONE_ROW_PLAN_GRAPH_BYTES,
-            planBytes,
-        )
         println(
             "M3_CANONICAL_MUTATION_OVERLAY_DIRTY_WORK " +
                 "smallRows=${one.work.dirtyRows} largeRows=${hundredK.work.dirtyRows} " +
@@ -343,8 +355,12 @@ class M3CanonicalMutationOverlayTest {
     private fun prepared(value: M3CanonicalMutationPreparation) = (value as M3CanonicalMutationPreparation.Prepared).mutation
 
     private companion object {
-        const val EXPECTED_ONE_ROW_PLAN_GRAPH_BYTES = 1_464L
-        const val EXPECTED_MAX_PLAN_GRAPH_BYTES = 493_008L
+        const val EXPECTED_ONE_ROW_ENCODED_BYTES = 244
+        const val EXPECTED_ONE_ROW_STAGING_BYTES = 73_788L
+        const val EXPECTED_MAX_ENCODED_BYTES = 557_325
+        const val EXPECTED_MAX_RETAINED_BYTES = 499_780L
+        const val EXPECTED_WRITER_SCRATCH_BYTES = 65_536L
+        const val EXPECTED_MAX_CONSTRUCTION_PEAK_BYTES = 942_376L
     }
     private fun rows(plan: M3PreparedCanonicalMutation) = mutableListOf<M3PreparedRow>().also { values -> plan.visitDirtyRows { values += it; true } }
     private fun support(plan: M3PreparedCanonicalMutation) = mutableListOf<M3PreparedSupport>().also { values -> plan.visitDirtySupport { values += it; true } }
