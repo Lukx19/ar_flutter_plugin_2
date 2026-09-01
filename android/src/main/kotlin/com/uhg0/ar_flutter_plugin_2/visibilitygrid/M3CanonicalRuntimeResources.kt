@@ -70,14 +70,14 @@ internal class M3CanonicalRuntimeResources private constructor(
 
     /** Dirty-only view: exact current scalars plus kernel-owned row correlation. */
     @Synchronized fun <T> withCorrelatedCurrent(
-        changes: List<M3FeatureFusionChange>,
+        changes: List<FeatureFusionChange>,
         block: (M3CanonicalStateView) -> T,
     ): T? {
         checkOpen()
         val lease = current ?: coldCurrent()?.also { current = it } ?: return null
-        val correlations = HashMap<M3Voxel, M3FeatureCanonicalCorrelation>()
+        val correlations = HashMap<M3Voxel, CanonicalFeatureCorrelation>()
         changes.forEach { change ->
-            val upsert = change as? M3FeatureFusionChange.Upsert ?: return@forEach
+            val upsert = change as? FeatureFusionChange.Upsert ?: return@forEach
             upsert.canonicalCorrelation?.let { correlations[M3Voxel(upsert.x, upsert.y, upsert.z)] = it }
         }
         val view = M3CorrelatedCanonicalStateView(lease.view, correlations)
@@ -167,7 +167,7 @@ internal class M3CanonicalRuntimeResources private constructor(
 
     /** One named cold recovery scope; the complete view is closed before return. */
     @Synchronized fun rebuildAndHydrate(
-        kernel: M3FeatureFusionKernel,
+        kernel: FeatureFusionKernel,
         rendererLimit: Int,
         sink: (M3CanonicalRendererPage) -> Unit,
     ): M3CompactCanonicalCut? {
@@ -340,7 +340,7 @@ private open class M3ScalarCanonicalStateView(
 
 private class M3CorrelatedCanonicalStateView(
     private val scalar: M3ScalarCanonicalStateView,
-    private val correlations: Map<M3Voxel, M3FeatureCanonicalCorrelation>,
+    private val correlations: Map<M3Voxel, CanonicalFeatureCorrelation>,
 ) : M3ScalarCanonicalAuthority by scalar {
     override fun findById(id: M3SurfaceId): M3CompactSurface? = correlations.entries.firstOrNull { it.value.id == id }
         ?.let { (voxel, correlation) -> M3CompactSurface(correlation.id, voxel, correlation.packedNormal, correlation.normalConfidence) }

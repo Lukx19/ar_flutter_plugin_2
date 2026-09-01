@@ -859,7 +859,7 @@ class VisibilityGridV2BindingTest {
     }
 
     @Test
-    fun `Issue 98 debug endpoint replaces the owned stream and its fresh transaction one succeeds`() {
+    fun `VGS2 recovery debug endpoint replaces the owned stream and its fresh transaction one succeeds`() {
         val messenger = MethodTestMessenger()
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
@@ -985,7 +985,7 @@ class VisibilityGridV2BindingTest {
     }
 
     @Test
-    fun `Issue 98 debug handoff rejects a mismatched correlated baseline`() {
+    fun `VGS2 recovery debug handoff rejects a mismatched correlated baseline`() {
         val messenger = MethodTestMessenger()
         val binding = VisibilityGridV2Binding(
             messenger, 981, M0aCommittedBaselineAuthority(), postToMain = { it() }, isDebuggable = true,
@@ -1032,7 +1032,7 @@ class VisibilityGridV2BindingTest {
     }
 
     @Test
-    fun `M3 chained current delta accepts only exact acknowledged successors`() {
+    fun `feature fusion runtime chained current delta accepts only exact acknowledged successors`() {
         val messenger = MethodTestMessenger()
         val binding = VisibilityGridV2Binding(
             messenger = messenger,

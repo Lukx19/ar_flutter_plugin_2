@@ -121,8 +121,8 @@ internal class M3MutableCanonicalOverlay private constructor(
         val seenVoxels = HashSet<M3Voxel>()
         for (change in command.changes) {
             when (change) {
-                is M3FeatureFusionChange.Removal -> Unit
-                is M3FeatureFusionChange.Upsert -> {
+                is FeatureFusionChange.Removal -> Unit
+                is FeatureFusionChange.Upsert -> {
                     val voxel = M3Voxel(change.x, change.y, change.z)
                     if (!seenVoxels.add(voxel)) return refuse(M3CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
                     targetSetInsertions++
@@ -138,7 +138,7 @@ internal class M3MutableCanonicalOverlay private constructor(
         }
         // Duplicate removals remain no-op, but a removal of an upsert voxel is
         // a typed conflict without inserting any removal into the bounded set.
-        for (change in command.changes) if (change is M3FeatureFusionChange.Removal &&
+        for (change in command.changes) if (change is FeatureFusionChange.Removal &&
             M3Voxel(change.x, change.y, change.z) in seenVoxels
         ) return refuse(M3CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
         if (view.cut.geometryRevision >= configuration.revisionLimit) return refuse(M3CanonicalMutationRefusal.REVISION_EXHAUSTED)
@@ -561,7 +561,7 @@ internal class M3MutableCanonicalOverlay private constructor(
             ) return featureBatchRefusal(view.cut, M3CanonicalMutationRefusal.REVISION_CONFLICT)
             val budget = featureBatchBudget(configuration, command.commandId)
             var upserts = 0
-            for (change in command.changes) if (change is M3FeatureFusionChange.Upsert) {
+            for (change in command.changes) if (change is FeatureFusionChange.Upsert) {
                 upserts++
                 if (upserts > configuration.surfaceCapacity) return featureBatchRefusal(
                     view.cut, M3CanonicalMutationRefusal.CAPACITY, budget.copy(upserts = upserts),
@@ -647,7 +647,7 @@ internal data class M3CanonicalFeatureBatchCommand(
     val commandId: String,
     val expectedGeometryRevision: Long,
     val expectedLineageRevision: Long,
-    val changes: List<M3FeatureFusionChange>,
+    val changes: List<FeatureFusionChange>,
 ) {
     internal fun fingerprint(): ByteArray {
         val digest = MessageDigest.getInstance("SHA-256")
@@ -655,10 +655,10 @@ internal data class M3CanonicalFeatureBatchCommand(
         token(commandId); token('|'); token(expectedGeometryRevision); token('|'); token(expectedLineageRevision); token('|')
         changes.forEach { change ->
             when (change) {
-                is M3FeatureFusionChange.Removal -> {
+                is FeatureFusionChange.Removal -> {
                     token('R'); token(':'); token(change.x); token(':'); token(change.y); token(':'); token(change.z)
                 }
-                is M3FeatureFusionChange.Upsert -> {
+                is FeatureFusionChange.Upsert -> {
                     val primary = change.candidate.primaryCanonicalTarget()
                     token('U'); token(':'); token(change.x); token(':'); token(change.y); token(':'); token(change.z); token(':')
                     token(primary?.normalOctX); token(':'); token(primary?.normalOctY); token(':'); token(primary?.normalConfidence)

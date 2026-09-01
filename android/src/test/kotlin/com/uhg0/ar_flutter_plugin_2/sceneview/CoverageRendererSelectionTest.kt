@@ -43,7 +43,7 @@ class CoverageRendererSelectionTest {
     }
 
     @Test
-    fun `M0d lazy mode resource peaks stay within the shared eight MiB cap`() {
+    fun `renderer lazy mode resource peaks stay within the shared eight MiB cap`() {
         assertEquals(2_000, CoverageRendererLimits.RAW_POINT_CAPACITY)
         assertEquals(20_000, CoverageRendererLimits.CENTROID_CAPACITY)
         assertEquals(8_000, CoverageRendererLimits.CUBE_CAPACITY)

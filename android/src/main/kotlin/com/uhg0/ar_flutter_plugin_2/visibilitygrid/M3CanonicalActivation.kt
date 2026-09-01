@@ -636,7 +636,7 @@ internal object M3CanonicalActivationSelector {
             plan.work.retainedPlanBytes, plan.work.writerScratchBytes,
             plan.work.constructionPeakBytes,
         )
-        M3CanonicalActivationTestHooks.onAdjacentOwnership?.invoke(observation)
+        CanonicalActivationTestHooks.onAdjacentOwnership?.invoke(observation)
         return if (base.generationZeroAuthority is M3ScalarCanonicalAuthority) {
             resident.liveStoreCount == 0 && resident.retainedBytes == 0L
         } else resident.liveStoreCount == 1 && resident.retainedBytes == base.retainedMemoryReceipt().residentTotalBytes
@@ -1334,7 +1334,7 @@ internal object M3CanonicalActivationSelector {
     private fun sync(parent: File, stage: M3CanonicalActivationSyncStage) {
         val physical = !System.getProperty("os.name").orEmpty().startsWith("Windows", true)
         if (physical) FileChannel.open(parent.toPath(), StandardOpenOption.READ).use { it.force(true) }
-        M3CanonicalActivationTestHooks.onDirectorySync?.invoke(stage, physical)
+        CanonicalActivationTestHooks.onDirectorySync?.invoke(stage, physical)
     }
     private fun round(bytes: Long, unit: Long) = if (bytes == 0L) 0L else Math.multiplyExact((bytes - 1L) / unit + 1L, unit)
     private fun digest(bytes: ByteArray) = M3CanonicalReceiptBytes(MessageDigest.getInstance("SHA-256").digest(bytes))
@@ -1349,7 +1349,7 @@ internal enum class M3CanonicalActivationSyncStage {
     ADJACENT_INTENT, ADJACENT_PREREQUISITES, ADJACENT_SELECTOR,
     RECLAIM_INTENT, RECLAIM_DELETE, RECLAIM_COMPLETE, RECOVERY,
 }
-internal object M3CanonicalActivationTestHooks {
+internal object CanonicalActivationTestHooks {
     /** Test-only observation after the requested physical sync has completed. */
     @Volatile var onDirectorySync: ((M3CanonicalActivationSyncStage, Boolean) -> Unit)? = null
     /** Test-only latch point while selector absence and legacy restoration share the group lock. */

@@ -46,7 +46,7 @@ internal class M3VisibilityGridIntegration(
     private var active = 0
     private var cut: VisibilityObservationOwnership? = null
     private var baseline: M3CommittedEmptyBaseline? = null
-    private var kernel: M3FeatureFusionKernel? = null
+    private var kernel: FeatureFusionKernel? = null
     private var owner: M3SurfaceOwnership? = null
     private var resources: M3CanonicalRuntimeResources? = null
     private var batchSequence = 0L
@@ -89,22 +89,22 @@ internal class M3VisibilityGridIntegration(
         }
         // This adapter is the only M2-to-M3 conversion point.  It creates
         // fixed camera/sample evidence before the kernel can mutate anything.
-        val normalEvidence = (M3FeatureNormalEvidence.from(observation) as? M3FeatureNormalEvidence.Conversion.Accepted)
+        val normalEvidence = (FeatureNormalEvidence.from(observation) as? FeatureNormalEvidence.Conversion.Accepted)
             ?: run {
                 rejected++
                 receipt = receipt.copy(status = "normalEvidenceRefused", rejected = rejected)
                 return@mutate
             }
         val fused = requireNotNull(kernel).prepare(
-            M3FeatureFusionBatch(
+            FeatureFusionBatch(
                 sequence = ++batchSequence,
                 timestampNs = observation.frame.sourceTimestampNs,
                 observations = observation.samples.zip(normalEvidence.evidence).map { (sample, normal) ->
-                    M3FeatureFusionEvidence(sample.xWorld, sample.yWorld, sample.zWorld, 2, sample.id, normal)
+                    FeatureFusionEvidence(sample.xWorld, sample.yWorld, sample.zWorld, 2, sample.id, normal)
                 },
             ),
         )
-        val accepted = fused as? M3FeatureFusionResult.Accepted ?: run {
+        val accepted = fused as? FeatureFusionResult.Accepted ?: run {
             rejected++
             receipt = receipt.copy(status = "kernelRefused", rejected = rejected)
             return@mutate
@@ -255,7 +255,7 @@ internal class M3VisibilityGridIntegration(
         }
         resources = runtimeResources
         owner = opened.ownership
-        kernel = M3FeatureFusionKernel()
+        kernel = FeatureFusionKernel()
         cut = expected
         baseline = seeded
         nextTransactionId = seeded.transactionId + 1
@@ -276,10 +276,10 @@ internal class M3VisibilityGridIntegration(
 
     private fun publishInitialV6Create(
         expected: VisibilityObservationOwnership,
-        changes: List<M3FeatureFusionChange>,
+        changes: List<FeatureFusionChange>,
     ) {
-        val targets = changes.mapNotNull { (it as? M3FeatureFusionChange.Upsert)?.candidate }
-            .mapNotNull(M3FeatureFusionCandidate::primaryCanonicalTarget)
+        val targets = changes.mapNotNull { (it as? FeatureFusionChange.Upsert)?.candidate }
+            .mapNotNull(FeatureFusionCandidate::primaryCanonicalTarget)
         if (targets.isEmpty()) {
             check(requireNotNull(kernel).prepareCanonicalApplication(emptyList()))
             requireNotNull(kernel).applyPrepared()
@@ -329,7 +329,7 @@ internal class M3VisibilityGridIntegration(
 
     private fun publishMaterialBatch(
         expected: VisibilityObservationOwnership,
-        changes: List<M3FeatureFusionChange>,
+        changes: List<FeatureFusionChange>,
     ) {
         // An accepted kernel batch with no material delta needs no canonical
         // authority at all. In particular, do not turn a no-op refinement into
@@ -394,21 +394,21 @@ internal class M3VisibilityGridIntegration(
     }
 
     private fun canonicalAssignments(
-        changes: List<M3FeatureFusionChange>,
+        changes: List<FeatureFusionChange>,
         mutation: M3PreparedCanonicalMutation,
         voxels: MutableList<M3Voxel>,
-    ): List<M3FeatureCanonicalAssignment> {
+    ): List<CanonicalFeatureAssignment> {
         val slots = HashMap<M3Voxel, Int>()
         changes.forEach { change ->
-            val upsert = change as? M3FeatureFusionChange.Upsert ?: return@forEach
+            val upsert = change as? FeatureFusionChange.Upsert ?: return@forEach
             check(upsert.kernelSlot >= 0)
             slots[M3Voxel(upsert.x, upsert.y, upsert.z)] = upsert.kernelSlot
         }
-        val assignments = ArrayList<M3FeatureCanonicalAssignment>(mutation.dirtyRowCount)
+        val assignments = ArrayList<CanonicalFeatureAssignment>(mutation.dirtyRowCount)
         check(mutation.visitDirtyRows { row ->
             val slot = slots[row.voxel] ?: return@visitDirtyRows false
             voxels += row.voxel
-            assignments += M3FeatureCanonicalAssignment(
+            assignments += CanonicalFeatureAssignment(
                 slot, row.voxel.x, row.voxel.y, row.voxel.z, row.id, row.allocationFingerprint,
                 row.packedNormal, row.normalConfidence,
             )
@@ -575,8 +575,8 @@ internal data class M3RuntimeOwnerMemoryReceipt(
 private class M3RendererRebuildFenced : RuntimeException()
 
 /** #111 owns creating an ID for OPPOSING; current CREATE consumes pinned PRIMARY only. */
-internal fun M3FeatureFusionCandidate.primaryCanonicalTarget(): M3CanonicalTarget? =
-    normalCandidates.firstOrNull { it.face == M3FeatureNormalFace.PRIMARY }?.let {
+internal fun FeatureFusionCandidate.primaryCanonicalTarget(): M3CanonicalTarget? =
+    normalCandidates.firstOrNull { it.face == FeatureNormalFace.PRIMARY }?.let {
         M3CanonicalTarget(
             voxel = M3Voxel(x, y, z),
             normalOctX = it.normalOctX,

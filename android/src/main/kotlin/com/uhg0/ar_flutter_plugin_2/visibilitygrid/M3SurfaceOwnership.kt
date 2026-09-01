@@ -640,7 +640,7 @@ internal class M3SurfaceOwnership private constructor(
             if (M3CanonicalActivationSelector.hasDurableSelector(group, directory)) {
                 return@withGroupLock M3SurfaceOwnershipOpenResult.Refused(M3SurfaceOwnershipRestoreRefusal.CORRUPT)
             }
-            M3CanonicalActivationTestHooks.afterLegacySelection?.invoke()
+            CanonicalActivationTestHooks.afterLegacySelection?.invoke()
             open(group, configuration, M3FileSurfaceOwnershipStore(directory, group, fault)).also { result ->
                 if (result is M3SurfaceOwnershipOpenResult.Opened) {
                     result.ownership.attachLegacyLease(
