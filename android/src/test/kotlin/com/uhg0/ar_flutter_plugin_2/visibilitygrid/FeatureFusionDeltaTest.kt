@@ -19,7 +19,7 @@ import org.openjdk.jol.info.GraphLayout
 class FeatureFusionDeltaTest {
     @Test
     fun `accumulated deltas reproduce the locked candidate A material projection`() {
-        val root = fixture("m0b_fusion_vector_v1.json")
+        val root = fixture("feature_fusion_fusion_vector_v1.json")
         val observations = root.getValue("observations").jsonArray.map(::fusionEvidence)
         val kernel = FeatureFusionKernel()
         val accumulator = DeltaAccumulator()
@@ -133,7 +133,7 @@ class FeatureFusionDeltaTest {
         // retained population. The kernel itself is intentionally excluded.
         val resultBytes = GraphLayout.parseInstance(refinement).totalSize()
         println(
-            "M3_INCREMENTAL_DELTA_RECEIPT liveSurfaces=${refinement.receipt.surfaceCount} " +
+            "CANONICAL_SURFACE_INCREMENTAL_DELTA_RECEIPT liveSurfaces=${refinement.receipt.surfaceCount} " +
                 "associations=${refinement.receipt.associationCount} " +
                 "touchedVoxels=${refinement.work.distinctTouchedVoxelCount} " +
                 "emittedEvents=${refinement.work.emittedEventCount} resultBytes=$resultBytes",

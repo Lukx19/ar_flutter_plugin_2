@@ -618,8 +618,8 @@ internal data class VisibilityObservationHealth(
 }
 
 /**
- * The production mapping intake seam. M2 qualifies and admits observations;
- * the selected M3 kernel will provide the bounded evidence mutation callbacks.
+ * The production mapping intake seam. capture ingress qualifies and admits observations;
+ * the selected canonical surface kernel will provide the bounded evidence mutation callbacks.
  */
 internal class AndroidVisibilityGridMappingAdmission(
     private val ownership: () -> VisibilityObservationOwnership?,

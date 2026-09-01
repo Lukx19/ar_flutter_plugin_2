@@ -729,7 +729,7 @@ internal class CaptureResourceCountersV2 {
 }
 
 /**
- * Exact-cut signal consumed by M2.  It is false until a V2 owner has both a
+ * Exact-cut signal consumed by capture ingress.  It is false until a V2 owner has both a
  * durable accepted receipt and the matching live per-view lifecycle cut.
  */
 internal class CaptureSafetySignalV2 : VisibilityCaptureSafePredicate {

@@ -13,9 +13,9 @@ import org.openjdk.jol.info.GraphLayout
 class IntegratedCapacityCampaignTest {
     @Test
     fun `constructed maximum profile survives ACK adjacent coexistence within fixed limits`() {
-        val directory = Files.createTempDirectory("m3-integrated-maximum").toFile()
+        val directory = Files.createTempDirectory("canonical-surface-integrated-maximum").toFile()
         try {
-            val group = M3SurfaceGroup("integrated-maximum")
+            val group = SurfaceGroup("integrated-maximum")
             CanonicalStoreMigrationTest().writeMaximumV3Fixture(
                 directory, group, version = 5, includeCanonicalCurrent = true,
             )
@@ -24,11 +24,11 @@ class IntegratedCapacityCampaignTest {
                 JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L }),
                 freeBytes = { 512L * 1024 * 1024 },
             ).use { coordinator ->
-                val budget = M3CoordinatorStorageBudget(coordinator)
-                val migrated = M3CompactCanonicalStore.prepareV6SiblingMigration(group, directory, budget)
-                    as M3CompactCanonicalMigrationResult.Prepared
-                val base = (M3CompactCanonicalStore.openV6(group, directory, budget)
-                    as M3CompactCanonicalOpenResult.Opened).store
+                val budget = CoordinatorStorageBudget(coordinator)
+                val migrated = CompactCanonicalStore.prepareV6SiblingMigration(group, directory, budget)
+                    as CompactCanonicalMigrationResult.Prepared
+                val base = (CompactCanonicalStore.openV6(group, directory, budget)
+                    as CompactCanonicalOpenResult.Opened).store
                 try {
                     assertEquals(100_000, migrated.cut.liveSurfaceCount)
                     assertEquals(200_000, migrated.cut.lineageCount)
@@ -36,61 +36,61 @@ class IntegratedCapacityCampaignTest {
                     assertEquals(300_000, migrated.cut.supportCount)
                     val memory = base.retainedMemoryReceipt()
                     val storage = base.allocatedStorageReceipt()
-                    val commitReopenOwnerBytes = requireNotNull(M3CanonicalCommitStore.open(directory, budget)).use {
+                    val commitReopenOwnerBytes = requireNotNull(CanonicalCommitStore.open(directory, budget)).use {
                         GraphLayout.parseInstance(it).totalSize()
                     }
                     assertEquals(14_565_056L, memory.residentTotalBytes)
-                    assertTrue(storage.directoryBytes <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
+                    assertTrue(storage.directoryBytes <= CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
 
-                    val activation = (M3CanonicalActivation.prepare(group, directory, budget)
-                        as M3CanonicalActivationPreparation.Prepared).plan
-                    val owner = (M3SurfaceOwnership.open(group, directory, budget, activation)
-                        as M3SurfaceOwnershipOpenResult.Opened).ownership
+                    val activation = (CanonicalActivation.prepare(group, directory, budget)
+                        as CanonicalActivationPreparation.Prepared).plan
+                    val owner = (SurfaceOwnership.open(group, directory, budget, activation)
+                        as SurfaceOwnershipOpenResult.Opened).ownership
                     try {
                         val before = requireNotNull(owner.activationState())
-                        val selected = before.current as M3CanonicalActivationCurrent.Receipt
-                        assertTrue(selected.identity.canonicalLength in 1..M3CanonicalActivationResources.MAX_CURRENT_BYTES)
+                        val selected = before.current as CanonicalActivationCurrent.Receipt
+                        assertTrue(selected.identity.canonicalLength in 1..CanonicalActivationResources.MAX_CURRENT_BYTES)
                         assertTrue(owner.acknowledgeCanonicalCurrent(
-                            M3CanonicalAcknowledgement(
+                            CanonicalAcknowledgement(
                                 selected.identity.commandHash,
                                 before.cut.geometryRevision,
                                 before.cut.lineageRevision,
                             ),
-                        ) is M3CanonicalAcknowledgementResult.Acknowledged)
+                        ) is CanonicalAcknowledgementResult.Acknowledged)
 
                         val mutation = (owner.prepareAdjacentMutation(
                             base,
-                            M3FeatureMutationCommand(
+                            FeatureMutationCommand(
                                 "maximum-adjacent",
                                 before.cut.geometryRevision,
                                 before.cut.lineageRevision,
-                                M3CanonicalTarget(M3SurfaceId(1), M3Voxel(0, 0, 0), 0x13, 0x34, 197),
+                                CanonicalTarget(SurfaceId(1), Voxel(0, 0, 0), 0x13, 0x34, 197),
                             ),
-                        ) as M3CanonicalMutationPreparation.Prepared).mutation
-                        val ownership = mutableListOf<M3CanonicalAdjacentOwnershipObservation>()
+                        ) as CanonicalMutationPreparation.Prepared).mutation
+                        val ownership = mutableListOf<CanonicalAdjacentOwnershipObservation>()
                         CanonicalActivationTestHooks.onAdjacentOwnership = ownership::add
                         try {
                             // The production seam itself must reject a second maximum-resident
                             // authority; closing a test fixture is not the ownership invariant.
-                            val duplicate = (M3CompactCanonicalStore.openV6(group, directory, budget)
-                                as M3CompactCanonicalOpenResult.Opened).store
+                            val duplicate = (CompactCanonicalStore.openV6(group, directory, budget)
+                                as CompactCanonicalOpenResult.Opened).store
                             try {
                                 val refused = owner.commitAdjacentCanonicalMutation(mutation)
-                                    as M3CanonicalAdjacentCommitResult.Refused
-                                assertEquals(M3CanonicalAdjacentCommitRefusal.DUPLICATE_RESIDENT_AUTHORITY, refused.reason)
-                                assertEquals(M3PreparedMutationDisposition.RETRYABLE, refused.disposition)
-                                assertEquals(M3PreparedMutationLifecycle.READY, mutation.lifecycle())
+                                    as CanonicalAdjacentCommitResult.Refused
+                                assertEquals(CanonicalAdjacentCommitRefusal.DUPLICATE_RESIDENT_AUTHORITY, refused.reason)
+                                assertEquals(PreparedMutationDisposition.RETRYABLE, refused.disposition)
+                                assertEquals(PreparedMutationLifecycle.READY, mutation.lifecycle())
                                 assertEquals(2, ownership.single().liveStoreCount)
                                 assertEquals(memory.residentTotalBytes * 2, ownership.single().liveStoreBytes)
                             } finally { duplicate.close() }
                             ownership.clear()
-                            assertTrue(owner.commitAdjacentCanonicalMutation(mutation) is M3CanonicalAdjacentCommitResult.Committed)
-                            assertEquals(M3PreparedMutationLifecycle.CONSUMED, mutation.lifecycle())
+                            assertTrue(owner.commitAdjacentCanonicalMutation(mutation) is CanonicalAdjacentCommitResult.Committed)
+                            assertEquals(PreparedMutationLifecycle.CONSUMED, mutation.lifecycle())
                         } finally { CanonicalActivationTestHooks.onAdjacentOwnership = null }
-                        assertEquals(M3CanonicalAdjacentOwnershipStage.entries.toSet(), ownership.map { it.stage }.toSet())
+                        assertEquals(CanonicalAdjacentOwnershipStage.entries.toSet(), ownership.map { it.stage }.toSet())
                         assertTrue(ownership.all { it.liveStoreCount == 1 && it.liveStoreBytes == memory.residentTotalBytes })
                         val after = requireNotNull(owner.activationState())
-                        val next = after.current as M3CanonicalActivationCurrent.Receipt
+                        val next = after.current as CanonicalActivationCurrent.Receipt
                         assertEquals(100_000, after.cut.liveSurfaceCount)
                         assertEquals(200_000, after.cut.lineageCount)
                         assertEquals(300_000, after.cut.sourceCount)
@@ -119,10 +119,10 @@ class IntegratedCapacityCampaignTest {
                         // JOL owner graphs are diagnostic; modeled receipts and portable ceilings are normative.
                         assertEquals(EXPECTED_SHARED_PHASE_BYTES, sharedPhaseBytes)
                         assertEquals(EXPECTED_DIRECTORY_BYTES, storage.directoryBytes)
-                        assertTrue("shared phase=$sharedPhaseBytes", sharedPhaseBytes <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
-                        assertTrue("complete peak=$completePeakBytes", completePeakBytes <= M3CompactCanonicalStore.C17_TOTAL_BYTES)
+                        assertTrue("shared phase=$sharedPhaseBytes", sharedPhaseBytes <= CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
+                        assertTrue("complete peak=$completePeakBytes", completePeakBytes <= CompactCanonicalStore.C17_TOTAL_BYTES)
 
-                        val activationPrefix = "m3-activation-${group.hash.joinToString("") { "%02x".format(it) }}"
+                        val activationPrefix = "canonical-surface-activation-${group.hash.joinToString("") { "%02x".format(it) }}"
                         val files = directory.walkTopDown().filter(File::isFile).toList()
                         assertEquals(2, files.count { it.name.startsWith("$activationPrefix-root-") })
                         assertEquals(1, files.count { it.name.startsWith("$activationPrefix-current-") })
@@ -130,14 +130,14 @@ class IntegratedCapacityCampaignTest {
                         assertEquals(0L, coordinator.reservedBytes())
 
                         val chargedPhysicalBytes = directory.listFiles().orEmpty().filter { entry ->
-                            !entry.name.startsWith("m3-surface-") &&
+                            !entry.name.startsWith("canonical-surface-surface-") &&
                                 entry.name !in setOf("ledger-v2", "reservations-v2", "reclaims-v2")
                         }.sumOf(budget::allocatedBytes)
                         assertEquals(EXPECTED_COMMITTED_PHYSICAL_BYTES, chargedPhysicalBytes)
                         assertEquals(EXPECTED_COMMITTED_PHYSICAL_BYTES, coordinator.committedBytes())
                         assertEquals(chargedPhysicalBytes, coordinator.committedBytes())
                         println(
-                            "M3_INTEGRATED_MAXIMUM=resident=${memory.residentTotalBytes} " +
+                            "CANONICAL_SURFACE_INTEGRATED_MAXIMUM=resident=${memory.residentTotalBytes} " +
                                 "liveStores=${ownership.maxOf { it.liveStoreCount }} owner=$ownerBytes " +
                                 "commitReopenOwner=$commitReopenOwnerBytes " +
                                 "sharedPhase=$sharedPhaseBytes completePeak=$completePeakBytes " +

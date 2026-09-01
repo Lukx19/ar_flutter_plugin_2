@@ -1,6 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.proposal08
 
-import com.uhg0.ar_flutter_plugin_2.m0.*
+import com.uhg0.ar_flutter_plugin_2.proposal08.*
 
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate
@@ -80,7 +80,7 @@ internal object RendererT5ReceiptCampaign {
             ).encodeToByteArray(),
         )
         val receipt = buildJsonObject {
-            put("format", "proposal08-m0d-executable-receipt-v1")
+            put("format", "proposal08-coverage-renderer-executable-receipt-v1")
             put("tier", "T5")
             put("executionId", executionId)
             put("runner", buildJsonObject {
@@ -98,13 +98,13 @@ internal object RendererT5ReceiptCampaign {
             put("coveredSelectors", buildJsonArray {
                 add(JsonPrimitive("renderer_reference_v1"))
                 add(JsonPrimitive("resource_budget_v1"))
-                add(JsonPrimitive("P08-BUD-M0d-64KiB-ordinary-upload"))
+                add(JsonPrimitive("P08-BUD-coverage renderer-64KiB-ordinary-upload"))
             })
             put("assertions", assertions(measurements))
             put("measurements", measurements)
         }
 
-        val report = File("build/reports/tests/m0d_t5_receipt_v1.json")
+        val report = File("build/reports/tests/coverage_renderer_t5_receipt_v1.json")
         checkNotNull(report.parentFile).mkdirs()
         report.writeText(receipt.toString() + "\n")
     }
@@ -432,19 +432,19 @@ internal object RendererT5ReceiptCampaign {
 
     private fun corpusDescriptor(): JsonObject {
         val files = listOf(
-            "m0d_reference_corpus_v1.json",
-            "m0d_renderer_corpus_v1.json",
-            "m0d_renderer_train_v1.json",
-            "m0d_renderer_validation_v1.json",
-            "m0d_renderer_locked_v1.json",
+            "coverage_renderer_reference_corpus_v1.json",
+            "coverage_renderer_corpus_v1.json",
+            "coverage_renderer_train_v1.json",
+            "coverage_renderer_validation_v1.json",
+            "coverage_renderer_locked_v1.json",
         )
         val descriptor = buildJsonObject {
             put("fixtureFamily", "renderer_reference_v1")
             put("files", buildJsonObject {
-                files.forEach { file -> put("docs/m0/$file", sha256(resourceBytes(file))) }
+                files.forEach { file -> put("docs/proposal08/evidence/$file", sha256(resourceBytes(file))) }
             })
         }
-        val reference = fixture("m0d_reference_corpus_v1.json")
+        val reference = fixture("coverage_renderer_reference_corpus_v1.json")
         val stageDescriptors = reference.getValue("rendererCorpus").jsonObject
             .getValue("stageCorpora").jsonObject
         stageDescriptors.values.forEach { value ->
@@ -452,7 +452,7 @@ internal object RendererT5ReceiptCampaign {
             assertEquals(
                 stage.getValue("sha256").jsonPrimitive.content,
                 descriptor.getValue("files").jsonObject
-                    .getValue("docs/m0/${stage.getValue("file").jsonPrimitive.content}")
+                    .getValue("docs/proposal08/evidence/${stage.getValue("file").jsonPrimitive.content}")
                     .jsonPrimitive.content,
             )
         }
@@ -499,15 +499,15 @@ internal object RendererT5ReceiptCampaign {
      * The parent runner supplies an immutable lock file explicitly instead.
      */
     internal fun explicitSourceLock(
-        configuredPath: String? = System.getProperty("m0d.source.lock")
-            ?: System.getenv("M0D_SOURCE_LOCK"),
+        configuredPath: String? = System.getProperty("coverageRenderer.sourceLock")
+            ?: System.getenv("COVERAGE_RENDERER_SOURCE_LOCK"),
     ): JsonObject {
         require(!configuredPath.isNullOrBlank()) {
-            "M0d T5 requires explicit -Dm0d.source.lock=<absolute lock path>."
+            "coverage renderer T5 requires explicit -DcoverageRenderer.sourceLock=<absolute lock path>."
         }
         val lockFile = File(configuredPath)
         require(lockFile.isAbsolute && lockFile.isFile) {
-            "M0d T5 source lock must be an existing absolute file."
+            "coverage renderer T5 source lock must be an existing absolute file."
         }
         val declaredLock = Json.parseToJsonElement(lockFile.readText()).jsonObject
         // The runner accepts either the minimal source-lock object or the
@@ -515,17 +515,17 @@ internal object RendererT5ReceiptCampaign {
         // returned receipt carries only the exact source triple.
         val lock = declaredLock["source"]?.jsonObject ?: declaredLock
         require(lock.keys == setOf("format", "parentCommit", "pluginCommit")) {
-            "M0d T5 source lock has unexpected fields."
+            "coverage renderer T5 source lock has unexpected fields."
         }
-        require(lock["format"]?.jsonPrimitive?.content == "proposal08-m0d-source-pins-v1") {
-            "M0d T5 source lock format is invalid."
+        require(lock["format"]?.jsonPrimitive?.content == "proposal08-coverage-renderer-source-pins-v1") {
+            "coverage renderer T5 source lock format is invalid."
         }
         val commit = Regex("^[0-9a-f]{40}$")
         require(commit.matches(lock["parentCommit"]?.jsonPrimitive?.content.orEmpty())) {
-            "M0d T5 source lock parentCommit must be an exact 40-hex commit."
+            "coverage renderer T5 source lock parentCommit must be an exact 40-hex commit."
         }
         require(commit.matches(lock["pluginCommit"]?.jsonPrimitive?.content.orEmpty())) {
-            "M0d T5 source lock pluginCommit must be an exact 40-hex commit."
+            "coverage renderer T5 source lock pluginCommit must be an exact 40-hex commit."
         }
         return lock
     }

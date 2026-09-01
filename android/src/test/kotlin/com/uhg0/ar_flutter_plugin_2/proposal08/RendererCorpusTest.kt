@@ -1,6 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.proposal08
 
-import com.uhg0.ar_flutter_plugin_2.m0.*
+import com.uhg0.ar_flutter_plugin_2.proposal08.*
 
 import java.security.MessageDigest
 import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_MAX_STYLE_PATCH_ROWS
@@ -111,24 +111,24 @@ class RendererCorpusTest {
         val expected = testCase.getValue("expected").jsonObject
         when (kind) {
             "slot-reuse" -> {
-                val renderer = M0CentroidRendererState(testCase.int("capacity"))
-                assertTrue(renderer.upsert(row("g/s1", M0SemanticState.COVERED)))
-                assertTrue(renderer.upsert(row("g/s2", M0SemanticState.PENDING)))
+                val renderer = CentroidRendererState(testCase.int("capacity"))
+                assertTrue(renderer.upsert(row("g/s1", SemanticState.COVERED)))
+                assertTrue(renderer.upsert(row("g/s2", SemanticState.PENDING)))
                 renderer.flush()
                 assertTrue(renderer.remove("g/s1"))
-                assertTrue(renderer.upsert(row("g/s3", M0SemanticState.UNCOVERED)))
+                assertTrue(renderer.upsert(row("g/s3", SemanticState.UNCOVERED)))
                 assertEquals(expected.int("rowCount"), renderer.rowCount)
                 assertEquals(expected.int("reusedSlot"), renderer.slotFor("g/s3"))
             }
             "accessibility" -> {
-                val renderer = M0CentroidRendererState(testCase.int("capacity"))
-                assertTrue(renderer.upsert(row("g/pending", M0SemanticState.PENDING)))
+                val renderer = CentroidRendererState(testCase.int("capacity"))
+                assertTrue(renderer.upsert(row("g/pending", SemanticState.PENDING)))
                 assertEquals(expected.getValue("label").jsonPrimitive.content, renderer.accessibilityLabel("g/pending"))
                 assertTrue(expected.getValue("available").jsonPrimitive.boolean)
             }
             "context" -> {
-                val renderer = M0CentroidRendererState(testCase.int("capacity"))
-                assertTrue(renderer.upsert(row("g/live", M0SemanticState.COVERED)))
+                val renderer = CentroidRendererState(testCase.int("capacity"))
+                assertTrue(renderer.upsert(row("g/live", SemanticState.COVERED)))
                 renderer.flush()
                 renderer.loseContext()
                 val lost = renderer.flush()
@@ -139,11 +139,11 @@ class RendererCorpusTest {
                 assertEquals(expected.int("rowCount"), renderer.rowCount)
             }
             "stale" -> {
-                val renderer = M0CentroidRendererState(testCase.int("capacity"))
-                assertTrue(renderer.upsert(row("g/old", M0SemanticState.COVERED)))
+                val renderer = CentroidRendererState(testCase.int("capacity"))
+                assertTrue(renderer.upsert(row("g/old", SemanticState.COVERED)))
                 renderer.flush()
                 assertTrue(renderer.remove("g/old"))
-                assertTrue(renderer.upsert(row("g/live", M0SemanticState.PENDING, x = 1f)))
+                assertTrue(renderer.upsert(row("g/live", SemanticState.PENDING, x = 1f)))
                 renderer.flush()
                 renderer.loseContext()
                 while (renderer.flush().dirtySpans.isNotEmpty()) { }
@@ -155,10 +155,10 @@ class RendererCorpusTest {
                 assertEquals(expected.getValue("liveHit").jsonPrimitive.content, renderer.hitTest(1f, 0f, 0f))
             }
             "mode-switch" -> {
-                val renderer = M0CentroidRendererState(testCase.int("capacity"))
-                assertTrue(renderer.upsert(row("g/live", M0SemanticState.COVERED)))
+                val renderer = CentroidRendererState(testCase.int("capacity"))
+                assertTrue(renderer.upsert(row("g/live", SemanticState.COVERED)))
                 renderer.flush()
-                renderer.setMode(M0RendererMode.CUBES)
+                renderer.setMode(RendererMode.CUBES)
                 val plan = renderer.flush()
                 assertEquals(expected.getValue("mode").jsonPrimitive.content.uppercase(), plan.mode.name)
                 assertEquals(expected.int("rowCount"), plan.rowCount)
@@ -167,18 +167,18 @@ class RendererCorpusTest {
             "population" -> {
                 val mode = mode(testCase.getValue("mode").jsonPrimitive.content)
                 val rows = testCase.int("rows")
-                val renderer = M0CentroidRendererState(rows)
+                val renderer = CentroidRendererState(rows)
                 renderer.setMode(mode)
                 repeat(rows) { index ->
-                    assertTrue(renderer.upsert(row("$mode/$index", M0SemanticState.COVERED, x = index.toFloat())))
+                    assertTrue(renderer.upsert(row("$mode/$index", SemanticState.COVERED, x = index.toFloat())))
                 }
                 assertEquals(expected.int("rowCap"), renderer.rowCount)
                 assertTrue(renderer.flush().uploadBytes <= 64 * 1024)
             }
             "upload" -> {
                 val rows = testCase.int("rows")
-                val renderer = M0CentroidRendererState(rows)
-                repeat(rows) { index -> assertTrue(renderer.upsert(row("g/$index", M0SemanticState.COVERED))) }
+                val renderer = CentroidRendererState(rows)
+                repeat(rows) { index -> assertTrue(renderer.upsert(row("g/$index", SemanticState.COVERED))) }
                 assertEquals(expected.int("uploadBytes"), renderer.flush().uploadBytes)
                 assertEquals(rows, renderer.rowCount)
                 renderer.flush()
@@ -187,24 +187,24 @@ class RendererCorpusTest {
             "allocation" -> {
                 val mode = mode(testCase.getValue("mode").jsonPrimitive.content)
                 val rows = testCase.int("rows")
-                val renderer = M0CentroidRendererState(rows)
+                val renderer = CentroidRendererState(rows)
                 renderer.setMode(mode)
-                repeat(rows) { index -> assertTrue(renderer.upsert(row("$mode/$index", M0SemanticState.COVERED))) }
+                repeat(rows) { index -> assertTrue(renderer.upsert(row("$mode/$index", SemanticState.COVERED))) }
                 assertTrue(renderer.allocatedBytes <= 8 * 1024 * 1024)
             }
             "churn" -> {
                 val rows = testCase.int("rows")
-                val renderer = M0CentroidRendererState(rows)
-                repeat(rows) { index -> assertTrue(renderer.upsert(row("g/$index", M0SemanticState.COVERED))) }
+                val renderer = CentroidRendererState(rows)
+                repeat(rows) { index -> assertTrue(renderer.upsert(row("g/$index", SemanticState.COVERED))) }
                 renderer.flush()
                 assertTrue(renderer.remove("g/0"))
-                assertTrue(renderer.upsert(row("g/replacement", M0SemanticState.COVERED)))
+                assertTrue(renderer.upsert(row("g/replacement", SemanticState.COVERED)))
                 val plan = renderer.flush()
                 val changedRows = plan.dirtySpans.sumOf { it.endExclusive - it.start }
                 assertTrue(changedRows <= expected.int("maximumChangedRows"))
                 assertTrue(plan.uploadBytes <= expected.int("maximumUploadBytes"))
             }
-            else -> error("Unknown M0d case $kind")
+            else -> error("Unknown coverage renderer case $kind")
         }
     }
 
@@ -343,21 +343,21 @@ class RendererCorpusTest {
         }
     }
 
-    private fun mode(value: String): M0RendererMode = when (value) {
-        "centroids" -> M0RendererMode.CENTROIDS
-        "cubes" -> M0RendererMode.CUBES
-        "rawPoints" -> M0RendererMode.RAW_POINTS
-        "warmProxies" -> M0RendererMode.WARM_PROXIES
-        "overview" -> M0RendererMode.OVERVIEW
-        "glyphs" -> M0RendererMode.GLYPHS
-        "suppressedDebug" -> M0RendererMode.SUPPRESSED_DEBUG
+    private fun mode(value: String): RendererMode = when (value) {
+        "centroids" -> RendererMode.CENTROIDS
+        "cubes" -> RendererMode.CUBES
+        "rawPoints" -> RendererMode.RAW_POINTS
+        "warmProxies" -> RendererMode.WARM_PROXIES
+        "overview" -> RendererMode.OVERVIEW
+        "glyphs" -> RendererMode.GLYPHS
+        "suppressedDebug" -> RendererMode.SUPPRESSED_DEBUG
         else -> error("Unknown renderer mode $value")
     }
 
-    private fun row(key: String, state: M0SemanticState, x: Float = 0f) =
-        M0CentroidRow(key, x, 0f, 0f, state)
+    private fun row(key: String, state: SemanticState, x: Float = 0f) =
+        CentroidRow(key, x, 0f, 0f, state)
 
-    private fun fixture(fileName: String = "m0d_reference_corpus_v1.json"): JsonObject =
+    private fun fixture(fileName: String = "coverage_renderer_reference_corpus_v1.json"): JsonObject =
         Json.parseToJsonElement(
             requireNotNull(javaClass.classLoader?.getResourceAsStream(fileName))
                 .bufferedReader()

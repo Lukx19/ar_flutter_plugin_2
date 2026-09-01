@@ -1,6 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.proposal08
 
-import com.uhg0.ar_flutter_plugin_2.m0.*
+import com.uhg0.ar_flutter_plugin_2.proposal08.*
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -15,13 +15,13 @@ import kotlinx.serialization.json.long
 class VisibilityProtocolResyncCommandTest {
     @Test
     fun `resync command matches the locked 50-byte golden vector`() {
-        val command = M0aResyncCommandV1(
-            M0aResyncPayloadV1(
+        val command = ResyncCommandV1(
+            ResyncPayloadV1(
                 lastCommittedTransactionId = 0x0102030405060708,
                 lastCommittedGeometryRevision = 0x1112131415161718,
                 lastCommittedLineageRevision = 0x2122232425262728,
                 failedTransactionId = 0x3132333435363738,
-                reason = M0aResyncReason.INVALID_PAYLOAD_CRC,
+                reason = ResyncReason.INVALID_PAYLOAD_CRC,
                 flags = 1,
                 failedResponseRequestSequence = 0x4142434445464748,
             ),
@@ -30,44 +30,44 @@ class VisibilityProtocolResyncCommandTest {
             "0401080706050403020118171615141312112827262524232221383736353433323102000100000000004847464544434241",
             command.encode().toHex(),
         )
-        val decoded = M0aResyncCommandV1.decode(command.encode())
-        assertEquals(M0aResyncReason.INVALID_PAYLOAD_CRC, decoded.payload.reason)
+        val decoded = ResyncCommandV1.decode(command.encode())
+        assertEquals(ResyncReason.INVALID_PAYLOAD_CRC, decoded.payload.reason)
         assertTrue(decoded.payload.failedResponseHeaderReadable)
     }
 
     @Test
     fun `resync payload rejects reserved bits and bytes`() {
         assertThrows(IllegalArgumentException::class.java) {
-            M0aResyncPayloadV1(
+            ResyncPayloadV1(
                 lastCommittedTransactionId = 7,
                 lastCommittedGeometryRevision = 0,
                 lastCommittedLineageRevision = 0,
                 failedTransactionId = 7,
-                reason = M0aResyncReason.INVALID_TRANSACTION_ORDER,
+                reason = ResyncReason.INVALID_TRANSACTION_ORDER,
             )
         }
-        val command = M0aResyncCommandV1(
-            M0aResyncPayloadV1(
+        val command = ResyncCommandV1(
+            ResyncPayloadV1(
                 lastCommittedTransactionId = 7,
                 lastCommittedGeometryRevision = 8,
                 lastCommittedLineageRevision = 9,
                 failedTransactionId = 10,
-                reason = M0aResyncReason.ABANDONED_STAGING,
+                reason = ResyncReason.ABANDONED_STAGING,
             ),
         ).encode()
         command[2 + 36] = 1
         assertThrows(IllegalArgumentException::class.java) {
-            M0aResyncCommandV1.decode(command)
+            ResyncCommandV1.decode(command)
         }
     }
 
     @Test
     fun `resync command matches the checked-in cross-language fixture`() {
         val root = Json.parseToJsonElement(
-            requireNotNull(javaClass.classLoader?.getResourceAsStream("m0a_resync_command_v1.json"))
+            requireNotNull(javaClass.classLoader?.getResourceAsStream("visibility_protocol_resync_command_v1.json"))
                 .bufferedReader().use { it.readText() },
         ).jsonObject
-        val command = M0aResyncCommandV1.decode(hex(root.getValue("commandHex").jsonPrimitive.content))
+        val command = ResyncCommandV1.decode(hex(root.getValue("commandHex").jsonPrimitive.content))
         assertEquals(root.getValue("reasonId").jsonPrimitive.int, command.payload.reason.id)
         assertEquals(root.getValue("flags").jsonPrimitive.int, command.payload.flags)
         assertEquals(

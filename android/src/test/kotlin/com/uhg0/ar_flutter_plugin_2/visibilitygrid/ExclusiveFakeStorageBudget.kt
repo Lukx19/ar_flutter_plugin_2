@@ -3,7 +3,7 @@ package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 import java.io.File
 
 /** Explicit process-local exclusivity for tests that exercise candidate admission. */
-internal abstract class ExclusiveFakeStorageBudget : M3CanonicalStorageBudget {
+internal abstract class ExclusiveFakeStorageBudget : CanonicalStorageBudget {
     private data class ExclusiveToken(val delegate: Any, val target: String)
     private val targets = mutableSetOf<String>()
 
@@ -18,16 +18,16 @@ internal abstract class ExclusiveFakeStorageBudget : M3CanonicalStorageBudget {
         target: File,
         fileBytes: Map<String, Long>,
         maximumPhysicalBytes: Long,
-    ): M3CanonicalCandidateReservation = synchronized(targets) {
+    ): CanonicalCandidateReservation = synchronized(targets) {
         val identity = target.canonicalPath
-        if (!targets.add(identity)) return@synchronized M3CanonicalCandidateReservation.TargetReserved
+        if (!targets.add(identity)) return@synchronized CanonicalCandidateReservation.TargetReserved
         val delegate = try { reserveCandidate(staging, target, fileBytes, maximumPhysicalBytes) } catch (failure: Exception) {
             targets.remove(identity); throw failure
         }
         if (delegate == null) {
             targets.remove(identity)
-            M3CanonicalCandidateReservation.QuotaRefused
-        } else M3CanonicalCandidateReservation.Reserved(ExclusiveToken(delegate, identity))
+            CanonicalCandidateReservation.QuotaRefused
+        } else CanonicalCandidateReservation.Reserved(ExclusiveToken(delegate, identity))
     }
 
     final override fun commit(token: Any, actualBytes: Long) = commitBytes(unwrap(token), actualBytes)

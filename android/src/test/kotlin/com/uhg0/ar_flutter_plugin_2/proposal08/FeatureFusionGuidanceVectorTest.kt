@@ -1,6 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.proposal08
 
-import com.uhg0.ar_flutter_plugin_2.m0.*
+import com.uhg0.ar_flutter_plugin_2.proposal08.*
 
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -18,7 +18,7 @@ class FeatureFusionGuidanceVectorTest {
     fun `synthetic feature fusion guidance vector matches the fixed-point reference`() {
         val root = fixture()
         val cameraJson = root.getValue("camera").jsonObject
-        val camera = M0PictureVisibilityCamera(
+        val camera = PictureVisibilityCamera(
             imageWidth = cameraJson.int("imageWidth"),
             imageHeight = cameraJson.int("imageHeight"),
             fxQ8 = cameraJson.int("fxQ8"),
@@ -30,16 +30,16 @@ class FeatureFusionGuidanceVectorTest {
                 .jsonArray.map { it.jsonPrimitive.content.toLong() },
         )
         val surfaceJson = root.getValue("surface").jsonObject
-        val surface = M0PictureVisibilitySurface(
+        val surface = PictureVisibilitySurface(
             surfaceId = surfaceJson.int("surfaceId").toLong(),
             key = key(surfaceJson.getValue("key")),
             normal = vector(surfaceJson.getValue("normal")),
             normalConfidence = surfaceJson.int("normalConfidence"),
         )
-        val evaluation = M0PictureVisibilityEvaluator.evaluate(camera, surface)
+        val evaluation = PictureVisibilityEvaluator.evaluate(camera, surface)
         val expectedEvaluation = root.getValue("expectedEvaluation").jsonObject
         assertEquals(
-            M0PictureVisibilityRejection.APPROVED,
+            PictureVisibilityRejection.APPROVED,
             evaluation.rejection,
         )
         assertEquals(expectedEvaluation.getValue("bin").jsonPrimitive.int, evaluation.bin)
@@ -52,17 +52,17 @@ class FeatureFusionGuidanceVectorTest {
 
         val candidates = root.getValue("candidates").jsonArray.map { value ->
             val candidate = value.jsonObject
-            M0GuidanceCandidateInput(
+            GuidanceCandidateInput(
                 surfaceId = candidate.getValue("surfaceId").jsonPrimitive.content.toLong(),
                 evaluation = evaluation,
                 normal = surface.normal,
                 count = candidate.int("count"),
-                occupancy = M0PictureVisibilityOccupancy.valueOf(
+                occupancy = PictureVisibilityOccupancy.valueOf(
                     candidate.getValue("occupancy").jsonPrimitive.content.uppercase(),
                 ),
             )
         }
-        val targets = M0GuidanceReference.select(candidates)
+        val targets = GuidanceReference.select(candidates)
         val expectedTargets = root.getValue("expectedTargets").jsonArray
         assertEquals(expectedTargets.size, targets.size)
         expectedTargets.forEachIndexed { index, value ->
@@ -76,12 +76,12 @@ class FeatureFusionGuidanceVectorTest {
 
         root.getValue("rejectionCases").jsonArray.forEach { value ->
             val rejectionCase = value.jsonObject
-            val rejected = M0PictureVisibilityEvaluator.evaluate(
+            val rejected = PictureVisibilityEvaluator.evaluate(
                 camera = camera,
                 surface = surface.copy(
                     alreadyCredited = rejectionCase.booleanOrFalse("alreadyCredited"),
                 ),
-                cut = M0PictureVisibilityCutState(
+                cut = PictureVisibilityCutState(
                     coveragePending = rejectionCase.booleanOrFalse("coveragePending"),
                 ),
                 occludingCells = rejectionCase.array("occludingCells").map(::key),
@@ -93,7 +93,7 @@ class FeatureFusionGuidanceVectorTest {
         }
 
         val completion = root.getValue("completion").jsonObject
-        val coverage = M0VisibilityCoverage24()
+        val coverage = VisibilityCoverage24()
         completion.getValue("creditBins").jsonArray.forEach { bin ->
             coverage.credit(
                 bin.jsonPrimitive.int,
@@ -107,9 +107,9 @@ class FeatureFusionGuidanceVectorTest {
 
         val environmentJson = root.getValue("outOfGridEnvironment").jsonObject
         assertTrue(
-            M0GuidanceReference.select(
+            GuidanceReference.select(
                 candidates,
-                M0GuidanceEnvironment(
+                GuidanceEnvironment(
                     gridMinMm = key(environmentJson.getValue("gridMinMm")),
                     gridMaxMm = key(environmentJson.getValue("gridMaxMm")),
                     occupiedCells = emptySet(),
@@ -119,25 +119,25 @@ class FeatureFusionGuidanceVectorTest {
     }
 
     private fun fixture(): JsonObject = Json.parseToJsonElement(
-        requireNotNull(javaClass.classLoader?.getResourceAsStream("m0b_guidance_vector_v1.json"))
+        requireNotNull(javaClass.classLoader?.getResourceAsStream("feature_fusion_guidance_vector_v1.json"))
             .bufferedReader()
             .use { it.readText() },
     ).jsonObject
 
-    private fun key(value: kotlinx.serialization.json.JsonElement): M0VoxelKey {
+    private fun key(value: kotlinx.serialization.json.JsonElement): VoxelKey {
         val values = value.jsonArray.map { it.jsonPrimitive.content.toInt() }
-        return M0VoxelKey(values[0], values[1], values[2])
+        return VoxelKey(values[0], values[1], values[2])
     }
 
-    private fun vector(value: kotlinx.serialization.json.JsonElement): M0Q15Vector {
+    private fun vector(value: kotlinx.serialization.json.JsonElement): Q15Vector {
         val values = value.jsonArray.map { it.jsonPrimitive.content.toInt() }
-        return M0Q15Vector(values[0], values[1], values[2])
+        return Q15Vector(values[0], values[1], values[2])
     }
 
-    private fun rejection(name: String): M0PictureVisibilityRejection = when (name) {
-        "occluded" -> M0PictureVisibilityRejection.OCCLUDED
-        "captureSurfaceDuplicate" -> M0PictureVisibilityRejection.CAPTURE_SURFACE_DUPLICATE
-        "coveragePending" -> M0PictureVisibilityRejection.COVERAGE_PENDING
+    private fun rejection(name: String): PictureVisibilityRejection = when (name) {
+        "occluded" -> PictureVisibilityRejection.OCCLUDED
+        "captureSurfaceDuplicate" -> PictureVisibilityRejection.CAPTURE_SURFACE_DUPLICATE
+        "coveragePending" -> PictureVisibilityRejection.COVERAGE_PENDING
         else -> error("Unknown rejection $name")
     }
 

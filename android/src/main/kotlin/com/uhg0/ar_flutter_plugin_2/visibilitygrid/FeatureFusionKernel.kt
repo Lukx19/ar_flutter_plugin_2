@@ -86,7 +86,7 @@ internal class FeatureFusionKernel(
             val lastId = sortedNew.last().id.value
             val priorFingerprint = if (allocationRangeCount == 0) null else {
                 val offset = (allocationRangeCount - 1) * HASH_BYTES
-                M3CanonicalReceiptBytes(allocationFingerprints.copyOfRange(offset, offset + HASH_BYTES))
+                CanonicalReceiptBytes(allocationFingerprints.copyOfRange(offset, offset + HASH_BYTES))
             }
             extendLast = allocationRangeCount > 0 &&
                 (allocationRangeEnds[allocationRangeCount - 1].toLong() and UINT32_MASK) + 1L == firstId &&
@@ -252,7 +252,7 @@ internal class FeatureFusionKernel(
                         if (next > SURFACE_CAPACITY) {
                             return@allocate Staging.Refused(FeatureFusionRefusal.SURFACE_CAPACITY)
                         }
-                        projected = ProjectedSurface(projectedSurfaceCount, item.key, 0, 0, false, true, 0, 0, 0, 0, 0, M3FeaturePrimarySide.NONE)
+                        projected = ProjectedSurface(projectedSurfaceCount, item.key, 0, 0, false, true, 0, 0, 0, 0, 0, FeaturePrimarySide.NONE)
                         projectedSurfaceCount = next
                     }
                 }
@@ -345,25 +345,25 @@ internal class FeatureFusionKernel(
     }
 
     private fun pinReliablePrimary(surface: ProjectedSurface): ProjectedSurface {
-        if (surface.primarySide != M3FeaturePrimarySide.NONE || surface.positiveSupportQ13 == surface.negativeSupportQ13) return surface
+        if (surface.primarySide != FeaturePrimarySide.NONE || surface.positiveSupportQ13 == surface.negativeSupportQ13) return surface
         val positive = normalConfidence(surface.positiveSupportQ13)
         val negative = normalConfidence(surface.negativeSupportQ13)
         val dominant = if (surface.positiveSupportQ13 > surface.negativeSupportQ13) {
-            M3FeaturePrimarySide.POSITIVE to positive
+            FeaturePrimarySide.POSITIVE to positive
         } else {
-            M3FeaturePrimarySide.NEGATIVE to negative
+            FeaturePrimarySide.NEGATIVE to negative
         }
         return if (dominant.second >= 64) surface.copy(primarySide = dominant.first) else surface
     }
 
     private fun observationCount(encoded: Int): Int = encoded and OBSERVATION_COUNT_MASK
-    private fun primarySide(encoded: Int): M3FeaturePrimarySide = when (encoded ushr OBSERVATION_PRIMARY_SHIFT) {
-        0 -> M3FeaturePrimarySide.NONE
-        1 -> M3FeaturePrimarySide.POSITIVE
-        2 -> M3FeaturePrimarySide.NEGATIVE
+    private fun primarySide(encoded: Int): FeaturePrimarySide = when (encoded ushr OBSERVATION_PRIMARY_SHIFT) {
+        0 -> FeaturePrimarySide.NONE
+        1 -> FeaturePrimarySide.POSITIVE
+        2 -> FeaturePrimarySide.NEGATIVE
         else -> error("invalid retained primary-side state")
     }
-    private fun encodeObservationState(count: Int, side: M3FeaturePrimarySide): Int {
+    private fun encodeObservationState(count: Int, side: FeaturePrimarySide): Int {
         require(count in 0..OBSERVATION_COUNT_MASK)
         return count or (side.code shl OBSERVATION_PRIMARY_SHIFT)
     }
@@ -422,7 +422,7 @@ internal class FeatureFusionKernel(
             val lastId = sortedNew.last().id.value
             val priorFingerprint = if (allocationRangeCount == 0) null else {
                 val offset = (allocationRangeCount - 1) * HASH_BYTES
-                M3CanonicalReceiptBytes(allocationFingerprints.copyOfRange(offset, offset + HASH_BYTES))
+                CanonicalReceiptBytes(allocationFingerprints.copyOfRange(offset, offset + HASH_BYTES))
             }
             extendLast = allocationRangeCount > 0 &&
                 (allocationRangeEnds[allocationRangeCount - 1].toLong() and UINT32_MASK) + 1L == firstId &&
@@ -461,7 +461,7 @@ internal class FeatureFusionKernel(
     }
 
     /** Hydrates one cold-recovery row before ordinary admissions resume. */
-    internal fun hydrateCanonicalSurface(row: M3CompactSurface, fingerprint: M3CanonicalReceiptBytes): Boolean {
+    internal fun hydrateCanonicalSurface(row: CompactSurface, fingerprint: CanonicalReceiptBytes): Boolean {
         if (row.id.value !in 1..UINT32_MASK || fingerprint.size != HASH_BYTES) return false
         val key = VoxelKey(row.voxel.x, row.voxel.y, row.voxel.z)
         if (findSlot(key) >= 0 || surfaceCount >= SURFACE_CAPACITY) return false
@@ -473,7 +473,7 @@ internal class FeatureFusionKernel(
         accumulatedWeights[slot] = encodeWeightAndCanonical(
             OCCUPANCY_THRESHOLD, row.packedNormal, row.normalConfidence,
         )
-        observationCounts[slot] = encodeObservationState(0, M3FeaturePrimarySide.POSITIVE)
+        observationCounts[slot] = encodeObservationState(0, FeaturePrimarySide.POSITIVE)
         active[slot] = true
         // Only the canonical octant survives restart. Seed a deterministic
         // bounded prior strong enough that replaying one retained sample cannot
@@ -507,8 +507,8 @@ internal class FeatureFusionKernel(
                 else -> {
                     val offset = mid * HASH_BYTES
                     return CanonicalFeatureCorrelation(
-                        M3SurfaceId(encodedId.toLong() and UINT32_MASK),
-                        M3CanonicalReceiptBytes(allocationFingerprints.copyOfRange(offset, offset + HASH_BYTES)),
+                        SurfaceId(encodedId.toLong() and UINT32_MASK),
+                        CanonicalReceiptBytes(allocationFingerprints.copyOfRange(offset, offset + HASH_BYTES)),
                         retainedPackedNormal(kernelSlot),
                         retainedConfidence(kernelSlot),
                     )
@@ -545,7 +545,7 @@ internal class FeatureFusionKernel(
     private fun refused(reason: FeatureFusionRefusal) = FeatureFusionResult.Refused(reason, receipt())
     internal fun resourceReceipt(): FeatureFusionResourceReceipt = receipt()
     private fun receipt(surfaces: Int = surfaceCount, associations: Int = associationCount) =
-        FeatureFusionResourceReceipt(surfaces, associations, M3_TUPLE_SHARE_BYTES)
+        FeatureFusionResourceReceipt(surfaces, associations, CANONICAL_SURFACE_TUPLE_SHARE_BYTES)
 
     private fun hash(key: VoxelKey): Int {
         var value = key.x * 73856093 xor key.y * 19349663 xor key.z * 83492791
@@ -580,9 +580,9 @@ internal class FeatureFusionKernel(
         val negativeConfidence = normalConfidence(negative)
         val bothReliable = positiveConfidence >= 64 && negativeConfidence >= 64
         val primaryPositive = when (surface.primarySide) {
-            M3FeaturePrimarySide.POSITIVE -> true
-            M3FeaturePrimarySide.NEGATIVE -> false
-            M3FeaturePrimarySide.NONE -> positive > negative
+            FeaturePrimarySide.POSITIVE -> true
+            FeaturePrimarySide.NEGATIVE -> false
+            FeaturePrimarySide.NONE -> positive > negative
         }
         val primaryCode = if (primaryPositive) axisCode else opposite
         val primaryConfidence = if (bothReliable) {
@@ -610,7 +610,7 @@ internal class FeatureFusionKernel(
     private data class ProjectedSurface(
         val slot: Int, val key: VoxelKey, val weight: Int, val observationCount: Int, val isActive: Boolean, val isNew: Boolean,
         val axisXQ13: Int, val axisYQ13: Int, val axisZQ13: Int, val positiveSupportQ13: Int, val negativeSupportQ13: Int,
-        val primarySide: M3FeaturePrimarySide,
+        val primarySide: FeaturePrimarySide,
     ) {
         fun addNormal(evidence: NormalizedEvidence): ProjectedSurface {
             fun contribution(component: Int) = Math.toIntExact(FeatureNormalMath.roundTiesEven(component.toLong() * evidence.supportQ13, 32_767L))
@@ -680,7 +680,7 @@ internal class FeatureFusionKernel(
         const val ASSOCIATION_CAPACITY = 200_000
         const val HASH_SLOTS = 262_144
         const val HASH_MASK = HASH_SLOTS - 1
-        const val M3_TUPLE_SHARE_BYTES = 7_589_960
+        const val CANONICAL_SURFACE_TUPLE_SHARE_BYTES = 7_589_960
         const val MAX_ALLOCATION_RANGES = 1_024
         const val HASH_BYTES = 32
         const val UINT32_MASK = 0xffff_ffffL
@@ -696,7 +696,7 @@ internal class FeatureFusionKernel(
     }
 }
 
-private enum class M3FeaturePrimarySide(val code: Int) { NONE(0), POSITIVE(1), NEGATIVE(2) }
+private enum class FeaturePrimarySide(val code: Int) { NONE(0), POSITIVE(1), NEGATIVE(2) }
 
 /** Internal seam: production and fault-injected adapters stage the same work. */
 internal interface FeatureFusionOperations {
@@ -744,7 +744,7 @@ internal data class FeatureFusionCandidate(
     val x: Int, val y: Int, val z: Int, val weight: Int, val observationCount: Int,
     val normalCandidates: List<FeatureNormalCandidate>,
 ) {
-    /** Compatibility-only diagnostic for the immutable M0 candidate-A oracle. */
+    /** Compatibility-only diagnostic for the immutable Proposal 08 spike candidate-A oracle. */
     val normalOctant: Int get() = ((x.compareTo(0) shl 2) or (y.compareTo(0) shl 1) or z.compareTo(0)) and 7
 
     @Suppress("unused")
@@ -771,8 +771,8 @@ internal sealed interface FeatureFusionChange {
     data class Removal(override val x: Int, override val y: Int, override val z: Int) : FeatureFusionChange
 }
 internal data class CanonicalFeatureCorrelation(
-    val id: M3SurfaceId,
-    val allocationFingerprint: M3CanonicalReceiptBytes,
+    val id: SurfaceId,
+    val allocationFingerprint: CanonicalReceiptBytes,
     val packedNormal: Int,
     val normalConfidence: Int,
 )
@@ -781,8 +781,8 @@ internal data class CanonicalFeatureAssignment(
     val x: Int,
     val y: Int,
     val z: Int,
-    val id: M3SurfaceId,
-    val allocationFingerprint: M3CanonicalReceiptBytes,
+    val id: SurfaceId,
+    val allocationFingerprint: CanonicalReceiptBytes,
     val packedNormal: Int = 0,
     val normalConfidence: Int = 0,
 )

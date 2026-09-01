@@ -1,6 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.proposal08
 
-import com.uhg0.ar_flutter_plugin_2.m0.*
+import com.uhg0.ar_flutter_plugin_2.proposal08.*
 
 import java.io.File
 import java.nio.file.Files
@@ -18,49 +18,49 @@ import org.junit.Test
 class ResidencyLockedCampaignTest {
     @Test
     fun `locked T0 through T3 campaign produces a native receipt`() {
-        val source = fixture("m0c_source_pins_v1.json")
-        val policy = M0cResidencyPolicyCampaignV1.run()
+        val source = fixture("residency_source_pins_v1.json")
+        val policy = ResidencyPolicyCampaignV1.run()
         assertEquals("A", policy.selectedCandidateOrNone)
 
-        val canonical = M0RegionShardV5.encodeCanonical(
-            M0RegionCoordinate(-1, 2, -3),
+        val canonical = RegionShardV5.encodeCanonical(
+            RegionCoordinate(-1, 2, -3),
             2,
             1,
             List(100_000) { row(19, it) },
             emptyList(),
         )
-        val coverage = M0RegionShardV5.encodeCoverage(
-            M0RegionCoordinate(-1, 2, -3),
+        val coverage = RegionShardV5.encodeCoverage(
+            RegionCoordinate(-1, 2, -3),
             2,
             1,
             List(100_000) { row(56, it) },
             emptyList(),
         )
-        assertEquals(100_000, M0RegionShardV5.decode(canonical).surfaceRows.size)
-        assertEquals(100_000, M0RegionShardV5.decode(coverage).surfaceRows.size)
+        assertEquals(100_000, RegionShardV5.decode(canonical).surfaceRows.size)
+        assertEquals(100_000, RegionShardV5.decode(coverage).surfaceRows.size)
 
-        val mutationBase = M0RegionShardV5.encodeCoverage(
-            M0RegionCoordinate(1, 2, 3),
+        val mutationBase = RegionShardV5.encodeCoverage(
+            RegionCoordinate(1, 2, 3),
             2,
             1,
             listOf(row(56, 7)),
             listOf(row(13, 11)),
-            M0RegionShardV5.Compression.ZLIB,
+            RegionShardV5.Compression.ZLIB,
         )
         var mutationRejections = 0
         repeat(256) { seed ->
             val malformed = mutationBase.copyOf()
-            val index = M0RegionShardV5.headerBytes + seed % (malformed.size - M0RegionShardV5.headerBytes)
+            val index = RegionShardV5.headerBytes + seed % (malformed.size - RegionShardV5.headerBytes)
             malformed[index] = (malformed[index].toInt() xor (1 shl (seed % 8))).toByte()
-            if (runCatching { M0RegionShardV5.decode(malformed) }.isFailure) mutationRejections++
+            if (runCatching { RegionShardV5.decode(malformed) }.isFailure) mutationRejections++
         }
         assertEquals(256, mutationRejections)
 
         var faultPasses = 0
-        M0DurableCutFaultPoint.entries.forEach { fault ->
-            val directory = Files.createTempDirectory("m0c-locked-fault-").toFile()
+        DurableCutFaultPoint.entries.forEach { fault ->
+            val directory = Files.createTempDirectory("residency-locked-fault-").toFile()
             try {
-                val store = M0Schema5DurableRegionCutStore(directory, cuts(1))
+                val store = Schema5DurableRegionCutStore(directory, cuts(1))
                 val result = store.publish(cuts(2), fault)
                 assertEquals(fault.publishesNewRoot, result.published)
                 assertEquals(if (fault.publishesNewRoot) 1L else 0L, result.visibleRootId)
@@ -71,11 +71,11 @@ class ResidencyLockedCampaignTest {
             }
         }
 
-        val replayDirectory = Files.createTempDirectory("m0c-locked-replay-").toFile()
+        val replayDirectory = Files.createTempDirectory("residency-locked-replay-").toFile()
         val idempotentReplay = try {
-            val store = M0Schema5DurableRegionCutStore(replayDirectory, cuts(1))
-            store.publish(cuts(2), M0DurableCutFaultPoint.afterReceipt, "checkpoint-7")
-            val restarted = M0Schema5DurableRegionCutStore(replayDirectory)
+            val store = Schema5DurableRegionCutStore(replayDirectory, cuts(1))
+            store.publish(cuts(2), DurableCutFaultPoint.afterReceipt, "checkpoint-7")
+            val restarted = Schema5DurableRegionCutStore(replayDirectory)
             restarted.publish(cuts(2), operationId = "checkpoint-7")
             restarted.publish(cuts(2), operationId = "checkpoint-7")
             restarted.visibleRootId == 1L && !restarted.hasRoot(2)
@@ -85,8 +85,8 @@ class ResidencyLockedCampaignTest {
         assertTrue(idempotentReplay)
 
         val gb = 1_000_000_000L
-        val quotaPolicy = M0StorageQuotaPolicy.forVolume(64 * gb)
-        val quota = M0StorageBudgetCoordinator(quotaPolicy, 31 * gb, 33 * gb)
+        val quotaPolicy = StorageQuotaPolicy.forVolume(64 * gb)
+        val quota = StorageBudgetCoordinator(quotaPolicy, 31 * gb, 33 * gb)
         val first = quota.tryReserve(600_000_000, "session-a/checkpoint")!!
         val second = quota.tryReserve(400_000_000, "session-b/picture")!!
         val crossSessionOvercommitRejected = quota.tryReserve(1, "session-c/trace") == null
@@ -95,7 +95,7 @@ class ResidencyLockedCampaignTest {
         assertTrue(crossSessionOvercommitRejected)
 
         val receipt = buildJsonObject {
-            put("format", "proposal08-m0c-kotlin-receipt-v1")
+            put("format", "proposal08-residency-kotlin-receipt-v1")
             put("source", source)
             put("lockedTiers", buildJsonArray {
                 listOf("T0", "T1", "T2", "T3").forEach { add(JsonPrimitive(it)) }
@@ -136,7 +136,7 @@ class ResidencyLockedCampaignTest {
                 put("mutationRejections", mutationRejections)
             })
             put("durability", buildJsonObject {
-                put("faultCases", M0DurableCutFaultPoint.entries.size)
+                put("faultCases", DurableCutFaultPoint.entries.size)
                 put("faultPasses", faultPasses)
                 put("idempotentReceiptReplay", idempotentReplay)
             })
@@ -147,11 +147,11 @@ class ResidencyLockedCampaignTest {
                 put("crossSessionOvercommitRejected", crossSessionOvercommitRejected)
             })
         }.toString()
-        val report = File("build/reports/tests/m0c_kotlin_receipt_v1.json")
+        val report = File("build/reports/tests/residency_kotlin_receipt_v1.json")
         report.parentFile?.mkdirs()
         report.writeText(receipt)
         assertEquals(
-            requireNotNull(javaClass.classLoader?.getResourceAsStream("m0c_kotlin_receipt_v1.json"))
+            requireNotNull(javaClass.classLoader?.getResourceAsStream("residency_kotlin_receipt_v1.json"))
                 .bufferedReader().use { it.readText() }.trim(),
             receipt,
         )
@@ -166,8 +166,8 @@ class ResidencyLockedCampaignTest {
         cut(generation, 0),
     )
 
-    private fun cut(generation: Long, coordinate: Int) = M0RegionPairCut(
-        M0RegionCoordinate(coordinate, 0, 0),
+    private fun cut(generation: Long, coordinate: Int) = RegionPairCut(
+        RegionCoordinate(coordinate, 0, 0),
         generation,
         generation,
         generation,

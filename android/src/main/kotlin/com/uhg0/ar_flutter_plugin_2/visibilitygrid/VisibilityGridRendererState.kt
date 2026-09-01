@@ -9,7 +9,7 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import com.uhg0.ar_flutter_plugin_2.pointcloud.identityGridRotation
 
 /** Minimal immutable geometry retained after a group config's keys are consumed. */
-internal class M3RendererGroupGeometry private constructor(
+internal class RendererGroupGeometry private constructor(
     val voxelSizeMeters: Double,
     val worldFromGroupGl: DoubleArray,
 ) {
@@ -19,7 +19,7 @@ internal class M3RendererGroupGeometry private constructor(
         private const val OBJECT_BYTES = 24L
         private const val TRANSFORM_BYTES = 144L
 
-        fun from(config: VisibilityGridGroupConfig) = M3RendererGroupGeometry(
+        fun from(config: VisibilityGridGroupConfig) = RendererGroupGeometry(
             voxelSizeMeters = config.voxelSizeMeters,
             worldFromGroupGl = config.worldFromGroupGl.copyOf(),
         )
@@ -39,7 +39,7 @@ class VisibilityGridRendererState(
     private val defaultColor: Int = 0xFFFF0000.toInt(),
 ) {
     companion object {
-        /** Chapter 17 M0d maximum for clean centroid presentation rows. */
+        /** Chapter 17 coverage renderer maximum for clean centroid presentation rows. */
         const val CENTROID_PRESENTATION_CAPACITY = 20_000
 
         fun presentationCapacity(mode: VoxelRenderMode): Int =
@@ -82,7 +82,7 @@ class VisibilityGridRendererState(
     private val rowsByKey = LongRowIndex(capacity)
     private val selectedKeys = SelectedKeyMaxHeap(capacity)
     private val dirtyRows = DirtyRowQueue(capacity)
-    private var group: M3RendererGroupGeometry? = null
+    private var group: RendererGroupGeometry? = null
     private var count = 0
     private var renderRevision = 0L
     private var geometryRevision = 0L
@@ -130,7 +130,7 @@ class VisibilityGridRendererState(
         // restoredKeys are consumed into the renderer's fixed primitive arrays
         // below. Retain only the geometry needed for later row projection, not
         // the caller's full config (which can own another 20k-key copy).
-        group = M3RendererGroupGeometry.from(config)
+        group = RendererGroupGeometry.from(config)
         this.geometryRevision = geometryRevision
         require(visibilityRevision >= 0)
         this.visibilityRevision = visibilityRevision
@@ -517,7 +517,7 @@ class VisibilityGridRendererState(
 }
 
 /** One snapshot retained across the explicit SceneViewHost handoff boundary. */
-internal data class M3RendererSnapshotOwnershipReceipt(
+internal data class RendererSnapshotOwnershipReceipt(
     val snapshotObjectBytes: Long,
     val primaryArrayBytes: Long,
     val updateObjectBytes: Long,
@@ -537,22 +537,22 @@ internal data class M3RendererSnapshotOwnershipReceipt(
             alignedArray(rows * Int.SIZE_BYTES.toLong()) +
             alignedArray(rows * COVERAGE_RENDERER_STYLE_ROW_BYTES.toLong())
 
-        fun fullResync(rows: Int) = M3RendererSnapshotOwnershipReceipt(
+        fun fullResync(rows: Int) = RendererSnapshotOwnershipReceipt(
             56L, arrays(rows), 40L, listBytes(if (rows == 0) 0 else 1),
             if (rows == 0) 0L else span(rows),
         )
 
         /** Worst legal sparse dirty set: alternating rows, one row per span. */
-        fun maximumSparse(rows: Int): M3RendererSnapshotOwnershipReceipt {
+        fun maximumSparse(rows: Int): RendererSnapshotOwnershipReceipt {
             val spans = (rows + 1) / 2
-            return M3RendererSnapshotOwnershipReceipt(
+            return RendererSnapshotOwnershipReceipt(
                 56L, arrays(rows), 40L, listBytes(spans), spans * span(1),
             )
         }
     }
 }
 
-internal fun CoveragePointRenderSnapshot.m3OwnershipReceipt(): M3RendererSnapshotOwnershipReceipt {
+internal fun CoveragePointRenderSnapshot.ownershipReceipt(): RendererSnapshotOwnershipReceipt {
     val spans = update?.spans.orEmpty()
     fun alignedArray(payload: Long) = ((16L + payload + 7L) / 8L) * 8L
     val primary = alignedArray(keys.size * Long.SIZE_BYTES.toLong()) +
@@ -564,5 +564,5 @@ internal fun CoveragePointRenderSnapshot.m3OwnershipReceipt(): M3RendererSnapsho
         32L + alignedArray(span.positions.size * Float.SIZE_BYTES.toLong()) +
             alignedArray(span.colors.size * Int.SIZE_BYTES.toLong()) + alignedArray(span.styleRows.size.toLong())
     }
-    return M3RendererSnapshotOwnershipReceipt(56L, primary, if (update == null) 0L else 40L, list, spanBytes)
+    return RendererSnapshotOwnershipReceipt(56L, primary, if (update == null) 0L else 40L, list, spanBytes)
 }

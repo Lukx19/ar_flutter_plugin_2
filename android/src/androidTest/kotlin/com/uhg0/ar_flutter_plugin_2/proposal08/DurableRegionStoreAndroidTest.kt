@@ -1,6 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.proposal08
 
-import com.uhg0.ar_flutter_plugin_2.m0.*
+import com.uhg0.ar_flutter_plugin_2.proposal08.*
 
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -23,7 +23,7 @@ class DurableRegionStoreAndroidTest {
     @Before
     fun setUp() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
-        root = File(context.noBackupFilesDir, "m0c-native-${UUID.randomUUID()}")
+        root = File(context.noBackupFilesDir, "residency-native-${UUID.randomUUID()}")
         check(root.mkdirs())
     }
 
@@ -70,7 +70,7 @@ class DurableRegionStoreAndroidTest {
         val testContext = instrumentation.context
         val directory = File(
             instrumentation.targetContext.noBackupFilesDir,
-            "m0c-process-${UUID.randomUUID()}",
+            "residency-process-${UUID.randomUUID()}",
         )
         check(directory.mkdirs())
         try {
@@ -100,14 +100,14 @@ class DurableRegionStoreAndroidTest {
         }
     }
 
-    private fun nativeStore(directory: File) = M0Schema5DurableRegionCutStore(
+    private fun nativeStore(directory: File) = Schema5DurableRegionCutStore(
         directory = directory,
         initialCuts = listOf(cut(1, 0), cut(1, 1)),
-        directorySync = M0DirectorySync.strictAndroid,
+        directorySync = DirectorySync.strictAndroid,
     )
 
-    private fun cut(generation: Long, coordinate: Int) = M0RegionPairCut(
-        region = M0RegionCoordinate(coordinate, 0, 0),
+    private fun cut(generation: Long, coordinate: Int) = RegionPairCut(
+        region = RegionCoordinate(coordinate, 0, 0),
         generation = generation,
         geometryRevision = generation,
         coverageRevision = generation,

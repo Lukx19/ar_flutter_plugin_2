@@ -1,6 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.proposal08
 
-import com.uhg0.ar_flutter_plugin_2.m0.*
+import com.uhg0.ar_flutter_plugin_2.proposal08.*
 
 import io.flutter.plugin.common.BinaryMessenger
 import java.nio.ByteBuffer
@@ -23,7 +23,7 @@ class VisibilitySurfaceStreamChannelTest {
     fun `binding qualifier rejects stale token before stream admission`() {
         val messenger = TestMessenger(88)
         val qualifier = ByteArray(32) { (it + 1).toByte() }
-        val binding = M0aVisibilitySurfaceStreamChannel(
+        val binding = VisibilitySurfaceStreamChannel(
             messenger,
             88,
             bindingQualifier = qualifier,
@@ -37,7 +37,7 @@ class VisibilitySurfaceStreamChannelTest {
 
         val qualifiedResponse = messenger.exchange(qualifier + packet)
         assertArrayEquals(qualifier, qualifiedResponse.copyOfRange(0, qualifier.size))
-        val response = M0aPacketCodec.decodeResponse(
+        val response = PacketCodec.decodeResponse(
             qualifiedResponse.copyOfRange(qualifier.size, qualifiedResponse.size),
         )
         assertEquals(1L, response.requestSequence)
@@ -47,8 +47,8 @@ class VisibilitySurfaceStreamChannelTest {
 
     @Test
     fun `packet codec validates all portable ordinals and response envelope fields`() {
-        val base = M0aPacketCodec.encodeRequest(
-            M0aPacketCodec.Request(
+        val base = PacketCodec.encodeRequest(
+            PacketCodec.Request(
                 requestFlags = 0,
                 streamToken = 91,
                 acknowledgedTransactionId = 0,
@@ -67,12 +67,12 @@ class VisibilitySurfaceStreamChannelTest {
                 .putLong(offset, Long.MIN_VALUE)
             rewriteCrc(mutated, 72)
             assertThrows(IllegalArgumentException::class.java) {
-                M0aPacketCodec.decodeRequest(mutated)
+                PacketCodec.decodeRequest(mutated)
             }
         }
 
-        val invalidKind = M0aPacketCodec.encodeResponse(
-            M0aPacketCodec.noChanges(
+        val invalidKind = PacketCodec.encodeResponse(
+            PacketCodec.noChanges(
                 streamToken = 91,
                 requestSequence = 1,
                 nextExpectedRequestSequence = 2,
@@ -83,35 +83,35 @@ class VisibilitySurfaceStreamChannelTest {
             rewriteCrc(packet, 104)
         }
         assertThrows(IllegalArgumentException::class.java) {
-            M0aPacketCodec.decodeResponse(invalidKind)
+            PacketCodec.decodeResponse(invalidKind)
         }
 
-        val oversized = ByteArray(M0aPacketCodec.catchUpMaximumBytes + 1)
+        val oversized = ByteArray(PacketCodec.catchUpMaximumBytes + 1)
         oversized[0] = 'V'.code.toByte()
         oversized[1] = 'G'.code.toByte()
         oversized[2] = 'S'.code.toByte()
         oversized[3] = '2'.code.toByte()
         ByteBuffer.wrap(oversized).order(ByteOrder.LITTLE_ENDIAN).apply {
             putShort(4, 2)
-            putShort(6, M0aPacketCodec.responseHeaderBytes.toShort())
+            putShort(6, PacketCodec.responseHeaderBytes.toShort())
             putInt(16, oversized.size)
-            putInt(100, oversized.size - M0aPacketCodec.responseHeaderBytes)
+            putInt(100, oversized.size - PacketCodec.responseHeaderBytes)
         }
         rewriteCrc(oversized, 104)
         assertThrows(IllegalArgumentException::class.java) {
-            M0aPacketCodec.decodeResponse(oversized)
+            PacketCodec.decodeResponse(oversized)
         }
 
         assertThrows(IllegalArgumentException::class.java) {
-            M0aPacketCodec.encodeResponse(
-                M0aPacketCodec.noChanges(
+            PacketCodec.encodeResponse(
+                PacketCodec.noChanges(
                     streamToken = 91,
                     requestSequence = 1,
                     nextExpectedRequestSequence = 2,
                 ).copy(
-                    payload = ByteArray(M0aPacketCodec.catchUpMaximumBytes),
+                    payload = ByteArray(PacketCodec.catchUpMaximumBytes),
                 ),
-                M0aPacketCodec.catchUpMaximumBytes + 1,
+                PacketCodec.catchUpMaximumBytes + 1,
             )
         }
     }
@@ -119,13 +119,13 @@ class VisibilitySurfaceStreamChannelTest {
     @Test
     fun `serial binding returns exact response for duplicate and rejects conflict`() {
         val messenger = TestMessenger(17)
-        val binding = M0aVisibilitySurfaceStreamChannel(messenger, 17)
+        val binding = VisibilitySurfaceStreamChannel(messenger, 17)
         val request = request(sequence = 1, token = 91)
 
         val first = messenger.exchange(request)
         val duplicate = messenger.exchange(request)
         assertArrayEquals(first, duplicate)
-        assertEquals(1L, M0aPacketCodec.decodeResponse(first).requestSequence)
+        assertEquals(1L, PacketCodec.decodeResponse(first).requestSequence)
         val telemetry = binding.transportInstrumentation.snapshot()
         assertEquals(2L, telemetry.submittedRequests)
         assertEquals(1L, telemetry.acceptedRequests)
@@ -160,7 +160,7 @@ class VisibilitySurfaceStreamChannelTest {
         assertEquals(168, binding.transportInstrumentation.tryEncodeBoundedSummary(1_200_000_000)!!.size)
 
         val conflict = messenger.exchange(request(sequence = 1, token = 92))
-        val conflictResponse = M0aPacketCodec.decodeResponse(conflict)
+        val conflictResponse = PacketCodec.decodeResponse(conflict)
         assertEquals(255, conflictResponse.messageKind)
         assertEquals(30, conflictResponse.errorId)
         assertEquals(1L, conflictResponse.requestSequence)
@@ -172,7 +172,7 @@ class VisibilitySurfaceStreamChannelTest {
     fun `queued backpressure consumes and caches exactly once before advertised resync succeeds`() {
         val messenger = TestMessenger(34)
         val executor = HoldingExecutor()
-        val binding = M0aVisibilitySurfaceStreamChannel(
+        val binding = VisibilitySurfaceStreamChannel(
             messenger,
             34,
             workerExecutor = executor,
@@ -201,7 +201,7 @@ class VisibilitySurfaceStreamChannelTest {
         assertTrue(firstCompleted.await(2, TimeUnit.SECONDS))
         executor.runNext()
         assertTrue(rejectedCompleted.await(2, TimeUnit.SECONDS))
-        val rejected = M0aPacketCodec.decodeResponse(rejectedBytes[0]!!)
+        val rejected = PacketCodec.decodeResponse(rejectedBytes[0]!!)
         assertEquals(255, rejected.messageKind)
         assertEquals(8, rejected.errorId)
         assertEquals(9, rejected.resultFlags)
@@ -219,7 +219,7 @@ class VisibilitySurfaceStreamChannelTest {
         assertTrue(replayCompleted.await(2, TimeUnit.SECONDS))
         assertArrayEquals(rejectedBytes[0], replayBytes[0])
 
-        val resync = M0aPacketCodec.Request(
+        val resync = PacketCodec.Request(
             requestFlags = 1 shl 2,
             streamToken = 34,
             acknowledgedTransactionId = 0,
@@ -228,8 +228,8 @@ class VisibilitySurfaceStreamChannelTest {
             nextStyleRevision = 0,
             maximumResponseBytes = 4096,
             styleRecords = emptyList(),
-            commandBytes = M0aResyncCommandV1(
-                M0aResyncPayloadV1(0, 0, 0, 1, M0aResyncReason.INVALID_TRANSACTION_ORDER),
+            commandBytes = ResyncCommandV1(
+                ResyncPayloadV1(0, 0, 0, 1, ResyncReason.INVALID_TRANSACTION_ORDER),
             ).encode(),
             requestSequence = 3,
         )
@@ -237,7 +237,7 @@ class VisibilitySurfaceStreamChannelTest {
         val recoveredCompleted = CountDownLatch(1)
         messenger.send(
             "visibility_surface_stream_34",
-            ByteBuffer.wrap(M0aPacketCodec.encodeRequest(resync)),
+            ByteBuffer.wrap(PacketCodec.encodeRequest(resync)),
         ) { response ->
             recoveredBytes[0] = response?.let { buffer ->
                 ByteArray(buffer.remaining()).also { buffer.slice().get(it) }
@@ -246,7 +246,7 @@ class VisibilitySurfaceStreamChannelTest {
         }
         executor.runNext()
         assertTrue(recoveredCompleted.await(2, TimeUnit.SECONDS))
-        val recovered = M0aPacketCodec.decodeResponse(recoveredBytes[0]!!)
+        val recovered = PacketCodec.decodeResponse(recoveredBytes[0]!!)
         assertEquals(0, recovered.messageKind)
         assertEquals(3, recovered.requestSequence)
         assertEquals(4, recovered.nextExpectedRequestSequence)
@@ -258,9 +258,9 @@ class VisibilitySurfaceStreamChannelTest {
     @Test
     fun `binding owns structural transaction receiver through disposal`() {
         val messenger = TestMessenger(25)
-        val binding = M0aVisibilitySurfaceStreamChannel(messenger, 25)
+        val binding = VisibilitySurfaceStreamChannel(messenger, 25)
         binding.structuralTransactionReceiver.begin(
-            M0aTransactionBeginV1(
+            TransactionBeginV1(
                 transactionId = 1,
                 baseGeometryRevision = 1,
                 targetGeometryRevision = 2,
@@ -270,16 +270,16 @@ class VisibilitySurfaceStreamChannelTest {
                 payloadChecksum = 0,
             ),
         )
-        assertEquals(M0aStructuralTransactionState.SENDING_BEGIN, binding.structuralTransactionReceiver.state)
+        assertEquals(StructuralTransactionState.SENDING_BEGIN, binding.structuralTransactionReceiver.state)
         binding.dispose()
-        assertEquals(M0aStructuralTransactionState.STOPPED, binding.structuralTransactionReceiver.state)
+        assertEquals(StructuralTransactionState.STOPPED, binding.structuralTransactionReceiver.state)
     }
 
     @Test
     fun `serial worker pull delivers queued structural frames and replays exactly`() {
         val messenger = TestMessenger(27)
-        val binding = M0aVisibilitySurfaceStreamChannel(messenger, 27)
-        val frames = M0aStructuralTransactionProducerV1.produce(
+        val binding = VisibilitySurfaceStreamChannel(messenger, 27)
+        val frames = StructuralTransactionProducerV1.produce(
             transactionId = 1,
             baseGeometryRevision = 0,
             targetGeometryRevision = 1,
@@ -292,8 +292,8 @@ class VisibilitySurfaceStreamChannelTest {
             messenger.exchange(request(sequence = index.toLong() + 1, token = 27))
         }
         responses.forEachIndexed { index, packet ->
-            val response = M0aPacketCodec.decodeResponse(packet)
-            val frame = M0aTransactionResponseCodecV1.decodeFrame(response)
+            val response = PacketCodec.decodeResponse(packet)
+            val frame = TransactionResponseCodecV1.decodeFrame(response)
             assertEquals(frames[index]::class, frame::class)
             assertEquals(index.toLong() + 1, response.requestSequence)
         }
@@ -302,7 +302,7 @@ class VisibilitySurfaceStreamChannelTest {
             messenger.exchange(request(sequence = responses.size.toLong(), token = 27)),
         )
         assertEquals(1L, binding.transportInstrumentation.snapshot().replayedRequests)
-        val acknowledgement = M0aPacketCodec.decodeResponse(
+        val acknowledgement = PacketCodec.decodeResponse(
             messenger.exchange(
                 request(
                     sequence = responses.size.toLong() + 1,
@@ -313,7 +313,7 @@ class VisibilitySurfaceStreamChannelTest {
                 ),
             ),
         )
-        assertEquals(M0aPacketCodec.noChangesMessageKind, acknowledgement.messageKind)
+        assertEquals(PacketCodec.noChangesMessageKind, acknowledgement.messageKind)
         assertEquals(1L, acknowledgement.transactionId)
         binding.dispose()
     }
@@ -321,9 +321,9 @@ class VisibilitySurfaceStreamChannelTest {
     @Test
     fun `lower pull rejects without consuming the fixed queued response profile`() {
         val messenger = TestMessenger(127)
-        val binding = M0aVisibilitySurfaceStreamChannel(messenger, 127)
-        val profile = M0aTransactionResponseProfileV1.ordinary
-        val frames = M0aStructuralTransactionProducerV1.produce(
+        val binding = VisibilitySurfaceStreamChannel(messenger, 127)
+        val profile = TransactionResponseProfileV1.ordinary
+        val frames = StructuralTransactionProducerV1.produce(
             transactionId = 1,
             baseGeometryRevision = 0,
             targetGeometryRevision = 1,
@@ -333,21 +333,21 @@ class VisibilitySurfaceStreamChannelTest {
         )
         binding.queueStructuralTransaction(frames, profile)
 
-        val rejected = M0aPacketCodec.decodeResponse(
-            messenger.exchange(request(1, 127, maximumResponseBytes = M0aPacketCodec.responseMinimumBytes)),
+        val rejected = PacketCodec.decodeResponse(
+            messenger.exchange(request(1, 127, maximumResponseBytes = PacketCodec.responseMinimumBytes)),
         )
         assertEquals(34, rejected.errorId)
         assertEquals(1, rejected.nextExpectedRequestSequence)
 
-        val begin = M0aPacketCodec.decodeResponse(
-            messenger.exchange(request(1, 127, maximumResponseBytes = M0aPacketCodec.responseMaximumBytes)),
+        val begin = PacketCodec.decodeResponse(
+            messenger.exchange(request(1, 127, maximumResponseBytes = PacketCodec.responseMaximumBytes)),
         )
-        assertEquals(M0aTransactionResponseCodecV1.beginMessageKind, begin.messageKind)
+        assertEquals(TransactionResponseCodecV1.beginMessageKind, begin.messageKind)
         assertEquals(2, begin.chunkCount)
-        val firstChunk = M0aPacketCodec.decodeResponse(
-            messenger.exchange(request(2, 127, maximumResponseBytes = M0aPacketCodec.responseMaximumBytes)),
+        val firstChunk = PacketCodec.decodeResponse(
+            messenger.exchange(request(2, 127, maximumResponseBytes = PacketCodec.responseMaximumBytes)),
         )
-        assertEquals(M0aTransactionResponseCodecV1.chunkMessageKind, firstChunk.messageKind)
+        assertEquals(TransactionResponseCodecV1.chunkMessageKind, firstChunk.messageKind)
         assertEquals(0, firstChunk.chunkIndex)
         binding.dispose()
     }
@@ -355,22 +355,22 @@ class VisibilitySurfaceStreamChannelTest {
     @Test
     fun `current delta source selects and retains only one immutable named receipt until exact ACK`() {
         data class JournalEntry(
-            val selector: M0aCurrentDeltaSelectorV1,
+            val selector: CurrentDeltaSelectorV1,
             val baseGeometryRevision: Long,
             val bytes: ByteArray,
         )
 
         val selectedBytes = byteArrayOf(41, 42, 43, 44)
         val journal = listOf(
-            JournalEntry(M0aCurrentDeltaSelectorV1(7, 7, 7), 6, byteArrayOf(11, 12, 13)),
-            JournalEntry(M0aCurrentDeltaSelectorV1(1, 1, 1), 0, selectedBytes),
-            JournalEntry(M0aCurrentDeltaSelectorV1(9, 9, 9), 8, byteArrayOf(91, 92, 93)),
+            JournalEntry(CurrentDeltaSelectorV1(7, 7, 7), 6, byteArrayOf(11, 12, 13)),
+            JournalEntry(CurrentDeltaSelectorV1(1, 1, 1), 0, selectedBytes),
+            JournalEntry(CurrentDeltaSelectorV1(9, 9, 9), 8, byteArrayOf(91, 92, 93)),
         )
-        val copied = mutableListOf<M0aCurrentDeltaSelectorV1>()
-        val source = M0aCurrentDeltaSourceV1 { selector ->
+        val copied = mutableListOf<CurrentDeltaSelectorV1>()
+        val source = CurrentDeltaSourceV1 { selector ->
             journal.firstOrNull { it.selector == selector }?.let { entry ->
                 copied += entry.selector
-                M0aCurrentDeltaReceiptV1(
+                CurrentDeltaReceiptV1(
                     entry.selector,
                     entry.baseGeometryRevision,
                     entry.bytes,
@@ -379,8 +379,8 @@ class VisibilitySurfaceStreamChannelTest {
             }
         }
         val messenger = TestMessenger(128)
-        val binding = M0aVisibilitySurfaceStreamChannel(messenger, 128)
-        val selected = M0aCurrentDeltaSelectorV1(1, 1, 1)
+        val binding = VisibilitySurfaceStreamChannel(messenger, 128)
+        val selected = CurrentDeltaSelectorV1(1, 1, 1)
         binding.queueCurrentDelta(source, selected, minimumResponseProfile)
         selectedBytes.fill(99)
         assertEquals(listOf(selected), copied)
@@ -388,16 +388,16 @@ class VisibilitySurfaceStreamChannelTest {
         val beginPacket = messenger.exchange(request(1, 128))
         val chunkPacket = messenger.exchange(request(2, 128))
         val commitPacket = messenger.exchange(request(3, 128))
-        val chunk = M0aTransactionResponseCodecV1.decodeFrame(
-            M0aPacketCodec.decodeResponse(chunkPacket),
-        ) as M0aTransactionChunkFrameV1
+        val chunk = TransactionResponseCodecV1.decodeFrame(
+            PacketCodec.decodeResponse(chunkPacket),
+        ) as TransactionChunkFrameV1
         assertArrayEquals(byteArrayOf(41, 42, 43, 44), chunk.value.bytes)
-        assertEquals(1, M0aPacketCodec.decodeResponse(beginPacket).transactionId)
+        assertEquals(1, PacketCodec.decodeResponse(beginPacket).transactionId)
         assertArrayEquals(commitPacket, messenger.exchange(request(3, 128)))
         assertTrue(!chunk.value.bytes.contentEquals(journal[0].bytes))
         assertTrue(!chunk.value.bytes.contentEquals(journal[2].bytes))
 
-        val acknowledged = M0aPacketCodec.decodeResponse(
+        val acknowledged = PacketCodec.decodeResponse(
             messenger.exchange(
                 request(
                     sequence = 4,
@@ -408,17 +408,17 @@ class VisibilitySurfaceStreamChannelTest {
                 ),
             ),
         )
-        assertEquals(M0aPacketCodec.noChangesMessageKind, acknowledged.messageKind)
+        assertEquals(PacketCodec.noChangesMessageKind, acknowledged.messageKind)
         binding.dispose()
     }
 
     @Test
     fun `terminal drain refuses a new current delta before stream staging`() {
         val messenger = TestMessenger(129)
-        val binding = M0aVisibilitySurfaceStreamChannel(messenger, 129)
+        val binding = VisibilitySurfaceStreamChannel(messenger, 129)
         val terminal = binding.executeDebugTerminalDrain(129)
 
-        assertEquals(M0aPacketCodec.noChangesMessageKind, terminal.messageKind)
+        assertEquals(PacketCodec.noChangesMessageKind, terminal.messageKind)
         assertEquals(5, terminal.resultFlags)
         assertTrue(!binding.canQueueStructuralTransaction())
         binding.dispose()
@@ -426,12 +426,12 @@ class VisibilitySurfaceStreamChannelTest {
 
     @Test
     fun `stream accepts only the active control lifecycle token`() {
-        val lifecycle = M0aControlLifecycle()
-        val start = controlRequest(M0aControlOperation.START, 0, 1)
-        lifecycle.handle(start, M0aControlCodec.encodeRequest(start))
+        val lifecycle = controlLifecycle()
+        val start = controlRequest(ControlOperation.START, 0, 1)
+        lifecycle.handle(start, ControlCodec.encodeRequest(start))
         val messenger = TestMessenger(28)
         val executor = Executors.newSingleThreadExecutor()
-        val binding = M0aVisibilitySurfaceStreamChannel(
+        val binding = VisibilitySurfaceStreamChannel(
             messenger = messenger,
             viewId = 28,
             workerExecutor = executor,
@@ -439,10 +439,10 @@ class VisibilitySurfaceStreamChannelTest {
             controlLifecycle = lifecycle,
         )
 
-        val stale = M0aPacketCodec.decodeResponse(messenger.exchange(request(1, 99)))
+        val stale = PacketCodec.decodeResponse(messenger.exchange(request(1, 99)))
         assertEquals(255, stale.messageKind)
         assertEquals(4, stale.errorId)
-        val accepted = M0aPacketCodec.decodeResponse(messenger.exchange(request(1, 1)))
+        val accepted = PacketCodec.decodeResponse(messenger.exchange(request(1, 1)))
         assertEquals(0, accepted.messageKind)
         binding.dispose()
         executor.shutdownNow()
@@ -450,18 +450,18 @@ class VisibilitySurfaceStreamChannelTest {
 
     @Test
     fun `stream adopts the baseline carried by the shared control lifecycle`() {
-        val lifecycle = M0aControlLifecycle(
-            initialCommittedBaseline = M0aCommittedBaselineV1(9, 10, 11, 12),
+        val lifecycle = controlLifecycle(
+            initialCommittedBaseline = CommittedBaselineV1(9, 10, 11, 12),
         )
-        val start = controlRequest(M0aControlOperation.START, 0, 1)
-        lifecycle.handle(start, M0aControlCodec.encodeRequest(start))
+        val start = controlRequest(ControlOperation.START, 0, 1)
+        lifecycle.handle(start, ControlCodec.encodeRequest(start))
         val messenger = TestMessenger(32)
-        val binding = M0aVisibilitySurfaceStreamChannel(
+        val binding = VisibilitySurfaceStreamChannel(
             messenger = messenger,
             viewId = 32,
             controlLifecycle = lifecycle,
         )
-        val response = M0aPacketCodec.decodeResponse(
+        val response = PacketCodec.decodeResponse(
             messenger.exchange(
                 request(
                     sequence = 1,
@@ -484,9 +484,9 @@ class VisibilitySurfaceStreamChannelTest {
     @Test
     fun `empty acknowledgement is fenced against a restored baseline`() {
         val messenger = TestMessenger(33)
-        val binding = M0aVisibilitySurfaceStreamChannel(messenger, 33)
+        val binding = VisibilitySurfaceStreamChannel(messenger, 33)
         binding.setCommittedBaseline(9, 10, 11, 12)
-        val response = M0aPacketCodec.decodeResponse(
+        val response = PacketCodec.decodeResponse(
             messenger.exchange(
                 request(
                     sequence = 1,
@@ -502,9 +502,9 @@ class VisibilitySurfaceStreamChannelTest {
     @Test
     fun `exact restored and post commit baselines advance without resync`() {
         val restoredMessenger = TestMessenger(30)
-        val restoredBinding = M0aVisibilitySurfaceStreamChannel(restoredMessenger, 30)
+        val restoredBinding = VisibilitySurfaceStreamChannel(restoredMessenger, 30)
         restoredBinding.setCommittedBaseline(9, 10, 11, 12)
-        val restoredResponse = M0aPacketCodec.decodeResponse(
+        val restoredResponse = PacketCodec.decodeResponse(
             restoredMessenger.exchange(
                 request(
                     sequence = 1,
@@ -520,9 +520,9 @@ class VisibilitySurfaceStreamChannelTest {
         restoredBinding.dispose()
 
         val messenger = TestMessenger(29)
-        val binding = M0aVisibilitySurfaceStreamChannel(messenger, 29)
+        val binding = VisibilitySurfaceStreamChannel(messenger, 29)
         binding.queueStructuralTransaction(
-            M0aStructuralTransactionProducerV1.produce(
+            StructuralTransactionProducerV1.produce(
                 transactionId = 1,
                 baseGeometryRevision = 0,
                 targetGeometryRevision = 1,
@@ -534,7 +534,7 @@ class VisibilitySurfaceStreamChannelTest {
         messenger.exchange(request(1, 29))
         messenger.exchange(request(2, 29))
         messenger.exchange(request(3, 29))
-        val restored = M0aPacketCodec.decodeResponse(
+        val restored = PacketCodec.decodeResponse(
             messenger.exchange(
                 request(
                     sequence = 4,
@@ -546,7 +546,7 @@ class VisibilitySurfaceStreamChannelTest {
             ),
         )
         assertEquals(0, restored.messageKind)
-        val mismatched = M0aPacketCodec.decodeResponse(
+        val mismatched = PacketCodec.decodeResponse(
             messenger.exchange(
                 request(
                     sequence = 5,
@@ -564,9 +564,9 @@ class VisibilitySurfaceStreamChannelTest {
     @Test
     fun `style acknowledgement is checked independently from structural baseline`() {
         val messenger = TestMessenger(31)
-        val binding = M0aVisibilitySurfaceStreamChannel(messenger, 31)
+        val binding = VisibilitySurfaceStreamChannel(messenger, 31)
         binding.setCommittedBaseline(0, 0, 0, 4)
-        val adjacent = M0aPacketCodec.decodeResponse(
+        val adjacent = PacketCodec.decodeResponse(
             messenger.exchange(
                 request(
                     sequence = 1,
@@ -578,7 +578,7 @@ class VisibilitySurfaceStreamChannelTest {
         )
         assertEquals(0, adjacent.messageKind)
         assertEquals(5, adjacent.acceptedStyleRevision)
-        val empty = M0aPacketCodec.decodeResponse(
+        val empty = PacketCodec.decodeResponse(
             messenger.exchange(
                 request(
                     sequence = 2,
@@ -589,7 +589,7 @@ class VisibilitySurfaceStreamChannelTest {
         )
         assertEquals(0, empty.messageKind)
         assertEquals(5, empty.acceptedStyleRevision)
-        val mismatch = M0aPacketCodec.decodeResponse(
+        val mismatch = PacketCodec.decodeResponse(
             messenger.exchange(
                 request(
                     sequence = 3,
@@ -606,9 +606,9 @@ class VisibilitySurfaceStreamChannelTest {
     @Test
     fun `ahead acknowledgement emits packed resync required response`() {
         val messenger = TestMessenger(26)
-        val binding = M0aVisibilitySurfaceStreamChannel(messenger, 26)
+        val binding = VisibilitySurfaceStreamChannel(messenger, 26)
 
-        val response = M0aPacketCodec.decodeResponse(
+        val response = PacketCodec.decodeResponse(
             messenger.exchange(
                 request(sequence = 1, token = 12).copyAcknowledgement(
                     transaction = 1,
@@ -620,13 +620,13 @@ class VisibilitySurfaceStreamChannelTest {
         assertEquals(0, response.errorId)
         assertEquals(2L, response.nextExpectedRequestSequence)
 
-        val missingResync = M0aPacketCodec.decodeResponse(
+        val missingResync = PacketCodec.decodeResponse(
             messenger.exchange(request(sequence = 2, token = 12)),
         )
         assertEquals(255, missingResync.messageKind)
         assertEquals(34, missingResync.errorId)
 
-        val resync = M0aPacketCodec.Request(
+        val resync = PacketCodec.Request(
             requestFlags = 1 shl 2,
             streamToken = 12,
             acknowledgedTransactionId = 1,
@@ -635,19 +635,19 @@ class VisibilitySurfaceStreamChannelTest {
             nextStyleRevision = 0,
             maximumResponseBytes = 4096,
             styleRecords = emptyList(),
-            commandBytes = M0aResyncCommandV1(
-                M0aResyncPayloadV1(
+            commandBytes = ResyncCommandV1(
+                ResyncPayloadV1(
                     lastCommittedTransactionId = 1,
                     lastCommittedGeometryRevision = 0,
                     lastCommittedLineageRevision = 0,
                     failedTransactionId = 2,
-                    reason = M0aResyncReason.INVALID_TRANSACTION_ORDER,
+                    reason = ResyncReason.INVALID_TRANSACTION_ORDER,
                 ),
             ).encode(),
             requestSequence = 2,
         )
-        val recovered = M0aPacketCodec.decodeResponse(
-            messenger.exchange(M0aPacketCodec.encodeRequest(resync)),
+        val recovered = PacketCodec.decodeResponse(
+            messenger.exchange(PacketCodec.encodeRequest(resync)),
         )
         assertEquals(0, recovered.messageKind)
         assertEquals(2L, recovered.requestSequence)
@@ -657,24 +657,24 @@ class VisibilitySurfaceStreamChannelTest {
     @Test
     fun `binding reports sequence gap and malformed packet without crashing executor`() {
         val messenger = TestMessenger(18)
-        val binding = M0aVisibilitySurfaceStreamChannel(messenger, 18)
+        val binding = VisibilitySurfaceStreamChannel(messenger, 18)
 
         val gap = messenger.exchange(request(sequence = 2, token = 4))
-        val gapResponse = M0aPacketCodec.decodeResponse(gap)
+        val gapResponse = PacketCodec.decodeResponse(gap)
         assertEquals(255, gapResponse.messageKind)
         assertEquals(32, gapResponse.errorId)
         assertEquals(2L, gapResponse.requestSequence)
         assertEquals(1L, gapResponse.nextExpectedRequestSequence)
 
         val malformed = request(sequence = 1, token = 4).also { it[20] = (it[20].toInt() xor 1).toByte() }
-        val malformedResponse = M0aPacketCodec.decodeResponse(messenger.exchange(malformed))
+        val malformedResponse = PacketCodec.decodeResponse(messenger.exchange(malformed))
         assertEquals(255, malformedResponse.messageKind)
         assertEquals(6, malformedResponse.errorId)
 
         val accepted = messenger.exchange(request(sequence = 1, token = 4))
-        assertEquals(0, M0aPacketCodec.decodeResponse(accepted).messageKind)
-        assertEquals(0, M0aPacketCodec.decodeResponse(messenger.exchange(request(sequence = 2, token = 4))).messageKind)
-        val stale = M0aPacketCodec.decodeResponse(messenger.exchange(request(sequence = 1, token = 5)))
+        assertEquals(0, PacketCodec.decodeResponse(accepted).messageKind)
+        assertEquals(0, PacketCodec.decodeResponse(messenger.exchange(request(sequence = 2, token = 4))).messageKind)
+        val stale = PacketCodec.decodeResponse(messenger.exchange(request(sequence = 1, token = 5)))
         assertEquals(255, stale.messageKind)
         assertEquals(31, stale.errorId)
         binding.dispose()
@@ -683,28 +683,28 @@ class VisibilitySurfaceStreamChannelTest {
     @Test
     fun `dispose removes handler and a replacement binding can serve the view`() {
         val messenger = TestMessenger(19)
-        val firstBinding = M0aVisibilitySurfaceStreamChannel(messenger, 19)
+        val firstBinding = VisibilitySurfaceStreamChannel(messenger, 19)
         messenger.exchange(request(sequence = 1, token = 5))
         firstBinding.dispose()
         assertNull(messenger.tryExchange(request(sequence = 1, token = 5)))
 
-        val replacement = M0aVisibilitySurfaceStreamChannel(messenger, 19)
+        val replacement = VisibilitySurfaceStreamChannel(messenger, 19)
         val response = messenger.exchange(request(sequence = 1, token = 5))
-        assertEquals(0, M0aPacketCodec.decodeResponse(response).messageKind)
+        assertEquals(0, PacketCodec.decodeResponse(response).messageKind)
         replacement.dispose()
     }
 
     @Test
     fun `worker rejection returns stable binding lost error and replacement recovers`() {
         val messenger = TestMessenger(20)
-        val failedBinding = M0aVisibilitySurfaceStreamChannel(
+        val failedBinding = VisibilitySurfaceStreamChannel(
             messenger,
             20,
             workerExecutor = Executor { throw RejectedExecutionException("worker exited") },
             shutdownWorkerOnDispose = false,
         )
 
-        val failed = M0aPacketCodec.decodeResponse(
+        val failed = PacketCodec.decodeResponse(
             messenger.exchange(request(sequence = 1, token = 6)),
         )
         assertEquals(255, failed.messageKind)
@@ -712,8 +712,8 @@ class VisibilitySurfaceStreamChannelTest {
         assertEquals(1L, failed.requestSequence)
         failedBinding.dispose()
 
-        val replacement = M0aVisibilitySurfaceStreamChannel(messenger, 20)
-        val recovered = M0aPacketCodec.decodeResponse(
+        val replacement = VisibilitySurfaceStreamChannel(messenger, 20)
+        val recovered = PacketCodec.decodeResponse(
             messenger.exchange(request(sequence = 1, token = 6)),
         )
         assertEquals(0, recovered.messageKind)
@@ -723,11 +723,11 @@ class VisibilitySurfaceStreamChannelTest {
     @Test
     fun `accepted worker exception returns binding lost error and replacement recovers`() {
         val messenger = TestMessenger(24)
-        val failedBinding = M0aVisibilitySurfaceStreamChannel(
+        val failedBinding = VisibilitySurfaceStreamChannel(
             messenger,
             24,
             workerExecutor = Executor { command ->
-                Thread(command, "m0a-accepted-worker-exit").start()
+                Thread(command, "visibility-protocol-accepted-worker-exit").start()
             },
             shutdownWorkerOnDispose = false,
             beforeWorkerProcessing = {
@@ -735,7 +735,7 @@ class VisibilitySurfaceStreamChannelTest {
             },
         )
 
-        val failed = M0aPacketCodec.decodeResponse(
+        val failed = PacketCodec.decodeResponse(
             messenger.exchange(request(sequence = 1, token = 10)),
         )
         assertEquals(255, failed.messageKind)
@@ -744,8 +744,8 @@ class VisibilitySurfaceStreamChannelTest {
         assertNull(messenger.tryExchange(request(sequence = 2, token = 10)))
         failedBinding.dispose()
 
-        val replacement = M0aVisibilitySurfaceStreamChannel(messenger, 24)
-        val recovered = M0aPacketCodec.decodeResponse(
+        val replacement = VisibilitySurfaceStreamChannel(messenger, 24)
+        val recovered = PacketCodec.decodeResponse(
             messenger.exchange(request(sequence = 1, token = 10)),
         )
         assertEquals(0, recovered.messageKind)
@@ -756,7 +756,7 @@ class VisibilitySurfaceStreamChannelTest {
     fun `reply delivery failure abandons the binding after claiming the reply`() {
         val messenger = TestMessenger(25)
         val executor = HoldingExecutor()
-        val binding = M0aVisibilitySurfaceStreamChannel(
+        val binding = VisibilitySurfaceStreamChannel(
             messenger,
             25,
             workerExecutor = executor,
@@ -778,7 +778,7 @@ class VisibilitySurfaceStreamChannelTest {
     fun `queued work returns binding lost after disposal`() {
         val messenger = TestMessenger(21)
         val executor = HoldingExecutor()
-        val binding = M0aVisibilitySurfaceStreamChannel(
+        val binding = VisibilitySurfaceStreamChannel(
             messenger,
             21,
             workerExecutor = executor,
@@ -800,7 +800,7 @@ class VisibilitySurfaceStreamChannelTest {
         binding.dispose()
         executor.runQueued()
         assertTrue(completed.await(2, TimeUnit.SECONDS))
-        val decoded = M0aPacketCodec.decodeResponse(reply[0]!!)
+        val decoded = PacketCodec.decodeResponse(reply[0]!!)
         assertEquals(255, decoded.messageKind)
         assertEquals(144, decoded.errorId)
         assertEquals(1L, decoded.requestSequence)
@@ -811,7 +811,7 @@ class VisibilitySurfaceStreamChannelTest {
         val messenger = TestMessenger(22)
         val executor = HoldingExecutor()
         val scheduler = HoldingTimeoutScheduler()
-        val binding = M0aVisibilitySurfaceStreamChannel(
+        val binding = VisibilitySurfaceStreamChannel(
             messenger,
             22,
             workerExecutor = executor,
@@ -837,7 +837,7 @@ class VisibilitySurfaceStreamChannelTest {
         scheduler.fireNext()
 
         assertTrue(completed.await(2, TimeUnit.SECONDS))
-        val abandoned = M0aPacketCodec.decodeResponse(result[0]!!)
+        val abandoned = PacketCodec.decodeResponse(result[0]!!)
         assertEquals(255, abandoned.messageKind)
         assertEquals(142, abandoned.errorId)
         assertEquals(1L, abandoned.requestSequence)
@@ -848,12 +848,12 @@ class VisibilitySurfaceStreamChannelTest {
         assertEquals(1, replies.get())
 
         binding.dispose()
-        val replacement = M0aVisibilitySurfaceStreamChannel(
+        val replacement = VisibilitySurfaceStreamChannel(
             messenger,
             22,
             timeoutScheduler = HoldingTimeoutScheduler(),
         )
-        val recovered = M0aPacketCodec.decodeResponse(
+        val recovered = PacketCodec.decodeResponse(
             messenger.exchange(request(sequence = 1, token = 8)),
         )
         assertEquals(0, recovered.messageKind)
@@ -867,11 +867,11 @@ class VisibilitySurfaceStreamChannelTest {
         val started = CountDownLatch(1)
         val release = CountDownLatch(1)
         var workerThread: Thread? = null
-        val binding = M0aVisibilitySurfaceStreamChannel(
+        val binding = VisibilitySurfaceStreamChannel(
             messenger,
             23,
             workerExecutor = Executor { command ->
-                val thread = Thread(command, "m0a-active-stall")
+                val thread = Thread(command, "visibility-protocol-active-stall")
                 workerThread = thread
                 thread.start()
             },
@@ -899,7 +899,7 @@ class VisibilitySurfaceStreamChannelTest {
         assertTrue(started.await(2, TimeUnit.SECONDS))
         scheduler.fireNext()
         assertTrue(completed.await(2, TimeUnit.SECONDS))
-        val abandoned = M0aPacketCodec.decodeResponse(reply[0]!!)
+        val abandoned = PacketCodec.decodeResponse(reply[0]!!)
         assertEquals(255, abandoned.messageKind)
         assertEquals(142, abandoned.errorId)
 
@@ -913,18 +913,18 @@ class VisibilitySurfaceStreamChannelTest {
     @Test
     fun `maximum sequence requires terminal drain and replays without wrap`() {
         val messenger = TestMessenger(117)
-        val binding = M0aVisibilitySurfaceStreamChannel(
+        val binding = VisibilitySurfaceStreamChannel(
             messenger,
             117,
             initialNextExpectedSequence = Long.MAX_VALUE,
         )
 
         val ordinary = request(sequence = Long.MAX_VALUE, token = 117)
-        val rejected = M0aPacketCodec.decodeResponse(messenger.exchange(ordinary))
+        val rejected = PacketCodec.decodeResponse(messenger.exchange(ordinary))
         assertEquals(35, rejected.errorId)
         assertEquals(0, rejected.resultFlags)
         assertEquals(Long.MAX_VALUE, rejected.nextExpectedRequestSequence)
-        val detail = M0aControlCodec.decodeErrorDetail(rejected.payload)
+        val detail = ControlCodec.decodeErrorDetail(rejected.payload)
         assertEquals(96, rejected.payload.size)
         assertEquals(35, detail.errorId)
         assertEquals(5, detail.validationPhase)
@@ -937,7 +937,7 @@ class VisibilitySurfaceStreamChannelTest {
             requestFlags = 1 shl 5,
         )
         val firstBytes = messenger.exchange(terminal)
-        val first = M0aPacketCodec.decodeResponse(firstBytes)
+        val first = PacketCodec.decodeResponse(firstBytes)
         assertEquals(0, first.messageKind)
         assertEquals(5, first.resultFlags)
         assertEquals(Long.MAX_VALUE, first.nextExpectedRequestSequence)
@@ -945,7 +945,7 @@ class VisibilitySurfaceStreamChannelTest {
         assertEquals(1L, binding.transportInstrumentation.snapshot().acceptedRequests)
         assertEquals(1L, binding.transportInstrumentation.snapshot().replayedRequests)
 
-        val conflict = M0aPacketCodec.decodeResponse(
+        val conflict = PacketCodec.decodeResponse(
             messenger.exchange(
                 request(
                     sequence = Long.MAX_VALUE,
@@ -961,7 +961,7 @@ class VisibilitySurfaceStreamChannelTest {
     @Test
     fun `terminal drain on a fresh binding resets transaction cursor and preserves semantic authority`() {
         val messenger = TestMessenger(118)
-        val binding = M0aVisibilitySurfaceStreamChannel(
+        val binding = VisibilitySurfaceStreamChannel(
             messenger, 118, initialNextExpectedSequence = Long.MAX_VALUE - 2,
         )
         binding.setCommittedBaseline(
@@ -975,26 +975,26 @@ class VisibilitySurfaceStreamChannelTest {
             schemaRootRevision = 70,
             nextSurfaceIdHighWater = 80,
         )
-        binding.queueStructuralTransaction(M0aStructuralTransactionProducerV1.produce(
+        binding.queueStructuralTransaction(StructuralTransactionProducerV1.produce(
             transactionId = Long.MAX_VALUE,
             baseGeometryRevision = 10,
             targetGeometryRevision = 11,
             targetLineageRevision = 21,
             bytes = byteArrayOf(),
         ), minimumResponseProfile)
-        val begin = M0aPacketCodec.decodeResponse(messenger.exchange(request(
+        val begin = PacketCodec.decodeResponse(messenger.exchange(request(
             Long.MAX_VALUE - 2, 118, acknowledgedTransaction = Long.MAX_VALUE - 1,
             acknowledgedGeometry = 10, acknowledgedLineage = 20, styleRevision = 30,
         )))
         assertEquals(2, begin.messageKind)
         assertEquals(Long.MAX_VALUE, begin.transactionId)
-        val commit = M0aPacketCodec.decodeResponse(messenger.exchange(request(
+        val commit = PacketCodec.decodeResponse(messenger.exchange(request(
             Long.MAX_VALUE - 1, 118, acknowledgedTransaction = Long.MAX_VALUE - 1,
             acknowledgedGeometry = 10, acknowledgedLineage = 20, styleRevision = 30,
         )))
         assertEquals(4, commit.messageKind)
         assertEquals(Long.MAX_VALUE, commit.transactionId)
-        val terminal = M0aPacketCodec.decodeResponse(messenger.exchange(request(
+        val terminal = PacketCodec.decodeResponse(messenger.exchange(request(
             Long.MAX_VALUE, 118, requestFlags = 1 shl 5,
             acknowledgedTransaction = Long.MAX_VALUE,
             acknowledgedGeometry = 11, acknowledgedLineage = 21, styleRevision = 30,
@@ -1004,8 +1004,8 @@ class VisibilitySurfaceStreamChannelTest {
         binding.dispose()
 
         val freshMessenger = TestMessenger(119)
-        val fresh = M0aVisibilitySurfaceStreamChannel(freshMessenger, 119)
-        fresh.setFreshBindingBaseline(M0aCommittedBaselineV1(
+        val fresh = VisibilitySurfaceStreamChannel(freshMessenger, 119)
+        fresh.setFreshBindingBaseline(CommittedBaselineV1(
             transactionId = Long.MAX_VALUE,
             geometryRevision = 11,
             lineageRevision = 21,
@@ -1016,11 +1016,11 @@ class VisibilitySurfaceStreamChannelTest {
             schemaRootRevision = 70,
             nextSurfaceIdHighWater = 80,
         ))
-        fresh.queueStructuralTransaction(M0aStructuralTransactionProducerV1.produce(
+        fresh.queueStructuralTransaction(StructuralTransactionProducerV1.produce(
             transactionId = 1, baseGeometryRevision = 11,
             targetGeometryRevision = 12, targetLineageRevision = 22, bytes = byteArrayOf(),
         ), minimumResponseProfile)
-        val recovered = M0aPacketCodec.decodeResponse(freshMessenger.exchange(request(
+        val recovered = PacketCodec.decodeResponse(freshMessenger.exchange(request(
             1, 119, acknowledgedTransaction = 0,
             acknowledgedGeometry = 11, acknowledgedLineage = 21, styleRevision = 30,
         )))
@@ -1034,22 +1034,22 @@ class VisibilitySurfaceStreamChannelTest {
 
     @Test
     fun `VGS2 errors enforce canonical policy detail and preserved authority`() {
-        val authority = M0aPacketCodec.ErrorAuthority(
+        val authority = PacketCodec.ErrorAuthority(
             geometryRevision = 11, lineageRevision = 12, captureRevision = 13,
             coverageRevision = 14, acceptedStyleRevision = 15,
             regionManifestRevision = 16, nextSurfaceIdHighWater = 17,
             schemaRootRevision = 18,
         )
         listOf(4, 6, 8, 30, 31, 32, 34, 35, 48, 142, 144).forEach { id ->
-            val response = M0aPacketCodec.error(
+            val response = PacketCodec.error(
                 7, 9, 9, id, authority,
                 expectedValue = 9, observedValue = 9,
             )
-            val decoded = M0aPacketCodec.decodeResponse(
-                M0aPacketCodec.encodeResponse(response, 4096),
+            val decoded = PacketCodec.decodeResponse(
+                PacketCodec.encodeResponse(response, 4096),
             )
-            val detail = M0aControlCodec.decodeErrorDetail(decoded.payload)
-            val policy = M0aPacketCodec.errorPolicy(id)
+            val detail = ControlCodec.decodeErrorDetail(decoded.payload)
+            val policy = PacketCodec.errorPolicy(id)
             assertEquals(96, decoded.payload.size)
             assertEquals(id, detail.errorId)
             assertEquals(policy.resultFlags, decoded.resultFlags)
@@ -1067,40 +1067,40 @@ class VisibilitySurfaceStreamChannelTest {
             assertEquals(18L, detail.schemaRootRevision)
             assertEquals(9L, detail.expectedValue)
             assertEquals(9L, detail.observedValue)
-            assertEquals(M0aPacketCodec.nextSequenceForPolicy(id, 9, 9),
+            assertEquals(PacketCodec.nextSequenceForPolicy(id, 9, 9),
                 decoded.nextExpectedRequestSequence)
         }
-        val canonical = M0aPacketCodec.error(7, 9, 9, 35, authority)
-        val detail = M0aControlCodec.decodeErrorDetail(canonical.payload)
+        val canonical = PacketCodec.error(7, 9, 9, 35, authority)
+        val detail = ControlCodec.decodeErrorDetail(canonical.payload)
         assertThrows(IllegalArgumentException::class.java) {
-            M0aPacketCodec.encodeResponse(canonical.copy(errorId = 34), 4096)
+            PacketCodec.encodeResponse(canonical.copy(errorId = 34), 4096)
         }
         assertThrows(IllegalArgumentException::class.java) {
-            M0aPacketCodec.encodeResponse(canonical.copy(diagnostic = byteArrayOf(1)), 4096)
+            PacketCodec.encodeResponse(canonical.copy(diagnostic = byteArrayOf(1)), 4096)
         }
         assertThrows(IllegalArgumentException::class.java) {
-            M0aPacketCodec.encodeResponse(canonical.copy(payload = M0aControlCodec.encodeErrorDetail(
+            PacketCodec.encodeResponse(canonical.copy(payload = ControlCodec.encodeErrorDetail(
                 detail.copy(disposition = 1),
             )), 4096)
         }
         assertThrows(IllegalArgumentException::class.java) {
-            M0aPacketCodec.encodeResponse(canonical.copy(targetGeometryRevision = 10), 4096)
+            PacketCodec.encodeResponse(canonical.copy(targetGeometryRevision = 10), 4096)
         }
     }
 
     @Test
     fun `abandon fence query reports zero and late COMMIT has no authority`() {
-        val authority = M0aCommittedBaselineAuthority()
-        val lifecycle = M0aControlLifecycle(committedBaselineAuthority = authority)
-        val start = controlRequest(M0aControlOperation.START, 0, 91)
-        lifecycle.handle(start, M0aControlCodec.encodeRequest(start))
-        val scope = M0aCommittedBaselineScopeV1.from(start)
+        val authority = CommittedBaselineAuthority()
+        val lifecycle = controlLifecycle(CommittedBaselineAuthority = authority)
+        val start = controlRequest(ControlOperation.START, 0, 91)
+        lifecycle.handle(start, ControlCodec.encodeRequest(start))
+        val scope = CommittedBaselineScopeV1.from(start)
         val messenger = TestMessenger(91)
         val enteredPublication = CountDownLatch(1)
         val releasePublication = CountDownLatch(1)
         val executor = Executors.newSingleThreadExecutor()
-        lateinit var abandonedQuery: M0aCommitReceiptQueryV1
-        val binding = M0aVisibilitySurfaceStreamChannel(
+        lateinit var abandonedQuery: CommitReceiptQueryV1
+        val binding = VisibilitySurfaceStreamChannel(
             messenger = messenger,
             viewId = 91,
             workerExecutor = executor,
@@ -1113,7 +1113,7 @@ class VisibilitySurfaceStreamChannelTest {
                 }
             },
             onAbandonedRequest = { request, targetBaseline ->
-                abandonedQuery = M0aCommitReceiptQueryV1(
+                abandonedQuery = CommitReceiptQueryV1(
                     controlRequestId = start.controlRequestId,
                     scope = scope,
                     nativeStreamToken = ByteArray(16) { (it + 1).toByte() },
@@ -1128,7 +1128,7 @@ class VisibilitySurfaceStreamChannelTest {
             },
         )
         binding.queueStructuralTransaction(
-            M0aStructuralTransactionProducerV1.produce(
+            StructuralTransactionProducerV1.produce(
                 transactionId = 1,
                 baseGeometryRevision = 0,
                 targetGeometryRevision = 1,
@@ -1137,7 +1137,7 @@ class VisibilitySurfaceStreamChannelTest {
             ),
             minimumResponseProfile,
         )
-        val begin = M0aPacketCodec.decodeResponse(messenger.exchange(request(1, 1)))
+        val begin = PacketCodec.decodeResponse(messenger.exchange(request(1, 1)))
         assertEquals(2, begin.messageKind)
         val commitBytes = arrayOfNulls<ByteArray>(1)
         val commitCompleted = CountDownLatch(1)
@@ -1159,43 +1159,43 @@ class VisibilitySurfaceStreamChannelTest {
         executor.shutdown()
         assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS))
 
-        val terminal = M0aPacketCodec.decodeResponse(commitBytes[0]!!)
+        val terminal = PacketCodec.decodeResponse(commitBytes[0]!!)
         assertEquals(142, terminal.errorId)
-        assertEquals(M0aCommittedBaselineV1.ZERO, authority.snapshot(scope))
-        assertEquals(M0aCommittedBaselineV1.ZERO, lifecycle.committedBaseline())
+        assertEquals(CommittedBaselineV1.ZERO, authority.snapshot(scope))
+        assertEquals(CommittedBaselineV1.ZERO, lifecycle.committedBaseline())
         val receipt = checkNotNull(authority.queryReceipt(abandonedQuery))
         assertEquals(false, receipt.committed)
-        assertEquals(M0aCommittedBaselineV1.ZERO, receipt.baseline)
+        assertEquals(CommittedBaselineV1.ZERO, receipt.baseline)
         assertEquals(receipt, authority.queryReceipt(abandonedQuery))
 
-        val recoveredLifecycle = M0aControlLifecycle(committedBaselineAuthority = authority)
-        val recoveredStart = controlRequest(M0aControlOperation.START, 0, 92)
-        val recoveredResponse = M0aControlCodec.decodeResponse(
+        val recoveredLifecycle = controlLifecycle(CommittedBaselineAuthority = authority)
+        val recoveredStart = controlRequest(ControlOperation.START, 0, 92)
+        val recoveredResponse = ControlCodec.decodeResponse(
             recoveredLifecycle.handle(
                 recoveredStart,
-                M0aControlCodec.encodeRequest(recoveredStart),
+                ControlCodec.encodeRequest(recoveredStart),
             ),
         )
         val recoveredResult = ByteBuffer.wrap(recoveredResponse.payload).order(ByteOrder.LITTLE_ENDIAN)
         assertEquals(0L, recoveredResult.getLong(96))
         assertEquals(0L, recoveredResult.getLong(104))
         assertEquals(0L, recoveredResponse.nativeTransactionId)
-        assertEquals(M0aCommittedBaselineV1.ZERO, recoveredLifecycle.committedBaseline())
+        assertEquals(CommittedBaselineV1.ZERO, recoveredLifecycle.committedBaseline())
     }
 
     @Test
     fun `COMMIT publication claims its reply before a racing abandon`() {
-        val authority = M0aCommittedBaselineAuthority()
-        val lifecycle = M0aControlLifecycle(committedBaselineAuthority = authority)
-        val start = controlRequest(M0aControlOperation.START, 0, 93)
-        lifecycle.handle(start, M0aControlCodec.encodeRequest(start))
-        val scope = M0aCommittedBaselineScopeV1.from(start)
+        val authority = CommittedBaselineAuthority()
+        val lifecycle = controlLifecycle(CommittedBaselineAuthority = authority)
+        val start = controlRequest(ControlOperation.START, 0, 93)
+        lifecycle.handle(start, ControlCodec.encodeRequest(start))
+        val scope = CommittedBaselineScopeV1.from(start)
         val messenger = TestMessenger(93)
         val enteredFence = CountDownLatch(1)
         val releaseFence = CountDownLatch(1)
         val abandonStarted = CountDownLatch(1)
         val executor = Executors.newSingleThreadExecutor()
-        val binding = M0aVisibilitySurfaceStreamChannel(
+        val binding = VisibilitySurfaceStreamChannel(
             messenger = messenger,
             viewId = 93,
             workerExecutor = executor,
@@ -1207,7 +1207,7 @@ class VisibilitySurfaceStreamChannelTest {
             },
         )
         binding.queueStructuralTransaction(
-            M0aStructuralTransactionProducerV1.produce(
+            StructuralTransactionProducerV1.produce(
                 transactionId = 1,
                 baseGeometryRevision = 0,
                 targetGeometryRevision = 1,
@@ -1216,7 +1216,7 @@ class VisibilitySurfaceStreamChannelTest {
             ),
             minimumResponseProfile,
         )
-        assertEquals(2, M0aPacketCodec.decodeResponse(messenger.exchange(request(1, 1))).messageKind)
+        assertEquals(2, PacketCodec.decodeResponse(messenger.exchange(request(1, 1))).messageKind)
         val commitBytes = arrayOfNulls<ByteArray>(1)
         val commitCompleted = CountDownLatch(1)
         messenger.send(
@@ -1240,7 +1240,7 @@ class VisibilitySurfaceStreamChannelTest {
         abandonThread.join(2_000)
         assertTrue(!abandonThread.isAlive)
 
-        val commit = M0aPacketCodec.decodeResponse(commitBytes[0]!!)
+        val commit = PacketCodec.decodeResponse(commitBytes[0]!!)
         assertEquals(4, commit.messageKind)
         assertEquals(0, commit.errorId)
         assertEquals(0L, authority.snapshot(scope).transactionId)
@@ -1251,24 +1251,24 @@ class VisibilitySurfaceStreamChannelTest {
 
     @Test
     fun `unacknowledged COMMIT deadline retains no authority and no duplicate effect`() {
-        val authority = M0aCommittedBaselineAuthority()
-        val lifecycle = M0aControlLifecycle(
-            committedBaselineAuthority = authority,
+        val authority = CommittedBaselineAuthority()
+        val lifecycle = controlLifecycle(
+            CommittedBaselineAuthority = authority,
         )
-        val start = controlRequest(M0aControlOperation.START, 0, 97)
-        val startResponse = M0aControlCodec.decodeResponse(
-            lifecycle.handle(start, M0aControlCodec.encodeRequest(start)),
+        val start = controlRequest(ControlOperation.START, 0, 97)
+        val startResponse = ControlCodec.decodeResponse(
+            lifecycle.handle(start, ControlCodec.encodeRequest(start)),
         )
         val streamToken = startResponse.streamToken
-        val scope = M0aCommittedBaselineScopeV1.from(start)
-        val expectedBaseline = M0aCommittedBaselineV1(1, 1, 1, 0)
+        val scope = CommittedBaselineScopeV1.from(start)
+        val expectedBaseline = CommittedBaselineV1(1, 1, 1, 0)
         val messenger = TestMessenger(97)
         val executor = Executors.newSingleThreadExecutor()
         val scheduler = HoldingTimeoutScheduler()
         val enteredAcknowledgement = CountDownLatch(1)
         val releaseAcknowledgement = CountDownLatch(1)
         val commitPublications = AtomicInteger(0)
-        val binding = M0aVisibilitySurfaceStreamChannel(
+        val binding = VisibilitySurfaceStreamChannel(
             messenger = messenger,
             viewId = 97,
             workerExecutor = executor,
@@ -1287,7 +1287,7 @@ class VisibilitySurfaceStreamChannelTest {
             },
         )
         binding.queueStructuralTransaction(
-            M0aStructuralTransactionProducerV1.produce(
+            StructuralTransactionProducerV1.produce(
                 transactionId = 1,
                 baseGeometryRevision = 0,
                 targetGeometryRevision = 1,
@@ -1297,13 +1297,13 @@ class VisibilitySurfaceStreamChannelTest {
             minimumResponseProfile,
         )
 
-        assertEquals(2, M0aPacketCodec.decodeResponse(
+        assertEquals(2, PacketCodec.decodeResponse(
             messenger.exchange(request(1, streamToken)),
         ).messageKind)
-        assertEquals(4, M0aPacketCodec.decodeResponse(
+        assertEquals(4, PacketCodec.decodeResponse(
             messenger.exchange(request(2, streamToken)),
         ).messageKind)
-        assertEquals(M0aCommittedBaselineV1.ZERO, authority.snapshot(scope))
+        assertEquals(CommittedBaselineV1.ZERO, authority.snapshot(scope))
         assertEquals(1, commitPublications.get())
 
         val acknowledgementReply = arrayOfNulls<ByteArray>(1)
@@ -1328,28 +1328,28 @@ class VisibilitySurfaceStreamChannelTest {
         assertTrue(enteredAcknowledgement.await(2, TimeUnit.SECONDS))
         scheduler.fireNext()
         assertTrue(acknowledgementCompleted.await(2, TimeUnit.SECONDS))
-        val deadline = M0aPacketCodec.decodeResponse(acknowledgementReply[0]!!)
+        val deadline = PacketCodec.decodeResponse(acknowledgementReply[0]!!)
         assertEquals(142, deadline.errorId)
-        assertEquals(M0aCommittedBaselineV1.ZERO, authority.snapshot(scope))
+        assertEquals(CommittedBaselineV1.ZERO, authority.snapshot(scope))
         releaseAcknowledgement.countDown()
         executor.shutdown()
         assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS))
         binding.dispose()
 
-        val freshLifecycle = M0aControlLifecycle(
-            committedBaselineAuthority = authority,
+        val freshLifecycle = controlLifecycle(
+            CommittedBaselineAuthority = authority,
         )
-        val freshResponse = M0aControlCodec.decodeResponse(
+        val freshResponse = ControlCodec.decodeResponse(
             freshLifecycle.handle(
                 controlRequest(
-                    M0aControlOperation.START,
+                    ControlOperation.START,
                     0,
                     98,
                     payload = restoredPayload(),
                 ),
-                M0aControlCodec.encodeRequest(
+                ControlCodec.encodeRequest(
                     controlRequest(
-                        M0aControlOperation.START,
+                        ControlOperation.START,
                         0,
                         98,
                         payload = restoredPayload(),
@@ -1359,19 +1359,19 @@ class VisibilitySurfaceStreamChannelTest {
         )
         assertEquals(0, freshResponse.outcome)
         assertEquals(1, commitPublications.get())
-        assertEquals(M0aCommittedBaselineV1.ZERO, authority.snapshot(scope))
+        assertEquals(CommittedBaselineV1.ZERO, authority.snapshot(scope))
     }
 
     @Test
     fun `receipt query distinguishes abandon winner without mutating baseline`() {
-        val authority = M0aCommittedBaselineAuthority()
-        val scope = M0aCommittedBaselineScopeV1(
+        val authority = CommittedBaselineAuthority()
+        val scope = CommittedBaselineScopeV1(
             sessionId = uuid(94),
             captureGroupId = uuid(95),
             sessionGeneration = 3,
             groupGeneration = 4,
         )
-        val query = M0aCommitReceiptQueryV1(
+        val query = CommitReceiptQueryV1(
             controlRequestId = uuid(96),
             scope = scope,
             nativeStreamToken = ByteArray(16) { (it + 1).toByte() },
@@ -1388,7 +1388,7 @@ class VisibilitySurfaceStreamChannelTest {
         val first = checkNotNull(authority.queryReceipt(query))
         val replay = checkNotNull(authority.queryReceipt(query))
         assertEquals(false, first.committed)
-        assertEquals(M0aCommittedBaselineV1.ZERO, first.baseline)
+        assertEquals(CommittedBaselineV1.ZERO, first.baseline)
         assertEquals(first, replay)
         assertEquals(before, authority.snapshot(scope))
 
@@ -1405,10 +1405,10 @@ class VisibilitySurfaceStreamChannelTest {
         acknowledgedLineage: Long = 0,
         styleRevision: Long = 0,
         styleRecords: List<ByteArray> = emptyList(),
-        maximumResponseBytes: Int = M0aPacketCodec.responseMinimumBytes,
+        maximumResponseBytes: Int = PacketCodec.responseMinimumBytes,
     ): ByteArray =
-        M0aPacketCodec.encodeRequest(
-            M0aPacketCodec.Request(
+        PacketCodec.encodeRequest(
+            PacketCodec.Request(
                 requestFlags = requestFlags,
                 streamToken = token,
                 acknowledgedTransactionId = acknowledgedTransaction,
@@ -1423,11 +1423,11 @@ class VisibilitySurfaceStreamChannelTest {
         )
 
     private fun controlRequest(
-        operation: M0aControlOperation,
+        operation: ControlOperation,
         streamToken: Long,
         seed: Int,
         payload: ByteArray? = null,
-    ): M0aControlRequest = M0aControlRequest(
+    ): ControlRequest = ControlRequest(
         operation = operation,
         flags = 0,
         controlRequestId = uuid(seed),
@@ -1437,26 +1437,26 @@ class VisibilitySurfaceStreamChannelTest {
         groupGeneration = 1,
         coverageEpoch = 1,
         streamToken = streamToken,
-        payload = payload ?: if (operation == M0aControlOperation.START) {
-            M0aStartRequestCodecV2.defaultPayload()
+        payload = payload ?: if (operation == ControlOperation.START) {
+            StartRequestCodecV2.defaultPayload()
         } else byteArrayOf(),
     )
 
     private fun restoredPayload(
         geometry: Long = 0,
         lineage: Long = 0,
-    ): ByteArray = M0aStartRequestCodecV2.defaultPayload().also { bytes ->
+    ): ByteArray = StartRequestCodecV2.defaultPayload().also { bytes ->
         val data = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
         data.put(7, 1)
         data.putLong(64, geometry)
         data.putLong(72, lineage)
     }
 
-    private fun uuid(seed: Int): M0aUuid {
+    private fun uuid(seed: Int): Uuid {
         val bytes = ByteArray(16) { (seed + it).toByte() }
         bytes[6] = 0x40
         bytes[8] = 0x80.toByte()
-        return M0aUuid(bytes)
+        return Uuid(bytes)
     }
 
     private fun ByteArray.copyAcknowledgement(transaction: Long): ByteArray {
@@ -1486,7 +1486,7 @@ class VisibilitySurfaceStreamChannelTest {
 }
 
 private val minimumResponseProfile =
-    M0aTransactionResponseProfileV1(M0aPacketCodec.responseMinimumBytes)
+    TransactionResponseProfileV1(PacketCodec.responseMinimumBytes)
 
 private class HoldingExecutor : Executor {
     private val queued = ArrayDeque<Runnable>()
@@ -1502,12 +1502,12 @@ private class HoldingExecutor : Executor {
     fun runNext() = queued.removeFirst().run()
 }
 
-private class HoldingTimeoutScheduler : M0aTimeoutScheduler {
+private class HoldingTimeoutScheduler : TimeoutScheduler {
     private var pending: (() -> Unit)? = null
 
-    override fun schedule(delayMillis: Long, task: () -> Unit): M0aTimeoutHandle {
+    override fun schedule(delayMillis: Long, task: () -> Unit): TimeoutHandle {
         pending = task
-        return M0aTimeoutHandle { pending = null }
+        return TimeoutHandle { pending = null }
     }
 
     override fun shutdown() {

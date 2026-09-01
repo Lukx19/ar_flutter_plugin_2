@@ -9,18 +9,18 @@ import org.junit.Test
 class CompactCanonicalStoreFaultTest {
     @Test
     fun `quota refusal writes nothing and leaves legacy readable`() {
-        val directory = Files.createTempDirectory("m3-quota-refusal").toFile()
+        val directory = Files.createTempDirectory("canonical-surface-quota-refusal").toFile()
         try {
-            val group = M3SurfaceGroup("quota-refusal")
+            val group = SurfaceGroup("quota-refusal")
             val owner =
-                (M3SurfaceOwnership.open(group, directory) as M3SurfaceOwnershipOpenResult.Opened)
+                (SurfaceOwnership.open(group, directory) as SurfaceOwnershipOpenResult.Opened)
                     .ownership
             owner.apply(
-                M3SurfaceOwnershipCommand(
+                SurfaceOwnershipCommand(
                     "seed",
                     listOf(
-                        M3SurfaceCandidate(
-                            voxel = M3Voxel(0, 0, 0),
+                        SurfaceCandidate(
+                            voxel = Voxel(0, 0, 0),
                             normalOctX = 0,
                             normalOctY = 0,
                             normalConfidence = 192,
@@ -30,13 +30,13 @@ class CompactCanonicalStoreFaultTest {
             )
             owner.close()
             val result =
-                M3CompactCanonicalStore.prepareV6SiblingMigration(
+                CompactCanonicalStore.prepareV6SiblingMigration(
                     group,
                     directory,
-                    object : M3CanonicalStorageBudget {
+                    object : CanonicalStorageBudget {
                         override fun reserve(bytes: Long): Any? = null
                         override fun reserveCandidateExclusive(staging: File, target: File, fileBytes: Map<String, Long>, maximumPhysicalBytes: Long) =
-                            M3CanonicalCandidateReservation.QuotaRefused
+                            CanonicalCandidateReservation.QuotaRefused
 
                         override fun commit(token: Any, actualBytes: Long) =
                             error("must not commit")
@@ -47,14 +47,14 @@ class CompactCanonicalStoreFaultTest {
                     },
                 )
             assertEquals(
-                M3CompactCanonicalRefusal.QUOTA_REFUSED,
-                (result as M3CompactCanonicalMigrationResult.Refused).reason,
+                CompactCanonicalRefusal.QUOTA_REFUSED,
+                (result as CompactCanonicalMigrationResult.Refused).reason,
             )
             assertTrue(
-                directory.listFiles().orEmpty().none { it.name.startsWith("m3-canonical-v6-") }
+                directory.listFiles().orEmpty().none { it.name.startsWith("canonical-surface-canonical-v6-") }
             )
             assertTrue(
-                M3SurfaceOwnership.open(group, directory) is M3SurfaceOwnershipOpenResult.Opened
+                SurfaceOwnership.open(group, directory) is SurfaceOwnershipOpenResult.Opened
             )
         } finally {
             directory.deleteRecursively()
@@ -63,43 +63,43 @@ class CompactCanonicalStoreFaultTest {
 
     @Test
     fun `wrong root cursor and close fail without sink publication`() {
-        val directory = Files.createTempDirectory("m3-cursor-close").toFile()
+        val directory = Files.createTempDirectory("canonical-surface-cursor-close").toFile()
         try {
-            val group = M3SurfaceGroup("cursor-close")
+            val group = SurfaceGroup("cursor-close")
             val owner =
-                (M3SurfaceOwnership.open(group, directory) as M3SurfaceOwnershipOpenResult.Opened)
+                (SurfaceOwnership.open(group, directory) as SurfaceOwnershipOpenResult.Opened)
                     .ownership
             val accepted =
                 owner.apply(
-                    M3SurfaceOwnershipCommand(
+                    SurfaceOwnershipCommand(
                         "seed",
                         listOf(
-                            M3SurfaceCandidate(
-                                voxel = M3Voxel(0, 0, 0),
+                            SurfaceCandidate(
+                                voxel = Voxel(0, 0, 0),
                                 normalOctX = 0,
                                 normalOctY = 0,
                                 normalConfidence = 192,
                             )
                         ),
                     )
-                ) as M3SurfaceOwnershipResult.Accepted
+                ) as SurfaceOwnershipResult.Accepted
             owner.close()
             val result =
-                M3CompactCanonicalStore.prepareV6SiblingMigration(
+                CompactCanonicalStore.prepareV6SiblingMigration(
                     group,
                     directory,
                     acceptingBudget(),
-                ) as M3CompactCanonicalMigrationResult.Prepared
+                ) as CompactCanonicalMigrationResult.Prepared
             val store =
-                (M3CompactCanonicalStore.openV6(group, directory, acceptingBudget())
-                        as M3CompactCanonicalOpenResult.Opened)
+                (CompactCanonicalStore.openV6(group, directory, acceptingBudget())
+                        as CompactCanonicalOpenResult.Opened)
                     .store
             var calls = 0
             val stale =
                 store.visitSourceSupport(
                     accepted.owners.single().id,
-                    M3SourceSupportCursor(
-                        M3CanonicalReceiptBytes(ByteArray(32)),
+                    SourceSupportCursor(
+                        CanonicalReceiptBytes(ByteArray(32)),
                         accepted.owners.single().id,
                         0,
                         0,
@@ -109,8 +109,8 @@ class CompactCanonicalStoreFaultTest {
                     true
                 }
             assertEquals(
-                M3CompactCanonicalRefusal.STALE_CURSOR,
-                (stale as M3SourceSupportRead.Refused).reason,
+                CompactCanonicalRefusal.STALE_CURSOR,
+                (stale as SourceSupportRead.Refused).reason,
             )
             assertEquals(0, calls)
             store.close()
@@ -120,8 +120,8 @@ class CompactCanonicalStoreFaultTest {
                     true
                 }
             assertEquals(
-                M3CompactCanonicalRefusal.CLOSED,
-                (closed as M3SourceSupportRead.Refused).reason,
+                CompactCanonicalRefusal.CLOSED,
+                (closed as SourceSupportRead.Refused).reason,
             )
             assertEquals(0, calls)
             assertTrue(result.storage.allocatedBytes > 0)
@@ -133,50 +133,50 @@ class CompactCanonicalStoreFaultTest {
     @Test
     fun `open rejects every corrupted v6 authority file and reads revalidate pages`() {
         listOf("root.v6", "resident.v6", "directory.v6", "sources.v6.pages").forEach { damaged ->
-            val directory = Files.createTempDirectory("m3-corrupt-$damaged").toFile()
+            val directory = Files.createTempDirectory("canonical-surface-corrupt-$damaged").toFile()
             try {
-                val group = M3SurfaceGroup("corrupt-$damaged")
+                val group = SurfaceGroup("corrupt-$damaged")
                 val owner =
-                    (M3SurfaceOwnership.open(group, directory)
-                            as M3SurfaceOwnershipOpenResult.Opened)
+                    (SurfaceOwnership.open(group, directory)
+                            as SurfaceOwnershipOpenResult.Opened)
                         .ownership
                 val accepted =
                     owner.apply(
-                        M3SurfaceOwnershipCommand(
+                        SurfaceOwnershipCommand(
                             "seed",
                             listOf(
-                                M3SurfaceCandidate(
-                                    voxel = M3Voxel(0, 0, 0),
+                                SurfaceCandidate(
+                                    voxel = Voxel(0, 0, 0),
                                     normalOctX = 0,
                                     normalOctY = 0,
                                     normalConfidence = 192,
                                 )
                             ),
                         )
-                    ) as M3SurfaceOwnershipResult.Accepted
+                    ) as SurfaceOwnershipResult.Accepted
                 owner.close()
                 val prepared =
-                    M3CompactCanonicalStore.prepareV6SiblingMigration(
+                    CompactCanonicalStore.prepareV6SiblingMigration(
                         group,
                         directory,
                         acceptingBudget(),
-                    ) as M3CompactCanonicalMigrationResult.Prepared
+                    ) as CompactCanonicalMigrationResult.Prepared
                 if (damaged == "sources.v6.pages") {
                     val store =
-                        (M3CompactCanonicalStore.openV6(group, directory, acceptingBudget())
-                                as M3CompactCanonicalOpenResult.Opened)
+                        (CompactCanonicalStore.openV6(group, directory, acceptingBudget())
+                                as CompactCanonicalOpenResult.Opened)
                             .store
                     flip(prepared.candidateDirectory.resolve(damaged))
                     val read = store.readSourceById(accepted.owners.single().id)
                     assertEquals(
-                        M3CompactCanonicalRefusal.CORRUPT,
-                        (read as M3CanonicalPageRead.Refused).reason,
+                        CompactCanonicalRefusal.CORRUPT,
+                        (read as CanonicalPageRead.Refused).reason,
                     )
                 } else {
                     flip(prepared.candidateDirectory.resolve(damaged))
                     assertTrue(
-                        M3CompactCanonicalStore.openV6(group, directory, acceptingBudget())
-                            is M3CompactCanonicalOpenResult.Refused
+                        CompactCanonicalStore.openV6(group, directory, acceptingBudget())
+                            is CompactCanonicalOpenResult.Refused
                     )
                 }
             } finally {
@@ -186,10 +186,10 @@ class CompactCanonicalStoreFaultTest {
     }
 
     private fun acceptingBudget() =
-        object : M3CanonicalStorageBudget {
+        object : CanonicalStorageBudget {
             override fun reserve(bytes: Long): Any = bytes
             override fun reserveCandidateExclusive(staging: File, target: File, fileBytes: Map<String, Long>, maximumPhysicalBytes: Long) =
-                M3CanonicalCandidateReservation.QuotaRefused
+                CanonicalCandidateReservation.QuotaRefused
 
             override fun commit(token: Any, actualBytes: Long) = Unit
 

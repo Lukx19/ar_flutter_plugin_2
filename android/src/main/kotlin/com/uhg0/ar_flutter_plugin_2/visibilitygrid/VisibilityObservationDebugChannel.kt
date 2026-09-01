@@ -36,7 +36,7 @@ internal class VisibilityObservationDebugGate {
     }
 }
 
-/** Debug-only scalar/synthetic seam used by the exact M2 emulator selector. */
+/** Debug-only scalar/synthetic seam used by the exact capture ingress emulator selector. */
 internal class VisibilityObservationDebugChannel(
     messenger: BinaryMessenger,
     viewId: Int,

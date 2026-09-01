@@ -232,7 +232,7 @@ internal interface VisibilityObservationMapper : AutoCloseable {
 /**
  * Proof that reduced-rate map intake cannot interfere with capture.
  *
- * M2 cannot establish capture ownership (#61), so production uses the
+ * capture ingress cannot establish capture ownership (#61), so production uses the
  * conservative false implementation until that owner supplies this predicate.
  */
 internal fun interface VisibilityCaptureSafePredicate {

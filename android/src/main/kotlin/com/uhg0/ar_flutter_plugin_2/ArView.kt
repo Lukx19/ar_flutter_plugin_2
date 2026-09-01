@@ -39,15 +39,15 @@ import com.uhg0.ar_flutter_plugin_2.sceneview.resolveNodeUri
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridMethodChannel
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridRuntimeCapabilities
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridV2Binding
-import com.uhg0.ar_flutter_plugin_2.visibilitygrid.M3VisibilityGridIntegration
-import com.uhg0.ar_flutter_plugin_2.visibilitygrid.M3NativeRendererProjection
-import com.uhg0.ar_flutter_plugin_2.visibilitygrid.M3CanonicalRuntimeResources
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridIntegration
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.NativeRendererProjection
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.CanonicalRuntimeResources
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.AndroidVisibilityGridRuntime
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.ArCoreVisibilityObservationSource
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityObservationDebugChannel
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityObservationDebugGate
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityCaptureSafePredicate
-import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineAuthority
+import com.uhg0.ar_flutter_plugin_2.proposal08.CommittedBaselineAuthority
 import com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraCapabilityQuerier
 import io.flutter.FlutterInjector
 import io.flutter.plugin.common.BinaryMessenger
@@ -71,7 +71,7 @@ internal class ArView(
     id: Int,
     initialSessionFeatures: Set<Session.Feature> = emptySet(),
     requestedRearCameraId: String? = null,
-    m0aCommittedBaselineAuthority: M0aCommittedBaselineAuthority,
+    CommittedBaselineAuthority: CommittedBaselineAuthority,
 ) : PlatformView {
     private val root = FrameLayout(context)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -130,27 +130,27 @@ internal class ArView(
     private val visibilityGridV2Binding = VisibilityGridV2Binding(
         messenger = messenger,
         viewId = id,
-        committedBaselineAuthority = m0aCommittedBaselineAuthority,
+        CommittedBaselineAuthority = CommittedBaselineAuthority,
         isDebuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0,
     )
     private val visibilityObservationDebugGate = VisibilityObservationDebugGate()
     // #101 owns this native proof only.  It remains false until an internal
     // V2 capture owner binds one exact durable attempt/cut; Dart cannot enable it.
     private val captureSafetySignalV2 = CaptureSafetySignalV2()
-    // One physical accounting root is shared across successive group-owned M3 resources.
+    // One physical accounting root is shared across successive group-owned canonical surface resources.
     // Each resource borrows this coordinator and releases its owner before a replacement opens.
     private val visibilityM3BudgetCoordinator = StorageBudgetCoordinatorV2(
-        File(context.filesDir, "visibility-grid-m3-runtime"),
+        File(context.filesDir, "visibility-grid-canonical-surface-runtime"),
         StorageBudgetPolicyV2(64L * 1024L * 1024L, 0),
     )
-    private val visibilityObservationMappingAdmission = M3VisibilityGridIntegration(
+    private val visibilityObservationMappingAdmission = VisibilityGridIntegration(
         binding = visibilityGridV2Binding,
         ownership = visibilityGridV2Binding::currentObservationOwnership,
         directory = context.filesDir,
         resourcesForGroup = { group ->
-            M3CanonicalRuntimeResources.open(context.filesDir, group, visibilityM3BudgetCoordinator)
+            CanonicalRuntimeResources.open(context.filesDir, group, visibilityM3BudgetCoordinator)
         },
-        renderer = M3NativeRendererProjection(sceneHost::updateCoverageRenderer),
+        renderer = NativeRendererProjection(sceneHost::updateCoverageRenderer),
         beforeAdmission = visibilityObservationDebugGate::awaitIfArmed,
     )
     private val visibilityObservationRuntime = AndroidVisibilityGridRuntime(

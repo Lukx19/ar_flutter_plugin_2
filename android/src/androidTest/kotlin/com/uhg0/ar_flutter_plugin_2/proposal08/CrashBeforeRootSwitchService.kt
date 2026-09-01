@@ -1,6 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.proposal08
 
-import com.uhg0.ar_flutter_plugin_2.m0.*
+import com.uhg0.ar_flutter_plugin_2.proposal08.*
 
 import android.app.Service
 import android.content.Intent
@@ -19,22 +19,22 @@ class CrashBeforeRootSwitchService : Service() {
             output.write(Process.myPid().toString().toByteArray(Charsets.UTF_8))
             output.fd.sync()
         }
-        M0Schema5DurableRegionCutStore(
+        Schema5DurableRegionCutStore(
             directory = directory,
             initialCuts = listOf(cut(1, 0), cut(1, 1)),
-            directorySync = M0DirectorySync.strictAndroid,
+            directorySync = DirectorySync.strictAndroid,
             onBeforeProcessDeathCut = { Process.killProcess(Process.myPid()) },
         ).publish(
             replacement = listOf(cut(2, 0), cut(2, 1)),
-            fault = M0DurableCutFaultPoint.processDeathBeforeRootSwitch,
+            fault = DurableCutFaultPoint.processDeathBeforeRootSwitch,
         )
         return START_NOT_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun cut(generation: Long, coordinate: Int) = M0RegionPairCut(
-        region = M0RegionCoordinate(coordinate, 0, 0),
+    private fun cut(generation: Long, coordinate: Int) = RegionPairCut(
+        region = RegionCoordinate(coordinate, 0, 0),
         generation = generation,
         geometryRevision = generation,
         coverageRevision = generation,

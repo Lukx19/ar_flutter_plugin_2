@@ -1,6 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.proposal08
 
-import com.uhg0.ar_flutter_plugin_2.m0.*
+import com.uhg0.ar_flutter_plugin_2.proposal08.*
 
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -18,7 +18,7 @@ class FeatureFusionVectorTest {
         val root = fixture()
         val observations = root.getValue("observations").jsonArray.map { value ->
             val row = value.jsonObject
-            M0VoxelObservation(
+            VoxelObservation(
                 x = row.int("x"),
                 y = row.int("y"),
                 z = row.int("z"),
@@ -29,9 +29,9 @@ class FeatureFusionVectorTest {
         val expected = root.getValue("expected").jsonObject
 
         listOf(
-            "A" to M0SignedOccupancyKernel(),
-            "B" to M0PlanarConsolidationKernel(),
-            "C" to M0BoundedTsdfKernel(),
+            "A" to SignedOccupancyKernel(),
+            "B" to PlanarConsolidationKernel(),
+            "C" to BoundedTsdfKernel(),
         ).forEach { (candidate, kernel) ->
             val actual = kernel.fuse(observations)
             val rows = expected.getValue(candidate).jsonArray
@@ -41,7 +41,7 @@ class FeatureFusionVectorTest {
                 val row = value.jsonObject
                 val surface = actual.surfaces[index]
                 assertEquals(candidate, row.long("surfaceId"), surface.surfaceId)
-                assertEquals(candidate, M0VoxelKey(row.int("x"), row.int("y"), row.int("z")), surface.key)
+                assertEquals(candidate, VoxelKey(row.int("x"), row.int("y"), row.int("z")), surface.key)
                 assertEquals(candidate, row.int("weight"), surface.weight)
                 assertEquals(candidate, row.int("normalOctant"), surface.normalOctant)
                 assertEquals(candidate, row.int("extentU"), surface.extentU)
@@ -59,7 +59,7 @@ class FeatureFusionVectorTest {
 
     private fun fixture(): JsonObject =
         Json.parseToJsonElement(
-            requireNotNull(javaClass.classLoader?.getResourceAsStream("m0b_fusion_vector_v1.json"))
+            requireNotNull(javaClass.classLoader?.getResourceAsStream("feature_fusion_fusion_vector_v1.json"))
                 .bufferedReader()
                 .use { it.readText() },
         ).jsonObject

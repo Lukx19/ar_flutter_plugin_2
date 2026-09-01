@@ -342,12 +342,12 @@ class StorageBudgetCoordinatorV2(
     }
 
     /**
-     * Deletes one exact committed M3 private generation before releasing its charge. A durable
+     * Deletes one exact committed canonical surface private generation before releasing its charge. A durable
      * marker lets recovery finish either half without ever exposing an uncharged tree.
      */
     fun reclaimCommittedCandidate(candidate: File): Long = withAuthority {
         val candidatePath = candidateRelativePath(candidate)
-        require(candidate.name.matches(COMMITTED_M3_CANDIDATE))
+        require(candidate.name.matches(COMMITTED_CANONICAL_SURFACE_CANDIDATE))
         val actual = files.allocatedTreeBytes(candidate)
         require(actual in 1..committed)
         val previous = committed
@@ -416,7 +416,7 @@ class StorageBudgetCoordinatorV2(
             .sortedBy(File::getName)
             .forEach { marker ->
                 val lines = files.readLines(marker)
-                require(lines.size == 3 && lines[0].matches(COMMITTED_M3_CANDIDATE_PATH)) { "Corrupt committed reclaim" }
+                require(lines.size == 3 && lines[0].matches(COMMITTED_CANONICAL_SURFACE_CANDIDATE_PATH)) { "Corrupt committed reclaim" }
                 val bytes = lines[1].toLongOrNull() ?: error("Corrupt committed reclaim bytes")
                 val previous = lines[2].toLongOrNull() ?: error("Corrupt committed reclaim revision")
                 require(bytes > 0 && previous >= bytes && committed in setOf(previous, previous - bytes))
@@ -617,16 +617,16 @@ class StorageBudgetCoordinatorV2(
         private val CANDIDATE_PATH = Regex("(?:[0-9a-f]{32}/)?[A-Za-z0-9._-]{1,160}")
         private val POINTER_PUBLICATION = Regex("[0-9a-f]{64}")
         private val RECLAIM_ID = Regex("[0-9a-f]{64}")
-        private val COMMITTED_M3_CANDIDATE = Regex(
-            "(?:m3-cow-command-[0-9a-f]{64}|m3-canonical-v6-[0-9a-f]{64}\\.intent)",
+        private val COMMITTED_CANONICAL_SURFACE_CANDIDATE = Regex(
+            "(?:canonical-surface-cow-command-[0-9a-f]{64}|canonical-surface-canonical-v6-[0-9a-f]{64}\\.intent)",
         )
-        private val COMMITTED_M3_CANDIDATE_PATH = Regex(
-            "(?:[0-9a-f]{32}/)?(?:m3-cow-command-[0-9a-f]{64}|m3-canonical-v6-[0-9a-f]{64}\\.intent)",
+        private val COMMITTED_CANONICAL_SURFACE_CANDIDATE_PATH = Regex(
+            "(?:[0-9a-f]{32}/)?(?:canonical-surface-cow-command-[0-9a-f]{64}|canonical-surface-canonical-v6-[0-9a-f]{64}\\.intent)",
         )
         /** Exact private-candidate namespaces whose uncharged trees startup recovery may delete. */
         private val STAGING = Regex(
-            "(?:m3-canonical-v6-[0-9a-f]{64}\\.staging-[A-Za-z0-9._-]{1,64}|" +
-                "\\.m3-cow-command-[0-9a-f]{64}\\.staging)",
+            "(?:canonical-surface-canonical-v6-[0-9a-f]{64}\\.staging-[A-Za-z0-9._-]{1,64}|" +
+                "\\.canonical-surface-cow-command-[0-9a-f]{64}\\.staging)",
         )
         private val locks = mutableMapOf<String, Any>()
         private val liveCandidateTokens = ConcurrentHashMap.newKeySet<String>()

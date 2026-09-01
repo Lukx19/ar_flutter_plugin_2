@@ -6,9 +6,9 @@ import com.google.ar.core.Config
 import com.google.ar.core.Frame
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.NotYetAvailableException
-import com.uhg0.ar_flutter_plugin_2.m0.M0aControlCodec
-import com.uhg0.ar_flutter_plugin_2.m0.M0aControlLifecycle
-import com.uhg0.ar_flutter_plugin_2.m0.M0aControlOperation
+import com.uhg0.ar_flutter_plugin_2.proposal08.ControlCodec
+import com.uhg0.ar_flutter_plugin_2.proposal08.controlLifecycle
+import com.uhg0.ar_flutter_plugin_2.proposal08.ControlOperation
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
@@ -27,7 +27,7 @@ class VisibilityGridMethodChannel(
     private val runtimeCapabilities: () -> VisibilityGridRuntimeCapabilities,
     private val render: (CoveragePointRenderSnapshot?, PointCloudNativeConfig?) -> Unit,
     private val renderRawPoints: (CoveragePointRenderSnapshot?) -> Unit = {},
-    private val m0aControlLifecycle: M0aControlLifecycle = M0aControlLifecycle(),
+    private val controlLifecycle: controlLifecycle = controlLifecycle(),
     sharedExecutor: Executor? = null,
 ) : MethodChannel.MethodCallHandler {
     private val channel = MethodChannel(messenger, "arpointcloud_$viewId")
@@ -103,7 +103,7 @@ class VisibilityGridMethodChannel(
             call.method in setOf("start", "beginCheckpoint", "releaseCheckpoint", "stop") &&
             (call.method != "releaseCheckpoint" || call.arguments is ByteArray)
         ) {
-            handleM0aControl(call, result)
+            handleVisibilityProtocolControl(call, result)
             return
         }
         try {
@@ -155,8 +155,8 @@ class VisibilityGridMethodChannel(
                     dispose()
                     result.success(true)
                 }
-                "disposeM0aBinding" -> {
-                    m0aControlLifecycle.abandon()
+                "disposeVisibilityProtocolBinding" -> {
+                    controlLifecycle.abandon()
                     result.success(true)
                 }
                 else -> result.notImplemented()
@@ -438,26 +438,26 @@ class VisibilityGridMethodChannel(
         )
     }
 
-    private fun handleM0aControl(call: MethodCall, result: MethodChannel.Result) {
+    private fun handleVisibilityProtocolControl(call: MethodCall, result: MethodChannel.Result) {
         val operation = when (call.method) {
-            "start" -> M0aControlOperation.START
-            "beginCheckpoint" -> M0aControlOperation.BEGIN_CHECKPOINT
-            "releaseCheckpoint" -> M0aControlOperation.RELEASE_CHECKPOINT
-            "stop" -> M0aControlOperation.STOP
+            "start" -> ControlOperation.START
+            "beginCheckpoint" -> ControlOperation.BEGIN_CHECKPOINT
+            "releaseCheckpoint" -> ControlOperation.RELEASE_CHECKPOINT
+            "stop" -> ControlOperation.STOP
             else -> null
         }
         val bytes = call.arguments as? ByteArray
         if (operation == null || bytes == null) {
-            result.error("VG_PROTOCOL_INVALID", "M0a control requires one Uint8List", null)
+            result.error("VG_PROTOCOL_INVALID", "visibility protocol control requires one Uint8List", null)
             return
         }
         executor.execute {
             try {
                 val response: ByteArray? = synchronized(this) {
                     if (disposed) return@synchronized null
-                    val request = M0aControlCodec.decodeRequest(bytes)
+                    val request = ControlCodec.decodeRequest(bytes)
                     require(request.operation == operation) { "Control method and operation differ" }
-                    val encoded = m0aControlLifecycle.handle(request, bytes)
+                    val encoded = controlLifecycle.handle(request, bytes)
                     encoded
                 }
                 if (response == null) {
@@ -1376,7 +1376,7 @@ class VisibilityGridMethodChannel(
                 coalescedFeatureObservations = coalescedFeatureObservations,
                 coalescedDepthObservations = coalescedDepthObservations,
                 // This wire contract describes the authoritative semantic
-                // grid, whose 100k capacity remains distinct from M0d's 20k
+                // grid, whose 100k capacity remains distinct from coverage renderer's 20k
                 // presentation selection. Keep its row/free invariant valid
                 // for Dart while the bounded renderer is ledgered separately.
                 rendererRows = renderedRows,

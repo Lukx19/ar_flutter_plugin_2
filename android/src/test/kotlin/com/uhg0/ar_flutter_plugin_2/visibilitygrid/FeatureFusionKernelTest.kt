@@ -19,7 +19,7 @@ import org.openjdk.jol.info.GraphLayout
 class FeatureFusionKernelTest {
     @Test
     fun `candidate A bytes match the immutable fusion lock and reject B and C`() {
-        val root = fixture("m0b_fusion_vector_v1.json")
+        val root = fixture("feature_fusion_fusion_vector_v1.json")
         val observations = root.getValue("observations").jsonArray.map(::fusionEvidence)
         val actual = canonical(upserts(accepted(kernel(), batch(1, observations))))
         val expected = root.getValue("expected").jsonObject
@@ -30,17 +30,17 @@ class FeatureFusionKernelTest {
         assertArrayEquals(candidateA, actual)
         assertFalse("Candidate B consolidation must remain rejected", candidateB.contentEquals(actual))
         assertFalse("Candidate C averaging must remain rejected", candidateC.contentEquals(actual))
-        assertEquals("957ad2856b197eaad44e42db72a444cc9b6c516fa746a225329aaada0fb8ac85", testSha256Hex(resourceBytes("m0b_fusion_vector_v1.json")))
+        assertEquals("957ad2856b197eaad44e42db72a444cc9b6c516fa746a225329aaada0fb8ac85", testSha256Hex(resourceBytes("feature_fusion_fusion_vector_v1.json")))
     }
 
     @Test
     fun `locked clean wall jitter signed boundary relocation and independent runs preserve oracle keys`() {
-        val oracle = fixture("m0b_reference_oracle_v1.json")
+        val oracle = fixture("feature_fusion_reference_oracle_v1.json")
         val selected = linkedSetOf("clean_wall", "jitter", "relocation", "negative_boundary")
         val scenes = listOf(
-            "m0b_feature_depth_train_v1.json",
-            "m0b_feature_depth_locked_v1.json",
-            "m0b_feature_depth_held_out_v1.json",
+            "feature_fusion_feature_depth_train_v1.json",
+            "feature_fusion_feature_depth_locked_v1.json",
+            "feature_fusion_feature_depth_held_out_v1.json",
         ).flatMap { fixture(it).getValue("scenes").jsonArray }.map { it.jsonObject }.filter { it.string("name") in selected }
         assertEquals(selected, scenes.mapTo(linkedSetOf()) { it.string("name") })
 
@@ -179,17 +179,17 @@ class FeatureFusionKernelTest {
         val kernel = kernel()
         val accepted = accepted(kernel, batch(1, listOf(evidence(0, 0, 0, 2, 1), evidence(1, 0, 0, 2, 2))))
         val changes = accepted.delta.map { it as FeatureFusionChange.Upsert }
-        val firstFingerprint = M3CanonicalReceiptBytes(ByteArray(32) { 0x11 })
-        val lastFingerprint = M3CanonicalReceiptBytes(ByteArray(32) { 0x7f })
-        assertTrue(kernel.assignCanonicalCorrelations(listOf(changes[0].assignment(M3SurfaceId(1), firstFingerprint))))
-        assertTrue(kernel.assignCanonicalCorrelations(listOf(changes[1].assignment(M3SurfaceId(0xffff_ffffL), lastFingerprint))))
-        assertEquals(M3SurfaceId(1), kernel.canonicalCorrelation(changes[0].kernelSlot)?.id)
+        val firstFingerprint = CanonicalReceiptBytes(ByteArray(32) { 0x11 })
+        val lastFingerprint = CanonicalReceiptBytes(ByteArray(32) { 0x7f })
+        assertTrue(kernel.assignCanonicalCorrelations(listOf(changes[0].assignment(SurfaceId(1), firstFingerprint))))
+        assertTrue(kernel.assignCanonicalCorrelations(listOf(changes[1].assignment(SurfaceId(0xffff_ffffL), lastFingerprint))))
+        assertEquals(SurfaceId(1), kernel.canonicalCorrelation(changes[0].kernelSlot)?.id)
         assertEquals(firstFingerprint, kernel.canonicalCorrelation(changes[0].kernelSlot)?.allocationFingerprint)
-        assertEquals(M3SurfaceId(0xffff_ffffL), kernel.canonicalCorrelation(changes[1].kernelSlot)?.id)
+        assertEquals(SurfaceId(0xffff_ffffL), kernel.canonicalCorrelation(changes[1].kernelSlot)?.id)
         assertEquals(lastFingerprint, kernel.canonicalCorrelation(changes[1].kernelSlot)?.allocationFingerprint)
 
         val before = kernel.canonicalCorrelation(changes[0].kernelSlot)
-        assertFalse(kernel.assignCanonicalCorrelations(listOf(changes[0].assignment(M3SurfaceId(2), firstFingerprint))))
+        assertFalse(kernel.assignCanonicalCorrelations(listOf(changes[0].assignment(SurfaceId(2), firstFingerprint))))
         assertEquals(before, kernel.canonicalCorrelation(changes[0].kernelSlot))
     }
 
@@ -201,8 +201,8 @@ class FeatureFusionKernelTest {
         val packed = ((target.normalOctX and 0xff) shl 8) or (target.normalOctY and 0xff)
         val recovered = kernel()
         assertTrue(recovered.hydrateCanonicalSurface(
-            M3CompactSurface(M3SurfaceId(1), target.voxel, packed, target.normalConfidence),
-            M3CanonicalReceiptBytes(ByteArray(32) { 3 }),
+            CompactSurface(SurfaceId(1), target.voxel, packed, target.normalConfidence),
+            CanonicalReceiptBytes(ByteArray(32) { 3 }),
         ))
         assertTrue(accepted(recovered, batch(1, listOf(sample))).delta.isEmpty())
     }
@@ -236,7 +236,7 @@ class FeatureFusionKernelTest {
 
     @Test
     fun `hydrated canonical confidence retains every uint8 boundary exactly`() {
-        val fingerprint = M3CanonicalReceiptBytes(ByteArray(32) { 0x4d })
+        val fingerprint = CanonicalReceiptBytes(ByteArray(32) { 0x4d })
         val target = requireNotNull(
             upserts(accepted(kernel(), batch(1, listOf(evidence(0, 0, 0, 2, 1))))).single().primaryCanonicalTarget(),
         )
@@ -244,7 +244,7 @@ class FeatureFusionKernelTest {
         listOf(0, 1, 63, 64, 191, 192, 255).forEachIndexed { index, confidence ->
             val kernel = kernel()
             assertTrue(kernel.hydrateCanonicalSurface(
-                M3CompactSurface(M3SurfaceId(1), M3Voxel(index, 0, 0), packedNormal, confidence),
+                CompactSurface(SurfaceId(1), Voxel(index, 0, 0), packedNormal, confidence),
                 fingerprint,
             ))
             assertEquals(confidence, kernel.canonicalCorrelation(0)?.normalConfidence)
@@ -280,7 +280,7 @@ class FeatureFusionKernelTest {
     private fun upserts(result: FeatureFusionResult.Accepted) =
         result.delta.mapNotNull { (it as? FeatureFusionChange.Upsert)?.candidate }
 
-    private fun FeatureFusionChange.Upsert.assignment(id: M3SurfaceId, fingerprint: M3CanonicalReceiptBytes) =
+    private fun FeatureFusionChange.Upsert.assignment(id: SurfaceId, fingerprint: CanonicalReceiptBytes) =
         CanonicalFeatureAssignment(kernelSlot, x, y, z, id, fingerprint)
 
     private fun assertAtomicRefusal(

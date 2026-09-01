@@ -1,6 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.proposal08
 
-import com.uhg0.ar_flutter_plugin_2.m0.*
+import com.uhg0.ar_flutter_plugin_2.proposal08.*
 
 import java.nio.file.Files
 import kotlinx.serialization.json.Json
@@ -17,20 +17,20 @@ import org.junit.Test
 class DurableRegionStoreTest {
     @Test
     fun `receipt resumes exact retry after death before root switch`() {
-        val directory = Files.createTempDirectory("m0c-receipt-").toFile()
+        val directory = Files.createTempDirectory("residency-receipt-").toFile()
         try {
             val old = listOf(cut(1, -1), cut(1, 0))
             val next = listOf(cut(2, -1), cut(2, 0))
-            val store = M0Schema5DurableRegionCutStore(directory, old)
+            val store = Schema5DurableRegionCutStore(directory, old)
             val interrupted = store.publish(
                 next,
-                fault = M0DurableCutFaultPoint.afterReceipt,
+                fault = DurableCutFaultPoint.afterReceipt,
                 operationId = "checkpoint-7",
             )
             assertFalse(interrupted.published)
             assertEquals(0L, interrupted.visibleRootId)
 
-            val restarted = M0Schema5DurableRegionCutStore(directory)
+            val restarted = Schema5DurableRegionCutStore(directory)
             val resumed = restarted.publish(next, operationId = "checkpoint-7")
             assertTrue(resumed.published)
             assertEquals(1L, resumed.visibleRootId)
@@ -52,9 +52,9 @@ class DurableRegionStoreTest {
 
     @Test
     fun `Kotlin durable root executes the shared twenty case fault matrix`() {
-        val corpus = fixture("m0c_fault_corpus_v1.json")
+        val corpus = fixture("residency_fault_corpus_v1.json")
         val faults = corpus.getValue("faults").jsonArray
-        val root = Files.createTempDirectory("capture3d-m0c-kotlin-").toFile()
+        val root = Files.createTempDirectory("capture3d-residency-kotlin-").toFile()
         try {
             faults.forEach { value ->
                 val expected = value.jsonObject
@@ -62,20 +62,20 @@ class DurableRegionStoreTest {
                 val directory = root.resolve(name)
                 val old = listOf(cut(1, 0), cut(1, 1))
                 val next = listOf(cut(2, 0), cut(2, 1))
-                val store = M0Schema5DurableRegionCutStore(directory, old)
-                val result = store.publish(next, M0DurableCutFaultPoint.valueOf(name))
-                val restarted = M0Schema5DurableRegionCutStore(directory)
+                val store = Schema5DurableRegionCutStore(directory, old)
+                val result = store.publish(next, DurableCutFaultPoint.valueOf(name))
+                val restarted = Schema5DurableRegionCutStore(directory)
 
                 assertEquals(name, expected.getValue("publishesNewRoot").jsonPrimitive.content.toBoolean(), result.published)
                 assertEquals(name, setOf(expected.getValue("visibleGeneration").jsonPrimitive.int.toLong()), restarted.visibleCuts.values.map { it.generation }.toSet())
                 assertFalse(restarted.hasStaging)
-                fun reached(point: M0DurableCutFaultPoint) =
-                    M0DurableCutFaultPoint.valueOf(name).ordinal >= point.ordinal
-                assertEquals(name, reached(M0DurableCutFaultPoint.afterReceipt), restarted.hasReceipt(1))
-                assertEquals(name, reached(M0DurableCutFaultPoint.afterActivation), restarted.hasActivation(1))
-                assertEquals(name, reached(M0DurableCutFaultPoint.afterEviction), restarted.hasEviction(1))
-                assertEquals(name, reached(M0DurableCutFaultPoint.afterMigration), restarted.hasMigration(1))
-                assertEquals(name, reached(M0DurableCutFaultPoint.afterTombstone), restarted.hasTombstone(1))
+                fun reached(point: DurableCutFaultPoint) =
+                    DurableCutFaultPoint.valueOf(name).ordinal >= point.ordinal
+                assertEquals(name, reached(DurableCutFaultPoint.afterReceipt), restarted.hasReceipt(1))
+                assertEquals(name, reached(DurableCutFaultPoint.afterActivation), restarted.hasActivation(1))
+                assertEquals(name, reached(DurableCutFaultPoint.afterEviction), restarted.hasEviction(1))
+                assertEquals(name, reached(DurableCutFaultPoint.afterMigration), restarted.hasMigration(1))
+                assertEquals(name, reached(DurableCutFaultPoint.afterTombstone), restarted.hasTombstone(1))
                 val orphanRoot = expected.getValue("orphanRoot").jsonPrimitive.content.toBoolean()
                 if (orphanRoot) {
                     assertTrue(name, restarted.hasRoot(1))
@@ -91,15 +91,15 @@ class DurableRegionStoreTest {
 
     @Test
     fun `Kotlin pointer fallback keeps the prior root when the current slot is corrupt`() {
-        val root = Files.createTempDirectory("capture3d-m0c-pointer-").toFile()
+        val root = Files.createTempDirectory("capture3d-residency-pointer-").toFile()
         try {
-            val store = M0Schema5DurableRegionCutStore(root, listOf(cut(1, 0)))
+            val store = Schema5DurableRegionCutStore(root, listOf(cut(1, 0)))
             assertTrue(store.publish(listOf(cut(2, 0))).published)
             val current = root.resolve("root-B.ptr")
             val corrupted = current.readBytes()
             corrupted[252] = (corrupted[252].toInt() xor 1).toByte()
             current.writeBytes(corrupted)
-            val recovered = M0Schema5DurableRegionCutStore(root)
+            val recovered = Schema5DurableRegionCutStore(root)
             assertEquals(0L, recovered.visibleRootId)
             assertEquals(1L, recovered.visibleCuts.values.single().generation)
             assertTrue(recovered.hasRoot(1))
@@ -108,8 +108,8 @@ class DurableRegionStoreTest {
         }
     }
 
-    private fun cut(generation: Long, coordinate: Int) = M0RegionPairCut(
-        region = M0RegionCoordinate(coordinate, 0, 0),
+    private fun cut(generation: Long, coordinate: Int) = RegionPairCut(
+        region = RegionCoordinate(coordinate, 0, 0),
         generation = generation,
         geometryRevision = generation,
         coverageRevision = generation,

@@ -14,7 +14,7 @@ class StorageBudgetCoordinatorV2Test {
         val root = directory(); val policy = StorageBudgetPolicyV2(64 * 1024, 0)
         val id = "ab".repeat(32)
         StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 1_000_000 }.use { first ->
-            val reservation = requireNotNull(first.reserve("m3:canonical:test", 4_096))
+            val reservation = requireNotNull(first.reserve("canonical-surface:canonical:test", 4_096))
             first.commit(reservation, 4_096)
             first.reclaimVerifiedOnce(id, 4_096)
             assertEquals(0L, first.committedBytes())
@@ -59,15 +59,15 @@ class StorageBudgetCoordinatorV2Test {
         val aStaging = File(groupA, "candidate-a.staging")
         val aTarget = File(groupA, "candidate-a")
         val a = requireNotNull(first.reserveCandidate(
-            "m3:canonical:v6-migration", aStaging, aTarget, mapOf("root" to 1L), 16_384L,
+            "canonical-surface:canonical:v6-migration", aStaging, aTarget, mapOf("root" to 1L), 16_384L,
         ))
         first.publishCandidate(a, aStaging, aTarget)
         val chargedA = first.verifyCandidate(a, aTarget)
         first.commit(a, chargedA)
 
-        val orphan = File(groupB, "m3-canonical-v6-${"d".repeat(64)}.staging-1-1")
+        val orphan = File(groupB, "canonical-surface-canonical-v6-${"d".repeat(64)}.staging-1-1")
         val b = requireNotNull(first.reserveCandidate(
-            "m3:canonical:v6-migration", orphan, File(groupB, "candidate-b"),
+            "canonical-surface:canonical:v6-migration", orphan, File(groupB, "candidate-b"),
             mapOf("root" to 1L), 16_384L,
         ))
         val metadata = File(root, "reservations-v2/${b.token}.reservation")
@@ -91,13 +91,13 @@ class StorageBudgetCoordinatorV2Test {
         val deeper = File(group, "nested").apply { assertTrue(mkdirs()) }
         assertThrows(IllegalArgumentException::class.java) {
             coordinator.reserveCandidate(
-                "m3:canonical:v6-migration", File(deeper, "staging"), File(deeper, "target"),
+                "canonical-surface:canonical:v6-migration", File(deeper, "staging"), File(deeper, "target"),
                 mapOf("root" to 1L), 16_384L,
             )
         }
         assertThrows(IllegalArgumentException::class.java) {
             coordinator.reserveCandidate(
-                "m3:canonical:v6-migration", File(root.parentFile, "escape-staging"),
+                "canonical-surface:canonical:v6-migration", File(root.parentFile, "escape-staging"),
                 File(root.parentFile, "escape-target"), mapOf("root" to 1L), 16_384L,
             )
         }
@@ -132,7 +132,7 @@ class StorageBudgetCoordinatorV2Test {
         val staging = File(root, "candidate.staging-1")
         val target = File(root, "candidate-v6")
         val reservation = coordinator.reserveCandidate(
-            "m3:canonical:v6-migration", staging, target,
+            "canonical-surface:canonical:v6-migration", staging, target,
             mapOf("root.v6" to 4096L, "pages.v6" to 8192L), 64_000L,
         )!!
         assertTrue(staging.isDirectory)
@@ -159,10 +159,10 @@ class StorageBudgetCoordinatorV2Test {
         val coordinator = StorageBudgetCoordinatorV2(
             root, StorageBudgetPolicyV2(1_000_000, 10_000), physicalFilesystem(),
         ) { if (++checks < 4) 1_000_000 else 9_999 }
-        val staging = File(root, "m3-canonical-v6-${"a".repeat(64)}.staging-1-1")
+        val staging = File(root, "canonical-surface-canonical-v6-${"a".repeat(64)}.staging-1-1")
         assertThrows(IllegalArgumentException::class.java) {
             coordinator.reserveCandidate(
-                "m3:canonical:v6-migration", staging, File(root, "candidate-v6"),
+                "canonical-surface:canonical:v6-migration", staging, File(root, "candidate-v6"),
                 mapOf("one" to 4096L, "two" to 4096L), 64_000L,
             )
         }
@@ -174,7 +174,7 @@ class StorageBudgetCoordinatorV2Test {
         val root = directory(); val policy = StorageBudgetPolicyV2(1_000_000, 0)
         val first = StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 10_000_000 }
         val reservation = first.reservePointerPublication(
-            "m3:canonical:selector", "a".repeat(64), 1,
+            "canonical-surface:canonical:selector", "a".repeat(64), 1,
             rootBeforeBytes = 0L, slotBeforeBytes = 4_096L, selectorBeforeBytes = 4_096L,
             commitBytes = 4_096L, maximumPhysicalBytes = 32_768L,
         )!!

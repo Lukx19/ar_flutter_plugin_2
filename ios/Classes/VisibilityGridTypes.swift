@@ -392,7 +392,7 @@ struct DepthObservation {
     let worldFromCameraGL: [Double]
 }
 
-// Proposal 08 M2 declaration-only seam. This Android milestone intentionally
+// Proposal 08 capture ingress declaration-only seam. This Android milestone intentionally
 // provides no ARKit adapter, scheduling, mapping, or lifecycle implementation.
 enum VisibilityObservationSourceV2: String {
     case arcoreFeature

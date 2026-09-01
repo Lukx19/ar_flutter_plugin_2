@@ -1,6 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.proposal08
 
-import com.uhg0.ar_flutter_plugin_2.m0.*
+import com.uhg0.ar_flutter_plugin_2.proposal08.*
 
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -40,7 +40,7 @@ class FeatureFusionQualityCorpusTest {
 
     @Test
     fun `locked quality stage is hash-bound and passes synthetic quality gates`() {
-        val manifest = fixture("m0b_reference_corpus_v1.json")
+        val manifest = fixture("feature_fusion_reference_corpus_v1.json")
         val stages = manifest
             .getValue("syntheticQualityCorpus").jsonObject
             .getValue("stageCorpora").jsonObject
@@ -65,7 +65,7 @@ class FeatureFusionQualityCorpusTest {
         assertTrue(sceneNames.getValue("validation").intersect(sceneNames.getValue("lockedAcceptance")).isEmpty())
 
         val locked = Json.parseToJsonElement(
-            resourceBytes("m0b_quality_locked_v1.json").decodeToString(),
+            resourceBytes("feature_fusion_quality_locked_v1.json").decodeToString(),
         ).jsonObject
         assertEquals(
             19,
@@ -87,7 +87,7 @@ class FeatureFusionQualityCorpusTest {
     @Test
     fun `locked synthetic selection keeps first passing order without promotion`() {
         val root = Json.parseToJsonElement(
-            resourceBytes("m0b_quality_locked_v1.json").decodeToString(),
+            resourceBytes("feature_fusion_quality_locked_v1.json").decodeToString(),
         ).jsonObject
         val gates = root.getValue("gates").jsonObject
         val baseline = root.double("proposal07BaselineRecall")
@@ -155,13 +155,13 @@ class FeatureFusionQualityCorpusTest {
 
     @Test
     fun `synthetic population reaches the exact bounded association seam`() {
-        val resource = fixture("m0b_quality_locked_v1.json").getValue("resourceCampaign").jsonObject
+        val resource = fixture("feature_fusion_quality_locked_v1.json").getValue("resourceCampaign").jsonObject
         val surfaceCapacity = resource.int("surfaceCapacity")
         val associationCount = resource.int("associationCount")
         val observations = sequence {
             repeat(associationCount) { index ->
                 yield(
-                    M0VoxelObservation(
+                    VoxelObservation(
                         x = index % surfaceCapacity,
                         y = 0,
                         z = 0,
@@ -171,7 +171,7 @@ class FeatureFusionQualityCorpusTest {
                 )
             }
         }.asIterable()
-        val result = M0SignedOccupancyKernel(
+        val result = SignedOccupancyKernel(
             capacity = surfaceCapacity,
             maxObservations = associationCount,
         ).fuse(observations)
@@ -180,12 +180,12 @@ class FeatureFusionQualityCorpusTest {
 
         val overBudget = sequence {
             repeat(associationCount + 1) { index ->
-                yield(M0VoxelObservation(index % surfaceCapacity, 0, 1, 1, index))
+                yield(VoxelObservation(index % surfaceCapacity, 0, 1, 1, index))
             }
         }.asIterable()
         assertEquals(
             1,
-            M0SignedOccupancyKernel(maxObservations = associationCount)
+            SignedOccupancyKernel(maxObservations = associationCount)
                 .fuse(overBudget)
                 .overflowObservationCount,
         )
@@ -199,16 +199,16 @@ class FeatureFusionQualityCorpusTest {
         assertEquals(resource.int("expectedCpuWorkUnits"), associationCount + result.surfaces.size)
     }
 
-    private fun expandedKeys(surfaces: List<M0CanonicalSurface>): Set<M0VoxelKey> =
+    private fun expandedKeys(surfaces: List<CanonicalSurface>): Set<VoxelKey> =
         buildSet {
             surfaces.forEach { surface ->
                 repeat(surface.extentU) { u ->
                     repeat(surface.extentV) { v ->
                         add(
                             when (surface.planeAxis) {
-                                2 -> M0VoxelKey(surface.key.x + u, surface.key.y + v, surface.key.z)
-                                1 -> M0VoxelKey(surface.key.x + u, surface.key.y, surface.key.z + v)
-                                0 -> M0VoxelKey(surface.key.x, surface.key.y + u, surface.key.z + v)
+                                2 -> VoxelKey(surface.key.x + u, surface.key.y + v, surface.key.z)
+                                1 -> VoxelKey(surface.key.x + u, surface.key.y, surface.key.z + v)
+                                0 -> VoxelKey(surface.key.x, surface.key.y + u, surface.key.z + v)
                                 else -> surface.key
                             },
                         )
@@ -217,7 +217,7 @@ class FeatureFusionQualityCorpusTest {
             }
         }
 
-    private fun assertExpectedOutput(expected: JsonObject, actual: M0FusionResult) {
+    private fun assertExpectedOutput(expected: JsonObject, actual: FusionResult) {
         assertEquals(expected.int("overflowObservationCount"), actual.overflowObservationCount)
         val expectedSurfaces = expected.getValue("surfaces").jsonArray
         assertEquals(expectedSurfaces.size, actual.surfaces.size)
@@ -226,7 +226,7 @@ class FeatureFusionQualityCorpusTest {
             val surface = actual.surfaces[index]
             val key = expectedSurface.getValue("key").jsonArray.map { it.jsonPrimitive.int }
             assertEquals(expectedSurface.int("surfaceId").toLong(), surface.surfaceId)
-            assertEquals(M0VoxelKey(key[0], key[1], key[2]), surface.key)
+            assertEquals(VoxelKey(key[0], key[1], key[2]), surface.key)
             assertEquals(expectedSurface.int("weight"), surface.weight)
             assertEquals(expectedSurface.int("normalOctant"), surface.normalOctant)
             assertEquals(expectedSurface.int("extentU"), surface.extentU)
@@ -261,11 +261,11 @@ class FeatureFusionQualityCorpusTest {
         assertEquals(
             pointCloud.getValue("expectedVoxelKeys").jsonArray.map { row ->
                 val key = row.jsonArray.map { it.jsonPrimitive.int }
-                M0VoxelKey(key[0], key[1], key[2])
+                VoxelKey(key[0], key[1], key[2])
             },
             acceptedIndices.map { index ->
                 val point = points[index]
-                M0VoxelKey(
+                VoxelKey(
                     origin[0] + kotlin.math.round(point[0] * metersToVoxel).toInt(),
                     origin[1] + kotlin.math.round(point[1] * metersToVoxel).toInt(),
                     origin[2] + kotlin.math.round(point[2] * metersToVoxel).toInt(),
@@ -296,7 +296,7 @@ class FeatureFusionQualityCorpusTest {
         )
     }
 
-    private fun sensorObservations(root: JsonObject): List<M0VoxelObservation> {
+    private fun sensorObservations(root: JsonObject): List<VoxelObservation> {
         val frames = root["sensorFrames"]?.jsonObject ?: return emptyList()
         val pointCloud = frames.getValue("arcorePointCloud").jsonObject
         val pointIds = pointCloud.getValue("pointIds").jsonArray.map { it.jsonPrimitive.int }
@@ -312,7 +312,7 @@ class FeatureFusionQualityCorpusTest {
             .filter { confidence[it] >= minimumConfidence }
             .map { index ->
                 val point = points[index]
-                M0VoxelObservation(
+                VoxelObservation(
                     origin[0] + kotlin.math.round(point[0] * metersToVoxel).toInt(),
                     origin[1] + kotlin.math.round(point[1] * metersToVoxel).toInt(),
                     origin[2] + kotlin.math.round(point[2] * metersToVoxel).toInt(),
@@ -336,7 +336,7 @@ class FeatureFusionQualityCorpusTest {
             .filter { depths[it] > 0.0 && ranks.getValue(depthConfidence[it]) >= minimumDepthConfidence }
             .forEach { index ->
                 val key = projected[index]
-                observations += M0VoxelObservation(
+                observations += VoxelObservation(
                     key[0], key[1], key[2], depthWeight, supportIdBase + index,
                 )
             }
@@ -349,7 +349,7 @@ class FeatureFusionQualityCorpusTest {
             scene.getValue("observations").jsonArray.map { value ->
                 val row = value.jsonObject
                 val key = row.getValue("key").jsonArray.map { it.jsonPrimitive.int }
-                M0VoxelObservation(key[0], key[1], key[2], row.int("signedWeight"), row.int("supportId"))
+                VoxelObservation(key[0], key[1], key[2], row.int("signedWeight"), row.int("supportId"))
             }
         } + sensorObservations(root)
         val expected = scenes.flatMap { keys(it.getValue("expectedSurfaceKeys")) }.toSet()
@@ -357,9 +357,9 @@ class FeatureFusionQualityCorpusTest {
         val protected = scenes.flatMap { keys(it.getValue("protectedKeys")) }.toSet()
         val gates = root.getValue("gates").jsonObject
         val factories = listOf(
-            "A" to { M0SignedOccupancyKernel() },
-            "B" to { M0PlanarConsolidationKernel() },
-            "C" to { M0BoundedTsdfKernel() },
+            "A" to { SignedOccupancyKernel() },
+            "B" to { PlanarConsolidationKernel() },
+            "C" to { BoundedTsdfKernel() },
         )
         return factories.associate { (candidate, factory) ->
             val first = factory().fuse(observations)
@@ -380,15 +380,15 @@ class FeatureFusionQualityCorpusTest {
         }
     }
 
-    private fun keys(value: kotlinx.serialization.json.JsonElement): List<M0VoxelKey> =
+    private fun keys(value: kotlinx.serialization.json.JsonElement): List<VoxelKey> =
         value.jsonArray.map { row ->
             val key = row.jsonArray.map { it.jsonPrimitive.int }
-            M0VoxelKey(key[0], key[1], key[2])
+            VoxelKey(key[0], key[1], key[2])
         }
 
     private fun falseThickness(
-        output: Set<M0VoxelKey>,
-        phantom: Set<M0VoxelKey>,
+        output: Set<VoxelKey>,
+        phantom: Set<VoxelKey>,
     ): Int = output.intersect(phantom)
         .groupBy { it.x to it.y }
         .values
@@ -407,7 +407,7 @@ class FeatureFusionQualityCorpusTest {
             longest
         } ?: 0
 
-    private fun fixture(fileName: String = "m0b_quality_corpus_v1.json"): JsonObject =
+    private fun fixture(fileName: String = "feature_fusion_quality_corpus_v1.json"): JsonObject =
         Json.parseToJsonElement(
             resourceBytes(fileName).decodeToString(),
         ).jsonObject

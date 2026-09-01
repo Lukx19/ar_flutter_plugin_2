@@ -2,24 +2,24 @@ package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
 import android.os.Handler
 import android.os.Looper
-import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineAuthority
-import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineScopeV1
-import com.uhg0.ar_flutter_plugin_2.m0.M0aCommitReceiptQueryV1
-import com.uhg0.ar_flutter_plugin_2.m0.M0aControlCodec
-import com.uhg0.ar_flutter_plugin_2.m0.M0aControlLifecycle
-import com.uhg0.ar_flutter_plugin_2.m0.M0aControlOperation
-import com.uhg0.ar_flutter_plugin_2.m0.M0aControlRequest
-import com.uhg0.ar_flutter_plugin_2.m0.M0aPacketCodec
-import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineV1
-import com.uhg0.ar_flutter_plugin_2.m0.toMap
-import com.uhg0.ar_flutter_plugin_2.m0.M0aUuid
-import com.uhg0.ar_flutter_plugin_2.m0.M0aStructuralTransactionProducerV1
-import com.uhg0.ar_flutter_plugin_2.m0.M0aTransactionResponseProfileV1
-import com.uhg0.ar_flutter_plugin_2.m0.M0aStartRequestCodecV2
-import com.uhg0.ar_flutter_plugin_2.m0.M0aVisibilitySurfaceStreamChannel
-import com.uhg0.ar_flutter_plugin_2.m0.M0aDebugTransportProbe
-import com.uhg0.ar_flutter_plugin_2.m0.M0aCurrentDeltaSelectorV1
-import com.uhg0.ar_flutter_plugin_2.m0.M0aCurrentDeltaSourceV1
+import com.uhg0.ar_flutter_plugin_2.proposal08.CommittedBaselineAuthority
+import com.uhg0.ar_flutter_plugin_2.proposal08.CommittedBaselineScopeV1
+import com.uhg0.ar_flutter_plugin_2.proposal08.CommitReceiptQueryV1
+import com.uhg0.ar_flutter_plugin_2.proposal08.ControlCodec
+import com.uhg0.ar_flutter_plugin_2.proposal08.controlLifecycle
+import com.uhg0.ar_flutter_plugin_2.proposal08.ControlOperation
+import com.uhg0.ar_flutter_plugin_2.proposal08.ControlRequest
+import com.uhg0.ar_flutter_plugin_2.proposal08.PacketCodec
+import com.uhg0.ar_flutter_plugin_2.proposal08.CommittedBaselineV1
+import com.uhg0.ar_flutter_plugin_2.proposal08.toMap
+import com.uhg0.ar_flutter_plugin_2.proposal08.Uuid
+import com.uhg0.ar_flutter_plugin_2.proposal08.StructuralTransactionProducerV1
+import com.uhg0.ar_flutter_plugin_2.proposal08.TransactionResponseProfileV1
+import com.uhg0.ar_flutter_plugin_2.proposal08.StartRequestCodecV2
+import com.uhg0.ar_flutter_plugin_2.proposal08.VisibilitySurfaceStreamChannel
+import com.uhg0.ar_flutter_plugin_2.proposal08.DebugTransportProbe
+import com.uhg0.ar_flutter_plugin_2.proposal08.CurrentDeltaSelectorV1
+import com.uhg0.ar_flutter_plugin_2.proposal08.CurrentDeltaSourceV1
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -36,7 +36,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
-internal enum class M3CurrentDeltaQueueResult { QUEUED, ALREADY_QUEUED, RECOVERED_EXACT_QUEUE }
+internal enum class CurrentDeltaQueueResult { QUEUED, ALREADY_QUEUED, RECOVERED_EXACT_QUEUE }
 
 /**
  * Production owner for one immutable V2 platform-view binding generation.
@@ -49,7 +49,7 @@ internal enum class M3CurrentDeltaQueueResult { QUEUED, ALREADY_QUEUED, RECOVERE
 class VisibilityGridV2Binding internal constructor(
     private val messenger: BinaryMessenger,
     private val viewId: Int,
-    private val committedBaselineAuthority: M0aCommittedBaselineAuthority,
+    private val CommittedBaselineAuthority: CommittedBaselineAuthority,
     private val bindingGenerationSeed: Long = nextBindingGeneration.incrementAndGet(),
     private val lifecycleSequenceAllocator: () -> Long = { nextLifecycleSequence.incrementAndGet() },
     private val viewGeneration: Long = nextViewGeneration.incrementAndGet(),
@@ -59,8 +59,8 @@ class VisibilityGridV2Binding internal constructor(
     private val postToMain: ((() -> Unit) -> Unit)? = null,
     private val beforeControlAdmission: (() -> Unit)? = null,
     private val beforeControlPublication: (() -> Unit)? = null,
-    private val activeSessionIdSeed: M0aUuid? = null,
-    private val activeCaptureGroupIdSeed: M0aUuid? = null,
+    private val activeSessionIdSeed: Uuid? = null,
+    private val activeCaptureGroupIdSeed: Uuid? = null,
     private val activeSessionGenerationSeed: Long = 0L,
     private val activeGroupGenerationSeed: Long = 0L,
     private val activeCoverageEpochSeed: Long = 0L,
@@ -68,8 +68,8 @@ class VisibilityGridV2Binding internal constructor(
     private val debugRecoverySeam: VisibilityGridV2DebugRecoverySeam =
         VisibilityGridV2DebugRecoverySeam(),
     private val cleanupAuthority: CleanupAuthority = CleanupAuthority(),
-    private val initialCommittedBaselineSeed: M0aCommittedBaselineV1 =
-        M0aCommittedBaselineV1.ZERO,
+    private val initialCommittedBaselineSeed: CommittedBaselineV1 =
+        CommittedBaselineV1.ZERO,
     internal val beforeAbandonCleanup: (() -> Unit)? = null,
 ) {
     private val main = Handler(Looper.getMainLooper())
@@ -82,30 +82,30 @@ class VisibilityGridV2Binding internal constructor(
     )
     private var nativeStreamToken = newOpaqueToken()
     private var workerBindingToken = newOpaqueToken()
-    @Volatile private var issue98Probe: M0aDebugTransportProbe? = null
+    @Volatile private var issue98Probe: DebugTransportProbe? = null
     @Volatile private var issue98Correlation: ByteArray? = null
     @Volatile private var issue98Preparation: Map<String, Any>? = null
-    @Volatile private var issue98RestoredBaseline: M0aCommittedBaselineV1? = null
+    @Volatile private var issue98RestoredBaseline: CommittedBaselineV1? = null
     @Volatile private var issue98AuthorityArmed = false
     @Volatile private var streamChannel = newStreamChannel()
     @Volatile private var currentBindingGeneration = bindingGenerationSeed
     private var initialTransactionQueued = false
-    @Volatile private var acknowledgedEmptyBaseline: M3CommittedEmptyBaseline? = null
-    @Volatile private var expectedEmptyBootstrap: M0aCurrentDeltaSelectorV1? = null
+    @Volatile private var acknowledgedEmptyBaseline: committedEmptyBaseline? = null
+    @Volatile private var expectedEmptyBootstrap: CurrentDeltaSelectorV1? = null
     /**
-     * The one acknowledged M3 cut and, while its successor is in flight, the
+     * The one acknowledged canonical surface cut and, while its successor is in flight, the
      * one bounded current delta retained by the stream. This deliberately
      * retains only scalar identity and a command digest: BEGIN/CHUNK/COMMIT
      * own the sole canonical-byte copy.
      */
-    @Volatile private var acknowledgedM3Cut: M3AcknowledgedCut? = null
-    @Volatile private var pendingM3Cut: M3CurrentDeltaCut? = null
-    @Volatile private var m3AcknowledgementListener: ((M0aCurrentDeltaSelectorV1) -> Unit)? = null
+    @Volatile private var acknowledgedM3Cut: AcknowledgedCut? = null
+    @Volatile private var pendingM3Cut: CurrentDeltaCut? = null
+    @Volatile private var acknowledgementListener: ((CurrentDeltaSelectorV1) -> Unit)? = null
     private var acceptedControls = 0L
     private var closedResources = 0L
-    private var activeControlRequestId: M0aUuid? = null
-    private var activeSessionId: M0aUuid? = activeSessionIdSeed
-    private var activeCaptureGroupId: M0aUuid? = activeCaptureGroupIdSeed
+    private var activeControlRequestId: Uuid? = null
+    private var activeSessionId: Uuid? = activeSessionIdSeed
+    private var activeCaptureGroupId: Uuid? = activeCaptureGroupIdSeed
     private var activeSessionGeneration = activeSessionGenerationSeed
     private var activeGroupGeneration = activeGroupGenerationSeed
     private var activeCoverageEpoch = activeCoverageEpochSeed
@@ -121,12 +121,12 @@ class VisibilityGridV2Binding internal constructor(
     @Volatile private var replacementBinding: VisibilityGridV2Binding? = null
     @Volatile private var observationRuntime: AndroidVisibilityGridRuntime? = null
 
-    private fun newLifecycle() = M0aControlLifecycle(
-        committedBaselineAuthority = committedBaselineAuthority,
+    private fun newLifecycle() = controlLifecycle(
+        CommittedBaselineAuthority = CommittedBaselineAuthority,
         initialCommittedBaseline = initialCommittedBaselineSeed,
     )
 
-    private fun newStreamChannel() = M0aVisibilitySurfaceStreamChannel(
+    private fun newStreamChannel() = VisibilitySurfaceStreamChannel(
         messenger = messenger,
         viewId = viewId,
         workerExecutor = executor,
@@ -138,14 +138,14 @@ class VisibilityGridV2Binding internal constructor(
         beforeRequestProcessing = debugRecoverySeam::beforeRequest,
         onCommitPublished = { request, baseline ->
             activeReceiptQuery(request, baseline)?.let { query ->
-                committedBaselineAuthority.publishCommit(query, baseline)
+                CommittedBaselineAuthority.publishCommit(query, baseline)
             }
             debugRecoverySeam.commitPublished()
         },
         afterCommitPublication = debugRecoverySeam::afterCommitPublication,
         onAbandonedRequest = { request, targetBaseline ->
             activeReceiptQuery(request, targetBaseline)?.let { query ->
-                committedBaselineAuthority.publishAbandon(query)
+                CommittedBaselineAuthority.publishAbandon(query)
             }
         },
         onAbandonedContinuation = debugRecoverySeam::oldContinuationFenced,
@@ -165,9 +165,9 @@ class VisibilityGridV2Binding internal constructor(
         val initialTransactionQueued: Boolean,
         val disposed: Boolean,
         val closedResources: Long,
-        val controlRequestId: M0aUuid?,
-        val sessionId: M0aUuid?,
-        val captureGroupId: M0aUuid?,
+        val controlRequestId: Uuid?,
+        val sessionId: Uuid?,
+        val captureGroupId: Uuid?,
         val sessionGeneration: Long,
         val groupGeneration: Long,
         val coverageEpoch: Long,
@@ -208,7 +208,7 @@ class VisibilityGridV2Binding internal constructor(
     )
 
     /** Exact assigned portable layout for the live binding/stream scalar owners. */
-    @Synchronized internal fun m3PortableOwnerBytes(): Long {
+    @Synchronized internal fun portableOwnerBytes(): Long {
         val transportPayload = streamChannel.transportInstrumentation.snapshot().retainedAllocationBytes
         val identityPayload = arSessionIdentity.size + viewInstanceId.size + nativeStreamToken.size +
             workerBindingToken.size + (issue98Correlation?.size ?: 0) +
@@ -256,19 +256,19 @@ class VisibilityGridV2Binding internal constructor(
         replacementBinding?.attachObservationRuntime(runtime)
     }
 
-    /** The narrow seeded-baseline seam; null until M1's exact bootstrap ACK. */
+    /** The narrow seeded-baseline seam; null until binding lifecycle's exact bootstrap ACK. */
     @Synchronized
-    internal fun m3CommittedEmptyBaseline(): M3CommittedEmptyBaseline? {
-        replacementBinding?.let { return it.m3CommittedEmptyBaseline() }
+    internal fun committedEmptyBaseline(): committedEmptyBaseline? {
+        replacementBinding?.let { return it.committedEmptyBaseline() }
         return acknowledgedEmptyBaseline?.takeIf { !disposed.get() }
     }
 
     @Synchronized
     internal fun attachM3AcknowledgementListener(
-        listener: (M0aCurrentDeltaSelectorV1) -> Unit,
+        listener: (CurrentDeltaSelectorV1) -> Unit,
     ) {
-        check(m3AcknowledgementListener == null) { "M3 acknowledgement listener already attached" }
-        m3AcknowledgementListener = listener
+        check(acknowledgementListener == null) { "canonical surface acknowledgement listener already attached" }
+        acknowledgementListener = listener
     }
 
     /**
@@ -277,22 +277,22 @@ class VisibilityGridV2Binding internal constructor(
      */
     @Synchronized
     internal fun queueCommittedCurrentDelta(
-        source: M0aCurrentDeltaSourceV1,
-        selector: M0aCurrentDeltaSelectorV1,
-    ): M3CurrentDeltaQueueResult {
+        source: CurrentDeltaSourceV1,
+        selector: CurrentDeltaSelectorV1,
+    ): CurrentDeltaQueueResult {
         check(!disposed.get() && replacementBinding == null) { "V2 binding is not current" }
-        check(lifecycle.state() == M0aControlLifecycle.State.ACTIVE) {
+        check(lifecycle.state() == controlLifecycle.State.ACTIVE) {
             "V2 observation cut is unavailable"
         }
         val acknowledged = requireNotNull(acknowledgedM3Cut) {
-            "M1 bootstrap is not acknowledged"
+            "binding lifecycle bootstrap is not acknowledged"
         }
         val receipt = requireNotNull(source.selectCurrentDelta(selector)) {
             "The named current delta is not retained"
         }
         check(receipt.selector == selector) { "Current-delta source returned a different receipt" }
         val bytes = receipt.bytes
-        val candidate = M3CurrentDeltaCut(
+        val candidate = CurrentDeltaCut(
             selector = selector,
             baseGeometryRevision = receipt.baseGeometryRevision,
             commandHash = receipt.commandHash,
@@ -304,43 +304,43 @@ class VisibilityGridV2Binding internal constructor(
                     receipt.baseGeometryRevision,
                     bytes,
                 )
-            ) { "M3 current delta replay is not byte-exact" }
-            return M3CurrentDeltaQueueResult.ALREADY_QUEUED
+            ) { "canonical surface current delta replay is not byte-exact" }
+            return CurrentDeltaQueueResult.ALREADY_QUEUED
         }
         check(selector.transactionId == nextPortableOrdinal(acknowledged.transactionId)) {
-            "M3 current delta is not the next transaction"
+            "canonical surface current delta is not the next transaction"
         }
         check(receipt.baseGeometryRevision == acknowledged.targetGeometryRevision) {
-            "M3 current delta does not start at the acknowledged geometry cut"
+            "canonical surface current delta does not start at the acknowledged geometry cut"
         }
         check(selector.targetGeometryRevision == nextPortableOrdinal(acknowledged.targetGeometryRevision)) {
-            "M3 current delta is not the next geometry cut"
+            "canonical surface current delta is not the next geometry cut"
         }
         check(selector.targetLineageRevision >= acknowledged.targetLineageRevision) {
-            "M3 current delta regresses lineage"
+            "canonical surface current delta regresses lineage"
         }
         // A prior call may have thrown after the stream atomically installed
         // the exact frames but before this binding recorded its scalar cut.
         if (streamChannel.hasExactQueuedCurrentDelta(selector, receipt.baseGeometryRevision, bytes)) {
             pendingM3Cut = candidate
-            return M3CurrentDeltaQueueResult.RECOVERED_EXACT_QUEUE
+            return CurrentDeltaQueueResult.RECOVERED_EXACT_QUEUE
         }
         check(streamChannel.canQueueStructuralTransaction()) {
             "V2 stream requires binding rollover"
         }
         streamChannel.queueCurrentDelta(
-            M0aCurrentDeltaSourceV1 { requested -> receipt.takeIf { requested == selector } },
+            CurrentDeltaSourceV1 { requested -> receipt.takeIf { requested == selector } },
             selector,
-            M0aTransactionResponseProfileV1.ordinary,
+            TransactionResponseProfileV1.ordinary,
         )
         pendingM3Cut = candidate
-        return M3CurrentDeltaQueueResult.QUEUED
+        return CurrentDeltaQueueResult.QUEUED
     }
 
     @Synchronized
-    private fun onStructuralTransactionAcknowledged(baseline: M0aCommittedBaselineV1) {
+    private fun onStructuralTransactionAcknowledged(baseline: CommittedBaselineV1) {
         if (disposed.get()) return
-        val selector = M0aCurrentDeltaSelectorV1(
+        val selector = CurrentDeltaSelectorV1(
             baseline.transactionId,
             baseline.geometryRevision,
             baseline.lineageRevision,
@@ -349,21 +349,21 @@ class VisibilityGridV2Binding internal constructor(
             val cut = snapshot()
             val session = cut.sessionId ?: return
             val group = cut.captureGroupId ?: return
-            acknowledgedEmptyBaseline = M3CommittedEmptyBaseline(
+            acknowledgedEmptyBaseline = committedEmptyBaseline(
                 bindingIdentity = "${session.hex()}:${group.hex()}:${cut.bindingGeneration}:${cut.lifecycleSequence}",
                 groupIdentity = group.hex(),
                 transactionId = baseline.transactionId,
                 geometryRevision = baseline.geometryRevision,
                 lineageRevision = baseline.lineageRevision,
             )
-            acknowledgedM3Cut = M3AcknowledgedCut.from(selector)
+            acknowledgedM3Cut = AcknowledgedCut.from(selector)
             return
         }
         val pending = pendingM3Cut ?: return
         if (pending.selector != selector) return
         pendingM3Cut = null
-        acknowledgedM3Cut = M3AcknowledgedCut.from(selector)
-        m3AcknowledgementListener?.invoke(selector)
+        acknowledgedM3Cut = AcknowledgedCut.from(selector)
+        acknowledgementListener?.invoke(selector)
     }
 
     private fun onControlCall(call: MethodCall, result: MethodChannel.Result) {
@@ -411,7 +411,7 @@ class VisibilityGridV2Binding internal constructor(
             if (!isDebuggable) {
                 result.error("VG_PROTOCOL_INVALID", "V2 recovery seam is debug-only", null)
             } else {
-                val old = M0aCommittedBaselineV1(
+                val old = CommittedBaselineV1(
                     transactionId = Long.MAX_VALUE,
                     geometryRevision = 11,
                     lineageRevision = 12,
@@ -438,21 +438,21 @@ class VisibilityGridV2Binding internal constructor(
                 val before = lifecycleResources().ownedResourceCount
                 val correlation = newOpaqueToken()
                 issue98Correlation = correlation
-                val staleEffectRequest = M0aPacketCodec.encodeRequest(
-                    M0aPacketCodec.Request(
+                val staleEffectRequest = PacketCodec.encodeRequest(
+                    PacketCodec.Request(
                         requestFlags = 0,
                         streamToken = 99,
                         acknowledgedTransactionId = old.transactionId,
                         acknowledgedGeometryRevision = old.geometryRevision,
                         acknowledgedLineageRevision = old.lineageRevision,
                         nextStyleRevision = old.styleRevision + 1,
-                        maximumResponseBytes = M0aPacketCodec.responseMinimumBytes,
-                        styleRecords = listOf(ByteArray(M0aPacketCodec.styleRecordBytes)),
+                        maximumResponseBytes = PacketCodec.responseMinimumBytes,
+                        styleRecords = listOf(ByteArray(PacketCodec.styleRecordBytes)),
                         commandBytes = byteArrayOf(),
                         requestSequence = 1,
                     ),
                 )
-                issue98Probe = M0aDebugTransportProbe(oldQualifier + staleEffectRequest, old)
+                issue98Probe = DebugTransportProbe(oldQualifier + staleEffectRequest, old)
                 issue98RestoredBaseline = old
                 issue98AuthorityArmed = false
                 replaceBinding()
@@ -639,10 +639,10 @@ class VisibilityGridV2Binding internal constructor(
             return
         }
         val operation = when (call.method) {
-            "start" -> M0aControlOperation.START
-            "beginCheckpoint" -> M0aControlOperation.BEGIN_CHECKPOINT
-            "releaseCheckpoint" -> M0aControlOperation.RELEASE_CHECKPOINT
-            "stop" -> M0aControlOperation.STOP
+            "start" -> ControlOperation.START
+            "beginCheckpoint" -> ControlOperation.BEGIN_CHECKPOINT
+            "releaseCheckpoint" -> ControlOperation.RELEASE_CHECKPOINT
+            "stop" -> ControlOperation.STOP
             else -> null
         }
         val admission = operation?.let { admitControl(call.arguments as? ByteArray) }
@@ -657,11 +657,11 @@ class VisibilityGridV2Binding internal constructor(
                 val outcome = runCatching {
                     checkCurrentBinding(admission.generation, admission.qualifier)
                     recordExecutorOperation("control:${operation.name.lowercase()}")
-                    val correlated = M0aControlCodec.decodeCorrelatedRequest(admission.payload, operation)
+                    val correlated = ControlCodec.decodeCorrelatedRequest(admission.payload, operation)
                     val request = correlated.request
                     val framingFailure = correlated.failure
                     val payloadFailure = if (framingFailure == null) {
-                        M0aControlCodec.validateControlPayload(request)
+                        ControlCodec.validateControlPayload(request)
                     } else null
                     val malformed = framingFailure ?: payloadFailure
                     if (malformed != null) {
@@ -672,11 +672,11 @@ class VisibilityGridV2Binding internal constructor(
                             qualify(response)
                         }
                     } else {
-                        val wasIdle = lifecycle.state() == M0aControlLifecycle.State.IDLE
+                        val wasIdle = lifecycle.state() == controlLifecycle.State.IDLE
                         val response = lifecycle.handle(request, admission.payload)
-                        val decoded = M0aControlCodec.decodeResponse(response)
+                        val decoded = ControlCodec.decodeResponse(response)
                         if (
-                            wasIdle && operation == M0aControlOperation.START &&
+                            wasIdle && operation == ControlOperation.START &&
                             decoded.outcome == 0
                         ) {
                             recoveryGroupCut = RecoveryGroupCut.from(request)
@@ -687,7 +687,7 @@ class VisibilityGridV2Binding internal constructor(
                         synchronized(publicationFence) {
                             checkCurrentBinding(admission.generation, admission.qualifier)
                             if (
-                                wasIdle && operation == M0aControlOperation.START &&
+                                wasIdle && operation == ControlOperation.START &&
                                 decoded.outcome == 0
                             ) {
                                 operationGeneration++
@@ -750,9 +750,9 @@ class VisibilityGridV2Binding internal constructor(
             return
         }
         try {
-            val query = M0aCommitReceiptQueryV1(
+            val query = CommitReceiptQueryV1(
                 controlRequestId = parseUuid(arguments.requiredString("controlRequestId")),
-                scope = M0aCommittedBaselineScopeV1(
+                scope = CommittedBaselineScopeV1(
                     sessionId = parseUuid(arguments.requiredString("sessionId")),
                     captureGroupId = parseUuid(arguments.requiredString("captureGroupId")),
                     sessionGeneration = arguments.requiredLong("sessionGeneration"),
@@ -766,7 +766,7 @@ class VisibilityGridV2Binding internal constructor(
                 targetGeometryRevision = arguments.requiredLong("targetGeometryRevision"),
                 targetLineageRevision = arguments.requiredLong("targetLineageRevision"),
             )
-            val receipt = committedBaselineAuthority.queryReceipt(query)
+            val receipt = CommittedBaselineAuthority.queryReceipt(query)
                 ?: throw StaleReceiptException()
             result.success(receipt.toMap())
         } catch (_: StaleReceiptException) {
@@ -777,15 +777,15 @@ class VisibilityGridV2Binding internal constructor(
     }
 
     private fun activeReceiptQuery(
-        request: M0aPacketCodec.Request,
-        targetBaseline: M0aCommittedBaselineV1,
-    ): M0aCommitReceiptQueryV1? {
+        request: PacketCodec.Request,
+        targetBaseline: CommittedBaselineV1,
+    ): CommitReceiptQueryV1? {
         val controlRequestId = activeControlRequestId ?: return null
         val sessionId = activeSessionId ?: return null
         val captureGroupId = activeCaptureGroupId ?: return null
-        return M0aCommitReceiptQueryV1(
+        return CommitReceiptQueryV1(
             controlRequestId = controlRequestId,
-            scope = M0aCommittedBaselineScopeV1(
+            scope = CommittedBaselineScopeV1(
                 sessionId = sessionId,
                 captureGroupId = captureGroupId,
                 sessionGeneration = activeSessionGeneration,
@@ -802,7 +802,7 @@ class VisibilityGridV2Binding internal constructor(
     }
 
     @Synchronized
-    private fun queueInitialTransaction(baseline: M0aCommittedBaselineV1) {
+    private fun queueInitialTransaction(baseline: CommittedBaselineV1) {
         check(!initialTransactionQueued) { "Initial transaction already queued" }
         check(baseline.transactionId == 0L) {
             "A fresh binding must allocate transaction 1 from cursor zero"
@@ -828,35 +828,35 @@ class VisibilityGridV2Binding internal constructor(
             groupFromWorldIdentity = baseline.groupFromWorldIdentity,
             worldFromGroupIdentity = baseline.worldFromGroupIdentity,
         )
-        if (baseline != M0aCommittedBaselineV1.ZERO) {
+        if (baseline != CommittedBaselineV1.ZERO) {
             val session = requireNotNull(activeSessionId)
             val group = requireNotNull(activeCaptureGroupId)
-            val scope = M0aCommittedBaselineScopeV1(
+            val scope = CommittedBaselineScopeV1(
                 session, group, activeSessionGeneration, activeGroupGeneration,
             )
             issue98RestoredBaseline?.let { debugBaseline ->
-                val exactFreshBaseline = M0aCommittedBaselineV1.forFreshBinding(debugBaseline) == baseline
+                val exactFreshBaseline = CommittedBaselineV1.forFreshBinding(debugBaseline) == baseline
                 check(isDebuggable && issue98AuthorityArmed && exactFreshBaseline) {
                     "Debug restored baseline is not correlated to this replacement " +
                         "(debuggable=$isDebuggable armed=$issue98AuthorityArmed exact=$exactFreshBaseline)"
                 }
-                check(committedBaselineAuthority.snapshot(scope) == M0aCommittedBaselineV1.ZERO) {
+                check(CommittedBaselineAuthority.snapshot(scope) == CommittedBaselineV1.ZERO) {
                     "Debug replacement scope already has a different authority"
                 }
-                committedBaselineAuthority.publish(scope, debugBaseline)
+                CommittedBaselineAuthority.publish(scope, debugBaseline)
                 issue98RestoredBaseline = null
                 issue98AuthorityArmed = false
             }
-            val authoritative = committedBaselineAuthority.snapshot(scope)
-            check(authoritative != M0aCommittedBaselineV1.ZERO &&
-                M0aCommittedBaselineV1.forFreshBinding(authoritative) == baseline
-            ) { "Restored M3 baseline is not authenticated by the capture-group authority" }
-            val selector = M3AcknowledgedCut(
+            val authoritative = CommittedBaselineAuthority.snapshot(scope)
+            check(authoritative != CommittedBaselineV1.ZERO &&
+                CommittedBaselineV1.forFreshBinding(authoritative) == baseline
+            ) { "Restored canonical surface baseline is not authenticated by the capture-group authority" }
+            val selector = AcknowledgedCut(
                 transactionId = 0,
                 targetGeometryRevision = baseline.geometryRevision,
                 targetLineageRevision = baseline.lineageRevision,
             )
-            acknowledgedEmptyBaseline = M3CommittedEmptyBaseline(
+            acknowledgedEmptyBaseline = committedEmptyBaseline(
                 bindingIdentity = "${session.hex()}:${group.hex()}:$currentBindingGeneration:$lifecycleSequence",
                 groupIdentity = group.hex(),
                 transactionId = selector.transactionId,
@@ -868,16 +868,16 @@ class VisibilityGridV2Binding internal constructor(
             return
         }
         streamChannel.queueStructuralTransaction(
-            M0aStructuralTransactionProducerV1.produce(
+            StructuralTransactionProducerV1.produce(
                 transactionId = 1,
                 baseGeometryRevision = baseline.geometryRevision,
                 targetGeometryRevision = baseline.geometryRevision + 1,
                 targetLineageRevision = baseline.lineageRevision + 1,
                 bytes = byteArrayOf(),
             ),
-            M0aTransactionResponseProfileV1.ordinary,
+            TransactionResponseProfileV1.ordinary,
         )
-        expectedEmptyBootstrap = M0aCurrentDeltaSelectorV1(
+        expectedEmptyBootstrap = CurrentDeltaSelectorV1(
             transactionId = 1,
             targetGeometryRevision = baseline.geometryRevision + 1,
             targetLineageRevision = baseline.lineageRevision + 1,
@@ -909,8 +909,8 @@ class VisibilityGridV2Binding internal constructor(
             after = lifecycleResources(excludedCleanup = currentCleanup),
         )
         synchronized(publicationFence) {
-            lifecycle = M0aControlLifecycle(
-                committedBaselineAuthority = committedBaselineAuthority,
+            lifecycle = controlLifecycle(
+                CommittedBaselineAuthority = CommittedBaselineAuthority,
                 initialCommittedBaseline = lifecycle.committedBaseline(),
             )
             currentBindingGeneration = nextBindingGeneration.incrementAndGet()
@@ -982,7 +982,7 @@ class VisibilityGridV2Binding internal constructor(
         replacementBinding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = viewId,
-            committedBaselineAuthority = committedBaselineAuthority,
+            CommittedBaselineAuthority = CommittedBaselineAuthority,
             lifecycleSequenceAllocator = lifecycleSequenceAllocator,
             viewGeneration = viewGeneration,
             arSessionIdentity = arSessionIdentity,
@@ -999,7 +999,7 @@ class VisibilityGridV2Binding internal constructor(
             initialCommittedBaselineSeed = lifecycle.committedBaseline(),
         ).also { replacement ->
             observationRuntime?.let(replacement::attachObservationRuntime)
-            m3AcknowledgementListener?.let(replacement::attachM3AcknowledgementListener)
+            acknowledgementListener?.let(replacement::attachM3AcknowledgementListener)
         }
         return oldSnapshot.withCleanupBalances(
             closedBefore = closedBefore,
@@ -1142,7 +1142,7 @@ class VisibilityGridV2Binding internal constructor(
     private fun currentIdentity(): BindingIdentity =
         BindingIdentity(currentBindingGeneration, bindingQualifier())
 
-    private fun M0aUuid.hex(): String = bytes.joinToString("") { byte ->
+    private fun Uuid.hex(): String = bytes.joinToString("") { byte ->
         "%02x".format(byte.toInt() and 0xff)
     }
 
@@ -1228,19 +1228,19 @@ class VisibilityGridV2Binding internal constructor(
 
     private class StaleReceiptException : IllegalStateException()
 
-    private data class M3CurrentDeltaCut(
-        val selector: M0aCurrentDeltaSelectorV1,
+    private data class CurrentDeltaCut(
+        val selector: CurrentDeltaSelectorV1,
         val baseGeometryRevision: Long,
         val commandHash: ByteArray,
     ) {
-        fun matches(other: M3CurrentDeltaCut): Boolean =
+        fun matches(other: CurrentDeltaCut): Boolean =
             selector == other.selector &&
                 baseGeometryRevision == other.baseGeometryRevision &&
                 commandHash.contentEquals(other.commandHash)
     }
 
     /** Binding-local acknowledged cursor; fresh binding transaction zero is valid here. */
-    private data class M3AcknowledgedCut(
+    private data class AcknowledgedCut(
         val transactionId: Long,
         val targetGeometryRevision: Long,
         val targetLineageRevision: Long,
@@ -1248,26 +1248,26 @@ class VisibilityGridV2Binding internal constructor(
         init { require(transactionId >= 0 && targetGeometryRevision > 0 && targetLineageRevision > 0) }
 
         companion object {
-            fun from(selector: M0aCurrentDeltaSelectorV1) = M3AcknowledgedCut(
+            fun from(selector: CurrentDeltaSelectorV1) = AcknowledgedCut(
                 selector.transactionId, selector.targetGeometryRevision, selector.targetLineageRevision,
             )
         }
     }
 
     private fun nextPortableOrdinal(value: Long): Long {
-        check(value < Long.MAX_VALUE) { "M3 current delta requires binding rollover" }
+        check(value < Long.MAX_VALUE) { "canonical surface current delta requires binding rollover" }
         return value + 1
     }
 
     internal data class RecoveryGroupCut(
-        val sessionId: M0aUuid?,
-        val captureGroupId: M0aUuid?,
+        val sessionId: Uuid?,
+        val captureGroupId: Uuid?,
         val sessionGeneration: Long,
         val groupGeneration: Long,
         val coverageEpoch: Long,
     ) {
         companion object {
-            fun from(request: M0aControlRequest) = RecoveryGroupCut(
+            fun from(request: ControlRequest) = RecoveryGroupCut(
                 sessionId = request.sessionId,
                 captureGroupId = request.captureGroupId,
                 sessionGeneration = request.sessionGeneration,
@@ -1508,12 +1508,12 @@ private fun Map<*, *>.requiredToken(key: String): ByteArray {
     return value.copyOf()
 }
 
-private fun parseUuid(value: String): M0aUuid {
+private fun parseUuid(value: String): Uuid {
     require(value.length == 32) { "V2 receipt UUID must be 32 hex characters" }
     val bytes = ByteArray(16) { index ->
         value.substring(index * 2, index * 2 + 2).toInt(16).toByte()
     }
-    return M0aUuid(bytes)
+    return Uuid(bytes)
 }
 
 internal class VisibilityGridV2DebugRecoverySeam {
@@ -1618,7 +1618,7 @@ internal class VisibilityGridV2DebugRecoverySeam {
         if (interrupted) Thread.currentThread().interrupt()
     }
 
-    fun beforeRequest(request: M0aPacketCodec.Request) {
+    fun beforeRequest(request: PacketCodec.Request) {
         val shouldStall = synchronized(lock) {
             acknowledgementStall && request.requestSequence == 3L && !stallClaimed
         }
@@ -1662,9 +1662,9 @@ internal class VisibilityGridV2DebugRecoverySeam {
         oldContinuationFenced()
     }
 
-    fun afterRestoredStartQualification(request: M0aControlRequest) {
-        val restored = request.operation == M0aControlOperation.START &&
-            M0aStartRequestCodecV2.decode(request.payload).restoreRequested
+    fun afterRestoredStartQualification(request: ControlRequest) {
+        val restored = request.operation == ControlOperation.START &&
+            StartRequestCodecV2.decode(request.payload).restoreRequested
         if (!restored) return
         val gate = synchronized(lock) {
             if (!restoredStartStall || !restoredStartPhase || stallClaimed) return
@@ -1689,10 +1689,10 @@ internal class VisibilityGridV2DebugRecoverySeam {
         if (commitPublicationStall || acknowledgementStall) appendTrace("commit-published")
     }
 
-    fun acceptedCut(request: M0aControlRequest) = synchronized(lock) {
+    fun acceptedCut(request: ControlRequest) = synchronized(lock) {
         if (recoveryTraceActive) {
             appendTrace("accepted-cut:${request.cutIdentity()}")
-            val start = M0aStartRequestCodecV2.decode(request.payload)
+            val start = StartRequestCodecV2.decode(request.payload)
             appendTrace(
                 "accepted-start:restore=${start.restoreRequested}:" +
                     "geometry=${start.restoredRevisions[1]}:lineage=${start.restoredRevisions[2]}",
@@ -1780,7 +1780,7 @@ internal class VisibilityGridV2DebugRecoverySeam {
         trace += entry
     }
 
-    private fun M0aControlRequest.cutIdentity(): String =
+    private fun ControlRequest.cutIdentity(): String =
         "${sessionId.hex()}:${captureGroupId.hex()}:" +
             "$sessionGeneration:$groupGeneration:$coverageEpoch"
 
@@ -1791,7 +1791,7 @@ internal class VisibilityGridV2DebugRecoverySeam {
         "${sessionId?.hex()}:${captureGroupId?.hex()}:" +
             "$sessionGeneration:$groupGeneration:$coverageEpoch"
 
-    private fun M0aUuid.hex(): String = bytes.joinToString("") { byte ->
+    private fun Uuid.hex(): String = bytes.joinToString("") { byte ->
         "%02x".format(byte.toInt() and 0xff)
     }
 }

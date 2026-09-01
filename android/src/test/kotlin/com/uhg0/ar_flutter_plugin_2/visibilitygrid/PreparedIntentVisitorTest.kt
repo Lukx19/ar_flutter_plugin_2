@@ -20,8 +20,8 @@ import org.junit.Test
 class PreparedIntentVisitorTest {
     @Test
     fun `file backed intent rehashes and streams immutable scalar records without live N work`() {
-        val smallDirectory = Files.createTempDirectory("m3-intent-visitor-small-").toFile()
-        val largeDirectory = Files.createTempDirectory("m3-intent-visitor-large-").toFile()
+        val smallDirectory = Files.createTempDirectory("canonical-surface-intent-visitor-small-").toFile()
+        val largeDirectory = Files.createTempDirectory("canonical-surface-intent-visitor-large-").toFile()
         try {
             val small = view("small", 1)
             val large = view("large", 100_000)
@@ -32,24 +32,24 @@ class PreparedIntentVisitorTest {
             val smallResult = smallIntent.visit(smallVisitor)
             val largeResult = largeIntent.visit(largeVisitor)
 
-            assertTrue(smallResult is M3PreparedIntentVisitResult.Complete)
-            assertTrue(largeResult is M3PreparedIntentVisitResult.Complete)
+            assertTrue(smallResult is PreparedIntentVisitResult.Complete)
+            assertTrue(largeResult is PreparedIntentVisitResult.Complete)
             assertEquals(1, smallVisitor.rows)
             assertEquals(smallVisitor.rows, largeVisitor.rows)
             assertEquals(smallVisitor.supports, largeVisitor.supports)
             assertEquals(smallVisitor.sources, largeVisitor.sources)
             assertEquals(smallVisitor.lineage, largeVisitor.lineage)
             assertEquals(1, smallVisitor.terminals)
-            assertEquals(M3CanonicalDirtyJournal.WRITER_SCRATCH_BYTES, 65_536)
-            assertEquals(65_536, M3PreparedIntentVisitorResources.STREAMING_SCRATCH_BYTES)
-            assertEquals(0, M3PreparedIntentVisitorResources.RETAINED_DECODED_RECORD_BYTES)
-            assertTrue(M3PreparedIntentVisitorResources.PHASE_PEAK_BYTES <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
-            assertTrue((smallResult as M3PreparedIntentVisitResult.Complete).currentReceipt.length <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
-            assertTrue((largeResult as M3PreparedIntentVisitResult.Complete).currentReceipt.length <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
-            assertTrue(smallIntent.currentReceipt() is M3PreparedIntentCurrentReceiptResult.Complete)
-            assertTrue(smallIntent.identity() is M3PreparedIntentIdentityResult.Complete)
+            assertEquals(CanonicalDirtyJournal.WRITER_SCRATCH_BYTES, 65_536)
+            assertEquals(65_536, PreparedIntentVisitorResources.STREAMING_SCRATCH_BYTES)
+            assertEquals(0, PreparedIntentVisitorResources.RETAINED_DECODED_RECORD_BYTES)
+            assertTrue(PreparedIntentVisitorResources.PHASE_PEAK_BYTES <= CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
+            assertTrue((smallResult as PreparedIntentVisitResult.Complete).currentReceipt.length <= CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
+            assertTrue((largeResult as PreparedIntentVisitResult.Complete).currentReceipt.length <= CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
+            assertTrue(smallIntent.currentReceipt() is PreparedIntentCurrentReceiptResult.Complete)
+            assertTrue(smallIntent.identity() is PreparedIntentIdentityResult.Complete)
             val staleGetters = setOf("getSourceCut", "getTargetHighWater", "getWalLength", "getWalHash", "getCurrentLength", "getCurrentHash")
-            assertTrue(M3PreparedIntent::class.java.methods.none { it.name in staleGetters })
+            assertTrue(PreparedIntent::class.java.methods.none { it.name in staleGetters })
         } finally {
             smallDirectory.deleteRecursively()
             largeDirectory.deleteRecursively()
@@ -58,7 +58,7 @@ class PreparedIntentVisitorTest {
 
     @Test
     fun `early stop close and disk corruption never yield a terminal success`() {
-        val directory = Files.createTempDirectory("m3-intent-visitor-fault-").toFile()
+        val directory = Files.createTempDirectory("canonical-surface-intent-visitor-fault-").toFile()
         try {
             val view = view("fault", 1)
             val stopped = intent(directory, view, "stop")
@@ -66,22 +66,22 @@ class PreparedIntentVisitorTest {
                 override fun onDirtyRow(id: Long, x: Int, y: Int, z: Int, packedNormal: Int, confidence: Int, fingerprint0: Long, fingerprint1: Long, fingerprint2: Long, fingerprint3: Long) = false
             }
             val stopResult = stopped.visit(stopVisitor)
-            assertTrue(stopResult is M3PreparedIntentVisitResult.Stopped)
+            assertTrue(stopResult is PreparedIntentVisitResult.Stopped)
             assertEquals(0, stopVisitor.terminals)
 
             stopped.close()
             val afterClose = CountingVisitor()
-            assertEquals(M3PreparedIntentVisitRefusal.CLOSED, (stopped.visit(afterClose) as M3PreparedIntentVisitResult.Refused).reason)
+            assertEquals(PreparedIntentVisitRefusal.CLOSED, (stopped.visit(afterClose) as PreparedIntentVisitResult.Refused).reason)
             assertEquals(0, afterClose.callbacks)
 
-            val corruptDirectory = Files.createTempDirectory("m3-intent-visitor-corrupt-").toFile()
+            val corruptDirectory = Files.createTempDirectory("canonical-surface-intent-visitor-corrupt-").toFile()
             try {
                 val corrupted = intent(corruptDirectory, view("corrupt", 1), "corrupt")
                 val bytes = corrupted.file.readBytes()
                 bytes[bytes.size / 2] = (bytes[bytes.size / 2].toInt() xor 0x5a).toByte()
                 corrupted.file.writeBytes(bytes)
-                assertEquals(M3PreparedIntentVisitRefusal.CORRUPT_INTENT,
-                    (corrupted.visit(CountingVisitor()) as M3PreparedIntentVisitResult.Refused).reason)
+                assertEquals(PreparedIntentVisitRefusal.CORRUPT_INTENT,
+                    (corrupted.visit(CountingVisitor()) as PreparedIntentVisitResult.Refused).reason)
             } finally { corruptDirectory.deleteRecursively() }
         } finally { directory.deleteRecursively() }
     }
@@ -127,14 +127,14 @@ class PreparedIntentVisitorTest {
         val supports = rows.associate { row -> row.id.value to listOf(scenarioSource(row.id.value, row.voxel.x)) }
         val active = scenarioView("all-kinds-active", rows, geometry = 7, lineage = 5, high = 5, sources = sources, supports = supports)
         val cases = listOf(
-            empty to prepare(empty, M3FeatureMutationCommand("feature-add", 0, 0, scenarioTarget(10))),
-            active to prepare(active, M3FeatureMutationCommand("feature-refine", 7, 5, scenarioTarget(0, M3SurfaceId(1), confidence = 191))),
-            empty to prepare(empty, scenarioCommand("create", M3CanonicalOperation.CREATE, 0, 0, emptyList(), scenarioTarget(0), scenarioTarget(1))),
-            active to prepare(active, scenarioCommand("relocation", M3CanonicalOperation.RELOCATION, 7, 5, listOf(M3SurfaceId(1)), scenarioTarget(10, M3SurfaceId(1)))),
-            active to prepare(active, scenarioCommand("merge", M3CanonicalOperation.MERGE, 7, 5, listOf(M3SurfaceId(2), M3SurfaceId(3)), scenarioTarget(20))),
-            active to prepare(active, scenarioCommand("split", M3CanonicalOperation.SPLIT, 7, 5, listOf(M3SurfaceId(4)), scenarioTarget(30), scenarioTarget(31))),
-            active to prepare(active, scenarioCommand("replacement", M3CanonicalOperation.REPLACEMENT, 7, 5, listOf(M3SurfaceId(1)), scenarioTarget(40))),
-            empty to prepare(empty, M3CanonicalFeatureBatchCommand(
+            empty to prepare(empty, FeatureMutationCommand("feature-add", 0, 0, scenarioTarget(10))),
+            active to prepare(active, FeatureMutationCommand("feature-refine", 7, 5, scenarioTarget(0, SurfaceId(1), confidence = 191))),
+            empty to prepare(empty, scenarioCommand("create", CanonicalOperation.CREATE, 0, 0, emptyList(), scenarioTarget(0), scenarioTarget(1))),
+            active to prepare(active, scenarioCommand("relocation", CanonicalOperation.RELOCATION, 7, 5, listOf(SurfaceId(1)), scenarioTarget(10, SurfaceId(1)))),
+            active to prepare(active, scenarioCommand("merge", CanonicalOperation.MERGE, 7, 5, listOf(SurfaceId(2), SurfaceId(3)), scenarioTarget(20))),
+            active to prepare(active, scenarioCommand("split", CanonicalOperation.SPLIT, 7, 5, listOf(SurfaceId(4)), scenarioTarget(30), scenarioTarget(31))),
+            active to prepare(active, scenarioCommand("replacement", CanonicalOperation.REPLACEMENT, 7, 5, listOf(SurfaceId(1)), scenarioTarget(40))),
+            empty to prepare(empty, CanonicalFeatureBatchCommand(
                 "feature-batch", 0, 0,
                 listOf(FeatureFusionChange.Upsert(FeatureFusionCandidate(
                     50, 0, 0, 2, 1,
@@ -142,15 +142,15 @@ class PreparedIntentVisitorTest {
                 ))),
             )),
         )
-        assertEquals(M3PreparedMutationKind.entries, cases.map { it.second.kind })
+        assertEquals(PreparedMutationKind.entries, cases.map { it.second.kind })
 
         cases.forEach { (view, plan) ->
-            val directory = Files.createTempDirectory("m3-intent-kind-${plan.kind.name.lowercase()}-").toFile()
+            val directory = Files.createTempDirectory("canonical-surface-intent-kind-${plan.kind.name.lowercase()}-").toFile()
             try {
                 val expected = ScalarSnapshot.from(plan)
                 val prepared = intent(directory, view, plan)
                 val visitor = ScalarVisitor()
-                val result = prepared.visit(visitor) as M3PreparedIntentVisitResult.Complete
+                val result = prepared.visit(visitor) as PreparedIntentVisitResult.Complete
                 assertEquals(plan.kind.name, expected, visitor.snapshot())
                 assertEquals(plan.kind.name, expected.identity, result.identity)
                 assertEquals(plan.kind.name, plan.commandId, result.identity.commandId)
@@ -162,15 +162,15 @@ class PreparedIntentVisitorTest {
 
     @Test
     fun `fresh validated identity follows a fully rechecksummed disk divergence`() {
-        val directory = Files.createTempDirectory("m3-intent-disk-divergence-").toFile()
+        val directory = Files.createTempDirectory("canonical-surface-intent-disk-divergence-").toFile()
         try {
             val prepared = intent(directory, view("disk-divergence", 1), "disk-divergence")
-            val before = (prepared.identity() as M3PreparedIntentIdentityResult.Complete).identity
-            val changedHash = M3CanonicalReceiptBytes(testSha256("changed-on-disk".encodeToByteArray()))
+            val before = (prepared.identity() as PreparedIntentIdentityResult.Complete).identity
+            val changedHash = CanonicalReceiptBytes(testSha256("changed-on-disk".encodeToByteArray()))
             RechecksummedIntentFixture(prepared).rewriteHeader { header ->
                 header.copy(sourceCut = header.sourceCut.copy(sourceHash = changedHash))
             }
-            val after = (prepared.identity() as M3PreparedIntentIdentityResult.Complete).identity
+            val after = (prepared.identity() as PreparedIntentIdentityResult.Complete).identity
             assertEquals(changedHash, after.sourceCut.sourceHash)
             assertTrue(before.sourceCut.sourceHash != after.sourceCut.sourceHash)
         } finally { directory.deleteRecursively() }
@@ -178,7 +178,7 @@ class PreparedIntentVisitorTest {
 
     @Test
     fun `rechecksummed structural ordinal substitution changes the observed durable kind`() {
-        val directory = Files.createTempDirectory("m3-intent-kind-substitution-").toFile()
+        val directory = Files.createTempDirectory("canonical-surface-intent-kind-substitution-").toFile()
         try {
             val row = scenarioSurface(1, 0)
             val source = scenarioSource(1, 0)
@@ -187,29 +187,29 @@ class PreparedIntentVisitorTest {
                 supports = mapOf(1L to listOf(source)),
             )
             val plan = prepare(active, scenarioCommand(
-                "kind-substitution", M3CanonicalOperation.RELOCATION, 0, 0,
-                listOf(M3SurfaceId(1)), scenarioTarget(10, M3SurfaceId(1)),
+                "kind-substitution", CanonicalOperation.RELOCATION, 0, 0,
+                listOf(SurfaceId(1)), scenarioTarget(10, SurfaceId(1)),
             ))
             val prepared = intent(directory, active, plan)
-            val before = (prepared.identity() as M3PreparedIntentIdentityResult.Complete).identity
-            assertEquals(M3PreparedMutationKind.RELOCATION, before.kind)
-            RechecksummedIntentFixture(prepared).rewriteKind(M3PreparedMutationKind.REPLACEMENT)
-            val after = (prepared.identity() as M3PreparedIntentIdentityResult.Complete).identity
+            val before = (prepared.identity() as PreparedIntentIdentityResult.Complete).identity
+            assertEquals(PreparedMutationKind.RELOCATION, before.kind)
+            RechecksummedIntentFixture(prepared).rewriteKind(PreparedMutationKind.REPLACEMENT)
+            val after = (prepared.identity() as PreparedIntentIdentityResult.Complete).identity
             assertEquals("kind-substitution", after.commandId)
-            assertEquals(M3PreparedMutationKind.REPLACEMENT, after.kind)
+            assertEquals(PreparedMutationKind.REPLACEMENT, after.kind)
             assertTrue(before != after)
         } finally { directory.deleteRecursively() }
     }
 
     @Test
     fun `legacy v1 feature body remains readable while structural cardinality is typed refused`() {
-        val featureDirectory = Files.createTempDirectory("m3-intent-v1-feature-").toFile()
-        val structuralDirectory = Files.createTempDirectory("m3-intent-v1-structural-").toFile()
+        val featureDirectory = Files.createTempDirectory("canonical-surface-intent-v1-feature-").toFile()
+        val structuralDirectory = Files.createTempDirectory("canonical-surface-intent-v1-structural-").toFile()
         try {
             val feature = intent(featureDirectory, view("v1-feature", 1), "v1-feature")
             RechecksummedIntentFixture(feature).downgradeBodyToLegacyV1()
             val featureVisitor = CountingVisitor()
-            assertTrue(feature.visit(featureVisitor) is M3PreparedIntentVisitResult.Complete)
+            assertTrue(feature.visit(featureVisitor) is PreparedIntentVisitResult.Complete)
             assertEquals(1, featureVisitor.rows)
             assertEquals(1, featureVisitor.terminals)
 
@@ -220,15 +220,15 @@ class PreparedIntentVisitorTest {
                 supports = mapOf(1L to listOf(source)),
             )
             val plan = prepare(active, scenarioCommand(
-                "v1-relocation", M3CanonicalOperation.RELOCATION, 0, 0,
-                listOf(M3SurfaceId(1)), scenarioTarget(10, M3SurfaceId(1)),
+                "v1-relocation", CanonicalOperation.RELOCATION, 0, 0,
+                listOf(SurfaceId(1)), scenarioTarget(10, SurfaceId(1)),
             ))
             val structural = intent(structuralDirectory, active, plan)
             RechecksummedIntentFixture(structural).downgradeBodyToLegacyV1()
             val structuralVisitor = CountingVisitor()
             assertEquals(
-                M3PreparedIntentVisitRefusal.UNVERIFIABLE_LEGACY_STRUCTURAL_CARDINALITY,
-                (structural.visit(structuralVisitor) as M3PreparedIntentVisitResult.Refused).reason,
+                PreparedIntentVisitRefusal.UNVERIFIABLE_LEGACY_STRUCTURAL_CARDINALITY,
+                (structural.visit(structuralVisitor) as PreparedIntentVisitResult.Refused).reason,
             )
             assertEquals(0, structuralVisitor.terminals)
         } finally {
@@ -239,15 +239,15 @@ class PreparedIntentVisitorTest {
 
     @Test
     fun `close is serialized with an active visit and prevents every later callback`() {
-        val directory = Files.createTempDirectory("m3-intent-visitor-close-").toFile()
+        val directory = Files.createTempDirectory("canonical-surface-intent-visitor-close-").toFile()
         val executor = Executors.newFixedThreadPool(2)
         try {
             val prepared = intent(directory, view("serialized-close", 1), "serialized-close")
             val entered = CountDownLatch(1)
             val release = CountDownLatch(1)
-            val visit = executor.submit<M3PreparedIntentVisitResult> {
+            val visit = executor.submit<PreparedIntentVisitResult> {
                 prepared.visit(object : CountingVisitor() {
-                    override fun onHeader(identity: M3PreparedIntentIdentity): Boolean {
+                    override fun onHeader(identity: PreparedIntentIdentity): Boolean {
                         entered.countDown()
                         assertTrue(release.await(10, TimeUnit.SECONDS))
                         return true
@@ -259,12 +259,12 @@ class PreparedIntentVisitorTest {
             Thread.sleep(50)
             assertFalse(close.isDone)
             release.countDown()
-            assertTrue(visit.get(10, TimeUnit.SECONDS) is M3PreparedIntentVisitResult.Complete)
+            assertTrue(visit.get(10, TimeUnit.SECONDS) is PreparedIntentVisitResult.Complete)
             close.get(10, TimeUnit.SECONDS)
 
             val afterClose = CountingVisitor()
-            assertEquals(M3PreparedIntentVisitRefusal.CLOSED,
-                (prepared.visit(afterClose) as M3PreparedIntentVisitResult.Refused).reason)
+            assertEquals(PreparedIntentVisitRefusal.CLOSED,
+                (prepared.visit(afterClose) as PreparedIntentVisitResult.Refused).reason)
             assertEquals(0, afterClose.callbacks)
         } finally {
             executor.shutdownNow()
@@ -273,83 +273,83 @@ class PreparedIntentVisitorTest {
     }
 
     private fun structuralFault(name: String, mutate: (RechecksummedIntentFixture) -> Unit) {
-        val directory = Files.createTempDirectory("m3-intent-corpus-$name-").toFile()
+        val directory = Files.createTempDirectory("canonical-surface-intent-corpus-$name-").toFile()
         try {
             val prepared = intent(directory, view(name, 1), name)
             mutate(RechecksummedIntentFixture(prepared))
             val visitor = CountingVisitor()
-            assertEquals(name, M3PreparedIntentVisitRefusal.CORRUPT_INTENT,
-                (prepared.visit(visitor) as M3PreparedIntentVisitResult.Refused).reason)
+            assertEquals(name, PreparedIntentVisitRefusal.CORRUPT_INTENT,
+                (prepared.visit(visitor) as PreparedIntentVisitResult.Refused).reason)
             assertEquals(name, 0, visitor.terminals)
         } finally { directory.deleteRecursively() }
     }
 
     private fun allocationRangeFault(name: String, mutate: (RechecksummedIntentFixture) -> Unit) {
-        val directory = Files.createTempDirectory("m3-intent-allocation-$name-").toFile()
+        val directory = Files.createTempDirectory("canonical-surface-intent-allocation-$name-").toFile()
         try {
             val view = scenarioView("allocation-$name")
-            val plan = prepare(view, M3FeatureMutationCommand(name, 0, 0, scenarioTarget(0)))
+            val plan = prepare(view, FeatureMutationCommand(name, 0, 0, scenarioTarget(0)))
             val prepared = intent(directory, view, plan)
             mutate(RechecksummedIntentFixture(prepared))
             val visitor = CountingVisitor()
-            assertEquals(name, M3PreparedIntentVisitRefusal.CORRUPT_INTENT,
-                (prepared.visit(visitor) as M3PreparedIntentVisitResult.Refused).reason)
+            assertEquals(name, PreparedIntentVisitRefusal.CORRUPT_INTENT,
+                (prepared.visit(visitor) as PreparedIntentVisitResult.Refused).reason)
             assertEquals(name, 0, visitor.terminals)
         } finally { directory.deleteRecursively() }
     }
 
-    private fun prepare(view: M3CanonicalStateView, command: Any): M3PreparedCanonicalMutation {
+    private fun prepare(view: CanonicalStateView, command: Any): PreparedCanonicalMutation {
         val result = when (command) {
-            is M3FeatureMutationCommand -> M3SurfaceOwnership.prepareMutation(view, M3SurfaceOwnershipConfiguration(), command)
-            is M3CanonicalTransactionCommand -> M3SurfaceOwnership.prepareMutation(view, M3SurfaceOwnershipConfiguration(), command)
-            is M3CanonicalFeatureBatchCommand -> M3MutableCanonicalOverlay.prepare(view, M3SurfaceOwnershipConfiguration(), command)
+            is FeatureMutationCommand -> SurfaceOwnership.prepareMutation(view, SurfaceOwnershipConfiguration(), command)
+            is CanonicalTransactionCommand -> SurfaceOwnership.prepareMutation(view, SurfaceOwnershipConfiguration(), command)
+            is CanonicalFeatureBatchCommand -> MutableCanonicalOverlay.prepare(view, SurfaceOwnershipConfiguration(), command)
             else -> error("unsupported command")
         }
-        return (result as M3CanonicalMutationPreparation.Prepared).mutation
+        return (result as CanonicalMutationPreparation.Prepared).mutation
     }
 
     private fun scenarioCommand(
         id: String,
-        kind: M3CanonicalOperation,
+        kind: CanonicalOperation,
         geometry: Long,
         lineage: Long,
-        sources: List<M3SurfaceId>,
-        vararg targets: M3CanonicalTarget,
-    ) = M3CanonicalTransactionCommand(id, kind, geometry, lineage, sources, targets.toList())
+        sources: List<SurfaceId>,
+        vararg targets: CanonicalTarget,
+    ) = CanonicalTransactionCommand(id, kind, geometry, lineage, sources, targets.toList())
 
-    private fun scenarioTarget(x: Int, id: M3SurfaceId? = null, confidence: Int = 192) =
-        M3CanonicalTarget(id, M3Voxel(x, 0, 0), 0, 0, confidence)
-    private fun scenarioSurface(id: Long, x: Int) = M3CompactSurface(M3SurfaceId(id), M3Voxel(x, 0, 0), 0, 192)
-    private fun scenarioSource(id: Long, x: Int) = M3PagedSource(
-        M3SurfaceId(id), M3Voxel(x, 0, 0), 0, 192, M3CanonicalReceiptBytes(ByteArray(32) { id.toByte() }),
+    private fun scenarioTarget(x: Int, id: SurfaceId? = null, confidence: Int = 192) =
+        CanonicalTarget(id, Voxel(x, 0, 0), 0, 0, confidence)
+    private fun scenarioSurface(id: Long, x: Int) = CompactSurface(SurfaceId(id), Voxel(x, 0, 0), 0, 192)
+    private fun scenarioSource(id: Long, x: Int) = PagedSource(
+        SurfaceId(id), Voxel(x, 0, 0), 0, 192, CanonicalReceiptBytes(ByteArray(32) { id.toByte() }),
     )
 
     private fun scenarioView(
         identity: String,
-        rows: List<M3CompactSurface> = emptyList(),
+        rows: List<CompactSurface> = emptyList(),
         geometry: Long = 0,
         lineage: Long = 0,
         high: Long = 1,
-        sources: List<M3PagedSource> = emptyList(),
-        supports: Map<Long, List<M3PagedSource>> = emptyMap(),
+        sources: List<PagedSource> = emptyList(),
+        supports: Map<Long, List<PagedSource>> = emptyMap(),
     ) = ScenarioView(identity, rows, geometry, lineage, high, sources, supports)
 
-    private fun intent(directory: File, view: M3CanonicalStateView, plan: M3PreparedCanonicalMutation): M3PreparedIntent {
+    private fun intent(directory: File, view: CanonicalStateView, plan: PreparedCanonicalMutation): PreparedIntent {
         val coordinator = StorageBudgetCoordinatorV2(directory, StorageBudgetPolicyV2(8L * 1024 * 1024, 4_096L), JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L }), freeBytes = { 16L * 1024 * 1024 })
-        val journal = (M3CanonicalDirtyJournal.open(view, directory, M3CoordinatorStorageBudget(coordinator)) as M3CanonicalDirtyJournalOpenResult.Opened).journal
-        return (journal.flush(plan) as M3CanonicalDirtyJournalFlushResult.Prepared).intent
+        val journal = (CanonicalDirtyJournal.open(view, directory, CoordinatorStorageBudget(coordinator)) as CanonicalDirtyJournalOpenResult.Opened).journal
+        return (journal.flush(plan) as CanonicalDirtyJournalFlushResult.Prepared).intent
     }
 
-    private fun intent(directory: File, view: TestView, command: String): M3PreparedIntent {
-        val plan = M3SurfaceOwnership.prepareMutation(view, M3SurfaceOwnershipConfiguration(),
-            M3FeatureMutationCommand(command, 0, 0, M3CanonicalTarget(M3SurfaceId(1), M3Voxel(0, 0, 0), 0, 0, 191)))
-            as M3CanonicalMutationPreparation.Prepared
+    private fun intent(directory: File, view: TestView, command: String): PreparedIntent {
+        val plan = SurfaceOwnership.prepareMutation(view, SurfaceOwnershipConfiguration(),
+            FeatureMutationCommand(command, 0, 0, CanonicalTarget(SurfaceId(1), Voxel(0, 0, 0), 0, 0, 191)))
+            as CanonicalMutationPreparation.Prepared
         return intent(directory, view, plan.mutation)
     }
 
     private fun view(identity: String, rows: Int): TestView {
-        val cut = M3CompactCanonicalCut(M3SurfaceGroup(identity), M3CompactCanonicalStore.PROFILE, 0, 0, rows + 1L, rows, rows, rows, 0, null,
-            M3CanonicalReceiptBytes(testSha256("root-$identity".encodeToByteArray())), M3CanonicalReceiptBytes(testSha256("source-$identity".encodeToByteArray())))
+        val cut = CompactCanonicalCut(SurfaceGroup(identity), CompactCanonicalStore.PROFILE, 0, 0, rows + 1L, rows, rows, rows, 0, null,
+            CanonicalReceiptBytes(testSha256("root-$identity".encodeToByteArray())), CanonicalReceiptBytes(testSha256("source-$identity".encodeToByteArray())))
         return TestView(cut)
     }
 
@@ -360,7 +360,7 @@ class PreparedIntentVisitorTest {
         val f0: Long, val f1: Long, val f2: Long, val f3: Long,
     ) {
         companion object {
-            fun from(id: Long, voxel: M3Voxel, normal: Int, confidence: Int, fingerprint: M3CanonicalReceiptBytes): ScalarRecord {
+            fun from(id: Long, voxel: Voxel, normal: Int, confidence: Int, fingerprint: CanonicalReceiptBytes): ScalarRecord {
                 val words = ByteBuffer.wrap(fingerprint.toByteArray())
                 return ScalarRecord(id, voxel.x, voxel.y, voxel.z, normal, confidence,
                     words.long, words.long, words.long, words.long)
@@ -369,25 +369,25 @@ class PreparedIntentVisitorTest {
     }
     private data class ScalarSupport(val target: Long, val source: ScalarRecord)
     private data class ScalarSnapshot(
-        val identity: M3PreparedIntentIdentity?,
+        val identity: PreparedIntentIdentity?,
         val rows: List<ScalarRecord>,
         val removed: List<Long>,
         val supports: List<ScalarSupport>,
         val sources: List<ScalarRecord>,
         val lineage: List<Pair<Long, Long>>,
-        val terminal: M3PreparedIntentCurrentReceipt?,
+        val terminal: PreparedIntentCurrentReceipt?,
         val order: List<String>,
     ) {
         companion object {
-            fun from(plan: M3PreparedCanonicalMutation): ScalarSnapshot {
+            fun from(plan: PreparedCanonicalMutation): ScalarSnapshot {
                 val wal = ByteArrayOutputStream().also(plan::writeWalTo).toByteArray()
                 val current = ByteArrayOutputStream().also(plan::writeCurrentTo).toByteArray()
-                val identity = M3PreparedIntentIdentity(
+                val identity = PreparedIntentIdentity(
                     plan.sourceCut, plan.commandId, plan.kind, plan.commandHash, plan.commandFingerprint, plan.targetHighWater,
                     plan.targetLiveSurfaceCount, plan.targetSourceCount, plan.targetSupportCount,
                     plan.targetLineageCount, plan.targetGeometryRevision, plan.targetLineageRevision,
-                    M3PreparedIntentWalReceipt(wal.size.toLong(), M3CanonicalReceiptBytes(digest(wal))),
-                    M3PreparedIntentCurrentReceipt(current.size.toLong(), M3CanonicalReceiptBytes(digest(current))),
+                    PreparedIntentWalReceipt(wal.size.toLong(), CanonicalReceiptBytes(digest(wal))),
+                    PreparedIntentCurrentReceipt(current.size.toLong(), CanonicalReceiptBytes(digest(current))),
                 )
                 val rows = mutableListOf<ScalarRecord>()
                 plan.visitDirtyRows { rows += ScalarRecord.from(it.id.value, it.voxel, it.packedNormal, it.normalConfidence, it.allocationFingerprint); true }
@@ -415,16 +415,16 @@ class PreparedIntentVisitorTest {
         }
     }
 
-    private class ScalarVisitor : M3PreparedIntentVisitor {
-        private var identity: M3PreparedIntentIdentity? = null
+    private class ScalarVisitor : PreparedIntentVisitor {
+        private var identity: PreparedIntentIdentity? = null
         private val rows = mutableListOf<ScalarRecord>()
         private val removed = mutableListOf<Long>()
         private val supports = mutableListOf<ScalarSupport>()
         private val sources = mutableListOf<ScalarRecord>()
         private val lineage = mutableListOf<Pair<Long, Long>>()
-        private var terminal: M3PreparedIntentCurrentReceipt? = null
+        private var terminal: PreparedIntentCurrentReceipt? = null
         private val order = mutableListOf<String>()
-        override fun onHeader(identity: M3PreparedIntentIdentity) = true.also { this.identity = identity; order += "header" }
+        override fun onHeader(identity: PreparedIntentIdentity) = true.also { this.identity = identity; order += "header" }
         override fun onDirtyRow(id: Long, x: Int, y: Int, z: Int, packedNormal: Int, confidence: Int, fingerprint0: Long, fingerprint1: Long, fingerprint2: Long, fingerprint3: Long) =
             true.also { ScalarRecord(id, x, y, z, packedNormal, confidence, fingerprint0, fingerprint1, fingerprint2, fingerprint3).also { row -> rows += row; order += "row:$row" } }
         override fun onRemovedId(id: Long) = true.also { removed += id; order += "removed:$id" }
@@ -433,36 +433,36 @@ class PreparedIntentVisitorTest {
         override fun onDirtySource(id: Long, x: Int, y: Int, z: Int, packedNormal: Int, confidence: Int, fingerprint0: Long, fingerprint1: Long, fingerprint2: Long, fingerprint3: Long) =
             true.also { ScalarRecord(id, x, y, z, packedNormal, confidence, fingerprint0, fingerprint1, fingerprint2, fingerprint3).also { source -> sources += source; order += "source:$source" } }
         override fun onDirtyLineage(sourceId: Long, targetId: Long) = true.also { lineage += sourceId to targetId; order += "lineage:${sourceId to targetId}" }
-        override fun onTerminal(currentReceipt: M3PreparedIntentCurrentReceipt) = true.also { terminal = currentReceipt; order += "terminal" }
+        override fun onTerminal(currentReceipt: PreparedIntentCurrentReceipt) = true.also { terminal = currentReceipt; order += "terminal" }
         fun snapshot() = ScalarSnapshot(identity, rows, removed, supports, sources, lineage, terminal, order)
     }
 
     private class ScenarioView(
         identity: String,
-        rows: List<M3CompactSurface>,
+        rows: List<CompactSurface>,
         geometry: Long,
         lineage: Long,
         high: Long,
-        sources: List<M3PagedSource>,
-        private val supports: Map<Long, List<M3PagedSource>>,
-    ) : M3CanonicalStateView {
+        sources: List<PagedSource>,
+        private val supports: Map<Long, List<PagedSource>>,
+    ) : CanonicalStateView {
         private val ids = rows.associateBy { it.id }
         private val voxels = rows.associateBy { it.voxel }
         private val sourceIds = sources.associateBy { it.id }
-        override val cut = M3CompactCanonicalCut(
-            M3SurfaceGroup(identity), M3CompactCanonicalStore.PROFILE, geometry, lineage, high,
+        override val cut = CompactCanonicalCut(
+            SurfaceGroup(identity), CompactCanonicalStore.PROFILE, geometry, lineage, high,
             rows.size, sources.size, supports.values.sumOf { it.size }, 0, null,
-            M3CanonicalReceiptBytes(testSha256("root-$identity".encodeToByteArray())),
-            M3CanonicalReceiptBytes(testSha256("source-$identity".encodeToByteArray())),
+            CanonicalReceiptBytes(testSha256("root-$identity".encodeToByteArray())),
+            CanonicalReceiptBytes(testSha256("source-$identity".encodeToByteArray())),
         )
-        override fun findById(id: M3SurfaceId) = ids[id]
-        override fun findByVoxel(voxel: M3Voxel) = voxels[voxel]
-        override fun readPage(region: M3StorageRegion, page: Int, cursor: Int, limit: Int) = M3CompactPage(emptyList(), null, 0)
-        override fun readSourceById(id: M3SurfaceId) = M3CanonicalPageRead.Complete(sourceIds[id], 0, 0)
-        override fun visitSourceSupport(target: M3SurfaceId, cursor: M3SourceSupportCursor?, sink: (M3PagedSupport) -> Boolean): M3SourceSupportRead {
+        override fun findById(id: SurfaceId) = ids[id]
+        override fun findByVoxel(voxel: Voxel) = voxels[voxel]
+        override fun readPage(region: StorageRegion, page: Int, cursor: Int, limit: Int) = CompactPage(emptyList(), null, 0)
+        override fun readSourceById(id: SurfaceId) = CanonicalPageRead.Complete(sourceIds[id], 0, 0)
+        override fun visitSourceSupport(target: SurfaceId, cursor: SourceSupportCursor?, sink: (PagedSupport) -> Boolean): SourceSupportRead {
             var delivered = 0
-            supports[target.value].orEmpty().forEach { source -> if (sink(M3PagedSupport(target, source))) delivered++ }
-            return M3SourceSupportRead.Complete(delivered, null, 0, 0)
+            supports[target.value].orEmpty().forEach { source -> if (sink(PagedSupport(target, source))) delivered++ }
+            return SourceSupportRead.Complete(delivered, null, 0, 0)
         }
         override fun retainedMemoryReceipt() = error("not used")
         override fun allocatedStorageReceipt() = error("not used")
@@ -470,14 +470,14 @@ class PreparedIntentVisitorTest {
     }
 
     /** Rebuilds a structurally valid test envelope so each fault reaches its named invariant. */
-    private class RechecksummedIntentFixture(private val intent: M3PreparedIntent) {
-        private var header = M3DirtyIntentHeader.read(intent.file)
+    private class RechecksummedIntentFixture(private val intent: PreparedIntent) {
+        private var header = DirtyIntentHeader.read(intent.file)
         var wal = intent.file.readBytes().copyOfRange(header.walOffset.toInt(), header.walOffset.toInt() + header.walLength.toInt())
             private set
         val headerTargetSupport get() = header.targetSupport
         val layout get() = WalLayout.read(wal)
 
-        fun rewriteHeader(change: (M3DirtyIntentHeader) -> M3DirtyIntentHeader) = rewrite(change(header), wal)
+        fun rewriteHeader(change: (DirtyIntentHeader) -> DirtyIntentHeader) = rewrite(change(header), wal)
 
         fun putWalInt(offset: Int, value: Int) {
             val changed = wal.copyOf()
@@ -503,7 +503,7 @@ class PreparedIntentVisitorTest {
         fun rewriteWal(changed: ByteArray, recomputeWalHash: Boolean = true) {
             val changedHeader = header.copy(
                 walLength = changed.size.toLong(),
-                walHash = if (recomputeWalHash) M3CanonicalReceiptBytes(digest(changed)) else header.walHash,
+                walHash = if (recomputeWalHash) CanonicalReceiptBytes(digest(changed)) else header.walHash,
                 walOffset = 0,
             )
             rewrite(changedHeader, changed)
@@ -516,22 +516,22 @@ class PreparedIntentVisitorTest {
             rewrite(
                 header.copy(
                     targetSupport = changedTargetSupport,
-                    walHash = M3CanonicalReceiptBytes(digest(changed)),
-                    currentHash = M3CanonicalReceiptBytes(digest(current)),
+                    walHash = CanonicalReceiptBytes(digest(changed)),
+                    currentHash = CanonicalReceiptBytes(digest(current)),
                     walOffset = 0,
                 ),
                 changed,
             )
         }
 
-        fun rewriteKind(changedKind: M3PreparedMutationKind) {
+        fun rewriteKind(changedKind: PreparedMutationKind) {
             val changed = wal.copyOf()
             ByteBuffer.wrap(changed).putInt(layout.kind, changedKind.ordinal)
             val current = currentFrom(changed)
             rewrite(
                 header.copy(
-                    walHash = M3CanonicalReceiptBytes(digest(changed)),
-                    currentHash = M3CanonicalReceiptBytes(digest(current)),
+                    walHash = CanonicalReceiptBytes(digest(changed)),
+                    currentHash = CanonicalReceiptBytes(digest(current)),
                     walOffset = 0,
                 ),
                 changed,
@@ -553,9 +553,9 @@ class PreparedIntentVisitorTest {
             rewrite(
                 header.copy(
                     walLength = changed.size.toLong(),
-                    walHash = M3CanonicalReceiptBytes(digest(changed)),
+                    walHash = CanonicalReceiptBytes(digest(changed)),
                     currentLength = current.size.toLong(),
-                    currentHash = M3CanonicalReceiptBytes(digest(current)),
+                    currentHash = CanonicalReceiptBytes(digest(current)),
                     walOffset = 0,
                 ),
                 changed,
@@ -571,8 +571,8 @@ class PreparedIntentVisitorTest {
             val current = currentFrom(changed)
             rewrite(
                 header.copy(
-                    walHash = M3CanonicalReceiptBytes(digest(changed)),
-                    currentHash = M3CanonicalReceiptBytes(digest(current)),
+                    walHash = CanonicalReceiptBytes(digest(changed)),
+                    currentHash = CanonicalReceiptBytes(digest(current)),
                     walOffset = 0,
                 ),
                 changed,
@@ -591,9 +591,9 @@ class PreparedIntentVisitorTest {
             rewrite(
                 header.copy(
                     walLength = changed.size.toLong(),
-                    walHash = M3CanonicalReceiptBytes(digest(changed)),
+                    walHash = CanonicalReceiptBytes(digest(changed)),
                     currentLength = current.size.toLong(),
-                    currentHash = M3CanonicalReceiptBytes(digest(current)),
+                    currentHash = CanonicalReceiptBytes(digest(current)),
                     walOffset = 0,
                 ),
                 changed,
@@ -606,7 +606,7 @@ class PreparedIntentVisitorTest {
             intent.file.writeBytes(bytes)
         }
 
-        private fun rewrite(changedHeader: M3DirtyIntentHeader, changedWal: ByteArray) {
+        private fun rewrite(changedHeader: DirtyIntentHeader, changedWal: ByteArray) {
             val payload = ByteArrayOutputStream().also { bytes ->
                 DataOutputStream(bytes).use { output ->
                     changedHeader.writeWithoutChecksum(output)
@@ -658,28 +658,28 @@ class PreparedIntentVisitorTest {
         }
     }
 
-    private class TestView(override val cut: M3CompactCanonicalCut) : M3CanonicalStateView {
-        private val row = M3CompactSurface(M3SurfaceId(1), M3Voxel(0, 0, 0), 0, 192)
-        override fun findById(id: M3SurfaceId) = row.takeIf { it.id == id }
-        override fun findByVoxel(voxel: M3Voxel) = row.takeIf { it.voxel == voxel }
-        override fun readPage(region: M3StorageRegion, page: Int, cursor: Int, limit: Int) = M3CompactPage(emptyList(), null, 0)
-        override fun readSourceById(id: M3SurfaceId) = M3CanonicalPageRead.Complete(row.takeIf { it.id == id }?.let { M3PagedSource(it.id, it.voxel, it.packedNormal, it.normalConfidence, M3CanonicalReceiptBytes(ByteArray(32))) }, 0, 0)
-        override fun visitSourceSupport(target: M3SurfaceId, cursor: M3SourceSupportCursor?, sink: (M3PagedSupport) -> Boolean) = M3SourceSupportRead.Complete(0, null, 0, 0)
+    private class TestView(override val cut: CompactCanonicalCut) : CanonicalStateView {
+        private val row = CompactSurface(SurfaceId(1), Voxel(0, 0, 0), 0, 192)
+        override fun findById(id: SurfaceId) = row.takeIf { it.id == id }
+        override fun findByVoxel(voxel: Voxel) = row.takeIf { it.voxel == voxel }
+        override fun readPage(region: StorageRegion, page: Int, cursor: Int, limit: Int) = CompactPage(emptyList(), null, 0)
+        override fun readSourceById(id: SurfaceId) = CanonicalPageRead.Complete(row.takeIf { it.id == id }?.let { PagedSource(it.id, it.voxel, it.packedNormal, it.normalConfidence, CanonicalReceiptBytes(ByteArray(32))) }, 0, 0)
+        override fun visitSourceSupport(target: SurfaceId, cursor: SourceSupportCursor?, sink: (PagedSupport) -> Boolean) = SourceSupportRead.Complete(0, null, 0, 0)
         override fun retainedMemoryReceipt() = error("not used")
         override fun allocatedStorageReceipt() = error("not used")
         override fun close() = Unit
     }
 
-    private open class CountingVisitor : M3PreparedIntentVisitor {
+    private open class CountingVisitor : PreparedIntentVisitor {
         var rows = 0; var removed = 0; var supports = 0; var sources = 0; var lineage = 0; var terminals = 0
         private var headers = 0
         val callbacks get() = headers + rows + removed + supports + sources + lineage + terminals
-        override fun onHeader(identity: M3PreparedIntentIdentity) = true.also { headers++ }
+        override fun onHeader(identity: PreparedIntentIdentity) = true.also { headers++ }
         override fun onDirtyRow(id: Long, x: Int, y: Int, z: Int, packedNormal: Int, confidence: Int, fingerprint0: Long, fingerprint1: Long, fingerprint2: Long, fingerprint3: Long): Boolean { rows++; return true }
         override fun onRemovedId(id: Long): Boolean { removed++; return true }
         override fun onDirtySupport(targetId: Long, sourceId: Long, x: Int, y: Int, z: Int, packedNormal: Int, confidence: Int, fingerprint0: Long, fingerprint1: Long, fingerprint2: Long, fingerprint3: Long): Boolean { supports++; return true }
         override fun onDirtySource(id: Long, x: Int, y: Int, z: Int, packedNormal: Int, confidence: Int, fingerprint0: Long, fingerprint1: Long, fingerprint2: Long, fingerprint3: Long): Boolean { sources++; return true }
         override fun onDirtyLineage(sourceId: Long, targetId: Long): Boolean { lineage++; return true }
-        override fun onTerminal(currentReceipt: M3PreparedIntentCurrentReceipt): Boolean { terminals++; return true }
+        override fun onTerminal(currentReceipt: PreparedIntentCurrentReceipt): Boolean { terminals++; return true }
     }
 }

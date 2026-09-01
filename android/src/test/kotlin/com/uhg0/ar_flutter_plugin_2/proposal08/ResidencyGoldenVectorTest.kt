@@ -1,6 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.proposal08
 
-import com.uhg0.ar_flutter_plugin_2.m0.*
+import com.uhg0.ar_flutter_plugin_2.proposal08.*
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -19,7 +19,7 @@ import org.junit.Test
 class ResidencyGoldenVectorTest {
     @Test
     fun `staged residency fault corpus is hash bound and complete`() {
-        val manifest = fixture("m0c_reference_corpus_v1.json")
+        val manifest = fixture("residency_reference_corpus_v1.json")
         val faultCorpus = manifest.getValue("faultCorpus").jsonObject
         val base = fixture(faultCorpus.getValue("baseCorpus").jsonPrimitive.content)
         val baseCases = base.getValue("faults").jsonArray.associateBy {
@@ -56,8 +56,8 @@ class ResidencyGoldenVectorTest {
             .removeSuffix("]")
             .split(",")
             .map { it.trim().toInt() }
-        val region = M0RegionCoordinate(regionValues[0], regionValues[1], regionValues[2])
-        val canonical = M0RegionShardV5.encodeCanonical(
+        val region = RegionCoordinate(regionValues[0], regionValues[1], regionValues[2])
+        val canonical = RegionShardV5.encodeCanonical(
             region = region,
             captureEvaluatedThrough = root.int("captureEvaluatedThrough").toLong(),
             pendingThrough = root.int("pendingThrough").toLong(),
@@ -65,30 +65,30 @@ class ResidencyGoldenVectorTest {
             lineageRows = listOf(ByteArray(9) { (it + 19).toByte() }),
         )
         assertVector(canonical, root.getValue("canonical").jsonObject)
-        val decodedCanonical = M0RegionShardV5.decode(canonical)
+        val decodedCanonical = RegionShardV5.decode(canonical)
         assertEquals(region, decodedCanonical.region)
         assertEquals(19, decodedCanonical.surfaceRows.single().size)
         assertEquals(9, decodedCanonical.secondaryRows.single().size)
 
-        val coverage = M0RegionShardV5.encodeCoverage(
+        val coverage = RegionShardV5.encodeCoverage(
             region = region,
             captureEvaluatedThrough = root.int("captureEvaluatedThrough").toLong(),
             pendingThrough = root.int("pendingThrough").toLong(),
             surfaceRows = listOf(ByteArray(56) { (it + 28).toByte() }),
             overflowRows = listOf(ByteArray(13) { (it + 84).toByte() }),
-            compression = M0RegionShardV5.Compression.ZLIB,
+            compression = RegionShardV5.Compression.ZLIB,
         )
         assertVector(coverage, root.getValue("coverage").jsonObject)
-        val decodedCoverage = M0RegionShardV5.decode(coverage)
-        assertEquals(M0RegionShardV5.Compression.ZLIB, decodedCoverage.compression)
+        val decodedCoverage = RegionShardV5.decode(coverage)
+        assertEquals(RegionShardV5.Compression.ZLIB, decodedCoverage.compression)
         assertEquals(56, decodedCoverage.surfaceRows.single().size)
         assertEquals(13, decodedCoverage.secondaryRows.single().size)
     }
 
     @Test
     fun `schema five decoder rejects declared row bytes that do not match payload`() {
-        val packet = M0RegionShardV5.encodeCanonical(
-            region = M0RegionCoordinate(1, 2, 3),
+        val packet = RegionShardV5.encodeCanonical(
+            region = RegionCoordinate(1, 2, 3),
             captureEvaluatedThrough = 2,
             pendingThrough = 1,
             surfaceRows = listOf(ByteArray(19) { it.toByte() }),
@@ -97,51 +97,51 @@ class ResidencyGoldenVectorTest {
         ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN).putInt(24, 0)
 
         assertThrows(IllegalArgumentException::class.java) {
-            M0RegionShardV5.decode(packet)
+            RegionShardV5.decode(packet)
         }
     }
 
     @Test
     fun `schema five decoder rejects zlib payload trailing bytes`() {
-        val packet = M0RegionShardV5.encodeCoverage(
-            region = M0RegionCoordinate(1, 2, 3),
+        val packet = RegionShardV5.encodeCoverage(
+            region = RegionCoordinate(1, 2, 3),
             captureEvaluatedThrough = 2,
             pendingThrough = 1,
             surfaceRows = listOf(ByteArray(56)),
             overflowRows = listOf(ByteArray(13)),
-            compression = M0RegionShardV5.Compression.ZLIB,
+            compression = RegionShardV5.Compression.ZLIB,
         )
         val malformed = packet.copyOf(packet.size + 1)
         malformed[malformed.lastIndex] = 0x7f
         ByteBuffer.wrap(malformed).order(ByteOrder.LITTLE_ENDIAN)
-            .putInt(52, malformed.size - M0RegionShardV5.headerBytes)
+            .putInt(52, malformed.size - RegionShardV5.headerBytes)
         MessageDigest.getInstance("SHA-256")
-            .digest(malformed.copyOfRange(M0RegionShardV5.headerBytes, malformed.size))
+            .digest(malformed.copyOfRange(RegionShardV5.headerBytes, malformed.size))
             .copyInto(malformed, 64)
 
         assertThrows(IllegalArgumentException::class.java) {
-            M0RegionShardV5.decode(malformed)
+            RegionShardV5.decode(malformed)
         }
     }
 
     @Test
     fun `schema five decoder rejects a duplicated zlib trailer`() {
-        val packet = M0RegionShardV5.encodeCoverage(
-            region = M0RegionCoordinate(1, 2, 3),
+        val packet = RegionShardV5.encodeCoverage(
+            region = RegionCoordinate(1, 2, 3),
             captureEvaluatedThrough = 2,
             pendingThrough = 1,
             surfaceRows = listOf(ByteArray(56)),
             overflowRows = listOf(ByteArray(13)),
-            compression = M0RegionShardV5.Compression.ZLIB,
+            compression = RegionShardV5.Compression.ZLIB,
         )
         val originalPayload = packet.copyOfRange(
-            M0RegionShardV5.headerBytes,
+            RegionShardV5.headerBytes,
             packet.size,
         )
         val payload = originalPayload +
             originalPayload.copyOfRange(originalPayload.size - 4, originalPayload.size)
         val malformed = packet.copyOf(packet.size + 4)
-        payload.copyInto(malformed, M0RegionShardV5.headerBytes)
+        payload.copyInto(malformed, RegionShardV5.headerBytes)
         ByteBuffer.wrap(malformed).order(ByteOrder.LITTLE_ENDIAN)
             .putInt(52, payload.size)
         MessageDigest.getInstance("SHA-256")
@@ -149,22 +149,22 @@ class ResidencyGoldenVectorTest {
             .copyInto(malformed, 64)
 
         assertThrows(IllegalArgumentException::class.java) {
-            M0RegionShardV5.decode(malformed)
+            RegionShardV5.decode(malformed)
         }
     }
 
     @Test
     fun `schema five decoder accepts an empty zlib shard`() {
-        val packet = M0RegionShardV5.encodeCoverage(
-            region = M0RegionCoordinate(1, 2, 3),
+        val packet = RegionShardV5.encodeCoverage(
+            region = RegionCoordinate(1, 2, 3),
             captureEvaluatedThrough = 2,
             pendingThrough = 1,
             surfaceRows = emptyList(),
             overflowRows = emptyList(),
-            compression = M0RegionShardV5.Compression.ZLIB,
+            compression = RegionShardV5.Compression.ZLIB,
         )
 
-        val decoded = M0RegionShardV5.decode(packet)
+        val decoded = RegionShardV5.decode(packet)
 
         assertTrue(decoded.surfaceRows.isEmpty())
         assertTrue(decoded.secondaryRows.isEmpty())
@@ -172,31 +172,31 @@ class ResidencyGoldenVectorTest {
 
     @Test
     fun `schema five decoder rejects a zlib checksum mismatch`() {
-        val packet = M0RegionShardV5.encodeCoverage(
-            region = M0RegionCoordinate(1, 2, 3),
+        val packet = RegionShardV5.encodeCoverage(
+            region = RegionCoordinate(1, 2, 3),
             captureEvaluatedThrough = 2,
             pendingThrough = 1,
             surfaceRows = listOf(ByteArray(56)),
             overflowRows = listOf(ByteArray(13)),
-            compression = M0RegionShardV5.Compression.ZLIB,
+            compression = RegionShardV5.Compression.ZLIB,
         )
-        val payload = packet.copyOfRange(M0RegionShardV5.headerBytes, packet.size)
+        val payload = packet.copyOfRange(RegionShardV5.headerBytes, packet.size)
         payload[payload.lastIndex] = (payload[payload.lastIndex].toInt() xor 1).toByte()
         val malformed = packet.copyOf()
-        payload.copyInto(malformed, M0RegionShardV5.headerBytes)
+        payload.copyInto(malformed, RegionShardV5.headerBytes)
         MessageDigest.getInstance("SHA-256")
             .digest(payload)
             .copyInto(malformed, 64)
 
         assertThrows(IllegalArgumentException::class.java) {
-            M0RegionShardV5.decode(malformed)
+            RegionShardV5.decode(malformed)
         }
     }
 
     @Test
     fun `schema five decoder rejects non portable unsigned watermarks`() {
-        val packet = M0RegionShardV5.encodeCoverage(
-            region = M0RegionCoordinate(1, 2, 3),
+        val packet = RegionShardV5.encodeCoverage(
+            region = RegionCoordinate(1, 2, 3),
             captureEvaluatedThrough = 2,
             pendingThrough = 1,
             surfaceRows = listOf(ByteArray(56)),
@@ -206,35 +206,35 @@ class ResidencyGoldenVectorTest {
             .putLong(32, Long.MIN_VALUE)
 
         assertThrows(IllegalArgumentException::class.java) {
-            M0RegionShardV5.decode(packet)
+            RegionShardV5.decode(packet)
         }
     }
 
     @Test
     fun `schema five decoder rejects a packet larger than the total shard limit`() {
-        val packet = M0RegionShardV5.encodeCoverage(
-            region = M0RegionCoordinate(1, 2, 3),
+        val packet = RegionShardV5.encodeCoverage(
+            region = RegionCoordinate(1, 2, 3),
             captureEvaluatedThrough = 2,
             pendingThrough = 1,
             surfaceRows = listOf(ByteArray(56)),
             overflowRows = listOf(ByteArray(13)),
         )
-        val oversized = ByteArray(M0RegionShardV5.maximumBytes + 1)
+        val oversized = ByteArray(RegionShardV5.maximumBytes + 1)
         packet.copyInto(oversized)
 
         assertThrows(IllegalArgumentException::class.java) {
-            M0RegionShardV5.decode(oversized)
+            RegionShardV5.decode(oversized)
         }
     }
 
     @Test
     fun `hash bound schema five resource corpus preserves bounds precedence`() {
-        val corpusBytes = resourceBytes("m0c_shard_resource_corpus_v1.json")
+        val corpusBytes = resourceBytes("residency_shard_resource_corpus_v1.json")
         assertEquals(
-            "db975c3001f3e682958399fd9a25deb29c3fbe4333836d5fe0f3443e77fe1875",
+            "54d4ec80c83ef5ec45b4a4de7b58c6623e1a7d7db146b9b8746d81742e94c64b",
             sha256(corpusBytes),
         )
-        val manifest = fixture("m0c_shard_resource_corpus_v1.json")
+        val manifest = fixture("residency_shard_resource_corpus_v1.json")
         val baseVector = fixture(manifest.getValue("baseVector").jsonPrimitive.content)
         val cases = manifest.getValue("cases").jsonArray
         assertEquals(manifest.int("expectedCaseCount"), cases.size)
@@ -250,19 +250,19 @@ class ResidencyGoldenVectorTest {
                 fault.getValue("operation").jsonPrimitive.content,
             )
             assertThrows(IllegalArgumentException::class.java) {
-                M0RegionShardV5.decode(malformed)
+                RegionShardV5.decode(malformed)
             }
         }
     }
 
     @Test
     fun `hash bound schema five shard error corpus preserves Kotlin outcomes`() {
-        val corpusBytes = resourceBytes("m0c_shard_error_corpus_v1.json")
+        val corpusBytes = resourceBytes("residency_shard_error_corpus_v1.json")
         assertEquals(
-            "257338f80bd2dc797c3c12e645bcd4746b1b54266a181c058e78f2263613e83f",
+            "87b9d378aad69dab45378e7211368de149580d140ebdd6ddaa8a7623cf16c2c3",
             sha256(corpusBytes),
         )
-        val manifest = fixture("m0c_shard_error_corpus_v1.json")
+        val manifest = fixture("residency_shard_error_corpus_v1.json")
         val vectorBytes = resourceBytes(manifest.getValue("baseVector").jsonPrimitive.content)
         assertEquals(
             manifest.getValue("baseVectorSha256").jsonPrimitive.content,
@@ -287,17 +287,17 @@ class ResidencyGoldenVectorTest {
             if (fault.getValue("outcome").jsonPrimitive.content == "accept") {
                 assertTrue(
                     fault.getValue("name").jsonPrimitive.content,
-                    runCatching { M0RegionShardV5.decode(packet) }.isSuccess,
+                    runCatching { RegionShardV5.decode(packet) }.isSuccess,
                 )
             } else {
                 assertThrows(IllegalArgumentException::class.java) {
-                    M0RegionShardV5.decode(packet)
+                    RegionShardV5.decode(packet)
                 }
             }
         }
     }
 
-    private fun fixture(fileName: String = "m0c_golden_vector_v1.json"): JsonObject =
+    private fun fixture(fileName: String = "residency_golden_vector_v1.json"): JsonObject =
         Json.parseToJsonElement(
             requireNotNull(javaClass.classLoader?.getResourceAsStream(fileName))
                 .bufferedReader()
@@ -309,11 +309,11 @@ class ResidencyGoldenVectorTest {
 
     private fun resourceBasePacket(vector: JsonObject): ByteArray {
         val regionValues = vector.getValue("region").jsonArray.map { it.jsonPrimitive.int }
-        return M0RegionShardV5.encodeCoverage(
-            region = M0RegionCoordinate(regionValues[0], regionValues[1], regionValues[2]),
+        return RegionShardV5.encodeCoverage(
+            region = RegionCoordinate(regionValues[0], regionValues[1], regionValues[2]),
             captureEvaluatedThrough = vector.int("captureEvaluatedThrough").toLong(),
             pendingThrough = vector.int("pendingThrough").toLong(),
-            compression = M0RegionShardV5.Compression.ZLIB,
+            compression = RegionShardV5.Compression.ZLIB,
             surfaceRows = listOf(ByteArray(56)),
             overflowRows = listOf(ByteArray(13)),
         )
@@ -321,7 +321,7 @@ class ResidencyGoldenVectorTest {
 
     private fun applyResourceCase(base: ByteArray, operation: String): ByteArray {
         if (operation == "oversize-packet") {
-            return ByteArray(M0RegionShardV5.maximumBytes + 1).also { oversized ->
+            return ByteArray(RegionShardV5.maximumBytes + 1).also { oversized ->
                 base.copyInto(oversized)
             }
         }
@@ -331,7 +331,7 @@ class ResidencyGoldenVectorTest {
             "set-capture-high-bit" -> data.putLong(32, Long.MIN_VALUE)
             "set-pending-high-bit" -> data.putLong(40, Long.MIN_VALUE)
             "set-stored-bytes-zero" -> data.putInt(52, 0)
-            else -> error("Unknown M0c resource operation: $operation")
+            else -> error("Unknown residency policy resource operation: $operation")
         }
         return malformed
     }
@@ -345,11 +345,11 @@ class ResidencyGoldenVectorTest {
 
     private fun applyShardErrorCase(vector: JsonObject, fault: JsonObject): ByteArray {
         val regionValues = vector.getValue("region").jsonArray.map { it.jsonPrimitive.int }
-        val region = M0RegionCoordinate(regionValues[0], regionValues[1], regionValues[2])
+        val region = RegionCoordinate(regionValues[0], regionValues[1], regionValues[2])
         val capture = vector.int("captureEvaluatedThrough").toLong()
         val pending = vector.int("pendingThrough").toLong()
         return when (fault.getValue("operation").jsonPrimitive.content) {
-            "zero-canonical-surface-count" -> M0RegionShardV5.encodeCanonical(
+            "zero-canonical-surface-count" -> RegionShardV5.encodeCanonical(
                 region = region,
                 captureEvaluatedThrough = capture,
                 pendingThrough = pending,
@@ -358,24 +358,24 @@ class ResidencyGoldenVectorTest {
             ).also { packet ->
                 ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN).putInt(24, 0)
             }
-            "encode-empty-coverage" -> M0RegionShardV5.encodeCoverage(
+            "encode-empty-coverage" -> RegionShardV5.encodeCoverage(
                 region = region,
                 captureEvaluatedThrough = capture,
                 pendingThrough = pending,
                 surfaceRows = emptyList(),
                 overflowRows = emptyList(),
-                compression = M0RegionShardV5.Compression.ZLIB,
+                compression = RegionShardV5.Compression.ZLIB,
             )
             else -> {
-                val base = M0RegionShardV5.encodeCoverage(
+                val base = RegionShardV5.encodeCoverage(
                     region = region,
                     captureEvaluatedThrough = capture,
                     pendingThrough = pending,
                     surfaceRows = listOf(ByteArray(56)),
                     overflowRows = listOf(ByteArray(13)),
-                    compression = M0RegionShardV5.Compression.ZLIB,
+                    compression = RegionShardV5.Compression.ZLIB,
                 )
-                val originalPayload = base.copyOfRange(M0RegionShardV5.headerBytes, base.size)
+                val originalPayload = base.copyOfRange(RegionShardV5.headerBytes, base.size)
                 val payload = when (fault.getValue("operation").jsonPrimitive.content) {
                     "append-byte" -> originalPayload +
                         byteArrayOf(fault.getValue("byte").jsonPrimitive.int.toByte())
@@ -391,10 +391,10 @@ class ResidencyGoldenVectorTest {
                             bytes[bytes.lastIndex].toInt() xor fault.int("mask")
                         ).toByte()
                     }
-                    else -> error("Unknown M0c shard error operation")
+                    else -> error("Unknown residency policy shard error operation")
                 }
-                val malformed = base.copyOf(M0RegionShardV5.headerBytes + payload.size)
-                payload.copyInto(malformed, M0RegionShardV5.headerBytes)
+                val malformed = base.copyOf(RegionShardV5.headerBytes + payload.size)
+                payload.copyInto(malformed, RegionShardV5.headerBytes)
                 ByteBuffer.wrap(malformed).order(ByteOrder.LITTLE_ENDIAN)
                 .putInt(52, payload.size)
                 .also {

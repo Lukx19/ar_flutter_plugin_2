@@ -18,13 +18,13 @@ class CanonicalFeatureBatchTest {
         assertEquals(listOf(256L, 258L, 255L, 258L, 256L, 257L), listOf(
             nulValid, nulInvalid, surrogateValid, surrogateInvalid, asciiValid, asciiInvalid,
         ).map(::modifiedUtf8Length))
-        assertEquals(3_552, M3MutableCanonicalOverlay.featureBatchBudget(configuration(), "limit").maximumUpserts)
+        assertEquals(3_552, MutableCanonicalOverlay.featureBatchBudget(configuration(), "limit").maximumUpserts)
 
         listOf(nulValid, surrogateValid, asciiValid).forEach { commandId ->
             assertTrue(validM3CommandId(commandId))
             val view = view(rows = emptyList(), high = 1)
-            val plan = prepared(M3MutableCanonicalOverlay.prepare(
-                view, configuration(), M3CanonicalFeatureBatchCommand(commandId, 0, 0, listOf(upsert(1))),
+            val plan = prepared(MutableCanonicalOverlay.prepare(
+                view, configuration(), CanonicalFeatureBatchCommand(commandId, 0, 0, listOf(upsert(1))),
             ))
             assertEquals(modifiedUtf8Length(commandId), plan.commandId.let(::modifiedUtf8Length))
             assertEquals(2, view.authoritySnapshots) // before and after accepted authority work
@@ -34,11 +34,11 @@ class CanonicalFeatureBatchTest {
         listOf("", nulInvalid, surrogateInvalid, asciiInvalid).forEach { commandId ->
             assertTrue(!validM3CommandId(commandId))
             val view = view(rows = emptyList(), high = 1)
-            val refused = M3MutableCanonicalOverlay.prepare(
-                view, configuration(), M3CanonicalFeatureBatchCommand(commandId, 0, 0, listOf(upsert(1))),
-            ) as M3CanonicalMutationPreparation.Refused
-            assertEquals(M3CanonicalMutationRefusal.INVALID_COMMAND, refused.reason)
-            assertEquals(M3CanonicalMutationPreflightWork(), refused.preflightWork)
+            val refused = MutableCanonicalOverlay.prepare(
+                view, configuration(), CanonicalFeatureBatchCommand(commandId, 0, 0, listOf(upsert(1))),
+            ) as CanonicalMutationPreparation.Refused
+            assertEquals(CanonicalMutationRefusal.INVALID_COMMAND, refused.reason)
+            assertEquals(CanonicalMutationPreflightWork(), refused.preflightWork)
             assertEquals(0, view.authoritySnapshots)
             assertEquals(0, view.authorityReads)
         }
@@ -46,23 +46,23 @@ class CanonicalFeatureBatchTest {
 
     @Test
     fun `scalar worst case preflight rejects max plus one before owned work or authority`() {
-        val budget = M3MutableCanonicalOverlay.featureBatchBudget(configuration(), "limit")
+        val budget = MutableCanonicalOverlay.featureBatchBudget(configuration(), "limit")
         assertEquals(5_576, budget.journalAndCurrentMaximum)
         assertEquals(16_247, budget.sharedMaximum)
         assertEquals(3_552, budget.constructionMaximum)
         assertEquals(3_552, budget.maximumUpserts)
-        assertEquals(Int.MAX_VALUE, M3MutableCanonicalOverlay.boundedRecordMaximum(Long.MAX_VALUE, 0, 1))
-        assertEquals(0, M3MutableCanonicalOverlay.boundedRecordMaximum(Long.MAX_VALUE - 1, Long.MAX_VALUE, 1))
+        assertEquals(Int.MAX_VALUE, MutableCanonicalOverlay.boundedRecordMaximum(Long.MAX_VALUE, 0, 1))
+        assertEquals(0, MutableCanonicalOverlay.boundedRecordMaximum(Long.MAX_VALUE - 1, Long.MAX_VALUE, 1))
 
         val view = view(rows = emptyList(), high = 1)
-        val refused = M3MutableCanonicalOverlay.prepare(
+        val refused = MutableCanonicalOverlay.prepare(
             view, configuration(), batch("limit", List(budget.maximumUpserts + 1) { upsert(it) }),
-        ) as M3CanonicalMutationPreparation.Refused
+        ) as CanonicalMutationPreparation.Refused
 
-        assertEquals(M3CanonicalMutationRefusal.JOURNAL_EXHAUSTED, refused.reason)
+        assertEquals(CanonicalMutationRefusal.JOURNAL_EXHAUSTED, refused.reason)
         assertEquals(budget.maximumUpserts + 1, refused.preflightWork.featureBatchUpserts)
         assertEquals(budget.maximumUpserts, refused.preflightWork.featureBatchMaximumUpserts)
-        assertEquals(M3CanonicalMutationPreflightWork(
+        assertEquals(CanonicalMutationPreflightWork(
             featureBatchUpserts = budget.maximumUpserts + 1,
             featureBatchMaximumUpserts = budget.maximumUpserts,
         ), refused.preflightWork)
@@ -72,27 +72,27 @@ class CanonicalFeatureBatchTest {
 
     @Test
     fun `exact scalar maximum stays within the shared journal current and construction budget`() {
-        val budget = M3MutableCanonicalOverlay.featureBatchBudget(configuration(), "limit")
+        val budget = MutableCanonicalOverlay.featureBatchBudget(configuration(), "limit")
         val view = view(rows = emptyList(), high = 1)
-        val plan = prepared(M3MutableCanonicalOverlay.prepare(
+        val plan = prepared(MutableCanonicalOverlay.prepare(
             view, configuration(), batch("limit", List(budget.maximumUpserts) { upsert(it) }),
         ))
 
         assertEquals(budget.maximumUpserts, plan.work.dirtyRows)
-        assertTrue(plan.work.walBytes <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
-        assertTrue(plan.work.currentBytes <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
-        assertTrue(plan.work.stagingBytes <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
-        assertEquals(M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES, plan.work.constructionPeakBytes)
+        assertTrue(plan.work.walBytes <= CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
+        assertTrue(plan.work.currentBytes <= CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
+        assertTrue(plan.work.stagingBytes <= CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
+        assertEquals(CompactCanonicalStore.JOURNAL_RESERVE_BYTES, plan.work.constructionPeakBytes)
     }
 
     @Test
     fun `ordered upserts become one mixed add refine plan with ascending burned ids`() {
         val view = view(rows = listOf(surface(7, 7)), high = 8)
-        val plan = prepared(M3MutableCanonicalOverlay.prepare(view, configuration(), batch(
+        val plan = prepared(MutableCanonicalOverlay.prepare(view, configuration(), batch(
             "batch", listOf(upsert(10, confidence = 191), upsert(7, confidence = 191), upsert(-2, confidence = 191)),
         )))
 
-        assertEquals(M3PreparedMutationKind.FEATURE_BATCH, plan.kind)
+        assertEquals(PreparedMutationKind.FEATURE_BATCH, plan.kind)
         assertEquals(10L, plan.targetHighWater)
         assertEquals(3, plan.targetLiveSurfaceCount)
         assertEquals(3, plan.targetSourceCount)
@@ -107,19 +107,19 @@ class CanonicalFeatureBatchTest {
         assertEquals(3, plan.work.dirtyRows)
         assertEquals(2, plan.work.dirtySourceRecords)
         assertEquals(2, plan.work.dirtySupportRecords)
-        assertTrue(ByteArrayOutputStream().also(plan::writeWalTo).size() <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
+        assertTrue(ByteArrayOutputStream().also(plan::writeWalTo).size() <= CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
     }
 
     @Test
     fun `removal only and nonmaterial batches retain canonical state without publication`() {
         val view = view(rows = listOf(surface(1, 1)), high = 2)
-        val removal = M3MutableCanonicalOverlay.prepare(
+        val removal = MutableCanonicalOverlay.prepare(
             view, configuration(), batch("removal", Collections.nCopies(100_001, removal(1))),
         )
-        val same = M3MutableCanonicalOverlay.prepare(view, configuration(), batch("same", listOf(upsert(1, confidence = 192))))
+        val same = MutableCanonicalOverlay.prepare(view, configuration(), batch("same", listOf(upsert(1, confidence = 192))))
 
-        assertEquals(M3CanonicalMutationPreparation.NoOp(M3CanonicalStateReceipt(0, 0, 2, 1)), removal)
-        assertEquals(M3CanonicalMutationPreparation.NoOp(M3CanonicalStateReceipt(0, 0, 2, 1)), same)
+        assertEquals(CanonicalMutationPreparation.NoOp(CanonicalStateReceipt(0, 0, 2, 1)), removal)
+        assertEquals(CanonicalMutationPreparation.NoOp(CanonicalStateReceipt(0, 0, 2, 1)), same)
         assertEquals(0, view.mutations)
         assertEquals(1, view.authoritySnapshots) // only the accepted nonmaterial upsert
     }
@@ -127,62 +127,62 @@ class CanonicalFeatureBatchTest {
     @Test
     fun `duplicate conflicting stale exhausted and journal batches refuse before a plan exists`() {
         val base = view(rows = listOf(surface(1, 1)), high = 2)
-        fun refused(value: M3CanonicalMutationPreparation) = value as M3CanonicalMutationPreparation.Refused
+        fun refused(value: CanonicalMutationPreparation) = value as CanonicalMutationPreparation.Refused
 
-        assertEquals(M3CanonicalMutationRefusal.OWNERSHIP_CONFLICT, refused(M3MutableCanonicalOverlay.prepare(base, configuration(), batch(
+        assertEquals(CanonicalMutationRefusal.OWNERSHIP_CONFLICT, refused(MutableCanonicalOverlay.prepare(base, configuration(), batch(
             "duplicate", listOf(upsert(2), upsert(2)),
         ))).reason)
-        assertEquals(M3CanonicalMutationRefusal.OWNERSHIP_CONFLICT, refused(M3MutableCanonicalOverlay.prepare(base, configuration(), batch(
+        assertEquals(CanonicalMutationRefusal.OWNERSHIP_CONFLICT, refused(MutableCanonicalOverlay.prepare(base, configuration(), batch(
             "conflict", listOf(upsert(2), removal(2)),
         ))).reason)
-        assertEquals(M3CanonicalMutationRefusal.REVISION_CONFLICT, refused(M3MutableCanonicalOverlay.prepare(base, configuration(),
-            M3CanonicalFeatureBatchCommand("stale", 1, 0, listOf(upsert(2))),
+        assertEquals(CanonicalMutationRefusal.REVISION_CONFLICT, refused(MutableCanonicalOverlay.prepare(base, configuration(),
+            CanonicalFeatureBatchCommand("stale", 1, 0, listOf(upsert(2))),
         )).reason)
-        assertEquals(M3CanonicalMutationRefusal.EXHAUSTED, refused(M3MutableCanonicalOverlay.prepare(
+        assertEquals(CanonicalMutationRefusal.EXHAUSTED, refused(MutableCanonicalOverlay.prepare(
             view(rows = emptyList(), high = 0xffff_ffffL), configuration(), batch("u32", listOf(upsert(2), upsert(3))),
         )).reason)
-        assertEquals(M3CanonicalMutationRefusal.JOURNAL_EXHAUSTED, refused(M3MutableCanonicalOverlay.prepare(base,
+        assertEquals(CanonicalMutationRefusal.JOURNAL_EXHAUSTED, refused(MutableCanonicalOverlay.prepare(base,
             configuration(changeJournalByteCapacity = 1), batch("journal", listOf(upsert(2))),
         )).reason)
     }
 
-    private fun batch(id: String, changes: List<FeatureFusionChange>) = M3CanonicalFeatureBatchCommand(id, 0, 0, changes)
+    private fun batch(id: String, changes: List<FeatureFusionChange>) = CanonicalFeatureBatchCommand(id, 0, 0, changes)
     private fun upsert(x: Int, confidence: Int = 191) = FeatureFusionChange.Upsert(FeatureFusionCandidate(
         x, 0, 0, 2, 1, listOf(FeatureNormalCandidate(x, 0, 0, FeatureNormalFace.PRIMARY, 0, 0, confidence)),
     ))
     private fun removal(x: Int) = FeatureFusionChange.Removal(x, 0, 0)
-    private fun surface(id: Long, x: Int, confidence: Int = 192) = M3CompactSurface(M3SurfaceId(id), M3Voxel(x, 0, 0), 0, confidence)
-    private fun prepared(value: M3CanonicalMutationPreparation) = (value as M3CanonicalMutationPreparation.Prepared).mutation
-    private fun rows(plan: M3PreparedCanonicalMutation) = mutableListOf<M3PreparedRow>().also { values -> plan.visitDirtyRows { values += it; true } }
-    private fun support(plan: M3PreparedCanonicalMutation) = mutableListOf<M3PreparedSupport>().also { values -> plan.visitDirtySupport { values += it; true } }
-    private fun configuration(changeJournalByteCapacity: Int = 1_048_576) = M3SurfaceOwnershipConfiguration(changeJournalByteCapacity = changeJournalByteCapacity)
-    private fun view(rows: List<M3CompactSurface>, high: Long) = TestView(rows, high)
+    private fun surface(id: Long, x: Int, confidence: Int = 192) = CompactSurface(SurfaceId(id), Voxel(x, 0, 0), 0, confidence)
+    private fun prepared(value: CanonicalMutationPreparation) = (value as CanonicalMutationPreparation.Prepared).mutation
+    private fun rows(plan: PreparedCanonicalMutation) = mutableListOf<PreparedRow>().also { values -> plan.visitDirtyRows { values += it; true } }
+    private fun support(plan: PreparedCanonicalMutation) = mutableListOf<PreparedSupport>().also { values -> plan.visitDirtySupport { values += it; true } }
+    private fun configuration(changeJournalByteCapacity: Int = 1_048_576) = SurfaceOwnershipConfiguration(changeJournalByteCapacity = changeJournalByteCapacity)
+    private fun view(rows: List<CompactSurface>, high: Long) = TestView(rows, high)
 
-    private class TestView(private val rows: List<M3CompactSurface>, high: Long) : M3CanonicalStateView {
+    private class TestView(private val rows: List<CompactSurface>, high: Long) : CanonicalStateView {
         private val ids = rows.associateBy { it.id }
         private val voxels = rows.associateBy { it.voxel }
-        override val cut = M3CompactCanonicalCut(
-            M3SurfaceGroup("batch"), M3CompactCanonicalStore.PROFILE, 0, 0, high, rows.size, rows.size, rows.size, 0,
-            null, M3CanonicalReceiptBytes(ByteArray(32)), M3CanonicalReceiptBytes(ByteArray(32) { 1 }),
+        override val cut = CompactCanonicalCut(
+            SurfaceGroup("batch"), CompactCanonicalStore.PROFILE, 0, 0, high, rows.size, rows.size, rows.size, 0,
+            null, CanonicalReceiptBytes(ByteArray(32)), CanonicalReceiptBytes(ByteArray(32) { 1 }),
         )
         var mutations = 0
         var authoritySnapshots = 0
         var authorityReads = 0
-        override fun readWorkReceipt(): M3CanonicalReadWork {
+        override fun readWorkReceipt(): CanonicalReadWork {
             authoritySnapshots++
-            return M3CanonicalReadWork.ZERO
+            return CanonicalReadWork.ZERO
         }
-        override fun findById(id: M3SurfaceId) = ids[id].also { authorityReads++ }
-        override fun findByVoxel(voxel: M3Voxel) = voxels[voxel].also { authorityReads++ }
-        override fun readPage(region: M3StorageRegion, page: Int, cursor: Int, limit: Int) = M3CompactPage(emptyList(), null, 0)
-        override fun readSourceById(id: M3SurfaceId) = M3CanonicalPageRead.Complete(
+        override fun findById(id: SurfaceId) = ids[id].also { authorityReads++ }
+        override fun findByVoxel(voxel: Voxel) = voxels[voxel].also { authorityReads++ }
+        override fun readPage(region: StorageRegion, page: Int, cursor: Int, limit: Int) = CompactPage(emptyList(), null, 0)
+        override fun readSourceById(id: SurfaceId) = CanonicalPageRead.Complete(
             rows.firstOrNull { it.id == id }?.let { row ->
-                M3PagedSource(row.id, row.voxel, row.packedNormal, row.normalConfidence,
-                    M3CanonicalReceiptBytes(ByteArray(32) { row.id.value.toByte() }))
+                PagedSource(row.id, row.voxel, row.packedNormal, row.normalConfidence,
+                    CanonicalReceiptBytes(ByteArray(32) { row.id.value.toByte() }))
             }, 0, 0,
         ).also { authorityReads++ }
-        override fun visitSourceSupport(target: M3SurfaceId, cursor: M3SourceSupportCursor?, sink: (M3PagedSupport) -> Boolean) =
-            M3SourceSupportRead.Complete(0, null, 0, 0)
+        override fun visitSourceSupport(target: SurfaceId, cursor: SourceSupportCursor?, sink: (PagedSupport) -> Boolean) =
+            SourceSupportRead.Complete(0, null, 0, 0)
         override fun retainedMemoryReceipt() = error("not used")
         override fun allocatedStorageReceipt() = error("not used")
         override fun close() { mutations++ }

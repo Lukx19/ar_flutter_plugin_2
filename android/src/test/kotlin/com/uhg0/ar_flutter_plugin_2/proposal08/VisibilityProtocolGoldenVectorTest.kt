@@ -1,6 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.proposal08
 
-import com.uhg0.ar_flutter_plugin_2.m0.*
+import com.uhg0.ar_flutter_plugin_2.proposal08.*
 
 import java.security.MessageDigest
 import kotlinx.serialization.json.Json
@@ -19,7 +19,7 @@ class VisibilityProtocolGoldenVectorTest {
     fun `pinned Dart vector has identical Kotlin bytes and values`() {
         val root = fixture()
         val requestSpec = root.getValue("request").jsonObject
-        val request = M0aPacketCodec.Request(
+        val request = PacketCodec.Request(
             requestFlags = 0,
             streamToken = requestSpec.long("streamToken"),
             acknowledgedTransactionId = 0,
@@ -31,10 +31,10 @@ class VisibilityProtocolGoldenVectorTest {
             commandBytes = hex(requestSpec.getValue("commandHex").jsonPrimitive.content),
             requestSequence = requestSpec.long("requestSequence"),
         )
-        val requestBytes = M0aPacketCodec.encodeRequest(request)
+        val requestBytes = PacketCodec.encodeRequest(request)
         assertEquals(requestSpec.int("length"), requestBytes.size)
         assertEquals(requestSpec.getValue("sha256").jsonPrimitive.content, sha256(requestBytes))
-        val decodedRequest = M0aPacketCodec.decodeRequest(requestBytes)
+        val decodedRequest = PacketCodec.decodeRequest(requestBytes)
         assertEquals(request.streamToken, decodedRequest.streamToken)
         assertEquals(request.maximumResponseBytes, decodedRequest.maximumResponseBytes)
         assertEquals(request.requestSequence, decodedRequest.requestSequence)
@@ -42,28 +42,28 @@ class VisibilityProtocolGoldenVectorTest {
         assertArrayEquals(request.commandBytes, decodedRequest.commandBytes)
 
         val responseSpec = root.getValue("response").jsonObject
-        val response = M0aPacketCodec.noChanges(
+        val response = PacketCodec.noChanges(
             streamToken = responseSpec.long("streamToken"),
             requestSequence = responseSpec.long("requestSequence"),
             nextExpectedRequestSequence = responseSpec.long("nextExpectedRequestSequence"),
         )
-        val responseBytes = M0aPacketCodec.encodeResponse(
+        val responseBytes = PacketCodec.encodeResponse(
             response,
             requestSpec.int("maximumResponseBytes"),
         )
         assertEquals(responseSpec.int("length"), responseBytes.size)
         assertEquals(responseSpec.getValue("sha256").jsonPrimitive.content, sha256(responseBytes))
-        val decodedResponse = M0aPacketCodec.decodeResponse(responseBytes)
+        val decodedResponse = PacketCodec.decodeResponse(responseBytes)
         assertEquals(response.messageKind, decodedResponse.messageKind)
         assertEquals(response.streamToken, decodedResponse.streamToken)
         assertEquals(response.requestSequence, decodedResponse.requestSequence)
         assertEquals(response.nextExpectedRequestSequence, decodedResponse.nextExpectedRequestSequence)
-        assertArrayEquals(responseBytes, M0aPacketCodec.encodeResponse(decodedResponse, 4096))
+        assertArrayEquals(responseBytes, PacketCodec.encodeResponse(decodedResponse, 4096))
     }
 
     private fun fixture(): JsonObject =
         Json.parseToJsonElement(
-            requireNotNull(javaClass.classLoader?.getResourceAsStream("m0a_golden_vector_v1.json"))
+            requireNotNull(javaClass.classLoader?.getResourceAsStream("visibility_protocol_golden_vector_v1.json"))
                 .bufferedReader()
                 .use { it.readText() },
         ).jsonObject

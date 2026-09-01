@@ -1,6 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.proposal08
 
-import com.uhg0.ar_flutter_plugin_2.m0.*
+import com.uhg0.ar_flutter_plugin_2.proposal08.*
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -21,7 +21,7 @@ import org.junit.Test
 class VisibilityProtocolFaultCorpusTest {
     @Test
     fun `every locked descriptor executes against a production codec or lifecycle`() {
-        val matrix = fixture("m0a_crosslang_matrix_v2.json")
+        val matrix = fixture("visibility_protocol_crosslang_matrix_v2.json")
         val descriptors = matrix.getValue("executableCases").jsonArray.map { it.jsonObject }
         val declared = buildSet {
             matrix.getValue("requiredFamilies").jsonArray.forEach { add("family:${it.jsonPrimitive.content}") }
@@ -45,7 +45,7 @@ class VisibilityProtocolFaultCorpusTest {
 
     @Test
     fun `locked cross language matrix executes every stream and control kind`() {
-        val matrix = fixture("m0a_crosslang_matrix_v2.json")
+        val matrix = fixture("visibility_protocol_crosslang_matrix_v2.json")
         assertEquals("locked-exhaustive", matrix.getValue("status").jsonPrimitive.content)
 
         val responseKinds = matrix.getValue("responseKinds").jsonArray
@@ -54,14 +54,14 @@ class VisibilityProtocolFaultCorpusTest {
             val descriptor = element.jsonObject
             val kind = descriptor.int("kind")
             val response = if (kind == 255) {
-                M0aPacketCodec.error(
+                PacketCodec.error(
                     streamToken = 7,
                     requestSequence = 11,
                     nextExpectedRequestSequence = 11,
                     errorId = descriptor.int("errorId"),
                 )
             } else {
-                M0aPacketCodec.Response(
+                PacketCodec.Response(
                     messageKind = kind,
                     responseFlags = descriptor.int("responseFlags"),
                     resultFlags = descriptor.int("resultFlags"),
@@ -83,11 +83,11 @@ class VisibilityProtocolFaultCorpusTest {
                     payload = hex(descriptor.getValue("payloadHex").jsonPrimitive.content),
                 )
             }
-            val bytes = M0aPacketCodec.encodeResponse(response, M0aPacketCodec.catchUpMaximumBytes)
+            val bytes = PacketCodec.encodeResponse(response, PacketCodec.catchUpMaximumBytes)
             assertEquals(descriptor.getValue("packetSha256").jsonPrimitive.content, sha256(bytes))
             assertEquals(
                 descriptor.getValue("packetSha256").jsonPrimitive.content,
-                sha256(M0aPacketCodec.encodeResponse(M0aPacketCodec.decodeResponse(bytes), M0aPacketCodec.catchUpMaximumBytes)),
+                sha256(PacketCodec.encodeResponse(PacketCodec.decodeResponse(bytes), PacketCodec.catchUpMaximumBytes)),
             )
         }
 
@@ -95,8 +95,8 @@ class VisibilityProtocolFaultCorpusTest {
         assertEquals(listOf(1, 2, 3, 4), controlOperations.map { it.jsonObject.int("operation") })
         controlOperations.forEach { element ->
             val descriptor = element.jsonObject
-            val operation = M0aControlOperation.fromWire(descriptor.int("operation"))
-            val request = M0aControlRequest(
+            val operation = ControlOperation.fromWire(descriptor.int("operation"))
+            val request = ControlRequest(
                 operation = operation,
                 flags = 0,
                 controlRequestId = uuid(1 + descriptor.int("operation")),
@@ -105,12 +105,12 @@ class VisibilityProtocolFaultCorpusTest {
                 sessionGeneration = 1,
                 groupGeneration = 2,
                 coverageEpoch = 3,
-                streamToken = if (operation == M0aControlOperation.START) 0 else 7,
+                streamToken = if (operation == ControlOperation.START) 0 else 7,
                 payload = hex(descriptor.getValue("payloadHex").jsonPrimitive.content),
             )
-            val bytes = M0aControlCodec.encodeRequest(request)
+            val bytes = ControlCodec.encodeRequest(request)
             assertEquals(descriptor.getValue("packetSha256").jsonPrimitive.content, sha256(bytes))
-            assertEquals(request, M0aControlCodec.decodeRequest(bytes))
+            assertEquals(request, ControlCodec.decodeRequest(bytes))
         }
 
         val requiredFamilies = matrix.getValue("requiredFamilies").jsonArray
@@ -135,7 +135,7 @@ class VisibilityProtocolFaultCorpusTest {
 
     @Test
     fun `visibility protocol train validation and locked fault corpora are hash-bound`() {
-        val manifest = fixture("m0a_reference_corpus_v1.json")
+        val manifest = fixture("visibility_protocol_reference_corpus_v1.json")
         val faultCorpus = manifest.getValue("faultCorpus").jsonObject
         val stages = faultCorpus.getValue("stageCorpora").jsonObject
         val stageNames = mutableMapOf<String, Set<String>>()
@@ -182,9 +182,9 @@ class VisibilityProtocolFaultCorpusTest {
                 val mutated = applyFault(packet, fault)
                 assertThrows(IllegalArgumentException::class.java) {
                     if (fault.getValue("packet").jsonPrimitive.content == "request") {
-                        M0aPacketCodec.decodeRequest(mutated)
+                        PacketCodec.decodeRequest(mutated)
                     } else {
-                        M0aPacketCodec.decodeResponse(mutated)
+                        PacketCodec.decodeResponse(mutated)
                     }
                 }
             }
@@ -216,7 +216,7 @@ class VisibilityProtocolFaultCorpusTest {
 
     @Test
     fun `shared visibility protocol fault corpus rejects malformed request and response packets`() {
-        val corpus = fixture("m0a_fault_corpus_v1.json")
+        val corpus = fixture("visibility_protocol_fault_corpus_v1.json")
         val vectors = baseVectors()
         corpus.getValue("cases").jsonArray.forEach { value ->
             val fault = value.jsonObject
@@ -228,9 +228,9 @@ class VisibilityProtocolFaultCorpusTest {
             val mutated = applyFault(packet, fault)
             assertThrows(IllegalArgumentException::class.java) {
                 if (fault.getValue("packet").jsonPrimitive.content == "request") {
-                    M0aPacketCodec.decodeRequest(mutated)
+                    PacketCodec.decodeRequest(mutated)
                 } else {
-                    M0aPacketCodec.decodeResponse(mutated)
+                    PacketCodec.decodeResponse(mutated)
                 }
             }
         }
@@ -238,10 +238,10 @@ class VisibilityProtocolFaultCorpusTest {
 
     @Test
     fun `visibility protocol codecs accept exact packet ceilings and reject one byte over`() {
-        val bounds = fixture("m0a_fault_corpus_v1.json").getValue("bounds").jsonObject
+        val bounds = fixture("visibility_protocol_fault_corpus_v1.json").getValue("bounds").jsonObject
         val requestCeiling = bounds.int("requestCeilingBytes")
         val responseMaximum = bounds.int("responseMaximumBytes")
-        val request = M0aPacketCodec.Request(
+        val request = PacketCodec.Request(
             requestFlags = 0,
             streamToken = 7,
             acknowledgedTransactionId = 0,
@@ -249,22 +249,22 @@ class VisibilityProtocolFaultCorpusTest {
             acknowledgedLineageRevision = 0,
             nextStyleRevision = 0,
             maximumResponseBytes = responseMaximum,
-            styleRecords = listOf(ByteArray(M0aPacketCodec.styleRecordBytes)),
+            styleRecords = listOf(ByteArray(PacketCodec.styleRecordBytes)),
             commandBytes = ByteArray(
-                requestCeiling - M0aPacketCodec.requestHeaderBytes -
-                    M0aPacketCodec.styleRecordBytes,
+                requestCeiling - PacketCodec.requestHeaderBytes -
+                    PacketCodec.styleRecordBytes,
             ),
             requestSequence = 1,
         )
-        assertEquals(requestCeiling, M0aPacketCodec.encodeRequest(request).size)
-        M0aPacketCodec.decodeRequest(M0aPacketCodec.encodeRequest(request))
+        assertEquals(requestCeiling, PacketCodec.encodeRequest(request).size)
+        PacketCodec.decodeRequest(PacketCodec.encodeRequest(request))
         assertThrows(IllegalArgumentException::class.java) {
-            M0aPacketCodec.encodeRequest(
+            PacketCodec.encodeRequest(
                 request.copy(commandBytes = ByteArray(request.commandBytes.size + 1)),
             )
         }
 
-        val response = M0aPacketCodec.Response(
+        val response = PacketCodec.Response(
             messageKind = 0,
             responseFlags = 0,
             resultFlags = 0,
@@ -272,14 +272,14 @@ class VisibilityProtocolFaultCorpusTest {
             requestSequence = 1,
             streamToken = 7,
             nextExpectedRequestSequence = 2,
-            payload = ByteArray(responseMaximum - M0aPacketCodec.responseHeaderBytes),
+            payload = ByteArray(responseMaximum - PacketCodec.responseHeaderBytes),
         )
         assertEquals(
             responseMaximum,
-            M0aPacketCodec.encodeResponse(response, responseMaximum).size,
+            PacketCodec.encodeResponse(response, responseMaximum).size,
         )
         assertThrows(IllegalArgumentException::class.java) {
-            M0aPacketCodec.encodeResponse(
+            PacketCodec.encodeResponse(
                 response.copy(payload = ByteArray(response.payload.size + 1)),
                 responseMaximum,
             )
@@ -288,7 +288,7 @@ class VisibilityProtocolFaultCorpusTest {
 
     @Test
     fun `seeded visibility protocol request mutations never cross the CRC boundary`() {
-        val corpus = fixture("m0a_fault_corpus_v1.json")
+        val corpus = fixture("visibility_protocol_fault_corpus_v1.json")
         val count = corpus.getValue("bounds").jsonObject.int("seededRequestMutations")
         val request = baseVectors().request
         repeat(count) { seed ->
@@ -296,15 +296,15 @@ class VisibilityProtocolFaultCorpusTest {
             val offset = (seed * 37 + 11) % mutated.size
             mutated[offset] = (mutated[offset].toInt() xor ((seed % 255) + 1)).toByte()
             assertThrows(IllegalArgumentException::class.java) {
-                M0aPacketCodec.decodeRequest(mutated)
+                PacketCodec.decodeRequest(mutated)
             }
         }
     }
 
     private fun baseVectors(): Vectors {
-        val root = fixture("m0a_golden_vector_v1.json")
+        val root = fixture("visibility_protocol_golden_vector_v1.json")
         val requestSpec = root.getValue("request").jsonObject
-        val request = M0aPacketCodec.Request(
+        val request = PacketCodec.Request(
             requestFlags = 0,
             streamToken = requestSpec.long("streamToken"),
             acknowledgedTransactionId = 0,
@@ -317,14 +317,14 @@ class VisibilityProtocolFaultCorpusTest {
             requestSequence = requestSpec.long("requestSequence"),
         )
         val responseSpec = root.getValue("response").jsonObject
-        val response = M0aPacketCodec.noChanges(
+        val response = PacketCodec.noChanges(
             streamToken = responseSpec.long("streamToken"),
             requestSequence = responseSpec.long("requestSequence"),
             nextExpectedRequestSequence = responseSpec.long("nextExpectedRequestSequence"),
         )
         return Vectors(
-            request = M0aPacketCodec.encodeRequest(request),
-            response = M0aPacketCodec.encodeResponse(
+            request = PacketCodec.encodeRequest(request),
+            response = PacketCodec.encodeResponse(
                 response,
                 requestSpec.int("maximumResponseBytes"),
             ),
@@ -347,19 +347,19 @@ class VisibilityProtocolFaultCorpusTest {
         val errorName = descriptor.getValue("errorName").jsonPrimitive.content
         assertEquals("error:$errorId:$errorName", descriptor.getValue("executor").jsonPrimitive.content)
         assertTrue(errorName.startsWith("VG_") && errorName.length > 3)
-        val detail = M0aErrorDetail(
+        val detail = ErrorDetail(
             errorId, errorScope(errorId), if (errorId >= 135) 2 else 0,
             if (errorId <= 6) 2 else if (errorId <= 134) 7 else 9,
             if (errorId >= 135) 4 else 0, if (errorId <= 69) ((errorId - 1) % 24) + 1 else 0,
             errorAuthority(errorId), 0, 11, 12, 13, 14, 15, 16, 17,
             errorId.toLong(), errorId + 1L, 18,
         )
-        val detailBytes = M0aControlCodec.encodeErrorDetail(detail)
-        assertEquals(detail, M0aControlCodec.decodeErrorDetail(detailBytes))
-        val response = M0aPacketCodec.error(7, errorId.toLong(), errorId.toLong(), errorId)
+        val detailBytes = ControlCodec.encodeErrorDetail(detail)
+        assertEquals(detail, ControlCodec.decodeErrorDetail(detailBytes))
+        val response = PacketCodec.error(7, errorId.toLong(), errorId.toLong(), errorId)
             .copy(payload = detailBytes)
-        val bytes = M0aPacketCodec.encodeResponse(response, M0aPacketCodec.responseMaximumBytes)
-        assertEquals(errorId, M0aPacketCodec.decodeResponse(bytes).errorId)
+        val bytes = PacketCodec.encodeResponse(response, PacketCodec.responseMaximumBytes)
+        assertEquals(errorId, PacketCodec.decodeResponse(bytes).errorId)
     }
 
     private fun executeFamily(matrix: JsonObject, descriptor: JsonObject) {
@@ -367,22 +367,22 @@ class VisibilityProtocolFaultCorpusTest {
         assertEquals("family:$family", descriptor.getValue("executor").jsonPrimitive.content)
         when (family) {
             "shards" -> {
-                val bytes = M0RegionShardV5.encodeCanonical(
-                    M0RegionCoordinate(-1, 0, 1), 2, 1,
-                    listOf(ByteArray(19)), listOf(ByteArray(9)), M0RegionShardV5.Compression.ZLIB,
+                val bytes = RegionShardV5.encodeCanonical(
+                    RegionCoordinate(-1, 0, 1), 2, 1,
+                    listOf(ByteArray(19)), listOf(ByteArray(9)), RegionShardV5.Compression.ZLIB,
                 )
-                val decoded = M0RegionShardV5.decode(bytes)
-                assertEquals(M0RegionCoordinate(-1, 0, 1), decoded.region)
+                val decoded = RegionShardV5.decode(bytes)
+                assertEquals(RegionCoordinate(-1, 0, 1), decoded.region)
                 assertEquals(1, decoded.surfaceRows.size)
             }
             "trace" -> {
-                val metrics = M0aTransportInstrumentation()
+                val metrics = TransportInstrumentation()
                 metrics.allocated(7)
                 assertEquals(168, metrics.encodeBoundedSummary().size)
             }
             "begin", "chunk", "commit", "paged-reset", "lineage" -> {
                 val payload = byteArrayOf(1, 2, 3, 4, 5)
-                val frames = M0aStructuralTransactionProducerV1.produce(9, 1, 2, 3, payload)
+                val frames = StructuralTransactionProducerV1.produce(9, 1, 2, 3, payload)
                 val selected = when (family) {
                     "begin" -> listOf(frames.first())
                     "chunk" -> listOf(frames[1])
@@ -391,9 +391,9 @@ class VisibilityProtocolFaultCorpusTest {
                     else -> frames
                 }
                 selected.forEach { frame ->
-                    val response = M0aTransactionResponseCodecV1.encodeFrame(frame, 7, 1, 2)
-                    val bytes = M0aPacketCodec.encodeResponse(response, M0aPacketCodec.catchUpMaximumBytes)
-                    assertEquals(frame::class, M0aTransactionResponseCodecV1.decodeFrame(M0aPacketCodec.decodeResponse(bytes))::class)
+                    val response = TransactionResponseCodecV1.encodeFrame(frame, 7, 1, 2)
+                    val bytes = PacketCodec.encodeResponse(response, PacketCodec.catchUpMaximumBytes)
+                    assertEquals(frame::class, TransactionResponseCodecV1.decodeFrame(PacketCodec.decodeResponse(bytes))::class)
                 }
             }
             "styles" -> {
@@ -403,20 +403,20 @@ class VisibilityProtocolFaultCorpusTest {
                     styleRecords = listOf(byteArrayOf(1, 0, 0, 0, 2, 0, 0, 0)),
                     commandBytes = byteArrayOf(),
                 )
-                val decoded = M0aPacketCodec.decodeRequest(M0aPacketCodec.encodeRequest(request))
-                val committed = M0aStyleRevisionSemantics.committedRevision(
+                val decoded = PacketCodec.decodeRequest(PacketCodec.encodeRequest(request))
+                val committed = StyleRevisionSemantics.committedRevision(
                     currentRevision,
                     decoded.nextStyleRevision,
                     decoded.styleRecords.isNotEmpty(),
                 )
                 assertEquals(1L, committed)
-                assertTrue(M0aStyleRevisionSemantics.accepts(committed, 1, false))
+                assertTrue(StyleRevisionSemantics.accepts(committed, 1, false))
             }
             "checkpoints" -> executeLifecycle(matrix, descriptorForLifecycle("checkpoint-replay"))
             "roots" -> executeRetainedRootAuthority()
             "errors-1-150" -> (1..150).forEach { errorId ->
-                val bytes = M0aPacketCodec.encodeResponse(M0aPacketCodec.error(7, errorId.toLong(), errorId.toLong(), errorId), M0aPacketCodec.responseMaximumBytes)
-                assertEquals(errorId, M0aPacketCodec.decodeResponse(bytes).errorId)
+                val bytes = PacketCodec.encodeResponse(PacketCodec.error(7, errorId.toLong(), errorId.toLong(), errorId), PacketCodec.responseMaximumBytes)
+                assertEquals(errorId, PacketCodec.decodeResponse(bytes).errorId)
             }
             "allocation-attack" -> executeAllocationAttack()
             "decompression-attack" -> executeDecompressionAttack()
@@ -434,7 +434,7 @@ class VisibilityProtocolFaultCorpusTest {
             }
             else -> {
                 val seed = descriptor.int("seed")
-                val response = M0aPacketCodec.Response(
+                val response = PacketCodec.Response(
                     messageKind = 1,
                     responseFlags = if (family == "catch-up") 8 else 1,
                     resultFlags = 0,
@@ -444,28 +444,28 @@ class VisibilityProtocolFaultCorpusTest {
                     nextExpectedRequestSequence = seed + 1L,
                     payload = ByteArray(8 + seed) { index -> (seed + index).toByte() },
                 )
-                val bytes = M0aPacketCodec.encodeResponse(response, M0aPacketCodec.catchUpMaximumBytes)
-                assertArrayEquals(bytes, M0aPacketCodec.encodeResponse(M0aPacketCodec.decodeResponse(bytes), M0aPacketCodec.catchUpMaximumBytes))
+                val bytes = PacketCodec.encodeResponse(response, PacketCodec.catchUpMaximumBytes)
+                assertArrayEquals(bytes, PacketCodec.encodeResponse(PacketCodec.decodeResponse(bytes), PacketCodec.catchUpMaximumBytes))
             }
         }
     }
 
     private fun executeRetainedRootAuthority() {
-        val payload = M0aStartRequestCodecV2.defaultPayload()
+        val payload = StartRequestCodecV2.defaultPayload()
         val data = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
         payload[7] = 1
         repeat(10) { index -> data.putLong(56 + index * 8, (index + 1).toLong()) }
         payload.fill(1, 392, 424)
         payload.fill(2, 424, 456)
-        val configuration = M0aStartRequestCodecV2.decode(payload)
-        val baseline = M0aCommittedBaselineV1.fromRestoredConfiguration(configuration)
-        val acceptedLifecycle = M0aControlLifecycle(initialCommittedBaseline = baseline)
+        val configuration = StartRequestCodecV2.decode(payload)
+        val baseline = CommittedBaselineV1.fromRestoredConfiguration(configuration)
+        val acceptedLifecycle = controlLifecycle(initialCommittedBaseline = baseline)
         val acceptedRequest = boundaryControlRequest().copy(payload = payload)
         val acceptedBytes = acceptedLifecycle.handle(
             acceptedRequest,
-            M0aControlCodec.encodeRequest(acceptedRequest),
+            ControlCodec.encodeRequest(acceptedRequest),
         )
-        val accepted = M0aControlCodec.decodeResponse(acceptedBytes)
+        val accepted = ControlCodec.decodeResponse(acceptedBytes)
         assertEquals(0, accepted.outcome)
         assertEquals(configuration.schemaRootHashIdentity, acceptedLifecycle.committedBaseline().schemaRootHashIdentity)
         assertEquals(configuration.manifestRootHashIdentity, acceptedLifecycle.committedBaseline().manifestRootHashIdentity)
@@ -473,12 +473,12 @@ class VisibilityProtocolFaultCorpusTest {
         assertEquals(configuration.worldFromGroupIdentity, acceptedLifecycle.committedBaseline().worldFromGroupIdentity)
 
         val mismatched = baseline.copy(schemaRootHashIdentity = "ff${baseline.schemaRootHashIdentity.drop(2)}")
-        val rejectedLifecycle = M0aControlLifecycle(initialCommittedBaseline = mismatched)
+        val rejectedLifecycle = controlLifecycle(initialCommittedBaseline = mismatched)
         val rejectedBytes = rejectedLifecycle.handle(
             acceptedRequest,
-            M0aControlCodec.encodeRequest(acceptedRequest),
+            ControlCodec.encodeRequest(acceptedRequest),
         )
-        val rejected = M0aControlCodec.decodeResponse(rejectedBytes)
+        val rejected = ControlCodec.decodeResponse(rejectedBytes)
         assertEquals(1, rejected.outcome)
         assertEquals(58, rejected.errorId)
     }
@@ -487,136 +487,136 @@ class VisibilityProtocolFaultCorpusTest {
         val name = descriptor.getValue("covers").jsonPrimitive.content
         assertEquals("boundary:$name", descriptor.getValue("executor").jsonPrimitive.content)
         if (descriptor.int("expectedErrorId") == 0) {
-            assertEquals(80, M0aPacketCodec.requestHeaderBytes)
-            assertEquals(112, M0aPacketCodec.responseHeaderBytes)
-            assertEquals(104, M0aControlCodec.requestHeaderBytes)
-            assertEquals(128, M0aControlCodec.responseHeaderBytes)
+            assertEquals(80, PacketCodec.requestHeaderBytes)
+            assertEquals(112, PacketCodec.responseHeaderBytes)
+            assertEquals(104, ControlCodec.requestHeaderBytes)
+            assertEquals(128, ControlCodec.responseHeaderBytes)
             when (name) {
                 "ordinary-min-4096", "ordinary-max-16384", "catch-up-max-65536" -> {
                     val ceiling = when (name) {
-                        "ordinary-min-4096" -> M0aPacketCodec.responseMinimumBytes
-                        "ordinary-max-16384" -> M0aPacketCodec.responseMaximumBytes
-                        else -> M0aPacketCodec.catchUpMaximumBytes
+                        "ordinary-min-4096" -> PacketCodec.responseMinimumBytes
+                        "ordinary-max-16384" -> PacketCodec.responseMaximumBytes
+                        else -> PacketCodec.catchUpMaximumBytes
                     }
-                    val encoded = M0aPacketCodec.encodeResponse(
-                        M0aPacketCodec.Response(
+                    val encoded = PacketCodec.encodeResponse(
+                        PacketCodec.Response(
                             messageKind = if (name == "catch-up-max-65536") 4 else 1,
                             responseFlags = 0, resultFlags = 0, errorId = 0,
                             requestSequence = 1, streamToken = 7, nextExpectedRequestSequence = 2,
-                            payload = ByteArray(ceiling - M0aPacketCodec.responseHeaderBytes),
+                            payload = ByteArray(ceiling - PacketCodec.responseHeaderBytes),
                         ), ceiling,
                     )
                     assertEquals(ceiling, encoded.size)
                 }
                 "diagnostic-max-1024" -> {
-                    val encoded = M0aPacketCodec.encodeResponse(
-                        M0aPacketCodec.Response(
+                    val encoded = PacketCodec.encodeResponse(
+                        PacketCodec.Response(
                             messageKind = 1, responseFlags = 0, resultFlags = 0, errorId = 0,
                             requestSequence = 1, streamToken = 7, nextExpectedRequestSequence = 2,
                             diagnostic = ByteArray(1024),
-                        ), M0aPacketCodec.responseMinimumBytes,
+                        ), PacketCodec.responseMinimumBytes,
                     )
-                    assertEquals(1024, M0aPacketCodec.decodeResponse(encoded).diagnostic.size)
+                    assertEquals(1024, PacketCodec.decodeResponse(encoded).diagnostic.size)
                 }
-                "portable-ordinal-zero" -> assertEquals(0, M0aPacketCodec.decodeRequest(baseVectors().request).acknowledgedTransactionId)
+                "portable-ordinal-zero" -> assertEquals(0, PacketCodec.decodeRequest(baseVectors().request).acknowledgedTransactionId)
                 "portable-ordinal-max" -> {
-                    val encoded = M0aPacketCodec.encodeRequest(baseRequest().copy(streamToken = Long.MAX_VALUE, requestSequence = Long.MAX_VALUE))
-                    assertEquals(Long.MAX_VALUE, M0aPacketCodec.decodeRequest(encoded).streamToken)
+                    val encoded = PacketCodec.encodeRequest(baseRequest().copy(streamToken = Long.MAX_VALUE, requestSequence = Long.MAX_VALUE))
+                    assertEquals(Long.MAX_VALUE, PacketCodec.decodeRequest(encoded).streamToken)
                 }
                 "style-count-max" -> {
-                    val count = (M0aPacketCodec.requestCeilingBytes - M0aPacketCodec.requestHeaderBytes) / M0aPacketCodec.styleRecordBytes
-                    assertEquals(M0aPacketCodec.requestCeilingBytes, M0aPacketCodec.encodeRequest(baseRequest().copy(styleRecords = List(count) { ByteArray(8) }, commandBytes = byteArrayOf())).size)
+                    val count = (PacketCodec.requestCeilingBytes - PacketCodec.requestHeaderBytes) / PacketCodec.styleRecordBytes
+                    assertEquals(PacketCodec.requestCeilingBytes, PacketCodec.encodeRequest(baseRequest().copy(styleRecords = List(count) { ByteArray(8) }, commandBytes = byteArrayOf())).size)
                 }
                 "command-length-max" -> {
-                    val count = M0aPacketCodec.requestCeilingBytes - M0aPacketCodec.requestHeaderBytes
-                    assertEquals(M0aPacketCodec.requestCeilingBytes, M0aPacketCodec.encodeRequest(baseRequest().copy(styleRecords = emptyList(), commandBytes = ByteArray(count))).size)
+                    val count = PacketCodec.requestCeilingBytes - PacketCodec.requestHeaderBytes
+                    assertEquals(PacketCodec.requestCeilingBytes, PacketCodec.encodeRequest(baseRequest().copy(styleRecords = emptyList(), commandBytes = ByteArray(count))).size)
                 }
                 "allocation-before-validation-zero" -> {
                     val malformed = baseVectors().request.copyOf()
                     ByteBuffer.wrap(malformed).order(ByteOrder.LITTLE_ENDIAN).putInt(12, -1).putInt(72, 0)
                     ByteBuffer.wrap(malformed).order(ByteOrder.LITTLE_ENDIAN).putInt(72, crc32(malformed, 72))
-                    assertThrows(IllegalArgumentException::class.java) { M0aPacketCodec.decodeRequest(malformed) }
+                    assertThrows(IllegalArgumentException::class.java) { PacketCodec.decodeRequest(malformed) }
                 }
-                "live-decompression-zero" -> assertTrue(M0RegionShardV5.decode(M0RegionShardV5.encodeCanonical(M0RegionCoordinate(0, 0, 0), 1, 0, emptyList(), emptyList(), M0RegionShardV5.Compression.NONE)).surfaceRows.isEmpty())
+                "live-decompression-zero" -> assertTrue(RegionShardV5.decode(RegionShardV5.encodeCanonical(RegionCoordinate(0, 0, 0), 1, 0, emptyList(), emptyList(), RegionShardV5.Compression.NONE)).surfaceRows.isEmpty())
             }
             return
         }
         if (name == "unknown-kind" || name.startsWith("unknown-error")) {
             assertThrows(IllegalArgumentException::class.java) {
-                M0aPacketCodec.encodeResponse(
-                    M0aPacketCodec.Response(
+                PacketCodec.encodeResponse(
+                    PacketCodec.Response(
                         messageKind = if (name == "unknown-kind") 6 else 255,
                         responseFlags = 0, resultFlags = 0,
                         errorId = if (name == "unknown-error-151") 151 else 0,
                         requestSequence = 1, streamToken = 7, nextExpectedRequestSequence = 1,
                     ),
-                    M0aPacketCodec.responseMaximumBytes,
+                    PacketCodec.responseMaximumBytes,
                 )
             }
             return
         }
         when (name) {
             "ordinary-one-over", "catch-up-one-over" -> {
-                val ceiling = if (name == "ordinary-one-over") M0aPacketCodec.responseMaximumBytes else M0aPacketCodec.catchUpMaximumBytes
+                val ceiling = if (name == "ordinary-one-over") PacketCodec.responseMaximumBytes else PacketCodec.catchUpMaximumBytes
                 assertThrows(IllegalArgumentException::class.java) {
-                    M0aPacketCodec.encodeResponse(
-                        M0aPacketCodec.Response(
+                    PacketCodec.encodeResponse(
+                        PacketCodec.Response(
                             messageKind = 1, responseFlags = 0, resultFlags = 0, errorId = 0,
                             requestSequence = 1, streamToken = 7, nextExpectedRequestSequence = 2,
-                            payload = ByteArray(ceiling - M0aPacketCodec.responseHeaderBytes + 1),
+                            payload = ByteArray(ceiling - PacketCodec.responseHeaderBytes + 1),
                         ), ceiling,
                     )
                 }
             }
             "diagnostic-one-over" -> assertThrows(IllegalArgumentException::class.java) {
-                M0aPacketCodec.encodeResponse(
-                    M0aPacketCodec.Response(
+                PacketCodec.encodeResponse(
+                    PacketCodec.Response(
                         messageKind = 1, responseFlags = 0, resultFlags = 0, errorId = 0,
                         requestSequence = 1, streamToken = 7, nextExpectedRequestSequence = 2,
                         diagnostic = ByteArray(1025),
-                    ), M0aPacketCodec.responseMinimumBytes,
+                    ), PacketCodec.responseMinimumBytes,
                 )
             }
             "portable-ordinal-overflow" -> assertThrows(IllegalArgumentException::class.java) {
-                M0aPacketCodec.encodeRequest(baseRequest().copy(streamToken = Long.MIN_VALUE))
+                PacketCodec.encodeRequest(baseRequest().copy(streamToken = Long.MIN_VALUE))
             }
             "reserved-bits", "live-compression-bit" -> assertThrows(IllegalArgumentException::class.java) {
-                M0aPacketCodec.encodeRequest(baseRequest().copy(requestFlags = 0x40))
+                PacketCodec.encodeRequest(baseRequest().copy(requestFlags = 0x40))
             }
             "crc-response" -> {
                 val bytes = baseVectors().response.copyOf().also { it[104] = (it[104].toInt() xor 1).toByte() }
-                assertThrows(IllegalArgumentException::class.java) { M0aPacketCodec.decodeResponse(bytes) }
+                assertThrows(IllegalArgumentException::class.java) { PacketCodec.decodeResponse(bytes) }
             }
             "crc-control-request", "crc-control-response" -> {
                 val request = boundaryControlRequest()
                 val bytes = if (name == "crc-control-request") {
-                    M0aControlCodec.encodeRequest(request).also { it[96] = (it[96].toInt() xor 1).toByte() }
+                    ControlCodec.encodeRequest(request).also { it[96] = (it[96].toInt() xor 1).toByte() }
                 } else {
-                    val lifecycle = M0aControlLifecycle()
-                    lifecycle.handle(request, M0aControlCodec.encodeRequest(request)).also { it[120] = (it[120].toInt() xor 1).toByte() }
+                    val lifecycle = controlLifecycle()
+                    lifecycle.handle(request, ControlCodec.encodeRequest(request)).also { it[120] = (it[120].toInt() xor 1).toByte() }
                 }
                 assertThrows(IllegalArgumentException::class.java) {
-                    if (name == "crc-control-request") M0aControlCodec.decodeRequest(bytes) else M0aControlCodec.decodeResponse(bytes)
+                    if (name == "crc-control-request") ControlCodec.decodeRequest(bytes) else ControlCodec.decodeResponse(bytes)
                 }
             }
             "truncated-every-header" -> {
                 val request = boundaryControlRequest()
-                val lifecycle = M0aControlLifecycle()
-                val controlRequest = M0aControlCodec.encodeRequest(request)
+                val lifecycle = controlLifecycle()
+                val controlRequest = ControlCodec.encodeRequest(request)
                 val packets = listOf(
-                    baseVectors().request to M0aPacketCodec.requestHeaderBytes,
-                    baseVectors().response to M0aPacketCodec.responseHeaderBytes,
-                    controlRequest to M0aControlCodec.requestHeaderBytes,
-                    lifecycle.handle(request, controlRequest) to M0aControlCodec.responseHeaderBytes,
+                    baseVectors().request to PacketCodec.requestHeaderBytes,
+                    baseVectors().response to PacketCodec.responseHeaderBytes,
+                    controlRequest to ControlCodec.requestHeaderBytes,
+                    lifecycle.handle(request, controlRequest) to ControlCodec.responseHeaderBytes,
                 )
                 packets.forEachIndexed { index, (packet, header) ->
                     repeat(header) { length ->
                         assertThrows(IllegalArgumentException::class.java) {
                             when (index) {
-                                0 -> M0aPacketCodec.decodeRequest(packet.copyOf(length))
-                                1 -> M0aPacketCodec.decodeResponse(packet.copyOf(length))
-                                2 -> M0aControlCodec.decodeRequest(packet.copyOf(length))
-                                else -> M0aControlCodec.decodeResponse(packet.copyOf(length))
+                                0 -> PacketCodec.decodeRequest(packet.copyOf(length))
+                                1 -> PacketCodec.decodeResponse(packet.copyOf(length))
+                                2 -> ControlCodec.decodeRequest(packet.copyOf(length))
+                                else -> ControlCodec.decodeResponse(packet.copyOf(length))
                             }
                         }
                     }
@@ -635,17 +635,17 @@ class VisibilityProtocolFaultCorpusTest {
                     data.putInt(72, 0)
                     data.putInt(72, crc32(bytes, 72))
                 }
-                assertThrows(IllegalArgumentException::class.java) { M0aPacketCodec.decodeRequest(bytes) }
+                assertThrows(IllegalArgumentException::class.java) { PacketCodec.decodeRequest(bytes) }
             }
         }
     }
 
-    private fun baseRequest(): M0aPacketCodec.Request = M0aPacketCodec.decodeRequest(baseVectors().request)
+    private fun baseRequest(): PacketCodec.Request = PacketCodec.decodeRequest(baseVectors().request)
 
-    private fun boundaryControlRequest(): M0aControlRequest = M0aControlRequest(
-        M0aControlOperation.START, 0, uuid(2), uuid(10), uuid(20), 1, 2, 3, 0,
+    private fun boundaryControlRequest(): ControlRequest = ControlRequest(
+        ControlOperation.START, 0, uuid(2), uuid(10), uuid(20), 1, 2, 3, 0,
         hex(
-            fixture("m0a_crosslang_matrix_v2.json").getValue("controlOperations").jsonArray
+            fixture("visibility_protocol_crosslang_matrix_v2.json").getValue("controlOperations").jsonArray
                 .map { it.jsonObject }.first { it.int("operation") == 1 }
                 .getValue("payloadHex").jsonPrimitive.content,
         ),
@@ -655,34 +655,34 @@ class VisibilityProtocolFaultCorpusTest {
         val name = descriptor.getValue("covers").jsonPrimitive.content
         assertEquals("lifecycle:$name", descriptor.getValue("executor").jsonPrimitive.content)
         val start = matrix.getValue("controlOperations").jsonArray.map { it.jsonObject }.first { it.int("operation") == 1 }
-        val request = M0aControlRequest(
-            M0aControlOperation.START, 0, uuid(2), uuid(10), uuid(20), 1, 2, 3, 0,
+        val request = ControlRequest(
+            ControlOperation.START, 0, uuid(2), uuid(10), uuid(20), 1, 2, 3, 0,
             hex(start.getValue("payloadHex").jsonPrimitive.content),
         )
-        val encoded = M0aControlCodec.encodeRequest(request)
-        val lifecycle = M0aControlLifecycle()
+        val encoded = ControlCodec.encodeRequest(request)
+        val lifecycle = controlLifecycle()
         val first = lifecycle.handle(request, encoded)
         assertArrayEquals(first, lifecycle.handle(request, encoded))
         when (name) {
-            "exact-replay", "lost-response", "start-replay", "checkpoint-replay", "release-replay", "stop-replay", "restored-baseline", "resync-required", "resync-recovery" -> assertEquals(M0aControlLifecycle.State.ACTIVE, lifecycle.state())
+            "exact-replay", "lost-response", "start-replay", "checkpoint-replay", "release-replay", "stop-replay", "restored-baseline", "resync-required", "resync-recovery" -> assertEquals(controlLifecycle.State.ACTIVE, lifecycle.state())
             "binding-replacement" -> {
                 lifecycle.abandon()
-                assertEquals(M0aControlLifecycle.State.ABANDONED, lifecycle.state())
+                assertEquals(controlLifecycle.State.ABANDONED, lifecycle.state())
             }
             "queued-disposal" -> {
                 lifecycle.abandon()
-                assertEquals(M0aControlLifecycle.State.ABANDONED, lifecycle.state())
+                assertEquals(controlLifecycle.State.ABANDONED, lifecycle.state())
             }
             else -> {
                 lifecycle.abandon()
-                assertEquals(M0aControlLifecycle.State.ABANDONED, lifecycle.state())
+                assertEquals(controlLifecycle.State.ABANDONED, lifecycle.state())
             }
         }
         assertTrue(descriptor.getValue("expectedTransition").jsonPrimitive.content.isNotBlank())
     }
 
     private fun executeAllocationAttack() {
-        val exact = M0aPacketCodec.Response(
+        val exact = PacketCodec.Response(
             messageKind = 1,
             responseFlags = 1,
             resultFlags = 0,
@@ -690,16 +690,16 @@ class VisibilityProtocolFaultCorpusTest {
             requestSequence = 1,
             streamToken = 7,
             nextExpectedRequestSequence = 2,
-            payload = ByteArray(M0aPacketCodec.responseMaximumBytes - M0aPacketCodec.responseHeaderBytes),
+            payload = ByteArray(PacketCodec.responseMaximumBytes - PacketCodec.responseHeaderBytes),
         )
-        assertEquals(M0aPacketCodec.responseMaximumBytes, M0aPacketCodec.encodeResponse(exact, M0aPacketCodec.responseMaximumBytes).size)
-        assertThrows(IllegalArgumentException::class.java) { M0aPacketCodec.encodeResponse(exact.copy(payload = ByteArray(exact.payload.size + 1)), M0aPacketCodec.responseMaximumBytes) }
+        assertEquals(PacketCodec.responseMaximumBytes, PacketCodec.encodeResponse(exact, PacketCodec.responseMaximumBytes).size)
+        assertThrows(IllegalArgumentException::class.java) { PacketCodec.encodeResponse(exact.copy(payload = ByteArray(exact.payload.size + 1)), PacketCodec.responseMaximumBytes) }
     }
 
     private fun executeDecompressionAttack() {
-        val bytes = M0RegionShardV5.encodeCanonical(M0RegionCoordinate(0, 0, 0), 1, 0, listOf(ByteArray(19)), emptyList(), M0RegionShardV5.Compression.ZLIB)
+        val bytes = RegionShardV5.encodeCanonical(RegionCoordinate(0, 0, 0), 1, 0, listOf(ByteArray(19)), emptyList(), RegionShardV5.Compression.ZLIB)
         bytes[52] = 0
-        assertThrows(IllegalArgumentException::class.java) { M0RegionShardV5.decode(bytes) }
+        assertThrows(IllegalArgumentException::class.java) { RegionShardV5.decode(bytes) }
     }
 
     private fun descriptorForBoundary(name: String): JsonObject = Json.parseToJsonElement("""{"id":"boundary:$name","covers":"$name","executor":"boundary:$name","expectedErrorId":6}""").jsonObject
@@ -708,19 +708,19 @@ class VisibilityProtocolFaultCorpusTest {
     private fun errorAuthority(id: Int): Int = if (id <= 69) 1 else if (id <= 89) 2 else if (id <= 116) 3 else if (id <= 124) 4 else if (id <= 134) 5 else 6
 
     private fun emitPortableAndNativeReceipts(matrix: JsonObject, executedCases: Int) {
-        if (System.getenv("M0A_RECEIPT_MODE") != "1") return
+        if (System.getenv("VISIBILITY_PROTOCOL_RECEIPT_MODE") != "1") return
         fun required(name: String): String = requireNotNull(System.getenv(name)) {
             "Missing executable provenance $name"
         }.also { require(it.isNotBlank()) }
-        val parentCommit = required("M0A_PARENT_COMMIT")
-        val pluginCommit = required("M0A_PLUGIN_COMMIT")
-        val hostFingerprint = required("M0A_HOST_FINGERPRINT")
+        val parentCommit = required("VISIBILITY_PROTOCOL_PARENT_COMMIT")
+        val pluginCommit = required("VISIBILITY_PROTOCOL_PLUGIN_COMMIT")
+        val hostFingerprint = required("VISIBILITY_PROTOCOL_HOST_FINGERPRINT")
         val runnerVersion = "gradle-jvm-${System.getProperty("java.version")}"
-        val corpusSha256 = sha256(resourceBytes("m0a_crosslang_matrix_v2.json"))
+        val corpusSha256 = sha256(resourceBytes("visibility_protocol_crosslang_matrix_v2.json"))
         val stages = listOf(
-            listOf("train", "m0a_fault_train_v1.json", "1024", "324508639"),
-            listOf("validation", "m0a_fault_validation_v1.json", "2048", "610839777"),
-            listOf("lockedAcceptance", "m0a_fault_locked_v1.json", "4096", "1831565813"),
+            listOf("train", "visibility_protocol_fault_train_v1.json", "1024", "324508639"),
+            listOf("validation", "visibility_protocol_fault_validation_v1.json", "2048", "610839777"),
+            listOf("lockedAcceptance", "visibility_protocol_fault_locked_v1.json", "4096", "1831565813"),
         )
         val nativeSelector = "VisibilityProtocolFaultCorpusTest.every locked descriptor executes against a production codec or lifecycle"
         val crosslangSelector = "VisibilityProtocolFaultCorpusTest.locked cross language matrix executes every stream and control kind"
@@ -738,7 +738,7 @@ class VisibilityProtocolFaultCorpusTest {
                 val offset = (state.toLong() and 0xffffffffL).rem(mutated.size).toInt()
                 mutated[offset] = (mutated[offset].toInt() xor ((state and 0xff) or 1)).toByte()
                 try {
-                    M0aPacketCodec.decodeRequest(mutated)
+                    PacketCodec.decodeRequest(mutated)
                 } catch (_: IllegalArgumentException) {
                     rejected++
                 }
@@ -752,14 +752,14 @@ class VisibilityProtocolFaultCorpusTest {
                 val requestFault = fault.getValue("packet").jsonPrimitive.content == "request"
                 val mutated = applyFault(if (requestFault) vectors.request else vectors.response, fault)
                 try {
-                    if (requestFault) M0aPacketCodec.decodeRequest(mutated) else M0aPacketCodec.decodeResponse(mutated)
+                    if (requestFault) PacketCodec.decodeRequest(mutated) else PacketCodec.decodeResponse(mutated)
                 } catch (_: IllegalArgumentException) {
                     stageFaultRejects++
                 }
             }
             assertEquals(stageRoot.getValue("cases").jsonArray.size, stageFaultRejects)
-            val exactResponseBytes = M0aPacketCodec.encodeResponse(
-                M0aPacketCodec.Response(
+            val exactResponseBytes = PacketCodec.encodeResponse(
+                PacketCodec.Response(
                     messageKind = 1,
                     responseFlags = 1,
                     resultFlags = 0,
@@ -767,11 +767,11 @@ class VisibilityProtocolFaultCorpusTest {
                     requestSequence = 1,
                     streamToken = 7,
                     nextExpectedRequestSequence = 2,
-                    payload = ByteArray(M0aPacketCodec.responseMaximumBytes - M0aPacketCodec.responseHeaderBytes),
+                    payload = ByteArray(PacketCodec.responseMaximumBytes - PacketCodec.responseHeaderBytes),
                 ),
-                M0aPacketCodec.responseMaximumBytes,
+                PacketCodec.responseMaximumBytes,
             ).size
-            assertEquals(M0aPacketCodec.responseMaximumBytes, exactResponseBytes)
+            assertEquals(PacketCodec.responseMaximumBytes, exactResponseBytes)
             val stageSha256 = sha256(resourceBytes(stageFile))
             listOf(
                 Triple("T2", "kotlin-dart-crosslang-jvm", crosslangSelector),
@@ -780,8 +780,8 @@ class VisibilityProtocolFaultCorpusTest {
                 val semantic = if (tier == "T2") "crosslang-$stage-byte-value-parity" else "native-$stage-descriptor-fault-execution"
                 val observedSha256 = sha256("$tier|$stage|$executedCases|$stageFaultRejects|$rejected|$exactResponseBytes".toByteArray())
                 val executionId = sha256("$tier\u0000$stage\u0000$runnerVersion\u0000$selector\u0000$stageSha256\u0000$observedSha256".toByteArray())
-                val json = """{"format":"proposal08-m0a-executable-receipt-v1","tier":"$tier","stage":"$stage","executionId":"$executionId","runner":{"name":"$runnerName","version":"$runnerVersion","hostFingerprint":"$hostFingerprint"},"testSelector":"$selector","source":{"parentCommit":"$parentCommit","pluginCommit":"$pluginCommit"},"corpus":{"file":"docs/m0/m0a_crosslang_matrix_v2.json","sha256":"$corpusSha256","stage":"$stage","stageSha256":"$stageSha256"},"execution":{"inputSha256":"$stageSha256","observedSha256":"$observedSha256","semantic":"$semantic"},"coveredSelectors":["$selector"],"assertions":[{"id":"declared-cases-executed","predicate":"atLeast","actual":$executedCases,"expected":1},{"id":"stable-error-count","predicate":"equals","actual":${matrix.getValue("errorIds").jsonArray.size},"expected":150},{"id":"stage-faults-executed","predicate":"equals","actual":$stageFaultRejects,"expected":${stageRoot.getValue("cases").jsonArray.size}},{"id":"independent-stage-mutations","predicate":"equals","actual":$rejected,"expected":$mutations}],"measurements":{"executedDescriptors":$executedCases,"stableErrors":${matrix.getValue("errorIds").jsonArray.size},"stageFaults":$stageFaultRejects,"mutationSeed":$seedText,"mutationCount":$mutations,"unexpectedAcceptances":${mutations - rejected},"exactResponseBytes":$exactResponseBytes}}"""
-                println("M0A_EXECUTABLE_RECEIPT $json")
+                val json = """{"format":"proposal08-visibility-protocol-executable-receipt-v1","tier":"$tier","stage":"$stage","executionId":"$executionId","runner":{"name":"$runnerName","version":"$runnerVersion","hostFingerprint":"$hostFingerprint"},"testSelector":"$selector","source":{"parentCommit":"$parentCommit","pluginCommit":"$pluginCommit"},"corpus":{"file":"docs/proposal08/evidence/visibility_protocol_crosslang_matrix_v2.json","sha256":"$corpusSha256","stage":"$stage","stageSha256":"$stageSha256"},"execution":{"inputSha256":"$stageSha256","observedSha256":"$observedSha256","semantic":"$semantic"},"coveredSelectors":["$selector"],"assertions":[{"id":"declared-cases-executed","predicate":"atLeast","actual":$executedCases,"expected":1},{"id":"stable-error-count","predicate":"equals","actual":${matrix.getValue("errorIds").jsonArray.size},"expected":150},{"id":"stage-faults-executed","predicate":"equals","actual":$stageFaultRejects,"expected":${stageRoot.getValue("cases").jsonArray.size}},{"id":"independent-stage-mutations","predicate":"equals","actual":$rejected,"expected":$mutations}],"measurements":{"executedDescriptors":$executedCases,"stableErrors":${matrix.getValue("errorIds").jsonArray.size},"stageFaults":$stageFaultRejects,"mutationSeed":$seedText,"mutationCount":$mutations,"unexpectedAcceptances":${mutations - rejected},"exactResponseBytes":$exactResponseBytes}}"""
+                println("VISIBILITY_PROTOCOL_EXECUTABLE_RECEIPT $json")
             }
         }
     }
@@ -800,7 +800,7 @@ class VisibilityProtocolFaultCorpusTest {
             16 -> data.putShort(offset, value.toShort())
             32 -> data.putInt(offset, value.toInt())
             64 -> data.putLong(offset, value)
-            else -> error("Unsupported M0a fault width $width")
+            else -> error("Unsupported visibility protocol fault width $width")
         }
         if (fault["recomputeCrc"]?.jsonPrimitive?.content == "true") {
             val crcOffset = if (fault.getValue("packet").jsonPrimitive.content == "request") 72 else 104
@@ -828,11 +828,11 @@ class VisibilityProtocolFaultCorpusTest {
         value.substring(index * 2, index * 2 + 2).toInt(16).toByte()
     }
 
-    private fun uuid(seed: Int): M0aUuid {
+    private fun uuid(seed: Int): Uuid {
         val bytes = ByteArray(16) { index -> (seed + index).toByte() }
         bytes[6] = 0x40
         bytes[8] = 0x80.toByte()
-        return M0aUuid(bytes)
+        return Uuid(bytes)
     }
 
     private fun crc32(bytes: ByteArray, zeroOffset: Int): Int {

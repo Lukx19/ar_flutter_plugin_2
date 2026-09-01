@@ -3,16 +3,16 @@ package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 import com.uhg0.ar_flutter_plugin_2.capture.JvmDescriptorFilesystemV2
 import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetCoordinatorV2
 import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetPolicyV2
-import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineAuthority
-import com.uhg0.ar_flutter_plugin_2.m0.M0aControlCodec
-import com.uhg0.ar_flutter_plugin_2.m0.M0aControlOperation
-import com.uhg0.ar_flutter_plugin_2.m0.M0aControlRequest
-import com.uhg0.ar_flutter_plugin_2.m0.M0aPacketCodec
-import com.uhg0.ar_flutter_plugin_2.m0.M0aStartRequestCodecV2
-import com.uhg0.ar_flutter_plugin_2.m0.M0aTransactionResponseProfileV1
-import com.uhg0.ar_flutter_plugin_2.m0.M0aTransactionChunkFrameV1
-import com.uhg0.ar_flutter_plugin_2.m0.M0aTransactionResponseCodecV1
-import com.uhg0.ar_flutter_plugin_2.m0.M0aUuid
+import com.uhg0.ar_flutter_plugin_2.proposal08.CommittedBaselineAuthority
+import com.uhg0.ar_flutter_plugin_2.proposal08.ControlCodec
+import com.uhg0.ar_flutter_plugin_2.proposal08.ControlOperation
+import com.uhg0.ar_flutter_plugin_2.proposal08.ControlRequest
+import com.uhg0.ar_flutter_plugin_2.proposal08.PacketCodec
+import com.uhg0.ar_flutter_plugin_2.proposal08.StartRequestCodecV2
+import com.uhg0.ar_flutter_plugin_2.proposal08.TransactionResponseProfileV1
+import com.uhg0.ar_flutter_plugin_2.proposal08.TransactionChunkFrameV1
+import com.uhg0.ar_flutter_plugin_2.proposal08.TransactionResponseCodecV1
+import com.uhg0.ar_flutter_plugin_2.proposal08.Uuid
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
@@ -31,7 +31,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.openjdk.jol.info.GraphLayout
 
-/** Complete M3 proof through the same mapper, v6, V2 and renderer seams used at runtime. */
+/** Complete canonical surface proof through the same mapper, v6, V2 and renderer seams used at runtime. */
 class ContinuousRuntimeCapacityCampaignTest {
     @Test
     fun `diagnostic records ordinary verification work at three six and twelve batches`() {
@@ -39,19 +39,19 @@ class ContinuousRuntimeCapacityCampaignTest {
         var opens = 0L
         var pages = 0L
         var checksumBytes = 0L
-        M3CanonicalCowGenerationTestHooks.onVerifiedOpen = { observation ->
+        CanonicalCowGenerationTestHooks.onVerifiedOpen = { observation ->
             opens++
             pages += observation.verifiedPages
             checksumBytes += observation.currentChecksumBytes
         }
-        M3CanonicalRuntimeCurrentTestHooks.onAuthenticatedBorrow = { checksumBytes += it }
-        val ownershipByThread = ConcurrentHashMap<Long, MutableList<M3CanonicalAdjacentOwnershipObservation>>()
+        CanonicalRuntimeCurrentTestHooks.onAuthenticatedBorrow = { checksumBytes += it }
+        val ownershipByThread = ConcurrentHashMap<Long, MutableList<CanonicalAdjacentOwnershipObservation>>()
         CanonicalActivationTestHooks.onAdjacentOwnership = { observation ->
             ownershipByThread.computeIfAbsent(Thread.currentThread().id) { mutableListOf() } += observation
         }
         try {
             listOf(3_600, 7_200, 14_400).forEachIndexed { index, target ->
-                val root = Files.createTempDirectory("m3-continuous-verification-$target").toFile()
+                val root = Files.createTempDirectory("canonical-surface-continuous-verification-$target").toFile()
                 try {
                     runCampaign(
                         root, 2270 + index, verifyProtocol = false, ownershipByThread,
@@ -61,7 +61,7 @@ class ContinuousRuntimeCapacityCampaignTest {
                     )
                 } finally { root.deleteRecursively() }
             }
-            println("M3_VERIFICATION_WORK " + observations.joinToString())
+            println("CANONICAL_SURFACE_VERIFICATION_WORK " + observations.joinToString())
             val firstCreates = observations.groupBy { it.surfaceTarget }.values.map { it.first() }
             val ordinaryLater = observations.groupBy { it.surfaceTarget }.values.flatMap { it.drop(1) }
             assertTrue(firstCreates.all { it.generationOpens == 3L && it.verifiedPages == 60L })
@@ -70,16 +70,16 @@ class ContinuousRuntimeCapacityCampaignTest {
             // generation/current; it never reopens a historical generation.
             assertTrue(ordinaryLater.all { it.currentChecksumBytes in 225_781L..225_782L })
         } finally {
-            M3CanonicalCowGenerationTestHooks.onVerifiedOpen = null
-            M3CanonicalRuntimeCurrentTestHooks.onAuthenticatedBorrow = null
+            CanonicalCowGenerationTestHooks.onVerifiedOpen = null
+            CanonicalRuntimeCurrentTestHooks.onAuthenticatedBorrow = null
             CanonicalActivationTestHooks.onAdjacentOwnership = null
         }
     }
 
     @Test
     fun `narrow campaign proves later proportionality and acknowledged worker reopen`() {
-        val root = Files.createTempDirectory("m3-continuous-narrow").toFile()
-        val ownershipByThread = ConcurrentHashMap<Long, MutableList<M3CanonicalAdjacentOwnershipObservation>>()
+        val root = Files.createTempDirectory("canonical-surface-continuous-narrow").toFile()
+        val ownershipByThread = ConcurrentHashMap<Long, MutableList<CanonicalAdjacentOwnershipObservation>>()
         CanonicalActivationTestHooks.onAdjacentOwnership = { observation ->
             ownershipByThread.computeIfAbsent(Thread.currentThread().id) { mutableListOf() } += observation
         }
@@ -94,10 +94,10 @@ class ContinuousRuntimeCapacityCampaignTest {
 
     @Test
     fun `continuous runtime reaches exact capacity and reopens the same bounded cut`() {
-        val firstRoot = Files.createTempDirectory("m3-continuous-a").toFile()
-        val secondRoot = Files.createTempDirectory("m3-continuous-b").toFile()
+        val firstRoot = Files.createTempDirectory("canonical-surface-continuous-a").toFile()
+        val secondRoot = Files.createTempDirectory("canonical-surface-continuous-b").toFile()
         val campaigns = Executors.newFixedThreadPool(2)
-        val ownershipByThread = ConcurrentHashMap<Long, MutableList<M3CanonicalAdjacentOwnershipObservation>>()
+        val ownershipByThread = ConcurrentHashMap<Long, MutableList<CanonicalAdjacentOwnershipObservation>>()
         CanonicalActivationTestHooks.onAdjacentOwnership = { observation ->
             ownershipByThread.computeIfAbsent(Thread.currentThread().id) { mutableListOf() } += observation
         }
@@ -144,7 +144,7 @@ class ContinuousRuntimeCapacityCampaignTest {
         root: File,
         viewId: Int,
         verifyProtocol: Boolean,
-        ownershipByThread: ConcurrentHashMap<Long, MutableList<M3CanonicalAdjacentOwnershipObservation>>,
+        ownershipByThread: ConcurrentHashMap<Long, MutableList<CanonicalAdjacentOwnershipObservation>>,
         surfaceTarget: Int = SURFACES,
         verificationSnapshot: (() -> Triple<Long, Long, Long>)? = null,
         verificationBatches: MutableList<BatchVerification>? = null,
@@ -154,7 +154,7 @@ class ContinuousRuntimeCapacityCampaignTest {
         val expectedRendererRows = minOf(surfaceTarget, RENDERER_ROWS)
         val coordinator = coordinator(root)
         val messenger = MethodTestMessenger()
-        val baselineAuthority = M0aCommittedBaselineAuthority()
+        val baselineAuthority = CommittedBaselineAuthority()
         val deterministicLifecycleSequence = java.util.concurrent.atomic.AtomicLong()
         val lifecycleSequenceAllocator = { deterministicLifecycleSequence.incrementAndGet() }
         val binding = VisibilityGridV2Binding(
@@ -162,27 +162,27 @@ class ContinuousRuntimeCapacityCampaignTest {
             lifecycleSequenceAllocator = lifecycleSequenceAllocator, postToMain = { it() },
         )
         val executor = DirectExecutorService()
-        var resources: M3CanonicalRuntimeResources? = null
+        var resources: CanonicalRuntimeResources? = null
         var rendered: CoveragePointRenderSnapshot? = null
         var maximumObservedRendererHandoff = 0L
         var maximumDirtyRendererRows = 0
         var lastDirtyRendererRows = 0
-        val renderer = M3NativeRendererProjection(render = { snapshot, _ ->
+        val renderer = NativeRendererProjection(render = { snapshot, _ ->
             rendered = snapshot
             if (snapshot != null) maximumObservedRendererHandoff =
-                maxOf(maximumObservedRendererHandoff, snapshot.m3OwnershipReceipt().portableBytes)
+                maxOf(maximumObservedRendererHandoff, snapshot.ownershipReceipt().portableBytes)
             lastDirtyRendererRows = snapshot?.update?.spans?.sumOf { it.positions.size / 3 } ?: 0
             maximumDirtyRendererRows = maxOf(
                 maximumDirtyRendererRows,
                 lastDirtyRendererRows,
             )
         })
-        val integration = M3VisibilityGridIntegration(
+        val integration = VisibilityGridIntegration(
             binding = binding,
             ownership = binding::currentObservationOwnership,
             directory = root,
             resourcesForGroup = { group ->
-                M3CanonicalRuntimeResources.open(root, group, coordinator).also { resources = it }
+                CanonicalRuntimeResources.open(root, group, coordinator).also { resources = it }
             },
             renderer = renderer,
             executor = executor,
@@ -207,9 +207,9 @@ class ContinuousRuntimeCapacityCampaignTest {
             while (created < surfaceTarget) {
                 val verificationBefore = verificationSnapshot?.invoke()
                 val count = minOf(V2_FEATURE_SAMPLE_CAPACITY, surfaceTarget - created)
-                val groupDirectory = File(root, "visibility-grid-m3-runtime").listFiles().orEmpty()
+                val groupDirectory = File(root, "visibility-grid-canonical-surface-runtime").listFiles().orEmpty()
                     .singleOrNull { it.isDirectory && it.name !in COORDINATOR_FILES }
-                val persistenceBefore = groupDirectory?.listFiles().orEmpty().associate { it.name to M3CoordinatorStorageBudget(coordinator).allocatedBytes(it) }
+                val persistenceBefore = groupDirectory?.listFiles().orEmpty().associate { it.name to CoordinatorStorageBudget(coordinator).allocatedBytes(it) }
                 lastDirtyRendererRows = 0
                 integration.admitFeature(observation(cut, materialBatches + 10L, created, count, 0))
                 val receipt = integration.integrationReceipt()
@@ -234,7 +234,7 @@ class ContinuousRuntimeCapacityCampaignTest {
                 }
 
                 val current = requireNotNull(resources).owner().activationState()?.current
-                    as M3CanonicalActivationCurrent.Receipt
+                    as CanonicalActivationCurrent.Receipt
                 val beforeHash = requireNotNull(resources).owner().activationState()?.cut?.rootHash?.toByteArray()
                 val delivery = exchange(messenger, viewId, stream, sequence, previousAck)
                 assertEquals(2, delivery.response.messageKind)
@@ -251,13 +251,13 @@ class ContinuousRuntimeCapacityCampaignTest {
                     val chunk = exchange(messenger, viewId, stream, sequence++, previousAck)
                     assertEquals(3, chunk.response.messageKind)
                     assertEquals(it, chunk.response.chunkIndex)
-                    val frame = M0aTransactionResponseCodecV1.decodeFrame(chunk.response)
-                        as M0aTransactionChunkFrameV1
+                    val frame = TransactionResponseCodecV1.decodeFrame(chunk.response)
+                        as TransactionChunkFrameV1
                     workerBytes.write(frame.value.bytes)
                 }
                 val commit = exchange(messenger, viewId, stream, sequence++, previousAck)
                 assertEquals(4, commit.response.messageKind)
-                M0aTransactionResponseCodecV1.decodeFrame(commit.response)
+                TransactionResponseCodecV1.decodeFrame(commit.response)
                 assertArrayEquals(current.identity.canonicalHash.toByteArray(), testSha256(workerBytes.toByteArray()))
                 lastWorkerHash = testSha256(workerBytes.toByteArray())
                 assertArrayEquals(beforeHash, requireNotNull(resources).owner().activationState()?.cut?.rootHash?.toByteArray())
@@ -266,7 +266,7 @@ class ContinuousRuntimeCapacityCampaignTest {
                 assertEquals("acknowledged", integration.integrationReceipt().status)
                 if (materialBatches > 0) {
                     val selectedGroup = requireNotNull(groupDirectory)
-                    val persistenceAfter = selectedGroup.listFiles().orEmpty().associate { it.name to M3CoordinatorStorageBudget(coordinator).allocatedBytes(it) }
+                    val persistenceAfter = selectedGroup.listFiles().orEmpty().associate { it.name to CoordinatorStorageBudget(coordinator).allocatedBytes(it) }
                     val addedPersistence = persistenceAfter.entries
                         .filter { (name, _) -> name !in persistenceBefore }
                         .sumOf(Map.Entry<String, Long>::value)
@@ -290,7 +290,7 @@ class ContinuousRuntimeCapacityCampaignTest {
                 materialBatches++
             }
             assertTrue(materialBatches > 2)
-            assertTrue(ownershipObservations.any { it.stage == M3CanonicalAdjacentOwnershipStage.ADMISSION })
+            assertTrue(ownershipObservations.any { it.stage == CanonicalAdjacentOwnershipStage.ADMISSION })
             assertTrue(ownershipObservations.all { it.liveStoreCount == 0 })
 
             // A second observation for every retained surface reaches the exact
@@ -315,7 +315,7 @@ class ContinuousRuntimeCapacityCampaignTest {
             assertEquals(surfaceTarget, finalState.cut.liveSurfaceCount)
             assertEquals(materialBatches + 1L, finalState.cut.geometryRevision)
             assertEquals(1L, finalState.cut.lineageRevision)
-            assertTrue(finalState.currentState is M3CanonicalCurrentState.Acknowledged)
+            assertTrue(finalState.currentState is CanonicalCurrentState.Acknowledged)
 
             val fullKeys = rendererKeys(activeResources)
             assertEquals(surfaceTarget, fullKeys.size)
@@ -324,7 +324,7 @@ class ContinuousRuntimeCapacityCampaignTest {
             assertEquals(expectedRendererRows, rendererKeys.size)
             assertArrayEquals(canonicalSelection, rendererKeys)
 
-            var storage: M3CompactStorageReceipt? = null
+            var storage: CompactStorageReceipt? = null
             activeResources.withCurrent { view ->
                 storage = view.allocatedStorageReceipt()
             }
@@ -334,8 +334,8 @@ class ContinuousRuntimeCapacityCampaignTest {
             val rendererRebuildBytes = RENDERER_ROWS.toLong() * Long.SIZE_BYTES
             val rendererBytes = VisibilityGridRendererState.ownedStorageBytes(RENDERER_ROWS).toLong() +
                 rendererRebuildBytes
-            val fullRendererHandoff = M3RendererSnapshotOwnershipReceipt.fullResync(RENDERER_ROWS).portableBytes
-            val sparseRendererHandoff = M3RendererSnapshotOwnershipReceipt.maximumSparse(RENDERER_ROWS).portableBytes
+            val fullRendererHandoff = RendererSnapshotOwnershipReceipt.fullResync(RENDERER_ROWS).portableBytes
+            val sparseRendererHandoff = RendererSnapshotOwnershipReceipt.maximumSparse(RENDERER_ROWS).portableBytes
             val rendererHandoffBytes = maxOf(fullRendererHandoff, sparseRendererHandoff)
             assertTrue(maximumObservedRendererHandoff <= rendererHandoffBytes)
             val ownerMemory = integration.portableOwnerMemoryReceipt()
@@ -347,16 +347,16 @@ class ContinuousRuntimeCapacityCampaignTest {
                 )
             }
             val currentHandoffBytes = maximumCurrentBytes.toLong() * 2L +
-                M0aTransactionResponseProfileV1.ordinary.responseCeilingBytes.toLong()
+                TransactionResponseProfileV1.ordinary.responseCeilingBytes.toLong()
             val sharedPhaseBytes = maxOf(
                 currentHandoffBytes, allocated.directoryBytes, maximumOperationBytes,
             )
             val portableCompleteBytes = kernelBytes + scalarMemory.portableBytes + ownerMemory.portableBytes + rendererBytes +
                 rendererHandoffBytes + verificationProofBytes + sharedPhaseBytes
-            assertTrue(maximumCurrentBytes in 1..M3CanonicalActivationResources.MAX_CURRENT_BYTES)
-            assertTrue(allocated.directoryBytes <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
-            assertTrue(maximumOperationBytes <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
-            assertTrue(sharedPhaseBytes <= M3CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
+            assertTrue(maximumCurrentBytes in 1..CanonicalActivationResources.MAX_CURRENT_BYTES)
+            assertTrue(allocated.directoryBytes <= CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
+            assertTrue(maximumOperationBytes <= CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
+            assertTrue(sharedPhaseBytes <= CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
             assertTrue(rendererRebuildBytes <= 1L * 1024L * 1024L)
             assertTrue(verificationProofBytes in 1L..(1L * 1024L * 1024L))
             assertTrue(
@@ -366,7 +366,7 @@ class ContinuousRuntimeCapacityCampaignTest {
                     "verificationProof=$verificationProofBytes " +
                     "current=$maximumCurrentBytes currentHandoff=$currentHandoffBytes directory=${allocated.directoryBytes} " +
                     "operation=$maximumOperationBytes shared=$sharedPhaseBytes",
-                portableCompleteBytes <= M3CompactCanonicalStore.C17_TOTAL_BYTES,
+                portableCompleteBytes <= CompactCanonicalStore.C17_TOTAL_BYTES,
             )
             assertTrue(maximumDirtyRendererRows <= V2_FEATURE_SAMPLE_CAPACITY)
             assertTrue(maximumLaterCanonicalBytesPerRow in 1..256L)
@@ -380,7 +380,7 @@ class ContinuousRuntimeCapacityCampaignTest {
             // This diagnostic intentionally includes test callbacks/messenger and therefore
             // Gradle/JUnit/class-loader infrastructure. Portable acceptance above instead
             // names only strongly reachable production owners and exact bounded buffers.
-            assertTrue("JOL complete graph=$jolBytes", jolBytes <= M3CompactCanonicalStore.C17_TOTAL_BYTES)
+            assertTrue("JOL complete graph=$jolBytes", jolBytes <= CompactCanonicalStore.C17_TOTAL_BYTES)
 
             val beforeRefusal = finalState.cut
             if (surfaceTarget == SURFACES) {
@@ -396,7 +396,7 @@ class ContinuousRuntimeCapacityCampaignTest {
             val removal = activeResources.withCurrent { view ->
                 activeResources.owner().prepareAdjacentMutation(
                     view,
-                    M3CanonicalFeatureBatchCommand(
+                    CanonicalFeatureBatchCommand(
                         commandId = "removal-retains-durable-row",
                         expectedGeometryRevision = view.cut.geometryRevision,
                         expectedLineageRevision = view.cut.lineageRevision,
@@ -404,17 +404,17 @@ class ContinuousRuntimeCapacityCampaignTest {
                     ),
                 )
             }
-            assertTrue(removal is M3CanonicalMutationPreparation.NoOp)
+            assertTrue(removal is CanonicalMutationPreparation.NoOp)
             verificationBeforeRemoval?.let { assertEquals(it, requireNotNull(verificationSnapshot).invoke()) }
             assertEquals(beforeRefusal, activeResources.owner().activationState()?.cut)
             assertEquals(0, exchange(messenger, viewId, stream, sequence, previousAck).response.messageKind)
 
-            val chargedPhysicalBytesAtCut = chargedPhysical(File(root, "visibility-grid-m3-runtime"), coordinator)
+            val chargedPhysicalBytesAtCut = chargedPhysical(File(root, "visibility-grid-canonical-surface-runtime"), coordinator)
             val committedBytesAtCut = coordinator.committedBytes()
             assertEquals(chargedPhysicalBytesAtCut, committedBytesAtCut)
             assertEquals(0L, coordinator.reservedBytes())
 
-            val group = M3SurfaceGroup(cut.captureGroupId)
+            val group = SurfaceGroup(cut.captureGroupId)
             val rootHash = beforeRefusal.rootHash.toByteArray()
             val sourceHash = beforeRefusal.sourceHash.toByteArray()
             val canonicalSelectionHash = hashKeys(canonicalSelection)
@@ -433,16 +433,16 @@ class ContinuousRuntimeCapacityCampaignTest {
                 reopenedMessenger, viewId, baselineAuthority, bindingGenerationSeed = 102,
                 lifecycleSequenceAllocator = lifecycleSequenceAllocator, postToMain = { it() },
             )
-            var reopenedResources: M3CanonicalRuntimeResources? = null
+            var reopenedResources: CanonicalRuntimeResources? = null
             val reopenedRenders = mutableListOf<CoveragePointRenderSnapshot>()
             val reopenedExecutor = DirectExecutorService()
-            val reopened = M3VisibilityGridIntegration(
+            val reopened = VisibilityGridIntegration(
                 reopenedBinding, reopenedBinding::currentObservationOwnership, root,
                 resourcesForGroup = { selected ->
                     assertEquals(group, selected)
-                    M3CanonicalRuntimeResources.open(root, selected, coordinator).also { reopenedResources = it }
+                    CanonicalRuntimeResources.open(root, selected, coordinator).also { reopenedResources = it }
                 },
-                renderer = M3NativeRendererProjection(render = { snapshot, _ -> snapshot?.let(reopenedRenders::add) }),
+                renderer = NativeRendererProjection(render = { snapshot, _ -> snapshot?.let(reopenedRenders::add) }),
                 executor = reopenedExecutor,
                 ownsExecutor = false,
             )
@@ -473,7 +473,7 @@ class ContinuousRuntimeCapacityCampaignTest {
                 assertArrayEquals(sourceHash, reopenedState?.sourceHash?.toByteArray())
                 assertTrue(
                     requireNotNull(reopenedResources).owner().activationState()?.current is
-                        M3CanonicalActivationCurrent.None,
+                        CanonicalActivationCurrent.None,
                 )
 
                 if (surfaceTarget < SURFACES) {
@@ -493,11 +493,11 @@ class ContinuousRuntimeCapacityCampaignTest {
                         val chunk = exchange(reopenedMessenger, viewId, reopenedStream, reopenedSequence++, reopenedAck)
                         assertEquals(3, chunk.response.messageKind)
                         assertEquals(index, chunk.response.chunkIndex)
-                        bytes.write((M0aTransactionResponseCodecV1.decodeFrame(chunk.response) as M0aTransactionChunkFrameV1).value.bytes)
+                        bytes.write((TransactionResponseCodecV1.decodeFrame(chunk.response) as TransactionChunkFrameV1).value.bytes)
                     }
                     assertEquals(4, exchange(reopenedMessenger, viewId, reopenedStream, reopenedSequence++, reopenedAck).response.messageKind)
                     val nextCurrent = requireNotNull(reopenedResources).owner().activationState()?.current
-                        as M3CanonicalActivationCurrent.Receipt
+                        as CanonicalActivationCurrent.Receipt
                     assertArrayEquals(nextCurrent.identity.canonicalHash.toByteArray(), testSha256(bytes.toByteArray()))
                     val nextAck = Ack(next.transactionId, next.geometryRevision, next.lineageRevision)
                     assertEquals(0, exchange(reopenedMessenger, viewId, reopenedStream, reopenedSequence, nextAck).response.messageKind)
@@ -510,11 +510,11 @@ class ContinuousRuntimeCapacityCampaignTest {
                 reopenedExecutor.shutdown()
             }
 
-            val chargedPhysicalBytes = chargedPhysical(File(root, "visibility-grid-m3-runtime"), coordinator)
+            val chargedPhysicalBytes = chargedPhysical(File(root, "visibility-grid-canonical-surface-runtime"), coordinator)
             val committedBytes = coordinator.committedBytes()
             assertEquals(chargedPhysicalBytes, committedBytes)
             println(
-                "M3_CONTINUOUS_RUNTIME=surfaces=$surfaceTarget associations=$associationTarget " +
+                "CANONICAL_SURFACE_CONTINUOUS_RUNTIME=surfaces=$surfaceTarget associations=$associationTarget " +
                     "materialBatches=$materialBatches kernel=$kernelBytes " +
                     "scalar=${scalarMemory.portableBytes} owners=${ownerMemory.portableBytes} " +
                     "v6Allocated=${allocated.allocatedBytes} renderer=$rendererBytes handoff=$rendererHandoffBytes " +
@@ -575,7 +575,7 @@ class ContinuousRuntimeCapacityCampaignTest {
         )
     }
 
-    private fun rendererKeys(resources: M3CanonicalRuntimeResources): LongArray {
+    private fun rendererKeys(resources: CanonicalRuntimeResources): LongArray {
         return requireNotNull(resources.readAllRendererKeys())
     }
 
@@ -583,17 +583,17 @@ class ContinuousRuntimeCapacityCampaignTest {
     private data class Ack(val transaction: Long, val geometry: Long, val lineage: Long) {
         companion object { val ZERO = Ack(0, 0, 0) }
     }
-    private data class Exchange(val response: M0aPacketCodec.Response, val raw: ByteArray)
+    private data class Exchange(val response: PacketCodec.Response, val raw: ByteArray)
 
     private fun start(binding: VisibilityGridV2Binding, messenger: MethodTestMessenger, viewId: Int): Stream {
         val snapshot = binding.snapshot()
         val qualifier = snapshot.nativeStreamToken + snapshot.workerBindingToken
         val result = RecordingResult()
         MethodChannel(messenger, "visibility_grid_v2_control_$viewId").invokeMethod(
-            "start", qualifier + M0aControlCodec.encodeRequest(startRequest()), result,
+            "start", qualifier + ControlCodec.encodeRequest(startRequest()), result,
         )
         assertTrue(result.completed.await(2, TimeUnit.SECONDS))
-        val response = M0aControlCodec.decodeResponse(strip(result.successValue as ByteArray, qualifier))
+        val response = ControlCodec.decodeResponse(strip(result.successValue as ByteArray, qualifier))
         assertEquals(0, response.outcome)
         return Stream(qualifier, response.streamToken)
     }
@@ -605,10 +605,10 @@ class ContinuousRuntimeCapacityCampaignTest {
         sequence: Long,
         ack: Ack,
     ): Exchange {
-        val request = stream.qualifier + M0aPacketCodec.encodeRequest(
-            M0aPacketCodec.Request(
+        val request = stream.qualifier + PacketCodec.encodeRequest(
+            PacketCodec.Request(
                 0, stream.token, ack.transaction, ack.geometry, ack.lineage, 0,
-                M0aTransactionResponseProfileV1.ordinary.responseCeilingBytes,
+                TransactionResponseProfileV1.ordinary.responseCeilingBytes,
                 emptyList(), byteArrayOf(), sequence,
             ),
         )
@@ -616,19 +616,19 @@ class ContinuousRuntimeCapacityCampaignTest {
         messenger.send("visibility_surface_stream_$viewId", ByteBuffer.wrap(request), reply)
         assertTrue("worker reply timed out at request sequence $sequence", reply.completed.await(30, TimeUnit.SECONDS))
         val raw = strip(requireNotNull(reply.bytes), stream.qualifier)
-        return Exchange(M0aPacketCodec.decodeResponse(raw), raw)
+        return Exchange(PacketCodec.decodeResponse(raw), raw)
     }
 
-    private fun startRequest() = M0aControlRequest(
-        M0aControlOperation.START, 0, uuid(1), uuid(20), uuid(40), 3, 4, 5, 0,
-        M0aStartRequestCodecV2.defaultPayload(),
+    private fun startRequest() = ControlRequest(
+        ControlOperation.START, 0, uuid(1), uuid(20), uuid(40), 3, 4, 5, 0,
+        StartRequestCodecV2.defaultPayload(),
     )
 
-    private fun uuid(seed: Int): M0aUuid {
+    private fun uuid(seed: Int): Uuid {
         val bytes = ByteArray(16) { (seed + it).toByte() }
         bytes[6] = 0x40
         bytes[8] = 0x80.toByte()
-        return M0aUuid(bytes)
+        return Uuid(bytes)
     }
 
     private fun strip(bytes: ByteArray, qualifier: ByteArray): ByteArray {
@@ -637,7 +637,7 @@ class ContinuousRuntimeCapacityCampaignTest {
     }
 
     private fun coordinator(root: File) = StorageBudgetCoordinatorV2(
-        File(root, "visibility-grid-m3-runtime"),
+        File(root, "visibility-grid-canonical-surface-runtime"),
         StorageBudgetPolicyV2(256L * 1024L * 1024L, 0),
         JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L }),
     ) { 512L * 1024L * 1024L }
@@ -662,7 +662,7 @@ class ContinuousRuntimeCapacityCampaignTest {
 
     /** Mirrors coordinator tree charging while excluding uncharged group-container directories. */
     private fun chargedPhysical(runtime: File, coordinator: StorageBudgetCoordinatorV2): Long {
-        val budget = M3CoordinatorStorageBudget(coordinator)
+        val budget = CoordinatorStorageBudget(coordinator)
         return runtime.listFiles().orEmpty()
             .filter { it.isDirectory && it.name !in COORDINATOR_FILES }
             .sumOf { group -> group.listFiles().orEmpty().sumOf(budget::allocatedBytes) }

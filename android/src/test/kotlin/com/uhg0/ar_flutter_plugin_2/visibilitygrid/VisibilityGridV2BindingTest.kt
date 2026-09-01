@@ -1,19 +1,19 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
-import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineAuthority
-import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineScopeV1
-import com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineV1
-import com.uhg0.ar_flutter_plugin_2.m0.M0aCommitReceiptQueryV1
-import com.uhg0.ar_flutter_plugin_2.m0.M0aControlCodec
-import com.uhg0.ar_flutter_plugin_2.m0.M0aControlOperation
-import com.uhg0.ar_flutter_plugin_2.m0.M0aControlRequest
-import com.uhg0.ar_flutter_plugin_2.m0.M0aCurrentDeltaReceiptV1
-import com.uhg0.ar_flutter_plugin_2.m0.M0aCurrentDeltaSelectorV1
-import com.uhg0.ar_flutter_plugin_2.m0.M0aCurrentDeltaSourceV1
-import com.uhg0.ar_flutter_plugin_2.m0.M0aPacketCodec
-import com.uhg0.ar_flutter_plugin_2.m0.M0aStartRequestCodecV2
-import com.uhg0.ar_flutter_plugin_2.m0.M0aTransactionResponseProfileV1
-import com.uhg0.ar_flutter_plugin_2.m0.M0aUuid
+import com.uhg0.ar_flutter_plugin_2.proposal08.CommittedBaselineAuthority
+import com.uhg0.ar_flutter_plugin_2.proposal08.CommittedBaselineScopeV1
+import com.uhg0.ar_flutter_plugin_2.proposal08.CommittedBaselineV1
+import com.uhg0.ar_flutter_plugin_2.proposal08.CommitReceiptQueryV1
+import com.uhg0.ar_flutter_plugin_2.proposal08.ControlCodec
+import com.uhg0.ar_flutter_plugin_2.proposal08.ControlOperation
+import com.uhg0.ar_flutter_plugin_2.proposal08.ControlRequest
+import com.uhg0.ar_flutter_plugin_2.proposal08.CurrentDeltaReceiptV1
+import com.uhg0.ar_flutter_plugin_2.proposal08.CurrentDeltaSelectorV1
+import com.uhg0.ar_flutter_plugin_2.proposal08.CurrentDeltaSourceV1
+import com.uhg0.ar_flutter_plugin_2.proposal08.PacketCodec
+import com.uhg0.ar_flutter_plugin_2.proposal08.StartRequestCodecV2
+import com.uhg0.ar_flutter_plugin_2.proposal08.TransactionResponseProfileV1
+import com.uhg0.ar_flutter_plugin_2.proposal08.Uuid
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodChannel
 import java.nio.ByteBuffer
@@ -34,13 +34,13 @@ class VisibilityGridV2BindingTest {
     fun `lifecycle allocator requires positive strictly increasing values`() {
         assertThrows(IllegalArgumentException::class.java) {
             VisibilityGridV2Binding(
-                MethodTestMessenger(), 2128, M0aCommittedBaselineAuthority(),
+                MethodTestMessenger(), 2128, CommittedBaselineAuthority(),
                 lifecycleSequenceAllocator = { 0 }, postToMain = { it() },
             )
         }
         val messenger = MethodTestMessenger()
         val repeated = VisibilityGridV2Binding(
-            messenger, 2129, M0aCommittedBaselineAuthority(),
+            messenger, 2129, CommittedBaselineAuthority(),
             lifecycleSequenceAllocator = { 1 }, postToMain = { it() },
         )
         try {
@@ -49,7 +49,7 @@ class VisibilityGridV2BindingTest {
             MethodChannel(messenger, "visibility_grid_v2_control_2129").invokeMethod(
                 "start",
                 snapshot.nativeStreamToken + snapshot.workerBindingToken +
-                    M0aControlCodec.encodeRequest(startRequest()),
+                    ControlCodec.encodeRequest(startRequest()),
                 result,
             )
             assertTrue(result.completed.await(2, TimeUnit.SECONDS))
@@ -60,15 +60,15 @@ class VisibilityGridV2BindingTest {
 
     @Test
     fun `authority authenticated restart preserves semantic cut and allocates adjacent transaction one`() {
-        assertThrows(IllegalArgumentException::class.java) { M3CommittedEmptyBaseline("binding", "group", -1, 85, 1) }
-        assertThrows(IllegalArgumentException::class.java) { M3CommittedEmptyBaseline("binding", "group", 0, 0, 1) }
-        assertThrows(IllegalArgumentException::class.java) { M3CommittedEmptyBaseline("binding", "group", 0, 85, 0) }
+        assertThrows(IllegalArgumentException::class.java) { committedEmptyBaseline("binding", "group", -1, 85, 1) }
+        assertThrows(IllegalArgumentException::class.java) { committedEmptyBaseline("binding", "group", 0, 0, 1) }
+        assertThrows(IllegalArgumentException::class.java) { committedEmptyBaseline("binding", "group", 0, 85, 0) }
         val messenger = MethodTestMessenger()
-        val authority = M0aCommittedBaselineAuthority()
+        val authority = CommittedBaselineAuthority()
         val request = startRequest()
         authority.publish(
-            M0aCommittedBaselineScopeV1.from(request),
-            M0aCommittedBaselineV1(transactionId = 84, geometryRevision = 85, lineageRevision = 1, styleRevision = 0),
+            CommittedBaselineScopeV1.from(request),
+            CommittedBaselineV1(transactionId = 84, geometryRevision = 85, lineageRevision = 1, styleRevision = 0),
         )
         val binding = VisibilityGridV2Binding(messenger, 2127, authority, postToMain = { it() })
         try {
@@ -76,25 +76,25 @@ class VisibilityGridV2BindingTest {
             val qualifier = snapshot.nativeStreamToken + snapshot.workerBindingToken
             val start = RecordingResult()
             MethodChannel(messenger, "visibility_grid_v2_control_2127").invokeMethod(
-                "start", qualifier + M0aControlCodec.encodeRequest(request), start,
+                "start", qualifier + ControlCodec.encodeRequest(request), start,
             )
             assertTrue(start.completed.await(2, TimeUnit.SECONDS))
             assertEquals("start error=${start.errorCode}:${start.errorMessage}", 1, start.successCount)
-            val stream = M0aControlCodec.decodeResponse(stripQualifier(start.successValue as ByteArray, qualifier))
+            val stream = ControlCodec.decodeResponse(stripQualifier(start.successValue as ByteArray, qualifier))
 
-            fun exchange(sequence: Long, transaction: Long, geometry: Long): M0aPacketCodec.Response {
+            fun exchange(sequence: Long, transaction: Long, geometry: Long): PacketCodec.Response {
                 val reply = RecordingBinaryReply()
                 messenger.send(
                     "visibility_surface_stream_2127",
-                    ByteBuffer.wrap(qualifier + M0aPacketCodec.encodeRequest(M0aPacketCodec.Request(
+                    ByteBuffer.wrap(qualifier + PacketCodec.encodeRequest(PacketCodec.Request(
                         0, stream.streamToken, transaction, geometry, 1, 0,
-                        M0aTransactionResponseProfileV1.ordinary.responseCeilingBytes,
+                        TransactionResponseProfileV1.ordinary.responseCeilingBytes,
                         emptyList(), byteArrayOf(), sequence,
                     ))),
                     reply,
                 )
                 assertTrue(reply.completed.await(2, TimeUnit.SECONDS))
-                return M0aPacketCodec.decodeResponse(stripQualifier(requireNotNull(reply.bytes), qualifier))
+                return PacketCodec.decodeResponse(stripQualifier(requireNotNull(reply.bytes), qualifier))
             }
 
             val unchanged = exchange(1, 0, 85)
@@ -102,16 +102,16 @@ class VisibilityGridV2BindingTest {
             assertEquals(0, unchanged.transactionId)
             assertEquals(85, unchanged.targetGeometryRevision)
             assertEquals(1, unchanged.targetLineageRevision)
-            assertEquals(M3CommittedEmptyBaseline(
-                requireNotNull(binding.m3CommittedEmptyBaseline()).bindingIdentity,
+            assertEquals(committedEmptyBaseline(
+                requireNotNull(binding.committedEmptyBaseline()).bindingIdentity,
                 request.captureGroupId.hex(), 0, 85, 1,
-            ), binding.m3CommittedEmptyBaseline())
+            ), binding.committedEmptyBaseline())
 
-            val selector = M0aCurrentDeltaSelectorV1(1, 86, 1)
+            val selector = CurrentDeltaSelectorV1(1, 86, 1)
             val bytes = byteArrayOf(1, 8, 6)
             binding.queueCommittedCurrentDelta(
-                M0aCurrentDeltaSourceV1 { selected ->
-                    M0aCurrentDeltaReceiptV1(selector, 85, bytes, ByteArray(32) { 7 }).takeIf { selected == selector }
+                CurrentDeltaSourceV1 { selected ->
+                    CurrentDeltaReceiptV1(selector, 85, bytes, ByteArray(32) { 7 }).takeIf { selected == selector }
                 },
                 selector,
             )
@@ -125,10 +125,10 @@ class VisibilityGridV2BindingTest {
 
     @Test
     fun `exact qualified malformed control returns canonical correlated bytes with no effect`() {
-        val authority = M0aCommittedBaselineAuthority()
+        val authority = CommittedBaselineAuthority()
         val request = startRequest()
-        val scope = M0aCommittedBaselineScopeV1.from(request)
-        val baseline = com.uhg0.ar_flutter_plugin_2.m0.M0aCommittedBaselineV1(
+        val scope = CommittedBaselineScopeV1.from(request)
+        val baseline = com.uhg0.ar_flutter_plugin_2.proposal08.CommittedBaselineV1(
             transactionId = 9,
             geometryRevision = 10,
             lineageRevision = 11,
@@ -144,13 +144,13 @@ class VisibilityGridV2BindingTest {
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 1200,
-            committedBaselineAuthority = authority,
+            CommittedBaselineAuthority = authority,
             postToMain = { task -> task() },
         )
         try {
             val before = binding.snapshot()
             val qualifier = before.nativeStreamToken + before.workerBindingToken
-            val malformed = M0aControlCodec.encodeRequest(request).also { bytes ->
+            val malformed = ControlCodec.encodeRequest(request).also { bytes ->
                 bytes[96] = (bytes[96].toInt() xor 0x01).toByte()
             }
             val result = RecordingResult()
@@ -161,10 +161,10 @@ class VisibilityGridV2BindingTest {
             )
             assertTrue(result.completed.await(2, TimeUnit.SECONDS))
             assertEquals(1, result.successCount)
-            val response = M0aControlCodec.decodeResponse(
+            val response = ControlCodec.decodeResponse(
                 stripQualifier(result.successValue as ByteArray, qualifier),
             )
-            assertEquals(M0aControlOperation.START, response.operation)
+            assertEquals(ControlOperation.START, response.operation)
             assertEquals(1, response.outcome)
             assertEquals(0, response.resultFlags)
             assertEquals(6, response.errorId)
@@ -177,7 +177,7 @@ class VisibilityGridV2BindingTest {
             assertEquals(0, response.streamToken)
             assertEquals(0, response.nextExchangeRequestSequence)
             assertEquals(9, response.nativeTransactionId)
-            val detail = M0aControlCodec.decodeErrorDetail(response.payload)
+            val detail = ControlCodec.decodeErrorDetail(response.payload)
             assertEquals(6, detail.errorId)
             assertEquals(0, detail.disposition)
             assertEquals(2, detail.validationPhase)
@@ -204,18 +204,18 @@ class VisibilityGridV2BindingTest {
             val shortStart = request.copy(payload = request.payload.copyOf(request.payload.size - 1))
             MethodChannel(messenger, "visibility_grid_v2_control_1200").invokeMethod(
                 "start",
-                qualifier + M0aControlCodec.encodeRequest(shortStart),
+                qualifier + ControlCodec.encodeRequest(shortStart),
                 malformedPayload,
             )
             assertTrue(malformedPayload.completed.await(2, TimeUnit.SECONDS))
-            val payloadError = M0aControlCodec.decodeResponse(
+            val payloadError = ControlCodec.decodeResponse(
                 stripQualifier(malformedPayload.successValue as ByteArray, qualifier),
             )
-            val payloadDetail = M0aControlCodec.decodeErrorDetail(payloadError.payload)
+            val payloadDetail = ControlCodec.decodeErrorDetail(payloadError.payload)
             assertEquals(6, payloadError.errorId)
             assertEquals(2, payloadDetail.validationPhase)
             assertEquals(3, payloadDetail.fieldId)
-            assertEquals(M0aStartRequestCodecV2.byteLength.toLong(), payloadDetail.expectedValue)
+            assertEquals(StartRequestCodecV2.byteLength.toLong(), payloadDetail.expectedValue)
             assertEquals(shortStart.payload.size.toLong(), payloadDetail.observedValue)
             assertEquals(0, binding.snapshot().acceptedControls)
             assertEquals(baseline, authority.snapshot(scope))
@@ -223,11 +223,11 @@ class VisibilityGridV2BindingTest {
             val corrected = RecordingResult()
             MethodChannel(messenger, "visibility_grid_v2_control_1200").invokeMethod(
                 "start",
-                qualifier + M0aControlCodec.encodeRequest(request),
+                qualifier + ControlCodec.encodeRequest(request),
                 corrected,
             )
             assertTrue(corrected.completed.await(2, TimeUnit.SECONDS))
-            val correctedResponse = M0aControlCodec.decodeResponse(
+            val correctedResponse = ControlCodec.decodeResponse(
                 stripQualifier(corrected.successValue as ByteArray, qualifier),
             )
             assertEquals(0, correctedResponse.outcome)
@@ -249,7 +249,7 @@ class VisibilityGridV2BindingTest {
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 1201,
-            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
             postToMain = { task -> task() },
         )
         try {
@@ -257,12 +257,12 @@ class VisibilityGridV2BindingTest {
             val initial = binding.snapshot()
             val qualifier = initial.nativeStreamToken + initial.workerBindingToken
 
-            fun invoke(method: String, request: M0aControlRequest): com.uhg0.ar_flutter_plugin_2.m0.M0aControlResponse {
+            fun invoke(method: String, request: ControlRequest): com.uhg0.ar_flutter_plugin_2.proposal08.ControlResponse {
                 val result = RecordingResult()
-                channel.invokeMethod(method, qualifier + M0aControlCodec.encodeRequest(request), result)
+                channel.invokeMethod(method, qualifier + ControlCodec.encodeRequest(request), result)
                 assertTrue(result.completed.await(2, TimeUnit.SECONDS))
                 assertEquals(1, result.successCount)
-                return M0aControlCodec.decodeResponse(
+                return ControlCodec.decodeResponse(
                     stripQualifier(result.successValue as ByteArray, qualifier),
                 )
             }
@@ -285,9 +285,9 @@ class VisibilityGridV2BindingTest {
                 data.putLong(8, 1)
             }
             val operations = listOf(
-                Triple("beginCheckpoint", M0aControlOperation.BEGIN_CHECKPOINT, begin),
-                Triple("releaseCheckpoint", M0aControlOperation.RELEASE_CHECKPOINT, release),
-                Triple("stop", M0aControlOperation.STOP, stop),
+                Triple("beginCheckpoint", ControlOperation.BEGIN_CHECKPOINT, begin),
+                Triple("releaseCheckpoint", ControlOperation.RELEASE_CHECKPOINT, release),
+                Triple("stop", ControlOperation.STOP, stop),
             )
             operations.forEachIndexed { index, (method, operation, payload) ->
                 val request = startRequest().copy(
@@ -298,15 +298,15 @@ class VisibilityGridV2BindingTest {
                 )
                 val malformedPayload = payload.copyOf().also { bytes ->
                     when (operation) {
-                        M0aControlOperation.BEGIN_CHECKPOINT ->
+                        ControlOperation.BEGIN_CHECKPOINT ->
                             ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN).putInt(96, 0)
-                        M0aControlOperation.RELEASE_CHECKPOINT -> bytes[8] = 1
-                        M0aControlOperation.STOP -> bytes[1] = 0
-                        M0aControlOperation.START -> error("unreachable")
+                        ControlOperation.RELEASE_CHECKPOINT -> bytes[8] = 1
+                        ControlOperation.STOP -> bytes[1] = 0
+                        ControlOperation.START -> error("unreachable")
                     }
                 }
                 val before = binding.snapshot()
-                val malformedPayloads = if (operation == M0aControlOperation.STOP) {
+                val malformedPayloads = if (operation == ControlOperation.STOP) {
                     listOf(
                         payload.copyOf().also { it[0] = 0 },
                         payload.copyOf().also {
@@ -319,11 +319,11 @@ class VisibilityGridV2BindingTest {
                 malformedPayloads.forEachIndexed { malformedIndex, candidate ->
                     val malformed = invoke(method, request.copy(payload = candidate))
                     assertEquals(1, malformed.outcome)
-                    val detail = M0aControlCodec.decodeErrorDetail(malformed.payload)
+                    val detail = ControlCodec.decodeErrorDetail(malformed.payload)
                     assertEquals(0, detail.disposition)
                     assertEquals(5, detail.recoveryAction)
                     assertTrue(detail.validationPhase in 1..7)
-                    if (operation == M0aControlOperation.STOP && malformedIndex < 2) {
+                    if (operation == ControlOperation.STOP && malformedIndex < 2) {
                         assertEquals(3, detail.validationPhase)
                         assertEquals(if (malformedIndex == 0) 16 else 5, detail.fieldId)
                     }
@@ -359,13 +359,13 @@ class VisibilityGridV2BindingTest {
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 1199,
-            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
             postToMain = { task -> task() },
         )
         try {
             val snapshot = binding.snapshot()
             val qualifier = snapshot.nativeStreamToken + snapshot.workerBindingToken
-            val request = M0aControlCodec.encodeRequest(startRequest())
+            val request = ControlCodec.encodeRequest(startRequest())
 
             val wrong = qualifier.copyOf().also { it[0] = (it[0].toInt() xor 1).toByte() }
             val stale = RecordingResult()
@@ -380,7 +380,7 @@ class VisibilityGridV2BindingTest {
             val anonymous = RecordingResult()
             MethodChannel(messenger, "visibility_grid_v2_control_1199").invokeMethod(
                 "start",
-                qualifier + ByteArray(M0aControlCodec.requestHeaderBytes - 1),
+                qualifier + ByteArray(ControlCodec.requestHeaderBytes - 1),
                 anonymous,
             )
             assertTrue(anonymous.completed.await(2, TimeUnit.SECONDS))
@@ -400,7 +400,7 @@ class VisibilityGridV2BindingTest {
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 1198,
-            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
             postToMain = { task -> task() },
             beforeControlPublication = {
                 entered.countDown()
@@ -410,7 +410,7 @@ class VisibilityGridV2BindingTest {
         try {
             val snapshot = binding.snapshot()
             val qualifier = snapshot.nativeStreamToken + snapshot.workerBindingToken
-            val malformed = M0aControlCodec.encodeRequest(startRequest()).also { bytes ->
+            val malformed = ControlCodec.encodeRequest(startRequest()).also { bytes ->
                 bytes[96] = (bytes[96].toInt() xor 1).toByte()
             }
             val control = RecordingResult()
@@ -454,7 +454,7 @@ class VisibilityGridV2BindingTest {
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 1197,
-            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
             executor = worker,
             postToMain = { task -> task() },
             beforeControlAdmission = {
@@ -471,7 +471,7 @@ class VisibilityGridV2BindingTest {
             val controlCall = callers.submit {
                 channel.invokeMethod(
                     "start",
-                    oldQualifier + M0aControlCodec.encodeRequest(startRequest()),
+                    oldQualifier + ControlCodec.encodeRequest(startRequest()),
                     oldControl,
                 )
             }
@@ -500,14 +500,14 @@ class VisibilityGridV2BindingTest {
             val stale = RecordingResult()
             channel.invokeMethod(
                 "start",
-                oldQualifier + M0aControlCodec.encodeRequest(startRequest()),
+                oldQualifier + ControlCodec.encodeRequest(startRequest()),
                 stale,
             )
             assertEquals(1, stale.errorCount)
             val corrected = RecordingResult()
             channel.invokeMethod(
                 "start",
-                newQualifier + M0aControlCodec.encodeRequest(startRequest()),
+                newQualifier + ControlCodec.encodeRequest(startRequest()),
                 corrected,
             )
             assertTrue(corrected.completed.await(2, TimeUnit.SECONDS))
@@ -563,7 +563,7 @@ class VisibilityGridV2BindingTest {
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 1201,
-            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
             executor = executor,
             postToMain = { task -> task() },
         )
@@ -636,7 +636,7 @@ class VisibilityGridV2BindingTest {
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 1202,
-            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
             executor = executor,
             postToMain = { task -> task() },
         )
@@ -684,7 +684,7 @@ class VisibilityGridV2BindingTest {
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 1203,
-            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
             executor = executor,
             postToMain = { task -> task() },
             cleanupAuthority = authority,
@@ -726,7 +726,7 @@ class VisibilityGridV2BindingTest {
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 1204,
-            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
             postToMain = { task ->
                 synchronized(queuedPosts) { queuedPosts.addLast(task) }
                 posted.countDown()
@@ -778,14 +778,14 @@ class VisibilityGridV2BindingTest {
         val acknowledgement = Executors.newSingleThreadExecutor()
         val acknowledgementContinuation = acknowledgement.submit {
             seam.beforeRequest(
-                M0aPacketCodec.Request(
+                PacketCodec.Request(
                     requestFlags = 0,
                     streamToken = 1,
                     acknowledgedTransactionId = 1,
                     acknowledgedGeometryRevision = 1,
                     acknowledgedLineageRevision = 1,
                     nextStyleRevision = 0,
-                    maximumResponseBytes = M0aTransactionResponseProfileV1.ordinary.responseCeilingBytes,
+                    maximumResponseBytes = TransactionResponseProfileV1.ordinary.responseCeilingBytes,
                     styleRecords = emptyList(),
                     commandBytes = byteArrayOf(),
                     requestSequence = 3,
@@ -797,7 +797,7 @@ class VisibilityGridV2BindingTest {
         acknowledgement.shutdownNow()
 
         val restoredRequest = startRequest().copy(
-            payload = M0aStartRequestCodecV2.defaultPayload().also { it[7] = 1 },
+            payload = StartRequestCodecV2.defaultPayload().also { it[7] = 1 },
         )
         val cut = VisibilityGridV2Binding.RecoveryGroupCut.from(restoredRequest)
         seam.replacementSeeded(cut)
@@ -864,7 +864,7 @@ class VisibilityGridV2BindingTest {
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 98,
-            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
             postToMain = { task -> task() },
             isDebuggable = true,
         )
@@ -908,31 +908,31 @@ class VisibilityGridV2BindingTest {
             val start = RecordingResult()
             channel.invokeMethod(
                 "start",
-                qualifier + M0aControlCodec.encodeRequest(startRequest()),
+                qualifier + ControlCodec.encodeRequest(startRequest()),
                 start,
             )
             assertTrue(start.completed.await(2, TimeUnit.SECONDS))
             assertEquals(start.errorMessage, 0, start.errorCount)
-            val startResponse = M0aControlCodec.decodeResponse(
+            val startResponse = ControlCodec.decodeResponse(
                 stripQualifier(start.successValue as ByteArray, qualifier),
             )
             assertEquals(0, startResponse.nativeTransactionId)
             assertEquals(1, startResponse.nextExchangeRequestSequence)
 
-            fun exchange(sequence: Long, acknowledgedTransactionId: Long): M0aPacketCodec.Response {
+            fun exchange(sequence: Long, acknowledgedTransactionId: Long): PacketCodec.Response {
                 val reply = RecordingBinaryReply()
                 messenger.send(
                     "visibility_surface_stream_98",
                     ByteBuffer.wrap(
-                        qualifier + M0aPacketCodec.encodeRequest(
-                            M0aPacketCodec.Request(
+                        qualifier + PacketCodec.encodeRequest(
+                            PacketCodec.Request(
                                 requestFlags = 0,
                                 streamToken = startResponse.streamToken,
                                 acknowledgedTransactionId = acknowledgedTransactionId,
                                 acknowledgedGeometryRevision = if (acknowledgedTransactionId == 0L) 11 else 12,
                                 acknowledgedLineageRevision = if (acknowledgedTransactionId == 0L) 12 else 13,
                                 nextStyleRevision = 15,
-                                maximumResponseBytes = M0aTransactionResponseProfileV1.ordinary.responseCeilingBytes,
+                                maximumResponseBytes = TransactionResponseProfileV1.ordinary.responseCeilingBytes,
                                 styleRecords = emptyList(),
                                 commandBytes = byteArrayOf(),
                                 requestSequence = sequence,
@@ -942,7 +942,7 @@ class VisibilityGridV2BindingTest {
                     reply,
                 )
                 assertTrue(reply.completed.await(2, TimeUnit.SECONDS))
-                return M0aPacketCodec.decodeResponse(stripQualifier(reply.bytes!!, qualifier))
+                return PacketCodec.decodeResponse(stripQualifier(reply.bytes!!, qualifier))
             }
             val restored = exchange(1, 0)
             assertEquals(0, restored.messageKind)
@@ -950,16 +950,16 @@ class VisibilityGridV2BindingTest {
             assertEquals(11, restored.targetGeometryRevision)
             assertEquals(12, restored.targetLineageRevision)
             val observationCut = requireNotNull(binding.currentObservationOwnership())
-            val emptyBaseline = requireNotNull(binding.m3CommittedEmptyBaseline())
+            val emptyBaseline = requireNotNull(binding.committedEmptyBaseline())
             assertEquals(0, emptyBaseline.transactionId)
             assertEquals(11, emptyBaseline.geometryRevision)
             assertEquals(12, emptyBaseline.lineageRevision)
             assertEquals(observationCut.captureGroupId, emptyBaseline.groupIdentity)
 
-            val selector = M0aCurrentDeltaSelectorV1(1, 12, 12)
+            val selector = CurrentDeltaSelectorV1(1, 12, 12)
             binding.queueCommittedCurrentDelta(
-                M0aCurrentDeltaSourceV1 { selected ->
-                    M0aCurrentDeltaReceiptV1(selector, 11, byteArrayOf(9), ByteArray(32) { 8 })
+                CurrentDeltaSourceV1 { selected ->
+                    CurrentDeltaReceiptV1(selector, 11, byteArrayOf(9), ByteArray(32) { 8 })
                         .takeIf { selected == selector }
                 },
                 selector,
@@ -974,7 +974,7 @@ class VisibilityGridV2BindingTest {
             val stale = RecordingBinaryReply()
             messenger.send(
                 "visibility_surface_stream_98",
-                ByteBuffer.wrap(oldQualifier + ByteArray(M0aPacketCodec.requestHeaderBytes)),
+                ByteBuffer.wrap(oldQualifier + ByteArray(PacketCodec.requestHeaderBytes)),
                 stale,
             )
             assertTrue(stale.completed.await(2, TimeUnit.SECONDS))
@@ -988,7 +988,7 @@ class VisibilityGridV2BindingTest {
     fun `VGS2 recovery debug handoff rejects a mismatched correlated baseline`() {
         val messenger = MethodTestMessenger()
         val binding = VisibilityGridV2Binding(
-            messenger, 981, M0aCommittedBaselineAuthority(), postToMain = { it() }, isDebuggable = true,
+            messenger, 981, CommittedBaselineAuthority(), postToMain = { it() }, isDebuggable = true,
         )
         try {
             val channel = MethodChannel(messenger, "visibility_grid_v2_control_981")
@@ -1014,14 +1014,14 @@ class VisibilityGridV2BindingTest {
 
             binding.javaClass.getDeclaredField("issue98RestoredBaseline").also {
                 it.isAccessible = true
-                it.set(binding, M0aCommittedBaselineV1(0, 99, 12, 15))
+                it.set(binding, CommittedBaselineV1(0, 99, 12, 15))
             }
             val snapshot = binding.snapshot()
             val start = RecordingResult()
             channel.invokeMethod(
                 "start",
                 snapshot.nativeStreamToken + snapshot.workerBindingToken +
-                    M0aControlCodec.encodeRequest(startRequest()),
+                    ControlCodec.encodeRequest(startRequest()),
                 start,
             )
             assertTrue(start.completed.await(2, TimeUnit.SECONDS))
@@ -1037,7 +1037,7 @@ class VisibilityGridV2BindingTest {
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 127,
-            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
             postToMain = { task -> task() },
         )
         try {
@@ -1046,11 +1046,11 @@ class VisibilityGridV2BindingTest {
             val start = RecordingResult()
             MethodChannel(messenger, "visibility_grid_v2_control_127").invokeMethod(
                 "start",
-                qualifier + M0aControlCodec.encodeRequest(startRequest()),
+                qualifier + ControlCodec.encodeRequest(startRequest()),
                 start,
             )
             assertTrue(start.completed.await(2, TimeUnit.SECONDS))
-            val streamToken = M0aControlCodec.decodeResponse(
+            val streamToken = ControlCodec.decodeResponse(
                 stripQualifier(start.successValue as ByteArray, qualifier),
             ).streamToken
 
@@ -1064,8 +1064,8 @@ class VisibilityGridV2BindingTest {
                 messenger.send(
                     "visibility_surface_stream_127",
                     ByteBuffer.wrap(
-                        qualifier + M0aPacketCodec.encodeRequest(
-                            M0aPacketCodec.Request(
+                        qualifier + PacketCodec.encodeRequest(
+                            PacketCodec.Request(
                                 requestFlags = 0,
                                 streamToken = streamToken,
                                 acknowledgedTransactionId = transaction,
@@ -1073,7 +1073,7 @@ class VisibilityGridV2BindingTest {
                                 acknowledgedLineageRevision = lineage,
                                 nextStyleRevision = 0,
                                 maximumResponseBytes =
-                                    M0aTransactionResponseProfileV1.ordinary.responseCeilingBytes,
+                                    TransactionResponseProfileV1.ordinary.responseCeilingBytes,
                                 styleRecords = emptyList(),
                                 commandBytes = byteArrayOf(),
                                 requestSequence = sequence,
@@ -1086,23 +1086,23 @@ class VisibilityGridV2BindingTest {
                 return stripQualifier(reply.bytes!!, qualifier)
             }
 
-            // The empty M1 transaction is the first acknowledged current cut.
-            assertEquals(2, M0aPacketCodec.decodeResponse(exchange(1, 0, 0, 0)).messageKind)
-            assertEquals(4, M0aPacketCodec.decodeResponse(exchange(2, 0, 0, 0)).messageKind)
-            assertEquals(0, M0aPacketCodec.decodeResponse(exchange(3, 1, 1, 1)).messageKind)
-            assertEquals(1L, requireNotNull(binding.m3CommittedEmptyBaseline()).transactionId)
+            // The empty binding lifecycle transaction is the first acknowledged current cut.
+            assertEquals(2, PacketCodec.decodeResponse(exchange(1, 0, 0, 0)).messageKind)
+            assertEquals(4, PacketCodec.decodeResponse(exchange(2, 0, 0, 0)).messageKind)
+            assertEquals(0, PacketCodec.decodeResponse(exchange(3, 1, 1, 1)).messageKind)
+            assertEquals(1L, requireNotNull(binding.committedEmptyBaseline()).transactionId)
 
             fun source(
-                selector: M0aCurrentDeltaSelectorV1,
+                selector: CurrentDeltaSelectorV1,
                 baseGeometry: Long,
                 bytes: ByteArray,
                 commandHash: ByteArray = ByteArray(32) { bytes.sum().toByte() },
-            ) = M0aCurrentDeltaSourceV1 { requested ->
-                M0aCurrentDeltaReceiptV1(selector, baseGeometry, bytes, commandHash)
+            ) = CurrentDeltaSourceV1 { requested ->
+                CurrentDeltaReceiptV1(selector, baseGeometry, bytes, commandHash)
                     .takeIf { requested == selector }
             }
 
-            val create = M0aCurrentDeltaSelectorV1(2, 2, 1)
+            val create = CurrentDeltaSelectorV1(2, 2, 1)
             val createBytes = byteArrayOf(2, 7, 1)
             val createCommandHash = ByteArray(32) { 2 }
             binding.queueCommittedCurrentDelta(
@@ -1134,40 +1134,40 @@ class VisibilityGridV2BindingTest {
             }
             refused {
                 binding.queueCommittedCurrentDelta(
-                    source(M0aCurrentDeltaSelectorV1(2, 2, 2), 1, createBytes),
-                    M0aCurrentDeltaSelectorV1(2, 2, 2),
+                    source(CurrentDeltaSelectorV1(2, 2, 2), 1, createBytes),
+                    CurrentDeltaSelectorV1(2, 2, 2),
                 )
             }
             refused {
                 binding.queueCommittedCurrentDelta(
-                    source(M0aCurrentDeltaSelectorV1(3, 3, 1), 2, byteArrayOf(3)),
-                    M0aCurrentDeltaSelectorV1(3, 3, 1),
+                    source(CurrentDeltaSelectorV1(3, 3, 1), 2, byteArrayOf(3)),
+                    CurrentDeltaSelectorV1(3, 3, 1),
                 )
             }
             refused {
                 binding.queueCommittedCurrentDelta(
-                    source(M0aCurrentDeltaSelectorV1(1, 1, 1), 0, byteArrayOf(1)),
-                    M0aCurrentDeltaSelectorV1(1, 1, 1),
+                    source(CurrentDeltaSelectorV1(1, 1, 1), 0, byteArrayOf(1)),
+                    CurrentDeltaSelectorV1(1, 1, 1),
                 )
             }
 
             val beginCreate = exchange(4, 1, 1, 1)
             assertArrayEquals(beginCreate, exchange(4, 1, 1, 1))
-            assertEquals(2L, M0aPacketCodec.decodeResponse(beginCreate).transactionId)
-            assertEquals(3, M0aPacketCodec.decodeResponse(exchange(5, 1, 1, 1)).messageKind)
-            assertEquals(4, M0aPacketCodec.decodeResponse(exchange(6, 1, 1, 1)).messageKind)
-            assertEquals(0, M0aPacketCodec.decodeResponse(exchange(7, 2, 2, 1)).messageKind)
+            assertEquals(2L, PacketCodec.decodeResponse(beginCreate).transactionId)
+            assertEquals(3, PacketCodec.decodeResponse(exchange(5, 1, 1, 1)).messageKind)
+            assertEquals(4, PacketCodec.decodeResponse(exchange(6, 1, 1, 1)).messageKind)
+            assertEquals(0, PacketCodec.decodeResponse(exchange(7, 2, 2, 1)).messageKind)
 
-            val refine = M0aCurrentDeltaSelectorV1(3, 3, 2)
+            val refine = CurrentDeltaSelectorV1(3, 3, 2)
             binding.queueCommittedCurrentDelta(source(refine, 2, byteArrayOf(3, 4)), refine)
-            val beginRefine = M0aPacketCodec.decodeResponse(exchange(8, 2, 2, 1))
+            val beginRefine = PacketCodec.decodeResponse(exchange(8, 2, 2, 1))
             assertEquals(2, beginRefine.messageKind)
             assertEquals(3L, beginRefine.transactionId)
             assertEquals(3L, beginRefine.targetGeometryRevision)
             assertEquals(2L, beginRefine.targetLineageRevision)
-            assertEquals(3, M0aPacketCodec.decodeResponse(exchange(9, 2, 2, 1)).messageKind)
-            assertEquals(4, M0aPacketCodec.decodeResponse(exchange(10, 2, 2, 1)).messageKind)
-            assertEquals(0, M0aPacketCodec.decodeResponse(exchange(11, 3, 3, 2)).messageKind)
+            assertEquals(3, PacketCodec.decodeResponse(exchange(9, 2, 2, 1)).messageKind)
+            assertEquals(4, PacketCodec.decodeResponse(exchange(10, 2, 2, 1)).messageKind)
+            assertEquals(0, PacketCodec.decodeResponse(exchange(11, 3, 3, 2)).messageKind)
 
             val stopPayload = ByteArray(88).also { bytes ->
                 ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN).apply {
@@ -1179,9 +1179,9 @@ class VisibilityGridV2BindingTest {
             val stopped = RecordingResult()
             MethodChannel(messenger, "visibility_grid_v2_control_127").invokeMethod(
                 "stop",
-                qualifier + M0aControlCodec.encodeRequest(
+                qualifier + ControlCodec.encodeRequest(
                     startRequest().copy(
-                        operation = M0aControlOperation.STOP,
+                        operation = ControlOperation.STOP,
                         controlRequestId = uuid(90),
                         streamToken = streamToken,
                         payload = stopPayload,
@@ -1192,7 +1192,7 @@ class VisibilityGridV2BindingTest {
             assertTrue(stopped.completed.await(2, TimeUnit.SECONDS))
             assertEquals(1, stopped.successCount)
             refused {
-                val successor = M0aCurrentDeltaSelectorV1(4, 4, 2)
+                val successor = CurrentDeltaSelectorV1(4, 4, 2)
                 binding.queueCommittedCurrentDelta(source(successor, 3, byteArrayOf(4)), successor)
             }
         } finally {
@@ -1206,7 +1206,7 @@ class VisibilityGridV2BindingTest {
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 83,
-            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
             postToMain = { task -> task() },
         )
         val channel = MethodChannel(messenger, "visibility_grid_v2_control_83")
@@ -1215,29 +1215,29 @@ class VisibilityGridV2BindingTest {
         val start = RecordingResult()
         channel.invokeMethod(
             "start",
-            qualifier + M0aControlCodec.encodeRequest(startRequest()),
+            qualifier + ControlCodec.encodeRequest(startRequest()),
             start,
         )
         assertTrue(start.completed.await(2, TimeUnit.SECONDS))
-        val startResponse = M0aControlCodec.decodeResponse(
+        val startResponse = ControlCodec.decodeResponse(
             stripQualifier(start.successValue as ByteArray, qualifier),
         )
         val streamToken = startResponse.streamToken
 
-        fun exchange(sequence: Long): M0aPacketCodec.Response {
+        fun exchange(sequence: Long): PacketCodec.Response {
             val response = RecordingBinaryReply()
             messenger.send(
                 "visibility_surface_stream_83",
                 ByteBuffer.wrap(
-                    qualifier + M0aPacketCodec.encodeRequest(
-                        M0aPacketCodec.Request(
+                    qualifier + PacketCodec.encodeRequest(
+                        PacketCodec.Request(
                             requestFlags = 0,
                             streamToken = streamToken,
                             acknowledgedTransactionId = 0,
                             acknowledgedGeometryRevision = 0,
                             acknowledgedLineageRevision = 0,
                             nextStyleRevision = 0,
-                            maximumResponseBytes = M0aTransactionResponseProfileV1.ordinary.responseCeilingBytes,
+                            maximumResponseBytes = TransactionResponseProfileV1.ordinary.responseCeilingBytes,
                             styleRecords = emptyList(),
                             commandBytes = byteArrayOf(),
                             requestSequence = sequence,
@@ -1247,7 +1247,7 @@ class VisibilityGridV2BindingTest {
                 response,
             )
             assertTrue(response.completed.await(2, TimeUnit.SECONDS))
-            return M0aPacketCodec.decodeResponse(stripQualifier(response.bytes!!, qualifier))
+            return PacketCodec.decodeResponse(stripQualifier(response.bytes!!, qualifier))
         }
 
         assertEquals(2, exchange(1).messageKind)
@@ -1316,7 +1316,7 @@ class VisibilityGridV2BindingTest {
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 79,
-            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
             executor = executor,
             postToMain = { task -> task() },
             beforeControlPublication = {
@@ -1332,7 +1332,7 @@ class VisibilityGridV2BindingTest {
         val channel = MethodChannel(messenger, "visibility_grid_v2_control_79")
         val start = RecordingResult()
 
-        channel.invokeMethod("start", qualifier + M0aControlCodec.encodeRequest(startRequest()), start)
+        channel.invokeMethod("start", qualifier + ControlCodec.encodeRequest(startRequest()), start)
         assertTrue(enteredPublication.await(2, TimeUnit.SECONDS))
 
         val abandoned = RecordingResult()
@@ -1387,7 +1387,7 @@ class VisibilityGridV2BindingTest {
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 92,
-            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
             executor = executor,
             postToMain = { task -> task() },
         )
@@ -1461,7 +1461,7 @@ class VisibilityGridV2BindingTest {
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 93,
-            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
             postToMain = { task ->
                 synchronized(queuedPosts) { queuedPosts.addLast(task) }
                 posted.countDown()
@@ -1518,7 +1518,7 @@ class VisibilityGridV2BindingTest {
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 94,
-            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
             executor = executor,
             postToMain = { task -> task() },
             beforeAbandonCleanup = {
@@ -1581,7 +1581,7 @@ class VisibilityGridV2BindingTest {
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 95,
-            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
             executor = executor,
             postToMain = { task -> task() },
         )
@@ -1659,7 +1659,7 @@ class VisibilityGridV2BindingTest {
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 951,
-            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
             executor = executor,
             postToMain = { task ->
                 synchronized(queuedPosts) { queuedPosts.addLast(task) }
@@ -1742,7 +1742,7 @@ class VisibilityGridV2BindingTest {
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 96,
-            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
             executor = executor,
             postToMain = { task ->
                 synchronized(queuedPosts) { queuedPosts.addLast(task) }
@@ -1800,7 +1800,7 @@ class VisibilityGridV2BindingTest {
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 97,
-            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
             postToMain = { task -> task() },
             cleanupAuthority = authority,
         )
@@ -1866,7 +1866,7 @@ class VisibilityGridV2BindingTest {
                 val binding = VisibilityGridV2Binding(
                     messenger = messenger,
                     viewId = viewId,
-                    committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+                    CommittedBaselineAuthority = CommittedBaselineAuthority(),
                     executor = executor,
                     postToMain = { task -> task() },
                     cleanupAuthority = authority,
@@ -1963,7 +1963,7 @@ class VisibilityGridV2BindingTest {
                 val binding = VisibilityGridV2Binding(
                     messenger = messenger,
                     viewId = viewId,
-                    committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+                    CommittedBaselineAuthority = CommittedBaselineAuthority(),
                     executor = executor,
                     postToMain = { task ->
                         if (delayPosts.get()) delayedPosts.addLast(task) else task()
@@ -2062,19 +2062,19 @@ class VisibilityGridV2BindingTest {
 
     @Test
     fun `real receipt query rejects inexact and out of range numbers before lookup`() {
-        val authority = M0aCommittedBaselineAuthority()
+        val authority = CommittedBaselineAuthority()
         val messenger = MethodTestMessenger()
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 86,
-            committedBaselineAuthority = authority,
+            CommittedBaselineAuthority = authority,
             postToMain = { task -> task() },
         )
         val snapshot = binding.snapshot()
         val channel = MethodChannel(messenger, "visibility_grid_v2_control_86")
-        val validQuery = M0aCommitReceiptQueryV1(
+        val validQuery = CommitReceiptQueryV1(
             controlRequestId = uuid(1),
-            scope = M0aCommittedBaselineScopeV1(
+            scope = CommittedBaselineScopeV1(
                 sessionId = uuid(20),
                 captureGroupId = uuid(40),
                 sessionGeneration = 0,
@@ -2126,19 +2126,19 @@ class VisibilityGridV2BindingTest {
 
     @Test
     fun `real receipt query preserves signed 64 bit boundary values`() {
-        val authority = M0aCommittedBaselineAuthority()
+        val authority = CommittedBaselineAuthority()
         val messenger = MethodTestMessenger()
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 87,
-            committedBaselineAuthority = authority,
+            CommittedBaselineAuthority = authority,
             postToMain = { task -> task() },
         )
         val snapshot = binding.snapshot()
         val maximum = Long.MAX_VALUE
-        val query = M0aCommitReceiptQueryV1(
+        val query = CommitReceiptQueryV1(
             controlRequestId = uuid(2),
-            scope = M0aCommittedBaselineScopeV1(
+            scope = CommittedBaselineScopeV1(
                 sessionId = uuid(21),
                 captureGroupId = uuid(41),
                 sessionGeneration = maximum,
@@ -2177,7 +2177,7 @@ class VisibilityGridV2BindingTest {
         binding.dispose()
     }
 
-    private fun M0aCommitReceiptQueryV1.toChannelMap(): Map<String, Any> = mapOf(
+    private fun CommitReceiptQueryV1.toChannelMap(): Map<String, Any> = mapOf(
         "controlRequestId" to controlRequestId.hex(),
         "sessionId" to scope.sessionId.hex(),
         "captureGroupId" to scope.captureGroupId.hex(),
@@ -2192,8 +2192,8 @@ class VisibilityGridV2BindingTest {
         "targetLineageRevision" to targetLineageRevision,
     )
 
-    private fun startRequest() = M0aControlRequest(
-        operation = M0aControlOperation.START,
+    private fun startRequest() = ControlRequest(
+        operation = ControlOperation.START,
         flags = 0,
         controlRequestId = uuid(1),
         sessionId = uuid(20),
@@ -2202,17 +2202,17 @@ class VisibilityGridV2BindingTest {
         groupGeneration = 4,
         coverageEpoch = 5,
         streamToken = 0,
-        payload = M0aStartRequestCodecV2.defaultPayload(),
+        payload = StartRequestCodecV2.defaultPayload(),
     )
 
-    private fun uuid(seed: Int): M0aUuid {
+    private fun uuid(seed: Int): Uuid {
         val bytes = ByteArray(16) { (seed + it).toByte() }
         bytes[6] = 0x40
         bytes[8] = 0x80.toByte()
-        return M0aUuid(bytes)
+        return Uuid(bytes)
     }
 
-    private fun M0aUuid.hex(): String = bytes.joinToString("") { byte ->
+    private fun Uuid.hex(): String = bytes.joinToString("") { byte ->
         "%02x".format(byte.toInt() and 0xff)
     }
 

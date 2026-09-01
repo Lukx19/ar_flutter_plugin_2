@@ -3,6 +3,6 @@
         <service
             android:name="com.uhg0.ar_flutter_plugin_2.proposal08.CrashBeforeRootSwitchService"
             android:exported="false"
-            android:process=":m0c_crash" />
+            android:process=":residency_crash" />
     </application>
 </manifest>

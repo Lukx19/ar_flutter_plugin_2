@@ -1,6 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.proposal08
 
-import com.uhg0.ar_flutter_plugin_2.m0.*
+import com.uhg0.ar_flutter_plugin_2.proposal08.*
 
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.MethodTestMessenger
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.RecordingBinaryReply
@@ -19,7 +19,7 @@ class VisibilityProtocolVgs2RecoveryCorpusTest {
     @Test
     fun `VGS2 recovery production runner executes every SHA locked VGS2 policy case`() {
         val bytes = fixture()
-        val receipt = M0aVgs2RecoveryCorpus.run(
+        val receipt = Vgs2RecoveryCorpus.run(
             bytes,
             executeFreshBinding = ::executeProductionFreshBinding,
         )
@@ -48,7 +48,7 @@ class VisibilityProtocolVgs2RecoveryCorpusTest {
         ).forEach { mutation ->
             val bytes = mutation.encodeToByteArray()
             assertThrows(IllegalArgumentException::class.java) {
-                M0aVgs2RecoveryCorpus.run(
+                Vgs2RecoveryCorpus.run(
                     bytes,
                     sha256(bytes),
                     ::executeProductionFreshBinding,
@@ -57,18 +57,18 @@ class VisibilityProtocolVgs2RecoveryCorpusTest {
         }
     }
 
-    private fun fixture() = File("../../../docs/m1/issue98_vgs2_recovery_corpus_v1.json").readBytes()
+    private fun fixture() = File("../../../docs/proposal08/evidence/vgs2_recovery_corpus_v1.json").readBytes()
     private fun sha256(bytes: ByteArray) = MessageDigest.getInstance("SHA-256")
         .digest(bytes).joinToString("") { "%02x".format(it) }
 
     private fun executeProductionFreshBinding(
-        expected: M0aVgs2RecoveryCorpus.FreshBindingExpectation,
-    ): M0aVgs2RecoveryCorpus.FreshBindingObservation {
+        expected: Vgs2RecoveryCorpus.FreshBindingExpectation,
+    ): Vgs2RecoveryCorpus.FreshBindingObservation {
         val messenger = MethodTestMessenger()
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 98,
-            committedBaselineAuthority = M0aCommittedBaselineAuthority(),
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
             postToMain = { task -> task() },
             isDebuggable = true,
         )
@@ -104,22 +104,22 @@ class VisibilityProtocolVgs2RecoveryCorpusTest {
             val start = RecordingResult()
             channel.invokeMethod(
                 "start",
-                qualifier + M0aControlCodec.encodeRequest(request),
+                qualifier + ControlCodec.encodeRequest(request),
                 start,
             )
             require(start.completed.await(2, TimeUnit.SECONDS))
-            val startResponse = M0aControlCodec.decodeResponse(
+            val startResponse = ControlCodec.decodeResponse(
                 stripQualifier(start.successValue as ByteArray, qualifier),
             )
             val attempted = mutableListOf<Long>()
-            fun exchange(sequence: Long, acknowledgedTransactionId: Long): M0aPacketCodec.Response {
+            fun exchange(sequence: Long, acknowledgedTransactionId: Long): PacketCodec.Response {
                 attempted += sequence
                 val reply = RecordingBinaryReply()
                 messenger.send(
                     "visibility_surface_stream_98",
                     ByteBuffer.wrap(
-                        qualifier + M0aPacketCodec.encodeRequest(
-                            M0aPacketCodec.Request(
+                        qualifier + PacketCodec.encodeRequest(
+                            PacketCodec.Request(
                                 requestFlags = 0,
                                 streamToken = startResponse.streamToken,
                                 acknowledgedTransactionId = acknowledgedTransactionId,
@@ -144,13 +144,13 @@ class VisibilityProtocolVgs2RecoveryCorpusTest {
                     reply,
                 )
                 require(reply.completed.await(2, TimeUnit.SECONDS))
-                return M0aPacketCodec.decodeResponse(stripQualifier(reply.bytes!!, qualifier))
+                return PacketCodec.decodeResponse(stripQualifier(reply.bytes!!, qualifier))
             }
             val begin = exchange(expected.beginRequestSequence, 0)
             val commit = exchange(expected.commitRequestSequence, 0)
             val acknowledged = exchange(expected.ackRequestSequence, expected.nextTransactionId)
             require(begin.messageKind == 2 && commit.messageKind == 4 && acknowledged.messageKind == 0)
-            return M0aVgs2RecoveryCorpus.FreshBindingObservation(
+            return Vgs2RecoveryCorpus.FreshBindingObservation(
                 freshTransactionId = startResponse.nativeTransactionId,
                 freshRequestSequence = startResponse.nextExchangeRequestSequence,
                 attemptedRequestSequences = attempted,
@@ -173,8 +173,8 @@ class VisibilityProtocolVgs2RecoveryCorpusTest {
         }
     }
 
-    private fun startRequest() = M0aControlRequest(
-        operation = M0aControlOperation.START,
+    private fun startRequest() = ControlRequest(
+        operation = ControlOperation.START,
         flags = 0,
         controlRequestId = uuid(1),
         sessionId = uuid(20),
@@ -183,14 +183,14 @@ class VisibilityProtocolVgs2RecoveryCorpusTest {
         groupGeneration = 4,
         coverageEpoch = 5,
         streamToken = 0,
-        payload = M0aStartRequestCodecV2.defaultPayload(),
+        payload = StartRequestCodecV2.defaultPayload(),
     )
 
-    private fun uuid(seed: Int): M0aUuid {
+    private fun uuid(seed: Int): Uuid {
         val bytes = ByteArray(16) { (seed + it).toByte() }
         bytes[6] = 0x40
         bytes[8] = 0x80.toByte()
-        return M0aUuid(bytes)
+        return Uuid(bytes)
     }
 
     private fun stripQualifier(bytes: ByteArray, qualifier: ByteArray): ByteArray {

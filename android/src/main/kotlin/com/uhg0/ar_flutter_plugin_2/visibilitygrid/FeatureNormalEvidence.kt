@@ -4,7 +4,7 @@ import java.math.BigInteger
 import kotlin.math.floor
 
 /**
- * Immutable, fixed-point evidence passed from M2 to the M3 normal kernel.
+ * Immutable, fixed-point evidence passed from capture ingress to the canonical surface normal kernel.
  * It deliberately has no identity, lineage, or publication fields.
  */
 internal data class FeatureNormalEvidence(

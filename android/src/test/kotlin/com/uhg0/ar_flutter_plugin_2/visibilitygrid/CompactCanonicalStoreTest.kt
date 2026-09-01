@@ -10,22 +10,22 @@ import org.junit.Test
 class CompactCanonicalStoreTest {
     @Test
     fun `seeded baseline high water and revisions remain part of the exact cut`() {
-        val directory = Files.createTempDirectory("m3-compact-baseline").toFile()
+        val directory = Files.createTempDirectory("canonical-surface-compact-baseline").toFile()
         try {
-            val group = M3SurfaceGroup("compact-baseline")
-            val baseline = M3CommittedEmptyBaseline("binding", group.value, 7, 11, 13)
-            val configuration = M3SurfaceOwnershipConfiguration(seededEmptyBaseline = baseline)
-            val legacy = opened(M3SurfaceOwnership.open(group, directory, configuration))
+            val group = SurfaceGroup("compact-baseline")
+            val baseline = committedEmptyBaseline("binding", group.value, 7, 11, 13)
+            val configuration = SurfaceOwnershipConfiguration(seededEmptyBaseline = baseline)
+            val legacy = opened(SurfaceOwnership.open(group, directory, configuration))
             val accepted =
-                accepted(legacy.apply(M3SurfaceOwnershipCommand("seed", listOf(candidate(0)))))
+                accepted(legacy.apply(SurfaceOwnershipCommand("seed", listOf(candidate(0)))))
             legacy.close()
             val prepared =
-                M3CompactCanonicalStore.prepareV6SiblingMigration(
+                CompactCanonicalStore.prepareV6SiblingMigration(
                     group,
                     directory,
                     acceptingBudget(),
                     configuration,
-                ) as M3CompactCanonicalMigrationResult.Prepared
+                ) as CompactCanonicalMigrationResult.Prepared
             assertEquals(baseline, prepared.cut.seededEmptyBaseline)
             assertEquals(
                 accepted.receipt.nextSurfaceIdHighWater,
@@ -40,14 +40,14 @@ class CompactCanonicalStoreTest {
 
     @Test
     fun `v6 opens exact canonical rows by id voxel and bounded page`() {
-        val directory = Files.createTempDirectory("m3-compact-view").toFile()
+        val directory = Files.createTempDirectory("canonical-surface-compact-view").toFile()
         try {
-            val group = M3SurfaceGroup("compact-view")
-            val legacy = opened(M3SurfaceOwnership.open(group, directory))
+            val group = SurfaceGroup("compact-view")
+            val legacy = opened(SurfaceOwnership.open(group, directory))
             val seeded =
                 accepted(
                     legacy.apply(
-                        M3SurfaceOwnershipCommand(
+                        SurfaceOwnershipCommand(
                             "seed",
                             listOf(candidate(-1), candidate(0), candidate(31)),
                         )
@@ -55,16 +55,16 @@ class CompactCanonicalStoreTest {
                 )
             accepted(
                 legacy.transact(
-                    M3CanonicalTransactionCommand(
+                    CanonicalTransactionCommand(
                         "move",
-                        M3CanonicalOperation.RELOCATION,
+                        CanonicalOperation.RELOCATION,
                         0,
                         0,
                         listOf(seeded.owners.first().id),
                         listOf(
-                            M3CanonicalTarget(
+                            CanonicalTarget(
                                 seeded.owners.first().id,
-                                M3Voxel(-2, 0, 0),
+                                Voxel(-2, 0, 0),
                                 1,
                                 2,
                                 193,
@@ -76,44 +76,44 @@ class CompactCanonicalStoreTest {
             legacy.close()
 
             val prepared =
-                M3CompactCanonicalStore.prepareV6SiblingMigration(
+                CompactCanonicalStore.prepareV6SiblingMigration(
                     group,
                     directory,
                     acceptingBudget(),
                 )
             assertTrue(
-                "$prepared files=${directory.walkTopDown().map { it.name }.toList()} open=${M3CompactCanonicalStore.openV6(group, directory, acceptingBudget())}",
-                prepared is M3CompactCanonicalMigrationResult.Prepared,
+                "$prepared files=${directory.walkTopDown().map { it.name }.toList()} open=${CompactCanonicalStore.openV6(group, directory, acceptingBudget())}",
+                prepared is CompactCanonicalMigrationResult.Prepared,
             )
-            val cut = (prepared as M3CompactCanonicalMigrationResult.Prepared).cut
+            val cut = (prepared as CompactCanonicalMigrationResult.Prepared).cut
             val store =
-                (M3CompactCanonicalStore.openV6(group, directory, acceptingBudget())
-                        as M3CompactCanonicalOpenResult.Opened)
+                (CompactCanonicalStore.openV6(group, directory, acceptingBudget())
+                        as CompactCanonicalOpenResult.Opened)
                     .store
             assertEquals(cut, store.cut)
             assertEquals(
-                M3Voxel(-2, 0, 0),
+                Voxel(-2, 0, 0),
                 requireNotNull(store.findById(seeded.owners.first().id)).voxel,
             )
             assertEquals(
                 seeded.owners[1].id,
-                requireNotNull(store.findByVoxel(M3Voxel(0, 0, 0))).id,
+                requireNotNull(store.findByVoxel(Voxel(0, 0, 0))).id,
             )
-            assertNull(store.findByVoxel(M3Voxel(99, 0, 0)))
-            val first = store.readPage(M3StorageRegion(-1, 0, 0), 2, 0, 1)
+            assertNull(store.findByVoxel(Voxel(99, 0, 0)))
+            val first = store.readPage(StorageRegion(-1, 0, 0), 2, 0, 1)
             assertEquals(1, first.rows.size)
             assertEquals(1, first.inspectedRows)
             assertTrue(first.rows.single().id.value > 0)
-            val empty = store.readPage(M3StorageRegion(Int.MAX_VALUE, 0, 0), 0, 0, 1)
+            val empty = store.readPage(StorageRegion(Int.MAX_VALUE, 0, 0), 0, 0, 1)
             assertTrue(empty.rows.isEmpty())
             assertEquals(0, empty.inspectedRows)
-            val sources = mutableListOf<M3PagedSupport>()
+            val sources = mutableListOf<PagedSupport>()
             val support =
                 store.visitSourceSupport(seeded.owners.first().id, null) {
                     sources += it
                     true
                 }
-            assertEquals(1, (support as M3SourceSupportRead.Complete).delivered)
+            assertEquals(1, (support as SourceSupportRead.Complete).delivered)
             assertEquals(seeded.owners.first().id, sources.single().source.id)
             assertEquals(32, sources.single().source.allocationFingerprint.size)
         } finally {
@@ -123,16 +123,16 @@ class CompactCanonicalStoreTest {
 
     @Test
     fun `receipt includes every retained owner and reserves the mutation journal`() {
-        val directory = Files.createTempDirectory("m3-compact-memory").toFile()
+        val directory = Files.createTempDirectory("canonical-surface-compact-memory").toFile()
         try {
-            val group = M3SurfaceGroup("compact-memory")
-            val legacy = opened(M3SurfaceOwnership.open(group, directory))
-            accepted(legacy.apply(M3SurfaceOwnershipCommand("seed", listOf(candidate(0)))))
+            val group = SurfaceGroup("compact-memory")
+            val legacy = opened(SurfaceOwnership.open(group, directory))
+            accepted(legacy.apply(SurfaceOwnershipCommand("seed", listOf(candidate(0)))))
             legacy.close()
-            M3CompactCanonicalStore.prepareV6SiblingMigration(group, directory, acceptingBudget())
+            CompactCanonicalStore.prepareV6SiblingMigration(group, directory, acceptingBudget())
             val receipt =
-                ((M3CompactCanonicalStore.openV6(group, directory, acceptingBudget())
-                            as M3CompactCanonicalOpenResult.Opened)
+                ((CompactCanonicalStore.openV6(group, directory, acceptingBudget())
+                            as CompactCanonicalOpenResult.Opened)
                         .store)
                     .retainedMemoryReceipt()
             assertEquals(7_589_936L, receipt.kernelBytes)
@@ -155,27 +155,27 @@ class CompactCanonicalStoreTest {
     }
 
     private fun candidate(x: Int) =
-        M3SurfaceCandidate(
-            voxel = M3Voxel(x, 0, 0),
+        SurfaceCandidate(
+            voxel = Voxel(x, 0, 0),
             normalOctX = 0,
             normalOctY = 0,
             normalConfidence = 192,
         )
 
-    private fun opened(result: M3SurfaceOwnershipOpenResult) =
-        (result as M3SurfaceOwnershipOpenResult.Opened).ownership
+    private fun opened(result: SurfaceOwnershipOpenResult) =
+        (result as SurfaceOwnershipOpenResult.Opened).ownership
 
-    private fun accepted(result: M3SurfaceOwnershipResult) =
-        result as M3SurfaceOwnershipResult.Accepted
+    private fun accepted(result: SurfaceOwnershipResult) =
+        result as SurfaceOwnershipResult.Accepted
 
-    private fun accepted(result: M3CanonicalTransactionResult) =
-        result as M3CanonicalTransactionResult.Accepted
+    private fun accepted(result: CanonicalTransactionResult) =
+        result as CanonicalTransactionResult.Accepted
 
     private fun acceptingBudget() =
-        object : M3CanonicalStorageBudget {
+        object : CanonicalStorageBudget {
             override fun reserve(bytes: Long): Any = bytes
             override fun reserveCandidateExclusive(staging: File, target: File, fileBytes: Map<String, Long>, maximumPhysicalBytes: Long) =
-                M3CanonicalCandidateReservation.QuotaRefused
+                CanonicalCandidateReservation.QuotaRefused
 
             override fun commit(token: Any, actualBytes: Long) = Unit
 

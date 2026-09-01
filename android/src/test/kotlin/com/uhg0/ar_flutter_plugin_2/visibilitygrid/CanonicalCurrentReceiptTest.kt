@@ -9,46 +9,46 @@ import org.junit.Test
 class CanonicalCurrentReceiptTest {
     @Test
     fun `active current rejects changed or unrelated replay before another reservation`() {
-        val directory = Files.createTempDirectory("m3-current-pending").toFile()
+        val directory = Files.createTempDirectory("canonical-surface-current-pending").toFile()
         try {
-            val group = M3SurfaceGroup("current-pending")
+            val group = SurfaceGroup("current-pending")
             val budget = CountingBudget()
-            val owner = (M3SurfaceOwnership.open(group, directory) as M3SurfaceOwnershipOpenResult.Opened).ownership
-            val id = (owner.apply(M3SurfaceOwnershipCommand("seed", listOf(candidate(0)))) as M3SurfaceOwnershipResult.Accepted).owners.single().id
-            owner.transact(M3CanonicalTransactionCommand(
-                "current", M3CanonicalOperation.RELOCATION, 0, 0, listOf(id),
-                listOf(M3CanonicalTarget(id, M3Voxel(1, 0, 0), 0, 0, 192)),
+            val owner = (SurfaceOwnership.open(group, directory) as SurfaceOwnershipOpenResult.Opened).ownership
+            val id = (owner.apply(SurfaceOwnershipCommand("seed", listOf(candidate(0)))) as SurfaceOwnershipResult.Accepted).owners.single().id
+            owner.transact(CanonicalTransactionCommand(
+                "current", CanonicalOperation.RELOCATION, 0, 0, listOf(id),
+                listOf(CanonicalTarget(id, Voxel(1, 0, 0), 0, 0, 192)),
             ))
             owner.close()
-            M3CompactCanonicalStore.prepareV6SiblingMigration(group, directory, budget)
-            val plan = (M3CanonicalActivation.prepare(group, directory, budget) as M3CanonicalActivationPreparation.Prepared).plan
-            val activation = M3SurfaceOwnership.activateV6(group, directory, budget, plan)
-            assertTrue("activation=$activation", activation is M3CanonicalActivationResult.Active)
+            CompactCanonicalStore.prepareV6SiblingMigration(group, directory, budget)
+            val plan = (CanonicalActivation.prepare(group, directory, budget) as CanonicalActivationPreparation.Prepared).plan
+            val activation = SurfaceOwnership.activateV6(group, directory, budget, plan)
+            assertTrue("activation=$activation", activation is CanonicalActivationResult.Active)
             val reservationsAfterActivation = budget.reservations
-            val receipt = plan.current as M3CanonicalActivationCurrent.Receipt
-            val changed = M3CanonicalActivation.Plan(plan.legacySourceHash, plan.siblingCut,
-                M3CanonicalActivationCurrent.Receipt(
-                    receipt.identity.copy(canonicalHash = M3CanonicalReceiptBytes(ByteArray(32) { 3 })), receipt.source,
+            val receipt = plan.current as CanonicalActivationCurrent.Receipt
+            val changed = CanonicalActivation.Plan(plan.legacySourceHash, plan.siblingCut,
+                CanonicalActivationCurrent.Receipt(
+                    receipt.identity.copy(canonicalHash = CanonicalReceiptBytes(ByteArray(32) { 3 })), receipt.source,
                 ), plan.receipt)
-            val unrelated = M3CanonicalActivation.Plan(plan.legacySourceHash, plan.siblingCut,
-                M3CanonicalActivationCurrent.Receipt(
-                    receipt.identity.copy(commandHash = M3CanonicalReceiptBytes(ByteArray(32) { 4 })), receipt.source,
+            val unrelated = CanonicalActivation.Plan(plan.legacySourceHash, plan.siblingCut,
+                CanonicalActivationCurrent.Receipt(
+                    receipt.identity.copy(commandHash = CanonicalReceiptBytes(ByteArray(32) { 4 })), receipt.source,
                 ), plan.receipt)
 
-            assertEquals(M3CanonicalActivationSelectorRefusal.CHANGED_CURRENT,
-                (M3SurfaceOwnership.activateV6(group, directory, budget, changed) as M3CanonicalActivationResult.Refused).reason)
-            assertEquals(M3CanonicalActivationSelectorRefusal.CURRENT_PENDING,
-                (M3SurfaceOwnership.activateV6(group, directory, budget, unrelated) as M3CanonicalActivationResult.Refused).reason)
+            assertEquals(CanonicalActivationSelectorRefusal.CHANGED_CURRENT,
+                (SurfaceOwnership.activateV6(group, directory, budget, changed) as CanonicalActivationResult.Refused).reason)
+            assertEquals(CanonicalActivationSelectorRefusal.CURRENT_PENDING,
+                (SurfaceOwnership.activateV6(group, directory, budget, unrelated) as CanonicalActivationResult.Refused).reason)
             assertEquals(reservationsAfterActivation, budget.reservations)
         } finally { directory.deleteRecursively() }
     }
 
-    private fun candidate(x: Int) = M3SurfaceCandidate(null, M3Voxel(x, 0, 0), 0, 0, 192)
-    private class CountingBudget : M3CanonicalStorageBudget {
+    private fun candidate(x: Int) = SurfaceCandidate(null, Voxel(x, 0, 0), 0, 0, 192)
+    private class CountingBudget : CanonicalStorageBudget {
         var reservations = 0
         override fun reserve(bytes: Long): Any = bytes.also { reservations++; require(it >= 0) }
         override fun reserveCandidateExclusive(staging: File, target: File, fileBytes: Map<String, Long>, maximumPhysicalBytes: Long) =
-            M3CanonicalCandidateReservation.QuotaRefused
+            CanonicalCandidateReservation.QuotaRefused
         override fun commit(token: Any, actualBytes: Long) = Unit
         override fun release(token: Any) = Unit
         override fun allocationUnitBytes(path: File) = 4_096L

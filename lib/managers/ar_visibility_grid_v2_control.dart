@@ -701,7 +701,7 @@ ARVisibilityGridV2CommitReceipt _exactCommitReceipt(
   return receipt;
 }
 
-/// Packed debug control endpoint for the Proposal 08 M0a reference seam.
+/// Packed debug control endpoint for the Proposal 08 visibility protocol reference seam.
 ///
 /// Each invocation is one VGC2 request and returns one VGD2 response. The V1
 /// visibility-grid manager remains the compatibility product path.
@@ -941,7 +941,7 @@ final class ARVisibilityGridV2Control {
   Future<Uint8List> _invoke(String method, Uint8List request) async {
     final response = await _channel.invokeMethod<Object?>(method, request);
     if (response is! Uint8List) {
-      throw StateError('M0a control returned a non-byte response.');
+      throw StateError('visibility protocol control returned a non-byte response.');
     }
     return Uint8List.fromList(response);
   }
