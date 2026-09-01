@@ -1,4 +1,6 @@
-package com.uhg0.ar_flutter_plugin_2.m0
+package com.uhg0.ar_flutter_plugin_2.proposal08
+
+import com.uhg0.ar_flutter_plugin_2.m0.*
 
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -15,7 +17,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
-class M0AndroidSchema5DurableRegionStoreTest {
+class DurableRegionStoreAndroidTest {
     private lateinit var root: File
 
     @Before
@@ -73,8 +75,8 @@ class M0AndroidSchema5DurableRegionStoreTest {
         check(directory.mkdirs())
         try {
             testContext.startService(
-                Intent(testContext, M0CrashBeforeRootSwitchService::class.java)
-                    .putExtra(M0CrashBeforeRootSwitchService.EXTRA_DIRECTORY, directory.path),
+                Intent(testContext, CrashBeforeRootSwitchService::class.java)
+                    .putExtra(CrashBeforeRootSwitchService.EXTRA_DIRECTORY, directory.path),
             )
             val orphanRoot = File(directory, "roots/root_1.json")
             val deadline = SystemClock.uptimeMillis() + 10_000L

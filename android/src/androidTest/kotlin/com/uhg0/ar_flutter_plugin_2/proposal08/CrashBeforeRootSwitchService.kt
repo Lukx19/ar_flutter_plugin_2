@@ -1,4 +1,6 @@
-package com.uhg0.ar_flutter_plugin_2.m0
+package com.uhg0.ar_flutter_plugin_2.proposal08
+
+import com.uhg0.ar_flutter_plugin_2.m0.*
 
 import android.app.Service
 import android.content.Intent
@@ -8,7 +10,7 @@ import java.io.File
 import java.io.FileOutputStream
 
 /** Test-only child process that dies at the durable root cut. */
-class M0CrashBeforeRootSwitchService : Service() {
+class CrashBeforeRootSwitchService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val path = intent?.getStringExtra(EXTRA_DIRECTORY) ?: return START_NOT_STICKY
         val directory = File(path)

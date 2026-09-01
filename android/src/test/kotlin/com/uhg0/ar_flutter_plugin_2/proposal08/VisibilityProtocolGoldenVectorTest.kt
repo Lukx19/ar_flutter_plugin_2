@@ -1,4 +1,6 @@
-package com.uhg0.ar_flutter_plugin_2.m0
+package com.uhg0.ar_flutter_plugin_2.proposal08
+
+import com.uhg0.ar_flutter_plugin_2.m0.*
 
 import java.security.MessageDigest
 import kotlinx.serialization.json.Json

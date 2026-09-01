@@ -2,7 +2,7 @@ import 'package:ar_flutter_plugin_2/models/capture_intent_contract.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  group('Issue 99 capture intent contract', () {
+  group('capture intent contract', () {
     test('preflight failures allocate no ID and automatic requires selector',
         () {
       final model = _admissionModel();

@@ -12,8 +12,8 @@ import org.junit.Test
 class SafeFilesystemV2AndroidTest {
     @Test fun nestedOpenatRejectsIntermediateSymlinkAndFsyncsAtomicParent() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
-        val root = File(context.cacheDir, "issue100-${System.nanoTime()}")
-        val outside = File(context.cacheDir, "issue100-outside-${System.nanoTime()}")
+        val root = File(context.cacheDir, "safe-filesystem-${System.nanoTime()}")
+        val outside = File(context.cacheDir, "safe-filesystem-outside-${System.nanoTime()}")
         val sessions = File(root, "sessions")
         var intermediateSymlinkInstalled = false
         try {

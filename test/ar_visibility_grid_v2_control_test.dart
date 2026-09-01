@@ -6,7 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
-  test('Issue 98 handoff returns a validated immutable typed receipt',
+  test('visibility handoff returns a validated immutable typed receipt',
       () async {
     const channel = MethodChannel('visibility_grid_v2_control_98');
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
