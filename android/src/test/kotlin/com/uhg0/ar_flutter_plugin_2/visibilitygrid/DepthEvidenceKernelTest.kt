@@ -14,7 +14,7 @@ class DepthEvidenceKernelTest {
         val batch = batch(
             timestamp = 1,
             groupFrame = frame(),
-            groupFromCamera = translation(0.0, 0.0, 0.0),
+            groupFromCamera = translation(0.02, 0.02, 0.02),
             samples = listOf(VisibilityDepthSample(2, 1, 1_000, 200)),
         )
 
@@ -25,6 +25,21 @@ class DepthEvidenceKernelTest {
         assertEquals(0, accepted.changes.size)
         assertEquals(1, accepted.receipt.acceptedSamples)
         assertEquals(Voxel(2, 0, -10), view.visitedEndpoints.single())
+    }
+
+    @Test
+    fun `duplicate endpoint samples count as one occupied observation`() {
+        val kernel = DepthEvidenceKernel()
+        val duplicateSamples = List(32) { sample() }
+        val result = kernel.prepare(
+            batch(1, frame(), translation(0.0, 0.0, 0.0), duplicateSamples),
+            FakeCanonicalView(),
+        ) as DepthEvidenceResult.Accepted
+
+        assertEquals(32, result.receipt.acceptedSamples)
+        assertEquals(1, result.receipt.touchedEvidenceRows)
+        assertEquals(0, result.receipt.createCount)
+        assertTrue(result.changes.isEmpty())
     }
 
     @Test
@@ -146,6 +161,123 @@ class DepthEvidenceKernelTest {
     }
 
     @Test
+    fun `voxel volume touching the safety band is rejected at exact boundary`() {
+        val candidate = Voxel(0, 0, -3)
+        val view = FakeCanonicalView(mapOf(candidate to surface(7, candidate)), listOf(candidate))
+        val largeFrame = frame(voxelSizeMicrometres = 300_000)
+        val result = kernelForSafety().prepare(
+            depthBatchForFrame(1, largeFrame, translation(0.0, 0.0, -0.05)),
+            view,
+        ) as DepthEvidenceResult.Accepted
+
+        assertEquals(2, result.receipt.touchedEvidenceRows)
+        assertEquals(0, result.receipt.independentDirectionVotes)
+        assertTrue(result.changes.isEmpty())
+    }
+
+    @Test
+    fun `ray cells behind the endpoint cannot provide free evidence`() {
+        val candidate = Voxel(0, 0, -13)
+        val view = FakeCanonicalView(mapOf(candidate to surface(7, candidate)), listOf(candidate))
+        val result = kernelForSafety().prepare(
+            depthBatchForFrame(1, frame(), translation(0.0, 0.0, 0.0)),
+            view,
+        ) as DepthEvidenceResult.Accepted
+
+        assertEquals(0, result.receipt.independentDirectionVotes)
+        assertTrue(result.changes.isEmpty())
+    }
+
+    @Test
+    fun `corridor fixture records the clear span but not the phantom safety band`() {
+        val clear = Voxel(0, 0, -6)
+        val safety = Voxel(0, 0, -9)
+        val behind = Voxel(0, 0, -13)
+        val view = FakeCanonicalView(
+            mapOf(clear to surface(1, clear), safety to surface(2, safety), behind to surface(3, behind)),
+            listOf(clear, safety, behind),
+        )
+
+        val result = DepthEvidenceKernel().prepare(
+            depthBatchForFrame(1, frame(), translation(0.05, 0.05, 0.05)),
+            view,
+        ) as DepthEvidenceResult.Accepted
+
+        assertEquals(1, result.receipt.independentDirectionVotes)
+        assertTrue(result.changes.isEmpty())
+    }
+
+    @Test
+    fun `thin and double wall fixture cannot be carved through opposed endpoints`() {
+        val thin = Voxel(0, 0, -9)
+        val double = Voxel(0, 0, -12)
+        val view = FakeCanonicalView(
+            mapOf(thin to surface(1, thin), double to surface(2, double)),
+            listOf(thin, double),
+        )
+        val kernel = DepthEvidenceKernel()
+        repeat(4) { index ->
+            val result = kernel.prepare(
+                depthBatchForFrame(index + 1L, frame(), translation(0.05, 0.05, 0.05)), view,
+            ) as DepthEvidenceResult.Accepted
+            assertEquals(0, result.receipt.independentDirectionVotes)
+            assertTrue(result.changes.none { it is DepthEvidenceChange.Remove })
+            kernel.applyPrepared()
+        }
+        assertEquals(3, kernel.resourceReceipt().residentEvidenceRows)
+    }
+
+    @Test
+    fun `hole foreground edge fixture rejects off-ray foreground evidence`() {
+        val edge = Voxel(2, 0, -5)
+        val view = FakeCanonicalView(mapOf(edge to surface(1, edge)), listOf(edge))
+        val result = DepthEvidenceKernel().prepare(
+            depthBatchForFrame(1, frame(), translation(0.0, 0.0, 0.0)), view,
+        ) as DepthEvidenceResult.Accepted
+
+        assertEquals(0, result.receipt.independentDirectionVotes)
+        assertTrue(result.changes.isEmpty())
+    }
+
+    @Test
+    fun `canonical intention producer emits every change shape deterministically`() {
+        fun target(x: Int) = CanonicalTarget(null, Voxel(x, 0, -5), 0, 0, 200)
+        fun source(id: Long, x: Int) = surface(id, Voxel(x, 0, -5))
+        fun result(
+            sequence: Long,
+            sources: List<DepthCanonicalSurface>,
+            targets: List<CanonicalTarget>,
+        ) = DepthEvidenceKernel().prepareIntentions(
+            sequence, sequence, frame(), 1, 2, sources, targets,
+        ) as DepthEvidenceResult.Accepted
+
+        assertTrue(result(1, emptyList(), listOf(target(1))).changes.single() is DepthEvidenceChange.Create)
+        assertTrue(result(2, listOf(source(1, 1)), emptyList()).changes.single() is DepthEvidenceChange.Remove)
+        assertTrue(result(3, listOf(source(1, 1)), listOf(target(1))).changes.single() is DepthEvidenceChange.Refine)
+        assertTrue(result(4, listOf(source(1, 1)), listOf(target(2))).changes.single() is DepthEvidenceChange.Relocate)
+        assertTrue(result(5, listOf(source(1, 1), source(2, 2)), listOf(target(3))).changes.single() is DepthEvidenceChange.Merge)
+        assertTrue(result(6, listOf(source(1, 1)), listOf(target(2), target(3))).changes.single() is DepthEvidenceChange.Split)
+        assertTrue(result(7, listOf(source(1, 1), source(2, 2)), listOf(target(3), target(4))).changes.single() is DepthEvidenceChange.Replace)
+    }
+
+    @Test
+    fun `canonical intention producer refuses overlapping sources and duplicate targets`() {
+        val source = surface(1, Voxel(1, 0, -5))
+        val duplicateSource = DepthEvidenceKernel().prepareIntentions(
+            1, 1, frame(), 1, 2, listOf(source, source), listOf(CanonicalTarget(null, Voxel(3, 0, -5), 0, 0, 200)),
+        ) as DepthEvidenceResult.Refused
+        assertEquals(DepthEvidenceRefusal.SOURCE_OVERLAP, duplicateSource.reason)
+
+        val duplicateTarget = DepthEvidenceKernel().prepareIntentions(
+            1, 1, frame(), 1, 2, listOf(source), listOf(
+                CanonicalTarget(null, Voxel(3, 0, -5), 0, 0, 200),
+                CanonicalTarget(null, Voxel(3, 0, -5), 1, 0, 200),
+            ),
+        ) as DepthEvidenceResult.Refused
+        assertEquals(DepthEvidenceRefusal.DUPLICATE_TARGET, duplicateTarget.reason)
+    }
+
+    @Test
     fun `typed refusal leaves prepared and committed state unchanged`() {
         val kernel = DepthEvidenceKernel()
         val view = FakeCanonicalView()
@@ -237,11 +369,27 @@ class DepthEvidenceKernelTest {
         tracking = tracking,
     )
 
-    private fun frame() = VisibilityGroupFrame.copyOf(
-        identityVisibilityGridTransform(),
-        identityVisibilityGridTransform(),
-        voxelSizeMicrometres = 100_000,
+    private fun frame(voxelSizeMicrometres: Int = 100_000) = VisibilityGroupFrame.copyOf(
+        translation(0.3, -0.2, 0.1),
+        translation(-0.3, 0.2, -0.1),
+        voxelSizeMicrometres = voxelSizeMicrometres,
         modelCapacity = 100,
+    )
+
+    private fun kernelForSafety() = DepthEvidenceKernel()
+
+    private fun depthBatchForFrame(
+        timestamp: Long,
+        groupFrame: VisibilityGroupFrame,
+        groupFromCamera: DoubleArray,
+    ) = DepthEvidenceBatch(
+        sequence = timestamp,
+        sourceTimestampNs = timestamp,
+        groupFrame = groupFrame,
+        groupFromCameraGl = groupFromCamera.toList(),
+        intrinsics = VisibilityCameraIntrinsics(1, 1, 1.0, 1.0, 0.0, 0.0),
+        samples = listOf(VisibilityDepthSample(0, 0, 1_000, 255)),
+        sourceRejectedSamples = 0,
     )
 
     private fun translation(x: Double, y: Double, z: Double) =

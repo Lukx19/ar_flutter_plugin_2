@@ -46,10 +46,20 @@ class DepthEvidencePropertyTest {
             PropertyView(),
         ) as DepthEvidenceResult.Refused
         assertEquals(DepthEvidenceRefusal.SAMPLE_CAPACITY, tooManySamples.reason)
+        assertEquals(1, tooManySamples.receipt.capacityRefusals)
+        assertEquals(0, sampleLimited.resourceReceipt().residentEvidenceRows)
+        val afterSampleRefusal = sampleLimited.prepare(
+            DepthEvidenceBatch(2, 2, frame(), identity(), intrinsics(), listOf(sample()), 0),
+            PropertyView(),
+        ) as DepthEvidenceResult.Accepted
+        assertEquals(1, afterSampleRefusal.receipt.capacityRefusals)
+        sampleLimited.discardPrepared()
 
         val rayLimited = DepthEvidenceKernel(DepthEvidenceConfiguration(rayVisitCapacity = 1))
         val tooManyRays = rayLimited.prepare(batch(1), PropertyView(rayCells = listOf(Voxel(0, 0, -2), Voxel(0, 0, -3)))) as DepthEvidenceResult.Refused
         assertEquals(DepthEvidenceRefusal.RAY_VISIT_CAPACITY, tooManyRays.reason)
+        assertEquals(1, tooManyRays.receipt.capacityRefusals)
+        assertEquals(0, rayLimited.resourceReceipt().residentEvidenceRows)
 
         val surfaceLimited = DepthEvidenceKernel(DepthEvidenceConfiguration(surfaceCapacity = 1))
         val twoEndpoints = surfaceLimited.prepare(
@@ -60,7 +70,24 @@ class DepthEvidencePropertyTest {
             PropertyView(),
         ) as DepthEvidenceResult.Refused
         assertEquals(DepthEvidenceRefusal.SURFACE_CAPACITY, twoEndpoints.reason)
+        assertEquals(1, twoEndpoints.receipt.capacityRefusals)
         assertEquals(0, surfaceLimited.resourceReceipt().residentEvidenceRows)
+    }
+
+    @Test
+    fun `resource receipt reports fixed primitive ownership and staged row bytes`() {
+        val kernel = DepthEvidenceKernel(DepthEvidenceConfiguration(surfaceCapacity = 1))
+        val before = kernel.resourceReceipt()
+        assertEquals(175, before.fixedPrimitiveBytes)
+
+        val accepted = kernel.prepare(batch(1), PropertyView()) as DepthEvidenceResult.Accepted
+        val staged = kernel.resourceReceipt()
+        assertEquals(1, staged.preparedEvidenceRows)
+        assertEquals(32, staged.preparedResidentBytes)
+        assertEquals(before.fixedPrimitiveBytes, staged.fixedPrimitiveBytes)
+        assertEquals(32, accepted.receipt.preparedResidentBytes)
+        kernel.discardPrepared()
+        assertEquals(0, kernel.resourceReceipt().preparedEvidenceRows)
     }
 
     @Test

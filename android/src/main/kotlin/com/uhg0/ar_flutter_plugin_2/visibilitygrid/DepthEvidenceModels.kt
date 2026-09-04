@@ -210,7 +210,6 @@ internal sealed interface DepthEvidenceResult {
 
 internal sealed interface DepthEvidenceApplyResult {
     data class Applied(val receipt: DepthEvidenceReceipt) : DepthEvidenceApplyResult
-    data class AlreadyApplied(val receipt: DepthEvidenceReceipt) : DepthEvidenceApplyResult
     data class NoPrepared(val receipt: DepthEvidenceReceipt) : DepthEvidenceApplyResult
 }
 
