@@ -191,7 +191,7 @@ internal class DepthEvidenceKernel(
             } catch (_: RuntimeException) {
                 throw DepthLookupFailure()
             }
-            if (endpointSurface != null) canonical.putIfAbsent(endpointVoxel, endpointSurface)
+            if (endpointSurface != null) retainCanonical(canonical, endpointVoxel, endpointSurface)
             val endpointState = stateFor(endpointVoxel, local, endpointSurface)
             endpointState.occupied = increment(endpointState.occupied).also {
                 if (it.second) overflowCount = checkedAdd(overflowCount, 1)
@@ -210,7 +210,7 @@ internal class DepthEvidenceKernel(
                     remaining,
                 ) { voxel, surface ->
                     if (!voxelInRange(voxel)) return@visitRayCells false
-                    if (surface != null) canonical.putIfAbsent(voxel, surface)
+                    if (surface != null) retainCanonical(canonical, voxel, surface)
                     val cellCenter = center(voxel, batch.groupFrame)
                     if (isFreeEvidence(cameraGroup, endpoint, endpointVoxel, voxel, cellCenter, batch.groupFrame)) {
                         val retained = findRow(voxel) != EMPTY_ROW
@@ -426,6 +426,15 @@ internal class DepthEvidenceKernel(
         if (surface != null) state.attach(surface)
         local[voxel] = state
         return state
+    }
+
+    private fun retainCanonical(
+        canonical: MutableMap<Voxel, DepthCanonicalSurface>,
+        voxel: Voxel,
+        surface: DepthCanonicalSurface,
+    ) {
+        val prior = canonical[voxel]
+        if (prior == null || surface.id.value < prior.id.value) canonical[voxel] = surface
     }
 
     private fun EvidenceState.attach(surface: DepthCanonicalSurface) {
@@ -678,7 +687,9 @@ internal class DepthEvidenceKernel(
     private fun checkedBytes(rows: Int): Int = Math.multiplyExact(rows, EVIDENCE_BYTES)
 
     private fun fixedPrimitiveBytes(): Int = Math.addExact(
-        Math.multiplyExact(tableCapacity, 4 * 4 + 3 * 4 + 2 + 2 * 8),
+        // Eleven IntArray columns, one LongArray column, and three BooleanArray
+        // columns are retained for each bounded row. Hash columns are fixed too.
+        Math.multiplyExact(tableCapacity, 11 * 4 + 8 + 3),
         Math.multiplyExact(hashCapacity, 8 + 4),
     )
 
