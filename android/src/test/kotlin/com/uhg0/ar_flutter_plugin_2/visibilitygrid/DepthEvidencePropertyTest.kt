@@ -1,6 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -15,7 +16,9 @@ class DepthEvidencePropertyTest {
         val first = prepare(DepthEvidenceBatch(1, 1, frame(), identity(), intrinsics(), samples, 0))
         val reversed = prepare(DepthEvidenceBatch(1, 1, frame(), identity(), intrinsics(), samples.reversed(), 0))
 
-        assertEquals(first, reversed)
+        val expected = accepted(sequence = 1, acceptedSamples = 3, touchedRows = 3, virtualWork = 6)
+        assertEquals(expected, first)
+        assertEquals(expected, reversed)
     }
 
     @Test
@@ -26,15 +29,16 @@ class DepthEvidencePropertyTest {
         assertTrue(kernel.prepare(valid, view) is DepthEvidenceResult.Accepted)
         kernel.applyPrepared()
 
-        val duplicate = kernel.prepare(batch(1), view) as DepthEvidenceResult.Refused
-        assertEquals(DepthEvidenceRefusal.DUPLICATE_TIMESTAMP, duplicate.reason)
-        val notTracking = kernel.prepare(batch(2, tracking = false), view) as DepthEvidenceResult.Refused
-        assertEquals(DepthEvidenceRefusal.NOT_TRACKING, notTracking.reason)
+        val committed = accepted(1).receipt
+        val duplicate = kernel.prepare(batch(1), view)
+        assertEquals(DepthEvidenceResult.Refused(DepthEvidenceRefusal.DUPLICATE_TIMESTAMP, committed), duplicate)
+        val notTracking = kernel.prepare(batch(2, tracking = false), view)
+        assertEquals(DepthEvidenceResult.Refused(DepthEvidenceRefusal.NOT_TRACKING, committed), notTracking)
         val malformedMatrix = kernel.prepare(
             DepthEvidenceBatch(3, 3, frame(), listOf(1.0), intrinsics(), listOf(sample()), 0),
             view,
-        ) as DepthEvidenceResult.Refused
-        assertEquals(DepthEvidenceRefusal.INVALID_FRAME, malformedMatrix.reason)
+        )
+        assertEquals(DepthEvidenceResult.Refused(DepthEvidenceRefusal.INVALID_FRAME, committed), malformedMatrix)
         assertEquals(1, kernel.resourceReceipt().residentEvidenceRows)
     }
 
@@ -45,20 +49,19 @@ class DepthEvidencePropertyTest {
             DepthEvidenceBatch(1, 1, frame(), identity(), intrinsics(), listOf(sample(), sample()), 0),
             PropertyView(),
         ) as DepthEvidenceResult.Refused
-        assertEquals(DepthEvidenceRefusal.SAMPLE_CAPACITY, tooManySamples.reason)
-        assertEquals(1, tooManySamples.receipt.capacityRefusals)
+        val capacityReceipt = DepthEvidenceReceipt(capacityRefusals = 1)
+        assertEquals(DepthEvidenceResult.Refused(DepthEvidenceRefusal.SAMPLE_CAPACITY, capacityReceipt), tooManySamples)
         assertEquals(0, sampleLimited.resourceReceipt().residentEvidenceRows)
         val afterSampleRefusal = sampleLimited.prepare(
             DepthEvidenceBatch(2, 2, frame(), identity(), intrinsics(), listOf(sample()), 0),
             PropertyView(),
         ) as DepthEvidenceResult.Accepted
-        assertEquals(1, afterSampleRefusal.receipt.capacityRefusals)
+        assertEquals(accepted(2, capacityRefusals = 1), afterSampleRefusal)
         sampleLimited.discardPrepared()
 
         val rayLimited = DepthEvidenceKernel(DepthEvidenceConfiguration(rayVisitCapacity = 1))
         val tooManyRays = rayLimited.prepare(batch(1), PropertyView(rayCells = listOf(Voxel(0, 0, -2), Voxel(0, 0, -3)))) as DepthEvidenceResult.Refused
-        assertEquals(DepthEvidenceRefusal.RAY_VISIT_CAPACITY, tooManyRays.reason)
-        assertEquals(1, tooManyRays.receipt.capacityRefusals)
+        assertEquals(DepthEvidenceResult.Refused(DepthEvidenceRefusal.RAY_VISIT_CAPACITY, capacityReceipt), tooManyRays)
         assertEquals(0, rayLimited.resourceReceipt().residentEvidenceRows)
 
         val surfaceLimited = DepthEvidenceKernel(DepthEvidenceConfiguration(surfaceCapacity = 1))
@@ -69,8 +72,7 @@ class DepthEvidencePropertyTest {
             ),
             PropertyView(),
         ) as DepthEvidenceResult.Refused
-        assertEquals(DepthEvidenceRefusal.SURFACE_CAPACITY, twoEndpoints.reason)
-        assertEquals(1, twoEndpoints.receipt.capacityRefusals)
+        assertEquals(DepthEvidenceResult.Refused(DepthEvidenceRefusal.SURFACE_CAPACITY, capacityReceipt), twoEndpoints)
         assertEquals(0, surfaceLimited.resourceReceipt().residentEvidenceRows)
     }
 
@@ -78,7 +80,7 @@ class DepthEvidencePropertyTest {
     fun `resource receipt reports fixed primitive ownership and staged row bytes`() {
         val kernel = DepthEvidenceKernel(DepthEvidenceConfiguration(surfaceCapacity = 1))
         val before = kernel.resourceReceipt()
-        assertEquals(205, before.fixedPrimitiveBytes)
+        assertEquals(1_024, before.fixedPrimitiveBytes)
 
         val accepted = kernel.prepare(batch(1), PropertyView()) as DepthEvidenceResult.Accepted
         val staged = kernel.resourceReceipt()
@@ -88,6 +90,34 @@ class DepthEvidencePropertyTest {
         assertEquals(32, accepted.receipt.preparedResidentBytes)
         kernel.discardPrepared()
         assertEquals(0, kernel.resourceReceipt().preparedEvidenceRows)
+    }
+
+    @Test
+    fun `maximum configured ownership remains within the semantic state budget`() {
+        val receipt = DepthEvidenceKernel(
+            DepthEvidenceConfiguration(
+                sampleCapacity = 1_536,
+                rayVisitCapacity = 65_536,
+                surfaceCapacity = 100_000,
+            ),
+        ).resourceReceipt()
+
+        assertEquals(
+            DepthEvidenceResourceReceipt(
+                residentEvidenceRows = 0,
+                residentBytes = 0,
+                preparedEvidenceRows = 0,
+                preparedResidentBytes = 0,
+                evidenceRowCapacity = 100_000,
+                fixedPrimitiveBytes = 16_735_904,
+                closed = false,
+            ),
+            receipt,
+        )
+        assertTrue(receipt.fixedPrimitiveBytes <= 16 * 1024 * 1024)
+        assertThrows(IllegalArgumentException::class.java) {
+            DepthEvidenceConfiguration(surfaceCapacity = 100_001)
+        }
     }
 
     @Test
@@ -116,14 +146,14 @@ class DepthEvidencePropertyTest {
         val invalid = kernel.prepare(
             DepthEvidenceBatch(1, 1, frame(), identity(), intrinsics(), listOf(VisibilityDepthSample(0, 0, 1, 255)), 0),
             PropertyView(),
-        ) as DepthEvidenceResult.Refused
-        assertEquals(DepthEvidenceRefusal.INVALID_SAMPLE, invalid.reason)
+        )
+        assertEquals(DepthEvidenceResult.Refused(DepthEvidenceRefusal.INVALID_SAMPLE, DepthEvidenceReceipt()), invalid)
 
         val overflow = kernel.prepare(
             DepthEvidenceBatch(2, 2, frame(), identity(), intrinsics(), listOf(VisibilityDepthSample(0, 0, 1, 255)), Int.MAX_VALUE),
             PropertyView(),
-        ) as DepthEvidenceResult.Refused
-        assertEquals(DepthEvidenceRefusal.ARITHMETIC_OVERFLOW, overflow.reason)
+        )
+        assertEquals(DepthEvidenceResult.Refused(DepthEvidenceRefusal.ARITHMETIC_OVERFLOW, DepthEvidenceReceipt()), overflow)
     }
 
     @Test
@@ -139,6 +169,29 @@ class DepthEvidencePropertyTest {
         val kernel = DepthEvidenceKernel()
         return kernel.prepare(batch, PropertyView()) as DepthEvidenceResult.Accepted
     }
+
+    private fun accepted(
+        sequence: Long,
+        acceptedSamples: Int = 1,
+        touchedRows: Int = 1,
+        capacityRefusals: Int = 0,
+        virtualWork: Int = acceptedSamples + touchedRows,
+    ) = DepthEvidenceResult.Accepted(
+        expectedGeometryRevision = 0,
+        expectedLineageRevision = 0,
+        changes = emptyList(),
+        receipt = DepthEvidenceReceipt(
+            sequence = sequence,
+            sourceTimestampNs = sequence,
+            acceptedSamples = acceptedSamples,
+            touchedEvidenceRows = touchedRows,
+            capacityRefusals = capacityRefusals,
+            preparedResidentBytes = touchedRows * 32,
+            p50VirtualWorkUnits = virtualWork,
+            p95VirtualWorkUnits = virtualWork,
+        ),
+        work = DepthEvidenceWorkReceipt(touchedRows, 0, 0, 0, virtualWork),
+    )
 
     private fun batch(timestamp: Long, tracking: Boolean = true) = DepthEvidenceBatch(
         timestamp, timestamp, frame(), identity(), intrinsics(), listOf(sample()), 0, tracking,

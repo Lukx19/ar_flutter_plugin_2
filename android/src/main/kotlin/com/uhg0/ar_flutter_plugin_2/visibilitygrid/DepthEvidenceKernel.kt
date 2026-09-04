@@ -19,6 +19,11 @@ internal class DepthEvidenceKernel(
 ) : AutoCloseable {
     private val tableCapacity = configuration.surfaceCapacity
     private val hashCapacity = nextPowerOfTwo((tableCapacity * 2).coerceAtLeast(2))
+    private val stageCapacity = minOf(
+        tableCapacity,
+        Math.addExact(configuration.rayVisitCapacity, configuration.sampleCapacity),
+    )
+    private val stageHashCapacity = nextPowerOfTwo((stageCapacity * 2).coerceAtLeast(2))
     private var hashKeys = LongArray(hashCapacity)
     private var hashRows = IntArray(hashCapacity) { EMPTY_ROW }
     // A retained evidence row is exactly 32 bytes: voxel key (8), evidence
@@ -36,39 +41,39 @@ internal class DepthEvidenceKernel(
     private var rowNormalConfidence = ByteArray(tableCapacity)
     private var rowLineageCount = ShortArray(tableCapacity)
 
-    // One fixed staging table is reused by every prepare. It is deliberately
-    // primitive and bounded by the negotiated surface capacity; no per-prepare
-    // hash table or growing collection is allocated.
-    private var stageHashKeys = LongArray(hashCapacity)
-    private var stageHashRows = IntArray(hashCapacity) { EMPTY_ROW }
-    private var stageX = IntArray(tableCapacity)
-    private var stageY = IntArray(tableCapacity)
-    private var stageZ = IntArray(tableCapacity)
-    private var stageOccupied = IntArray(tableCapacity)
-    private var stageFree = IntArray(tableCapacity)
-    private var stageDirections = IntArray(tableCapacity)
-    private var stageContradicted = BooleanArray(tableCapacity)
-    private var stageSourceId = LongArray(tableCapacity)
-    private var stageSourceKey = LongArray(tableCapacity)
-    private var stagePackedNormal = IntArray(tableCapacity)
-    private var stageNormalConfidence = IntArray(tableCapacity)
-    private var stageLineageCount = IntArray(tableCapacity)
-    private var stagePublished = BooleanArray(tableCapacity)
-    private var stageHasOccupied = BooleanArray(tableCapacity)
-    private var stageOccupiedCameraX = DoubleArray(tableCapacity)
-    private var stageOccupiedCameraY = DoubleArray(tableCapacity)
-    private var stageOccupiedCameraZ = DoubleArray(tableCapacity)
-    private var stageFreeBin = IntArray(tableCapacity) { NO_DIRECTION }
-    private var stageOrder = IntArray(tableCapacity)
-    private var stageRelationTarget = IntArray(tableCapacity)
-    private var stageRelationSource = LongArray(tableCapacity)
-    private var stageComponent = IntArray(tableCapacity)
-    private var stagePositive = BooleanArray(tableCapacity)
-    private var stageRemoval = BooleanArray(tableCapacity)
-    private var stageChangeKind = IntArray(tableCapacity)
-    private var stageChangeSource = LongArray(tableCapacity)
-    private var stageChangeTarget = IntArray(tableCapacity)
-    private var stageChangeComponent = IntArray(tableCapacity)
+    // One fixed staging table is reused by every prepare. A batch can address
+    // at most one endpoint per sample plus one row per ray visit, so staging is
+    // bounded by that locked work budget rather than the larger model capacity.
+    private var stageHashKeys = LongArray(stageHashCapacity)
+    private var stageHashRows = IntArray(stageHashCapacity) { EMPTY_ROW }
+    private var stageX = IntArray(stageCapacity)
+    private var stageY = IntArray(stageCapacity)
+    private var stageZ = IntArray(stageCapacity)
+    private var stageOccupied = ByteArray(stageCapacity)
+    private var stageFree = ByteArray(stageCapacity)
+    private var stageDirections = IntArray(stageCapacity)
+    private var stageContradicted = BooleanArray(stageCapacity)
+    private var stageSourceId = IntArray(stageCapacity)
+    private var stageSourceKey = LongArray(stageCapacity)
+    private var stagePackedNormal = ShortArray(stageCapacity)
+    private var stageNormalConfidence = ByteArray(stageCapacity)
+    private var stageLineageCount = ShortArray(stageCapacity)
+    private var stagePublished = BooleanArray(stageCapacity)
+    private var stageHasOccupied = BooleanArray(stageCapacity)
+    private var stageOccupiedCameraX = DoubleArray(stageCapacity)
+    private var stageOccupiedCameraY = DoubleArray(stageCapacity)
+    private var stageOccupiedCameraZ = DoubleArray(stageCapacity)
+    private var stageFreeBin = IntArray(stageCapacity) { NO_DIRECTION }
+    private var stageOrder = IntArray(stageCapacity)
+    private var stageRelationTarget = IntArray(stageCapacity)
+    private var stageRelationSource = LongArray(stageCapacity)
+    private var stageComponent = IntArray(stageCapacity)
+    private var stagePositive = BooleanArray(stageCapacity)
+    private var stageRemoval = BooleanArray(stageCapacity)
+    private var stageChangeKind = IntArray(stageCapacity)
+    private var stageChangeSource = LongArray(stageCapacity)
+    private var stageChangeTarget = IntArray(stageCapacity)
+    private var stageChangeComponent = IntArray(stageCapacity)
     private var stageCount = 0
     private var stageRelationCount = 0
     private var stageChangeCount = 0
@@ -81,6 +86,12 @@ internal class DepthEvidenceKernel(
     private var lastReceipt = DepthEvidenceReceipt()
     private var capacityRefusalCount = 0
     private var closed = false
+
+    init {
+        require(fixedPrimitiveBytes() <= SEMANTIC_STATE_BUDGET_BYTES) {
+            "fixed primitive ownership exceeds the native semantic-state budget"
+        }
+    }
 
     /** Stages one batch without changing retained evidence. */
     fun prepare(batch: DepthEvidenceBatch, surfaces: BoundedCanonicalSurfaceView): DepthEvidenceResult {
@@ -197,15 +208,15 @@ internal class DepthEvidenceKernel(
         stageX = IntArray(0)
         stageY = IntArray(0)
         stageZ = IntArray(0)
-        stageOccupied = IntArray(0)
-        stageFree = IntArray(0)
+        stageOccupied = ByteArray(0)
+        stageFree = ByteArray(0)
         stageDirections = IntArray(0)
         stageContradicted = BooleanArray(0)
-        stageSourceId = LongArray(0)
+        stageSourceId = IntArray(0)
         stageSourceKey = LongArray(0)
-        stagePackedNormal = IntArray(0)
-        stageNormalConfidence = IntArray(0)
-        stageLineageCount = IntArray(0)
+        stagePackedNormal = ShortArray(0)
+        stageNormalConfidence = ByteArray(0)
+        stageLineageCount = ShortArray(0)
         stagePublished = BooleanArray(0)
         stageHasOccupied = BooleanArray(0)
         stageOccupiedCameraX = DoubleArray(0)
@@ -325,13 +336,13 @@ internal class DepthEvidenceKernel(
         var conflicts = 0
         for (index in 0 until stageCount) {
             if (stageHasOccupied[index]) {
-                val updated = increment(stageOccupied[index])
-                stageOccupied[index] = updated.first
+                val updated = increment(stageOccupiedValue(index))
+                stageOccupied[index] = updated.first.toByte()
                 if (updated.second) overflowCount = checkedAdd(overflowCount, 1)
             }
             if (stageFreeBin[index] != NO_DIRECTION) {
-                val updated = increment(stageFree[index])
-                stageFree[index] = updated.first
+                val updated = increment(stageFreeValue(index))
+                stageFree[index] = updated.first.toByte()
                 if (updated.second) overflowCount = checkedAdd(overflowCount, 1)
                 val bit = 1 shl stageFreeBin[index]
                 if (stageDirections[index] and bit == 0) {
@@ -339,7 +350,7 @@ internal class DepthEvidenceKernel(
                     directionVotes++
                 }
             }
-            if (stageHasOccupied[index] && stageFree[index] > 0) conflicts = checkedAdd(conflicts, 1)
+            if (stageHasOccupied[index] && stageFreeValue(index) > 0) conflicts = checkedAdd(conflicts, 1)
         }
         sortStageOrder()
         planChanges()
@@ -403,9 +414,9 @@ internal class DepthEvidenceKernel(
             stagePositive[index] = false
             stageRemoval[index] = false
             stageComponent[index] = index
-            val sourceId = stageSourceId[index]
+            val sourceId = stageSourceIdValue(index)
             if (stageContradicted[index]) {
-                if (stageOccupied[index] >= configuration.occupiedEvidenceToShow) {
+                if (stageOccupiedValue(index) >= configuration.occupiedEvidenceToShow) {
                     stageContradicted[index] = false
                     stageFree[index] = 0
                     stageDirections[index] = 0
@@ -414,16 +425,16 @@ internal class DepthEvidenceKernel(
                 }
                 continue
             }
-            val conflicted = stageHasOccupied[index] && stageFree[index] > 0
-            val canCarve = stageFree[index] >= configuration.freeEvidenceToCarve &&
-                stageFree[index] - stageOccupied[index] >= configuration.freeEvidenceMargin &&
+            val conflicted = stageHasOccupied[index] && stageFreeValue(index) > 0
+            val canCarve = stageFreeValue(index) >= configuration.freeEvidenceToCarve &&
+                stageFreeValue(index) - stageOccupiedValue(index) >= configuration.freeEvidenceMargin &&
                 hasSeparatedDirections(stageDirections[index], configuration.separatedDirectionBinsRequired)
             if (canCarve && !conflicted && sourceId != 0L) {
                 stageContradicted[index] = true
                 stageOccupied[index] = 0
                 stagePublished[index] = false
                 stageRemoval[index] = true
-            } else if (!conflicted && stageOccupied[index] >= configuration.occupiedEvidenceToShow &&
+            } else if (!conflicted && stageOccupiedValue(index) >= configuration.occupiedEvidenceToShow &&
                 !stagePublished[index]
             ) {
                 stagePublished[index] = true
@@ -470,7 +481,7 @@ internal class DepthEvidenceKernel(
     }
 
     private fun addPlannedChange(kind: Int, index: Int, component: Int, hasSingleSource: Boolean) {
-        check(stageChangeCount < tableCapacity)
+        check(stageChangeCount < stageCapacity)
         val slot = stageChangeCount++
         stageChangeKind[slot] = kind
         stageChangeTarget[slot] = index
@@ -478,7 +489,7 @@ internal class DepthEvidenceKernel(
         stageChangeSource[slot] = if (hasSingleSource) {
             sourceAtRank(component, 0)
         } else {
-            stageSourceId[index]
+            stageSourceIdValue(index)
         }
     }
 
@@ -518,7 +529,7 @@ internal class DepthEvidenceKernel(
         for (relation in 0 until stageRelationCount) {
             if (stageRelationTarget[relation] == index) count++
         }
-        return if (count == 0 && stageSourceId[index] != 0L) 1 else count
+        return if (count == 0 && stageSourceIdValue(index) != 0L) 1 else count
     }
 
     private fun relationSourceAt(index: Int, ordinal: Int): Long {
@@ -529,8 +540,8 @@ internal class DepthEvidenceKernel(
                 seen++
             }
         }
-        check(stageSourceId[index] != 0L && ordinal == 0)
-        return stageSourceId[index]
+        check(stageSourceIdValue(index) != 0L && ordinal == 0)
+        return stageSourceIdValue(index)
     }
 
     private fun componentTargetCount(root: Int): Int {
@@ -722,7 +733,7 @@ internal class DepthEvidenceKernel(
         frame: VisibilityGroupFrame,
         sourceId: SurfaceId?,
     ): CanonicalTarget {
-        val packed = if (stagePackedNormal[index] != 0) stagePackedNormal[index] else {
+        val packed = if (stagePackedNormalValue(index) != 0) stagePackedNormalValue(index) else {
             val center = center(Voxel(stageX[index], stageY[index], stageZ[index]), frame)
             val direction = cameraPoint?.let {
                 DepthPointMm(cameraGroup.x - it.x, cameraGroup.y - it.y, cameraGroup.z - it.z)
@@ -734,10 +745,10 @@ internal class DepthEvidenceKernel(
             voxel = Voxel(stageX[index], stageY[index], stageZ[index]),
             normalOctX = (packed ushr 8).toByte().toInt(),
             normalOctY = packed.toByte().toInt(),
-            normalConfidence = if (stageNormalConfidence[index] != 0) {
-                stageNormalConfidence[index]
+            normalConfidence = if (stageNormalConfidenceValue(index) != 0) {
+                stageNormalConfidenceValue(index)
             } else {
-                (stageOccupied[index] * 64).coerceIn(0, 255)
+                (stageOccupiedValue(index) * 64).coerceIn(0, 255)
             },
         )
     }
@@ -832,27 +843,27 @@ internal class DepthEvidenceKernel(
 
     private fun writeStage(row: Int, index: Int) {
         rowVoxelKey[row] = packVisibilityGridKey(stageX[index], stageY[index], stageZ[index])
-        rowOccupied[row] = stageOccupied[index].toByte()
-        rowFree[row] = stageFree[index].toByte()
+        rowOccupied[row] = stageOccupied[index]
+        rowFree[row] = stageFree[index]
         rowDirections[row] = stageDirections[index]
         rowFlags[row] = flags(stageContradicted[index], stagePublished[index])
-        rowSourceId[row] = stageSourceId[index].toInt()
+        rowSourceId[row] = stageSourceId[index]
         rowSourceKey[row] = stageSourceKey[index]
-        rowPackedNormal[row] = stagePackedNormal[index].toShort()
-        rowNormalConfidence[row] = stageNormalConfidence[index].toByte()
-        rowLineageCount[row] = stageLineageCount[index].toShort()
+        rowPackedNormal[row] = stagePackedNormal[index]
+        rowNormalConfidence[row] = stageNormalConfidence[index]
+        rowLineageCount[row] = stageLineageCount[index]
     }
 
     private fun stageFind(voxel: Voxel): Int = stageFind(voxel.x, voxel.y, voxel.z)
 
     private fun stageFind(x: Int, y: Int, z: Int): Int {
         val key = packVisibilityGridKey(x, y, z)
-        var slot = hash(key)
+        var slot = stageHash(key)
         while (true) {
             val row = stageHashRows[slot]
             if (row == EMPTY_ROW) return EMPTY_ROW
             if (stageHashKeys[slot] == key) return row
-            slot = (slot + 1) and (hashCapacity - 1)
+            slot = (slot + 1) and (stageHashCapacity - 1)
         }
     }
 
@@ -862,7 +873,7 @@ internal class DepthEvidenceKernel(
             if (surface != null) stageAttach(index, surface)
             return index
         }
-        if (stageCount >= tableCapacity) throw StageCapacityFailure()
+        if (stageCount >= stageCapacity) throw StageCapacityFailure()
         index = stageCount++
         stageX[index] = voxel.x
         stageY[index] = voxel.y
@@ -871,7 +882,7 @@ internal class DepthEvidenceKernel(
         stageFree[index] = 0
         stageDirections[index] = 0
         stageContradicted[index] = false
-        stageSourceId[index] = 0L
+        stageSourceId[index] = 0
         stageSourceKey[index] = packVisibilityGridKey(voxel.x, voxel.y, voxel.z)
         stagePackedNormal[index] = 0
         stageNormalConfidence[index] = 0
@@ -883,20 +894,20 @@ internal class DepthEvidenceKernel(
         stageFreeBin[index] = NO_DIRECTION
         val resident = findRow(voxel.x, voxel.y, voxel.z)
         if (resident != EMPTY_ROW) {
-            stageOccupied[index] = rowOccupied[resident].toInt() and 0xff
-            stageFree[index] = rowFree[resident].toInt() and 0xff
+            stageOccupied[index] = rowOccupied[resident]
+            stageFree[index] = rowFree[resident]
             stageDirections[index] = rowDirections[resident]
             stageContradicted[index] = rowFlags[resident].toInt() and CONTRADICTED_FLAG != 0
             stagePublished[index] = rowFlags[resident].toInt() and PUBLISHED_FLAG != 0
-            stageSourceId[index] = rowSourceId[resident].toLong() and 0xffff_ffffL
+            stageSourceId[index] = rowSourceId[resident]
             stageSourceKey[index] = rowSourceKey[resident]
-            stagePackedNormal[index] = rowPackedNormal[resident].toInt() and 0xffff
-            stageNormalConfidence[index] = rowNormalConfidence[resident].toInt() and 0xff
-            stageLineageCount[index] = rowLineageCount[resident].toInt() and 0xffff
-            if (stageSourceId[index] != 0L) stageAddRelation(index, stageSourceId[index])
+            stagePackedNormal[index] = rowPackedNormal[resident]
+            stageNormalConfidence[index] = rowNormalConfidence[resident]
+            stageLineageCount[index] = rowLineageCount[resident]
+            if (stageSourceIdValue(index) != 0L) stageAddRelation(index, stageSourceIdValue(index))
         }
-        var slot = hash(packVisibilityGridKey(voxel.x, voxel.y, voxel.z))
-        while (stageHashRows[slot] != EMPTY_ROW) slot = (slot + 1) and (hashCapacity - 1)
+        var slot = stageHash(packVisibilityGridKey(voxel.x, voxel.y, voxel.z))
+        while (stageHashRows[slot] != EMPTY_ROW) slot = (slot + 1) and (stageHashCapacity - 1)
         stageHashKeys[slot] = packVisibilityGridKey(voxel.x, voxel.y, voxel.z)
         stageHashRows[slot] = index
         if (surface != null) stageAttach(index, surface)
@@ -905,13 +916,13 @@ internal class DepthEvidenceKernel(
 
     private fun stageAttach(index: Int, surface: DepthCanonicalSurface) {
         stageAddRelation(index, surface.id.value)
-        val prior = stageSourceId[index]
+        val prior = stageSourceIdValue(index)
         if (prior == 0L || surface.id.value < prior) {
-            stageSourceId[index] = surface.id.value
+            stageSourceId[index] = surface.id.value.toInt()
             stageSourceKey[index] = packVisibilityGridKey(surface.voxel.x, surface.voxel.y, surface.voxel.z)
-            stagePackedNormal[index] = surface.packedNormal
-            stageNormalConfidence[index] = surface.normalConfidence
-            stageLineageCount[index] = surface.lineageCount
+            stagePackedNormal[index] = surface.packedNormal.toShort()
+            stageNormalConfidence[index] = surface.normalConfidence.toByte()
+            stageLineageCount[index] = surface.lineageCount.toShort()
             stagePublished[index] = false
         }
     }
@@ -920,7 +931,7 @@ internal class DepthEvidenceKernel(
         for (relation in 0 until stageRelationCount) {
             if (stageRelationTarget[relation] == index && stageRelationSource[relation] == sourceId) return
         }
-        if (stageRelationCount >= tableCapacity) throw StageCapacityFailure()
+        if (stageRelationCount >= stageCapacity) throw StageCapacityFailure()
         stageRelationTarget[stageRelationCount] = index
         stageRelationSource[stageRelationCount] = sourceId
         stageRelationCount++
@@ -990,12 +1001,20 @@ internal class DepthEvidenceKernel(
     private fun hash(voxel: Voxel): Int = hash(packVisibilityGridKey(voxel.x, voxel.y, voxel.z))
 
     private fun hash(value: Long): Int {
+        return mixedHash(value) and (hashCapacity - 1)
+    }
+
+    private fun stageHash(value: Long): Int {
+        return mixedHash(value) and (stageHashCapacity - 1)
+    }
+
+    private fun mixedHash(value: Long): Int {
         var mixed = value xor (value ushr 33)
         mixed *= -49064778989728563L
         mixed = mixed xor (mixed ushr 33)
         mixed *= -4265267296055464877L
         mixed = mixed xor (mixed ushr 33)
-        return mixed.toInt() and (hashCapacity - 1)
+        return mixed.toInt()
     }
 
     private fun refused(reason: DepthEvidenceRefusal): DepthEvidenceResult.Refused {
@@ -1111,17 +1130,38 @@ internal class DepthEvidenceKernel(
 
     private fun checkedBytes(rows: Int): Int = Math.multiplyExact(rows, EVIDENCE_BYTES)
 
-    private fun fixedPrimitiveBytes(): Int = Math.addExact(
-        // Retained rows are exactly 32 bytes. Staging adds its bounded
-        // primitive columns, three doubles for the deterministic occupied
-        // sample, one free-direction bin, one sort index, relation columns,
-        // and primitive change descriptor columns.
-        Math.addExact(
-            Math.multiplyExact(tableCapacity, EVIDENCE_BYTES),
-            Math.multiplyExact(tableCapacity, STAGING_PRIMITIVE_BYTES),
-        ),
-        Math.multiplyExact(hashCapacity, HASH_SLOT_BYTES * 2),
-    )
+    private fun stageOccupiedValue(index: Int): Int = stageOccupied[index].toInt() and 0xff
+
+    private fun stageFreeValue(index: Int): Int = stageFree[index].toInt() and 0xff
+
+    private fun stageSourceIdValue(index: Int): Long = stageSourceId[index].toLong() and 0xffff_ffffL
+
+    private fun stagePackedNormalValue(index: Int): Int = stagePackedNormal[index].toInt() and 0xffff
+
+    private fun stageNormalConfidenceValue(index: Int): Int = stageNormalConfidence[index].toInt() and 0xff
+
+    private fun fixedPrimitiveBytes(): Int {
+        var total = 0L
+        fun addArrays(count: Int, capacity: Int, elementBytes: Int) {
+            val payload = capacity.toLong() * elementBytes
+            val alignedPayload = (payload + OBJECT_ALIGNMENT_BYTES - 1) / OBJECT_ALIGNMENT_BYTES * OBJECT_ALIGNMENT_BYTES
+            total += count.toLong() * (ARRAY_HEADER_BYTES + alignedPayload)
+        }
+
+        addArrays(1, hashCapacity, Long.SIZE_BYTES)
+        addArrays(1, hashCapacity, Int.SIZE_BYTES)
+        addArrays(2, tableCapacity, Long.SIZE_BYTES)
+        addArrays(4, tableCapacity, Byte.SIZE_BYTES)
+        addArrays(2, tableCapacity, Int.SIZE_BYTES)
+        addArrays(2, tableCapacity, Short.SIZE_BYTES)
+        addArrays(1, stageHashCapacity, Long.SIZE_BYTES)
+        addArrays(1, stageHashCapacity, Int.SIZE_BYTES)
+        addArrays(12, stageCapacity, Int.SIZE_BYTES)
+        addArrays(8, stageCapacity, Byte.SIZE_BYTES)
+        addArrays(6, stageCapacity, Long.SIZE_BYTES)
+        addArrays(2, stageCapacity, Short.SIZE_BYTES)
+        return Math.toIntExact(total)
+    }
 
     private fun flags(contradicted: Boolean, published: Boolean): Byte =
         ((if (contradicted) CONTRADICTED_FLAG else 0) or
@@ -1145,13 +1185,9 @@ internal class DepthEvidenceKernel(
     private companion object {
         const val EMPTY_ROW = -1
         const val EVIDENCE_BYTES = 32
-        // x/y/z, evidence counters/directions, source metadata, lifecycle
-        // flags, occupied sample coordinates, ordering/relations, and change
-        // descriptors respectively. Every term is a primitive payload byte.
-        const val STAGING_PRIMITIVE_BYTES =
-            3 * 4 + 3 * 4 + 1 + 2 * 8 + 3 * 4 + 2 + 3 * 8 +
-                3 * 4 + 8 + 4 + 2 + 4 + 8 + 4 + 4
-        const val HASH_SLOT_BYTES = 8 + 4
+        const val SEMANTIC_STATE_BUDGET_BYTES = 16 * 1024 * 1024
+        const val ARRAY_HEADER_BYTES = 16L
+        const val OBJECT_ALIGNMENT_BYTES = 8L
         const val DIRECTION_BINS = 24
         const val NO_DIRECTION = -1
         const val CONTRADICTED_FLAG = 1

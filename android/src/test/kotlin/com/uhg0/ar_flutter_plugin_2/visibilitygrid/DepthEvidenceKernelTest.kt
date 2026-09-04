@@ -1,9 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DepthEvidenceKernelTest {
@@ -20,10 +17,7 @@ class DepthEvidenceKernelTest {
 
         val result = kernel.prepare(batch, view)
 
-        assertTrue(result is DepthEvidenceResult.Accepted)
-        val accepted = result as DepthEvidenceResult.Accepted
-        assertEquals(0, accepted.changes.size)
-        assertEquals(1, accepted.receipt.acceptedSamples)
+        assertEquals(expectedAccepted(1), result)
         assertEquals(Voxel(2, 0, -10), view.visitedEndpoints.single())
     }
 
@@ -36,10 +30,7 @@ class DepthEvidenceKernelTest {
             FakeCanonicalView(),
         ) as DepthEvidenceResult.Accepted
 
-        assertEquals(32, result.receipt.acceptedSamples)
-        assertEquals(1, result.receipt.touchedEvidenceRows)
-        assertEquals(0, result.receipt.createCount)
-        assertTrue(result.changes.isEmpty())
+        assertEquals(expectedAccepted(1, acceptedSamples = 32, virtualWork = 33), result)
     }
 
     @Test
@@ -52,9 +43,7 @@ class DepthEvidenceKernelTest {
             FakeCanonicalView(),
         ) as DepthEvidenceResult.Accepted
 
-        assertEquals(1, result.receipt.touchedEvidenceRows)
-        assertEquals(0, result.receipt.createCount)
-        assertTrue(result.changes.isEmpty())
+        assertEquals(expectedAccepted(1, acceptedSamples = 64, virtualWork = 65), result)
     }
 
     @Test
@@ -65,16 +54,25 @@ class DepthEvidenceKernelTest {
         val kernel = DepthEvidenceKernel()
 
         repeat(3) { index ->
-            assertTrue(kernel.prepare(depthBatchForFrame(index + 1L, frame(), identity()), view)
-                is DepthEvidenceResult.Accepted)
+            assertEquals(
+                expectedAccepted(index + 1L),
+                kernel.prepare(depthBatchForFrame(index + 1L, frame(), identity()), view),
+            )
             kernel.applyPrepared()
         }
         val result = kernel.prepare(depthBatchForFrame(4, frame(), identity()), view)
             as DepthEvidenceResult.Accepted
 
-        val relocation = result.changes.single() as DepthEvidenceChange.Relocate
-        assertEquals(SurfaceId(21), relocation.sourceId)
-        assertEquals(target, relocation.target.voxel)
+        assertEquals(
+            expectedAccepted(
+                4,
+                changes = listOf(DepthEvidenceChange.Relocate(
+                    SurfaceId(21), canonicalTarget(SurfaceId(21), target, 16, 16, 200),
+                )),
+                relocateCount = 1,
+            ),
+            result,
+        )
     }
 
     @Test
@@ -95,9 +93,18 @@ class DepthEvidenceKernelTest {
         val result = kernel.prepare(depthBatchForFrame(4, frame(), identity()), view)
             as DepthEvidenceResult.Accepted
 
-        val merge = result.changes.single() as DepthEvidenceChange.Merge
-        assertEquals(listOf(SurfaceId(31), SurfaceId(32)), merge.sourceIds)
-        assertEquals(target, merge.target.voxel)
+        assertEquals(
+            expectedAccepted(
+                4,
+                changes = listOf(DepthEvidenceChange.Merge(
+                    listOf(SurfaceId(31), SurfaceId(32)), canonicalTarget(null, target, 16, 16, 200),
+                )),
+                rayVisits = 1,
+                mergeCount = 1,
+                virtualWork = 3,
+            ),
+            result,
+        )
     }
 
     @Test
@@ -123,9 +130,23 @@ class DepthEvidenceKernelTest {
             depthBatchForSamples(4, frame(), identity(), intrinsics, samples), view,
         ) as DepthEvidenceResult.Accepted
 
-        val split = result.changes.single() as DepthEvidenceChange.Split
-        assertEquals(SurfaceId(41), split.sourceId)
-        assertEquals(listOf(firstTarget, secondTarget), split.targets.map { it.voxel })
+        assertEquals(
+            expectedAccepted(
+                4,
+                changes = listOf(DepthEvidenceChange.Split(
+                    SurfaceId(41),
+                    listOf(
+                        canonicalTarget(null, firstTarget, 16, 16, 200),
+                        canonicalTarget(null, secondTarget, 16, 16, 200),
+                    ),
+                )),
+                acceptedSamples = 2,
+                touchedRows = 2,
+                splitCount = 1,
+                virtualWork = 4,
+            ),
+            result,
+        )
     }
 
     @Test
@@ -153,9 +174,24 @@ class DepthEvidenceKernelTest {
             depthBatchForSamples(4, frame(), identity(), intrinsics, samples), view,
         ) as DepthEvidenceResult.Accepted
 
-        val replace = result.changes.single() as DepthEvidenceChange.Replace
-        assertEquals(listOf(SurfaceId(51), SurfaceId(52)), replace.sourceIds)
-        assertEquals(listOf(firstTarget, secondTarget), replace.targets.map { it.voxel })
+        assertEquals(
+            expectedAccepted(
+                4,
+                changes = listOf(DepthEvidenceChange.Replace(
+                    listOf(SurfaceId(51), SurfaceId(52)),
+                    listOf(
+                        canonicalTarget(null, firstTarget, 16, 16, 200),
+                        canonicalTarget(null, secondTarget, 16, 16, 200),
+                    ),
+                )),
+                acceptedSamples = 2,
+                rayVisits = 4,
+                touchedRows = 2,
+                replaceCount = 1,
+                virtualWork = 8,
+            ),
+            result,
+        )
     }
 
     @Test
@@ -210,9 +246,19 @@ class DepthEvidenceKernelTest {
             view,
         )
 
-        assertTrue("candidate=$candidate", candidate is DepthEvidenceResult.Refused)
-        val refusal = candidate as DepthEvidenceResult.Refused
-        assertEquals(DepthEvidenceRefusal.SOURCE_OVERLAP, refusal.reason)
+        assertEquals(
+            DepthEvidenceResult.Refused(
+                DepthEvidenceRefusal.SOURCE_OVERLAP,
+                expectedAccepted(
+                    22,
+                    acceptedSamples = 2,
+                    rayVisits = 4,
+                    touchedRows = 4,
+                    virtualWork = 10,
+                ).receipt,
+            ),
+            candidate,
+        )
         assertEquals(0, kernel.resourceReceipt().preparedEvidenceRows)
     }
 
@@ -225,7 +271,10 @@ class DepthEvidenceKernelTest {
             depthBatchForFrame(1, frame(), identity()),
             FakeCanonicalView(surfaces = mapOf(target to source), idLookup = emptyMap()),
         ) as DepthEvidenceResult.Refused
-        assertEquals(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED, missing.reason)
+        assertEquals(
+            DepthEvidenceResult.Refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED, DepthEvidenceReceipt()),
+            missing,
+        )
 
         val conflicting = DepthEvidenceKernel().prepare(
             depthBatchForFrame(1, frame(), identity()),
@@ -234,7 +283,10 @@ class DepthEvidenceKernelTest {
                 idLookup = mapOf(SurfaceId(61) to surface(61, Voxel(1, 0, -10))),
             ),
         ) as DepthEvidenceResult.Refused
-        assertEquals(DepthEvidenceRefusal.DUPLICATE_TARGET, conflicting.reason)
+        assertEquals(
+            DepthEvidenceResult.Refused(DepthEvidenceRefusal.DUPLICATE_TARGET, DepthEvidenceReceipt()),
+            conflicting,
+        )
     }
 
     @Test
@@ -245,8 +297,8 @@ class DepthEvidenceKernelTest {
             view,
         ) as DepthEvidenceResult.Accepted
 
+        assertEquals(expectedAccepted(1), result)
         assertEquals(Voxel(0, 0, 10), view.visitedEndpoints.single())
-        assertEquals(1, result.receipt.acceptedSamples)
     }
 
     @Test
@@ -256,18 +308,26 @@ class DepthEvidenceKernelTest {
         val first = batch(1, frame(), translation(0.0, 0.0, 0.0), listOf(sample()))
 
         repeat(3) { index ->
-            assertTrue(kernel.prepare(first.copyWithTimestamp(index + 1L), view) is DepthEvidenceResult.Accepted)
+            assertEquals(expectedAccepted(index + 1L), kernel.prepare(first.copyWithTimestamp(index + 1L), view))
             kernel.applyPrepared()
         }
         val staged = kernel.prepare(first.copyWithTimestamp(4), view) as DepthEvidenceResult.Accepted
 
-        assertEquals(1, staged.changes.size)
-        assertTrue(staged.changes.single() is DepthEvidenceChange.Create)
+        assertEquals(
+            expectedAccepted(
+                4,
+                changes = listOf(DepthEvidenceChange.Create(
+                    canonicalTarget(null, Voxel(-8, 5, -10), 42, -28, 255),
+                )),
+                createCount = 1,
+            ),
+            staged,
+        )
         assertEquals(1, kernel.resourceReceipt().residentEvidenceRows)
-        assertTrue(kernel.applyPrepared() is DepthEvidenceApplyResult.Applied)
+        assertEquals(DepthEvidenceApplyResult.Applied(staged.receipt), kernel.applyPrepared())
         assertEquals(1, kernel.resourceReceipt().residentEvidenceRows)
         assertEquals(32, kernel.resourceReceipt().residentBytes)
-        assertTrue(kernel.applyPrepared() is DepthEvidenceApplyResult.NoPrepared)
+        assertEquals(DepthEvidenceApplyResult.NoPrepared(staged.receipt), kernel.applyPrepared())
     }
 
     @Test
@@ -282,33 +342,62 @@ class DepthEvidenceKernelTest {
             rayCells = listOf(stale, safety),
         )
         val kernel = DepthEvidenceKernel()
-        val removedIds = mutableListOf<SurfaceId>()
         repeat(4) { index ->
             val result = kernel.prepare(
                 depthBatch(index + 1L, cameraX = 0.05, endpointX = 0.05),
                 view,
             ) as DepthEvidenceResult.Accepted
-            removedIds += result.changes.filterIsInstance<DepthEvidenceChange.Remove>().map { it.sourceId }
+            val changes = if (index == 3) listOf(
+                DepthEvidenceChange.Create(
+                    canonicalTarget(null, Voxel(0, 0, -10), 5, 5, 255),
+                ),
+            ) else emptyList()
+            assertEquals(
+                expectedAccepted(
+                    index + 1L,
+                    changes = changes,
+                    rayVisits = 2,
+                    touchedRows = 3,
+                    directionVotes = if (index == 0) 1 else 0,
+                    createCount = if (index == 3) 1 else 0,
+                    virtualWork = 6,
+                ),
+                result,
+            )
             kernel.applyPrepared()
-            assertTrue(result.receipt.rayVisits <= 2)
         }
         repeat(4) { index ->
             val result = kernel.prepare(
                 depthBatch(10L + index, cameraX = 0.55, endpointX = -0.45),
                 view,
             ) as DepthEvidenceResult.Accepted
-            removedIds += result.changes.filterIsInstance<DepthEvidenceChange.Remove>().map { it.sourceId }
+            val changes = if (index == 3) listOf(
+                DepthEvidenceChange.Create(
+                    canonicalTarget(null, Voxel(-5, 0, -10), 74, 2, 255),
+                ),
+                DepthEvidenceChange.Remove(SurfaceId(7)),
+            ) else emptyList()
+            assertEquals(
+                expectedAccepted(
+                    10L + index,
+                    changes = changes,
+                    rayVisits = 2,
+                    touchedRows = 3,
+                    directionVotes = if (index == 0) 1 else 0,
+                    createCount = if (index == 3) 1 else 0,
+                    removeCount = if (index == 3) 1 else 0,
+                    virtualWork = 6,
+                ),
+                result,
+            )
             kernel.applyPrepared()
         }
 
-        val receipt = kernel.resourceReceipt()
-        assertTrue(SurfaceId(7) in removedIds)
-        assertTrue(SurfaceId(8) !in removedIds)
         val last = kernel.prepare(
             depthBatch(30, cameraX = 0.55, endpointX = -0.45),
             view,
         ) as DepthEvidenceResult.Accepted
-        assertTrue(last.changes.none { it is DepthEvidenceChange.Remove && it.sourceId == SurfaceId(8) })
+        assertEquals(expectedAccepted(30, rayVisits = 2, touchedRows = 3, virtualWork = 6), last)
     }
 
     @Test
@@ -321,9 +410,10 @@ class DepthEvidenceKernelTest {
         val kernel = DepthEvidenceKernel()
         val result = kernel.prepare(depthBatch(1, 0.05, 0.05), view) as DepthEvidenceResult.Accepted
 
-        assertEquals("receipt=${result.receipt}", 2, result.receipt.touchedEvidenceRows)
-        assertEquals("receipt=${result.receipt}", 1, result.receipt.independentDirectionVotes)
-        assertTrue(result.changes.isEmpty())
+        assertEquals(
+            expectedAccepted(1, rayVisits = 32, touchedRows = 2, directionVotes = 1, virtualWork = 35),
+            result,
+        )
     }
 
     @Test
@@ -338,33 +428,81 @@ class DepthEvidenceKernelTest {
             val result = kernel.prepare(
                 depthBatch(1L + index, cameraX = 0.05, endpointX = 0.05), view,
             ) as DepthEvidenceResult.Accepted
+            val changes = if (index == 3) listOf(
+                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(0, 0, -10), 5, 5, 255)),
+            ) else emptyList()
+            assertEquals(
+                expectedAccepted(
+                    1L + index,
+                    changes = changes,
+                    rayVisits = 1,
+                    touchedRows = 2,
+                    directionVotes = if (index == 0) 1 else 0,
+                    createCount = if (index == 3) 1 else 0,
+                    virtualWork = 4,
+                ),
+                result,
+            )
             kernel.applyPrepared()
-            assertTrue(result.changes.none { it is DepthEvidenceChange.Remove })
         }
-        var removed = false
         repeat(4) { index ->
             val result = kernel.prepare(
                 depthBatch(10L + index, cameraX = 0.55, endpointX = -0.45), view,
             ) as DepthEvidenceResult.Accepted
-            removed = removed || result.changes.any { it is DepthEvidenceChange.Remove && it.sourceId == SurfaceId(7) }
+            val changes = if (index == 3) listOf(
+                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(-5, 0, -10), 74, 2, 255)),
+                DepthEvidenceChange.Remove(SurfaceId(7)),
+            ) else emptyList()
+            assertEquals(
+                expectedAccepted(
+                    10L + index,
+                    changes = changes,
+                    rayVisits = 1,
+                    touchedRows = 2,
+                    directionVotes = if (index == 0) 1 else 0,
+                    createCount = if (index == 3) 1 else 0,
+                    removeCount = if (index == 3) 1 else 0,
+                    virtualWork = 4,
+                ),
+                result,
+            )
             kernel.applyPrepared()
         }
-        assertTrue(removed)
 
         repeat(3) { index ->
             val result = kernel.prepare(
                 depthBatch(30L + index, cameraX = 0.05, endpointX = 0.05, depthMillimeters = 500), view,
             ) as DepthEvidenceResult.Accepted
-            assertTrue(result.changes.none { it is DepthEvidenceChange.Relocate || it is DepthEvidenceChange.Refine })
+            assertEquals(
+                expectedAccepted(
+                    30L + index,
+                    rayVisits = 1,
+                    conflictsRetained = 1,
+                    virtualWork = 3,
+                ),
+                result,
+            )
             kernel.applyPrepared()
         }
         val restored = kernel.prepare(depthBatch(40, 0.05, 0.05, depthMillimeters = 500), view)
             as DepthEvidenceResult.Accepted
-        assertTrue(restored.changes.any { it is DepthEvidenceChange.Refine && it.sourceId == SurfaceId(7) })
+        assertEquals(
+            expectedAccepted(
+                40,
+                changes = listOf(DepthEvidenceChange.Refine(
+                    SurfaceId(7), canonicalTarget(SurfaceId(7), stale, 16, 16, 200),
+                )),
+                rayVisits = 1,
+                refineCount = 1,
+                conflictsRetained = 1,
+                virtualWork = 3,
+            ),
+            restored,
+        )
         kernel.applyPrepared()
         val next = kernel.prepare(depthBatch(41, 0.05, 0.05, depthMillimeters = 500), view)
             as DepthEvidenceResult.Accepted
-        assertTrue(next.changes.none { it is DepthEvidenceChange.Remove })
+        assertEquals(expectedAccepted(41, rayVisits = 1, virtualWork = 3), next)
     }
 
     @Test
@@ -377,9 +515,7 @@ class DepthEvidenceKernelTest {
             view,
         ) as DepthEvidenceResult.Accepted
 
-        assertEquals(2, result.receipt.touchedEvidenceRows)
-        assertEquals(0, result.receipt.independentDirectionVotes)
-        assertTrue(result.changes.isEmpty())
+        assertEquals(expectedAccepted(1, rayVisits = 1, touchedRows = 2, virtualWork = 4), result)
     }
 
     @Test
@@ -391,8 +527,7 @@ class DepthEvidenceKernelTest {
             view,
         ) as DepthEvidenceResult.Accepted
 
-        assertEquals(0, result.receipt.independentDirectionVotes)
-        assertTrue(result.changes.isEmpty())
+        assertEquals(expectedAccepted(1, rayVisits = 1, touchedRows = 2, virtualWork = 4), result)
     }
 
     @Test
@@ -410,8 +545,10 @@ class DepthEvidenceKernelTest {
             view,
         ) as DepthEvidenceResult.Accepted
 
-        assertEquals(1, result.receipt.independentDirectionVotes)
-        assertTrue(result.changes.isEmpty())
+        assertEquals(
+            expectedAccepted(1, rayVisits = 3, touchedRows = 4, directionVotes = 1, virtualWork = 8),
+            result,
+        )
     }
 
     @Test
@@ -423,6 +560,8 @@ class DepthEvidenceKernelTest {
         val sources = phantom.mapIndexed { index, voxel -> voxel to surface(101L + index, voxel) }.toMap()
         val kernel = DepthEvidenceKernel()
         val view = FakeCanonicalView(surfaces = sources, rayCells = phantom)
+        val emittedChanges = mutableListOf<DepthEvidenceChange>()
+        var lastResult: DepthEvidenceResult.Accepted? = null
 
         phantom.forEachIndexed { index, voxel ->
             repeat(4) { observation ->
@@ -435,12 +574,12 @@ class DepthEvidenceKernelTest {
                     ),
                     view,
                 ) as DepthEvidenceResult.Accepted
-                assertTrue(result.changes.none { it is DepthEvidenceChange.Remove })
+                emittedChanges += result.changes
+                lastResult = result
                 kernel.applyPrepared()
             }
         }
 
-        val removedIds = mutableSetOf<SurfaceId>()
         phantom.forEachIndexed { index, voxel ->
             val targetZ = (voxel.z + 0.5) * 0.1
             val fraction = (0.05 - targetZ) / 1.0
@@ -456,17 +595,35 @@ class DepthEvidenceKernelTest {
                     ),
                     view,
                 ) as DepthEvidenceResult.Accepted
-                removedIds += result.changes.filterIsInstance<DepthEvidenceChange.Remove>()
-                    .map { it.sourceId }
+                emittedChanges += result.changes
+                lastResult = result
                 kernel.applyPrepared()
             }
         }
 
         assertEquals(
-            setOf(SurfaceId(101), SurfaceId(102), SurfaceId(103), SurfaceId(104), SurfaceId(105)),
-            removedIds,
+            listOf(
+                DepthEvidenceChange.Refine(SurfaceId(101), canonicalTarget(SurfaceId(101), phantom[0], 16, 16, 200)),
+                DepthEvidenceChange.Refine(SurfaceId(102), canonicalTarget(SurfaceId(102), phantom[1], 16, 16, 200)),
+                DepthEvidenceChange.Refine(SurfaceId(103), canonicalTarget(SurfaceId(103), phantom[2], 16, 16, 200)),
+                DepthEvidenceChange.Refine(SurfaceId(104), canonicalTarget(SurfaceId(104), phantom[3], 16, 16, 200)),
+                DepthEvidenceChange.Refine(SurfaceId(105), canonicalTarget(SurfaceId(105), phantom[4], 16, 16, 200)),
+                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(-3, 0, -10), 70, 2, 255)),
+                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(0, 0, -10), 5, 5, 255)),
+                DepthEvidenceChange.Remove(SurfaceId(101)),
+                DepthEvidenceChange.Remove(SurfaceId(102)),
+                DepthEvidenceChange.Remove(SurfaceId(103)),
+                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(-5, 0, -10), 74, 2, 255)),
+                DepthEvidenceChange.Remove(SurfaceId(104)),
+                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(-7, 0, -10), 78, 2, 255)),
+                DepthEvidenceChange.Remove(SurfaceId(105)),
+                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(-12, 0, -10), 84, 1, 255)),
+                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(-20, 0, -10), 93, 1, 255)),
+            ),
+            emittedChanges,
         )
-        assertTrue(kernel.resourceReceipt().residentEvidenceRows >= phantom.size)
+        assertEquals(expectedAccepted(139, rayVisits = 5, touchedRows = 6, virtualWork = 12), lastResult)
+        assertEquals(11, kernel.resourceReceipt().residentEvidenceRows)
     }
 
     @Test
@@ -478,17 +635,37 @@ class DepthEvidenceKernelTest {
         val kernel = DepthEvidenceKernel(DepthEvidenceConfiguration(surfaceCapacity = 2))
 
         repeat(4) { index ->
-            kernel.prepare(
+            val result = kernel.prepare(
                 depthBatchForDepth(1L + index, groupFrame, identity(), 500),
                 view,
             ) as DepthEvidenceResult.Accepted
+            assertEquals(
+                expectedAccepted(
+                    1L + index,
+                    changes = if (index == 3) listOf(DepthEvidenceChange.Refine(
+                        SurfaceId(81), canonicalTarget(SurfaceId(81), stale, 16, 16, 200),
+                    )) else emptyList(),
+                    refineCount = if (index == 3) 1 else 0,
+                ),
+                result,
+            )
             kernel.applyPrepared()
         }
         repeat(4) { index ->
-            kernel.prepare(
+            val result = kernel.prepare(
                 depthBatchForDepth(10L + index, groupFrame, identity(), 1_000),
                 view,
             ) as DepthEvidenceResult.Accepted
+            assertEquals(
+                expectedAccepted(
+                    10L + index,
+                    changes = if (index == 3) listOf(DepthEvidenceChange.Create(
+                        canonicalTarget(null, Voxel(0, 0, -5), 0, 0, 255),
+                    )) else emptyList(),
+                    createCount = if (index == 3) 1 else 0,
+                ),
+                result,
+            )
             kernel.applyPrepared()
         }
 
@@ -496,7 +673,6 @@ class DepthEvidenceKernelTest {
             surfaces = mapOf(stale to staleSurface),
             rayCells = listOf(stale),
         )
-        var removed = false
         repeat(8) { index ->
             val result = kernel.prepare(
                 depthBatchAtFrame(
@@ -508,17 +684,25 @@ class DepthEvidenceKernelTest {
                 ),
                 carvingView,
             ) as DepthEvidenceResult.Accepted
-            removed = removed || result.changes.any {
-                it is DepthEvidenceChange.Remove && it.sourceId == SurfaceId(81)
-            }
-            assertEquals(0, result.receipt.capacityRefusals)
+            assertEquals(
+                expectedAccepted(
+                    20L + index,
+                    changes = if (index == 7) listOf(DepthEvidenceChange.Remove(SurfaceId(81))) else emptyList(),
+                    rayVisits = 1,
+                    touchedRows = 2,
+                    directionVotes = if (index == 0 || index == 4) 1 else 0,
+                    removeCount = if (index == 7) 1 else 0,
+                    virtualWork = 4,
+                ),
+                result,
+            )
             kernel.applyPrepared()
         }
 
-        assertTrue(removed)
-        assertEquals(2, kernel.resourceReceipt().residentEvidenceRows)
-        assertEquals(2, kernel.resourceReceipt().evidenceRowCapacity)
-        assertEquals(64, kernel.resourceReceipt().residentBytes)
+        assertEquals(
+            DepthEvidenceResourceReceipt(2, 64, 0, 0, 2, 1_136, false),
+            kernel.resourceReceipt(),
+        )
     }
 
     @Test
@@ -537,12 +721,15 @@ class DepthEvidenceKernelTest {
             FakeCanonicalView(),
         ) as DepthEvidenceResult.Accepted
 
-        assertEquals(V2_DEPTH_SAMPLE_CAPACITY, result.receipt.acceptedSamples)
-        assertEquals(1, result.receipt.touchedEvidenceRows)
-        assertEquals(0, result.receipt.createCount)
-        assertEquals(0, result.changes.size)
-        assertTrue(kernel.resourceReceipt().fixedPrimitiveBytes > 32)
-        assertEquals(result.receipt.acceptedSamples + 1, result.work.virtualWorkUnits)
+        assertEquals(
+            expectedAccepted(
+                1,
+                acceptedSamples = V2_DEPTH_SAMPLE_CAPACITY,
+                virtualWork = V2_DEPTH_SAMPLE_CAPACITY + 1,
+            ),
+            result,
+        )
+        assertEquals(16_735_904, kernel.resourceReceipt().fixedPrimitiveBytes)
         kernel.discardPrepared()
     }
 
@@ -567,10 +754,10 @@ class DepthEvidenceKernelTest {
             view,
         ) as DepthEvidenceResult.Accepted
 
-        assertEquals(1, result.receipt.acceptedSamples)
-        assertEquals(1, result.receipt.rejectedSamples)
-        assertEquals(0, result.receipt.independentDirectionVotes)
-        assertTrue(result.changes.isEmpty())
+        assertEquals(
+            expectedAccepted(1, rejectedSamples = 1, rayVisits = 1, touchedRows = 2, virtualWork = 4),
+            result,
+        )
         assertEquals(listOf(Voxel(0, 0, -10)), view.visitedEndpoints)
     }
 
@@ -604,14 +791,35 @@ class DepthEvidenceKernelTest {
                     ),
                     view,
                 ) as DepthEvidenceResult.Accepted
-                assertTrue("source=${source.id} index=$index receipt=${result.receipt}", result.receipt.conflictsRetained >= 1)
-                assertTrue(result.changes.none { it is DepthEvidenceChange.Remove })
+                val changes = when {
+                    source.id == SurfaceId(1) && index == 6 -> listOf(DepthEvidenceChange.Create(
+                        canonicalTarget(null, Voxel(0, 0, -16), 0, 3, 255),
+                    ))
+                    source.id == SurfaceId(1) && index == 7 -> listOf(DepthEvidenceChange.Create(
+                        canonicalTarget(null, Voxel(0, 0, -2), 101, 127, 255),
+                    ))
+                    else -> emptyList()
+                }
+                assertEquals(
+                    expectedAccepted(
+                        source.id.value * 10 + index,
+                        changes = changes,
+                        acceptedSamples = 2,
+                        rayVisits = 2,
+                        touchedRows = 2,
+                        directionVotes = if (index < 2) 1 else 0,
+                        createCount = if (source.id == SurfaceId(1) && (index == 6 || index == 7)) 1 else 0,
+                        conflictsRetained = 1,
+                        virtualWork = 6,
+                    ),
+                    result,
+                )
                 kernel.applyPrepared()
             }
         }
         supportedWall(surface(1, thin), frontDepth = 900, opposingDepth = 900)
         supportedWall(surface(2, double), frontDepth = 1_200, opposingDepth = 650)
-        assertTrue(kernel.resourceReceipt().residentEvidenceRows >= 2)
+        assertEquals(4, kernel.resourceReceipt().residentEvidenceRows)
     }
 
     @Test
@@ -622,8 +830,7 @@ class DepthEvidenceKernelTest {
             depthBatchForFrame(1, frame(), translation(0.0, 0.0, 0.0)), view,
         ) as DepthEvidenceResult.Accepted
 
-        assertEquals(0, result.receipt.independentDirectionVotes)
-        assertTrue(result.changes.isEmpty())
+        assertEquals(expectedAccepted(1, rayVisits = 1, touchedRows = 2, virtualWork = 4), result)
     }
 
     @Test
@@ -637,15 +844,28 @@ class DepthEvidenceKernelTest {
         }
         val before = kernel.resourceReceipt()
         val refusal = kernel.prepare(valid.copyWithTimestamp(5), view)
-        assertTrue(refusal is DepthEvidenceResult.Accepted)
-        assertTrue(kernel.prepare(valid.copyWithTimestamp(6), view) is DepthEvidenceResult.Refused)
-        assertEquals(DepthEvidenceRefusal.PREPARED_BUSY, (kernel.prepare(valid.copyWithTimestamp(7), view) as DepthEvidenceResult.Refused).reason)
+        assertEquals(expectedAccepted(5), refusal)
+        val committedReceipt = expectedAccepted(
+            4,
+            changes = listOf(DepthEvidenceChange.Create(
+                canonicalTarget(null, Voxel(0, 0, -10), 5, 5, 255),
+            )),
+            createCount = 1,
+        ).receipt
+        assertEquals(
+            DepthEvidenceResult.Refused(DepthEvidenceRefusal.PREPARED_BUSY, committedReceipt),
+            kernel.prepare(valid.copyWithTimestamp(6), view),
+        )
+        assertEquals(
+            DepthEvidenceResult.Refused(DepthEvidenceRefusal.PREPARED_BUSY, committedReceipt),
+            kernel.prepare(valid.copyWithTimestamp(7), view),
+        )
         kernel.discardPrepared()
         assertEquals(before, kernel.resourceReceipt())
 
         val invalid = valid.copyWithTimestamp(8).withSamples(listOf(VisibilityDepthSample(0, 0, 1, 255)))
         val invalidResult = kernel.prepare(invalid, view) as DepthEvidenceResult.Refused
-        assertEquals(DepthEvidenceRefusal.INVALID_SAMPLE, invalidResult.reason)
+        assertEquals(DepthEvidenceResult.Refused(DepthEvidenceRefusal.INVALID_SAMPLE, committedReceipt), invalidResult)
         assertEquals(before, kernel.resourceReceipt())
     }
 
@@ -657,14 +877,14 @@ class DepthEvidenceKernelTest {
         kernel.applyPrepared()
         kernel.close()
 
-        val closed = kernel.resourceReceipt()
-        assertEquals(0, closed.residentEvidenceRows)
-        assertEquals(0, closed.residentBytes)
-        assertEquals(0, closed.preparedEvidenceRows)
-        assertEquals(0, closed.fixedPrimitiveBytes)
+        val closed = DepthEvidenceResourceReceipt(0, 0, 0, 0, 100_000, 0, true)
+        assertEquals(closed, kernel.resourceReceipt())
         kernel.close()
         assertEquals(closed, kernel.resourceReceipt())
-        assertEquals(DepthEvidenceRefusal.CLOSED, (kernel.prepare(depthBatch(2, 0.05, 0.05), view) as DepthEvidenceResult.Refused).reason)
+        assertEquals(
+            DepthEvidenceResult.Refused(DepthEvidenceRefusal.CLOSED, expectedAccepted(1).receipt),
+            kernel.prepare(depthBatch(2, 0.05, 0.05), view),
+        )
     }
 
     private fun batch(
@@ -719,6 +939,68 @@ class DepthEvidenceKernelTest {
     )
 
     private fun sample() = VisibilityDepthSample(0, 0, 1_000, 255)
+
+    private fun canonicalTarget(
+        id: SurfaceId?,
+        voxel: Voxel,
+        normalOctX: Int,
+        normalOctY: Int,
+        normalConfidence: Int,
+    ) = CanonicalTarget(id, voxel, normalOctX, normalOctY, normalConfidence)
+
+    private fun expectedAccepted(
+        sequence: Long,
+        changes: List<DepthEvidenceChange> = emptyList(),
+        acceptedSamples: Int = 1,
+        rejectedSamples: Int = 0,
+        rayVisits: Int = 0,
+        touchedRows: Int = 1,
+        directionVotes: Int = 0,
+        createCount: Int = 0,
+        refineCount: Int = 0,
+        relocateCount: Int = 0,
+        mergeCount: Int = 0,
+        splitCount: Int = 0,
+        replaceCount: Int = 0,
+        removeCount: Int = 0,
+        conflictsRetained: Int = 0,
+        capacityRefusals: Int = 0,
+        overflowCount: Int = 0,
+        virtualWork: Int = acceptedSamples + rayVisits + touchedRows,
+    ) = DepthEvidenceResult.Accepted(
+        expectedGeometryRevision = 0,
+        expectedLineageRevision = 0,
+        changes = changes,
+        receipt = DepthEvidenceReceipt(
+            sequence = sequence,
+            sourceTimestampNs = sequence,
+            acceptedSamples = acceptedSamples,
+            rejectedSamples = rejectedSamples,
+            rayVisits = rayVisits,
+            touchedEvidenceRows = touchedRows,
+            independentDirectionVotes = directionVotes,
+            createCount = createCount,
+            refineCount = refineCount,
+            relocateCount = relocateCount,
+            mergeCount = mergeCount,
+            splitCount = splitCount,
+            replaceCount = replaceCount,
+            removeCount = removeCount,
+            conflictsRetained = conflictsRetained,
+            capacityRefusals = capacityRefusals,
+            overflowCount = overflowCount,
+            preparedResidentBytes = touchedRows * 32,
+            p50VirtualWorkUnits = virtualWork,
+            p95VirtualWorkUnits = virtualWork,
+        ),
+        work = DepthEvidenceWorkReceipt(
+            distinctTouchedVoxelCount = touchedRows,
+            emittedChangeCount = changes.size,
+            rayVisits = rayVisits,
+            independentDirectionVotes = directionVotes,
+            virtualWorkUnits = virtualWork,
+        ),
+    )
 
     private fun surface(id: Long, voxel: Voxel) = DepthCanonicalSurface(
         SurfaceId(id), voxel, 0x1010, 200, 1,
