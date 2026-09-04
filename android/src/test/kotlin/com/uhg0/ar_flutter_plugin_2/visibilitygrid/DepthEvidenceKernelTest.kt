@@ -448,6 +448,71 @@ class DepthEvidenceKernelTest {
     }
 
     @Test
+    fun `threshold crossing refuses a stale retained source identity`() {
+        val target = Voxel(0, 0, -10)
+        val old = surface(71, target)
+        val replacement = surface(72, target)
+        val kernel = DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 2))
+        val first = kernel.prepare(
+            depthBatchForFrame(1, frame(), identity()),
+            FakeCanonicalView(surfaces = mapOf(target to old)),
+        ) as DepthEvidenceResult.Accepted
+        kernel.applyPrepared()
+
+        assertEquals(
+            DepthEvidenceResult.Refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED, first.receipt),
+            kernel.prepare(
+                depthBatchForFrame(2, frame(), identity()),
+                FakeCanonicalView(surfaces = mapOf(target to replacement)),
+            ),
+        )
+        assertEquals(0, kernel.resourceReceipt().preparedEvidenceRows)
+    }
+
+    @Test
+    fun `address alias emits a resolvable relocated source`() {
+        val addressed = Voxel(0, 0, -10)
+        val canonical = surface(73, Voxel(3, 0, -10))
+        val view = FakeCanonicalView(
+            surfaces = mapOf(addressed to canonical),
+            idLookup = mapOf(canonical.id to canonical),
+        )
+        val kernel = DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 2))
+        kernel.prepare(depthBatchForFrame(1, frame(), identity()), view)
+        kernel.applyPrepared()
+
+        val emitted = kernel.prepare(depthBatchForFrame(2, frame(), identity()), view)
+            as DepthEvidenceResult.Accepted
+        val relocate = emitted.changes.single() as DepthEvidenceChange.Relocate
+        assertEquals(canonical.id, relocate.sourceId)
+        assertEquals(addressed, relocate.target.voxel)
+        assertEquals(canonical.id, view.findSurfaceById(relocate.sourceId)?.id)
+    }
+
+    @Test
+    fun `implicit relations retain unsigned source extremes in canonical order`() {
+        val target = Voxel(0, 0, -10)
+        val maximum = surface(0xffff_ffffL, Voxel(2, 0, -10))
+        val minimum = surface(1, Voxel(-2, 0, -10))
+        val kernel = DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 2))
+        kernel.prepare(
+            depthBatchForFrame(1, frame(), identity()),
+            FakeCanonicalView(surfaces = mapOf(target to maximum)),
+        )
+        kernel.applyPrepared()
+        val view = FakeCanonicalView(
+            surfaces = mapOf(target to minimum),
+            idLookup = mapOf(minimum.id to minimum, maximum.id to maximum),
+        )
+
+        val result = kernel.prepare(depthBatchForFrame(2, frame(), identity()), view)
+            as DepthEvidenceResult.Accepted
+        val merge = result.changes.single() as DepthEvidenceChange.Merge
+        assertEquals(listOf(minimum.id, maximum.id), merge.sourceIds)
+        assertEquals(target, merge.target.voxel)
+    }
+
+    @Test
     fun `rotated group emits the locked target and group-space normal`() {
         val kernel = DepthEvidenceKernel()
         val view = FakeCanonicalView()
@@ -892,7 +957,7 @@ class DepthEvidenceKernelTest {
         }
 
         assertEquals(
-            DepthEvidenceResourceReceipt(2, 64, 0, 0, 2, 2_160, false, 3_842_320, 3_844_480),
+            DepthEvidenceResourceReceipt(2, 64, 0, 0, 2, 2_160, false, 2_546_760, 2_548_920),
             kernel.resourceReceipt(),
         )
     }
