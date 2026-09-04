@@ -125,7 +125,7 @@ internal class DepthEvidenceKernel(
         if (staged is Staged.Refused) return refused(staged.reason)
 
         val accepted = staged as Staged.Accepted
-        pending = Pending(accepted.result, stageCount, accepted.frame)
+        pending = Pending(accepted.result.receipt, stageCount, accepted.frame)
         return accepted.result
     }
 
@@ -142,10 +142,10 @@ internal class DepthEvidenceKernel(
             }
             writeStage(resident, index)
         }
-        lastSequence = staged.result.receipt.sequence
-        lastTimestampNs = staged.result.receipt.sourceTimestampNs
+        lastSequence = staged.receipt.sequence
+        lastTimestampNs = staged.receipt.sourceTimestampNs
         activeFrame = staged.frame
-        lastReceipt = staged.result.receipt
+        lastReceipt = staged.receipt
         pending = null
         resetStage()
         return DepthEvidenceApplyResult.Applied(lastReceipt)
@@ -1128,7 +1128,7 @@ internal class DepthEvidenceKernel(
             (if (published) PUBLISHED_FLAG else 0)).toByte()
 
     private data class Pending(
-        val result: DepthEvidenceResult.Accepted,
+        val receipt: DepthEvidenceReceipt,
         val stageCount: Int,
         val frame: VisibilityGroupFrame,
     )

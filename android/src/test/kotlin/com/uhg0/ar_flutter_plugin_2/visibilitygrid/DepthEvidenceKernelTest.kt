@@ -415,23 +415,203 @@ class DepthEvidenceKernelTest {
     }
 
     @Test
-    fun `thin and double wall fixture cannot be carved through opposed endpoints`() {
-        val thin = Voxel(0, 0, -9)
-        val double = Voxel(0, 0, -12)
-        val view = FakeCanonicalView(
-            mapOf(thin to surface(1, thin), double to surface(2, double)),
-            listOf(thin, double),
+    fun `five voxel corridor reduction removes the literal phantom span`() {
+        val phantom = listOf(
+            Voxel(0, 0, -6), Voxel(0, 0, -5), Voxel(0, 0, -4),
+            Voxel(0, 0, -3), Voxel(0, 0, -2),
         )
+        val sources = phantom.mapIndexed { index, voxel -> voxel to surface(101L + index, voxel) }.toMap()
         val kernel = DepthEvidenceKernel()
+        val view = FakeCanonicalView(surfaces = sources, rayCells = phantom)
+
+        phantom.forEachIndexed { index, voxel ->
+            repeat(4) { observation ->
+                val result = kernel.prepare(
+                    depthBatchForDepth(
+                        timestamp = 1L + index * 4 + observation,
+                        groupFrame = frame(),
+                        groupFromCamera = identity(),
+                        depthMillimeters = -voxel.z * 100,
+                    ),
+                    view,
+                ) as DepthEvidenceResult.Accepted
+                assertTrue(result.changes.none { it is DepthEvidenceChange.Remove })
+                kernel.applyPrepared()
+            }
+        }
+
+        val removedIds = mutableSetOf<SurfaceId>()
+        phantom.forEachIndexed { index, voxel ->
+            val targetZ = (voxel.z + 0.5) * 0.1
+            val fraction = (0.05 - targetZ) / 1.0
+            val endpointX = 0.55 + (0.05 - 0.55) / fraction
+            repeat(8) { observation ->
+                val cameraX = if (observation < 4) 0.55 else 0.05
+                val result = kernel.prepare(
+                    depthBatchAtFrame(
+                        timestamp = 100L + index * 8 + observation,
+                        groupFrame = frame(),
+                        cameraX = cameraX,
+                        endpointX = if (cameraX == 0.05) 0.05 else endpointX,
+                    ),
+                    view,
+                ) as DepthEvidenceResult.Accepted
+                removedIds += result.changes.filterIsInstance<DepthEvidenceChange.Remove>()
+                    .map { it.sourceId }
+                kernel.applyPrepared()
+            }
+        }
+
+        assertEquals(
+            setOf(SurfaceId(101), SurfaceId(102), SurfaceId(103), SurfaceId(104), SurfaceId(105)),
+            removedIds,
+        )
+        assertTrue(kernel.resourceReceipt().residentEvidenceRows >= phantom.size)
+    }
+
+    @Test
+    fun `viable capacity carves a stale row while preserving the bounded budget`() {
+        val stale = Voxel(0, 0, -3)
+        val staleSurface = surface(81, stale)
+        val view = FakeCanonicalView(surfaces = mapOf(stale to staleSurface))
+        val groupFrame = frame(voxelSizeMicrometres = 200_000)
+        val kernel = DepthEvidenceKernel(DepthEvidenceConfiguration(surfaceCapacity = 2))
+
         repeat(4) { index ->
-            val result = kernel.prepare(
-                depthBatchForFrame(index + 1L, frame(), translation(0.05, 0.05, 0.05)), view,
+            kernel.prepare(
+                depthBatchForDepth(1L + index, groupFrame, identity(), 500),
+                view,
             ) as DepthEvidenceResult.Accepted
-            assertEquals(0, result.receipt.independentDirectionVotes)
-            assertTrue(result.changes.none { it is DepthEvidenceChange.Remove })
             kernel.applyPrepared()
         }
-        assertEquals(3, kernel.resourceReceipt().residentEvidenceRows)
+        repeat(4) { index ->
+            kernel.prepare(
+                depthBatchForDepth(10L + index, groupFrame, identity(), 1_000),
+                view,
+            ) as DepthEvidenceResult.Accepted
+            kernel.applyPrepared()
+        }
+
+        val carvingView = FakeCanonicalView(
+            surfaces = mapOf(stale to staleSurface),
+            rayCells = listOf(stale),
+        )
+        var removed = false
+        repeat(8) { index ->
+            val result = kernel.prepare(
+                depthBatchAtFrame(
+                    timestamp = 20L + index,
+                    groupFrame = groupFrame,
+                    cameraX = if (index < 4) 0.65 else 0.05,
+                    endpointX = if (index < 4) 0.0 else 0.05,
+                    depthMillimeters = 1_000,
+                ),
+                carvingView,
+            ) as DepthEvidenceResult.Accepted
+            removed = removed || result.changes.any {
+                it is DepthEvidenceChange.Remove && it.sourceId == SurfaceId(81)
+            }
+            assertEquals(0, result.receipt.capacityRefusals)
+            kernel.applyPrepared()
+        }
+
+        assertTrue(removed)
+        assertEquals(2, kernel.resourceReceipt().residentEvidenceRows)
+        assertEquals(2, kernel.resourceReceipt().evidenceRowCapacity)
+        assertEquals(64, kernel.resourceReceipt().residentBytes)
+    }
+
+    @Test
+    fun `full sample budget remains bounded and duplicate rows remain one observation`() {
+        val configuration = DepthEvidenceConfiguration()
+        val kernel = DepthEvidenceKernel(configuration)
+        val samples = List(V2_DEPTH_SAMPLE_CAPACITY) { sample() }
+        val result = kernel.prepare(
+            depthBatchForSamples(
+                1L,
+                frame(),
+                identity(),
+                VisibilityCameraIntrinsics(1, 1, 1.0, 1.0, 0.0, 0.0),
+                samples,
+            ),
+            FakeCanonicalView(),
+        ) as DepthEvidenceResult.Accepted
+
+        assertEquals(V2_DEPTH_SAMPLE_CAPACITY, result.receipt.acceptedSamples)
+        assertEquals(1, result.receipt.touchedEvidenceRows)
+        assertEquals(0, result.receipt.createCount)
+        assertEquals(0, result.changes.size)
+        assertTrue(kernel.resourceReceipt().fixedPrimitiveBytes > 32)
+        assertEquals(result.receipt.acceptedSamples + 1, result.work.virtualWorkUnits)
+        kernel.discardPrepared()
+    }
+
+    @Test
+    fun `hole and low confidence samples remain conservative at the new seam`() {
+        val hole = Voxel(2, 0, -5)
+        val view = FakeCanonicalView(
+            surfaces = mapOf(hole to surface(91, hole)),
+            rayCells = listOf(hole),
+        )
+        val result = DepthEvidenceKernel().prepare(
+            depthBatchForSamples(
+                1L,
+                frame(),
+                identity(),
+                VisibilityCameraIntrinsics(1, 1, 1.0, 1.0, 0.0, 0.0),
+                listOf(
+                    VisibilityDepthSample(0, 0, 1_000, 255),
+                    VisibilityDepthSample(0, 0, 500, 127),
+                ),
+            ),
+            view,
+        ) as DepthEvidenceResult.Accepted
+
+        assertEquals(1, result.receipt.acceptedSamples)
+        assertEquals(1, result.receipt.rejectedSamples)
+        assertEquals(0, result.receipt.independentDirectionVotes)
+        assertTrue(result.changes.isEmpty())
+        assertEquals(listOf(Voxel(0, 0, -10)), view.visitedEndpoints)
+    }
+
+    @Test
+    fun `opposing supported thin and double walls survive the carve threshold`() {
+        val thin = Voxel(0, 0, -9)
+        val double = Voxel(0, 0, -12)
+        val kernel = DepthEvidenceKernel()
+        val intrinsics = VisibilityCameraIntrinsics(1, 1, 1.0, 1.0, 0.0, 0.0)
+        fun supportedWall(
+            source: DepthCanonicalSurface,
+            frontDepth: Int,
+            opposingDepth: Int,
+        ) {
+            val view = FakeCanonicalView(
+                surfaces = mapOf(source.voxel to source),
+                rayCells = listOf(source.voxel),
+            )
+            repeat(8) { index ->
+                val opposing = index % 2 == 1
+                val result = kernel.prepare(
+                    depthBatchForSamples(
+                        timestamp = source.id.value * 10 + index,
+                        groupFrame = frame(),
+                        groupFromCamera = if (opposing) opposingTransform(-1.8) else translation(0.0, 0.05, 0.05),
+                        intrinsics = intrinsics,
+                        samples = listOf(
+                            VisibilityDepthSample(0, 0, if (opposing) opposingDepth else frontDepth, 255),
+                            VisibilityDepthSample(0, 0, 1_600, 255),
+                        ),
+                    ),
+                    view,
+                ) as DepthEvidenceResult.Accepted
+                assertTrue("source=${source.id} index=$index receipt=${result.receipt}", result.receipt.conflictsRetained >= 1)
+                assertTrue(result.changes.none { it is DepthEvidenceChange.Remove })
+                kernel.applyPrepared()
+            }
+        }
+        supportedWall(surface(1, thin), frontDepth = 900, opposingDepth = 900)
+        supportedWall(surface(2, double), frontDepth = 1_200, opposingDepth = 650)
+        assertTrue(kernel.resourceReceipt().residentEvidenceRows >= 2)
     }
 
     @Test
@@ -503,17 +683,40 @@ class DepthEvidenceKernelTest {
     )
 
     private fun depthBatch(timestamp: Long, cameraX: Double, endpointX: Double, depthMillimeters: Int = 1_000) =
-        DepthEvidenceBatch(
+        depthBatchAtFrame(timestamp, frame(), cameraX, endpointX, depthMillimeters)
+
+    private fun depthBatchAtFrame(
+        timestamp: Long,
+        groupFrame: VisibilityGroupFrame,
+        cameraX: Double,
+        endpointX: Double,
+        depthMillimeters: Int = 1_000,
+    ) = DepthEvidenceBatch(
             sequence = timestamp,
             sourceTimestampNs = timestamp,
-            groupFrame = frame(),
+            groupFrame = groupFrame,
             groupFromCameraGl = translation(cameraX, 0.05, 0.05).toList(),
             intrinsics = VisibilityCameraIntrinsics(
-                1, 1, 1.0, 1.0, (cameraX - endpointX) / 1.0, 0.0,
+                8, 1, 1.0, 1.0, (cameraX - endpointX) / 1.0, 0.0,
             ),
             samples = listOf(VisibilityDepthSample(0, 0, depthMillimeters, 255)),
             sourceRejectedSamples = 0,
         )
+
+    private fun depthBatchForDepth(
+        timestamp: Long,
+        groupFrame: VisibilityGroupFrame,
+        groupFromCamera: DoubleArray,
+        depthMillimeters: Int,
+    ) = DepthEvidenceBatch(
+        sequence = timestamp,
+        sourceTimestampNs = timestamp,
+        groupFrame = groupFrame,
+        groupFromCameraGl = groupFromCamera.toList(),
+        intrinsics = VisibilityCameraIntrinsics(1, 1, 1.0, 1.0, 0.0, 0.0),
+        samples = listOf(VisibilityDepthSample(0, 0, depthMillimeters, 255)),
+        sourceRejectedSamples = 0,
+    )
 
     private fun sample() = VisibilityDepthSample(0, 0, 1_000, 255)
 
@@ -560,6 +763,11 @@ class DepthEvidenceKernelTest {
         0.0, 0.0, -1.0, 0.0,
         0.0, 0.0, 0.0, 1.0,
     )
+
+    private fun opposingTransform(cameraZ: Double) = rotationY180().also {
+        it[13] = 0.05
+        it[14] = cameraZ
+    }
 
     private fun kernelForSafety() = DepthEvidenceKernel()
 

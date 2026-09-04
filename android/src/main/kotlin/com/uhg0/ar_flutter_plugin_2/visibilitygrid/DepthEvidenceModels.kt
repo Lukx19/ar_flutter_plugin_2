@@ -96,9 +96,7 @@ internal data class DepthRayVisitResult(
     val visitedCells: Int,
     val truncated: Boolean = false,
     val arithmeticOverflow: Boolean = false,
-) {
-    val visitCount: Int get() = visitedCells
-}
+)
 
 internal data class DepthCanonicalSurface(
     val id: SurfaceId,
@@ -164,12 +162,7 @@ internal data class DepthEvidenceReceipt(
     val preparedResidentBytes: Int = 0,
     val p50VirtualWorkUnits: Int = 0,
     val p95VirtualWorkUnits: Int = 0,
-) {
-    val acceptedPixelCount: Int get() = acceptedSamples
-    val rejectedPixelCount: Int get() = rejectedSamples
-    val rayVisitCount: Int get() = rayVisits
-    val touchedRows: Int get() = touchedEvidenceRows
-}
+)
 
 internal data class DepthEvidenceWorkReceipt(
     val distinctTouchedVoxelCount: Int,
@@ -177,9 +170,7 @@ internal data class DepthEvidenceWorkReceipt(
     val rayVisits: Int,
     val independentDirectionVotes: Int,
     val virtualWorkUnits: Int,
-) {
-    val touchedEvidenceRows: Int get() = distinctTouchedVoxelCount
-}
+)
 
 internal data class DepthEvidenceResourceReceipt(
     val residentEvidenceRows: Int,
@@ -189,9 +180,7 @@ internal data class DepthEvidenceResourceReceipt(
     val evidenceRowCapacity: Int,
     val fixedPrimitiveBytes: Int,
     val closed: Boolean,
-) {
-    val rowCount: Int get() = residentEvidenceRows
-}
+)
 
 internal sealed interface DepthEvidenceResult {
     data class Accepted(
