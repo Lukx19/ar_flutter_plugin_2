@@ -140,7 +140,7 @@ class DepthEvidenceKernelTest {
 
         repeat(3) { index ->
             assertEquals(
-                expectedAccepted(index + 1L, rayVisits = 11, virtualWork = 13),
+                expectedAccepted(index + 1L, rayVisits = 11, virtualWork = 13, relationCount = 1),
                 kernel.prepare(depthBatchForFrame(index + 1L, frame(), identity()), view),
             )
             kernel.applyPrepared()
@@ -157,6 +157,7 @@ class DepthEvidenceKernelTest {
                 relocateCount = 1,
                 rayVisits = 11,
                 virtualWork = 13,
+                relationCount = 1,
             ),
             result,
         )
@@ -239,6 +240,7 @@ class DepthEvidenceKernelTest {
                 touchedRows = 2,
                 splitCount = 1,
                 virtualWork = 46,
+                relationCount = 2,
             ),
             result,
         )
@@ -262,6 +264,7 @@ class DepthEvidenceKernelTest {
                 DepthEvidenceRefusal.SURFACE_CAPACITY,
                 expectedAccepted(
                     3, acceptedSamples = 2, rayVisits = 42, touchedRows = 2, virtualWork = 46,
+                    relationCount = 2,
                 ).receipt.copy(capacityRefusals = 1),
             ),
             fullKernel.prepare(depthBatchForSamples(4, frame(), identity(), intrinsics, samples), fullView),
@@ -310,6 +313,7 @@ class DepthEvidenceKernelTest {
                 touchedRows = 2,
                 replaceCount = 1,
                 virtualWork = 46,
+                relationCount = 4,
             ),
             result,
         )
@@ -384,6 +388,7 @@ class DepthEvidenceKernelTest {
                     rayVisits = 56,
                     touchedRows = 5,
                     virtualWork = 63,
+                    relationCount = 2,
                 ).receipt,
             ),
             candidate,
@@ -528,6 +533,7 @@ class DepthEvidenceKernelTest {
                     directionVotes = if (index == 0) 1 else 0,
                     createCount = if (index == 3) 1 else 0,
                     virtualWork = 15,
+                    relationCount = 2,
                 ),
                 result,
             )
@@ -554,6 +560,7 @@ class DepthEvidenceKernelTest {
                     createCount = if (index == 3) 1 else 0,
                     removeCount = if (index == 3) 1 else 0,
                     virtualWork = 34,
+                    relationCount = 1,
                 ),
                 result,
             )
@@ -564,7 +571,7 @@ class DepthEvidenceKernelTest {
             depthBatch(30, cameraX = 0.55, endpointX = -0.45),
             view,
         ) as DepthEvidenceResult.Accepted
-        assertEquals(expectedAccepted(30, rayVisits = 31, touchedRows = 2, virtualWork = 34), last)
+        assertEquals(expectedAccepted(30, rayVisits = 31, touchedRows = 2, virtualWork = 34, relationCount = 1), last)
     }
 
     @Test
@@ -577,7 +584,7 @@ class DepthEvidenceKernelTest {
         val result = kernel.prepare(depthBatch(1, 0.05, 0.05), view) as DepthEvidenceResult.Accepted
 
         assertEquals(
-            expectedAccepted(1, rayVisits = 11, touchedRows = 2, directionVotes = 1, virtualWork = 14),
+            expectedAccepted(1, rayVisits = 11, touchedRows = 2, directionVotes = 1, virtualWork = 14, relationCount = 1),
             result,
         )
     }
@@ -605,6 +612,7 @@ class DepthEvidenceKernelTest {
                     directionVotes = if (index == 0) 1 else 0,
                     createCount = if (index == 3) 1 else 0,
                     virtualWork = 14,
+                    relationCount = 1,
                 ),
                 result,
             )
@@ -628,6 +636,7 @@ class DepthEvidenceKernelTest {
                     createCount = if (index == 3) 1 else 0,
                     removeCount = if (index == 3) 1 else 0,
                     virtualWork = 34,
+                    relationCount = 1,
                 ),
                 result,
             )
@@ -644,6 +653,7 @@ class DepthEvidenceKernelTest {
                     rayVisits = 6,
                     conflictsRetained = 1,
                     virtualWork = 8,
+                    relationCount = 1,
                 ),
                 result,
             )
@@ -661,13 +671,14 @@ class DepthEvidenceKernelTest {
                 refineCount = 1,
                 conflictsRetained = 1,
                 virtualWork = 8,
+                relationCount = 1,
             ),
             restored,
         )
         kernel.applyPrepared()
         val next = kernel.prepare(depthBatch(41, 0.05, 0.05, depthMillimeters = 500), view)
             as DepthEvidenceResult.Accepted
-        assertEquals(expectedAccepted(41, rayVisits = 6, virtualWork = 8), next)
+        assertEquals(expectedAccepted(41, rayVisits = 6, virtualWork = 8, relationCount = 1), next)
     }
 
     @Test
@@ -680,7 +691,7 @@ class DepthEvidenceKernelTest {
             view,
         ) as DepthEvidenceResult.Accepted
 
-        assertEquals(expectedAccepted(1, rayVisits = 4, touchedRows = 2, virtualWork = 7), result)
+        assertEquals(expectedAccepted(1, rayVisits = 4, touchedRows = 2, virtualWork = 7, relationCount = 1), result)
     }
 
     @Test
@@ -710,7 +721,7 @@ class DepthEvidenceKernelTest {
         ) as DepthEvidenceResult.Accepted
 
         assertEquals(
-            expectedAccepted(1, rayVisits = 11, touchedRows = 3, directionVotes = 1, virtualWork = 15),
+            expectedAccepted(1, rayVisits = 11, touchedRows = 3, directionVotes = 1, virtualWork = 15, relationCount = 2),
             result,
         )
     }
@@ -786,7 +797,7 @@ class DepthEvidenceKernelTest {
             ),
             emittedChanges,
         )
-        assertEquals(expectedAccepted(139, rayVisits = 11, touchedRows = 6, virtualWork = 18), lastResult)
+        assertEquals(expectedAccepted(139, rayVisits = 11, touchedRows = 6, virtualWork = 18, relationCount = 5), lastResult)
         assertEquals(11, kernel.resourceReceipt().residentEvidenceRows)
     }
 
@@ -812,6 +823,7 @@ class DepthEvidenceKernelTest {
                     refineCount = if (index == 3) 1 else 0,
                     rayVisits = 4,
                     virtualWork = 6,
+                    relationCount = 1,
                 ),
                 result,
             )
@@ -833,6 +845,7 @@ class DepthEvidenceKernelTest {
                     touchedRows = 2,
                     directionVotes = if (index == 0) 1 else 0,
                     virtualWork = 9,
+                    relationCount = 1,
                 ),
                 result,
             )
@@ -862,6 +875,7 @@ class DepthEvidenceKernelTest {
                     directionVotes = if (index == 0) 1 else 0,
                     removeCount = if (index == 3) 1 else 0,
                     virtualWork = if (index < 4) 10 else 9,
+                    relationCount = 1,
                 ),
                 result,
             )
@@ -869,7 +883,7 @@ class DepthEvidenceKernelTest {
         }
 
         assertEquals(
-            DepthEvidenceResourceReceipt(2, 64, 0, 0, 2, 2_088, false, 3_842_320, 3_844_408),
+            DepthEvidenceResourceReceipt(2, 64, 0, 0, 2, 2_160, false, 3_842_320, 3_844_480),
             kernel.resourceReceipt(),
         )
     }
@@ -899,7 +913,7 @@ class DepthEvidenceKernelTest {
             ),
             result,
         )
-        assertEquals(11_871_904, kernel.resourceReceipt().fixedPrimitiveBytes)
+        assertEquals(12_676_816, kernel.resourceReceipt().fixedPrimitiveBytes)
         kernel.discardPrepared()
     }
 
@@ -975,6 +989,7 @@ class DepthEvidenceKernelTest {
                         virtualWork = if (source.id == SurfaceId(1)) {
                             if (index == 0) 31 else 32
                         } else if (index == 0) 34 else if (index % 2 == 0) 35 else 29,
+                        relationCount = 1,
                     ),
                     result,
                 )
@@ -1133,8 +1148,40 @@ class DepthEvidenceKernelTest {
         capacityRefusals: Int = 0,
         overflowCount: Int = 0,
         virtualWork: Int = acceptedSamples + rayVisits + touchedRows,
+        relationCount: Int = changes.sumOf { change ->
+            when (change) {
+                is DepthEvidenceChange.Create -> 0
+                is DepthEvidenceChange.Refine, is DepthEvidenceChange.Relocate,
+                is DepthEvidenceChange.Split, is DepthEvidenceChange.Remove -> 1
+                is DepthEvidenceChange.Merge -> change.sourceIds.size
+                is DepthEvidenceChange.Replace -> change.sourceIds.size
+            }
+        },
     ): DepthEvidenceResult.Accepted {
-        val accountedWork = virtualWork + touchedRows * 24
+        val positiveTargets = changes.sumOf { change ->
+            when (change) {
+                is DepthEvidenceChange.Create, is DepthEvidenceChange.Refine,
+                is DepthEvidenceChange.Relocate, is DepthEvidenceChange.Merge -> 1
+                is DepthEvidenceChange.Split -> change.targets.size
+                is DepthEvidenceChange.Replace -> change.targets.size
+                is DepthEvidenceChange.Remove -> 0
+            }
+        }
+        val positiveSources = changes.flatMap { change ->
+            when (change) {
+                is DepthEvidenceChange.Refine -> listOf(change.sourceId)
+                is DepthEvidenceChange.Relocate -> listOf(change.sourceId)
+                is DepthEvidenceChange.Merge -> change.sourceIds
+                is DepthEvidenceChange.Split -> listOf(change.sourceId)
+                is DepthEvidenceChange.Replace -> change.sourceIds
+                is DepthEvidenceChange.Create, is DepthEvidenceChange.Remove -> emptyList()
+            }
+        }.distinct().size
+        val removals = changes.count { it is DepthEvidenceChange.Remove }
+        val planningAndValidationWork =
+            3 * touchedRows + 11 * relationCount + 10 * positiveTargets +
+                18 * positiveSources + 2 * changes.size + 9 * removals
+        val accountedWork = virtualWork + touchedRows * 24 + planningAndValidationWork
         return DepthEvidenceResult.Accepted(
         expectedGeometryRevision = 0,
         expectedLineageRevision = 0,

@@ -193,7 +193,7 @@ class DepthEvidencePropertyTest {
     fun `resource receipt reports fixed primitive ownership and staged row bytes`() {
         val kernel = DepthEvidenceKernel(DepthEvidenceConfiguration(surfaceCapacity = 1))
         val before = kernel.resourceReceipt()
-        assertEquals(2_024, before.fixedPrimitiveBytes)
+        assertEquals(2_096, before.fixedPrimitiveBytes)
 
         val accepted = kernel.prepare(batch(1), PropertyView()) as DepthEvidenceResult.Accepted
         val staged = kernel.resourceReceipt()
@@ -222,10 +222,10 @@ class DepthEvidencePropertyTest {
                 preparedEvidenceRows = 0,
                 preparedResidentBytes = 0,
                 evidenceRowCapacity = 100_000,
-                fixedPrimitiveBytes = 11_871_904,
+                fixedPrimitiveBytes = 12_676_816,
                 closed = false,
                 maximumAcceptedOutputReserveBytes = 3_842_320,
-                modeledMaximumSemanticStateBytes = 15_714_224,
+                modeledMaximumSemanticStateBytes = 16_519_136,
             ),
             receipt,
         )
@@ -305,17 +305,106 @@ class DepthEvidencePropertyTest {
                 touchedEvidenceRows = capacity,
                 createCount = capacity,
                 preparedResidentBytes = capacity * 32,
-                p50VirtualWorkUnits = 78_272,
-                p95VirtualWorkUnits = 78_272,
+                p50VirtualWorkUnits = 101_312,
+                p95VirtualWorkUnits = 101_312,
             ),
             result.receipt,
         )
         assertEquals(
-            DepthEvidenceWorkReceipt(capacity, capacity, 38_336, 0, 78_272),
+            DepthEvidenceWorkReceipt(capacity, capacity, 38_336, 0, 101_312),
             result.work,
         )
         assertEquals(3_842_320, kernel.resourceReceipt().maximumAcceptedOutputReserveBytes)
-        assertEquals(15_714_224, kernel.resourceReceipt().modeledMaximumSemanticStateBytes)
+        assertEquals(16_519_136, kernel.resourceReceipt().modeledMaximumSemanticStateBytes)
+    }
+
+    @Test
+    fun `maximum ray packet plans every interior removal with linear work`() {
+        val voxelSizeMillimetres = 0.122
+        val cameraZ = 3_997.5
+        val depthMillimetres = 7_995
+        val endpointX = 0.3
+        val frame = VisibilityGroupFrame.copyOf(
+            identity().toDoubleArray(),
+            identity().toDoubleArray(),
+            voxelSizeMicrometres = 122,
+            modelCapacity = 100_000,
+        )
+        val forwardVoxels = referenceUntiedRay(
+            DepthPointMm(0.0, 0.0, cameraZ),
+            DepthPointMm(endpointX, 0.0, -cameraZ),
+            voxelSizeMillimetres,
+        )
+        assertEquals(65_536, forwardVoxels.size)
+        val surfaces = forwardVoxels.associateWith(::maximumRaySurface)
+        val view = MaximumRayView(surfaces)
+        val kernel = DepthEvidenceKernel(
+            DepthEvidenceConfiguration(
+                safetyBandMillimetres = 0,
+                freeEvidenceToCarve = 2,
+                freeEvidenceMargin = 2,
+                separatedDirectionBinsRequired = 2,
+            ),
+        )
+        val intrinsics = VisibilityCameraIntrinsics(2, 1, 26_650.0, 1.0, 0.0, 0.0)
+        val sample = listOf(VisibilityDepthSample(1, 0, depthMillimetres, 255))
+        val forward = DepthEvidenceBatch(
+            1, 1, frame, translated(0.0, 0.0, cameraZ / 1_000.0), intrinsics, sample, 0,
+        )
+        val reverse = DepthEvidenceBatch(
+            2, 2, frame, reversed(endpointX / 1_000.0, -cameraZ / 1_000.0), intrinsics, sample, 0,
+        )
+
+        val first = kernel.prepare(forward, view) as DepthEvidenceResult.Accepted
+        assertEquals(emptyList<DepthEvidenceChange>(), first.changes)
+        assertEquals(
+            DepthEvidenceReceipt(
+                sequence = 1,
+                sourceTimestampNs = 1,
+                acceptedSamples = 1,
+                rayVisits = 65_536,
+                touchedEvidenceRows = 65_536,
+                independentDirectionVotes = 65_534,
+                preparedResidentBytes = 65_536 * 32,
+                p50VirtualWorkUnits = 2_621_441,
+                p95VirtualWorkUnits = 2_621_441,
+            ),
+            first.receipt,
+        )
+        kernel.applyPrepared()
+
+        val second = kernel.prepare(reverse, view) as DepthEvidenceResult.Accepted
+        val expectedSourceIds = forwardVoxels
+            .subList(1, forwardVoxels.lastIndex)
+            .sortedWith(compareBy<Voxel>({ it.x }, { it.y }, { it.z }))
+            .map { maximumRaySurface(it).id }
+        assertEquals(65_534, expectedSourceIds.size)
+        assertEquals(
+            expectedSourceIds,
+            second.changes.map { (it as DepthEvidenceChange.Remove).sourceId },
+        )
+        assertEquals(
+            DepthEvidenceReceipt(
+                sequence = 2,
+                sourceTimestampNs = 2,
+                acceptedSamples = 1,
+                rayVisits = 65_536,
+                touchedEvidenceRows = 65_536,
+                independentDirectionVotes = 65_534,
+                removeCount = 65_534,
+                preparedResidentBytes = 65_536 * 32,
+                p50VirtualWorkUnits = 3_342_315,
+                p95VirtualWorkUnits = 3_342_315,
+            ),
+            second.receipt,
+        )
+        assertEquals(
+            DepthEvidenceWorkReceipt(65_536, 65_534, 65_536, 65_534, 3_342_315),
+            second.work,
+        )
+        assertTrue(second.work.virtualWorkUnits < 4_000_000)
+        assertEquals(3_842_320, kernel.resourceReceipt().maximumAcceptedOutputReserveBytes)
+        assertEquals(16_519_136, kernel.resourceReceipt().modeledMaximumSemanticStateBytes)
     }
 
     @Test
@@ -417,7 +506,7 @@ class DepthEvidencePropertyTest {
         capacityRefusals: Int = 0,
         virtualWork: Int = acceptedSamples + rayVisits + touchedRows,
     ): DepthEvidenceResult.Accepted {
-        val accountedWork = virtualWork + touchedRows * 24
+        val accountedWork = virtualWork + touchedRows * 27
         return DepthEvidenceResult.Accepted(
         expectedGeometryRevision = 0,
         expectedLineageRevision = 0,
@@ -447,6 +536,50 @@ class DepthEvidencePropertyTest {
     private fun identity() = identityVisibilityGridTransform().toList()
     private fun intrinsics() = VisibilityCameraIntrinsics(4, 1, 2.0, 2.0, 1.5, 0.0)
 
+    private fun translated(x: Double, y: Double, z: Double) = identity().toMutableList().also {
+        it[12] = x
+        it[13] = y
+        it[14] = z
+    }
+
+    private fun reversed(x: Double, z: Double) = listOf(
+        -1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, -1.0, 0.0,
+        x, 0.0, z, 1.0,
+    )
+
+    private fun referenceUntiedRay(start: DepthPointMm, end: DepthPointMm, size: Double): List<Voxel> {
+        var x = Math.floor(start.x / size).toInt()
+        var z = Math.floor(start.z / size).toInt()
+        val endX = Math.floor(end.x / size).toInt()
+        val endZ = Math.floor(end.z / size).toInt()
+        val deltaX = end.x - start.x
+        val deltaZ = end.z - start.z
+        var nextX = ((x + 1) * size - start.x) / deltaX
+        var nextZ = (z * size - start.z) / deltaZ
+        val stepX = size / deltaX
+        val stepZ = -size / deltaZ
+        return buildList(65_536) {
+            add(Voxel(x, 0, z))
+            while (x != endX || z != endZ) {
+                if (x != endX && (z == endZ || nextX < nextZ)) {
+                    x++
+                    nextX += stepX
+                } else {
+                    z--
+                    nextZ += stepZ
+                }
+                add(Voxel(x, 0, z))
+            }
+        }
+    }
+
+    private fun maximumRaySurface(voxel: Voxel): DepthCanonicalSurface {
+        val id = (voxel.x + 1L) * 100_000L + voxel.z + 40_000L
+        return DepthCanonicalSurface(SurfaceId(id), voxel, 0x1010, 200, 1)
+    }
+
     private fun quantize(point: DepthPointMm): Voxel? {
         val value = Math.floor(point.x / 100.0)
         return if (value >= VOXEL_COORDINATE_MIN && value <= VOXEL_COORDINATE_MAX) {
@@ -466,5 +599,18 @@ class DepthEvidencePropertyTest {
         override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? = surface?.takeIf { it.id == id }
         override fun findSurfaceAt(voxel: Voxel): AddressedCanonicalSurface? =
             surface?.takeIf { it.voxel == voxel }?.let { AddressedCanonicalSurface(voxel, it) }
+    }
+
+    private class MaximumRayView(
+        private val surfaces: Map<Voxel, DepthCanonicalSurface>,
+    ) : BoundedCanonicalSurfaceView {
+        private val surfacesById = surfaces.values.associateBy { it.id }
+        override val geometryRevision: Long = 0
+        override val lineageRevision: Long = 0
+        override val surfaceCount: Int = surfaces.size
+
+        override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? = surfacesById[id]
+        override fun findSurfaceAt(voxel: Voxel): AddressedCanonicalSurface? =
+            surfaces[voxel]?.let { AddressedCanonicalSurface(voxel, it) }
     }
 }

@@ -67,6 +67,9 @@ internal class DepthEvidenceKernel(
     private var stageSortCounts = IntArray(RADIX_BUCKETS)
     private var stageRelationTarget = IntArray(stageCapacity)
     private var stageRelationSource = IntArray(stageCapacity)
+    private var stageRelationOrder = IntArray(stageCapacity)
+    private var stageComponentOrder = IntArray(stageCapacity)
+    private var stageComponentRank = IntArray(stageCapacity)
     private var stageComponent = IntArray(stageCapacity)
     private var stagePositive = BooleanArray(stageCapacity)
     private var stageRemoval = BooleanArray(stageCapacity)
@@ -76,6 +79,8 @@ internal class DepthEvidenceKernel(
     private var stageChangeComponent = IntArray(stageCapacity)
     private var stageCount = 0
     private var stageRelationCount = 0
+    private var stageOrderedSourceCount = 0
+    private var stageOrderedTargetCount = 0
     private var stageChangeCount = 0
 
     private var residentRows = 0
@@ -230,6 +235,9 @@ internal class DepthEvidenceKernel(
         stageSortCounts = IntArray(0)
         stageRelationTarget = IntArray(0)
         stageRelationSource = IntArray(0)
+        stageRelationOrder = IntArray(0)
+        stageComponentOrder = IntArray(0)
+        stageComponentRank = IntArray(0)
         stageComponent = IntArray(0)
         stagePositive = BooleanArray(0)
         stageRemoval = BooleanArray(0)
@@ -356,16 +364,17 @@ internal class DepthEvidenceKernel(
             if (stageHasOccupied[index] && stageFreeValue(index) > 0) conflicts = checkedAdd(conflicts, 1)
         }
         val orderingWork = sortStageOrder()
-        planChanges()
-        validatePlannedChanges()?.let { return Staged.Refused(it) }
+        val planningWork = planChanges()
+        val validation = validatePlannedChanges()
+        validation.refusal?.let { return Staged.Refused(it) }
         var newRows = 0
         for (index in 0 until stageCount) {
             if (findRow(stageX[index], stageY[index], stageZ[index]) == EMPTY_ROW) newRows++
         }
-        val projectedCanonicalSurfaces = projectedSurfaceCount(surfaces.surfaceCount)
-        if (projectedCanonicalSurfaces < 0) throw DepthLookupFailure()
+        val projection = projectedSurfaceCount(surfaces.surfaceCount)
+        if (projection.count < 0) throw DepthLookupFailure()
         if (residentRows + newRows > minOf(configuration.surfaceCapacity, batch.groupFrame.modelCapacity) ||
-            projectedCanonicalSurfaces > minOf(configuration.surfaceCapacity, batch.groupFrame.modelCapacity)
+            projection.count > minOf(configuration.surfaceCapacity, batch.groupFrame.modelCapacity)
         ) {
             return Staged.Refused(DepthEvidenceRefusal.SURFACE_CAPACITY)
         }
@@ -373,7 +382,10 @@ internal class DepthEvidenceKernel(
             (0 until stageChangeCount).map { materializeChange(it, cameraGroup, batch.groupFrame) },
         )
         val kindCounts = kindCounts(stageChangeKind, stageChangeCount)
-        val virtualWork = checkedAdd(orderingWork, checkedAdd(acceptedSamples, checkedAdd(visits, stageCount)))
+        val virtualWork = checkedAdd(
+            checkedAdd(orderingWork, checkedAdd(planningWork, checkedAdd(validation.work, projection.work))),
+            checkedAdd(acceptedSamples, checkedAdd(visits, stageCount)),
+        )
         val receipt = DepthEvidenceReceipt(
             sequence = batch.sequence,
             sourceTimestampNs = batch.sourceTimestampNs,
@@ -416,7 +428,8 @@ internal class DepthEvidenceKernel(
         )
     }
 
-    private fun planChanges() {
+    private fun planChanges(): Int {
+        var work = stageCount
         for (index in 0 until stageCount) {
             stagePositive[index] = false
             stageRemoval[index] = false
@@ -449,20 +462,60 @@ internal class DepthEvidenceKernel(
             }
         }
 
-        for (leftPosition in 0 until stageCount) {
-            val left = stageOrder[leftPosition]
-            if (!stagePositive[left]) continue
-            for (rightPosition in leftPosition + 1 until stageCount) {
-                val right = stageOrder[rightPosition]
-                if (stagePositive[right] && sharesSource(left, right)) unionComponents(left, right)
+        for (relation in 0 until stageRelationCount) stageRelationOrder[relation] = relation
+        work = checkedAdd(work, stageRelationCount)
+        work = checkedAdd(work, radixSortRelationOrderBySource(stageRelationCount))
+        var relationPosition = 0
+        while (relationPosition < stageRelationCount) {
+            val source = relationSourceValue(stageRelationOrder[relationPosition])
+            var end = relationPosition + 1
+            while (end < stageRelationCount && relationSourceValue(stageRelationOrder[end]) == source) end++
+            var firstPositive = EMPTY_ROW
+            for (position in relationPosition until end) {
+                val target = stageRelationTarget[stageRelationOrder[position]]
+                if (stagePositive[target]) {
+                    if (firstPositive == EMPTY_ROW) firstPositive = target else unionComponents(firstPositive, target)
+                }
             }
+            work = checkedAdd(work, end - relationPosition)
+            relationPosition = end
         }
-        stageChangeCount = 0
+
+        stageOrderedTargetCount = 0
         for (position in 0 until stageCount) {
             val index = stageOrder[position]
-            if (!stagePositive[index]) continue
+            stageComponentRank[index] = position
+            if (stagePositive[index]) stageComponentOrder[stageOrderedTargetCount++] = index
+        }
+        work = checkedAdd(work, stageCount)
+        work = checkedAdd(work, radixSortComponentOrderByRoot(stageOrderedTargetCount))
+
+        var sourceWrite = 0
+        relationPosition = 0
+        while (relationPosition < stageRelationCount) {
+            val source = relationSourceValue(stageRelationOrder[relationPosition])
+            var end = relationPosition + 1
+            while (end < stageRelationCount && relationSourceValue(stageRelationOrder[end]) == source) end++
+            var representative = EMPTY_ROW
+            for (position in relationPosition until end) {
+                val relation = stageRelationOrder[position]
+                if (stagePositive[stageRelationTarget[relation]]) {
+                    representative = relation
+                    break
+                }
+            }
+            if (representative != EMPTY_ROW) stageRelationOrder[sourceWrite++] = representative
+            work = checkedAdd(work, end - relationPosition)
+            relationPosition = end
+        }
+        stageOrderedSourceCount = sourceWrite
+        work = checkedAdd(work, radixSortRelationOrderByRoot(stageOrderedSourceCount))
+
+        stageChangeCount = 0
+        var targetPosition = 0
+        while (targetPosition < stageOrderedTargetCount) {
+            val index = stageComponentOrder[targetPosition]
             val root = findComponent(index)
-            if (root != index) continue
             val sourceCount = componentSourceCount(root)
             val targetCount = componentTargetCount(root)
             val kind = when {
@@ -479,11 +532,14 @@ internal class DepthEvidenceKernel(
                 else -> CHANGE_REPLACE
             }
             addPlannedChange(kind, index, root, sourceCount == 1)
+            targetPosition += targetCount
         }
+        work = checkedAdd(work, stageOrderedTargetCount)
         for (position in 0 until stageCount) {
             val index = stageOrder[position]
             if (stageRemoval[index]) addPlannedChange(CHANGE_REMOVE, index, index, false)
         }
+        return checkedAdd(work, stageCount)
     }
 
     private fun addPlannedChange(kind: Int, index: Int, component: Int, hasSingleSource: Boolean) {
@@ -518,96 +574,59 @@ internal class DepthEvidenceKernel(
         if (leftRoot < rightRoot) stageComponent[rightRoot] = leftRoot else stageComponent[leftRoot] = rightRoot
     }
 
-    private fun sharesSource(left: Int, right: Int): Boolean {
-        val leftCount = relationCount(left)
-        val rightCount = relationCount(right)
-        for (leftOrdinal in 0 until leftCount) {
-            val source = relationSourceAt(left, leftOrdinal)
-            for (rightOrdinal in 0 until rightCount) {
-                if (source == relationSourceAt(right, rightOrdinal)) return true
-            }
-        }
-        return false
-    }
-
-    private fun relationCount(index: Int): Int {
-        var count = 0
-        for (relation in 0 until stageRelationCount) {
-            if (stageRelationTarget[relation] == index) count++
-        }
-        return if (count == 0 && stageSourceIdValue(index) != 0L) 1 else count
-    }
-
-    private fun relationSourceAt(index: Int, ordinal: Int): Long {
-        var seen = 0
-        for (relation in 0 until stageRelationCount) {
-            if (stageRelationTarget[relation] == index) {
-                if (seen == ordinal) return stageRelationSource[relation].toLong() and 0xffff_ffffL
-                seen++
-            }
-        }
-        check(stageSourceIdValue(index) != 0L && ordinal == 0)
-        return stageSourceIdValue(index)
-    }
-
     private fun componentTargetCount(root: Int): Int {
-        var count = 0
-        for (position in 0 until stageCount) {
-            val index = stageOrder[position]
-            if (stagePositive[index] && findComponent(index) == root) count++
-        }
-        return count
+        val start = lowerBoundTargetRoot(root)
+        var end = start
+        while (end < stageOrderedTargetCount && targetRootAt(end) == root) end++
+        return end - start
     }
 
     private fun componentSourceCount(root: Int): Int {
-        var count = 0
-        var lowerBound = 0L
-        while (true) {
-            var next = Long.MAX_VALUE
-            for (position in 0 until stageCount) {
-                val index = stageOrder[position]
-                if (!stagePositive[index] || findComponent(index) != root) continue
-                for (ordinal in 0 until relationCount(index)) {
-                    val source = relationSourceAt(index, ordinal)
-                    if (source > lowerBound && source < next) next = source
-                }
-            }
-            if (next == Long.MAX_VALUE) return count
-            count++
-            lowerBound = next
-        }
+        val start = lowerBoundSourceRoot(root)
+        var end = start
+        while (end < stageOrderedSourceCount && sourceRootAt(end) == root) end++
+        return end - start
     }
 
     private fun sourceAtRank(root: Int, rank: Int): Long {
-        var lowerBound = 0L
-        var current = Long.MAX_VALUE
-        for (step in 0..rank) {
-            current = Long.MAX_VALUE
-            for (position in 0 until stageCount) {
-                val index = stageOrder[position]
-                if (!stagePositive[index] || findComponent(index) != root) continue
-                for (ordinal in 0 until relationCount(index)) {
-                    val source = relationSourceAt(index, ordinal)
-                    if (source > lowerBound && source < current) current = source
-                }
-            }
-            check(current != Long.MAX_VALUE)
-            lowerBound = current
-        }
-        return current
+        val position = lowerBoundSourceRoot(root) + rank
+        check(position < stageOrderedSourceCount && sourceRootAt(position) == root)
+        return relationSourceValue(stageRelationOrder[position])
     }
 
     private fun targetAtRank(root: Int, rank: Int): Int {
-        var seen = 0
-        for (position in 0 until stageCount) {
-            val index = stageOrder[position]
-            if (stagePositive[index] && findComponent(index) == root) {
-                if (seen == rank) return index
-                seen++
-            }
-        }
-        error("target rank outside component")
+        val position = lowerBoundTargetRoot(root) + rank
+        check(position < stageOrderedTargetCount && targetRootAt(position) == root)
+        return stageComponentOrder[position]
     }
+
+    private fun lowerBoundTargetRoot(root: Int): Int {
+        var low = 0
+        var high = stageOrderedTargetCount
+        while (low < high) {
+            val middle = (low + high) ushr 1
+            if (stageComponentRank[targetRootAt(middle)] < stageComponentRank[root]) low = middle + 1 else high = middle
+        }
+        return low
+    }
+
+    private fun lowerBoundSourceRoot(root: Int): Int {
+        var low = 0
+        var high = stageOrderedSourceCount
+        while (low < high) {
+            val middle = (low + high) ushr 1
+            if (stageComponentRank[sourceRootAt(middle)] < stageComponentRank[root]) low = middle + 1 else high = middle
+        }
+        return low
+    }
+
+    private fun targetRootAt(position: Int): Int = findComponent(stageComponentOrder[position])
+
+    private fun sourceRootAt(position: Int): Int =
+        findComponent(stageRelationTarget[stageRelationOrder[position]])
+
+    private fun relationSourceValue(relation: Int): Long =
+        stageRelationSource[relation].toLong() and 0xffff_ffffL
 
     private fun materializeChange(
         slot: Int,
@@ -650,7 +669,7 @@ internal class DepthEvidenceKernel(
     private fun <T> immutableCopy(values: Collection<T>): List<T> =
         Collections.unmodifiableList(ArrayList(values))
 
-    private fun projectedSurfaceCount(initialCount: Int): Int {
+    private fun projectedSurfaceCount(initialCount: Int): SurfaceProjection {
         var projected = initialCount
         for (slot in 0 until stageChangeCount) {
             val component = stageChangeComponent[slot]
@@ -665,7 +684,7 @@ internal class DepthEvidenceKernel(
             }
             projected = Math.addExact(projected, delta)
         }
-        return projected
+        return SurfaceProjection(projected, stageChangeCount)
     }
 
     private fun targetsForComponent(
@@ -682,76 +701,37 @@ internal class DepthEvidenceKernel(
         )
     }
 
-    private fun validatePlannedChanges(): DepthEvidenceRefusal? {
+    private fun validatePlannedChanges(): PlannedValidation {
+        // Each staged target has one coordinate-hash row, and each positive row
+        // appears in exactly one component order, so a linear range check proves
+        // target uniqueness without comparing planned changes pairwise.
+        for (position in 0 until stageOrderedTargetCount) {
+            val target = stageComponentOrder[position]
+            if (!voxelInRange(Voxel(stageX[target], stageY[target], stageZ[target]))) {
+                return PlannedValidation(DepthEvidenceRefusal.DUPLICATE_TARGET, position + 1)
+            }
+        }
+        var sourceConsumers = 0
+        for (position in 0 until stageOrderedSourceCount) {
+            stageSortScratch[sourceConsumers++] = stageRelationSource[stageRelationOrder[position]]
+        }
         for (slot in 0 until stageChangeCount) {
-            val kind = stageChangeKind[slot].toInt()
-            if (kind == CHANGE_CREATE || kind == CHANGE_REFINE || kind == CHANGE_RELOCATE ||
-                kind == CHANGE_MERGE || kind == CHANGE_SPLIT || kind == CHANGE_REPLACE
-            ) {
-                val targetCount = if (kind == CHANGE_SPLIT || kind == CHANGE_REPLACE) {
-                    componentTargetCount(stageChangeComponent[slot])
-                } else {
-                    1
-                }
-                for (rank in 0 until targetCount) {
-                    val targetIndex = if (kind == CHANGE_SPLIT || kind == CHANGE_REPLACE) {
-                        targetAtRank(stageChangeComponent[slot], rank)
-                    } else {
-                        stageChangeTarget[slot]
-                    }
-                    if (!voxelInRange(Voxel(stageX[targetIndex], stageY[targetIndex], stageZ[targetIndex]))) {
-                        return DepthEvidenceRefusal.DUPLICATE_TARGET
-                    }
-                    for (prior in 0 until slot) {
-                        if (plannedTargetContains(prior, Voxel(stageX[targetIndex], stageY[targetIndex], stageZ[targetIndex]))) {
-                            return DepthEvidenceRefusal.DUPLICATE_TARGET
-                        }
-                    }
-                }
-            }
-            val sourceCount = when (kind) {
-                CHANGE_MERGE, CHANGE_REPLACE -> componentSourceCount(stageChangeComponent[slot])
-                CHANGE_REFINE, CHANGE_RELOCATE, CHANGE_SPLIT, CHANGE_REMOVE -> 1
-                else -> 0
-            }
-            for (rank in 0 until sourceCount) {
-                val source = if (sourceCount == 1) stageChangeSourceValue(slot) else {
-                    sourceAtRank(stageChangeComponent[slot], rank)
-                }
-                for (prior in 0 until slot) {
-                    if (plannedSourceContains(prior, source)) return DepthEvidenceRefusal.SOURCE_OVERLAP
-                }
+            if (stageChangeKind[slot].toInt() == CHANGE_REMOVE) {
+                stageSortScratch[sourceConsumers++] = stageChangeSource[slot]
             }
         }
-        return null
-    }
-
-    private fun plannedSourceContains(slot: Int, source: Long): Boolean {
-        return when (stageChangeKind[slot].toInt()) {
-            CHANGE_MERGE, CHANGE_REPLACE -> {
-                val root = stageChangeComponent[slot]
-                (0 until componentSourceCount(root)).any { sourceAtRank(root, it) == source }
+        check(sourceConsumers <= stageCapacity)
+        // Coordinate lookup is dead after staging/planning. Reuse its larger
+        // primitive table as radix destination; resetStage restores it before
+        // any later prepare, and applyPrepared never reads it.
+        var work = checkedAdd(stageOrderedTargetCount, checkedAdd(stageOrderedSourceCount, stageChangeCount))
+        work = checkedAdd(work, radixSortUnsignedValues(stageSortScratch, stageHashRows, sourceConsumers))
+        for (position in 1 until sourceConsumers) {
+            if (stageSortScratch[position] == stageSortScratch[position - 1]) {
+                return PlannedValidation(DepthEvidenceRefusal.SOURCE_OVERLAP, checkedAdd(work, position))
             }
-            CHANGE_REFINE, CHANGE_RELOCATE, CHANGE_SPLIT, CHANGE_REMOVE -> stageChangeSourceValue(slot) == source
-            else -> false
         }
-    }
-
-    private fun plannedTargetContains(slot: Int, voxel: Voxel): Boolean {
-        return when (stageChangeKind[slot].toInt()) {
-            CHANGE_SPLIT, CHANGE_REPLACE -> {
-                val root = stageChangeComponent[slot]
-                (0 until componentTargetCount(root)).any {
-                    val target = targetAtRank(root, it)
-                    Voxel(stageX[target], stageY[target], stageZ[target]) == voxel
-                }
-            }
-            CHANGE_CREATE, CHANGE_REFINE, CHANGE_RELOCATE, CHANGE_MERGE -> {
-                val target = stageChangeTarget[slot]
-                Voxel(stageX[target], stageY[target], stageZ[target]) == voxel
-            }
-            else -> false
-        }
+        return PlannedValidation(null, checkedAdd(work, sourceConsumers))
     }
 
     private fun targetFor(
@@ -1012,7 +992,7 @@ internal class DepthEvidenceKernel(
             stagePackedNormal[index] = rowPackedNormal[resident]
             stageNormalConfidence[index] = rowNormalConfidence[resident]
             stageLineageCount[index] = rowLineageCount[resident]
-            if (stageSourceIdValue(index) != 0L) stageAddRelation(index, stageSourceIdValue(index))
+            if (stageSourceIdValue(index) != 0L) appendStageRelation(index, stageSourceIdValue(index))
         }
         var slot = stageHash(packVisibilityGridKey(voxel.x, voxel.y, voxel.z))
         while (stageHashRows[slot] != EMPTY_ROW) slot = (slot + 1) and (stageHashCapacity - 1)
@@ -1035,11 +1015,21 @@ internal class DepthEvidenceKernel(
     }
 
     private fun stageAddRelation(index: Int, sourceId: Long) {
+        val primary = stageSourceIdValue(index)
+        if (primary == sourceId && primary != 0L) return
+        if (primary == 0L) {
+            appendStageRelation(index, sourceId)
+            return
+        }
         for (relation in 0 until stageRelationCount) {
             if (stageRelationTarget[relation] == index &&
                 (stageRelationSource[relation].toLong() and 0xffff_ffffL) == sourceId
             ) return
         }
+        appendStageRelation(index, sourceId)
+    }
+
+    private fun appendStageRelation(index: Int, sourceId: Long) {
         if (stageRelationCount >= stageCapacity) throw StageCapacityFailure()
         stageRelationTarget[stageRelationCount] = index
         stageRelationSource[stageRelationCount] = sourceId.toInt()
@@ -1089,6 +1079,79 @@ internal class DepthEvidenceKernel(
         return ((coordinate xor Int.MIN_VALUE) ushr shift) and (RADIX_BUCKETS - 1)
     }
 
+    private fun radixSortRelationOrderBySource(count: Int): Int = radixSortIndices(
+        stageRelationOrder,
+        count,
+    ) { relation -> stageRelationSource[relation] }
+
+    private fun radixSortRelationOrderByRoot(count: Int): Int = radixSortIndices(
+        stageRelationOrder,
+        count,
+    ) { relation -> stageComponentRank[findComponent(stageRelationTarget[relation])] }
+
+    private fun radixSortComponentOrderByRoot(count: Int): Int = radixSortIndices(
+        stageComponentOrder,
+        count,
+    ) { index -> stageComponentRank[findComponent(index)] }
+
+    private inline fun radixSortIndices(
+        values: IntArray,
+        count: Int,
+        crossinline key: (Int) -> Int,
+    ): Int {
+        var source = values
+        var destination = stageSortScratch
+        for (shift in 0 until Int.SIZE_BITS step RADIX_BITS) {
+            java.util.Arrays.fill(stageSortCounts, 0)
+            for (position in 0 until count) {
+                stageSortCounts[(key(source[position]) ushr shift) and (RADIX_BUCKETS - 1)]++
+            }
+            var prefix = 0
+            for (bucket in stageSortCounts.indices) {
+                val bucketCount = stageSortCounts[bucket]
+                stageSortCounts[bucket] = prefix
+                prefix += bucketCount
+            }
+            for (position in 0 until count) {
+                val value = source[position]
+                val bucket = (key(value) ushr shift) and (RADIX_BUCKETS - 1)
+                destination[stageSortCounts[bucket]++] = value
+            }
+            val previousSource = source
+            source = destination
+            destination = previousSource
+        }
+        check(source === values)
+        return Math.multiplyExact(count, Int.SIZE_BYTES * 2)
+    }
+
+    private fun radixSortUnsignedValues(values: IntArray, destinationValues: IntArray, count: Int): Int {
+        var source = values
+        var destination = destinationValues
+        for (shift in 0 until Int.SIZE_BITS step RADIX_BITS) {
+            java.util.Arrays.fill(stageSortCounts, 0)
+            for (position in 0 until count) {
+                stageSortCounts[(source[position] ushr shift) and (RADIX_BUCKETS - 1)]++
+            }
+            var prefix = 0
+            for (bucket in stageSortCounts.indices) {
+                val bucketCount = stageSortCounts[bucket]
+                stageSortCounts[bucket] = prefix
+                prefix += bucketCount
+            }
+            for (position in 0 until count) {
+                val value = source[position]
+                val bucket = (value ushr shift) and (RADIX_BUCKETS - 1)
+                destination[stageSortCounts[bucket]++] = value
+            }
+            val previousSource = source
+            source = destination
+            destination = previousSource
+        }
+        check(source === values)
+        return Math.multiplyExact(count, Int.SIZE_BYTES * 2)
+    }
+
     private fun resetStage() {
         java.util.Arrays.fill(stageHashRows, EMPTY_ROW)
         java.util.Arrays.fill(stageFreeBin, NO_DIRECTION.toByte())
@@ -1097,6 +1160,8 @@ internal class DepthEvidenceKernel(
         java.util.Arrays.fill(stageRemoval, false)
         stageCount = 0
         stageRelationCount = 0
+        stageOrderedSourceCount = 0
+        stageOrderedTargetCount = 0
         stageChangeCount = 0
     }
 
@@ -1280,7 +1345,8 @@ internal class DepthEvidenceKernel(
         stageNormalConfidence, stageLineageCount, stagePublished, stageHasOccupied,
         stageOccupiedPointX, stageOccupiedPointY, stageOccupiedPointZ,
         stageFreeBin, stageOrder, stageSortScratch, stageSortCounts,
-        stageRelationTarget, stageRelationSource,
+        stageRelationTarget, stageRelationSource, stageRelationOrder, stageComponentOrder,
+        stageComponentRank,
         stageComponent, stagePositive, stageRemoval, stageChangeKind,
         stageChangeSource, stageChangeTarget, stageChangeComponent,
     )
@@ -1320,6 +1386,10 @@ internal class DepthEvidenceKernel(
         val stageCount: Int,
         val frame: VisibilityGroupFrame,
     )
+
+    private data class PlannedValidation(val refusal: DepthEvidenceRefusal?, val work: Int)
+
+    private data class SurfaceProjection(val count: Int, val work: Int)
 
     private sealed interface Staged {
         data class Accepted(val result: DepthEvidenceResult.Accepted, val stageCount: Int, val frame: VisibilityGroupFrame) : Staged
