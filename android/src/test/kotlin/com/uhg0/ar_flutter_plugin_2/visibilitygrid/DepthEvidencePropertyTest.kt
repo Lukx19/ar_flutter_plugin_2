@@ -78,7 +78,7 @@ class DepthEvidencePropertyTest {
     fun `resource receipt reports fixed primitive ownership and staged row bytes`() {
         val kernel = DepthEvidenceKernel(DepthEvidenceConfiguration(surfaceCapacity = 1))
         val before = kernel.resourceReceipt()
-        assertEquals(175, before.fixedPrimitiveBytes)
+        assertEquals(205, before.fixedPrimitiveBytes)
 
         val accepted = kernel.prepare(batch(1), PropertyView()) as DepthEvidenceResult.Accepted
         val staged = kernel.resourceReceipt()
@@ -88,6 +88,26 @@ class DepthEvidencePropertyTest {
         assertEquals(32, accepted.receipt.preparedResidentBytes)
         kernel.discardPrepared()
         assertEquals(0, kernel.resourceReceipt().preparedEvidenceRows)
+    }
+
+    @Test
+    fun `prepared bytes account for an update to an existing resident row`() {
+        val kernel = DepthEvidenceKernel(DepthEvidenceConfiguration(surfaceCapacity = 1))
+        val view = PropertyView()
+
+        kernel.prepare(batch(1), view)
+        kernel.applyPrepared()
+        val update = kernel.prepare(batch(2), view) as DepthEvidenceResult.Accepted
+        val staged = kernel.resourceReceipt()
+
+        assertEquals(1, staged.residentEvidenceRows)
+        assertEquals(32, staged.residentBytes)
+        assertEquals(1, staged.preparedEvidenceRows)
+        assertEquals(32, staged.preparedResidentBytes)
+        assertEquals(32, update.receipt.preparedResidentBytes)
+        kernel.discardPrepared()
+        assertEquals(0, kernel.resourceReceipt().preparedEvidenceRows)
+        assertEquals(1, kernel.resourceReceipt().residentEvidenceRows)
     }
 
     @Test
