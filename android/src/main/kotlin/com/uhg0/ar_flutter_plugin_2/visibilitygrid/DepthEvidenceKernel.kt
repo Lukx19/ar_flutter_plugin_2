@@ -79,6 +79,7 @@ internal class DepthEvidenceKernel(
     private var stageChangeComponent = IntArray(stageCapacity)
     private var stageCount = 0
     private var stageRelationCount = 0
+    private var stageRelationAdmissionWork = 0
     private var stageOrderedSourceCount = 0
     private var stageOrderedTargetCount = 0
     private var stageChangeCount = 0
@@ -384,7 +385,7 @@ internal class DepthEvidenceKernel(
         val kindCounts = kindCounts(stageChangeKind, stageChangeCount)
         val virtualWork = checkedAdd(
             checkedAdd(orderingWork, checkedAdd(planningWork, checkedAdd(validation.work, projection.work))),
-            checkedAdd(acceptedSamples, checkedAdd(visits, stageCount)),
+            checkedAdd(stageRelationAdmissionWork, checkedAdd(acceptedSamples, checkedAdd(visits, stageCount))),
         )
         val receipt = DepthEvidenceReceipt(
             sequence = batch.sequence,
@@ -975,6 +976,10 @@ internal class DepthEvidenceKernel(
         stagePackedNormal[index] = 0
         stageNormalConfidence[index] = 0
         stagePublished[index] = false
+        // Reuse the later planned-change source column as the row-local
+        // canonical attachment marker. Planning overwrites it only after all
+        // lookups and relation admission have completed.
+        stageChangeSource[index] = 0
         stageHasOccupied[index] = false
         stageOccupiedPointX[index] = 0.0
         stageOccupiedPointY[index] = 0.0
@@ -1015,18 +1020,18 @@ internal class DepthEvidenceKernel(
     }
 
     private fun stageAddRelation(index: Int, sourceId: Long) {
+        stageRelationAdmissionWork = checkedAdd(stageRelationAdmissionWork, 1)
         val primary = stageSourceIdValue(index)
         if (primary == sourceId && primary != 0L) return
+        val attached = stageChangeSource[index].toLong() and 0xffff_ffffL
+        if (attached == sourceId) return
+        if (attached != 0L) throw DepthLookupFailure()
         if (primary == 0L) {
             appendStageRelation(index, sourceId)
             return
         }
-        for (relation in 0 until stageRelationCount) {
-            if (stageRelationTarget[relation] == index &&
-                (stageRelationSource[relation].toLong() and 0xffff_ffffL) == sourceId
-            ) return
-        }
         appendStageRelation(index, sourceId)
+        stageChangeSource[index] = sourceId.toInt()
     }
 
     private fun appendStageRelation(index: Int, sourceId: Long) {
@@ -1160,6 +1165,7 @@ internal class DepthEvidenceKernel(
         java.util.Arrays.fill(stageRemoval, false)
         stageCount = 0
         stageRelationCount = 0
+        stageRelationAdmissionWork = 0
         stageOrderedSourceCount = 0
         stageOrderedTargetCount = 0
         stageChangeCount = 0

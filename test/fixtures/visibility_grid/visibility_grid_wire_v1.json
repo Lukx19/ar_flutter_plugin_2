@@ -730,8 +730,8 @@
                       "touchedEvidenceRows": 1,
                       "refineCount": 1,
                       "preparedResidentBytes": 32,
-                      "p50VirtualWorkUnits": 76,
-                      "p95VirtualWorkUnits": 76,
+                      "p50VirtualWorkUnits": 78,
+                      "p95VirtualWorkUnits": 78,
                       "independentDirectionVotes": 0
                     },
                     "expectedWork": {
@@ -739,7 +739,7 @@
                       "emittedChangeCount": 1,
                       "rayVisits": 6,
                       "independentDirectionVotes": 0,
-                      "virtualWorkUnits": 76
+                      "virtualWorkUnits": 78
                     }
                   }
                 }
@@ -775,8 +775,8 @@
           "touchedEvidenceRows": 1,
           "refineCount": 1,
           "preparedResidentBytes": 32,
-          "p50VirtualWorkUnits": 76,
-          "p95VirtualWorkUnits": 76,
+          "p50VirtualWorkUnits": 78,
+          "p95VirtualWorkUnits": 78,
           "independentDirectionVotes": 0
         },
         "expectedWork": {
@@ -784,7 +784,7 @@
           "emittedChangeCount": 1,
           "rayVisits": 6,
           "independentDirectionVotes": 0,
-          "virtualWorkUnits": 76
+          "virtualWorkUnits": 78
         }
       },
       {
@@ -866,8 +866,8 @@
                       "touchedEvidenceRows": 1,
                       "relocateCount": 1,
                       "preparedResidentBytes": 32,
-                      "p50VirtualWorkUnits": 81,
-                      "p95VirtualWorkUnits": 81,
+                      "p50VirtualWorkUnits": 83,
+                      "p95VirtualWorkUnits": 83,
                       "rayVisits": 11,
                       "independentDirectionVotes": 0
                     },
@@ -876,7 +876,7 @@
                       "emittedChangeCount": 1,
                       "rayVisits": 11,
                       "independentDirectionVotes": 0,
-                      "virtualWorkUnits": 81
+                      "virtualWorkUnits": 83
                     }
                   }
                 }
@@ -911,8 +911,8 @@
           "touchedEvidenceRows": 1,
           "relocateCount": 1,
           "preparedResidentBytes": 32,
-          "p50VirtualWorkUnits": 81,
-          "p95VirtualWorkUnits": 81,
+          "p50VirtualWorkUnits": 83,
+          "p95VirtualWorkUnits": 83,
           "rayVisits": 11,
           "independentDirectionVotes": 0
         },
@@ -921,7 +921,7 @@
           "emittedChangeCount": 1,
           "rayVisits": 11,
           "independentDirectionVotes": 0,
-          "virtualWorkUnits": 81
+          "virtualWorkUnits": 83
         }
       },
       {
@@ -1006,15 +1006,15 @@
                       "rayVisits": 11,
                       "touchedEvidenceRows": 1,
                       "preparedResidentBytes": 32,
-                      "p50VirtualWorkUnits": 51,
-                      "p95VirtualWorkUnits": 51
+                      "p50VirtualWorkUnits": 53,
+                      "p95VirtualWorkUnits": 53
                     },
                     "expectedWork": {
                       "distinctTouchedVoxelCount": 1,
                       "emittedChangeCount": 0,
                       "rayVisits": 11,
                       "independentDirectionVotes": 0,
-                      "virtualWorkUnits": 51
+                      "virtualWorkUnits": 53
                     }
                   },
                   "lifecycle": "apply"
@@ -1060,15 +1060,15 @@
                       "rayVisits": 11,
                       "touchedEvidenceRows": 1,
                       "preparedResidentBytes": 32,
-                      "p50VirtualWorkUnits": 51,
-                      "p95VirtualWorkUnits": 51
+                      "p50VirtualWorkUnits": 53,
+                      "p95VirtualWorkUnits": 53
                     },
                     "expectedWork": {
                       "distinctTouchedVoxelCount": 1,
                       "emittedChangeCount": 0,
                       "rayVisits": 11,
                       "independentDirectionVotes": 0,
-                      "virtualWorkUnits": 51
+                      "virtualWorkUnits": 53
                     }
                   },
                   "lifecycle": "apply"
@@ -1114,15 +1114,15 @@
                       "rayVisits": 11,
                       "touchedEvidenceRows": 1,
                       "preparedResidentBytes": 32,
-                      "p50VirtualWorkUnits": 51,
-                      "p95VirtualWorkUnits": 51
+                      "p50VirtualWorkUnits": 53,
+                      "p95VirtualWorkUnits": 53
                     },
                     "expectedWork": {
                       "distinctTouchedVoxelCount": 1,
                       "emittedChangeCount": 0,
                       "rayVisits": 11,
                       "independentDirectionVotes": 0,
-                      "virtualWorkUnits": 51
+                      "virtualWorkUnits": 53
                     }
                   },
                   "lifecycle": "apply"
@@ -1188,8 +1188,8 @@
                       "touchedEvidenceRows": 1,
                       "mergeCount": 1,
                       "preparedResidentBytes": 32,
-                      "p50VirtualWorkUnits": 110,
-                      "p95VirtualWorkUnits": 110,
+                      "p50VirtualWorkUnits": 112,
+                      "p95VirtualWorkUnits": 112,
                       "independentDirectionVotes": 0
                     },
                     "expectedWork": {
@@ -1197,7 +1197,7 @@
                       "emittedChangeCount": 1,
                       "rayVisits": 11,
                       "independentDirectionVotes": 0,
-                      "virtualWorkUnits": 110
+                      "virtualWorkUnits": 112
                     }
                   }
                 }
@@ -1234,8 +1234,8 @@
           "touchedEvidenceRows": 1,
           "mergeCount": 1,
           "preparedResidentBytes": 32,
-          "p50VirtualWorkUnits": 110,
-          "p95VirtualWorkUnits": 110,
+          "p50VirtualWorkUnits": 112,
+          "p95VirtualWorkUnits": 112,
           "independentDirectionVotes": 0
         },
         "expectedWork": {
@@ -1243,7 +1243,7 @@
           "emittedChangeCount": 1,
           "rayVisits": 11,
           "independentDirectionVotes": 0,
-          "virtualWorkUnits": 110
+          "virtualWorkUnits": 112
         }
       },
       {
@@ -1357,8 +1357,8 @@
                       "touchedEvidenceRows": 2,
                       "splitCount": 1,
                       "preparedResidentBytes": 64,
-                      "p50VirtualWorkUnits": 162,
-                      "p95VirtualWorkUnits": 162,
+                      "p50VirtualWorkUnits": 166,
+                      "p95VirtualWorkUnits": 166,
                       "rayVisits": 42,
                       "independentDirectionVotes": 0
                     },
@@ -1367,7 +1367,7 @@
                       "emittedChangeCount": 1,
                       "rayVisits": 42,
                       "independentDirectionVotes": 0,
-                      "virtualWorkUnits": 162
+                      "virtualWorkUnits": 166
                     }
                   }
                 }
@@ -1415,8 +1415,8 @@
           "touchedEvidenceRows": 2,
           "splitCount": 1,
           "preparedResidentBytes": 64,
-          "p50VirtualWorkUnits": 162,
-          "p95VirtualWorkUnits": 162,
+          "p50VirtualWorkUnits": 166,
+          "p95VirtualWorkUnits": 166,
           "rayVisits": 42,
           "independentDirectionVotes": 0
         },
@@ -1425,7 +1425,7 @@
           "emittedChangeCount": 1,
           "rayVisits": 42,
           "independentDirectionVotes": 0,
-          "virtualWorkUnits": 162
+          "virtualWorkUnits": 166
         }
       },
       {
@@ -1524,15 +1524,15 @@
                       "rayVisits": 42,
                       "touchedEvidenceRows": 2,
                       "preparedResidentBytes": 64,
-                      "p50VirtualWorkUnits": 122,
-                      "p95VirtualWorkUnits": 122
+                      "p50VirtualWorkUnits": 126,
+                      "p95VirtualWorkUnits": 126
                     },
                     "expectedWork": {
                       "distinctTouchedVoxelCount": 2,
                       "emittedChangeCount": 0,
                       "rayVisits": 42,
                       "independentDirectionVotes": 0,
-                      "virtualWorkUnits": 122
+                      "virtualWorkUnits": 126
                     }
                   },
                   "lifecycle": "apply"
@@ -1592,15 +1592,15 @@
                       "rayVisits": 42,
                       "touchedEvidenceRows": 2,
                       "preparedResidentBytes": 64,
-                      "p50VirtualWorkUnits": 122,
-                      "p95VirtualWorkUnits": 122
+                      "p50VirtualWorkUnits": 126,
+                      "p95VirtualWorkUnits": 126
                     },
                     "expectedWork": {
                       "distinctTouchedVoxelCount": 2,
                       "emittedChangeCount": 0,
                       "rayVisits": 42,
                       "independentDirectionVotes": 0,
-                      "virtualWorkUnits": 122
+                      "virtualWorkUnits": 126
                     }
                   },
                   "lifecycle": "apply"
@@ -1660,15 +1660,15 @@
                       "rayVisits": 42,
                       "touchedEvidenceRows": 2,
                       "preparedResidentBytes": 64,
-                      "p50VirtualWorkUnits": 122,
-                      "p95VirtualWorkUnits": 122
+                      "p50VirtualWorkUnits": 126,
+                      "p95VirtualWorkUnits": 126
                     },
                     "expectedWork": {
                       "distinctTouchedVoxelCount": 2,
                       "emittedChangeCount": 0,
                       "rayVisits": 42,
                       "independentDirectionVotes": 0,
-                      "virtualWorkUnits": 122
+                      "virtualWorkUnits": 126
                     }
                   },
                   "lifecycle": "apply"
@@ -1761,8 +1761,8 @@
                       "touchedEvidenceRows": 2,
                       "replaceCount": 1,
                       "preparedResidentBytes": 64,
-                      "p50VirtualWorkUnits": 202,
-                      "p95VirtualWorkUnits": 202,
+                      "p50VirtualWorkUnits": 206,
+                      "p95VirtualWorkUnits": 206,
                       "independentDirectionVotes": 0
                     },
                     "expectedWork": {
@@ -1770,7 +1770,7 @@
                       "emittedChangeCount": 1,
                       "rayVisits": 42,
                       "independentDirectionVotes": 0,
-                      "virtualWorkUnits": 202
+                      "virtualWorkUnits": 206
                     }
                   }
                 }
@@ -1820,8 +1820,8 @@
           "touchedEvidenceRows": 2,
           "replaceCount": 1,
           "preparedResidentBytes": 64,
-          "p50VirtualWorkUnits": 202,
-          "p95VirtualWorkUnits": 202,
+          "p50VirtualWorkUnits": 206,
+          "p95VirtualWorkUnits": 206,
           "independentDirectionVotes": 0
         },
         "expectedWork": {
@@ -1829,7 +1829,7 @@
           "emittedChangeCount": 1,
           "rayVisits": 42,
           "independentDirectionVotes": 0,
-          "virtualWorkUnits": 202
+          "virtualWorkUnits": 206
         }
       },
       {
@@ -1902,15 +1902,15 @@
                       "touchedEvidenceRows": 2,
                       "independentDirectionVotes": 1,
                       "preparedResidentBytes": 64,
-                      "p50VirtualWorkUnits": 75,
-                      "p95VirtualWorkUnits": 75
+                      "p50VirtualWorkUnits": 76,
+                      "p95VirtualWorkUnits": 76
                     },
                     "expectedWork": {
                       "distinctTouchedVoxelCount": 2,
                       "emittedChangeCount": 0,
                       "rayVisits": 7,
                       "independentDirectionVotes": 1,
-                      "virtualWorkUnits": 75
+                      "virtualWorkUnits": 76
                     }
                   },
                   "lifecycle": "apply"
@@ -1960,15 +1960,15 @@
                       "independentDirectionVotes": 1,
                       "removeCount": 1,
                       "preparedResidentBytes": 64,
-                      "p50VirtualWorkUnits": 85,
-                      "p95VirtualWorkUnits": 85
+                      "p50VirtualWorkUnits": 86,
+                      "p95VirtualWorkUnits": 86
                     },
                     "expectedWork": {
                       "distinctTouchedVoxelCount": 2,
                       "emittedChangeCount": 1,
                       "rayVisits": 6,
                       "independentDirectionVotes": 1,
-                      "virtualWorkUnits": 85
+                      "virtualWorkUnits": 86
                     }
                   }
                 }
@@ -1994,15 +1994,15 @@
           "independentDirectionVotes": 1,
           "removeCount": 1,
           "preparedResidentBytes": 64,
-          "p50VirtualWorkUnits": 85,
-          "p95VirtualWorkUnits": 85
+          "p50VirtualWorkUnits": 86,
+          "p95VirtualWorkUnits": 86
         },
         "expectedWork": {
           "distinctTouchedVoxelCount": 2,
           "emittedChangeCount": 1,
           "rayVisits": 6,
           "independentDirectionVotes": 1,
-          "virtualWorkUnits": 85
+          "virtualWorkUnits": 86
         }
       },
       {
@@ -2080,15 +2080,15 @@
                       "touchedEvidenceRows": 3,
                       "independentDirectionVotes": 1,
                       "preparedResidentBytes": 96,
-                      "p50VirtualWorkUnits": 118,
-                      "p95VirtualWorkUnits": 118
+                      "p50VirtualWorkUnits": 120,
+                      "p95VirtualWorkUnits": 120
                     },
                     "expectedWork": {
                       "distinctTouchedVoxelCount": 3,
                       "emittedChangeCount": 0,
                       "rayVisits": 11,
                       "independentDirectionVotes": 1,
-                      "virtualWorkUnits": 118
+                      "virtualWorkUnits": 120
                     }
                   }
                 }
@@ -2106,15 +2106,15 @@
           "touchedEvidenceRows": 3,
           "independentDirectionVotes": 1,
           "preparedResidentBytes": 96,
-          "p50VirtualWorkUnits": 118,
-          "p95VirtualWorkUnits": 118
+          "p50VirtualWorkUnits": 120,
+          "p95VirtualWorkUnits": 120
         },
         "expectedWork": {
           "distinctTouchedVoxelCount": 3,
           "emittedChangeCount": 0,
           "rayVisits": 11,
           "independentDirectionVotes": 1,
-          "virtualWorkUnits": 118
+          "virtualWorkUnits": 120
         }
       },
       {
@@ -2179,8 +2179,8 @@
                       "rayVisits": 4,
                       "touchedEvidenceRows": 2,
                       "preparedResidentBytes": 64,
-                      "p50VirtualWorkUnits": 72,
-                      "p95VirtualWorkUnits": 72,
+                      "p50VirtualWorkUnits": 73,
+                      "p95VirtualWorkUnits": 73,
                       "independentDirectionVotes": 0
                     },
                     "expectedWork": {
@@ -2188,7 +2188,7 @@
                       "emittedChangeCount": 0,
                       "rayVisits": 4,
                       "independentDirectionVotes": 0,
-                      "virtualWorkUnits": 72
+                      "virtualWorkUnits": 73
                     }
                   }
                 }
@@ -2265,8 +2265,8 @@
           "rayVisits": 4,
           "touchedEvidenceRows": 2,
           "preparedResidentBytes": 64,
-          "p50VirtualWorkUnits": 72,
-          "p95VirtualWorkUnits": 72,
+          "p50VirtualWorkUnits": 73,
+          "p95VirtualWorkUnits": 73,
           "independentDirectionVotes": 0
         },
         "expectedWork": {
@@ -2274,7 +2274,7 @@
           "emittedChangeCount": 0,
           "rayVisits": 4,
           "independentDirectionVotes": 0,
-          "virtualWorkUnits": 72
+          "virtualWorkUnits": 73
         }
       },
       {
@@ -2510,15 +2510,15 @@
                       "independentDirectionVotes": 1,
                       "conflictsRetained": 1,
                       "preparedResidentBytes": 64,
-                      "p50VirtualWorkUnits": 96,
-                      "p95VirtualWorkUnits": 96
+                      "p50VirtualWorkUnits": 99,
+                      "p95VirtualWorkUnits": 99
                     },
                     "expectedWork": {
                       "distinctTouchedVoxelCount": 2,
                       "emittedChangeCount": 0,
                       "rayVisits": 27,
                       "independentDirectionVotes": 1,
-                      "virtualWorkUnits": 96
+                      "virtualWorkUnits": 99
                     }
                   },
                   "lifecycle": "apply"
@@ -2567,15 +2567,15 @@
                       "independentDirectionVotes": 2,
                       "conflictsRetained": 1,
                       "preparedResidentBytes": 96,
-                      "p50VirtualWorkUnits": 124,
-                      "p95VirtualWorkUnits": 124
+                      "p50VirtualWorkUnits": 127,
+                      "p95VirtualWorkUnits": 127
                     },
                     "expectedWork": {
                       "distinctTouchedVoxelCount": 3,
                       "emittedChangeCount": 0,
                       "rayVisits": 27,
                       "independentDirectionVotes": 2,
-                      "virtualWorkUnits": 124
+                      "virtualWorkUnits": 127
                     }
                   }
                 }
@@ -2645,15 +2645,15 @@
                       "independentDirectionVotes": 1,
                       "conflictsRetained": 1,
                       "preparedResidentBytes": 64,
-                      "p50VirtualWorkUnits": 99,
-                      "p95VirtualWorkUnits": 99
+                      "p50VirtualWorkUnits": 102,
+                      "p95VirtualWorkUnits": 102
                     },
                     "expectedWork": {
                       "distinctTouchedVoxelCount": 2,
                       "emittedChangeCount": 0,
                       "rayVisits": 30,
                       "independentDirectionVotes": 1,
-                      "virtualWorkUnits": 99
+                      "virtualWorkUnits": 102
                     }
                   },
                   "lifecycle": "apply"
@@ -2702,15 +2702,15 @@
                       "independentDirectionVotes": 2,
                       "conflictsRetained": 1,
                       "preparedResidentBytes": 96,
-                      "p50VirtualWorkUnits": 121,
-                      "p95VirtualWorkUnits": 121
+                      "p50VirtualWorkUnits": 124,
+                      "p95VirtualWorkUnits": 124
                     },
                     "expectedWork": {
                       "distinctTouchedVoxelCount": 3,
                       "emittedChangeCount": 0,
                       "rayVisits": 24,
                       "independentDirectionVotes": 2,
-                      "virtualWorkUnits": 121
+                      "virtualWorkUnits": 124
                     }
                   }
                 }
@@ -2729,15 +2729,15 @@
           "independentDirectionVotes": 2,
           "conflictsRetained": 1,
           "preparedResidentBytes": 96,
-          "p50VirtualWorkUnits": 124,
-          "p95VirtualWorkUnits": 124
+          "p50VirtualWorkUnits": 127,
+          "p95VirtualWorkUnits": 127
         },
         "expectedWork": {
           "distinctTouchedVoxelCount": 3,
           "emittedChangeCount": 0,
           "rayVisits": 27,
           "independentDirectionVotes": 2,
-          "virtualWorkUnits": 124
+          "virtualWorkUnits": 127
         }
       },
       {

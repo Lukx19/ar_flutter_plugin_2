@@ -140,7 +140,7 @@ class DepthEvidenceKernelTest {
 
         repeat(3) { index ->
             assertEquals(
-                expectedAccepted(index + 1L, rayVisits = 11, virtualWork = 13, relationCount = 1),
+                expectedAccepted(index + 1L, rayVisits = 11, virtualWork = 13, relationCount = 1, relationAdmissionWork = 2),
                 kernel.prepare(depthBatchForFrame(index + 1L, frame(), identity()), view),
             )
             kernel.applyPrepared()
@@ -158,6 +158,7 @@ class DepthEvidenceKernelTest {
                 rayVisits = 11,
                 virtualWork = 13,
                 relationCount = 1,
+                relationAdmissionWork = 2,
             ),
             result,
         )
@@ -241,6 +242,7 @@ class DepthEvidenceKernelTest {
                 splitCount = 1,
                 virtualWork = 46,
                 relationCount = 2,
+                relationAdmissionWork = 4,
             ),
             result,
         )
@@ -265,6 +267,7 @@ class DepthEvidenceKernelTest {
                 expectedAccepted(
                     3, acceptedSamples = 2, rayVisits = 42, touchedRows = 2, virtualWork = 46,
                     relationCount = 2,
+                    relationAdmissionWork = 4,
                 ).receipt.copy(capacityRefusals = 1),
             ),
             fullKernel.prepare(depthBatchForSamples(4, frame(), identity(), intrinsics, samples), fullView),
@@ -397,7 +400,7 @@ class DepthEvidenceKernelTest {
     }
 
     @Test
-    fun `missing and duplicate canonical source lookups refuse at the real prepare seam`() {
+    fun `canonical source lookup inconsistencies refuse preparation`() {
         val target = Voxel(0, 0, -10)
         val source = surface(61, target)
 
@@ -654,6 +657,7 @@ class DepthEvidenceKernelTest {
                     conflictsRetained = 1,
                     virtualWork = 8,
                     relationCount = 1,
+                    relationAdmissionWork = 2,
                 ),
                 result,
             )
@@ -672,13 +676,17 @@ class DepthEvidenceKernelTest {
                 conflictsRetained = 1,
                 virtualWork = 8,
                 relationCount = 1,
+                relationAdmissionWork = 2,
             ),
             restored,
         )
         kernel.applyPrepared()
         val next = kernel.prepare(depthBatch(41, 0.05, 0.05, depthMillimeters = 500), view)
             as DepthEvidenceResult.Accepted
-        assertEquals(expectedAccepted(41, rayVisits = 6, virtualWork = 8, relationCount = 1), next)
+        assertEquals(
+            expectedAccepted(41, rayVisits = 6, virtualWork = 8, relationCount = 1, relationAdmissionWork = 2),
+            next,
+        )
     }
 
     @Test
@@ -824,6 +832,7 @@ class DepthEvidenceKernelTest {
                     rayVisits = 4,
                     virtualWork = 6,
                     relationCount = 1,
+                    relationAdmissionWork = 2,
                 ),
                 result,
             )
@@ -918,7 +927,7 @@ class DepthEvidenceKernelTest {
     }
 
     @Test
-    fun `hole and low confidence samples remain conservative at the new seam`() {
+    fun `hole and low confidence samples retain conservative evidence`() {
         val hole = Voxel(2, 0, -5)
         val view = FakeCanonicalView(
             surfaces = mapOf(hole to surface(91, hole)),
@@ -990,6 +999,7 @@ class DepthEvidenceKernelTest {
                             if (index == 0) 31 else 32
                         } else if (index == 0) 34 else if (index % 2 == 0) 35 else 29,
                         relationCount = 1,
+                        relationAdmissionWork = 3,
                     ),
                     result,
                 )
@@ -1157,6 +1167,7 @@ class DepthEvidenceKernelTest {
                 is DepthEvidenceChange.Replace -> change.sourceIds.size
             }
         },
+        relationAdmissionWork: Int = relationCount,
     ): DepthEvidenceResult.Accepted {
         val positiveTargets = changes.sumOf { change ->
             when (change) {
@@ -1179,7 +1190,7 @@ class DepthEvidenceKernelTest {
         }.distinct().size
         val removals = changes.count { it is DepthEvidenceChange.Remove }
         val planningAndValidationWork =
-            3 * touchedRows + 11 * relationCount + 10 * positiveTargets +
+            relationAdmissionWork + 3 * touchedRows + 11 * relationCount + 10 * positiveTargets +
                 18 * positiveSources + 2 * changes.size + 9 * removals
         val accountedWork = virtualWork + touchedRows * 24 + planningAndValidationWork
         return DepthEvidenceResult.Accepted(
