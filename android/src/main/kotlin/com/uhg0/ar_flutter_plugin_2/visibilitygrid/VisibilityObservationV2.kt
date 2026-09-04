@@ -1,6 +1,56 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
 import java.util.Collections
+import com.uhg0.ar_flutter_plugin_2.proposal08.areInverseTransforms
+
+/** The exact immutable coordinate frame accepted by one V2 group binding. */
+internal class VisibilityGroupFrame private constructor(
+    val groupFromWorldGl: List<Double>,
+    val worldFromGroupGl: List<Double>,
+    val voxelSizeMicrometres: Int,
+    val modelCapacity: Int,
+) {
+    init {
+        require(groupFromWorldGl.size == 16 && groupFromWorldGl.all(Double::isFinite))
+        require(worldFromGroupGl.size == 16 && worldFromGroupGl.all(Double::isFinite))
+        require(voxelSizeMicrometres > 0)
+        require(modelCapacity in 1..100_000)
+        require(areInverseTransforms(groupFromWorldGl, worldFromGroupGl))
+    }
+
+    companion object {
+        fun copyOf(
+            groupFromWorldGl: DoubleArray,
+            worldFromGroupGl: DoubleArray,
+            voxelSizeMicrometres: Int,
+            modelCapacity: Int,
+        ): VisibilityGroupFrame = VisibilityGroupFrame(
+            Collections.unmodifiableList(groupFromWorldGl.copyOf().toList()),
+            Collections.unmodifiableList(worldFromGroupGl.copyOf().toList()),
+            voxelSizeMicrometres,
+            modelCapacity,
+        )
+    }
+
+    override fun equals(other: Any?): Boolean =
+        other is VisibilityGroupFrame &&
+            groupFromWorldGl == other.groupFromWorldGl &&
+            worldFromGroupGl == other.worldFromGroupGl &&
+            voxelSizeMicrometres == other.voxelSizeMicrometres &&
+            modelCapacity == other.modelCapacity
+
+    override fun hashCode(): Int = listOf(
+        groupFromWorldGl,
+        worldFromGroupGl,
+        voxelSizeMicrometres,
+        modelCapacity,
+    ).hashCode()
+
+    override fun toString(): String =
+        "VisibilityGroupFrame(groupFromWorldGl=$groupFromWorldGl, " +
+            "worldFromGroupGl=$worldFromGroupGl, voxelSizeMicrometres=$voxelSizeMicrometres, " +
+            "modelCapacity=$modelCapacity)"
+}
 
 internal const val VISIBILITY_OBSERVATION_VERSION = "visibility_observation_v2"
 internal const val V2_FEATURE_SAMPLE_CAPACITY = 1_200
@@ -44,6 +94,7 @@ internal data class VisibilityObservationOwnership(
     val bindingGeneration: Long,
     val lifecycleSequence: Long,
     val operationGeneration: Long,
+    val groupFrame: VisibilityGroupFrame,
 ) {
     init {
         require(sessionId.matches(HEX_128))

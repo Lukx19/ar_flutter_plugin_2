@@ -113,6 +113,7 @@ class VisibilityGridV2Binding internal constructor(
     private var lastAllocatedLifecycleSequence = 0L
     private var lifecycleSequence = allocateLifecycleSequence()
     private var operationGeneration = 0L
+    @Volatile private var activeGroupFrame: VisibilityGroupFrame? = null
     private val executorTrace = ArrayDeque<String>()
     private val publicationFence = Any()
     private val pendingControlResults = ConcurrentHashMap.newKeySet<PendingControlResult>()
@@ -229,26 +230,29 @@ class VisibilityGridV2Binding internal constructor(
     /** Returns the exact active V2 lifecycle cut or null before a qualified START. */
     internal fun currentObservationOwnership(): VisibilityObservationOwnership? {
         replacementBinding?.let { return it.currentObservationOwnership() }
-        val current = snapshot()
-        val baseline = acknowledgedEmptyBaseline
-        if (current.disposed || !current.initialTransactionQueued || baseline == null) return null
-        val sessionId = current.sessionId ?: return null
-        val captureGroupId = current.captureGroupId ?: return null
-        return VisibilityObservationOwnership(
-            sessionId = sessionId.hex(),
-            sessionGeneration = current.sessionGeneration,
-            captureGroupId = captureGroupId.hex(),
-            groupGeneration = current.groupGeneration,
-            coverageEpoch = current.coverageEpoch,
-            arSessionIdentity = current.arSessionIdentity.hex(),
-            viewInstanceId = current.viewInstanceId.hex(),
-            viewGeneration = current.viewGeneration,
-            nativeStreamToken = current.nativeStreamToken.hex(),
-            workerBindingToken = current.workerBindingToken.hex(),
-            bindingGeneration = current.bindingGeneration,
-            lifecycleSequence = current.lifecycleSequence,
-            operationGeneration = current.operationGeneration,
-        )
+        return synchronized(publicationFence) {
+            val frame = activeGroupFrame ?: return@synchronized null
+            val baseline = acknowledgedEmptyBaseline
+            if (disposed.get() || !initialTransactionQueued || baseline == null) return@synchronized null
+            val sessionId = activeSessionId ?: return@synchronized null
+            val captureGroupId = activeCaptureGroupId ?: return@synchronized null
+            VisibilityObservationOwnership(
+                sessionId = sessionId.hex(),
+                sessionGeneration = activeSessionGeneration,
+                captureGroupId = captureGroupId.hex(),
+                groupGeneration = activeGroupGeneration,
+                coverageEpoch = activeCoverageEpoch,
+                arSessionIdentity = arSessionIdentity.hex(),
+                viewInstanceId = viewInstanceId.hex(),
+                viewGeneration = viewGeneration,
+                nativeStreamToken = nativeStreamToken.hex(),
+                workerBindingToken = workerBindingToken.hex(),
+                bindingGeneration = currentBindingGeneration,
+                lifecycleSequence = lifecycleSequence,
+                operationGeneration = operationGeneration,
+                groupFrame = frame,
+            )
+        }
     }
 
     internal fun attachObservationRuntime(runtime: AndroidVisibilityGridRuntime) {
@@ -690,6 +694,15 @@ class VisibilityGridV2Binding internal constructor(
                                 wasIdle && operation == ControlOperation.START &&
                                 decoded.outcome == 0
                             ) {
+                                val configuration = lifecycle.successfulStartConfiguration()
+                                    ?: error("Accepted START has no decoded configuration")
+                                activeGroupFrame = VisibilityGroupFrame.copyOf(
+                                    groupFromWorldGl = configuration.groupFromWorldGl.toDoubleArray(),
+                                    worldFromGroupGl = configuration.worldFromGroupGl.toDoubleArray(),
+                                    voxelSizeMicrometres = configuration.voxelSizeMicrometres,
+                                    modelCapacity = configuration.requestedModelCapacity
+                                        .takeIf { it > 0 } ?: 100_000,
+                                )
                                 operationGeneration++
                                 lifecycleSequence = allocateLifecycleSequence()
                                 activeControlRequestId = request.controlRequestId
@@ -699,6 +712,9 @@ class VisibilityGridV2Binding internal constructor(
                                 activeGroupGeneration = request.groupGeneration
                                 activeCoverageEpoch = request.coverageEpoch
                                 queueInitialTransaction(lifecycle.committedBaseline())
+                            }
+                            if (operation == ControlOperation.STOP && decoded.outcome == 0) {
+                                activeGroupFrame = null
                             }
                             acceptedControls++
                             qualify(response)
@@ -914,6 +930,7 @@ class VisibilityGridV2Binding internal constructor(
                 initialCommittedBaseline = lifecycle.committedBaseline(),
             )
             currentBindingGeneration = nextBindingGeneration.incrementAndGet()
+            activeGroupFrame = null
             nativeStreamToken = newOpaqueToken()
             workerBindingToken = newOpaqueToken()
             streamChannel = newStreamChannel()
@@ -1051,6 +1068,7 @@ class VisibilityGridV2Binding internal constructor(
     }
 
     private fun closeBindingResources(abandonStream: Boolean = false) {
+        synchronized(publicationFence) { activeGroupFrame = null }
         terminatePendingControlResults()
         controlChannel.setMethodCallHandler(null)
         controlHandlerInstalled.set(false)

@@ -491,6 +491,9 @@ class AndroidVisibilityGridRuntimeTest {
         bindingGeneration = 1,
         lifecycleSequence = 1,
         operationGeneration = 1,
+        groupFrame = VisibilityGroupFrame.copyOf(
+            identityVisibilityGridTransform(), identityVisibilityGridTransform(), 1_000, 100_000,
+        ),
     )
 
     private fun feature(

@@ -29,17 +29,42 @@ import org.junit.Test
 /** Locks Option A's BINDING-LIFECYCLE-ACK seeded CREATE cut without a Flutter payload seam. */
 class VisibilityGridIntegrationTest {
     @Test
+    fun `stable identity replacement may reuse the removed surface voxel`() {
+        val projection = NativeRendererProjection(render = { _, _ -> })
+        val ownership = rendererOwnership()
+        val rebuild = rebuildCut(ownership, 4, 1)
+        projection.beginRebuild(rebuild)
+        projection.appendRebuildPage(rebuild.withUpserts(listOf(row(1, 0))))
+        projection.finishRebuild(rebuild)
+
+        val replacement = CommittedGeometryCut(
+            ownership = ownership,
+            transactionId = 5,
+            baseGeometryRevision = 4,
+            geometryRevision = 5,
+            lineageRevision = 2,
+            reset = false,
+            upserts = listOf(row(2, 0)),
+            removedSurfaceIds = longArrayOf(1),
+        )
+
+        assertEquals(RendererProjectionResult.Applied(1), projection.applyGeometry(replacement))
+        projection.close()
+    }
+
+    @Test
     fun `renderer rebuild publishes one exact snapshot after all pages`() {
         val rendered = mutableListOf<com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot>()
         val projection = NativeRendererProjection(render = { snapshot, _ -> snapshot?.let(rendered::add) })
         val cut = rendererOwnership()
 
-        projection.beginRebuild(cut, 9, 3)
-        projection.appendRebuildPage(cut, 9, 3, listOf(Voxel(1, 0, 0), Voxel(2, 0, 0)))
+        val rebuild = rebuildCut(cut, 9, 3)
+        projection.beginRebuild(rebuild)
+        projection.appendRebuildPage(rebuild.withUpserts(listOf(row(1, 0), row(2, 1))))
         assertTrue(rendered.isEmpty())
-        projection.appendRebuildPage(cut, 9, 3, listOf(Voxel(3, 0, 0)))
+        projection.appendRebuildPage(rebuild.withUpserts(listOf(row(3, 2))))
         assertTrue(rendered.isEmpty())
-        projection.finishRebuild(cut, 9, 3)
+        projection.finishRebuild(rebuild)
 
         assertEquals(1, rendered.size)
         assertEquals(3, rendered.single().count)
@@ -53,14 +78,16 @@ class VisibilityGridIntegrationTest {
         val first = rendererOwnership()
         val replacement = first.copy(coverageEpoch = 2, operationGeneration = 2)
 
-        projection.beginRebuild(first, 4, 1)
-        projection.appendRebuildPage(first, 4, 1, listOf(Voxel(1, 0, 0)))
+        val firstRebuild = rebuildCut(first, 4, 1)
+        projection.beginRebuild(firstRebuild)
+        projection.appendRebuildPage(firstRebuild.withUpserts(listOf(row(1, 0))))
         projection.abortRebuild()
         assertTrue(rendered.isEmpty())
 
-        projection.beginRebuild(replacement, 5, 1)
-        projection.appendRebuildPage(replacement, 5, 1, listOf(Voxel(2, 0, 0)))
-        projection.finishRebuild(replacement, 5, 1)
+        val replacementRebuild = rebuildCut(replacement, 5, 1)
+        projection.beginRebuild(replacementRebuild)
+        projection.appendRebuildPage(replacementRebuild.withUpserts(listOf(row(2, 0))))
+        projection.finishRebuild(replacementRebuild)
         assertEquals(1, rendered.size)
         assertEquals(5L, rendered.single().update?.geometryRevision)
     }
@@ -103,7 +130,6 @@ class VisibilityGridIntegrationTest {
             assertEquals(4, exchange(messenger, 2106, stream, 2, 0, 0, 0).first.messageKind)
             assertEquals(0, exchange(messenger, 2106, stream, 3, 1, 1, 1).first.messageKind)
             val cut = requireNotNull(binding.currentObservationOwnership())
-
             integration.admitFeature(feature(cut, 10))
             val staged = integration.integrationReceipt()
             assertEquals("pendingAck", staged.status)
@@ -289,7 +315,9 @@ class VisibilityGridIntegrationTest {
             val canonical = requireNotNull(activeResources).readRendererPage(0, 512)
             assertEquals(later.geometryRevision, canonical?.cut?.geometryRevision)
             assertArrayEquals(
-                canonical?.voxels?.map { packVisibilityGridKey(it.x, it.y, it.z) }?.toLongArray(),
+                canonical?.rows?.map { row ->
+                    packVisibilityGridKey(row.voxel.x, row.voxel.y, row.voxel.z)
+                }?.toLongArray(),
                 rendered.last().keys,
             )
             val current = requireNotNull(activeResources.owner().activationState()?.current)
@@ -733,6 +761,32 @@ class VisibilityGridIntegrationTest {
         arSessionIdentity = "03".repeat(16), viewInstanceId = "04".repeat(16), viewGeneration = 1,
         nativeStreamToken = "05".repeat(16), workerBindingToken = "06".repeat(16),
         bindingGeneration = 1, lifecycleSequence = 1, operationGeneration = 1,
+        groupFrame = VisibilityGroupFrame.copyOf(
+            identityVisibilityGridTransform(), identityVisibilityGridTransform(), 1_000, 100_000,
+        ),
+    )
+
+    private fun rebuildCut(
+        ownership: VisibilityObservationOwnership,
+        geometryRevision: Long,
+        lineageRevision: Long,
+    ) = CommittedGeometryCut(
+        ownership = ownership,
+        transactionId = 0,
+        baseGeometryRevision = 0,
+        geometryRevision = geometryRevision,
+        lineageRevision = lineageRevision,
+        reset = true,
+        upserts = emptyList(),
+        removedSurfaceIds = LongArray(0),
+    )
+
+    private fun row(id: Long, x: Int) = CommittedGeometryRow(
+        surfaceId = id,
+        voxel = Voxel(x, 0, 0),
+        packedNormal = 0,
+        normalConfidence = 0,
+        lineageCount = 0,
     )
 
     private fun startRequest() = ControlRequest(

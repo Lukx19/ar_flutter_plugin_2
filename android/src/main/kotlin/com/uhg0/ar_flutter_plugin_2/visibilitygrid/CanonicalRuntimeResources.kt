@@ -185,13 +185,19 @@ internal class CanonicalRuntimeResources private constructor(
                 val installScalar = current == null
                 var id = 1L
                 var rendered = 0
-                val page = ArrayList<Voxel>(512)
+                val page = ArrayList<CommittedGeometryRow>(512)
                 while (id < view.cut.nextSurfaceIdHighWater) {
                     val row = view.findById(SurfaceId(id++)) ?: continue
                     val source = (view.readSourceById(row.id) as? CanonicalPageRead.Complete)?.value ?: return null
                     if (!kernel.hydrateCanonicalSurface(row, source.allocationFingerprint)) return null
                     if (rendered < rendererLimit) {
-                        page += row.voxel
+                        page += CommittedGeometryRow(
+                            surfaceId = row.id.value,
+                            voxel = row.voxel,
+                            packedNormal = row.packedNormal,
+                            normalConfidence = row.normalConfidence,
+                            lineageCount = view.cut.lineageCount,
+                        )
                         rendered++
                         if (page.size == 512) {
                             sink(CanonicalRendererPage(view.cut, page.toList(), null)); page.clear()
@@ -234,10 +240,18 @@ internal class CanonicalRuntimeResources private constructor(
             try {
             if (view.cut != lease.view.cut) return null
             require(cursor in 0 until view.cut.nextSurfaceIdHighWater && limit in 1..512)
-            val rows = ArrayList<Voxel>(limit)
+            val rows = ArrayList<CommittedGeometryRow>(limit)
             var id = cursor + 1
             while (id < view.cut.nextSurfaceIdHighWater && rows.size < limit) {
-                view.findById(SurfaceId(id))?.let { rows += it.voxel }
+                view.findById(SurfaceId(id))?.let { row ->
+                    rows += CommittedGeometryRow(
+                        surfaceId = row.id.value,
+                        voxel = row.voxel,
+                        packedNormal = row.packedNormal,
+                        normalConfidence = row.normalConfidence,
+                        lineageCount = view.cut.lineageCount,
+                    )
+                }
                 id++
             }
             CanonicalRendererPage(
@@ -406,6 +420,6 @@ internal object CanonicalRuntimeCurrentTestHooks {
 
 internal data class CanonicalRendererPage(
     val cut: CompactCanonicalCut,
-    val voxels: List<Voxel>,
+    val rows: List<CommittedGeometryRow>,
     val nextCursor: Long?,
 )

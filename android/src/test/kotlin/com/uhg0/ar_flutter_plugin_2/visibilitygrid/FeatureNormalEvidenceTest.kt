@@ -149,6 +149,9 @@ class FeatureNormalEvidenceTest {
                 "00000000000000000000000000000004", 1,
                 "00000000000000000000000000000005",
                 "00000000000000000000000000000006", 1, 1, 1,
+                VisibilityGroupFrame.copyOf(
+                    identityVisibilityGridTransform(), identityVisibilityGridTransform(), 1_000, 100_000,
+                ),
             ),
             frame = VisibilityObservationFrame(
                 VisibilityObservationSource.SYNTHETIC_FEATURE, 1, 1, 1, "camera", true,

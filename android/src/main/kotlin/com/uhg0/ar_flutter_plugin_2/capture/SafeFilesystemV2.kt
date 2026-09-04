@@ -338,5 +338,5 @@ class SafeFilesystemV2(
     private fun requireContained(file: File) { require(file.absoluteFile.toPath().normalize().startsWith(rootPath)) }
     private fun validateSegment(name: String) { require(name.matches(SEGMENT) && name != "." && name != "..") }
     override fun close() { if (closed.compareAndSet(false, true)) backend.close() }
-    companion object { private val SEGMENT = Regex("[A-Za-z0-9._-]{1,160}") }
+    companion object { private val SEGMENT = Regex("[A-Za-z0-9._-]{1,240}") }
 }

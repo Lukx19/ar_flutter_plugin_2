@@ -110,6 +110,12 @@ class controlLifecycle(
 ) {
     enum class State { IDLE, ACTIVE, ABANDONED, STOPPED }
 
+    private var activeStartConfiguration: StartRequestCodecV2.Configuration? = null
+
+    /** The exact decoded configuration for the currently accepted START. */
+    @Synchronized fun successfulStartConfiguration(): StartRequestCodecV2.Configuration? =
+        activeStartConfiguration
+
     /** Bounded scalar telemetry; requested bit identities are never retained. */
     class Metrics {
         companion object {
@@ -311,6 +317,7 @@ class controlLifecycle(
         } else {
             CommittedBaselineV1.ZERO
         }).let(CommittedBaselineV1::forFreshBinding)
+        activeStartConfiguration = configuration
         activeStreamToken = nextStreamToken++
         state = State.ACTIVE
         return success(request, activeStreamToken, committedBaseline, configuration)

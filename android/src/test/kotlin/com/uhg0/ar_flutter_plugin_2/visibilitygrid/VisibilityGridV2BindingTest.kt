@@ -31,6 +31,69 @@ import org.junit.Test
 
 class VisibilityGridV2BindingTest {
     @Test
+    fun `accepted START exposes exact immutable group frame and disposal clears it`() {
+        val messenger = MethodTestMessenger()
+        val binding = VisibilityGridV2Binding(
+            messenger, 2130, CommittedBaselineAuthority(), postToMain = { it() },
+        )
+        try {
+            val groupFromWorld = doubleArrayOf(
+                1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.5, 1.5, -2.0, 1.0,
+            )
+            val worldFromGroup = groupFromWorld.copyOf().also {
+                it[12] = -0.5; it[13] = -1.5; it[14] = 2.0
+            }
+            val payload = StartRequestCodecV2.defaultPayload()
+            val data = ByteBuffer.wrap(payload).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            data.putInt(40, 12_345)
+            groupFromWorld.forEachIndexed { index, value -> data.putDouble(136 + index * 8, value) }
+            worldFromGroup.forEachIndexed { index, value -> data.putDouble(264 + index * 8, value) }
+            val request = startRequest().copy(payload = payload)
+            val snapshot = binding.snapshot()
+            val result = RecordingResult()
+            MethodChannel(messenger, "visibility_grid_v2_control_2130").invokeMethod(
+                "start",
+                snapshot.nativeStreamToken + snapshot.workerBindingToken + ControlCodec.encodeRequest(request),
+                result,
+            )
+            assertTrue(result.completed.await(2, TimeUnit.SECONDS))
+            assertEquals("start error=${result.errorCode}:${result.errorMessage}", 1, result.successCount)
+            val qualifier = snapshot.nativeStreamToken + snapshot.workerBindingToken
+            val stream = ControlCodec.decodeResponse(stripQualifier(result.successValue as ByteArray, qualifier))
+            fun exchange(sequence: Long, transaction: Long, geometry: Long, lineage: Long) {
+                val reply = RecordingBinaryReply()
+                messenger.send(
+                    "visibility_surface_stream_2130",
+                    ByteBuffer.wrap(qualifier + PacketCodec.encodeRequest(PacketCodec.Request(
+                        0, stream.streamToken, transaction, geometry, lineage, 0,
+                        TransactionResponseProfileV1.ordinary.responseCeilingBytes,
+                        emptyList(), byteArrayOf(), sequence,
+                    ))),
+                    reply,
+                )
+                assertTrue(reply.completed.await(2, TimeUnit.SECONDS))
+            }
+            exchange(1, 0, 0, 0)
+            exchange(2, 0, 0, 0)
+            exchange(3, 1, 1, 1)
+
+            val frame = requireNotNull(binding.currentObservationOwnership()).groupFrame
+            assertEquals(groupFromWorld.toList(), frame.groupFromWorldGl)
+            assertEquals(worldFromGroup.toList(), frame.worldFromGroupGl)
+            assertEquals(1_000, frame.voxelSizeMicrometres)
+            assertEquals(12_345, frame.modelCapacity)
+            groupFromWorld[12] = 99.0
+            assertEquals(0.5, frame.groupFromWorldGl[12], 0.0)
+        } finally {
+            binding.dispose()
+        }
+        assertEquals(null, binding.currentObservationOwnership())
+    }
+
+    @Test
     fun `lifecycle allocator requires positive strictly increasing values`() {
         assertThrows(IllegalArgumentException::class.java) {
             VisibilityGridV2Binding(

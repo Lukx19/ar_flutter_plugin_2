@@ -251,7 +251,10 @@ class VisibilityProtocolControlLifecycleTest {
         assertEquals(58, rootResponse.errorId)
 
         val transformMismatch = restoredPayload.copyOf().also {
-            ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putDouble(136, 2.0)
+            ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).apply {
+                putDouble(136, 2.0)
+                putDouble(264, 0.5)
+            }
         }
         val transformLifecycle = controlLifecycle(initialCommittedBaseline = baseline)
         val transformRequest = request(ControlOperation.START, 0, 10).copy(payload = transformMismatch)

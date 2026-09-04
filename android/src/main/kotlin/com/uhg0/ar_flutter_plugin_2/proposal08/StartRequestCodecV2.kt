@@ -2,6 +2,7 @@ package com.uhg0.ar_flutter_plugin_2.proposal08
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Collections
 
 internal const val A_IDENTITY_MATRIX_IDENTITY =
     "3ff0000000000000,0,0,0,0,3ff0000000000000,0,0,0,0,3ff0000000000000,0,0,0,0,3ff0000000000000"
@@ -10,6 +11,32 @@ internal fun matrixIdentity(data: ByteBuffer, offset: Int): String =
     (0 until 16).joinToString(",") { index ->
         data.getDouble(offset + index * 8).toBits().toString(16)
     }
+
+internal fun matrixValues(data: ByteBuffer, offset: Int): List<Double> =
+    Collections.unmodifiableList(List(16) { index -> data.getDouble(offset + index * 8) })
+
+/** Column-major affine matrix validation for the immutable group-frame cut. */
+internal fun areInverseTransforms(first: List<Double>, second: List<Double>): Boolean {
+    if (first.size != 16 || second.size != 16 ||
+        first.any { !it.isFinite() } || second.any { !it.isFinite() }
+    ) return false
+    val affine = listOf(first, second).all { matrix ->
+        kotlin.math.abs(matrix[3]) <= 1e-9 &&
+            kotlin.math.abs(matrix[7]) <= 1e-9 &&
+            kotlin.math.abs(matrix[11]) <= 1e-9 &&
+            kotlin.math.abs(matrix[15] - 1.0) <= 1e-9
+    }
+    if (!affine) return false
+    return (0 until 4).all { row ->
+        (0 until 4).all { column ->
+            val actual = (0 until 4).sumOf { index ->
+                first[index * 4 + row] * second[column * 4 + index]
+            }
+            val expected = if (row == column) 1.0 else 0.0
+            kotlin.math.abs(actual - expected) <= 1e-6
+        }
+    }
+}
 
 internal fun hashIdentity(bytes: ByteArray): String =
     bytes.joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
@@ -48,6 +75,8 @@ object StartRequestCodecV2 {
         val matrixConvention: Int,
         val directionConvention: Int,
         val normalEncoding: Int,
+        val groupFromWorldGl: List<Double>,
+        val worldFromGroupGl: List<Double>,
         val groupFromWorldIdentity: String,
         val worldFromGroupIdentity: String,
         val restoredRevisions: LongArray,
@@ -148,6 +177,11 @@ object StartRequestCodecV2 {
                 }
             }
         }
+        val groupFromWorldGl = matrixValues(data, 136)
+        val worldFromGroupGl = matrixValues(data, 264)
+        if (!areInverseTransforms(groupFromWorldGl, worldFromGroupGl)) {
+            return invalid(36, 5, 21, 1, 0)
+        }
         val schemaHash = bytes.copyOfRange(392, 424)
         val manifestHash = bytes.copyOfRange(424, 456)
         val schemaEmpty = schemaHash.all { it.toInt() == 0 }
@@ -190,6 +224,8 @@ object StartRequestCodecV2 {
             matrixConvention,
             directionConvention,
             normalEncoding,
+            groupFromWorldGl,
+            worldFromGroupGl,
             matrixIdentity(data, 136),
             matrixIdentity(data, 264),
             revisions,

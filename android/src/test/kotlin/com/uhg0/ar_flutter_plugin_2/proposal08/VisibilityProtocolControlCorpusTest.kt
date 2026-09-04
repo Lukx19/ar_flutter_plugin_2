@@ -20,6 +20,32 @@ import org.junit.Test
 
 class VisibilityProtocolControlCorpusTest {
     @Test
+    fun `START retains exact non identity inverse matrix values and bit identities`() {
+        val payload = StartRequestCodecV2.defaultPayload()
+        val groupFromWorld = doubleArrayOf(
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            1.25, -2.5, 3.75, 1.0,
+        )
+        val worldFromGroup = groupFromWorld.copyOf().also {
+            it[12] = -1.25; it[13] = 2.5; it[14] = -3.75
+        }
+        val data = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+        groupFromWorld.forEachIndexed { index, value -> data.putDouble(136 + index * 8, value) }
+        worldFromGroup.forEachIndexed { index, value -> data.putDouble(264 + index * 8, value) }
+
+        val configuration = StartRequestCodecV2.decode(payload)
+
+        assertEquals(groupFromWorld.toList(), configuration.groupFromWorldGl)
+        assertEquals(worldFromGroup.toList(), configuration.worldFromGroupGl)
+        assertEquals(groupFromWorld.joinToString(",") { it.toBits().toString(16) }, configuration.groupFromWorldIdentity)
+        assertEquals(worldFromGroup.joinToString(",") { it.toBits().toString(16) }, configuration.worldFromGroupIdentity)
+        payload[136] = 0
+        assertEquals(groupFromWorld.toList(), configuration.groupFromWorldGl)
+    }
+
+    @Test
     fun `START payload failures retain stable phase field and evidence identity`() {
         val valid = StartRequestCodecV2.defaultPayload()
         val cases = listOf(
