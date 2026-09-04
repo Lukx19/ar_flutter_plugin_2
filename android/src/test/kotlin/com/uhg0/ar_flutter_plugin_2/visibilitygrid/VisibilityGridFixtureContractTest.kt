@@ -858,7 +858,8 @@ class VisibilityGridFixtureContractTest {
         override val lineageRevision = 0L
         override val surfaceCount = specification?.get("surfaceCount")?.jsonPrimitive?.content?.toInt() ?: surfaces.size
         override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? = if (missingIds) null else byId[id]
-        override fun findSurfaceAt(voxel: Voxel): DepthCanonicalSurface? = surfaces[voxel]
+        override fun findSurfaceAt(voxel: Voxel): AddressedCanonicalSurface? =
+            surfaces[voxel]?.let { AddressedCanonicalSurface(voxel, it) }
 
         fun replaceAddresses(addresses: kotlinx.serialization.json.JsonArray) {
             surfaces = addresses.associate { value ->

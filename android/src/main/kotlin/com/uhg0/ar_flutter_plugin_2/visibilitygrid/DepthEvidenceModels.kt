@@ -42,9 +42,8 @@ internal class DepthEvidenceBatch(
     val sourceRejectedSamples: Int,
     val tracking: Boolean = true,
 ) {
-    val groupFromCameraGl: List<Double> = immutableDoubles(groupFromCameraGl)
-    val samples: List<VisibilityDepthSample> =
-        Collections.unmodifiableList(ArrayList(samples))
+    val groupFromCameraGl: List<Double> = immutableMatrix(groupFromCameraGl)
+    val samples: List<VisibilityDepthSample> = immutableDepthSamples(samples)
 
     fun copy(
         sequence: Long = this.sequence,
@@ -83,8 +82,17 @@ internal class DepthEvidenceBatch(
             "sourceRejectedSamples=$sourceRejectedSamples, tracking=$tracking)"
 }
 
-private fun immutableDoubles(values: List<Double>): List<Double> =
-    Collections.unmodifiableList(ArrayList(values))
+private fun immutableMatrix(values: List<Double>): List<Double> {
+    require(values.size == VISIBILITY_TRANSFORM_ELEMENT_COUNT)
+    return Collections.unmodifiableList(ArrayList(values))
+}
+
+private fun immutableDepthSamples(values: List<VisibilityDepthSample>): List<VisibilityDepthSample> {
+    require(values.size <= V2_DEPTH_SAMPLE_CAPACITY)
+    return Collections.unmodifiableList(ArrayList(values))
+}
+
+private const val VISIBILITY_TRANSFORM_ELEMENT_COUNT = 16
 
 /** A point in group coordinates, expressed in millimetres. */
 internal data class DepthPointMm(val x: Double, val y: Double, val z: Double) {
@@ -112,6 +120,12 @@ internal data class DepthCanonicalSurface(
     }
 }
 
+/** Immutable proof binding a canonical surface to the exact queried address. */
+internal data class AddressedCanonicalSurface(
+    val addressedVoxel: Voxel,
+    val surface: DepthCanonicalSurface,
+)
+
 internal interface BoundedCanonicalSurfaceView {
     val geometryRevision: Long
     val lineageRevision: Long
@@ -120,7 +134,7 @@ internal interface BoundedCanonicalSurfaceView {
     /** Returns only a directly addressed row; implementations must not enumerate rows. */
     fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface?
 
-    fun findSurfaceAt(voxel: Voxel): DepthCanonicalSurface?
+    fun findSurfaceAt(voxel: Voxel): AddressedCanonicalSurface?
 }
 
 internal sealed interface DepthEvidenceChange {

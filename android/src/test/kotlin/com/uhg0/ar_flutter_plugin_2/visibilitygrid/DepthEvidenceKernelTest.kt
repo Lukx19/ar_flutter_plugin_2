@@ -1,6 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class DepthEvidenceKernelTest {
@@ -177,6 +178,7 @@ class DepthEvidenceKernelTest {
             kernel.applyPrepared()
         }
         view.replaceSurfaces(mapOf(target to second))
+        view.reportSurfaceCount(100)
         val result = kernel.prepare(depthBatchForFrame(4, frame(), identity()), view)
             as DepthEvidenceResult.Accepted
 
@@ -192,6 +194,11 @@ class DepthEvidenceKernelTest {
             ),
             result,
         )
+        val merge = result.changes.single() as DepthEvidenceChange.Merge
+        assertThrows(RuntimeException::class.java) {
+            (merge.sourceIds as MutableList).add(SurfaceId(99))
+        }
+        assertEquals(listOf(SurfaceId(31), SurfaceId(32)), merge.sourceIds)
     }
 
     @Test
@@ -235,6 +242,30 @@ class DepthEvidenceKernelTest {
             ),
             result,
         )
+        val split = result.changes.single() as DepthEvidenceChange.Split
+        assertThrows(RuntimeException::class.java) {
+            (split.targets as MutableList).add(split.targets.single())
+        }
+        assertEquals(2, split.targets.size)
+
+        val fullView = FakeCanonicalView(
+            surfaces = mapOf(firstTarget to source, secondTarget to source),
+            reportedSurfaceCount = 100,
+        )
+        val fullKernel = DepthEvidenceKernel()
+        repeat(3) { index ->
+            fullKernel.prepare(depthBatchForSamples(index + 1L, frame(), identity(), intrinsics, samples), fullView)
+            fullKernel.applyPrepared()
+        }
+        assertEquals(
+            DepthEvidenceResult.Refused(
+                DepthEvidenceRefusal.SURFACE_CAPACITY,
+                expectedAccepted(
+                    3, acceptedSamples = 2, rayVisits = 42, touchedRows = 2, virtualWork = 46,
+                ).receipt.copy(capacityRefusals = 1),
+            ),
+            fullKernel.prepare(depthBatchForSamples(4, frame(), identity(), intrinsics, samples), fullView),
+        )
     }
 
     @Test
@@ -259,6 +290,7 @@ class DepthEvidenceKernelTest {
             kernel.applyPrepared()
         }
         view.replaceSurfaces(mapOf(firstTarget to secondSource, secondTarget to firstSource))
+        view.reportSurfaceCount(100)
         val result = kernel.prepare(
             depthBatchForSamples(4, frame(), identity(), intrinsics, samples), view,
         ) as DepthEvidenceResult.Accepted
@@ -281,6 +313,15 @@ class DepthEvidenceKernelTest {
             ),
             result,
         )
+        val replace = result.changes.single() as DepthEvidenceChange.Replace
+        assertThrows(RuntimeException::class.java) {
+            (replace.sourceIds as MutableList).add(SurfaceId(99))
+        }
+        assertThrows(RuntimeException::class.java) {
+            (replace.targets as MutableList).add(replace.targets.single())
+        }
+        assertEquals(listOf(SurfaceId(51), SurfaceId(52)), replace.sourceIds)
+        assertEquals(2, replace.targets.size)
     }
 
     @Test
@@ -374,6 +415,27 @@ class DepthEvidenceKernelTest {
         assertEquals(
             DepthEvidenceResult.Refused(DepthEvidenceRefusal.DUPLICATE_TARGET, DepthEvidenceReceipt()),
             conflicting,
+        )
+    }
+
+    @Test
+    fun `canonical lookup refuses evidence bound to a different addressed voxel`() {
+        val target = Voxel(0, 0, -10)
+        val source = surface(62, Voxel(3, 0, -10))
+        val result = DepthEvidenceKernel().prepare(
+            depthBatchForFrame(1, frame(), identity()),
+            FakeCanonicalView(
+                surfaces = mapOf(target to source),
+                addressedVoxelOverride = Voxel(1, 0, -10),
+            ),
+        )
+
+        assertEquals(
+            DepthEvidenceResult.Refused(
+                DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED,
+                DepthEvidenceReceipt(),
+            ),
+            result,
         )
     }
 
@@ -807,7 +869,7 @@ class DepthEvidenceKernelTest {
         }
 
         assertEquals(
-            DepthEvidenceResourceReceipt(2, 64, 0, 0, 2, 1_024, false, 4_194_304, 4_195_328),
+            DepthEvidenceResourceReceipt(2, 64, 0, 0, 2, 2_088, false, 3_842_320, 3_844_408),
             kernel.resourceReceipt(),
         )
     }
@@ -837,7 +899,7 @@ class DepthEvidenceKernelTest {
             ),
             result,
         )
-        assertEquals(11_602_560, kernel.resourceReceipt().fixedPrimitiveBytes)
+        assertEquals(11_871_904, kernel.resourceReceipt().fixedPrimitiveBytes)
         kernel.discardPrepared()
     }
 
@@ -1071,7 +1133,9 @@ class DepthEvidenceKernelTest {
         capacityRefusals: Int = 0,
         overflowCount: Int = 0,
         virtualWork: Int = acceptedSamples + rayVisits + touchedRows,
-    ) = DepthEvidenceResult.Accepted(
+    ): DepthEvidenceResult.Accepted {
+        val accountedWork = virtualWork + touchedRows * 24
+        return DepthEvidenceResult.Accepted(
         expectedGeometryRevision = 0,
         expectedLineageRevision = 0,
         changes = changes,
@@ -1094,17 +1158,18 @@ class DepthEvidenceKernelTest {
             capacityRefusals = capacityRefusals,
             overflowCount = overflowCount,
             preparedResidentBytes = touchedRows * 32,
-            p50VirtualWorkUnits = virtualWork,
-            p95VirtualWorkUnits = virtualWork,
+            p50VirtualWorkUnits = accountedWork,
+            p95VirtualWorkUnits = accountedWork,
         ),
         work = DepthEvidenceWorkReceipt(
             distinctTouchedVoxelCount = touchedRows,
             emittedChangeCount = changes.size,
             rayVisits = rayVisits,
             independentDirectionVotes = directionVotes,
-            virtualWorkUnits = virtualWork,
+            virtualWorkUnits = accountedWork,
         ),
     )
+    }
 
     private fun surface(id: Long, voxel: Voxel) = DepthCanonicalSurface(
         SurfaceId(id), voxel, 0x1010, 200, 1,
@@ -1199,20 +1264,28 @@ class DepthEvidenceKernelTest {
     private class FakeCanonicalView(
         private var surfaces: Map<Voxel, DepthCanonicalSurface> = emptyMap(),
         private val idLookup: Map<SurfaceId, DepthCanonicalSurface>? = null,
+        private val addressedVoxelOverride: Voxel? = null,
+        reportedSurfaceCount: Int? = null,
     ) : BoundedCanonicalSurfaceView {
         override val geometryRevision: Long = 0
         override val lineageRevision: Long = 0
-        override val surfaceCount: Int = maxOf(surfaces.size, idLookup?.size ?: 0)
+        private var reportedCount: Int? = reportedSurfaceCount
+        override val surfaceCount: Int get() = reportedCount ?: maxOf(surfaces.size, idLookup?.size ?: 0)
         override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? = if (idLookup != null) {
             idLookup[id]
         } else {
             surfaces.values.firstOrNull { it.id == id }
         }
 
-        override fun findSurfaceAt(voxel: Voxel): DepthCanonicalSurface? = surfaces[voxel]
+        override fun findSurfaceAt(voxel: Voxel): AddressedCanonicalSurface? =
+            surfaces[voxel]?.let { AddressedCanonicalSurface(addressedVoxelOverride ?: voxel, it) }
 
         fun replaceSurfaces(replacement: Map<Voxel, DepthCanonicalSurface>) {
             surfaces = replacement
+        }
+
+        fun reportSurfaceCount(count: Int) {
+            reportedCount = count
         }
 
     }

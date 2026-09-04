@@ -63,6 +63,8 @@ internal class DepthEvidenceKernel(
     private var stageOccupiedPointZ = DoubleArray(stageCapacity)
     private var stageFreeBin = ByteArray(stageCapacity) { NO_DIRECTION.toByte() }
     private var stageOrder = IntArray(stageCapacity)
+    private var stageSortScratch = IntArray(stageCapacity)
+    private var stageSortCounts = IntArray(RADIX_BUCKETS)
     private var stageRelationTarget = IntArray(stageCapacity)
     private var stageRelationSource = IntArray(stageCapacity)
     private var stageComponent = IntArray(stageCapacity)
@@ -83,6 +85,7 @@ internal class DepthEvidenceKernel(
     private var pending: Pending? = null
     private var lastReceipt = DepthEvidenceReceipt()
     private var capacityRefusalCount = 0
+    private var overflowEvidenceCount = 0
     private var closed = false
 
     init {
@@ -155,6 +158,7 @@ internal class DepthEvidenceKernel(
         lastTimestampNs = staged.receipt.sourceTimestampNs
         activeFrame = staged.frame
         lastReceipt = staged.receipt
+        overflowEvidenceCount = staged.receipt.overflowCount
         pending = null
         resetStage()
         return DepthEvidenceApplyResult.Applied(lastReceipt)
@@ -222,6 +226,8 @@ internal class DepthEvidenceKernel(
         stageOccupiedPointZ = DoubleArray(0)
         stageFreeBin = ByteArray(0)
         stageOrder = IntArray(0)
+        stageSortScratch = IntArray(0)
+        stageSortCounts = IntArray(0)
         stageRelationTarget = IntArray(0)
         stageRelationSource = IntArray(0)
         stageComponent = IntArray(0)
@@ -268,18 +274,16 @@ internal class DepthEvidenceKernel(
             val endpoint = transform(batch.groupFromCameraGl, cameraPoint)
                 ?: throw ArithmeticException("non-finite depth transform")
             val endpointVoxel = quantize(endpoint, batch.groupFrame)
-                ?: run {
-                    rejectedSamples = checkedAdd(rejectedSamples, 1)
-                    continue
-                }
-            val endpointSurface = try {
+                ?: return Staged.Refused(DepthEvidenceRefusal.ARITHMETIC_OVERFLOW)
+            val endpointLookup = try {
                 surfaces.findSurfaceAt(endpointVoxel)
             } catch (failure: DuplicateTargetFailure) {
                 throw failure
             } catch (_: RuntimeException) {
                 throw DepthLookupFailure()
             }
-            if (endpointSurface != null) validateCanonicalSurface(surfaces, endpointVoxel, endpointSurface)
+            if (endpointLookup != null) validateCanonicalSurface(surfaces, endpointVoxel, endpointLookup)
+            val endpointSurface = endpointLookup?.surface
             val priorEndpointIndex = stageFind(endpointVoxel)
             val hadOccupied = priorEndpointIndex != EMPTY_ROW && stageHasOccupied[priorEndpointIndex]
             val endpointIndex = stageIndex(endpointVoxel, endpointSurface)
@@ -294,9 +298,10 @@ internal class DepthEvidenceKernel(
             if (remaining < 0) return Staged.Refused(DepthEvidenceRefusal.RAY_VISIT_CAPACITY)
             try {
                 rayResult = visitRayCells(cameraGroup, endpoint, batch.groupFrame, remaining) { voxel ->
-                    val surface = if (voxel == endpointVoxel) endpointSurface else surfaces.findSurfaceAt(voxel)
+                    val lookup = if (voxel == endpointVoxel) endpointLookup else surfaces.findSurfaceAt(voxel)
                     if (!voxelInRange(voxel)) return@visitRayCells false
-                    if (surface != null) validateCanonicalSurface(surfaces, voxel, surface)
+                    if (lookup != null) validateCanonicalSurface(surfaces, voxel, lookup)
+                    val surface = lookup?.surface
                     val candidateIndex = if (surface != null) stageIndex(voxel, surface) else stageFind(voxel)
                     val cellCenter = center(voxel, batch.groupFrame)
                     if (isFreeEvidence(cameraGroup, endpoint, endpointVoxel, voxel, cellCenter, batch.groupFrame)) {
@@ -318,7 +323,10 @@ internal class DepthEvidenceKernel(
             } catch (_: RuntimeException) {
                 throw DepthLookupFailure()
             }
-            if (rayResult.arithmeticOverflow || rayResult.truncated ||
+            if (rayResult.arithmeticOverflow) {
+                return Staged.Refused(DepthEvidenceRefusal.ARITHMETIC_OVERFLOW)
+            }
+            if (rayResult.truncated ||
                 rayResult.visitedCells < 0 || rayResult.visitedCells > remaining
             ) return Staged.Refused(DepthEvidenceRefusal.RAY_VISIT_CAPACITY)
             visits = checkedAdd(visits, rayResult.visitedCells)
@@ -347,21 +355,25 @@ internal class DepthEvidenceKernel(
             }
             if (stageHasOccupied[index] && stageFreeValue(index) > 0) conflicts = checkedAdd(conflicts, 1)
         }
-        sortStageOrder()
+        val orderingWork = sortStageOrder()
         planChanges()
         validatePlannedChanges()?.let { return Staged.Refused(it) }
         var newRows = 0
         for (index in 0 until stageCount) {
             if (findRow(stageX[index], stageY[index], stageZ[index]) == EMPTY_ROW) newRows++
         }
-        if (residentRows + newRows > minOf(configuration.surfaceCapacity, batch.groupFrame.modelCapacity)) {
+        val projectedCanonicalSurfaces = projectedSurfaceCount(surfaces.surfaceCount)
+        if (projectedCanonicalSurfaces < 0) throw DepthLookupFailure()
+        if (residentRows + newRows > minOf(configuration.surfaceCapacity, batch.groupFrame.modelCapacity) ||
+            projectedCanonicalSurfaces > minOf(configuration.surfaceCapacity, batch.groupFrame.modelCapacity)
+        ) {
             return Staged.Refused(DepthEvidenceRefusal.SURFACE_CAPACITY)
         }
         val immutableChanges = Collections.unmodifiableList(
             (0 until stageChangeCount).map { materializeChange(it, cameraGroup, batch.groupFrame) },
         )
         val kindCounts = kindCounts(stageChangeKind, stageChangeCount)
-        val virtualWork = checkedAdd(acceptedSamples, checkedAdd(visits, stageCount))
+        val virtualWork = checkedAdd(orderingWork, checkedAdd(acceptedSamples, checkedAdd(visits, stageCount)))
         val receipt = DepthEvidenceReceipt(
             sequence = batch.sequence,
             sourceTimestampNs = batch.sourceTimestampNs,
@@ -379,7 +391,7 @@ internal class DepthEvidenceKernel(
             removeCount = kindCounts[6],
             conflictsRetained = conflicts,
             capacityRefusals = capacityRefusalCount,
-            overflowCount = overflowCount,
+            overflowCount = checkedAdd(overflowEvidenceCount, overflowCount),
             preparedResidentBytes = checkedBytes(stageCount),
             p50VirtualWorkUnits = virtualWork,
             p95VirtualWorkUnits = virtualWork,
@@ -468,7 +480,6 @@ internal class DepthEvidenceKernel(
             }
             addPlannedChange(kind, index, root, sourceCount == 1)
         }
-        sortStageOrder()
         for (position in 0 until stageCount) {
             val index = stageOrder[position]
             if (stageRemoval[index]) addPlannedChange(CHANGE_REMOVE, index, index, false)
@@ -618,13 +629,14 @@ internal class DepthEvidenceKernel(
             CHANGE_REFINE -> DepthEvidenceChange.Refine(requireNotNull(source), target(index, source))
             CHANGE_RELOCATE -> DepthEvidenceChange.Relocate(requireNotNull(source), target(index, source))
             CHANGE_MERGE -> DepthEvidenceChange.Merge(
-                sourceIdsForComponent(root), target(index),
+                immutableCopy(sourceIdsForComponent(root)), target(index),
             )
             CHANGE_SPLIT -> DepthEvidenceChange.Split(
-                requireNotNull(source), targetsForComponent(root, cameraGroup, frame),
+                requireNotNull(source), immutableCopy(targetsForComponent(root, cameraGroup, frame)),
             )
             CHANGE_REPLACE -> DepthEvidenceChange.Replace(
-                sourceIdsForComponent(root), targetsForComponent(root, cameraGroup, frame),
+                immutableCopy(sourceIdsForComponent(root)),
+                immutableCopy(targetsForComponent(root, cameraGroup, frame)),
             )
             CHANGE_REMOVE -> DepthEvidenceChange.Remove(requireNotNull(source))
             else -> error("unknown staged change kind")
@@ -633,6 +645,27 @@ internal class DepthEvidenceKernel(
 
     private fun sourceIdsForComponent(root: Int): List<SurfaceId> = List(componentSourceCount(root)) { rank ->
         SurfaceId(sourceAtRank(root, rank))
+    }
+
+    private fun <T> immutableCopy(values: Collection<T>): List<T> =
+        Collections.unmodifiableList(ArrayList(values))
+
+    private fun projectedSurfaceCount(initialCount: Int): Int {
+        var projected = initialCount
+        for (slot in 0 until stageChangeCount) {
+            val component = stageChangeComponent[slot]
+            val delta = when (stageChangeKind[slot].toInt()) {
+                CHANGE_CREATE -> 1
+                CHANGE_REFINE, CHANGE_RELOCATE -> 0
+                CHANGE_MERGE -> 1 - componentSourceCount(component)
+                CHANGE_SPLIT -> componentTargetCount(component) - 1
+                CHANGE_REPLACE -> componentTargetCount(component) - componentSourceCount(component)
+                CHANGE_REMOVE -> -1
+                else -> throw ArithmeticException("unknown projected change kind")
+            }
+            projected = Math.addExact(projected, delta)
+        }
+        return projected
     }
 
     private fun targetsForComponent(
@@ -883,9 +916,12 @@ internal class DepthEvidenceKernel(
 
     private fun validateCanonicalSurface(
         surfaces: BoundedCanonicalSurfaceView,
-        _addressedVoxel: Voxel,
-        surface: DepthCanonicalSurface,
+        addressedVoxel: Voxel,
+        lookup: AddressedCanonicalSurface,
     ) {
+        if (lookup.addressedVoxel != addressedVoxel) throw DepthLookupFailure()
+        if (surfaces.surfaceCount == 0) throw DepthLookupFailure()
+        val surface = lookup.surface
         val canonical = surfaces.findSurfaceById(surface.id) ?: throw DepthLookupFailure()
         if (canonical.id != surface.id || !voxelInRange(surface.voxel)) throw DepthLookupFailure()
         if (canonical.voxel != surface.voxel) throw DuplicateTargetFailure()
@@ -1014,24 +1050,43 @@ internal class DepthEvidenceKernel(
         stageOccupiedPointX[index], stageOccupiedPointY[index], stageOccupiedPointZ[index],
     )
 
-    private fun sortStageOrder() {
+    private fun sortStageOrder(): Int {
         for (index in 0 until stageCount) stageOrder[index] = index
-        for (position in 1 until stageCount) {
-            val value = stageOrder[position]
-            var cursor = position - 1
-            while (cursor >= 0 && compareStageIndices(stageOrder[cursor], value) > 0) {
-                stageOrder[cursor + 1] = stageOrder[cursor]
-                cursor--
+        var source = stageOrder
+        var destination = stageSortScratch
+        for (axis in 2 downTo 0) {
+            for (shift in 0 until Int.SIZE_BITS step RADIX_BITS) {
+                java.util.Arrays.fill(stageSortCounts, 0)
+                for (position in 0 until stageCount) {
+                    stageSortCounts[radixByte(source[position], axis, shift)]++
+                }
+                var prefix = 0
+                for (bucket in stageSortCounts.indices) {
+                    val count = stageSortCounts[bucket]
+                    stageSortCounts[bucket] = prefix
+                    prefix += count
+                }
+                for (position in 0 until stageCount) {
+                    val value = source[position]
+                    val bucket = radixByte(value, axis, shift)
+                    destination[stageSortCounts[bucket]++] = value
+                }
+                val previousSource = source
+                source = destination
+                destination = previousSource
             }
-            stageOrder[cursor + 1] = value
         }
+        check(source === stageOrder)
+        return Math.multiplyExact(stageCount, RADIX_PASSES * 2)
     }
 
-    private fun compareStageIndices(left: Int, right: Int): Int {
-        val x = stageX[left].compareTo(stageX[right])
-        if (x != 0) return x
-        val y = stageY[left].compareTo(stageY[right])
-        return if (y != 0) y else stageZ[left].compareTo(stageZ[right])
+    private fun radixByte(index: Int, axis: Int, shift: Int): Int {
+        val coordinate = when (axis) {
+            0 -> stageX[index]
+            1 -> stageY[index]
+            else -> stageZ[index]
+        }
+        return ((coordinate xor Int.MIN_VALUE) ushr shift) and (RADIX_BUCKETS - 1)
     }
 
     private fun resetStage() {
@@ -1095,6 +1150,10 @@ internal class DepthEvidenceKernel(
         ) {
             capacityRefusalCount = checkedAdd(capacityRefusalCount, 1)
             lastReceipt = lastReceipt.copy(capacityRefusals = capacityRefusalCount)
+        }
+        if (reason == DepthEvidenceRefusal.ARITHMETIC_OVERFLOW) {
+            overflowEvidenceCount = checkedAdd(overflowEvidenceCount, 1)
+            lastReceipt = lastReceipt.copy(overflowCount = overflowEvidenceCount)
         }
         return DepthEvidenceResult.Refused(reason, lastReceipt)
     }
@@ -1220,7 +1279,8 @@ internal class DepthEvidenceKernel(
         stageContradicted, stageSourceId, stageSourceKey, stagePackedNormal,
         stageNormalConfidence, stageLineageCount, stagePublished, stageHasOccupied,
         stageOccupiedPointX, stageOccupiedPointY, stageOccupiedPointZ,
-        stageFreeBin, stageOrder, stageRelationTarget, stageRelationSource,
+        stageFreeBin, stageOrder, stageSortScratch, stageSortCounts,
+        stageRelationTarget, stageRelationSource,
         stageComponent, stagePositive, stageRemoval, stageChangeKind,
         stageChangeSource, stageChangeTarget, stageChangeComponent,
     )
@@ -1274,13 +1334,28 @@ internal class DepthEvidenceKernel(
         const val EMPTY_ROW = -1
         const val EVIDENCE_BYTES = 32
         const val SEMANTIC_STATE_BUDGET_BYTES = 16 * 1024 * 1024
-        // Conservative semantic ownership allowance, not a JVM heap-size claim.
-        // It covers the larger of 67,072 compact removal descriptors (one per
-        // staged row) or 1,536 target-bearing endpoint changes, plus immutable
-        // list references and the Accepted/result/receipt/work containers.
-        const val MAXIMUM_ACCEPTED_OUTPUT_RESERVE_BYTES = 4 * 1024 * 1024
+        // Conservative modeled ownership under the same 16-byte header,
+        // 8-byte reference and 8-byte alignment convention as the array
+        // ledger. The largest shape reserves 65,536 Removes (a 24-byte change
+        // plus a 24-byte SurfaceId) and 1,536 Creates (a 24-byte change plus
+        // an 80-byte target/voxel graph), as well as 67,072 outer references,
+        // the exact list graph, and the Accepted/receipt/work containers. This
+        // is a semantic model, not a particular JVM heap measurement.
+        const val MAXIMUM_CHANGE_ROWS = 65_536 + V2_DEPTH_SAMPLE_CAPACITY
+        const val MAXIMUM_REMOVE_ROWS = 65_536
+        const val REMOVE_AND_ID_BYTES = MAXIMUM_REMOVE_ROWS * (24 + 24)
+        const val CREATE_AND_TARGET_BYTES = V2_DEPTH_SAMPLE_CAPACITY * (24 + 80)
+        const val CHANGE_REFERENCE_ARRAY_BYTES = 16 + MAXIMUM_CHANGE_ROWS * 8
+        const val CHANGE_LIST_GRAPH_BYTES = 32 + 24
+        const val ACCEPTED_PACKET_CONTAINER_BYTES = 56 + 104 + 40
+        const val MAXIMUM_ACCEPTED_OUTPUT_RESERVE_BYTES = REMOVE_AND_ID_BYTES +
+            CREATE_AND_TARGET_BYTES + CHANGE_REFERENCE_ARRAY_BYTES +
+            CHANGE_LIST_GRAPH_BYTES + ACCEPTED_PACKET_CONTAINER_BYTES
         const val ARRAY_HEADER_BYTES = 16L
         const val OBJECT_ALIGNMENT_BYTES = 8L
+        const val RADIX_BITS = 8
+        const val RADIX_BUCKETS = 1 shl RADIX_BITS
+        const val RADIX_PASSES = 3 * Int.SIZE_BYTES
         const val DIRECTION_BINS = 24
         const val NO_DIRECTION = -1
         const val CONTRADICTED_FLAG = 1
