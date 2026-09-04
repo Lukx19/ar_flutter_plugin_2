@@ -5,20 +5,32 @@ import org.junit.Test
 
 class DepthEvidenceKernelTest {
     @Test
-    fun `translated group unprojects the locked depth fixture`() {
+    fun `translated group emits the locked target and group-space normal`() {
         val kernel = DepthEvidenceKernel()
         val view = FakeCanonicalView()
-        val batch = batch(
-            timestamp = 1,
+        fun translatedBatch(sequence: Long) = batch(
+            timestamp = sequence,
             groupFrame = frame(),
             groupFromCamera = translation(0.02, 0.02, 0.02),
             samples = listOf(VisibilityDepthSample(2, 1, 1_000, 200)),
         )
+        repeat(3) { index ->
+            assertEquals(expectedAccepted(index + 1L), kernel.prepare(translatedBatch(index + 1L), view))
+            kernel.applyPrepared()
+        }
+        val result = kernel.prepare(translatedBatch(4), view)
 
-        val result = kernel.prepare(batch, view)
-
-        assertEquals(expectedAccepted(1), result)
-        assertEquals(Voxel(2, 0, -10), view.visitedEndpoints.single())
+        assertEquals(
+            expectedAccepted(
+                4,
+                changes = listOf(DepthEvidenceChange.Create(
+                    canonicalTarget(null, Voxel(2, 0, -10), -25, 0, 255),
+                )),
+                createCount = 1,
+            ),
+            result,
+        )
+        assertEquals(List(4) { Voxel(2, 0, -10) }, view.visitedEndpoints)
     }
 
     @Test
@@ -290,15 +302,30 @@ class DepthEvidenceKernelTest {
     }
 
     @Test
-    fun `nonidentity group transform remains deterministic at the prepare seam`() {
+    fun `rotated group emits the locked target and group-space normal`() {
+        val kernel = DepthEvidenceKernel()
         val view = FakeCanonicalView()
-        val result = DepthEvidenceKernel().prepare(
-            depthBatchForFrame(1, rotatedFrame(), rotationY180()),
-            view,
-        ) as DepthEvidenceResult.Accepted
+        repeat(3) { index ->
+            assertEquals(
+                expectedAccepted(index + 1L),
+                kernel.prepare(depthBatchForFrame(index + 1L, rotatedFrame(), rotationY180()), view),
+            )
+            kernel.applyPrepared()
+        }
+        val result = kernel.prepare(depthBatchForFrame(4, rotatedFrame(), rotationY180()), view)
+            as DepthEvidenceResult.Accepted
 
-        assertEquals(expectedAccepted(1), result)
-        assertEquals(Voxel(0, 0, 10), view.visitedEndpoints.single())
+        assertEquals(
+            expectedAccepted(
+                4,
+                changes = listOf(DepthEvidenceChange.Create(
+                    canonicalTarget(null, Voxel(0, 0, 10), 127, 127, 255),
+                )),
+                createCount = 1,
+            ),
+            result,
+        )
+        assertEquals(List(4) { Voxel(0, 0, 10) }, view.visitedEndpoints)
     }
 
     @Test
@@ -349,7 +376,7 @@ class DepthEvidenceKernelTest {
             ) as DepthEvidenceResult.Accepted
             val changes = if (index == 3) listOf(
                 DepthEvidenceChange.Create(
-                    canonicalTarget(null, Voxel(0, 0, -10), 5, 5, 255),
+                    canonicalTarget(null, Voxel(0, 0, -10), 0, 0, 255),
                 ),
             ) else emptyList()
             assertEquals(
@@ -373,7 +400,7 @@ class DepthEvidenceKernelTest {
             ) as DepthEvidenceResult.Accepted
             val changes = if (index == 3) listOf(
                 DepthEvidenceChange.Create(
-                    canonicalTarget(null, Voxel(-5, 0, -10), 74, 2, 255),
+                    canonicalTarget(null, Voxel(-5, 0, -10), 63, 0, 255),
                 ),
                 DepthEvidenceChange.Remove(SurfaceId(7)),
             ) else emptyList()
@@ -429,7 +456,7 @@ class DepthEvidenceKernelTest {
                 depthBatch(1L + index, cameraX = 0.05, endpointX = 0.05), view,
             ) as DepthEvidenceResult.Accepted
             val changes = if (index == 3) listOf(
-                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(0, 0, -10), 5, 5, 255)),
+                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(0, 0, -10), 0, 0, 255)),
             ) else emptyList()
             assertEquals(
                 expectedAccepted(
@@ -450,7 +477,7 @@ class DepthEvidenceKernelTest {
                 depthBatch(10L + index, cameraX = 0.55, endpointX = -0.45), view,
             ) as DepthEvidenceResult.Accepted
             val changes = if (index == 3) listOf(
-                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(-5, 0, -10), 74, 2, 255)),
+                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(-5, 0, -10), 63, 0, 255)),
                 DepthEvidenceChange.Remove(SurfaceId(7)),
             ) else emptyList()
             assertEquals(
@@ -608,17 +635,17 @@ class DepthEvidenceKernelTest {
                 DepthEvidenceChange.Refine(SurfaceId(103), canonicalTarget(SurfaceId(103), phantom[2], 16, 16, 200)),
                 DepthEvidenceChange.Refine(SurfaceId(104), canonicalTarget(SurfaceId(104), phantom[3], 16, 16, 200)),
                 DepthEvidenceChange.Refine(SurfaceId(105), canonicalTarget(SurfaceId(105), phantom[4], 16, 16, 200)),
-                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(-3, 0, -10), 70, 2, 255)),
-                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(0, 0, -10), 5, 5, 255)),
+                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(-3, 0, -10), 57, 0, 255)),
+                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(0, 0, -10), 0, 0, 255)),
                 DepthEvidenceChange.Remove(SurfaceId(101)),
                 DepthEvidenceChange.Remove(SurfaceId(102)),
                 DepthEvidenceChange.Remove(SurfaceId(103)),
-                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(-5, 0, -10), 74, 2, 255)),
+                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(-5, 0, -10), 63, 0, 255)),
                 DepthEvidenceChange.Remove(SurfaceId(104)),
-                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(-7, 0, -10), 78, 2, 255)),
+                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(-7, 0, -10), 70, 0, 255)),
                 DepthEvidenceChange.Remove(SurfaceId(105)),
-                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(-12, 0, -10), 84, 1, 255)),
-                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(-20, 0, -10), 93, 1, 255)),
+                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(-12, 0, -10), 79, 0, 255)),
+                DepthEvidenceChange.Create(canonicalTarget(null, Voxel(-20, 0, -10), 90, 0, 255)),
             ),
             emittedChanges,
         )
@@ -793,10 +820,10 @@ class DepthEvidenceKernelTest {
                 ) as DepthEvidenceResult.Accepted
                 val changes = when {
                     source.id == SurfaceId(1) && index == 6 -> listOf(DepthEvidenceChange.Create(
-                        canonicalTarget(null, Voxel(0, 0, -16), 0, 3, 255),
+                        canonicalTarget(null, Voxel(0, 0, -16), 0, 0, 255),
                     ))
                     source.id == SurfaceId(1) && index == 7 -> listOf(DepthEvidenceChange.Create(
-                        canonicalTarget(null, Voxel(0, 0, -2), 101, 127, 255),
+                        canonicalTarget(null, Voxel(0, 0, -2), 127, 127, 255),
                     ))
                     else -> emptyList()
                 }
@@ -848,7 +875,7 @@ class DepthEvidenceKernelTest {
         val committedReceipt = expectedAccepted(
             4,
             changes = listOf(DepthEvidenceChange.Create(
-                canonicalTarget(null, Voxel(0, 0, -10), 5, 5, 255),
+                canonicalTarget(null, Voxel(0, 0, -10), 0, 0, 255),
             )),
             createCount = 1,
         ).receipt

@@ -29,7 +29,7 @@ final class VisibilityGridCoreTests: XCTestCase {
         return scenarios.first { $0["name"] as? String == name }!
     }
 
-    func testSharedCorpusPinsDepthEvidencePacketsForEveryPlatform() throws {
+    func testSharedCorpusDeclarativelyPinsDepthEvidencePackets() throws {
         let specification = try XCTUnwrap(
             corpus["depthEvidenceKernel"] as? [String: Any]
         )
@@ -49,19 +49,49 @@ final class VisibilityGridCoreTests: XCTestCase {
         ]
         XCTAssertEqual(Set(cases.compactMap { $0["name"] as? String }), requiredNames)
         for fixtureCase in cases {
-            XCTAssertNotNil(fixtureCase["expectedChanges"] as? [[String: Any]])
-            XCTAssertNotNil(fixtureCase["expectedReceipt"] as? [String: Any])
-            XCTAssertTrue(fixtureCase.keys.contains("expectedWork"))
+            let input = try XCTUnwrap(fixtureCase["input"] as? [String: Any])
+            let runs = try XCTUnwrap(input["runs"] as? [[String: Any]])
+            XCTAssertFalse(runs.isEmpty)
+            for run in runs {
+                let steps = try XCTUnwrap(run["steps"] as? [[String: Any]])
+                XCTAssertFalse(steps.isEmpty)
+                for step in steps {
+                    XCTAssertNotNil(step["groupFromCamera"] as? [String: Any])
+                    XCTAssertNotNil(step["intrinsics"] as? [Any])
+                    XCTAssertNotNil(step["samples"])
+                    XCTAssertNotNil(step["expected"] as? [String: Any])
+                }
+            }
         }
         let create = try XCTUnwrap(
             cases.first { $0["name"] as? String == "create" }
         )
-        let changes = try XCTUnwrap(create["expectedChanges"] as? [[String: Any]])
+        let createInput = try XCTUnwrap(create["input"] as? [String: Any])
+        let createRuns = try XCTUnwrap(createInput["runs"] as? [[String: Any]])
+        let createSteps = try XCTUnwrap(createRuns.first?["steps"] as? [[String: Any]])
+        let createExpected = try XCTUnwrap(createSteps.last?["expected"] as? [String: Any])
+        let changes = try XCTUnwrap(createExpected["expectedChanges"] as? [[String: Any]])
         let target = try XCTUnwrap(changes.first?["target"] as? [String: Any])
         XCTAssertEqual(target["voxel"] as? [Int], [-8, 5, -10])
         XCTAssertEqual(target["normalOctX"] as? Int, 42)
         XCTAssertEqual(target["normalOctY"] as? Int, -28)
-        XCTAssertEqual(target["normalConfidence"] as? Int, 255)
+        XCTAssertEqual(target["normalConfidence"] as? Int, 64)
+        let transformed = try XCTUnwrap(
+            cases.first { $0["name"] as? String == "transformed_frame" }
+        )
+        let transformedInput = try XCTUnwrap(transformed["input"] as? [String: Any])
+        let transformedRuns = try XCTUnwrap(transformedInput["runs"] as? [[String: Any]])
+        func finalTarget(_ run: [String: Any]) throws -> [String: Any] {
+            let steps = try XCTUnwrap(run["steps"] as? [[String: Any]])
+            let expected = try XCTUnwrap(steps.last?["expected"] as? [String: Any])
+            let changes = try XCTUnwrap(expected["expectedChanges"] as? [[String: Any]])
+            return try XCTUnwrap(changes.first?["target"] as? [String: Any])
+        }
+        let translatedTarget = try finalTarget(try XCTUnwrap(transformedRuns.first))
+        let rotatedTarget = try finalTarget(try XCTUnwrap(transformedRuns.last))
+        XCTAssertEqual(translatedTarget["normalOctX"] as? Int, -25)
+        XCTAssertEqual(rotatedTarget["normalOctX"] as? Int, 127)
+        XCTAssertEqual(rotatedTarget["normalOctY"] as? Int, 127)
     }
 
     func testSharedCorpusPackedKeysAndGroupTransform() throws {

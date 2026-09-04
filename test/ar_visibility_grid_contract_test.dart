@@ -455,7 +455,8 @@ void main() {
       );
     });
 
-    test('rejects a mixed semantic style cut while retaining row residency', () {
+    test('rejects a mixed semantic style cut while retaining row residency',
+        () {
       final active = ARCoverageRendererStyleRowV1(
         semanticGeneration: 8,
         styleGeneration: 3,
@@ -670,17 +671,31 @@ void main() {
       ]),
     );
     for (final fixtureCase in depthEvidenceCases) {
-      expect(fixtureCase, containsPair('expectedChanges', isA<List<dynamic>>()));
-      expect(
-        fixtureCase,
-        containsPair('expectedReceipt', isA<Map<String, dynamic>>()),
-      );
-      expect(fixtureCase, contains('expectedWork'));
+      expect(fixtureCase, containsPair('input', isA<Map<String, dynamic>>()));
+      final input = fixtureCase['input'] as Map<String, dynamic>;
+      final runs = input['runs'] as List<dynamic>;
+      expect(runs, isNotEmpty);
+      for (final run in runs.cast<Map<String, dynamic>>()) {
+        final steps =
+            (run['steps'] as List<dynamic>).cast<Map<String, dynamic>>();
+        expect(steps, isNotEmpty);
+        for (final step in steps) {
+          expect(step, contains('groupFromCamera'));
+          expect(step, contains('intrinsics'));
+          expect(step, contains('samples'));
+          expect(step, containsPair('expected', isA<Map<String, dynamic>>()));
+        }
+      }
     }
     final createPacket = depthEvidenceCases.singleWhere(
       (fixtureCase) => fixtureCase['name'] == 'create',
     );
-    expect(createPacket['expectedChanges'], <Map<String, dynamic>>[
+    final createStep = ((((createPacket['input']
+                as Map<String, dynamic>)['runs'] as List<dynamic>)
+            .single as Map<String, dynamic>)['steps'] as List<dynamic>)
+        .single as Map<String, dynamic>;
+    final createExpected = createStep['expected'] as Map<String, dynamic>;
+    expect(createExpected['expectedChanges'], <Map<String, dynamic>>[
       <String, dynamic>{
         'kind': 'create',
         'target': <String, dynamic>{
@@ -688,13 +703,46 @@ void main() {
           'voxel': <int>[-8, 5, -10],
           'normalOctX': 42,
           'normalOctY': -28,
-          'normalConfidence': 255,
+          'normalConfidence': 64,
         },
       },
     ]);
     expect(
-      createPacket['expectedReceipt'],
+      createExpected['expectedReceipt'],
       containsPair('preparedResidentBytes', 32),
+    );
+    final transformedPacket = depthEvidenceCases.singleWhere(
+      (fixtureCase) => fixtureCase['name'] == 'transformed_frame',
+    );
+    Map<String, dynamic> finalExpected(
+      Map<String, dynamic> fixtureCase,
+      int runIndex,
+    ) {
+      final input = fixtureCase['input'] as Map<String, dynamic>;
+      final runs =
+          (input['runs'] as List<dynamic>).cast<Map<String, dynamic>>();
+      final steps = (runs[runIndex]['steps'] as List<dynamic>)
+          .cast<Map<String, dynamic>>();
+      return steps.last['expected'] as Map<String, dynamic>;
+    }
+
+    expect(
+      finalExpected(transformedPacket, 0)['expectedChanges'],
+      contains(
+        containsPair(
+          'target',
+          containsPair('normalOctX', -25),
+        ),
+      ),
+    );
+    expect(
+      finalExpected(transformedPacket, 1)['expectedChanges'],
+      contains(
+        containsPair(
+          'target',
+          containsPair('normalOctX', 127),
+        ),
+      ),
     );
     final scenarios =
         (fixture['scenarios'] as List<dynamic>).cast<Map<String, dynamic>>();

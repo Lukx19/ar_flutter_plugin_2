@@ -58,9 +58,9 @@ internal class DepthEvidenceKernel(
     private var stageLineageCount = ShortArray(stageCapacity)
     private var stagePublished = BooleanArray(stageCapacity)
     private var stageHasOccupied = BooleanArray(stageCapacity)
-    private var stageOccupiedCameraX = DoubleArray(stageCapacity)
-    private var stageOccupiedCameraY = DoubleArray(stageCapacity)
-    private var stageOccupiedCameraZ = DoubleArray(stageCapacity)
+    private var stageOccupiedPointX = DoubleArray(stageCapacity)
+    private var stageOccupiedPointY = DoubleArray(stageCapacity)
+    private var stageOccupiedPointZ = DoubleArray(stageCapacity)
     private var stageFreeBin = ByteArray(stageCapacity) { NO_DIRECTION.toByte() }
     private var stageOrder = IntArray(stageCapacity)
     private var stageRelationTarget = IntArray(stageCapacity)
@@ -217,9 +217,9 @@ internal class DepthEvidenceKernel(
         stageLineageCount = ShortArray(0)
         stagePublished = BooleanArray(0)
         stageHasOccupied = BooleanArray(0)
-        stageOccupiedCameraX = DoubleArray(0)
-        stageOccupiedCameraY = DoubleArray(0)
-        stageOccupiedCameraZ = DoubleArray(0)
+        stageOccupiedPointX = DoubleArray(0)
+        stageOccupiedPointY = DoubleArray(0)
+        stageOccupiedPointZ = DoubleArray(0)
         stageFreeBin = ByteArray(0)
         stageOrder = IntArray(0)
         stageRelationTarget = IntArray(0)
@@ -284,10 +284,10 @@ internal class DepthEvidenceKernel(
             val hadOccupied = priorEndpointIndex != EMPTY_ROW && stageHasOccupied[priorEndpointIndex]
             val endpointIndex = stageIndex(endpointVoxel, endpointSurface)
             stageHasOccupied[endpointIndex] = true
-            if (!hadOccupied || comparePoint(cameraPoint, occupiedPoint(endpointIndex)) < 0) {
-                stageOccupiedCameraX[endpointIndex] = cameraPoint.x
-                stageOccupiedCameraY[endpointIndex] = cameraPoint.y
-                stageOccupiedCameraZ[endpointIndex] = cameraPoint.z
+            if (!hadOccupied || comparePoint(endpoint, occupiedPoint(endpointIndex)) < 0) {
+                stageOccupiedPointX[endpointIndex] = endpoint.x
+                stageOccupiedPointY[endpointIndex] = endpoint.y
+                stageOccupiedPointZ[endpointIndex] = endpoint.z
             }
             var rayResult: DepthRayVisitResult
             val remaining = configuration.rayVisitCapacity - visits
@@ -886,9 +886,9 @@ internal class DepthEvidenceKernel(
         stageNormalConfidence[index] = 0
         stagePublished[index] = false
         stageHasOccupied[index] = false
-        stageOccupiedCameraX[index] = 0.0
-        stageOccupiedCameraY[index] = 0.0
-        stageOccupiedCameraZ[index] = 0.0
+        stageOccupiedPointX[index] = 0.0
+        stageOccupiedPointY[index] = 0.0
+        stageOccupiedPointZ[index] = 0.0
         stageFreeBin[index] = NO_DIRECTION.toByte()
         val resident = findRow(voxel.x, voxel.y, voxel.z)
         if (resident != EMPTY_ROW) {
@@ -937,7 +937,7 @@ internal class DepthEvidenceKernel(
     }
 
     private fun occupiedPoint(index: Int): DepthPointMm = DepthPointMm(
-        stageOccupiedCameraX[index], stageOccupiedCameraY[index], stageOccupiedCameraZ[index],
+        stageOccupiedPointX[index], stageOccupiedPointY[index], stageOccupiedPointZ[index],
     )
 
     private fun sortStageOrder() {
@@ -1145,7 +1145,7 @@ internal class DepthEvidenceKernel(
         stageX, stageY, stageZ, stageOccupied, stageFree, stageDirections,
         stageContradicted, stageSourceId, stageSourceKey, stagePackedNormal,
         stageNormalConfidence, stageLineageCount, stagePublished, stageHasOccupied,
-        stageOccupiedCameraX, stageOccupiedCameraY, stageOccupiedCameraZ,
+        stageOccupiedPointX, stageOccupiedPointY, stageOccupiedPointZ,
         stageFreeBin, stageOrder, stageRelationTarget, stageRelationSource,
         stageComponent, stagePositive, stageRemoval, stageChangeKind,
         stageChangeSource, stageChangeTarget, stageChangeComponent,

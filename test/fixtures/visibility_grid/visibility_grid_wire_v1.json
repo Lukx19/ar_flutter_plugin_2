@@ -41,14 +41,32 @@
       {
         "name": "transformed_frame",
         "covers": ["transformed frame"],
+        "input": {"runs": [
+          {"steps": [
+            {"sequence": 1, "groupFromCamera": {"type": "translation", "xyz": [0.02, 0.02, 0.02]}, "intrinsics": [4, 3, 2.0, 2.0, 1.5, 1.0], "samples": [[2, 1, 1000, 200]], "expected": {"expectedStatus": "accepted", "expectedChanges": [], "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 1, "touchedEvidenceRows": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 2, "p95VirtualWorkUnits": 2}, "expectedWork": {"distinctTouchedVoxelCount": 1, "emittedChangeCount": 0, "rayVisits": 0, "independentDirectionVotes": 0, "virtualWorkUnits": 2}}, "lifecycle": "apply"},
+            {"sequence": 2, "groupFromCamera": {"type": "translation", "xyz": [0.02, 0.02, 0.02]}, "intrinsics": [4, 3, 2.0, 2.0, 1.5, 1.0], "samples": [[2, 1, 1000, 200]], "expected": {"expectedStatus": "accepted", "expectedChanges": [], "expectedReceipt": {"sequence": 2, "sourceTimestampNs": 2, "acceptedSamples": 1, "touchedEvidenceRows": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 2, "p95VirtualWorkUnits": 2}, "expectedWork": {"distinctTouchedVoxelCount": 1, "emittedChangeCount": 0, "rayVisits": 0, "independentDirectionVotes": 0, "virtualWorkUnits": 2}}, "lifecycle": "apply"},
+            {"sequence": 3, "groupFromCamera": {"type": "translation", "xyz": [0.02, 0.02, 0.02]}, "intrinsics": [4, 3, 2.0, 2.0, 1.5, 1.0], "samples": [[2, 1, 1000, 200]], "expected": {"expectedStatus": "accepted", "expectedChanges": [], "expectedReceipt": {"sequence": 3, "sourceTimestampNs": 3, "acceptedSamples": 1, "touchedEvidenceRows": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 2, "p95VirtualWorkUnits": 2}, "expectedWork": {"distinctTouchedVoxelCount": 1, "emittedChangeCount": 0, "rayVisits": 0, "independentDirectionVotes": 0, "virtualWorkUnits": 2}}, "lifecycle": "apply"},
+            {"sequence": 4, "groupFromCamera": {"type": "translation", "xyz": [0.02, 0.02, 0.02]}, "intrinsics": [4, 3, 2.0, 2.0, 1.5, 1.0], "samples": [[2, 1, 1000, 200]], "expected": {"expectedStatus": "accepted", "expectedChanges": [{"kind": "create", "target": {"sourceId": null, "voxel": [2, 0, -10], "normalOctX": -25, "normalOctY": 0, "normalConfidence": 255}}], "expectedReceipt": {"sequence": 4, "sourceTimestampNs": 4, "acceptedSamples": 1, "touchedEvidenceRows": 1, "createCount": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 2, "p95VirtualWorkUnits": 2}, "expectedWork": {"distinctTouchedVoxelCount": 1, "emittedChangeCount": 1, "rayVisits": 0, "independentDirectionVotes": 0, "virtualWorkUnits": 2}}}
+          ]},
+          {"frame": {"worldFromGroup": {"type": "rotation_y_180"}, "groupFromWorld": {"type": "rotation_y_180"}}, "steps": [
+            {"sequence": 1, "groupFromCamera": {"type": "rotation_y_180"}, "intrinsics": [1, 1, 1.0, 1.0, 0.0, 0.0], "samples": [[0, 0, 1000, 255]], "expected": {"expectedStatus": "accepted", "expectedChanges": [], "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 1, "touchedEvidenceRows": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 2, "p95VirtualWorkUnits": 2}, "expectedWork": {"distinctTouchedVoxelCount": 1, "emittedChangeCount": 0, "rayVisits": 0, "independentDirectionVotes": 0, "virtualWorkUnits": 2}}, "lifecycle": "apply"},
+            {"sequence": 2, "groupFromCamera": {"type": "rotation_y_180"}, "intrinsics": [1, 1, 1.0, 1.0, 0.0, 0.0], "samples": [[0, 0, 1000, 255]], "expected": {"expectedStatus": "accepted", "expectedChanges": [], "expectedReceipt": {"sequence": 2, "sourceTimestampNs": 2, "acceptedSamples": 1, "touchedEvidenceRows": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 2, "p95VirtualWorkUnits": 2}, "expectedWork": {"distinctTouchedVoxelCount": 1, "emittedChangeCount": 0, "rayVisits": 0, "independentDirectionVotes": 0, "virtualWorkUnits": 2}}, "lifecycle": "apply"},
+            {"sequence": 3, "groupFromCamera": {"type": "rotation_y_180"}, "intrinsics": [1, 1, 1.0, 1.0, 0.0, 0.0], "samples": [[0, 0, 1000, 255]], "expected": {"expectedStatus": "accepted", "expectedChanges": [], "expectedReceipt": {"sequence": 3, "sourceTimestampNs": 3, "acceptedSamples": 1, "touchedEvidenceRows": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 2, "p95VirtualWorkUnits": 2}, "expectedWork": {"distinctTouchedVoxelCount": 1, "emittedChangeCount": 0, "rayVisits": 0, "independentDirectionVotes": 0, "virtualWorkUnits": 2}}, "lifecycle": "apply"},
+            {"sequence": 4, "groupFromCamera": {"type": "rotation_y_180"}, "intrinsics": [1, 1, 1.0, 1.0, 0.0, 0.0], "samples": [[0, 0, 1000, 255]], "expected": {"expectedStatus": "accepted", "expectedChanges": [{"kind": "create", "target": {"sourceId": null, "voxel": [0, 0, 10], "normalOctX": 127, "normalOctY": 127, "normalConfidence": 255}}], "expectedReceipt": {"sequence": 4, "sourceTimestampNs": 4, "acceptedSamples": 1, "touchedEvidenceRows": 1, "createCount": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 2, "p95VirtualWorkUnits": 2}, "expectedWork": {"distinctTouchedVoxelCount": 1, "emittedChangeCount": 1, "rayVisits": 0, "independentDirectionVotes": 0, "virtualWorkUnits": 2}}}
+          ]}
+        ]},
         "expectedStatus": "accepted",
-        "expectedChanges": [],
-        "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 1, "touchedEvidenceRows": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 2, "p95VirtualWorkUnits": 2},
-        "expectedWork": {"distinctTouchedVoxelCount": 1, "emittedChangeCount": 0, "rayVisits": 0, "independentDirectionVotes": 0, "virtualWorkUnits": 2}
+        "expectedChanges": [{"kind": "create", "target": {"sourceId": null, "voxel": [2, 0, -10], "normalOctX": -25, "normalOctY": 0, "normalConfidence": 255}}],
+        "expectedReceipt": {"sequence": 4, "sourceTimestampNs": 4, "acceptedSamples": 1, "touchedEvidenceRows": 1, "createCount": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 2, "p95VirtualWorkUnits": 2},
+        "expectedWork": {"distinctTouchedVoxelCount": 1, "emittedChangeCount": 1, "rayVisits": 0, "independentDirectionVotes": 0, "virtualWorkUnits": 2},
+        "expectedRotatedChanges": [{"kind": "create", "target": {"sourceId": null, "voxel": [0, 0, 10], "normalOctX": 127, "normalOctY": 127, "normalConfidence": 255}}],
+        "expectedRotatedReceipt": {"sequence": 4, "sourceTimestampNs": 4, "acceptedSamples": 1, "touchedEvidenceRows": 1, "createCount": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 2, "p95VirtualWorkUnits": 2},
+        "expectedRotatedWork": {"distinctTouchedVoxelCount": 1, "emittedChangeCount": 1, "rayVisits": 0, "independentDirectionVotes": 0, "virtualWorkUnits": 2}
       },
       {
         "name": "create",
         "covers": ["wall", "create", "change intent"],
+        "input": {"runs": [{"configuration": {"occupiedEvidenceToShow": 1}, "steps": [{"sequence": 1, "groupFromCamera": {"type": "identity"}, "intrinsics": [4, 3, 2.0, 2.0, 1.5, 1.0], "samples": [[0, 0, 1000, 255]], "expected": {"expectedStatus": "accepted", "expectedChanges": [{"kind": "create", "target": {"sourceId": null, "voxel": [-8, 5, -10], "normalOctX": 42, "normalOctY": -28, "normalConfidence": 64}}], "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 1, "touchedEvidenceRows": 1, "createCount": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 2, "p95VirtualWorkUnits": 2}, "expectedWork": {"distinctTouchedVoxelCount": 1, "emittedChangeCount": 1, "rayVisits": 0, "independentDirectionVotes": 0, "virtualWorkUnits": 2}}}]}]},
         "expectedStatus": "accepted",
         "expectedChanges": [{"kind": "create", "target": {"sourceId": null, "voxel": [-8, 5, -10], "normalOctX": 42, "normalOctY": -28, "normalConfidence": 255}}],
         "expectedReceipt": {"sequence": 4, "sourceTimestampNs": 4, "acceptedSamples": 1, "touchedEvidenceRows": 1, "createCount": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 2, "p95VirtualWorkUnits": 2},
@@ -57,6 +75,7 @@
       {
         "name": "refine",
         "covers": ["refine", "change intent"],
+        "input": {"runs": [{"configuration": {"occupiedEvidenceToShow": 1}, "view": {"surfaces": [{"sourceId": 7, "voxel": [0, 0, -5]}], "rayCells": [[0, 0, -5]]}, "steps": [{"sequence": 1, "groupFromCamera": {"type": "identity"}, "intrinsics": [1, 1, 1.0, 1.0, 0.0, 0.0], "samples": [[0, 0, 500, 255]], "expected": {"expectedStatus": "accepted", "expectedChanges": [{"kind": "refine", "sourceIds": [7], "target": {"sourceId": 7, "voxel": [0, 0, -5], "normalOctX": 16, "normalOctY": 16, "normalConfidence": 200}}], "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 1, "rayVisits": 1, "touchedEvidenceRows": 1, "refineCount": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 3, "p95VirtualWorkUnits": 3}, "expectedWork": {"distinctTouchedVoxelCount": 1, "emittedChangeCount": 1, "rayVisits": 1, "independentDirectionVotes": 0, "virtualWorkUnits": 3}}}]}]},
         "expectedStatus": "accepted",
         "expectedChanges": [{"kind": "refine", "sourceIds": [7], "target": {"sourceId": 7, "voxel": [0, 0, -5], "normalOctX": 16, "normalOctY": 16, "normalConfidence": 200}}],
         "expectedReceipt": {"sequence": 40, "sourceTimestampNs": 40, "acceptedSamples": 1, "rayVisits": 1, "touchedEvidenceRows": 1, "refineCount": 1, "conflictsRetained": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 3, "p95VirtualWorkUnits": 3},
@@ -65,6 +84,7 @@
       {
         "name": "relocate",
         "covers": ["relocate", "change intent"],
+        "input": {"runs": [{"configuration": {"occupiedEvidenceToShow": 1}, "view": {"surfaces": [{"sourceId": 21, "voxel": [3, 0, -10], "addressedAt": [0, 0, -10]}]}, "steps": [{"sequence": 1, "groupFromCamera": {"type": "identity"}, "intrinsics": [1, 1, 1.0, 1.0, 0.0, 0.0], "samples": [[0, 0, 1000, 255]], "expected": {"expectedStatus": "accepted", "expectedChanges": [{"kind": "relocate", "sourceIds": [21], "target": {"sourceId": 21, "voxel": [0, 0, -10], "normalOctX": 16, "normalOctY": 16, "normalConfidence": 200}}], "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 1, "touchedEvidenceRows": 1, "relocateCount": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 2, "p95VirtualWorkUnits": 2}, "expectedWork": {"distinctTouchedVoxelCount": 1, "emittedChangeCount": 1, "rayVisits": 0, "independentDirectionVotes": 0, "virtualWorkUnits": 2}}}]}]},
         "expectedStatus": "accepted",
         "expectedChanges": [{"kind": "relocate", "sourceIds": [21], "target": {"sourceId": 21, "voxel": [0, 0, -10], "normalOctX": 16, "normalOctY": 16, "normalConfidence": 200}}],
         "expectedReceipt": {"sequence": 4, "sourceTimestampNs": 4, "acceptedSamples": 1, "touchedEvidenceRows": 1, "relocateCount": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 2, "p95VirtualWorkUnits": 2},
@@ -73,6 +93,7 @@
       {
         "name": "merge",
         "covers": ["merge", "change intent"],
+        "input": {"runs": [{"configuration": {"occupiedEvidenceToShow": 1}, "view": {"surfaces": [{"sourceId": 31, "voxel": [-2, 0, -10], "addressedAt": [0, 0, -10]}, {"sourceId": 32, "voxel": [2, 0, -10], "addressedAt": [2, 0, -10]}], "rayHits": [{"voxel": [0, 0, -10], "sourceId": 32}]}, "steps": [{"sequence": 1, "groupFromCamera": {"type": "identity"}, "intrinsics": [1, 1, 1.0, 1.0, 0.0, 0.0], "samples": [[0, 0, 1000, 255]], "expected": {"expectedStatus": "accepted", "expectedChanges": [{"kind": "merge", "sourceIds": [31, 32], "target": {"sourceId": null, "voxel": [0, 0, -10], "normalOctX": 16, "normalOctY": 16, "normalConfidence": 200}}], "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 1, "rayVisits": 1, "touchedEvidenceRows": 1, "mergeCount": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 3, "p95VirtualWorkUnits": 3}, "expectedWork": {"distinctTouchedVoxelCount": 1, "emittedChangeCount": 1, "rayVisits": 1, "independentDirectionVotes": 0, "virtualWorkUnits": 3}}}]}]},
         "expectedStatus": "accepted",
         "expectedChanges": [{"kind": "merge", "sourceIds": [31, 32], "target": {"sourceId": null, "voxel": [0, 0, -10], "normalOctX": 16, "normalOctY": 16, "normalConfidence": 200}}],
         "expectedReceipt": {"sequence": 4, "sourceTimestampNs": 4, "acceptedSamples": 1, "rayVisits": 1, "touchedEvidenceRows": 1, "mergeCount": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 3, "p95VirtualWorkUnits": 3},
@@ -81,6 +102,7 @@
       {
         "name": "split",
         "covers": ["split", "change intent"],
+        "input": {"runs": [{"configuration": {"occupiedEvidenceToShow": 1}, "view": {"surfaces": [{"sourceId": 41, "voxel": [2, 0, -10], "addressedAt": [-8, 0, -10]}, {"sourceId": 41, "voxel": [2, 0, -10], "addressedAt": [7, 0, -10]}]}, "steps": [{"sequence": 1, "groupFromCamera": {"type": "identity"}, "intrinsics": [4, 1, 2.0, 1.0, 1.5, 0.0], "samples": [[0, 0, 1000, 255], [3, 0, 1000, 255]], "expected": {"expectedStatus": "accepted", "expectedChanges": [{"kind": "split", "sourceIds": [41], "targets": [{"sourceId": null, "voxel": [-8, 0, -10], "normalOctX": 16, "normalOctY": 16, "normalConfidence": 200}, {"sourceId": null, "voxel": [7, 0, -10], "normalOctX": 16, "normalOctY": 16, "normalConfidence": 200}]}], "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 2, "touchedEvidenceRows": 2, "splitCount": 1, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 4, "p95VirtualWorkUnits": 4}, "expectedWork": {"distinctTouchedVoxelCount": 2, "emittedChangeCount": 1, "rayVisits": 0, "independentDirectionVotes": 0, "virtualWorkUnits": 4}}}]}]},
         "expectedStatus": "accepted",
         "expectedChanges": [{"kind": "split", "sourceIds": [41], "targets": [{"sourceId": null, "voxel": [-8, 0, -10], "normalOctX": 16, "normalOctY": 16, "normalConfidence": 200}, {"sourceId": null, "voxel": [7, 0, -10], "normalOctX": 16, "normalOctY": 16, "normalConfidence": 200}]}],
         "expectedReceipt": {"sequence": 4, "sourceTimestampNs": 4, "acceptedSamples": 2, "touchedEvidenceRows": 2, "splitCount": 1, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 4, "p95VirtualWorkUnits": 4},
@@ -89,6 +111,7 @@
       {
         "name": "replace",
         "covers": ["replace", "change intent"],
+        "input": {"runs": [{"configuration": {"occupiedEvidenceToShow": 1}, "view": {"surfaces": [{"sourceId": 51, "voxel": [-2, 0, -10], "addressedAt": [-8, 0, -10]}, {"sourceId": 52, "voxel": [2, 0, -10], "addressedAt": [7, 0, -10]}], "rayHits": [{"voxel": [-8, 0, -10], "sourceId": 52}, {"voxel": [7, 0, -10], "sourceId": 51}]}, "steps": [{"sequence": 1, "groupFromCamera": {"type": "identity"}, "intrinsics": [4, 1, 2.0, 1.0, 1.5, 0.0], "samples": [[0, 0, 1000, 255], [3, 0, 1000, 255]], "expected": {"expectedStatus": "accepted", "expectedChanges": [{"kind": "replace", "sourceIds": [51, 52], "targets": [{"sourceId": null, "voxel": [-8, 0, -10], "normalOctX": 16, "normalOctY": 16, "normalConfidence": 200}, {"sourceId": null, "voxel": [7, 0, -10], "normalOctX": 16, "normalOctY": 16, "normalConfidence": 200}]}], "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 2, "rayVisits": 4, "touchedEvidenceRows": 2, "replaceCount": 1, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 8, "p95VirtualWorkUnits": 8}, "expectedWork": {"distinctTouchedVoxelCount": 2, "emittedChangeCount": 1, "rayVisits": 4, "independentDirectionVotes": 0, "virtualWorkUnits": 8}}}]}]},
         "expectedStatus": "accepted",
         "expectedChanges": [{"kind": "replace", "sourceIds": [51, 52], "targets": [{"sourceId": null, "voxel": [-8, 0, -10], "normalOctX": 16, "normalOctY": 16, "normalConfidence": 200}, {"sourceId": null, "voxel": [7, 0, -10], "normalOctX": 16, "normalOctY": 16, "normalConfidence": 200}]}],
         "expectedReceipt": {"sequence": 4, "sourceTimestampNs": 4, "acceptedSamples": 2, "rayVisits": 4, "touchedEvidenceRows": 2, "replaceCount": 1, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 8, "p95VirtualWorkUnits": 8},
@@ -97,6 +120,10 @@
       {
         "name": "remove_at_viable_capacity",
         "covers": ["remove", "capacity", "change intent"],
+        "input": {"runs": [{"configuration": {"surfaceCapacity": 2, "freeEvidenceToCarve": 2, "freeEvidenceMargin": 0, "separatedDirectionBinsRequired": 2}, "frame": {"voxelSizeMicrometres": 200000, "modelCapacity": 2}, "view": {"surfaces": [{"sourceId": 81, "voxel": [0, 0, -3]}], "rayCells": [[0, 0, -3]]}, "steps": [
+          {"sequence": 1, "groupFromCamera": {"type": "translation", "xyz": [0.65, 0.05, 0.05]}, "intrinsics": [1, 1, 1.0, 1.0, 0.65, 0.0], "samples": [[0, 0, 1000, 255]], "expected": {"expectedStatus": "accepted", "expectedChanges": [], "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 1, "rayVisits": 1, "touchedEvidenceRows": 2, "independentDirectionVotes": 1, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 4, "p95VirtualWorkUnits": 4}, "expectedWork": {"distinctTouchedVoxelCount": 2, "emittedChangeCount": 0, "rayVisits": 1, "independentDirectionVotes": 1, "virtualWorkUnits": 4}}, "lifecycle": "apply"},
+          {"sequence": 2, "groupFromCamera": {"type": "translation", "xyz": [0.05, 0.05, 0.05]}, "intrinsics": [1, 1, 1.0, 1.0, 0.0, 0.0], "samples": [[0, 0, 1000, 255]], "expected": {"expectedStatus": "accepted", "expectedChanges": [{"kind": "remove", "sourceIds": [81]}], "expectedReceipt": {"sequence": 2, "sourceTimestampNs": 2, "acceptedSamples": 1, "rayVisits": 1, "touchedEvidenceRows": 2, "independentDirectionVotes": 1, "removeCount": 1, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 4, "p95VirtualWorkUnits": 4}, "expectedWork": {"distinctTouchedVoxelCount": 2, "emittedChangeCount": 1, "rayVisits": 1, "independentDirectionVotes": 1, "virtualWorkUnits": 4}}}
+        ]}]},
         "expectedStatus": "accepted",
         "expectedChanges": [{"kind": "remove", "sourceIds": [81]}],
         "expectedReceipt": {"sequence": 27, "sourceTimestampNs": 27, "acceptedSamples": 1, "rayVisits": 1, "touchedEvidenceRows": 2, "removeCount": 1, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 4, "p95VirtualWorkUnits": 4},
@@ -105,6 +132,7 @@
       {
         "name": "corridor",
         "covers": ["corridor", "safety band"],
+        "input": {"runs": [{"view": {"surfaces": [{"sourceId": 1, "voxel": [0, 0, -6]}, {"sourceId": 2, "voxel": [0, 0, -9]}, {"sourceId": 3, "voxel": [0, 0, -13]}], "rayCells": [[0, 0, -6], [0, 0, -9], [0, 0, -13]]}, "steps": [{"sequence": 1, "groupFromCamera": {"type": "translation", "xyz": [0.05, 0.05, 0.05]}, "intrinsics": [1, 1, 1.0, 1.0, 0.0, 0.0], "samples": [[0, 0, 1000, 255]], "expected": {"expectedStatus": "accepted", "expectedChanges": [], "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 1, "rayVisits": 3, "touchedEvidenceRows": 4, "independentDirectionVotes": 1, "preparedResidentBytes": 128, "p50VirtualWorkUnits": 8, "p95VirtualWorkUnits": 8}, "expectedWork": {"distinctTouchedVoxelCount": 4, "emittedChangeCount": 0, "rayVisits": 3, "independentDirectionVotes": 1, "virtualWorkUnits": 8}}}]}]},
         "expectedStatus": "accepted",
         "expectedChanges": [],
         "expectedReceipt": {"sequence": 139, "sourceTimestampNs": 139, "acceptedSamples": 1, "rayVisits": 5, "touchedEvidenceRows": 6, "preparedResidentBytes": 192, "p50VirtualWorkUnits": 12, "p95VirtualWorkUnits": 12},
@@ -113,6 +141,10 @@
       {
         "name": "safety_band_boundary",
         "covers": ["safety band", "no behind endpoint"],
+        "input": {"runs": [
+          {"frame": {"voxelSizeMicrometres": 300000, "modelCapacity": 100}, "view": {"surfaces": [{"sourceId": 7, "voxel": [0, 0, -3]}], "rayCells": [[0, 0, -3]]}, "steps": [{"sequence": 1, "groupFromCamera": {"type": "translation", "xyz": [0.0, 0.0, -0.05]}, "intrinsics": [1, 1, 1.0, 1.0, 0.0, 0.0], "samples": [[0, 0, 1000, 255]], "expected": {"expectedStatus": "accepted", "expectedChanges": [], "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 1, "rayVisits": 1, "touchedEvidenceRows": 2, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 4, "p95VirtualWorkUnits": 4}, "expectedWork": {"distinctTouchedVoxelCount": 2, "emittedChangeCount": 0, "rayVisits": 1, "independentDirectionVotes": 0, "virtualWorkUnits": 4}}}]},
+          {"view": {"surfaces": [{"sourceId": 7, "voxel": [0, 0, -13]}], "rayCells": [[0, 0, -13]]}, "steps": [{"sequence": 1, "groupFromCamera": {"type": "identity"}, "intrinsics": [1, 1, 1.0, 1.0, 0.0, 0.0], "samples": [[0, 0, 1000, 255]], "expected": {"expectedStatus": "accepted", "expectedChanges": [], "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 1, "rayVisits": 1, "touchedEvidenceRows": 2, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 4, "p95VirtualWorkUnits": 4}, "expectedWork": {"distinctTouchedVoxelCount": 2, "emittedChangeCount": 0, "rayVisits": 1, "independentDirectionVotes": 0, "virtualWorkUnits": 4}}}]}
+        ]},
         "expectedStatus": "accepted",
         "expectedChanges": [],
         "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 1, "rayVisits": 1, "touchedEvidenceRows": 2, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 4, "p95VirtualWorkUnits": 4},
@@ -121,6 +153,10 @@
       {
         "name": "hole_and_foreground_edge",
         "covers": ["hole", "low confidence", "foreground edge"],
+        "input": {"runs": [
+          {"view": {"surfaces": [{"sourceId": 91, "voxel": [2, 0, -5]}], "rayCells": [[2, 0, -5]]}, "steps": [{"sequence": 1, "groupFromCamera": {"type": "identity"}, "intrinsics": [1, 1, 1.0, 1.0, 0.0, 0.0], "samples": [[0, 0, 1000, 255], [0, 0, 500, 127]], "expected": {"expectedStatus": "accepted", "expectedChanges": [], "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 1, "rejectedSamples": 1, "rayVisits": 1, "touchedEvidenceRows": 2, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 4, "p95VirtualWorkUnits": 4}, "expectedWork": {"distinctTouchedVoxelCount": 2, "emittedChangeCount": 0, "rayVisits": 1, "independentDirectionVotes": 0, "virtualWorkUnits": 4}}}]},
+          {"view": {"surfaces": [{"sourceId": 1, "voxel": [2, 0, -5]}], "rayCells": [[2, 0, -5]]}, "steps": [{"sequence": 1, "groupFromCamera": {"type": "identity"}, "intrinsics": [1, 1, 1.0, 1.0, 0.0, 0.0], "samples": [[0, 0, 1000, 255]], "expected": {"expectedStatus": "accepted", "expectedChanges": [], "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 1, "rayVisits": 1, "touchedEvidenceRows": 2, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 4, "p95VirtualWorkUnits": 4}, "expectedWork": {"distinctTouchedVoxelCount": 2, "emittedChangeCount": 0, "rayVisits": 1, "independentDirectionVotes": 0, "virtualWorkUnits": 4}}}]}
+        ]},
         "expectedStatus": "accepted",
         "expectedChanges": [],
         "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 1, "rejectedSamples": 1, "rayVisits": 1, "touchedEvidenceRows": 2, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 4, "p95VirtualWorkUnits": 4},
@@ -129,6 +165,16 @@
       {
         "name": "thin_double_opposed_views",
         "covers": ["thin wall", "double wall", "opposed views"],
+        "input": {"runs": [
+          {"configuration": {"occupiedEvidenceToShow": 255, "freeEvidenceToCarve": 1, "freeEvidenceMargin": 1, "separatedDirectionBinsRequired": 1}, "view": {"surfaces": [{"sourceId": 1, "voxel": [0, 0, -9]}], "rayCells": [[0, 0, -9]]}, "steps": [
+            {"sequence": 1, "groupFromCamera": {"type": "translation", "xyz": [0.0, 0.05, 0.05]}, "intrinsics": [1, 1, 1.0, 1.0, 0.0, 0.0], "samples": [[0, 0, 900, 255], [0, 0, 1600, 255]], "expected": {"expectedStatus": "accepted", "expectedChanges": [], "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 2, "rayVisits": 2, "touchedEvidenceRows": 2, "independentDirectionVotes": 1, "conflictsRetained": 1, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 6, "p95VirtualWorkUnits": 6}, "expectedWork": {"distinctTouchedVoxelCount": 2, "emittedChangeCount": 0, "rayVisits": 2, "independentDirectionVotes": 1, "virtualWorkUnits": 6}}, "lifecycle": "apply"},
+            {"sequence": 2, "groupFromCamera": {"type": "rotation_y_180", "translation": [0.0, 0.05, -1.8]}, "intrinsics": [1, 1, 1.0, 1.0, 0.0, 0.0], "samples": [[0, 0, 900, 255], [0, 0, 1600, 255]], "expected": {"expectedStatus": "accepted", "expectedChanges": [], "expectedReceipt": {"sequence": 2, "sourceTimestampNs": 2, "acceptedSamples": 2, "rayVisits": 2, "touchedEvidenceRows": 2, "independentDirectionVotes": 1, "conflictsRetained": 1, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 6, "p95VirtualWorkUnits": 6}, "expectedWork": {"distinctTouchedVoxelCount": 2, "emittedChangeCount": 0, "rayVisits": 2, "independentDirectionVotes": 1, "virtualWorkUnits": 6}}}
+          ]},
+          {"configuration": {"occupiedEvidenceToShow": 255, "freeEvidenceToCarve": 1, "freeEvidenceMargin": 1, "separatedDirectionBinsRequired": 1}, "view": {"surfaces": [{"sourceId": 2, "voxel": [0, 0, -12]}], "rayCells": [[0, 0, -12]]}, "steps": [
+            {"sequence": 1, "groupFromCamera": {"type": "translation", "xyz": [0.0, 0.05, 0.05]}, "intrinsics": [1, 1, 1.0, 1.0, 0.0, 0.0], "samples": [[0, 0, 1200, 255], [0, 0, 1600, 255]], "expected": {"expectedStatus": "accepted", "expectedChanges": [], "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 2, "rayVisits": 2, "touchedEvidenceRows": 2, "independentDirectionVotes": 1, "conflictsRetained": 1, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 6, "p95VirtualWorkUnits": 6}, "expectedWork": {"distinctTouchedVoxelCount": 2, "emittedChangeCount": 0, "rayVisits": 2, "independentDirectionVotes": 1, "virtualWorkUnits": 6}}, "lifecycle": "apply"},
+            {"sequence": 2, "groupFromCamera": {"type": "rotation_y_180", "translation": [0.0, 0.05, -1.8]}, "intrinsics": [1, 1, 1.0, 1.0, 0.0, 0.0], "samples": [[0, 0, 650, 255], [0, 0, 1600, 255]], "expected": {"expectedStatus": "accepted", "expectedChanges": [], "expectedReceipt": {"sequence": 2, "sourceTimestampNs": 2, "acceptedSamples": 2, "rayVisits": 2, "touchedEvidenceRows": 2, "independentDirectionVotes": 1, "conflictsRetained": 1, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 6, "p95VirtualWorkUnits": 6}, "expectedWork": {"distinctTouchedVoxelCount": 2, "emittedChangeCount": 0, "rayVisits": 2, "independentDirectionVotes": 1, "virtualWorkUnits": 6}}}
+          ]}
+        ]},
         "expectedStatus": "accepted",
         "expectedChanges": [],
         "expectedReceipt": {"sequence": 27, "sourceTimestampNs": 27, "acceptedSamples": 2, "rayVisits": 2, "touchedEvidenceRows": 2, "conflictsRetained": 1, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 6, "p95VirtualWorkUnits": 6},
@@ -137,6 +183,7 @@
       {
         "name": "full_sample_budget",
         "covers": ["full budget"],
+        "input": {"runs": [{"steps": [{"sequence": 1, "groupFromCamera": {"type": "identity"}, "intrinsics": [1, 1, 1.0, 1.0, 0.0, 0.0], "samples": {"repeat": 1536, "value": [0, 0, 1000, 255]}, "expected": {"expectedStatus": "accepted", "expectedChanges": [], "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 1536, "touchedEvidenceRows": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 1537, "p95VirtualWorkUnits": 1537}, "expectedWork": {"distinctTouchedVoxelCount": 1, "emittedChangeCount": 0, "rayVisits": 0, "independentDirectionVotes": 0, "virtualWorkUnits": 1537}}}]}]},
         "expectedStatus": "accepted",
         "expectedChanges": [],
         "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 1536, "touchedEvidenceRows": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 1537, "p95VirtualWorkUnits": 1537},
@@ -145,6 +192,7 @@
       {
         "name": "canonical_lookup_refusal",
         "covers": ["refusal", "canonical lookup"],
+        "input": {"runs": [{"view": {"surfaces": [{"sourceId": 61, "voxel": [0, 0, -10]}], "idLookup": "missing"}, "steps": [{"sequence": 1, "groupFromCamera": {"type": "identity"}, "intrinsics": [1, 1, 1.0, 1.0, 0.0, 0.0], "samples": [[0, 0, 1000, 255]], "expected": {"expectedStatus": "refused", "expectedRefusal": "CANONICAL_LOOKUP_FAILED", "expectedChanges": [], "expectedReceipt": {"sequence": 0, "sourceTimestampNs": 0}, "expectedWork": null}}]}]},
         "expectedStatus": "refused",
         "expectedRefusal": "CANONICAL_LOOKUP_FAILED",
         "expectedChanges": [],
@@ -154,6 +202,7 @@
       {
         "name": "capacity_refusal",
         "covers": ["refusal", "capacity"],
+        "input": {"runs": [{"configuration": {"surfaceCapacity": 1}, "frame": {"modelCapacity": 1}, "view": {"surfaceCount": 2}, "steps": [{"sequence": 1, "groupFromCamera": {"type": "identity"}, "intrinsics": [1, 1, 1.0, 1.0, 0.0, 0.0], "samples": [[0, 0, 1000, 255]], "expected": {"expectedStatus": "refused", "expectedRefusal": "SURFACE_CAPACITY", "expectedChanges": [], "expectedReceipt": {"sequence": 0, "sourceTimestampNs": 0, "capacityRefusals": 1}, "expectedWork": null}}]}]},
         "expectedStatus": "refused",
         "expectedRefusal": "SURFACE_CAPACITY",
         "expectedChanges": [],

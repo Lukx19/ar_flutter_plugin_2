@@ -12,7 +12,7 @@ import org.junit.Test
 
 class VisibilityGridFixtureContractTest {
     @Test
-    fun `shared corpus drives an exact depth evidence public packet`() {
+    fun `shared corpus executes every exact depth evidence fixture`() {
         val specification = loadFixture().getValue("depthEvidenceKernel").jsonObject
         assertEquals(
             "bounded_depth_evidence_fixture_v1",
@@ -30,53 +30,12 @@ class VisibilityGridFixtureContractTest {
         }.toSet()
         assertTrue(actualCoverage.containsAll(requiredCoverage))
         cases.forEach { case ->
-            assertTrue(case.containsKey("expectedChanges"))
-            assertTrue(case.containsKey("expectedReceipt"))
-            assertTrue(case.containsKey("expectedWork"))
+            assertTrue(case.containsKey("input"))
+            assertTrue(case.getValue("input").jsonObject.getValue("runs").jsonArray.isNotEmpty())
         }
-
-        val expectedCase = cases.single { it.getValue("name").jsonPrimitive.content == "create" }
-        val kernel = DepthEvidenceKernel()
-        val view = object : BoundedCanonicalSurfaceView {
-            override val geometryRevision = 0L
-            override val lineageRevision = 0L
-            override val surfaceCount = 0
-            override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? = null
-            override fun findSurfaceAt(voxel: Voxel): DepthCanonicalSurface? = null
-            override fun visitRayCells(
-                startGroupMm: DepthPointMm,
-                endpointGroupMm: DepthPointMm,
-                maximumVisits: Int,
-                visitor: (Voxel, DepthCanonicalSurface?) -> Boolean,
-            ) = DepthRayVisitResult(0, false)
+        cases.forEach { case ->
+            executeDepthEvidenceCase(specification, case)
         }
-        fun translation(x: Double, y: Double, z: Double) =
-            identityVisibilityGridTransform().also { matrix ->
-                matrix[12] = x
-                matrix[13] = y
-                matrix[14] = z
-            }
-        val groupFrame = VisibilityGroupFrame.copyOf(
-            translation(0.3, -0.2, 0.1),
-            translation(-0.3, 0.2, -0.1),
-            voxelSizeMicrometres = 100_000,
-            modelCapacity = 100,
-        )
-        fun batch(sequence: Long) = DepthEvidenceBatch(
-            sequence = sequence,
-            sourceTimestampNs = sequence,
-            groupFrame = groupFrame,
-            groupFromCameraGl = translation(0.0, 0.0, 0.0).toList(),
-            intrinsics = VisibilityCameraIntrinsics(4, 3, 2.0, 2.0, 1.5, 1.0),
-            samples = listOf(VisibilityDepthSample(0, 0, 1_000, 255)),
-            sourceRejectedSamples = 0,
-        )
-        repeat(3) { index ->
-            kernel.prepare(batch(index + 1L), view)
-            kernel.applyPrepared()
-        }
-        val actual = kernel.prepare(batch(4), view)
-        assertEquals(expectedDepthEvidenceResult(specification, expectedCase), actual)
     }
 
     @Test
@@ -776,6 +735,142 @@ class VisibilityGridFixtureContractTest {
 
     private fun kotlinx.serialization.json.JsonObject.int(field: String): Int =
         getValue(field).jsonPrimitive.content.toInt()
+
+    private fun executeDepthEvidenceCase(
+        specification: kotlinx.serialization.json.JsonObject,
+        case: kotlinx.serialization.json.JsonObject,
+    ) {
+        val caseName = case.getValue("name").jsonPrimitive.content
+        val runs = case.getValue("input").jsonObject.getValue("runs").jsonArray
+        runs.forEachIndexed { runIndex, runValue ->
+            val run = runValue.jsonObject
+            val configured = run["configuration"]?.jsonObject
+            val configuration = DepthEvidenceConfiguration(
+                confidenceMinimum = configured?.get("confidenceMinimum")?.jsonPrimitive?.content?.toInt() ?: 128,
+                safetyBandMillimetres = configured?.get("safetyBandMillimetres")?.jsonPrimitive?.content?.toInt() ?: 150,
+                occupiedEvidenceToShow = configured?.get("occupiedEvidenceToShow")?.jsonPrimitive?.content?.toInt() ?: 4,
+                freeEvidenceToCarve = configured?.get("freeEvidenceToCarve")?.jsonPrimitive?.content?.toInt() ?: 8,
+                freeEvidenceMargin = configured?.get("freeEvidenceMargin")?.jsonPrimitive?.content?.toInt() ?: 4,
+                separatedDirectionBinsRequired = configured?.get("separatedDirectionBinsRequired")?.jsonPrimitive?.content?.toInt() ?: 2,
+                surfaceCapacity = configured?.get("surfaceCapacity")?.jsonPrimitive?.content?.toInt() ?: 100_000,
+            )
+            val kernel = DepthEvidenceKernel(configuration)
+            val view = CorpusDepthView(run["view"]?.jsonObject)
+            val frameSpec = run["frame"]?.jsonObject
+            val voxelSize = frameSpec?.get("voxelSizeMicrometres")?.jsonPrimitive?.content?.toInt() ?: 100_000
+            val modelCapacity = frameSpec?.get("modelCapacity")?.jsonPrimitive?.content?.toInt() ?: 100
+            val frame = VisibilityGroupFrame.copyOf(
+                corpusTransform(frameSpec?.get("worldFromGroup")?.jsonObject),
+                corpusTransform(frameSpec?.get("groupFromWorld")?.jsonObject),
+                voxelSize,
+                modelCapacity,
+            )
+            run.getValue("steps").jsonArray.forEachIndexed { stepIndex, stepValue ->
+                val step = stepValue.jsonObject
+                val intrinsics = step.getValue("intrinsics").jsonArray.map { it.jsonPrimitive.content.toDouble() }
+                val sampleElement = step.getValue("samples")
+                val sampleValues = if (sampleElement is kotlinx.serialization.json.JsonObject) {
+                    List(sampleElement.int("repeat")) { sampleElement.getValue("value") }
+                } else {
+                    sampleElement.jsonArray
+                }
+                val samples = sampleValues.map { sampleValue ->
+                    val sample = sampleValue.jsonArray.map { it.jsonPrimitive.content.toInt() }
+                    VisibilityDepthSample(sample[0], sample[1], sample[2], sample[3])
+                }
+                val sequence = step.getValue("sequence").jsonPrimitive.content.toLong()
+                val batch = DepthEvidenceBatch(
+                    sequence = sequence,
+                    sourceTimestampNs = step["sourceTimestampNs"]?.jsonPrimitive?.content?.toLong() ?: sequence,
+                    groupFrame = frame,
+                    groupFromCameraGl = corpusTransform(step.getValue("groupFromCamera").jsonObject).toList(),
+                    intrinsics = VisibilityCameraIntrinsics(
+                        intrinsics[0].toInt(), intrinsics[1].toInt(), intrinsics[2],
+                        intrinsics[3], intrinsics[4], intrinsics[5],
+                    ),
+                    samples = samples,
+                    sourceRejectedSamples = step["sourceRejectedSamples"]?.jsonPrimitive?.content?.toInt() ?: 0,
+                    tracking = step["tracking"]?.jsonPrimitive?.content?.toBoolean() ?: true,
+                )
+                val expected = expectedDepthEvidenceResult(specification, step.getValue("expected").jsonObject)
+                val actual = kernel.prepare(batch, view)
+                assertEquals("$caseName run=$runIndex step=$stepIndex", expected, actual)
+                when (step["lifecycle"]?.jsonPrimitive?.content ?: "none") {
+                    "apply" -> assertEquals(
+                        DepthEvidenceApplyResult.Applied((expected as DepthEvidenceResult.Accepted).receipt),
+                        kernel.applyPrepared(),
+                    )
+                    "discard" -> assertEquals(
+                        DepthEvidenceDiscardResult.Discarded((expected as DepthEvidenceResult.Accepted).receipt),
+                        kernel.discardPrepared(),
+                    )
+                    "none" -> Unit
+                    else -> error("Unknown depth-evidence fixture lifecycle")
+                }
+            }
+        }
+    }
+
+    private fun corpusTransform(value: kotlinx.serialization.json.JsonObject?): DoubleArray {
+        val matrix = identityVisibilityGridTransform()
+        when (value?.get("type")?.jsonPrimitive?.content ?: "identity") {
+            "identity" -> Unit
+            "translation" -> requireNotNull(value).getValue("xyz").jsonArray.forEachIndexed { index, coordinate ->
+                matrix[12 + index] = coordinate.jsonPrimitive.content.toDouble()
+            }
+            "rotation_y_180" -> {
+                matrix[0] = -1.0
+                matrix[10] = -1.0
+                requireNotNull(value)["translation"]?.jsonArray?.forEachIndexed { index, coordinate ->
+                    matrix[12 + index] = coordinate.jsonPrimitive.content.toDouble()
+                }
+            }
+            else -> error("Unknown depth-evidence fixture transform")
+        }
+        return matrix
+    }
+
+    private class CorpusDepthView(specification: kotlinx.serialization.json.JsonObject?) : BoundedCanonicalSurfaceView {
+        private fun voxel(value: kotlinx.serialization.json.JsonElement): Voxel {
+            val coordinates = value.jsonArray.map { it.jsonPrimitive.content.toInt() }
+            return Voxel(coordinates[0], coordinates[1], coordinates[2])
+        }
+        private val surfaces = specification?.get("surfaces")?.jsonArray?.associate { value ->
+            val surface = value.jsonObject
+            val canonicalVoxel = voxel(surface.getValue("voxel"))
+            val addressed = surface["addressedAt"]?.let(::voxel) ?: canonicalVoxel
+            addressed to DepthCanonicalSurface(
+                SurfaceId(surface.getValue("sourceId").jsonPrimitive.content.toLong()),
+                canonicalVoxel,
+                surface["packedNormal"]?.jsonPrimitive?.content?.toInt() ?: 0x1010,
+                surface["normalConfidence"]?.jsonPrimitive?.content?.toInt() ?: 200,
+                surface["lineageCount"]?.jsonPrimitive?.content?.toInt() ?: 1,
+            )
+        }.orEmpty()
+        private val byId = surfaces.values.associateBy { it.id }
+        private val rayCells = specification?.get("rayCells")?.jsonArray?.map(::voxel).orEmpty()
+        private val rayHits = specification?.get("rayHits")?.jsonArray?.map { value ->
+            val hit = value.jsonObject
+            voxel(hit.getValue("voxel")) to
+                hit["sourceId"]?.jsonPrimitive?.content?.toLong()?.let { byId[SurfaceId(it)] }
+        }
+        private val missingIds = specification?.get("idLookup")?.jsonPrimitive?.content == "missing"
+        override val geometryRevision = 0L
+        override val lineageRevision = 0L
+        override val surfaceCount = specification?.get("surfaceCount")?.jsonPrimitive?.content?.toInt() ?: surfaces.size
+        override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? = if (missingIds) null else byId[id]
+        override fun findSurfaceAt(voxel: Voxel): DepthCanonicalSurface? = surfaces[voxel]
+        override fun visitRayCells(
+            startGroupMm: DepthPointMm,
+            endpointGroupMm: DepthPointMm,
+            maximumVisits: Int,
+            visitor: (Voxel, DepthCanonicalSurface?) -> Boolean,
+        ): DepthRayVisitResult {
+            val hits = rayHits ?: rayCells.map { it to surfaces[it] }
+            hits.take(maximumVisits).forEach { visitor(it.first, it.second) }
+            return DepthRayVisitResult(hits.size.coerceAtMost(maximumVisits), hits.size > maximumVisits)
+        }
+    }
 
     private fun expectedDepthEvidenceResult(
         specification: kotlinx.serialization.json.JsonObject,
