@@ -2,7 +2,7 @@ package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
 import com.uhg0.ar_flutter_plugin_2.proposal08.CommittedBaselineAuthority
 import com.uhg0.ar_flutter_plugin_2.proposal08.CommittedBaselineScopeV1
-import com.uhg0.ar_flutter_plugin_2.proposal08.CommittedBaselineV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineV1
 import com.uhg0.ar_flutter_plugin_2.proposal08.CommitReceiptQueryV1
 import com.uhg0.ar_flutter_plugin_2.proposal08.ControlCodec
 import com.uhg0.ar_flutter_plugin_2.proposal08.ControlOperation
@@ -11,7 +11,7 @@ import com.uhg0.ar_flutter_plugin_2.proposal08.CurrentDeltaReceiptV1
 import com.uhg0.ar_flutter_plugin_2.proposal08.CurrentDeltaSelectorV1
 import com.uhg0.ar_flutter_plugin_2.proposal08.CurrentDeltaSourceV1
 import com.uhg0.ar_flutter_plugin_2.proposal08.PacketCodec
-import com.uhg0.ar_flutter_plugin_2.proposal08.StartRequestCodecV2
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.StartRequestCodecV2
 import com.uhg0.ar_flutter_plugin_2.proposal08.TransactionResponseProfileV1
 import com.uhg0.ar_flutter_plugin_2.proposal08.Uuid
 import io.flutter.plugin.common.BinaryMessenger
@@ -191,7 +191,7 @@ class VisibilityGridV2BindingTest {
         val authority = CommittedBaselineAuthority()
         val request = startRequest()
         val scope = CommittedBaselineScopeV1.from(request)
-        val baseline = com.uhg0.ar_flutter_plugin_2.proposal08.CommittedBaselineV1(
+        val baseline = com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineV1(
             transactionId = 9,
             geometryRevision = 10,
             lineageRevision = 11,
@@ -262,6 +262,7 @@ class VisibilityGridV2BindingTest {
             assertEquals(before.initialTransactionQueued, afterMalformed.initialTransactionQueued)
             assertEquals(before.streamToken, afterMalformed.streamToken)
             assertEquals(baseline, authority.snapshot(scope))
+            assertEquals(null, binding.currentObservationOwnership())
 
             val malformedPayload = RecordingResult()
             val shortStart = request.copy(payload = request.payload.copyOf(request.payload.size - 1))
@@ -282,6 +283,7 @@ class VisibilityGridV2BindingTest {
             assertEquals(shortStart.payload.size.toLong(), payloadDetail.observedValue)
             assertEquals(0, binding.snapshot().acceptedControls)
             assertEquals(baseline, authority.snapshot(scope))
+            assertEquals(null, binding.currentObservationOwnership())
 
             val corrected = RecordingResult()
             MethodChannel(messenger, "visibility_grid_v2_control_1200").invokeMethod(
@@ -1042,6 +1044,7 @@ class VisibilityGridV2BindingTest {
             )
             assertTrue(stale.completed.await(2, TimeUnit.SECONDS))
             assertEquals(null, stale.bytes)
+            assertEquals(observationCut, binding.currentObservationOwnership())
         } finally {
             binding.dispose()
         }
@@ -1254,6 +1257,7 @@ class VisibilityGridV2BindingTest {
             )
             assertTrue(stopped.completed.await(2, TimeUnit.SECONDS))
             assertEquals(1, stopped.successCount)
+            assertEquals(null, binding.currentObservationOwnership())
             refused {
                 val successor = CurrentDeltaSelectorV1(4, 4, 2)
                 binding.queueCommittedCurrentDelta(source(successor, 3, byteArrayOf(4)), successor)

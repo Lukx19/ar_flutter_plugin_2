@@ -5,7 +5,7 @@ import com.uhg0.ar_flutter_plugin_2.proposal08.ControlCodec
 import com.uhg0.ar_flutter_plugin_2.proposal08.ControlOperation
 import com.uhg0.ar_flutter_plugin_2.proposal08.ControlRequest
 import com.uhg0.ar_flutter_plugin_2.proposal08.PacketCodec
-import com.uhg0.ar_flutter_plugin_2.proposal08.StartRequestCodecV2
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.StartRequestCodecV2
 import com.uhg0.ar_flutter_plugin_2.proposal08.TransactionResponseProfileV1
 import com.uhg0.ar_flutter_plugin_2.proposal08.TransactionChunkFrameV1
 import com.uhg0.ar_flutter_plugin_2.proposal08.TransactionResponseCodecV1
@@ -130,6 +130,8 @@ class VisibilityGridIntegrationTest {
             assertEquals(4, exchange(messenger, 2106, stream, 2, 0, 0, 0).first.messageKind)
             assertEquals(0, exchange(messenger, 2106, stream, 3, 1, 1, 1).first.messageKind)
             val cut = requireNotNull(binding.currentObservationOwnership())
+            assertEquals(0, cut.groupFrame.modelCapacity)
+            assertEquals(100_000, cut.groupFrame.effectiveModelCapacity)
             integration.admitFeature(feature(cut, 10))
             val staged = integration.integrationReceipt()
             assertEquals("pendingAck", staged.status)
@@ -225,9 +227,16 @@ class VisibilityGridIntegrationTest {
             val viewId = 2120 + index
             val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
             var armed = true
+            val projected = mutableListOf<CommittedGeometryCut>()
             val integration = VisibilityGridIntegration(
                 binding, binding::currentObservationOwnership, directory,
                 resourcesForGroup = resources(directory, coordinator),
+                renderer = object : CommittedRendererProjection {
+                    override fun applyGeometry(cut: CommittedGeometryCut): RendererProjectionResult {
+                        projected += cut
+                        return RendererProjectionResult.Applied(cut.upserts.size)
+                    }
+                },
                 queueCurrent = { activeBinding, source, selector ->
                     if (armed) {
                         armed = false
@@ -246,11 +255,13 @@ class VisibilityGridIntegrationTest {
 
                 integration.admitFeature(feature(cut, 10))
                 assertEquals("publicationRetryPending", integration.integrationReceipt().status)
+                assertTrue("A refused queue must not project geometry", projected.isEmpty())
                 val kernel = privateField<FeatureFusionKernel>(integration, "kernel")
                 assertEquals(1, kernel.resourceReceipt().surfaceCount)
                 assertEquals(1, kernel.resourceReceipt().associationCount)
                 integration.admitFeature(feature(cut, 11, 0.32))
                 assertEquals("awaitingExactAck", integration.integrationReceipt().status)
+                assertEquals(1, projected.size)
                 assertEquals(1, kernel.resourceReceipt().surfaceCount)
                 assertEquals(1, kernel.resourceReceipt().associationCount)
 
@@ -266,6 +277,64 @@ class VisibilityGridIntegrationTest {
             } finally {
                 integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
             }
+        }
+    }
+
+    @Test
+    fun `renderer refusal retains queued cut through ACK and retries the exact cut`() {
+        val directory = Files.createTempDirectory("canonical-surface-runtime-renderer-retry").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val viewId = 2122
+        val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+        val attempts = mutableListOf<CommittedGeometryCut>()
+        var refuse = true
+        val integration = VisibilityGridIntegration(
+            binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = resources(directory, coordinator),
+            renderer = object : CommittedRendererProjection {
+                override fun applyGeometry(cut: CommittedGeometryCut): RendererProjectionResult {
+                    attempts += cut
+                    return if (refuse) {
+                        refuse = false
+                        RendererProjectionResult.Refused(RendererProjectionRefusal.CAPACITY)
+                    } else {
+                        RendererProjectionResult.Applied(cut.upserts.size)
+                    }
+                }
+            },
+        )
+        try {
+            val stream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            val ownership = requireNotNull(binding.currentObservationOwnership())
+
+            integration.admitFeature(feature(ownership, 10))
+            assertEquals("rendererRetryPending", integration.integrationReceipt().status)
+            val retained = attempts.single()
+            assertEquals(2, retained.transactionId)
+            assertEquals(1, retained.baseGeometryRevision)
+            assertEquals(2, retained.geometryRevision)
+            assertEquals(1, retained.lineageRevision)
+            assertEquals(1, retained.upserts.size)
+
+            exchange(messenger, viewId, stream, 4, 1, 1, 1)
+            exchange(messenger, viewId, stream, 5, 1, 1, 1)
+            exchange(messenger, viewId, stream, 6, 1, 1, 1)
+            exchange(messenger, viewId, stream, 7, 2, 2, 1)
+            await { integration.integrationReceipt().status == "rendererRetryPending" }
+
+            integration.admitFeature(feature(ownership, 11, 0.32))
+            assertEquals(3, attempts.size)
+            assertEquals(retained.transactionId, attempts[1].transactionId)
+            assertEquals(retained.geometryRevision, attempts[1].geometryRevision)
+            assertEquals(retained.upserts.single().surfaceId, attempts[1].upserts.single().surfaceId)
+            assertEquals(3, attempts[2].transactionId)
+            assertEquals("pendingAck", integration.integrationReceipt().status)
+        } finally {
+            integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
         }
     }
 

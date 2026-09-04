@@ -8,7 +8,7 @@ import com.uhg0.ar_flutter_plugin_2.proposal08.ControlCodec
 import com.uhg0.ar_flutter_plugin_2.proposal08.ControlOperation
 import com.uhg0.ar_flutter_plugin_2.proposal08.ControlRequest
 import com.uhg0.ar_flutter_plugin_2.proposal08.PacketCodec
-import com.uhg0.ar_flutter_plugin_2.proposal08.StartRequestCodecV2
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.StartRequestCodecV2
 import com.uhg0.ar_flutter_plugin_2.proposal08.TransactionResponseProfileV1
 import com.uhg0.ar_flutter_plugin_2.proposal08.TransactionChunkFrameV1
 import com.uhg0.ar_flutter_plugin_2.proposal08.TransactionResponseCodecV1

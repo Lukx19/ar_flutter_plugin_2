@@ -55,6 +55,7 @@ internal class VisibilityGridIntegration(
     private var pendingQueued = false
     private var pendingGeometryCut: CommittedGeometryCut? = null
     private var pendingRendererApplied = false
+    private var pendingBindingAcknowledged = false
     private var pendingRendererRows = 0
     private var pendingCanonicalAcknowledgement: CanonicalAcknowledgement? = null
     private val retainedDelta = ExactCurrentDeltaSource()
@@ -70,25 +71,29 @@ internal class VisibilityGridIntegration(
     override fun admitFeature(observation: VisibilityFeatureObservation) = mutate(observation.ownership) {
         if (isFenced(observation.ownership)) return@mutate
         if (pending != null) {
-            if (!pendingQueued && !retryPendingQueue()) {
+            if ((!pendingQueued || !pendingRendererApplied) && !retryPendingQueue()) {
                 rejected++
                 receipt = receipt.copy(rejected = rejected)
                 return@mutate
             }
-            rejected++
-            receipt = receipt.copy(status = "awaitingExactAck", rejected = rejected)
-            return@mutate
+            if (pending != null) {
+                rejected++
+                receipt = receipt.copy(status = "awaitingExactAck", rejected = rejected)
+                return@mutate
+            }
         }
         ensureOpened(observation.ownership) ?: return@mutate
         if (pending != null) {
-            if (!pendingQueued && !retryPendingQueue()) {
+            if ((!pendingQueued || !pendingRendererApplied) && !retryPendingQueue()) {
                 rejected++
                 receipt = receipt.copy(rejected = rejected)
                 return@mutate
             }
-            rejected++
-            receipt = receipt.copy(status = "awaitingExactAck", rejected = rejected)
-            return@mutate
+            if (pending != null) {
+                rejected++
+                receipt = receipt.copy(status = "awaitingExactAck", rejected = rejected)
+                return@mutate
+            }
         }
         // This adapter is the only CAPTURE-INGRESS-to-canonical surface conversion point.  It creates
         // fixed camera/sample evidence before the kernel can mutate anything.
@@ -467,6 +472,7 @@ internal class VisibilityGridIntegration(
         pendingQueued = false
         pendingGeometryCut = geometryCut
         pendingRendererApplied = rendererAlreadyCurrent
+        pendingBindingAcknowledged = false
         pendingRendererRows = if (rendererAlreadyCurrent) renderer.currentRowCount() else 0
         committed++
         receipt = VisibilityGridIntegrationReceipt(
@@ -481,38 +487,48 @@ internal class VisibilityGridIntegration(
     /** Idempotently correlates the already-retained durable current to V2. */
     private fun retryPendingQueue(): Boolean {
         val selector = pending ?: return true
-        return try {
-            queueCurrent(binding, retainedDelta, selector)
-            pendingQueued = true
-            if (!pendingRendererApplied) {
-                val cut = pendingGeometryCut ?: return false
-                if (isFenced(cut.ownership)) {
-                    receipt = receipt.copy(status = "publicationDeferred")
+        if (!pendingQueued) {
+            try {
+                queueCurrent(binding, retainedDelta, selector)
+                pendingQueued = true
+            } catch (_: IllegalStateException) {
+                receipt = receipt.copy(status = "publicationRetryPending")
+                return false
+            } catch (_: IllegalArgumentException) {
+                receipt = receipt.copy(status = "publicationRetryPending")
+                return false
+            }
+        }
+        if (!pendingRendererApplied) {
+            val cut = pendingGeometryCut ?: return false
+            if (isFenced(cut.ownership)) {
+                receipt = receipt.copy(status = "publicationDeferred")
+                return false
+            }
+            val result = try {
+                renderer.applyGeometry(cut)
+            } catch (_: IllegalStateException) {
+                receipt = receipt.copy(status = "rendererRetryPending")
+                return false
+            } catch (_: IllegalArgumentException) {
+                receipt = receipt.copy(status = "rendererRetryPending")
+                return false
+            }
+            when (result) {
+                is RendererProjectionResult.Applied -> {
+                    pendingRendererApplied = true
+                    pendingRendererRows = result.rowCount
+                }
+                is RendererProjectionResult.Refused -> {
+                    rejected++
+                    receipt = receipt.copy(status = "rendererRetryPending", rejected = rejected)
                     return false
                 }
-                when (val result = renderer.applyGeometry(cut)) {
-                    is RendererProjectionResult.Applied -> {
-                        pendingRendererApplied = true
-                        pendingRendererRows = result.rowCount
-                    }
-                    is RendererProjectionResult.Refused -> {
-                        rejected++
-                        receipt = receipt.copy(status = "rendererRefused", rejected = rejected)
-                        return false
-                    }
-                }
             }
-            receipt = receipt.copy(status = "pendingAck", rendererRows = pendingRendererRows)
-            true
-        } catch (_: IllegalStateException) {
-            pendingQueued = false
-            receipt = receipt.copy(status = "publicationRetryPending")
-            false
-        } catch (_: IllegalArgumentException) {
-            pendingQueued = false
-            receipt = receipt.copy(status = "publicationRetryPending")
-            false
         }
+        if (pendingBindingAcknowledged) finishPendingAcknowledgement(selector)
+        if (pending != null) receipt = receipt.copy(status = "pendingAck", rendererRows = pendingRendererRows)
+        return true
     }
 
     private fun rebuildCanonicalRenderer(
@@ -558,26 +574,37 @@ internal class VisibilityGridIntegration(
             executor.submit {
                 synchronized(lock) {
                     if (pending != selector || !pendingQueued || closed) return@synchronized
-                    val acknowledgement = requireNotNull(pendingCanonicalAcknowledgement)
-                    when (val result = requireNotNull(owner).acknowledgeCanonicalCurrent(acknowledgement)) {
-                        is CanonicalAcknowledgementResult.Acknowledged,
-                        is CanonicalAcknowledgementResult.Idempotent -> Unit
-                        is CanonicalAcknowledgementResult.NoOp -> {
-                            receipt = receipt.copy(status = "ack${result.reason.name}")
-                            return@synchronized
-                        }
+                    pendingBindingAcknowledged = true
+                    if (!pendingRendererApplied) {
+                        receipt = receipt.copy(status = "rendererRetryPending")
+                        return@synchronized
                     }
-                    retainedDelta.acknowledge(selector)
-                    pending = null
-                    pendingQueued = false
-                    pendingGeometryCut = null
-                    pendingRendererApplied = false
-                    pendingRendererRows = 0
-                    pendingCanonicalAcknowledgement = null
-                    receipt = receipt.copy(status = "acknowledged")
+                    finishPendingAcknowledgement(selector)
                 }
             }
         }
+    }
+
+    private fun finishPendingAcknowledgement(selector: CurrentDeltaSelectorV1) {
+        if (pending != selector || !pendingBindingAcknowledged || !pendingRendererApplied) return
+        val acknowledgement = requireNotNull(pendingCanonicalAcknowledgement)
+        when (val result = requireNotNull(owner).acknowledgeCanonicalCurrent(acknowledgement)) {
+            is CanonicalAcknowledgementResult.Acknowledged,
+            is CanonicalAcknowledgementResult.Idempotent -> Unit
+            is CanonicalAcknowledgementResult.NoOp -> {
+                receipt = receipt.copy(status = "ack${result.reason.name}")
+                return
+            }
+        }
+        retainedDelta.acknowledge(selector)
+        pending = null
+        pendingQueued = false
+        pendingGeometryCut = null
+        pendingRendererApplied = false
+        pendingBindingAcknowledged = false
+        pendingRendererRows = 0
+        pendingCanonicalAcknowledgement = null
+        receipt = receipt.copy(status = "acknowledged")
     }
 
     private fun closeOwner() {
@@ -586,6 +613,7 @@ internal class VisibilityGridIntegration(
         pendingQueued = false
         pendingGeometryCut = null
         pendingRendererApplied = false
+        pendingBindingAcknowledged = false
         pendingRendererRows = 0
         resources?.close() ?: owner?.close()
         resources = null
@@ -680,13 +708,14 @@ internal class NativeRendererProjection(
         if (cut.lineageRevision < activeLineageRevision) {
             return RendererProjectionResult.Refused(RendererProjectionRefusal.MIXED_CUT)
         }
-        val removedKnownCount = cut.removedSurfaceIds.count(surfaceVoxels::containsKey)
-        val insertedCount = cut.upserts.count { !surfaceVoxels.containsKey(it.surfaceId) }
+        val removedIds = cut.removedSurfaceIds
+        val removedKnownCount = removedIds.count(surfaceVoxels::containsKey)
+        val remainingIds = surfaceVoxels.keys - removedIds.toSet()
+        val insertedCount = cut.upserts.count { it.surfaceId !in remainingIds }
         val targetRowCount = surfaceVoxels.size - removedKnownCount + insertedCount
-        if (targetRowCount > cut.ownership.groupFrame.modelCapacity) {
+        if (targetRowCount > cut.ownership.groupFrame.effectiveModelCapacity) {
             return RendererProjectionResult.Refused(RendererProjectionRefusal.CAPACITY)
         }
-        val removedIds = cut.removedSurfaceIds
         val removalKeys = removedIds.map { surfaceVoxels[it] }.filterNotNull()
             .map { packVisibilityGridKey(it.x, it.y, it.z) }
             .toMutableSet()
@@ -769,7 +798,7 @@ internal class NativeRendererProjection(
                 groupGeneration = cut.ownership.groupGeneration,
                 sessionGeneration = cut.ownership.sessionGeneration,
                 voxelSizeMeters = frame.voxelSizeMicrometres.toDouble() / 1_000_000.0,
-                capacity = frame.modelCapacity,
+                capacity = frame.effectiveModelCapacity,
                 groupFromWorldGl = frame.groupFromWorldGl.toDoubleArray(),
                 worldFromGroupGl = frame.worldFromGroupGl.toDoubleArray(),
                 restoredGeometryRevision = cut.geometryRevision,
@@ -788,7 +817,7 @@ internal class NativeRendererProjection(
     private fun renderConfig(cut: CommittedGeometryCut): PointCloudNativeConfig {
         val frame = cut.ownership.groupFrame
         return PointCloudNativeConfig(
-            renderCapacity = frame.modelCapacity,
+            renderCapacity = frame.effectiveModelCapacity,
             voxelRenderMode = VoxelRenderMode.CENTROIDS,
             voxelSizeMeters = frame.voxelSizeMicrometres.toFloat() / 1_000_000f,
         )

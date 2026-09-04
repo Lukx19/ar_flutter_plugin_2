@@ -1,5 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CoordinateFrameTransforms
+
 const val VISIBILITY_GRID_WIRE_VERSION = "visibility_grid_wire_v1"
 
 private const val VOXEL_COORDINATE_BIAS = 1L shl 20
@@ -153,7 +155,7 @@ data class VisibilityGridGroupConfig(
         require(matrixConvention == "column_major_gl_v1")
         require(groupFromWorldGl.size == 16 && groupFromWorldGl.all(Double::isFinite))
         require(worldFromGroupGl.size == 16 && worldFromGroupGl.all(Double::isFinite))
-        require(areInverseTransforms(groupFromWorldGl, worldFromGroupGl))
+        require(CoordinateFrameTransforms.areFiniteAffineInverses(groupFromWorldGl, worldFromGroupGl))
         require(restoredGeometryRevision >= 0)
         require(restoredVisibilityRevision >= 0)
         require(restoredKeys.distinct().size == restoredKeys.size)
@@ -161,21 +163,6 @@ data class VisibilityGridGroupConfig(
         require(restoredKeys.isEmpty() || restoredGeometryRevision > 0)
     }
 }
-
-private fun areInverseTransforms(
-    first: DoubleArray,
-    second: DoubleArray,
-): Boolean =
-    (0 until 4).all { row ->
-        (0 until 4).all { column ->
-            val actual =
-                (0 until 4).sumOf { index ->
-                    first[index * 4 + row] * second[column * 4 + index]
-                }
-            val expected = if (row == column) 1.0 else 0.0
-            kotlin.math.abs(actual - expected) <= 1e-6
-        }
-    }
 
 data class FeatureSample(
     val id: Int,

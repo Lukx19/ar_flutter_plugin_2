@@ -156,6 +156,17 @@ class PreparedIntentVisitorTest {
                 assertEquals(plan.kind.name, plan.commandId, result.identity.commandId)
                 assertEquals(plan.kind.name, plan.kind, result.identity.kind)
                 assertEquals(plan.kind.name, expected.terminal, result.currentReceipt)
+                val geometryCut = plan.toCommittedGeometryCut(committedOwnership(), transactionId = 91)
+                assertEquals(plan.kind.name, 91, geometryCut.transactionId)
+                assertEquals(plan.kind.name, plan.sourceCut.geometryRevision, geometryCut.baseGeometryRevision)
+                assertEquals(plan.kind.name, plan.targetGeometryRevision, geometryCut.geometryRevision)
+                assertEquals(plan.kind.name, plan.targetLineageRevision, geometryCut.lineageRevision)
+                assertEquals(plan.kind.name, expected.removed, geometryCut.removedSurfaceIds.toList())
+                assertEquals(
+                    plan.kind.name,
+                    expected.rows.map { listOf(it.id, it.x.toLong(), it.y.toLong(), it.z.toLong(), it.normal.toLong(), it.confidence.toLong(), plan.targetLineageCount.toLong()) },
+                    geometryCut.upserts.map { listOf(it.surfaceId, it.voxel.x.toLong(), it.voxel.y.toLong(), it.voxel.z.toLong(), it.packedNormal.toLong(), it.normalConfidence.toLong(), it.lineageCount.toLong()) },
+                )
             } finally { directory.deleteRecursively() }
         }
     }
@@ -322,6 +333,17 @@ class PreparedIntentVisitorTest {
     private fun scenarioSurface(id: Long, x: Int) = CompactSurface(SurfaceId(id), Voxel(x, 0, 0), 0, 192)
     private fun scenarioSource(id: Long, x: Int) = PagedSource(
         SurfaceId(id), Voxel(x, 0, 0), 0, 192, CanonicalReceiptBytes(ByteArray(32) { id.toByte() }),
+    )
+
+    private fun committedOwnership() = VisibilityObservationOwnership(
+        sessionId = "01".repeat(16), sessionGeneration = 1,
+        captureGroupId = "02".repeat(16), groupGeneration = 1, coverageEpoch = 1,
+        arSessionIdentity = "03".repeat(16), viewInstanceId = "04".repeat(16), viewGeneration = 1,
+        nativeStreamToken = "05".repeat(16), workerBindingToken = "06".repeat(16),
+        bindingGeneration = 1, lifecycleSequence = 1, operationGeneration = 1,
+        groupFrame = VisibilityGroupFrame.copyOf(
+            identityVisibilityGridTransform(), identityVisibilityGridTransform(), 1_000, 100_000,
+        ),
     )
 
     private fun scenarioView(

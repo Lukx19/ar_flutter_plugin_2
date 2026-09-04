@@ -1,6 +1,9 @@
 package com.uhg0.ar_flutter_plugin_2.proposal08
 
 import com.uhg0.ar_flutter_plugin_2.proposal08.*
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlLifecycle
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.StartRequestCodecV2
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -459,7 +462,7 @@ class VisibilityProtocolFaultCorpusTest {
         payload.fill(2, 424, 456)
         val configuration = StartRequestCodecV2.decode(payload)
         val baseline = CommittedBaselineV1.fromRestoredConfiguration(configuration)
-        val acceptedLifecycle = controlLifecycle(initialCommittedBaseline = baseline)
+        val acceptedLifecycle = ControlLifecycle(initialCommittedBaseline = baseline)
         val acceptedRequest = boundaryControlRequest().copy(payload = payload)
         val acceptedBytes = acceptedLifecycle.handle(
             acceptedRequest,
@@ -473,7 +476,7 @@ class VisibilityProtocolFaultCorpusTest {
         assertEquals(configuration.worldFromGroupIdentity, acceptedLifecycle.committedBaseline().worldFromGroupIdentity)
 
         val mismatched = baseline.copy(schemaRootHashIdentity = "ff${baseline.schemaRootHashIdentity.drop(2)}")
-        val rejectedLifecycle = controlLifecycle(initialCommittedBaseline = mismatched)
+        val rejectedLifecycle = ControlLifecycle(initialCommittedBaseline = mismatched)
         val rejectedBytes = rejectedLifecycle.handle(
             acceptedRequest,
             ControlCodec.encodeRequest(acceptedRequest),
@@ -592,7 +595,7 @@ class VisibilityProtocolFaultCorpusTest {
                 val bytes = if (name == "crc-control-request") {
                     ControlCodec.encodeRequest(request).also { it[96] = (it[96].toInt() xor 1).toByte() }
                 } else {
-                    val lifecycle = controlLifecycle()
+                    val lifecycle = ControlLifecycle()
                     lifecycle.handle(request, ControlCodec.encodeRequest(request)).also { it[120] = (it[120].toInt() xor 1).toByte() }
                 }
                 assertThrows(IllegalArgumentException::class.java) {
@@ -601,7 +604,7 @@ class VisibilityProtocolFaultCorpusTest {
             }
             "truncated-every-header" -> {
                 val request = boundaryControlRequest()
-                val lifecycle = controlLifecycle()
+                val lifecycle = ControlLifecycle()
                 val controlRequest = ControlCodec.encodeRequest(request)
                 val packets = listOf(
                     baseVectors().request to PacketCodec.requestHeaderBytes,
@@ -660,22 +663,22 @@ class VisibilityProtocolFaultCorpusTest {
             hex(start.getValue("payloadHex").jsonPrimitive.content),
         )
         val encoded = ControlCodec.encodeRequest(request)
-        val lifecycle = controlLifecycle()
+        val lifecycle = ControlLifecycle()
         val first = lifecycle.handle(request, encoded)
         assertArrayEquals(first, lifecycle.handle(request, encoded))
         when (name) {
-            "exact-replay", "lost-response", "start-replay", "checkpoint-replay", "release-replay", "stop-replay", "restored-baseline", "resync-required", "resync-recovery" -> assertEquals(controlLifecycle.State.ACTIVE, lifecycle.state())
+            "exact-replay", "lost-response", "start-replay", "checkpoint-replay", "release-replay", "stop-replay", "restored-baseline", "resync-required", "resync-recovery" -> assertEquals(ControlLifecycle.State.ACTIVE, lifecycle.state())
             "binding-replacement" -> {
                 lifecycle.abandon()
-                assertEquals(controlLifecycle.State.ABANDONED, lifecycle.state())
+                assertEquals(ControlLifecycle.State.ABANDONED, lifecycle.state())
             }
             "queued-disposal" -> {
                 lifecycle.abandon()
-                assertEquals(controlLifecycle.State.ABANDONED, lifecycle.state())
+                assertEquals(ControlLifecycle.State.ABANDONED, lifecycle.state())
             }
             else -> {
                 lifecycle.abandon()
-                assertEquals(controlLifecycle.State.ABANDONED, lifecycle.state())
+                assertEquals(ControlLifecycle.State.ABANDONED, lifecycle.state())
             }
         }
         assertTrue(descriptor.getValue("expectedTransition").jsonPrimitive.content.isNotBlank())

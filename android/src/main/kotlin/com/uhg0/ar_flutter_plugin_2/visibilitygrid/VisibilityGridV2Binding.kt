@@ -6,16 +6,16 @@ import com.uhg0.ar_flutter_plugin_2.proposal08.CommittedBaselineAuthority
 import com.uhg0.ar_flutter_plugin_2.proposal08.CommittedBaselineScopeV1
 import com.uhg0.ar_flutter_plugin_2.proposal08.CommitReceiptQueryV1
 import com.uhg0.ar_flutter_plugin_2.proposal08.ControlCodec
-import com.uhg0.ar_flutter_plugin_2.proposal08.controlLifecycle
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlLifecycle
 import com.uhg0.ar_flutter_plugin_2.proposal08.ControlOperation
 import com.uhg0.ar_flutter_plugin_2.proposal08.ControlRequest
 import com.uhg0.ar_flutter_plugin_2.proposal08.PacketCodec
-import com.uhg0.ar_flutter_plugin_2.proposal08.CommittedBaselineV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineV1
 import com.uhg0.ar_flutter_plugin_2.proposal08.toMap
 import com.uhg0.ar_flutter_plugin_2.proposal08.Uuid
 import com.uhg0.ar_flutter_plugin_2.proposal08.StructuralTransactionProducerV1
 import com.uhg0.ar_flutter_plugin_2.proposal08.TransactionResponseProfileV1
-import com.uhg0.ar_flutter_plugin_2.proposal08.StartRequestCodecV2
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.StartRequestCodecV2
 import com.uhg0.ar_flutter_plugin_2.proposal08.VisibilitySurfaceStreamChannel
 import com.uhg0.ar_flutter_plugin_2.proposal08.DebugTransportProbe
 import com.uhg0.ar_flutter_plugin_2.proposal08.CurrentDeltaSelectorV1
@@ -122,7 +122,7 @@ class VisibilityGridV2Binding internal constructor(
     @Volatile private var replacementBinding: VisibilityGridV2Binding? = null
     @Volatile private var observationRuntime: AndroidVisibilityGridRuntime? = null
 
-    private fun newLifecycle() = controlLifecycle(
+    private fun newLifecycle() = ControlLifecycle(
         CommittedBaselineAuthority = CommittedBaselineAuthority,
         initialCommittedBaseline = initialCommittedBaselineSeed,
     )
@@ -285,7 +285,7 @@ class VisibilityGridV2Binding internal constructor(
         selector: CurrentDeltaSelectorV1,
     ): CurrentDeltaQueueResult {
         check(!disposed.get() && replacementBinding == null) { "V2 binding is not current" }
-        check(lifecycle.state() == controlLifecycle.State.ACTIVE) {
+        check(lifecycle.state() == ControlLifecycle.State.ACTIVE) {
             "V2 observation cut is unavailable"
         }
         val acknowledged = requireNotNull(acknowledgedM3Cut) {
@@ -676,7 +676,7 @@ class VisibilityGridV2Binding internal constructor(
                             qualify(response)
                         }
                     } else {
-                        val wasIdle = lifecycle.state() == controlLifecycle.State.IDLE
+                        val wasIdle = lifecycle.state() == ControlLifecycle.State.IDLE
                         val response = lifecycle.handle(request, admission.payload)
                         val decoded = ControlCodec.decodeResponse(response)
                         if (
@@ -700,8 +700,7 @@ class VisibilityGridV2Binding internal constructor(
                                     groupFromWorldGl = configuration.groupFromWorldGl.toDoubleArray(),
                                     worldFromGroupGl = configuration.worldFromGroupGl.toDoubleArray(),
                                     voxelSizeMicrometres = configuration.voxelSizeMicrometres,
-                                    modelCapacity = configuration.requestedModelCapacity
-                                        .takeIf { it > 0 } ?: 100_000,
+                                    modelCapacity = configuration.requestedModelCapacity,
                                 )
                                 operationGeneration++
                                 lifecycleSequence = allocateLifecycleSequence()
@@ -925,7 +924,7 @@ class VisibilityGridV2Binding internal constructor(
             after = lifecycleResources(excludedCleanup = currentCleanup),
         )
         synchronized(publicationFence) {
-            lifecycle = controlLifecycle(
+            lifecycle = ControlLifecycle(
                 CommittedBaselineAuthority = CommittedBaselineAuthority,
                 initialCommittedBaseline = lifecycle.committedBaseline(),
             )

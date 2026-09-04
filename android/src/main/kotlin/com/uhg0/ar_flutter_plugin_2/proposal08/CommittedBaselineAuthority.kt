@@ -1,5 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.proposal08
 
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineV1
 /**
  * Process-scoped owner for the last native committed cut.
  *

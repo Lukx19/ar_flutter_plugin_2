@@ -1,6 +1,9 @@
 package com.uhg0.ar_flutter_plugin_2.proposal08
 
 import com.uhg0.ar_flutter_plugin_2.proposal08.*
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlLifecycle
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.StartRequestCodecV2
 
 import io.flutter.plugin.common.BinaryMessenger
 import java.nio.ByteBuffer
@@ -426,7 +429,7 @@ class VisibilitySurfaceStreamChannelTest {
 
     @Test
     fun `stream accepts only the active control lifecycle token`() {
-        val lifecycle = controlLifecycle()
+        val lifecycle = ControlLifecycle()
         val start = controlRequest(ControlOperation.START, 0, 1)
         lifecycle.handle(start, ControlCodec.encodeRequest(start))
         val messenger = TestMessenger(28)
@@ -450,7 +453,7 @@ class VisibilitySurfaceStreamChannelTest {
 
     @Test
     fun `stream adopts the baseline carried by the shared control lifecycle`() {
-        val lifecycle = controlLifecycle(
+        val lifecycle = ControlLifecycle(
             initialCommittedBaseline = CommittedBaselineV1(9, 10, 11, 12),
         )
         val start = controlRequest(ControlOperation.START, 0, 1)
@@ -1091,7 +1094,7 @@ class VisibilitySurfaceStreamChannelTest {
     @Test
     fun `abandon fence query reports zero and late COMMIT has no authority`() {
         val authority = CommittedBaselineAuthority()
-        val lifecycle = controlLifecycle(CommittedBaselineAuthority = authority)
+        val lifecycle = ControlLifecycle(CommittedBaselineAuthority = authority)
         val start = controlRequest(ControlOperation.START, 0, 91)
         lifecycle.handle(start, ControlCodec.encodeRequest(start))
         val scope = CommittedBaselineScopeV1.from(start)
@@ -1168,7 +1171,7 @@ class VisibilitySurfaceStreamChannelTest {
         assertEquals(CommittedBaselineV1.ZERO, receipt.baseline)
         assertEquals(receipt, authority.queryReceipt(abandonedQuery))
 
-        val recoveredLifecycle = controlLifecycle(CommittedBaselineAuthority = authority)
+        val recoveredLifecycle = ControlLifecycle(CommittedBaselineAuthority = authority)
         val recoveredStart = controlRequest(ControlOperation.START, 0, 92)
         val recoveredResponse = ControlCodec.decodeResponse(
             recoveredLifecycle.handle(
@@ -1186,7 +1189,7 @@ class VisibilitySurfaceStreamChannelTest {
     @Test
     fun `COMMIT publication claims its reply before a racing abandon`() {
         val authority = CommittedBaselineAuthority()
-        val lifecycle = controlLifecycle(CommittedBaselineAuthority = authority)
+        val lifecycle = ControlLifecycle(CommittedBaselineAuthority = authority)
         val start = controlRequest(ControlOperation.START, 0, 93)
         lifecycle.handle(start, ControlCodec.encodeRequest(start))
         val scope = CommittedBaselineScopeV1.from(start)
@@ -1252,7 +1255,7 @@ class VisibilitySurfaceStreamChannelTest {
     @Test
     fun `unacknowledged COMMIT deadline retains no authority and no duplicate effect`() {
         val authority = CommittedBaselineAuthority()
-        val lifecycle = controlLifecycle(
+        val lifecycle = ControlLifecycle(
             CommittedBaselineAuthority = authority,
         )
         val start = controlRequest(ControlOperation.START, 0, 97)
@@ -1336,7 +1339,7 @@ class VisibilitySurfaceStreamChannelTest {
         assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS))
         binding.dispose()
 
-        val freshLifecycle = controlLifecycle(
+        val freshLifecycle = ControlLifecycle(
             CommittedBaselineAuthority = authority,
         )
         val freshResponse = ControlCodec.decodeResponse(

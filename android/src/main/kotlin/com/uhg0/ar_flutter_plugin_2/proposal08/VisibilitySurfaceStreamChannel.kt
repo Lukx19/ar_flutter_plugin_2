@@ -2,6 +2,9 @@ package com.uhg0.ar_flutter_plugin_2.proposal08
 
 import android.os.Handler
 import android.os.Looper
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.A_IDENTITY_MATRIX_IDENTITY
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlLifecycle
 import io.flutter.plugin.common.BasicMessageChannel
 import io.flutter.plugin.common.BinaryCodec
 import io.flutter.plugin.common.BinaryMessenger
@@ -83,7 +86,7 @@ class VisibilitySurfaceStreamChannel(
     private val timeoutScheduler: TimeoutScheduler = TimeoutScheduler.real(),
     private val beforeWorkerProcessing: (() -> Unit)? = null,
     private val beforeRequestProcessing: ((PacketCodec.Request) -> Unit)? = null,
-    private val controlLifecycle: controlLifecycle? = null,
+    private val controlLifecycle: ControlLifecycle? = null,
     private val onExecutorOperation: ((String) -> Unit)? = null,
     private val bindingQualifier: ByteArray? = null,
     private val beforeAuthorityPublication: (() -> Unit)? = null,

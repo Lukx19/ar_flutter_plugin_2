@@ -7,7 +7,7 @@ import com.google.ar.core.Frame
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.NotYetAvailableException
 import com.uhg0.ar_flutter_plugin_2.proposal08.ControlCodec
-import com.uhg0.ar_flutter_plugin_2.proposal08.controlLifecycle
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlLifecycle
 import com.uhg0.ar_flutter_plugin_2.proposal08.ControlOperation
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
@@ -27,7 +27,7 @@ class VisibilityGridMethodChannel(
     private val runtimeCapabilities: () -> VisibilityGridRuntimeCapabilities,
     private val render: (CoveragePointRenderSnapshot?, PointCloudNativeConfig?) -> Unit,
     private val renderRawPoints: (CoveragePointRenderSnapshot?) -> Unit = {},
-    private val controlLifecycle: controlLifecycle = controlLifecycle(),
+    private val controlLifecycle: ControlLifecycle = ControlLifecycle(),
     sharedExecutor: Executor? = null,
 ) : MethodChannel.MethodCallHandler {
     private val channel = MethodChannel(messenger, "arpointcloud_$viewId")

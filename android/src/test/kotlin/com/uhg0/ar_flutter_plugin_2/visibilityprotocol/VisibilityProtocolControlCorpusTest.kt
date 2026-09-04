@@ -1,4 +1,4 @@
-package com.uhg0.ar_flutter_plugin_2.proposal08
+package com.uhg0.ar_flutter_plugin_2.visibilityprotocol
 
 import com.uhg0.ar_flutter_plugin_2.proposal08.*
 
@@ -19,6 +19,12 @@ import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class VisibilityProtocolControlCorpusTest {
+    @Test
+    fun `START default retains exact zero request while declaring its accepted default separately`() {
+        val defaultPayload = StartRequestCodecV2.defaultPayload()
+        assertEquals(0, StartRequestCodecV2.decode(defaultPayload).requestedModelCapacity)
+    }
+
     @Test
     fun `START retains exact non identity inverse matrix values and bit identities`() {
         val payload = StartRequestCodecV2.defaultPayload()

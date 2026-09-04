@@ -1,7 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
 import java.util.Collections
-import com.uhg0.ar_flutter_plugin_2.proposal08.areInverseTransforms
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CoordinateFrameTransforms
 
 /** The exact immutable coordinate frame accepted by one V2 group binding. */
 internal class VisibilityGroupFrame private constructor(
@@ -14,9 +14,13 @@ internal class VisibilityGroupFrame private constructor(
         require(groupFromWorldGl.size == 16 && groupFromWorldGl.all(Double::isFinite))
         require(worldFromGroupGl.size == 16 && worldFromGroupGl.all(Double::isFinite))
         require(voxelSizeMicrometres > 0)
-        require(modelCapacity in 1..100_000)
-        require(areInverseTransforms(groupFromWorldGl, worldFromGroupGl))
+        require(modelCapacity in 0..100_000)
+        require(CoordinateFrameTransforms.areFiniteAffineInverses(groupFromWorldGl, worldFromGroupGl))
     }
+
+    /** Accepted operational capacity when START requested the protocol-defined default. */
+    val effectiveModelCapacity: Int
+        get() = if (modelCapacity == 0) 100_000 else modelCapacity
 
     companion object {
         fun copyOf(

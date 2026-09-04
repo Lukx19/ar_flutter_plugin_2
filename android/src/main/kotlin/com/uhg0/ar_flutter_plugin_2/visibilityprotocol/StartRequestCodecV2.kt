@@ -1,11 +1,9 @@
-package com.uhg0.ar_flutter_plugin_2.proposal08
+package com.uhg0.ar_flutter_plugin_2.visibilityprotocol
 
+import com.uhg0.ar_flutter_plugin_2.proposal08.ControlValidationFailure
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Collections
-
-internal const val A_IDENTITY_MATRIX_IDENTITY =
-    "3ff0000000000000,0,0,0,0,3ff0000000000000,0,0,0,0,3ff0000000000000,0,0,0,0,3ff0000000000000"
 
 internal fun matrixIdentity(data: ByteBuffer, offset: Int): String =
     (0 until 16).joinToString(",") { index ->
@@ -14,29 +12,6 @@ internal fun matrixIdentity(data: ByteBuffer, offset: Int): String =
 
 internal fun matrixValues(data: ByteBuffer, offset: Int): List<Double> =
     Collections.unmodifiableList(List(16) { index -> data.getDouble(offset + index * 8) })
-
-/** Column-major affine matrix validation for the immutable group-frame cut. */
-internal fun areInverseTransforms(first: List<Double>, second: List<Double>): Boolean {
-    if (first.size != 16 || second.size != 16 ||
-        first.any { !it.isFinite() } || second.any { !it.isFinite() }
-    ) return false
-    val affine = listOf(first, second).all { matrix ->
-        kotlin.math.abs(matrix[3]) <= 1e-9 &&
-            kotlin.math.abs(matrix[7]) <= 1e-9 &&
-            kotlin.math.abs(matrix[11]) <= 1e-9 &&
-            kotlin.math.abs(matrix[15] - 1.0) <= 1e-9
-    }
-    if (!affine) return false
-    return (0 until 4).all { row ->
-        (0 until 4).all { column ->
-            val actual = (0 until 4).sumOf { index ->
-                first[index * 4 + row] * second[column * 4 + index]
-            }
-            val expected = if (row == column) 1.0 else 0.0
-            kotlin.math.abs(actual - expected) <= 1e-6
-        }
-    }
-}
 
 internal fun hashIdentity(bytes: ByteArray): String =
     bytes.joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
@@ -179,7 +154,7 @@ object StartRequestCodecV2 {
         }
         val groupFromWorldGl = matrixValues(data, 136)
         val worldFromGroupGl = matrixValues(data, 264)
-        if (!areInverseTransforms(groupFromWorldGl, worldFromGroupGl)) {
+        if (!CoordinateFrameTransforms.areFiniteAffineInverses(groupFromWorldGl, worldFromGroupGl)) {
             return invalid(36, 5, 21, 1, 0)
         }
         val schemaHash = bytes.copyOfRange(392, 424)

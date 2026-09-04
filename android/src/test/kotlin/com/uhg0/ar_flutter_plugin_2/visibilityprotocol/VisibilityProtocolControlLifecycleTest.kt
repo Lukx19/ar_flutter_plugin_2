@@ -1,4 +1,6 @@
-package com.uhg0.ar_flutter_plugin_2.proposal08
+package com.uhg0.ar_flutter_plugin_2.visibilityprotocol
+
+import com.uhg0.ar_flutter_plugin_2.proposal08.*
 
 import com.uhg0.ar_flutter_plugin_2.proposal08.*
 
@@ -12,7 +14,7 @@ import java.security.MessageDigest
 class VisibilityProtocolControlLifecycleTest {
     @Test
     fun `canonical malformed error records no receipt and corrected control remains legal`() {
-        val lifecycle = controlLifecycle()
+        val lifecycle = ControlLifecycle()
         val start = request(ControlOperation.START, 0, 71)
         val errorBytes = lifecycle.malformed(
             start,
@@ -30,7 +32,7 @@ class VisibilityProtocolControlLifecycleTest {
         assertEquals(0, error.resultFlags)
         assertEquals(0, detail.disposition)
         assertEquals(5, detail.recoveryAction)
-        assertEquals(controlLifecycle.State.IDLE, lifecycle.state())
+        assertEquals(ControlLifecycle.State.IDLE, lifecycle.state())
         assertEquals(0, lifecycle.cachedRequestBytes())
         assertEquals(0, lifecycle.cachedResponseBytes())
 
@@ -38,25 +40,25 @@ class VisibilityProtocolControlLifecycleTest {
             lifecycle.handle(start, ControlCodec.encodeRequest(start)),
         )
         assertEquals(0, corrected.outcome)
-        assertEquals(controlLifecycle.State.ACTIVE, lifecycle.state())
+        assertEquals(ControlLifecycle.State.ACTIVE, lifecycle.state())
     }
 
     @Test
     fun `control lifecycle allocates fresh token and exact replay`() {
-        val lifecycle = controlLifecycle()
+        val lifecycle = ControlLifecycle()
         val start = request(ControlOperation.START, 0, 1)
         val encoded = ControlCodec.encodeRequest(start)
         val first = lifecycle.handle(start, encoded)
         val replay = lifecycle.handle(start, encoded)
 
         assertArrayEquals(first, replay)
-        assertEquals(controlLifecycle.State.ACTIVE, lifecycle.state())
+        assertEquals(ControlLifecycle.State.ACTIVE, lifecycle.state())
         assertEquals(1L, ControlCodec.decodeResponse(first).streamToken)
     }
 
     @Test
     fun `start negotiates frozen minor and ignores unsupported desired bits`() {
-        val lifecycle = controlLifecycle()
+        val lifecycle = ControlLifecycle()
         val desired = request(ControlOperation.START, 0, 2).copy(
             payload = startPayload {
                 putLong(16, 1L shl 4)
@@ -82,7 +84,7 @@ class VisibilityProtocolControlLifecycleTest {
         }
         assertEquals(0xffffL, lifecycle.metrics.unsupportedDesiredCapabilityBits)
 
-        val mandatoryLifecycle = controlLifecycle()
+        val mandatoryLifecycle = ControlLifecycle()
         val mandatory = request(ControlOperation.START, 0, 6).copy(
             payload = startPayload {
                 putLong(8, StartRequestCodecV2.supportedCapabilities)
@@ -98,7 +100,7 @@ class VisibilityProtocolControlLifecycleTest {
 
     @Test
     fun `start rejects unsupported required capability and minor range`() {
-        val capabilityLifecycle = controlLifecycle()
+        val capabilityLifecycle = ControlLifecycle()
         val required = request(ControlOperation.START, 0, 3).copy(
             payload = startPayload {
                 putLong(8, 1L shl 4)
@@ -128,7 +130,7 @@ class VisibilityProtocolControlLifecycleTest {
         )
         assertEquals(0, correctedCapabilityResponse.outcome)
 
-        val minorLifecycle = controlLifecycle()
+        val minorLifecycle = ControlLifecycle()
         val minor = request(ControlOperation.START, 0, 4).copy(
             payload = startPayload {
                 putShort(0, 1)
@@ -159,7 +161,7 @@ class VisibilityProtocolControlLifecycleTest {
 
     @Test
     fun `lifecycle and stale-token errors carry canonical retry fencing and receipt policy`() {
-        val idle = controlLifecycle()
+        val idle = ControlLifecycle()
         val premature = request(ControlOperation.BEGIN_CHECKPOINT, 1, 81)
         val prematureResponse = ControlCodec.decodeResponse(
             idle.handle(premature, ControlCodec.encodeRequest(premature)),
@@ -184,7 +186,7 @@ class VisibilityProtocolControlLifecycleTest {
             ).outcome,
         )
 
-        val active = controlLifecycle()
+        val active = ControlLifecycle()
         val start = request(ControlOperation.START, 0, 82)
         val startBytes = ControlCodec.encodeRequest(start)
         active.handle(start, startBytes)
@@ -207,7 +209,7 @@ class VisibilityProtocolControlLifecycleTest {
 
     @Test
     fun `restored cut conflict is rejected rather than overlaid`() {
-        val lifecycle = controlLifecycle(
+        val lifecycle = ControlLifecycle(
             initialCommittedBaseline = CommittedBaselineV1(7, 11, 13, 17),
         )
         val conflicting = request(ControlOperation.START, 0, 5).copy(
@@ -225,7 +227,7 @@ class VisibilityProtocolControlLifecycleTest {
         )
         assertEquals(1, response.outcome)
         assertEquals(58, response.errorId)
-        assertEquals(controlLifecycle.State.IDLE, lifecycle.state())
+        assertEquals(ControlLifecycle.State.IDLE, lifecycle.state())
     }
 
     @Test
@@ -234,7 +236,7 @@ class VisibilityProtocolControlLifecycleTest {
         val restored = StartRequestCodecV2.decode(restoredPayload)
         val baseline = CommittedBaselineV1.fromRestoredConfiguration(restored)
 
-        val exactLifecycle = controlLifecycle(initialCommittedBaseline = baseline)
+        val exactLifecycle = ControlLifecycle(initialCommittedBaseline = baseline)
         val exact = request(ControlOperation.START, 0, 8).copy(payload = restoredPayload)
         val exactResponse = ControlCodec.decodeResponse(
             exactLifecycle.handle(exact, ControlCodec.encodeRequest(exact)),
@@ -242,7 +244,7 @@ class VisibilityProtocolControlLifecycleTest {
         assertEquals(0, exactResponse.outcome)
 
         val rootMismatch = restoredPayload.copyOf().also { it[392] = (it[392].toInt() xor 1).toByte() }
-        val rootLifecycle = controlLifecycle(initialCommittedBaseline = baseline)
+        val rootLifecycle = ControlLifecycle(initialCommittedBaseline = baseline)
         val rootRequest = request(ControlOperation.START, 0, 9).copy(payload = rootMismatch)
         val rootResponse = ControlCodec.decodeResponse(
             rootLifecycle.handle(rootRequest, ControlCodec.encodeRequest(rootRequest)),
@@ -256,7 +258,7 @@ class VisibilityProtocolControlLifecycleTest {
                 putDouble(264, 0.5)
             }
         }
-        val transformLifecycle = controlLifecycle(initialCommittedBaseline = baseline)
+        val transformLifecycle = ControlLifecycle(initialCommittedBaseline = baseline)
         val transformRequest = request(ControlOperation.START, 0, 10).copy(payload = transformMismatch)
         val transformResponse = ControlCodec.decodeResponse(
             transformLifecycle.handle(transformRequest, ControlCodec.encodeRequest(transformRequest)),
@@ -273,7 +275,7 @@ class VisibilityProtocolControlLifecycleTest {
             putLong(64, 1L)
             putLong(72, 1L)
         }
-        val lifecycle = controlLifecycle(initialCommittedBaseline = baseline)
+        val lifecycle = ControlLifecycle(initialCommittedBaseline = baseline)
         val start = request(ControlOperation.START, 0, 11).copy(payload = payload)
 
         val response = ControlCodec.decodeResponse(
@@ -281,12 +283,12 @@ class VisibilityProtocolControlLifecycleTest {
         )
 
         assertEquals(0, response.outcome)
-        assertEquals(baseline, lifecycle.committedBaseline())
+        assertEquals(CommittedBaselineV1.forFreshBinding(baseline), lifecycle.committedBaseline())
     }
 
     @Test
     fun `start retains one complete cut with non-default configuration`() {
-        val lifecycle = controlLifecycle(
+        val lifecycle = ControlLifecycle(
             initialCommittedBaseline = CommittedBaselineV1(
                 transactionId = 12,
                 geometryRevision = 3,
@@ -343,7 +345,7 @@ class VisibilityProtocolControlLifecycleTest {
 
     @Test
     fun `start receipt carries the authoritative restored committed baseline`() {
-        val lifecycle = controlLifecycle(
+        val lifecycle = ControlLifecycle(
             initialCommittedBaseline = CommittedBaselineV1(9, 10, 11, 12),
         )
         val start = request(ControlOperation.START, 0, 1)
@@ -362,14 +364,14 @@ class VisibilityProtocolControlLifecycleTest {
     @Test
     fun `factory authority survives a replaced view binding`() {
         val authority = CommittedBaselineAuthority()
-        val firstLifecycle = controlLifecycle(
+        val firstLifecycle = ControlLifecycle(
             CommittedBaselineAuthority = authority,
         )
         val firstStart = request(ControlOperation.START, 0, 1)
         firstLifecycle.handle(firstStart, ControlCodec.encodeRequest(firstStart))
         firstLifecycle.setCommittedBaseline(CommittedBaselineV1(41, 42, 43, 44))
 
-        val replacementLifecycle = controlLifecycle(
+        val replacementLifecycle = ControlLifecycle(
             CommittedBaselineAuthority = authority,
         )
         val replacementStart = request(ControlOperation.START, 0, 60)
@@ -397,12 +399,12 @@ class VisibilityProtocolControlLifecycleTest {
         val restored = StartRequestCodecV2.decode(restoredPayload)
         val baseline = CommittedBaselineV1.fromRestoredConfiguration(restored)
         val firstStart = request(ControlOperation.START, 0, 61).copy(payload = restoredPayload)
-        val firstLifecycle = controlLifecycle(CommittedBaselineAuthority = authority)
+        val firstLifecycle = ControlLifecycle(CommittedBaselineAuthority = authority)
         firstLifecycle.handle(firstStart, ControlCodec.encodeRequest(firstStart))
         firstLifecycle.setCommittedBaseline(baseline)
 
         val exactStart = request(ControlOperation.START, 0, 62).copy(payload = restoredPayload)
-        val exactLifecycle = controlLifecycle(CommittedBaselineAuthority = authority)
+        val exactLifecycle = ControlLifecycle(CommittedBaselineAuthority = authority)
         val exactResponse = ControlCodec.decodeResponse(
             exactLifecycle.handle(exactStart, ControlCodec.encodeRequest(exactStart)),
         )
@@ -411,7 +413,7 @@ class VisibilityProtocolControlLifecycleTest {
 
         val mismatchedPayload = restoredPayload.copyOf().also { it[424] = (it[424].toInt() xor 1).toByte() }
         val mismatchStart = request(ControlOperation.START, 0, 63).copy(payload = mismatchedPayload)
-        val mismatchLifecycle = controlLifecycle(CommittedBaselineAuthority = authority)
+        val mismatchLifecycle = ControlLifecycle(CommittedBaselineAuthority = authority)
         val mismatchResponse = ControlCodec.decodeResponse(
             mismatchLifecycle.handle(mismatchStart, ControlCodec.encodeRequest(mismatchStart)),
         )
@@ -422,7 +424,7 @@ class VisibilityProtocolControlLifecycleTest {
     @Test
     fun `baseline authority cannot cross group epochs`() {
         val authority = CommittedBaselineAuthority()
-        val firstLifecycle = controlLifecycle(CommittedBaselineAuthority = authority)
+        val firstLifecycle = ControlLifecycle(CommittedBaselineAuthority = authority)
         val firstStart = request(ControlOperation.START, 0, 70)
         firstLifecycle.handle(firstStart, ControlCodec.encodeRequest(firstStart))
         firstLifecycle.setCommittedBaseline(CommittedBaselineV1(51, 52, 53, 54))
@@ -430,7 +432,7 @@ class VisibilityProtocolControlLifecycleTest {
         val otherGroup = request(ControlOperation.START, 0, 71).copy(
             captureGroupId = uuid(90),
         )
-        val otherLifecycle = controlLifecycle(CommittedBaselineAuthority = authority)
+        val otherLifecycle = ControlLifecycle(CommittedBaselineAuthority = authority)
         val response = ControlCodec.decodeResponse(
             otherLifecycle.handle(otherGroup, ControlCodec.encodeRequest(otherGroup)),
         )
@@ -443,13 +445,13 @@ class VisibilityProtocolControlLifecycleTest {
     @Test
     fun `baseline authority survives same group replacement with a new coverage epoch`() {
         val authority = CommittedBaselineAuthority()
-        val firstLifecycle = controlLifecycle(CommittedBaselineAuthority = authority)
+        val firstLifecycle = ControlLifecycle(CommittedBaselineAuthority = authority)
         val firstStart = request(ControlOperation.START, 0, 72)
         firstLifecycle.handle(firstStart, ControlCodec.encodeRequest(firstStart))
         firstLifecycle.setCommittedBaseline(CommittedBaselineV1(61, 62, 63, 64))
 
         val replacement = request(ControlOperation.START, 0, 73).copy(coverageEpoch = 2)
-        val replacementLifecycle = controlLifecycle(CommittedBaselineAuthority = authority)
+        val replacementLifecycle = ControlLifecycle(CommittedBaselineAuthority = authority)
         val response = ControlCodec.decodeResponse(
             replacementLifecycle.handle(replacement, ControlCodec.encodeRequest(replacement)),
         )
@@ -461,7 +463,7 @@ class VisibilityProtocolControlLifecycleTest {
 
     @Test
     fun `checkpoint and stop require active token and stale token is fenced`() {
-        val lifecycle = controlLifecycle()
+        val lifecycle = ControlLifecycle()
         val start = request(ControlOperation.START, 0, 1)
         lifecycle.handle(start, ControlCodec.encodeRequest(start))
 
@@ -477,12 +479,12 @@ class VisibilityProtocolControlLifecycleTest {
             lifecycle.handle(stop, ControlCodec.encodeRequest(stop)),
         )
         assertEquals(0, stopResponse.outcome)
-        assertEquals(controlLifecycle.State.STOPPED, lifecycle.state())
+        assertEquals(ControlLifecycle.State.STOPPED, lifecycle.state())
     }
 
     @Test
     fun `same control id with changed bytes is a replay conflict`() {
-        val lifecycle = controlLifecycle()
+        val lifecycle = ControlLifecycle()
         val first = request(ControlOperation.START, 0, 1)
         val firstBytes = ControlCodec.encodeRequest(first)
         val firstResponse = lifecycle.handle(first, firstBytes)
@@ -504,7 +506,7 @@ class VisibilityProtocolControlLifecycleTest {
 
     @Test
     fun `control receipt storage is bounded to four entries`() {
-        val lifecycle = controlLifecycle()
+        val lifecycle = ControlLifecycle()
         val start = request(ControlOperation.START, 0, 1)
         lifecycle.handle(start, ControlCodec.encodeRequest(start))
 

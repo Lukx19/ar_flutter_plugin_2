@@ -211,6 +211,20 @@ class StorageBudgetCoordinatorV2Test {
         }
     }
 
+    @Test fun `safe component limit admits authenticated activation names only within bounded syntax`() {
+        val root = directory()
+        SafeFilesystemV2(root, DurableStoreFaultInjectorV2 { }, physicalFilesystem()).use { files ->
+            val activationAttempt =
+                "canonical-surface-activation-${"a".repeat(64)}-attempt-${"b".repeat(64)}.attempt"
+            assertEquals(174, activationAttempt.length)
+            assertEquals(activationAttempt, files.child(activationAttempt).name)
+            assertEquals("c".repeat(240), files.child("c".repeat(240)).name)
+            assertThrows(IllegalArgumentException::class.java) { files.child("c".repeat(241)) }
+            assertThrows(IllegalArgumentException::class.java) { files.child("../escape") }
+            assertThrows(IllegalArgumentException::class.java) { files.child("unsafe:name") }
+        }
+    }
+
     @Test fun `construction performs no reservation directory scan`() {
         val root = directory()
         val reservations = File(root, "reservations-v2").apply { assertTrue(mkdirs()) }
