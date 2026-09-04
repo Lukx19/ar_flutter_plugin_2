@@ -12,6 +12,74 @@ import org.junit.Test
 
 class VisibilityGridFixtureContractTest {
     @Test
+    fun `shared corpus drives an exact depth evidence public packet`() {
+        val specification = loadFixture().getValue("depthEvidenceKernel").jsonObject
+        assertEquals(
+            "bounded_depth_evidence_fixture_v1",
+            specification.getValue("format").jsonPrimitive.content,
+        )
+        val cases = specification.getValue("cases").jsonArray.map { it.jsonObject }
+        val requiredCoverage = setOf(
+            "wall", "corridor", "safety band", "no behind endpoint", "hole",
+            "foreground edge", "thin wall", "double wall", "opposed views",
+            "create", "refine", "relocate", "merge", "split", "replace", "remove",
+            "capacity", "full budget", "transformed frame", "refusal",
+        )
+        val actualCoverage = cases.flatMap { case ->
+            case.getValue("covers").jsonArray.map { it.jsonPrimitive.content }
+        }.toSet()
+        assertTrue(actualCoverage.containsAll(requiredCoverage))
+        cases.forEach { case ->
+            assertTrue(case.containsKey("expectedChanges"))
+            assertTrue(case.containsKey("expectedReceipt"))
+            assertTrue(case.containsKey("expectedWork"))
+        }
+
+        val expectedCase = cases.single { it.getValue("name").jsonPrimitive.content == "create" }
+        val kernel = DepthEvidenceKernel()
+        val view = object : BoundedCanonicalSurfaceView {
+            override val geometryRevision = 0L
+            override val lineageRevision = 0L
+            override val surfaceCount = 0
+            override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? = null
+            override fun findSurfaceAt(voxel: Voxel): DepthCanonicalSurface? = null
+            override fun visitRayCells(
+                startGroupMm: DepthPointMm,
+                endpointGroupMm: DepthPointMm,
+                maximumVisits: Int,
+                visitor: (Voxel, DepthCanonicalSurface?) -> Boolean,
+            ) = DepthRayVisitResult(0, false)
+        }
+        fun translation(x: Double, y: Double, z: Double) =
+            identityVisibilityGridTransform().also { matrix ->
+                matrix[12] = x
+                matrix[13] = y
+                matrix[14] = z
+            }
+        val groupFrame = VisibilityGroupFrame.copyOf(
+            translation(0.3, -0.2, 0.1),
+            translation(-0.3, 0.2, -0.1),
+            voxelSizeMicrometres = 100_000,
+            modelCapacity = 100,
+        )
+        fun batch(sequence: Long) = DepthEvidenceBatch(
+            sequence = sequence,
+            sourceTimestampNs = sequence,
+            groupFrame = groupFrame,
+            groupFromCameraGl = translation(0.0, 0.0, 0.0).toList(),
+            intrinsics = VisibilityCameraIntrinsics(4, 3, 2.0, 2.0, 1.5, 1.0),
+            samples = listOf(VisibilityDepthSample(0, 0, 1_000, 255)),
+            sourceRejectedSamples = 0,
+        )
+        repeat(3) { index ->
+            kernel.prepare(batch(index + 1L), view)
+            kernel.applyPrepared()
+        }
+        val actual = kernel.prepare(batch(4), view)
+        assertEquals(expectedDepthEvidenceResult(specification, expectedCase), actual)
+    }
+
+    @Test
     fun `synthetic ARCore and ARKit-shaped sensor frames share the native seam`() {
         val fixture = loadFixture()
         val sensor =
@@ -708,6 +776,85 @@ class VisibilityGridFixtureContractTest {
 
     private fun kotlinx.serialization.json.JsonObject.int(field: String): Int =
         getValue(field).jsonPrimitive.content.toInt()
+
+    private fun expectedDepthEvidenceResult(
+        specification: kotlinx.serialization.json.JsonObject,
+        case: kotlinx.serialization.json.JsonObject,
+    ): DepthEvidenceResult {
+        val defaults = specification.getValue("receiptDefaults").jsonObject
+        val receiptValues = case.getValue("expectedReceipt").jsonObject
+        fun receiptLong(field: String): Long =
+            (receiptValues[field] ?: defaults[field])?.jsonPrimitive?.content?.toLong() ?: 0L
+        fun receiptInt(field: String): Int = receiptLong(field).toInt()
+        val receipt = DepthEvidenceReceipt(
+            sequence = receiptLong("sequence"),
+            sourceTimestampNs = receiptLong("sourceTimestampNs"),
+            acceptedSamples = receiptInt("acceptedSamples"),
+            rejectedSamples = receiptInt("rejectedSamples"),
+            rayVisits = receiptInt("rayVisits"),
+            touchedEvidenceRows = receiptInt("touchedEvidenceRows"),
+            independentDirectionVotes = receiptInt("independentDirectionVotes"),
+            createCount = receiptInt("createCount"),
+            refineCount = receiptInt("refineCount"),
+            relocateCount = receiptInt("relocateCount"),
+            mergeCount = receiptInt("mergeCount"),
+            splitCount = receiptInt("splitCount"),
+            replaceCount = receiptInt("replaceCount"),
+            removeCount = receiptInt("removeCount"),
+            conflictsRetained = receiptInt("conflictsRetained"),
+            capacityRefusals = receiptInt("capacityRefusals"),
+            overflowCount = receiptInt("overflowCount"),
+            preparedResidentBytes = receiptInt("preparedResidentBytes"),
+            p50VirtualWorkUnits = receiptInt("p50VirtualWorkUnits"),
+            p95VirtualWorkUnits = receiptInt("p95VirtualWorkUnits"),
+        )
+        if (case.getValue("expectedStatus").jsonPrimitive.content == "refused") {
+            return DepthEvidenceResult.Refused(
+                DepthEvidenceRefusal.valueOf(case.getValue("expectedRefusal").jsonPrimitive.content),
+                receipt,
+            )
+        }
+        fun target(value: kotlinx.serialization.json.JsonObject): CanonicalTarget {
+            val sourceValue = value["sourceId"]
+            val coordinates = value.getValue("voxel").jsonArray.map { it.jsonPrimitive.content.toInt() }
+            return CanonicalTarget(
+                if (sourceValue == null || sourceValue.toString() == "null") null
+                else SurfaceId(sourceValue.jsonPrimitive.content.toLong()),
+                Voxel(coordinates[0], coordinates[1], coordinates[2]),
+                value.int("normalOctX"),
+                value.int("normalOctY"),
+                value.int("normalConfidence"),
+            )
+        }
+        val changes = case.getValue("expectedChanges").jsonArray.map { value ->
+            val change = value.jsonObject
+            val sources = change["sourceIds"]?.jsonArray?.map { SurfaceId(it.jsonPrimitive.content.toLong()) }.orEmpty()
+            when (change.getValue("kind").jsonPrimitive.content) {
+                "create" -> DepthEvidenceChange.Create(target(change.getValue("target").jsonObject))
+                "refine" -> DepthEvidenceChange.Refine(sources.single(), target(change.getValue("target").jsonObject))
+                "relocate" -> DepthEvidenceChange.Relocate(sources.single(), target(change.getValue("target").jsonObject))
+                "merge" -> DepthEvidenceChange.Merge(sources, target(change.getValue("target").jsonObject))
+                "split" -> DepthEvidenceChange.Split(sources.single(), change.getValue("targets").jsonArray.map { target(it.jsonObject) })
+                "replace" -> DepthEvidenceChange.Replace(sources, change.getValue("targets").jsonArray.map { target(it.jsonObject) })
+                "remove" -> DepthEvidenceChange.Remove(sources.single())
+                else -> error("Unsupported depth-evidence change fixture")
+            }
+        }
+        val workValue = case.getValue("expectedWork").jsonObject
+        return DepthEvidenceResult.Accepted(
+            expectedGeometryRevision = 0,
+            expectedLineageRevision = 0,
+            changes = changes,
+            receipt = receipt,
+            work = DepthEvidenceWorkReceipt(
+                distinctTouchedVoxelCount = workValue.int("distinctTouchedVoxelCount"),
+                emittedChangeCount = workValue.int("emittedChangeCount"),
+                rayVisits = workValue.int("rayVisits"),
+                independentDirectionVotes = workValue.int("independentDirectionVotes"),
+                virtualWorkUnits = workValue.int("virtualWorkUnits"),
+            ),
+        )
+    }
 
     private fun featureGrid(): NativeVisibilityGrid =
         NativeVisibilityGrid(

@@ -180,6 +180,8 @@ internal data class DepthEvidenceResourceReceipt(
     val evidenceRowCapacity: Int,
     val fixedPrimitiveBytes: Int,
     val closed: Boolean,
+    val maximumAcceptedOutputReserveBytes: Int = 0,
+    val modeledMaximumSemanticStateBytes: Int = 0,
 )
 
 internal sealed interface DepthEvidenceResult {

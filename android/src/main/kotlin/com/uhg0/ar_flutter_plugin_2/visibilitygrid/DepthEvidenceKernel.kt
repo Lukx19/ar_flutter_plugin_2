@@ -24,7 +24,6 @@ internal class DepthEvidenceKernel(
         Math.addExact(configuration.rayVisitCapacity, configuration.sampleCapacity),
     )
     private val stageHashCapacity = nextPowerOfTwo((stageCapacity * 2).coerceAtLeast(2))
-    private var hashKeys = LongArray(hashCapacity)
     private var hashRows = IntArray(hashCapacity) { EMPTY_ROW }
     // A retained evidence row is exactly 32 bytes: voxel key (8), evidence
     // counters/directions/flags (7), source id (4), source voxel key (8),
@@ -44,7 +43,6 @@ internal class DepthEvidenceKernel(
     // One fixed staging table is reused by every prepare. A batch can address
     // at most one endpoint per sample plus one row per ray visit, so staging is
     // bounded by that locked work budget rather than the larger model capacity.
-    private var stageHashKeys = LongArray(stageHashCapacity)
     private var stageHashRows = IntArray(stageHashCapacity) { EMPTY_ROW }
     private var stageX = IntArray(stageCapacity)
     private var stageY = IntArray(stageCapacity)
@@ -63,15 +61,15 @@ internal class DepthEvidenceKernel(
     private var stageOccupiedCameraX = DoubleArray(stageCapacity)
     private var stageOccupiedCameraY = DoubleArray(stageCapacity)
     private var stageOccupiedCameraZ = DoubleArray(stageCapacity)
-    private var stageFreeBin = IntArray(stageCapacity) { NO_DIRECTION }
+    private var stageFreeBin = ByteArray(stageCapacity) { NO_DIRECTION.toByte() }
     private var stageOrder = IntArray(stageCapacity)
     private var stageRelationTarget = IntArray(stageCapacity)
-    private var stageRelationSource = LongArray(stageCapacity)
+    private var stageRelationSource = IntArray(stageCapacity)
     private var stageComponent = IntArray(stageCapacity)
     private var stagePositive = BooleanArray(stageCapacity)
     private var stageRemoval = BooleanArray(stageCapacity)
-    private var stageChangeKind = IntArray(stageCapacity)
-    private var stageChangeSource = LongArray(stageCapacity)
+    private var stageChangeKind = ByteArray(stageCapacity)
+    private var stageChangeSource = IntArray(stageCapacity)
     private var stageChangeTarget = IntArray(stageCapacity)
     private var stageChangeComponent = IntArray(stageCapacity)
     private var stageCount = 0
@@ -88,8 +86,8 @@ internal class DepthEvidenceKernel(
     private var closed = false
 
     init {
-        require(fixedPrimitiveBytes() <= SEMANTIC_STATE_BUDGET_BYTES) {
-            "fixed primitive ownership exceeds the native semantic-state budget"
+        require(modeledMaximumSemanticStateBytes() <= SEMANTIC_STATE_BUDGET_BYTES) {
+            "modeled semantic-state ownership exceeds the native budget"
         }
     }
 
@@ -184,6 +182,8 @@ internal class DepthEvidenceKernel(
             evidenceRowCapacity = tableCapacity,
             fixedPrimitiveBytes = if (closed) 0 else fixedPrimitiveBytes(),
             closed = closed,
+            maximumAcceptedOutputReserveBytes = if (closed) 0 else MAXIMUM_ACCEPTED_OUTPUT_RESERVE_BYTES,
+            modeledMaximumSemanticStateBytes = if (closed) 0 else modeledMaximumSemanticStateBytes(),
         )
     }
 
@@ -191,7 +191,6 @@ internal class DepthEvidenceKernel(
         if (closed) return
         pending = null
         resetStage()
-        hashKeys = LongArray(0)
         hashRows = IntArray(0)
         rowVoxelKey = LongArray(0)
         rowOccupied = ByteArray(0)
@@ -203,7 +202,6 @@ internal class DepthEvidenceKernel(
         rowPackedNormal = ShortArray(0)
         rowNormalConfidence = ByteArray(0)
         rowLineageCount = ShortArray(0)
-        stageHashKeys = LongArray(0)
         stageHashRows = IntArray(0)
         stageX = IntArray(0)
         stageY = IntArray(0)
@@ -222,15 +220,15 @@ internal class DepthEvidenceKernel(
         stageOccupiedCameraX = DoubleArray(0)
         stageOccupiedCameraY = DoubleArray(0)
         stageOccupiedCameraZ = DoubleArray(0)
-        stageFreeBin = IntArray(0)
+        stageFreeBin = ByteArray(0)
         stageOrder = IntArray(0)
         stageRelationTarget = IntArray(0)
-        stageRelationSource = LongArray(0)
+        stageRelationSource = IntArray(0)
         stageComponent = IntArray(0)
         stagePositive = BooleanArray(0)
         stageRemoval = BooleanArray(0)
-        stageChangeKind = IntArray(0)
-        stageChangeSource = LongArray(0)
+        stageChangeKind = ByteArray(0)
+        stageChangeSource = IntArray(0)
         stageChangeTarget = IntArray(0)
         stageChangeComponent = IntArray(0)
         residentRows = 0
@@ -309,10 +307,10 @@ internal class DepthEvidenceKernel(
                         if (candidateIndex != EMPTY_ROW || retained) {
                             val index = if (candidateIndex != EMPTY_ROW) candidateIndex else stageIndex(voxel, null)
                             val direction = directionBin(cameraGroup, cellCenter)
-                            stageFreeBin[index] = if (stageFreeBin[index] == NO_DIRECTION) {
-                                direction
+                            stageFreeBin[index] = if (stageFreeBinValue(index) == NO_DIRECTION) {
+                                direction.toByte()
                             } else {
-                                minOf(stageFreeBin[index], direction)
+                                minOf(stageFreeBinValue(index), direction).toByte()
                             }
                         }
                     }
@@ -340,11 +338,11 @@ internal class DepthEvidenceKernel(
                 stageOccupied[index] = updated.first.toByte()
                 if (updated.second) overflowCount = checkedAdd(overflowCount, 1)
             }
-            if (stageFreeBin[index] != NO_DIRECTION) {
+            if (stageFreeBinValue(index) != NO_DIRECTION) {
                 val updated = increment(stageFreeValue(index))
                 stageFree[index] = updated.first.toByte()
                 if (updated.second) overflowCount = checkedAdd(overflowCount, 1)
-                val bit = 1 shl stageFreeBin[index]
+                val bit = 1 shl stageFreeBinValue(index)
                 if (stageDirections[index] and bit == 0) {
                     stageDirections[index] = stageDirections[index] or bit
                     directionVotes++
@@ -483,14 +481,14 @@ internal class DepthEvidenceKernel(
     private fun addPlannedChange(kind: Int, index: Int, component: Int, hasSingleSource: Boolean) {
         check(stageChangeCount < stageCapacity)
         val slot = stageChangeCount++
-        stageChangeKind[slot] = kind
+        stageChangeKind[slot] = kind.toByte()
         stageChangeTarget[slot] = index
         stageChangeComponent[slot] = component
-        stageChangeSource[slot] = if (hasSingleSource) {
+        stageChangeSource[slot] = (if (hasSingleSource) {
             sourceAtRank(component, 0)
         } else {
             stageSourceIdValue(index)
-        }
+        }).toInt()
     }
 
     private fun findComponent(index: Int): Int {
@@ -536,7 +534,7 @@ internal class DepthEvidenceKernel(
         var seen = 0
         for (relation in 0 until stageRelationCount) {
             if (stageRelationTarget[relation] == index) {
-                if (seen == ordinal) return stageRelationSource[relation]
+                if (seen == ordinal) return stageRelationSource[relation].toLong() and 0xffff_ffffL
                 seen++
             }
         }
@@ -610,7 +608,7 @@ internal class DepthEvidenceKernel(
     ): DepthEvidenceChange {
         val index = stageChangeTarget[slot]
         val root = stageChangeComponent[slot]
-        val source = stageChangeSource[slot].takeIf { it != 0L }?.let(::SurfaceId)
+        val source = stageChangeSourceValue(slot).takeIf { it != 0L }?.let(::SurfaceId)
         fun target(targetIndex: Int, id: SurfaceId? = null): CanonicalTarget = targetFor(
             targetIndex,
             if (stageHasOccupied[targetIndex]) occupiedPoint(targetIndex) else null,
@@ -618,7 +616,7 @@ internal class DepthEvidenceKernel(
             frame,
             id,
         )
-        return when (stageChangeKind[slot]) {
+        return when (stageChangeKind[slot].toInt()) {
             CHANGE_CREATE -> DepthEvidenceChange.Create(target(index))
             CHANGE_REFINE -> DepthEvidenceChange.Refine(requireNotNull(source), target(index, source))
             CHANGE_RELOCATE -> DepthEvidenceChange.Relocate(requireNotNull(source), target(index, source))
@@ -656,7 +654,7 @@ internal class DepthEvidenceKernel(
 
     private fun validatePlannedChanges(): DepthEvidenceRefusal? {
         for (slot in 0 until stageChangeCount) {
-            val kind = stageChangeKind[slot]
+            val kind = stageChangeKind[slot].toInt()
             if (kind == CHANGE_CREATE || kind == CHANGE_REFINE || kind == CHANGE_RELOCATE ||
                 kind == CHANGE_MERGE || kind == CHANGE_SPLIT || kind == CHANGE_REPLACE
             ) {
@@ -687,7 +685,7 @@ internal class DepthEvidenceKernel(
                 else -> 0
             }
             for (rank in 0 until sourceCount) {
-                val source = if (sourceCount == 1) stageChangeSource[slot] else {
+                val source = if (sourceCount == 1) stageChangeSourceValue(slot) else {
                     sourceAtRank(stageChangeComponent[slot], rank)
                 }
                 for (prior in 0 until slot) {
@@ -699,18 +697,18 @@ internal class DepthEvidenceKernel(
     }
 
     private fun plannedSourceContains(slot: Int, source: Long): Boolean {
-        return when (stageChangeKind[slot]) {
+        return when (stageChangeKind[slot].toInt()) {
             CHANGE_MERGE, CHANGE_REPLACE -> {
                 val root = stageChangeComponent[slot]
                 (0 until componentSourceCount(root)).any { sourceAtRank(root, it) == source }
             }
-            CHANGE_REFINE, CHANGE_RELOCATE, CHANGE_SPLIT, CHANGE_REMOVE -> stageChangeSource[slot] == source
+            CHANGE_REFINE, CHANGE_RELOCATE, CHANGE_SPLIT, CHANGE_REMOVE -> stageChangeSourceValue(slot) == source
             else -> false
         }
     }
 
     private fun plannedTargetContains(slot: Int, voxel: Voxel): Boolean {
-        return when (stageChangeKind[slot]) {
+        return when (stageChangeKind[slot].toInt()) {
             CHANGE_SPLIT, CHANGE_REPLACE -> {
                 val root = stageChangeComponent[slot]
                 (0 until componentTargetCount(root)).any {
@@ -862,7 +860,7 @@ internal class DepthEvidenceKernel(
         while (true) {
             val row = stageHashRows[slot]
             if (row == EMPTY_ROW) return EMPTY_ROW
-            if (stageHashKeys[slot] == key) return row
+            if (packVisibilityGridKey(stageX[row], stageY[row], stageZ[row]) == key) return row
             slot = (slot + 1) and (stageHashCapacity - 1)
         }
     }
@@ -891,7 +889,7 @@ internal class DepthEvidenceKernel(
         stageOccupiedCameraX[index] = 0.0
         stageOccupiedCameraY[index] = 0.0
         stageOccupiedCameraZ[index] = 0.0
-        stageFreeBin[index] = NO_DIRECTION
+        stageFreeBin[index] = NO_DIRECTION.toByte()
         val resident = findRow(voxel.x, voxel.y, voxel.z)
         if (resident != EMPTY_ROW) {
             stageOccupied[index] = rowOccupied[resident]
@@ -908,7 +906,6 @@ internal class DepthEvidenceKernel(
         }
         var slot = stageHash(packVisibilityGridKey(voxel.x, voxel.y, voxel.z))
         while (stageHashRows[slot] != EMPTY_ROW) slot = (slot + 1) and (stageHashCapacity - 1)
-        stageHashKeys[slot] = packVisibilityGridKey(voxel.x, voxel.y, voxel.z)
         stageHashRows[slot] = index
         if (surface != null) stageAttach(index, surface)
         return index
@@ -929,11 +926,13 @@ internal class DepthEvidenceKernel(
 
     private fun stageAddRelation(index: Int, sourceId: Long) {
         for (relation in 0 until stageRelationCount) {
-            if (stageRelationTarget[relation] == index && stageRelationSource[relation] == sourceId) return
+            if (stageRelationTarget[relation] == index &&
+                (stageRelationSource[relation].toLong() and 0xffff_ffffL) == sourceId
+            ) return
         }
         if (stageRelationCount >= stageCapacity) throw StageCapacityFailure()
         stageRelationTarget[stageRelationCount] = index
-        stageRelationSource[stageRelationCount] = sourceId
+        stageRelationSource[stageRelationCount] = sourceId.toInt()
         stageRelationCount++
     }
 
@@ -963,8 +962,7 @@ internal class DepthEvidenceKernel(
 
     private fun resetStage() {
         java.util.Arrays.fill(stageHashRows, EMPTY_ROW)
-        java.util.Arrays.fill(stageHashKeys, 0L)
-        java.util.Arrays.fill(stageFreeBin, NO_DIRECTION)
+        java.util.Arrays.fill(stageFreeBin, NO_DIRECTION.toByte())
         java.util.Arrays.fill(stageHasOccupied, false)
         java.util.Arrays.fill(stagePositive, false)
         java.util.Arrays.fill(stageRemoval, false)
@@ -980,7 +978,6 @@ internal class DepthEvidenceKernel(
         rowVoxelKey[row] = key
         var slot = hash(key)
         while (hashRows[slot] != EMPTY_ROW) slot = (slot + 1) and (hashCapacity - 1)
-        hashKeys[slot] = key
         hashRows[slot] = row
         return row
     }
@@ -993,7 +990,7 @@ internal class DepthEvidenceKernel(
         while (true) {
             val row = hashRows[slot]
             if (row == EMPTY_ROW) return EMPTY_ROW
-            if (hashKeys[slot] == key && rowVoxelKey[row] == key) return row
+            if (rowVoxelKey[row] == key) return row
             slot = (slot + 1) and (hashCapacity - 1)
         }
     }
@@ -1028,8 +1025,8 @@ internal class DepthEvidenceKernel(
         return DepthEvidenceResult.Refused(reason, lastReceipt)
     }
 
-    private fun kindCounts(kinds: IntArray, count: Int): IntArray = IntArray(7).also { counts ->
-        for (index in 0 until count) when (kinds[index]) {
+    private fun kindCounts(kinds: ByteArray, count: Int): IntArray = IntArray(7).also { counts ->
+        for (index in 0 until count) when (kinds[index].toInt()) {
             CHANGE_CREATE -> counts[0]++
             CHANGE_REFINE -> counts[1]++
             CHANGE_RELOCATE -> counts[2]++
@@ -1140,28 +1137,45 @@ internal class DepthEvidenceKernel(
 
     private fun stageNormalConfidenceValue(index: Int): Int = stageNormalConfidence[index].toInt() and 0xff
 
-    private fun fixedPrimitiveBytes(): Int {
-        var total = 0L
-        fun addArrays(count: Int, capacity: Int, elementBytes: Int) {
-            val payload = capacity.toLong() * elementBytes
-            val alignedPayload = (payload + OBJECT_ALIGNMENT_BYTES - 1) / OBJECT_ALIGNMENT_BYTES * OBJECT_ALIGNMENT_BYTES
-            total += count.toLong() * (ARRAY_HEADER_BYTES + alignedPayload)
-        }
+    internal fun primitiveArraysForAccounting(): List<Any> = listOf(
+        hashRows,
+        rowVoxelKey, rowOccupied, rowFree, rowDirections, rowFlags, rowSourceId,
+        rowSourceKey, rowPackedNormal, rowNormalConfidence, rowLineageCount,
+        stageHashRows,
+        stageX, stageY, stageZ, stageOccupied, stageFree, stageDirections,
+        stageContradicted, stageSourceId, stageSourceKey, stagePackedNormal,
+        stageNormalConfidence, stageLineageCount, stagePublished, stageHasOccupied,
+        stageOccupiedCameraX, stageOccupiedCameraY, stageOccupiedCameraZ,
+        stageFreeBin, stageOrder, stageRelationTarget, stageRelationSource,
+        stageComponent, stagePositive, stageRemoval, stageChangeKind,
+        stageChangeSource, stageChangeTarget, stageChangeComponent,
+    )
 
-        addArrays(1, hashCapacity, Long.SIZE_BYTES)
-        addArrays(1, hashCapacity, Int.SIZE_BYTES)
-        addArrays(2, tableCapacity, Long.SIZE_BYTES)
-        addArrays(4, tableCapacity, Byte.SIZE_BYTES)
-        addArrays(2, tableCapacity, Int.SIZE_BYTES)
-        addArrays(2, tableCapacity, Short.SIZE_BYTES)
-        addArrays(1, stageHashCapacity, Long.SIZE_BYTES)
-        addArrays(1, stageHashCapacity, Int.SIZE_BYTES)
-        addArrays(12, stageCapacity, Int.SIZE_BYTES)
-        addArrays(8, stageCapacity, Byte.SIZE_BYTES)
-        addArrays(6, stageCapacity, Long.SIZE_BYTES)
-        addArrays(2, stageCapacity, Short.SIZE_BYTES)
-        return Math.toIntExact(total)
+    private fun fixedPrimitiveBytes(): Int = Math.toIntExact(
+        primitiveArraysForAccounting().sumOf(::modeledArrayBytes),
+    )
+
+    private fun modeledArrayBytes(array: Any): Long {
+        val elementBytes = when (array) {
+            is ByteArray, is BooleanArray -> Byte.SIZE_BYTES
+            is ShortArray -> Short.SIZE_BYTES
+            is IntArray, is FloatArray -> Int.SIZE_BYTES
+            is LongArray, is DoubleArray -> Long.SIZE_BYTES
+            else -> error("non-primitive array in depth evidence ledger")
+        }
+        val payload = java.lang.reflect.Array.getLength(array).toLong() * elementBytes
+        val alignedPayload = (payload + OBJECT_ALIGNMENT_BYTES - 1) / OBJECT_ALIGNMENT_BYTES * OBJECT_ALIGNMENT_BYTES
+        return ARRAY_HEADER_BYTES + alignedPayload
     }
+
+    private fun modeledMaximumSemanticStateBytes(): Int = Math.addExact(
+        fixedPrimitiveBytes(),
+        MAXIMUM_ACCEPTED_OUTPUT_RESERVE_BYTES,
+    )
+
+    private fun stageFreeBinValue(index: Int): Int = stageFreeBin[index].toInt()
+
+    private fun stageChangeSourceValue(index: Int): Long = stageChangeSource[index].toLong() and 0xffff_ffffL
 
     private fun flags(contradicted: Boolean, published: Boolean): Byte =
         ((if (contradicted) CONTRADICTED_FLAG else 0) or
@@ -1186,6 +1200,11 @@ internal class DepthEvidenceKernel(
         const val EMPTY_ROW = -1
         const val EVIDENCE_BYTES = 32
         const val SEMANTIC_STATE_BUDGET_BYTES = 16 * 1024 * 1024
+        // Conservative semantic ownership allowance, not a JVM heap-size claim.
+        // It covers the larger of 67,072 compact removal descriptors (one per
+        // staged row) or 1,536 target-bearing endpoint changes, plus immutable
+        // list references and the Accepted/result/receipt/work containers.
+        const val MAXIMUM_ACCEPTED_OUTPUT_RESERVE_BYTES = 4 * 1024 * 1024
         const val ARRAY_HEADER_BYTES = 16L
         const val OBJECT_ALIGNMENT_BYTES = 8L
         const val DIRECTION_BINS = 24

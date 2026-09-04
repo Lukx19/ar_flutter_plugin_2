@@ -29,6 +29,41 @@ final class VisibilityGridCoreTests: XCTestCase {
         return scenarios.first { $0["name"] as? String == name }!
     }
 
+    func testSharedCorpusPinsDepthEvidencePacketsForEveryPlatform() throws {
+        let specification = try XCTUnwrap(
+            corpus["depthEvidenceKernel"] as? [String: Any]
+        )
+        XCTAssertEqual(
+            specification["format"] as? String,
+            "bounded_depth_evidence_fixture_v1"
+        )
+        let cases = try XCTUnwrap(
+            specification["cases"] as? [[String: Any]]
+        )
+        let requiredNames: Set<String> = [
+            "transformed_frame", "create", "refine", "relocate", "merge",
+            "split", "replace", "remove_at_viable_capacity", "corridor",
+            "safety_band_boundary", "hole_and_foreground_edge",
+            "thin_double_opposed_views", "full_sample_budget",
+            "canonical_lookup_refusal", "capacity_refusal",
+        ]
+        XCTAssertEqual(Set(cases.compactMap { $0["name"] as? String }), requiredNames)
+        for fixtureCase in cases {
+            XCTAssertNotNil(fixtureCase["expectedChanges"] as? [[String: Any]])
+            XCTAssertNotNil(fixtureCase["expectedReceipt"] as? [String: Any])
+            XCTAssertTrue(fixtureCase.keys.contains("expectedWork"))
+        }
+        let create = try XCTUnwrap(
+            cases.first { $0["name"] as? String == "create" }
+        )
+        let changes = try XCTUnwrap(create["expectedChanges"] as? [[String: Any]])
+        let target = try XCTUnwrap(changes.first?["target"] as? [String: Any])
+        XCTAssertEqual(target["voxel"] as? [Int], [-8, 5, -10])
+        XCTAssertEqual(target["normalOctX"] as? Int, 42)
+        XCTAssertEqual(target["normalOctY"] as? Int, -28)
+        XCTAssertEqual(target["normalConfidence"] as? Int, 255)
+    }
+
     func testSharedCorpusPackedKeysAndGroupTransform() throws {
         XCTAssertEqual(corpus["version"] as? String, visibilityGridWireVersion)
         let fixture = scenario("group_transform_and_packed_keys")

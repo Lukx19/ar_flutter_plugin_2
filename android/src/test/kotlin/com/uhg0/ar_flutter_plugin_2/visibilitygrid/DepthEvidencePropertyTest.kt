@@ -1,5 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
+import java.util.Collections
+import java.util.IdentityHashMap
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -80,7 +82,7 @@ class DepthEvidencePropertyTest {
     fun `resource receipt reports fixed primitive ownership and staged row bytes`() {
         val kernel = DepthEvidenceKernel(DepthEvidenceConfiguration(surfaceCapacity = 1))
         val before = kernel.resourceReceipt()
-        assertEquals(1_024, before.fixedPrimitiveBytes)
+        assertEquals(960, before.fixedPrimitiveBytes)
 
         val accepted = kernel.prepare(batch(1), PropertyView()) as DepthEvidenceResult.Accepted
         val staged = kernel.resourceReceipt()
@@ -109,15 +111,80 @@ class DepthEvidencePropertyTest {
                 preparedEvidenceRows = 0,
                 preparedResidentBytes = 0,
                 evidenceRowCapacity = 100_000,
-                fixedPrimitiveBytes = 16_735_904,
+                fixedPrimitiveBytes = 11_602_560,
                 closed = false,
+                maximumAcceptedOutputReserveBytes = 4_194_304,
+                modeledMaximumSemanticStateBytes = 15_796_864,
             ),
             receipt,
         )
-        assertTrue(receipt.fixedPrimitiveBytes <= 16 * 1024 * 1024)
+        assertTrue(receipt.modeledMaximumSemanticStateBytes <= 16 * 1024 * 1024)
         assertThrows(IllegalArgumentException::class.java) {
             DepthEvidenceConfiguration(surfaceCapacity = 100_001)
         }
+    }
+
+    @Test
+    fun `primitive ownership ledger contains every allocated array column exactly once`() {
+        val kernel = DepthEvidenceKernel()
+        val reflected = kernel.javaClass.declaredFields.mapNotNull { field ->
+            if (!field.type.isArray || field.type.componentType?.isPrimitive != true) return@mapNotNull null
+            field.isAccessible = true
+            field.get(kernel)
+        }
+        val reflectedIdentities = Collections.newSetFromMap(IdentityHashMap<Any, Boolean>()).apply {
+            addAll(reflected)
+        }
+        val ledger = kernel.primitiveArraysForAccounting()
+        val ledgerIdentities = Collections.newSetFromMap(IdentityHashMap<Any, Boolean>()).apply {
+            addAll(ledger)
+        }
+
+        assertEquals(reflected.size, reflectedIdentities.size)
+        assertEquals(reflectedIdentities, ledgerIdentities)
+        assertEquals(reflected.size, ledger.size)
+    }
+
+    @Test
+    fun `maximum endpoint change packet remains inside reserved output headroom`() {
+        val capacity = V2_DEPTH_SAMPLE_CAPACITY
+        val samples = List(capacity) { x -> VisibilityDepthSample(x, 0, 1_000, 255) }
+        val largeFrame = VisibilityGroupFrame.copyOf(
+            identity().toDoubleArray(), identity().toDoubleArray(), 100_000, 100_000,
+        )
+        val batch = DepthEvidenceBatch(
+            1, 1, largeFrame, identity(),
+            VisibilityCameraIntrinsics(capacity, 1, 1.0, 1.0, 0.0, 0.0),
+            samples, 0,
+        )
+        val kernel = DepthEvidenceKernel()
+        repeat(3) { index ->
+            kernel.prepare(batch.copy(sequence = index + 1L, sourceTimestampNs = index + 1L), PropertyView())
+            kernel.applyPrepared()
+        }
+        val result = kernel.prepare(batch.copy(sequence = 4, sourceTimestampNs = 4), PropertyView())
+            as DepthEvidenceResult.Accepted
+
+        assertEquals(capacity, result.changes.size)
+        assertEquals(
+            DepthEvidenceReceipt(
+                sequence = 4,
+                sourceTimestampNs = 4,
+                acceptedSamples = capacity,
+                touchedEvidenceRows = capacity,
+                createCount = capacity,
+                preparedResidentBytes = capacity * 32,
+                p50VirtualWorkUnits = capacity * 2,
+                p95VirtualWorkUnits = capacity * 2,
+            ),
+            result.receipt,
+        )
+        assertEquals(
+            DepthEvidenceWorkReceipt(capacity, capacity, 0, 0, capacity * 2),
+            result.work,
+        )
+        assertEquals(4_194_304, kernel.resourceReceipt().maximumAcceptedOutputReserveBytes)
+        assertEquals(15_796_864, kernel.resourceReceipt().modeledMaximumSemanticStateBytes)
     }
 
     @Test

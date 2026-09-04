@@ -644,6 +644,58 @@ void main() {
     expect(fixture['version'], visibilityGridWireVersion);
     expect(fixture['voxelKeyConvention'], 'coverage_grid_v3');
     expect(fixture['matrixConvention'], 'column_major_gl_meters_v1');
+    final depthEvidence =
+        fixture['depthEvidenceKernel'] as Map<String, dynamic>;
+    expect(depthEvidence['format'], 'bounded_depth_evidence_fixture_v1');
+    final depthEvidenceCases =
+        (depthEvidence['cases'] as List<dynamic>).cast<Map<String, dynamic>>();
+    expect(
+      depthEvidenceCases.map((fixtureCase) => fixtureCase['name']),
+      containsAll(<String>[
+        'transformed_frame',
+        'create',
+        'refine',
+        'relocate',
+        'merge',
+        'split',
+        'replace',
+        'remove_at_viable_capacity',
+        'corridor',
+        'safety_band_boundary',
+        'hole_and_foreground_edge',
+        'thin_double_opposed_views',
+        'full_sample_budget',
+        'canonical_lookup_refusal',
+        'capacity_refusal',
+      ]),
+    );
+    for (final fixtureCase in depthEvidenceCases) {
+      expect(fixtureCase, containsPair('expectedChanges', isA<List<dynamic>>()));
+      expect(
+        fixtureCase,
+        containsPair('expectedReceipt', isA<Map<String, dynamic>>()),
+      );
+      expect(fixtureCase, contains('expectedWork'));
+    }
+    final createPacket = depthEvidenceCases.singleWhere(
+      (fixtureCase) => fixtureCase['name'] == 'create',
+    );
+    expect(createPacket['expectedChanges'], <Map<String, dynamic>>[
+      <String, dynamic>{
+        'kind': 'create',
+        'target': <String, dynamic>{
+          'sourceId': null,
+          'voxel': <int>[-8, 5, -10],
+          'normalOctX': 42,
+          'normalOctY': -28,
+          'normalConfidence': 255,
+        },
+      },
+    ]);
+    expect(
+      createPacket['expectedReceipt'],
+      containsPair('preparedResidentBytes', 32),
+    );
     final scenarios =
         (fixture['scenarios'] as List<dynamic>).cast<Map<String, dynamic>>();
     expect(

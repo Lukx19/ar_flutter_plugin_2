@@ -700,7 +700,7 @@ class DepthEvidenceKernelTest {
         }
 
         assertEquals(
-            DepthEvidenceResourceReceipt(2, 64, 0, 0, 2, 1_136, false),
+            DepthEvidenceResourceReceipt(2, 64, 0, 0, 2, 1_024, false, 4_194_304, 4_195_328),
             kernel.resourceReceipt(),
         )
     }
@@ -729,7 +729,7 @@ class DepthEvidenceKernelTest {
             ),
             result,
         )
-        assertEquals(16_735_904, kernel.resourceReceipt().fixedPrimitiveBytes)
+        assertEquals(11_602_560, kernel.resourceReceipt().fixedPrimitiveBytes)
         kernel.discardPrepared()
     }
 
@@ -877,7 +877,7 @@ class DepthEvidenceKernelTest {
         kernel.applyPrepared()
         kernel.close()
 
-        val closed = DepthEvidenceResourceReceipt(0, 0, 0, 0, 100_000, 0, true)
+        val closed = DepthEvidenceResourceReceipt(0, 0, 0, 0, 100_000, 0, true, 0, 0)
         assertEquals(closed, kernel.resourceReceipt())
         kernel.close()
         assertEquals(closed, kernel.resourceReceipt())

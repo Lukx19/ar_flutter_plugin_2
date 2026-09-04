@@ -15,6 +15,153 @@
     "freeEvidenceToCarve": 8,
     "separatedDirectionBinsRequired": 2
   },
+  "depthEvidenceKernel": {
+    "format": "bounded_depth_evidence_fixture_v1",
+    "receiptDefaults": {
+      "acceptedSamples": 0,
+      "rejectedSamples": 0,
+      "rayVisits": 0,
+      "touchedEvidenceRows": 0,
+      "independentDirectionVotes": 0,
+      "createCount": 0,
+      "refineCount": 0,
+      "relocateCount": 0,
+      "mergeCount": 0,
+      "splitCount": 0,
+      "replaceCount": 0,
+      "removeCount": 0,
+      "conflictsRetained": 0,
+      "capacityRefusals": 0,
+      "overflowCount": 0,
+      "preparedResidentBytes": 0,
+      "p50VirtualWorkUnits": 0,
+      "p95VirtualWorkUnits": 0
+    },
+    "cases": [
+      {
+        "name": "transformed_frame",
+        "covers": ["transformed frame"],
+        "expectedStatus": "accepted",
+        "expectedChanges": [],
+        "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 1, "touchedEvidenceRows": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 2, "p95VirtualWorkUnits": 2},
+        "expectedWork": {"distinctTouchedVoxelCount": 1, "emittedChangeCount": 0, "rayVisits": 0, "independentDirectionVotes": 0, "virtualWorkUnits": 2}
+      },
+      {
+        "name": "create",
+        "covers": ["wall", "create", "change intent"],
+        "expectedStatus": "accepted",
+        "expectedChanges": [{"kind": "create", "target": {"sourceId": null, "voxel": [-8, 5, -10], "normalOctX": 42, "normalOctY": -28, "normalConfidence": 255}}],
+        "expectedReceipt": {"sequence": 4, "sourceTimestampNs": 4, "acceptedSamples": 1, "touchedEvidenceRows": 1, "createCount": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 2, "p95VirtualWorkUnits": 2},
+        "expectedWork": {"distinctTouchedVoxelCount": 1, "emittedChangeCount": 1, "rayVisits": 0, "independentDirectionVotes": 0, "virtualWorkUnits": 2}
+      },
+      {
+        "name": "refine",
+        "covers": ["refine", "change intent"],
+        "expectedStatus": "accepted",
+        "expectedChanges": [{"kind": "refine", "sourceIds": [7], "target": {"sourceId": 7, "voxel": [0, 0, -5], "normalOctX": 16, "normalOctY": 16, "normalConfidence": 200}}],
+        "expectedReceipt": {"sequence": 40, "sourceTimestampNs": 40, "acceptedSamples": 1, "rayVisits": 1, "touchedEvidenceRows": 1, "refineCount": 1, "conflictsRetained": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 3, "p95VirtualWorkUnits": 3},
+        "expectedWork": {"distinctTouchedVoxelCount": 1, "emittedChangeCount": 1, "rayVisits": 1, "independentDirectionVotes": 0, "virtualWorkUnits": 3}
+      },
+      {
+        "name": "relocate",
+        "covers": ["relocate", "change intent"],
+        "expectedStatus": "accepted",
+        "expectedChanges": [{"kind": "relocate", "sourceIds": [21], "target": {"sourceId": 21, "voxel": [0, 0, -10], "normalOctX": 16, "normalOctY": 16, "normalConfidence": 200}}],
+        "expectedReceipt": {"sequence": 4, "sourceTimestampNs": 4, "acceptedSamples": 1, "touchedEvidenceRows": 1, "relocateCount": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 2, "p95VirtualWorkUnits": 2},
+        "expectedWork": {"distinctTouchedVoxelCount": 1, "emittedChangeCount": 1, "rayVisits": 0, "independentDirectionVotes": 0, "virtualWorkUnits": 2}
+      },
+      {
+        "name": "merge",
+        "covers": ["merge", "change intent"],
+        "expectedStatus": "accepted",
+        "expectedChanges": [{"kind": "merge", "sourceIds": [31, 32], "target": {"sourceId": null, "voxel": [0, 0, -10], "normalOctX": 16, "normalOctY": 16, "normalConfidence": 200}}],
+        "expectedReceipt": {"sequence": 4, "sourceTimestampNs": 4, "acceptedSamples": 1, "rayVisits": 1, "touchedEvidenceRows": 1, "mergeCount": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 3, "p95VirtualWorkUnits": 3},
+        "expectedWork": {"distinctTouchedVoxelCount": 1, "emittedChangeCount": 1, "rayVisits": 1, "independentDirectionVotes": 0, "virtualWorkUnits": 3}
+      },
+      {
+        "name": "split",
+        "covers": ["split", "change intent"],
+        "expectedStatus": "accepted",
+        "expectedChanges": [{"kind": "split", "sourceIds": [41], "targets": [{"sourceId": null, "voxel": [-8, 0, -10], "normalOctX": 16, "normalOctY": 16, "normalConfidence": 200}, {"sourceId": null, "voxel": [7, 0, -10], "normalOctX": 16, "normalOctY": 16, "normalConfidence": 200}]}],
+        "expectedReceipt": {"sequence": 4, "sourceTimestampNs": 4, "acceptedSamples": 2, "touchedEvidenceRows": 2, "splitCount": 1, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 4, "p95VirtualWorkUnits": 4},
+        "expectedWork": {"distinctTouchedVoxelCount": 2, "emittedChangeCount": 1, "rayVisits": 0, "independentDirectionVotes": 0, "virtualWorkUnits": 4}
+      },
+      {
+        "name": "replace",
+        "covers": ["replace", "change intent"],
+        "expectedStatus": "accepted",
+        "expectedChanges": [{"kind": "replace", "sourceIds": [51, 52], "targets": [{"sourceId": null, "voxel": [-8, 0, -10], "normalOctX": 16, "normalOctY": 16, "normalConfidence": 200}, {"sourceId": null, "voxel": [7, 0, -10], "normalOctX": 16, "normalOctY": 16, "normalConfidence": 200}]}],
+        "expectedReceipt": {"sequence": 4, "sourceTimestampNs": 4, "acceptedSamples": 2, "rayVisits": 4, "touchedEvidenceRows": 2, "replaceCount": 1, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 8, "p95VirtualWorkUnits": 8},
+        "expectedWork": {"distinctTouchedVoxelCount": 2, "emittedChangeCount": 1, "rayVisits": 4, "independentDirectionVotes": 0, "virtualWorkUnits": 8}
+      },
+      {
+        "name": "remove_at_viable_capacity",
+        "covers": ["remove", "capacity", "change intent"],
+        "expectedStatus": "accepted",
+        "expectedChanges": [{"kind": "remove", "sourceIds": [81]}],
+        "expectedReceipt": {"sequence": 27, "sourceTimestampNs": 27, "acceptedSamples": 1, "rayVisits": 1, "touchedEvidenceRows": 2, "removeCount": 1, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 4, "p95VirtualWorkUnits": 4},
+        "expectedWork": {"distinctTouchedVoxelCount": 2, "emittedChangeCount": 1, "rayVisits": 1, "independentDirectionVotes": 0, "virtualWorkUnits": 4}
+      },
+      {
+        "name": "corridor",
+        "covers": ["corridor", "safety band"],
+        "expectedStatus": "accepted",
+        "expectedChanges": [],
+        "expectedReceipt": {"sequence": 139, "sourceTimestampNs": 139, "acceptedSamples": 1, "rayVisits": 5, "touchedEvidenceRows": 6, "preparedResidentBytes": 192, "p50VirtualWorkUnits": 12, "p95VirtualWorkUnits": 12},
+        "expectedWork": {"distinctTouchedVoxelCount": 6, "emittedChangeCount": 0, "rayVisits": 5, "independentDirectionVotes": 0, "virtualWorkUnits": 12}
+      },
+      {
+        "name": "safety_band_boundary",
+        "covers": ["safety band", "no behind endpoint"],
+        "expectedStatus": "accepted",
+        "expectedChanges": [],
+        "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 1, "rayVisits": 1, "touchedEvidenceRows": 2, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 4, "p95VirtualWorkUnits": 4},
+        "expectedWork": {"distinctTouchedVoxelCount": 2, "emittedChangeCount": 0, "rayVisits": 1, "independentDirectionVotes": 0, "virtualWorkUnits": 4}
+      },
+      {
+        "name": "hole_and_foreground_edge",
+        "covers": ["hole", "low confidence", "foreground edge"],
+        "expectedStatus": "accepted",
+        "expectedChanges": [],
+        "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 1, "rejectedSamples": 1, "rayVisits": 1, "touchedEvidenceRows": 2, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 4, "p95VirtualWorkUnits": 4},
+        "expectedWork": {"distinctTouchedVoxelCount": 2, "emittedChangeCount": 0, "rayVisits": 1, "independentDirectionVotes": 0, "virtualWorkUnits": 4}
+      },
+      {
+        "name": "thin_double_opposed_views",
+        "covers": ["thin wall", "double wall", "opposed views"],
+        "expectedStatus": "accepted",
+        "expectedChanges": [],
+        "expectedReceipt": {"sequence": 27, "sourceTimestampNs": 27, "acceptedSamples": 2, "rayVisits": 2, "touchedEvidenceRows": 2, "conflictsRetained": 1, "preparedResidentBytes": 64, "p50VirtualWorkUnits": 6, "p95VirtualWorkUnits": 6},
+        "expectedWork": {"distinctTouchedVoxelCount": 2, "emittedChangeCount": 0, "rayVisits": 2, "independentDirectionVotes": 0, "virtualWorkUnits": 6}
+      },
+      {
+        "name": "full_sample_budget",
+        "covers": ["full budget"],
+        "expectedStatus": "accepted",
+        "expectedChanges": [],
+        "expectedReceipt": {"sequence": 1, "sourceTimestampNs": 1, "acceptedSamples": 1536, "touchedEvidenceRows": 1, "preparedResidentBytes": 32, "p50VirtualWorkUnits": 1537, "p95VirtualWorkUnits": 1537},
+        "expectedWork": {"distinctTouchedVoxelCount": 1, "emittedChangeCount": 0, "rayVisits": 0, "independentDirectionVotes": 0, "virtualWorkUnits": 1537}
+      },
+      {
+        "name": "canonical_lookup_refusal",
+        "covers": ["refusal", "canonical lookup"],
+        "expectedStatus": "refused",
+        "expectedRefusal": "CANONICAL_LOOKUP_FAILED",
+        "expectedChanges": [],
+        "expectedReceipt": {"sequence": 0, "sourceTimestampNs": 0},
+        "expectedWork": null
+      },
+      {
+        "name": "capacity_refusal",
+        "covers": ["refusal", "capacity"],
+        "expectedStatus": "refused",
+        "expectedRefusal": "SURFACE_CAPACITY",
+        "expectedChanges": [],
+        "expectedReceipt": {"sequence": 0, "sourceTimestampNs": 0, "capacityRefusals": 1},
+        "expectedWork": null
+      }
+    ]
+  },
   "scenarios": [
     {
       "name": "group_transform_and_packed_keys",
