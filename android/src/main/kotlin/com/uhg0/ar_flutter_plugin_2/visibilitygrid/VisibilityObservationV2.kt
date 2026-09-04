@@ -256,8 +256,10 @@ internal class VisibilityDepthObservation(
         const val DEPTH_FIXED_BYTES = 512
         const val DEPTH_SAMPLE_BYTES = 16
 
-        fun copySamples(samples: List<VisibilityDepthSample>): List<VisibilityDepthSample> =
-            Collections.unmodifiableList(ArrayList(samples))
+        fun copySamples(samples: List<VisibilityDepthSample>): List<VisibilityDepthSample> {
+            require(samples.size <= V2_DEPTH_SAMPLE_CAPACITY)
+            return Collections.unmodifiableList(ArrayList(samples))
+        }
     }
 }
 

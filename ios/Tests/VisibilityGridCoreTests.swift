@@ -37,6 +37,14 @@ final class VisibilityGridCoreTests: XCTestCase {
             specification["format"] as? String,
             "bounded_depth_evidence_fixture_v1"
         )
+        let encodedSpecification = try JSONSerialization.data(
+            withJSONObject: specification
+        )
+        let specificationText = try XCTUnwrap(
+            String(data: encodedSpecification, encoding: .utf8)
+        )
+        XCTAssertFalse(specificationText.contains("\"rayCells\""))
+        XCTAssertFalse(specificationText.contains("\"rayHits\""))
         let cases = try XCTUnwrap(
             specification["cases"] as? [[String: Any]]
         )

@@ -18,6 +18,8 @@ class VisibilityGridFixtureContractTest {
             "bounded_depth_evidence_fixture_v1",
             specification.getValue("format").jsonPrimitive.content,
         )
+        assertFalse(specification.toString().contains("\"rayCells\""))
+        assertFalse(specification.toString().contains("\"rayHits\""))
         val cases = specification.getValue("cases").jsonArray.map { it.jsonObject }
         val requiredCoverage = setOf(
             "wall", "corridor", "safety band", "no behind endpoint", "hole",
@@ -767,6 +769,7 @@ class VisibilityGridFixtureContractTest {
             )
             run.getValue("steps").jsonArray.forEachIndexed { stepIndex, stepValue ->
                 val step = stepValue.jsonObject
+                step["surfaceAddresses"]?.jsonArray?.let(view::replaceAddresses)
                 val intrinsics = step.getValue("intrinsics").jsonArray.map { it.jsonPrimitive.content.toDouble() }
                 val sampleElement = step.getValue("samples")
                 val sampleValues = if (sampleElement is kotlinx.serialization.json.JsonObject) {
@@ -835,11 +838,10 @@ class VisibilityGridFixtureContractTest {
             val coordinates = value.jsonArray.map { it.jsonPrimitive.content.toInt() }
             return Voxel(coordinates[0], coordinates[1], coordinates[2])
         }
-        private val surfaces = specification?.get("surfaces")?.jsonArray?.associate { value ->
+        private val definitions = specification?.get("surfaces")?.jsonArray?.map { value ->
             val surface = value.jsonObject
             val canonicalVoxel = voxel(surface.getValue("voxel"))
-            val addressed = surface["addressedAt"]?.let(::voxel) ?: canonicalVoxel
-            addressed to DepthCanonicalSurface(
+            surface to DepthCanonicalSurface(
                 SurfaceId(surface.getValue("sourceId").jsonPrimitive.content.toLong()),
                 canonicalVoxel,
                 surface["packedNormal"]?.jsonPrimitive?.content?.toInt() ?: 0x1010,
@@ -847,12 +849,9 @@ class VisibilityGridFixtureContractTest {
                 surface["lineageCount"]?.jsonPrimitive?.content?.toInt() ?: 1,
             )
         }.orEmpty()
-        private val byId = surfaces.values.associateBy { it.id }
-        private val rayCells = specification?.get("rayCells")?.jsonArray?.map(::voxel).orEmpty()
-        private val rayHits = specification?.get("rayHits")?.jsonArray?.map { value ->
-            val hit = value.jsonObject
-            voxel(hit.getValue("voxel")) to
-                hit["sourceId"]?.jsonPrimitive?.content?.toLong()?.let { byId[SurfaceId(it)] }
+        private val byId = definitions.associate { it.second.id to it.second }
+        private var surfaces = definitions.associate { (source, surface) ->
+            (source["addressedAt"]?.let(::voxel) ?: surface.voxel) to surface
         }
         private val missingIds = specification?.get("idLookup")?.jsonPrimitive?.content == "missing"
         override val geometryRevision = 0L
@@ -860,15 +859,14 @@ class VisibilityGridFixtureContractTest {
         override val surfaceCount = specification?.get("surfaceCount")?.jsonPrimitive?.content?.toInt() ?: surfaces.size
         override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? = if (missingIds) null else byId[id]
         override fun findSurfaceAt(voxel: Voxel): DepthCanonicalSurface? = surfaces[voxel]
-        override fun visitRayCells(
-            startGroupMm: DepthPointMm,
-            endpointGroupMm: DepthPointMm,
-            maximumVisits: Int,
-            visitor: (Voxel, DepthCanonicalSurface?) -> Boolean,
-        ): DepthRayVisitResult {
-            val hits = rayHits ?: rayCells.map { it to surfaces[it] }
-            hits.take(maximumVisits).forEach { visitor(it.first, it.second) }
-            return DepthRayVisitResult(hits.size.coerceAtMost(maximumVisits), hits.size > maximumVisits)
+
+        fun replaceAddresses(addresses: kotlinx.serialization.json.JsonArray) {
+            surfaces = addresses.associate { value ->
+                val address = value.jsonObject
+                voxel(address.getValue("voxel")) to requireNotNull(
+                    byId[SurfaceId(address.getValue("sourceId").jsonPrimitive.content.toLong())],
+                )
+            }
         }
     }
 

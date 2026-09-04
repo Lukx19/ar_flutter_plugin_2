@@ -9,6 +9,48 @@ import org.junit.Test
 
 class DepthEvidencePropertyTest {
     @Test
+    fun `depth observation rejects over capacity before copying samples`() {
+        var elementRead = false
+        val samples = object : AbstractList<VisibilityDepthSample>() {
+            override val size = V2_DEPTH_SAMPLE_CAPACITY + 1
+            override fun get(index: Int): VisibilityDepthSample {
+                elementRead = true
+                error("over-capacity input must not be copied")
+            }
+        }
+        val groupFrame = frame()
+        val ownership = VisibilityObservationOwnership(
+            sessionId = "0".repeat(32), sessionGeneration = 1,
+            captureGroupId = "1".repeat(32), groupGeneration = 1, coverageEpoch = 1,
+            arSessionIdentity = "2".repeat(32), viewInstanceId = "3".repeat(32), viewGeneration = 1,
+            nativeStreamToken = "4".repeat(32), workerBindingToken = "5".repeat(32),
+            bindingGeneration = 1, lifecycleSequence = 1, operationGeneration = 1,
+            groupFrame = groupFrame,
+        )
+        val observationFrame = VisibilityObservationFrame(
+            source = VisibilityObservationSource.SYNTHETIC_DEPTH,
+            frameSequence = 1, frameTimestampNs = 1, sourceTimestampNs = 1,
+            cameraIdentity = "camera", tracking = true,
+            imageOrientation = "landscape_right_x_right_y_down_v1",
+            pose = VisibilityCameraPose.copyOf(identity().toDoubleArray()),
+            intrinsics = VisibilityCameraIntrinsics(1, 1, 1.0, 1.0, 0.0, 0.0),
+            depthCapability = VisibilityDepthCapability.RAW_DEPTH,
+        )
+
+        assertThrows(IllegalArgumentException::class.java) {
+            VisibilityDepthObservation(
+                ownership = ownership,
+                frame = observationFrame,
+                samples = samples,
+                sourceRejectedSamples = 0,
+                payloadBytes = VisibilityDepthObservation.DEPTH_FIXED_BYTES +
+                    samples.size * VisibilityDepthObservation.DEPTH_SAMPLE_BYTES,
+            )
+        }
+        assertEquals(false, elementRead)
+    }
+
+    @Test
     fun `permuting pixels preserves the deterministic accepted packet`() {
         val samples = listOf(
             VisibilityDepthSample(0, 0, 1_000, 255),
@@ -18,7 +60,7 @@ class DepthEvidencePropertyTest {
         val first = prepare(DepthEvidenceBatch(1, 1, frame(), identity(), intrinsics(), samples, 0))
         val reversed = prepare(DepthEvidenceBatch(1, 1, frame(), identity(), intrinsics(), samples.reversed(), 0))
 
-        val expected = accepted(sequence = 1, acceptedSamples = 3, touchedRows = 3, virtualWork = 6)
+        val expected = accepted(sequence = 1, acceptedSamples = 3, rayVisits = 52, touchedRows = 3, virtualWork = 58)
         assertEquals(expected, first)
         assertEquals(expected, reversed)
     }
@@ -31,7 +73,7 @@ class DepthEvidencePropertyTest {
         assertTrue(kernel.prepare(valid, view) is DepthEvidenceResult.Accepted)
         kernel.applyPrepared()
 
-        val committed = accepted(1).receipt
+        val committed = accepted(1, rayVisits = 22, virtualWork = 24).receipt
         val duplicate = kernel.prepare(batch(1), view)
         assertEquals(DepthEvidenceResult.Refused(DepthEvidenceRefusal.DUPLICATE_TIMESTAMP, committed), duplicate)
         val notTracking = kernel.prepare(batch(2, tracking = false), view)
@@ -58,11 +100,11 @@ class DepthEvidencePropertyTest {
             DepthEvidenceBatch(2, 2, frame(), identity(), intrinsics(), listOf(sample()), 0),
             PropertyView(),
         ) as DepthEvidenceResult.Accepted
-        assertEquals(accepted(2, capacityRefusals = 1), afterSampleRefusal)
+        assertEquals(accepted(2, rayVisits = 22, capacityRefusals = 1, virtualWork = 24), afterSampleRefusal)
         sampleLimited.discardPrepared()
 
         val rayLimited = DepthEvidenceKernel(DepthEvidenceConfiguration(rayVisitCapacity = 1))
-        val tooManyRays = rayLimited.prepare(batch(1), PropertyView(rayCells = listOf(Voxel(0, 0, -2), Voxel(0, 0, -3)))) as DepthEvidenceResult.Refused
+        val tooManyRays = rayLimited.prepare(batch(1), PropertyView()) as DepthEvidenceResult.Refused
         assertEquals(DepthEvidenceResult.Refused(DepthEvidenceRefusal.RAY_VISIT_CAPACITY, capacityReceipt), tooManyRays)
         assertEquals(0, rayLimited.resourceReceipt().residentEvidenceRows)
 
@@ -148,16 +190,20 @@ class DepthEvidencePropertyTest {
     @Test
     fun `maximum endpoint change packet remains inside reserved output headroom`() {
         val capacity = V2_DEPTH_SAMPLE_CAPACITY
-        val samples = List(capacity) { x -> VisibilityDepthSample(x, 0, 1_000, 255) }
+        val width = 48
+        val height = 32
+        val samples = List(capacity) { index ->
+            VisibilityDepthSample(index % width, index / width, 200, 255)
+        }
         val largeFrame = VisibilityGroupFrame.copyOf(
             identity().toDoubleArray(), identity().toDoubleArray(), 100_000, 100_000,
         )
         val batch = DepthEvidenceBatch(
             1, 1, largeFrame, identity(),
-            VisibilityCameraIntrinsics(capacity, 1, 1.0, 1.0, 0.0, 0.0),
+            VisibilityCameraIntrinsics(width, height, 2.0, 2.0, 23.5, 15.5),
             samples, 0,
         )
-        val kernel = DepthEvidenceKernel()
+        val kernel = DepthEvidenceKernel(DepthEvidenceConfiguration(safetyBandMillimetres = 10_000))
         repeat(3) { index ->
             kernel.prepare(batch.copy(sequence = index + 1L, sourceTimestampNs = index + 1L), PropertyView())
             kernel.applyPrepared()
@@ -167,20 +213,25 @@ class DepthEvidencePropertyTest {
 
         assertEquals(capacity, result.changes.size)
         assertEquals(
+            capacity,
+            result.changes.map { (it as DepthEvidenceChange.Create).target.voxel }.toSet().size,
+        )
+        assertEquals(
             DepthEvidenceReceipt(
                 sequence = 4,
                 sourceTimestampNs = 4,
                 acceptedSamples = capacity,
+                rayVisits = 38_336,
                 touchedEvidenceRows = capacity,
                 createCount = capacity,
                 preparedResidentBytes = capacity * 32,
-                p50VirtualWorkUnits = capacity * 2,
-                p95VirtualWorkUnits = capacity * 2,
+                p50VirtualWorkUnits = 41_408,
+                p95VirtualWorkUnits = 41_408,
             ),
             result.receipt,
         )
         assertEquals(
-            DepthEvidenceWorkReceipt(capacity, capacity, 0, 0, capacity * 2),
+            DepthEvidenceWorkReceipt(capacity, capacity, 38_336, 0, 41_408),
             result.work,
         )
         assertEquals(4_194_304, kernel.resourceReceipt().maximumAcceptedOutputReserveBytes)
@@ -240,9 +291,10 @@ class DepthEvidencePropertyTest {
     private fun accepted(
         sequence: Long,
         acceptedSamples: Int = 1,
+        rayVisits: Int = 0,
         touchedRows: Int = 1,
         capacityRefusals: Int = 0,
-        virtualWork: Int = acceptedSamples + touchedRows,
+        virtualWork: Int = acceptedSamples + rayVisits + touchedRows,
     ) = DepthEvidenceResult.Accepted(
         expectedGeometryRevision = 0,
         expectedLineageRevision = 0,
@@ -251,13 +303,14 @@ class DepthEvidencePropertyTest {
             sequence = sequence,
             sourceTimestampNs = sequence,
             acceptedSamples = acceptedSamples,
+            rayVisits = rayVisits,
             touchedEvidenceRows = touchedRows,
             capacityRefusals = capacityRefusals,
             preparedResidentBytes = touchedRows * 32,
             p50VirtualWorkUnits = virtualWork,
             p95VirtualWorkUnits = virtualWork,
         ),
-        work = DepthEvidenceWorkReceipt(touchedRows, 0, 0, 0, virtualWork),
+        work = DepthEvidenceWorkReceipt(touchedRows, 0, rayVisits, 0, virtualWork),
     )
 
     private fun batch(timestamp: Long, tracking: Boolean = true) = DepthEvidenceBatch(
@@ -279,23 +332,12 @@ class DepthEvidencePropertyTest {
         }
     }
 
-    private class PropertyView(
-        private val rayCells: List<Voxel> = emptyList(),
-    ) : BoundedCanonicalSurfaceView {
+    private class PropertyView : BoundedCanonicalSurfaceView {
         override val geometryRevision: Long = 0
         override val lineageRevision: Long = 0
         override val surfaceCount: Int = 0
 
         override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? = null
         override fun findSurfaceAt(voxel: Voxel): DepthCanonicalSurface? = null
-        override fun visitRayCells(
-            startGroupMm: DepthPointMm,
-            endpointGroupMm: DepthPointMm,
-            maximumVisits: Int,
-            visitor: (Voxel, DepthCanonicalSurface?) -> Boolean,
-        ): DepthRayVisitResult {
-            rayCells.take(maximumVisits).forEach { visitor(it, null) }
-            return DepthRayVisitResult(rayCells.size.coerceAtMost(maximumVisits), rayCells.size > maximumVisits)
-        }
     }
 }

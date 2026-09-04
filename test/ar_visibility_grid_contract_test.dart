@@ -648,6 +648,8 @@ void main() {
     final depthEvidence =
         fixture['depthEvidenceKernel'] as Map<String, dynamic>;
     expect(depthEvidence['format'], 'bounded_depth_evidence_fixture_v1');
+    expect(jsonEncode(depthEvidence), isNot(contains('"rayCells"')));
+    expect(jsonEncode(depthEvidence), isNot(contains('"rayHits"')));
     final depthEvidenceCases =
         (depthEvidence['cases'] as List<dynamic>).cast<Map<String, dynamic>>();
     expect(

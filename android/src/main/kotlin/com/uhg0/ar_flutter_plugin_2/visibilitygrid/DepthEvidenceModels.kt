@@ -91,7 +91,7 @@ internal data class DepthPointMm(val x: Double, val y: Double, val z: Double) {
     fun isFinite(): Boolean = x.isFinite() && y.isFinite() && z.isFinite()
 }
 
-/** Result of bounded ray traversal supplied by the canonical surface view. */
+/** Result of the kernel-owned bounded ray traversal. */
 internal data class DepthRayVisitResult(
     val visitedCells: Int,
     val truncated: Boolean = false,
@@ -121,13 +121,6 @@ internal interface BoundedCanonicalSurfaceView {
     fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface?
 
     fun findSurfaceAt(voxel: Voxel): DepthCanonicalSurface?
-
-    fun visitRayCells(
-        startGroupMm: DepthPointMm,
-        endpointGroupMm: DepthPointMm,
-        maximumVisits: Int,
-        visitor: (Voxel, DepthCanonicalSurface?) -> Boolean,
-    ): DepthRayVisitResult
 }
 
 internal sealed interface DepthEvidenceChange {

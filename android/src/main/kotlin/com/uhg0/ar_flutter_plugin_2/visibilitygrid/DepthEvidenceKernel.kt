@@ -293,11 +293,8 @@ internal class DepthEvidenceKernel(
             val remaining = configuration.rayVisitCapacity - visits
             if (remaining < 0) return Staged.Refused(DepthEvidenceRefusal.RAY_VISIT_CAPACITY)
             try {
-                rayResult = surfaces.visitRayCells(
-                    cameraGroup,
-                    endpoint,
-                    remaining,
-                ) { voxel, surface ->
+                rayResult = visitRayCells(cameraGroup, endpoint, batch.groupFrame, remaining) { voxel ->
+                    val surface = if (voxel == endpointVoxel) endpointSurface else surfaces.findSurfaceAt(voxel)
                     if (!voxelInRange(voxel)) return@visitRayCells false
                     if (surface != null) validateCanonicalSurface(surfaces, voxel, surface)
                     val candidateIndex = if (surface != null) stageIndex(voxel, surface) else stageFind(voxel)
@@ -749,6 +746,83 @@ internal class DepthEvidenceKernel(
                 (stageOccupiedValue(index) * 64).coerceIn(0, 255)
             },
         )
+    }
+
+    /** Deterministic 3-D supercover in increasing segment parameter order. */
+    internal fun visitRayCells(
+        camera: DepthPointMm,
+        endpoint: DepthPointMm,
+        frame: VisibilityGroupFrame,
+        maximumVisits: Int,
+        visitor: (Voxel) -> Boolean,
+    ): DepthRayVisitResult {
+        if (maximumVisits !in 0..65_536 || !camera.isFinite() || !endpoint.isFinite()) {
+            return DepthRayVisitResult(0, arithmeticOverflow = true)
+        }
+        val start = quantize(camera, frame)
+            ?: return DepthRayVisitResult(0, arithmeticOverflow = true)
+        val end = quantize(endpoint, frame)
+            ?: return DepthRayVisitResult(0, arithmeticOverflow = true)
+        val size = frame.voxelSizeMicrometres.toDouble() / 1_000.0
+        val delta = doubleArrayOf(endpoint.x - camera.x, endpoint.y - camera.y, endpoint.z - camera.z)
+        if (!size.isFinite() || size <= 0.0 || delta.any { !it.isFinite() }) {
+            return DepthRayVisitResult(0, arithmeticOverflow = true)
+        }
+        val current = intArrayOf(start.x, start.y, start.z)
+        val target = intArrayOf(end.x, end.y, end.z)
+        val step = IntArray(3) { axis -> delta[axis].compareTo(0.0) }
+        val startPoint = doubleArrayOf(camera.x, camera.y, camera.z)
+        val tDelta = DoubleArray(3) { axis ->
+            if (step[axis] == 0) Double.POSITIVE_INFINITY else size / kotlin.math.abs(delta[axis])
+        }
+        val tMax = DoubleArray(3) { axis ->
+            if (step[axis] == 0) {
+                Double.POSITIVE_INFINITY
+            } else {
+                val boundary = (current[axis] + if (step[axis] > 0) 1 else 0) * size
+                (boundary - startPoint[axis]) / delta[axis]
+            }
+        }
+        var visited = 0
+        fun emit(voxel: Voxel): Boolean {
+            if (visited >= maximumVisits) return false
+            visited = Math.addExact(visited, 1)
+            return visitor(voxel)
+        }
+        try {
+            if (!emit(start)) return DepthRayVisitResult(visited)
+            while (!current.contentEquals(target)) {
+                val crossing = (0..2)
+                    .asSequence()
+                    .filter { current[it] != target[it] }
+                    .minOfOrNull { tMax[it] }
+                    ?: return DepthRayVisitResult(visited, arithmeticOverflow = true)
+                if (!crossing.isFinite()) return DepthRayVisitResult(visited, arithmeticOverflow = true)
+                var tiedMask = 0
+                for (axis in 0..2) {
+                    if (current[axis] != target[axis] && tMax[axis] == crossing) {
+                        tiedMask = tiedMask or (1 shl axis)
+                    }
+                }
+                for (subset in 1..7) {
+                    if (subset and tiedMask != subset) continue
+                    val next = current.copyOf()
+                    for (axis in 0..2) if (subset and (1 shl axis) != 0) {
+                        next[axis] = Math.addExact(next[axis], step[axis])
+                    }
+                    val voxel = Voxel(next[0], next[1], next[2])
+                    if (!voxelInRange(voxel)) return DepthRayVisitResult(visited, arithmeticOverflow = true)
+                    if (!emit(voxel)) return DepthRayVisitResult(visited, truncated = true)
+                }
+                for (axis in 0..2) if (tiedMask and (1 shl axis) != 0) {
+                    current[axis] = Math.addExact(current[axis], step[axis])
+                    tMax[axis] += tDelta[axis]
+                }
+            }
+        } catch (_: ArithmeticException) {
+            return DepthRayVisitResult(visited, arithmeticOverflow = true)
+        }
+        return DepthRayVisitResult(visited)
     }
 
     private fun isFreeEvidence(
