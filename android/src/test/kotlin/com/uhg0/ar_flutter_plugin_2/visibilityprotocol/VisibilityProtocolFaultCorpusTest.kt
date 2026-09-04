@@ -1,7 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.visibilityprotocol
 
-import com.uhg0.ar_flutter_plugin_2.proposal08.RegionCoordinate
-import com.uhg0.ar_flutter_plugin_2.proposal08.RegionShardV5
+import com.uhg0.ar_flutter_plugin_2.visibilitystorage.RegionCoordinate
+import com.uhg0.ar_flutter_plugin_2.visibilitystorage.RegionShardV5
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlLifecycle
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.StartRequestCodecV2

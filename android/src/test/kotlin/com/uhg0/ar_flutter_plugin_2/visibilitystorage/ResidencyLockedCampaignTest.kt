@@ -1,6 +1,4 @@
-package com.uhg0.ar_flutter_plugin_2.proposal08
-
-import com.uhg0.ar_flutter_plugin_2.proposal08.*
+package com.uhg0.ar_flutter_plugin_2.visibilitystorage
 
 import java.io.File
 import java.nio.file.Files

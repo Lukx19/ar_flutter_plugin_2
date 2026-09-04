@@ -1,4 +1,4 @@
-package com.uhg0.ar_flutter_plugin_2.proposal08
+package com.uhg0.ar_flutter_plugin_2.visibilityguidance
 
 data class Q15Vector(val x: Int, val y: Int, val z: Int) {
     fun dot(other: Q15Vector): Long =

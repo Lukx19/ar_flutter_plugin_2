@@ -1,4 +1,4 @@
-package com.uhg0.ar_flutter_plugin_2.proposal08
+package com.uhg0.ar_flutter_plugin_2.visibilitystorage
 
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer

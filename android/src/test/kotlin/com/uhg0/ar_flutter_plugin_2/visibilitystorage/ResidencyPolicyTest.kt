@@ -1,6 +1,4 @@
-package com.uhg0.ar_flutter_plugin_2.proposal08
-
-import com.uhg0.ar_flutter_plugin_2.proposal08.*
+package com.uhg0.ar_flutter_plugin_2.visibilitystorage
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue

@@ -15,6 +15,8 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
+private enum class PendingPublicationGateResult { READY, REJECTED }
+
 /**
  * One group-local canonical surface module behind the capture ingress mapper seam.
  *
@@ -70,31 +72,9 @@ internal class VisibilityGridIntegration(
 
     override fun admitFeature(observation: VisibilityFeatureObservation) = mutate(observation.ownership) {
         if (isFenced(observation.ownership)) return@mutate
-        if (pending != null) {
-            if ((!pendingQueued || !pendingRendererApplied) && !retryPendingQueue()) {
-                rejected++
-                receipt = receipt.copy(rejected = rejected)
-                return@mutate
-            }
-            if (pending != null) {
-                rejected++
-                receipt = receipt.copy(status = "awaitingExactAck", rejected = rejected)
-                return@mutate
-            }
-        }
+        if (drainPendingPublication() == PendingPublicationGateResult.REJECTED) return@mutate
         ensureOpened(observation.ownership) ?: return@mutate
-        if (pending != null) {
-            if ((!pendingQueued || !pendingRendererApplied) && !retryPendingQueue()) {
-                rejected++
-                receipt = receipt.copy(rejected = rejected)
-                return@mutate
-            }
-            if (pending != null) {
-                rejected++
-                receipt = receipt.copy(status = "awaitingExactAck", rejected = rejected)
-                return@mutate
-            }
-        }
+        if (drainPendingPublication() == PendingPublicationGateResult.REJECTED) return@mutate
         // This adapter is the only CAPTURE-INGRESS-to-canonical surface conversion point.  It creates
         // fixed camera/sample evidence before the kernel can mutate anything.
         val normalEvidence = (FeatureNormalEvidence.from(observation) as? FeatureNormalEvidence.Conversion.Accepted)
@@ -129,6 +109,22 @@ internal class VisibilityGridIntegration(
         } else {
             publishMaterialBatch(observation.ownership, accepted.delta)
         }
+    }
+
+    /** Resolves or rejects the one exact publication that must precede new admission. */
+    private fun drainPendingPublication(): PendingPublicationGateResult {
+        if (pending == null) return PendingPublicationGateResult.READY
+        if ((!pendingQueued || !pendingRendererApplied) && !retryPendingQueue()) {
+            rejected++
+            receipt = receipt.copy(rejected = rejected)
+            return PendingPublicationGateResult.REJECTED
+        }
+        if (pending != null) {
+            rejected++
+            receipt = receipt.copy(status = "awaitingExactAck", rejected = rejected)
+            return PendingPublicationGateResult.REJECTED
+        }
+        return PendingPublicationGateResult.READY
     }
 
     /** #63 owns depth semantics; this feature-only integration refuses it. */

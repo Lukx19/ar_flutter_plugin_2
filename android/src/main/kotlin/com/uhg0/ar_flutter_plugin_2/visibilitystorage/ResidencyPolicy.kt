@@ -1,5 +1,11 @@
-package com.uhg0.ar_flutter_plugin_2.proposal08
+package com.uhg0.ar_flutter_plugin_2.visibilitystorage
 
+import com.uhg0.ar_flutter_plugin_2.visibilitystorage.PageCoordinate
+import com.uhg0.ar_flutter_plugin_2.visibilitystorage.RegionCoordinate
+import com.uhg0.ar_flutter_plugin_2.visibilitystorage.ResidencyModel
+import com.uhg0.ar_flutter_plugin_2.visibilitystorage.ResolvedResidencyCoordinate
+import com.uhg0.ar_flutter_plugin_2.visibilitystorage.pageEdgeMillimetres
+import com.uhg0.ar_flutter_plugin_2.visibilitystorage.regionEdgeMillimetres
 import kotlin.math.max
 
 data class ResidencyPolicyConfigV1(
