@@ -708,7 +708,7 @@ internal class NativeRendererProjection(
         val removedKnownCount = removedIds.count(surfaceVoxels::containsKey)
         val insertedCount = cut.upserts.count { !surfaceVoxels.containsKey(it.surfaceId) }
         val targetRowCount = surfaceVoxels.size - removedKnownCount + insertedCount
-        if (targetRowCount > cut.ownership.groupFrame.effectiveModelCapacity) {
+        if (targetRowCount > cut.ownership.groupFrame.modelCapacity) {
             return RendererProjectionResult.Refused(RendererProjectionRefusal.CAPACITY)
         }
         val removalKeys = removedIds.map { surfaceVoxels[it] }.filterNotNull()
@@ -793,7 +793,7 @@ internal class NativeRendererProjection(
                 groupGeneration = cut.ownership.groupGeneration,
                 sessionGeneration = cut.ownership.sessionGeneration,
                 voxelSizeMeters = frame.voxelSizeMicrometres.toDouble() / 1_000_000.0,
-                capacity = frame.effectiveModelCapacity,
+                capacity = frame.modelCapacity,
                 groupFromWorldGl = frame.groupFromWorldGl.toDoubleArray(),
                 worldFromGroupGl = frame.worldFromGroupGl.toDoubleArray(),
                 restoredGeometryRevision = cut.geometryRevision,
@@ -812,7 +812,7 @@ internal class NativeRendererProjection(
     private fun renderConfig(cut: CommittedGeometryCut): PointCloudNativeConfig {
         val frame = cut.ownership.groupFrame
         return PointCloudNativeConfig(
-            renderCapacity = frame.effectiveModelCapacity,
+            renderCapacity = frame.modelCapacity,
             voxelRenderMode = VoxelRenderMode.CENTROIDS,
             voxelSizeMeters = frame.voxelSizeMicrometres.toFloat() / 1_000_000f,
         )

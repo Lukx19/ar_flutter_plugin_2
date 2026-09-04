@@ -23,7 +23,13 @@ internal object CoordinateFrameTransforms {
                 kotlin.math.abs(matrix(15) - 1.0) <= AFFINE_TOLERANCE
         }
         if (!affine) return false
-        return (0 until 4).all { row ->
+        return isIdentityProduct(first, second) && isIdentityProduct(second, first)
+    }
+
+    private fun isIdentityProduct(
+        first: (Int) -> Double,
+        second: (Int) -> Double,
+    ): Boolean = (0 until 4).all { row ->
             (0 until 4).all { column ->
                 val actual = (0 until 4).sumOf { index ->
                     first(index * 4 + row) * second(column * 4 + index)
@@ -32,7 +38,6 @@ internal object CoordinateFrameTransforms {
                 kotlin.math.abs(actual - expected) <= INVERSE_TOLERANCE
             }
         }
-    }
 
     private const val AFFINE_TOLERANCE = 1e-9
     private const val INVERSE_TOLERANCE = 1e-6

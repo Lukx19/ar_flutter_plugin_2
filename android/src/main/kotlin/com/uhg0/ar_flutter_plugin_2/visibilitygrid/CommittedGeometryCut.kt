@@ -46,6 +46,7 @@ internal class CommittedGeometryCut(
         require(lineageRevision >= 0)
         if (reset) {
             require(baseGeometryRevision == 0L)
+            require(geometryRevision in 1 until Long.MAX_VALUE)
         } else {
             require(baseGeometryRevision < Long.MAX_VALUE)
             require(geometryRevision == baseGeometryRevision + 1L)

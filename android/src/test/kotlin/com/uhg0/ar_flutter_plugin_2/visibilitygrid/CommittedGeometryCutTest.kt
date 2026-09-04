@@ -1,6 +1,8 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CoordinateFrameTransforms
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertThrows
 import org.junit.Test
@@ -51,6 +53,30 @@ class CommittedGeometryCutTest {
         }
         assertThrows(IllegalArgumentException::class.java) {
             cut(base = 4, target = 6, reset = true)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            cut(base = 0, target = 0, reset = true)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            cut(base = 0, target = Long.MAX_VALUE, reset = true)
+        }
+        assertEquals(1, cut(base = 0, target = 1, reset = true).geometryRevision)
+    }
+
+    @Test
+    fun `group frame rejects zero capacity and asymmetric approximate inverses`() {
+        val identity = identityVisibilityGridTransform()
+        assertThrows(IllegalArgumentException::class.java) {
+            VisibilityGroupFrame.copyOf(identity, identity, 1_000, 0)
+        }
+        val groupFromWorld = identity.copyOf().also { it[0] = 1e8 }
+        val worldFromGroup = identity.copyOf().also {
+            it[0] = 1e-8
+            it[1] = 1e-7
+        }
+        assertFalse(CoordinateFrameTransforms.areFiniteAffineInverses(groupFromWorld, worldFromGroup))
+        assertThrows(IllegalArgumentException::class.java) {
+            VisibilityGroupFrame.copyOf(groupFromWorld, worldFromGroup, 1_000, 10)
         }
     }
 

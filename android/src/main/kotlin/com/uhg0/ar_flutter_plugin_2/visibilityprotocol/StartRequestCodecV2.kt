@@ -130,7 +130,7 @@ object StartRequestCodecV2 {
         if (voxel <= 0 || 1_000_000 % voxel != 0 || 3_000_000 % voxel != 0) {
             return invalid(36, 4, 20, 1_000_000, voxel.toLong())
         }
-        if (modelCapacity !in 0..100_000) return invalid(36, 4, 20, 100_000, modelCapacity.toLong())
+        if (modelCapacity !in 1..100_000) return invalid(36, 4, 20, 100_000, modelCapacity.toLong())
         if (pendingCapacity !in 0..200_000) return invalid(36, 4, 20, 200_000, pendingCapacity.toLong())
         for (convention in intArrayOf(
             groupFrameConvention,
@@ -222,7 +222,7 @@ object StartRequestCodecV2 {
         data.putShort(32, 0)
         data.putShort(34, 8)
         data.putInt(36, 1000)
-        data.putInt(40, 0)
+        data.putInt(40, 100_000)
         data.putInt(44, 0)
         data.putShort(48, 1)
         data.putShort(50, 1)

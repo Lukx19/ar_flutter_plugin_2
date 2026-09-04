@@ -14,14 +14,52 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class VisibilityProtocolControlCorpusTest {
     @Test
-    fun `START default retains exact zero request while declaring its accepted default separately`() {
+    fun `START default encodes the explicit maximum accepted model capacity`() {
         val defaultPayload = StartRequestCodecV2.defaultPayload()
-        assertEquals(0, StartRequestCodecV2.decode(defaultPayload).requestedModelCapacity)
+        assertEquals(100_000, StartRequestCodecV2.decode(defaultPayload).requestedModelCapacity)
+
+        val historicalZero = defaultPayload.copyOf().also {
+            ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putInt(40, 0)
+        }
+        assertEquals(
+            ControlValidationFailure(36, 4, 20, 100_000, 0),
+            (StartRequestCodecV2.decodeDetailed(historicalZero) as
+                StartRequestCodecV2.DetailedDecode.Invalid).failure,
+        )
+    }
+
+    @Test
+    fun `START rejects a one direction only ill conditioned inverse`() {
+        val groupFromWorld = doubleArrayOf(
+            1e8, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        )
+        val worldFromGroup = doubleArrayOf(
+            1e-8, 1e-7, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        )
+        assertEquals(1e-7, groupFromWorld[5] * worldFromGroup[1], 0.0)
+        assertEquals(10.0, worldFromGroup[1] * groupFromWorld[0], 0.0)
+        assertFalse(CoordinateFrameTransforms.areFiniteAffineInverses(groupFromWorld, worldFromGroup))
+
+        val payload = StartRequestCodecV2.defaultPayload()
+        val data = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+        groupFromWorld.forEachIndexed { index, value -> data.putDouble(136 + index * 8, value) }
+        worldFromGroup.forEachIndexed { index, value -> data.putDouble(264 + index * 8, value) }
+        assertEquals(
+            ControlValidationFailure(36, 5, 21, 1, 0),
+            (StartRequestCodecV2.decodeDetailed(payload) as StartRequestCodecV2.DetailedDecode.Invalid).failure,
+        )
     }
 
     @Test
@@ -127,7 +165,14 @@ class VisibilityProtocolControlCorpusTest {
             assertEquals(spec.int("length"), bytes.size)
             assertEquals(spec.string("sha256"), sha256(bytes))
             assertArrayEquals(bytes, ControlCodec.encodeRequest(ControlCodec.decodeRequest(bytes)))
-            assertEquals(null, ControlCodec.validateControlPayload(request))
+            val validationFailure = ControlCodec.validateControlPayload(request)
+            if (request.operation == ControlOperation.START &&
+                ByteBuffer.wrap(request.payload).order(ByteOrder.LITTLE_ENDIAN).getInt(40) == 0
+            ) {
+                assertEquals(ControlValidationFailure(36, 4, 20, 100_000, 0), validationFailure)
+            } else {
+                assertEquals(null, validationFailure)
+            }
             val truncated = ControlCodec.validateControlPayload(
                 request.copy(payload = request.payload.copyOf(request.payload.size - 1)),
             )

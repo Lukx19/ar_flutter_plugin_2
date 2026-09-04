@@ -14,13 +14,9 @@ internal class VisibilityGroupFrame private constructor(
         require(groupFromWorldGl.size == 16 && groupFromWorldGl.all(Double::isFinite))
         require(worldFromGroupGl.size == 16 && worldFromGroupGl.all(Double::isFinite))
         require(voxelSizeMicrometres > 0)
-        require(modelCapacity in 0..100_000)
+        require(modelCapacity in 1..100_000)
         require(CoordinateFrameTransforms.areFiniteAffineInverses(groupFromWorldGl, worldFromGroupGl))
     }
-
-    /** Accepted operational capacity when START requested the protocol-defined default. */
-    val effectiveModelCapacity: Int
-        get() = if (modelCapacity == 0) 100_000 else modelCapacity
 
     companion object {
         fun copyOf(
