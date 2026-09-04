@@ -42,7 +42,7 @@ object StartResultCodecV2 {
                 StartRequestCodecV2.supportedCapabilities
         data.putLong(8, acceptedCapabilities)
         data.putLong(16, StartRequestCodecV2.supportedCapabilities)
-        data.putInt(24, configuration.requestedModelCapacity)
+        data.putInt(24, configuration.negotiatedModelCapacity)
         data.putInt(28, if (configuration.requestedPendingObservationCapacity == 0) acceptedPendingObservationCapacity else configuration.requestedPendingObservationCapacity)
         data.putInt(32, residentRegionCount)
         data.putInt(36, regionSurfaceSoftLimit)

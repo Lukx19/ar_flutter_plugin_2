@@ -24,7 +24,8 @@ private fun String.asRestoredHashWireIdentity(): String =
 /** Strict decoder for the canonical Chapter 13 StartRequestV2 payload. */
 object StartRequestCodecV2 {
     const val byteLength = 464
-    /** Chapter 13 freezes the Proposal 08 spike start negotiation at minor version zero. */
+    const val negotiatedDefaultModelCapacity = 100_000
+    /** Chapter 13 fixes the initial visibility-protocol negotiation at minor version zero. */
     const val supportedMinor = 0
     /** Chapter 13 MVP support: occupancy, normals, lineage, and region paging. */
     const val supportedCapabilities = 0x107L
@@ -56,6 +57,18 @@ object StartRequestCodecV2 {
         val worldFromGroupIdentity: String,
         val restoredRevisions: LongArray,
     ) {
+        init {
+            require(requestedModelCapacity in 0..negotiatedDefaultModelCapacity)
+        }
+
+        /** Resolves only the wire-level zero sentinel before constructing an accepted frame. */
+        val negotiatedModelCapacity: Int
+            get() = if (requestedModelCapacity == 0) {
+                negotiatedDefaultModelCapacity
+            } else {
+                requestedModelCapacity
+            }
+
         fun hasRestoredCutConflict(baseline: CommittedBaselineV1): Boolean =
             restoreRequested && baseline != CommittedBaselineV1.ZERO &&
                 (restoredRevisions.indices.any { index ->
@@ -130,7 +143,9 @@ object StartRequestCodecV2 {
         if (voxel <= 0 || 1_000_000 % voxel != 0 || 3_000_000 % voxel != 0) {
             return invalid(36, 4, 20, 1_000_000, voxel.toLong())
         }
-        if (modelCapacity !in 1..100_000) return invalid(36, 4, 20, 100_000, modelCapacity.toLong())
+        if (modelCapacity !in 0..negotiatedDefaultModelCapacity) {
+            return invalid(36, 4, 20, negotiatedDefaultModelCapacity.toLong(), modelCapacity.toLong())
+        }
         if (pendingCapacity !in 0..200_000) return invalid(36, 4, 20, 200_000, pendingCapacity.toLong())
         for (convention in intArrayOf(
             groupFrameConvention,
@@ -222,7 +237,7 @@ object StartRequestCodecV2 {
         data.putShort(32, 0)
         data.putShort(34, 8)
         data.putInt(36, 1000)
-        data.putInt(40, 100_000)
+        data.putInt(40, 0)
         data.putInt(44, 0)
         data.putShort(48, 1)
         data.putShort(50, 1)

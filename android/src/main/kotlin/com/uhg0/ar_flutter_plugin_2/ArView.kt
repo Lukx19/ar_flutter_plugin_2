@@ -139,7 +139,7 @@ internal class ArView(
     private val captureSafetySignalV2 = CaptureSafetySignalV2()
     // One physical accounting root is shared across successive group-owned canonical surface resources.
     // Each resource borrows this coordinator and releases its owner before a replacement opens.
-    private val visibilityM3BudgetCoordinator = StorageBudgetCoordinatorV2(
+    private val visibilityStorageBudgetCoordinator = StorageBudgetCoordinatorV2(
         File(context.filesDir, "visibility-grid-canonical-surface-runtime"),
         StorageBudgetPolicyV2(64L * 1024L * 1024L, 0),
     )
@@ -148,7 +148,7 @@ internal class ArView(
         ownership = visibilityGridV2Binding::currentObservationOwnership,
         directory = context.filesDir,
         resourcesForGroup = { group ->
-            CanonicalRuntimeResources.open(context.filesDir, group, visibilityM3BudgetCoordinator)
+            CanonicalRuntimeResources.open(context.filesDir, group, visibilityStorageBudgetCoordinator)
         },
         renderer = NativeRendererProjection(sceneHost::updateCoverageRenderer),
         beforeAdmission = visibilityObservationDebugGate::awaitIfArmed,
@@ -296,7 +296,7 @@ internal class ArView(
         visibilityGridChannel.dispose()
         visibilityObservationDebugChannel.dispose()
         visibilityObservationRuntime.close()
-        visibilityM3BudgetCoordinator.close()
+        visibilityStorageBudgetCoordinator.close()
         visibilityGridV2Binding.dispose()
         lifecycle.removeObserver(lifecycleObserver)
         if (!captureSession.dispose { result ->

@@ -67,7 +67,7 @@ internal class VisibilityGridIntegration(
     @Volatile private var receipt = VisibilityGridIntegrationReceipt.empty()
 
     init {
-        binding.attachM3AcknowledgementListener(::acknowledge)
+        binding.attachPublicationAcknowledgementListener(::acknowledge)
     }
 
     override fun admitFeature(observation: VisibilityFeatureObservation) = mutate(observation.ownership) {

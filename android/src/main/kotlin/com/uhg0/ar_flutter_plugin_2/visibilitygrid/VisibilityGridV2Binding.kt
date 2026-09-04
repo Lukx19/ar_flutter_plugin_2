@@ -98,8 +98,8 @@ class VisibilityGridV2Binding internal constructor(
      * retains only scalar identity and a command digest: BEGIN/CHUNK/COMMIT
      * own the sole canonical-byte copy.
      */
-    @Volatile private var acknowledgedM3Cut: AcknowledgedCut? = null
-    @Volatile private var pendingM3Cut: CurrentDeltaCut? = null
+    @Volatile private var acknowledgedPublicationCut: AcknowledgedCut? = null
+    @Volatile private var pendingPublicationCut: CurrentDeltaCut? = null
     @Volatile private var acknowledgementListener: ((CurrentDeltaSelectorV1) -> Unit)? = null
     private var acceptedControls = 0L
     private var closedResources = 0L
@@ -268,7 +268,7 @@ class VisibilityGridV2Binding internal constructor(
     }
 
     @Synchronized
-    internal fun attachM3AcknowledgementListener(
+    internal fun attachPublicationAcknowledgementListener(
         listener: (CurrentDeltaSelectorV1) -> Unit,
     ) {
         check(acknowledgementListener == null) { "canonical surface acknowledgement listener already attached" }
@@ -288,7 +288,7 @@ class VisibilityGridV2Binding internal constructor(
         check(lifecycle.state() == ControlLifecycle.State.ACTIVE) {
             "V2 observation cut is unavailable"
         }
-        val acknowledged = requireNotNull(acknowledgedM3Cut) {
+        val acknowledged = requireNotNull(acknowledgedPublicationCut) {
             "binding lifecycle bootstrap is not acknowledged"
         }
         val receipt = requireNotNull(source.selectCurrentDelta(selector)) {
@@ -301,7 +301,7 @@ class VisibilityGridV2Binding internal constructor(
             baseGeometryRevision = receipt.baseGeometryRevision,
             commandHash = receipt.commandHash,
         )
-        pendingM3Cut?.let { pending ->
+        pendingPublicationCut?.let { pending ->
             check(pending.matches(candidate) &&
                 streamChannel.hasExactQueuedCurrentDelta(
                     selector,
@@ -326,7 +326,7 @@ class VisibilityGridV2Binding internal constructor(
         // A prior call may have thrown after the stream atomically installed
         // the exact frames but before this binding recorded its scalar cut.
         if (streamChannel.hasExactQueuedCurrentDelta(selector, receipt.baseGeometryRevision, bytes)) {
-            pendingM3Cut = candidate
+            pendingPublicationCut = candidate
             return CurrentDeltaQueueResult.RECOVERED_EXACT_QUEUE
         }
         check(streamChannel.canQueueStructuralTransaction()) {
@@ -337,7 +337,7 @@ class VisibilityGridV2Binding internal constructor(
             selector,
             TransactionResponseProfileV1.ordinary,
         )
-        pendingM3Cut = candidate
+        pendingPublicationCut = candidate
         return CurrentDeltaQueueResult.QUEUED
     }
 
@@ -360,13 +360,13 @@ class VisibilityGridV2Binding internal constructor(
                 geometryRevision = baseline.geometryRevision,
                 lineageRevision = baseline.lineageRevision,
             )
-            acknowledgedM3Cut = AcknowledgedCut.from(selector)
+            acknowledgedPublicationCut = AcknowledgedCut.from(selector)
             return
         }
-        val pending = pendingM3Cut ?: return
+        val pending = pendingPublicationCut ?: return
         if (pending.selector != selector) return
-        pendingM3Cut = null
-        acknowledgedM3Cut = AcknowledgedCut.from(selector)
+        pendingPublicationCut = null
+        acknowledgedPublicationCut = AcknowledgedCut.from(selector)
         acknowledgementListener?.invoke(selector)
     }
 
@@ -700,7 +700,7 @@ class VisibilityGridV2Binding internal constructor(
                                     groupFromWorldGl = configuration.groupFromWorldGl.toDoubleArray(),
                                     worldFromGroupGl = configuration.worldFromGroupGl.toDoubleArray(),
                                     voxelSizeMicrometres = configuration.voxelSizeMicrometres,
-                                    modelCapacity = configuration.requestedModelCapacity,
+                                    modelCapacity = configuration.negotiatedModelCapacity,
                                 )
                                 operationGeneration++
                                 lifecycleSequence = allocateLifecycleSequence()
@@ -878,7 +878,7 @@ class VisibilityGridV2Binding internal constructor(
                 geometryRevision = selector.targetGeometryRevision,
                 lineageRevision = selector.targetLineageRevision,
             )
-            acknowledgedM3Cut = selector
+            acknowledgedPublicationCut = selector
             initialTransactionQueued = true
             return
         }
@@ -937,8 +937,8 @@ class VisibilityGridV2Binding internal constructor(
         initialTransactionQueued = false
         expectedEmptyBootstrap = null
         acknowledgedEmptyBaseline = null
-        acknowledgedM3Cut = null
-        pendingM3Cut = null
+        acknowledgedPublicationCut = null
+        pendingPublicationCut = null
         acceptedControls = 0L
         activeControlRequestId = null
         synchronized(this) {
@@ -1015,7 +1015,7 @@ class VisibilityGridV2Binding internal constructor(
             initialCommittedBaselineSeed = lifecycle.committedBaseline(),
         ).also { replacement ->
             observationRuntime?.let(replacement::attachObservationRuntime)
-            acknowledgementListener?.let(replacement::attachM3AcknowledgementListener)
+            acknowledgementListener?.let(replacement::attachPublicationAcknowledgementListener)
         }
         return oldSnapshot.withCleanupBalances(
             closedBefore = closedBefore,

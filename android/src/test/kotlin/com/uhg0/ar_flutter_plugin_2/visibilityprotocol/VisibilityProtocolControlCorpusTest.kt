@@ -20,18 +20,20 @@ import org.junit.Test
 
 class VisibilityProtocolControlCorpusTest {
     @Test
-    fun `START default encodes the explicit maximum accepted model capacity`() {
+    fun `START default preserves zero negotiation and resolves an exact accepted capacity`() {
         val defaultPayload = StartRequestCodecV2.defaultPayload()
-        assertEquals(100_000, StartRequestCodecV2.decode(defaultPayload).requestedModelCapacity)
+        val default = StartRequestCodecV2.decode(defaultPayload)
+        assertEquals(0, default.requestedModelCapacity)
+        assertEquals(100_000, default.negotiatedModelCapacity)
 
-        val historicalZero = defaultPayload.copyOf().also {
-            ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putInt(40, 0)
+        for (capacity in intArrayOf(1, 100_000)) {
+            val explicitPayload = defaultPayload.copyOf().also {
+                ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putInt(40, capacity)
+            }
+            val explicit = StartRequestCodecV2.decode(explicitPayload)
+            assertEquals(capacity, explicit.requestedModelCapacity)
+            assertEquals(capacity, explicit.negotiatedModelCapacity)
         }
-        assertEquals(
-            ControlValidationFailure(36, 4, 20, 100_000, 0),
-            (StartRequestCodecV2.decodeDetailed(historicalZero) as
-                StartRequestCodecV2.DetailedDecode.Invalid).failure,
-        )
     }
 
     @Test
@@ -102,6 +104,10 @@ class VisibilityProtocolControlCorpusTest {
                 ControlValidationFailure(6, 3, 5, 1, 2),
             valid.copyOf().also { ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putInt(24, 0) } to
                 ControlValidationFailure(36, 4, 20, 4096, 0),
+            valid.copyOf().also { ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putInt(40, -1) } to
+                ControlValidationFailure(36, 4, 20, 100_000, -1),
+            valid.copyOf().also { ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putInt(40, 100_001) } to
+                ControlValidationFailure(36, 4, 20, 100_000, 100_001),
             valid.copyOf().also { ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putShort(48, 2.toShort()) } to
                 ControlValidationFailure(6, 5, 21, 1, 2),
             valid.copyOf().also {
@@ -165,14 +171,7 @@ class VisibilityProtocolControlCorpusTest {
             assertEquals(spec.int("length"), bytes.size)
             assertEquals(spec.string("sha256"), sha256(bytes))
             assertArrayEquals(bytes, ControlCodec.encodeRequest(ControlCodec.decodeRequest(bytes)))
-            val validationFailure = ControlCodec.validateControlPayload(request)
-            if (request.operation == ControlOperation.START &&
-                ByteBuffer.wrap(request.payload).order(ByteOrder.LITTLE_ENDIAN).getInt(40) == 0
-            ) {
-                assertEquals(ControlValidationFailure(36, 4, 20, 100_000, 0), validationFailure)
-            } else {
-                assertEquals(null, validationFailure)
-            }
+            assertEquals(null, ControlCodec.validateControlPayload(request))
             val truncated = ControlCodec.validateControlPayload(
                 request.copy(payload = request.payload.copyOf(request.payload.size - 1)),
             )
