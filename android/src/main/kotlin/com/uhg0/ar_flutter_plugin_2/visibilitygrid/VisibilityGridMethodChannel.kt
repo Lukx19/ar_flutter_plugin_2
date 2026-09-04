@@ -6,9 +6,9 @@ import com.google.ar.core.Config
 import com.google.ar.core.Frame
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.NotYetAvailableException
-import com.uhg0.ar_flutter_plugin_2.proposal08.ControlCodec
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlCodec
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlLifecycle
-import com.uhg0.ar_flutter_plugin_2.proposal08.ControlOperation
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlOperation
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode

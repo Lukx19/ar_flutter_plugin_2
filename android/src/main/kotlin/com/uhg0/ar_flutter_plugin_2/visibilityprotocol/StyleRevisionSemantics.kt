@@ -1,4 +1,4 @@
-package com.uhg0.ar_flutter_plugin_2.proposal08
+package com.uhg0.ar_flutter_plugin_2.visibilityprotocol
 
 /** Shared production rule for stream style acceptance and retained revision. */
 object StyleRevisionSemantics {

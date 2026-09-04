@@ -1,7 +1,35 @@
-package com.uhg0.ar_flutter_plugin_2.proposal08
+package com.uhg0.ar_flutter_plugin_2.visibilityprotocol
 
-import com.uhg0.ar_flutter_plugin_2.proposal08.*
-
+import com.uhg0.ar_flutter_plugin_2.proposal08.BoundedTsdfKernel
+import com.uhg0.ar_flutter_plugin_2.proposal08.CanonicalRegionRow
+import com.uhg0.ar_flutter_plugin_2.proposal08.CanonicalRegionShardCodec
+import com.uhg0.ar_flutter_plugin_2.proposal08.CentroidRendererState
+import com.uhg0.ar_flutter_plugin_2.proposal08.CentroidRow
+import com.uhg0.ar_flutter_plugin_2.proposal08.DirtySpan
+import com.uhg0.ar_flutter_plugin_2.proposal08.GuidanceCandidateInput
+import com.uhg0.ar_flutter_plugin_2.proposal08.GuidanceEnvironment
+import com.uhg0.ar_flutter_plugin_2.proposal08.GuidanceReference
+import com.uhg0.ar_flutter_plugin_2.proposal08.PageCoordinate
+import com.uhg0.ar_flutter_plugin_2.proposal08.PictureViewBins24
+import com.uhg0.ar_flutter_plugin_2.proposal08.PictureVisibilityCamera
+import com.uhg0.ar_flutter_plugin_2.proposal08.PictureVisibilityCutState
+import com.uhg0.ar_flutter_plugin_2.proposal08.PictureVisibilityEvaluator
+import com.uhg0.ar_flutter_plugin_2.proposal08.PictureVisibilityOccupancy
+import com.uhg0.ar_flutter_plugin_2.proposal08.PictureVisibilityRejection
+import com.uhg0.ar_flutter_plugin_2.proposal08.PictureVisibilitySurface
+import com.uhg0.ar_flutter_plugin_2.proposal08.PlanarConsolidationKernel
+import com.uhg0.ar_flutter_plugin_2.proposal08.Q15Vector
+import com.uhg0.ar_flutter_plugin_2.proposal08.RegionCoordinate
+import com.uhg0.ar_flutter_plugin_2.proposal08.RegionShardV5
+import com.uhg0.ar_flutter_plugin_2.proposal08.RendererMode
+import com.uhg0.ar_flutter_plugin_2.proposal08.RendererPopulationLimits
+import com.uhg0.ar_flutter_plugin_2.proposal08.SemanticState
+import com.uhg0.ar_flutter_plugin_2.proposal08.SignedOccupancyKernel
+import com.uhg0.ar_flutter_plugin_2.proposal08.SupercoverCells100mm
+import com.uhg0.ar_flutter_plugin_2.proposal08.VisibilityCoverage24
+import com.uhg0.ar_flutter_plugin_2.proposal08.VoxelKey
+import com.uhg0.ar_flutter_plugin_2.proposal08.VoxelObservation
+import com.uhg0.ar_flutter_plugin_2.proposal08.regionForMillimetres
 import java.io.ByteArrayOutputStream
 import java.security.MessageDigest
 import kotlinx.serialization.json.Json
@@ -15,7 +43,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-class Proposal08ReferenceSeamsTest {
+class VisibilityProtocolReferenceSeamsTest {
     @Test
     fun `visibility protocol request and response framing round trips`() {
         val request = PacketCodec.Request(

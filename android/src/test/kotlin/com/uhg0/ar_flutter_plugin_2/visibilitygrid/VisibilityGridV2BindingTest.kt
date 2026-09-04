@@ -1,19 +1,19 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
-import com.uhg0.ar_flutter_plugin_2.proposal08.CommittedBaselineAuthority
-import com.uhg0.ar_flutter_plugin_2.proposal08.CommittedBaselineScopeV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineAuthority
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineScopeV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineV1
-import com.uhg0.ar_flutter_plugin_2.proposal08.CommitReceiptQueryV1
-import com.uhg0.ar_flutter_plugin_2.proposal08.ControlCodec
-import com.uhg0.ar_flutter_plugin_2.proposal08.ControlOperation
-import com.uhg0.ar_flutter_plugin_2.proposal08.ControlRequest
-import com.uhg0.ar_flutter_plugin_2.proposal08.CurrentDeltaReceiptV1
-import com.uhg0.ar_flutter_plugin_2.proposal08.CurrentDeltaSelectorV1
-import com.uhg0.ar_flutter_plugin_2.proposal08.CurrentDeltaSourceV1
-import com.uhg0.ar_flutter_plugin_2.proposal08.PacketCodec
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommitReceiptQueryV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlCodec
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlOperation
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlRequest
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaReceiptV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaSelectorV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaSourceV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.PacketCodec
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.StartRequestCodecV2
-import com.uhg0.ar_flutter_plugin_2.proposal08.TransactionResponseProfileV1
-import com.uhg0.ar_flutter_plugin_2.proposal08.Uuid
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.TransactionResponseProfileV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.Uuid
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodChannel
 import java.nio.ByteBuffer
@@ -322,7 +322,7 @@ class VisibilityGridV2BindingTest {
             val initial = binding.snapshot()
             val qualifier = initial.nativeStreamToken + initial.workerBindingToken
 
-            fun invoke(method: String, request: ControlRequest): com.uhg0.ar_flutter_plugin_2.proposal08.ControlResponse {
+            fun invoke(method: String, request: ControlRequest): com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlResponse {
                 val result = RecordingResult()
                 channel.invokeMethod(method, qualifier + ControlCodec.encodeRequest(request), result)
                 assertTrue(result.completed.await(2, TimeUnit.SECONDS))

@@ -1,4 +1,4 @@
-package com.uhg0.ar_flutter_plugin_2.proposal08
+package com.uhg0.ar_flutter_plugin_2.visibilityprotocol
 
 /** Exact durable-journal identity of the one canonical delta requested by canonical surface. */
 data class CurrentDeltaSelectorV1(

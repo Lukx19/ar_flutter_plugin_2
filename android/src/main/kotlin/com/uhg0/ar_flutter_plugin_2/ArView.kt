@@ -47,7 +47,7 @@ import com.uhg0.ar_flutter_plugin_2.visibilitygrid.ArCoreVisibilityObservationSo
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityObservationDebugChannel
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityObservationDebugGate
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityCaptureSafePredicate
-import com.uhg0.ar_flutter_plugin_2.proposal08.CommittedBaselineAuthority
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineAuthority
 import com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraCapabilityQuerier
 import io.flutter.FlutterInjector
 import io.flutter.plugin.common.BinaryMessenger

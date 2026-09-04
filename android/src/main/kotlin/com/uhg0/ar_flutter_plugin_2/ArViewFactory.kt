@@ -8,7 +8,7 @@ import io.flutter.plugin.common.StandardMessageCodec
 import io.flutter.plugin.platform.PlatformView
 import io.flutter.plugin.platform.PlatformViewFactory
 import androidx.lifecycle.Lifecycle
-import com.uhg0.ar_flutter_plugin_2.proposal08.CommittedBaselineAuthority
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineAuthority
 
 class ArViewFactory(
     private val messenger: BinaryMessenger,

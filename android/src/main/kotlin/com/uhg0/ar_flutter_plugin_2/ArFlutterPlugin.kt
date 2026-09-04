@@ -7,7 +7,7 @@ import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
 import com.uhg0.ar_flutter_plugin_2.capabilities.MethodChannelARCameraCapabilities
-import com.uhg0.ar_flutter_plugin_2.proposal08.CommittedBaselineAuthority
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineAuthority
 
 class ArFlutterPlugin: FlutterPlugin, ActivityAware {
     private var activity: Activity? = null

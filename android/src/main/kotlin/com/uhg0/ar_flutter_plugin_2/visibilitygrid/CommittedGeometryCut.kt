@@ -53,8 +53,9 @@ internal class CommittedGeometryCut(
         require(upserts.map { it.surfaceId }.toSet().size == upserts.size)
         require(removedSurfaceIds.all { it in 1 until 0x1_0000_0000L })
         require(removedSurfaceIds.distinct().size == removedSurfaceIds.size)
-        // REPLACEMENT may retire and recreate the same stable identity atomically.
-        // Consumers apply removals before upserts from this one committed cut.
+        require(upserts.none { it.surfaceId in removedSurfaceIds.toSet() }) {
+            "Committed geometry upsert and removal identities must be disjoint"
+        }
     }
 
     /** Creates one rebuild page while preserving the exact cut identity. */
@@ -113,13 +114,17 @@ internal fun PreparedCanonicalMutation.toCommittedGeometryCut(
         )
         true
     })
-    val removed = LongArray(removedSurfaceCount)
+    // Canonical relocation rewrites storage indexes by removing and re-inserting the
+    // same stable identity. At the renderer seam that is one upsert, not a removal:
+    // committed geometry cuts keep their removal and upsert identity sets disjoint.
+    val upsertIds = rows.mapTo(HashSet(rows.size)) { it.surfaceId }
+    val removedBuffer = LongArray(removedSurfaceCount)
     var index = 0
     visitRemovedSurfaceIds { id ->
-        removed[index++] = id.value
+        if (id.value !in upsertIds) removedBuffer[index++] = id.value
         true
     }
-    check(index == removed.size)
+    val removed = removedBuffer.copyOf(index)
     return CommittedGeometryCut(
         ownership = ownership,
         transactionId = transactionId,

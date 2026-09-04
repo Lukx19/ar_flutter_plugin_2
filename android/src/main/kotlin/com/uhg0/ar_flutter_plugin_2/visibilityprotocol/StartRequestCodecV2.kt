@@ -1,6 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.visibilityprotocol
 
-import com.uhg0.ar_flutter_plugin_2.proposal08.ControlValidationFailure
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlValidationFailure
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Collections

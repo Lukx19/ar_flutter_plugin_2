@@ -161,7 +161,16 @@ class PreparedIntentVisitorTest {
                 assertEquals(plan.kind.name, plan.sourceCut.geometryRevision, geometryCut.baseGeometryRevision)
                 assertEquals(plan.kind.name, plan.targetGeometryRevision, geometryCut.geometryRevision)
                 assertEquals(plan.kind.name, plan.targetLineageRevision, geometryCut.lineageRevision)
-                assertEquals(plan.kind.name, expected.removed, geometryCut.removedSurfaceIds.toList())
+                val upsertIds = expected.rows.map { it.id }.toSet()
+                val projectedRemovals = expected.removed.filterNot(upsertIds::contains)
+                assertEquals(plan.kind.name, projectedRemovals, geometryCut.removedSurfaceIds.toList())
+                if (plan.kind == PreparedMutationKind.RELOCATION) {
+                    assertTrue(geometryCut.removedSurfaceIds.isEmpty())
+                }
+                if (plan.kind == PreparedMutationKind.REPLACEMENT) {
+                    assertTrue(geometryCut.removedSurfaceIds.isNotEmpty())
+                    assertTrue(geometryCut.upserts.all { it.surfaceId !in geometryCut.removedSurfaceIds })
+                }
                 assertEquals(
                     plan.kind.name,
                     expected.rows.map { listOf(it.id, it.x.toLong(), it.y.toLong(), it.z.toLong(), it.normal.toLong(), it.confidence.toLong(), plan.targetLineageCount.toLong()) },

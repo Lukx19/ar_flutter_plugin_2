@@ -1,8 +1,8 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
-import com.uhg0.ar_flutter_plugin_2.proposal08.CurrentDeltaReceiptV1
-import com.uhg0.ar_flutter_plugin_2.proposal08.CurrentDeltaSelectorV1
-import com.uhg0.ar_flutter_plugin_2.proposal08.CurrentDeltaSourceV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaReceiptV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaSelectorV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaSourceV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
@@ -710,8 +710,7 @@ internal class NativeRendererProjection(
         }
         val removedIds = cut.removedSurfaceIds
         val removedKnownCount = removedIds.count(surfaceVoxels::containsKey)
-        val remainingIds = surfaceVoxels.keys - removedIds.toSet()
-        val insertedCount = cut.upserts.count { it.surfaceId !in remainingIds }
+        val insertedCount = cut.upserts.count { !surfaceVoxels.containsKey(it.surfaceId) }
         val targetRowCount = surfaceVoxels.size - removedKnownCount + insertedCount
         if (targetRowCount > cut.ownership.groupFrame.effectiveModelCapacity) {
             return RendererProjectionResult.Refused(RendererProjectionRefusal.CAPACITY)

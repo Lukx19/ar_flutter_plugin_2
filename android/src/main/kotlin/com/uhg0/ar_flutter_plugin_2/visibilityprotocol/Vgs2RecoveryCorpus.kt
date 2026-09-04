@@ -1,4 +1,4 @@
-package com.uhg0.ar_flutter_plugin_2.proposal08
+package com.uhg0.ar_flutter_plugin_2.visibilityprotocol
 
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineV1
 import java.security.MessageDigest
@@ -80,7 +80,7 @@ object Vgs2RecoveryCorpus {
         val root = Json.parseToJsonElement(bytes.decodeToString()).jsonObject
         root.requireExactKeys(rootKeys, "root")
         require(root.getValue("format").jsonPrimitive.content ==
-            "proposal08_binding_lifecycle_vgs2_recovery_corpus_v1")
+            "visibility_protocol_binding_lifecycle_vgs2_recovery_corpus_v1")
         val policies = root.getValue("policies").jsonArray.map { it.jsonObject }
         require(policies.map { it.int("errorId") }.toSet() == policyIds && policies.size == policyIds.size)
         policies.forEach { executePolicy(it) }
