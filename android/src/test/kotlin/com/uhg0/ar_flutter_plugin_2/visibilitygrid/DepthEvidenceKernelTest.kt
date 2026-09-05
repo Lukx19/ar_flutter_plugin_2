@@ -221,6 +221,64 @@ class DepthEvidenceKernelTest {
     }
 
     @Test
+    fun `zero ray budget truncates while visitor stop remains an intentional completion`() {
+        val kernel = DepthEvidenceKernel()
+        var zeroVisits = 0
+        val zero = kernel.visitRayCells(
+            DepthPointMm(50.0, 50.0, 50.0), DepthPointMm(50.0, 50.0, -250.0), frame(), 0,
+        ) { zeroVisits++; true }
+        assertEquals(DepthRayVisitResult(0, truncated = true), zero)
+        assertEquals(0, zeroVisits)
+
+        var stoppedVisits = 0
+        val stopped = kernel.visitRayCells(
+            DepthPointMm(50.0, 50.0, 50.0), DepthPointMm(50.0, 50.0, -250.0), frame(), 4,
+        ) { ++stoppedVisits < 2 }
+        assertEquals(DepthRayVisitResult(2), stopped)
+        assertEquals(2, stoppedVisits)
+
+        val adapter = CanonicalSurfaceRayViewAdapter(FakeCanonicalView(), frame())
+        assertEquals(
+            zero,
+            adapter.visitRayCells(
+                DepthPointMm(50.0, 50.0, 50.0), DepthPointMm(50.0, 50.0, -250.0), 0,
+            ) { _, _ -> true },
+        )
+        var adapterStops = 0
+        assertEquals(
+            stopped,
+            adapter.visitRayCells(
+                DepthPointMm(50.0, 50.0, 50.0), DepthPointMm(50.0, 50.0, -250.0), 4,
+            ) { _, _ -> ++adapterStops < 2 },
+        )
+        assertEquals(2, adapterStops)
+    }
+
+    @Test
+    fun `endpoint and traversal share exact voxel address boundaries`() {
+        val voxelSize = 100_000
+        val maximumPoint = DepthPointMm(VOXEL_COORDINATE_MAX * 100.0, 0.0, 0.0)
+        val maximumVoxel = Voxel(VOXEL_COORDINATE_MAX, 0, 0)
+        assertEquals(maximumVoxel, DepthVoxelAddressing.quantize(maximumPoint, voxelSize))
+        val visited = mutableListOf<Voxel>()
+        assertEquals(
+            DepthRayVisitResult(1),
+            DepthEvidenceKernel().visitRayCells(maximumPoint, maximumPoint, frame(), 1) {
+                visited += it
+                true
+            },
+        )
+        assertEquals(listOf(maximumVoxel), visited)
+
+        val beyond = DepthPointMm((VOXEL_COORDINATE_MAX + 1L) * 100.0, 0.0, 0.0)
+        assertEquals(null, DepthVoxelAddressing.quantize(beyond, voxelSize))
+        assertEquals(
+            DepthRayVisitResult(0, arithmeticOverflow = true),
+            DepthEvidenceKernel().visitRayCells(beyond, beyond, frame(), 1) { true },
+        )
+    }
+
+    @Test
     fun `translated group emits the locked target and group-space normal`() {
         val kernel = DepthEvidenceKernel()
         val view = FakeCanonicalView()

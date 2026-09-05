@@ -422,6 +422,31 @@ class DepthEvidencePropertyTest {
     }
 
     @Test
+    fun `second valid sample refuses after first ray consumes the exact global visit budget`() {
+        val cameraZ = 3_997.5
+        val frame = VisibilityGroupFrame.copyOf(
+            identity().toDoubleArray(), identity().toDoubleArray(), 122, 100_000,
+        )
+        val sample = VisibilityDepthSample(1, 0, 7_995, 255)
+        val batch = DepthEvidenceBatch(
+            1, 1, frame, translated(0.0, 0.0, cameraZ / 1_000.0),
+            VisibilityCameraIntrinsics(2, 1, 26_650.0, 1.0, 0.0, 0.0),
+            listOf(sample, sample), 0,
+        )
+        val kernel = DepthEvidenceKernel(DepthEvidenceConfiguration(safetyBandMillimetres = 0))
+
+        assertEquals(
+            DepthEvidenceResult.Refused(
+                DepthEvidenceRefusal.RAY_VISIT_CAPACITY,
+                DepthEvidenceReceipt(capacityRefusals = 1),
+            ),
+            kernel.prepare(batch, MaximumRayView(emptyMap())),
+        )
+        assertEquals(0, kernel.resourceReceipt().preparedEvidenceRows)
+        assertEquals(DepthEvidenceApplyResult.NoPrepared(DepthEvidenceReceipt(capacityRefusals = 1)), kernel.applyPrepared())
+    }
+
+    @Test
     fun `maximum changed canonical cut retains old and new identities with linear work`() {
         val size = 0.122
         val cameraZ = 3_997.5

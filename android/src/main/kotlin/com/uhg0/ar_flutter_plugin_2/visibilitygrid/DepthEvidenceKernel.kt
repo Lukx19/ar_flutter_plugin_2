@@ -151,7 +151,10 @@ internal class DepthEvidenceKernel(
         } catch (_: StageCapacityFailure) {
             return refused(DepthEvidenceRefusal.SURFACE_CAPACITY)
         }
-        if (staged is Staged.Refused) return refused(staged.reason)
+        if (staged is Staged.Refused) {
+            resetStage()
+            return refused(staged.reason)
+        }
 
         val accepted = staged as Staged.Accepted
         val revisionAfterPlanning = canonicalAccess { surfaces.revisionPair }
@@ -303,7 +306,7 @@ internal class DepthEvidenceKernel(
             }
             val endpoint = transform(batch.groupFromCameraGl, cameraPoint)
                 ?: throw ArithmeticException("non-finite depth transform")
-            val endpointVoxel = quantize(endpoint, batch.groupFrame)
+            val endpointVoxel = DepthVoxelAddressing.quantize(endpoint, batch.groupFrame.voxelSizeMicrometres)
                 ?: return Staged.Refused(DepthEvidenceRefusal.ARITHMETIC_OVERFLOW)
             val endpointLookup = canonicalAccess { surfaces.findSurfaceAt(endpointVoxel) }
             if (endpointLookup != null) validateCanonicalSurface(surfaces, endpointVoxel, endpointLookup)
@@ -1327,15 +1330,6 @@ internal class DepthEvidenceKernel(
         return elevationBin * 8 + azimuthBin
     }
 
-    private fun quantize(point: DepthPointMm, frame: VisibilityGroupFrame): Voxel? {
-        if (!point.isFinite()) return null
-        fun coordinate(value: Double): Int? {
-            val quantized = floor(value * 1_000.0 / frame.voxelSizeMicrometres)
-            return if (quantized.isFinite() && quantized >= VOXEL_COORDINATE_MIN && quantized <= VOXEL_COORDINATE_MAX) quantized.toInt() else null
-        }
-        return Voxel(coordinate(point.x) ?: return null, coordinate(point.y) ?: return null, coordinate(point.z) ?: return null)
-    }
-
     private fun center(voxel: Voxel, frame: VisibilityGroupFrame): DepthPointMm {
         val size = frame.voxelSizeMicrometres.toDouble() / 1_000.0
         return DepthPointMm((voxel.x + 0.5) * size, (voxel.y + 0.5) * size, (voxel.z + 0.5) * size)
@@ -1373,8 +1367,7 @@ internal class DepthEvidenceKernel(
         kotlin.math.abs(matrix[3]) <= 1e-6 && kotlin.math.abs(matrix[7]) <= 1e-6 &&
         kotlin.math.abs(matrix[11]) <= 1e-6 && kotlin.math.abs(matrix[15] - 1.0) <= 1e-6
 
-    private fun voxelInRange(voxel: Voxel): Boolean =
-        voxel.x in VOXEL_COORDINATE_MIN..VOXEL_COORDINATE_MAX && voxel.y in VOXEL_COORDINATE_MIN..VOXEL_COORDINATE_MAX && voxel.z in VOXEL_COORDINATE_MIN..VOXEL_COORDINATE_MAX
+    private fun voxelInRange(voxel: Voxel): Boolean = DepthVoxelAddressing.contains(voxel)
 
     private fun increment(value: Int): Pair<Int, Boolean> = if (value >= 255) 255 to true else value + 1 to false
 

@@ -14,9 +14,9 @@ internal object DepthRaySupercover {
         if (maximumVisits !in 0..65_536 || voxelSizeMicrometres <= 0 ||
             !camera.isFinite() || !endpoint.isFinite()
         ) return DepthRayVisitResult(0, arithmeticOverflow = true)
-        val start = quantize(camera, voxelSizeMicrometres)
+        val start = DepthVoxelAddressing.quantize(camera, voxelSizeMicrometres)
             ?: return DepthRayVisitResult(0, arithmeticOverflow = true)
-        val end = quantize(endpoint, voxelSizeMicrometres)
+        val end = DepthVoxelAddressing.quantize(endpoint, voxelSizeMicrometres)
             ?: return DepthRayVisitResult(0, arithmeticOverflow = true)
         val size = voxelSizeMicrometres.toDouble() / 1_000.0
         val delta = doubleArrayOf(endpoint.x - camera.x, endpoint.y - camera.y, endpoint.z - camera.z)
@@ -39,13 +39,16 @@ internal object DepthRaySupercover {
             }
         }
         var visited = 0
-        fun emit(voxel: Voxel): Boolean {
-            if (visited >= maximumVisits) return false
+        fun emit(voxel: Voxel): Int {
+            if (visited >= maximumVisits) return CAPACITY_STOP
             visited = Math.addExact(visited, 1)
-            return visitor(voxel)
+            return if (visitor(voxel)) CONTINUE else VISITOR_STOP
         }
         try {
-            if (!emit(start)) return DepthRayVisitResult(visited)
+            when (emit(start)) {
+                CAPACITY_STOP -> return DepthRayVisitResult(visited, truncated = true)
+                VISITOR_STOP -> return DepthRayVisitResult(visited)
+            }
             while (!current.contentEquals(target)) {
                 val crossing = (0..2)
                     .asSequence()
@@ -66,8 +69,13 @@ internal object DepthRaySupercover {
                         next[axis] = Math.addExact(next[axis], step[axis])
                     }
                     val voxel = Voxel(next[0], next[1], next[2])
-                    if (!inRange(voxel)) return DepthRayVisitResult(visited, arithmeticOverflow = true)
-                    if (!emit(voxel)) return DepthRayVisitResult(visited, truncated = true)
+                    if (!DepthVoxelAddressing.contains(voxel)) {
+                        return DepthRayVisitResult(visited, arithmeticOverflow = true)
+                    }
+                    when (emit(voxel)) {
+                        CAPACITY_STOP -> return DepthRayVisitResult(visited, truncated = true)
+                        VISITOR_STOP -> return DepthRayVisitResult(visited)
+                    }
                 }
                 for (axis in 0..2) if (tiedMask and (1 shl axis) != 0) {
                     current[axis] = Math.addExact(current[axis], step[axis])
@@ -80,7 +88,15 @@ internal object DepthRaySupercover {
         return DepthRayVisitResult(visited)
     }
 
-    private fun quantize(point: DepthPointMm, voxelSizeMicrometres: Int): Voxel? {
+    private const val CONTINUE = 0
+    private const val VISITOR_STOP = 1
+    private const val CAPACITY_STOP = 2
+}
+
+/** Shared allocation-free validation for every depth voxel address. */
+internal object DepthVoxelAddressing {
+    fun quantize(point: DepthPointMm, voxelSizeMicrometres: Int): Voxel? {
+        if (!point.isFinite() || voxelSizeMicrometres <= 0) return null
         fun coordinate(value: Double): Int? {
             val quantized = floor(value * 1_000.0 / voxelSizeMicrometres)
             return if (quantized.isFinite() &&
@@ -94,7 +110,7 @@ internal object DepthRaySupercover {
         )
     }
 
-    private fun inRange(voxel: Voxel): Boolean =
+    fun contains(voxel: Voxel): Boolean =
         voxel.x in VOXEL_COORDINATE_MIN..VOXEL_COORDINATE_MAX &&
             voxel.y in VOXEL_COORDINATE_MIN..VOXEL_COORDINATE_MAX &&
             voxel.z in VOXEL_COORDINATE_MIN..VOXEL_COORDINATE_MAX
