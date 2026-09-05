@@ -104,9 +104,9 @@ class DepthEvidencePropertyTest {
 
         val committed = accepted(1, rayVisits = 22, virtualWork = 24).receipt
         val duplicate = kernel.prepare(batch(1), view)
-        assertEquals(DepthEvidenceResult.Refused(DepthEvidenceRefusal.DUPLICATE_TIMESTAMP, committed), duplicate)
+        assertEquals(DepthEvidenceResult.Refused(DepthEvidenceRefusal.DUPLICATE_TIMESTAMP, attemptReceipt(1)), duplicate)
         val notTracking = kernel.prepare(batch(2, tracking = false), view)
-        assertEquals(DepthEvidenceResult.Refused(DepthEvidenceRefusal.NOT_TRACKING, committed), notTracking)
+        assertEquals(DepthEvidenceResult.Refused(DepthEvidenceRefusal.NOT_TRACKING, attemptReceipt(2)), notTracking)
         assertThrows(IllegalArgumentException::class.java) {
             DepthEvidenceBatch(3, 3, frame(), listOf(1.0), intrinsics(), listOf(sample()), 0)
         }
@@ -120,19 +120,25 @@ class DepthEvidencePropertyTest {
             DepthEvidenceBatch(1, 1, frame(), identity(), intrinsics(), listOf(sample(), sample()), 0),
             PropertyView(),
         ) as DepthEvidenceResult.Refused
-        val capacityReceipt = DepthEvidenceReceipt(capacityRefusals = 1)
+        val capacityReceipt = attemptReceipt(1, capacityRefusals = 1)
         assertEquals(DepthEvidenceResult.Refused(DepthEvidenceRefusal.SAMPLE_CAPACITY, capacityReceipt), tooManySamples)
         assertEquals(0, sampleLimited.resourceReceipt().residentEvidenceRows)
         val afterSampleRefusal = sampleLimited.prepare(
             DepthEvidenceBatch(2, 2, frame(), identity(), intrinsics(), listOf(sample()), 0),
             PropertyView(),
         ) as DepthEvidenceResult.Accepted
-        assertEquals(accepted(2, rayVisits = 22, capacityRefusals = 1, virtualWork = 24), afterSampleRefusal)
+        assertEquals(accepted(2, rayVisits = 22, virtualWork = 24), afterSampleRefusal)
         sampleLimited.discardPrepared()
 
         val rayLimited = DepthEvidenceKernel(DepthEvidenceConfiguration(rayVisitCapacity = 1))
         val tooManyRays = rayLimited.prepare(batch(1), PropertyView()) as DepthEvidenceResult.Refused
-        assertEquals(DepthEvidenceResult.Refused(DepthEvidenceRefusal.RAY_VISIT_CAPACITY, capacityReceipt), tooManyRays)
+        assertEquals(
+            DepthEvidenceResult.Refused(
+                DepthEvidenceRefusal.RAY_VISIT_CAPACITY,
+                attemptReceipt(1, rayVisits = 1, touchedRows = 1, capacityRefusals = 1, virtualWork = 2),
+            ),
+            tooManyRays,
+        )
         assertEquals(0, rayLimited.resourceReceipt().residentEvidenceRows)
 
         val surfaceLimited = DepthEvidenceKernel(DepthEvidenceConfiguration(surfaceCapacity = 1))
@@ -143,7 +149,13 @@ class DepthEvidencePropertyTest {
             ),
             PropertyView(),
         ) as DepthEvidenceResult.Refused
-        assertEquals(DepthEvidenceResult.Refused(DepthEvidenceRefusal.SURFACE_CAPACITY, capacityReceipt), twoEndpoints)
+        assertEquals(
+            DepthEvidenceResult.Refused(
+                DepthEvidenceRefusal.SURFACE_CAPACITY,
+                attemptReceipt(1, capacityRefusals = 1),
+            ),
+            twoEndpoints,
+        )
         assertEquals(0, surfaceLimited.resourceReceipt().residentEvidenceRows)
     }
 
@@ -164,7 +176,7 @@ class DepthEvidencePropertyTest {
         assertEquals(
             DepthEvidenceResult.Refused(
                 DepthEvidenceRefusal.SURFACE_CAPACITY,
-                accepted(3, rayVisits = 22, virtualWork = 24).receipt.copy(capacityRefusals = 1),
+                attemptReceipt(4, acceptedSamples = 1, rayVisits = 22, touchedRows = 1, capacityRefusals = 1, virtualWork = 24),
             ),
             result,
         )
@@ -183,7 +195,7 @@ class DepthEvidencePropertyTest {
         assertEquals(
             DepthEvidenceResult.Refused(
                 DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED,
-                DepthEvidenceReceipt(),
+                attemptReceipt(1),
             ),
             result,
         )
@@ -428,22 +440,32 @@ class DepthEvidencePropertyTest {
             identity().toDoubleArray(), identity().toDoubleArray(), 122, 100_000,
         )
         val sample = VisibilityDepthSample(1, 0, 7_995, 255)
-        val batch = DepthEvidenceBatch(
-            1, 1, frame, translated(0.0, 0.0, cameraZ / 1_000.0),
+        fun batch(sequence: Long, samples: List<VisibilityDepthSample>) = DepthEvidenceBatch(
+            sequence, sequence, frame, translated(0.0, 0.0, cameraZ / 1_000.0),
             VisibilityCameraIntrinsics(2, 1, 26_650.0, 1.0, 0.0, 0.0),
-            listOf(sample, sample), 0,
+            samples, 0,
         )
         val kernel = DepthEvidenceKernel(DepthEvidenceConfiguration(safetyBandMillimetres = 0))
+        val view = MaximumRayView(emptyMap())
+        val committed = kernel.prepare(batch(1, listOf(sample)), view) as DepthEvidenceResult.Accepted
+        kernel.applyPrepared()
+        val before = kernel.resourceReceipt()
 
         assertEquals(
             DepthEvidenceResult.Refused(
                 DepthEvidenceRefusal.RAY_VISIT_CAPACITY,
-                DepthEvidenceReceipt(capacityRefusals = 1),
+                attemptReceipt(
+                    2, acceptedSamples = 1, rayVisits = 65_536, touchedRows = 1,
+                    capacityRefusals = 1, virtualWork = 65_538,
+                ),
             ),
-            kernel.prepare(batch, MaximumRayView(emptyMap())),
+            kernel.prepare(batch(2, listOf(sample, sample)), view),
         )
         assertEquals(0, kernel.resourceReceipt().preparedEvidenceRows)
-        assertEquals(DepthEvidenceApplyResult.NoPrepared(DepthEvidenceReceipt(capacityRefusals = 1)), kernel.applyPrepared())
+        assertEquals(before, kernel.resourceReceipt())
+        assertEquals(DepthEvidenceApplyResult.NoPrepared(committed.receipt), kernel.applyPrepared())
+        assertTrue(kernel.prepare(batch(2, listOf(sample)), view) is DepthEvidenceResult.Accepted)
+        kernel.discardPrepared()
     }
 
     @Test
@@ -503,7 +525,7 @@ class DepthEvidencePropertyTest {
         assertEquals(3_407_874, third.work.virtualWorkUnits)
         kernel.applyPrepared()
         assertEquals(
-            DepthEvidenceResult.Refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED, third.receipt),
+            DepthEvidenceResult.Refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED, attemptReceipt(4)),
             kernel.prepare(batch(4), view),
         )
         assertEquals(12_676_816, kernel.resourceReceipt().fixedPrimitiveBytes)
@@ -617,7 +639,7 @@ class DepthEvidencePropertyTest {
         )
 
         assertEquals(
-            DepthEvidenceResult.Refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED, committed.receipt),
+            DepthEvidenceResult.Refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED, attemptReceipt(2)),
             kernel.prepare(duplicateSamples, inconsistent),
         )
         assertEquals(2, endpointLookups)
@@ -651,7 +673,7 @@ class DepthEvidencePropertyTest {
             DepthEvidenceBatch(1, 1, frame(), identity(), intrinsics(), listOf(VisibilityDepthSample(0, 0, 1, 255)), 0),
             PropertyView(),
         )
-        assertEquals(DepthEvidenceResult.Refused(DepthEvidenceRefusal.INVALID_SAMPLE, DepthEvidenceReceipt()), invalid)
+        assertEquals(DepthEvidenceResult.Refused(DepthEvidenceRefusal.INVALID_SAMPLE, attemptReceipt(1, rejectedSamples = 1)), invalid)
 
         val overflow = kernel.prepare(
             DepthEvidenceBatch(2, 2, frame(), identity(), intrinsics(), listOf(VisibilityDepthSample(0, 0, 1, 255)), Int.MAX_VALUE),
@@ -660,7 +682,7 @@ class DepthEvidencePropertyTest {
         assertEquals(
             DepthEvidenceResult.Refused(
                 DepthEvidenceRefusal.ARITHMETIC_OVERFLOW,
-                DepthEvidenceReceipt(overflowCount = 1),
+                attemptReceipt(2, overflowCount = 1),
             ),
             overflow,
         )
@@ -678,7 +700,7 @@ class DepthEvidencePropertyTest {
         assertEquals(
             DepthEvidenceResult.Refused(
                 DepthEvidenceRefusal.ARITHMETIC_OVERFLOW,
-                DepthEvidenceReceipt(overflowCount = 1),
+                attemptReceipt(1, overflowCount = 1),
             ),
             endpointOverflow,
         )
@@ -695,7 +717,7 @@ class DepthEvidencePropertyTest {
         assertEquals(
             DepthEvidenceResult.Refused(
                 DepthEvidenceRefusal.ARITHMETIC_OVERFLOW,
-                DepthEvidenceReceipt(overflowCount = 1),
+                attemptReceipt(1, touchedRows = 1, overflowCount = 1, virtualWork = 1),
             ),
             traversalOverflow,
         )
@@ -742,6 +764,28 @@ class DepthEvidencePropertyTest {
         work = DepthEvidenceWorkReceipt(touchedRows, 0, rayVisits, 0, accountedWork),
     )
     }
+
+    private fun attemptReceipt(
+        sequence: Long,
+        acceptedSamples: Int = 0,
+        rejectedSamples: Int = 0,
+        rayVisits: Int = 0,
+        touchedRows: Int = 0,
+        capacityRefusals: Int = 0,
+        overflowCount: Int = 0,
+        virtualWork: Int = 0,
+    ) = DepthEvidenceReceipt(
+        sequence = sequence,
+        sourceTimestampNs = sequence,
+        acceptedSamples = acceptedSamples,
+        rejectedSamples = rejectedSamples,
+        rayVisits = rayVisits,
+        touchedEvidenceRows = touchedRows,
+        capacityRefusals = capacityRefusals,
+        overflowCount = overflowCount,
+        p50VirtualWorkUnits = virtualWork,
+        p95VirtualWorkUnits = virtualWork,
+    )
 
     private fun batch(timestamp: Long, tracking: Boolean = true) = DepthEvidenceBatch(
         timestamp, timestamp, frame(), identity(), intrinsics(), listOf(sample()), 0, tracking,

@@ -121,7 +121,7 @@ class DepthEvidenceKernelTest {
             val kernel = DepthEvidenceKernel()
 
             assertEquals(
-                DepthEvidenceResult.Refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED, DepthEvidenceReceipt()),
+                DepthEvidenceResult.Refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED, attemptReceipt(1)),
                 kernel.prepare(depthBatchForFrame(1, frame(), identity()), view),
             )
             assertEquals(0, kernel.resourceReceipt().preparedEvidenceRows)
@@ -211,7 +211,7 @@ class DepthEvidenceKernelTest {
         assertEquals(
             DepthEvidenceResult.Refused(
                 DepthEvidenceRefusal.RAY_VISIT_CAPACITY,
-                DepthEvidenceReceipt(capacityRefusals = 1),
+                attemptReceipt(1, rayVisits = 3, touchedRows = 1, capacityRefusals = 1, virtualWork = 4),
             ),
             DepthEvidenceKernel(DepthEvidenceConfiguration(rayVisitCapacity = 3)).prepare(
                 depthBatchForFrame(1, frame(), identity()),
@@ -466,11 +466,10 @@ class DepthEvidenceKernelTest {
         assertEquals(
             DepthEvidenceResult.Refused(
                 DepthEvidenceRefusal.SURFACE_CAPACITY,
-                expectedAccepted(
-                    3, acceptedSamples = 2, rayVisits = 42, touchedRows = 2, virtualWork = 46,
-                    relationCount = 2,
-                    relationAdmissionWork = 4,
-                ).receipt.copy(capacityRefusals = 1),
+                attemptReceipt(
+                    4, acceptedSamples = 2, rayVisits = 42, touchedRows = 2,
+                    capacityRefusals = 1, virtualWork = 46,
+                ),
             ),
             fullKernel.prepare(depthBatchForSamples(4, frame(), identity(), intrinsics, samples), fullView),
         )
@@ -587,14 +586,7 @@ class DepthEvidenceKernelTest {
         assertEquals(
             DepthEvidenceResult.Refused(
                 DepthEvidenceRefusal.SOURCE_OVERLAP,
-                expectedAccepted(
-                    22,
-                    acceptedSamples = 2,
-                    rayVisits = 56,
-                    touchedRows = 5,
-                    virtualWork = 63,
-                    relationCount = 2,
-                ).receipt,
+                attemptReceipt(23),
             ),
             candidate,
         )
@@ -611,7 +603,7 @@ class DepthEvidenceKernelTest {
             FakeCanonicalView(surfaces = mapOf(target to source), idLookup = emptyMap()),
         ) as DepthEvidenceResult.Refused
         assertEquals(
-            DepthEvidenceResult.Refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED, DepthEvidenceReceipt()),
+            DepthEvidenceResult.Refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED, attemptReceipt(1)),
             missing,
         )
 
@@ -623,7 +615,7 @@ class DepthEvidenceKernelTest {
             ),
         ) as DepthEvidenceResult.Refused
         assertEquals(
-            DepthEvidenceResult.Refused(DepthEvidenceRefusal.DUPLICATE_TARGET, DepthEvidenceReceipt()),
+            DepthEvidenceResult.Refused(DepthEvidenceRefusal.DUPLICATE_TARGET, attemptReceipt(1)),
             conflicting,
         )
     }
@@ -643,7 +635,7 @@ class DepthEvidenceKernelTest {
         assertEquals(
             DepthEvidenceResult.Refused(
                 DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED,
-                DepthEvidenceReceipt(),
+                attemptReceipt(1),
             ),
             result,
         )
@@ -662,7 +654,7 @@ class DepthEvidenceKernelTest {
         kernel.applyPrepared()
 
         assertEquals(
-            DepthEvidenceResult.Refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED, first.receipt),
+            DepthEvidenceResult.Refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED, attemptReceipt(2)),
             kernel.prepare(
                 depthBatchForFrame(2, frame(), identity()),
                 FakeCanonicalView(surfaces = mapOf(target to replacement)),
@@ -1323,7 +1315,7 @@ class DepthEvidenceKernelTest {
 
         val invalid = valid.copyWithTimestamp(8).withSamples(listOf(VisibilityDepthSample(0, 0, 1, 255)))
         val invalidResult = kernel.prepare(invalid, view) as DepthEvidenceResult.Refused
-        assertEquals(DepthEvidenceResult.Refused(DepthEvidenceRefusal.INVALID_SAMPLE, committedReceipt), invalidResult)
+        assertEquals(DepthEvidenceResult.Refused(DepthEvidenceRefusal.INVALID_SAMPLE, attemptReceipt(8, rejectedSamples = 1)), invalidResult)
         assertEquals(before, kernel.resourceReceipt())
     }
 
@@ -1346,12 +1338,50 @@ class DepthEvidenceKernelTest {
     }
 
     @Test
+    fun `overflow and canonical refusal diagnostics do not replace the committed receipt`() {
+        val kernel = DepthEvidenceKernel()
+        val stableView = FakeCanonicalView()
+        kernel.prepare(depthBatchForFrame(1, frame(), identity()), stableView)
+        val applied = kernel.applyPrepared() as DepthEvidenceApplyResult.Applied
+        val committed = applied.receipt
+        val before = kernel.resourceReceipt()
+
+        val overflowBatch = batch(
+            2,
+            frame(),
+            translation(200_000.0, 0.0, 0.0),
+            listOf(sample()),
+        )
+        assertEquals(
+            DepthEvidenceResult.Refused(
+                DepthEvidenceRefusal.ARITHMETIC_OVERFLOW,
+                attemptReceipt(2, overflowCount = 1),
+            ),
+            kernel.prepare(overflowBatch, stableView),
+        )
+        assertEquals(before, kernel.resourceReceipt())
+        assertEquals(DepthEvidenceApplyResult.NoPrepared(committed), kernel.applyPrepared())
+
+        assertEquals(
+            DepthEvidenceResult.Refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED, attemptReceipt(2)),
+            kernel.prepare(
+                depthBatchForFrame(2, frame(), identity()),
+                ThrowingCanonicalView(ThrowAccess.ADDRESS, null),
+            ),
+        )
+        assertEquals(before, kernel.resourceReceipt())
+        assertEquals(DepthEvidenceApplyResult.NoPrepared(committed), kernel.applyPrepared())
+        assertTrue(kernel.prepare(depthBatchForFrame(2, frame(), identity()), stableView) is DepthEvidenceResult.Accepted)
+        kernel.discardPrepared()
+    }
+
+    @Test
     fun `canonical cut change during addressed lookup cannot publish mixed evidence`() {
         val kernel = DepthEvidenceKernel()
         val view = RevisionMutatingCanonicalView(mutateDuringAddressLookup = true)
 
         assertEquals(
-            DepthEvidenceResult.Refused(DepthEvidenceRefusal.STALE_CANONICAL_CUT, DepthEvidenceReceipt()),
+            DepthEvidenceResult.Refused(DepthEvidenceRefusal.STALE_CANONICAL_CUT, attemptReceipt(1)),
             kernel.prepare(depthBatchForFrame(1, frame(), identity()), view),
         )
         assertEquals(0, kernel.resourceReceipt().preparedEvidenceRows)
@@ -1369,7 +1399,7 @@ class DepthEvidenceKernelTest {
         val view = RevisionMutatingCanonicalView(canonical, mutateDuringSourceLookup = true)
 
         assertEquals(
-            DepthEvidenceResult.Refused(DepthEvidenceRefusal.STALE_CANONICAL_CUT, DepthEvidenceReceipt()),
+            DepthEvidenceResult.Refused(DepthEvidenceRefusal.STALE_CANONICAL_CUT, attemptReceipt(1)),
             kernel.prepare(depthBatchForFrame(1, frame(), identity()), view),
         )
         assertEquals(0, kernel.resourceReceipt().preparedEvidenceRows)
@@ -1537,6 +1567,28 @@ class DepthEvidenceKernelTest {
         ),
     )
     }
+
+    private fun attemptReceipt(
+        sequence: Long,
+        acceptedSamples: Int = 0,
+        rejectedSamples: Int = 0,
+        rayVisits: Int = 0,
+        touchedRows: Int = 0,
+        capacityRefusals: Int = 0,
+        overflowCount: Int = 0,
+        virtualWork: Int = 0,
+    ) = DepthEvidenceReceipt(
+        sequence = sequence,
+        sourceTimestampNs = sequence,
+        acceptedSamples = acceptedSamples,
+        rejectedSamples = rejectedSamples,
+        rayVisits = rayVisits,
+        touchedEvidenceRows = touchedRows,
+        capacityRefusals = capacityRefusals,
+        overflowCount = overflowCount,
+        p50VirtualWorkUnits = virtualWork,
+        p95VirtualWorkUnits = virtualWork,
+    )
 
     private fun surface(id: Long, voxel: Voxel) = DepthCanonicalSurface(
         SurfaceId(id), voxel, 0x1010, 200, 1,

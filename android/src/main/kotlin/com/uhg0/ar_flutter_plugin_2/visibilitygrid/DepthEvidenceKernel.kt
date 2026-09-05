@@ -92,7 +92,6 @@ internal class DepthEvidenceKernel(
     private var activeFrame: VisibilityGroupFrame? = null
     private var pending: Pending? = null
     private var lastReceipt = DepthEvidenceReceipt()
-    private var capacityRefusalCount = 0
     private var overflowEvidenceCount = 0
     private var closed = false
 
@@ -108,26 +107,26 @@ internal class DepthEvidenceKernel(
         prepareLocked(batch, surfaces)
     } catch (_: DepthLookupFailure) {
         resetStage()
-        refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED)
+        refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED, batch)
     }
 
     private fun prepareLocked(batch: DepthEvidenceBatch, surfaces: BoundedCanonicalSurfaceView): DepthEvidenceResult {
-        if (closed) return refused(DepthEvidenceRefusal.CLOSED)
-        if (pending != null) return refused(DepthEvidenceRefusal.PREPARED_BUSY)
-        if (!batch.tracking) return refused(DepthEvidenceRefusal.NOT_TRACKING)
+        if (closed) return refused(DepthEvidenceRefusal.CLOSED, batch)
+        if (pending != null) return refused(DepthEvidenceRefusal.PREPARED_BUSY, batch)
+        if (!batch.tracking) return refused(DepthEvidenceRefusal.NOT_TRACKING, batch)
         if (batch.sequence <= lastSequence || batch.sourceTimestampNs <= lastTimestampNs) {
-            return refused(DepthEvidenceRefusal.DUPLICATE_TIMESTAMP)
+            return refused(DepthEvidenceRefusal.DUPLICATE_TIMESTAMP, batch)
         }
         if (batch.sequence < 0L || batch.sourceTimestampNs <= 0L ||
             !isAffine(batch.groupFromCameraGl) ||
             activeFrame?.let { it != batch.groupFrame } == true
-        ) return refused(DepthEvidenceRefusal.INVALID_FRAME)
+        ) return refused(DepthEvidenceRefusal.INVALID_FRAME, batch)
         val revisionPair = canonicalAccess { surfaces.revisionPair }
         if (revisionPair.geometryRevision < 0L || revisionPair.lineageRevision < 0L ||
             revisionPair.geometryRevision == Long.MAX_VALUE || revisionPair.lineageRevision == Long.MAX_VALUE
-        ) return refused(DepthEvidenceRefusal.STALE_CANONICAL_CUT)
+        ) return refused(DepthEvidenceRefusal.STALE_CANONICAL_CUT, batch)
         if (batch.samples.size > configuration.sampleCapacity) {
-            return refused(DepthEvidenceRefusal.SAMPLE_CAPACITY)
+            return refused(DepthEvidenceRefusal.SAMPLE_CAPACITY, batch)
         }
         val surfaceCapacity = minOf(configuration.surfaceCapacity, batch.groupFrame.modelCapacity)
         if (batch.sourceRejectedSamples < 0 || canonicalAccess { surfaces.surfaceCount } !in 0..surfaceCapacity) {
@@ -135,32 +134,32 @@ internal class DepthEvidenceKernel(
                 DepthEvidenceRefusal.INVALID_SAMPLE
             } else {
                 DepthEvidenceRefusal.SURFACE_CAPACITY
-            })
+            }, batch)
         }
 
         val cameraGroup = transform(batch.groupFromCameraGl, DepthPointMm(0.0, 0.0, 0.0))
-            ?: return refused(DepthEvidenceRefusal.INVALID_FRAME)
+            ?: return refused(DepthEvidenceRefusal.INVALID_FRAME, batch)
         val staged = try {
             stage(batch, surfaces, cameraGroup, revisionPair)
         } catch (_: ArithmeticException) {
-            return refused(DepthEvidenceRefusal.ARITHMETIC_OVERFLOW)
+            return refused(DepthEvidenceRefusal.ARITHMETIC_OVERFLOW, batch)
         } catch (_: DuplicateTargetFailure) {
-            return refused(DepthEvidenceRefusal.DUPLICATE_TARGET)
+            return refused(DepthEvidenceRefusal.DUPLICATE_TARGET, batch)
         } catch (_: SourceOverlapFailure) {
-            return refused(DepthEvidenceRefusal.SOURCE_OVERLAP)
+            return refused(DepthEvidenceRefusal.SOURCE_OVERLAP, batch)
         } catch (_: StageCapacityFailure) {
-            return refused(DepthEvidenceRefusal.SURFACE_CAPACITY)
+            return refused(DepthEvidenceRefusal.SURFACE_CAPACITY, batch)
         }
         if (staged is Staged.Refused) {
             resetStage()
-            return refused(staged.reason)
+            return refused(staged.reason, batch, staged.receipt)
         }
 
         val accepted = staged as Staged.Accepted
         val revisionAfterPlanning = canonicalAccess { surfaces.revisionPair }
         if (revisionAfterPlanning != revisionPair) {
             resetStage()
-            return refused(DepthEvidenceRefusal.STALE_CANONICAL_CUT)
+            return refused(DepthEvidenceRefusal.STALE_CANONICAL_CUT, batch)
         }
         pending = Pending(accepted.result.receipt, stageCount, accepted.frame)
         return accepted.result
@@ -285,6 +284,23 @@ internal class DepthEvidenceKernel(
         var rejectedSamples = batch.sourceRejectedSamples
         var visits = 0
         var overflowCount = 0
+        fun refuseAttempt(reason: DepthEvidenceRefusal, attemptedVisits: Int = visits): Staged.Refused {
+            val work = checkedAdd(acceptedSamples, checkedAdd(attemptedVisits, stageCount))
+            return Staged.Refused(
+                reason,
+                DepthEvidenceReceipt(
+                    sequence = batch.sequence,
+                    sourceTimestampNs = batch.sourceTimestampNs,
+                    acceptedSamples = acceptedSamples,
+                    rejectedSamples = rejectedSamples,
+                    rayVisits = attemptedVisits,
+                    touchedEvidenceRows = stageCount,
+                    overflowCount = overflowCount,
+                    p50VirtualWorkUnits = work,
+                    p95VirtualWorkUnits = work,
+                ),
+            )
+        }
 
         for (sample in batch.samples) {
             if (sample.x !in 0 until batch.intrinsics.imageWidth ||
@@ -307,7 +323,7 @@ internal class DepthEvidenceKernel(
             val endpoint = transform(batch.groupFromCameraGl, cameraPoint)
                 ?: throw ArithmeticException("non-finite depth transform")
             val endpointVoxel = DepthVoxelAddressing.quantize(endpoint, batch.groupFrame.voxelSizeMicrometres)
-                ?: return Staged.Refused(DepthEvidenceRefusal.ARITHMETIC_OVERFLOW)
+                ?: return refuseAttempt(DepthEvidenceRefusal.ARITHMETIC_OVERFLOW)
             val endpointLookup = canonicalAccess { surfaces.findSurfaceAt(endpointVoxel) }
             if (endpointLookup != null) validateCanonicalSurface(surfaces, endpointVoxel, endpointLookup)
             val endpointSurface = endpointLookup?.surface
@@ -322,7 +338,7 @@ internal class DepthEvidenceKernel(
             }
             var rayResult: DepthRayVisitResult
             val remaining = configuration.rayVisitCapacity - visits
-            if (remaining < 0) return Staged.Refused(DepthEvidenceRefusal.RAY_VISIT_CAPACITY)
+            if (remaining < 0) return refuseAttempt(DepthEvidenceRefusal.RAY_VISIT_CAPACITY)
             try {
                 rayResult = visitRayCells(cameraGroup, endpoint, batch.groupFrame, remaining) { voxel ->
                     val lookup = if (voxel == endpointVoxel) endpointLookup else canonicalAccess { surfaces.findSurfaceAt(voxel) }
@@ -351,16 +367,22 @@ internal class DepthEvidenceKernel(
                 throw DepthLookupFailure()
             }
             if (rayResult.arithmeticOverflow) {
-                return Staged.Refused(DepthEvidenceRefusal.ARITHMETIC_OVERFLOW)
+                return refuseAttempt(
+                    DepthEvidenceRefusal.ARITHMETIC_OVERFLOW,
+                    checkedAdd(visits, rayResult.visitedCells),
+                )
             }
             if (rayResult.truncated ||
                 rayResult.visitedCells < 0 || rayResult.visitedCells > remaining
-            ) return Staged.Refused(DepthEvidenceRefusal.RAY_VISIT_CAPACITY)
+            ) return refuseAttempt(
+                DepthEvidenceRefusal.RAY_VISIT_CAPACITY,
+                checkedAdd(visits, rayResult.visitedCells),
+            )
             visits = checkedAdd(visits, rayResult.visitedCells)
             acceptedSamples = checkedAdd(acceptedSamples, 1)
         }
         if (acceptedSamples == 0 && batch.samples.isNotEmpty()) {
-            return Staged.Refused(DepthEvidenceRefusal.INVALID_SAMPLE)
+            return refuseAttempt(DepthEvidenceRefusal.INVALID_SAMPLE)
         }
         var directionVotes = 0
         var conflicts = 0
@@ -385,7 +407,7 @@ internal class DepthEvidenceKernel(
         val orderingWork = sortStageOrder()
         val planningWork = planChanges(surfaces)
         val validation = validatePlannedChanges()
-        validation.refusal?.let { return Staged.Refused(it) }
+        validation.refusal?.let { return refuseAttempt(it) }
         var newRows = 0
         for (index in 0 until stageCount) {
             if (findRow(stageX[index], stageY[index], stageZ[index]) == EMPTY_ROW) newRows++
@@ -395,7 +417,7 @@ internal class DepthEvidenceKernel(
         if (residentRows + newRows > minOf(configuration.surfaceCapacity, batch.groupFrame.modelCapacity) ||
             projection.count > minOf(configuration.surfaceCapacity, batch.groupFrame.modelCapacity)
         ) {
-            return Staged.Refused(DepthEvidenceRefusal.SURFACE_CAPACITY)
+            return refuseAttempt(DepthEvidenceRefusal.SURFACE_CAPACITY)
         }
         val immutableChanges = materializeChanges(cameraGroup, batch.groupFrame)
         val kindCounts = kindCounts(stageChangeKind, stageChangeCount)
@@ -419,7 +441,7 @@ internal class DepthEvidenceKernel(
             replaceCount = kindCounts[5],
             removeCount = kindCounts[6],
             conflictsRetained = conflicts,
-            capacityRefusals = capacityRefusalCount,
+            capacityRefusals = 0,
             overflowCount = checkedAdd(overflowEvidenceCount, overflowCount),
             preparedResidentBytes = checkedBytes(stageCount),
             p50VirtualWorkUnits = virtualWork,
@@ -1268,19 +1290,29 @@ internal class DepthEvidenceKernel(
         return mixed.toInt()
     }
 
-    private fun refused(reason: DepthEvidenceRefusal): DepthEvidenceResult.Refused {
-        if (reason == DepthEvidenceRefusal.SAMPLE_CAPACITY ||
+    private fun refused(
+        reason: DepthEvidenceRefusal,
+        batch: DepthEvidenceBatch,
+        attempt: DepthEvidenceReceipt? = null,
+    ): DepthEvidenceResult.Refused {
+        if (reason == DepthEvidenceRefusal.CLOSED || reason == DepthEvidenceRefusal.PREPARED_BUSY) {
+            return DepthEvidenceResult.Refused(reason, lastReceipt)
+        }
+        val base = attempt ?: DepthEvidenceReceipt(
+            sequence = batch.sequence,
+            sourceTimestampNs = batch.sourceTimestampNs,
+        )
+        val receipt = if (reason == DepthEvidenceRefusal.SAMPLE_CAPACITY ||
             reason == DepthEvidenceRefusal.RAY_VISIT_CAPACITY ||
             reason == DepthEvidenceRefusal.SURFACE_CAPACITY
         ) {
-            capacityRefusalCount = checkedAdd(capacityRefusalCount, 1)
-            lastReceipt = lastReceipt.copy(capacityRefusals = capacityRefusalCount)
+            base.copy(capacityRefusals = checkedAdd(base.capacityRefusals, 1))
+        } else if (reason == DepthEvidenceRefusal.ARITHMETIC_OVERFLOW) {
+            base.copy(overflowCount = checkedAdd(base.overflowCount, 1))
+        } else {
+            base
         }
-        if (reason == DepthEvidenceRefusal.ARITHMETIC_OVERFLOW) {
-            overflowEvidenceCount = checkedAdd(overflowEvidenceCount, 1)
-            lastReceipt = lastReceipt.copy(overflowCount = overflowEvidenceCount)
-        }
-        return DepthEvidenceResult.Refused(reason, lastReceipt)
+        return DepthEvidenceResult.Refused(reason, receipt)
     }
 
     private fun kindCounts(kinds: ByteArray, count: Int): IntArray = IntArray(7).also { counts ->
@@ -1531,7 +1563,7 @@ internal class DepthEvidenceKernel(
 
     private sealed interface Staged {
         data class Accepted(val result: DepthEvidenceResult.Accepted, val stageCount: Int, val frame: VisibilityGroupFrame) : Staged
-        data class Refused(val reason: DepthEvidenceRefusal) : Staged
+        data class Refused(val reason: DepthEvidenceRefusal, val receipt: DepthEvidenceReceipt) : Staged
     }
 
     private class DepthLookupFailure : RuntimeException()

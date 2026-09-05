@@ -2868,8 +2868,8 @@
                     "expectedRefusal": "CANONICAL_LOOKUP_FAILED",
                     "expectedChanges": [],
                     "expectedReceipt": {
-                      "sequence": 0,
-                      "sourceTimestampNs": 0
+                      "sequence": 1,
+                      "sourceTimestampNs": 1
                     },
                     "expectedWork": null
                   }
@@ -2882,8 +2882,8 @@
         "expectedRefusal": "CANONICAL_LOOKUP_FAILED",
         "expectedChanges": [],
         "expectedReceipt": {
-          "sequence": 0,
-          "sourceTimestampNs": 0
+          "sequence": 1,
+          "sourceTimestampNs": 1
         },
         "expectedWork": null
       },
@@ -2932,8 +2932,8 @@
                     "expectedRefusal": "SURFACE_CAPACITY",
                     "expectedChanges": [],
                     "expectedReceipt": {
-                      "sequence": 0,
-                      "sourceTimestampNs": 0,
+                      "sequence": 1,
+                      "sourceTimestampNs": 1,
                       "capacityRefusals": 1
                     },
                     "expectedWork": null
@@ -2947,8 +2947,8 @@
         "expectedRefusal": "SURFACE_CAPACITY",
         "expectedChanges": [],
         "expectedReceipt": {
-          "sequence": 0,
-          "sourceTimestampNs": 0,
+          "sequence": 1,
+          "sourceTimestampNs": 1,
           "capacityRefusals": 1
         },
         "expectedWork": null
