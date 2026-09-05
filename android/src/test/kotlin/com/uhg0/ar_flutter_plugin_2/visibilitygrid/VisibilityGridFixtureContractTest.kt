@@ -854,8 +854,7 @@ class VisibilityGridFixtureContractTest {
             (source["addressedAt"]?.let(::voxel) ?: surface.voxel) to surface
         }
         private val missingIds = specification?.get("idLookup")?.jsonPrimitive?.content == "missing"
-        override val geometryRevision = 0L
-        override val lineageRevision = 0L
+        override val revisionPair = CanonicalRevisionPair(0, 0)
         override val surfaceCount = specification?.get("surfaceCount")?.jsonPrimitive?.content?.toInt() ?: surfaces.size
         override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? = if (missingIds) null else byId[id]
         override fun findSurfaceAt(voxel: Voxel): AddressedCanonicalSurface? =

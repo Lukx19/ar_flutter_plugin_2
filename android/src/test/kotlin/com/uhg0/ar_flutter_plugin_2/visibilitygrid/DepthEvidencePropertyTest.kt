@@ -567,8 +567,7 @@ class DepthEvidencePropertyTest {
         kernel.applyPrepared()
         var endpointLookups = 0
         val inconsistent = object : BoundedCanonicalSurfaceView {
-            override val geometryRevision: Long = 0
-            override val lineageRevision: Long = 0
+            override val revisionPair = CanonicalRevisionPair(0, 0)
             override val surfaceCount: Int = 1
             override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? = when (id) {
                 old.id -> old
@@ -780,8 +779,7 @@ class DepthEvidencePropertyTest {
         override val surfaceCount: Int = 0,
         private val surface: DepthCanonicalSurface? = null,
     ) : BoundedCanonicalSurfaceView {
-        override val geometryRevision: Long = 0
-        override val lineageRevision: Long = 0
+        override val revisionPair = CanonicalRevisionPair(0, 0)
 
         override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? = surface?.takeIf { it.id == id }
         override fun findSurfaceAt(voxel: Voxel): AddressedCanonicalSurface? =
@@ -794,8 +792,7 @@ class DepthEvidencePropertyTest {
         private var surfacesById = surfaces.values.associateBy { it.id }
         var addressedSurfaceReturns: Int = 0
             private set
-        override val geometryRevision: Long = 0
-        override val lineageRevision: Long = 0
+        override val revisionPair = CanonicalRevisionPair(0, 0)
         override val surfaceCount: Int get() = surfacesById.size
 
         override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? = surfacesById[id]

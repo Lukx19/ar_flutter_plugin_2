@@ -126,9 +126,17 @@ internal data class AddressedCanonicalSurface(
     val surface: DepthCanonicalSurface,
 )
 
+/**
+ * One immutable canonical-cut version. Implementations publish and read this pair atomically.
+ * Both coordinates are monotonic, and every visible canonical mutation advances at least one.
+ */
+internal data class CanonicalRevisionPair(
+    val geometryRevision: Long,
+    val lineageRevision: Long,
+)
+
 internal interface BoundedCanonicalSurfaceView {
-    val geometryRevision: Long
-    val lineageRevision: Long
+    val revisionPair: CanonicalRevisionPair
     val surfaceCount: Int
 
     /** Returns only a directly addressed row; implementations must not enumerate rows. */

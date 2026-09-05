@@ -114,8 +114,13 @@ internal class DepthEvidenceKernel(
             !isAffine(batch.groupFromCameraGl) ||
             activeFrame?.let { it != batch.groupFrame } == true
         ) return refused(DepthEvidenceRefusal.INVALID_FRAME)
-        if (surfaces.geometryRevision < 0L || surfaces.lineageRevision < 0L ||
-            surfaces.geometryRevision == Long.MAX_VALUE || surfaces.lineageRevision == Long.MAX_VALUE
+        val revisionPair = try {
+            surfaces.revisionPair
+        } catch (_: RuntimeException) {
+            return refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED)
+        }
+        if (revisionPair.geometryRevision < 0L || revisionPair.lineageRevision < 0L ||
+            revisionPair.geometryRevision == Long.MAX_VALUE || revisionPair.lineageRevision == Long.MAX_VALUE
         ) return refused(DepthEvidenceRefusal.STALE_CANONICAL_CUT)
         if (batch.samples.size > configuration.sampleCapacity) {
             return refused(DepthEvidenceRefusal.SAMPLE_CAPACITY)
@@ -132,7 +137,7 @@ internal class DepthEvidenceKernel(
         val cameraGroup = transform(batch.groupFromCameraGl, DepthPointMm(0.0, 0.0, 0.0))
             ?: return refused(DepthEvidenceRefusal.INVALID_FRAME)
         val staged = try {
-            stage(batch, surfaces, cameraGroup)
+            stage(batch, surfaces, cameraGroup, revisionPair)
         } catch (_: ArithmeticException) {
             return refused(DepthEvidenceRefusal.ARITHMETIC_OVERFLOW)
         } catch (_: DepthLookupFailure) {
@@ -147,6 +152,16 @@ internal class DepthEvidenceKernel(
         if (staged is Staged.Refused) return refused(staged.reason)
 
         val accepted = staged as Staged.Accepted
+        val revisionAfterPlanning = try {
+            surfaces.revisionPair
+        } catch (_: RuntimeException) {
+            resetStage()
+            return refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED)
+        }
+        if (revisionAfterPlanning != revisionPair) {
+            resetStage()
+            return refused(DepthEvidenceRefusal.STALE_CANONICAL_CUT)
+        }
         pending = Pending(accepted.result.receipt, stageCount, accepted.frame)
         return accepted.result
     }
@@ -259,6 +274,7 @@ internal class DepthEvidenceKernel(
         batch: DepthEvidenceBatch,
         surfaces: BoundedCanonicalSurfaceView,
         cameraGroup: DepthPointMm,
+        revisionPair: CanonicalRevisionPair,
     ): Staged {
         resetStage()
         var acceptedSamples = 0
@@ -420,8 +436,8 @@ internal class DepthEvidenceKernel(
         )
         return Staged.Accepted(
             DepthEvidenceResult.Accepted(
-                surfaces.geometryRevision,
-                surfaces.lineageRevision,
+                revisionPair.geometryRevision,
+                revisionPair.lineageRevision,
                 immutableChanges,
                 receipt,
                 work,

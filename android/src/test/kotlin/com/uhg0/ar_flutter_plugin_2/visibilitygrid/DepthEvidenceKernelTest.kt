@@ -1143,6 +1143,46 @@ class DepthEvidenceKernelTest {
         )
     }
 
+    @Test
+    fun `canonical cut change during addressed lookup cannot publish mixed evidence`() {
+        val kernel = DepthEvidenceKernel()
+        val view = RevisionMutatingCanonicalView(mutateDuringAddressLookup = true)
+
+        assertEquals(
+            DepthEvidenceResult.Refused(DepthEvidenceRefusal.STALE_CANONICAL_CUT, DepthEvidenceReceipt()),
+            kernel.prepare(depthBatchForFrame(1, frame(), identity()), view),
+        )
+        assertEquals(0, kernel.resourceReceipt().preparedEvidenceRows)
+        assertEquals(DepthEvidenceApplyResult.NoPrepared(DepthEvidenceReceipt()), kernel.applyPrepared())
+        assertEquals(
+            expectedAccepted(2, rayVisits = 11, virtualWork = 13, geometryRevision = 2, lineageRevision = 1),
+            kernel.prepare(depthBatchForFrame(2, frame(), identity()), view),
+        )
+    }
+
+    @Test
+    fun `canonical cut change during source lookup cannot publish mixed evidence`() {
+        val canonical = surface(41, Voxel(0, 0, -10))
+        val kernel = DepthEvidenceKernel()
+        val view = RevisionMutatingCanonicalView(canonical, mutateDuringSourceLookup = true)
+
+        assertEquals(
+            DepthEvidenceResult.Refused(DepthEvidenceRefusal.STALE_CANONICAL_CUT, DepthEvidenceReceipt()),
+            kernel.prepare(depthBatchForFrame(1, frame(), identity()), view),
+        )
+        assertEquals(0, kernel.resourceReceipt().preparedEvidenceRows)
+        assertEquals(DepthEvidenceApplyResult.NoPrepared(DepthEvidenceReceipt()), kernel.applyPrepared())
+    }
+
+    @Test
+    fun `stable canonical cut publishes its single atomic revision pair`() {
+        val view = RevisionMutatingCanonicalView(revision = CanonicalRevisionPair(7, 9))
+        val result = DepthEvidenceKernel().prepare(depthBatchForFrame(1, frame(), identity()), view)
+
+        assertEquals(expectedAccepted(1, rayVisits = 11, virtualWork = 13, geometryRevision = 7, lineageRevision = 9), result)
+        assertEquals(2, view.revisionReads)
+    }
+
     private fun batch(
         timestamp: Long,
         groupFrame: VisibilityGroupFrame,
@@ -1233,6 +1273,8 @@ class DepthEvidenceKernelTest {
             }
         },
         relationAdmissionWork: Int = relationCount,
+        geometryRevision: Long = 0,
+        lineageRevision: Long = 0,
     ): DepthEvidenceResult.Accepted {
         val positiveTargets = changes.sumOf { change ->
             when (change) {
@@ -1259,8 +1301,8 @@ class DepthEvidenceKernelTest {
                 18 * positiveSources + 2 * changes.size + 9 * removals
         val accountedWork = virtualWork + touchedRows * 24 + planningAndValidationWork
         return DepthEvidenceResult.Accepted(
-        expectedGeometryRevision = 0,
-        expectedLineageRevision = 0,
+        expectedGeometryRevision = geometryRevision,
+        expectedLineageRevision = lineageRevision,
         changes = changes,
         receipt = DepthEvidenceReceipt(
             sequence = sequence,
@@ -1390,8 +1432,7 @@ class DepthEvidenceKernelTest {
         private val addressedVoxelOverride: Voxel? = null,
         reportedSurfaceCount: Int? = null,
     ) : BoundedCanonicalSurfaceView {
-        override val geometryRevision: Long = 0
-        override val lineageRevision: Long = 0
+        override val revisionPair = CanonicalRevisionPair(0, 0)
         private var reportedCount: Int? = reportedSurfaceCount
         override val surfaceCount: Int get() = reportedCount ?: maxOf(surfaces.size, idLookup?.size ?: 0)
         override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? = if (idLookup != null) {
@@ -1411,5 +1452,38 @@ class DepthEvidenceKernelTest {
             reportedCount = count
         }
 
+    }
+
+    private class RevisionMutatingCanonicalView(
+        private val canonical: DepthCanonicalSurface? = null,
+        private val mutateDuringAddressLookup: Boolean = false,
+        private val mutateDuringSourceLookup: Boolean = false,
+        revision: CanonicalRevisionPair = CanonicalRevisionPair(1, 1),
+    ) : BoundedCanonicalSurfaceView {
+        private var currentRevision = revision
+        private var mutated = false
+        var revisionReads = 0
+            private set
+        override val revisionPair: CanonicalRevisionPair
+            get() {
+                revisionReads++
+                return currentRevision
+            }
+        override val surfaceCount: Int = if (canonical == null) 0 else 1
+
+        override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? {
+            if (mutateDuringSourceLookup && !mutated) advanceRevision()
+            return canonical?.takeIf { it.id == id }
+        }
+
+        override fun findSurfaceAt(voxel: Voxel): AddressedCanonicalSurface? {
+            if (mutateDuringAddressLookup && !mutated) advanceRevision()
+            return canonical?.let { AddressedCanonicalSurface(voxel, it) }
+        }
+
+        private fun advanceRevision() {
+            currentRevision = currentRevision.copy(geometryRevision = currentRevision.geometryRevision + 1)
+            mutated = true
+        }
     }
 }
