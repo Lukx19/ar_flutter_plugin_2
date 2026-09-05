@@ -206,6 +206,9 @@ internal class PreparedIntentStreamingVisitor(
                 supports == sources && header.targetLive == header.sourceCut.liveSurfaceCount + sources &&
                 header.targetSupport == header.sourceCut.supportCount + sources &&
                 header.targetLineage == header.sourceCut.lineageCount
+            PreparedMutationKind.DEPTH_BATCH ->
+                header.targetLive in (header.sourceCut.liveSurfaceCount - removed)..(header.sourceCut.liveSurfaceCount - removed + rows) &&
+                    header.targetLineage == header.sourceCut.lineageCount + lineage
             PreparedMutationKind.CREATE -> header.sourceCut.liveSurfaceCount == 0 && header.sourceCut.sourceCount == 0 && header.sourceCut.supportCount == 0 && header.sourceCut.lineageCount == 0 && removed == 0 && rows > 0 && supports == rows && sources == rows && lineage == 0 && header.targetLive == rows && header.targetSupport == rows && header.targetLineage == 0
             else -> rows > 0 && removed > 0 && lineage.toLong() == rows.toLong() * removed.toLong() && header.targetLive == header.sourceCut.liveSurfaceCount - removed + rows && header.targetLineage == header.sourceCut.lineageCount + lineage
         }

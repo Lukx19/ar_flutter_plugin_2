@@ -120,7 +120,7 @@ class PreparedIntentVisitorTest {
     }
 
     @Test
-    fun `all eight mutation kinds round trip exact typed records order and target cut`() {
+    fun `all mutation kinds round trip exact typed records order and target cut`() {
         val empty = scenarioView("all-kinds-empty")
         val rows = listOf(scenarioSurface(1, 0), scenarioSurface(2, 1), scenarioSurface(3, 2), scenarioSurface(4, 3))
         val sources = rows.map { scenarioSource(it.id.value, it.voxel.x) }
@@ -139,7 +139,13 @@ class PreparedIntentVisitorTest {
                 listOf(FeatureFusionChange.Upsert(FeatureFusionCandidate(
                     50, 0, 0, 2, 1,
                     listOf(FeatureNormalCandidate(50, 0, 0, FeatureNormalFace.PRIMARY, 0, 0, 191)),
-                ))),
+                    ))),
+            )),
+            active to prepare(active, CanonicalEvidenceBatchCommand(
+                "depth-batch", 7, 5,
+                listOf(DepthEvidenceChange.Relocate(
+                    SurfaceId(1), scenarioTarget(10, SurfaceId(1)),
+                )),
             )),
         )
         assertEquals(PreparedMutationKind.entries, cases.map { it.second.kind })
@@ -177,6 +183,76 @@ class PreparedIntentVisitorTest {
                     geometryCut.upserts.map { listOf(it.surfaceId, it.voxel.x.toLong(), it.voxel.y.toLong(), it.voxel.z.toLong(), it.packedNormal.toLong(), it.normalConfidence.toLong(), it.lineageCount.toLong()) },
                 )
             } finally { directory.deleteRecursively() }
+        }
+    }
+
+    @Test
+    fun `pure depth removal is structural and has no fabricated lineage edge`() {
+        val rows = listOf(scenarioSurface(1, 0), scenarioSurface(2, 1), scenarioSurface(3, 2))
+        val sources = rows.map { scenarioSource(it.id.value, it.voxel.x) }
+        val active = scenarioView(
+            "depth-remove", rows, geometry = 7, lineage = 5, high = 4,
+            sources = sources,
+            supports = rows.associate { row -> row.id.value to listOf(scenarioSource(row.id.value, row.voxel.x)) },
+        )
+        val plan = prepare(active, CanonicalEvidenceBatchCommand(
+            "depth-remove", 7, 5, listOf(DepthEvidenceChange.Remove(SurfaceId(1))),
+        ))
+        assertEquals(PreparedMutationKind.DEPTH_BATCH, plan.kind)
+        assertEquals(2, plan.targetLiveSurfaceCount)
+        assertEquals(3, plan.targetSourceCount)
+        assertEquals(2, plan.targetSupportCount)
+        assertEquals(0, plan.targetLineageCount)
+        assertEquals(8L, plan.targetGeometryRevision)
+        assertEquals(6L, plan.targetLineageRevision)
+        val removedIds = mutableListOf<Long>()
+        plan.visitRemovedSurfaceIds { removedIds += it.value; true }
+        assertEquals(listOf(1L), removedIds)
+        val lineageEdges = mutableListOf<LineageEdge>()
+        plan.visitDirtyLineage { lineageEdges += it; true }
+        assertTrue(lineageEdges.isEmpty())
+
+        val directory = Files.createTempDirectory("canonical-surface-depth-remove-").toFile()
+        try {
+            val prepared = intent(directory, active, plan)
+            val visitor = CountingVisitor()
+            assertTrue(prepared.visit(visitor) is PreparedIntentVisitResult.Complete)
+            assertEquals(1, visitor.removed)
+            assertEquals(0, visitor.lineage)
+        } finally {
+            directory.deleteRecursively()
+            plan.discard()
+        }
+    }
+
+    @Test
+    fun `depth refine current voxel survives WAL visitor without structural records`() {
+        val row = scenarioSurface(1, 0)
+        val source = scenarioSource(1, 0)
+        val active = scenarioView(
+            "depth-refine", listOf(row), geometry = 7, lineage = 5, high = 2,
+            sources = listOf(source), supports = mapOf(1L to listOf(source)),
+        )
+        val plan = prepare(active, CanonicalEvidenceBatchCommand(
+            "depth-refine", 7, 5,
+            listOf(DepthEvidenceChange.Refine(
+                SurfaceId(1), scenarioTarget(0, SurfaceId(1), confidence = 193),
+            )),
+        ))
+        val directory = Files.createTempDirectory("canonical-surface-depth-refine-").toFile()
+        try {
+            val prepared = intent(directory, active, plan)
+            val visitor = CountingVisitor()
+            assertTrue(prepared.visit(visitor) is PreparedIntentVisitResult.Complete)
+            assertEquals(1, visitor.rows)
+            assertEquals(0, visitor.removed)
+            assertEquals(0, visitor.supports)
+            assertEquals(0, visitor.sources)
+            assertEquals(0, visitor.lineage)
+            assertEquals(1, visitor.terminals)
+        } finally {
+            directory.deleteRecursively()
+            plan.discard()
         }
     }
 
@@ -323,6 +399,7 @@ class PreparedIntentVisitorTest {
             is FeatureMutationCommand -> SurfaceOwnership.prepareMutation(view, SurfaceOwnershipConfiguration(), command)
             is CanonicalTransactionCommand -> SurfaceOwnership.prepareMutation(view, SurfaceOwnershipConfiguration(), command)
             is CanonicalFeatureBatchCommand -> MutableCanonicalOverlay.prepare(view, SurfaceOwnershipConfiguration(), command)
+            is CanonicalEvidenceBatchCommand -> MutableCanonicalOverlay.prepare(view, SurfaceOwnershipConfiguration(), command)
             else -> error("unsupported command")
         }
         return (result as CanonicalMutationPreparation.Prepared).mutation

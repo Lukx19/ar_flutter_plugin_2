@@ -364,6 +364,15 @@ internal class SurfaceOwnership private constructor(
         MutableCanonicalOverlay.prepare(view, configuration, command), view,
     )
 
+    /** Public adjacent-authority seam for one immutable depth evidence batch. */
+    @Synchronized
+    internal fun prepareAdjacentMutation(
+        view: CanonicalStateView,
+        command: CanonicalEvidenceBatchCommand,
+    ): CanonicalMutationPreparation = bindAdjacentPreparation(
+        MutableCanonicalOverlay.prepare(view, configuration, command), view,
+    )
+
     private fun bindAdjacentPreparation(
         preparation: CanonicalMutationPreparation,
         view: CanonicalStateView,
