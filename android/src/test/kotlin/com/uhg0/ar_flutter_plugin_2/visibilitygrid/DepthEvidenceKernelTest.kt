@@ -1,10 +1,154 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DepthEvidenceKernelTest {
+    @Test
+    fun `canonical view traversal adapter matches kernel supercover and direct addresses`() {
+        val addressed = surface(7, Voxel(0, 0, -1))
+        val adapter = CanonicalSurfaceRayViewAdapter(
+            FakeCanonicalView(mapOf(addressed.voxel to addressed)),
+            frame(),
+        )
+        val visits = mutableListOf<Pair<Voxel, SurfaceId?>>()
+
+        val result = adapter.visitRayCells(
+            DepthPointMm(50.0, 50.0, 50.0),
+            DepthPointMm(50.0, 50.0, -250.0),
+            3,
+        ) { voxel, canonical -> visits += voxel to canonical?.id; true }
+
+        assertEquals(DepthRayVisitResult(3, truncated = true), result)
+        assertEquals(
+            listOf(
+                Voxel(0, 0, 0) to null,
+                Voxel(0, 0, -1) to SurfaceId(7),
+                Voxel(0, 0, -2) to null,
+            ),
+            visits,
+        )
+        val mismatched = CanonicalSurfaceRayViewAdapter(
+            FakeCanonicalView(mapOf(addressed.voxel to addressed), addressedVoxelOverride = Voxel(1, 0, -1)),
+            frame(),
+        )
+        assertThrows(IllegalArgumentException::class.java) {
+            mismatched.visitRayCells(
+                DepthPointMm(50.0, 50.0, -50.0), DepthPointMm(50.0, 50.0, -50.0), 1,
+            ) { _, _ -> true }
+        }
+    }
+
+    @Test
+    fun `prepare ignores canonical view traversal override`() {
+        val result = DepthEvidenceKernel().prepare(depthBatchForFrame(1, frame(), identity()), FakeCanonicalView())
+        assertEquals(expectedAccepted(1, rayVisits = 11, virtualWork = 13), result)
+    }
+
+    @Test
+    fun `concurrent preparations serialize and preserve the single prepared slot`() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val view = BlockingCanonicalView(entered, release)
+        val kernel = DepthEvidenceKernel()
+        val executor = Executors.newFixedThreadPool(3)
+        try {
+            val first = executor.submit<DepthEvidenceResult> {
+                kernel.prepare(depthBatchForFrame(1, frame(), identity()), view)
+            }
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            val second = executor.submit<DepthEvidenceResult> {
+                kernel.prepare(depthBatchForFrame(2, frame(), identity()), FakeCanonicalView())
+            }
+            val resource = executor.submit<DepthEvidenceResourceReceipt> { kernel.resourceReceipt() }
+            assertThrows(TimeoutException::class.java) { second.get(100, TimeUnit.MILLISECONDS) }
+            assertThrows(TimeoutException::class.java) { resource.get(100, TimeUnit.MILLISECONDS) }
+            release.countDown()
+            assertTrue(first.get(5, TimeUnit.SECONDS) is DepthEvidenceResult.Accepted)
+            assertEquals(
+                DepthEvidenceResult.Refused(
+                    DepthEvidenceRefusal.PREPARED_BUSY,
+                    DepthEvidenceReceipt(),
+                ),
+                second.get(5, TimeUnit.SECONDS),
+            )
+            assertEquals(1, resource.get(5, TimeUnit.SECONDS).preparedEvidenceRows)
+        } finally {
+            release.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `concurrent terminal lifecycle calls cannot double apply or expose torn resources`() {
+        repeat(20) { iteration ->
+            val kernel = DepthEvidenceKernel()
+            val prepared = kernel.prepare(depthBatchForFrame(iteration + 1L, frame(), identity()), FakeCanonicalView())
+            assertTrue(prepared is DepthEvidenceResult.Accepted)
+            val start = CountDownLatch(1)
+            val executor = Executors.newFixedThreadPool(4)
+            try {
+                val applies = List(2) { executor.submit<DepthEvidenceApplyResult> { start.await(); kernel.applyPrepared() } }
+                val discard = executor.submit<DepthEvidenceDiscardResult> { start.await(); kernel.discardPrepared() }
+                val close = executor.submit { start.await(); kernel.close() }
+                start.countDown()
+                val appliedCount = applies.count { it.get(5, TimeUnit.SECONDS) is DepthEvidenceApplyResult.Applied }
+                discard.get(5, TimeUnit.SECONDS)
+                close.get(5, TimeUnit.SECONDS)
+                assertTrue(appliedCount <= 1)
+                assertEquals(
+                    DepthEvidenceResourceReceipt(0, 0, 0, 0, 100_000, 0, true, 0, 0),
+                    kernel.resourceReceipt(),
+                )
+                kernel.close()
+            } finally {
+                executor.shutdownNow()
+            }
+        }
+    }
+
+    @Test
+    fun `every canonical view exception is typed and leaves preparation recoverable`() {
+        ThrowAccess.entries.forEach { access ->
+            val canonical = surface(71, Voxel(0, 0, -10))
+            val view = ThrowingCanonicalView(access, canonical.takeIf { access == ThrowAccess.SOURCE })
+            val kernel = DepthEvidenceKernel()
+
+            assertEquals(
+                DepthEvidenceResult.Refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED, DepthEvidenceReceipt()),
+                kernel.prepare(depthBatchForFrame(1, frame(), identity()), view),
+            )
+            assertEquals(0, kernel.resourceReceipt().preparedEvidenceRows)
+            assertTrue(kernel.prepare(depthBatchForFrame(2, frame(), identity()), view) is DepthEvidenceResult.Accepted)
+            kernel.discardPrepared()
+        }
+    }
+
+    @Test
+    fun `fatal canonical view errors are not converted into lookup refusals`() {
+        val fatal = object : BoundedCanonicalSurfaceView {
+            override val revisionPair: CanonicalRevisionPair get() = throw AssertionError("fatal")
+            override val surfaceCount: Int = 0
+            override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? = null
+            override fun findSurfaceAt(voxel: Voxel): AddressedCanonicalSurface? = null
+            override fun visitRayCells(
+                startGroupMm: DepthPointMm,
+                endpointGroupMm: DepthPointMm,
+                maximumVisits: Int,
+                visitor: (Voxel, DepthCanonicalSurface?) -> Boolean,
+            ): DepthRayVisitResult = error("prepare must own ray traversal")
+        }
+        assertThrows(AssertionError::class.java) {
+            DepthEvidenceKernel().prepare(depthBatchForFrame(1, frame(), identity()), fatal)
+        }
+    }
+
     @Test
     fun `kernel supercover visits axis diagonal corner and negative cells exactly`() {
         val kernel = DepthEvidenceKernel()
@@ -1444,6 +1588,13 @@ class DepthEvidenceKernelTest {
         override fun findSurfaceAt(voxel: Voxel): AddressedCanonicalSurface? =
             surfaces[voxel]?.let { AddressedCanonicalSurface(addressedVoxelOverride ?: voxel, it) }
 
+        override fun visitRayCells(
+            startGroupMm: DepthPointMm,
+            endpointGroupMm: DepthPointMm,
+            maximumVisits: Int,
+            visitor: (Voxel, DepthCanonicalSurface?) -> Boolean,
+        ): DepthRayVisitResult = error("prepare must own ray traversal")
+
         fun replaceSurfaces(replacement: Map<Voxel, DepthCanonicalSurface>) {
             surfaces = replacement
         }
@@ -1481,9 +1632,83 @@ class DepthEvidenceKernelTest {
             return canonical?.let { AddressedCanonicalSurface(voxel, it) }
         }
 
+        override fun visitRayCells(
+            startGroupMm: DepthPointMm,
+            endpointGroupMm: DepthPointMm,
+            maximumVisits: Int,
+            visitor: (Voxel, DepthCanonicalSurface?) -> Boolean,
+        ): DepthRayVisitResult = error("prepare must own ray traversal")
+
         private fun advanceRevision() {
             currentRevision = currentRevision.copy(geometryRevision = currentRevision.geometryRevision + 1)
             mutated = true
+        }
+    }
+
+    private class BlockingCanonicalView(
+        private val entered: CountDownLatch,
+        private val release: CountDownLatch,
+    ) : BoundedCanonicalSurfaceView {
+        private var blocked = false
+        override val revisionPair: CanonicalRevisionPair
+            get() {
+                if (!blocked) {
+                    blocked = true
+                    entered.countDown()
+                    check(release.await(5, TimeUnit.SECONDS))
+                }
+                return CanonicalRevisionPair(0, 0)
+            }
+        override val surfaceCount: Int = 0
+        override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? = null
+        override fun findSurfaceAt(voxel: Voxel): AddressedCanonicalSurface? = null
+        override fun visitRayCells(
+            startGroupMm: DepthPointMm,
+            endpointGroupMm: DepthPointMm,
+            maximumVisits: Int,
+            visitor: (Voxel, DepthCanonicalSurface?) -> Boolean,
+        ): DepthRayVisitResult = error("prepare must own ray traversal")
+    }
+
+    private enum class ThrowAccess { INITIAL_REVISION, FINAL_REVISION, SURFACE_COUNT, ADDRESS, SOURCE }
+
+    private class ThrowingCanonicalView(
+        private val access: ThrowAccess,
+        private val canonical: DepthCanonicalSurface?,
+    ) : BoundedCanonicalSurfaceView {
+        private var thrown = false
+        private var revisionReads = 0
+        override val revisionPair: CanonicalRevisionPair
+            get() {
+                revisionReads++
+                if (!thrown && (access == ThrowAccess.INITIAL_REVISION ||
+                        access == ThrowAccess.FINAL_REVISION && revisionReads == 2)
+                ) fail()
+                return CanonicalRevisionPair(0, 0)
+            }
+        override val surfaceCount: Int
+            get() {
+                if (!thrown && access == ThrowAccess.SURFACE_COUNT) fail()
+                return if (canonical == null) 0 else 1
+            }
+        override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? {
+            if (!thrown && access == ThrowAccess.SOURCE) fail()
+            return canonical?.takeIf { it.id == id }
+        }
+        override fun findSurfaceAt(voxel: Voxel): AddressedCanonicalSurface? {
+            if (!thrown && access == ThrowAccess.ADDRESS) fail()
+            return canonical?.let { AddressedCanonicalSurface(voxel, it) }
+        }
+        override fun visitRayCells(
+            startGroupMm: DepthPointMm,
+            endpointGroupMm: DepthPointMm,
+            maximumVisits: Int,
+            visitor: (Voxel, DepthCanonicalSurface?) -> Boolean,
+        ): DepthRayVisitResult = error("prepare must own ray traversal")
+
+        private fun fail(): Nothing {
+            thrown = true
+            throw IllegalStateException("invalidated canonical view")
         }
     }
 }

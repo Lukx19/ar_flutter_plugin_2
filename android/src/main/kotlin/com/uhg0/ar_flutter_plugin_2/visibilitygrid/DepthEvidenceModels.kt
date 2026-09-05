@@ -143,6 +143,13 @@ internal interface BoundedCanonicalSurfaceView {
     fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface?
 
     fun findSurfaceAt(voxel: Voxel): AddressedCanonicalSurface?
+
+    fun visitRayCells(
+        startGroupMm: DepthPointMm,
+        endpointGroupMm: DepthPointMm,
+        maximumVisits: Int,
+        visitor: (Voxel, DepthCanonicalSurface?) -> Boolean,
+    ): DepthRayVisitResult
 }
 
 internal sealed interface DepthEvidenceChange {

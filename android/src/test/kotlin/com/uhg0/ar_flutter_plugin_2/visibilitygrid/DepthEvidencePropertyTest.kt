@@ -580,6 +580,12 @@ class DepthEvidencePropertyTest {
                 val surface = if (endpointLookups++ == 0) second else third
                 return AddressedCanonicalSurface(voxel, surface)
             }
+            override fun visitRayCells(
+                startGroupMm: DepthPointMm,
+                endpointGroupMm: DepthPointMm,
+                maximumVisits: Int,
+                visitor: (Voxel, DepthCanonicalSurface?) -> Boolean,
+            ): DepthRayVisitResult = error("prepare must own ray traversal")
         }
         val duplicateSamples = DepthEvidenceBatch(
             2, 2, frame(), identity(), intrinsics(), listOf(sample(), sample()), 0,
@@ -784,6 +790,12 @@ class DepthEvidencePropertyTest {
         override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? = surface?.takeIf { it.id == id }
         override fun findSurfaceAt(voxel: Voxel): AddressedCanonicalSurface? =
             surface?.takeIf { it.voxel == voxel }?.let { AddressedCanonicalSurface(voxel, it) }
+        override fun visitRayCells(
+            startGroupMm: DepthPointMm,
+            endpointGroupMm: DepthPointMm,
+            maximumVisits: Int,
+            visitor: (Voxel, DepthCanonicalSurface?) -> Boolean,
+        ): DepthRayVisitResult = error("prepare must own ray traversal")
     }
 
     private class MaximumRayView(
@@ -801,6 +813,12 @@ class DepthEvidencePropertyTest {
                 addressedSurfaceReturns++
                 AddressedCanonicalSurface(voxel, it)
             }
+        override fun visitRayCells(
+            startGroupMm: DepthPointMm,
+            endpointGroupMm: DepthPointMm,
+            maximumVisits: Int,
+            visitor: (Voxel, DepthCanonicalSurface?) -> Boolean,
+        ): DepthRayVisitResult = error("prepare must own ray traversal")
 
         fun replaceSurfaces(
             replacement: Map<Voxel, DepthCanonicalSurface>,

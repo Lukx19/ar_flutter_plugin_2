@@ -103,7 +103,15 @@ internal class DepthEvidenceKernel(
     }
 
     /** Stages one batch without changing retained evidence. */
-    fun prepare(batch: DepthEvidenceBatch, surfaces: BoundedCanonicalSurfaceView): DepthEvidenceResult {
+    @Synchronized
+    fun prepare(batch: DepthEvidenceBatch, surfaces: BoundedCanonicalSurfaceView): DepthEvidenceResult = try {
+        prepareLocked(batch, surfaces)
+    } catch (_: DepthLookupFailure) {
+        resetStage()
+        refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED)
+    }
+
+    private fun prepareLocked(batch: DepthEvidenceBatch, surfaces: BoundedCanonicalSurfaceView): DepthEvidenceResult {
         if (closed) return refused(DepthEvidenceRefusal.CLOSED)
         if (pending != null) return refused(DepthEvidenceRefusal.PREPARED_BUSY)
         if (!batch.tracking) return refused(DepthEvidenceRefusal.NOT_TRACKING)
@@ -114,11 +122,7 @@ internal class DepthEvidenceKernel(
             !isAffine(batch.groupFromCameraGl) ||
             activeFrame?.let { it != batch.groupFrame } == true
         ) return refused(DepthEvidenceRefusal.INVALID_FRAME)
-        val revisionPair = try {
-            surfaces.revisionPair
-        } catch (_: RuntimeException) {
-            return refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED)
-        }
+        val revisionPair = canonicalAccess { surfaces.revisionPair }
         if (revisionPair.geometryRevision < 0L || revisionPair.lineageRevision < 0L ||
             revisionPair.geometryRevision == Long.MAX_VALUE || revisionPair.lineageRevision == Long.MAX_VALUE
         ) return refused(DepthEvidenceRefusal.STALE_CANONICAL_CUT)
@@ -126,7 +130,7 @@ internal class DepthEvidenceKernel(
             return refused(DepthEvidenceRefusal.SAMPLE_CAPACITY)
         }
         val surfaceCapacity = minOf(configuration.surfaceCapacity, batch.groupFrame.modelCapacity)
-        if (batch.sourceRejectedSamples < 0 || surfaces.surfaceCount !in 0..surfaceCapacity) {
+        if (batch.sourceRejectedSamples < 0 || canonicalAccess { surfaces.surfaceCount } !in 0..surfaceCapacity) {
             return refused(if (batch.sourceRejectedSamples < 0) {
                 DepthEvidenceRefusal.INVALID_SAMPLE
             } else {
@@ -140,8 +144,6 @@ internal class DepthEvidenceKernel(
             stage(batch, surfaces, cameraGroup, revisionPair)
         } catch (_: ArithmeticException) {
             return refused(DepthEvidenceRefusal.ARITHMETIC_OVERFLOW)
-        } catch (_: DepthLookupFailure) {
-            return refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED)
         } catch (_: DuplicateTargetFailure) {
             return refused(DepthEvidenceRefusal.DUPLICATE_TARGET)
         } catch (_: SourceOverlapFailure) {
@@ -152,12 +154,7 @@ internal class DepthEvidenceKernel(
         if (staged is Staged.Refused) return refused(staged.reason)
 
         val accepted = staged as Staged.Accepted
-        val revisionAfterPlanning = try {
-            surfaces.revisionPair
-        } catch (_: RuntimeException) {
-            resetStage()
-            return refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED)
-        }
+        val revisionAfterPlanning = canonicalAccess { surfaces.revisionPair }
         if (revisionAfterPlanning != revisionPair) {
             resetStage()
             return refused(DepthEvidenceRefusal.STALE_CANONICAL_CUT)
@@ -167,6 +164,7 @@ internal class DepthEvidenceKernel(
     }
 
     /** Installs the previously staged primitive evidence exactly once. */
+    @Synchronized
     fun applyPrepared(): DepthEvidenceApplyResult {
         if (closed) return DepthEvidenceApplyResult.NoPrepared(lastReceipt)
         val staged = pending ?: return DepthEvidenceApplyResult.NoPrepared(lastReceipt)
@@ -190,6 +188,7 @@ internal class DepthEvidenceKernel(
     }
 
     /** Drops the staged packet and leaves all retained primitive state untouched. */
+    @Synchronized
     fun discardPrepared(): DepthEvidenceDiscardResult {
         if (closed) return DepthEvidenceDiscardResult.AlreadyDiscarded(lastReceipt)
         if (pending == null) return DepthEvidenceDiscardResult.AlreadyDiscarded(lastReceipt)
@@ -199,6 +198,7 @@ internal class DepthEvidenceKernel(
     }
 
     /** Reports exact resident/staged row ownership; observation payloads are never retained. */
+    @Synchronized
     fun resourceReceipt(): DepthEvidenceResourceReceipt {
         val preparedRows = pending?.stageCount ?: 0
         val residentBytes = checkedBytes(residentRows)
@@ -216,6 +216,7 @@ internal class DepthEvidenceKernel(
         )
     }
 
+    @Synchronized
     override fun close() {
         if (closed) return
         pending = null
@@ -304,13 +305,7 @@ internal class DepthEvidenceKernel(
                 ?: throw ArithmeticException("non-finite depth transform")
             val endpointVoxel = quantize(endpoint, batch.groupFrame)
                 ?: return Staged.Refused(DepthEvidenceRefusal.ARITHMETIC_OVERFLOW)
-            val endpointLookup = try {
-                surfaces.findSurfaceAt(endpointVoxel)
-            } catch (failure: DuplicateTargetFailure) {
-                throw failure
-            } catch (_: RuntimeException) {
-                throw DepthLookupFailure()
-            }
+            val endpointLookup = canonicalAccess { surfaces.findSurfaceAt(endpointVoxel) }
             if (endpointLookup != null) validateCanonicalSurface(surfaces, endpointVoxel, endpointLookup)
             val endpointSurface = endpointLookup?.surface
             val priorEndpointIndex = stageFind(endpointVoxel)
@@ -327,7 +322,7 @@ internal class DepthEvidenceKernel(
             if (remaining < 0) return Staged.Refused(DepthEvidenceRefusal.RAY_VISIT_CAPACITY)
             try {
                 rayResult = visitRayCells(cameraGroup, endpoint, batch.groupFrame, remaining) { voxel ->
-                    val lookup = if (voxel == endpointVoxel) endpointLookup else surfaces.findSurfaceAt(voxel)
+                    val lookup = if (voxel == endpointVoxel) endpointLookup else canonicalAccess { surfaces.findSurfaceAt(voxel) }
                     if (!voxelInRange(voxel)) return@visitRayCells false
                     if (lookup != null) validateCanonicalSurface(surfaces, voxel, lookup)
                     val surface = lookup?.surface
@@ -392,7 +387,7 @@ internal class DepthEvidenceKernel(
         for (index in 0 until stageCount) {
             if (findRow(stageX[index], stageY[index], stageZ[index]) == EMPTY_ROW) newRows++
         }
-        val projection = projectedSurfaceCount(surfaces.surfaceCount)
+        val projection = projectedSurfaceCount(canonicalAccess { surfaces.surfaceCount })
         if (projection.count < 0) throw DepthLookupFailure()
         if (residentRows + newRows > minOf(configuration.surfaceCapacity, batch.groupFrame.modelCapacity) ||
             projection.count > minOf(configuration.surfaceCapacity, batch.groupFrame.modelCapacity)
@@ -534,7 +529,7 @@ internal class DepthEvidenceKernel(
             relationPosition = end
         }
         stageOrderedSourceCount = sourceWrite
-        work = checkedAdd(work, validateRemovalSourcesAgainstPositiveSources(surfaces.surfaceCount))
+        work = checkedAdd(work, validateRemovalSourcesAgainstPositiveSources(canonicalAccess { surfaces.surfaceCount }))
         work = checkedAdd(work, radixSortImplicitRelations(0, stageOrderedSourceCount) { relation ->
             stageComponentRank[findComponent(implicitRelationTarget(relation))]
         })
@@ -836,75 +831,9 @@ internal class DepthEvidenceKernel(
         frame: VisibilityGroupFrame,
         maximumVisits: Int,
         visitor: (Voxel) -> Boolean,
-    ): DepthRayVisitResult {
-        if (maximumVisits !in 0..65_536 || !camera.isFinite() || !endpoint.isFinite()) {
-            return DepthRayVisitResult(0, arithmeticOverflow = true)
-        }
-        val start = quantize(camera, frame)
-            ?: return DepthRayVisitResult(0, arithmeticOverflow = true)
-        val end = quantize(endpoint, frame)
-            ?: return DepthRayVisitResult(0, arithmeticOverflow = true)
-        val size = frame.voxelSizeMicrometres.toDouble() / 1_000.0
-        val delta = doubleArrayOf(endpoint.x - camera.x, endpoint.y - camera.y, endpoint.z - camera.z)
-        if (!size.isFinite() || size <= 0.0 || delta.any { !it.isFinite() }) {
-            return DepthRayVisitResult(0, arithmeticOverflow = true)
-        }
-        val current = intArrayOf(start.x, start.y, start.z)
-        val target = intArrayOf(end.x, end.y, end.z)
-        val step = IntArray(3) { axis -> delta[axis].compareTo(0.0) }
-        val startPoint = doubleArrayOf(camera.x, camera.y, camera.z)
-        val tDelta = DoubleArray(3) { axis ->
-            if (step[axis] == 0) Double.POSITIVE_INFINITY else size / kotlin.math.abs(delta[axis])
-        }
-        val tMax = DoubleArray(3) { axis ->
-            if (step[axis] == 0) {
-                Double.POSITIVE_INFINITY
-            } else {
-                val boundary = (current[axis] + if (step[axis] > 0) 1 else 0) * size
-                (boundary - startPoint[axis]) / delta[axis]
-            }
-        }
-        var visited = 0
-        fun emit(voxel: Voxel): Boolean {
-            if (visited >= maximumVisits) return false
-            visited = Math.addExact(visited, 1)
-            return visitor(voxel)
-        }
-        try {
-            if (!emit(start)) return DepthRayVisitResult(visited)
-            while (!current.contentEquals(target)) {
-                val crossing = (0..2)
-                    .asSequence()
-                    .filter { current[it] != target[it] }
-                    .minOfOrNull { tMax[it] }
-                    ?: return DepthRayVisitResult(visited, arithmeticOverflow = true)
-                if (!crossing.isFinite()) return DepthRayVisitResult(visited, arithmeticOverflow = true)
-                var tiedMask = 0
-                for (axis in 0..2) {
-                    if (current[axis] != target[axis] && tMax[axis] == crossing) {
-                        tiedMask = tiedMask or (1 shl axis)
-                    }
-                }
-                for (subset in 1..7) {
-                    if (subset and tiedMask != subset) continue
-                    val next = current.copyOf()
-                    for (axis in 0..2) if (subset and (1 shl axis) != 0) {
-                        next[axis] = Math.addExact(next[axis], step[axis])
-                    }
-                    val voxel = Voxel(next[0], next[1], next[2])
-                    if (!voxelInRange(voxel)) return DepthRayVisitResult(visited, arithmeticOverflow = true)
-                    if (!emit(voxel)) return DepthRayVisitResult(visited, truncated = true)
-                }
-                for (axis in 0..2) if (tiedMask and (1 shl axis) != 0) {
-                    current[axis] = Math.addExact(current[axis], step[axis])
-                    tMax[axis] += tDelta[axis]
-                }
-            }
-        } catch (_: ArithmeticException) {
-            return DepthRayVisitResult(visited, arithmeticOverflow = true)
-        }
-        return DepthRayVisitResult(visited)
-    }
+    ): DepthRayVisitResult = DepthRaySupercover.visit(
+        camera, endpoint, frame.voxelSizeMicrometres, maximumVisits, visitor,
+    )
 
     private fun isFreeEvidence(
         camera: DepthPointMm,
@@ -968,19 +897,15 @@ internal class DepthEvidenceKernel(
         lookup: AddressedCanonicalSurface,
     ) {
         if (lookup.addressedVoxel != addressedVoxel) throw DepthLookupFailure()
-        if (surfaces.surfaceCount == 0) throw DepthLookupFailure()
+        if (canonicalAccess { surfaces.surfaceCount } == 0) throw DepthLookupFailure()
         val surface = lookup.surface
-        val canonical = surfaces.findSurfaceById(surface.id) ?: throw DepthLookupFailure()
+        val canonical = canonicalAccess { surfaces.findSurfaceById(surface.id) } ?: throw DepthLookupFailure()
         if (canonical.id != surface.id || !voxelInRange(surface.voxel)) throw DepthLookupFailure()
         if (canonical.voxel != surface.voxel) throw DuplicateTargetFailure()
     }
 
     private fun validateEmittedSource(surfaces: BoundedCanonicalSurfaceView, sourceId: Long) {
-        val canonical = try {
-            surfaces.findSurfaceById(SurfaceId(sourceId))
-        } catch (_: RuntimeException) {
-            throw DepthLookupFailure()
-        } ?: throw DepthLookupFailure()
+        val canonical = canonicalAccess { surfaces.findSurfaceById(SurfaceId(sourceId)) } ?: throw DepthLookupFailure()
         if (canonical.id.value != sourceId || !voxelInRange(canonical.voxel)) throw DepthLookupFailure()
     }
 
@@ -1456,6 +1381,12 @@ internal class DepthEvidenceKernel(
     private fun checkedAdd(left: Int, right: Int): Int = Math.addExact(left, right)
 
     private fun checkedBytes(rows: Int): Int = Math.multiplyExact(rows, EVIDENCE_BYTES)
+
+    private inline fun <T> canonicalAccess(access: () -> T): T = try {
+        access()
+    } catch (_: Exception) {
+        throw DepthLookupFailure()
+    }
 
     private fun stageOccupiedValue(index: Int): Int = stageOccupied[index].toInt() and 0xff
 

@@ -859,6 +859,12 @@ class VisibilityGridFixtureContractTest {
         override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? = if (missingIds) null else byId[id]
         override fun findSurfaceAt(voxel: Voxel): AddressedCanonicalSurface? =
             surfaces[voxel]?.let { AddressedCanonicalSurface(voxel, it) }
+        override fun visitRayCells(
+            startGroupMm: DepthPointMm,
+            endpointGroupMm: DepthPointMm,
+            maximumVisits: Int,
+            visitor: (Voxel, DepthCanonicalSurface?) -> Boolean,
+        ): DepthRayVisitResult = error("prepare must own ray traversal")
 
         fun replaceAddresses(addresses: kotlinx.serialization.json.JsonArray) {
             surfaces = addresses.associate { value ->
