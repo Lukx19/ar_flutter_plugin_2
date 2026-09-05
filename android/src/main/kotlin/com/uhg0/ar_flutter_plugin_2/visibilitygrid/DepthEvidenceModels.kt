@@ -162,7 +162,10 @@ internal sealed interface DepthEvidenceChange {
     data class Remove(val sourceId: SurfaceId) : DepthEvidenceChange
 }
 
-/** Scalar receipt for one accepted or previously committed batch. */
+/**
+ * Scalar receipt for one batch attempt, whether accepted or refused. An applied
+ * accepted receipt is also retained as the kernel's last committed receipt.
+ */
 internal data class DepthEvidenceReceipt(
     val sequence: Long = 0,
     val sourceTimestampNs: Long = 0,
