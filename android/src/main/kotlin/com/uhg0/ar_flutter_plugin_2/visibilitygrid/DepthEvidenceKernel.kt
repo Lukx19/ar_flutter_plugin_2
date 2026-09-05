@@ -1295,9 +1295,6 @@ internal class DepthEvidenceKernel(
         batch: DepthEvidenceBatch,
         attempt: DepthEvidenceReceipt? = null,
     ): DepthEvidenceResult.Refused {
-        if (reason == DepthEvidenceRefusal.CLOSED || reason == DepthEvidenceRefusal.PREPARED_BUSY) {
-            return DepthEvidenceResult.Refused(reason, lastReceipt)
-        }
         val base = attempt ?: DepthEvidenceReceipt(
             sequence = batch.sequence,
             sourceTimestampNs = batch.sourceTimestampNs,

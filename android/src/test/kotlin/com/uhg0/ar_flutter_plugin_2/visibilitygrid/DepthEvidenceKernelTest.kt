@@ -74,7 +74,7 @@ class DepthEvidenceKernelTest {
             assertEquals(
                 DepthEvidenceResult.Refused(
                     DepthEvidenceRefusal.PREPARED_BUSY,
-                    DepthEvidenceReceipt(),
+                    attemptReceipt(2),
                 ),
                 second.get(5, TimeUnit.SECONDS),
             )
@@ -1293,24 +1293,17 @@ class DepthEvidenceKernelTest {
         val before = kernel.resourceReceipt()
         val refusal = kernel.prepare(valid.copyWithTimestamp(5), view)
         assertEquals(expectedAccepted(5, rayVisits = 11, virtualWork = 13), refusal)
-        val committedReceipt = expectedAccepted(
-            4,
-            changes = listOf(DepthEvidenceChange.Create(
-                canonicalTarget(null, Voxel(0, 0, -10), 0, 0, 255),
-            )),
-            createCount = 1,
-            rayVisits = 11,
-            virtualWork = 13,
-        ).receipt
         assertEquals(
-            DepthEvidenceResult.Refused(DepthEvidenceRefusal.PREPARED_BUSY, committedReceipt),
+            DepthEvidenceResult.Refused(DepthEvidenceRefusal.PREPARED_BUSY, attemptReceipt(6)),
             kernel.prepare(valid.copyWithTimestamp(6), view),
         )
         assertEquals(
-            DepthEvidenceResult.Refused(DepthEvidenceRefusal.PREPARED_BUSY, committedReceipt),
+            DepthEvidenceResult.Refused(DepthEvidenceRefusal.PREPARED_BUSY, attemptReceipt(7)),
             kernel.prepare(valid.copyWithTimestamp(7), view),
         )
-        kernel.discardPrepared()
+        val pendingReceipt = (refusal as DepthEvidenceResult.Accepted).receipt
+        assertEquals(DepthEvidenceApplyResult.Applied(pendingReceipt), kernel.applyPrepared())
+        assertEquals(DepthEvidenceApplyResult.NoPrepared(pendingReceipt), kernel.applyPrepared())
         assertEquals(before, kernel.resourceReceipt())
 
         val invalid = valid.copyWithTimestamp(8).withSamples(listOf(VisibilityDepthSample(0, 0, 1, 255)))
@@ -1331,10 +1324,13 @@ class DepthEvidenceKernelTest {
         assertEquals(closed, kernel.resourceReceipt())
         kernel.close()
         assertEquals(closed, kernel.resourceReceipt())
+        val committed = expectedAccepted(1, rayVisits = 11, virtualWork = 13).receipt
         assertEquals(
-            DepthEvidenceResult.Refused(DepthEvidenceRefusal.CLOSED, expectedAccepted(1, rayVisits = 11, virtualWork = 13).receipt),
+            DepthEvidenceResult.Refused(DepthEvidenceRefusal.CLOSED, attemptReceipt(2)),
             kernel.prepare(depthBatch(2, 0.05, 0.05), view),
         )
+        assertEquals(closed, kernel.resourceReceipt())
+        assertEquals(DepthEvidenceApplyResult.NoPrepared(committed), kernel.applyPrepared())
     }
 
     @Test
