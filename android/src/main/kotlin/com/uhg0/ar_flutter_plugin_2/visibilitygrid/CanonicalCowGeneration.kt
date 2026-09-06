@@ -46,7 +46,7 @@ internal class CanonicalCowGeneration private constructor(
     private val entries: List<CowDirectoryEntry>,
     private var storage: CowStorageReceipt,
 ) : AutoCloseable {
-    private val entryIndex = CowDirectoryIndex(entries)
+    private var entryIndex: CowDirectoryIndex? = CowDirectoryIndex(entries)
     private var closed = false
     private var cowPagesRead = 0L
     private var cowRecordsInspected = 0L
@@ -57,23 +57,28 @@ internal class CanonicalCowGeneration private constructor(
     override fun close() {
         if (!closed) {
             closed = true
-            entryIndex.close()
+            entryIndex?.close()
+            entryIndex = null
         }
     }
 
     @Synchronized
     fun storageReceipt() = storage.copy(
-        indexRetainedBytes = if (closed) 0L else entryIndex.memoryReceipt.retainedBytes,
+        indexRetainedBytes = if (closed) 0L else entryIndex?.memoryReceipt?.retainedBytes ?: 0L,
     )
 
     @Synchronized
     fun readWorkReceipt() = CowReadWork(cowPagesRead, cowRecordsInspected, cowHashesValidated, cowBytesRead)
 
     @Synchronized
-    internal fun matchingPageCount(kind: CowFragmentKind, key: Long): Long = entryIndex.matchingPageCount(kind, key)
+    internal fun matchingPageCount(kind: CowFragmentKind, key: Long): Long = entryIndex?.matchingPageCount(kind, key) ?: 0L
 
     @Synchronized
-    internal fun pageCount(kind: CowFragmentKind): Long = entryIndex.pageCount(kind)
+    internal fun pageCount(kind: CowFragmentKind): Long = entryIndex?.pageCount(kind) ?: 0L
+
+    /** Internal lifecycle seam: a closed generation owns no directory index arrays or object. */
+    @Synchronized
+    internal fun directoryIndexRetained(): Boolean = entryIndex != null
     @Synchronized
     internal fun withAllocatedStorage(bytes: Long): CanonicalCowGeneration {
         check(!closed)
@@ -122,7 +127,8 @@ internal class CanonicalCowGeneration private constructor(
     @Synchronized
     private fun records(kind: CowFragmentKind, sink: (CowRecord) -> Boolean): Boolean {
         if (closed) return false
-        return entryIndex.entries(kind).asSequence().all { entry ->
+        val index = entryIndex ?: return false
+        return index.entries(kind).asSequence().all { entry ->
             val file = File(directory, entry.file)
             readPage(file, entry, sink)
         }
@@ -131,7 +137,8 @@ internal class CanonicalCowGeneration private constructor(
     @Synchronized
     private fun records(kind: CowFragmentKind, key: Long, sink: (CowRecord) -> Boolean): Boolean {
         if (closed) return false
-        return entryIndex.forEachMatching(kind, key) { entry ->
+        val index = entryIndex ?: return false
+        return index.forEachMatching(kind, key) { entry ->
             readPage(File(directory, entry.file), entry, sink)
         }
     }
@@ -236,10 +243,11 @@ internal class CanonicalCowGeneration private constructor(
         if (maximumPageReads < 0L || maximumBytesRead < 0L) {
             return CowBoundedVisitResult.Limit(CanonicalReadWork.ZERO)
         }
+        val index = entryIndex ?: return CowBoundedVisitResult.Corrupt(CanonicalReadWork.ZERO)
         val before = readWorkReceipt()
         var status = CowPageVisitStatus.VALID_COMPLETE
         var limit = false
-        entryIndex.forEachMatching(kind, key) { entry ->
+        index.forEachMatching(kind, key) { entry ->
             val consumed = readWorkReceipt() - before
             if (consumed.pages < 0L || consumed.bytes < 0L) {
                 status = CowPageVisitStatus.CORRUPT
@@ -264,7 +272,7 @@ internal class CanonicalCowGeneration private constructor(
     }
 
     @Synchronized
-    internal fun has(kind: CowFragmentKind, key: Long) = !closed && entryIndex.matchingPageCount(kind, key) > 0L
+    internal fun has(kind: CowFragmentKind, key: Long) = !closed && (entryIndex?.matchingPageCount(kind, key) ?: 0L) > 0L
 
     @Synchronized
     internal fun indexes(kind: CowFragmentKind, key: Long): CowLookup<CowRecord.Index> {

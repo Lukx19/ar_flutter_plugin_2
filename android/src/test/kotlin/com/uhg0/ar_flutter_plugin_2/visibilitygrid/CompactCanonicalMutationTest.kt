@@ -450,6 +450,7 @@ class CompactCanonicalMutationTest {
             assertTrue("phase includes index construction=$phase", phase.phasePeakBytes > phase.indexConstructionPeakBytes)
             assertTrue("maximum admitted dirty phase=$phase", phase.phasePeakBytes <= 1_048_576L)
             val retainedIndexBytes = phase.indexRetainedBytes
+            assertTrue(large.directoryIndexRetained())
             assertSame(large, large.withAllocatedStorage(phase.allocatedBytes))
             assertEquals(retainedIndexBytes, large.storageReceipt().indexRetainedBytes)
             fun receipt(base: TestView, generation: CanonicalCowGeneration): CowReadWork {
@@ -465,6 +466,7 @@ class CompactCanonicalMutationTest {
             assertEquals(4, largeWork.pages)
             assertTrue(largeWork.records <= 2_200)
             large.close()
+            assertFalse(large.directoryIndexRetained())
             assertEquals(0L, large.storageReceipt().indexRetainedBytes)
         } finally { directory.deleteRecursively() }
     }
