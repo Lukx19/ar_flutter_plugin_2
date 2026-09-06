@@ -4,6 +4,7 @@ import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineAuthorit
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlCodec
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlOperation
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlRequest
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaReceiptV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.PacketCodec
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.StartRequestCodecV2
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.TransactionResponseProfileV1
@@ -215,6 +216,145 @@ class VisibilityGridIntegrationTest {
             exchange(messenger, viewId, stream, 6, 1, 1, 1)
             exchange(messenger, viewId, stream, 7, 2, 2, 1)
             await { integration.integrationReceipt().status == "acknowledged" }
+        } finally {
+            integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `depth queue boundary reuses exact current and cut without reapplying evidence`() {
+        val directory = Files.createTempDirectory("canonical-surface-runtime-depth-queue-boundary").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val viewId = 2135
+        val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+        lateinit var depthKernel: DepthEvidenceKernel
+        lateinit var featureKernel: FeatureFusionKernel
+        val queuedReceipts = mutableListOf<CurrentDeltaReceiptV1>()
+        val projected = mutableListOf<CommittedGeometryCut>()
+        var throwAfterExactQueue = true
+        val integration = VisibilityGridIntegration(
+            binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = resources(directory, coordinator),
+            depthKernelFactory = {
+                DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 1)).also { depthKernel = it }
+            },
+            featureKernelFactory = { FeatureFusionKernel().also { featureKernel = it } },
+            queueCurrent = { activeBinding, source, selector ->
+                queuedReceipts += requireNotNull(source.selectCurrentDelta(selector))
+                val result = activeBinding.queueCommittedCurrentDelta(source, selector)
+                if (throwAfterExactQueue) {
+                    throwAfterExactQueue = false
+                    throw IllegalStateException("injected lost queue acknowledgement")
+                }
+                result
+            },
+            renderer = object : CommittedRendererProjection {
+                override fun applyGeometry(cut: CommittedGeometryCut): RendererProjectionResult {
+                    projected += cut
+                    return RendererProjectionResult.Applied(cut.upserts.size)
+                }
+            },
+        )
+        try {
+            val stream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            val cut = requireNotNull(binding.currentObservationOwnership())
+
+            integration.admitDepth(depth(cut, 10))
+            assertEquals("publicationRetryPending", integration.integrationReceipt().status)
+            assertTrue(projected.isEmpty())
+            assertEquals(1L, integration.snapshot().admittedDepths)
+            val depthAfterCommit = depthKernel.resourceReceipt()
+            val featureAfterCommit = featureKernel.resourceReceipt()
+            val retainedCut = requireNotNull(integration.pendingPublicationGeometryCut())
+
+            integration.admitDepth(depth(cut, 11))
+
+            assertEquals(2, queuedReceipts.size)
+            assertEquals(queuedReceipts[0].selector, queuedReceipts[1].selector)
+            assertEquals(queuedReceipts[0].baseGeometryRevision, queuedReceipts[1].baseGeometryRevision)
+            assertArrayEquals(queuedReceipts[0].bytes, queuedReceipts[1].bytes)
+            assertArrayEquals(queuedReceipts[0].commandHash, queuedReceipts[1].commandHash)
+            assertEquals(1, projected.size)
+            assertTrue(retainedCut === integration.pendingPublicationGeometryCut())
+            assertTrue(retainedCut === projected.single())
+            assertEquals(queuedReceipts[0].selector.transactionId, projected.single().transactionId)
+            assertEquals(queuedReceipts[0].selector.targetGeometryRevision, projected.single().geometryRevision)
+            assertEquals(depthAfterCommit, depthKernel.resourceReceipt())
+            assertEquals(featureAfterCommit, featureKernel.resourceReceipt())
+            assertEquals(1L, integration.snapshot().admittedDepths)
+        } finally {
+            integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `depth renderer refusal retains ACK then rebuilds canonical cut without reapplying evidence`() {
+        val directory = Files.createTempDirectory("canonical-surface-runtime-depth-renderer-rebuild").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val viewId = 2136
+        val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+        lateinit var depthKernel: DepthEvidenceKernel
+        val deltaAttempts = mutableListOf<CommittedGeometryCut>()
+        val rebuildBegins = mutableListOf<CommittedGeometryCut>()
+        val rebuildPages = mutableListOf<CommittedGeometryCut>()
+        val rebuildFinishes = mutableListOf<CommittedGeometryCut>()
+        val integration = VisibilityGridIntegration(
+            binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = resources(directory, coordinator),
+            depthKernelFactory = {
+                DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 1)).also { depthKernel = it }
+            },
+            renderer = object : CommittedRendererProjection {
+                override val maximumRows = 100_000
+                override fun applyGeometry(cut: CommittedGeometryCut): RendererProjectionResult {
+                    deltaAttempts += cut
+                    return RendererProjectionResult.Refused(RendererProjectionRefusal.CAPACITY)
+                }
+                override fun beginRebuild(cut: CommittedGeometryCut) { rebuildBegins += cut }
+                override fun appendRebuildPage(cut: CommittedGeometryCut) { rebuildPages += cut }
+                override fun finishRebuild(cut: CommittedGeometryCut) { rebuildFinishes += cut }
+                override fun currentRowCount() = rebuildPages.sumOf { it.upserts.size }
+            },
+        )
+        try {
+            val stream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            val cut = requireNotNull(binding.currentObservationOwnership())
+            rebuildBegins.clear(); rebuildPages.clear(); rebuildFinishes.clear()
+
+            integration.admitDepth(depth(cut, 10))
+            assertEquals("rendererRebuildPending", integration.integrationReceipt().status)
+            assertEquals(1, deltaAttempts.size)
+            assertEquals(1L, integration.snapshot().admittedDepths)
+            val appliedDepth = depthKernel.resourceReceipt()
+            rebuildBegins.clear(); rebuildPages.clear(); rebuildFinishes.clear()
+
+            exchange(messenger, viewId, stream, 4, 1, 1, 1)
+            exchange(messenger, viewId, stream, 5, 1, 1, 1)
+            exchange(messenger, viewId, stream, 6, 1, 1, 1)
+            exchange(messenger, viewId, stream, 7, 2, 2, 1)
+            await { integration.integrationReceipt().status == "rendererRebuildPending" }
+
+            integration.admitDepth(depth(cut, 11))
+
+            assertEquals("acknowledged", integration.integrationReceipt().status)
+            assertEquals(1, deltaAttempts.size)
+            assertEquals(appliedDepth, depthKernel.resourceReceipt())
+            assertEquals(1L, integration.snapshot().admittedDepths)
+            assertEquals(1, rebuildBegins.size)
+            assertTrue(rebuildPages.isNotEmpty())
+            assertEquals(1, rebuildFinishes.size)
+            assertEquals(2, rebuildBegins.single().transactionId)
+            assertEquals(2, rebuildBegins.single().geometryRevision)
+            assertEquals(1, rebuildBegins.single().lineageRevision)
+            assertEquals(2, rebuildPages.single().geometryRevision)
         } finally {
             integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
         }
@@ -628,27 +768,29 @@ class VisibilityGridIntegrationTest {
     }
 
     @Test
-    fun `renderer refusal retains queued cut through ACK and retries the exact cut`() {
+    fun `renderer refusal retains ACK and rebuilds canonical current instead of retrying delta`() {
         val directory = Files.createTempDirectory("canonical-surface-runtime-renderer-retry").toFile()
         val coordinator = budget(directory)
         val messenger = MethodTestMessenger()
         val viewId = 2122
         val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
         val attempts = mutableListOf<CommittedGeometryCut>()
-        var refuse = true
+        val rebuildBegins = mutableListOf<CommittedGeometryCut>()
+        val rebuildPages = mutableListOf<CommittedGeometryCut>()
+        val rebuildFinishes = mutableListOf<CommittedGeometryCut>()
         val integration = VisibilityGridIntegration(
             binding, binding::currentObservationOwnership, directory,
             resourcesForGroup = resources(directory, coordinator),
             renderer = object : CommittedRendererProjection {
+                override val maximumRows = 100_000
                 override fun applyGeometry(cut: CommittedGeometryCut): RendererProjectionResult {
                     attempts += cut
-                    return if (refuse) {
-                        refuse = false
-                        RendererProjectionResult.Refused(RendererProjectionRefusal.CAPACITY)
-                    } else {
-                        RendererProjectionResult.Applied(cut.upserts.size)
-                    }
+                    return RendererProjectionResult.Refused(RendererProjectionRefusal.CAPACITY)
                 }
+                override fun beginRebuild(cut: CommittedGeometryCut) { rebuildBegins += cut }
+                override fun appendRebuildPage(cut: CommittedGeometryCut) { rebuildPages += cut }
+                override fun finishRebuild(cut: CommittedGeometryCut) { rebuildFinishes += cut }
+                override fun currentRowCount() = rebuildPages.sumOf { it.upserts.size }
             },
         )
         try {
@@ -657,29 +799,34 @@ class VisibilityGridIntegrationTest {
             exchange(messenger, viewId, stream, 2, 0, 0, 0)
             exchange(messenger, viewId, stream, 3, 1, 1, 1)
             val ownership = requireNotNull(binding.currentObservationOwnership())
+            rebuildBegins.clear(); rebuildPages.clear(); rebuildFinishes.clear()
 
             integration.admitFeature(feature(ownership, 10))
-            assertEquals("rendererRetryPending", integration.integrationReceipt().status)
+            assertEquals("rendererRebuildPending", integration.integrationReceipt().status)
             val retained = attempts.single()
             assertEquals(2, retained.transactionId)
             assertEquals(1, retained.baseGeometryRevision)
             assertEquals(2, retained.geometryRevision)
             assertEquals(1, retained.lineageRevision)
             assertEquals(1, retained.upserts.size)
+            rebuildBegins.clear(); rebuildPages.clear(); rebuildFinishes.clear()
 
             exchange(messenger, viewId, stream, 4, 1, 1, 1)
             exchange(messenger, viewId, stream, 5, 1, 1, 1)
             exchange(messenger, viewId, stream, 6, 1, 1, 1)
             exchange(messenger, viewId, stream, 7, 2, 2, 1)
-            await { integration.integrationReceipt().status == "rendererRetryPending" }
+            await { integration.integrationReceipt().status == "rendererRebuildPending" }
 
             integration.admitFeature(feature(ownership, 11, 0.32))
-            assertEquals(3, attempts.size)
-            assertEquals(retained.transactionId, attempts[1].transactionId)
-            assertEquals(retained.geometryRevision, attempts[1].geometryRevision)
-            assertEquals(retained.upserts.single().surfaceId, attempts[1].upserts.single().surfaceId)
-            assertEquals(3, attempts[2].transactionId)
-            assertEquals("pendingAck", integration.integrationReceipt().status)
+            assertEquals(1, attempts.size)
+            assertEquals("acknowledged", integration.integrationReceipt().status)
+            assertEquals(1, rebuildBegins.size)
+            assertTrue(rebuildPages.isNotEmpty())
+            assertEquals(1, rebuildFinishes.size)
+            assertEquals(retained.transactionId, rebuildBegins.single().transactionId)
+            assertEquals(retained.geometryRevision, rebuildBegins.single().geometryRevision)
+            assertEquals(retained.lineageRevision, rebuildBegins.single().lineageRevision)
+            assertEquals(retained.upserts.single().surfaceId, rebuildPages.single().upserts.single().surfaceId)
         } finally {
             integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
         }

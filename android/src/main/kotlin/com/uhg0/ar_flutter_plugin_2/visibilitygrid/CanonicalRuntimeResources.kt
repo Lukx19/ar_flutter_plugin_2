@@ -296,6 +296,7 @@ internal class CanonicalRuntimeResources private constructor(
     @Synchronized fun rebuildAndHydrate(
         kernel: FeatureFusionKernel,
         rendererLimit: Int,
+        hydrateKernel: Boolean = true,
         sink: (CanonicalRendererPage) -> Unit,
     ): CompactCanonicalCut? {
         checkOpen()
@@ -316,7 +317,7 @@ internal class CanonicalRuntimeResources private constructor(
                 while (id < view.cut.nextSurfaceIdHighWater) {
                     val row = view.findById(SurfaceId(id++)) ?: continue
                     val source = (view.readSourceById(row.id) as? CanonicalPageRead.Complete)?.value ?: return null
-                    if (!kernel.hydrateCanonicalSurface(row, source.allocationFingerprint)) return null
+                    if (hydrateKernel && !kernel.hydrateCanonicalSurface(row, source.allocationFingerprint)) return null
                     if (rendered < rendererLimit) {
                         page += CommittedGeometryRow(
                             surfaceId = row.id.value,
