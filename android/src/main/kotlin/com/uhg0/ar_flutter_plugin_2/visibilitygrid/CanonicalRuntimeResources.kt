@@ -262,6 +262,8 @@ internal class CanonicalRuntimeResources private constructor(
         current?.resourceReceipt()
     @Synchronized internal fun featurePlanningMemoryReceipt(maximumTouches: Int): CanonicalFeaturePlanningMemoryReceipt? =
         current?.featurePlanningMemoryReceipt(maximumTouches)
+    @Synchronized internal fun currentRowFoldScratchBytes(): Long? =
+        current?.let { CurrentRowFoldScratch.memoryBytes() }
 
     internal fun portableOwnerBytes(): Long =
         40L + // CanonicalRuntimeResources
@@ -321,13 +323,10 @@ internal class CanonicalRuntimeResources private constructor(
         require(rendererLimit >= 0)
         val lease = current ?: return null
         val view = lease.completeView
-        var id = 1L
         var rendered = 0
         val page = ArrayList<CommittedGeometryRow>(512)
-        while (id < view.cut.nextSurfaceIdHighWater) {
-            val row = view.findById(SurfaceId(id++)) ?: continue
-            val source = (view.readSourceById(row.id) as? CanonicalPageRead.Complete)?.value ?: return null
-            if (hydrateKernel && !kernel.hydrateCanonicalSurface(row, source.allocationFingerprint)) return null
+        val folded = lease.foldCurrentRows { row, allocationFingerprint ->
+            if (hydrateKernel && !kernel.hydrateCanonicalSurface(row, allocationFingerprint)) return@foldCurrentRows false
             if (rendered < rendererLimit) {
                 page += CommittedGeometryRow(
                     surfaceId = row.id.value,
@@ -341,7 +340,9 @@ internal class CanonicalRuntimeResources private constructor(
                     sink(CanonicalRendererPage(view.cut, page.toList(), null)); page.clear()
                 }
             }
+            true
         }
+        if (!folded) return null
         if (page.isNotEmpty()) sink(CanonicalRendererPage(view.cut, page.toList(), null))
         return view.cut
     }
@@ -390,16 +391,7 @@ internal class CanonicalRuntimeResources private constructor(
     internal fun readAllRendererKeys(): LongArray? {
         checkOpen()
         val lease = current ?: return null
-        val view = lease.completeView
-        val keys = LongArray(view.cut.liveSurfaceCount)
-        var size = 0
-        var id = 1L
-        while (id < view.cut.nextSurfaceIdHighWater) {
-            view.findById(SurfaceId(id++))?.let { row ->
-                keys[size++] = packVisibilityGridKey(row.voxel.x, row.voxel.y, row.voxel.z)
-            }
-        }
-        return if (size == keys.size) keys else keys.copyOf(size)
+        return lease.copyOccupiedKeys()
     }
 
     override fun close() {
@@ -458,6 +450,38 @@ internal class CanonicalRuntimeResources private constructor(
         fun featurePlanningView(budget: FeaturePlanningReadBudget): RoutedFeaturePlanningView =
             featureRoutes.view(scalarView.cut, base, commit, budget)
         fun featurePlanningMemoryReceipt(maximumTouches: Int) = featureRoutes.memoryReceipt(maximumTouches)
+        fun copyOccupiedKeys(): LongArray? = featureRoutes.copyOccupiedKeys(scalarView.cut.liveSurfaceCount)
+        fun foldCurrentRows(sink: (CompactSurface, CanonicalReceiptBytes) -> Boolean): Boolean {
+            val highWater = scalarView.cut.nextSurfaceIdHighWater
+            if (highWater !in 1..(Int.MAX_VALUE.toLong())) return false
+            val scratch = CurrentRowFoldScratch()
+            val published = commit
+            var emitted = 0
+            var first = 1L
+            while (first < highWater) {
+                val last = minOf(highWater - 1L, first + CurrentRowFoldScratch.WINDOW_SIZE - 1L)
+                scratch.reset(first, last)
+                if (published != null) for (ordinal in published.routingGenerationCount() - 1 downTo 0) {
+                    if (!scratch.apply(published.routingGenerationAt(ordinal))) return false
+                }
+                for (idValue in first..last) {
+                    val folded = scratch.row(idValue)
+                    val row = if (folded == CurrentRowFoldScratch.PRESENT) {
+                        scratch.surface(idValue)
+                    } else base.findById(SurfaceId(idValue))
+                    row ?: continue
+                    if (!featureRoutes.contains(row.voxel, row.id)) continue
+                    val fingerprint = scratch.sourceFingerprint(idValue) ?: run {
+                        val source = (base.readSourceById(row.id) as? CanonicalPageRead.Complete)?.value ?: return false
+                        source.allocationFingerprint
+                    }
+                    if (!sink(row, fingerprint)) return false
+                    emitted++
+                }
+                first = last + 1L
+            }
+            return emitted == scalarView.cut.liveSurfaceCount
+        }
 
         fun prepareRouting(plan: PreparedCanonicalMutation): CanonicalFeatureRouteDelta? =
             featureRoutes.prepare(
@@ -518,8 +542,9 @@ internal class CanonicalRuntimeResources private constructor(
 
 /**
  * Lifecycle-owned voxel routing for ordinary feature planning. The retained
- * primitive payload at 100k is 2,372,864 bytes: one 131,072-entry long/int
- * table plus two 100k Int provider columns. No canonical row is duplicated.
+ * primitive payload at 100k is 3,172,864 bytes: one 131,072-entry long/int
+ * table plus two 100k Int provider columns and one Long identity column.
+ * No canonical row metadata or source payload is duplicated.
  */
 private class CanonicalFeaturePlanningRoutes private constructor(private val capacity: Int) : AutoCloseable {
     private val tableSize = run { var value = 1; while (value <= capacity) value = value shl 1; value }
@@ -527,9 +552,27 @@ private class CanonicalFeaturePlanningRoutes private constructor(private val cap
     private val tokens = IntArray(tableSize)
     private val rowProviders = IntArray(capacity)
     private val sourceProviders = IntArray(capacity)
+    private val surfaceIds = LongArray(capacity)
     private var freeHead = -1
     private var nextDescriptor = 0
     private var closed = false
+
+    fun copyOccupiedKeys(expectedLiveCount: Int): LongArray? {
+        if (closed || expectedLiveCount !in 0..capacity) return null
+        val occupied = LongArray(expectedLiveCount)
+        var size = 0
+        for (slot in tokens.indices) if (tokens[slot] != 0) {
+            if (size >= occupied.size) return null
+            occupied[size++] = keys[slot]
+        }
+        return occupied.takeIf { size == expectedLiveCount }
+    }
+
+    fun contains(voxel: Voxel, id: SurfaceId): Boolean {
+        if (closed) return false
+        val descriptor = descriptor(packVisibilityGridKey(voxel.x, voxel.y, voxel.z)) ?: return false
+        return surfaceIds[descriptor] == id.value
+    }
 
     fun view(
         cut: CompactCanonicalCut,
@@ -552,6 +595,7 @@ private class CanonicalFeaturePlanningRoutes private constructor(private val cap
         if (removedCount != plan.removedSurfaceCount) return null
         val keys = LongArray(plan.dirtyRowCount)
         val sources = IntArray(plan.dirtyRowCount)
+        val ids = LongArray(plan.dirtyRowCount)
         var dirtyCount = 0
         if (!plan.visitDirtyRows { row ->
             val key = packVisibilityGridKey(row.voxel.x, row.voxel.y, row.voxel.z)
@@ -561,10 +605,10 @@ private class CanonicalFeaturePlanningRoutes private constructor(private val cap
                     ?: plan.removedRouteKey(row.id)?.let(::descriptor)?.let { sourceProviders[it] }
                     ?: return@visitDirtyRows false
             }
-            keys[dirtyCount] = key; sources[dirtyCount] = sourceProvider; dirtyCount++
+            keys[dirtyCount] = key; sources[dirtyCount] = sourceProvider; ids[dirtyCount] = row.id.value; dirtyCount++
             true
         } || dirtyCount != plan.dirtyRowCount) return null
-        return CanonicalFeatureRouteDelta(providerToken, removed, keys, sources).also {
+        return CanonicalFeatureRouteDelta(providerToken, removed, keys, sources, ids).also {
             CanonicalRuntimeCurrentTestHooks.onFeatureRouteDeltaPrepared?.invoke(it.memoryReceipt)
         }
     }
@@ -577,6 +621,7 @@ private class CanonicalFeaturePlanningRoutes private constructor(private val cap
             val descriptor = descriptor(key) ?: requireNotNull(acquire())
             rowProviders[descriptor] = delta.providerToken
             sourceProviders[descriptor] = delta.sourceProviders[index]
+            surfaceIds[descriptor] = delta.surfaceIds[index]
             put(key, descriptor)
         }
     }
@@ -602,6 +647,7 @@ private class CanonicalFeaturePlanningRoutes private constructor(private val cap
                     val descriptor = retained ?: acquire() ?: return@visitRoutingRecords false
                     rowProviders[descriptor] = FeatureRouteProviderToken.generation(ordinal)
                     sourceProviders[descriptor] = source
+                    surfaceIds[descriptor] = record.id
                     put(key, descriptor)
                 }
             }
@@ -661,6 +707,7 @@ private class CanonicalFeaturePlanningRoutes private constructor(private val cap
     private fun release(value: Int) {
         rowProviders[value] = -(freeHead + 1)
         sourceProviders[value] = 0
+        surfaceIds[value] = 0L
         freeHead = value
     }
     private fun descriptor(key: Long): Int? {
@@ -700,16 +747,16 @@ private class CanonicalFeaturePlanningRoutes private constructor(private val cap
         require(maximumTouches in 0..capacity)
         val routeArrays = Math.addExact(
             Math.multiplyExact(tableSize.toLong(), (Long.SIZE_BYTES + Int.SIZE_BYTES).toLong()),
-            Math.multiplyExact(capacity.toLong(), 2L * Int.SIZE_BYTES),
+            Math.multiplyExact(capacity.toLong(), 2L * Int.SIZE_BYTES + Long.SIZE_BYTES),
         )
-        val retained = Math.addExact(128L, Math.addExact(routeArrays, 4L * 16L))
+        val retained = Math.addExact(136L, Math.addExact(routeArrays, 5L * 16L))
         val scratch = Math.addExact(64L, Math.addExact(2L * 16L,
             Math.multiplyExact(tableSize.toLong(), (Long.SIZE_BYTES + Int.SIZE_BYTES).toLong())))
         val borrow = Math.addExact(128L + 3L * 16L, Math.multiplyExact(maximumTouches.toLong(), 24L))
-        val routeDelta = Math.addExact(88L, Math.multiplyExact(maximumTouches.toLong(), 20L))
+        val routeDelta = Math.addExact(112L, Math.multiplyExact(maximumTouches.toLong(), 28L))
         return CanonicalFeaturePlanningMemoryReceipt(retained, scratch, borrow, routeDelta)
     }
-    override fun close() { if (!closed) { closed = true; tokens.fill(0); rowProviders.fill(0); sourceProviders.fill(0) } }
+    override fun close() { if (!closed) { closed = true; tokens.fill(0); rowProviders.fill(0); sourceProviders.fill(0); surfaceIds.fill(0) } }
 
     companion object {
         fun build(base: CompactCanonicalStore, commit: CanonicalPublishedCommit?, capacity: Int): CanonicalFeaturePlanningRoutes? {
@@ -723,6 +770,7 @@ private class CanonicalFeaturePlanningRoutes private constructor(private val cap
                 val descriptor = routes.acquire() ?: run { routes.close(); return null }
                 routes.rowProviders[descriptor] = FeatureRouteProviderToken.BASE
                 routes.sourceProviders[descriptor] = FeatureRouteProviderToken.BASE
+                routes.surfaceIds[descriptor] = row.id.value
                 routes.put(packVisibilityGridKey(row.voxel.x, row.voxel.y, row.voxel.z), descriptor)
             }
             commit?.let { published ->
@@ -779,6 +827,77 @@ private object FeatureRouteProviderToken {
     }
 }
 
+private class CurrentRowFoldScratch {
+    private val states = ByteArray(WINDOW_SIZE)
+    private val sourceStates = ByteArray(WINDOW_SIZE)
+    private val xs = IntArray(WINDOW_SIZE)
+    private val ys = IntArray(WINDOW_SIZE)
+    private val zs = IntArray(WINDOW_SIZE)
+    private val normals = IntArray(WINDOW_SIZE)
+    private val confidences = IntArray(WINDOW_SIZE)
+    private val fingerprints = ByteArray(Math.multiplyExact(WINDOW_SIZE, 32))
+    private var firstId = 1L
+    private var lastId = 0L
+
+    fun reset(first: Long, last: Long) {
+        require(first >= 1L && last >= first && last - first < WINDOW_SIZE)
+        firstId = first; lastId = last
+        states.fill(UNKNOWN); sourceStates.fill(UNKNOWN)
+    }
+
+    fun apply(generation: CanonicalCowGeneration): Boolean = generation.visitCurrentFoldRecords(firstId, lastId) { kind, record ->
+        when {
+            kind == CowFragmentKind.ROW && record is CowRecord.Row -> {
+                val value = record.value
+                val id = value.id.toWindowIndex() ?: return@visitCurrentFoldRecords true
+                if (states[id] == UNKNOWN) {
+                    states[id] = PRESENT
+                    xs[id] = value.x; ys[id] = value.y; zs[id] = value.z
+                    normals[id] = value.normal; confidences[id] = value.confidence
+                }
+            }
+            kind == CowFragmentKind.SOURCE && record is CowRecord.Source -> {
+                val value = record.value
+                val id = value.id.toWindowIndex() ?: return@visitCurrentFoldRecords true
+                if (sourceStates[id] == UNKNOWN) {
+                    sourceStates[id] = PRESENT
+                    value.words().copyInto(fingerprints, id * 32)
+                }
+            }
+        }
+        true
+    }
+
+    fun row(id: Long) = states[requireNotNull(id.toWindowIndex())]
+    fun surface(id: Long): CompactSurface {
+        val index = requireNotNull(id.toWindowIndex())
+        return CompactSurface(
+            SurfaceId(id),
+            Voxel(xs[index], ys[index], zs[index]),
+            normals[index],
+            confidences[index],
+        )
+    }
+
+    fun sourceFingerprint(id: Long): CanonicalReceiptBytes? {
+        val index = requireNotNull(id.toWindowIndex())
+        return if (sourceStates[index] == PRESENT) {
+            CanonicalReceiptBytes(fingerprints.copyOfRange(index * 32, index * 32 + 32))
+        } else {
+            null
+        }
+    }
+
+    private fun Long.toWindowIndex(): Int? = if (this in firstId..lastId) (this - firstId).toInt() else null
+
+    companion object {
+        const val UNKNOWN: Byte = 0
+        const val PRESENT: Byte = 1
+        const val WINDOW_SIZE = 272
+        fun memoryBytes(): Long = Math.addExact(176L, Math.multiplyExact(WINDOW_SIZE.toLong(), 54L))
+    }
+}
+
 private class SourceProviderRouteScratch(tableSize: Int) {
     private val mask = tableSize - 1
     private val keys = LongArray(tableSize)
@@ -814,15 +933,16 @@ private class CanonicalFeatureRouteDelta(
     val removedKeys: LongArray,
     val dirtyKeys: LongArray,
     val sourceProviders: IntArray,
+    val surfaceIds: LongArray,
 ) {
     val memoryReceipt = CanonicalFeatureRouteDeltaMemoryReceipt(
         removedKeys.size,
         dirtyKeys.size,
         Math.addExact(
-            88L,
+            112L,
             Math.addExact(
                 Math.multiplyExact(removedKeys.size.toLong(), 8L),
-                Math.multiplyExact(dirtyKeys.size.toLong(), 12L),
+                Math.multiplyExact(dirtyKeys.size.toLong(), 20L),
             ),
         ),
     )
@@ -997,6 +1117,7 @@ internal object CanonicalRuntimeCurrentTestHooks {
     @Volatile var onFeatureRouteRead: ((String, CowReadWork) -> Unit)? = null
     @Volatile var failFeatureRouteRead: ((String) -> Boolean)? = null
     @Volatile var onFeatureRouteDeltaPrepared: ((CanonicalFeatureRouteDeltaMemoryReceipt) -> Unit)? = null
+    @Volatile var onCurrentFoldRead: ((CowReadWork) -> Unit)? = null
 }
 
 internal data class CanonicalRendererPage(

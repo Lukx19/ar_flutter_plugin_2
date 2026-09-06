@@ -100,7 +100,9 @@ class ContinuousRuntimeCapacityCampaignTest {
             ownershipByThread.computeIfAbsent(Thread.currentThread().id) { mutableListOf() } += observation
         }
         try {
-            val result = runCampaign(root, 2301, verifyProtocol = true, ownershipByThread)
+            val result = runCampaign(
+                root, 2301, verifyProtocol = true, ownershipByThread, measureJvmGraph = false,
+            )
             assertEquals(32, result.rootHash.size)
             assertEquals(32, result.workerCurrentHash.size)
             assertTrue(result.committedPhysicalBytes > 0L)
@@ -183,6 +185,7 @@ class ContinuousRuntimeCapacityCampaignTest {
         surfaceTarget: Int = SURFACES,
         verificationSnapshot: (() -> Triple<Long, Long, Long>)? = null,
         verificationBatches: MutableList<BatchVerification>? = null,
+        measureJvmGraph: Boolean = true,
     ): CampaignResult {
         require(surfaceTarget in V2_FEATURE_SAMPLE_CAPACITY * 3..SURFACES)
         val featureSurfaceTarget = surfaceTarget - 1
@@ -460,10 +463,11 @@ class ContinuousRuntimeCapacityCampaignTest {
                     observation.constructionPeakBytes,
                 )
             }
+            val currentRowFoldBytes = requireNotNull(activeResources.currentRowFoldScratchBytes())
             val currentHandoffBytes = maximumCurrentBytes.toLong() * 2L +
                 TransactionResponseProfileV1.ordinary.responseCeilingBytes.toLong()
             val sharedPhaseBytes = maxOf(
-                currentHandoffBytes, allocated.directoryBytes, maximumOperationBytes,
+                currentHandoffBytes, allocated.directoryBytes, maximumOperationBytes, currentRowFoldBytes,
             )
             val portableCompleteBytes = listOf(
                 kernelBytes, depthKernelBytes, completeCurrentBytes,
@@ -504,7 +508,7 @@ class ContinuousRuntimeCapacityCampaignTest {
                     "renderer=$rendererBytes rendererRebuild=$rendererRebuildBytes handoff=$rendererHandoffBytes " +
                     "verificationProof=$verificationProofBytes " +
                     "current=$maximumCurrentBytes currentHandoff=$currentHandoffBytes directory=${allocated.directoryBytes} " +
-                    "operation=$maximumOperationBytes shared=$sharedPhaseBytes",
+                    "operation=$maximumOperationBytes currentRowFold=$currentRowFoldBytes shared=$sharedPhaseBytes",
                 portableCompleteBytes <= Math.addExact(
                     Math.addExact(
                         CompactCanonicalStore.C17_TOTAL_BYTES,
@@ -520,21 +524,24 @@ class ContinuousRuntimeCapacityCampaignTest {
             // The JOL graph is diagnostic only. The portable modeled/encoded
             // receipts above are normative and include the kernel reservation,
             // v6 arrays, renderer storage and the maximum shared operation phase.
-            val completeLayout = GraphLayout.parseInstance(integration, binding, coordinator)
-            val jolBytes = completeLayout.totalSize()
-            // This diagnostic intentionally includes test callbacks/messenger and therefore
-            // Gradle/JUnit/class-loader infrastructure. Portable acceptance above instead
-            // names only strongly reachable production owners and exact bounded buffers.
-            assertTrue(
-                "JOL complete graph=$jolBytes",
-                jolBytes <= Math.addExact(
-                    Math.addExact(
-                        CompactCanonicalStore.C17_TOTAL_BYTES,
-                        depthReceipt.semanticStateBudgetBytes.toLong(),
+            var jolBytes = -1L
+            if (measureJvmGraph) {
+                val completeLayout = GraphLayout.parseInstance(integration, binding, coordinator)
+                jolBytes = completeLayout.totalSize()
+                // This diagnostic intentionally includes test callbacks/messenger and therefore
+                // Gradle/JUnit/class-loader infrastructure. Portable acceptance above instead
+                // names only strongly reachable production owners and exact bounded buffers.
+                assertTrue(
+                    "JOL complete graph=$jolBytes",
+                    jolBytes <= Math.addExact(
+                        Math.addExact(
+                            CompactCanonicalStore.C17_TOTAL_BYTES,
+                            depthReceipt.semanticStateBudgetBytes.toLong(),
+                        ),
+                        pendingDepth.budgetBytes,
                     ),
-                    pendingDepth.budgetBytes,
-                ),
-            )
+                )
+            }
 
             val beforeRefusal = finalState.cut
             if (surfaceTarget == SURFACES) {
@@ -678,7 +685,7 @@ class ContinuousRuntimeCapacityCampaignTest {
                     "v6Allocated=${allocated.allocatedBytes} renderer=$rendererBytes handoff=$rendererHandoffBytes " +
                     "verificationProof=$verificationProofBytes " +
                     "currentMax=$maximumCurrentBytes directory=${allocated.directoryBytes} " +
-                    "operationMax=$maximumOperationBytes sharedPhase=$sharedPhaseBytes " +
+                    "operationMax=$maximumOperationBytes currentRowFold=$currentRowFoldBytes sharedPhase=$sharedPhaseBytes " +
                     "portableComplete=$portableCompleteBytes jol=$jolBytes " +
                     "committedAtCut=$committedBytesAtCut chargedPhysicalAtCut=$chargedPhysicalBytesAtCut " +
                     "committed=$committedBytes chargedPhysical=$chargedPhysicalBytes",

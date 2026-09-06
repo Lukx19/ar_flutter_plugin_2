@@ -395,10 +395,10 @@ internal class MutableCanonicalOverlay private constructor(
             supports.constructionArrayPeakBytes + supports.constructionHashBytes +
             (supportPairs?.allocatedBytes ?: 0L) + (lineagePairs?.allocatedBytes ?: 0L) + removedRoutes.allocatedBytes
         val routeDeltaConstructionBytes = Math.addExact(
-            88L,
+            112L,
             Math.addExact(
                 Math.multiplyExact(removedIds.size.toLong(), 8L),
-                Math.multiplyExact(rows.size.toLong(), 12L),
+                Math.multiplyExact(rows.size.toLong(), 20L),
             ),
         )
         val constructionPeakBytes = maxOf(

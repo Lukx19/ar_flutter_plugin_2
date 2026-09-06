@@ -388,6 +388,27 @@ internal class CanonicalCowGeneration private constructor(
         return true
     }
 
+    /** Operation-local current fold; overlapping boundary pages may be read at most twice. */
+    @Synchronized
+    internal fun visitCurrentFoldRecords(
+        minimumId: Long,
+        maximumId: Long,
+        sink: (CowFragmentKind, CowRecord) -> Boolean,
+    ): Boolean {
+        if (closed) return false
+        val index = entryIndex ?: return false
+        val before = readWorkReceipt()
+        // Live-route membership filters removed/relocated historical rows, so
+        // only fixed-width ROW/SOURCE pages participate in this range fold.
+        for (kind in listOf(CowFragmentKind.SOURCE, CowFragmentKind.ROW)) {
+            if (!index.forEachOverlapping(kind, minimumId, maximumId) { entry ->
+                readPage(File(directory, entry.file), entry) { record -> sink(kind, record) }
+            }) return false
+        }
+        CanonicalRuntimeCurrentTestHooks.onCurrentFoldRead?.invoke(readWorkReceipt() - before)
+        return true
+    }
+
     @Synchronized
     internal fun visitSupport(
         rootHash: CanonicalReceiptBytes,
@@ -701,6 +722,28 @@ private class CowDirectoryIndex(entries: List<CowDirectoryEntry>) {
                 java.lang.Long.compareUnsigned(key, entry.maximumKey) <= 0 &&
                 !action(entry)
             ) return false
+        }
+        return true
+    }
+
+    fun forEachOverlapping(
+        kind: CowFragmentKind,
+        minimumKey: Long,
+        maximumKey: Long,
+        action: (CowDirectoryEntry) -> Boolean,
+    ): Boolean {
+        val ranges = byKey[kind.ordinal] ?: return true
+        val maxima = prefixMaximum[kind.ordinal] ?: return true
+        var low = 0
+        var high = ranges.size
+        while (low < high) {
+            val middle = (low + high) ushr 1
+            if (java.lang.Long.compareUnsigned(maxima[middle], minimumKey) >= 0) high = middle else low = middle + 1
+        }
+        var index = low
+        while (index < ranges.size && java.lang.Long.compareUnsigned(ranges[index].minimumKey, maximumKey) <= 0) {
+            if (!action(ranges[index])) return false
+            index++
         }
         return true
     }

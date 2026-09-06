@@ -5,6 +5,7 @@ import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetPolicyV2
 import com.uhg0.ar_flutter_plugin_2.capture.JvmDescriptorFilesystemV2
 import java.io.File
 import java.nio.file.Files
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -42,7 +43,7 @@ class BoundedCanonicalDepthLookupTest {
             assertTrue(resources.openInitial(committedEmptyBaseline("binding", group.value, 1, 1, 1)) is SurfaceOwnershipOpenResult.Opened)
             val generationZeroReceipt = requireNotNull(resources.completeCurrentLeaseReceipt())
             assertEquals(0L, generationZeroReceipt.cowProofAndIndexBytes)
-            assertEquals(2_373_056L, generationZeroReceipt.featurePlanningRouteBytes)
+            assertEquals(3_173_080L, generationZeroReceipt.featurePlanningRouteBytes)
             assertEquals(
                 Math.addExact(
                     generationZeroReceipt.baseRetained.residentTotalBytes,
@@ -51,10 +52,10 @@ class BoundedCanonicalDepthLookupTest {
                 generationZeroReceipt.retainedTotalBytes,
             )
             val planningMemory = requireNotNull(resources.featurePlanningMemoryReceipt(1))
-            assertEquals(2_373_056L, planningMemory.routeRetainedBytes)
+            assertEquals(3_173_080L, planningMemory.routeRetainedBytes)
             assertEquals(1_572_960L, planningMemory.lifecycleConstructionScratchBytes)
             assertEquals(200L, planningMemory.borrowCacheBytes)
-            assertEquals(108L, planningMemory.maximumRouteDeltaBytes)
+            assertEquals(140L, planningMemory.maximumRouteDeltaBytes)
             assertTrue(planningMemory.routeRetainedBytes <= 4L * 1024L * 1024L)
             val create = resources.prepareEvidenceBatch(
                 CanonicalEvidenceBatchCommand(
@@ -187,6 +188,47 @@ class BoundedCanonicalDepthLookupTest {
     }
 
     @Test
+    fun `occupied route keys match canonical rows including packed zero`() {
+        val durable = runtimeWithCommitHistory(3, "0".repeat(32))
+        try {
+            val expected = requireNotNull(durable.runtime.withCurrent { view ->
+                LongArray(view.cut.liveSurfaceCount) { index ->
+                    val row = requireNotNull(view.findById(SurfaceId(index + 1L)))
+                    packVisibilityGridKey(row.voxel.x, row.voxel.y, row.voxel.z)
+                }
+            }).sortedArray()
+            val routed = requireNotNull(durable.runtime.readAllRendererKeys()).sortedArray()
+            assertArrayEquals(expected, routed)
+            assertTrue(routed.binarySearch(packVisibilityGridKey(0, 0, 0)) >= 0)
+        } finally {
+            durable.close()
+        }
+    }
+
+    @Test
+    fun `current row fold emits exact id order with fixed accounted scratch`() {
+        val durable = runtimeWithCommitHistory(3, "a".repeat(32))
+        val kernel = FeatureFusionKernel()
+        try {
+            var foldedPages = 0L
+            CanonicalRuntimeCurrentTestHooks.onCurrentFoldRead = { foldedPages += it.pages }
+            val expected = requireNotNull(durable.runtime.withCurrent { view ->
+                (1L until view.cut.nextSurfaceIdHighWater).mapNotNull { view.findById(SurfaceId(it)) }
+            })
+            val pages = mutableListOf<CanonicalRendererPage>()
+            val cut = durable.runtime.rebuildAndHydrate(kernel, expected.size, hydrateKernel = true, pages::add)
+            assertEquals(requireNotNull(durable.runtime.owner().activationState()).cut, cut)
+            assertEquals(expected.map { it.id.value }, pages.flatMap { it.rows }.map { it.surfaceId })
+            assertEquals(14_864L, durable.runtime.currentRowFoldScratchBytes())
+            val uniqueRelevantPages = 6L // one ROW and SOURCE page in each of three generations
+            assertTrue(foldedPages in uniqueRelevantPages..(2L * uniqueRelevantPages))
+        } finally {
+            CanonicalRuntimeCurrentTestHooks.onCurrentFoldRead = null
+            durable.close()
+        }
+    }
+
+    @Test
     fun `feature planning refuses a routed provider read failure without treating occupancy as empty`() {
         val durable = runtimeWithCommitHistory(1, "3".repeat(32))
         try {
@@ -242,13 +284,13 @@ class BoundedCanonicalDepthLookupTest {
                 )
             }) as CanonicalMutationPreparation.Prepared
             assertEquals(96L, replacement.mutation.work.removedRouteBytes)
-            assertEquals(108L, replacement.mutation.work.routeDeltaConstructionBytes)
+            assertEquals(140L, replacement.mutation.work.routeDeltaConstructionBytes)
             assertTrue(replacement.mutation.work.constructionPeakBytes >=
                 replacement.mutation.work.retainedPlanBytes + replacement.mutation.work.routeDeltaConstructionBytes)
             var routeDelta: CanonicalFeatureRouteDeltaMemoryReceipt? = null
             CanonicalRuntimeCurrentTestHooks.onFeatureRouteDeltaPrepared = { routeDelta = it }
             assertTrue(resources.commitAdjacent(replacement.mutation) is CanonicalAdjacentCommitResult.Committed)
-            assertEquals(CanonicalFeatureRouteDeltaMemoryReceipt(1, 1, 108L), routeDelta)
+            assertEquals(CanonicalFeatureRouteDeltaMemoryReceipt(1, 1, 140L), routeDelta)
             CanonicalRuntimeCurrentTestHooks.onFeatureRouteDeltaPrepared = null
             cut = requireNotNull(resources.owner().activationState()).cut
             val replacementCurrent = requireNotNull(resources.owner().activationState()).current as CanonicalActivationCurrent.Receipt
@@ -311,6 +353,8 @@ class BoundedCanonicalDepthLookupTest {
         val durable = runtimeWithCommitHistory(1, "9".repeat(32))
         val resources = durable.runtime
         try {
+            var foldedPages = 0L
+            CanonicalRuntimeCurrentTestHooks.onCurrentFoldRead = { foldedPages += it.pages }
             fun commitAndAcknowledge(command: CanonicalTransactionCommand) {
                 val prepared = requireNotNull(resources.withCurrent {
                     resources.owner().prepareAdjacentMutation(it, command)
@@ -334,6 +378,14 @@ class BoundedCanonicalDepthLookupTest {
                 listOf(SurfaceId(1)),
                 listOf(CanonicalTarget(SurfaceId(1), Voxel(10, 0, 0), 9, 7, 220)),
             ))
+            val relocatedPages = mutableListOf<CanonicalRendererPage>()
+            assertEquals(
+                listOf(1L),
+                resources.rebuildAndHydrate(FeatureFusionKernel(), 1, true, relocatedPages::add)
+                    ?.let { relocatedPages.flatMap { page -> page.rows }.map { row -> row.surfaceId } },
+            )
+            assertTrue(foldedPages in 3L..6L)
+            foldedPages = 0L
             cut = requireNotNull(resources.owner().activationState()).cut
             commitAndAcknowledge(CanonicalTransactionCommand(
                 "replace-relocated-route", CanonicalOperation.REPLACEMENT,
@@ -345,7 +397,15 @@ class BoundedCanonicalDepthLookupTest {
                 assertEquals(null, view.findByVoxel(Voxel(0, 0, 0)))
                 requireNotNull(view.findByVoxel(Voxel(10, 0, 0))).id
             })
+            val replacedPages = mutableListOf<CanonicalRendererPage>()
+            assertEquals(
+                listOf(2L),
+                resources.rebuildAndHydrate(FeatureFusionKernel(), 1, true, replacedPages::add)
+                    ?.let { replacedPages.flatMap { page -> page.rows }.map { row -> row.surfaceId } },
+            )
+            assertTrue(foldedPages in 5L..10L)
         } finally {
+            CanonicalRuntimeCurrentTestHooks.onCurrentFoldRead = null
             durable.close()
         }
     }
