@@ -221,14 +221,14 @@ class VisibilityGridIntegrationTest {
     }
 
     @Test
-    fun `depth canonical refusal discards prepared state and a retry publishes exactly once`() {
+    fun `retryable depth commit retains exact work and next admission publishes it once`() {
         val directory = Files.createTempDirectory("canonical-surface-runtime-depth-retry").toFile()
         val coordinator = budget(directory)
         val messenger = MethodTestMessenger()
         val viewId = 2131
         val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
         lateinit var depthKernel: DepthEvidenceKernel
-        var refuseNext = true
+        val attemptedMutations = mutableListOf<PreparedCanonicalMutation>()
         val renderedCuts = mutableListOf<CommittedGeometryCut>()
         val integration = VisibilityGridIntegration(
             binding, binding::currentObservationOwnership, directory,
@@ -237,12 +237,11 @@ class VisibilityGridIntegrationTest {
                 DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 1)).also { depthKernel = it }
             },
             commitCanonical = { runtime, mutation ->
-                if (refuseNext) {
-                    refuseNext = false
-                    mutation.discard()
+                attemptedMutations += mutation
+                if (attemptedMutations.size == 1) {
                     CanonicalAdjacentCommitResult.Refused(
                         CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE,
-                        disposition = PreparedMutationDisposition.TERMINAL,
+                        disposition = PreparedMutationDisposition.RETRYABLE,
                     )
                 } else runtime.commitAdjacent(mutation)
             },
@@ -261,18 +260,133 @@ class VisibilityGridIntegrationTest {
             val cut = requireNotNull(binding.currentObservationOwnership())
 
             integration.admitDepth(depth(cut, 10))
-            assertEquals("depthCommitRefused", integration.integrationReceipt().status)
+            assertEquals("depthCommitRetryPending", integration.integrationReceipt().status)
             assertTrue(renderedCuts.isEmpty())
             assertEquals(0, exchange(messenger, viewId, stream, 4, 1, 1, 1).first.messageKind)
             assertEquals(0, depthKernel.resourceReceipt().residentEvidenceRows)
-            assertEquals(0, depthKernel.resourceReceipt().preparedEvidenceRows)
+            assertTrue(depthKernel.resourceReceipt().preparedEvidenceRows > 0)
             assertEquals(0L, integration.snapshot().admittedDepths)
 
             integration.admitDepth(depth(cut, 11))
             assertEquals("pendingAck", integration.integrationReceipt().status)
+            assertEquals(2, attemptedMutations.size)
+            assertTrue(attemptedMutations[0] === attemptedMutations[1])
             assertEquals(1, renderedCuts.size)
             assertEquals(2, renderedCuts.single().transactionId)
             assertEquals(1, depthKernel.resourceReceipt().residentEvidenceRows)
+            assertEquals(1L, integration.snapshot().admittedDepths)
+        } finally {
+            integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `repeated retryable depth refusal retains one capability until pause discards it`() {
+        val directory = Files.createTempDirectory("canonical-surface-runtime-depth-repeat-retry").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val viewId = 2133
+        val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+        lateinit var depthKernel: DepthEvidenceKernel
+        val attemptedMutations = mutableListOf<PreparedCanonicalMutation>()
+        val renderedCuts = mutableListOf<CommittedGeometryCut>()
+        val integration = VisibilityGridIntegration(
+            binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = resources(directory, coordinator),
+            depthKernelFactory = {
+                DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 1)).also { depthKernel = it }
+            },
+            commitCanonical = { _, mutation ->
+                attemptedMutations += mutation
+                CanonicalAdjacentCommitResult.Refused(
+                    CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE,
+                    disposition = PreparedMutationDisposition.RETRYABLE,
+                )
+            },
+            renderer = object : CommittedRendererProjection {
+                override fun applyGeometry(cut: CommittedGeometryCut): RendererProjectionResult {
+                    renderedCuts += cut
+                    return RendererProjectionResult.Applied(cut.upserts.size)
+                }
+            },
+        )
+        try {
+            val stream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            val cut = requireNotNull(binding.currentObservationOwnership())
+
+            integration.admitDepth(depth(cut, 10))
+            integration.admitFeature(feature(cut, 11))
+            integration.admitDepth(depth(cut, 12))
+
+            assertEquals(3, attemptedMutations.size)
+            assertTrue(attemptedMutations.all { it === attemptedMutations.first() })
+            assertEquals("depthCommitRetryPending", integration.integrationReceipt().status)
+            assertTrue(renderedCuts.isEmpty())
+            assertEquals(0L, integration.snapshot().admittedDepths)
+            assertTrue(depthKernel.resourceReceipt().preparedEvidenceRows > 0)
+
+            integration.pause()
+            assertEquals(PreparedMutationLifecycle.DISCARDED, attemptedMutations.first().lifecycle())
+            assertEquals(0, depthKernel.resourceReceipt().preparedEvidenceRows)
+        } finally {
+            integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `terminal pending depth refusal discards exact work and permits a later fresh batch`() {
+        val directory = Files.createTempDirectory("canonical-surface-runtime-depth-terminal-retry").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val viewId = 2134
+        val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+        lateinit var depthKernel: DepthEvidenceKernel
+        val attemptedMutations = mutableListOf<PreparedCanonicalMutation>()
+        val integration = VisibilityGridIntegration(
+            binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = resources(directory, coordinator),
+            depthKernelFactory = {
+                DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 1)).also { depthKernel = it }
+            },
+            commitCanonical = { runtime, mutation ->
+                attemptedMutations += mutation
+                when (attemptedMutations.size) {
+                    1 -> CanonicalAdjacentCommitResult.Refused(
+                        CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE,
+                        disposition = PreparedMutationDisposition.RETRYABLE,
+                    )
+                    2 -> {
+                        mutation.discard()
+                        CanonicalAdjacentCommitResult.Refused(
+                            CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE,
+                            disposition = PreparedMutationDisposition.TERMINAL,
+                        )
+                    }
+                    else -> runtime.commitAdjacent(mutation)
+                }
+            },
+        )
+        try {
+            val stream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            val cut = requireNotNull(binding.currentObservationOwnership())
+
+            integration.admitDepth(depth(cut, 10))
+            integration.admitDepth(depth(cut, 11))
+            assertEquals("depthCommitTerminalRefused", integration.integrationReceipt().status)
+            assertTrue(attemptedMutations[0] === attemptedMutations[1])
+            assertEquals(0, depthKernel.resourceReceipt().preparedEvidenceRows)
+            assertEquals(0L, integration.snapshot().admittedDepths)
+
+            integration.admitDepth(depth(cut, 12))
+            assertEquals("pendingAck", integration.integrationReceipt().status)
+            assertEquals(3, attemptedMutations.size)
+            assertTrue(attemptedMutations[2] !== attemptedMutations[0])
             assertEquals(1L, integration.snapshot().admittedDepths)
         } finally {
             integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()

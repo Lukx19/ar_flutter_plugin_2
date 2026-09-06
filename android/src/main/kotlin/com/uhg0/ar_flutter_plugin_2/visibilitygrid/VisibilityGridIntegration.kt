@@ -17,6 +17,12 @@ import java.util.concurrent.atomic.AtomicLong
 
 private enum class PendingPublicationGateResult { READY, REJECTED }
 
+private data class PendingDepthCommit(
+    val ownership: VisibilityObservationOwnership,
+    val mutation: PreparedCanonicalMutation,
+    val geometryCut: CommittedGeometryCut,
+)
+
 /**
  * One group-local canonical surface module behind the capture ingress mapper seam.
  *
@@ -63,6 +69,7 @@ internal class VisibilityGridIntegration(
     private var pendingBindingAcknowledged = false
     private var pendingRendererRows = 0
     private var pendingCanonicalAcknowledgement: CanonicalAcknowledgement? = null
+    private var pendingDepthCommit: PendingDepthCommit? = null
     private val retainedDelta = ExactCurrentDeltaSource()
     @Volatile private var committed = 0L
     @Volatile private var committedFeatures = 0L
@@ -78,6 +85,7 @@ internal class VisibilityGridIntegration(
     override fun admitFeature(observation: VisibilityFeatureObservation) = mutate(observation.ownership) {
         if (isFenced(observation.ownership)) return@mutate
         if (drainPendingPublication() == PendingPublicationGateResult.REJECTED) return@mutate
+        if (retryPendingDepthCommit(observation.ownership)) return@mutate
         ensureOpened(observation.ownership) ?: return@mutate
         if (drainPendingPublication() == PendingPublicationGateResult.REJECTED) return@mutate
         // This adapter is the only CAPTURE-INGRESS-to-canonical surface conversion point.  It creates
@@ -137,6 +145,7 @@ internal class VisibilityGridIntegration(
         mutate(observation.ownership) {
             if (isFenced(observation.ownership)) return@mutate
             if (drainPendingPublication() == PendingPublicationGateResult.REJECTED) return@mutate
+            if (retryPendingDepthCommit(observation.ownership)) return@mutate
             ensureOpened(observation.ownership) ?: return@mutate
             if (drainPendingPublication() == PendingPublicationGateResult.REJECTED) return@mutate
             admitDepthLocked(observation)
@@ -150,6 +159,7 @@ internal class VisibilityGridIntegration(
         }
         afterLifecycleFence()
         drain()
+        synchronized(lock) { discardPendingDepthCommit() }
     }
 
     override fun resume() {
@@ -200,7 +210,7 @@ internal class VisibilityGridIntegration(
     /** Portable scalar owners only; kernel/renderer arrays and phase buffers are named separately. */
     internal fun portableOwnerMemoryReceipt(): RuntimeOwnerMemoryReceipt = synchronized(lock) {
         RuntimeOwnerMemoryReceipt(
-            integrationObjectBytes = 144,
+            integrationObjectBytes = 152,
             integrationReceiptBytes = 104,
             retainedDeltaOwnerBytes = 16,
             runtimeOwnerBytes = resources?.portableOwnerBytes() ?: 0,
@@ -399,8 +409,14 @@ internal class VisibilityGridIntegration(
         val committedResult = commitCanonical(requireNotNull(resources), prepared.mutation)
         val state = (committedResult as? CanonicalAdjacentCommitResult.Committed)?.state ?: run {
             if (committedResult is CanonicalAdjacentCommitResult.Refused &&
-                committedResult.disposition == PreparedMutationDisposition.TERMINAL
-            ) prepared.mutation.discard()
+                committedResult.disposition == PreparedMutationDisposition.RETRYABLE
+            ) {
+                pendingDepthCommit = PendingDepthCommit(observation.ownership, prepared.mutation, geometryCut)
+                rejected++
+                receipt = receipt.copy(status = "depthCommitRetryPending", rejected = rejected)
+                return
+            }
+            prepared.mutation.discard()
             requireNotNull(kernel).discardPreparedCanonicalRemap()
             depth.discardPrepared()
             rejected++
@@ -411,6 +427,44 @@ internal class VisibilityGridIntegration(
         check(depth.applyPrepared() is DepthEvidenceApplyResult.Applied)
         admittedDepths++
         publishV6Current(observation.ownership, state, prebuiltGeometryCut = geometryCut)
+    }
+
+    /** Retries one retained canonical depth capability and always gates the triggering observation. */
+    private fun retryPendingDepthCommit(expected: VisibilityObservationOwnership): Boolean {
+        val pendingDepth = pendingDepthCommit ?: return false
+        if (pendingDepth.ownership != expected || isFenced(pendingDepth.ownership)) {
+            discardPendingDepthCommit()
+            fenced++
+            receipt = receipt.copy(status = "depthCommitFenced", fenced = fenced)
+            return true
+        }
+        when (val result = commitCanonical(requireNotNull(resources), pendingDepth.mutation)) {
+            is CanonicalAdjacentCommitResult.Committed -> {
+                pendingDepthCommit = null
+                requireNotNull(kernel).applyPreparedCanonicalRemap()
+                check(requireNotNull(depthKernel).applyPrepared() is DepthEvidenceApplyResult.Applied)
+                admittedDepths++
+                publishV6Current(pendingDepth.ownership, result.state, prebuiltGeometryCut = pendingDepth.geometryCut)
+            }
+            is CanonicalAdjacentCommitResult.Refused -> {
+                rejected++
+                if (result.disposition == PreparedMutationDisposition.RETRYABLE) {
+                    receipt = receipt.copy(status = "depthCommitRetryPending", rejected = rejected)
+                } else {
+                    discardPendingDepthCommit()
+                    receipt = receipt.copy(status = "depthCommitTerminalRefused", rejected = rejected)
+                }
+            }
+        }
+        return true
+    }
+
+    private fun discardPendingDepthCommit() {
+        val pendingDepth = pendingDepthCommit ?: return
+        pendingDepthCommit = null
+        pendingDepth.mutation.discard()
+        kernel?.discardPreparedCanonicalRemap()
+        depthKernel?.discardPrepared()
     }
 
     private fun collectDepthFeatureSources(
@@ -759,6 +813,7 @@ internal class VisibilityGridIntegration(
     }
 
     private fun closeOwner() {
+        discardPendingDepthCommit()
         retainedDelta.clear()
         pending = null
         pendingQueued = false
