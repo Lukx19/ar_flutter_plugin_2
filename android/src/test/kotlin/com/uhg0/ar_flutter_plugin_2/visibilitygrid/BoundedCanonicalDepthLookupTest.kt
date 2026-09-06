@@ -248,6 +248,47 @@ class BoundedCanonicalDepthLookupTest {
     }
 
     @Test
+    fun `feature planning accounts corrupt routed source work once and poisons later reads`() {
+        val durable = runtimeWithCommitHistory(1, "6".repeat(32))
+        try {
+            val sourcePage = durable.root.walkTopDown().single { it.isFile && it.name == "source.pages" }
+            sourcePage.writeBytes(sourcePage.readBytes().also { bytes ->
+                bytes[bytes.lastIndex] = (bytes.last().toInt() xor 0x40).toByte()
+            })
+            val providerWork = mutableListOf<Pair<String, CowReadWork>>()
+            CanonicalRuntimeCurrentTestHooks.onFeatureRouteRead = { kind, receipt -> providerWork += kind to receipt }
+            var firstWork: CanonicalReadWork? = null
+            var secondWork: CanonicalReadWork? = null
+
+            assertEquals(null, durable.runtime.withFeaturePlanningCurrent(2, 6, 49_152) { view ->
+                assertEquals(null, view.findByVoxel(Voxel(0, 0, 0)))
+                firstWork = view.readWorkReceipt()
+                assertEquals(null, view.findByVoxel(Voxel(0, 0, 0)))
+                secondWork = view.readWorkReceipt()
+                "the poisoned borrow must be refused"
+            })
+
+            assertEquals(listOf("row", "source"), providerWork.map { it.first })
+            val expected = providerWork.fold(CanonicalReadWork.ZERO) { total, (_, read) ->
+                CanonicalReadWork(
+                    total.directLookups,
+                    Math.addExact(total.pageReads, read.pages),
+                    Math.addExact(total.inspectedRows, read.records),
+                    Math.addExact(total.bytesRead, read.bytes),
+                )
+            }
+            assertEquals(3L, expected.pageReads)
+            assertEquals(49_152L, expected.bytesRead)
+            assertEquals(expected, firstWork)
+            assertEquals(firstWork, secondWork)
+            assertEquals(2, providerWork.size)
+        } finally {
+            CanonicalRuntimeCurrentTestHooks.onFeatureRouteRead = null
+            durable.close()
+        }
+    }
+
+    @Test
     fun `feature planning refuses an occupied routed read before zero page and byte caps perform work`() {
         val durable = runtimeWithCommitHistory(1, "4".repeat(32))
         try {

@@ -668,31 +668,37 @@ private class CanonicalFeaturePlanningRoutes private constructor(private val cap
         val requiredPages = Math.addExact(rowPages, 1L)
         val requiredBytes = Math.multiplyExact(requiredPages, CanonicalPageCache.PAGE_BYTES.toLong())
         if (maximumPageReads < requiredPages || maximumBytesRead < requiredBytes) return RoutedFeatureRead.Failed(CanonicalReadWork.ZERO)
-        val row = providerSurface(rowProviders[descriptor], voxel, base, commit)
-            ?: return RoutedFeatureRead.Failed()
-        val source = providerSource(sourceProviders[descriptor], row.value.id, base, commit)
-            ?: return RoutedFeatureRead.Failed(row.work)
+        val row = when (val read = providerSurface(rowProviders[descriptor], voxel, base, commit)) {
+            is RoutedProviderResult.Complete -> read
+            is RoutedProviderResult.Refused -> return RoutedFeatureRead.Failed(read.work)
+        }
+        val source = when (val read = providerSource(sourceProviders[descriptor], row.value.id, base, commit)) {
+            is RoutedProviderResult.Complete -> read
+            is RoutedProviderResult.Refused -> return RoutedFeatureRead.Failed(row.work + read.work)
+        }
         return RoutedFeatureRead.Found(row.value, source.value, row.work + source.work)
     }
 
-    private fun providerSurface(token: Int, voxel: Voxel, base: CanonicalStateView, commit: CanonicalPublishedCommit?): RoutedProviderRead<CompactSurface>? {
-        if (CanonicalRuntimeCurrentTestHooks.failFeatureRouteRead?.invoke("row") == true) return null
+    private fun providerSurface(token: Int, voxel: Voxel, base: CanonicalStateView, commit: CanonicalPublishedCommit?): RoutedProviderResult<CompactSurface> {
+        if (CanonicalRuntimeCurrentTestHooks.failFeatureRouteRead?.invoke("row") == true) return RoutedProviderResult.Refused(CanonicalReadWork.ZERO)
         return if (FeatureRouteProviderToken.isBase(token)) when (val read = base.findByVoxelBounded(voxel, 1L, CanonicalPageCache.PAGE_BYTES.toLong())) {
-            is CanonicalBoundedReadResult.Complete -> read.value?.let { RoutedProviderRead(it, read.work) }
-            is CanonicalBoundedReadResult.Refused -> null
+            is CanonicalBoundedReadResult.Complete -> read.value?.let { RoutedProviderResult.Complete(it, read.work) } ?: RoutedProviderResult.Refused(read.work)
+            is CanonicalBoundedReadResult.Refused -> RoutedProviderResult.Refused(read.work)
         } else when (val read = commit?.routingGenerationAt(FeatureRouteProviderToken.generationOrdinal(token))?.routedSurface(voxel)) {
-            is RoutedGenerationRead.Complete -> RoutedProviderRead(read.value, read.work)
-            is RoutedGenerationRead.Refused, null -> null
+            is RoutedGenerationRead.Complete -> RoutedProviderResult.Complete(read.value, read.work)
+            is RoutedGenerationRead.Refused -> RoutedProviderResult.Refused(read.work)
+            null -> RoutedProviderResult.Refused(CanonicalReadWork.ZERO)
         }
     }
-    private fun providerSource(token: Int, id: SurfaceId, base: CanonicalStateView, commit: CanonicalPublishedCommit?): RoutedProviderRead<PagedSource>? {
-        if (CanonicalRuntimeCurrentTestHooks.failFeatureRouteRead?.invoke("source") == true) return null
+    private fun providerSource(token: Int, id: SurfaceId, base: CanonicalStateView, commit: CanonicalPublishedCommit?): RoutedProviderResult<PagedSource> {
+        if (CanonicalRuntimeCurrentTestHooks.failFeatureRouteRead?.invoke("source") == true) return RoutedProviderResult.Refused(CanonicalReadWork.ZERO)
         return if (FeatureRouteProviderToken.isBase(token)) when (val read = base.readSourceByIdBounded(id, 1L, CanonicalPageCache.PAGE_BYTES.toLong())) {
-            is CanonicalBoundedReadResult.Complete -> read.value?.let { RoutedProviderRead(it, read.work) }
-            is CanonicalBoundedReadResult.Refused -> null
+            is CanonicalBoundedReadResult.Complete -> read.value?.let { RoutedProviderResult.Complete(it, read.work) } ?: RoutedProviderResult.Refused(read.work)
+            is CanonicalBoundedReadResult.Refused -> RoutedProviderResult.Refused(read.work)
         } else when (val read = commit?.routingGenerationAt(FeatureRouteProviderToken.generationOrdinal(token))?.routedSource(id)) {
-            is RoutedGenerationRead.Complete -> RoutedProviderRead(read.value, read.work)
-            is RoutedGenerationRead.Refused, null -> null
+            is RoutedGenerationRead.Complete -> RoutedProviderResult.Complete(read.value, read.work)
+            is RoutedGenerationRead.Refused -> RoutedProviderResult.Refused(read.work)
+            null -> RoutedProviderResult.Refused(CanonicalReadWork.ZERO)
         }
     }
 
@@ -972,6 +978,7 @@ private class RoutedFeaturePlanningView(
         private set
     override val generationZeroAuthority: CanonicalStateView get() = base.generationZeroAuthority
     override fun findByVoxel(voxel: Voxel): CompactSurface? {
+        if (routingFailed) return null
         (0 until touchedCount).firstOrNull { touchedRows[it]?.voxel == voxel }
             ?.let { return touchedRows[it] }
         return when (
@@ -1026,7 +1033,10 @@ private sealed interface RoutedFeatureRead {
     data class Found(val row: CompactSurface, val source: PagedSource, val work: CanonicalReadWork) : RoutedFeatureRead
 }
 
-private data class RoutedProviderRead<T>(val value: T, val work: CanonicalReadWork)
+private sealed interface RoutedProviderResult<out T> {
+    data class Complete<T>(val value: T, val work: CanonicalReadWork) : RoutedProviderResult<T>
+    data class Refused(val work: CanonicalReadWork) : RoutedProviderResult<Nothing>
+}
 
 private operator fun CanonicalReadWork.plus(other: CanonicalReadWork) = CanonicalReadWork(
     Math.addExact(directLookups, other.directLookups),
