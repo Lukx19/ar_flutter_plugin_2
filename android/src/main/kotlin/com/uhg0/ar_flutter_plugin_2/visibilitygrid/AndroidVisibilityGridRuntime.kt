@@ -33,6 +33,8 @@ internal class AndroidVisibilityGridRuntime(
     private val afterMapperAdmission: () -> Unit = {},
     private val beforeDepthCapabilityFence: () -> Unit = {},
     private val afterDepthCapabilityInvalidated: () -> Unit = {},
+    private val afterTerminalIngressInvalidated: () -> Unit = {},
+    private val beforeLaneResidentPublication: (VisibilityObservationSource) -> Unit = {},
 ) : AutoCloseable {
     private val lock = Any()
     private val lifecycleLock = ReentrantReadWriteLock()
@@ -97,6 +99,7 @@ internal class AndroidVisibilityGridRuntime(
         payloadBytes = VisibilityFeatureObservation::payloadBytes,
         deliver = { beforeLaneDelivery(it.frame.source); deliverFeature(it) },
         afterDelivery = { afterLaneDelivery(it.frame.source) },
+        beforeResidentPublication = { beforeLaneResidentPublication(it.frame.source) },
         onReplacement = { synchronized(lock) { replacedFeatureObservations++ } },
         onStale = { synchronized(lock) { staleGenerationObservations++ } },
         onResidentBytesChanged = { bytes -> updateResidentBytes(featureBytes = bytes) },
@@ -108,6 +111,7 @@ internal class AndroidVisibilityGridRuntime(
         payloadBytes = VisibilityDepthObservation::payloadBytes,
         deliver = { beforeLaneDelivery(it.frame.source); deliverDepth(it) },
         afterDelivery = { afterLaneDelivery(it.frame.source) },
+        beforeResidentPublication = { beforeLaneResidentPublication(it.frame.source) },
         onReplacement = { synchronized(lock) { replacedDepthObservations++ } },
         onStale = { synchronized(lock) { staleGenerationObservations++ } },
         onResidentBytesChanged = { bytes -> updateResidentBytes(depthBytes = bytes) },
@@ -291,6 +295,7 @@ internal class AndroidVisibilityGridRuntime(
                 featureHealth = VisibilitySourceHealth.FAILED
             }
             discardUnusableIngress(feature = true)
+                .also { afterTerminalIngressInvalidated() }
         }
         awaitUnusableIngress(drain)
     }
@@ -311,7 +316,9 @@ internal class AndroidVisibilityGridRuntime(
                     false
                 }
             }
-            if (terminal) discardUnusableIngress(depth = true) else UnusableIngressDrain.NONE
+            if (terminal) {
+                discardUnusableIngress(depth = true).also { afterTerminalIngressInvalidated() }
+            } else UnusableIngressDrain.NONE
         }
         awaitUnusableIngress(drain)
     }
@@ -920,6 +927,7 @@ private class LatestObservationLane<T : Any>(
     private val payloadBytes: (T) -> Int,
     private val deliver: (T) -> Unit,
     private val afterDelivery: (T) -> Unit,
+    private val beforeResidentPublication: (T) -> Unit,
     private val onReplacement: () -> Unit,
     private val onStale: () -> Unit,
     private val onResidentBytesChanged: (Long) -> Unit,
@@ -932,6 +940,7 @@ private class LatestObservationLane<T : Any>(
     private var lastDeliveryNs = Long.MIN_VALUE
     private var scheduleEpoch = 0L
     private var running = false
+    private var accountingPending = false
 
     val residentBytes: Long
         get() = synchronized(lock) {
@@ -980,7 +989,7 @@ private class LatestObservationLane<T : Any>(
     }
 
     fun awaitIdle() = synchronized(lock) {
-        while (running) (lock as java.lang.Object).wait()
+        while (running || accountingPending) (lock as java.lang.Object).wait()
     }
 
     private fun scheduleLocked(delayNs: Long) {
@@ -1005,6 +1014,7 @@ private class LatestObservationLane<T : Any>(
         val nextDelay = synchronized(lock) {
             lastDeliveryNs = nanoTime()
             running = false
+            accountingPending = true
             current = latest
             latest = null
             if (current == null || closed) {
@@ -1014,8 +1024,15 @@ private class LatestObservationLane<T : Any>(
                 intervalNs
             }
         }
-        onResidentBytesChanged(residentBytes)
-        synchronized(lock) { (lock as java.lang.Object).notifyAll() }
+        try {
+            beforeResidentPublication(value)
+            onResidentBytesChanged(residentBytes)
+        } finally {
+            synchronized(lock) {
+                accountingPending = false
+                (lock as java.lang.Object).notifyAll()
+            }
+        }
         if (nextDelay != null) {
             synchronized(lock) {
                 if (!closed && scheduled && epoch == scheduleEpoch) scheduleLocked(nextDelay)

@@ -519,6 +519,8 @@ class AndroidVisibilityGridRuntimeTest {
         val depthSnapshotComplete = CountDownLatch(1)
         val secondDepthSnapshotComplete = CountDownLatch(1)
         val accounted = CountDownLatch(3)
+        val newerAccounted = CountDownLatch(1)
+        val accountedCalls = AtomicLong()
         val returnOldFeatureSnapshot = ThreadLocal.withInitial { false }
         val mapper = object : VisibilityObservationMapper {
             override fun admitFeature(observation: VisibilityFeatureObservation) {
@@ -546,13 +548,17 @@ class AndroidVisibilityGridRuntimeTest {
                 }
             }
         }
-        val runtime = runtime(cut, mapper, afterMapperAdmission = accounted::countDown)
+        val runtime = runtime(cut, mapper, afterMapperAdmission = {
+            if (accountedCalls.incrementAndGet() == 1L) newerAccounted.countDown()
+            accounted.countDown()
+        })
         try {
             runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
             assertTrue(runtime.offerFeature(feature(cut.get(), 1, 1)))
             assertTrue(featureSnapshotEntered.await(1, TimeUnit.SECONDS))
             assertTrue(runtime.offerDepth(depth(cut.get(), 1, 1)))
             assertTrue(depthSnapshotComplete.await(1, TimeUnit.SECONDS))
+            assertTrue(newerAccounted.await(1, TimeUnit.SECONDS))
             featureSnapshotRelease.countDown()
             runtime.offerDepth(depth(cut.get(), 2_000_000, 2))
             assertTrue(secondDepthSnapshotComplete.await(1, TimeUnit.SECONDS))
@@ -657,6 +663,7 @@ class AndroidVisibilityGridRuntimeTest {
         val cleanupRelease = CountDownLatch(1)
         val failureStarted = CountDownLatch(1)
         val failureReturned = CountDownLatch(1)
+        val terminalInvalidated = CountDownLatch(1)
         val residentAtReturn = AtomicLong(-1)
         val mapped = AtomicLong()
         val runtime = AndroidVisibilityGridRuntime(
@@ -678,6 +685,7 @@ class AndroidVisibilityGridRuntimeTest {
                     cleanupRelease.await(2, TimeUnit.SECONDS)
                 }
             },
+            afterTerminalIngressInvalidated = terminalInvalidated::countDown,
         )
         try {
             runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
@@ -691,6 +699,7 @@ class AndroidVisibilityGridRuntimeTest {
                 failureReturned.countDown()
             }.apply { start() }
             assertTrue(failureStarted.await(1, TimeUnit.SECONDS))
+            assertTrue(terminalInvalidated.await(1, TimeUnit.SECONDS))
             cleanupRelease.countDown()
             assertTrue(failureReturned.await(1, TimeUnit.SECONDS))
             failing.join(1_000)
@@ -758,6 +767,10 @@ class AndroidVisibilityGridRuntimeTest {
         val transitionReturned = CountDownLatch(1)
         val transitionEntered = CountDownLatch(1)
         val transitionInvalidated = CountDownLatch(1)
+        val residentPublicationEntered = CountDownLatch(1)
+        val residentPublicationRelease = CountDownLatch(1)
+        val residentPublicationFinished = AtomicBoolean()
+        val publicationFinishedAtReturn = AtomicBoolean()
         val mapped = AtomicLong()
         val mappedAtReturn = AtomicLong(-1)
         val runtime = runtime(
@@ -780,6 +793,13 @@ class AndroidVisibilityGridRuntimeTest {
                 }
             },
             afterDepthCapabilityInvalidated = transitionInvalidated::countDown,
+            beforeLaneResidentPublication = { source ->
+                if (source == VisibilityObservationSource.SYNTHETIC_DEPTH) {
+                    residentPublicationEntered.countDown()
+                    residentPublicationRelease.await(2, TimeUnit.SECONDS)
+                    residentPublicationFinished.set(true)
+                }
+            },
         )
         try {
             runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
@@ -790,16 +810,20 @@ class AndroidVisibilityGridRuntimeTest {
             val disabling = Thread {
                 runtime.setDepthCapability(VisibilityDepthCapability.UNSUPPORTED)
                 mappedAtReturn.set(mapped.get())
+                publicationFinishedAtReturn.set(residentPublicationFinished.get())
                 transitionReturned.countDown()
             }.apply { start() }
             assertTrue(transitionEntered.await(1, TimeUnit.SECONDS))
             assertTrue(transitionInvalidated.await(1, TimeUnit.SECONDS))
             deliveryRelease.countDown()
+            assertTrue(residentPublicationEntered.await(1, TimeUnit.SECONDS))
+            residentPublicationRelease.countDown()
             assertTrue(transitionReturned.await(1, TimeUnit.SECONDS))
             disabling.join(1_000)
 
             assertEquals(0, mapped.get())
             assertEquals(0, mappedAtReturn.get())
+            assertTrue(publicationFinishedAtReturn.get())
             assertEquals(0, runtime.snapshot().admittedDepthObservations)
             assertEquals(2, runtime.snapshot().lifecycleDiscardedObservations)
             assertEquals(0, runtime.snapshot().residentPayloadBytes)
@@ -809,6 +833,7 @@ class AndroidVisibilityGridRuntimeTest {
             assertEquals(0, mapped.get())
         } finally {
             deliveryRelease.countDown()
+            residentPublicationRelease.countDown()
             runtime.close()
         }
     }
@@ -881,6 +906,8 @@ class AndroidVisibilityGridRuntimeTest {
         beforeDepthCapabilityFence: () -> Unit = {},
         beforeLaneDelivery: (VisibilityObservationSource) -> Unit = {},
         afterDepthCapabilityInvalidated: () -> Unit = {},
+        afterTerminalIngressInvalidated: () -> Unit = {},
+        beforeLaneResidentPublication: (VisibilityObservationSource) -> Unit = {},
     ) = AndroidVisibilityGridRuntime(
         ownership = cut::get,
         mapper = mapper,
@@ -892,6 +919,8 @@ class AndroidVisibilityGridRuntimeTest {
         beforeDepthCapabilityFence = beforeDepthCapabilityFence,
         beforeLaneDelivery = beforeLaneDelivery,
         afterDepthCapabilityInvalidated = afterDepthCapabilityInvalidated,
+        afterTerminalIngressInvalidated = afterTerminalIngressInvalidated,
+        beforeLaneResidentPublication = beforeLaneResidentPublication,
     )
 
     private fun ownership() = VisibilityObservationOwnership(
