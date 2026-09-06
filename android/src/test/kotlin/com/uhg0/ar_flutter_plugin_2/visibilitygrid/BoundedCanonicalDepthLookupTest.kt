@@ -40,6 +40,12 @@ class BoundedCanonicalDepthLookupTest {
         val resources = CanonicalRuntimeResources.open(root, group, coordinator)
         try {
             assertTrue(resources.openInitial(committedEmptyBaseline("binding", group.value, 1, 1, 1)) is SurfaceOwnershipOpenResult.Opened)
+            val generationZeroReceipt = requireNotNull(resources.completeCurrentLeaseReceipt())
+            assertEquals(0L, generationZeroReceipt.cowProofAndIndexBytes)
+            assertEquals(
+                generationZeroReceipt.baseRetained.residentTotalBytes,
+                generationZeroReceipt.retainedTotalBytes,
+            )
             val create = resources.prepareEvidenceBatch(
                 CanonicalEvidenceBatchCommand(
                     "warm-create", 1, 1,
@@ -57,7 +63,10 @@ class BoundedCanonicalDepthLookupTest {
                 val lookup = resources.withBoundedCurrent(
                     BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 1, 0, 2, 32_768),
                 ) { it.findSurfaceAt(Voxel(1, 0, 0)) }
-                assertTrue(lookup is BoundedCanonicalLookupResult.Completed)
+                val completed = lookup as BoundedCanonicalLookupResult.Completed
+                val value = requireNotNull(completed.value)
+                assertEquals(Voxel(1, 0, 0), value.addressedVoxel)
+                assertEquals(SurfaceId(1), value.surface.id)
             }
             val zeroBudget = resources.withBoundedCurrent(
                 BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 1, 0, 0, 0),
@@ -78,8 +87,16 @@ class BoundedCanonicalDepthLookupTest {
 
             assertEquals(0, cowOpens)
             val leaseReceipt = requireNotNull(resources.completeCurrentLeaseReceipt())
-            assertTrue(leaseReceipt.retained.residentTotalBytes > 0)
-            assertEquals(leaseReceipt.retained.peakWithScratchBytes, leaseReceipt.lifecycleOpenPeakBytes)
+            assertEquals(resources.retainedCurrentProofBytes(), leaseReceipt.cowProofAndIndexBytes)
+            assertTrue(leaseReceipt.cowProofAndIndexBytes > 0)
+            assertEquals(
+                Math.addExact(
+                    leaseReceipt.baseRetained.residentTotalBytes,
+                    leaseReceipt.cowProofAndIndexBytes,
+                ),
+                leaseReceipt.retainedTotalBytes,
+            )
+            assertTrue(leaseReceipt.lifecycleOpenPeakBytes >= leaseReceipt.retainedTotalBytes)
         } finally {
             CanonicalCowGenerationTestHooks.onVerifiedOpen = null
             resources.close()
@@ -105,10 +122,13 @@ class BoundedCanonicalDepthLookupTest {
 
             val shallowResult = lookup(shallow.runtime, Voxel(0, 0, 0))
             val deepResult = lookup(deep.runtime, Voxel(5, 0, 0))
-            assertEquals(
-                (shallowResult as BoundedCanonicalLookupResult.Completed).receipt,
-                (deepResult as BoundedCanonicalLookupResult.Completed).receipt,
-            )
+            val shallowCompleted = shallowResult as BoundedCanonicalLookupResult.Completed
+            val deepCompleted = deepResult as BoundedCanonicalLookupResult.Completed
+            assertEquals(shallowCompleted.receipt, deepCompleted.receipt)
+            assertEquals(Voxel(0, 0, 0), requireNotNull(shallowCompleted.value).addressedVoxel)
+            assertEquals(SurfaceId(1), shallowCompleted.value.surface.id)
+            assertEquals(Voxel(5, 0, 0), requireNotNull(deepCompleted.value).addressedVoxel)
+            assertEquals(SurfaceId(6), deepCompleted.value.surface.id)
             assertEquals(0, cowOpens)
         } finally {
             CanonicalCowGenerationTestHooks.onVerifiedOpen = null

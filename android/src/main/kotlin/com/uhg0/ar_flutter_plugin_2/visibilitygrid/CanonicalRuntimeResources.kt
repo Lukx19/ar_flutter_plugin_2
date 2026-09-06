@@ -224,9 +224,7 @@ internal class CanonicalRuntimeResources private constructor(
     @Synchronized internal fun retainedCompleteCurrentMemoryReceipt(): CompactRetainedMemoryReceipt? =
         current?.completeView?.retainedMemoryReceipt()
     @Synchronized internal fun completeCurrentLeaseReceipt(): CanonicalCompleteCurrentLeaseReceipt? =
-        current?.completeView?.retainedMemoryReceipt()?.let {
-            CanonicalCompleteCurrentLeaseReceipt(it, it.peakWithScratchBytes)
-        }
+        current?.resourceReceipt()
 
     internal fun portableOwnerBytes(): Long =
         40L + // CanonicalRuntimeResources
@@ -419,6 +417,21 @@ internal class CanonicalRuntimeResources private constructor(
         private val base: CompactCanonicalStore,
         var commit: CanonicalPublishedCommit?,
     ) : AutoCloseable {
+        fun resourceReceipt(): CanonicalCompleteCurrentLeaseReceipt {
+            val baseReceipt = base.retainedMemoryReceipt()
+            val cow = commit?.leaseMemoryReceipt()
+            val cowRetained = cow?.retainedProofBytes ?: 0L
+            val retainedTotal = Math.addExact(baseReceipt.residentTotalBytes, cowRetained)
+            val cowConstruction = cow?.let {
+                Math.addExact(baseReceipt.residentTotalBytes, it.lifecycleConstructionPeakBytes)
+            } ?: 0L
+            return CanonicalCompleteCurrentLeaseReceipt(
+                baseReceipt,
+                cowRetained,
+                retainedTotal,
+                maxOf(baseReceipt.peakWithScratchBytes, cowConstruction),
+            )
+        }
         fun isCurrent(cut: CompactCanonicalCut?): Boolean =
             cut != null && cut == scalarView.cut && cut == completeView.cut
         override fun close() {
@@ -428,7 +441,9 @@ internal class CanonicalRuntimeResources private constructor(
 }
 
 internal data class CanonicalCompleteCurrentLeaseReceipt(
-    val retained: CompactRetainedMemoryReceipt,
+    val baseRetained: CompactRetainedMemoryReceipt,
+    val cowProofAndIndexBytes: Long,
+    val retainedTotalBytes: Long,
     /** Lifecycle-only cold materialization peak; never charged to an ordinary bounded request. */
     val lifecycleOpenPeakBytes: Long,
 )

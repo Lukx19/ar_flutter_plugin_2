@@ -528,6 +528,24 @@ internal class CanonicalPublishedCommit internal constructor(
         generations.forEach { generation -> total = Math.addExact(total, generation.retainedProofBytes()) }
         return total
     }
+
+    internal fun leaseMemoryReceipt(): CanonicalCowLeaseMemoryReceipt {
+        val rootProofBytes = Math.addExact(512L, Math.multiplyExact(roots.size.toLong(), 512L))
+        var retainedGenerations = 0L
+        var constructionPeak = rootProofBytes
+        generations.forEach { generation ->
+            val receipt = generation.leaseMemoryReceipt()
+            constructionPeak = maxOf(
+                constructionPeak,
+                Math.addExact(rootProofBytes, Math.addExact(retainedGenerations, receipt.lifecycleConstructionPeakBytes)),
+            )
+            retainedGenerations = Math.addExact(retainedGenerations, receipt.retainedProofBytes)
+        }
+        return CanonicalCowLeaseMemoryReceipt(
+            Math.addExact(rootProofBytes, retainedGenerations),
+            constructionPeak,
+        )
+    }
 }
 
 internal sealed interface CanonicalPublishResult {

@@ -421,7 +421,7 @@ class ContinuousRuntimeCapacityCampaignTest {
             }
             val scalarMemory = requireNotNull(activeResources.retainedScalarMemoryReceipt())
             val completeCurrent = requireNotNull(activeResources.completeCurrentLeaseReceipt())
-            val completeCurrentBytes = completeCurrent.retained.residentTotalBytes
+            val completeCurrentBytes = completeCurrent.retainedTotalBytes
             val kernelBytes = kernel.resourceReceipt().assignedTupleShareBytes.toLong()
             // Resident/prepared rows occupy the already-counted primitive
             // arrays; charge those arrays once, not once again per live row.
@@ -435,7 +435,7 @@ class ContinuousRuntimeCapacityCampaignTest {
             val rendererHandoffBytes = maxOf(fullRendererHandoff, sparseRendererHandoff)
             assertTrue(maximumObservedRendererHandoff <= rendererHandoffBytes)
             val ownerMemory = integration.portableOwnerMemoryReceipt()
-            val verificationProofBytes = activeResources.retainedCurrentProofBytes()
+            val verificationProofBytes = completeCurrent.cowProofAndIndexBytes
             val maximumOperationBytes = ownershipObservations.maxOf { observation ->
                 maxOf(
                     observation.retainedPlanBytes + observation.writerScratchBytes,
@@ -450,7 +450,7 @@ class ContinuousRuntimeCapacityCampaignTest {
             val portableCompleteBytes = listOf(
                 kernelBytes, depthKernelBytes, completeCurrentBytes,
                 scalarMemory.portableBytes, ownerMemory.portableBytes,
-                rendererBytes, rendererHandoffBytes, verificationProofBytes, sharedPhaseBytes,
+                rendererBytes, rendererHandoffBytes, sharedPhaseBytes,
             ).fold(0L, Math::addExact)
             assertTrue(maximumCurrentBytes in 1..CanonicalActivationResources.MAX_CURRENT_BYTES)
             assertTrue(allocated.directoryBytes <= CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
@@ -464,8 +464,8 @@ class ContinuousRuntimeCapacityCampaignTest {
             )
             assertTrue(completeCurrentBytes <= CompactCanonicalStore.C17_TOTAL_BYTES)
             assertEquals(
-                completeCurrent.retained.peakWithScratchBytes,
-                completeCurrent.lifecycleOpenPeakBytes,
+                completeCurrent.baseRetained.residentTotalBytes + completeCurrent.cowProofAndIndexBytes,
+                completeCurrent.retainedTotalBytes,
             )
             assertTrue(
                 "portable complete=$portableCompleteBytes scalar=${scalarMemory.portableBytes} " +

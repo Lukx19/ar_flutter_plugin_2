@@ -93,6 +93,12 @@ internal class CanonicalCowGeneration private constructor(
         return Math.addExact(256L, Math.addExact(manifestBytes, storageReceipt().indexRetainedBytes))
     }
 
+    @Synchronized
+    internal fun leaseMemoryReceipt() = CanonicalCowLeaseMemoryReceipt(
+        retainedProofBytes = retainedProofBytes(),
+        lifecycleConstructionPeakBytes = storage.phasePeakBytes,
+    )
+
     /** Holds the generation lifecycle lock across a complete overlay operation. */
     @Synchronized
     internal fun <T> readOr(closedResult: T, operation: () -> T): T =
@@ -771,6 +777,10 @@ internal data class CowStorageReceipt(
     val phasePeakBytes: Long,
     val indexRetainedBytes: Long = 0L,
     val indexConstructionPeakBytes: Long = 0L,
+)
+internal data class CanonicalCowLeaseMemoryReceipt(
+    val retainedProofBytes: Long,
+    val lifecycleConstructionPeakBytes: Long,
 )
 internal data class CowReadWork(
     val pages: Long,
