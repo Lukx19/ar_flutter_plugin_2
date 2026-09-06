@@ -35,6 +35,8 @@ internal class AndroidVisibilityGridRuntime(
     private val afterDepthCapabilityInvalidated: () -> Unit = {},
     private val afterTerminalIngressInvalidated: () -> Unit = {},
     private val beforeLaneResidentPublication: (VisibilityObservationSource) -> Unit = {},
+    private val afterLaneResidentPublication: (VisibilityObservationSource) -> Unit = {},
+    private val beforeLaneDiscardResidentPublication: (VisibilityObservationSource) -> Unit = {},
 ) : AutoCloseable {
     private val lock = Any()
     private val lifecycleLock = ReentrantReadWriteLock()
@@ -100,6 +102,10 @@ internal class AndroidVisibilityGridRuntime(
         deliver = { beforeLaneDelivery(it.frame.source); deliverFeature(it) },
         afterDelivery = { afterLaneDelivery(it.frame.source) },
         beforeResidentPublication = { beforeLaneResidentPublication(it.frame.source) },
+        afterResidentPublication = { afterLaneResidentPublication(it.frame.source) },
+        beforeDiscardResidentPublication = {
+            beforeLaneDiscardResidentPublication(VisibilityObservationSource.SYNTHETIC_FEATURE)
+        },
         onReplacement = { synchronized(lock) { replacedFeatureObservations++ } },
         onStale = { synchronized(lock) { staleGenerationObservations++ } },
         onResidentBytesChanged = { bytes -> updateResidentBytes(featureBytes = bytes) },
@@ -112,6 +118,10 @@ internal class AndroidVisibilityGridRuntime(
         deliver = { beforeLaneDelivery(it.frame.source); deliverDepth(it) },
         afterDelivery = { afterLaneDelivery(it.frame.source) },
         beforeResidentPublication = { beforeLaneResidentPublication(it.frame.source) },
+        afterResidentPublication = { afterLaneResidentPublication(it.frame.source) },
+        beforeDiscardResidentPublication = {
+            beforeLaneDiscardResidentPublication(VisibilityObservationSource.SYNTHETIC_DEPTH)
+        },
         onReplacement = { synchronized(lock) { replacedDepthObservations++ } },
         onStale = { synchronized(lock) { staleGenerationObservations++ } },
         onResidentBytesChanged = { bytes -> updateResidentBytes(depthBytes = bytes) },
@@ -928,11 +938,14 @@ private class LatestObservationLane<T : Any>(
     private val deliver: (T) -> Unit,
     private val afterDelivery: (T) -> Unit,
     private val beforeResidentPublication: (T) -> Unit,
+    private val afterResidentPublication: (T) -> Unit,
+    private val beforeDiscardResidentPublication: () -> Unit,
     private val onReplacement: () -> Unit,
     private val onStale: () -> Unit,
     private val onResidentBytesChanged: (Long) -> Unit,
 ) {
     private val lock = Any()
+    private val publicationLock = Any()
     private var current: T? = null
     private var latest: T? = null
     private var scheduled = false
@@ -960,7 +973,7 @@ private class LatestObservationLane<T : Any>(
                 latest = value
             }
         }
-        onResidentBytesChanged(residentBytes)
+        publishResidentBytes()
     }
 
     fun close() {
@@ -970,7 +983,7 @@ private class LatestObservationLane<T : Any>(
             current = null
             latest = null
         }
-        onResidentBytesChanged(residentBytes)
+        publishResidentBytes()
     }
 
     /** Drops every copied value that has not entered mapper admission. */
@@ -984,7 +997,7 @@ private class LatestObservationLane<T : Any>(
             scheduleEpoch++
             count.toLong()
         }
-        onResidentBytesChanged(residentBytes)
+        publishResidentBytes(beforeDiscardResidentPublication)
         return discarded
     }
 
@@ -1026,7 +1039,8 @@ private class LatestObservationLane<T : Any>(
         }
         try {
             beforeResidentPublication(value)
-            onResidentBytesChanged(residentBytes)
+            publishResidentBytes()
+            afterResidentPublication(value)
         } finally {
             synchronized(lock) {
                 accountingPending = false
@@ -1037,6 +1051,13 @@ private class LatestObservationLane<T : Any>(
             synchronized(lock) {
                 if (!closed && scheduled && epoch == scheduleEpoch) scheduleLocked(nextDelay)
             }
+        }
+    }
+
+    private fun publishResidentBytes(beforePublication: () -> Unit = {}) {
+        beforePublication()
+        synchronized(publicationLock) {
+            onResidentBytesChanged(residentBytes)
         }
     }
 }

@@ -664,6 +664,9 @@ class AndroidVisibilityGridRuntimeTest {
         val failureStarted = CountDownLatch(1)
         val failureReturned = CountDownLatch(1)
         val terminalInvalidated = CountDownLatch(1)
+        val discardPublicationEntered = CountDownLatch(1)
+        val discardPublicationRelease = CountDownLatch(1)
+        val workerPublicationComplete = CountDownLatch(1)
         val residentAtReturn = AtomicLong(-1)
         val mapped = AtomicLong()
         val runtime = AndroidVisibilityGridRuntime(
@@ -686,6 +689,17 @@ class AndroidVisibilityGridRuntimeTest {
                 }
             },
             afterTerminalIngressInvalidated = terminalInvalidated::countDown,
+            beforeLaneDiscardResidentPublication = { source ->
+                if (source == VisibilityObservationSource.SYNTHETIC_DEPTH) {
+                    discardPublicationEntered.countDown()
+                    discardPublicationRelease.await(2, TimeUnit.SECONDS)
+                }
+            },
+            afterLaneResidentPublication = { source ->
+                if (source == VisibilityObservationSource.SYNTHETIC_DEPTH) {
+                    workerPublicationComplete.countDown()
+                }
+            },
         )
         try {
             runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
@@ -699,8 +713,11 @@ class AndroidVisibilityGridRuntimeTest {
                 failureReturned.countDown()
             }.apply { start() }
             assertTrue(failureStarted.await(1, TimeUnit.SECONDS))
-            assertTrue(terminalInvalidated.await(1, TimeUnit.SECONDS))
+            assertTrue(discardPublicationEntered.await(1, TimeUnit.SECONDS))
             cleanupRelease.countDown()
+            assertTrue(workerPublicationComplete.await(1, TimeUnit.SECONDS))
+            discardPublicationRelease.countDown()
+            assertTrue(terminalInvalidated.await(1, TimeUnit.SECONDS))
             assertTrue(failureReturned.await(1, TimeUnit.SECONDS))
             failing.join(1_000)
             scheduler.submit {}.get(1, TimeUnit.SECONDS)
@@ -711,6 +728,7 @@ class AndroidVisibilityGridRuntimeTest {
             assertEquals(0, residentAtReturn.get())
         } finally {
             cleanupRelease.countDown()
+            discardPublicationRelease.countDown()
             runtime.close()
         }
     }
