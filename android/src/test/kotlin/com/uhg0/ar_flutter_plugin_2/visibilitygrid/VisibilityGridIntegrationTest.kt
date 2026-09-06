@@ -169,12 +169,13 @@ class VisibilityGridIntegrationTest {
         val messenger = MethodTestMessenger()
         val viewId = 2130
         val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+        lateinit var depthKernel: DepthEvidenceKernel
         val renderedCuts = mutableListOf<CommittedGeometryCut>()
         val integration = VisibilityGridIntegration(
             binding, binding::currentObservationOwnership, directory,
             resourcesForGroup = resources(directory, coordinator),
             depthKernelFactory = {
-                DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 1))
+                DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 1)).also { depthKernel = it }
             },
             renderer = object : CommittedRendererProjection {
                 override fun applyGeometry(cut: CommittedGeometryCut): RendererProjectionResult {
@@ -207,7 +208,7 @@ class VisibilityGridIntegrationTest {
             assertEquals(1, rendererCut.upserts.size)
             assertTrue(rendererCut.removedSurfaceIds.isEmpty())
             assertEquals(1L, integration.snapshot().admittedDepths)
-            assertEquals(1, privateField<DepthEvidenceKernel>(integration, "depthKernel").resourceReceipt().residentEvidenceRows)
+            assertEquals(1, depthKernel.resourceReceipt().residentEvidenceRows)
 
             assertEquals(2, exchange(messenger, viewId, stream, 4, 1, 1, 1).first.messageKind)
             exchange(messenger, viewId, stream, 5, 1, 1, 1)
@@ -226,13 +227,14 @@ class VisibilityGridIntegrationTest {
         val messenger = MethodTestMessenger()
         val viewId = 2131
         val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+        lateinit var depthKernel: DepthEvidenceKernel
         var refuseNext = true
         val renderedCuts = mutableListOf<CommittedGeometryCut>()
         val integration = VisibilityGridIntegration(
             binding, binding::currentObservationOwnership, directory,
             resourcesForGroup = resources(directory, coordinator),
             depthKernelFactory = {
-                DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 1))
+                DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 1)).also { depthKernel = it }
             },
             commitCanonical = { runtime, mutation ->
                 if (refuseNext) {
@@ -262,7 +264,6 @@ class VisibilityGridIntegrationTest {
             assertEquals("depthCommitRefused", integration.integrationReceipt().status)
             assertTrue(renderedCuts.isEmpty())
             assertEquals(0, exchange(messenger, viewId, stream, 4, 1, 1, 1).first.messageKind)
-            val depthKernel = privateField<DepthEvidenceKernel>(integration, "depthKernel")
             assertEquals(0, depthKernel.resourceReceipt().residentEvidenceRows)
             assertEquals(0, depthKernel.resourceReceipt().preparedEvidenceRows)
             assertEquals(0L, integration.snapshot().admittedDepths)
