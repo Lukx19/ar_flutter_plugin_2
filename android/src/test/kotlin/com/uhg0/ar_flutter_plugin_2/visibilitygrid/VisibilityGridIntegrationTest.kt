@@ -956,6 +956,142 @@ class VisibilityGridIntegrationTest {
     }
 
     @Test
+    fun `reopened unacknowledged current recovers failed rebuild before completing ACK`() {
+        val directory = Files.createTempDirectory("canonical-surface-runtime-reopen-unack-rebuild").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val viewId = 2140
+        val firstBinding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+        val first = VisibilityGridIntegration(
+            firstBinding, firstBinding::currentObservationOwnership, directory,
+            resourcesForGroup = resources(directory, coordinator),
+        )
+        try {
+            val stream = start(firstBinding, messenger, viewId)
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            first.admitFeature(feature(requireNotNull(firstBinding.currentObservationOwnership()), 10))
+            assertEquals("pendingAck", first.integrationReceipt().status)
+        } finally {
+            first.close(); firstBinding.dispose()
+        }
+
+        val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+        var failBegin = true
+        var beginCount = 0
+        var finishCount = 0
+        val replacement = VisibilityGridIntegration(
+            binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = resources(directory, coordinator),
+            renderer = object : CommittedRendererProjection {
+                override val maximumRows = 100_000
+                override fun applyGeometry(cut: CommittedGeometryCut) = RendererProjectionResult.Applied(cut.upserts.size)
+                override fun beginRebuild(cut: CommittedGeometryCut) {
+                    beginCount++
+                    if (failBegin) { failBegin = false; throw IllegalStateException("injected reopen begin") }
+                }
+                override fun appendRebuildPage(cut: CommittedGeometryCut) = Unit
+                override fun finishRebuild(cut: CommittedGeometryCut) { finishCount++ }
+                override fun currentRowCount() = 1
+            },
+        )
+        try {
+            val stream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            val cut = requireNotNull(binding.currentObservationOwnership())
+
+            replacement.admitFeature(feature(cut, 11, 0.32))
+            assertTrue(beginCount >= 2)
+            assertEquals(1, finishCount)
+            assertEquals("awaitingExactAck", replacement.integrationReceipt().status)
+
+            exchange(messenger, viewId, stream, 4, 1, 1, 1)
+            exchange(messenger, viewId, stream, 5, 1, 1, 1)
+            exchange(messenger, viewId, stream, 6, 1, 1, 1)
+            exchange(messenger, viewId, stream, 7, 2, 2, 1)
+            await { replacement.integrationReceipt().status == "acknowledged" }
+
+            replacement.admitFeature(feature(cut, 12, 0.32))
+            assertEquals("pendingAck", replacement.integrationReceipt().status)
+            assertEquals(3, replacement.integrationReceipt().geometryRevision)
+        } finally {
+            replacement.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `reopened acknowledged current gates begin and page failures until rebuild succeeds`() {
+        listOf("begin", "page").forEachIndexed { index, failurePoint ->
+            val directory = Files.createTempDirectory("canonical-surface-runtime-reopen-ack-$failurePoint").toFile()
+            val coordinator = budget(directory)
+            val messenger = MethodTestMessenger()
+            val viewId = 2141 + index
+            val firstBinding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+            val first = VisibilityGridIntegration(
+                firstBinding, firstBinding::currentObservationOwnership, directory,
+                resourcesForGroup = resources(directory, coordinator),
+            )
+            try {
+                val stream = start(firstBinding, messenger, viewId)
+                exchange(messenger, viewId, stream, 1, 0, 0, 0)
+                exchange(messenger, viewId, stream, 2, 0, 0, 0)
+                exchange(messenger, viewId, stream, 3, 1, 1, 1)
+                val cut = requireNotNull(firstBinding.currentObservationOwnership())
+                first.admitFeature(feature(cut, 10))
+                exchange(messenger, viewId, stream, 4, 1, 1, 1)
+                exchange(messenger, viewId, stream, 5, 1, 1, 1)
+                exchange(messenger, viewId, stream, 6, 1, 1, 1)
+                exchange(messenger, viewId, stream, 7, 2, 2, 1)
+                await { first.integrationReceipt().status == "acknowledged" }
+            } finally {
+                first.close(); firstBinding.dispose()
+            }
+
+            val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+            var armed = true
+            var finishCount = 0
+            val replacement = VisibilityGridIntegration(
+                binding, binding::currentObservationOwnership, directory,
+                resourcesForGroup = resources(directory, coordinator),
+                renderer = object : CommittedRendererProjection {
+                    override val maximumRows = 100_000
+                    override fun applyGeometry(cut: CommittedGeometryCut) = RendererProjectionResult.Applied(cut.upserts.size)
+                    override fun beginRebuild(cut: CommittedGeometryCut) {
+                        if (armed && failurePoint == "begin") { armed = false; throw IllegalStateException("injected begin") }
+                    }
+                    override fun appendRebuildPage(cut: CommittedGeometryCut) {
+                        if (armed && failurePoint == "page") { armed = false; throw IllegalStateException("injected page") }
+                    }
+                    override fun finishRebuild(cut: CommittedGeometryCut) { finishCount++ }
+                },
+            )
+            try {
+                val stream = start(binding, messenger, viewId)
+                exchange(messenger, viewId, stream, 1, 0, 0, 0)
+                exchange(messenger, viewId, stream, 2, 0, 0, 0)
+                exchange(messenger, viewId, stream, 3, 1, 1, 1)
+                val cut = requireNotNull(binding.currentObservationOwnership())
+
+                replacement.admitFeature(feature(cut, 11, 0.32))
+                assertEquals("rendererRebuildPending", replacement.integrationReceipt().status)
+                assertEquals(0, replacement.integrationReceipt().committed)
+
+                replacement.admitFeature(feature(cut, 12, 0.32))
+                assertEquals("rendererRebuildRecovered", replacement.integrationReceipt().status)
+                assertEquals(1, finishCount)
+
+                replacement.admitFeature(feature(cut, 13, 0.12))
+                assertEquals("nonMaterialRetained", replacement.integrationReceipt().status)
+            } finally {
+                replacement.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+            }
+        }
+    }
+
+    @Test
     fun `restart replays an unacknowledged v6 receipt before admitting a later batch`() {
         val directory = Files.createTempDirectory("canonical-surface-runtime-replay").toFile()
         val coordinator = budget(directory)
