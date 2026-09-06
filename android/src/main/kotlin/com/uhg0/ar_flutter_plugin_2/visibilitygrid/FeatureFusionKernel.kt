@@ -218,36 +218,12 @@ internal class FeatureFusionKernel(
             if (retained != 0 && retained != assignment.id.value.toInt()) return false
             copied += assignment
         }
-        val sortedNew = copied.filter { (if (it.kernelSlot < surfaceCount) canonicalIds[it.kernelSlot] else 0) == 0 }
-            .sortedWith { left, right -> java.lang.Integer.compareUnsigned(left.id.value.toInt(), right.id.value.toInt()) }
-        var extendLast = false
-        if (sortedNew.isNotEmpty()) {
-            val firstId = sortedNew.first().id.value
-            val lastId = sortedNew.last().id.value
-            val priorFingerprint = if (allocationRangeCount == 0) null else {
-                val offset = (allocationRangeCount - 1) * HASH_BYTES
-                CanonicalReceiptBytes(allocationFingerprints.copyOfRange(offset, offset + HASH_BYTES))
-            }
-            extendLast = allocationRangeCount > 0 &&
-                (allocationRangeEnds[allocationRangeCount - 1].toLong() and UINT32_MASK) + 1L == firstId &&
-                priorFingerprint == sortedNew.first().allocationFingerprint
-            if (lastId - firstId + 1L != sortedNew.size.toLong() ||
-                sortedNew.any { it.allocationFingerprint != sortedNew.first().allocationFingerprint } ||
-                (!extendLast && allocationRangeCount >= MAX_ALLOCATION_RANGES) ||
-                (allocationRangeCount > 0 && java.lang.Integer.compareUnsigned(
-                    allocationRangeEnds[allocationRangeCount - 1], firstId.toInt(),
-                ) >= 0)
-            ) return false
-        }
         prepared.assignments = copied
         prepared.canonicalFingerprints = ByteArray(Math.multiplyExact(copied.size, HASH_BYTES)).also { fingerprints ->
             copied.forEachIndexed { index, assignment ->
                 assignment.allocationFingerprint.toByteArray().copyInto(fingerprints, index * HASH_BYTES)
             }
         }
-        prepared.sortedNewAssignments = sortedNew
-        prepared.extendLastRange = extendLast
-        prepared.newRangeFingerprint = sortedNew.firstOrNull()?.allocationFingerprint?.toByteArray()
         return true
     }
 
@@ -280,7 +256,6 @@ internal class FeatureFusionKernel(
             observationCounts[update.slot] = encodeObservationState(
                 update.observationCount,
                 update.primarySide,
-                canonicalRangeIndex(observationCounts[update.slot]),
             )
             active[update.slot] = update.isActive
             axisXQ13[update.slot] = update.axisXQ13
@@ -289,10 +264,16 @@ internal class FeatureFusionKernel(
             positiveSupportQ13[update.slot] = update.positiveSupportQ13
             negativeSupportQ13[update.slot] = update.negativeSupportQ13
         }
-        for (assignment in prepared.sortedNewAssignments) {
-            canonicalIds[assignment.kernelSlot] = assignment.id.value.toInt()
-        }
         for ((assignmentIndex, assignment) in assignments.withIndex()) {
+            if (canonicalIds[assignment.kernelSlot] == 0) {
+                canonicalIds[assignment.kernelSlot] = assignment.id.value.toInt()
+                requireNotNull(prepared.canonicalFingerprints).copyInto(
+                    featureEvidenceAllocationFingerprints,
+                    assignment.kernelSlot * HASH_BYTES,
+                    assignmentIndex * HASH_BYTES,
+                    (assignmentIndex + 1) * HASH_BYTES,
+                )
+            }
             accumulatedWeights[assignment.kernelSlot] = encodeWeightAndCanonical(
                 retainedWeight(assignment.kernelSlot), assignment.packedNormal, assignment.normalConfidence,
             )
@@ -303,11 +284,6 @@ internal class FeatureFusionKernel(
                 (assignmentIndex + 1) * HASH_BYTES,
             )
         }
-        installCanonicalAllocationRange(
-            prepared.sortedNewAssignments,
-            prepared.extendLastRange,
-            prepared.newRangeFingerprint,
-        )
         lastSequence = prepared.sequence
         lastTimestampNs = prepared.timestampNs
         pending = null
@@ -505,48 +481,15 @@ internal class FeatureFusionKernel(
     }
 
     private fun observationCount(encoded: Int): Int = encoded and OBSERVATION_COUNT_MASK
-    private fun canonicalRangeIndex(encoded: Int): Int =
-        if (encoded and OBSERVATION_RANGE_PRESENT == 0) -1 else
-            (encoded ushr OBSERVATION_RANGE_SHIFT) and OBSERVATION_RANGE_MASK
     private fun primarySide(encoded: Int): FeaturePrimarySide = when (encoded ushr OBSERVATION_PRIMARY_SHIFT) {
         0 -> FeaturePrimarySide.NONE
         1 -> FeaturePrimarySide.POSITIVE
         2 -> FeaturePrimarySide.NEGATIVE
         else -> error("invalid retained primary-side state")
     }
-    private fun encodeObservationState(count: Int, side: FeaturePrimarySide, rangeIndex: Int = -1): Int {
+    private fun encodeObservationState(count: Int, side: FeaturePrimarySide): Int {
         require(count in 0..OBSERVATION_COUNT_MASK)
-        require(rangeIndex in -1 until MAX_ALLOCATION_RANGES)
-        val range = if (rangeIndex < 0) 0 else
-            OBSERVATION_RANGE_PRESENT or (rangeIndex shl OBSERVATION_RANGE_SHIFT)
-        return count or range or (side.code shl OBSERVATION_PRIMARY_SHIFT)
-    }
-    private fun setCanonicalRangeIndex(slot: Int, rangeIndex: Int) {
-        val encoded = observationCounts[slot]
-        observationCounts[slot] = encodeObservationState(
-            observationCount(encoded), primarySide(encoded), rangeIndex,
-        )
-    }
-
-    private fun installCanonicalAllocationRange(
-        assignments: List<CanonicalFeatureAssignment>,
-        extendLast: Boolean,
-        fingerprint: ByteArray?,
-    ) {
-        if (assignments.isEmpty()) return
-        val rangeIndex = if (extendLast) {
-            val existingIndex = allocationRangeCount - 1
-            allocationRangeEnds[existingIndex] = assignments.last().id.value.toInt()
-            existingIndex
-        } else {
-            val newIndex = allocationRangeCount
-            allocationRangeStarts[newIndex] = assignments.first().id.value.toInt()
-            allocationRangeEnds[newIndex] = assignments.last().id.value.toInt()
-            requireNotNull(fingerprint).copyInto(allocationFingerprints, newIndex * HASH_BYTES)
-            allocationRangeCount++
-            newIndex
-        }
-        for (assignment in assignments) setCanonicalRangeIndex(assignment.kernelSlot, rangeIndex)
+        return count or (side.code shl OBSERVATION_PRIMARY_SHIFT)
     }
 
     private fun insertAt(slot: Int, key: VoxelKey) {
@@ -579,7 +522,6 @@ internal class FeatureFusionKernel(
     @Synchronized
     internal fun assignCanonicalCorrelations(assignments: List<CanonicalFeatureAssignment>): Boolean {
         if (assignments.isEmpty()) return true
-        val sortedNew = ArrayList<CanonicalFeatureAssignment>()
         val seenSlots = HashSet<Int>()
         for (assignment in assignments) {
             val slot = assignment.kernelSlot
@@ -588,38 +530,16 @@ internal class FeatureFusionKernel(
             ) return false
             val encoded = assignment.id.value.toInt()
             val retained = canonicalIds[slot]
-            if (retained == 0) {
-                sortedNew += assignment
-            } else if (retained != encoded) return false
-        }
-        sortedNew.sortWith { left, right ->
-            java.lang.Integer.compareUnsigned(left.id.value.toInt(), right.id.value.toInt())
-        }
-        var extendLast = false
-        if (sortedNew.isNotEmpty()) {
-            val firstId = sortedNew.first().id.value
-            val lastId = sortedNew.last().id.value
-            val priorFingerprint = if (allocationRangeCount == 0) null else {
-                val offset = (allocationRangeCount - 1) * HASH_BYTES
-                CanonicalReceiptBytes(allocationFingerprints.copyOfRange(offset, offset + HASH_BYTES))
-            }
-            extendLast = allocationRangeCount > 0 &&
-                (allocationRangeEnds[allocationRangeCount - 1].toLong() and UINT32_MASK) + 1L == firstId &&
-                priorFingerprint == sortedNew.first().allocationFingerprint
-            if (lastId - firstId + 1L != sortedNew.size.toLong() ||
-                sortedNew.any { it.allocationFingerprint != sortedNew.first().allocationFingerprint } ||
-                (!extendLast && allocationRangeCount >= MAX_ALLOCATION_RANGES) ||
-                (allocationRangeCount > 0 &&
-                    java.lang.Integer.compareUnsigned(
-                        allocationRangeEnds[allocationRangeCount - 1],
-                        firstId.toInt(),
-                    ) >= 0)
-            ) return false
-        }
-        for (assignment in sortedNew) {
-            canonicalIds[assignment.kernelSlot] = assignment.id.value.toInt()
+            if (retained != 0 && retained != encoded) return false
         }
         for (assignment in assignments) {
+            if (canonicalIds[assignment.kernelSlot] == 0) {
+                canonicalIds[assignment.kernelSlot] = assignment.id.value.toInt()
+                assignment.allocationFingerprint.toByteArray().copyInto(
+                    featureEvidenceAllocationFingerprints,
+                    assignment.kernelSlot * HASH_BYTES,
+                )
+            }
             accumulatedWeights[assignment.kernelSlot] = encodeWeightAndCanonical(
                 retainedWeight(assignment.kernelSlot), assignment.packedNormal, assignment.normalConfidence,
             )
@@ -628,12 +548,6 @@ internal class FeatureFusionKernel(
                 assignment.kernelSlot * HASH_BYTES,
             )
         }
-        installCanonicalAllocationRange(
-            sortedNew,
-            extendLast,
-            if (extendLast || sortedNew.isEmpty()) null
-            else sortedNew.first().allocationFingerprint.toByteArray(),
-        )
         return true
     }
 
@@ -674,8 +588,6 @@ internal class FeatureFusionKernel(
         if (kernelSlot !in 0 until surfaceCount) return null
         val encodedId = canonicalIds[kernelSlot]
         if (encodedId == 0) return null
-        val rangeIndex = canonicalRangeIndex(observationCounts[kernelSlot])
-        if (rangeIndex !in 0 until allocationRangeCount) return null
         return CanonicalFeatureCorrelation(
             SurfaceId(encodedId.toLong() and UINT32_MASK),
             CanonicalReceiptBytes(canonicalAllocationFingerprints.copyOfRange(
@@ -690,10 +602,10 @@ internal class FeatureFusionKernel(
     /** Immutable allocation provenance recorded when this feature slot first gained canonical identity. */
     internal fun featureEvidenceAllocationFingerprint(kernelSlot: Int): CanonicalReceiptBytes? {
         if (kernelSlot !in 0 until surfaceCount || canonicalIds[kernelSlot] == 0) return null
-        val rangeIndex = canonicalRangeIndex(observationCounts[kernelSlot])
-        if (rangeIndex !in 0 until allocationRangeCount) return null
-        val offset = rangeIndex * HASH_BYTES
-        return CanonicalReceiptBytes(allocationFingerprints.copyOfRange(offset, offset + HASH_BYTES))
+        return CanonicalReceiptBytes(featureEvidenceAllocationFingerprints.copyOfRange(
+            kernelSlot * HASH_BYTES,
+            (kernelSlot + 1) * HASH_BYTES,
+        ))
     }
 
     /** Resolves one retained feature slot by its exact voxel and canonical identity. */
@@ -830,9 +742,6 @@ internal class FeatureFusionKernel(
     ) {
         var assignments: List<CanonicalFeatureAssignment>? = null
         var canonicalFingerprints: ByteArray? = null
-        var sortedNewAssignments: List<CanonicalFeatureAssignment> = emptyList()
-        var extendLastRange: Boolean = false
-        var newRangeFingerprint: ByteArray? = null
     }
 
     private class PendingCanonicalRemap(
@@ -855,11 +764,9 @@ internal class FeatureFusionKernel(
     private val surfaceKeys = LongArray(SURFACE_CAPACITY)
     private val canonicalIds = IntArray(SURFACE_CAPACITY)
     // Canonical association provenance is mutable after replacement, while the
-    // allocation-range table below remains immutable historical feature evidence.
+    // per-slot feature-evidence provenance is installed once and stays immutable.
     private val canonicalAllocationFingerprints = ByteArray(SURFACE_CAPACITY * HASH_BYTES)
-    private val allocationRangeStarts = IntArray(MAX_ALLOCATION_RANGES)
-    private val allocationRangeEnds = IntArray(MAX_ALLOCATION_RANGES)
-    private val allocationFingerprints = ByteArray(MAX_ALLOCATION_RANGES * HASH_BYTES)
+    private val featureEvidenceAllocationFingerprints = ByteArray(SURFACE_CAPACITY * HASH_BYTES)
     private val accumulatedWeights = IntArray(SURFACE_CAPACITY)
     private val observationCounts = IntArray(SURFACE_CAPACITY)
     private val active = BooleanArray(SURFACE_CAPACITY)
@@ -875,7 +782,6 @@ internal class FeatureFusionKernel(
     private val hashSlots = IntArray(HASH_SLOTS)
     private var surfaceCount = 0
     private var associationCount = 0
-    private var allocationRangeCount = 0
     private var lastSequence = Long.MIN_VALUE
     private var lastTimestampNs = Long.MIN_VALUE
     private var pending: PendingApplication? = null
@@ -903,8 +809,7 @@ internal class FeatureFusionKernel(
         const val ASSOCIATION_CAPACITY = 200_000
         const val HASH_SLOTS = 262_144
         const val HASH_MASK = HASH_SLOTS - 1
-        const val CANONICAL_SURFACE_TUPLE_SHARE_BYTES = 10_789_976
-        const val MAX_ALLOCATION_RANGES = 1_024
+        const val CANONICAL_SURFACE_TUPLE_SHARE_BYTES = 13_948_984
         const val HASH_BYTES = 32
         const val UINT32_MASK = 0xffff_ffffL
         const val HYDRATED_AXIS_SCALE = 1_024
@@ -912,9 +817,6 @@ internal class FeatureFusionKernel(
         const val DEACTIVATION_THRESHOLD = 1
         const val EVIDENCE_SATURATION = 127
         const val OBSERVATION_COUNT_MASK = (1 shl 18) - 1
-        const val OBSERVATION_RANGE_SHIFT = 18
-        const val OBSERVATION_RANGE_MASK = (1 shl 10) - 1
-        const val OBSERVATION_RANGE_PRESENT = 1 shl 28
         const val OBSERVATION_PRIMARY_SHIFT = 30
         const val VOXEL_METERS = 0.1
         const val VOXEL_MIN = -(1 shl 20).toDouble()

@@ -653,8 +653,17 @@ internal class VisibilityGridIntegration(
             receipt = receipt.copy(status = "canonicalRefused", rejected = rejected)
             return
         }
-        val assignments = canonicalAssignments(changes, prepared.mutation)
+        val assignments = requireNotNull(resources).withFeaturePlanningCurrent { current ->
+            canonicalAssignments(changes, prepared.mutation, current)
+        } ?: run {
+            prepared.mutation.discard()
+            requireNotNull(kernel).discardPrepared()
+            rejected++
+            receipt = receipt.copy(status = "v6ReadRefused", rejected = rejected)
+            return
+        }
         if (!requireNotNull(kernel).prepareCanonicalApplication(assignments)) {
+            prepared.mutation.discard()
             requireNotNull(kernel).discardPrepared()
             rejected++
             receipt = receipt.copy(status = "kernelApplyRefused", rejected = rejected)
@@ -714,8 +723,17 @@ internal class VisibilityGridIntegration(
             }
             return
         }
-        val assignments = canonicalAssignments(changes, prepared.mutation)
+        val assignments = requireNotNull(resources).withFeaturePlanningCurrent { current ->
+            canonicalAssignments(changes, prepared.mutation, current)
+        } ?: run {
+            prepared.mutation.discard()
+            requireNotNull(kernel).discardPrepared()
+            rejected++
+            receipt = receipt.copy(status = "v6ReadRefused", rejected = rejected)
+            return
+        }
         if (!requireNotNull(kernel).prepareCanonicalApplication(assignments)) {
+            prepared.mutation.discard()
             requireNotNull(kernel).discardPrepared()
             rejected++
             receipt = receipt.copy(status = "kernelApplyRefused", rejected = rejected)
@@ -741,24 +759,36 @@ internal class VisibilityGridIntegration(
     private fun canonicalAssignments(
         changes: List<FeatureFusionChange>,
         mutation: PreparedCanonicalMutation,
-    ): List<CanonicalFeatureAssignment> {
+        current: CanonicalStateView,
+    ): List<CanonicalFeatureAssignment>? {
         val slots = HashMap<Voxel, Int>()
         changes.forEach { change ->
             val upsert = change as? FeatureFusionChange.Upsert ?: return@forEach
             check(upsert.kernelSlot >= 0)
             slots[Voxel(upsert.x, upsert.y, upsert.z)] = upsert.kernelSlot
         }
-        val assignments = ArrayList<CanonicalFeatureAssignment>(mutation.dirtyRowCount)
-        check(mutation.visitDirtyRows { row ->
-            val slot = slots[row.voxel] ?: return@visitDirtyRows false
-            assignments += CanonicalFeatureAssignment(
-                slot, row.voxel.x, row.voxel.y, row.voxel.z, row.id, row.allocationFingerprint,
-                row.packedNormal, row.normalConfidence,
-            )
-            true
-        })
-        check(assignments.size == slots.size) {
-            "prepared canonical mutation did not name every staged kernel upsert"
+        val dirty = HashMap<Voxel, PreparedRow>(mutation.dirtyRowCount)
+        if (!mutation.visitDirtyRows { row ->
+            dirty[row.voxel] = row
+            slots.containsKey(row.voxel)
+        }) return null
+        val assignments = ArrayList<CanonicalFeatureAssignment>(slots.size)
+        slots.forEach { (voxel, slot) ->
+            val row = dirty[voxel]
+            if (row != null) {
+                assignments += CanonicalFeatureAssignment(
+                    slot, voxel.x, voxel.y, voxel.z, row.id, row.allocationFingerprint,
+                    row.packedNormal, row.normalConfidence,
+                )
+            } else {
+                val existing = current.findByVoxel(voxel) ?: return null
+                val source = (current.readSourceById(existing.id) as? CanonicalPageRead.Complete)?.value
+                    ?: return null
+                assignments += CanonicalFeatureAssignment(
+                    slot, voxel.x, voxel.y, voxel.z, existing.id, source.allocationFingerprint,
+                    existing.packedNormal, existing.normalConfidence,
+                )
+            }
         }
         return assignments
     }
