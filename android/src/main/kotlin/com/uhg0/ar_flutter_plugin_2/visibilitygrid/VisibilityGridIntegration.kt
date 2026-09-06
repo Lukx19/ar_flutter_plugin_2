@@ -116,6 +116,7 @@ internal class VisibilityGridIntegration(
     private var pendingRendererApplied = false
     private var pendingRendererRebuildRequired = false
     private var pendingBindingAcknowledged = false
+    private var pendingEarlyAcknowledged = false
     private var pendingRendererRows = 0
     private var pendingCanonicalAcknowledgement: CanonicalAcknowledgement? = null
     private var pendingDepthCommit: PendingDepthCommit? = null
@@ -764,6 +765,7 @@ internal class VisibilityGridIntegration(
         pendingRendererApplied = rendererAlreadyCurrent
         pendingRendererRebuildRequired = rendererRebuildRequired
         pendingBindingAcknowledged = false
+        pendingEarlyAcknowledged = false
         pendingRendererRows = if (rendererAlreadyCurrent) renderer.currentRowCount() else 0
         committed++
         receipt = VisibilityGridIntegrationReceipt(
@@ -778,6 +780,7 @@ internal class VisibilityGridIntegration(
     /** Idempotently correlates the already-retained durable current to V2. */
     private fun retryPendingQueue(): Boolean {
         val selector = pending ?: return true
+        if (pendingEarlyAcknowledged) pendingQueued = true
         if (!pendingQueued) {
             try {
                 when (queueCurrent(binding, retainedDelta, selector)) {
@@ -892,8 +895,12 @@ internal class VisibilityGridIntegration(
         runCatching {
             executor.submit {
                 synchronized(lock) {
-                    if (pending != selector || !pendingQueued || closed) return@synchronized
+                    if (pending != selector || closed) return@synchronized
                     pendingBindingAcknowledged = true
+                    if (!pendingQueued) {
+                        pendingEarlyAcknowledged = true
+                        return@synchronized
+                    }
                     if (!pendingRendererApplied) {
                         receipt = receipt.copy(
                             status = if (pendingRendererRebuildRequired) "rendererRebuildPending" else "rendererRetryPending",
@@ -924,6 +931,7 @@ internal class VisibilityGridIntegration(
         pendingRendererApplied = false
         pendingRendererRebuildRequired = false
         pendingBindingAcknowledged = false
+        pendingEarlyAcknowledged = false
         pendingRendererRows = 0
         pendingCanonicalAcknowledgement = null
         receipt = receipt.copy(status = "acknowledged")
@@ -938,6 +946,7 @@ internal class VisibilityGridIntegration(
         pendingRendererApplied = false
         pendingRendererRebuildRequired = false
         pendingBindingAcknowledged = false
+        pendingEarlyAcknowledged = false
         pendingRendererRows = 0
         resources?.close() ?: owner?.close()
         resources = null

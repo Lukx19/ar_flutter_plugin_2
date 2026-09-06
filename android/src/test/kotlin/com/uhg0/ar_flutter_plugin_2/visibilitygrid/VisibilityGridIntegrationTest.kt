@@ -222,7 +222,7 @@ class VisibilityGridIntegrationTest {
     }
 
     @Test
-    fun `depth queue boundary reuses exact current and cut without reapplying evidence`() {
+    fun `depth queue boundary retains synchronous early ACK and recovers without reapplying evidence`() {
         val directory = Files.createTempDirectory("canonical-surface-runtime-depth-queue-boundary").toFile()
         val coordinator = budget(directory)
         val messenger = MethodTestMessenger()
@@ -231,9 +231,12 @@ class VisibilityGridIntegrationTest {
         lateinit var depthKernel: DepthEvidenceKernel
         lateinit var featureKernel: FeatureFusionKernel
         val queuedReceipts = mutableListOf<CurrentDeltaReceiptV1>()
+        val queuedCuts = mutableListOf<CommittedGeometryCut>()
         val projected = mutableListOf<CommittedGeometryCut>()
         var throwAfterExactQueue = true
-        val integration = VisibilityGridIntegration(
+        lateinit var stream: Stream
+        lateinit var integration: VisibilityGridIntegration
+        integration = VisibilityGridIntegration(
             binding, binding::currentObservationOwnership, directory,
             resourcesForGroup = resources(directory, coordinator),
             depthKernelFactory = {
@@ -242,9 +245,14 @@ class VisibilityGridIntegrationTest {
             featureKernelFactory = { FeatureFusionKernel().also { featureKernel = it } },
             queueCurrent = { activeBinding, source, selector ->
                 queuedReceipts += requireNotNull(source.selectCurrentDelta(selector))
+                queuedCuts += requireNotNull(integration.pendingPublicationGeometryCut())
                 val result = activeBinding.queueCommittedCurrentDelta(source, selector)
                 if (throwAfterExactQueue) {
                     throwAfterExactQueue = false
+                    exchange(messenger, viewId, stream, 4, 1, 1, 1)
+                    exchange(messenger, viewId, stream, 5, 1, 1, 1)
+                    exchange(messenger, viewId, stream, 6, 1, 1, 1)
+                    exchange(messenger, viewId, stream, 7, 2, 2, 1)
                     throw IllegalStateException("injected lost queue acknowledgement")
                 }
                 result
@@ -257,7 +265,7 @@ class VisibilityGridIntegrationTest {
             },
         )
         try {
-            val stream = start(binding, messenger, viewId)
+            stream = start(binding, messenger, viewId)
             exchange(messenger, viewId, stream, 1, 0, 0, 0)
             exchange(messenger, viewId, stream, 2, 0, 0, 0)
             exchange(messenger, viewId, stream, 3, 1, 1, 1)
@@ -269,23 +277,23 @@ class VisibilityGridIntegrationTest {
             assertEquals(1L, integration.snapshot().admittedDepths)
             val depthAfterCommit = depthKernel.resourceReceipt()
             val featureAfterCommit = featureKernel.resourceReceipt()
-            val retainedCut = requireNotNull(integration.pendingPublicationGeometryCut())
 
             integration.admitDepth(depth(cut, 11))
 
-            assertEquals(2, queuedReceipts.size)
-            assertEquals(queuedReceipts[0].selector, queuedReceipts[1].selector)
-            assertEquals(queuedReceipts[0].baseGeometryRevision, queuedReceipts[1].baseGeometryRevision)
-            assertArrayEquals(queuedReceipts[0].bytes, queuedReceipts[1].bytes)
-            assertArrayEquals(queuedReceipts[0].commandHash, queuedReceipts[1].commandHash)
+            assertEquals("acknowledged", integration.integrationReceipt().status)
+            assertEquals(1, queuedReceipts.size)
             assertEquals(1, projected.size)
-            assertTrue(retainedCut === integration.pendingPublicationGeometryCut())
-            assertTrue(retainedCut === projected.single())
+            assertEquals(1, queuedCuts.size)
+            assertTrue(queuedCuts[0] === projected.single())
             assertEquals(queuedReceipts[0].selector.transactionId, projected.single().transactionId)
             assertEquals(queuedReceipts[0].selector.targetGeometryRevision, projected.single().geometryRevision)
             assertEquals(depthAfterCommit, depthKernel.resourceReceipt())
             assertEquals(featureAfterCommit, featureKernel.resourceReceipt())
             assertEquals(1L, integration.snapshot().admittedDepths)
+
+            integration.admitDepth(depth(cut, 12))
+            assertEquals("pendingAck", integration.integrationReceipt().status)
+            assertEquals(2L, integration.snapshot().admittedDepths)
         } finally {
             integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
         }
