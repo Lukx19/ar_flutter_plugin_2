@@ -29,7 +29,13 @@ private data class PendingRendererRebuild(
     val geometryRevision: Long,
     val lineageRevision: Long,
     val hydrateKernel: Boolean,
-)
+) {
+    companion object {
+        // Conservative portable model: object/header and alignment (24), one
+        // ownership reference (8), three Long scalars (24), Boolean slot (8).
+        const val PORTABLE_BYTES = 64L
+    }
+}
 
 internal data class PendingDepthRetentionReceipt(
     val pendingOwnerScalarBytes: Long,
@@ -122,7 +128,6 @@ internal class VisibilityGridIntegration(
     private var pendingQueued = false
     private var pendingGeometryCut: CommittedGeometryCut? = null
     private var pendingRendererApplied = false
-    private var pendingRendererRebuildRequired = false
     private var pendingRendererRebuild: PendingRendererRebuild? = null
     private var pendingBindingAcknowledged = false
     private var pendingEarlyAcknowledged = false
@@ -277,9 +282,14 @@ internal class VisibilityGridIntegration(
     /** Portable scalar owners only; kernel/renderer arrays and phase buffers are named separately. */
     internal fun portableOwnerMemoryReceipt(): RuntimeOwnerMemoryReceipt = synchronized(lock) {
         RuntimeOwnerMemoryReceipt(
-            integrationObjectBytes = 152,
+            // The renderer-rebuild reference and early-ACK scalar were added
+            // after the locked 152-byte owner model; charge one 8-byte slot each.
+            integrationObjectBytes = 168,
             integrationReceiptBytes = 104,
             retainedDeltaOwnerBytes = 16,
+            pendingRendererRebuildBytes = pendingRendererRebuild?.let {
+                PendingRendererRebuild.PORTABLE_BYTES
+            } ?: 0,
             runtimeOwnerBytes = resources?.portableOwnerBytes() ?: 0,
             bindingOwnerBytes = binding.portableOwnerBytes(),
             coordinatorOwnerBytes = resources?.portableCoordinatorOwnerBytes() ?: 0,
@@ -786,7 +796,6 @@ internal class VisibilityGridIntegration(
         pendingQueued = false
         pendingGeometryCut = geometryCut
         pendingRendererApplied = rendererAlreadyCurrent
-        pendingRendererRebuildRequired = rendererRebuildRequired
         pendingRendererRebuild = if (rendererRebuildRequired) PendingRendererRebuild(
             expected, selector.transactionId, state.cut.geometryRevision,
             state.cut.lineageRevision, rendererRebuildHydratesKernel,
@@ -824,13 +833,12 @@ internal class VisibilityGridIntegration(
             }
         }
         if (!pendingRendererApplied) {
-            if (pendingRendererRebuildRequired) {
-                val rebuild = pendingRendererRebuild ?: return false
+            val rebuild = pendingRendererRebuild
+            if (rebuild != null) {
                 if (!retryRendererRebuild(rebuild)) {
                     receipt = receipt.copy(status = "rendererRebuildPending")
                     return false
                 }
-                pendingRendererRebuildRequired = false
                 pendingRendererRebuild = null
                 pendingRendererApplied = true
                 pendingRendererRows = renderer.currentRowCount()
@@ -843,12 +851,10 @@ internal class VisibilityGridIntegration(
                 val result = try {
                     renderer.applyGeometry(cut)
                 } catch (_: IllegalStateException) {
-                    pendingRendererRebuildRequired = true
                     pendingRendererRebuild = cut.toPendingRendererRebuild(hydrateKernel = false)
                     receipt = receipt.copy(status = "rendererRebuildPending")
                     return false
                 } catch (_: IllegalArgumentException) {
-                    pendingRendererRebuildRequired = true
                     pendingRendererRebuild = cut.toPendingRendererRebuild(hydrateKernel = false)
                     receipt = receipt.copy(status = "rendererRebuildPending")
                     return false
@@ -859,7 +865,6 @@ internal class VisibilityGridIntegration(
                         pendingRendererRows = result.rowCount
                     }
                     is RendererProjectionResult.Refused -> {
-                        pendingRendererRebuildRequired = true
                         pendingRendererRebuild = cut.toPendingRendererRebuild(hydrateKernel = false)
                         rejected++
                         receipt = receipt.copy(status = "rendererRebuildPending", rejected = rejected)
@@ -949,7 +954,7 @@ internal class VisibilityGridIntegration(
                     }
                     if (!pendingRendererApplied) {
                         receipt = receipt.copy(
-                            status = if (pendingRendererRebuildRequired) "rendererRebuildPending" else "rendererRetryPending",
+                            status = if (pendingRendererRebuild != null) "rendererRebuildPending" else "rendererRetryPending",
                         )
                         return@synchronized
                     }
@@ -975,7 +980,6 @@ internal class VisibilityGridIntegration(
         pendingQueued = false
         pendingGeometryCut = null
         pendingRendererApplied = false
-        pendingRendererRebuildRequired = false
         pendingRendererRebuild = null
         pendingBindingAcknowledged = false
         pendingEarlyAcknowledged = false
@@ -991,7 +995,6 @@ internal class VisibilityGridIntegration(
         pendingQueued = false
         pendingGeometryCut = null
         pendingRendererApplied = false
-        pendingRendererRebuildRequired = false
         pendingRendererRebuild = null
         pendingBindingAcknowledged = false
         pendingEarlyAcknowledged = false
@@ -1012,13 +1015,22 @@ internal data class RuntimeOwnerMemoryReceipt(
     val integrationObjectBytes: Long,
     val integrationReceiptBytes: Long,
     val retainedDeltaOwnerBytes: Long,
+    val pendingRendererRebuildBytes: Long,
     val runtimeOwnerBytes: Long,
     val bindingOwnerBytes: Long,
     val coordinatorOwnerBytes: Long,
     val rendererOwnerBytes: Long,
 ) {
-    val portableBytes: Long get() = integrationObjectBytes + integrationReceiptBytes + retainedDeltaOwnerBytes +
-        runtimeOwnerBytes + bindingOwnerBytes + coordinatorOwnerBytes + rendererOwnerBytes
+    val portableBytes: Long get() = listOf(
+        integrationObjectBytes,
+        integrationReceiptBytes,
+        retainedDeltaOwnerBytes,
+        pendingRendererRebuildBytes,
+        runtimeOwnerBytes,
+        bindingOwnerBytes,
+        coordinatorOwnerBytes,
+        rendererOwnerBytes,
+    ).fold(0L, Math::addExact)
 }
 
 private class RendererRebuildFenced : RuntimeException()

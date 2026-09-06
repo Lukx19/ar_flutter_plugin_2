@@ -1078,15 +1078,35 @@ class VisibilityGridIntegrationTest {
                 replacement.admitFeature(feature(cut, 11, 0.32))
                 assertEquals("rendererRebuildPending", replacement.integrationReceipt().status)
                 assertEquals(0, replacement.integrationReceipt().committed)
+                replacement.portableOwnerMemoryReceipt().let { memory ->
+                    assertEquals(168L, memory.integrationObjectBytes)
+                    assertEquals(64L, memory.pendingRendererRebuildBytes)
+                    assertEquals(
+                        listOf(
+                            memory.integrationObjectBytes,
+                            memory.integrationReceiptBytes,
+                            memory.retainedDeltaOwnerBytes,
+                            memory.pendingRendererRebuildBytes,
+                            memory.runtimeOwnerBytes,
+                            memory.bindingOwnerBytes,
+                            memory.coordinatorOwnerBytes,
+                            memory.rendererOwnerBytes,
+                        ).fold(0L, Math::addExact),
+                        memory.portableBytes,
+                    )
+                }
 
                 replacement.admitFeature(feature(cut, 12, 0.32))
                 assertEquals("rendererRebuildRecovered", replacement.integrationReceipt().status)
                 assertEquals(1, finishCount)
+                assertEquals(0L, replacement.portableOwnerMemoryReceipt().pendingRendererRebuildBytes)
 
                 replacement.admitFeature(feature(cut, 13, 0.12))
                 assertEquals("nonMaterialRetained", replacement.integrationReceipt().status)
             } finally {
-                replacement.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+                replacement.close()
+                assertEquals(0L, replacement.portableOwnerMemoryReceipt().pendingRendererRebuildBytes)
+                binding.dispose(); coordinator.close(); directory.deleteRecursively()
             }
         }
     }
