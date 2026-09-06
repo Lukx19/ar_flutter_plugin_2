@@ -865,6 +865,7 @@ class AndroidVisibilityGridRuntimeTest {
         val reconfigurationAttempted = CountDownLatch(1)
         val reconfigurationReturned = CountDownLatch(1)
         val freshDepthDelivered = CountDownLatch(1)
+        val freshDepthCleanedUp = CountDownLatch(1)
         val invalidated = AtomicBoolean()
         val deliveryCount = AtomicLong()
         val cleanupOrder = AtomicLong()
@@ -898,6 +899,11 @@ class AndroidVisibilityGridRuntimeTest {
                     cleanupOrder.get() == 0L
                 ) {
                     cleanupOrder.compareAndSet(0L, sequence.incrementAndGet())
+                }
+                if (source == VisibilityObservationSource.SYNTHETIC_DEPTH &&
+                    deliveryCount.get() >= 2L
+                ) {
+                    freshDepthCleanedUp.countDown()
                 }
             },
             afterDepthCapabilityInvalidated = {
@@ -938,7 +944,7 @@ class AndroidVisibilityGridRuntimeTest {
 
             assertTrue(runtime.offerDepth(depth(cut.get(), 3_000_000, 3)))
             assertTrue(freshDepthDelivered.await(1, TimeUnit.SECONDS))
-            runtime.pause()
+            assertTrue(freshDepthCleanedUp.await(1, TimeUnit.SECONDS))
             assertEquals(0, runtime.snapshot().residentPayloadBytes)
             assertEquals(1, runtime.snapshot().admittedDepthObservations)
         } finally {
