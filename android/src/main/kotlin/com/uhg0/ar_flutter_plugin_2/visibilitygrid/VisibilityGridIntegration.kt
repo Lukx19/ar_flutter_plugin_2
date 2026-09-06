@@ -1506,12 +1506,14 @@ private class CanonicalRemapList(
             SurfaceId(previousIds[index]),
             nextIds[index].takeIf { it != 0L }?.let(::SurfaceId),
             nextIds[index].takeIf { it != 0L && hasMetadata[index] }?.let {
-                CanonicalReceiptBytes(fingerprints.copyOfRange(
-                    index * FeatureFusionKernel.HASH_BYTES,
-                    (index + 1) * FeatureFusionKernel.HASH_BYTES,
-                ))
+                CanonicalFeatureProvenance(
+                    CanonicalReceiptBytes(fingerprints.copyOfRange(
+                        index * FeatureFusionKernel.HASH_BYTES,
+                        (index + 1) * FeatureFusionKernel.HASH_BYTES,
+                    )),
+                    packedNormals[index], normalConfidences[index],
+                )
             },
-            packedNormals[index], normalConfidences[index],
         )
     }
 }

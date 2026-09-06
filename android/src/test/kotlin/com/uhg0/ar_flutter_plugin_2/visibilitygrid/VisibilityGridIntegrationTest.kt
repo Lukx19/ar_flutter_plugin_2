@@ -760,14 +760,7 @@ class VisibilityGridIntegrationTest {
             exchange(messenger, viewId, stream, 11, 3, 3, 2)
             await { integration.integrationReceipt().status == "acknowledged" }
             integration.admitFeature(feature(ownership, 30, x = -0.75, z = -0.95))
-            assertTrue(integration.integrationReceipt().status != "kernelApplyRefused")
-            if (integration.integrationReceipt().status == "pendingAck") {
-                exchange(messenger, viewId, stream, 12, 3, 3, 2)
-                exchange(messenger, viewId, stream, 13, 3, 3, 2)
-                exchange(messenger, viewId, stream, 14, 3, 3, 2)
-                exchange(messenger, viewId, stream, 15, 4, 4, 2)
-                await { integration.integrationReceipt().status == "acknowledged" }
-            }
+            assertEquals("nonMaterialRetained", integration.integrationReceipt().status)
             integration.close()
             binding.dispose()
 
@@ -787,7 +780,7 @@ class VisibilityGridIntegrationTest {
                 exchange(messenger, viewId, reopenedStream, 3, 1, 1, 1)
                 val reopenedOwnership = requireNotNull(reopenedBinding.currentObservationOwnership())
                 reopened.admitFeature(feature(reopenedOwnership, 40, x = -0.75, z = -0.95))
-                assertTrue(reopened.integrationReceipt().status != "kernelApplyRefused")
+                assertEquals("nonMaterialRetained", reopened.integrationReceipt().status)
                 val expected = requireNotNull(replacementCorrelations[0])
                 val reopenedSlot = requireNotNull(reopenedKernel.canonicalFeatureSlot(firstVoxel, expected.id))
                 assertEquals(expected.allocationFingerprint, reopenedKernel.canonicalCorrelation(reopenedSlot)?.allocationFingerprint)

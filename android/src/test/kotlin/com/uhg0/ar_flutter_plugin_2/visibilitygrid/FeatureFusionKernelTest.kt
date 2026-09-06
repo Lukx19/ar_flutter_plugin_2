@@ -247,7 +247,8 @@ class FeatureFusionKernelTest {
         )))
         assertTrue(kernel.prepareCanonicalRemap(
             CanonicalFeatureRemap(
-                change.kernelSlot, SurfaceId(17), SurfaceId(42), replacementFingerprint, 0x0304, 211,
+                change.kernelSlot, SurfaceId(17), SurfaceId(42),
+                CanonicalFeatureProvenance(replacementFingerprint, 0x0304, 211),
             ),
         ) is FeatureCanonicalRemapPreparation.Prepared)
         kernel.applyPreparedCanonicalRemap()

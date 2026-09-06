@@ -139,14 +139,15 @@ internal class FeatureFusionKernel(
             }
             slots[index] = slot
             targetIds[index] = target
-            remap.nextAllocationFingerprint?.let { fingerprint ->
-                if (fingerprint.size != HASH_BYTES || remap.nextPackedNormal !in 0..0xffff ||
-                    remap.nextNormalConfidence !in 0..255 || remap.nextSurfaceId == null
+            remap.nextProvenance?.let { provenance ->
+                if (provenance.allocationFingerprint.size != HASH_BYTES ||
+                    provenance.packedNormal !in 0..0xffff || provenance.normalConfidence !in 0..255 ||
+                    remap.nextSurfaceId == null
                 ) return CanonicalRemapStage.Refused(FeatureCanonicalRemapRefusal.INVALID_ID)
                 hasCanonicalMetadata[index] = true
-                fingerprint.toByteArray().copyInto(fingerprints, index * HASH_BYTES)
-                packedNormals[index] = remap.nextPackedNormal
-                normalConfidences[index] = remap.nextNormalConfidence
+                provenance.allocationFingerprint.toByteArray().copyInto(fingerprints, index * HASH_BYTES)
+                packedNormals[index] = provenance.packedNormal
+                normalConfidences[index] = provenance.normalConfidence
             }
         }
         return CanonicalRemapStage.Accepted(PendingCanonicalRemap(
@@ -1015,9 +1016,12 @@ internal data class CanonicalFeatureRemap(
     val featureSlot: Int,
     val previousSurfaceId: SurfaceId,
     val nextSurfaceId: SurfaceId?,
-    val nextAllocationFingerprint: CanonicalReceiptBytes? = null,
-    val nextPackedNormal: Int = 0,
-    val nextNormalConfidence: Int = 0,
+    val nextProvenance: CanonicalFeatureProvenance? = null,
+)
+internal data class CanonicalFeatureProvenance(
+    val allocationFingerprint: CanonicalReceiptBytes,
+    val packedNormal: Int,
+    val normalConfidence: Int,
 )
 internal sealed interface FeatureCanonicalRemapPreparation {
     data class Prepared(val count: Int) : FeatureCanonicalRemapPreparation
