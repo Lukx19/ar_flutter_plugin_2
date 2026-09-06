@@ -275,17 +275,24 @@ class AndroidVisibilityGridRuntimeTest {
         val featureEntered = CountDownLatch(1)
         val featureRelease = CountDownLatch(1)
         val depthDelivered = CountDownLatch(1)
+        val mappedFeatures = AtomicLong()
+        val mappedDepths = AtomicLong()
         val runtime = runtime(
             cut = cut,
             mapper = object : VisibilityObservationMapper {
                 override fun admitFeature(observation: VisibilityFeatureObservation) {
                     featureEntered.countDown()
                     featureRelease.await(2, TimeUnit.SECONDS)
+                    mappedFeatures.incrementAndGet()
                 }
 
                 override fun admitDepth(observation: VisibilityDepthObservation) {
+                    mappedDepths.incrementAndGet()
                     depthDelivered.countDown()
                 }
+                override fun snapshot() = VisibilityMappingAdmissionHealth.empty().copy(
+                    admittedFeatures = mappedFeatures.get(), admittedDepths = mappedDepths.get(),
+                )
             },
         )
         try {
@@ -315,6 +322,7 @@ class AndroidVisibilityGridRuntimeTest {
         val delivered = CopyOnWriteArrayList<Int>()
         val complete = CountDownLatch(2)
         val deliveryTimes = CopyOnWriteArrayList<Long>()
+        val mappedFeatures = AtomicLong()
         val runtime = runtime(
             cut = cut,
             intervalNs = 40_000_000,
@@ -326,10 +334,14 @@ class AndroidVisibilityGridRuntimeTest {
                         entered.countDown()
                         release.await(2, TimeUnit.SECONDS)
                     }
+                    mappedFeatures.incrementAndGet()
                     complete.countDown()
                 }
 
                 override fun admitDepth(observation: VisibilityDepthObservation) = Unit
+                override fun snapshot() = VisibilityMappingAdmissionHealth.empty().copy(
+                    admittedFeatures = mappedFeatures.get(),
+                )
             },
         )
         try {
@@ -400,6 +412,133 @@ class AndroidVisibilityGridRuntimeTest {
             assertTrue(health.toWireMap().size <= 64)
             assertFalse(health.toWireMap().values.any { it is Collection<*> || it is ByteArray })
         } finally {
+            runtime.close()
+        }
+    }
+
+    @Test
+    fun `mapper snapshot deltas count accepted work across lanes and ignore refusal`() {
+        val cut = AtomicReference(ownership())
+        val features = AtomicLong()
+        val depths = AtomicLong()
+        val deliveries = CountDownLatch(2)
+        val accept = AtomicBoolean(false)
+        val mapper = object : VisibilityObservationMapper {
+            override fun admitFeature(observation: VisibilityFeatureObservation) {
+                if (accept.get()) {
+                    features.incrementAndGet()
+                    // Models a staged depth commit completed by feature admission.
+                    depths.incrementAndGet()
+                }
+                deliveries.countDown()
+            }
+            override fun admitDepth(observation: VisibilityDepthObservation) = Unit
+            override fun snapshot() = VisibilityMappingAdmissionHealth.empty().copy(
+                admittedFeatures = features.get(), admittedDepths = depths.get(),
+            )
+        }
+        val runtime = runtime(cut, mapper)
+        try {
+            runtime.recordFeatureTransientUnavailable()
+            runtime.recordFeatureStalled()
+            assertTrue(runtime.offerFeature(feature(cut.get(), 1, 1)))
+            await { deliveries.count == 1L }
+            assertEquals(VisibilitySourceHealth.HEALTHY, runtime.snapshot().featureHealth)
+            assertEquals(0, runtime.snapshot().featureFailures)
+            assertEquals(0, runtime.snapshot().admittedFeatureObservations)
+            assertEquals(0, runtime.snapshot().admittedDepthObservations)
+
+            accept.set(true)
+            assertTrue(runtime.offerFeature(feature(cut.get(), 2_000_000, 2)))
+            assertTrue(deliveries.await(1, TimeUnit.SECONDS))
+            await { runtime.snapshot().admittedDepthObservations == 1L }
+            assertEquals(1, runtime.snapshot().admittedFeatureObservations)
+            assertEquals(1, runtime.snapshot().admittedDepthObservations)
+        } finally {
+            runtime.close()
+        }
+    }
+
+    @Test
+    fun `source health permits transient recovery and isolates terminal lane failures`() {
+        val cut = AtomicReference(ownership())
+        val runtime = runtime(cut)
+        try {
+            assertFalse(runtime.shouldCopyDepth(1))
+            assertFalse(runtime.offerDepth(depth(cut.get(), 1, 1)))
+
+            runtime.setDepthCapability(VisibilityDepthCapability.RAW_DEPTH)
+            runtime.recordDepthTransientUnavailable()
+            runtime.recordDepthStalled()
+            assertTrue(runtime.offerDepth(depth(cut.get(), 2, 2)))
+            await { runtime.snapshot().admittedDepthObservations == 1L }
+            assertEquals(VisibilitySourceHealth.HEALTHY, runtime.snapshot().depthHealth)
+            assertEquals(0, runtime.snapshot().depthFailures)
+
+            repeat(3) { runtime.recordDepthFailure() }
+            assertEquals(VisibilitySourceHealth.FAILED, runtime.snapshot().depthHealth)
+            assertFalse(runtime.shouldCopyDepth(300_000_000))
+            assertFalse(runtime.offerDepth(depth(cut.get(), 300_000_000, 3)))
+            assertTrue(runtime.offerFeature(feature(cut.get(), 300_000_000, 4)))
+            await { runtime.snapshot().admittedFeatureObservations == 1L }
+            assertEquals("featureOnly", runtime.snapshot().totalGridHealth)
+        } finally {
+            runtime.close()
+        }
+
+        val depthOnly = runtime(cut)
+        try {
+            depthOnly.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            assertTrue(depthOnly.offerDepth(depth(cut.get(), 1, 5)))
+            await { depthOnly.snapshot().admittedDepthObservations == 1L }
+            depthOnly.recordFeatureFailure()
+            assertFalse(depthOnly.shouldCopyFeature(1))
+            assertFalse(depthOnly.offerFeature(feature(cut.get(), 2, 6)))
+            assertEquals(VisibilitySourceHealth.FAILED, depthOnly.snapshot().featureHealth)
+            assertEquals(VisibilitySourceHealth.HEALTHY, depthOnly.snapshot().depthHealth)
+            assertEquals("healthy", depthOnly.snapshot().totalGridHealth)
+        } finally {
+            depthOnly.close()
+        }
+
+        val neither = runtime(cut)
+        try {
+            neither.recordFeatureFailure()
+            assertEquals(VisibilitySourceHealth.UNSUPPORTED, neither.snapshot().depthHealth)
+            assertEquals("failed", neither.snapshot().totalGridHealth)
+        } finally {
+            neither.close()
+        }
+    }
+
+    @Test
+    fun `terminal source failure discards queued periodic input`() {
+        val cut = AtomicReference(ownership())
+        val scheduler = Executors.newSingleThreadScheduledExecutor()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        scheduler.execute { entered.countDown(); release.await(2, TimeUnit.SECONDS) }
+        assertTrue(entered.await(1, TimeUnit.SECONDS))
+        val runtime = AndroidVisibilityGridRuntime(
+            ownership = cut::get,
+            mapper = AndroidVisibilityGridMappingAdmission(cut::get),
+            scheduler = scheduler,
+            featureIntervalNs = 1_000_000,
+            depthIntervalNs = 1_000_000,
+            ownsScheduler = true,
+        )
+        try {
+            runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            assertTrue(runtime.offerDepth(depth(cut.get(), 1, 1)))
+            assertTrue(runtime.snapshot().residentPayloadBytes > 0)
+            repeat(3) { runtime.recordDepthFailure() }
+            assertEquals(0, runtime.snapshot().residentPayloadBytes)
+            assertEquals(1, runtime.snapshot().lifecycleDiscardedObservations)
+            release.countDown()
+            Thread.sleep(20)
+            assertEquals(0, runtime.snapshot().admittedDepthObservations)
+        } finally {
+            release.countDown()
             runtime.close()
         }
     }

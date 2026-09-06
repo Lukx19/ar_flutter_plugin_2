@@ -45,6 +45,8 @@ internal class AndroidVisibilityGridRuntime(
     private var copiedDepthObservations = 0L
     private var admittedFeatureObservations = 0L
     private var admittedDepthObservations = 0L
+    private var accountedMapperFeatures = 0L
+    private var accountedMapperDepths = 0L
     private var invalidFeatureObservations = 0L
     private var invalidDepthObservations = 0L
     private var duplicateFeatureObservations = 0L
@@ -108,6 +110,9 @@ internal class AndroidVisibilityGridRuntime(
         require(callbackCopySampleCapacity > 0)
         require(callbackCopyBudgetNs == CALLBACK_COPY_BUDGET_NS)
         require(callbackCopyRecoveryNs >= 0)
+        val initialMapperHealth = mapper.snapshot()
+        accountedMapperFeatures = initialMapperHealth.admittedFeatures
+        accountedMapperDepths = initialMapperHealth.admittedDepths
     }
 
     fun setDepthCapability(capability: VisibilityDepthCapability) = synchronized(lock) {
@@ -137,6 +142,7 @@ internal class AndroidVisibilityGridRuntime(
     }
 
     fun shouldCopyFeature(timestampNs: Long): Boolean = synchronized(lock) {
+        if (featureHealth == VisibilitySourceHealth.FAILED) return@synchronized false
         if (callbackCopyBudgetDegraded && !isCaptureSafe()) return@synchronized false
         claimCopy(
             timestampNs,
@@ -154,6 +160,7 @@ internal class AndroidVisibilityGridRuntime(
 
     fun shouldCopyDepth(timestampNs: Long): Boolean = synchronized(lock) {
         !callbackCopyBudgetDegraded && depthCapability != VisibilityDepthCapability.UNSUPPORTED &&
+            depthHealth != VisibilitySourceHealth.FAILED &&
             claimCopy(timestampNs, depthLastCopyAttemptTimestampNs, depthIntervalNs).also {
                 if (it) depthLastCopyAttemptTimestampNs = timestampNs
             }
@@ -168,6 +175,7 @@ internal class AndroidVisibilityGridRuntime(
                 pausedObservationRejections++
                 return false
             }
+            if (featureHealth == VisibilitySourceHealth.FAILED) return false
             if (closed || !isStructurallyValid(observation) ||
                 observation.samples.size > featureSampleCapacity() ||
                 (callbackCopyBudgetDegraded && !isCaptureSafe())
@@ -184,6 +192,8 @@ internal class AndroidVisibilityGridRuntime(
                 return false
             }
             featureLastCopiedTimestampNs = observation.frame.sourceTimestampNs
+            featureHealth = VisibilitySourceHealth.HEALTHY
+            featureFailures = 0
             recordOwnership(observation.ownership)
             copiedFeatureObservations++
             recordCallbackCopy(callbackCopyNs)
@@ -201,6 +211,7 @@ internal class AndroidVisibilityGridRuntime(
                 pausedObservationRejections++
                 return false
             }
+            if (depthHealth == VisibilitySourceHealth.FAILED) return false
             if (closed || callbackCopyBudgetDegraded ||
                 depthCapability == VisibilityDepthCapability.UNSUPPORTED ||
                 !isStructurallyValid(observation)
@@ -217,6 +228,8 @@ internal class AndroidVisibilityGridRuntime(
                 return false
             }
             depthLastCopiedTimestampNs = observation.frame.sourceTimestampNs
+            depthHealth = VisibilitySourceHealth.HEALTHY
+            depthFailures = 0
             recordOwnership(observation.ownership)
             copiedDepthObservations++
             recordCallbackCopy(callbackCopyNs)
@@ -237,20 +250,30 @@ internal class AndroidVisibilityGridRuntime(
         }
     }
 
-    fun recordFeatureFailure() = synchronized(lock) {
-        featureFailures++
-        featureHealth = VisibilitySourceHealth.FAILED
+    fun recordFeatureFailure() {
+        synchronized(lock) {
+            featureFailures++
+            featureHealth = VisibilitySourceHealth.FAILED
+        }
+        discardUnusableIngress(feature = true)
     }
 
-    fun recordDepthFailure() = synchronized(lock) {
-        if (depthCapability != VisibilityDepthCapability.UNSUPPORTED) {
-            depthFailures++
-            if (depthFailures >= TERMINAL_FAILURE_THRESHOLD) {
-                depthHealth = VisibilitySourceHealth.FAILED
+    fun recordDepthFailure() {
+        val terminal = synchronized(lock) {
+            if (depthCapability != VisibilityDepthCapability.UNSUPPORTED) {
+                depthFailures++
+                if (depthFailures >= TERMINAL_FAILURE_THRESHOLD) {
+                    depthHealth = VisibilitySourceHealth.FAILED
+                    true
+                } else {
+                    depthHealth = VisibilitySourceHealth.TRANSIENT_UNAVAILABLE
+                    false
+                }
             } else {
-                depthHealth = VisibilitySourceHealth.TRANSIENT_UNAVAILABLE
+                false
             }
         }
+        if (terminal) discardUnusableIngress(depth = true)
     }
 
     fun recordFeatureStalled() = synchronized(lock) {
@@ -467,10 +490,7 @@ internal class AndroidVisibilityGridRuntime(
             2 -> synchronized(lock) { staleGenerationObservations++ }
             else -> {
                 mapper.admitFeature(observation)
-                synchronized(lock) {
-                    admittedFeatureObservations++
-                    featureHealth = VisibilitySourceHealth.HEALTHY
-                }
+                recordMapperAdmissionDelta(mapper.snapshot())
             }
         }
     }
@@ -488,12 +508,34 @@ internal class AndroidVisibilityGridRuntime(
             2 -> synchronized(lock) { staleGenerationObservations++ }
             else -> {
                 mapper.admitDepth(observation)
-                synchronized(lock) {
-                    admittedDepthObservations++
-                    depthHealth = VisibilitySourceHealth.HEALTHY
-                }
+                recordMapperAdmissionDelta(mapper.snapshot())
             }
         }
+    }
+
+    /** Mapper counters are authoritative; either lane may finish staged work from the other. */
+    private fun recordMapperAdmissionDelta(after: VisibilityMappingAdmissionHealth) = synchronized(lock) {
+        val features = if (after.admittedFeatures > accountedMapperFeatures) {
+            Math.subtractExact(after.admittedFeatures, accountedMapperFeatures)
+        } else 0L
+        val depths = if (after.admittedDepths > accountedMapperDepths) {
+            Math.subtractExact(after.admittedDepths, accountedMapperDepths)
+        } else 0L
+        admittedFeatureObservations = Math.addExact(admittedFeatureObservations, features)
+        admittedDepthObservations = Math.addExact(admittedDepthObservations, depths)
+        accountedMapperFeatures = maxOf(accountedMapperFeatures, after.admittedFeatures)
+        accountedMapperDepths = maxOf(accountedMapperDepths, after.admittedDepths)
+    }
+
+    private fun discardUnusableIngress(feature: Boolean = false, depth: Boolean = false) {
+        val bothUnusable = synchronized(lock) {
+            featureHealth == VisibilitySourceHealth.FAILED &&
+                (depthHealth == VisibilitySourceHealth.FAILED ||
+                    depthHealth == VisibilitySourceHealth.UNSUPPORTED)
+        }
+        val discarded = (if (feature || bothUnusable) featureLane.pauseAndDiscard() else 0) +
+            (if (depth || bothUnusable) depthLane.pauseAndDiscard() else 0)
+        synchronized(lock) { lifecycleDiscardedObservations = Math.addExact(lifecycleDiscardedObservations, discarded) }
     }
 
     companion object {
