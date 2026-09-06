@@ -266,6 +266,21 @@ class VisibilityGridIntegrationTest {
             assertEquals(0, depthKernel.resourceReceipt().residentEvidenceRows)
             assertTrue(depthKernel.resourceReceipt().preparedEvidenceRows > 0)
             assertEquals(0L, integration.snapshot().admittedDepths)
+            val retained = requireNotNull(integration.pendingDepthRetentionReceipt())
+            assertTrue(retained.pendingOwnerScalarBytes > 0)
+            assertTrue(retained.mutationPlanBytes > 0)
+            assertTrue(retained.geometryCutBytes > 0)
+            assertTrue(retained.featureRemapPrimitiveBytes > 0)
+            assertTrue(retained.depthPreparedBytes > 0)
+            val checkedTotal = listOf(
+                retained.pendingOwnerScalarBytes,
+                retained.mutationPlanBytes,
+                retained.geometryCutBytes,
+                retained.featureRemapPrimitiveBytes,
+                retained.depthPreparedBytes,
+            ).fold(0L) { total, bytes -> Math.addExact(total, bytes) }
+            assertEquals(checkedTotal, retained.totalBytes)
+            assertTrue(retained.totalBytes <= retained.budgetBytes)
 
             integration.admitDepth(depth(cut, 11))
             assertEquals("pendingAck", integration.integrationReceipt().status)
@@ -275,6 +290,7 @@ class VisibilityGridIntegrationTest {
             assertEquals(2, renderedCuts.single().transactionId)
             assertEquals(1, depthKernel.resourceReceipt().residentEvidenceRows)
             assertEquals(1L, integration.snapshot().admittedDepths)
+            assertEquals(null, integration.pendingDepthRetentionReceipt())
         } finally {
             integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
         }
@@ -331,6 +347,7 @@ class VisibilityGridIntegrationTest {
             integration.pause()
             assertEquals(PreparedMutationLifecycle.DISCARDED, attemptedMutations.first().lifecycle())
             assertEquals(0, depthKernel.resourceReceipt().preparedEvidenceRows)
+            assertEquals(null, integration.pendingDepthRetentionReceipt())
         } finally {
             integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
         }
@@ -382,6 +399,7 @@ class VisibilityGridIntegrationTest {
             assertTrue(attemptedMutations[0] === attemptedMutations[1])
             assertEquals(0, depthKernel.resourceReceipt().preparedEvidenceRows)
             assertEquals(0L, integration.snapshot().admittedDepths)
+            assertEquals(null, integration.pendingDepthRetentionReceipt())
 
             integration.admitDepth(depth(cut, 12))
             assertEquals("pendingAck", integration.integrationReceipt().status)
@@ -391,6 +409,23 @@ class VisibilityGridIntegrationTest {
         } finally {
             integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
         }
+    }
+
+    @Test
+    fun `pending depth maximum memory formula stays within its checked budget`() {
+        val maximum = PendingDepthRetentionReceipt.maximumModeled()
+        val checkedTotal = listOf(
+            maximum.pendingOwnerScalarBytes,
+            maximum.mutationPlanBytes,
+            maximum.geometryCutBytes,
+            maximum.featureRemapPrimitiveBytes,
+            maximum.depthPreparedBytes,
+        ).fold(0L) { total, bytes -> Math.addExact(total, bytes) }
+
+        assertEquals(100_000L * 32L, maximum.depthPreparedBytes)
+        assertEquals(checkedTotal, maximum.totalBytes)
+        assertTrue(maximum.totalBytes <= maximum.budgetBytes)
+        assertEquals(null, PendingDepthRetentionReceipt.create(Long.MAX_VALUE, 1, 1, 1))
     }
 
     @Test

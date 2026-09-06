@@ -91,6 +91,13 @@ internal class FeatureFusionKernel(
         pendingCanonicalRemap = null
     }
 
+    /** Incremental primitive-array ownership of the staged identity-only remap. */
+    @Synchronized
+    internal fun pendingCanonicalRemapPrimitiveBytes(): Long {
+        val prepared = pendingCanonicalRemap ?: return 0L
+        return canonicalRemapPrimitiveBytes(prepared.slots.size)
+    }
+
     private fun stageCanonicalRemap(remaps: List<CanonicalFeatureRemap>): CanonicalRemapStage {
         val count = remaps.size
         val tableCapacity = remapTableCapacity(count)
@@ -818,7 +825,19 @@ internal class FeatureFusionKernel(
     private var pending: PendingApplication? = null
     private var pendingCanonicalRemap: PendingCanonicalRemap? = null
 
-    private companion object {
+    companion object {
+        private const val ARRAY_HEADER_BYTES = 16L
+
+        internal fun maximumPendingCanonicalRemapPrimitiveBytes(): Long =
+            canonicalRemapPrimitiveBytes(SURFACE_CAPACITY)
+
+        private fun canonicalRemapPrimitiveBytes(count: Int): Long {
+            require(count in 0..SURFACE_CAPACITY)
+            val slots = Math.addExact(ARRAY_HEADER_BYTES, Math.multiplyExact(count.toLong(), Int.SIZE_BYTES.toLong()))
+            val targets = Math.addExact(ARRAY_HEADER_BYTES, Math.multiplyExact(count.toLong(), Long.SIZE_BYTES.toLong()))
+            return Math.addExact(slots, targets)
+        }
+
         const val SURFACE_CAPACITY = 100_000
         const val ASSOCIATION_CAPACITY = 200_000
         const val HASH_SLOTS = 262_144

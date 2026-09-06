@@ -23,6 +23,54 @@ private data class PendingDepthCommit(
     val geometryCut: CommittedGeometryCut,
 )
 
+internal data class PendingDepthRetentionReceipt(
+    val pendingOwnerScalarBytes: Long,
+    val mutationPlanBytes: Long,
+    val geometryCutBytes: Long,
+    val featureRemapPrimitiveBytes: Long,
+    val depthPreparedBytes: Long,
+    val totalBytes: Long,
+    val budgetBytes: Long = BUDGET_BYTES,
+) {
+    companion object {
+        const val PENDING_OWNER_SCALAR_BYTES = 40L
+        const val BUDGET_BYTES = 32L * 1024L * 1024L
+        private const val MAXIMUM_ROWS = 100_000
+        private const val DEPTH_EVIDENCE_ROW_BYTES = 32L
+
+        internal fun create(
+            mutationPlanBytes: Long,
+            geometryCutBytes: Long,
+            featureRemapPrimitiveBytes: Long,
+            depthPreparedBytes: Long,
+        ): PendingDepthRetentionReceipt? = try {
+            if (mutationPlanBytes < 0 || geometryCutBytes < 0 ||
+                featureRemapPrimitiveBytes < 0 || depthPreparedBytes < 0
+            ) return null
+            val total = Math.addExact(
+                Math.addExact(PENDING_OWNER_SCALAR_BYTES, mutationPlanBytes),
+                Math.addExact(
+                    geometryCutBytes,
+                    Math.addExact(featureRemapPrimitiveBytes, depthPreparedBytes),
+                ),
+            )
+            PendingDepthRetentionReceipt(
+                PENDING_OWNER_SCALAR_BYTES, mutationPlanBytes, geometryCutBytes,
+                featureRemapPrimitiveBytes, depthPreparedBytes, total,
+            )
+        } catch (_: ArithmeticException) {
+            null
+        }
+
+        internal fun maximumModeled(): PendingDepthRetentionReceipt = requireNotNull(create(
+            CanonicalActivationResources.MAXIMUM_PROFILE_RETAINED_BYTES,
+            CommittedGeometryCut.modeledRetainedBytes(MAXIMUM_ROWS, MAXIMUM_ROWS),
+            FeatureFusionKernel.maximumPendingCanonicalRemapPrimitiveBytes(),
+            Math.multiplyExact(MAXIMUM_ROWS.toLong(), DEPTH_EVIDENCE_ROW_BYTES),
+        ))
+    }
+}
+
 /**
  * One group-local canonical surface module behind the capture ingress mapper seam.
  *
@@ -206,6 +254,10 @@ internal class VisibilityGridIntegration(
     }
 
     fun integrationReceipt(): VisibilityGridIntegrationReceipt = synchronized(lock) { receipt }
+
+    internal fun pendingDepthRetentionReceipt(): PendingDepthRetentionReceipt? = synchronized(lock) {
+        pendingDepthCommit?.let(::retentionReceipt)
+    }
 
     /** Portable scalar owners only; kernel/renderer arrays and phase buffers are named separately. */
     internal fun portableOwnerMemoryReceipt(): RuntimeOwnerMemoryReceipt = synchronized(lock) {
@@ -411,7 +463,17 @@ internal class VisibilityGridIntegration(
             if (committedResult is CanonicalAdjacentCommitResult.Refused &&
                 committedResult.disposition == PreparedMutationDisposition.RETRYABLE
             ) {
-                pendingDepthCommit = PendingDepthCommit(observation.ownership, prepared.mutation, geometryCut)
+                val retained = PendingDepthCommit(observation.ownership, prepared.mutation, geometryCut)
+                val retention = retentionReceipt(retained)
+                if (retention == null || retention.totalBytes > retention.budgetBytes) {
+                    retained.mutation.discard()
+                    requireNotNull(kernel).discardPreparedCanonicalRemap()
+                    depth.discardPrepared()
+                    rejected++
+                    receipt = receipt.copy(status = "depthCommitRetentionRefused", rejected = rejected)
+                    return
+                }
+                pendingDepthCommit = retained
                 rejected++
                 receipt = receipt.copy(status = "depthCommitRetryPending", rejected = rejected)
                 return
@@ -465,6 +527,19 @@ internal class VisibilityGridIntegration(
         pendingDepth.mutation.discard()
         kernel?.discardPreparedCanonicalRemap()
         depthKernel?.discardPrepared()
+    }
+
+    private fun retentionReceipt(pendingDepth: PendingDepthCommit): PendingDepthRetentionReceipt? = try {
+        PendingDepthRetentionReceipt.create(
+            mutationPlanBytes = pendingDepth.mutation.work.retainedPlanBytes,
+            geometryCutBytes = pendingDepth.geometryCut.modeledRetainedBytes(),
+            featureRemapPrimitiveBytes = kernel?.pendingCanonicalRemapPrimitiveBytes() ?: 0L,
+            depthPreparedBytes = depthKernel?.resourceReceipt()?.preparedResidentBytes?.toLong() ?: 0L,
+        )
+    } catch (_: ArithmeticException) {
+        null
+    } catch (_: IllegalArgumentException) {
+        null
     }
 
     private fun collectDepthFeatureSources(

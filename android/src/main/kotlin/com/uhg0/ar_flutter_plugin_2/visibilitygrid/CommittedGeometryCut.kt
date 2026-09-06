@@ -72,6 +72,9 @@ internal class CommittedGeometryCut(
             removedSurfaceIds = removedSurfaceIdsValue,
         )
 
+    /** Modeled incremental ownership retained when this copied cut is queued for retry. */
+    internal fun modeledRetainedBytes(): Long = modeledRetainedBytes(upserts.size, removedSurfaceIdsValue.size)
+
     override fun equals(other: Any?): Boolean = other is CommittedGeometryCut &&
         ownership == other.ownership &&
         transactionId == other.transactionId &&
@@ -97,6 +100,25 @@ internal class CommittedGeometryCut(
             "baseGeometryRevision=$baseGeometryRevision, geometryRevision=$geometryRevision, " +
             "lineageRevision=$lineageRevision, reset=$reset, upserts=$upserts, " +
             "removedSurfaceIds=${removedSurfaceIdsValue.contentToString()})"
+
+    companion object {
+        private const val CUT_OWNER_BYTES = 80L
+        private const val LIST_OWNERS_AND_ARRAY_HEADER_BYTES = 80L
+        private const val ROW_OWNER_BYTES = 48L
+        private const val VOXEL_OWNER_BYTES = 32L
+        private const val ARRAY_HEADER_BYTES = 16L
+
+        internal fun modeledRetainedBytes(upsertCount: Int, removalCount: Int): Long {
+            require(upsertCount >= 0 && removalCount >= 0)
+            val rowBytes = Math.multiplyExact(upsertCount.toLong(), ROW_OWNER_BYTES + VOXEL_OWNER_BYTES)
+            val rowReferences = Math.multiplyExact(upsertCount.toLong(), java.lang.Long.BYTES.toLong())
+            val removals = Math.multiplyExact(removalCount.toLong(), java.lang.Long.BYTES.toLong())
+            return Math.addExact(
+                Math.addExact(CUT_OWNER_BYTES + LIST_OWNERS_AND_ARRAY_HEADER_BYTES, rowBytes),
+                Math.addExact(rowReferences, Math.addExact(ARRAY_HEADER_BYTES, removals)),
+            )
+        }
+    }
 }
 
 /** Copies only the bounded dirty rows and removed identities from a prepared mutation. */
