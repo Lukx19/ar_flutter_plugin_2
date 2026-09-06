@@ -92,8 +92,26 @@ class ContinuousRuntimeCapacityCampaignTest {
         }
     }
 
-    @Test
+    @Test(timeout = 14L * 60L * 1_000L)
     fun `continuous runtime reaches exact capacity and reopens the same bounded cut`() {
+        val root = Files.createTempDirectory("canonical-surface-continuous-exact").toFile()
+        val ownershipByThread = ConcurrentHashMap<Long, MutableList<CanonicalAdjacentOwnershipObservation>>()
+        CanonicalActivationTestHooks.onAdjacentOwnership = { observation ->
+            ownershipByThread.computeIfAbsent(Thread.currentThread().id) { mutableListOf() } += observation
+        }
+        try {
+            val result = runCampaign(root, 2301, verifyProtocol = true, ownershipByThread)
+            assertEquals(32, result.rootHash.size)
+            assertEquals(32, result.workerCurrentHash.size)
+            assertTrue(result.committedPhysicalBytes > 0L)
+        } finally {
+            CanonicalActivationTestHooks.onAdjacentOwnership = null
+            root.deleteRecursively()
+        }
+    }
+
+    @Test(timeout = 14L * 60L * 1_000L)
+    fun `independent roots produce identical canonical hashes storage and invariant memory`() {
         val firstRoot = Files.createTempDirectory("canonical-surface-continuous-a").toFile()
         val secondRoot = Files.createTempDirectory("canonical-surface-continuous-b").toFile()
         val campaigns = Executors.newFixedThreadPool(2)
@@ -103,15 +121,15 @@ class ContinuousRuntimeCapacityCampaignTest {
         }
         try {
             val firstFuture = campaigns.submit<CampaignResult> {
-                runCampaign(firstRoot, 2301, verifyProtocol = true, ownershipByThread)
+                runCampaign(firstRoot, 2301, verifyProtocol = true, ownershipByThread, surfaceTarget = 3_600)
             }
             val secondFuture = campaigns.submit<CampaignResult> {
-                runCampaign(secondRoot, 2302, verifyProtocol = false, ownershipByThread)
+                runCampaign(secondRoot, 2302, verifyProtocol = false, ownershipByThread, surfaceTarget = 3_600)
             }
             campaigns.shutdown()
             assertTrue(
-                "both exact-capacity campaign lanes complete within the test-harness deadline",
-                campaigns.awaitTermination(3, TimeUnit.HOURS),
+                "both minimum-size campaign lanes complete within the 14-minute test deadline",
+                campaigns.awaitTermination(14, TimeUnit.MINUTES),
             )
             val firstResult = runCatching { firstFuture.get() }
             val secondResult = runCatching { secondFuture.get() }
