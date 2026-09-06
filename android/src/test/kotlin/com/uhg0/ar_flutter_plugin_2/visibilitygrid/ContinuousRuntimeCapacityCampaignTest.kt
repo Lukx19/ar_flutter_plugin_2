@@ -128,10 +128,24 @@ class ContinuousRuntimeCapacityCampaignTest {
             assertArrayEquals(first.canonicalSelectionHash, second.canonicalSelectionHash)
             assertArrayEquals(first.rendererSelectionHash, second.rendererSelectionHash)
             assertArrayEquals(first.workerCurrentHash, second.workerCurrentHash)
-            assertTrue(
-                "portable receipts differ only by bounded variable-length identity/trace encoding",
-                kotlin.math.abs(first.portableCompleteBytes - second.portableCompleteBytes) <= 8L,
+            // Canonical scalar identities and binding-owned identities/executor
+            // traces are variable-length UTF-8 payloads. Every other modeled
+            // owner is invariant across the two independent campaign roots.
+            val firstInvariantBytes = Math.subtractExact(
+                Math.subtractExact(first.portableCompleteBytes, first.scalarMemoryBytes),
+                first.ownerMemoryBytes,
             )
+            val secondInvariantBytes = Math.subtractExact(
+                Math.subtractExact(second.portableCompleteBytes, second.scalarMemoryBytes),
+                second.ownerMemoryBytes,
+            )
+            assertEquals(firstInvariantBytes, secondInvariantBytes)
+            val totalDelta = Math.subtractExact(first.portableCompleteBytes, second.portableCompleteBytes)
+            val namedVariableDelta = Math.addExact(
+                Math.subtractExact(first.scalarMemoryBytes, second.scalarMemoryBytes),
+                Math.subtractExact(first.ownerMemoryBytes, second.ownerMemoryBytes),
+            )
+            assertEquals(namedVariableDelta, totalDelta)
             assertEquals(first.directoryBytes, second.directoryBytes)
             assertEquals(first.committedPhysicalBytes, second.committedPhysicalBytes)
         } finally {
@@ -629,7 +643,8 @@ class ContinuousRuntimeCapacityCampaignTest {
             )
             return CampaignResult(
                 rootHash, sourceHash, canonicalSelectionHash, rendererSelectionHash, lastWorkerHash,
-                portableCompleteBytes, allocated.directoryBytes, chargedPhysicalBytes,
+                portableCompleteBytes, scalarMemory.portableBytes, ownerMemory.portableBytes,
+                allocated.directoryBytes, chargedPhysicalBytes,
             )
         } finally {
             integration.close()
@@ -825,6 +840,8 @@ class ContinuousRuntimeCapacityCampaignTest {
         val rendererSelectionHash: ByteArray,
         val workerCurrentHash: ByteArray,
         val portableCompleteBytes: Long,
+        val scalarMemoryBytes: Long,
+        val ownerMemoryBytes: Long,
         val directoryBytes: Long,
         val committedPhysicalBytes: Long,
     )
