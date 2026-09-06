@@ -607,6 +607,495 @@ internal class MutableCanonicalOverlay private constructor(
         )
     }
 
+    /**
+     * Performs the depth planner's admission pass without retaining a graph of
+     * operations, source rows, targets, or support values. The support-ID
+     * scratch array is allocated only after the fixed planner bound and the
+     * streamed source cardinalities have both fit the effective journal limit.
+     */
+    private fun depthBatchPreflight(
+        command: CanonicalEvidenceBatchCommand,
+        scalars: DepthBatchScalars,
+    ): DepthBatchPreflightResult {
+        val journalLimit = minOf(
+            CompactCanonicalStore.JOURNAL_RESERVE_BYTES,
+            configuration.changeJournalByteCapacity.toLong(),
+        )
+        val minimumPlannerBytes = depthPlannerBytes(scalars, 0L, 0L, command.commandId)
+            ?: return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
+        if (minimumPlannerBytes > journalLimit) {
+            return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
+        }
+
+        // Validate every source reference and duplicate source identity before
+        // any operation/source/target collection is constructed.
+        for (changeIndex in command.changes.indices) {
+            val change = command.changes[changeIndex]
+            val sourceCount = depthSourceCount(change)
+            for (sourceIndex in 0 until sourceCount) {
+                val source = depthSourceAt(change, sourceIndex)
+                if (hasEarlierDepthSource(command, changeIndex, sourceIndex, source, false)) {
+                    return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
+                }
+                directLookups++
+                if (source.value !in 1 until UINT32_END || view.findById(source) == null) {
+                    return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.UNKNOWN_IDENTITY)
+                }
+            }
+        }
+
+        // Validate target shape, identity, voxel uniqueness, and occupancy by
+        // scalar scans over the immutable command/view only.
+        for (changeIndex in command.changes.indices) {
+            val change = command.changes[changeIndex]
+            when (change) {
+                is DepthEvidenceChange.Create -> if (change.target.id != null) {
+                    return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.INVALID_COMMAND)
+                }
+                is DepthEvidenceChange.Refine -> if (change.target.id != change.sourceId) {
+                    return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
+                }
+                is DepthEvidenceChange.Relocate -> if (change.target.id != change.sourceId) {
+                    return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
+                }
+                is DepthEvidenceChange.Merge -> if (change.sourceIds.size < 2 || change.target.id != null) {
+                    return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
+                }
+                is DepthEvidenceChange.Split -> if (change.targets.size < 2 || change.targets.any { it.id != null }) {
+                    return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
+                }
+                is DepthEvidenceChange.Replace -> if (change.sourceIds.isEmpty() || change.targets.isEmpty() || change.targets.any { it.id != null }) {
+                    return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
+                }
+                is DepthEvidenceChange.Remove -> Unit
+            }
+            val targetCount = depthTargetCount(change)
+            for (targetIndex in 0 until targetCount) {
+                val target = depthTargetAt(change, targetIndex)
+                if (hasEarlierDepthTarget(command, changeIndex, targetIndex, target.voxel)) {
+                    return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
+                }
+                if (CompactLocation(configuration, target.voxel) == null) {
+                    return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.INVALID_OWNERSHIP)
+                }
+                if (packed(target) == null) {
+                    return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.INVALID_NORMAL)
+                }
+                if (target.id != null && !hasDepthSource(command, target.id, false)) {
+                    return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.UNKNOWN_IDENTITY)
+                }
+                directLookups++
+                val occupied = view.findByVoxel(target.voxel)
+                if (occupied != null && !hasDepthSource(command, occupied.id, true) && occupied.id != target.id) {
+                    return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
+                }
+                if (change is DepthEvidenceChange.Refine) {
+                    directLookups++
+                    val source = view.findById(change.sourceId)
+                        ?: return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.UNKNOWN_IDENTITY)
+                    if (source.voxel != target.voxel) {
+                        return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
+                    }
+                }
+            }
+        }
+
+        val hasLineageChange = command.changes.any { depthKind(it).lineageChanged }
+        if (hasLineageChange && view.cut.lineageRevision >= configuration.revisionLimit) {
+            return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.REVISION_EXHAUSTED)
+        }
+
+        var removedLineageRecords = 0L
+        var removedSupportRecords = 0L
+        var supportValueCapacity = 0L
+        var streamRefusal: CanonicalMutationRefusal? = null
+        val uniqueSourcesRead = forEachUniqueDepthSource(command, true) { source ->
+            val lineage = streamLineageCount(source)
+            if (lineage == null) {
+                streamRefusal = CanonicalMutationRefusal.SOURCE_READ_FAILURE
+                false
+            } else {
+                removedLineageRecords = try { Math.addExact(removedLineageRecords, lineage) }
+                catch (_: ArithmeticException) {
+                    streamRefusal = CanonicalMutationRefusal.LINEAGE_EXHAUSTED
+                    return@forEachUniqueDepthSource false
+                }
+                val supports = streamSupportCount(source)
+                if (supports == null) {
+                    streamRefusal = CanonicalMutationRefusal.SOURCE_READ_FAILURE
+                    false
+                } else {
+                    removedSupportRecords = try { Math.addExact(removedSupportRecords, supports) }
+                    catch (_: ArithmeticException) {
+                        streamRefusal = CanonicalMutationRefusal.JOURNAL_EXHAUSTED
+                        return@forEachUniqueDepthSource false
+                    }
+                    supportValueCapacity = try {
+                        Math.addExact(supportValueCapacity, supports)
+                    } catch (_: ArithmeticException) {
+                        streamRefusal = CanonicalMutationRefusal.JOURNAL_EXHAUSTED
+                        return@forEachUniqueDepthSource false
+                    }
+                    if (supports == 0L && depthSourceNeedsSupport(command, source)) {
+                        when (val fallback = view.readSourceById(source)) {
+                            is CanonicalPageRead.Refused -> {
+                                streamRefusal = CanonicalMutationRefusal.SOURCE_READ_FAILURE
+                                return@forEachUniqueDepthSource false
+                            }
+                            is CanonicalPageRead.Complete -> {
+                                pageFaults += fallback.pageFaults; bytesRead += fallback.bytesRead
+                                if (fallback.value == null) {
+                                    streamRefusal = CanonicalMutationRefusal.UNKNOWN_IDENTITY
+                                    return@forEachUniqueDepthSource false
+                                }
+                                supportValueCapacity = try { Math.addExact(supportValueCapacity, 1L) }
+                                catch (_: ArithmeticException) {
+                                    streamRefusal = CanonicalMutationRefusal.JOURNAL_EXHAUSTED
+                                    return@forEachUniqueDepthSource false
+                                }
+                            }
+                        }
+                    }
+                    true
+                }
+            }
+        }
+        if (!uniqueSourcesRead) {
+            return DepthBatchPreflightResult.Refused(
+                streamRefusal ?: CanonicalMutationRefusal.SOURCE_READ_FAILURE,
+            )
+        }
+        if (removedLineageRecords > view.cut.lineageCount.toLong() || removedLineageRecords > Int.MAX_VALUE.toLong()) {
+            return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.LINEAGE_EXHAUSTED)
+        }
+        if (removedSupportRecords > view.cut.supportCount.toLong() || removedSupportRecords > Int.MAX_VALUE.toLong()) {
+            return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
+        }
+        if (supportValueCapacity > Int.MAX_VALUE.toLong()) {
+            return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
+        }
+
+        val scratchBytes = depthPlannerBytes(scalars, supportValueCapacity, 0L, command.commandId)
+            ?: return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
+        if (scratchBytes > journalLimit) {
+            return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
+        }
+        val supportIds = LongArray(supportValueCapacity.toInt())
+        var supportPairCount = 0L
+        var exactRefusal: CanonicalMutationRefusal? = null
+        command.changes.forEach { change ->
+            if (exactRefusal != null) return@forEach
+            val targetCount = depthTargetCount(change)
+            val supportSourceCount = if (depthKind(change).supportMode == DepthBatchSupportMode.SOURCE_TO_TARGETS) {
+                var unionSize = 0
+                for (sourceIndex in 0 until depthSourceCount(change)) {
+                    val source = depthSourceAt(change, sourceIndex)
+                    var streamed = 0L
+                    val streamOk = streamSourceSupports(source) { support ->
+                        streamed = try { Math.addExact(streamed, 1L) }
+                        catch (_: ArithmeticException) {
+                            exactRefusal = CanonicalMutationRefusal.JOURNAL_EXHAUSTED
+                            return@streamSourceSupports false
+                        }
+                        val value = support.source.id.value
+                        if (value <= 0L) {
+                            exactRefusal = CanonicalMutationRefusal.SOURCE_READ_FAILURE
+                            return@streamSourceSupports false
+                        }
+                        var present = false
+                        for (index in 0 until unionSize) if (supportIds[index] == value) {
+                            present = true
+                            break
+                        }
+                        if (!present) {
+                            if (unionSize >= supportIds.size) {
+                                exactRefusal = CanonicalMutationRefusal.JOURNAL_EXHAUSTED
+                                return@streamSourceSupports false
+                            }
+                            supportIds[unionSize++] = value
+                        }
+                        true
+                    }
+                    if (!streamOk || exactRefusal != null) break
+                    if (streamed == 0L) {
+                        when (val fallback = view.readSourceById(source)) {
+                            is CanonicalPageRead.Refused -> {
+                                exactRefusal = CanonicalMutationRefusal.SOURCE_READ_FAILURE
+                                break
+                            }
+                            is CanonicalPageRead.Complete -> {
+                                pageFaults += fallback.pageFaults; bytesRead += fallback.bytesRead
+                                val value = fallback.value?.id?.value
+                                if (value == null || value <= 0L) {
+                                    exactRefusal = CanonicalMutationRefusal.UNKNOWN_IDENTITY
+                                    break
+                                }
+                                var present = false
+                                for (index in 0 until unionSize) if (supportIds[index] == value) {
+                                    present = true
+                                    break
+                                }
+                                if (!present) supportIds[unionSize++] = value
+                            }
+                        }
+                    }
+                }
+                unionSize
+            } else {
+                if (depthKind(change).supportMode == DepthBatchSupportMode.SELF) targetCount else 0
+            }
+            if (exactRefusal == null) {
+                val contribution = try { Math.multiplyExact(supportSourceCount.toLong(), targetCount.toLong()) }
+                catch (_: ArithmeticException) {
+                    exactRefusal = CanonicalMutationRefusal.JOURNAL_EXHAUSTED
+                    0L
+                }
+                supportPairCount = try { Math.addExact(supportPairCount, contribution) }
+                catch (_: ArithmeticException) {
+                    exactRefusal = CanonicalMutationRefusal.JOURNAL_EXHAUSTED
+                    supportPairCount
+                }
+            }
+        }
+        exactRefusal?.let { return DepthBatchPreflightResult.Refused(it) }
+
+        val finalLive = try {
+            command.changes.fold(view.cut.liveSurfaceCount.toLong()) { current, change ->
+                Math.addExact(current, depthLiveDelta(change).toLong())
+            }
+        } catch (_: ArithmeticException) {
+            return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.CAPACITY)
+        }
+        val finalSources = try { Math.addExact(view.cut.sourceCount.toLong(), scalars.allocatedRows.toLong()) }
+        catch (_: ArithmeticException) { return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.LINEAGE_EXHAUSTED) }
+        val finalLineage = try {
+            Math.addExact(Math.subtractExact(view.cut.lineageCount.toLong(), removedLineageRecords), scalars.lineageEdges)
+        } catch (_: ArithmeticException) { return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.LINEAGE_EXHAUSTED) }
+        val finalSupport = try {
+            Math.addExact(Math.subtractExact(view.cut.supportCount.toLong(), removedSupportRecords), supportPairCount)
+        } catch (_: ArithmeticException) { return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.CAPACITY) }
+        if (finalLive !in 0..configuration.surfaceCapacity.toLong() ||
+            finalSources !in 0..sourceCapacity() || finalSupport !in 0..sourceCapacity() ||
+            finalLineage !in 0..configuration.lineageCapacity.toLong()
+        ) return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.CAPACITY)
+
+        val plannedBytes = depthPlannerBytes(scalars, supportValueCapacity, supportPairCount, command.commandId)
+            ?: return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
+        if (plannedBytes > journalLimit) {
+            return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
+        }
+        return DepthBatchPreflightResult.Complete(
+            DepthBatchPreflight(
+                removedLineageRecords.toInt(), removedSupportRecords, supportPairCount,
+            ),
+        )
+    }
+
+    private fun depthPlannerBytes(
+        scalars: DepthBatchScalars,
+        supportRecords: Long,
+        supportPairs: Long,
+        commandId: String,
+    ): Long? = try {
+        val wal = Math.addExact(
+            encodedRecordBytes(
+                scalars.targetRows, scalars.removedRows, supportPairs,
+                scalars.allocatedRows.toLong(), scalars.lineageEdges, commandId,
+            ) ?: return null,
+            4L,
+        )
+        var bytes = Math.addExact(PLAN_FIXED_OWNER_BYTES, WRITER_SCRATCH_BYTES)
+        bytes = Math.addExact(bytes, PLANNING_PAGE_SCRATCH_BYTES)
+        bytes = Math.addExact(bytes, Math.multiplyExact(scalars.sourceReferences.toLong(), DEPTH_SOURCE_GRAPH_BYTES))
+        bytes = Math.addExact(bytes, Math.multiplyExact(scalars.targetRows.toLong(), DEPTH_TARGET_GRAPH_BYTES))
+        bytes = Math.addExact(bytes, Math.multiplyExact(scalars.sourceReferences.toLong(), DEPTH_OPERATION_GRAPH_BYTES))
+        bytes = Math.addExact(bytes, Math.multiplyExact(supportRecords, DEPTH_SUPPORT_DETAILS_BYTES_PER_RECORD))
+        bytes = Math.addExact(bytes, Math.multiplyExact(supportRecords, DEPTH_SUPPORT_SCRATCH_BYTES_PER_RECORD))
+        bytes = Math.addExact(bytes, Math.multiplyExact(supportPairs, 68L))
+        bytes = Math.addExact(bytes, 64L)
+        bytes = Math.addExact(bytes, Math.multiplyExact(scalars.lineageEdges, 16L))
+        bytes = Math.addExact(bytes, 40L)
+        Math.addExact(bytes, wal)
+    } catch (_: ArithmeticException) { null }
+
+    private fun depthSourceCount(change: DepthEvidenceChange): Int = when (change) {
+        is DepthEvidenceChange.Create -> 0
+        is DepthEvidenceChange.Refine -> 1
+        is DepthEvidenceChange.Relocate -> 1
+        is DepthEvidenceChange.Merge -> change.sourceIds.size
+        is DepthEvidenceChange.Split -> 1
+        is DepthEvidenceChange.Replace -> change.sourceIds.size
+        is DepthEvidenceChange.Remove -> 1
+    }
+
+    private fun depthSourceAt(change: DepthEvidenceChange, index: Int): SurfaceId = when (change) {
+        is DepthEvidenceChange.Create -> error("create has no source")
+        is DepthEvidenceChange.Refine -> change.sourceId
+        is DepthEvidenceChange.Relocate -> change.sourceId
+        is DepthEvidenceChange.Merge -> change.sourceIds[index]
+        is DepthEvidenceChange.Split -> change.sourceId
+        is DepthEvidenceChange.Replace -> change.sourceIds[index]
+        is DepthEvidenceChange.Remove -> change.sourceId
+    }
+
+    private fun depthTargetCount(change: DepthEvidenceChange): Int = when (change) {
+        is DepthEvidenceChange.Create -> 1
+        is DepthEvidenceChange.Refine -> 1
+        is DepthEvidenceChange.Relocate -> 1
+        is DepthEvidenceChange.Merge -> 1
+        is DepthEvidenceChange.Split -> change.targets.size
+        is DepthEvidenceChange.Replace -> change.targets.size
+        is DepthEvidenceChange.Remove -> 0
+    }
+
+    private fun depthTargetAt(change: DepthEvidenceChange, index: Int): CanonicalTarget = when (change) {
+        is DepthEvidenceChange.Create -> change.target
+        is DepthEvidenceChange.Refine -> change.target
+        is DepthEvidenceChange.Relocate -> change.target
+        is DepthEvidenceChange.Merge -> change.target
+        is DepthEvidenceChange.Split -> change.targets[index]
+        is DepthEvidenceChange.Replace -> change.targets[index]
+        is DepthEvidenceChange.Remove -> error("remove has no target")
+    }
+
+    private fun depthKind(change: DepthEvidenceChange): DepthBatchOperationKind = when (change) {
+        is DepthEvidenceChange.Create -> DepthBatchOperationKind.CREATE
+        is DepthEvidenceChange.Refine -> DepthBatchOperationKind.REFINE
+        is DepthEvidenceChange.Relocate -> DepthBatchOperationKind.RELOCATE
+        is DepthEvidenceChange.Merge -> DepthBatchOperationKind.MERGE
+        is DepthEvidenceChange.Split -> DepthBatchOperationKind.SPLIT
+        is DepthEvidenceChange.Replace -> DepthBatchOperationKind.REPLACE
+        is DepthEvidenceChange.Remove -> DepthBatchOperationKind.REMOVE
+    }
+
+    private fun depthLiveDelta(change: DepthEvidenceChange): Int = when (change) {
+        is DepthEvidenceChange.Create -> 1
+        is DepthEvidenceChange.Refine -> 0
+        is DepthEvidenceChange.Relocate -> 0
+        is DepthEvidenceChange.Merge -> 1 - change.sourceIds.size
+        is DepthEvidenceChange.Split -> change.targets.size - 1
+        is DepthEvidenceChange.Replace -> change.targets.size - change.sourceIds.size
+        is DepthEvidenceChange.Remove -> -1
+    }
+
+    private fun forEachDepthSource(change: DepthEvidenceChange, sink: (SurfaceId) -> Unit) {
+        for (index in 0 until depthSourceCount(change)) sink(depthSourceAt(change, index))
+    }
+
+    private fun hasEarlierDepthSource(
+        command: CanonicalEvidenceBatchCommand,
+        changeIndex: Int,
+        sourceIndex: Int,
+        source: SurfaceId,
+        structuralOnly: Boolean,
+    ): Boolean {
+        for (priorChangeIndex in 0..changeIndex) {
+            val prior = command.changes[priorChangeIndex]
+            if (structuralOnly && !depthKind(prior).structural) continue
+            val end = if (priorChangeIndex == changeIndex) sourceIndex else depthSourceCount(prior)
+            for (priorSourceIndex in 0 until end) if (depthSourceAt(prior, priorSourceIndex) == source) return true
+        }
+        return false
+    }
+
+    private fun hasDepthSource(command: CanonicalEvidenceBatchCommand, source: SurfaceId, structuralOnly: Boolean): Boolean {
+        for (change in command.changes) {
+            if (structuralOnly && !depthKind(change).structural) continue
+            for (sourceIndex in 0 until depthSourceCount(change)) {
+                if (depthSourceAt(change, sourceIndex) == source) return true
+            }
+        }
+        return false
+    }
+
+    private fun forEachUniqueDepthSource(
+        command: CanonicalEvidenceBatchCommand,
+        structuralOnly: Boolean,
+        sink: (SurfaceId) -> Boolean,
+    ): Boolean {
+        for (changeIndex in command.changes.indices) {
+            val change = command.changes[changeIndex]
+            if (structuralOnly && !depthKind(change).structural) continue
+            for (sourceIndex in 0 until depthSourceCount(change)) {
+                val source = depthSourceAt(change, sourceIndex)
+                if (!hasEarlierDepthSource(command, changeIndex, sourceIndex, source, structuralOnly) && !sink(source)) {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+
+    private fun hasEarlierDepthTarget(
+        command: CanonicalEvidenceBatchCommand,
+        changeIndex: Int,
+        targetIndex: Int,
+        voxel: Voxel,
+    ): Boolean {
+        for (priorChangeIndex in 0..changeIndex) {
+            val prior = command.changes[priorChangeIndex]
+            val end = if (priorChangeIndex == changeIndex) targetIndex else depthTargetCount(prior)
+            for (priorTargetIndex in 0 until end) if (depthTargetAt(prior, priorTargetIndex).voxel == voxel) return true
+        }
+        return false
+    }
+
+    private fun depthSourceNeedsSupport(command: CanonicalEvidenceBatchCommand, source: SurfaceId): Boolean {
+        for (change in command.changes) if (depthKind(change).supportMode == DepthBatchSupportMode.SOURCE_TO_TARGETS) {
+            for (sourceIndex in 0 until depthSourceCount(change)) {
+                if (depthSourceAt(change, sourceIndex) == source) return true
+            }
+        }
+        return false
+    }
+
+    private fun streamLineageCount(source: SurfaceId): Long? {
+        var cursor: LineageCursor? = null
+        var count = 0L
+        var pages = 0L
+        do {
+            val read = view.visitLineage(source, cursor) {
+                count = try { Math.addExact(count, 1L) } catch (_: ArithmeticException) { Long.MAX_VALUE }
+                count <= configuration.lineageCapacity.toLong()
+            }
+            when (read) {
+                is LineageRead.Refused -> return null
+                is LineageRead.Complete -> {
+                    cursor = read.nextCursor
+                    pages = try { Math.addExact(pages, 1L) } catch (_: ArithmeticException) { Long.MAX_VALUE }
+                    if (pages > configuration.lineageCapacity.toLong() || count > configuration.lineageCapacity.toLong()) return null
+                }
+            }
+        } while (cursor != null)
+        return count
+    }
+
+    private fun streamSourceSupports(source: SurfaceId, sink: (PagedSupport) -> Boolean): Boolean {
+        var cursor: SourceSupportCursor? = null
+        var pages = 0L
+        do {
+            val read = view.visitSourceSupport(source, cursor, sink)
+            when (read) {
+                is SourceSupportRead.Refused -> return false
+                is SourceSupportRead.Complete -> {
+                    cursor = read.nextCursor
+                    pages = try { Math.addExact(pages, 1L) } catch (_: ArithmeticException) { Long.MAX_VALUE }
+                    if (pages > view.cut.supportCount.toLong() + 1L) return false
+                }
+            }
+        } while (cursor != null)
+        return true
+    }
+
+    private fun streamSupportCount(source: SurfaceId): Long? {
+        var count = 0L
+        val complete = streamSourceSupports(source) {
+            count = try { Math.addExact(count, 1L) } catch (_: ArithmeticException) { Long.MAX_VALUE }
+            count <= sourceCapacity()
+        }
+        return if (complete && count <= sourceCapacity()) count else null
+    }
+
     private fun prepareEvidenceBatch(command: CanonicalEvidenceBatchCommand): CanonicalMutationPreparation {
         if (!validCommandId(command.commandId) || command.changes.isEmpty()) {
             return refuse(CanonicalMutationRefusal.INVALID_COMMAND)
@@ -619,13 +1108,10 @@ internal class MutableCanonicalOverlay private constructor(
         if (command.changes.size > configuration.surfaceCapacity + configuration.lineageCapacity) {
             return refuse(CanonicalMutationRefusal.CAPACITY)
         }
-        val scalarEncodedBase = encodedRecordBytes(
-            scalars.targetRows, scalars.removedRows, scalars.minimumSupportPairs,
-            scalars.allocatedRows.toLong(), scalars.lineageEdges, command.commandId,
-        ) ?: return refuse(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
-        val scalarEncodedBytes = try { Math.addExact(scalarEncodedBase, 4L) }
-            catch (_: ArithmeticException) { return refuse(CanonicalMutationRefusal.JOURNAL_EXHAUSTED) }
-        if (!journalFits(scalarEncodedBytes)) return refuse(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
+        val preflight = when (val result = depthBatchPreflight(command, scalars)) {
+            is DepthBatchPreflightResult.Refused -> return refuse(result.reason)
+            is DepthBatchPreflightResult.Complete -> result.value
+        }
 
         data class Operation(val kind: DepthBatchOperationKind, val sources: List<SurfaceId>, val targets: IntArray)
         val operations = ArrayList<Operation>(command.changes.size)
@@ -731,29 +1217,7 @@ internal class MutableCanonicalOverlay private constructor(
             operations.any { it.kind.lineageChanged }
         ) return refuse(CanonicalMutationRefusal.REVISION_EXHAUSTED)
 
-        val outgoingLineage = HashMap<SurfaceId, Int>()
-        fun readOutgoingLineage(source: SurfaceId): Int? {
-            outgoingLineage[source]?.let { return it }
-            var cursor: LineageCursor? = null
-            var count = 0L
-            var pages = 0
-            do {
-                val read = view.visitLineage(source, cursor) {
-                    count++
-                    count <= configuration.lineageCapacity.toLong()
-                }
-                when (read) {
-                    is LineageRead.Refused -> return null
-                    is LineageRead.Complete -> {
-                        cursor = read.nextCursor
-                        if (++pages > configuration.lineageCapacity) return null
-                    }
-                }
-            } while (cursor != null)
-            if (count > Int.MAX_VALUE.toLong()) return null
-            return count.toInt().also { outgoingLineage[source] = it }
-        }
-        val removedLineageRecords = structuralSources.sumOf { readOutgoingLineage(it) ?: return refuse(CanonicalMutationRefusal.SOURCE_READ_FAILURE) }
+        val removedLineageRecords = preflight.removedLineageRecords
 
         data class SupportDetails(val values: List<ImmutableSourceSupport>, val records: Int)
         val details = HashMap<SurfaceId, SupportDetails>()
@@ -881,11 +1345,32 @@ internal class MutableCanonicalOverlay private constructor(
             .sortedWith(compareBy<PreparedSupport> { it.target.value }.thenBy { it.source.id.value })
         val distinctLineage = lineagePairs.distinctBy { it.source.value to it.target.value }
             .sortedWith(compareBy<LineageEdge> { it.source.value }.thenBy { it.target.value })
+        if (distinctSupports.size.toLong() != preflight.supportPairCount) {
+            return refuse(CanonicalMutationRefusal.SOURCE_READ_FAILURE)
+        }
         val targetLive = view.cut.liveSurfaceCount + operations.sumOf { operation ->
             operation.kind.liveDelta(operation.sources.size, operation.targets.size)
         }
-        val removedSupportRecords = removedSupportTargets.sumOf { readDetails(it)?.records ?: 0 }
-        val targetSupport = view.cut.supportCount - removedSupportRecords + distinctSupports.size
+        var removedSupportRecords = 0L
+        for (source in removedSupportTargets) {
+            val records = readDetails(source)?.records ?: return refuse(CanonicalMutationRefusal.SOURCE_READ_FAILURE)
+            removedSupportRecords = try { Math.addExact(removedSupportRecords, records.toLong()) }
+            catch (_: ArithmeticException) { return refuse(CanonicalMutationRefusal.JOURNAL_EXHAUSTED) }
+        }
+        if (removedSupportRecords != preflight.removedSupportRecords) {
+            return refuse(CanonicalMutationRefusal.SOURCE_READ_FAILURE)
+        }
+        if (removedSupportRecords > Int.MAX_VALUE.toLong()) {
+            return refuse(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
+        }
+        val targetSupport = try {
+            Math.addExact(
+                Math.subtractExact(view.cut.supportCount.toLong(), removedSupportRecords),
+                distinctSupports.size.toLong(),
+            ).toIntExact()
+        } catch (_: ArithmeticException) {
+            return refuse(CanonicalMutationRefusal.CAPACITY)
+        }
         val allocations = targets.count { it.id == null }
         val targetSource = view.cut.sourceCount + allocations
         val targetLineage = view.cut.lineageCount - removedLineageRecords + distinctLineage.size
@@ -936,6 +1421,12 @@ internal class MutableCanonicalOverlay private constructor(
         // Temporary callback values coexist with the compact primitive table until it is built.
         internal const val PREPARED_SUPPORT_CONSTRUCTION_BYTES_PER_RECORD = 128L
         internal const val PREPARED_LINEAGE_CONSTRUCTION_BYTES_PER_RECORD = 32L
+        // Conservative retained planner graph costs used by the scalar admission pass.
+        private const val DEPTH_SOURCE_GRAPH_BYTES = 48L
+        private const val DEPTH_TARGET_GRAPH_BYTES = 32L
+        private const val DEPTH_OPERATION_GRAPH_BYTES = 64L
+        private const val DEPTH_SUPPORT_DETAILS_BYTES_PER_RECORD = 128L
+        private const val DEPTH_SUPPORT_SCRATCH_BYTES_PER_RECORD = 8L
 
         fun prepare(view: CanonicalStateView, configuration: SurfaceOwnershipConfiguration, command: FeatureMutationCommand) =
             MutableCanonicalOverlay(view, configuration).prepareFeature(command)
@@ -1087,6 +1578,17 @@ private data class DepthBatchScalars(
     val allocatedRows: Int,
     val minimumSupportPairs: Long,
 )
+
+private data class DepthBatchPreflight(
+    val removedLineageRecords: Int,
+    val removedSupportRecords: Long,
+    val supportPairCount: Long,
+)
+
+private sealed interface DepthBatchPreflightResult {
+    data class Complete(val value: DepthBatchPreflight) : DepthBatchPreflightResult
+    data class Refused(val reason: CanonicalMutationRefusal) : DepthBatchPreflightResult
+}
 
 private enum class DepthBatchSupportMode { NONE, SELF, SOURCE_TO_TARGETS }
 

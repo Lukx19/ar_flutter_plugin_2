@@ -6,6 +6,72 @@ import org.junit.Test
 
 class CanonicalEvidenceBatchTest {
     @Test
+    fun `many removes refuse before planner scratch or source materialization`() {
+        val rows = (1L..200L).map { surface(it, it.toInt()) }
+        val view = TestView(rows, high = 201, geometry = 7, lineage = 5)
+        val preparation = MutableCanonicalOverlay.prepare(
+            view,
+            SurfaceOwnershipConfiguration(
+                surfaceCapacity = 200,
+                lineageCapacity = 200,
+                changeJournalByteCapacity = 10_000,
+            ),
+            CanonicalEvidenceBatchCommand(
+                "remove-scratch", 7, 5,
+                rows.map { DepthEvidenceChange.Remove(it.id) },
+            ),
+        )
+
+        assertTrue(preparation is CanonicalMutationPreparation.Refused)
+        assertEquals(
+            CanonicalMutationRefusal.JOURNAL_EXHAUSTED,
+            (preparation as CanonicalMutationPreparation.Refused).reason,
+        )
+        assertEquals(0, view.sourceMaterializationReads)
+        assertEquals(0, view.supportPageReads)
+        assertEquals(0, view.supportStreamRecords)
+    }
+
+    @Test
+    fun `actual streamed source supports are budgeted before support retention`() {
+        val supportRows = (1L..30L).map { id ->
+            PagedSupport(
+                SurfaceId(1),
+                PagedSource(
+                    SurfaceId(id + 100), Voxel(id.toInt(), 1, 0), 0, 192,
+                    CanonicalReceiptBytes(ByteArray(32) { id.toByte() }),
+                ),
+            )
+        }
+        val view = TestView(
+            listOf(surface(1, 0), surface(2, 1), surface(3, 2)),
+            high = 4,
+            geometry = 7,
+            lineage = 5,
+            supportBySource = mapOf(1L to supportRows),
+        )
+        val preparation = MutableCanonicalOverlay.prepare(
+            view,
+            SurfaceOwnershipConfiguration(changeJournalByteCapacity = 146_000),
+            CanonicalEvidenceBatchCommand(
+                "support-fanout", 7, 5,
+                listOf(DepthEvidenceChange.Relocate(
+                    SurfaceId(1), CanonicalTarget(SurfaceId(1), Voxel(10, 0, 0), 0, 0, 192),
+                )),
+            ),
+        )
+
+        assertTrue(preparation is CanonicalMutationPreparation.Refused)
+        assertEquals(
+            CanonicalMutationRefusal.JOURNAL_EXHAUSTED,
+            (preparation as CanonicalMutationPreparation.Refused).reason,
+        )
+        assertEquals(0, view.sourceMaterializationReads)
+        assertTrue(view.supportPageReads > 0)
+        assertEquals(30, view.supportStreamRecords)
+    }
+
+    @Test
     fun `small journal budget refuses before source support materialization`() {
         val view = TestView(
             listOf(surface(1, 0)),
@@ -208,9 +274,11 @@ class CanonicalEvidenceBatchTest {
         geometry: Long,
         lineage: Long,
         private val outgoingLineage: Map<Long, List<Long>> = emptyMap(),
+        private val supportBySource: Map<Long, List<PagedSupport>> = emptyMap(),
     ) : CanonicalStateView {
         var sourceMaterializationReads = 0
         var supportPageReads = 0
+        var supportStreamRecords = 0
         private val byId = rows.associateBy { it.id }
         private val byVoxel = rows.associateBy { it.voxel }
         override val cut = CompactCanonicalCut(
@@ -238,7 +306,16 @@ class CanonicalEvidenceBatchTest {
             target: SurfaceId,
             cursor: SourceSupportCursor?,
             sink: (PagedSupport) -> Boolean,
-        ) = SourceSupportRead.Complete(0, null, 0, 0).also { supportPageReads++ }
+        ): SourceSupportRead {
+            supportPageReads++
+            var delivered = 0
+            for (support in supportBySource[target.value].orEmpty().drop(cursor?.offset ?: 0)) {
+                if (!sink(support)) break
+                delivered++
+                supportStreamRecords++
+            }
+            return SourceSupportRead.Complete(delivered, null, 0, 0)
+        }
         override fun visitLineage(
             source: SurfaceId,
             cursor: LineageCursor?,
