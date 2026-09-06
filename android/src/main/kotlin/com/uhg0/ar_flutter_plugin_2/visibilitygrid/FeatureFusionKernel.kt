@@ -253,7 +253,6 @@ internal class FeatureFusionKernel(
             positiveSupportQ13[update.slot] = update.positiveSupportQ13
             negativeSupportQ13[update.slot] = update.negativeSupportQ13
         }
-        var assignmentRangeIndex = -1
         for (assignment in prepared.sortedNewAssignments) {
             canonicalIds[assignment.kernelSlot] = assignment.id.value.toInt()
         }
@@ -262,23 +261,11 @@ internal class FeatureFusionKernel(
                 retainedWeight(assignment.kernelSlot), assignment.packedNormal, assignment.normalConfidence,
             )
         }
-        if (prepared.sortedNewAssignments.isNotEmpty()) {
-            if (prepared.extendLastRange) {
-                assignmentRangeIndex = allocationRangeCount - 1
-                allocationRangeEnds[allocationRangeCount - 1] = prepared.sortedNewAssignments.last().id.value.toInt()
-            } else {
-                assignmentRangeIndex = allocationRangeCount
-                allocationRangeStarts[allocationRangeCount] = prepared.sortedNewAssignments.first().id.value.toInt()
-                allocationRangeEnds[allocationRangeCount] = prepared.sortedNewAssignments.last().id.value.toInt()
-                requireNotNull(prepared.newRangeFingerprint).copyInto(
-                    allocationFingerprints, allocationRangeCount * HASH_BYTES,
-                )
-                allocationRangeCount++
-            }
-            for (assignment in prepared.sortedNewAssignments) {
-                setCanonicalRangeIndex(assignment.kernelSlot, assignmentRangeIndex)
-            }
-        }
+        installCanonicalAllocationRange(
+            prepared.sortedNewAssignments,
+            prepared.extendLastRange,
+            prepared.newRangeFingerprint,
+        )
         lastSequence = prepared.sequence
         lastTimestampNs = prepared.timestampNs
         pending = null
@@ -499,6 +486,27 @@ internal class FeatureFusionKernel(
         )
     }
 
+    private fun installCanonicalAllocationRange(
+        assignments: List<CanonicalFeatureAssignment>,
+        extendLast: Boolean,
+        fingerprint: ByteArray?,
+    ) {
+        if (assignments.isEmpty()) return
+        val rangeIndex = if (extendLast) {
+            val existingIndex = allocationRangeCount - 1
+            allocationRangeEnds[existingIndex] = assignments.last().id.value.toInt()
+            existingIndex
+        } else {
+            val newIndex = allocationRangeCount
+            allocationRangeStarts[newIndex] = assignments.first().id.value.toInt()
+            allocationRangeEnds[newIndex] = assignments.last().id.value.toInt()
+            requireNotNull(fingerprint).copyInto(allocationFingerprints, newIndex * HASH_BYTES)
+            allocationRangeCount++
+            newIndex
+        }
+        for (assignment in assignments) setCanonicalRangeIndex(assignment.kernelSlot, rangeIndex)
+    }
+
     private fun insertAt(slot: Int, key: VoxelKey) {
         check(slot == surfaceCount && surfaceCount < SURFACE_CAPACITY)
         var bucket = hash(key)
@@ -576,22 +584,12 @@ internal class FeatureFusionKernel(
                 retainedWeight(assignment.kernelSlot), assignment.packedNormal, assignment.normalConfidence,
             )
         }
-        var assignmentRangeIndex = -1
-        if (sortedNew.isNotEmpty()) {
-            if (extendLast) allocationRangeEnds[allocationRangeCount - 1] = sortedNew.last().id.value.toInt()
-            else {
-                assignmentRangeIndex = allocationRangeCount
-                allocationRangeStarts[allocationRangeCount] = sortedNew.first().id.value.toInt()
-                allocationRangeEnds[allocationRangeCount] = sortedNew.last().id.value.toInt()
-                sortedNew.first().allocationFingerprint.toByteArray().copyInto(
-                    allocationFingerprints,
-                    allocationRangeCount * HASH_BYTES,
-                )
-                allocationRangeCount++
-            }
-            if (extendLast) assignmentRangeIndex = allocationRangeCount - 1
-            for (assignment in sortedNew) setCanonicalRangeIndex(assignment.kernelSlot, assignmentRangeIndex)
-        }
+        installCanonicalAllocationRange(
+            sortedNew,
+            extendLast,
+            if (extendLast || sortedNew.isEmpty()) null
+            else sortedNew.first().allocationFingerprint.toByteArray(),
+        )
         return true
     }
 
