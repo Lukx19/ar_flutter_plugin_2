@@ -462,9 +462,20 @@ class ContinuousRuntimeCapacityCampaignTest {
                 depthReceipt.modeledMaximumSemanticStateBytes <=
                     depthReceipt.semanticStateBudgetBytes,
             )
-            assertTrue(completeCurrentBytes <= CompactCanonicalStore.C17_TOTAL_BYTES)
+            val compactCanonicalLeaseBytes = Math.addExact(
+                completeCurrent.baseRetained.residentTotalBytes,
+                completeCurrent.cowProofAndIndexBytes,
+            )
+            assertTrue(
+                "compact canonical lease=$compactCanonicalLeaseBytes exceeds C17=${CompactCanonicalStore.C17_TOTAL_BYTES}",
+                compactCanonicalLeaseBytes <= CompactCanonicalStore.C17_TOTAL_BYTES,
+            )
+            assertTrue(
+                "feature planning route=${completeCurrent.featurePlanningRouteBytes} exceeds 4 MiB",
+                completeCurrent.featurePlanningRouteBytes in 1L..(4L * 1024L * 1024L),
+            )
             assertEquals(
-                completeCurrent.baseRetained.residentTotalBytes + completeCurrent.cowProofAndIndexBytes,
+                Math.addExact(compactCanonicalLeaseBytes, completeCurrent.featurePlanningRouteBytes),
                 completeCurrent.retainedTotalBytes,
             )
             assertTrue(
