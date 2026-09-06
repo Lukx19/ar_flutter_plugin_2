@@ -24,6 +24,8 @@ internal enum class BoundedCanonicalLookupReason {
     CURRENT_UNAVAILABLE,
     REVISION_CONFLICT,
     LIMIT_EXHAUSTED,
+    CANONICAL_READ_FAILURE,
+    LINEAGE_UNREPRESENTABLE,
 }
 
 internal sealed interface BoundedCanonicalLookupResult<out T> {
@@ -54,6 +56,7 @@ internal class BoundedCanonicalCurrentView internal constructor(
     private var pageReads = 0L
     private var bytesRead = 0L
     private var refusedByLimit = false
+    private var failureReason: BoundedCanonicalLookupReason? = null
 
     override val revisionPair = CanonicalRevisionPair(
         delegate.cut.geometryRevision,
@@ -63,16 +66,20 @@ internal class BoundedCanonicalCurrentView internal constructor(
 
     override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? {
         if (!chargeDirectLookup()) return null
-        val row = readDirect { delegate.findById(id) } ?: return null
-        if (refusedByLimit) return null
+        val row = readDirect { remainingPages, remainingBytes ->
+            delegate.findByIdBounded(id, remainingPages, remainingBytes)
+        } ?: return null
+        if (refusedByLimit || failureReason != null) return null
         return surface(row)
     }
 
     override fun findSurfaceAt(voxel: Voxel): AddressedCanonicalSurface? {
         if (!chargeDirectLookup()) return null
-        val row = readDirect { delegate.findByVoxel(voxel) } ?: return null
-        if (refusedByLimit || row.voxel != voxel) return null
-        return AddressedCanonicalSurface(voxel, surface(row))
+        val row = readDirect { remainingPages, remainingBytes ->
+            delegate.findByVoxelBounded(voxel, remainingPages, remainingBytes)
+        } ?: return null
+        if (refusedByLimit || failureReason != null || row.voxel != voxel) return null
+        return surface(row)?.let { AddressedCanonicalSurface(voxel, it) }
     }
 
     override fun visitRayCells(
@@ -96,8 +103,10 @@ internal class BoundedCanonicalCurrentView internal constructor(
         ) { voxel ->
             rayCellVisits++
             val row = lookupVoxelForRay(voxel)
-            if (refusedByLimit) return@visit false
-            visitor(voxel, row?.let(::surface))
+            if (refusedByLimit || failureReason != null) return@visit false
+            val surface = row?.let(::surface)
+            if (refusedByLimit || failureReason != null) return@visit false
+            visitor(voxel, surface)
         }
         if (result.truncated &&
             (request.maximumRayCellVisits.toLong() <= maximumVisits.toLong() || remaining < maximumVisits.toLong())
@@ -107,7 +116,10 @@ internal class BoundedCanonicalCurrentView internal constructor(
 
     internal fun <T> result(value: T): BoundedCanonicalLookupResult<T> {
         val receipt = receipt()
-        return if (refusedByLimit) {
+        val reason = failureReason
+        return if (reason != null) {
+            BoundedCanonicalLookupResult.Refused(reason, receipt)
+        } else if (refusedByLimit) {
             BoundedCanonicalLookupResult.Refused(BoundedCanonicalLookupReason.LIMIT_EXHAUSTED, receipt)
         } else {
             BoundedCanonicalLookupResult.Completed(value, receipt)
@@ -132,20 +144,35 @@ internal class BoundedCanonicalCurrentView internal constructor(
     }
 
     private fun lookupVoxelForRay(voxel: Voxel): CompactSurface? {
-        return readDirect { delegate.findByVoxel(voxel) }
+        return readDirect { remainingPages, remainingBytes ->
+            delegate.findByVoxelBounded(voxel, remainingPages, remainingBytes)
+        }
     }
 
-    private inline fun <T> readDirect(read: () -> T): T {
-        val before = delegate.readWorkReceipt()
-        val value = read()
-        recordWork(before, delegate.readWorkReceipt())
-        return value
+    private inline fun <T> readDirect(
+        read: (remainingPages: Long, remainingBytes: Long) -> CanonicalBoundedReadResult<T>,
+    ): T? {
+        val operation = read(remainingPageBudget(), remainingByteBudget())
+        return when (operation) {
+            is CanonicalBoundedReadResult.Complete -> {
+                if (!acceptWork(operation.work)) {
+                    failureReason = BoundedCanonicalLookupReason.CANONICAL_READ_FAILURE
+                    null
+                } else operation.value
+            }
+            is CanonicalBoundedReadResult.Refused -> {
+                when (operation.reason) {
+                    CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED -> refusedByLimit = true
+                    CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE ->
+                        failureReason = BoundedCanonicalLookupReason.CANONICAL_READ_FAILURE
+                }
+                null
+            }
+        }
     }
 
-    private fun surface(row: CompactSurface): DepthCanonicalSurface {
-        val before = delegate.readWorkReceipt()
-        val lineage = lineageCount(row.id)
-        recordWork(before, delegate.readWorkReceipt())
+    private fun surface(row: CompactSurface): DepthCanonicalSurface? {
+        val lineage = lineageCount(row.id) ?: return null
         return DepthCanonicalSurface(
             row.id,
             row.voxel,
@@ -155,31 +182,75 @@ internal class BoundedCanonicalCurrentView internal constructor(
         )
     }
 
-    private fun lineageCount(id: SurfaceId): Int {
+    private fun lineageCount(id: SurfaceId): Int? {
         var count = 0
         var cursor: LineageCursor? = null
         do {
-            when (val read = delegate.visitLineage(id, cursor) { count++; true }) {
-                is LineageRead.Refused -> return count.coerceAtMost(0xffff)
+            val read = readLineage(id, cursor) {
+                if (count >= MAX_LINEAGE_COUNT) {
+                    failureReason = BoundedCanonicalLookupReason.LINEAGE_UNREPRESENTABLE
+                    false
+                } else {
+                    count++
+                    true
+                }
+            } ?: return null
+            when (read) {
+                is LineageRead.Refused -> {
+                    failureReason = BoundedCanonicalLookupReason.CANONICAL_READ_FAILURE
+                    return null
+                }
                 is LineageRead.Complete -> cursor = read.nextCursor
             }
-        } while (cursor != null && count < 0xffff)
+        } while (cursor != null && failureReason == null)
         return count
     }
 
-    private fun recordWork(before: CanonicalReadWork, after: CanonicalReadWork) {
-        val pageDelta = after.pageReads - before.pageReads
-        val byteDelta = after.bytesRead - before.bytesRead
-        pageReads = try { Math.addExact(pageReads, pageDelta) } catch (_: ArithmeticException) { Long.MAX_VALUE }
-        bytesRead = try { Math.addExact(bytesRead, byteDelta) } catch (_: ArithmeticException) { Long.MAX_VALUE }
-        if (pageReads > request.maximumPageReads.toLong() || bytesRead > request.maximumBytesRead) {
-            refusedByLimit = true
+    private fun readLineage(
+        id: SurfaceId,
+        cursor: LineageCursor?,
+        sink: (LineageEdge) -> Boolean,
+    ): LineageRead? {
+        val operation = delegate.visitLineageBounded(
+            id, cursor, remainingPageBudget(), remainingByteBudget(), sink,
+        )
+        return when (operation) {
+            is CanonicalBoundedReadResult.Complete -> {
+                if (!acceptWork(operation.work)) {
+                    failureReason = BoundedCanonicalLookupReason.CANONICAL_READ_FAILURE
+                    null
+                } else operation.value
+            }
+            is CanonicalBoundedReadResult.Refused -> {
+                when (operation.reason) {
+                    CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED -> refusedByLimit = true
+                    CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE ->
+                        failureReason = BoundedCanonicalLookupReason.CANONICAL_READ_FAILURE
+                }
+                null
+            }
         }
+    }
+
+    private fun remainingPageBudget() = request.maximumPageReads.toLong() - pageReads
+    private fun remainingByteBudget() = request.maximumBytesRead - bytesRead
+
+    private fun acceptWork(work: CanonicalReadWork): Boolean {
+        if (work.pageReads < 0 || work.bytesRead < 0 ||
+            work.pageReads > remainingPageBudget() || work.bytesRead > remainingByteBudget()
+        ) return false
+        pageReads = try { Math.addExact(pageReads, work.pageReads) } catch (_: ArithmeticException) { return false }
+        bytesRead = try { Math.addExact(bytesRead, work.bytesRead) } catch (_: ArithmeticException) { return false }
+        return true
     }
 
     private fun Long.toIntExactOrLimit(): Int = when {
         this < 0L -> 0
         this > Int.MAX_VALUE.toLong() -> Int.MAX_VALUE
         else -> toInt()
+    }
+
+    private companion object {
+        const val MAX_LINEAGE_COUNT = 0xffff
     }
 }

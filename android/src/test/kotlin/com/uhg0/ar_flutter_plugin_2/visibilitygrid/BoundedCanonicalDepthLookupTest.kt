@@ -58,7 +58,7 @@ class BoundedCanonicalDepthLookupTest {
 
             val cut = requireNotNull(resources.owner().activationState()).cut
             val result = resources.withBoundedCurrent(
-                BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 1, 0, 0, 0),
+                BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 1, 0, Int.MAX_VALUE, Long.MAX_VALUE),
             ) { view ->
                 view.findSurfaceAt(Voxel(2, 3, 4))
             }
@@ -70,7 +70,7 @@ class BoundedCanonicalDepthLookupTest {
                 ),
                 completed.value,
             )
-            assertEquals(BoundedCanonicalLookupReceipt(1, 0, 0, 0, false), completed.receipt)
+            assertEquals(BoundedCanonicalLookupReceipt(1, 0, 2, 32_768, false), completed.receipt)
         } finally {
             resources.close()
             coordinator.close()
@@ -180,7 +180,7 @@ class BoundedCanonicalDepthLookupTest {
             val visited = mutableListOf<Voxel>()
 
             val result = resources.withBoundedCurrent(
-                BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 0, 8, 0, 0),
+                BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 0, 8, Int.MAX_VALUE, Long.MAX_VALUE),
             ) { view ->
                 view.visitRayCells(DepthPointMm(0.0, 0.0, 0.0), DepthPointMm(250.0, 0.0, 0.0), 8) { voxel, _ ->
                     visited += voxel
@@ -191,7 +191,7 @@ class BoundedCanonicalDepthLookupTest {
             val completed = result as BoundedCanonicalLookupResult.Completed
             assertEquals(3, completed.value.visitedCells)
             assertEquals(listOf(Voxel(0, 0, 0), Voxel(1, 0, 0), Voxel(2, 0, 0)), visited)
-            assertEquals(BoundedCanonicalLookupReceipt(0, 3, 0, 0, false), completed.receipt)
+            assertEquals(BoundedCanonicalLookupReceipt(0, 3, 2, 32_768, false), completed.receipt)
         } finally {
             resources.close()
             coordinator.close()
@@ -224,11 +224,11 @@ class BoundedCanonicalDepthLookupTest {
             assertTrue(reopened.reopen() is SurfaceOwnershipOpenResult.Opened)
             val cut = requireNotNull(reopened.owner().activationState()).cut
             val result = reopened.withBoundedCurrent(
-                BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 1, 0, 0, 0),
+                BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 1, 0, Int.MAX_VALUE, Long.MAX_VALUE),
             ) { view -> view.findSurfaceById(SurfaceId(1)) }
             val completed = result as BoundedCanonicalLookupResult.Completed
             assertEquals(SurfaceId(1), completed.value?.id)
-            assertEquals(BoundedCanonicalLookupReceipt(1, 0, 0, 0, false), completed.receipt)
+            assertEquals(BoundedCanonicalLookupReceipt(1, 0, 1, 16_384, false), completed.receipt)
 
             val state = requireNotNull(reopened.owner().activationState())
             val current = state.current as CanonicalActivationCurrent.Receipt
@@ -273,14 +273,14 @@ class BoundedCanonicalDepthLookupTest {
             val cut = requireNotNull(resources.owner().activationState()).cut
 
             val result = resources.withBoundedCurrent(
-                BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 0, 2, 0, 0),
+                BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 0, 2, Int.MAX_VALUE, Long.MAX_VALUE),
             ) { view ->
                 view.visitRayCells(DepthPointMm(0.0, 0.0, 0.0), DepthPointMm(250.0, 0.0, 0.0), 8) { _, _ -> true }
             }
 
             val refused = result as BoundedCanonicalLookupResult.Refused
             assertEquals(BoundedCanonicalLookupReason.LIMIT_EXHAUSTED, refused.reason)
-            assertEquals(BoundedCanonicalLookupReceipt(0, 2, 0, 0, true), refused.receipt)
+            assertEquals(BoundedCanonicalLookupReceipt(0, 2, 2, 32_768, true), refused.receipt)
         } finally {
             resources.close()
             coordinator.close()
@@ -332,7 +332,7 @@ class BoundedCanonicalDepthLookupTest {
             assertTrue(selector.delete())
 
             val result = resources.withBoundedCurrent(
-                BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 1, 0, 0, 0),
+                BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 1, 0, Int.MAX_VALUE, Long.MAX_VALUE),
             ) { error("authentication failure must not borrow current") }
             assertEquals(BoundedCanonicalLookupReason.CURRENT_UNAVAILABLE, (result as BoundedCanonicalLookupResult.Refused).reason)
         } finally {
@@ -374,11 +374,11 @@ class BoundedCanonicalDepthLookupTest {
             val cut = requireNotNull(resources.owner().activationState()).cut
 
             val result = resources.withBoundedCurrent(
-                BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 1, 0, 0, 0),
+                BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 1, 0, Int.MAX_VALUE, Long.MAX_VALUE),
             ) { view -> view.findSurfaceById(SurfaceId(1)) }
             val completed = result as BoundedCanonicalLookupResult.Completed
             assertEquals(1, completed.value?.lineageCount)
-            assertEquals(1, completed.receipt.directLookups)
+            assertEquals(BoundedCanonicalLookupReceipt(1, 0, 2, 32_768, false), completed.receipt)
         } finally {
             resources.close()
             coordinator.close()
@@ -432,7 +432,9 @@ class BoundedCanonicalDepthLookupTest {
         assertTrue(result is BoundedCanonicalLookupResult.Refused)
         val refused = result as BoundedCanonicalLookupResult.Refused
         assertEquals(BoundedCanonicalLookupReason.LIMIT_EXHAUSTED, refused.reason)
-        assertEquals(BoundedCanonicalLookupReceipt(1, 0, 2, 0, true), refused.receipt)
+        assertEquals(BoundedCanonicalLookupReceipt(1, 0, 1, 0, true), refused.receipt)
+        assertEquals(1, view.lineageReadAttempts)
+        assertEquals(0, view.lineageReadStarts)
     }
 
     @Test
@@ -449,7 +451,52 @@ class BoundedCanonicalDepthLookupTest {
         assertTrue(result is BoundedCanonicalLookupResult.Refused)
         val refused = result as BoundedCanonicalLookupResult.Refused
         assertEquals(BoundedCanonicalLookupReason.LIMIT_EXHAUSTED, refused.reason)
-        assertEquals(BoundedCanonicalLookupReceipt(1, 0, 0, 128, true), refused.receipt)
+        assertEquals(BoundedCanonicalLookupReceipt(1, 0, 0, 64, true), refused.receipt)
+        assertEquals(1, view.lineageReadAttempts)
+        assertEquals(0, view.lineageReadStarts)
+    }
+
+    @Test
+    fun `lineage exceeding uint16 representation refuses without full enumeration`() {
+        val view = MeteredCanonicalLookupView(
+            pageReadDelta = 0,
+            byteReadDelta = 0,
+            lineageEdgeCount = 100_000,
+        )
+        val bounded = BoundedCanonicalCurrentView(
+            view,
+            BoundedCanonicalLookupRequest(1, 1, 1, 0, 0, 0),
+            100_000,
+        )
+
+        val result = bounded.result(bounded.findSurfaceById(SurfaceId(1)))
+
+        assertTrue(result is BoundedCanonicalLookupResult.Refused)
+        val refused = result as BoundedCanonicalLookupResult.Refused
+        assertEquals(BoundedCanonicalLookupReason.LINEAGE_UNREPRESENTABLE, refused.reason)
+        assertEquals(BoundedCanonicalLookupReceipt(1, 0, 0, 0, false), refused.receipt)
+        assertEquals(65_536, view.lineageEdgesObserved)
+    }
+
+    @Test
+    fun `lineage read refusal is canonical failure without a partial surface`() {
+        val view = MeteredCanonicalLookupView(
+            pageReadDelta = 0,
+            byteReadDelta = 0,
+            lineageReadFailure = true,
+        )
+        val bounded = BoundedCanonicalCurrentView(
+            view,
+            BoundedCanonicalLookupRequest(1, 1, 1, 0, 0, 0),
+            100_000,
+        )
+
+        val result = bounded.result(bounded.findSurfaceById(SurfaceId(1)))
+
+        assertTrue(result is BoundedCanonicalLookupResult.Refused)
+        val refused = result as BoundedCanonicalLookupResult.Refused
+        assertEquals(BoundedCanonicalLookupReason.CANONICAL_READ_FAILURE, refused.reason)
+        assertEquals(BoundedCanonicalLookupReceipt(1, 0, 0, 0, false), refused.receipt)
     }
 
     private fun coordinator(root: File) = StorageBudgetCoordinatorV2(
@@ -514,9 +561,17 @@ class BoundedCanonicalDepthLookupTest {
     private class MeteredCanonicalLookupView(
         private val pageReadDelta: Long,
         private val byteReadDelta: Long,
+        private val lineageEdgeCount: Int = 0,
+        private val lineageReadFailure: Boolean = false,
     ) : CanonicalStateView {
         private var pageReads = 0L
         private var bytesRead = 0L
+        var lineageReadAttempts = 0
+            private set
+        var lineageReadStarts = 0
+            private set
+        var lineageEdgesObserved = 0
+            private set
 
         override val cut = CompactCanonicalCut(
             SurfaceGroup("a".repeat(32)), CompactCanonicalStore.PROFILE,
@@ -525,8 +580,6 @@ class BoundedCanonicalDepthLookupTest {
         )
 
         override fun findById(id: SurfaceId): CompactSurface? {
-            pageReads += pageReadDelta
-            bytesRead += byteReadDelta
             return CompactSurface(SurfaceId(1), Voxel(0, 0, 0), 0x0101, 200)
                 .takeIf { id == it.id }
         }
@@ -546,10 +599,61 @@ class BoundedCanonicalDepthLookupTest {
             cursor: LineageCursor?,
             sink: (LineageEdge) -> Boolean,
         ): LineageRead {
-            pageReads += pageReadDelta
-            bytesRead += byteReadDelta
             return LineageRead.Complete(0, null)
         }
+
+        override fun findByIdBounded(
+            id: SurfaceId,
+            maximumPageReads: Long,
+            maximumBytesRead: Long,
+        ): CanonicalBoundedReadResult<CompactSurface?> {
+            if (!fits(maximumPageReads, maximumBytesRead)) {
+                return CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED)
+            }
+            pageReads += pageReadDelta
+            bytesRead += byteReadDelta
+            return CanonicalBoundedReadResult.Complete(
+                findById(id), CanonicalReadWork(0, pageReadDelta, 0, byteReadDelta),
+            )
+        }
+
+        override fun visitLineageBounded(
+            source: SurfaceId,
+            cursor: LineageCursor?,
+            maximumPageReads: Long,
+            maximumBytesRead: Long,
+            sink: (LineageEdge) -> Boolean,
+        ): CanonicalBoundedReadResult<LineageRead> {
+            lineageReadAttempts++
+            if (!fits(maximumPageReads, maximumBytesRead)) {
+                return CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED)
+            }
+            lineageReadStarts++
+            pageReads += pageReadDelta
+            bytesRead += byteReadDelta
+            if (lineageReadFailure) {
+                return CanonicalBoundedReadResult.Complete(
+                    LineageRead.Refused(CompactCanonicalRefusal.CORRUPT),
+                    CanonicalReadWork(0, pageReadDelta, 0, byteReadDelta),
+                )
+            }
+            var delivered = 0
+            for (index in 0 until lineageEdgeCount) {
+                lineageEdgesObserved++
+                if (!sink(LineageEdge(source, SurfaceId(index.toLong() + 2)))) break
+                delivered++
+            }
+            val next = if (delivered < lineageEdgeCount) {
+                LineageCursor(cut.rootHash, source, delivered)
+            } else null
+            return CanonicalBoundedReadResult.Complete(
+                LineageRead.Complete(delivered, next),
+                CanonicalReadWork(0, pageReadDelta, 0, byteReadDelta),
+            )
+        }
+
+        private fun fits(maximumPageReads: Long, maximumBytesRead: Long) =
+            pageReadDelta in 0..maximumPageReads && byteReadDelta in 0..maximumBytesRead
         override fun retainedMemoryReceipt() = CompactRetainedMemoryReceipt(
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         )

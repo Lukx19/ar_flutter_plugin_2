@@ -89,51 +89,17 @@ internal class CanonicalRuntimeResources private constructor(
                 BoundedCanonicalLookupReceipt(0, 0, 0, 0, false),
             )
         }
-        val lease = current ?: coldCurrent()?.also { current = it } ?: return BoundedCanonicalLookupResult.Refused(
-            BoundedCanonicalLookupReason.CURRENT_UNAVAILABLE,
-            BoundedCanonicalLookupReceipt(0, 0, 0, 0, false),
-        )
-        if (request.expectedGeometryRevision != lease.view.cut.geometryRevision ||
-            request.expectedLineageRevision != lease.view.cut.lineageRevision
-        ) {
-            return BoundedCanonicalLookupResult.Refused(
-                BoundedCanonicalLookupReason.REVISION_CONFLICT,
-                BoundedCanonicalLookupReceipt(0, 0, 0, 0, false),
-            )
-        }
-        val authenticated = CanonicalActivationSelector.reopenAuthenticatedCurrent(
-            group, directory, budget, lease.view.cut,
-        ) as? CanonicalActivationResult.Active ?: run {
-            invalidateCurrent()
-            return BoundedCanonicalLookupResult.Refused(
-                BoundedCanonicalLookupReason.CURRENT_UNAVAILABLE,
-                BoundedCanonicalLookupReceipt(0, 0, 0, 0, false),
-            )
-        }
-        if (authenticated.state.cut != lease.view.cut) {
-            invalidateCurrent()
-            return BoundedCanonicalLookupResult.Refused(
-                BoundedCanonicalLookupReason.CURRENT_UNAVAILABLE,
-                BoundedCanonicalLookupReceipt(0, 0, 0, 0, false),
-            )
-        }
-        val authenticatedCurrentBytes = when (val state = authenticated.state.currentState) {
-            is CanonicalCurrentState.Unacknowledged -> state.identity.canonicalLength
-            else -> 0L
-        }
-        CanonicalRuntimeCurrentTestHooks.onAuthenticatedBorrow?.invoke(authenticatedCurrentBytes)
-        val opened = openCompleteCurrent(lease.view.cut) ?: run {
-            invalidateCurrent()
-            return BoundedCanonicalLookupResult.Refused(
-                BoundedCanonicalLookupReason.CURRENT_UNAVAILABLE,
-                BoundedCanonicalLookupReceipt(0, 0, 0, 0, false),
-            )
-        }
-        val bounded = BoundedCanonicalCurrentView(opened.view, request, configuration.voxelMicrometers)
-        return try {
+        return withAuthenticatedCompleteCurrent(
+            CanonicalRevisionPair(request.expectedGeometryRevision, request.expectedLineageRevision),
+            onFailure = { failure ->
+                BoundedCanonicalLookupResult.Refused(
+                    failure.lookupReason,
+                    BoundedCanonicalLookupReceipt(0, 0, 0, 0, false),
+                )
+            },
+        ) { view ->
+            val bounded = BoundedCanonicalCurrentView(view, request, configuration.voxelMicrometers)
             bounded.result(block(bounded))
-        } finally {
-            opened.close()
         }
     }
 
@@ -143,35 +109,63 @@ internal class CanonicalRuntimeResources private constructor(
         command: CanonicalEvidenceBatchCommand,
     ): CanonicalMutationPreparation {
         checkOpen()
-        val lease = current ?: coldCurrent()?.also { current = it } ?: return CanonicalMutationPreparation.Refused(
-            CanonicalMutationRefusal.INVALID_OWNERSHIP,
-            CanonicalStateReceipt(0, 0, 1, 0),
+        return withAuthenticatedCompleteCurrent(
+            CanonicalRevisionPair(command.expectedGeometryRevision, command.expectedLineageRevision),
+            onFailure = { failure ->
+                when (failure) {
+                    CompleteCurrentBorrowFailure.REVISION_CONFLICT ->
+                        CanonicalMutationPreparation.Refused(
+                            CanonicalMutationRefusal.REVISION_CONFLICT,
+                            currentStateReceipt(),
+                        )
+                    CompleteCurrentBorrowFailure.CURRENT_UNAVAILABLE ->
+                        CanonicalMutationPreparation.Refused(
+                            CanonicalMutationRefusal.INVALID_OWNERSHIP,
+                            CanonicalStateReceipt(0, 0, 1, 0),
+                        )
+                }
+            },
+        ) { view -> owner().prepareAdjacentMutation(view, command) }
+    }
+
+    private fun currentStateReceipt() = current?.view?.cut?.let { cut ->
+        CanonicalStateReceipt(
+            cut.geometryRevision, cut.lineageRevision,
+            cut.nextSurfaceIdHighWater, cut.liveSurfaceCount,
         )
+    } ?: CanonicalStateReceipt(0, 0, 1, 0)
+
+    private fun <T> withAuthenticatedCompleteCurrent(
+        expected: CanonicalRevisionPair,
+        onFailure: (CompleteCurrentBorrowFailure) -> T,
+        block: (CanonicalStateView) -> T,
+    ): T {
+        val lease = current ?: coldCurrent()?.also { current = it }
+            ?: return onFailure(CompleteCurrentBorrowFailure.CURRENT_UNAVAILABLE)
+        if (expected.geometryRevision != lease.view.cut.geometryRevision ||
+            expected.lineageRevision != lease.view.cut.lineageRevision
+        ) return onFailure(CompleteCurrentBorrowFailure.REVISION_CONFLICT)
         val authenticated = CanonicalActivationSelector.reopenAuthenticatedCurrent(
             group, directory, budget, lease.view.cut,
         ) as? CanonicalActivationResult.Active ?: run {
             invalidateCurrent()
-            return CanonicalMutationPreparation.Refused(
-                CanonicalMutationRefusal.INVALID_OWNERSHIP,
-                CanonicalStateReceipt(0, 0, 1, 0),
-            )
+            return onFailure(CompleteCurrentBorrowFailure.CURRENT_UNAVAILABLE)
         }
         if (authenticated.state.cut != lease.view.cut) {
             invalidateCurrent()
-            return CanonicalMutationPreparation.Refused(
-                CanonicalMutationRefusal.INVALID_OWNERSHIP,
-                CanonicalStateReceipt(0, 0, 1, 0),
-            )
+            return onFailure(CompleteCurrentBorrowFailure.CURRENT_UNAVAILABLE)
         }
+        val authenticatedCurrentBytes = when (val state = authenticated.state.currentState) {
+            is CanonicalCurrentState.Unacknowledged -> state.identity.canonicalLength
+            else -> 0L
+        }
+        CanonicalRuntimeCurrentTestHooks.onAuthenticatedBorrow?.invoke(authenticatedCurrentBytes)
         val opened = openCompleteCurrent(lease.view.cut) ?: run {
             invalidateCurrent()
-            return CanonicalMutationPreparation.Refused(
-                CanonicalMutationRefusal.INVALID_OWNERSHIP,
-                CanonicalStateReceipt(0, 0, 1, 0),
-            )
+            return onFailure(CompleteCurrentBorrowFailure.CURRENT_UNAVAILABLE)
         }
         return try {
-            owner().prepareAdjacentMutation(opened.view, command)
+            block(opened.view)
         } finally {
             opened.close()
         }
@@ -454,6 +448,17 @@ internal class CanonicalRuntimeResources private constructor(
             // group root while the borrowed coordinator accounts them from its shared ancestor.
             return CanonicalRuntimeResources(group, groupDirectory, groupDirectory, coordinator, configuration)
         }
+    }
+
+    private enum class CompleteCurrentBorrowFailure {
+        CURRENT_UNAVAILABLE,
+        REVISION_CONFLICT;
+
+        val lookupReason: BoundedCanonicalLookupReason
+            get() = when (this) {
+                CURRENT_UNAVAILABLE -> BoundedCanonicalLookupReason.CURRENT_UNAVAILABLE
+                REVISION_CONFLICT -> BoundedCanonicalLookupReason.REVISION_CONFLICT
+            }
     }
 
     private class CompleteCurrent(

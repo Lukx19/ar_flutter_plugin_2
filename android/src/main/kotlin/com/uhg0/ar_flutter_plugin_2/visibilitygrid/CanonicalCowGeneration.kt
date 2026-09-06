@@ -25,6 +25,7 @@ internal class CanonicalCowGeneration private constructor(
     private var cowPagesRead = 0L
     private var cowRecordsInspected = 0L
     private var cowHashesValidated = 0L
+    private var cowBytesRead = 0L
 
     @Synchronized
     override fun close() { closed = true }
@@ -33,7 +34,16 @@ internal class CanonicalCowGeneration private constructor(
     fun storageReceipt() = storage
 
     @Synchronized
-    fun readWorkReceipt() = CowReadWork(cowPagesRead, cowRecordsInspected, cowHashesValidated)
+    fun readWorkReceipt() = CowReadWork(cowPagesRead, cowRecordsInspected, cowHashesValidated, cowBytesRead)
+
+    @Synchronized
+    internal fun matchingPageCount(kind: CowFragmentKind, key: Long): Long = entries.count {
+        it.kind == kind && java.lang.Long.compareUnsigned(key, it.minimumKey) >= 0 &&
+            java.lang.Long.compareUnsigned(key, it.maximumKey) <= 0
+    }.toLong()
+
+    @Synchronized
+    internal fun pageCount(kind: CowFragmentKind): Long = entries.count { it.kind == kind }.toLong()
     @Synchronized
     internal fun withAllocatedStorage(bytes: Long): CanonicalCowGeneration {
         check(!closed)
@@ -92,6 +102,7 @@ internal class CanonicalCowGeneration private constructor(
         cowPagesRead++
         cowHashesValidated++
         cowRecordsInspected += entry.count
+        cowBytesRead = try { Math.addExact(cowBytesRead, PAGE_BYTES.toLong()) } catch (_: ArithmeticException) { Long.MAX_VALUE }
         val bytes = ByteArray(PAGE_BYTES)
         RandomAccessReader(file, entry.page.toLong() * PAGE_BYTES).use { input -> input.readFully(bytes) }
         if (!sha(bytes).contentEquals(entry.hash)) return false
@@ -562,8 +573,15 @@ internal data class CowGenerationIdentity(val hash: CanonicalReceiptBytes) {
 }
 
 internal data class CowStorageReceipt(val allocatedBytes: Long, val directoryEntries: Int, val phasePeakBytes: Long)
-internal data class CowReadWork(val pages: Long, val records: Long, val hashes: Long) {
-    operator fun minus(other: CowReadWork) = CowReadWork(pages - other.pages, records - other.records, hashes - other.hashes)
+internal data class CowReadWork(
+    val pages: Long,
+    val records: Long,
+    val hashes: Long,
+    val bytes: Long = 0L,
+) {
+    operator fun minus(other: CowReadWork) = CowReadWork(
+        pages - other.pages, records - other.records, hashes - other.hashes, bytes - other.bytes,
+    )
 }
 internal data class CowPageCursor(
     val rootHash: CanonicalReceiptBytes,
@@ -599,6 +617,64 @@ private class CowOverlay(private val base: CanonicalStateView, private val delta
         return if (removed) null else base.findById(id)
     }
     override fun findByVoxel(voxel: Voxel): CompactSurface? = delta.readOr(null) { findByVoxelOpen(voxel) }
+
+    override fun findByIdBounded(
+        id: SurfaceId,
+        maximumPageReads: Long,
+        maximumBytesRead: Long,
+    ): CanonicalBoundedReadResult<CompactSurface?> = boundedCowRead(
+        maximumPageReads,
+        maximumBytesRead,
+        delta.matchingPageCount(CowFragmentKind.ROW, id.value) +
+            delta.matchingPageCount(CowFragmentKind.ID_TOMBSTONE, id.value),
+    ) { findById(id) }
+
+    override fun findByVoxelBounded(
+        voxel: Voxel,
+        maximumPageReads: Long,
+        maximumBytesRead: Long,
+    ): CanonicalBoundedReadResult<CompactSurface?> {
+        val key = CanonicalCowGeneration.voxelKey(voxel.x, voxel.y, voxel.z)
+        val indexPages = delta.matchingPageCount(CowFragmentKind.VOXEL_INDEX, key)
+        val rowPages = delta.pageCount(CowFragmentKind.ROW)
+        val rowLookups = try {
+            Math.multiplyExact(indexPages, CowFragmentKind.VOXEL_INDEX.recordsPerPage.toLong())
+        } catch (_: ArithmeticException) { Long.MAX_VALUE }
+        val rowLookupPages = try { Math.multiplyExact(rowLookups, rowPages) } catch (_: ArithmeticException) { Long.MAX_VALUE }
+        val estimatedPages = listOf(
+            indexPages,
+            rowLookupPages,
+            delta.matchingPageCount(CowFragmentKind.VOXEL_TOMBSTONE, key),
+            rowPages,
+            delta.pageCount(CowFragmentKind.ID_TOMBSTONE),
+        ).fold(0L) { total, value -> try { Math.addExact(total, value) } catch (_: ArithmeticException) { Long.MAX_VALUE } }
+        return boundedCowRead(maximumPageReads, maximumBytesRead, estimatedPages) { findByVoxel(voxel) }
+    }
+
+    private inline fun <T> boundedCowRead(
+        maximumPageReads: Long,
+        maximumBytesRead: Long,
+        estimatedPages: Long,
+        read: () -> T,
+    ): CanonicalBoundedReadResult<T> {
+        if (maximumPageReads < 0L || maximumBytesRead < 0L) {
+            return CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED)
+        }
+        val estimatedBytes = try {
+            Math.multiplyExact(estimatedPages, CanonicalCowGeneration.PAGE_BYTES.toLong())
+        } catch (_: ArithmeticException) { Long.MAX_VALUE }
+        if (estimatedPages > maximumPageReads || estimatedBytes > maximumBytesRead) {
+            return CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED)
+        }
+        val before = readWorkReceipt()
+        val value = read()
+        val work = readWorkReceipt() - before
+        return if (work.pageReads < 0L || work.bytesRead < 0L) {
+            CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE)
+        } else if (work.pageReads > maximumPageReads || work.bytesRead > maximumBytesRead) {
+            CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE)
+        } else CanonicalBoundedReadResult.Complete(value, work)
+    }
     private fun findByVoxelOpen(voxel: Voxel): CompactSurface? {
         val key = CanonicalCowGeneration.voxelKey(voxel.x, voxel.y, voxel.z)
         val indexes = when (val read = delta.indexes(CowFragmentKind.VOXEL_INDEX, key)) {
@@ -735,6 +811,19 @@ private class CowOverlay(private val base: CanonicalStateView, private val delta
     }
     override fun visitLineage(source: SurfaceId, cursor: LineageCursor?, sink: (LineageEdge) -> Boolean): LineageRead =
         delta.readOr(LineageRead.Refused(CompactCanonicalRefusal.CLOSED)) { visitLineageOpen(source, cursor, sink) }
+
+    override fun visitLineageBounded(
+        source: SurfaceId,
+        cursor: LineageCursor?,
+        maximumPageReads: Long,
+        maximumBytesRead: Long,
+        sink: (LineageEdge) -> Boolean,
+    ): CanonicalBoundedReadResult<LineageRead> = boundedCowRead(
+        maximumPageReads,
+        maximumBytesRead,
+        delta.matchingPageCount(CowFragmentKind.LINEAGE, source.value) +
+            delta.matchingPageCount(CowFragmentKind.LINEAGE_TOMBSTONE, source.value),
+    ) { visitLineage(source, cursor, sink) }
     private fun visitLineageOpen(source: SurfaceId, cursor: LineageCursor?, sink: (LineageEdge) -> Boolean): LineageRead {
         if (cursor != null && (cursor.rootHash != cut.rootHash || cursor.source != source || cursor.offset < 0))
             return LineageRead.Refused(CompactCanonicalRefusal.STALE_CURSOR)
@@ -767,7 +856,16 @@ private class CowOverlay(private val base: CanonicalStateView, private val delta
         ?: error("COW generation is closed")
     override fun allocatedStorageReceipt() = delta.readOr<CompactStorageReceipt?>(null) { base.allocatedStorageReceipt() }
         ?: error("COW generation is closed")
-    override fun readWorkReceipt() = delta.readOr<CanonicalReadWork?>(null) { base.readWorkReceipt() }
+    override fun readWorkReceipt() = delta.readOr<CanonicalReadWork?>(null) {
+        val baseWork = base.readWorkReceipt()
+        val cowWork = delta.readWorkReceipt()
+        CanonicalReadWork(
+            baseWork.directLookups,
+            Math.addExact(baseWork.pageReads, cowWork.pages),
+            Math.addExact(baseWork.inspectedRows, cowWork.records),
+            Math.addExact(baseWork.bytesRead, cowWork.bytes),
+        )
+    }
         ?: error("COW generation is closed")
     override fun close() = Unit
 }
