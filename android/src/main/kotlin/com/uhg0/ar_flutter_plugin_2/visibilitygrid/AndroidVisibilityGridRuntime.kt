@@ -118,12 +118,14 @@ internal class AndroidVisibilityGridRuntime(
 
     fun setDepthCapability(capability: VisibilityDepthCapability) = synchronized(lock) {
         depthCapability = capability
-        depthHealth = if (capability == VisibilityDepthCapability.UNSUPPORTED) {
-            VisibilitySourceHealth.UNSUPPORTED
-        } else if (depthHealth == VisibilitySourceHealth.UNSUPPORTED) {
-            VisibilitySourceHealth.CONFIGURED
-        } else {
-            depthHealth
+        if (depthHealth != VisibilitySourceHealth.FAILED) {
+            depthHealth = if (capability == VisibilityDepthCapability.UNSUPPORTED) {
+                VisibilitySourceHealth.UNSUPPORTED
+            } else if (depthHealth == VisibilitySourceHealth.UNSUPPORTED) {
+                VisibilitySourceHealth.CONFIGURED
+            } else {
+                depthHealth
+            }
         }
     }
 
@@ -257,7 +259,7 @@ internal class AndroidVisibilityGridRuntime(
         }
     }
 
-    fun recordFeatureFailure() {
+    fun recordFeatureFailure() = lifecycleLock.write {
         synchronized(lock) {
             featureFailures++
             featureHealth = VisibilitySourceHealth.FAILED
@@ -265,7 +267,7 @@ internal class AndroidVisibilityGridRuntime(
         discardUnusableIngress(feature = true)
     }
 
-    fun recordDepthFailure() {
+    fun recordDepthFailure() = lifecycleLock.write {
         val terminal = synchronized(lock) {
             if (depthCapability != VisibilityDepthCapability.UNSUPPORTED) {
                 depthFailures++

@@ -229,6 +229,10 @@ class AndroidVisibilityGridRuntimeTest {
             runtime.recordDepthTransientUnavailable()
             runtime.recordDepthStalled()
             assertEquals(VisibilitySourceHealth.FAILED, runtime.snapshot().depthHealth)
+            runtime.setDepthCapability(VisibilityDepthCapability.UNSUPPORTED)
+            assertEquals(VisibilitySourceHealth.FAILED, runtime.snapshot().depthHealth)
+            runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            assertEquals(VisibilitySourceHealth.FAILED, runtime.snapshot().depthHealth)
             assertEquals("featureOnly", runtime.snapshot().totalGridHealth)
 
             assertTrue(runtime.offerFeature(feature(cut.get(), 1, 1), 2_000_001))
@@ -601,6 +605,50 @@ class AndroidVisibilityGridRuntimeTest {
             assertEquals(0, runtime.snapshot().residentPayloadBytes)
         } finally {
             enqueueRelease.countDown()
+            runtime.close()
+        }
+    }
+
+    @Test
+    fun `terminal failure waits for admitted mapper call then fences later delivery`() {
+        val cut = AtomicReference(ownership())
+        val mapperEntered = CountDownLatch(1)
+        val mapperRelease = CountDownLatch(1)
+        val failureReturned = CountDownLatch(1)
+        val mapped = AtomicLong()
+        val runtime = runtime(
+            cut,
+            object : VisibilityObservationMapper {
+                override fun admitFeature(observation: VisibilityFeatureObservation) {
+                    mapperEntered.countDown()
+                    mapperRelease.await(2, TimeUnit.SECONDS)
+                    mapped.incrementAndGet()
+                }
+                override fun admitDepth(observation: VisibilityDepthObservation) = Unit
+                override fun snapshot() = VisibilityMappingAdmissionHealth.empty().copy(
+                    admittedFeatures = mapped.get(),
+                )
+            },
+        )
+        try {
+            assertTrue(runtime.offerFeature(feature(cut.get(), 1, 1)))
+            assertTrue(mapperEntered.await(1, TimeUnit.SECONDS))
+            val failing = Thread {
+                runtime.recordFeatureFailure()
+                failureReturned.countDown()
+            }.apply { start() }
+            assertFalse(failureReturned.await(25, TimeUnit.MILLISECONDS))
+
+            mapperRelease.countDown()
+            assertTrue(failureReturned.await(1, TimeUnit.SECONDS))
+            failing.join(1_000)
+            assertEquals(1, mapped.get())
+            assertEquals(1, runtime.snapshot().admittedFeatureObservations)
+            assertEquals(VisibilitySourceHealth.FAILED, runtime.snapshot().featureHealth)
+            assertFalse(runtime.offerFeature(feature(cut.get(), 2_000_000, 2)))
+            assertEquals(1, mapped.get())
+        } finally {
+            mapperRelease.countDown()
             runtime.close()
         }
     }
