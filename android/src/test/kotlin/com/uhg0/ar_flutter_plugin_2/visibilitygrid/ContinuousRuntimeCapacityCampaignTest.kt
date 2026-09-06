@@ -420,6 +420,8 @@ class ContinuousRuntimeCapacityCampaignTest {
                 storage = view.allocatedStorageReceipt()
             }
             val scalarMemory = requireNotNull(activeResources.retainedScalarMemoryReceipt())
+            val completeCurrent = requireNotNull(activeResources.completeCurrentLeaseReceipt())
+            val completeCurrentBytes = completeCurrent.retained.residentTotalBytes
             val kernelBytes = kernel.resourceReceipt().assignedTupleShareBytes.toLong()
             // Resident/prepared rows occupy the already-counted primitive
             // arrays; charge those arrays once, not once again per live row.
@@ -446,7 +448,8 @@ class ContinuousRuntimeCapacityCampaignTest {
                 currentHandoffBytes, allocated.directoryBytes, maximumOperationBytes,
             )
             val portableCompleteBytes = listOf(
-                kernelBytes, depthKernelBytes, scalarMemory.portableBytes, ownerMemory.portableBytes,
+                kernelBytes, depthKernelBytes, completeCurrentBytes,
+                scalarMemory.portableBytes, ownerMemory.portableBytes,
                 rendererBytes, rendererHandoffBytes, verificationProofBytes, sharedPhaseBytes,
             ).fold(0L, Math::addExact)
             assertTrue(maximumCurrentBytes in 1..CanonicalActivationResources.MAX_CURRENT_BYTES)
@@ -459,16 +462,25 @@ class ContinuousRuntimeCapacityCampaignTest {
                 depthReceipt.modeledMaximumSemanticStateBytes <=
                     depthReceipt.semanticStateBudgetBytes,
             )
+            assertTrue(completeCurrentBytes <= CompactCanonicalStore.C17_TOTAL_BYTES)
+            assertEquals(
+                completeCurrent.retained.peakWithScratchBytes,
+                completeCurrent.lifecycleOpenPeakBytes,
+            )
             assertTrue(
                 "portable complete=$portableCompleteBytes scalar=${scalarMemory.portableBytes} " +
-                    "kernel=$kernelBytes depthKernel=$depthKernelBytes depthPrepared=${pendingDepth.totalBytes} " +
+                    "kernel=$kernelBytes depthKernel=$depthKernelBytes completeCurrent=$completeCurrentBytes " +
+                    "completeCurrentOpenPeak=${completeCurrent.lifecycleOpenPeakBytes} depthPrepared=${pendingDepth.totalBytes} " +
                     "depthLookup=${lookup.bytesRead} owners=${ownerMemory.portableBytes} v6Allocated=${allocated.allocatedBytes} " +
                     "renderer=$rendererBytes rendererRebuild=$rendererRebuildBytes handoff=$rendererHandoffBytes " +
                     "verificationProof=$verificationProofBytes " +
                     "current=$maximumCurrentBytes currentHandoff=$currentHandoffBytes directory=${allocated.directoryBytes} " +
                     "operation=$maximumOperationBytes shared=$sharedPhaseBytes",
                 portableCompleteBytes <= Math.addExact(
-                    CompactCanonicalStore.C17_TOTAL_BYTES,
+                    Math.addExact(
+                        CompactCanonicalStore.C17_TOTAL_BYTES,
+                        CompactCanonicalStore.C17_TOTAL_BYTES,
+                    ),
                     depthReceipt.semanticStateBudgetBytes.toLong(),
                 ),
             )
@@ -631,6 +643,7 @@ class ContinuousRuntimeCapacityCampaignTest {
             println(
                 "CANONICAL_SURFACE_CONTINUOUS_RUNTIME=surfaces=$surfaceTarget associations=$associationTarget " +
                     "materialBatches=$materialBatches kernel=$kernelBytes depthKernel=$depthKernelBytes " +
+                    "completeCurrent=$completeCurrentBytes completeCurrentOpenPeak=${completeCurrent.lifecycleOpenPeakBytes} " +
                     "depthPrepared=${pendingDepth.totalBytes} depthLookup=${lookup.bytesRead} " +
                     "scalar=${scalarMemory.portableBytes} owners=${ownerMemory.portableBytes} " +
                     "v6Allocated=${allocated.allocatedBytes} renderer=$rendererBytes handoff=$rendererHandoffBytes " +

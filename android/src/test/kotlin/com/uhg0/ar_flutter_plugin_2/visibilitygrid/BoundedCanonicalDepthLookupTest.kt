@@ -11,6 +11,112 @@ import org.junit.Test
 
 class BoundedCanonicalDepthLookupTest {
     @Test
+    fun `unwarmed bounded current refuses without request work`() {
+        val root = Files.createTempDirectory("bounded-canonical-depth-unwarmed").toFile()
+        val coordinator = coordinator(root)
+        val resources = CanonicalRuntimeResources.open(root, SurfaceGroup("0".repeat(32)), coordinator)
+        try {
+            val result = resources.withBoundedCurrent(
+                BoundedCanonicalLookupRequest(1, 1, 1, 1, 1, 1),
+            ) { error("an unwarmed lifecycle must not expose a current") }
+            assertEquals(
+                BoundedCanonicalLookupResult.Refused(
+                    BoundedCanonicalLookupReason.CURRENT_UNAVAILABLE,
+                    BoundedCanonicalLookupReceipt(0, 0, 0, 0, false),
+                ),
+                result,
+            )
+            assertEquals(null, resources.retainedCompleteCurrentMemoryReceipt())
+        } finally {
+            resources.close(); coordinator.close(); root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `warm current serves lookup and evidence preparation without canonical reopen`() {
+        val root = Files.createTempDirectory("bounded-canonical-depth-warm").toFile()
+        val coordinator = coordinator(root)
+        val group = SurfaceGroup("9".repeat(32))
+        val resources = CanonicalRuntimeResources.open(root, group, coordinator)
+        try {
+            assertTrue(resources.openInitial(committedEmptyBaseline("binding", group.value, 1, 1, 1)) is SurfaceOwnershipOpenResult.Opened)
+            val create = resources.prepareEvidenceBatch(
+                CanonicalEvidenceBatchCommand(
+                    "warm-create", 1, 1,
+                    listOf(DepthEvidenceChange.Create(CanonicalTarget(
+                        voxel = Voxel(1, 0, 0), normalOctX = 1, normalOctY = 1, normalConfidence = 200,
+                    ))),
+                ),
+            ) as CanonicalMutationPreparation.Prepared
+            assertTrue(resources.commitAdjacent(create.mutation) is CanonicalAdjacentCommitResult.Committed)
+            val cut = requireNotNull(resources.owner().activationState()).cut
+            var cowOpens = 0
+            CanonicalCowGenerationTestHooks.onVerifiedOpen = { cowOpens++ }
+
+            repeat(2) {
+                val lookup = resources.withBoundedCurrent(
+                    BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 1, 0, 2, 32_768),
+                ) { it.findSurfaceAt(Voxel(1, 0, 0)) }
+                assertTrue(lookup is BoundedCanonicalLookupResult.Completed)
+            }
+            val zeroBudget = resources.withBoundedCurrent(
+                BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 1, 0, 0, 0),
+            ) { it.findSurfaceAt(Voxel(1, 0, 0)) }
+            assertEquals(
+                BoundedCanonicalLookupReason.LIMIT_EXHAUSTED,
+                (zeroBudget as BoundedCanonicalLookupResult.Refused).reason,
+            )
+            val prepared = resources.prepareEvidenceBatch(
+                CanonicalEvidenceBatchCommand(
+                    "warm-second", cut.geometryRevision, cut.lineageRevision,
+                    listOf(DepthEvidenceChange.Create(CanonicalTarget(
+                        voxel = Voxel(2, 0, 0), normalOctX = 1, normalOctY = 1, normalConfidence = 200,
+                    ))),
+                ),
+            ) as CanonicalMutationPreparation.Prepared
+            prepared.mutation.discard()
+
+            assertEquals(0, cowOpens)
+            val leaseReceipt = requireNotNull(resources.completeCurrentLeaseReceipt())
+            assertTrue(leaseReceipt.retained.residentTotalBytes > 0)
+            assertEquals(leaseReceipt.retained.peakWithScratchBytes, leaseReceipt.lifecycleOpenPeakBytes)
+        } finally {
+            CanonicalCowGenerationTestHooks.onVerifiedOpen = null
+            resources.close()
+            assertEquals(null, resources.retainedCompleteCurrentMemoryReceipt())
+            assertEquals(null, resources.completeCurrentLeaseReceipt())
+            coordinator.close(); root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `addressed request work ignores unrelated retained generation history`() {
+        val shallow = runtimeWithCommitHistory(1, "7".repeat(32))
+        val deep = runtimeWithCommitHistory(6, "8".repeat(32))
+        try {
+            var cowOpens = 0
+            CanonicalCowGenerationTestHooks.onVerifiedOpen = { cowOpens++ }
+            fun lookup(runtime: CanonicalRuntimeResources, voxel: Voxel): BoundedCanonicalLookupResult<AddressedCanonicalSurface?> {
+                val cut = requireNotNull(runtime.owner().activationState()).cut
+                return runtime.withBoundedCurrent(
+                    BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 1, 0, 2, 32_768),
+                ) { it.findSurfaceAt(voxel) }
+            }
+
+            val shallowResult = lookup(shallow.runtime, Voxel(0, 0, 0))
+            val deepResult = lookup(deep.runtime, Voxel(5, 0, 0))
+            assertEquals(
+                (shallowResult as BoundedCanonicalLookupResult.Completed).receipt,
+                (deepResult as BoundedCanonicalLookupResult.Completed).receipt,
+            )
+            assertEquals(0, cowOpens)
+        } finally {
+            CanonicalCowGenerationTestHooks.onVerifiedOpen = null
+            shallow.close(); deep.close()
+        }
+    }
+
+    @Test
     fun `negative lookup cap is refused before borrowing current`() {
         val root = Files.createTempDirectory("bounded-canonical-depth-invalid").toFile()
         val coordinator = coordinator(root)
@@ -658,6 +764,38 @@ class BoundedCanonicalDepthLookupTest {
         )
         val runtime = CanonicalRuntimeResources.open(root, group, coordinator)
         assertTrue(runtime.reopen() is SurfaceOwnershipOpenResult.Opened)
+        return DurableRuntime(root, coordinator, runtime)
+    }
+
+    private fun runtimeWithCommitHistory(generations: Int, groupValue: String): DurableRuntime {
+        val root = Files.createTempDirectory("bounded-canonical-history-$generations").toFile()
+        val coordinator = coordinator(root)
+        val group = SurfaceGroup(groupValue)
+        val runtime = CanonicalRuntimeResources.open(root, group, coordinator)
+        assertTrue(runtime.openInitial(committedEmptyBaseline("binding", group.value, 1, 1, 1)) is SurfaceOwnershipOpenResult.Opened)
+        repeat(generations) { index ->
+            val cut = requireNotNull(runtime.owner().activationState()).cut
+            val prepared = runtime.prepareEvidenceBatch(
+                CanonicalEvidenceBatchCommand(
+                    "history-$index", cut.geometryRevision, cut.lineageRevision,
+                    listOf(DepthEvidenceChange.Create(CanonicalTarget(
+                        voxel = Voxel(index, 0, 0), normalOctX = 1, normalOctY = 1, normalConfidence = 200,
+                    ))),
+                ),
+            ) as CanonicalMutationPreparation.Prepared
+            assertTrue(runtime.commitAdjacent(prepared.mutation) is CanonicalAdjacentCommitResult.Committed)
+            val committedCut = requireNotNull(runtime.owner().activationState()).cut
+            val current = requireNotNull(runtime.owner().activationState()).current as CanonicalActivationCurrent.Receipt
+            assertTrue(
+                runtime.owner().acknowledgeCanonicalCurrent(
+                    CanonicalAcknowledgement(
+                        current.identity.commandHash,
+                        committedCut.geometryRevision,
+                        committedCut.lineageRevision,
+                    ),
+                ) is CanonicalAcknowledgementResult.Acknowledged,
+            )
+        }
         return DurableRuntime(root, coordinator, runtime)
     }
 

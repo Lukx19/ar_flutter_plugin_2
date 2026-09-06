@@ -38,9 +38,14 @@ internal class CanonicalRuntimeResources private constructor(
         )
             as? CanonicalActivationPreparation.Prepared)?.plan
             ?: return SurfaceOwnershipOpenResult.Refused(SurfaceOwnershipRestoreRefusal.DURABILITY_FAILURE)
-        return SurfaceOwnership.open(group, directory, budget, plan, configuration).also { opened ->
-            if (opened is SurfaceOwnershipOpenResult.Opened) owner = opened.ownership
+        val opened = SurfaceOwnership.open(group, directory, budget, plan, configuration)
+        if (opened !is SurfaceOwnershipOpenResult.Opened) return opened
+        owner = opened.ownership
+        if (!warmCurrent()) {
+            opened.ownership.close(); owner = null
+            return SurfaceOwnershipOpenResult.Refused(SurfaceOwnershipRestoreRefusal.DURABILITY_FAILURE)
         }
+        return opened
     }
 
     /** Opens only the selected v6 authority; an absent selector is never a legacy fallback. */
@@ -50,9 +55,14 @@ internal class CanonicalRuntimeResources private constructor(
         if (!CanonicalActivationSelector.hasDurableSelector(group, directory)) {
             return SurfaceOwnershipOpenResult.Refused(SurfaceOwnershipRestoreRefusal.CORRUPT)
         }
-        return SurfaceOwnership.open(group, directory, budget, configuration).also { opened ->
-            if (opened is SurfaceOwnershipOpenResult.Opened) owner = opened.ownership
+        val opened = SurfaceOwnership.open(group, directory, budget, configuration)
+        if (opened !is SurfaceOwnershipOpenResult.Opened) return opened
+        owner = opened.ownership
+        if (!warmCurrent()) {
+            opened.ownership.close(); owner = null
+            return SurfaceOwnershipOpenResult.Refused(SurfaceOwnershipRestoreRefusal.CORRUPT)
         }
+        return opened
     }
 
     fun owner(): SurfaceOwnership = requireNotNull(owner) { "canonical surface runtime authority is unavailable" }
@@ -65,8 +75,8 @@ internal class CanonicalRuntimeResources private constructor(
     /** Borrows exactly the selector-named v6 cut for one bounded operation. */
     @Synchronized fun <T> withCurrent(block: (CanonicalStateView) -> T): T? {
         checkOpen()
-        val lease = current ?: coldCurrent()?.also { current = it } ?: return null
-        return authenticatedBorrow(lease, lease.view, block)
+        val lease = current ?: return null
+        return authenticatedBorrow(lease, lease.completeView, block)
     }
 
     /** Borrows one exact complete current cut behind explicit lookup limits. */
@@ -128,7 +138,7 @@ internal class CanonicalRuntimeResources private constructor(
         ) { view -> owner().prepareAdjacentMutation(view, command) }
     }
 
-    private fun currentStateReceipt() = current?.view?.cut?.let { cut ->
+    private fun currentStateReceipt() = current?.scalarView?.cut?.let { cut ->
         CanonicalStateReceipt(
             cut.geometryRevision, cut.lineageRevision,
             cut.nextSurfaceIdHighWater, cut.liveSurfaceCount,
@@ -140,59 +150,15 @@ internal class CanonicalRuntimeResources private constructor(
         onFailure: (CompleteCurrentBorrowFailure) -> T,
         block: (CanonicalStateView) -> T,
     ): T {
-        val lease = current ?: coldCurrent()?.also { current = it }
-            ?: return onFailure(CompleteCurrentBorrowFailure.CURRENT_UNAVAILABLE)
-        if (expected.geometryRevision != lease.view.cut.geometryRevision ||
-            expected.lineageRevision != lease.view.cut.lineageRevision
+        val lease = current ?: return onFailure(CompleteCurrentBorrowFailure.CURRENT_UNAVAILABLE)
+        if (expected.geometryRevision != lease.scalarView.cut.geometryRevision ||
+            expected.lineageRevision != lease.scalarView.cut.lineageRevision
         ) return onFailure(CompleteCurrentBorrowFailure.REVISION_CONFLICT)
-        val authenticated = CanonicalActivationSelector.reopenAuthenticatedCurrent(
-            group, directory, budget, lease.view.cut,
-        ) as? CanonicalActivationResult.Active ?: run {
+        if (!lease.isCurrent(owner?.activationState()?.cut)) {
             invalidateCurrent()
             return onFailure(CompleteCurrentBorrowFailure.CURRENT_UNAVAILABLE)
         }
-        if (authenticated.state.cut != lease.view.cut) {
-            invalidateCurrent()
-            return onFailure(CompleteCurrentBorrowFailure.CURRENT_UNAVAILABLE)
-        }
-        val authenticatedCurrentBytes = when (val state = authenticated.state.currentState) {
-            is CanonicalCurrentState.Unacknowledged -> state.identity.canonicalLength
-            else -> 0L
-        }
-        CanonicalRuntimeCurrentTestHooks.onAuthenticatedBorrow?.invoke(authenticatedCurrentBytes)
-        val opened = openCompleteCurrent(lease.view.cut) ?: run {
-            invalidateCurrent()
-            return onFailure(CompleteCurrentBorrowFailure.CURRENT_UNAVAILABLE)
-        }
-        return try {
-            block(opened.view)
-        } finally {
-            opened.close()
-        }
-    }
-
-    private fun openCompleteCurrent(expectedCut: CompactCanonicalCut): CompleteCurrent? {
-        val base = (openGenerationZero() as? CompactCanonicalOpenResult.Opened)?.store ?: return null
-        val store = CanonicalCommitStore.open(directory, budget) ?: run { base.close(); return null }
-        return try {
-            when (val selected = store.reopen(base, retainedCurrentReceipt())) {
-                is CanonicalReopenResult.GenerationZero -> {
-                    if (selected.view.cut != expectedCut) {
-                        base.close(); store.close(); null
-                    } else CompleteCurrent(base, selected.view, store, null)
-                }
-                is CanonicalReopenResult.Selected -> {
-                    if (selected.commit.view.cut != expectedCut) {
-                        selected.commit.close(); base.close(); store.close(); null
-                    } else CompleteCurrent(base, selected.commit.view, store, selected.commit)
-                }
-                is CanonicalReopenResult.Refused -> {
-                    base.close(); store.close(); null
-                }
-            }
-        } catch (_: Throwable) {
-            store.close(); base.close(); null
-        }
+        return block(lease.completeView)
     }
 
     /** Dirty-only view: exact current scalars plus kernel-owned row correlation. */
@@ -201,13 +167,13 @@ internal class CanonicalRuntimeResources private constructor(
         block: (CanonicalStateView) -> T,
     ): T? {
         checkOpen()
-        val lease = current ?: coldCurrent()?.also { current = it } ?: return null
+        val lease = current ?: return null
         val correlations = HashMap<Voxel, CanonicalFeatureCorrelation>()
         changes.forEach { change ->
             val upsert = change as? FeatureFusionChange.Upsert ?: return@forEach
             upsert.canonicalCorrelation?.let { correlations[Voxel(upsert.x, upsert.y, upsert.z)] = it }
         }
-        val view = CorrelatedCanonicalStateView(lease.view, correlations)
+        val view = CorrelatedCanonicalStateView(lease.scalarView, correlations)
         return authenticatedBorrow(lease, view, block)
     }
 
@@ -216,15 +182,9 @@ internal class CanonicalRuntimeResources private constructor(
         view: CanonicalStateView,
         block: (CanonicalStateView) -> T,
     ): T? {
-        val authenticated = CanonicalActivationSelector.reopenAuthenticatedCurrent(
-            group, directory, budget, view.cut,
-        ) as? CanonicalActivationResult.Active ?: run { invalidateCurrent(); return null }
-        if (authenticated.state.cut != view.cut) { invalidateCurrent(); return null }
-        val authenticatedCurrentBytes = when (val state = authenticated.state.currentState) {
-            is CanonicalCurrentState.Unacknowledged -> state.identity.canonicalLength
-            else -> 0L
+        if (!lease.isCurrent(owner?.activationState()?.cut) || view.cut != lease.scalarView.cut) {
+            invalidateCurrent(); return null
         }
-        CanonicalRuntimeCurrentTestHooks.onAuthenticatedBorrow?.invoke(authenticatedCurrentBytes)
         val result = block(view)
         if (result is CanonicalMutationPreparation.Prepared && lease.commit != null) {
             check(CanonicalAuthorityLeaseRegistry.attachPublished(
@@ -251,19 +211,26 @@ internal class CanonicalRuntimeResources private constructor(
             val lease = current ?: run { successor.close(); return result }
             val scalar = successor.view.scalarView(directory)
             lease.commit?.close()
-            lease.commit = successor.detachScalar(scalar)
-            lease.view = scalar
+            lease.commit = successor
+            lease.completeView = successor.view
+            lease.scalarView = scalar
         }
         return result
     }
 
     @Synchronized internal fun retainedCurrentProofBytes(): Long = current?.commit?.retainedProofBytes() ?: 0L
     @Synchronized internal fun retainedScalarMemoryReceipt(): ScalarCanonicalMemoryReceipt? =
-        current?.view?.scalarMemoryReceipt
+        current?.scalarView?.scalarMemoryReceipt
+    @Synchronized internal fun retainedCompleteCurrentMemoryReceipt(): CompactRetainedMemoryReceipt? =
+        current?.completeView?.retainedMemoryReceipt()
+    @Synchronized internal fun completeCurrentLeaseReceipt(): CanonicalCompleteCurrentLeaseReceipt? =
+        current?.completeView?.retainedMemoryReceipt()?.let {
+            CanonicalCompleteCurrentLeaseReceipt(it, it.peakWithScratchBytes)
+        }
 
     internal fun portableOwnerBytes(): Long =
         40L + // CanonicalRuntimeResources
-            24L + // CurrentLease
+            48L + // CurrentLease with scalar and retained complete-current capabilities
             104L + 56L + // SurfaceOwnership + configuration
             40L + 120L + 32L + 32L + // published/current activation scalars
             16L + 16L + // coordinator budget adapter + surface group
@@ -276,23 +243,39 @@ internal class CanonicalRuntimeResources private constructor(
             8L * 16L + // bounded atomic/counter owners
             2L * 32L // reservations/reclaims directory owners
 
-    private fun coldCurrent(): CurrentLease? {
+    private fun warmCurrent(): Boolean {
+        check(current == null)
+        current = materializeCurrent()
+        current?.let {
+            val authenticatedCurrentBytes = when (val state = owner?.activationState()?.currentState) {
+                is CanonicalCurrentState.Unacknowledged -> state.identity.canonicalLength
+                else -> 0L
+            }
+            CanonicalRuntimeCurrentTestHooks.onAuthenticatedBorrow?.invoke(authenticatedCurrentBytes)
+        }
+        return current != null
+    }
+
+    private fun materializeCurrent(): CurrentLease? {
         val base = (openGenerationZero() as? CompactCanonicalOpenResult.Opened)?.store ?: return null
         val store = CanonicalCommitStore.open(directory, budget) ?: run { base.close(); return null }
         val retained = retainedCurrentReceipt()
         return try {
             when (val selected = store.reopen(base, retained)) {
-                is CanonicalReopenResult.GenerationZero -> CurrentLease(base.scalarView(directory), null)
+                is CanonicalReopenResult.GenerationZero ->
+                    CurrentLease(base.scalarView(directory), selected.view, base, null)
                 is CanonicalReopenResult.Selected -> {
                     val scalar = selected.commit.view.scalarView(directory)
-                    CurrentLease(scalar, selected.commit.detachScalar(scalar))
+                    CurrentLease(scalar, selected.commit.view, base, selected.commit)
                 }
-                is CanonicalReopenResult.Refused -> null
+                is CanonicalReopenResult.Refused -> { base.close(); null }
             }
-        } finally { store.close(); base.close() }
+        } catch (_: Throwable) {
+            base.close(); null
+        } finally { store.close() }
     }
 
-    /** One named cold recovery scope; the complete view is closed before return. */
+    /** Rebuilds from the lifecycle-owned authenticated complete current. */
     @Synchronized fun rebuildAndHydrate(
         kernel: FeatureFusionKernel,
         rendererLimit: Int,
@@ -301,47 +284,31 @@ internal class CanonicalRuntimeResources private constructor(
     ): CompactCanonicalCut? {
         checkOpen()
         require(rendererLimit >= 0)
-        val base = (openGenerationZero() as? CompactCanonicalOpenResult.Opened)?.store ?: return null
-        val store = CanonicalCommitStore.open(directory, budget) ?: run { base.close(); return null }
-        try {
-            val reopened = store.reopen(base, retainedCurrentReceipt())
-            val commit = (reopened as? CanonicalReopenResult.Selected)?.commit
-            val view = commit?.view ?: (reopened as? CanonicalReopenResult.GenerationZero)?.view ?: return null
-            try {
-                val expected = current?.view?.cut
-                if (expected != null && expected != view.cut) return null
-                val installScalar = current == null
-                var id = 1L
-                var rendered = 0
-                val page = ArrayList<CommittedGeometryRow>(512)
-                while (id < view.cut.nextSurfaceIdHighWater) {
-                    val row = view.findById(SurfaceId(id++)) ?: continue
-                    val source = (view.readSourceById(row.id) as? CanonicalPageRead.Complete)?.value ?: return null
-                    if (hydrateKernel && !kernel.hydrateCanonicalSurface(row, source.allocationFingerprint)) return null
-                    if (rendered < rendererLimit) {
-                        page += CommittedGeometryRow(
-                            surfaceId = row.id.value,
-                            voxel = row.voxel,
-                            packedNormal = row.packedNormal,
-                            normalConfidence = row.normalConfidence,
-                            lineageCount = view.cut.lineageCount,
-                        )
-                        rendered++
-                        if (page.size == 512) {
-                            sink(CanonicalRendererPage(view.cut, page.toList(), null)); page.clear()
-                        }
-                    }
+        val lease = current ?: return null
+        val view = lease.completeView
+        var id = 1L
+        var rendered = 0
+        val page = ArrayList<CommittedGeometryRow>(512)
+        while (id < view.cut.nextSurfaceIdHighWater) {
+            val row = view.findById(SurfaceId(id++)) ?: continue
+            val source = (view.readSourceById(row.id) as? CanonicalPageRead.Complete)?.value ?: return null
+            if (hydrateKernel && !kernel.hydrateCanonicalSurface(row, source.allocationFingerprint)) return null
+            if (rendered < rendererLimit) {
+                page += CommittedGeometryRow(
+                    surfaceId = row.id.value,
+                    voxel = row.voxel,
+                    packedNormal = row.packedNormal,
+                    normalConfidence = row.normalConfidence,
+                    lineageCount = view.cut.lineageCount,
+                )
+                rendered++
+                if (page.size == 512) {
+                    sink(CanonicalRendererPage(view.cut, page.toList(), null)); page.clear()
                 }
-                if (page.isNotEmpty()) sink(CanonicalRendererPage(view.cut, page.toList(), null))
-                if (installScalar) {
-                    val scalar = view.scalarView(directory)
-                    current = CurrentLease(scalar, commit?.detachScalar(scalar))
-                }
-                return view.cut
-            } finally {
-                if (commit != null && !commit.scalar) commit.close()
             }
-        } finally { store.close(); base.close() }
+        }
+        if (page.isNotEmpty()) sink(CanonicalRendererPage(view.cut, page.toList(), null))
+        return view.cut
     }
 
     private fun retainedCurrentReceipt(): PreparedIntentCurrentReceipt? = owner?.activationState()?.currentState.let { state ->
@@ -358,15 +325,9 @@ internal class CanonicalRuntimeResources private constructor(
     /** One bounded renderer page from the active v6 root for restart rebuild. */
     fun readRendererPage(cursor: Long, limit: Int = 512): CanonicalRendererPage? {
         checkOpen()
-        val lease = current ?: coldCurrent()?.also { current = it } ?: return null
-        val base = (openGenerationZero() as? CompactCanonicalOpenResult.Opened)?.store ?: return null
-        val store = CanonicalCommitStore.open(directory, budget) ?: run { base.close(); return null }
-        return try {
-            val reopened = store.reopen(base, retainedCurrentReceipt())
-            val view = (reopened as? CanonicalReopenResult.Selected)?.commit?.view
-                ?: (reopened as? CanonicalReopenResult.GenerationZero)?.view ?: return null
-            try {
-            if (view.cut != lease.view.cut) return null
+        val lease = current ?: return null
+        val view = lease.completeView
+        return run {
             require(cursor in 0 until view.cut.nextSurfaceIdHighWater && limit in 1..512)
             val rows = ArrayList<CommittedGeometryRow>(limit)
             var id = cursor + 1
@@ -387,33 +348,23 @@ internal class CanonicalRuntimeResources private constructor(
                 rows,
                 id.takeIf { it < view.cut.nextSurfaceIdHighWater }?.minus(1),
             )
-            } finally { (reopened as? CanonicalReopenResult.Selected)?.commit?.close() }
-        } finally { store.close(); base.close() }
+        }
     }
 
     /** Test/diagnostic recovery projection in one cold verified scope. */
     internal fun readAllRendererKeys(): LongArray? {
         checkOpen()
-        val lease = current ?: coldCurrent()?.also { current = it } ?: return null
-        val base = (openGenerationZero() as? CompactCanonicalOpenResult.Opened)?.store ?: return null
-        val store = CanonicalCommitStore.open(directory, budget) ?: run { base.close(); return null }
-        return try {
-            val reopened = store.reopen(base, retainedCurrentReceipt())
-            val commit = (reopened as? CanonicalReopenResult.Selected)?.commit
-            val view = commit?.view ?: (reopened as? CanonicalReopenResult.GenerationZero)?.view ?: return null
-            try {
-                if (view.cut != lease.view.cut) return null
-                val keys = LongArray(view.cut.liveSurfaceCount)
-                var size = 0
-                var id = 1L
-                while (id < view.cut.nextSurfaceIdHighWater) {
-                    view.findById(SurfaceId(id++))?.let { row ->
-                        keys[size++] = packVisibilityGridKey(row.voxel.x, row.voxel.y, row.voxel.z)
-                    }
-                }
-                if (size == keys.size) keys else keys.copyOf(size)
-            } finally { commit?.close() }
-        } finally { store.close(); base.close() }
+        val lease = current ?: return null
+        val view = lease.completeView
+        val keys = LongArray(view.cut.liveSurfaceCount)
+        var size = 0
+        var id = 1L
+        while (id < view.cut.nextSurfaceIdHighWater) {
+            view.findById(SurfaceId(id++))?.let { row ->
+                keys[size++] = packVisibilityGridKey(row.voxel.x, row.voxel.y, row.voxel.z)
+            }
+        }
+        return if (size == keys.size) keys else keys.copyOf(size)
     }
 
     override fun close() {
@@ -462,28 +413,25 @@ internal class CanonicalRuntimeResources private constructor(
             }
     }
 
-    private class CompleteCurrent(
-        private val base: CompactCanonicalStore,
-        val view: CanonicalStateView,
-        private val store: CanonicalCommitStore,
-        private val commit: CanonicalPublishedCommit?,
-    ) : AutoCloseable {
-        override fun close() {
-            commit?.close()
-            base.close()
-            store.close()
-        }
-    }
-
     private class CurrentLease(
-        var view: ScalarCanonicalStateView,
+        var scalarView: ScalarCanonicalStateView,
+        var completeView: CanonicalStateView,
+        private val base: CompactCanonicalStore,
         var commit: CanonicalPublishedCommit?,
     ) : AutoCloseable {
+        fun isCurrent(cut: CompactCanonicalCut?): Boolean =
+            cut != null && cut == scalarView.cut && cut == completeView.cut
         override fun close() {
-            commit?.close(); commit = null
+            commit?.close(); commit = null; base.close()
         }
     }
 }
+
+internal data class CanonicalCompleteCurrentLeaseReceipt(
+    val retained: CompactRetainedMemoryReceipt,
+    /** Lifecycle-only cold materialization peak; never charged to an ordinary bounded request. */
+    val lifecycleOpenPeakBytes: Long,
+)
 
 private open class ScalarCanonicalStateView(
     override val authorityParentKey: String,
