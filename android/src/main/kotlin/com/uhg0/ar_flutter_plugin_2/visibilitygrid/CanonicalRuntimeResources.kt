@@ -158,23 +158,26 @@ internal class CanonicalRuntimeResources private constructor(
             invalidateCurrent()
             return onFailure(CompleteCurrentBorrowFailure.CURRENT_UNAVAILABLE)
         }
-        return block(lease.completeView)
+        val result = block(lease.completeView)
+        if (result is CanonicalMutationPreparation.Prepared && lease.commit != null) {
+            check(CanonicalAuthorityLeaseRegistry.attachPublished(
+                result.mutation.authorityLease, requireNotNull(lease.commit),
+            ))
+        }
+        return result
     }
 
     /** Dirty-only view: exact current scalars plus kernel-owned row correlation. */
     @Synchronized fun <T> withCorrelatedCurrent(
-        changes: List<FeatureFusionChange>,
+        @Suppress("UNUSED_PARAMETER") changes: List<FeatureFusionChange>,
         block: (CanonicalStateView) -> T,
     ): T? {
         checkOpen()
         val lease = current ?: return null
-        val correlations = HashMap<Voxel, CanonicalFeatureCorrelation>()
-        changes.forEach { change ->
-            val upsert = change as? FeatureFusionChange.Upsert ?: return@forEach
-            upsert.canonicalCorrelation?.let { correlations[Voxel(upsert.x, upsert.y, upsert.z)] = it }
-        }
-        val view = CorrelatedCanonicalStateView(lease.scalarView, correlations)
-        return authenticatedBorrow(lease, view, block)
+        // Feature-local correlation identifies associations only. Canonical
+        // occupancy, normals, identity and allocation provenance always come
+        // from the lifecycle-owned complete authority.
+        return authenticatedBorrow(lease, lease.completeView, block)
     }
 
     private fun <T> authenticatedBorrow(
@@ -466,27 +469,6 @@ private open class ScalarCanonicalStateView(
     )
     override fun allocatedStorageReceipt() = storage
     override fun close() = Unit
-}
-
-private class CorrelatedCanonicalStateView(
-    private val scalar: ScalarCanonicalStateView,
-    private val correlations: Map<Voxel, CanonicalFeatureCorrelation>,
-) : ScalarCanonicalAuthority by scalar {
-    override fun findById(id: SurfaceId): CompactSurface? = correlations.entries.firstOrNull { it.value.id == id }
-        ?.let { (voxel, correlation) -> CompactSurface(correlation.id, voxel, correlation.packedNormal, correlation.normalConfidence) }
-    override fun findByVoxel(voxel: Voxel): CompactSurface? = correlations[voxel]
-        ?.let { CompactSurface(it.id, voxel, it.packedNormal, it.normalConfidence) }
-    override fun readSourceById(id: SurfaceId): CanonicalPageRead<PagedSource?> {
-        val entry = correlations.entries.firstOrNull { it.value.id == id }
-            ?: return CanonicalPageRead.Complete(null, 0, 0)
-        val correlation = entry.value
-        return CanonicalPageRead.Complete(
-            PagedSource(
-                correlation.id, entry.key, correlation.packedNormal,
-                correlation.normalConfidence, correlation.allocationFingerprint,
-            ), 0, 0,
-        )
-    }
 }
 
 private fun CanonicalStateView.scalarView(directory: File) = ScalarCanonicalStateView(

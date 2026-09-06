@@ -975,7 +975,9 @@ internal class MutableCanonicalOverlay private constructor(
         if (command.expectedGeometryRevision != view.cut.geometryRevision ||
             command.expectedLineageRevision != view.cut.lineageRevision
         ) return refuse(CanonicalMutationRefusal.REVISION_CONFLICT)
-        if (view.cut.geometryRevision == Long.MAX_VALUE) return refuse(CanonicalMutationRefusal.REVISION_EXHAUSTED)
+        if (view.cut.geometryRevision >= configuration.revisionLimit) {
+            return refuse(CanonicalMutationRefusal.REVISION_EXHAUSTED)
+        }
         val scalars = depthBatchScalars(command) ?: return refuse(CanonicalMutationRefusal.CAPACITY)
         if (command.changes.size > configuration.surfaceCapacity + configuration.lineageCapacity) {
             return refuse(CanonicalMutationRefusal.CAPACITY)

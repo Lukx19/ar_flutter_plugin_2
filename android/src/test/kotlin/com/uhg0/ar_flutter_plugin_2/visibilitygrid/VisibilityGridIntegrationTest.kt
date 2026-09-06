@@ -219,6 +219,21 @@ class VisibilityGridIntegrationTest {
             exchange(messenger, viewId, stream, 6, 1, 1, 1)
             exchange(messenger, viewId, stream, 7, 2, 2, 1)
             await { integration.integrationReceipt().status == "acknowledged" }
+
+            val depthRow = renderedCuts.single().upserts.single()
+            val voxelMeters = 0.1
+            integration.admitFeature(feature(
+                cut, 11,
+                x = (depthRow.voxel.x + 0.5) * voxelMeters,
+                y = (depthRow.voxel.y + 0.5) * voxelMeters,
+                z = (depthRow.voxel.z + 0.5) * voxelMeters,
+                cameraX = (depthRow.voxel.x + 0.5) * voxelMeters + 1.0,
+            ))
+            assertEquals("pendingAck", integration.integrationReceipt().status)
+            val refined = renderedCuts.last()
+            assertEquals(depthRow.voxel, refined.upserts.single().voxel)
+            assertEquals(1L, refined.upserts.single().surfaceId)
+            assertTrue(refined.removedSurfaceIds.isEmpty())
         } finally {
             integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
         }

@@ -56,6 +56,10 @@ class BoundedCanonicalDepthLookupTest {
             ) as CanonicalMutationPreparation.Prepared
             assertTrue(resources.commitAdjacent(create.mutation) is CanonicalAdjacentCommitResult.Committed)
             val cut = requireNotNull(resources.owner().activationState()).cut
+            val current = requireNotNull(resources.owner().activationState()).current as CanonicalActivationCurrent.Receipt
+            assertTrue(resources.owner().acknowledgeCanonicalCurrent(
+                CanonicalAcknowledgement(current.identity.commandHash, cut.geometryRevision, cut.lineageRevision),
+            ) is CanonicalAcknowledgementResult.Acknowledged)
             var cowOpens = 0
             CanonicalCowGenerationTestHooks.onVerifiedOpen = { cowOpens++ }
 
@@ -83,9 +87,13 @@ class BoundedCanonicalDepthLookupTest {
                     ))),
                 ),
             ) as CanonicalMutationPreparation.Prepared
-            prepared.mutation.discard()
+            assertTrue(resources.commitAdjacent(prepared.mutation) is CanonicalAdjacentCommitResult.Committed)
+            val successor = requireNotNull(resources.owner().activationState()).cut
+            assertEquals(cut.geometryRevision + 1, successor.geometryRevision)
 
-            assertEquals(0, cowOpens)
+            // Exactly one verified open belongs to the newly staged successor;
+            // no prior generation is reopened during prepare or commit.
+            assertEquals(1, cowOpens)
             val leaseReceipt = requireNotNull(resources.completeCurrentLeaseReceipt())
             assertEquals(resources.retainedCurrentProofBytes(), leaseReceipt.cowProofAndIndexBytes)
             assertTrue(leaseReceipt.cowProofAndIndexBytes > 0)
@@ -133,6 +141,117 @@ class BoundedCanonicalDepthLookupTest {
         } finally {
             CanonicalCowGenerationTestHooks.onVerifiedOpen = null
             shallow.close(); deep.close()
+        }
+    }
+
+    @Test
+    fun `feature planning uses replacement canonical provenance instead of remapped slot history`() {
+        val durable = runtimeWithCommitHistory(1, "6".repeat(32))
+        var resources = durable.runtime
+        try {
+            var cut = requireNotNull(resources.owner().activationState()).cut
+            val oldSource = requireNotNull(resources.withCurrent {
+                (it.readSourceById(SurfaceId(1)) as CanonicalPageRead.Complete).value
+            })
+            val replacement = requireNotNull(resources.withCurrent {
+                resources.owner().prepareAdjacentMutation(
+                    it,
+                    CanonicalTransactionCommand(
+                        "replace-provenance", CanonicalOperation.REPLACEMENT,
+                        cut.geometryRevision, cut.lineageRevision,
+                        listOf(SurfaceId(1)),
+                        listOf(CanonicalTarget(null, Voxel(0, 0, 0), 9, 7, 220)),
+                    ),
+                )
+            }) as CanonicalMutationPreparation.Prepared
+            assertTrue(resources.commitAdjacent(replacement.mutation) is CanonicalAdjacentCommitResult.Committed)
+            cut = requireNotNull(resources.owner().activationState()).cut
+            val replacementCurrent = requireNotNull(resources.owner().activationState()).current as CanonicalActivationCurrent.Receipt
+            assertTrue(resources.owner().acknowledgeCanonicalCurrent(
+                CanonicalAcknowledgement(
+                    replacementCurrent.identity.commandHash, cut.geometryRevision, cut.lineageRevision,
+                ),
+            ) is CanonicalAcknowledgementResult.Acknowledged)
+            val replacementId = SurfaceId(2)
+            val replacementSource = requireNotNull(resources.withCurrent {
+                (it.readSourceById(replacementId) as CanonicalPageRead.Complete).value
+            })
+            assertTrue(replacementSource.allocationFingerprint != oldSource.allocationFingerprint)
+            resources.close()
+            resources = CanonicalRuntimeResources.open(
+                durable.root, SurfaceGroup("6".repeat(32)), durable.coordinator,
+            )
+            assertTrue(resources.reopen() is SurfaceOwnershipOpenResult.Opened)
+            cut = requireNotNull(resources.owner().activationState()).cut
+
+            val candidate = FeatureFusionCandidate(
+                0, 0, 0, 2, 2,
+                listOf(FeatureNormalCandidate(0, 0, 0, FeatureNormalFace.PRIMARY, -8, 6, 230)),
+            )
+            val change = FeatureFusionChange.Upsert(
+                candidate,
+                canonicalCorrelation = CanonicalFeatureCorrelation(
+                    replacementId, oldSource.allocationFingerprint,
+                    oldSource.packedNormal, oldSource.normalConfidence,
+                ),
+            )
+            val planned = requireNotNull(resources.withCorrelatedCurrent(listOf(change)) { view ->
+                val row = requireNotNull(view.findById(replacementId))
+                val source = requireNotNull((view.readSourceById(replacementId) as CanonicalPageRead.Complete).value)
+                assertEquals(replacementSource.packedNormal, row.packedNormal)
+                assertEquals(replacementSource.allocationFingerprint, source.allocationFingerprint)
+                resources.owner().prepareAdjacentMutation(
+                    view,
+                    CanonicalFeatureBatchCommand(
+                        "refine-replacement-provenance", cut.geometryRevision, cut.lineageRevision,
+                        listOf(change),
+                    ),
+                )
+            }) as CanonicalMutationPreparation.Prepared
+            assertTrue(resources.commitAdjacent(planned.mutation) is CanonicalAdjacentCommitResult.Committed)
+            val finalSource = requireNotNull(resources.withCurrent {
+                (it.readSourceById(replacementId) as CanonicalPageRead.Complete).value
+            })
+            assertEquals(replacementSource.allocationFingerprint, finalSource.allocationFingerprint)
+        } finally {
+            resources.close()
+            durable.close()
+        }
+    }
+
+    @Test
+    fun `feature planning after reopen refines the depth owned voxel identity`() {
+        val durable = runtimeWithCommitHistory(1, "5".repeat(32))
+        durable.runtime.close()
+        val resources = CanonicalRuntimeResources.open(
+            durable.root, SurfaceGroup("5".repeat(32)), durable.coordinator,
+        )
+        try {
+            assertTrue(resources.reopen() is SurfaceOwnershipOpenResult.Opened)
+            val cut = requireNotNull(resources.owner().activationState()).cut
+            val change = FeatureFusionChange.Upsert(FeatureFusionCandidate(
+                0, 0, 0, 2, 2,
+                listOf(FeatureNormalCandidate(0, 0, 0, FeatureNormalFace.PRIMARY, -9, 7, 230)),
+            ))
+            val prepared = requireNotNull(resources.withCorrelatedCurrent(listOf(change)) { view ->
+                resources.owner().prepareAdjacentMutation(
+                    view,
+                    CanonicalFeatureBatchCommand(
+                        "reopen-feature-on-depth", cut.geometryRevision, cut.lineageRevision,
+                        listOf(change),
+                    ),
+                )
+            }) as CanonicalMutationPreparation.Prepared
+            assertTrue(resources.commitAdjacent(prepared.mutation) is CanonicalAdjacentCommitResult.Committed)
+            val finalCut = requireNotNull(resources.owner().activationState()).cut
+            assertEquals(1, finalCut.liveSurfaceCount)
+            assertEquals(2L, finalCut.nextSurfaceIdHighWater)
+            resources.withCurrent { view ->
+                assertEquals(SurfaceId(1), requireNotNull(view.findByVoxel(Voxel(0, 0, 0))).id)
+                assertEquals(null, view.findById(SurfaceId(2)))
+            }
+        } finally {
+            resources.close(); durable.close()
         }
     }
 

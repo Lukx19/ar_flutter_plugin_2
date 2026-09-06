@@ -6,6 +6,28 @@ import org.junit.Test
 
 class CanonicalEvidenceBatchTest {
     @Test
+    fun `depth batch refuses at configured geometry revision limit without mutation`() {
+        val view = TestView(emptyList(), high = 1, geometry = 7, lineage = 5)
+        val preparation = MutableCanonicalOverlay.prepare(
+            view,
+            SurfaceOwnershipConfiguration(revisionLimit = 7),
+            CanonicalEvidenceBatchCommand(
+                "depth-revision-limit", 7, 5,
+                listOf(DepthEvidenceChange.Create(CanonicalTarget(
+                    null, Voxel(1, 0, 0), 1, 1, 200,
+                ))),
+            ),
+        )
+
+        assertEquals(
+            CanonicalMutationRefusal.REVISION_EXHAUSTED,
+            (preparation as CanonicalMutationPreparation.Refused).reason,
+        )
+        assertEquals(0, view.sourceMaterializationReads)
+        assertEquals(0, view.supportPageReads)
+    }
+
+    @Test
     fun `create-only batch refuses planner bound before materialization`() {
         val changes = (0 until 200).map { index ->
             DepthEvidenceChange.Create(
