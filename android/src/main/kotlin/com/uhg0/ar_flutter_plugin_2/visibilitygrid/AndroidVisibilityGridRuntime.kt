@@ -27,6 +27,7 @@ internal class AndroidVisibilityGridRuntime(
     private val callbackCopyRecoveryNs: Long = 30_000_000_000L,
     private val captureSafe: VisibilityCaptureSafePredicate =
         VisibilityCaptureSafePredicate.CONSERVATIVE,
+    private val beforeLaneEnqueue: (VisibilityObservationSource) -> Unit = {},
 ) : AutoCloseable {
     private val lock = Any()
     private val lifecycleLock = ReentrantReadWriteLock()
@@ -198,6 +199,7 @@ internal class AndroidVisibilityGridRuntime(
             copiedFeatureObservations++
             recordCallbackCopy(callbackCopyNs)
         }
+        beforeLaneEnqueue(observation.frame.source)
         featureLane.offer(observation)
         return true
     }
@@ -234,19 +236,24 @@ internal class AndroidVisibilityGridRuntime(
             copiedDepthObservations++
             recordCallbackCopy(callbackCopyNs)
         }
+        beforeLaneEnqueue(observation.frame.source)
         depthLane.offer(observation)
         return true
     }
 
     fun recordFeatureTransientUnavailable() = synchronized(lock) {
         featureTransientUnavailable++
-        featureHealth = VisibilitySourceHealth.TRANSIENT_UNAVAILABLE
+        if (featureHealth != VisibilitySourceHealth.FAILED) {
+            featureHealth = VisibilitySourceHealth.TRANSIENT_UNAVAILABLE
+        }
     }
 
     fun recordDepthTransientUnavailable() = synchronized(lock) {
         if (depthCapability != VisibilityDepthCapability.UNSUPPORTED) {
             depthTransientUnavailable++
-            depthHealth = VisibilitySourceHealth.TRANSIENT_UNAVAILABLE
+            if (depthHealth != VisibilitySourceHealth.FAILED) {
+                depthHealth = VisibilitySourceHealth.TRANSIENT_UNAVAILABLE
+            }
         }
     }
 
@@ -277,11 +284,15 @@ internal class AndroidVisibilityGridRuntime(
     }
 
     fun recordFeatureStalled() = synchronized(lock) {
-        featureHealth = VisibilitySourceHealth.STALLED
+        if (featureHealth != VisibilitySourceHealth.FAILED) {
+            featureHealth = VisibilitySourceHealth.STALLED
+        }
     }
 
     fun recordDepthStalled() = synchronized(lock) {
-        if (depthCapability != VisibilityDepthCapability.UNSUPPORTED) {
+        if (depthCapability != VisibilityDepthCapability.UNSUPPORTED &&
+            depthHealth != VisibilitySourceHealth.FAILED
+        ) {
             depthHealth = VisibilitySourceHealth.STALLED
         }
     }
@@ -461,7 +472,9 @@ internal class AndroidVisibilityGridRuntime(
                 callbackCopyBudgetDegraded = true
                 callbackCopyDepthSheds++
                 if (!isCaptureSafe()) callbackCopyFeatureSheds++
-                if (depthCapability != VisibilityDepthCapability.UNSUPPORTED) {
+                if (depthCapability != VisibilityDepthCapability.UNSUPPORTED &&
+                    depthHealth != VisibilitySourceHealth.FAILED
+                ) {
                     depthHealth = VisibilitySourceHealth.TRANSIENT_UNAVAILABLE
                 }
             }
@@ -471,7 +484,9 @@ internal class AndroidVisibilityGridRuntime(
         ) {
             callbackCopyBudgetDegraded = false
             callbackCopyBudgetRecoveries++
-            if (depthCapability != VisibilityDepthCapability.UNSUPPORTED) {
+            if (depthCapability != VisibilityDepthCapability.UNSUPPORTED &&
+                depthHealth != VisibilitySourceHealth.FAILED
+            ) {
                 depthHealth = VisibilitySourceHealth.CONFIGURED
             }
         }
@@ -482,6 +497,7 @@ internal class AndroidVisibilityGridRuntime(
             when {
                 closed || paused -> 1
                 ownership() != observation.ownership -> 2
+                featureHealth == VisibilitySourceHealth.FAILED -> 1
                 else -> 0
             }
         }
@@ -500,6 +516,8 @@ internal class AndroidVisibilityGridRuntime(
             when {
                 closed || paused -> 1
                 ownership() != observation.ownership -> 2
+                depthHealth == VisibilitySourceHealth.FAILED ||
+                    depthHealth == VisibilitySourceHealth.UNSUPPORTED -> 1
                 else -> 0
             }
         }
