@@ -54,6 +54,7 @@ class BoundedCanonicalDepthLookupTest {
             assertEquals(2_373_056L, planningMemory.routeRetainedBytes)
             assertEquals(1_572_960L, planningMemory.lifecycleConstructionScratchBytes)
             assertEquals(200L, planningMemory.borrowCacheBytes)
+            assertEquals(108L, planningMemory.maximumRouteDeltaBytes)
             assertTrue(planningMemory.routeRetainedBytes <= 4L * 1024L * 1024L)
             val create = resources.prepareEvidenceBatch(
                 CanonicalEvidenceBatchCommand(
@@ -205,6 +206,22 @@ class BoundedCanonicalDepthLookupTest {
     }
 
     @Test
+    fun `feature planning refuses an occupied routed read before zero page and byte caps perform work`() {
+        val durable = runtimeWithCommitHistory(1, "4".repeat(32))
+        try {
+            val work = mutableListOf<CowReadWork>()
+            CanonicalRuntimeCurrentTestHooks.onFeatureRouteRead = { _, receipt -> work += receipt }
+            assertEquals(null, durable.runtime.withFeaturePlanningCurrent(1, 0, 0) { view ->
+                view.findByVoxel(Voxel(0, 0, 0))
+            })
+            assertTrue(work.isEmpty())
+        } finally {
+            CanonicalRuntimeCurrentTestHooks.onFeatureRouteRead = null
+            durable.close()
+        }
+    }
+
+    @Test
     fun `feature planning uses replacement canonical provenance instead of remapped slot history`() {
         val durable = runtimeWithCommitHistory(1, "6".repeat(32))
         var resources = durable.runtime
@@ -224,7 +241,15 @@ class BoundedCanonicalDepthLookupTest {
                     ),
                 )
             }) as CanonicalMutationPreparation.Prepared
+            assertEquals(96L, replacement.mutation.work.removedRouteBytes)
+            assertEquals(108L, replacement.mutation.work.routeDeltaConstructionBytes)
+            assertTrue(replacement.mutation.work.constructionPeakBytes >=
+                replacement.mutation.work.retainedPlanBytes + replacement.mutation.work.routeDeltaConstructionBytes)
+            var routeDelta: CanonicalFeatureRouteDeltaMemoryReceipt? = null
+            CanonicalRuntimeCurrentTestHooks.onFeatureRouteDeltaPrepared = { routeDelta = it }
             assertTrue(resources.commitAdjacent(replacement.mutation) is CanonicalAdjacentCommitResult.Committed)
+            assertEquals(CanonicalFeatureRouteDeltaMemoryReceipt(1, 1, 108L), routeDelta)
+            CanonicalRuntimeCurrentTestHooks.onFeatureRouteDeltaPrepared = null
             cut = requireNotNull(resources.owner().activationState()).cut
             val replacementCurrent = requireNotNull(resources.owner().activationState()).current as CanonicalActivationCurrent.Receipt
             assertTrue(resources.owner().acknowledgeCanonicalCurrent(
@@ -275,7 +300,52 @@ class BoundedCanonicalDepthLookupTest {
             })
             assertEquals(replacementSource.allocationFingerprint, finalSource.allocationFingerprint)
         } finally {
+            CanonicalRuntimeCurrentTestHooks.onFeatureRouteDeltaPrepared = null
             resources.close()
+            durable.close()
+        }
+    }
+
+    @Test
+    fun `feature routing removes the current relocated voxel when replacement commits`() {
+        val durable = runtimeWithCommitHistory(1, "9".repeat(32))
+        val resources = durable.runtime
+        try {
+            fun commitAndAcknowledge(command: CanonicalTransactionCommand) {
+                val prepared = requireNotNull(resources.withCurrent {
+                    resources.owner().prepareAdjacentMutation(it, command)
+                }) as CanonicalMutationPreparation.Prepared
+                assertTrue(resources.commitAdjacent(prepared.mutation) is CanonicalAdjacentCommitResult.Committed)
+                val activation = requireNotNull(resources.owner().activationState())
+                val current = activation.current as CanonicalActivationCurrent.Receipt
+                assertTrue(resources.owner().acknowledgeCanonicalCurrent(
+                    CanonicalAcknowledgement(
+                        current.identity.commandHash,
+                        activation.cut.geometryRevision,
+                        activation.cut.lineageRevision,
+                    ),
+                ) is CanonicalAcknowledgementResult.Acknowledged)
+            }
+
+            var cut = requireNotNull(resources.owner().activationState()).cut
+            commitAndAcknowledge(CanonicalTransactionCommand(
+                "relocate-route", CanonicalOperation.RELOCATION,
+                cut.geometryRevision, cut.lineageRevision,
+                listOf(SurfaceId(1)),
+                listOf(CanonicalTarget(SurfaceId(1), Voxel(10, 0, 0), 9, 7, 220)),
+            ))
+            cut = requireNotNull(resources.owner().activationState()).cut
+            commitAndAcknowledge(CanonicalTransactionCommand(
+                "replace-relocated-route", CanonicalOperation.REPLACEMENT,
+                cut.geometryRevision, cut.lineageRevision,
+                listOf(SurfaceId(1)),
+                listOf(CanonicalTarget(null, Voxel(10, 0, 0), 9, 7, 220)),
+            ))
+            assertEquals(SurfaceId(2), resources.withFeaturePlanningCurrent(2) { view ->
+                assertEquals(null, view.findByVoxel(Voxel(0, 0, 0)))
+                requireNotNull(view.findByVoxel(Voxel(10, 0, 0))).id
+            })
+        } finally {
             durable.close()
         }
     }

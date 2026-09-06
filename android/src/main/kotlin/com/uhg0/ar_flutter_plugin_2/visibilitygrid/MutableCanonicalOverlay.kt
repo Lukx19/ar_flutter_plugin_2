@@ -16,9 +16,11 @@ import java.util.Collections
  * a journal or staging refusal after a reservation has been burned.
  */
 internal class MutableCanonicalOverlay private constructor(
-    private val view: CanonicalStateView,
+    private val view: CanonicalFeaturePlanningView,
     private val configuration: SurfaceOwnershipConfiguration,
 ) {
+    private fun completeView(): CanonicalStateView = view as? CanonicalStateView
+        ?: error("complete canonical view required outside feature planning")
     private val startingReadWork = view.readWorkReceipt()
     private var pageFaults = 0
     private var bytesRead = 0
@@ -348,6 +350,16 @@ internal class MutableCanonicalOverlay private constructor(
     ): CanonicalMutationPreparation {
         val rowTable = PreparedRowTable.from(rows)
         val removedIds = LongArray(removed.size) { removed[it].value }.also { it.sort() }
+        val removedRoutes = if (removedIds.isEmpty()) PreparedRemovedRouteTable.EMPTY else {
+            val routeKeys = LongArray(removedIds.size)
+            removedIds.forEachIndexed { index, id ->
+                directLookups++
+                val row = view.findById(SurfaceId(id))
+                    ?: return refuse(CanonicalMutationRefusal.UNKNOWN_IDENTITY)
+                routeKeys[index] = packVisibilityGridKey(row.voxel.x, row.voxel.y, row.voxel.z)
+            }
+            PreparedRemovedRouteTable(removedIds.copyOf(), routeKeys)
+        }
         val dirtySupportRecords = supportPairs?.size?.toLong() ?: when (supportMode) {
             PreparedSupportMode.NONE -> 0L
             PreparedSupportMode.SELF -> rows.size.toLong()
@@ -375,13 +387,24 @@ internal class MutableCanonicalOverlay private constructor(
             Math.addExact(encodedBytesBase, if (kind == PreparedMutationKind.DEPTH_BATCH) 4L else 0L)
         } catch (_: ArithmeticException) { return refuse(CanonicalMutationRefusal.JOURNAL_EXHAUSTED) }
         if (!journalFits(encodedBytes)) return refuse(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
-        val retainedPlanBytes = PLAN_FIXED_OWNER_BYTES + rowTable.allocatedBytes + removedIds.size * 8L +
+        val retainedPlanBytes = PLAN_FIXED_OWNER_BYTES + rowTable.allocatedBytes + removedIds.size * 8L + removedRoutes.allocatedBytes +
             (supportPairs?.allocatedBytes ?: supports.allocatedBytes) + (lineagePairs?.allocatedBytes ?: 0L)
         val sharedReserveBytes = retainedPlanBytes + WRITER_SCRATCH_BYTES
-        val constructionPeakBytes = PLAN_FIXED_OWNER_BYTES + WRITER_SCRATCH_BYTES + PLANNING_PAGE_SCRATCH_BYTES +
+        val planningConstructionPeakBytes = PLAN_FIXED_OWNER_BYTES + WRITER_SCRATCH_BYTES + PLANNING_PAGE_SCRATCH_BYTES +
             rows.size * ROW_CONSTRUCTION_BYTES_PER_RECORD + removedIds.size * REMOVED_CONSTRUCTION_BYTES_PER_RECORD +
             supports.constructionArrayPeakBytes + supports.constructionHashBytes +
-            (supportPairs?.allocatedBytes ?: 0L) + (lineagePairs?.allocatedBytes ?: 0L)
+            (supportPairs?.allocatedBytes ?: 0L) + (lineagePairs?.allocatedBytes ?: 0L) + removedRoutes.allocatedBytes
+        val routeDeltaConstructionBytes = Math.addExact(
+            88L,
+            Math.addExact(
+                Math.multiplyExact(removedIds.size.toLong(), 8L),
+                Math.multiplyExact(rows.size.toLong(), 12L),
+            ),
+        )
+        val constructionPeakBytes = maxOf(
+            planningConstructionPeakBytes,
+            Math.addExact(retainedPlanBytes, routeDeltaConstructionBytes),
+        )
         if (sharedReserveBytes > CompactCanonicalStore.JOURNAL_RESERVE_BYTES ||
             constructionPeakBytes > CompactCanonicalStore.JOURNAL_RESERVE_BYTES
         ) return refuse(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
@@ -399,13 +422,14 @@ internal class MutableCanonicalOverlay private constructor(
             rowTable.allocatedBytes, removedIds.size * 8L, supports.allocatedBytes,
             supports.constructionHashBytes, PLAN_FIXED_OWNER_BYTES, PLANNING_PAGE_SCRATCH_BYTES,
             supports.constructionArrayPeakBytes, rowConstructionBytes, removedConstructionBytes,
+            removedRoutes.allocatedBytes, routeDeltaConstructionBytes,
         )
         return CanonicalMutationPreparation.Prepared(PreparedCanonicalMutation(
             CanonicalAuthorityLease(),
             view.cut, CanonicalReceiptBytes(overlayHash(commandId.encodeToByteArray())),
             CanonicalReceiptBytes(fingerprint), commandId, kind, rowTable, removedIds,
             supports, supportMode, removedSupportRecords.toIntExact(), high, live, sourceCount, supportCount, lineageCount,
-            geometry, lineage, work, supportPairs, lineagePairs, removedLineageRecords,
+            geometry, lineage, work, supportPairs, lineagePairs, removedLineageRecords, removedRoutes,
         ))
     }
 
@@ -420,7 +444,7 @@ internal class MutableCanonicalOverlay private constructor(
         var records = 0L
         var overflow = false
         do {
-            val read = view.visitSourceSupport(target, cursor, { support ->
+            val read = completeView().visitSourceSupport(target, cursor, { support ->
                 if (!accumulator.add(support.source)) {
                     overflow = true
                     false
@@ -920,7 +944,7 @@ internal class MutableCanonicalOverlay private constructor(
         var count = 0L
         var pages = 0L
         do {
-            val read = view.visitLineage(source, cursor) {
+            val read = completeView().visitLineage(source, cursor) {
                 count = try { Math.addExact(count, 1L) } catch (_: ArithmeticException) { Long.MAX_VALUE }
                 count <= configuration.lineageCapacity.toLong()
             }
@@ -940,7 +964,7 @@ internal class MutableCanonicalOverlay private constructor(
         var cursor: SourceSupportCursor? = null
         var pages = 0L
         do {
-            val read = view.visitSourceSupport(source, cursor, sink)
+            val read = completeView().visitSourceSupport(source, cursor, sink)
             when (read) {
                 is SourceSupportRead.Refused -> return false
                 is SourceSupportRead.Complete -> {
@@ -1069,7 +1093,7 @@ internal class MutableCanonicalOverlay private constructor(
             var records = 0
             var pages = 0L
             do {
-                val read = view.visitSourceSupport(source, cursor) { support ->
+                val read = completeView().visitSourceSupport(source, cursor) { support ->
                     records++
                     if (records > sourceCapacity().coerceAtMost(Int.MAX_VALUE.toLong())) return@visitSourceSupport false
                     values += support.source.toImmutableSupport()
@@ -1274,7 +1298,7 @@ internal class MutableCanonicalOverlay private constructor(
             MutableCanonicalOverlay(view, configuration).prepareStructural(command)
 
         fun prepare(
-            view: CanonicalStateView,
+            view: CanonicalFeaturePlanningView,
             configuration: SurfaceOwnershipConfiguration,
             command: CanonicalFeatureBatchCommand,
         ): CanonicalMutationPreparation {
@@ -1607,7 +1631,22 @@ internal data class CanonicalMutationWork(
     val supportConstructionArrayPeakBytes: Long = 0,
     val rowConstructionBytes: Long = 0,
     val removedConstructionBytes: Long = 0,
+    val removedRouteBytes: Long = 0,
+    val routeDeltaConstructionBytes: Long = 0,
 )
+
+internal class PreparedRemovedRouteTable(
+    private val ids: LongArray,
+    private val voxelKeys: LongArray,
+) {
+    init { require(ids.size == voxelKeys.size) }
+    val allocatedBytes: Long = if (ids.isEmpty()) 0L else Math.addExact(80L, Math.multiplyExact(ids.size.toLong(), 16L))
+    fun key(id: SurfaceId): Long? {
+        val index = ids.binarySearch(id.value)
+        return if (index >= 0) voxelKeys[index] else null
+    }
+    companion object { val EMPTY = PreparedRemovedRouteTable(LongArray(0), LongArray(0)) }
+}
 
 internal class PreparedCanonicalMutation(
     /** Opaque capability; the retained authority is deliberately outside this bounded graph. */
@@ -1633,6 +1672,7 @@ internal class PreparedCanonicalMutation(
     private val supportPairs: PreparedSupportPairTable? = null,
     private val lineagePairs: PreparedLineageTable? = null,
     val removedLineageRecords: Int = 0,
+    private val removedRoutes: PreparedRemovedRouteTable = PreparedRemovedRouteTable.EMPTY,
 ) : AutoCloseable {
     private var lifecycle = PreparedMutationLifecycle.READY
     private var discardPending = false
@@ -1717,6 +1757,8 @@ internal class PreparedCanonicalMutation(
     fun visitRemovedSurfaceIds(sink: (SurfaceId) -> Boolean) {
         for (id in removedIds) if (!sink(SurfaceId(id))) return
     }
+
+    internal fun removedRouteKey(id: SurfaceId): Long? = removedRoutes.key(id)
 
     fun visitDirtySupport(sink: (PreparedSupport) -> Boolean) {
         supportPairs?.let { pairs -> pairs.visit(sink); return }

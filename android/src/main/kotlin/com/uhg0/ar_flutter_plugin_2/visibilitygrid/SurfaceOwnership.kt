@@ -358,10 +358,10 @@ internal class SurfaceOwnership private constructor(
     /** Private #128 seam: one kernel delta batch plans one adjacent v6 commit. */
     @Synchronized
     internal fun prepareAdjacentMutation(
-        view: CanonicalStateView,
+        view: CanonicalFeaturePlanningView,
         command: CanonicalFeatureBatchCommand,
     ): CanonicalMutationPreparation = bindAdjacentPreparation(
-        MutableCanonicalOverlay.prepare(view, configuration, command), view,
+        MutableCanonicalOverlay.prepare(view, configuration, command), view.generationZeroAuthority,
     )
 
     /** Public adjacent-authority seam for one immutable depth evidence batch. */

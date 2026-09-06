@@ -729,7 +729,7 @@ internal class VisibilityGridIntegration(
     private fun canonicalAssignments(
         changes: List<FeatureFusionChange>,
         mutation: PreparedCanonicalMutation,
-        current: CanonicalStateView,
+        current: CanonicalFeaturePlanningView,
     ): List<CanonicalFeatureAssignment>? {
         val slots = HashMap<Voxel, Int>()
         changes.forEach { change ->

@@ -164,10 +164,13 @@ internal class CanonicalRuntimeResources private constructor(
     /** Borrows complete canonical authority for bounded feature planning. */
     @Synchronized fun <T> withFeaturePlanningCurrent(
         maximumTouches: Int,
-        block: (CanonicalStateView) -> T,
+        maximumPageReads: Long = Math.multiplyExact(maximumTouches.toLong(), 3L),
+        maximumBytesRead: Long = Math.multiplyExact(maximumPageReads, CanonicalPageCache.PAGE_BYTES.toLong()),
+        block: (CanonicalFeaturePlanningView) -> T,
     ): T? {
         checkOpen()
-        require(maximumTouches >= 0 && maximumTouches <= configuration.surfaceCapacity)
+        require(maximumTouches >= 0 && maximumTouches <= configuration.surfaceCapacity &&
+            maximumPageReads >= 0L && maximumBytesRead >= 0L)
         val lease = current ?: return null
         // Feature-local correlation identifies associations only. Canonical
         // occupancy, normals, identity and allocation provenance always come
@@ -175,7 +178,7 @@ internal class CanonicalRuntimeResources private constructor(
         if (!lease.isCurrent(owner?.activationState()?.cut)) {
             invalidateCurrent(); return null
         }
-        val view = lease.featurePlanningView(maximumTouches)
+        val view = lease.featurePlanningView(maximumTouches, maximumPageReads, maximumBytesRead)
         val result = block(view)
         if (view.routingFailed) {
             if (result is CanonicalMutationPreparation.Prepared) result.mutation.discard()
@@ -437,8 +440,8 @@ internal class CanonicalRuntimeResources private constructor(
         var commit: CanonicalPublishedCommit?,
         private val featureRoutes: CanonicalFeaturePlanningRoutes,
     ) : AutoCloseable {
-        fun featurePlanningView(maximumTouches: Int): RoutedFeaturePlanningView =
-            featureRoutes.view(scalarView.cut, base, commit, maximumTouches)
+        fun featurePlanningView(maximumTouches: Int, maximumPageReads: Long, maximumBytesRead: Long): RoutedFeaturePlanningView =
+            featureRoutes.view(scalarView.cut, base, commit, maximumTouches, maximumPageReads, maximumBytesRead)
         fun featurePlanningMemoryReceipt(maximumTouches: Int) = featureRoutes.memoryReceipt(maximumTouches)
 
         fun prepareRouting(plan: PreparedCanonicalMutation): CanonicalFeatureRouteDelta? =
@@ -516,19 +519,19 @@ private class CanonicalFeaturePlanningRoutes private constructor(private val cap
         base: CanonicalStateView,
         commit: CanonicalPublishedCommit?,
         maximumTouches: Int,
-    ) = RoutedFeaturePlanningView(cut, this, base, commit, maximumTouches)
+        maximumPageReads: Long,
+        maximumBytesRead: Long,
+    ) = RoutedFeaturePlanningView(cut, this, base, commit, maximumTouches, maximumPageReads, maximumBytesRead)
 
     fun prepare(plan: PreparedCanonicalMutation, providerToken: Int): CanonicalFeatureRouteDelta? {
         if (closed || plan.targetLiveSurfaceCount !in 0..capacity) return null
-        val sourceVoxels = HashMap<Long, Voxel>()
-        if (!plan.visitRetainedSources { source -> sourceVoxels[source.id.value] = source.voxel; true }) return null
         val removed = LongArray(plan.removedSurfaceCount)
         var removedCount = 0
         plan.visitRemovedSurfaceIds { id ->
-            val voxel = sourceVoxels[id.value] ?: return@visitRemovedSurfaceIds false
-            val descriptor = descriptor(packVisibilityGridKey(voxel.x, voxel.y, voxel.z))
+            val key = plan.removedRouteKey(id) ?: return@visitRemovedSurfaceIds false
+            val descriptor = descriptor(key)
                 ?: return@visitRemovedSurfaceIds false
-            removed[removedCount++] = packVisibilityGridKey(voxel.x, voxel.y, voxel.z)
+            removed[removedCount++] = key
             true
         }
         if (removedCount != plan.removedSurfaceCount) return null
@@ -539,14 +542,16 @@ private class CanonicalFeaturePlanningRoutes private constructor(private val cap
             val key = packVisibilityGridKey(row.voxel.x, row.voxel.y, row.voxel.z)
             val retained = descriptor(key)
             val sourceProvider = if (row.id.value >= plan.sourceCut.nextSurfaceIdHighWater) providerToken else {
-                retained?.let { sourceProviders[it] } ?: sourceVoxels[row.id.value]?.let { old ->
-                    descriptor(packVisibilityGridKey(old.x, old.y, old.z))?.let { sourceProviders[it] }
-                } ?: return@visitDirtyRows false
+                retained?.let { sourceProviders[it] }
+                    ?: plan.removedRouteKey(row.id)?.let(::descriptor)?.let { sourceProviders[it] }
+                    ?: return@visitDirtyRows false
             }
             keys[dirtyCount] = key; sources[dirtyCount] = sourceProvider; dirtyCount++
             true
         } || dirtyCount != plan.dirtyRowCount) return null
-        return CanonicalFeatureRouteDelta(providerToken, removed, keys, sources)
+        return CanonicalFeatureRouteDelta(providerToken, removed, keys, sources).also {
+            CanonicalRuntimeCurrentTestHooks.onFeatureRouteDeltaPrepared?.invoke(it.memoryReceipt)
+        }
     }
 
     fun apply(delta: CanonicalFeatureRouteDelta) {
@@ -593,24 +598,41 @@ private class CanonicalFeaturePlanningRoutes private constructor(private val cap
         voxel: Voxel,
         base: CanonicalStateView,
         commit: CanonicalPublishedCommit?,
+        maximumPageReads: Long,
+        maximumBytesRead: Long,
     ): RoutedFeatureRead {
         val descriptor = descriptor(packVisibilityGridKey(voxel.x, voxel.y, voxel.z))
             ?: return RoutedFeatureRead.Missing
+        val rowPages = if (rowProviders[descriptor] == 1) 0L else 2L
+        val requiredPages = Math.addExact(rowPages, 1L)
+        val requiredBytes = Math.multiplyExact(requiredPages, CanonicalPageCache.PAGE_BYTES.toLong())
+        if (maximumPageReads < requiredPages || maximumBytesRead < requiredBytes) return RoutedFeatureRead.Failed(CanonicalReadWork.ZERO)
         val row = providerSurface(rowProviders[descriptor], voxel, base, commit)
-            ?: return RoutedFeatureRead.Failed
-        val source = providerSource(sourceProviders[descriptor], row.id, base, commit)
-            ?: return RoutedFeatureRead.Failed
-        return RoutedFeatureRead.Found(row, source)
+            ?: return RoutedFeatureRead.Failed()
+        val source = providerSource(sourceProviders[descriptor], row.value.id, base, commit)
+            ?: return RoutedFeatureRead.Failed(row.work)
+        return RoutedFeatureRead.Found(row.value, source.value, row.work + source.work)
     }
 
-    private fun providerSurface(token: Int, voxel: Voxel, base: CanonicalStateView, commit: CanonicalPublishedCommit?): CompactSurface? {
+    private fun providerSurface(token: Int, voxel: Voxel, base: CanonicalStateView, commit: CanonicalPublishedCommit?): RoutedProviderRead<CompactSurface>? {
         if (CanonicalRuntimeCurrentTestHooks.failFeatureRouteRead?.invoke("row") == true) return null
-        return if (token == 1) base.findByVoxel(voxel) else commit?.routingGenerationAt(token - 2)?.routedSurface(voxel)
+        return if (token == 1) when (val read = base.findByVoxelBounded(voxel, 1L, CanonicalPageCache.PAGE_BYTES.toLong())) {
+            is CanonicalBoundedReadResult.Complete -> read.value?.let { RoutedProviderRead(it, read.work) }
+            is CanonicalBoundedReadResult.Refused -> null
+        } else when (val read = commit?.routingGenerationAt(token - 2)?.routedSurface(voxel)) {
+            is RoutedGenerationRead.Complete -> RoutedProviderRead(read.value, read.work)
+            is RoutedGenerationRead.Refused, null -> null
+        }
     }
-    private fun providerSource(token: Int, id: SurfaceId, base: CanonicalStateView, commit: CanonicalPublishedCommit?): PagedSource? {
+    private fun providerSource(token: Int, id: SurfaceId, base: CanonicalStateView, commit: CanonicalPublishedCommit?): RoutedProviderRead<PagedSource>? {
         if (CanonicalRuntimeCurrentTestHooks.failFeatureRouteRead?.invoke("source") == true) return null
-        return if (token == 1) (base.readSourceById(id) as? CanonicalPageRead.Complete)?.value
-        else commit?.routingGenerationAt(token - 2)?.routedSource(id)
+        return if (token == 1) when (val read = base.readSourceByIdBounded(id, 1L, CanonicalPageCache.PAGE_BYTES.toLong())) {
+            is CanonicalBoundedReadResult.Complete -> read.value?.let { RoutedProviderRead(it, read.work) }
+            is CanonicalBoundedReadResult.Refused -> null
+        } else when (val read = commit?.routingGenerationAt(token - 2)?.routedSource(id)) {
+            is RoutedGenerationRead.Complete -> RoutedProviderRead(read.value, read.work)
+            is RoutedGenerationRead.Refused, null -> null
+        }
     }
 
     private fun acquire(): Int? = when {
@@ -657,8 +679,7 @@ private class CanonicalFeaturePlanningRoutes private constructor(private val cap
         return null
     }
     private fun slot(key: Long): Int {
-        var mixed = key xor (key ushr 33); mixed *= -49064778989728563L; mixed = mixed xor (mixed ushr 33)
-        return mixed.toInt() and (tableSize - 1)
+        return featureRouteSlot(key, tableSize - 1)
     }
     fun memoryReceipt(maximumTouches: Int): CanonicalFeaturePlanningMemoryReceipt {
         require(maximumTouches in 0..capacity)
@@ -670,7 +691,8 @@ private class CanonicalFeaturePlanningRoutes private constructor(private val cap
         val scratch = Math.addExact(64L, Math.addExact(2L * 16L,
             Math.multiplyExact(tableSize.toLong(), (Long.SIZE_BYTES + Int.SIZE_BYTES).toLong())))
         val borrow = Math.addExact(128L + 3L * 16L, Math.multiplyExact(maximumTouches.toLong(), 24L))
-        return CanonicalFeaturePlanningMemoryReceipt(retained, scratch, borrow)
+        val routeDelta = Math.addExact(88L, Math.multiplyExact(maximumTouches.toLong(), 20L))
+        return CanonicalFeaturePlanningMemoryReceipt(retained, scratch, borrow, routeDelta)
     }
     override fun close() { if (!closed) { closed = true; tokens.fill(0); rowProviders.fill(0); sourceProviders.fill(0) } }
 
@@ -718,9 +740,15 @@ private class LongProviderScratch(tableSize: Int) {
         keys[slot] = key; values[slot] = value
     }
     private fun slot(key: Long): Int {
-        var mixed = key xor (key ushr 33); mixed *= -49064778989728563L; mixed = mixed xor (mixed ushr 33)
-        return mixed.toInt() and mask
+        return featureRouteSlot(key, mask)
     }
+}
+
+private fun featureRouteSlot(key: Long, mask: Int): Int {
+    var mixed = key xor (key ushr 33)
+    mixed *= -49064778989728563L
+    mixed = mixed xor (mixed ushr 33)
+    return mixed.toInt() and mask
 }
 
 private class CanonicalFeatureRouteDelta(
@@ -728,6 +756,24 @@ private class CanonicalFeatureRouteDelta(
     val removedKeys: LongArray,
     val dirtyKeys: LongArray,
     val sourceProviders: IntArray,
+) {
+    val memoryReceipt = CanonicalFeatureRouteDeltaMemoryReceipt(
+        removedKeys.size,
+        dirtyKeys.size,
+        Math.addExact(
+            88L,
+            Math.addExact(
+                Math.multiplyExact(removedKeys.size.toLong(), 8L),
+                Math.multiplyExact(dirtyKeys.size.toLong(), 12L),
+            ),
+        ),
+    )
+}
+
+internal data class CanonicalFeatureRouteDeltaMemoryReceipt(
+    val removedRoutes: Int,
+    val dirtyRoutes: Int,
+    val retainedBytes: Long,
 )
 
 private class RoutedFeaturePlanningView(
@@ -736,24 +782,38 @@ private class RoutedFeaturePlanningView(
     private val base: CanonicalStateView,
     private val commit: CanonicalPublishedCommit?,
     maximumTouches: Int,
-) : CanonicalStateView {
+    private val maximumPageReads: Long,
+    private val maximumBytesRead: Long,
+) : CanonicalFeaturePlanningView {
     private val touchedIds = LongArray(maximumTouches)
     private val touchedRows = arrayOfNulls<CompactSurface>(maximumTouches)
     private val touchedSources = arrayOfNulls<PagedSource>(maximumTouches)
     private var touchedCount = 0
+    private var work = CanonicalReadWork.ZERO
     var routingFailed = false
         private set
     override val generationZeroAuthority: CanonicalStateView get() = base.generationZeroAuthority
-    override fun findByVoxel(voxel: Voxel): CompactSurface? = when (val read = routes.resolve(voxel, base, commit)) {
+    override fun findByVoxel(voxel: Voxel): CompactSurface? {
+        (0 until touchedCount).firstOrNull { touchedRows[it]?.voxel == voxel }
+            ?.let { return touchedRows[it] }
+        return when (
+        val read = routes.resolve(
+            voxel, base, commit,
+            maximumPageReads - work.pageReads,
+            maximumBytesRead - work.bytesRead,
+        )
+        ) {
         RoutedFeatureRead.Missing -> null
-        RoutedFeatureRead.Failed -> null.also { routingFailed = true }
+        is RoutedFeatureRead.Failed -> null.also { work += read.work; routingFailed = true }
         is RoutedFeatureRead.Found -> read.row.also {
+            work += read.work
             val existing = (0 until touchedCount).firstOrNull { index -> touchedIds[index] == it.id.value }
             val index = existing ?: touchedCount.also { next ->
                 if (next >= touchedIds.size) { routingFailed = true; return@also }
                 touchedCount++
             }
             touchedIds[index] = it.id.value; touchedRows[index] = it; touchedSources[index] = read.source
+        }
         }
     }
     override fun findById(id: SurfaceId): CompactSurface? =
@@ -762,19 +822,33 @@ private class RoutedFeaturePlanningView(
         CanonicalPageRead.Complete(
             (0 until touchedCount).firstOrNull { touchedIds[it] == id.value }?.let { touchedSources[it] }, 0, 0,
         )
-    override fun readPage(region: StorageRegion, page: Int, cursor: Int, limit: Int) = CompactPage(emptyList(), null, 0)
-    override fun visitSourceSupport(target: SurfaceId, cursor: SourceSupportCursor?, sink: (PagedSupport) -> Boolean) =
-        SourceSupportRead.Complete(0, null, 0, 0)
-    override fun retainedMemoryReceipt() = base.retainedMemoryReceipt()
-    override fun allocatedStorageReceipt() = base.allocatedStorageReceipt()
-    override fun close() = Unit
+    override fun readSourceByIdBounded(
+        id: SurfaceId,
+        maximumPageReads: Long,
+        maximumBytesRead: Long,
+    ): CanonicalBoundedReadResult<PagedSource?> = if (maximumPageReads < 0L || maximumBytesRead < 0L) {
+        CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED)
+    } else CanonicalBoundedReadResult.Complete(
+        (0 until touchedCount).firstOrNull { touchedIds[it] == id.value }?.let { touchedSources[it] },
+        CanonicalReadWork.ZERO,
+    )
+    override fun readWorkReceipt() = work
 }
 
 private sealed interface RoutedFeatureRead {
     data object Missing : RoutedFeatureRead
-    data object Failed : RoutedFeatureRead
-    data class Found(val row: CompactSurface, val source: PagedSource) : RoutedFeatureRead
+    data class Failed(val work: CanonicalReadWork = CanonicalReadWork.ZERO) : RoutedFeatureRead
+    data class Found(val row: CompactSurface, val source: PagedSource, val work: CanonicalReadWork) : RoutedFeatureRead
 }
+
+private data class RoutedProviderRead<T>(val value: T, val work: CanonicalReadWork)
+
+private operator fun CanonicalReadWork.plus(other: CanonicalReadWork) = CanonicalReadWork(
+    Math.addExact(directLookups, other.directLookups),
+    Math.addExact(pageReads, other.pageReads),
+    Math.addExact(inspectedRows, other.inspectedRows),
+    Math.addExact(bytesRead, other.bytesRead),
+)
 
 internal data class CanonicalCompleteCurrentLeaseReceipt(
     val baseRetained: CompactRetainedMemoryReceipt,
@@ -789,6 +863,7 @@ internal data class CanonicalFeaturePlanningMemoryReceipt(
     val routeRetainedBytes: Long,
     val lifecycleConstructionScratchBytes: Long,
     val borrowCacheBytes: Long,
+    val maximumRouteDeltaBytes: Long,
 )
 
 private open class ScalarCanonicalStateView(
@@ -856,6 +931,7 @@ internal object CanonicalRuntimeCurrentTestHooks {
     @Volatile var onAuthenticatedBorrow: ((Long) -> Unit)? = null
     @Volatile var onFeatureRouteRead: ((String, CowReadWork) -> Unit)? = null
     @Volatile var failFeatureRouteRead: ((String) -> Boolean)? = null
+    @Volatile var onFeatureRouteDeltaPrepared: ((CanonicalFeatureRouteDeltaMemoryReceipt) -> Unit)? = null
 }
 
 internal data class CanonicalRendererPage(

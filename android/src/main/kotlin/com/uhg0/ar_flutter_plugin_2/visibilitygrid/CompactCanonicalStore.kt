@@ -10,14 +10,28 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 
-internal interface CanonicalStateView : AutoCloseable {
+internal interface CanonicalFeaturePlanningView {
     val cut: CompactCanonicalCut
-    /** Exact compact authority borrowed by any overlays composing this view. */
-    val generationZeroAuthority: CanonicalStateView get() = this
+    val generationZeroAuthority: CanonicalStateView
 
     fun findById(id: SurfaceId): CompactSurface?
 
     fun findByVoxel(voxel: Voxel): CompactSurface?
+
+    fun readSourceById(id: SurfaceId): CanonicalPageRead<PagedSource?>
+
+    fun readSourceByIdBounded(
+        id: SurfaceId,
+        maximumPageReads: Long,
+        maximumBytesRead: Long,
+    ): CanonicalBoundedReadResult<PagedSource?>
+
+    fun readWorkReceipt(): CanonicalReadWork = CanonicalReadWork.ZERO
+}
+
+internal interface CanonicalStateView : CanonicalFeaturePlanningView, AutoCloseable {
+    /** Exact compact authority borrowed by any overlays composing this view. */
+    override val generationZeroAuthority: CanonicalStateView get() = this
 
     /** Narrow read seams for bounded runtime lookups. */
     fun findByIdBounded(
@@ -36,7 +50,14 @@ internal interface CanonicalStateView : AutoCloseable {
 
     fun readPage(region: StorageRegion, page: Int, cursor: Int, limit: Int): CompactPage
 
-    fun readSourceById(id: SurfaceId): CanonicalPageRead<PagedSource?>
+    override fun readSourceById(id: SurfaceId): CanonicalPageRead<PagedSource?>
+
+    override fun readSourceByIdBounded(
+        id: SurfaceId,
+        maximumPageReads: Long,
+        maximumBytesRead: Long,
+    ): CanonicalBoundedReadResult<PagedSource?> =
+        CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE)
 
     fun visitSourceSupport(
         target: SurfaceId,
@@ -64,7 +85,7 @@ internal interface CanonicalStateView : AutoCloseable {
     fun allocatedStorageReceipt(): CompactStorageReceipt
 
     /** Monotonic bounded-reader work, used to prove dirty planning is independent of live N. */
-    fun readWorkReceipt(): CanonicalReadWork = CanonicalReadWork.ZERO
+    override fun readWorkReceipt(): CanonicalReadWork = CanonicalReadWork.ZERO
 }
 
 internal enum class CanonicalBoundedReadRefusal {
@@ -841,6 +862,23 @@ private constructor(
                     }
                 CanonicalPageRead.Complete(value, page.pageFaults, page.bytesRead)
             }
+        }
+    }
+
+    override fun readSourceByIdBounded(
+        id: SurfaceId,
+        maximumPageReads: Long,
+        maximumBytesRead: Long,
+    ): CanonicalBoundedReadResult<PagedSource?> {
+        if (maximumPageReads < 1L || maximumBytesRead < CanonicalPageCache.PAGE_BYTES.toLong()) {
+            return CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED)
+        }
+        return when (val read = readSourceById(id)) {
+            is CanonicalPageRead.Refused -> CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE)
+            is CanonicalPageRead.Complete -> CanonicalBoundedReadResult.Complete(
+                read.value,
+                CanonicalReadWork(1, read.pageFaults.toLong(), 0, read.bytesRead.toLong()),
+            )
         }
     }
 

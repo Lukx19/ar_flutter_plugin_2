@@ -335,37 +335,47 @@ internal class CanonicalCowGeneration private constructor(
 
     /** One generation-local row read. It never delegates to an older overlay. */
     @Synchronized
-    internal fun routedSurface(voxel: Voxel): CompactSurface? {
-        if (closed) return null
+    internal fun routedSurface(voxel: Voxel): RoutedGenerationRead<CompactSurface> {
+        if (closed) return RoutedGenerationRead.Refused(CanonicalReadWork.ZERO)
         val before = readWorkReceipt()
         val key = voxelKey(voxel.x, voxel.y, voxel.z)
         var id: Long? = null
-        if (!records(CowFragmentKind.VOXEL_INDEX, key) { record ->
+        val index = visitBounded(CowFragmentKind.VOXEL_INDEX, key, 1, PAGE_BYTES.toLong()) { record ->
             if (record is CowRecord.Index && record.x == voxel.x && record.y == voxel.y && record.z == voxel.z) {
                 id = record.id
             }
             true
-        }) return null
-        return id?.let { wanted ->
-            var value: CompactSurface? = null
-            if (!records(CowFragmentKind.ROW, wanted) { record ->
-                if (record is CowRecord.Row && record.value.id == wanted) value = record.value.surface()
-                true
-            }) null else value
-        }.also { CanonicalRuntimeCurrentTestHooks.onFeatureRouteRead?.invoke("row", readWorkReceipt() - before) }
+        }
+        if (index !is CowBoundedVisitResult.Valid || id == null) return RoutedGenerationRead.Refused(index.work)
+        var value: CompactSurface? = null
+        val row = visitBounded(CowFragmentKind.ROW, requireNotNull(id), 1, PAGE_BYTES.toLong()) { record ->
+            if (record is CowRecord.Row && record.value.id == id) value = record.value.surface()
+            true
+        }
+        val work = (readWorkReceipt() - before).canonical()
+        CanonicalRuntimeCurrentTestHooks.onFeatureRouteRead?.invoke(
+            "row", CowReadWork(work.pageReads, work.inspectedRows, work.pageReads, work.bytesRead),
+        )
+        return if (row is CowBoundedVisitResult.Valid && value != null) RoutedGenerationRead.Complete(requireNotNull(value), work)
+        else RoutedGenerationRead.Refused(work)
     }
 
     /** One generation-local allocation-source read with no ancestry fallback. */
     @Synchronized
-    internal fun routedSource(id: SurfaceId): PagedSource? {
-        if (closed) return null
+    internal fun routedSource(id: SurfaceId): RoutedGenerationRead<PagedSource> {
+        if (closed) return RoutedGenerationRead.Refused(CanonicalReadWork.ZERO)
         val before = readWorkReceipt()
         var value: PagedSource? = null
-        if (!records(CowFragmentKind.SOURCE, id.value) { record ->
+        val read = visitBounded(CowFragmentKind.SOURCE, id.value, 1, PAGE_BYTES.toLong()) { record ->
             if (record is CowRecord.Source && record.value.id == id.value) value = record.value.source()
             true
-        }) return null
-        return value.also { CanonicalRuntimeCurrentTestHooks.onFeatureRouteRead?.invoke("source", readWorkReceipt() - before) }
+        }
+        val work = (readWorkReceipt() - before).canonical()
+        CanonicalRuntimeCurrentTestHooks.onFeatureRouteRead?.invoke(
+            "source", CowReadWork(work.pageReads, work.inspectedRows, work.pageReads, work.bytesRead),
+        )
+        return if (read is CowBoundedVisitResult.Valid && value != null) RoutedGenerationRead.Complete(requireNotNull(value), work)
+        else RoutedGenerationRead.Refused(work)
     }
 
     /** Lifecycle-only routing materialization; each fragment is streamed once. */
@@ -524,6 +534,12 @@ internal class CanonicalCowGeneration private constructor(
                 FileChannel.open(directory.toPath(), StandardOpenOption.READ).use { it.force(true) }
         }
     }
+}
+
+internal sealed interface RoutedGenerationRead<out T> {
+    val work: CanonicalReadWork
+    data class Complete<T>(val value: T, override val work: CanonicalReadWork) : RoutedGenerationRead<T>
+    data class Refused(override val work: CanonicalReadWork) : RoutedGenerationRead<Nothing>
 }
 
 /** Disabled-by-default scalar test observation; it retains no opened generation or payload. */
