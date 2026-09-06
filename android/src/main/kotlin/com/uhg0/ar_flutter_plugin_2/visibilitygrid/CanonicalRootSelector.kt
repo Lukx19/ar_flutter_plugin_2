@@ -523,8 +523,11 @@ internal class CanonicalPublishedCommit internal constructor(
         ).also { it.scalar = scalar }
     }
 
-    internal fun retainedProofBytes(): Long = 512L + roots.size * 512L +
-        generations.sumOf { 256L + it.root.manifest.size * 128L }
+    internal fun retainedProofBytes(): Long {
+        var total = Math.addExact(512L, Math.multiplyExact(roots.size.toLong(), 512L))
+        generations.forEach { generation -> total = Math.addExact(total, generation.retainedProofBytes()) }
+        return total
+    }
 }
 
 internal sealed interface CanonicalPublishResult {

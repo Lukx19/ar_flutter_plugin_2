@@ -18,6 +18,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -444,7 +445,13 @@ class CompactCanonicalMutationTest {
             val large = stage(largeBase, largeIntent, File(directory, "dirty-large-generation"))
             val phase = large.storageReceipt()
             assertEquals(CanonicalCowGeneration.phasePeakBytes(large.root.manifest.size), phase.phasePeakBytes)
+            assertTrue("directory index retained bytes=$phase", phase.indexRetainedBytes > 0L)
+            assertTrue("index construction peak=$phase", phase.indexConstructionPeakBytes >= phase.indexRetainedBytes)
+            assertTrue("phase includes index construction=$phase", phase.phasePeakBytes > phase.indexConstructionPeakBytes)
             assertTrue("maximum admitted dirty phase=$phase", phase.phasePeakBytes <= 1_048_576L)
+            val retainedIndexBytes = phase.indexRetainedBytes
+            assertSame(large, large.withAllocatedStorage(phase.allocatedBytes))
+            assertEquals(retainedIndexBytes, large.storageReceipt().indexRetainedBytes)
             fun receipt(base: TestView, generation: CanonicalCowGeneration): CowReadWork {
                 val before = generation.readWorkReceipt()
                 assertEquals(SurfaceId(1), generation.overlay(base).findByVoxel(lookupVoxel)?.id)
@@ -457,6 +464,8 @@ class CompactCanonicalMutationTest {
             assertEquals(smallWork, largeWork)
             assertEquals(4, largeWork.pages)
             assertTrue(largeWork.records <= 2_200)
+            large.close()
+            assertEquals(0L, large.storageReceipt().indexRetainedBytes)
         } finally { directory.deleteRecursively() }
     }
 

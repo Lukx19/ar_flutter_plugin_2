@@ -10,6 +10,31 @@ import java.nio.channels.FileChannel
 import java.nio.file.StandardOpenOption
 import java.security.MessageDigest
 
+private data class CowIndexMemoryReceipt(
+    val retainedBytes: Long,
+    val constructionPeakBytes: Long,
+)
+
+private data class CowGenerationMemoryReceipt(
+    val indexRetainedBytes: Long,
+    val indexConstructionPeakBytes: Long,
+    val phasePeakBytes: Long,
+)
+
+private fun generationMemoryReceipt(directoryEntries: Int): CowGenerationMemoryReceipt {
+    val index = CowDirectoryIndex.memoryReceiptForEntryCount(directoryEntries)
+    val phaseFixed = Math.addExact(
+        Math.addExact(CanonicalCowGeneration.FIXED_PHASE_BYTES, CanonicalCowGeneration.SORT_SCRATCH_BYTES),
+        Math.addExact(CanonicalCowGeneration.PHASE_OBJECT_OVERHEAD_BYTES, 64L),
+    )
+    return CowGenerationMemoryReceipt(
+        index.retainedBytes,
+        index.constructionPeakBytes,
+        Math.addExact(Math.addExact(phaseFixed, index.constructionPeakBytes),
+            Math.multiplyExact(directoryEntries.toLong(), 128L)),
+    )
+}
+
 /**
  * An immutable, deliberately unreferenced canonical surface delta.  It is not a schema-5
  * authority and this type has no operation which can make it one.  #123 owns
@@ -19,7 +44,7 @@ internal class CanonicalCowGeneration private constructor(
     val directory: File,
     val root: MutableSemanticRoot,
     private val entries: List<CowDirectoryEntry>,
-    private val storage: CowStorageReceipt,
+    private var storage: CowStorageReceipt,
 ) : AutoCloseable {
     private val entryIndex = CowDirectoryIndex(entries)
     private var closed = false
@@ -29,10 +54,17 @@ internal class CanonicalCowGeneration private constructor(
     private var cowBytesRead = 0L
 
     @Synchronized
-    override fun close() { closed = true }
+    override fun close() {
+        if (!closed) {
+            closed = true
+            entryIndex.close()
+        }
+    }
 
     @Synchronized
-    fun storageReceipt() = storage
+    fun storageReceipt() = storage.copy(
+        indexRetainedBytes = if (closed) 0L else entryIndex.memoryReceipt.retainedBytes,
+    )
 
     @Synchronized
     fun readWorkReceipt() = CowReadWork(cowPagesRead, cowRecordsInspected, cowHashesValidated, cowBytesRead)
@@ -45,7 +77,15 @@ internal class CanonicalCowGeneration private constructor(
     @Synchronized
     internal fun withAllocatedStorage(bytes: Long): CanonicalCowGeneration {
         check(!closed)
-        return CanonicalCowGeneration(directory, root, entries, storage.copy(allocatedBytes = bytes))
+        storage = storage.copy(allocatedBytes = bytes)
+        return this
+    }
+
+    /** Bytes retained by this generation's proof, including its keyed directory index. */
+    @Synchronized
+    internal fun retainedProofBytes(): Long {
+        val manifestBytes = Math.multiplyExact(entries.size.toLong(), 128L)
+        return Math.addExact(256L, Math.addExact(manifestBytes, storageReceipt().indexRetainedBytes))
     }
 
     /** Holds the generation lifecycle lock across a complete overlay operation. */
@@ -328,8 +368,7 @@ internal class CanonicalCowGeneration private constructor(
         /** Writer maps/instances, receipts, list backing arrays and transient root metadata. */
         internal const val PHASE_OBJECT_OVERHEAD_BYTES = 65_536L
         internal const val SORT_SCRATCH_BYTES = 16_384L
-        internal fun phasePeakBytes(directoryEntries: Int) = FIXED_PHASE_BYTES + SORT_SCRATCH_BYTES +
-            PHASE_OBJECT_OVERHEAD_BYTES + 64L + directoryEntries * 128L
+        internal fun phasePeakBytes(directoryEntries: Int) = generationMemoryReceipt(directoryEntries).phasePeakBytes
         internal const val PAGE_MAGIC = 0x4d334350
         private const val ROOT_FILE = "root.m3cow"
         private const val DIRECTORY_FILE = "directory.m3cow"
@@ -349,7 +388,7 @@ internal class CanonicalCowGeneration private constructor(
             val entries = root.manifest
             require(CowDirectoryEntry.matches(File(directory, DIRECTORY_FILE), entries))
             require(entries.sumOf { it.encodedBytes() } <= DIRECTORY_LIMIT_BYTES)
-            require(64L + entries.size * 128L <= DIRECTORY_LIMIT_BYTES)
+            require(Math.addExact(64L, Math.multiplyExact(entries.size.toLong(), 128L)) <= DIRECTORY_LIMIT_BYTES)
             val currentFile = File(directory, CURRENT_UNACKED_FILE)
             require(
                 validateCurrent(currentFile, root.current) ||
@@ -370,8 +409,10 @@ internal class CanonicalCowGeneration private constructor(
             val expectedNames = entries.mapTo(mutableSetOf()) { it.file } + setOf(ROOT_FILE, DIRECTORY_FILE) +
                 if (currentFile.exists()) setOf(CURRENT_UNACKED_FILE) else emptySet()
             require(directory.listFiles().orEmpty().mapTo(mutableSetOf()) { it.name } == expectedNames)
+            val memory = generationMemoryReceipt(entries.size)
             val storage = CowStorageReceipt(
-                directory.listFiles().orEmpty().sumOf { allocated(it) }, entries.size, phasePeakBytes(entries.size),
+                directory.listFiles().orEmpty().sumOf { allocated(it) }, entries.size, memory.phasePeakBytes,
+                memory.indexRetainedBytes, memory.indexConstructionPeakBytes,
             )
             require(storage.phasePeakBytes <= DIRECTORY_LIMIT_BYTES)
             CanonicalCowGeneration(directory, root, entries, storage).also { generation ->
@@ -526,18 +567,19 @@ internal data class CowDirectoryEntry(val kind: CowFragmentKind, val page: Int, 
  * lookup only visits ranges whose key interval can contain the requested key.
  */
 private class CowDirectoryIndex(entries: List<CowDirectoryEntry>) {
-    private val byKind = Array(CowFragmentKind.entries.size) { kind ->
+    val memoryReceipt: CowIndexMemoryReceipt = memoryReceiptForEntryCount(entries.size)
+    private var byKind: Array<Array<CowDirectoryEntry>?> = Array(CowFragmentKind.entries.size) { kind ->
         entries.filter { it.kind.ordinal == kind }.sortedBy { it.page }.toTypedArray()
     }
-    private val byKey = Array(CowFragmentKind.entries.size) { kind ->
-        byKind[kind].sortedWith { left, right ->
+    private var byKey: Array<Array<CowDirectoryEntry>?> = Array(CowFragmentKind.entries.size) { kind ->
+        byKind[kind]!!.sortedWith { left, right ->
             val minimum = java.lang.Long.compareUnsigned(left.minimumKey, right.minimumKey)
             if (minimum != 0) minimum else java.lang.Long.compareUnsigned(left.maximumKey, right.maximumKey)
         }.toTypedArray()
     }
-    private val prefixMaximum = Array(CowFragmentKind.entries.size) { kind ->
-        LongArray(byKey[kind].size).also { maxima ->
-            byKey[kind].forEachIndexed { index, entry ->
+    private var prefixMaximum: Array<LongArray?> = Array(CowFragmentKind.entries.size) { kind ->
+        LongArray(byKey[kind]!!.size).also { maxima ->
+            byKey[kind]!!.forEachIndexed { index, entry ->
                 maxima[index] = if (index == 0 ||
                     java.lang.Long.compareUnsigned(entry.maximumKey, maxima[index - 1]) > 0
                 ) entry.maximumKey else maxima[index - 1]
@@ -545,9 +587,15 @@ private class CowDirectoryIndex(entries: List<CowDirectoryEntry>) {
         }
     }
 
-    fun entries(kind: CowFragmentKind): Array<CowDirectoryEntry> = byKind[kind.ordinal]
+    fun close() {
+        byKind.fill(null)
+        byKey.fill(null)
+        prefixMaximum.fill(null)
+    }
 
-    fun pageCount(kind: CowFragmentKind): Long = byKind[kind.ordinal].size.toLong()
+    fun entries(kind: CowFragmentKind): Array<CowDirectoryEntry> = byKind[kind.ordinal] ?: emptyArray()
+
+    fun pageCount(kind: CowFragmentKind): Long = byKind[kind.ordinal]?.size?.toLong() ?: 0L
 
     fun matchingPageCount(kind: CowFragmentKind, key: Long): Long {
         var count = 0L
@@ -556,9 +604,9 @@ private class CowDirectoryIndex(entries: List<CowDirectoryEntry>) {
     }
 
     fun forEachMatching(kind: CowFragmentKind, key: Long, action: (CowDirectoryEntry) -> Boolean): Boolean {
-        val ranges = byKey[kind.ordinal]
+        val ranges = byKey[kind.ordinal] ?: return true
         if (ranges.isEmpty()) return true
-        val maxima = prefixMaximum[kind.ordinal]
+        val maxima = prefixMaximum[kind.ordinal] ?: return true
         var low = 0
         var high = ranges.size
         while (low < high) {
@@ -580,6 +628,39 @@ private class CowDirectoryIndex(entries: List<CowDirectoryEntry>) {
             ) return false
         }
         return true
+    }
+
+    companion object {
+        private const val OBJECT_HEADER_BYTES = 32L
+        private const val ARRAY_HEADER_BYTES = 24L
+        private const val REFERENCE_BYTES = 8L
+        private const val LONG_BYTES = 8L
+        /** Temporary filter/sort lists and arrays retained while the index is built. */
+        private const val TEMPORARY_BYTES_PER_ENTRY = 96L
+
+        fun memoryReceiptForEntryCount(entryCount: Int): CowIndexMemoryReceipt {
+            require(entryCount >= 0)
+            val kinds = CowFragmentKind.entries.size.toLong()
+            val outerArrays = Math.addExact(
+                Math.addExact(OBJECT_HEADER_BYTES, Math.multiplyExact(3L, ARRAY_HEADER_BYTES)),
+                Math.multiplyExact(Math.multiplyExact(3L, kinds), REFERENCE_BYTES),
+            )
+            val innerHeaders = Math.multiplyExact(Math.multiplyExact(3L, kinds), ARRAY_HEADER_BYTES)
+            val retainedPerEntry = Math.addExact(Math.multiplyExact(2L, REFERENCE_BYTES), LONG_BYTES)
+            val retained = Math.addExact(
+                Math.addExact(outerArrays, innerHeaders),
+                Math.multiplyExact(entryCount.toLong(), retainedPerEntry),
+            )
+            val temporaryHeaders = Math.addExact(
+                Math.multiplyExact(2L, OBJECT_HEADER_BYTES),
+                Math.multiplyExact(3L, ARRAY_HEADER_BYTES),
+            )
+            val temporary = Math.addExact(
+                temporaryHeaders,
+                Math.multiplyExact(entryCount.toLong(), TEMPORARY_BYTES_PER_ENTRY),
+            )
+            return CowIndexMemoryReceipt(retained, Math.addExact(retained, temporary))
+        }
     }
 }
 
@@ -676,7 +757,13 @@ internal data class CowGenerationIdentity(val hash: CanonicalReceiptBytes) {
     }
 }
 
-internal data class CowStorageReceipt(val allocatedBytes: Long, val directoryEntries: Int, val phasePeakBytes: Long)
+internal data class CowStorageReceipt(
+    val allocatedBytes: Long,
+    val directoryEntries: Int,
+    val phasePeakBytes: Long,
+    val indexRetainedBytes: Long = 0L,
+    val indexConstructionPeakBytes: Long = 0L,
+)
 internal data class CowReadWork(
     val pages: Long,
     val records: Long,
