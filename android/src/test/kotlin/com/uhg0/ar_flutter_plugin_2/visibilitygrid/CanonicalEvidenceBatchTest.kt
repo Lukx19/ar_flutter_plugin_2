@@ -6,6 +6,33 @@ import org.junit.Test
 
 class CanonicalEvidenceBatchTest {
     @Test
+    fun `small journal budget refuses before source support materialization`() {
+        val view = TestView(
+            listOf(surface(1, 0)),
+            high = 2,
+            geometry = 7,
+            lineage = 5,
+        )
+        val preparation = MutableCanonicalOverlay.prepare(
+            view,
+            SurfaceOwnershipConfiguration(changeJournalByteCapacity = 200),
+            CanonicalEvidenceBatchCommand(
+                "over-budget", 7, 5,
+                listOf(DepthEvidenceChange.Relocate(
+                    SurfaceId(1), CanonicalTarget(SurfaceId(1), Voxel(10, 0, 0), 0, 0, 192),
+                )),
+            ),
+        )
+        assertTrue(preparation is CanonicalMutationPreparation.Refused)
+        assertEquals(
+            CanonicalMutationRefusal.JOURNAL_EXHAUSTED,
+            (preparation as CanonicalMutationPreparation.Refused).reason,
+        )
+        assertEquals(0, view.sourceMaterializationReads)
+        assertEquals(0, view.supportPageReads)
+    }
+
+    @Test
     fun `refine must address the source voxel and does not mutate structure`() {
         val view = TestView(
             listOf(surface(1, 0), surface(2, 1), surface(3, 2)),
@@ -128,6 +155,35 @@ class CanonicalEvidenceBatchTest {
         }
     }
 
+    @Test
+    fun `relocation replaces existing source lineage without inflating the count`() {
+        val view = TestView(
+            listOf(surface(1, 0), surface(2, 1), surface(3, 2)),
+            high = 4,
+            geometry = 7,
+            lineage = 5,
+            outgoingLineage = mapOf(1L to listOf(8L, 9L)),
+        )
+        val preparation = MutableCanonicalOverlay.prepare(
+            view,
+            SurfaceOwnershipConfiguration(),
+            CanonicalEvidenceBatchCommand(
+                "relocate-existing-lineage", 7, 5,
+                listOf(DepthEvidenceChange.Relocate(
+                    SurfaceId(1), CanonicalTarget(SurfaceId(1), Voxel(10, 0, 0), 0, 0, 192),
+                )),
+            ),
+        ) as CanonicalMutationPreparation.Prepared
+        val plan = preparation.mutation
+        try {
+            assertEquals(4, plan.targetLineageCount)
+            assertEquals(6L, plan.targetLineageRevision)
+            assertEquals(listOf(1L to 1L), dirtyLineage(plan).map { it.source.value to it.target.value })
+        } finally {
+            plan.discard()
+        }
+    }
+
     private fun surface(id: Long, x: Int) = CompactSurface(SurfaceId(id), Voxel(x, 0, 0), 0, 192)
 
     private fun dirtyRows(plan: PreparedCanonicalMutation) = mutableListOf<PreparedRow>().also { values ->
@@ -151,7 +207,10 @@ class CanonicalEvidenceBatchTest {
         high: Long,
         geometry: Long,
         lineage: Long,
+        private val outgoingLineage: Map<Long, List<Long>> = emptyMap(),
     ) : CanonicalStateView {
+        var sourceMaterializationReads = 0
+        var supportPageReads = 0
         private val byId = rows.associateBy { it.id }
         private val byVoxel = rows.associateBy { it.voxel }
         override val cut = CompactCanonicalCut(
@@ -164,19 +223,32 @@ class CanonicalEvidenceBatchTest {
         override fun findByVoxel(voxel: Voxel) = byVoxel[voxel]
         override fun readPage(region: StorageRegion, page: Int, cursor: Int, limit: Int) =
             CompactPage(emptyList(), null, 0)
-        override fun readSourceById(id: SurfaceId) = CanonicalPageRead.Complete(
-            byId[id]?.let { row ->
-                PagedSource(
-                    row.id, row.voxel, row.packedNormal, row.normalConfidence,
-                    CanonicalReceiptBytes(ByteArray(32) { row.id.value.toByte() }),
-                )
-            }, 0, 0,
-        )
+        override fun readSourceById(id: SurfaceId): CanonicalPageRead<PagedSource?> {
+            sourceMaterializationReads++
+            return CanonicalPageRead.Complete(
+                byId[id]?.let { row ->
+                    PagedSource(
+                        row.id, row.voxel, row.packedNormal, row.normalConfidence,
+                        CanonicalReceiptBytes(ByteArray(32) { row.id.value.toByte() }),
+                    )
+                }, 0, 0,
+            )
+        }
         override fun visitSourceSupport(
             target: SurfaceId,
             cursor: SourceSupportCursor?,
             sink: (PagedSupport) -> Boolean,
-        ) = SourceSupportRead.Complete(0, null, 0, 0)
+        ) = SourceSupportRead.Complete(0, null, 0, 0).also { supportPageReads++ }
+        override fun visitLineage(
+            source: SurfaceId,
+            cursor: LineageCursor?,
+            sink: (LineageEdge) -> Boolean,
+        ): LineageRead {
+            outgoingLineage[source.value].orEmpty().drop(cursor?.offset ?: 0).forEach { target ->
+                if (!sink(LineageEdge(source, SurfaceId(target)))) return LineageRead.Complete(1, null)
+            }
+            return LineageRead.Complete(outgoingLineage[source.value].orEmpty().size, null)
+        }
         override fun retainedMemoryReceipt() = error("not used")
         override fun allocatedStorageReceipt() = error("not used")
         override fun close() = Unit

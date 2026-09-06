@@ -343,6 +343,7 @@ internal class MutableCanonicalOverlay private constructor(
         geometry: Long, lineage: Long,
         supportPairs: PreparedSupportPairTable? = null,
         lineagePairs: PreparedLineageTable? = null,
+        removedLineageRecords: Int = 0,
     ): CanonicalMutationPreparation {
         val rowTable = PreparedRowTable.from(rows)
         val removedIds = LongArray(removed.size) { removed[it].value }.also { it.sort() }
@@ -365,10 +366,13 @@ internal class MutableCanonicalOverlay private constructor(
         } catch (_: ArithmeticException) { return refuse(CanonicalMutationRefusal.LINEAGE_EXHAUSTED) }
         if (removedSupportRecords !in 0..view.cut.supportCount.toLong())
             return refuse(CanonicalMutationRefusal.LINEAGE_EXHAUSTED)
-        val encodedBytes = encodedRecordBytes(
+        val encodedBytesBase = encodedRecordBytes(
             rows.size, removed.size, dirtySupportRecords, dirtySourceRecords.toLong(),
             dirtyLineageRecords, commandId,
         ) ?: return refuse(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
+        val encodedBytes = try {
+            Math.addExact(encodedBytesBase, if (kind == PreparedMutationKind.DEPTH_BATCH) 4L else 0L)
+        } catch (_: ArithmeticException) { return refuse(CanonicalMutationRefusal.JOURNAL_EXHAUSTED) }
         if (!journalFits(encodedBytes)) return refuse(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
         val retainedPlanBytes = PLAN_FIXED_OWNER_BYTES + rowTable.allocatedBytes + removedIds.size * 8L +
             (supportPairs?.allocatedBytes ?: supports.allocatedBytes) + (lineagePairs?.allocatedBytes ?: 0L)
@@ -400,7 +404,7 @@ internal class MutableCanonicalOverlay private constructor(
             view.cut, CanonicalReceiptBytes(overlayHash(commandId.encodeToByteArray())),
             CanonicalReceiptBytes(fingerprint), commandId, kind, rowTable, removedIds,
             supports, supportMode, removedSupportRecords.toIntExact(), high, live, sourceCount, supportCount, lineageCount,
-            geometry, lineage, work, supportPairs, lineagePairs,
+            geometry, lineage, work, supportPairs, lineagePairs, removedLineageRecords,
         ))
     }
 
@@ -545,37 +549,62 @@ internal class MutableCanonicalOverlay private constructor(
         var sources = 0L
         var targets = 0L
         var lineage = 0L
+        var removed = 0L
+        var allocations = 0L
+        var minimumSupports = 0L
         fun add(value: Long, current: Long): Long? = try { Math.addExact(current, value) } catch (_: ArithmeticException) { null }
         fun product(left: Int, right: Int): Long? = try { Math.multiplyExact(left.toLong(), right.toLong()) } catch (_: ArithmeticException) { null }
         command.changes.forEach { change ->
             when (change) {
-                is DepthEvidenceChange.Create -> targets = add(1, targets) ?: return null
+                is DepthEvidenceChange.Create -> {
+                    targets = add(1, targets) ?: return null
+                    allocations = add(1, allocations) ?: return null
+                    minimumSupports = add(1, minimumSupports) ?: return null
+                }
                 is DepthEvidenceChange.Refine,
                 is DepthEvidenceChange.Relocate -> {
                     sources = add(1, sources) ?: return null
                     targets = add(1, targets) ?: return null
-                    if (change is DepthEvidenceChange.Relocate) lineage = add(1, lineage) ?: return null
+                    if (change is DepthEvidenceChange.Relocate) {
+                        lineage = add(1, lineage) ?: return null
+                        removed = add(1, removed) ?: return null
+                        minimumSupports = add(1, minimumSupports) ?: return null
+                    }
                 }
                 is DepthEvidenceChange.Merge -> {
                     sources = add(change.sourceIds.size.toLong(), sources) ?: return null
                     targets = add(1, targets) ?: return null
                     lineage = add(change.sourceIds.size.toLong(), lineage) ?: return null
+                    removed = add(change.sourceIds.size.toLong(), removed) ?: return null
+                    minimumSupports = add(change.sourceIds.size.toLong(), minimumSupports) ?: return null
+                    allocations = add(1, allocations) ?: return null
                 }
                 is DepthEvidenceChange.Split -> {
                     sources = add(1, sources) ?: return null
                     targets = add(change.targets.size.toLong(), targets) ?: return null
                     lineage = add(product(1, change.targets.size) ?: return null, lineage) ?: return null
+                    removed = add(1, removed) ?: return null
+                    minimumSupports = add(change.targets.size.toLong(), minimumSupports) ?: return null
+                    allocations = add(change.targets.size.toLong(), allocations) ?: return null
                 }
                 is DepthEvidenceChange.Replace -> {
                     sources = add(change.sourceIds.size.toLong(), sources) ?: return null
                     targets = add(change.targets.size.toLong(), targets) ?: return null
                     lineage = add(product(change.sourceIds.size, change.targets.size) ?: return null, lineage) ?: return null
+                    removed = add(change.sourceIds.size.toLong(), removed) ?: return null
+                    minimumSupports = add(product(change.sourceIds.size, change.targets.size) ?: return null, minimumSupports) ?: return null
+                    allocations = add(change.targets.size.toLong(), allocations) ?: return null
                 }
-                is DepthEvidenceChange.Remove -> sources = add(1, sources) ?: return null
+                is DepthEvidenceChange.Remove -> {
+                    sources = add(1, sources) ?: return null
+                    removed = add(1, removed) ?: return null
+                }
             }
         }
         if (sources > sourceCapacity() || targets > configuration.surfaceCapacity || lineage > configuration.lineageCapacity) return null
-        return DepthBatchScalars(sources.toInt(), targets.toInt(), lineage)
+        return DepthBatchScalars(
+            sources.toInt(), targets.toInt(), lineage, removed.toInt(), allocations.toInt(), minimumSupports,
+        )
     }
 
     private fun prepareEvidenceBatch(command: CanonicalEvidenceBatchCommand): CanonicalMutationPreparation {
@@ -590,8 +619,15 @@ internal class MutableCanonicalOverlay private constructor(
         if (command.changes.size > configuration.surfaceCapacity + configuration.lineageCapacity) {
             return refuse(CanonicalMutationRefusal.CAPACITY)
         }
+        val scalarEncodedBase = encodedRecordBytes(
+            scalars.targetRows, scalars.removedRows, scalars.minimumSupportPairs,
+            scalars.allocatedRows.toLong(), scalars.lineageEdges, command.commandId,
+        ) ?: return refuse(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
+        val scalarEncodedBytes = try { Math.addExact(scalarEncodedBase, 4L) }
+            catch (_: ArithmeticException) { return refuse(CanonicalMutationRefusal.JOURNAL_EXHAUSTED) }
+        if (!journalFits(scalarEncodedBytes)) return refuse(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
 
-        data class Operation(val kind: Int, val sources: List<SurfaceId>, val targets: IntArray)
+        data class Operation(val kind: DepthBatchOperationKind, val sources: List<SurfaceId>, val targets: IntArray)
         val operations = ArrayList<Operation>(command.changes.size)
         val sources = ArrayList<SurfaceId>(scalars.sourceReferences)
         val structuralSources = HashSet<SurfaceId>(scalars.sourceReferences)
@@ -615,51 +651,51 @@ internal class MutableCanonicalOverlay private constructor(
                     if (change.target.id != null) return refuse(CanonicalMutationRefusal.INVALID_COMMAND)
                     val target = addTarget(change.target.copy(id = null))
                     if (target < 0) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                    operations += Operation(CHANGE_CREATE, emptyList(), intArrayOf(target))
+                    operations += Operation(DepthBatchOperationKind.CREATE, emptyList(), intArrayOf(target))
                 }
                 is DepthEvidenceChange.Refine -> {
-                    if (change.target.id != change.sourceId || !addSource(change.sourceId, false)) {
+                    if (change.target.id != change.sourceId || !addSource(change.sourceId, DepthBatchOperationKind.REFINE.structural)) {
                         return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
                     }
                     val target = addTarget(change.target.copy(id = change.sourceId))
                     if (target < 0) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                    operations += Operation(CHANGE_REFINE, listOf(change.sourceId), intArrayOf(target))
+                    operations += Operation(DepthBatchOperationKind.REFINE, listOf(change.sourceId), intArrayOf(target))
                 }
                 is DepthEvidenceChange.Relocate -> {
-                    if (change.target.id != change.sourceId || !addSource(change.sourceId, true)) {
+                    if (change.target.id != change.sourceId || !addSource(change.sourceId, DepthBatchOperationKind.RELOCATE.structural)) {
                         return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
                     }
                     val target = addTarget(change.target.copy(id = change.sourceId))
                     if (target < 0) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                    operations += Operation(CHANGE_RELOCATE, listOf(change.sourceId), intArrayOf(target))
+                    operations += Operation(DepthBatchOperationKind.RELOCATE, listOf(change.sourceId), intArrayOf(target))
                 }
                 is DepthEvidenceChange.Merge -> {
                     if (change.sourceIds.size < 2 || change.target.id != null ||
-                        change.sourceIds.any { !addSource(it, true) }
+                        change.sourceIds.any { !addSource(it, DepthBatchOperationKind.MERGE.structural) }
                     ) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
                     val target = addTarget(change.target.copy(id = null))
                     if (target < 0) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                    operations += Operation(CHANGE_MERGE, change.sourceIds.toList(), intArrayOf(target))
+                    operations += Operation(DepthBatchOperationKind.MERGE, change.sourceIds.toList(), intArrayOf(target))
                 }
                 is DepthEvidenceChange.Split -> {
-                    if (change.targets.size < 2 || !addSource(change.sourceId, true) ||
+                    if (change.targets.size < 2 || !addSource(change.sourceId, DepthBatchOperationKind.SPLIT.structural) ||
                         change.targets.any { it.id != null }
                     ) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
                     val targetIndexes = IntArray(change.targets.size) { index -> addTarget(change.targets[index].copy(id = null)) }
                     if (targetIndexes.any { it < 0 }) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                    operations += Operation(CHANGE_SPLIT, listOf(change.sourceId), targetIndexes)
+                    operations += Operation(DepthBatchOperationKind.SPLIT, listOf(change.sourceId), targetIndexes)
                 }
                 is DepthEvidenceChange.Replace -> {
                     if (change.sourceIds.isEmpty() || change.targets.isEmpty() ||
-                        change.sourceIds.any { !addSource(it, true) } || change.targets.any { it.id != null }
+                        change.sourceIds.any { !addSource(it, DepthBatchOperationKind.REPLACE.structural) } || change.targets.any { it.id != null }
                     ) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
                     val targetIndexes = IntArray(change.targets.size) { index -> addTarget(change.targets[index].copy(id = null)) }
                     if (targetIndexes.any { it < 0 }) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                    operations += Operation(CHANGE_REPLACE, change.sourceIds.toList(), targetIndexes)
+                    operations += Operation(DepthBatchOperationKind.REPLACE, change.sourceIds.toList(), targetIndexes)
                 }
                 is DepthEvidenceChange.Remove -> {
-                    if (!addSource(change.sourceId, true)) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                    operations += Operation(CHANGE_REMOVE, listOf(change.sourceId), IntArray(0))
+                    if (!addSource(change.sourceId, DepthBatchOperationKind.REMOVE.structural)) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
+                    operations += Operation(DepthBatchOperationKind.REMOVE, listOf(change.sourceId), IntArray(0))
                 }
             }
         }
@@ -672,7 +708,7 @@ internal class MutableCanonicalOverlay private constructor(
             val row = view.findById(source) ?: return refuse(CanonicalMutationRefusal.UNKNOWN_IDENTITY)
             sourceRows[source] = row
         }
-        operations.filter { it.kind == CHANGE_REFINE }.forEach { operation ->
+        operations.filter { it.kind == DepthBatchOperationKind.REFINE }.forEach { operation ->
             val source = operation.sources.single()
             val target = targets[operation.targets.single()]
             if (sourceRows[source]?.voxel != target.voxel) {
@@ -692,8 +728,32 @@ internal class MutableCanonicalOverlay private constructor(
             }
         }
         if (structuralSources.isNotEmpty() && view.cut.lineageRevision >= configuration.revisionLimit &&
-            operations.any { it.kind in setOf(CHANGE_RELOCATE, CHANGE_MERGE, CHANGE_SPLIT, CHANGE_REPLACE) }
+            operations.any { it.kind.lineageChanged }
         ) return refuse(CanonicalMutationRefusal.REVISION_EXHAUSTED)
+
+        val outgoingLineage = HashMap<SurfaceId, Int>()
+        fun readOutgoingLineage(source: SurfaceId): Int? {
+            outgoingLineage[source]?.let { return it }
+            var cursor: LineageCursor? = null
+            var count = 0L
+            var pages = 0
+            do {
+                val read = view.visitLineage(source, cursor) {
+                    count++
+                    count <= configuration.lineageCapacity.toLong()
+                }
+                when (read) {
+                    is LineageRead.Refused -> return null
+                    is LineageRead.Complete -> {
+                        cursor = read.nextCursor
+                        if (++pages > configuration.lineageCapacity) return null
+                    }
+                }
+            } while (cursor != null)
+            if (count > Int.MAX_VALUE.toLong()) return null
+            return count.toInt().also { outgoingLineage[source] = it }
+        }
+        val removedLineageRecords = structuralSources.sumOf { readOutgoingLineage(it) ?: return refuse(CanonicalMutationRefusal.SOURCE_READ_FAILURE) }
 
         data class SupportDetails(val values: List<ImmutableSourceSupport>, val records: Int)
         val details = HashMap<SurfaceId, SupportDetails>()
@@ -750,14 +810,15 @@ internal class MutableCanonicalOverlay private constructor(
         var supportPairCount = 0L
         operations.forEach { operation ->
             val sourceSupportCount = when (operation.kind) {
-                CHANGE_CREATE -> 0L
-                CHANGE_REFINE, CHANGE_REMOVE -> 0L
+                DepthBatchOperationKind.CREATE,
+                DepthBatchOperationKind.REFINE,
+                DepthBatchOperationKind.REMOVE -> 0L
                 else -> operation.sources.sumOf { readDetails(it)?.values?.size?.toLong() ?: 0L }
             }
-            val contribution = when (operation.kind) {
-                CHANGE_CREATE -> operation.targets.size.toLong()
-                CHANGE_REFINE, CHANGE_REMOVE -> 0L
-                else -> try { Math.multiplyExact(sourceSupportCount, operation.targets.size.toLong()) }
+            val contribution = when (operation.kind.supportMode) {
+                DepthBatchSupportMode.SELF -> operation.targets.size.toLong()
+                DepthBatchSupportMode.NONE -> 0L
+                DepthBatchSupportMode.SOURCE_TO_TARGETS -> try { Math.multiplyExact(sourceSupportCount, operation.targets.size.toLong()) }
                     catch (_: ArithmeticException) { return refuse(CanonicalMutationRefusal.JOURNAL_EXHAUSTED) }
             }
             supportPairCount = try { Math.addExact(supportPairCount, contribution) }
@@ -795,21 +856,14 @@ internal class MutableCanonicalOverlay private constructor(
             supportPairs += PreparedSupport(SurfaceId(allocatedIds[targetIndex]), source)
         }
         operations.forEach { operation ->
-            when (operation.kind) {
-                CHANGE_CREATE -> rows[operation.targets.single()].let { row ->
+            when (operation.kind.supportMode) {
+                DepthBatchSupportMode.SELF -> rows[operation.targets.single()].let { row ->
                     addSupport(operation.targets.single(), ImmutableSourceSupport(
                         row.id, row.voxel, row.packedNormal, row.normalConfidence,
                         CanonicalReceiptBytes(row.allocatedBy.copyOf()),
                     ))
                 }
-                CHANGE_REFINE -> Unit
-                CHANGE_RELOCATE -> {
-                    val source = operation.sources.single()
-                    removedSupportTargets += source
-                    readDetails(source)?.values.orEmpty().forEach { addSupport(operation.targets.single(), it) }
-                    lineagePairs += LineageEdge(source, SurfaceId(allocatedIds[operation.targets.single()]))
-                }
-                CHANGE_MERGE, CHANGE_SPLIT, CHANGE_REPLACE -> {
+                DepthBatchSupportMode.SOURCE_TO_TARGETS -> {
                     operation.sources.forEach { removedSupportTargets += it }
                     val union = operation.sources.flatMap { readDetails(it)?.values.orEmpty() }
                         .distinctBy { it.id.value }.sortedBy { it.id.value }
@@ -818,7 +872,9 @@ internal class MutableCanonicalOverlay private constructor(
                         lineagePairs += LineageEdge(source, SurfaceId(allocatedIds[target]))
                     } }
                 }
-                CHANGE_REMOVE -> removedSupportTargets += operation.sources.single()
+                DepthBatchSupportMode.NONE -> if (operation.kind.structural) {
+                    removedSupportTargets += operation.sources.single()
+                }
             }
         }
         val distinctSupports = supportPairs.distinctBy { it.target.value to it.source.id.value }
@@ -826,35 +882,31 @@ internal class MutableCanonicalOverlay private constructor(
         val distinctLineage = lineagePairs.distinctBy { it.source.value to it.target.value }
             .sortedWith(compareBy<LineageEdge> { it.source.value }.thenBy { it.target.value })
         val targetLive = view.cut.liveSurfaceCount + operations.sumOf { operation ->
-            when (operation.kind) {
-                CHANGE_CREATE -> operation.targets.size
-                CHANGE_REFINE, CHANGE_RELOCATE -> 0
-                CHANGE_MERGE -> 1 - operation.sources.size
-                CHANGE_SPLIT -> operation.targets.size - 1
-                CHANGE_REPLACE -> operation.targets.size - operation.sources.size
-                CHANGE_REMOVE -> -operation.sources.size
-                else -> 0
-            }
+            operation.kind.liveDelta(operation.sources.size, operation.targets.size)
         }
         val removedSupportRecords = removedSupportTargets.sumOf { readDetails(it)?.records ?: 0 }
         val targetSupport = view.cut.supportCount - removedSupportRecords + distinctSupports.size
         val allocations = targets.count { it.id == null }
         val targetSource = view.cut.sourceCount + allocations
-        val targetLineage = view.cut.lineageCount + distinctLineage.size
+        val targetLineage = view.cut.lineageCount - removedLineageRecords + distinctLineage.size
         if (targetLive !in 0..configuration.surfaceCapacity ||
             targetSource !in 0..sourceCapacity() || targetSupport !in 0..sourceCapacity() ||
             targetLineage !in 0..configuration.lineageCapacity
         ) return refuse(CanonicalMutationRefusal.CAPACITY)
-        val estimated = encodedRecordBytes(rows.size, structuralSources.size, distinctSupports.size.toLong(), allocations.toLong(), distinctLineage.size.toLong(), command.commandId)
+        val estimatedBase = encodedRecordBytes(rows.size, structuralSources.size, distinctSupports.size.toLong(), allocations.toLong(), distinctLineage.size.toLong(), command.commandId)
             ?: return refuse(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
+        val estimated = try { Math.addExact(estimatedBase, 4L) }
+            catch (_: ArithmeticException) { return refuse(CanonicalMutationRefusal.JOURNAL_EXHAUSTED) }
         if (!journalFits(estimated)) return refuse(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
-        val lineageChanged = operations.any { it.kind !in setOf(CHANGE_CREATE, CHANGE_REFINE) }
+        val lineageChanged = operations.any { it.kind.lineageChanged }
         return finish(
-            command.commandId, PreparedMutationKind.DEPTH_BATCH, command.fingerprint(), rows,
+            command.commandId, PreparedMutationKind.DEPTH_BATCH, command.fingerprint(),
+            rows.sortedWith { left, right -> java.lang.Long.compareUnsigned(left.id.value, right.id.value) },
             structuralSources.sortedBy { it.value }, PreparedSourceTable.EMPTY, PreparedSupportMode.NONE,
             high, targetLive, targetSource, targetSupport, targetLineage,
             view.cut.geometryRevision + 1, view.cut.lineageRevision + if (lineageChanged) 1 else 0,
             PreparedSupportPairTable.from(distinctSupports), PreparedLineageTable.from(distinctLineage),
+            removedLineageRecords,
         )
     }
 
@@ -1031,7 +1083,36 @@ private data class DepthBatchScalars(
     val sourceReferences: Int,
     val targetRows: Int,
     val lineageEdges: Long,
+    val removedRows: Int,
+    val allocatedRows: Int,
+    val minimumSupportPairs: Long,
 )
+
+private enum class DepthBatchSupportMode { NONE, SELF, SOURCE_TO_TARGETS }
+
+/** Semantic operation policy for one depth batch; no persisted/kernel ordinals are reused. */
+private enum class DepthBatchOperationKind(
+    val structural: Boolean,
+    val lineageChanged: Boolean,
+    val supportMode: DepthBatchSupportMode,
+) {
+    CREATE(false, false, DepthBatchSupportMode.SELF),
+    REFINE(false, false, DepthBatchSupportMode.NONE),
+    RELOCATE(true, true, DepthBatchSupportMode.SOURCE_TO_TARGETS),
+    MERGE(true, true, DepthBatchSupportMode.SOURCE_TO_TARGETS),
+    SPLIT(true, true, DepthBatchSupportMode.SOURCE_TO_TARGETS),
+    REPLACE(true, true, DepthBatchSupportMode.SOURCE_TO_TARGETS),
+    REMOVE(true, true, DepthBatchSupportMode.NONE);
+
+    fun liveDelta(sourceCount: Int, targetCount: Int): Int = when (this) {
+        CREATE -> targetCount
+        REFINE, RELOCATE -> 0
+        MERGE -> 1 - sourceCount
+        SPLIT -> targetCount - 1
+        REPLACE -> targetCount - sourceCount
+        REMOVE -> -sourceCount
+    }
+}
 
 /** One depth-kernel delta admitted as one canonical surface transaction. */
 internal class CanonicalEvidenceBatchCommand(
@@ -1232,6 +1313,7 @@ internal class PreparedCanonicalMutation(
     val work: CanonicalMutationWork,
     private val supportPairs: PreparedSupportPairTable? = null,
     private val lineagePairs: PreparedLineageTable? = null,
+    val removedLineageRecords: Int = 0,
 ) : AutoCloseable {
     private var lifecycle = PreparedMutationLifecycle.READY
     private var discardPending = false
@@ -1359,7 +1441,8 @@ internal class PreparedCanonicalMutation(
 
     private fun writeTo(output: java.io.OutputStream, magic: Int) {
         val out = DataOutputStream(output)
-        out.writeInt(magic); out.writeInt(BODY_VERSION); out.write(sourceCut.rootHash.toByteArray())
+        val bodyVersion = if (kind == PreparedMutationKind.DEPTH_BATCH) DEPTH_BODY_VERSION else BODY_VERSION
+        out.writeInt(magic); out.writeInt(bodyVersion); out.write(sourceCut.rootHash.toByteArray())
         out.writeUTF(commandId); out.writeInt(kind.ordinal)
         out.write(commandHash.toByteArray()); out.write(commandFingerprint.toByteArray())
         out.writeLong(targetHighWater); out.writeInt(targetLiveSurfaceCount)
@@ -1368,6 +1451,7 @@ internal class PreparedCanonicalMutation(
         out.writeInt(rows.size); rows.writeRecords(out)
         out.writeInt(removedIds.size); removedIds.forEach(out::writeLong)
         out.writeInt(removedSupportRecords)
+        if (bodyVersion >= DEPTH_BODY_VERSION) out.writeInt(removedLineageRecords)
         out.writeInt(work.dirtySupportRecords)
         supportPairs?.writeTo(out) ?: when (supportMode) {
             PreparedSupportMode.NONE -> Unit
@@ -1385,6 +1469,7 @@ internal class PreparedCanonicalMutation(
         private const val WAL_MAGIC = 0x4d33574c
         private const val CURRENT_MAGIC = 0x4d334350
         private const val BODY_VERSION = 2
+        private const val DEPTH_BODY_VERSION = 3
     }
 }
 
@@ -1654,11 +1739,3 @@ internal fun validM3CommandId(value: String): Boolean =
     value.isNotBlank() && modifiedUtf8Length(value) in 1..CANONICAL_SURFACE_COMMAND_MODIFIED_UTF_BYTES
 
 private fun overlayHash(bytes: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(bytes)
-
-private const val CHANGE_CREATE = 0
-private const val CHANGE_REFINE = 1
-private const val CHANGE_RELOCATE = 2
-private const val CHANGE_MERGE = 3
-private const val CHANGE_SPLIT = 4
-private const val CHANGE_REPLACE = 5
-private const val CHANGE_REMOVE = 6

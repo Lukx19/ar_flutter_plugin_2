@@ -145,12 +145,14 @@ internal class PreparedIntentStreamingVisitor(
                         require(id > 0 && id < header.sourceCut.nextSurfaceIdHighWater && unsignedAfter(id, previousRemoved)); previousRemoved = id
                         if (!call { visitor.onRemovedId(id) }) return stoppedOrClosed()
                     }
-                    val removedSupports = if (bodyVersion >= BODY_VERSION) count(input, output, 300_000) else {
+                    val removedSupports = if (bodyVersion >= REMOVED_SUPPORT_BODY_VERSION) count(input, output, 300_000) else {
                         if (kind !in LEGACY_DERIVABLE_KINDS)
                             return refused(PreparedIntentVisitRefusal.UNVERIFIABLE_LEGACY_STRUCTURAL_CARDINALITY)
                         0
                     }
                     require(removedSupports <= header.sourceCut.supportCount)
+                    val removedLineage = if (bodyVersion >= DEPTH_BODY_VERSION) count(input, output, 200_000) else 0
+                    require(removedLineage <= header.sourceCut.lineageCount)
                     val supports = count(input, output, 300_000)
                     var previousSupportTarget = 0L; var previousSupportSource = 0L
                     repeat(supports) {
@@ -177,7 +179,7 @@ internal class PreparedIntentStreamingVisitor(
                     }
                     require(input.read() == -1)
                     require(newRows == sources && header.targetHighWater == allocationEnd(header.sourceCut.nextSurfaceIdHighWater, newRows))
-                    require(validCardinality(kind, header, rows, removed, removedSupports, supports, sources, lineage))
+                    require(validCardinality(kind, header, rows, removed, removedSupports, removedLineage, supports, sources, lineage))
                     output.flush()
                     val receipt = PreparedIntentCurrentReceipt(counter.count, CanonicalReceiptBytes(digest.digest()))
                     require(receipt.length == header.currentLength && receipt.hash == header.currentHash)
@@ -192,7 +194,7 @@ internal class PreparedIntentStreamingVisitor(
         }
     }
 
-    private fun validCardinality(kind: PreparedMutationKind, header: DirtyIntentHeader, rows: Int, removed: Int, removedSupports: Int, supports: Int, sources: Int, lineage: Int): Boolean {
+    private fun validCardinality(kind: PreparedMutationKind, header: DirtyIntentHeader, rows: Int, removed: Int, removedSupports: Int, removedLineage: Int, supports: Int, sources: Int, lineage: Int): Boolean {
         if (header.targetSource != header.sourceCut.sourceCount + sources) return false
         if (header.targetLive !in (header.sourceCut.liveSurfaceCount - removed)..(header.sourceCut.liveSurfaceCount - removed + rows)) return false
         val expectedSupport = try {
@@ -208,7 +210,7 @@ internal class PreparedIntentStreamingVisitor(
                 header.targetLineage == header.sourceCut.lineageCount
             PreparedMutationKind.DEPTH_BATCH ->
                 header.targetLive in (header.sourceCut.liveSurfaceCount - removed)..(header.sourceCut.liveSurfaceCount - removed + rows) &&
-                    header.targetLineage == header.sourceCut.lineageCount + lineage
+                    header.targetLineage == header.sourceCut.lineageCount - removedLineage + lineage
             PreparedMutationKind.CREATE -> header.sourceCut.liveSurfaceCount == 0 && header.sourceCut.sourceCount == 0 && header.sourceCut.supportCount == 0 && header.sourceCut.lineageCount == 0 && removed == 0 && rows > 0 && supports == rows && sources == rows && lineage == 0 && header.targetLive == rows && header.targetSupport == rows && header.targetLineage == 0
             else -> rows > 0 && removed > 0 && lineage.toLong() == rows.toLong() * removed.toLong() && header.targetLive == header.sourceCut.liveSurfaceCount - removed + rows && header.targetLineage == header.sourceCut.lineageCount + lineage
         }
@@ -253,7 +255,9 @@ internal class PreparedIntentStreamingVisitor(
         const val WAL_MAGIC = 0x4d33574c
         const val CURRENT_MAGIC = 0x4d334350
         const val LEGACY_BODY_VERSION = 1
-        const val BODY_VERSION = 2
+        const val REMOVED_SUPPORT_BODY_VERSION = 2
+        const val DEPTH_BODY_VERSION = 3
+        const val BODY_VERSION = DEPTH_BODY_VERSION
         const val UINT32_END = 0x1_0000_0000L
         val LEGACY_DERIVABLE_KINDS = setOf(
             PreparedMutationKind.FEATURE_ADD,

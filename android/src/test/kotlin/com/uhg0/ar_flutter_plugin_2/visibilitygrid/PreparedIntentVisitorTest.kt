@@ -257,6 +257,58 @@ class PreparedIntentVisitorTest {
     }
 
     @Test
+    fun `depth create followed by relocation writes rows in canonical ID order`() {
+        val rows = listOf(scenarioSurface(1, 0), scenarioSurface(2, 1), scenarioSurface(3, 2))
+        val sources = rows.map { scenarioSource(it.id.value, it.voxel.x) }
+        val active = scenarioView(
+            "depth-order", rows, geometry = 7, lineage = 5, high = 4,
+            sources = sources,
+            supports = rows.associate { row -> row.id.value to listOf(scenarioSource(row.id.value, row.voxel.x)) },
+        )
+        val plan = prepare(active, CanonicalEvidenceBatchCommand(
+            "depth-order", 7, 5,
+            listOf(
+                DepthEvidenceChange.Create(scenarioTarget(4)),
+                DepthEvidenceChange.Relocate(SurfaceId(1), scenarioTarget(10, SurfaceId(1))),
+            ),
+        ))
+        val directory = Files.createTempDirectory("canonical-surface-depth-order-").toFile()
+        try {
+            val prepared = intent(directory, active, plan)
+            assertTrue(prepared.visit(CountingVisitor()) is PreparedIntentVisitResult.Complete)
+        } finally {
+            directory.deleteRecursively()
+            plan.discard()
+        }
+    }
+
+    @Test
+    fun `descending depth refine IDs remain a valid canonical WAL`() {
+        val rows = listOf(scenarioSurface(1, 0), scenarioSurface(2, 1), scenarioSurface(3, 2))
+        val sources = rows.map { scenarioSource(it.id.value, it.voxel.x) }
+        val active = scenarioView(
+            "depth-refine-order", rows, geometry = 7, lineage = 5, high = 4,
+            sources = sources,
+            supports = rows.associate { row -> row.id.value to listOf(scenarioSource(row.id.value, row.voxel.x)) },
+        )
+        val plan = prepare(active, CanonicalEvidenceBatchCommand(
+            "depth-refine-order", 7, 5,
+            listOf(
+                DepthEvidenceChange.Refine(SurfaceId(3), scenarioTarget(2, SurfaceId(3))),
+                DepthEvidenceChange.Refine(SurfaceId(1), scenarioTarget(0, SurfaceId(1))),
+            ),
+        ))
+        val directory = Files.createTempDirectory("canonical-surface-depth-refine-order-").toFile()
+        try {
+            val prepared = intent(directory, active, plan)
+            assertTrue(prepared.visit(CountingVisitor()) is PreparedIntentVisitResult.Complete)
+        } finally {
+            directory.deleteRecursively()
+            plan.discard()
+        }
+    }
+
+    @Test
     fun `fresh validated identity follows a fully rechecksummed disk divergence`() {
         val directory = Files.createTempDirectory("canonical-surface-intent-disk-divergence-").toFile()
         try {
