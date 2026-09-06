@@ -16,6 +16,7 @@ internal class CanonicalRuntimeResources private constructor(
     val directory: File,
     val groupDirectory: File,
     coordinator: StorageBudgetCoordinatorV2,
+    private val configuration: SurfaceOwnershipConfiguration = SurfaceOwnershipConfiguration(),
 ) : AutoCloseable {
     private val budget = CoordinatorStorageBudget(coordinator)
     private var owner: SurfaceOwnership? = null
@@ -26,7 +27,7 @@ internal class CanonicalRuntimeResources private constructor(
         checkOpen()
         check(owner == null)
         check(!CanonicalActivationSelector.hasDurableSelector(group, directory))
-        val configuration = SurfaceOwnershipConfiguration(seededEmptyBaseline = baseline)
+        val configuration = this.configuration.copy(seededEmptyBaseline = baseline)
         if (CompactCanonicalStore.prepareEmptyV6Bootstrap(
                 group, directory, budget, baseline, configuration,
             )
@@ -49,7 +50,7 @@ internal class CanonicalRuntimeResources private constructor(
         if (!CanonicalActivationSelector.hasDurableSelector(group, directory)) {
             return SurfaceOwnershipOpenResult.Refused(SurfaceOwnershipRestoreRefusal.CORRUPT)
         }
-        return SurfaceOwnership.open(group, directory, budget).also { opened ->
+        return SurfaceOwnership.open(group, directory, budget, configuration).also { opened ->
             if (opened is SurfaceOwnershipOpenResult.Opened) owner = opened.ownership
         }
     }
@@ -58,7 +59,7 @@ internal class CanonicalRuntimeResources private constructor(
 
     private fun openGenerationZero(): CompactCanonicalOpenResult {
         checkOpen()
-        return CompactCanonicalStore.openV6(group, directory, budget)
+        return CompactCanonicalStore.openV6(group, directory, budget, configuration)
     }
 
     /** Borrows exactly the selector-named v6 cut for one bounded operation. */
@@ -66,6 +67,138 @@ internal class CanonicalRuntimeResources private constructor(
         checkOpen()
         val lease = current ?: coldCurrent()?.also { current = it } ?: return null
         return authenticatedBorrow(lease, lease.view, block)
+    }
+
+    /** Borrows one exact complete current cut behind explicit lookup limits. */
+    @Synchronized
+    internal fun <T> withBoundedCurrent(
+        request: BoundedCanonicalLookupRequest,
+        block: (BoundedCanonicalSurfaceView) -> T,
+    ): BoundedCanonicalLookupResult<T> {
+        if (request.maximumDirectLookups < 0 || request.maximumRayCellVisits < 0 ||
+            request.maximumPageReads < 0 || request.maximumBytesRead < 0L
+        ) {
+            return BoundedCanonicalLookupResult.Refused(
+                BoundedCanonicalLookupReason.INVALID_REQUEST,
+                BoundedCanonicalLookupReceipt(0, 0, 0, 0, false),
+            )
+        }
+        if (closed) {
+            return BoundedCanonicalLookupResult.Refused(
+                BoundedCanonicalLookupReason.CURRENT_UNAVAILABLE,
+                BoundedCanonicalLookupReceipt(0, 0, 0, 0, false),
+            )
+        }
+        val lease = current ?: coldCurrent()?.also { current = it } ?: return BoundedCanonicalLookupResult.Refused(
+            BoundedCanonicalLookupReason.CURRENT_UNAVAILABLE,
+            BoundedCanonicalLookupReceipt(0, 0, 0, 0, false),
+        )
+        if (request.expectedGeometryRevision != lease.view.cut.geometryRevision ||
+            request.expectedLineageRevision != lease.view.cut.lineageRevision
+        ) {
+            return BoundedCanonicalLookupResult.Refused(
+                BoundedCanonicalLookupReason.REVISION_CONFLICT,
+                BoundedCanonicalLookupReceipt(0, 0, 0, 0, false),
+            )
+        }
+        val authenticated = CanonicalActivationSelector.reopenAuthenticatedCurrent(
+            group, directory, budget, lease.view.cut,
+        ) as? CanonicalActivationResult.Active ?: run {
+            invalidateCurrent()
+            return BoundedCanonicalLookupResult.Refused(
+                BoundedCanonicalLookupReason.CURRENT_UNAVAILABLE,
+                BoundedCanonicalLookupReceipt(0, 0, 0, 0, false),
+            )
+        }
+        if (authenticated.state.cut != lease.view.cut) {
+            invalidateCurrent()
+            return BoundedCanonicalLookupResult.Refused(
+                BoundedCanonicalLookupReason.CURRENT_UNAVAILABLE,
+                BoundedCanonicalLookupReceipt(0, 0, 0, 0, false),
+            )
+        }
+        val authenticatedCurrentBytes = when (val state = authenticated.state.currentState) {
+            is CanonicalCurrentState.Unacknowledged -> state.identity.canonicalLength
+            else -> 0L
+        }
+        CanonicalRuntimeCurrentTestHooks.onAuthenticatedBorrow?.invoke(authenticatedCurrentBytes)
+        val opened = openCompleteCurrent(lease.view.cut) ?: run {
+            invalidateCurrent()
+            return BoundedCanonicalLookupResult.Refused(
+                BoundedCanonicalLookupReason.CURRENT_UNAVAILABLE,
+                BoundedCanonicalLookupReceipt(0, 0, 0, 0, false),
+            )
+        }
+        val bounded = BoundedCanonicalCurrentView(opened.view, request, configuration.voxelMicrometers)
+        return try {
+            bounded.result(block(bounded))
+        } finally {
+            opened.close()
+        }
+    }
+
+    /** Prepares one depth batch from the same authenticated complete current cut. */
+    @Synchronized
+    internal fun prepareEvidenceBatch(
+        command: CanonicalEvidenceBatchCommand,
+    ): CanonicalMutationPreparation {
+        checkOpen()
+        val lease = current ?: coldCurrent()?.also { current = it } ?: return CanonicalMutationPreparation.Refused(
+            CanonicalMutationRefusal.INVALID_OWNERSHIP,
+            CanonicalStateReceipt(0, 0, 1, 0),
+        )
+        val authenticated = CanonicalActivationSelector.reopenAuthenticatedCurrent(
+            group, directory, budget, lease.view.cut,
+        ) as? CanonicalActivationResult.Active ?: run {
+            invalidateCurrent()
+            return CanonicalMutationPreparation.Refused(
+                CanonicalMutationRefusal.INVALID_OWNERSHIP,
+                CanonicalStateReceipt(0, 0, 1, 0),
+            )
+        }
+        if (authenticated.state.cut != lease.view.cut) {
+            invalidateCurrent()
+            return CanonicalMutationPreparation.Refused(
+                CanonicalMutationRefusal.INVALID_OWNERSHIP,
+                CanonicalStateReceipt(0, 0, 1, 0),
+            )
+        }
+        val opened = openCompleteCurrent(lease.view.cut) ?: run {
+            invalidateCurrent()
+            return CanonicalMutationPreparation.Refused(
+                CanonicalMutationRefusal.INVALID_OWNERSHIP,
+                CanonicalStateReceipt(0, 0, 1, 0),
+            )
+        }
+        return try {
+            owner().prepareAdjacentMutation(opened.view, command)
+        } finally {
+            opened.close()
+        }
+    }
+
+    private fun openCompleteCurrent(expectedCut: CompactCanonicalCut): CompleteCurrent? {
+        val base = (openGenerationZero() as? CompactCanonicalOpenResult.Opened)?.store ?: return null
+        val store = CanonicalCommitStore.open(directory, budget) ?: run { base.close(); return null }
+        return try {
+            when (val selected = store.reopen(base, retainedCurrentReceipt())) {
+                is CanonicalReopenResult.GenerationZero -> {
+                    if (selected.view.cut != expectedCut) {
+                        base.close(); store.close(); null
+                    } else CompleteCurrent(base, selected.view, store, null)
+                }
+                is CanonicalReopenResult.Selected -> {
+                    if (selected.commit.view.cut != expectedCut) {
+                        selected.commit.close(); base.close(); store.close(); null
+                    } else CompleteCurrent(base, selected.commit.view, store, selected.commit)
+                }
+                is CanonicalReopenResult.Refused -> {
+                    base.close(); store.close(); null
+                }
+            }
+        } catch (_: Throwable) {
+            store.close(); base.close(); null
+        }
     }
 
     /** Dirty-only view: exact current scalars plus kernel-owned row correlation. */
@@ -304,6 +437,7 @@ internal class CanonicalRuntimeResources private constructor(
             root: File,
             group: SurfaceGroup,
             coordinator: StorageBudgetCoordinatorV2,
+            configuration: SurfaceOwnershipConfiguration = SurfaceOwnershipConfiguration(),
         ): CanonicalRuntimeResources {
             val normalizedRoot = root.absoluteFile.toPath().normalize().toFile()
             val groupName = group.value.lowercase()
@@ -318,7 +452,20 @@ internal class CanonicalRuntimeResources private constructor(
             require(groupDirectory.mkdirs() || groupDirectory.isDirectory)
             // Every canonical selector, root, current and candidate lives under the normalized
             // group root while the borrowed coordinator accounts them from its shared ancestor.
-            return CanonicalRuntimeResources(group, groupDirectory, groupDirectory, coordinator)
+            return CanonicalRuntimeResources(group, groupDirectory, groupDirectory, coordinator, configuration)
+        }
+    }
+
+    private class CompleteCurrent(
+        private val base: CompactCanonicalStore,
+        val view: CanonicalStateView,
+        private val store: CanonicalCommitStore,
+        private val commit: CanonicalPublishedCommit?,
+    ) : AutoCloseable {
+        override fun close() {
+            commit?.close()
+            base.close()
+            store.close()
         }
     }
 

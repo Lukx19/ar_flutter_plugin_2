@@ -1,0 +1,560 @@
+package com.uhg0.ar_flutter_plugin_2.visibilitygrid
+
+import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetCoordinatorV2
+import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetPolicyV2
+import com.uhg0.ar_flutter_plugin_2.capture.JvmDescriptorFilesystemV2
+import java.io.File
+import java.nio.file.Files
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class BoundedCanonicalDepthLookupTest {
+    @Test
+    fun `negative lookup cap is refused before borrowing current`() {
+        val root = Files.createTempDirectory("bounded-canonical-depth-invalid").toFile()
+        val coordinator = coordinator(root)
+        val group = SurfaceGroup("a".repeat(32))
+        val resources = CanonicalRuntimeResources.open(root, group, coordinator)
+        try {
+            resources.openInitial(committedEmptyBaseline("binding", group.value, 1, 1, 1))
+
+            val result = resources.withBoundedCurrent(
+                BoundedCanonicalLookupRequest(1, 1, -1, 0, 0, 0),
+            ) { error("invalid request must not borrow current") }
+
+            assertTrue(result is BoundedCanonicalLookupResult.Refused)
+            val refused = result as BoundedCanonicalLookupResult.Refused
+            assertEquals(BoundedCanonicalLookupReason.INVALID_REQUEST, refused.reason)
+            assertEquals(
+                BoundedCanonicalLookupReceipt(0, 0, 0, 0, false),
+                refused.receipt,
+            )
+        } finally {
+            resources.close()
+            coordinator.close()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `authenticated current maps one addressed surface without enumeration`() {
+        val root = Files.createTempDirectory("bounded-canonical-depth-one-row").toFile()
+        val coordinator = coordinator(root)
+        val group = SurfaceGroup("b".repeat(32))
+        val resources = CanonicalRuntimeResources.open(root, group, coordinator)
+        try {
+            resources.openInitial(committedEmptyBaseline("binding", group.value, 1, 1, 1))
+            val created = resources.prepareEvidenceBatch(
+                CanonicalEvidenceBatchCommand(
+                    "create-one", 1, 1, listOf(
+                        DepthEvidenceChange.Create(
+                            CanonicalTarget(voxel = Voxel(2, 3, 4), normalOctX = 7, normalOctY = -3, normalConfidence = 211),
+                        ),
+                    ),
+                ),
+            ) as CanonicalMutationPreparation.Prepared
+            resources.commitAdjacent(created.mutation)
+
+            val cut = requireNotNull(resources.owner().activationState()).cut
+            val result = resources.withBoundedCurrent(
+                BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 1, 0, 0, 0),
+            ) { view ->
+                view.findSurfaceAt(Voxel(2, 3, 4))
+            }
+            val completed = result as BoundedCanonicalLookupResult.Completed
+            assertEquals(
+                AddressedCanonicalSurface(
+                    Voxel(2, 3, 4),
+                    DepthCanonicalSurface(SurfaceId(1), Voxel(2, 3, 4), 0x07fd, 211, 0),
+                ),
+                completed.value,
+            )
+            assertEquals(BoundedCanonicalLookupReceipt(1, 0, 0, 0, false), completed.receipt)
+        } finally {
+            resources.close()
+            coordinator.close()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `direct lookup limit suppresses the callback result`() {
+        val root = Files.createTempDirectory("bounded-canonical-depth-direct-limit").toFile()
+        val coordinator = coordinator(root)
+        val group = SurfaceGroup("c".repeat(32))
+        val resources = CanonicalRuntimeResources.open(root, group, coordinator)
+        try {
+            resources.openInitial(committedEmptyBaseline("binding", group.value, 1, 1, 1))
+            val created = resources.prepareEvidenceBatch(
+                CanonicalEvidenceBatchCommand(
+                    "create-limit", 1, 1,
+                    listOf(DepthEvidenceChange.Create(CanonicalTarget(voxel = Voxel(2, 3, 4), normalOctX = 1, normalOctY = 1, normalConfidence = 200))),
+                ),
+            ) as CanonicalMutationPreparation.Prepared
+            resources.commitAdjacent(created.mutation)
+            val cut = requireNotNull(resources.owner().activationState()).cut
+
+            val result = resources.withBoundedCurrent(
+                BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 0, 0, 0, 0),
+            ) { view -> view.findSurfaceById(SurfaceId(1)) }
+
+            val refused = result as BoundedCanonicalLookupResult.Refused
+            assertEquals(BoundedCanonicalLookupReason.LIMIT_EXHAUSTED, refused.reason)
+            assertEquals(BoundedCanonicalLookupReceipt(0, 0, 0, 0, true), refused.receipt)
+        } finally {
+            resources.close()
+            coordinator.close()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `revision mismatch is typed and zero-work caps may complete`() {
+        val root = Files.createTempDirectory("bounded-canonical-depth-revision").toFile()
+        val coordinator = coordinator(root)
+        val group = SurfaceGroup("d".repeat(32))
+        val resources = CanonicalRuntimeResources.open(root, group, coordinator)
+        try {
+            resources.openInitial(committedEmptyBaseline("binding", group.value, 1, 1, 1))
+
+            val complete = resources.withBoundedCurrent(
+                BoundedCanonicalLookupRequest(1, 1, 0, 0, 0, 0),
+            ) { it.revisionPair }
+            assertEquals(
+                BoundedCanonicalLookupResult.Completed(
+                    CanonicalRevisionPair(1, 1),
+                    BoundedCanonicalLookupReceipt(0, 0, 0, 0, false),
+                ),
+                complete,
+            )
+
+            val refused = resources.withBoundedCurrent(
+                BoundedCanonicalLookupRequest(2, 1, 0, 0, 0, 0),
+            ) { error("revision mismatch must not borrow current") }
+            assertEquals(BoundedCanonicalLookupReason.REVISION_CONFLICT, (refused as BoundedCanonicalLookupResult.Refused).reason)
+            assertEquals(BoundedCanonicalLookupReceipt(0, 0, 0, 0, false), refused.receipt)
+        } finally {
+            resources.close()
+            coordinator.close()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `missing selected current is unavailable`() {
+        val root = Files.createTempDirectory("bounded-canonical-depth-unavailable").toFile()
+        val coordinator = coordinator(root)
+        val group = SurfaceGroup("e".repeat(32))
+        val resources = CanonicalRuntimeResources.open(root, group, coordinator)
+        try {
+            val result = resources.withBoundedCurrent(
+                BoundedCanonicalLookupRequest(1, 1, 0, 0, 0, 0),
+            ) { error("unavailable current must not borrow") }
+            val refused = result as BoundedCanonicalLookupResult.Refused
+            assertEquals(BoundedCanonicalLookupReason.CURRENT_UNAVAILABLE, refused.reason)
+            assertEquals(BoundedCanonicalLookupReceipt(0, 0, 0, 0, false), refused.receipt)
+        } finally {
+            resources.close()
+            coordinator.close()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `ray visit charges ray cells without charging direct lookups`() {
+        val root = Files.createTempDirectory("bounded-canonical-depth-ray").toFile()
+        val coordinator = coordinator(root)
+        val group = SurfaceGroup("f".repeat(32))
+        val resources = CanonicalRuntimeResources.open(root, group, coordinator)
+        try {
+            resources.openInitial(committedEmptyBaseline("binding", group.value, 1, 1, 1))
+            val created = resources.prepareEvidenceBatch(
+                CanonicalEvidenceBatchCommand(
+                    "create-ray", 1, 1,
+                    listOf(DepthEvidenceChange.Create(CanonicalTarget(voxel = Voxel(1, 0, 0), normalOctX = 1, normalOctY = 1, normalConfidence = 200))),
+                ),
+            ) as CanonicalMutationPreparation.Prepared
+            resources.commitAdjacent(created.mutation)
+            val cut = requireNotNull(resources.owner().activationState()).cut
+            val visited = mutableListOf<Voxel>()
+
+            val result = resources.withBoundedCurrent(
+                BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 0, 8, 0, 0),
+            ) { view ->
+                view.visitRayCells(DepthPointMm(0.0, 0.0, 0.0), DepthPointMm(250.0, 0.0, 0.0), 8) { voxel, _ ->
+                    visited += voxel
+                    true
+                }
+            }
+
+            val completed = result as BoundedCanonicalLookupResult.Completed
+            assertEquals(3, completed.value.visitedCells)
+            assertEquals(listOf(Voxel(0, 0, 0), Voxel(1, 0, 0), Voxel(2, 0, 0)), visited)
+            assertEquals(BoundedCanonicalLookupReceipt(0, 3, 0, 0, false), completed.receipt)
+        } finally {
+            resources.close()
+            coordinator.close()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `evidence preparation and bounded lookup survive runtime reopen`() {
+        val root = Files.createTempDirectory("bounded-canonical-depth-reopen").toFile()
+        val coordinator = coordinator(root)
+        val group = SurfaceGroup("a".repeat(32))
+        val baseline = committedEmptyBaseline("binding", group.value, 1, 1, 1)
+        val first = CanonicalRuntimeResources.open(root, group, coordinator)
+        try {
+            first.openInitial(baseline)
+            val created = first.prepareEvidenceBatch(
+                CanonicalEvidenceBatchCommand(
+                    "create-reopen", 1, 1,
+                    listOf(DepthEvidenceChange.Create(CanonicalTarget(voxel = Voxel(3, 0, 0), normalOctX = 1, normalOctY = 1, normalConfidence = 200))),
+                ),
+            ) as CanonicalMutationPreparation.Prepared
+            assertTrue(first.commitAdjacent(created.mutation) is CanonicalAdjacentCommitResult.Committed)
+        } finally {
+            first.close()
+        }
+
+        val reopened = CanonicalRuntimeResources.open(root, group, coordinator)
+        try {
+            assertTrue(reopened.reopen() is SurfaceOwnershipOpenResult.Opened)
+            val cut = requireNotNull(reopened.owner().activationState()).cut
+            val result = reopened.withBoundedCurrent(
+                BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 1, 0, 0, 0),
+            ) { view -> view.findSurfaceById(SurfaceId(1)) }
+            val completed = result as BoundedCanonicalLookupResult.Completed
+            assertEquals(SurfaceId(1), completed.value?.id)
+            assertEquals(BoundedCanonicalLookupReceipt(1, 0, 0, 0, false), completed.receipt)
+
+            val state = requireNotNull(reopened.owner().activationState())
+            val current = state.current as CanonicalActivationCurrent.Receipt
+            assertTrue(
+                reopened.owner().acknowledgeCanonicalCurrent(
+                    CanonicalAcknowledgement(current.identity.commandHash, cut.geometryRevision, cut.lineageRevision),
+                ) is CanonicalAcknowledgementResult.Acknowledged,
+            )
+            val second = reopened.prepareEvidenceBatch(
+                CanonicalEvidenceBatchCommand(
+                    "create-reopen-second", cut.geometryRevision, cut.lineageRevision,
+                    listOf(DepthEvidenceChange.Create(CanonicalTarget(voxel = Voxel(4, 0, 0), normalOctX = 1, normalOctY = 1, normalConfidence = 200))),
+                ),
+            ) as CanonicalMutationPreparation.Prepared
+            assertEquals(1, CanonicalAuthorityLeaseRegistry.activeLeaseCount())
+            assertEquals(1, CanonicalAuthorityLeaseRegistry.activeResidentStoreCount())
+            assertTrue(reopened.commitAdjacent(second.mutation) is CanonicalAdjacentCommitResult.Committed)
+            assertEquals(0, CanonicalAuthorityLeaseRegistry.activeLeaseCount())
+            assertEquals(0, CanonicalAuthorityLeaseRegistry.activeResidentStoreCount())
+        } finally {
+            reopened.close()
+            coordinator.close()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `ray limit suppresses truncated traversal result`() {
+        val root = Files.createTempDirectory("bounded-canonical-depth-ray-limit").toFile()
+        val coordinator = coordinator(root)
+        val group = SurfaceGroup("b".repeat(32))
+        val resources = CanonicalRuntimeResources.open(root, group, coordinator)
+        try {
+            resources.openInitial(committedEmptyBaseline("binding", group.value, 1, 1, 1))
+            val created = resources.prepareEvidenceBatch(
+                CanonicalEvidenceBatchCommand(
+                    "create-ray-limit", 1, 1,
+                    listOf(DepthEvidenceChange.Create(CanonicalTarget(voxel = Voxel(1, 0, 0), normalOctX = 1, normalOctY = 1, normalConfidence = 200))),
+                ),
+            ) as CanonicalMutationPreparation.Prepared
+            resources.commitAdjacent(created.mutation)
+            val cut = requireNotNull(resources.owner().activationState()).cut
+
+            val result = resources.withBoundedCurrent(
+                BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 0, 2, 0, 0),
+            ) { view ->
+                view.visitRayCells(DepthPointMm(0.0, 0.0, 0.0), DepthPointMm(250.0, 0.0, 0.0), 8) { _, _ -> true }
+            }
+
+            val refused = result as BoundedCanonicalLookupResult.Refused
+            assertEquals(BoundedCanonicalLookupReason.LIMIT_EXHAUSTED, refused.reason)
+            assertEquals(BoundedCanonicalLookupReceipt(0, 2, 0, 0, true), refused.receipt)
+        } finally {
+            resources.close()
+            coordinator.close()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `stale runtime evidence preparation refuses without changing the cut`() {
+        val root = Files.createTempDirectory("bounded-canonical-depth-stale-batch").toFile()
+        val coordinator = coordinator(root)
+        val group = SurfaceGroup("c".repeat(32))
+        val resources = CanonicalRuntimeResources.open(root, group, coordinator)
+        try {
+            resources.openInitial(committedEmptyBaseline("binding", group.value, 1, 1, 1))
+            val before = requireNotNull(resources.owner().activationState()).cut
+            val result = resources.prepareEvidenceBatch(
+                CanonicalEvidenceBatchCommand(
+                    "stale-batch", before.geometryRevision + 1, before.lineageRevision,
+                    listOf(DepthEvidenceChange.Create(CanonicalTarget(voxel = Voxel(7, 0, 0), normalOctX = 1, normalOctY = 1, normalConfidence = 200))),
+                ),
+            )
+            assertEquals(CanonicalMutationRefusal.REVISION_CONFLICT, (result as CanonicalMutationPreparation.Refused).reason)
+            assertEquals(before, requireNotNull(resources.owner().activationState()).cut)
+        } finally {
+            resources.close()
+            coordinator.close()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `selector authentication failure is reported as unavailable`() {
+        val root = Files.createTempDirectory("bounded-canonical-depth-auth-failure").toFile()
+        val coordinator = coordinator(root)
+        val group = SurfaceGroup("d".repeat(32))
+        val resources = CanonicalRuntimeResources.open(root, group, coordinator)
+        try {
+            resources.openInitial(committedEmptyBaseline("binding", group.value, 1, 1, 1))
+            val created = resources.prepareEvidenceBatch(
+                CanonicalEvidenceBatchCommand(
+                    "create-auth-failure", 1, 1,
+                    listOf(DepthEvidenceChange.Create(CanonicalTarget(voxel = Voxel(8, 0, 0), normalOctX = 1, normalOctY = 1, normalConfidence = 200))),
+                ),
+            ) as CanonicalMutationPreparation.Prepared
+            resources.commitAdjacent(created.mutation)
+            val cut = requireNotNull(resources.owner().activationState()).cut
+            val selector = resources.groupDirectory.listFiles().orEmpty().single { it.name.endsWith(".selector") }
+            assertTrue(selector.delete())
+
+            val result = resources.withBoundedCurrent(
+                BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 1, 0, 0, 0),
+            ) { error("authentication failure must not borrow current") }
+            assertEquals(BoundedCanonicalLookupReason.CURRENT_UNAVAILABLE, (result as BoundedCanonicalLookupResult.Refused).reason)
+        } finally {
+            resources.close()
+            coordinator.close()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `surface lookup reports exact outgoing lineage count`() {
+        val root = Files.createTempDirectory("bounded-canonical-depth-lineage").toFile()
+        val coordinator = coordinator(root)
+        val group = SurfaceGroup("e".repeat(32))
+        val resources = CanonicalRuntimeResources.open(root, group, coordinator)
+        try {
+            resources.openInitial(committedEmptyBaseline("binding", group.value, 1, 1, 1))
+            val create = resources.prepareEvidenceBatch(
+                CanonicalEvidenceBatchCommand(
+                    "create-lineage", 1, 1,
+                    listOf(DepthEvidenceChange.Create(CanonicalTarget(voxel = Voxel(10, 0, 0), normalOctX = 1, normalOctY = 1, normalConfidence = 200))),
+                ),
+            ) as CanonicalMutationPreparation.Prepared
+            resources.commitAdjacent(create.mutation)
+            val firstState = requireNotNull(resources.owner().activationState())
+            val firstCurrent = firstState.current as CanonicalActivationCurrent.Receipt
+            assertTrue(
+                resources.owner().acknowledgeCanonicalCurrent(
+                    CanonicalAcknowledgement(firstCurrent.identity.commandHash, firstState.cut.geometryRevision, firstState.cut.lineageRevision),
+                ) is CanonicalAcknowledgementResult.Acknowledged,
+            )
+            val relocation = resources.prepareEvidenceBatch(
+                CanonicalEvidenceBatchCommand(
+                    "relocate-lineage", firstState.cut.geometryRevision, firstState.cut.lineageRevision,
+                    listOf(DepthEvidenceChange.Relocate(SurfaceId(1), CanonicalTarget(SurfaceId(1), Voxel(11, 0, 0), 1, 1, 200))),
+                ),
+            ) as CanonicalMutationPreparation.Prepared
+            resources.commitAdjacent(relocation.mutation)
+            val cut = requireNotNull(resources.owner().activationState()).cut
+
+            val result = resources.withBoundedCurrent(
+                BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 1, 0, 0, 0),
+            ) { view -> view.findSurfaceById(SurfaceId(1)) }
+            val completed = result as BoundedCanonicalLookupResult.Completed
+            assertEquals(1, completed.value?.lineageCount)
+            assertEquals(1, completed.receipt.directLookups)
+        } finally {
+            resources.close()
+            coordinator.close()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `addressed lookup work is independent of one hundred thousand unrelated rows`() {
+        val small = durableRuntimeWithRows(1, "f".repeat(32))
+        val large = durableRuntimeWithRows(100_000, "a".repeat(32))
+        try {
+            val smallCut = requireNotNull(small.runtime.owner().activationState()).cut
+            val largeCut = requireNotNull(large.runtime.owner().activationState()).cut
+            assertEquals(1, smallCut.liveSurfaceCount)
+            assertEquals(100_000, largeCut.liveSurfaceCount)
+
+            val smallResult = small.runtime.withBoundedCurrent(
+                BoundedCanonicalLookupRequest(smallCut.geometryRevision, smallCut.lineageRevision, 1, 0, 0, 0),
+            ) { it.findSurfaceAt(Voxel(0, 0, 0)) }
+            val largeResult = large.runtime.withBoundedCurrent(
+                BoundedCanonicalLookupRequest(largeCut.geometryRevision, largeCut.lineageRevision, 1, 0, 0, 0),
+            ) { it.findSurfaceAt(Voxel(0, 0, 0)) }
+
+            assertEquals(smallResult, largeResult)
+            assertEquals(
+                AddressedCanonicalSurface(
+                    Voxel(0, 0, 0),
+                    DepthCanonicalSurface(SurfaceId(1), Voxel(0, 0, 0), 0x0101, 200, 0),
+                ),
+                (smallResult as BoundedCanonicalLookupResult.Completed).value,
+            )
+            assertEquals(BoundedCanonicalLookupReceipt(1, 0, 0, 0, false), smallResult.receipt)
+        } finally {
+            small.close()
+            large.close()
+        }
+    }
+
+    @Test
+    fun `page read cap refuses after exact underlying page work`() {
+        val view = MeteredCanonicalLookupView(pageReadDelta = 1, byteReadDelta = 0)
+        val bounded = BoundedCanonicalCurrentView(
+            view,
+            BoundedCanonicalLookupRequest(1, 1, 1, 0, 1, 128),
+            100_000,
+        )
+
+        val result = bounded.result(bounded.findSurfaceById(SurfaceId(1)))
+
+        assertTrue(result is BoundedCanonicalLookupResult.Refused)
+        val refused = result as BoundedCanonicalLookupResult.Refused
+        assertEquals(BoundedCanonicalLookupReason.LIMIT_EXHAUSTED, refused.reason)
+        assertEquals(BoundedCanonicalLookupReceipt(1, 0, 2, 0, true), refused.receipt)
+    }
+
+    @Test
+    fun `byte read cap refuses after exact underlying byte work`() {
+        val view = MeteredCanonicalLookupView(pageReadDelta = 0, byteReadDelta = 64)
+        val bounded = BoundedCanonicalCurrentView(
+            view,
+            BoundedCanonicalLookupRequest(1, 1, 1, 0, 1, 100),
+            100_000,
+        )
+
+        val result = bounded.result(bounded.findSurfaceById(SurfaceId(1)))
+
+        assertTrue(result is BoundedCanonicalLookupResult.Refused)
+        val refused = result as BoundedCanonicalLookupResult.Refused
+        assertEquals(BoundedCanonicalLookupReason.LIMIT_EXHAUSTED, refused.reason)
+        assertEquals(BoundedCanonicalLookupReceipt(1, 0, 0, 128, true), refused.receipt)
+    }
+
+    private fun coordinator(root: File) = StorageBudgetCoordinatorV2(
+        File(root, "visibility-grid-canonical-surface-runtime"),
+        StorageBudgetPolicyV2(64L * 1024L * 1024L, 0),
+        JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L }),
+    ) { 128L * 1024L * 1024L }
+
+    private data class DurableRuntime(
+        val root: File,
+        val coordinator: StorageBudgetCoordinatorV2,
+        val runtime: CanonicalRuntimeResources,
+    ) : AutoCloseable {
+        override fun close() {
+            runtime.close()
+            coordinator.close()
+            root.deleteRecursively()
+        }
+    }
+
+    private fun durableRuntimeWithRows(rows: Int, groupValue: String): DurableRuntime {
+        val root = Files.createTempDirectory("bounded-canonical-depth-$rows").toFile()
+        val coordinator = coordinator(root)
+        val group = SurfaceGroup(groupValue)
+        val directory = File(
+            File(root, "visibility-grid-canonical-surface-runtime"), group.value,
+        ).also { require(it.mkdirs() || it.isDirectory) }
+        val legacy = SurfaceOwnership.open(group, directory)
+        val ownership = (legacy as SurfaceOwnershipOpenResult.Opened).ownership
+        val candidates = List(rows) { index ->
+            SurfaceCandidate(
+                voxel = Voxel(index, 0, 0),
+                normalOctX = 1,
+                normalOctY = 1,
+                normalConfidence = 200,
+            )
+        }
+        assertTrue(
+            ownership.apply(SurfaceOwnershipCommand("seed-$rows", candidates))
+                is SurfaceOwnershipResult.Accepted,
+        )
+        ownership.close()
+
+        val budget = CoordinatorStorageBudget(coordinator)
+        assertTrue(
+            CompactCanonicalStore.prepareV6SiblingMigration(group, directory, budget)
+                is CompactCanonicalMigrationResult.Prepared,
+        )
+        val activation = CanonicalActivation.prepare(group, directory, budget)
+        assertTrue(activation is CanonicalActivationPreparation.Prepared)
+        assertTrue(
+            SurfaceOwnership.activateV6(
+                group, directory, budget,
+                (activation as CanonicalActivationPreparation.Prepared).plan,
+            ) is CanonicalActivationResult.Active,
+        )
+        val runtime = CanonicalRuntimeResources.open(root, group, coordinator)
+        assertTrue(runtime.reopen() is SurfaceOwnershipOpenResult.Opened)
+        return DurableRuntime(root, coordinator, runtime)
+    }
+
+    private class MeteredCanonicalLookupView(
+        private val pageReadDelta: Long,
+        private val byteReadDelta: Long,
+    ) : CanonicalStateView {
+        private var pageReads = 0L
+        private var bytesRead = 0L
+
+        override val cut = CompactCanonicalCut(
+            SurfaceGroup("a".repeat(32)), CompactCanonicalStore.PROFILE,
+            1, 1, 2, 1, 1, 1, 0, null,
+            CanonicalReceiptBytes.EMPTY, CanonicalReceiptBytes.EMPTY,
+        )
+
+        override fun findById(id: SurfaceId): CompactSurface? {
+            pageReads += pageReadDelta
+            bytesRead += byteReadDelta
+            return CompactSurface(SurfaceId(1), Voxel(0, 0, 0), 0x0101, 200)
+                .takeIf { id == it.id }
+        }
+
+        override fun findByVoxel(voxel: Voxel): CompactSurface? = null
+        override fun readPage(region: StorageRegion, page: Int, cursor: Int, limit: Int) =
+            CompactPage(emptyList(), null, 0)
+        override fun readSourceById(id: SurfaceId): CanonicalPageRead<PagedSource?> =
+            CanonicalPageRead.Complete(null, 0, 0)
+        override fun visitSourceSupport(
+            target: SurfaceId,
+            cursor: SourceSupportCursor?,
+            sink: (PagedSupport) -> Boolean,
+        ) = SourceSupportRead.Complete(0, null, 0, 0)
+        override fun visitLineage(
+            source: SurfaceId,
+            cursor: LineageCursor?,
+            sink: (LineageEdge) -> Boolean,
+        ): LineageRead {
+            pageReads += pageReadDelta
+            bytesRead += byteReadDelta
+            return LineageRead.Complete(0, null)
+        }
+        override fun retainedMemoryReceipt() = CompactRetainedMemoryReceipt(
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        )
+        override fun allocatedStorageReceipt() = CompactStorageReceipt(0, 0, 0, 0, 0)
+        override fun readWorkReceipt() = CanonicalReadWork(0, pageReads, 0, bytesRead)
+        override fun close() = Unit
+    }
+}
