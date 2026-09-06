@@ -653,22 +653,7 @@ internal class VisibilityGridIntegration(
             receipt = receipt.copy(status = "canonicalRefused", rejected = rejected)
             return
         }
-        val assignments = requireNotNull(resources).withFeaturePlanningCurrent { current ->
-            canonicalAssignments(changes, prepared.mutation, current)
-        } ?: run {
-            prepared.mutation.discard()
-            requireNotNull(kernel).discardPrepared()
-            rejected++
-            receipt = receipt.copy(status = "v6ReadRefused", rejected = rejected)
-            return
-        }
-        if (!requireNotNull(kernel).prepareCanonicalApplication(assignments)) {
-            prepared.mutation.discard()
-            requireNotNull(kernel).discardPrepared()
-            rejected++
-            receipt = receipt.copy(status = "kernelApplyRefused", rejected = rejected)
-            return
-        }
+        if (!stageFeatureCanonicalApplication(changes, prepared.mutation)) return
         val state = (commitCanonical(requireNotNull(resources), prepared.mutation)
             as? CanonicalAdjacentCommitResult.Committed)?.state ?: run {
             requireNotNull(kernel).discardPrepared()
@@ -723,22 +708,7 @@ internal class VisibilityGridIntegration(
             }
             return
         }
-        val assignments = requireNotNull(resources).withFeaturePlanningCurrent { current ->
-            canonicalAssignments(changes, prepared.mutation, current)
-        } ?: run {
-            prepared.mutation.discard()
-            requireNotNull(kernel).discardPrepared()
-            rejected++
-            receipt = receipt.copy(status = "v6ReadRefused", rejected = rejected)
-            return
-        }
-        if (!requireNotNull(kernel).prepareCanonicalApplication(assignments)) {
-            prepared.mutation.discard()
-            requireNotNull(kernel).discardPrepared()
-            rejected++
-            receipt = receipt.copy(status = "kernelApplyRefused", rejected = rejected)
-            return
-        }
+        if (!stageFeatureCanonicalApplication(changes, prepared.mutation)) return
         val committedState = (commitCanonical(requireNotNull(resources), prepared.mutation)
             as? CanonicalAdjacentCommitResult.Committed)?.state ?: run {
             requireNotNull(kernel).discardPrepared()
@@ -791,6 +761,39 @@ internal class VisibilityGridIntegration(
             }
         }
         return assignments
+    }
+
+    /**
+     * Resolves every touched feature slot against complete canonical authority and
+     * preflights its post-commit kernel writes. Failure owns the complete cleanup
+     * boundary: neither the mutation capability nor kernel staging may escape.
+     */
+    private fun stageFeatureCanonicalApplication(
+        changes: List<FeatureFusionChange>,
+        mutation: PreparedCanonicalMutation,
+    ): Boolean {
+        val assignments = requireNotNull(resources).withFeaturePlanningCurrent { current ->
+            canonicalAssignments(changes, mutation, current)
+        }
+        if (assignments == null) {
+            discardFeatureCanonicalApplication(mutation, "v6ReadRefused")
+            return false
+        }
+        if (!requireNotNull(kernel).prepareCanonicalApplication(assignments)) {
+            discardFeatureCanonicalApplication(mutation, "kernelApplyRefused")
+            return false
+        }
+        return true
+    }
+
+    private fun discardFeatureCanonicalApplication(
+        mutation: PreparedCanonicalMutation,
+        status: String,
+    ) {
+        mutation.discard()
+        requireNotNull(kernel).discardPrepared()
+        rejected++
+        receipt = receipt.copy(status = status, rejected = rejected)
     }
 
     private fun publishV6Current(
