@@ -1743,6 +1743,14 @@ internal class PreparedCanonicalMutation(
         if (row.id.value < sourceCut.nextSurfaceIdHighWater) true else sink(row.toSupport())
     }
 
+    /** Source rows retained by planning, including structural/removal inputs. */
+    internal fun visitRetainedSources(sink: (ImmutableSourceSupport) -> Boolean): Boolean {
+        supportPairs?.let { pairs ->
+            return pairs.visit { prepared -> sink(prepared.source) }
+        }
+        return supports.visit(sink)
+    }
+
     fun visitDirtyLineage(sink: (LineageEdge) -> Boolean) {
         lineagePairs?.let { pairs -> pairs.visit(sink); return }
         for (source in removedIds) {

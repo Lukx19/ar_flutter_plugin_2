@@ -163,14 +163,25 @@ internal class CanonicalRuntimeResources private constructor(
 
     /** Borrows complete canonical authority for bounded feature planning. */
     @Synchronized fun <T> withFeaturePlanningCurrent(
+        maximumTouches: Int,
         block: (CanonicalStateView) -> T,
     ): T? {
         checkOpen()
+        require(maximumTouches >= 0 && maximumTouches <= configuration.surfaceCapacity)
         val lease = current ?: return null
         // Feature-local correlation identifies associations only. Canonical
         // occupancy, normals, identity and allocation provenance always come
         // from the lifecycle-owned complete authority.
-        return authenticatedBorrow(lease, lease.completeView, block)
+        if (!lease.isCurrent(owner?.activationState()?.cut)) {
+            invalidateCurrent(); return null
+        }
+        val view = lease.featurePlanningView(maximumTouches)
+        val result = block(view)
+        if (view.routingFailed) {
+            if (result is CanonicalMutationPreparation.Prepared) result.mutation.discard()
+            return null
+        }
+        return attachRetainedPublishedAuthority(lease, result)
     }
 
     private fun <T> authenticatedBorrow(
@@ -199,6 +210,13 @@ internal class CanonicalRuntimeResources private constructor(
         faults: CanonicalCommitFaults = CanonicalCommitFaults(),
     ): CanonicalAdjacentCommitResult {
         checkOpen()
+        val lease = current ?: return CanonicalAdjacentCommitResult.Refused(
+            CanonicalAdjacentCommitRefusal.NO_ACTIVE_AUTHORITY,
+        )
+        val routeDelta = lease.prepareRouting(plan) ?: run {
+            plan.discard()
+            return CanonicalAdjacentCommitResult.Refused(CanonicalAdjacentCommitRefusal.PLAN_DISCARDED)
+        }
         val result = try {
             owner().commitAdjacentCanonicalMutation(plan, faults)
         } catch (failure: Throwable) {
@@ -207,7 +225,7 @@ internal class CanonicalRuntimeResources private constructor(
         }
         if (result is CanonicalAdjacentCommitResult.Committed) {
             val successor = result.successor ?: run { invalidateCurrent(); return result }
-            val lease = current ?: run { successor.close(); return result }
+            lease.applyRouting(routeDelta, successor)
             val scalar = successor.view.scalarView(directory)
             lease.commit?.close()
             lease.commit = successor
@@ -224,10 +242,12 @@ internal class CanonicalRuntimeResources private constructor(
         current?.completeView?.retainedMemoryReceipt()
     @Synchronized internal fun completeCurrentLeaseReceipt(): CanonicalCompleteCurrentLeaseReceipt? =
         current?.resourceReceipt()
+    @Synchronized internal fun featurePlanningMemoryReceipt(maximumTouches: Int): CanonicalFeaturePlanningMemoryReceipt? =
+        current?.featurePlanningMemoryReceipt(maximumTouches)
 
     internal fun portableOwnerBytes(): Long =
         40L + // CanonicalRuntimeResources
-            48L + // CurrentLease with scalar and retained complete-current capabilities
+            56L + // CurrentLease with scalar, complete-current, and feature-route capabilities
             104L + 56L + // SurfaceOwnership + configuration
             40L + 120L + 32L + 32L + // published/current activation scalars
             16L + 16L + // coordinator budget adapter + surface group
@@ -260,10 +280,10 @@ internal class CanonicalRuntimeResources private constructor(
         return try {
             when (val selected = store.reopen(base, retained)) {
                 is CanonicalReopenResult.GenerationZero ->
-                    CurrentLease(base.scalarView(directory), selected.view, base, null)
+                    CurrentLease.create(base.scalarView(directory), selected.view, base, null, configuration.surfaceCapacity)
                 is CanonicalReopenResult.Selected -> {
                     val scalar = selected.commit.view.scalarView(directory)
-                    CurrentLease(scalar, selected.commit.view, base, selected.commit)
+                    CurrentLease.create(scalar, selected.commit.view, base, selected.commit, configuration.surfaceCapacity)
                 }
                 is CanonicalReopenResult.Refused -> { base.close(); null }
             }
@@ -410,12 +430,24 @@ internal class CanonicalRuntimeResources private constructor(
             }
     }
 
-    private class CurrentLease(
+    private class CurrentLease private constructor(
         var scalarView: ScalarCanonicalStateView,
         var completeView: CanonicalStateView,
         private val base: CompactCanonicalStore,
         var commit: CanonicalPublishedCommit?,
+        private val featureRoutes: CanonicalFeaturePlanningRoutes,
     ) : AutoCloseable {
+        fun featurePlanningView(maximumTouches: Int): RoutedFeaturePlanningView =
+            featureRoutes.view(scalarView.cut, base, commit, maximumTouches)
+        fun featurePlanningMemoryReceipt(maximumTouches: Int) = featureRoutes.memoryReceipt(maximumTouches)
+
+        fun prepareRouting(plan: PreparedCanonicalMutation): CanonicalFeatureRouteDelta? =
+            featureRoutes.prepare(plan, (commit?.routingGenerationCount() ?: 0) + 2)
+
+        fun applyRouting(delta: CanonicalFeatureRouteDelta, successor: CanonicalPublishedCommit) {
+            check(successor.routingGenerationCount() + 1 == delta.providerToken)
+            featureRoutes.apply(delta)
+        }
         fun resourceReceipt(): CanonicalCompleteCurrentLeaseReceipt {
             val baseReceipt = base.retainedMemoryReceipt()
             val cow = commit?.leaseMemoryReceipt()
@@ -424,27 +456,339 @@ internal class CanonicalRuntimeResources private constructor(
             val cowConstruction = cow?.let {
                 Math.addExact(baseReceipt.residentTotalBytes, it.lifecycleConstructionPeakBytes)
             } ?: 0L
+            val routing = featureRoutes.memoryReceipt(0)
             return CanonicalCompleteCurrentLeaseReceipt(
                 baseReceipt,
                 cowRetained,
-                retainedTotal,
-                maxOf(baseReceipt.peakWithScratchBytes, cowConstruction),
+                routing.routeRetainedBytes,
+                Math.addExact(retainedTotal, routing.routeRetainedBytes),
+                maxOf(
+                    Math.addExact(baseReceipt.peakWithScratchBytes, routing.routeRetainedBytes),
+                    cowConstruction,
+                    Math.addExact(
+                        retainedTotal,
+                        Math.addExact(routing.routeRetainedBytes, routing.lifecycleConstructionScratchBytes),
+                    ),
+                ),
             )
         }
         fun isCurrent(cut: CompactCanonicalCut?): Boolean =
             cut != null && cut == scalarView.cut && cut == completeView.cut
         override fun close() {
+            featureRoutes.close()
             commit?.close(); commit = null; base.close()
         }
+
+        companion object {
+            fun create(
+                scalarView: ScalarCanonicalStateView,
+                completeView: CanonicalStateView,
+                base: CompactCanonicalStore,
+                commit: CanonicalPublishedCommit?,
+                capacity: Int,
+            ): CurrentLease? {
+                val routes = CanonicalFeaturePlanningRoutes.build(base, commit, capacity) ?: run {
+                    commit?.close(); base.close(); return null
+                }
+                return CurrentLease(scalarView, completeView, base, commit, routes)
+            }
+        }
     }
+}
+
+/**
+ * Lifecycle-owned voxel routing for ordinary feature planning. The retained
+ * primitive payload at 100k is 2,372,864 bytes: one 131,072-entry long/int
+ * table plus two 100k Int provider columns. No canonical row is duplicated.
+ */
+private class CanonicalFeaturePlanningRoutes private constructor(private val capacity: Int) : AutoCloseable {
+    private val tableSize = run { var value = 1; while (value <= capacity) value = value shl 1; value }
+    private val keys = LongArray(tableSize)
+    private val tokens = IntArray(tableSize)
+    private val rowProviders = IntArray(capacity)
+    private val sourceProviders = IntArray(capacity)
+    private var freeHead = -1
+    private var nextDescriptor = 0
+    private var closed = false
+
+    fun view(
+        cut: CompactCanonicalCut,
+        base: CanonicalStateView,
+        commit: CanonicalPublishedCommit?,
+        maximumTouches: Int,
+    ) = RoutedFeaturePlanningView(cut, this, base, commit, maximumTouches)
+
+    fun prepare(plan: PreparedCanonicalMutation, providerToken: Int): CanonicalFeatureRouteDelta? {
+        if (closed || plan.targetLiveSurfaceCount !in 0..capacity) return null
+        val sourceVoxels = HashMap<Long, Voxel>()
+        if (!plan.visitRetainedSources { source -> sourceVoxels[source.id.value] = source.voxel; true }) return null
+        val removed = LongArray(plan.removedSurfaceCount)
+        var removedCount = 0
+        plan.visitRemovedSurfaceIds { id ->
+            val voxel = sourceVoxels[id.value] ?: return@visitRemovedSurfaceIds false
+            val descriptor = descriptor(packVisibilityGridKey(voxel.x, voxel.y, voxel.z))
+                ?: return@visitRemovedSurfaceIds false
+            removed[removedCount++] = packVisibilityGridKey(voxel.x, voxel.y, voxel.z)
+            true
+        }
+        if (removedCount != plan.removedSurfaceCount) return null
+        val keys = LongArray(plan.dirtyRowCount)
+        val sources = IntArray(plan.dirtyRowCount)
+        var dirtyCount = 0
+        if (!plan.visitDirtyRows { row ->
+            val key = packVisibilityGridKey(row.voxel.x, row.voxel.y, row.voxel.z)
+            val retained = descriptor(key)
+            val sourceProvider = if (row.id.value >= plan.sourceCut.nextSurfaceIdHighWater) providerToken else {
+                retained?.let { sourceProviders[it] } ?: sourceVoxels[row.id.value]?.let { old ->
+                    descriptor(packVisibilityGridKey(old.x, old.y, old.z))?.let { sourceProviders[it] }
+                } ?: return@visitDirtyRows false
+            }
+            keys[dirtyCount] = key; sources[dirtyCount] = sourceProvider; dirtyCount++
+            true
+        } || dirtyCount != plan.dirtyRowCount) return null
+        return CanonicalFeatureRouteDelta(providerToken, removed, keys, sources)
+    }
+
+    fun apply(delta: CanonicalFeatureRouteDelta) {
+        check(!closed)
+        delta.removedKeys.forEach { key -> remove(key)?.let(::release) }
+        delta.dirtyKeys.indices.forEach { index ->
+            val key = delta.dirtyKeys[index]
+            val descriptor = descriptor(key) ?: requireNotNull(acquire())
+            rowProviders[descriptor] = delta.providerToken
+            sourceProviders[descriptor] = delta.sourceProviders[index]
+            put(key, descriptor)
+        }
+    }
+
+    private fun applyGeneration(generation: CanonicalCowGeneration, ordinal: Int): Boolean {
+        val sourceRoutes = LongProviderScratch(tableSize)
+        return generation.visitRoutingRecords { kind, record ->
+            when {
+                kind == CowFragmentKind.SOURCE && record is CowRecord.Source ->
+                    sourceRoutes.put(record.value.id, ordinal + 2)
+                kind == CowFragmentKind.VOXEL_TOMBSTONE && record is CowRecord.Tombstone -> {
+                    remove(packVisibilityGridKey(record.x, record.y, record.z))?.let { descriptor ->
+                        sourceRoutes.put(record.id, sourceProviders[descriptor])
+                        release(descriptor)
+                    }
+                }
+                kind == CowFragmentKind.VOXEL_INDEX && record is CowRecord.Index -> {
+                    val key = packVisibilityGridKey(record.x, record.y, record.z)
+                    val retained = descriptor(key)
+                    val source = sourceRoutes[record.id]
+                        ?: retained?.let { sourceProviders[it] }
+                        ?: return@visitRoutingRecords false
+                    val descriptor = retained ?: acquire() ?: return@visitRoutingRecords false
+                    rowProviders[descriptor] = ordinal + 2
+                    sourceProviders[descriptor] = source
+                    put(key, descriptor)
+                }
+            }
+            true
+        }
+    }
+
+    fun resolve(
+        voxel: Voxel,
+        base: CanonicalStateView,
+        commit: CanonicalPublishedCommit?,
+    ): RoutedFeatureRead {
+        val descriptor = descriptor(packVisibilityGridKey(voxel.x, voxel.y, voxel.z))
+            ?: return RoutedFeatureRead.Missing
+        val row = providerSurface(rowProviders[descriptor], voxel, base, commit)
+            ?: return RoutedFeatureRead.Failed
+        val source = providerSource(sourceProviders[descriptor], row.id, base, commit)
+            ?: return RoutedFeatureRead.Failed
+        return RoutedFeatureRead.Found(row, source)
+    }
+
+    private fun providerSurface(token: Int, voxel: Voxel, base: CanonicalStateView, commit: CanonicalPublishedCommit?): CompactSurface? {
+        if (CanonicalRuntimeCurrentTestHooks.failFeatureRouteRead?.invoke("row") == true) return null
+        return if (token == 1) base.findByVoxel(voxel) else commit?.routingGenerationAt(token - 2)?.routedSurface(voxel)
+    }
+    private fun providerSource(token: Int, id: SurfaceId, base: CanonicalStateView, commit: CanonicalPublishedCommit?): PagedSource? {
+        if (CanonicalRuntimeCurrentTestHooks.failFeatureRouteRead?.invoke("source") == true) return null
+        return if (token == 1) (base.readSourceById(id) as? CanonicalPageRead.Complete)?.value
+        else commit?.routingGenerationAt(token - 2)?.routedSource(id)
+    }
+
+    private fun acquire(): Int? = when {
+        freeHead >= 0 -> freeHead.also { descriptor ->
+            freeHead = -rowProviders[descriptor] - 1
+            rowProviders[descriptor] = 0
+        }
+        nextDescriptor < capacity -> nextDescriptor++
+        else -> null
+    }
+    private fun release(value: Int) {
+        rowProviders[value] = -(freeHead + 1)
+        sourceProviders[value] = 0
+        freeHead = value
+    }
+    private fun descriptor(key: Long): Int? {
+        var index = slot(key)
+        while (tokens[index] != 0) {
+            if (keys[index] == key) return tokens[index] - 1
+            index = (index + 1) and (tableSize - 1)
+        }
+        return null
+    }
+    private fun put(key: Long, descriptor: Int) {
+        var index = slot(key)
+        while (tokens[index] != 0 && keys[index] != key) index = (index + 1) and (tableSize - 1)
+        keys[index] = key; tokens[index] = descriptor + 1
+    }
+    private fun remove(key: Long): Int? {
+        var index = slot(key)
+        while (tokens[index] != 0) {
+            if (keys[index] == key) {
+                val removed = tokens[index] - 1
+                tokens[index] = 0
+                var next = (index + 1) and (tableSize - 1)
+                while (tokens[next] != 0) {
+                    val movedKey = keys[next]; val moved = tokens[next] - 1
+                    tokens[next] = 0; put(movedKey, moved); next = (next + 1) and (tableSize - 1)
+                }
+                return removed
+            }
+            index = (index + 1) and (tableSize - 1)
+        }
+        return null
+    }
+    private fun slot(key: Long): Int {
+        var mixed = key xor (key ushr 33); mixed *= -49064778989728563L; mixed = mixed xor (mixed ushr 33)
+        return mixed.toInt() and (tableSize - 1)
+    }
+    fun memoryReceipt(maximumTouches: Int): CanonicalFeaturePlanningMemoryReceipt {
+        require(maximumTouches in 0..capacity)
+        val routeArrays = Math.addExact(
+            Math.multiplyExact(tableSize.toLong(), (Long.SIZE_BYTES + Int.SIZE_BYTES).toLong()),
+            Math.multiplyExact(capacity.toLong(), 2L * Int.SIZE_BYTES),
+        )
+        val retained = Math.addExact(128L, Math.addExact(routeArrays, 4L * 16L))
+        val scratch = Math.addExact(64L, Math.addExact(2L * 16L,
+            Math.multiplyExact(tableSize.toLong(), (Long.SIZE_BYTES + Int.SIZE_BYTES).toLong())))
+        val borrow = Math.addExact(128L + 3L * 16L, Math.multiplyExact(maximumTouches.toLong(), 24L))
+        return CanonicalFeaturePlanningMemoryReceipt(retained, scratch, borrow)
+    }
+    override fun close() { if (!closed) { closed = true; tokens.fill(0); rowProviders.fill(0); sourceProviders.fill(0) } }
+
+    companion object {
+        fun build(base: CompactCanonicalStore, commit: CanonicalPublishedCommit?, capacity: Int): CanonicalFeaturePlanningRoutes? {
+            val routes = CanonicalFeaturePlanningRoutes(capacity)
+            var id = 1L
+            while (id < base.cut.nextSurfaceIdHighWater) {
+                val row = base.findById(SurfaceId(id++)) ?: continue
+                val source = (base.readSourceById(row.id) as? CanonicalPageRead.Complete)?.value ?: run {
+                    routes.close(); return null
+                }
+                val descriptor = routes.acquire() ?: run { routes.close(); return null }
+                routes.rowProviders[descriptor] = 1; routes.sourceProviders[descriptor] = 1
+                routes.put(packVisibilityGridKey(row.voxel.x, row.voxel.y, row.voxel.z), descriptor)
+            }
+            commit?.let { published ->
+                for (ordinal in 0 until published.routingGenerationCount()) {
+                    if (!routes.applyGeneration(published.routingGenerationAt(ordinal), ordinal)) {
+                        routes.close(); return null
+                    }
+                }
+            }
+            return routes
+        }
+    }
+}
+
+private class LongProviderScratch(tableSize: Int) {
+    private val mask = tableSize - 1
+    private val keys = LongArray(tableSize)
+    private val values = IntArray(tableSize)
+    operator fun get(key: Long): Int? {
+        var slot = slot(key)
+        while (values[slot] != 0) {
+            if (keys[slot] == key) return values[slot]
+            slot = (slot + 1) and mask
+        }
+        return null
+    }
+    fun put(key: Long, value: Int) {
+        require(value > 0)
+        var slot = slot(key)
+        while (values[slot] != 0 && keys[slot] != key) slot = (slot + 1) and mask
+        keys[slot] = key; values[slot] = value
+    }
+    private fun slot(key: Long): Int {
+        var mixed = key xor (key ushr 33); mixed *= -49064778989728563L; mixed = mixed xor (mixed ushr 33)
+        return mixed.toInt() and mask
+    }
+}
+
+private class CanonicalFeatureRouteDelta(
+    val providerToken: Int,
+    val removedKeys: LongArray,
+    val dirtyKeys: LongArray,
+    val sourceProviders: IntArray,
+)
+
+private class RoutedFeaturePlanningView(
+    override val cut: CompactCanonicalCut,
+    private val routes: CanonicalFeaturePlanningRoutes,
+    private val base: CanonicalStateView,
+    private val commit: CanonicalPublishedCommit?,
+    maximumTouches: Int,
+) : CanonicalStateView {
+    private val touchedIds = LongArray(maximumTouches)
+    private val touchedRows = arrayOfNulls<CompactSurface>(maximumTouches)
+    private val touchedSources = arrayOfNulls<PagedSource>(maximumTouches)
+    private var touchedCount = 0
+    var routingFailed = false
+        private set
+    override val generationZeroAuthority: CanonicalStateView get() = base.generationZeroAuthority
+    override fun findByVoxel(voxel: Voxel): CompactSurface? = when (val read = routes.resolve(voxel, base, commit)) {
+        RoutedFeatureRead.Missing -> null
+        RoutedFeatureRead.Failed -> null.also { routingFailed = true }
+        is RoutedFeatureRead.Found -> read.row.also {
+            val existing = (0 until touchedCount).firstOrNull { index -> touchedIds[index] == it.id.value }
+            val index = existing ?: touchedCount.also { next ->
+                if (next >= touchedIds.size) { routingFailed = true; return@also }
+                touchedCount++
+            }
+            touchedIds[index] = it.id.value; touchedRows[index] = it; touchedSources[index] = read.source
+        }
+    }
+    override fun findById(id: SurfaceId): CompactSurface? =
+        (0 until touchedCount).firstOrNull { touchedIds[it] == id.value }?.let { touchedRows[it] }
+    override fun readSourceById(id: SurfaceId): CanonicalPageRead<PagedSource?> =
+        CanonicalPageRead.Complete(
+            (0 until touchedCount).firstOrNull { touchedIds[it] == id.value }?.let { touchedSources[it] }, 0, 0,
+        )
+    override fun readPage(region: StorageRegion, page: Int, cursor: Int, limit: Int) = CompactPage(emptyList(), null, 0)
+    override fun visitSourceSupport(target: SurfaceId, cursor: SourceSupportCursor?, sink: (PagedSupport) -> Boolean) =
+        SourceSupportRead.Complete(0, null, 0, 0)
+    override fun retainedMemoryReceipt() = base.retainedMemoryReceipt()
+    override fun allocatedStorageReceipt() = base.allocatedStorageReceipt()
+    override fun close() = Unit
+}
+
+private sealed interface RoutedFeatureRead {
+    data object Missing : RoutedFeatureRead
+    data object Failed : RoutedFeatureRead
+    data class Found(val row: CompactSurface, val source: PagedSource) : RoutedFeatureRead
 }
 
 internal data class CanonicalCompleteCurrentLeaseReceipt(
     val baseRetained: CompactRetainedMemoryReceipt,
     val cowProofAndIndexBytes: Long,
+    val featurePlanningRouteBytes: Long,
     val retainedTotalBytes: Long,
     /** Lifecycle-only cold materialization peak; never charged to an ordinary bounded request. */
     val lifecycleOpenPeakBytes: Long,
+)
+
+internal data class CanonicalFeaturePlanningMemoryReceipt(
+    val routeRetainedBytes: Long,
+    val lifecycleConstructionScratchBytes: Long,
+    val borrowCacheBytes: Long,
 )
 
 private open class ScalarCanonicalStateView(
@@ -510,6 +854,8 @@ internal data class ScalarCanonicalMemoryReceipt(
 /** Disabled-by-default scalar observation; it retains no current view or payload. */
 internal object CanonicalRuntimeCurrentTestHooks {
     @Volatile var onAuthenticatedBorrow: ((Long) -> Unit)? = null
+    @Volatile var onFeatureRouteRead: ((String, CowReadWork) -> Unit)? = null
+    @Volatile var failFeatureRouteRead: ((String) -> Boolean)? = null
 }
 
 internal data class CanonicalRendererPage(

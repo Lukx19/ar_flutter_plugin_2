@@ -529,6 +529,12 @@ internal class CanonicalPublishedCommit internal constructor(
         return total
     }
 
+    /** O(1) access to ordered, already-authenticated lease-routing providers. */
+    internal fun routingGenerationCount(): Int { check(!closed); return generations.size }
+    internal fun routingGenerationAt(ordinal: Int): CanonicalCowGeneration {
+        check(!closed); return generations[ordinal]
+    }
+
     internal fun leaseMemoryReceipt(): CanonicalCowLeaseMemoryReceipt {
         val rootProofBytes = Math.addExact(512L, Math.multiplyExact(roots.size.toLong(), 512L))
         var retainedGenerations = 0L

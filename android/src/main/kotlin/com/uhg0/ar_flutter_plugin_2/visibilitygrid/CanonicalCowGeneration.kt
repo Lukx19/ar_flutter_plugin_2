@@ -333,6 +333,51 @@ internal class CanonicalCowGeneration private constructor(
         return if (valid) CowLookup.Complete(listOfNotNull(value)) else CowLookup.Refused
     }
 
+    /** One generation-local row read. It never delegates to an older overlay. */
+    @Synchronized
+    internal fun routedSurface(voxel: Voxel): CompactSurface? {
+        if (closed) return null
+        val before = readWorkReceipt()
+        val key = voxelKey(voxel.x, voxel.y, voxel.z)
+        var id: Long? = null
+        if (!records(CowFragmentKind.VOXEL_INDEX, key) { record ->
+            if (record is CowRecord.Index && record.x == voxel.x && record.y == voxel.y && record.z == voxel.z) {
+                id = record.id
+            }
+            true
+        }) return null
+        return id?.let { wanted ->
+            var value: CompactSurface? = null
+            if (!records(CowFragmentKind.ROW, wanted) { record ->
+                if (record is CowRecord.Row && record.value.id == wanted) value = record.value.surface()
+                true
+            }) null else value
+        }.also { CanonicalRuntimeCurrentTestHooks.onFeatureRouteRead?.invoke("row", readWorkReceipt() - before) }
+    }
+
+    /** One generation-local allocation-source read with no ancestry fallback. */
+    @Synchronized
+    internal fun routedSource(id: SurfaceId): PagedSource? {
+        if (closed) return null
+        val before = readWorkReceipt()
+        var value: PagedSource? = null
+        if (!records(CowFragmentKind.SOURCE, id.value) { record ->
+            if (record is CowRecord.Source && record.value.id == id.value) value = record.value.source()
+            true
+        }) return null
+        return value.also { CanonicalRuntimeCurrentTestHooks.onFeatureRouteRead?.invoke("source", readWorkReceipt() - before) }
+    }
+
+    /** Lifecycle-only routing materialization; each fragment is streamed once. */
+    @Synchronized
+    internal fun visitRoutingRecords(sink: (CowFragmentKind, CowRecord) -> Boolean): Boolean {
+        if (closed) return false
+        for (kind in listOf(CowFragmentKind.SOURCE, CowFragmentKind.VOXEL_TOMBSTONE, CowFragmentKind.VOXEL_INDEX)) {
+            if (!records(kind) { sink(kind, it) }) return false
+        }
+        return true
+    }
+
     @Synchronized
     internal fun visitSupport(
         rootHash: CanonicalReceiptBytes,

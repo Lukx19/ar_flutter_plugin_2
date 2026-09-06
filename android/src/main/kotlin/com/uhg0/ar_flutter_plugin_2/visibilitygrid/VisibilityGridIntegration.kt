@@ -680,7 +680,7 @@ internal class VisibilityGridIntegration(
             return
         }
         val activeOwner = requireNotNull(owner)
-        val preparation = requireNotNull(resources).withFeaturePlanningCurrent {
+        val preparation = requireNotNull(resources).withFeaturePlanningCurrent(changes.size) {
             activeOwner.prepareAdjacentMutation(
                 it,
                 CanonicalFeatureBatchCommand(
@@ -772,7 +772,7 @@ internal class VisibilityGridIntegration(
         changes: List<FeatureFusionChange>,
         mutation: PreparedCanonicalMutation,
     ): Boolean {
-        val assignments = requireNotNull(resources).withFeaturePlanningCurrent { current ->
+        val assignments = requireNotNull(resources).withFeaturePlanningCurrent(changes.size) { current ->
             canonicalAssignments(changes, mutation, current)
         }
         if (assignments == null) {

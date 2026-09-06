@@ -42,10 +42,19 @@ class BoundedCanonicalDepthLookupTest {
             assertTrue(resources.openInitial(committedEmptyBaseline("binding", group.value, 1, 1, 1)) is SurfaceOwnershipOpenResult.Opened)
             val generationZeroReceipt = requireNotNull(resources.completeCurrentLeaseReceipt())
             assertEquals(0L, generationZeroReceipt.cowProofAndIndexBytes)
+            assertEquals(2_373_056L, generationZeroReceipt.featurePlanningRouteBytes)
             assertEquals(
-                generationZeroReceipt.baseRetained.residentTotalBytes,
+                Math.addExact(
+                    generationZeroReceipt.baseRetained.residentTotalBytes,
+                    generationZeroReceipt.featurePlanningRouteBytes,
+                ),
                 generationZeroReceipt.retainedTotalBytes,
             )
+            val planningMemory = requireNotNull(resources.featurePlanningMemoryReceipt(1))
+            assertEquals(2_373_056L, planningMemory.routeRetainedBytes)
+            assertEquals(1_572_960L, planningMemory.lifecycleConstructionScratchBytes)
+            assertEquals(200L, planningMemory.borrowCacheBytes)
+            assertTrue(planningMemory.routeRetainedBytes <= 4L * 1024L * 1024L)
             val create = resources.prepareEvidenceBatch(
                 CanonicalEvidenceBatchCommand(
                     "warm-create", 1, 1,
@@ -99,8 +108,11 @@ class BoundedCanonicalDepthLookupTest {
             assertTrue(leaseReceipt.cowProofAndIndexBytes > 0)
             assertEquals(
                 Math.addExact(
-                    leaseReceipt.baseRetained.residentTotalBytes,
-                    leaseReceipt.cowProofAndIndexBytes,
+                    Math.addExact(
+                        leaseReceipt.baseRetained.residentTotalBytes,
+                        leaseReceipt.cowProofAndIndexBytes,
+                    ),
+                    leaseReceipt.featurePlanningRouteBytes,
                 ),
                 leaseReceipt.retainedTotalBytes,
             )
@@ -141,6 +153,54 @@ class BoundedCanonicalDepthLookupTest {
         } finally {
             CanonicalCowGenerationTestHooks.onVerifiedOpen = null
             shallow.close(); deep.close()
+        }
+    }
+
+    @Test
+    fun `feature planning routed work is identical across shallow and deep history`() {
+        val deepGenerationCount = 3
+        val shallow = runtimeWithCommitHistory(1, "1".repeat(32))
+        val deep = runtimeWithCommitHistory(deepGenerationCount, "2".repeat(32))
+        try {
+            fun reads(runtime: CanonicalRuntimeResources, occupied: Voxel): List<Pair<String, CowReadWork>> {
+                val work = mutableListOf<Pair<String, CowReadWork>>()
+                CanonicalRuntimeCurrentTestHooks.onFeatureRouteRead = { kind, receipt -> work += kind to receipt }
+                requireNotNull(runtime.withFeaturePlanningCurrent(2) { view ->
+                    assertEquals(null, view.findByVoxel(Voxel(99_999, 0, 0)))
+                    val row = requireNotNull(view.findByVoxel(occupied))
+                    val source = requireNotNull((view.readSourceById(row.id) as CanonicalPageRead.Complete).value)
+                    row.id to source.allocationFingerprint
+                })
+                return work
+            }
+
+            val shallowWork = reads(shallow.runtime, Voxel(0, 0, 0))
+            val deepWork = reads(deep.runtime, Voxel(deepGenerationCount - 1, 0, 0))
+            assertEquals(shallowWork, deepWork)
+            assertEquals(listOf("row", "source"), shallowWork.map { it.first })
+            assertTrue(shallowWork.all { (_, work) -> work.pages in 1L..2L && work.bytes > 0L })
+        } finally {
+            CanonicalRuntimeCurrentTestHooks.onFeatureRouteRead = null
+            shallow.close(); deep.close()
+        }
+    }
+
+    @Test
+    fun `feature planning refuses a routed provider read failure without treating occupancy as empty`() {
+        val durable = runtimeWithCommitHistory(1, "3".repeat(32))
+        try {
+            CanonicalRuntimeCurrentTestHooks.failFeatureRouteRead = { it == "row" }
+            assertEquals(null, durable.runtime.withFeaturePlanningCurrent(1) { view ->
+                assertEquals(null, view.findByVoxel(Voxel(0, 0, 0)))
+                "must be discarded by the poisoned borrow"
+            })
+            CanonicalRuntimeCurrentTestHooks.failFeatureRouteRead = null
+            assertEquals(SurfaceId(1), durable.runtime.withFeaturePlanningCurrent(1) { view ->
+                requireNotNull(view.findByVoxel(Voxel(0, 0, 0))).id
+            })
+        } finally {
+            CanonicalRuntimeCurrentTestHooks.failFeatureRouteRead = null
+            durable.close()
         }
     }
 
@@ -195,7 +255,8 @@ class BoundedCanonicalDepthLookupTest {
                     oldSource.packedNormal, oldSource.normalConfidence,
                 ),
             )
-            val planned = requireNotNull(resources.withFeaturePlanningCurrent { view ->
+            val planned = requireNotNull(resources.withFeaturePlanningCurrent(1) { view ->
+                assertEquals(replacementId, requireNotNull(view.findByVoxel(Voxel(0, 0, 0))).id)
                 val row = requireNotNull(view.findById(replacementId))
                 val source = requireNotNull((view.readSourceById(replacementId) as CanonicalPageRead.Complete).value)
                 assertEquals(replacementSource.packedNormal, row.packedNormal)
@@ -233,7 +294,7 @@ class BoundedCanonicalDepthLookupTest {
                 0, 0, 0, 2, 2,
                 listOf(FeatureNormalCandidate(0, 0, 0, FeatureNormalFace.PRIMARY, -9, 7, 230)),
             ))
-            val prepared = requireNotNull(resources.withFeaturePlanningCurrent { view ->
+            val prepared = requireNotNull(resources.withFeaturePlanningCurrent(1) { view ->
                 resources.owner().prepareAdjacentMutation(
                     view,
                     CanonicalFeatureBatchCommand(
