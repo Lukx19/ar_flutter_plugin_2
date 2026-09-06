@@ -601,8 +601,8 @@ private class CanonicalFeaturePlanningRoutes private constructor(private val cap
             val key = packVisibilityGridKey(row.voxel.x, row.voxel.y, row.voxel.z)
             val retained = descriptor(key)
             val sourceProvider = if (row.id.value >= plan.sourceCut.nextSurfaceIdHighWater) providerToken else {
-                retained?.let { sourceProviders[it] }
-                    ?: plan.removedRouteKey(row.id)?.let(::descriptor)?.let { sourceProviders[it] }
+                plan.removedRouteKey(row.id)?.let(::descriptor)?.let { sourceProviders[it] }
+                    ?: retained?.takeIf { surfaceIds[it] == row.id.value }?.let { sourceProviders[it] }
                     ?: return@visitDirtyRows false
             }
             keys[dirtyCount] = key; sources[dirtyCount] = sourceProvider; ids[dirtyCount] = row.id.value; dirtyCount++

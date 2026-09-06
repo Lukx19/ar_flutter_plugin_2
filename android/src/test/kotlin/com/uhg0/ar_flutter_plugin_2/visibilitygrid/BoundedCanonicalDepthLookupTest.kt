@@ -411,6 +411,70 @@ class BoundedCanonicalDepthLookupTest {
     }
 
     @Test
+    fun `feature routing preserves relocated identity source across a vacated destination and reopen`() {
+        val durable = runtimeWithCommitHistory(2, "8".repeat(32))
+        val resources = durable.runtime
+        try {
+            val originalSource = requireNotNull(resources.withCurrent {
+                (it.readSourceById(SurfaceId(1)) as CanonicalPageRead.Complete).value
+            })
+            val cut = requireNotNull(resources.owner().activationState()).cut
+            val prepared = resources.prepareEvidenceBatch(
+                CanonicalEvidenceBatchCommand(
+                    "vacate-and-relocate-route",
+                    cut.geometryRevision,
+                    cut.lineageRevision,
+                    listOf(
+                        DepthEvidenceChange.Remove(SurfaceId(2)),
+                        DepthEvidenceChange.Relocate(
+                            SurfaceId(1),
+                            CanonicalTarget(SurfaceId(1), Voxel(1, 0, 0), 9, 7, 220),
+                        ),
+                    ),
+                ),
+            ) as CanonicalMutationPreparation.Prepared
+            var routeDelta: CanonicalFeatureRouteDeltaMemoryReceipt? = null
+            CanonicalRuntimeCurrentTestHooks.onFeatureRouteDeltaPrepared = { routeDelta = it }
+            assertTrue(resources.commitAdjacent(prepared.mutation) is CanonicalAdjacentCommitResult.Committed)
+            assertEquals(CanonicalFeatureRouteDeltaMemoryReceipt(2, 1, 148L), routeDelta)
+            val committed = requireNotNull(resources.owner().activationState())
+            val current = committed.current as CanonicalActivationCurrent.Receipt
+            assertTrue(resources.owner().acknowledgeCanonicalCurrent(
+                CanonicalAcknowledgement(
+                    current.identity.commandHash,
+                    committed.cut.geometryRevision,
+                    committed.cut.lineageRevision,
+                ),
+            ) is CanonicalAcknowledgementResult.Acknowledged)
+
+            fun assertRelocatedSource(runtime: CanonicalRuntimeResources) {
+                assertEquals(originalSource.allocationFingerprint, runtime.withFeaturePlanningCurrent(1) { view ->
+                    val row = requireNotNull(view.findByVoxel(Voxel(1, 0, 0)))
+                    assertEquals(SurfaceId(1), row.id)
+                    val source = requireNotNull((view.readSourceById(row.id) as CanonicalPageRead.Complete).value)
+                    source.allocationFingerprint
+                })
+            }
+            assertRelocatedSource(resources)
+            resources.close()
+
+            val reopened = CanonicalRuntimeResources.open(
+                durable.root, SurfaceGroup("8".repeat(32)), durable.coordinator,
+            )
+            try {
+                assertTrue(reopened.reopen() is SurfaceOwnershipOpenResult.Opened)
+                assertRelocatedSource(reopened)
+            } finally {
+                reopened.close()
+            }
+        } finally {
+            CanonicalRuntimeCurrentTestHooks.onFeatureRouteDeltaPrepared = null
+            resources.close()
+            durable.close()
+        }
+    }
+
+    @Test
     fun `feature planning after reopen refines the depth owned voxel identity`() {
         val durable = runtimeWithCommitHistory(1, "5".repeat(32))
         durable.runtime.close()
