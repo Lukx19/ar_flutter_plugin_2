@@ -841,6 +841,61 @@ class VisibilityGridIntegrationTest {
     }
 
     @Test
+    fun `renderer runtime failure after delta side effect rebuilds canonical current without delta replay`() {
+        val directory = Files.createTempDirectory("canonical-surface-runtime-renderer-runtime").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val viewId = 2143
+        val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+        var applyCount = 0
+        var sideEffectCount = 0
+        var rebuildCount = 0
+        val integration = VisibilityGridIntegration(
+            binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = resources(directory, coordinator),
+            renderer = object : CommittedRendererProjection {
+                override val maximumRows = 100_000
+                override fun applyGeometry(cut: CommittedGeometryCut): RendererProjectionResult {
+                    applyCount++
+                    sideEffectCount += cut.upserts.size
+                    throw RendererCallbackFailure("injected after renderer side effect")
+                }
+                override fun beginRebuild(cut: CommittedGeometryCut) { rebuildCount++ }
+                override fun appendRebuildPage(cut: CommittedGeometryCut) = Unit
+                override fun finishRebuild(cut: CommittedGeometryCut) = Unit
+                override fun currentRowCount() = 1
+            },
+        )
+        try {
+            val stream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            val ownership = requireNotNull(binding.currentObservationOwnership())
+            rebuildCount = 0
+
+            integration.admitFeature(feature(ownership, 10))
+            assertEquals("rendererRebuildPending", integration.integrationReceipt().status)
+            assertEquals(1, applyCount)
+            assertEquals(1, sideEffectCount)
+
+            exchange(messenger, viewId, stream, 4, 1, 1, 1)
+            exchange(messenger, viewId, stream, 5, 1, 1, 1)
+            exchange(messenger, viewId, stream, 6, 1, 1, 1)
+            exchange(messenger, viewId, stream, 7, 2, 2, 1)
+            await { integration.integrationReceipt().status == "rendererRebuildPending" }
+
+            integration.admitFeature(feature(ownership, 11, 0.32))
+            assertEquals("acknowledged", integration.integrationReceipt().status)
+            assertEquals(1, applyCount)
+            assertEquals(1, sideEffectCount)
+            assertTrue(rebuildCount >= 1)
+        } finally {
+            integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `acknowledged initial CREATE admits the next material kernel batch through v6`() {
         val directory = Files.createTempDirectory("canonical-surface-runtime-next-batch").toFile()
         val coordinator = budget(directory)
@@ -1023,7 +1078,7 @@ class VisibilityGridIntegrationTest {
     }
 
     @Test
-    fun `reopened acknowledged current gates begin and page failures until rebuild succeeds`() {
+    fun `reopened acknowledged current recovers runtime begin and page failures before admission`() {
         listOf("begin", "page").forEachIndexed { index, failurePoint ->
             val directory = Files.createTempDirectory("canonical-surface-runtime-reopen-ack-$failurePoint").toFile()
             val coordinator = budget(directory)
@@ -1060,10 +1115,10 @@ class VisibilityGridIntegrationTest {
                     override val maximumRows = 100_000
                     override fun applyGeometry(cut: CommittedGeometryCut) = RendererProjectionResult.Applied(cut.upserts.size)
                     override fun beginRebuild(cut: CommittedGeometryCut) {
-                        if (armed && failurePoint == "begin") { armed = false; throw IllegalStateException("injected begin") }
+                        if (armed && failurePoint == "begin") { armed = false; throw RendererCallbackFailure("injected begin") }
                     }
                     override fun appendRebuildPage(cut: CommittedGeometryCut) {
-                        if (armed && failurePoint == "page") { armed = false; throw IllegalStateException("injected page") }
+                        if (armed && failurePoint == "page") { armed = false; throw RendererCallbackFailure("injected page") }
                     }
                     override fun finishRebuild(cut: CommittedGeometryCut) { finishCount++ }
                 },
@@ -1587,4 +1642,6 @@ class VisibilityGridIntegrationTest {
     ): (SurfaceGroup) -> CanonicalRuntimeResources = { group ->
         CanonicalRuntimeResources.open(directory, group, coordinator)
     }
+
+    private class RendererCallbackFailure(message: String) : RuntimeException(message)
 }

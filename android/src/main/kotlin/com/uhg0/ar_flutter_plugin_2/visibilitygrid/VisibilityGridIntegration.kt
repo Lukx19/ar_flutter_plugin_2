@@ -850,11 +850,7 @@ internal class VisibilityGridIntegration(
                 }
                 val result = try {
                     renderer.applyGeometry(cut)
-                } catch (_: IllegalStateException) {
-                    pendingRendererRebuild = cut.toPendingRendererRebuild(hydrateKernel = false)
-                    receipt = receipt.copy(status = "rendererRebuildPending")
-                    return false
-                } catch (_: IllegalArgumentException) {
+                } catch (_: RuntimeException) {
                     pendingRendererRebuild = cut.toPendingRendererRebuild(hydrateKernel = false)
                     receipt = receipt.copy(status = "rendererRebuildPending")
                     return false
@@ -914,9 +910,7 @@ internal class VisibilityGridIntegration(
             return true
         } catch (_: RendererRebuildFenced) {
             return false
-        } catch (_: IllegalStateException) {
-            return false
-        } catch (_: IllegalArgumentException) {
+        } catch (_: RuntimeException) {
             return false
         } finally {
             if (!finished) runCatching { renderer.abortRebuild() }
