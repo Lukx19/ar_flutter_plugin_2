@@ -195,7 +195,7 @@ class BoundedCanonicalDepthLookupTest {
                     oldSource.packedNormal, oldSource.normalConfidence,
                 ),
             )
-            val planned = requireNotNull(resources.withCorrelatedCurrent(listOf(change)) { view ->
+            val planned = requireNotNull(resources.withFeaturePlanningCurrent { view ->
                 val row = requireNotNull(view.findById(replacementId))
                 val source = requireNotNull((view.readSourceById(replacementId) as CanonicalPageRead.Complete).value)
                 assertEquals(replacementSource.packedNormal, row.packedNormal)
@@ -233,7 +233,7 @@ class BoundedCanonicalDepthLookupTest {
                 0, 0, 0, 2, 2,
                 listOf(FeatureNormalCandidate(0, 0, 0, FeatureNormalFace.PRIMARY, -9, 7, 230)),
             ))
-            val prepared = requireNotNull(resources.withCorrelatedCurrent(listOf(change)) { view ->
+            val prepared = requireNotNull(resources.withFeaturePlanningCurrent { view ->
                 resources.owner().prepareAdjacentMutation(
                     view,
                     CanonicalFeatureBatchCommand(

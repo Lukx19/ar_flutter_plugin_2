@@ -236,6 +236,36 @@ class FeatureFusionKernelTest {
     }
 
     @Test
+    fun `canonical application updates replacement provenance without overwriting feature evidence`() {
+        val kernel = kernel()
+        val first = accepted(kernel, batch(1, listOf(evidence(0, 0, 0, 2, 1))))
+        val change = first.delta.single() as FeatureFusionChange.Upsert
+        val historicalFingerprint = CanonicalReceiptBytes(ByteArray(32) { 0x2a })
+        val replacementFingerprint = CanonicalReceiptBytes(ByteArray(32) { 0x5b })
+        assertTrue(kernel.assignCanonicalCorrelations(listOf(
+            change.assignment(SurfaceId(17), historicalFingerprint),
+        )))
+        assertTrue(kernel.prepareCanonicalRemap(
+            CanonicalFeatureRemap(
+                change.kernelSlot, SurfaceId(17), SurfaceId(42), replacementFingerprint, 0x0304, 211,
+            ),
+        ) is FeatureCanonicalRemapPreparation.Prepared)
+        kernel.applyPreparedCanonicalRemap()
+        assertEquals(replacementFingerprint, kernel.canonicalCorrelation(change.kernelSlot)?.allocationFingerprint)
+        assertEquals(0x0304, kernel.canonicalCorrelation(change.kernelSlot)?.packedNormal)
+        assertEquals(historicalFingerprint, kernel.featureEvidenceAllocationFingerprint(change.kernelSlot))
+
+        assertTrue(kernel.prepare(batch(2, listOf(evidence(0, 0, 0, 1, 2)))) is FeatureFusionResult.Accepted)
+        assertTrue(kernel.prepareCanonicalApplication(listOf(
+            change.assignment(SurfaceId(42), replacementFingerprint),
+        )))
+        kernel.applyPrepared()
+
+        assertEquals(replacementFingerprint, kernel.canonicalCorrelation(change.kernelSlot)?.allocationFingerprint)
+        assertEquals(historicalFingerprint, kernel.featureEvidenceAllocationFingerprint(change.kernelSlot))
+    }
+
+    @Test
     fun `canonical remap permits multiple feature slots to share one destination identity`() {
         val kernel = kernel()
         val accepted = accepted(kernel, batch(1, listOf(evidence(0, 0, 0, 2, 1), evidence(1, 0, 0, 2, 2))))
@@ -493,7 +523,7 @@ class FeatureFusionKernelTest {
         // retained kernel state. GraphLayout measures the active JVM object model.
         val layout = GraphLayout.parseInstance(kernel)
         val retainedBytes = layout.totalSize()
-        val primitivePayloadBytes = 7_589_536L
+        val primitivePayloadBytes = 10_789_536L
         val overheadBytes = retainedBytes - primitivePayloadBytes
         val implementationBytes = requireNotNull(
             javaClass.classLoader?.getResourceAsStream(
@@ -503,7 +533,7 @@ class FeatureFusionKernelTest {
         println("FEATURE_FUSION_RETAINED_ALLOCATION_RECEIPT implementationClassSha256=${testSha256Hex(implementationBytes)} retainedBytes=$retainedBytes primitivePayloadBytes=$primitivePayloadBytes objectAndArrayOverheadBytes=$overheadBytes assignedTupleShareBytes=${outcome.receipt.assignedTupleShareBytes}")
         assertTrue("JVM graph measurement must include headers/alignment", overheadBytes > 0)
         assertTrue(retainedBytes <= outcome.receipt.assignedTupleShareBytes)
-        assertEquals(7_589_960, outcome.receipt.assignedTupleShareBytes)
+        assertEquals(10_789_976, outcome.receipt.assignedTupleShareBytes)
     }
 
     private fun kernel() = FeatureFusionKernel()

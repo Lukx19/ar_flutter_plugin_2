@@ -686,7 +686,7 @@ internal class VisibilityGridIntegration(
             return
         }
         val activeOwner = requireNotNull(owner)
-        val preparation = requireNotNull(resources).withCorrelatedCurrent(changes) {
+        val preparation = requireNotNull(resources).withFeaturePlanningCurrent {
             activeOwner.prepareAdjacentMutation(
                 it,
                 CanonicalFeatureBatchCommand(
@@ -1383,15 +1383,36 @@ private class DepthFeatureSourceTable private constructor(maximumSources: Int) {
         val slots = IntArray(count)
         val previousIds = LongArray(count)
         val nextIds = LongArray(count)
+        val writeBySourceIndex = IntArray(size) { -1 }
+        val fingerprints = ByteArray(Math.multiplyExact(count, FeatureFusionKernel.HASH_BYTES))
+        val hasMetadata = BooleanArray(count)
+        val packedNormals = IntArray(count)
+        val normalConfidences = IntArray(count)
         var write = 0
         for (index in 0 until size) {
             if (targetIds[index] == sourceIds[index]) continue
             slots[write] = sourceSlots[index]
             previousIds[write] = sourceIds[index]
             nextIds[write] = targetIds[index]
+            writeBySourceIndex[index] = write
             write++
         }
-        return CanonicalRemapList(slots, previousIds, nextIds)
+        prepared.visitDirtyRows { row ->
+            val sourceIndex = findSourceByVoxel(packVisibilityGridKey(row.voxel.x, row.voxel.y, row.voxel.z))
+            val outputIndex = if (sourceIndex < 0) -1 else writeBySourceIndex[sourceIndex]
+            if (outputIndex >= 0 && row.id.value == nextIds[outputIndex]) {
+                row.allocationFingerprint.toByteArray().copyInto(
+                    fingerprints, outputIndex * FeatureFusionKernel.HASH_BYTES,
+                )
+                packedNormals[outputIndex] = row.packedNormal
+                normalConfidences[outputIndex] = row.normalConfidence
+                hasMetadata[outputIndex] = true
+            }
+            true
+        }
+        return CanonicalRemapList(
+            slots, previousIds, nextIds, hasMetadata, fingerprints, packedNormals, normalConfidences,
+        )
     }
 
     private fun findSourceByVoxel(key: Long): Int {
@@ -1471,6 +1492,10 @@ private class CanonicalRemapList(
     private val slots: IntArray,
     private val previousIds: LongArray,
     private val nextIds: LongArray,
+    private val hasMetadata: BooleanArray,
+    private val fingerprints: ByteArray,
+    private val packedNormals: IntArray,
+    private val normalConfidences: IntArray,
 ) : java.util.AbstractList<CanonicalFeatureRemap>() {
     override val size: Int get() = slots.size
 
@@ -1480,6 +1505,13 @@ private class CanonicalRemapList(
             slots[index],
             SurfaceId(previousIds[index]),
             nextIds[index].takeIf { it != 0L }?.let(::SurfaceId),
+            nextIds[index].takeIf { it != 0L && hasMetadata[index] }?.let {
+                CanonicalReceiptBytes(fingerprints.copyOfRange(
+                    index * FeatureFusionKernel.HASH_BYTES,
+                    (index + 1) * FeatureFusionKernel.HASH_BYTES,
+                ))
+            },
+            packedNormals[index], normalConfidences[index],
         )
     }
 }

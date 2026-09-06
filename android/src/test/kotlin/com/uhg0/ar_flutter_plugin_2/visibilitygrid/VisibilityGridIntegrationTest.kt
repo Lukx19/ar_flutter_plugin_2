@@ -689,6 +689,117 @@ class VisibilityGridIntegrationTest {
     }
 
     @Test
+    fun `depth replacement refreshes canonical feature provenance through integration`() {
+        val directory = Files.createTempDirectory("canonical-surface-runtime-depth-replacement").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val viewId = 2141
+        val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+        val depthConfiguration = DepthEvidenceConfiguration(minimumDepthMillimetres = 1)
+        val injectedDepth = DepthEvidenceKernel(depthConfiguration)
+        lateinit var featureKernel: FeatureFusionKernel
+        val cuts = mutableListOf<CommittedGeometryCut>()
+        val integration = VisibilityGridIntegration(
+            binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = resources(directory, coordinator),
+            depthKernelFactory = { injectedDepth },
+            featureKernelFactory = { FeatureFusionKernel().also { featureKernel = it } },
+            renderer = object : CommittedRendererProjection {
+                override fun applyGeometry(cut: CommittedGeometryCut) = RendererProjectionResult.Applied(cut.upserts.size)
+                    .also { cuts += cut }
+            },
+        )
+        try {
+            val stream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            val ownership = requireNotNull(binding.currentObservationOwnership())
+            integration.admitFeature(twoFeature(ownership, 10))
+            exchange(messenger, viewId, stream, 4, 1, 1, 1)
+            exchange(messenger, viewId, stream, 5, 1, 1, 1)
+            exchange(messenger, viewId, stream, 6, 1, 1, 1)
+            exchange(messenger, viewId, stream, 7, 2, 2, 1)
+            await { integration.integrationReceipt().status == "acknowledged" }
+            val initialRows = cuts.single().upserts.associateBy { it.voxel }
+            val firstVoxel = Voxel(-8, 0, -10)
+            val secondVoxel = Voxel(7, 0, -10)
+            val first = requireNotNull(initialRows[firstVoxel])
+            val second = requireNotNull(initialRows[secondVoxel])
+            val trainingView = ReplacementTrainingView(mapOf(
+                firstVoxel to second.toDepthCanonicalSurface(), secondVoxel to first.toDepthCanonicalSurface(),
+            ))
+            val samples = replacementDepthSamples()
+            repeat(3) { index ->
+                assertTrue(injectedDepth.prepare(
+                    replacementDepthBatch(index + 1L, ownership, samples), trainingView,
+                ) is DepthEvidenceResult.Accepted)
+                injectedDepth.applyPrepared()
+            }
+            integration.admitFeature(feature(ownership, 10, x = -0.75, z = -0.95))
+            integration.admitFeature(feature(ownership, 10, x = -0.75, z = -0.95))
+
+            integration.admitDepth(depthWithSamples(ownership, 20, samples))
+            assertEquals("pendingAck", integration.integrationReceipt().status)
+            val historical = listOf(0, 1).map { requireNotNull(featureKernel.featureEvidenceAllocationFingerprint(it)) }
+            val replacementCorrelations = arrayOfNulls<CanonicalFeatureCorrelation>(2)
+            cuts.last().upserts.forEach { row ->
+                val slot = requireNotNull(featureKernel.canonicalFeatureSlot(row.voxel, SurfaceId(row.surfaceId))) {
+                    "row=$row correlations=${listOf(featureKernel.canonicalCorrelation(0), featureKernel.canonicalCorrelation(1))}"
+                }
+                val correlation = requireNotNull(featureKernel.canonicalCorrelation(slot))
+                replacementCorrelations[slot] = correlation
+                assertTrue(correlation.allocationFingerprint != historical[slot])
+                assertEquals(row.packedNormal, correlation.packedNormal)
+                assertEquals(row.normalConfidence, correlation.normalConfidence)
+                assertEquals(historical[slot], featureKernel.featureEvidenceAllocationFingerprint(slot))
+            }
+            exchange(messenger, viewId, stream, 8, 2, 2, 1)
+            exchange(messenger, viewId, stream, 9, 2, 2, 1)
+            exchange(messenger, viewId, stream, 10, 2, 2, 1)
+            exchange(messenger, viewId, stream, 11, 3, 3, 2)
+            await { integration.integrationReceipt().status == "acknowledged" }
+            integration.admitFeature(feature(ownership, 30, x = -0.75, z = -0.95))
+            assertTrue(integration.integrationReceipt().status != "kernelApplyRefused")
+            if (integration.integrationReceipt().status == "pendingAck") {
+                exchange(messenger, viewId, stream, 12, 3, 3, 2)
+                exchange(messenger, viewId, stream, 13, 3, 3, 2)
+                exchange(messenger, viewId, stream, 14, 3, 3, 2)
+                exchange(messenger, viewId, stream, 15, 4, 4, 2)
+                await { integration.integrationReceipt().status == "acknowledged" }
+            }
+            integration.close()
+            binding.dispose()
+
+            val reopenedBinding = VisibilityGridV2Binding(
+                messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() },
+            )
+            lateinit var reopenedKernel: FeatureFusionKernel
+            val reopened = VisibilityGridIntegration(
+                reopenedBinding, reopenedBinding::currentObservationOwnership, directory,
+                resourcesForGroup = resources(directory, coordinator),
+                featureKernelFactory = { FeatureFusionKernel().also { reopenedKernel = it } },
+            )
+            try {
+                val reopenedStream = start(reopenedBinding, messenger, viewId)
+                exchange(messenger, viewId, reopenedStream, 1, 0, 0, 0)
+                exchange(messenger, viewId, reopenedStream, 2, 0, 0, 0)
+                exchange(messenger, viewId, reopenedStream, 3, 1, 1, 1)
+                val reopenedOwnership = requireNotNull(reopenedBinding.currentObservationOwnership())
+                reopened.admitFeature(feature(reopenedOwnership, 40, x = -0.75, z = -0.95))
+                assertTrue(reopened.integrationReceipt().status != "kernelApplyRefused")
+                val expected = requireNotNull(replacementCorrelations[0])
+                val reopenedSlot = requireNotNull(reopenedKernel.canonicalFeatureSlot(firstVoxel, expected.id))
+                assertEquals(expected.allocationFingerprint, reopenedKernel.canonicalCorrelation(reopenedSlot)?.allocationFingerprint)
+            } finally {
+                reopened.close(); reopenedBinding.dispose()
+            }
+        } finally {
+            integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `canonical commit refusal leaves new and refined kernel batches retryable`() {
         val directory = Files.createTempDirectory("canonical-surface-runtime-kernel-retry").toFile()
         val coordinator = budget(directory)
@@ -1602,6 +1713,53 @@ class VisibilityGridIntegrationTest {
         )
     }
 
+    private fun twoFeature(cut: VisibilityObservationOwnership, timestamp: Long): VisibilityFeatureObservation {
+        val samples = VisibilityFeatureObservation.copySamples(listOf(
+            VisibilityFeatureSample(7, -0.75, 0.02, -0.95, 1.0),
+            VisibilityFeatureSample(8, 0.75, 0.02, -0.95, 1.0),
+        ))
+        return VisibilityFeatureObservation(
+            ownership = cut,
+            frame = VisibilityObservationFrame(
+                VisibilityObservationSource.SYNTHETIC_FEATURE, timestamp, timestamp, timestamp,
+                "synthetic-camera", true, "landscape_right_x_right_y_down_v1",
+                VisibilityCameraPose.copyOf(identityVisibilityGridTransform()),
+                VisibilityCameraIntrinsics(16, 12, 10.0, 10.0, 8.0, 6.0), VisibilityDepthCapability.UNSUPPORTED,
+            ),
+            samples = samples, sourceRejectedSamples = 0,
+            payloadBytes = VisibilityFeatureObservation.FEATURE_FIXED_BYTES + samples.size * VisibilityFeatureObservation.FEATURE_SAMPLE_BYTES,
+        )
+    }
+
+    private fun replacementDepthSamples() = listOf(
+        VisibilityDepthSample(0, 0, 10, 255), VisibilityDepthSample(3, 0, 10, 255),
+    )
+
+    private fun replacementDepthBatch(
+        sequence: Long,
+        ownership: VisibilityObservationOwnership,
+        samples: List<VisibilityDepthSample>,
+    ) = DepthEvidenceBatch(
+        sequence, sequence, ownership.groupFrame, ownership.groupFrame.groupFromWorldGl.toList(),
+        VisibilityCameraIntrinsics(4, 3, 2.0, 1.0, 1.5, 0.0), samples, 0,
+    )
+
+    private fun depthWithSamples(
+        cut: VisibilityObservationOwnership,
+        timestamp: Long,
+        samples: List<VisibilityDepthSample>,
+    ) = VisibilityDepthObservation(
+        ownership = cut,
+        frame = VisibilityObservationFrame(
+            VisibilityObservationSource.SYNTHETIC_DEPTH, timestamp, timestamp, timestamp,
+            "synthetic-camera", true, "landscape_right_x_right_y_down_v1",
+            VisibilityCameraPose.copyOf(identityVisibilityGridTransform()),
+            VisibilityCameraIntrinsics(4, 3, 2.0, 1.0, 1.5, 0.0), VisibilityDepthCapability.RAW_DEPTH,
+        ),
+        samples = samples, sourceRejectedSamples = 0,
+        payloadBytes = VisibilityDepthObservation.DEPTH_FIXED_BYTES + samples.size * VisibilityDepthObservation.DEPTH_SAMPLE_BYTES,
+    )
+
     private fun normalEvidence(supportId: Int, positive: Boolean): FeatureFusionEvidence {
         val cameraX = if (positive) 1_020 else -980
         return FeatureFusionEvidence(
@@ -1642,6 +1800,10 @@ class VisibilityGridIntegrationTest {
         packedNormal = 0,
         normalConfidence = 0,
         lineageCount = 0,
+    )
+
+    private fun CommittedGeometryRow.toDepthCanonicalSurface() = DepthCanonicalSurface(
+        SurfaceId(surfaceId), voxel, packedNormal, normalConfidence, lineageCount,
     )
 
     private fun startRequest() = ControlRequest(
@@ -1688,4 +1850,17 @@ class VisibilityGridIntegrationTest {
     }
 
     private class RendererCallbackFailure(message: String) : RuntimeException(message)
+
+    private class ReplacementTrainingView(
+        private val surfaces: Map<Voxel, DepthCanonicalSurface>,
+    ) : BoundedCanonicalSurfaceView {
+        override val revisionPair = CanonicalRevisionPair(2, 1)
+        override val surfaceCount get() = surfaces.size
+        override fun findSurfaceById(id: SurfaceId) = surfaces.values.firstOrNull { it.id == id }
+        override fun findSurfaceAt(voxel: Voxel) = surfaces[voxel]?.let { AddressedCanonicalSurface(voxel, it) }
+        override fun visitRayCells(
+            startGroupMm: DepthPointMm, endpointGroupMm: DepthPointMm, maximumVisits: Int,
+            visitor: (Voxel, DepthCanonicalSurface?) -> Boolean,
+        ): DepthRayVisitResult = error("depth preparation owns ray traversal")
+    }
 }

@@ -80,7 +80,17 @@ internal class FeatureFusionKernel(
     internal fun applyPreparedCanonicalRemap() {
         val prepared = checkNotNull(pendingCanonicalRemap) { "no prepared canonical remap" }
         for (index in prepared.slots.indices) {
-            canonicalIds[prepared.slots[index]] = prepared.targetIds[index].toInt()
+            val slot = prepared.slots[index]
+            canonicalIds[slot] = prepared.targetIds[index].toInt()
+            if (prepared.hasCanonicalMetadata[index]) {
+                prepared.fingerprints.copyInto(
+                    canonicalAllocationFingerprints, slot * HASH_BYTES,
+                    index * HASH_BYTES, (index + 1) * HASH_BYTES,
+                )
+                accumulatedWeights[slot] = encodeWeightAndCanonical(
+                    retainedWeight(slot), prepared.packedNormals[index], prepared.normalConfidences[index],
+                )
+            }
         }
         pendingCanonicalRemap = null
     }
@@ -104,6 +114,10 @@ internal class FeatureFusionKernel(
         val seenSlots = IntArray(tableCapacity)
         val slots = IntArray(count)
         val targetIds = LongArray(count)
+        val hasCanonicalMetadata = BooleanArray(count)
+        val fingerprints = ByteArray(Math.multiplyExact(count, HASH_BYTES))
+        val packedNormals = IntArray(count)
+        val normalConfidences = IntArray(count)
         for (index in remaps.indices) {
             val remap = remaps[index]
             val slot = remap.featureSlot
@@ -125,8 +139,19 @@ internal class FeatureFusionKernel(
             }
             slots[index] = slot
             targetIds[index] = target
+            remap.nextAllocationFingerprint?.let { fingerprint ->
+                if (fingerprint.size != HASH_BYTES || remap.nextPackedNormal !in 0..0xffff ||
+                    remap.nextNormalConfidence !in 0..255 || remap.nextSurfaceId == null
+                ) return CanonicalRemapStage.Refused(FeatureCanonicalRemapRefusal.INVALID_ID)
+                hasCanonicalMetadata[index] = true
+                fingerprint.toByteArray().copyInto(fingerprints, index * HASH_BYTES)
+                packedNormals[index] = remap.nextPackedNormal
+                normalConfidences[index] = remap.nextNormalConfidence
+            }
         }
-        return CanonicalRemapStage.Accepted(PendingCanonicalRemap(slots, targetIds))
+        return CanonicalRemapStage.Accepted(PendingCanonicalRemap(
+            slots, targetIds, hasCanonicalMetadata, fingerprints, packedNormals, normalConfidences,
+        ))
     }
 
     private fun remapTableCapacity(count: Int): Int {
@@ -189,9 +214,7 @@ internal class FeatureFusionKernel(
                 expectedKey != packVisibilityGridKey(assignment.x, assignment.y, assignment.z)
             ) return false
             val retained = if (slot < surfaceCount) canonicalIds[slot] else 0
-            if (retained != 0 && (retained != assignment.id.value.toInt() ||
-                    canonicalCorrelation(slot)?.allocationFingerprint != assignment.allocationFingerprint)
-            ) return false
+            if (retained != 0 && retained != assignment.id.value.toInt()) return false
             copied += assignment
         }
         val sortedNew = copied.filter { (if (it.kernelSlot < surfaceCount) canonicalIds[it.kernelSlot] else 0) == 0 }
@@ -216,6 +239,11 @@ internal class FeatureFusionKernel(
             ) return false
         }
         prepared.assignments = copied
+        prepared.canonicalFingerprints = ByteArray(Math.multiplyExact(copied.size, HASH_BYTES)).also { fingerprints ->
+            copied.forEachIndexed { index, assignment ->
+                assignment.allocationFingerprint.toByteArray().copyInto(fingerprints, index * HASH_BYTES)
+            }
+        }
         prepared.sortedNewAssignments = sortedNew
         prepared.extendLastRange = extendLast
         prepared.newRangeFingerprint = sortedNew.firstOrNull()?.allocationFingerprint?.toByteArray()
@@ -263,9 +291,15 @@ internal class FeatureFusionKernel(
         for (assignment in prepared.sortedNewAssignments) {
             canonicalIds[assignment.kernelSlot] = assignment.id.value.toInt()
         }
-        for (assignment in assignments) {
+        for ((assignmentIndex, assignment) in assignments.withIndex()) {
             accumulatedWeights[assignment.kernelSlot] = encodeWeightAndCanonical(
                 retainedWeight(assignment.kernelSlot), assignment.packedNormal, assignment.normalConfidence,
+            )
+            requireNotNull(prepared.canonicalFingerprints).copyInto(
+                canonicalAllocationFingerprints,
+                assignment.kernelSlot * HASH_BYTES,
+                assignmentIndex * HASH_BYTES,
+                (assignmentIndex + 1) * HASH_BYTES,
             )
         }
         installCanonicalAllocationRange(
@@ -555,9 +589,7 @@ internal class FeatureFusionKernel(
             val retained = canonicalIds[slot]
             if (retained == 0) {
                 sortedNew += assignment
-            } else if (retained != encoded ||
-                canonicalCorrelation(slot)?.allocationFingerprint != assignment.allocationFingerprint
-            ) return false
+            } else if (retained != encoded) return false
         }
         sortedNew.sortWith { left, right ->
             java.lang.Integer.compareUnsigned(left.id.value.toInt(), right.id.value.toInt())
@@ -589,6 +621,10 @@ internal class FeatureFusionKernel(
         for (assignment in assignments) {
             accumulatedWeights[assignment.kernelSlot] = encodeWeightAndCanonical(
                 retainedWeight(assignment.kernelSlot), assignment.packedNormal, assignment.normalConfidence,
+            )
+            assignment.allocationFingerprint.toByteArray().copyInto(
+                canonicalAllocationFingerprints,
+                assignment.kernelSlot * HASH_BYTES,
             )
         }
         installCanonicalAllocationRange(
@@ -639,13 +675,24 @@ internal class FeatureFusionKernel(
         if (encodedId == 0) return null
         val rangeIndex = canonicalRangeIndex(observationCounts[kernelSlot])
         if (rangeIndex !in 0 until allocationRangeCount) return null
-        val offset = rangeIndex * HASH_BYTES
         return CanonicalFeatureCorrelation(
             SurfaceId(encodedId.toLong() and UINT32_MASK),
-            CanonicalReceiptBytes(allocationFingerprints.copyOfRange(offset, offset + HASH_BYTES)),
+            CanonicalReceiptBytes(canonicalAllocationFingerprints.copyOfRange(
+                kernelSlot * HASH_BYTES,
+                (kernelSlot + 1) * HASH_BYTES,
+            )),
             retainedPackedNormal(kernelSlot),
             retainedConfidence(kernelSlot),
         )
+    }
+
+    /** Immutable allocation provenance recorded when this feature slot first gained canonical identity. */
+    internal fun featureEvidenceAllocationFingerprint(kernelSlot: Int): CanonicalReceiptBytes? {
+        if (kernelSlot !in 0 until surfaceCount || canonicalIds[kernelSlot] == 0) return null
+        val rangeIndex = canonicalRangeIndex(observationCounts[kernelSlot])
+        if (rangeIndex !in 0 until allocationRangeCount) return null
+        val offset = rangeIndex * HASH_BYTES
+        return CanonicalReceiptBytes(allocationFingerprints.copyOfRange(offset, offset + HASH_BYTES))
     }
 
     /** Resolves one retained feature slot by its exact voxel and canonical identity. */
@@ -781,6 +828,7 @@ internal class FeatureFusionKernel(
         val timestampNs: Long,
     ) {
         var assignments: List<CanonicalFeatureAssignment>? = null
+        var canonicalFingerprints: ByteArray? = null
         var sortedNewAssignments: List<CanonicalFeatureAssignment> = emptyList()
         var extendLastRange: Boolean = false
         var newRangeFingerprint: ByteArray? = null
@@ -789,6 +837,10 @@ internal class FeatureFusionKernel(
     private class PendingCanonicalRemap(
         val slots: IntArray,
         val targetIds: LongArray,
+        val hasCanonicalMetadata: BooleanArray,
+        val fingerprints: ByteArray,
+        val packedNormals: IntArray,
+        val normalConfidences: IntArray,
     )
 
     private sealed interface CanonicalRemapStage {
@@ -801,6 +853,9 @@ internal class FeatureFusionKernel(
     // the exact uint32 canonical identity without growing the tuple payload.
     private val surfaceKeys = LongArray(SURFACE_CAPACITY)
     private val canonicalIds = IntArray(SURFACE_CAPACITY)
+    // Canonical association provenance is mutable after replacement, while the
+    // allocation-range table below remains immutable historical feature evidence.
+    private val canonicalAllocationFingerprints = ByteArray(SURFACE_CAPACITY * HASH_BYTES)
     private val allocationRangeStarts = IntArray(MAX_ALLOCATION_RANGES)
     private val allocationRangeEnds = IntArray(MAX_ALLOCATION_RANGES)
     private val allocationFingerprints = ByteArray(MAX_ALLOCATION_RANGES * HASH_BYTES)
@@ -835,14 +890,19 @@ internal class FeatureFusionKernel(
             require(count in 0..SURFACE_CAPACITY)
             val slots = Math.addExact(ARRAY_HEADER_BYTES, Math.multiplyExact(count.toLong(), Int.SIZE_BYTES.toLong()))
             val targets = Math.addExact(ARRAY_HEADER_BYTES, Math.multiplyExact(count.toLong(), Long.SIZE_BYTES.toLong()))
-            return Math.addExact(slots, targets)
+            val flags = Math.addExact(ARRAY_HEADER_BYTES, count.toLong())
+            val fingerprints = Math.addExact(ARRAY_HEADER_BYTES, Math.multiplyExact(count.toLong(), HASH_BYTES.toLong()))
+            val metadata = Math.multiplyExact(
+                2L, Math.addExact(ARRAY_HEADER_BYTES, Math.multiplyExact(count.toLong(), Int.SIZE_BYTES.toLong())),
+            )
+            return listOf(slots, targets, flags, fingerprints, metadata).fold(0L, Math::addExact)
         }
 
         const val SURFACE_CAPACITY = 100_000
         const val ASSOCIATION_CAPACITY = 200_000
         const val HASH_SLOTS = 262_144
         const val HASH_MASK = HASH_SLOTS - 1
-        const val CANONICAL_SURFACE_TUPLE_SHARE_BYTES = 7_589_960
+        const val CANONICAL_SURFACE_TUPLE_SHARE_BYTES = 10_789_976
         const val MAX_ALLOCATION_RANGES = 1_024
         const val HASH_BYTES = 32
         const val UINT32_MASK = 0xffff_ffffL
@@ -955,6 +1015,9 @@ internal data class CanonicalFeatureRemap(
     val featureSlot: Int,
     val previousSurfaceId: SurfaceId,
     val nextSurfaceId: SurfaceId?,
+    val nextAllocationFingerprint: CanonicalReceiptBytes? = null,
+    val nextPackedNormal: Int = 0,
+    val nextNormalConfidence: Int = 0,
 )
 internal sealed interface FeatureCanonicalRemapPreparation {
     data class Prepared(val count: Int) : FeatureCanonicalRemapPreparation

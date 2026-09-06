@@ -158,18 +158,11 @@ internal class CanonicalRuntimeResources private constructor(
             invalidateCurrent()
             return onFailure(CompleteCurrentBorrowFailure.CURRENT_UNAVAILABLE)
         }
-        val result = block(lease.completeView)
-        if (result is CanonicalMutationPreparation.Prepared && lease.commit != null) {
-            check(CanonicalAuthorityLeaseRegistry.attachPublished(
-                result.mutation.authorityLease, requireNotNull(lease.commit),
-            ))
-        }
-        return result
+        return attachRetainedPublishedAuthority(lease, block(lease.completeView))
     }
 
-    /** Dirty-only view: exact current scalars plus kernel-owned row correlation. */
-    @Synchronized fun <T> withCorrelatedCurrent(
-        @Suppress("UNUSED_PARAMETER") changes: List<FeatureFusionChange>,
+    /** Borrows complete canonical authority for bounded feature planning. */
+    @Synchronized fun <T> withFeaturePlanningCurrent(
         block: (CanonicalStateView) -> T,
     ): T? {
         checkOpen()
@@ -188,7 +181,10 @@ internal class CanonicalRuntimeResources private constructor(
         if (!lease.isCurrent(owner?.activationState()?.cut) || view.cut != lease.scalarView.cut) {
             invalidateCurrent(); return null
         }
-        val result = block(view)
+        return attachRetainedPublishedAuthority(lease, block(view))
+    }
+
+    private fun <T> attachRetainedPublishedAuthority(lease: CurrentLease, result: T): T {
         if (result is CanonicalMutationPreparation.Prepared && lease.commit != null) {
             check(CanonicalAuthorityLeaseRegistry.attachPublished(
                 result.mutation.authorityLease, requireNotNull(lease.commit),
