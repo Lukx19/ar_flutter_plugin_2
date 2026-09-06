@@ -841,7 +841,7 @@ class VisibilityGridIntegrationTest {
     }
 
     @Test
-    fun `renderer runtime failure after delta side effect rebuilds canonical current without delta replay`() {
+    fun `ACK before rebuild retains recovery when renderer row count throws once`() {
         val directory = Files.createTempDirectory("canonical-surface-runtime-renderer-runtime").toFile()
         val coordinator = budget(directory)
         val messenger = MethodTestMessenger()
@@ -850,6 +850,7 @@ class VisibilityGridIntegrationTest {
         var applyCount = 0
         var sideEffectCount = 0
         var rebuildCount = 0
+        var failRowCount = false
         val integration = VisibilityGridIntegration(
             binding, binding::currentObservationOwnership, directory,
             resourcesForGroup = resources(directory, coordinator),
@@ -858,12 +859,19 @@ class VisibilityGridIntegrationTest {
                 override fun applyGeometry(cut: CommittedGeometryCut): RendererProjectionResult {
                     applyCount++
                     sideEffectCount += cut.upserts.size
+                    failRowCount = true
                     throw RendererCallbackFailure("injected after renderer side effect")
                 }
                 override fun beginRebuild(cut: CommittedGeometryCut) { rebuildCount++ }
                 override fun appendRebuildPage(cut: CommittedGeometryCut) = Unit
                 override fun finishRebuild(cut: CommittedGeometryCut) = Unit
-                override fun currentRowCount() = 1
+                override fun currentRowCount(): Int {
+                    if (failRowCount) {
+                        failRowCount = false
+                        throw RendererCallbackFailure("injected renderer row count")
+                    }
+                    return 1
+                }
             },
         )
         try {
@@ -886,6 +894,11 @@ class VisibilityGridIntegrationTest {
             await { integration.integrationReceipt().status == "rendererRebuildPending" }
 
             integration.admitFeature(feature(ownership, 11, 0.32))
+            assertEquals("rendererRebuildPending", integration.integrationReceipt().status)
+            assertEquals(1, applyCount)
+            assertEquals(1, sideEffectCount)
+
+            integration.admitFeature(feature(ownership, 12, 0.32))
             assertEquals("acknowledged", integration.integrationReceipt().status)
             assertEquals(1, applyCount)
             assertEquals(1, sideEffectCount)

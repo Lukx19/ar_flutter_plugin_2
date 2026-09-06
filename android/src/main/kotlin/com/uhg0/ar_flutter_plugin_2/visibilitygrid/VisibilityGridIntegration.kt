@@ -37,6 +37,8 @@ private data class PendingRendererRebuild(
     }
 }
 
+private data class RendererRebuildSuccess(val rowCount: Int)
+
 internal data class PendingDepthRetentionReceipt(
     val pendingOwnerScalarBytes: Long,
     val mutationPlanBytes: Long,
@@ -340,7 +342,10 @@ internal class VisibilityGridIntegration(
     private fun ensureOpened(expected: VisibilityObservationOwnership): committedEmptyBaseline? {
         if (cut == expected) {
             pendingRendererRebuild?.let { rebuild ->
-                if (retryRendererRebuild(rebuild)) receipt = receipt.copy(status = "rendererRebuildRecovered")
+                if (retryRendererRebuild(rebuild) != null) {
+                    if (pendingRendererRebuild === rebuild) pendingRendererRebuild = null
+                    receipt = receipt.copy(status = "rendererRebuildRecovered")
+                }
                 return null
             }
             return baseline
@@ -374,12 +379,12 @@ internal class VisibilityGridIntegration(
                 val rebuilt = rebuildCanonicalRenderer(expected, state)
                 publishV6Current(
                     expected, state,
-                    rendererAlreadyCurrent = rebuilt,
-                    rendererRebuildRequired = !rebuilt,
-                    rendererRebuildHydratesKernel = !rebuilt,
+                    rendererAlreadyCurrentRows = rebuilt?.rowCount,
+                    rendererRebuildRequired = rebuilt == null,
+                    rendererRebuildHydratesKernel = rebuilt == null,
                 )
             } else {
-                if (!rebuildCanonicalRenderer(expected, state)) {
+                if (rebuildCanonicalRenderer(expected, state) == null) {
                     pendingRendererRebuild = PendingRendererRebuild(
                         expected, 0, state.cut.geometryRevision, state.cut.lineageRevision, true,
                     )
@@ -749,7 +754,7 @@ internal class VisibilityGridIntegration(
         expected: VisibilityObservationOwnership,
         state: CanonicalActivationState,
         mutation: PreparedCanonicalMutation? = null,
-        rendererAlreadyCurrent: Boolean = false,
+        rendererAlreadyCurrentRows: Int? = null,
         rendererRebuildRequired: Boolean = false,
         rendererRebuildHydratesKernel: Boolean = false,
         prebuiltGeometryCut: CommittedGeometryCut? = null,
@@ -795,14 +800,14 @@ internal class VisibilityGridIntegration(
         pending = selector
         pendingQueued = false
         pendingGeometryCut = geometryCut
-        pendingRendererApplied = rendererAlreadyCurrent
+        pendingRendererApplied = rendererAlreadyCurrentRows != null
         pendingRendererRebuild = if (rendererRebuildRequired) PendingRendererRebuild(
             expected, selector.transactionId, state.cut.geometryRevision,
             state.cut.lineageRevision, rendererRebuildHydratesKernel,
         ) else null
         pendingBindingAcknowledged = false
         pendingEarlyAcknowledged = false
-        pendingRendererRows = if (rendererAlreadyCurrent) renderer.currentRowCount() else 0
+        pendingRendererRows = rendererAlreadyCurrentRows ?: 0
         committed++
         receipt = VisibilityGridIntegrationReceipt(
             "pendingAck", expected.bindingGeneration, expected.sessionGeneration,
@@ -835,13 +840,14 @@ internal class VisibilityGridIntegration(
         if (!pendingRendererApplied) {
             val rebuild = pendingRendererRebuild
             if (rebuild != null) {
-                if (!retryRendererRebuild(rebuild)) {
+                val success = retryRendererRebuild(rebuild)
+                if (success == null) {
                     receipt = receipt.copy(status = "rendererRebuildPending")
                     return false
                 }
                 pendingRendererRebuild = null
                 pendingRendererApplied = true
-                pendingRendererRows = renderer.currentRowCount()
+                pendingRendererRows = success.rowCount
             } else {
                 val cut = pendingGeometryCut ?: return false
                 if (isFenced(cut.ownership)) {
@@ -879,7 +885,7 @@ internal class VisibilityGridIntegration(
         state: CanonicalActivationState,
         transactionId: Long = 0,
         hydrateKernel: Boolean = true,
-    ): Boolean {
+    ): RendererRebuildSuccess? {
         val rebuildCut = CommittedGeometryCut(
             ownership = expected,
             transactionId = transactionId,
@@ -902,33 +908,32 @@ internal class VisibilityGridIntegration(
             } ?: run {
                 rejected++
                 receipt = receipt.copy(status = "rebuildRefused", rejected = rejected)
-                return false
+                return null
             }
-            if (rebuilt != state.cut || isFenced(expected)) return false
+            if (rebuilt != state.cut || isFenced(expected)) return null
             renderer.finishRebuild(rebuildCut)
+            val rowCount = renderer.currentRowCount()
             finished = true
-            return true
+            return RendererRebuildSuccess(rowCount)
         } catch (_: RendererRebuildFenced) {
-            return false
+            return null
         } catch (_: RuntimeException) {
-            return false
+            return null
         } finally {
             if (!finished) runCatching { renderer.abortRebuild() }
         }
     }
 
-    private fun retryRendererRebuild(rebuild: PendingRendererRebuild): Boolean {
-        if (isFenced(rebuild.ownership)) return false
-        val state = requireNotNull(owner).activationState() ?: return false
+    private fun retryRendererRebuild(rebuild: PendingRendererRebuild): RendererRebuildSuccess? {
+        if (isFenced(rebuild.ownership)) return null
+        val state = requireNotNull(owner).activationState() ?: return null
         if (state.cut.geometryRevision != rebuild.geometryRevision ||
             state.cut.lineageRevision != rebuild.lineageRevision
-        ) return false
+        ) return null
         if (rebuild.hydrateKernel) kernel = featureKernelFactory()
-        val rebuilt = rebuildCanonicalRenderer(
+        return rebuildCanonicalRenderer(
             rebuild.ownership, state, rebuild.transactionId, rebuild.hydrateKernel,
         )
-        if (rebuilt && pendingRendererRebuild === rebuild) pendingRendererRebuild = null
-        return rebuilt
     }
 
     private fun CommittedGeometryCut.toPendingRendererRebuild(hydrateKernel: Boolean) = PendingRendererRebuild(
