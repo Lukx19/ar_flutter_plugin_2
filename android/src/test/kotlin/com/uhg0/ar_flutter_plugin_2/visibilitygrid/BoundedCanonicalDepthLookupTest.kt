@@ -289,6 +289,62 @@ class BoundedCanonicalDepthLookupTest {
     }
 
     @Test
+    fun `bounded COW composes touched pages across generations and refuses before the next page`() {
+        val root = Files.createTempDirectory("bounded-canonical-depth-cow-generations").toFile()
+        val coordinator = coordinator(root)
+        val group = SurfaceGroup("f".repeat(32))
+        val resources = CanonicalRuntimeResources.open(root, group, coordinator)
+        fun acknowledge(cut: CompactCanonicalCut) {
+            val current = requireNotNull(resources.owner().activationState()).current as CanonicalActivationCurrent.Receipt
+            assertTrue(
+                resources.owner().acknowledgeCanonicalCurrent(
+                    CanonicalAcknowledgement(current.identity.commandHash, cut.geometryRevision, cut.lineageRevision),
+                ) is CanonicalAcknowledgementResult.Acknowledged,
+            )
+        }
+        fun commit(commandId: String, cut: CompactCanonicalCut, change: DepthEvidenceChange): CompactCanonicalCut {
+            val preparation = resources.prepareEvidenceBatch(
+                CanonicalEvidenceBatchCommand(commandId, cut.geometryRevision, cut.lineageRevision, listOf(change)),
+            ) as CanonicalMutationPreparation.Prepared
+            assertTrue(resources.commitAdjacent(preparation.mutation) is CanonicalAdjacentCommitResult.Committed)
+            return requireNotNull(resources.owner().activationState()).cut
+        }
+        try {
+            resources.openInitial(committedEmptyBaseline("binding", group.value, 1, 1, 1))
+            var cut = requireNotNull(resources.owner().activationState()).cut
+            cut = commit("cow-generation-one", cut, DepthEvidenceChange.Create(CanonicalTarget(voxel = Voxel(1, 0, 0), normalOctX = 1, normalOctY = 1, normalConfidence = 200)))
+            acknowledge(cut)
+            cut = commit("cow-generation-two", cut, DepthEvidenceChange.Create(CanonicalTarget(voxel = Voxel(2, 0, 0), normalOctX = 1, normalOctY = 1, normalConfidence = 200)))
+            acknowledge(cut)
+            cut = commit("cow-generation-three", cut, DepthEvidenceChange.Relocate(SurfaceId(1), CanonicalTarget(SurfaceId(1), Voxel(3, 0, 0), 1, 1, 200)))
+            acknowledge(cut)
+            cut = commit("cow-generation-four", cut, DepthEvidenceChange.Create(CanonicalTarget(voxel = Voxel(4, 0, 0), normalOctX = 1, normalOctY = 1, normalConfidence = 200)))
+
+            val idResult = resources.withBoundedCurrent(
+                BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 1, 0, Int.MAX_VALUE, Long.MAX_VALUE),
+            ) { it.findSurfaceById(SurfaceId(1)) }
+            assertEquals(Voxel(3, 0, 0), (idResult as BoundedCanonicalLookupResult.Completed).value?.voxel)
+            assertEquals(BoundedCanonicalLookupReceipt(1, 0, 2, 32_768, false), idResult.receipt)
+
+            val voxelResult = resources.withBoundedCurrent(
+                BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 1, 0, Int.MAX_VALUE, Long.MAX_VALUE),
+            ) { it.findSurfaceAt(Voxel(3, 0, 0)) }
+            assertEquals(SurfaceId(1), (voxelResult as BoundedCanonicalLookupResult.Completed).value?.surface?.id)
+            assertEquals(BoundedCanonicalLookupReceipt(1, 0, 4, 65_536, false), voxelResult.receipt)
+
+            val refused = resources.withBoundedCurrent(
+                BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 1, 0, 1, CanonicalCowGeneration.PAGE_BYTES.toLong()),
+            ) { it.findSurfaceById(SurfaceId(1)) }
+            assertEquals(BoundedCanonicalLookupReason.LIMIT_EXHAUSTED, (refused as BoundedCanonicalLookupResult.Refused).reason)
+            assertEquals(BoundedCanonicalLookupReceipt(1, 0, 1, CanonicalCowGeneration.PAGE_BYTES.toLong(), true), refused.receipt)
+        } finally {
+            resources.close()
+            coordinator.close()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `stale runtime evidence preparation refuses without changing the cut`() {
         val root = Files.createTempDirectory("bounded-canonical-depth-stale-batch").toFile()
         val coordinator = coordinator(root)
@@ -499,6 +555,53 @@ class BoundedCanonicalDepthLookupTest {
         assertEquals(BoundedCanonicalLookupReceipt(1, 0, 0, 0, false), refused.receipt)
     }
 
+    @Test
+    fun `default bounded read refuses without entering unbounded delegate`() {
+        val view = DefaultBoundedFallbackView()
+        val bounded = BoundedCanonicalCurrentView(
+            view,
+            BoundedCanonicalLookupRequest(1, 1, 1, 0, 10, 100),
+            100_000,
+        )
+
+        val result = bounded.result(bounded.findSurfaceById(SurfaceId(1)))
+
+        assertTrue(result is BoundedCanonicalLookupResult.Refused)
+        assertEquals(
+            BoundedCanonicalLookupReason.CANONICAL_READ_FAILURE,
+            (result as BoundedCanonicalLookupResult.Refused).reason,
+        )
+        assertEquals(BoundedCanonicalLookupReceipt(1, 0, 0, 0, false), result.receipt)
+        assertEquals(0, view.unboundedCalls)
+
+        val lineage = view.visitLineageBounded(SurfaceId(1), null, 10, 100) { true }
+        assertEquals(
+            CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE),
+            lineage,
+        )
+        assertEquals(0, view.unboundedCalls)
+    }
+
+    @Test
+    fun `bounded refusal propagates work spent before refusal`() {
+        val view = MeteredCanonicalLookupView(
+            pageReadDelta = 0,
+            byteReadDelta = 0,
+            lineageReadRefusalWork = CanonicalReadWork(0, 1, 0, 64),
+        )
+        val bounded = BoundedCanonicalCurrentView(
+            view,
+            BoundedCanonicalLookupRequest(1, 1, 1, 0, 4, 100),
+            100_000,
+        )
+
+        val result = bounded.result(bounded.findSurfaceById(SurfaceId(1)))
+
+        assertEquals(BoundedCanonicalLookupReason.LIMIT_EXHAUSTED, (result as BoundedCanonicalLookupResult.Refused).reason)
+        assertEquals(BoundedCanonicalLookupReceipt(1, 0, 1, 64, true), result.receipt)
+        assertEquals(0, view.lineageReadStarts)
+    }
+
     private fun coordinator(root: File) = StorageBudgetCoordinatorV2(
         File(root, "visibility-grid-canonical-surface-runtime"),
         StorageBudgetPolicyV2(64L * 1024L * 1024L, 0),
@@ -563,6 +666,7 @@ class BoundedCanonicalDepthLookupTest {
         private val byteReadDelta: Long,
         private val lineageEdgeCount: Int = 0,
         private val lineageReadFailure: Boolean = false,
+        private val lineageReadRefusalWork: CanonicalReadWork? = null,
     ) : CanonicalStateView {
         private var pageReads = 0L
         private var bytesRead = 0L
@@ -625,6 +729,14 @@ class BoundedCanonicalDepthLookupTest {
             sink: (LineageEdge) -> Boolean,
         ): CanonicalBoundedReadResult<LineageRead> {
             lineageReadAttempts++
+            lineageReadRefusalWork?.let {
+                pageReads += it.pageReads
+                bytesRead += it.bytesRead
+                return CanonicalBoundedReadResult.Refused(
+                    CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED,
+                    it,
+                )
+            }
             if (!fits(maximumPageReads, maximumBytesRead)) {
                 return CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED)
             }
@@ -659,6 +771,54 @@ class BoundedCanonicalDepthLookupTest {
         )
         override fun allocatedStorageReceipt() = CompactStorageReceipt(0, 0, 0, 0, 0)
         override fun readWorkReceipt() = CanonicalReadWork(0, pageReads, 0, bytesRead)
+        override fun close() = Unit
+    }
+
+    private class DefaultBoundedFallbackView : CanonicalStateView {
+        var unboundedCalls = 0
+
+        override val cut = CompactCanonicalCut(
+            SurfaceGroup("a".repeat(32)), CompactCanonicalStore.PROFILE,
+            1, 1, 2, 1, 1, 1, 0, null,
+            CanonicalReceiptBytes.EMPTY, CanonicalReceiptBytes.EMPTY,
+        )
+
+        override fun findById(id: SurfaceId): CompactSurface? {
+            unboundedCalls++
+            return CompactSurface(SurfaceId(1), Voxel(0, 0, 0), 0x0101, 200)
+        }
+
+        override fun findByVoxel(voxel: Voxel): CompactSurface? {
+            unboundedCalls++
+            return null
+        }
+
+        override fun readPage(region: StorageRegion, page: Int, cursor: Int, limit: Int) =
+            CompactPage(emptyList(), null, 0)
+
+        override fun readSourceById(id: SurfaceId): CanonicalPageRead<PagedSource?> =
+            CanonicalPageRead.Complete(null, 0, 0)
+
+        override fun visitSourceSupport(
+            target: SurfaceId,
+            cursor: SourceSupportCursor?,
+            sink: (PagedSupport) -> Boolean,
+        ) = SourceSupportRead.Complete(0, null, 0, 0)
+
+        override fun visitLineage(
+            source: SurfaceId,
+            cursor: LineageCursor?,
+            sink: (LineageEdge) -> Boolean,
+        ): LineageRead {
+            unboundedCalls++
+            return LineageRead.Complete(0, null)
+        }
+
+        override fun retainedMemoryReceipt() = CompactRetainedMemoryReceipt(
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        )
+
+        override fun allocatedStorageReceipt() = CompactStorageReceipt(0, 0, 0, 0, 0)
         override fun close() = Unit
     }
 }

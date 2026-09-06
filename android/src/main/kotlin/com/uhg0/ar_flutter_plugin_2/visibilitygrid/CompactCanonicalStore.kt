@@ -19,27 +19,20 @@ internal interface CanonicalStateView : AutoCloseable {
 
     fun findByVoxel(voxel: Voxel): CompactSurface?
 
-    /**
-     * Narrow read seams for bounded runtime lookups. Implementations must refuse before
-     * touching storage when the operation cannot fit the supplied remaining page/byte budget.
-     * The default keeps existing planner-only views source-compatible; durable compact/COW
-     * authorities override it with their zero-page in-memory index reads.
-     */
+    /** Narrow read seams for bounded runtime lookups. */
     fun findByIdBounded(
         id: SurfaceId,
         maximumPageReads: Long,
         maximumBytesRead: Long,
-    ): CanonicalBoundedReadResult<CompactSurface?> = boundedRead(
-        maximumPageReads, maximumBytesRead,
-    ) { findById(id) }
+    ): CanonicalBoundedReadResult<CompactSurface?> =
+        CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE)
 
     fun findByVoxelBounded(
         voxel: Voxel,
         maximumPageReads: Long,
         maximumBytesRead: Long,
-    ): CanonicalBoundedReadResult<CompactSurface?> = boundedRead(
-        maximumPageReads, maximumBytesRead,
-    ) { findByVoxel(voxel) }
+    ): CanonicalBoundedReadResult<CompactSurface?> =
+        CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE)
 
     fun readPage(region: StorageRegion, page: Int, cursor: Int, limit: Int): CompactPage
 
@@ -63,9 +56,8 @@ internal interface CanonicalStateView : AutoCloseable {
         maximumPageReads: Long,
         maximumBytesRead: Long,
         sink: (LineageEdge) -> Boolean,
-    ): CanonicalBoundedReadResult<LineageRead> = boundedRead(
-        maximumPageReads, maximumBytesRead,
-    ) { visitLineage(source, cursor, sink) }
+    ): CanonicalBoundedReadResult<LineageRead> =
+        CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE)
 
     fun retainedMemoryReceipt(): CompactRetainedMemoryReceipt
 
@@ -82,27 +74,10 @@ internal enum class CanonicalBoundedReadRefusal {
 
 internal sealed interface CanonicalBoundedReadResult<out T> {
     data class Complete<T>(val value: T, val work: CanonicalReadWork) : CanonicalBoundedReadResult<T>
-    data class Refused(val reason: CanonicalBoundedReadRefusal) : CanonicalBoundedReadResult<Nothing>
-}
-
-private inline fun <T> CanonicalStateView.boundedRead(
-    maximumPageReads: Long,
-    maximumBytesRead: Long,
-    read: () -> T,
-): CanonicalBoundedReadResult<T> {
-    if (maximumPageReads < 0L || maximumBytesRead < 0L) {
-        return CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED)
-    }
-    val before = readWorkReceipt()
-    val value = read()
-    val work = readWorkReceipt() - before
-    return if (work.pageReads < 0L || work.bytesRead < 0L) {
-        CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE)
-    } else if (work.pageReads > maximumPageReads || work.bytesRead > maximumBytesRead) {
-        CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED)
-    } else {
-        CanonicalBoundedReadResult.Complete(value, work)
-    }
+    data class Refused(
+        val reason: CanonicalBoundedReadRefusal,
+        val work: CanonicalReadWork = CanonicalReadWork.ZERO,
+    ) : CanonicalBoundedReadResult<Nothing>
 }
 
 internal data class CanonicalReadWork(

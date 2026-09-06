@@ -21,6 +21,7 @@ internal class CanonicalCowGeneration private constructor(
     private val entries: List<CowDirectoryEntry>,
     private val storage: CowStorageReceipt,
 ) : AutoCloseable {
+    private val entryIndex = CowDirectoryIndex(entries)
     private var closed = false
     private var cowPagesRead = 0L
     private var cowRecordsInspected = 0L
@@ -37,13 +38,10 @@ internal class CanonicalCowGeneration private constructor(
     fun readWorkReceipt() = CowReadWork(cowPagesRead, cowRecordsInspected, cowHashesValidated, cowBytesRead)
 
     @Synchronized
-    internal fun matchingPageCount(kind: CowFragmentKind, key: Long): Long = entries.count {
-        it.kind == kind && java.lang.Long.compareUnsigned(key, it.minimumKey) >= 0 &&
-            java.lang.Long.compareUnsigned(key, it.maximumKey) <= 0
-    }.toLong()
+    internal fun matchingPageCount(kind: CowFragmentKind, key: Long): Long = entryIndex.matchingPageCount(kind, key)
 
     @Synchronized
-    internal fun pageCount(kind: CowFragmentKind): Long = entries.count { it.kind == kind }.toLong()
+    internal fun pageCount(kind: CowFragmentKind): Long = entryIndex.pageCount(kind)
     @Synchronized
     internal fun withAllocatedStorage(bytes: Long): CanonicalCowGeneration {
         check(!closed)
@@ -84,7 +82,7 @@ internal class CanonicalCowGeneration private constructor(
     @Synchronized
     private fun records(kind: CowFragmentKind, sink: (CowRecord) -> Boolean): Boolean {
         if (closed) return false
-        return entries.asSequence().filter { it.kind == kind }.all { entry ->
+        return entryIndex.entries(kind).asSequence().all { entry ->
             val file = File(directory, entry.file)
             readPage(file, entry, sink)
         }
@@ -93,21 +91,27 @@ internal class CanonicalCowGeneration private constructor(
     @Synchronized
     private fun records(kind: CowFragmentKind, key: Long, sink: (CowRecord) -> Boolean): Boolean {
         if (closed) return false
-        return entries.asSequence().filter { it.kind == kind && java.lang.Long.compareUnsigned(key, it.minimumKey) >= 0 && java.lang.Long.compareUnsigned(key, it.maximumKey) <= 0 }
-            .all { readPage(File(directory, it.file), it, sink) }
+        return entryIndex.forEachMatching(kind, key) { entry ->
+            readPage(File(directory, entry.file), entry, sink)
+        }
     }
 
-    private fun readPage(file: File, entry: CowDirectoryEntry, sink: (CowRecord) -> Boolean): Boolean {
-        if (!file.isFile || file.length() < (entry.page.toLong() + 1) * PAGE_BYTES) return false
+    private fun readPage(file: File, entry: CowDirectoryEntry, sink: (CowRecord) -> Boolean): Boolean =
+        readPageStatus(file, entry, sink) == CowPageVisitStatus.VALID_COMPLETE
+
+    private fun readPageStatus(file: File, entry: CowDirectoryEntry, sink: (CowRecord) -> Boolean): CowPageVisitStatus {
+        if (!file.isFile || file.length() < (entry.page.toLong() + 1) * PAGE_BYTES) return CowPageVisitStatus.CORRUPT
         cowPagesRead++
         cowHashesValidated++
         cowRecordsInspected += entry.count
         cowBytesRead = try { Math.addExact(cowBytesRead, PAGE_BYTES.toLong()) } catch (_: ArithmeticException) { Long.MAX_VALUE }
         val bytes = ByteArray(PAGE_BYTES)
-        RandomAccessReader(file, entry.page.toLong() * PAGE_BYTES).use { input -> input.readFully(bytes) }
-        if (!sha(bytes).contentEquals(entry.hash)) return false
+        try {
+            RandomAccessReader(file, entry.page.toLong() * PAGE_BYTES).use { input -> input.readFully(bytes) }
+        } catch (_: Exception) { return CowPageVisitStatus.CORRUPT }
+        if (!sha(bytes).contentEquals(entry.hash)) return CowPageVisitStatus.CORRUPT
         val input = DataInputStream(bytes.inputStream())
-        if (input.readInt() != PAGE_MAGIC || input.readInt() != entry.kind.wire || input.readInt() != entry.count) return false
+        if (input.readInt() != PAGE_MAGIC || input.readInt() != entry.kind.wire || input.readInt() != entry.count) return CowPageVisitStatus.CORRUPT
         var keepGoing = true
         var minimum = Long.MAX_VALUE
         var maximum = Long.MIN_VALUE
@@ -123,7 +127,7 @@ internal class CanonicalCowGeneration private constructor(
                 CowFragmentKind.VOXEL_TOMBSTONE, CowFragmentKind.PAGE_TOMBSTONE -> CowRecord.Tombstone(0, input.readInt(), input.readInt(), input.readInt(), input.readLong())
                 CowFragmentKind.LINEAGE_TOMBSTONE -> CowRecord.Lineage(input.readLong(), input.readLong())
             }
-            val key = recordKey(entry.kind, record) ?: return false
+            val key = recordKey(entry.kind, record) ?: return CowPageVisitStatus.CORRUPT
             if (it == 0) { minimum = key; maximum = key }
             else {
                 if (java.lang.Long.compareUnsigned(key, minimum) < 0) minimum = key
@@ -131,9 +135,9 @@ internal class CanonicalCowGeneration private constructor(
             }
             if (keepGoing) keepGoing = sink(record)
         }
-        if (minimum != entry.minimumKey || maximum != entry.maximumKey) return false
-        while (input.available() > 0) if (input.readUnsignedByte() != 0) return false
-        return keepGoing
+        if (minimum != entry.minimumKey || maximum != entry.maximumKey) return CowPageVisitStatus.CORRUPT
+        while (input.available() > 0) if (input.readUnsignedByte() != 0) return CowPageVisitStatus.CORRUPT
+        return if (keepGoing) CowPageVisitStatus.VALID_COMPLETE else CowPageVisitStatus.VALID_EARLY_STOP
     }
 
     private fun recordKey(kind: CowFragmentKind, record: CowRecord): Long? = when (record) {
@@ -179,10 +183,48 @@ internal class CanonicalCowGeneration private constructor(
 
     internal fun visit(kind: CowFragmentKind, sink: (CowRecord) -> Boolean) = records(kind, sink)
     internal fun visit(kind: CowFragmentKind, key: Long, sink: (CowRecord) -> Boolean) = records(kind, key, sink)
+
     @Synchronized
-    internal fun has(kind: CowFragmentKind, key: Long) = !closed && entries.any {
-        it.kind == kind && java.lang.Long.compareUnsigned(key, it.minimumKey) >= 0 && java.lang.Long.compareUnsigned(key, it.maximumKey) <= 0
+    internal fun visitBounded(
+        kind: CowFragmentKind,
+        key: Long,
+        maximumPageReads: Long,
+        maximumBytesRead: Long,
+        sink: (CowRecord) -> Boolean,
+    ): CowBoundedVisitResult {
+        if (closed) return CowBoundedVisitResult.Corrupt(CanonicalReadWork.ZERO)
+        if (maximumPageReads < 0L || maximumBytesRead < 0L) {
+            return CowBoundedVisitResult.Limit(CanonicalReadWork.ZERO)
+        }
+        val before = readWorkReceipt()
+        var status = CowPageVisitStatus.VALID_COMPLETE
+        var limit = false
+        entryIndex.forEachMatching(kind, key) { entry ->
+            val consumed = readWorkReceipt() - before
+            if (consumed.pages < 0L || consumed.bytes < 0L) {
+                status = CowPageVisitStatus.CORRUPT
+                return@forEachMatching false
+            }
+            val remainingPages = maximumPageReads - consumed.pages
+            val remainingBytes = maximumBytesRead - consumed.bytes
+            if (remainingPages < 1L || remainingBytes < PAGE_BYTES.toLong()) {
+                limit = true
+                return@forEachMatching false
+            }
+            status = readPageStatus(File(directory, entry.file), entry, sink)
+            status == CowPageVisitStatus.VALID_COMPLETE
+        }
+        val work = (readWorkReceipt() - before).canonical()
+        return when {
+            limit -> CowBoundedVisitResult.Limit(work)
+            status == CowPageVisitStatus.CORRUPT -> CowBoundedVisitResult.Corrupt(work)
+            status == CowPageVisitStatus.VALID_EARLY_STOP -> CowBoundedVisitResult.Valid(CowPageVisitStatus.VALID_EARLY_STOP, work)
+            else -> CowBoundedVisitResult.Valid(CowPageVisitStatus.VALID_COMPLETE, work)
+        }
     }
+
+    @Synchronized
+    internal fun has(kind: CowFragmentKind, key: Long) = !closed && entryIndex.matchingPageCount(kind, key) > 0L
 
     @Synchronized
     internal fun indexes(kind: CowFragmentKind, key: Long): CowLookup<CowRecord.Index> {
@@ -261,7 +303,7 @@ internal class CanonicalCowGeneration private constructor(
             var matchingOffset = 0
             var stopped = false
             var resumeOffset = 0
-            val valid = readPage(File(directory, entry.file), entry) { record ->
+            val status = readPageStatus(File(directory, entry.file), entry) { record ->
                 if (record is CowRecord.Support && record.target == target.value) {
                     if (matchingOffset++ >= skip && !stopped) {
                         if (sink(PagedSupport(target, record.source.source()))) delivered++ else { stopped = true; resumeOffset = matchingOffset - 1 }
@@ -269,7 +311,7 @@ internal class CanonicalCowGeneration private constructor(
                 }
                 true
             }
-            if (!valid) return SourceSupportRead.Refused(CompactCanonicalRefusal.CORRUPT)
+            if (status == CowPageVisitStatus.CORRUPT) return SourceSupportRead.Refused(CompactCanonicalRefusal.CORRUPT)
             if (cursor != null && entryIndex == startEntry && skip >= matchingOffset)
                 return SourceSupportRead.Refused(CompactCanonicalRefusal.STALE_CURSOR)
             if (stopped) return SourceSupportRead.Complete(delivered, SourceSupportCursor(rootHash, target, entryIndex, resumeOffset), candidates.size, candidates.size * PAGE_BYTES)
@@ -479,6 +521,68 @@ internal data class CowDirectoryEntry(val kind: CowFragmentKind, val page: Int, 
     }
 }
 
+/**
+ * Immutable keyed directory metadata.  Page ranges are sorted once at open, so a
+ * lookup only visits ranges whose key interval can contain the requested key.
+ */
+private class CowDirectoryIndex(entries: List<CowDirectoryEntry>) {
+    private val byKind = Array(CowFragmentKind.entries.size) { kind ->
+        entries.filter { it.kind.ordinal == kind }.sortedBy { it.page }.toTypedArray()
+    }
+    private val byKey = Array(CowFragmentKind.entries.size) { kind ->
+        byKind[kind].sortedWith { left, right ->
+            val minimum = java.lang.Long.compareUnsigned(left.minimumKey, right.minimumKey)
+            if (minimum != 0) minimum else java.lang.Long.compareUnsigned(left.maximumKey, right.maximumKey)
+        }.toTypedArray()
+    }
+    private val prefixMaximum = Array(CowFragmentKind.entries.size) { kind ->
+        LongArray(byKey[kind].size).also { maxima ->
+            byKey[kind].forEachIndexed { index, entry ->
+                maxima[index] = if (index == 0 ||
+                    java.lang.Long.compareUnsigned(entry.maximumKey, maxima[index - 1]) > 0
+                ) entry.maximumKey else maxima[index - 1]
+            }
+        }
+    }
+
+    fun entries(kind: CowFragmentKind): Array<CowDirectoryEntry> = byKind[kind.ordinal]
+
+    fun pageCount(kind: CowFragmentKind): Long = byKind[kind.ordinal].size.toLong()
+
+    fun matchingPageCount(kind: CowFragmentKind, key: Long): Long {
+        var count = 0L
+        forEachMatching(kind, key) { count++; true }
+        return count
+    }
+
+    fun forEachMatching(kind: CowFragmentKind, key: Long, action: (CowDirectoryEntry) -> Boolean): Boolean {
+        val ranges = byKey[kind.ordinal]
+        if (ranges.isEmpty()) return true
+        val maxima = prefixMaximum[kind.ordinal]
+        var low = 0
+        var high = ranges.size
+        while (low < high) {
+            val middle = (low + high) ushr 1
+            if (java.lang.Long.compareUnsigned(maxima[middle], key) >= 0) high = middle else low = middle + 1
+        }
+        val firstPossible = low
+        low = firstPossible
+        high = ranges.size
+        while (low < high) {
+            val middle = (low + high) ushr 1
+            if (java.lang.Long.compareUnsigned(ranges[middle].minimumKey, key) <= 0) low = middle + 1 else high = middle
+        }
+        for (index in firstPossible until low) {
+            val entry = ranges[index]
+            if (java.lang.Long.compareUnsigned(key, entry.minimumKey) >= 0 &&
+                java.lang.Long.compareUnsigned(key, entry.maximumKey) <= 0 &&
+                !action(entry)
+            ) return false
+        }
+        return true
+    }
+}
+
 /** Complete, self-validating root for a candidate only.  It names #114's root hash. */
 internal data class MutableSemanticRoot(
     val baseCut: CompactCanonicalCut,
@@ -583,6 +687,7 @@ internal data class CowReadWork(
         pages - other.pages, records - other.records, hashes - other.hashes, bytes - other.bytes,
     )
 }
+private fun CowReadWork.canonical() = CanonicalReadWork(0L, pages, records, bytes)
 internal data class CowPageCursor(
     val rootHash: CanonicalReceiptBytes,
     val region: StorageRegion,
@@ -592,6 +697,25 @@ internal data class CowPageCursor(
     val tombstoneOffset: Int,
 )
 internal data class CowMergeWindow(val rows: List<CompactSurface>, val nextCursor: CowPageCursor?, val inspectedRows: Int)
+internal enum class CowPageVisitStatus { VALID_COMPLETE, VALID_EARLY_STOP, CORRUPT }
+internal sealed interface CowBoundedVisitResult {
+    val work: CanonicalReadWork
+    data class Valid(val status: CowPageVisitStatus, override val work: CanonicalReadWork) : CowBoundedVisitResult
+    data class Limit(override val work: CanonicalReadWork) : CowBoundedVisitResult
+    data class Corrupt(override val work: CanonicalReadWork) : CowBoundedVisitResult
+}
+private class CowLongBuffer(initialCapacity: Int = 8) {
+    private var values = LongArray(initialCapacity)
+    var size = 0
+        private set
+
+    fun add(value: Long) {
+        if (size == values.size) values = values.copyOf(values.size.coerceAtLeast(1) * 2)
+        values[size++] = value
+    }
+
+    operator fun get(index: Int): Long = values[index]
+}
 internal sealed interface CowPageRead {
     data class Complete(val rows: List<CompactSurface>, val nextCursor: CowPageCursor?, val inspectedRows: Int) : CowPageRead
     data class Refused(val reason: CompactCanonicalRefusal) : CowPageRead
@@ -607,6 +731,52 @@ private fun compareSurfaceKey(ax: Int, ay: Int, az: Int, aid: Long, bx: Int, by:
 }
 
 private class CowOverlay(private val base: CanonicalStateView, private val delta: CanonicalCowGeneration) : CanonicalStateView {
+    private class CowBudget(private val maximumPageReads: Long, private val maximumBytesRead: Long) {
+        var work = CanonicalReadWork.ZERO
+            private set
+
+        fun remainingPageReads() = maximumPageReads - work.pageReads
+        fun remainingBytesRead() = maximumBytesRead - work.bytesRead
+
+        fun add(next: CanonicalReadWork): Boolean {
+            if (next.directLookups < 0L || next.pageReads < 0L || next.inspectedRows < 0L || next.bytesRead < 0L) return false
+            val updated = try {
+                CanonicalReadWork(
+                    Math.addExact(work.directLookups, next.directLookups),
+                    Math.addExact(work.pageReads, next.pageReads),
+                    Math.addExact(work.inspectedRows, next.inspectedRows),
+                    Math.addExact(work.bytesRead, next.bytesRead),
+                )
+            } catch (_: ArithmeticException) { return false }
+            if (updated.pageReads > maximumPageReads || updated.bytesRead > maximumBytesRead) return false
+            work = updated
+            return true
+        }
+
+        fun <T> complete(value: T): CanonicalBoundedReadResult<T> =
+            CanonicalBoundedReadResult.Complete(value, work)
+        fun <T> refused(reason: CanonicalBoundedReadRefusal): CanonicalBoundedReadResult<T> =
+            CanonicalBoundedReadResult.Refused(reason, work)
+
+        fun <T> combine(result: CanonicalBoundedReadResult<T>): CanonicalBoundedReadResult<T> = when (result) {
+            is CanonicalBoundedReadResult.Complete ->
+                if (add(result.work)) complete(result.value)
+                else refused(CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE)
+            is CanonicalBoundedReadResult.Refused ->
+                if (add(result.work)) refused(result.reason)
+                else refused(CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE)
+        }
+
+        fun refusal(result: CowBoundedVisitResult): CanonicalBoundedReadRefusal? {
+            if (!add(result.work)) return CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE
+            return when (result) {
+                is CowBoundedVisitResult.Limit -> CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED
+                is CowBoundedVisitResult.Corrupt -> CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE
+                is CowBoundedVisitResult.Valid -> null
+            }
+        }
+    }
+
     override val generationZeroAuthority: CanonicalStateView get() = base.generationZeroAuthority
     override val cut get() = delta.root.targetCut()
     override fun findById(id: SurfaceId): CompactSurface? = delta.readOr(null) { findByIdOpen(id) }
@@ -622,58 +792,101 @@ private class CowOverlay(private val base: CanonicalStateView, private val delta
         id: SurfaceId,
         maximumPageReads: Long,
         maximumBytesRead: Long,
-    ): CanonicalBoundedReadResult<CompactSurface?> = boundedCowRead(
-        maximumPageReads,
-        maximumBytesRead,
-        delta.matchingPageCount(CowFragmentKind.ROW, id.value) +
-            delta.matchingPageCount(CowFragmentKind.ID_TOMBSTONE, id.value),
-    ) { findById(id) }
+    ): CanonicalBoundedReadResult<CompactSurface?> {
+        val budget = CowBudget(maximumPageReads, maximumBytesRead)
+        if (maximumPageReads < 0L || maximumBytesRead < 0L) return budget.refused(CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED)
+        var row: CompactSurface? = null
+        val rows = delta.visitBounded(
+            CowFragmentKind.ROW, id.value,
+            budget.remainingPageReads(), budget.remainingBytesRead(),
+        ) { record ->
+            if (record is CowRecord.Row && record.value.id == id.value) row = record.value.surface()
+            true
+        }
+        budget.refusal(rows)?.let { return budget.refused(it) }
+        if (row != null) return budget.complete(row)
+
+        var removed = false
+        val tombstones = delta.visitBounded(
+            CowFragmentKind.ID_TOMBSTONE, id.value,
+            budget.remainingPageReads(), budget.remainingBytesRead(),
+        ) { record ->
+            if (record is CowRecord.Tombstone && record.key == id.value) removed = true
+            true
+        }
+        budget.refusal(tombstones)?.let { return budget.refused(it) }
+        if (removed) return budget.complete(null)
+        return budget.combine(
+            base.findByIdBounded(id, budget.remainingPageReads(), budget.remainingBytesRead()),
+        )
+    }
 
     override fun findByVoxelBounded(
         voxel: Voxel,
         maximumPageReads: Long,
         maximumBytesRead: Long,
     ): CanonicalBoundedReadResult<CompactSurface?> {
+        val budget = CowBudget(maximumPageReads, maximumBytesRead)
+        if (maximumPageReads < 0L || maximumBytesRead < 0L) return budget.refused(CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED)
         val key = CanonicalCowGeneration.voxelKey(voxel.x, voxel.y, voxel.z)
-        val indexPages = delta.matchingPageCount(CowFragmentKind.VOXEL_INDEX, key)
-        val rowPages = delta.pageCount(CowFragmentKind.ROW)
-        val rowLookups = try {
-            Math.multiplyExact(indexPages, CowFragmentKind.VOXEL_INDEX.recordsPerPage.toLong())
-        } catch (_: ArithmeticException) { Long.MAX_VALUE }
-        val rowLookupPages = try { Math.multiplyExact(rowLookups, rowPages) } catch (_: ArithmeticException) { Long.MAX_VALUE }
-        val estimatedPages = listOf(
-            indexPages,
-            rowLookupPages,
-            delta.matchingPageCount(CowFragmentKind.VOXEL_TOMBSTONE, key),
-            rowPages,
-            delta.pageCount(CowFragmentKind.ID_TOMBSTONE),
-        ).fold(0L) { total, value -> try { Math.addExact(total, value) } catch (_: ArithmeticException) { Long.MAX_VALUE } }
-        return boundedCowRead(maximumPageReads, maximumBytesRead, estimatedPages) { findByVoxel(voxel) }
-    }
+        val candidateIds = CowLongBuffer()
+        val indexes = delta.visitBounded(
+            CowFragmentKind.VOXEL_INDEX, key,
+            budget.remainingPageReads(), budget.remainingBytesRead(),
+        ) { record ->
+            if (record is CowRecord.Index && record.x == voxel.x && record.y == voxel.y && record.z == voxel.z) {
+                candidateIds.add(record.id)
+            }
+            true
+        }
+        budget.refusal(indexes)?.let { return budget.refused(it) }
+        var dirty: CompactSurface? = null
+        var refusal: CanonicalBoundedReadRefusal? = null
+        for (index in 0 until candidateIds.size) {
+            var candidate: CompactSurface? = null
+            val row = delta.visitBounded(
+                CowFragmentKind.ROW, candidateIds[index],
+                budget.remainingPageReads(), budget.remainingBytesRead(),
+            ) { record ->
+                if (record is CowRecord.Row && record.value.id == candidateIds[index]) candidate = record.value.surface()
+                true
+            }
+            refusal = budget.refusal(row)
+            if (refusal != null) break
+            if (candidate?.voxel == voxel) {
+                dirty = candidate
+                break
+            }
+        }
+        refusal?.let { return budget.refused(it) }
+        if (dirty != null) return budget.complete(dirty)
 
-    private inline fun <T> boundedCowRead(
-        maximumPageReads: Long,
-        maximumBytesRead: Long,
-        estimatedPages: Long,
-        read: () -> T,
-    ): CanonicalBoundedReadResult<T> {
-        if (maximumPageReads < 0L || maximumBytesRead < 0L) {
-            return CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED)
+        val oldResult = budget.combine(
+            base.findByVoxelBounded(voxel, budget.remainingPageReads(), budget.remainingBytesRead()),
+        )
+        val old = when (oldResult) {
+            is CanonicalBoundedReadResult.Complete -> oldResult.value
+            is CanonicalBoundedReadResult.Refused -> return oldResult
+        } ?: return budget.complete(null)
+        var tombstoned = false
+        val tombstones = delta.visitBounded(
+            CowFragmentKind.VOXEL_TOMBSTONE, key,
+            budget.remainingPageReads(), budget.remainingBytesRead(),
+        ) { record ->
+            if (record is CowRecord.Tombstone && record.id == old.id.value &&
+                record.x == voxel.x && record.y == voxel.y && record.z == voxel.z
+            ) tombstoned = true
+            true
         }
-        val estimatedBytes = try {
-            Math.multiplyExact(estimatedPages, CanonicalCowGeneration.PAGE_BYTES.toLong())
-        } catch (_: ArithmeticException) { Long.MAX_VALUE }
-        if (estimatedPages > maximumPageReads || estimatedBytes > maximumBytesRead) {
-            return CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED)
+        budget.refusal(tombstones)?.let { return budget.refused(it) }
+        if (tombstoned) return budget.complete(null)
+        val current = budget.combine(
+            findByIdBounded(old.id, budget.remainingPageReads(), budget.remainingBytesRead()),
+        )
+        return when (current) {
+            is CanonicalBoundedReadResult.Complete -> budget.complete(current.value?.takeIf { it.voxel == voxel })
+            is CanonicalBoundedReadResult.Refused -> current
         }
-        val before = readWorkReceipt()
-        val value = read()
-        val work = readWorkReceipt() - before
-        return if (work.pageReads < 0L || work.bytesRead < 0L) {
-            CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE)
-        } else if (work.pageReads > maximumPageReads || work.bytesRead > maximumBytesRead) {
-            CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE)
-        } else CanonicalBoundedReadResult.Complete(value, work)
     }
     private fun findByVoxelOpen(voxel: Voxel): CompactSurface? {
         val key = CanonicalCowGeneration.voxelKey(voxel.x, voxel.y, voxel.z)
@@ -818,12 +1031,71 @@ private class CowOverlay(private val base: CanonicalStateView, private val delta
         maximumPageReads: Long,
         maximumBytesRead: Long,
         sink: (LineageEdge) -> Boolean,
-    ): CanonicalBoundedReadResult<LineageRead> = boundedCowRead(
-        maximumPageReads,
-        maximumBytesRead,
-        delta.matchingPageCount(CowFragmentKind.LINEAGE, source.value) +
-            delta.matchingPageCount(CowFragmentKind.LINEAGE_TOMBSTONE, source.value),
-    ) { visitLineage(source, cursor, sink) }
+    ): CanonicalBoundedReadResult<LineageRead> {
+        val budget = CowBudget(maximumPageReads, maximumBytesRead)
+        if (maximumPageReads < 0L || maximumBytesRead < 0L) return budget.refused(CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED)
+        if (cursor != null && (cursor.rootHash != cut.rootHash || cursor.source != source || cursor.offset < 0)) {
+            return budget.complete(LineageRead.Refused(CompactCanonicalRefusal.STALE_CURSOR))
+        }
+        var matching = 0
+        var delivered = 0
+        var stopped = false
+        val offset = cursor?.offset ?: 0
+        val lineage = delta.visitBounded(
+            CowFragmentKind.LINEAGE, source.value,
+            budget.remainingPageReads(), budget.remainingBytesRead(),
+        ) { record ->
+            if (record is CowRecord.Lineage && record.source == source.value) {
+                matching++
+                if (matching > offset) {
+                    if (sink(LineageEdge(source, SurfaceId(record.target)))) {
+                        delivered++
+                    } else {
+                        stopped = true
+                        return@visitBounded false
+                    }
+                }
+            }
+            true
+        }
+        budget.refusal(lineage)?.let { return budget.refused(it) }
+        if (matching > 0) {
+            val next = if (stopped) {
+                LineageCursor(cut.rootHash, source, matching - 1)
+            } else null
+            return budget.complete(LineageRead.Complete(delivered, next))
+        }
+
+        var tombstoned = false
+        val tombstones = delta.visitBounded(
+            CowFragmentKind.LINEAGE_TOMBSTONE, source.value,
+            budget.remainingPageReads(), budget.remainingBytesRead(),
+        ) { record ->
+            if (record is CowRecord.Lineage && record.source == source.value) {
+                tombstoned = true
+                return@visitBounded false
+            }
+            true
+        }
+        budget.refusal(tombstones)?.let { return budget.refused(it) }
+        if (tombstoned) return budget.complete(LineageRead.Complete(0, null))
+
+        val baseCursor = cursor?.copy(rootHash = base.cut.rootHash)
+        val baseResult = base.visitLineageBounded(
+            source, baseCursor, budget.remainingPageReads(), budget.remainingBytesRead(), sink,
+        )
+        return when (baseResult) {
+            is CanonicalBoundedReadResult.Complete -> {
+                val value = when (val read = baseResult.value) {
+                    is LineageRead.Refused -> read
+                    is LineageRead.Complete -> read.copy(nextCursor = read.nextCursor?.copy(rootHash = cut.rootHash))
+                }
+                if (budget.add(baseResult.work)) budget.complete(value)
+                else budget.refused(CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE)
+            }
+            is CanonicalBoundedReadResult.Refused -> budget.combine(baseResult)
+        }
+    }
     private fun visitLineageOpen(source: SurfaceId, cursor: LineageCursor?, sink: (LineageEdge) -> Boolean): LineageRead {
         if (cursor != null && (cursor.rootHash != cut.rootHash || cursor.source != source || cursor.offset < 0))
             return LineageRead.Refused(CompactCanonicalRefusal.STALE_CURSOR)

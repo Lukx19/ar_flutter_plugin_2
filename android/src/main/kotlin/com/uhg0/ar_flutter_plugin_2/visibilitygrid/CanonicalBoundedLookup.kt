@@ -161,10 +161,14 @@ internal class BoundedCanonicalCurrentView internal constructor(
                 } else operation.value
             }
             is CanonicalBoundedReadResult.Refused -> {
-                when (operation.reason) {
-                    CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED -> refusedByLimit = true
-                    CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE ->
-                        failureReason = BoundedCanonicalLookupReason.CANONICAL_READ_FAILURE
+                if (!acceptWork(operation.work)) {
+                    failureReason = BoundedCanonicalLookupReason.CANONICAL_READ_FAILURE
+                } else {
+                    when (operation.reason) {
+                        CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED -> refusedByLimit = true
+                        CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE ->
+                            failureReason = BoundedCanonicalLookupReason.CANONICAL_READ_FAILURE
+                    }
                 }
                 null
             }
@@ -222,10 +226,14 @@ internal class BoundedCanonicalCurrentView internal constructor(
                 } else operation.value
             }
             is CanonicalBoundedReadResult.Refused -> {
-                when (operation.reason) {
-                    CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED -> refusedByLimit = true
-                    CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE ->
-                        failureReason = BoundedCanonicalLookupReason.CANONICAL_READ_FAILURE
+                if (!acceptWork(operation.work)) {
+                    failureReason = BoundedCanonicalLookupReason.CANONICAL_READ_FAILURE
+                } else {
+                    when (operation.reason) {
+                        CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED -> refusedByLimit = true
+                        CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE ->
+                            failureReason = BoundedCanonicalLookupReason.CANONICAL_READ_FAILURE
+                    }
                 }
                 null
             }
