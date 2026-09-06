@@ -655,6 +655,9 @@ class AndroidVisibilityGridRuntimeTest {
         val scheduler = Executors.newSingleThreadScheduledExecutor()
         val cleanupEntered = CountDownLatch(1)
         val cleanupRelease = CountDownLatch(1)
+        val failureStarted = CountDownLatch(1)
+        val failureReturned = CountDownLatch(1)
+        val residentAtReturn = AtomicLong(-1)
         val mapped = AtomicLong()
         val runtime = AndroidVisibilityGridRuntime(
             ownership = cut::get,
@@ -681,13 +684,22 @@ class AndroidVisibilityGridRuntimeTest {
             assertTrue(runtime.offerDepth(depth(cut.get(), 1, 1)))
             assertTrue(cleanupEntered.await(1, TimeUnit.SECONDS))
             assertTrue(runtime.offerDepth(depth(cut.get(), 2_000_000, 2)))
-            repeat(3) { runtime.recordDepthFailure() }
+            val failing = Thread {
+                failureStarted.countDown()
+                repeat(3) { runtime.recordDepthFailure() }
+                residentAtReturn.set(runtime.snapshot().residentPayloadBytes)
+                failureReturned.countDown()
+            }.apply { start() }
+            assertTrue(failureStarted.await(1, TimeUnit.SECONDS))
             cleanupRelease.countDown()
+            assertTrue(failureReturned.await(1, TimeUnit.SECONDS))
+            failing.join(1_000)
             scheduler.submit {}.get(1, TimeUnit.SECONDS)
             assertEquals(1, runtime.snapshot().admittedDepthObservations)
             assertEquals(1, mapped.get())
             assertEquals(1, runtime.snapshot().lifecycleDiscardedObservations)
             assertEquals(0, runtime.snapshot().residentPayloadBytes)
+            assertEquals(0, residentAtReturn.get())
         } finally {
             cleanupRelease.countDown()
             runtime.close()
@@ -734,6 +746,69 @@ class AndroidVisibilityGridRuntimeTest {
             assertEquals(1, mapped.get())
         } finally {
             mapperRelease.countDown()
+            runtime.close()
+        }
+    }
+
+    @Test
+    fun `unsupported depth transition invalidates pending depth before awaiting blocked delivery cleanup`() {
+        val cut = AtomicReference(ownership())
+        val deliveryEntered = CountDownLatch(1)
+        val deliveryRelease = CountDownLatch(1)
+        val transitionReturned = CountDownLatch(1)
+        val transitionEntered = CountDownLatch(1)
+        val transitionInvalidated = CountDownLatch(1)
+        val mapped = AtomicLong()
+        val mappedAtReturn = AtomicLong(-1)
+        val runtime = runtime(
+            cut,
+            object : VisibilityObservationMapper {
+                override fun admitFeature(observation: VisibilityFeatureObservation) = Unit
+                override fun admitDepth(observation: VisibilityDepthObservation) {
+                    mapped.incrementAndGet()
+                }
+                override fun snapshot() = VisibilityMappingAdmissionHealth.empty().copy(
+                    admittedDepths = mapped.get(),
+                )
+            },
+            intervalNs = 40_000_000,
+            beforeDepthCapabilityFence = transitionEntered::countDown,
+            beforeLaneDelivery = { source ->
+                if (source == VisibilityObservationSource.SYNTHETIC_DEPTH) {
+                    deliveryEntered.countDown()
+                    deliveryRelease.await(2, TimeUnit.SECONDS)
+                }
+            },
+            afterDepthCapabilityInvalidated = transitionInvalidated::countDown,
+        )
+        try {
+            runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            assertTrue(runtime.offerDepth(depth(cut.get(), 1, 1)))
+            assertTrue(deliveryEntered.await(1, TimeUnit.SECONDS))
+            assertTrue(runtime.offerDepth(depth(cut.get(), 2_000_000, 2)))
+
+            val disabling = Thread {
+                runtime.setDepthCapability(VisibilityDepthCapability.UNSUPPORTED)
+                mappedAtReturn.set(mapped.get())
+                transitionReturned.countDown()
+            }.apply { start() }
+            assertTrue(transitionEntered.await(1, TimeUnit.SECONDS))
+            assertTrue(transitionInvalidated.await(1, TimeUnit.SECONDS))
+            deliveryRelease.countDown()
+            assertTrue(transitionReturned.await(1, TimeUnit.SECONDS))
+            disabling.join(1_000)
+
+            assertEquals(0, mapped.get())
+            assertEquals(0, mappedAtReturn.get())
+            assertEquals(0, runtime.snapshot().admittedDepthObservations)
+            assertEquals(2, runtime.snapshot().lifecycleDiscardedObservations)
+            assertEquals(0, runtime.snapshot().residentPayloadBytes)
+            assertEquals(VisibilitySourceHealth.UNSUPPORTED, runtime.snapshot().depthHealth)
+            assertFalse(runtime.shouldCopyDepth(3_000_000))
+            assertFalse(runtime.offerDepth(depth(cut.get(), 3_000_000, 3)))
+            assertEquals(0, mapped.get())
+        } finally {
+            deliveryRelease.countDown()
             runtime.close()
         }
     }
@@ -803,6 +878,9 @@ class AndroidVisibilityGridRuntimeTest {
         mapper: VisibilityObservationMapper = AndroidVisibilityGridMappingAdmission(cut::get),
         intervalNs: Long = 1_000_000,
         afterMapperAdmission: () -> Unit = {},
+        beforeDepthCapabilityFence: () -> Unit = {},
+        beforeLaneDelivery: (VisibilityObservationSource) -> Unit = {},
+        afterDepthCapabilityInvalidated: () -> Unit = {},
     ) = AndroidVisibilityGridRuntime(
         ownership = cut::get,
         mapper = mapper,
@@ -811,6 +889,9 @@ class AndroidVisibilityGridRuntimeTest {
         depthIntervalNs = intervalNs,
         ownsScheduler = true,
         afterMapperAdmission = afterMapperAdmission,
+        beforeDepthCapabilityFence = beforeDepthCapabilityFence,
+        beforeLaneDelivery = beforeLaneDelivery,
+        afterDepthCapabilityInvalidated = afterDepthCapabilityInvalidated,
     )
 
     private fun ownership() = VisibilityObservationOwnership(

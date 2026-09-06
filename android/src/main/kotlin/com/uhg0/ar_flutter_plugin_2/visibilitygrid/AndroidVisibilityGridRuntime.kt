@@ -28,8 +28,11 @@ internal class AndroidVisibilityGridRuntime(
     private val captureSafe: VisibilityCaptureSafePredicate =
         VisibilityCaptureSafePredicate.CONSERVATIVE,
     private val beforeLaneEnqueue: (VisibilityObservationSource) -> Unit = {},
+    private val beforeLaneDelivery: (VisibilityObservationSource) -> Unit = {},
     private val afterLaneDelivery: (VisibilityObservationSource) -> Unit = {},
     private val afterMapperAdmission: () -> Unit = {},
+    private val beforeDepthCapabilityFence: () -> Unit = {},
+    private val afterDepthCapabilityInvalidated: () -> Unit = {},
 ) : AutoCloseable {
     private val lock = Any()
     private val lifecycleLock = ReentrantReadWriteLock()
@@ -92,7 +95,7 @@ internal class AndroidVisibilityGridRuntime(
         scheduler = scheduler,
         nanoTime = nanoTime,
         payloadBytes = VisibilityFeatureObservation::payloadBytes,
-        deliver = ::deliverFeature,
+        deliver = { beforeLaneDelivery(it.frame.source); deliverFeature(it) },
         afterDelivery = { afterLaneDelivery(it.frame.source) },
         onReplacement = { synchronized(lock) { replacedFeatureObservations++ } },
         onStale = { synchronized(lock) { staleGenerationObservations++ } },
@@ -103,7 +106,7 @@ internal class AndroidVisibilityGridRuntime(
         scheduler = scheduler,
         nanoTime = nanoTime,
         payloadBytes = VisibilityDepthObservation::payloadBytes,
-        deliver = ::deliverDepth,
+        deliver = { beforeLaneDelivery(it.frame.source); deliverDepth(it) },
         afterDelivery = { afterLaneDelivery(it.frame.source) },
         onReplacement = { synchronized(lock) { replacedDepthObservations++ } },
         onStale = { synchronized(lock) { staleGenerationObservations++ } },
@@ -120,21 +123,39 @@ internal class AndroidVisibilityGridRuntime(
         accountedMapperDepths = initialMapperHealth.admittedDepths
     }
 
-    fun setDepthCapability(capability: VisibilityDepthCapability) = synchronized(lock) {
-        depthCapability = capability
-        if (depthHealth != VisibilitySourceHealth.FAILED) {
-            depthHealth = if (capability == VisibilityDepthCapability.UNSUPPORTED) {
-                VisibilitySourceHealth.UNSUPPORTED
-            } else if (depthHealth == VisibilitySourceHealth.UNSUPPORTED) {
-                VisibilitySourceHealth.CONFIGURED
-            } else {
-                depthHealth
+    fun setDepthCapability(capability: VisibilityDepthCapability) {
+        if (capability == VisibilityDepthCapability.UNSUPPORTED) {
+            beforeDepthCapabilityFence()
+            lifecycleLock.write {
+                synchronized(lock) {
+                    depthCapability = capability
+                    if (depthHealth != VisibilitySourceHealth.FAILED) {
+                        depthHealth = VisibilitySourceHealth.UNSUPPORTED
+                    }
+                }
+                val discarded = depthLane.pauseAndDiscard()
+                synchronized(lock) {
+                    lifecycleDiscardedObservations = Math.addExact(
+                        lifecycleDiscardedObservations, discarded,
+                    )
+                }
+            }
+            afterDepthCapabilityInvalidated()
+            depthLane.awaitIdle()
+            return
+        }
+        synchronized(lock) {
+            depthCapability = capability
+            if (depthHealth != VisibilitySourceHealth.FAILED &&
+                depthHealth == VisibilitySourceHealth.UNSUPPORTED
+            ) {
+                depthHealth = VisibilitySourceHealth.CONFIGURED
             }
         }
     }
 
-    fun configureSyntheticSource(capability: VisibilityDepthCapability) = synchronized(lock) {
-        syntheticSource = true
+    fun configureSyntheticSource(capability: VisibilityDepthCapability) {
+        synchronized(lock) { syntheticSource = true }
         setDepthCapability(capability)
     }
 
@@ -263,30 +284,36 @@ internal class AndroidVisibilityGridRuntime(
         }
     }
 
-    fun recordFeatureFailure() = lifecycleLock.write {
-        synchronized(lock) {
-            featureFailures++
-            featureHealth = VisibilitySourceHealth.FAILED
+    fun recordFeatureFailure() {
+        val drain = lifecycleLock.write {
+            synchronized(lock) {
+                featureFailures++
+                featureHealth = VisibilitySourceHealth.FAILED
+            }
+            discardUnusableIngress(feature = true)
         }
-        discardUnusableIngress(feature = true)
+        awaitUnusableIngress(drain)
     }
 
-    fun recordDepthFailure() = lifecycleLock.write {
-        val terminal = synchronized(lock) {
-            if (depthCapability != VisibilityDepthCapability.UNSUPPORTED) {
-                depthFailures++
-                if (depthFailures >= TERMINAL_FAILURE_THRESHOLD) {
-                    depthHealth = VisibilitySourceHealth.FAILED
-                    true
+    fun recordDepthFailure() {
+        val drain = lifecycleLock.write {
+            val terminal = synchronized(lock) {
+                if (depthCapability != VisibilityDepthCapability.UNSUPPORTED) {
+                    depthFailures++
+                    if (depthFailures >= TERMINAL_FAILURE_THRESHOLD) {
+                        depthHealth = VisibilitySourceHealth.FAILED
+                        true
+                    } else {
+                        depthHealth = VisibilitySourceHealth.TRANSIENT_UNAVAILABLE
+                        false
+                    }
                 } else {
-                    depthHealth = VisibilitySourceHealth.TRANSIENT_UNAVAILABLE
                     false
                 }
-            } else {
-                false
             }
+            if (terminal) discardUnusableIngress(depth = true) else UnusableIngressDrain.NONE
         }
-        if (terminal) discardUnusableIngress(depth = true)
+        awaitUnusableIngress(drain)
     }
 
     fun recordFeatureStalled() = synchronized(lock) {
@@ -553,15 +580,27 @@ internal class AndroidVisibilityGridRuntime(
         accountedMapperDepths = maxOf(accountedMapperDepths, after.admittedDepths)
     }
 
-    private fun discardUnusableIngress(feature: Boolean = false, depth: Boolean = false) {
+    private fun discardUnusableIngress(feature: Boolean = false, depth: Boolean = false): UnusableIngressDrain {
         val bothUnusable = synchronized(lock) {
             featureHealth == VisibilitySourceHealth.FAILED &&
                 (depthHealth == VisibilitySourceHealth.FAILED ||
                     depthHealth == VisibilitySourceHealth.UNSUPPORTED)
         }
-        val discarded = (if (feature || bothUnusable) featureLane.pauseAndDiscard() else 0) +
-            (if (depth || bothUnusable) depthLane.pauseAndDiscard() else 0)
+        val drainFeature = feature || bothUnusable
+        val drainDepth = depth || bothUnusable
+        val discarded = (if (drainFeature) featureLane.pauseAndDiscard() else 0) +
+            (if (drainDepth) depthLane.pauseAndDiscard() else 0)
         synchronized(lock) { lifecycleDiscardedObservations = Math.addExact(lifecycleDiscardedObservations, discarded) }
+        return UnusableIngressDrain(drainFeature, drainDepth)
+    }
+
+    private fun awaitUnusableIngress(drain: UnusableIngressDrain) {
+        if (drain.feature) featureLane.awaitIdle()
+        if (drain.depth) depthLane.awaitIdle()
+    }
+
+    private data class UnusableIngressDrain(val feature: Boolean, val depth: Boolean) {
+        companion object { val NONE = UnusableIngressDrain(false, false) }
     }
 
     companion object {
@@ -873,6 +912,7 @@ internal data class VisibilityMappingAdmissionHealth(
     }
 }
 
+@Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
 private class LatestObservationLane<T : Any>(
     private val intervalNs: Long,
     private val scheduler: ScheduledExecutorService,
@@ -939,6 +979,10 @@ private class LatestObservationLane<T : Any>(
         return discarded
     }
 
+    fun awaitIdle() = synchronized(lock) {
+        while (running) (lock as java.lang.Object).wait()
+    }
+
     private fun scheduleLocked(delayNs: Long) {
         val epoch = scheduleEpoch
         scheduler.schedule({ runOne(epoch) }, delayNs.coerceAtLeast(0), TimeUnit.NANOSECONDS)
@@ -971,6 +1015,7 @@ private class LatestObservationLane<T : Any>(
             }
         }
         onResidentBytesChanged(residentBytes)
+        synchronized(lock) { (lock as java.lang.Object).notifyAll() }
         if (nextDelay != null) {
             synchronized(lock) {
                 if (!closed && scheduled && epoch == scheduleEpoch) scheduleLocked(nextDelay)
