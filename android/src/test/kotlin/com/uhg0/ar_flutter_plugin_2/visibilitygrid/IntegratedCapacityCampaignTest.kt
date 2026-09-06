@@ -39,7 +39,7 @@ class IntegratedCapacityCampaignTest {
                     val commitReopenOwnerBytes = requireNotNull(CanonicalCommitStore.open(directory, budget)).use {
                         GraphLayout.parseInstance(it).totalSize()
                     }
-                    assertEquals(14_565_056L, memory.residentTotalBytes)
+                    assertEquals(EXPECTED_MODELED_RESIDENT_BYTES, memory.residentTotalBytes)
                     assertTrue(storage.directoryBytes <= CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
 
                     val activation = (CanonicalActivation.prepare(group, directory, budget)
@@ -112,15 +112,59 @@ class IntegratedCapacityCampaignTest {
                             intentBytes,
                         )
                         val ownerBytes = GraphLayout.parseInstance(owner, before, after).totalSize()
+                        val maximumPendingDepth = PendingDepthRetentionReceipt.maximumModeled()
+                        val depthKernel = DepthEvidenceKernel()
+                        val depthResources = try {
+                            depthKernel.resourceReceipt()
+                        } finally {
+                            depthKernel.close()
+                        }
+                        assertTrue(maximumPendingDepth.totalBytes <= maximumPendingDepth.budgetBytes)
+                        assertTrue(maximumPendingDepth.mutationPlanBytes > 0)
+                        assertTrue(maximumPendingDepth.geometryCutBytes > 0)
+                        assertTrue(maximumPendingDepth.featureRemapPrimitiveBytes > 0)
+                        assertTrue(maximumPendingDepth.depthPreparedBytes > 0)
+                        assertTrue(depthResources.fixedPrimitiveBytes > 0)
+                        assertTrue(depthResources.maximumAcceptedOutputReserveBytes > 0)
+                        assertTrue(depthResources.modeledMaximumSemanticStateBytes > 0)
+                        assertTrue(
+                            depthResources.modeledMaximumSemanticStateBytes <=
+                                depthResources.semanticStateBudgetBytes,
+                        )
+                        val pendingDepthOutsideKernelArrays = Math.subtractExact(
+                            maximumPendingDepth.totalBytes,
+                            maximumPendingDepth.depthPreparedBytes,
+                        )
                         val completePeakBytes = Math.addExact(
                             memory.residentTotalBytes,
-                            Math.addExact(ownerBytes, Math.addExact(commitReopenOwnerBytes, sharedPhaseBytes)),
+                            Math.addExact(
+                                ownerBytes,
+                                Math.addExact(
+                                    commitReopenOwnerBytes,
+                                    Math.addExact(
+                                        sharedPhaseBytes,
+                                        Math.addExact(
+                                            depthResources.modeledMaximumSemanticStateBytes.toLong(),
+                                            pendingDepthOutsideKernelArrays,
+                                        ),
+                                    ),
+                                ),
+                            ),
                         )
                         // JOL owner graphs are diagnostic; modeled receipts and portable ceilings are normative.
                         assertEquals(EXPECTED_SHARED_PHASE_BYTES, sharedPhaseBytes)
                         assertEquals(EXPECTED_DIRECTORY_BYTES, storage.directoryBytes)
                         assertTrue("shared phase=$sharedPhaseBytes", sharedPhaseBytes <= CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
-                        assertTrue("complete peak=$completePeakBytes", completePeakBytes <= CompactCanonicalStore.C17_TOTAL_BYTES)
+                        assertTrue(
+                            "complete peak=$completePeakBytes",
+                            completePeakBytes <= Math.addExact(
+                                Math.addExact(
+                                    CompactCanonicalStore.C17_TOTAL_BYTES,
+                                    depthResources.semanticStateBudgetBytes.toLong(),
+                                ),
+                                maximumPendingDepth.budgetBytes,
+                            ),
+                        )
 
                         val activationPrefix = "canonical-surface-activation-${group.hash.joinToString("") { "%02x".format(it) }}"
                         val files = directory.walkTopDown().filter(File::isFile).toList()
@@ -140,6 +184,8 @@ class IntegratedCapacityCampaignTest {
                             "CANONICAL_SURFACE_INTEGRATED_MAXIMUM=resident=${memory.residentTotalBytes} " +
                                 "liveStores=${ownership.maxOf { it.liveStoreCount }} owner=$ownerBytes " +
                                 "commitReopenOwner=$commitReopenOwnerBytes " +
+                                "depthKernelMaximum=${depthResources.modeledMaximumSemanticStateBytes} " +
+                                "pendingDepthMaximum=${maximumPendingDepth.totalBytes} " +
                                 "sharedPhase=$sharedPhaseBytes completePeak=$completePeakBytes " +
                                 "directory=${storage.directoryBytes} committed=${coordinator.committedBytes()} " +
                                 "chargedPhysical=$chargedPhysicalBytes",
@@ -151,7 +197,7 @@ class IntegratedCapacityCampaignTest {
     }
 
     private companion object {
-        const val EXPECTED_MODELED_RESIDENT_BYTES = 14_565_056L
+        const val EXPECTED_MODELED_RESIDENT_BYTES = 14_606_056L
         const val EXPECTED_SHARED_PHASE_BYTES = 139_520L
         const val EXPECTED_DIRECTORY_BYTES = 139_264L
         const val EXPECTED_COMMITTED_PHYSICAL_BYTES = 42_188_800L

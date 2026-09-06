@@ -136,6 +136,7 @@ internal class VisibilityGridIntegration(
     private var pendingRendererRows = 0
     private var pendingCanonicalAcknowledgement: CanonicalAcknowledgement? = null
     private var pendingDepthCommit: PendingDepthCommit? = null
+    private var lastDepthLookupReceipt: BoundedCanonicalLookupReceipt? = null
     private val retainedDelta = ExactCurrentDeltaSource()
     @Volatile private var committed = 0L
     @Volatile private var committedFeatures = 0L
@@ -279,18 +280,29 @@ internal class VisibilityGridIntegration(
         pendingDepthCommit?.let(::retentionReceipt)
     }
 
+    internal fun depthResourceReceipt(): DepthEvidenceResourceReceipt? = synchronized(lock) {
+        depthKernel?.resourceReceipt()
+    }
+
+    internal fun depthLookupReceipt(): BoundedCanonicalLookupReceipt? = synchronized(lock) {
+        lastDepthLookupReceipt
+    }
+
     internal fun pendingPublicationGeometryCut(): CommittedGeometryCut? = synchronized(lock) { pendingGeometryCut }
 
     /** Portable scalar owners only; kernel/renderer arrays and phase buffers are named separately. */
     internal fun portableOwnerMemoryReceipt(): RuntimeOwnerMemoryReceipt = synchronized(lock) {
         RuntimeOwnerMemoryReceipt(
-            // The renderer-rebuild reference and early-ACK scalar were added
-            // after the locked 152-byte owner model; charge one 8-byte slot each.
-            integrationObjectBytes = 168,
+            // Renderer-rebuild and depth-lookup references plus the early-ACK
+            // scalar were added after the locked 152-byte owner model.
+            integrationObjectBytes = 176,
             integrationReceiptBytes = 104,
             retainedDeltaOwnerBytes = 16,
             pendingRendererRebuildBytes = pendingRendererRebuild?.let {
                 PendingRendererRebuild.PORTABLE_BYTES
+            } ?: 0,
+            retainedDepthLookupReceiptBytes = lastDepthLookupReceipt?.let {
+                BoundedCanonicalLookupReceipt.PORTABLE_BYTES
             } ?: 0,
             runtimeOwnerBytes = resources?.portableOwnerBytes() ?: 0,
             bindingOwnerBytes = binding.portableOwnerBytes(),
@@ -441,6 +453,7 @@ internal class VisibilityGridIntegration(
             }
             result
         }
+        lastDepthLookupReceipt = lookup.receipt
         val accepted = (lookup as? BoundedCanonicalLookupResult.Completed)?.value
             as? DepthEvidenceResult.Accepted ?: run {
             depth.discardPrepared()
@@ -1004,6 +1017,7 @@ internal class VisibilityGridIntegration(
         kernel = null
         depthKernel?.close()
         depthKernel = null
+        lastDepthLookupReceipt = null
         pendingCanonicalAcknowledgement = null
     }
 
@@ -1015,6 +1029,7 @@ internal data class RuntimeOwnerMemoryReceipt(
     val integrationReceiptBytes: Long,
     val retainedDeltaOwnerBytes: Long,
     val pendingRendererRebuildBytes: Long,
+    val retainedDepthLookupReceiptBytes: Long,
     val runtimeOwnerBytes: Long,
     val bindingOwnerBytes: Long,
     val coordinatorOwnerBytes: Long,
@@ -1025,6 +1040,7 @@ internal data class RuntimeOwnerMemoryReceipt(
         integrationReceiptBytes,
         retainedDeltaOwnerBytes,
         pendingRendererRebuildBytes,
+        retainedDepthLookupReceiptBytes,
         runtimeOwnerBytes,
         bindingOwnerBytes,
         coordinatorOwnerBytes,

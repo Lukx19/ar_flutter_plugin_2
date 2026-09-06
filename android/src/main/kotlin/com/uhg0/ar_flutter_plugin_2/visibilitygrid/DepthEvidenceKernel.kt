@@ -215,6 +215,7 @@ internal class DepthEvidenceKernel(
             closed = closed,
             maximumAcceptedOutputReserveBytes = if (closed) 0 else MAXIMUM_ACCEPTED_OUTPUT_RESERVE_BYTES,
             modeledMaximumSemanticStateBytes = if (closed) 0 else modeledMaximumSemanticStateBytes(),
+            semanticStateBudgetBytes = if (closed) 0 else SEMANTIC_STATE_BUDGET_BYTES,
         )
     }
 

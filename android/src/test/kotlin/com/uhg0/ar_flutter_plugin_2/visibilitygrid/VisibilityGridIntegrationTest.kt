@@ -26,6 +26,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.openjdk.jol.info.GraphLayout
 
 /** Locks Option A's BINDING-LIFECYCLE-ACK seeded CREATE cut without a Flutter payload seam. */
 class VisibilityGridIntegrationTest {
@@ -191,6 +192,8 @@ class VisibilityGridIntegrationTest {
             exchange(messenger, viewId, stream, 2, 0, 0, 0)
             exchange(messenger, viewId, stream, 3, 1, 1, 1)
             val cut = requireNotNull(binding.currentObservationOwnership())
+            assertEquals(null, integration.depthLookupReceipt())
+            assertEquals(0L, integration.portableOwnerMemoryReceipt().retainedDepthLookupReceiptBytes)
 
             integration.admitDepth(depth(cut, 10))
 
@@ -415,6 +418,15 @@ class VisibilityGridIntegrationTest {
             assertTrue(depthKernel.resourceReceipt().preparedEvidenceRows > 0)
             assertEquals(0L, integration.snapshot().admittedDepths)
             val retained = requireNotNull(integration.pendingDepthRetentionReceipt())
+            val retainedLookup = requireNotNull(integration.depthLookupReceipt())
+            assertEquals(
+                GraphLayout.parseInstance(retainedLookup).totalSize(),
+                BoundedCanonicalLookupReceipt.PORTABLE_BYTES,
+            )
+            assertEquals(
+                BoundedCanonicalLookupReceipt.PORTABLE_BYTES,
+                integration.portableOwnerMemoryReceipt().retainedDepthLookupReceiptBytes,
+            )
             assertTrue(retained.pendingOwnerScalarBytes > 0)
             assertTrue(retained.mutationPlanBytes > 0)
             assertTrue(retained.geometryCutBytes > 0)
@@ -440,7 +452,10 @@ class VisibilityGridIntegrationTest {
             assertEquals(1L, integration.snapshot().admittedDepths)
             assertEquals(null, integration.pendingDepthRetentionReceipt())
         } finally {
-            integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+            integration.close()
+            assertEquals(null, integration.depthLookupReceipt())
+            assertEquals(0L, integration.portableOwnerMemoryReceipt().retainedDepthLookupReceiptBytes)
+            binding.dispose(); coordinator.close(); directory.deleteRecursively()
         }
     }
 
@@ -1147,7 +1162,7 @@ class VisibilityGridIntegrationTest {
                 assertEquals("rendererRebuildPending", replacement.integrationReceipt().status)
                 assertEquals(0, replacement.integrationReceipt().committed)
                 replacement.portableOwnerMemoryReceipt().let { memory ->
-                    assertEquals(168L, memory.integrationObjectBytes)
+                    assertEquals(176L, memory.integrationObjectBytes)
                     assertEquals(64L, memory.pendingRendererRebuildBytes)
                     assertEquals(
                         listOf(
@@ -1155,6 +1170,7 @@ class VisibilityGridIntegrationTest {
                             memory.integrationReceiptBytes,
                             memory.retainedDeltaOwnerBytes,
                             memory.pendingRendererRebuildBytes,
+                            memory.retainedDepthLookupReceiptBytes,
                             memory.runtimeOwnerBytes,
                             memory.bindingOwnerBytes,
                             memory.coordinatorOwnerBytes,

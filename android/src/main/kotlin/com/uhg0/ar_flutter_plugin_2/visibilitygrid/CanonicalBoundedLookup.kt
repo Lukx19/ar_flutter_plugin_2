@@ -17,7 +17,12 @@ internal data class BoundedCanonicalLookupReceipt(
     val pageReads: Int,
     val bytesRead: Long,
     val refusedByLimit: Boolean,
-)
+) {
+    companion object {
+        /** Portable shallow owner retained by the integration after one depth lookup. */
+        const val PORTABLE_BYTES = 40L
+    }
+}
 
 internal enum class BoundedCanonicalLookupReason {
     INVALID_REQUEST,

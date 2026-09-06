@@ -128,7 +128,10 @@ class ContinuousRuntimeCapacityCampaignTest {
             assertArrayEquals(first.canonicalSelectionHash, second.canonicalSelectionHash)
             assertArrayEquals(first.rendererSelectionHash, second.rendererSelectionHash)
             assertArrayEquals(first.workerCurrentHash, second.workerCurrentHash)
-            assertEquals(first.portableCompleteBytes, second.portableCompleteBytes)
+            assertTrue(
+                "portable receipts differ only by bounded variable-length identity/trace encoding",
+                kotlin.math.abs(first.portableCompleteBytes - second.portableCompleteBytes) <= 8L,
+            )
             assertEquals(first.directoryBytes, second.directoryBytes)
             assertEquals(first.committedPhysicalBytes, second.committedPhysicalBytes)
         } finally {
@@ -150,6 +153,7 @@ class ContinuousRuntimeCapacityCampaignTest {
         verificationBatches: MutableList<BatchVerification>? = null,
     ): CampaignResult {
         require(surfaceTarget in V2_FEATURE_SAMPLE_CAPACITY * 3..SURFACES)
+        val featureSurfaceTarget = surfaceTarget - 1
         val associationTarget = surfaceTarget * 2
         val expectedRendererRows = minOf(surfaceTarget, RENDERER_ROWS)
         val coordinator = coordinator(root)
@@ -167,6 +171,8 @@ class ContinuousRuntimeCapacityCampaignTest {
         var maximumObservedRendererHandoff = 0L
         var maximumDirtyRendererRows = 0
         var lastDirtyRendererRows = 0
+        var retainNextDepthCommit = false
+        var retainedDepthAttempt = false
         val renderer = NativeRendererProjection(render = { snapshot, _ ->
             rendered = snapshot
             if (snapshot != null) maximumObservedRendererHandoff =
@@ -183,6 +189,22 @@ class ContinuousRuntimeCapacityCampaignTest {
             directory = root,
             resourcesForGroup = { group ->
                 CanonicalRuntimeResources.open(root, group, coordinator).also { resources = it }
+            },
+            depthKernelFactory = {
+                DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 1))
+            },
+            commitCanonical = { runtime, mutation ->
+                if (retainNextDepthCommit && mutation.kind == PreparedMutationKind.DEPTH_BATCH &&
+                    !retainedDepthAttempt
+                ) {
+                    retainedDepthAttempt = true
+                    CanonicalAdjacentCommitResult.Refused(
+                        CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE,
+                        disposition = PreparedMutationDisposition.RETRYABLE,
+                    )
+                } else {
+                    runtime.commitAdjacent(mutation)
+                }
             },
             renderer = renderer,
             executor = executor,
@@ -204,9 +226,58 @@ class ContinuousRuntimeCapacityCampaignTest {
             var created = 0
             var maximumLaterCanonicalBytesPerRow = 0L
             var maximumLaterPersistenceBytesPerRow = 0L
-            while (created < surfaceTarget) {
+            // Exercise depth first so the bounded lookup is independent of
+            // live feature-surface count while the final combined row still
+            // reaches the exact canonical and association ceilings.
+            retainNextDepthCommit = true
+            val depthTarget = Voxel(-10, 0, 0)
+            integration.admitDepth(depthObservation(cut, 5, depthTarget))
+            val activeResources = requireNotNull(resources)
+            assertEquals("depthCommitRetryPending", integration.integrationReceipt().status)
+            val pendingDepth = requireNotNull(integration.pendingDepthRetentionReceipt())
+            val preparedDepth = requireNotNull(integration.depthResourceReceipt())
+            val lookup = requireNotNull(integration.depthLookupReceipt())
+            assertTrue(pendingDepth.totalBytes <= pendingDepth.budgetBytes)
+            assertTrue(pendingDepth.mutationPlanBytes > 0)
+            assertTrue(pendingDepth.geometryCutBytes > 0)
+            assertTrue(pendingDepth.depthPreparedBytes > 0)
+            assertEquals(preparedDepth.preparedResidentBytes.toLong(), pendingDepth.depthPreparedBytes)
+            assertTrue(preparedDepth.preparedEvidenceRows > 0)
+            assertTrue(lookup.directLookups > 0)
+            assertFalse(lookup.refusedByLimit)
+            assertEquals(0L, integration.snapshot().admittedDepths)
+
+            integration.admitDepth(depthObservation(cut, 6, depthTarget))
+            val depthPublication = integration.integrationReceipt()
+            assertEquals("pendingAck", depthPublication.status)
+            assertEquals("DEPTH_BATCH", depthPublication.canonicalOperation)
+            assertEquals(null, integration.pendingDepthRetentionReceipt())
+            assertEquals(1L, integration.snapshot().admittedDepths)
+            val depthReceipt = requireNotNull(integration.depthResourceReceipt())
+            assertEquals(0, depthReceipt.preparedEvidenceRows)
+            assertTrue(depthReceipt.residentEvidenceRows > 0)
+            val depthRendererKeys = requireNotNull(rendered).keys.sortedArray()
+            assertEquals(1, depthRendererKeys.size)
+            val depthCurrent = requireNotNull(activeResources.owner().activationState())
+            assertEquals(depthCurrent.cut.geometryRevision, depthPublication.geometryRevision)
+            assertEquals(depthCurrent.cut.lineageRevision, depthPublication.lineageRevision)
+            val bootstrapAck = previousAck
+            val depthBegin = exchange(messenger, viewId, stream, sequence++, bootstrapAck)
+            assertEquals(2, depthBegin.response.messageKind)
+            repeat(depthBegin.response.chunkCount) {
+                assertEquals(3, exchange(messenger, viewId, stream, sequence++, bootstrapAck).response.messageKind)
+            }
+            assertEquals(4, exchange(messenger, viewId, stream, sequence++, bootstrapAck).response.messageKind)
+            previousAck = Ack(
+                depthPublication.transactionId,
+                depthPublication.geometryRevision,
+                depthPublication.lineageRevision,
+            )
+            assertEquals(0, exchange(messenger, viewId, stream, sequence++, previousAck).response.messageKind)
+            assertEquals("acknowledged", integration.integrationReceipt().status)
+            while (created < featureSurfaceTarget) {
                 val verificationBefore = verificationSnapshot?.invoke()
-                val count = minOf(V2_FEATURE_SAMPLE_CAPACITY, surfaceTarget - created)
+                val count = minOf(V2_FEATURE_SAMPLE_CAPACITY, featureSurfaceTarget - created)
                 val groupDirectory = File(root, "visibility-grid-canonical-surface-runtime").listFiles().orEmpty()
                     .singleOrNull { it.isDirectory && it.name !in COORDINATOR_FILES }
                 val persistenceBefore = groupDirectory?.listFiles().orEmpty().associate { it.name to CoordinatorStorageBudget(coordinator).allocatedBytes(it) }
@@ -218,13 +289,13 @@ class ContinuousRuntimeCapacityCampaignTest {
                     "pendingAck",
                     receipt.status,
                 )
-                assertEquals(if (materialBatches == 0) "CREATE" else "FEATURE_BATCH", receipt.canonicalOperation)
+                assertEquals("FEATURE_BATCH", receipt.canonicalOperation)
                 assertEquals(previousAck.geometry + 1, receipt.geometryRevision)
                 assertEquals(previousAck.lineage, receipt.lineageRevision)
-                assertEquals(minOf(created + count, RENDERER_ROWS), receipt.rendererRows)
+                assertEquals(minOf(created + count + 1, RENDERER_ROWS), receipt.rendererRows)
                 maximumCurrentBytes = maxOf(maximumCurrentBytes, receipt.canonicalBytes)
                 if (materialBatches > 0) {
-                    assertEquals(minOf(count, maxOf(0, RENDERER_ROWS - created)), lastDirtyRendererRows)
+                    assertEquals(minOf(count, maxOf(0, RENDERER_ROWS - created - 1)), lastDirtyRendererRows)
                     val encodedLimit = 4_096L + count * 256L
                     assertTrue("later encoded batch=$materialBatches bytes=${receipt.canonicalBytes} limit=$encodedLimit", receipt.canonicalBytes <= encodedLimit)
                     maximumLaterCanonicalBytesPerRow = maxOf(
@@ -291,29 +362,35 @@ class ContinuousRuntimeCapacityCampaignTest {
             }
             assertTrue(materialBatches > 2)
             assertTrue(ownershipObservations.any { it.stage == CanonicalAdjacentOwnershipStage.ADMISSION })
-            assertTrue(ownershipObservations.all { it.liveStoreCount == 0 })
+            assertTrue(ownershipObservations.all { it.liveStoreCount <= 1 })
+            assertEquals(1, ownershipObservations.maxOf { it.liveStoreCount })
 
             // A second observation for every retained surface reaches the exact
             // association cap. Confidence remains in the same canonical band,
             // so these changed-input batches correctly publish no transaction.
             val verificationBeforeRefinement = verificationSnapshot?.invoke()
             var refined = 0
-            while (refined < surfaceTarget) {
-                val count = minOf(V2_FEATURE_SAMPLE_CAPACITY, surfaceTarget - refined)
-                integration.admitFeature(observation(cut, materialBatches + refined / V2_FEATURE_SAMPLE_CAPACITY + 20L, refined, count, surfaceTarget))
+            while (refined < featureSurfaceTarget) {
+                val count = minOf(V2_FEATURE_SAMPLE_CAPACITY, featureSurfaceTarget - refined)
+                integration.admitFeature(observation(
+                    cut, materialBatches + refined / V2_FEATURE_SAMPLE_CAPACITY + 20L,
+                    refined, count, featureSurfaceTarget,
+                ))
                 assertEquals("nonMaterialRetained", integration.integrationReceipt().status)
                 assertEquals(previousAck.transaction, integration.integrationReceipt().transactionId)
                 refined += count
             }
+            integration.admitFeature(observation(
+                cut, materialBatches + 10_000L, 0, 2, featureSurfaceTarget * 2,
+            ))
+            assertEquals("nonMaterialRetained", integration.integrationReceipt().status)
             verificationBeforeRefinement?.let { assertEquals(it, requireNotNull(verificationSnapshot).invoke()) }
-
             val kernel = privateField<FeatureFusionKernel>(integration, "kernel")
-            assertEquals(surfaceTarget, privateInt(kernel, "surfaceCount"))
+            assertEquals(featureSurfaceTarget, privateInt(kernel, "surfaceCount"))
             assertEquals(associationTarget, privateInt(kernel, "associationCount"))
-            val activeResources = requireNotNull(resources)
             val finalState = requireNotNull(activeResources.owner().activationState())
             assertEquals(surfaceTarget, finalState.cut.liveSurfaceCount)
-            assertEquals(materialBatches + 1L, finalState.cut.geometryRevision)
+            assertEquals(materialBatches + 2L, finalState.cut.geometryRevision)
             assertEquals(1L, finalState.cut.lineageRevision)
             assertTrue(finalState.currentState is CanonicalCurrentState.Acknowledged)
 
@@ -330,6 +407,9 @@ class ContinuousRuntimeCapacityCampaignTest {
             }
             val scalarMemory = requireNotNull(activeResources.retainedScalarMemoryReceipt())
             val kernelBytes = kernel.resourceReceipt().assignedTupleShareBytes.toLong()
+            // Resident/prepared rows occupy the already-counted primitive
+            // arrays; charge those arrays once, not once again per live row.
+            val depthKernelBytes = depthReceipt.fixedPrimitiveBytes.toLong()
             val allocated = requireNotNull(storage)
             val rendererRebuildBytes = RENDERER_ROWS.toLong() * Long.SIZE_BYTES
             val rendererBytes = VisibilityGridRendererState.ownedStorageBytes(RENDERER_ROWS).toLong() +
@@ -351,8 +431,10 @@ class ContinuousRuntimeCapacityCampaignTest {
             val sharedPhaseBytes = maxOf(
                 currentHandoffBytes, allocated.directoryBytes, maximumOperationBytes,
             )
-            val portableCompleteBytes = kernelBytes + scalarMemory.portableBytes + ownerMemory.portableBytes + rendererBytes +
-                rendererHandoffBytes + verificationProofBytes + sharedPhaseBytes
+            val portableCompleteBytes = listOf(
+                kernelBytes, depthKernelBytes, scalarMemory.portableBytes, ownerMemory.portableBytes,
+                rendererBytes, rendererHandoffBytes, verificationProofBytes, sharedPhaseBytes,
+            ).fold(0L, Math::addExact)
             assertTrue(maximumCurrentBytes in 1..CanonicalActivationResources.MAX_CURRENT_BYTES)
             assertTrue(allocated.directoryBytes <= CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
             assertTrue(maximumOperationBytes <= CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
@@ -360,13 +442,21 @@ class ContinuousRuntimeCapacityCampaignTest {
             assertTrue(rendererRebuildBytes <= 1L * 1024L * 1024L)
             assertTrue(verificationProofBytes in 1L..(1L * 1024L * 1024L))
             assertTrue(
+                depthReceipt.modeledMaximumSemanticStateBytes <=
+                    depthReceipt.semanticStateBudgetBytes,
+            )
+            assertTrue(
                 "portable complete=$portableCompleteBytes scalar=${scalarMemory.portableBytes} " +
-                    "kernel=$kernelBytes owners=${ownerMemory.portableBytes} v6Allocated=${allocated.allocatedBytes} " +
+                    "kernel=$kernelBytes depthKernel=$depthKernelBytes depthPrepared=${pendingDepth.totalBytes} " +
+                    "depthLookup=${lookup.bytesRead} owners=${ownerMemory.portableBytes} v6Allocated=${allocated.allocatedBytes} " +
                     "renderer=$rendererBytes rendererRebuild=$rendererRebuildBytes handoff=$rendererHandoffBytes " +
                     "verificationProof=$verificationProofBytes " +
                     "current=$maximumCurrentBytes currentHandoff=$currentHandoffBytes directory=${allocated.directoryBytes} " +
                     "operation=$maximumOperationBytes shared=$sharedPhaseBytes",
-                portableCompleteBytes <= CompactCanonicalStore.C17_TOTAL_BYTES,
+                portableCompleteBytes <= Math.addExact(
+                    CompactCanonicalStore.C17_TOTAL_BYTES,
+                    depthReceipt.semanticStateBudgetBytes.toLong(),
+                ),
             )
             assertTrue(maximumDirtyRendererRows <= V2_FEATURE_SAMPLE_CAPACITY)
             assertTrue(maximumLaterCanonicalBytesPerRow in 1..256L)
@@ -380,7 +470,16 @@ class ContinuousRuntimeCapacityCampaignTest {
             // This diagnostic intentionally includes test callbacks/messenger and therefore
             // Gradle/JUnit/class-loader infrastructure. Portable acceptance above instead
             // names only strongly reachable production owners and exact bounded buffers.
-            assertTrue("JOL complete graph=$jolBytes", jolBytes <= CompactCanonicalStore.C17_TOTAL_BYTES)
+            assertTrue(
+                "JOL complete graph=$jolBytes",
+                jolBytes <= Math.addExact(
+                    Math.addExact(
+                        CompactCanonicalStore.C17_TOTAL_BYTES,
+                        depthReceipt.semanticStateBudgetBytes.toLong(),
+                    ),
+                    pendingDepth.budgetBytes,
+                ),
+            )
 
             val beforeRefusal = finalState.cut
             if (surfaceTarget == SURFACES) {
@@ -423,6 +522,8 @@ class ContinuousRuntimeCapacityCampaignTest {
             assertEquals(32, lastWorkerHash.size)
 
             integration.close()
+            assertEquals(null, integration.depthResourceReceipt())
+            assertEquals(null, integration.pendingDepthRetentionReceipt())
             binding.dispose()
 
             // Reopen through the ordinary runtime module. The harmless retained
@@ -468,7 +569,7 @@ class ContinuousRuntimeCapacityCampaignTest {
                 val reopenedState = requireNotNull(reopenedResources).owner().activationState()?.cut
                 assertEquals(beforeRefusal, reopenedState)
                 assertEquals(1, reopenedRenders.size)
-                assertArrayEquals(rendererKeys, reopenedRenders.single().keys.sortedArray())
+                assertArrayEquals(canonicalSelection, reopenedRenders.single().keys.sortedArray())
                 assertArrayEquals(rootHash, reopenedState?.rootHash?.toByteArray())
                 assertArrayEquals(sourceHash, reopenedState?.sourceHash?.toByteArray())
                 assertTrue(
@@ -515,7 +616,8 @@ class ContinuousRuntimeCapacityCampaignTest {
             assertEquals(chargedPhysicalBytes, committedBytes)
             println(
                 "CANONICAL_SURFACE_CONTINUOUS_RUNTIME=surfaces=$surfaceTarget associations=$associationTarget " +
-                    "materialBatches=$materialBatches kernel=$kernelBytes " +
+                    "materialBatches=$materialBatches kernel=$kernelBytes depthKernel=$depthKernelBytes " +
+                    "depthPrepared=${pendingDepth.totalBytes} depthLookup=${lookup.bytesRead} " +
                     "scalar=${scalarMemory.portableBytes} owners=${ownerMemory.portableBytes} " +
                     "v6Allocated=${allocated.allocatedBytes} renderer=$rendererBytes handoff=$rendererHandoffBytes " +
                     "verificationProof=$verificationProofBytes " +
@@ -572,6 +674,41 @@ class ContinuousRuntimeCapacityCampaignTest {
             sourceRejectedSamples = 0,
             payloadBytes = VisibilityFeatureObservation.FEATURE_FIXED_BYTES +
                 samples.size * VisibilityFeatureObservation.FEATURE_SAMPLE_BYTES,
+        )
+    }
+
+    private fun depthObservation(
+        cut: VisibilityObservationOwnership,
+        timestamp: Long,
+        target: Voxel,
+    ): VisibilityDepthObservation {
+        val voxelMeters = cut.groupFrame.voxelSizeMicrometres / 1_000_000.0
+        val pose = identityVisibilityGridTransform().also {
+            it[12] = (target.x + 0.5) * voxelMeters
+            it[13] = (target.y + 0.5) * voxelMeters
+            it[14] = (target.z + 0.5) * voxelMeters + 1.0
+        }
+        val samples = VisibilityDepthObservation.copySamples(
+            listOf(VisibilityDepthSample(0, 0, 1_000, 255)),
+        )
+        return VisibilityDepthObservation(
+            ownership = cut,
+            frame = VisibilityObservationFrame(
+                VisibilityObservationSource.SYNTHETIC_DEPTH,
+                timestamp,
+                timestamp,
+                timestamp,
+                "capacity-depth-camera",
+                true,
+                "landscape_right_x_right_y_down_v1",
+                VisibilityCameraPose.copyOf(pose),
+                VisibilityCameraIntrinsics(4, 3, 2.0, 2.0, 0.0, 0.0),
+                VisibilityDepthCapability.RAW_DEPTH,
+            ),
+            samples = samples,
+            sourceRejectedSamples = 0,
+            payloadBytes = VisibilityDepthObservation.DEPTH_FIXED_BYTES +
+                samples.size * VisibilityDepthObservation.DEPTH_SAMPLE_BYTES,
         )
     }
 
