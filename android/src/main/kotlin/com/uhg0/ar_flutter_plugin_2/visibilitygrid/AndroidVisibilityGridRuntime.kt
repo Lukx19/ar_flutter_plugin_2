@@ -28,6 +28,8 @@ internal class AndroidVisibilityGridRuntime(
     private val captureSafe: VisibilityCaptureSafePredicate =
         VisibilityCaptureSafePredicate.CONSERVATIVE,
     private val beforeLaneEnqueue: (VisibilityObservationSource) -> Unit = {},
+    private val afterLaneDelivery: (VisibilityObservationSource) -> Unit = {},
+    private val afterMapperAdmission: () -> Unit = {},
 ) : AutoCloseable {
     private val lock = Any()
     private val lifecycleLock = ReentrantReadWriteLock()
@@ -91,6 +93,7 @@ internal class AndroidVisibilityGridRuntime(
         nanoTime = nanoTime,
         payloadBytes = VisibilityFeatureObservation::payloadBytes,
         deliver = ::deliverFeature,
+        afterDelivery = { afterLaneDelivery(it.frame.source) },
         onReplacement = { synchronized(lock) { replacedFeatureObservations++ } },
         onStale = { synchronized(lock) { staleGenerationObservations++ } },
         onResidentBytesChanged = { bytes -> updateResidentBytes(featureBytes = bytes) },
@@ -101,6 +104,7 @@ internal class AndroidVisibilityGridRuntime(
         nanoTime = nanoTime,
         payloadBytes = VisibilityDepthObservation::payloadBytes,
         deliver = ::deliverDepth,
+        afterDelivery = { afterLaneDelivery(it.frame.source) },
         onReplacement = { synchronized(lock) { replacedDepthObservations++ } },
         onStale = { synchronized(lock) { staleGenerationObservations++ } },
         onResidentBytesChanged = { bytes -> updateResidentBytes(depthBytes = bytes) },
@@ -172,27 +176,27 @@ internal class AndroidVisibilityGridRuntime(
     fun offerFeature(
         observation: VisibilityFeatureObservation,
         callbackCopyNs: Long = 0,
-    ): Boolean {
+    ): Boolean = lifecycleLock.read {
         synchronized(lock) {
             if (paused) {
                 pausedObservationRejections++
-                return false
+                return@read false
             }
-            if (featureHealth == VisibilitySourceHealth.FAILED) return false
+            if (featureHealth == VisibilitySourceHealth.FAILED) return@read false
             if (closed || !isStructurallyValid(observation) ||
                 observation.samples.size > featureSampleCapacity() ||
                 (callbackCopyBudgetDegraded && !isCaptureSafe())
             ) {
                 invalidFeatureObservations++
-                return false
+                return@read false
             }
             if (observation.frame.sourceTimestampNs <= featureLastCopiedTimestampNs) {
                 duplicateFeatureObservations++
-                return false
+                return@read false
             }
             if (ownership() != observation.ownership) {
                 staleGenerationObservations++
-                return false
+                return@read false
             }
             featureLastCopiedTimestampNs = observation.frame.sourceTimestampNs
             featureHealth = VisibilitySourceHealth.HEALTHY
@@ -203,33 +207,33 @@ internal class AndroidVisibilityGridRuntime(
         }
         beforeLaneEnqueue(observation.frame.source)
         featureLane.offer(observation)
-        return true
+        true
     }
 
     fun offerDepth(
         observation: VisibilityDepthObservation,
         callbackCopyNs: Long = 0,
-    ): Boolean {
+    ): Boolean = lifecycleLock.read {
         synchronized(lock) {
             if (paused) {
                 pausedObservationRejections++
-                return false
+                return@read false
             }
-            if (depthHealth == VisibilitySourceHealth.FAILED) return false
+            if (depthHealth == VisibilitySourceHealth.FAILED) return@read false
             if (closed || callbackCopyBudgetDegraded ||
                 depthCapability == VisibilityDepthCapability.UNSUPPORTED ||
                 !isStructurallyValid(observation)
             ) {
                 invalidDepthObservations++
-                return false
+                return@read false
             }
             if (observation.frame.sourceTimestampNs <= depthLastCopiedTimestampNs) {
                 duplicateDepthObservations++
-                return false
+                return@read false
             }
             if (ownership() != observation.ownership) {
                 staleGenerationObservations++
-                return false
+                return@read false
             }
             depthLastCopiedTimestampNs = observation.frame.sourceTimestampNs
             depthHealth = VisibilitySourceHealth.HEALTHY
@@ -240,7 +244,7 @@ internal class AndroidVisibilityGridRuntime(
         }
         beforeLaneEnqueue(observation.frame.source)
         depthLane.offer(observation)
-        return true
+        true
     }
 
     fun recordFeatureTransientUnavailable() = synchronized(lock) {
@@ -509,6 +513,7 @@ internal class AndroidVisibilityGridRuntime(
             else -> {
                 mapper.admitFeature(observation)
                 recordMapperAdmissionDelta(mapper.snapshot())
+                afterMapperAdmission()
             }
         }
     }
@@ -529,6 +534,7 @@ internal class AndroidVisibilityGridRuntime(
             else -> {
                 mapper.admitDepth(observation)
                 recordMapperAdmissionDelta(mapper.snapshot())
+                afterMapperAdmission()
             }
         }
     }
@@ -873,6 +879,7 @@ private class LatestObservationLane<T : Any>(
     private val nanoTime: () -> Long,
     private val payloadBytes: (T) -> Int,
     private val deliver: (T) -> Unit,
+    private val afterDelivery: (T) -> Unit,
     private val onReplacement: () -> Unit,
     private val onStale: () -> Unit,
     private val onResidentBytesChanged: (Long) -> Unit,
@@ -950,6 +957,7 @@ private class LatestObservationLane<T : Any>(
             // not a scheduler failure that may wedge the source forever.
             onStale()
         }
+        afterDelivery(value)
         val nextDelay = synchronized(lock) {
             lastDeliveryNs = nanoTime()
             running = false
