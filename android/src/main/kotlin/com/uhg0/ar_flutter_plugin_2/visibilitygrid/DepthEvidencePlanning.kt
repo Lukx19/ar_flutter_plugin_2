@@ -1,5 +1,16 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
+/** Returns the checked power-of-two capacity used by every admission table. */
+private fun openAddressCapacity(expected: Int): Int {
+    require(expected >= 0)
+    val needed = Math.max(2L, Math.multiplyExact(expected.toLong(), 2L))
+    var capacity = 1L
+    while (capacity < needed) {
+        capacity = Math.multiplyExact(capacity, 2L)
+    }
+    return Math.toIntExact(capacity)
+}
+
 /** Primitive open-addressed identity table used only during batch admission. */
 internal class DepthEvidenceIdTable private constructor(
     private val keys: LongArray,
@@ -30,20 +41,12 @@ internal class DepthEvidenceIdTable private constructor(
     companion object {
         private const val TABLE_BYTES = 64L
 
-        fun forExpected(expected: Int): DepthEvidenceIdTable =
-            DepthEvidenceIdTable(LongArray(capacity(expected)), BooleanArray(capacity(expected)))
-
-        fun bytesForExpected(expected: Int): Long = capacity(expected) * 9L + TABLE_BYTES
-
-        private fun capacity(expected: Int): Int {
-            require(expected >= 0)
-            val needed = Math.max(2L, Math.multiplyExact(expected.toLong(), 2L))
-            var capacity = 1
-            while (capacity.toLong() < needed) {
-                capacity = Math.multiplyExact(capacity, 2)
-            }
-            return capacity
+        fun forExpected(expected: Int): DepthEvidenceIdTable {
+            val capacity = openAddressCapacity(expected)
+            return DepthEvidenceIdTable(LongArray(capacity), BooleanArray(capacity))
         }
+
+        fun bytesForExpected(expected: Int): Long = openAddressCapacity(expected) * 9L + TABLE_BYTES
 
         private fun mix(value: Long): Long {
             var mixed = value
@@ -78,21 +81,11 @@ internal class DepthEvidenceVoxelTable private constructor(
         private const val TABLE_BYTES = 64L
 
         fun forExpected(expected: Int): DepthEvidenceVoxelTable {
-            val capacity = capacity(expected)
+            val capacity = openAddressCapacity(expected)
             return DepthEvidenceVoxelTable(IntArray(capacity), IntArray(capacity), IntArray(capacity), BooleanArray(capacity))
         }
 
-        fun bytesForExpected(expected: Int): Long = capacity(expected) * 13L + TABLE_BYTES
-
-        private fun capacity(expected: Int): Int {
-            require(expected >= 0)
-            val needed = Math.max(2L, Math.multiplyExact(expected.toLong(), 2L))
-            var capacity = 1
-            while (capacity.toLong() < needed) {
-                capacity = Math.multiplyExact(capacity, 2)
-            }
-            return capacity
-        }
+        fun bytesForExpected(expected: Int): Long = openAddressCapacity(expected) * 13L + TABLE_BYTES
 
         private fun mix(voxel: Voxel): Long {
             var mixed = voxel.x.toLong() * -7046029254386353131L

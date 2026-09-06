@@ -631,15 +631,15 @@ internal class MutableCanonicalOverlay private constructor(
         // Validate every source reference and duplicate source identity before
         // any operation/source/target collection is constructed.
         for (change in command.changes) {
-            for (sourceIndex in 0 until depthSourceCount(change)) {
-                val source = depthSourceAt(change, sourceIndex)
+            for (sourceIndex in 0 until change.sourceCount) {
+                val source = change.sourceAt(sourceIndex)
                 if (!sourceIds.add(source.value)) {
                     return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
                 }
-                if (depthKind(change).structural && !structuralSourceIds.add(source.value)) {
+                if (change.operationKind.structural && !structuralSourceIds.add(source.value)) {
                     return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
                 }
-                if (depthKind(change).supportMode == DepthBatchSupportMode.SOURCE_TO_TARGETS) {
+                if (change.operationKind.supportMode == DepthBatchSupportMode.SOURCE_TO_TARGETS) {
                     supportSourceIds.add(source.value)
                 }
                 directLookups++
@@ -658,9 +658,9 @@ internal class MutableCanonicalOverlay private constructor(
                     else CanonicalMutationRefusal.OWNERSHIP_CONFLICT,
                 )
             }
-            val targetCount = depthTargetCount(change)
+            val targetCount = change.targetCount
             for (targetIndex in 0 until targetCount) {
-                val target = depthTargetAt(change, targetIndex)
+                val target = change.targetAt(targetIndex)
                 if (!targetVoxels.add(target.voxel)) {
                     return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
                 }
@@ -689,7 +689,7 @@ internal class MutableCanonicalOverlay private constructor(
             }
         }
 
-        val hasLineageChange = command.changes.any { depthKind(it).lineageChanged }
+        val hasLineageChange = command.changes.any { it.operationKind.lineageChanged }
         if (hasLineageChange && view.cut.lineageRevision >= configuration.revisionLimit) {
             return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.REVISION_EXHAUSTED)
         }
@@ -750,9 +750,9 @@ internal class MutableCanonicalOverlay private constructor(
             }
         }
         for (change in command.changes) {
-            if (!depthKind(change).structural) continue
-            for (sourceIndex in 0 until depthSourceCount(change)) {
-                if (!readStructuralSource(depthSourceAt(change, sourceIndex))) {
+            if (!change.operationKind.structural) continue
+            for (sourceIndex in 0 until change.sourceCount) {
+                if (!readStructuralSource(change.sourceAt(sourceIndex))) {
                     return DepthBatchPreflightResult.Refused(
                         streamRefusal ?: CanonicalMutationRefusal.SOURCE_READ_FAILURE,
                     )
@@ -779,11 +779,11 @@ internal class MutableCanonicalOverlay private constructor(
         var exactRefusal: CanonicalMutationRefusal? = null
         command.changes.forEach { change ->
             if (exactRefusal != null) return@forEach
-            val targetCount = depthTargetCount(change)
-            val supportSourceCount = if (depthKind(change).supportMode == DepthBatchSupportMode.SOURCE_TO_TARGETS) {
+            val targetCount = change.targetCount
+            val supportSourceCount = if (change.operationKind.supportMode == DepthBatchSupportMode.SOURCE_TO_TARGETS) {
                 var unionSize = 0
-                for (sourceIndex in 0 until depthSourceCount(change)) {
-                    val source = depthSourceAt(change, sourceIndex)
+                for (sourceIndex in 0 until change.sourceCount) {
+                    val source = change.sourceAt(sourceIndex)
                     var streamed = 0L
                     val streamOk = streamSourceSupports(source) { support ->
                         streamed = try { Math.addExact(streamed, 1L) }
@@ -833,7 +833,7 @@ internal class MutableCanonicalOverlay private constructor(
                 }
                 distinct
             } else {
-                if (depthKind(change).supportMode == DepthBatchSupportMode.SELF) targetCount else 0
+                if (change.operationKind.supportMode == DepthBatchSupportMode.SELF) targetCount else 0
             }
             if (exactRefusal == null) {
                 val contribution = try { Math.multiplyExact(supportSourceCount.toLong(), targetCount.toLong()) }
@@ -852,7 +852,7 @@ internal class MutableCanonicalOverlay private constructor(
 
         val finalLive = try {
             command.changes.fold(view.cut.liveSurfaceCount.toLong()) { current, change ->
-                Math.addExact(current, depthLiveDelta(change).toLong())
+                Math.addExact(current, change.liveDelta.toLong())
             }
         } catch (_: ArithmeticException) {
             return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.CAPACITY)
@@ -914,19 +914,6 @@ internal class MutableCanonicalOverlay private constructor(
         bytes = Math.addExact(bytes, 40L)
         Math.addExact(bytes, wal)
     } catch (_: ArithmeticException) { null }
-
-    private fun depthSourceCount(change: DepthEvidenceChange): Int = change.sourceCount
-
-    private fun depthSourceAt(change: DepthEvidenceChange, index: Int): SurfaceId = change.sourceAt(index)
-
-    private fun depthTargetCount(change: DepthEvidenceChange): Int = change.targetCount
-
-    private fun depthTargetAt(change: DepthEvidenceChange, index: Int): CanonicalTarget = change.targetAt(index)
-
-    private fun depthKind(change: DepthEvidenceChange): DepthBatchOperationKind = change.operationKind
-
-    private fun depthLiveDelta(change: DepthEvidenceChange): Int =
-        change.operationKind.liveDelta(change.sourceCount, change.targetCount)
 
     private fun streamLineageCount(source: SurfaceId): Long? {
         var cursor: LineageCursor? = null
@@ -998,7 +985,12 @@ internal class MutableCanonicalOverlay private constructor(
             is DepthBatchPreflightResult.Complete -> result.value
         }
 
-        data class Operation(val kind: DepthBatchOperationKind, val sources: List<SurfaceId>, val targets: IntArray)
+        data class Operation(
+            val kind: DepthBatchOperationKind,
+            val sources: List<SurfaceId>,
+            val targets: IntArray,
+            val liveDelta: Int,
+        )
         val operations = ArrayList<Operation>(command.changes.size)
         val sources = ArrayList<SurfaceId>(scalars.sourceReferences)
         val structuralSources = HashSet<SurfaceId>(scalars.sourceReferences)
@@ -1030,7 +1022,7 @@ internal class MutableCanonicalOverlay private constructor(
                 if (target < 0) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
                 operationTargets[targetIndex] = target
             }
-            operations += Operation(kind, operationSources, operationTargets)
+            operations += Operation(kind, operationSources, operationTargets, change.liveDelta)
         }
         if (sources.size > configuration.surfaceCapacity + configuration.lineageCapacity) {
             return refuse(CanonicalMutationRefusal.CAPACITY)
@@ -1195,9 +1187,7 @@ internal class MutableCanonicalOverlay private constructor(
         if (distinctSupports.size.toLong() != preflight.supportPairCount) {
             return refuse(CanonicalMutationRefusal.SOURCE_READ_FAILURE)
         }
-        val targetLive = view.cut.liveSurfaceCount + operations.sumOf { operation ->
-            operation.kind.liveDelta(operation.sources.size, operation.targets.size)
-        }
+        val targetLive = view.cut.liveSurfaceCount + operations.sumOf { operation -> operation.liveDelta }
         var removedSupportRecords = 0L
         for (source in removedSupportTargets) {
             val records = readDetails(source)?.records ?: return refuse(CanonicalMutationRefusal.SOURCE_READ_FAILURE)
