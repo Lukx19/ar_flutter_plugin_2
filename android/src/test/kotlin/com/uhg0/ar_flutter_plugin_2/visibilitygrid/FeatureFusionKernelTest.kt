@@ -64,7 +64,7 @@ class FeatureFusionKernelTest {
 
     @Test
     fun `allocation failures before and after preflight preserve prior receipt and next delta`() {
-        FeatureFusionAllocationCut.entries.forEach { cut ->
+        FeatureFusionAllocationCut.entries.filter { it != FeatureFusionAllocationCut.CANONICAL_REMAP }.forEach { cut ->
             val operations = FaultOperations(allocationCut = cut)
             val kernel = FeatureFusionKernel(operations)
             val prior = accepted(kernel, batch(1, listOf(evidence(0, 0, 0, 2, 1))))
@@ -191,6 +191,223 @@ class FeatureFusionKernelTest {
         val before = kernel.canonicalCorrelation(changes[0].kernelSlot)
         assertFalse(kernel.assignCanonicalCorrelations(listOf(changes[0].assignment(SurfaceId(2), firstFingerprint))))
         assertEquals(before, kernel.canonicalCorrelation(changes[0].kernelSlot))
+    }
+
+    @Test
+    fun `canonical replacement remap preserves slot evidence and allocation provenance`() {
+        val kernel = kernel()
+        val accepted = accepted(kernel, batch(1, listOf(evidence(0, 0, 0, 2, 1))))
+        val change = accepted.delta.single() as FeatureFusionChange.Upsert
+        val fingerprint = CanonicalReceiptBytes(ByteArray(32) { 0x2a })
+        assertTrue(kernel.assignCanonicalCorrelations(listOf(
+            CanonicalFeatureAssignment(
+                change.kernelSlot, change.x, change.y, change.z, SurfaceId(17), fingerprint, 0x0102, 191,
+            ),
+        )))
+        val before = requireNotNull(kernel.canonicalCorrelation(change.kernelSlot))
+
+        val prepared = kernel.prepareCanonicalRemap(listOf(
+            CanonicalFeatureRemap(change.kernelSlot, SurfaceId(17), SurfaceId(42)),
+        ))
+        assertTrue(prepared is FeatureCanonicalRemapPreparation.Prepared)
+        assertEquals(1, (prepared as FeatureCanonicalRemapPreparation.Prepared).count)
+        kernel.applyPreparedCanonicalRemap()
+
+        val after = requireNotNull(kernel.canonicalCorrelation(change.kernelSlot))
+        assertEquals(SurfaceId(42), after.id)
+        assertEquals(before.allocationFingerprint, after.allocationFingerprint)
+        assertEquals(before.packedNormal, after.packedNormal)
+        assertEquals(before.normalConfidence, after.normalConfidence)
+    }
+
+    @Test
+    fun `canonical remap permits multiple feature slots to share one destination identity`() {
+        val kernel = kernel()
+        val accepted = accepted(kernel, batch(1, listOf(evidence(0, 0, 0, 2, 1), evidence(1, 0, 0, 2, 2))))
+        val first = accepted.delta[0] as FeatureFusionChange.Upsert
+        val second = accepted.delta[1] as FeatureFusionChange.Upsert
+        val firstFingerprint = CanonicalReceiptBytes(ByteArray(32) { 0x37 })
+        val secondFingerprint = CanonicalReceiptBytes(ByteArray(32) { 0x38 })
+        assertTrue(kernel.assignCanonicalCorrelations(listOf(
+            CanonicalFeatureAssignment(first.kernelSlot, first.x, first.y, first.z, SurfaceId(17), firstFingerprint),
+        )))
+        assertTrue(kernel.assignCanonicalCorrelations(listOf(
+            CanonicalFeatureAssignment(second.kernelSlot, second.x, second.y, second.z, SurfaceId(18), secondFingerprint),
+        )))
+
+        assertTrue(kernel.prepareCanonicalRemap(listOf(
+            CanonicalFeatureRemap(first.kernelSlot, SurfaceId(17), SurfaceId(42)),
+            CanonicalFeatureRemap(second.kernelSlot, SurfaceId(18), SurfaceId(42)),
+        )) is FeatureCanonicalRemapPreparation.Prepared)
+        kernel.applyPreparedCanonicalRemap()
+
+        assertEquals(SurfaceId(42), kernel.canonicalCorrelation(first.kernelSlot)?.id)
+        assertEquals(firstFingerprint, kernel.canonicalCorrelation(first.kernelSlot)?.allocationFingerprint)
+        assertEquals(SurfaceId(42), kernel.canonicalCorrelation(second.kernelSlot)?.id)
+        assertEquals(secondFingerprint, kernel.canonicalCorrelation(second.kernelSlot)?.allocationFingerprint)
+    }
+
+    @Test
+    fun `canonical relocation keeps the existing identity and feature evidence`() {
+        val kernel = kernel()
+        val accepted = accepted(kernel, batch(1, listOf(evidence(0, 0, 0, 2, 1))))
+        val change = accepted.delta.single() as FeatureFusionChange.Upsert
+        val fingerprint = CanonicalReceiptBytes(ByteArray(32) { 0x31 })
+        val assignment = CanonicalFeatureAssignment(change.kernelSlot, change.x, change.y, change.z, SurfaceId(17), fingerprint, 0x0203, 64)
+        assertTrue(kernel.assignCanonicalCorrelations(listOf(assignment)))
+
+        assertTrue(kernel.prepareCanonicalRemap(
+            CanonicalFeatureRemap(change.kernelSlot, SurfaceId(17), SurfaceId(17)),
+        ) is FeatureCanonicalRemapPreparation.Prepared)
+        kernel.applyPreparedCanonicalRemap()
+
+        assertEquals(CanonicalFeatureCorrelation(SurfaceId(17), fingerprint, 0x0203, 64), kernel.canonicalCorrelation(change.kernelSlot))
+    }
+
+    @Test
+    fun `canonical removal clears identity but preserves retained feature state`() {
+        val kernel = kernel()
+        val first = accepted(kernel, batch(1, listOf(evidence(0, 0, 0, 2, 1))))
+        val change = first.delta.single() as FeatureFusionChange.Upsert
+        val fingerprint = CanonicalReceiptBytes(ByteArray(32) { 0x32 })
+        assertTrue(kernel.assignCanonicalCorrelations(listOf(
+            CanonicalFeatureAssignment(change.kernelSlot, change.x, change.y, change.z, SurfaceId(17), fingerprint, 0x0304, 192),
+        )))
+        val before = kernel.resourceReceipt()
+
+        assertTrue(kernel.prepareCanonicalRemap(
+            CanonicalFeatureRemap(change.kernelSlot, SurfaceId(17), null),
+        ) is FeatureCanonicalRemapPreparation.Prepared)
+        kernel.applyPreparedCanonicalRemap()
+
+        assertEquals(before, kernel.resourceReceipt())
+        assertEquals(null, kernel.canonicalCorrelation(change.kernelSlot))
+        val later = accepted(kernel, batch(2, listOf(evidence(0, 0, 0, 1, 2))))
+        assertEquals(before.associationCount + 1, later.receipt.associationCount)
+    }
+
+    @Test
+    fun `canonical remap validates current IDs slots duplicates and bounded size atomically`() {
+        val kernel = kernel()
+        val accepted = accepted(kernel, batch(1, listOf(evidence(0, 0, 0, 2, 1), evidence(1, 0, 0, 2, 2))))
+        val first = accepted.delta[0] as FeatureFusionChange.Upsert
+        val second = accepted.delta[1] as FeatureFusionChange.Upsert
+        val fingerprint = CanonicalReceiptBytes(ByteArray(32) { 0x33 })
+        assertTrue(kernel.assignCanonicalCorrelations(listOf(
+            CanonicalFeatureAssignment(first.kernelSlot, first.x, first.y, first.z, SurfaceId(17), fingerprint),
+            CanonicalFeatureAssignment(second.kernelSlot, second.x, second.y, second.z, SurfaceId(18), fingerprint),
+        )))
+        val unchanged = kernel.canonicalCorrelation(first.kernelSlot)
+
+        fun refused(remaps: List<CanonicalFeatureRemap>, reason: FeatureCanonicalRemapRefusal) {
+            val result = kernel.prepareCanonicalRemap(remaps) as FeatureCanonicalRemapPreparation.Refused
+            assertEquals(reason, result.reason)
+            assertEquals(unchanged, kernel.canonicalCorrelation(first.kernelSlot))
+        }
+        refused(listOf(CanonicalFeatureRemap(first.kernelSlot, SurfaceId(99), null)), FeatureCanonicalRemapRefusal.STALE_PREVIOUS_ID)
+        refused(listOf(CanonicalFeatureRemap(-1, SurfaceId(17), null)), FeatureCanonicalRemapRefusal.INVALID_SLOT)
+        refused(listOf(
+            CanonicalFeatureRemap(first.kernelSlot, SurfaceId(17), null),
+            CanonicalFeatureRemap(first.kernelSlot, SurfaceId(17), null),
+        ), FeatureCanonicalRemapRefusal.DUPLICATE_SLOT)
+        var invalidIdRejected = false
+        try {
+            SurfaceId(0)
+        } catch (_: IllegalArgumentException) {
+            invalidIdRejected = true
+        }
+        assertTrue(invalidIdRejected)
+
+        val oversized = List(100_001) { CanonicalFeatureRemap(0, SurfaceId(17), null) }
+        val capacity = kernel.prepareCanonicalRemap(oversized) as FeatureCanonicalRemapPreparation.Refused
+        assertEquals(FeatureCanonicalRemapRefusal.CAPACITY, capacity.reason)
+        assertEquals(unchanged, kernel.canonicalCorrelation(first.kernelSlot))
+    }
+
+    @Test
+    fun `canonical remap allocation and checked sizing refusals preserve retryability`() {
+        listOf(
+            FeatureFusionAllocationFailureMode.ALLOCATION,
+            FeatureFusionAllocationFailureMode.ARITHMETIC,
+        ).forEach { mode ->
+            val operations = FaultOperations(
+                allocationCut = if (mode == FeatureFusionAllocationFailureMode.ALLOCATION) FeatureFusionAllocationCut.CANONICAL_REMAP else null,
+                arithmeticFailure = mode == FeatureFusionAllocationFailureMode.ARITHMETIC,
+            )
+            val kernel = FeatureFusionKernel(operations)
+            val accepted = accepted(kernel, batch(1, listOf(evidence(0, 0, 0, 2, 1))))
+            val change = accepted.delta.single() as FeatureFusionChange.Upsert
+            val fingerprint = CanonicalReceiptBytes(ByteArray(32) { 0x34 })
+            assertTrue(kernel.assignCanonicalCorrelations(listOf(
+                CanonicalFeatureAssignment(change.kernelSlot, change.x, change.y, change.z, SurfaceId(17), fingerprint),
+            )))
+            operations.armed = true
+            val refusal = kernel.prepareCanonicalRemap(
+                CanonicalFeatureRemap(change.kernelSlot, SurfaceId(17), SurfaceId(42)),
+            ) as FeatureCanonicalRemapPreparation.Refused
+            assertEquals(
+                if (mode == FeatureFusionAllocationFailureMode.ALLOCATION) FeatureCanonicalRemapRefusal.ALLOCATION
+                else FeatureCanonicalRemapRefusal.CHECKED_ARITHMETIC,
+                refusal.reason,
+            )
+            assertEquals(SurfaceId(17), kernel.canonicalCorrelation(change.kernelSlot)?.id)
+            assertTrue(kernel.prepareCanonicalRemap(
+                CanonicalFeatureRemap(change.kernelSlot, SurfaceId(17), SurfaceId(42)),
+            ) is FeatureCanonicalRemapPreparation.Prepared)
+            kernel.applyPreparedCanonicalRemap()
+            assertEquals(SurfaceId(42), kernel.canonicalCorrelation(change.kernelSlot)?.id)
+        }
+    }
+
+    @Test
+    fun `canonical remap discard is idempotent and feature batch pending state is independent`() {
+        val kernel = kernel()
+        val first = accepted(kernel, batch(1, listOf(evidence(0, 0, 0, 2, 1))))
+        val change = first.delta.single() as FeatureFusionChange.Upsert
+        val fingerprint = CanonicalReceiptBytes(ByteArray(32) { 0x35 })
+        assertTrue(kernel.assignCanonicalCorrelations(listOf(
+            CanonicalFeatureAssignment(change.kernelSlot, change.x, change.y, change.z, SurfaceId(17), fingerprint),
+        )))
+
+        assertTrue(kernel.prepare(batch(2, listOf(evidence(0, 0, 0, 1, 2)))) is FeatureFusionResult.Accepted)
+        assertTrue(kernel.prepareCanonicalRemap(
+            CanonicalFeatureRemap(change.kernelSlot, SurfaceId(17), SurfaceId(42)),
+        ) is FeatureCanonicalRemapPreparation.Prepared)
+        kernel.discardPreparedCanonicalRemap()
+        kernel.discardPreparedCanonicalRemap()
+        assertEquals(SurfaceId(17), kernel.canonicalCorrelation(change.kernelSlot)?.id)
+        assertTrue(kernel.prepareCanonicalRemap(
+            CanonicalFeatureRemap(change.kernelSlot, SurfaceId(17), SurfaceId(42)),
+        ) is FeatureCanonicalRemapPreparation.Prepared)
+        kernel.applyPreparedCanonicalRemap()
+        assertEquals(SurfaceId(42), kernel.canonicalCorrelation(change.kernelSlot)?.id)
+
+        kernel.prepareCanonicalApplication(emptyList())
+        kernel.applyPrepared()
+        assertEquals(SurfaceId(42), kernel.canonicalCorrelation(change.kernelSlot)?.id)
+    }
+
+    @Test
+    fun `canonical remap apply consumes the packet exactly once`() {
+        val kernel = kernel()
+        val accepted = accepted(kernel, batch(1, listOf(evidence(0, 0, 0, 2, 1))))
+        val change = accepted.delta.single() as FeatureFusionChange.Upsert
+        val fingerprint = CanonicalReceiptBytes(ByteArray(32) { 0x36 })
+        assertTrue(kernel.assignCanonicalCorrelations(listOf(
+            CanonicalFeatureAssignment(change.kernelSlot, change.x, change.y, change.z, SurfaceId(17), fingerprint),
+        )))
+        assertTrue(kernel.prepareCanonicalRemap(
+            CanonicalFeatureRemap(change.kernelSlot, SurfaceId(17), SurfaceId(42)),
+        ) is FeatureCanonicalRemapPreparation.Prepared)
+        kernel.applyPreparedCanonicalRemap()
+        var rejected = false
+        try {
+            kernel.applyPreparedCanonicalRemap()
+        } catch (_: IllegalStateException) {
+            rejected = true
+        }
+        assertTrue(rejected)
+        assertEquals(SurfaceId(42), kernel.canonicalCorrelation(change.kernelSlot)?.id)
     }
 
     @Test
@@ -335,4 +552,6 @@ class FeatureFusionKernelTest {
             return Math.addExact(left, right)
         }
     }
+
+    private enum class FeatureFusionAllocationFailureMode { ALLOCATION, ARITHMETIC }
 }

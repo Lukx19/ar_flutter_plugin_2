@@ -43,6 +43,115 @@ internal class FeatureFusionKernel(
     }
 
     /**
+     * Stages identity-only canonical changes independently of the feature batch
+     * admission above.  The staged packet owns only exact-size primitive arrays;
+     * input model objects are never retained after this call.
+     */
+    @Synchronized
+    internal fun prepareCanonicalRemap(remaps: List<CanonicalFeatureRemap>): FeatureCanonicalRemapPreparation {
+        if (pendingCanonicalRemap != null) return FeatureCanonicalRemapPreparation.Refused(FeatureCanonicalRemapRefusal.PREPARED_BUSY)
+        if (remaps.size > SURFACE_CAPACITY) return FeatureCanonicalRemapPreparation.Refused(FeatureCanonicalRemapRefusal.CAPACITY)
+        val staged = try {
+            operations.allocate(FeatureFusionAllocationCut.CANONICAL_REMAP) {
+                stageCanonicalRemap(remaps)
+            }
+        } catch (_: FeatureFusionAllocationFailure) {
+            return FeatureCanonicalRemapPreparation.Refused(FeatureCanonicalRemapRefusal.ALLOCATION)
+        } catch (_: OutOfMemoryError) {
+            return FeatureCanonicalRemapPreparation.Refused(FeatureCanonicalRemapRefusal.ALLOCATION)
+        } catch (_: ArithmeticException) {
+            return FeatureCanonicalRemapPreparation.Refused(FeatureCanonicalRemapRefusal.CHECKED_ARITHMETIC)
+        }
+        if (staged is CanonicalRemapStage.Refused) {
+            return FeatureCanonicalRemapPreparation.Refused(staged.reason)
+        }
+        staged as CanonicalRemapStage.Accepted
+        pendingCanonicalRemap = staged.packet
+        return FeatureCanonicalRemapPreparation.Prepared(staged.packet.slots.size)
+    }
+
+    /** Convenience overload for callers changing one canonical identity. */
+    @Synchronized
+    internal fun prepareCanonicalRemap(remap: CanonicalFeatureRemap): FeatureCanonicalRemapPreparation =
+        prepareCanonicalRemap(listOf(remap))
+
+    /** Applies a successful remap using only the preflighted primitive packet. */
+    @Synchronized
+    internal fun applyPreparedCanonicalRemap() {
+        val prepared = checkNotNull(pendingCanonicalRemap) { "no prepared canonical remap" }
+        for (index in prepared.slots.indices) {
+            canonicalIds[prepared.slots[index]] = prepared.targetIds[index].toInt()
+        }
+        pendingCanonicalRemap = null
+    }
+
+    /** Idempotently drops a canonical remap packet without touching feature state. */
+    @Synchronized
+    internal fun discardPreparedCanonicalRemap() {
+        pendingCanonicalRemap = null
+    }
+
+    private fun stageCanonicalRemap(remaps: List<CanonicalFeatureRemap>): CanonicalRemapStage {
+        val count = remaps.size
+        val tableCapacity = remapTableCapacity(count)
+        val seenSlots = IntArray(tableCapacity)
+        val slots = IntArray(count)
+        val targetIds = LongArray(count)
+        for (index in remaps.indices) {
+            val remap = remaps[index]
+            val slot = remap.featureSlot
+            if (slot !in 0 until surfaceCount) {
+                return CanonicalRemapStage.Refused(FeatureCanonicalRemapRefusal.INVALID_SLOT)
+            }
+            if (!insertRemapSlot(seenSlots, slot)) {
+                return CanonicalRemapStage.Refused(FeatureCanonicalRemapRefusal.DUPLICATE_SLOT)
+            }
+            val previous = remap.previousSurfaceId.value
+            if (previous !in 1L..UINT32_MASK ||
+                (canonicalIds[slot].toLong() and UINT32_MASK) != previous
+            ) {
+                return CanonicalRemapStage.Refused(FeatureCanonicalRemapRefusal.STALE_PREVIOUS_ID)
+            }
+            val target = remap.nextSurfaceId?.value ?: 0L
+            if (target !in 0L..UINT32_MASK || (remap.nextSurfaceId != null && target == 0L)) {
+                return CanonicalRemapStage.Refused(FeatureCanonicalRemapRefusal.INVALID_ID)
+            }
+            slots[index] = slot
+            targetIds[index] = target
+        }
+        return CanonicalRemapStage.Accepted(PendingCanonicalRemap(slots, targetIds))
+    }
+
+    private fun remapTableCapacity(count: Int): Int {
+        var capacity = 1
+        val required = operations.addExact(count, count)
+        while (capacity < required) capacity = operations.addExact(capacity, capacity)
+        return capacity
+    }
+
+    private fun insertRemapSlot(table: IntArray, slot: Int): Boolean {
+        var index = remapHash(slot.toLong()) and (table.size - 1)
+        while (true) {
+            val encoded = table[index]
+            if (encoded == 0) {
+                table[index] = slot + 1
+                return true
+            }
+            if (encoded == slot + 1) return false
+            index = (index + 1) and (table.size - 1)
+        }
+    }
+
+    private fun remapHash(value: Long): Int {
+        var mixed = value xor (value ushr 33)
+        mixed *= -49064778989728563L
+        mixed = mixed xor (mixed ushr 33)
+        mixed *= -4265267296055464877L
+        return mixed.toInt()
+    }
+
+
+    /**
      * Validates and copies every post-commit write before durability is attempted.
      * A successful call makes [applyPrepared] allocation-free and infallible under
      * the integration's single mutation lane.
@@ -132,7 +241,11 @@ internal class FeatureFusionKernel(
         while (index < staged.updates.size) {
             val update = staged.updates[index++]
             accumulatedWeights[update.slot] = withWeight(accumulatedWeights[update.slot], update.weight)
-            observationCounts[update.slot] = encodeObservationState(update.observationCount, update.primarySide)
+            observationCounts[update.slot] = encodeObservationState(
+                update.observationCount,
+                update.primarySide,
+                canonicalRangeIndex(observationCounts[update.slot]),
+            )
             active[update.slot] = update.isActive
             axisXQ13[update.slot] = update.axisXQ13
             axisYQ13[update.slot] = update.axisYQ13
@@ -140,6 +253,7 @@ internal class FeatureFusionKernel(
             positiveSupportQ13[update.slot] = update.positiveSupportQ13
             negativeSupportQ13[update.slot] = update.negativeSupportQ13
         }
+        var assignmentRangeIndex = -1
         for (assignment in prepared.sortedNewAssignments) {
             canonicalIds[assignment.kernelSlot] = assignment.id.value.toInt()
         }
@@ -150,14 +264,19 @@ internal class FeatureFusionKernel(
         }
         if (prepared.sortedNewAssignments.isNotEmpty()) {
             if (prepared.extendLastRange) {
+                assignmentRangeIndex = allocationRangeCount - 1
                 allocationRangeEnds[allocationRangeCount - 1] = prepared.sortedNewAssignments.last().id.value.toInt()
             } else {
+                assignmentRangeIndex = allocationRangeCount
                 allocationRangeStarts[allocationRangeCount] = prepared.sortedNewAssignments.first().id.value.toInt()
                 allocationRangeEnds[allocationRangeCount] = prepared.sortedNewAssignments.last().id.value.toInt()
                 requireNotNull(prepared.newRangeFingerprint).copyInto(
                     allocationFingerprints, allocationRangeCount * HASH_BYTES,
                 )
                 allocationRangeCount++
+            }
+            for (assignment in prepared.sortedNewAssignments) {
+                setCanonicalRangeIndex(assignment.kernelSlot, assignmentRangeIndex)
             }
         }
         lastSequence = prepared.sequence
@@ -357,15 +476,27 @@ internal class FeatureFusionKernel(
     }
 
     private fun observationCount(encoded: Int): Int = encoded and OBSERVATION_COUNT_MASK
+    private fun canonicalRangeIndex(encoded: Int): Int =
+        if (encoded and OBSERVATION_RANGE_PRESENT == 0) -1 else
+            (encoded ushr OBSERVATION_RANGE_SHIFT) and OBSERVATION_RANGE_MASK
     private fun primarySide(encoded: Int): FeaturePrimarySide = when (encoded ushr OBSERVATION_PRIMARY_SHIFT) {
         0 -> FeaturePrimarySide.NONE
         1 -> FeaturePrimarySide.POSITIVE
         2 -> FeaturePrimarySide.NEGATIVE
         else -> error("invalid retained primary-side state")
     }
-    private fun encodeObservationState(count: Int, side: FeaturePrimarySide): Int {
+    private fun encodeObservationState(count: Int, side: FeaturePrimarySide, rangeIndex: Int = -1): Int {
         require(count in 0..OBSERVATION_COUNT_MASK)
-        return count or (side.code shl OBSERVATION_PRIMARY_SHIFT)
+        require(rangeIndex in -1 until MAX_ALLOCATION_RANGES)
+        val range = if (rangeIndex < 0) 0 else
+            OBSERVATION_RANGE_PRESENT or (rangeIndex shl OBSERVATION_RANGE_SHIFT)
+        return count or range or (side.code shl OBSERVATION_PRIMARY_SHIFT)
+    }
+    private fun setCanonicalRangeIndex(slot: Int, rangeIndex: Int) {
+        val encoded = observationCounts[slot]
+        observationCounts[slot] = encodeObservationState(
+            observationCount(encoded), primarySide(encoded), rangeIndex,
+        )
     }
 
     private fun insertAt(slot: Int, key: VoxelKey) {
@@ -445,9 +576,11 @@ internal class FeatureFusionKernel(
                 retainedWeight(assignment.kernelSlot), assignment.packedNormal, assignment.normalConfidence,
             )
         }
+        var assignmentRangeIndex = -1
         if (sortedNew.isNotEmpty()) {
             if (extendLast) allocationRangeEnds[allocationRangeCount - 1] = sortedNew.last().id.value.toInt()
             else {
+                assignmentRangeIndex = allocationRangeCount
                 allocationRangeStarts[allocationRangeCount] = sortedNew.first().id.value.toInt()
                 allocationRangeEnds[allocationRangeCount] = sortedNew.last().id.value.toInt()
                 sortedNew.first().allocationFingerprint.toByteArray().copyInto(
@@ -456,6 +589,8 @@ internal class FeatureFusionKernel(
                 )
                 allocationRangeCount++
             }
+            if (extendLast) assignmentRangeIndex = allocationRangeCount - 1
+            for (assignment in sortedNew) setCanonicalRangeIndex(assignment.kernelSlot, assignmentRangeIndex)
         }
         return true
     }
@@ -497,25 +632,15 @@ internal class FeatureFusionKernel(
         if (kernelSlot !in 0 until surfaceCount) return null
         val encodedId = canonicalIds[kernelSlot]
         if (encodedId == 0) return null
-        var low = 0
-        var high = allocationRangeCount - 1
-        while (low <= high) {
-            val mid = (low + high) ushr 1
-            when {
-                java.lang.Integer.compareUnsigned(encodedId, allocationRangeStarts[mid]) < 0 -> high = mid - 1
-                java.lang.Integer.compareUnsigned(encodedId, allocationRangeEnds[mid]) > 0 -> low = mid + 1
-                else -> {
-                    val offset = mid * HASH_BYTES
-                    return CanonicalFeatureCorrelation(
-                        SurfaceId(encodedId.toLong() and UINT32_MASK),
-                        CanonicalReceiptBytes(allocationFingerprints.copyOfRange(offset, offset + HASH_BYTES)),
-                        retainedPackedNormal(kernelSlot),
-                        retainedConfidence(kernelSlot),
-                    )
-                }
-            }
-        }
-        return null
+        val rangeIndex = canonicalRangeIndex(observationCounts[kernelSlot])
+        if (rangeIndex !in 0 until allocationRangeCount) return null
+        val offset = rangeIndex * HASH_BYTES
+        return CanonicalFeatureCorrelation(
+            SurfaceId(encodedId.toLong() and UINT32_MASK),
+            CanonicalReceiptBytes(allocationFingerprints.copyOfRange(offset, offset + HASH_BYTES)),
+            retainedPackedNormal(kernelSlot),
+            retainedConfidence(kernelSlot),
+        )
     }
 
     private fun retainedWeight(slot: Int) = accumulatedWeights[slot].toByte().toInt()
@@ -647,6 +772,16 @@ internal class FeatureFusionKernel(
         var newRangeFingerprint: ByteArray? = null
     }
 
+    private class PendingCanonicalRemap(
+        val slots: IntArray,
+        val targetIds: LongArray,
+    )
+
+    private sealed interface CanonicalRemapStage {
+        data class Accepted(val packet: PendingCanonicalRemap) : CanonicalRemapStage
+        data class Refused(val reason: FeatureCanonicalRemapRefusal) : CanonicalRemapStage
+    }
+
     // The normalized voxel domain is exactly three signed 21-bit coordinates.
     // Sharing the renderer's canonical packing frees one primitive column for
     // the exact uint32 canonical identity without growing the tuple payload.
@@ -674,6 +809,7 @@ internal class FeatureFusionKernel(
     private var lastSequence = Long.MIN_VALUE
     private var lastTimestampNs = Long.MIN_VALUE
     private var pending: PendingApplication? = null
+    private var pendingCanonicalRemap: PendingCanonicalRemap? = null
 
     private companion object {
         const val SURFACE_CAPACITY = 100_000
@@ -688,8 +824,11 @@ internal class FeatureFusionKernel(
         const val OCCUPANCY_THRESHOLD = 2
         const val DEACTIVATION_THRESHOLD = 1
         const val EVIDENCE_SATURATION = 127
+        const val OBSERVATION_COUNT_MASK = (1 shl 18) - 1
+        const val OBSERVATION_RANGE_SHIFT = 18
+        const val OBSERVATION_RANGE_MASK = (1 shl 10) - 1
+        const val OBSERVATION_RANGE_PRESENT = 1 shl 28
         const val OBSERVATION_PRIMARY_SHIFT = 30
-        const val OBSERVATION_COUNT_MASK = (1 shl OBSERVATION_PRIMARY_SHIFT) - 1
         const val VOXEL_METERS = 0.1
         const val VOXEL_MIN = -(1 shl 20).toDouble()
         const val VOXEL_MAX = ((1 shl 20) - 1).toDouble()
@@ -709,7 +848,7 @@ internal object JvmFeatureFusionOperations : FeatureFusionOperations {
     override fun addExact(left: Int, right: Int): Int = Math.addExact(left, right)
 }
 
-internal enum class FeatureFusionAllocationCut { NORMALIZATION, PREFLIGHT, RESULT }
+internal enum class FeatureFusionAllocationCut { NORMALIZATION, PREFLIGHT, RESULT, CANONICAL_REMAP }
 internal class FeatureFusionAllocationFailure : RuntimeException()
 
 internal class FeatureFusionBatch(val sequence: Long, val timestampNs: Long, observations: List<FeatureFusionEvidence>) {
@@ -786,6 +925,25 @@ internal data class CanonicalFeatureAssignment(
     val packedNormal: Int = 0,
     val normalConfidence: Int = 0,
 )
+internal data class CanonicalFeatureRemap(
+    val featureSlot: Int,
+    val previousSurfaceId: SurfaceId,
+    val nextSurfaceId: SurfaceId?,
+)
+internal sealed interface FeatureCanonicalRemapPreparation {
+    data class Prepared(val count: Int) : FeatureCanonicalRemapPreparation
+    data class Refused(val reason: FeatureCanonicalRemapRefusal) : FeatureCanonicalRemapPreparation
+}
+internal enum class FeatureCanonicalRemapRefusal {
+    PREPARED_BUSY,
+    CAPACITY,
+    INVALID_SLOT,
+    STALE_PREVIOUS_ID,
+    DUPLICATE_SLOT,
+    INVALID_ID,
+    CHECKED_ARITHMETIC,
+    ALLOCATION,
+}
 internal data class FeatureFusionResourceReceipt(val surfaceCount: Int, val associationCount: Int, val assignedTupleShareBytes: Int)
 /** Scalar-only receipt for bounded output work; it never exposes retained rows. */
 internal data class FeatureFusionWorkReceipt(val distinctTouchedVoxelCount: Int, val emittedEventCount: Int)
