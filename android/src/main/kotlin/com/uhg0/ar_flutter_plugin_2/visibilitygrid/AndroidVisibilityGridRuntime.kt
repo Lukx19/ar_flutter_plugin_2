@@ -39,6 +39,7 @@ internal class AndroidVisibilityGridRuntime(
     private val beforeLaneDiscardResidentPublication: (VisibilityObservationSource) -> Unit = {},
 ) : AutoCloseable {
     private val lock = Any()
+    private val depthCapabilityTransitionLock = Any()
     private val lifecycleLock = ReentrantReadWriteLock()
     private var closed = false
     private var paused = false
@@ -138,32 +139,34 @@ internal class AndroidVisibilityGridRuntime(
     }
 
     fun setDepthCapability(capability: VisibilityDepthCapability) {
-        if (capability == VisibilityDepthCapability.UNSUPPORTED) {
-            beforeDepthCapabilityFence()
-            lifecycleLock.write {
-                synchronized(lock) {
-                    depthCapability = capability
-                    if (depthHealth != VisibilitySourceHealth.FAILED) {
-                        depthHealth = VisibilitySourceHealth.UNSUPPORTED
+        synchronized(depthCapabilityTransitionLock) {
+            if (capability == VisibilityDepthCapability.UNSUPPORTED) {
+                beforeDepthCapabilityFence()
+                lifecycleLock.write {
+                    synchronized(lock) {
+                        depthCapability = capability
+                        if (depthHealth != VisibilitySourceHealth.FAILED) {
+                            depthHealth = VisibilitySourceHealth.UNSUPPORTED
+                        }
+                    }
+                    val discarded = depthLane.pauseAndDiscard()
+                    synchronized(lock) {
+                        lifecycleDiscardedObservations = Math.addExact(
+                            lifecycleDiscardedObservations, discarded,
+                        )
                     }
                 }
-                val discarded = depthLane.pauseAndDiscard()
-                synchronized(lock) {
-                    lifecycleDiscardedObservations = Math.addExact(
-                        lifecycleDiscardedObservations, discarded,
-                    )
-                }
+                afterDepthCapabilityInvalidated()
+                depthLane.awaitIdle()
+                return
             }
-            afterDepthCapabilityInvalidated()
-            depthLane.awaitIdle()
-            return
-        }
-        synchronized(lock) {
-            depthCapability = capability
-            if (depthHealth != VisibilitySourceHealth.FAILED &&
-                depthHealth == VisibilitySourceHealth.UNSUPPORTED
-            ) {
-                depthHealth = VisibilitySourceHealth.CONFIGURED
+            synchronized(lock) {
+                depthCapability = capability
+                if (depthHealth != VisibilitySourceHealth.FAILED &&
+                    depthHealth == VisibilitySourceHealth.UNSUPPORTED
+                ) {
+                    depthHealth = VisibilitySourceHealth.CONFIGURED
+                }
             }
         }
     }

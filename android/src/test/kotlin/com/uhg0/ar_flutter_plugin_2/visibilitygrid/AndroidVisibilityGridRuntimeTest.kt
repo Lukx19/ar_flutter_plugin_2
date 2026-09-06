@@ -857,6 +857,97 @@ class AndroidVisibilityGridRuntimeTest {
     }
 
     @Test
+    fun `supported depth reconfiguration waits for unsupported drain before accepting fresh depth`() {
+        val cut = AtomicReference(ownership())
+        val oldDeliveryEntered = CountDownLatch(1)
+        val oldDeliveryRelease = CountDownLatch(1)
+        val transitionInvalidated = CountDownLatch(1)
+        val reconfigurationAttempted = CountDownLatch(1)
+        val reconfigurationReturned = CountDownLatch(1)
+        val freshDepthDelivered = CountDownLatch(1)
+        val invalidated = AtomicBoolean()
+        val deliveryCount = AtomicLong()
+        val cleanupOrder = AtomicLong()
+        val reconfigurationOrder = AtomicLong()
+        val sequence = AtomicLong()
+        val mapped = AtomicLong()
+        val runtime = runtime(
+            cut,
+            object : VisibilityObservationMapper {
+                override fun admitFeature(observation: VisibilityFeatureObservation) = Unit
+                override fun admitDepth(observation: VisibilityDepthObservation) {
+                    mapped.incrementAndGet()
+                    freshDepthDelivered.countDown()
+                }
+                override fun snapshot() = VisibilityMappingAdmissionHealth.empty().copy(
+                    admittedDepths = mapped.get(),
+                )
+            },
+            intervalNs = 1,
+            beforeLaneDelivery = { source ->
+                if (source == VisibilityObservationSource.SYNTHETIC_DEPTH &&
+                    deliveryCount.incrementAndGet() == 1L
+                ) {
+                    oldDeliveryEntered.countDown()
+                    oldDeliveryRelease.await(2, TimeUnit.SECONDS)
+                }
+            },
+            afterLaneResidentPublication = { source ->
+                if (source == VisibilityObservationSource.SYNTHETIC_DEPTH &&
+                    invalidated.get() &&
+                    cleanupOrder.get() == 0L
+                ) {
+                    cleanupOrder.compareAndSet(0L, sequence.incrementAndGet())
+                }
+            },
+            afterDepthCapabilityInvalidated = {
+                invalidated.set(true)
+                transitionInvalidated.countDown()
+            },
+        )
+        try {
+            runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            assertTrue(runtime.offerDepth(depth(cut.get(), 1, 1)))
+            assertTrue(oldDeliveryEntered.await(1, TimeUnit.SECONDS))
+            assertTrue(runtime.offerDepth(depth(cut.get(), 2_000_000, 2)))
+
+            val disabling = Thread {
+                runtime.setDepthCapability(VisibilityDepthCapability.UNSUPPORTED)
+            }.apply { start() }
+            assertTrue(transitionInvalidated.await(1, TimeUnit.SECONDS))
+
+            val reenabling = Thread {
+                reconfigurationAttempted.countDown()
+                runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+                reconfigurationOrder.set(sequence.incrementAndGet())
+                reconfigurationReturned.countDown()
+            }.apply { start() }
+            assertTrue(reconfigurationAttempted.await(1, TimeUnit.SECONDS))
+
+            oldDeliveryRelease.countDown()
+            disabling.join(1_000)
+            assertFalse(disabling.isAlive)
+            assertTrue(reconfigurationReturned.await(1, TimeUnit.SECONDS))
+            reenabling.join(1_000)
+
+            assertTrue(cleanupOrder.get() > 0L)
+            assertTrue(cleanupOrder.get() < reconfigurationOrder.get())
+            assertEquals(0, runtime.snapshot().residentPayloadBytes)
+            assertEquals(VisibilityDepthCapability.AUTOMATIC, runtime.snapshot().depthCapability)
+            assertEquals(VisibilitySourceHealth.CONFIGURED, runtime.snapshot().depthHealth)
+
+            assertTrue(runtime.offerDepth(depth(cut.get(), 3_000_000, 3)))
+            assertTrue(freshDepthDelivered.await(1, TimeUnit.SECONDS))
+            runtime.pause()
+            assertEquals(0, runtime.snapshot().residentPayloadBytes)
+            assertEquals(1, runtime.snapshot().admittedDepthObservations)
+        } finally {
+            oldDeliveryRelease.countDown()
+            runtime.close()
+        }
+    }
+
+    @Test
     fun `pose and sample copies do not retain producer owned arrays or lists`() {
         val matrix = identityVisibilityGridTransform()
         val pose = VisibilityCameraPose.copyOf(matrix)
@@ -926,6 +1017,7 @@ class AndroidVisibilityGridRuntimeTest {
         afterDepthCapabilityInvalidated: () -> Unit = {},
         afterTerminalIngressInvalidated: () -> Unit = {},
         beforeLaneResidentPublication: (VisibilityObservationSource) -> Unit = {},
+        afterLaneResidentPublication: (VisibilityObservationSource) -> Unit = {},
     ) = AndroidVisibilityGridRuntime(
         ownership = cut::get,
         mapper = mapper,
@@ -939,6 +1031,7 @@ class AndroidVisibilityGridRuntimeTest {
         afterDepthCapabilityInvalidated = afterDepthCapabilityInvalidated,
         afterTerminalIngressInvalidated = afterTerminalIngressInvalidated,
         beforeLaneResidentPublication = beforeLaneResidentPublication,
+        afterLaneResidentPublication = afterLaneResidentPublication,
     )
 
     private fun ownership() = VisibilityObservationOwnership(
