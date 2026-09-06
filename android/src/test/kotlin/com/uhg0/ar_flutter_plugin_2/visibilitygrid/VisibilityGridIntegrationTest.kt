@@ -163,6 +163,122 @@ class VisibilityGridIntegrationTest {
     }
 
     @Test
+    fun `real binding publishes one depth wall create through canonical renderer and v2`() {
+        val directory = Files.createTempDirectory("canonical-surface-runtime-depth-integration").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val viewId = 2130
+        val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+        val renderedCuts = mutableListOf<CommittedGeometryCut>()
+        val integration = VisibilityGridIntegration(
+            binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = resources(directory, coordinator),
+            depthKernelFactory = {
+                DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 1))
+            },
+            renderer = object : CommittedRendererProjection {
+                override fun applyGeometry(cut: CommittedGeometryCut): RendererProjectionResult {
+                    renderedCuts += cut
+                    return RendererProjectionResult.Applied(cut.upserts.size)
+                }
+            },
+        )
+        try {
+            val stream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            val cut = requireNotNull(binding.currentObservationOwnership())
+
+            integration.admitDepth(depth(cut, 10))
+
+            val staged = integration.integrationReceipt()
+            assertEquals("pendingAck", staged.status)
+            assertEquals(2, staged.transactionId)
+            assertEquals(2, staged.geometryRevision)
+            assertEquals(1, staged.lineageRevision)
+            assertEquals("DEPTH_BATCH", staged.canonicalOperation)
+            assertEquals(1, renderedCuts.size)
+            val rendererCut = renderedCuts.last()
+            assertEquals(staged.transactionId, rendererCut.transactionId)
+            assertEquals(staged.geometryRevision, rendererCut.geometryRevision)
+            assertEquals(staged.lineageRevision, rendererCut.lineageRevision)
+            assertEquals(cut, rendererCut.ownership)
+            assertEquals(1, rendererCut.upserts.size)
+            assertTrue(rendererCut.removedSurfaceIds.isEmpty())
+            assertEquals(1L, integration.snapshot().admittedDepths)
+            assertEquals(1, privateField<DepthEvidenceKernel>(integration, "depthKernel").resourceReceipt().residentEvidenceRows)
+
+            assertEquals(2, exchange(messenger, viewId, stream, 4, 1, 1, 1).first.messageKind)
+            exchange(messenger, viewId, stream, 5, 1, 1, 1)
+            exchange(messenger, viewId, stream, 6, 1, 1, 1)
+            exchange(messenger, viewId, stream, 7, 2, 2, 1)
+            await { integration.integrationReceipt().status == "acknowledged" }
+        } finally {
+            integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `depth canonical refusal discards prepared state and a retry publishes exactly once`() {
+        val directory = Files.createTempDirectory("canonical-surface-runtime-depth-retry").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val viewId = 2131
+        val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+        var refuseNext = true
+        val renderedCuts = mutableListOf<CommittedGeometryCut>()
+        val integration = VisibilityGridIntegration(
+            binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = resources(directory, coordinator),
+            depthKernelFactory = {
+                DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 1))
+            },
+            commitCanonical = { runtime, mutation ->
+                if (refuseNext) {
+                    refuseNext = false
+                    mutation.discard()
+                    CanonicalAdjacentCommitResult.Refused(
+                        CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE,
+                        disposition = PreparedMutationDisposition.TERMINAL,
+                    )
+                } else runtime.commitAdjacent(mutation)
+            },
+            renderer = object : CommittedRendererProjection {
+                override fun applyGeometry(cut: CommittedGeometryCut): RendererProjectionResult {
+                    renderedCuts += cut
+                    return RendererProjectionResult.Applied(cut.upserts.size)
+                }
+            },
+        )
+        try {
+            val stream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            val cut = requireNotNull(binding.currentObservationOwnership())
+
+            integration.admitDepth(depth(cut, 10))
+            assertEquals("depthCommitRefused", integration.integrationReceipt().status)
+            assertTrue(renderedCuts.isEmpty())
+            assertEquals(0, exchange(messenger, viewId, stream, 4, 1, 1, 1).first.messageKind)
+            val depthKernel = privateField<DepthEvidenceKernel>(integration, "depthKernel")
+            assertEquals(0, depthKernel.resourceReceipt().residentEvidenceRows)
+            assertEquals(0, depthKernel.resourceReceipt().preparedEvidenceRows)
+            assertEquals(0L, integration.snapshot().admittedDepths)
+
+            integration.admitDepth(depth(cut, 11))
+            assertEquals("pendingAck", integration.integrationReceipt().status)
+            assertEquals(1, renderedCuts.size)
+            assertEquals(2, renderedCuts.single().transactionId)
+            assertEquals(1, depthKernel.resourceReceipt().residentEvidenceRows)
+            assertEquals(1L, integration.snapshot().admittedDepths)
+        } finally {
+            integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `canonical commit refusal leaves new and refined kernel batches retryable`() {
         val directory = Files.createTempDirectory("canonical-surface-runtime-kernel-retry").toFile()
         val coordinator = budget(directory)
@@ -812,6 +928,27 @@ class VisibilityGridIntegrationTest {
             sourceRejectedSamples = 0,
             payloadBytes = VisibilityFeatureObservation.FEATURE_FIXED_BYTES +
                 samples.size * VisibilityFeatureObservation.FEATURE_SAMPLE_BYTES,
+        )
+    }
+
+    private fun depth(
+        cut: VisibilityObservationOwnership,
+        timestamp: Long,
+    ): VisibilityDepthObservation {
+        val samples = listOf(VisibilityDepthSample(0, 0, 1_000, 255))
+        return VisibilityDepthObservation(
+            ownership = cut,
+            frame = VisibilityObservationFrame(
+                VisibilityObservationSource.SYNTHETIC_DEPTH, timestamp, timestamp, timestamp,
+                "synthetic-camera", true, "landscape_right_x_right_y_down_v1",
+                VisibilityCameraPose.copyOf(identityVisibilityGridTransform()),
+                VisibilityCameraIntrinsics(4, 3, 2.0, 2.0, 1.5, 1.0),
+                VisibilityDepthCapability.RAW_DEPTH,
+            ),
+            samples = samples,
+            sourceRejectedSamples = 0,
+            payloadBytes = VisibilityDepthObservation.DEPTH_FIXED_BYTES +
+                samples.size * VisibilityDepthObservation.DEPTH_SAMPLE_BYTES,
         )
     }
 

@@ -35,6 +35,7 @@ internal class VisibilityGridIntegration(
         { runtime, mutation -> runtime.commitAdjacent(mutation) },
     private val queueCurrent: (VisibilityGridV2Binding, CurrentDeltaSourceV1, CurrentDeltaSelectorV1) -> CurrentDeltaQueueResult =
         { activeBinding, source, selector -> activeBinding.queueCommittedCurrentDelta(source, selector) },
+    private val depthKernelFactory: (VisibilityGroupFrame) -> DepthEvidenceKernel = { DepthEvidenceKernel() },
     private val beforeAdmission: () -> Unit = {},
     private val afterLifecycleFence: () -> Unit = {},
     private val executor: ExecutorService = Executors.newSingleThreadExecutor(),
@@ -49,6 +50,7 @@ internal class VisibilityGridIntegration(
     private var cut: VisibilityObservationOwnership? = null
     private var baseline: committedEmptyBaseline? = null
     private var kernel: FeatureFusionKernel? = null
+    private var depthKernel: DepthEvidenceKernel? = null
     private var owner: SurfaceOwnership? = null
     private var resources: CanonicalRuntimeResources? = null
     private var batchSequence = 0L
@@ -62,6 +64,8 @@ internal class VisibilityGridIntegration(
     private var pendingCanonicalAcknowledgement: CanonicalAcknowledgement? = null
     private val retainedDelta = ExactCurrentDeltaSource()
     @Volatile private var committed = 0L
+    @Volatile private var committedFeatures = 0L
+    @Volatile private var admittedDepths = 0L
     @Volatile private var rejected = 0L
     @Volatile private var fenced = 0L
     @Volatile private var receipt = VisibilityGridIntegrationReceipt.empty()
@@ -127,11 +131,14 @@ internal class VisibilityGridIntegration(
         return PendingPublicationGateResult.READY
     }
 
-    /** #63 owns depth semantics; this feature-only integration refuses it. */
+    /** Depth and feature ingress share the same serialized publication lane. */
     override fun admitDepth(observation: VisibilityDepthObservation) {
-        synchronized(lock) {
-            rejected++
-            receipt = receipt.copy(status = "depthDeferred", rejected = rejected)
+        mutate(observation.ownership) {
+            if (isFenced(observation.ownership)) return@mutate
+            if (drainPendingPublication() == PendingPublicationGateResult.REJECTED) return@mutate
+            ensureOpened(observation.ownership) ?: return@mutate
+            if (drainPendingPublication() == PendingPublicationGateResult.REJECTED) return@mutate
+            admitDepthLocked(observation)
         }
     }
 
@@ -171,8 +178,8 @@ internal class VisibilityGridIntegration(
 
     override fun snapshot(): VisibilityMappingAdmissionHealth = synchronized(lock) {
         VisibilityMappingAdmissionHealth(
-            admittedFeatures = committed,
-            admittedDepths = 0,
+            admittedFeatures = committedFeatures,
+            admittedDepths = admittedDepths,
             replacedFeatures = 0,
             replacedDepths = 0,
             residentBytes = 0,
@@ -260,6 +267,7 @@ internal class VisibilityGridIntegration(
         resources = runtimeResources
         owner = opened.ownership
         kernel = FeatureFusionKernel()
+        depthKernel = depthKernelFactory(expected.groupFrame)
         cut = expected
         baseline = seeded
         nextTransactionId = seeded.transactionId + 1
@@ -276,6 +284,107 @@ internal class VisibilityGridIntegration(
             }
         }
         return seeded
+    }
+
+    private fun admitDepthLocked(observation: VisibilityDepthObservation) {
+        val depth = requireNotNull(depthKernel)
+        val groupFrame = observation.ownership.groupFrame
+        val groupFromCamera = composeGroupFromCamera(
+            groupFrame.groupFromWorldGl,
+            observation.frame.pose.worldFromCameraGl,
+        ) ?: run {
+            depth.discardPrepared()
+            rejected++
+            receipt = receipt.copy(status = "depthFrameRefused", rejected = rejected)
+            return
+        }
+        val batch = DepthEvidenceBatch(
+            sequence = ++batchSequence,
+            sourceTimestampNs = observation.frame.sourceTimestampNs,
+            groupFrame = groupFrame,
+            groupFromCameraGl = groupFromCamera,
+            intrinsics = observation.frame.intrinsics,
+            samples = observation.samples,
+            sourceRejectedSamples = observation.sourceRejectedSamples,
+            tracking = observation.frame.tracking,
+        )
+        val currentCut = requireNotNull(owner).activationState()?.cut ?: run {
+            depth.discardPrepared()
+            rejected++
+            receipt = receipt.copy(status = "depthCurrentUnavailable", rejected = rejected)
+            return
+        }
+        val lookup = requireNotNull(resources).withBoundedCurrent(
+            BoundedCanonicalLookupRequest(
+                expectedGeometryRevision = currentCut.geometryRevision,
+                expectedLineageRevision = currentCut.lineageRevision,
+                maximumDirectLookups = 100_000,
+                maximumRayCellVisits = 65_536,
+                maximumPageReads = 65_536,
+                maximumBytesRead = 8L * 1024L * 1024L,
+            ),
+        ) { view -> depth.prepare(batch, view) }
+        val accepted = (lookup as? BoundedCanonicalLookupResult.Completed)?.value
+            as? DepthEvidenceResult.Accepted ?: run {
+            depth.discardPrepared()
+            rejected++
+            receipt = receipt.copy(status = "depthLookupRefused", rejected = rejected)
+            return
+        }
+        val remap = requireNotNull(kernel).prepareCanonicalRemap(emptyList())
+        if (remap !is FeatureCanonicalRemapPreparation.Prepared) {
+            depth.discardPrepared()
+            rejected++
+            receipt = receipt.copy(status = "depthRemapRefused", rejected = rejected)
+            return
+        }
+        if (accepted.changes.isEmpty()) {
+            requireNotNull(kernel).applyPreparedCanonicalRemap()
+            check(depth.applyPrepared() is DepthEvidenceApplyResult.Applied)
+            admittedDepths++
+            receipt = receipt.copy(status = "nonMaterialRetained")
+            return
+        }
+        val preparation = requireNotNull(resources).prepareEvidenceBatch(
+            CanonicalEvidenceBatchCommand(
+                commandId = "${observation.ownership.bindingGeneration}:${observation.ownership.lifecycleSequence}:depth:${batchSequence}",
+                expectedGeometryRevision = accepted.expectedGeometryRevision,
+                expectedLineageRevision = accepted.expectedLineageRevision,
+                changes = accepted.changes,
+            ),
+        )
+        val prepared = preparation as? CanonicalMutationPreparation.Prepared ?: run {
+            requireNotNull(kernel).discardPreparedCanonicalRemap()
+            depth.discardPrepared()
+            rejected++
+            receipt = receipt.copy(status = "depthCanonicalRefused", rejected = rejected)
+            return
+        }
+        val transactionId = nextTransactionId
+        val geometryCut = prepared.mutation.toCommittedGeometryCut(observation.ownership, transactionId)
+        if (isFenced(observation.ownership)) {
+            prepared.mutation.discard()
+            requireNotNull(kernel).discardPreparedCanonicalRemap()
+            depth.discardPrepared()
+            fenced++
+            receipt = receipt.copy(status = "publicationDeferred", fenced = fenced)
+            return
+        }
+        val committedResult = commitCanonical(requireNotNull(resources), prepared.mutation)
+        val state = (committedResult as? CanonicalAdjacentCommitResult.Committed)?.state ?: run {
+            if (committedResult is CanonicalAdjacentCommitResult.Refused &&
+                committedResult.disposition == PreparedMutationDisposition.TERMINAL
+            ) prepared.mutation.discard()
+            requireNotNull(kernel).discardPreparedCanonicalRemap()
+            depth.discardPrepared()
+            rejected++
+            receipt = receipt.copy(status = "depthCommitRefused", rejected = rejected)
+            return
+        }
+        requireNotNull(kernel).applyPreparedCanonicalRemap()
+        check(depth.applyPrepared() is DepthEvidenceApplyResult.Applied)
+        admittedDepths++
+        publishV6Current(observation.ownership, state, prebuiltGeometryCut = geometryCut)
     }
 
     private fun publishInitialV6Create(
@@ -326,6 +435,7 @@ internal class VisibilityGridIntegration(
             receipt = receipt.copy(status = "canonicalCommitRefused", rejected = rejected)
             return
         }
+        committedFeatures++
         requireNotNull(kernel).applyPrepared()
         publishV6Current(expected, state, prepared.mutation)
     }
@@ -386,6 +496,7 @@ internal class VisibilityGridIntegration(
             receipt = receipt.copy(status = "batchCommitRefused", rejected = rejected)
             return
         }
+        committedFeatures++
         requireNotNull(kernel).applyPrepared()
         if (isFenced(expected)) {
             fenced++
@@ -425,6 +536,7 @@ internal class VisibilityGridIntegration(
         state: CanonicalActivationState,
         mutation: PreparedCanonicalMutation? = null,
         rendererAlreadyCurrent: Boolean = false,
+        prebuiltGeometryCut: CommittedGeometryCut? = null,
     ) {
         val current = state.current as? CanonicalActivationCurrent.Receipt ?: run {
             rejected++
@@ -450,7 +562,7 @@ internal class VisibilityGridIntegration(
             receipt = receipt.copy(status = "publicationDeferred", fenced = fenced)
             return
         }
-        val geometryCut = mutation?.toCommittedGeometryCut(expected, selector.transactionId)
+        val geometryCut = prebuiltGeometryCut ?: mutation?.toCommittedGeometryCut(expected, selector.transactionId)
         retainedDelta.retain(
             CurrentDeltaReceiptV1(
                 selector,
@@ -615,6 +727,8 @@ internal class VisibilityGridIntegration(
         resources = null
         owner = null
         kernel = null
+        depthKernel?.close()
+        depthKernel = null
         pendingCanonicalAcknowledgement = null
     }
 
@@ -879,7 +993,7 @@ internal data class VisibilityGridIntegrationReceipt(
 
 private fun canonicalOperation(bytes: ByteArray): String = try {
     DataInputStream(ByteArrayInputStream(bytes)).use { input ->
-        require(input.readInt() == 0x4d334350 && input.readInt() == 2)
+        require(input.readInt() == 0x4d334350 && input.readInt() in 2..3)
         input.readFully(ByteArray(32))
         input.readUTF()
         PreparedMutationKind.entries[input.readInt()].name
@@ -887,6 +1001,42 @@ private fun canonicalOperation(bytes: ByteArray): String = try {
 } catch (_: Exception) {
     "invalid"
 }
+
+/** Composes column-major GL transforms only when the finite affine contract survives. */
+private fun composeGroupFromCamera(
+    groupFromWorld: List<Double>,
+    worldFromCamera: List<Double>,
+): List<Double>? {
+    if (groupFromWorld.size != 16 || worldFromCamera.size != 16 ||
+        groupFromWorld.any { !it.isFinite() } || worldFromCamera.any { !it.isFinite() } ||
+        !isAffineTransform(groupFromWorld) || !isAffineTransform(worldFromCamera)
+    ) return null
+    val composed = DoubleArray(16)
+    for (column in 0 until 4) {
+        for (row in 0 until 4) {
+            var value = 0.0
+            for (index in 0 until 4) {
+                value += groupFromWorld[index * 4 + row] * worldFromCamera[column * 4 + index]
+                if (!value.isFinite()) return null
+            }
+            composed[column * 4 + row] = value
+        }
+    }
+    return composed.takeIf(::isAffineTransform)?.toList()
+}
+
+private fun isAffineTransform(matrix: List<Double>): Boolean = matrix.size == 16 &&
+    kotlin.math.abs(matrix[3]) <= 1e-6 &&
+    kotlin.math.abs(matrix[7]) <= 1e-6 &&
+    kotlin.math.abs(matrix[11]) <= 1e-6 &&
+    kotlin.math.abs(matrix[15] - 1.0) <= 1e-6
+
+private fun isAffineTransform(matrix: DoubleArray): Boolean = matrix.size == 16 &&
+    matrix.all(Double::isFinite) &&
+    kotlin.math.abs(matrix[3]) <= 1e-6 &&
+    kotlin.math.abs(matrix[7]) <= 1e-6 &&
+    kotlin.math.abs(matrix[11]) <= 1e-6 &&
+    kotlin.math.abs(matrix[15] - 1.0) <= 1e-6
 
 private class ExactCurrentDeltaSource : CurrentDeltaSourceV1 {
     private var value: CurrentDeltaReceiptV1? = null
