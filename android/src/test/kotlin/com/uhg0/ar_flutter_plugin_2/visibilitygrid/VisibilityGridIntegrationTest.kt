@@ -280,6 +280,88 @@ class VisibilityGridIntegrationTest {
     }
 
     @Test
+    fun `depth removal clears feature correlation when the source voxel is vacated`() {
+        val directory = Files.createTempDirectory("canonical-surface-runtime-depth-remap").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val viewId = 2132
+        val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+        lateinit var featureKernel: FeatureFusionKernel
+        val renderedCuts = mutableListOf<CommittedGeometryCut>()
+        val integration = VisibilityGridIntegration(
+            binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = resources(directory, coordinator),
+            featureKernelFactory = {
+                FeatureFusionKernel().also { featureKernel = it }
+            },
+            depthKernelFactory = {
+                DepthEvidenceKernel(DepthEvidenceConfiguration(
+                    safetyBandMillimetres = 0,
+                    minimumDepthMillimetres = 1,
+                    freeEvidenceToCarve = 1,
+                    freeEvidenceMargin = 0,
+                    separatedDirectionBinsRequired = 1,
+                    occupiedEvidenceToShow = 4,
+                ))
+            },
+            renderer = object : CommittedRendererProjection {
+                override fun applyGeometry(cut: CommittedGeometryCut): RendererProjectionResult {
+                    renderedCuts += cut
+                    return RendererProjectionResult.Applied(cut.upserts.size)
+                }
+            },
+        )
+        try {
+            val stream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            val cut = requireNotNull(binding.currentObservationOwnership())
+
+            integration.admitFeature(feature(cut, 10, x = 0.02, y = 0.02, z = -0.45))
+            assertEquals("pendingAck", integration.integrationReceipt().status)
+            exchange(messenger, viewId, stream, 4, 1, 1, 1)
+            exchange(messenger, viewId, stream, 5, 1, 1, 1)
+            exchange(messenger, viewId, stream, 6, 1, 1, 1)
+            exchange(messenger, viewId, stream, 7, 2, 2, 1)
+            await { integration.integrationReceipt().status == "acknowledged" }
+            val correlation = requireNotNull(featureKernel.canonicalCorrelation(0))
+            assertEquals(SurfaceId(1), correlation.id)
+            assertTrue(renderedCuts.first().upserts.any {
+                it.surfaceId == SurfaceId(1).value && it.voxel == Voxel(0, 0, -5)
+            })
+            assertEquals(0, featureKernel.canonicalFeatureSlot(Voxel(0, 0, -5), SurfaceId(1)))
+
+            integration.admitDepth(
+                depth(
+                    cut, 20, depthMillimeters = 10,
+                    principalX = 2.0, principalY = 0.0, cameraXMeters = 0.005,
+                ),
+            )
+
+            assertEquals("nonMaterialRetained", integration.integrationReceipt().status)
+            assertEquals(1, renderedCuts.size)
+            assertEquals(SurfaceId(1), featureKernel.canonicalCorrelation(0)?.id)
+
+            integration.admitDepth(
+                depth(
+                    cut, 21, depthMillimeters = 10,
+                    sampleX = 3, principalX = 1.0, principalY = 0.0, cameraXMeters = -0.004,
+                ),
+            )
+
+            assertEquals("pendingAck", integration.integrationReceipt().status)
+            assertEquals("DEPTH_BATCH", integration.integrationReceipt().canonicalOperation)
+            assertEquals(2, renderedCuts.size)
+            assertArrayEquals(longArrayOf(SurfaceId(1).value), renderedCuts.last().removedSurfaceIds)
+            assertTrue(renderedCuts.last().upserts.isEmpty())
+            assertEquals(null, featureKernel.canonicalCorrelation(0))
+        } finally {
+            integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `canonical commit refusal leaves new and refined kernel batches retryable`() {
         val directory = Files.createTempDirectory("canonical-surface-runtime-kernel-retry").toFile()
         val coordinator = budget(directory)
@@ -910,10 +992,12 @@ class VisibilityGridIntegrationTest {
         cut: VisibilityObservationOwnership,
         timestamp: Long,
         x: Double = 0.12,
+        y: Double = 0.02,
+        z: Double = 0.02,
         cameraX: Double = 0.0,
     ): VisibilityFeatureObservation {
         val samples = VisibilityFeatureObservation.copySamples(
-            listOf(VisibilityFeatureSample(7, x, 0.02, 0.02, 1.0)),
+            listOf(VisibilityFeatureSample(7, x, y, z, 1.0)),
         )
         val pose = identityVisibilityGridTransform().also { it[12] = cameraX }
         return VisibilityFeatureObservation(
@@ -935,15 +1019,21 @@ class VisibilityGridIntegrationTest {
     private fun depth(
         cut: VisibilityObservationOwnership,
         timestamp: Long,
+        sampleX: Int = 0,
+        depthMillimeters: Int = 1_000,
+        principalX: Double = 1.5,
+        principalY: Double = 0.5,
+        cameraXMeters: Double = 0.0,
     ): VisibilityDepthObservation {
-        val samples = listOf(VisibilityDepthSample(0, 0, 1_000, 255))
+        val samples = listOf(VisibilityDepthSample(sampleX, 0, depthMillimeters, 255))
+        val pose = identityVisibilityGridTransform().also { it[12] = cameraXMeters }
         return VisibilityDepthObservation(
             ownership = cut,
             frame = VisibilityObservationFrame(
                 VisibilityObservationSource.SYNTHETIC_DEPTH, timestamp, timestamp, timestamp,
                 "synthetic-camera", true, "landscape_right_x_right_y_down_v1",
-                VisibilityCameraPose.copyOf(identityVisibilityGridTransform()),
-                VisibilityCameraIntrinsics(4, 3, 2.0, 2.0, 1.5, 1.0),
+                VisibilityCameraPose.copyOf(pose),
+                VisibilityCameraIntrinsics(4, 3, 2.0, 1.0, principalX, principalY),
                 VisibilityDepthCapability.RAW_DEPTH,
             ),
             samples = samples,

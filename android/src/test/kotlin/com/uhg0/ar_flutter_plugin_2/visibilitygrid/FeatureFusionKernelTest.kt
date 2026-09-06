@@ -194,6 +194,21 @@ class FeatureFusionKernelTest {
     }
 
     @Test
+    fun `canonical feature slot resolves only the expected identity at its voxel`() {
+        val kernel = kernel()
+        val accepted = accepted(kernel, batch(1, listOf(evidence(0, 0, 0, 2, 1))))
+        val change = accepted.delta.single() as FeatureFusionChange.Upsert
+        val fingerprint = CanonicalReceiptBytes(ByteArray(32) { 0x19 })
+        assertTrue(kernel.assignCanonicalCorrelations(listOf(
+            change.assignment(SurfaceId(17), fingerprint),
+        )))
+
+        assertEquals(change.kernelSlot, kernel.canonicalFeatureSlot(Voxel(change.x, change.y, change.z), SurfaceId(17)))
+        assertEquals(null, kernel.canonicalFeatureSlot(Voxel(change.x, change.y, change.z), SurfaceId(18)))
+        assertEquals(null, kernel.canonicalFeatureSlot(Voxel(change.x + 1, change.y, change.z), SurfaceId(17)))
+    }
+
+    @Test
     fun `canonical replacement remap preserves slot evidence and allocation provenance`() {
         val kernel = kernel()
         val accepted = accepted(kernel, batch(1, listOf(evidence(0, 0, 0, 2, 1))))

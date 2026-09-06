@@ -641,6 +641,15 @@ internal class FeatureFusionKernel(
         )
     }
 
+    /** Resolves one retained feature slot by its exact voxel and canonical identity. */
+    @Synchronized
+    internal fun canonicalFeatureSlot(voxel: Voxel, expectedSurfaceId: SurfaceId): Int? {
+        val slot = findSlot(VoxelKey(voxel.x, voxel.y, voxel.z))
+        if (slot < 0) return null
+        val encodedId = canonicalIds[slot].toLong() and UINT32_MASK
+        return slot.takeIf { encodedId == expectedSurfaceId.value }
+    }
+
     private fun retainedWeight(slot: Int) = accumulatedWeights[slot].toByte().toInt()
     private fun withWeight(encoded: Int, weight: Int) = (encoded and -0x100) or (weight and 0xff)
     private fun retainedPackedNormal(slot: Int) = (accumulatedWeights[slot] ushr 8) and 0xffff

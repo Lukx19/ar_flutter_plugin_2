@@ -36,6 +36,7 @@ internal class VisibilityGridIntegration(
     private val queueCurrent: (VisibilityGridV2Binding, CurrentDeltaSourceV1, CurrentDeltaSelectorV1) -> CurrentDeltaQueueResult =
         { activeBinding, source, selector -> activeBinding.queueCommittedCurrentDelta(source, selector) },
     private val depthKernelFactory: (VisibilityGroupFrame) -> DepthEvidenceKernel = { DepthEvidenceKernel() },
+    private val featureKernelFactory: () -> FeatureFusionKernel = { FeatureFusionKernel() },
     private val beforeAdmission: () -> Unit = {},
     private val afterLifecycleFence: () -> Unit = {},
     private val executor: ExecutorService = Executors.newSingleThreadExecutor(),
@@ -266,7 +267,7 @@ internal class VisibilityGridIntegration(
         }
         resources = runtimeResources
         owner = opened.ownership
-        kernel = FeatureFusionKernel()
+        kernel = featureKernelFactory()
         depthKernel = depthKernelFactory(expected.groupFrame)
         cut = expected
         baseline = seeded
@@ -314,6 +315,7 @@ internal class VisibilityGridIntegration(
             receipt = receipt.copy(status = "depthCurrentUnavailable", rejected = rejected)
             return
         }
+        var featureSources: DepthFeatureSourceTable? = null
         val lookup = requireNotNull(resources).withBoundedCurrent(
             BoundedCanonicalLookupRequest(
                 expectedGeometryRevision = currentCut.geometryRevision,
@@ -323,7 +325,13 @@ internal class VisibilityGridIntegration(
                 maximumPageReads = 65_536,
                 maximumBytesRead = 8L * 1024L * 1024L,
             ),
-        ) { view -> depth.prepare(batch, view) }
+        ) { view ->
+            val result = depth.prepare(batch, view)
+            if (result is DepthEvidenceResult.Accepted && result.changes.isNotEmpty()) {
+                featureSources = collectDepthFeatureSources(requireNotNull(kernel), view, result.changes)
+            }
+            result
+        }
         val accepted = (lookup as? BoundedCanonicalLookupResult.Completed)?.value
             as? DepthEvidenceResult.Accepted ?: run {
             depth.discardPrepared()
@@ -331,14 +339,14 @@ internal class VisibilityGridIntegration(
             receipt = receipt.copy(status = "depthLookupRefused", rejected = rejected)
             return
         }
-        val remap = requireNotNull(kernel).prepareCanonicalRemap(emptyList())
-        if (remap !is FeatureCanonicalRemapPreparation.Prepared) {
-            depth.discardPrepared()
-            rejected++
-            receipt = receipt.copy(status = "depthRemapRefused", rejected = rejected)
-            return
-        }
         if (accepted.changes.isEmpty()) {
+            val remap = requireNotNull(kernel).prepareCanonicalRemap(emptyList())
+            if (remap !is FeatureCanonicalRemapPreparation.Prepared) {
+                depth.discardPrepared()
+                rejected++
+                receipt = receipt.copy(status = "depthRemapRefused", rejected = rejected)
+                return
+            }
             requireNotNull(kernel).applyPreparedCanonicalRemap()
             check(depth.applyPrepared() is DepthEvidenceApplyResult.Applied)
             admittedDepths++
@@ -358,6 +366,24 @@ internal class VisibilityGridIntegration(
             depth.discardPrepared()
             rejected++
             receipt = receipt.copy(status = "depthCanonicalRefused", rejected = rejected)
+            return
+        }
+        val sourceTable = featureSources
+        if (sourceTable?.isOverflowed() == true) {
+            prepared.mutation.discard()
+            depth.discardPrepared()
+            rejected++
+            receipt = receipt.copy(status = "depthRemapRefused", rejected = rejected)
+            return
+        }
+        val remap = requireNotNull(kernel).prepareCanonicalRemap(
+            sourceTable?.remapsFor(prepared.mutation) ?: emptyList(),
+        )
+        if (remap !is FeatureCanonicalRemapPreparation.Prepared) {
+            prepared.mutation.discard()
+            depth.discardPrepared()
+            rejected++
+            receipt = receipt.copy(status = "depthRemapRefused", rejected = rejected)
             return
         }
         val transactionId = nextTransactionId
@@ -385,6 +411,23 @@ internal class VisibilityGridIntegration(
         check(depth.applyPrepared() is DepthEvidenceApplyResult.Applied)
         admittedDepths++
         publishV6Current(observation.ownership, state, prebuiltGeometryCut = geometryCut)
+    }
+
+    private fun collectDepthFeatureSources(
+        featureKernel: FeatureFusionKernel,
+        view: BoundedCanonicalSurfaceView,
+        changes: List<DepthEvidenceChange>,
+    ): DepthFeatureSourceTable {
+        val sources = DepthFeatureSourceTable.forChanges(changes)
+        changes.forEach { change ->
+            for (sourceIndex in 0 until change.sourceCount) {
+                val source = change.sourceAt(sourceIndex)
+                val row = view.findSurfaceById(source) ?: continue
+                val slot = featureKernel.canonicalFeatureSlot(row.voxel, source) ?: continue
+                sources.add(source.value, slot, row.voxel)
+            }
+        }
+        return sources
     }
 
     private fun publishInitialV6Create(
@@ -1044,4 +1087,142 @@ private class ExactCurrentDeltaSource : CurrentDeltaSourceV1 {
     @Synchronized override fun selectCurrentDelta(selector: CurrentDeltaSelectorV1) = value?.takeIf { it.selector == selector }
     @Synchronized fun acknowledge(selector: CurrentDeltaSelectorV1) { check(value?.selector == selector); value = null }
     @Synchronized fun clear() { value = null }
+}
+
+/** Primitive bounded source table used while deriving feature identity remaps. */
+private class DepthFeatureSourceTable private constructor(maximumSources: Int) {
+    private val sourceIds = LongArray(maximumSources)
+    private val sourceSlots = IntArray(maximumSources)
+    private val sourceVoxels = LongArray(maximumSources)
+    private val targetIds = LongArray(maximumSources)
+    private var size = 0
+    private var overflowed = false
+
+    fun isOverflowed(): Boolean = overflowed
+
+    fun add(id: Long, slot: Int, voxel: Voxel) {
+        if (size == sourceIds.size) {
+            overflowed = true
+            return
+        }
+        val voxelKey = packVisibilityGridKey(voxel.x, voxel.y, voxel.z)
+        val index = size++
+        sourceIds[index] = id
+        sourceSlots[index] = slot
+        sourceVoxels[index] = voxelKey
+    }
+
+    fun remapsFor(prepared: PreparedCanonicalMutation): List<CanonicalFeatureRemap> {
+        sortByVoxel()
+        prepared.visitDirtyRows { row ->
+            findSourceByVoxel(packVisibilityGridKey(row.voxel.x, row.voxel.y, row.voxel.z))
+                .takeIf { it >= 0 }
+                ?.let { targetIds[it] = row.id.value }
+            true
+        }
+        var count = 0
+        for (index in 0 until size) if (targetIds[index] != sourceIds[index]) count++
+        if (count == 0) return emptyList()
+        val slots = IntArray(count)
+        val previousIds = LongArray(count)
+        val nextIds = LongArray(count)
+        var write = 0
+        for (index in 0 until size) {
+            if (targetIds[index] == sourceIds[index]) continue
+            slots[write] = sourceSlots[index]
+            previousIds[write] = sourceIds[index]
+            nextIds[write] = targetIds[index]
+            write++
+        }
+        return CanonicalRemapList(slots, previousIds, nextIds)
+    }
+
+    private fun findSourceByVoxel(key: Long): Int {
+        var low = 0
+        var high = size
+        while (low < high) {
+            val middle = (low + high) ushr 1
+            when (java.lang.Long.compareUnsigned(sourceVoxels[middle], key)) {
+                0 -> return middle
+                -1 -> low = middle + 1
+                else -> high = middle
+            }
+        }
+        return -1
+    }
+
+    private fun sortByVoxel() {
+        for (root in (size ushr 1) - 1 downTo 0) siftDown(root, size)
+        for (end in size - 1 downTo 1) {
+            swap(0, end)
+            siftDown(0, end)
+        }
+    }
+
+    private fun siftDown(start: Int, end: Int) {
+        var root = start
+        while (root <= (end ushr 1) - 1) {
+            var child = (root shl 1) + 1
+            if (child + 1 < end &&
+                java.lang.Long.compareUnsigned(sourceVoxels[child], sourceVoxels[child + 1]) < 0
+            ) child++
+            if (java.lang.Long.compareUnsigned(sourceVoxels[root], sourceVoxels[child]) >= 0) return
+            swap(root, child)
+            root = child
+        }
+    }
+
+    private fun swap(first: Int, second: Int) {
+        var longValue = sourceVoxels[first]
+        sourceVoxels[first] = sourceVoxels[second]
+        sourceVoxels[second] = longValue
+        longValue = sourceIds[first]
+        sourceIds[first] = sourceIds[second]
+        sourceIds[second] = longValue
+        val slot = sourceSlots[first]
+        sourceSlots[first] = sourceSlots[second]
+        sourceSlots[second] = slot
+        longValue = targetIds[first]
+        targetIds[first] = targetIds[second]
+        targetIds[second] = longValue
+    }
+
+    companion object {
+        private const val MAX_FEATURE_SOURCES = 100_000
+
+        fun forChanges(changes: List<DepthEvidenceChange>): DepthFeatureSourceTable {
+            var maximum = 0
+            var overflowed = false
+            changes.forEach { change ->
+                maximum = try {
+                    Math.addExact(maximum, change.sourceCount)
+                } catch (_: ArithmeticException) {
+                    overflowed = true
+                    MAX_FEATURE_SOURCES
+                }
+            }
+            if (maximum > MAX_FEATURE_SOURCES) overflowed = true
+            return DepthFeatureSourceTable(maximum.coerceIn(0, MAX_FEATURE_SOURCES)).also {
+                it.overflowed = overflowed
+            }
+        }
+
+    }
+}
+
+private class CanonicalRemapList(
+    private val slots: IntArray,
+    private val previousIds: LongArray,
+    private val nextIds: LongArray,
+) : java.util.AbstractList<CanonicalFeatureRemap>() {
+    override val size: Int get() = slots.size
+
+    override fun get(index: Int): CanonicalFeatureRemap {
+        if (index !in slots.indices) throw IndexOutOfBoundsException("remap index $index")
+        return CanonicalFeatureRemap(
+            slots[index],
+            SurfaceId(previousIds[index]),
+            nextIds[index].takeIf { it != 0L }?.let(::SurfaceId),
+        )
+    }
 }
