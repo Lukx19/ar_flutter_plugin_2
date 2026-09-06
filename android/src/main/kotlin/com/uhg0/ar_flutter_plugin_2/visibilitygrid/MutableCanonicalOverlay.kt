@@ -3,6 +3,7 @@ package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 import java.io.DataOutputStream
 import java.io.OutputStream
 import java.security.MessageDigest
+import java.util.Arrays
 import java.util.Collections
 
 /**
@@ -555,55 +556,47 @@ internal class MutableCanonicalOverlay private constructor(
         fun add(value: Long, current: Long): Long? = try { Math.addExact(current, value) } catch (_: ArithmeticException) { null }
         fun product(left: Int, right: Int): Long? = try { Math.multiplyExact(left.toLong(), right.toLong()) } catch (_: ArithmeticException) { null }
         command.changes.forEach { change ->
-            when (change) {
-                is DepthEvidenceChange.Create -> {
-                    targets = add(1, targets) ?: return null
-                    allocations = add(1, allocations) ?: return null
-                    minimumSupports = add(1, minimumSupports) ?: return null
+            val kind = change.operationKind
+            val sourceCount = change.sourceCount.toLong()
+            val targetCount = change.targetCount.toLong()
+            sources = add(sourceCount, sources) ?: return null
+            targets = add(targetCount, targets) ?: return null
+            when (kind) {
+                DepthBatchOperationKind.CREATE -> {
+                    allocations = add(targetCount, allocations) ?: return null
+                    minimumSupports = add(targetCount, minimumSupports) ?: return null
                 }
-                is DepthEvidenceChange.Refine,
-                is DepthEvidenceChange.Relocate -> {
-                    sources = add(1, sources) ?: return null
-                    targets = add(1, targets) ?: return null
-                    if (change is DepthEvidenceChange.Relocate) {
-                        lineage = add(1, lineage) ?: return null
-                        removed = add(1, removed) ?: return null
-                        minimumSupports = add(1, minimumSupports) ?: return null
-                    }
+                DepthBatchOperationKind.REFINE -> Unit
+                DepthBatchOperationKind.RELOCATE -> {
+                    lineage = add(product(change.sourceCount, change.targetCount) ?: return null, lineage) ?: return null
+                    removed = add(sourceCount, removed) ?: return null
+                    minimumSupports = add(targetCount, minimumSupports) ?: return null
                 }
-                is DepthEvidenceChange.Merge -> {
-                    sources = add(change.sourceIds.size.toLong(), sources) ?: return null
-                    targets = add(1, targets) ?: return null
-                    lineage = add(change.sourceIds.size.toLong(), lineage) ?: return null
-                    removed = add(change.sourceIds.size.toLong(), removed) ?: return null
-                    minimumSupports = add(change.sourceIds.size.toLong(), minimumSupports) ?: return null
-                    allocations = add(1, allocations) ?: return null
+                DepthBatchOperationKind.MERGE -> {
+                    lineage = add(product(change.sourceCount, change.targetCount) ?: return null, lineage) ?: return null
+                    removed = add(sourceCount, removed) ?: return null
+                    minimumSupports = add(sourceCount, minimumSupports) ?: return null
+                    allocations = add(targetCount, allocations) ?: return null
                 }
-                is DepthEvidenceChange.Split -> {
-                    sources = add(1, sources) ?: return null
-                    targets = add(change.targets.size.toLong(), targets) ?: return null
-                    lineage = add(product(1, change.targets.size) ?: return null, lineage) ?: return null
-                    removed = add(1, removed) ?: return null
-                    minimumSupports = add(change.targets.size.toLong(), minimumSupports) ?: return null
-                    allocations = add(change.targets.size.toLong(), allocations) ?: return null
+                DepthBatchOperationKind.SPLIT -> {
+                    lineage = add(product(change.sourceCount, change.targetCount) ?: return null, lineage) ?: return null
+                    removed = add(sourceCount, removed) ?: return null
+                    minimumSupports = add(targetCount, minimumSupports) ?: return null
+                    allocations = add(targetCount, allocations) ?: return null
                 }
-                is DepthEvidenceChange.Replace -> {
-                    sources = add(change.sourceIds.size.toLong(), sources) ?: return null
-                    targets = add(change.targets.size.toLong(), targets) ?: return null
-                    lineage = add(product(change.sourceIds.size, change.targets.size) ?: return null, lineage) ?: return null
-                    removed = add(change.sourceIds.size.toLong(), removed) ?: return null
-                    minimumSupports = add(product(change.sourceIds.size, change.targets.size) ?: return null, minimumSupports) ?: return null
-                    allocations = add(change.targets.size.toLong(), allocations) ?: return null
+                DepthBatchOperationKind.REPLACE -> {
+                    val pairs = product(change.sourceCount, change.targetCount) ?: return null
+                    lineage = add(pairs, lineage) ?: return null
+                    removed = add(sourceCount, removed) ?: return null
+                    minimumSupports = add(pairs, minimumSupports) ?: return null
+                    allocations = add(targetCount, allocations) ?: return null
                 }
-                is DepthEvidenceChange.Remove -> {
-                    sources = add(1, sources) ?: return null
-                    removed = add(1, removed) ?: return null
-                }
+                DepthBatchOperationKind.REMOVE -> removed = add(sourceCount, removed) ?: return null
             }
         }
         if (sources > sourceCapacity() || targets > configuration.surfaceCapacity || lineage > configuration.lineageCapacity) return null
         return DepthBatchScalars(
-            sources.toInt(), targets.toInt(), lineage, removed.toInt(), allocations.toInt(), minimumSupports,
+            command.changes.size, sources.toInt(), targets.toInt(), lineage, removed.toInt(), allocations.toInt(), minimumSupports,
         )
     }
 
@@ -626,16 +619,28 @@ internal class MutableCanonicalOverlay private constructor(
         if (minimumPlannerBytes > journalLimit) {
             return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
         }
+        val sourceIds = try { DepthEvidenceIdTable.forExpected(scalars.sourceReferences) }
+        catch (_: ArithmeticException) { return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED) }
+        val structuralSourceIds = try { DepthEvidenceIdTable.forExpected(scalars.sourceReferences) }
+            catch (_: ArithmeticException) { return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED) }
+        val supportSourceIds = try { DepthEvidenceIdTable.forExpected(scalars.sourceReferences) }
+            catch (_: ArithmeticException) { return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED) }
+        val targetVoxels = try { DepthEvidenceVoxelTable.forExpected(scalars.targetRows) }
+        catch (_: ArithmeticException) { return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED) }
 
         // Validate every source reference and duplicate source identity before
         // any operation/source/target collection is constructed.
-        for (changeIndex in command.changes.indices) {
-            val change = command.changes[changeIndex]
-            val sourceCount = depthSourceCount(change)
-            for (sourceIndex in 0 until sourceCount) {
+        for (change in command.changes) {
+            for (sourceIndex in 0 until depthSourceCount(change)) {
                 val source = depthSourceAt(change, sourceIndex)
-                if (hasEarlierDepthSource(command, changeIndex, sourceIndex, source, false)) {
+                if (!sourceIds.add(source.value)) {
                     return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
+                }
+                if (depthKind(change).structural && !structuralSourceIds.add(source.value)) {
+                    return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
+                }
+                if (depthKind(change).supportMode == DepthBatchSupportMode.SOURCE_TO_TARGETS) {
+                    supportSourceIds.add(source.value)
                 }
                 directLookups++
                 if (source.value !in 1 until UINT32_END || view.findById(source) == null) {
@@ -646,33 +651,17 @@ internal class MutableCanonicalOverlay private constructor(
 
         // Validate target shape, identity, voxel uniqueness, and occupancy by
         // scalar scans over the immutable command/view only.
-        for (changeIndex in command.changes.indices) {
-            val change = command.changes[changeIndex]
-            when (change) {
-                is DepthEvidenceChange.Create -> if (change.target.id != null) {
-                    return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.INVALID_COMMAND)
-                }
-                is DepthEvidenceChange.Refine -> if (change.target.id != change.sourceId) {
-                    return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                }
-                is DepthEvidenceChange.Relocate -> if (change.target.id != change.sourceId) {
-                    return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                }
-                is DepthEvidenceChange.Merge -> if (change.sourceIds.size < 2 || change.target.id != null) {
-                    return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                }
-                is DepthEvidenceChange.Split -> if (change.targets.size < 2 || change.targets.any { it.id != null }) {
-                    return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                }
-                is DepthEvidenceChange.Replace -> if (change.sourceIds.isEmpty() || change.targets.isEmpty() || change.targets.any { it.id != null }) {
-                    return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                }
-                is DepthEvidenceChange.Remove -> Unit
+        for (change in command.changes) {
+            if (!change.hasCanonicalShape) {
+                return DepthBatchPreflightResult.Refused(
+                    if (change.operationKind == DepthBatchOperationKind.CREATE) CanonicalMutationRefusal.INVALID_COMMAND
+                    else CanonicalMutationRefusal.OWNERSHIP_CONFLICT,
+                )
             }
             val targetCount = depthTargetCount(change)
             for (targetIndex in 0 until targetCount) {
                 val target = depthTargetAt(change, targetIndex)
-                if (hasEarlierDepthTarget(command, changeIndex, targetIndex, target.voxel)) {
+                if (!targetVoxels.add(target.voxel)) {
                     return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
                 }
                 if (CompactLocation(configuration, target.voxel) == null) {
@@ -681,17 +670,17 @@ internal class MutableCanonicalOverlay private constructor(
                 if (packed(target) == null) {
                     return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.INVALID_NORMAL)
                 }
-                if (target.id != null && !hasDepthSource(command, target.id, false)) {
+                if (target.id != null && !sourceIds.contains(target.id.value)) {
                     return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.UNKNOWN_IDENTITY)
                 }
                 directLookups++
                 val occupied = view.findByVoxel(target.voxel)
-                if (occupied != null && !hasDepthSource(command, occupied.id, true) && occupied.id != target.id) {
+                if (occupied != null && !structuralSourceIds.contains(occupied.id.value) && occupied.id != target.id) {
                     return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
                 }
-                if (change is DepthEvidenceChange.Refine) {
+                if (change.operationKind == DepthBatchOperationKind.REFINE) {
                     directLookups++
-                    val source = view.findById(change.sourceId)
+                    val source = view.findById(change.sourceAt(0))
                         ?: return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.UNKNOWN_IDENTITY)
                     if (source.voxel != target.voxel) {
                         return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
@@ -709,16 +698,16 @@ internal class MutableCanonicalOverlay private constructor(
         var removedSupportRecords = 0L
         var supportValueCapacity = 0L
         var streamRefusal: CanonicalMutationRefusal? = null
-        val uniqueSourcesRead = forEachUniqueDepthSource(command, true) { source ->
+        fun readStructuralSource(source: SurfaceId): Boolean {
             val lineage = streamLineageCount(source)
-            if (lineage == null) {
+            return if (lineage == null) {
                 streamRefusal = CanonicalMutationRefusal.SOURCE_READ_FAILURE
                 false
             } else {
                 removedLineageRecords = try { Math.addExact(removedLineageRecords, lineage) }
                 catch (_: ArithmeticException) {
                     streamRefusal = CanonicalMutationRefusal.LINEAGE_EXHAUSTED
-                    return@forEachUniqueDepthSource false
+                    return false
                 }
                 val supports = streamSupportCount(source)
                 if (supports == null) {
@@ -728,30 +717,30 @@ internal class MutableCanonicalOverlay private constructor(
                     removedSupportRecords = try { Math.addExact(removedSupportRecords, supports) }
                     catch (_: ArithmeticException) {
                         streamRefusal = CanonicalMutationRefusal.JOURNAL_EXHAUSTED
-                        return@forEachUniqueDepthSource false
+                        return false
                     }
                     supportValueCapacity = try {
                         Math.addExact(supportValueCapacity, supports)
                     } catch (_: ArithmeticException) {
                         streamRefusal = CanonicalMutationRefusal.JOURNAL_EXHAUSTED
-                        return@forEachUniqueDepthSource false
+                        return false
                     }
-                    if (supports == 0L && depthSourceNeedsSupport(command, source)) {
+                    if (supports == 0L && supportSourceIds.contains(source.value)) {
                         when (val fallback = view.readSourceById(source)) {
                             is CanonicalPageRead.Refused -> {
                                 streamRefusal = CanonicalMutationRefusal.SOURCE_READ_FAILURE
-                                return@forEachUniqueDepthSource false
+                                return false
                             }
                             is CanonicalPageRead.Complete -> {
                                 pageFaults += fallback.pageFaults; bytesRead += fallback.bytesRead
                                 if (fallback.value == null) {
                                     streamRefusal = CanonicalMutationRefusal.UNKNOWN_IDENTITY
-                                    return@forEachUniqueDepthSource false
+                                    return false
                                 }
                                 supportValueCapacity = try { Math.addExact(supportValueCapacity, 1L) }
                                 catch (_: ArithmeticException) {
                                     streamRefusal = CanonicalMutationRefusal.JOURNAL_EXHAUSTED
-                                    return@forEachUniqueDepthSource false
+                                    return false
                                 }
                             }
                         }
@@ -760,10 +749,15 @@ internal class MutableCanonicalOverlay private constructor(
                 }
             }
         }
-        if (!uniqueSourcesRead) {
-            return DepthBatchPreflightResult.Refused(
-                streamRefusal ?: CanonicalMutationRefusal.SOURCE_READ_FAILURE,
-            )
+        for (change in command.changes) {
+            if (!depthKind(change).structural) continue
+            for (sourceIndex in 0 until depthSourceCount(change)) {
+                if (!readStructuralSource(depthSourceAt(change, sourceIndex))) {
+                    return DepthBatchPreflightResult.Refused(
+                        streamRefusal ?: CanonicalMutationRefusal.SOURCE_READ_FAILURE,
+                    )
+                }
+            }
         }
         if (removedLineageRecords > view.cut.lineageCount.toLong() || removedLineageRecords > Int.MAX_VALUE.toLong()) {
             return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.LINEAGE_EXHAUSTED)
@@ -802,18 +796,11 @@ internal class MutableCanonicalOverlay private constructor(
                             exactRefusal = CanonicalMutationRefusal.SOURCE_READ_FAILURE
                             return@streamSourceSupports false
                         }
-                        var present = false
-                        for (index in 0 until unionSize) if (supportIds[index] == value) {
-                            present = true
-                            break
+                        if (unionSize >= supportIds.size) {
+                            exactRefusal = CanonicalMutationRefusal.JOURNAL_EXHAUSTED
+                            return@streamSourceSupports false
                         }
-                        if (!present) {
-                            if (unionSize >= supportIds.size) {
-                                exactRefusal = CanonicalMutationRefusal.JOURNAL_EXHAUSTED
-                                return@streamSourceSupports false
-                            }
-                            supportIds[unionSize++] = value
-                        }
+                        supportIds[unionSize++] = value
                         true
                     }
                     if (!streamOk || exactRefusal != null) break
@@ -830,17 +817,21 @@ internal class MutableCanonicalOverlay private constructor(
                                     exactRefusal = CanonicalMutationRefusal.UNKNOWN_IDENTITY
                                     break
                                 }
-                                var present = false
-                                for (index in 0 until unionSize) if (supportIds[index] == value) {
-                                    present = true
+                                if (unionSize >= supportIds.size) {
+                                    exactRefusal = CanonicalMutationRefusal.JOURNAL_EXHAUSTED
                                     break
                                 }
-                                if (!present) supportIds[unionSize++] = value
+                                supportIds[unionSize++] = value
                             }
                         }
                     }
                 }
-                unionSize
+                Arrays.sort(supportIds, 0, unionSize)
+                var distinct = 0
+                for (index in 0 until unionSize) {
+                    if (index == 0 || supportIds[index] != supportIds[index - 1]) distinct++
+                }
+                distinct
             } else {
                 if (depthKind(change).supportMode == DepthBatchSupportMode.SELF) targetCount else 0
             }
@@ -908,9 +899,15 @@ internal class MutableCanonicalOverlay private constructor(
         bytes = Math.addExact(bytes, PLANNING_PAGE_SCRATCH_BYTES)
         bytes = Math.addExact(bytes, Math.multiplyExact(scalars.sourceReferences.toLong(), DEPTH_SOURCE_GRAPH_BYTES))
         bytes = Math.addExact(bytes, Math.multiplyExact(scalars.targetRows.toLong(), DEPTH_TARGET_GRAPH_BYTES))
-        bytes = Math.addExact(bytes, Math.multiplyExact(scalars.sourceReferences.toLong(), DEPTH_OPERATION_GRAPH_BYTES))
+        bytes = Math.addExact(bytes, Math.multiplyExact(scalars.operationCount.toLong(), DEPTH_OPERATION_GRAPH_BYTES))
+        bytes = Math.addExact(bytes, Math.multiplyExact(scalars.targetRows.toLong(), ROW_CONSTRUCTION_BYTES_PER_RECORD))
+        bytes = Math.addExact(bytes, Math.multiplyExact(scalars.removedRows.toLong(), REMOVED_CONSTRUCTION_BYTES_PER_RECORD))
         bytes = Math.addExact(bytes, Math.multiplyExact(supportRecords, DEPTH_SUPPORT_DETAILS_BYTES_PER_RECORD))
         bytes = Math.addExact(bytes, Math.multiplyExact(supportRecords, DEPTH_SUPPORT_SCRATCH_BYTES_PER_RECORD))
+        bytes = Math.addExact(bytes, Math.multiplyExact(supportPairs, PREPARED_SUPPORT_CONSTRUCTION_BYTES_PER_RECORD))
+        bytes = Math.addExact(bytes, Math.multiplyExact(scalars.lineageEdges, PREPARED_LINEAGE_CONSTRUCTION_BYTES_PER_RECORD))
+        bytes = Math.addExact(bytes, Math.multiplyExact(DepthEvidenceIdTable.bytesForExpected(scalars.sourceReferences), 3L))
+        bytes = Math.addExact(bytes, DepthEvidenceVoxelTable.bytesForExpected(scalars.targetRows))
         bytes = Math.addExact(bytes, Math.multiplyExact(supportPairs, 68L))
         bytes = Math.addExact(bytes, 64L)
         bytes = Math.addExact(bytes, Math.multiplyExact(scalars.lineageEdges, 16L))
@@ -918,136 +915,18 @@ internal class MutableCanonicalOverlay private constructor(
         Math.addExact(bytes, wal)
     } catch (_: ArithmeticException) { null }
 
-    private fun depthSourceCount(change: DepthEvidenceChange): Int = when (change) {
-        is DepthEvidenceChange.Create -> 0
-        is DepthEvidenceChange.Refine -> 1
-        is DepthEvidenceChange.Relocate -> 1
-        is DepthEvidenceChange.Merge -> change.sourceIds.size
-        is DepthEvidenceChange.Split -> 1
-        is DepthEvidenceChange.Replace -> change.sourceIds.size
-        is DepthEvidenceChange.Remove -> 1
-    }
+    private fun depthSourceCount(change: DepthEvidenceChange): Int = change.sourceCount
 
-    private fun depthSourceAt(change: DepthEvidenceChange, index: Int): SurfaceId = when (change) {
-        is DepthEvidenceChange.Create -> error("create has no source")
-        is DepthEvidenceChange.Refine -> change.sourceId
-        is DepthEvidenceChange.Relocate -> change.sourceId
-        is DepthEvidenceChange.Merge -> change.sourceIds[index]
-        is DepthEvidenceChange.Split -> change.sourceId
-        is DepthEvidenceChange.Replace -> change.sourceIds[index]
-        is DepthEvidenceChange.Remove -> change.sourceId
-    }
+    private fun depthSourceAt(change: DepthEvidenceChange, index: Int): SurfaceId = change.sourceAt(index)
 
-    private fun depthTargetCount(change: DepthEvidenceChange): Int = when (change) {
-        is DepthEvidenceChange.Create -> 1
-        is DepthEvidenceChange.Refine -> 1
-        is DepthEvidenceChange.Relocate -> 1
-        is DepthEvidenceChange.Merge -> 1
-        is DepthEvidenceChange.Split -> change.targets.size
-        is DepthEvidenceChange.Replace -> change.targets.size
-        is DepthEvidenceChange.Remove -> 0
-    }
+    private fun depthTargetCount(change: DepthEvidenceChange): Int = change.targetCount
 
-    private fun depthTargetAt(change: DepthEvidenceChange, index: Int): CanonicalTarget = when (change) {
-        is DepthEvidenceChange.Create -> change.target
-        is DepthEvidenceChange.Refine -> change.target
-        is DepthEvidenceChange.Relocate -> change.target
-        is DepthEvidenceChange.Merge -> change.target
-        is DepthEvidenceChange.Split -> change.targets[index]
-        is DepthEvidenceChange.Replace -> change.targets[index]
-        is DepthEvidenceChange.Remove -> error("remove has no target")
-    }
+    private fun depthTargetAt(change: DepthEvidenceChange, index: Int): CanonicalTarget = change.targetAt(index)
 
-    private fun depthKind(change: DepthEvidenceChange): DepthBatchOperationKind = when (change) {
-        is DepthEvidenceChange.Create -> DepthBatchOperationKind.CREATE
-        is DepthEvidenceChange.Refine -> DepthBatchOperationKind.REFINE
-        is DepthEvidenceChange.Relocate -> DepthBatchOperationKind.RELOCATE
-        is DepthEvidenceChange.Merge -> DepthBatchOperationKind.MERGE
-        is DepthEvidenceChange.Split -> DepthBatchOperationKind.SPLIT
-        is DepthEvidenceChange.Replace -> DepthBatchOperationKind.REPLACE
-        is DepthEvidenceChange.Remove -> DepthBatchOperationKind.REMOVE
-    }
+    private fun depthKind(change: DepthEvidenceChange): DepthBatchOperationKind = change.operationKind
 
-    private fun depthLiveDelta(change: DepthEvidenceChange): Int = when (change) {
-        is DepthEvidenceChange.Create -> 1
-        is DepthEvidenceChange.Refine -> 0
-        is DepthEvidenceChange.Relocate -> 0
-        is DepthEvidenceChange.Merge -> 1 - change.sourceIds.size
-        is DepthEvidenceChange.Split -> change.targets.size - 1
-        is DepthEvidenceChange.Replace -> change.targets.size - change.sourceIds.size
-        is DepthEvidenceChange.Remove -> -1
-    }
-
-    private fun forEachDepthSource(change: DepthEvidenceChange, sink: (SurfaceId) -> Unit) {
-        for (index in 0 until depthSourceCount(change)) sink(depthSourceAt(change, index))
-    }
-
-    private fun hasEarlierDepthSource(
-        command: CanonicalEvidenceBatchCommand,
-        changeIndex: Int,
-        sourceIndex: Int,
-        source: SurfaceId,
-        structuralOnly: Boolean,
-    ): Boolean {
-        for (priorChangeIndex in 0..changeIndex) {
-            val prior = command.changes[priorChangeIndex]
-            if (structuralOnly && !depthKind(prior).structural) continue
-            val end = if (priorChangeIndex == changeIndex) sourceIndex else depthSourceCount(prior)
-            for (priorSourceIndex in 0 until end) if (depthSourceAt(prior, priorSourceIndex) == source) return true
-        }
-        return false
-    }
-
-    private fun hasDepthSource(command: CanonicalEvidenceBatchCommand, source: SurfaceId, structuralOnly: Boolean): Boolean {
-        for (change in command.changes) {
-            if (structuralOnly && !depthKind(change).structural) continue
-            for (sourceIndex in 0 until depthSourceCount(change)) {
-                if (depthSourceAt(change, sourceIndex) == source) return true
-            }
-        }
-        return false
-    }
-
-    private fun forEachUniqueDepthSource(
-        command: CanonicalEvidenceBatchCommand,
-        structuralOnly: Boolean,
-        sink: (SurfaceId) -> Boolean,
-    ): Boolean {
-        for (changeIndex in command.changes.indices) {
-            val change = command.changes[changeIndex]
-            if (structuralOnly && !depthKind(change).structural) continue
-            for (sourceIndex in 0 until depthSourceCount(change)) {
-                val source = depthSourceAt(change, sourceIndex)
-                if (!hasEarlierDepthSource(command, changeIndex, sourceIndex, source, structuralOnly) && !sink(source)) {
-                    return false
-                }
-            }
-        }
-        return true
-    }
-
-    private fun hasEarlierDepthTarget(
-        command: CanonicalEvidenceBatchCommand,
-        changeIndex: Int,
-        targetIndex: Int,
-        voxel: Voxel,
-    ): Boolean {
-        for (priorChangeIndex in 0..changeIndex) {
-            val prior = command.changes[priorChangeIndex]
-            val end = if (priorChangeIndex == changeIndex) targetIndex else depthTargetCount(prior)
-            for (priorTargetIndex in 0 until end) if (depthTargetAt(prior, priorTargetIndex).voxel == voxel) return true
-        }
-        return false
-    }
-
-    private fun depthSourceNeedsSupport(command: CanonicalEvidenceBatchCommand, source: SurfaceId): Boolean {
-        for (change in command.changes) if (depthKind(change).supportMode == DepthBatchSupportMode.SOURCE_TO_TARGETS) {
-            for (sourceIndex in 0 until depthSourceCount(change)) {
-                if (depthSourceAt(change, sourceIndex) == source) return true
-            }
-        }
-        return false
-    }
+    private fun depthLiveDelta(change: DepthEvidenceChange): Int =
+        change.operationKind.liveDelta(change.sourceCount, change.targetCount)
 
     private fun streamLineageCount(source: SurfaceId): Long? {
         var cursor: LineageCursor? = null
@@ -1078,6 +957,12 @@ internal class MutableCanonicalOverlay private constructor(
             when (read) {
                 is SourceSupportRead.Refused -> return false
                 is SourceSupportRead.Complete -> {
+                    try {
+                        pageFaults = Math.addExact(pageFaults, read.pageFaults)
+                        bytesRead = Math.addExact(bytesRead, read.bytesRead)
+                    } catch (_: ArithmeticException) {
+                        return false
+                    }
                     cursor = read.nextCursor
                     pages = try { Math.addExact(pages, 1L) } catch (_: ArithmeticException) { Long.MAX_VALUE }
                     if (pages > view.cut.supportCount.toLong() + 1L) return false
@@ -1132,58 +1017,20 @@ internal class MutableCanonicalOverlay private constructor(
             return targets.lastIndex
         }
         for (change in command.changes) {
-            when (change) {
-                is DepthEvidenceChange.Create -> {
-                    if (change.target.id != null) return refuse(CanonicalMutationRefusal.INVALID_COMMAND)
-                    val target = addTarget(change.target.copy(id = null))
-                    if (target < 0) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                    operations += Operation(DepthBatchOperationKind.CREATE, emptyList(), intArrayOf(target))
-                }
-                is DepthEvidenceChange.Refine -> {
-                    if (change.target.id != change.sourceId || !addSource(change.sourceId, DepthBatchOperationKind.REFINE.structural)) {
-                        return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                    }
-                    val target = addTarget(change.target.copy(id = change.sourceId))
-                    if (target < 0) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                    operations += Operation(DepthBatchOperationKind.REFINE, listOf(change.sourceId), intArrayOf(target))
-                }
-                is DepthEvidenceChange.Relocate -> {
-                    if (change.target.id != change.sourceId || !addSource(change.sourceId, DepthBatchOperationKind.RELOCATE.structural)) {
-                        return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                    }
-                    val target = addTarget(change.target.copy(id = change.sourceId))
-                    if (target < 0) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                    operations += Operation(DepthBatchOperationKind.RELOCATE, listOf(change.sourceId), intArrayOf(target))
-                }
-                is DepthEvidenceChange.Merge -> {
-                    if (change.sourceIds.size < 2 || change.target.id != null ||
-                        change.sourceIds.any { !addSource(it, DepthBatchOperationKind.MERGE.structural) }
-                    ) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                    val target = addTarget(change.target.copy(id = null))
-                    if (target < 0) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                    operations += Operation(DepthBatchOperationKind.MERGE, change.sourceIds.toList(), intArrayOf(target))
-                }
-                is DepthEvidenceChange.Split -> {
-                    if (change.targets.size < 2 || !addSource(change.sourceId, DepthBatchOperationKind.SPLIT.structural) ||
-                        change.targets.any { it.id != null }
-                    ) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                    val targetIndexes = IntArray(change.targets.size) { index -> addTarget(change.targets[index].copy(id = null)) }
-                    if (targetIndexes.any { it < 0 }) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                    operations += Operation(DepthBatchOperationKind.SPLIT, listOf(change.sourceId), targetIndexes)
-                }
-                is DepthEvidenceChange.Replace -> {
-                    if (change.sourceIds.isEmpty() || change.targets.isEmpty() ||
-                        change.sourceIds.any { !addSource(it, DepthBatchOperationKind.REPLACE.structural) } || change.targets.any { it.id != null }
-                    ) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                    val targetIndexes = IntArray(change.targets.size) { index -> addTarget(change.targets[index].copy(id = null)) }
-                    if (targetIndexes.any { it < 0 }) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                    operations += Operation(DepthBatchOperationKind.REPLACE, change.sourceIds.toList(), targetIndexes)
-                }
-                is DepthEvidenceChange.Remove -> {
-                    if (!addSource(change.sourceId, DepthBatchOperationKind.REMOVE.structural)) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
-                    operations += Operation(DepthBatchOperationKind.REMOVE, listOf(change.sourceId), IntArray(0))
-                }
+            val kind = change.operationKind
+            val operationSources = ArrayList<SurfaceId>(change.sourceCount)
+            for (sourceIndex in 0 until change.sourceCount) {
+                val source = change.sourceAt(sourceIndex)
+                if (!addSource(source, kind.structural)) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
+                operationSources += source
             }
+            val operationTargets = IntArray(change.targetCount)
+            for (targetIndex in operationTargets.indices) {
+                val target = addTarget(change.canonicalTargetAt(targetIndex))
+                if (target < 0) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
+                operationTargets[targetIndex] = target
+            }
+            operations += Operation(kind, operationSources, operationTargets)
         }
         if (sources.size > configuration.surfaceCapacity + configuration.lineageCapacity) {
             return refuse(CanonicalMutationRefusal.CAPACITY)
@@ -1571,6 +1418,7 @@ internal data class CanonicalFeatureBatchPreflightReceipt(
 )
 
 private data class DepthBatchScalars(
+    val operationCount: Int,
     val sourceReferences: Int,
     val targetRows: Int,
     val lineageEdges: Long,
@@ -1590,31 +1438,8 @@ private sealed interface DepthBatchPreflightResult {
     data class Refused(val reason: CanonicalMutationRefusal) : DepthBatchPreflightResult
 }
 
-private enum class DepthBatchSupportMode { NONE, SELF, SOURCE_TO_TARGETS }
-
-/** Semantic operation policy for one depth batch; no persisted/kernel ordinals are reused. */
-private enum class DepthBatchOperationKind(
-    val structural: Boolean,
-    val lineageChanged: Boolean,
-    val supportMode: DepthBatchSupportMode,
-) {
-    CREATE(false, false, DepthBatchSupportMode.SELF),
-    REFINE(false, false, DepthBatchSupportMode.NONE),
-    RELOCATE(true, true, DepthBatchSupportMode.SOURCE_TO_TARGETS),
-    MERGE(true, true, DepthBatchSupportMode.SOURCE_TO_TARGETS),
-    SPLIT(true, true, DepthBatchSupportMode.SOURCE_TO_TARGETS),
-    REPLACE(true, true, DepthBatchSupportMode.SOURCE_TO_TARGETS),
-    REMOVE(true, true, DepthBatchSupportMode.NONE);
-
-    fun liveDelta(sourceCount: Int, targetCount: Int): Int = when (this) {
-        CREATE -> targetCount
-        REFINE, RELOCATE -> 0
-        MERGE -> 1 - sourceCount
-        SPLIT -> targetCount - 1
-        REPLACE -> targetCount - sourceCount
-        REMOVE -> -sourceCount
-    }
-}
+private typealias DepthBatchSupportMode = DepthEvidenceSupportMode
+private typealias DepthBatchOperationKind = DepthEvidenceOperationKind
 
 /** One depth-kernel delta admitted as one canonical surface transaction. */
 internal class CanonicalEvidenceBatchCommand(

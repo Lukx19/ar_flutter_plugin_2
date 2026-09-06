@@ -162,6 +162,109 @@ internal sealed interface DepthEvidenceChange {
     data class Remove(val sourceId: SurfaceId) : DepthEvidenceChange
 }
 
+/** Allocation-free semantic description shared by the canonical planner. */
+internal enum class DepthEvidenceSupportMode { NONE, SELF, SOURCE_TO_TARGETS }
+
+internal enum class DepthEvidenceOperationKind(
+    val structural: Boolean,
+    val lineageChanged: Boolean,
+    val supportMode: DepthEvidenceSupportMode,
+) {
+    CREATE(false, false, DepthEvidenceSupportMode.SELF),
+    REFINE(false, false, DepthEvidenceSupportMode.NONE),
+    RELOCATE(true, true, DepthEvidenceSupportMode.SOURCE_TO_TARGETS),
+    MERGE(true, true, DepthEvidenceSupportMode.SOURCE_TO_TARGETS),
+    SPLIT(true, true, DepthEvidenceSupportMode.SOURCE_TO_TARGETS),
+    REPLACE(true, true, DepthEvidenceSupportMode.SOURCE_TO_TARGETS),
+    REMOVE(true, true, DepthEvidenceSupportMode.NONE);
+
+    fun liveDelta(sourceCount: Int, targetCount: Int): Int = when (this) {
+        CREATE -> targetCount
+        REFINE, RELOCATE -> 0
+        MERGE -> 1 - sourceCount
+        SPLIT -> targetCount - 1
+        REPLACE -> targetCount - sourceCount
+        REMOVE -> -sourceCount
+    }
+}
+
+internal val DepthEvidenceChange.operationKind: DepthEvidenceOperationKind
+    get() = when (this) {
+        is DepthEvidenceChange.Create -> DepthEvidenceOperationKind.CREATE
+        is DepthEvidenceChange.Refine -> DepthEvidenceOperationKind.REFINE
+        is DepthEvidenceChange.Relocate -> DepthEvidenceOperationKind.RELOCATE
+        is DepthEvidenceChange.Merge -> DepthEvidenceOperationKind.MERGE
+        is DepthEvidenceChange.Split -> DepthEvidenceOperationKind.SPLIT
+        is DepthEvidenceChange.Replace -> DepthEvidenceOperationKind.REPLACE
+        is DepthEvidenceChange.Remove -> DepthEvidenceOperationKind.REMOVE
+    }
+
+internal val DepthEvidenceChange.sourceCount: Int
+    get() = when (this) {
+        is DepthEvidenceChange.Create -> 0
+        is DepthEvidenceChange.Refine -> 1
+        is DepthEvidenceChange.Relocate -> 1
+        is DepthEvidenceChange.Merge -> sourceIds.size
+        is DepthEvidenceChange.Split -> 1
+        is DepthEvidenceChange.Replace -> sourceIds.size
+        is DepthEvidenceChange.Remove -> 1
+    }
+
+internal fun DepthEvidenceChange.sourceAt(index: Int): SurfaceId = when (this) {
+    is DepthEvidenceChange.Create -> error("create has no source")
+    is DepthEvidenceChange.Refine -> sourceId
+    is DepthEvidenceChange.Relocate -> sourceId
+    is DepthEvidenceChange.Merge -> sourceIds[index]
+    is DepthEvidenceChange.Split -> sourceId
+    is DepthEvidenceChange.Replace -> sourceIds[index]
+    is DepthEvidenceChange.Remove -> sourceId
+}
+
+internal val DepthEvidenceChange.targetCount: Int
+    get() = when (this) {
+        is DepthEvidenceChange.Create,
+        is DepthEvidenceChange.Refine,
+        is DepthEvidenceChange.Relocate,
+        is DepthEvidenceChange.Merge -> 1
+        is DepthEvidenceChange.Split -> targets.size
+        is DepthEvidenceChange.Replace -> targets.size
+        is DepthEvidenceChange.Remove -> 0
+    }
+
+internal fun DepthEvidenceChange.targetAt(index: Int): CanonicalTarget = when (this) {
+    is DepthEvidenceChange.Create -> target
+    is DepthEvidenceChange.Refine -> target
+    is DepthEvidenceChange.Relocate -> target
+    is DepthEvidenceChange.Merge -> target
+    is DepthEvidenceChange.Split -> targets[index]
+    is DepthEvidenceChange.Replace -> targets[index]
+    is DepthEvidenceChange.Remove -> error("remove has no target")
+}
+
+internal val DepthEvidenceChange.hasCanonicalShape: Boolean
+    get() = when (this) {
+        is DepthEvidenceChange.Create -> target.id == null
+        is DepthEvidenceChange.Refine -> target.id == sourceId
+        is DepthEvidenceChange.Relocate -> target.id == sourceId
+        is DepthEvidenceChange.Merge -> sourceIds.size >= 2 && target.id == null
+        is DepthEvidenceChange.Split -> sourceId.value > 0L && targets.size >= 2 && targets.all { it.id == null }
+        is DepthEvidenceChange.Replace -> sourceIds.isNotEmpty() && targets.isNotEmpty() && targets.all { it.id == null }
+        is DepthEvidenceChange.Remove -> true
+    }
+
+internal fun DepthEvidenceChange.canonicalTargetAt(index: Int): CanonicalTarget {
+    val target = targetAt(index)
+    return when (operationKind) {
+        DepthEvidenceOperationKind.CREATE,
+        DepthEvidenceOperationKind.MERGE,
+        DepthEvidenceOperationKind.SPLIT,
+        DepthEvidenceOperationKind.REPLACE -> target.copy(id = null)
+        DepthEvidenceOperationKind.REFINE,
+        DepthEvidenceOperationKind.RELOCATE -> target.copy(id = sourceAt(0))
+        DepthEvidenceOperationKind.REMOVE -> error("remove has no target")
+    }
+}
+
 /**
  * Scalar receipt for one batch attempt, whether accepted or refused. An applied
  * accepted receipt is also retained as the kernel's last committed receipt.

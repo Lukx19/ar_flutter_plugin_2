@@ -6,6 +6,36 @@ import org.junit.Test
 
 class CanonicalEvidenceBatchTest {
     @Test
+    fun `create-only batch refuses planner bound before materialization`() {
+        val changes = (0 until 200).map { index ->
+            DepthEvidenceChange.Create(
+                CanonicalTarget(null, Voxel(index, 0, 0), 0, 0, 192),
+            )
+        }
+        val view = TestView(emptyList(), high = 1, geometry = 7, lineage = 5)
+        val preparation = MutableCanonicalOverlay.prepare(
+            view,
+            SurfaceOwnershipConfiguration(
+                surfaceCapacity = 200,
+                lineageCapacity = 200,
+                changeJournalByteCapacity = 20_000,
+            ),
+            CanonicalEvidenceBatchCommand("create-scratch", 7, 5, changes),
+        )
+
+        assertTrue(preparation is CanonicalMutationPreparation.Refused)
+        assertEquals(
+            CanonicalMutationRefusal.JOURNAL_EXHAUSTED,
+            (preparation as CanonicalMutationPreparation.Refused).reason,
+        )
+        assertEquals(0, view.sourceMaterializationReads)
+        assertEquals(0, view.supportPageReads)
+        assertEquals(0, view.supportStreamRecords)
+        assertEquals(0, (preparation as CanonicalMutationPreparation.Refused).preflightWork.targetSetInsertions)
+        assertEquals(0, preparation.preflightWork.ownerConstructions)
+    }
+
+    @Test
     fun `many removes refuse before planner scratch or source materialization`() {
         val rows = (1L..200L).map { surface(it, it.toInt()) }
         val view = TestView(rows, high = 201, geometry = 7, lineage = 5)
@@ -250,6 +280,43 @@ class CanonicalEvidenceBatchTest {
         }
     }
 
+    @Test
+    fun `support page work is included for every streaming pass`() {
+        val support = PagedSupport(
+            SurfaceId(1),
+            PagedSource(
+                SurfaceId(101), Voxel(4, 1, 0), 0, 192,
+                CanonicalReceiptBytes(ByteArray(32) { 7 }),
+            ),
+        )
+        val view = TestView(
+            listOf(surface(1, 0), surface(2, 1), surface(3, 2)),
+            high = 4,
+            geometry = 7,
+            lineage = 5,
+            supportBySource = mapOf(1L to listOf(support)),
+            supportPageFaults = 2,
+            supportBytesRead = 17,
+        )
+        val preparation = MutableCanonicalOverlay.prepare(
+            view,
+            SurfaceOwnershipConfiguration(),
+            CanonicalEvidenceBatchCommand(
+                "support-work", 7, 5,
+                listOf(DepthEvidenceChange.Relocate(
+                    SurfaceId(1), CanonicalTarget(SurfaceId(1), Voxel(10, 0, 0), 0, 0, 192),
+                )),
+            ),
+        ) as CanonicalMutationPreparation.Prepared
+        val plan = preparation.mutation
+        try {
+            assertEquals(6, plan.work.sourcePageFaults)
+            assertEquals(51, plan.work.sourceBytesRead)
+        } finally {
+            plan.discard()
+        }
+    }
+
     private fun surface(id: Long, x: Int) = CompactSurface(SurfaceId(id), Voxel(x, 0, 0), 0, 192)
 
     private fun dirtyRows(plan: PreparedCanonicalMutation) = mutableListOf<PreparedRow>().also { values ->
@@ -275,6 +342,8 @@ class CanonicalEvidenceBatchTest {
         lineage: Long,
         private val outgoingLineage: Map<Long, List<Long>> = emptyMap(),
         private val supportBySource: Map<Long, List<PagedSupport>> = emptyMap(),
+        private val supportPageFaults: Int = 0,
+        private val supportBytesRead: Int = 0,
     ) : CanonicalStateView {
         var sourceMaterializationReads = 0
         var supportPageReads = 0
@@ -314,7 +383,7 @@ class CanonicalEvidenceBatchTest {
                 delivered++
                 supportStreamRecords++
             }
-            return SourceSupportRead.Complete(delivered, null, 0, 0)
+            return SourceSupportRead.Complete(delivered, null, supportPageFaults, supportBytesRead)
         }
         override fun visitLineage(
             source: SurfaceId,
