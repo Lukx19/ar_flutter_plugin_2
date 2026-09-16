@@ -44,6 +44,8 @@ class RawDepthCopySource(
     private val acquirer: PairedRawDepthAcquirer,
     private val maxCopiedPixels: Int = 4_096,
     private val discontinuityThresholdMillimeters: Int = 100,
+    private val onResourceAcquired: () -> Unit = {},
+    private val onResourceClosed: () -> Unit = {},
 ) {
     init {
         require(maxCopiedPixels in 1..4_096)
@@ -60,8 +62,8 @@ class RawDepthCopySource(
         var depth: RawDepthImage? = null
         var confidence: RawDepthImage? = null
         return try {
-            depth = acquirer.acquireDepth()
-            confidence = acquirer.acquireConfidence()
+            depth = acquirer.acquireDepth().also { onResourceAcquired() }
+            confidence = acquirer.acquireConfidence().also { onResourceAcquired() }
             val metadata = metadataForDimensions(depth.width, depth.height)
             if (
                 depth.width != confidence.width ||
@@ -79,9 +81,21 @@ class RawDepthCopySource(
             DepthAcquisitionResult.Failure(error.message ?: error.javaClass.simpleName)
         } finally {
             try {
-                confidence?.close()
+                confidence?.let {
+                    try {
+                        it.close()
+                    } finally {
+                        onResourceClosed()
+                    }
+                }
             } finally {
-                depth?.close()
+                depth?.let {
+                    try {
+                        it.close()
+                    } finally {
+                        onResourceClosed()
+                    }
+                }
             }
         }
     }

@@ -9,7 +9,7 @@ import '../datatypes/image_format.dart';
 /// Provides information about available camera capabilities for AR capture
 /// Can be used independently throughout the application for capability discovery
 class ARCameraCapabilities {
-  static const int capabilityPresetVersion = 11;
+  static const int capabilityPresetVersion = 12;
 
   /// Platform channel for camera capability queries
   static const MethodChannel _channel =

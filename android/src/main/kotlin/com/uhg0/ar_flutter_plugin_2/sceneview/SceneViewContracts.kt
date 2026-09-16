@@ -228,3 +228,189 @@ internal class SharedCameraSceneLifecycleGate(sharedCameraRequested: Boolean) {
         resumeAllowed = true
     }
 }
+
+/** Exactly-once terminal reply fence for a bounded, replaceable native operation. */
+internal class BoundedReplyFence<T> {
+    private var generation = 0L
+    private var reply: ((T) -> Unit)? = null
+
+    @Synchronized
+    fun begin(next: (T) -> Unit, superseded: T): Long {
+        reply?.invoke(superseded)
+        generation++
+        reply = next
+        return generation
+    }
+
+    @Synchronized
+    fun settle(token: Long, terminal: T): Boolean {
+        if (token != generation) return false
+        val current = reply ?: return false
+        reply = null
+        current(terminal)
+        return true
+    }
+
+    @Synchronized
+    fun dispose(cancelled: T) {
+        generation++
+        reply?.invoke(cancelled)
+        reply = null
+    }
+}
+
+/** Production coordinator for a blocking operation with an independent deadline. */
+internal class BoundedOperationCoordinator<T>(
+    private val launchOperation: ((() -> Unit) -> Unit),
+    private val scheduleDeadline: (Long, () -> Unit) -> Unit,
+    private val dispatchTerminal: ((() -> Unit) -> Unit),
+) {
+    private val fence = BoundedReplyFence<T>()
+    private val lock = Any()
+    private var running: Operation<T>? = null
+    private var queued: Operation<T>? = null
+    private var disposed = false
+    private var onDisposedDrained: (() -> Unit)? = null
+
+    private class Operation<T>(
+        val token: Long,
+        val timedOut: T,
+        val failed: T,
+        val succeeded: T,
+        val operation: () -> Unit,
+        val rollbackLateSuccess: () -> Unit,
+    ) {
+        var abandonedBeforeStart = false
+    }
+
+    fun begin(
+        timeoutMillis: Long,
+        next: (T) -> Unit,
+        superseded: T,
+        timedOut: T,
+        failed: T,
+        succeeded: T,
+        operation: () -> Unit,
+        rollbackLateSuccess: () -> Unit,
+    ): Long {
+        lateinit var pending: Operation<T>
+        var start: Operation<T>? = null
+        synchronized(lock) {
+            // This admission check and fence registration must be one critical
+            // section. Otherwise a begin racing a completed dispose can retain
+            // a callback after disposal has already emitted SESSION_ERROR.
+            check(!disposed) { "Operation coordinator is disposed" }
+            val token = fence.begin(next, superseded)
+            pending = Operation(
+                token = token,
+                timedOut = timedOut,
+                failed = failed,
+                succeeded = succeeded,
+                operation = operation,
+                rollbackLateSuccess = rollbackLateSuccess,
+            )
+            // A not-yet-started request has no native side effect. Replace it
+            // outright; BoundedReplyFence has returned its terminal reply as
+            // superseded while this coordinator is still open.
+            queued?.abandonedBeforeStart = true
+            if (running == null) {
+                running = pending
+                start = pending
+            } else {
+                queued = pending
+            }
+        }
+        scheduleDeadline(timeoutMillis) {
+            dispatchTerminal {
+                fence.settle(pending.token, timedOut)
+                synchronized(lock) {
+                    if (queued === pending) {
+                        pending.abandonedBeforeStart = true
+                        queued = null
+                    }
+                }
+            }
+        }
+        start?.let(::launch)
+        return pending.token
+    }
+
+    /**
+     * Fence replies immediately, but delay [onDrained] until a blocking native
+     * operation has returned and a late successful resume has been rolled back.
+     */
+    fun dispose(cancelled: T, onDrained: () -> Unit) {
+        var drainNow = false
+        synchronized(lock) {
+            if (disposed) return
+            disposed = true
+            queued?.abandonedBeforeStart = true
+            queued = null
+            onDisposedDrained = onDrained
+            drainNow = running == null
+            if (drainNow) onDisposedDrained = null
+        }
+        // No begin can install a reply after disposed was set under lock.
+        // Fence the one already admitted reply exactly once outside that lock.
+        fence.dispose(cancelled)
+        if (drainNow) onDrained()
+    }
+
+    /**
+     * Fence a currently stalled operation and discard a queued successor.
+     * The running native call cannot be interrupted, so its eventual success
+     * still reaches [launch] and is rolled back before another queued resume
+     * is allowed to start.  This is the lifecycle pause boundary.
+     */
+    fun invalidate(invalidated: T) {
+        val tokens = mutableListOf<Long>()
+        synchronized(lock) {
+            running?.let { tokens += it.token }
+            queued?.let {
+                it.abandonedBeforeStart = true
+                tokens += it.token
+            }
+            queued = null
+        }
+        tokens.forEach { fence.settle(it, invalidated) }
+    }
+
+    private fun launch(pending: Operation<T>) {
+        launchOperation {
+            val success = runCatching(pending.operation).isSuccess
+            dispatchTerminal {
+                // A timeout, supersede, or disposal has fenced the Dart reply,
+                // but ARCore may still have completed Session.resume. Pause it
+                // before another resume or host disposal can proceed.
+                val accepted = fence.settle(
+                    pending.token,
+                    if (success) pending.succeeded else pending.failed,
+                )
+                if (success && !accepted) pending.rollbackLateSuccess()
+                finish(pending)
+            }
+        }
+    }
+
+    private fun finish(completed: Operation<T>) {
+        var next: Operation<T>? = null
+        var drained: (() -> Unit)? = null
+        synchronized(lock) {
+            if (running !== completed) return
+            running = null
+            if (disposed) {
+                drained = onDisposedDrained
+                onDisposedDrained = null
+            } else {
+                val candidate = queued
+                queued = null
+                if (candidate != null && !candidate.abandonedBeforeStart) {
+                    running = candidate
+                    next = candidate
+                }
+            }
+        }
+        drained?.invoke()
+        next?.let(::launch)
+    }
+}

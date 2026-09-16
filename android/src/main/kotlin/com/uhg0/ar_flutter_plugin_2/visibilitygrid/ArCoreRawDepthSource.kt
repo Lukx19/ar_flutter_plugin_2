@@ -8,6 +8,8 @@ import java.nio.ByteOrder
 
 class ArCoreRawDepthSource(
     private val maxCopiedPixels: Int = 4_096,
+    private val onResourceAcquired: () -> Unit = {},
+    private val onResourceClosed: () -> Unit = {},
 ) {
     fun acquire(
         frame: Frame,
@@ -18,6 +20,8 @@ class ArCoreRawDepthSource(
             RawDepthCopySource(
                 acquirer = ArCorePairedRawDepthAcquirer(frame),
                 maxCopiedPixels = maxCopiedPixels,
+                onResourceAcquired = onResourceAcquired,
+                onResourceClosed = onResourceClosed,
             )
         return source.acquire { depthWidth, depthHeight ->
             val imageIntrinsics = frame.camera.imageIntrinsics

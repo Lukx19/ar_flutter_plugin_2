@@ -1,0 +1,1701 @@
+package com.uhg0.ar_flutter_plugin_2.visibilitygrid
+
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.OutputStream
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.DataInputStream
+import java.io.DataOutputStream
+import java.nio.channels.FileChannel
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
+import java.security.MessageDigest
+
+/**
+ * Read-only bridge between a validated legacy authority and its inactive v6 sibling.  It owns the
+ * selection rules so the later activation step receives one immutable fact, not a second chance to
+ * reinterpret receipt history.
+ */
+internal object CanonicalActivation {
+    private val PREPARATION_AUTHORITY = Any()
+    /**
+     * Opaque preparation capability. The binding retains the exact objects selected by [prepare],
+     * in addition to their values, so copying a cut/current or substituting a source cannot create
+     * another valid activation request.
+     */
+    internal class Plan internal constructor(
+        internal val legacySourceHash: CanonicalReceiptBytes,
+        internal val siblingCut: CompactCanonicalCut,
+        internal val current: CanonicalActivationCurrent,
+        internal val receipt: CanonicalActivationPreparationReceipt,
+        private val preparationAuthority: Any? = null,
+    ) {
+        private val binding = Binding(legacySourceHash, siblingCut, current)
+
+        internal fun isExactlyBound() =
+            preparationAuthority === PREPARATION_AUTHORITY &&
+                binding.legacySourceHash === legacySourceHash &&
+                binding.siblingCut === siblingCut &&
+                binding.current === current &&
+                (current !is CanonicalActivationCurrent.Receipt ||
+                    binding.currentSource === current.source)
+
+        private class Binding(
+            val legacySourceHash: CanonicalReceiptBytes,
+            val siblingCut: CompactCanonicalCut,
+            val current: CanonicalActivationCurrent,
+        ) {
+            val currentSource = (current as? CanonicalActivationCurrent.Receipt)?.source
+        }
+    }
+
+    fun prepare(
+        group: SurfaceGroup,
+        directory: File,
+        budget: CanonicalStorageBudget,
+        configuration: SurfaceOwnershipConfiguration = SurfaceOwnershipConfiguration(),
+    ): CanonicalActivationPreparation = try {
+        val legacy = SurfaceOwnershipLegacyCodec.readValidated(group, directory, configuration)
+        val opened = CompactCanonicalStore.openV6(group, directory, budget, configuration)
+        val sibling = (opened as? CompactCanonicalOpenResult.Opened)?.store
+            ?: return CanonicalActivationPreparation.Refused(CanonicalActivationRefusal.SIBLING_INVALID)
+        val cut = sibling.use { it.cut }
+        if (!matchesLegacy(legacy, cut))
+            return CanonicalActivationPreparation.Refused(CanonicalActivationRefusal.SIBLING_MISMATCH)
+
+        var selected: LegacyCanonicalReceipt? = null
+        var scanned = 0L
+        var matching = 0L
+        var refusal: CanonicalActivationRefusal? = null
+        legacy.visitCanonicalReceipts { receipt ->
+            scanned++
+            if (receipt.geometryRevision != legacy.geometryRevision ||
+                receipt.lineageRevision != legacy.lineageRevision
+            ) return@visitCanonicalReceipts
+            if (receipt.nextHighWater != legacy.nextHighWater ||
+                receipt.liveSurfaceCount != legacy.resident.rows
+            ) {
+                refusal = CanonicalActivationRefusal.INCOMPATIBLE_FINAL_CUT
+                return@visitCanonicalReceipts
+            }
+            matching++
+            val prior = selected
+            if (prior == null) {
+                selected = receipt
+                return@visitCanonicalReceipts
+            }
+            refusal = when {
+                prior.commandHash == receipt.commandHash &&
+                    prior.commandFingerprint == receipt.commandFingerprint &&
+                    prior.canonicalHash == receipt.canonicalHash &&
+                    prior.canonicalLength == receipt.canonicalLength -> null
+                prior.commandHash == receipt.commandHash &&
+                    prior.commandFingerprint == receipt.commandFingerprint ->
+                    CanonicalActivationRefusal.CHANGED_RECEIPT
+                prior.commandHash == receipt.commandHash -> CanonicalActivationRefusal.FORKED_IDENTITY
+                prior.canonicalHash == receipt.canonicalHash -> CanonicalActivationRefusal.FORKED_IDENTITY
+                else -> CanonicalActivationRefusal.AMBIGUOUS_CURRENT
+            }
+        }
+        refusal?.let { return CanonicalActivationPreparation.Refused(it) }
+        val current = selected?.let {
+            CanonicalActivationCurrent.Receipt(
+                CanonicalCurrentIdentity(
+                    it.commandHash,
+                    it.commandFingerprint,
+                    it.canonicalLength,
+                    it.canonicalHash,
+                ),
+                CanonicalCurrentSource(it),
+            )
+        } ?: CanonicalActivationCurrent.None
+        CanonicalActivationPreparation.Prepared(
+            Plan(
+                CanonicalReceiptBytes(legacy.sourceHash), cut, current,
+                CanonicalActivationPreparationReceipt(scanned, matching, 512),
+                PREPARATION_AUTHORITY,
+            )
+        )
+    } catch (_: RestoreFailure) {
+        CanonicalActivationPreparation.Refused(CanonicalActivationRefusal.LEGACY_INVALID)
+    } catch (_: Exception) {
+        CanonicalActivationPreparation.Refused(CanonicalActivationRefusal.LEGACY_INVALID)
+    }
+
+    /** Opaque activation plan for a directly-created empty v6 authority. */
+    fun prepareEmptyV6(
+        group: SurfaceGroup,
+        directory: File,
+        budget: CanonicalStorageBudget,
+        baseline: committedEmptyBaseline,
+        configuration: SurfaceOwnershipConfiguration = SurfaceOwnershipConfiguration(
+            seededEmptyBaseline = baseline,
+        ),
+    ): CanonicalActivationPreparation = try {
+        if (baseline.groupIdentity != group.value || configuration.seededEmptyBaseline != baseline) {
+            return CanonicalActivationPreparation.Refused(CanonicalActivationRefusal.SIBLING_MISMATCH)
+        }
+        val opened = CompactCanonicalStore.openV6(group, directory, budget, configuration)
+        val sibling = (opened as? CompactCanonicalOpenResult.Opened)?.store
+            ?: return CanonicalActivationPreparation.Refused(CanonicalActivationRefusal.SIBLING_INVALID)
+        val cut = sibling.use { it.cut }
+        if (
+            cut.group != group || cut.geometryRevision != baseline.geometryRevision ||
+            cut.lineageRevision != baseline.lineageRevision || cut.nextSurfaceIdHighWater != 1L ||
+            cut.liveSurfaceCount != 0 || cut.sourceCount != 0 || cut.supportCount != 0 ||
+            cut.lineageCount != 0 || cut.seededEmptyBaseline != baseline
+        ) return CanonicalActivationPreparation.Refused(CanonicalActivationRefusal.SIBLING_MISMATCH)
+        CanonicalActivationPreparation.Prepared(
+            Plan(
+                cut.sourceHash,
+                cut,
+                CanonicalActivationCurrent.None,
+                CanonicalActivationPreparationReceipt(0, 0, 512),
+                PREPARATION_AUTHORITY,
+            ),
+        )
+    } catch (_: Exception) {
+        CanonicalActivationPreparation.Refused(CanonicalActivationRefusal.SIBLING_INVALID)
+    }
+
+    private fun matchesLegacy(legacy: LegacyCanonicalState, cut: CompactCanonicalCut) =
+        cut.group == legacy.group &&
+            cut.profile == CompactCanonicalStore.PROFILE &&
+            cut.geometryRevision == legacy.geometryRevision &&
+            cut.lineageRevision == legacy.lineageRevision &&
+            cut.nextSurfaceIdHighWater == legacy.nextHighWater &&
+            cut.liveSurfaceCount == legacy.resident.rows &&
+            cut.sourceCount == legacy.sourceCount &&
+            cut.supportCount == legacy.supportCount &&
+            cut.lineageCount == legacy.lineageCount &&
+            cut.seededEmptyBaseline == legacy.baseline &&
+            cut.sourceHash == CanonicalReceiptBytes(legacy.sourceHash)
+}
+
+internal typealias CanonicalActivationPlan = CanonicalActivation.Plan
+
+internal data class CanonicalActivationPreparationReceipt(
+    val scannedReceipts: Long,
+    val finalCutReceipts: Long,
+    /** One fixed descriptor and no history or receipt body. */
+    val retainedBytes: Long,
+)
+
+internal sealed interface CanonicalActivationPreparation {
+    data class Prepared(val plan: CanonicalActivationPlan) : CanonicalActivationPreparation
+    data class Refused(val reason: CanonicalActivationRefusal) : CanonicalActivationPreparation
+}
+
+internal sealed interface CanonicalActivationCurrent {
+    data object None : CanonicalActivationCurrent
+    data class Receipt(
+        val identity: CanonicalCurrentIdentity,
+        val source: CanonicalCurrentSource,
+    ) : CanonicalActivationCurrent
+}
+
+internal data class CanonicalCurrentIdentity(
+    val commandHash: CanonicalReceiptBytes,
+    val commandFingerprint: CanonicalReceiptBytes,
+    val canonicalLength: Long,
+    val canonicalHash: CanonicalReceiptBytes,
+)
+
+/** A source can copy one selected immutable receipt, but never exposes its backing byte array. */
+internal class CanonicalCurrentSource internal constructor(
+    private val copyTo: (OutputStream) -> Unit,
+) {
+    internal constructor(receipt: LegacyCanonicalReceipt) : this(receipt::writeCanonicalTo)
+
+    fun writeTo(output: OutputStream) = copyTo(output)
+
+    internal companion object {
+        fun fromFile(file: File) = CanonicalCurrentSource { output ->
+            FileInputStream(file).use { input ->
+                val scratch = ByteArray(CURRENT_STREAM_BUFFER_BYTES)
+                while (true) {
+                    val count = input.read(scratch)
+                    if (count < 0) break
+                    output.write(scratch, 0, count)
+                }
+            }
+        }
+    }
+}
+
+internal enum class CanonicalActivationRefusal {
+    LEGACY_INVALID,
+    SIBLING_INVALID,
+    SIBLING_MISMATCH,
+    INCOMPATIBLE_FINAL_CUT,
+    AMBIGUOUS_CURRENT,
+    FORKED_IDENTITY,
+    CHANGED_RECEIPT,
+}
+
+/**
+ * The one group-local durable switch from immutable legacy authority to its already prepared v6
+ * sibling.  The selector is deliberately separate from #117's mutation selector: no mutable
+ * generation can be admitted here, and an active selector is sufficient authority to bypass
+ * legacy parsing forever.
+ */
+internal object CanonicalActivationSelector {
+    fun activate(
+        group: SurfaceGroup,
+        parent: File,
+        budget: CanonicalStorageBudget,
+        plan: CanonicalActivationPlan,
+        fault: CanonicalActivationFault? = null,
+    ): CanonicalActivationResult = withGroupLock(parent, group) {
+        if (legacyLeaseCount(parent, group) != 0) {
+            return@withGroupLock CanonicalActivationResult.Refused(
+                CanonicalActivationSelectorRefusal.LEGACY_OWNER_ACTIVE,
+            )
+        }
+        if (!reconcileReclaimsLocked(group, parent, budget) || !reconcileAttemptsLocked(group, parent, budget) || !reconcileAcknowledgementsLocked(group, parent, budget) ||
+            !reconcileAdjacentTransactionsLocked(group, parent, budget)) {
+            return@withGroupLock CanonicalActivationResult.Refused(
+                CanonicalActivationSelectorRefusal.DURABILITY_FAILURE,
+            )
+        }
+        val existing = reopenLocked(group, parent, budget)
+        when (existing) {
+            is CanonicalActivationResult.Active -> return@withGroupLock replay(existing.state, plan)
+            is CanonicalActivationResult.Refused -> return@withGroupLock existing
+            CanonicalActivationResult.Legacy -> Unit
+            CanonicalActivationResult.UnknownAfterSwitch -> return@withGroupLock CanonicalActivationResult.Refused(
+                CanonicalActivationSelectorRefusal.DURABILITY_FAILURE,
+            )
+        }
+        if (!validPlan(group, parent, budget, plan)) {
+            return@withGroupLock CanonicalActivationResult.Refused(CanonicalActivationSelectorRefusal.INVALID_PLAN)
+        }
+
+        val root = ActivationRoot(
+            plan.siblingCut,
+            (plan.current as? CanonicalActivationCurrent.Receipt)?.let { CurrentRecord.Unacknowledged(it.identity) },
+        )
+        val rootBytes = root.bytes()
+        val rootHash = digest(rootBytes)
+        val rootTarget = rootFile(parent, group, rootHash)
+        val currentTarget = currentFile(parent, group, plan.current)
+        val slotTarget = slotFile(parent, group, 0)
+        val selectorTarget = selectorFile(parent, group)
+        if (slotTarget.exists() || selectorTarget.exists()) {
+            return@withGroupLock CanonicalActivationResult.Refused(
+                CanonicalActivationSelectorRefusal.DURABILITY_FAILURE,
+            )
+        }
+        val unit = try { budget.allocationUnitBytes(parent) } catch (_: Exception) {
+            return@withGroupLock CanonicalActivationResult.Refused(CanonicalActivationSelectorRefusal.DURABILITY_FAILURE)
+        }
+        val attempt = ActivationAttempt(
+            group.hash.hex(),
+            rootTarget.name,
+            currentTarget?.name,
+            slotTarget.name,
+            rootTarget.exists(),
+            currentTarget?.exists() == true,
+        )
+        val attemptBytes = attempt.bytes()
+        val attemptId = digest(attemptBytes)
+        val attemptTarget = attemptFile(parent, group, attemptId)
+        val commitBytes = listOf(
+            rootBytes.size.toLong(), ActivationSlot.BYTES.toLong(), ActivationSelector.BYTES.toLong(),
+            currentLength(plan.current),
+        ).fold(0L) { total, bytes -> Math.addExact(total, round(bytes, unit)) }
+        val maximum = listOf(attemptBytes.size.toLong(), 1L, 1L, 1L).fold(commitBytes) { total, bytes ->
+            Math.addExact(total, round(bytes, unit))
+        }
+        var reservation: Any? = null
+        var switched = false
+        try {
+            inject(fault, CanonicalActivationFault.BEFORE_RESERVATION)
+            reservation = budget.reserveActivationAttempt(
+                group.hash.hex(),
+                attemptId.toByteArray().hex(),
+                if (rootTarget.exists()) budget.allocatedBytes(rootTarget) else 0L,
+                0L,
+                0L,
+                commitBytes,
+                maximum,
+            )
+                ?: return@withGroupLock CanonicalActivationResult.Refused(CanonicalActivationSelectorRefusal.QUOTA_REFUSED)
+            inject(fault, CanonicalActivationFault.AFTER_RESERVATION)
+            writeAttempt(attemptTarget, attemptBytes)
+            sync(parent, CanonicalActivationSyncStage.ATTEMPT)
+            inject(fault, CanonicalActivationFault.AFTER_ATTEMPT_SYNC)
+            if (currentTarget != null) {
+                inject(fault, CanonicalActivationFault.BEFORE_CURRENT_WRITE)
+                writeCurrent(currentTarget, plan.current as CanonicalActivationCurrent.Receipt, fault)
+                inject(fault, CanonicalActivationFault.AFTER_CURRENT_SYNC)
+            }
+            inject(fault, CanonicalActivationFault.BEFORE_ROOT_WRITE)
+            writeImmutable(rootTarget, rootBytes, fault == CanonicalActivationFault.DURING_ROOT_WRITE)
+            inject(fault, CanonicalActivationFault.AFTER_ROOT_SYNC)
+            val slot = ActivationSlot(1L, rootHash)
+            inject(fault, CanonicalActivationFault.BEFORE_SLOT_WRITE)
+            atomicReplace(slotTarget, slot.bytes(), fault == CanonicalActivationFault.DURING_SLOT_WRITE)
+            inject(fault, CanonicalActivationFault.AFTER_SLOT_SYNC)
+            // Persist every prerequisite target name before the selector is allowed to name it.
+            // Android/Linux opens and fsyncs the directory. The Windows host adapter cannot open
+            // directory descriptors, and reports that limitation through the ordered test receipt.
+            inject(fault, CanonicalActivationFault.BEFORE_PREREQUISITE_PARENT_SYNC)
+            sync(parent, CanonicalActivationSyncStage.PREREQUISITES)
+            inject(fault, CanonicalActivationFault.AFTER_PREREQUISITE_PARENT_SYNC)
+            inject(fault, CanonicalActivationFault.PROCESS_CRASH_AFTER_PREREQUISITE_SYNC)
+            inject(fault, CanonicalActivationFault.BEFORE_SELECTOR_SWITCH)
+            atomicReplace(
+                selectorTarget,
+                ActivationSelector(0, 1L, rootHash).bytes(),
+                fault == CanonicalActivationFault.DURING_SELECTOR_WRITE,
+            )
+            switched = true
+            inject(fault, CanonicalActivationFault.AFTER_SELECTOR_SWITCH)
+            inject(fault, CanonicalActivationFault.BEFORE_PARENT_SYNC)
+            sync(parent, CanonicalActivationSyncStage.SELECTOR)
+            inject(fault, CanonicalActivationFault.AFTER_PARENT_SYNC)
+            val actual = selectedActivationBytes(
+                rootTarget, currentTarget, slotTarget, selectorTarget, budget,
+            )
+            require(actual == commitBytes)
+            inject(fault, CanonicalActivationFault.BEFORE_BUDGET_COMMIT)
+            budget.commit(requireNotNull(reservation), actual)
+            reservation = null
+            inject(fault, CanonicalActivationFault.AFTER_BUDGET_COMMIT)
+            require(attemptTarget.delete())
+            sync(parent, CanonicalActivationSyncStage.RECOVERY)
+            inject(fault, CanonicalActivationFault.BEFORE_CLEANUP)
+            cleanupLegacyCandidates(parent, group)
+            inject(fault, CanonicalActivationFault.AFTER_CLEANUP)
+            reopenLocked(group, parent, budget)
+        } catch (_: Exception) {
+            if (switched) CanonicalActivationResult.UnknownAfterSwitch
+            else CanonicalActivationResult.Refused(CanonicalActivationSelectorRefusal.DURABILITY_FAILURE)
+        } finally {
+            if (!fault.isProcessCrash()) reservation?.let { token ->
+                try {
+                    if (switched) {
+                        budget.commit(token, selectedActivationBytes(
+                            rootTarget, currentTarget, slotTarget, selectorTarget, budget,
+                        ))
+                    } else {
+                        cleanupAttempt(parent, group, attempt, attemptTarget, emptySet())
+                        sync(parent, CanonicalActivationSyncStage.RECOVERY)
+                        budget.release(token)
+                    }
+                } catch (_: Exception) { }
+            }
+            if (!switched && !fault.isProcessCrash()) cleanupLegacyCandidates(parent, group)
+        }
+    }
+
+    fun reopen(
+        group: SurfaceGroup,
+        parent: File,
+        budget: CanonicalStorageBudget,
+    ): CanonicalActivationResult = withGroupLock(parent, group) {
+        if (!reconcileReclaimsLocked(group, parent, budget) || !reconcileAttemptsLocked(group, parent, budget) || !reconcileAcknowledgementsLocked(group, parent, budget) ||
+            !reconcileAdjacentTransactionsLocked(group, parent, budget)) {
+            CanonicalActivationResult.Refused(CanonicalActivationSelectorRefusal.DURABILITY_FAILURE)
+        } else {
+            reopenLocked(group, parent, budget)
+        }
+    }
+
+    /** Revalidates only activation/current credentials for an owned composed cut. */
+    fun reopenAuthenticatedCurrent(
+        group: SurfaceGroup,
+        parent: File,
+        budget: CanonicalStorageBudget,
+        cut: CompactCanonicalCut,
+    ): CanonicalActivationResult = withGroupLock(parent, group) {
+        reopenLocked(group, parent, budget, authenticatedCut = cut)
+    }
+
+    /**
+     * Publishes an ACK-only activation root.  The semantic cut is copied
+     * byte-for-byte; only the retained-current ownership changes.  The second
+     * slot means a pre-selector crash still has a complete old root to reopen.
+     */
+    fun acknowledge(
+        group: SurfaceGroup,
+        parent: File,
+        budget: CanonicalStorageBudget,
+        acknowledgement: CanonicalAcknowledgement,
+        fault: CanonicalAcknowledgementFault? = null,
+        authenticatedCut: CompactCanonicalCut? = null,
+    ): CanonicalAcknowledgementResult = withGroupLock(parent, group) {
+        if (!reconcileReclaimsLocked(group, parent, budget) || !reconcileAttemptsLocked(group, parent, budget) || !reconcileAcknowledgementsLocked(group, parent, budget) ||
+            !reconcileAdjacentTransactionsLocked(group, parent, budget)) {
+            return@withGroupLock CanonicalAcknowledgementResult.NoOp(CanonicalAcknowledgementNoOp.DURABILITY_FAILURE)
+        }
+        val selectorTarget = selectorFile(parent, group)
+        val selector = ActivationSelector.read(selectorTarget)
+            ?: return@withGroupLock CanonicalAcknowledgementResult.NoOp(CanonicalAcknowledgementNoOp.NO_CURRENT)
+        val oldRoot = ActivationRoot.read(rootFile(parent, group, selector.rootHash), selector.rootHash)
+            ?: return@withGroupLock CanonicalAcknowledgementResult.NoOp(CanonicalAcknowledgementNoOp.DURABILITY_FAILURE)
+        if (authenticatedCut != null && authenticatedCut != oldRoot.cut)
+            return@withGroupLock CanonicalAcknowledgementResult.NoOp(CanonicalAcknowledgementNoOp.DURABILITY_FAILURE)
+        val expected = oldRoot.current
+            ?: return@withGroupLock CanonicalAcknowledgementResult.NoOp(CanonicalAcknowledgementNoOp.NO_CURRENT)
+        if (oldRoot.cut.geometryRevision != acknowledgement.geometryRevision ||
+            oldRoot.cut.lineageRevision != acknowledgement.lineageRevision
+        ) return@withGroupLock CanonicalAcknowledgementResult.NoOp(CanonicalAcknowledgementNoOp.STALE_REVISION)
+        if (expected.identity.commandHash != acknowledgement.commandHash)
+            return@withGroupLock CanonicalAcknowledgementResult.NoOp(CanonicalAcknowledgementNoOp.COMMAND_MISMATCH)
+        if (expected is CurrentRecord.Acknowledged) {
+            val rawReopened = reopenLocked(group, parent, budget, authenticatedCut = authenticatedCut)
+            val reopened = rawReopened as? CanonicalActivationResult.Active
+                ?: error("ack reopen failed: $rawReopened")
+            return@withGroupLock CanonicalAcknowledgementResult.Idempotent(reopened.state)
+        }
+        val oldCurrent = currentFile(parent, group, expected)
+        if (!verifyCurrent(oldCurrent, expected.identity))
+            return@withGroupLock CanonicalAcknowledgementResult.NoOp(CanonicalAcknowledgementNoOp.DURABILITY_FAILURE)
+
+        val nextRoot = ActivationRoot(oldRoot.cut, CurrentRecord.Acknowledged(expected.identity))
+        val nextRootBytes = nextRoot.bytes()
+        val nextRootHash = digest(nextRootBytes)
+        val nextRootTarget = rootFile(parent, group, nextRootHash)
+        val nextSlot = 1 - selector.slot
+        val nextSlotTarget = slotFile(parent, group, nextSlot)
+        val obsoleteRootName = obsoleteRootName(parent, group, nextSlot, selector.rootHash, nextRootHash)
+        val rootBefore = nextRootTarget.takeIf(File::exists)?.let(budget::allocatedBytes) ?: 0L
+        val slotBefore = nextSlotTarget.takeIf(File::exists)?.let(budget::allocatedBytes) ?: 0L
+        val selectorBefore = selectorTarget.takeIf(File::exists)?.let(budget::allocatedBytes) ?: 0L
+        val unit = budget.allocationUnitBytes(parent)
+        val commitBytes = Math.max(0L, round(nextRootBytes.size.toLong(), unit) - rootBefore) +
+            Math.max(0L, round(ActivationSlot.BYTES.toLong(), unit) - slotBefore) +
+            Math.max(0L, round(ActivationSelector.BYTES.toLong(), unit) - selectorBefore)
+        val reservationMaximum = listOf(nextRootBytes.size.toLong(), ActivationSlot.BYTES.toLong(), ActivationSelector.BYTES.toLong(), 1L)
+            .fold(0L) { total, bytes -> Math.addExact(total, round(bytes, unit)) }
+        val attempt = AcknowledgementAttempt(
+            group.hash.hex(), oldCurrent.name, nextRootTarget.name, nextSlotTarget.name,
+            selectorTarget.name, obsoleteRootName, nextRootTarget.exists(), nextSlotTarget.exists(),
+        )
+        val attemptTarget = acknowledgementAttemptFile(parent, group, digest(attempt.bytes()))
+        var switched = false
+        var token: Any? = null
+        var reservation: CanonicalPointerReservation? = null
+        try {
+            inject(fault, CanonicalAcknowledgementFault.BEFORE_ATTEMPT)
+            token = budget.reserveActivationAttempt(
+                acknowledgementBudgetGroup(group), nextRootHash.toByteArray().hex(), rootBefore,
+                slotBefore, selectorBefore, commitBytes, reservationMaximum,
+            ) ?: return@withGroupLock CanonicalAcknowledgementResult.NoOp(CanonicalAcknowledgementNoOp.DURABILITY_FAILURE)
+            reservation = CanonicalPointerReservation(
+                requireNotNull(token), nextRootHash.toByteArray().hex(), nextSlot,
+                rootBefore, slotBefore, selectorBefore, commitBytes,
+            )
+            writeAcknowledgementAttempt(attemptTarget, attempt.bytes())
+            sync(parent, CanonicalActivationSyncStage.ACK_ATTEMPT)
+            inject(fault, CanonicalAcknowledgementFault.AFTER_ATTEMPT_SYNC)
+            inject(fault, CanonicalAcknowledgementFault.BEFORE_ROOT_WRITE)
+            writeImmutable(nextRootTarget, nextRootBytes, false)
+            sync(parent, CanonicalActivationSyncStage.ACK_ROOT)
+            inject(fault, CanonicalAcknowledgementFault.AFTER_ROOT_SYNC)
+            inject(fault, CanonicalAcknowledgementFault.PROCESS_CRASH_AFTER_ROOT_SYNC)
+            inject(fault, CanonicalAcknowledgementFault.BEFORE_SLOT_WRITE)
+            atomicReplace(nextSlotTarget, ActivationSlot(selector.revision + 1, nextRootHash).bytes(), false)
+            sync(parent, CanonicalActivationSyncStage.ACK_SLOT)
+            inject(fault, CanonicalAcknowledgementFault.AFTER_SLOT_SYNC)
+            inject(fault, CanonicalAcknowledgementFault.BEFORE_SELECTOR_SWITCH)
+            atomicReplace(selectorTarget, ActivationSelector(nextSlot, selector.revision + 1, nextRootHash).bytes(), false)
+            switched = true
+            inject(fault, CanonicalAcknowledgementFault.AFTER_SELECTOR_SWITCH)
+            inject(fault, CanonicalAcknowledgementFault.PROCESS_CRASH_AFTER_SELECTOR_SWITCH)
+            inject(fault, CanonicalAcknowledgementFault.BEFORE_PARENT_SYNC)
+            sync(parent, CanonicalActivationSyncStage.ACK_SELECTOR)
+            budget.commitActivationAttempt(requireNotNull(reservation)); token = null; reservation = null
+            inject(fault, CanonicalAcknowledgementFault.AFTER_PARENT_SYNC)
+            // The new root is authoritative before the payload is touched.
+            inject(fault, CanonicalAcknowledgementFault.BEFORE_CLEANUP)
+            reclaimArtifacts(
+                group, parent, budget, "ack-${nextRootHash.toByteArray().hex()}",
+                listOfNotNull(oldCurrent, obsoleteRootName?.let { File(parent, it) }),
+            ) { stage -> injectAcknowledgementReclaim(fault, stage) }
+            require(!attemptTarget.exists() || attemptTarget.delete())
+            sync(parent, CanonicalActivationSyncStage.RECOVERY)
+            inject(fault, CanonicalAcknowledgementFault.AFTER_CLEANUP)
+            val reopened = reopenLocked(group, parent, budget, authenticatedCut = authenticatedCut) as? CanonicalActivationResult.Active
+                ?: return@withGroupLock CanonicalAcknowledgementResult.NoOp(CanonicalAcknowledgementNoOp.DURABILITY_FAILURE)
+            CanonicalAcknowledgementResult.Acknowledged(reopened.state)
+        } catch (failure: Exception) {
+            if (!fault.isAcknowledgementProcessCrash() && !switched) {
+                cleanupAcknowledgementAttempt(parent, group, attempt, attemptTarget, emptySet())
+                sync(parent, CanonicalActivationSyncStage.RECOVERY)
+                reservation?.let(budget::releaseActivationAttempt); token = null; reservation = null
+            } else if (!fault.isAcknowledgementProcessCrash() && switched) {
+                reservation?.let(budget::commitActivationAttempt); token = null; reservation = null
+            }
+            CanonicalAcknowledgementResult.NoOp(CanonicalAcknowledgementNoOp.DURABILITY_FAILURE)
+        }
+    }
+
+    /** Owner-issued one-shot admission from one durable ACK to one exact #117 successor. */
+    fun commitAdjacent(
+        group: SurfaceGroup,
+        parent: File,
+        budget: CanonicalStorageBudget,
+        plan: PreparedCanonicalMutation,
+        boundBase: CanonicalStateView,
+        faults: CanonicalCommitFaults = CanonicalCommitFaults(),
+        authenticatedPrior: CanonicalPublishedCommit? = null,
+    ): CanonicalAdjacentCommitResult = withGroupLock(parent, group) {
+        if (plan.lifecycle() != PreparedMutationLifecycle.IN_FLIGHT)
+            return@withGroupLock adjacentRefusal(CanonicalAdjacentCommitRefusal.PLAN_DISCARDED)
+        if (boundBase.cut.group != group || boundBase.cut.profile != CompactCanonicalStore.PROFILE)
+            return@withGroupLock adjacentRefusal(CanonicalAdjacentCommitRefusal.STALE_CUT)
+        if (!reconcileReclaimsLocked(group, parent, budget) || !reconcileAttemptsLocked(group, parent, budget) || !reconcileAcknowledgementsLocked(group, parent, budget) ||
+            !reconcileAdjacentTransactionsLocked(group, parent, budget, boundBase = boundBase))
+            return@withGroupLock adjacentRefusal(CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
+        val selector = ActivationSelector.read(selectorFile(parent, group))
+            ?: return@withGroupLock adjacentRefusal(CanonicalAdjacentCommitRefusal.NO_ACTIVE_AUTHORITY)
+        val root = ActivationRoot.read(rootFile(parent, group, selector.rootHash), selector.rootHash)
+            ?: return@withGroupLock adjacentRefusal(CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
+        val acknowledged = when (val current = root.current) {
+            null -> null
+            is CurrentRecord.Acknowledged -> current.identity
+            is CurrentRecord.Unacknowledged ->
+                return@withGroupLock adjacentRefusal(
+                    CanonicalAdjacentCommitRefusal.CURRENT_UNACKNOWLEDGED,
+                    PreparedMutationDisposition.RETRYABLE,
+                )
+        }
+        if (plan.sourceCut != root.cut)
+            return@withGroupLock adjacentRefusal(CanonicalAdjacentCommitRefusal.STALE_CUT)
+        if (!observeAdjacentOwnership(boundBase, CanonicalAdjacentOwnershipStage.ADMISSION, plan))
+            return@withGroupLock adjacentRefusal(
+                CanonicalAdjacentCommitRefusal.DUPLICATE_RESIDENT_AUTHORITY,
+                PreparedMutationDisposition.RETRYABLE,
+            )
+        val attempt = AdjacentTransaction(
+            group.hash.hex(), selector.rootHash, plan.sourceCut.rootHash, plan.commandHash,
+            plan.commandFingerprint, acknowledged,
+            obsoleteRootName(parent, group, 1 - selector.slot, selector.rootHash, null),
+        )
+        val target = adjacentAttemptFile(parent, group)
+        try {
+            if (!target.exists()) writeAcknowledgementAttempt(target, attempt.bytes())
+            else require(AdjacentTransaction.read(target, group.hash.hex()) == attempt)
+            sync(parent, CanonicalActivationSyncStage.ADJACENT_INTENT)
+            if (!observeAdjacentOwnership(boundBase, CanonicalAdjacentOwnershipStage.COMMIT, plan))
+                return@withGroupLock adjacentRefusal(CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
+            val store = CanonicalCommitStore.open(parent, budget)
+                ?: return@withGroupLock adjacentRefusal(CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
+            var successor: CanonicalPublishedCommit? = null
+            store.use {
+                when (val committed = store.commit(
+                    plan, boundBase, faults, acknowledged?.toIntentReceipt(), authenticatedPrior,
+                )) {
+                    is CanonicalCommitResult.Refused -> {
+                        require(target.delete()); sync(parent, CanonicalActivationSyncStage.RECOVERY)
+                        return@withGroupLock adjacentRefusal(CanonicalAdjacentCommitRefusal.COMMIT_REFUSED, commit = committed)
+                    }
+                    is CanonicalCommitResult.Committed -> successor = committed.commit
+                    is CanonicalCommitResult.UnknownAfterSwitch -> Unit
+                }
+            }
+            if (!observeAdjacentOwnership(boundBase, CanonicalAdjacentOwnershipStage.RECONCILE, plan) ||
+                !reconcileAdjacentTransactionsLocked(
+                    group, parent, budget, faults.adjacent, boundBase, successor,
+                ))
+                return@withGroupLock adjacentRefusal(CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
+            if (!observeAdjacentOwnership(boundBase, CanonicalAdjacentOwnershipStage.REOPEN, plan))
+                return@withGroupLock adjacentRefusal(CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
+            val active = reopenLocked(
+                group, parent, budget, boundBase, successor?.view?.cut,
+            ) as? CanonicalActivationResult.Active
+                ?: return@withGroupLock adjacentRefusal(CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
+            CanonicalAdjacentCommitResult.Committed(active.state, successor)
+        } catch (_: Exception) {
+            adjacentRefusal(CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE)
+        }
+    }
+
+    private fun adjacentRefusal(
+        reason: CanonicalAdjacentCommitRefusal,
+        disposition: PreparedMutationDisposition = PreparedMutationDisposition.TERMINAL,
+        commit: CanonicalCommitResult.Refused? = null,
+    ) = CanonicalAdjacentCommitResult.Refused(reason, commit, disposition)
+
+    /** A prepared adjacent mutation borrows exactly one live compact authority until completion. */
+    private fun observeAdjacentOwnership(
+        base: CanonicalStateView,
+        stage: CanonicalAdjacentOwnershipStage,
+        plan: PreparedCanonicalMutation,
+    ): Boolean {
+        val resident = (base.generationZeroAuthority as? CompactCanonicalStore)?.residentOwnership()
+            ?: CanonicalResidentOwnership(0, 0L)
+        val observation = CanonicalAdjacentOwnershipObservation(
+            stage, resident.liveStoreCount, resident.retainedBytes,
+            plan.work.retainedPlanBytes, plan.work.writerScratchBytes,
+            plan.work.constructionPeakBytes,
+        )
+        CanonicalActivationTestHooks.onAdjacentOwnership?.invoke(observation)
+        return if (base.generationZeroAuthority is ScalarCanonicalAuthority) {
+            resident.liveStoreCount == 0 && resident.retainedBytes == 0L
+        } else resident.liveStoreCount == 1 && resident.retainedBytes == base.retainedMemoryReceipt().residentTotalBytes
+    }
+
+    /** Shared selector/restore lock used by every directory-backed ownership opener. */
+    internal fun <T> withGroupLock(parent: File, group: SurfaceGroup, block: () -> T): T {
+        val key = parent.absoluteFile.toPath().normalize().toString() + ':' + group.value
+        val lock = synchronized(locks) { locks.getOrPut(key) { Any() } }
+        return synchronized(lock, block)
+    }
+
+    /** Registers a live writable legacy owner. Must be called while [withGroupLock] is held. */
+    internal fun acquireLegacyLease(parent: File, group: SurfaceGroup): () -> Unit {
+        val key = lockKey(parent, group)
+        check(!selectorFile(parent, group).exists())
+        synchronized(legacyLeases) { legacyLeases[key] = (legacyLeases[key] ?: 0) + 1 }
+        var released = false
+        return {
+            withGroupLock(parent, group) {
+                if (!released) {
+                    released = true
+                    synchronized(legacyLeases) {
+                        val remaining = requireNotNull(legacyLeases[key]) - 1
+                        if (remaining == 0) legacyLeases.remove(key) else legacyLeases[key] = remaining
+                    }
+                }
+            }
+        }
+    }
+
+    private fun legacyLeaseCount(parent: File, group: SurfaceGroup) =
+        synchronized(legacyLeases) { legacyLeases[lockKey(parent, group)] ?: 0 }
+
+    private fun lockKey(parent: File, group: SurfaceGroup) =
+        parent.absoluteFile.toPath().normalize().toString() + ':' + group.value
+
+    /** A legacy-only caller must never step around a durable v6 authority. */
+    fun hasDurableSelector(group: SurfaceGroup, parent: File): Boolean =
+        selectorFile(parent, group).exists() || parent.listFiles().orEmpty().any {
+            it.name.startsWith("canonical-surface-activation-${group.hash.hex()}-attempt-") && it.name.endsWith(".attempt")
+        }
+
+    /** Finishes exact-byte deletion journals before any authority is exposed. */
+    private fun reconcileReclaimsLocked(
+        group: SurfaceGroup,
+        parent: File,
+        budget: CanonicalStorageBudget,
+    ): Boolean = try {
+        val prefix = "canonical-surface-activation-${group.hash.hex()}-reclaim-"
+        parent.listFiles().orEmpty()
+            .filter { it.name.startsWith(prefix) && it.name.endsWith(".attempt") }
+            .sortedBy(File::getName)
+            .forEach { target ->
+                val id = target.name.removePrefix(prefix).removeSuffix(".attempt")
+                val attempt = ReclaimAttempt.read(target, id, group.hash.hex()) ?: return false
+                executeReclaim(parent, budget, target, attempt) {}
+            }
+        true
+    } catch (_: Exception) { false }
+
+    private fun reclaimArtifacts(
+        group: SurfaceGroup,
+        parent: File,
+        budget: CanonicalStorageBudget,
+        purpose: String,
+        candidates: List<File>,
+        cut: (ReclaimStage) -> Unit = {},
+    ) {
+        val id = digest("${group.hash.hex()}:$purpose".encodeToByteArray()).toByteArray().hex()
+        val target = reclaimAttemptFile(parent, group, id)
+        val attempt = if (target.exists()) {
+            ReclaimAttempt.read(target, id, group.hash.hex()) ?: error("corrupt activation reclaim")
+        } else {
+            val entries = candidates.distinctBy { it.absoluteFile.toPath().normalize() }
+                .filter(File::exists)
+                .map { file ->
+                    require(file.isFile && file.parentFile != null)
+                    val relative = parent.toPath().relativize(file.toPath()).toString().replace('\\', '/')
+                    require(relative.isSafeRelativeActivationPath())
+                    ReclaimEntry(relative, budget.allocatedBytes(file).also { require(it > 0L) })
+                }
+            if (entries.isEmpty()) return
+            ReclaimAttempt(group.hash.hex(), id, false, entries).also { value ->
+                writeReclaimAttempt(target, value.bytes())
+                sync(parent, CanonicalActivationSyncStage.RECLAIM_INTENT)
+                cut(ReclaimStage.AFTER_INTENT_SYNC)
+            }
+        }
+        executeReclaim(parent, budget, target, attempt, cut)
+    }
+
+    private fun executeReclaim(
+        parent: File,
+        budget: CanonicalStorageBudget,
+        target: File,
+        attempt: ReclaimAttempt,
+        cut: (ReclaimStage) -> Unit,
+    ) {
+        val total = attempt.entries.fold(0L) { sum, entry -> Math.addExact(sum, entry.bytes) }
+        if (!attempt.complete) {
+            attempt.entries.forEach { entry ->
+                require(entry.path.isSafeRelativeActivationPath())
+                val file = File(parent, entry.path)
+                if (file.exists()) {
+                    require(file.isFile && budget.allocatedBytes(file) == entry.bytes && file.delete())
+                }
+            }
+            sync(parent, CanonicalActivationSyncStage.RECLAIM_DELETE)
+            cut(ReclaimStage.AFTER_DELETE_SYNC)
+            budget.reclaimCommittedBytesOnce(attempt.reclaimId, total)
+            cut(ReclaimStage.AFTER_LEDGER)
+            atomicReplace(target, attempt.copy(complete = true).bytes(), false)
+            sync(parent, CanonicalActivationSyncStage.RECLAIM_COMPLETE)
+        }
+        budget.forgetCommittedReclaim(attempt.reclaimId)
+        require(!target.exists() || target.delete())
+        sync(parent, CanonicalActivationSyncStage.RECOVERY)
+    }
+
+    private fun obsoleteRootName(
+        parent: File,
+        group: SurfaceGroup,
+        overwrittenSlot: Int,
+        activeRoot: CanonicalReceiptBytes,
+        nextRoot: CanonicalReceiptBytes?,
+    ): String? {
+        val rootHash = ActivationSlot.read(slotFile(parent, group, overwrittenSlot))?.rootHash ?: return null
+        if (rootHash == activeRoot || rootHash == nextRoot) return null
+        val target = rootFile(parent, group, rootHash)
+        return target.name.takeIf { ActivationRoot.read(target, rootHash) != null }
+    }
+
+    /** Reconciles durable attempts before authority selection; release always follows deletion fsync. */
+    private fun reconcileAttemptsLocked(
+        group: SurfaceGroup,
+        parent: File,
+        budget: CanonicalStorageBudget,
+    ): Boolean = try {
+        val prefix = "canonical-surface-activation-${group.hash.hex()}-attempt-"
+        val reservations = budget.activationAttempts(group.hash.hex())
+        val liveIds = reservations.mapTo(hashSetOf()) { it.publicationId }
+        for (reservation in reservations) {
+            val target = attemptFile(parent, group, CanonicalReceiptBytes(hex(reservation.publicationId)))
+            if (!target.exists()) {
+                // Reservation landed before its manifest; therefore no named activation artifact
+                // could have been written by this attempt.
+                budget.releaseActivationAttempt(reservation)
+                continue
+            }
+            val attempt = ActivationAttempt.read(target, reservation.publicationId, group.hash.hex())
+                ?: return false
+            val reachable = selectedReachableNames(parent, group) ?: return false
+            if (attempt.rootName in reachable) {
+                budget.commitActivationAttempt(reservation)
+                require(target.delete())
+                sync(parent, CanonicalActivationSyncStage.RECOVERY)
+            } else {
+                cleanupAttempt(parent, group, attempt, target, reachable)
+                sync(parent, CanonicalActivationSyncStage.RECOVERY)
+                budget.releaseActivationAttempt(reservation)
+            }
+        }
+        // A crash after commit but before manifest deletion leaves no reservation. Its manifest is
+        // still sufficient to preserve reachable authority and remove itself idempotently.
+        parent.listFiles().orEmpty()
+            .filter { it.name.startsWith(prefix) && it.name.endsWith(".attempt") }
+            .forEach { target ->
+                val id = target.name.removePrefix(prefix).removeSuffix(".attempt")
+                if (id !in liveIds) {
+                    val attempt = ActivationAttempt.read(target, id, group.hash.hex()) ?: return false
+                    cleanupAttempt(parent, group, attempt, target, selectedReachableNames(parent, group) ?: return false)
+                    sync(parent, CanonicalActivationSyncStage.RECOVERY)
+                }
+            }
+        true
+    } catch (_: Exception) {
+        false
+    }
+
+    /** Replays the ACK's tiny intent journal before exposing either root. */
+    private fun reconcileAcknowledgementsLocked(
+        group: SurfaceGroup,
+        parent: File,
+        budget: CanonicalStorageBudget,
+    ): Boolean = try {
+        val prefix = "canonical-surface-activation-${group.hash.hex()}-ack-"
+        val reservations = budget.activationAttempts(acknowledgementBudgetGroup(group)).associateBy { it.publicationId }.toMutableMap()
+        parent.listFiles().orEmpty().filter { it.name.startsWith(prefix) && it.name.endsWith(".attempt") }
+            .forEach { target ->
+                val id = target.name.removePrefix(prefix).removeSuffix(".attempt")
+                val attempt = AcknowledgementAttempt.read(target, id, group.hash.hex()) ?: return false
+                val selected = ActivationSelector.read(selectorFile(parent, group))
+                val selectedRoot = selected?.let { rootFile(parent, group, it.rootHash).name }
+                val nextHash = attempt.nextRootName.removePrefix("canonical-surface-activation-${group.hash.hex()}-root-").removeSuffix(".root")
+                val reservation = reservations.remove(nextHash)
+                if (selectedRoot == attempt.nextRootName) {
+                    reservation?.let { value ->
+                        val actual = incrementalBytes(budget, File(parent, attempt.nextRootName), value.rootBeforeBytes) +
+                            incrementalBytes(budget, File(parent, attempt.nextSlotName), value.slotBeforeBytes) +
+                            incrementalBytes(budget, File(parent, attempt.selectorName), value.selectorBeforeBytes)
+                        require(actual == value.commitBytes)
+                        budget.commitActivationAttempt(value)
+                    }
+                    reclaimArtifacts(
+                        group, parent, budget, "ack-$nextHash",
+                        listOfNotNull(File(parent, attempt.oldCurrentName), attempt.obsoleteRootName?.let { File(parent, it) }),
+                    )
+                    require(target.delete())
+                    sync(parent, CanonicalActivationSyncStage.RECOVERY)
+                } else {
+                    cleanupAcknowledgementAttempt(parent, group, attempt, target, emptySet())
+                    reservation?.let(budget::releaseActivationAttempt)
+                }
+                sync(parent, CanonicalActivationSyncStage.RECOVERY)
+            }
+        reservations.values.forEach(budget::releaseActivationAttempt)
+        true
+    } catch (_: Exception) { false }
+
+    /** Forward-repairs a crossed #117 selector before activation authority is exposed. */
+    private fun reconcileAdjacentTransactionsLocked(
+        group: SurfaceGroup,
+        parent: File,
+        budget: CanonicalStorageBudget,
+        fault: CanonicalAdjacentFault? = null,
+        boundBase: CanonicalStateView? = null,
+        publishedSuccessor: CanonicalPublishedCommit? = null,
+    ): Boolean = try {
+        val target = adjacentAttemptFile(parent, group)
+        if (!target.exists()) return true
+        val attempt = AdjacentTransaction.read(target, group.hash.hex()) ?: return false
+        val activationSelector = ActivationSelector.read(selectorFile(parent, group)) ?: return false
+        val activationRoot = ActivationRoot.read(rootFile(parent, group, activationSelector.rootHash), activationSelector.rootHash) ?: return false
+        if (activationSelector.rootHash != attempt.activationRootHash) {
+            // The exact successor is already authoritative; only durable cleanup remains.
+            val retained = activationRoot.current as? CurrentRecord.Unacknowledged ?: return false
+            val reservation = budget.activationAttempts(adjacentBudgetGroup(group))
+                .singleOrNull { it.publicationId == activationSelector.rootHash.toByteArray().hex() }
+            reservation?.let { value ->
+                val currentTarget = currentFile(parent, group, retained)
+                val actual = Math.max(0L,
+                    budget.allocatedBytes(currentTarget) + budget.allocatedBytes(rootFile(parent, group, activationSelector.rootHash)) - value.rootBeforeBytes,
+                ) + incrementalBytes(budget, slotFile(parent, group, activationSelector.slot), value.slotBeforeBytes) +
+                    incrementalBytes(budget, selectorFile(parent, group), value.selectorBeforeBytes)
+                require(actual == value.commitBytes)
+                sync(parent, CanonicalActivationSyncStage.RECOVERY)
+                budget.commitActivationAttempt(value)
+            }
+            val generationZero = boundBase ?: (CompactCanonicalStore.openV6(group, parent, budget) as? CompactCanonicalOpenResult.Opened)?.store ?: return false
+            try {
+                val base = generationZero
+                val store = CanonicalCommitStore.open(parent, budget) ?: return false
+                store.use {
+                    val selected = store.reopen(base, retained.identity.toIntentReceipt()) as? CanonicalReopenResult.Selected ?: return false
+                    selected.commit.use { commit ->
+                        val latest = commit.roots.lastOrNull() ?: return false
+                        val duplicate = File(File(parent, latest.generationDirectory), CanonicalCowGeneration.CURRENT_UNACKED_FILE)
+                        if (duplicate.exists()) require(verifyCurrent(duplicate, retained.identity))
+                        reclaimArtifacts(
+                            group, parent, budget,
+                            "adjacent-${activationSelector.rootHash.toByteArray().hex()}",
+                            listOfNotNull(duplicate, attempt.obsoleteRootName?.let { File(parent, it) }),
+                        )
+                    }
+                }
+            } finally { if (boundBase == null) generationZero.close() }
+            require(target.delete()); sync(parent, CanonicalActivationSyncStage.RECOVERY); return true
+        }
+        require(
+            if (attempt.acknowledged == null) activationRoot.current == null
+            else activationRoot.current is CurrentRecord.Acknowledged && activationRoot.current.identity == attempt.acknowledged
+        )
+        fun publish(commit: CanonicalPublishedCommit): Boolean {
+            val published = commit.roots.lastOrNull() ?: return false
+            require(published.baseRootHash == attempt.sourceRootHash &&
+                published.commandHash == attempt.commandHash &&
+                published.commandFingerprint == attempt.commandFingerprint &&
+                commit.view.cut.rootHash == published.targetRootHash)
+            val identity = CanonicalCurrentIdentity(
+                published.commandHash, published.commandFingerprint,
+                published.current.length, published.current.hash,
+            )
+            require(identity.canonicalLength <= CanonicalActivationResources.MAX_CURRENT_BYTES)
+            val sourceFile = File(File(parent, published.generationDirectory), CanonicalCowGeneration.CURRENT_UNACKED_FILE)
+            require(sourceFile.exists())
+            publishAdjacentRoot(group, parent, budget, activationSelector, commit.view.cut, identity, sourceFile, fault)
+            return true
+        }
+        if (publishedSuccessor != null) {
+            if (!publish(publishedSuccessor)) return false
+        } else {
+            val generationZero = boundBase ?: (CompactCanonicalStore.openV6(group, parent, budget) as? CompactCanonicalOpenResult.Opened)?.store ?: return false
+            try {
+                val store = CanonicalCommitStore.open(parent, budget) ?: return false
+                store.use {
+                    when (val reopened = store.reopen(generationZero, attempt.acknowledged?.toIntentReceipt())) {
+                        is CanonicalReopenResult.GenerationZero -> {
+                            require(target.delete()); sync(parent, CanonicalActivationSyncStage.RECOVERY); return true
+                        }
+                        is CanonicalReopenResult.Refused -> return false
+                        is CanonicalReopenResult.Selected -> reopened.commit.use { if (!publish(it)) return false }
+                    }
+                }
+            } finally { if (boundBase == null) generationZero.close() }
+        }
+        require(target.delete()); sync(parent, CanonicalActivationSyncStage.RECOVERY)
+        true
+    } catch (_: Exception) { false }
+
+    private fun selectedReachableNames(parent: File, group: SurfaceGroup): Set<String>? {
+        val selectorTarget = selectorFile(parent, group)
+        if (!selectorTarget.exists()) return emptySet()
+        val selector = ActivationSelector.read(selectorTarget) ?: return null
+        val slotTarget = slotFile(parent, group, selector.slot)
+        val slot = ActivationSlot.read(slotTarget)
+            ?.takeIf { it.revision == selector.revision && it.rootHash == selector.rootHash }
+            ?: return null
+        val rootTarget = rootFile(parent, group, selector.rootHash)
+        val root = ActivationRoot.read(rootTarget, selector.rootHash) ?: return null
+        val names = linkedSetOf(selectorTarget.name, slotTarget.name, rootTarget.name)
+        (root.current as? CurrentRecord.Unacknowledged)?.let {
+            val current = currentFile(parent, group, it)
+            if (!verifyCurrent(current, it.identity)) return null
+            names += current.name
+        }
+        return names
+    }
+
+    private fun cleanupAttempt(
+        parent: File,
+        group: SurfaceGroup,
+        attempt: ActivationAttempt,
+        attemptTarget: File,
+        reachable: Set<String>,
+    ) {
+        require(attempt.groupHash == group.hash.hex())
+        val created = buildList {
+            if (attempt.rootCreated) add(attempt.rootName)
+            if (attempt.currentCreated) attempt.currentName?.let(::add)
+            add(attempt.slotName)
+        }
+        val prefix = "canonical-surface-activation-${group.hash.hex()}"
+        created.filter { it !in reachable }.forEach { name ->
+            require(name.startsWith(prefix) && '/' !in name && '\\' !in name)
+            val target = File(parent, name)
+            require(!target.exists() || target.delete())
+            val part = File(parent, ".$name.part")
+            require(!part.exists() || part.delete())
+        }
+        val selectorPart = File(parent, ".${selectorFile(parent, group).name}.part")
+        require(!selectorPart.exists() || selectorPart.delete())
+        require(!attemptTarget.exists() || attemptTarget.delete())
+        cleanupLegacyCandidates(parent, group)
+    }
+
+    private fun cleanupAcknowledgementAttempt(
+        parent: File,
+        group: SurfaceGroup,
+        attempt: AcknowledgementAttempt,
+        attemptTarget: File,
+        reachable: Set<String>,
+    ) {
+        require(attempt.groupHash == group.hash.hex())
+        listOfNotNull(
+            attempt.nextRootName.takeIf { attempt.rootCreated },
+            attempt.nextSlotName.takeIf { attempt.slotCreated },
+        ).filter { it !in reachable }.forEach { name ->
+            require(name.startsWith("canonical-surface-activation-${group.hash.hex()}") && '/' !in name && '\\' !in name)
+            val target = File(parent, name)
+            require(!target.exists() || target.delete())
+            val part = File(parent, ".$name.part")
+            require(!part.exists() || part.delete())
+        }
+        require(!attemptTarget.exists() || attemptTarget.delete())
+    }
+
+    private fun reopenLocked(
+        group: SurfaceGroup,
+        parent: File,
+        budget: CanonicalStorageBudget,
+        boundBase: CanonicalStateView? = null,
+        authenticatedCut: CompactCanonicalCut? = null,
+    ): CanonicalActivationResult {
+        val selectorFile = selectorFile(parent, group)
+        if (!selectorFile.exists()) return CanonicalActivationResult.Legacy
+        val selector = ActivationSelector.read(selectorFile)
+            ?: return CanonicalActivationResult.Refused(CanonicalActivationSelectorRefusal.CORRUPT_SELECTOR)
+        val slot = ActivationSlot.read(slotFile(parent, group, selector.slot))
+            ?.takeIf { it.revision == selector.revision && it.rootHash == selector.rootHash }
+            ?: return CanonicalActivationResult.Refused(CanonicalActivationSelectorRefusal.FORKED_SELECTOR)
+        val root = ActivationRoot.read(rootFile(parent, group, selector.rootHash), selector.rootHash)
+            ?: return CanonicalActivationResult.Refused(CanonicalActivationSelectorRefusal.CORRUPT_SELECTOR)
+        if (root.cut.group != group || root.cut.profile != CompactCanonicalStore.PROFILE) {
+            return CanonicalActivationResult.Refused(CanonicalActivationSelectorRefusal.FORKED_SELECTOR)
+        }
+        val base = if (authenticatedCut == null) {
+            boundBase ?: (CompactCanonicalStore.openV6(group, parent, budget)
+                as? CompactCanonicalOpenResult.Opened)?.store
+                ?: return CanonicalActivationResult.Refused(CanonicalActivationSelectorRefusal.CORRUPT_V6)
+        } else boundBase
+        val v6Cut = authenticatedCut ?: try {
+            val store = CanonicalCommitStore.open(parent, budget)
+                ?: return CanonicalActivationResult.Refused(CanonicalActivationSelectorRefusal.CORRUPT_V6)
+            store.use {
+                // Activation owns the exact retained payload after supersession, so the
+                // duplicate embedded COW payload may already have been reclaimed.
+                val retained = root.current?.identity?.toIntentReceipt()
+                when (val selected = store.reopen(requireNotNull(base), retained)) {
+                    is CanonicalReopenResult.GenerationZero -> selected.view.cut
+                    is CanonicalReopenResult.Selected -> selected.commit.use { it.view.cut }
+                    is CanonicalReopenResult.Refused ->
+                        return CanonicalActivationResult.Refused(CanonicalActivationSelectorRefusal.CORRUPT_V6)
+                }
+            }
+        } finally { if (boundBase == null) base?.close() }
+        if (v6Cut != root.cut) return CanonicalActivationResult.Refused(CanonicalActivationSelectorRefusal.FORKED_SELECTOR)
+        val current = (root.current as? CurrentRecord.Unacknowledged)?.let { record ->
+            val file = currentFile(parent, group, record)
+            if (!verifyCurrent(file, record.identity)) return CanonicalActivationResult.Refused(
+                CanonicalActivationSelectorRefusal.CORRUPT_CURRENT,
+            )
+            CanonicalActivationCurrent.Receipt(record.identity, CanonicalCurrentSource.fromFile(file))
+        } ?: CanonicalActivationCurrent.None
+        val currentState = when (val record = root.current) {
+            null -> CanonicalCurrentState.None
+            is CurrentRecord.Acknowledged -> CanonicalCurrentState.Acknowledged(record.identity)
+            is CurrentRecord.Unacknowledged -> CanonicalCurrentState.Unacknowledged(record.identity)
+        }
+        return CanonicalActivationResult.Active(
+            CanonicalActivationState(root.cut, current, CanonicalActivationIdentity(selector.rootHash), currentState),
+        )
+    }
+
+    private fun replay(
+        state: CanonicalActivationState,
+        plan: CanonicalActivationPlan,
+    ): CanonicalActivationResult {
+        if (state.cut != plan.siblingCut) return CanonicalActivationResult.Refused(
+            CanonicalActivationSelectorRefusal.FORKED_SELECTOR,
+        )
+        val existing = state.current
+        val requested = plan.current
+        if (existing == CanonicalActivationCurrent.None && requested == CanonicalActivationCurrent.None) {
+            return CanonicalActivationResult.Active(state)
+        }
+        if (existing is CanonicalActivationCurrent.Receipt && requested is CanonicalActivationCurrent.Receipt) {
+            if (existing.identity == requested.identity) return CanonicalActivationResult.Active(state)
+            return CanonicalActivationResult.Refused(
+                if (existing.identity.commandHash == requested.identity.commandHash &&
+                    existing.identity.commandFingerprint == requested.identity.commandFingerprint
+                ) CanonicalActivationSelectorRefusal.CHANGED_CURRENT
+                else CanonicalActivationSelectorRefusal.CURRENT_PENDING,
+            )
+        }
+        return CanonicalActivationResult.Refused(CanonicalActivationSelectorRefusal.CURRENT_PENDING)
+    }
+
+    private fun validPlan(
+        group: SurfaceGroup,
+        parent: File,
+        budget: CanonicalStorageBudget,
+        plan: CanonicalActivationPlan,
+    ): Boolean {
+        if (!plan.isExactlyBound()) return false
+        if (plan.siblingCut.group != group || plan.legacySourceHash != plan.siblingCut.sourceHash) return false
+        val opened = CompactCanonicalStore.openV6(group, parent, budget)
+            as? CompactCanonicalOpenResult.Opened ?: return false
+        if (opened.store.use { it.cut } != plan.siblingCut) return false
+        val receipt = plan.current as? CanonicalActivationCurrent.Receipt ?: return true
+        return receipt.identity.canonicalLength in 0..CanonicalActivationResources.MAX_CURRENT_BYTES &&
+            streamMatches(receipt.source, receipt.identity)
+    }
+
+    private fun streamMatches(source: CanonicalCurrentSource, identity: CanonicalCurrentIdentity): Boolean = try {
+        val digest = MessageDigest.getInstance("SHA-256")
+        var length = 0L
+        source.writeTo(object : OutputStream() {
+            override fun write(value: Int) { digest.update(value.toByte()); length = Math.addExact(length, 1L) }
+            override fun write(bytes: ByteArray, offset: Int, count: Int) {
+                digest.update(bytes, offset, count); length = Math.addExact(length, count.toLong())
+            }
+        })
+        length == identity.canonicalLength && CanonicalReceiptBytes(digest.digest()) == identity.canonicalHash
+    } catch (_: Exception) { false }
+
+    private fun publishAdjacentRoot(
+        group: SurfaceGroup,
+        parent: File,
+        budget: CanonicalStorageBudget,
+        selector: ActivationSelector,
+        cut: CompactCanonicalCut,
+        identity: CanonicalCurrentIdentity,
+        sourceFile: File,
+        fault: CanonicalAdjacentFault?,
+    ) {
+        val record = CurrentRecord.Unacknowledged(identity)
+        val currentTarget = currentFile(parent, group, record)
+        val nextRoot = ActivationRoot(cut, record)
+        val rootBytes = nextRoot.bytes()
+        val rootHash = digest(rootBytes)
+        val rootTarget = rootFile(parent, group, rootHash)
+        val nextSlot = 1 - selector.slot
+        val slotTarget = slotFile(parent, group, nextSlot)
+        val obsoleteRootName = obsoleteRootName(parent, group, nextSlot, selector.rootHash, rootHash)
+        val selectorTarget = selectorFile(parent, group)
+        val unit = budget.allocationUnitBytes(parent)
+        val currentBefore = currentTarget.takeIf(File::exists)?.let(budget::allocatedBytes) ?: 0L
+        val rootBefore = rootTarget.takeIf(File::exists)?.let(budget::allocatedBytes) ?: 0L
+        val slotBefore = slotTarget.takeIf(File::exists)?.let(budget::allocatedBytes) ?: 0L
+        val selectorBefore = selectorTarget.takeIf(File::exists)?.let(budget::allocatedBytes) ?: 0L
+        val combinedBefore = Math.addExact(currentBefore, rootBefore)
+        val commitBytes = Math.max(0L, round(identity.canonicalLength, unit) - currentBefore) +
+            Math.max(0L, round(rootBytes.size.toLong(), unit) - rootBefore) +
+            Math.max(0L, round(ActivationSlot.BYTES.toLong(), unit) - slotBefore) +
+            Math.max(0L, round(ActivationSelector.BYTES.toLong(), unit) - selectorBefore)
+        val maximum = listOf(identity.canonicalLength, rootBytes.size.toLong(), ActivationSlot.BYTES.toLong(), ActivationSelector.BYTES.toLong(), 1L)
+            .fold(0L) { total, bytes -> Math.addExact(total, round(bytes, unit)) }
+        val publicationId = rootHash.toByteArray().hex()
+        val existing = budget.activationAttempts(adjacentBudgetGroup(group)).singleOrNull { it.publicationId == publicationId }
+        val token = existing?.token ?: budget.reserveActivationAttempt(
+            adjacentBudgetGroup(group), publicationId, combinedBefore, slotBefore,
+            selectorBefore, commitBytes, maximum,
+        ) ?: error("adjacent quota refused")
+        val reservation = existing ?: CanonicalPointerReservation(
+            token, publicationId, nextSlot, combinedBefore, slotBefore, selectorBefore, commitBytes,
+        )
+        var switched = false
+        var reservationClosed = false
+        try {
+            val receipt = CanonicalActivationCurrent.Receipt(identity, CanonicalCurrentSource.fromFile(sourceFile))
+            writeCurrent(currentTarget, receipt, null)
+            writeImmutable(rootTarget, rootBytes, false)
+            atomicReplace(slotTarget, ActivationSlot(selector.revision + 1, rootHash).bytes(), false)
+            sync(parent, CanonicalActivationSyncStage.ADJACENT_PREREQUISITES)
+            injectAdjacent(fault, CanonicalAdjacentFault.PROCESS_CRASH_BEFORE_SELECTOR_SWITCH)
+            atomicReplace(selectorTarget, ActivationSelector(nextSlot, selector.revision + 1, rootHash).bytes(), false)
+            switched = true
+            injectAdjacent(fault, CanonicalAdjacentFault.PROCESS_CRASH_AFTER_SELECTOR_SWITCH)
+            sync(parent, CanonicalActivationSyncStage.ADJACENT_SELECTOR)
+            budget.commitActivationAttempt(reservation)
+            reservationClosed = true
+            reclaimArtifacts(
+                group, parent, budget, "adjacent-${rootHash.toByteArray().hex()}",
+                listOfNotNull(sourceFile, obsoleteRootName?.let { File(parent, it) }),
+            ) { stage -> injectAdjacentReclaim(fault, stage) }
+        } catch (failure: Exception) {
+            if (!switched && !reservationClosed) {
+                listOf(currentTarget, rootTarget).forEach { if (it.exists()) it.delete() }
+                sync(parent, CanonicalActivationSyncStage.RECOVERY)
+                budget.releaseActivationAttempt(reservation)
+            } else if (!reservationClosed) {
+                budget.commitActivationAttempt(reservation)
+            }
+            throw failure
+        }
+    }
+
+    private fun injectAdjacent(requested: CanonicalAdjacentFault?, point: CanonicalAdjacentFault) {
+        if (requested == point) throw CanonicalAdjacentProcessCrash(point)
+    }
+
+    private fun writeCurrent(
+        target: File,
+        receipt: CanonicalActivationCurrent.Receipt,
+        fault: CanonicalActivationFault?,
+    ) {
+        if (target.exists()) {
+            require(verifyCurrent(target, receipt.identity))
+            return
+        }
+        val temporary = File(target.parentFile, ".${target.name}.part")
+        FileOutputStream(temporary, false).use { output ->
+            var written = 0L
+            val digest = MessageDigest.getInstance("SHA-256")
+            receipt.source.writeTo(object : OutputStream() {
+                override fun write(value: Int) { output.write(value); digest.update(value.toByte()); written++ }
+                override fun write(bytes: ByteArray, offset: Int, count: Int) {
+                    output.write(bytes, offset, count); digest.update(bytes, offset, count); written = Math.addExact(written, count.toLong())
+                }
+            })
+            output.fd.sync()
+            require(written == receipt.identity.canonicalLength && CanonicalReceiptBytes(digest.digest()) == receipt.identity.canonicalHash)
+        }
+        if (fault == CanonicalActivationFault.DURING_CURRENT_WRITE) throw IllegalStateException("fault")
+        Files.move(temporary.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE)
+    }
+
+    private fun verifyCurrent(file: File, identity: CanonicalCurrentIdentity): Boolean = try {
+        if (!file.isFile || file.length() != identity.canonicalLength) return false
+        val digest = MessageDigest.getInstance("SHA-256")
+        FileInputStream(file).use { input ->
+            val scratch = ByteArray(CURRENT_STREAM_BUFFER_BYTES)
+            while (true) { val count = input.read(scratch); if (count < 0) break; digest.update(scratch, 0, count) }
+        }
+        CanonicalReceiptBytes(digest.digest()) == identity.canonicalHash
+    } catch (_: Exception) { false }
+
+    private fun writeImmutable(target: File, bytes: ByteArray, partial: Boolean) {
+        if (target.exists()) { require(ActivationRoot.read(target, digest(bytes)) != null); return }
+        val temporary = File(target.parentFile, ".${target.name}.part")
+        FileOutputStream(temporary, false).use { output -> output.write(if (partial) bytes.copyOf(bytes.size / 2) else bytes); output.fd.sync() }
+        if (partial) throw IllegalStateException("fault")
+        Files.move(temporary.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE)
+    }
+    private fun writeAttempt(target: File, bytes: ByteArray) {
+        require(!target.exists())
+        val temporary = File(target.parentFile, ".${target.name}.part")
+        FileOutputStream(temporary, false).use { output -> output.write(bytes); output.fd.sync() }
+        Files.move(temporary.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE)
+    }
+    private fun atomicReplace(target: File, bytes: ByteArray, partial: Boolean) {
+        val temporary = File(target.parentFile, ".${target.name}.part")
+        FileOutputStream(temporary, false).use { output -> output.write(if (partial) bytes.copyOf(bytes.size / 2) else bytes); output.fd.sync() }
+        if (partial) throw IllegalStateException("fault")
+        Files.move(temporary.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+    }
+    private fun cleanupLegacyCandidates(parent: File, group: SurfaceGroup) {
+        val prefix = "canonical-surface-activation-${group.hash.hex()}"
+        parent.listFiles().orEmpty().filter { it.name.startsWith(".$prefix") && it.name.endsWith(".part") }.forEach(File::delete)
+    }
+    private fun selectedActivationBytes(
+        root: File,
+        current: File?,
+        slot: File,
+        selector: File,
+        budget: CanonicalStorageBudget,
+    ) = listOfNotNull(root, current, slot, selector).sumOf(budget::allocatedBytes)
+    private fun currentLength(current: CanonicalActivationCurrent) = (current as? CanonicalActivationCurrent.Receipt)?.identity?.canonicalLength ?: 0L
+    private fun currentFile(parent: File, group: SurfaceGroup, current: CanonicalActivationCurrent): File? =
+        (current as? CanonicalActivationCurrent.Receipt)?.let { currentFile(parent, group, CurrentRecord.Unacknowledged(it.identity)) }
+    private fun currentFile(parent: File, group: SurfaceGroup, current: CurrentRecord): File =
+        File(parent, "canonical-surface-activation-${group.hash.hex()}-current-${current.identity.canonicalHash.toByteArray().hex()}.receipt")
+    private fun rootFile(parent: File, group: SurfaceGroup, hash: CanonicalReceiptBytes) =
+        File(parent, "canonical-surface-activation-${group.hash.hex()}-root-${hash.toByteArray().hex()}.root")
+    private fun slotFile(parent: File, group: SurfaceGroup, slot: Int) = File(parent, "canonical-surface-activation-${group.hash.hex()}-$slot.slot")
+    private fun selectorFile(parent: File, group: SurfaceGroup) = File(parent, "canonical-surface-activation-${group.hash.hex()}.selector")
+    private fun attemptFile(parent: File, group: SurfaceGroup, id: CanonicalReceiptBytes) =
+        File(parent, "canonical-surface-activation-${group.hash.hex()}-attempt-${id.toByteArray().hex()}.attempt")
+    private fun inject(fault: CanonicalActivationFault?, point: CanonicalActivationFault) {
+        if (fault == point) {
+            if (point.isProcessCrash()) throw CanonicalActivationProcessCrash(point)
+            throw IllegalStateException("fault:$point")
+        }
+    }
+    private fun writeAcknowledgementAttempt(target: File, bytes: ByteArray) {
+        require(bytes.size <= MAX_ATTEMPT_BYTES)
+        require(!target.exists())
+        val temporary = File(target.parentFile, ".${target.name}.part")
+        FileOutputStream(temporary, false).use { output -> output.write(bytes); output.fd.sync() }
+        Files.move(temporary.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE)
+    }
+    private fun acknowledgementAttemptFile(parent: File, group: SurfaceGroup, id: CanonicalReceiptBytes) =
+        File(parent, "canonical-surface-activation-${group.hash.hex()}-ack-${id.toByteArray().hex()}.attempt")
+    private fun adjacentAttemptFile(parent: File, group: SurfaceGroup) =
+        File(parent, "canonical-surface-activation-${group.hash.hex()}-adjacent.transaction")
+    private fun reclaimAttemptFile(parent: File, group: SurfaceGroup, id: String) =
+        File(parent, "canonical-surface-activation-${group.hash.hex()}-reclaim-$id.attempt")
+    private fun writeReclaimAttempt(target: File, bytes: ByteArray) {
+        require(bytes.size <= MAX_ATTEMPT_BYTES)
+        atomicReplace(target, bytes, false)
+    }
+    private fun acknowledgementBudgetGroup(group: SurfaceGroup) = "ack:${group.hash.hex()}"
+    private fun adjacentBudgetGroup(group: SurfaceGroup) = "adjacent:${group.hash.hex()}"
+    private fun incrementalBytes(budget: CanonicalStorageBudget, file: File, before: Long) =
+        Math.max(0L, (file.takeIf(File::exists)?.let(budget::allocatedBytes) ?: 0L) - before)
+    private fun inject(fault: CanonicalAcknowledgementFault?, point: CanonicalAcknowledgementFault) {
+        if (fault == point) {
+            if (fault.isAcknowledgementProcessCrash()) throw CanonicalAcknowledgementProcessCrash(point)
+            throw IllegalStateException("fault:$point")
+        }
+    }
+    private fun CanonicalAcknowledgementFault?.isAcknowledgementProcessCrash() =
+        this == CanonicalAcknowledgementFault.PROCESS_CRASH_AFTER_ROOT_SYNC ||
+            this == CanonicalAcknowledgementFault.PROCESS_CRASH_AFTER_SELECTOR_SWITCH ||
+            this == CanonicalAcknowledgementFault.PROCESS_CRASH_AFTER_RECLAIM_INTENT_SYNC ||
+            this == CanonicalAcknowledgementFault.PROCESS_CRASH_AFTER_RECLAIM_DELETE_SYNC ||
+            this == CanonicalAcknowledgementFault.PROCESS_CRASH_AFTER_RECLAIM_LEDGER
+    private fun injectAcknowledgementReclaim(fault: CanonicalAcknowledgementFault?, stage: ReclaimStage) {
+        val expected = when (stage) {
+            ReclaimStage.AFTER_INTENT_SYNC -> CanonicalAcknowledgementFault.PROCESS_CRASH_AFTER_RECLAIM_INTENT_SYNC
+            ReclaimStage.AFTER_DELETE_SYNC -> CanonicalAcknowledgementFault.PROCESS_CRASH_AFTER_RECLAIM_DELETE_SYNC
+            ReclaimStage.AFTER_LEDGER -> CanonicalAcknowledgementFault.PROCESS_CRASH_AFTER_RECLAIM_LEDGER
+        }
+        if (fault == expected) throw CanonicalAcknowledgementProcessCrash(fault)
+    }
+    private fun injectAdjacentReclaim(fault: CanonicalAdjacentFault?, stage: ReclaimStage) {
+        val expected = when (stage) {
+            ReclaimStage.AFTER_INTENT_SYNC -> CanonicalAdjacentFault.PROCESS_CRASH_AFTER_RECLAIM_INTENT_SYNC
+            ReclaimStage.AFTER_DELETE_SYNC -> CanonicalAdjacentFault.PROCESS_CRASH_AFTER_RECLAIM_DELETE_SYNC
+            ReclaimStage.AFTER_LEDGER -> CanonicalAdjacentFault.PROCESS_CRASH_AFTER_RECLAIM_LEDGER
+        }
+        if (fault == expected) throw CanonicalAdjacentProcessCrash(fault)
+    }
+    private fun sync(parent: File, stage: CanonicalActivationSyncStage) {
+        val physical = !System.getProperty("os.name").orEmpty().startsWith("Windows", true)
+        if (physical) FileChannel.open(parent.toPath(), StandardOpenOption.READ).use { it.force(true) }
+        CanonicalActivationTestHooks.onDirectorySync?.invoke(stage, physical)
+    }
+    private fun round(bytes: Long, unit: Long) = if (bytes == 0L) 0L else Math.multiplyExact((bytes - 1L) / unit + 1L, unit)
+    private fun digest(bytes: ByteArray) = CanonicalReceiptBytes(MessageDigest.getInstance("SHA-256").digest(bytes))
+    private fun hex(value: String) = value.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+    private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
+    private val locks = mutableMapOf<String, Any>()
+    private val legacyLeases = mutableMapOf<String, Int>()
+}
+
+internal enum class CanonicalActivationSyncStage {
+    ATTEMPT, PREREQUISITES, SELECTOR, ACK_ATTEMPT, ACK_ROOT, ACK_SLOT, ACK_SELECTOR,
+    ADJACENT_INTENT, ADJACENT_PREREQUISITES, ADJACENT_SELECTOR,
+    RECLAIM_INTENT, RECLAIM_DELETE, RECLAIM_COMPLETE, RECOVERY,
+}
+internal object CanonicalActivationTestHooks {
+    /** Test-only observation after the requested physical sync has completed. */
+    @Volatile var onDirectorySync: ((CanonicalActivationSyncStage, Boolean) -> Unit)? = null
+    /** Test-only latch point while selector absence and legacy restoration share the group lock. */
+    @Volatile var afterLegacySelection: (() -> Unit)? = null
+    /** Scalar-only in-operation proof that adjacent admission never duplicates its maximum store. */
+    @Volatile var onAdjacentOwnership: ((CanonicalAdjacentOwnershipObservation) -> Unit)? = null
+}
+
+internal enum class CanonicalAdjacentOwnershipStage { ADMISSION, COMMIT, RECONCILE, REOPEN }
+internal data class CanonicalAdjacentOwnershipObservation(
+    val stage: CanonicalAdjacentOwnershipStage,
+    val liveStoreCount: Int,
+    val liveStoreBytes: Long,
+    val retainedPlanBytes: Long,
+    val writerScratchBytes: Long,
+    val constructionPeakBytes: Long,
+)
+
+internal data class CanonicalActivationState(
+    val cut: CompactCanonicalCut,
+    val current: CanonicalActivationCurrent,
+    val identity: CanonicalActivationIdentity,
+    val currentState: CanonicalCurrentState = when (current) {
+        CanonicalActivationCurrent.None -> CanonicalCurrentState.None
+        is CanonicalActivationCurrent.Receipt -> CanonicalCurrentState.Unacknowledged(current.identity)
+    },
+)
+internal data class CanonicalActivationIdentity(val rootHash: CanonicalReceiptBytes)
+
+/** Durable, revision-qualified state of the one retained canonical receipt. */
+internal sealed interface CanonicalCurrentState {
+    data object None : CanonicalCurrentState
+    data class Unacknowledged(val identity: CanonicalCurrentIdentity) : CanonicalCurrentState
+    data class Acknowledged(val identity: CanonicalCurrentIdentity) : CanonicalCurrentState
+}
+
+/** Exact ACK identity; the cut revisions fence a delayed ACK from a newer current. */
+internal data class CanonicalAcknowledgement(
+    val commandHash: CanonicalReceiptBytes,
+    val geometryRevision: Long,
+    val lineageRevision: Long,
+)
+
+internal sealed interface CanonicalAcknowledgementResult {
+    data class Acknowledged(val state: CanonicalActivationState) : CanonicalAcknowledgementResult
+    data class Idempotent(val state: CanonicalActivationState) : CanonicalAcknowledgementResult
+    data class NoOp(val reason: CanonicalAcknowledgementNoOp) : CanonicalAcknowledgementResult
+}
+
+internal sealed interface CanonicalAdjacentCommitResult {
+    data class Committed(
+        val state: CanonicalActivationState,
+        internal val successor: CanonicalPublishedCommit? = null,
+    ) : CanonicalAdjacentCommitResult
+    data class Refused(
+        val reason: CanonicalAdjacentCommitRefusal,
+        val commit: CanonicalCommitResult.Refused? = null,
+        val disposition: PreparedMutationDisposition = PreparedMutationDisposition.TERMINAL,
+    ) : CanonicalAdjacentCommitResult
+}
+internal enum class CanonicalAdjacentCommitRefusal {
+    NO_ACTIVE_AUTHORITY, CURRENT_UNACKNOWLEDGED, STALE_CUT, COMMIT_REFUSED, DURABILITY_FAILURE,
+    DUPLICATE_RESIDENT_AUTHORITY, PLAN_DISCARDED, PLAN_IN_FLIGHT, INVALID_AUTHORITY_LEASE,
+}
+internal enum class PreparedMutationDisposition { RETRYABLE, TERMINAL }
+internal enum class CanonicalAdjacentFault {
+    PROCESS_CRASH_BEFORE_SELECTOR_SWITCH,
+    PROCESS_CRASH_AFTER_SELECTOR_SWITCH,
+    PROCESS_CRASH_AFTER_RECLAIM_INTENT_SYNC,
+    PROCESS_CRASH_AFTER_RECLAIM_DELETE_SYNC,
+    PROCESS_CRASH_AFTER_RECLAIM_LEDGER,
+}
+internal class CanonicalAdjacentProcessCrash(val point: CanonicalAdjacentFault) : Error(point.name)
+
+internal enum class CanonicalAcknowledgementNoOp { CLOSED, NO_CURRENT, COMMAND_MISMATCH, STALE_REVISION, DURABILITY_FAILURE }
+internal enum class CanonicalAcknowledgementFault {
+    BEFORE_ATTEMPT, AFTER_ATTEMPT_SYNC, BEFORE_ROOT_WRITE, AFTER_ROOT_SYNC,
+    BEFORE_SLOT_WRITE, AFTER_SLOT_SYNC, BEFORE_SELECTOR_SWITCH, AFTER_SELECTOR_SWITCH,
+    BEFORE_PARENT_SYNC, AFTER_PARENT_SYNC, BEFORE_CLEANUP, AFTER_CLEANUP,
+    PROCESS_CRASH_AFTER_ROOT_SYNC, PROCESS_CRASH_AFTER_SELECTOR_SWITCH,
+    PROCESS_CRASH_AFTER_RECLAIM_INTENT_SYNC, PROCESS_CRASH_AFTER_RECLAIM_DELETE_SYNC,
+    PROCESS_CRASH_AFTER_RECLAIM_LEDGER,
+}
+internal class CanonicalAcknowledgementProcessCrash(val point: CanonicalAcknowledgementFault) : Error(point.name)
+internal sealed interface CanonicalActivationResult {
+    data object Legacy : CanonicalActivationResult
+    data class Active(val state: CanonicalActivationState) : CanonicalActivationResult
+    data object UnknownAfterSwitch : CanonicalActivationResult
+    data class Refused(val reason: CanonicalActivationSelectorRefusal) : CanonicalActivationResult
+}
+internal enum class CanonicalActivationSelectorRefusal { INVALID_PLAN, LEGACY_OWNER_ACTIVE, QUOTA_REFUSED, CURRENT_PENDING, CHANGED_CURRENT, CORRUPT_SELECTOR, FORKED_SELECTOR, CORRUPT_V6, CORRUPT_CURRENT, DURABILITY_FAILURE }
+internal enum class CanonicalActivationFault {
+    BEFORE_RESERVATION, AFTER_RESERVATION, BEFORE_CURRENT_WRITE, DURING_CURRENT_WRITE, AFTER_CURRENT_SYNC,
+    AFTER_ATTEMPT_SYNC,
+    BEFORE_ROOT_WRITE, DURING_ROOT_WRITE, AFTER_ROOT_SYNC, BEFORE_SLOT_WRITE, DURING_SLOT_WRITE, AFTER_SLOT_SYNC,
+    BEFORE_PREREQUISITE_PARENT_SYNC, AFTER_PREREQUISITE_PARENT_SYNC,
+    PROCESS_CRASH_AFTER_PREREQUISITE_SYNC,
+    BEFORE_SELECTOR_SWITCH, DURING_SELECTOR_WRITE, AFTER_SELECTOR_SWITCH, BEFORE_PARENT_SYNC, AFTER_PARENT_SYNC,
+    BEFORE_BUDGET_COMMIT, AFTER_BUDGET_COMMIT, BEFORE_CLEANUP, AFTER_CLEANUP,
+}
+
+internal class CanonicalActivationProcessCrash(val point: CanonicalActivationFault) : Error(point.name)
+private fun CanonicalActivationFault?.isProcessCrash() =
+    this == CanonicalActivationFault.PROCESS_CRASH_AFTER_PREREQUISITE_SYNC
+
+private enum class ReclaimStage { AFTER_INTENT_SYNC, AFTER_DELETE_SYNC, AFTER_LEDGER }
+private data class ReclaimEntry(val path: String, val bytes: Long)
+private data class ReclaimAttempt(
+    val groupHash: String,
+    val reclaimId: String,
+    val complete: Boolean,
+    val entries: List<ReclaimEntry>,
+) {
+    fun bytes(): ByteArray = checked { out ->
+        out.writeInt(0x4d335243); out.writeInt(1); out.writeUTF(groupHash); out.writeUTF(reclaimId)
+        out.writeBoolean(complete); out.writeInt(entries.size)
+        entries.forEach { entry -> out.writeUTF(entry.path); out.writeLong(entry.bytes) }
+    }.also { require(it.size <= MAX_ATTEMPT_BYTES) }
+
+    companion object {
+        fun read(file: File, expectedId: String, expectedGroup: String): ReclaimAttempt? = try {
+            val bytes = readBounded(file, MAX_ATTEMPT_BYTES, 33) ?: return null
+            val body = checkedBody(bytes) ?: return null
+            DataInputStream(ByteArrayInputStream(body)).use { input ->
+                require(input.readInt() == 0x4d335243 && input.readInt() == 1)
+                val group = input.readUTF(); val id = input.readUTF(); val complete = input.readBoolean()
+                val count = input.readInt(); require(count in 1..3)
+                val entries = List(count) {
+                    ReclaimEntry(input.readUTF().also { require(it.isSafeRelativeActivationPath()) }, input.readLong().also { require(it > 0L) })
+                }
+                require(input.read() == -1 && group == expectedGroup && id == expectedId && entries.map(ReclaimEntry::path).distinct().size == entries.size)
+                ReclaimAttempt(group, id, complete, entries)
+            }
+        } catch (_: Exception) { null }
+    }
+}
+
+private fun String.isSafeRelativeActivationPath(): Boolean {
+    if (isEmpty() || startsWith('/') || contains('\\')) return false
+    val segments = split('/')
+    return segments.size in 1..2 && segments.all { it.isNotEmpty() && it != "." && it != ".." && it.matches(Regex("[A-Za-z0-9._-]{1,180}")) }
+}
+
+private data class ActivationAttempt(
+    val groupHash: String,
+    val rootName: String,
+    val currentName: String?,
+    val slotName: String,
+    val rootPreexisted: Boolean,
+    val currentPreexisted: Boolean,
+) {
+    val rootCreated get() = !rootPreexisted
+    val currentCreated get() = currentName != null && !currentPreexisted
+
+    fun bytes(): ByteArray = ByteArrayOutputStream().use { raw ->
+        DataOutputStream(raw).use { output ->
+            output.writeInt(MAGIC); output.writeInt(1)
+            output.writeUTF(groupHash); output.writeUTF(rootName)
+            output.writeBoolean(currentName != null); currentName?.let(output::writeUTF)
+            output.writeUTF(slotName); output.writeBoolean(rootPreexisted); output.writeBoolean(currentPreexisted)
+        }
+        raw.toByteArray()
+    }
+
+    companion object {
+        private const val MAGIC = 0x4d334141
+        fun read(file: File, expectedId: String, expectedGroupHash: String): ActivationAttempt? = try {
+            val bytes = readBounded(file, MAX_ATTEMPT_BYTES, 16) ?: return null
+            val actualId = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+            require(actualId == expectedId)
+            DataInputStream(ByteArrayInputStream(bytes)).use { input ->
+                require(input.readInt() == MAGIC && input.readInt() == 1)
+                val groupHash = input.readUTF(); val root = input.readUTF()
+                val current = if (input.readBoolean()) input.readUTF() else null
+                val slot = input.readUTF(); val rootBefore = input.readBoolean(); val currentBefore = input.readBoolean()
+                require(input.available() == 0 && groupHash == expectedGroupHash)
+                ActivationAttempt(groupHash, root, current, slot, rootBefore, currentBefore)
+            }
+        } catch (_: Exception) { null }
+    }
+}
+
+/** Bounded durable intent for an ACK root switch and later payload release. */
+private data class AcknowledgementAttempt(
+    val groupHash: String,
+    val oldCurrentName: String,
+    val nextRootName: String,
+    val nextSlotName: String,
+    val selectorName: String,
+    val obsoleteRootName: String?,
+    val rootPreexisted: Boolean,
+    val slotPreexisted: Boolean,
+) {
+    val rootCreated get() = !rootPreexisted
+    val slotCreated get() = !slotPreexisted
+    fun bytes(): ByteArray = checked { out ->
+            out.writeInt(0x4d33414b); out.writeInt(2); out.writeUTF(groupHash)
+            out.writeUTF(oldCurrentName); out.writeUTF(nextRootName); out.writeUTF(nextSlotName)
+            out.writeUTF(selectorName); out.writeBoolean(obsoleteRootName != null); obsoleteRootName?.let(out::writeUTF)
+            out.writeBoolean(rootPreexisted); out.writeBoolean(slotPreexisted)
+    }
+    companion object {
+        fun read(file: File, expectedId: String, expectedGroupHash: String): AcknowledgementAttempt? = try {
+            val bytes = readBounded(file, MAX_ATTEMPT_BYTES, 33) ?: return null
+            require(MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) } == expectedId)
+            val body = checkedBody(bytes) ?: return null
+            DataInputStream(ByteArrayInputStream(body)).use { input ->
+                require(input.readInt() == 0x4d33414b && input.readInt() == 2)
+                val group = input.readUTF(); val old = input.readUTF(); val root = input.readUTF(); val slot = input.readUTF()
+                val selector = input.readUTF(); val obsolete = if (input.readBoolean()) input.readUTF() else null
+                val rootBefore = input.readBoolean(); val slotBefore = input.readBoolean()
+                require(input.available() == 0 && group == expectedGroupHash)
+                AcknowledgementAttempt(group, old, root, slot, selector, obsolete, rootBefore, slotBefore)
+            }
+        } catch (_: Exception) { null }
+    }
+}
+
+private data class AdjacentTransaction(
+    val groupHash: String,
+    val activationRootHash: CanonicalReceiptBytes,
+    val sourceRootHash: CanonicalReceiptBytes,
+    val commandHash: CanonicalReceiptBytes,
+    val commandFingerprint: CanonicalReceiptBytes,
+    val acknowledged: CanonicalCurrentIdentity?,
+    val obsoleteRootName: String?,
+) {
+    fun bytes() = checked { out ->
+        out.writeInt(0x4d334154); out.writeInt(2); out.writeUTF(groupHash)
+        out.write(activationRootHash.toByteArray()); out.write(sourceRootHash.toByteArray())
+        out.write(commandHash.toByteArray()); out.write(commandFingerprint.toByteArray())
+        out.writeBoolean(acknowledged != null)
+        acknowledged?.let {
+            out.write(it.commandHash.toByteArray()); out.write(it.commandFingerprint.toByteArray())
+            out.writeLong(it.canonicalLength); out.write(it.canonicalHash.toByteArray())
+        }
+        out.writeBoolean(obsoleteRootName != null); obsoleteRootName?.let(out::writeUTF)
+    }
+    companion object {
+        fun read(file: File, expectedGroup: String): AdjacentTransaction? = try {
+            val bytes = readBounded(file, MAX_ATTEMPT_BYTES, 33) ?: return null
+            val body = checkedBody(bytes) ?: return null
+            DataInputStream(ByteArrayInputStream(body)).use { input ->
+                require(input.readInt() == 0x4d334154 && input.readInt() == 2)
+                val group = input.readUTF(); require(group == expectedGroup)
+                fun hash() = CanonicalReceiptBytes(ByteArray(32).also(input::readFully))
+                val activation = hash(); val source = hash(); val command = hash(); val fingerprint = hash()
+                val acknowledged = if (input.readBoolean()) CanonicalCurrentIdentity(hash(), hash(), input.readLong(), hash()) else null
+                val obsolete = if (input.readBoolean()) input.readUTF() else null
+                require((acknowledged == null || acknowledged.canonicalLength in 0..CanonicalActivationResources.MAX_CURRENT_BYTES) && input.read() == -1)
+                AdjacentTransaction(group, activation, source, command, fingerprint, acknowledged, obsolete)
+            }
+        } catch (_: Exception) { null }
+    }
+}
+
+/** Explicit durable authority states; an ACK is never inferred from payload absence. */
+private sealed interface CurrentRecord {
+    val identity: CanonicalCurrentIdentity
+    data class Unacknowledged(override val identity: CanonicalCurrentIdentity) : CurrentRecord
+    data class Acknowledged(override val identity: CanonicalCurrentIdentity) : CurrentRecord
+}
+private data class ActivationRoot(val cut: CompactCanonicalCut, val current: CurrentRecord?) {
+    fun bytes(): ByteArray {
+        val raw = ByteArrayOutputStream()
+        DataOutputStream(raw).use { out ->
+            out.writeInt(0x4d334152); out.writeInt(2); out.writeUTF(cut.group.value); out.writeUTF(cut.profile)
+            out.writeLong(cut.geometryRevision); out.writeLong(cut.lineageRevision); out.writeLong(cut.nextSurfaceIdHighWater)
+            out.writeInt(cut.liveSurfaceCount); out.writeInt(cut.sourceCount); out.writeInt(cut.supportCount); out.writeInt(cut.lineageCount)
+            out.writeBoolean(cut.seededEmptyBaseline != null)
+            cut.seededEmptyBaseline?.let { baseline -> out.writeUTF(baseline.bindingIdentity); out.writeUTF(baseline.groupIdentity); out.writeLong(baseline.transactionId); out.writeLong(baseline.geometryRevision); out.writeLong(baseline.lineageRevision) }
+            out.write(cut.rootHash.toByteArray()); out.write(cut.sourceHash.toByteArray())
+            out.writeByte(when (current) { null -> 0; is CurrentRecord.Unacknowledged -> 1; is CurrentRecord.Acknowledged -> 2 })
+            current?.let { value -> out.write(value.identity.commandHash.toByteArray()); out.write(value.identity.commandFingerprint.toByteArray()); out.writeLong(value.identity.canonicalLength); out.write(value.identity.canonicalHash.toByteArray()) }
+        }
+        val body = raw.toByteArray()
+        return body + MessageDigest.getInstance("SHA-256").digest(body)
+    }
+    companion object {
+        fun read(file: File, expected: CanonicalReceiptBytes): ActivationRoot? = try {
+            val bytes = readBounded(file, MAX_ROOT_BYTES, 33) ?: return null
+            require(CanonicalActivationSelectorDigest.of(bytes) == expected)
+            val body = checkedBody(bytes) ?: return null
+            DataInputStream(ByteArrayInputStream(body)).use { input ->
+                require(input.readInt() == 0x4d334152); val version = input.readInt(); require(version in 1..2)
+                val group = SurfaceGroup(input.readUTF()); val profile = input.readUTF()
+                val geometry = input.readLong(); val lineageRevision = input.readLong(); val high = input.readLong(); val live = input.readInt(); val sources = input.readInt(); val supports = input.readInt(); val lineage = input.readInt()
+                val baseline = if (input.readBoolean()) committedEmptyBaseline(input.readUTF(), input.readUTF(), input.readLong(), input.readLong(), input.readLong()) else null
+                val root = CanonicalReceiptBytes(ByteArray(32).also(input::readFully)); val source = CanonicalReceiptBytes(ByteArray(32).also(input::readFully))
+                val currentState = if (version == 1) if (input.readBoolean()) 1 else 0 else input.readUnsignedByte().also { require(it in 0..2) }
+                val current = if (currentState != 0) {
+                    val identity = CanonicalCurrentIdentity(CanonicalReceiptBytes(ByteArray(32).also(input::readFully)), CanonicalReceiptBytes(ByteArray(32).also(input::readFully)), input.readLong(), CanonicalReceiptBytes(ByteArray(32).also(input::readFully)))
+                    require(identity.canonicalLength in 0..CanonicalActivationResources.MAX_CURRENT_BYTES)
+                    if (currentState == 2) CurrentRecord.Acknowledged(identity) else CurrentRecord.Unacknowledged(identity)
+                } else null
+                require(input.read() == -1)
+                val cut = CompactCanonicalCut(group, profile, geometry, lineageRevision, high, live, sources, supports, lineage, baseline, root, source)
+                ActivationRoot(cut, current)
+            }
+        } catch (_: Exception) { null }
+    }
+}
+private data class ActivationSlot(val revision: Long, val rootHash: CanonicalReceiptBytes) {
+    fun bytes() = checked { out -> out.writeInt(0x4d334153); out.writeInt(1); out.writeLong(revision); out.write(rootHash.toByteArray()) }
+    companion object { const val BYTES = 80; fun read(file: File) = readCheckedActivation(file, BYTES) { input -> require(input.readInt() == 0x4d334153 && input.readInt() == 1); ActivationSlot(input.readLong().also { require(it > 0) }, CanonicalReceiptBytes(ByteArray(32).also(input::readFully))) } }
+}
+private data class ActivationSelector(val slot: Int, val revision: Long, val rootHash: CanonicalReceiptBytes) {
+    fun bytes() = checked { out -> out.writeInt(0x4d334154); out.writeInt(1); out.writeByte(slot); out.writeLong(revision); out.write(rootHash.toByteArray()); repeat(7) { out.writeByte(0) } }
+    companion object { const val BYTES = 88; fun read(file: File) = readCheckedActivation(file, BYTES) { input -> require(input.readInt() == 0x4d334154 && input.readInt() == 1); val slot = input.readUnsignedByte(); require(slot in 0..1); ActivationSelector(slot, input.readLong().also { require(it > 0) }, CanonicalReceiptBytes(ByteArray(32).also(input::readFully))).also { repeat(7) { require(input.readUnsignedByte() == 0) } } } }
+}
+private object CanonicalActivationSelectorDigest { fun of(bytes: ByteArray) = CanonicalReceiptBytes(MessageDigest.getInstance("SHA-256").digest(bytes)) }
+private fun checked(body: (DataOutputStream) -> Unit): ByteArray { val raw = ByteArrayOutputStream(); DataOutputStream(raw).use(body); val bytes = raw.toByteArray(); return bytes + MessageDigest.getInstance("SHA-256").digest(bytes) }
+private fun checkedBody(bytes: ByteArray): ByteArray? {
+    if (bytes.size <= 32) return null
+    val body = bytes.copyOf(bytes.size - 32)
+    return body.takeIf { MessageDigest.getInstance("SHA-256").digest(it).contentEquals(bytes.copyOfRange(body.size, bytes.size)) }
+}
+private fun readBounded(file: File, maximum: Int, minimum: Int): ByteArray? = try {
+    val length = file.length()
+    if (!file.isFile || length !in minimum.toLong()..maximum.toLong()) return null
+    val bytes = ByteArray(length.toInt())
+    FileInputStream(file).use { input ->
+        var offset = 0
+        while (offset < bytes.size) {
+            val count = input.read(bytes, offset, bytes.size - offset)
+            if (count <= 0) return null
+            offset += count
+        }
+        if (input.read() != -1) return null
+    }
+    bytes
+} catch (_: Exception) { null }
+private fun <T> readCheckedActivation(file: File, size: Int, reader: (DataInputStream) -> T): T? = try {
+    val bytes = readBounded(file, size, size) ?: return null
+    val body = checkedBody(bytes) ?: return null
+    DataInputStream(ByteArrayInputStream(body)).use { input -> reader(input).also { require(input.read() == -1) } }
+} catch (_: Exception) { null }
+private const val MAX_ATTEMPT_BYTES = 2_048
+private const val MAX_ROOT_BYTES = 8_192
+private const val CURRENT_STREAM_BUFFER_BYTES = 8 * 1024
+internal object CanonicalActivationResources {
+    const val MAX_CURRENT_BYTES = 1_048_576L
+    const val RETAINED_STATE_BYTES = 1_024L
+    const val MAXIMUM_PROFILE_RETAINED_BYTES = 14_565_056L
+    const val SHARED_PHASE_BYTES = 1_048_576L
+    const val INTEGRATED_PEAK_BYTES = MAXIMUM_PROFILE_RETAINED_BYTES + RETAINED_STATE_BYTES + SHARED_PHASE_BYTES
+}
+private fun CanonicalCurrentIdentity.toIntentReceipt() =
+    PreparedIntentCurrentReceipt(canonicalLength, canonicalHash)

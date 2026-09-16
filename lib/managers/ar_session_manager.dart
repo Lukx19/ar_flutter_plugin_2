@@ -602,11 +602,22 @@ class ARSessionManager {
     try {
       final serializedCameraPose =
           await _channel.invokeMethod<List<dynamic>>('getCameraPose', {});
-      return MatrixConverter().fromJson(serializedCameraPose!);
+      if (serializedCameraPose == null) {
+        return null;
+      }
+      return MatrixConverter().fromJson(serializedCameraPose);
     } catch (e) {
       print('Error caught: ' + e.toString());
       return null;
     }
+  }
+
+  /// Returns native frame-cadence diagnostics for this AR view.
+  Future<Map<String, Object?>> getRendererPerformanceSnapshot() async {
+    return await _channel.invokeMapMethod<String, Object?>(
+          'getRendererPerformanceSnapshot',
+        ) ??
+        const <String, Object?>{};
   }
 
   /// Returns the given anchor pose in Matrix4 format with respect to the world coordinate system of the [ARView]
@@ -619,7 +630,10 @@ class ARSessionManager {
           await _channel.invokeMethod<List<dynamic>>('getAnchorPose', {
         "anchorId": anchor.name,
       });
-      return MatrixConverter().fromJson(serializedCameraPose!);
+      if (serializedCameraPose == null) {
+        return null;
+      }
+      return MatrixConverter().fromJson(serializedCameraPose);
     } catch (e) {
       print('Error caught: ' + e.toString());
       return null;

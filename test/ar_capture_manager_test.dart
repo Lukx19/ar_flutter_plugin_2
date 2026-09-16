@@ -10,7 +10,9 @@ import 'package:ar_flutter_plugin_2/models/ar_camera_intrinsics.dart';
 import 'package:ar_flutter_plugin_2/models/ar_capture_config.dart';
 import 'package:ar_flutter_plugin_2/models/camera_resolution.dart';
 import 'package:ar_flutter_plugin_2/models/capture_capacity.dart';
+import 'package:ar_flutter_plugin_2/models/capture_intent_contract.dart';
 import 'package:ar_flutter_plugin_2/models/capture_quality_policy.dart';
+import 'package:ar_flutter_plugin_2/models/native_capture_v2.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -45,6 +47,8 @@ void main() {
   String? initializeErrorCode;
   String? initializeErrorMessage;
   dynamic initializeCaptureResponse;
+  Map<String, dynamic>? nativeAdmissionResponse;
+  bool debugSyntheticRouteInstalled = true;
 
   setUp(() {
     ARCaptureManager.debugIsSupportedOverride = true;
@@ -63,6 +67,8 @@ void main() {
     initializeErrorCode = null;
     initializeErrorMessage = null;
     initializeCaptureResponse = <String, dynamic>{'mode': 'sharedCamera'};
+    nativeAdmissionResponse = null;
+    debugSyntheticRouteInstalled = true;
     SharedPreferences.setMockInitialValues(<String, Object>{});
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(captureChannel, (call) async {
@@ -408,10 +414,115 @@ void main() {
             'isFlashReady': true,
             'flashStatus': 'ready',
           };
+        case 'debugNativeCaptureV2Synthetic':
+          return debugSyntheticRouteInstalled;
+        case 'admitNativeCaptureV2':
+          return nativeAdmissionResponse;
         default:
           return null;
       }
     });
+  });
+
+  test('debug V2 route fails closed when native binding rejects install',
+      () async {
+    final sessionManager = ARSessionManager(
+      42,
+      _FakeBuildContext(),
+      PlaneDetectionConfig.horizontal,
+    );
+    final captureManager = ARCaptureManager(
+      sessionManager,
+      captureConfig,
+      _FakeBuildContext(),
+    );
+
+    await captureManager.debugConfigureNativeCaptureV2(fault: 'store');
+    expect(
+      methodCalls.last.arguments,
+      <String, Object?>{'fault': 'store'},
+    );
+
+    debugSyntheticRouteInstalled = false;
+    await expectLater(
+      captureManager.debugConfigureNativeCaptureV2(fault: 'malformed'),
+      throwsA(
+        isA<ARCaptureException>().having(
+          (error) => error.code,
+          'code',
+          'NATIVE_CAPTURE_V2_DEBUG_ROUTE_UNAVAILABLE',
+        ),
+      ),
+    );
+  });
+
+  test('admission terminal is exact once across result and live callback',
+      () async {
+    final admission = _nativeAdmission();
+    final terminal = <String, dynamic>{
+      'wireVersion': nativeCaptureV2WireVersion,
+      'kind': 'abandoned',
+      'attemptId': 'attempt',
+      'reason': 'camera-synthetic-camera',
+      'recoveryContext': admission.recoveryContext.toMap(),
+    };
+    nativeAdmissionResponse = <String, dynamic>{
+      'wireVersion': nativeCaptureV2WireVersion,
+      'attemptId': 'attempt',
+      'phase': 'abandoned_attempt',
+      'durable': true,
+      'terminal': terminal,
+    };
+    final sessionManager = ARSessionManager(
+      42,
+      _FakeBuildContext(),
+      PlaneDetectionConfig.horizontal,
+    );
+    final captureManager = ARCaptureManager(
+      sessionManager,
+      captureConfig,
+      _FakeBuildContext(),
+    );
+    final events = <ARNativeCaptureEventV2>[];
+    final errors = <Object>[];
+    final subscription = captureManager.nativeCaptureV2Events.listen(
+      events.add,
+      onError: errors.add,
+    );
+
+    final first = await captureManager.admitNativeCaptureV2(admission);
+    final replay = await captureManager.admitNativeCaptureV2(admission);
+    await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .handlePlatformMessage(
+      captureChannel.name,
+      const StandardMethodCodec().encodeMethodCall(
+        MethodCall('onNativeCaptureV2Event', terminal),
+      ),
+      (_) {},
+    );
+    await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .handlePlatformMessage(
+      captureChannel.name,
+      const StandardMethodCodec().encodeMethodCall(
+        MethodCall('onNativeCaptureV2Event', <String, dynamic>{
+          ...terminal,
+          'reason': 'changed|camera-terminal',
+        }),
+      ),
+      (_) {},
+    );
+    await Future<void>.delayed(Duration.zero);
+
+    expect(first.terminal?.kind, ARNativeCaptureEventKindV2.abandoned);
+    expect(replay.terminal?.kind, ARNativeCaptureEventKindV2.abandoned);
+    expect(
+      events.where((event) => event.isTerminal).map((event) => event.attemptId),
+      ['attempt'],
+    );
+    expect(errors, [isA<StateError>()]);
+
+    await subscription.cancel();
+    await captureManager.dispose();
   });
 
   tearDown(() {
@@ -1503,7 +1614,7 @@ void main() {
     );
 
     await expectLater(
-        captureManager.getImageData('missing-image', CaptureAssetFormat.jpeg),
+      captureManager.getImageData('missing-image', CaptureAssetFormat.jpeg),
       throwsA(
         isA<ARCaptureException>()
             .having((error) => error.code, 'code', 'IMAGE_NOT_FOUND')
@@ -1532,7 +1643,7 @@ void main() {
       captureManager.saveImageToFile(
         'img-1',
         '/tmp/test.png',
-          CaptureAssetFormat.jpeg,
+        CaptureAssetFormat.jpeg,
       ),
       throwsA(
         isA<ARCaptureException>()
@@ -2350,9 +2461,87 @@ void main() {
       isEmpty,
     );
     expect(
-        await captureManager.getImageData('img-1', CaptureAssetFormat.jpeg),
+      await captureManager.getImageData('img-1', CaptureAssetFormat.jpeg),
       isNull,
     );
     expect(await captureManager.getCameraIntrinsics(), isNull);
   });
+}
+
+ARNativeCaptureAdmissionV2 _nativeAdmission() {
+  final digest = List<int>.filled(32, 7);
+  final cut = CaptureLifecycleCut(
+    sessionId: 'session',
+    sessionGeneration: 1,
+    groupId: 'group',
+    groupGeneration: 1,
+    arSessionId: 'ar',
+    viewId: 'view',
+    viewGeneration: 1,
+    bindingToken: 'binding',
+    lifecycleSequence: 1,
+    operationGeneration: 1,
+  );
+  return ARNativeCaptureAdmissionV2(
+    accepted: CaptureAcceptedAttempt(
+      identity: CaptureAttemptIdentity(
+        attemptId: 'attempt',
+        commitId: 'commit',
+        attemptOrdinal: 1,
+        lifecycleCut: cut,
+      ),
+      lane: CaptureLane.manual,
+      profile: CaptureComponentProfile(
+        profileId: 'jpeg-v2',
+        requiredComponents: const {CaptureComponentKind.jpeg},
+        maximumComponentBytes: 1024,
+        maximumWorkingBytes: 128,
+      ),
+      reservation: CaptureReservationLiability(
+        memoryBytes: 128,
+        physicalStoreBytes: NativeCaptureReservationBoundsV2.physicalBytes(
+          1024,
+          1,
+        ),
+        componentEntries: 1,
+        terminalEntries: 1,
+        rollbackBytes: NativeCaptureReservationBoundsV2.rollbackBytes(1024),
+        physicallyBacked: true,
+      ),
+      canonicalIntentHash: digest,
+      acceptedReceiptHash: digest,
+    ),
+    poseRecordHash: digest,
+    cameraModelHash: digest,
+    validationRecordHash: digest,
+    ledgerRecordHash: digest,
+    recoveryContext: ARNativeCaptureRecoveryContextV2(
+      sessionId: 'session',
+      groupId: 'group',
+      groupIndex: 0,
+      groupGeneration: 1,
+      trigger: 'manual',
+      requestedAtMs: 1,
+      coverageRevision: 0,
+      timestampMs: 1,
+      position: const [0, 0, 0],
+      rotation: const [0, 0, 0, 1],
+      viewMatrix: List<double>.generate(
+        16,
+        (index) => index % 5 == 0 ? 1 : 0,
+      ),
+      projectionMatrix: List<double>.generate(
+        16,
+        (index) => index % 5 == 0 ? 1 : 0,
+      ),
+      groupFromWorld: List<double>.generate(
+        16,
+        (index) => index % 5 == 0 ? 1 : 0,
+      ),
+      worldFromGroup: List<double>.generate(
+        16,
+        (index) => index % 5 == 0 ? 1 : 0,
+      ),
+    ),
+  );
 }

@@ -1,0 +1,637 @@
+package com.uhg0.ar_flutter_plugin_2.capture
+
+import java.io.File
+import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
+
+data class StorageBudgetPolicyV2(val quotaBytes: Long, val freeSpaceFloorBytes: Long) {
+    init { require(quotaBytes >= 0 && freeSpaceFloorBytes >= 0) }
+}
+
+data class StorageBudgetReservationV2(
+    val token: String,
+    val owner: String,
+    val bytes: Long,
+    val stagingName: String? = null,
+    val targetName: String? = null,
+    val pointerPublicationId: String? = null,
+    val pointerSlot: Int? = null,
+    val pointerRootBeforeBytes: Long? = null,
+    val pointerSlotBeforeBytes: Long? = null,
+    val pointerSelectorBeforeBytes: Long? = null,
+    val pointerCommitBytes: Long? = null,
+)
+
+sealed interface StorageBudgetCandidateReservationV2 {
+    data class Reserved(val reservation: StorageBudgetReservationV2) : StorageBudgetCandidateReservationV2
+    data object TargetReserved : StorageBudgetCandidateReservationV2
+    data object QuotaRefused : StorageBudgetCandidateReservationV2
+}
+
+/** Process-global, refreshed, physically-backed storage authority. */
+class StorageBudgetCoordinatorV2(
+    directory: File,
+    private val policy: StorageBudgetPolicyV2,
+    filesystemBackend: DescriptorFilesystemV2 = AndroidDescriptorFilesystemV2(),
+    private val freeBytes: () -> Long = { directory.usableSpace },
+) : AutoCloseable {
+    private val files = SafeFilesystemV2(directory, DurableStoreFaultInjectorV2 { }, filesystemBackend)
+    private val ledger = files.child("ledger-v2")
+    private val reservationsDirectory = files.child("reservations-v2")
+    private val reclaimsDirectory = files.child("reclaims-v2")
+    private var committed = 0L
+    private val reservations = linkedMapOf<String, StorageBudgetReservationV2>()
+    private val ownedCandidateTokens = hashSetOf<String>()
+
+    init {
+        try {
+            files.ensureDirectory(reservationsDirectory)
+            files.ensureDirectory(reclaimsDirectory)
+        } catch (error: Throwable) { files.close(); throw error }
+    }
+
+    /** Closes only the bound filesystem created from the borrowed backend factory. */
+    override fun close() = synchronized(lockFor(requireNotNull(ledger.parentFile))) {
+        liveCandidateTokens.removeAll(ownedCandidateTokens)
+        ownedCandidateTokens.clear()
+        files.close()
+    }
+
+    fun reserve(owner: String, bytes: Long): StorageBudgetReservationV2? = withAuthority {
+        require(owner.matches(OWNER)) { "Storage reservation owner is non-canonical" }
+        if (bytes <= 0 || !canCharge(bytes)) return@withAuthority null
+        val token = sha256("$owner:$bytes:${nextTokenLocked()}".toByteArray()).hex()
+        val reservation = StorageBudgetReservationV2(token, owner, bytes)
+        val allocation = allocationFile(token)
+        val metadata = metadataFile(token)
+        try {
+            files.allocateExclusive(allocation, bytes)
+            files.writeExclusive(metadata, "$owner\n$bytes\n".toByteArray(), DurableStoreFaultPointV2.ACCEPTED_RECORD)
+            reservations[token] = reservation
+            persistLedgerLocked()
+            reservation
+        } catch (error: Throwable) {
+            if (files.isFile(metadata)) files.delete(metadata, DurableStoreFaultPointV2.DELETE_RECLAIM)
+            if (files.isFile(allocation)) files.delete(allocation, DurableStoreFaultPointV2.DELETE_RECLAIM)
+            throw error
+        }
+    }
+
+    /** Physically backed durable reservation for one hash-identified pointer publication. */
+    fun reservePointerPublication(
+        owner: String,
+        publicationId: String,
+        slot: Int,
+        rootBeforeBytes: Long,
+        slotBeforeBytes: Long,
+        selectorBeforeBytes: Long,
+        commitBytes: Long,
+        maximumPhysicalBytes: Long,
+    ): StorageBudgetReservationV2? = withAuthority {
+        require(owner.matches(OWNER) && publicationId.matches(POINTER_PUBLICATION))
+        require(slot in 0..1 && listOf(rootBeforeBytes, slotBeforeBytes, selectorBeforeBytes, commitBytes).all { it >= 0L })
+        require(commitBytes <= maximumPhysicalBytes && maximumPhysicalBytes > 0L)
+        if (!canCharge(maximumPhysicalBytes)) return@withAuthority null
+        val token = sha256("$owner:$publicationId:$maximumPhysicalBytes:${nextTokenLocked()}".toByteArray()).hex()
+        val reservation = StorageBudgetReservationV2(
+            token, owner, maximumPhysicalBytes,
+            pointerPublicationId = publicationId,
+            pointerSlot = slot,
+            pointerRootBeforeBytes = rootBeforeBytes,
+            pointerSlotBeforeBytes = slotBeforeBytes,
+            pointerSelectorBeforeBytes = selectorBeforeBytes,
+            pointerCommitBytes = commitBytes,
+        )
+        val allocation = allocationFile(token)
+        val metadata = metadataFile(token)
+        try {
+            files.allocateExclusive(allocation, maximumPhysicalBytes)
+            files.writeExclusive(
+                metadata,
+                "$owner\n$maximumPhysicalBytes\nPOINTER\n$publicationId\n$slot\n$rootBeforeBytes\n$slotBeforeBytes\n$selectorBeforeBytes\n$commitBytes\n".toByteArray(),
+                DurableStoreFaultPointV2.ACCEPTED_RECORD,
+            )
+            reservations[token] = reservation
+            persistLedgerLocked()
+            reservation
+        } catch (error: Throwable) {
+            if (files.isFile(metadata)) files.delete(metadata, DurableStoreFaultPointV2.DELETE_RECLAIM)
+            if (files.isFile(allocation)) files.delete(allocation, DurableStoreFaultPointV2.DELETE_RECLAIM)
+            throw error
+        }
+    }
+
+    fun pointerPublications(): List<StorageBudgetReservationV2> = withAuthority {
+        reservations.values.filter { it.pointerPublicationId != null }
+    }
+
+    fun commitPointerPublication(reservation: StorageBudgetReservationV2) {
+        val bytes = requireNotNull(reservation.pointerCommitBytes)
+        commit(reservation, bytes)
+    }
+
+    /**
+     * Reserves storage by allocating the candidate files themselves. The staging tree remains the
+     * durable physical backing before and after publication; no second reservation-sized file exists.
+     */
+    fun reserveCandidate(
+        owner: String,
+        staging: File,
+        target: File,
+        fileBytes: Map<String, Long>,
+        maximumPhysicalBytes: Long,
+    ): StorageBudgetReservationV2? = when (val result = reserveCandidateExclusive(
+        owner, staging, target, fileBytes, maximumPhysicalBytes,
+    )) {
+        is StorageBudgetCandidateReservationV2.Reserved -> result.reservation
+        StorageBudgetCandidateReservationV2.TargetReserved,
+        StorageBudgetCandidateReservationV2.QuotaRefused -> null
+    }
+
+    /** Admits at most one durable reservation for a deterministic publication target. */
+    fun reserveCandidateExclusive(
+        owner: String,
+        staging: File,
+        target: File,
+        fileBytes: Map<String, Long>,
+        maximumPhysicalBytes: Long,
+    ): StorageBudgetCandidateReservationV2 = withAuthority {
+        require(owner.matches(OWNER)) { "Storage reservation owner is non-canonical" }
+        val stagingPath = candidateRelativePath(staging)
+        val targetPath = candidateRelativePath(target)
+        require(staging.name.matches(CANDIDATE) && target.name.matches(CANDIDATE))
+        require(fileBytes.isNotEmpty() && fileBytes.keys.all { it.matches(CANDIDATE) })
+        require(fileBytes.values.all { it >= 0L } && maximumPhysicalBytes > 0L)
+        if (reservations.values.any { it.targetName == targetPath })
+            return@withAuthority StorageBudgetCandidateReservationV2.TargetReserved
+        if (!canCharge(maximumPhysicalBytes)) return@withAuthority StorageBudgetCandidateReservationV2.QuotaRefused
+        val token = sha256("$owner:$maximumPhysicalBytes:${nextTokenLocked()}".toByteArray()).hex()
+        val reservation = StorageBudgetReservationV2(
+            token, owner, maximumPhysicalBytes, stagingPath, targetPath,
+        )
+        val metadata = metadataFile(token)
+        try {
+            check(!files.isDirectory(staging) && !files.isDirectory(target))
+            files.ensureDirectory(staging)
+            fileBytes.toSortedMap().forEach { (name, bytes) ->
+                if (bytes == 0L) files.writeExclusive(
+                    File(staging, name), ByteArray(0), DurableStoreFaultPointV2.ACCEPTED_RECORD,
+                ) else files.allocateExclusive(File(staging, name), bytes)
+                require(files.allocatedTreeBytes(staging) <= maximumPhysicalBytes)
+                require(freeBytes() >= policy.freeSpaceFloorBytes) {
+                    "Candidate allocation violates free-space floor"
+                }
+            }
+            val actual = files.allocatedTreeBytes(staging)
+            require(actual in 1..maximumPhysicalBytes)
+            require(freeBytes() >= policy.freeSpaceFloorBytes) { "Candidate violates free-space floor" }
+            files.writeExclusive(
+                metadata,
+                "$owner\n$maximumPhysicalBytes\n$stagingPath\n$targetPath\n".toByteArray(),
+                DurableStoreFaultPointV2.ACCEPTED_RECORD,
+            )
+            require(freeBytes() >= policy.freeSpaceFloorBytes)
+            reservations[token] = reservation
+            ownedCandidateTokens += token
+            liveCandidateTokens += token
+            persistLedgerLocked()
+            require(freeBytes() >= policy.freeSpaceFloorBytes)
+            StorageBudgetCandidateReservationV2.Reserved(reservation)
+        } catch (error: Throwable) {
+            reservations.remove(token)
+            ownedCandidateTokens -= token
+            liveCandidateTokens -= token
+            if (files.isFile(metadata)) files.delete(metadata, DurableStoreFaultPointV2.DELETE_RECLAIM)
+            if (files.isDirectory(staging)) files.deleteTree(staging, DurableStoreFaultPointV2.DELETE_RECLAIM)
+            throw error
+        }
+    }
+
+    fun verifyCandidate(reservation: StorageBudgetReservationV2, candidate: File): Long = withAuthority {
+        val current = requireReservationLocked(reservation)
+        require(current.stagingName != null && candidateRelativePath(candidate) in setOf(current.stagingName, current.targetName))
+        val actual = files.allocatedTreeBytes(candidate)
+        require(actual in 1..current.bytes)
+        require(freeBytes() >= policy.freeSpaceFloorBytes) { "Candidate violates free-space floor" }
+        actual
+    }
+
+    fun publishCandidate(reservation: StorageBudgetReservationV2, staging: File, target: File) = withAuthority {
+        val current = requireReservationLocked(reservation)
+        require(current.stagingName == candidateRelativePath(staging) && current.targetName == candidateRelativePath(target))
+        val before = files.allocatedTreeBytes(staging)
+        require(before in 1..current.bytes && freeBytes() >= policy.freeSpaceFloorBytes)
+        files.moveAtomic(staging, target)
+        val after = files.allocatedTreeBytes(target)
+        require(after == before && freeBytes() >= policy.freeSpaceFloorBytes)
+    }
+
+    /** Completes a publication cut left after the durable rename but before the explicit commit. */
+    fun reconcilePublishedCandidate(target: File) = withAuthority {
+        val current = reservations.values.singleOrNull { it.targetName == candidateRelativePath(target) } ?: return@withAuthority
+        require(files.isDirectory(target) && current.stagingName != null)
+        val actual = files.allocatedTreeBytes(target)
+        commitCandidateLocked(current, actual)
+    }
+
+    /** Reopen-only resolution for one known target: commit a rename or reclaim its private staging. */
+    fun reconcileCandidate(target: File) = withAuthority {
+        val current = reservations.values.singleOrNull { it.targetName == candidateRelativePath(target) } ?: return@withAuthority
+        val staging = candidateFile(requireNotNull(current.stagingName))
+        when {
+            files.isDirectory(target) -> commitCandidateLocked(current, files.allocatedTreeBytes(target))
+            current.token in liveCandidateTokens -> Unit
+            files.isDirectory(staging) -> {
+                files.delete(metadataFile(current.token), DurableStoreFaultPointV2.DELETE_RECLAIM)
+                reservations.remove(current.token)
+                ownedCandidateTokens -= current.token
+                liveCandidateTokens -= current.token
+                persistLedgerLocked()
+                files.deleteTree(staging, DurableStoreFaultPointV2.DELETE_RECLAIM)
+            }
+            else -> error("Candidate reservation has no physical backing")
+        }
+    }
+
+    fun releaseCandidate(reservation: StorageBudgetReservationV2, staging: File): Boolean = withAuthority {
+        val current = reservations[reservation.token] ?: return@withAuthority false
+        require(current == reservation && current.stagingName == candidateRelativePath(staging))
+        // Remove authority first. A crash can then leave only an uncharged staging orphan, which
+        // recovery reclaims under this same global lock before another reservation is admitted.
+        files.delete(metadataFile(current.token), DurableStoreFaultPointV2.DELETE_RECLAIM)
+        reservations.remove(current.token)
+        ownedCandidateTokens -= current.token
+        liveCandidateTokens -= current.token
+        persistLedgerLocked()
+        if (files.isDirectory(staging)) files.deleteTree(staging, DurableStoreFaultPointV2.DELETE_RECLAIM)
+        true
+    }
+
+    fun commit(reservation: StorageBudgetReservationV2, actualBytes: Long) = withAuthority {
+        val current = requireReservationLocked(reservation)
+        require(actualBytes in 0..current.bytes)
+        if (current.stagingName != null) {
+            commitCandidateLocked(current, actualBytes)
+            return@withAuthority
+        }
+        if (current.pointerPublicationId != null) {
+            require(actualBytes == current.pointerCommitBytes)
+            commitPointerLocked(current, actualBytes)
+            return@withAuthority
+        }
+        val other = reservedBytesLocked() - current.bytes
+        val violatesFreeFloor = actualBytes > freeBytes() - policy.freeSpaceFloorBytes - other
+        if (actualBytes > policy.quotaBytes - committed || violatesFreeFloor) {
+            throw IllegalStateException("Committed bytes would violate the global storage budget")
+        }
+        committed = Math.addExact(committed, actualBytes)
+        deleteReservationLocked(current)
+        persistLedgerLocked()
+    }
+
+    fun release(reservation: StorageBudgetReservationV2): Boolean = withAuthority {
+        val current = reservations[reservation.token] ?: return@withAuthority false
+        if (current != reservation) throw IllegalStateException("Storage reservation token conflict")
+        deleteReservationLocked(current)
+        persistLedgerLocked()
+        true
+    }
+
+    fun reclaimVerified(bytes: Long) = withAuthority {
+        require(bytes in 1..committed)
+        committed -= bytes
+        persistLedgerLocked()
+    }
+
+    /**
+     * Applies one identity-bound reclaim exactly once. The DONE marker deliberately remains until
+     * the owning journal has durably advanced, so a crash after the ledger cut cannot double debit.
+     */
+    fun reclaimVerifiedOnce(reclaimId: String, bytes: Long) = withAuthority {
+        require(reclaimId.matches(RECLAIM_ID) && bytes > 0L)
+        val marker = verifiedReclaimFile(reclaimId)
+        if (files.isFile(marker)) {
+            val lines = files.readLines(marker)
+            require(lines.size == 4 && lines[0] == "DONE" && lines[1] == reclaimId && lines[2].toLongOrNull() == bytes)
+            return@withAuthority
+        }
+        require(bytes <= committed)
+        val previous = committed
+        files.atomicReplace(
+            marker,
+            "PENDING\n$reclaimId\n$bytes\n$previous\n".toByteArray(),
+            DurableStoreFaultPointV2.POINTER_SLOT_REPLACE,
+        )
+        committed = previous - bytes
+        persistLedgerLocked()
+        files.atomicReplace(
+            marker,
+            "DONE\n$reclaimId\n$bytes\n$previous\n".toByteArray(),
+            DurableStoreFaultPointV2.POINTER_SLOT_REPLACE,
+        )
+    }
+
+    fun forgetVerifiedReclaim(reclaimId: String) = withAuthority {
+        require(reclaimId.matches(RECLAIM_ID))
+        val marker = verifiedReclaimFile(reclaimId)
+        if (files.isFile(marker)) {
+            val lines = files.readLines(marker)
+            require(lines.size == 4 && lines[0] == "DONE" && lines[1] == reclaimId)
+            files.delete(marker, DurableStoreFaultPointV2.DELETE_RECLAIM)
+        }
+    }
+
+    /**
+     * Deletes one exact committed canonical surface private generation before releasing its charge. A durable
+     * marker lets recovery finish either half without ever exposing an uncharged tree.
+     */
+    fun reclaimCommittedCandidate(candidate: File): Long = withAuthority {
+        val candidatePath = candidateRelativePath(candidate)
+        require(candidate.name.matches(COMMITTED_CANONICAL_SURFACE_CANDIDATE))
+        val actual = files.allocatedTreeBytes(candidate)
+        require(actual in 1..committed)
+        val previous = committed
+        val marker = reclaimFile(candidatePath)
+        files.atomicReplace(
+            marker,
+            "$candidatePath\n$actual\n$previous\n".toByteArray(),
+            DurableStoreFaultPointV2.POINTER_SLOT_REPLACE,
+        )
+        files.deleteTree(candidate, DurableStoreFaultPointV2.DELETE_RECLAIM)
+        committed = previous - actual
+        persistLedgerLocked()
+        files.delete(marker, DurableStoreFaultPointV2.DELETE_RECLAIM)
+        actual
+    }
+
+    fun reservation(token: String): StorageBudgetReservationV2? = withAuthority { reservations[token] }
+    fun committedBytes(): Long = withAuthority { committed }
+    fun reservedBytes(): Long = withAuthority { reservedBytesLocked() }
+    fun physicallyAllocatedBytes(token: String): Long = withAuthority {
+        reservations[token]?.let { files.allocatedLength(allocationFile(token)) } ?: 0L
+    }
+    fun physicallyAllocatedTreeBytes(directory: File): Long = withAuthority {
+        files.allocatedTreeBytes(directory)
+    }
+    fun allocationUnitBytes(path: File): Long = withAuthority {
+        files.allocationUnit(path)
+    }
+
+    private fun <T> withAuthority(block: () -> T): T = synchronized(lockFor(requireNotNull(ledger.parentFile))) {
+        recoverLocked()
+        block()
+    }
+
+    /** Reloaded before every mutation and query so independent instances never use stale state. */
+    private fun recoverLocked() {
+        committed = if (files.isFile(ledger)) files.readBytes(ledger).toString(Charsets.UTF_8).trim().toLongOrNull()
+            ?: error("Corrupt storage budget ledger") else 0L
+        require(committed >= 0) { "Corrupt storage budget ledger" }
+        files.list(reclaimsDirectory)
+            .filter { it.name.matches(Regex("verified-[0-9a-f]{64}\\.reclaim")) }
+            .sortedBy(File::getName)
+            .forEach { marker ->
+                val lines = files.readLines(marker)
+                require(lines.size == 4 && lines[0] in setOf("PENDING", "DONE") && lines[1].matches(RECLAIM_ID)) {
+                    "Corrupt verified reclaim"
+                }
+                val bytes = lines[2].toLongOrNull() ?: error("Corrupt verified reclaim bytes")
+                val previous = lines[3].toLongOrNull() ?: error("Corrupt verified reclaim revision")
+                require(bytes > 0 && previous >= bytes)
+                if (lines[0] == "PENDING") {
+                    require(committed in setOf(previous, previous - bytes))
+                    if (committed == previous) {
+                        committed = previous - bytes
+                        persistLedgerLocked()
+                    }
+                    files.atomicReplace(
+                        marker,
+                        "DONE\n${lines[1]}\n$bytes\n$previous\n".toByteArray(),
+                        DurableStoreFaultPointV2.POINTER_SLOT_REPLACE,
+                    )
+                }
+            }
+        files.list(reclaimsDirectory)
+            .filter { it.name.matches(Regex("[0-9a-f]{64}\\.reclaim")) }
+            .sortedBy(File::getName)
+            .forEach { marker ->
+                val lines = files.readLines(marker)
+                require(lines.size == 3 && lines[0].matches(COMMITTED_CANONICAL_SURFACE_CANDIDATE_PATH)) { "Corrupt committed reclaim" }
+                val bytes = lines[1].toLongOrNull() ?: error("Corrupt committed reclaim bytes")
+                val previous = lines[2].toLongOrNull() ?: error("Corrupt committed reclaim revision")
+                require(bytes > 0 && previous >= bytes && committed in setOf(previous, previous - bytes))
+                val candidate = candidateFile(lines[0])
+                if (files.isDirectory(candidate)) {
+                    require(committed == previous) { "Committed reclaim target reappeared after ledger release" }
+                    require(files.allocatedTreeBytes(candidate) == bytes)
+                    files.deleteTree(candidate, DurableStoreFaultPointV2.DELETE_RECLAIM)
+                }
+                if (committed == previous) {
+                    committed = previous - bytes
+                    persistLedgerLocked()
+                }
+                files.delete(marker, DurableStoreFaultPointV2.DELETE_RECLAIM)
+            }
+        files.list(reclaimsDirectory)
+            .filter { it.name.matches(Regex("\\.[0-9a-f]{64}\\.reclaim\\.part")) }
+            .forEach { files.delete(it, DurableStoreFaultPointV2.DELETE_RECLAIM) }
+        reservations.clear()
+        val metadata = files.list(reservationsDirectory).filter { it.name.matches(Regex("[0-9a-f]{64}\\.reservation")) }
+        metadata.sortedBy(File::getName).forEach { file ->
+            val lines = files.readLines(file)
+            require(lines.size in setOf(2, 4, 5, 9, 10) && lines[0].matches(OWNER)) { "Corrupt storage reservation" }
+            val bytes = lines[1].toLongOrNull() ?: error("Corrupt storage reservation bytes")
+            val token = file.name.removeSuffix(".reservation")
+            if (lines.size == 2 || lines.size in setOf(9, 10)) {
+                require(bytes > 0 && files.isFile(allocationFile(token)) && files.length(allocationFile(token)) == bytes) {
+                    "Reservation is not physically backed"
+                }
+                val reservation = if (lines.size == 2) StorageBudgetReservationV2(token, lines[0], bytes) else {
+                    require(lines[2] == "POINTER" && lines[3].matches(POINTER_PUBLICATION))
+                    val slot = lines[4].toIntOrNull() ?: error("Corrupt pointer reservation slot")
+                    val rootBefore = lines[5].toLongOrNull() ?: error("Corrupt pointer root allocation")
+                    val slotBefore = lines[6].toLongOrNull() ?: error("Corrupt pointer slot allocation")
+                    val selectorBefore = lines[7].toLongOrNull() ?: error("Corrupt pointer selector allocation")
+                    val commitBytes = lines[8].toLongOrNull() ?: error("Corrupt pointer commit allocation")
+                    require(slot in 0..1 && listOf(rootBefore, slotBefore, selectorBefore, commitBytes).all { it >= 0L } && commitBytes <= bytes)
+                    StorageBudgetReservationV2(
+                        token, lines[0], bytes,
+                        pointerPublicationId = lines[3], pointerSlot = slot,
+                        pointerRootBeforeBytes = rootBefore, pointerSlotBeforeBytes = slotBefore,
+                        pointerSelectorBeforeBytes = selectorBefore, pointerCommitBytes = commitBytes,
+                    )
+                }
+                if (lines.size == 10) {
+                    val state = lines[9].split(':')
+                    val actual = requireNotNull(reservation.pointerCommitBytes)
+                    require(state.size == 3 && state[0] == "COMMITTING" && state[1].toLongOrNull() == actual)
+                    val previous = state[2].toLongOrNull() ?: error("Corrupt pointer commit revision")
+                    require(committed in setOf(previous, Math.addExact(previous, actual)))
+                    if (committed == previous) {
+                        committed = Math.addExact(previous, actual)
+                        persistLedgerLocked()
+                    }
+                    files.delete(file, DurableStoreFaultPointV2.DELETE_RECLAIM)
+                    if (files.isFile(allocationFile(token))) files.delete(allocationFile(token), DurableStoreFaultPointV2.DELETE_RECLAIM)
+                } else reservations[token] = reservation
+            } else {
+                require(lines[2].matches(CANDIDATE_PATH) && lines[3].matches(CANDIDATE_PATH))
+                val staging = candidateFile(lines[2]); val target = candidateFile(lines[3])
+                val backing = when {
+                    files.isDirectory(target) -> target
+                    files.isDirectory(staging) -> staging
+                    else -> error("Candidate reservation is not physically backed")
+                }
+                val actual = files.allocatedTreeBytes(backing)
+                require(actual in 1..bytes) { "Candidate reservation exceeds liability" }
+                val reservation = StorageBudgetReservationV2(token, lines[0], bytes, lines[2], lines[3])
+                if (lines.size == 5) {
+                    val state = lines[4].split(':')
+                    require(state.size == 3 && state[0] == "COMMITTING" && backing == target)
+                    val candidateBytes = state[1].toLongOrNull() ?: error("Corrupt candidate commit")
+                    val previous = state[2].toLongOrNull() ?: error("Corrupt candidate commit")
+                    require(candidateBytes == actual && committed in setOf(previous, Math.addExact(previous, actual)))
+                    if (committed == previous) {
+                        committed = Math.addExact(previous, actual)
+                        persistLedgerLocked()
+                    }
+                    files.delete(file, DurableStoreFaultPointV2.DELETE_RECLAIM)
+                } else reservations[token] = reservation
+            }
+        }
+        val candidateTargets = hashSetOf<String>()
+        require(reservations.values.mapNotNull { it.targetName }.all(candidateTargets::add)) {
+            "Duplicate durable candidate target reservation"
+        }
+        // An allocation without published metadata is not an authority and is reclaimed.
+        val live = reservations.keys
+        files.list(reservationsDirectory).filter { it.name.matches(Regex("[0-9a-f]{64}\\.allocation")) }
+            .filter { it.name.removeSuffix(".allocation") !in live }
+            .forEach { files.delete(it, DurableStoreFaultPointV2.DELETE_RECLAIM) }
+        files.list(reservationsDirectory)
+            .filter { it.name.matches(Regex("\\.[0-9a-f]{64}\\.reservation\\.part")) }
+            .forEach { files.delete(it, DurableStoreFaultPointV2.DELETE_RECLAIM) }
+        val liveStaging = reservations.values.mapNotNull { it.stagingName }.toSet()
+        files.list(requireNotNull(ledger.parentFile))
+            .filter { it.name.matches(STAGING) && it.name !in liveStaging && files.isDirectory(it) }
+            .forEach { files.deleteTree(it, DurableStoreFaultPointV2.DELETE_RECLAIM) }
+        files.list(requireNotNull(ledger.parentFile))
+            .filter { it.name.matches(GROUP_DIRECTORY) && files.isDirectory(it) }
+            .forEach { group ->
+                files.list(group)
+                    .filter { child ->
+                        child.name.matches(STAGING) &&
+                            "${group.name}/${child.name}" !in liveStaging && files.isDirectory(child)
+                    }
+                    .forEach { files.deleteTree(it, DurableStoreFaultPointV2.DELETE_RECLAIM) }
+            }
+        if (committed > policy.quotaBytes || policy.freeSpaceFloorBytes > freeBytes()) {
+            throw IllegalStateException("Storage budget cannot open within its physical quota/floor")
+        }
+    }
+
+    private fun canCharge(bytes: Long): Boolean {
+        val reserved = reservedBytesLocked()
+        if (committed > Long.MAX_VALUE - reserved || committed + reserved > Long.MAX_VALUE - bytes) return false
+        val charged = committed + reserved + bytes
+        return charged <= policy.quotaBytes && charged <= freeBytes() - policy.freeSpaceFloorBytes
+    }
+    private fun reservedBytesLocked() = reservations.values.fold(0L) { total, value -> Math.addExact(total, value.bytes) }
+    private fun requireReservationLocked(value: StorageBudgetReservationV2) =
+        reservations[value.token]?.also { check(it == value) { "Storage reservation token conflict" } }
+            ?: error("Storage reservation is stale or already closed")
+    private fun commitCandidateLocked(value: StorageBudgetReservationV2, actualBytes: Long) {
+        require(value.stagingName != null && actualBytes in 1..value.bytes)
+        require(actualBytes <= policy.quotaBytes - committed)
+        require(freeBytes() >= policy.freeSpaceFloorBytes)
+        files.atomicReplace(
+            metadataFile(value.token),
+            "${value.owner}\n${value.bytes}\n${value.stagingName}\n${value.targetName}\nCOMMITTING:$actualBytes:$committed\n".toByteArray(),
+            DurableStoreFaultPointV2.POINTER_SLOT_REPLACE,
+        )
+        committed = Math.addExact(committed, actualBytes)
+        persistLedgerLocked()
+        files.delete(metadataFile(value.token), DurableStoreFaultPointV2.DELETE_RECLAIM)
+        reservations.remove(value.token)
+        ownedCandidateTokens -= value.token
+        liveCandidateTokens -= value.token
+    }
+    private fun commitPointerLocked(value: StorageBudgetReservationV2, actualBytes: Long) {
+        require(value.pointerPublicationId != null && actualBytes == value.pointerCommitBytes && actualBytes in 0..value.bytes)
+        val other = reservedBytesLocked() - value.bytes
+        val violatesFreeFloor = actualBytes > freeBytes() - policy.freeSpaceFloorBytes - other
+        require(actualBytes <= policy.quotaBytes - committed && !violatesFreeFloor)
+        files.atomicReplace(
+            metadataFile(value.token),
+            (pointerMetadata(value) + "COMMITTING:$actualBytes:$committed\n").toByteArray(),
+            DurableStoreFaultPointV2.POINTER_SLOT_REPLACE,
+        )
+        committed = Math.addExact(committed, actualBytes)
+        persistLedgerLocked()
+        deleteReservationLocked(value)
+    }
+    private fun deleteReservationLocked(value: StorageBudgetReservationV2) {
+        files.delete(metadataFile(value.token), DurableStoreFaultPointV2.DELETE_RECLAIM)
+        if (value.stagingName == null) {
+            files.delete(allocationFile(value.token), DurableStoreFaultPointV2.DELETE_RECLAIM)
+        }
+        reservations.remove(value.token)
+    }
+    private fun nextTokenLocked() = "${reservations.size}:${committed}:${System.nanoTime()}"
+    private fun persistLedgerLocked() = files.atomicReplace(ledger, "$committed\n".toByteArray(), DurableStoreFaultPointV2.POINTER_SLOT_REPLACE)
+    private fun metadataFile(token: String) = files.child("reservations-v2", "$token.reservation")
+    private fun allocationFile(token: String) = files.child("reservations-v2", "$token.allocation")
+    private fun pointerMetadata(value: StorageBudgetReservationV2) =
+        "${value.owner}\n${value.bytes}\nPOINTER\n${value.pointerPublicationId}\n${value.pointerSlot}\n" +
+            "${value.pointerRootBeforeBytes}\n${value.pointerSlotBeforeBytes}\n${value.pointerSelectorBeforeBytes}\n${value.pointerCommitBytes}\n"
+    private fun reclaimFile(candidateName: String) = files.child(
+        "reclaims-v2",
+        "${sha256(candidateName.toByteArray()).hex()}.reclaim",
+    )
+    private fun verifiedReclaimFile(reclaimId: String) =
+        files.child("reclaims-v2", "verified-$reclaimId.reclaim")
+    private fun sha256(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes)
+    private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
+
+    private fun candidateRelativePath(candidate: File): String {
+        val root = requireNotNull(ledger.parentFile).absoluteFile.toPath().normalize()
+        val path = candidate.absoluteFile.toPath().normalize()
+        require(path.startsWith(root)) { "Candidate escapes storage root" }
+        val relative = root.relativize(path)
+        require(relative.nameCount in 1..2)
+        val segments = (0 until relative.nameCount).map { relative.getName(it).toString() }
+        require(segments.all { it.matches(CANDIDATE) })
+        if (segments.size == 2) require(segments.first().matches(GROUP_DIRECTORY))
+        return segments.joinToString("/")
+    }
+
+    private fun candidateFile(relative: String): File {
+        require(relative.matches(CANDIDATE_PATH))
+        return files.child(*relative.split('/').toTypedArray())
+    }
+
+    companion object {
+        private val OWNER = Regex("[A-Za-z0-9._:-]{1,160}")
+        private val CANDIDATE = Regex("[A-Za-z0-9._-]{1,160}")
+        private val GROUP_DIRECTORY = Regex("[0-9a-f]{32}")
+        private val CANDIDATE_PATH = Regex("(?:[0-9a-f]{32}/)?[A-Za-z0-9._-]{1,160}")
+        private val POINTER_PUBLICATION = Regex("[0-9a-f]{64}")
+        private val RECLAIM_ID = Regex("[0-9a-f]{64}")
+        private val COMMITTED_CANONICAL_SURFACE_CANDIDATE = Regex(
+            "(?:canonical-surface-cow-command-[0-9a-f]{64}|canonical-surface-canonical-v6-[0-9a-f]{64}\\.intent)",
+        )
+        private val COMMITTED_CANONICAL_SURFACE_CANDIDATE_PATH = Regex(
+            "(?:[0-9a-f]{32}/)?(?:canonical-surface-cow-command-[0-9a-f]{64}|canonical-surface-canonical-v6-[0-9a-f]{64}\\.intent)",
+        )
+        /** Exact private-candidate namespaces whose uncharged trees startup recovery may delete. */
+        private val STAGING = Regex(
+            "(?:canonical-surface-canonical-v6-[0-9a-f]{64}\\.staging-[A-Za-z0-9._-]{1,64}|" +
+                "\\.canonical-surface-cow-command-[0-9a-f]{64}\\.staging)",
+        )
+        private val locks = mutableMapOf<String, Any>()
+        private val liveCandidateTokens = ConcurrentHashMap.newKeySet<String>()
+        private fun lockFor(directory: File): Any = synchronized(locks) {
+            locks.getOrPut(directory.absoluteFile.toPath().normalize().toString()) { Any() }
+        }
+    }
+}

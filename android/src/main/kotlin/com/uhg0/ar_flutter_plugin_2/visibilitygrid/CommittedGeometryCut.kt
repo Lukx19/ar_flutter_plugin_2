@@ -1,0 +1,161 @@
+package com.uhg0.ar_flutter_plugin_2.visibilitygrid
+
+import java.util.Collections
+
+/** One immutable stable-identity row handed from canonical storage to a renderer. */
+internal data class CommittedGeometryRow(
+    val surfaceId: Long,
+    val voxel: Voxel,
+    val packedNormal: Int,
+    val normalConfidence: Int,
+    val lineageCount: Int,
+) {
+    init {
+        require(surfaceId in 1 until 0x1_0000_0000L)
+        require(normalConfidence in 0..255)
+        require(lineageCount in 0..0xffff)
+    }
+}
+
+/**
+ * Complete, post-commit canonical geometry delta. The arrays and list are
+ * copied at the boundary so a renderer cannot retain mutable canonical state.
+ */
+internal class CommittedGeometryCut(
+    val ownership: VisibilityObservationOwnership,
+    val transactionId: Long,
+    val baseGeometryRevision: Long,
+    val geometryRevision: Long,
+    val lineageRevision: Long,
+    val reset: Boolean,
+    upserts: List<CommittedGeometryRow>,
+    removedSurfaceIds: LongArray,
+) {
+    val upserts: List<CommittedGeometryRow> =
+        Collections.unmodifiableList(ArrayList(upserts))
+    private val removedSurfaceIdsValue: LongArray = removedSurfaceIds.copyOf()
+
+    /** Returns a defensive copy of stable identities removed by this cut. */
+    val removedSurfaceIds: LongArray
+        get() = removedSurfaceIdsValue.copyOf()
+
+    init {
+        require(transactionId >= 0)
+        require(baseGeometryRevision >= 0)
+        require(geometryRevision >= 0)
+        require(lineageRevision >= 0)
+        if (reset) {
+            require(baseGeometryRevision == 0L)
+            require(geometryRevision in 1 until Long.MAX_VALUE)
+        } else {
+            require(baseGeometryRevision < Long.MAX_VALUE)
+            require(geometryRevision == baseGeometryRevision + 1L)
+        }
+        require(upserts.map { it.surfaceId }.toSet().size == upserts.size)
+        require(removedSurfaceIds.all { it in 1 until 0x1_0000_0000L })
+        require(removedSurfaceIds.distinct().size == removedSurfaceIds.size)
+        require(upserts.none { it.surfaceId in removedSurfaceIds.toSet() }) {
+            "Committed geometry upsert and removal identities must be disjoint"
+        }
+    }
+
+    /** Creates one rebuild page while preserving the exact cut identity. */
+    internal fun withUpserts(rows: List<CommittedGeometryRow>): CommittedGeometryCut =
+        CommittedGeometryCut(
+            ownership = ownership,
+            transactionId = transactionId,
+            baseGeometryRevision = baseGeometryRevision,
+            geometryRevision = geometryRevision,
+            lineageRevision = lineageRevision,
+            reset = reset,
+            upserts = rows,
+            removedSurfaceIds = removedSurfaceIdsValue,
+        )
+
+    /** Modeled incremental ownership retained when this copied cut is queued for retry. */
+    internal fun modeledRetainedBytes(): Long = modeledRetainedBytes(upserts.size, removedSurfaceIdsValue.size)
+
+    override fun equals(other: Any?): Boolean = other is CommittedGeometryCut &&
+        ownership == other.ownership &&
+        transactionId == other.transactionId &&
+        baseGeometryRevision == other.baseGeometryRevision &&
+        geometryRevision == other.geometryRevision &&
+        lineageRevision == other.lineageRevision &&
+        reset == other.reset &&
+        upserts == other.upserts &&
+        removedSurfaceIdsValue.contentEquals(other.removedSurfaceIdsValue)
+
+    override fun hashCode(): Int = listOf(
+        ownership,
+        transactionId,
+        baseGeometryRevision,
+        geometryRevision,
+        lineageRevision,
+        reset,
+        upserts,
+    ).hashCode() * 31 + removedSurfaceIdsValue.contentHashCode()
+
+    override fun toString(): String =
+        "CommittedGeometryCut(ownership=$ownership, transactionId=$transactionId, " +
+            "baseGeometryRevision=$baseGeometryRevision, geometryRevision=$geometryRevision, " +
+            "lineageRevision=$lineageRevision, reset=$reset, upserts=$upserts, " +
+            "removedSurfaceIds=${removedSurfaceIdsValue.contentToString()})"
+
+    companion object {
+        private const val CUT_OWNER_BYTES = 80L
+        private const val LIST_OWNERS_AND_ARRAY_HEADER_BYTES = 80L
+        private const val ROW_OWNER_BYTES = 48L
+        private const val VOXEL_OWNER_BYTES = 32L
+        private const val ARRAY_HEADER_BYTES = 16L
+
+        internal fun modeledRetainedBytes(upsertCount: Int, removalCount: Int): Long {
+            require(upsertCount >= 0 && removalCount >= 0)
+            val rowBytes = Math.multiplyExact(upsertCount.toLong(), ROW_OWNER_BYTES + VOXEL_OWNER_BYTES)
+            val rowReferences = Math.multiplyExact(upsertCount.toLong(), java.lang.Long.BYTES.toLong())
+            val removals = Math.multiplyExact(removalCount.toLong(), java.lang.Long.BYTES.toLong())
+            return Math.addExact(
+                Math.addExact(CUT_OWNER_BYTES + LIST_OWNERS_AND_ARRAY_HEADER_BYTES, rowBytes),
+                Math.addExact(rowReferences, Math.addExact(ARRAY_HEADER_BYTES, removals)),
+            )
+        }
+    }
+}
+
+/** Copies only the bounded dirty rows and removed identities from a prepared mutation. */
+internal fun PreparedCanonicalMutation.toCommittedGeometryCut(
+    ownership: VisibilityObservationOwnership,
+    transactionId: Long,
+): CommittedGeometryCut {
+    val rows = ArrayList<CommittedGeometryRow>(dirtyRowCount)
+    check(visitDirtyRows { row ->
+        rows += CommittedGeometryRow(
+            surfaceId = row.id.value,
+            voxel = row.voxel.copy(),
+            packedNormal = row.packedNormal,
+            normalConfidence = row.normalConfidence,
+            lineageCount = targetLineageCount,
+        )
+        true
+    })
+    // Canonical relocation rewrites storage indexes by removing and re-inserting the
+    // same stable identity. At the renderer seam that is one upsert, not a removal:
+    // committed geometry cuts keep their removal and upsert identity sets disjoint.
+    val upsertIds = rows.mapTo(HashSet(rows.size)) { it.surfaceId }
+    val removedBuffer = LongArray(removedSurfaceCount)
+    var index = 0
+    visitRemovedSurfaceIds { id ->
+        if (id.value !in upsertIds) removedBuffer[index++] = id.value
+        true
+    }
+    val removed = removedBuffer.copyOf(index)
+    return CommittedGeometryCut(
+        ownership = ownership,
+        transactionId = transactionId,
+        baseGeometryRevision = sourceCut.geometryRevision,
+        geometryRevision = targetGeometryRevision,
+        lineageRevision = targetLineageRevision,
+        reset = false,
+        upserts = rows,
+        removedSurfaceIds = removed,
+    )
+}

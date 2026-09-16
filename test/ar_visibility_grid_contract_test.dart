@@ -385,7 +385,41 @@ void main() {
       );
     });
 
-    test('encodes a color-only visibility patch', () {
+    test('encodes a bounded semantic style visibility patch', () {
+      final style = ARCoverageRendererStyleRowV1(
+        semanticGeneration: 0xffffffff,
+        styleGeneration: 17,
+        semantic: ARCoverageRendererSemantic.ambiguous,
+        coverage: ARCoverageRendererCoverage.partial,
+        palette: ARCoverageRendererPalette.direction,
+        cut: ARCoverageRendererCut.indeterminateHistory,
+        residency: ARCoverageRendererResidency.warmL1,
+        target: ARCoverageRendererTarget.halo,
+        directionBin: 23,
+        glyph: ARCoverageRendererGlyph.viewRose,
+        lineageCount: 0xffff,
+        age: ARCoverageRendererAge.old,
+        sourceHealth: ARCoverageRendererSourceHealth.featureOnly,
+      );
+      expect(style.encode(), <int>[
+        1,
+        149,
+        72,
+        31,
+        23,
+        0,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        17,
+        0,
+        0,
+        0,
+      ]);
+      expect(ARCoverageRendererStyleRowV1.decode(style.encode()), style);
       final patch = ARVisibilityGridVisibilityPatch(
         groupId: 'group-1',
         groupGeneration: 7,
@@ -393,7 +427,7 @@ void main() {
         geometryRevision: 4,
         visibilityRevision: 9,
         keys: Int64List.fromList(<int>[10, 20]),
-        colors: Int32List.fromList(<int>[0xFFFF0000, 0xFF00FF00]),
+        styles: <ARCoverageRendererStyleRowV1>[style, style],
       );
 
       final map = patch.toMap();
@@ -401,11 +435,12 @@ void main() {
       expect(map['geometryRevision'], 4);
       expect(map['visibilityRevision'], 9);
       expect(map['keys'], <int>[10, 20]);
-      expect(map['colors'], <int>[-65536, -16711936]);
+      expect(map['styles'], <int>[...style.encode(), ...style.encode()]);
+      expect(map, isNot(contains('colors')));
       expect(map, isNot(contains('positions')));
     });
 
-    test('rejects visibility keys and colors with different lengths', () {
+    test('rejects visibility keys and styles with different lengths', () {
       expect(
         () => ARVisibilityGridVisibilityPatch(
           groupId: 'group-1',
@@ -414,7 +449,52 @@ void main() {
           geometryRevision: 4,
           visibilityRevision: 9,
           keys: Int64List.fromList(<int>[10]),
-          colors: Int32List(0),
+          styles: <ARCoverageRendererStyleRowV1>[],
+        ),
+        throwsArgumentError,
+      );
+    });
+
+    test('rejects a mixed semantic style cut while retaining row residency',
+        () {
+      final active = ARCoverageRendererStyleRowV1(
+        semanticGeneration: 8,
+        styleGeneration: 3,
+        residency: ARCoverageRendererResidency.activeL0,
+      );
+      final warm = ARCoverageRendererStyleRowV1(
+        semanticGeneration: 8,
+        styleGeneration: 3,
+        residency: ARCoverageRendererResidency.warmL1,
+      );
+      expect(
+        () => ARVisibilityGridVisibilityPatch(
+          groupId: 'group-1',
+          groupGeneration: 7,
+          sessionGeneration: 11,
+          geometryRevision: 4,
+          visibilityRevision: 9,
+          keys: Int64List.fromList(<int>[10, 20]),
+          styles: <ARCoverageRendererStyleRowV1>[active, warm],
+        ),
+        returnsNormally,
+      );
+      expect(
+        () => ARVisibilityGridVisibilityPatch(
+          groupId: 'group-1',
+          groupGeneration: 7,
+          sessionGeneration: 11,
+          geometryRevision: 4,
+          visibilityRevision: 9,
+          keys: Int64List.fromList(<int>[10, 20]),
+          styles: <ARCoverageRendererStyleRowV1>[
+            active,
+            ARCoverageRendererStyleRowV1(
+              semanticGeneration: 7,
+              styleGeneration: 4,
+              residency: ARCoverageRendererResidency.warmL1,
+            ),
+          ],
         ),
         throwsArgumentError,
       );
@@ -429,9 +509,29 @@ void main() {
           geometryRevision: 4,
           visibilityRevision: 9,
           keys: Int64List.fromList(<int>[10, 10]),
-          colors: Int32List.fromList(<int>[0xFFFF0000, 0xFF00FF00]),
+          styles: <ARCoverageRendererStyleRowV1>[
+            ARCoverageRendererStyleRowV1(),
+            ARCoverageRendererStyleRowV1(),
+          ],
         ),
         throwsArgumentError,
+      );
+    });
+
+    test('rejects reserved renderer style codes and invalid glyph cuts', () {
+      expect(
+        () => ARCoverageRendererStyleRowV1(
+          directionBin: 0,
+          glyph: ARCoverageRendererGlyph.none,
+        ),
+        throwsArgumentError,
+      );
+      expect(
+        () => ARCoverageRendererStyleRowV1.decode(
+          Uint8List.fromList(
+              <int>[1, 0, 0x80, 0, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        ),
+        throwsFormatException,
       );
     });
   });
@@ -545,6 +645,107 @@ void main() {
     expect(fixture['version'], visibilityGridWireVersion);
     expect(fixture['voxelKeyConvention'], 'coverage_grid_v3');
     expect(fixture['matrixConvention'], 'column_major_gl_meters_v1');
+    final depthEvidence =
+        fixture['depthEvidenceKernel'] as Map<String, dynamic>;
+    expect(depthEvidence['format'], 'bounded_depth_evidence_fixture_v1');
+    expect(jsonEncode(depthEvidence), isNot(contains('"rayCells"')));
+    expect(jsonEncode(depthEvidence), isNot(contains('"rayHits"')));
+    final depthEvidenceCases =
+        (depthEvidence['cases'] as List<dynamic>).cast<Map<String, dynamic>>();
+    expect(
+      depthEvidenceCases.map((fixtureCase) => fixtureCase['name']),
+      containsAll(<String>[
+        'transformed_frame',
+        'create',
+        'refine',
+        'relocate',
+        'merge',
+        'split',
+        'replace',
+        'remove_at_viable_capacity',
+        'corridor',
+        'safety_band_boundary',
+        'hole_and_foreground_edge',
+        'thin_double_opposed_views',
+        'full_sample_budget',
+        'canonical_lookup_refusal',
+        'capacity_refusal',
+      ]),
+    );
+    for (final fixtureCase in depthEvidenceCases) {
+      expect(fixtureCase, containsPair('input', isA<Map<String, dynamic>>()));
+      final input = fixtureCase['input'] as Map<String, dynamic>;
+      final runs = input['runs'] as List<dynamic>;
+      expect(runs, isNotEmpty);
+      for (final run in runs.cast<Map<String, dynamic>>()) {
+        final steps =
+            (run['steps'] as List<dynamic>).cast<Map<String, dynamic>>();
+        expect(steps, isNotEmpty);
+        for (final step in steps) {
+          expect(step, contains('groupFromCamera'));
+          expect(step, contains('intrinsics'));
+          expect(step, contains('samples'));
+          expect(step, containsPair('expected', isA<Map<String, dynamic>>()));
+        }
+      }
+    }
+    final createPacket = depthEvidenceCases.singleWhere(
+      (fixtureCase) => fixtureCase['name'] == 'create',
+    );
+    final createStep = ((((createPacket['input']
+                as Map<String, dynamic>)['runs'] as List<dynamic>)
+            .single as Map<String, dynamic>)['steps'] as List<dynamic>)
+        .single as Map<String, dynamic>;
+    final createExpected = createStep['expected'] as Map<String, dynamic>;
+    expect(createExpected['expectedChanges'], <Map<String, dynamic>>[
+      <String, dynamic>{
+        'kind': 'create',
+        'target': <String, dynamic>{
+          'sourceId': null,
+          'voxel': <int>[-8, 5, -10],
+          'normalOctX': 42,
+          'normalOctY': -28,
+          'normalConfidence': 64,
+        },
+      },
+    ]);
+    expect(
+      createExpected['expectedReceipt'],
+      containsPair('preparedResidentBytes', 32),
+    );
+    final transformedPacket = depthEvidenceCases.singleWhere(
+      (fixtureCase) => fixtureCase['name'] == 'transformed_frame',
+    );
+    Map<String, dynamic> finalExpected(
+      Map<String, dynamic> fixtureCase,
+      int runIndex,
+    ) {
+      final input = fixtureCase['input'] as Map<String, dynamic>;
+      final runs =
+          (input['runs'] as List<dynamic>).cast<Map<String, dynamic>>();
+      final steps = (runs[runIndex]['steps'] as List<dynamic>)
+          .cast<Map<String, dynamic>>();
+      return steps.last['expected'] as Map<String, dynamic>;
+    }
+
+    expect(
+      finalExpected(transformedPacket, 0)['expectedChanges'],
+      contains(
+        containsPair(
+          'target',
+          containsPair('normalOctX', -25),
+        ),
+      ),
+    );
+    expect(
+      finalExpected(transformedPacket, 1)['expectedChanges'],
+      contains(
+        containsPair(
+          'target',
+          containsPair('normalOctX', 127),
+        ),
+      ),
+    );
     final scenarios =
         (fixture['scenarios'] as List<dynamic>).cast<Map<String, dynamic>>();
     expect(
@@ -557,6 +758,7 @@ void main() {
         'depth_safe_band_and_multiview_carving',
         'ios_scene_depth_orientation_and_fallback',
         'source_health_and_resource_closure',
+        'synthetic_arcore_arkit_sensor_frames',
         'geometry_revision_and_resync',
       ]),
     );

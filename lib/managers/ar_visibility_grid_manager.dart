@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:ui' as ui;
 
 import 'package:flutter/services.dart';
 
@@ -6,14 +7,23 @@ import '../models/ar_visibility_grid.dart';
 
 /// Strict Dart endpoint for the per-view `visibility_grid_wire_v1` channel.
 class ARVisibilityGridManager {
-  ARVisibilityGridManager(int viewId, {MethodChannel? channel})
-      : _channel = channel ?? MethodChannel('arpointcloud_$viewId') {
+  ARVisibilityGridManager(
+    int viewId, {
+    MethodChannel? channel,
+    Duration rendererFenceTimeout = const Duration(seconds: 45),
+  })  : viewId = viewId,
+        _rendererFenceTimeout = rendererFenceTimeout,
+        _channel = channel ?? MethodChannel('arpointcloud_$viewId') {
     _channel.setMethodCallHandler(_handleNativeCall);
   }
 
   final MethodChannel _channel;
+  final int viewId;
+  final Duration _rendererFenceTimeout;
   final StreamController<ARVisibilityGridDelta> _deltas =
       StreamController<ARVisibilityGridDelta>.broadcast(sync: true);
+  final StreamController<ARVisibilityGridDeltaSummary> _summaries =
+      StreamController<ARVisibilityGridDeltaSummary>.broadcast(sync: true);
   final StreamController<ARVisibilityGridError> _errors =
       StreamController<ARVisibilityGridError>.broadcast(sync: true);
   final StreamController<ARVisibilityGridSourceHealth> _health =
@@ -24,6 +34,9 @@ class ARVisibilityGridManager {
 
   /// Revisioned stable-key upserts, removals, and reset snapshots.
   Stream<ARVisibilityGridDelta> get deltas => _deltas.stream;
+
+  /// Fixed-size ordinary callbacks. No semantic keys cross the UI isolate.
+  Stream<ARVisibilityGridDeltaSummary> get summaries => _summaries.stream;
 
   /// Typed native protocol failures.
   Stream<ARVisibilityGridError> get errors => _errors.stream;
@@ -68,6 +81,22 @@ class ARVisibilityGridManager {
     return ARVisibilityGridDelta.fromMap(result);
   }
 
+  /// Starts native acquisition without materializing its reset keys on the
+  /// root isolate. A background worker must call [pullDeltaInBackground].
+  Future<ARVisibilityGridDeltaSummary> startGridSummary(
+    ARVisibilityGridGroupConfig config,
+  ) async {
+    _ensureActive();
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      'startGridSummary',
+      config.toMap(),
+    );
+    if (result == null) {
+      throw const FormatException('Missing visibility-grid start summary.');
+    }
+    return ARVisibilityGridDeltaSummary.fromMap(result);
+  }
+
   /// Acknowledges an atomically applied geometry revision.
   Future<bool> ackGeometry(ARVisibilityGridDelta delta) async {
     _ensureActive();
@@ -79,6 +108,23 @@ class ARVisibilityGridManager {
         'groupGeneration': delta.groupGeneration,
         'sessionGeneration': delta.sessionGeneration,
         'acceptedGeometryRevision': delta.geometryRevision,
+      },
+    );
+    return result?['accepted'] == true;
+  }
+
+  /// Acknowledges a worker-pulled revision without reintroducing its keys to
+  /// the root isolate.
+  Future<bool> ackGeometrySummary(ARVisibilityGridDeltaSummary summary) async {
+    _ensureActive();
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      'ackGeometry',
+      <String, Object>{
+        'version': visibilityGridWireVersion,
+        'groupId': summary.groupId,
+        'groupGeneration': summary.groupGeneration,
+        'sessionGeneration': summary.sessionGeneration,
+        'acceptedGeometryRevision': summary.geometryRevision,
       },
     );
     return result?['accepted'] == true;
@@ -109,6 +155,35 @@ class ARVisibilityGridManager {
     return snapshot;
   }
 
+  /// Explicit recovery reset without returning semantic keys to the root
+  /// isolate. The coverage worker pulls the retained reset before ACK.
+  Future<ARVisibilityGridDeltaSummary> requestSnapshotSummary({
+    required String groupId,
+    required int groupGeneration,
+    required int sessionGeneration,
+    required int receiverGeometryRevision,
+  }) async {
+    _ensureActive();
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      'requestSnapshotSummary',
+      <String, Object>{
+        'version': visibilityGridWireVersion,
+        'groupId': groupId,
+        'groupGeneration': groupGeneration,
+        'sessionGeneration': sessionGeneration,
+        'receiverGeometryRevision': receiverGeometryRevision,
+      },
+    );
+    if (result == null) {
+      throw const FormatException('Missing visibility-grid recovery summary.');
+    }
+    final summary = ARVisibilityGridDeltaSummary.fromMap(result);
+    if (!summary.reset) {
+      throw const FormatException('Visibility-grid recovery must reset.');
+    }
+    return summary;
+  }
+
   /// Applies colors to existing native-owned geometry only.
   Future<bool> applyVisibility(
     ARVisibilityGridVisibilityPatch patch,
@@ -119,6 +194,98 @@ class ARVisibilityGridManager {
       patch.toMap(),
     );
     return result?['applied'] == true;
+  }
+
+  /// Reads the native renderer's authoritative revision pair. Use this after
+  /// an unknown apply outcome; it is deliberately separate from a retry.
+  Future<ARVisibilityGridVisibilityRevision> getAppliedVisibilityRevision({
+    required String groupId,
+    required int groupGeneration,
+    required int sessionGeneration,
+  }) async {
+    _ensureActive();
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      'getVisibilityRevision',
+      <String, Object>{
+        'version': visibilityGridWireVersion,
+        'groupId': groupId,
+        'groupGeneration': groupGeneration,
+        'sessionGeneration': sessionGeneration,
+      },
+    );
+    if (result == null) {
+      throw const FormatException('Missing visibility-grid revision receipt.');
+    }
+    return ARVisibilityGridVisibilityRevision.fromMap(result);
+  }
+
+  /// Arms one debug-build-only native background request seam.
+  ///
+  /// [method] must be `pullGridDelta`, `applyVisibility`, or
+  /// `getVisibilityRevision`; [delay] must be between zero and 30 seconds.
+  /// When [neverReply] is true, only `cancelBackgroundRequest` can complete the
+  /// original request. Throws [PlatformException] in release builds or for an
+  /// invalid method/argument map.
+  Future<void> configureDebugBackgroundRequest({
+    required String method,
+    Duration delay = Duration.zero,
+    bool neverReply = false,
+  }) async {
+    _ensureActive();
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      'configureDebugBackgroundRequest',
+      <String, Object>{
+        'method': method,
+        'delayMs': delay.inMilliseconds,
+        'neverReply': neverReply,
+      },
+    );
+    if (result?['armed'] != true) {
+      throw const FormatException(
+        'Native background request test seam was not armed.',
+      );
+    }
+  }
+
+  /// Reads the debug seam's ordered native trace and pending-request count.
+  ///
+  /// Throws [PlatformException] outside a debuggable Android build and
+  /// [FormatException] when the response does not match `{trace, pendingCount}`.
+  Future<Map<Object?, Object?>> getDebugBackgroundRequestTrace() async {
+    _ensureActive();
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      'getDebugBackgroundRequestTrace',
+    );
+    if (result == null ||
+        result['trace'] is! List ||
+        result['pendingCount'] is! num) {
+      throw const FormatException(
+        'Invalid native background request test trace.',
+      );
+    }
+    return result;
+  }
+
+  /// Disarms the debug request seam and clears its retained trace.
+  ///
+  /// Throws [StateError] after this manager is disposed, propagates
+  /// [PlatformException] when the native invocation fails, and throws
+  /// [FormatException] when native code returns a malformed acknowledgement.
+  Future<void> disarmDebugBackgroundRequest() async {
+    _ensureActive();
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      'disarmDebugBackgroundRequest',
+    );
+    if (result == null ||
+        result.keys
+            .toSet()
+            .difference(const <Object?>{'disarmed'}).isNotEmpty ||
+        result.length != 1 ||
+        result['disarmed'] is! bool ||
+        result['disarmed'] != true) {
+      throw const FormatException(
+          'Native background request seam was not disarmed.');
+    }
   }
 
   /// Reads current health and diagnostics without waiting for geometry.
@@ -204,6 +371,35 @@ class ARVisibilityGridManager {
     });
   }
 
+  /// Waits for the native Compose mesh requested by the latest mode change.
+  ///
+  /// This is a lifecycle fence, not a frame-delay heuristic: it completes
+  /// only after SceneView reports that an actual renderer mesh mounted. The
+  /// wait is bounded so a stopped PlatformView cannot strand its Dart owner.
+  Future<void> awaitRendererMounted() async {
+    _ensureActive();
+    final mounted = await _channel
+        .invokeMethod<bool>('awaitRendererMounted')
+        .timeout(_rendererFenceTimeout);
+    if (mounted != true) {
+      throw StateError('Native visibility-grid renderer did not mount.');
+    }
+  }
+
+  /// Waits until SceneView reports disposal of the active native mesh.
+  ///
+  /// The wait is bounded so teardown can release the owning PlatformView even
+  /// when a Compose disposal callback is lost.
+  Future<void> awaitRendererUnmounted() async {
+    _ensureActive();
+    final unmounted = await _channel
+        .invokeMethod<bool>('awaitRendererUnmounted')
+        .timeout(_rendererFenceTimeout);
+    if (unmounted != true) {
+      throw StateError('Native visibility-grid renderer did not unmount.');
+    }
+  }
+
   /// Stops the exact active group generation.
   Future<void> stopGrid({
     required String groupId,
@@ -232,6 +428,7 @@ class ARVisibilityGridManager {
     } finally {
       _channel.setMethodCallHandler(null);
       await _deltas.close();
+      await _summaries.close();
       await _errors.close();
       await _health.close();
       await _diagnostics.close();
@@ -244,6 +441,16 @@ class ARVisibilityGridManager {
       case 'onGridDelta':
         try {
           _deltas.add(ARVisibilityGridDelta.fromMap(_map(call.arguments)));
+        } on FormatException catch (error) {
+          _errors.add(_protocolError(error.message));
+          rethrow;
+        }
+        return null;
+      case 'onGridSummary':
+        try {
+          _summaries.add(
+            ARVisibilityGridDeltaSummary.fromMap(_map(call.arguments)),
+          );
         } on FormatException catch (error) {
           _errors.add(_protocolError(error.message));
           rethrow;
@@ -285,6 +492,241 @@ class ARVisibilityGridManager {
     if (_disposed) {
       throw StateError('ARVisibilityGridManager is disposed.');
     }
+  }
+}
+
+/// Production background-isolate pull for the semantic delta named by a
+/// root-isolate [ARVisibilityGridDeltaSummary].
+///
+/// The method channel is initialized in the worker isolate, so no ordinary
+/// callback or semantic key collection is materialized by the UI isolate.
+final class ARVisibilityGridBackgroundWorker {
+  const ARVisibilityGridBackgroundWorker._();
+
+  static Future<ARVisibilityGridDelta> pullDelta({
+    required ui.RootIsolateToken rootIsolateToken,
+    required int viewId,
+    required String groupId,
+    required int groupGeneration,
+    required int sessionGeneration,
+  }) async {
+    BackgroundIsolateBinaryMessenger.ensureInitialized(rootIsolateToken);
+    final channel = MethodChannel(
+      'arpointcloud_$viewId',
+      const StandardMethodCodec(),
+      BackgroundIsolateBinaryMessenger.instance,
+    );
+    final result = await channel.invokeMapMethod<Object?, Object?>(
+      'pullGridDelta',
+      <String, Object>{
+        'version': visibilityGridWireVersion,
+        'groupId': groupId,
+        'groupGeneration': groupGeneration,
+        'sessionGeneration': sessionGeneration,
+      },
+    );
+    if (result == null) {
+      throw const FormatException('Missing worker-pulled visibility delta.');
+    }
+    return ARVisibilityGridDelta.fromMap(result);
+  }
+
+  /// Applies a worker-owned color patch directly from the background isolate.
+  /// The UI isolate receives only its bounded revision result; it never
+  /// materializes ordinary semantic keys or colors.
+  static Future<bool> applyVisibility({
+    required ui.RootIsolateToken rootIsolateToken,
+    required int viewId,
+    required ARVisibilityGridVisibilityPatch patch,
+  }) async {
+    BackgroundIsolateBinaryMessenger.ensureInitialized(rootIsolateToken);
+    final channel = MethodChannel(
+      'arpointcloud_$viewId',
+      const StandardMethodCodec(),
+      BackgroundIsolateBinaryMessenger.instance,
+    );
+    final result = await channel.invokeMapMethod<Object?, Object?>(
+      'applyVisibility',
+      patch.toMap(),
+    );
+    return result?['applied'] == true;
+  }
+
+  /// Background-isolate equivalent of [getAppliedVisibilityRevision].
+  static Future<ARVisibilityGridVisibilityRevision>
+      getAppliedVisibilityRevision({
+    required ui.RootIsolateToken rootIsolateToken,
+    required int viewId,
+    required String groupId,
+    required int groupGeneration,
+    required int sessionGeneration,
+  }) async {
+    BackgroundIsolateBinaryMessenger.ensureInitialized(rootIsolateToken);
+    final channel = MethodChannel(
+      'arpointcloud_$viewId',
+      const StandardMethodCodec(),
+      BackgroundIsolateBinaryMessenger.instance,
+    );
+    final result = await channel.invokeMapMethod<Object?, Object?>(
+      'getVisibilityRevision',
+      <String, Object>{
+        'version': visibilityGridWireVersion,
+        'groupId': groupId,
+        'groupGeneration': groupGeneration,
+        'sessionGeneration': sessionGeneration,
+      },
+    );
+    if (result == null) {
+      throw const FormatException('Missing visibility-grid revision receipt.');
+    }
+    return ARVisibilityGridVisibilityRevision.fromMap(result);
+  }
+}
+
+/// One cancellable platform request issued from the background coverage
+/// isolate. Cancellation completes only after native code has acknowledged
+/// that it completed the original MethodChannel result exactly once.
+final class ARVisibilityGridBackgroundRequest<T> {
+  const ARVisibilityGridBackgroundRequest._({
+    required this.requestId,
+    required this.result,
+    required Future<bool> Function() cancel,
+  }) : _cancel = cancel;
+
+  final String requestId;
+  final Future<T> result;
+  final Future<bool> Function() _cancel;
+
+  Future<bool> cancel() => _cancel();
+}
+
+/// Production request/ack protocol used by a background-isolate grid owner.
+///
+/// A client is isolate-local and keeps monotonically increasing request IDs.
+/// The native endpoint retains each original result until either the operation
+/// or an explicit cancellation completes it, while suppressing late replies.
+/// Request methods add a non-empty `backgroundRequestId` string to their normal
+/// v1 argument map. Cancellation sends `{version, backgroundRequestId}` and
+/// requires `{acknowledged: true, cancelled: bool}`; malformed or missing
+/// responses throw [FormatException], and native operation errors remain
+/// [PlatformException]s on [ARVisibilityGridBackgroundRequest.result].
+final class ARVisibilityGridBackgroundChannel {
+  ARVisibilityGridBackgroundChannel._(this._channel, this._requestPrefix);
+
+  /// Connects this background isolate to one platform view.
+  factory ARVisibilityGridBackgroundChannel.connect({
+    required ui.RootIsolateToken rootIsolateToken,
+    required int viewId,
+  }) {
+    BackgroundIsolateBinaryMessenger.ensureInitialized(rootIsolateToken);
+    return ARVisibilityGridBackgroundChannel._(
+      MethodChannel(
+        'arpointcloud_$viewId',
+        const StandardMethodCodec(),
+        BackgroundIsolateBinaryMessenger.instance,
+      ),
+      'view-$viewId',
+    );
+  }
+
+  /// Injects the real MethodChannel seam for host tests.
+  factory ARVisibilityGridBackgroundChannel.forTesting(MethodChannel channel) =>
+      ARVisibilityGridBackgroundChannel._(channel, 'test');
+
+  final MethodChannel _channel;
+  final String _requestPrefix;
+  int _nextRequest = 0;
+
+  ARVisibilityGridBackgroundRequest<ARVisibilityGridDelta> pullDelta({
+    required String groupId,
+    required int groupGeneration,
+    required int sessionGeneration,
+  }) =>
+      _request<ARVisibilityGridDelta>(
+        method: 'pullGridDelta',
+        arguments: <String, Object>{
+          'version': visibilityGridWireVersion,
+          'groupId': groupId,
+          'groupGeneration': groupGeneration,
+          'sessionGeneration': sessionGeneration,
+        },
+        decode: (value) => ARVisibilityGridDelta.fromMap(value),
+        missingMessage: 'Missing worker-pulled visibility delta.',
+      );
+
+  ARVisibilityGridBackgroundRequest<bool> applyVisibility(
+    ARVisibilityGridVisibilityPatch patch,
+  ) =>
+      _request<bool>(
+        method: 'applyVisibility',
+        arguments: patch.toMap(),
+        decode: (value) => value['applied'] == true,
+        missingMessage: 'Missing worker visibility application receipt.',
+      );
+
+  ARVisibilityGridBackgroundRequest<ARVisibilityGridVisibilityRevision>
+      getAppliedVisibilityRevision({
+    required String groupId,
+    required int groupGeneration,
+    required int sessionGeneration,
+  }) =>
+          _request<ARVisibilityGridVisibilityRevision>(
+            method: 'getVisibilityRevision',
+            arguments: <String, Object>{
+              'version': visibilityGridWireVersion,
+              'groupId': groupId,
+              'groupGeneration': groupGeneration,
+              'sessionGeneration': sessionGeneration,
+            },
+            decode: ARVisibilityGridVisibilityRevision.fromMap,
+            missingMessage: 'Missing visibility-grid revision receipt.',
+          );
+
+  ARVisibilityGridBackgroundRequest<T> _request<T>({
+    required String method,
+    required Map<String, Object> arguments,
+    required T Function(Map<Object?, Object?> value) decode,
+    required String missingMessage,
+  }) {
+    final requestId = '$_requestPrefix-${++_nextRequest}';
+    final result = _channel.invokeMapMethod<Object?, Object?>(
+      method,
+      <String, Object>{
+        ...arguments,
+        'backgroundRequestId': requestId,
+      },
+    ).then<T>((value) {
+      if (value == null) throw FormatException(missingMessage);
+      return decode(value);
+    });
+    return ARVisibilityGridBackgroundRequest<T>._(
+      requestId: requestId,
+      result: result,
+      cancel: () => _cancel(requestId),
+    );
+  }
+
+  Future<bool> _cancel(String requestId) async {
+    final response = await _channel.invokeMapMethod<Object?, Object?>(
+      'cancelBackgroundRequest',
+      <String, Object>{
+        'version': visibilityGridWireVersion,
+        'backgroundRequestId': requestId,
+      },
+    );
+    if (response == null ||
+        response.length != 2 ||
+        response.keys.toSet().difference(
+          const <Object?>{'acknowledged', 'cancelled'},
+        ).isNotEmpty ||
+        response['acknowledged'] is! bool ||
+        response['cancelled'] is! bool ||
+        response['acknowledged'] != true) {
+      throw const FormatException(
+        'Native visibility-grid cancellation response is invalid.',
+      );
+    }
+    return response['cancelled']! as bool;
   }
 }
 

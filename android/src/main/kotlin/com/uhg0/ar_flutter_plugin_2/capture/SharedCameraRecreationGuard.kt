@@ -48,6 +48,47 @@ internal object SharedCameraCallbackGuard {
     }
 }
 
+internal class SharedCameraSessionCallbackFence {
+    private var generation = 0L
+    private var draining = false
+
+    @Synchronized
+    fun open(): Long {
+        generation += 1L
+        draining = false
+        return generation
+    }
+
+    @Synchronized
+    fun beginShutdown(expectedGeneration: Long): Boolean {
+        if (generation != expectedGeneration || draining) return false
+        draining = true
+        return true
+    }
+
+    @Synchronized
+    fun finishShutdown(expectedGeneration: Long): Boolean {
+        if (generation != expectedGeneration || !draining) return false
+        generation += 1L
+        draining = false
+        return true
+    }
+
+    @Synchronized
+    fun runActive(expectedGeneration: Long, callback: () -> Unit): Boolean {
+        if (generation != expectedGeneration || draining) return false
+        callback()
+        return true
+    }
+
+    @Synchronized
+    fun runTerminal(expectedGeneration: Long, callback: () -> Unit): Boolean {
+        if (generation != expectedGeneration) return false
+        callback()
+        return true
+    }
+}
+
 internal enum class SharedCameraStartupFailureReason {
     SESSION_CONFIGURATION,
 }

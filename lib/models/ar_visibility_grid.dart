@@ -473,7 +473,225 @@ T _enumByName<T extends Enum>(
   throw FormatException('Invalid visibility-grid value for $field.');
 }
 
-/// Color-only update for keys in an acknowledged geometry revision.
+/// Fixed byte width of [ARCoverageRendererStyleRowV1].
+const int coverageRendererStyleRowV1Bytes = 16;
+
+/// Maximum key/style rows in one 64-KiB renderer request payload.
+const int coverageRendererMaxStylePatchRows = 2048;
+
+enum ARCoverageRendererSemantic { confirmed, ambiguous, suppressedDebug }
+
+enum ARCoverageRendererCoverage { uncovered, partial, complete }
+
+enum ARCoverageRendererPalette {
+  uniform,
+  coverage,
+  normal,
+  occupancy,
+  lineage,
+  age,
+  sourceHealth,
+  residency,
+  direction,
+}
+
+enum ARCoverageRendererCut {
+  exactCurrent,
+  staleDisplay,
+  lowerBound,
+  coveragePending,
+  indeterminateHistory,
+  unavailable,
+}
+
+enum ARCoverageRendererResidency { activeL0, warmL1, coldL2 }
+
+enum ARCoverageRendererTarget { none, primary, halo }
+
+enum ARCoverageRendererGlyph { none, normal, desiredDirection, viewRose }
+
+enum ARCoverageRendererAge { fresh, recent, aging, old }
+
+enum ARCoverageRendererSourceHealth {
+  healthy,
+  featureOnly,
+  transientUnavailable,
+  failed,
+  unsupported,
+}
+
+/// Fixed-width, disposable renderer projection of one semantic/style cut.
+final class ARCoverageRendererStyleRowV1 {
+  ARCoverageRendererStyleRowV1({
+    this.semanticGeneration = 0,
+    this.styleGeneration = 0,
+    this.semantic = ARCoverageRendererSemantic.confirmed,
+    this.coverage = ARCoverageRendererCoverage.uncovered,
+    this.palette = ARCoverageRendererPalette.coverage,
+    this.cut = ARCoverageRendererCut.exactCurrent,
+    this.residency = ARCoverageRendererResidency.activeL0,
+    this.target = ARCoverageRendererTarget.none,
+    this.directionBin = 0xff,
+    this.glyph = ARCoverageRendererGlyph.none,
+    this.lineageCount = 0,
+    this.age = ARCoverageRendererAge.fresh,
+    this.sourceHealth = ARCoverageRendererSourceHealth.healthy,
+  }) {
+    if (semanticGeneration < 0 ||
+        semanticGeneration > 0xffffffff ||
+        styleGeneration < 0 ||
+        styleGeneration > 0xffffffff ||
+        lineageCount < 0 ||
+        lineageCount > 0xffff ||
+        !(directionBin == 0xff || directionBin >= 0 && directionBin <= 23) ||
+        ((glyph == ARCoverageRendererGlyph.none ||
+                glyph == ARCoverageRendererGlyph.normal) !=
+            (directionBin == 0xff))) {
+      throw ArgumentError('Invalid coverage renderer style row.');
+    }
+  }
+
+  final int semanticGeneration;
+  final int styleGeneration;
+  final ARCoverageRendererSemantic semantic;
+  final ARCoverageRendererCoverage coverage;
+  final ARCoverageRendererPalette palette;
+  final ARCoverageRendererCut cut;
+  final ARCoverageRendererResidency residency;
+  final ARCoverageRendererTarget target;
+  final int directionBin;
+  final ARCoverageRendererGlyph glyph;
+  final int lineageCount;
+  final ARCoverageRendererAge age;
+  final ARCoverageRendererSourceHealth sourceHealth;
+
+  /// True when a packet's rows name one committed semantic/style cut.
+  ///
+  /// Residency is intentionally per-row presentation state within that cut,
+  /// not a separately publishable snapshot.
+  static bool hasCoherentGenerations(
+    Iterable<ARCoverageRendererStyleRowV1> rows,
+  ) {
+    int? semantic;
+    int? style;
+    for (final row in rows) {
+      semantic ??= row.semanticGeneration;
+      style ??= row.styleGeneration;
+      if (row.semanticGeneration != semantic || row.styleGeneration != style) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  Uint8List encode() {
+    final bytes = Uint8List(coverageRendererStyleRowV1Bytes);
+    final data = ByteData.sublistView(bytes);
+    bytes[0] = 1;
+    bytes[1] = semantic.index |
+        coverage.index << 2 |
+        residency.index << 4 |
+        target.index << 6;
+    bytes[2] = palette.index | cut.index << 4;
+    bytes[3] = glyph.index | age.index << 2 | sourceHealth.index << 4;
+    bytes[4] = directionBin;
+    data.setUint16(6, lineageCount, Endian.little);
+    data.setUint32(8, semanticGeneration, Endian.little);
+    data.setUint32(12, styleGeneration, Endian.little);
+    return bytes;
+  }
+
+  static ARCoverageRendererStyleRowV1 decode(Uint8List bytes,
+      [int offset = 0]) {
+    if (offset < 0 || bytes.length - offset < coverageRendererStyleRowV1Bytes) {
+      throw const FormatException('Truncated coverage renderer style row.');
+    }
+    final row = Uint8List.sublistView(
+      bytes,
+      offset,
+      offset + coverageRendererStyleRowV1Bytes,
+    );
+    if (row[0] != 1 ||
+        row[2] & 0x80 != 0 ||
+        row[3] & 0x80 != 0 ||
+        row[5] != 0) {
+      throw const FormatException('Reserved coverage renderer style value.');
+    }
+    T value<T extends Enum>(List<T> values, int index) {
+      if (index < 0 || index >= values.length) {
+        throw const FormatException('Reserved coverage renderer enum code.');
+      }
+      return values[index];
+    }
+
+    final semanticBits = row[1];
+    final paletteCutBits = row[2];
+    final glyphAgeHealthBits = row[3];
+    final data = ByteData.sublistView(row);
+    try {
+      return ARCoverageRendererStyleRowV1(
+        semanticGeneration: data.getUint32(8, Endian.little),
+        styleGeneration: data.getUint32(12, Endian.little),
+        semantic: value(ARCoverageRendererSemantic.values, semanticBits & 0x3),
+        coverage:
+            value(ARCoverageRendererCoverage.values, (semanticBits >> 2) & 0x3),
+        palette: value(ARCoverageRendererPalette.values, paletteCutBits & 0xf),
+        cut: value(ARCoverageRendererCut.values, (paletteCutBits >> 4) & 0x7),
+        residency: value(
+            ARCoverageRendererResidency.values, (semanticBits >> 4) & 0x3),
+        target:
+            value(ARCoverageRendererTarget.values, (semanticBits >> 6) & 0x3),
+        directionBin: row[4],
+        glyph: value(ARCoverageRendererGlyph.values, glyphAgeHealthBits & 0x3),
+        lineageCount: data.getUint16(6, Endian.little),
+        age: value(
+            ARCoverageRendererAge.values, (glyphAgeHealthBits >> 2) & 0x3),
+        sourceHealth: value(
+          ARCoverageRendererSourceHealth.values,
+          (glyphAgeHealthBits >> 4) & 0x7,
+        ),
+      );
+    } on ArgumentError catch (error) {
+      throw FormatException('Invalid coverage renderer style row.', error);
+    }
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      other is ARCoverageRendererStyleRowV1 &&
+      semanticGeneration == other.semanticGeneration &&
+      styleGeneration == other.styleGeneration &&
+      semantic == other.semantic &&
+      coverage == other.coverage &&
+      palette == other.palette &&
+      cut == other.cut &&
+      residency == other.residency &&
+      target == other.target &&
+      directionBin == other.directionBin &&
+      glyph == other.glyph &&
+      lineageCount == other.lineageCount &&
+      age == other.age &&
+      sourceHealth == other.sourceHealth;
+
+  @override
+  int get hashCode => Object.hash(
+        semanticGeneration,
+        styleGeneration,
+        semantic,
+        coverage,
+        palette,
+        cut,
+        residency,
+        target,
+        directionBin,
+        glyph,
+        lineageCount,
+        age,
+        sourceHealth,
+      );
+}
+
+/// Semantic/style update for keys in an acknowledged geometry revision.
 ///
 /// Construction throws [ArgumentError] for invalid revisions, lengths, or
 /// duplicate keys.
@@ -485,17 +703,21 @@ class ARVisibilityGridVisibilityPatch {
     required this.geometryRevision,
     required this.visibilityRevision,
     required Int64List keys,
-    required Int32List colors,
+    required Iterable<ARCoverageRendererStyleRowV1> styles,
   })  : keys = Int64List.fromList(keys),
-        colors = Int32List.fromList(colors) {
+        styles = List<ARCoverageRendererStyleRowV1>.unmodifiable(styles) {
     if (groupId.isEmpty ||
         groupGeneration < 0 ||
         sessionGeneration < 0 ||
         geometryRevision < 0 ||
         visibilityRevision <= 0 ||
-        keys.length != colors.length ||
+        keys.length > coverageRendererMaxStylePatchRows ||
+        keys.length != this.styles.length ||
         _hasDuplicates(keys)) {
       throw ArgumentError('Invalid visibility-grid visibility patch.');
+    }
+    if (!ARCoverageRendererStyleRowV1.hasCoherentGenerations(this.styles)) {
+      throw ArgumentError('Visibility patch contains mixed renderer cuts.');
     }
   }
 
@@ -517,10 +739,10 @@ class ARVisibilityGridVisibilityPatch {
   /// Existing stable voxel keys.
   final Int64List keys;
 
-  /// Packed colors parallel to [keys].
-  final Int32List colors;
+  /// Fixed-width semantic/style rows parallel to [keys].
+  final List<ARCoverageRendererStyleRowV1> styles;
 
-  /// Serializes the immutable v1 color payload.
+  /// Serializes the immutable v1 semantic/style payload.
   Map<String, Object> toMap() => <String, Object>{
         'version': visibilityGridWireVersion,
         'groupId': groupId,
@@ -529,8 +751,40 @@ class ARVisibilityGridVisibilityPatch {
         'geometryRevision': geometryRevision,
         'visibilityRevision': visibilityRevision,
         'keys': Int64List.fromList(keys),
-        'colors': Int32List.fromList(colors),
+        'styles': Uint8List.fromList(<int>[
+          for (final style in styles) ...style.encode(),
+        ]),
       };
+}
+
+/// Authoritative native revision receipt for an indeterminate visibility call.
+///
+/// A caller must query this record after losing an `applyVisibility` reply
+/// before it decides whether the immutable patch was applied or can be retried.
+class ARVisibilityGridVisibilityRevision {
+  const ARVisibilityGridVisibilityRevision({
+    required this.geometryRevision,
+    required this.visibilityRevision,
+  });
+
+  factory ARVisibilityGridVisibilityRevision.fromMap(
+      Map<Object?, Object?> map) {
+    final geometryRevision = map['geometryRevision'];
+    final visibilityRevision = map['visibilityRevision'];
+    if (geometryRevision is! num ||
+        visibilityRevision is! num ||
+        geometryRevision < 0 ||
+        visibilityRevision < 0) {
+      throw const FormatException('Invalid visibility-grid revision receipt.');
+    }
+    return ARVisibilityGridVisibilityRevision(
+      geometryRevision: geometryRevision.toInt(),
+      visibilityRevision: visibilityRevision.toInt(),
+    );
+  }
+
+  final int geometryRevision;
+  final int visibilityRevision;
 }
 
 /// Current health of each native visibility-grid component.
@@ -902,6 +1156,99 @@ class ARVisibilityGridDelta {
   final ARVisibilityGridSourceHealth sourceHealth;
 
   /// Native counters sampled atomically with [geometryRevision].
+  final ARVisibilityGridDiagnostics diagnostics;
+}
+
+/// Fixed-size notification that a native-owned geometry revision is ready.
+///
+/// This is deliberately distinct from [ARVisibilityGridDelta]: ordinary
+/// platform callbacks carry no stable-key collections into the root isolate.
+/// A background worker must pull and validate the corresponding delta before
+/// acknowledging the revision. Full deltas remain available only through the
+/// explicit worker-pull/recovery endpoint.
+class ARVisibilityGridDeltaSummary {
+  ARVisibilityGridDeltaSummary({
+    required this.groupId,
+    required this.groupGeneration,
+    required this.sessionGeneration,
+    required this.baseGeometryRevision,
+    required this.geometryRevision,
+    required this.reset,
+    required this.capacity,
+    required this.sourceHealth,
+    required this.diagnostics,
+  });
+
+  factory ARVisibilityGridDeltaSummary.fromMap(Map<Object?, Object?> map) {
+    if (map['version'] != visibilityGridWireVersion) {
+      throw const FormatException('Unsupported visibility-grid wire version.');
+    }
+    // Rejecting these fields is intentional: accepting them would make an
+    // ordinary root-isolate callback a semantic-surface transport again.
+    if (map.containsKey('upsertKeys') || map.containsKey('removalKeys')) {
+      throw const FormatException(
+        'Visibility-grid summary must not contain semantic keys.',
+      );
+    }
+    final groupId = map['groupId'];
+    final groupGeneration = map['groupGeneration'];
+    final sessionGeneration = map['sessionGeneration'];
+    final baseGeometryRevision = map['baseGeometryRevision'];
+    final geometryRevision = map['geometryRevision'];
+    final reset = map['reset'];
+    final capacity = map['capacity'];
+    final sourceHealth = map['sourceHealth'];
+    final diagnostics = map['diagnostics'];
+    if (groupId is! String ||
+        groupId.isEmpty ||
+        groupGeneration is! int ||
+        groupGeneration < 0 ||
+        sessionGeneration is! int ||
+        sessionGeneration < 0 ||
+        baseGeometryRevision is! int ||
+        baseGeometryRevision < 0 ||
+        geometryRevision is! int ||
+        geometryRevision <= baseGeometryRevision ||
+        reset is! bool ||
+        capacity is! int ||
+        capacity <= 0 ||
+        sourceHealth is! Map<Object?, Object?> ||
+        diagnostics is! Map<Object?, Object?>) {
+      throw const FormatException('Invalid visibility-grid delta summary.');
+    }
+    if (!reset && geometryRevision != baseGeometryRevision + 1) {
+      throw const FormatException(
+        'Non-reset geometry revisions must be adjacent.',
+      );
+    }
+    final parsedDiagnostics = ARVisibilityGridDiagnostics.fromMap(diagnostics);
+    if (parsedDiagnostics.geometryRevision != geometryRevision ||
+        parsedDiagnostics.stableVoxelCapacity != capacity) {
+      throw const FormatException(
+        'Visibility-grid diagnostics do not match the summary revision.',
+      );
+    }
+    return ARVisibilityGridDeltaSummary(
+      groupId: groupId,
+      groupGeneration: groupGeneration,
+      sessionGeneration: sessionGeneration,
+      baseGeometryRevision: baseGeometryRevision,
+      geometryRevision: geometryRevision,
+      reset: reset,
+      capacity: capacity,
+      sourceHealth: ARVisibilityGridSourceHealth.fromMap(sourceHealth),
+      diagnostics: parsedDiagnostics,
+    );
+  }
+
+  final String groupId;
+  final int groupGeneration;
+  final int sessionGeneration;
+  final int baseGeometryRevision;
+  final int geometryRevision;
+  final bool reset;
+  final int capacity;
+  final ARVisibilityGridSourceHealth sourceHealth;
   final ARVisibilityGridDiagnostics diagnostics;
 }
 

@@ -77,6 +77,37 @@ class SharedCameraRecreationGuardTest {
     }
 
     @Test
+    fun `session callback fence drains close and rejects late activity`() {
+        val fence = SharedCameraSessionCallbackFence()
+        val generation = fence.open()
+        val effects = mutableListOf<String>()
+
+        assertTrue(fence.runActive(generation) { effects += "active" })
+        assertTrue(fence.beginShutdown(generation))
+        assertFalse(fence.runActive(generation) { effects += "late-ready" })
+        assertTrue(fence.runTerminal(generation) { effects += "closed" })
+        assertTrue(fence.finishShutdown(generation))
+        assertFalse(fence.runTerminal(generation) { effects += "late-closed" })
+        assertEquals(listOf("active", "closed"), effects)
+    }
+
+    @Test
+    fun `session callback fence rejects an old generation after replacement`() {
+        val fence = SharedCameraSessionCallbackFence()
+        val old = fence.open()
+        assertTrue(fence.beginShutdown(old))
+        assertTrue(fence.finishShutdown(old))
+        val replacement = fence.open()
+        var oldInvoked = false
+        var replacementInvoked = false
+
+        assertFalse(fence.runActive(old) { oldInvoked = true })
+        assertTrue(fence.runActive(replacement) { replacementInvoked = true })
+        assertFalse(oldInvoked)
+        assertTrue(replacementInvoked)
+    }
+
+    @Test
     fun `startup retry policy accepts transient configure failures`() {
         val transient =
             SharedCameraStartupException(

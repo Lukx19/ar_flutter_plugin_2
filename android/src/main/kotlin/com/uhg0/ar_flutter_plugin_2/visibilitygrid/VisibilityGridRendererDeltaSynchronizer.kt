@@ -12,6 +12,7 @@ internal fun synchronizeRendererGeometry(
     renderer: VisibilityGridRendererState,
     delta: VisibilityGridDelta,
     fullSnapshot: () -> VisibilityGridSnapshot,
+    selectedRenderKeys: () -> LongArray = { fullSnapshot().stableKeys.take(renderer.capacity).toLongArray() },
 ): RendererGeometrySyncResult {
     if (delta.geometryRevision <= renderer.currentGeometryRevision) {
         return RendererGeometrySyncResult.STALE_IGNORED
@@ -22,6 +23,7 @@ internal fun synchronizeRendererGeometry(
             reset = delta.reset,
             upsertKeys = delta.upsertKeys.toLongArray(),
             removalKeys = delta.removalKeys.toLongArray(),
+            selectedKeysForResetOrReplacement = selectedRenderKeys,
         )
     ) {
         return RendererGeometrySyncResult.DELTA_APPLIED
@@ -37,6 +39,7 @@ internal fun synchronizeRendererGeometry(
             reset = true,
             upsertKeys = snapshot.stableKeys.toLongArray(),
             removalKeys = longArrayOf(),
+            selectedKeysForResetOrReplacement = selectedRenderKeys,
         )
     ) {
         RendererGeometrySyncResult.SNAPSHOT_APPLIED
