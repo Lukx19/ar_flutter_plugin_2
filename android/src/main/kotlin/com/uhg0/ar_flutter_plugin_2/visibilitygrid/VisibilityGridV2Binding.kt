@@ -20,6 +20,10 @@ import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.VisibilitySurfaceStreamCh
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.DebugTransportProbe
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaSelectorV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaSourceV1
+import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationMode
+import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageRendererControls
+import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageRendererOwner
+import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageHitReceipt
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.RendererStyleCommandApplyResultV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.RendererStyleCutPayloadV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.RendererStyleCommandV1
@@ -75,6 +79,7 @@ class VisibilityGridV2Binding internal constructor(
         CommittedBaselineV1.ZERO,
     internal val beforeAbandonCleanup: (() -> Unit)? = null,
     private val onRendererStyleCut: ((QualifiedRendererStyleCut) -> RendererStyleCutResult)? = null,
+    private val coverageRendererOwner: CoverageRendererOwner? = null,
 ) {
     private val main = Handler(Looper.getMainLooper())
     private val disposed = AtomicBoolean(false)
@@ -441,7 +446,138 @@ class VisibilityGridV2Binding internal constructor(
             page.lineageRevision == baseline.lineageRevision
     }
 
+    private fun rendererStatusMap(): Map<String, Any> {
+        val owner = coverageRendererOwner
+            ?: return mapOf(
+                "rendererUnavailable" to true,
+                "visible" to false,
+                "mode" to CoveragePresentationMode.SEMANTIC_CENTROIDS.wireName,
+                "palette" to "coverage",
+                "rowCount" to 0,
+                "selectedRowCount" to 0,
+                "rendererGeneration" to 0L,
+                "geometryRevision" to 0L,
+                "styleRevision" to 0L,
+            )
+        val status = owner.status()
+        return mapOf(
+            "rendererUnavailable" to status.rendererUnavailable,
+            "visible" to status.visible,
+            "mode" to status.mode.wireName,
+            "palette" to status.palette.name.lowercase(),
+            "rowCount" to status.rowCount,
+            "selectedRowCount" to status.selectedRowCount,
+            "rendererGeneration" to status.rendererGeneration,
+            "geometryRevision" to status.geometryRevision,
+            "styleRevision" to status.styleRevision,
+        )
+    }
+
+    private fun rendererExpectedRevisionStale(arguments: Map<*, *>): Boolean {
+        val owner = coverageRendererOwner ?: return true
+        val status = owner.status()
+        val expectedGeometry = (arguments["expectedGeometryRevision"] as? Number)?.toLong()
+        val expectedStyle = (arguments["expectedStyleRevision"] as? Number)?.toLong()
+        return (expectedGeometry != null && expectedGeometry != status.geometryRevision) ||
+            (expectedStyle != null && expectedStyle != status.styleRevision)
+    }
+
+    private fun onRendererControlCall(call: MethodCall, result: MethodChannel.Result): Boolean {
+        val owner = coverageRendererOwner ?: run {
+            result.error("VG_RENDERER_UNAVAILABLE", "coverage renderer owner is unavailable", null)
+            return true
+        }
+        if (call.method == "rendererStatus" || call.method == "getRendererStatus") {
+            result.success(rendererStatusMap())
+            return true
+        }
+        val arguments = call.arguments as? Map<*, *> ?: run {
+            result.error("VG_RENDERER_INVALID", "renderer request must be a map", null)
+            return true
+        }
+        if (call.method == "setRendererControls" || call.method == "setCoverageRendererControls") {
+            if (rendererExpectedRevisionStale(arguments)) {
+                result.error("VG_RENDERER_STALE", "renderer controls are stale", rendererStatusMap())
+                return true
+            }
+            val visible = arguments["visible"] as? Boolean
+            val modeWire = arguments["mode"] as? String
+            val paletteWire = arguments["palette"] as? String
+            if (visible == null || modeWire == null || paletteWire == null) {
+                result.error("VG_RENDERER_INVALID", "renderer controls are incomplete", null)
+                return true
+            }
+            val controls = runCatching {
+                CoverageRendererControls(
+                    visible = visible,
+                    mode = CoveragePresentationMode.fromWire(modeWire),
+                    palette = com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette.entries
+                        .first { it.name.equals(paletteWire, ignoreCase = true) },
+                )
+            }.getOrElse {
+                result.error("VG_RENDERER_INVALID", "renderer controls are invalid", null)
+                return true
+            }
+            val receipt = owner.setControls(controls)
+            result.success(
+                mapOf(
+                    "accepted" to receipt.accepted,
+                    "rendererUnavailable" to receipt.rendererUnavailable,
+                    "visible" to receipt.visible,
+                    "mode" to receipt.mode.wireName,
+                    "palette" to receipt.palette.name.lowercase(),
+                    "rowCount" to receipt.rowCount,
+                    "rendererGeneration" to receipt.rendererGeneration,
+                ),
+            )
+            return true
+        }
+        if (call.method == "rendererHitTest" || call.method == "hitTestCoverage") {
+            val x = (arguments["xPx"] as? Number)?.toFloat()
+            val y = (arguments["yPx"] as? Number)?.toFloat()
+            if (x == null || y == null || !x.isFinite() || !y.isFinite()) {
+                result.error("VG_RENDERER_INVALID", "hit test coordinates are invalid", null)
+                return true
+            }
+            val requestId = arguments["requestId"]
+            val expectedGeometry = (arguments["expectedGeometryRevision"] as? Number)?.toLong()
+            val expectedStyle = (arguments["expectedStyleRevision"] as? Number)?.toLong()
+            val receipt = owner.hitTestReceipt(x, y, expectedGeometry, expectedStyle)
+            when (receipt) {
+                is CoverageHitReceipt.Stale -> result.error(
+                    "VG_RENDERER_STALE",
+                    "renderer hit test revisions are stale",
+                    mapOf(
+                        "requestId" to requestId,
+                        "expectedGeometryRevision" to receipt.expectedGeometryRevision,
+                        "actualGeometryRevision" to receipt.actualGeometryRevision,
+                        "expectedStyleRevision" to receipt.expectedStyleRevision,
+                        "actualStyleRevision" to receipt.actualStyleRevision,
+                    ),
+                )
+                is CoverageHitReceipt.Hit -> result.success(
+                    mapOf(
+                        "requestId" to requestId,
+                        "hit" to true,
+                        "surfaceId" to receipt.result.surfaceId,
+                        "semanticLabel" to receipt.result.semanticLabel.name.lowercase(),
+                        "coverageLabel" to receipt.result.coverageLabel.name.lowercase(),
+                        "targetDirectionIndex" to receipt.result.targetDirectionIndex,
+                        "geometryRevision" to receipt.result.geometryRevision,
+                        "styleRevision" to receipt.result.styleRevision,
+                    ),
+                )
+                CoverageHitReceipt.Miss -> result.success(
+                    mapOf("requestId" to requestId, "hit" to false),
+                )
+            }
+            return true
+        }
+        return false
+    }
+
     private fun onControlCall(call: MethodCall, result: MethodChannel.Result) {
+        if (onRendererControlCall(call, result)) return
         if (call.method == "configureDebugV2ExchangeStall") {
             if (!isDebuggable) {
                 result.error("VG_PROTOCOL_INVALID", "V2 recovery seam is debug-only", null)

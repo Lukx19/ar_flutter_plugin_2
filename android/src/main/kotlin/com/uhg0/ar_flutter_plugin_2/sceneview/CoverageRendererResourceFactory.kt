@@ -6,7 +6,10 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
  * Owns the one active mesh resource generation. Its small interface makes the
  * clear-before-replace rule identical for Compose and the JVM fake backend.
  */
-internal class CoverageRendererResourceFactory {
+internal class CoverageRendererResourceFactory(
+    private val onReplacement: () -> Unit = {},
+    private val onDisposal: () -> Unit = {},
+) {
     private var active: Any? = null
     private var releaseActive: ((Any) -> Unit)? = null
 
@@ -35,13 +38,18 @@ internal class CoverageRendererResourceFactory {
     ): T {
         val prior = active
         val priorRelease = releaseActive
-        active = null
-        releaseActive = null
-        if (prior != null && priorRelease != null) priorRelease(prior)
-        return create(mode, capacity, owner).also { next ->
-            active = next
-            releaseActive = { value -> release(value as T) }
+        // Creation is transactional: retain the current owner until the new
+        // resource exists and can be installed. A failed allocation therefore
+        // leaves the old renderer valid and mounted.
+        val next = create(mode, capacity, owner)
+        active = next
+        releaseActive = { value -> release(value as T) }
+        if (prior != null && priorRelease != null) {
+            onReplacement()
+            priorRelease(prior)
+            onDisposal()
         }
+        return next
     }
 
     fun clear() {
@@ -49,6 +57,9 @@ internal class CoverageRendererResourceFactory {
         val priorRelease = releaseActive
         active = null
         releaseActive = null
-        if (prior != null && priorRelease != null) priorRelease(prior)
+        if (prior != null && priorRelease != null) {
+            priorRelease(prior)
+            onDisposal()
+        }
     }
 }

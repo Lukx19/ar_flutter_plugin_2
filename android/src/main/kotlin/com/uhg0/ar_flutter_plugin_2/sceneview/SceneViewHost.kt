@@ -44,6 +44,7 @@ import com.google.ar.core.Point
 import com.google.ar.core.Pose
 import com.google.ar.core.Session
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.ArCoreDepthModeController
@@ -133,7 +134,31 @@ internal class SceneViewHost(
     private val frameCadenceTracker = FrameCadenceTracker()
     private val rendererTelemetry = RendererTelemetry()
     private val rendererAllocationLedger = CoverageRendererAllocationLedger(rendererTelemetry)
-    private val coverageResourceFactory = CoverageRendererResourceFactory()
+    private val coverageResourceFactory = CoverageRendererResourceFactory(
+        onReplacement = rendererTelemetry::recordResourceReplacement,
+        onDisposal = rendererTelemetry::recordResourceDisposal,
+    )
+    /** The host owns the sole V2 coverage renderer owner for this SceneView. */
+    internal val coverageRendererOwner: NativeCoverageRendererOwner =
+        NativeCoverageRendererOwner { controls ->
+            rendererTelemetry.recordPresentation(controls.mode)
+            val current = coverageRenderConfig.value
+            if (current != null) {
+                val mode = when (controls.mode) {
+                    CoveragePresentationMode.RAW_FEATURES -> VoxelRenderMode.POINTS
+                    CoveragePresentationMode.SEMANTIC_CUBES -> VoxelRenderMode.CUBES
+                    CoveragePresentationMode.SEMANTIC_CENTROIDS,
+                    CoveragePresentationMode.WARM_PROXIES,
+                    CoveragePresentationMode.OVERVIEW,
+                    CoveragePresentationMode.SUPPRESSED_DEBUG,
+                    -> VoxelRenderMode.CENTROIDS
+                }
+                coverageRenderConfig.value = current.copy(
+                    enabled = controls.visible,
+                    voxelRenderMode = mode,
+                )
+            }
+        }
     // A PlatformView replacement must not overlap the outgoing Compose-owned
     // ARCore/Filament session. See [SceneViewSessionLease].
     private val sceneSessionGeneration = sceneSessionGenerationCounter.incrementAndGet()
@@ -579,12 +604,22 @@ internal class SceneViewHost(
         config: PointCloudNativeConfig?,
     ) {
         if (snapshot == null || config == null) {
+            coverageRendererOwner.clearLatest()
             coverageSnapshotRef.set(null)
             coverageMeshRef.get()?.updateCoverage(null)
             coverageRenderConfig.value = null
             rendererAllocationLedger.clearCoverageState()
             return
         }
+
+        coverageRendererOwner.install(snapshot.toVisibilityRendererSnapshot(config))
+        rendererTelemetry.recordPresentation(
+            when (config.voxelRenderMode) {
+                VoxelRenderMode.POINTS -> CoveragePresentationMode.RAW_FEATURES
+                VoxelRenderMode.CENTROIDS -> CoveragePresentationMode.SEMANTIC_CENTROIDS
+                VoxelRenderMode.CUBES -> CoveragePresentationMode.SEMANTIC_CUBES
+            },
+        )
 
         coverageSnapshotRef.set(snapshot)
         val current = coverageRenderConfig.value
@@ -629,6 +664,16 @@ internal class SceneViewHost(
         checkNotDisposed()
         check(!futureResumesBlocked) { "SceneView host is shutting down" }
         activeSession?.resume()
+        val recovery = coverageRendererOwner.resume()
+        if (recovery.recovered) {
+            coverageRenderConfig.value?.let { current ->
+                // Force one Compose resource generation so the latest complete
+                // owner snapshot is mounted after GPU loss.
+                coverageRenderConfig.value = current.copy(
+                    rendererGeneration = current.rendererGeneration + 1,
+                )
+            }
+        }
         rendererPaused = false
     }
 
@@ -639,13 +684,63 @@ internal class SceneViewHost(
 
     fun pause() {
         if (!disposed) {
+            coverageRendererOwner.pause()
             rendererPaused = true
+            coverageMeshRef.get()?.disposeForReplacement()
+            coverageResourceFactory.clear()
+            rendererAllocationLedger.clearCoverageState()
             activeSession?.pause()
         }
     }
 
-    fun rendererPerformanceSnapshot(): Map<String, Any> =
-        frameCadenceTracker.snapshot() + rendererTelemetry.snapshot()
+    private fun CoveragePointRenderSnapshot.toVisibilityRendererSnapshot(
+        config: PointCloudNativeConfig,
+    ): VisibilityRendererSnapshot {
+        val rows = (0 until count).map { index ->
+            val offset = index * 3
+            val style = if (styleRows.isEmpty()) {
+                CoverageRendererStyleRowV1()
+            } else {
+                CoverageRendererStyleRowV1.decode(
+                    styleRows,
+                    index * com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                )
+            }
+            VisibilityRendererRow(
+                surfaceId = surfaceIds[index],
+                x = positions[offset],
+                y = positions[offset + 1],
+                z = positions[offset + 2],
+                semanticLabel = style.semantic,
+                coverageLabel = style.coverage,
+                targetDirectionIndex = style.directionBin.takeUnless { it == 0xff },
+            )
+        }
+        return VisibilityRendererSnapshot(
+            bindingGeneration = bindingGeneration,
+            groupGeneration = groupGeneration,
+            rendererGeneration = config.rendererGeneration,
+            transactionId = transactionId.takeIf { it > 0L } ?: (update?.geometryRevision ?: revision),
+            geometryRevision = geometryRevision.takeIf { it > 0L } ?: (update?.geometryRevision ?: revision),
+            styleRevision = styleRevision.takeIf { it > 0L } ?: (update?.visibilityRevision ?: revision),
+            rows = rows,
+            targetSurfaceId = rows.firstOrNull { it.targetDirectionIndex != null }?.surfaceId,
+            targetDirectionIndex = rows.firstOrNull { it.targetDirectionIndex != null }
+                ?.targetDirectionIndex,
+        )
+    }
+
+    fun rendererPerformanceSnapshot(): Map<String, Any> {
+        val status = coverageRendererOwner.status()
+        return frameCadenceTracker.snapshot() + rendererTelemetry.snapshot() + mapOf(
+            "rendererUnavailable" to status.rendererUnavailable,
+            "rendererPresentationMode" to status.mode.wireName,
+            "rendererPresentationVisible" to status.visible,
+            "rendererPresentationRowCount" to status.selectedRowCount,
+            "rendererGeometryRevision" to status.geometryRevision,
+            "rendererStyleRevision" to status.styleRevision,
+        )
+    }
 
     /**
      * Callback completion is a fence, not permission to upload inline. Resume
@@ -671,6 +766,7 @@ internal class SceneViewHost(
     fun dispose() {
         if (!ownership.onDispose()) return
         disposed = true
+        coverageRendererOwner.dispose()
         futureResumesBlocked = true
         cancelCoverageUploadFrame()
         composeView.removeCallbacks(replaySettledTextureResize)

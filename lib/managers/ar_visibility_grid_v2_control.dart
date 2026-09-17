@@ -7,6 +7,270 @@ import 'package:flutter/services.dart';
 
 import 'ar_visibility_surface_stream.dart';
 
+/// Bounded native presentation modes. Structural renderer rows never cross
+/// this transport; only scalar controls, status, and hit receipts do.
+enum ARCoveragePresentationMode {
+  semanticCentroids('semanticCentroids'),
+  semanticCubes('semanticCubes'),
+  rawFeatures('rawFeatures'),
+  warmProxies('warmProxies'),
+  overview('overview'),
+  suppressedDebug('suppressedDebug');
+
+  const ARCoveragePresentationMode(this.wireName);
+  final String wireName;
+}
+
+final class ARVisibilityRendererControls {
+  const ARVisibilityRendererControls({
+    required this.visible,
+    required this.mode,
+    required this.palette,
+    this.expectedGeometryRevision,
+    this.expectedStyleRevision,
+  });
+
+  final bool visible;
+  final ARCoveragePresentationMode mode;
+  final String palette;
+  final int? expectedGeometryRevision;
+  final int? expectedStyleRevision;
+
+  Map<String, Object?> toMap() => <String, Object?>{
+        'visible': visible,
+        'mode': mode.wireName,
+        'palette': palette,
+        if (expectedGeometryRevision != null)
+          'expectedGeometryRevision': expectedGeometryRevision,
+        if (expectedStyleRevision != null)
+          'expectedStyleRevision': expectedStyleRevision,
+      };
+}
+
+final class ARVisibilityRendererControlReceipt {
+  const ARVisibilityRendererControlReceipt({
+    required this.accepted,
+    required this.rendererUnavailable,
+    required this.visible,
+    required this.mode,
+    required this.palette,
+    required this.rowCount,
+    required this.rendererGeneration,
+  });
+
+  final bool accepted;
+  final bool rendererUnavailable;
+  final bool visible;
+  final String mode;
+  final String palette;
+  final int rowCount;
+  final int rendererGeneration;
+
+  static ARVisibilityRendererControlReceipt fromMap(Object? raw) {
+    final map = _rendererMap(raw, 'renderer control receipt');
+    return ARVisibilityRendererControlReceipt(
+      accepted: _rendererBool(map, 'accepted'),
+      rendererUnavailable: _rendererBool(map, 'rendererUnavailable'),
+      visible: _rendererBool(map, 'visible'),
+      mode: _rendererString(map, 'mode'),
+      palette: _rendererString(map, 'palette'),
+      rowCount: _rendererInt(map, 'rowCount'),
+      rendererGeneration: _rendererInt(map, 'rendererGeneration'),
+    );
+  }
+}
+
+final class ARVisibilityRendererStatus {
+  const ARVisibilityRendererStatus({
+    required this.rendererUnavailable,
+    required this.visible,
+    required this.mode,
+    required this.palette,
+    required this.rowCount,
+    required this.selectedRowCount,
+    required this.rendererGeneration,
+    required this.geometryRevision,
+    required this.styleRevision,
+  });
+
+  final bool rendererUnavailable;
+  final bool visible;
+  final String mode;
+  final String palette;
+  final int rowCount;
+  final int selectedRowCount;
+  final int rendererGeneration;
+  final int geometryRevision;
+  final int styleRevision;
+
+  static ARVisibilityRendererStatus fromMap(Object? raw) {
+    final map = _rendererMap(raw, 'renderer status');
+    return ARVisibilityRendererStatus(
+      rendererUnavailable: _rendererBool(map, 'rendererUnavailable'),
+      visible: _rendererBool(map, 'visible'),
+      mode: _rendererString(map, 'mode'),
+      palette: _rendererString(map, 'palette'),
+      rowCount: _rendererInt(map, 'rowCount'),
+      selectedRowCount: _rendererInt(map, 'selectedRowCount'),
+      rendererGeneration: _rendererInt(map, 'rendererGeneration'),
+      geometryRevision: _rendererInt(map, 'geometryRevision'),
+      styleRevision: _rendererInt(map, 'styleRevision'),
+    );
+  }
+}
+
+final class ARVisibilityRendererHitReceipt {
+  const ARVisibilityRendererHitReceipt({
+    required this.requestId,
+    required this.hit,
+    this.stale = false,
+    this.surfaceId,
+    this.semanticLabel,
+    this.coverageLabel,
+    this.targetDirectionIndex,
+    this.geometryRevision,
+    this.styleRevision,
+    this.expectedGeometryRevision,
+    this.actualGeometryRevision,
+    this.expectedStyleRevision,
+    this.actualStyleRevision,
+  });
+
+  final Object? requestId;
+  final bool hit;
+  final bool stale;
+  final int? surfaceId;
+  final String? semanticLabel;
+  final String? coverageLabel;
+  final int? targetDirectionIndex;
+  final int? geometryRevision;
+  final int? styleRevision;
+  final int? expectedGeometryRevision;
+  final int? actualGeometryRevision;
+  final int? expectedStyleRevision;
+  final int? actualStyleRevision;
+
+  static ARVisibilityRendererHitReceipt fromMap(Object? raw) {
+    final map = _rendererMap(raw, 'renderer hit receipt');
+    final hit = _rendererBool(map, 'hit');
+    if (!hit) {
+      return ARVisibilityRendererHitReceipt(
+        requestId: map['requestId'],
+        hit: false,
+      );
+    }
+    return ARVisibilityRendererHitReceipt(
+      requestId: map['requestId'],
+      hit: true,
+      surfaceId: _rendererInt(map, 'surfaceId'),
+      semanticLabel: _rendererString(map, 'semanticLabel'),
+      coverageLabel: _rendererString(map, 'coverageLabel'),
+      targetDirectionIndex: _rendererNullableInt(map, 'targetDirectionIndex'),
+      geometryRevision: _rendererInt(map, 'geometryRevision'),
+      styleRevision: _rendererInt(map, 'styleRevision'),
+    );
+  }
+
+  static ARVisibilityRendererHitReceipt staleFromDetails(Object? details) {
+    final map = _rendererMap(details, 'stale renderer hit receipt');
+    return ARVisibilityRendererHitReceipt(
+      requestId: map['requestId'],
+      hit: false,
+      stale: true,
+      expectedGeometryRevision: _rendererInt(map, 'expectedGeometryRevision'),
+      actualGeometryRevision: _rendererInt(map, 'actualGeometryRevision'),
+      expectedStyleRevision: _rendererInt(map, 'expectedStyleRevision'),
+      actualStyleRevision: _rendererInt(map, 'actualStyleRevision'),
+    );
+  }
+}
+
+/// Scalar V2 renderer transport shared by UI controls and the background
+/// coverage worker. It intentionally has no API for structural row payloads.
+final class ARVisibilityGridV2RendererTransport {
+  ARVisibilityGridV2RendererTransport(MethodChannel channel)
+      : this.fromInvoker(channel.invokeMethod<Object?>);
+
+  ARVisibilityGridV2RendererTransport.fromInvoker(
+    Future<Object?> Function(String method, [Object? arguments]) invoke,
+  ) : _invoke = invoke;
+
+  final Future<Object?> Function(String method, [Object? arguments]) _invoke;
+
+  Future<ARVisibilityRendererControlReceipt> setControls(
+    ARVisibilityRendererControls controls,
+  ) async {
+    final response = await _invoke('setRendererControls', controls.toMap());
+    return ARVisibilityRendererControlReceipt.fromMap(response);
+  }
+
+  Future<ARVisibilityRendererStatus> status() async =>
+      ARVisibilityRendererStatus.fromMap(await _invoke('rendererStatus'));
+
+  Future<ARVisibilityRendererHitReceipt> hitTest({
+    required double xPx,
+    required double yPx,
+    required Object requestId,
+    int? expectedGeometryRevision,
+    int? expectedStyleRevision,
+  }) async {
+    try {
+      final response = await _invoke(
+        'rendererHitTest',
+        <String, Object?>{
+          'xPx': xPx,
+          'yPx': yPx,
+          'requestId': requestId,
+          if (expectedGeometryRevision != null)
+            'expectedGeometryRevision': expectedGeometryRevision,
+          if (expectedStyleRevision != null)
+            'expectedStyleRevision': expectedStyleRevision,
+        },
+      );
+      return ARVisibilityRendererHitReceipt.fromMap(response);
+    } on PlatformException catch (error) {
+      if (error.code != 'VG_RENDERER_STALE') rethrow;
+      return ARVisibilityRendererHitReceipt.staleFromDetails(error.details);
+    }
+  }
+}
+
+Map<Object?, Object?> _rendererMap(Object? raw, String label) {
+  if (raw is! Map) throw StateError('$label is malformed.');
+  return Map<Object?, Object?>.from(raw);
+}
+
+bool _rendererBool(Map<Object?, Object?> map, String key) {
+  final value = map[key];
+  if (value is! bool) throw StateError('Renderer field $key is malformed.');
+  return value;
+}
+
+String _rendererString(Map<Object?, Object?> map, String key) {
+  final value = map[key];
+  if (value is! String || value.isEmpty) {
+    throw StateError('Renderer field $key is malformed.');
+  }
+  return value;
+}
+
+int _rendererInt(Map<Object?, Object?> map, String key) {
+  final value = map[key];
+  if (value is! num || !value.isFinite || value != value.truncate()) {
+    throw StateError('Renderer field $key is malformed.');
+  }
+  return value.toInt();
+}
+
+int? _rendererNullableInt(Map<Object?, Object?> map, String key) {
+  final value = map[key];
+  if (value == null) return null;
+  if (value is! num || !value.isFinite || value != value.truncate()) {
+    throw StateError('Renderer field $key is malformed.');
+  }
+  return value.toInt();
+}
+
 /// The winner of one identity-qualified, outcome-unknown COMMIT attempt.
 enum ARVisibilityGridV2CommitDecision {
   /// Native committed the exact queried transaction.
@@ -751,6 +1015,10 @@ final class ARVisibilityGridV2Control {
   Future<Map<Object?, Object?>>? _disposeFuture;
   bool _closed = false;
 
+  /// Scalar renderer controls/status/hit transport for this V2 binding.
+  ARVisibilityGridV2RendererTransport get renderer =>
+      ARVisibilityGridV2RendererTransport(_channel);
+
   /// Completes after the connection-time native identity snapshot has been
   /// captured (or an optional compatibility endpoint has declined it).
   /// Propagates [PlatformException] from the snapshot call and throws
@@ -941,7 +1209,8 @@ final class ARVisibilityGridV2Control {
   Future<Uint8List> _invoke(String method, Uint8List request) async {
     final response = await _channel.invokeMethod<Object?>(method, request);
     if (response is! Uint8List) {
-      throw StateError('visibility protocol control returned a non-byte response.');
+      throw StateError(
+          'visibility protocol control returned a non-byte response.');
     }
     return Uint8List.fromList(response);
   }
@@ -1248,6 +1517,10 @@ final class ARVisibilityGridV2WorkerBinding {
   bool _abandoned = false;
   Future<Map<Object?, Object?>>? _disposeFuture;
   Future<Map<Object?, Object?>>? _abandonFuture;
+
+  /// Scalar renderer controls/status/hit transport for this worker binding.
+  ARVisibilityGridV2RendererTransport get renderer =>
+      ARVisibilityGridV2RendererTransport(_controlChannel);
 
   /// Stable sendable identity for this connection-owned cleanup lease.
   String get cleanupLeaseIdentity => _cleanupLease

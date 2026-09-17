@@ -412,6 +412,9 @@ internal class CoveragePresentationSelector(
         capacity = presentationCapacity,
         count = selectedCount,
         keys = selectedKeys.copyOf(selectedCount),
+        surfaceIds = LongArray(selectedCount) { destination ->
+            source.surfaceIds[selectedSourceSlots[destination]]
+        },
         positions = selectedPositions.copyOf(
             selectedCount * CoveragePointMeshResources.POSITION_COMPONENTS,
         ),

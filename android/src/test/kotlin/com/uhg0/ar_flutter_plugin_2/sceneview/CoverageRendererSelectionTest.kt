@@ -11,7 +11,7 @@ import org.junit.Test
 
 class CoverageRendererSelectionTest {
     @Test
-    fun `production resource factory releases the old generation before creating replacement`() {
+    fun `production resource factory installs replacement before releasing old generation`() {
         val events = mutableListOf<String>()
         val modes = mutableListOf<com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode>()
         val factory = CoverageRendererResourceFactory()
@@ -30,7 +30,7 @@ class CoverageRendererSelectionTest {
         )
         factory.clear()
         assertEquals(
-            listOf("create:cube:CUBES:8000:cubes", "release:cube", "create:centroid:CENTROIDS:20000:centroids", "release:centroid"),
+            listOf("create:cube:CUBES:8000:cubes", "create:centroid:CENTROIDS:20000:centroids", "release:cube", "release:centroid"),
             events,
         )
         assertEquals(
@@ -43,11 +43,36 @@ class CoverageRendererSelectionTest {
     }
 
     @Test
+    fun `failed replacement leaves the current renderer owner mounted`() {
+        val released = mutableListOf<String>()
+        val factory = CoverageRendererResourceFactory()
+        factory.replaceCube(
+            8_000,
+            "current",
+            create = { _, _, _ -> "current" },
+            release = { value: String -> released += value },
+        )
+
+        assertThrows(IllegalStateException::class.java) {
+            factory.replacePoint(
+                com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS,
+                20_000,
+                "replacement",
+                create = { _, _, _ -> throw IllegalStateException("allocation failed") },
+                release = { value: String -> released += value },
+            )
+        }
+        assertEquals(emptyList<String>(), released)
+        factory.clear()
+        assertEquals(listOf("current"), released)
+    }
+
+    @Test
     fun `renderer lazy mode resource peaks stay within the shared eight MiB cap`() {
         assertEquals(2_000, CoverageRendererLimits.RAW_POINT_CAPACITY)
         assertEquals(20_000, CoverageRendererLimits.CENTROID_CAPACITY)
         assertEquals(8_000, CoverageRendererLimits.CUBE_CAPACITY)
-        assertEquals(7_963_200, CoverageRendererLimits.maximumActiveRendererBytes)
+        assertEquals(8_016_704, CoverageRendererLimits.maximumActiveRendererBytes)
         com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.entries.forEach { mode ->
             assertTrue(
                 "$mode startup peak must fit the shared renderer cap",

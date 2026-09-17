@@ -379,13 +379,27 @@ data class CoveragePointRenderSnapshot(
     val capacity: Int,
     val count: Int,
     val keys: LongArray,
+    /** Stable canonical surface identities; legacy raw snapshots use keys. */
+    val surfaceIds: LongArray = keys.copyOf(),
     val positions: FloatArray,
     val colors: IntArray,
     val styleRows: ByteArray = ByteArray(0),
     val gridRotationWorld: FloatArray = identityGridRotation(),
     val update: CoveragePointRenderUpdate? = null,
+    /** V2 canonical qualifiers; legacy/raw snapshots leave these at zero. */
+    val bindingGeneration: Long = 0L,
+    val groupGeneration: Long = 0L,
+    val transactionId: Long = 0L,
+    val geometryRevision: Long = 0L,
+    val styleRevision: Long = 0L,
 ) {
     init {
+        require(bindingGeneration >= 0L)
+        require(groupGeneration >= 0L)
+        require(transactionId >= 0L)
+        require(geometryRevision >= 0L)
+        require(styleRevision >= 0L)
+        require(surfaceIds.size == count)
         require(styleRows.isEmpty() || styleRows.size == count * COVERAGE_RENDERER_STYLE_ROW_BYTES)
     }
 }

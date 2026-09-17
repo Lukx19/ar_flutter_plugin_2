@@ -33,6 +33,32 @@ internal class RendererTelemetry {
     private var totalUploadCompletionNanos = 0L
     private var peakUploadCompletionNanos = 0L
     private var rendererUpdateCount = 0
+    private val presentationCounts = linkedMapOf<String, Int>()
+    private var resourceReplacementCount = 0
+    private var resourceDisposalCount = 0
+
+    @Synchronized
+    fun recordPresentation(mode: CoveragePresentationMode) {
+        val key = when (mode) {
+            CoveragePresentationMode.SEMANTIC_CENTROIDS -> "semanticCentroidCount"
+            CoveragePresentationMode.SEMANTIC_CUBES -> "semanticCubeCount"
+            CoveragePresentationMode.RAW_FEATURES -> "rawFeatureCount"
+            CoveragePresentationMode.WARM_PROXIES -> "warmProxyCount"
+            CoveragePresentationMode.OVERVIEW -> "coldOverviewCount"
+            CoveragePresentationMode.SUPPRESSED_DEBUG -> "debugCount"
+        }
+        presentationCounts[key] = (presentationCounts[key] ?: 0) + 1
+    }
+
+    @Synchronized
+    fun recordResourceReplacement() {
+        resourceReplacementCount++
+    }
+
+    @Synchronized
+    fun recordResourceDisposal() {
+        resourceDisposalCount++
+    }
 
     fun setOwnedBufferBytes(owner: String, bytes: Int) {
         require(owner.isNotBlank())
@@ -127,6 +153,7 @@ internal class RendererTelemetry {
     private val ownedBufferBytes: Int
         get() = allocationsByOwner.values.sum()
 
+    @Synchronized
     fun snapshot(): Map<String, Any> = mapOf(
         "rendererUpdateCount" to rendererUpdateCount,
         "ownedBufferBytes" to ownedBufferBytes,
@@ -161,6 +188,17 @@ internal class RendererTelemetry {
         "gpuCounterStatus" to "unavailable: Filament driver counters are not exposed",
         "ordinaryUploadLimitBytes" to ORDINARY_UPLOAD_LIMIT_BYTES,
         "rendererAllocationLimitBytes" to RENDERER_ALLOCATION_LIMIT_BYTES,
+        "semanticCentroidCount" to (presentationCounts["semanticCentroidCount"] ?: 0),
+        "semanticCubeCount" to (presentationCounts["semanticCubeCount"] ?: 0),
+        "rawFeatureCount" to (presentationCounts["rawFeatureCount"] ?: 0),
+        "warmProxyCount" to (presentationCounts["warmProxyCount"] ?: 0),
+        "coldOverviewCount" to (presentationCounts["coldOverviewCount"] ?: 0),
+        "glyphCount" to (presentationCounts["glyphCount"] ?: 0),
+        "debugCount" to (presentationCounts["debugCount"] ?: 0),
+        "resourceReplacementCount" to resourceReplacementCount,
+        "resourceDisposalCount" to resourceDisposalCount,
+        "resourceReplacementDisposalBalance" to
+            resourceDisposalCount - resourceReplacementCount,
     )
 
     internal companion object {

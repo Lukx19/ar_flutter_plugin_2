@@ -135,6 +135,7 @@ internal class ArView(
         CommittedBaselineAuthority = CommittedBaselineAuthority,
         isDebuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0,
         onRendererStyleCut = visibilityRendererProjection::applyStyleCut,
+        coverageRendererOwner = sceneHost.coverageRendererOwner,
     )
     private val visibilityObservationDebugGate = VisibilityObservationDebugGate()
     // #101 owns this native proof only.  It remains false until an internal

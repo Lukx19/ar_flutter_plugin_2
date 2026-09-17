@@ -688,11 +688,17 @@ class VisibilityGridRendererState(
             capacity = capacity,
             count = count,
             keys = snapshotKeys,
+            surfaceIds = surfaceIds.copyOf(count),
             positions = snapshotPositions,
             colors = snapshotColors,
             styleRows = styleRows.copyOf(count * COVERAGE_RENDERER_STYLE_ROW_BYTES),
             gridRotationWorld = identityGridRotation(),
             update = update,
+            bindingGeneration = installedOwnership?.bindingGeneration ?: 0L,
+            groupGeneration = installedGroupGeneration,
+            transactionId = installedTransactionId,
+            geometryRevision = geometryRevision,
+            styleRevision = styleRevision,
         )
     }
 
