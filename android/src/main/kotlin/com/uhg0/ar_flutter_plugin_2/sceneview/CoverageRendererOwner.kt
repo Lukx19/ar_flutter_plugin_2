@@ -3,8 +3,8 @@ package com.uhg0.ar_flutter_plugin_2.sceneview
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererCoverage
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererSemantic
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import java.util.Collections
-import kotlin.math.hypot
 
 /** Stable renderer modes exposed by the V2 visibility binding. */
 enum class CoveragePresentationMode(val wireName: String) {
@@ -18,7 +18,7 @@ enum class CoveragePresentationMode(val wireName: String) {
 
     companion object {
         fun fromWire(value: String): CoveragePresentationMode =
-            entries.firstOrNull { it.wireName == value || it.name == value } ?:
+            entries.firstOrNull { it.wireName == value } ?:
                 throw IllegalArgumentException("Unknown coverage presentation mode: $value")
     }
 }
@@ -26,6 +26,20 @@ enum class CoveragePresentationMode(val wireName: String) {
 typealias CoveragePalette = CoverageRendererPalette
 typealias CoverageSemanticLabel = CoverageRendererSemantic
 typealias CoverageLabel = CoverageRendererCoverage
+
+internal data class CoverageScreenPoint(
+    val xPx: Float,
+    val yPx: Float,
+    val depth: Float,
+) {
+    init {
+        require(xPx.isFinite() && yPx.isFinite() && depth.isFinite())
+    }
+}
+
+internal fun interface CoverageWorldToScreenProjection {
+    fun project(x: Float, y: Float, z: Float): CoverageScreenPoint?
+}
 
 internal data class CoverageRendererControls(
     val visible: Boolean,
@@ -62,6 +76,7 @@ internal class VisibilityRendererSnapshot(
     val geometryRevision: Long,
     val styleRevision: Long,
     rows: List<VisibilityRendererRow>,
+    renderSnapshot: CoveragePointRenderSnapshot? = null,
     val semanticRevision: Long = geometryRevision,
     val coverageRevision: Long = styleRevision,
     val residencyRevision: Long = styleRevision,
@@ -72,6 +87,27 @@ internal class VisibilityRendererSnapshot(
     val rows: List<VisibilityRendererRow> = Collections.unmodifiableList(
         rows.map { it.copy() },
     )
+    val renderSnapshot: CoveragePointRenderSnapshot? = renderSnapshot?.let { source ->
+        source.copy(
+            keys = source.keys.copyOf(),
+            surfaceIds = source.surfaceIds.copyOf(),
+            positions = source.positions.copyOf(),
+            colors = source.colors.copyOf(),
+            styleRows = source.styleRows.copyOf(),
+            gridRotationWorld = source.gridRotationWorld.copyOf(),
+            update = source.update?.let { update ->
+                update.copy(
+                    spans = update.spans.map { span ->
+                        span.copy(
+                            positions = span.positions.copyOf(),
+                            colors = span.colors.copyOf(),
+                            styleRows = span.styleRows.copyOf(),
+                        )
+                    },
+                )
+            },
+        )
+    }
     val rowCount: Int get() = rows.size
 
     init {
@@ -100,6 +136,8 @@ internal data class RendererInstallReceipt(
     val rendererGeneration: Long,
     val geometryRevision: Long,
     val styleRevision: Long,
+    val stale: Boolean = false,
+    val replayed: Boolean = false,
 )
 
 internal data class RendererControlReceipt(
@@ -190,6 +228,9 @@ internal interface CoverageRendererOwner {
  */
 internal class NativeCoverageRendererOwner(
     private val onControlsChanged: (CoverageRendererControls) -> Unit = {},
+    private val onPresentationChanged: (CoveragePointRenderSnapshot?, CoveragePresentationMode) -> Unit = { _, _ -> },
+    private val worldToScreen: CoverageWorldToScreenProjection =
+        CoverageWorldToScreenProjection { x, y, _ -> CoverageScreenPoint(x, y, 1f) },
 ) : CoverageRendererOwner {
     private var latest: VisibilityRendererSnapshot? = null
     private var controls = CoverageRendererControls(
@@ -200,6 +241,48 @@ internal class NativeCoverageRendererOwner(
     private var unavailable = false
     private var disposed = false
     private var recoveryPending = false
+    private var lastAcceptedQualifier: InstallQualifier? = null
+
+    private data class InstallQualifier(
+        val bindingGeneration: Long,
+        val groupGeneration: Long,
+        val rendererGeneration: Long,
+        val transactionId: Long,
+        val geometryRevision: Long,
+        val styleRevision: Long,
+    ) : Comparable<InstallQualifier> {
+        override fun compareTo(other: InstallQualifier): Int {
+            listOf(
+                bindingGeneration,
+                groupGeneration,
+                transactionId,
+                geometryRevision,
+                styleRevision,
+                rendererGeneration,
+            ).zip(
+                listOf(
+                    other.bindingGeneration,
+                    other.groupGeneration,
+                    other.transactionId,
+                    other.geometryRevision,
+                    other.styleRevision,
+                    other.rendererGeneration,
+                ),
+            ).forEach { (left, right) ->
+                left.compareTo(right).takeIf { it != 0 }?.let { return it }
+            }
+            return 0
+        }
+    }
+
+    private fun VisibilityRendererSnapshot.qualifier() = InstallQualifier(
+        bindingGeneration,
+        groupGeneration,
+        rendererGeneration,
+        transactionId,
+        geometryRevision,
+        styleRevision,
+    )
 
     @Synchronized
     override fun install(snapshot: VisibilityRendererSnapshot): RendererInstallReceipt {
@@ -215,7 +298,25 @@ internal class NativeCoverageRendererOwner(
                 styleRevision = snapshot.styleRevision,
             )
         }
+        val qualifier = snapshot.qualifier()
+        val priorQualifier = lastAcceptedQualifier
+        if (priorQualifier != null && qualifier < priorQualifier) {
+            val current = latest
+            return RendererInstallReceipt(
+                installed = false,
+                rendererUnavailable = unavailable,
+                rowCount = current?.let { selectedRows(it).size } ?: 0,
+                bindingGeneration = current?.bindingGeneration ?: snapshot.bindingGeneration,
+                groupGeneration = current?.groupGeneration ?: snapshot.groupGeneration,
+                rendererGeneration = current?.rendererGeneration ?: snapshot.rendererGeneration,
+                geometryRevision = current?.geometryRevision ?: snapshot.geometryRevision,
+                styleRevision = current?.styleRevision ?: snapshot.styleRevision,
+                stale = true,
+            )
+        }
+        val replayed = priorQualifier == qualifier
         latest = snapshot
+        lastAcceptedQualifier = qualifier
         val mounted = !unavailable
         return RendererInstallReceipt(
             installed = mounted,
@@ -226,6 +327,7 @@ internal class NativeCoverageRendererOwner(
             rendererGeneration = snapshot.rendererGeneration,
             geometryRevision = snapshot.geometryRevision,
             styleRevision = snapshot.styleRevision,
+            replayed = replayed,
         )
     }
 
@@ -244,6 +346,7 @@ internal class NativeCoverageRendererOwner(
         }
         this.controls = controls
         onControlsChanged(controls)
+        notifyPresentationChanged()
         val snapshot = latest
         return RendererControlReceipt(
             accepted = !unavailable,
@@ -288,9 +391,22 @@ internal class NativeCoverageRendererOwner(
         }
         val row = selectedRows(snapshot)
             .asSequence()
-            .map { it to hypot((it.x - xPx).toDouble(), (it.y - yPx).toDouble()) }
-            .filter { it.second <= HIT_RADIUS_PX }
-            .sortedWith(compareBy<Pair<VisibilityRendererRow, Double>> { it.second }.thenBy { it.first.surfaceId })
+            .mapNotNull { row ->
+                val projected = worldToScreen.project(row.x, row.y, row.z) ?: return@mapNotNull null
+                if (projected.depth <= 0f) return@mapNotNull null
+                val dx = projected.xPx - xPx
+                val dy = projected.yPx - yPx
+                val distanceSquared = dx * dx + dy * dy
+                if (!distanceSquared.isFinite() || distanceSquared > HIT_RADIUS_PX * HIT_RADIUS_PX) {
+                    return@mapNotNull null
+                }
+                Triple(row, distanceSquared, projected.depth)
+            }
+            .sortedWith(
+                compareBy<Triple<VisibilityRendererRow, Float, Float>> { it.second }
+                    .thenBy { it.third }
+                    .thenBy { it.first.surfaceId },
+            )
             .firstOrNull()?.first ?: return CoverageHitReceipt.Miss
         return CoverageHitReceipt.Hit(
             CoverageHitResult(
@@ -354,6 +470,17 @@ internal class NativeCoverageRendererOwner(
     fun snapshot(): VisibilityRendererSnapshot? = latest
 
     @Synchronized
+    fun presentationSnapshot(): CoveragePointRenderSnapshot? {
+        val current = latest ?: return null
+        return current.renderSnapshot?.let { selectForMode(it) }
+    }
+
+    @Synchronized
+    fun refreshPresentation() {
+        notifyPresentationChanged()
+    }
+
+    @Synchronized
     fun clearLatest() {
         latest = null
     }
@@ -384,6 +511,23 @@ internal class NativeCoverageRendererOwner(
             CoveragePresentationMode.SUPPRESSED_DEBUG -> CoverageRendererLimits.DEBUG_ROW_CAPACITY
         }
         return snapshot.rows.sortedBy { it.surfaceId }.take(capacity)
+    }
+
+    private fun selectForMode(snapshot: CoveragePointRenderSnapshot): CoveragePointRenderSnapshot {
+        val capacity = when (controls.mode) {
+            CoveragePresentationMode.SEMANTIC_CENTROIDS -> CoverageRendererLimits.CENTROID_CAPACITY
+            CoveragePresentationMode.SEMANTIC_CUBES -> CoverageRendererLimits.CUBE_CAPACITY
+            CoveragePresentationMode.RAW_FEATURES -> CoverageRendererLimits.RAW_POINT_CAPACITY
+            CoveragePresentationMode.WARM_PROXIES -> CoverageRendererLimits.WARM_PROXY_CAPACITY
+            CoveragePresentationMode.OVERVIEW -> CoverageRendererLimits.COLD_OVERVIEW_CAPACITY
+            CoveragePresentationMode.SUPPRESSED_DEBUG -> CoverageRendererLimits.DEBUG_ROW_CAPACITY
+        }
+        return snapshot.boundedForPresentation(capacity)
+    }
+
+    private fun notifyPresentationChanged() {
+        if (unavailable || disposed) return
+        onPresentationChanged(presentationSnapshot(), controls.mode)
     }
 
     private companion object {

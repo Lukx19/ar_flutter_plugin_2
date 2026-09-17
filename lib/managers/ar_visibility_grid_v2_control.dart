@@ -19,6 +19,79 @@ enum ARCoveragePresentationMode {
 
   const ARCoveragePresentationMode(this.wireName);
   final String wireName;
+
+  static ARCoveragePresentationMode fromWire(Object? value) =>
+      ARCoveragePresentationMode.values.firstWhere(
+        (mode) => mode.wireName == value,
+        orElse: () => throw ArgumentError.value(
+          value,
+          'mode',
+          'Unknown coverage presentation mode.',
+        ),
+      );
+}
+
+enum ARCoveragePalette {
+  uniform('uniform'),
+  coverage('coverage'),
+  normal('normal'),
+  occupancy('occupancy'),
+  lineage('lineage'),
+  age('age'),
+  sourceHealth('source_health'),
+  residency('residency'),
+  direction('direction');
+
+  const ARCoveragePalette(this.wireName);
+  final String wireName;
+
+  static ARCoveragePalette fromWire(Object? value) =>
+      ARCoveragePalette.values.firstWhere(
+        (palette) => palette.wireName == value,
+        orElse: () => throw ArgumentError.value(
+          value,
+          'palette',
+          'Unknown coverage palette.',
+        ),
+      );
+}
+
+enum ARCoverageSemanticLabel {
+  confirmed('confirmed'),
+  ambiguous('ambiguous'),
+  suppressedDebug('suppressed_debug');
+
+  const ARCoverageSemanticLabel(this.wireName);
+  final String wireName;
+
+  static ARCoverageSemanticLabel fromWire(Object? value) =>
+      ARCoverageSemanticLabel.values.firstWhere(
+        (label) => label.wireName == value,
+        orElse: () => throw ArgumentError.value(
+          value,
+          'semanticLabel',
+          'Unknown coverage semantic label.',
+        ),
+      );
+}
+
+enum ARCoverageLabel {
+  uncovered('uncovered'),
+  partial('partial'),
+  complete('complete');
+
+  const ARCoverageLabel(this.wireName);
+  final String wireName;
+
+  static ARCoverageLabel fromWire(Object? value) =>
+      ARCoverageLabel.values.firstWhere(
+        (label) => label.wireName == value,
+        orElse: () => throw ArgumentError.value(
+          value,
+          'coverageLabel',
+          'Unknown coverage label.',
+        ),
+      );
 }
 
 final class ARVisibilityRendererControls {
@@ -32,19 +105,31 @@ final class ARVisibilityRendererControls {
 
   final bool visible;
   final ARCoveragePresentationMode mode;
-  final String palette;
+  final ARCoveragePalette palette;
   final int? expectedGeometryRevision;
   final int? expectedStyleRevision;
 
   Map<String, Object?> toMap() => <String, Object?>{
         'visible': visible,
         'mode': mode.wireName,
-        'palette': palette,
+        'palette': palette.wireName,
         if (expectedGeometryRevision != null)
           'expectedGeometryRevision': expectedGeometryRevision,
         if (expectedStyleRevision != null)
           'expectedStyleRevision': expectedStyleRevision,
       };
+
+  static ARVisibilityRendererControls fromMap(Object? raw) {
+    final map = _rendererMap(raw, 'renderer controls');
+    return ARVisibilityRendererControls(
+      visible: _rendererBool(map, 'visible'),
+      mode: ARCoveragePresentationMode.fromWire(map['mode']),
+      palette: ARCoveragePalette.fromWire(map['palette']),
+      expectedGeometryRevision:
+          _rendererNullableInt(map, 'expectedGeometryRevision'),
+      expectedStyleRevision: _rendererNullableInt(map, 'expectedStyleRevision'),
+    );
+  }
 }
 
 final class ARVisibilityRendererControlReceipt {
@@ -61,8 +146,8 @@ final class ARVisibilityRendererControlReceipt {
   final bool accepted;
   final bool rendererUnavailable;
   final bool visible;
-  final String mode;
-  final String palette;
+  final ARCoveragePresentationMode mode;
+  final ARCoveragePalette palette;
   final int rowCount;
   final int rendererGeneration;
 
@@ -72,8 +157,8 @@ final class ARVisibilityRendererControlReceipt {
       accepted: _rendererBool(map, 'accepted'),
       rendererUnavailable: _rendererBool(map, 'rendererUnavailable'),
       visible: _rendererBool(map, 'visible'),
-      mode: _rendererString(map, 'mode'),
-      palette: _rendererString(map, 'palette'),
+      mode: ARCoveragePresentationMode.fromWire(map['mode']),
+      palette: ARCoveragePalette.fromWire(map['palette']),
       rowCount: _rendererInt(map, 'rowCount'),
       rendererGeneration: _rendererInt(map, 'rendererGeneration'),
     );
@@ -95,8 +180,8 @@ final class ARVisibilityRendererStatus {
 
   final bool rendererUnavailable;
   final bool visible;
-  final String mode;
-  final String palette;
+  final ARCoveragePresentationMode mode;
+  final ARCoveragePalette palette;
   final int rowCount;
   final int selectedRowCount;
   final int rendererGeneration;
@@ -108,8 +193,8 @@ final class ARVisibilityRendererStatus {
     return ARVisibilityRendererStatus(
       rendererUnavailable: _rendererBool(map, 'rendererUnavailable'),
       visible: _rendererBool(map, 'visible'),
-      mode: _rendererString(map, 'mode'),
-      palette: _rendererString(map, 'palette'),
+      mode: ARCoveragePresentationMode.fromWire(map['mode']),
+      palette: ARCoveragePalette.fromWire(map['palette']),
       rowCount: _rendererInt(map, 'rowCount'),
       selectedRowCount: _rendererInt(map, 'selectedRowCount'),
       rendererGeneration: _rendererInt(map, 'rendererGeneration'),
@@ -140,8 +225,8 @@ final class ARVisibilityRendererHitReceipt {
   final bool hit;
   final bool stale;
   final int? surfaceId;
-  final String? semanticLabel;
-  final String? coverageLabel;
+  final ARCoverageSemanticLabel? semanticLabel;
+  final ARCoverageLabel? coverageLabel;
   final int? targetDirectionIndex;
   final int? geometryRevision;
   final int? styleRevision;
@@ -163,8 +248,8 @@ final class ARVisibilityRendererHitReceipt {
       requestId: map['requestId'],
       hit: true,
       surfaceId: _rendererInt(map, 'surfaceId'),
-      semanticLabel: _rendererString(map, 'semanticLabel'),
-      coverageLabel: _rendererString(map, 'coverageLabel'),
+      semanticLabel: ARCoverageSemanticLabel.fromWire(map['semanticLabel']),
+      coverageLabel: ARCoverageLabel.fromWire(map['coverageLabel']),
       targetDirectionIndex: _rendererNullableInt(map, 'targetDirectionIndex'),
       geometryRevision: _rendererInt(map, 'geometryRevision'),
       styleRevision: _rendererInt(map, 'styleRevision'),
@@ -243,14 +328,6 @@ Map<Object?, Object?> _rendererMap(Object? raw, String label) {
 bool _rendererBool(Map<Object?, Object?> map, String key) {
   final value = map[key];
   if (value is! bool) throw StateError('Renderer field $key is malformed.');
-  return value;
-}
-
-String _rendererString(Map<Object?, Object?> map, String key) {
-  final value = map[key];
-  if (value is! String || value.isEmpty) {
-    throw StateError('Renderer field $key is malformed.');
-  }
   return value;
 }
 

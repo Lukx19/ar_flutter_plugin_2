@@ -24,6 +24,9 @@ import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationMode
 import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageRendererControls
 import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageRendererOwner
 import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageHitReceipt
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererCoverage
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererSemantic
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.RendererStyleCommandApplyResultV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.RendererStyleCutPayloadV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.RendererStyleCommandV1
@@ -44,6 +47,30 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 internal enum class CurrentDeltaQueueResult { QUEUED, ALREADY_QUEUED, RECOVERED_EXACT_QUEUE }
+
+private fun rendererPaletteWire(value: CoverageRendererPalette): String = when (value) {
+    CoverageRendererPalette.UNIFORM -> "uniform"
+    CoverageRendererPalette.COVERAGE -> "coverage"
+    CoverageRendererPalette.NORMAL -> "normal"
+    CoverageRendererPalette.OCCUPANCY -> "occupancy"
+    CoverageRendererPalette.LINEAGE -> "lineage"
+    CoverageRendererPalette.AGE -> "age"
+    CoverageRendererPalette.SOURCE_HEALTH -> "source_health"
+    CoverageRendererPalette.RESIDENCY -> "residency"
+    CoverageRendererPalette.DIRECTION -> "direction"
+}
+
+private fun rendererSemanticWire(value: CoverageRendererSemantic): String = when (value) {
+    CoverageRendererSemantic.CONFIRMED -> "confirmed"
+    CoverageRendererSemantic.AMBIGUOUS -> "ambiguous"
+    CoverageRendererSemantic.SUPPRESSED_DEBUG -> "suppressed_debug"
+}
+
+private fun rendererCoverageWire(value: CoverageRendererCoverage): String = when (value) {
+    CoverageRendererCoverage.UNCOVERED -> "uncovered"
+    CoverageRendererCoverage.PARTIAL -> "partial"
+    CoverageRendererCoverage.COMPLETE -> "complete"
+}
 
 /**
  * Production owner for one immutable V2 platform-view binding generation.
@@ -464,7 +491,7 @@ class VisibilityGridV2Binding internal constructor(
             "rendererUnavailable" to status.rendererUnavailable,
             "visible" to status.visible,
             "mode" to status.mode.wireName,
-            "palette" to status.palette.name.lowercase(),
+            "palette" to rendererPaletteWire(status.palette),
             "rowCount" to status.rowCount,
             "selectedRowCount" to status.selectedRowCount,
             "rendererGeneration" to status.rendererGeneration,
@@ -512,7 +539,7 @@ class VisibilityGridV2Binding internal constructor(
                     visible = visible,
                     mode = CoveragePresentationMode.fromWire(modeWire),
                     palette = com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette.entries
-                        .first { it.name.equals(paletteWire, ignoreCase = true) },
+                        .first { rendererPaletteWire(it) == paletteWire },
                 )
             }.getOrElse {
                 result.error("VG_RENDERER_INVALID", "renderer controls are invalid", null)
@@ -525,7 +552,7 @@ class VisibilityGridV2Binding internal constructor(
                     "rendererUnavailable" to receipt.rendererUnavailable,
                     "visible" to receipt.visible,
                     "mode" to receipt.mode.wireName,
-                    "palette" to receipt.palette.name.lowercase(),
+                    "palette" to rendererPaletteWire(receipt.palette),
                     "rowCount" to receipt.rowCount,
                     "rendererGeneration" to receipt.rendererGeneration,
                 ),
@@ -560,8 +587,8 @@ class VisibilityGridV2Binding internal constructor(
                         "requestId" to requestId,
                         "hit" to true,
                         "surfaceId" to receipt.result.surfaceId,
-                        "semanticLabel" to receipt.result.semanticLabel.name.lowercase(),
-                        "coverageLabel" to receipt.result.coverageLabel.name.lowercase(),
+                        "semanticLabel" to rendererSemanticWire(receipt.result.semanticLabel),
+                        "coverageLabel" to rendererCoverageWire(receipt.result.coverageLabel),
                         "targetDirectionIndex" to receipt.result.targetDirectionIndex,
                         "geometryRevision" to receipt.result.geometryRevision,
                         "styleRevision" to receipt.result.styleRevision,

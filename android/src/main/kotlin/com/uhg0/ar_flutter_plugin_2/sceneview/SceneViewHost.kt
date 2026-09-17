@@ -11,6 +11,7 @@ import android.view.Choreographer
 import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
+import android.opengl.Matrix
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -45,6 +46,7 @@ import com.google.ar.core.Pose
 import com.google.ar.core.Session
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette
 import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.ArCoreDepthModeController
@@ -140,25 +142,75 @@ internal class SceneViewHost(
     )
     /** The host owns the sole V2 coverage renderer owner for this SceneView. */
     internal val coverageRendererOwner: NativeCoverageRendererOwner =
-        NativeCoverageRendererOwner { controls ->
-            rendererTelemetry.recordPresentation(controls.mode)
-            val current = coverageRenderConfig.value
-            if (current != null) {
-                val mode = when (controls.mode) {
-                    CoveragePresentationMode.RAW_FEATURES -> VoxelRenderMode.POINTS
-                    CoveragePresentationMode.SEMANTIC_CUBES -> VoxelRenderMode.CUBES
-                    CoveragePresentationMode.SEMANTIC_CENTROIDS,
-                    CoveragePresentationMode.WARM_PROXIES,
-                    CoveragePresentationMode.OVERVIEW,
-                    CoveragePresentationMode.SUPPRESSED_DEBUG,
-                    -> VoxelRenderMode.CENTROIDS
+        NativeCoverageRendererOwner(
+            onControlsChanged = { controls ->
+                rendererTelemetry.recordPresentation(controls.mode)
+                val current = coverageRenderConfig.value
+                if (current != null) {
+                    val mode = controls.voxelMode()
+                    coverageRenderConfig.value = current.copy(
+                        enabled = controls.visible,
+                        voxelRenderMode = mode,
+                    )
                 }
-                coverageRenderConfig.value = current.copy(
-                    enabled = controls.visible,
-                    voxelRenderMode = mode,
-                )
-            }
-        }
+            },
+            onPresentationChanged = { snapshot, mode ->
+                if (snapshot != null) {
+                    coverageSnapshotRef.set(snapshot)
+                    coverageMeshRef.get()?.updateCoverage(snapshot, mode.voxelMode())
+                }
+            },
+            worldToScreen = CoverageWorldToScreenProjection(::projectCoveragePoint),
+        )
+
+    private fun CoverageRendererControls.voxelMode(): VoxelRenderMode = when (mode) {
+        CoveragePresentationMode.RAW_FEATURES -> VoxelRenderMode.POINTS
+        CoveragePresentationMode.SEMANTIC_CUBES -> VoxelRenderMode.CUBES
+        CoveragePresentationMode.SEMANTIC_CENTROIDS,
+        CoveragePresentationMode.WARM_PROXIES,
+        CoveragePresentationMode.OVERVIEW,
+        CoveragePresentationMode.SUPPRESSED_DEBUG,
+        -> VoxelRenderMode.CENTROIDS
+    }
+
+    private fun CoveragePresentationMode.voxelMode(): VoxelRenderMode = when (this) {
+        CoveragePresentationMode.RAW_FEATURES -> VoxelRenderMode.POINTS
+        CoveragePresentationMode.SEMANTIC_CUBES -> VoxelRenderMode.CUBES
+        CoveragePresentationMode.SEMANTIC_CENTROIDS,
+        CoveragePresentationMode.WARM_PROXIES,
+        CoveragePresentationMode.OVERVIEW,
+        CoveragePresentationMode.SUPPRESSED_DEBUG,
+        -> VoxelRenderMode.CENTROIDS
+    }
+
+    private fun projectCoveragePoint(x: Float, y: Float, z: Float): CoverageScreenPoint? {
+        val frame = frameRef.get() ?: return null
+        if (composeView.width <= 0 || composeView.height <= 0) return null
+        val view = FloatArray(16)
+        val projection = FloatArray(16)
+        val camera = frame.camera
+        runCatching {
+            camera.getViewMatrix(view, 0)
+            camera.getProjectionMatrix(projection, 0, 0.01f, 100f)
+        }.getOrNull() ?: return null
+        val viewProjection = FloatArray(16)
+        Matrix.multiplyMM(viewProjection, 0, projection, 0, view, 0)
+        val clip = FloatArray(4)
+        Matrix.multiplyMV(clip, 0, viewProjection, 0, floatArrayOf(x, y, z, 1f), 0)
+        val w = clip[3]
+        if (!w.isFinite() || w <= 0f) return null
+        val ndcX = clip[0] / w
+        val ndcY = clip[1] / w
+        val depth = clip[2] / w
+        if (!ndcX.isFinite() || !ndcY.isFinite() || !depth.isFinite() ||
+            depth < -1f || depth > 1f
+        ) return null
+        return CoverageScreenPoint(
+            xPx = (ndcX + 1f) * 0.5f * composeView.width,
+            yPx = (1f - ndcY) * 0.5f * composeView.height,
+            depth = depth,
+        )
+    }
     // A PlatformView replacement must not overlap the outgoing Compose-owned
     // ARCore/Filament session. See [SceneViewSessionLease].
     private val sceneSessionGeneration = sceneSessionGenerationCounter.incrementAndGet()
@@ -612,7 +664,18 @@ internal class SceneViewHost(
             return
         }
 
-        coverageRendererOwner.install(snapshot.toVisibilityRendererSnapshot(config))
+        val controls = CoverageRendererControls(
+            visible = config.enabled,
+            mode = when (config.voxelRenderMode) {
+                VoxelRenderMode.POINTS -> CoveragePresentationMode.RAW_FEATURES
+                VoxelRenderMode.CENTROIDS -> CoveragePresentationMode.SEMANTIC_CENTROIDS
+                VoxelRenderMode.CUBES -> CoveragePresentationMode.SEMANTIC_CUBES
+            },
+            palette = CoverageRendererPalette.COVERAGE,
+        )
+        val install = coverageRendererOwner.install(snapshot.toVisibilityRendererSnapshot(config))
+        if (install.stale) return
+        coverageRendererOwner.setControls(controls)
         rendererTelemetry.recordPresentation(
             when (config.voxelRenderMode) {
                 VoxelRenderMode.POINTS -> CoveragePresentationMode.RAW_FEATURES
@@ -641,18 +704,14 @@ internal class SceneViewHost(
             // snapshot hand-off is 20k rows; replacing a cube while it is
             // still charged would produce a real transient over the shared
             // cap even though each active mode fits on its own.
-            rendererAllocationLedger.installPersistentCoverageStateForCapacity(
-                snapshot.capacity,
-            )
+            rendererAllocationLedger.installPersistentCoverageState(config.voxelRenderMode)
             rendererAllocationLedger.updateSnapshotHandoff(config.voxelRenderMode)
             coverageRenderConfig.value = config
         } else {
-            rendererAllocationLedger.installPersistentCoverageStateForCapacity(
-                snapshot.capacity,
-            )
+            rendererAllocationLedger.installPersistentCoverageState(config.voxelRenderMode)
             rendererAllocationLedger.updateSnapshotHandoff(config.voxelRenderMode)
-            coverageMeshRef.get()?.updateCoverage(snapshot, config.voxelRenderMode)
         }
+        coverageRendererOwner.refreshPresentation()
     }
 
     fun updateRawPointCloud(snapshot: CoveragePointRenderSnapshot?) {
@@ -724,6 +783,7 @@ internal class SceneViewHost(
             geometryRevision = geometryRevision.takeIf { it > 0L } ?: (update?.geometryRevision ?: revision),
             styleRevision = styleRevision.takeIf { it > 0L } ?: (update?.visibilityRevision ?: revision),
             rows = rows,
+            renderSnapshot = this,
             targetSurfaceId = rows.firstOrNull { it.targetDirectionIndex != null }?.surfaceId,
             targetDirectionIndex = rows.firstOrNull { it.targetDirectionIndex != null }
                 ?.targetDirectionIndex,
@@ -1309,13 +1369,13 @@ internal class SceneViewHost(
             requestedMode: VoxelRenderMode = mode,
         ) {
             if (disposed || requestedMode != mode) return
-            latestCoverageSnapshot = snapshot
+            latestCoverageSnapshot = snapshot?.boundedForMesh(mode)
             if (attached && mode != VoxelRenderMode.POINTS) updateActiveTarget()
         }
 
         fun updateRawPoints(snapshot: CoveragePointRenderSnapshot?) {
             if (disposed) return
-            latestRawPointSnapshot = snapshot
+            latestRawPointSnapshot = snapshot?.boundedForMesh(VoxelRenderMode.POINTS)
             if (attached && mode == VoxelRenderMode.POINTS) updateActiveTarget()
         }
 
@@ -1402,6 +1462,21 @@ internal class SceneViewHost(
             handleRotation = false,
             planeFindingMode = Config.PlaneFindingMode.DISABLED,
         )
+    }
+}
+
+private fun CoveragePointRenderSnapshot.boundedForMesh(
+    mode: VoxelRenderMode,
+): CoveragePointRenderSnapshot {
+    val capacity = when (mode) {
+        VoxelRenderMode.POINTS -> CoverageRendererLimits.RAW_POINT_CAPACITY
+        VoxelRenderMode.CENTROIDS -> CoverageRendererLimits.CENTROID_CAPACITY
+        VoxelRenderMode.CUBES -> CoverageRendererLimits.CUBE_CAPACITY
+    }
+    return if (this.capacity == capacity && count <= capacity) {
+        this
+    } else {
+        boundedForPresentation(capacity)
     }
 }
 
