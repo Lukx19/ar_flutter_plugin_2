@@ -25,6 +25,7 @@ internal data class CoverageRendererResourceTransition(
     val hadActiveResource: Boolean,
     val mode: VoxelRenderMode,
     val capacity: Int,
+    val rendererGeneration: Long,
 )
 
 /**
@@ -55,25 +56,28 @@ internal class CoverageRendererResourceFactory(
         mode: VoxelRenderMode,
         capacity: Int,
         owner: String,
+        rendererGeneration: Long = 0L,
         create: (VoxelRenderMode, Int, String) -> T,
         release: (T) -> Unit,
-    ): T = replace(mode, capacity, owner, create, release)
+    ): T? = replace(mode, capacity, owner, rendererGeneration, create, release)
 
     fun <T : Any> replaceCube(
         capacity: Int,
         owner: String,
+        rendererGeneration: Long = 0L,
         create: (VoxelRenderMode, Int, String) -> T,
         release: (T) -> Unit,
-    ): T = replace(VoxelRenderMode.CUBES, capacity, owner, create, release)
+    ): T? = replace(VoxelRenderMode.CUBES, capacity, owner, rendererGeneration, create, release)
 
     @Suppress("UNCHECKED_CAST")
     private fun <T : Any> replace(
         mode: VoxelRenderMode,
         capacity: Int,
         owner: String,
+        rendererGeneration: Long,
         create: (VoxelRenderMode, Int, String) -> T,
         release: (T) -> Unit,
-    ): T {
+    ): T? {
         val prior = active
         val priorRelease = releaseActive
         val admission = admit(mode, capacity)
@@ -82,6 +86,7 @@ internal class CoverageRendererResourceFactory(
             hadActiveResource = prior != null,
             mode = mode,
             capacity = capacity,
+            rendererGeneration = rendererGeneration,
         )
         if (admission.strategy == CoverageRendererTransitionStrategy.CLEAR_FIRST && prior != null) {
             onClearFirst(transition)
@@ -100,7 +105,7 @@ internal class CoverageRendererResourceFactory(
             if (admission.strategy == CoverageRendererTransitionStrategy.CLEAR_FIRST || prior == null) {
                 onCreationFailure(transition)
             }
-            throw error
+            return null
         }
         try {
             onCreated(transition)
@@ -111,7 +116,7 @@ internal class CoverageRendererResourceFactory(
             ) {
                 onCreationFailure(transition)
             }
-            throw error
+            return null
         }
         active = next
         releaseActive = { value -> release(value as T) }

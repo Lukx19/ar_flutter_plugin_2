@@ -73,6 +73,11 @@ internal object CoverageRendererLimits {
         // its full dirty span. The active uploader references that snapshot,
         // rather than cloning it again.
         presentationCapacity(mode) * SNAPSHOT_ROW_BYTES * 4
+
+    fun snapshotHandoffBytes(mode: VoxelRenderMode, retainedCount: Int): Int {
+        require(retainedCount >= 0)
+        return minOf(retainedCount, presentationCapacity(mode)) * SNAPSHOT_ROW_BYTES * 4
+    }
 }
 
 /**
@@ -113,6 +118,19 @@ internal class CoverageRendererAllocationLedger(
         )
     }
 
+    /** The retained selector/state charge is lazy until a snapshot exists. */
+    fun installPersistentCoverageState(
+        mode: VoxelRenderMode,
+        snapshot: CoveragePointRenderSnapshot?,
+    ) {
+        if (snapshot == null) {
+            telemetry.removeOwner(RENDERER_STATE_OWNER)
+            telemetry.removeOwner(AUXILIARY_OWNER)
+            return
+        }
+        installPersistentCoverageState(mode)
+    }
+
     /** Charges the concrete bounded state received from the native renderer. */
     fun installPersistentCoverageState(rendererState: VisibilityGridRendererState) {
         chargePersistentCoverageState(rendererState.ownedStorageBytes)
@@ -140,6 +158,24 @@ internal class CoverageRendererAllocationLedger(
             SNAPSHOT_HANDOFF_OWNER,
             CoverageRendererLimits.snapshotHandoffBytes(mode),
         )
+    }
+
+    /** Charges only the retained hand-off that actually exists. */
+    fun updateSnapshotHandoff(
+        mode: VoxelRenderMode,
+        snapshot: CoveragePointRenderSnapshot?,
+    ) {
+        val count = snapshot?.count ?: 0
+        val bytes = if (count == 0) {
+            0
+        } else {
+            CoverageRendererLimits.snapshotHandoffBytes(
+                mode,
+                count,
+            )
+        }
+        if (bytes == 0) telemetry.removeOwner(SNAPSHOT_HANDOFF_OWNER)
+        else telemetry.setOwnedBufferBytes(SNAPSHOT_HANDOFF_OWNER, bytes)
     }
 
     fun clearCoverageState() {
@@ -241,6 +277,9 @@ internal class CoveragePresentationSelector(
     private var selectedCount = 0
     private var sourceCount = 0
     private var sourceSlotToDestination = IntArray(0)
+    private var sourceRankingSurfaceIds = LongArray(0)
+    private var sourceRankingKeys = LongArray(0)
+    private var sourceRankingStyles = IntArray(0)
     private var initialized = false
     private var styleRowsPresent = false
 
@@ -262,8 +301,10 @@ internal class CoveragePresentationSelector(
         validate(snapshot)
         styleRowsPresent = snapshot.styleRows.isNotEmpty()
         ensureSourceCapacity(snapshot.capacity)
-        val sourceRewritten = initialized && selectedIdentityChanged(snapshot)
-        if (!initialized || sourceRewritten || snapshot.count < sourceCount) {
+        val sourceShrunk = initialized && snapshot.count < sourceCount
+        val sourceRewritten = initialized && !sourceShrunk && selectedIdentityChanged(snapshot)
+        val rankingRewritten = initialized && sourceRankingChanged(snapshot)
+        if (!initialized || sourceRewritten || rankingRewritten || sourceShrunk) {
             initialize(snapshot)
             return presentation(snapshot, reset = true, spans = fullSpan())
         }
@@ -271,6 +312,7 @@ internal class CoveragePresentationSelector(
         val membershipDirtyDestinations = acceptNewCandidates(snapshot)
         if (membershipDirtyDestinations.isNotEmpty()) {
             sourceCount = snapshot.count
+            rememberSourceRanking(snapshot)
             return presentation(
                 snapshot,
                 reset = false,
@@ -279,6 +321,7 @@ internal class CoveragePresentationSelector(
         }
 
         sourceCount = snapshot.count
+        rememberSourceRanking(snapshot)
         val update = snapshot.update
         if (update == null) {
             // The owner fences explicit resyncs before calling the selector.
@@ -308,6 +351,9 @@ internal class CoveragePresentationSelector(
             freeDestinations[destination] = maximumCapacity - destination - 1
         }
         sourceSlotToDestination.fill(-1)
+        sourceRankingSurfaceIds.fill(0L)
+        sourceRankingKeys.fill(0L)
+        sourceRankingStyles.fill(0)
         dirtyDestinations.clear()
         initialized = false
         styleRowsPresent = false
@@ -344,6 +390,7 @@ internal class CoveragePresentationSelector(
         selectedCount = 0
         selectedSources.forEach { source -> assignSourceToFreeDestination(snapshot, source) }
         sourceCount = snapshot.count
+        rememberSourceRanking(snapshot)
         initialized = true
     }
 
@@ -537,8 +584,54 @@ internal class CoveragePresentationSelector(
 
     private fun ensureSourceCapacity(sourceCapacity: Int) {
         if (sourceSlotToDestination.size >= sourceCapacity) return
-        sourceSlotToDestination = IntArray(sourceCapacity) { -1 }
+        val previousDestinations = sourceSlotToDestination
+        val previousSurfaceIds = sourceRankingSurfaceIds
+        val previousKeys = sourceRankingKeys
+        val previousStyles = sourceRankingStyles
+        sourceSlotToDestination = IntArray(sourceCapacity) { index ->
+            previousDestinations.getOrElse(index) { -1 }
+        }
+        sourceRankingSurfaceIds = LongArray(sourceCapacity) { index ->
+            previousSurfaceIds.getOrElse(index) { 0L }
+        }
+        sourceRankingKeys = LongArray(sourceCapacity) { index ->
+            previousKeys.getOrElse(index) { 0L }
+        }
+        sourceRankingStyles = IntArray(sourceCapacity) { index ->
+            previousStyles.getOrElse(index) { 0 }
+        }
     }
+
+    /**
+     * Detects ranking changes in every previously known source slot. An
+     * unselected row can become the best candidate after a target/need/
+     * residency change, so retaining the prior cut would make mesh, hit and
+     * telemetry selection disagree. Geometry and color are intentionally
+     * absent from this fingerprint and continue through dirty-span updates.
+     */
+    private fun sourceRankingChanged(snapshot: CoveragePointRenderSnapshot): Boolean {
+        val comparedCount = minOf(sourceCount, snapshot.count)
+        return (0 until comparedCount).any { source ->
+            val style = styleAt(snapshot, source)
+            snapshot.surfaceIds[source] != sourceRankingSurfaceIds[source] ||
+                snapshot.keys[source] != sourceRankingKeys[source] ||
+                rankingStyle(style) != sourceRankingStyles[source]
+        }
+    }
+
+    private fun rememberSourceRanking(snapshot: CoveragePointRenderSnapshot) {
+        for (source in 0 until snapshot.count) {
+            val style = styleAt(snapshot, source)
+            sourceRankingSurfaceIds[source] = snapshot.surfaceIds[source]
+            sourceRankingKeys[source] = snapshot.keys[source]
+            sourceRankingStyles[source] = rankingStyle(style)
+        }
+    }
+
+    private fun rankingStyle(style: CoverageRendererStyleRowV1): Int =
+        style.target.code or
+            (style.coverage.code shl 4) or
+            (style.residency.code shl 8)
 
     private fun validate(snapshot: CoveragePointRenderSnapshot) {
         require(snapshot.count in 0..snapshot.capacity)

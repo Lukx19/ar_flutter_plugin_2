@@ -74,7 +74,7 @@ class RendererTelemetryTest {
     @Test
     fun `telemetry exposes resident row and glyph gauges plus cumulative replacement balance`() {
         val telemetry = RendererTelemetry()
-        telemetry.setResidentPresentation(128, 7)
+        telemetry.setResidentPresentation(CoveragePresentationMode.SEMANTIC_CUBES, 128, 7)
         telemetry.recordResourceReplacement()
         telemetry.recordResourceDisposal()
         telemetry.recordResourceDisposal()
@@ -82,6 +82,8 @@ class RendererTelemetryTest {
         val snapshot = telemetry.snapshot()
         assertEquals(128, snapshot.getValue("residentRowCount"))
         assertEquals(7, snapshot.getValue("residentGlyphCount"))
+        assertEquals(128, snapshot.getValue("residentSemanticCubeCount"))
+        assertEquals(7, snapshot.getValue("residentSemanticCubeGlyphCount"))
         assertEquals(1, snapshot.getValue("cumulativeResourceReplacementCount"))
         assertEquals(2, snapshot.getValue("cumulativeResourceDisposalCount"))
         assertEquals(1, snapshot.getValue("cumulativeReplacementBalance"))

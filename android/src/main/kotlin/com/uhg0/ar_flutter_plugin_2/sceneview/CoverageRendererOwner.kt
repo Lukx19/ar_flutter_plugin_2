@@ -5,6 +5,7 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererSemantic
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
+import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
 import com.uhg0.ar_flutter_plugin_2.pointcloud.deepCopy
 import com.uhg0.ar_flutter_plugin_2.pointcloud.rewritePaletteBuffers
 import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_NO_DIRECTION
@@ -335,6 +336,7 @@ internal class NativeCoverageRendererOwner(
     // replaces this with concrete mount/upload receipts as resources appear.
     private var resourceMounted = true
     private var resourceFailureCount = 0
+    private var paletteRevision = 0L
     private var lastAcceptedQualifier: InstallQualifier? = null
     private var presentationPlan: CoveragePresentationPlan? = null
     private val presentationSelector =
@@ -466,6 +468,9 @@ internal class NativeCoverageRendererOwner(
         val paletteOnlyChange = this.controls.visible == controls.visible &&
             this.controls.mode == controls.mode &&
             this.controls.palette != controls.palette
+        if (this.controls.palette != controls.palette) {
+            paletteRevision++
+        }
         this.controls = controls
         controlsConfigured = true
         recomputePresentationPlan(fullPaletteRecolor = paletteOnlyChange)
@@ -707,7 +712,6 @@ internal class NativeCoverageRendererOwner(
         }
         val rows = current.rows
             .sortedWith(::compareCoverageRows)
-            .take(controls.mode.presentationCapacity)
             .map { row -> row.copy(style = row.style.copy(palette = controls.palette)) }
         val selectedSnapshot = current.renderSnapshot?.let { source ->
             presentationSelector
@@ -720,11 +724,40 @@ internal class NativeCoverageRendererOwner(
                     palette = controls.palette,
                     fullSpanOnPaletteChange = fullPaletteRecolor,
                 )
+                .copy(paletteRevision = paletteRevision)
         }
+        val authoritativeRows = selectedSnapshot?.let { selected ->
+            val rowsBySurface = rows.associateBy { it.surfaceId }
+            selected.surfaceIds.mapIndexed { index, surfaceId ->
+                rowsBySurface[surfaceId] ?: run {
+                    val style = selected.styleRows
+                        .takeIf { it.isNotEmpty() }
+                        ?.let { bytes ->
+                            CoverageRendererStyleRowV1.decode(
+                                bytes,
+                                index * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                            )
+                        } ?: CoverageRendererStyleRowV1()
+                    val offset = index * 3
+                    VisibilityRendererRow(
+                        surfaceId = surfaceId,
+                        x = selected.positions[offset],
+                        y = selected.positions[offset + 1],
+                        z = selected.positions[offset + 2],
+                        semanticLabel = style.semantic,
+                        coverageLabel = style.coverage,
+                        targetDirectionIndex = style.directionBin.takeUnless {
+                            it == COVERAGE_RENDERER_NO_DIRECTION
+                        },
+                        style = style,
+                    )
+                }
+            }.take(controls.mode.presentationCapacity)
+        } ?: rows.take(controls.mode.presentationCapacity)
         presentationPlan = CoveragePresentationPlan(
             mode = controls.mode,
             palette = controls.palette,
-            rows = rows,
+            rows = authoritativeRows,
             renderSnapshot = selectedSnapshot,
         )
     }

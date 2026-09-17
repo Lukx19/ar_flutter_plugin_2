@@ -432,6 +432,7 @@ class CoverageRendererOwnerTest {
         assertEquals(slots.toList(), after.surfaceIds.toList())
         val update = checkNotNull(after.update)
         assertFalse(update.reset)
+        assertEquals(1L, after.paletteRevision)
         assertEquals(1, update.spans.size)
         assertEquals(0, update.spans.single().startSlot)
         assertEquals(after.count, update.spans.single().colors.size)

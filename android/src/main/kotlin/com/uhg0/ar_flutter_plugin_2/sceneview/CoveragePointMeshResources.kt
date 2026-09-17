@@ -7,6 +7,8 @@ import com.google.android.filament.MaterialInstance
 import com.google.android.filament.RenderableManager
 import com.google.android.filament.VertexBuffer
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointUploadQualifier
+import com.uhg0.ar_flutter_plugin_2.pointcloud.uploadQualifier
 import io.github.sceneview.node.Node
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -42,7 +44,7 @@ internal class CoveragePointMeshResources(
         .bufferType(IndexBuffer.Builder.IndexType.UINT)
         .build(engine)
 
-    private var lastRevision = Long.MIN_VALUE
+    private var lastUploadQualifier: CoveragePointUploadQualifier? = null
     private var retainedSnapshotUploadRequired = true
     private var destroyed = false
     @Volatile private var onUploadPageReleased: () -> Unit = {}
@@ -102,7 +104,8 @@ internal class CoveragePointMeshResources(
         check(presentation.count in 0..capacity)
         check(presentation.positions.size == presentation.count * POSITION_COMPONENTS)
         check(presentation.colors.size == presentation.count)
-        if (presentation.revision != lastRevision || retainedSnapshotUploadRequired) {
+        val uploadQualifier = presentation.uploadQualifier()
+        if (uploadQualifier != lastUploadQualifier || retainedSnapshotUploadRequired) {
             if (presentation.count > 0) {
                 if (retainedSnapshotUploadRequired) {
                     uploadCoordinator.submitForResourceGeneration(presentation)
@@ -110,7 +113,7 @@ internal class CoveragePointMeshResources(
                     uploadCoordinator.submit(presentation)
                 }
             }
-            lastRevision = presentation.revision
+            lastUploadQualifier = uploadQualifier
             retainedSnapshotUploadRequired = false
         }
         setDrawCount(

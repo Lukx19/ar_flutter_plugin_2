@@ -39,6 +39,8 @@ internal class RendererTelemetry {
     private var resourceFailureCount = 0
     private var residentRowCount = 0
     private var residentGlyphCount = 0
+    private val residentRowsByMode = linkedMapOf<CoveragePresentationMode, Int>()
+    private val residentGlyphsByMode = linkedMapOf<CoveragePresentationMode, Int>()
 
     @Synchronized
     fun recordPresentation(mode: CoveragePresentationMode) {
@@ -74,6 +76,17 @@ internal class RendererTelemetry {
         require(glyphCount in 0..rowCount)
         residentRowCount = rowCount
         residentGlyphCount = glyphCount
+    }
+
+    @Synchronized
+    fun setResidentPresentation(
+        mode: CoveragePresentationMode,
+        rowCount: Int,
+        glyphCount: Int,
+    ) {
+        setResidentPresentation(rowCount, glyphCount)
+        residentRowsByMode[mode] = rowCount
+        residentGlyphsByMode[mode] = glyphCount
     }
 
     fun setOwnedBufferBytes(owner: String, bytes: Int) {
@@ -221,6 +234,42 @@ internal class RendererTelemetry {
         "cumulativeResourceDisposalCount" to resourceDisposalCount,
         "residentRowCount" to residentRowCount,
         "residentGlyphCount" to residentGlyphCount,
+        "residentSemanticCentroidCount" to residentRowsByMode[
+            CoveragePresentationMode.SEMANTIC_CENTROIDS
+        ].orZero(),
+        "residentSemanticCentroidGlyphCount" to residentGlyphsByMode[
+            CoveragePresentationMode.SEMANTIC_CENTROIDS
+        ].orZero(),
+        "residentSemanticCubeCount" to residentRowsByMode[
+            CoveragePresentationMode.SEMANTIC_CUBES
+        ].orZero(),
+        "residentSemanticCubeGlyphCount" to residentGlyphsByMode[
+            CoveragePresentationMode.SEMANTIC_CUBES
+        ].orZero(),
+        "residentRawFeatureCount" to residentRowsByMode[
+            CoveragePresentationMode.RAW_FEATURES
+        ].orZero(),
+        "residentRawFeatureGlyphCount" to residentGlyphsByMode[
+            CoveragePresentationMode.RAW_FEATURES
+        ].orZero(),
+        "residentWarmProxyCount" to residentRowsByMode[
+            CoveragePresentationMode.WARM_PROXIES
+        ].orZero(),
+        "residentWarmProxyGlyphCount" to residentGlyphsByMode[
+            CoveragePresentationMode.WARM_PROXIES
+        ].orZero(),
+        "residentOverviewCount" to residentRowsByMode[
+            CoveragePresentationMode.OVERVIEW
+        ].orZero(),
+        "residentOverviewGlyphCount" to residentGlyphsByMode[
+            CoveragePresentationMode.OVERVIEW
+        ].orZero(),
+        "residentSuppressedDebugCount" to residentRowsByMode[
+            CoveragePresentationMode.SUPPRESSED_DEBUG
+        ].orZero(),
+        "residentSuppressedDebugGlyphCount" to residentGlyphsByMode[
+            CoveragePresentationMode.SUPPRESSED_DEBUG
+        ].orZero(),
         "cumulativeReplacementBalance" to resourceDisposalCount - resourceReplacementCount,
         "resourceReplacementDisposalBalance" to
             resourceDisposalCount - resourceReplacementCount,
@@ -232,6 +281,8 @@ internal class RendererTelemetry {
         private val fencedDestroyedUploadCallbacks = AtomicInteger()
     }
 }
+
+private fun Int?.orZero(): Int = this ?: 0
 
 private val RendererUploadPageOrigin.wireName: String
     get() = when (this) {

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
 import 'dart:ui' as ui;
 
@@ -246,7 +247,7 @@ final class ARVisibilityRendererHitReceipt {
     this.actualStyleRevision,
   });
 
-  final Object requestId;
+  final String requestId;
   final bool hit;
   final bool stale;
   final int? surfaceId;
@@ -262,10 +263,7 @@ final class ARVisibilityRendererHitReceipt {
 
   static ARVisibilityRendererHitReceipt fromMap(Object? raw) {
     final map = _rendererMap(raw, 'renderer hit receipt');
-    final requestId = map['requestId'];
-    if (requestId == null) {
-      throw StateError('Renderer field requestId is malformed.');
-    }
+    final requestId = _rendererRequestId(map);
     final hit = _rendererBool(map, 'hit');
     if (!hit) {
       return ARVisibilityRendererHitReceipt(
@@ -288,10 +286,7 @@ final class ARVisibilityRendererHitReceipt {
 
   static ARVisibilityRendererHitReceipt staleFromDetails(Object? details) {
     final map = _rendererMap(details, 'stale renderer hit receipt');
-    final requestId = map['requestId'];
-    if (requestId == null) {
-      throw StateError('Renderer field requestId is malformed.');
-    }
+    final requestId = _rendererRequestId(map);
     return ARVisibilityRendererHitReceipt(
       requestId: requestId,
       hit: false,
@@ -332,14 +327,15 @@ final class ARVisibilityGridV2RendererTransport {
   Future<ARVisibilityRendererHitReceipt> hitTest({
     required double xPx,
     required double yPx,
-    required Object requestId,
+    required String requestId,
     required int expectedGeometryRevision,
     required int expectedStyleRevision,
   }) async {
     if (!xPx.isFinite ||
         !yPx.isFinite ||
         expectedGeometryRevision < 0 ||
-        expectedStyleRevision < 0) {
+        expectedStyleRevision < 0 ||
+        !_validRendererRequestId(requestId)) {
       throw ArgumentError('Renderer hit request fields are invalid.');
     }
     try {
@@ -378,6 +374,20 @@ int _rendererInt(Map<Object?, Object?> map, String key) {
     throw StateError('Renderer field $key is malformed.');
   }
   return value.toInt();
+}
+
+const _maximumRendererRequestIdUtf8Bytes = 128;
+
+bool _validRendererRequestId(String value) =>
+    value.isNotEmpty &&
+    utf8.encode(value).length <= _maximumRendererRequestIdUtf8Bytes;
+
+String _rendererRequestId(Map<Object?, Object?> map) {
+  final value = map['requestId'];
+  if (value is! String || !_validRendererRequestId(value)) {
+    throw StateError('Renderer field requestId is malformed.');
+  }
+  return value;
 }
 
 int? _rendererNullableInt(Map<Object?, Object?> map, String key) {

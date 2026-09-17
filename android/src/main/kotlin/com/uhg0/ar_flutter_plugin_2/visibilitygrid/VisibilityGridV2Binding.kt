@@ -72,6 +72,13 @@ private fun rendererCoverageWire(value: CoverageRendererCoverage): String = when
     CoverageRendererCoverage.COMPLETE -> "complete"
 }
 
+private const val MAX_RENDERER_REQUEST_ID_UTF8_BYTES = 128
+
+private fun rendererRequestId(value: Any?): String? =
+    (value as? String)?.takeIf {
+        it.isNotEmpty() && it.toByteArray(Charsets.UTF_8).size <= MAX_RENDERER_REQUEST_ID_UTF8_BYTES
+    }
+
 /**
  * Production owner for one immutable V2 platform-view binding generation.
  *
@@ -587,7 +594,7 @@ class VisibilityGridV2Binding internal constructor(
                 result.error("VG_RENDERER_INVALID", "hit test coordinates are invalid", null)
                 return true
             }
-            val requestId = arguments["requestId"]
+            val requestId = rendererRequestId(arguments["requestId"])
             val expectedGeometry = (arguments["expectedGeometryRevision"] as? Number)?.toLong()
             val expectedStyle = (arguments["expectedStyleRevision"] as? Number)?.toLong()
             if (requestId == null || expectedGeometry == null || expectedStyle == null ||

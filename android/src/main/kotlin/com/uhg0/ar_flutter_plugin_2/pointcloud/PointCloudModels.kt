@@ -392,6 +392,8 @@ data class CoveragePointRenderSnapshot(
     val transactionId: Long = 0L,
     val geometryRevision: Long = 0L,
     val styleRevision: Long = 0L,
+    /** Renderer-local palette epoch; changes even when canonical geometry is unchanged. */
+    val paletteRevision: Long = 0L,
 ) {
     init {
         require(bindingGeneration >= 0L)
@@ -399,6 +401,7 @@ data class CoveragePointRenderSnapshot(
         require(transactionId >= 0L)
         require(geometryRevision >= 0L)
         require(styleRevision >= 0L)
+        require(paletteRevision >= 0L)
         require(surfaceIds.size == count)
         require(styleRows.isEmpty() || styleRows.size == count * COVERAGE_RENDERER_STYLE_ROW_BYTES)
     }
@@ -480,6 +483,22 @@ internal fun CoveragePointRenderSnapshot.rewritePaletteBuffers(
         update = update?.copy(spans = styledSpans.orEmpty()),
     )
 }
+
+/** Compound mesh upload identity; palette recolors must not be deduplicated. */
+internal data class CoveragePointUploadQualifier(
+    val revision: Long,
+    val geometryRevision: Long,
+    val styleRevision: Long,
+    val paletteRevision: Long,
+)
+
+internal fun CoveragePointRenderSnapshot.uploadQualifier(): CoveragePointUploadQualifier =
+    CoveragePointUploadQualifier(
+        revision = revision,
+        geometryRevision = geometryRevision,
+        styleRevision = styleRevision,
+        paletteRevision = paletteRevision,
+    )
 
 fun identityGridRotation(): FloatArray = floatArrayOf(
     1f, 0f, 0f,

@@ -1,16 +1,30 @@
 package com.uhg0.ar_flutter_plugin_2.sceneview
 
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
+import com.uhg0.ar_flutter_plugin_2.pointcloud.uploadQualifier
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CoveragePointUploadCoordinatorTest {
+    @Test
+    fun `palette revision participates in the retained mesh upload qualifier`() {
+        val geometry = snapshot(1, 1f)
+        val recolored = geometry.copy(paletteRevision = 1L)
+
+        assertNotEquals(geometry.uploadQualifier(), recolored.uploadQualifier())
+        assertEquals(
+            geometry.uploadQualifier(),
+            geometry.copy(colors = geometry.colors.copyOf()).uploadQualifier(),
+        )
+    }
+
     @Test
     fun `driver completion requests one later renderer frame`() {
         val uploader = FakeUploader()
