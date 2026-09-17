@@ -7,6 +7,9 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererCoverage
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridRendererState
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageCommittedRow
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageCommittedRows
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRowsQualifier
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
@@ -15,6 +18,77 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CoverageRendererSelectionTest {
+    @Test
+    fun `streamed canonical source is bounded to centroid and cube presentation caps`() {
+        val rows = streamedRows(100_000)
+        val selector = CoveragePresentationSelector(CoverageRendererLimits.CENTROID_CAPACITY)
+
+        val centroid = selector.select(
+            rows,
+            requestedCapacity = CoverageRendererLimits.CENTROID_CAPACITY,
+            forceReset = true,
+        )
+        assertEquals(CoverageRendererLimits.CENTROID_CAPACITY, centroid.count)
+        val centroidStorage = selector.ownedStorageBytes
+        assertEquals(
+            CoveragePresentationStorage.estimatedOwnedStorageBytes(
+                CoverageRendererLimits.CENTROID_CAPACITY,
+                sourceCapacity = 0,
+            ),
+            centroidStorage,
+        )
+
+        val cube = selector.select(
+            rows,
+            requestedCapacity = CoverageRendererLimits.CUBE_CAPACITY,
+            forceReset = true,
+        )
+        assertEquals(CoverageRendererLimits.CUBE_CAPACITY, cube.count)
+        assertTrue(selector.ownedStorageBytes < centroidStorage)
+        assertEquals(1L, cube.surfaceIds.first())
+        assertEquals(8_000L, cube.surfaceIds.last())
+    }
+
+    @Test
+    fun `streamed ordinary update carries one range-only presentation span`() {
+        val rows = streamedRows(100_000)
+        val selector = CoveragePresentationSelector(CoverageRendererLimits.CENTROID_CAPACITY)
+        selector.select(rows, forceReset = true)
+        val before = selector.ownedStorageBytes
+        rows.geometryRevision = 2L
+        rows.xOffset = 42f
+        val update = CoveragePointRenderUpdate(
+            geometryRevision = 2L,
+            visibilityRevision = 1L,
+            enabled = true,
+            count = rows.count,
+            spans = listOf(
+                CoveragePointSpan(
+                    startSlot = 0,
+                    positions = FloatArray(0),
+                    colors = IntArray(0),
+                    endSlotExclusive = 1,
+                ),
+            ),
+            reset = false,
+        )
+        val next = selector.select(rows, sourceUpdate = update, forceReset = false)
+        assertEquals(42f, next.positions[0])
+        assertEquals(before, selector.ownedStorageBytes)
+        val span = next.update!!.spans.single()
+        assertTrue(span.positions.isEmpty())
+        assertTrue(span.colors.isEmpty())
+        assertEquals(0, span.startSlot)
+        assertEquals(1, span.endSlotExclusive)
+    }
+
+    @Test
+    fun `canonical source capacity rejects one row beyond the contract`() {
+        assertThrows(IllegalArgumentException::class.java) {
+            VisibilityGridRendererState(100_001)
+        }
+    }
+
     @Test
     fun `selection identity lookup uses compact sorted surface ids`() {
         val selector = CoveragePresentationSelector(8)
@@ -39,6 +113,31 @@ class CoverageRendererSelectionTest {
         assertEquals(10L, selector.selectedSurfaceId(destinationForTen))
         assertEquals(30L, selector.selectedSurfaceId(destinationForThirty))
         assertEquals(-1, selector.destinationForSurfaceId(99L))
+    }
+
+    private fun streamedRows(count: Int): MutableStreamRows = MutableStreamRows(count)
+
+    private class MutableStreamRows(
+        override val count: Int,
+    ) : CoverageCommittedRows {
+        override val capacity: Int = 100_000
+        var geometryRevision: Long = 1L
+        var xOffset: Float = 0f
+        override val qualifier: CoverageRowsQualifier
+            get() = CoverageRowsQualifier(1L, 1L, 1L, 1L, geometryRevision, 1L)
+
+        override fun rowAt(index: Int): CoverageCommittedRow {
+            require(index in 0 until count)
+            return CoverageCommittedRow(
+                surfaceId = index + 1L,
+                key = index + 1L,
+                x = index.toFloat() + xOffset,
+                y = 0f,
+                z = 0f,
+                color = 0,
+                style = CoverageRendererStyleRowV1(),
+            )
+        }
     }
 
     @Test

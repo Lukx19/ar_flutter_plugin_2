@@ -450,6 +450,20 @@ interface CoverageCommittedRows {
     val capacity: Int
     val qualifier: CoverageRowsQualifier
     fun rowAt(index: Int): CoverageCommittedRow
+
+    /**
+     * Visits canonical rows without creating a source-sized collection.  The
+     * default keeps test and compatibility borrowers source-compatible while
+     * allowing the production projection to stream a 100k source cut through
+     * a bounded presentation selector.
+     */
+    fun forEachRow(block: (CoverageCommittedRow) -> Unit) {
+        repeat(count) { index -> block(rowAt(index)) }
+    }
+
+    /** Optional qualifier-matched dirty ranges; values never cross this seam. */
+    val update: CoveragePointRenderUpdate?
+        get() = null
 }
 
 /**
@@ -608,6 +622,11 @@ data class CoveragePointRenderUpdate(
     val count: Int,
     val spans: List<CoveragePointSpan>,
     val reset: Boolean,
+)
+
+/** Drops mutable span payloads while preserving the authoritative dirty ranges. */
+internal fun CoveragePointRenderUpdate.rangeOnly(): CoveragePointRenderUpdate = copy(
+    spans = spans.map { it.rangeOnly() },
 )
 
 data class PointCloudRenderStats(

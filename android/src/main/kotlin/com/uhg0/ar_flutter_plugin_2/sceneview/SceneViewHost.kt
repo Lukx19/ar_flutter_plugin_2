@@ -50,6 +50,7 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette
 import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
 import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
+import com.uhg0.ar_flutter_plugin_2.pointcloud.rangeOnly
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.ArCoreDepthModeController
 import io.github.sceneview.SurfaceType
 import io.github.sceneview.ar.ARSceneView
@@ -733,7 +734,7 @@ internal class SceneViewHost(
                 retainedCount = snapshot.count,
                 selectorStorageBytes = CoveragePresentationStorage.estimatedOwnedStorageBytes(
                     effectiveConfig.voxelRenderMode.toDefaultCoveragePresentationMode().presentationCapacity,
-                    sourceRows,
+                    sourceCapacity = 0,
                 ),
             )
         } else {
@@ -880,27 +881,28 @@ internal class SceneViewHost(
     private fun CoveragePointRenderSnapshot.toVisibilityRendererSnapshot(
         config: PointCloudNativeConfig,
     ): VisibilityRendererSnapshot {
-        val rows = (0 until count).map { index ->
-            val offset = index * 3
-            val style = if (styleRows.isEmpty()) {
-                CoverageRendererStyleRowV1()
-            } else {
-                CoverageRendererStyleRowV1.decode(
-                    styleRows,
-                    index * com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES,
-                )
-            }
-            VisibilityRendererRow(
-                surfaceId = surfaceIds[index],
-                x = positions[offset],
-                y = positions[offset + 1],
-                z = positions[offset + 2],
-                semanticLabel = style.semantic,
-                coverageLabel = style.coverage,
-                targetDirectionIndex = style.directionBin.takeUnless { it == 0xff },
-                style = style,
+        // The projection borrower is the canonical source seam. Do not turn
+        // its 100k cut into a second row list or deep-copied snapshot at the
+        // host boundary; the owner streams it into the bounded selector.
+        var bestIndex = -1
+        var bestStyle: CoverageRendererStyleRowV1? = null
+        repeat(count) { index ->
+            if (styleRows.isEmpty()) return@repeat
+            val style = CoverageRendererStyleRowV1.decode(
+                styleRows,
+                index * COVERAGE_RENDERER_STYLE_ROW_BYTES,
             )
+            if (style.target == com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererTarget.NONE) {
+                return@repeat
+            }
+            val currentBest = bestStyle
+            if (currentBest == null || compareCoverageStyles(style, currentBest, surfaceIds[index], surfaceIds[bestIndex])) {
+                bestIndex = index
+                bestStyle = style
+            }
         }
+        val targetSurfaceId = bestStyle?.let { surfaceIds[bestIndex] }
+        val targetDirectionIndex = bestStyle?.directionBin?.takeUnless { it == 0xff }
         return VisibilityRendererSnapshot(
             bindingGeneration = bindingGeneration,
             groupGeneration = groupGeneration,
@@ -908,13 +910,41 @@ internal class SceneViewHost(
             transactionId = transactionId.takeIf { it > 0L } ?: (update?.geometryRevision ?: revision),
             geometryRevision = geometryRevision.takeIf { it > 0L } ?: (update?.geometryRevision ?: revision),
             styleRevision = styleRevision.takeIf { it > 0L } ?: (update?.visibilityRevision ?: revision),
-            rows = rows,
-            renderSnapshot = this,
-            targetSurfaceId = rows.sortedWith(::compareCoverageRows)
-                .firstOrNull { it.targetDirectionIndex != null }?.surfaceId,
-            targetDirectionIndex = rows.sortedWith(::compareCoverageRows)
-                .firstOrNull { it.targetDirectionIndex != null }?.targetDirectionIndex,
+            rows = emptyList(),
+            renderSnapshot = null,
+            rowCountOverride = count,
+            sourceCapacity = capacity,
+            sourceCount = count,
+            update = update?.rangeOnly(),
+            targetSurfaceId = targetSurfaceId,
+            targetDirectionIndex = targetDirectionIndex,
         )
+    }
+
+    private fun compareCoverageStyles(
+        first: CoverageRendererStyleRowV1,
+        second: CoverageRendererStyleRowV1,
+        firstSurfaceId: Long,
+        secondSurfaceId: Long,
+    ): Boolean {
+        val firstTarget = first.target.code
+        val secondTarget = second.target.code
+        if (firstTarget != secondTarget) return firstTarget > secondTarget
+        val firstNeed = when (first.coverage) {
+            com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererCoverage.UNCOVERED -> 2
+            com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererCoverage.PARTIAL -> 1
+            com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererCoverage.COMPLETE -> 0
+        }
+        val secondNeed = when (second.coverage) {
+            com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererCoverage.UNCOVERED -> 2
+            com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererCoverage.PARTIAL -> 1
+            com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererCoverage.COMPLETE -> 0
+        }
+        if (firstNeed != secondNeed) return firstNeed > secondNeed
+        val firstResidency = first.residency.code
+        val secondResidency = second.residency.code
+        if (firstResidency != secondResidency) return firstResidency > secondResidency
+        return firstSurfaceId < secondSurfaceId
     }
 
     fun rendererPerformanceSnapshot(): Map<String, Any> {

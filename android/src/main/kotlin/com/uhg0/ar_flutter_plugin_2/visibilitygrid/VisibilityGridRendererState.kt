@@ -385,6 +385,20 @@ class VisibilityGridRendererState(
         renderRevision++
     }
 
+    /**
+     * Appends one bounded rebuild page directly into canonical state. Pages
+     * are consumed while the rebuild fence is held; the renderer projection
+     * must not accumulate a second source-sized row list between pages.
+     */
+    @Synchronized
+    internal fun appendCanonicalRows(rows: List<CanonicalRenderRow>) {
+        ensureActive()
+        require(group != null)
+        require(count + rows.size <= capacity)
+        require(rows.map { it.surfaceId }.toSet().size == rows.size)
+        rows.forEach(::admitCandidate)
+    }
+
     /** Applies one V2 geometry delta without treating a voxel coordinate as identity. */
     @Synchronized
     internal fun applyGeometry(

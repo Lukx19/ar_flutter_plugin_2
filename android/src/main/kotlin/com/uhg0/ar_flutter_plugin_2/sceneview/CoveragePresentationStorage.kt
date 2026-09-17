@@ -76,6 +76,14 @@ internal class CoveragePresentationStorage(
         sourceRankingStyles = sourceRankingStyles.copyOf(sourceCapacity)
     }
 
+    /** Production streaming never needs source-sized reverse/ranking tables. */
+    fun dropSourceTracking() {
+        sourceSlotToDestination = IntArray(0)
+        sourceRankingSurfaceIds = LongArray(0)
+        sourceRankingKeys = LongArray(0)
+        sourceRankingStyles = IntArray(0)
+    }
+
     val ownedStorageBytes: Int
         get() {
             if (capacity == 0) return 0

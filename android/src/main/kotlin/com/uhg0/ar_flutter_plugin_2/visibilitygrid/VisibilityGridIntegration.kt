@@ -1142,7 +1142,6 @@ internal class NativeRendererProjection(
 ) : CommittedRendererProjection {
     private val state = VisibilityGridRendererState(capacity)
     private var closed = false
-    private val rebuildRows = ArrayList<CommittedGeometryRow>(capacity)
     private var rebuildCut: CommittedGeometryCut? = null
     private var activeOwnership: VisibilityObservationOwnership? = null
     private var activeLineageRevision = 0L
@@ -1216,41 +1215,6 @@ internal class NativeRendererProjection(
     ) {
         check(!closed)
         require(cut.reset)
-        rebuildRows.clear()
-        rebuildCut = cut
-    }
-
-    @Synchronized
-    override fun appendRebuildPage(
-        cut: CommittedGeometryCut,
-    ) {
-        check(!closed)
-        check(rebuildCut?.sameIdentityAs(cut) == true) {
-            "Renderer rebuild page does not name the active canonical cut"
-        }
-        check(cut.removedSurfaceIds.isEmpty()) { "Renderer rebuild page cannot remove rows" }
-        require(rebuildRows.size + cut.upserts.size <= state.capacity)
-        rebuildRows += cut.upserts
-    }
-
-    @Synchronized
-    override fun finishRebuild(
-        cut: CommittedGeometryCut,
-    ) {
-        check(!closed)
-        check(rebuildCut?.sameIdentityAs(cut) == true) {
-            "Renderer rebuild finish does not name the active canonical cut"
-        }
-        renderRows(cut, rebuildRows)
-        discardRebuild()
-    }
-
-    @Synchronized
-    override fun abortRebuild() {
-        discardRebuild()
-    }
-
-    private fun renderRows(cut: CommittedGeometryCut, rows: List<CommittedGeometryRow>) {
         val frame = cut.ownership.groupFrame
         state.startCanonicalGroup(
             config = VisibilityGridGroupConfig(
@@ -1265,16 +1229,46 @@ internal class NativeRendererProjection(
                 restoredKeys = longArrayOf(),
             ),
             geometryRevision = cut.geometryRevision,
-            rows = rows.map { it.toCanonicalRenderRow() },
+            rows = emptyList(),
             ownership = cut.ownership,
             transactionId = cut.transactionId,
             lineageRevision = cut.lineageRevision,
         )
+        rebuildCut = cut
+    }
+
+    @Synchronized
+    override fun appendRebuildPage(
+        cut: CommittedGeometryCut,
+    ) {
+        check(!closed)
+        check(rebuildCut?.sameIdentityAs(cut) == true) {
+            "Renderer rebuild page does not name the active canonical cut"
+        }
+        check(cut.removedSurfaceIds.isEmpty()) { "Renderer rebuild page cannot remove rows" }
+        require(currentRowCount() + cut.upserts.size <= cut.ownership.groupFrame.modelCapacity)
+        state.appendCanonicalRows(cut.upserts.map { it.toCanonicalRenderRow() })
+    }
+
+    @Synchronized
+    override fun finishRebuild(
+        cut: CommittedGeometryCut,
+    ) {
+        check(!closed)
+        check(rebuildCut?.sameIdentityAs(cut) == true) {
+            "Renderer rebuild finish does not name the active canonical cut"
+        }
         activeOwnership = cut.ownership
         activeLineageRevision = cut.lineageRevision
         val config = renderConfig(cut)
         activeRenderConfig = config
         render(state.snapshot(), config)
+        discardRebuild()
+    }
+
+    @Synchronized
+    override fun abortRebuild() {
+        discardRebuild()
     }
 
     private fun renderConfig(cut: CommittedGeometryCut): PointCloudNativeConfig {
@@ -1309,7 +1303,6 @@ internal class NativeRendererProjection(
     }
 
     private fun discardRebuild() {
-        rebuildRows.clear()
         rebuildCut = null
     }
 
