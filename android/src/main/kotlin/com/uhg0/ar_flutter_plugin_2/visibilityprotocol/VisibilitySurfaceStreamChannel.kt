@@ -562,6 +562,9 @@ class VisibilitySurfaceStreamChannel(
                                                         )
                                                     }
                                                     else -> {
+                                                        // Prove the complete response path before a final style page
+                                                        // can invoke its irreversible renderer callback.
+                                                        validateNextStructuralResponse(request)
                                                         rendererStyleCommand?.let { page ->
                                                             when (val staged = rendererStyleStaging.accept(page)) {
                                                                 is RendererStyleCommandStagingV1.Result.Progress -> Unit
@@ -968,6 +971,30 @@ class VisibilitySurfaceStreamChannel(
                 check(encoded.isNotEmpty())
                 structuralFrameCursor = Math.addExact(structuralFrameCursor, 1)
                 return response
+            }
+        }
+    }
+
+    /** Validates the queued response without advancing its producer cursor. */
+    private fun validateNextStructuralResponse(request: PacketCodec.Request) {
+        synchronized(this) {
+            synchronized(structuralFrames) {
+                val frame = structuralFrames.elementAtOrNull(structuralFrameCursor) ?: return
+                val responseProfile = requireNotNull(queuedResponseProfile) {
+                    "Queued structural transaction has no response profile"
+                }
+                if (request.maximumResponseBytes < responseProfile.responseCeilingBytes) {
+                    throw BindingError(TRANSACTION_STATE_ERROR_ID)
+                }
+                val response = TransactionResponseCodecV1.encodeFrame(
+                    frame = frame,
+                    streamToken = request.streamToken,
+                    requestSequence = request.requestSequence,
+                    nextExpectedRequestSequence = request.requestSequence + 1,
+                ).copy(acceptedStyleRevision = request.nextStyleRevision)
+                check(
+                    PacketCodec.encodeResponse(response, responseProfile.responseCeilingBytes).isNotEmpty(),
+                )
             }
         }
     }

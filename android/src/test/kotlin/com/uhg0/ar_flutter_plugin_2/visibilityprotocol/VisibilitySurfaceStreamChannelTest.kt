@@ -556,6 +556,81 @@ class VisibilitySurfaceStreamChannelTest {
     }
 
     @Test
+    fun `undersized structural response rejects final style page before renderer mutation`() {
+        val messenger = TestMessenger(143)
+        var callbackCount = 0
+        val binding = VisibilitySurfaceStreamChannel(
+            messenger,
+            143,
+            onRendererStyleCut = { cut ->
+                callbackCount++
+                RendererStyleCommandApplyResultV1(cut.styleRevision)
+            },
+        )
+        try {
+            val profile = TransactionResponseProfileV1.ordinary
+            binding.queueStructuralTransaction(
+                StructuralTransactionProducerV1.produce(
+                    transactionId = 1,
+                    baseGeometryRevision = 0,
+                    targetGeometryRevision = 1,
+                    targetLineageRevision = 1,
+                    bytes = ByteArray(profile.chunkPayloadBytes + 1),
+                    responseProfile = profile,
+                ),
+                profile,
+            )
+            val page = RendererStyleCommandV1.encodePages(
+                RendererStyleCutPayloadV1(
+                    captureGroupId = ByteArray(16) { it.toByte() },
+                    bindingGeneration = 1,
+                    groupGeneration = 1,
+                    transactionId = 0,
+                    geometryRevision = 0,
+                    lineageRevision = 0,
+                    semanticRevision = 1,
+                    coverageRevision = 1,
+                    styleRevision = 1,
+                    residencyRevision = 1,
+                    targetRevision = 1,
+                    reset = true,
+                    surfaceIds = longArrayOf(),
+                    styleRows = byteArrayOf(),
+                ),
+            ).single()
+            fun styleRequest(maximumResponseBytes: Int) = PacketCodec.encodeRequest(
+                PacketCodec.Request(
+                    requestFlags = 0,
+                    streamToken = 143,
+                    acknowledgedTransactionId = 0,
+                    acknowledgedGeometryRevision = 0,
+                    acknowledgedLineageRevision = 0,
+                    nextStyleRevision = 1,
+                    maximumResponseBytes = maximumResponseBytes,
+                    styleRecords = emptyList(),
+                    commandBytes = page,
+                    requestSequence = 1,
+                ),
+            )
+
+            val rejected = PacketCodec.decodeResponse(
+                messenger.exchange(styleRequest(PacketCodec.responseMinimumBytes)),
+            )
+            assertEquals(34, rejected.errorId)
+            assertEquals(0, callbackCount)
+
+            val accepted = PacketCodec.decodeResponse(
+                messenger.exchange(styleRequest(PacketCodec.responseMaximumBytes)),
+            )
+            assertEquals(0, accepted.errorId)
+            assertEquals(1L, accepted.acceptedStyleRevision)
+            assertEquals(1, callbackCount)
+        } finally {
+            binding.dispose()
+        }
+    }
+
+    @Test
     fun `current delta source selects and retains only one immutable named receipt until exact ACK`() {
         data class JournalEntry(
             val selector: CurrentDeltaSelectorV1,

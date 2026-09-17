@@ -155,6 +155,14 @@ class QualifiedRendererStyleCutTest {
             baseline.copy(styleRevision = 2, semanticRevision = 2, coverageRevision = 2,
                 residencyRevision = 2, targetRevision = 2, surfaceIds = longArrayOf(1),
                 styleRows = styles(style(semanticGeneration = 2, styleGeneration = 2))),
+            baseline.copy(styleRevision = 2, semanticRevision = 2, coverageRevision = 2,
+                residencyRevision = 2, targetRevision = 2, targetSurfaceId = 1,
+                targetDirectionIndex = 4, styleRows = styles(
+                    style(semanticGeneration = 2, styleGeneration = 2,
+                        target = CoverageRendererTarget.PRIMARY),
+                    style(semanticGeneration = 2, styleGeneration = 2,
+                        target = CoverageRendererTarget.PRIMARY),
+                )),
         )
         val reasons = listOf(
             RendererStyleCutRejection.GEOMETRY_REVISION_MISMATCH,
@@ -162,6 +170,7 @@ class QualifiedRendererStyleCutTest {
             RendererStyleCutRejection.UNSORTED_SURFACE_IDS,
             RendererStyleCutRejection.TARGET_NOT_SUPPLIED,
             RendererStyleCutRejection.INCOMPLETE_RESET,
+            RendererStyleCutRejection.MALFORMED_STYLE,
         )
         cases.zip(reasons).forEach { (candidate, reason) ->
             assertEquals(reason, (state.applyStyleCut(candidate) as RendererStyleCutResult.Rejected).reason)

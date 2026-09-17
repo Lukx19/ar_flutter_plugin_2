@@ -557,11 +557,14 @@ class VisibilityGridRendererState(
             val targetRow = rows[targetIndex]
             if (targetRow.target != CoverageRendererTarget.PRIMARY ||
                 targetRow.directionBin != candidate.targetDirectionIndex ||
-                targetRow.glyph != CoverageRendererGlyph.DESIRED_DIRECTION
+                targetRow.glyph != CoverageRendererGlyph.DESIRED_DIRECTION ||
+                rows.indices.any { index ->
+                    index != targetIndex && rows[index].target != CoverageRendererTarget.NONE
+                }
             ) {
                 return RendererStyleCutResult.Rejected(RendererStyleCutRejection.MALFORMED_STYLE)
             }
-        } else if (rows.any { it.target == CoverageRendererTarget.PRIMARY }) {
+        } else if (rows.any { it.target != CoverageRendererTarget.NONE }) {
             return RendererStyleCutResult.Rejected(RendererStyleCutRejection.MALFORMED_STYLE)
         }
         if (candidate.reset && !hasExactlyCurrentSurfaceIds(candidate.surfaceIds)) {
