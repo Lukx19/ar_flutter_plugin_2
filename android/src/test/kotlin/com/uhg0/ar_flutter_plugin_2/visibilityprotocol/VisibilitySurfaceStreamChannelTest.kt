@@ -22,6 +22,207 @@ import org.junit.Test
 
 class VisibilitySurfaceStreamChannelTest {
     @Test
+    fun `renderer style pages stage until final and replay exact response without callback replay`() {
+        val messenger = TestMessenger(140)
+        var callbackCount = 0
+        val binding = VisibilitySurfaceStreamChannel(
+            messenger,
+            140,
+            onRendererStyleCut = { cut ->
+                callbackCount++
+                RendererStyleCommandApplyResultV1(cut.styleRevision)
+            },
+        )
+        try {
+            val cut = RendererStyleCutPayloadV1(
+                captureGroupId = ByteArray(16) { (it + 1).toByte() },
+                bindingGeneration = 9,
+                groupGeneration = 3,
+                transactionId = 4,
+                geometryRevision = 5,
+                lineageRevision = 6,
+                semanticRevision = 7,
+                coverageRevision = 8,
+                styleRevision = 1,
+                residencyRevision = 9,
+                targetRevision = 10,
+                reset = true,
+                surfaceIds = longArrayOf(1, 4),
+                styleRows = ByteArray(32) { it.toByte() },
+            )
+            val pages = RendererStyleCommandV1.encodePages(cut, maxPageBytes = 200)
+            fun exchange(sequence: Long, page: ByteArray): ByteArray = messenger.exchange(
+                PacketCodec.encodeRequest(
+                    PacketCodec.Request(
+                        requestFlags = 0,
+                        streamToken = 140,
+                        acknowledgedTransactionId = 0,
+                        acknowledgedGeometryRevision = 0,
+                        acknowledgedLineageRevision = 0,
+                        nextStyleRevision = 1,
+                        maximumResponseBytes = PacketCodec.responseMinimumBytes,
+                        styleRecords = emptyList(),
+                        commandBytes = page,
+                        requestSequence = sequence,
+                    ),
+                ),
+            )
+
+            val first = PacketCodec.decodeResponse(exchange(1, pages.first()))
+            assertEquals(0, first.errorId)
+            assertEquals(0L, first.acceptedStyleRevision)
+            assertEquals(0, callbackCount)
+            val final = PacketCodec.decodeResponse(exchange(2, pages.last()))
+            assertEquals(0, final.errorId)
+            assertEquals(1L, final.acceptedStyleRevision)
+            assertEquals(1, callbackCount)
+
+            val replay = exchange(2, pages.last())
+            assertArrayEquals(PacketCodec.encodeResponse(final, PacketCodec.responseMinimumBytes), replay)
+            assertEquals(1, callbackCount)
+        } finally {
+            binding.dispose()
+        }
+    }
+
+    @Test
+    fun `malformed renderer style length is rejected without consuming the sequence`() {
+        val messenger = TestMessenger(141)
+        var callbackCount = 0
+        val binding = VisibilitySurfaceStreamChannel(
+            messenger,
+            141,
+            onRendererStyleCut = {
+                callbackCount++
+                RendererStyleCommandApplyResultV1(it.styleRevision)
+            },
+        )
+        try {
+            val cut = RendererStyleCutPayloadV1(
+                captureGroupId = ByteArray(16) { (it + 3).toByte() },
+                bindingGeneration = 4,
+                groupGeneration = 2,
+                transactionId = 7,
+                geometryRevision = 8,
+                lineageRevision = 9,
+                semanticRevision = 1,
+                coverageRevision = 1,
+                styleRevision = 1,
+                residencyRevision = 1,
+                targetRevision = 1,
+                reset = true,
+                surfaceIds = longArrayOf(1),
+                styleRows = ByteArray(RendererStyleCommandV1.STYLE_ROW_BYTES),
+            )
+            val page = RendererStyleCommandV1.encodePages(cut).single()
+            val malformed = page.copyOf(page.size - 1)
+            fun exchange(sequence: Long, command: ByteArray): PacketCodec.Response =
+                PacketCodec.decodeResponse(
+                    messenger.exchange(
+                        PacketCodec.encodeRequest(
+                            PacketCodec.Request(
+                                requestFlags = 0,
+                                streamToken = 141,
+                                acknowledgedTransactionId = 0,
+                                acknowledgedGeometryRevision = 0,
+                                acknowledgedLineageRevision = 0,
+                                nextStyleRevision = 1,
+                                maximumResponseBytes = PacketCodec.responseMinimumBytes,
+                                styleRecords = emptyList(),
+                                commandBytes = command,
+                                requestSequence = sequence,
+                            ),
+                        ),
+                    ),
+                )
+
+            val rejected = exchange(1, malformed)
+            assertEquals(255, rejected.messageKind)
+            assertEquals(6, rejected.errorId)
+            assertEquals(1L, rejected.requestSequence)
+            assertEquals(1L, rejected.nextExpectedRequestSequence)
+            assertEquals(0, callbackCount)
+
+            val accepted = exchange(1, page)
+            assertEquals(0, accepted.errorId)
+            assertEquals(1L, accepted.acceptedStyleRevision)
+            assertEquals(1, callbackCount)
+        } finally {
+            binding.dispose()
+        }
+    }
+
+    @Test
+    fun `geometry change during staged style cut rejects the final page without applying it`() {
+        val messenger = TestMessenger(142)
+        var callbackCount = 0
+        var geometryRevision = 5L
+        val binding = VisibilitySurfaceStreamChannel(
+            messenger,
+            142,
+            onRendererStyleCut = { cut ->
+                callbackCount++
+                if (cut.geometryRevision != geometryRevision) {
+                    throw IllegalArgumentException("geometry cut is stale")
+                }
+                RendererStyleCommandApplyResultV1(cut.styleRevision)
+            },
+        )
+        try {
+            val cut = RendererStyleCutPayloadV1(
+                captureGroupId = ByteArray(16) { (it + 4).toByte() },
+                bindingGeneration = 5,
+                groupGeneration = 3,
+                transactionId = 8,
+                geometryRevision = 5,
+                lineageRevision = 1,
+                semanticRevision = 1,
+                coverageRevision = 1,
+                styleRevision = 1,
+                residencyRevision = 1,
+                targetRevision = 1,
+                reset = true,
+                surfaceIds = longArrayOf(1, 2),
+                styleRows = ByteArray(2 * RendererStyleCommandV1.STYLE_ROW_BYTES),
+            )
+            val pages = RendererStyleCommandV1.encodePages(cut, maxPageBytes = 200)
+            fun exchange(sequence: Long, command: ByteArray): PacketCodec.Response =
+                PacketCodec.decodeResponse(
+                    messenger.exchange(
+                        PacketCodec.encodeRequest(
+                            PacketCodec.Request(
+                                requestFlags = 0,
+                                streamToken = 142,
+                                acknowledgedTransactionId = 0,
+                                acknowledgedGeometryRevision = 0,
+                                acknowledgedLineageRevision = 0,
+                                nextStyleRevision = 1,
+                                maximumResponseBytes = PacketCodec.responseMinimumBytes,
+                                styleRecords = emptyList(),
+                                commandBytes = command,
+                                requestSequence = sequence,
+                            ),
+                        ),
+                    ),
+                )
+
+            val progress = exchange(1, pages.first())
+            assertEquals(0, progress.errorId)
+            assertEquals(0L, progress.acceptedStyleRevision)
+            assertEquals(0, callbackCount)
+
+            geometryRevision = 6L
+            val rejected = exchange(2, pages.last())
+            assertEquals(255, rejected.messageKind)
+            assertEquals(6, rejected.errorId)
+            assertEquals(1, callbackCount)
+            assertEquals(0L, rejected.acceptedStyleRevision)
+        } finally {
+            binding.dispose()
+        }
+    }
+
+    @Test
     fun `binding qualifier rejects stale token before stream admission`() {
         val messenger = TestMessenger(88)
         val qualifier = ByteArray(32) { (it + 1).toByte() }

@@ -12,6 +12,8 @@ import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaSelectorV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaSourceV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.PacketCodec
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.StartRequestCodecV2
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.RendererStyleCommandV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.RendererStyleCutPayloadV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.TransactionResponseProfileV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.Uuid
 import io.flutter.plugin.common.BinaryMessenger
@@ -30,6 +32,129 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VisibilityGridV2BindingTest {
+    @Test
+    fun `renderer style command is qualified by active binding and group before callback`() {
+        val messenger = MethodTestMessenger()
+        var applied: QualifiedRendererStyleCut? = null
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 2140,
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
+            postToMain = { it() },
+            onRendererStyleCut = { cut ->
+                applied = cut
+                RendererStyleCutResult.Applied(
+                    cut.styleRevision,
+                    cut.targetRevision,
+                    cut.surfaceIds.size,
+                    cut.targetSurfaceId,
+                )
+            },
+        )
+        try {
+            val start = startRequest()
+            val before = binding.snapshot()
+            val qualifier = before.nativeStreamToken + before.workerBindingToken
+            val startResult = RecordingResult()
+            MethodChannel(messenger, "visibility_grid_v2_control_2140").invokeMethod(
+                "start",
+                qualifier + ControlCodec.encodeRequest(start),
+                startResult,
+            )
+            assertTrue(startResult.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(1, startResult.successCount)
+            val stream = ControlCodec.decodeResponse(
+                stripQualifier(startResult.successValue as ByteArray, qualifier),
+            )
+
+            fun exchange(
+                sequence: Long,
+                transaction: Long,
+                geometry: Long,
+                lineage: Long,
+                command: ByteArray = byteArrayOf(),
+                styleRevision: Long = 0,
+            ): PacketCodec.Response {
+                val reply = RecordingBinaryReply()
+                messenger.send(
+                    "visibility_surface_stream_2140",
+                    ByteBuffer.wrap(qualifier + PacketCodec.encodeRequest(PacketCodec.Request(
+                        requestFlags = 0,
+                        streamToken = stream.streamToken,
+                        acknowledgedTransactionId = transaction,
+                        acknowledgedGeometryRevision = geometry,
+                        acknowledgedLineageRevision = lineage,
+                        nextStyleRevision = styleRevision,
+                        maximumResponseBytes = TransactionResponseProfileV1.ordinary.responseCeilingBytes,
+                        styleRecords = emptyList(),
+                        commandBytes = command,
+                        requestSequence = sequence,
+                    ))),
+                    reply,
+                )
+                assertTrue(reply.completed.await(2, TimeUnit.SECONDS))
+                return PacketCodec.decodeResponse(stripQualifier(requireNotNull(reply.bytes), qualifier))
+            }
+
+            val first = exchange(1, 0, 0, 0)
+            assertEquals("${first.errorId}/${first.nextExpectedRequestSequence}", 0, first.errorId)
+            val second = exchange(2, 0, 0, 0)
+            assertEquals("${second.errorId}/${second.nextExpectedRequestSequence}", 0, second.errorId)
+            val third = exchange(3, 1, 1, 1)
+            assertEquals("${third.errorId}/${third.nextExpectedRequestSequence}", 0, third.errorId)
+            val groupId = uuid(40).bytes
+            val cut = RendererStyleCutPayloadV1(
+                captureGroupId = groupId,
+                bindingGeneration = binding.snapshot().bindingGeneration,
+                groupGeneration = start.groupGeneration,
+                transactionId = 1,
+                geometryRevision = 1,
+                lineageRevision = 1,
+                semanticRevision = 1,
+                coverageRevision = 1,
+                styleRevision = 1,
+                residencyRevision = 1,
+                targetRevision = 1,
+                reset = true,
+                surfaceIds = longArrayOf(),
+                styleRows = byteArrayOf(),
+            )
+            val staleGroupResponse = exchange(
+                4,
+                1,
+                1,
+                1,
+                RendererStyleCommandV1.encodePages(
+                    cut.copy(groupGeneration = cut.groupGeneration + 1),
+                ).single(),
+                1,
+            )
+            assertEquals(255, staleGroupResponse.messageKind)
+            assertEquals(6, staleGroupResponse.errorId)
+            assertEquals(null, applied)
+
+            val response = exchange(
+                4,
+                1,
+                1,
+                1,
+                RendererStyleCommandV1.encodePages(cut).single(),
+                1,
+            )
+            assertEquals(
+                "error=${response.errorId} seq=${response.requestSequence} next=${response.nextExpectedRequestSequence}",
+                0,
+                response.errorId,
+            )
+            assertEquals(1L, response.acceptedStyleRevision)
+            assertEquals(cut.groupGeneration, requireNotNull(applied).ownership.groupGeneration)
+            assertEquals(cut.bindingGeneration, applied!!.ownership.bindingGeneration)
+            assertArrayEquals(cut.captureGroupId, uuid(40).bytes)
+        } finally {
+            binding.dispose()
+        }
+    }
+
     @Test
     fun `accepted START exposes exact immutable group frame and disposal clears it`() {
         val messenger = MethodTestMessenger()

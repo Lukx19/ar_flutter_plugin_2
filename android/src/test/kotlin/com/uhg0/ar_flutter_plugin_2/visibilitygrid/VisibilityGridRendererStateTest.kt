@@ -55,12 +55,12 @@ class VisibilityGridRendererStateTest {
         )
         val cubes = VisibilityGridRendererState(8_000)
 
-        // 20k rows (800,000), 32,768-slot key index (425,984), heap
+        // 20k canonical rows (1,200,000), 32,768-slot ID index (425,984), heap
         // (320,000), and dirty queue (100,000). These are retained arrays,
         // not a ledger estimate that may omit a second selector/state.
-        assertEquals(1_645_984, centroid.ownedStorageBytes)
+        assertEquals(2_045_984, centroid.ownedStorageBytes)
         assertEquals(
-            8_000 * 40 +
+            8_000 * 60 +
                 LongRowIndex.ownedStorageBytes(8_000) +
                 SelectedKeyMaxHeap.ownedStorageBytes(8_000) +
                 DirtyRowQueue.ownedStorageBytes(8_000),

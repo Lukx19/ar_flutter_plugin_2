@@ -1097,6 +1097,8 @@ internal fun FeatureFusionCandidate.primaryCanonicalTarget(): CanonicalTarget? =
 internal interface CommittedRendererProjection : AutoCloseable {
     val maximumRows: Int get() = 0
     fun applyGeometry(cut: CommittedGeometryCut): RendererProjectionResult
+    fun applyStyleCut(cut: QualifiedRendererStyleCut): RendererStyleCutResult =
+        RendererStyleCutResult.Rejected(RendererStyleCutRejection.CLOSED)
     fun currentRowCount(): Int = 0
     fun portableOwnerBytes(): Long = 0
     fun beginRebuild(cut: CommittedGeometryCut) = Unit
@@ -1132,12 +1134,12 @@ internal class NativeRendererProjection(
     capacity: Int = VisibilityGridRendererState.CENTROID_PRESENTATION_CAPACITY,
 ) : CommittedRendererProjection {
     private val state = VisibilityGridRendererState(capacity)
-    private val surfaceVoxels = HashMap<Long, Voxel>(capacity)
     private var closed = false
     private val rebuildRows = ArrayList<CommittedGeometryRow>(capacity)
     private var rebuildCut: CommittedGeometryCut? = null
     private var activeOwnership: VisibilityObservationOwnership? = null
     private var activeLineageRevision = 0L
+    private var activeRenderConfig: PointCloudNativeConfig? = null
     override val maximumRows: Int get() = state.capacity
     override fun portableOwnerBytes(): Long =
         56L + 96L + 64L + state.retainedGroupGeometryBytes // projection, state, native config, group geometry
@@ -1152,40 +1154,39 @@ internal class NativeRendererProjection(
             return RendererProjectionResult.Refused(RendererProjectionRefusal.MIXED_CUT)
         }
         val removedIds = cut.removedSurfaceIds
-        val removedKnownCount = removedIds.count(surfaceVoxels::containsKey)
-        val insertedCount = cut.upserts.count { !surfaceVoxels.containsKey(it.surfaceId) }
-        val targetRowCount = surfaceVoxels.size - removedKnownCount + insertedCount
+        val removedKnownCount = removedIds.count(state::containsSurfaceId)
+        val insertedCount = cut.upserts.count { !state.containsSurfaceId(it.surfaceId) }
+        val targetRowCount = currentRowCount() - removedKnownCount + insertedCount
         if (targetRowCount > cut.ownership.groupFrame.modelCapacity) {
             return RendererProjectionResult.Refused(RendererProjectionRefusal.CAPACITY)
         }
-        val removalKeys = removedIds.map { surfaceVoxels[it] }.filterNotNull()
-            .map { packVisibilityGridKey(it.x, it.y, it.z) }
-            .toMutableSet()
-        val upsertKeys = cut.upserts.map { row ->
-            surfaceVoxels[row.surfaceId]?.let { previous ->
-                if (previous != row.voxel) {
-                    removalKeys += packVisibilityGridKey(previous.x, previous.y, previous.z)
-                }
-            }
-            packVisibilityGridKey(row.voxel.x, row.voxel.y, row.voxel.z)
-        }
-        // Stable-ID replacement may remove one surface and create another at
-        // the same voxel. The voxel-keyed legacy renderer keeps that location.
-        removalKeys.removeAll(upsertKeys.toSet())
         if (!state.applyGeometry(
                 revision = cut.geometryRevision,
                 reset = cut.reset,
-                upsertKeys = upsertKeys.toLongArray(),
-                removalKeys = removalKeys.toLongArray(),
+                upsertRows = cut.upserts.map { it.toCanonicalRenderRow() },
+                removalSurfaceIds = removedIds,
+                ownership = cut.ownership,
+                transactionId = cut.transactionId,
+                lineageRevision = cut.lineageRevision,
             )
         ) {
             return RendererProjectionResult.Refused(RendererProjectionRefusal.NON_ADJACENT_GEOMETRY)
         }
-        removedIds.forEach(surfaceVoxels::remove)
-        cut.upserts.forEach { row -> surfaceVoxels[row.surfaceId] = row.voxel }
         activeLineageRevision = cut.lineageRevision
-        render(state.snapshot(), renderConfig(cut))
+        val config = renderConfig(cut)
+        activeRenderConfig = config
+        render(state.snapshot(), config)
         return RendererProjectionResult.Applied(currentRowCount())
+    }
+
+    @Synchronized
+    override fun applyStyleCut(cut: QualifiedRendererStyleCut): RendererStyleCutResult {
+        if (closed) return RendererStyleCutResult.Rejected(RendererStyleCutRejection.CLOSED)
+        val result = state.applyStyleCut(cut)
+        if (result is RendererStyleCutResult.Applied) {
+            render(state.snapshot(), checkNotNull(activeRenderConfig))
+        }
+        return result
     }
 
     @Synchronized
@@ -1232,9 +1233,8 @@ internal class NativeRendererProjection(
     }
 
     private fun renderRows(cut: CommittedGeometryCut, rows: List<CommittedGeometryRow>) {
-        val keys = rows.map { packVisibilityGridKey(it.voxel.x, it.voxel.y, it.voxel.z) }.toLongArray()
         val frame = cut.ownership.groupFrame
-        state.startGroup(
+        state.startCanonicalGroup(
             config = VisibilityGridGroupConfig(
                 groupId = cut.ownership.captureGroupId,
                 groupGeneration = cut.ownership.groupGeneration,
@@ -1244,16 +1244,19 @@ internal class NativeRendererProjection(
                 groupFromWorldGl = frame.groupFromWorldGl.toDoubleArray(),
                 worldFromGroupGl = frame.worldFromGroupGl.toDoubleArray(),
                 restoredGeometryRevision = cut.geometryRevision,
-                restoredKeys = keys,
+                restoredKeys = longArrayOf(),
             ),
             geometryRevision = cut.geometryRevision,
-            restoredKeys = keys,
+            rows = rows.map { it.toCanonicalRenderRow() },
+            ownership = cut.ownership,
+            transactionId = cut.transactionId,
+            lineageRevision = cut.lineageRevision,
         )
-        surfaceVoxels.clear()
-        rows.forEach { row -> surfaceVoxels[row.surfaceId] = row.voxel }
         activeOwnership = cut.ownership
         activeLineageRevision = cut.lineageRevision
-        render(state.snapshot(), renderConfig(cut))
+        val config = renderConfig(cut)
+        activeRenderConfig = config
+        render(state.snapshot(), config)
     }
 
     private fun renderConfig(cut: CommittedGeometryCut): PointCloudNativeConfig {
@@ -1269,9 +1272,9 @@ internal class NativeRendererProjection(
     override fun clear() {
         if (closed) return
         discardRebuild()
-        surfaceVoxels.clear()
         activeOwnership = null
         activeLineageRevision = 0
+        activeRenderConfig = null
         state.stopGroup()
         render(null, null)
     }
@@ -1281,8 +1284,8 @@ internal class NativeRendererProjection(
         if (closed) return
         closed = true
         discardRebuild()
-        surfaceVoxels.clear()
         activeOwnership = null
+        activeRenderConfig = null
         state.dispose()
         render(null, null)
     }
@@ -1299,6 +1302,14 @@ internal class NativeRendererProjection(
             geometryRevision == other.geometryRevision &&
             lineageRevision == other.lineageRevision &&
             reset == other.reset
+
+    private fun CommittedGeometryRow.toCanonicalRenderRow() = CanonicalRenderRow(
+        surfaceId = surfaceId,
+        voxelKey = packVisibilityGridKey(voxel.x, voxel.y, voxel.z),
+        packedNormal = packedNormal,
+        normalConfidence = normalConfidence,
+        lineageCount = lineageCount,
+    )
 }
 
 /** Typed scalar test receipt; ordinary feature/surface payload bytes are absent. */

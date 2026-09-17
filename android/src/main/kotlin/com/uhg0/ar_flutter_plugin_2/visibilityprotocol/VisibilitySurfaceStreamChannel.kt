@@ -98,6 +98,7 @@ class VisibilitySurfaceStreamChannel(
     initialNextExpectedSequence: Long = 1L,
     private val debugTransportProbe: DebugTransportProbe? = null,
     private val onStructuralTransactionAcknowledged: ((CommittedBaselineV1) -> Unit)? = null,
+    private val onRendererStyleCut: ((RendererStyleCutPayloadV1) -> RendererStyleCommandApplyResultV1)? = null,
 ) {
     init {
         require(initialNextExpectedSequence in 1..Long.MAX_VALUE) {
@@ -129,6 +130,7 @@ class VisibilitySurfaceStreamChannel(
     private val bindingAbandoned = AtomicBoolean(false)
     private val publicationFence = Any()
     private val transactionReceiver = StructuralTransactionReceiverV1()
+    private val rendererStyleStaging = RendererStyleCommandStagingV1(bindingQualifier ?: byteArrayOf())
     private val telemetry = TransportInstrumentation()
     private val structuralFrames = ArrayDeque<TransactionFrameV1>()
     private var structuralFrameCursor = 0
@@ -443,6 +445,7 @@ class VisibilitySurfaceStreamChannel(
                                 null
                             } else {
                                 var decodedRequest: PacketCodec.Request? = null
+                                var rendererStyleCommand: RendererStyleCommandV1.Page? = null
                                 val encoded = try {
                                     val request = PacketCodec.decodeRequest(bytes)
                                     decodedRequest = request
@@ -493,7 +496,29 @@ class VisibilitySurfaceStreamChannel(
                                                 controlLifecycle?.let {
                                                     committedBaseline = it.committedBaseline()
                                                 }
-                                                val requiresResync = requiresResync(request)
+                                                rendererStyleCommand = if (
+                                                    request.commandBytes.isNotEmpty() &&
+                                                        request.requestFlags and RESYNC_REQUEST_FLAG == 0
+                                                ) {
+                                                    if (request.styleRecords.isNotEmpty() ||
+                                                        !RendererStyleCommandV1.isKind(request.commandBytes)
+                                                    ) {
+                                                        throw BindingError(MALFORMED_PACKET_ERROR_ID)
+                                                    }
+                                                    RendererStyleCommandV1.decode(request.commandBytes).also { page ->
+                                                        if (request.nextStyleRevision != page.styleRevision ||
+                                                            !rendererStyleStaging.canAccept(
+                                                                page,
+                                                                committedBaseline.styleRevision,
+                                                            )
+                                                        ) {
+                                                            throw BindingError(TRANSACTION_STATE_ERROR_ID)
+                                                        }
+                                                    }
+                                                } else {
+                                                    null
+                                                }
+                                                val requiresResync = requiresResync(request, rendererStyleCommand)
                                                 if (!requiresResync) {
                                                     acknowledgedStructuralBaseline =
                                                         acknowledgePendingStructuralTransaction(request)
@@ -537,6 +562,27 @@ class VisibilitySurfaceStreamChannel(
                                                         )
                                                     }
                                                     else -> {
+                                                        rendererStyleCommand?.let { page ->
+                                                            when (val staged = rendererStyleStaging.accept(page)) {
+                                                                is RendererStyleCommandStagingV1.Result.Progress -> Unit
+                                                                is RendererStyleCommandStagingV1.Result.Complete -> {
+                                                                    val applied = onRendererStyleCut?.invoke(staged.cut)
+                                                                        ?: throw IllegalStateException(
+                                                                            "Renderer-style owner is unavailable",
+                                                                        )
+                                                                    require(
+                                                                        applied.acceptedStyleRevision ==
+                                                                            staged.cut.styleRevision,
+                                                                    ) {
+                                                                        "Renderer-style callback returned a non-deterministic revision"
+                                                                    }
+                                                                    committedBaseline = committedBaseline.copy(
+                                                                        styleRevision = applied.acceptedStyleRevision,
+                                                                    )
+                                                                    controlLifecycle?.setCommittedBaseline(committedBaseline)
+                                                                }
+                                                            }
+                                                        }
                                                         if (request.styleRecords.isNotEmpty()) {
                                                             committedBaseline = committedBaseline.copy(
                                                                 styleRevision = StyleRevisionSemantics.committedRevision(
@@ -577,6 +623,7 @@ class VisibilitySurfaceStreamChannel(
                                         }
                                     }
                                 } catch (error: BindingError) {
+                                    rendererStyleStaging.clear()
                                     telemetry.rejected()
                                     val sequence = if (bytes.size >= PacketCodec.requestHeaderBytes) {
                                         ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getLong(64)
@@ -595,6 +642,7 @@ class VisibilitySurfaceStreamChannel(
                                         PacketCodec.responseMinimumBytes,
                                     )
                                 } catch (_: Exception) {
+                                    rendererStyleStaging.clear()
                                     telemetry.malformed()
                                     val sequence = if (bytes.size >= PacketCodec.requestHeaderBytes) {
                                         ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getLong(64)
@@ -788,6 +836,7 @@ class VisibilitySurfaceStreamChannel(
     }
 
     private fun clearPreparedStaging() {
+        rendererStyleStaging.clear()
         lastRequest = null
         lastResponse = null
         resyncPending = false
@@ -854,7 +903,10 @@ class VisibilitySurfaceStreamChannel(
                         request.acknowledgedLineageRevision == queuedTransactionBaseline!!.lineageRevision)
             }
 
-    private fun requiresResync(request: PacketCodec.Request): Boolean {
+    private fun requiresResync(
+        request: PacketCodec.Request,
+        rendererStyleCommand: RendererStyleCommandV1.Page? = null,
+    ): Boolean {
         val structuralAcknowledgement =
             (request.acknowledgedTransactionId != 0L ||
                 request.acknowledgedGeometryRevision != 0L ||
@@ -873,11 +925,15 @@ class VisibilitySurfaceStreamChannel(
             (request.acknowledgedTransactionId != committedBaseline.transactionId ||
                 request.acknowledgedGeometryRevision != committedBaseline.geometryRevision ||
                 request.acknowledgedLineageRevision != committedBaseline.lineageRevision)
-        val styleMismatch = !StyleRevisionSemantics.accepts(
-            committedBaseline.styleRevision,
-            request.nextStyleRevision,
-            request.styleRecords.isNotEmpty(),
-        )
+        val styleMismatch = if (rendererStyleCommand != null) {
+            false
+        } else {
+            !StyleRevisionSemantics.accepts(
+                committedBaseline.styleRevision,
+                request.nextStyleRevision,
+                request.styleRecords.isNotEmpty(),
+            )
+        }
         return structuralMismatch || styleMismatch
     }
 

@@ -127,11 +127,14 @@ internal class ArView(
         onNodeGesture = ::onNodeGesture,
     )
     private lateinit var visibilityGridChannel: VisibilityGridMethodChannel
+    private val visibilityRendererProjection =
+        NativeRendererProjection(sceneHost::updateCoverageRenderer)
     private val visibilityGridV2Binding = VisibilityGridV2Binding(
         messenger = messenger,
         viewId = id,
         CommittedBaselineAuthority = CommittedBaselineAuthority,
         isDebuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0,
+        onRendererStyleCut = visibilityRendererProjection::applyStyleCut,
     )
     private val visibilityObservationDebugGate = VisibilityObservationDebugGate()
     // #101 owns this native proof only.  It remains false until an internal
@@ -150,7 +153,7 @@ internal class ArView(
         resourcesForGroup = { group ->
             CanonicalRuntimeResources.open(context.filesDir, group, visibilityStorageBudgetCoordinator)
         },
-        renderer = NativeRendererProjection(sceneHost::updateCoverageRenderer),
+        renderer = visibilityRendererProjection,
         beforeAdmission = visibilityObservationDebugGate::awaitIfArmed,
     )
     private val visibilityObservationRuntime = AndroidVisibilityGridRuntime(

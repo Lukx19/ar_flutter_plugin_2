@@ -20,6 +20,9 @@ import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.VisibilitySurfaceStreamCh
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.DebugTransportProbe
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaSelectorV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaSourceV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.RendererStyleCommandApplyResultV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.RendererStyleCutPayloadV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.RendererStyleCommandV1
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -71,6 +74,7 @@ class VisibilityGridV2Binding internal constructor(
     private val initialCommittedBaselineSeed: CommittedBaselineV1 =
         CommittedBaselineV1.ZERO,
     internal val beforeAbandonCleanup: (() -> Unit)? = null,
+    private val onRendererStyleCut: ((QualifiedRendererStyleCut) -> RendererStyleCutResult)? = null,
 ) {
     private val main = Handler(Looper.getMainLooper())
     private val disposed = AtomicBoolean(false)
@@ -152,6 +156,7 @@ class VisibilityGridV2Binding internal constructor(
         onAbandonedContinuation = debugRecoverySeam::oldContinuationFenced,
         onStructuralTransactionAcknowledged = ::onStructuralTransactionAcknowledged,
         debugTransportProbe = issue98Probe,
+        onRendererStyleCut = ::applyRendererStyleCutCommand,
     )
 
     init {
@@ -368,6 +373,59 @@ class VisibilityGridV2Binding internal constructor(
         pendingPublicationCut = null
         acknowledgedPublicationCut = AcknowledgedCut.from(selector)
         acknowledgementListener?.invoke(selector)
+    }
+
+    /**
+     * Qualifies a complete kind-5 cut against the live binding before handing
+     * it to the renderer owner.  The stream has already authenticated the
+     * outer binding qualifier; these inner identities fence a stale worker or
+     * capture group that was serialized before replacement.
+     */
+    private fun applyRendererStyleCutCommand(
+        command: RendererStyleCutPayloadV1,
+    ): RendererStyleCommandApplyResultV1 {
+        val ownership = currentObservationOwnership()
+            ?: throw IllegalArgumentException("Renderer-style cut has no active ownership")
+        require(command.bindingGeneration == ownership.bindingGeneration) {
+            "Renderer-style cut binding generation is stale"
+        }
+        require(command.groupGeneration == ownership.groupGeneration) {
+            "Renderer-style cut group generation is stale"
+        }
+        require(command.captureGroupId.contentEquals(parseUuid(ownership.captureGroupId).bytes)) {
+            "Renderer-style cut capture group identity is stale"
+        }
+        val qualified = QualifiedRendererStyleCut(
+            ownership = ownership,
+            transactionId = command.transactionId,
+            geometryRevision = command.geometryRevision,
+            lineageRevision = command.lineageRevision,
+            semanticRevision = command.semanticRevision,
+            coverageRevision = command.coverageRevision,
+            styleRevision = command.styleRevision,
+            residencyRevision = command.residencyRevision,
+            targetRevision = command.targetRevision,
+            reset = command.reset,
+            surfaceIds = command.surfaceIds.copyOf(),
+            styleRows = command.styleRows.copyOf(),
+            targetSurfaceId = command.targetSurfaceId,
+            targetDirectionIndex = command.targetDirectionIndex,
+        )
+        when (val result = onRendererStyleCut?.invoke(qualified)
+            ?: throw IllegalStateException("Renderer-style owner is unavailable")) {
+            is RendererStyleCutResult.Applied -> require(
+                result.styleRevision == command.styleRevision,
+            ) { "Renderer-style callback accepted a different style revision" }
+            is RendererStyleCutResult.Replayed -> require(
+                result.styleRevision == command.styleRevision,
+            ) { "Renderer-style replay returned a different style revision" }
+            is RendererStyleCutResult.Rejected -> {
+                throw IllegalArgumentException(
+                    "Renderer-style cut rejected: ${result.reason.name}",
+                )
+            }
+        }
+        return RendererStyleCommandApplyResultV1(command.styleRevision)
     }
 
     private fun onControlCall(call: MethodCall, result: MethodChannel.Result) {
@@ -1013,6 +1071,7 @@ class VisibilityGridV2Binding internal constructor(
             debugRecoverySeam = debugRecoverySeam,
             cleanupAuthority = cleanupAuthority,
             initialCommittedBaselineSeed = lifecycle.committedBaseline(),
+            onRendererStyleCut = onRendererStyleCut,
         ).also { replacement ->
             observationRuntime?.let(replacement::attachObservationRuntime)
             acknowledgementListener?.let(replacement::attachPublicationAcknowledgementListener)

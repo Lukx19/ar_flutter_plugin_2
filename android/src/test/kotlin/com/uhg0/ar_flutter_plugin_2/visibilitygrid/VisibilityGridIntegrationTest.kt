@@ -31,6 +31,46 @@ import org.openjdk.jol.info.GraphLayout
 /** Locks Option A's BINDING-LIFECYCLE-ACK seeded CREATE cut without a Flutter payload seam. */
 class VisibilityGridIntegrationTest {
     @Test
+    fun `renderer retains distinct stable surfaces that share one voxel`() {
+        val rendered = mutableListOf<com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot>()
+        val projection = NativeRendererProjection(render = { snapshot, _ -> snapshot?.let(rendered::add) })
+        val ownership = rendererOwnership()
+        val rebuild = rebuildCut(ownership, 4, 1)
+
+        projection.beginRebuild(rebuild)
+        projection.appendRebuildPage(rebuild.withUpserts(listOf(row(1, 0), row(2, 0))))
+        projection.finishRebuild(rebuild)
+
+        assertEquals(2, projection.currentRowCount())
+        assertEquals(2, rendered.single().count)
+        projection.close()
+    }
+
+    @Test
+    fun `moving a stable surface onto an occupied voxel retains both identities`() {
+        val projection = NativeRendererProjection(render = { _, _ -> })
+        val ownership = rendererOwnership()
+        val rebuild = rebuildCut(ownership, 4, 1)
+        projection.beginRebuild(rebuild)
+        projection.appendRebuildPage(rebuild.withUpserts(listOf(row(1, 0), row(2, 1))))
+        projection.finishRebuild(rebuild)
+
+        val moved = CommittedGeometryCut(
+            ownership = ownership,
+            transactionId = 5,
+            baseGeometryRevision = 4,
+            geometryRevision = 5,
+            lineageRevision = 2,
+            reset = false,
+            upserts = listOf(row(1, 1)),
+            removedSurfaceIds = LongArray(0),
+        )
+
+        assertEquals(RendererProjectionResult.Applied(2), projection.applyGeometry(moved))
+        projection.close()
+    }
+
+    @Test
     fun `stable identity replacement may reuse the removed surface voxel`() {
         val projection = NativeRendererProjection(render = { _, _ -> })
         val ownership = rendererOwnership()

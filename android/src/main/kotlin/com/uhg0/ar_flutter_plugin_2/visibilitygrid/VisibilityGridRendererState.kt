@@ -5,6 +5,8 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan
 import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererGlyph
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererTarget
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import com.uhg0.ar_flutter_plugin_2.pointcloud.identityGridRotation
 
@@ -23,6 +25,21 @@ internal class RendererGroupGeometry private constructor(
             voxelSizeMeters = config.voxelSizeMeters,
             worldFromGroupGl = config.worldFromGroupGl.copyOf(),
         )
+    }
+}
+
+/** Stable renderer identity plus the canonical geometry needed for one slot. */
+internal data class CanonicalRenderRow(
+    val surfaceId: Long,
+    val voxelKey: Long,
+    val packedNormal: Int,
+    val normalConfidence: Int,
+    val lineageCount: Int,
+) {
+    init {
+        require(surfaceId in 1 until 0x1_0000_0000L)
+        require(normalConfidence in 0..255)
+        require(lineageCount in 0..0xffff)
     }
 }
 
@@ -58,9 +75,9 @@ class VisibilityGridRendererState(
         fun ownedStorageBytes(capacity: Int): Int {
             require(capacity > 0)
             return capacity * (
-                Long.SIZE_BYTES +
+                Long.SIZE_BYTES * 2 +
                     POSITION_COMPONENTS * Float.SIZE_BYTES +
-                    Int.SIZE_BYTES +
+                    Int.SIZE_BYTES * 4 +
                     COVERAGE_RENDERER_STYLE_ROW_BYTES
                 ) +
                 LongRowIndex.ownedStorageBytes(capacity) +
@@ -75,12 +92,16 @@ class VisibilityGridRendererState(
         require(capacity in 1..100_000)
     }
 
-    private val keys = LongArray(capacity)
+    private val surfaceIds = LongArray(capacity)
+    private val voxelKeys = LongArray(capacity)
+    private val packedNormals = IntArray(capacity)
+    private val normalConfidences = IntArray(capacity)
+    private val lineageCounts = IntArray(capacity)
     private val positions = FloatArray(capacity * 3)
     private val colors = IntArray(capacity)
     private val styleRows = ByteArray(capacity * COVERAGE_RENDERER_STYLE_ROW_BYTES)
-    private val rowsByKey = LongRowIndex(capacity)
-    private val selectedKeys = SelectedKeyMaxHeap(capacity)
+    private val rowsByIdentity = LongRowIndex(capacity)
+    private val selectedIdentities = SelectedKeyMaxHeap(capacity)
     private val dirtyRows = DirtyRowQueue(capacity)
     private var group: RendererGroupGeometry? = null
     private var count = 0
@@ -92,6 +113,22 @@ class VisibilityGridRendererState(
     private var disposed = false
     private var resetUpload = true
     private var ignoredVisibilityKeyCount = 0L
+    /** Qualifiers of the currently installed canonical geometry cut. */
+    private var installedOwnership: VisibilityObservationOwnership? = null
+    private var installedGroupId: String? = null
+    private var installedGroupGeneration = 0L
+    private var installedTransactionId = 0L
+    private var installedLineageRevision = 0L
+
+    /** Revision ledger for the last accepted worker style/target cut. */
+    private var semanticRevision = 0L
+    private var coverageRevision = 0L
+    private var styleRevision = 0L
+    private var residencyRevision = 0L
+    private var targetRevision = 0L
+    private var targetSurfaceIdValue: Long? = null
+    private var targetDirectionIndexValue: Int? = null
+    private var lastStyleCut: QualifiedRendererStyleCut? = null
 
     val freeRowCount: Int
         @Synchronized get() = capacity - count
@@ -108,12 +145,36 @@ class VisibilityGridRendererState(
     val ignoredDeletedVisibilityKeys: Long
         @Synchronized get() = ignoredVisibilityKeyCount
 
+    internal val currentSemanticRevision: Long
+        @Synchronized get() = semanticRevision
+
+    internal val currentCoverageRevision: Long
+        @Synchronized get() = coverageRevision
+
+    internal val currentStyleRevision: Long
+        @Synchronized get() = styleRevision
+
+    internal val currentResidencyRevision: Long
+        @Synchronized get() = residencyRevision
+
+    internal val currentTargetRevision: Long
+        @Synchronized get() = targetRevision
+
+    internal val currentTargetSurfaceId: Long?
+        @Synchronized get() = targetSurfaceIdValue
+
+    internal val currentTargetDirectionIndex: Int?
+        @Synchronized get() = targetDirectionIndexValue
+
     /** Concrete primitive storage retained by this production state. */
     val ownedStorageBytes: Int
         get() = ownedStorageBytes(capacity)
 
     internal val retainedGroupGeometryBytes: Long
         @Synchronized get() = group?.portableBytes ?: 0L
+
+    @Synchronized
+    internal fun containsSurfaceId(surfaceId: Long): Boolean = rowsByIdentity.containsKey(surfaceId)
 
     @Synchronized
     fun startGroup(
@@ -134,8 +195,17 @@ class VisibilityGridRendererState(
         this.geometryRevision = geometryRevision
         require(visibilityRevision >= 0)
         this.visibilityRevision = visibilityRevision
+        this.installedOwnership = null
+        this.installedGroupId = config.groupId
+        this.installedGroupGeneration = config.groupGeneration.toLong()
+        this.installedTransactionId = 0L
+        this.installedLineageRevision = 0L
+        resetStyleCutState()
+        // Legacy visibility patches use this revision as their coverage
+        // baseline, while the qualified style ledger starts from zero.
+        coverageRevision = visibilityRevision
         ignoredVisibilityKeyCount = 0
-        restoredKeys.forEach(::admitCandidate)
+        restoredKeys.forEach { key -> admitCandidate(key, key) }
         dirtyRows.addRange(count)
         resetUpload = true
         renderRevision++
@@ -162,7 +232,7 @@ class VisibilityGridRendererState(
             restoredKeys = snapshot.keys,
         )
         snapshot.keys.indices.forEach { source ->
-            val row = rowsByKey[snapshot.keys[source]] ?: return@forEach
+            val row = rowsByIdentity[snapshot.keys[source]] ?: return@forEach
             val styleOffset = source * COVERAGE_RENDERER_STYLE_ROW_BYTES
             val encoded = snapshot.styleRows.copyOfRange(
                 styleOffset,
@@ -200,11 +270,11 @@ class VisibilityGridRendererState(
                 (selected.size > capacity || selected.toSet().size != selected.size)
             ) return false
             clearRows()
-            (selected ?: upsertKeys).forEach(::admitCandidate)
+            (selected ?: upsertKeys).forEach { key -> admitCandidate(key, key) }
             dirtyRows.addRange(count)
             resetUpload = true
         } else {
-            val removedSelectedIdentity = removalKeys.any(rowsByKey::containsKey)
+            val removedSelectedIdentity = removalKeys.any(rowsByIdentity::containsKey)
             if (removedSelectedIdentity) {
                 // The semantic grid supplies only the first presentation-cap
                 // identities. Reconciliation is bounded by this state's
@@ -219,21 +289,104 @@ class VisibilityGridRendererState(
                     // keep the historical delta-only free-row behavior.
                     removalKeys.forEach(::remove)
                     upsertKeys.forEach { key ->
-                        if (key !in rowsByKey && count < capacity) append(key)
+                        if (key !in rowsByIdentity && count < capacity) append(key, key)
                     }
                 }
             } else {
                 upsertKeys.forEach { key ->
-                    if (key in rowsByKey) return@forEach
+                    if (key in rowsByIdentity) return@forEach
                     if (count < capacity) {
-                        append(key)
-                    } else if (key < checkNotNull(selectedKeys.largest(rowsByKey::containsKey))) {
-                        remove(checkNotNull(selectedKeys.largest(rowsByKey::containsKey)))
-                        append(key)
+                        append(key, key)
+                    } else if (key < checkNotNull(selectedIdentities.largest(rowsByIdentity::containsKey))) {
+                        remove(checkNotNull(selectedIdentities.largest(rowsByIdentity::containsKey)))
+                        append(key, key)
                     }
                 }
             }
         }
+        geometryRevision = revision
+        renderRevision++
+        return true
+    }
+
+    /** Installs a complete V2 geometry cut keyed by stable canonical identity. */
+    @Synchronized
+    internal fun startCanonicalGroup(
+        config: VisibilityGridGroupConfig,
+        geometryRevision: Long,
+        rows: List<CanonicalRenderRow>,
+        ownership: VisibilityObservationOwnership? = null,
+        transactionId: Long = 0L,
+        lineageRevision: Long = 0L,
+    ) {
+        ensureActive()
+        require(geometryRevision >= 0)
+        require(transactionId >= 0)
+        require(lineageRevision >= 0)
+        require(rows.size <= config.capacity)
+        require(rows.map { it.surfaceId }.toSet().size == rows.size)
+        clearRows()
+        group = RendererGroupGeometry.from(config)
+        this.geometryRevision = geometryRevision
+        this.installedOwnership = ownership
+        this.installedGroupId = config.groupId
+        this.installedGroupGeneration = config.groupGeneration.toLong()
+        this.installedTransactionId = transactionId
+        this.installedLineageRevision = lineageRevision
+        resetStyleCutState()
+        ignoredVisibilityKeyCount = 0
+        rows.forEach(::admitCandidate)
+        dirtyRows.addRange(count)
+        resetUpload = true
+        renderRevision++
+    }
+
+    /** Applies one V2 geometry delta without treating a voxel coordinate as identity. */
+    @Synchronized
+    internal fun applyGeometry(
+        revision: Long,
+        reset: Boolean,
+        upsertRows: List<CanonicalRenderRow>,
+        removalSurfaceIds: LongArray,
+        ownership: VisibilityObservationOwnership? = null,
+        transactionId: Long = installedTransactionId,
+        lineageRevision: Long = installedLineageRevision,
+    ): Boolean {
+        ensureActive()
+        require(transactionId >= 0)
+        require(lineageRevision >= 0)
+        if (group == null ||
+            (!reset && revision != geometryRevision + 1) ||
+            (reset && revision <= geometryRevision) ||
+            upsertRows.map { it.surfaceId }.toSet().size != upsertRows.size ||
+            removalSurfaceIds.toSet().size != removalSurfaceIds.size ||
+            upsertRows.any { it.surfaceId in removalSurfaceIds.toSet() }
+        ) return false
+
+        if (reset) {
+            clearRows()
+            upsertRows.forEach(::admitCandidate)
+            dirtyRows.addRange(count)
+            resetUpload = true
+        } else {
+            removalSurfaceIds.forEach(::remove)
+            upsertRows.forEach { next ->
+                val existing = rowsByIdentity[next.surfaceId]
+                if (existing != null) {
+                    updateGeometry(existing, next)
+                } else {
+                    admitCandidate(next)
+                }
+            }
+        }
+        if (ownership != null) {
+            installedOwnership = ownership
+            installedGroupId = ownership.captureGroupId
+            installedGroupGeneration = ownership.groupGeneration
+        }
+        installedTransactionId = transactionId
+        installedLineageRevision = lineageRevision
+        invalidateStyleCutAfterGeometryChange(reset)
         geometryRevision = revision
         renderRevision++
         return true
@@ -264,7 +417,7 @@ class VisibilityGridRendererState(
             return false
         }
         patchKeys.indices.forEach { index ->
-            val row = rowsByKey[patchKeys[index]] ?: return@forEach
+            val row = rowsByIdentity[patchKeys[index]] ?: return@forEach
             val current = styleAt(row)
             val next = decoded[index]
             if (next.semanticGeneration < current.semanticGeneration ||
@@ -272,7 +425,7 @@ class VisibilityGridRendererState(
             ) return false
         }
         patchKeys.indices.forEach { index ->
-            val row = rowsByKey[patchKeys[index]]
+            val row = rowsByIdentity[patchKeys[index]]
             if (row == null) {
                 ignoredVisibilityKeyCount++
                 return@forEach
@@ -290,6 +443,170 @@ class VisibilityGridRendererState(
         visibilityRevision = nextVisibilityRevision
         renderRevision++
         return true
+    }
+
+    /**
+     * Applies one complete worker style/target cut.  Validation deliberately
+     * finishes before the first row, revision, dirty-span, or target mutation.
+     */
+    @Synchronized
+    internal fun applyStyleCut(
+        cut: QualifiedRendererStyleCut,
+    ): RendererStyleCutResult {
+        if (disposed) return RendererStyleCutResult.Rejected(RendererStyleCutRejection.CLOSED)
+
+        // Copy mutable payloads at the seam.  The copied cut is also retained
+        // as the exact replay receipt, so a caller cannot mutate replay state.
+        val candidate = cut.copy(
+            surfaceIds = cut.surfaceIds.copyOf(),
+            styleRows = cut.styleRows.copyOf(),
+        )
+        if (lastStyleCut?.samePayload(candidate) == true) {
+            return RendererStyleCutResult.Replayed(candidate.styleRevision)
+        }
+
+        if (group == null) {
+            return RendererStyleCutResult.Rejected(RendererStyleCutRejection.GROUP_MISMATCH)
+        }
+        val expectedOwnership = installedOwnership
+        if (expectedOwnership != null) {
+            if (candidate.ownership != expectedOwnership) {
+                return RendererStyleCutResult.Rejected(RendererStyleCutRejection.STALE_OWNERSHIP)
+            }
+        } else if (candidate.ownership.captureGroupId != installedGroupId ||
+            candidate.ownership.groupGeneration != installedGroupGeneration
+        ) {
+            return RendererStyleCutResult.Rejected(RendererStyleCutRejection.GROUP_MISMATCH)
+        }
+        if (candidate.transactionId != installedTransactionId) {
+            return RendererStyleCutResult.Rejected(RendererStyleCutRejection.TRANSACTION_MISMATCH)
+        }
+        if (candidate.geometryRevision != geometryRevision) {
+            return RendererStyleCutResult.Rejected(RendererStyleCutRejection.GEOMETRY_REVISION_MISMATCH)
+        }
+        if (candidate.lineageRevision != installedLineageRevision) {
+            return RendererStyleCutResult.Rejected(RendererStyleCutRejection.LINEAGE_REVISION_MISMATCH)
+        }
+        val revisionResult = validateStyleRevisions(candidate)
+        if (revisionResult != null) {
+            return RendererStyleCutResult.Rejected(revisionResult)
+        }
+        val rowCount = candidate.surfaceIds.size
+        if (rowCount > capacity || rowCount > QUALIFIED_RENDERER_STYLE_CUT_MAX_ROWS) {
+            return RendererStyleCutResult.Rejected(RendererStyleCutRejection.CAPACITY)
+        }
+        val expectedStyleBytes = try {
+            Math.multiplyExact(rowCount, COVERAGE_RENDERER_STYLE_ROW_BYTES)
+        } catch (_: ArithmeticException) {
+            return RendererStyleCutResult.Rejected(RendererStyleCutRejection.MALFORMED_LENGTH)
+        }
+        if (candidate.styleRows.size != expectedStyleBytes) {
+            return RendererStyleCutResult.Rejected(RendererStyleCutRejection.MALFORMED_LENGTH)
+        }
+        if ((candidate.targetSurfaceId == null) != (candidate.targetDirectionIndex == null)) {
+            return RendererStyleCutResult.Rejected(RendererStyleCutRejection.TARGET_NOT_SUPPLIED)
+        }
+        if (candidate.targetDirectionIndex != null && candidate.targetDirectionIndex !in 0..23) {
+            return RendererStyleCutResult.Rejected(RendererStyleCutRejection.TARGET_DIRECTION_INVALID)
+        }
+
+        var previousSurfaceId = 0L
+        val decoded = arrayOfNulls<CoverageRendererStyleRowV1>(rowCount)
+        for (index in 0 until rowCount) {
+            val surfaceId = candidate.surfaceIds[index]
+            if (surfaceId !in 1 until 0x1_0000_0000L) {
+                return RendererStyleCutResult.Rejected(RendererStyleCutRejection.UNKNOWN_SURFACE_ID)
+            }
+            if (surfaceId == previousSurfaceId) {
+                return RendererStyleCutResult.Rejected(RendererStyleCutRejection.DUPLICATE_SURFACE_ID)
+            }
+            if (index > 0 && surfaceId < previousSurfaceId) {
+                return RendererStyleCutResult.Rejected(RendererStyleCutRejection.UNSORTED_SURFACE_IDS)
+            }
+            previousSurfaceId = surfaceId
+            if (!rowsByIdentity.containsKey(surfaceId)) {
+                return RendererStyleCutResult.Rejected(RendererStyleCutRejection.UNKNOWN_SURFACE_ID)
+            }
+            decoded[index] = try {
+                CoverageRendererStyleRowV1.decode(
+                    candidate.styleRows,
+                    index * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                )
+            } catch (_: IllegalArgumentException) {
+                return RendererStyleCutResult.Rejected(RendererStyleCutRejection.MALFORMED_STYLE)
+            }
+        }
+        val rows = decoded.map { requireNotNull(it) }
+        if (!CoverageRendererStyleRowV1.hasCoherentGenerations(rows)) {
+            return RendererStyleCutResult.Rejected(RendererStyleCutRejection.MIXED_STYLE_GENERATION)
+        }
+        if (rows.any {
+                it.semanticGeneration != candidate.semanticRevision ||
+                    it.styleGeneration != candidate.styleRevision
+            }
+        ) {
+            return RendererStyleCutResult.Rejected(RendererStyleCutRejection.MALFORMED_STYLE)
+        }
+        if (candidate.targetSurfaceId != null &&
+            candidate.targetSurfaceId !in candidate.surfaceIds
+        ) {
+            return RendererStyleCutResult.Rejected(RendererStyleCutRejection.TARGET_NOT_SUPPLIED)
+        }
+        val targetIndex = candidate.targetSurfaceId?.let(candidate.surfaceIds::indexOf)
+        if (targetIndex != null) {
+            val targetRow = rows[targetIndex]
+            if (targetRow.target != CoverageRendererTarget.PRIMARY ||
+                targetRow.directionBin != candidate.targetDirectionIndex ||
+                targetRow.glyph != CoverageRendererGlyph.DESIRED_DIRECTION
+            ) {
+                return RendererStyleCutResult.Rejected(RendererStyleCutRejection.MALFORMED_STYLE)
+            }
+        } else if (rows.any { it.target == CoverageRendererTarget.PRIMARY }) {
+            return RendererStyleCutResult.Rejected(RendererStyleCutRejection.MALFORMED_STYLE)
+        }
+        if (candidate.reset && !hasExactlyCurrentSurfaceIds(candidate.surfaceIds)) {
+            return RendererStyleCutResult.Rejected(RendererStyleCutRejection.INCOMPLETE_RESET)
+        }
+
+        // The complete cut is valid.  Only now do we touch row bytes and the
+        // revision/target receipt, making every rejection byte-identical.
+        var changedRows = 0
+        for (index in 0 until rowCount) {
+            val row = checkNotNull(rowsByIdentity[candidate.surfaceIds[index]])
+            val encodedOffset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
+            val styleOffset = row * COVERAGE_RENDERER_STYLE_ROW_BYTES
+            val encoded = candidate.styleRows.copyOfRange(
+                encodedOffset,
+                encodedOffset + COVERAGE_RENDERER_STYLE_ROW_BYTES,
+            )
+            val nextColor = rows[index].packedColor()
+            if (!styleRows.regionMatches(styleOffset, encoded) || colors[row] != nextColor) {
+                encoded.copyInto(styleRows, styleOffset)
+                colors[row] = nextColor
+                dirtyRows.add(row)
+                changedRows++
+            }
+        }
+        if (candidate.reset) {
+            dirtyRows.addRange(count)
+            resetUpload = true
+        }
+        semanticRevision = candidate.semanticRevision
+        coverageRevision = candidate.coverageRevision
+        styleRevision = candidate.styleRevision
+        residencyRevision = candidate.residencyRevision
+        targetRevision = candidate.targetRevision
+        visibilityRevision = candidate.coverageRevision
+        targetSurfaceIdValue = candidate.targetSurfaceId
+        targetDirectionIndexValue = candidate.targetDirectionIndex
+        lastStyleCut = candidate
+        renderRevision++
+        return RendererStyleCutResult.Applied(
+            styleRevision = candidate.styleRevision,
+            targetRevision = candidate.targetRevision,
+            changedRows = changedRows,
+            targetSurfaceId = candidate.targetSurfaceId,
+        )
     }
 
     @Synchronized
@@ -311,7 +628,7 @@ class VisibilityGridRendererState(
     @Synchronized
     fun snapshot(): CoveragePointRenderSnapshot {
         ensureActive()
-        val snapshotKeys = keys.copyOf(count)
+        val snapshotKeys = voxelKeys.copyOf(count)
         val snapshotPositions = positions.copyOf(count * 3)
         val snapshotColors = colors.copyOf(count)
         val spans = dirtySpans()
@@ -355,6 +672,12 @@ class VisibilityGridRendererState(
         group = null
         geometryRevision = 0
         visibilityRevision = 0
+        installedOwnership = null
+        installedGroupId = null
+        installedGroupGeneration = 0L
+        installedTransactionId = 0L
+        installedLineageRevision = 0L
+        resetStyleCutState()
         ignoredVisibilityKeyCount = 0
         resetUpload = true
         renderRevision++
@@ -367,39 +690,105 @@ class VisibilityGridRendererState(
         disposed = true
     }
 
-    private fun append(key: Long) {
+    private fun append(
+        identity: Long,
+        voxelKey: Long,
+        packedNormal: Int = 0,
+        normalConfidence: Int = 0,
+        lineageCount: Int = 0,
+    ) {
         check(count < capacity)
         val row = count++
-        keys[row] = key
+        surfaceIds[row] = identity
+        voxelKeys[row] = voxelKey
+        packedNormals[row] = packedNormal
+        normalConfidences[row] = normalConfidence
+        lineageCounts[row] = lineageCount
         val initialStyle = CoverageRendererStyleRowV1()
         initialStyle.encode().copyInto(styleRows, row * COVERAGE_RENDERER_STYLE_ROW_BYTES)
         colors[row] = initialStyle.packedColor()
-        writePosition(row, key)
-        rowsByKey[key] = row
-        selectedKeys.add(key, rowsByKey::containsKey)
+        writePosition(row, voxelKey)
+        rowsByIdentity[identity] = row
+        selectedIdentities.add(identity, rowsByIdentity::containsKey)
         dirtyRows.add(row)
     }
 
     /** Deterministic bounded admission without a steady full-key sort. */
-    private fun admitCandidate(key: Long) {
-        if (rowsByKey.containsKey(key)) return
+    private fun admitCandidate(identity: Long, voxelKey: Long) {
+        if (rowsByIdentity.containsKey(identity)) return
         if (count < capacity) {
-            append(key)
+            append(identity, voxelKey)
             return
         }
-        val largest = selectedKeys.largest(rowsByKey::containsKey) ?: return
-        if (key < largest) {
+        val largest = selectedIdentities.largest(rowsByIdentity::containsKey) ?: return
+        if (identity < largest) {
             remove(largest)
-            append(key)
+            append(identity, voxelKey)
         }
     }
 
-    private fun remove(key: Long) {
-        val row = rowsByKey.remove(key) ?: return
+    private fun admitCandidate(row: CanonicalRenderRow) {
+        val existing = rowsByIdentity[row.surfaceId]
+        if (existing != null) {
+            updateGeometry(existing, row)
+            return
+        }
+        if (count < capacity) {
+            append(
+                row.surfaceId,
+                row.voxelKey,
+                row.packedNormal,
+                row.normalConfidence,
+                row.lineageCount,
+            )
+            return
+        }
+        val largest = selectedIdentities.largest(rowsByIdentity::containsKey) ?: return
+        if (row.surfaceId < largest) {
+            remove(largest)
+            append(
+                row.surfaceId,
+                row.voxelKey,
+                row.packedNormal,
+                row.normalConfidence,
+                row.lineageCount,
+            )
+        }
+    }
+
+    private fun updateGeometry(slot: Int, next: CanonicalRenderRow) {
+        val changed = voxelKeys[slot] != next.voxelKey ||
+            packedNormals[slot] != next.packedNormal ||
+            normalConfidences[slot] != next.normalConfidence ||
+            lineageCounts[slot] != next.lineageCount
+        voxelKeys[slot] = next.voxelKey
+        packedNormals[slot] = next.packedNormal
+        normalConfidences[slot] = next.normalConfidence
+        lineageCounts[slot] = next.lineageCount
+        if (changed) {
+            if (targetSurfaceIdValue == surfaceIds[slot]) {
+                targetSurfaceIdValue = null
+                targetDirectionIndexValue = null
+            }
+            writePosition(slot, next.voxelKey)
+            dirtyRows.add(slot)
+        }
+    }
+
+    private fun remove(identity: Long) {
+        val row = rowsByIdentity.remove(identity) ?: return
+        if (targetSurfaceIdValue == identity) {
+            targetSurfaceIdValue = null
+            targetDirectionIndexValue = null
+        }
         val last = --count
         if (row != last) {
-            val movedKey = keys[last]
-            keys[row] = movedKey
+            val movedIdentity = surfaceIds[last]
+            surfaceIds[row] = movedIdentity
+            voxelKeys[row] = voxelKeys[last]
+            packedNormals[row] = packedNormals[last]
+            normalConfidences[row] = normalConfidences[last]
+            lineageCounts[row] = lineageCounts[last]
             colors[row] = colors[last]
             styleRows.copyInto(
                 styleRows,
@@ -410,10 +799,14 @@ class VisibilityGridRendererState(
             positions[last * 3].let { positions[row * 3] = it }
             positions[last * 3 + 1].let { positions[row * 3 + 1] = it }
             positions[last * 3 + 2].let { positions[row * 3 + 2] = it }
-            rowsByKey[movedKey] = row
+            rowsByIdentity[movedIdentity] = row
             dirtyRows.add(row)
         }
-        keys[last] = 0
+        surfaceIds[last] = 0
+        voxelKeys[last] = 0
+        packedNormals[last] = 0
+        normalConfidences[last] = 0
+        lineageCounts[last] = 0
         colors[last] = 0
         styleRows.fill(
             0,
@@ -472,12 +865,16 @@ class VisibilityGridRendererState(
     }
 
     private fun clearRows() {
-        keys.fill(0)
+        surfaceIds.fill(0)
+        voxelKeys.fill(0)
+        packedNormals.fill(0)
+        normalConfidences.fill(0)
+        lineageCounts.fill(0)
         positions.fill(0f)
         colors.fill(0)
         styleRows.fill(0)
-        rowsByKey.clear()
-        selectedKeys.clear()
+        rowsByIdentity.clear()
+        selectedIdentities.clear()
         dirtyRows.clear()
         count = 0
     }
@@ -488,15 +885,99 @@ class VisibilityGridRendererState(
         val removals = LongArray(count)
         var removalCount = 0
         for (row in 0 until count) {
-            val key = keys[row]
+            val key = surfaceIds[row]
             if (!desired.containsKey(key)) removals[removalCount++] = key
         }
         for (index in 0 until removalCount) remove(removals[index])
         nextSelected.forEach { key ->
-            if (key !in rowsByKey) append(key)
+            if (key !in rowsByIdentity) append(key, key)
         }
         check(count == nextSelected.size)
     }
+
+    private fun validateStyleRevisions(
+        cut: QualifiedRendererStyleCut,
+    ): RendererStyleCutRejection? {
+        val revisions = arrayOf(
+            cut.semanticRevision,
+            cut.coverageRevision,
+            cut.styleRevision,
+            cut.residencyRevision,
+            cut.targetRevision,
+        )
+        val current = longArrayOf(
+            semanticRevision,
+            coverageRevision,
+            styleRevision,
+            residencyRevision,
+            targetRevision,
+        )
+        val staleReasons = arrayOf(
+            RendererStyleCutRejection.SEMANTIC_REVISION_STALE,
+            RendererStyleCutRejection.COVERAGE_REVISION_STALE,
+            RendererStyleCutRejection.STYLE_REVISION_STALE,
+            RendererStyleCutRejection.RESIDENCY_REVISION_STALE,
+            RendererStyleCutRejection.TARGET_REVISION_STALE,
+        )
+        revisions.indices.forEach { index ->
+            if (revisions[index] < 0) return RendererStyleCutRejection.REVISION_OVERFLOW
+            if (current[index] == Long.MAX_VALUE) return RendererStyleCutRejection.REVISION_OVERFLOW
+            if (revisions[index] <= current[index]) return staleReasons[index]
+            if (revisions[index] != current[index] + 1L) {
+                return RendererStyleCutRejection.REVISION_GAP
+            }
+        }
+        return null
+    }
+
+    private fun hasExactlyCurrentSurfaceIds(ids: LongArray): Boolean {
+        if (ids.size != count) return false
+        val current = surfaceIds.copyOf(count)
+        current.sort()
+        return current.contentEquals(ids)
+    }
+
+    private fun resetStyleCutState() {
+        semanticRevision = 0L
+        coverageRevision = 0L
+        styleRevision = 0L
+        residencyRevision = 0L
+        targetRevision = 0L
+        targetSurfaceIdValue = null
+        targetDirectionIndexValue = null
+        lastStyleCut = null
+    }
+
+    /** Geometry identity changed; an old style receipt can never be replayed. */
+    private fun invalidateStyleCutAfterGeometryChange(reset: Boolean) {
+        lastStyleCut = null
+        if (reset) {
+            targetSurfaceIdValue = null
+            targetDirectionIndexValue = null
+        } else if (targetSurfaceIdValue != null &&
+            !rowsByIdentity.containsKey(checkNotNull(targetSurfaceIdValue))
+        ) {
+            targetSurfaceIdValue = null
+            targetDirectionIndexValue = null
+        }
+    }
+
+    private fun QualifiedRendererStyleCut.samePayload(
+        other: QualifiedRendererStyleCut,
+    ): Boolean = ownership == other.ownership &&
+        transactionId == other.transactionId &&
+        geometryRevision == other.geometryRevision &&
+        lineageRevision == other.lineageRevision &&
+        semanticRevision == other.semanticRevision &&
+        coverageRevision == other.coverageRevision &&
+        styleRevision == other.styleRevision &&
+        residencyRevision == other.residencyRevision &&
+        targetRevision == other.targetRevision &&
+        reset == other.reset &&
+        targetSurfaceId == other.targetSurfaceId &&
+        targetDirectionIndex == other.targetDirectionIndex &&
+        surfaceIds.contentEquals(other.surfaceIds) &&
+        styleRows.contentEquals(other.styleRows)
 
     private fun ensureActive() {
         check(!disposed) { "VisibilityGridRendererState is disposed" }
