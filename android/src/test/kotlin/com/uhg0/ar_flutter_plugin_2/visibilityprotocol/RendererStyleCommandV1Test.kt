@@ -158,11 +158,17 @@ class RendererStyleCommandV1Test {
     @Test
     fun `partial cut expires before accepting a late continuation and can restart`() {
         var nowNanos = 0L
+        var expiryTask: (() -> Unit)? = null
         val staging = RendererStyleCommandStagingV1(
             bindingIdentity = ByteArray(16) { 7 },
             maximumRows = 2,
             clockNanos = { nowNanos },
             timeoutNanos = 10L,
+            scheduleExpiry = { delayMillis, task ->
+                assertEquals(1L, delayMillis)
+                expiryTask = task
+                TimeoutHandle { expiryTask = null }
+            },
         )
         val pages = twoPageCutPages()
 
@@ -172,6 +178,8 @@ class RendererStyleCommandV1Test {
         assertEquals(1, staging.stagedPageCount())
 
         nowNanos = 10L
+        checkNotNull(expiryTask).invoke()
+        assertEquals(0, staging.stagedCutCount())
         assertThrows(IllegalArgumentException::class.java) {
             staging.accept(pages.last())
         }

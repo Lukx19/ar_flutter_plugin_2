@@ -116,31 +116,37 @@ class VisibilityGridV2BindingTest {
                 residencyRevision = 1,
                 targetRevision = 1,
                 reset = true,
-                surfaceIds = longArrayOf(),
-                styleRows = byteArrayOf(),
+                surfaceIds = longArrayOf(1, 2),
+                styleRows = ByteArray(32),
+            )
+            val validPages = RendererStyleCommandV1.encodePages(cut, maxPageBytes = 200)
+            val stalePages = RendererStyleCommandV1.encodePages(
+                cut.copy(groupGeneration = cut.groupGeneration + 1),
+                maxPageBytes = 200,
             )
             val staleGroupResponse = exchange(
                 4,
                 1,
                 1,
                 1,
-                RendererStyleCommandV1.encodePages(
-                    cut.copy(groupGeneration = cut.groupGeneration + 1),
-                ).single(),
+                stalePages.first(),
                 1,
             )
             assertEquals(255, staleGroupResponse.messageKind)
-            assertEquals(6, staleGroupResponse.errorId)
+            assertEquals(34, staleGroupResponse.errorId)
             assertEquals(null, applied)
 
-            val response = exchange(
+            val progress = exchange(
                 4,
                 1,
                 1,
                 1,
-                RendererStyleCommandV1.encodePages(cut).single(),
+                validPages.first(),
                 1,
             )
+            assertEquals(0, progress.errorId)
+            assertEquals(0L, progress.acceptedStyleRevision)
+            val response = exchange(5, 1, 1, 1, validPages.last(), 1)
             assertEquals(
                 "error=${response.errorId} seq=${response.requestSequence} next=${response.nextExpectedRequestSequence}",
                 0,

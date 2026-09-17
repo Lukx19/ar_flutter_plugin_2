@@ -156,6 +156,7 @@ class VisibilityGridV2Binding internal constructor(
         onAbandonedContinuation = debugRecoverySeam::oldContinuationFenced,
         onStructuralTransactionAcknowledged = ::onStructuralTransactionAcknowledged,
         debugTransportProbe = issue98Probe,
+        admitRendererStylePage = ::admitRendererStylePage,
         onRendererStyleCut = ::applyRendererStyleCutCommand,
     )
 
@@ -426,6 +427,18 @@ class VisibilityGridV2Binding internal constructor(
             }
         }
         return RendererStyleCommandApplyResultV1(command.styleRevision)
+    }
+
+    /** Rejects stale inner qualifiers before they can reserve page staging. */
+    private fun admitRendererStylePage(page: RendererStyleCommandV1.Page): Boolean {
+        val ownership = currentObservationOwnership() ?: return false
+        val baseline = lifecycle.committedBaseline()
+        return page.bindingGeneration == ownership.bindingGeneration &&
+            page.groupGeneration == ownership.groupGeneration &&
+            page.captureGroupId.contentEquals(parseUuid(ownership.captureGroupId).bytes) &&
+            page.transactionId == baseline.transactionId &&
+            page.geometryRevision == baseline.geometryRevision &&
+            page.lineageRevision == baseline.lineageRevision
     }
 
     private fun onControlCall(call: MethodCall, result: MethodChannel.Result) {

@@ -98,6 +98,7 @@ class VisibilitySurfaceStreamChannel(
     initialNextExpectedSequence: Long = 1L,
     private val debugTransportProbe: DebugTransportProbe? = null,
     private val onStructuralTransactionAcknowledged: ((CommittedBaselineV1) -> Unit)? = null,
+    private val admitRendererStylePage: ((RendererStyleCommandV1.Page) -> Boolean)? = null,
     private val onRendererStyleCut: ((RendererStyleCutPayloadV1) -> RendererStyleCommandApplyResultV1)? = null,
 ) {
     init {
@@ -130,7 +131,10 @@ class VisibilitySurfaceStreamChannel(
     private val bindingAbandoned = AtomicBoolean(false)
     private val publicationFence = Any()
     private val transactionReceiver = StructuralTransactionReceiverV1()
-    private val rendererStyleStaging = RendererStyleCommandStagingV1(bindingQualifier ?: byteArrayOf())
+    private val rendererStyleStaging = RendererStyleCommandStagingV1(
+        bindingIdentity = bindingQualifier ?: byteArrayOf(),
+        scheduleExpiry = { delayMillis, task -> timeoutScheduler.schedule(delayMillis, task) },
+    )
     private val telemetry = TransportInstrumentation()
     private val structuralFrames = ArrayDeque<TransactionFrameV1>()
     private var structuralFrameCursor = 0
@@ -506,7 +510,8 @@ class VisibilitySurfaceStreamChannel(
                                                         throw BindingError(MALFORMED_PACKET_ERROR_ID)
                                                     }
                                                     RendererStyleCommandV1.decode(request.commandBytes).also { page ->
-                                                        if (request.nextStyleRevision != page.styleRevision ||
+                                                        if (admitRendererStylePage?.invoke(page) == false ||
+                                                            request.nextStyleRevision != page.styleRevision ||
                                                             !rendererStyleStaging.canAccept(
                                                                 page,
                                                                 committedBaseline.styleRevision,

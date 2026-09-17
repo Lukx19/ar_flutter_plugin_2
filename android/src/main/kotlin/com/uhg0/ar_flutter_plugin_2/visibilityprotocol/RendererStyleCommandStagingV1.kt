@@ -1,5 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.visibilityprotocol
 
+import java.util.concurrent.TimeUnit
+
 data class RendererStyleCommandApplyResultV1(val acceptedStyleRevision: Long) {
     init { require(acceptedStyleRevision >= 0) }
 }
@@ -16,6 +18,7 @@ class RendererStyleCommandStagingV1(
     private val maximumRows: Int = RendererStyleCommandV1.MAX_ROWS,
     private val clockNanos: () -> Long = System::nanoTime,
     private val timeoutNanos: Long = DEFAULT_TIMEOUT_NANOS,
+    private val scheduleExpiry: ((Long, () -> Unit) -> TimeoutHandle)? = null,
 ) {
     init {
         require(maximumRows in 1..RendererStyleCommandV1.MAX_ROWS)
@@ -24,6 +27,7 @@ class RendererStyleCommandStagingV1(
 
     private val bindingKey = bindingIdentity.copyOf().asList()
     private val stages = linkedMapOf<Key, Stage>()
+    private var expiryHandle: TimeoutHandle? = null
 
     sealed interface Result {
         data class Progress(val key: Key, val nextPageIndex: Int, val stagedRows: Int) : Result
@@ -38,6 +42,7 @@ class RendererStyleCommandStagingV1(
         val styleRevision: Long,
     )
 
+    @Synchronized
     fun accept(page: RendererStyleCommandV1.Page): Result {
         val nowNanos = clockNanos()
         expire(nowNanos)
@@ -52,7 +57,10 @@ class RendererStyleCommandStagingV1(
         )
         val stage = if (page.pageIndex == 0) {
             require(stages.isEmpty()) { "Renderer-style binding already has an active cut" }
-            Stage.from(page, maximumRows, key, nowNanos).also { stages[key] = it }
+            Stage.from(page, maximumRows, key, nowNanos).also {
+                stages[key] = it
+                scheduleTimeout()
+            }
         } else {
             require(page.pageIndex > 0) { "Renderer-style page index is invalid" }
             stages[key] ?: throw IllegalArgumentException("Renderer-style page has no active staging")
@@ -64,30 +72,40 @@ class RendererStyleCommandStagingV1(
             }
             val cut = stage.finish()
             stages.remove(key)
+            cancelTimeout()
             return Result.Complete(key, cut)
         } catch (error: Exception) {
             stages.remove(key)
+            if (stages.isEmpty()) cancelTimeout()
             throw error
         }
     }
 
+    @Synchronized
     fun clear() {
         stages.clear()
+        cancelTimeout()
     }
 
+    @Synchronized
     fun clear(groupGeneration: Long, styleRevision: Long) {
         stages.keys.removeIf { it.groupGeneration == groupGeneration && it.styleRevision == styleRevision }
+        if (stages.isEmpty()) cancelTimeout()
     }
 
+    @Synchronized
     fun stagedCutCount(): Int = stages.size
 
     /** Retained row capacity, including rows reserved for pages not received yet. */
+    @Synchronized
     fun stagedRowCapacity(): Int = stages.values.sumOf(Stage::totalRows)
 
     /** Number of authenticated pages currently retained across incomplete cuts. */
+    @Synchronized
     fun stagedPageCount(): Int = stages.values.sumOf(Stage::nextPageIndex)
 
     /** Admission check that does not mutate or retain the page. */
+    @Synchronized
     fun canAccept(page: RendererStyleCommandV1.Page, committedStyleRevision: Long): Boolean {
         expire(clockNanos())
         val key = Key(
@@ -107,9 +125,25 @@ class RendererStyleCommandStagingV1(
     }
 
     private fun expire(nowNanos: Long) {
-        stages.entries.removeIf { (_, stage) ->
+        val removed = stages.entries.removeIf { (_, stage) ->
             nowNanos - stage.startedAtNanos >= timeoutNanos
         }
+        if (removed && stages.isEmpty()) cancelTimeout()
+    }
+
+    private fun scheduleTimeout() {
+        cancelTimeout()
+        val delayMillis = TimeUnit.NANOSECONDS.toMillis(timeoutNanos - 1L) + 1L
+        expiryHandle = scheduleExpiry?.invoke(delayMillis) {
+            synchronized(this) {
+                expire(clockNanos())
+            }
+        }
+    }
+
+    private fun cancelTimeout() {
+        expiryHandle?.cancel()
+        expiryHandle = null
     }
 
     private class Stage private constructor(
