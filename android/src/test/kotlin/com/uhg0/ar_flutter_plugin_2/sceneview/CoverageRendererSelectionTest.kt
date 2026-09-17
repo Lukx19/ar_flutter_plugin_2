@@ -348,9 +348,12 @@ class CoverageRendererSelectionTest {
             positions = FloatArray(3),
             colors = IntArray(1),
         )
+        val selector = CoveragePresentationSelector(CoverageRendererLimits.CENTROID_CAPACITY)
+        selector.select(snapshot)
         ledger.installPersistentCoverageState(
             com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS,
             snapshot,
+            selectorStorageBytes = selector.ownedStorageBytes,
         )
         ledger.updateSnapshotHandoff(
             com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS,
@@ -360,8 +363,8 @@ class CoverageRendererSelectionTest {
             VisibilityGridRendererState.ownedStorageBytes(CoverageRendererLimits.CENTROID_CAPACITY) +
                 CoverageRendererLimits.presentationStorageBytes(
                     com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS,
-                    snapshot.capacity,
-                ) +
+                snapshot.capacity,
+            ) +
                 CoverageRendererLimits.AUXILIARY_BYTES +
                 CoverageRendererLimits.SNAPSHOT_ROW_BYTES,
             telemetry.snapshot().getValue("ownedBufferBytes"),

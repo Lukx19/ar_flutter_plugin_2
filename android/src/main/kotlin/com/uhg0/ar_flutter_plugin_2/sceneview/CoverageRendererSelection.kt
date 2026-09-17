@@ -71,10 +71,11 @@ internal object CoverageRendererLimits {
         mode: VoxelRenderMode,
         sourceCapacity: Int,
         retainedCount: Int,
+        selectorStorageBytes: Int? = null,
     ): Int =
         resourcePeakBytes(mode) +
             rendererStateBytes(mode) +
-            presentationStorageBytes(mode, sourceCapacity) +
+            (selectorStorageBytes ?: presentationStorageBytes(mode, sourceCapacity)) +
             AUXILIARY_BYTES +
             snapshotHandoffBytes(mode, retainedCount)
 
@@ -116,12 +117,14 @@ internal class CoverageRendererAllocationLedger(
         mode: VoxelRenderMode,
         sourceCapacity: Int = CoverageRendererLimits.presentationCapacity(mode),
         retainedCount: Int = CoverageRendererLimits.presentationCapacity(mode),
+        selectorStorageBytes: Int? = null,
     ): CoverageRendererResourceAdmission {
         val currentBytes = telemetry.ownedBufferBytesSnapshot()
         val candidateBytes = CoverageRendererLimits.activeRendererPeakBytes(
             mode,
             sourceCapacity,
             retainedCount,
+            selectorStorageBytes,
         )
         val combinedBytes = currentBytes + candidateBytes
         return CoverageRendererResourceAdmission(
@@ -146,6 +149,7 @@ internal class CoverageRendererAllocationLedger(
     fun installPersistentCoverageState(
         mode: VoxelRenderMode,
         snapshot: CoveragePointRenderSnapshot?,
+        selectorStorageBytes: Int? = null,
     ) {
         if (snapshot == null) {
             telemetry.removeOwner(RENDERER_STATE_OWNER)
@@ -156,6 +160,7 @@ internal class CoverageRendererAllocationLedger(
         installPersistentCoverageStateForCapacity(
             presentationCapacity = CoverageRendererLimits.presentationCapacity(mode),
             sourceCapacity = snapshot.capacity,
+            selectorStorageBytes = selectorStorageBytes,
         )
     }
 
@@ -171,11 +176,13 @@ internal class CoverageRendererAllocationLedger(
     fun installPersistentCoverageStateForCapacity(
         presentationCapacity: Int,
         sourceCapacity: Int = presentationCapacity,
+        selectorStorageBytes: Int? = null,
     ) {
         chargePersistentCoverageState(
             VisibilityGridRendererState.ownedStorageBytes(presentationCapacity),
             presentationCapacity,
             sourceCapacity,
+            selectorStorageBytes,
         )
     }
 
@@ -183,6 +190,7 @@ internal class CoverageRendererAllocationLedger(
         rendererStateBytes: Int,
         presentationCapacity: Int,
         sourceCapacity: Int?,
+        selectorStorageBytes: Int? = null,
     ) {
         telemetry.setOwnedBufferBytes(
             RENDERER_STATE_OWNER,
@@ -197,7 +205,7 @@ internal class CoverageRendererAllocationLedger(
         } else {
             telemetry.setOwnedBufferBytes(
                 PRESENTATION_STORAGE_OWNER,
-                CoveragePresentationStorage.estimatedOwnedStorageBytes(
+                selectorStorageBytes ?: CoveragePresentationStorage.estimatedOwnedStorageBytes(
                     presentationCapacity,
                     sourceCapacity,
                 ),
@@ -339,6 +347,16 @@ internal class CoveragePresentationSelector(
 
     val ownedStorageBytes: Int
         get() = storage.ownedStorageBytes
+
+    /** Exact post-selection storage, including this selector's source high-water. */
+    fun ownedStorageBytesFor(requestedCapacity: Int, sourceCapacity: Int): Int {
+        require(requestedCapacity in 1..maximumCapacity)
+        require(sourceCapacity >= 0)
+        return CoveragePresentationStorage.estimatedOwnedStorageBytes(
+            requestedCapacity,
+            maxOf(storage.sourceCapacity, sourceCapacity),
+        )
+    }
 
     fun select(
         snapshot: CoveragePointRenderSnapshot,

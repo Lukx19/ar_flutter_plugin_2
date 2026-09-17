@@ -263,7 +263,9 @@ class CoverageRendererOwnerTest {
             positions = FloatArray(count * 3),
             colors = IntArray(count),
         )
-        val owner = NativeCoverageRendererOwner()
+        val owner = NativeCoverageRendererOwner(
+            sourceProvider = { renderSnapshot },
+        )
         owner.install(
             VisibilityRendererSnapshot(
                 bindingGeneration = 1L,
@@ -308,6 +310,72 @@ class CoverageRendererOwnerTest {
             LongArray(CoverageRendererLimits.CUBE_CAPACITY) { it.toLong() }.toList(),
             owner.presentationSnapshot()!!.keys.toList(),
         )
+    }
+
+    @Test
+    fun `mode transition uses source provider to restore the full centroid cut`() {
+        val source = generatedSnapshot(
+            count = CoverageRendererLimits.CENTROID_CAPACITY,
+            geometryRevision = 1L,
+        )
+        val canonicalSource = checkNotNull(source.renderSnapshot)
+        val owner = NativeCoverageRendererOwner(
+            sourceProvider = { canonicalSource },
+        )
+        owner.install(source)
+
+        owner.setControls(
+            CoverageRendererControls(
+                visible = true,
+                mode = CoveragePresentationMode.SEMANTIC_CUBES,
+                palette = CoverageRendererPalette.COVERAGE,
+            ),
+        )
+        assertEquals(CoverageRendererLimits.CUBE_CAPACITY, owner.status().selectedRowCount)
+
+        owner.setControls(
+            CoverageRendererControls(
+                visible = true,
+                mode = CoveragePresentationMode.SEMANTIC_CENTROIDS,
+                palette = CoverageRendererPalette.COVERAGE,
+            ),
+        )
+        assertEquals(CoverageRendererLimits.CENTROID_CAPACITY, owner.status().selectedRowCount)
+        assertEquals(CoverageRendererLimits.CENTROID_CAPACITY, owner.presentationSnapshot()!!.count)
+        assertEquals(CoverageRendererLimits.CENTROID_CAPACITY, owner.sourceCapacity())
+    }
+
+    @Test
+    fun `mode transition source failure preserves controls plan and recovery state`() {
+        val source = generatedSnapshot(count = 4, geometryRevision = 1L)
+        var canonicalSource: CoveragePointRenderSnapshot? = source.renderSnapshot
+        val owner = NativeCoverageRendererOwner(
+            sourceProvider = { canonicalSource },
+        )
+        owner.install(source)
+        owner.setControls(
+            CoverageRendererControls(
+                visible = true,
+                mode = CoveragePresentationMode.SEMANTIC_CUBES,
+                palette = CoverageRendererPalette.COVERAGE,
+            ),
+        )
+        val priorPlan = checkNotNull(owner.presentationSnapshot())
+        val priorStatus = owner.status()
+        canonicalSource = null
+
+        val rejected = owner.setControls(
+            CoverageRendererControls(
+                visible = true,
+                mode = CoveragePresentationMode.SEMANTIC_CENTROIDS,
+                palette = CoverageRendererPalette.COVERAGE,
+            ),
+        )
+
+        assertFalse(rejected.accepted)
+        assertEquals(CoveragePresentationMode.SEMANTIC_CUBES, owner.status().mode)
+        assertEquals(priorStatus.rendererUnavailable, owner.status().rendererUnavailable)
+        assertArrayEquals(priorPlan.keys, owner.presentationSnapshot()!!.keys)
     }
 
     @Test

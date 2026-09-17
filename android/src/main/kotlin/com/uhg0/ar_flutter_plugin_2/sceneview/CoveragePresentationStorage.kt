@@ -83,6 +83,9 @@ internal class CoveragePresentationStorage(
             return estimatedOwnedStorageBytes(capacity, sourceSlotToDestination.size)
         }
 
+    val sourceCapacity: Int
+        get() = sourceSlotToDestination.size
+
     companion object {
         fun estimatedOwnedStorageBytes(
             capacity: Int,

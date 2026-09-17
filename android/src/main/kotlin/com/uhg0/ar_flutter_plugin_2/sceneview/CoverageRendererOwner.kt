@@ -231,6 +231,48 @@ internal class VisibilityRendererSnapshot(
     }
 }
 
+/**
+ * Lightweight owner metadata for the accepted semantic cut. The complete
+ * source arrays and row list are consumed during [NativeCoverageRendererOwner.install]
+ * and are never retained by the owner after that call returns.
+ */
+internal data class CoverageRendererCutMetadata(
+    val bindingGeneration: Long,
+    val groupGeneration: Long,
+    val rendererGeneration: Long,
+    val transactionId: Long,
+    val geometryRevision: Long,
+    val styleRevision: Long,
+    val rowCount: Int,
+    val sourceCapacity: Int,
+    val sourceCount: Int,
+    val targetSurfaceId: Long?,
+    val targetDirectionIndex: Int?,
+) {
+    init {
+        require(rowCount >= 0)
+        require(sourceCapacity >= 0)
+        require(sourceCount in 0..sourceCapacity)
+    }
+}
+
+private fun VisibilityRendererSnapshot.toCutMetadata(): CoverageRendererCutMetadata {
+    val source = renderSnapshot
+    return CoverageRendererCutMetadata(
+        bindingGeneration = bindingGeneration,
+        groupGeneration = groupGeneration,
+        rendererGeneration = rendererGeneration,
+        transactionId = transactionId,
+        geometryRevision = geometryRevision,
+        styleRevision = styleRevision,
+        rowCount = rowCount,
+        sourceCapacity = source?.capacity ?: rowCount,
+        sourceCount = source?.count ?: rowCount,
+        targetSurfaceId = targetSurfaceId,
+        targetDirectionIndex = targetDirectionIndex,
+    )
+}
+
 internal data class RendererInstallReceipt(
     val installed: Boolean,
     val rendererUnavailable: Boolean,
@@ -341,8 +383,9 @@ internal class NativeCoverageRendererOwner(
     private val onResourceLifecycleChanged: (CoverageResourceToken, Boolean) -> Unit = { _, _ -> },
     private val worldToScreen: CoverageWorldToScreenProjection =
         CoverageWorldToScreenProjection { x, y, _ -> CoverageScreenPoint(x, y, 1f) },
+    private val sourceProvider: (() -> CoveragePointRenderSnapshot?)? = null,
 ) : CoverageRendererOwner {
-    private var latest: VisibilityRendererSnapshot? = null
+    private var latest: CoverageRendererCutMetadata? = null
     private var controls = CoverageRendererControls(
         visible = true,
         mode = CoveragePresentationMode.SEMANTIC_CENTROIDS,
@@ -435,7 +478,7 @@ internal class NativeCoverageRendererOwner(
             return RendererInstallReceipt(
                 installed = false,
                 rendererUnavailable = unavailable,
-                rowCount = current?.let { selectedRows(it).size } ?: 0,
+                rowCount = current?.let { selectedRows().size } ?: 0,
                 bindingGeneration = current?.bindingGeneration ?: snapshot.bindingGeneration,
                 groupGeneration = current?.groupGeneration ?: snapshot.groupGeneration,
                 rendererGeneration = current?.rendererGeneration ?: snapshot.rendererGeneration,
@@ -445,15 +488,20 @@ internal class NativeCoverageRendererOwner(
             )
         }
         val replayed = priorQualifier == qualifier
-        latest = snapshot
+        latest = snapshot.toCutMetadata()
         lastAcceptedQualifier = qualifier
-        val explicitResync = snapshot.renderSnapshot?.update?.let { it.reset } ?: true
-        recomputePresentationPlan(explicitResync = explicitResync)
+        val source = snapshot.renderSnapshot
+        val explicitResync = source?.update?.let { it.reset } ?: true
+        recomputePresentationPlan(
+            sourceOverride = source,
+            rowsOverride = snapshot.rows,
+            explicitResync = explicitResync,
+        )
         val mounted = !unavailable && resourceMounted
         return RendererInstallReceipt(
             installed = mounted,
             rendererUnavailable = unavailable,
-            rowCount = selectedRows(snapshot).size,
+            rowCount = selectedRows().size,
             bindingGeneration = snapshot.bindingGeneration,
             groupGeneration = snapshot.groupGeneration,
             rendererGeneration = snapshot.rendererGeneration,
@@ -476,6 +524,24 @@ internal class NativeCoverageRendererOwner(
                 rendererGeneration = 0L,
             )
         }
+        val modeChanged = this.controls.mode != controls.mode
+        val modeSource = if (modeChanged) {
+            sourceProvider?.let { provider -> runCatching { provider() }.getOrNull() }
+        } else {
+            null
+        }
+        if (modeChanged && sourceProvider != null && modeSource == null) {
+            val current = latest
+            return RendererControlReceipt(
+                accepted = false,
+                rendererUnavailable = unavailable,
+                visible = this.controls.visible,
+                mode = this.controls.mode,
+                palette = this.controls.palette,
+                rowCount = current?.let { selectedRows().size } ?: 0,
+                rendererGeneration = current?.rendererGeneration ?: 0L,
+            )
+        }
         if (!onControlsChanged(controls)) {
             val current = latest
             return RendererControlReceipt(
@@ -484,21 +550,24 @@ internal class NativeCoverageRendererOwner(
                 visible = this.controls.visible,
                 mode = this.controls.mode,
                 palette = this.controls.palette,
-                rowCount = current?.let { selectedRows(it).size } ?: 0,
+                rowCount = current?.let { selectedRows().size } ?: 0,
                 rendererGeneration = current?.rendererGeneration ?: 0L,
             )
         }
         val paletteOnlyChange = this.controls.visible == controls.visible &&
             this.controls.mode == controls.mode &&
             this.controls.palette != controls.palette
-        val modeChanged = this.controls.mode != controls.mode
         if (this.controls.palette != controls.palette) {
             paletteRevision++
         }
         this.controls = controls
         if (modeChanged) resourceToken = null
         controlsConfigured = true
-        recomputePresentationPlan(fullPaletteRecolor = paletteOnlyChange)
+        recomputePresentationPlan(
+            sourceOverride = modeSource,
+            explicitResync = modeChanged,
+            fullPaletteRecolor = paletteOnlyChange,
+        )
         notifyPresentationChanged()
         val snapshot = latest
         return RendererControlReceipt(
@@ -507,7 +576,7 @@ internal class NativeCoverageRendererOwner(
             visible = controls.visible,
             mode = controls.mode,
             palette = controls.palette,
-            rowCount = snapshot?.let { selectedRows(it).size } ?: 0,
+            rowCount = snapshot?.let { selectedRows().size } ?: 0,
             rendererGeneration = snapshot?.rendererGeneration ?: 0L,
         )
     }
@@ -542,7 +611,7 @@ internal class NativeCoverageRendererOwner(
         if (unavailable || !controls.visible || controls.mode == CoveragePresentationMode.SUPPRESSED_DEBUG) {
             return CoverageHitReceipt.Miss
         }
-        val row = selectedRows(snapshot)
+        val row = selectedRows()
             .asSequence()
             .mapNotNull { row ->
                 val projected = worldToScreen.project(row.x, row.y, row.z) ?: return@mapNotNull null
@@ -593,7 +662,7 @@ internal class NativeCoverageRendererOwner(
                 recovered = false,
                 rendererUnavailable = unavailable,
                 rehydrated = false,
-                rowCount = current?.let { selectedRows(it).size } ?: 0,
+                rowCount = current?.let { selectedRows().size } ?: 0,
                 rendererGeneration = current?.rendererGeneration ?: 0L,
                 geometryRevision = current?.geometryRevision ?: 0L,
                 styleRevision = current?.styleRevision ?: 0L,
@@ -611,7 +680,7 @@ internal class NativeCoverageRendererOwner(
             recovered = current != null,
             rendererUnavailable = unavailable,
             rehydrated = resourceMounted && current != null,
-            rowCount = current?.let { selectedRows(it).size } ?: 0,
+            rowCount = current?.let { selectedRows().size } ?: 0,
             rendererGeneration = current?.rendererGeneration ?: 0L,
             geometryRevision = current?.geometryRevision ?: 0L,
             styleRevision = current?.styleRevision ?: 0L,
@@ -746,7 +815,7 @@ internal class NativeCoverageRendererOwner(
     fun controlsConfigured(): Boolean = controlsConfigured
 
     @Synchronized
-    fun snapshot(): VisibilityRendererSnapshot? = latest
+    fun snapshot(): CoverageRendererCutMetadata? = latest
 
     @Synchronized
     fun presentationSnapshot(): CoveragePointRenderSnapshot? {
@@ -759,10 +828,28 @@ internal class NativeCoverageRendererOwner(
      * those are read from the incoming cut and the single bounded plan.
      */
     @Synchronized
-    fun sourceCapacity(): Int? = latest?.renderSnapshot?.capacity
+    fun sourceCapacity(): Int? = latest?.sourceCapacity
 
     @Synchronized
-    fun sourceRowCount(): Int? = latest?.renderSnapshot?.count
+    fun sourceRowCount(): Int? = latest?.sourceCount
+
+    /** Exact selector charge for the currently retained presentation cut. */
+    @Synchronized
+    fun presentationStorageBytes(): Int? =
+        presentationPlan?.renderSnapshot?.let { presentationSelector.ownedStorageBytes }
+
+    /** Exact selector charge expected after a mode cut, including source high-water. */
+    @Synchronized
+    fun presentationStorageBytesFor(mode: CoveragePresentationMode): Int? {
+        val current = latest ?: return null
+        val providerCapacity = sourceProvider?.let { provider ->
+            runCatching { provider()?.capacity ?: 0 }.getOrDefault(0)
+        } ?: 0
+        return presentationSelector.ownedStorageBytesFor(
+            requestedCapacity = mode.presentationCapacity,
+            sourceCapacity = maxOf(current.sourceCapacity, providerCapacity),
+        )
+    }
 
     @Synchronized
     fun presentationPlan(): CoveragePresentationPlan? = presentationPlan
@@ -790,7 +877,7 @@ internal class NativeCoverageRendererOwner(
             mode = controls.mode,
             palette = controls.palette,
             rowCount = current?.rowCount ?: 0,
-            selectedRowCount = current?.let { selectedRows(it).size } ?: 0,
+            selectedRowCount = current?.let { selectedRows().size } ?: 0,
             rendererGeneration = current?.rendererGeneration ?: 0L,
             geometryRevision = current?.geometryRevision ?: 0L,
             styleRevision = current?.styleRevision ?: 0L,
@@ -802,11 +889,7 @@ internal class NativeCoverageRendererOwner(
         )
     }
 
-    private fun selectedRows(snapshot: VisibilityRendererSnapshot): List<VisibilityRendererRow> {
-        return presentationPlan?.rows ?: snapshot.rows
-            .sortedWith(::compareCoverageRows)
-            .take(controls.mode.presentationCapacity)
-    }
+    private fun selectedRows(): List<VisibilityRendererRow> = presentationPlan?.rows.orEmpty()
 
     private fun notifyPresentationChanged() {
         if (unavailable || disposed) return
@@ -814,6 +897,8 @@ internal class NativeCoverageRendererOwner(
     }
 
     private fun recomputePresentationPlan(
+        sourceOverride: CoveragePointRenderSnapshot? = null,
+        rowsOverride: List<VisibilityRendererRow>? = null,
         explicitResync: Boolean = false,
         fullPaletteRecolor: Boolean = false,
     ) {
@@ -833,13 +918,16 @@ internal class NativeCoverageRendererOwner(
             presentationSelector.reset()
             selectorEpoch = epoch
         }
-        val rows = current.rows
+        val source = sourceOverride ?:
+            sourceProvider?.let { provider -> runCatching { provider() }.getOrNull() } ?:
+            presentationPlan?.renderSnapshot
+        val rows = (rowsOverride ?: source?.toVisibilityRows() ?: presentationPlan?.rows.orEmpty())
             .sortedWith(::compareCoverageRows)
             .map { row -> row.copy(style = row.style.copy(palette = controls.palette)) }
-        val selectedSnapshot = current.renderSnapshot?.let { source ->
+        val selectedSnapshot = source?.let { sourceSnapshot ->
             presentationSelector
                 .select(
-                    source,
+                    sourceSnapshot,
                     controls.mode.presentationCapacity,
                     forceReset = selectorReset,
                 )
@@ -889,6 +977,31 @@ internal class NativeCoverageRendererOwner(
         presentationSelector.reset()
         selectorEpoch = null
     }
+
+    private fun CoveragePointRenderSnapshot.toVisibilityRows(): List<VisibilityRendererRow> =
+        (0 until count).map { index ->
+            val style = if (styleRows.isEmpty()) {
+                CoverageRendererStyleRowV1()
+            } else {
+                CoverageRendererStyleRowV1.decode(
+                    styleRows,
+                    index * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                )
+            }
+            val offset = index * 3
+            VisibilityRendererRow(
+                surfaceId = surfaceIds[index],
+                x = positions[offset],
+                y = positions[offset + 1],
+                z = positions[offset + 2],
+                semanticLabel = style.semantic,
+                coverageLabel = style.coverage,
+                targetDirectionIndex = style.directionBin.takeUnless {
+                    it == COVERAGE_RENDERER_NO_DIRECTION
+                },
+                style = style,
+            )
+        }
 
     private fun createResourceToken(
         sourceRendererGeneration: Long,

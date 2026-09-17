@@ -124,6 +124,8 @@ internal class SceneViewHost(
     private val coverageRenderConfig = mutableStateOf<PointCloudNativeConfig?>(null)
     private val coverageSnapshotRef = AtomicReference<CoveragePointRenderSnapshot?>()
     private val rawPointSnapshotRef = AtomicReference<CoveragePointRenderSnapshot?>()
+    /** Canonical upstream source used transiently for larger mode cuts. */
+    private val coverageSourceRef = AtomicReference<CoveragePointRenderSnapshot?>()
     private val coverageMeshRef = AtomicReference<CoveragePointMeshBinding?>()
     /** Owner lifetime key; source renderer generations remain upstream-owned. */
     private val coverageResourceEpoch = mutableStateOf(0L)
@@ -152,6 +154,9 @@ internal class SceneViewHost(
                     ?: CoverageRendererLimits.presentationCapacity(mode),
                 retainedCount = coverageRendererOwner.sourceRowCount()
                     ?: CoverageRendererLimits.presentationCapacity(mode),
+                selectorStorageBytes = coverageRendererOwner.presentationStorageBytesFor(
+                    mode.toDefaultCoveragePresentationMode(),
+                ),
             )
         },
         onClearFirst = { transition ->
@@ -164,6 +169,7 @@ internal class SceneViewHost(
             rendererAllocationLedger.installPersistentCoverageState(
                 transition.mode,
                 coverageRendererOwner.presentationSnapshot(),
+                selectorStorageBytes = coverageRendererOwner.presentationStorageBytes(),
             )
             rendererAllocationLedger.updateSnapshotHandoff(
                 transition.mode,
@@ -223,6 +229,7 @@ internal class SceneViewHost(
                 if (!mounted) rendererTelemetry.clearResidentPresentation(token)
             },
             worldToScreen = CoverageWorldToScreenProjection(::projectCoveragePoint),
+            sourceProvider = { coverageSourceRef.get() },
         )
 
     private fun projectCoveragePoint(x: Float, y: Float, z: Float): CoverageScreenPoint? {
@@ -706,6 +713,7 @@ internal class SceneViewHost(
     ) {
         if (snapshot == null || config == null) {
             coverageRendererOwner.clearLatest()
+            coverageSourceRef.set(null)
             coverageSnapshotRef.set(null)
             coverageMeshRef.get()?.disposeForReplacement()
             coverageResourceFactory.clear()
@@ -742,10 +750,14 @@ internal class SceneViewHost(
         val effectiveConfig = requestedConfig
         val requiresReplacement = current == null || visualChange ||
             current.rendererGeneration != effectiveConfig.rendererGeneration
+        val previousSource = coverageSourceRef.getAndSet(snapshot)
         val install = coverageRendererOwner.install(
             snapshot.toVisibilityRendererSnapshot(effectiveConfig),
         )
-        if (install.stale) return
+        if (install.stale) {
+            coverageSourceRef.compareAndSet(snapshot, previousSource)
+            return
+        }
         if (!coverageRendererOwner.controlsConfigured()) {
             val controlReceipt = coverageRendererOwner.setControls(controls)
             if (!controlReceipt.accepted && !controlReceipt.rendererUnavailable) return
@@ -758,6 +770,9 @@ internal class SceneViewHost(
                     ?: CoverageRendererLimits.presentationCapacity(effectiveConfig.voxelRenderMode),
                 retainedCount = coverageRendererOwner.sourceRowCount()
                     ?: CoverageRendererLimits.presentationCapacity(effectiveConfig.voxelRenderMode),
+                selectorStorageBytes = coverageRendererOwner.presentationStorageBytesFor(
+                    effectiveConfig.voxelRenderMode.toDefaultCoveragePresentationMode(),
+                ),
             )
             if (current != null &&
                 admission.strategy == CoverageRendererTransitionStrategy.CLEAR_FIRST
@@ -797,6 +812,9 @@ internal class SceneViewHost(
                         ?: CoverageRendererLimits.presentationCapacity(nextMode),
                     retainedCount = coverageRendererOwner.sourceRowCount()
                         ?: CoverageRendererLimits.presentationCapacity(nextMode),
+                    selectorStorageBytes = coverageRendererOwner.presentationStorageBytesFor(
+                        controls.mode,
+                    ),
                 )
                 if (admission.strategy == CoverageRendererTransitionStrategy.CLEAR_FIRST) {
                     coverageRendererOwner.currentResourceToken()?.let {
@@ -942,6 +960,7 @@ internal class SceneViewHost(
         disposed = true
         coverageRendererOwner.dispose()
         rendererTelemetry.clearResidentPresentation()
+        coverageSourceRef.set(null)
         futureResumesBlocked = true
         cancelCoverageUploadFrame()
         composeView.removeCallbacks(replaySettledTextureResize)
