@@ -518,16 +518,9 @@ internal fun CoveragePointRenderSnapshot.rewritePaletteBuffers(
     palette: CoverageRendererPalette,
     fullSpanOnPaletteChange: Boolean = false,
 ): CoveragePointRenderSnapshot {
-    val styledRows = styleRows.copyOf()
-    val styledColors = colors.copyOf()
-    if (styleRows.isNotEmpty()) {
-        repeat(count) { index ->
-            val offset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
-            val style = CoverageRendererStyleRowV1.decode(styleRows, offset).copy(palette = palette)
-            style.encode().copyInto(styledRows, offset)
-            styledColors[index] = style.packedColor()
-        }
-    }
+    val recolored = recolorStyleBuffers(styleRows, colors, palette)
+    val styledRows = recolored.styleRows
+    val styledColors = recolored.colors
     val styledSpans = update?.let { sourceUpdate ->
         if (fullSpanOnPaletteChange) {
             if (count == 0) {
@@ -544,17 +537,11 @@ internal fun CoveragePointRenderSnapshot.rewritePaletteBuffers(
             }
         } else {
             sourceUpdate.spans.map { span ->
-                val spanColors = span.colors.copyOf()
-                val spanStyles = span.styleRows.copyOf()
-                if (spanStyles.isNotEmpty()) {
-                    repeat(spanColors.size) { index ->
-                        val offset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
-                        val style = CoverageRendererStyleRowV1.decode(spanStyles, offset).copy(palette = palette)
-                        style.encode().copyInto(spanStyles, offset)
-                        spanColors[index] = style.packedColor()
-                    }
-                }
-                span.copy(colors = spanColors, styleRows = spanStyles)
+                val spanRecolored = recolorStyleBuffers(span.styleRows, span.colors, palette)
+                span.copy(
+                    colors = spanRecolored.colors,
+                    styleRows = spanRecolored.styleRows,
+                )
             }
         }
     }
@@ -563,6 +550,30 @@ internal fun CoveragePointRenderSnapshot.rewritePaletteBuffers(
         styleRows = styledRows,
         update = update?.copy(spans = styledSpans.orEmpty()),
     )
+}
+
+private data class RecoloredStyleBuffers(
+    val styleRows: ByteArray,
+    val colors: IntArray,
+)
+
+/** Recolors one immutable style/color buffer pair without mutating its owner. */
+private fun recolorStyleBuffers(
+    styleRows: ByteArray,
+    colors: IntArray,
+    palette: CoverageRendererPalette,
+): RecoloredStyleBuffers {
+    val recoloredRows = styleRows.copyOf()
+    val recoloredColors = colors.copyOf()
+    if (recoloredRows.isEmpty()) return RecoloredStyleBuffers(recoloredRows, recoloredColors)
+    require(recoloredRows.size == recoloredColors.size * COVERAGE_RENDERER_STYLE_ROW_BYTES)
+    repeat(recoloredColors.size) { index ->
+        val offset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
+        val style = CoverageRendererStyleRowV1.decode(recoloredRows, offset).copy(palette = palette)
+        style.encode().copyInto(recoloredRows, offset)
+        recoloredColors[index] = style.packedColor()
+    }
+    return RecoloredStyleBuffers(recoloredRows, recoloredColors)
 }
 
 /** Compound mesh upload identity; palette recolors must not be deduplicated. */

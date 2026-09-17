@@ -4,10 +4,116 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
 
 class PointCloudModelsTest {
+    @Test
+    fun `palette rewrite centralizes top-level and populated span buffers`() {
+        val first = CoverageRendererStyleRowV1(
+            coverage = CoverageRendererCoverage.UNCOVERED,
+            palette = CoverageRendererPalette.COVERAGE,
+        )
+        val second = CoverageRendererStyleRowV1(
+            coverage = CoverageRendererCoverage.COMPLETE,
+            palette = CoverageRendererPalette.COVERAGE,
+        )
+        val firstBytes = first.encode()
+        val secondBytes = second.encode()
+        val source = CoveragePointRenderSnapshot(
+            revision = 1L,
+            enabled = true,
+            capacity = 2,
+            count = 2,
+            keys = longArrayOf(1L, 2L),
+            positions = FloatArray(6),
+            colors = intArrayOf(first.packedColor(), second.packedColor()),
+            styleRows = firstBytes + secondBytes,
+            update = CoveragePointRenderUpdate(
+                geometryRevision = 1L,
+                visibilityRevision = 1L,
+                enabled = true,
+                count = 2,
+                spans = listOf(
+                    CoveragePointSpan(
+                        startSlot = 1,
+                        positions = FloatArray(3),
+                        colors = intArrayOf(second.packedColor()),
+                        styleRows = secondBytes,
+                    ),
+                ),
+                reset = false,
+            ),
+        )
+
+        val recolored = source.rewritePaletteBuffers(CoverageRendererPalette.NORMAL)
+
+        assertEquals(
+            CoverageRendererPalette.COVERAGE,
+            CoverageRendererStyleRowV1.decode(source.styleRows).palette,
+        )
+        assertEquals(
+            CoverageRendererPalette.NORMAL,
+            CoverageRendererStyleRowV1.decode(recolored.styleRows).palette,
+        )
+        assertEquals(
+            CoverageRendererStyleRowV1(coverage = CoverageRendererCoverage.UNCOVERED, palette = CoverageRendererPalette.NORMAL)
+                .packedColor(),
+            recolored.colors[0],
+        )
+        val span = recolored.update!!.spans.single()
+        assertEquals(
+            CoverageRendererPalette.NORMAL,
+            CoverageRendererStyleRowV1.decode(span.styleRows).palette,
+        )
+        assertEquals(
+            CoverageRendererStyleRowV1(coverage = CoverageRendererCoverage.COMPLETE, palette = CoverageRendererPalette.NORMAL)
+                .packedColor(),
+            span.colors[0],
+        )
+        assertNotSame(source.styleRows, recolored.styleRows)
+        assertNotSame(source.update!!.spans.single().styleRows, span.styleRows)
+    }
+
+    @Test
+    fun `palette rewrite preserves range-only spans`() {
+        val source = CoveragePointRenderSnapshot(
+            revision = 1L,
+            enabled = true,
+            capacity = 1,
+            count = 1,
+            keys = longArrayOf(1L),
+            positions = FloatArray(3),
+            colors = intArrayOf(0xff00ff00.toInt()),
+            styleRows = CoverageRendererStyleRowV1().encode(),
+            update = CoveragePointRenderUpdate(
+                geometryRevision = 1L,
+                visibilityRevision = 1L,
+                enabled = true,
+                count = 1,
+                spans = listOf(
+                    CoveragePointSpan(
+                        startSlot = 0,
+                        positions = FloatArray(0),
+                        colors = IntArray(0),
+                        endSlotExclusive = 1,
+                    ),
+                ),
+                reset = false,
+            ),
+        )
+
+        val recolored = source.rewritePaletteBuffers(CoverageRendererPalette.NORMAL)
+        val recoloredUpdate = checkNotNull(recolored.update)
+        val span = recoloredUpdate.spans.single()
+        assertTrue(span.positions.isEmpty())
+        assertTrue(span.colors.isEmpty())
+        assertTrue(span.styleRows.isEmpty())
+        assertFalse(recoloredUpdate.reset)
+    }
+
     @Test
     fun `config validates protocol and resource bounds`() {
         assertFails { PointCloudNativeConfig(wireVersion = "v2") }
