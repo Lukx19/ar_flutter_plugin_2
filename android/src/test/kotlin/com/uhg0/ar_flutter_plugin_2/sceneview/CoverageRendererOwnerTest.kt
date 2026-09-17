@@ -9,6 +9,10 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererTarget
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageCommittedRowsBorrower
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageCommittedRows
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageCommittedRow
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRowsQualifier
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -18,6 +22,57 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CoverageRendererOwnerTest {
+    private fun borrowerFor(
+        source: () -> CoveragePointRenderSnapshot?,
+        qualifier: CoverageRowsQualifier,
+    ) = CoverageCommittedRowsBorrower { expected, block ->
+        if (expected != qualifier) return@CoverageCommittedRowsBorrower false
+        val snapshot = runCatching { source() }.getOrNull() ?:
+            return@CoverageCommittedRowsBorrower false
+        block(object : CoverageCommittedRows {
+            override val count: Int = snapshot.count
+            override val capacity: Int = snapshot.capacity
+            override val qualifier: CoverageRowsQualifier = qualifier
+
+            override fun rowAt(index: Int): CoverageCommittedRow {
+                val offset = index * 3
+                val style = if (snapshot.styleRows.isEmpty()) {
+                    CoverageRendererStyleRowV1()
+                } else {
+                    CoverageRendererStyleRowV1.decode(
+                        snapshot.styleRows,
+                        index * com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                    )
+                }
+                return CoverageCommittedRow(
+                    surfaceId = snapshot.surfaceIds[index],
+                    key = snapshot.keys[index],
+                    x = snapshot.positions[offset],
+                    y = snapshot.positions[offset + 1],
+                    z = snapshot.positions[offset + 2],
+                    color = snapshot.colors[index],
+                    style = style,
+                )
+            }
+        })
+        true
+    }
+
+    private fun borrowerFor(
+        cut: VisibilityRendererSnapshot,
+        source: () -> CoveragePointRenderSnapshot?,
+    ) = borrowerFor(
+        source,
+        CoverageRowsQualifier(
+            bindingGeneration = cut.bindingGeneration,
+            groupGeneration = cut.groupGeneration,
+            rendererGeneration = cut.rendererGeneration,
+            transactionId = cut.transactionId,
+            geometryRevision = cut.geometryRevision,
+            styleRevision = cut.styleRevision,
+        ),
+    )
+
     private fun snapshot(
         geometryRevision: Long = 4,
         styleRevision: Long = 7,
@@ -130,6 +185,46 @@ class CoverageRendererOwnerTest {
     }
 
     @Test
+    fun `state borrower restores modes without retaining a presentation plan`() {
+        val cut = snapshot()
+        val source = checkNotNull(cut.renderSnapshot)
+        val qualifier = CoverageRowsQualifier(
+            bindingGeneration = cut.bindingGeneration,
+            groupGeneration = cut.groupGeneration,
+            rendererGeneration = cut.rendererGeneration,
+            transactionId = cut.transactionId,
+            geometryRevision = cut.geometryRevision,
+            styleRevision = cut.styleRevision,
+        )
+        var current = source
+        val owner = NativeCoverageRendererOwner(
+            committedRowsBorrower = borrowerFor({ current }, qualifier),
+        )
+        owner.install(cut)
+        assertNull(owner.presentationPlan())
+        assertEquals(2, owner.status().selectedRowCount)
+
+        current = current.copy(
+            positions = current.positions.copyOf().also { it[0] = 42f },
+        )
+        owner.setControls(
+            CoverageRendererControls(
+                visible = true,
+                mode = CoveragePresentationMode.SEMANTIC_CUBES,
+                palette = CoverageRendererPalette.COVERAGE,
+            ),
+        )
+        owner.setControls(
+            CoverageRendererControls(
+                visible = true,
+                mode = CoveragePresentationMode.SEMANTIC_CENTROIDS,
+                palette = CoverageRendererPalette.COVERAGE,
+            ),
+        )
+        assertTrue(checkNotNull(owner.presentationSnapshot()).positions.any { it == 42f })
+    }
+
+    @Test
     fun `pause reports renderer unavailable and resume rehydrates newest committed cut once`() {
         val owner = NativeCoverageRendererOwner()
         owner.install(snapshot())
@@ -144,6 +239,28 @@ class CoverageRendererOwnerTest {
         assertEquals(5L, recovery.geometryRevision)
         assertEquals(8L, recovery.styleRevision)
         assertTrue(owner.resume().recovered.not())
+    }
+
+    @Test
+    fun `low memory pressure fences resources while retaining a recoverable semantic cut`() {
+        val owner = NativeCoverageRendererOwner()
+        owner.install(snapshot())
+        val before = owner.status()
+
+        assertTrue(owner.markLowMemoryPressure())
+        val pressured = owner.status()
+        assertTrue(pressured.rendererUnavailable)
+        assertTrue(pressured.recoveryPending)
+        assertTrue(pressured.lowMemoryPressure)
+        assertEquals(before.rowCount, pressured.rowCount)
+        assertEquals(before.mode, pressured.mode)
+        assertEquals(before.palette, pressured.palette)
+
+        assertTrue(owner.resume().recovered)
+        val token = checkNotNull(owner.requestResourceReplacement())
+        assertTrue(owner.markResourceMounted(token))
+        assertFalse(owner.status().lowMemoryPressure)
+        assertTrue(owner.status().resourceAvailable)
     }
 
     @Test
@@ -263,11 +380,7 @@ class CoverageRendererOwnerTest {
             positions = FloatArray(count * 3),
             colors = IntArray(count),
         )
-        val owner = NativeCoverageRendererOwner(
-            sourceProvider = { renderSnapshot },
-        )
-        owner.install(
-            VisibilityRendererSnapshot(
+        val cut = VisibilityRendererSnapshot(
                 bindingGeneration = 1L,
                 groupGeneration = 1L,
                 rendererGeneration = 1L,
@@ -276,8 +389,11 @@ class CoverageRendererOwnerTest {
                 styleRevision = 1L,
                 rows = rows,
                 renderSnapshot = renderSnapshot,
-            ),
         )
+        val owner = NativeCoverageRendererOwner(
+            committedRowsBorrower = borrowerFor(cut) { renderSnapshot },
+        )
+        owner.install(cut)
 
         val expected = mapOf(
             CoveragePresentationMode.SEMANTIC_CENTROIDS to CoverageRendererLimits.CENTROID_CAPACITY,
@@ -313,14 +429,14 @@ class CoverageRendererOwnerTest {
     }
 
     @Test
-    fun `mode transition uses source provider to restore the full centroid cut`() {
+    fun `mode transition borrows canonical rows to restore the full centroid cut`() {
         val source = generatedSnapshot(
             count = CoverageRendererLimits.CENTROID_CAPACITY,
             geometryRevision = 1L,
         )
         val canonicalSource = checkNotNull(source.renderSnapshot)
         val owner = NativeCoverageRendererOwner(
-            sourceProvider = { canonicalSource },
+            committedRowsBorrower = borrowerFor(source) { canonicalSource },
         )
         owner.install(source)
 
@@ -350,7 +466,7 @@ class CoverageRendererOwnerTest {
         val source = generatedSnapshot(count = 4, geometryRevision = 1L)
         var canonicalSource: CoveragePointRenderSnapshot? = source.renderSnapshot
         val owner = NativeCoverageRendererOwner(
-            sourceProvider = { canonicalSource },
+            committedRowsBorrower = borrowerFor(source) { canonicalSource },
         )
         owner.install(source)
         owner.setControls(
@@ -375,7 +491,10 @@ class CoverageRendererOwnerTest {
         assertFalse(rejected.accepted)
         assertEquals(CoveragePresentationMode.SEMANTIC_CUBES, owner.status().mode)
         assertEquals(priorStatus.rendererUnavailable, owner.status().rendererUnavailable)
-        assertArrayEquals(priorPlan.keys, owner.presentationSnapshot()!!.keys)
+        assertArrayEquals(
+            LongArray(priorPlan.surfaceIds.size) { priorPlan.surfaceIds[it] },
+            owner.selectedSurfaceIds(),
+        )
     }
 
     @Test

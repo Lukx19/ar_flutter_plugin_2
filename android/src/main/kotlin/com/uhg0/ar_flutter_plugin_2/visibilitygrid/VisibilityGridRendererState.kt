@@ -8,6 +8,9 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererGlyph
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererTarget
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageCommittedRow
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageCommittedRows
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRowsQualifier
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import com.uhg0.ar_flutter_plugin_2.pointcloud.identityGridRotation
 
@@ -166,6 +169,46 @@ class VisibilityGridRendererState(
 
     internal val currentTargetDirectionIndex: Int?
         @Synchronized get() = targetDirectionIndexValue
+
+    /**
+     * Borrows the canonical rows without materialising a renderer snapshot.
+     * The view is intentionally created inside the synchronized section and
+     * is valid only for the duration of [block].
+     */
+    @Synchronized
+    internal fun withCommittedRows(
+        expected: CoverageRowsQualifier,
+        block: (CoverageCommittedRows) -> Unit,
+    ): Boolean {
+        if (disposed || expected.bindingGeneration != (installedOwnership?.bindingGeneration ?: 0L) ||
+            expected.groupGeneration != installedGroupGeneration ||
+            expected.transactionId != installedTransactionId ||
+            expected.geometryRevision != geometryRevision ||
+            expected.styleRevision != styleRevision
+        ) return false
+        val view = object : CoverageCommittedRows {
+            override val count: Int get() = this@VisibilityGridRendererState.count
+            override val capacity: Int get() = this@VisibilityGridRendererState.capacity
+            override val qualifier: CoverageRowsQualifier = expected
+
+            override fun rowAt(index: Int): CoverageCommittedRow {
+                require(index in 0 until count)
+                val position = index * POSITION_COMPONENTS
+                val styleOffset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
+                return CoverageCommittedRow(
+                    surfaceId = surfaceIds[index],
+                    key = voxelKeys[index],
+                    x = positions[position],
+                    y = positions[position + 1],
+                    z = positions[position + 2],
+                    color = colors[index],
+                    style = CoverageRendererStyleRowV1.decode(styleRows, styleOffset),
+                )
+            }
+        }
+        block(view)
+        return true
+    }
 
     /** Concrete primitive storage retained by this production state. */
     val ownedStorageBytes: Int

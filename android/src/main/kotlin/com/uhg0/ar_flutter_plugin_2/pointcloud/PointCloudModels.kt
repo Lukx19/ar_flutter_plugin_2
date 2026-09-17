@@ -408,6 +408,62 @@ data class CoveragePointRenderSnapshot(
 }
 
 /**
+ * Qualifier for a synchronous borrow from the canonical visibility renderer.
+ * A borrower must reject the view when any field no longer names the
+ * committed cut that the consumer installed.
+ */
+data class CoverageRowsQualifier(
+    val bindingGeneration: Long,
+    val groupGeneration: Long,
+    val rendererGeneration: Long,
+    val transactionId: Long,
+    val geometryRevision: Long,
+    val styleRevision: Long,
+) {
+    init {
+        require(bindingGeneration >= 0L)
+        require(groupGeneration >= 0L)
+        require(rendererGeneration >= 0L)
+        require(transactionId >= 0L)
+        require(geometryRevision >= 0L)
+        require(styleRevision >= 0L)
+    }
+}
+
+/** One row borrowed from canonical state; it is valid only during the borrow callback. */
+data class CoverageCommittedRow(
+    val surfaceId: Long,
+    val key: Long,
+    val x: Float,
+    val y: Float,
+    val z: Float,
+    val color: Int,
+    val style: CoverageRendererStyleRowV1,
+)
+
+/**
+ * Synchronous, non-owning view over canonical rows. Implementations must not
+ * retain the view or rows after [CoverageCommittedRowsBorrower] returns.
+ */
+interface CoverageCommittedRows {
+    val count: Int
+    val capacity: Int
+    val qualifier: CoverageRowsQualifier
+    fun rowAt(index: Int): CoverageCommittedRow
+}
+
+/**
+ * State-only renderer seam. The callback runs while the authoritative state
+ * is fenced; it receives no full source snapshot and cannot outlive the call.
+ */
+fun interface CoverageCommittedRowsBorrower {
+    fun withCommittedRows(
+        expected: CoverageRowsQualifier,
+        block: (CoverageCommittedRows) -> Unit,
+    ): Boolean
+}
+
+/**
  * Authoritative immutable hand-off copy for renderer consumers.  All nested
  * buffers, including dirty spans, are detached from the producer snapshot.
  */

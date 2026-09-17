@@ -16,6 +16,32 @@ import org.junit.Test
 
 class CoverageRendererSelectionTest {
     @Test
+    fun `selection identity lookup uses compact sorted surface ids`() {
+        val selector = CoveragePresentationSelector(8)
+        selector.select(
+            CoveragePointRenderSnapshot(
+                revision = 1L,
+                enabled = true,
+                capacity = 3,
+                count = 3,
+                keys = longArrayOf(30L, 10L, 20L),
+                surfaceIds = longArrayOf(30L, 10L, 20L),
+                positions = FloatArray(9),
+                colors = IntArray(3),
+            ),
+            requestedCapacity = 3,
+        )
+
+        val destinationForTen = selector.destinationForSurfaceId(10L)
+        val destinationForThirty = selector.destinationForSurfaceId(30L)
+        assertTrue(destinationForTen >= 0)
+        assertTrue(destinationForThirty >= 0)
+        assertEquals(10L, selector.selectedSurfaceId(destinationForTen))
+        assertEquals(30L, selector.selectedSurfaceId(destinationForThirty))
+        assertEquals(-1, selector.destinationForSurfaceId(99L))
+    }
+
+    @Test
     fun `mode cycle shrinks cube cut and restores centroid from canonical source while dirty values stay top level`() {
         val sourceCount = CoverageRendererLimits.CENTROID_CAPACITY
         val positions = FloatArray(sourceCount * 3)
@@ -48,7 +74,7 @@ class CoverageRendererSelectionTest {
                 VoxelRenderMode.CUBES,
                 sourceCapacity = source.capacity,
                 retainedCount = source.count,
-            ) <= CoverageRendererLimits.SHARED_OWNED_BUFFER_LIMIT_BYTES,
+            ) <= CoverageRendererLimits.ACTIVE_RENDERER_OWNED_LIMIT_BYTES,
         )
 
         val mutatedPositions = positions.copyOf().also { it[0] = 42f }
@@ -158,6 +184,30 @@ class CoverageRendererSelectionTest {
     }
 
     @Test
+    fun `token-qualified resource owners keep both generations chargeable during coexistence`() {
+        val owners = mutableListOf<String>()
+        val factory = CoverageRendererResourceFactory()
+        factory.replacePoint(
+            VoxelRenderMode.POINTS,
+            1,
+            "coverage-points",
+            token = CoverageResourceToken(1L, 7L, CoveragePresentationMode.RAW_FEATURES),
+            create = { _, _, owner -> owners += owner; "old" },
+            release = { _: String -> },
+        )
+        factory.replacePoint(
+            VoxelRenderMode.POINTS,
+            1,
+            "coverage-points",
+            token = CoverageResourceToken(2L, 7L, CoveragePresentationMode.RAW_FEATURES),
+            create = { _, _, owner -> owners += owner; "new" },
+            release = { _: String -> },
+        )
+
+        assertEquals(listOf("coverage-points-epoch-1", "coverage-points-epoch-2"), owners)
+    }
+
+    @Test
     fun `failed replacement leaves the current renderer owner mounted`() {
         val released = mutableListOf<String>()
         val factory = CoverageRendererResourceFactory()
@@ -191,6 +241,7 @@ class CoverageRendererSelectionTest {
             admit = { mode, _ -> ledger.admitResourceReplacement(mode) },
             onClearFirst = { transition ->
                 assertEquals(CoverageRendererTransitionStrategy.CLEAR_FIRST, transition.admission.strategy)
+                telemetry.removeOwner("transition-pressure")
                 events += "clear-first"
             },
         )
@@ -223,6 +274,14 @@ class CoverageRendererSelectionTest {
             create = { mode, _, _ -> construct(mode) },
             release = { release(com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CUBES) },
         )
+        val centroidCandidate = ledger.admitResourceReplacement(
+            VoxelRenderMode.CENTROIDS,
+        ).candidateBytes
+        telemetry.setOwnedBufferBytes(
+            "transition-pressure",
+            CoverageRendererLimits.INSTANTANEOUS_TRANSITION_LIMIT_BYTES -
+                telemetry.ownedBufferBytesSnapshot() - centroidCandidate + 1,
+        )
         factory.replacePoint(
             com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS,
             CoverageRendererLimits.CENTROID_CAPACITY,
@@ -236,7 +295,10 @@ class CoverageRendererSelectionTest {
             listOf("create:CUBES", "clear-first", "release:CUBES", "create:CENTROIDS", "release:CENTROIDS"),
             events,
         )
-        assertTrue((telemetry.snapshot().getValue("peakOwnedBufferBytes") as Int) <= 8 * 1024 * 1024)
+        assertTrue(
+            (telemetry.snapshot().getValue("peakOwnedBufferBytes") as Int) <=
+                CoverageRendererLimits.INSTANTANEOUS_TRANSITION_LIMIT_BYTES,
+        )
         assertEquals(0, telemetry.snapshot().getValue("ownedBufferBytes"))
     }
 
@@ -269,6 +331,93 @@ class CoverageRendererSelectionTest {
         assertEquals(emptyList<String>(), released)
         factory.clear()
         assertEquals(listOf("old"), released)
+    }
+
+    @Test
+    fun `admission records candidate peaks and rejects a standalone over active ceiling`() {
+        val telemetry = RendererTelemetry()
+        val ledger = CoverageRendererAllocationLedger(telemetry)
+
+        val coexist = ledger.admitResourceReplacement(VoxelRenderMode.POINTS)
+        assertEquals(CoverageRendererTransitionStrategy.COEXIST, coexist.strategy)
+        assertEquals("coexist", telemetry.snapshot().getValue("lastAdmissionStrategy"))
+        assertEquals(coexist.candidateBytes, telemetry.snapshot().getValue("lastAdmissionCandidateBytes"))
+
+        val rejected = ledger.admitResourceReplacement(
+            VoxelRenderMode.POINTS,
+            selectorStorageBytes = CoverageRendererLimits.ACTIVE_RENDERER_OWNED_LIMIT_BYTES,
+        )
+        assertEquals(CoverageRendererTransitionStrategy.REJECT, rejected.strategy)
+        assertEquals("reject", telemetry.snapshot().getValue("lastAdmissionStrategy"))
+        assertTrue(
+            rejected.candidateBytes > CoverageRendererLimits.ACTIVE_RENDERER_OWNED_LIMIT_BYTES,
+        )
+    }
+
+    @Test
+    fun `admission uses clear first only when both generations exceed transition ceiling`() {
+        val telemetry = RendererTelemetry()
+        val ledger = CoverageRendererAllocationLedger(telemetry)
+        val candidate = ledger.admitResourceReplacement(VoxelRenderMode.CENTROIDS).candidateBytes
+        telemetry.setOwnedBufferBytes(
+            "existing-generation",
+            CoverageRendererLimits.INSTANTANEOUS_TRANSITION_LIMIT_BYTES - candidate + 1,
+        )
+
+        val admission = ledger.admitResourceReplacement(VoxelRenderMode.CENTROIDS)
+        assertEquals(CoverageRendererTransitionStrategy.CLEAR_FIRST, admission.strategy)
+        assertTrue(
+            admission.candidateBytes <= CoverageRendererLimits.ACTIVE_RENDERER_OWNED_LIMIT_BYTES,
+        )
+        assertTrue(
+            admission.combinedBytes > CoverageRendererLimits.INSTANTANEOUS_TRANSITION_LIMIT_BYTES,
+        )
+    }
+
+    @Test
+    fun `rejected replacement does not invoke creation or release current resource`() {
+        val telemetry = RendererTelemetry()
+        val ledger = CoverageRendererAllocationLedger(telemetry)
+        val events = mutableListOf<String>()
+        var admissionCalls = 0
+        val factory = CoverageRendererResourceFactory(
+            admit = { mode, _ ->
+                admissionCalls++
+                if (admissionCalls == 1) {
+                    CoverageRendererResourceAdmission(
+                        strategy = CoverageRendererTransitionStrategy.COEXIST,
+                        currentBytes = 0,
+                        candidateBytes = 0,
+                        combinedBytes = 0,
+                    )
+                } else {
+                    ledger.admitResourceReplacement(
+                        mode,
+                        selectorStorageBytes = CoverageRendererLimits.ACTIVE_RENDERER_OWNED_LIMIT_BYTES,
+                    )
+                }
+            },
+            onCreationFailure = { events += "rejected" },
+        )
+        factory.replacePoint(
+            VoxelRenderMode.POINTS,
+            1,
+            "old",
+            create = { _, _, _ -> "old" },
+            release = { events += "release" },
+        )
+        val replacement = factory.replacePoint(
+            VoxelRenderMode.POINTS,
+            1,
+            "new",
+            create = { _, _, _ -> events += "create"; "new" },
+            release = { events += "release-new" },
+        )
+
+        assertNull(replacement)
+        assertEquals(listOf("rejected"), events)
+        factory.clear()
+        assertEquals(listOf("rejected", "release"), events)
     }
 
     @Test
@@ -311,16 +460,16 @@ class CoverageRendererSelectionTest {
     }
 
     @Test
-    fun `renderer lazy mode resource peaks stay within the shared eight MiB cap`() {
+    fun `renderer lazy mode resource peaks stay within the active twelve MiB cap`() {
         assertEquals(2_000, CoverageRendererLimits.RAW_POINT_CAPACITY)
         assertEquals(20_000, CoverageRendererLimits.CENTROID_CAPACITY)
         assertEquals(8_000, CoverageRendererLimits.CUBE_CAPACITY)
-        assertEquals(7_779_200, CoverageRendererLimits.maximumActiveRendererBytes)
+        assertEquals(8_445_984, CoverageRendererLimits.maximumActiveRendererBytes)
         com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.entries.forEach { mode ->
             assertTrue(
-                "$mode startup peak must fit the shared renderer cap",
+                "$mode startup peak must fit the active renderer cap",
                 CoverageRendererLimits.activeRendererPeakBytes(mode) <=
-                    CoverageRendererLimits.SHARED_OWNED_BUFFER_LIMIT_BYTES,
+                    CoverageRendererLimits.ACTIVE_RENDERER_OWNED_LIMIT_BYTES,
             )
         }
     }
@@ -360,13 +509,14 @@ class CoverageRendererSelectionTest {
             snapshot,
         )
         assertEquals(
-            VisibilityGridRendererState.ownedStorageBytes(CoverageRendererLimits.CENTROID_CAPACITY) +
+            CoverageRendererLimits.rendererStateBytes(VoxelRenderMode.CENTROIDS) +
                 CoverageRendererLimits.presentationStorageBytes(
                     com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS,
                 snapshot.capacity,
             ) +
-                CoverageRendererLimits.AUXILIARY_BYTES +
-                CoverageRendererLimits.SNAPSHOT_ROW_BYTES,
+                CoverageRendererLimits.snapshotHandoffBytes(
+                    com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS,
+                ),
             telemetry.snapshot().getValue("ownedBufferBytes"),
         )
     }
@@ -384,12 +534,12 @@ class CoverageRendererSelectionTest {
         )
 
         telemetry.setOwnedBufferBytes(
-            "exact-cap-reservation",
-            CoverageRendererLimits.SHARED_OWNED_BUFFER_LIMIT_BYTES -
+            "exact-transition-reservation",
+            CoverageRendererLimits.INSTANTANEOUS_TRANSITION_LIMIT_BYTES -
                 CoverageRendererLimits.maximumActiveRendererBytes,
         )
         assertThrows(IllegalStateException::class.java) {
-            telemetry.setOwnedBufferBytes("limit-plus-one", 1)
+            telemetry.setOwnedBufferBytes("transition-limit-plus-one", 1)
         }
     }
 

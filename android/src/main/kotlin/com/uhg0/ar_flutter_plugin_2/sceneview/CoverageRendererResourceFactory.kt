@@ -5,7 +5,15 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 internal enum class CoverageRendererTransitionStrategy {
     COEXIST,
     CLEAR_FIRST,
+    REJECT,
 }
+
+internal val CoverageRendererTransitionStrategy.wireName: String
+    get() = when (this) {
+        CoverageRendererTransitionStrategy.COEXIST -> "coexist"
+        CoverageRendererTransitionStrategy.CLEAR_FIRST -> "clearFirst"
+        CoverageRendererTransitionStrategy.REJECT -> "reject"
+    }
 
 internal data class CoverageRendererResourceAdmission(
     val strategy: CoverageRendererTransitionStrategy,
@@ -98,6 +106,12 @@ internal class CoverageRendererResourceFactory(
             token = token,
             previousToken = priorToken,
         )
+        if (admission.strategy == CoverageRendererTransitionStrategy.REJECT) {
+            // Admission is non-mutating: reject before clearing or invoking
+            // the factory, while the current generation remains mounted.
+            onCreationFailure(transition)
+            return null
+        }
         if (admission.strategy == CoverageRendererTransitionStrategy.CLEAR_FIRST && prior != null) {
             onClearFirst(transition)
             active = null
@@ -111,8 +125,12 @@ internal class CoverageRendererResourceFactory(
         // new resource exists and can be installed. A failed allocation then
         // leaves the old renderer valid and mounted. Clear-first has already
         // made the old resource unavailable, so its failure remains fenced.
+        val resourceOwner = token?.let { "$owner-epoch-${it.epoch}" } ?: owner
         val next = try {
-            create(mode, capacity, owner)
+            // Token-qualified names keep both generations visible to the
+            // allocation ledger during a coexistence transaction. Legacy
+            // callers without a token retain their existing owner names.
+            create(mode, capacity, resourceOwner)
         } catch (error: Throwable) {
             onCreationFailure(transition)
             return null

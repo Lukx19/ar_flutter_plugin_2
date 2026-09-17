@@ -4,6 +4,8 @@ import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaReceiptV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaSelectorV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaSourceV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageCommittedRows
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRowsQualifier
 import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import java.io.ByteArrayInputStream
@@ -1100,6 +1102,11 @@ internal interface CommittedRendererProjection : AutoCloseable {
     fun applyStyleCut(cut: QualifiedRendererStyleCut): RendererStyleCutResult =
         RendererStyleCutResult.Rejected(RendererStyleCutRejection.CLOSED)
     fun currentRowCount(): Int = 0
+    /** Borrow canonical rows synchronously; no source snapshot is retained. */
+    fun withCommittedRows(
+        expected: CoverageRowsQualifier,
+        block: (CoverageCommittedRows) -> Unit,
+    ): Boolean = false
     fun portableOwnerBytes(): Long = 0
     fun beginRebuild(cut: CommittedGeometryCut) = Unit
     fun appendRebuildPage(cut: CommittedGeometryCut) = Unit
@@ -1143,6 +1150,17 @@ internal class NativeRendererProjection(
     override val maximumRows: Int get() = state.capacity
     override fun portableOwnerBytes(): Long =
         56L + 96L + 64L + state.retainedGroupGeometryBytes // projection, state, native config, group geometry
+
+    @Synchronized
+    override fun withCommittedRows(
+        expected: CoverageRowsQualifier,
+        block: (CoverageCommittedRows) -> Unit,
+    ): Boolean {
+        if (closed || activeRenderConfig?.rendererGeneration != expected.rendererGeneration) {
+            return false
+        }
+        return state.withCommittedRows(expected, block)
+    }
 
     @Synchronized
     override fun applyGeometry(cut: CommittedGeometryCut): RendererProjectionResult {

@@ -37,6 +37,10 @@ internal class RendererTelemetry {
     private var resourceReplacementCount = 0
     private var resourceDisposalCount = 0
     private var resourceFailureCount = 0
+    private var lastAdmissionStrategy = "none"
+    private var lastAdmissionCurrentBytes = 0
+    private var lastAdmissionCandidateBytes = 0
+    private var lastAdmissionCombinedBytes = 0
     private var residentRowCount = 0
     private var residentGlyphCount = 0
     private var residentToken: CoverageResourceToken? = null
@@ -69,6 +73,14 @@ internal class RendererTelemetry {
     @Synchronized
     fun recordResourceFailure() {
         resourceFailureCount++
+    }
+
+    @Synchronized
+    fun recordResourceAdmission(admission: CoverageRendererResourceAdmission) {
+        lastAdmissionStrategy = admission.strategy.wireName
+        lastAdmissionCurrentBytes = admission.currentBytes
+        lastAdmissionCandidateBytes = admission.candidateBytes
+        lastAdmissionCombinedBytes = admission.combinedBytes
     }
 
     @Synchronized
@@ -130,14 +142,14 @@ internal class RendererTelemetry {
         require(owner.isNotBlank())
         require(bytes >= 0)
         val previous = allocationsByOwner.put(owner, bytes)
-        if (ownedBufferBytes > RENDERER_ALLOCATION_LIMIT_BYTES) {
+        if (ownedBufferBytes > RENDERER_INSTANTANEOUS_LIMIT_BYTES) {
             if (previous == null) {
                 allocationsByOwner.remove(owner)
             } else {
                 allocationsByOwner[owner] = previous
             }
             throw IllegalStateException(
-                "renderer-owned buffers exceed $RENDERER_ALLOCATION_LIMIT_BYTES bytes",
+                "renderer-owned buffers exceed $RENDERER_INSTANTANEOUS_LIMIT_BYTES bytes",
             )
         }
         peakOwnedBufferBytes = maxOf(peakOwnedBufferBytes, ownedBufferBytes)
@@ -257,6 +269,9 @@ internal class RendererTelemetry {
         "gpuCounterStatus" to "unavailable: Filament driver counters are not exposed",
         "ordinaryUploadLimitBytes" to ORDINARY_UPLOAD_LIMIT_BYTES,
         "rendererAllocationLimitBytes" to RENDERER_ALLOCATION_LIMIT_BYTES,
+        "rendererInstantaneousLimitBytes" to RENDERER_INSTANTANEOUS_LIMIT_BYTES,
+        "rendererTransitionReserveBytes" to CoverageRendererLimits.TRANSITION_RESERVE_BYTES,
+        "ownedBufferBytesByOwner" to allocationsByOwner.toMap(),
         "semanticCentroidCount" to (presentationCounts["semanticCentroidCount"] ?: 0),
         "semanticCubeCount" to (presentationCounts["semanticCubeCount"] ?: 0),
         "rawFeatureCount" to (presentationCounts["rawFeatureCount"] ?: 0),
@@ -267,6 +282,10 @@ internal class RendererTelemetry {
         "resourceReplacementCount" to resourceReplacementCount,
         "resourceDisposalCount" to resourceDisposalCount,
         "resourceFailureCount" to resourceFailureCount,
+        "lastAdmissionStrategy" to lastAdmissionStrategy,
+        "lastAdmissionCurrentBytes" to lastAdmissionCurrentBytes,
+        "lastAdmissionCandidateBytes" to lastAdmissionCandidateBytes,
+        "lastAdmissionCombinedBytes" to lastAdmissionCombinedBytes,
         "cumulativeResourceReplacementCount" to resourceReplacementCount,
         "cumulativeResourceDisposalCount" to resourceDisposalCount,
         "residentRowCount" to residentRowCount,
@@ -314,7 +333,11 @@ internal class RendererTelemetry {
 
     internal companion object {
         const val ORDINARY_UPLOAD_LIMIT_BYTES = 64 * 1024
-        const val RENDERER_ALLOCATION_LIMIT_BYTES = 8 * 1024 * 1024
+        /** One-generation admission ceiling; coexistence uses the transition ceiling. */
+        const val RENDERER_ALLOCATION_LIMIT_BYTES =
+            CoverageRendererLimits.ACTIVE_RENDERER_OWNED_LIMIT_BYTES
+        const val RENDERER_INSTANTANEOUS_LIMIT_BYTES =
+            CoverageRendererLimits.INSTANTANEOUS_TRANSITION_LIMIT_BYTES
         private val fencedDestroyedUploadCallbacks = AtomicInteger()
     }
 }

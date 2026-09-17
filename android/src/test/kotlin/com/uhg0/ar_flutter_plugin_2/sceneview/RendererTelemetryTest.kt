@@ -41,14 +41,14 @@ class RendererTelemetryTest {
     }
 
     @Test
-    fun `telemetry rejects a renderer-owned allocation above the shared cap`() {
+    fun `telemetry rejects a renderer-owned allocation above the instantaneous transition cap`() {
         val telemetry = RendererTelemetry()
         telemetry.setOwnedBufferBytes("centroids", 20_000 * 36)
 
         assertThrows(IllegalStateException::class.java) {
             telemetry.setOwnedBufferBytes(
                 "cubes",
-                RendererTelemetry.RENDERER_ALLOCATION_LIMIT_BYTES,
+                RendererTelemetry.RENDERER_INSTANTANEOUS_LIMIT_BYTES,
             )
         }
 

@@ -497,6 +497,7 @@ class VisibilityGridV2Binding internal constructor(
                 "resourceAvailable" to false,
                 "recoveryPending" to false,
                 "resourceFailureCount" to 0,
+                "lowMemoryPressure" to false,
             )
         val status = owner.status()
         return mapOf(
@@ -514,6 +515,7 @@ class VisibilityGridV2Binding internal constructor(
             "resourceAvailable" to status.resourceAvailable,
             "recoveryPending" to status.recoveryPending,
             "resourceFailureCount" to status.resourceFailureCount,
+            "lowMemoryPressure" to status.lowMemoryPressure,
         )
     }
 

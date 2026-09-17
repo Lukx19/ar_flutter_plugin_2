@@ -1,9 +1,5 @@
 package com.uhg0.ar_flutter_plugin_2.sceneview
 
-import com.uhg0.ar_flutter_plugin_2.visibilitygrid.DirtyRowQueue
-import com.uhg0.ar_flutter_plugin_2.visibilitygrid.LongRowIndex
-import com.uhg0.ar_flutter_plugin_2.visibilitygrid.SelectedKeyMaxHeap
-
 /**
  * Primitive backing storage retained by one presentation selector.
  *
@@ -26,13 +22,15 @@ internal class CoveragePresentationStorage(
         private set
     lateinit var selectedSurfaceIds: LongArray
         private set
-    lateinit var selectedKeyToDestination: LongRowIndex
+    lateinit var sortedSurfaceIds: LongArray
         private set
-    lateinit var selectedKeyMaxHeap: SelectedKeyMaxHeap
+    lateinit var sortedDestinations: IntArray
         private set
     lateinit var freeDestinations: IntArray
         private set
-    lateinit var dirtyDestinations: DirtyRowQueue
+    lateinit var dirtyDestinations: IntArray
+        private set
+    var dirtyDestinationCount: Int = 0
         private set
 
     var sourceSlotToDestination = IntArray(0)
@@ -58,10 +56,11 @@ internal class CoveragePresentationStorage(
             selectedSourceSlots = IntArray(requestedCapacity)
             selectedKeys = LongArray(requestedCapacity)
             selectedSurfaceIds = LongArray(requestedCapacity)
-            selectedKeyToDestination = LongRowIndex(requestedCapacity)
-            selectedKeyMaxHeap = SelectedKeyMaxHeap(requestedCapacity)
+            sortedSurfaceIds = LongArray(requestedCapacity)
+            sortedDestinations = IntArray(requestedCapacity)
             freeDestinations = IntArray(requestedCapacity)
-            dirtyDestinations = DirtyRowQueue(requestedCapacity)
+            dirtyDestinations = IntArray(requestedCapacity)
+            dirtyDestinationCount = 0
         }
         styleRowsPresent = withStyleRows
     }
@@ -86,24 +85,47 @@ internal class CoveragePresentationStorage(
     val sourceCapacity: Int
         get() = sourceSlotToDestination.size
 
+    fun markDirty(destination: Int) {
+        require(destination in 0 until capacity)
+        if (dirtyDestinationCount < dirtyDestinations.size) {
+            dirtyDestinations[dirtyDestinationCount++] = destination
+        }
+    }
+
+    fun clearDirty() {
+        dirtyDestinationCount = 0
+    }
+
+    fun drainDirty(maxCount: Int = dirtyDestinationCount): IntArray {
+        val count = minOf(maxCount, dirtyDestinationCount)
+        val values = dirtyDestinations.copyOf(count)
+        values.sort()
+        var unique = 0
+        values.forEach { value ->
+            if (unique == 0 || values[unique - 1] != value) {
+                values[unique++] = value
+            }
+        }
+        dirtyDestinationCount = 0
+        return values.copyOf(unique)
+    }
+
     companion object {
         fun estimatedOwnedStorageBytes(
             capacity: Int,
             sourceCapacity: Int = capacity,
             // Kept for source compatibility with earlier accounting callers;
-            // style values live only in the immutable plan now.
+            // style values are borrowed from canonical state.
             withStyleRows: Boolean = true,
         ): Int {
             require(capacity > 0)
             require(sourceCapacity >= 0)
             return capacity * (
                 Int.SIZE_BYTES +
-                    Long.SIZE_BYTES * 2
+                    Long.SIZE_BYTES * 2 +
+                    Long.SIZE_BYTES +
+                    Int.SIZE_BYTES * 3
             ) +
-                LongRowIndex.ownedStorageBytes(capacity) +
-                SelectedKeyMaxHeap.ownedStorageBytes(capacity) +
-                DirtyRowQueue.ownedStorageBytes(capacity) +
-                capacity * Int.SIZE_BYTES +
                 sourceCapacity * (Int.SIZE_BYTES + Long.SIZE_BYTES + Long.SIZE_BYTES + Int.SIZE_BYTES)
         }
     }

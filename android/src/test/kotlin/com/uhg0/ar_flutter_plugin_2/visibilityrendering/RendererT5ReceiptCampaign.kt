@@ -303,7 +303,7 @@ internal object RendererT5ReceiptCampaign {
         )
         data class ReceiptResource(val mode: VoxelRenderMode, val release: () -> Unit)
         fun construct(mode: VoxelRenderMode): ReceiptResource {
-            ledger.installPersistentCoverageState(VisibilityGridRendererState(CoverageRendererLimits.presentationCapacity(mode)))
+            ledger.installPersistentCoverageState(mode)
             ledger.updateSnapshotHandoff(mode)
             when (mode) {
                 VoxelRenderMode.CUBES -> ledger.installCubeResources("active", CoverageRendererLimits.CUBE_CAPACITY)
@@ -318,10 +318,13 @@ internal object RendererT5ReceiptCampaign {
                 ledger.clearCoverageState()
             }
         }
-        val cubeState = VisibilityGridRendererState(CoverageRendererLimits.CUBE_CAPACITY)
+        // The projection owns one canonical centroid-capacity state across
+        // lazy mesh modes; mode resources are the only capacity-specific
+        // allocation in this ledger.
+        val canonicalState = VisibilityGridRendererState(CoverageRendererLimits.CENTROID_CAPACITY)
         assertEquals(
             CoverageRendererLimits.rendererStateBytes(VoxelRenderMode.CUBES),
-            cubeState.ownedStorageBytes,
+            canonicalState.ownedStorageBytes,
         )
         resources.replaceCube(
             CoverageRendererLimits.CUBE_CAPACITY,
@@ -333,18 +336,16 @@ internal object RendererT5ReceiptCampaign {
         assertEquals(CoverageRendererLimits.maximumActiveRendererBytes, maximum)
         val boundaryTelemetry = RendererTelemetry()
         val boundaryLedger = CoverageRendererAllocationLedger(boundaryTelemetry)
-        boundaryLedger.installPersistentCoverageState(
-            VisibilityGridRendererState(CoverageRendererLimits.CUBE_CAPACITY),
-        )
+        boundaryLedger.installPersistentCoverageState(VoxelRenderMode.CUBES)
         boundaryLedger.updateSnapshotHandoff(VoxelRenderMode.CUBES)
         boundaryLedger.installCubeResources("active", CoverageRendererLimits.CUBE_CAPACITY)
         boundaryTelemetry.setOwnedBufferBytes(
-            "exact-cap-reservation",
-            RendererTelemetry.RENDERER_ALLOCATION_LIMIT_BYTES - maximum,
+            "exact-transition-reservation",
+            RendererTelemetry.RENDERER_INSTANTANEOUS_LIMIT_BYTES - maximum,
         )
         val limitPlusOneRejected = runCatching {
             boundaryTelemetry.setOwnedBufferBytes(
-                "limit-plus-one",
+                "transition-limit-plus-one",
                 1,
             )
         }.isFailure
@@ -356,14 +357,18 @@ internal object RendererT5ReceiptCampaign {
             create = { _, _, _ -> construct(VoxelRenderMode.CENTROIDS) },
             release = { it.release() },
         )
-        assertEquals(maximum, telemetry.snapshot().getValue("peakOwnedBufferBytes"))
+        val peakAfterReplacement = telemetry.snapshot().getValue("peakOwnedBufferBytes") as Int
+        assertTrue(peakAfterReplacement >= maximum)
+        assertTrue(peakAfterReplacement <= CoverageRendererLimits.INSTANTANEOUS_TRANSITION_LIMIT_BYTES)
         resources.clear()
         return buildJsonObject {
             put("maximumActiveRendererBytes", maximum)
             put("rendererOwnedBufferLimitBytes", RendererTelemetry.RENDERER_ALLOCATION_LIMIT_BYTES)
-            put("limitPlusOneBytes", RendererTelemetry.RENDERER_ALLOCATION_LIMIT_BYTES + 1)
+            put("rendererInstantaneousLimitBytes", RendererTelemetry.RENDERER_INSTANTANEOUS_LIMIT_BYTES)
+            put("rendererTransitionReserveBytes", CoverageRendererLimits.TRANSITION_RESERVE_BYTES)
+            put("limitPlusOneBytes", RendererTelemetry.RENDERER_INSTANTANEOUS_LIMIT_BYTES + 1)
             put("limitPlusOneRejected", limitPlusOneRejected)
-            put("peakAfterReplacementBytes", telemetry.snapshot().getValue("peakOwnedBufferBytes") as Int)
+            put("peakAfterReplacementBytes", peakAfterReplacement)
         }
     }
 

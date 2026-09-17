@@ -177,6 +177,9 @@ internal class ArView(
     )
 
     init {
+        sceneHost.coverageRendererOwner.attachCommittedRowsBorrower(
+            visibilityRendererProjection::withCommittedRows,
+        )
         visibilityGridV2Binding.attachObservationRuntime(visibilityObservationRuntime)
         visibilityGridChannel = VisibilityGridMethodChannel(
             messenger = messenger,

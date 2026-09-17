@@ -6,9 +6,6 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan
 import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
-import com.uhg0.ar_flutter_plugin_2.visibilitygrid.DirtyRowQueue
-import com.uhg0.ar_flutter_plugin_2.visibilitygrid.LongRowIndex
-import com.uhg0.ar_flutter_plugin_2.visibilitygrid.SelectedKeyMaxHeap
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridRendererState
 
 /** Chapter 17 fixed presentation maxima; semantic-grid capacity is separate. */
@@ -20,15 +17,20 @@ internal object CoverageRendererLimits {
     const val COLD_OVERVIEW_CAPACITY = 512
     const val GLYPH_CAPACITY = 256
     const val DEBUG_ROW_CAPACITY = 1_024
-    const val SHARED_OWNED_BUFFER_LIMIT_BYTES = 8 * 1024 * 1024
+    /** Maximum renderer-owned CPU/native buffers for one mounted generation. */
+    const val ACTIVE_RENDERER_OWNED_LIMIT_BYTES = 12 * 1024 * 1024
+
+    /** Capacity reserved for replacement bookkeeping and rollback. */
+    const val TRANSITION_RESERVE_BYTES = 4 * 1024 * 1024
+
+    /** Maximum instantaneous ownership while two generations coexist. */
+    const val INSTANTANEOUS_TRANSITION_LIMIT_BYTES =
+        ACTIVE_RENDERER_OWNED_LIMIT_BYTES + TRANSITION_RESERVE_BYTES
 
     const val AUXILIARY_ROW_BYTES = 16
     const val AUXILIARY_BYTES =
         (WARM_PROXY_CAPACITY + COLD_OVERVIEW_CAPACITY + GLYPH_CAPACITY + DEBUG_ROW_CAPACITY) *
             AUXILIARY_ROW_BYTES
-
-    /** key + surface identity + position + color + style row in one plan row. */
-    const val SNAPSHOT_ROW_BYTES = 48
 
     /**
      * The three mode resources are deliberately lazy and mutually exclusive.
@@ -49,11 +51,13 @@ internal object CoverageRendererLimits {
         mode.toDefaultCoveragePresentationMode().presentationCapacity
 
     /**
-     * The production visibility renderer is the sole retained selector. Its
-     * state is mode-sized, so cube mode does not silently retain a 20k state.
+     * Canonical geometry state is owned once by the projection at centroid
+     * capacity. Presentation modes retain only compact selected slots.
      */
     fun rendererStateBytes(mode: VoxelRenderMode): Int =
-        VisibilityGridRendererState.ownedStorageBytes(presentationCapacity(mode))
+        // The projection's canonical state is one physical 20k-row owner,
+        // including its identity, selection, and dirty primitive indexes.
+        VisibilityGridRendererState.ownedStorageBytes(CENTROID_CAPACITY)
 
     fun presentationStorageBytes(mode: VoxelRenderMode): Int =
         CoveragePresentationStorage.estimatedOwnedStorageBytes(presentationCapacity(mode))
@@ -76,24 +80,23 @@ internal object CoverageRendererLimits {
         resourcePeakBytes(mode) +
             rendererStateBytes(mode) +
             (selectorStorageBytes ?: presentationStorageBytes(mode, sourceCapacity)) +
-            AUXILIARY_BYTES +
-            snapshotHandoffBytes(mode, retainedCount)
+            // Auxiliary glyph/proxy arrays are allocated only by the mode
+            // that needs them and are not part of the centroid baseline.
+            0
 
     val maximumActiveRendererBytes: Int = VoxelRenderMode.entries.maxOf(::activeRendererPeakBytes)
 
     init {
-        check(maximumActiveRendererBytes <= SHARED_OWNED_BUFFER_LIMIT_BYTES)
+        check(maximumActiveRendererBytes <= ACTIVE_RENDERER_OWNED_LIMIT_BYTES)
     }
 
     fun snapshotHandoffBytes(mode: VoxelRenderMode): Int =
-        // One immutable bounded cut is shared by mesh, hit, and telemetry
-        // consumers. The selector owns its working arrays separately; no
-        // second full reset/span clone is charged here.
-        presentationCapacity(mode) * SNAPSHOT_ROW_BYTES
+        // Mesh and hit consumers borrow canonical state; no retained handoff.
+        0
 
     fun snapshotHandoffBytes(mode: VoxelRenderMode, retainedCount: Int): Int {
         require(retainedCount >= 0)
-        return minOf(retainedCount, presentationCapacity(mode)) * SNAPSHOT_ROW_BYTES
+        return 0
     }
 }
 
@@ -127,16 +130,20 @@ internal class CoverageRendererAllocationLedger(
             selectorStorageBytes,
         )
         val combinedBytes = currentBytes + candidateBytes
-        return CoverageRendererResourceAdmission(
-            strategy = if (combinedBytes <= CoverageRendererLimits.SHARED_OWNED_BUFFER_LIMIT_BYTES) {
-                CoverageRendererTransitionStrategy.COEXIST
-            } else {
-                CoverageRendererTransitionStrategy.CLEAR_FIRST
+        val admission = CoverageRendererResourceAdmission(
+            strategy = when {
+                candidateBytes > CoverageRendererLimits.ACTIVE_RENDERER_OWNED_LIMIT_BYTES ->
+                    CoverageRendererTransitionStrategy.REJECT
+                combinedBytes <= CoverageRendererLimits.INSTANTANEOUS_TRANSITION_LIMIT_BYTES ->
+                    CoverageRendererTransitionStrategy.COEXIST
+                else -> CoverageRendererTransitionStrategy.CLEAR_FIRST
             },
             currentBytes = currentBytes,
             candidateBytes = candidateBytes,
             combinedBytes = combinedBytes,
         )
+        telemetry.recordResourceAdmission(admission)
+        return admission
     }
 
     fun installPersistentCoverageState(mode: VoxelRenderMode) {
@@ -167,8 +174,8 @@ internal class CoverageRendererAllocationLedger(
     /** Charges the concrete bounded state received from the native renderer. */
     fun installPersistentCoverageState(rendererState: VisibilityGridRendererState) {
         chargePersistentCoverageState(
-            rendererState.ownedStorageBytes,
-            rendererState.capacity,
+            CoverageRendererLimits.rendererStateBytes(VoxelRenderMode.CENTROIDS),
+            CoverageRendererLimits.CENTROID_CAPACITY,
             rendererState.capacity,
         )
     }
@@ -179,7 +186,7 @@ internal class CoverageRendererAllocationLedger(
         selectorStorageBytes: Int? = null,
     ) {
         chargePersistentCoverageState(
-            VisibilityGridRendererState.ownedStorageBytes(presentationCapacity),
+            CoverageRendererLimits.rendererStateBytes(VoxelRenderMode.CENTROIDS),
             presentationCapacity,
             sourceCapacity,
             selectorStorageBytes,
@@ -196,10 +203,9 @@ internal class CoverageRendererAllocationLedger(
             RENDERER_STATE_OWNER,
             rendererStateBytes,
         )
-        telemetry.setOwnedBufferBytes(
-            AUXILIARY_OWNER,
-            CoverageRendererLimits.AUXILIARY_BYTES,
-        )
+        // Auxiliary arrays are lazy. A mode-specific auxiliary owner is
+        // charged only by the concrete proxy/glyph resource when requested.
+        telemetry.removeOwner(AUXILIARY_OWNER)
         if (sourceCapacity == null) {
             telemetry.removeOwner(PRESENTATION_STORAGE_OWNER)
         } else {
@@ -327,11 +333,8 @@ internal class CoveragePresentationSelector(
     private val selectedSourceSlots get() = storage.selectedSourceSlots
     private val selectedKeys get() = storage.selectedKeys
     private val selectedSurfaceIds get() = storage.selectedSurfaceIds
-    private val selectedKeyToDestination get() = storage.selectedKeyToDestination
-    private val selectedKeyMaxHeap get() = storage.selectedKeyMaxHeap
     private val freeDestinations get() = storage.freeDestinations
     private var freeDestinationCount = 0
-    private val dirtyDestinations get() = storage.dirtyDestinations
     private var selectedCount = 0
     private var sourceCount = 0
     private val sourceSlotToDestination get() = storage.sourceSlotToDestination
@@ -340,6 +343,34 @@ internal class CoveragePresentationSelector(
     private val sourceRankingStyles get() = storage.sourceRankingStyles
     private var initialized = false
     private var styleRowsPresent = false
+
+    /** Binary-search lookup over selected stable identities. */
+    fun destinationForSurfaceId(surfaceId: Long): Int {
+        val size = selectedCount
+        var low = 0
+        var high = size - 1
+        while (low <= high) {
+            val middle = (low + high) ushr 1
+            when {
+                storage.sortedSurfaceIds[middle] < surfaceId -> low = middle + 1
+                storage.sortedSurfaceIds[middle] > surfaceId -> high = middle - 1
+                else -> return storage.sortedDestinations[middle]
+            }
+        }
+        return -1
+    }
+
+    fun selectedSourceSlot(destination: Int): Int {
+        require(destination in 0 until selectedCount)
+        return selectedSourceSlots[destination]
+    }
+
+    fun selectedSurfaceId(destination: Int): Long {
+        require(destination in 0 until selectedCount)
+        return selectedSurfaceIds[destination]
+    }
+
+    fun selectedCount(): Int = selectedCount
 
     init {
         require(maximumCapacity > 0)
@@ -376,7 +407,9 @@ internal class CoveragePresentationSelector(
         if (styleChanged) reset()
         if (forceReset && initialized) reset()
         styleRowsPresent = styleRowsAvailable
-        ensureSourceCapacity(snapshot.capacity)
+        // Capacity describes the upstream fixed array; only committed rows
+        // need selector metadata. This is the bounded source high-water.
+        ensureSourceCapacity(snapshot.count)
         val sourceShrunk = initialized && snapshot.count < sourceCount
         val sourceRewritten = initialized && !sourceShrunk && selectedIdentityChanged(snapshot)
         val rankingRewritten = initialized && sourceRankingChanged(snapshot)
@@ -422,8 +455,6 @@ internal class CoveragePresentationSelector(
             styleRowsPresent = false
             return
         }
-        selectedKeyToDestination.clear()
-        selectedKeyMaxHeap.clear()
         selectedCount = 0
         sourceCount = 0
         freeDestinationCount = activeCapacity
@@ -435,14 +466,12 @@ internal class CoveragePresentationSelector(
         sourceRankingSurfaceIds.fill(0L)
         sourceRankingKeys.fill(0L)
         sourceRankingStyles.fill(0)
-        dirtyDestinations.clear()
+        storage.clearDirty()
         initialized = false
         styleRowsPresent = false
     }
 
     private fun initialize(snapshot: CoveragePointRenderSnapshot) {
-        selectedKeyToDestination.clear()
-        selectedKeyMaxHeap.clear()
         sourceSlotToDestination.fill(-1)
         freeDestinationCount = activeCapacity
         for (destination in 0 until activeCapacity) {
@@ -472,15 +501,16 @@ internal class CoveragePresentationSelector(
         selectedSources.forEach { source -> assignSourceToFreeDestination(snapshot, source) }
         sourceCount = snapshot.count
         rememberSourceRanking(snapshot)
+        rebuildIdentityLookup()
         initialized = true
     }
 
     private fun acceptNewCandidates(snapshot: CoveragePointRenderSnapshot): IntArray {
-        dirtyDestinations.clear()
+        storage.clearDirty()
         for (source in sourceCount until snapshot.count) {
             if (selectedCount < activeCapacity) {
                 val destination = assignSourceToFreeDestination(snapshot, source)
-                dirtyDestinations.add(destination)
+                storage.markDirty(destination)
             } else if (selectedCount > 0) {
                 val largestDestination = (0 until selectedCount).maxWithOrNull { first, second ->
                     compareSource(selectedSourceSlots[first], selectedSourceSlots[second], snapshot)
@@ -490,19 +520,17 @@ internal class CoveragePresentationSelector(
                     compareSource(source, evictedSource, snapshot) < 0
                 ) {
                     val destination = largestDestination
-                    selectedKeyToDestination.remove(selectedSurfaceIds[destination])
                     sourceSlotToDestination[evictedSource] = -1
                     selectedSourceSlots[destination] = source
                     selectedKeys[destination] = snapshot.keys[source]
                     selectedSurfaceIds[destination] = snapshot.surfaceIds[source]
-                    selectedKeyToDestination[snapshot.surfaceIds[source]] = destination
-                    selectedKeyMaxHeap.add(snapshot.surfaceIds[source], selectedKeyToDestination::containsKey)
                     sourceSlotToDestination[source] = destination
-                    dirtyDestinations.add(destination)
+                    storage.markDirty(destination)
                 }
             }
         }
-        return dirtyDestinations.drainActive(selectedCount)
+        rebuildIdentityLookup()
+        return storage.drainDirty(selectedCount)
     }
 
     private fun assignSourceToFreeDestination(
@@ -514,11 +542,26 @@ internal class CoveragePresentationSelector(
         selectedSourceSlots[destination] = source
         selectedKeys[destination] = snapshot.keys[source]
         selectedSurfaceIds[destination] = snapshot.surfaceIds[source]
-        selectedKeyToDestination[snapshot.surfaceIds[source]] = destination
-        selectedKeyMaxHeap.add(snapshot.surfaceIds[source], selectedKeyToDestination::containsKey)
         sourceSlotToDestination[source] = destination
         selectedCount++
         return destination
+    }
+
+    private fun rebuildIdentityLookup() {
+        for (destination in 0 until selectedCount) {
+            storage.sortedSurfaceIds[destination] = selectedSurfaceIds[destination]
+            storage.sortedDestinations[destination] = destination
+        }
+        val order = (0 until selectedCount).toMutableList()
+        order.sortBy { storage.sortedSurfaceIds[it] }
+        val ids = LongArray(selectedCount)
+        val destinations = IntArray(selectedCount)
+        order.forEachIndexed { index, original ->
+            ids[index] = storage.sortedSurfaceIds[original]
+            destinations[index] = storage.sortedDestinations[original]
+        }
+        ids.copyInto(storage.sortedSurfaceIds)
+        destinations.copyInto(storage.sortedDestinations)
     }
 
     private fun applyDirtySpans(
