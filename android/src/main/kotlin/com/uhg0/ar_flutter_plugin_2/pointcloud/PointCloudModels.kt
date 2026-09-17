@@ -432,28 +432,47 @@ internal fun CoveragePointRenderSnapshot.deepCopy(): CoveragePointRenderSnapshot
  */
 internal fun CoveragePointRenderSnapshot.rewritePaletteBuffers(
     palette: CoverageRendererPalette,
+    fullSpanOnPaletteChange: Boolean = false,
 ): CoveragePointRenderSnapshot {
-    if (styleRows.isEmpty()) return this
     val styledRows = styleRows.copyOf()
     val styledColors = colors.copyOf()
-    repeat(count) { index ->
-        val offset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
-        val style = CoverageRendererStyleRowV1.decode(styleRows, offset).copy(palette = palette)
-        style.encode().copyInto(styledRows, offset)
-        styledColors[index] = style.packedColor()
+    if (styleRows.isNotEmpty()) {
+        repeat(count) { index ->
+            val offset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
+            val style = CoverageRendererStyleRowV1.decode(styleRows, offset).copy(palette = palette)
+            style.encode().copyInto(styledRows, offset)
+            styledColors[index] = style.packedColor()
+        }
     }
-    val styledSpans = update?.spans?.map { span ->
-        val spanColors = span.colors.copyOf()
-        val spanStyles = span.styleRows.copyOf()
-        if (spanStyles.isNotEmpty()) {
-            repeat(spanColors.size) { index ->
-                val offset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
-                val style = CoverageRendererStyleRowV1.decode(spanStyles, offset).copy(palette = palette)
-                style.encode().copyInto(spanStyles, offset)
-                spanColors[index] = style.packedColor()
+    val styledSpans = update?.let { sourceUpdate ->
+        if (fullSpanOnPaletteChange) {
+            if (count == 0) {
+                emptyList()
+            } else {
+                listOf(
+                    CoveragePointSpan(
+                        startSlot = 0,
+                        positions = positions.copyOf(),
+                        colors = styledColors.copyOf(),
+                        styleRows = styledRows.copyOf(),
+                    ),
+                )
+            }
+        } else {
+            sourceUpdate.spans.map { span ->
+                val spanColors = span.colors.copyOf()
+                val spanStyles = span.styleRows.copyOf()
+                if (spanStyles.isNotEmpty()) {
+                    repeat(spanColors.size) { index ->
+                        val offset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
+                        val style = CoverageRendererStyleRowV1.decode(spanStyles, offset).copy(palette = palette)
+                        style.encode().copyInto(spanStyles, offset)
+                        spanColors[index] = style.packedColor()
+                    }
+                }
+                span.copy(colors = spanColors, styleRows = spanStyles)
             }
         }
-        span.copy(colors = spanColors, styleRows = spanStyles)
     }
     return copy(
         colors = styledColors,

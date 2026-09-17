@@ -463,9 +463,12 @@ internal class NativeCoverageRendererOwner(
                 rendererGeneration = current?.rendererGeneration ?: 0L,
             )
         }
+        val paletteOnlyChange = this.controls.visible == controls.visible &&
+            this.controls.mode == controls.mode &&
+            this.controls.palette != controls.palette
         this.controls = controls
         controlsConfigured = true
-        recomputePresentationPlan()
+        recomputePresentationPlan(fullPaletteRecolor = paletteOnlyChange)
         notifyPresentationChanged()
         val snapshot = latest
         return RendererControlReceipt(
@@ -682,7 +685,10 @@ internal class NativeCoverageRendererOwner(
         onPresentationChanged(presentationSnapshot(), controls.mode)
     }
 
-    private fun recomputePresentationPlan(explicitResync: Boolean = false) {
+    private fun recomputePresentationPlan(
+        explicitResync: Boolean = false,
+        fullPaletteRecolor: Boolean = false,
+    ) {
         val current = latest ?: run {
             presentationPlan = null
             resetPresentationSelector()
@@ -710,7 +716,10 @@ internal class NativeCoverageRendererOwner(
                     controls.mode.presentationCapacity,
                     forceReset = selectorReset,
                 )
-                .rewritePaletteBuffers(controls.palette)
+                .rewritePaletteBuffers(
+                    palette = controls.palette,
+                    fullSpanOnPaletteChange = fullPaletteRecolor,
+                )
         }
         presentationPlan = CoveragePresentationPlan(
             mode = controls.mode,

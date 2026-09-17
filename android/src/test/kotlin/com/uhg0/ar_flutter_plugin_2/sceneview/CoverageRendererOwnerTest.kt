@@ -9,6 +9,7 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererTarget
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -401,7 +402,21 @@ class CoverageRendererOwnerTest {
             ).encode(),
         ).reduce { left, right -> left + right }
         val owner = NativeCoverageRendererOwner()
-        owner.install(generatedSnapshot(3, 1L, styleRows = styleRows))
+        owner.install(
+            generatedSnapshot(
+                3,
+                1L,
+                styleRows = styleRows,
+                update = CoveragePointRenderUpdate(
+                    geometryRevision = 1L,
+                    visibilityRevision = 1L,
+                    enabled = true,
+                    count = 3,
+                    spans = emptyList(),
+                    reset = false,
+                ),
+            ),
+        )
         val before = checkNotNull(owner.presentationSnapshot())
         val slots = before.surfaceIds.copyOf()
 
@@ -415,7 +430,14 @@ class CoverageRendererOwnerTest {
 
         val after = checkNotNull(owner.presentationSnapshot())
         assertEquals(slots.toList(), after.surfaceIds.toList())
-        assertFalse(checkNotNull(after.update).reset)
+        val update = checkNotNull(after.update)
+        assertFalse(update.reset)
+        assertEquals(1, update.spans.size)
+        assertEquals(0, update.spans.single().startSlot)
+        assertEquals(after.count, update.spans.single().colors.size)
+        assertArrayEquals(after.positions, update.spans.single().positions, 0f)
+        assertArrayEquals(after.colors, update.spans.single().colors)
+        assertArrayEquals(after.styleRows, update.spans.single().styleRows)
         assertEquals(
             CoverageRendererPalette.NORMAL,
             CoverageRendererStyleRowV1.decode(after.styleRows).palette,
