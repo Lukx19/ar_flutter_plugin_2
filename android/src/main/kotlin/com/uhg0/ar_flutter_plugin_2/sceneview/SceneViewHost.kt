@@ -145,7 +145,15 @@ internal class SceneViewHost(
             token?.let { coverageRendererOwner.markResourceReleased(it) }
             token?.let { rendererTelemetry.clearResidentPresentation(it) }
         },
-        admit = { mode, _ -> rendererAllocationLedger.admitResourceReplacement(mode) },
+        admit = { mode, _ ->
+            rendererAllocationLedger.admitResourceReplacement(
+                mode,
+                sourceCapacity = coverageRendererOwner.sourceCapacity()
+                    ?: CoverageRendererLimits.presentationCapacity(mode),
+                retainedCount = coverageRendererOwner.sourceRowCount()
+                    ?: CoverageRendererLimits.presentationCapacity(mode),
+            )
+        },
         onClearFirst = { transition ->
             transition.token?.let { coverageRendererOwner.markResourceFailure(it) }
                 ?: coverageRendererOwner.markResourceFailure(transition.rendererGeneration)
@@ -746,6 +754,10 @@ internal class SceneViewHost(
         if (requiresReplacement) {
             val admission = rendererAllocationLedger.admitResourceReplacement(
                 effectiveConfig.voxelRenderMode,
+                sourceCapacity = coverageRendererOwner.sourceCapacity()
+                    ?: CoverageRendererLimits.presentationCapacity(effectiveConfig.voxelRenderMode),
+                retainedCount = coverageRendererOwner.sourceRowCount()
+                    ?: CoverageRendererLimits.presentationCapacity(effectiveConfig.voxelRenderMode),
             )
             if (current != null &&
                 admission.strategy == CoverageRendererTransitionStrategy.CLEAR_FIRST
@@ -779,7 +791,13 @@ internal class SceneViewHost(
         val modeChanged = current.voxelRenderMode != nextMode
         return runCatching {
             if (modeChanged) {
-                val admission = rendererAllocationLedger.admitResourceReplacement(nextMode)
+                val admission = rendererAllocationLedger.admitResourceReplacement(
+                    nextMode,
+                    sourceCapacity = coverageRendererOwner.sourceCapacity()
+                        ?: CoverageRendererLimits.presentationCapacity(nextMode),
+                    retainedCount = coverageRendererOwner.sourceRowCount()
+                        ?: CoverageRendererLimits.presentationCapacity(nextMode),
+                )
                 if (admission.strategy == CoverageRendererTransitionStrategy.CLEAR_FIRST) {
                     coverageRendererOwner.currentResourceToken()?.let {
                         coverageRendererOwner.markResourceFailure(it)

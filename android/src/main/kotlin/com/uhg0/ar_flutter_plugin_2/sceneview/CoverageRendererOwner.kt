@@ -6,6 +6,7 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererSemantic
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
+import com.uhg0.ar_flutter_plugin_2.pointcloud.deepCopyWithoutSpanValues
 import com.uhg0.ar_flutter_plugin_2.pointcloud.deepCopy
 import com.uhg0.ar_flutter_plugin_2.pointcloud.rewritePaletteBuffers
 import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_NO_DIRECTION
@@ -145,7 +146,7 @@ internal class CoveragePresentationPlan(
     val rows: List<VisibilityRendererRow> = Collections.unmodifiableList(
         rows.map { it.copy(style = it.style.copy()) },
     )
-    val renderSnapshot: CoveragePointRenderSnapshot? = renderSnapshot?.deepCopy()
+    val renderSnapshot: CoveragePointRenderSnapshot? = renderSnapshot?.deepCopyWithoutSpanValues()
     val residentRowCount: Int = this.rows.size
     val residentGlyphCount: Int = this.rows.count {
         it.style.glyph != com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererGlyph.NONE
@@ -751,6 +752,17 @@ internal class NativeCoverageRendererOwner(
     fun presentationSnapshot(): CoveragePointRenderSnapshot? {
         return presentationPlan?.renderSnapshot
     }
+
+    /**
+     * Returns only the canonical source dimensions needed for resource
+     * admission. The selector never retains source values or update spans;
+     * those are read from the incoming cut and the single bounded plan.
+     */
+    @Synchronized
+    fun sourceCapacity(): Int? = latest?.renderSnapshot?.capacity
+
+    @Synchronized
+    fun sourceRowCount(): Int? = latest?.renderSnapshot?.count
 
     @Synchronized
     fun presentationPlan(): CoveragePresentationPlan? = presentationPlan

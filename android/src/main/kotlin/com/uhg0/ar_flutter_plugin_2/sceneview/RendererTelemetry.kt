@@ -102,6 +102,7 @@ internal class RendererTelemetry {
         if (residentToken != null && residentToken != token &&
             residentToken!!.epoch > token.epoch
         ) return false
+        if (residentToken != token) clearResidentPresentation()
         setResidentPresentation(rowCount, glyphCount)
         residentToken = token
         residentRowsByMode[mode] = rowCount

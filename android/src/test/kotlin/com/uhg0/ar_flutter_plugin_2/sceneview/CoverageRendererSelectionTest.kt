@@ -1,8 +1,11 @@
 package com.uhg0.ar_flutter_plugin_2.sceneview
 
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererCoverage
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
+import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridRendererState
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -12,6 +15,87 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CoverageRendererSelectionTest {
+    @Test
+    fun `mode cycle shrinks cube cut and restores centroid from canonical source while dirty values stay top level`() {
+        val sourceCount = CoverageRendererLimits.CENTROID_CAPACITY
+        val positions = FloatArray(sourceCount * 3)
+        positions[0] = 7f
+        val source = CoveragePointRenderSnapshot(
+            revision = 1L,
+            enabled = true,
+            capacity = sourceCount,
+            count = sourceCount,
+            keys = LongArray(sourceCount) { it.toLong() },
+            positions = positions,
+            colors = IntArray(sourceCount),
+        )
+        val selector = CoveragePresentationSelector(CoverageRendererLimits.CENTROID_CAPACITY)
+
+        val cube = selector.select(
+            source,
+            requestedCapacity = CoverageRendererLimits.CUBE_CAPACITY,
+        )
+        assertEquals(CoverageRendererLimits.CUBE_CAPACITY, cube.count)
+        assertEquals(
+            CoveragePresentationStorage.estimatedOwnedStorageBytes(
+                CoverageRendererLimits.CUBE_CAPACITY,
+                sourceCapacity = source.capacity,
+            ),
+            selector.ownedStorageBytes,
+        )
+        assertTrue(
+            CoverageRendererLimits.activeRendererPeakBytes(
+                VoxelRenderMode.CUBES,
+                sourceCapacity = source.capacity,
+                retainedCount = source.count,
+            ) <= CoverageRendererLimits.SHARED_OWNED_BUFFER_LIMIT_BYTES,
+        )
+
+        val mutatedPositions = positions.copyOf().also { it[0] = 42f }
+        val mutated = source.copy(
+            revision = 2L,
+            positions = mutatedPositions,
+            update = CoveragePointRenderUpdate(
+                geometryRevision = 2L,
+                visibilityRevision = 2L,
+                enabled = true,
+                count = sourceCount,
+                spans = listOf(
+                    CoveragePointSpan(
+                        startSlot = 0,
+                        positions = FloatArray(0),
+                        colors = IntArray(0),
+                        endSlotExclusive = 1,
+                    ),
+                ),
+                reset = false,
+            ),
+        )
+        val mutatedCube = selector.select(
+            mutated,
+            requestedCapacity = CoverageRendererLimits.CUBE_CAPACITY,
+            forceReset = false,
+        )
+        assertEquals(42f, mutatedCube.positions[0])
+        val dirtyUpdate = checkNotNull(mutatedCube.update)
+        assertTrue(dirtyUpdate.spans.single().positions.isEmpty())
+        assertTrue(dirtyUpdate.spans.single().colors.isEmpty())
+
+        val centroid = selector.select(
+            mutated,
+            requestedCapacity = CoverageRendererLimits.CENTROID_CAPACITY,
+        )
+        assertEquals(CoverageRendererLimits.CENTROID_CAPACITY, centroid.count)
+        assertEquals(42f, centroid.positions[0])
+        assertEquals(
+            CoveragePresentationStorage.estimatedOwnedStorageBytes(
+                CoverageRendererLimits.CENTROID_CAPACITY,
+                sourceCapacity = source.capacity,
+            ),
+            selector.ownedStorageBytes,
+        )
+    }
+
     @Test
     fun `retained selector storage is lazy and follows the active presentation capacity`() {
         val selector = CoveragePresentationSelector(CoverageRendererLimits.CENTROID_CAPACITY)
@@ -36,7 +120,6 @@ class CoverageRendererSelectionTest {
             CoveragePresentationStorage.estimatedOwnedStorageBytes(
                 CoverageRendererLimits.CENTROID_CAPACITY,
                 sourceCapacity = source.capacity,
-                withStyleRows = false,
             ),
             selector.ownedStorageBytes,
         )
@@ -232,7 +315,7 @@ class CoverageRendererSelectionTest {
         assertEquals(2_000, CoverageRendererLimits.RAW_POINT_CAPACITY)
         assertEquals(20_000, CoverageRendererLimits.CENTROID_CAPACITY)
         assertEquals(8_000, CoverageRendererLimits.CUBE_CAPACITY)
-        assertEquals(7_971_200, CoverageRendererLimits.maximumActiveRendererBytes)
+        assertEquals(7_779_200, CoverageRendererLimits.maximumActiveRendererBytes)
         com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.entries.forEach { mode ->
             assertTrue(
                 "$mode startup peak must fit the shared renderer cap",
@@ -277,6 +360,7 @@ class CoverageRendererSelectionTest {
             VisibilityGridRendererState.ownedStorageBytes(CoverageRendererLimits.CENTROID_CAPACITY) +
                 CoverageRendererLimits.presentationStorageBytes(
                     com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS,
+                    snapshot.capacity,
                 ) +
                 CoverageRendererLimits.AUXILIARY_BYTES +
                 CoverageRendererLimits.SNAPSHOT_ROW_BYTES,
@@ -383,7 +467,8 @@ class CoverageRendererSelectionTest {
         assertArrayEquals(floatArrayOf(10f, 0f, 0f, 20f, 0f, 0f), bounded.positions, 0f)
         val update = checkNotNull(bounded.update)
         assertTrue(update.reset)
-        assertEquals(2, update.spans.single().colors.size)
+        assertEquals(2, update.spans.single().rowCount)
+        assertTrue(update.spans.single().positions.isEmpty())
     }
 
     @Test
@@ -430,7 +515,8 @@ class CoverageRendererSelectionTest {
         assertArrayEquals(longArrayOf(10, 20), bounded.keys)
         assertEquals(false, checkNotNull(bounded.update).reset)
         assertEquals(0, bounded.update.spans.single().startSlot)
-        assertArrayEquals(floatArrayOf(11f, 0f, 0f), bounded.update.spans.single().positions, 0f)
+        assertEquals(1, bounded.update.spans.single().rowCount)
+        assertTrue(bounded.update.spans.single().positions.isEmpty())
     }
 
     @Test
@@ -463,7 +549,7 @@ class CoverageRendererSelectionTest {
             CoverageRendererCoverage.COMPLETE,
             CoverageRendererStyleRowV1.decode(bounded.styleRows, 16).coverage,
         )
-        assertArrayEquals(bounded.styleRows, bounded.update!!.spans.single().styleRows)
+        assertTrue(bounded.update!!.spans.single().styleRows.isEmpty())
     }
 
     @Test
@@ -515,7 +601,7 @@ class CoverageRendererSelectionTest {
         assertEquals(false, update.reset)
         assertEquals(1, update.spans.size)
         assertEquals(2, update.spans.single().startSlot)
-        assertEquals(1, update.spans.single().colors.size)
+        assertEquals(1, update.spans.single().rowCount)
     }
 
     @Test
@@ -548,7 +634,7 @@ class CoverageRendererSelectionTest {
         assertEquals(2, bounded.count)
         assertArrayEquals(longArrayOf(10, 30), bounded.keys)
         assertTrue(checkNotNull(bounded.update).reset)
-        assertEquals(2, bounded.update.spans.single().colors.size)
+        assertEquals(2, bounded.update.spans.single().rowCount)
     }
 
     @Test

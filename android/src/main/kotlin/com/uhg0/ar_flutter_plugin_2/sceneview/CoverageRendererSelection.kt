@@ -27,8 +27,8 @@ internal object CoverageRendererLimits {
         (WARM_PROXY_CAPACITY + COLD_OVERVIEW_CAPACITY + GLYPH_CAPACITY + DEBUG_ROW_CAPACITY) *
             AUXILIARY_ROW_BYTES
 
-    /** key + position + color + style row in one retained snapshot row. */
-    const val SNAPSHOT_ROW_BYTES = 40
+    /** key + surface identity + position + color + style row in one plan row. */
+    const val SNAPSHOT_ROW_BYTES = 48
 
     /**
      * The three mode resources are deliberately lazy and mutually exclusive.
@@ -58,12 +58,25 @@ internal object CoverageRendererLimits {
     fun presentationStorageBytes(mode: VoxelRenderMode): Int =
         CoveragePresentationStorage.estimatedOwnedStorageBytes(presentationCapacity(mode))
 
+    fun presentationStorageBytes(mode: VoxelRenderMode, sourceCapacity: Int): Int =
+        CoveragePresentationStorage.estimatedOwnedStorageBytes(
+            presentationCapacity(mode),
+            sourceCapacity,
+        )
+
     fun activeRendererPeakBytes(mode: VoxelRenderMode): Int =
+        activeRendererPeakBytes(mode, presentationCapacity(mode), presentationCapacity(mode))
+
+    fun activeRendererPeakBytes(
+        mode: VoxelRenderMode,
+        sourceCapacity: Int,
+        retainedCount: Int,
+    ): Int =
         resourcePeakBytes(mode) +
             rendererStateBytes(mode) +
-            presentationStorageBytes(mode) +
+            presentationStorageBytes(mode, sourceCapacity) +
             AUXILIARY_BYTES +
-            snapshotHandoffBytes(mode)
+            snapshotHandoffBytes(mode, retainedCount)
 
     val maximumActiveRendererBytes: Int = VoxelRenderMode.entries.maxOf(::activeRendererPeakBytes)
 
@@ -99,9 +112,17 @@ internal class CoverageRendererAllocationLedger(
      * old total in the sum makes clear-first a safe decision whenever the two
      * generations cannot coexist under the renderer cap.
      */
-    fun admitResourceReplacement(mode: VoxelRenderMode): CoverageRendererResourceAdmission {
+    fun admitResourceReplacement(
+        mode: VoxelRenderMode,
+        sourceCapacity: Int = CoverageRendererLimits.presentationCapacity(mode),
+        retainedCount: Int = CoverageRendererLimits.presentationCapacity(mode),
+    ): CoverageRendererResourceAdmission {
         val currentBytes = telemetry.ownedBufferBytesSnapshot()
-        val candidateBytes = CoverageRendererLimits.activeRendererPeakBytes(mode)
+        val candidateBytes = CoverageRendererLimits.activeRendererPeakBytes(
+            mode,
+            sourceCapacity,
+            retainedCount,
+        )
         val combinedBytes = currentBytes + candidateBytes
         return CoverageRendererResourceAdmission(
             strategy = if (combinedBytes <= CoverageRendererLimits.SHARED_OWNED_BUFFER_LIMIT_BYTES) {
@@ -132,7 +153,10 @@ internal class CoverageRendererAllocationLedger(
             telemetry.removeOwner(PRESENTATION_STORAGE_OWNER)
             return
         }
-        installPersistentCoverageState(mode)
+        installPersistentCoverageStateForCapacity(
+            presentationCapacity = CoverageRendererLimits.presentationCapacity(mode),
+            sourceCapacity = snapshot.capacity,
+        )
     }
 
     /** Charges the concrete bounded state received from the native renderer. */
@@ -140,23 +164,25 @@ internal class CoverageRendererAllocationLedger(
         chargePersistentCoverageState(
             rendererState.ownedStorageBytes,
             rendererState.capacity,
+            rendererState.capacity,
         )
     }
 
-    fun installPersistentCoverageStateForCapacity(presentationCapacity: Int) {
+    fun installPersistentCoverageStateForCapacity(
+        presentationCapacity: Int,
+        sourceCapacity: Int = presentationCapacity,
+    ) {
         chargePersistentCoverageState(
             VisibilityGridRendererState.ownedStorageBytes(presentationCapacity),
             presentationCapacity,
+            sourceCapacity,
         )
-    }
-
-    private fun chargePersistentCoverageState(rendererStateBytes: Int) {
-        chargePersistentCoverageState(rendererStateBytes, null)
     }
 
     private fun chargePersistentCoverageState(
         rendererStateBytes: Int,
-        presentationCapacity: Int?,
+        presentationCapacity: Int,
+        sourceCapacity: Int?,
     ) {
         telemetry.setOwnedBufferBytes(
             RENDERER_STATE_OWNER,
@@ -166,12 +192,15 @@ internal class CoverageRendererAllocationLedger(
             AUXILIARY_OWNER,
             CoverageRendererLimits.AUXILIARY_BYTES,
         )
-        if (presentationCapacity == null) {
+        if (sourceCapacity == null) {
             telemetry.removeOwner(PRESENTATION_STORAGE_OWNER)
         } else {
             telemetry.setOwnedBufferBytes(
                 PRESENTATION_STORAGE_OWNER,
-                CoveragePresentationStorage.estimatedOwnedStorageBytes(presentationCapacity),
+                CoveragePresentationStorage.estimatedOwnedStorageBytes(
+                    presentationCapacity,
+                    sourceCapacity,
+                ),
             )
         }
     }
@@ -290,9 +319,6 @@ internal class CoveragePresentationSelector(
     private val selectedSourceSlots get() = storage.selectedSourceSlots
     private val selectedKeys get() = storage.selectedKeys
     private val selectedSurfaceIds get() = storage.selectedSurfaceIds
-    private val selectedPositions get() = storage.selectedPositions
-    private val selectedColors get() = storage.selectedColors
-    private val selectedStyleRows get() = storage.selectedStyleRows
     private val selectedKeyToDestination get() = storage.selectedKeyToDestination
     private val selectedKeyMaxHeap get() = storage.selectedKeyMaxHeap
     private val freeDestinations get() = storage.freeDestinations
@@ -454,7 +480,6 @@ internal class CoveragePresentationSelector(
                     selectedKeyToDestination[snapshot.surfaceIds[source]] = destination
                     selectedKeyMaxHeap.add(snapshot.surfaceIds[source], selectedKeyToDestination::containsKey)
                     sourceSlotToDestination[source] = destination
-                    copySourceRow(snapshot, source, destination)
                     dirtyDestinations.add(destination)
                 }
             }
@@ -474,7 +499,6 @@ internal class CoveragePresentationSelector(
         selectedKeyToDestination[snapshot.surfaceIds[source]] = destination
         selectedKeyMaxHeap.add(snapshot.surfaceIds[source], selectedKeyToDestination::containsKey)
         sourceSlotToDestination[source] = destination
-        copySourceRow(snapshot, source, destination)
         selectedCount++
         return destination
     }
@@ -486,7 +510,7 @@ internal class CoveragePresentationSelector(
         val spans = ArrayList<CoveragePointSpan>()
         update.spans.forEach { span ->
             var source = span.startSlot
-            val end = span.startSlot + span.colors.size
+            val end = span.endSlotExclusive
             while (source < end) {
                 val destination = sourceSlotToDestination.getOrElse(source) { -1 }
                 if (destination < 0) {
@@ -495,23 +519,19 @@ internal class CoveragePresentationSelector(
                 }
                 val firstDestination = destination
                 var run = 1
-                copySourceRow(snapshot, source, destination)
                 source++
                 while (source < end &&
                     sourceSlotToDestination.getOrElse(source) { -1 } == firstDestination + run
                 ) {
-                    copySourceRow(snapshot, source, firstDestination + run)
                     source++
                     run++
                 }
                 spans += CoveragePointSpan(
                     startSlot = firstDestination,
-                    positions = selectedPositions.copyOfRange(
-                        firstDestination * CoveragePointMeshResources.POSITION_COMPONENTS,
-                        (firstDestination + run) * CoveragePointMeshResources.POSITION_COMPONENTS,
-                    ),
-                    colors = selectedColors.copyOfRange(firstDestination, firstDestination + run),
-                    styleRows = selectedStyleRange(firstDestination, firstDestination + run),
+                    positions = FloatArray(0),
+                    colors = IntArray(0),
+                    styleRows = ByteArray(0),
+                    endSlotExclusive = firstDestination + run,
                 )
             }
         }
@@ -528,25 +548,6 @@ internal class CoveragePresentationSelector(
             val source = selectedSourceSlots[destination]
             selectedKeys[destination] = snapshot.keys[source]
             selectedSurfaceIds[destination] = snapshot.surfaceIds[source]
-            copySourceRow(snapshot, source, destination)
-        }
-    }
-
-    private fun copySourceRow(snapshot: CoveragePointRenderSnapshot, source: Int, destination: Int) {
-        snapshot.positions.copyInto(
-            selectedPositions,
-            destinationOffset = destination * CoveragePointMeshResources.POSITION_COMPONENTS,
-            startIndex = source * CoveragePointMeshResources.POSITION_COMPONENTS,
-            endIndex = (source + 1) * CoveragePointMeshResources.POSITION_COMPONENTS,
-        )
-        selectedColors[destination] = snapshot.colors[source]
-        if (snapshot.styleRows.isNotEmpty()) {
-            snapshot.styleRows.copyInto(
-                selectedStyleRows,
-                destination * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-                source * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-                (source + 1) * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-            )
         }
     }
 
@@ -561,11 +562,32 @@ internal class CoveragePresentationSelector(
         surfaceIds = LongArray(selectedCount) { destination ->
             source.surfaceIds[selectedSourceSlots[destination]]
         },
-        positions = selectedPositions.copyOf(
-            selectedCount * CoveragePointMeshResources.POSITION_COMPONENTS,
-        ),
-        colors = selectedColors.copyOf(selectedCount),
-        styleRows = selectedStyleRange(0, selectedCount),
+        positions = FloatArray(selectedCount * CoveragePointMeshResources.POSITION_COMPONENTS) {
+            destination ->
+                val sourceSlot = selectedSourceSlots[
+                    destination / CoveragePointMeshResources.POSITION_COMPONENTS
+                ]
+                source.positions[
+                    sourceSlot * CoveragePointMeshResources.POSITION_COMPONENTS +
+                        destination % CoveragePointMeshResources.POSITION_COMPONENTS
+                ]
+        },
+        colors = IntArray(selectedCount) { destination ->
+            source.colors[selectedSourceSlots[destination]]
+        },
+        styleRows = if (!styleRowsPresent) ByteArray(0) else ByteArray(
+            selectedCount * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+        ).also { styles ->
+            repeat(selectedCount) { destination ->
+                val sourceSlot = selectedSourceSlots[destination]
+                source.styleRows.copyInto(
+                    styles,
+                    destination * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                    sourceSlot * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                    (sourceSlot + 1) * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                )
+            }
+        },
         update = CoveragePointRenderUpdate(
             geometryRevision = source.update?.geometryRevision ?: source.revision,
             visibilityRevision = source.update?.visibilityRevision ?: source.revision,
@@ -580,12 +602,10 @@ internal class CoveragePresentationSelector(
         if (selectedCount == 0) emptyList() else {
             listOf(
                 CoveragePointSpan(
-                    0,
-                    selectedPositions.copyOf(
-                        selectedCount * CoveragePointMeshResources.POSITION_COMPONENTS,
-                    ),
-                    selectedColors.copyOf(selectedCount),
-                    selectedStyleRange(0, selectedCount),
+                    startSlot = 0,
+                    positions = FloatArray(0),
+                    colors = IntArray(0),
+                    endSlotExclusive = selectedCount,
                 ),
             )
         }
@@ -599,12 +619,9 @@ internal class CoveragePresentationSelector(
             val endExclusive = endInclusive + 1
             spans += CoveragePointSpan(
                 startSlot = start,
-                positions = selectedPositions.copyOfRange(
-                    start * CoveragePointMeshResources.POSITION_COMPONENTS,
-                    endExclusive * CoveragePointMeshResources.POSITION_COMPONENTS,
-                ),
-                colors = selectedColors.copyOfRange(start, endExclusive),
-                styleRows = selectedStyleRange(start, endExclusive),
+                positions = FloatArray(0),
+                colors = IntArray(0),
+                endSlotExclusive = endExclusive,
             )
         }
         for (index in 1 until destinations.size) {
@@ -664,12 +681,6 @@ internal class CoveragePresentationSelector(
                 snapshot.styleRows.size == snapshot.count * COVERAGE_RENDERER_STYLE_ROW_BYTES,
         )
     }
-
-    private fun selectedStyleRange(start: Int, endExclusive: Int): ByteArray =
-        if (!styleRowsPresent) ByteArray(0) else selectedStyleRows.copyOfRange(
-            start * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-            endExclusive * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-        )
 
     private fun siftUp(heap: IntArray, start: Int, snapshot: CoveragePointRenderSnapshot) {
         var child = start

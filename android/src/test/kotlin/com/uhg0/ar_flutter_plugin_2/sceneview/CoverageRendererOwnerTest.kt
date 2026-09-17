@@ -435,10 +435,10 @@ class CoverageRendererOwnerTest {
         assertEquals(1L, after.paletteRevision)
         assertEquals(1, update.spans.size)
         assertEquals(0, update.spans.single().startSlot)
-        assertEquals(after.count, update.spans.single().colors.size)
-        assertArrayEquals(after.positions, update.spans.single().positions, 0f)
-        assertArrayEquals(after.colors, update.spans.single().colors)
-        assertArrayEquals(after.styleRows, update.spans.single().styleRows)
+        assertEquals(after.count, update.spans.single().rowCount)
+        assertTrue(update.spans.single().positions.isEmpty())
+        assertTrue(update.spans.single().colors.isEmpty())
+        assertTrue(update.spans.single().styleRows.isEmpty())
         assertEquals(
             CoverageRendererPalette.NORMAL,
             CoverageRendererStyleRowV1.decode(after.styleRows).palette,

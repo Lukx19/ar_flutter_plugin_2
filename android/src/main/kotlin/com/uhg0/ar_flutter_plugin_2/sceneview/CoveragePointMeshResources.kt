@@ -402,7 +402,7 @@ internal class CoveragePointUploadCoordinator(
                 listOf(UploadRange(0, count))
             } else {
                 spans.map { span ->
-                    UploadRange(span.startSlot, span.startSlot + span.colors.size)
+                    UploadRange(span.startSlot, span.endSlotExclusive)
                 }
             }
         return buildList {

@@ -429,6 +429,17 @@ internal fun CoveragePointRenderSnapshot.deepCopy(): CoveragePointRenderSnapshot
     ),
 )
 
+/** Immutable renderer-plan copy: one bounded row buffer plus range-only dirties. */
+internal fun CoveragePointRenderSnapshot.deepCopyWithoutSpanValues(): CoveragePointRenderSnapshot = copy(
+    keys = keys.copyOf(),
+    surfaceIds = surfaceIds.copyOf(),
+    positions = positions.copyOf(),
+    colors = colors.copyOf(),
+    styleRows = styleRows.copyOf(),
+    gridRotationWorld = gridRotationWorld.copyOf(),
+    update = update?.copy(spans = update.spans.map { it.rangeOnly() }),
+)
+
 /**
  * Rewrites palette-derived buffers without changing presentation slots or
  * dirty-span membership.  The caller owns the returned immutable snapshot.
@@ -511,13 +522,27 @@ data class CoveragePointSpan(
     val positions: FloatArray,
     val colors: IntArray,
     val styleRows: ByteArray = ByteArray(0),
+    /** Exclusive range end for immutable range-only dirty spans. */
+    val endSlotExclusive: Int = startSlot + colors.size,
 ) {
     init {
+        require(startSlot >= 0)
+        require(endSlotExclusive >= startSlot)
+        require(endSlotExclusive == startSlot + colors.size || colors.isEmpty())
         require(
             styleRows.isEmpty() ||
                 styleRows.size == colors.size * COVERAGE_RENDERER_STYLE_ROW_BYTES,
         )
     }
+
+    val rowCount: Int get() = endSlotExclusive - startSlot
+
+    fun rangeOnly(): CoveragePointSpan = CoveragePointSpan(
+        startSlot = startSlot,
+        positions = FloatArray(0),
+        colors = IntArray(0),
+        endSlotExclusive = endSlotExclusive,
+    )
 }
 
 data class CoveragePointRenderUpdate(

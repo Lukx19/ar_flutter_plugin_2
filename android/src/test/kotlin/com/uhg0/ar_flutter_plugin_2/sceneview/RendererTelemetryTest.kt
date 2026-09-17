@@ -106,4 +106,19 @@ class RendererTelemetryTest {
         assertEquals(0, telemetry.snapshot().getValue("residentRowCount"))
         assertEquals(0, telemetry.snapshot().getValue("residentSemanticCentroidCount"))
     }
+
+    @Test
+    fun `accepting a new mode token clears all previous resident mode gauges`() {
+        val telemetry = RendererTelemetry()
+        val centroid = CoverageResourceToken(3L, 7L, CoveragePresentationMode.SEMANTIC_CENTROIDS)
+        val cube = CoverageResourceToken(4L, 7L, CoveragePresentationMode.SEMANTIC_CUBES)
+        telemetry.setResidentPresentation(centroid, CoveragePresentationMode.SEMANTIC_CENTROIDS, 20, 4)
+        telemetry.setResidentPresentation(cube, CoveragePresentationMode.SEMANTIC_CUBES, 8, 2)
+
+        val snapshot = telemetry.snapshot()
+        assertEquals(0, snapshot.getValue("residentSemanticCentroidCount"))
+        assertEquals(0, snapshot.getValue("residentSemanticCentroidGlyphCount"))
+        assertEquals(8, snapshot.getValue("residentSemanticCubeCount"))
+        assertEquals(2, snapshot.getValue("residentSemanticCubeGlyphCount"))
+    }
 }

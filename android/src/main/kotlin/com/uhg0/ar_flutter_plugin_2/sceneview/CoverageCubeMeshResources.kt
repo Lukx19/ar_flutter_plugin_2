@@ -512,13 +512,13 @@ internal class CoverageCubeMeshResources(
             spans: List<com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan>,
         ): List<UploadRange> {
             val sourceRanges =
-                if (fullUpload) {
-                    listOf(UploadRange(0, count))
-                } else {
-                    spans.map { span ->
-                        UploadRange(span.startSlot, span.startSlot + span.colors.size)
-                    }
+            if (fullUpload) {
+                listOf(UploadRange(0, count))
+            } else {
+                spans.map { span ->
+                    UploadRange(span.startSlot, span.endSlotExclusive)
                 }
+            }
             return buildList {
                 sourceRanges.forEach { range ->
                     var start = range.startSlot
