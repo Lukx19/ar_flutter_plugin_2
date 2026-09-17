@@ -404,6 +404,64 @@ data class CoveragePointRenderSnapshot(
     }
 }
 
+/**
+ * Authoritative immutable hand-off copy for renderer consumers.  All nested
+ * buffers, including dirty spans, are detached from the producer snapshot.
+ */
+internal fun CoveragePointRenderSnapshot.deepCopy(): CoveragePointRenderSnapshot = copy(
+    keys = keys.copyOf(),
+    surfaceIds = surfaceIds.copyOf(),
+    positions = positions.copyOf(),
+    colors = colors.copyOf(),
+    styleRows = styleRows.copyOf(),
+    gridRotationWorld = gridRotationWorld.copyOf(),
+    update = update?.copy(
+        spans = update.spans.map { span ->
+            span.copy(
+                positions = span.positions.copyOf(),
+                colors = span.colors.copyOf(),
+                styleRows = span.styleRows.copyOf(),
+            )
+        },
+    ),
+)
+
+/**
+ * Rewrites palette-derived buffers without changing presentation slots or
+ * dirty-span membership.  The caller owns the returned immutable snapshot.
+ */
+internal fun CoveragePointRenderSnapshot.rewritePaletteBuffers(
+    palette: CoverageRendererPalette,
+): CoveragePointRenderSnapshot {
+    if (styleRows.isEmpty()) return this
+    val styledRows = styleRows.copyOf()
+    val styledColors = colors.copyOf()
+    repeat(count) { index ->
+        val offset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
+        val style = CoverageRendererStyleRowV1.decode(styleRows, offset).copy(palette = palette)
+        style.encode().copyInto(styledRows, offset)
+        styledColors[index] = style.packedColor()
+    }
+    val styledSpans = update?.spans?.map { span ->
+        val spanColors = span.colors.copyOf()
+        val spanStyles = span.styleRows.copyOf()
+        if (spanStyles.isNotEmpty()) {
+            repeat(spanColors.size) { index ->
+                val offset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
+                val style = CoverageRendererStyleRowV1.decode(spanStyles, offset).copy(palette = palette)
+                style.encode().copyInto(spanStyles, offset)
+                spanColors[index] = style.packedColor()
+            }
+        }
+        span.copy(colors = spanColors, styleRows = spanStyles)
+    }
+    return copy(
+        colors = styledColors,
+        styleRows = styledRows,
+        update = update?.copy(spans = styledSpans.orEmpty()),
+    )
+}
+
 fun identityGridRotation(): FloatArray = floatArrayOf(
     1f, 0f, 0f,
     0f, 1f, 0f,

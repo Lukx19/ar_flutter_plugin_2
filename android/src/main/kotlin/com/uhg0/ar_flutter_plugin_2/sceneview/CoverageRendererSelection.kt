@@ -84,6 +84,29 @@ internal object CoverageRendererLimits {
 internal class CoverageRendererAllocationLedger(
     private val telemetry: RendererTelemetry,
 ) {
+    /**
+     * Read-only admission for a fixed-capacity replacement.  The candidate
+     * peak includes the shared state, hand-off and startup staging that the
+     * new production resource will charge after construction.  Keeping the
+     * old total in the sum makes clear-first a safe decision whenever the two
+     * generations cannot coexist under the renderer cap.
+     */
+    fun admitResourceReplacement(mode: VoxelRenderMode): CoverageRendererResourceAdmission {
+        val currentBytes = telemetry.ownedBufferBytesSnapshot()
+        val candidateBytes = CoverageRendererLimits.activeRendererPeakBytes(mode)
+        val combinedBytes = currentBytes + candidateBytes
+        return CoverageRendererResourceAdmission(
+            strategy = if (combinedBytes <= CoverageRendererLimits.SHARED_OWNED_BUFFER_LIMIT_BYTES) {
+                CoverageRendererTransitionStrategy.COEXIST
+            } else {
+                CoverageRendererTransitionStrategy.CLEAR_FIRST
+            },
+            currentBytes = currentBytes,
+            candidateBytes = candidateBytes,
+            combinedBytes = combinedBytes,
+        )
+    }
+
     fun installPersistentCoverageState(mode: VoxelRenderMode) {
         installPersistentCoverageStateForCapacity(
             presentationCapacity = CoverageRendererLimits.presentationCapacity(mode),
@@ -199,38 +222,47 @@ internal class CoverageRendererAllocationLedger(
  * dirty.
  */
 internal class CoveragePresentationSelector(
-    private val presentationCapacity: Int,
+    private val maximumCapacity: Int,
 ) {
-    private val selectedSourceSlots = IntArray(presentationCapacity) { -1 }
-    private val selectedKeys = LongArray(presentationCapacity)
-    private val selectedSurfaceIds = LongArray(presentationCapacity)
+    private var activeCapacity = maximumCapacity
+    private val selectedSourceSlots = IntArray(maximumCapacity) { -1 }
+    private val selectedKeys = LongArray(maximumCapacity)
+    private val selectedSurfaceIds = LongArray(maximumCapacity)
     private val selectedPositions =
-        FloatArray(presentationCapacity * CoveragePointMeshResources.POSITION_COMPONENTS)
-    private val selectedColors = IntArray(presentationCapacity)
+        FloatArray(maximumCapacity * CoveragePointMeshResources.POSITION_COMPONENTS)
+    private val selectedColors = IntArray(maximumCapacity)
     private val selectedStyleRows =
-        ByteArray(presentationCapacity * COVERAGE_RENDERER_STYLE_ROW_BYTES)
-    private val selectedKeyToDestination = LongRowIndex(presentationCapacity)
-    private val selectedKeyMaxHeap = SelectedKeyMaxHeap(presentationCapacity)
-    private val freeDestinations = IntArray(presentationCapacity) { presentationCapacity - it - 1 }
-    private var freeDestinationCount = presentationCapacity
-    private val dirtyDestinations = DirtyRowQueue(presentationCapacity)
+        ByteArray(maximumCapacity * COVERAGE_RENDERER_STYLE_ROW_BYTES)
+    private val selectedKeyToDestination = LongRowIndex(maximumCapacity)
+    private val selectedKeyMaxHeap = SelectedKeyMaxHeap(maximumCapacity)
+    private val freeDestinations = IntArray(maximumCapacity) { maximumCapacity - it - 1 }
+    private var freeDestinationCount = maximumCapacity
+    private val dirtyDestinations = DirtyRowQueue(maximumCapacity)
     private var selectedCount = 0
     private var sourceCount = 0
     private var sourceSlotToDestination = IntArray(0)
-    private var sourceStyleFingerprints = LongArray(0)
     private var initialized = false
     private var styleRowsPresent = false
 
     init {
-        require(presentationCapacity > 0)
+        require(maximumCapacity > 0)
     }
 
-    fun select(snapshot: CoveragePointRenderSnapshot): CoveragePointRenderSnapshot {
+    fun select(
+        snapshot: CoveragePointRenderSnapshot,
+        requestedCapacity: Int = maximumCapacity,
+        forceReset: Boolean = snapshot.update?.reset ?: true,
+    ): CoveragePointRenderSnapshot {
+        require(requestedCapacity in 1..maximumCapacity)
+        if (activeCapacity != requestedCapacity) {
+            reset()
+            activeCapacity = requestedCapacity
+        }
+        if (forceReset && initialized) reset()
         validate(snapshot)
         styleRowsPresent = snapshot.styleRows.isNotEmpty()
         ensureSourceCapacity(snapshot.capacity)
-        val sourceRewritten = initialized &&
-            (selectedIdentityChanged(snapshot) || sourceStyleChanged(snapshot))
+        val sourceRewritten = initialized && selectedIdentityChanged(snapshot)
         if (!initialized || sourceRewritten || snapshot.count < sourceCount) {
             initialize(snapshot)
             return presentation(snapshot, reset = true, spans = fullSpan())
@@ -249,30 +281,48 @@ internal class CoveragePresentationSelector(
         sourceCount = snapshot.count
         val update = snapshot.update
         if (update == null) {
-            // A revision without dirty metadata is an explicit resync request,
-            // not permission to reuse stale presentation rows.
+            // The owner fences explicit resyncs before calling the selector.
+            // Retained controls (especially palette changes) must not turn a
+            // missing dirty list into a selector reset.
             rebuildSelectedRows(snapshot)
-            return presentation(snapshot, reset = true, spans = fullSpan())
+            return presentation(snapshot, reset = false, spans = fullSpan())
         }
         if (update.reset) {
             rebuildSelectedRows(snapshot)
-            return presentation(snapshot, reset = true, spans = fullSpan())
+            return presentation(snapshot, reset = false, spans = fullSpan())
         }
 
         val spans = applyDirtySpans(snapshot, update)
         return presentation(snapshot, reset = false, spans = spans)
     }
 
+    /** Drops retained source-to-presentation state before a new resource cut. */
+    fun reset() {
+        selectedKeyToDestination.clear()
+        selectedKeyMaxHeap.clear()
+        selectedCount = 0
+        sourceCount = 0
+        freeDestinationCount = activeCapacity
+        repeat(maximumCapacity) { destination ->
+            selectedSourceSlots[destination] = -1
+            freeDestinations[destination] = maximumCapacity - destination - 1
+        }
+        sourceSlotToDestination.fill(-1)
+        dirtyDestinations.clear()
+        initialized = false
+        styleRowsPresent = false
+    }
+
     private fun initialize(snapshot: CoveragePointRenderSnapshot) {
         selectedKeyToDestination.clear()
         selectedKeyMaxHeap.clear()
         sourceSlotToDestination.fill(-1)
-        freeDestinationCount = presentationCapacity
-        for (destination in freeDestinations.indices) {
-            freeDestinations[destination] = presentationCapacity - destination - 1
+        freeDestinationCount = activeCapacity
+        for (destination in 0 until activeCapacity) {
+            freeDestinations[destination] = activeCapacity - destination - 1
             selectedSourceSlots[destination] = -1
         }
-        selectedCount = minOf(snapshot.count, presentationCapacity)
+        selectedCount = minOf(snapshot.count, activeCapacity)
         val heap = IntArray(selectedCount)
         var heapSize = 0
         for (source in 0 until snapshot.count) {
@@ -294,14 +344,13 @@ internal class CoveragePresentationSelector(
         selectedCount = 0
         selectedSources.forEach { source -> assignSourceToFreeDestination(snapshot, source) }
         sourceCount = snapshot.count
-        snapshotStyleFingerprints(snapshot)
         initialized = true
     }
 
     private fun acceptNewCandidates(snapshot: CoveragePointRenderSnapshot): IntArray {
         dirtyDestinations.clear()
         for (source in sourceCount until snapshot.count) {
-            if (selectedCount < presentationCapacity) {
+            if (selectedCount < activeCapacity) {
                 val destination = assignSourceToFreeDestination(snapshot, source)
                 dirtyDestinations.add(destination)
             } else if (selectedCount > 0) {
@@ -321,13 +370,11 @@ internal class CoveragePresentationSelector(
                     selectedKeyToDestination[snapshot.surfaceIds[source]] = destination
                     selectedKeyMaxHeap.add(snapshot.surfaceIds[source], selectedKeyToDestination::containsKey)
                     sourceSlotToDestination[source] = destination
-                    sourceStyleFingerprints[source] = styleAt(snapshot, source).hashCode().toLong()
                     copySourceRow(snapshot, source, destination)
                     dirtyDestinations.add(destination)
                 }
             }
         }
-        snapshotStyleFingerprints(snapshot)
         return dirtyDestinations.drainActive(selectedCount)
     }
 
@@ -424,7 +471,7 @@ internal class CoveragePresentationSelector(
         reset: Boolean,
         spans: List<CoveragePointSpan>,
     ): CoveragePointRenderSnapshot = source.copy(
-        capacity = presentationCapacity,
+        capacity = activeCapacity,
         count = selectedCount,
         keys = selectedKeys.copyOf(selectedCount),
         surfaceIds = LongArray(selectedCount) { destination ->
@@ -491,7 +538,6 @@ internal class CoveragePresentationSelector(
     private fun ensureSourceCapacity(sourceCapacity: Int) {
         if (sourceSlotToDestination.size >= sourceCapacity) return
         sourceSlotToDestination = IntArray(sourceCapacity) { -1 }
-        sourceStyleFingerprints = LongArray(sourceCapacity)
     }
 
     private fun validate(snapshot: CoveragePointRenderSnapshot) {
@@ -510,19 +556,6 @@ internal class CoveragePresentationSelector(
             start * COVERAGE_RENDERER_STYLE_ROW_BYTES,
             endExclusive * COVERAGE_RENDERER_STYLE_ROW_BYTES,
         )
-
-    private fun sourceStyleChanged(snapshot: CoveragePointRenderSnapshot): Boolean {
-        val compared = minOf(sourceCount, snapshot.count)
-        return (0 until compared).any { source ->
-            sourceStyleFingerprints[source] != styleAt(snapshot, source).hashCode().toLong()
-        }
-    }
-
-    private fun snapshotStyleFingerprints(snapshot: CoveragePointRenderSnapshot) {
-        repeat(snapshot.count) { source ->
-            sourceStyleFingerprints[source] = styleAt(snapshot, source).hashCode().toLong()
-        }
-    }
 
     private fun siftUp(heap: IntArray, start: Int, snapshot: CoveragePointRenderSnapshot) {
         var child = start

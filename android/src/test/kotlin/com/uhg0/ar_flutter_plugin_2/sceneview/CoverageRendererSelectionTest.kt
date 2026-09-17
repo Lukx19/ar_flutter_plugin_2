@@ -68,6 +68,95 @@ class CoverageRendererSelectionTest {
     }
 
     @Test
+    fun `cube to centroid replacement clears first and restores ledger after one release each`() {
+        val telemetry = RendererTelemetry()
+        val ledger = CoverageRendererAllocationLedger(telemetry)
+        val events = mutableListOf<String>()
+        val factory = CoverageRendererResourceFactory(
+            admit = { mode, _ -> ledger.admitResourceReplacement(mode) },
+            onClearFirst = { transition ->
+                assertEquals(CoverageRendererTransitionStrategy.CLEAR_FIRST, transition.admission.strategy)
+                events += "clear-first"
+            },
+        )
+
+        fun construct(mode: com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode): String {
+            ledger.installPersistentCoverageState(mode)
+            ledger.updateSnapshotHandoff(mode)
+            when (mode) {
+                com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CUBES ->
+                    ledger.installCubeResources("active", CoverageRendererLimits.CUBE_CAPACITY)
+                else ->
+                    ledger.installPointResources("active", CoverageRendererLimits.CENTROID_CAPACITY)
+            }
+            events += "create:$mode"
+            return mode.name
+        }
+        fun release(mode: com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode) {
+            if (mode == com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CUBES) {
+                ledger.releaseCubeResources("active")
+            } else {
+                ledger.releasePointResources("active")
+            }
+            ledger.clearCoverageState()
+            events += "release:$mode"
+        }
+
+        factory.replaceCube(
+            CoverageRendererLimits.CUBE_CAPACITY,
+            "active",
+            create = { mode, _, _ -> construct(mode) },
+            release = { release(com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CUBES) },
+        )
+        factory.replacePoint(
+            com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS,
+            CoverageRendererLimits.CENTROID_CAPACITY,
+            "active",
+            create = { mode, _, _ -> construct(mode) },
+            release = { release(com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS) },
+        )
+        factory.clear()
+
+        assertEquals(
+            listOf("create:CUBES", "clear-first", "release:CUBES", "create:CENTROIDS", "release:CENTROIDS"),
+            events,
+        )
+        assertTrue((telemetry.snapshot().getValue("peakOwnedBufferBytes") as Int) <= 8 * 1024 * 1024)
+        assertEquals(0, telemetry.snapshot().getValue("ownedBufferBytes"))
+    }
+
+    @Test
+    fun `within-budget coexistence retains old resource when replacement creation fails`() {
+        val telemetry = RendererTelemetry()
+        telemetry.setOwnedBufferBytes("unrelated", 1)
+        val ledger = CoverageRendererAllocationLedger(telemetry)
+        val released = mutableListOf<String>()
+        val factory = CoverageRendererResourceFactory(
+            admit = { mode, _ -> ledger.admitResourceReplacement(mode) },
+        )
+        factory.replacePoint(
+            com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.POINTS,
+            1,
+            "old",
+            create = { _, _, _ -> "old" },
+            release = { value: String -> released += value },
+        )
+
+        assertThrows(IllegalStateException::class.java) {
+            factory.replacePoint(
+                com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.POINTS,
+                1,
+                "new",
+                create = { _, _, _ -> throw IllegalStateException("allocation failed") },
+                release = { value: String -> released += value },
+            )
+        }
+        assertEquals(emptyList<String>(), released)
+        factory.clear()
+        assertEquals(listOf("old"), released)
+    }
+
+    @Test
     fun `renderer lazy mode resource peaks stay within the shared eight MiB cap`() {
         assertEquals(2_000, CoverageRendererLimits.RAW_POINT_CAPACITY)
         assertEquals(20_000, CoverageRendererLimits.CENTROID_CAPACITY)

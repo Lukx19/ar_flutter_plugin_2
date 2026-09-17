@@ -298,7 +298,9 @@ internal object RendererT5ReceiptCampaign {
     private fun exerciseOwnedBufferLedger(): JsonObject {
         val telemetry = RendererTelemetry()
         val ledger = CoverageRendererAllocationLedger(telemetry)
-        val resources = CoverageRendererResourceFactory()
+        val resources = CoverageRendererResourceFactory(
+            admit = { mode, _ -> ledger.admitResourceReplacement(mode) },
+        )
         data class ReceiptResource(val mode: VoxelRenderMode, val release: () -> Unit)
         fun construct(mode: VoxelRenderMode): ReceiptResource {
             ledger.installPersistentCoverageState(VisibilityGridRendererState(CoverageRendererLimits.presentationCapacity(mode)))

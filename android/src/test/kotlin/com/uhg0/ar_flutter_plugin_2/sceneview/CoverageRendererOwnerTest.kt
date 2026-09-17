@@ -7,7 +7,10 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererSemantic
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererTarget
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -54,6 +57,47 @@ class CoverageRendererOwnerTest {
             surfaceIds = longArrayOf(30L, 10L),
             positions = floatArrayOf(3f, 0f, 0f, 1f, 0f, 0f),
             colors = intArrayOf(0, 0),
+        ),
+    )
+
+    private fun generatedSnapshot(
+        count: Int,
+        geometryRevision: Long,
+        rendererGeneration: Long = 1L,
+        styleRows: ByteArray = ByteArray(0),
+        positions: FloatArray? = null,
+        update: CoveragePointRenderUpdate? = null,
+    ) = VisibilityRendererSnapshot(
+        bindingGeneration = 1L,
+        groupGeneration = 1L,
+        rendererGeneration = rendererGeneration,
+        transactionId = geometryRevision,
+        geometryRevision = geometryRevision,
+        styleRevision = geometryRevision,
+        rows = (0 until count).map { index ->
+            VisibilityRendererRow(
+                surfaceId = index.toLong(),
+                x = index.toFloat(),
+                y = 0f,
+                z = 0f,
+                semanticLabel = CoverageRendererSemantic.CONFIRMED,
+                coverageLabel = CoverageRendererCoverage.COMPLETE,
+                targetDirectionIndex = null,
+            )
+        },
+        renderSnapshot = CoveragePointRenderSnapshot(
+            revision = geometryRevision,
+            enabled = true,
+            capacity = count,
+            count = count,
+            keys = LongArray(count) { it.toLong() },
+            surfaceIds = LongArray(count) { it.toLong() },
+            positions = positions ?: FloatArray(count * 3) { index ->
+                if (index % 3 == 0) (index / 3).toFloat() else 0f
+            },
+            colors = IntArray(count),
+            styleRows = styleRows,
+            update = update,
         ),
     )
 
@@ -266,6 +310,119 @@ class CoverageRendererOwnerTest {
     }
 
     @Test
+    fun `ordinary owner updates reuse selector and keep dirty churn below two percent`() {
+        val owner = NativeCoverageRendererOwner()
+        owner.install(generatedSnapshot(count = 100, geometryRevision = 1L))
+        val next = generatedSnapshot(
+            count = 100,
+            geometryRevision = 2L,
+            positions = FloatArray(300) { index ->
+                if (index == 0) 123f else if (index % 3 == 0) (index / 3).toFloat() else 0f
+            },
+            update = CoveragePointRenderUpdate(
+                geometryRevision = 2L,
+                visibilityRevision = 2L,
+                enabled = true,
+                count = 100,
+                spans = listOf(
+                    CoveragePointSpan(
+                        startSlot = 0,
+                        positions = floatArrayOf(123f, 0f, 0f),
+                        colors = intArrayOf(7),
+                    ),
+                ),
+                reset = false,
+            ),
+        )
+        owner.install(next)
+
+        val presented = checkNotNull(owner.presentationSnapshot())
+        val update = checkNotNull(presented.update)
+        assertFalse(update.reset)
+        val dirtyRows = update.spans.sumOf { it.colors.size }
+        assertTrue(dirtyRows * 100 < 100 * 2)
+        assertEquals(100, presented.surfaceIds.distinct().size)
+    }
+
+    @Test
+    fun `selector resets on renderer epoch and mode changes but not ordinary revisions`() {
+        val owner = NativeCoverageRendererOwner()
+        owner.install(generatedSnapshot(count = 4, geometryRevision = 1L))
+
+        val ordinary = generatedSnapshot(
+            count = 4,
+            geometryRevision = 2L,
+            update = CoveragePointRenderUpdate(
+                geometryRevision = 2L,
+                visibilityRevision = 2L,
+                enabled = true,
+                count = 4,
+                spans = emptyList(),
+                reset = false,
+            ),
+        )
+        owner.install(ordinary)
+        assertFalse(checkNotNull(owner.presentationSnapshot()!!.update).reset)
+
+        owner.install(
+            generatedSnapshot(
+                count = 4,
+                geometryRevision = 3L,
+                rendererGeneration = 2L,
+                update = ordinary.renderSnapshot!!.update,
+            ),
+        )
+        assertTrue(checkNotNull(owner.presentationSnapshot()!!.update).reset)
+
+        owner.setControls(
+            CoverageRendererControls(
+                visible = true,
+                mode = CoveragePresentationMode.SEMANTIC_CUBES,
+                palette = CoverageRendererPalette.COVERAGE,
+            ),
+        )
+        assertTrue(checkNotNull(owner.presentationSnapshot()!!.update).reset)
+    }
+
+    @Test
+    fun `palette recolor preserves retained selector slots without a reset`() {
+        val styleRows = listOf(
+            CoverageRendererStyleRowV1(
+                coverage = CoverageRendererCoverage.UNCOVERED,
+                palette = CoverageRendererPalette.COVERAGE,
+            ).encode(),
+            CoverageRendererStyleRowV1(
+                coverage = CoverageRendererCoverage.PARTIAL,
+                palette = CoverageRendererPalette.COVERAGE,
+            ).encode(),
+            CoverageRendererStyleRowV1(
+                coverage = CoverageRendererCoverage.COMPLETE,
+                palette = CoverageRendererPalette.COVERAGE,
+            ).encode(),
+        ).reduce { left, right -> left + right }
+        val owner = NativeCoverageRendererOwner()
+        owner.install(generatedSnapshot(3, 1L, styleRows = styleRows))
+        val before = checkNotNull(owner.presentationSnapshot())
+        val slots = before.surfaceIds.copyOf()
+
+        owner.setControls(
+            CoverageRendererControls(
+                visible = true,
+                mode = CoveragePresentationMode.SEMANTIC_CENTROIDS,
+                palette = CoverageRendererPalette.NORMAL,
+            ),
+        )
+
+        val after = checkNotNull(owner.presentationSnapshot())
+        assertEquals(slots.toList(), after.surfaceIds.toList())
+        assertFalse(checkNotNull(after.update).reset)
+        assertEquals(
+            CoverageRendererPalette.NORMAL,
+            CoverageRendererStyleRowV1.decode(after.styleRows).palette,
+        )
+    }
+
+    @Test
     fun `shared plan ranks target need residency and surface while applying palette`() {
         val styles = listOf(
             CoverageRendererStyleRowV1(
@@ -359,5 +516,36 @@ class CoverageRendererOwnerTest {
         assertTrue(owner.markResourceMounted(2L))
         assertTrue(owner.status().resourceAvailable)
         assertEquals(2, owner.status().rowCount)
+    }
+
+    @Test
+    fun `owner control transition keeps prior cut on rejected resource admission`() {
+        var admitted = false
+        val owner = NativeCoverageRendererOwner(
+            onControlsChanged = { admitted },
+        )
+        owner.install(snapshot())
+
+        val rejected = owner.setControls(
+            CoverageRendererControls(
+                visible = true,
+                mode = CoveragePresentationMode.SEMANTIC_CUBES,
+                palette = CoverageRendererPalette.COVERAGE,
+            ),
+        )
+        assertFalse(rejected.accepted)
+        assertEquals(CoveragePresentationMode.SEMANTIC_CENTROIDS, owner.status().mode)
+        assertEquals(5L, owner.status().rendererGeneration)
+
+        admitted = true
+        val accepted = owner.setControls(
+            CoverageRendererControls(
+                visible = true,
+                mode = CoveragePresentationMode.SEMANTIC_CUBES,
+                palette = CoverageRendererPalette.COVERAGE,
+            ),
+        )
+        assertTrue(accepted.accepted)
+        assertEquals(CoveragePresentationMode.SEMANTIC_CUBES, owner.status().mode)
     }
 }

@@ -170,6 +170,9 @@ internal class RendererTelemetry {
         get() = allocationsByOwner.values.sum()
 
     @Synchronized
+    internal fun ownedBufferBytesSnapshot(): Int = ownedBufferBytes
+
+    @Synchronized
     fun snapshot(): Map<String, Any> = mapOf(
         "rendererUpdateCount" to rendererUpdateCount,
         "ownedBufferBytes" to ownedBufferBytes,
