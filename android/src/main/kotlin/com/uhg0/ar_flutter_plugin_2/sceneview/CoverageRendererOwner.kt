@@ -19,12 +19,12 @@ enum class CoveragePresentationMode(val wireName: String) {
 
     val presentationCapacity: Int
         get() = when (this) {
-            SEMANTIC_CENTROIDS -> 20_000
-            SEMANTIC_CUBES -> 8_000
-            RAW_FEATURES -> 2_000
-            WARM_PROXIES -> 4_096
-            OVERVIEW -> 512
-            SUPPRESSED_DEBUG -> 1_024
+            SEMANTIC_CENTROIDS -> CoverageRendererLimits.CENTROID_CAPACITY
+            SEMANTIC_CUBES -> CoverageRendererLimits.CUBE_CAPACITY
+            RAW_FEATURES -> CoverageRendererLimits.RAW_POINT_CAPACITY
+            WARM_PROXIES -> CoverageRendererLimits.WARM_PROXY_CAPACITY
+            OVERVIEW -> CoverageRendererLimits.COLD_OVERVIEW_CAPACITY
+            SUPPRESSED_DEBUG -> CoverageRendererLimits.DEBUG_ROW_CAPACITY
         }
 
     companion object {
