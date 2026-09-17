@@ -80,6 +80,25 @@ internal data class CoverageRendererControls(
     val palette: CoveragePalette,
 )
 
+/**
+ * Owner-issued identity for one concrete GPU resource lifetime.
+ *
+ * The renderer generation is an upstream semantic qualifier.  [epoch] is
+ * deliberately separate: a resource may be replaced for the same semantic
+ * snapshot, and late Compose/resource callbacks must not be allowed to affect
+ * the replacement.
+ */
+internal data class CoverageResourceToken(
+    val epoch: Long,
+    val sourceRendererGeneration: Long,
+    val mode: CoveragePresentationMode,
+) {
+    init {
+        require(epoch > 0L)
+        require(sourceRendererGeneration >= 0L)
+    }
+}
+
 /** One immutable row in the latest fully committed presentation cut. */
 internal data class VisibilityRendererRow(
     val surfaceId: Long,
@@ -317,7 +336,8 @@ internal interface CoverageRendererOwner {
  */
 internal class NativeCoverageRendererOwner(
     private val onControlsChanged: (CoverageRendererControls) -> Boolean = { true },
-    private val onPresentationChanged: (CoveragePointRenderSnapshot?, CoveragePresentationMode) -> Unit = { _, _ -> },
+    private val onPresentationChanged: (CoveragePointRenderSnapshot?, CoveragePresentationMode, CoverageResourceToken?) -> Unit = { _, _, _ -> },
+    private val onResourceLifecycleChanged: (CoverageResourceToken, Boolean) -> Unit = { _, _ -> },
     private val worldToScreen: CoverageWorldToScreenProjection =
         CoverageWorldToScreenProjection { x, y, _ -> CoverageScreenPoint(x, y, 1f) },
 ) : CoverageRendererOwner {
@@ -342,6 +362,8 @@ internal class NativeCoverageRendererOwner(
     private val presentationSelector =
         CoveragePresentationSelector(CoverageRendererLimits.CENTROID_CAPACITY)
     private var selectorEpoch: SelectorEpoch? = null
+    private var resourceEpoch = 0L
+    private var resourceToken: CoverageResourceToken? = null
 
     private data class SelectorEpoch(
         val bindingGeneration: Long,
@@ -468,10 +490,12 @@ internal class NativeCoverageRendererOwner(
         val paletteOnlyChange = this.controls.visible == controls.visible &&
             this.controls.mode == controls.mode &&
             this.controls.palette != controls.palette
+        val modeChanged = this.controls.mode != controls.mode
         if (this.controls.palette != controls.palette) {
             paletteRevision++
         }
         this.controls = controls
+        if (modeChanged) resourceToken = null
         controlsConfigured = true
         recomputePresentationPlan(fullPaletteRecolor = paletteOnlyChange)
         notifyPresentationChanged()
@@ -615,6 +639,47 @@ internal class NativeCoverageRendererOwner(
         return true
     }
 
+    /** Returns the stable token for the current semantic source and mode. */
+    @Synchronized
+    fun issueResourceToken(): CoverageResourceToken? {
+        val current = latest ?: return null
+        if (disposed) return null
+        val existing = resourceToken
+        if (existing != null &&
+            existing.sourceRendererGeneration == current.rendererGeneration &&
+            existing.mode == controls.mode
+        ) {
+            return existing
+        }
+        return createResourceToken(current.rendererGeneration, controls.mode)
+    }
+
+    /** Forces a new owner lifetime without changing the semantic source cut. */
+    @Synchronized
+    fun requestResourceReplacement(): CoverageResourceToken? {
+        val current = latest ?: return null
+        if (disposed) return null
+        return createResourceToken(current.rendererGeneration, controls.mode)
+    }
+
+    @Synchronized
+    fun currentResourceToken(): CoverageResourceToken? = resourceToken
+
+    @Synchronized
+    fun acceptsResourceToken(token: CoverageResourceToken): Boolean =
+        !disposed && resourceToken == token && latest?.rendererGeneration == token.sourceRendererGeneration &&
+            controls.mode == token.mode
+
+    @Synchronized
+    fun markResourceMounted(token: CoverageResourceToken): Boolean {
+        if (!acceptsResourceToken(token)) return false
+        resourceMounted = true
+        unavailable = lifecyclePaused
+        recoveryPending = lifecyclePaused
+        onResourceLifecycleChanged(token, true)
+        return true
+    }
+
     /** Keeps semantic state intact while exposing a renderer-only failure. */
     @Synchronized
     fun markResourceFailure(rendererGeneration: Long): Boolean {
@@ -628,8 +693,53 @@ internal class NativeCoverageRendererOwner(
     }
 
     @Synchronized
+    fun markResourceFailure(token: CoverageResourceToken): Boolean {
+        if (!acceptsResourceToken(token)) return false
+        resetPresentationSelector()
+        resourceMounted = false
+        unavailable = true
+        recoveryPending = true
+        resourceFailureCount++
+        onResourceLifecycleChanged(token, false)
+        return true
+    }
+
+    @Synchronized
     fun markUploadFailure(rendererGeneration: Long): Boolean =
         markResourceFailure(rendererGeneration)
+
+    @Synchronized
+    fun markUploadFailure(token: CoverageResourceToken): Boolean =
+        markResourceFailure(token)
+
+    /**
+     * Clears resource state only for the still-current lifetime.  A late
+     * release from an outgoing resource therefore cannot clear its successor.
+     */
+    @Synchronized
+    fun markResourceReleased(token: CoverageResourceToken): Boolean {
+        if (!acceptsResourceToken(token)) return false
+        resourceMounted = false
+        unavailable = true
+        recoveryPending = true
+        onResourceLifecycleChanged(token, false)
+        return true
+    }
+
+    /** Restores the still-mounted lifetime after a coexistence allocation fails. */
+    @Synchronized
+    fun restoreResourceToken(token: CoverageResourceToken): Boolean {
+        if (disposed || latest?.rendererGeneration != token.sourceRendererGeneration ||
+            controls.mode != token.mode
+        ) return false
+        resourceToken = token
+        resourceMounted = true
+        unavailable = lifecyclePaused
+        recoveryPending = lifecyclePaused
+        onResourceLifecycleChanged(token, true)
+        notifyPresentationChanged()
+        return true
+    }
 
     @Synchronized
     fun controlsConfigured(): Boolean = controlsConfigured
@@ -655,6 +765,7 @@ internal class NativeCoverageRendererOwner(
         latest = null
         presentationPlan = null
         resetPresentationSelector()
+        resourceToken = null
     }
 
     @Synchronized
@@ -687,7 +798,7 @@ internal class NativeCoverageRendererOwner(
 
     private fun notifyPresentationChanged() {
         if (unavailable || disposed) return
-        onPresentationChanged(presentationSnapshot(), controls.mode)
+        onPresentationChanged(presentationSnapshot(), controls.mode, resourceToken)
     }
 
     private fun recomputePresentationPlan(
@@ -765,6 +876,19 @@ internal class NativeCoverageRendererOwner(
     private fun resetPresentationSelector() {
         presentationSelector.reset()
         selectorEpoch = null
+    }
+
+    private fun createResourceToken(
+        sourceRendererGeneration: Long,
+        mode: CoveragePresentationMode,
+    ): CoverageResourceToken {
+        val token = CoverageResourceToken(
+            epoch = ++resourceEpoch,
+            sourceRendererGeneration = sourceRendererGeneration,
+            mode = mode,
+        )
+        resourceToken = token
+        return token
     }
 
     private companion object {

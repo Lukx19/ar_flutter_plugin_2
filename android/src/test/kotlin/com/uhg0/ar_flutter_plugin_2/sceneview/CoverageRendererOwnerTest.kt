@@ -222,7 +222,7 @@ class CoverageRendererOwnerTest {
         var callbackCount = 0
         var selectedCount = -1
         val owner = NativeCoverageRendererOwner(
-            onPresentationChanged = { selected, _ ->
+            onPresentationChanged = { selected, _, _ ->
                 callbackCount++
                 selectedCount = selected?.count ?: 0
             },
@@ -570,5 +570,25 @@ class CoverageRendererOwnerTest {
         )
         assertTrue(accepted.accepted)
         assertEquals(CoveragePresentationMode.SEMANTIC_CUBES, owner.status().mode)
+    }
+
+    @Test
+    fun `late resource callbacks cannot clear a replacement owner lifetime`() {
+        val owner = NativeCoverageRendererOwner()
+        owner.install(snapshot(rendererGeneration = 9L))
+
+        val first = checkNotNull(owner.issueResourceToken())
+        val replacement = checkNotNull(owner.requestResourceReplacement())
+        assertTrue(replacement.epoch > first.epoch)
+        assertEquals(9L, replacement.sourceRendererGeneration)
+
+        assertFalse(owner.markResourceFailure(first))
+        assertFalse(owner.status().rendererUnavailable)
+        assertTrue(owner.markResourceFailure(replacement))
+        assertTrue(owner.status().rendererUnavailable)
+        assertFalse(owner.markResourceMounted(first))
+        assertTrue(owner.status().rendererUnavailable)
+        assertTrue(owner.markResourceMounted(replacement))
+        assertTrue(owner.status().resourceAvailable)
     }
 }

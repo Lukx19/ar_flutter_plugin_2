@@ -13,6 +13,36 @@ import org.junit.Test
 
 class CoverageRendererSelectionTest {
     @Test
+    fun `retained selector storage is lazy and follows the active presentation capacity`() {
+        val selector = CoveragePresentationSelector(CoverageRendererLimits.CENTROID_CAPACITY)
+        assertEquals(0, selector.ownedStorageBytes)
+        val source = CoveragePointRenderSnapshot(
+            revision = 1L,
+            enabled = true,
+            capacity = 2,
+            count = 2,
+            keys = longArrayOf(2L, 1L),
+            positions = FloatArray(6),
+            colors = IntArray(2),
+        )
+
+        selector.select(source, requestedCapacity = CoverageRendererLimits.COLD_OVERVIEW_CAPACITY)
+        val overviewBytes = selector.ownedStorageBytes
+        selector.select(source.copy(revision = 2L), requestedCapacity = CoverageRendererLimits.CENTROID_CAPACITY)
+
+        assertTrue(overviewBytes > 0)
+        assertTrue(selector.ownedStorageBytes > overviewBytes)
+        assertEquals(
+            CoveragePresentationStorage.estimatedOwnedStorageBytes(
+                CoverageRendererLimits.CENTROID_CAPACITY,
+                sourceCapacity = source.capacity,
+                withStyleRows = false,
+            ),
+            selector.ownedStorageBytes,
+        )
+    }
+
+    @Test
     fun `production resource factory installs replacement before releasing old generation`() {
         val events = mutableListOf<String>()
         val modes = mutableListOf<com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode>()
@@ -202,7 +232,7 @@ class CoverageRendererSelectionTest {
         assertEquals(2_000, CoverageRendererLimits.RAW_POINT_CAPACITY)
         assertEquals(20_000, CoverageRendererLimits.CENTROID_CAPACITY)
         assertEquals(8_000, CoverageRendererLimits.CUBE_CAPACITY)
-        assertEquals(8_016_704, CoverageRendererLimits.maximumActiveRendererBytes)
+        assertEquals(7_971_200, CoverageRendererLimits.maximumActiveRendererBytes)
         com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.entries.forEach { mode ->
             assertTrue(
                 "$mode startup peak must fit the shared renderer cap",
@@ -245,8 +275,11 @@ class CoverageRendererSelectionTest {
         )
         assertEquals(
             VisibilityGridRendererState.ownedStorageBytes(CoverageRendererLimits.CENTROID_CAPACITY) +
+                CoverageRendererLimits.presentationStorageBytes(
+                    com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS,
+                ) +
                 CoverageRendererLimits.AUXILIARY_BYTES +
-                CoverageRendererLimits.SNAPSHOT_ROW_BYTES * 4,
+                CoverageRendererLimits.SNAPSHOT_ROW_BYTES,
             telemetry.snapshot().getValue("ownedBufferBytes"),
         )
     }

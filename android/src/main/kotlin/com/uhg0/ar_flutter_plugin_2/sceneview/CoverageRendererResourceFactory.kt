@@ -26,6 +26,8 @@ internal data class CoverageRendererResourceTransition(
     val mode: VoxelRenderMode,
     val capacity: Int,
     val rendererGeneration: Long,
+    val token: CoverageResourceToken? = null,
+    val previousToken: CoverageResourceToken? = null,
 )
 
 /**
@@ -47,9 +49,11 @@ internal class CoverageRendererResourceFactory(
     private val onClearFirst: (CoverageRendererResourceTransition) -> Unit = {},
     private val onCreated: (CoverageRendererResourceTransition) -> Unit = {},
     private val onCreationFailure: (CoverageRendererResourceTransition) -> Unit = {},
+    private val onDisposed: (CoverageResourceToken?) -> Unit = {},
 ) {
     private var active: Any? = null
     private var releaseActive: ((Any) -> Unit)? = null
+    private var activeToken: CoverageResourceToken? = null
 
     @Suppress("UNCHECKED_CAST")
     fun <T : Any> replacePoint(
@@ -57,17 +61,19 @@ internal class CoverageRendererResourceFactory(
         capacity: Int,
         owner: String,
         rendererGeneration: Long = 0L,
+        token: CoverageResourceToken? = null,
         create: (VoxelRenderMode, Int, String) -> T,
         release: (T) -> Unit,
-    ): T? = replace(mode, capacity, owner, rendererGeneration, create, release)
+    ): T? = replace(mode, capacity, owner, rendererGeneration, token, create, release)
 
     fun <T : Any> replaceCube(
         capacity: Int,
         owner: String,
         rendererGeneration: Long = 0L,
+        token: CoverageResourceToken? = null,
         create: (VoxelRenderMode, Int, String) -> T,
         release: (T) -> Unit,
-    ): T? = replace(VoxelRenderMode.CUBES, capacity, owner, rendererGeneration, create, release)
+    ): T? = replace(VoxelRenderMode.CUBES, capacity, owner, rendererGeneration, token, create, release)
 
     @Suppress("UNCHECKED_CAST")
     private fun <T : Any> replace(
@@ -75,25 +81,31 @@ internal class CoverageRendererResourceFactory(
         capacity: Int,
         owner: String,
         rendererGeneration: Long,
+        token: CoverageResourceToken?,
         create: (VoxelRenderMode, Int, String) -> T,
         release: (T) -> Unit,
     ): T? {
         val prior = active
         val priorRelease = releaseActive
+        val priorToken = activeToken
         val admission = admit(mode, capacity)
         val transition = CoverageRendererResourceTransition(
             admission = admission,
             hadActiveResource = prior != null,
             mode = mode,
             capacity = capacity,
-            rendererGeneration = rendererGeneration,
+            rendererGeneration = token?.sourceRendererGeneration ?: rendererGeneration,
+            token = token,
+            previousToken = priorToken,
         )
         if (admission.strategy == CoverageRendererTransitionStrategy.CLEAR_FIRST && prior != null) {
             onClearFirst(transition)
             active = null
             releaseActive = null
+            activeToken = null
             priorRelease?.invoke(prior)
             onDisposal()
+            onDisposed(priorToken)
         }
         // Coexistence is transactional: retain the current owner until the
         // new resource exists and can be installed. A failed allocation then
@@ -102,30 +114,26 @@ internal class CoverageRendererResourceFactory(
         val next = try {
             create(mode, capacity, owner)
         } catch (error: Throwable) {
-            if (admission.strategy == CoverageRendererTransitionStrategy.CLEAR_FIRST || prior == null) {
-                onCreationFailure(transition)
-            }
+            onCreationFailure(transition)
             return null
         }
         try {
             onCreated(transition)
         } catch (error: Throwable) {
             runCatching { release(next) }
-            if (admission.strategy == CoverageRendererTransitionStrategy.CLEAR_FIRST ||
-                !transition.hadActiveResource
-            ) {
-                onCreationFailure(transition)
-            }
+            onCreationFailure(transition)
             return null
         }
         active = next
         releaseActive = { value -> release(value as T) }
+        activeToken = transition.token
         if (prior != null && priorRelease != null &&
             admission.strategy == CoverageRendererTransitionStrategy.COEXIST
         ) {
             onReplacement()
             priorRelease(prior)
             onDisposal()
+            onDisposed(priorToken)
         }
         return next
     }
@@ -133,11 +141,14 @@ internal class CoverageRendererResourceFactory(
     fun clear() {
         val prior = active
         val priorRelease = releaseActive
+        val priorToken = activeToken
         active = null
         releaseActive = null
+        activeToken = null
         if (prior != null && priorRelease != null) {
             priorRelease(prior)
             onDisposal()
+            onDisposed(priorToken)
         }
     }
 }

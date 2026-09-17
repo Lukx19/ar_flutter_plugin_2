@@ -1,7 +1,9 @@
 package com.uhg0.ar_flutter_plugin_2.sceneview
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RendererTelemetryTest {
@@ -88,5 +90,20 @@ class RendererTelemetryTest {
         assertEquals(2, snapshot.getValue("cumulativeResourceDisposalCount"))
         assertEquals(1, snapshot.getValue("cumulativeReplacementBalance"))
         assertEquals(1, snapshot.getValue("resourceReplacementDisposalBalance"))
+    }
+
+    @Test
+    fun `stale token release cannot clear replacement resident gauges`() {
+        val telemetry = RendererTelemetry()
+        val first = CoverageResourceToken(1L, 4L, CoveragePresentationMode.SEMANTIC_CENTROIDS)
+        val replacement = CoverageResourceToken(2L, 4L, CoveragePresentationMode.SEMANTIC_CENTROIDS)
+        assertTrue(telemetry.setResidentPresentation(first, CoveragePresentationMode.SEMANTIC_CENTROIDS, 12, 3))
+        assertTrue(telemetry.setResidentPresentation(replacement, CoveragePresentationMode.SEMANTIC_CENTROIDS, 8, 2))
+
+        assertFalse(telemetry.clearResidentPresentation(first))
+        assertEquals(8, telemetry.snapshot().getValue("residentRowCount"))
+        assertTrue(telemetry.clearResidentPresentation(replacement))
+        assertEquals(0, telemetry.snapshot().getValue("residentRowCount"))
+        assertEquals(0, telemetry.snapshot().getValue("residentSemanticCentroidCount"))
     }
 }

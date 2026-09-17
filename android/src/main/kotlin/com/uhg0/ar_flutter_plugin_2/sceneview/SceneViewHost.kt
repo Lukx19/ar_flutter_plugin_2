@@ -125,8 +125,8 @@ internal class SceneViewHost(
     private val coverageSnapshotRef = AtomicReference<CoveragePointRenderSnapshot?>()
     private val rawPointSnapshotRef = AtomicReference<CoveragePointRenderSnapshot?>()
     private val coverageMeshRef = AtomicReference<CoveragePointMeshBinding?>()
-    /** Monotonic key that prevents an outgoing Compose attach from rehydrating a new mesh. */
-    private val coverageResourceGeneration = CoverageMeshGenerationGate()
+    /** Owner lifetime key; source renderer generations remain upstream-owned. */
+    private val coverageResourceEpoch = mutableStateOf(0L)
     private val sharedCameraLifecycleGate = SharedCameraSceneLifecycleGate(
         Session.Feature.SHARED_CAMERA in sessionFeatures,
     )
@@ -141,11 +141,14 @@ internal class SceneViewHost(
     private val coverageResourceFactory = CoverageRendererResourceFactory(
         onReplacement = rendererTelemetry::recordResourceReplacement,
         onDisposal = rendererTelemetry::recordResourceDisposal,
+        onDisposed = { token ->
+            token?.let { coverageRendererOwner.markResourceReleased(it) }
+            token?.let { rendererTelemetry.clearResidentPresentation(it) }
+        },
         admit = { mode, _ -> rendererAllocationLedger.admitResourceReplacement(mode) },
         onClearFirst = { transition ->
-            coverageRendererOwner.markResourceFailure(
-                transition.rendererGeneration,
-            )
+            transition.token?.let { coverageRendererOwner.markResourceFailure(it) }
+                ?: coverageRendererOwner.markResourceFailure(transition.rendererGeneration)
             coverageMeshRef.get()?.disposeForReplacement()
             rendererAllocationLedger.clearCoverageState()
         },
@@ -158,7 +161,8 @@ internal class SceneViewHost(
                 transition.mode,
                 coverageRendererOwner.presentationSnapshot(),
             )
-            coverageRendererOwner.markResourceMounted(transition.rendererGeneration)
+            transition.token?.let { coverageRendererOwner.markResourceMounted(it) }
+                ?: coverageRendererOwner.markResourceMounted(transition.rendererGeneration)
         },
         onCreationFailure = { transition ->
             rendererTelemetry.recordResourceFailure()
@@ -166,9 +170,10 @@ internal class SceneViewHost(
                 !transition.hadActiveResource
             ) {
                 rendererAllocationLedger.clearCoverageState()
-                coverageRendererOwner.markResourceFailure(
-                    transition.rendererGeneration,
-                )
+                transition.token?.let { coverageRendererOwner.markResourceFailure(it) }
+                    ?: coverageRendererOwner.markResourceFailure(transition.rendererGeneration)
+            } else {
+                transition.previousToken?.let { coverageRendererOwner.restoreResourceToken(it) }
             }
         },
     )
@@ -178,7 +183,7 @@ internal class SceneViewHost(
             onControlsChanged = { controls ->
                 transitionCoverageControls(controls)
             },
-            onPresentationChanged = { snapshot, mode ->
+            onPresentationChanged = { snapshot, mode, token ->
                 val glyphCount = snapshot?.styleRows?.let { styles ->
                     (0 until snapshot.count).count { index ->
                         CoverageRendererStyleRowV1.decode(
@@ -187,11 +192,16 @@ internal class SceneViewHost(
                         ).glyph != CoverageRendererGlyph.NONE
                     }
                 } ?: 0
-                rendererTelemetry.setResidentPresentation(
-                    mode,
-                    snapshot?.count ?: 0,
-                    glyphCount,
-                )
+                val residentToken = token ?: coverageRendererOwner.issueResourceToken()
+                residentToken?.let { coverageResourceEpoch.value = it.epoch }
+                if (residentToken != null && coverageRendererOwner.acceptsResourceToken(residentToken)) {
+                    rendererTelemetry.setResidentPresentation(
+                        residentToken,
+                        mode,
+                        snapshot?.count ?: 0,
+                        glyphCount,
+                    )
+                }
                 rendererAllocationLedger.updateSnapshotHandoff(
                     mode.toVoxelRenderMode(),
                     snapshot,
@@ -200,6 +210,9 @@ internal class SceneViewHost(
                 if (snapshot != null) {
                     coverageMeshRef.get()?.updateCoverage(snapshot, mode.toVoxelRenderMode())
                 }
+            },
+            onResourceLifecycleChanged = { token, mounted ->
+                if (!mounted) rendererTelemetry.clearResidentPresentation(token)
             },
             worldToScreen = CoverageWorldToScreenProjection(::projectCoveragePoint),
         )
@@ -557,33 +570,34 @@ internal class SceneViewHost(
                         coverage.cubeSizeFactor,
                         coverage.pointSizePx,
                         coverage.rendererGeneration,
+                        coverageResourceEpoch.value,
                     ) {
                         if (coverage.enabled) {
                             when (coverage.voxelRenderMode) {
                                 VoxelRenderMode.POINTS -> {
-                                    val generation = remember { coverageResourceGeneration.reserve() }
-                                    CoverageActivePointNode(engine, materialLoader, rendererTelemetry, coverage, generation)
+                                    val token = coverageRendererOwner.issueResourceToken()
+                                    CoverageActivePointNode(engine, materialLoader, rendererTelemetry, coverage, token)
                                         ?.let { active ->
                                             NodeLifecycle(active.node) {
-                                                CoverageActiveBindingEffect(active.binding, coverage, coverageSnapshotRef.get(), rawPointSnapshotRef.get(), coverageMeshRef, onCoverageRendererMounted)
+                                                CoverageActiveBindingEffect(active.binding, coverage, token, coverageSnapshotRef.get(), rawPointSnapshotRef.get(), coverageMeshRef, onCoverageRendererMounted)
                                             }
                                         }
                                 }
                                 VoxelRenderMode.CENTROIDS -> {
-                                    val generation = remember { coverageResourceGeneration.reserve() }
-                                    CoverageActiveCentroidNode(engine, materialLoader, rendererTelemetry, coverage, generation)
+                                    val token = coverageRendererOwner.issueResourceToken()
+                                    CoverageActiveCentroidNode(engine, materialLoader, rendererTelemetry, coverage, token)
                                         ?.let { active ->
                                             NodeLifecycle(active.node) {
-                                                CoverageActiveBindingEffect(active.binding, coverage, coverageSnapshotRef.get(), rawPointSnapshotRef.get(), coverageMeshRef, onCoverageRendererMounted)
+                                                CoverageActiveBindingEffect(active.binding, coverage, token, coverageSnapshotRef.get(), rawPointSnapshotRef.get(), coverageMeshRef, onCoverageRendererMounted)
                                             }
                                         }
                                 }
                                 VoxelRenderMode.CUBES -> {
-                                    val generation = remember { coverageResourceGeneration.reserve() }
-                                    CoverageActiveCubeNode(engine, materialLoader, rendererTelemetry, coverage, generation)
+                                    val token = coverageRendererOwner.issueResourceToken()
+                                    CoverageActiveCubeNode(engine, materialLoader, rendererTelemetry, coverage, token)
                                         ?.let { active ->
                                             NodeLifecycle(active.node) {
-                                                CoverageActiveBindingEffect(active.binding, coverage, coverageSnapshotRef.get(), rawPointSnapshotRef.get(), coverageMeshRef, onCoverageRendererMounted)
+                                                CoverageActiveBindingEffect(active.binding, coverage, token, coverageSnapshotRef.get(), rawPointSnapshotRef.get(), coverageMeshRef, onCoverageRendererMounted)
                                             }
                                         }
                                 }
@@ -689,6 +703,7 @@ internal class SceneViewHost(
             coverageResourceFactory.clear()
             coverageRenderConfig.value = null
             rendererAllocationLedger.clearCoverageState()
+            rendererTelemetry.clearResidentPresentation()
             return
         }
 
@@ -714,16 +729,9 @@ internal class SceneViewHost(
             current.voxelRenderMode != requestedConfig.voxelRenderMode ||
             current.voxelSizeMeters != requestedConfig.voxelSizeMeters ||
             current.cubeSizeFactor != requestedConfig.cubeSizeFactor
-        val effectiveConfig = requestedConfig.copy(
-            rendererGeneration = when {
-                current == null -> requestedConfig.rendererGeneration
-                visualChange && requestedConfig.rendererGeneration <= current.rendererGeneration ->
-                    current.rendererGeneration + 1L
-                !visualChange && requestedConfig.rendererGeneration < current.rendererGeneration ->
-                    current.rendererGeneration
-                else -> requestedConfig.rendererGeneration
-            },
-        )
+        // rendererGeneration belongs to the upstream semantic snapshot. GPU
+        // lifetimes are fenced independently by the owner's resource epoch.
+        val effectiveConfig = requestedConfig
         val requiresReplacement = current == null || visualChange ||
             current.rendererGeneration != effectiveConfig.rendererGeneration
         val install = coverageRendererOwner.install(
@@ -742,12 +750,16 @@ internal class SceneViewHost(
             if (current != null &&
                 admission.strategy == CoverageRendererTransitionStrategy.CLEAR_FIRST
             ) {
-                coverageRendererOwner.markResourceFailure(effectiveConfig.rendererGeneration)
+                coverageRendererOwner.currentResourceToken()?.let {
+                    coverageRendererOwner.markResourceFailure(it)
+                }
                 coverageMeshRef.get()?.disposeForReplacement()
                 coverageResourceFactory.clear()
                 rendererAllocationLedger.clearCoverageState()
             }
             coverageRenderConfig.value = effectiveConfig
+            coverageRendererOwner.requestResourceReplacement()
+            coverageRendererOwner.issueResourceToken()?.let { coverageResourceEpoch.value = it.epoch }
         }
         coverageRendererOwner.refreshPresentation()
     }
@@ -769,7 +781,9 @@ internal class SceneViewHost(
             if (modeChanged) {
                 val admission = rendererAllocationLedger.admitResourceReplacement(nextMode)
                 if (admission.strategy == CoverageRendererTransitionStrategy.CLEAR_FIRST) {
-                    coverageRendererOwner.markResourceFailure(current.rendererGeneration)
+                    coverageRendererOwner.currentResourceToken()?.let {
+                        coverageRendererOwner.markResourceFailure(it)
+                    }
                     coverageMeshRef.get()?.disposeForReplacement()
                     coverageResourceFactory.clear()
                     rendererAllocationLedger.clearCoverageState()
@@ -778,12 +792,11 @@ internal class SceneViewHost(
             coverageRenderConfig.value = current.copy(
                 enabled = controls.visible,
                 voxelRenderMode = nextMode,
-                rendererGeneration = if (modeChanged) {
-                    current.rendererGeneration + 1L
-                } else {
-                    current.rendererGeneration
-                },
+                rendererGeneration = current.rendererGeneration,
             )
+            if (modeChanged) {
+                coverageRendererOwner.issueResourceToken()?.let { coverageResourceEpoch.value = it.epoch }
+            }
             rendererTelemetry.recordPresentation(controls.mode)
             true
         }.getOrElse { false }
@@ -809,9 +822,8 @@ internal class SceneViewHost(
             coverageRenderConfig.value?.let { current ->
                 // Force one Compose resource generation so the latest complete
                 // owner snapshot is mounted after GPU loss.
-                coverageRenderConfig.value = current.copy(
-                    rendererGeneration = current.rendererGeneration + 1,
-                )
+                coverageRendererOwner.requestResourceReplacement()
+                coverageRendererOwner.issueResourceToken()?.let { coverageResourceEpoch.value = it.epoch }
             }
         }
         rendererPaused = false
@@ -829,6 +841,7 @@ internal class SceneViewHost(
             coverageMeshRef.get()?.disposeForReplacement()
             coverageResourceFactory.clear()
             rendererAllocationLedger.clearCoverageState()
+            rendererTelemetry.clearResidentPresentation()
             activeSession?.pause()
         }
     }
@@ -910,6 +923,7 @@ internal class SceneViewHost(
         if (!ownership.onDispose()) return
         disposed = true
         coverageRendererOwner.dispose()
+        rendererTelemetry.clearResidentPresentation()
         futureResumesBlocked = true
         cancelCoverageUploadFrame()
         composeView.removeCallbacks(replaySettledTextureResize)
@@ -1076,7 +1090,7 @@ internal class SceneViewHost(
         materialLoader: MaterialLoader,
         telemetry: RendererTelemetry,
         coverage: PointCloudNativeConfig,
-        generation: Long,
+        token: CoverageResourceToken?,
     ): CoverageMeshAttachment? {
         val resources = remember(engine) {
             createCoverageResource {
@@ -1085,6 +1099,7 @@ internal class SceneViewHost(
                     CoverageRendererLimits.RAW_POINT_CAPACITY,
                     "coverage-points",
                     rendererGeneration = coverage.rendererGeneration,
+                    token = token,
                     create = { _, capacity, owner -> CoveragePointMeshResources(engine, capacity, telemetry, owner) },
                     release = CoverageVoxelMeshResources::destroy,
                 )
@@ -1102,13 +1117,13 @@ internal class SceneViewHost(
                 mode = VoxelRenderMode.POINTS,
                 target = CoverageMeshTarget(resources, materialInstance),
                 pointSizePx = coverage.pointSizePx,
-                generation = generation,
-                currentGeneration = coverageResourceGeneration,
+                resourceToken = token,
+                acceptsResourceToken = coverageRendererOwner::acceptsResourceToken,
                 requestRendererFrame = ::requestCoverageUploadFrame,
                 cancelRendererFrame = ::cancelCoverageUploadFrame,
                 onUploadFailure = {
                     rendererTelemetry.recordResourceFailure()
-                    coverageRendererOwner.markUploadFailure(coverage.rendererGeneration)
+                    token?.let { coverageRendererOwner.markUploadFailure(it) }
                 },
             )
         }
@@ -1133,7 +1148,7 @@ internal class SceneViewHost(
         materialLoader: MaterialLoader,
         telemetry: RendererTelemetry,
         coverage: PointCloudNativeConfig,
-        generation: Long,
+        token: CoverageResourceToken?,
     ): CoverageMeshAttachment? {
         val resources = remember(engine) {
             createCoverageResource {
@@ -1142,6 +1157,7 @@ internal class SceneViewHost(
                     CoverageRendererLimits.CENTROID_CAPACITY,
                     "coverage-centroids",
                     rendererGeneration = coverage.rendererGeneration,
+                    token = token,
                     create = { _, capacity, owner -> CoveragePointMeshResources(engine, capacity, telemetry, owner) },
                     release = CoverageVoxelMeshResources::destroy,
                 )
@@ -1159,13 +1175,13 @@ internal class SceneViewHost(
                 mode = VoxelRenderMode.CENTROIDS,
                 target = CoverageMeshTarget(resources, materialInstance),
                 pointSizePx = coverage.pointSizePx,
-                generation = generation,
-                currentGeneration = coverageResourceGeneration,
+                resourceToken = token,
+                acceptsResourceToken = coverageRendererOwner::acceptsResourceToken,
                 requestRendererFrame = ::requestCoverageUploadFrame,
                 cancelRendererFrame = ::cancelCoverageUploadFrame,
                 onUploadFailure = {
                     rendererTelemetry.recordResourceFailure()
-                    coverageRendererOwner.markUploadFailure(coverage.rendererGeneration)
+                    token?.let { coverageRendererOwner.markUploadFailure(it) }
                 },
             )
         }
@@ -1190,7 +1206,7 @@ internal class SceneViewHost(
         materialLoader: MaterialLoader,
         telemetry: RendererTelemetry,
         coverage: PointCloudNativeConfig,
-        generation: Long,
+        token: CoverageResourceToken?,
     ): CoverageMeshAttachment? {
         val resources = remember(
             engine,
@@ -1202,6 +1218,7 @@ internal class SceneViewHost(
                     CoverageRendererLimits.CUBE_CAPACITY,
                     "coverage-cubes",
                     rendererGeneration = coverage.rendererGeneration,
+                    token = token,
                     create = { _, capacity, owner -> CoverageCubeMeshResources(engine, capacity, coverage.voxelSizeMeters * coverage.cubeSizeFactor, telemetry, owner) },
                     release = CoverageVoxelMeshResources::destroy,
                 )
@@ -1222,13 +1239,13 @@ internal class SceneViewHost(
                 mode = VoxelRenderMode.CUBES,
                 target = CoverageMeshTarget(resources, materialInstance),
                 pointSizePx = coverage.pointSizePx,
-                generation = generation,
-                currentGeneration = coverageResourceGeneration,
+                resourceToken = token,
+                acceptsResourceToken = coverageRendererOwner::acceptsResourceToken,
                 requestRendererFrame = ::requestCoverageUploadFrame,
                 cancelRendererFrame = ::cancelCoverageUploadFrame,
                 onUploadFailure = {
                     rendererTelemetry.recordResourceFailure()
-                    coverageRendererOwner.markUploadFailure(coverage.rendererGeneration)
+                    token?.let { coverageRendererOwner.markUploadFailure(it) }
                 },
             )
         }
@@ -1259,6 +1276,7 @@ internal class SceneViewHost(
     private fun CoverageActiveBindingEffect(
         binding: CoveragePointMeshBinding,
         coverage: PointCloudNativeConfig,
+        token: CoverageResourceToken?,
         snapshot: CoveragePointRenderSnapshot?,
         rawSnapshot: CoveragePointRenderSnapshot?,
         coverageMeshRef: AtomicReference<CoveragePointMeshBinding?>,
@@ -1279,15 +1297,15 @@ internal class SceneViewHost(
                     coverageMeshRef.set(binding)
                 }
             ) {
-                coverageRendererOwner.markResourceMounted(coverage.rendererGeneration)
-                onCoverageRendererMounted(true, coverage.rendererGeneration)
+                token?.let { coverageRendererOwner.markResourceMounted(it) }
+                token?.let { onCoverageRendererMounted(true, it.epoch) }
             }
             onDispose {
                 val wasCurrent = coverageMeshRef.compareAndSet(binding, null)
                 binding.dispose()
                 if (wasCurrent) {
-                    coverageRendererOwner.markResourceFailure(coverage.rendererGeneration)
-                    onCoverageRendererMounted(false, coverage.rendererGeneration)
+                    token?.let { coverageRendererOwner.markResourceFailure(it) }
+                    token?.let { onCoverageRendererMounted(false, it.epoch) }
                 }
             }
         }
@@ -1450,8 +1468,8 @@ internal class SceneViewHost(
         private val mode: VoxelRenderMode,
         private val target: CoverageMeshTarget,
         private val pointSizePx: Float,
-        private val generation: Long,
-        private val currentGeneration: CoverageMeshGenerationGate,
+        private val resourceToken: CoverageResourceToken?,
+        private val acceptsResourceToken: (CoverageResourceToken) -> Boolean,
         private val requestRendererFrame: (CoveragePointMeshBinding) -> Unit,
         private val cancelRendererFrame: () -> Unit,
         private val onUploadFailure: () -> Unit,
@@ -1499,14 +1517,15 @@ internal class SceneViewHost(
          * prepared before it is registered for a subsequent renderer frame.
          */
         fun attachAfterNodeLifecycle(registerForFrames: () -> Unit): Boolean {
-            if (disposed) return false
-            return currentGeneration.attachIfCurrent(generation) {
+            if (disposed || resourceToken == null || !acceptsResourceToken(resourceToken)) return false
+            return run {
                 attached = true
                 target.resources.requireRetainedSnapshotUpload()
                 updateActiveTarget()
                 // Publish the binding only after its retained reset is queued.
                 // The coordinator will admit that page on a later real frame.
                 registerForFrames()
+                true
             }
         }
 

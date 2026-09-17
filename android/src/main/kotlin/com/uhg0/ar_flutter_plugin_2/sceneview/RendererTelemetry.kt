@@ -39,6 +39,7 @@ internal class RendererTelemetry {
     private var resourceFailureCount = 0
     private var residentRowCount = 0
     private var residentGlyphCount = 0
+    private var residentToken: CoverageResourceToken? = null
     private val residentRowsByMode = linkedMapOf<CoveragePresentationMode, Int>()
     private val residentGlyphsByMode = linkedMapOf<CoveragePresentationMode, Int>()
 
@@ -85,8 +86,43 @@ internal class RendererTelemetry {
         glyphCount: Int,
     ) {
         setResidentPresentation(rowCount, glyphCount)
+        residentToken = null
         residentRowsByMode[mode] = rowCount
         residentGlyphsByMode[mode] = glyphCount
+    }
+
+    /** Updates gauges only for the owner-issued resource lifetime. */
+    @Synchronized
+    fun setResidentPresentation(
+        token: CoverageResourceToken,
+        mode: CoveragePresentationMode,
+        rowCount: Int,
+        glyphCount: Int,
+    ): Boolean {
+        if (residentToken != null && residentToken != token &&
+            residentToken!!.epoch > token.epoch
+        ) return false
+        setResidentPresentation(rowCount, glyphCount)
+        residentToken = token
+        residentRowsByMode[mode] = rowCount
+        residentGlyphsByMode[mode] = glyphCount
+        return true
+    }
+
+    @Synchronized
+    fun clearResidentPresentation(token: CoverageResourceToken): Boolean {
+        if (residentToken != token) return false
+        clearResidentPresentation()
+        return true
+    }
+
+    @Synchronized
+    fun clearResidentPresentation() {
+        residentToken = null
+        residentRowCount = 0
+        residentGlyphCount = 0
+        residentRowsByMode.clear()
+        residentGlyphsByMode.clear()
     }
 
     fun setOwnedBufferBytes(owner: String, bytes: Int) {

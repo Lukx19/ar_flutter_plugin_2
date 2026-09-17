@@ -55,9 +55,13 @@ internal object CoverageRendererLimits {
     fun rendererStateBytes(mode: VoxelRenderMode): Int =
         VisibilityGridRendererState.ownedStorageBytes(presentationCapacity(mode))
 
+    fun presentationStorageBytes(mode: VoxelRenderMode): Int =
+        CoveragePresentationStorage.estimatedOwnedStorageBytes(presentationCapacity(mode))
+
     fun activeRendererPeakBytes(mode: VoxelRenderMode): Int =
         resourcePeakBytes(mode) +
             rendererStateBytes(mode) +
+            presentationStorageBytes(mode) +
             AUXILIARY_BYTES +
             snapshotHandoffBytes(mode)
 
@@ -68,15 +72,14 @@ internal object CoverageRendererLimits {
     }
 
     fun snapshotHandoffBytes(mode: VoxelRenderMode): Int =
-        // At most two reset-capable snapshots can be retained across the host
-        // hand-off and upload/coalescing boundary; each holds row arrays plus
-        // its full dirty span. The active uploader references that snapshot,
-        // rather than cloning it again.
-        presentationCapacity(mode) * SNAPSHOT_ROW_BYTES * 4
+        // One immutable bounded cut is shared by mesh, hit, and telemetry
+        // consumers. The selector owns its working arrays separately; no
+        // second full reset/span clone is charged here.
+        presentationCapacity(mode) * SNAPSHOT_ROW_BYTES
 
     fun snapshotHandoffBytes(mode: VoxelRenderMode, retainedCount: Int): Int {
         require(retainedCount >= 0)
-        return minOf(retainedCount, presentationCapacity(mode)) * SNAPSHOT_ROW_BYTES * 4
+        return minOf(retainedCount, presentationCapacity(mode)) * SNAPSHOT_ROW_BYTES
     }
 }
 
@@ -126,6 +129,7 @@ internal class CoverageRendererAllocationLedger(
         if (snapshot == null) {
             telemetry.removeOwner(RENDERER_STATE_OWNER)
             telemetry.removeOwner(AUXILIARY_OWNER)
+            telemetry.removeOwner(PRESENTATION_STORAGE_OWNER)
             return
         }
         installPersistentCoverageState(mode)
@@ -133,16 +137,27 @@ internal class CoverageRendererAllocationLedger(
 
     /** Charges the concrete bounded state received from the native renderer. */
     fun installPersistentCoverageState(rendererState: VisibilityGridRendererState) {
-        chargePersistentCoverageState(rendererState.ownedStorageBytes)
+        chargePersistentCoverageState(
+            rendererState.ownedStorageBytes,
+            rendererState.capacity,
+        )
     }
 
     fun installPersistentCoverageStateForCapacity(presentationCapacity: Int) {
         chargePersistentCoverageState(
             VisibilityGridRendererState.ownedStorageBytes(presentationCapacity),
+            presentationCapacity,
         )
     }
 
     private fun chargePersistentCoverageState(rendererStateBytes: Int) {
+        chargePersistentCoverageState(rendererStateBytes, null)
+    }
+
+    private fun chargePersistentCoverageState(
+        rendererStateBytes: Int,
+        presentationCapacity: Int?,
+    ) {
         telemetry.setOwnedBufferBytes(
             RENDERER_STATE_OWNER,
             rendererStateBytes,
@@ -151,6 +166,14 @@ internal class CoverageRendererAllocationLedger(
             AUXILIARY_OWNER,
             CoverageRendererLimits.AUXILIARY_BYTES,
         )
+        if (presentationCapacity == null) {
+            telemetry.removeOwner(PRESENTATION_STORAGE_OWNER)
+        } else {
+            telemetry.setOwnedBufferBytes(
+                PRESENTATION_STORAGE_OWNER,
+                CoveragePresentationStorage.estimatedOwnedStorageBytes(presentationCapacity),
+            )
+        }
     }
 
     fun updateSnapshotHandoff(mode: VoxelRenderMode) {
@@ -181,6 +204,7 @@ internal class CoverageRendererAllocationLedger(
     fun clearCoverageState() {
         telemetry.removeOwner(RENDERER_STATE_OWNER)
         telemetry.removeOwner(AUXILIARY_OWNER)
+        telemetry.removeOwner(PRESENTATION_STORAGE_OWNER)
         telemetry.removeOwner(SNAPSHOT_HANDOFF_OWNER)
     }
 
@@ -240,6 +264,7 @@ internal class CoverageRendererAllocationLedger(
     private companion object {
         const val RENDERER_STATE_OWNER = "coverage-renderer-state"
         const val AUXILIARY_OWNER = "coverage-auxiliary-state"
+        const val PRESENTATION_STORAGE_OWNER = "coverage-presentation-storage"
         const val SNAPSHOT_HANDOFF_OWNER = "coverage-snapshot-handoff"
     }
 }
@@ -260,26 +285,25 @@ internal class CoverageRendererAllocationLedger(
 internal class CoveragePresentationSelector(
     private val maximumCapacity: Int,
 ) {
-    private var activeCapacity = maximumCapacity
-    private val selectedSourceSlots = IntArray(maximumCapacity) { -1 }
-    private val selectedKeys = LongArray(maximumCapacity)
-    private val selectedSurfaceIds = LongArray(maximumCapacity)
-    private val selectedPositions =
-        FloatArray(maximumCapacity * CoveragePointMeshResources.POSITION_COMPONENTS)
-    private val selectedColors = IntArray(maximumCapacity)
-    private val selectedStyleRows =
-        ByteArray(maximumCapacity * COVERAGE_RENDERER_STYLE_ROW_BYTES)
-    private val selectedKeyToDestination = LongRowIndex(maximumCapacity)
-    private val selectedKeyMaxHeap = SelectedKeyMaxHeap(maximumCapacity)
-    private val freeDestinations = IntArray(maximumCapacity) { maximumCapacity - it - 1 }
-    private var freeDestinationCount = maximumCapacity
-    private val dirtyDestinations = DirtyRowQueue(maximumCapacity)
+    private var activeCapacity = 0
+    private val storage = CoveragePresentationStorage(maximumCapacity)
+    private val selectedSourceSlots get() = storage.selectedSourceSlots
+    private val selectedKeys get() = storage.selectedKeys
+    private val selectedSurfaceIds get() = storage.selectedSurfaceIds
+    private val selectedPositions get() = storage.selectedPositions
+    private val selectedColors get() = storage.selectedColors
+    private val selectedStyleRows get() = storage.selectedStyleRows
+    private val selectedKeyToDestination get() = storage.selectedKeyToDestination
+    private val selectedKeyMaxHeap get() = storage.selectedKeyMaxHeap
+    private val freeDestinations get() = storage.freeDestinations
+    private var freeDestinationCount = 0
+    private val dirtyDestinations get() = storage.dirtyDestinations
     private var selectedCount = 0
     private var sourceCount = 0
-    private var sourceSlotToDestination = IntArray(0)
-    private var sourceRankingSurfaceIds = LongArray(0)
-    private var sourceRankingKeys = LongArray(0)
-    private var sourceRankingStyles = IntArray(0)
+    private val sourceSlotToDestination get() = storage.sourceSlotToDestination
+    private val sourceRankingSurfaceIds get() = storage.sourceRankingSurfaceIds
+    private val sourceRankingKeys get() = storage.sourceRankingKeys
+    private val sourceRankingStyles get() = storage.sourceRankingStyles
     private var initialized = false
     private var styleRowsPresent = false
 
@@ -287,19 +311,27 @@ internal class CoveragePresentationSelector(
         require(maximumCapacity > 0)
     }
 
+    val ownedStorageBytes: Int
+        get() = storage.ownedStorageBytes
+
     fun select(
         snapshot: CoveragePointRenderSnapshot,
         requestedCapacity: Int = maximumCapacity,
         forceReset: Boolean = snapshot.update?.reset ?: true,
     ): CoveragePointRenderSnapshot {
         require(requestedCapacity in 1..maximumCapacity)
-        if (activeCapacity != requestedCapacity) {
-            reset()
+        validate(snapshot)
+        val styleRowsAvailable = snapshot.styleRows.isNotEmpty()
+        val capacityChanged = activeCapacity != requestedCapacity
+        val styleChanged = initialized && storage.styleRowsPresent != styleRowsAvailable
+        if (capacityChanged) {
+            if (activeCapacity > 0) reset()
             activeCapacity = requestedCapacity
         }
+        storage.ensurePresentationCapacity(requestedCapacity, styleRowsAvailable)
+        if (styleChanged) reset()
         if (forceReset && initialized) reset()
-        validate(snapshot)
-        styleRowsPresent = snapshot.styleRows.isNotEmpty()
+        styleRowsPresent = styleRowsAvailable
         ensureSourceCapacity(snapshot.capacity)
         val sourceShrunk = initialized && snapshot.count < sourceCount
         val sourceRewritten = initialized && !sourceShrunk && selectedIdentityChanged(snapshot)
@@ -341,14 +373,19 @@ internal class CoveragePresentationSelector(
 
     /** Drops retained source-to-presentation state before a new resource cut. */
     fun reset() {
+        if (activeCapacity == 0) {
+            initialized = false
+            styleRowsPresent = false
+            return
+        }
         selectedKeyToDestination.clear()
         selectedKeyMaxHeap.clear()
         selectedCount = 0
         sourceCount = 0
         freeDestinationCount = activeCapacity
-        repeat(maximumCapacity) { destination ->
+        repeat(activeCapacity) { destination ->
             selectedSourceSlots[destination] = -1
-            freeDestinations[destination] = maximumCapacity - destination - 1
+            freeDestinations[destination] = activeCapacity - destination - 1
         }
         sourceSlotToDestination.fill(-1)
         sourceRankingSurfaceIds.fill(0L)
@@ -583,23 +620,7 @@ internal class CoveragePresentationSelector(
     }
 
     private fun ensureSourceCapacity(sourceCapacity: Int) {
-        if (sourceSlotToDestination.size >= sourceCapacity) return
-        val previousDestinations = sourceSlotToDestination
-        val previousSurfaceIds = sourceRankingSurfaceIds
-        val previousKeys = sourceRankingKeys
-        val previousStyles = sourceRankingStyles
-        sourceSlotToDestination = IntArray(sourceCapacity) { index ->
-            previousDestinations.getOrElse(index) { -1 }
-        }
-        sourceRankingSurfaceIds = LongArray(sourceCapacity) { index ->
-            previousSurfaceIds.getOrElse(index) { 0L }
-        }
-        sourceRankingKeys = LongArray(sourceCapacity) { index ->
-            previousKeys.getOrElse(index) { 0L }
-        }
-        sourceRankingStyles = IntArray(sourceCapacity) { index ->
-            previousStyles.getOrElse(index) { 0 }
-        }
+        storage.ensureSourceCapacity(sourceCapacity)
     }
 
     /**
