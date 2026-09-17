@@ -147,7 +147,7 @@ internal class SceneViewHost(
                 rendererTelemetry.recordPresentation(controls.mode)
                 val current = coverageRenderConfig.value
                 if (current != null) {
-                    val mode = controls.voxelMode()
+                    val mode = controls.mode.toVoxelRenderMode()
                     coverageRenderConfig.value = current.copy(
                         enabled = controls.visible,
                         voxelRenderMode = mode,
@@ -157,31 +157,11 @@ internal class SceneViewHost(
             onPresentationChanged = { snapshot, mode ->
                 if (snapshot != null) {
                     coverageSnapshotRef.set(snapshot)
-                    coverageMeshRef.get()?.updateCoverage(snapshot, mode.voxelMode())
+                    coverageMeshRef.get()?.updateCoverage(snapshot, mode.toVoxelRenderMode())
                 }
             },
             worldToScreen = CoverageWorldToScreenProjection(::projectCoveragePoint),
         )
-
-    private fun CoverageRendererControls.voxelMode(): VoxelRenderMode = when (mode) {
-        CoveragePresentationMode.RAW_FEATURES -> VoxelRenderMode.POINTS
-        CoveragePresentationMode.SEMANTIC_CUBES -> VoxelRenderMode.CUBES
-        CoveragePresentationMode.SEMANTIC_CENTROIDS,
-        CoveragePresentationMode.WARM_PROXIES,
-        CoveragePresentationMode.OVERVIEW,
-        CoveragePresentationMode.SUPPRESSED_DEBUG,
-        -> VoxelRenderMode.CENTROIDS
-    }
-
-    private fun CoveragePresentationMode.voxelMode(): VoxelRenderMode = when (this) {
-        CoveragePresentationMode.RAW_FEATURES -> VoxelRenderMode.POINTS
-        CoveragePresentationMode.SEMANTIC_CUBES -> VoxelRenderMode.CUBES
-        CoveragePresentationMode.SEMANTIC_CENTROIDS,
-        CoveragePresentationMode.WARM_PROXIES,
-        CoveragePresentationMode.OVERVIEW,
-        CoveragePresentationMode.SUPPRESSED_DEBUG,
-        -> VoxelRenderMode.CENTROIDS
-    }
 
     private fun projectCoveragePoint(x: Float, y: Float, z: Float): CoverageScreenPoint? {
         val frame = frameRef.get() ?: return null
@@ -666,23 +646,13 @@ internal class SceneViewHost(
 
         val controls = CoverageRendererControls(
             visible = config.enabled,
-            mode = when (config.voxelRenderMode) {
-                VoxelRenderMode.POINTS -> CoveragePresentationMode.RAW_FEATURES
-                VoxelRenderMode.CENTROIDS -> CoveragePresentationMode.SEMANTIC_CENTROIDS
-                VoxelRenderMode.CUBES -> CoveragePresentationMode.SEMANTIC_CUBES
-            },
+            mode = config.voxelRenderMode.toDefaultCoveragePresentationMode(),
             palette = CoverageRendererPalette.COVERAGE,
         )
         val install = coverageRendererOwner.install(snapshot.toVisibilityRendererSnapshot(config))
         if (install.stale) return
         coverageRendererOwner.setControls(controls)
-        rendererTelemetry.recordPresentation(
-            when (config.voxelRenderMode) {
-                VoxelRenderMode.POINTS -> CoveragePresentationMode.RAW_FEATURES
-                VoxelRenderMode.CENTROIDS -> CoveragePresentationMode.SEMANTIC_CENTROIDS
-                VoxelRenderMode.CUBES -> CoveragePresentationMode.SEMANTIC_CUBES
-            },
-        )
+        rendererTelemetry.recordPresentation(config.voxelRenderMode.toDefaultCoveragePresentationMode())
 
         coverageSnapshotRef.set(snapshot)
         val current = coverageRenderConfig.value
@@ -1468,11 +1438,7 @@ internal class SceneViewHost(
 private fun CoveragePointRenderSnapshot.boundedForMesh(
     mode: VoxelRenderMode,
 ): CoveragePointRenderSnapshot {
-    val capacity = when (mode) {
-        VoxelRenderMode.POINTS -> CoverageRendererLimits.RAW_POINT_CAPACITY
-        VoxelRenderMode.CENTROIDS -> CoverageRendererLimits.CENTROID_CAPACITY
-        VoxelRenderMode.CUBES -> CoverageRendererLimits.CUBE_CAPACITY
-    }
+    val capacity = mode.toDefaultCoveragePresentationMode().presentationCapacity
     return if (this.capacity == capacity && count <= capacity) {
         this
     } else {

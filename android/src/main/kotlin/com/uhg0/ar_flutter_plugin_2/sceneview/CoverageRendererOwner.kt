@@ -4,6 +4,7 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererCoverage
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererSemantic
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
+import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import java.util.Collections
 
 /** Stable renderer modes exposed by the V2 visibility binding. */
@@ -16,12 +17,39 @@ enum class CoveragePresentationMode(val wireName: String) {
     SUPPRESSED_DEBUG("suppressedDebug"),
     ;
 
+    val presentationCapacity: Int
+        get() = when (this) {
+            SEMANTIC_CENTROIDS -> 20_000
+            SEMANTIC_CUBES -> 8_000
+            RAW_FEATURES -> 2_000
+            WARM_PROXIES -> 4_096
+            OVERVIEW -> 512
+            SUPPRESSED_DEBUG -> 1_024
+        }
+
     companion object {
         fun fromWire(value: String): CoveragePresentationMode =
             entries.firstOrNull { it.wireName == value } ?:
                 throw IllegalArgumentException("Unknown coverage presentation mode: $value")
     }
 }
+
+internal fun CoveragePresentationMode.toVoxelRenderMode(): VoxelRenderMode = when (this) {
+    CoveragePresentationMode.RAW_FEATURES -> VoxelRenderMode.POINTS
+    CoveragePresentationMode.SEMANTIC_CUBES -> VoxelRenderMode.CUBES
+    CoveragePresentationMode.SEMANTIC_CENTROIDS,
+    CoveragePresentationMode.WARM_PROXIES,
+    CoveragePresentationMode.OVERVIEW,
+    CoveragePresentationMode.SUPPRESSED_DEBUG,
+    -> VoxelRenderMode.CENTROIDS
+}
+
+internal fun VoxelRenderMode.toDefaultCoveragePresentationMode(): CoveragePresentationMode =
+    when (this) {
+        VoxelRenderMode.POINTS -> CoveragePresentationMode.RAW_FEATURES
+        VoxelRenderMode.CENTROIDS -> CoveragePresentationMode.SEMANTIC_CENTROIDS
+        VoxelRenderMode.CUBES -> CoveragePresentationMode.SEMANTIC_CUBES
+    }
 
 typealias CoveragePalette = CoverageRendererPalette
 typealias CoverageSemanticLabel = CoverageRendererSemantic
@@ -502,27 +530,11 @@ internal class NativeCoverageRendererOwner(
     }
 
     private fun selectedRows(snapshot: VisibilityRendererSnapshot): List<VisibilityRendererRow> {
-        val capacity = when (controls.mode) {
-            CoveragePresentationMode.SEMANTIC_CENTROIDS -> CoverageRendererLimits.CENTROID_CAPACITY
-            CoveragePresentationMode.SEMANTIC_CUBES -> CoverageRendererLimits.CUBE_CAPACITY
-            CoveragePresentationMode.RAW_FEATURES -> CoverageRendererLimits.RAW_POINT_CAPACITY
-            CoveragePresentationMode.WARM_PROXIES -> CoverageRendererLimits.WARM_PROXY_CAPACITY
-            CoveragePresentationMode.OVERVIEW -> CoverageRendererLimits.COLD_OVERVIEW_CAPACITY
-            CoveragePresentationMode.SUPPRESSED_DEBUG -> CoverageRendererLimits.DEBUG_ROW_CAPACITY
-        }
-        return snapshot.rows.sortedBy { it.surfaceId }.take(capacity)
+        return snapshot.rows.sortedBy { it.surfaceId }.take(controls.mode.presentationCapacity)
     }
 
     private fun selectForMode(snapshot: CoveragePointRenderSnapshot): CoveragePointRenderSnapshot {
-        val capacity = when (controls.mode) {
-            CoveragePresentationMode.SEMANTIC_CENTROIDS -> CoverageRendererLimits.CENTROID_CAPACITY
-            CoveragePresentationMode.SEMANTIC_CUBES -> CoverageRendererLimits.CUBE_CAPACITY
-            CoveragePresentationMode.RAW_FEATURES -> CoverageRendererLimits.RAW_POINT_CAPACITY
-            CoveragePresentationMode.WARM_PROXIES -> CoverageRendererLimits.WARM_PROXY_CAPACITY
-            CoveragePresentationMode.OVERVIEW -> CoverageRendererLimits.COLD_OVERVIEW_CAPACITY
-            CoveragePresentationMode.SUPPRESSED_DEBUG -> CoverageRendererLimits.DEBUG_ROW_CAPACITY
-        }
-        return snapshot.boundedForPresentation(capacity)
+        return snapshot.boundedForPresentation(controls.mode.presentationCapacity)
     }
 
     private fun notifyPresentationChanged() {

@@ -45,7 +45,7 @@ internal object CoverageRendererLimits {
         }
 
     fun presentationCapacity(mode: VoxelRenderMode): Int =
-        VisibilityGridRendererState.presentationCapacity(mode)
+        mode.toDefaultCoveragePresentationMode().presentationCapacity
 
     /**
      * The production visibility renderer is the sole retained selector. Its
