@@ -218,6 +218,85 @@ class QualifiedRendererStyleCutTest {
         assertEquals(8L, afterRejectedReplay.update!!.geometryRevision)
     }
 
+    @Test
+    fun `geometry replacement clears the stable row style before a new qualified cut`() {
+        val state = stateWithRows()
+        state.snapshot()
+        val styled = cut(
+            reset = true,
+            ids = longArrayOf(1, 2),
+            styleValues = arrayOf(
+                style(coverage = CoverageRendererCoverage.COMPLETE,
+                    target = CoverageRendererTarget.PRIMARY),
+                style(coverage = CoverageRendererCoverage.PARTIAL),
+            ),
+            targetSurfaceId = 1,
+            targetDirectionIndex = 4,
+        )
+        assertTrue(state.applyStyleCut(styled) is RendererStyleCutResult.Applied)
+        state.snapshot()
+
+        assertTrue(
+            state.applyGeometry(
+                revision = 8,
+                reset = false,
+                upsertRows = listOf(row(1, 1)),
+                removalSurfaceIds = longArrayOf(),
+            ),
+        )
+        val snapshot = state.snapshot()
+        val replaced = snapshot.keys.indexOf(packVisibilityGridKey(1, 0, 0))
+        val cleared = CoverageRendererStyleRowV1.decode(
+            snapshot.styleRows,
+            replaced * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+        )
+        assertEquals(CoverageRendererCoverage.UNCOVERED, cleared.coverage)
+        assertEquals(CoverageRendererTarget.NONE, cleared.target)
+        assertNull(state.currentTargetSurfaceId)
+        assertEquals(
+            RendererStyleCutRejection.GEOMETRY_REVISION_MISMATCH,
+            (state.applyStyleCut(styled) as RendererStyleCutResult.Rejected).reason,
+        )
+    }
+
+    @Test
+    fun `empty cut is accepted only when it clears an installed target`() {
+        val state = stateWithRows()
+        state.snapshot()
+        val empty = cut(
+            reset = false,
+            ids = longArrayOf(),
+            styleValues = emptyArray<CoverageRendererStyleRowV1>(),
+        )
+        assertEquals(
+            RendererStyleCutRejection.EMPTY_CUT_NOT_ALLOWED,
+            (state.applyStyleCut(empty) as RendererStyleCutResult.Rejected).reason,
+        )
+        assertEquals(0, state.currentStyleRevision)
+
+        val targeted = cut(
+            reset = true,
+            ids = longArrayOf(1, 2),
+            styleValues = arrayOf(
+                style(target = CoverageRendererTarget.PRIMARY),
+                style(),
+            ),
+            targetSurfaceId = 1,
+            targetDirectionIndex = 4,
+        )
+        assertTrue(state.applyStyleCut(targeted) is RendererStyleCutResult.Applied)
+        val clear = empty.copy(
+            semanticRevision = 2,
+            coverageRevision = 2,
+            styleRevision = 2,
+            residencyRevision = 2,
+            targetRevision = 2,
+        )
+        assertTrue(state.applyStyleCut(clear) is RendererStyleCutResult.Applied)
+        assertNull(state.currentTargetSurfaceId)
+        assertEquals(2, state.currentStyleRevision)
+    }
+
     private fun stateWithRows(): VisibilityGridRendererState {
         val state = VisibilityGridRendererState(2)
         state.startCanonicalGroup(

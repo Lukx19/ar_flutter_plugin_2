@@ -509,6 +509,12 @@ class VisibilityGridRendererState(
         if (candidate.targetDirectionIndex != null && candidate.targetDirectionIndex !in 0..23) {
             return RendererStyleCutResult.Rejected(RendererStyleCutRejection.TARGET_DIRECTION_INVALID)
         }
+        if (rowCount == 0 &&
+            !(candidate.reset && count == 0) &&
+            !(!candidate.reset && targetSurfaceIdValue != null)
+        ) {
+            return RendererStyleCutResult.Rejected(RendererStyleCutRejection.EMPTY_CUT_NOT_ALLOWED)
+        }
 
         var previousSurfaceId = 0L
         val decoded = arrayOfNulls<CoverageRendererStyleRowV1>(rowCount)
@@ -773,6 +779,10 @@ class VisibilityGridRendererState(
                 targetSurfaceIdValue = null
                 targetDirectionIndexValue = null
             }
+            val clearedRow = CoverageRendererStyleRowV1()
+            val cleared = clearedRow.encode()
+            cleared.copyInto(styleRows, slot * COVERAGE_RENDERER_STYLE_ROW_BYTES)
+            colors[slot] = clearedRow.packedColor()
             writePosition(slot, next.voxelKey)
             dirtyRows.add(slot)
         }
