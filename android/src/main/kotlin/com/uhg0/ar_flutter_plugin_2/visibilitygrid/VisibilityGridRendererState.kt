@@ -3,6 +3,7 @@ package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan
+import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_NO_DIRECTION
 import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererGlyph
@@ -580,6 +581,35 @@ class VisibilityGridRendererState(
         // The complete cut is valid.  Only now do we touch row bytes and the
         // revision/target receipt, making every rejection byte-identical.
         var changedRows = 0
+        val previousTargetSurfaceId = targetSurfaceIdValue
+        if (previousTargetSurfaceId != null &&
+            previousTargetSurfaceId != candidate.targetSurfaceId &&
+            previousTargetSurfaceId !in candidate.surfaceIds
+        ) {
+            val previousTargetRow = rowsByIdentity[previousTargetSurfaceId]
+            if (previousTargetRow != null) {
+                val current = styleAt(previousTargetRow)
+                if (current.target != CoverageRendererTarget.NONE) {
+                    val cleared = current.copy(
+                        semanticGeneration = candidate.semanticRevision,
+                        styleGeneration = candidate.styleRevision,
+                        target = CoverageRendererTarget.NONE,
+                        directionBin = COVERAGE_RENDERER_NO_DIRECTION,
+                        glyph = CoverageRendererGlyph.NONE,
+                    )
+                    val encoded = cleared.encode()
+                    val styleOffset = previousTargetRow * COVERAGE_RENDERER_STYLE_ROW_BYTES
+                    if (!styleRows.regionMatches(styleOffset, encoded) ||
+                        colors[previousTargetRow] != cleared.packedColor()
+                    ) {
+                        encoded.copyInto(styleRows, styleOffset)
+                        colors[previousTargetRow] = cleared.packedColor()
+                        dirtyRows.add(previousTargetRow)
+                        changedRows++
+                    }
+                }
+            }
+        }
         for (index in 0 until rowCount) {
             val row = checkNotNull(rowsByIdentity[candidate.surfaceIds[index]])
             val encodedOffset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES

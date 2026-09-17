@@ -47,6 +47,215 @@ class QualifiedRendererStyleCutTest {
     }
 
     @Test
+    fun `non-reset target move clears the omitted prior row and uploads both rows`() {
+        val state = stateWithRows()
+        state.snapshot()
+        val initial = cut(
+            reset = true,
+            ids = longArrayOf(1, 2),
+            styleValues = arrayOf(
+                style(coverage = CoverageRendererCoverage.COMPLETE,
+                    target = CoverageRendererTarget.PRIMARY),
+                style(coverage = CoverageRendererCoverage.PARTIAL),
+            ),
+            targetSurfaceId = 1,
+            targetDirectionIndex = 4,
+        )
+        assertTrue(state.applyStyleCut(initial) is RendererStyleCutResult.Applied)
+        state.snapshot()
+
+        val move = initial.copy(
+            semanticRevision = 2,
+            coverageRevision = 2,
+            styleRevision = 2,
+            residencyRevision = 2,
+            targetRevision = 2,
+            reset = false,
+            surfaceIds = longArrayOf(2),
+            styleRows = styles(
+                style(semanticGeneration = 2, styleGeneration = 2,
+                    coverage = CoverageRendererCoverage.PARTIAL,
+                    target = CoverageRendererTarget.PRIMARY,
+                    directionIndex = 7),
+            ),
+            targetSurfaceId = 2,
+            targetDirectionIndex = 7,
+        )
+        assertEquals(RendererStyleCutResult.Applied(2, 2, 2, 2), state.applyStyleCut(move))
+        assertEquals(2L, state.currentTargetSurfaceId)
+        assertEquals(7, state.currentTargetDirectionIndex)
+
+        val snapshot = state.snapshot()
+        val span = snapshot.update!!.spans.single()
+        assertEquals(0, span.startSlot)
+        assertEquals(2, span.colors.size)
+        assertEquals(
+            style(semanticGeneration = 2, styleGeneration = 2,
+                coverage = CoverageRendererCoverage.COMPLETE),
+            decodedRow(snapshot, 0),
+        )
+        assertEquals(
+            style(semanticGeneration = 2, styleGeneration = 2,
+                coverage = CoverageRendererCoverage.PARTIAL,
+                target = CoverageRendererTarget.PRIMARY,
+                directionIndex = 7),
+            decodedRow(snapshot, 1),
+        )
+    }
+
+    @Test
+    fun `non-reset target clear clears only target fields and exact replay is a no-op`() {
+        val state = stateWithRows()
+        state.snapshot()
+        val initial = cut(
+            reset = true,
+            ids = longArrayOf(1, 2),
+            styleValues = arrayOf(
+                style(coverage = CoverageRendererCoverage.COMPLETE,
+                    target = CoverageRendererTarget.PRIMARY),
+                style(coverage = CoverageRendererCoverage.PARTIAL),
+            ),
+            targetSurfaceId = 1,
+            targetDirectionIndex = 4,
+        )
+        assertTrue(state.applyStyleCut(initial) is RendererStyleCutResult.Applied)
+        state.snapshot()
+
+        val clear = initial.copy(
+            semanticRevision = 2,
+            coverageRevision = 2,
+            styleRevision = 2,
+            residencyRevision = 2,
+            targetRevision = 2,
+            reset = false,
+            surfaceIds = longArrayOf(),
+            styleRows = ByteArray(0),
+            targetSurfaceId = null,
+            targetDirectionIndex = null,
+        )
+        assertEquals(RendererStyleCutResult.Applied(2, 2, 1, null), state.applyStyleCut(clear))
+        assertNull(state.currentTargetSurfaceId)
+        assertNull(state.currentTargetDirectionIndex)
+
+        val cleared = state.snapshot()
+        val span = cleared.update!!.spans.single()
+        assertEquals(0, span.startSlot)
+        assertEquals(1, span.colors.size)
+        assertEquals(
+            style(semanticGeneration = 2, styleGeneration = 2,
+                coverage = CoverageRendererCoverage.COMPLETE),
+            decodedRow(cleared, 0),
+        )
+        assertEquals(style(coverage = CoverageRendererCoverage.PARTIAL), decodedRow(cleared, 1))
+
+        assertEquals(RendererStyleCutResult.Replayed(2), state.applyStyleCut(clear))
+        val replay = state.snapshot()
+        assertEquals(cleared.revision, replay.revision)
+        assertTrue(replay.update!!.spans.isEmpty())
+    }
+
+    @Test
+    fun `supplied prior target row is replaced once for reset and delta cuts`() {
+        listOf(true, false).forEach { reset ->
+            val state = stateWithRows()
+            state.snapshot()
+            val initial = cut(
+                reset = true,
+                ids = longArrayOf(1, 2),
+                styleValues = arrayOf(
+                    style(coverage = CoverageRendererCoverage.COMPLETE,
+                        target = CoverageRendererTarget.PRIMARY),
+                    style(coverage = CoverageRendererCoverage.PARTIAL),
+                ),
+                targetSurfaceId = 1,
+                targetDirectionIndex = 4,
+            )
+            assertTrue(state.applyStyleCut(initial) is RendererStyleCutResult.Applied)
+            state.snapshot()
+
+            val replacement = initial.copy(
+                semanticRevision = 2,
+                coverageRevision = 2,
+                styleRevision = 2,
+                residencyRevision = 2,
+                targetRevision = 2,
+                reset = reset,
+                surfaceIds = longArrayOf(1, 2),
+                styleRows = styles(
+                    style(semanticGeneration = 2, styleGeneration = 2,
+                        coverage = CoverageRendererCoverage.PARTIAL),
+                    style(semanticGeneration = 2, styleGeneration = 2,
+                        coverage = CoverageRendererCoverage.COMPLETE,
+                        target = CoverageRendererTarget.PRIMARY,
+                        directionIndex = 9),
+                ),
+                targetSurfaceId = 2,
+                targetDirectionIndex = 9,
+            )
+            assertEquals(
+                RendererStyleCutResult.Applied(2, 2, 2, 2),
+                state.applyStyleCut(replacement),
+            )
+            val snapshot = state.snapshot()
+            assertEquals(
+                style(semanticGeneration = 2, styleGeneration = 2,
+                    coverage = CoverageRendererCoverage.PARTIAL),
+                decodedRow(snapshot, 0),
+            )
+            assertEquals(
+                style(semanticGeneration = 2, styleGeneration = 2,
+                    coverage = CoverageRendererCoverage.COMPLETE,
+                    target = CoverageRendererTarget.PRIMARY,
+                    directionIndex = 9),
+                decodedRow(snapshot, 1),
+            )
+        }
+    }
+
+    @Test
+    fun `invalid non-reset target move leaves the prior target and dirty upload unchanged`() {
+        val state = stateWithRows()
+        state.snapshot()
+        val initial = cut(
+            reset = true,
+            ids = longArrayOf(1, 2),
+            styleValues = arrayOf(
+                style(target = CoverageRendererTarget.PRIMARY),
+                style(),
+            ),
+            targetSurfaceId = 1,
+            targetDirectionIndex = 4,
+        )
+        assertTrue(state.applyStyleCut(initial) is RendererStyleCutResult.Applied)
+        state.snapshot()
+
+        val invalidMove = initial.copy(
+            semanticRevision = 2,
+            coverageRevision = 2,
+            styleRevision = 2,
+            residencyRevision = 2,
+            targetRevision = 2,
+            reset = false,
+            surfaceIds = longArrayOf(2),
+            styleRows = styles(
+                style(semanticGeneration = 2, styleGeneration = 2,
+                    target = CoverageRendererTarget.PRIMARY),
+            ),
+            targetSurfaceId = 2,
+            targetDirectionIndex = 5,
+        )
+        assertEquals(
+            RendererStyleCutRejection.MALFORMED_STYLE,
+            (state.applyStyleCut(invalidMove) as RendererStyleCutResult.Rejected).reason,
+        )
+        assertEquals(1L, state.currentTargetSurfaceId)
+        assertEquals(4, state.currentTargetDirectionIndex)
+        val unchanged = state.snapshot()
+        assertTrue(unchanged.update!!.spans.isEmpty())
+        assertEquals(CoverageRendererTarget.PRIMARY, decodedRow(unchanged, 0).target)
+    }
+
+    @Test
     fun `malformed or stale cut is rejected before any row or revision mutation`() {
         val state = stateWithRows()
         state.snapshot()
@@ -338,18 +547,27 @@ class QualifiedRendererStyleCutTest {
         styleGeneration: Long = 1,
         coverage: CoverageRendererCoverage = CoverageRendererCoverage.UNCOVERED,
         target: CoverageRendererTarget = CoverageRendererTarget.NONE,
+        directionIndex: Int = 4,
     ) = CoverageRendererStyleRowV1(
         semanticGeneration = semanticGeneration,
         styleGeneration = styleGeneration,
         coverage = coverage,
         target = target,
-        directionBin = if (target == CoverageRendererTarget.NONE) 0xff else 4,
+        directionBin = if (target == CoverageRendererTarget.NONE) 0xff else directionIndex,
         glyph = if (target == CoverageRendererTarget.NONE) CoverageRendererGlyph.NONE
         else CoverageRendererGlyph.DESIRED_DIRECTION,
     )
 
     private fun styles(vararg rows: CoverageRendererStyleRowV1): ByteArray =
         rows.fold(ByteArray(0)) { bytes, row -> bytes + row.encode() }
+
+    private fun decodedRow(
+        snapshot: com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot,
+        slot: Int,
+    ): CoverageRendererStyleRowV1 = CoverageRendererStyleRowV1.decode(
+        snapshot.styleRows,
+        slot * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+    )
 
     private fun row(id: Long, x: Int) = CanonicalRenderRow(
         surfaceId = id,
