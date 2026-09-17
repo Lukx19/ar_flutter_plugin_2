@@ -1,5 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineAuthority
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineScopeV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineV1
@@ -157,6 +158,132 @@ class VisibilityGridV2BindingTest {
             assertEquals(cut.bindingGeneration, applied!!.ownership.bindingGeneration)
             assertArrayEquals(cut.captureGroupId, uuid(40).bytes)
         } finally {
+            binding.dispose()
+        }
+    }
+
+    @Test
+    fun `maximum negotiated renderer cut is paged qualified and applied`() {
+        val messenger = MethodTestMessenger()
+        var projection: NativeRendererProjection? = null
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 2141,
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
+            postToMain = { it() },
+            onRendererStyleCut = { cut -> requireNotNull(projection).applyStyleCut(cut) },
+        )
+        try {
+            val start = startRequest()
+            val before = binding.snapshot()
+            val qualifier = before.nativeStreamToken + before.workerBindingToken
+            val startResult = RecordingResult()
+            MethodChannel(messenger, "visibility_grid_v2_control_2141").invokeMethod(
+                "start",
+                qualifier + ControlCodec.encodeRequest(start),
+                startResult,
+            )
+            assertTrue(startResult.completed.await(2, TimeUnit.SECONDS))
+            val stream = ControlCodec.decodeResponse(
+                stripQualifier(startResult.successValue as ByteArray, qualifier),
+            )
+
+            var sequence = 1L
+            fun exchange(command: ByteArray = byteArrayOf()): PacketCodec.Response {
+                val reply = RecordingBinaryReply()
+                messenger.send(
+                    "visibility_surface_stream_2141",
+                    ByteBuffer.wrap(qualifier + PacketCodec.encodeRequest(PacketCodec.Request(
+                        requestFlags = 0,
+                        streamToken = stream.streamToken,
+                        acknowledgedTransactionId = if (sequence < 3) 0 else 1,
+                        acknowledgedGeometryRevision = if (sequence < 3) 0 else 1,
+                        acknowledgedLineageRevision = if (sequence < 3) 0 else 1,
+                        nextStyleRevision = if (command.isEmpty()) 0 else 1,
+                        maximumResponseBytes = TransactionResponseProfileV1.ordinary.responseCeilingBytes,
+                        styleRecords = emptyList(),
+                        commandBytes = command,
+                        requestSequence = sequence++,
+                    ))),
+                    reply,
+                )
+                assertTrue(reply.completed.await(2, TimeUnit.SECONDS))
+                return PacketCodec.decodeResponse(stripQualifier(requireNotNull(reply.bytes), qualifier))
+            }
+
+            assertEquals(0, exchange().errorId)
+            assertEquals(0, exchange().errorId)
+            assertEquals(0, exchange().errorId)
+            val ownership = requireNotNull(binding.currentObservationOwnership())
+            val rowCount = RendererStyleCommandV1.MAX_ROWS
+            val renderer = NativeRendererProjection(render = { _, _ -> })
+            projection = renderer
+            assertEquals(rowCount, renderer.maximumRows)
+            val geometry = CommittedGeometryCut(
+                ownership = ownership,
+                transactionId = 1,
+                baseGeometryRevision = 0,
+                geometryRevision = 1,
+                lineageRevision = 1,
+                reset = true,
+                upserts = emptyList(),
+                removedSurfaceIds = LongArray(0),
+            )
+            renderer.beginRebuild(geometry)
+            repeat(rowCount / 1_000) { page ->
+                renderer.appendRebuildPage(
+                    geometry.withUpserts(
+                        List(1_000) { offset ->
+                            val index = page * 1_000 + offset
+                            CommittedGeometryRow(
+                                surfaceId = index + 1L,
+                                voxel = Voxel(index, 0, 0),
+                                packedNormal = 0,
+                                normalConfidence = 0,
+                                lineageCount = 0,
+                            )
+                        },
+                    ),
+                )
+            }
+            renderer.finishRebuild(geometry)
+
+            val encodedStyle = CoverageRendererStyleRowV1(
+                semanticGeneration = 1,
+                styleGeneration = 1,
+            ).encode()
+            val styleRows = ByteArray(rowCount * RendererStyleCommandV1.STYLE_ROW_BYTES)
+            repeat(rowCount) { index ->
+                encodedStyle.copyInto(styleRows, index * RendererStyleCommandV1.STYLE_ROW_BYTES)
+            }
+            val cut = RendererStyleCutPayloadV1(
+                captureGroupId = uuid(40).bytes,
+                bindingGeneration = binding.snapshot().bindingGeneration,
+                groupGeneration = start.groupGeneration,
+                transactionId = 1,
+                geometryRevision = 1,
+                lineageRevision = 1,
+                semanticRevision = 1,
+                coverageRevision = 1,
+                styleRevision = 1,
+                residencyRevision = 1,
+                targetRevision = 1,
+                reset = true,
+                surfaceIds = LongArray(rowCount) { it + 1L },
+                styleRows = styleRows,
+            )
+            val pages = RendererStyleCommandV1.encodePages(cut)
+            pages.dropLast(1).forEach { page ->
+                val progress = exchange(page)
+                assertEquals(0, progress.errorId)
+                assertEquals(0L, progress.acceptedStyleRevision)
+            }
+            val accepted = exchange(pages.last())
+            assertEquals(0, accepted.errorId)
+            assertEquals(1L, accepted.acceptedStyleRevision)
+            assertEquals(rowCount, renderer.currentRowCount())
+        } finally {
+            projection?.close()
             binding.dispose()
         }
     }

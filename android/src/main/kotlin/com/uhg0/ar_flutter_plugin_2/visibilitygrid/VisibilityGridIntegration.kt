@@ -1131,7 +1131,7 @@ internal enum class RendererProjectionRefusal {
 /** Dedicated V2 adapter over the existing bounded native renderer state. */
 internal class NativeRendererProjection(
     private val render: (CoveragePointRenderSnapshot?, PointCloudNativeConfig?) -> Unit,
-    capacity: Int = VisibilityGridRendererState.CENTROID_PRESENTATION_CAPACITY,
+    capacity: Int = QUALIFIED_RENDERER_STYLE_CUT_MAX_ROWS,
 ) : CommittedRendererProjection {
     private val state = VisibilityGridRendererState(capacity)
     private var closed = false
