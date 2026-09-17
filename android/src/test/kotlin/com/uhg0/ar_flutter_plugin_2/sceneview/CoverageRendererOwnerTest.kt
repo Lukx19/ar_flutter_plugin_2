@@ -2,7 +2,10 @@ package com.uhg0.ar_flutter_plugin_2.sceneview
 
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererCoverage
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererResidency
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererSemantic
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererTarget
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -260,5 +263,101 @@ class CoverageRendererOwnerTest {
             LongArray(CoverageRendererLimits.CUBE_CAPACITY) { it.toLong() }.toList(),
             owner.presentationSnapshot()!!.keys.toList(),
         )
+    }
+
+    @Test
+    fun `shared plan ranks target need residency and surface while applying palette`() {
+        val styles = listOf(
+            CoverageRendererStyleRowV1(
+                coverage = CoverageRendererCoverage.COMPLETE,
+                residency = CoverageRendererResidency.ACTIVE_L0,
+            ),
+            CoverageRendererStyleRowV1(
+                coverage = CoverageRendererCoverage.UNCOVERED,
+                residency = CoverageRendererResidency.COLD_L2,
+            ),
+            CoverageRendererStyleRowV1(
+                coverage = CoverageRendererCoverage.PARTIAL,
+                residency = CoverageRendererResidency.WARM_L1,
+                target = CoverageRendererTarget.PRIMARY,
+            ),
+        )
+        val rows = styles.mapIndexed { index, style ->
+            VisibilityRendererRow(
+                surfaceId = longArrayOf(30L, 20L, 10L)[index],
+                x = index.toFloat(),
+                y = 0f,
+                z = 0f,
+                semanticLabel = style.semantic,
+                coverageLabel = style.coverage,
+                targetDirectionIndex = null,
+                style = style,
+            )
+        }
+        val encodedStyles = styles.flatMap { it.encode().toList() }.toByteArray()
+        val owner = NativeCoverageRendererOwner()
+        owner.install(
+            VisibilityRendererSnapshot(
+                bindingGeneration = 1L,
+                groupGeneration = 1L,
+                rendererGeneration = 1L,
+                transactionId = 1L,
+                geometryRevision = 1L,
+                styleRevision = 1L,
+                rows = rows,
+                renderSnapshot = CoveragePointRenderSnapshot(
+                    revision = 1L,
+                    enabled = true,
+                    capacity = 3,
+                    count = 3,
+                    keys = longArrayOf(30L, 20L, 10L),
+                    surfaceIds = longArrayOf(30L, 20L, 10L),
+                    positions = FloatArray(9),
+                    colors = IntArray(3),
+                    styleRows = encodedStyles,
+                ),
+            ),
+        )
+        owner.setControls(
+            CoverageRendererControls(
+                visible = true,
+                mode = CoveragePresentationMode.SEMANTIC_CENTROIDS,
+                palette = CoverageRendererPalette.NORMAL,
+            ),
+        )
+
+        assertEquals(listOf(10L, 20L, 30L), owner.presentationPlan()!!.surfaceIds)
+        val rendered = owner.presentationSnapshot()!!
+        assertEquals(owner.presentationPlan()!!.surfaceIds, rendered.surfaceIds.toList())
+        assertEquals(
+            CoverageRendererPalette.NORMAL,
+            CoverageRendererStyleRowV1.decode(rendered.styleRows).palette,
+        )
+    }
+
+    @Test
+    fun `controls survive a newer install and resource failure leaves semantic cut intact`() {
+        val owner = NativeCoverageRendererOwner()
+        owner.setControls(
+            CoverageRendererControls(
+                visible = true,
+                mode = CoveragePresentationMode.SEMANTIC_CUBES,
+                palette = CoverageRendererPalette.NORMAL,
+            ),
+        )
+        owner.install(snapshot(rendererGeneration = 2L))
+        assertEquals(CoveragePresentationMode.SEMANTIC_CUBES, owner.status().mode)
+        assertEquals(CoverageRendererPalette.NORMAL, owner.status().palette)
+
+        assertTrue(owner.markResourceFailure(2L))
+        assertTrue(owner.status().rendererUnavailable)
+        assertEquals(2, owner.status().rowCount)
+        val recovery = owner.resume()
+        assertTrue(recovery.recovered)
+        assertTrue(recovery.rehydrated.not())
+        assertTrue(owner.status().rendererUnavailable)
+        assertTrue(owner.markResourceMounted(2L))
+        assertTrue(owner.status().resourceAvailable)
+        assertEquals(2, owner.status().rowCount)
     }
 }

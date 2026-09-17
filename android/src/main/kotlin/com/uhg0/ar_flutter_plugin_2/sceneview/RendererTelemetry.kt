@@ -36,6 +36,9 @@ internal class RendererTelemetry {
     private val presentationCounts = linkedMapOf<String, Int>()
     private var resourceReplacementCount = 0
     private var resourceDisposalCount = 0
+    private var resourceFailureCount = 0
+    private var residentRowCount = 0
+    private var residentGlyphCount = 0
 
     @Synchronized
     fun recordPresentation(mode: CoveragePresentationMode) {
@@ -58,6 +61,19 @@ internal class RendererTelemetry {
     @Synchronized
     fun recordResourceDisposal() {
         resourceDisposalCount++
+    }
+
+    @Synchronized
+    fun recordResourceFailure() {
+        resourceFailureCount++
+    }
+
+    @Synchronized
+    fun setResidentPresentation(rowCount: Int, glyphCount: Int) {
+        require(rowCount >= 0)
+        require(glyphCount in 0..rowCount)
+        residentRowCount = rowCount
+        residentGlyphCount = glyphCount
     }
 
     fun setOwnedBufferBytes(owner: String, bytes: Int) {
@@ -197,6 +213,12 @@ internal class RendererTelemetry {
         "debugCount" to (presentationCounts["debugCount"] ?: 0),
         "resourceReplacementCount" to resourceReplacementCount,
         "resourceDisposalCount" to resourceDisposalCount,
+        "resourceFailureCount" to resourceFailureCount,
+        "cumulativeResourceReplacementCount" to resourceReplacementCount,
+        "cumulativeResourceDisposalCount" to resourceDisposalCount,
+        "residentRowCount" to residentRowCount,
+        "residentGlyphCount" to residentGlyphCount,
+        "cumulativeReplacementBalance" to resourceDisposalCount - resourceReplacementCount,
         "resourceReplacementDisposalBalance" to
             resourceDisposalCount - resourceReplacementCount,
     )

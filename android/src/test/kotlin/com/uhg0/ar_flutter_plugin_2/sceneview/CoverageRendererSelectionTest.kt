@@ -247,18 +247,18 @@ class CoverageRendererSelectionTest {
             keys = longArrayOf(30, 10, 20),
             positions = FloatArray(9),
             colors = intArrayOf(30, 10, 20),
-            styleRows = uncovered + complete + uncovered,
+            styleRows = complete + complete + uncovered,
         )
 
         val bounded = snapshot.boundedForPresentation(2)
 
-        assertArrayEquals(longArrayOf(10, 20), bounded.keys)
+        assertArrayEquals(longArrayOf(20, 10), bounded.keys)
         assertEquals(
-            CoverageRendererCoverage.COMPLETE,
+            CoverageRendererCoverage.UNCOVERED,
             CoverageRendererStyleRowV1.decode(bounded.styleRows).coverage,
         )
         assertEquals(
-            CoverageRendererCoverage.UNCOVERED,
+            CoverageRendererCoverage.COMPLETE,
             CoverageRendererStyleRowV1.decode(bounded.styleRows, 16).coverage,
         )
         assertArrayEquals(bounded.styleRows, bounded.update!!.spans.single().styleRows)

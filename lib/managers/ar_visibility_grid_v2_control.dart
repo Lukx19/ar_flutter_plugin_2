@@ -176,6 +176,11 @@ final class ARVisibilityRendererStatus {
     required this.rendererGeneration,
     required this.geometryRevision,
     required this.styleRevision,
+    this.residentRowCount = 0,
+    this.residentGlyphCount = 0,
+    this.resourceAvailable = true,
+    this.recoveryPending = false,
+    this.resourceFailureCount = 0,
   });
 
   final bool rendererUnavailable;
@@ -187,6 +192,11 @@ final class ARVisibilityRendererStatus {
   final int rendererGeneration;
   final int geometryRevision;
   final int styleRevision;
+  final int residentRowCount;
+  final int residentGlyphCount;
+  final bool resourceAvailable;
+  final bool recoveryPending;
+  final int resourceFailureCount;
 
   static ARVisibilityRendererStatus fromMap(Object? raw) {
     final map = _rendererMap(raw, 'renderer status');
@@ -200,6 +210,21 @@ final class ARVisibilityRendererStatus {
       rendererGeneration: _rendererInt(map, 'rendererGeneration'),
       geometryRevision: _rendererInt(map, 'geometryRevision'),
       styleRevision: _rendererInt(map, 'styleRevision'),
+      residentRowCount: map.containsKey('residentRowCount')
+          ? _rendererInt(map, 'residentRowCount')
+          : 0,
+      residentGlyphCount: map.containsKey('residentGlyphCount')
+          ? _rendererInt(map, 'residentGlyphCount')
+          : 0,
+      resourceAvailable: map.containsKey('resourceAvailable')
+          ? _rendererBool(map, 'resourceAvailable')
+          : true,
+      recoveryPending: map.containsKey('recoveryPending')
+          ? _rendererBool(map, 'recoveryPending')
+          : false,
+      resourceFailureCount: map.containsKey('resourceFailureCount')
+          ? _rendererInt(map, 'resourceFailureCount')
+          : 0,
     );
   }
 }
@@ -221,7 +246,7 @@ final class ARVisibilityRendererHitReceipt {
     this.actualStyleRevision,
   });
 
-  final Object? requestId;
+  final Object requestId;
   final bool hit;
   final bool stale;
   final int? surfaceId;
@@ -237,35 +262,47 @@ final class ARVisibilityRendererHitReceipt {
 
   static ARVisibilityRendererHitReceipt fromMap(Object? raw) {
     final map = _rendererMap(raw, 'renderer hit receipt');
+    final requestId = map['requestId'];
+    if (requestId == null) {
+      throw StateError('Renderer field requestId is malformed.');
+    }
     final hit = _rendererBool(map, 'hit');
     if (!hit) {
       return ARVisibilityRendererHitReceipt(
-        requestId: map['requestId'],
+        requestId: requestId,
         hit: false,
       );
     }
     return ARVisibilityRendererHitReceipt(
-      requestId: map['requestId'],
+      requestId: requestId,
       hit: true,
-      surfaceId: _rendererInt(map, 'surfaceId'),
+      surfaceId: _rendererNonNegativeInt(map, 'surfaceId'),
       semanticLabel: ARCoverageSemanticLabel.fromWire(map['semanticLabel']),
       coverageLabel: ARCoverageLabel.fromWire(map['coverageLabel']),
-      targetDirectionIndex: _rendererNullableInt(map, 'targetDirectionIndex'),
-      geometryRevision: _rendererInt(map, 'geometryRevision'),
-      styleRevision: _rendererInt(map, 'styleRevision'),
+      targetDirectionIndex:
+          _rendererDirectionIndex(map, 'targetDirectionIndex'),
+      geometryRevision: _rendererNonNegativeInt(map, 'geometryRevision'),
+      styleRevision: _rendererNonNegativeInt(map, 'styleRevision'),
     );
   }
 
   static ARVisibilityRendererHitReceipt staleFromDetails(Object? details) {
     final map = _rendererMap(details, 'stale renderer hit receipt');
+    final requestId = map['requestId'];
+    if (requestId == null) {
+      throw StateError('Renderer field requestId is malformed.');
+    }
     return ARVisibilityRendererHitReceipt(
-      requestId: map['requestId'],
+      requestId: requestId,
       hit: false,
       stale: true,
-      expectedGeometryRevision: _rendererInt(map, 'expectedGeometryRevision'),
-      actualGeometryRevision: _rendererInt(map, 'actualGeometryRevision'),
-      expectedStyleRevision: _rendererInt(map, 'expectedStyleRevision'),
-      actualStyleRevision: _rendererInt(map, 'actualStyleRevision'),
+      expectedGeometryRevision:
+          _rendererNonNegativeInt(map, 'expectedGeometryRevision'),
+      actualGeometryRevision:
+          _rendererNonNegativeInt(map, 'actualGeometryRevision'),
+      expectedStyleRevision:
+          _rendererNonNegativeInt(map, 'expectedStyleRevision'),
+      actualStyleRevision: _rendererNonNegativeInt(map, 'actualStyleRevision'),
     );
   }
 }
@@ -296,9 +333,15 @@ final class ARVisibilityGridV2RendererTransport {
     required double xPx,
     required double yPx,
     required Object requestId,
-    int? expectedGeometryRevision,
-    int? expectedStyleRevision,
+    required int expectedGeometryRevision,
+    required int expectedStyleRevision,
   }) async {
+    if (!xPx.isFinite ||
+        !yPx.isFinite ||
+        expectedGeometryRevision < 0 ||
+        expectedStyleRevision < 0) {
+      throw ArgumentError('Renderer hit request fields are invalid.');
+    }
     try {
       final response = await _invoke(
         'rendererHitTest',
@@ -306,10 +349,8 @@ final class ARVisibilityGridV2RendererTransport {
           'xPx': xPx,
           'yPx': yPx,
           'requestId': requestId,
-          if (expectedGeometryRevision != null)
-            'expectedGeometryRevision': expectedGeometryRevision,
-          if (expectedStyleRevision != null)
-            'expectedStyleRevision': expectedStyleRevision,
+          'expectedGeometryRevision': expectedGeometryRevision,
+          'expectedStyleRevision': expectedStyleRevision,
         },
       );
       return ARVisibilityRendererHitReceipt.fromMap(response);
@@ -346,6 +387,20 @@ int? _rendererNullableInt(Map<Object?, Object?> map, String key) {
     throw StateError('Renderer field $key is malformed.');
   }
   return value.toInt();
+}
+
+int _rendererNonNegativeInt(Map<Object?, Object?> map, String key) {
+  final value = _rendererInt(map, key);
+  if (value < 0) throw StateError('Renderer field $key is out of bounds.');
+  return value;
+}
+
+int? _rendererDirectionIndex(Map<Object?, Object?> map, String key) {
+  final value = _rendererNullableInt(map, key);
+  if (value != null && (value < 0 || value > 23)) {
+    throw StateError('Renderer field $key is out of bounds.');
+  }
+  return value;
 }
 
 /// The winner of one identity-qualified, outcome-unknown COMMIT attempt.

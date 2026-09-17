@@ -70,4 +70,21 @@ class RendererTelemetryTest {
         assertEquals(1, telemetry.snapshot().getValue("currentUpdateUploadBytes"))
         assertEquals(64 * 1024, telemetry.snapshot().getValue("peakUpdateUploadBytes"))
     }
+
+    @Test
+    fun `telemetry exposes resident row and glyph gauges plus cumulative replacement balance`() {
+        val telemetry = RendererTelemetry()
+        telemetry.setResidentPresentation(128, 7)
+        telemetry.recordResourceReplacement()
+        telemetry.recordResourceDisposal()
+        telemetry.recordResourceDisposal()
+
+        val snapshot = telemetry.snapshot()
+        assertEquals(128, snapshot.getValue("residentRowCount"))
+        assertEquals(7, snapshot.getValue("residentGlyphCount"))
+        assertEquals(1, snapshot.getValue("cumulativeResourceReplacementCount"))
+        assertEquals(2, snapshot.getValue("cumulativeResourceDisposalCount"))
+        assertEquals(1, snapshot.getValue("cumulativeReplacementBalance"))
+        assertEquals(1, snapshot.getValue("resourceReplacementDisposalBalance"))
+    }
 }

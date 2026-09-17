@@ -4,6 +4,7 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan
 import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.DirtyRowQueue
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.LongRowIndex
@@ -202,6 +203,7 @@ internal class CoveragePresentationSelector(
 ) {
     private val selectedSourceSlots = IntArray(presentationCapacity) { -1 }
     private val selectedKeys = LongArray(presentationCapacity)
+    private val selectedSurfaceIds = LongArray(presentationCapacity)
     private val selectedPositions =
         FloatArray(presentationCapacity * CoveragePointMeshResources.POSITION_COMPONENTS)
     private val selectedColors = IntArray(presentationCapacity)
@@ -215,6 +217,7 @@ internal class CoveragePresentationSelector(
     private var selectedCount = 0
     private var sourceCount = 0
     private var sourceSlotToDestination = IntArray(0)
+    private var sourceStyleFingerprints = LongArray(0)
     private var initialized = false
     private var styleRowsPresent = false
 
@@ -226,7 +229,8 @@ internal class CoveragePresentationSelector(
         validate(snapshot)
         styleRowsPresent = snapshot.styleRows.isNotEmpty()
         ensureSourceCapacity(snapshot.capacity)
-        val sourceRewritten = initialized && selectedIdentityChanged(snapshot)
+        val sourceRewritten = initialized &&
+            (selectedIdentityChanged(snapshot) || sourceStyleChanged(snapshot))
         if (!initialized || sourceRewritten || snapshot.count < sourceCount) {
             initialize(snapshot)
             return presentation(snapshot, reset = true, spans = fullSpan())
@@ -274,22 +278,23 @@ internal class CoveragePresentationSelector(
         for (source in 0 until snapshot.count) {
             if (heapSize < selectedCount) {
                 heap[heapSize] = source
-                siftUp(heap, heapSize, snapshot.keys)
+                siftUp(heap, heapSize, snapshot)
                 heapSize++
-            } else if (selectedCount > 0 && compareSource(source, heap[0], snapshot.keys) < 0) {
+            } else if (selectedCount > 0 && compareSource(source, heap[0], snapshot) < 0) {
                 heap[0] = source
-                siftDown(heap, 0, heapSize, snapshot.keys)
+                siftDown(heap, 0, heapSize, snapshot)
             }
         }
         val selectedSources = IntArray(selectedCount)
         for (destination in selectedCount - 1 downTo 0) {
             selectedSources[destination] = heap[0]
             heap[0] = heap[--heapSize]
-            if (heapSize > 0) siftDown(heap, 0, heapSize, snapshot.keys)
+            if (heapSize > 0) siftDown(heap, 0, heapSize, snapshot)
         }
         selectedCount = 0
         selectedSources.forEach { source -> assignSourceToFreeDestination(snapshot, source) }
         sourceCount = snapshot.count
+        snapshotStyleFingerprints(snapshot)
         initialized = true
     }
 
@@ -300,21 +305,29 @@ internal class CoveragePresentationSelector(
                 val destination = assignSourceToFreeDestination(snapshot, source)
                 dirtyDestinations.add(destination)
             } else if (selectedCount > 0) {
-                val largestKey = selectedKeyMaxHeap.largest(selectedKeyToDestination::containsKey)
-                if (largestKey != null && snapshot.keys[source] < largestKey) {
-                    val destination = checkNotNull(selectedKeyToDestination.remove(largestKey))
-                    val evictedSource = selectedSourceSlots[destination]
+                val largestDestination = (0 until selectedCount).maxWithOrNull { first, second ->
+                    compareSource(selectedSourceSlots[first], selectedSourceSlots[second], snapshot)
+                }
+                val evictedSource = largestDestination?.let(selectedSourceSlots::get)
+                if (largestDestination != null && evictedSource != null &&
+                    compareSource(source, evictedSource, snapshot) < 0
+                ) {
+                    val destination = largestDestination
+                    selectedKeyToDestination.remove(selectedSurfaceIds[destination])
                     sourceSlotToDestination[evictedSource] = -1
                     selectedSourceSlots[destination] = source
                     selectedKeys[destination] = snapshot.keys[source]
-                    selectedKeyToDestination[snapshot.keys[source]] = destination
-                    selectedKeyMaxHeap.add(snapshot.keys[source], selectedKeyToDestination::containsKey)
+                    selectedSurfaceIds[destination] = snapshot.surfaceIds[source]
+                    selectedKeyToDestination[snapshot.surfaceIds[source]] = destination
+                    selectedKeyMaxHeap.add(snapshot.surfaceIds[source], selectedKeyToDestination::containsKey)
                     sourceSlotToDestination[source] = destination
+                    sourceStyleFingerprints[source] = styleAt(snapshot, source).hashCode().toLong()
                     copySourceRow(snapshot, source, destination)
                     dirtyDestinations.add(destination)
                 }
             }
         }
+        snapshotStyleFingerprints(snapshot)
         return dirtyDestinations.drainActive(selectedCount)
     }
 
@@ -326,8 +339,9 @@ internal class CoveragePresentationSelector(
         val destination = freeDestinations[--freeDestinationCount]
         selectedSourceSlots[destination] = source
         selectedKeys[destination] = snapshot.keys[source]
-        selectedKeyToDestination[snapshot.keys[source]] = destination
-        selectedKeyMaxHeap.add(snapshot.keys[source], selectedKeyToDestination::containsKey)
+        selectedSurfaceIds[destination] = snapshot.surfaceIds[source]
+        selectedKeyToDestination[snapshot.surfaceIds[source]] = destination
+        selectedKeyMaxHeap.add(snapshot.surfaceIds[source], selectedKeyToDestination::containsKey)
         sourceSlotToDestination[source] = destination
         copySourceRow(snapshot, source, destination)
         selectedCount++
@@ -375,13 +389,14 @@ internal class CoveragePresentationSelector(
 
     private fun selectedIdentityChanged(snapshot: CoveragePointRenderSnapshot): Boolean =
         (0 until selectedCount).any { destination ->
-            snapshot.keys[selectedSourceSlots[destination]] != selectedKeys[destination]
+            snapshot.surfaceIds[selectedSourceSlots[destination]] != selectedSurfaceIds[destination]
         }
 
     private fun rebuildSelectedRows(snapshot: CoveragePointRenderSnapshot) {
         for (destination in 0 until selectedCount) {
             val source = selectedSourceSlots[destination]
             selectedKeys[destination] = snapshot.keys[source]
+            selectedSurfaceIds[destination] = snapshot.surfaceIds[source]
             copySourceRow(snapshot, source, destination)
         }
     }
@@ -476,6 +491,7 @@ internal class CoveragePresentationSelector(
     private fun ensureSourceCapacity(sourceCapacity: Int) {
         if (sourceSlotToDestination.size >= sourceCapacity) return
         sourceSlotToDestination = IntArray(sourceCapacity) { -1 }
+        sourceStyleFingerprints = LongArray(sourceCapacity)
     }
 
     private fun validate(snapshot: CoveragePointRenderSnapshot) {
@@ -495,11 +511,24 @@ internal class CoveragePresentationSelector(
             endExclusive * COVERAGE_RENDERER_STYLE_ROW_BYTES,
         )
 
-    private fun siftUp(heap: IntArray, start: Int, keys: LongArray) {
+    private fun sourceStyleChanged(snapshot: CoveragePointRenderSnapshot): Boolean {
+        val compared = minOf(sourceCount, snapshot.count)
+        return (0 until compared).any { source ->
+            sourceStyleFingerprints[source] != styleAt(snapshot, source).hashCode().toLong()
+        }
+    }
+
+    private fun snapshotStyleFingerprints(snapshot: CoveragePointRenderSnapshot) {
+        repeat(snapshot.count) { source ->
+            sourceStyleFingerprints[source] = styleAt(snapshot, source).hashCode().toLong()
+        }
+    }
+
+    private fun siftUp(heap: IntArray, start: Int, snapshot: CoveragePointRenderSnapshot) {
         var child = start
         while (child > 0) {
             val parent = (child - 1) / 2
-            if (compareSource(heap[child], heap[parent], keys) <= 0) return
+            if (compareSource(heap[child], heap[parent], snapshot) <= 0) return
             val value = heap[parent]
             heap[parent] = heap[child]
             heap[child] = value
@@ -507,14 +536,14 @@ internal class CoveragePresentationSelector(
         }
     }
 
-    private fun siftDown(heap: IntArray, start: Int, size: Int, keys: LongArray) {
+    private fun siftDown(heap: IntArray, start: Int, size: Int, snapshot: CoveragePointRenderSnapshot) {
         var parent = start
         while (true) {
             val left = parent * 2 + 1
             if (left >= size) return
             val right = left + 1
-            val child = if (right < size && compareSource(heap[right], heap[left], keys) > 0) right else left
-            if (compareSource(heap[child], heap[parent], keys) <= 0) return
+            val child = if (right < size && compareSource(heap[right], heap[left], snapshot) > 0) right else left
+            if (compareSource(heap[child], heap[parent], snapshot) <= 0) return
             val value = heap[parent]
             heap[parent] = heap[child]
             heap[child] = value
@@ -522,10 +551,46 @@ internal class CoveragePresentationSelector(
         }
     }
 
-    private fun compareSource(first: Int, second: Int, keys: LongArray): Int {
-        val keyOrder = keys[first].compareTo(keys[second])
-        return if (keyOrder != 0) keyOrder else first.compareTo(second)
+    private fun compareSource(
+        first: Int,
+        second: Int,
+        snapshot: CoveragePointRenderSnapshot,
+    ): Int {
+        val firstStyle = styleAt(snapshot, first)
+        val secondStyle = styleAt(snapshot, second)
+        val firstRow = VisibilityRendererRow(
+            surfaceId = snapshot.surfaceIds[first],
+            x = snapshot.positions[first * CoveragePointMeshResources.POSITION_COMPONENTS],
+            y = snapshot.positions[first * CoveragePointMeshResources.POSITION_COMPONENTS + 1],
+            z = snapshot.positions[first * CoveragePointMeshResources.POSITION_COMPONENTS + 2],
+            semanticLabel = firstStyle.semantic,
+            coverageLabel = firstStyle.coverage,
+            targetDirectionIndex = firstStyle.directionBin.takeUnless { it == 0xff },
+            style = firstStyle,
+        )
+        val secondRow = VisibilityRendererRow(
+            surfaceId = snapshot.surfaceIds[second],
+            x = snapshot.positions[second * CoveragePointMeshResources.POSITION_COMPONENTS],
+            y = snapshot.positions[second * CoveragePointMeshResources.POSITION_COMPONENTS + 1],
+            z = snapshot.positions[second * CoveragePointMeshResources.POSITION_COMPONENTS + 2],
+            semanticLabel = secondStyle.semantic,
+            coverageLabel = secondStyle.coverage,
+            targetDirectionIndex = secondStyle.directionBin.takeUnless { it == 0xff },
+            style = secondStyle,
+        )
+        val rowOrder = compareCoverageRows(firstRow, secondRow)
+        return if (rowOrder != 0) rowOrder else {
+            val keyOrder = snapshot.keys[first].compareTo(snapshot.keys[second])
+            if (keyOrder != 0) keyOrder else first.compareTo(second)
+        }
     }
+
+    private fun styleAt(snapshot: CoveragePointRenderSnapshot, index: Int): CoverageRendererStyleRowV1 =
+        if (snapshot.styleRows.isEmpty()) CoverageRendererStyleRowV1()
+        else CoverageRendererStyleRowV1.decode(
+            snapshot.styleRows,
+            index * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+        )
 }
 
 /** Stateless compatibility helper for a one-off presentation request. */

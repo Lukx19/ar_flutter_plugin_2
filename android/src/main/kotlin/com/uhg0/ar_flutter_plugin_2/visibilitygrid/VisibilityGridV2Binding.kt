@@ -485,6 +485,11 @@ class VisibilityGridV2Binding internal constructor(
                 "rendererGeneration" to 0L,
                 "geometryRevision" to 0L,
                 "styleRevision" to 0L,
+                "residentRowCount" to 0,
+                "residentGlyphCount" to 0,
+                "resourceAvailable" to false,
+                "recoveryPending" to false,
+                "resourceFailureCount" to 0,
             )
         val status = owner.status()
         return mapOf(
@@ -497,6 +502,11 @@ class VisibilityGridV2Binding internal constructor(
             "rendererGeneration" to status.rendererGeneration,
             "geometryRevision" to status.geometryRevision,
             "styleRevision" to status.styleRevision,
+            "residentRowCount" to status.residentRowCount,
+            "residentGlyphCount" to status.residentGlyphCount,
+            "resourceAvailable" to status.resourceAvailable,
+            "recoveryPending" to status.recoveryPending,
+            "resourceFailureCount" to status.resourceFailureCount,
         )
     }
 
@@ -510,6 +520,17 @@ class VisibilityGridV2Binding internal constructor(
     }
 
     private fun onRendererControlCall(call: MethodCall, result: MethodChannel.Result): Boolean {
+        // Dispatch only renderer-owned methods here. The shared control
+        // channel also carries protocol operations whose arguments are not
+        // maps; validating a map before checking the method would steal those
+        // calls and report a misleading renderer error.
+        val rendererMethod = call.method == "rendererStatus" ||
+            call.method == "getRendererStatus" ||
+            call.method == "setRendererControls" ||
+            call.method == "setCoverageRendererControls" ||
+            call.method == "rendererHitTest" ||
+            call.method == "hitTestCoverage"
+        if (!rendererMethod) return false
         val owner = coverageRendererOwner ?: run {
             result.error("VG_RENDERER_UNAVAILABLE", "coverage renderer owner is unavailable", null)
             return true
@@ -569,6 +590,16 @@ class VisibilityGridV2Binding internal constructor(
             val requestId = arguments["requestId"]
             val expectedGeometry = (arguments["expectedGeometryRevision"] as? Number)?.toLong()
             val expectedStyle = (arguments["expectedStyleRevision"] as? Number)?.toLong()
+            if (requestId == null || expectedGeometry == null || expectedStyle == null ||
+                expectedGeometry < 0L || expectedStyle < 0L
+            ) {
+                result.error(
+                    "VG_RENDERER_INVALID",
+                    "renderer hit request requires requestId and non-negative expected revisions",
+                    null,
+                )
+                return true
+            }
             val receipt = owner.hitTestReceipt(x, y, expectedGeometry, expectedStyle)
             when (receipt) {
                 is CoverageHitReceipt.Stale -> result.error(

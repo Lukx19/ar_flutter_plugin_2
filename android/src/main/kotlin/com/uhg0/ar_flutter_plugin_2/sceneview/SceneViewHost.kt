@@ -45,8 +45,10 @@ import com.google.ar.core.Point
 import com.google.ar.core.Pose
 import com.google.ar.core.Session
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererGlyph
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette
+import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
 import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.ArCoreDepthModeController
@@ -144,19 +146,20 @@ internal class SceneViewHost(
     internal val coverageRendererOwner: NativeCoverageRendererOwner =
         NativeCoverageRendererOwner(
             onControlsChanged = { controls ->
-                rendererTelemetry.recordPresentation(controls.mode)
-                val current = coverageRenderConfig.value
-                if (current != null) {
-                    val mode = controls.mode.toVoxelRenderMode()
-                    coverageRenderConfig.value = current.copy(
-                        enabled = controls.visible,
-                        voxelRenderMode = mode,
-                    )
-                }
+                transitionCoverageControls(controls)
             },
             onPresentationChanged = { snapshot, mode ->
+                val glyphCount = snapshot?.styleRows?.let { styles ->
+                    (0 until snapshot.count).count { index ->
+                        CoverageRendererStyleRowV1.decode(
+                            styles,
+                            index * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                        ).glyph != CoverageRendererGlyph.NONE
+                    }
+                } ?: 0
+                rendererTelemetry.setResidentPresentation(snapshot?.count ?: 0, glyphCount)
+                coverageSnapshotRef.set(snapshot)
                 if (snapshot != null) {
-                    coverageSnapshotRef.set(snapshot)
                     coverageMeshRef.get()?.updateCoverage(snapshot, mode.toVoxelRenderMode())
                 }
             },
@@ -644,44 +647,97 @@ internal class SceneViewHost(
             return
         }
 
-        val controls = CoverageRendererControls(
-            visible = config.enabled,
-            mode = config.voxelRenderMode.toDefaultCoveragePresentationMode(),
-            palette = CoverageRendererPalette.COVERAGE,
-        )
+        val controls = if (coverageRendererOwner.controlsConfigured()) {
+            val status = coverageRendererOwner.status()
+            CoverageRendererControls(status.visible, status.mode, status.palette)
+        } else {
+            CoverageRendererControls(
+                visible = config.enabled,
+                mode = config.voxelRenderMode.toDefaultCoveragePresentationMode(),
+                palette = CoverageRendererPalette.COVERAGE,
+            )
+        }
         val install = coverageRendererOwner.install(snapshot.toVisibilityRendererSnapshot(config))
         if (install.stale) return
-        coverageRendererOwner.setControls(controls)
-        rendererTelemetry.recordPresentation(config.voxelRenderMode.toDefaultCoveragePresentationMode())
+        if (!coverageRendererOwner.controlsConfigured()) {
+            val controlReceipt = coverageRendererOwner.setControls(controls)
+            if (!controlReceipt.accepted && !controlReceipt.rendererUnavailable) return
+        }
 
-        coverageSnapshotRef.set(snapshot)
+        val effectiveConfig = config.copy(
+            enabled = controls.visible,
+            voxelRenderMode = controls.mode.toVoxelRenderMode(),
+        )
+        coverageSnapshotRef.set(coverageRendererOwner.presentationSnapshot())
         val current = coverageRenderConfig.value
         val requiresReplacement = current == null ||
-            current.renderCapacity != config.renderCapacity ||
-            current.pointSizePx != config.pointSizePx ||
-            current.enabled != config.enabled ||
-            current.voxelRenderMode != config.voxelRenderMode ||
-            current.voxelSizeMeters != config.voxelSizeMeters ||
-            current.cubeSizeFactor != config.cubeSizeFactor ||
-            current.rendererGeneration != config.rendererGeneration
+            current.renderCapacity != effectiveConfig.renderCapacity ||
+            current.pointSizePx != effectiveConfig.pointSizePx ||
+            current.enabled != effectiveConfig.enabled ||
+            current.voxelRenderMode != effectiveConfig.voxelRenderMode ||
+            current.voxelSizeMeters != effectiveConfig.voxelSizeMeters ||
+            current.cubeSizeFactor != effectiveConfig.cubeSizeFactor ||
+            current.rendererGeneration != effectiveConfig.rendererGeneration
         if (requiresReplacement) {
             // Compose can briefly retain an outgoing node during a key change.
-            // Destroy its renderer-owned buffers before installing the next
-            // mode so a same-mode cube recreation cannot double the ledger.
-            coverageMeshRef.get()?.disposeForReplacement()
-            // Do not let Compose observe the new resource mode until every
+            // Preflight the new ledger before destroying the old resource, so
+            // a failed admission leaves the current renderer mounted. Do not
+            // let Compose observe the new resource mode until every
             // ledger owner has the new capacity. In particular a centroid
             // snapshot hand-off is 20k rows; replacing a cube while it is
             // still charged would produce a real transient over the shared
             // cap even though each active mode fits on its own.
-            rendererAllocationLedger.installPersistentCoverageState(config.voxelRenderMode)
-            rendererAllocationLedger.updateSnapshotHandoff(config.voxelRenderMode)
-            coverageRenderConfig.value = config
+            rendererAllocationLedger.installPersistentCoverageState(effectiveConfig.voxelRenderMode)
+            rendererAllocationLedger.updateSnapshotHandoff(effectiveConfig.voxelRenderMode)
+            coverageMeshRef.get()?.disposeForReplacement()
+            coverageRenderConfig.value = effectiveConfig
         } else {
-            rendererAllocationLedger.installPersistentCoverageState(config.voxelRenderMode)
-            rendererAllocationLedger.updateSnapshotHandoff(config.voxelRenderMode)
+            rendererAllocationLedger.installPersistentCoverageState(effectiveConfig.voxelRenderMode)
+            rendererAllocationLedger.updateSnapshotHandoff(effectiveConfig.voxelRenderMode)
         }
         coverageRendererOwner.refreshPresentation()
+    }
+
+    /**
+     * Renderer controls are admitted only after the host has fenced the old
+     * mesh and preflighted the replacement ledger. A failed preflight leaves
+     * the owner controls and semantic cut unchanged.
+     */
+    private fun transitionCoverageControls(controls: CoverageRendererControls): Boolean {
+        if (disposed) return false
+        val current = coverageRenderConfig.value ?: run {
+            rendererTelemetry.recordPresentation(controls.mode)
+            return true
+        }
+        val nextMode = controls.mode.toVoxelRenderMode()
+        val modeChanged = current.voxelRenderMode != nextMode
+        return runCatching {
+            if (modeChanged) {
+                rendererAllocationLedger.installPersistentCoverageState(nextMode)
+                rendererAllocationLedger.updateSnapshotHandoff(nextMode)
+                coverageMeshRef.get()?.disposeForReplacement()
+            }
+            coverageRenderConfig.value = current.copy(
+                enabled = controls.visible,
+                voxelRenderMode = nextMode,
+                rendererGeneration = if (modeChanged) {
+                    current.rendererGeneration + 1L
+                } else {
+                    current.rendererGeneration
+                },
+            )
+            rendererTelemetry.recordPresentation(controls.mode)
+            true
+        }.getOrElse { false }
+    }
+
+    private inline fun <T> createCoverageResource(
+        rendererGeneration: Long,
+        create: () -> T,
+    ): T = runCatching { create() }.getOrElse { error ->
+        rendererTelemetry.recordResourceFailure()
+        coverageRendererOwner.markResourceFailure(rendererGeneration)
+        throw error
     }
 
     fun updateRawPointCloud(snapshot: CoveragePointRenderSnapshot?) {
@@ -743,6 +799,7 @@ internal class SceneViewHost(
                 semanticLabel = style.semantic,
                 coverageLabel = style.coverage,
                 targetDirectionIndex = style.directionBin.takeUnless { it == 0xff },
+                style = style,
             )
         }
         return VisibilityRendererSnapshot(
@@ -754,9 +811,10 @@ internal class SceneViewHost(
             styleRevision = styleRevision.takeIf { it > 0L } ?: (update?.visibilityRevision ?: revision),
             rows = rows,
             renderSnapshot = this,
-            targetSurfaceId = rows.firstOrNull { it.targetDirectionIndex != null }?.surfaceId,
-            targetDirectionIndex = rows.firstOrNull { it.targetDirectionIndex != null }
-                ?.targetDirectionIndex,
+            targetSurfaceId = rows.sortedWith(::compareCoverageRows)
+                .firstOrNull { it.targetDirectionIndex != null }?.surfaceId,
+            targetDirectionIndex = rows.sortedWith(::compareCoverageRows)
+                .firstOrNull { it.targetDirectionIndex != null }?.targetDirectionIndex,
         )
     }
 
@@ -966,13 +1024,15 @@ internal class SceneViewHost(
         generation: Long,
     ): CoverageMeshAttachment {
         val resources = remember(engine) {
-            coverageResourceFactory.replacePoint(
-                VoxelRenderMode.POINTS,
-                CoverageRendererLimits.RAW_POINT_CAPACITY,
-                "coverage-points",
-                create = { _, capacity, owner -> CoveragePointMeshResources(engine, capacity, telemetry, owner) },
-                release = CoverageVoxelMeshResources::destroy,
-            )
+            createCoverageResource(coverage.rendererGeneration) {
+                coverageResourceFactory.replacePoint(
+                    VoxelRenderMode.POINTS,
+                    CoverageRendererLimits.RAW_POINT_CAPACITY,
+                    "coverage-points",
+                    create = { _, capacity, owner -> CoveragePointMeshResources(engine, capacity, telemetry, owner) },
+                    release = CoverageVoxelMeshResources::destroy,
+                )
+            }
         }
         val material = remember(materialLoader) {
             materialLoader.createMaterial("materials/coverage_points.filamat")
@@ -989,6 +1049,10 @@ internal class SceneViewHost(
                 currentGeneration = coverageResourceGeneration,
                 requestRendererFrame = ::requestCoverageUploadFrame,
                 cancelRendererFrame = ::cancelCoverageUploadFrame,
+                onUploadFailure = {
+                    rendererTelemetry.recordResourceFailure()
+                    coverageRendererOwner.markUploadFailure(coverage.rendererGeneration)
+                },
             )
         }
         val node = remember(engine, resources, material, materialInstance) {
@@ -1015,13 +1079,15 @@ internal class SceneViewHost(
         generation: Long,
     ): CoverageMeshAttachment {
         val resources = remember(engine) {
-            coverageResourceFactory.replacePoint(
-                VoxelRenderMode.CENTROIDS,
-                CoverageRendererLimits.CENTROID_CAPACITY,
-                "coverage-centroids",
-                create = { _, capacity, owner -> CoveragePointMeshResources(engine, capacity, telemetry, owner) },
-                release = CoverageVoxelMeshResources::destroy,
-            )
+            createCoverageResource(coverage.rendererGeneration) {
+                coverageResourceFactory.replacePoint(
+                    VoxelRenderMode.CENTROIDS,
+                    CoverageRendererLimits.CENTROID_CAPACITY,
+                    "coverage-centroids",
+                    create = { _, capacity, owner -> CoveragePointMeshResources(engine, capacity, telemetry, owner) },
+                    release = CoverageVoxelMeshResources::destroy,
+                )
+            }
         }
         val material = remember(materialLoader) {
             materialLoader.createMaterial("materials/coverage_points.filamat")
@@ -1038,6 +1104,10 @@ internal class SceneViewHost(
                 currentGeneration = coverageResourceGeneration,
                 requestRendererFrame = ::requestCoverageUploadFrame,
                 cancelRendererFrame = ::cancelCoverageUploadFrame,
+                onUploadFailure = {
+                    rendererTelemetry.recordResourceFailure()
+                    coverageRendererOwner.markUploadFailure(coverage.rendererGeneration)
+                },
             )
         }
         val node = remember(engine, resources, material, materialInstance) {
@@ -1068,12 +1138,14 @@ internal class SceneViewHost(
             coverage.voxelSizeMeters,
             coverage.cubeSizeFactor,
         ) {
-            coverageResourceFactory.replaceCube(
-                CoverageRendererLimits.CUBE_CAPACITY,
-                "coverage-cubes",
-                create = { _, capacity, owner -> CoverageCubeMeshResources(engine, capacity, coverage.voxelSizeMeters * coverage.cubeSizeFactor, telemetry, owner) },
-                release = CoverageVoxelMeshResources::destroy,
-            )
+            createCoverageResource(coverage.rendererGeneration) {
+                coverageResourceFactory.replaceCube(
+                    CoverageRendererLimits.CUBE_CAPACITY,
+                    "coverage-cubes",
+                    create = { _, capacity, owner -> CoverageCubeMeshResources(engine, capacity, coverage.voxelSizeMeters * coverage.cubeSizeFactor, telemetry, owner) },
+                    release = CoverageVoxelMeshResources::destroy,
+                )
+            }
         }
         val material = remember(materialLoader) {
             materialLoader.createMaterial("materials/coverage_cubes.filamat")
@@ -1093,6 +1165,10 @@ internal class SceneViewHost(
                 currentGeneration = coverageResourceGeneration,
                 requestRendererFrame = ::requestCoverageUploadFrame,
                 cancelRendererFrame = ::cancelCoverageUploadFrame,
+                onUploadFailure = {
+                    rendererTelemetry.recordResourceFailure()
+                    coverageRendererOwner.markUploadFailure(coverage.rendererGeneration)
+                },
             )
         }
         val node = remember(
@@ -1142,12 +1218,14 @@ internal class SceneViewHost(
                     coverageMeshRef.set(binding)
                 }
             ) {
+                coverageRendererOwner.markResourceMounted(coverage.rendererGeneration)
                 onCoverageRendererMounted(true, coverage.rendererGeneration)
             }
             onDispose {
                 val wasCurrent = coverageMeshRef.compareAndSet(binding, null)
                 binding.dispose()
                 if (wasCurrent) {
+                    coverageRendererOwner.markResourceFailure(coverage.rendererGeneration)
                     onCoverageRendererMounted(false, coverage.rendererGeneration)
                 }
             }
@@ -1315,6 +1393,7 @@ internal class SceneViewHost(
         private val currentGeneration: CoverageMeshGenerationGate,
         private val requestRendererFrame: (CoveragePointMeshBinding) -> Unit,
         private val cancelRendererFrame: () -> Unit,
+        private val onUploadFailure: () -> Unit,
     ) {
         private var latestCoverageSnapshot: CoveragePointRenderSnapshot? = null
         private var latestRawPointSnapshot: CoveragePointRenderSnapshot? = null
@@ -1382,12 +1461,14 @@ internal class SceneViewHost(
                 target.resources.hide(currentNode)
                 return
             }
-            target.resources.update(
-                node = currentNode,
-                snapshot = snapshot,
-                materialInstance = target.materialInstance,
-                pointSizePx = pointSizePx,
-            )
+            runCatching {
+                target.resources.update(
+                    node = currentNode,
+                    snapshot = snapshot,
+                    materialInstance = target.materialInstance,
+                    pointSizePx = pointSizePx,
+                )
+            }.onFailure { onUploadFailure() }
         }
 
         fun dispose() {

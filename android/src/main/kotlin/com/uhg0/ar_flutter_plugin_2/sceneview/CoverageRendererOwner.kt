@@ -3,7 +3,10 @@ package com.uhg0.ar_flutter_plugin_2.sceneview
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererCoverage
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererSemantic
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
+import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_NO_DIRECTION
+import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import java.util.Collections
 
@@ -84,12 +87,133 @@ internal data class VisibilityRendererRow(
     val semanticLabel: CoverageSemanticLabel,
     val coverageLabel: CoverageLabel,
     val targetDirectionIndex: Int?,
+    val style: CoverageRendererStyleRowV1 = CoverageRendererStyleRowV1(
+        semantic = semanticLabel,
+        coverage = coverageLabel,
+        target = if (targetDirectionIndex == null) {
+            com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererTarget.NONE
+        } else {
+            com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererTarget.PRIMARY
+        },
+        directionBin = targetDirectionIndex ?: COVERAGE_RENDERER_NO_DIRECTION,
+        glyph = if (targetDirectionIndex == null) {
+            com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererGlyph.NONE
+        } else {
+            com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererGlyph.DESIRED_DIRECTION
+        },
+    ),
 ) {
     init {
         require(surfaceId >= 0L)
         require(x.isFinite() && y.isFinite() && z.isFinite())
         require(targetDirectionIndex == null || targetDirectionIndex in 0..23)
     }
+}
+
+/**
+ * One immutable, bounded presentation cut shared by mesh, hit, and telemetry
+ * consumers. Selection order is authoritative: target, coverage need,
+ * residency, then stable surface identity.
+ */
+internal class CoveragePresentationPlan(
+    val mode: CoveragePresentationMode,
+    val palette: CoveragePalette,
+    rows: List<VisibilityRendererRow>,
+    renderSnapshot: CoveragePointRenderSnapshot?,
+) {
+    val rows: List<VisibilityRendererRow> = Collections.unmodifiableList(
+        rows.map { it.copy(style = it.style.copy()) },
+    )
+    val renderSnapshot: CoveragePointRenderSnapshot? = renderSnapshot?.deepCopy()
+    val residentRowCount: Int = this.rows.size
+    val residentGlyphCount: Int = this.rows.count {
+        it.style.glyph != com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererGlyph.NONE
+    }
+    val surfaceIds: List<Long> = this.rows.map { it.surfaceId }
+
+    init {
+        require(rows.map { it.surfaceId }.distinct().size == rows.size)
+    }
+}
+
+internal fun compareCoverageRows(
+    first: VisibilityRendererRow,
+    second: VisibilityRendererRow,
+): Int {
+    val target = targetRank(first.style).compareTo(targetRank(second.style))
+    if (target != 0) return -target
+    val need = needRank(first.style).compareTo(needRank(second.style))
+    if (need != 0) return -need
+    val residency = residencyRank(first.style).compareTo(residencyRank(second.style))
+    if (residency != 0) return -residency
+    return first.surfaceId.compareTo(second.surfaceId)
+}
+
+private fun targetRank(style: CoverageRendererStyleRowV1): Int =
+    style.target.code
+
+private fun needRank(style: CoverageRendererStyleRowV1): Int =
+    when (style.coverage) {
+        CoverageRendererCoverage.UNCOVERED -> 2
+        CoverageRendererCoverage.PARTIAL -> 1
+        CoverageRendererCoverage.COMPLETE -> 0
+    }
+
+private fun residencyRank(style: CoverageRendererStyleRowV1): Int =
+    when (style.residency) {
+        com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererResidency.ACTIVE_L0 -> 2
+        com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererResidency.WARM_L1 -> 1
+        com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererResidency.COLD_L2 -> 0
+    }
+
+private fun CoveragePointRenderSnapshot.deepCopy(): CoveragePointRenderSnapshot = copy(
+    keys = keys.copyOf(),
+    surfaceIds = surfaceIds.copyOf(),
+    positions = positions.copyOf(),
+    colors = colors.copyOf(),
+    styleRows = styleRows.copyOf(),
+    gridRotationWorld = gridRotationWorld.copyOf(),
+    update = update?.copy(
+        spans = update.spans.map { span ->
+            span.copy(
+                positions = span.positions.copyOf(),
+                colors = span.colors.copyOf(),
+                styleRows = span.styleRows.copyOf(),
+            )
+        },
+    ),
+)
+
+private fun CoveragePointRenderSnapshot.withPalette(
+    palette: CoveragePalette,
+): CoveragePointRenderSnapshot {
+    if (styleRows.isEmpty()) return this
+    val styledRows = styleRows.copyOf()
+    val styledColors = colors.copyOf()
+    repeat(count) { index ->
+        val offset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
+        val style = CoverageRendererStyleRowV1.decode(styleRows, offset).copy(palette = palette)
+        style.encode().copyInto(styledRows, offset)
+        styledColors[index] = style.packedColor()
+    }
+    val styledSpans = update?.spans?.map { span ->
+        val spanColors = span.colors.copyOf()
+        val spanStyles = span.styleRows.copyOf()
+        if (spanStyles.isNotEmpty()) {
+            repeat(spanColors.size) { index ->
+                val offset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
+                val style = CoverageRendererStyleRowV1.decode(spanStyles, offset).copy(palette = palette)
+                style.encode().copyInto(spanStyles, offset)
+                spanColors[index] = style.packedColor()
+            }
+        }
+        span.copy(colors = spanColors, styleRows = spanStyles)
+    }
+    return copy(
+        colors = styledColors,
+        styleRows = styledRows,
+        update = update?.copy(spans = styledSpans.orEmpty()),
+    )
 }
 
 /**
@@ -198,6 +322,11 @@ internal data class CoverageRendererStatus(
     val rendererGeneration: Long,
     val geometryRevision: Long,
     val styleRevision: Long,
+    val residentRowCount: Int = 0,
+    val residentGlyphCount: Int = 0,
+    val resourceAvailable: Boolean = true,
+    val recoveryPending: Boolean = false,
+    val resourceFailureCount: Int = 0,
 )
 
 internal data class CoverageHitResult(
@@ -255,7 +384,7 @@ internal interface CoverageRendererOwner {
  * GPU mount is paused or being replaced.
  */
 internal class NativeCoverageRendererOwner(
-    private val onControlsChanged: (CoverageRendererControls) -> Unit = {},
+    private val onControlsChanged: (CoverageRendererControls) -> Boolean = { true },
     private val onPresentationChanged: (CoveragePointRenderSnapshot?, CoveragePresentationMode) -> Unit = { _, _ -> },
     private val worldToScreen: CoverageWorldToScreenProjection =
         CoverageWorldToScreenProjection { x, y, _ -> CoverageScreenPoint(x, y, 1f) },
@@ -269,7 +398,14 @@ internal class NativeCoverageRendererOwner(
     private var unavailable = false
     private var disposed = false
     private var recoveryPending = false
+    private var lifecyclePaused = false
+    private var controlsConfigured = false
+    // Pure owner tests and the pre-Compose owner seam start healthy; the host
+    // replaces this with concrete mount/upload receipts as resources appear.
+    private var resourceMounted = true
+    private var resourceFailureCount = 0
     private var lastAcceptedQualifier: InstallQualifier? = null
+    private var presentationPlan: CoveragePresentationPlan? = null
 
     private data class InstallQualifier(
         val bindingGeneration: Long,
@@ -345,7 +481,8 @@ internal class NativeCoverageRendererOwner(
         val replayed = priorQualifier == qualifier
         latest = snapshot
         lastAcceptedQualifier = qualifier
-        val mounted = !unavailable
+        recomputePresentationPlan()
+        val mounted = !unavailable && resourceMounted
         return RendererInstallReceipt(
             installed = mounted,
             rendererUnavailable = unavailable,
@@ -372,12 +509,25 @@ internal class NativeCoverageRendererOwner(
                 rendererGeneration = 0L,
             )
         }
+        if (!onControlsChanged(controls)) {
+            val current = latest
+            return RendererControlReceipt(
+                accepted = false,
+                rendererUnavailable = unavailable,
+                visible = this.controls.visible,
+                mode = this.controls.mode,
+                palette = this.controls.palette,
+                rowCount = current?.let { selectedRows(it).size } ?: 0,
+                rendererGeneration = current?.rendererGeneration ?: 0L,
+            )
+        }
         this.controls = controls
-        onControlsChanged(controls)
+        controlsConfigured = true
+        recomputePresentationPlan()
         notifyPresentationChanged()
         val snapshot = latest
         return RendererControlReceipt(
-            accepted = !unavailable,
+            accepted = !unavailable && resourceMounted,
             rendererUnavailable = unavailable,
             visible = controls.visible,
             mode = controls.mode,
@@ -451,6 +601,7 @@ internal class NativeCoverageRendererOwner(
     @Synchronized
     override fun pause() {
         if (disposed) return
+        lifecyclePaused = true
         unavailable = true
         recoveryPending = true
     }
@@ -473,12 +624,16 @@ internal class NativeCoverageRendererOwner(
             )
         }
         val current = latest
-        unavailable = false
-        recoveryPending = false
+        lifecyclePaused = false
+        unavailable = !resourceMounted
+        recoveryPending = !resourceMounted
         return RendererRecoveryReceipt(
-            recovered = true,
-            rendererUnavailable = false,
-            rehydrated = current != null,
+            // A recovery receipt means the latest committed cut is eligible
+            // for a fresh resource generation. Mount/upload availability is
+            // reported separately when that generation actually succeeds.
+            recovered = current != null,
+            rendererUnavailable = unavailable,
+            rehydrated = resourceMounted && current != null,
             rowCount = current?.let { selectedRows(it).size } ?: 0,
             rendererGeneration = current?.rendererGeneration ?: 0L,
             geometryRevision = current?.geometryRevision ?: 0L,
@@ -489,19 +644,52 @@ internal class NativeCoverageRendererOwner(
     @Synchronized
     override fun dispose() {
         disposed = true
+        lifecyclePaused = true
         unavailable = true
         recoveryPending = false
         latest = null
+        presentationPlan = null
+        resourceMounted = false
     }
+
+    /** Called only after the concrete SceneView resource has mounted. */
+    @Synchronized
+    fun markResourceMounted(rendererGeneration: Long): Boolean {
+        if (disposed || latest?.rendererGeneration != rendererGeneration) return false
+        resourceMounted = true
+        unavailable = lifecyclePaused
+        recoveryPending = lifecyclePaused
+        return true
+    }
+
+    /** Keeps semantic state intact while exposing a renderer-only failure. */
+    @Synchronized
+    fun markResourceFailure(rendererGeneration: Long): Boolean {
+        if (disposed || latest?.rendererGeneration != rendererGeneration) return false
+        resourceMounted = false
+        unavailable = true
+        recoveryPending = true
+        resourceFailureCount++
+        return true
+    }
+
+    @Synchronized
+    fun markUploadFailure(rendererGeneration: Long): Boolean =
+        markResourceFailure(rendererGeneration)
+
+    @Synchronized
+    fun controlsConfigured(): Boolean = controlsConfigured
 
     @Synchronized
     fun snapshot(): VisibilityRendererSnapshot? = latest
 
     @Synchronized
     fun presentationSnapshot(): CoveragePointRenderSnapshot? {
-        val current = latest ?: return null
-        return current.renderSnapshot?.let { selectForMode(it) }
+        return presentationPlan?.renderSnapshot
     }
+
+    @Synchronized
+    fun presentationPlan(): CoveragePresentationPlan? = presentationPlan
 
     @Synchronized
     fun refreshPresentation() {
@@ -511,11 +699,13 @@ internal class NativeCoverageRendererOwner(
     @Synchronized
     fun clearLatest() {
         latest = null
+        presentationPlan = null
     }
 
     @Synchronized
     override fun status(): CoverageRendererStatus {
         val current = latest
+        val plan = presentationPlan
         return CoverageRendererStatus(
             rendererUnavailable = unavailable,
             visible = controls.visible,
@@ -526,20 +716,46 @@ internal class NativeCoverageRendererOwner(
             rendererGeneration = current?.rendererGeneration ?: 0L,
             geometryRevision = current?.geometryRevision ?: 0L,
             styleRevision = current?.styleRevision ?: 0L,
+            residentRowCount = plan?.residentRowCount ?: 0,
+            residentGlyphCount = plan?.residentGlyphCount ?: 0,
+            resourceAvailable = resourceMounted,
+            recoveryPending = recoveryPending,
+            resourceFailureCount = resourceFailureCount,
         )
     }
 
     private fun selectedRows(snapshot: VisibilityRendererSnapshot): List<VisibilityRendererRow> {
-        return snapshot.rows.sortedBy { it.surfaceId }.take(controls.mode.presentationCapacity)
+        return presentationPlan?.rows ?: snapshot.rows
+            .sortedWith(::compareCoverageRows)
+            .take(controls.mode.presentationCapacity)
     }
 
     private fun selectForMode(snapshot: CoveragePointRenderSnapshot): CoveragePointRenderSnapshot {
         return snapshot.boundedForPresentation(controls.mode.presentationCapacity)
+            .withPalette(controls.palette)
     }
 
     private fun notifyPresentationChanged() {
         if (unavailable || disposed) return
         onPresentationChanged(presentationSnapshot(), controls.mode)
+    }
+
+    private fun recomputePresentationPlan() {
+        val current = latest ?: run {
+            presentationPlan = null
+            return
+        }
+        val rows = current.rows
+            .sortedWith(::compareCoverageRows)
+            .take(controls.mode.presentationCapacity)
+            .map { row -> row.copy(style = row.style.copy(palette = controls.palette)) }
+        val selectedSnapshot = current.renderSnapshot?.let(::selectForMode)
+        presentationPlan = CoveragePresentationPlan(
+            mode = controls.mode,
+            palette = controls.palette,
+            rows = rows,
+            renderSnapshot = selectedSnapshot,
+        )
     }
 
     private companion object {
