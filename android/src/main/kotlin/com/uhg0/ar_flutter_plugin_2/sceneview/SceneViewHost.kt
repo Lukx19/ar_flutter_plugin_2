@@ -160,14 +160,6 @@ internal class SceneViewHost(
             rendererAllocationLedger.releaseRendererResources()
         },
         onCreated = { transition ->
-            val descriptor = coverageRendererOwner.presentationDescriptor()
-            rendererAllocationLedger.installPersistentCoverageStateForCapacity(
-                presentationCapacity = descriptor?.capacity
-                    ?: CoverageRendererLimits.presentationCapacity(transition.mode),
-                sourceCapacity = descriptor?.sourceCapacity
-                    ?: coverageRendererOwner.sourceRowCount()
-                    ?: CoverageRendererLimits.presentationCapacity(transition.mode),
-            )
             transition.token?.let { coverageRendererOwner.markResourceMounted(it) }
                 ?: coverageRendererOwner.markResourceMounted(transition.rendererGeneration)
         },
@@ -755,6 +747,10 @@ internal class SceneViewHost(
             val receipt = coverageRendererOwner.setControls(controls)
             if (!receipt.accepted && !receipt.rendererUnavailable) return
         }
+        installAcceptedCoverageOwnership(
+            mode = effectiveConfig.voxelRenderMode,
+            fallbackSourceCapacity = descriptor.sourceCapacity,
+        )
         if (requiresReplacement) {
             checkNotNull(admission)
             if (current != null && admission.strategy == CoverageRendererTransitionStrategy.CLEAR_FIRST) {
@@ -834,6 +830,10 @@ internal class SceneViewHost(
             val controlReceipt = coverageRendererOwner.setControls(controls)
             if (!controlReceipt.accepted && !controlReceipt.rendererUnavailable) return
         }
+        installAcceptedCoverageOwnership(
+            mode = effectiveConfig.voxelRenderMode,
+            fallbackSourceCapacity = minOf(snapshot.capacity, snapshot.count),
+        )
         if (requiresReplacement) {
             checkNotNull(admission)
             if (current != null &&
@@ -851,6 +851,25 @@ internal class SceneViewHost(
             coverageRendererOwner.issueResourceToken()?.let { coverageResourceEpoch.value = it.epoch }
         }
         coverageRendererOwner.refreshPresentation()
+    }
+
+    /**
+     * Charges semantic renderer ownership only after the owner accepted a
+     * non-stale install. The ledger setters are replacement-safe, so repeated
+     * accepted updates do not accumulate duplicate ownership.
+     */
+    private fun installAcceptedCoverageOwnership(
+        mode: VoxelRenderMode,
+        fallbackSourceCapacity: Int,
+    ) {
+        val descriptor = coverageRendererOwner.presentationDescriptor()
+        rendererAllocationLedger.installPersistentCoverageStateForCapacity(
+            presentationCapacity = descriptor?.capacity
+                ?: CoverageRendererLimits.presentationCapacity(mode),
+            sourceCapacity = descriptor?.sourceCapacity
+                ?: coverageRendererOwner.sourceRowCount()
+                ?: fallbackSourceCapacity,
+        )
     }
 
     /**

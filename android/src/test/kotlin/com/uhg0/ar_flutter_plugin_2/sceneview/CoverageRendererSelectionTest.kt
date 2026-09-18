@@ -749,6 +749,44 @@ class CoverageRendererSelectionTest {
     }
 
     @Test
+    fun `first resource creation failure retains accepted semantic ownership`() {
+        val telemetry = RendererTelemetry()
+        val ledger = CoverageRendererAllocationLedger(telemetry)
+        val factory = CoverageRendererResourceFactory(
+            admit = { _, _ ->
+                CoverageRendererResourceAdmission(
+                    strategy = CoverageRendererTransitionStrategy.COEXIST,
+                    currentBytes = 0,
+                    candidateBytes = 1,
+                    combinedBytes = 1,
+                )
+            },
+            onCreationFailure = { transition ->
+                assertTrue(!transition.hadActiveResource)
+                ledger.releaseRendererResources()
+            },
+        )
+
+        // This models the host acceptance helper running after a non-stale
+        // owner install and before Compose attempts the first native resource.
+        ledger.installPersistentCoverageState(VoxelRenderMode.CENTROIDS)
+
+        val failed = factory.replacePoint(
+            VoxelRenderMode.CENTROIDS,
+            CoverageRendererLimits.CENTROID_CAPACITY,
+            "coverage-centroids",
+            create = { _, _, _ -> error("synthetic first-resource failure") },
+            release = { _: String -> error("must not release failed allocation") },
+        )
+
+        assertNull(failed)
+        assertEquals(7_244_036, telemetry.snapshot().getValue("ownedBufferBytes"))
+        ledger.clearCoverageState()
+        ledger.clearCoverageState()
+        assertEquals(0, telemetry.snapshot().getValue("ownedBufferBytes"))
+    }
+
+    @Test
     fun `terminal clear after resource loss removes retained descriptor and mapping`() {
         val telemetry = RendererTelemetry()
         val ledger = CoverageRendererAllocationLedger(telemetry)
