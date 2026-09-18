@@ -103,11 +103,89 @@ class CoverageDescriptorPageSequencerTest {
 
         sequencer.release(inFlight.ticket)
         val replacement = checkNotNull(sequencer.nextPage())
-        assertEquals(300, replacement.page.startSlot)
+        assertEquals(0, replacement.page.startSlot)
+        assertTrue(replacement.reset)
         assertNotSame(inFlight.ticket, replacement.ticket)
 
         sequencer.release(inFlight.ticket)
         assertNull(sequencer.nextPage())
+    }
+
+    @Test
+    fun `superseding an incomplete baseline starts the newest descriptor from a full reset`() {
+        val baseline = descriptor(count = 1_025)
+        val ordinary = descriptor(
+            count = 1_025,
+            update = CoveragePointRenderUpdate(
+                geometryRevision = 2,
+                visibilityRevision = 2,
+                enabled = true,
+                count = 1_025,
+                spans = listOf(CoveragePointSpan(900, FloatArray(0), IntArray(0), endSlotExclusive = 901)),
+                reset = false,
+            ),
+        )
+        val sequencer = CoverageDescriptorPageSequencer()
+        sequencer.replace(baseline)
+        val first = checkNotNull(sequencer.nextPage())
+
+        sequencer.replace(ordinary)
+        assertNull(sequencer.nextPage())
+
+        sequencer.release(first.ticket)
+        val replacement = checkNotNull(sequencer.nextPage())
+        assertEquals(0, replacement.page.startSlot)
+        assertTrue(replacement.reset)
+    }
+
+    @Test
+    fun `page borrow failure makes that descriptor incomplete and blocks sparse successor`() {
+        val failed = descriptor(count = 4, pageAvailable = false)
+        val successor = descriptor(
+            count = 4,
+            update = CoveragePointRenderUpdate(
+                geometryRevision = 2,
+                visibilityRevision = 2,
+                enabled = true,
+                count = 4,
+                spans = listOf(CoveragePointSpan(2, FloatArray(0), IntArray(0), endSlotExclusive = 3)),
+                reset = false,
+            ),
+        )
+        val sequencer = CoverageDescriptorPageSequencer()
+        sequencer.replace(failed)
+        assertNull(sequencer.nextPage())
+
+        sequencer.replace(successor)
+        val reset = checkNotNull(sequencer.nextPage())
+        assertEquals(0, reset.page.startSlot)
+        assertTrue(reset.reset)
+    }
+
+    @Test
+    fun `clear forgets completed predecessor and preserves only an already in-flight release`() {
+        val baseline = descriptor(count = 4)
+        val successor = descriptor(
+            count = 4,
+            update = CoveragePointRenderUpdate(
+                geometryRevision = 2,
+                visibilityRevision = 2,
+                enabled = true,
+                count = 4,
+                spans = listOf(CoveragePointSpan(1, FloatArray(0), IntArray(0), endSlotExclusive = 2)),
+                reset = false,
+            ),
+        )
+        val sequencer = CoverageDescriptorPageSequencer()
+        sequencer.replace(baseline)
+        val page = checkNotNull(sequencer.nextPage())
+        sequencer.release(page.ticket)
+        sequencer.clear()
+        sequencer.replace(successor)
+
+        val reset = checkNotNull(sequencer.nextPage())
+        assertEquals(0, reset.page.startSlot)
+        assertTrue(reset.reset)
     }
 
     @Test
@@ -169,6 +247,7 @@ class CoverageDescriptorPageSequencerTest {
         mode: CoveragePresentationMode = CoveragePresentationMode.SEMANTIC_CENTROIDS,
         palette: CoverageRendererPalette = CoverageRendererPalette.COVERAGE,
         paletteEpoch: Long = 1,
+        pageAvailable: Boolean = true,
     ): BoundedCoveragePresentation {
         val qualifier = CoverageRowsQualifier(1, 1, 1, 1, update.geometryRevision, 1)
         val style = CoverageRendererStyleRowV1().encode()
@@ -187,7 +266,7 @@ class CoverageDescriptorPageSequencerTest {
             styleRows = styles,
             update = update,
             pageReader = { expected, start, maximum ->
-                if (expected != qualifier || start >= count) {
+                if (!pageAvailable || expected != qualifier || start >= count) {
                     null
                 } else {
                     val pageCount = minOf(maximum, count - start)

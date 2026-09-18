@@ -26,16 +26,11 @@ internal data class CoverageDescriptorPageSubmission(
  * handed to a coordinator remains owned until its opaque ticket is released;
  * this is what keeps a late callback from clearing a newer descriptor's
  * in-flight state.  Full work is reserved for a baseline, reset, rehydration,
- * mode, or palette transition.  Other updates become sorted, merged,
+ * mode, or palette transition, and for every successor whose predecessor is
+ * not fully complete.  Other updates become sorted, merged,
  * descriptor-count-clipped range-only pages.
  */
-internal class CoverageDescriptorPageSequencer(
-    private val maximumRowsPerPage: Int = MAX_ROWS_PER_PAGE,
-) {
-    init {
-        require(maximumRowsPerPage in 1..MAX_ROWS_PER_PAGE)
-    }
-
+internal class CoverageDescriptorPageSequencer {
     private data class PageWork(
         val descriptor: BoundedCoveragePresentation,
         val startSlot: Int,
@@ -48,9 +43,16 @@ internal class CoverageDescriptorPageSequencer(
         val endSlotExclusive: Int,
     )
 
+    private data class InFlightPage(
+        val work: PageWork,
+        val ticket: CoverageDescriptorPageTicket,
+    )
+
     private var currentDescriptor: BoundedCoveragePresentation? = null
+    private var completedDescriptor: BoundedCoveragePresentation? = null
+    private var failedDescriptor: BoundedCoveragePresentation? = null
     private val pendingPages = ArrayDeque<PageWork>()
-    private var inFlightTicket: CoverageDescriptorPageTicket? = null
+    private var inFlightPage: InFlightPage? = null
     private var nextTicketSerial = 0L
 
     /** Replaces queued work while preserving any page already in flight. */
@@ -59,11 +61,17 @@ internal class CoverageDescriptorPageSequencer(
         rehydrate: Boolean = false,
     ) {
         val previous = currentDescriptor
+        val predecessorComplete = previous != null &&
+            previous === completedDescriptor &&
+            previous !== failedDescriptor
         currentDescriptor = descriptor
+        completedDescriptor = null
+        failedDescriptor = null
         pendingPages.clear()
         if (descriptor == null) return
 
         val full = previous == null ||
+            !predecessorComplete ||
             rehydrate ||
             descriptor.mode != previous.mode ||
             descriptor.palette != previous.palette ||
@@ -77,7 +85,7 @@ internal class CoverageDescriptorPageSequencer(
         ranges.forEachIndexed { index, range ->
             var start = range.startSlot
             while (start < range.endSlotExclusive) {
-                val end = minOf(start + maximumRowsPerPage, range.endSlotExclusive)
+                val end = minOf(start + MAX_ROWS_PER_PAGE, range.endSlotExclusive)
                 pendingPages.addLast(
                     PageWork(
                         descriptor = descriptor,
@@ -89,17 +97,20 @@ internal class CoverageDescriptorPageSequencer(
                 start = end
             }
         }
+        if (ranges.isEmpty()) completedDescriptor = descriptor
     }
 
     /** Clears queued work; an already submitted page still owns its ticket. */
     fun clear() {
         currentDescriptor = null
+        completedDescriptor = null
+        failedDescriptor = null
         pendingPages.clear()
     }
 
     /** Returns the next page only when no previous page is still owned. */
     fun nextPage(): CoverageDescriptorPageSubmission? {
-        if (inFlightTicket != null) return null
+        if (inFlightPage != null) return null
         while (pendingPages.isNotEmpty()) {
             val work = pendingPages.removeFirst()
             if (work.descriptor !== currentDescriptor) continue
@@ -107,14 +118,19 @@ internal class CoverageDescriptorPageSequencer(
             val accepted = work.descriptor.withPage(
                 expected = work.descriptor.qualifier,
                 startSlot = work.startSlot,
-                maximumRows = minOf(maximumRowsPerPage, work.endSlotExclusive - work.startSlot),
+                maximumRows = minOf(MAX_ROWS_PER_PAGE, work.endSlotExclusive - work.startSlot),
             ) { borrowed ->
                 val end = minOf(work.endSlotExclusive, borrowed.startSlot + borrowed.count)
                 page = if (end == work.endSlotExclusive) borrowed else null
             }
-            if (!accepted || page == null) continue
+            if (!accepted || page == null) {
+                failedDescriptor = work.descriptor
+                pendingPages.clear()
+                completedDescriptor = null
+                return null
+            }
             val ticket = CoverageDescriptorPageTicket(++nextTicketSerial)
-            inFlightTicket = ticket
+            inFlightPage = InFlightPage(work, ticket)
             return CoverageDescriptorPageSubmission(ticket, page!!, work.reset)
         }
         return null
@@ -122,14 +138,19 @@ internal class CoverageDescriptorPageSequencer(
 
     /** Releases only the currently owned page represented by [ticket]. */
     fun release(ticket: CoverageDescriptorPageTicket) {
-        if (ticket === inFlightTicket) inFlightTicket = null
+        val inFlight = inFlightPage ?: return
+        if (ticket !== inFlight.ticket) return
+        inFlightPage = null
+        if (currentDescriptor === inFlight.work.descriptor &&
+            failedDescriptor !== inFlight.work.descriptor &&
+            pendingPages.isEmpty()
+        ) {
+            completedDescriptor = inFlight.work.descriptor
+        }
     }
 
     val hasInFlightPage: Boolean
-        get() = inFlightTicket != null
-
-    val pendingPageCount: Int
-        get() = pendingPages.size
+        get() = inFlightPage != null
 
     private fun mergeClippedRanges(
         spans: List<CoveragePointSpan>,
