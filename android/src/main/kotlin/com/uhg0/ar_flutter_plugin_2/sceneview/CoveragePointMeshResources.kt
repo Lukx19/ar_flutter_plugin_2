@@ -137,6 +137,7 @@ internal class CoveragePointMeshResources(
         pointSizePx: Float,
         reset: Boolean,
         ticket: CoverageDescriptorPageTicket?,
+        enabled: Boolean,
     ) {
         uploadCoordinator.submitPage(
             page,
@@ -146,7 +147,7 @@ internal class CoveragePointMeshResources(
         )
         setDrawCount(node, if (page.totalCount > 0) page.totalCount else 0)
         materialInstance.setParameter("pointSize", pointSizePx)
-        node.isVisible = page.totalCount > 0
+        node.isVisible = enabled && page.totalCount > 0
     }
 
     internal fun updateDescriptor(
@@ -177,6 +178,7 @@ internal class CoveragePointMeshResources(
             pointSizePx = currentPointSizeForDescriptor,
             reset = submission.reset,
             ticket = submission.ticket,
+            enabled = submission.enabled,
         )
     }
 

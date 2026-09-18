@@ -1,20 +1,15 @@
 package com.uhg0.ar_flutter_plugin_2.sceneview
 
-import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate
+import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRowsQualifier
-import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan
-import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
 import com.uhg0.ar_flutter_plugin_2.pointcloud.rangeOnly
 
-/** One bounded geometry/style page borrowed by a mesh upload.
- *
- * Page buffers are intentionally short lived.  A descriptor owns no source
- * positions or colors; [withPage] borrows them from the qualifier-matched
- * canonical projection and copies at most 512 rows for one upload.
- */
+/** One bounded geometry/style page borrowed by a mesh upload. */
 internal data class CoveragePresentationPage(
     val startSlot: Int,
     val totalCount: Int,
@@ -35,12 +30,130 @@ internal data class CoveragePresentationPage(
 }
 
 /**
- * Immutable bounded presentation metadata published by the native projection.
- *
- * The selected identity/style table is bounded by the active presentation
- * mode.  The canonical 100k source remains behind [pageReader] and is never
- * handed to SceneView as a full [CoveragePointRenderSnapshot].
+ * The one immutable bounded table shared by every descriptor control view.
+ * A control change changes only the view (count, palette, visibility, and
+ * update metadata); it never creates a transformed reader chain or another
+ * selected identity/style table.
  */
+private class PresentationBacking(
+    val qualifier: CoverageRowsQualifier,
+    val sourceCapacity: Int,
+    val sourceCount: Int,
+    val basePalette: CoverageRendererPalette,
+    selectedSurfaceIds: LongArray,
+    selectedSourceSlots: IntArray,
+    styleRows: ByteArray,
+    private val pageReader: (CoverageRowsQualifier, Int, Int) -> CoveragePresentationPage?,
+) {
+    private val surfaceIdTable = selectedSurfaceIds.copyOf()
+    private val sourceSlotTable = selectedSourceSlots.copyOf()
+    private val styleTable = styleRows.copyOf()
+    private val glyphPrefix = IntArray(surfaceIdTable.size + 1)
+
+    init {
+        require(sourceCapacity >= sourceCount && sourceCount >= 0)
+        require(surfaceIdTable.size == sourceSlotTable.size)
+        require(surfaceIdTable.size <= MAX_BACKING_ROWS)
+        require(styleTable.size == surfaceIdTable.size * COVERAGE_RENDERER_STYLE_ROW_BYTES)
+        require(surfaceIdTable.toSet().size == surfaceIdTable.size)
+        require(sourceSlotTable.all { it >= 0 && it < sourceCount })
+        repeat(surfaceIdTable.size) { index ->
+            glyphPrefix[index + 1] = glyphPrefix[index] +
+                if (CoverageRendererStyleRowV1.decode(
+                        styleTable,
+                        index * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                    ).glyph != com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererGlyph.NONE
+                ) 1 else 0
+        }
+    }
+
+    val count: Int get() = surfaceIdTable.size
+
+    fun selectedSurfaceIdsCopy(count: Int): LongArray = surfaceIdTable.copyOf(count)
+
+    fun selectedSourceSlotsCopy(count: Int): IntArray = sourceSlotTable.copyOf(count)
+
+    /** Legacy metadata access is a defensive copy; the backing remains shared. */
+    fun styleRowsCopy(count: Int, palette: CoverageRendererPalette): ByteArray {
+        val copied = styleTable.copyOf(count * COVERAGE_RENDERER_STYLE_ROW_BYTES)
+        if (palette == basePalette) return copied
+        recolorStyleRows(copied, count, palette)
+        return copied
+    }
+
+    fun glyphCount(count: Int): Int = glyphPrefix[count]
+
+    fun withPage(
+        expected: CoverageRowsQualifier,
+        startSlot: Int,
+        maximumRows: Int,
+        viewCount: Int,
+        palette: CoverageRendererPalette,
+        block: (CoveragePresentationPage) -> Unit,
+    ): Boolean {
+        if (expected != qualifier || startSlot !in 0..viewCount || maximumRows !in 1..512) {
+            return false
+        }
+        val page = pageReader(expected, startSlot, minOf(maximumRows, viewCount - startSlot))
+            ?: return false
+        val end = page.startSlot + page.count
+        if (page.startSlot != startSlot || page.count > maximumRows || end > viewCount) {
+            return false
+        }
+        val pageStyles = styleRowsCopyRange(startSlot, page.count, palette)
+        val pageColors = IntArray(page.count) { index ->
+            CoverageRendererStyleRowV1.decode(
+                pageStyles,
+                index * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+            ).packedColor()
+        }
+        block(
+            page.copy(
+                totalCount = viewCount,
+                colors = pageColors,
+                styleRows = pageStyles,
+            ),
+        )
+        return true
+    }
+
+    private fun styleRowsCopyRange(
+        startSlot: Int,
+        count: Int,
+        palette: CoverageRendererPalette,
+    ): ByteArray {
+        val start = startSlot * COVERAGE_RENDERER_STYLE_ROW_BYTES
+        val copied = styleTable.copyOfRange(start, start + count * COVERAGE_RENDERER_STYLE_ROW_BYTES)
+        if (palette != basePalette) recolorStyleRows(copied, count, palette)
+        return copied
+    }
+
+    /** Includes the one immutable bounded table, not borrowed page payloads. */
+    fun ownedStorageBytes(): Long =
+        96L + surfaceIdTable.size * Long.SIZE_BYTES.toLong() +
+            sourceSlotTable.size * Int.SIZE_BYTES.toLong() + styleTable.size +
+            glyphPrefix.size * Int.SIZE_BYTES.toLong()
+
+    private companion object {
+        const val MAX_BACKING_ROWS = 20_000
+
+        fun recolorStyleRows(
+            rows: ByteArray,
+            count: Int,
+            palette: CoverageRendererPalette,
+        ) {
+            repeat(count) { index ->
+                val offset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
+                CoverageRendererStyleRowV1.decode(rows, offset)
+                    .copy(palette = palette)
+                    .encode()
+                    .copyInto(rows, offset)
+            }
+        }
+    }
+}
+
+/** Immutable bounded presentation metadata published by the native projection. */
 internal class PresentationDescriptor private constructor(
     val qualifier: CoverageRowsQualifier,
     val mode: CoveragePresentationMode,
@@ -53,32 +166,28 @@ internal class PresentationDescriptor private constructor(
     val paletteEpoch: Long,
     val targetSurfaceId: Long? = null,
     val targetDirectionIndex: Int? = null,
-    selectedSurfaceIds: LongArray,
-    selectedSourceSlots: IntArray,
-    styleRows: ByteArray,
+    private val backing: PresentationBacking,
     val update: CoveragePointRenderUpdate?,
-    private val pageReader: (CoverageRowsQualifier, Int, Int) -> CoveragePresentationPage?,
 ) {
-    private val identityTable = selectedSurfaceIds.copyOf()
-    private val sourceSlotTable = selectedSourceSlots.copyOf()
-    private val styleTable = styleRows.copyOf()
-
     init {
         require(capacity in 0..20_000)
-        require(count == identityTable.size && count == sourceSlotTable.size)
-        require(count <= capacity)
-        require(sourceCapacity >= sourceCount && sourceCount >= 0)
-        require(styleTable.size == count * COVERAGE_RENDERER_STYLE_ROW_BYTES)
-        require(identityTable.toSet().size == identityTable.size)
-        require(sourceSlotTable.all { it >= 0 && it < sourceCount })
+        require(count in 0..capacity)
+        require(count <= backing.count)
+        require(backing.qualifier == qualifier)
+        require(backing.sourceCapacity == sourceCapacity)
+        require(backing.sourceCount == sourceCount)
         require(paletteEpoch >= 0L)
         require(targetSurfaceId == null || targetSurfaceId >= 0L)
         require(targetDirectionIndex == null || targetDirectionIndex in 0..23)
     }
 
-    val selectedSurfaceIds: LongArray get() = identityTable.copyOf()
-    val selectedSourceSlots: IntArray get() = sourceSlotTable.copyOf()
-    val styleRows: ByteArray get() = styleTable.copyOf()
+    /** Defensive copies are retained only for legacy callers. */
+    val selectedSurfaceIds: LongArray get() = backing.selectedSurfaceIdsCopy(count)
+    val selectedSourceSlots: IntArray get() = backing.selectedSourceSlotsCopy(count)
+    val styleRows: ByteArray get() = backing.styleRowsCopy(count, palette)
+
+    /** O(1) scalar used by renderer status and telemetry. */
+    val glyphCount: Int get() = backing.glyphCount(count)
 
     /** Borrows one <=512-row page only while the qualifier is still current. */
     fun withPage(
@@ -86,129 +195,63 @@ internal class PresentationDescriptor private constructor(
         startSlot: Int,
         maximumRows: Int = 512,
         block: (CoveragePresentationPage) -> Unit,
-    ): Boolean {
-        if (startSlot !in 0..count || maximumRows !in 1..512 || expected != qualifier) {
-            return false
-        }
-        val page = pageReader(expected, startSlot, minOf(maximumRows, count - startSlot))
-            ?: return false
-        block(page)
-        return true
-    }
+    ): Boolean = backing.withPage(expected, startSlot, maximumRows, count, palette, block)
 
-    /** Returns a bounded mode view without copying canonical source values. */
-    fun forMode(
+    /** Derives a flat control view over the same immutable bounded backing. */
+    fun withControls(
         mode: CoveragePresentationMode,
         enabled: Boolean = this.enabled,
-            palette: CoverageRendererPalette = this.palette,
-            paletteEpoch: Long = this.paletteEpoch,
-            fullRange: Boolean = false,
+        palette: CoverageRendererPalette = this.palette,
+        paletteEpoch: Long = this.paletteEpoch,
+        fullRange: Boolean = false,
     ): PresentationDescriptor {
-        val nextCount = minOf(count, mode.presentationCapacity)
-        val nextStyleRows = styleTable.copyOf(nextCount * COVERAGE_RENDERER_STYLE_ROW_BYTES)
-        if (palette != this.palette) {
-            repeat(nextCount) { index ->
-                val offset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
-                CoverageRendererStyleRowV1.decode(nextStyleRows, offset)
-                    .copy(palette = palette).encode().copyInto(nextStyleRows, offset)
-            }
-        }
-        val nextUpdate = update?.let {
-            it.copy(
+        if (!fullRange && mode == this.mode && enabled == this.enabled &&
+            palette == this.palette && paletteEpoch == this.paletteEpoch
+        ) return this
+        val nextCount = minOf(backing.count, mode.presentationCapacity)
+        val nextUpdate = if (fullRange) {
+            fullRangeUpdate(update, enabled, nextCount)
+        } else {
+            update?.copy(
                 enabled = enabled,
                 count = nextCount,
-                spans = clipSpans(it.spans, nextCount),
+                spans = clipSpans(update.spans, nextCount),
             )
         }
-        // The fullRange branch is filled by [fullRangeUpdate] below.  Keeping
-        // range-only updates here avoids retaining page payloads in metadata.
-        return create(
+        return PresentationDescriptor(
             qualifier = qualifier,
             mode = mode,
             enabled = enabled,
             capacity = mode.presentationCapacity,
+            count = nextCount,
             sourceCapacity = sourceCapacity,
             sourceCount = sourceCount,
             palette = palette,
             paletteEpoch = paletteEpoch,
             targetSurfaceId = targetSurfaceId,
             targetDirectionIndex = targetDirectionIndex,
-            selectedSurfaceIds = identityTable.copyOf(nextCount),
-            selectedSourceSlots = sourceSlotTable.copyOf(nextCount),
-            styleRows = nextStyleRows,
-            update = if (fullRange) fullRangeUpdate(update, enabled, nextCount) else nextUpdate,
-            pageReader = { expected, start, maximum ->
-                pageReader(expected, start, maximum)?.takeIf { it.startSlot + it.count <= nextCount }
-                    ?.let { page ->
-                        val pageStyles = nextStyleRows.copyOfRange(
-                            start * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-                            (start + page.count) * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-                        )
-                        page.copy(
-                            totalCount = nextCount,
-                            colors = IntArray(page.count) { index ->
-                                CoverageRendererStyleRowV1.decode(
-                                    pageStyles,
-                                    index * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-                                ).packedColor()
-                            },
-                            styleRows = pageStyles,
-                        )
-                    }
-            },
+            backing = backing,
+            update = nextUpdate,
         )
     }
 
+    /** Compatibility spelling for existing native callers. */
+    fun forMode(
+        mode: CoveragePresentationMode,
+        enabled: Boolean = this.enabled,
+        palette: CoverageRendererPalette = this.palette,
+        paletteEpoch: Long = this.paletteEpoch,
+        fullRange: Boolean = false,
+    ): PresentationDescriptor = withControls(mode, enabled, palette, paletteEpoch, fullRange)
+
+    /** Compatibility spelling for existing native callers. */
     fun recolor(
         palette: CoverageRendererPalette,
         paletteEpoch: Long,
         fullRange: Boolean,
-    ): PresentationDescriptor {
-        if (palette == this.palette && paletteEpoch == this.paletteEpoch) return this
-        val recolored = styleTable.copyOf()
-        repeat(count) { index ->
-            val offset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
-            CoverageRendererStyleRowV1.decode(recolored, offset)
-                .copy(palette = palette).encode().copyInto(recolored, offset)
-        }
-        return create(
-            qualifier = qualifier,
-            mode = mode,
-            enabled = enabled,
-            capacity = capacity,
-            sourceCapacity = sourceCapacity,
-            sourceCount = sourceCount,
-            palette = palette,
-            paletteEpoch = paletteEpoch,
-            targetSurfaceId = targetSurfaceId,
-            targetDirectionIndex = targetDirectionIndex,
-            selectedSurfaceIds = identityTable,
-            selectedSourceSlots = sourceSlotTable,
-            styleRows = recolored,
-            update = if (fullRange) fullRangeUpdate(update, enabled, count) else update,
-            pageReader = { expected, start, maximum ->
-                pageReader(expected, start, maximum)?.let { page ->
-                    val pageStyles = recolored.copyOfRange(
-                        start * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-                        (start + page.count) * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-                    )
-                    page.copy(
-                        colors = IntArray(page.count) { index ->
-                            CoverageRendererStyleRowV1.decode(
-                                pageStyles,
-                                index * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-                            ).packedColor()
-                        },
-                        styleRows = pageStyles,
-                    )
-                }
-            },
-        )
-    }
+    ): PresentationDescriptor = withControls(mode, enabled, palette, paletteEpoch, fullRange)
 
-    internal fun ownedStorageBytes(): Long =
-        96L + identityTable.size * Long.SIZE_BYTES.toLong() +
-            sourceSlotTable.size * Int.SIZE_BYTES.toLong() + styleTable.size
+    internal fun ownedStorageBytes(): Long = backing.ownedStorageBytes()
 
     companion object {
         fun create(
@@ -227,12 +270,35 @@ internal class PresentationDescriptor private constructor(
             styleRows: ByteArray,
             update: CoveragePointRenderUpdate?,
             pageReader: (CoverageRowsQualifier, Int, Int) -> CoveragePresentationPage?,
-        ) = PresentationDescriptor(
-            qualifier, mode, enabled, capacity, selectedSurfaceIds.size,
-            sourceCapacity, sourceCount, palette, paletteEpoch,
-            targetSurfaceId, targetDirectionIndex,
-            selectedSurfaceIds, selectedSourceSlots, styleRows, update?.rangeOnly(), pageReader,
-        )
+        ): PresentationDescriptor {
+            require(capacity == mode.presentationCapacity)
+            require(selectedSurfaceIds.size <= capacity)
+            val backing = PresentationBacking(
+                qualifier = qualifier,
+                sourceCapacity = sourceCapacity,
+                sourceCount = sourceCount,
+                basePalette = palette,
+                selectedSurfaceIds = selectedSurfaceIds,
+                selectedSourceSlots = selectedSourceSlots,
+                styleRows = styleRows,
+                pageReader = pageReader,
+            )
+            return PresentationDescriptor(
+                qualifier = qualifier,
+                mode = mode,
+                enabled = enabled,
+                capacity = capacity,
+                count = selectedSurfaceIds.size,
+                sourceCapacity = sourceCapacity,
+                sourceCount = sourceCount,
+                palette = palette,
+                paletteEpoch = paletteEpoch,
+                targetSurfaceId = targetSurfaceId,
+                targetDirectionIndex = targetDirectionIndex,
+                backing = backing,
+                update = update?.rangeOnly(),
+            )
+        }
 
         private fun fullRangeUpdate(
             source: CoveragePointRenderUpdate?,
@@ -242,7 +308,7 @@ internal class PresentationDescriptor private constructor(
             enabled = enabled,
             count = count,
             spans = if (count == 0) emptyList() else listOf(
-                com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan(
+                CoveragePointSpan(
                     startSlot = 0,
                     positions = FloatArray(0),
                     colors = IntArray(0),

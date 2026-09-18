@@ -165,6 +165,7 @@ class CoverageRendererOwnerTest {
         val install = owner.install(original)
         assertTrue(install.installed)
         assertEquals(2, install.rowCount)
+        assertEquals(2, install.selectedRowCount)
 
         val result = owner.hitTest(1.02f, 0f)
         assertNotNull(result)
@@ -181,6 +182,7 @@ class CoverageRendererOwnerTest {
             ),
         )
         assertEquals(CoveragePresentationMode.SEMANTIC_CUBES, controls.mode)
+        assertEquals(controls.rowCount, controls.selectedRowCount)
         assertEquals(2, checkNotNull(owner.snapshot()).rowCount)
     }
 
@@ -236,6 +238,7 @@ class CoverageRendererOwnerTest {
         val recovery = owner.resume()
         assertTrue(recovery.recovered)
         assertTrue(recovery.rehydrated)
+        assertEquals(recovery.rowCount, recovery.selectedRowCount)
         assertEquals(5L, recovery.geometryRevision)
         assertEquals(8L, recovery.styleRevision)
         assertTrue(owner.resume().recovered.not())

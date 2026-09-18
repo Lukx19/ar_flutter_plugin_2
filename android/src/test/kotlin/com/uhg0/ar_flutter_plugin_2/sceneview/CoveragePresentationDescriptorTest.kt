@@ -61,7 +61,35 @@ class CoveragePresentationDescriptorTest {
         assertEquals(512, pageCount)
         assertFalse(descriptor.withPage(qualifier.copy(styleRevision = 7), 0, 512) { })
 
-        val cube = descriptor.forMode(CoveragePresentationMode.SEMANTIC_CUBES)
+        val cube = descriptor.withControls(CoveragePresentationMode.SEMANTIC_CUBES)
         assertEquals(8_000, cube.count)
+
+        val restored = cube.withControls(CoveragePresentationMode.SEMANTIC_CENTROIDS)
+        assertEquals(10_001, restored.count)
+        var restoredPageId = -1L
+        assertTrue(restored.withPage(qualifier, 9_999, 2) { page ->
+            restoredPageId = page.surfaceIds.first()
+        })
+        assertEquals(10_000L, restoredPageId)
+
+        assertEquals(descriptor.glyphCount, cube.glyphCount)
+
+        val hiddenNormal = restored.withControls(
+            mode = CoveragePresentationMode.SEMANTIC_CENTROIDS,
+            enabled = false,
+            palette = CoverageRendererPalette.NORMAL,
+            paletteEpoch = 2L,
+        )
+        assertFalse(hiddenNormal.enabled)
+        assertEquals(
+            CoverageRendererPalette.NORMAL,
+            CoverageRendererStyleRowV1.decode(hiddenNormal.styleRows, 0).palette,
+        )
+        assertTrue(hiddenNormal.withPage(qualifier, 0, 1) { page ->
+            assertEquals(
+                CoverageRendererPalette.NORMAL,
+                CoverageRendererStyleRowV1.decode(page.styleRows, 0).palette,
+            )
+        })
     }
 }

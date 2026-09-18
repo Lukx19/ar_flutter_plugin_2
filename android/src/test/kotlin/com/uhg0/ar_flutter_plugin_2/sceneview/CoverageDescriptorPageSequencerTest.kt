@@ -234,6 +234,15 @@ class CoverageDescriptorPageSequencerTest {
         assertTrue(nextResetFor(ordinary, rehydrate = true))
     }
 
+    @Test
+    fun `page submission carries descriptor visibility`() {
+        val sequencer = CoverageDescriptorPageSequencer()
+        sequencer.replace(descriptor(count = 1, enabled = false))
+
+        val submission = checkNotNull(sequencer.nextPage())
+        assertFalse(submission.enabled)
+    }
+
     private fun descriptor(
         count: Int,
         update: CoveragePointRenderUpdate = CoveragePointRenderUpdate(
@@ -248,6 +257,7 @@ class CoverageDescriptorPageSequencerTest {
         palette: CoverageRendererPalette = CoverageRendererPalette.COVERAGE,
         paletteEpoch: Long = 1,
         pageAvailable: Boolean = true,
+        enabled: Boolean = true,
     ): BoundedCoveragePresentation {
         val qualifier = CoverageRowsQualifier(1, 1, 1, 1, update.geometryRevision, 1)
         val style = CoverageRendererStyleRowV1().encode()
@@ -255,7 +265,7 @@ class CoverageDescriptorPageSequencerTest {
         return PresentationDescriptor.create(
             qualifier = qualifier,
             mode = mode,
-            enabled = true,
+            enabled = enabled,
             capacity = mode.presentationCapacity,
             sourceCapacity = count,
             sourceCount = count,

@@ -17,6 +17,7 @@ internal data class CoverageDescriptorPageSubmission(
     val ticket: CoverageDescriptorPageTicket,
     val page: CoveragePresentationPage,
     val reset: Boolean,
+    val enabled: Boolean = true,
 )
 
 /**
@@ -131,7 +132,7 @@ internal class CoverageDescriptorPageSequencer {
             }
             val ticket = CoverageDescriptorPageTicket(++nextTicketSerial)
             inFlightPage = InFlightPage(work, ticket)
-            return CoverageDescriptorPageSubmission(ticket, page!!, work.reset)
+            return CoverageDescriptorPageSubmission(ticket, page!!, work.reset, work.descriptor.enabled)
         }
         return null
     }

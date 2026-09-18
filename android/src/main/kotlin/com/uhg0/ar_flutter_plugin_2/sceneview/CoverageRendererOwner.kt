@@ -303,6 +303,7 @@ internal data class RendererInstallReceipt(
     val styleRevision: Long,
     val stale: Boolean = false,
     val replayed: Boolean = false,
+    val selectedRowCount: Int = rowCount,
 )
 
 internal data class RendererControlReceipt(
@@ -313,6 +314,7 @@ internal data class RendererControlReceipt(
     val palette: CoveragePalette,
     val rowCount: Int,
     val rendererGeneration: Long,
+    val selectedRowCount: Int = rowCount,
 )
 
 internal data class RendererRecoveryReceipt(
@@ -323,6 +325,7 @@ internal data class RendererRecoveryReceipt(
     val rendererGeneration: Long,
     val geometryRevision: Long,
     val styleRevision: Long,
+    val selectedRowCount: Int = rowCount,
 )
 
 internal data class CoverageRendererStatus(
@@ -634,9 +637,12 @@ internal class NativeCoverageRendererOwner(
             )
         }
         val replayed = priorQualifier == qualifier
-        val presentation = descriptor
-            .forMode(controls.mode, enabled = controls.visible)
-            .recolor(controls.palette, paletteRevision, fullRange = false)
+        val presentation = descriptor.withControls(
+            mode = controls.mode,
+            enabled = controls.visible,
+            palette = controls.palette,
+            paletteEpoch = paletteRevision,
+        )
         latest = CoverageRendererCutMetadata(
             bindingGeneration = descriptor.qualifier.bindingGeneration,
             groupGeneration = descriptor.qualifier.groupGeneration,
@@ -1114,14 +1120,7 @@ internal class NativeCoverageRendererOwner(
         val selected = selectedRows()
         val descriptor = latestPresentationDescriptor
         val selectedCount = descriptor?.count ?: current?.let { selected.size } ?: 0
-        val descriptorGlyphCount = descriptor?.let { descriptorValue ->
-            (0 until descriptorValue.count).count { index ->
-                CoverageRendererStyleRowV1.decode(
-                    descriptorValue.styleRows,
-                    index * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-                ).glyph != CoverageRendererGlyph.NONE
-            }
-        } ?: 0
+        val descriptorGlyphCount = descriptor?.glyphCount ?: 0
         return CoverageRendererStatus(
             rendererUnavailable = unavailable,
             visible = controls.visible,
@@ -1204,13 +1203,13 @@ internal class NativeCoverageRendererOwner(
             return
         }
         latestPresentationDescriptor?.let { descriptor ->
-            latestPresentationDescriptor = descriptor
-                .forMode(controls.mode, enabled = controls.visible)
-                .recolor(
-                    controls.palette,
-                    paletteRevision,
-                    fullRange = fullPaletteRecolor || explicitResync,
-                )
+            latestPresentationDescriptor = descriptor.withControls(
+                mode = controls.mode,
+                enabled = controls.visible,
+                palette = controls.palette,
+                paletteEpoch = paletteRevision,
+                fullRange = fullPaletteRecolor || explicitResync,
+            )
             presentationPlan = null
             return
         }

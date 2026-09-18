@@ -29,11 +29,12 @@ internal interface CoverageVoxelMeshResources {
         pointSizePx: Float,
         reset: Boolean,
         ticket: CoverageDescriptorPageTicket? = null,
+        enabled: Boolean = true,
     ) {
         require(page.startSlot + page.count <= capacity)
         val snapshot = CoveragePointRenderSnapshot(
             revision = page.startSlot.toLong(),
-            enabled = true,
+            enabled = enabled,
             capacity = capacity,
             count = page.count,
             keys = page.surfaceIds.copyOf(),
