@@ -235,22 +235,6 @@ internal class PresentationDescriptor private constructor(
         )
     }
 
-    /** Compatibility spelling for existing native callers. */
-    fun forMode(
-        mode: CoveragePresentationMode,
-        enabled: Boolean = this.enabled,
-        palette: CoverageRendererPalette = this.palette,
-        paletteEpoch: Long = this.paletteEpoch,
-        fullRange: Boolean = false,
-    ): PresentationDescriptor = withControls(mode, enabled, palette, paletteEpoch, fullRange)
-
-    /** Compatibility spelling for existing native callers. */
-    fun recolor(
-        palette: CoverageRendererPalette,
-        paletteEpoch: Long,
-        fullRange: Boolean,
-    ): PresentationDescriptor = withControls(mode, enabled, palette, paletteEpoch, fullRange)
-
     internal fun ownedStorageBytes(): Long = backing.ownedStorageBytes()
 
     companion object {

@@ -17,7 +17,7 @@ internal data class CoverageDescriptorPageSubmission(
     val ticket: CoverageDescriptorPageTicket,
     val page: CoveragePresentationPage,
     val reset: Boolean,
-    val enabled: Boolean = true,
+    val enabled: Boolean,
 )
 
 /**

@@ -17,6 +17,15 @@ import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.RendererStyleCommandV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.RendererStyleCutPayloadV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.TransactionResponseProfileV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.Uuid
+import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationMode
+import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationPage
+import com.uhg0.ar_flutter_plugin_2.sceneview.NativeCoverageRendererOwner
+import com.uhg0.ar_flutter_plugin_2.sceneview.PresentationDescriptor
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette
+import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRowsQualifier
+import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
+import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodChannel
 import java.nio.ByteBuffer
@@ -33,6 +42,81 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VisibilityGridV2BindingTest {
+    @Test
+    fun `renderer control wire preserves nonzero descriptor selected row receipt`() {
+        val messenger = MethodTestMessenger()
+        val qualifier = CoverageRowsQualifier(1L, 1L, 1L, 1L, 1L, 1L)
+        val ids = LongArray(3) { it.toLong() + 1L }
+        val encodedStyle = CoverageRendererStyleRowV1().encode()
+        val styles = ByteArray(ids.size * COVERAGE_RENDERER_STYLE_ROW_BYTES) {
+            encodedStyle[it % encodedStyle.size]
+        }
+        val descriptor = PresentationDescriptor.create(
+            qualifier = qualifier,
+            mode = CoveragePresentationMode.SEMANTIC_CENTROIDS,
+            enabled = true,
+            capacity = CoveragePresentationMode.SEMANTIC_CENTROIDS.presentationCapacity,
+            sourceCapacity = ids.size,
+            sourceCount = ids.size,
+            palette = CoverageRendererPalette.COVERAGE,
+            paletteEpoch = 1L,
+            selectedSurfaceIds = ids,
+            selectedSourceSlots = IntArray(ids.size) { it },
+            styleRows = styles,
+            update = null,
+            pageReader = { expected, start, maximum ->
+                if (expected != qualifier || start >= ids.size) null else {
+                    val count = minOf(maximum, ids.size - start)
+                    CoveragePresentationPage(
+                        startSlot = start,
+                        totalCount = ids.size,
+                        surfaceIds = ids.copyOfRange(start, start + count),
+                        positions = FloatArray(count * 3),
+                        colors = IntArray(count),
+                        styleRows = styles.copyOfRange(
+                            start * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                            (start + count) * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                        ),
+                    )
+                }
+            },
+        )
+        val owner = NativeCoverageRendererOwner()
+        val descriptorReceipt = owner.installPresentation(
+            descriptor,
+            PointCloudNativeConfig(
+                renderCapacity = ids.size,
+                voxelRenderMode = VoxelRenderMode.CENTROIDS,
+                rendererGeneration = 1L,
+            ),
+        )
+        assertEquals(3, descriptorReceipt.selectedRowCount)
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 2142,
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
+            postToMain = { it() },
+            coverageRendererOwner = owner,
+        )
+        try {
+            val result = RecordingResult()
+            MethodChannel(messenger, "visibility_grid_v2_control_2142").invokeMethod(
+                "setRendererControls",
+                mapOf(
+                    "visible" to true,
+                    "mode" to CoveragePresentationMode.SEMANTIC_CENTROIDS.wireName,
+                    "palette" to "coverage",
+                ),
+                result,
+            )
+            assertTrue(result.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(1, result.successCount)
+            assertEquals(3, (result.successValue as Map<*, *>) ["selectedRowCount"])
+        } finally {
+            binding.dispose()
+        }
+    }
+
     @Test
     fun `renderer style command is qualified by active binding and group before callback`() {
         val messenger = MethodTestMessenger()

@@ -303,7 +303,7 @@ internal data class RendererInstallReceipt(
     val styleRevision: Long,
     val stale: Boolean = false,
     val replayed: Boolean = false,
-    val selectedRowCount: Int = rowCount,
+    val selectedRowCount: Int,
 )
 
 internal data class RendererControlReceipt(
@@ -314,7 +314,7 @@ internal data class RendererControlReceipt(
     val palette: CoveragePalette,
     val rowCount: Int,
     val rendererGeneration: Long,
-    val selectedRowCount: Int = rowCount,
+    val selectedRowCount: Int,
 )
 
 internal data class RendererRecoveryReceipt(
@@ -325,7 +325,7 @@ internal data class RendererRecoveryReceipt(
     val rendererGeneration: Long,
     val geometryRevision: Long,
     val styleRevision: Long,
-    val selectedRowCount: Int = rowCount,
+    val selectedRowCount: Int,
 )
 
 internal data class CoverageRendererStatus(
@@ -548,6 +548,7 @@ internal class NativeCoverageRendererOwner(
                 rendererGeneration = snapshot.rendererGeneration,
                 geometryRevision = snapshot.geometryRevision,
                 styleRevision = snapshot.styleRevision,
+                selectedRowCount = 0,
             )
         }
         val qualifier = snapshot.qualifier()
@@ -557,13 +558,14 @@ internal class NativeCoverageRendererOwner(
             return RendererInstallReceipt(
                 installed = false,
                 rendererUnavailable = unavailable,
-                rowCount = current?.let { selectedRows().size } ?: 0,
+                rowCount = currentPresentationRowCount(),
                 bindingGeneration = current?.bindingGeneration ?: snapshot.bindingGeneration,
                 groupGeneration = current?.groupGeneration ?: snapshot.groupGeneration,
                 rendererGeneration = current?.rendererGeneration ?: snapshot.rendererGeneration,
                 geometryRevision = current?.geometryRevision ?: snapshot.geometryRevision,
                 styleRevision = current?.styleRevision ?: snapshot.styleRevision,
                 stale = true,
+                selectedRowCount = currentPresentationRowCount(),
             )
         }
         val replayed = priorQualifier == qualifier
@@ -585,13 +587,14 @@ internal class NativeCoverageRendererOwner(
         return RendererInstallReceipt(
             installed = mounted,
             rendererUnavailable = unavailable,
-            rowCount = selectedRows().size,
+            rowCount = currentPresentationRowCount(),
             bindingGeneration = snapshot.bindingGeneration,
             groupGeneration = snapshot.groupGeneration,
             rendererGeneration = snapshot.rendererGeneration,
             geometryRevision = snapshot.geometryRevision,
             styleRevision = snapshot.styleRevision,
             replayed = replayed,
+            selectedRowCount = currentPresentationRowCount(),
         )
     }
 
@@ -611,6 +614,7 @@ internal class NativeCoverageRendererOwner(
                 rendererGeneration = config.rendererGeneration,
                 geometryRevision = descriptor.qualifier.geometryRevision,
                 styleRevision = descriptor.qualifier.styleRevision,
+                selectedRowCount = 0,
             )
         }
         val qualifier = InstallQualifier(
@@ -627,13 +631,14 @@ internal class NativeCoverageRendererOwner(
             return RendererInstallReceipt(
                 installed = false,
                 rendererUnavailable = unavailable,
-                rowCount = latestPresentationDescriptor?.count ?: 0,
+                rowCount = currentPresentationRowCount(),
                 bindingGeneration = current?.bindingGeneration ?: descriptor.qualifier.bindingGeneration,
                 groupGeneration = current?.groupGeneration ?: descriptor.qualifier.groupGeneration,
                 rendererGeneration = current?.rendererGeneration ?: config.rendererGeneration,
                 geometryRevision = current?.geometryRevision ?: descriptor.qualifier.geometryRevision,
                 styleRevision = current?.styleRevision ?: descriptor.qualifier.styleRevision,
                 stale = true,
+                selectedRowCount = currentPresentationRowCount(),
             )
         }
         val replayed = priorQualifier == qualifier
@@ -670,6 +675,7 @@ internal class NativeCoverageRendererOwner(
             geometryRevision = descriptor.qualifier.geometryRevision,
             styleRevision = descriptor.qualifier.styleRevision,
             replayed = replayed,
+            selectedRowCount = presentation.count,
         )
     }
 
@@ -684,6 +690,7 @@ internal class NativeCoverageRendererOwner(
                 palette = controls.palette,
                 rowCount = 0,
                 rendererGeneration = 0L,
+                selectedRowCount = 0,
             )
         }
         val modeChanged = this.controls.mode != controls.mode
@@ -705,8 +712,9 @@ internal class NativeCoverageRendererOwner(
                     visible = this.controls.visible,
                     mode = this.controls.mode,
                     palette = this.controls.palette,
-                    rowCount = current?.let { selectedRows().size } ?: 0,
+                    rowCount = currentPresentationRowCount(),
                     rendererGeneration = current?.rendererGeneration ?: 0L,
+                    selectedRowCount = currentPresentationRowCount(),
                 )
             }
         }
@@ -718,8 +726,9 @@ internal class NativeCoverageRendererOwner(
                 visible = this.controls.visible,
                 mode = this.controls.mode,
                 palette = this.controls.palette,
-                rowCount = current?.let { selectedRows().size } ?: 0,
+                rowCount = currentPresentationRowCount(),
                 rendererGeneration = current?.rendererGeneration ?: 0L,
+                selectedRowCount = currentPresentationRowCount(),
             )
         }
         val paletteOnlyChange = this.controls.visible == controls.visible &&
@@ -743,8 +752,9 @@ internal class NativeCoverageRendererOwner(
             visible = controls.visible,
             mode = controls.mode,
             palette = controls.palette,
-            rowCount = snapshot?.let { selectedRows().size } ?: 0,
+            rowCount = currentPresentationRowCount(),
             rendererGeneration = snapshot?.rendererGeneration ?: 0L,
+            selectedRowCount = currentPresentationRowCount(),
         )
     }
 
@@ -861,7 +871,16 @@ internal class NativeCoverageRendererOwner(
     @Synchronized
     override fun resume(): RendererRecoveryReceipt {
         if (disposed) {
-            return RendererRecoveryReceipt(false, true, false, 0, 0L, 0L, 0L)
+            return RendererRecoveryReceipt(
+                recovered = false,
+                rendererUnavailable = true,
+                rehydrated = false,
+                rowCount = 0,
+                rendererGeneration = 0L,
+                geometryRevision = 0L,
+                styleRevision = 0L,
+                selectedRowCount = 0,
+            )
         }
         if (!unavailable || !recoveryPending) {
             val current = latest
@@ -869,10 +888,11 @@ internal class NativeCoverageRendererOwner(
                 recovered = false,
                 rendererUnavailable = unavailable,
                 rehydrated = false,
-                rowCount = current?.let { selectedRows().size } ?: 0,
+                rowCount = currentPresentationRowCount(),
                 rendererGeneration = current?.rendererGeneration ?: 0L,
                 geometryRevision = current?.geometryRevision ?: 0L,
                 styleRevision = current?.styleRevision ?: 0L,
+                selectedRowCount = currentPresentationRowCount(),
             )
         }
         val current = latest
@@ -887,10 +907,11 @@ internal class NativeCoverageRendererOwner(
             recovered = current != null,
             rendererUnavailable = unavailable,
             rehydrated = resourceMounted && current != null,
-            rowCount = current?.let { selectedRows().size } ?: 0,
+            rowCount = currentPresentationRowCount(),
             rendererGeneration = current?.rendererGeneration ?: 0L,
             geometryRevision = current?.geometryRevision ?: 0L,
             styleRevision = current?.styleRevision ?: 0L,
+            selectedRowCount = currentPresentationRowCount(),
         )
     }
 
@@ -1160,6 +1181,12 @@ internal class NativeCoverageRendererOwner(
         }
         return emptyList()
     }
+
+    /** Receipt scalar shared by legacy selector and descriptor-backed paths. */
+    private fun currentPresentationRowCount(): Int =
+        latestPresentationDescriptor?.count
+            ?: presentationPlan?.residentRowCount
+            ?: selectedRows().size
 
     private fun compareHitCandidates(
         first: Triple<VisibilityRendererRow, Float, Float>,

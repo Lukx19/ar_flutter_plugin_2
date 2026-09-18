@@ -13,6 +13,8 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageCommittedRowsBorrower
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageCommittedRows
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageCommittedRow
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRowsQualifier
+import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
+import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -322,6 +324,8 @@ class CoverageRendererOwnerTest {
 
         val stale = owner.install(snapshot(geometryRevision = 3, rendererGeneration = 4))
         assertTrue(stale.stale)
+        assertEquals(2, stale.rowCount)
+        assertEquals(2, stale.selectedRowCount)
         assertEquals(5L, owner.status().rendererGeneration)
         assertEquals(4L, owner.status().geometryRevision)
 
@@ -329,12 +333,48 @@ class CoverageRendererOwnerTest {
             snapshot(geometryRevision = 3, rendererGeneration = 6),
         )
         assertTrue(staleCutOnNewRenderer.stale)
+        assertEquals(2, staleCutOnNewRenderer.selectedRowCount)
         assertEquals(5L, owner.status().rendererGeneration)
 
         val replacement = owner.install(snapshot(rendererGeneration = 6))
         assertTrue(replacement.installed)
         assertEquals(6L, owner.status().rendererGeneration)
         assertEquals(4L, owner.status().geometryRevision)
+    }
+
+    @Test
+    fun `descriptor-backed receipts retain selected count across stale legacy rejection and recovery`() {
+        val owner = NativeCoverageRendererOwner()
+        val descriptor = descriptorForReceipt(count = 3)
+        val install = owner.installPresentation(
+            descriptor,
+            PointCloudNativeConfig(
+                renderCapacity = 3,
+                voxelRenderMode = VoxelRenderMode.CENTROIDS,
+                rendererGeneration = 5L,
+            ),
+        )
+        assertEquals(3, install.rowCount)
+        assertEquals(3, install.selectedRowCount)
+
+        val stale = owner.install(snapshot(geometryRevision = 3L))
+        assertTrue(stale.stale)
+        assertEquals(3, stale.rowCount)
+        assertEquals(3, stale.selectedRowCount)
+
+        val controls = owner.setControls(
+            CoverageRendererControls(
+                visible = true,
+                mode = CoveragePresentationMode.SEMANTIC_CENTROIDS,
+                palette = CoverageRendererPalette.COVERAGE,
+            ),
+        )
+        assertEquals(3, controls.rowCount)
+        assertEquals(3, controls.selectedRowCount)
+        owner.pause()
+        val recovery = owner.resume()
+        assertEquals(3, recovery.rowCount)
+        assertEquals(3, recovery.selectedRowCount)
     }
 
     @Test
@@ -780,5 +820,44 @@ class CoverageRendererOwnerTest {
         assertTrue(owner.status().rendererUnavailable)
         assertTrue(owner.markResourceMounted(replacement))
         assertTrue(owner.status().resourceAvailable)
+    }
+
+    private fun descriptorForReceipt(count: Int): BoundedCoveragePresentation {
+        val qualifier = CoverageRowsQualifier(2L, 3L, 5L, 8L, 4L, 7L)
+        val surfaceIds = LongArray(count) { it.toLong() + 1L }
+        val style = CoverageRendererStyleRowV1().encode()
+        val styleRows = ByteArray(count * com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES) {
+            style[it % style.size]
+        }
+        return PresentationDescriptor.create(
+            qualifier = qualifier,
+            mode = CoveragePresentationMode.SEMANTIC_CENTROIDS,
+            enabled = true,
+            capacity = CoveragePresentationMode.SEMANTIC_CENTROIDS.presentationCapacity,
+            sourceCapacity = count,
+            sourceCount = count,
+            palette = CoverageRendererPalette.COVERAGE,
+            paletteEpoch = 1L,
+            selectedSurfaceIds = surfaceIds,
+            selectedSourceSlots = IntArray(count) { it },
+            styleRows = styleRows,
+            update = null,
+            pageReader = { expected, start, maximum ->
+                if (expected != qualifier || start >= count) null else {
+                    val pageCount = minOf(maximum, count - start)
+                    CoveragePresentationPage(
+                        startSlot = start,
+                        totalCount = count,
+                        surfaceIds = surfaceIds.copyOfRange(start, start + pageCount),
+                        positions = FloatArray(pageCount * 3),
+                        colors = IntArray(pageCount),
+                        styleRows = styleRows.copyOfRange(
+                            start * com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                            (start + pageCount) * com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                        ),
+                    )
+                }
+            },
+        )
     }
 }

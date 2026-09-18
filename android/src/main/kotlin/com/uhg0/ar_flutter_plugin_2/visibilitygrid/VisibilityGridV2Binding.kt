@@ -584,6 +584,7 @@ class VisibilityGridV2Binding internal constructor(
                     "mode" to receipt.mode.wireName,
                     "palette" to rendererPaletteWire(receipt.palette),
                     "rowCount" to receipt.rowCount,
+                    "selectedRowCount" to receipt.selectedRowCount,
                     "rendererGeneration" to receipt.rendererGeneration,
                 ),
             )
