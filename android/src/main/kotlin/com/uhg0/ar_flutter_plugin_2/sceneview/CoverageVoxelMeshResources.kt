@@ -28,6 +28,7 @@ internal interface CoverageVoxelMeshResources {
         materialInstance: MaterialInstance,
         pointSizePx: Float,
         reset: Boolean,
+        ticket: CoverageDescriptorPageTicket? = null,
     ) {
         require(page.startSlot + page.count <= capacity)
         val snapshot = CoveragePointRenderSnapshot(

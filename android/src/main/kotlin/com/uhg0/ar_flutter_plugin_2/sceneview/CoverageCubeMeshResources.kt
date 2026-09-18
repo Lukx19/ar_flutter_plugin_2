@@ -61,6 +61,7 @@ internal class CoverageCubeMeshResources(
     override val primitiveType: RenderableManager.PrimitiveType =
         RenderableManager.PrimitiveType.TRIANGLES
 
+    private val descriptorSequencer = CoverageDescriptorPageSequencer()
     private val uploadCoordinator = CoverageCubeUploadCoordinator(
         capacity = capacity,
         halfSize = halfSize,
@@ -74,8 +75,10 @@ internal class CoverageCubeMeshResources(
         onDestroyedUploadCallback = {
             telemetry?.recordFencedDestroyedUploadCallback()
         },
+        onUploadPageReleasedWithTicket = { ticket ->
+            descriptorSequencer.release(ticket)
+        },
         onUploadPageReleased = {
-            descriptorPageInFlight = false
             onUploadPageReleased()
         },
     )
@@ -84,10 +87,6 @@ internal class CoverageCubeMeshResources(
     private val allocationLedger = telemetry?.let(::CoverageRendererAllocationLedger)
     private var lastUploadQualifier: CoveragePointUploadQualifier? = null
     private var retainedSnapshotUploadRequired = true
-    private var pendingDescriptor: BoundedCoveragePresentation? = null
-    private var descriptorCursor = 0
-    private var descriptorReset = true
-    private var descriptorPageInFlight = false
     private var currentNodeForDescriptor: Node? = null
     private var currentMaterialForDescriptor: MaterialInstance? = null
     private var currentPointSizeForDescriptor = 0f
@@ -181,13 +180,14 @@ internal class CoverageCubeMeshResources(
         materialInstance: MaterialInstance,
         pointSizePx: Float,
         reset: Boolean,
+        ticket: CoverageDescriptorPageTicket?,
     ) {
         uploadCoordinator.submitPage(
             page,
             RendererUploadPageOrigin.RESOURCE_GENERATION_RESET.takeIf { reset }
                 ?: RendererUploadPageOrigin.ORDINARY,
+            ticket,
         )
-        descriptorPageInFlight = true
         setDrawCount(node, page.totalCount)
         materialInstance.setParameter("pointSize", pointSizePx)
         node.isVisible = page.totalCount > 0
@@ -202,31 +202,26 @@ internal class CoverageCubeMeshResources(
         currentNodeForDescriptor = node
         currentMaterialForDescriptor = materialInstance
         currentPointSizeForDescriptor = pointSizePx
-        pendingDescriptor = descriptor
-        descriptorCursor = 0
-        descriptorReset = true
-        descriptorPageInFlight = false
+        descriptorSequencer.replace(
+            descriptor,
+            rehydrate = retainedSnapshotUploadRequired,
+        )
+        retainedSnapshotUploadRequired = false
         setDrawCount(node, descriptor.count)
         materialInstance.setParameter("pointSize", pointSizePx)
         node.isVisible = descriptor.enabled && descriptor.count > 0
     }
 
     private fun queueNextDescriptorPage() {
-        val descriptor = pendingDescriptor ?: return
-        if (descriptorCursor >= descriptor.count) return
-        val start = descriptorCursor
-        if (!descriptor.withPage(descriptor.qualifier, start, 512) { page ->
-                updatePage(
-                    node = checkNotNull(currentNodeForDescriptor),
-                    page = page,
-                    materialInstance = checkNotNull(currentMaterialForDescriptor),
-                    pointSizePx = currentPointSizeForDescriptor,
-                    reset = descriptorReset,
-                )
-                descriptorCursor += page.count
-                descriptorReset = false
-            }
-        ) pendingDescriptor = null
+        val submission = descriptorSequencer.nextPage() ?: return
+        updatePage(
+            node = checkNotNull(currentNodeForDescriptor),
+            page = submission.page,
+            materialInstance = checkNotNull(currentMaterialForDescriptor),
+            pointSizePx = currentPointSizeForDescriptor,
+            reset = submission.reset,
+            ticket = submission.ticket,
+        )
     }
 
     override fun hide(node: Node) {
@@ -240,7 +235,7 @@ internal class CoverageCubeMeshResources(
 
     override fun onRendererFrame() {
         uploadCoordinator.onRendererFrame()
-        if (!descriptorPageInFlight) queueNextDescriptorPage()
+        if (!descriptorSequencer.hasInFlightPage) queueNextDescriptorPage()
     }
 
     override fun setOnUploadPageReleased(listener: () -> Unit) {
@@ -276,8 +271,7 @@ internal class CoverageCubeMeshResources(
         uploadCoordinator.destroy()
         indexStaging = null
         outlineIndexStaging = null
-        pendingDescriptor = null
-        descriptorPageInFlight = false
+        descriptorSequencer.clear()
         currentNodeForDescriptor = null
         currentMaterialForDescriptor = null
         allocationLedger?.releaseCubeResources(telemetryOwner)
@@ -362,6 +356,7 @@ internal class CoverageCubeMeshResources(
         private val onUploadCompleted: (Long) -> Unit = {},
         private val onUploadCompletedAttributed: (Long, RendererUploadPageOrigin) -> Unit = { _, _ -> },
         private val onDestroyedUploadCallback: () -> Unit = {},
+        private val onUploadPageReleasedWithTicket: (CoverageDescriptorPageTicket) -> Unit = {},
         private val onUploadPageReleased: () -> Unit = {},
         private val clockNanos: () -> Long = System::nanoTime,
     ) {
@@ -378,6 +373,7 @@ internal class CoverageCubeMeshResources(
         private data class PendingPage(
             val page: CoveragePresentationPage,
             val origin: RendererUploadPageOrigin,
+            val ticket: CoverageDescriptorPageTicket?,
         )
 
         private val pendingUploads = ArrayDeque<PendingUpload>()
@@ -389,6 +385,7 @@ internal class CoverageCubeMeshResources(
         private var activeUploadStartedNanos = 0L
         private var activeSnapshot: CoveragePointRenderSnapshot? = null
         private var activePage: CoveragePresentationPage? = null
+        private var activePageTicket: CoverageDescriptorPageTicket? = null
         private var activeOrigin = RendererUploadPageOrigin.ORDINARY
         private val pendingRanges = ArrayDeque<UploadRange>()
         // A completed reset establishes the mesh baseline. Afterwards a
@@ -399,12 +396,15 @@ internal class CoverageCubeMeshResources(
             enqueue(snapshot, RendererUploadPageOrigin.ORDINARY)
         }
 
-        fun submitPage(page: CoveragePresentationPage, origin: RendererUploadPageOrigin) {
+        fun submitPage(
+            page: CoveragePresentationPage,
+            origin: RendererUploadPageOrigin,
+            ticket: CoverageDescriptorPageTicket? = null,
+        ) {
             if (destroyed) return
             pendingPages.clear()
             pendingUploads.clear()
-            if (uploadBusy) pendingRanges.clear()
-            pendingPages.addLast(PendingPage(page, origin))
+            pendingPages.addLast(PendingPage(page, origin, ticket))
         }
 
         private fun enqueue(
@@ -446,6 +446,7 @@ internal class CoverageCubeMeshResources(
             pendingPages.clear()
             activeSnapshot = null
             activePage = null
+            activePageTicket = null
             pendingRanges.clear()
             activeFullUpload = false
         }
@@ -460,6 +461,7 @@ internal class CoverageCubeMeshResources(
                 val pendingPage = pendingPages.removeFirstOrNull()
                 if (pendingPage != null) {
                     activePage = pendingPage.page
+                    activePageTicket = pendingPage.ticket
                     activeOrigin = pendingPage.origin
                     pendingRanges.addLast(
                         UploadRange(
@@ -468,6 +470,7 @@ internal class CoverageCubeMeshResources(
                         ),
                     )
                 } else {
+                    activePageTicket = null
                     val pending = pendingUploads.removeFirstOrNull() ?: return
                     val snapshot = pending.snapshot
                     val update = snapshot.update
@@ -640,6 +643,9 @@ internal class CoverageCubeMeshResources(
                     if (activeFullUpload) hasUploadedSnapshot = true
                     activeSnapshot = null
                     activePage = null
+                    val ticket = activePageTicket
+                    activePageTicket = null
+                    if (ticket != null) onUploadPageReleasedWithTicket(ticket)
                 }
                 onUploadPageReleased()
                 // A completed callback only releases the page. The next page

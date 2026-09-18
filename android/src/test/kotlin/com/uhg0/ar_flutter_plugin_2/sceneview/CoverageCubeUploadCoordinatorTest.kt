@@ -1,6 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.sceneview
 
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
+import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
 import java.nio.ByteBuffer
 import java.nio.FloatBuffer
 import org.junit.Assert.assertArrayEquals
@@ -360,6 +361,32 @@ class CoverageCubeUploadCoordinatorTest {
 
         assertEquals(1, uploader.positionSubmissions.size)
     }
+
+    @Test
+    fun `descriptor supersession preserves active cube page and releases its ticket`() {
+        val uploader = FakeCubeUploader()
+        val releasedTickets = mutableListOf<CoverageDescriptorPageTicket>()
+        val coordinator = CoverageCubeMeshResources.CoverageCubeUploadCoordinator(
+            capacity = 1,
+            halfSize = 0.5f,
+            uploader = uploader,
+            onUploadPageReleasedWithTicket = releasedTickets::add,
+        )
+        val firstTicket = CoverageDescriptorPageTicket(1)
+        val secondTicket = CoverageDescriptorPageTicket(2)
+
+        coordinator.submitPage(cubePage(1f), RendererUploadPageOrigin.RESOURCE_GENERATION_RESET, firstTicket)
+        coordinator.onRendererFrame()
+        coordinator.submitPage(cubePage(2f), RendererUploadPageOrigin.ORDINARY, secondTicket)
+        uploader.completeAll()
+
+        assertEquals(listOf(firstTicket), releasedTickets)
+        coordinator.onRendererFrame()
+        assertEquals(2, uploader.positionSubmissions.size)
+        assertEquals(1.5f, uploader.positionSubmissions.last()[0], 0f)
+        uploader.completeAll()
+        assertEquals(listOf(firstTicket, secondTicket), releasedTickets)
+    }
 }
 
 private class FakeCubeUploader : CoverageCubeMeshResources.CoverageCubeVertexUploader {
@@ -410,6 +437,15 @@ private class FakeCubeUploader : CoverageCubeMeshResources.CoverageCubeVertexUpl
         }
     }
 }
+
+private fun cubePage(value: Float): CoveragePresentationPage = CoveragePresentationPage(
+    startSlot = 0,
+    totalCount = 1,
+    surfaceIds = longArrayOf(1),
+    positions = floatArrayOf(value, value, value),
+    colors = intArrayOf(0xFF000000.toInt()),
+    styleRows = ByteArray(COVERAGE_RENDERER_STYLE_ROW_BYTES),
+)
 
 private fun cubeSnapshot(
     revision: Long,

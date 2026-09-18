@@ -2,6 +2,7 @@ package com.uhg0.ar_flutter_plugin_2.sceneview
 
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.uploadQualifier
+import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -393,6 +394,43 @@ class CoveragePointUploadCoordinatorTest {
 
         assertEquals(1, uploader.positionSubmissions.size)
     }
+
+    @Test
+    fun `descriptor supersession preserves active page and releases its opaque ticket`() {
+        val uploader = FakeUploader()
+        val releasedTickets = mutableListOf<CoverageDescriptorPageTicket>()
+        val coordinator = CoveragePointUploadCoordinator(
+            capacity = 1,
+            uploader = uploader,
+            onUploadPageReleasedWithTicket = releasedTickets::add,
+        )
+        val firstTicket = CoverageDescriptorPageTicket(1)
+        val secondTicket = CoverageDescriptorPageTicket(2)
+
+        coordinator.submitPage(
+            page = page(value = 1f),
+            origin = RendererUploadPageOrigin.RESOURCE_GENERATION_RESET,
+            ticket = firstTicket,
+        )
+        coordinator.onRendererFrame()
+        val firstUpload = uploader.positionSubmissions.single().copyOf()
+
+        coordinator.submitPage(
+            page = page(value = 2f),
+            origin = RendererUploadPageOrigin.ORDINARY,
+            ticket = secondTicket,
+        )
+        uploader.completeAll()
+
+        assertEquals(listOf(firstTicket), releasedTickets)
+        assertArrayEquals(firstUpload, floatArrayOf(1f, 1f, 1f), 0f)
+
+        coordinator.onRendererFrame()
+        assertEquals(2, uploader.positionSubmissions.size)
+        assertArrayEquals(floatArrayOf(2f, 2f, 2f), uploader.positionSubmissions.last(), 0f)
+        uploader.completeAll()
+        assertEquals(listOf(firstTicket, secondTicket), releasedTickets)
+    }
 }
 
 private class FakeUploader : CoveragePointVertexUploader {
@@ -469,6 +507,15 @@ private fun snapshot(
             null
         },
     )
+
+private fun page(value: Float): CoveragePresentationPage = CoveragePresentationPage(
+    startSlot = 0,
+    totalCount = 1,
+    surfaceIds = longArrayOf(1),
+    positions = floatArrayOf(value, value, value),
+    colors = intArrayOf(0xFF000000.toInt()),
+    styleRows = ByteArray(COVERAGE_RENDERER_STYLE_ROW_BYTES),
+)
 
 private fun partialSnapshot(
     revision: Long,
