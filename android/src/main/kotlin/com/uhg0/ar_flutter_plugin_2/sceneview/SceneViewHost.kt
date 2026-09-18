@@ -151,9 +151,6 @@ internal class SceneViewHost(
                     ?: CoverageRendererLimits.presentationCapacity(mode),
                 retainedCount = coverageRendererOwner.sourceRowCount()
                     ?: CoverageRendererLimits.presentationCapacity(mode),
-                selectorStorageBytes = coverageRendererOwner.presentationStorageBytesFor(
-                    mode.toDefaultCoveragePresentationMode(),
-                ),
             )
         },
         onClearFirst = { transition ->
@@ -170,8 +167,6 @@ internal class SceneViewHost(
                 sourceCapacity = descriptor?.sourceCapacity
                     ?: coverageRendererOwner.sourceRowCount()
                     ?: CoverageRendererLimits.presentationCapacity(transition.mode),
-                selectorStorageBytes = descriptor?.ownedStorageBytes()?.toInt()
-                    ?: coverageRendererOwner.presentationStorageBytes(),
             )
             transition.token?.let { coverageRendererOwner.markResourceMounted(it) }
                 ?: coverageRendererOwner.markResourceMounted(transition.rendererGeneration)
@@ -751,7 +746,6 @@ internal class SceneViewHost(
                 effectiveConfig.voxelRenderMode,
                 sourceCapacity = descriptor.sourceCapacity,
                 retainedCount = descriptor.count,
-                selectorStorageBytes = descriptor.ownedStorageBytes().toInt(),
             )
         } else null
         if (admission?.strategy == CoverageRendererTransitionStrategy.REJECT) return
@@ -823,10 +817,6 @@ internal class SceneViewHost(
                 effectiveConfig.voxelRenderMode,
                 sourceCapacity = sourceRows,
                 retainedCount = snapshot.count,
-                selectorStorageBytes = CoveragePresentationStorage.estimatedOwnedStorageBytes(
-                    effectiveConfig.voxelRenderMode.toDefaultCoveragePresentationMode().presentationCapacity,
-                    sourceCapacity = 0,
-                ),
             )
         } else {
             null
@@ -884,9 +874,6 @@ internal class SceneViewHost(
                         ?: CoverageRendererLimits.presentationCapacity(nextMode),
                     retainedCount = coverageRendererOwner.sourceRowCount()
                         ?: CoverageRendererLimits.presentationCapacity(nextMode),
-                    selectorStorageBytes = coverageRendererOwner.presentationStorageBytesFor(
-                        controls.mode,
-                    ),
                 )
                 if (admission.strategy == CoverageRendererTransitionStrategy.REJECT) return@runCatching false
                 if (admission.strategy == CoverageRendererTransitionStrategy.CLEAR_FIRST) {

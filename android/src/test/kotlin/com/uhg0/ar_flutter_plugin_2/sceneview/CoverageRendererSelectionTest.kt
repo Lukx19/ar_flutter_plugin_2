@@ -466,6 +466,32 @@ class CoverageRendererSelectionTest {
     }
 
     @Test
+    fun `admission coexists at the transition boundary and clears one byte above it`() {
+        val telemetry = RendererTelemetry()
+        val ledger = CoverageRendererAllocationLedger(telemetry)
+        val candidate = ledger.admitResourceReplacement(VoxelRenderMode.CUBES).candidateBytes
+
+        telemetry.setOwnedBufferBytes(
+            "existing-generation",
+            CoverageRendererLimits.INSTANTANEOUS_TRANSITION_LIMIT_BYTES - candidate,
+        )
+        assertEquals(
+            CoverageRendererTransitionStrategy.COEXIST,
+            ledger.admitResourceReplacement(VoxelRenderMode.CUBES).strategy,
+        )
+
+        telemetry.removeOwner("existing-generation")
+        telemetry.setOwnedBufferBytes(
+            "existing-generation",
+            CoverageRendererLimits.INSTANTANEOUS_TRANSITION_LIMIT_BYTES - candidate + 1,
+        )
+        assertEquals(
+            CoverageRendererTransitionStrategy.CLEAR_FIRST,
+            ledger.admitResourceReplacement(VoxelRenderMode.CUBES).strategy,
+        )
+    }
+
+    @Test
     fun `rejected replacement does not invoke creation or release current resource`() {
         val telemetry = RendererTelemetry()
         val ledger = CoverageRendererAllocationLedger(telemetry)
@@ -551,11 +577,11 @@ class CoverageRendererSelectionTest {
     }
 
     @Test
-    fun `renderer lazy mode resource peaks stay within the active twelve MiB cap`() {
+    fun `renderer lazy mode resource peaks stay within the active fourteen MiB cap`() {
         assertEquals(2_000, CoverageRendererLimits.RAW_POINT_CAPACITY)
         assertEquals(20_000, CoverageRendererLimits.CENTROID_CAPACITY)
         assertEquals(8_000, CoverageRendererLimits.CUBE_CAPACITY)
-        assertEquals(11_869_472, CoverageRendererLimits.maximumActiveRendererBytes)
+        assertEquals(13_197_572, CoverageRendererLimits.maximumActiveRendererBytes)
         com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.entries.forEach { mode ->
             assertTrue(
                 "$mode startup peak must fit the active renderer cap",
@@ -563,6 +589,67 @@ class CoverageRendererSelectionTest {
                     CoverageRendererLimits.ACTIVE_RENDERER_OWNED_LIMIT_BYTES,
             )
         }
+    }
+
+    @Test
+    fun `production ownership receipt includes every live renderer owner exactly once`() {
+        val receipt = CoverageRendererLimits.ownershipReceipt(VoxelRenderMode.CUBES)
+
+        assertEquals(14 * 1024 * 1024, CoverageRendererLimits.ACTIVE_RENDERER_OWNED_LIMIT_BYTES)
+        assertEquals(18 * 1024 * 1024, CoverageRendererLimits.INSTANTANEOUS_TRANSITION_LIMIT_BYTES)
+        assertEquals(5_403_936, receipt.canonicalStateBytes)
+        assertEquals(800_000, receipt.mutableProjectionSelectorBytes)
+        assertEquals(640_100, receipt.descriptorBackingBytes)
+        assertEquals(400_000, receipt.pageReaderCapturedMappingBytes)
+        assertEquals(65_536, receipt.stagingBytes)
+        assertEquals(5_888_000, receipt.meshBytes)
+        assertEquals(13_197_572, receipt.totalBytes)
+        assertTrue(receipt.canonicalStateBytes > 0)
+        assertTrue(receipt.mutableProjectionSelectorBytes > 0)
+        assertTrue(receipt.descriptorBackingBytes > 0)
+        assertTrue(receipt.pageReaderCapturedMappingBytes > 0)
+        assertTrue(receipt.stagingBytes > 0)
+        assertTrue(receipt.meshBytes > 0)
+        assertEquals(
+            receipt.totalBytes,
+            receipt.canonicalStateBytes +
+                receipt.mutableProjectionSelectorBytes +
+                receipt.descriptorBackingBytes +
+                receipt.pageReaderCapturedMappingBytes +
+                receipt.stagingBytes +
+                receipt.meshBytes,
+        )
+
+        val telemetry = RendererTelemetry()
+        val admission = CoverageRendererAllocationLedger(telemetry)
+            .admitResourceReplacement(VoxelRenderMode.CUBES)
+        assertEquals(receipt, admission.ownershipReceipt)
+        assertEquals(receipt.totalBytes, admission.candidateBytes)
+        assertEquals(receipt.totalBytes, telemetry.snapshot().getValue("lastAdmissionOwnershipBytes"))
+
+        val rejected = admission
+            .let { CoverageRendererAllocationLedger(RendererTelemetry()) }
+            .admitResourceReplacement(
+                VoxelRenderMode.CUBES,
+                selectorStorageBytes = CoverageRendererLimits.ACTIVE_RENDERER_OWNED_LIMIT_BYTES -
+                    receipt.totalBytes + receipt.mutableProjectionSelectorBytes + 1,
+            )
+        assertEquals(CoverageRendererTransitionStrategy.REJECT, rejected.strategy)
+        assertEquals(CoverageRendererLimits.ACTIVE_RENDERER_OWNED_LIMIT_BYTES + 1, rejected.candidateBytes)
+    }
+
+    @Test
+    fun `descriptor backing is charged once while in flight and releases to zero`() {
+        val telemetry = RendererTelemetry()
+        val ledger = CoverageRendererAllocationLedger(telemetry)
+
+        ledger.installPersistentCoverageState(VoxelRenderMode.CUBES)
+        val first = telemetry.snapshot().getValue("ownedBufferBytes")
+        ledger.installPersistentCoverageState(VoxelRenderMode.CUBES)
+        assertEquals(first, telemetry.snapshot().getValue("ownedBufferBytes"))
+
+        ledger.clearCoverageState()
+        assertEquals(0, telemetry.snapshot().getValue("ownedBufferBytes"))
     }
 
     @Test
@@ -600,12 +687,16 @@ class CoverageRendererSelectionTest {
             snapshot,
         )
         assertEquals(
-            CoverageRendererLimits.rendererStateBytes(VoxelRenderMode.CENTROIDS) +
-                CoverageRendererLimits.presentationStorageBytes(
-                    com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS,
-                    snapshot.capacity,
-                ) +
-                CoverageRendererLimits.PAGE_STAGING_BYTES +
+            CoverageRendererLimits.ownershipReceipt(
+                VoxelRenderMode.CENTROIDS,
+                selectorStorageBytes = selector.ownedStorageBytes,
+            ).let { receipt ->
+                receipt.canonicalStateBytes +
+                    receipt.mutableProjectionSelectorBytes +
+                    receipt.descriptorBackingBytes +
+                    receipt.pageReaderCapturedMappingBytes +
+                    receipt.stagingBytes
+            } +
                 CoverageRendererLimits.snapshotHandoffBytes(
                     com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS,
                 ),

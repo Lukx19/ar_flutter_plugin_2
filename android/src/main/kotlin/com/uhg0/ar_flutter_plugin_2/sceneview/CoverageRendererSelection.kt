@@ -11,6 +11,46 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridRendererState
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.QUALIFIED_RENDERER_STYLE_CUT_MAX_ROWS
 
+/** Exact logical ownership receipt shared by admission and renderer telemetry. */
+internal data class CoverageRendererOwnershipReceipt(
+    val canonicalStateBytes: Int,
+    val mutableProjectionSelectorBytes: Int,
+    val descriptorBackingBytes: Int,
+    val pageReaderCapturedMappingBytes: Int,
+    val stagingBytes: Int,
+    val meshBytes: Int,
+) {
+    init {
+        require(canonicalStateBytes >= 0)
+        require(mutableProjectionSelectorBytes >= 0)
+        require(descriptorBackingBytes >= 0)
+        require(pageReaderCapturedMappingBytes >= 0)
+        require(stagingBytes >= 0)
+        require(meshBytes >= 0)
+    }
+
+    val totalBytes: Int
+        get() = canonicalStateBytes +
+            mutableProjectionSelectorBytes +
+            descriptorBackingBytes +
+            pageReaderCapturedMappingBytes +
+            stagingBytes +
+            meshBytes
+
+    companion object {
+        /** Compatibility receipt for test/fake admissions without owner detail. */
+        internal fun unattributed(bytes: Int): CoverageRendererOwnershipReceipt =
+            CoverageRendererOwnershipReceipt(
+                canonicalStateBytes = 0,
+                mutableProjectionSelectorBytes = 0,
+                descriptorBackingBytes = 0,
+                pageReaderCapturedMappingBytes = 0,
+                stagingBytes = 0,
+                meshBytes = bytes,
+            )
+    }
+}
+
 /** Chapter 17 fixed presentation maxima; semantic-grid capacity is separate. */
 internal object CoverageRendererLimits {
     const val RAW_POINT_CAPACITY = 2_000
@@ -21,7 +61,7 @@ internal object CoverageRendererLimits {
     const val GLYPH_CAPACITY = 256
     const val DEBUG_ROW_CAPACITY = 1_024
     /** Maximum renderer-owned CPU/native buffers for one mounted generation. */
-    const val ACTIVE_RENDERER_OWNED_LIMIT_BYTES = 12 * 1024 * 1024
+    const val ACTIVE_RENDERER_OWNED_LIMIT_BYTES = 14 * 1024 * 1024
 
     /** Capacity reserved for replacement bookkeeping and rollback. */
     const val TRANSITION_RESERVE_BYTES = 4 * 1024 * 1024
@@ -77,6 +117,34 @@ internal object CoverageRendererLimits {
             sourceCapacity,
         )
 
+    /**
+     * One receipt for every concrete renderer-owned CPU/native allocation.
+     * The descriptor and page-reader terms are bounded by the one 20k backing;
+     * they are deliberately charged once even while a page is in flight.
+     */
+    fun ownershipReceipt(
+        mode: VoxelRenderMode,
+        selectorStorageBytes: Int? = null,
+    ): CoverageRendererOwnershipReceipt {
+        val presentationCapacity = CENTROID_CAPACITY
+        return CoverageRendererOwnershipReceipt(
+            canonicalStateBytes = rendererStateBytes(mode),
+            mutableProjectionSelectorBytes = selectorStorageBytes
+                ?: CoveragePresentationStorage.estimatedOwnedStorageBytes(
+                    presentationCapacity,
+                    sourceCapacity = 0,
+                ),
+            descriptorBackingBytes = PresentationDescriptor.estimatedBackingBytes(
+                presentationCapacity,
+            ),
+            pageReaderCapturedMappingBytes = presentationCapacity * (
+                Long.SIZE_BYTES * 2 + Int.SIZE_BYTES
+            ),
+            stagingBytes = PAGE_STAGING_BYTES,
+            meshBytes = resourcePeakBytes(mode),
+        )
+    }
+
     fun activeRendererPeakBytes(mode: VoxelRenderMode): Int =
         activeRendererPeakBytes(mode, presentationCapacity(mode), presentationCapacity(mode))
 
@@ -85,17 +153,7 @@ internal object CoverageRendererLimits {
         sourceCapacity: Int,
         retainedCount: Int,
         selectorStorageBytes: Int? = null,
-    ): Int =
-        resourcePeakBytes(mode) +
-            rendererStateBytes(mode) +
-            // Production selection streams canonical rows and owns only the
-            // selected presentation arrays; sourceCapacity is an upstream
-            // admission fact, not a source-sized renderer allocation.
-            (selectorStorageBytes ?: presentationStorageBytes(mode)) +
-            PAGE_STAGING_BYTES +
-            // Auxiliary glyph/proxy arrays are allocated only by the mode
-            // that needs them and are not part of the centroid baseline.
-            0
+    ): Int = ownershipReceipt(mode, selectorStorageBytes).totalBytes
 
     val maximumActiveRendererBytes: Int = VoxelRenderMode.entries.maxOf(::activeRendererPeakBytes)
 
@@ -136,12 +194,11 @@ internal class CoverageRendererAllocationLedger(
         selectorStorageBytes: Int? = null,
     ): CoverageRendererResourceAdmission {
         val currentBytes = telemetry.ownedBufferBytesSnapshot()
-        val candidateBytes = CoverageRendererLimits.activeRendererPeakBytes(
+        val ownershipReceipt = CoverageRendererLimits.ownershipReceipt(
             mode,
-            sourceCapacity,
-            retainedCount,
             selectorStorageBytes,
         )
+        val candidateBytes = ownershipReceipt.totalBytes
         val combinedBytes = currentBytes + candidateBytes
         val admission = CoverageRendererResourceAdmission(
             strategy = when {
@@ -154,6 +211,7 @@ internal class CoverageRendererAllocationLedger(
             currentBytes = currentBytes,
             candidateBytes = candidateBytes,
             combinedBytes = combinedBytes,
+            ownershipReceipt = ownershipReceipt,
         )
         telemetry.recordResourceAdmission(admission)
         return admission
@@ -175,7 +233,11 @@ internal class CoverageRendererAllocationLedger(
             telemetry.removeOwner(RENDERER_STATE_OWNER)
             telemetry.removeOwner(AUXILIARY_OWNER)
             telemetry.removeOwner(PRESENTATION_STORAGE_OWNER)
+            telemetry.removeOwner(MUTABLE_SELECTOR_OWNER)
+            telemetry.removeOwner(DESCRIPTOR_BACKING_OWNER)
+            telemetry.removeOwner(PAGE_READER_MAPPING_OWNER)
             telemetry.removeOwner(PAGE_STAGING_OWNER)
+            telemetry.removeOwner(SNAPSHOT_HANDOFF_OWNER)
             return
         }
         installPersistentCoverageStateForCapacity(
@@ -217,6 +279,19 @@ internal class CoverageRendererAllocationLedger(
             RENDERER_STATE_OWNER,
             rendererStateBytes,
         )
+        val ownership = CoverageRendererLimits.ownershipReceipt(VoxelRenderMode.CENTROIDS)
+        telemetry.setOwnedBufferBytes(
+            MUTABLE_SELECTOR_OWNER,
+            selectorStorageBytes ?: ownership.mutableProjectionSelectorBytes,
+        )
+        telemetry.setOwnedBufferBytes(
+            DESCRIPTOR_BACKING_OWNER,
+            ownership.descriptorBackingBytes,
+        )
+        telemetry.setOwnedBufferBytes(
+            PAGE_READER_MAPPING_OWNER,
+            ownership.pageReaderCapturedMappingBytes,
+        )
         telemetry.setOwnedBufferBytes(PAGE_STAGING_OWNER, CoverageRendererLimits.PAGE_STAGING_BYTES)
         // Auxiliary arrays are lazy. A mode-specific auxiliary owner is
         // charged only by the concrete proxy/glyph resource when requested.
@@ -224,12 +299,7 @@ internal class CoverageRendererAllocationLedger(
         if (sourceCapacity == null) {
             telemetry.removeOwner(PRESENTATION_STORAGE_OWNER)
         } else {
-            telemetry.setOwnedBufferBytes(
-                PRESENTATION_STORAGE_OWNER,
-                selectorStorageBytes ?: CoveragePresentationStorage.estimatedOwnedStorageBytes(
-                    presentationCapacity,
-                ),
-            )
+            telemetry.removeOwner(PRESENTATION_STORAGE_OWNER)
         }
     }
 
@@ -262,6 +332,9 @@ internal class CoverageRendererAllocationLedger(
         telemetry.removeOwner(RENDERER_STATE_OWNER)
         telemetry.removeOwner(AUXILIARY_OWNER)
         telemetry.removeOwner(PRESENTATION_STORAGE_OWNER)
+        telemetry.removeOwner(MUTABLE_SELECTOR_OWNER)
+        telemetry.removeOwner(DESCRIPTOR_BACKING_OWNER)
+        telemetry.removeOwner(PAGE_READER_MAPPING_OWNER)
         telemetry.removeOwner(PAGE_STAGING_OWNER)
         telemetry.removeOwner(SNAPSHOT_HANDOFF_OWNER)
     }
@@ -323,6 +396,9 @@ internal class CoverageRendererAllocationLedger(
         const val RENDERER_STATE_OWNER = "coverage-renderer-state"
         const val AUXILIARY_OWNER = "coverage-auxiliary-state"
         const val PRESENTATION_STORAGE_OWNER = "coverage-presentation-storage"
+        const val MUTABLE_SELECTOR_OWNER = "coverage-mutable-projection-selector"
+        const val DESCRIPTOR_BACKING_OWNER = "coverage-descriptor-backing"
+        const val PAGE_READER_MAPPING_OWNER = "coverage-page-reader-mapping"
         const val PAGE_STAGING_OWNER = "coverage-page-staging"
         const val SNAPSHOT_HANDOFF_OWNER = "coverage-snapshot-handoff"
     }

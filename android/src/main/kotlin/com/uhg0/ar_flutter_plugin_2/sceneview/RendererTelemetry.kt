@@ -41,6 +41,7 @@ internal class RendererTelemetry {
     private var lastAdmissionCurrentBytes = 0
     private var lastAdmissionCandidateBytes = 0
     private var lastAdmissionCombinedBytes = 0
+    private var lastAdmissionOwnershipReceipt: CoverageRendererOwnershipReceipt? = null
     private var residentRowCount = 0
     private var residentGlyphCount = 0
     private var residentToken: CoverageResourceToken? = null
@@ -81,6 +82,7 @@ internal class RendererTelemetry {
         lastAdmissionCurrentBytes = admission.currentBytes
         lastAdmissionCandidateBytes = admission.candidateBytes
         lastAdmissionCombinedBytes = admission.combinedBytes
+        lastAdmissionOwnershipReceipt = admission.ownershipReceipt
     }
 
     @Synchronized
@@ -286,6 +288,10 @@ internal class RendererTelemetry {
         "lastAdmissionCurrentBytes" to lastAdmissionCurrentBytes,
         "lastAdmissionCandidateBytes" to lastAdmissionCandidateBytes,
         "lastAdmissionCombinedBytes" to lastAdmissionCombinedBytes,
+        "lastAdmissionOwnershipBytes" to (lastAdmissionOwnershipReceipt?.totalBytes ?: 0),
+        "lastAdmissionOwnershipReceipt" to (
+            lastAdmissionOwnershipReceipt?.asMap() ?: emptyMap<String, Any>()
+        ),
         "cumulativeResourceReplacementCount" to resourceReplacementCount,
         "cumulativeResourceDisposalCount" to resourceDisposalCount,
         "residentRowCount" to residentRowCount,
@@ -341,6 +347,16 @@ internal class RendererTelemetry {
         private val fencedDestroyedUploadCallbacks = AtomicInteger()
     }
 }
+
+private fun CoverageRendererOwnershipReceipt.asMap(): Map<String, Any> = mapOf(
+    "canonicalStateBytes" to canonicalStateBytes,
+    "mutableProjectionSelectorBytes" to mutableProjectionSelectorBytes,
+    "descriptorBackingBytes" to descriptorBackingBytes,
+    "pageReaderCapturedMappingBytes" to pageReaderCapturedMappingBytes,
+    "stagingBytes" to stagingBytes,
+    "meshBytes" to meshBytes,
+    "totalBytes" to totalBytes,
+)
 
 private fun Int?.orZero(): Int = this ?: 0
 

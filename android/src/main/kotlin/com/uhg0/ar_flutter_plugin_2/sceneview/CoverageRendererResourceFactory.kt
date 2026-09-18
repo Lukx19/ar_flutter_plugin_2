@@ -20,6 +20,8 @@ internal data class CoverageRendererResourceAdmission(
     val currentBytes: Int,
     val candidateBytes: Int,
     val combinedBytes: Int,
+    val ownershipReceipt: CoverageRendererOwnershipReceipt =
+        CoverageRendererOwnershipReceipt.unattributed(candidateBytes),
 ) {
     init {
         require(currentBytes >= 0)

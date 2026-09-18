@@ -130,9 +130,7 @@ private class PresentationBacking(
 
     /** Includes the one immutable bounded table, not borrowed page payloads. */
     fun ownedStorageBytes(): Long =
-        96L + surfaceIdTable.size * Long.SIZE_BYTES.toLong() +
-            sourceSlotTable.size * Int.SIZE_BYTES.toLong() + styleTable.size +
-            glyphPrefix.size * Int.SIZE_BYTES.toLong()
+        PresentationDescriptor.estimatedBackingBytes(surfaceIdTable.size).toLong()
 
     private companion object {
         const val MAX_BACKING_ROWS = 20_000
@@ -238,6 +236,18 @@ internal class PresentationDescriptor private constructor(
     internal fun ownedStorageBytes(): Long = backing.ownedStorageBytes()
 
     companion object {
+        /** Exact bytes of the immutable bounded backing, excluding borrowed pages. */
+        internal fun estimatedBackingBytes(rowCapacity: Int): Int {
+            require(rowCapacity in 0..20_000)
+            return 96 +
+                rowCapacity * (
+                    Long.SIZE_BYTES +
+                        Int.SIZE_BYTES +
+                        COVERAGE_RENDERER_STYLE_ROW_BYTES +
+                        Int.SIZE_BYTES
+                ) + Int.SIZE_BYTES
+        }
+
         fun create(
             qualifier: CoverageRowsQualifier,
             mode: CoveragePresentationMode,
