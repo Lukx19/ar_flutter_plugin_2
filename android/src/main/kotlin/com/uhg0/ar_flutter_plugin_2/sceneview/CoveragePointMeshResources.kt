@@ -46,6 +46,10 @@ internal class CoveragePointMeshResources(
 
     private var lastUploadQualifier: CoveragePointUploadQualifier? = null
     private var retainedSnapshotUploadRequired = true
+    private var pendingDescriptor: BoundedCoveragePresentation? = null
+    private var descriptorCursor = 0
+    private var descriptorReset = true
+    private var descriptorPageInFlight = false
     private var destroyed = false
     @Volatile private var onUploadPageReleased: () -> Unit = {}
     private val uploadCoordinator = CoveragePointUploadCoordinator(
@@ -60,7 +64,10 @@ internal class CoveragePointMeshResources(
         onDestroyedUploadCallback = {
             telemetry?.recordFencedDestroyedUploadCallback()
         },
-        onUploadPageReleased = { onUploadPageReleased() },
+        onUploadPageReleased = {
+            descriptorPageInFlight = false
+            onUploadPageReleased()
+        },
     )
     private val allocationLedger = telemetry?.let(::CoverageRendererAllocationLedger)
     private var indexStaging: java.nio.IntBuffer? = null
@@ -124,6 +131,68 @@ internal class CoveragePointMeshResources(
         node.isVisible = presentation.enabled && presentation.count > 0
     }
 
+    override fun updatePage(
+        node: Node,
+        page: CoveragePresentationPage,
+        materialInstance: MaterialInstance,
+        pointSizePx: Float,
+        reset: Boolean,
+    ) {
+        uploadCoordinator.submitPage(
+            page,
+            RendererUploadPageOrigin.RESOURCE_GENERATION_RESET.takeIf { reset }
+                ?: RendererUploadPageOrigin.ORDINARY,
+        )
+        descriptorPageInFlight = true
+        setDrawCount(node, if (page.totalCount > 0) page.totalCount else 0)
+        materialInstance.setParameter("pointSize", pointSizePx)
+        node.isVisible = page.totalCount > 0
+    }
+
+    internal fun updateDescriptor(
+        node: Node,
+        descriptor: BoundedCoveragePresentation,
+        materialInstance: MaterialInstance,
+        pointSizePx: Float,
+    ) {
+        currentNodeForDescriptor = node
+        currentMaterialForDescriptor = materialInstance
+        currentPointSizeForDescriptor = pointSizePx
+        pendingDescriptor = descriptor
+        descriptorCursor = 0
+        descriptorReset = true
+        descriptorPageInFlight = false
+        setDrawCount(node, descriptor.count)
+        materialInstance.setParameter("pointSize", pointSizePx)
+        node.isVisible = descriptor.enabled && descriptor.count > 0
+    }
+
+    private fun queueNextDescriptorPage() {
+        val descriptor = pendingDescriptor ?: return
+        if (descriptorCursor >= descriptor.count) return
+        val start = descriptorCursor
+        if (!descriptor.withPage(descriptor.qualifier, start, 512) { page ->
+                updatePage(
+                    node = checkNotNull(currentNodeForDescriptor),
+                    page = page,
+                    materialInstance = checkNotNull(currentMaterialForDescriptor),
+                    pointSizePx = currentPointSizeForDescriptor,
+                    reset = descriptorReset,
+                )
+                descriptorCursor += page.count
+                descriptorReset = false
+            }
+        ) {
+            pendingDescriptor = null
+        }
+    }
+
+    // These short-lived fields exist only while queueNextDescriptorPage runs;
+    // they avoid retaining a mesh/node in the descriptor itself.
+    private var currentNodeForDescriptor: Node? = null
+    private var currentMaterialForDescriptor: MaterialInstance? = null
+    private var currentPointSizeForDescriptor = 0f
+
     override fun hide(node: Node) {
         setDrawCount(node, 0)
         node.isVisible = false
@@ -133,7 +202,10 @@ internal class CoveragePointMeshResources(
         retainedSnapshotUploadRequired = true
     }
 
-    override fun onRendererFrame() = uploadCoordinator.onRendererFrame()
+    override fun onRendererFrame() {
+        uploadCoordinator.onRendererFrame()
+        if (!descriptorPageInFlight) queueNextDescriptorPage()
+    }
 
     override fun setOnUploadPageReleased(listener: () -> Unit) {
         onUploadPageReleased = listener
@@ -159,6 +231,10 @@ internal class CoveragePointMeshResources(
         onUploadPageReleased = {}
         uploadCoordinator.destroy()
         indexStaging = null
+        pendingDescriptor = null
+        descriptorPageInFlight = false
+        currentNodeForDescriptor = null
+        currentMaterialForDescriptor = null
         allocationLedger?.releasePointResources(telemetryOwner)
         engine.destroyVertexBuffer(vertexBuffer)
         engine.destroyIndexBuffer(indexBuffer)
@@ -254,16 +330,30 @@ internal class CoveragePointUploadCoordinator(
         val snapshot: CoveragePointRenderSnapshot,
         val origin: RendererUploadPageOrigin,
     )
+    private data class PendingPage(
+        val page: CoveragePresentationPage,
+        val origin: RendererUploadPageOrigin,
+    )
 
     private val pendingUploads = ArrayDeque<PendingUpload>()
+    private val pendingPages = ArrayDeque<PendingPage>()
     private var hasUploadedSnapshot = false
     private var destroyed = false
     private var activeUploadStartedNanos = 0L
     private var activeSnapshot: CoveragePointRenderSnapshot? = null
+    private var activePage: CoveragePresentationPage? = null
     private var activeOrigin = RendererUploadPageOrigin.ORDINARY
     private val pendingRanges = ArrayDeque<UploadRange>()
     fun submit(snapshot: CoveragePointRenderSnapshot) {
         enqueue(snapshot, RendererUploadPageOrigin.ORDINARY)
+    }
+
+    fun submitPage(page: CoveragePresentationPage, origin: RendererUploadPageOrigin) {
+        if (destroyed) return
+        pendingPages.clear()
+        pendingUploads.clear()
+        if (uploadBusy) pendingRanges.clear()
+        pendingPages.addLast(PendingPage(page, origin))
     }
 
     private fun enqueue(
@@ -308,35 +398,54 @@ internal class CoveragePointUploadCoordinator(
     fun destroy() {
         destroyed = true
         pendingUploads.clear()
+        pendingPages.clear()
         activeSnapshot = null
+        activePage = null
         pendingRanges.clear()
     }
 
     private fun drain() {
         if (destroyed || uploadBusy) return
         if (pendingRanges.isEmpty()) {
-            val pending = pendingUploads.removeFirstOrNull() ?: return
-            val snapshot = pending.snapshot
-            val update = snapshot.update
-            val spans = update?.spans.orEmpty()
-            val fullUpload = !hasUploadedSnapshot || update == null || update.reset
-            if (!fullUpload && spans.isEmpty()) return
-            activeSnapshot = snapshot
-            activeOrigin = pending.origin
-            pendingRanges.addAll(
-                uploadRanges(
-                    count = snapshot.count,
-                    fullUpload = fullUpload,
-                    spans = spans,
-                ),
-            )
-            hasUploadedSnapshot = true
+            val pendingPage = pendingPages.removeFirstOrNull()
+            if (pendingPage != null) {
+                activePage = pendingPage.page
+                activeOrigin = pendingPage.origin
+                pendingRanges.addLast(
+                    UploadRange(
+                        pendingPage.page.startSlot,
+                        pendingPage.page.startSlot + pendingPage.page.count,
+                    ),
+                )
+            } else {
+                val pending = pendingUploads.removeFirstOrNull() ?: return
+                val snapshot = pending.snapshot
+                val update = snapshot.update
+                val spans = update?.spans.orEmpty()
+                val fullUpload = !hasUploadedSnapshot || update == null || update.reset
+                if (!fullUpload && spans.isEmpty()) return
+                activeSnapshot = snapshot
+                activeOrigin = pending.origin
+                pendingRanges.addAll(
+                    uploadRanges(
+                        count = snapshot.count,
+                        fullUpload = fullUpload,
+                        spans = spans,
+                    ),
+                )
+                hasUploadedSnapshot = true
+            }
         }
-        val snapshot = checkNotNull(activeSnapshot)
         val range = pendingRanges.removeFirstOrNull() ?: return
         val startSlot = range.startSlot
         val endSlot = range.endSlotExclusive
-        buffers.writeRange(snapshot.positions, snapshot.colors, startSlot, endSlot)
+        val page = activePage
+        if (page != null) {
+            buffers.writePage(page.positions, page.colors, page.startSlot)
+        } else {
+            val snapshot = checkNotNull(activeSnapshot)
+            buffers.writeRange(snapshot.positions, snapshot.colors, startSlot, endSlot)
+        }
         onUploadSubmitted(
             (endSlot - startSlot) *
                 (CoveragePointMeshResources.POSITION_COMPONENTS * Float.SIZE_BYTES +
@@ -386,7 +495,10 @@ internal class CoveragePointUploadCoordinator(
                 activeOrigin,
             )
             uploadBusy = false
-            if (pendingRanges.isEmpty()) activeSnapshot = null
+            if (pendingRanges.isEmpty()) {
+                activeSnapshot = null
+                activePage = null
+            }
             onUploadPageReleased()
             // The next page is admitted only by onRendererFrame.
         }

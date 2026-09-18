@@ -4,10 +4,16 @@ import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaReceiptV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaSelectorV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaSourceV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageCommittedRows
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRowsQualifier
 import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette
+import com.uhg0.ar_flutter_plugin_2.sceneview.BoundedCoveragePresentation
+import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationMode
+import com.uhg0.ar_flutter_plugin_2.sceneview.PresentationDescriptor
+import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationSelector
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
@@ -1122,6 +1128,9 @@ internal interface CommittedRendererProjection : AutoCloseable {
     }
 }
 
+private val NO_PRESENTATION_PUBLISHER:
+    (BoundedCoveragePresentation?, PointCloudNativeConfig?) -> Unit = { _, _ -> }
+
 internal sealed interface RendererProjectionResult {
     data class Applied(val rowCount: Int) : RendererProjectionResult
     data class Refused(val reason: RendererProjectionRefusal) : RendererProjectionResult
@@ -1139,13 +1148,26 @@ internal enum class RendererProjectionRefusal {
 internal class NativeRendererProjection(
     private val render: (CoveragePointRenderSnapshot?, PointCloudNativeConfig?) -> Unit,
     capacity: Int = QUALIFIED_RENDERER_STYLE_CUT_MAX_ROWS,
+    private val publishPresentation: (BoundedCoveragePresentation?, PointCloudNativeConfig?) -> Unit =
+        NO_PRESENTATION_PUBLISHER,
 ) : CommittedRendererProjection {
-    private val state = VisibilityGridRendererState(capacity)
+    // Canonical projection retains IDs/keys/normals/style only. World
+    // positions and packed colors are borrowed into bounded page staging.
+    private val state = VisibilityGridRendererState(
+        capacity = capacity,
+        retainWorldPositions = publishPresentation === NO_PRESENTATION_PUBLISHER,
+        retainCanonicalNormalMetadata = publishPresentation === NO_PRESENTATION_PUBLISHER,
+    )
+    private val presentationSelector = CoveragePresentationSelector(
+        CoveragePresentationMode.SEMANTIC_CENTROIDS.presentationCapacity,
+    )
     private var closed = false
     private var rebuildCut: CommittedGeometryCut? = null
     private var activeOwnership: VisibilityObservationOwnership? = null
     private var activeLineageRevision = 0L
+    private var activeTransactionId = 0L
     private var activeRenderConfig: PointCloudNativeConfig? = null
+    private var activePresentation: PresentationDescriptor? = null
     override val maximumRows: Int get() = state.capacity
     override fun portableOwnerBytes(): Long =
         56L + 96L + 64L + state.retainedGroupGeometryBytes // projection, state, native config, group geometry
@@ -1190,9 +1212,10 @@ internal class NativeRendererProjection(
             return RendererProjectionResult.Refused(RendererProjectionRefusal.NON_ADJACENT_GEOMETRY)
         }
         activeLineageRevision = cut.lineageRevision
+        activeTransactionId = cut.transactionId
         val config = renderConfig(cut)
         activeRenderConfig = config
-        render(state.snapshot(), config)
+        emitPresentation(config, forceReset = cut.reset)
         return RendererProjectionResult.Applied(currentRowCount())
     }
 
@@ -1201,7 +1224,7 @@ internal class NativeRendererProjection(
         if (closed) return RendererStyleCutResult.Rejected(RendererStyleCutRejection.CLOSED)
         val result = state.applyStyleCut(cut)
         if (result is RendererStyleCutResult.Applied) {
-            render(state.snapshot(), checkNotNull(activeRenderConfig))
+            emitPresentation(checkNotNull(activeRenderConfig), forceReset = cut.reset)
         }
         return result
     }
@@ -1260,9 +1283,10 @@ internal class NativeRendererProjection(
         }
         activeOwnership = cut.ownership
         activeLineageRevision = cut.lineageRevision
+        activeTransactionId = cut.transactionId
         val config = renderConfig(cut)
         activeRenderConfig = config
-        render(state.snapshot(), config)
+        emitPresentation(config, forceReset = true)
         discardRebuild()
     }
 
@@ -1286,8 +1310,12 @@ internal class NativeRendererProjection(
         discardRebuild()
         activeOwnership = null
         activeLineageRevision = 0
+        activeTransactionId = 0
         activeRenderConfig = null
+        activePresentation = null
+        presentationSelector.reset()
         state.stopGroup()
+        publishPresentation(null, null)
         render(null, null)
     }
 
@@ -1297,10 +1325,73 @@ internal class NativeRendererProjection(
         closed = true
         discardRebuild()
         activeOwnership = null
+        activeLineageRevision = 0
+        activeTransactionId = 0
         activeRenderConfig = null
+        activePresentation = null
+        presentationSelector.reset()
         state.dispose()
+        publishPresentation(null, null)
         render(null, null)
     }
+
+    /** Builds an immutable bounded descriptor and keeps the raw snapshot as a test adapter. */
+    @Synchronized
+    private fun emitPresentation(config: PointCloudNativeConfig, forceReset: Boolean) {
+        if (publishPresentation === NO_PRESENTATION_PUBLISHER) {
+            render(state.snapshot(), config)
+            return
+        }
+        val ownership = activeOwnership
+        if (ownership == null) {
+            publishPresentation(null, config)
+            return
+        }
+        val qualifier = CoverageRowsQualifier(
+            bindingGeneration = ownership.bindingGeneration,
+            groupGeneration = ownership.groupGeneration,
+            rendererGeneration = config.rendererGeneration,
+            transactionId = activeTransactionId,
+            geometryRevision = state.currentGeometryRevision,
+            styleRevision = state.currentStyleRevision,
+        )
+        val sourceUpdate = state.takePresentationUpdate()
+        var selected = false
+        var presentationUpdate: CoveragePointRenderUpdate? = null
+        state.withCommittedRows(qualifier) { rows ->
+            // Selection scans the canonical source once and retains only
+            // bounded destination/source-slot identities in the selector.
+            presentationUpdate = presentationSelector.selectRows(
+                rows = rows,
+                requestedCapacity = CoveragePresentationMode.SEMANTIC_CENTROIDS.presentationCapacity,
+                forceReset = forceReset,
+                sourceUpdate = sourceUpdate,
+                enabled = config.enabled,
+            )
+            selected = true
+        }
+        if (!selected) {
+            publishPresentation(null, config)
+            return
+        }
+        val slots = IntArray(presentationSelector.selectedCount()) { index ->
+            presentationSelector.selectedSourceSlot(index)
+        }
+        val descriptor = state.presentationDescriptor(
+            expected = qualifier,
+            mode = CoveragePresentationMode.SEMANTIC_CENTROIDS,
+            enabled = config.enabled,
+            selectedSourceSlots = slots,
+            palette = CoverageRendererPalette.COVERAGE,
+            update = presentationUpdate ?: sourceUpdate,
+        )
+        activePresentation = descriptor
+        publishPresentation(descriptor, config)
+    }
+
+    @Synchronized
+    internal fun presentationDescriptor(): BoundedCoveragePresentation? = activePresentation
+
 
     private fun discardRebuild() {
         rebuildCut = null

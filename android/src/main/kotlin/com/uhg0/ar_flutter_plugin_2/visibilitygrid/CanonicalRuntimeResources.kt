@@ -387,6 +387,37 @@ internal class CanonicalRuntimeResources private constructor(
         }
     }
 
+    /**
+     * Borrows one qualifier-fenced canonical renderer page.  The callback is
+     * bounded to 512 rows and must not retain the page after it returns.
+     */
+    @Synchronized
+    internal fun withRendererPage(
+        expectedGeometryRevision: Long,
+        expectedLineageRevision: Long,
+        cursor: Long,
+        limit: Int = 512,
+        block: (CanonicalRendererPage) -> Unit,
+    ): Boolean {
+        if (limit !in 1..512 || closed) return false
+        val lease = current ?: return false
+        val expected = CanonicalRevisionPair(expectedGeometryRevision, expectedLineageRevision)
+        if (lease.scalarView.cut.let {
+                it.geometryRevision != expected.geometryRevision ||
+                    it.lineageRevision != expected.lineageRevision
+            } || !lease.isCurrent(owner?.activationState()?.cut)
+        ) {
+            invalidateCurrent()
+            return false
+        }
+        val page = runCatching { readRendererPage(cursor, limit) }.getOrNull() ?: return false
+        block(page)
+        val finalCut = lease.scalarView.cut
+        return current === lease && lease.isCurrent(owner?.activationState()?.cut) &&
+            finalCut.geometryRevision == expected.geometryRevision &&
+            finalCut.lineageRevision == expected.lineageRevision
+    }
+
     /** Test/diagnostic recovery projection in one cold verified scope. */
     internal fun readAllRendererKeys(): LongArray? {
         checkOpen()

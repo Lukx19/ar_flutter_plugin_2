@@ -74,13 +74,23 @@ internal class CoverageCubeMeshResources(
         onDestroyedUploadCallback = {
             telemetry?.recordFencedDestroyedUploadCallback()
         },
-        onUploadPageReleased = { onUploadPageReleased() },
+        onUploadPageReleased = {
+            descriptorPageInFlight = false
+            onUploadPageReleased()
+        },
     )
     private var indexStaging: java.nio.IntBuffer? = null
     private var outlineIndexStaging: java.nio.IntBuffer? = null
     private val allocationLedger = telemetry?.let(::CoverageRendererAllocationLedger)
     private var lastUploadQualifier: CoveragePointUploadQualifier? = null
     private var retainedSnapshotUploadRequired = true
+    private var pendingDescriptor: BoundedCoveragePresentation? = null
+    private var descriptorCursor = 0
+    private var descriptorReset = true
+    private var descriptorPageInFlight = false
+    private var currentNodeForDescriptor: Node? = null
+    private var currentMaterialForDescriptor: MaterialInstance? = null
+    private var currentPointSizeForDescriptor = 0f
     private var destroyed = false
     @Volatile private var onUploadPageReleased: () -> Unit = {}
 
@@ -165,6 +175,60 @@ internal class CoverageCubeMeshResources(
         node.isVisible = presentation.enabled && presentation.count > 0
     }
 
+    override fun updatePage(
+        node: Node,
+        page: CoveragePresentationPage,
+        materialInstance: MaterialInstance,
+        pointSizePx: Float,
+        reset: Boolean,
+    ) {
+        uploadCoordinator.submitPage(
+            page,
+            RendererUploadPageOrigin.RESOURCE_GENERATION_RESET.takeIf { reset }
+                ?: RendererUploadPageOrigin.ORDINARY,
+        )
+        descriptorPageInFlight = true
+        setDrawCount(node, page.totalCount)
+        materialInstance.setParameter("pointSize", pointSizePx)
+        node.isVisible = page.totalCount > 0
+    }
+
+    internal fun updateDescriptor(
+        node: Node,
+        descriptor: BoundedCoveragePresentation,
+        materialInstance: MaterialInstance,
+        pointSizePx: Float,
+    ) {
+        currentNodeForDescriptor = node
+        currentMaterialForDescriptor = materialInstance
+        currentPointSizeForDescriptor = pointSizePx
+        pendingDescriptor = descriptor
+        descriptorCursor = 0
+        descriptorReset = true
+        descriptorPageInFlight = false
+        setDrawCount(node, descriptor.count)
+        materialInstance.setParameter("pointSize", pointSizePx)
+        node.isVisible = descriptor.enabled && descriptor.count > 0
+    }
+
+    private fun queueNextDescriptorPage() {
+        val descriptor = pendingDescriptor ?: return
+        if (descriptorCursor >= descriptor.count) return
+        val start = descriptorCursor
+        if (!descriptor.withPage(descriptor.qualifier, start, 512) { page ->
+                updatePage(
+                    node = checkNotNull(currentNodeForDescriptor),
+                    page = page,
+                    materialInstance = checkNotNull(currentMaterialForDescriptor),
+                    pointSizePx = currentPointSizeForDescriptor,
+                    reset = descriptorReset,
+                )
+                descriptorCursor += page.count
+                descriptorReset = false
+            }
+        ) pendingDescriptor = null
+    }
+
     override fun hide(node: Node) {
         setDrawCount(node, 0)
         node.isVisible = false
@@ -174,7 +238,10 @@ internal class CoverageCubeMeshResources(
         retainedSnapshotUploadRequired = true
     }
 
-    override fun onRendererFrame() = uploadCoordinator.onRendererFrame()
+    override fun onRendererFrame() {
+        uploadCoordinator.onRendererFrame()
+        if (!descriptorPageInFlight) queueNextDescriptorPage()
+    }
 
     override fun setOnUploadPageReleased(listener: () -> Unit) {
         onUploadPageReleased = listener
@@ -209,6 +276,10 @@ internal class CoverageCubeMeshResources(
         uploadCoordinator.destroy()
         indexStaging = null
         outlineIndexStaging = null
+        pendingDescriptor = null
+        descriptorPageInFlight = false
+        currentNodeForDescriptor = null
+        currentMaterialForDescriptor = null
         allocationLedger?.releaseCubeResources(telemetryOwner)
         engine.destroyVertexBuffer(vertexBuffer)
         engine.destroyIndexBuffer(indexBuffer)
@@ -304,14 +375,20 @@ internal class CoverageCubeMeshResources(
             val snapshot: CoveragePointRenderSnapshot,
             val origin: RendererUploadPageOrigin,
         )
+        private data class PendingPage(
+            val page: CoveragePresentationPage,
+            val origin: RendererUploadPageOrigin,
+        )
 
         private val pendingUploads = ArrayDeque<PendingUpload>()
+        private val pendingPages = ArrayDeque<PendingPage>()
         private var uploadBusy = false
         private var consumedCallbackMask = 0
         private var activeUploadId = 0L
         private var destroyed = false
         private var activeUploadStartedNanos = 0L
         private var activeSnapshot: CoveragePointRenderSnapshot? = null
+        private var activePage: CoveragePresentationPage? = null
         private var activeOrigin = RendererUploadPageOrigin.ORDINARY
         private val pendingRanges = ArrayDeque<UploadRange>()
         // A completed reset establishes the mesh baseline. Afterwards a
@@ -320,6 +397,14 @@ internal class CoverageCubeMeshResources(
         private var activeFullUpload = false
         fun submit(snapshot: CoveragePointRenderSnapshot) {
             enqueue(snapshot, RendererUploadPageOrigin.ORDINARY)
+        }
+
+        fun submitPage(page: CoveragePresentationPage, origin: RendererUploadPageOrigin) {
+            if (destroyed) return
+            pendingPages.clear()
+            pendingUploads.clear()
+            if (uploadBusy) pendingRanges.clear()
+            pendingPages.addLast(PendingPage(page, origin))
         }
 
         private fun enqueue(
@@ -358,7 +443,9 @@ internal class CoverageCubeMeshResources(
         fun destroy() {
             destroyed = true
             pendingUploads.clear()
+            pendingPages.clear()
             activeSnapshot = null
+            activePage = null
             pendingRanges.clear()
             activeFullUpload = false
         }
@@ -370,26 +457,39 @@ internal class CoverageCubeMeshResources(
         private fun drain() {
             if (destroyed || uploadBusy) return
             if (pendingRanges.isEmpty()) {
-                val pending = pendingUploads.removeFirstOrNull() ?: return
-                val snapshot = pending.snapshot
-                val update = snapshot.update
-                val fullUpload = !hasUploadedSnapshot || update == null || update.reset
-                val spans = update?.spans.orEmpty()
-                if (!fullUpload && spans.isEmpty()) return
-                activeSnapshot = snapshot
-                activeFullUpload = fullUpload
-                activeOrigin = pending.origin
-                pendingRanges.addAll(
-                    uploadRanges(
-                        count = snapshot.count,
-                        fullUpload = fullUpload,
-                        spans = spans,
-                    ),
-                )
+                val pendingPage = pendingPages.removeFirstOrNull()
+                if (pendingPage != null) {
+                    activePage = pendingPage.page
+                    activeOrigin = pendingPage.origin
+                    pendingRanges.addLast(
+                        UploadRange(
+                            pendingPage.page.startSlot,
+                            pendingPage.page.startSlot + pendingPage.page.count,
+                        ),
+                    )
+                } else {
+                    val pending = pendingUploads.removeFirstOrNull() ?: return
+                    val snapshot = pending.snapshot
+                    val update = snapshot.update
+                    val fullUpload = !hasUploadedSnapshot || update == null || update.reset
+                    val spans = update?.spans.orEmpty()
+                    if (!fullUpload && spans.isEmpty()) return
+                    activeSnapshot = snapshot
+                    activeFullUpload = fullUpload
+                    activeOrigin = pending.origin
+                    pendingRanges.addAll(
+                        uploadRanges(
+                            count = snapshot.count,
+                            fullUpload = fullUpload,
+                            spans = spans,
+                        ),
+                    )
+                }
             }
-            val snapshot = checkNotNull(activeSnapshot)
             val range = pendingRanges.removeFirstOrNull() ?: return
-            writeRange(snapshot, range.startSlot, range.endSlotExclusive)
+            activePage?.let { page ->
+                writePage(page, page.startSlot)
+            } ?: writeRange(checkNotNull(activeSnapshot), range.startSlot, range.endSlotExclusive)
             uploadBusy = true
             consumedCallbackMask = 0
             activeUploadStartedNanos = clockNanos()
@@ -481,6 +581,46 @@ internal class CoverageCubeMeshResources(
             colorBuffer.limit(lastColor)
         }
 
+        private fun writePage(page: CoveragePresentationPage, destinationStartSlot: Int) {
+            val destinationEndSlot = destinationStartSlot + page.count
+            val firstPosition = destinationStartSlot * VERTICES_PER_VOXEL * POSITION_COMPONENTS
+            val lastPosition = destinationEndSlot * VERTICES_PER_VOXEL * POSITION_COMPONENTS
+            val positionTarget = positionBuffer.duplicate()
+            positionTarget.clear()
+            positionTarget.position(firstPosition)
+            val firstColor = destinationStartSlot * VERTICES_PER_VOXEL * COLOR_COMPONENTS
+            val lastColor = destinationEndSlot * VERTICES_PER_VOXEL * COLOR_COMPONENTS
+            val colorTarget = colorBuffer.duplicate()
+            colorTarget.clear()
+            colorTarget.position(firstColor)
+            repeat(page.count) { localVoxel ->
+                val sourceOffset = localVoxel * POSITION_COMPONENTS
+                val x = page.positions[sourceOffset]
+                val y = page.positions[sourceOffset + 1]
+                val z = page.positions[sourceOffset + 2]
+                val color = page.colors[localVoxel]
+                repeat(VERTICES_PER_VOXEL) { corner ->
+                    val cornerOffset = corner * POSITION_COMPONENTS
+                    val localX = CUBE_CORNERS[cornerOffset] * halfSize
+                    val localY = CUBE_CORNERS[cornerOffset + 1] * halfSize
+                    val localZ = CUBE_CORNERS[cornerOffset + 2] * halfSize
+                    positionTarget.put(x + localX)
+                    positionTarget.put(y + localY)
+                    positionTarget.put(z + localZ)
+                    colorTarget.put((color shr 16 and 0xFF).toByte())
+                    colorTarget.put((color shr 8 and 0xFF).toByte())
+                    colorTarget.put((color and 0xFF).toByte())
+                    colorTarget.put((color ushr 24 and 0xFF).toByte())
+                }
+            }
+            positionBuffer.clear()
+            positionBuffer.position(firstPosition)
+            positionBuffer.limit(lastPosition)
+            colorBuffer.clear()
+            colorBuffer.position(firstColor)
+            colorBuffer.limit(lastColor)
+        }
+
         private fun consumed(uploadId: Long, callbackBit: Int) {
             if (destroyed) {
                 onDestroyedUploadCallback()
@@ -499,6 +639,7 @@ internal class CoverageCubeMeshResources(
                 if (pendingRanges.isEmpty()) {
                     if (activeFullUpload) hasUploadedSnapshot = true
                     activeSnapshot = null
+                    activePage = null
                 }
                 onUploadPageReleased()
                 // A completed callback only releases the page. The next page

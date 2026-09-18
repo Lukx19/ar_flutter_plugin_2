@@ -47,6 +47,35 @@ class VisibilityGridIntegrationTest {
     }
 
     @Test
+    fun `production projection publishes bounded descriptor pages without a snapshot`() {
+        val descriptors = mutableListOf<com.uhg0.ar_flutter_plugin_2.sceneview.BoundedCoveragePresentation>()
+        val rendered = mutableListOf<com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot>()
+        val projection = NativeRendererProjection(
+            render = { snapshot, _ -> snapshot?.let(rendered::add) },
+            publishPresentation = { descriptor, _ -> descriptor?.let(descriptors::add) },
+        )
+        val ownership = rendererOwnership()
+        val rebuild = rebuildCut(ownership, 4, 1)
+        projection.beginRebuild(rebuild)
+        projection.appendRebuildPage(
+            rebuild.withUpserts((1L..513L).map { id -> row(id, id.toInt()) }),
+        )
+        projection.finishRebuild(rebuild)
+
+        val descriptor = checkNotNull(descriptors.single())
+        assertTrue(rendered.isEmpty())
+        assertEquals(513, descriptor.count)
+        assertTrue(descriptor.withPage(descriptor.qualifier, 0, 512) { page ->
+            assertEquals(512, page.count)
+            assertEquals(513, page.totalCount)
+        })
+        assertTrue(descriptor.withPage(descriptor.qualifier, 512, 512) { page ->
+            assertEquals(1, page.count)
+        })
+        projection.close()
+    }
+
+    @Test
     fun `moving a stable surface onto an occupied voxel retains both identities`() {
         val projection = NativeRendererProjection(render = { _, _ -> })
         val ownership = rendererOwnership()

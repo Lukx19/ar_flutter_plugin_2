@@ -9,6 +9,7 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageCommittedRow
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageCommittedRows
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridRendererState
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.QUALIFIED_RENDERER_STYLE_CUT_MAX_ROWS
 
 /** Chapter 17 fixed presentation maxima; semantic-grid capacity is separate. */
 internal object CoverageRendererLimits {
@@ -28,6 +29,8 @@ internal object CoverageRendererLimits {
     /** Maximum instantaneous ownership while two generations coexist. */
     const val INSTANTANEOUS_TRANSITION_LIMIT_BYTES =
         ACTIVE_RENDERER_OWNED_LIMIT_BYTES + TRANSITION_RESERVE_BYTES
+    /** Maximum one-page descriptor/upload staging retained by a mesh. */
+    const val PAGE_STAGING_BYTES = 64 * 1024
 
     const val AUXILIARY_ROW_BYTES = 16
     const val AUXILIARY_BYTES =
@@ -57,9 +60,13 @@ internal object CoverageRendererLimits {
      * capacity. Presentation modes retain only compact selected slots.
      */
     fun rendererStateBytes(mode: VoxelRenderMode): Int =
-        // The projection's canonical state is one physical 20k-row owner,
-        // including its identity, selection, and dirty primitive indexes.
-        VisibilityGridRendererState.ownedStorageBytes(CENTROID_CAPACITY)
+        // The projection's canonical table retains the negotiated 100k
+        // identity/key/style rows but borrows world positions into pages.
+        VisibilityGridRendererState.ownedStorageBytes(
+            QUALIFIED_RENDERER_STYLE_CUT_MAX_ROWS,
+            retainWorldPositions = false,
+            retainCanonicalNormalMetadata = false,
+        )
 
     fun presentationStorageBytes(mode: VoxelRenderMode): Int =
         CoveragePresentationStorage.estimatedOwnedStorageBytes(presentationCapacity(mode))
@@ -85,6 +92,7 @@ internal object CoverageRendererLimits {
             // selected presentation arrays; sourceCapacity is an upstream
             // admission fact, not a source-sized renderer allocation.
             (selectorStorageBytes ?: presentationStorageBytes(mode)) +
+            PAGE_STAGING_BYTES +
             // Auxiliary glyph/proxy arrays are allocated only by the mode
             // that needs them and are not part of the centroid baseline.
             0
@@ -167,6 +175,7 @@ internal class CoverageRendererAllocationLedger(
             telemetry.removeOwner(RENDERER_STATE_OWNER)
             telemetry.removeOwner(AUXILIARY_OWNER)
             telemetry.removeOwner(PRESENTATION_STORAGE_OWNER)
+            telemetry.removeOwner(PAGE_STAGING_OWNER)
             return
         }
         installPersistentCoverageStateForCapacity(
@@ -208,6 +217,7 @@ internal class CoverageRendererAllocationLedger(
             RENDERER_STATE_OWNER,
             rendererStateBytes,
         )
+        telemetry.setOwnedBufferBytes(PAGE_STAGING_OWNER, CoverageRendererLimits.PAGE_STAGING_BYTES)
         // Auxiliary arrays are lazy. A mode-specific auxiliary owner is
         // charged only by the concrete proxy/glyph resource when requested.
         telemetry.removeOwner(AUXILIARY_OWNER)
@@ -252,6 +262,7 @@ internal class CoverageRendererAllocationLedger(
         telemetry.removeOwner(RENDERER_STATE_OWNER)
         telemetry.removeOwner(AUXILIARY_OWNER)
         telemetry.removeOwner(PRESENTATION_STORAGE_OWNER)
+        telemetry.removeOwner(PAGE_STAGING_OWNER)
         telemetry.removeOwner(SNAPSHOT_HANDOFF_OWNER)
     }
 
@@ -312,6 +323,7 @@ internal class CoverageRendererAllocationLedger(
         const val RENDERER_STATE_OWNER = "coverage-renderer-state"
         const val AUXILIARY_OWNER = "coverage-auxiliary-state"
         const val PRESENTATION_STORAGE_OWNER = "coverage-presentation-storage"
+        const val PAGE_STAGING_OWNER = "coverage-page-staging"
         const val SNAPSHOT_HANDOFF_OWNER = "coverage-snapshot-handoff"
     }
 }
@@ -467,8 +479,8 @@ internal class CoveragePresentationSelector(
 
     /**
      * Selects a bounded presentation directly from a synchronous canonical
-     * row borrow. The source view is valid only for this call, so all output
-     * buffers are presentation-sized copies and all dirty spans are ranges.
+     * row borrow. The source view is valid only for this call. Production
+     * projection callers use [selectRows] so no render snapshot is created.
      */
     fun select(
         rows: CoverageCommittedRows,
@@ -477,6 +489,22 @@ internal class CoveragePresentationSelector(
         sourceUpdate: CoveragePointRenderUpdate? = rows.update,
         enabled: Boolean = true,
     ): CoveragePointRenderSnapshot {
+        val update = selectRows(rows, requestedCapacity, forceReset, sourceUpdate, enabled)
+        return streamPresentation(rows, enabled, update.reset, update.spans)
+    }
+
+    /**
+     * Production-only selection seam. It updates the bounded selected-slot
+     * table and returns range metadata; canonical geometry and style values
+     * stay behind the borrow callback and are not materialised as a snapshot.
+     */
+    fun selectRows(
+        rows: CoverageCommittedRows,
+        requestedCapacity: Int = maximumCapacity,
+        forceReset: Boolean = false,
+        sourceUpdate: CoveragePointRenderUpdate? = rows.update,
+        enabled: Boolean = true,
+    ): CoveragePointRenderUpdate {
         require(requestedCapacity in 1..maximumCapacity)
         require(rows.count in 0..rows.capacity)
         if (storage.sourceCapacity > 0) storage.dropSourceTracking()
@@ -508,7 +536,14 @@ internal class CoveragePresentationSelector(
             val membership = storage.drainDirty(selectedCount)
             mergeSpans(incremental, dirtySpans(membership))
         }
-        return streamPresentation(rows, enabled, mustReset, spans)
+        return CoveragePointRenderUpdate(
+            geometryRevision = sourceUpdate?.geometryRevision ?: rows.qualifier.geometryRevision,
+            visibilityRevision = sourceUpdate?.visibilityRevision ?: rows.qualifier.geometryRevision,
+            enabled = enabled,
+            count = selectedCount,
+            spans = spans,
+            reset = mustReset,
+        )
     }
 
     /** Drops retained source-to-presentation state before a new resource cut. */

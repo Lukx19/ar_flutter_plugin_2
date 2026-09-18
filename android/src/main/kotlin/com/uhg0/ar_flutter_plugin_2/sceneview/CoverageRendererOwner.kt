@@ -7,6 +7,7 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererGlyph
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate
+import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
 import com.uhg0.ar_flutter_plugin_2.pointcloud.rangeOnly
 import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
 import com.uhg0.ar_flutter_plugin_2.pointcloud.deepCopyWithoutSpanValues
@@ -399,6 +400,7 @@ internal interface CoverageRendererOwner {
 internal class NativeCoverageRendererOwner(
     private val onControlsChanged: (CoverageRendererControls) -> Boolean = { true },
     private val onPresentationChanged: (CoveragePointRenderSnapshot?, CoveragePresentationMode, CoverageResourceToken?) -> Unit = { _, _, _ -> },
+    private val onPresentationDescriptorChanged: (BoundedCoveragePresentation?, CoveragePresentationMode, CoverageResourceToken?) -> Unit = { _, _, _ -> },
     private val onResourceLifecycleChanged: (CoverageResourceToken, Boolean) -> Unit = { _, _ -> },
     private val worldToScreen: CoverageWorldToScreenProjection =
         CoverageWorldToScreenProjection { x, y, _ -> CoverageScreenPoint(x, y, 1f) },
@@ -423,6 +425,7 @@ internal class NativeCoverageRendererOwner(
     private var paletteRevision = 0L
     private var lastAcceptedQualifier: InstallQualifier? = null
     private var presentationPlan: CoveragePresentationPlan? = null
+    private var latestPresentationDescriptor: PresentationDescriptor? = null
     private val presentationSelector =
         CoveragePresentationSelector(CoverageRendererLimits.CENTROID_CAPACITY)
     private var selectorEpoch: SelectorEpoch? = null
@@ -562,6 +565,7 @@ internal class NativeCoverageRendererOwner(
         }
         val replayed = priorQualifier == qualifier
         latest = snapshot.toCutMetadata()
+        latestPresentationDescriptor = null
         lastAcceptedQualifier = qualifier
         val source = snapshot.renderSnapshot
         // A host snapshot may intentionally omit its source buffers because
@@ -584,6 +588,81 @@ internal class NativeCoverageRendererOwner(
             rendererGeneration = snapshot.rendererGeneration,
             geometryRevision = snapshot.geometryRevision,
             styleRevision = snapshot.styleRevision,
+            replayed = replayed,
+        )
+    }
+
+    /** Installs projection metadata without taking a source-sized snapshot. */
+    @Synchronized
+    fun installPresentation(
+        descriptor: BoundedCoveragePresentation,
+        config: PointCloudNativeConfig,
+    ): RendererInstallReceipt {
+        if (disposed) {
+            return RendererInstallReceipt(
+                installed = false,
+                rendererUnavailable = true,
+                rowCount = 0,
+                bindingGeneration = descriptor.qualifier.bindingGeneration,
+                groupGeneration = descriptor.qualifier.groupGeneration,
+                rendererGeneration = config.rendererGeneration,
+                geometryRevision = descriptor.qualifier.geometryRevision,
+                styleRevision = descriptor.qualifier.styleRevision,
+            )
+        }
+        val qualifier = InstallQualifier(
+            descriptor.qualifier.bindingGeneration,
+            descriptor.qualifier.groupGeneration,
+            config.rendererGeneration,
+            descriptor.qualifier.transactionId,
+            descriptor.qualifier.geometryRevision,
+            descriptor.qualifier.styleRevision,
+        )
+        val priorQualifier = lastAcceptedQualifier
+        if (priorQualifier != null && qualifier < priorQualifier) {
+            val current = latest
+            return RendererInstallReceipt(
+                installed = false,
+                rendererUnavailable = unavailable,
+                rowCount = latestPresentationDescriptor?.count ?: 0,
+                bindingGeneration = current?.bindingGeneration ?: descriptor.qualifier.bindingGeneration,
+                groupGeneration = current?.groupGeneration ?: descriptor.qualifier.groupGeneration,
+                rendererGeneration = current?.rendererGeneration ?: config.rendererGeneration,
+                geometryRevision = current?.geometryRevision ?: descriptor.qualifier.geometryRevision,
+                styleRevision = current?.styleRevision ?: descriptor.qualifier.styleRevision,
+                stale = true,
+            )
+        }
+        val replayed = priorQualifier == qualifier
+        val presentation = descriptor
+            .forMode(controls.mode, enabled = controls.visible)
+            .recolor(controls.palette, paletteRevision, fullRange = false)
+        latest = CoverageRendererCutMetadata(
+            bindingGeneration = descriptor.qualifier.bindingGeneration,
+            groupGeneration = descriptor.qualifier.groupGeneration,
+            rendererGeneration = config.rendererGeneration,
+            transactionId = descriptor.qualifier.transactionId,
+            geometryRevision = descriptor.qualifier.geometryRevision,
+            styleRevision = descriptor.qualifier.styleRevision,
+            rowCount = descriptor.sourceCount,
+            sourceCapacity = descriptor.sourceCapacity,
+            sourceCount = descriptor.sourceCount,
+            targetSurfaceId = descriptor.targetSurfaceId,
+            targetDirectionIndex = descriptor.targetDirectionIndex,
+            update = descriptor.update,
+        )
+        lastAcceptedQualifier = qualifier
+        latestPresentationDescriptor = presentation
+        presentationPlan = null
+        return RendererInstallReceipt(
+            installed = !unavailable && resourceMounted,
+            rendererUnavailable = unavailable,
+            rowCount = presentation.count,
+            bindingGeneration = descriptor.qualifier.bindingGeneration,
+            groupGeneration = descriptor.qualifier.groupGeneration,
+            rendererGeneration = config.rendererGeneration,
+            geometryRevision = descriptor.qualifier.geometryRevision,
+            styleRevision = descriptor.qualifier.styleRevision,
             replayed = replayed,
         )
     }
@@ -707,7 +786,42 @@ internal class NativeCoverageRendererOwner(
             val current = best
             if (current == null || compareHitCandidates(candidate, current) < 0) best = candidate
         }
+        val descriptor = latestPresentationDescriptor
+        if (descriptor != null) {
+            var start = 0
+            var accepted = true
+            while (start < descriptor.count) {
+                val pageStart = start
+                accepted = descriptor.withPage(snapshot.qualifier(), pageStart, 512) { page ->
+                    repeat(page.count) { index ->
+                        val style = CoverageRendererStyleRowV1.decode(
+                            page.styleRows,
+                            index * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                        )
+                        val position = index * 3
+                        consider(
+                            VisibilityRendererRow(
+                                surfaceId = page.surfaceIds[index],
+                                x = page.positions[position],
+                                y = page.positions[position + 1],
+                                z = page.positions[position + 2],
+                                semanticLabel = style.semantic,
+                                coverageLabel = style.coverage,
+                                targetDirectionIndex = style.directionBin.takeUnless {
+                                    it == COVERAGE_RENDERER_NO_DIRECTION
+                                },
+                                style = style,
+                            ),
+                        )
+                    }
+                }
+                if (!accepted) break
+                start += minOf(512, descriptor.count - start)
+            }
+            if (!accepted) return CoverageHitReceipt.Miss
+        }
         val borrowed = borrower?.withCommittedRows(snapshot.qualifier()) { rows ->
+            if (descriptor != null) return@withCommittedRows
             repeat(presentationSelector.selectedCount()) { destination ->
                 val sourceSlot = presentationSelector.selectedSourceSlot(destination)
                 if (sourceSlot in 0 until rows.count) {
@@ -782,6 +896,7 @@ internal class NativeCoverageRendererOwner(
         recoveryPending = false
         latest = null
         presentationPlan = null
+        latestPresentationDescriptor = null
         resetPresentationSelector()
         resourceMounted = false
     }
@@ -928,6 +1043,7 @@ internal class NativeCoverageRendererOwner(
 
     @Synchronized
     fun presentationSnapshot(): CoveragePointRenderSnapshot? {
+        latestPresentationDescriptor?.let { return it.toLegacySnapshot() }
         if (borrower != null) {
             return borrowPresentationSnapshot(forceReset = false)
         }
@@ -963,9 +1079,13 @@ internal class NativeCoverageRendererOwner(
     @Synchronized
     fun presentationPlan(): CoveragePresentationPlan? = presentationPlan
 
+    @Synchronized
+    fun presentationDescriptor(): BoundedCoveragePresentation? = latestPresentationDescriptor
+
     /** Compact selected identity receipt; source values remain in canonical state. */
     @Synchronized
     fun selectedSurfaceIds(): LongArray {
+        latestPresentationDescriptor?.let { return it.selectedSurfaceIds }
         presentationPlan?.let { return it.surfaceIds.toLongArray() }
         return LongArray(presentationSelector.selectedCount()) { destination ->
             presentationSelector.selectedSurfaceId(destination)
@@ -981,6 +1101,7 @@ internal class NativeCoverageRendererOwner(
     fun clearLatest() {
         latest = null
         presentationPlan = null
+        latestPresentationDescriptor = null
         resetPresentationSelector()
         resourceToken = null
         lowMemoryPressure = false
@@ -991,18 +1112,28 @@ internal class NativeCoverageRendererOwner(
         val current = latest
         val plan = presentationPlan
         val selected = selectedRows()
+        val descriptor = latestPresentationDescriptor
+        val selectedCount = descriptor?.count ?: current?.let { selected.size } ?: 0
+        val descriptorGlyphCount = descriptor?.let { descriptorValue ->
+            (0 until descriptorValue.count).count { index ->
+                CoverageRendererStyleRowV1.decode(
+                    descriptorValue.styleRows,
+                    index * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                ).glyph != CoverageRendererGlyph.NONE
+            }
+        } ?: 0
         return CoverageRendererStatus(
             rendererUnavailable = unavailable,
             visible = controls.visible,
             mode = controls.mode,
             palette = controls.palette,
             rowCount = current?.rowCount ?: 0,
-            selectedRowCount = current?.let { selected.size } ?: 0,
+            selectedRowCount = selectedCount,
             rendererGeneration = current?.rendererGeneration ?: 0L,
             geometryRevision = current?.geometryRevision ?: 0L,
             styleRevision = current?.styleRevision ?: 0L,
-            residentRowCount = plan?.residentRowCount ?: selected.size,
-            residentGlyphCount = plan?.residentGlyphCount ?: selected.count {
+            residentRowCount = descriptor?.count ?: plan?.residentRowCount ?: selected.size,
+            residentGlyphCount = descriptor?.let { descriptorGlyphCount } ?: plan?.residentGlyphCount ?: selected.count {
                 it.style.glyph != CoverageRendererGlyph.NONE
             },
             resourceAvailable = resourceMounted,
@@ -1013,6 +1144,7 @@ internal class NativeCoverageRendererOwner(
     }
 
     private fun selectedRows(): List<VisibilityRendererRow> {
+        if (latestPresentationDescriptor != null) return emptyList()
         presentationPlan?.let { return it.rows }
         val current = latest
         if (current != null && borrower != null) {
@@ -1052,6 +1184,10 @@ internal class NativeCoverageRendererOwner(
 
     private fun notifyPresentationChanged() {
         if (unavailable || disposed) return
+        latestPresentationDescriptor?.let {
+            onPresentationDescriptorChanged(it, controls.mode, resourceToken)
+            return
+        }
         onPresentationChanged(presentationSnapshot(), controls.mode, resourceToken)
     }
 
@@ -1063,7 +1199,19 @@ internal class NativeCoverageRendererOwner(
     ) {
         val current = latest ?: run {
             presentationPlan = null
+            latestPresentationDescriptor = null
             resetPresentationSelector()
+            return
+        }
+        latestPresentationDescriptor?.let { descriptor ->
+            latestPresentationDescriptor = descriptor
+                .forMode(controls.mode, enabled = controls.visible)
+                .recolor(
+                    controls.palette,
+                    paletteRevision,
+                    fullRange = fullPaletteRecolor || explicitResync,
+                )
+            presentationPlan = null
             return
         }
         val epoch = SelectorEpoch(

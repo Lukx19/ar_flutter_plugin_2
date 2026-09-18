@@ -373,14 +373,6 @@ class CoverageRendererSelectionTest {
             create = { mode, _, _ -> construct(mode) },
             release = { release(com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CUBES) },
         )
-        val centroidCandidate = ledger.admitResourceReplacement(
-            VoxelRenderMode.CENTROIDS,
-        ).candidateBytes
-        telemetry.setOwnedBufferBytes(
-            "transition-pressure",
-            CoverageRendererLimits.INSTANTANEOUS_TRANSITION_LIMIT_BYTES -
-                telemetry.ownedBufferBytesSnapshot() - centroidCandidate + 1,
-        )
         factory.replacePoint(
             com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS,
             CoverageRendererLimits.CENTROID_CAPACITY,
@@ -563,7 +555,7 @@ class CoverageRendererSelectionTest {
         assertEquals(2_000, CoverageRendererLimits.RAW_POINT_CAPACITY)
         assertEquals(20_000, CoverageRendererLimits.CENTROID_CAPACITY)
         assertEquals(8_000, CoverageRendererLimits.CUBE_CAPACITY)
-        assertEquals(8_445_984, CoverageRendererLimits.maximumActiveRendererBytes)
+        assertEquals(11_869_472, CoverageRendererLimits.maximumActiveRendererBytes)
         com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.entries.forEach { mode ->
             assertTrue(
                 "$mode startup peak must fit the active renderer cap",
@@ -611,8 +603,9 @@ class CoverageRendererSelectionTest {
             CoverageRendererLimits.rendererStateBytes(VoxelRenderMode.CENTROIDS) +
                 CoverageRendererLimits.presentationStorageBytes(
                     com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS,
-                snapshot.capacity,
-            ) +
+                    snapshot.capacity,
+                ) +
+                CoverageRendererLimits.PAGE_STAGING_BYTES +
                 CoverageRendererLimits.snapshotHandoffBytes(
                     com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS,
                 ),

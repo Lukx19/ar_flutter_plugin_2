@@ -21,6 +21,29 @@ internal interface CoverageVoxelMeshResources {
         pointSizePx: Float,
     )
 
+    /** Consumes one descriptor page; implementations keep only one page staged. */
+    fun updatePage(
+        node: Node,
+        page: CoveragePresentationPage,
+        materialInstance: MaterialInstance,
+        pointSizePx: Float,
+        reset: Boolean,
+    ) {
+        require(page.startSlot + page.count <= capacity)
+        val snapshot = CoveragePointRenderSnapshot(
+            revision = page.startSlot.toLong(),
+            enabled = true,
+            capacity = capacity,
+            count = page.count,
+            keys = page.surfaceIds.copyOf(),
+            surfaceIds = page.surfaceIds.copyOf(),
+            positions = page.positions.copyOf(),
+            colors = page.colors.copyOf(),
+            styleRows = page.styleRows.copyOf(),
+        )
+        update(node, snapshot, materialInstance, pointSizePx)
+    }
+
     /** Removes this mesh from the next draw without destroying retained buffers. */
     fun hide(node: Node)
 

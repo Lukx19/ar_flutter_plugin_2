@@ -128,7 +128,10 @@ internal class ArView(
     )
     private lateinit var visibilityGridChannel: VisibilityGridMethodChannel
     private val visibilityRendererProjection =
-        NativeRendererProjection(sceneHost::updateCoverageRenderer)
+        NativeRendererProjection(
+            render = sceneHost::updateCoverageRenderer,
+            publishPresentation = sceneHost::updateCoveragePresentation,
+        )
     private val visibilityGridV2Binding = VisibilityGridV2Binding(
         messenger = messenger,
         viewId = id,

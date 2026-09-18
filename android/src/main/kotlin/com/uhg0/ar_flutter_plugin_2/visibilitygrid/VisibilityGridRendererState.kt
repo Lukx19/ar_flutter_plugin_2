@@ -13,6 +13,10 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageCommittedRows
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRowsQualifier
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import com.uhg0.ar_flutter_plugin_2.pointcloud.identityGridRotation
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette
+import com.uhg0.ar_flutter_plugin_2.sceneview.BoundedCoveragePresentation
+import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationMode
+import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationPage
 
 /** Minimal immutable geometry retained after a group config's keys are consumed. */
 internal class RendererGroupGeometry private constructor(
@@ -58,6 +62,10 @@ internal data class CanonicalRenderRow(
 class VisibilityGridRendererState(
     val capacity: Int,
     private val defaultColor: Int = 0xFFFF0000.toInt(),
+    /** Production projection keeps canonical geometry/style only and borrows positions. */
+    private val retainWorldPositions: Boolean = true,
+    /** Normals/lineage are already represented by the worker style table. */
+    private val retainCanonicalNormalMetadata: Boolean = true,
 ) {
     companion object {
         /** Chapter 17 coverage renderer maximum for clean centroid presentation rows. */
@@ -76,16 +84,34 @@ class VisibilityGridRendererState(
          * snapshot hand-off buffers, which have distinct owners in the native
          * renderer ledger.
          */
-        fun ownedStorageBytes(capacity: Int): Int {
+        fun ownedStorageBytes(
+            capacity: Int,
+            retainWorldPositions: Boolean = true,
+            retainCanonicalNormalMetadata: Boolean = true,
+        ): Int {
             require(capacity > 0)
             return capacity * (
                 Long.SIZE_BYTES * 2 +
-                    POSITION_COMPONENTS * Float.SIZE_BYTES +
-                    Int.SIZE_BYTES * 4 +
+                    (if (retainWorldPositions) POSITION_COMPONENTS * Float.SIZE_BYTES else 0) +
+                    Int.SIZE_BYTES * when {
+                        retainCanonicalNormalMetadata && retainWorldPositions -> 4
+                        retainCanonicalNormalMetadata -> 3
+                        else -> 0
+                    } +
                     COVERAGE_RENDERER_STYLE_ROW_BYTES
                 ) +
                 LongRowIndex.ownedStorageBytes(capacity) +
-                SelectedKeyMaxHeap.ownedStorageBytes(capacity) +
+                (if (retainCanonicalNormalMetadata || retainWorldPositions) {
+                    SelectedKeyMaxHeap.ownedStorageBytes(capacity)
+                } else {
+                    // Production projection performs top-k selection in its
+                    // bounded selector. It does not need a second 100k-key
+                    // heap merely to maintain state admission.
+                    0
+                }) +
+                // Dirty ranges may cover any canonical row, including rows
+                // outside the current top-k cut, so this queue remains
+                // source-sized even when geometry is borrowed.
                 DirtyRowQueue.ownedStorageBytes(capacity)
         }
 
@@ -98,14 +124,18 @@ class VisibilityGridRendererState(
 
     private val surfaceIds = LongArray(capacity)
     private val voxelKeys = LongArray(capacity)
-    private val packedNormals = IntArray(capacity)
-    private val normalConfidences = IntArray(capacity)
-    private val lineageCounts = IntArray(capacity)
-    private val positions = FloatArray(capacity * 3)
-    private val colors = IntArray(capacity)
+    private val packedNormals = if (retainCanonicalNormalMetadata) IntArray(capacity) else IntArray(0)
+    private val normalConfidences = if (retainCanonicalNormalMetadata) IntArray(capacity) else IntArray(0)
+    private val lineageCounts = if (retainCanonicalNormalMetadata) IntArray(capacity) else IntArray(0)
+    private val positions = if (retainWorldPositions) FloatArray(capacity * 3) else FloatArray(0)
+    private val colors = if (retainWorldPositions) IntArray(capacity) else IntArray(0)
     private val styleRows = ByteArray(capacity * COVERAGE_RENDERER_STYLE_ROW_BYTES)
     private val rowsByIdentity = LongRowIndex(capacity)
-    private val selectedIdentities = SelectedKeyMaxHeap(capacity)
+    private val selectedIdentities = if (retainCanonicalNormalMetadata || retainWorldPositions) {
+        SelectedKeyMaxHeap(capacity)
+    } else {
+        null
+    }
     private val dirtyRows = DirtyRowQueue(capacity)
     private var group: RendererGroupGeometry? = null
     private var count = 0
@@ -198,10 +228,10 @@ class VisibilityGridRendererState(
                 return CoverageCommittedRow(
                     surfaceId = surfaceIds[index],
                     key = voxelKeys[index],
-                    x = positions[position],
-                    y = positions[position + 1],
-                    z = positions[position + 2],
-                    color = colors[index],
+                    x = positionComponent(index, 0),
+                    y = positionComponent(index, 1),
+                    z = positionComponent(index, 2),
+                    color = colorAt(index),
                     style = CoverageRendererStyleRowV1.decode(styleRows, styleOffset),
                 )
             }
@@ -212,7 +242,7 @@ class VisibilityGridRendererState(
 
     /** Concrete primitive storage retained by this production state. */
     val ownedStorageBytes: Int
-        get() = ownedStorageBytes(capacity)
+        get() = ownedStorageBytes(capacity, retainWorldPositions, retainCanonicalNormalMetadata)
 
     internal val retainedGroupGeometryBytes: Long
         @Synchronized get() = group?.portableBytes ?: 0L
@@ -283,7 +313,7 @@ class VisibilityGridRendererState(
                 styleOffset + COVERAGE_RENDERER_STYLE_ROW_BYTES,
             )
             encoded.copyInto(styleRows, row * COVERAGE_RENDERER_STYLE_ROW_BYTES)
-            colors[row] = CoverageRendererStyleRowV1.decode(encoded).packedColor()
+            setColor(row, CoverageRendererStyleRowV1.decode(encoded).packedColor())
         }
         dirtyRows.addRange(count)
         resetUpload = true
@@ -341,8 +371,8 @@ class VisibilityGridRendererState(
                     if (key in rowsByIdentity) return@forEach
                     if (count < capacity) {
                         append(key, key)
-                    } else if (key < checkNotNull(selectedIdentities.largest(rowsByIdentity::containsKey))) {
-                        remove(checkNotNull(selectedIdentities.largest(rowsByIdentity::containsKey)))
+                    } else if (key < checkNotNull(largestSelectedIdentity())) {
+                        remove(checkNotNull(largestSelectedIdentity()))
                         append(key, key)
                     }
                 }
@@ -492,9 +522,9 @@ class VisibilityGridRendererState(
             val encoded = next.encode()
             val styleOffset = row * COVERAGE_RENDERER_STYLE_ROW_BYTES
             val color = next.packedColor()
-            if (!styleRows.regionMatches(styleOffset, encoded) || colors[row] != color) {
+            if (!styleRows.regionMatches(styleOffset, encoded) || colorAt(row) != color) {
                 encoded.copyInto(styleRows, styleOffset)
-                colors[row] = color
+                setColor(row, color)
                 dirtyRows.add(row)
             }
         }
@@ -657,10 +687,10 @@ class VisibilityGridRendererState(
                     val encoded = cleared.encode()
                     val styleOffset = previousTargetRow * COVERAGE_RENDERER_STYLE_ROW_BYTES
                     if (!styleRows.regionMatches(styleOffset, encoded) ||
-                        colors[previousTargetRow] != cleared.packedColor()
+                        colorAt(previousTargetRow) != cleared.packedColor()
                     ) {
                         encoded.copyInto(styleRows, styleOffset)
-                        colors[previousTargetRow] = cleared.packedColor()
+                        setColor(previousTargetRow, cleared.packedColor())
                         dirtyRows.add(previousTargetRow)
                         changedRows++
                     }
@@ -676,9 +706,9 @@ class VisibilityGridRendererState(
                 encodedOffset + COVERAGE_RENDERER_STYLE_ROW_BYTES,
             )
             val nextColor = rows[index].packedColor()
-            if (!styleRows.regionMatches(styleOffset, encoded) || colors[row] != nextColor) {
+            if (!styleRows.regionMatches(styleOffset, encoded) || colorAt(row) != nextColor) {
                 encoded.copyInto(styleRows, styleOffset)
-                colors[row] = nextColor
+                setColor(row, nextColor)
                 dirtyRows.add(row)
                 changedRows++
             }
@@ -725,20 +755,10 @@ class VisibilityGridRendererState(
     fun snapshot(): CoveragePointRenderSnapshot {
         ensureActive()
         val snapshotKeys = voxelKeys.copyOf(count)
+        check(retainWorldPositions) { "Full snapshots are a legacy adapter only" }
         val snapshotPositions = positions.copyOf(count * 3)
         val snapshotColors = colors.copyOf(count)
-        val spans = dirtySpans()
-        val update =
-            CoveragePointRenderUpdate(
-                geometryRevision = geometryRevision,
-                visibilityRevision = visibilityRevision,
-                enabled = enabled,
-                count = count,
-                spans = spans,
-                reset = resetUpload,
-            )
-        dirtyRows.clear()
-        resetUpload = false
+        val update = nextUpdate()
         return CoveragePointRenderSnapshot(
             revision = renderRevision,
             enabled = enabled,
@@ -756,6 +776,124 @@ class VisibilityGridRendererState(
             transactionId = installedTransactionId,
             geometryRevision = geometryRevision,
             styleRevision = styleRevision,
+        )
+    }
+
+    /** Drains only range metadata for descriptor publication. */
+    @Synchronized
+    private fun nextUpdate(): CoveragePointRenderUpdate {
+        val update = CoveragePointRenderUpdate(
+            geometryRevision = geometryRevision,
+            visibilityRevision = visibilityRevision,
+            enabled = enabled,
+            count = count,
+            spans = dirtySpans().map { it.rangeOnly() },
+            reset = resetUpload,
+        )
+        dirtyRows.clear()
+        resetUpload = false
+        return update
+    }
+
+    /** Drains the bounded range receipt without copying geometry/style values. */
+    @Synchronized
+    internal fun takePresentationUpdate(): CoveragePointRenderUpdate {
+        ensureActive()
+        return nextUpdate()
+    }
+
+    /**
+     * Publishes only bounded presentation metadata.  Geometry/color values
+     * stay in this qualifier-fenced state and are copied one <=512-row page
+     * at a time by the returned descriptor.
+     */
+    @Synchronized
+    internal fun presentationDescriptor(
+        expected: CoverageRowsQualifier,
+        mode: CoveragePresentationMode,
+        enabled: Boolean,
+        selectedSourceSlots: IntArray,
+        palette: CoverageRendererPalette = CoverageRendererPalette.COVERAGE,
+        paletteEpoch: Long = 0L,
+        update: CoveragePointRenderUpdate? = null,
+    ): BoundedCoveragePresentation? {
+        if (!withCommittedRows(expected) { }) return null
+        val boundedCount = minOf(selectedSourceSlots.size, mode.presentationCapacity)
+        val slots = selectedSourceSlots.copyOf(boundedCount)
+        if (slots.any { it !in 0 until count } || slots.toSet().size != slots.size) return null
+        val ids = LongArray(boundedCount)
+        val styles = ByteArray(boundedCount * COVERAGE_RENDERER_STYLE_ROW_BYTES)
+        repeat(boundedCount) { destination ->
+            val source = slots[destination]
+            ids[destination] = surfaceIds[source]
+            styleRows.copyInto(
+                styles,
+                destination * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                source * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                (source + 1) * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+            )
+            CoverageRendererStyleRowV1.decode(styles, destination * COVERAGE_RENDERER_STYLE_ROW_BYTES)
+                .copy(palette = palette).encode().copyInto(
+                    styles,
+                    destination * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                )
+        }
+        val pageReader: (CoverageRowsQualifier, Int, Int) -> CoveragePresentationPage? =
+            { pageExpected, start, maximum ->
+                var page: CoveragePresentationPage? = null
+                val accepted = withCommittedRows(pageExpected) { rows ->
+                    val pageCount = minOf(maximum, boundedCount - start)
+                    if (pageCount <= 0) return@withCommittedRows
+                    val pageIds = LongArray(pageCount)
+                    val pagePositions = FloatArray(pageCount * 3)
+                    val pageColors = IntArray(pageCount)
+                    val pageStyles = ByteArray(pageCount * COVERAGE_RENDERER_STYLE_ROW_BYTES)
+                    repeat(pageCount) { offset ->
+                        val destination = start + offset
+                        val source = slots[destination]
+                        val row = rows.rowAt(source)
+                        pageIds[offset] = row.surfaceId
+                        pagePositions[offset * 3] = row.x
+                        pagePositions[offset * 3 + 1] = row.y
+                        pagePositions[offset * 3 + 2] = row.z
+                        styles.copyInto(
+                            pageStyles,
+                            offset * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                            destination * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                            (destination + 1) * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                        )
+                        pageColors[offset] = CoverageRendererStyleRowV1.decode(
+                            pageStyles,
+                            offset * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                        ).packedColor()
+                    }
+                    page = CoveragePresentationPage(
+                        startSlot = start,
+                        totalCount = boundedCount,
+                        surfaceIds = pageIds,
+                        positions = pagePositions,
+                        colors = pageColors,
+                        styleRows = pageStyles,
+                    )
+                }
+                page.takeIf { accepted }
+            }
+        return BoundedCoveragePresentation.create(
+            qualifier = expected,
+            mode = mode,
+            enabled = enabled,
+            capacity = mode.presentationCapacity,
+            sourceCapacity = capacity,
+            sourceCount = count,
+            palette = palette,
+            paletteEpoch = paletteEpoch,
+            targetSurfaceId = targetSurfaceIdValue,
+            targetDirectionIndex = targetDirectionIndexValue,
+            selectedSurfaceIds = ids,
+            selectedSourceSlots = slots,
+            styleRows = styles,
+            update = update ?: nextUpdate(),
+            pageReader = pageReader,
         )
     }
 
@@ -803,15 +941,17 @@ class VisibilityGridRendererState(
         val row = count++
         surfaceIds[row] = identity
         voxelKeys[row] = voxelKey
-        packedNormals[row] = packedNormal
-        normalConfidences[row] = normalConfidence
-        lineageCounts[row] = lineageCount
+        if (retainCanonicalNormalMetadata) {
+            packedNormals[row] = packedNormal
+            normalConfidences[row] = normalConfidence
+            lineageCounts[row] = lineageCount
+        }
         val initialStyle = CoverageRendererStyleRowV1()
         initialStyle.encode().copyInto(styleRows, row * COVERAGE_RENDERER_STYLE_ROW_BYTES)
-        colors[row] = initialStyle.packedColor()
+        setColor(row, initialStyle.packedColor())
         writePosition(row, voxelKey)
         rowsByIdentity[identity] = row
-        selectedIdentities.add(identity, rowsByIdentity::containsKey)
+        selectedIdentities?.add(identity, rowsByIdentity::containsKey)
         dirtyRows.add(row)
     }
 
@@ -822,7 +962,7 @@ class VisibilityGridRendererState(
             append(identity, voxelKey)
             return
         }
-        val largest = selectedIdentities.largest(rowsByIdentity::containsKey) ?: return
+        val largest = largestSelectedIdentity() ?: return
         if (identity < largest) {
             remove(largest)
             append(identity, voxelKey)
@@ -845,7 +985,7 @@ class VisibilityGridRendererState(
             )
             return
         }
-        val largest = selectedIdentities.largest(rowsByIdentity::containsKey) ?: return
+        val largest = largestSelectedIdentity() ?: return
         if (row.surfaceId < largest) {
             remove(largest)
             append(
@@ -860,13 +1000,16 @@ class VisibilityGridRendererState(
 
     private fun updateGeometry(slot: Int, next: CanonicalRenderRow) {
         val changed = voxelKeys[slot] != next.voxelKey ||
-            packedNormals[slot] != next.packedNormal ||
-            normalConfidences[slot] != next.normalConfidence ||
-            lineageCounts[slot] != next.lineageCount
+            (retainCanonicalNormalMetadata &&
+                (packedNormals[slot] != next.packedNormal ||
+                    normalConfidences[slot] != next.normalConfidence ||
+                    lineageCounts[slot] != next.lineageCount))
         voxelKeys[slot] = next.voxelKey
-        packedNormals[slot] = next.packedNormal
-        normalConfidences[slot] = next.normalConfidence
-        lineageCounts[slot] = next.lineageCount
+        if (retainCanonicalNormalMetadata) {
+            packedNormals[slot] = next.packedNormal
+            normalConfidences[slot] = next.normalConfidence
+            lineageCounts[slot] = next.lineageCount
+        }
         if (changed) {
             if (targetSurfaceIdValue == surfaceIds[slot]) {
                 targetSurfaceIdValue = null
@@ -875,7 +1018,7 @@ class VisibilityGridRendererState(
             val clearedRow = CoverageRendererStyleRowV1()
             val cleared = clearedRow.encode()
             cleared.copyInto(styleRows, slot * COVERAGE_RENDERER_STYLE_ROW_BYTES)
-            colors[slot] = clearedRow.packedColor()
+            setColor(slot, clearedRow.packedColor())
             writePosition(slot, next.voxelKey)
             dirtyRows.add(slot)
         }
@@ -892,28 +1035,34 @@ class VisibilityGridRendererState(
             val movedIdentity = surfaceIds[last]
             surfaceIds[row] = movedIdentity
             voxelKeys[row] = voxelKeys[last]
-            packedNormals[row] = packedNormals[last]
-            normalConfidences[row] = normalConfidences[last]
-            lineageCounts[row] = lineageCounts[last]
-            colors[row] = colors[last]
+            if (retainCanonicalNormalMetadata) {
+                packedNormals[row] = packedNormals[last]
+                normalConfidences[row] = normalConfidences[last]
+                lineageCounts[row] = lineageCounts[last]
+            }
+            setColor(row, colorAt(last))
             styleRows.copyInto(
                 styleRows,
                 row * COVERAGE_RENDERER_STYLE_ROW_BYTES,
                 last * COVERAGE_RENDERER_STYLE_ROW_BYTES,
                 (last + 1) * COVERAGE_RENDERER_STYLE_ROW_BYTES,
             )
-            positions[last * 3].let { positions[row * 3] = it }
-            positions[last * 3 + 1].let { positions[row * 3 + 1] = it }
-            positions[last * 3 + 2].let { positions[row * 3 + 2] = it }
+            if (retainWorldPositions) {
+                positions[last * 3].let { positions[row * 3] = it }
+                positions[last * 3 + 1].let { positions[row * 3 + 1] = it }
+                positions[last * 3 + 2].let { positions[row * 3 + 2] = it }
+            }
             rowsByIdentity[movedIdentity] = row
             dirtyRows.add(row)
         }
         surfaceIds[last] = 0
         voxelKeys[last] = 0
-        packedNormals[last] = 0
-        normalConfidences[last] = 0
-        lineageCounts[last] = 0
-        colors[last] = 0
+        if (retainCanonicalNormalMetadata) {
+            packedNormals[last] = 0
+            normalConfidences[last] = 0
+            lineageCounts[last] = 0
+        }
+        setColor(last, 0)
         styleRows.fill(
             0,
             last * COVERAGE_RENDERER_STYLE_ROW_BYTES,
@@ -921,7 +1070,48 @@ class VisibilityGridRendererState(
         )
     }
 
+    private fun positionComponent(row: Int, component: Int): Float {
+        require(component in 0..2)
+        if (retainWorldPositions) return positions[row * 3 + component]
+        val active = checkNotNull(group)
+        val coordinates = unpackVisibilityGridKey(voxelKeys[row])
+        val half = active.voxelSizeMeters / 2.0
+        val x = coordinates[0] * active.voxelSizeMeters + half
+        val y = coordinates[1] * active.voxelSizeMeters + half
+        val z = coordinates[2] * active.voxelSizeMeters + half
+        val matrix = active.worldFromGroupGl
+        return when (component) {
+            0 -> (matrix[0] * x + matrix[4] * y + matrix[8] * z + matrix[12]).toFloat()
+            1 -> (matrix[1] * x + matrix[5] * y + matrix[9] * z + matrix[13]).toFloat()
+            else -> (matrix[2] * x + matrix[6] * y + matrix[10] * z + matrix[14]).toFloat()
+        }
+    }
+
+    private fun colorAt(row: Int): Int = if (retainWorldPositions) {
+        colors[row]
+    } else {
+        CoverageRendererStyleRowV1.decode(
+            styleRows,
+            row * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+        ).packedColor()
+    }
+
+    private fun setColor(row: Int, value: Int) {
+        if (retainWorldPositions) colors[row] = value
+    }
+
+    /** Returns the largest admitted identity without a production heap. */
+    private fun largestSelectedIdentity(): Long? {
+        val heap = selectedIdentities
+        if (heap != null) return heap.largest(rowsByIdentity::containsKey)
+        if (count == 0) return null
+        var largest = surfaceIds[0]
+        for (row in 1 until count) largest = maxOf(largest, surfaceIds[row])
+        return largest
+    }
+
     private fun writePosition(row: Int, key: Long) {
+        if (!retainWorldPositions) return
         val active = checkNotNull(group)
         val coordinates = unpackVisibilityGridKey(key)
         val half = active.voxelSizeMeters / 2.0
@@ -956,16 +1146,24 @@ class VisibilityGridRendererState(
             while (cursor < activeRows.size && activeRows[cursor] == end + 1) {
                 end = activeRows[cursor++]
             }
-            spans +=
+            spans += if (retainWorldPositions) {
                 CoveragePointSpan(
                     startSlot = start,
                     positions = positions.copyOfRange(start * 3, (end + 1) * 3),
-                    colors = colors.copyOfRange(start, end + 1),
+                    colors = IntArray(end - start + 1) { offset -> colorAt(start + offset) },
                     styleRows = styleRows.copyOfRange(
                         start * COVERAGE_RENDERER_STYLE_ROW_BYTES,
                         (end + 1) * COVERAGE_RENDERER_STYLE_ROW_BYTES,
                     ),
                 )
+            } else {
+                CoveragePointSpan(
+                    startSlot = start,
+                    positions = FloatArray(0),
+                    colors = IntArray(0),
+                    endSlotExclusive = end + 1,
+                )
+            }
         }
         return spans
     }
@@ -976,11 +1174,11 @@ class VisibilityGridRendererState(
         packedNormals.fill(0)
         normalConfidences.fill(0)
         lineageCounts.fill(0)
-        positions.fill(0f)
-        colors.fill(0)
+        if (retainWorldPositions) positions.fill(0f)
+        if (retainWorldPositions) colors.fill(0)
         styleRows.fill(0)
         rowsByIdentity.clear()
-        selectedIdentities.clear()
+        selectedIdentities?.clear()
         dirtyRows.clear()
         count = 0
     }
