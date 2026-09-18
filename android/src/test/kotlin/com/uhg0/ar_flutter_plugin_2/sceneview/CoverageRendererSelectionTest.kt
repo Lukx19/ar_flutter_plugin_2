@@ -653,6 +653,116 @@ class CoverageRendererSelectionTest {
     }
 
     @Test
+    fun `resource-only release retains semantic receipt and removes mesh and staging`() {
+        val telemetry = RendererTelemetry()
+        val ledger = CoverageRendererAllocationLedger(telemetry)
+
+        ledger.installPersistentCoverageState(VoxelRenderMode.CUBES)
+        ledger.installCubeResources("coverage-cubes-epoch-1", CoverageRendererLimits.CUBE_CAPACITY)
+
+        ledger.releaseRendererResources()
+
+        assertEquals(7_244_036, telemetry.snapshot().getValue("ownedBufferBytes"))
+        assertEquals(
+            5_403_936,
+            telemetry.snapshot().getValue("ownedBufferBytesByOwner").let { owners ->
+                @Suppress("UNCHECKED_CAST")
+                (owners as Map<String, Int>).getValue("coverage-renderer-state")
+            },
+        )
+        @Suppress("UNCHECKED_CAST")
+        val owners = telemetry.snapshot().getValue("ownedBufferBytesByOwner") as Map<String, Int>
+        assertTrue("coverage-page-staging" !in owners)
+        assertTrue(owners.keys.none { it.startsWith("coverage-cubes") })
+    }
+
+    @Test
+    fun `repeated resource release and remount are idempotent`() {
+        val telemetry = RendererTelemetry()
+        val ledger = CoverageRendererAllocationLedger(telemetry)
+
+        ledger.installPersistentCoverageState(VoxelRenderMode.CENTROIDS)
+        ledger.installPointResources("coverage-centroids-epoch-1", CoverageRendererLimits.CENTROID_CAPACITY)
+        ledger.releaseRendererResources()
+        ledger.releaseRendererResources()
+        assertEquals(7_244_036, telemetry.snapshot().getValue("ownedBufferBytes"))
+
+        ledger.installPersistentCoverageState(VoxelRenderMode.CENTROIDS)
+        assertEquals(7_309_572, telemetry.snapshot().getValue("ownedBufferBytes"))
+        ledger.releaseRendererResources()
+        assertEquals(7_244_036, telemetry.snapshot().getValue("ownedBufferBytes"))
+    }
+
+    @Test
+    fun `clear-first creation failure retains semantic receipt after resource release`() {
+        val telemetry = RendererTelemetry()
+        val ledger = CoverageRendererAllocationLedger(telemetry)
+        var admissions = 0
+        val factory = CoverageRendererResourceFactory(
+            admit = { _, _ ->
+                admissions++
+                if (admissions == 1) {
+                    CoverageRendererResourceAdmission(
+                        strategy = CoverageRendererTransitionStrategy.COEXIST,
+                        currentBytes = 0,
+                        candidateBytes = 0,
+                        combinedBytes = 0,
+                    )
+                } else {
+                    CoverageRendererResourceAdmission(
+                        strategy = CoverageRendererTransitionStrategy.CLEAR_FIRST,
+                        currentBytes = 1,
+                        candidateBytes = 1,
+                        combinedBytes = 2,
+                    )
+                }
+            },
+            onClearFirst = { ledger.releaseRendererResources() },
+            onCreationFailure = { ledger.releaseRendererResources() },
+        )
+        ledger.installPersistentCoverageState(VoxelRenderMode.CUBES)
+        factory.replaceCube(
+            CoverageRendererLimits.CUBE_CAPACITY,
+            "coverage-cubes",
+            token = CoverageResourceToken(1L, 1L, CoveragePresentationMode.SEMANTIC_CUBES),
+            create = { _, capacity, owner ->
+                ledger.installCubeResources(owner, capacity)
+                "mounted"
+            },
+            release = { value: String ->
+                ledger.releaseCubeResources("coverage-cubes-epoch-1")
+                check(value == "mounted")
+            },
+        )
+
+        val failed = factory.replacePoint(
+            VoxelRenderMode.CENTROIDS,
+            CoverageRendererLimits.CENTROID_CAPACITY,
+            "coverage-centroids",
+            token = CoverageResourceToken(2L, 2L, CoveragePresentationMode.SEMANTIC_CENTROIDS),
+            create = { _, _, _ -> error("synthetic allocation failure") },
+            release = { _: String -> error("must not release failed allocation") },
+        )
+
+        assertNull(failed)
+        assertEquals(7_244_036, telemetry.snapshot().getValue("ownedBufferBytes"))
+    }
+
+    @Test
+    fun `terminal clear after resource loss removes retained descriptor and mapping`() {
+        val telemetry = RendererTelemetry()
+        val ledger = CoverageRendererAllocationLedger(telemetry)
+        ledger.installPersistentCoverageState(VoxelRenderMode.CUBES)
+        ledger.installCubeResources("coverage-cubes-epoch-1", CoverageRendererLimits.CUBE_CAPACITY)
+
+        ledger.releaseRendererResources()
+        assertEquals(7_244_036, telemetry.snapshot().getValue("ownedBufferBytes"))
+        ledger.clearCoverageState()
+        ledger.clearCoverageState()
+        assertEquals(0, telemetry.snapshot().getValue("ownedBufferBytes"))
+    }
+
+    @Test
     fun `lazy ledger charges selector and handoff only after an actual snapshot exists`() {
         val telemetry = RendererTelemetry()
         val ledger = CoverageRendererAllocationLedger(telemetry)

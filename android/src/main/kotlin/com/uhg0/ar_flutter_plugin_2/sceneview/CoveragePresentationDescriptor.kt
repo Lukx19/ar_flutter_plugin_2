@@ -53,7 +53,7 @@ private class PresentationBacking(
     init {
         require(sourceCapacity >= sourceCount && sourceCount >= 0)
         require(surfaceIdTable.size == sourceSlotTable.size)
-        require(surfaceIdTable.size <= MAX_BACKING_ROWS)
+        require(surfaceIdTable.size <= CoverageRendererLimits.CENTROID_CAPACITY)
         require(styleTable.size == surfaceIdTable.size * COVERAGE_RENDERER_STYLE_ROW_BYTES)
         require(surfaceIdTable.toSet().size == surfaceIdTable.size)
         require(sourceSlotTable.all { it >= 0 && it < sourceCount })
@@ -133,8 +133,6 @@ private class PresentationBacking(
         PresentationDescriptor.estimatedBackingBytes(surfaceIdTable.size).toLong()
 
     private companion object {
-        const val MAX_BACKING_ROWS = 20_000
-
         fun recolorStyleRows(
             rows: ByteArray,
             count: Int,
@@ -168,7 +166,7 @@ internal class PresentationDescriptor private constructor(
     val update: CoveragePointRenderUpdate?,
 ) {
     init {
-        require(capacity in 0..20_000)
+        require(capacity in 0..CoverageRendererLimits.CENTROID_CAPACITY)
         require(count in 0..capacity)
         require(count <= backing.count)
         require(backing.qualifier == qualifier)
@@ -238,7 +236,7 @@ internal class PresentationDescriptor private constructor(
     companion object {
         /** Exact bytes of the immutable bounded backing, excluding borrowed pages. */
         internal fun estimatedBackingBytes(rowCapacity: Int): Int {
-            require(rowCapacity in 0..20_000)
+            require(rowCapacity in 0..CoverageRendererLimits.CENTROID_CAPACITY)
             return 96 +
                 rowCapacity * (
                     Long.SIZE_BYTES +

@@ -157,7 +157,7 @@ internal class SceneViewHost(
             transition.token?.let { coverageRendererOwner.markResourceFailure(it) }
                 ?: coverageRendererOwner.markResourceFailure(transition.rendererGeneration)
             coverageMeshRef.get()?.disposeForReplacement()
-            rendererAllocationLedger.clearCoverageState()
+            rendererAllocationLedger.releaseRendererResources()
         },
         onCreated = { transition ->
             val descriptor = coverageRendererOwner.presentationDescriptor()
@@ -176,7 +176,7 @@ internal class SceneViewHost(
             if (transition.admission.strategy == CoverageRendererTransitionStrategy.CLEAR_FIRST ||
                 !transition.hadActiveResource
             ) {
-                rendererAllocationLedger.clearCoverageState()
+                rendererAllocationLedger.releaseRendererResources()
                 transition.token?.let { coverageRendererOwner.markResourceFailure(it) }
                     ?: coverageRendererOwner.markResourceFailure(transition.rendererGeneration)
             } else {
@@ -761,7 +761,7 @@ internal class SceneViewHost(
                 coverageRendererOwner.currentResourceToken()?.let { coverageRendererOwner.markResourceFailure(it) }
                 coverageMeshRef.get()?.disposeForReplacement()
                 coverageResourceFactory.clear()
-                rendererAllocationLedger.clearCoverageState()
+                rendererAllocationLedger.releaseRendererResources()
             }
             coverageRenderConfig.value = effectiveConfig
             coverageRendererOwner.requestResourceReplacement()
@@ -844,7 +844,7 @@ internal class SceneViewHost(
                 }
                 coverageMeshRef.get()?.disposeForReplacement()
                 coverageResourceFactory.clear()
-                rendererAllocationLedger.clearCoverageState()
+                rendererAllocationLedger.releaseRendererResources()
             }
             coverageRenderConfig.value = effectiveConfig
             coverageRendererOwner.requestResourceReplacement()
@@ -882,7 +882,7 @@ internal class SceneViewHost(
                     }
                     coverageMeshRef.get()?.disposeForReplacement()
                     coverageResourceFactory.clear()
-                    rendererAllocationLedger.clearCoverageState()
+                    rendererAllocationLedger.releaseRendererResources()
                 }
             }
             coverageRenderConfig.value = current.copy(
@@ -936,7 +936,7 @@ internal class SceneViewHost(
             rendererPaused = true
             coverageMeshRef.get()?.disposeForReplacement()
             coverageResourceFactory.clear()
-            rendererAllocationLedger.clearCoverageState()
+            rendererAllocationLedger.releaseRendererResources()
             rendererTelemetry.clearResidentPresentation()
             activeSession?.pause()
         }
@@ -951,7 +951,7 @@ internal class SceneViewHost(
         if (disposed) return
         coverageResourceFactory.clear()
         coverageMeshRef.getAndSet(null)?.disposeForReplacement()
-        rendererAllocationLedger.clearCoverageState()
+        rendererAllocationLedger.releaseRendererResources()
         rendererTelemetry.clearResidentPresentation()
         coverageRendererOwner.markLowMemoryPressure()
     }
@@ -1061,7 +1061,10 @@ internal class SceneViewHost(
     fun dispose() {
         if (!ownership.onDispose()) return
         disposed = true
+        coverageMeshRef.getAndSet(null)?.disposeForReplacement()
+        coverageResourceFactory.clear()
         coverageRendererOwner.dispose()
+        rendererAllocationLedger.clearCoverageState()
         rendererTelemetry.clearResidentPresentation()
         futureResumesBlocked = true
         cancelCoverageUploadFrame()
@@ -1450,6 +1453,7 @@ internal class SceneViewHost(
                 if (wasCurrent) {
                     token?.let { coverageRendererOwner.markResourceFailure(it) }
                     token?.let { onCoverageRendererMounted(false, it.epoch) }
+                    rendererAllocationLedger.releaseRendererResources()
                 }
             }
         }

@@ -180,6 +180,7 @@ internal object CoverageRendererLimits {
 internal class CoverageRendererAllocationLedger(
     private val telemetry: RendererTelemetry,
 ) {
+    private val resourceOwners = linkedSetOf<String>()
     /**
      * Read-only admission for a fixed-capacity replacement.  The candidate
      * peak includes the shared state, hand-off and startup staging that the
@@ -230,14 +231,7 @@ internal class CoverageRendererAllocationLedger(
         selectorStorageBytes: Int? = null,
     ) {
         if (snapshot == null) {
-            telemetry.removeOwner(RENDERER_STATE_OWNER)
-            telemetry.removeOwner(AUXILIARY_OWNER)
-            telemetry.removeOwner(PRESENTATION_STORAGE_OWNER)
-            telemetry.removeOwner(MUTABLE_SELECTOR_OWNER)
-            telemetry.removeOwner(DESCRIPTOR_BACKING_OWNER)
-            telemetry.removeOwner(PAGE_READER_MAPPING_OWNER)
-            telemetry.removeOwner(PAGE_STAGING_OWNER)
-            telemetry.removeOwner(SNAPSHOT_HANDOFF_OWNER)
+            clearCoverageState()
             return
         }
         installPersistentCoverageStateForCapacity(
@@ -329,6 +323,7 @@ internal class CoverageRendererAllocationLedger(
     }
 
     fun clearCoverageState() {
+        releaseRendererResources()
         telemetry.removeOwner(RENDERER_STATE_OWNER)
         telemetry.removeOwner(AUXILIARY_OWNER)
         telemetry.removeOwner(PRESENTATION_STORAGE_OWNER)
@@ -339,7 +334,21 @@ internal class CoverageRendererAllocationLedger(
         telemetry.removeOwner(SNAPSHOT_HANDOFF_OWNER)
     }
 
+    /**
+     * Releases mesh generations and page staging while retaining the committed
+     * canonical projection and its immutable presentation backing.
+     * Repeated pressure/pause/failure callbacks are intentionally idempotent.
+     */
+    fun releaseRendererResources() {
+        telemetry.removeOwner(PAGE_STAGING_OWNER)
+        telemetry.removeOwner(SNAPSHOT_HANDOFF_OWNER)
+        resourceOwners.forEach(telemetry::removeOwner)
+        resourceOwners.clear()
+        telemetry.removeCoverageMeshOwners()
+    }
+
     fun installPointResources(owner: String, capacity: Int) {
+        resourceOwners += owner
         telemetry.setOwnedBufferBytes(
             owner,
             capacity * CoveragePointMeshResources.STEADY_OWNED_BYTES_PER_ROW,
@@ -357,9 +366,11 @@ internal class CoverageRendererAllocationLedger(
     fun releasePointResources(owner: String) {
         completePointStartup(owner)
         telemetry.removeOwner(owner)
+        resourceOwners.remove(owner)
     }
 
     fun installCubeResources(owner: String, capacity: Int) {
+        resourceOwners += owner
         telemetry.setOwnedBufferBytes(
             owner,
             capacity * CoverageCubeMeshResources.STEADY_OWNED_BYTES_PER_VOXEL,
@@ -386,6 +397,7 @@ internal class CoverageRendererAllocationLedger(
         completeCubeTriangleStartup(owner)
         completeCubeOutlineStartup(owner)
         telemetry.removeOwner(owner)
+        resourceOwners.remove(owner)
     }
 
     private fun pointStartupOwner(owner: String) = "$owner-startup-index"

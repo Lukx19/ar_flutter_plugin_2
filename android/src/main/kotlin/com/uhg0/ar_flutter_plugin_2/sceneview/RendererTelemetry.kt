@@ -161,6 +161,19 @@ internal class RendererTelemetry {
         allocationsByOwner.remove(owner)
     }
 
+    /** Removes only concrete mesh generations; semantic projection owners stay resident. */
+    @Synchronized
+    internal fun removeCoverageMeshOwners() {
+        allocationsByOwner.keys
+            .filter { owner ->
+                owner == "coverage-points" || owner.startsWith("coverage-points-") ||
+                    owner == "coverage-centroids" || owner.startsWith("coverage-centroids-") ||
+                    owner == "coverage-cubes" || owner.startsWith("coverage-cubes-")
+            }
+            .toList()
+            .forEach(allocationsByOwner::remove)
+    }
+
     fun beginRendererFrame() {
         currentFrameUploadBytes = 0
         rendererUpdateCount++
