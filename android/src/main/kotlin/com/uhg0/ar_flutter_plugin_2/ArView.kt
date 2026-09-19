@@ -254,29 +254,7 @@ internal class ArView(
     private fun visibilityPressureOwnerScalars(): VisibilityPressureOwnerScalars {
         val canonical = visibilityObservationMappingAdmission.pressureSnapshot()
         val scene = sceneHost.visibilityPressureSnapshot()
-        return VisibilityPressureOwnerScalars(
-            geometryRevision = canonical.geometryRevision,
-            lineageRevision = canonical.lineageRevision,
-            coverageRevision = canonical.coverageRevision,
-            styleRevision = canonical.styleRevision,
-            canonicalSurfaceHighWater = canonical.canonicalSurfaceHighWater,
-            associationHighWater = canonical.associationHighWater,
-            canonicalOwnedBytes = canonical.canonicalOwnedBytes,
-            rendererOwnedBytes = scene.renderer.rendererOwnedBytes,
-            maxUploadBytesPerFrame = scene.renderer.maxUploadBytesPerFrame,
-            selectionChurnPermille = scene.renderer.selectionChurnPermille,
-            workerMaxPendingTransactions = scene.pages.maxPendingTransactions,
-            workerCoalescedPresentations = scene.pages.coalesced,
-            buffersAcquired = scene.renderer.buffersAcquired,
-            buffersReleased = scene.renderer.buffersReleased,
-            callbacksAcquired = scene.renderer.callbacksAcquired,
-            callbacksReleased = scene.renderer.callbacksReleased,
-            pagesAcquired = scene.pages.pagesAcquired,
-            pagesReleased = scene.pages.pagesReleased,
-            rendererResourcesAcquired = scene.renderer.rendererResourcesAcquired,
-            rendererResourcesReleased = scene.renderer.rendererResourcesReleased,
-            terminalGuidanceStatus = canonical.terminalGuidanceStatus,
-        )
+        return VisibilityPressureOwnerScalars.fromNativeOwners(canonical, scene.renderer, scene.pages)
     }
 
     private fun visibilitySmallSceneReceiptScalars(): VisibilitySmallSceneReceiptScalars {

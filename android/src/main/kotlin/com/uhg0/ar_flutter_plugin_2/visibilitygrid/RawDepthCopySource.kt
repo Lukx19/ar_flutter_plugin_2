@@ -82,19 +82,13 @@ class RawDepthCopySource(
         } finally {
             try {
                 confidence?.let {
-                    try {
-                        it.close()
-                    } finally {
-                        onResourceClosed()
-                    }
+                    it.close()
+                    onResourceClosed()
                 }
             } finally {
                 depth?.let {
-                    try {
-                        it.close()
-                    } finally {
-                        onResourceClosed()
-                    }
+                    it.close()
+                    onResourceClosed()
                 }
             }
         }

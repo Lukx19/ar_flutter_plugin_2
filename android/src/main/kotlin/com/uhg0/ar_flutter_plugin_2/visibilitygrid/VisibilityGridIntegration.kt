@@ -356,18 +356,30 @@ internal class VisibilityGridIntegration(
     }
 
     private fun recordCanonicalPressureHighWater() {
-        val resources = kernel?.resourceReceipt() ?: return
+        val feature = kernel?.resourceReceipt() ?: return
         canonicalSurfaceHighWater = maxOf(
             canonicalSurfaceHighWater,
-            resources.surfaceCount.toLong(),
+            feature.surfaceCount.toLong(),
+            owner?.activationState()?.cut?.liveSurfaceCount?.toLong() ?: 0,
         )
         associationHighWater = maxOf(
             associationHighWater,
-            resources.associationCount.toLong(),
+            feature.associationCount.toLong(),
         )
+        // Count retained ownership, not just populated feature tuples. Depth
+        // evidence rows live inside fixed arrays, so their logical row bytes
+        // must not be charged a second time. The complete-current receipt
+        // already includes COW proofs/indexes and feature routing ownership.
+        val retainedCanonicalBytes = listOf(
+            feature.assignedTupleShareBytes.toLong(),
+            depthKernel?.resourceReceipt()?.fixedPrimitiveBytes?.toLong() ?: 0,
+            resources?.completeCurrentLeaseReceipt()?.retainedTotalBytes ?: 0,
+            resources?.retainedScalarMemoryReceipt()?.portableBytes ?: 0,
+            portableOwnerMemoryReceipt().portableBytes,
+        ).fold(0L, Math::addExact)
         canonicalOwnedBytesHighWater = maxOf(
             canonicalOwnedBytesHighWater,
-            resources.assignedTupleShareBytes.toLong(),
+            retainedCanonicalBytes,
         )
     }
 
@@ -1080,6 +1092,7 @@ internal class VisibilityGridIntegration(
     }
 
     private fun closeOwner() {
+        recordCanonicalPressureHighWater()
         discardPendingDepthCommit()
         retainedDelta.clear()
         pending = null

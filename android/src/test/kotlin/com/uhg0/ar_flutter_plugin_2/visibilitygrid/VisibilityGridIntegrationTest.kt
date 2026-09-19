@@ -31,6 +31,143 @@ import org.openjdk.jol.info.GraphLayout
 /** Locks Option A's BINDING-LIFECYCLE-ACK seeded CREATE cut without a Flutter payload seam. */
 class VisibilityGridIntegrationTest {
     @Test
+    fun `combined ingress bounds depth lookup and commits admitted canonical renderer cuts`() {
+        val directory = Files.createTempDirectory("canonical-surface-combined-pressure").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val viewId = 2148
+        val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+        val scheduler = PressureObservationScheduler()
+        var publishedPages = 0
+        var publishedRows = 0
+        val projection = NativeRendererProjection(
+            render = { snapshot, _ -> check(snapshot == null) {
+                "pressure path must use bounded presentation pages"
+            } },
+            publishPresentation = { descriptor, _ ->
+                if (descriptor != null) {
+                    var offset = 0
+                    while (offset < descriptor.count) {
+                        assertTrue(descriptor.withPage(descriptor.qualifier, offset, 512) { page ->
+                            assertTrue(page.count in 1..512)
+                            publishedPages++
+                            publishedRows += page.count
+                        })
+                        offset += 512
+                    }
+                }
+            },
+        )
+        val integration = VisibilityGridIntegration(
+            binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = resources(directory, coordinator),
+            renderer = projection,
+            depthKernelFactory = { DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 1)) },
+        )
+        val runtime = AndroidVisibilityGridRuntime(binding::currentObservationOwnership,
+            integration, scheduler, nanoTime = { scheduler.nowNs })
+        try {
+            val stream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            var sequence = 3L
+            var transaction = 1L
+            var geometry = 1L
+            var lineage = 1L
+            fun acknowledge() {
+                val staged = integration.integrationReceipt()
+                assertEquals("pendingAck", staged.status)
+                var ended = false
+                repeat(256) {
+                    if (!ended) {
+                        val packet = exchange(messenger, viewId, stream, ++sequence,
+                            transaction, geometry, lineage).first
+                        ended = packet.messageKind == 4
+                    }
+                }
+                assertTrue("bounded transaction reached END", ended)
+                transaction = staged.transactionId
+                geometry = staged.geometryRevision
+                lineage = staged.lineageRevision
+                assertEquals(0, exchange(messenger, viewId, stream, ++sequence,
+                    transaction, geometry, lineage).first.messageKind)
+                await { integration.integrationReceipt().status == "acknowledged" }
+            }
+            val cut = requireNotNull(binding.currentObservationOwnership())
+            runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            repeat(1) { cycle ->
+                val timestamp = scheduler.nowNs
+                val featureFrame = feature(cut, timestamp).frame
+                val featureSamples = List(V2_FEATURE_SAMPLE_CAPACITY) { index ->
+                    // Maximum producer samples with axis-aligned normals keeps
+                    // CI focused on owners, not the separate normal-codec benchmark.
+                    VisibilityFeatureSample(index, 0.12, 0.0, 0.0, 1.0)
+                }
+                assertTrue(runtime.offerFeature(VisibilityFeatureObservation(
+                    ownership = cut, frame = featureFrame, samples = featureSamples,
+                    sourceRejectedSamples = 0,
+                    payloadBytes = VisibilityFeatureObservation.FEATURE_FIXED_BYTES +
+                        featureSamples.size * VisibilityFeatureObservation.FEATURE_SAMPLE_BYTES,
+                ), 1_500_000))
+                scheduler.advanceBy(0)
+                acknowledge()
+                val depthSamples = List(V2_DEPTH_SAMPLE_CAPACITY) { index ->
+                    VisibilityDepthSample(index % 48, index / 48, 1_000 + cycle * 100, 255)
+                }
+                assertTrue(runtime.offerDepth(VisibilityDepthObservation(
+                    ownership = cut,
+                    frame = depth(cut, timestamp).frame.copy(
+                        intrinsics = VisibilityCameraIntrinsics(48, 32, 40.0, 40.0, 24.0, 16.0)),
+                    samples = depthSamples, sourceRejectedSamples = 0,
+                    payloadBytes = VisibilityDepthObservation.DEPTH_FIXED_BYTES +
+                        depthSamples.size * VisibilityDepthObservation.DEPTH_SAMPLE_BYTES,
+                ), 1_500_000))
+                scheduler.advanceBy(0)
+                // Full-frame rays against an already-published canonical cut
+                // exceed this deterministic scene's bounded lookup budget.
+                // Refusal must preserve the feature cut; do not fabricate a
+                // successful maximum-depth admission in the receipt.
+                assertEquals("depthLookupRefused", integration.integrationReceipt().status)
+                assertEquals(2, integration.integrationReceipt().geometryRevision)
+                assertEquals(0, runtime.snapshot().admittedDepthObservations)
+                assertTrue(requireNotNull(integration.depthLookupReceipt()).bytesRead <= 8L * 1024L * 1024L)
+                assertTrue(runtime.offerDepth(depth(cut, timestamp + 1), 1_500_000))
+                scheduler.advanceBy(250_000_000)
+                acknowledge()
+                scheduler.advanceBy(250_000_000)
+            }
+            assertEquals(1, runtime.snapshot().admittedFeatureObservations)
+            assertEquals(1, runtime.snapshot().admittedDepthObservations)
+            assertTrue(integration.pressureSnapshot().canonicalSurfaceHighWater > 0)
+            assertTrue(integration.pressureSnapshot().associationHighWater >= V2_FEATURE_SAMPLE_CAPACITY)
+            assertTrue(publishedPages > 0)
+            assertTrue(publishedRows > 0)
+            assertEquals(3, integration.integrationReceipt().geometryRevision)
+            val pressure = integration.pressureSnapshot()
+            val currentResources = privateField<CanonicalRuntimeResources>(integration, "resources")
+            val featureOwner = privateField<FeatureFusionKernel>(integration, "kernel")
+            println("canonicalRetainedOwnedBytes=${pressure.canonicalOwnedBytes} " +
+                "featurePrimitiveBytes=${featureOwner.resourceReceipt().assignedTupleShareBytes} " +
+                "depthPrimitiveBytes=${integration.depthResourceReceipt()?.fixedPrimitiveBytes} " +
+                "completeCurrentBytes=${currentResources.completeCurrentLeaseReceipt()?.retainedTotalBytes} " +
+                "canonicalScalarBytes=${currentResources.retainedScalarMemoryReceipt()?.portableBytes} " +
+                "portableOwnerBytes=${integration.portableOwnerMemoryReceipt().portableBytes} " +
+                "canonicalSurfaces=${pressure.canonicalSurfaceHighWater} " +
+                "associations=${pressure.associationHighWater} " +
+                "featureAdmitted=${runtime.snapshot().admittedFeatureObservations} " +
+                "depthAdmitted=${runtime.snapshot().admittedDepthObservations}")
+        } finally {
+            runtime.close()
+            assertEquals(0, runtime.snapshot().residentPayloadBytes)
+            assertEquals(0, projection.currentRowCount())
+            binding.dispose()
+            coordinator.close()
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `renderer retains distinct stable surfaces that share one voxel`() {
         val rendered = mutableListOf<com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot>()
         val projection = NativeRendererProjection(render = { snapshot, _ -> snapshot?.let(rendered::add) })

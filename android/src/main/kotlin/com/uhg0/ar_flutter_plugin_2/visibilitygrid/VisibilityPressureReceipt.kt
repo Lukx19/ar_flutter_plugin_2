@@ -1,9 +1,15 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
+import com.uhg0.ar_flutter_plugin_2.sceneview.RendererPressureSnapshot
+import com.uhg0.ar_flutter_plugin_2.sceneview.RendererPageFramePressureSnapshot
+
 /**
  * Non-observation owners sampled at the same debug boundary as the V2
  * observation runtime. Every value is scalar so a pressure campaign cannot
- * accidentally retain canonical rows, images, or renderer payloads.
+ * accidentally retain canonical rows, images, or renderer payloads. Worker,
+ * capture and root-isolate metrics are unobserved zero placeholders in a native
+ * snapshot, not proof that Dart owns no resources. The Dart owner boundary must
+ * replace those fields before treating this as a combined certification receipt.
  */
 internal data class VisibilityPressureOwnerScalars(
     val geometryRevision: Long = 0,
@@ -38,6 +44,35 @@ internal data class VisibilityPressureOwnerScalars(
     init {
         require(nonNegativeValues().all { it >= 0 })
         require(terminalGuidanceStatus.isNotBlank() && terminalGuidanceStatus.length <= 64)
+    }
+
+    companion object {
+        /** Only native owners are sampled here; Dart supplies its own fields. */
+        fun fromNativeOwners(
+            canonical: CanonicalVisibilityPressureSnapshot,
+            renderer: RendererPressureSnapshot,
+            pages: RendererPageFramePressureSnapshot,
+        ) = VisibilityPressureOwnerScalars(
+            geometryRevision = canonical.geometryRevision,
+            lineageRevision = canonical.lineageRevision,
+            coverageRevision = canonical.coverageRevision,
+            styleRevision = canonical.styleRevision,
+            canonicalSurfaceHighWater = canonical.canonicalSurfaceHighWater,
+            associationHighWater = canonical.associationHighWater,
+            canonicalOwnedBytes = canonical.canonicalOwnedBytes,
+            rendererOwnedBytes = renderer.rendererOwnedBytes,
+            maxUploadBytesPerFrame = renderer.maxUploadBytesPerFrame,
+            selectionChurnPermille = renderer.selectionChurnPermille,
+            buffersAcquired = renderer.buffersAcquired,
+            buffersReleased = renderer.buffersReleased,
+            callbacksAcquired = renderer.callbacksAcquired,
+            callbacksReleased = renderer.callbacksReleased,
+            pagesAcquired = pages.pagesAcquired,
+            pagesReleased = pages.pagesReleased,
+            rendererResourcesAcquired = renderer.rendererResourcesAcquired,
+            rendererResourcesReleased = renderer.rendererResourcesReleased,
+            terminalGuidanceStatus = canonical.terminalGuidanceStatus,
+        )
     }
 
     private fun nonNegativeValues(): List<Long> = listOf(

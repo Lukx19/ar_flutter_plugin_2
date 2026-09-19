@@ -101,11 +101,8 @@ internal class ArCoreVisibilityObservationAdapter(
         } catch (error: RuntimeException) {
             VisibilityFeatureCopyResult.Rejected(error.message ?: "feature copy failed")
         } finally {
-            try {
-                pointCloud.release()
-            } finally {
-                resourceClosed()
-            }
+            pointCloud.release()
+            resourceClosed()
         }
     }
 
