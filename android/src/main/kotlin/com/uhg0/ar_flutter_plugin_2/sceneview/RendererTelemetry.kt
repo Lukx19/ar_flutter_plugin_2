@@ -35,6 +35,7 @@ internal class RendererTelemetry {
     private var rendererUpdateCount = 0
     private val presentationCounts = linkedMapOf<String, Int>()
     private var resourceReplacementCount = 0
+    private var resourceAcquisitionCount = 0
     private var resourceDisposalCount = 0
     private var resourceFailureCount = 0
     private var lastAdmissionStrategy = "none"
@@ -60,6 +61,11 @@ internal class RendererTelemetry {
             CoveragePresentationMode.SUPPRESSED_DEBUG -> "debugCount"
         }
         presentationCounts[key] = (presentationCounts[key] ?: 0) + 1
+    }
+
+    @Synchronized
+    fun recordResourceAcquisition() {
+        resourceAcquisitionCount++
     }
 
     @Synchronized
@@ -271,7 +277,7 @@ internal class RendererTelemetry {
         buffersReleased = completedUploadCount.toLong(),
         callbacksAcquired = uploadPageSubmissionCount.get().toLong(),
         callbacksReleased = completedUploadCount.toLong(),
-        rendererResourcesAcquired = resourceReplacementCount.toLong(),
+        rendererResourcesAcquired = resourceAcquisitionCount.toLong(),
         rendererResourcesReleased = resourceDisposalCount.toLong(),
     )
 

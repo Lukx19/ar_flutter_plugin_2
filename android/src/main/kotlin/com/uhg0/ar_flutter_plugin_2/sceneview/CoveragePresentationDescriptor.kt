@@ -71,6 +71,8 @@ private class PresentationBacking(
 
     fun selectedSurfaceIdsCopy(count: Int): LongArray = surfaceIdTable.copyOf(count)
 
+    fun surfaceIdAt(index: Int): Long = surfaceIdTable[index]
+
     fun selectedSourceSlotsCopy(count: Int): IntArray = sourceSlotTable.copyOf(count)
 
     /** Legacy metadata access is a defensive copy; the backing remains shared. */
@@ -184,6 +186,15 @@ internal class PresentationDescriptor private constructor(
 
     /** O(1) scalar used by renderer status and telemetry. */
     val glyphCount: Int get() = backing.glyphCount(count)
+
+    /** Compares bounded destination identities without copying or retaining row arrays. */
+    internal fun changedSelectionRows(previous: PresentationDescriptor): Int {
+        var changed = kotlin.math.abs(count - previous.count)
+        repeat(minOf(count, previous.count)) { index ->
+            if (backing.surfaceIdAt(index) != previous.backing.surfaceIdAt(index)) changed++
+        }
+        return changed
+    }
 
     /** Borrows one <=512-row page only while the qualifier is still current. */
     fun withPage(

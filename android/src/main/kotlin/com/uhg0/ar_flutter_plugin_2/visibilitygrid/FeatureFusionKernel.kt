@@ -644,7 +644,19 @@ internal class FeatureFusionKernel(
     private fun refused(reason: FeatureFusionRefusal) = FeatureFusionResult.Refused(reason, receipt())
     internal fun resourceReceipt(): FeatureFusionResourceReceipt = receipt()
     private fun receipt(surfaces: Int = surfaceCount, associations: Int = associationCount) =
-        FeatureFusionResourceReceipt(surfaces, associations, CANONICAL_SURFACE_TUPLE_SHARE_BYTES)
+        FeatureFusionResourceReceipt(surfaces, associations, retainedOwnerBytes())
+
+    /** Portable retained ownership: concrete array capacities plus the scalar owner/header. */
+    private fun retainedOwnerBytes(): Int = 152 +
+        16 * ARRAY_HEADER_BYTES.toInt() +
+        surfaceKeys.size * Long.SIZE_BYTES +
+        canonicalAllocationFingerprints.size + featureEvidenceAllocationFingerprints.size +
+        active.size + Int.SIZE_BYTES * (
+            canonicalIds.size + accumulatedWeights.size + observationCounts.size +
+                axisXQ13.size + axisYQ13.size + axisZQ13.size + positiveSupportQ13.size +
+                negativeSupportQ13.size + evidenceWeights.size + evidenceSupportIds.size +
+                associationSlots.size + hashSlots.size
+            )
 
     private fun hash(key: VoxelKey): Int {
         var value = key.x * 73856093 xor key.y * 19349663 xor key.z * 83492791

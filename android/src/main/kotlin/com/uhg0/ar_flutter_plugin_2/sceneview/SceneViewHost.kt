@@ -138,6 +138,7 @@ internal class SceneViewHost(
     private val rendererTelemetry = RendererTelemetry()
     private val rendererAllocationLedger = CoverageRendererAllocationLedger(rendererTelemetry)
     private val coverageResourceFactory = CoverageRendererResourceFactory(
+        onAcquisition = rendererTelemetry::recordResourceAcquisition,
         onReplacement = rendererTelemetry::recordResourceReplacement,
         onDisposal = rendererTelemetry::recordResourceDisposal,
         onDisposed = { token ->
@@ -214,6 +215,7 @@ internal class SceneViewHost(
                 if (!mounted) rendererTelemetry.clearResidentPresentation(token)
             },
             worldToScreen = CoverageWorldToScreenProjection(::projectCoveragePoint),
+            onSelectionChanged = rendererTelemetry::recordSelectionChurn,
         )
 
     private fun projectCoveragePoint(x: Float, y: Float, z: Float): CoverageScreenPoint? {

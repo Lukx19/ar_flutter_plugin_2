@@ -11,6 +11,7 @@ import org.junit.Test
 class CombinedVisibilityPressureTest {
     @Test
     fun `combined feature and depth overload remains latest-only and scalar`() {
+        val canonical = populatedFeatureOwner()
         val cut = AtomicReference(ownership())
         val scheduler = Executors.newSingleThreadScheduledExecutor()
         val blockerEntered = CountDownLatch(1)
@@ -45,17 +46,16 @@ class CombinedVisibilityPressureTest {
             val receipt = VisibilityPressureReceipt.capture(
                 runtime.snapshot(),
                 VisibilityPressureOwnerScalars(
-                    geometryRevision = 31,
-                    lineageRevision = 2,
-                    coverageRevision = 19,
-                    styleRevision = 5,
-                    canonicalSurfaceHighWater = 100_000,
-                    associationHighWater = 200_000,
-                    canonicalOwnedBytes = 16L * 1024L * 1024L,
+                    canonicalSurfaceHighWater = canonical.surfaceCount.toLong(),
+                    associationHighWater = canonical.associationCount.toLong(),
+                    canonicalOwnedBytes = canonical.assignedTupleShareBytes.toLong(),
                     terminalGuidanceStatus = "tracking",
                 ),
             )
 
+            assertEquals(100_000, receipt.canonicalSurfaceHighWater)
+            assertEquals(200_000, receipt.associationHighWater)
+            assertEquals(13_948_984, receipt.canonicalOwnedBytes)
             assertEquals(10, receipt.featureOffered)
             assertEquals(0, receipt.featureAdmitted)
             assertEquals(8, receipt.featureCoalesced)
@@ -84,6 +84,65 @@ class CombinedVisibilityPressureTest {
             runtime.close()
         }
     }
+
+    private fun populatedFeatureOwner(): FeatureFusionResourceReceipt {
+        val kernel = FeatureFusionKernel()
+        var sequence = 0L
+        repeat(2) { pass ->
+            repeat(100) { page ->
+                val observations = List(1_000) { offset ->
+                    val index = page * 1_000 + offset
+                    FeatureFusionEvidence(
+                        index * 0.1 + 0.02, 0.02, 0.02, 2,
+                        pass * 100_000 + index,
+                        normalEvidence(index),
+                    )
+                }
+                sequence++
+                assertTrue(kernel.accept(FeatureFusionBatch(sequence, sequence, observations))
+                    is FeatureFusionResult.Accepted)
+            }
+            if (pass == 0) {
+                val before = kernel.resourceReceipt()
+                val refused = kernel.accept(FeatureFusionBatch(
+                    sequence + 1, sequence + 1,
+                    listOf(FeatureFusionEvidence(
+                        10_000.02, 0.02, 0.02, 2, 200_000, normalEvidence(100_000),
+                    )),
+                )) as FeatureFusionResult.Refused
+                assertEquals(FeatureFusionRefusal.SURFACE_CAPACITY, refused.reason)
+                assertEquals(before, refused.receipt)
+                assertEquals(before, kernel.resourceReceipt())
+            }
+        }
+        val receipt = kernel.resourceReceipt()
+        // Independent reflection catches a newly retained primitive owner omitted from
+        // accounting, while avoiding a full object-graph or platform-memory estimate.
+        val arrays = kernel.javaClass.declaredFields.filter { it.type.isArray }.map { field ->
+            field.isAccessible = true
+            val array = field.get(kernel)
+            val width = when (array) {
+                is ByteArray, is BooleanArray -> 1
+                is IntArray -> 4
+                is LongArray -> 8
+                else -> error("unaccounted retained array ${field.name}")
+            }
+            16 + java.lang.reflect.Array.getLength(array) * width
+        }
+        assertEquals(receipt.assignedTupleShareBytes, 152 + arrays.sum())
+        val refusal = kernel.accept(FeatureFusionBatch(
+            sequence + 1, sequence + 1,
+            listOf(FeatureFusionEvidence(0.02, 0.02, 0.02, 1, 200_000, normalEvidence(0))),
+        )) as FeatureFusionResult.Refused
+        assertEquals(FeatureFusionRefusal.ASSOCIATION_CAPACITY, refusal.reason)
+        assertEquals(receipt, refusal.receipt)
+        assertEquals(receipt, kernel.resourceReceipt())
+        return receipt
+    }
+
+    private fun normalEvidence(index: Int) = FeatureNormalEvidence(
+        index, 0, 0, index * 100 + 20, 20, 20, index * 100 + 1_020, 20, 20, 32_767,
+    )
 
     private fun ownership() = VisibilityObservationOwnership(
         sessionId = "01".repeat(16),

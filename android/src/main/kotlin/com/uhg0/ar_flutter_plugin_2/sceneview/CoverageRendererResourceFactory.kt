@@ -45,6 +45,7 @@ internal data class CoverageRendererResourceTransition(
  * clear-before-replace rule identical for Compose and the JVM fake backend.
  */
 internal class CoverageRendererResourceFactory(
+    private val onAcquisition: () -> Unit = {},
     private val onReplacement: () -> Unit = {},
     private val onDisposal: () -> Unit = {},
     private val admit: (VoxelRenderMode, Int) -> CoverageRendererResourceAdmission =
@@ -137,10 +138,11 @@ internal class CoverageRendererResourceFactory(
             onCreationFailure(transition)
             return null
         }
+        onAcquisition()
         try {
             onCreated(transition)
         } catch (error: Throwable) {
-            runCatching { release(next) }
+            runCatching { release(next) }.onSuccess { onDisposal() }
             onCreationFailure(transition)
             return null
         }

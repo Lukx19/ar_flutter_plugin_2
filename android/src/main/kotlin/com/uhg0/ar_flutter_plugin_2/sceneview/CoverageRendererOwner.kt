@@ -408,6 +408,7 @@ internal class NativeCoverageRendererOwner(
     private val worldToScreen: CoverageWorldToScreenProjection =
         CoverageWorldToScreenProjection { x, y, _ -> CoverageScreenPoint(x, y, 1f) },
     private val committedRowsBorrower: CoverageCommittedRowsBorrower? = null,
+    private val onSelectionChanged: ((changedRows: Int, residentRows: Int) -> Unit)? = null,
 ) : CoverageRendererOwner {
     private var latest: CoverageRendererCutMetadata? = null
     private var controls = CoverageRendererControls(
@@ -569,6 +570,8 @@ internal class NativeCoverageRendererOwner(
             )
         }
         val replayed = priorQualifier == qualifier
+        val priorSelection = if (onSelectionChanged != null) selectedSurfaceIds() else null
+        val priorCut = latest
         latest = snapshot.toCutMetadata()
         latestPresentationDescriptor = null
         lastAcceptedQualifier = qualifier
@@ -583,6 +586,16 @@ internal class NativeCoverageRendererOwner(
             rowsOverride = snapshot.rows,
             explicitResync = explicitResync,
         )
+        onSelectionChanged?.let { record ->
+            val selected = selectedSurfaceIds()
+            val steady = priorCut?.bindingGeneration == snapshot.bindingGeneration &&
+                priorCut.groupGeneration == snapshot.groupGeneration &&
+                priorCut.rendererGeneration == snapshot.rendererGeneration && !explicitResync
+            val previous = checkNotNull(priorSelection)
+            val changed = if (!steady) 0 else kotlin.math.abs(selected.size - previous.size) +
+                (0 until minOf(selected.size, previous.size)).count { selected[it] != previous[it] }
+            record(changed, maxOf(selected.size, previous.size))
+        }
         val mounted = !unavailable && resourceMounted
         return RendererInstallReceipt(
             installed = mounted,
@@ -647,6 +660,16 @@ internal class NativeCoverageRendererOwner(
             enabled = controls.visible,
             palette = controls.palette,
             paletteEpoch = paletteRevision,
+        )
+        val previous = latestPresentationDescriptor
+        val steady = previous != null &&
+            previous.qualifier.bindingGeneration == presentation.qualifier.bindingGeneration &&
+            previous.qualifier.groupGeneration == presentation.qualifier.groupGeneration &&
+            latest?.rendererGeneration == config.rendererGeneration &&
+            previous.mode == presentation.mode && presentation.update?.reset != true
+        onSelectionChanged?.invoke(
+            if (steady) presentation.changedSelectionRows(checkNotNull(previous)) else 0,
+            maxOf(presentation.count, previous?.count ?: 0),
         )
         latest = CoverageRendererCutMetadata(
             bindingGeneration = descriptor.qualifier.bindingGeneration,
