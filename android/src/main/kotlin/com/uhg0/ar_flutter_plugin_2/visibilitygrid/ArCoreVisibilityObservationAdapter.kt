@@ -4,6 +4,8 @@ import com.google.ar.core.Config
 import com.google.ar.core.Frame
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.NotYetAvailableException
+import java.nio.FloatBuffer
+import java.nio.IntBuffer
 
 internal sealed interface VisibilityFeatureCopyResult {
     data class Observation(val value: VisibilityFeatureObservation) : VisibilityFeatureCopyResult
@@ -19,6 +21,61 @@ internal sealed interface VisibilityDepthCopyResult {
     data object TransientUnavailable : VisibilityDepthCopyResult
 
     data class Rejected(val reason: String) : VisibilityDepthCopyResult
+}
+
+internal sealed interface VisibilityFeatureSamplesCopyResult {
+    data class Samples(
+        val values: List<VisibilityFeatureSample>,
+        val sourceRejectedSamples: Int,
+    ) : VisibilityFeatureSamplesCopyResult
+
+    data object TransientUnavailable : VisibilityFeatureSamplesCopyResult
+
+    data class Rejected(val reason: String) : VisibilityFeatureSamplesCopyResult
+}
+
+internal fun copyVisibilityFeatureSamples(
+    sourceIds: IntBuffer,
+    sourcePoints: FloatBuffer,
+    minimumFeatureConfidence: Double,
+    maxCopiedSamples: Int,
+): VisibilityFeatureSamplesCopyResult {
+    require(minimumFeatureConfidence.isFinite() && minimumFeatureConfidence in 0.0..1.0)
+    require(maxCopiedSamples in 1..V2_FEATURE_SAMPLE_CAPACITY)
+    val ids = sourceIds.duplicate()
+    val points = sourcePoints.duplicate()
+    if (points.remaining().toLong() != ids.remaining().toLong() * 4L) {
+        return VisibilityFeatureSamplesCopyResult.Rejected(
+            "feature buffers have mismatched lengths",
+        )
+    }
+    val accepted = ArrayList<VisibilityFeatureSample>(maxCopiedSamples)
+    val seen = HashSet<Int>(maxCopiedSamples)
+    var rejected = 0
+    while (ids.hasRemaining()) {
+        val sample = VisibilityFeatureSample(
+            id = ids.get(),
+            xWorld = points.get().toDouble(),
+            yWorld = points.get().toDouble(),
+            zWorld = points.get().toDouble(),
+            confidence = points.get().toDouble(),
+        )
+        if (!sample.isValid() || sample.confidence < minimumFeatureConfidence ||
+            !seen.add(sample.id) || accepted.size == maxCopiedSamples
+        ) {
+            rejected++
+        } else {
+            accepted += sample
+        }
+    }
+    return if (accepted.isEmpty()) {
+        VisibilityFeatureSamplesCopyResult.TransientUnavailable
+    } else {
+        VisibilityFeatureSamplesCopyResult.Samples(
+            values = VisibilityFeatureObservation.copySamples(accepted),
+            sourceRejectedSamples = rejected,
+        )
+    }
 }
 
 /** Copies all ARCore-owned data before returning to the frame callback. */
@@ -51,50 +108,35 @@ internal class ArCoreVisibilityObservationAdapter(
             if (sourceTimestamp <= 0 || frame.timestamp <= 0) {
                 return VisibilityFeatureCopyResult.Rejected("feature timestamp is not positive")
             }
-            val ids = pointCloud.ids.duplicate()
-            val points = pointCloud.points.duplicate()
-            if (points.remaining() < ids.remaining() * 4) {
-                return VisibilityFeatureCopyResult.Rejected("feature buffers have mismatched lengths")
-            }
-            val accepted = ArrayList<VisibilityFeatureSample>(maxCopiedSamples)
-            val seen = HashSet<Int>(maxCopiedSamples)
-            var rejected = 0
-            while (ids.hasRemaining() && points.remaining() >= 4) {
-                val sample = VisibilityFeatureSample(
-                    id = ids.get(),
-                    xWorld = points.get().toDouble(),
-                    yWorld = points.get().toDouble(),
-                    zWorld = points.get().toDouble(),
-                    confidence = points.get().toDouble(),
+            when (
+                val samples = copyVisibilityFeatureSamples(
+                    sourceIds = pointCloud.ids,
+                    sourcePoints = pointCloud.points,
+                    minimumFeatureConfidence = minimumFeatureConfidence,
+                    maxCopiedSamples = maxCopiedSamples,
                 )
-                if (!sample.isValid() || sample.confidence < minimumFeatureConfidence ||
-                    !seen.add(sample.id) || accepted.size == maxCopiedSamples
-                ) {
-                    rejected++
-                } else {
-                    accepted += sample
-                }
-            }
-            if (accepted.isEmpty()) {
-                VisibilityFeatureCopyResult.Rejected("feature observation has no valid samples")
-            } else {
-                val copied = VisibilityFeatureObservation.copySamples(accepted)
-                VisibilityFeatureCopyResult.Observation(
-                    VisibilityFeatureObservation(
-                        ownership = ownership,
-                        frame = cameraFrame(
-                            frame = frame,
-                            source = VisibilityObservationSource.ARCORE_FEATURE,
-                            sourceTimestampNs = sourceTimestamp,
-                            frameSequence = frameSequence,
-                            depthCapability = depthCapability,
+            ) {
+                VisibilityFeatureSamplesCopyResult.TransientUnavailable ->
+                    VisibilityFeatureCopyResult.TransientUnavailable
+                is VisibilityFeatureSamplesCopyResult.Rejected ->
+                    VisibilityFeatureCopyResult.Rejected(samples.reason)
+                is VisibilityFeatureSamplesCopyResult.Samples ->
+                    VisibilityFeatureCopyResult.Observation(
+                        VisibilityFeatureObservation(
+                            ownership = ownership,
+                            frame = cameraFrame(
+                                frame = frame,
+                                source = VisibilityObservationSource.ARCORE_FEATURE,
+                                sourceTimestampNs = sourceTimestamp,
+                                frameSequence = frameSequence,
+                                depthCapability = depthCapability,
+                            ),
+                            samples = samples.values,
+                            sourceRejectedSamples = samples.sourceRejectedSamples,
+                            payloadBytes = VisibilityFeatureObservation.FEATURE_FIXED_BYTES +
+                                samples.values.size * VisibilityFeatureObservation.FEATURE_SAMPLE_BYTES,
                         ),
-                        samples = copied,
-                        sourceRejectedSamples = rejected,
-                        payloadBytes = VisibilityFeatureObservation.FEATURE_FIXED_BYTES +
-                            copied.size * VisibilityFeatureObservation.FEATURE_SAMPLE_BYTES,
-                    ),
-                )
+                    )
             }
         } catch (error: IllegalArgumentException) {
             VisibilityFeatureCopyResult.Rejected(error.message ?: "invalid feature metadata")
