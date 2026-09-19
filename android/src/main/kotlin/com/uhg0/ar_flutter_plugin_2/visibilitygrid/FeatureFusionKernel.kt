@@ -7,6 +7,7 @@ import kotlin.math.floor
 internal class FeatureFusionKernel(
     private val operations: FeatureFusionOperations = JvmFeatureFusionOperations,
 ) {
+    private val normalEncoder = FeatureNormalOctEncoder()
     /** Stages one immutable batch without changing retained state. */
     internal fun prepare(batch: FeatureFusionBatch): FeatureFusionResult {
         check(pending == null) { "a prepared kernel batch is already outstanding" }
@@ -325,7 +326,7 @@ internal class FeatureFusionKernel(
                 ) ?: return@allocate Normalization.Refused(FeatureFusionRefusal.INVALID_NORMAL_EVIDENCE)
                 val negated = FeatureNormalMath.negated(direction)
                 val codes = octCodes.getOrPut(DirectionKey(direction[0], direction[1], direction[2])) {
-                    FeatureNormalMath.encodeOct(direction) to FeatureNormalMath.encodeOct(negated)
+                    normalEncoder.encode(direction) to normalEncoder.encode(negated)
                 }
                 val directCode = codes.first
                 val oppositeCode = codes.second
@@ -647,7 +648,9 @@ internal class FeatureFusionKernel(
         FeatureFusionResourceReceipt(surfaces, associations, retainedOwnerBytes())
 
     /** Portable retained ownership: concrete array capacities plus the scalar owner/header. */
-    private fun retainedOwnerBytes(): Int = 152 +
+    internal fun normalEncoderPortableBytes(): Int = normalEncoder.portableBytes()
+
+    private fun retainedOwnerBytes(): Int = 160 + normalEncoder.portableBytes() +
         16 * ARRAY_HEADER_BYTES.toInt() +
         surfaceKeys.size * Long.SIZE_BYTES +
         canonicalAllocationFingerprints.size + featureEvidenceAllocationFingerprints.size +
@@ -676,7 +679,7 @@ internal class FeatureFusionKernel(
         val axis = FeatureNormalMath.normalizeQ15(surface.axisXQ13.toLong(), surface.axisYQ13.toLong(), surface.axisZQ13.toLong())
             ?: return emptyList()
         val codes = axisOctCodes.getOrPut(DirectionKey(axis[0], axis[1], axis[2])) {
-            FeatureNormalMath.encodeOct(axis) to FeatureNormalMath.encodeOct(FeatureNormalMath.negated(axis))
+            normalEncoder.encode(axis) to normalEncoder.encode(FeatureNormalMath.negated(axis))
         }
         val axisCode = codes.first
         val opposite = codes.second
@@ -821,7 +824,7 @@ internal class FeatureFusionKernel(
         const val ASSOCIATION_CAPACITY = 200_000
         const val HASH_SLOTS = 262_144
         const val HASH_MASK = HASH_SLOTS - 1
-        const val CANONICAL_SURFACE_TUPLE_SHARE_BYTES = 13_948_984
+        const val CANONICAL_SURFACE_TUPLE_SHARE_BYTES = 14_888_912
         const val HASH_BYTES = 32
         const val UINT32_MASK = 0xffff_ffffL
         const val HYDRATED_AXIS_SCALE = 1_024

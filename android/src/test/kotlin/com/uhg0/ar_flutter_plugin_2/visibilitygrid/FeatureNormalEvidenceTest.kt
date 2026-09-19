@@ -1,9 +1,12 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.openjdk.jol.info.GraphLayout
+import kotlin.random.Random
 
 class FeatureNormalEvidenceTest {
     @Test
@@ -22,6 +25,170 @@ class FeatureNormalEvidenceTest {
         assertEquals(expected, encoded)
         val decoded = requireNotNull(FeatureNormalMath.decodeOct(encoded.ushr(8).toByte().toInt(), encoded.toByte().toInt()))
         assertTrue(decoded[0].toLong() * vector[0] + decoded[1].toLong() * vector[1] + decoded[2].toLong() * vector[2] > 0)
+    }
+
+    @Test
+    fun `bounded oct decode normalization is exhaustive byte exact`() {
+        for (xByte in -127..127) {
+            for (yByte in -127..127) {
+                fun scale(value: Int) = FeatureNormalMath.roundTiesEven(
+                    value.toLong() * 32_767L,
+                    127L,
+                ).toInt()
+                val x = scale(xByte)
+                val y = scale(yByte)
+                val z = 32_767 - kotlin.math.abs(x) - kotlin.math.abs(y)
+                val unfolded = if (z < 0) {
+                    intArrayOf(
+                        (if (x < 0) -1 else 1) * (32_767 - kotlin.math.abs(y)),
+                        (if (y < 0) -1 else 1) * (32_767 - kotlin.math.abs(x)),
+                        z,
+                    )
+                } else {
+                    intArrayOf(x, y, z)
+                }
+                val exhaustiveReference = requireNotNull(
+                    FeatureNormalMath.normalizeQ15(
+                        unfolded[0].toLong(),
+                        unfolded[1].toLong(),
+                        unfolded[2].toLong(),
+                    ),
+                )
+                assertArrayEquals(
+                    "signed oct code ($xByte, $yByte)",
+                    exhaustiveReference,
+                    FeatureNormalMath.decodeOct(xByte, yByte),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `optimized decode keeps exhaustive encoder winners for boundary and random vectors`() {
+        val encoder = FeatureNormalOctEncoder()
+        val vectors = mutableListOf(
+            intArrayOf(32_767, 0, 0),
+            intArrayOf(-32_767, 0, 0),
+            intArrayOf(0, 32_767, 0),
+            intArrayOf(0, 0, 32_767),
+            intArrayOf(0, 0, -32_767),
+            requireNotNull(FeatureNormalMath.normalizeQ15(1, 1, 1)),
+            requireNotNull(FeatureNormalMath.normalizeQ15(-1, -1, -1)),
+        )
+        val seamBytes = intArrayOf(-127, -126, -1, 0, 1, 126, 127)
+        seamBytes.forEach { x ->
+            seamBytes.forEach { y ->
+                vectors += requireNotNull(FeatureNormalMath.decodeOct(x, y))
+            }
+        }
+        val random = Random(0x0c7a)
+        repeat(16) {
+            var vector: IntArray?
+            do {
+                vector = FeatureNormalMath.normalizeQ15(
+                    random.nextLong(-1_000_000L, 1_000_001L),
+                    random.nextLong(-1_000_000L, 1_000_001L),
+                    random.nextLong(-1_000_000L, 1_000_001L),
+                )
+            } while (vector == null)
+            vectors += requireNotNull(vector)
+        }
+
+        var maximumVisitedNodes = 0
+        var maximumEvaluatedCandidates = 0
+        vectors.forEach { vector ->
+            var expected = 0
+            var best = Long.MIN_VALUE
+            for (packed in 0..0xffff) {
+                val decoded = FeatureNormalMath.decodeOct(
+                    (packed ushr 8).toByte().toInt(),
+                    packed.toByte().toInt(),
+                ) ?: continue
+                val dot = decoded[0].toLong() * vector[0] +
+                    decoded[1].toLong() * vector[1] +
+                    decoded[2].toLong() * vector[2]
+                if (dot > best || (dot == best && packed < expected)) {
+                    best = dot
+                    expected = packed
+                }
+            }
+            assertEquals(expected, encoder.encode(vector))
+            val work = encoder.workReceipt()
+            maximumVisitedNodes = maxOf(maximumVisitedNodes, work.visitedNodes)
+            maximumEvaluatedCandidates = maxOf(maximumEvaluatedCandidates, work.evaluatedCandidates)
+            assertTrue(work.visitedNodes <= 5_461)
+            assertTrue(work.evaluatedCandidates <= 4_096)
+        }
+        println(
+            "FEATURE_NORMAL_OCT_ENCODER_WORK vectors=${vectors.size} " +
+                "maximumVisitedNodes=$maximumVisitedNodes " +
+                "maximumEvaluatedCandidates=$maximumEvaluatedCandidates",
+        )
+    }
+
+    @Test
+    fun `1200 varied directions and opposites complete within bounded exact search`() {
+        val encoder = FeatureNormalOctEncoder()
+        val encoded = ByteArray(1_200 * 2 * Short.SIZE_BYTES)
+        var encodedOffset = 0
+        var maximumVisitedNodes = 0
+        var maximumEvaluatedCandidates = 0
+
+        repeat(1_200) { index ->
+            fun component(multiplier: Long, offset: Long): Long =
+                ((index.toLong() * multiplier + offset) % 2_000_001L) - 1_000_000L
+            val direction = requireNotNull(FeatureNormalMath.normalizeQ15(
+                component(1_299_721L, 17_123L),
+                component(1_047_583L, 912_931L),
+                component(631_129L, 1_441_117L),
+            ))
+            listOf(direction, FeatureNormalMath.negated(direction)).forEach { vector ->
+                val packed = encoder.encode(vector)
+                val work = encoder.workReceipt()
+                maximumVisitedNodes = maxOf(maximumVisitedNodes, work.visitedNodes)
+                maximumEvaluatedCandidates = maxOf(
+                    maximumEvaluatedCandidates,
+                    work.evaluatedCandidates,
+                )
+                assertTrue(work.visitedNodes <= 5_461)
+                assertTrue(work.evaluatedCandidates <= 4_096)
+                val decoded = requireNotNull(FeatureNormalMath.decodeOct(
+                    (packed ushr 8).toByte().toInt(),
+                    packed.toByte().toInt(),
+                ))
+                assertTrue(
+                    decoded[0].toLong() * vector[0] +
+                        decoded[1].toLong() * vector[1] +
+                        decoded[2].toLong() * vector[2] > 0,
+                )
+                encoded[encodedOffset++] = (packed ushr 8).toByte()
+                encoded[encodedOffset++] = packed.toByte()
+            }
+        }
+
+        val digest = testSha256Hex(encoded)
+        println(
+            "FEATURE_NORMAL_OCT_ENCODER_FRAME directions=1200 encodes=2400 " +
+                "maximumVisitedNodes=$maximumVisitedNodes " +
+                "maximumEvaluatedCandidates=$maximumEvaluatedCandidates sha256=$digest",
+        )
+        assertEquals(encoded.size, encodedOffset)
+        assertEquals(
+            "ec804939b9160dd3cc23a3ceffb71d18ab4ba408a42306a94302df601f0136f9",
+            digest,
+        )
+    }
+
+    @Test
+    fun `oct encoder retained ownership is exact and charged once per kernel`() {
+        val encoder = FeatureNormalOctEncoder()
+        assertEquals(GraphLayout.parseInstance(encoder).totalSize(), encoder.portableBytes().toLong())
+        val kernel = FeatureFusionKernel()
+        assertEquals(encoder.portableBytes(), kernel.normalEncoderPortableBytes())
+        assertEquals(
+            FeatureFusionKernel.CANONICAL_SURFACE_TUPLE_SHARE_BYTES,
+            kernel.resourceReceipt().assignedTupleShareBytes,
+        )
     }
 
     @Test

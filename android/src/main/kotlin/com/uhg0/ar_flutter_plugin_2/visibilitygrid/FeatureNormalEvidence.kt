@@ -103,7 +103,36 @@ internal object FeatureNormalMath {
         val x = scale(xByte); val y = scale(yByte)
         val z = 32_767 - kotlin.math.abs(x) - kotlin.math.abs(y)
         val unfolded = if (z < 0) intArrayOf(signNonZero(x) * (32_767 - kotlin.math.abs(y)), signNonZero(y) * (32_767 - kotlin.math.abs(x)), z) else intArrayOf(x, y, z)
-        return normalizeQ15(unfolded[0].toLong(), unfolded[1].toLong(), unfolded[2].toLong())
+        return normalizeDecodedOctQ15(unfolded[0], unfolded[1], unfolded[2])
+    }
+
+    /**
+     * Exact [normalizeQ15] specialization for signed-oct decode coordinates.
+     *
+     * Every input component is in `-32_767..32_767`, so the squared length,
+     * Q15 numerator and midpoint comparison are all bounded by `Long`. Keeping
+     * this hot exhaustive-search path out of [BigInteger] preserves the same
+     * ties-to-even result without allocating big integers for every candidate.
+     */
+    internal fun normalizeDecodedOctQ15(x: Int, y: Int, z: Int): IntArray? {
+        require(x in -32_767..32_767 && y in -32_767..32_767 && z in -32_767..32_767)
+        val components = intArrayOf(x, y, z)
+        val squared = LongArray(components.size) { index ->
+            components[index].toLong() * components[index].toLong()
+        }
+        val length2 = squared.fold(0L, Math::addExact)
+        if (length2 == 0L) return null
+        val q15Squared = 32_767L * 32_767L
+        return IntArray(components.size) { index ->
+            val numerator = Math.multiplyExact(squared[index], q15Squared)
+            val q = integerSqrt(numerator / length2)
+            val next = 2L * q + 1L
+            val comparison = Math.multiplyExact(numerator, 4L).compareTo(
+                Math.multiplyExact(length2, Math.multiplyExact(next, next)),
+            )
+            val rounded = if (comparison > 0 || (comparison == 0 && (q and 1L) == 1L)) q + 1L else q
+            (if (components[index] < 0) -rounded else rounded).toInt()
+        }
     }
 
     fun negated(vector: IntArray) = intArrayOf(-vector[0], -vector[1], -vector[2])

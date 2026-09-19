@@ -550,7 +550,7 @@ class FeatureFusionKernelTest {
         // retained kernel state. GraphLayout measures the active JVM object model.
         val layout = GraphLayout.parseInstance(kernel)
         val retainedBytes = layout.totalSize()
-        val primitivePayloadBytes = 13_948_576L
+        val primitivePayloadBytes = 14_888_204L
         val overheadBytes = retainedBytes - primitivePayloadBytes
         val implementationBytes = requireNotNull(
             javaClass.classLoader?.getResourceAsStream(
@@ -560,7 +560,7 @@ class FeatureFusionKernelTest {
         println("FEATURE_FUSION_RETAINED_ALLOCATION_RECEIPT implementationClassSha256=${testSha256Hex(implementationBytes)} retainedBytes=$retainedBytes primitivePayloadBytes=$primitivePayloadBytes objectAndArrayOverheadBytes=$overheadBytes assignedTupleShareBytes=${outcome.receipt.assignedTupleShareBytes}")
         assertTrue("JVM graph measurement must include headers/alignment", overheadBytes > 0)
         assertTrue(retainedBytes <= outcome.receipt.assignedTupleShareBytes)
-        assertEquals(13_948_984, outcome.receipt.assignedTupleShareBytes)
+        assertEquals(14_888_912, outcome.receipt.assignedTupleShareBytes)
     }
 
     private fun kernel() = FeatureFusionKernel()

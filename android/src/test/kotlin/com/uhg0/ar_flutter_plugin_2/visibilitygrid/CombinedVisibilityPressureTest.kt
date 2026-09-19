@@ -83,7 +83,7 @@ class CombinedVisibilityPressureTest {
         val canonical = populatedFeatureOwner()
         assertEquals(100_000, canonical.surfaceCount)
         assertEquals(200_000, canonical.associationCount)
-        assertEquals(13_948_984, canonical.assignedTupleShareBytes)
+        assertEquals(14_888_912, canonical.assignedTupleShareBytes)
     }
 
     @Test
@@ -229,7 +229,10 @@ class CombinedVisibilityPressureTest {
             }
             16 + java.lang.reflect.Array.getLength(array) * width
         }
-        assertEquals(receipt.assignedTupleShareBytes, 152 + arrays.sum())
+        assertEquals(
+            receipt.assignedTupleShareBytes,
+            160 + arrays.sum() + kernel.normalEncoderPortableBytes(),
+        )
         val refusal = kernel.accept(FeatureFusionBatch(
             sequence + 1, sequence + 1,
             listOf(FeatureFusionEvidence(0.02, 0.02, 0.02, 1, 200_000, normalEvidence(0))),

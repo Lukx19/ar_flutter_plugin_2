@@ -168,6 +168,61 @@ class VisibilityGridIntegrationTest {
     }
 
     @Test
+    fun `small scene fixture advances the real canonical renderer`() {
+        val directory = Files.createTempDirectory("canonical-surface-small-scene").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val viewId = 2149
+        val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+        val scheduler = PressureObservationScheduler()
+        val projection = NativeRendererProjection(render = { _, _ -> })
+        val integration = VisibilityGridIntegration(
+            binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = resources(directory, coordinator),
+            renderer = projection,
+        )
+        val runtime = AndroidVisibilityGridRuntime(
+            binding::currentObservationOwnership,
+            integration,
+            scheduler,
+            nanoTime = { scheduler.nowNs },
+        )
+        try {
+            val stream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            val source = SyntheticVisibilityObservationSource(
+                runtime,
+                binding::currentObservationOwnership,
+            )
+            source.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            repeat(12) { marker ->
+                assertTrue(
+                    source.emitFeature(
+                        scheduler.nowNs + marker * 125_000_000L,
+                        marker = marker,
+                    ),
+                )
+            }
+            scheduler.advanceBy(0)
+            scheduler.advanceBy(125_000_000)
+
+            assertEquals(12L, runtime.snapshot().copiedFeatureObservations)
+            assertEquals(10L, runtime.snapshot().replacedFeatureObservations)
+            assertTrue(integration.integrationReceipt().geometryRevision > 1)
+            assertTrue(projection.currentRowCount() > 0)
+            assertEquals(1L, runtime.snapshot().admittedFeatureObservations)
+        } finally {
+            runtime.close()
+            assertEquals(0, projection.currentRowCount())
+            binding.dispose()
+            coordinator.close()
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `renderer retains distinct stable surfaces that share one voxel`() {
         val rendered = mutableListOf<com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot>()
         val projection = NativeRendererProjection(render = { snapshot, _ -> snapshot?.let(rendered::add) })
