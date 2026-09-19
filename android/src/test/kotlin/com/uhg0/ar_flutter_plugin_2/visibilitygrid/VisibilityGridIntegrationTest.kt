@@ -213,6 +213,53 @@ class VisibilityGridIntegrationTest {
     }
 
     @Test
+    fun `empty bootstrap style cut seeds an uninitialized renderer projection`() {
+        val descriptors = mutableListOf<com.uhg0.ar_flutter_plugin_2.sceneview.BoundedCoveragePresentation>()
+        val projection = NativeRendererProjection(
+            render = { snapshot, _ -> check(snapshot == null) },
+            publishPresentation = { descriptor, _ -> descriptor?.let(descriptors::add) },
+        )
+        val ownership = rendererOwnership()
+        val cut = QualifiedRendererStyleCut(
+            ownership = ownership,
+            transactionId = 1,
+            geometryRevision = 1,
+            lineageRevision = 1,
+            semanticRevision = 1,
+            coverageRevision = 1,
+            styleRevision = 1,
+            residencyRevision = 1,
+            targetRevision = 1,
+            reset = true,
+            surfaceIds = LongArray(0),
+            styleRows = ByteArray(0),
+            targetSurfaceId = null,
+            targetDirectionIndex = null,
+        )
+
+        assertEquals(
+            RendererStyleCutResult.Rejected(RendererStyleCutRejection.GROUP_MISMATCH),
+            projection.applyStyleCut(cut.copy(reset = false)),
+        )
+        assertEquals(
+            RendererStyleCutResult.Rejected(RendererStyleCutRejection.GROUP_MISMATCH),
+            projection.applyStyleCut(
+                cut.copy(surfaceIds = longArrayOf(1), styleRows = ByteArray(16)),
+            ),
+        )
+        assertEquals(0, projection.currentRowCount())
+        assertEquals(
+            RendererStyleCutResult.Applied(1, 1, 0, null),
+            projection.applyStyleCut(cut),
+        )
+        assertEquals(0, projection.currentRowCount())
+        assertEquals(1, descriptors.single().qualifier.styleRevision)
+        assertEquals(1, descriptors.single().qualifier.geometryRevision)
+        assertEquals(0, descriptors.single().count)
+        projection.close()
+    }
+
+    @Test
     fun `moving a stable surface onto an occupied voxel retains both identities`() {
         val projection = NativeRendererProjection(render = { _, _ -> })
         val ownership = rendererOwnership()

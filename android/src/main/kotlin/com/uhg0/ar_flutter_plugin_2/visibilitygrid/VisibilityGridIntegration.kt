@@ -1282,11 +1282,57 @@ internal class NativeRendererProjection(
     @Synchronized
     override fun applyStyleCut(cut: QualifiedRendererStyleCut): RendererStyleCutResult {
         if (closed) return RendererStyleCutResult.Rejected(RendererStyleCutRejection.CLOSED)
+        seedEmptyBootstrap(cut)
         val result = state.applyStyleCut(cut)
         if (result is RendererStyleCutResult.Applied) {
             emitPresentation(checkNotNull(activeRenderConfig), forceReset = cut.reset)
         }
         return result
+    }
+
+    /**
+     * The worker publishes its initial empty style cut immediately after the
+     * empty START bootstrap, before the first observation opens the canonical
+     * renderer owner. Seed only that exact protocol cut; all other style cuts
+     * still require a preceding geometry rebuild.
+     */
+    private fun seedEmptyBootstrap(cut: QualifiedRendererStyleCut) {
+        if (activeRenderConfig != null || activeOwnership != null || rebuildCut != null ||
+            cut.transactionId != 1L || cut.geometryRevision != 1L || cut.lineageRevision != 1L ||
+            !cut.reset || cut.surfaceIds.isNotEmpty() || cut.styleRows.isNotEmpty() ||
+            cut.targetSurfaceId != null || cut.targetDirectionIndex != null ||
+            cut.semanticRevision != 1L || cut.coverageRevision != 1L ||
+            cut.styleRevision != 1L || cut.residencyRevision != 1L ||
+            cut.targetRevision != 1L
+        ) return
+
+        val frame = cut.ownership.groupFrame
+        state.startCanonicalGroup(
+            config = VisibilityGridGroupConfig(
+                groupId = cut.ownership.captureGroupId,
+                groupGeneration = cut.ownership.groupGeneration,
+                sessionGeneration = cut.ownership.sessionGeneration,
+                voxelSizeMeters = frame.voxelSizeMicrometres.toDouble() / 1_000_000.0,
+                capacity = frame.modelCapacity,
+                groupFromWorldGl = frame.groupFromWorldGl.toDoubleArray(),
+                worldFromGroupGl = frame.worldFromGroupGl.toDoubleArray(),
+                restoredGeometryRevision = cut.geometryRevision,
+                restoredKeys = LongArray(0),
+            ),
+            geometryRevision = cut.geometryRevision,
+            rows = emptyList(),
+            ownership = cut.ownership,
+            transactionId = cut.transactionId,
+            lineageRevision = cut.lineageRevision,
+        )
+        activeOwnership = cut.ownership
+        activeLineageRevision = cut.lineageRevision
+        activeTransactionId = cut.transactionId
+        activeRenderConfig = PointCloudNativeConfig(
+            renderCapacity = frame.modelCapacity,
+            voxelRenderMode = VoxelRenderMode.CENTROIDS,
+            voxelSizeMeters = frame.voxelSizeMicrometres.toFloat() / 1_000_000f,
+        )
     }
 
     @Synchronized
