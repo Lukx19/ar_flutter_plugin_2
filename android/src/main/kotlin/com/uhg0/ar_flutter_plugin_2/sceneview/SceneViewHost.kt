@@ -932,6 +932,13 @@ internal class SceneViewHost(
         checkNotDisposed()
         check(!futureResumesBlocked) { "SceneView host is shutting down" }
         activeSession?.resume()
+        recoverCoverageRenderer()
+    }
+
+    /** Rehydrates the latest committed renderer cut after a renderer-only loss. */
+    fun recoverCoverageRenderer() {
+        checkNotDisposed()
+        check(!futureResumesBlocked) { "SceneView host is shutting down" }
         val recovery = coverageRendererOwner.resume()
         if (recovery.recovered) {
             coverageRenderConfig.value?.let { current ->
@@ -1055,6 +1062,13 @@ internal class SceneViewHost(
             "rendererStyleRevision" to status.styleRevision,
         )
     }
+
+    /** Fixed native renderer/page scalars for the visibility pressure receipt. */
+    internal fun visibilityPressureSnapshot(): SceneRendererPressureSnapshot =
+        SceneRendererPressureSnapshot(
+            renderer = rendererTelemetry.pressureSnapshot(),
+            pages = rendererPageFrameScheduler.pressureSnapshot(),
+        )
 
     /**
      * Callback completion is a fence, not permission to upload inline. Resume
@@ -1797,6 +1811,11 @@ internal class SceneViewHost(
         )
     }
 }
+
+internal data class SceneRendererPressureSnapshot(
+    val renderer: RendererPressureSnapshot,
+    val pages: RendererPageFramePressureSnapshot,
+)
 
 private fun CoveragePointRenderSnapshot.boundedForMesh(
     mode: VoxelRenderMode,

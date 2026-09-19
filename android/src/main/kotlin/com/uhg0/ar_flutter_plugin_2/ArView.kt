@@ -45,6 +45,10 @@ import com.uhg0.ar_flutter_plugin_2.visibilitygrid.ArCoreVisibilityObservationSo
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityObservationDebugChannel
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityObservationDebugGate
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityCaptureSafePredicate
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityPressureOwnerScalars
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilitySmallSceneDebugChannel
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilitySmallSceneProductHooks
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilitySmallSceneReceiptScalars
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineAuthority
 import com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraCapabilityQuerier
 import io.flutter.FlutterInjector
@@ -96,6 +100,8 @@ internal class ArView(
     private val disposeCompletionCallbacks = mutableListOf<() -> Unit>()
     private var coverageRendererMounted = false
     private val pendingCloudOperations = mutableSetOf<() -> Unit>()
+    private val isDebuggable =
+        context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
 
     private enum class ResumeTerminal {
         SUCCESS,
@@ -133,7 +139,7 @@ internal class ArView(
         messenger = messenger,
         viewId = id,
         CommittedBaselineAuthority = CommittedBaselineAuthority,
-        isDebuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0,
+        isDebuggable = isDebuggable,
         onRendererStyleCut = visibilityRendererProjection::applyStyleCut,
         coverageRendererOwner = sceneHost.coverageRendererOwner,
     )
@@ -170,10 +176,11 @@ internal class ArView(
     private val visibilityObservationDebugChannel = VisibilityObservationDebugChannel(
         messenger = messenger,
         viewId = id,
-        isDebuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0,
+        isDebuggable = isDebuggable,
         runtime = visibilityObservationRuntime,
         ownership = visibilityGridV2Binding::currentObservationOwnership,
         gate = visibilityObservationDebugGate,
+        pressureOwners = ::visibilityPressureOwnerScalars,
     )
 
     init {
@@ -206,6 +213,95 @@ internal class ArView(
         },
         captureSafetySignalV2 = captureSafetySignalV2,
     )
+
+    private val visibilitySmallSceneDebugChannel = VisibilitySmallSceneDebugChannel(
+        messenger = messenger,
+        viewId = id,
+        isDebuggable = isDebuggable,
+        runtime = visibilityObservationRuntime,
+        ownership = visibilityGridV2Binding::currentObservationOwnership,
+        productHooks = object : VisibilitySmallSceneProductHooks {
+            override fun rendererUnavailable() {
+                sceneHost.onLowMemoryPressure()
+            }
+
+            override fun rendererRecovered() {
+                sceneHost.recoverCoverageRenderer()
+            }
+
+            override fun guidanceTerminal() {
+                visibilityObservationRuntime.recordFeatureFailure()
+                visibilityObservationRuntime.setDepthCapability(
+                    com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityDepthCapability.UNSUPPORTED,
+                )
+            }
+
+            override fun pause() {
+                captureSafetySignalV2.invalidateLifecycleForViewPause()
+                sceneHost.pause()
+            }
+
+            override fun resume() {
+                sceneHost.resume()
+                captureSession.onSessionResumed()
+            }
+
+            override fun snapshot(): VisibilitySmallSceneReceiptScalars =
+                visibilitySmallSceneReceiptScalars()
+        },
+    )
+
+    private fun visibilityPressureOwnerScalars(): VisibilityPressureOwnerScalars {
+        val canonical = visibilityObservationMappingAdmission.pressureSnapshot()
+        val scene = sceneHost.visibilityPressureSnapshot()
+        return VisibilityPressureOwnerScalars(
+            geometryRevision = canonical.geometryRevision,
+            lineageRevision = canonical.lineageRevision,
+            coverageRevision = canonical.coverageRevision,
+            styleRevision = canonical.styleRevision,
+            canonicalSurfaceHighWater = canonical.canonicalSurfaceHighWater,
+            associationHighWater = canonical.associationHighWater,
+            canonicalOwnedBytes = canonical.canonicalOwnedBytes,
+            rendererOwnedBytes = scene.renderer.rendererOwnedBytes,
+            maxUploadBytesPerFrame = scene.renderer.maxUploadBytesPerFrame,
+            selectionChurnPermille = scene.renderer.selectionChurnPermille,
+            workerMaxPendingTransactions = scene.pages.maxPendingTransactions,
+            workerCoalescedPresentations = scene.pages.coalesced,
+            buffersAcquired = scene.renderer.buffersAcquired,
+            buffersReleased = scene.renderer.buffersReleased,
+            callbacksAcquired = scene.renderer.callbacksAcquired,
+            callbacksReleased = scene.renderer.callbacksReleased,
+            pagesAcquired = scene.pages.pagesAcquired,
+            pagesReleased = scene.pages.pagesReleased,
+            rendererResourcesAcquired = scene.renderer.rendererResourcesAcquired,
+            rendererResourcesReleased = scene.renderer.rendererResourcesReleased,
+            terminalGuidanceStatus = canonical.terminalGuidanceStatus,
+        )
+    }
+
+    private fun visibilitySmallSceneReceiptScalars(): VisibilitySmallSceneReceiptScalars {
+        val integration = visibilityObservationMappingAdmission.integrationReceipt()
+        val baseline = visibilityGridV2Binding.currentCommittedBaseline()
+        val renderer = sceneHost.coverageRendererOwner.status()
+        val targetSurfaceId = sceneHost.coverageRendererOwner.snapshot()?.targetSurfaceId
+        val observation = visibilityObservationRuntime.snapshot()
+        val pressure = visibilityPressureOwnerScalars()
+        return VisibilitySmallSceneReceiptScalars(
+            geometryRevision = maxOf(integration.geometryRevision, baseline.geometryRevision),
+            lineageRevision = maxOf(integration.lineageRevision, baseline.lineageRevision),
+            durableCaptureRevision = baseline.captureRevision,
+            coverageRevision = maxOf(baseline.coverageRevision, pressure.coverageRevision),
+            styleRevision = maxOf(baseline.styleRevision, renderer.styleRevision),
+            targetSurfaceId = targetSurfaceId,
+            rendererRows = renderer.rowCount,
+            automaticEligible = targetSurfaceId != null && observation.totalGridHealth != "failed",
+            guidanceStatus = observation.totalGridHealth,
+            rootIsolateSurfaceBytes = 0,
+            resourceBalance = observation.resourceBalance,
+            rootIsolateImageBytes = 0,
+            rendererOwnedBytes = pressure.rendererOwnedBytes,
+        )
+    }
 
     private fun setCoverageRendererMounted(mounted: Boolean, generation: Long) {
         coverageRendererMounted = mounted
@@ -279,6 +375,7 @@ internal class ArView(
         objectChannel.setMethodCallHandler(null)
         anchorChannel.setMethodCallHandler(null)
         captureChannel.setMethodCallHandler(null)
+        visibilitySmallSceneDebugChannel.dispose()
         visibilityObservationDebugChannel.dispose()
         visibilityObservationRuntime.close()
         visibilityStorageBudgetCoordinator.close()

@@ -145,6 +145,9 @@ internal class VisibilityGridIntegration(
     private var pendingCanonicalAcknowledgement: CanonicalAcknowledgement? = null
     private var pendingDepthCommit: PendingDepthCommit? = null
     private var lastDepthLookupReceipt: BoundedCanonicalLookupReceipt? = null
+    private var canonicalSurfaceHighWater = 0L
+    private var associationHighWater = 0L
+    private var canonicalOwnedBytesHighWater = 0L
     private val retainedDelta = ExactCurrentDeltaSource()
     @Volatile private var committed = 0L
     @Volatile private var committedFeatures = 0L
@@ -284,6 +287,22 @@ internal class VisibilityGridIntegration(
 
     fun integrationReceipt(): VisibilityGridIntegrationReceipt = synchronized(lock) { receipt }
 
+    /** Fixed native-owner scalars for the debug pressure receipt. */
+    internal fun pressureSnapshot(): CanonicalVisibilityPressureSnapshot = synchronized(lock) {
+        recordCanonicalPressureHighWater()
+        val rendererPressure = renderer.pressureRevisions()
+        CanonicalVisibilityPressureSnapshot(
+            geometryRevision = receipt.geometryRevision,
+            lineageRevision = receipt.lineageRevision,
+            coverageRevision = rendererPressure.coverageRevision,
+            styleRevision = rendererPressure.styleRevision,
+            canonicalSurfaceHighWater = canonicalSurfaceHighWater,
+            associationHighWater = associationHighWater,
+            canonicalOwnedBytes = canonicalOwnedBytesHighWater,
+            terminalGuidanceStatus = receipt.status,
+        )
+    }
+
     internal fun pendingDepthRetentionReceipt(): PendingDepthRetentionReceipt? = synchronized(lock) {
         pendingDepthCommit?.let(::retentionReceipt)
     }
@@ -328,9 +347,28 @@ internal class VisibilityGridIntegration(
         }
         afterLifecycleFence()
         drain()
-        synchronized(lock) { closeOwner() }
+        synchronized(lock) {
+            recordCanonicalPressureHighWater()
+            closeOwner()
+        }
         renderer.close()
         if (ownsExecutor) executor.shutdownNow()
+    }
+
+    private fun recordCanonicalPressureHighWater() {
+        val resources = kernel?.resourceReceipt() ?: return
+        canonicalSurfaceHighWater = maxOf(
+            canonicalSurfaceHighWater,
+            resources.surfaceCount.toLong(),
+        )
+        associationHighWater = maxOf(
+            associationHighWater,
+            resources.associationCount.toLong(),
+        )
+        canonicalOwnedBytesHighWater = maxOf(
+            canonicalOwnedBytesHighWater,
+            resources.assignedTupleShareBytes.toLong(),
+        )
     }
 
     private fun mutate(expected: VisibilityObservationOwnership, work: () -> Unit) {
@@ -1114,6 +1152,8 @@ internal interface CommittedRendererProjection : AutoCloseable {
         block: (CoverageCommittedRows) -> Unit,
     ): Boolean = false
     fun portableOwnerBytes(): Long = 0
+    fun pressureRevisions(): RendererProjectionPressureSnapshot =
+        RendererProjectionPressureSnapshot()
     fun beginRebuild(cut: CommittedGeometryCut) = Unit
     fun appendRebuildPage(cut: CommittedGeometryCut) = Unit
     fun finishRebuild(cut: CommittedGeometryCut) = Unit
@@ -1171,6 +1211,13 @@ internal class NativeRendererProjection(
     override val maximumRows: Int get() = state.capacity
     override fun portableOwnerBytes(): Long =
         56L + 96L + 64L + state.retainedGroupGeometryBytes // projection, state, native config, group geometry
+
+    @Synchronized
+    override fun pressureRevisions(): RendererProjectionPressureSnapshot =
+        RendererProjectionPressureSnapshot(
+            coverageRevision = state.currentCoverageRevision,
+            styleRevision = state.currentStyleRevision,
+        )
 
     @Synchronized
     override fun withCommittedRows(
@@ -1436,6 +1483,22 @@ internal data class VisibilityGridIntegrationReceipt(
             VisibilityGridIntegrationReceipt("seeded", cut.bindingGeneration, cut.sessionGeneration, cut.groupGeneration, baseline.transactionId, baseline.geometryRevision, baseline.lineageRevision, 0, 0, 0, 0, 0, "none")
     }
 }
+
+internal data class CanonicalVisibilityPressureSnapshot(
+    val geometryRevision: Long,
+    val lineageRevision: Long,
+    val coverageRevision: Long,
+    val styleRevision: Long,
+    val canonicalSurfaceHighWater: Long,
+    val associationHighWater: Long,
+    val canonicalOwnedBytes: Long,
+    val terminalGuidanceStatus: String,
+)
+
+internal data class RendererProjectionPressureSnapshot(
+    val coverageRevision: Long = 0,
+    val styleRevision: Long = 0,
+)
 
 private fun canonicalOperation(bytes: ByteArray): String = try {
     DataInputStream(ByteArrayInputStream(bytes)).use { input ->

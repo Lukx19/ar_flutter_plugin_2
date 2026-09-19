@@ -44,6 +44,7 @@ internal class RendererTelemetry {
     private var lastAdmissionOwnershipReceipt: CoverageRendererOwnershipReceipt? = null
     private var residentRowCount = 0
     private var residentGlyphCount = 0
+    private var selectionChurnPermille = 0
     private var residentToken: CoverageResourceToken? = null
     private val residentRowsByMode = linkedMapOf<CoveragePresentationMode, Int>()
     private val residentGlyphsByMode = linkedMapOf<CoveragePresentationMode, Int>()
@@ -91,6 +92,18 @@ internal class RendererTelemetry {
         require(glyphCount in 0..rowCount)
         residentRowCount = rowCount
         residentGlyphCount = glyphCount
+    }
+
+    /** Records the bounded scalar ratio for the latest steady-state selection. */
+    @Synchronized
+    fun recordSelectionChurn(changedRows: Int, residentRows: Int) {
+        require(changedRows >= 0 && residentRows >= 0)
+        require(changedRows <= residentRows)
+        selectionChurnPermille = if (residentRows == 0) {
+            0
+        } else {
+            (changedRows.toLong() * 1_000L / residentRows.toLong()).toInt()
+        }
     }
 
     @Synchronized
@@ -250,6 +263,19 @@ internal class RendererTelemetry {
     internal fun ownedBufferBytesSnapshot(): Int = ownedBufferBytes
 
     @Synchronized
+    internal fun pressureSnapshot(): RendererPressureSnapshot = RendererPressureSnapshot(
+        rendererOwnedBytes = ownedBufferBytes.toLong(),
+        maxUploadBytesPerFrame = peakFrameUploadBytes.toLong(),
+        selectionChurnPermille = selectionChurnPermille.toLong(),
+        buffersAcquired = uploadPageSubmissionCount.get().toLong(),
+        buffersReleased = completedUploadCount.toLong(),
+        callbacksAcquired = uploadPageSubmissionCount.get().toLong(),
+        callbacksReleased = completedUploadCount.toLong(),
+        rendererResourcesAcquired = resourceReplacementCount.toLong(),
+        rendererResourcesReleased = resourceDisposalCount.toLong(),
+    )
+
+    @Synchronized
     fun snapshot(): Map<String, Any> = mapOf(
         "rendererUpdateCount" to rendererUpdateCount,
         "ownedBufferBytes" to ownedBufferBytes,
@@ -313,6 +339,7 @@ internal class RendererTelemetry {
         "cumulativeResourceDisposalCount" to resourceDisposalCount,
         "residentRowCount" to residentRowCount,
         "residentGlyphCount" to residentGlyphCount,
+        "selectionChurnPermille" to selectionChurnPermille,
         "residentSemanticCentroidCount" to residentRowsByMode[
             CoveragePresentationMode.SEMANTIC_CENTROIDS
         ].orZero(),
@@ -367,6 +394,18 @@ internal class RendererTelemetry {
         private val fencedDestroyedUploadCallbacks = AtomicInteger()
     }
 }
+
+internal data class RendererPressureSnapshot(
+    val rendererOwnedBytes: Long,
+    val maxUploadBytesPerFrame: Long,
+    val selectionChurnPermille: Long,
+    val buffersAcquired: Long,
+    val buffersReleased: Long,
+    val callbacksAcquired: Long,
+    val callbacksReleased: Long,
+    val rendererResourcesAcquired: Long,
+    val rendererResourcesReleased: Long,
+)
 
 private fun CoverageRendererOwnershipReceipt.asMap(): Map<String, Any> = mapOf(
     "canonicalStateBytes" to canonicalStateBytes,

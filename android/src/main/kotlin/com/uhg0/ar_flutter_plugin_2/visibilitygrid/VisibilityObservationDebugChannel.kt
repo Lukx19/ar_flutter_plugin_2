@@ -44,6 +44,9 @@ internal class VisibilityObservationDebugChannel(
     private val runtime: AndroidVisibilityGridRuntime,
     ownership: () -> VisibilityObservationOwnership?,
     private val gate: VisibilityObservationDebugGate,
+    private val pressureOwners: () -> VisibilityPressureOwnerScalars = {
+        VisibilityPressureOwnerScalars()
+    },
 ) : MethodChannel.MethodCallHandler {
     private val channel = MethodChannel(messenger, "visibility_observation_v2_$viewId")
     private val source = SyntheticVisibilityObservationSource(runtime, ownership)
@@ -93,6 +96,12 @@ internal class VisibilityObservationDebugChannel(
                 }
                 "snapshot" -> result.success(
                     runtime.snapshotWireMap() + mapOf("mappingStalled" to gate.stalled()),
+                )
+                "pressureSnapshot" -> result.success(
+                    VisibilityPressureReceipt.capture(
+                        runtime.snapshot(),
+                        pressureOwners(),
+                    ).toWireMap(),
                 )
                 else -> result.notImplemented()
             }

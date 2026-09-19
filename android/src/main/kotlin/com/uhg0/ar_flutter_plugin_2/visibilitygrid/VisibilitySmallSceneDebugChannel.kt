@@ -1,0 +1,437 @@
+package com.uhg0.ar_flutter_plugin_2.visibilitygrid
+
+import io.flutter.plugin.common.BinaryMessenger
+import io.flutter.plugin.common.MethodCall
+import io.flutter.plugin.common.MethodChannel
+
+/**
+ * A finite, debug-only synthetic scene controller.
+ *
+ * The controller owns only fixture/scenario sequencing. Observation data still
+ * enters [AndroidVisibilityGridRuntime] through [SyntheticVisibilityObservationSource],
+ * and product state is exposed through the read-only hooks supplied by the
+ * production owner. No product counter or selector can be written by this
+ * channel.
+ */
+internal class VisibilitySmallSceneDebugChannel(
+    messenger: BinaryMessenger,
+    viewId: Int,
+    private val isDebuggable: Boolean,
+    private val runtime: AndroidVisibilityGridRuntime,
+    private val ownership: () -> VisibilityObservationOwnership?,
+    private val productHooks: VisibilitySmallSceneProductHooks =
+        VisibilitySmallSceneProductHooks.NONE,
+) : MethodChannel.MethodCallHandler {
+    private val channel = MethodChannel(messenger, "visibility_scenario_v2_$viewId")
+    private val source = SyntheticVisibilityObservationSource(runtime, ownership)
+    private val lock = Any()
+
+    private var scenarioId: String? = null
+    private var lastSequence = 0L
+    private val acceptedCommands = LinkedHashMap<Long, AcceptedSmallSceneCommand>()
+    private var completedDisarm: AcceptedSmallSceneCommand? = null
+    private var runtimePausedByDisarm = false
+    private var disposed = false
+
+    init {
+        channel.setMethodCallHandler(this)
+    }
+
+    override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
+        if (!isDebuggable) {
+            result.error(
+                "VG_SCENARIO_UNAVAILABLE",
+                "synthetic scene orchestration is debug-only",
+                null,
+            )
+            return
+        }
+        try {
+            synchronized(lock) {
+                check(!disposed) { "synthetic scene channel is disposed" }
+                when (call.method) {
+                    "arm" -> result.success(arm(call))
+                    "emit" -> result.success(runStep(call, parseStep(call.argument<String>("step"))))
+                    "setFault" -> result.success(runFault(call))
+                    "pauseResume" -> result.success(runPauseResume(call))
+                    "snapshot" -> result.success(runCommand(call, "SNAPSHOT") {})
+                    "disarm" -> result.success(disarm(call))
+                    else -> result.notImplemented()
+                }
+            }
+        } catch (error: Exception) {
+            result.error("VG_SCENARIO_REJECTED", error.message, null)
+        }
+    }
+
+    fun dispose() {
+        synchronized(lock) {
+            if (disposed) return
+            disposed = true
+            scenarioId = null
+            lastSequence = 0L
+            acceptedCommands.clear()
+            completedDisarm = null
+            runtimePausedByDisarm = false
+        }
+        channel.setMethodCallHandler(null)
+    }
+
+    private fun arm(call: MethodCall): Map<String, Any?> {
+        val requestedScenario = call.requiredScenarioId()
+        val capability = parseCapability(call.argument<String>("depthCapability"))
+        val sequence = call.requiredSequence()
+        val expectedBindingGeneration =
+            call.requiredPositiveLong("expectedBindingGeneration")
+        val expectedGroupGeneration =
+            call.requiredPositiveLong("expectedGroupGeneration")
+        val commandKey = listOf(
+            requestedScenario,
+            sequence,
+            SmallSceneStep.ARM.wireName,
+            capability.wireName,
+            expectedBindingGeneration,
+            expectedGroupGeneration,
+        ).joinToString(":")
+        if (scenarioId == requestedScenario) {
+            return replayOrReject(sequence, commandKey)
+                ?: error("ARM sequence is not retained")
+        }
+        check(scenarioId == null) { "a scenario is already armed" }
+        check(sequence == 1L) { "ARM must use sequence 1" }
+        val current = checkNotNull(runtimeOwnership())
+        check(expectedBindingGeneration == current.bindingGeneration) {
+            "binding generation does not match"
+        }
+        check(expectedGroupGeneration == current.groupGeneration) {
+            "group generation does not match"
+        }
+        if (runtimePausedByDisarm) {
+            check(runtime.resume()) { "runtime could not resume after DISARM" }
+            runtimePausedByDisarm = false
+        }
+
+        source.setDepthCapability(capability)
+        scenarioId = requestedScenario
+        lastSequence = sequence
+        acceptedCommands.clear()
+        completedDisarm = null
+        return rememberReceipt(sequence, commandKey)
+    }
+
+    private fun runStep(call: MethodCall, step: SmallSceneStep): Map<String, Any?> =
+        runCommand(call, step.wireName) {
+            when (step) {
+                SmallSceneStep.POPULATE_WALL -> emitFixture(intArrayOf(0, 1, 2, 3), 1_000_000_000L)
+                SmallSceneStep.POPULATE_CORNER -> emitFixture(intArrayOf(4, 5, 6, 7), 2_000_000_000L)
+                SmallSceneStep.ADD_FOREGROUND_OCCLUDER ->
+                    emitFixture(intArrayOf(8, 9, 10, 11), 3_000_000_000L)
+                SmallSceneStep.SECOND_VIEW -> emitFixture(intArrayOf(20, 21, 22, 23), 4_000_000_000L)
+                else -> error("step is not an observation fixture")
+            }
+        }
+
+    private fun runFault(call: MethodCall): Map<String, Any?> {
+        val fault = when (call.argument<String>("fault")) {
+            "rendererUnavailable" -> SmallSceneFault.RENDERER_UNAVAILABLE
+            "rendererRecovered" -> SmallSceneFault.RENDERER_RECOVERED
+            "guidanceTerminal" -> SmallSceneFault.GUIDANCE_TERMINAL
+            else -> error("unknown synthetic scene fault")
+        }
+        return runCommand(call, fault.wireName) {
+            when (fault) {
+                SmallSceneFault.RENDERER_UNAVAILABLE -> productHooks.rendererUnavailable()
+                SmallSceneFault.RENDERER_RECOVERED -> productHooks.rendererRecovered()
+                SmallSceneFault.GUIDANCE_TERMINAL -> productHooks.guidanceTerminal()
+            }
+        }
+    }
+
+    private fun runPauseResume(call: MethodCall): Map<String, Any?> =
+        runCommand(call, "pauseResume") {
+            runtime.pause()
+            productHooks.pause()
+            productHooks.resume()
+            check(runtime.resume()) { "runtime could not resume the current ownership cut" }
+        }
+
+    private fun disarm(call: MethodCall): Map<String, Any?> {
+        val requestedScenario = call.requiredScenarioId()
+        val sequence = call.requiredSequence()
+        val commandKey = "$requestedScenario:$sequence:${SmallSceneStep.DISARM.wireName}"
+        if (scenarioId == null) {
+            val completed = completedDisarm
+            check(completed != null && completed.commandKey == commandKey) {
+                "ARM is required before a scene command"
+            }
+            return completed.receipt
+        }
+        val receipt = runCommand(call, SmallSceneStep.DISARM.wireName) {
+            runtime.pause()
+            runtimePausedByDisarm = true
+        }
+        completedDisarm = checkNotNull(acceptedCommands[sequence])
+        scenarioId = null
+        lastSequence = 0L
+        acceptedCommands.clear()
+        return receipt
+    }
+
+    private fun runCommand(
+        call: MethodCall,
+        commandName: String,
+        action: () -> Unit,
+    ): Map<String, Any?> {
+        val activeScenario = checkNotNull(scenarioId) {
+            "ARM is required before a scene command"
+        }
+        val requestedScenario = call.requiredScenarioId()
+        check(requestedScenario == activeScenario) { "scenario ID does not match the armed scene" }
+        val sequence = call.requiredSequence()
+        val commandKey = "$activeScenario:$sequence:$commandName"
+        val replay = replayOrReject(sequence, commandKey)
+        if (replay != null) return replay
+        check(sequence == lastSequence + 1L) {
+            "scene sequence must be adjacent after $lastSequence"
+        }
+        check(sequence <= MAX_COMMAND_SEQUENCE) { "synthetic scene command limit exceeded" }
+        action()
+        lastSequence = sequence
+        return rememberReceipt(sequence, commandKey)
+    }
+
+    private fun emitFixture(markers: IntArray, firstTimestampNs: Long) {
+        var featureTimestamp = firstTimestampNs
+        var depthTimestamp = firstTimestampNs
+        markers.forEach { marker ->
+            source.emitFeature(featureTimestamp, marker)
+            source.emitDepth(depthTimestamp, marker)
+            featureTimestamp += FEATURE_INTERVAL_NS
+            depthTimestamp += DEPTH_INTERVAL_NS
+        }
+    }
+
+    private fun rememberReceipt(
+        sequence: Long,
+        commandKey: String,
+    ): Map<String, Any?> {
+        val receipt = receiptMap(sequence)
+        acceptedCommands[sequence] = AcceptedSmallSceneCommand(commandKey, receipt)
+        return receipt
+    }
+
+    private fun replayOrReject(
+        sequence: Long,
+        commandKey: String,
+    ): Map<String, Any?>? {
+        val accepted = acceptedCommands[sequence] ?: return null
+        check(accepted.commandKey == commandKey) {
+            "scene sequence $sequence was already used by a different command"
+        }
+        return accepted.receipt
+    }
+
+    private fun receiptMap(sequence: Long): Map<String, Any?> {
+        val health = runtime.snapshot()
+        val provided = productHooks.snapshot()
+        return SmallSceneScenarioReceipt(
+            scenarioId = checkNotNull(scenarioId),
+            sequence = sequence,
+            acceptedFeatureObservations = health.copiedFeatureObservations,
+            acceptedDepthObservations = health.copiedDepthObservations,
+            geometryRevision = provided.geometryRevision,
+            lineageRevision = provided.lineageRevision,
+            durableCaptureRevision = provided.durableCaptureRevision,
+            coverageRevision = provided.coverageRevision,
+            styleRevision = provided.styleRevision,
+            targetSurfaceId = provided.targetSurfaceId,
+            rendererRows = provided.rendererRows,
+            automaticEligible = provided.automaticEligible,
+            guidanceStatus = provided.guidanceStatus,
+            rootIsolateSurfaceBytes = provided.rootIsolateSurfaceBytes,
+            resourceBalance = provided.resourceBalance ?: health.resourceBalance,
+            callbackCopyP95Micros = health.callbackCopyP95Ns / 1_000L,
+            rootIsolateImageBytes = provided.rootIsolateImageBytes,
+            rendererOwnedBytes = provided.rendererOwnedBytes,
+        ).toMap()
+    }
+
+    private fun runtimeOwnership(): VisibilityObservationOwnership? = ownership()
+
+    private fun MethodCall.requiredSequence(): Long =
+        requiredPositiveLong("sequence")
+
+    private fun MethodCall.requiredPositiveLong(name: String): Long {
+        val value = when (val raw = argument<Any?>(name)) {
+            is Int -> raw.toLong()
+            is Long -> raw
+            null -> error("$name is required")
+            else -> error("$name must be an integer")
+        }
+        require(value > 0L) { "$name must be positive" }
+        return value
+    }
+
+    private fun MethodCall.requiredScenarioId(): String {
+        val value = argument<String>("scenarioId") ?: error("scenarioId is required")
+        require(value.length in 1..SCENARIO_ID_MAX_LENGTH)
+        require(value.all { it.code in 0x21..0x7e }) { "scenarioId must be printable ASCII" }
+        return value
+    }
+
+    private fun parseCapability(value: String?): VisibilityDepthCapability = when (value) {
+        "unsupported" -> VisibilityDepthCapability.UNSUPPORTED
+        "rawDepth" -> VisibilityDepthCapability.RAW_DEPTH
+        "automatic" -> VisibilityDepthCapability.AUTOMATIC
+        else -> error("unknown synthetic depth capability")
+    }
+
+    private fun parseStep(value: String?): SmallSceneStep = when (value) {
+        "wall" -> SmallSceneStep.POPULATE_WALL
+        "corner" -> SmallSceneStep.POPULATE_CORNER
+        "foregroundOccluder" -> SmallSceneStep.ADD_FOREGROUND_OCCLUDER
+        "secondView" -> SmallSceneStep.SECOND_VIEW
+        else -> error("unknown synthetic scene step")
+    }
+
+    private enum class SmallSceneFault(val wireName: String) {
+        RENDERER_UNAVAILABLE("rendererUnavailable"),
+        RENDERER_RECOVERED("rendererRecovered"),
+        GUIDANCE_TERMINAL("guidanceTerminal"),
+    }
+
+    companion object {
+        private const val SCENARIO_ID_MAX_LENGTH = 64
+        private const val MAX_COMMAND_SEQUENCE = 32L
+        private const val FEATURE_INTERVAL_NS = 125_000_000L
+        private const val DEPTH_INTERVAL_NS = 250_000_000L
+    }
+}
+
+private data class AcceptedSmallSceneCommand(
+    val commandKey: String,
+    val receipt: Map<String, Any?>,
+)
+
+internal enum class SmallSceneStep(val wireName: String) {
+    ARM("ARM"),
+    POPULATE_WALL("wall"),
+    POPULATE_CORNER("corner"),
+    ADD_FOREGROUND_OCCLUDER("foregroundOccluder"),
+    SECOND_VIEW("secondView"),
+    RENDERER_LOSS("rendererUnavailable"),
+    RENDERER_RESTORE("rendererRecovered"),
+    GUIDANCE_FAILURE("guidanceTerminal"),
+    PAUSE_RESUME("pauseResume"),
+    SNAPSHOT("SNAPSHOT"),
+    DISARM("DISARM"),
+}
+
+internal data class SmallSceneScenarioReceipt(
+    val scenarioId: String,
+    val sequence: Long,
+    val acceptedFeatureObservations: Long,
+    val acceptedDepthObservations: Long,
+    val geometryRevision: Long,
+    val lineageRevision: Long,
+    val durableCaptureRevision: Long,
+    val coverageRevision: Long,
+    val styleRevision: Long,
+    val targetSurfaceId: Long?,
+    val rendererRows: Int,
+    val automaticEligible: Boolean,
+    val guidanceStatus: String,
+    val rootIsolateSurfaceBytes: Long,
+    val resourceBalance: Long,
+    val callbackCopyP95Micros: Long = 0L,
+    val rootIsolateImageBytes: Long = 0L,
+    val rendererOwnedBytes: Long = 0L,
+) {
+    init {
+        require(scenarioId.isNotEmpty() && scenarioId.length <= 64)
+        require(sequence > 0L)
+        require(acceptedFeatureObservations >= 0L)
+        require(acceptedDepthObservations >= 0L)
+        require(geometryRevision >= 0L)
+        require(lineageRevision >= 0L)
+        require(durableCaptureRevision >= 0L)
+        require(coverageRevision >= 0L)
+        require(styleRevision >= 0L)
+        require(targetSurfaceId == null || targetSurfaceId >= 0L)
+        require(rendererRows >= 0)
+        require(guidanceStatus.isNotEmpty() && guidanceStatus.length <= 64)
+        require(rootIsolateSurfaceBytes >= 0L)
+        require(resourceBalance >= 0L)
+        require(callbackCopyP95Micros >= 0L)
+        require(rootIsolateImageBytes >= 0L)
+        require(rendererOwnedBytes >= 0L)
+    }
+
+    fun toMap(): Map<String, Any?> = mapOf(
+        "scenarioId" to scenarioId,
+        "sequence" to sequence,
+        "acceptedFeatureObservations" to acceptedFeatureObservations,
+        "acceptedDepthObservations" to acceptedDepthObservations,
+        "geometryRevision" to geometryRevision,
+        "lineageRevision" to lineageRevision,
+        "durableCaptureRevision" to durableCaptureRevision,
+        "coverageRevision" to coverageRevision,
+        "styleRevision" to styleRevision,
+        "targetSurfaceId" to targetSurfaceId,
+        "rendererRows" to rendererRows,
+        "automaticEligible" to automaticEligible,
+        "guidanceStatus" to guidanceStatus,
+        "rootIsolateSurfaceBytes" to rootIsolateSurfaceBytes,
+        "resourceBalance" to resourceBalance,
+        "callbackCopyP95Micros" to callbackCopyP95Micros,
+        "rootIsolateImageBytes" to rootIsolateImageBytes,
+        "rendererOwnedBytes" to rendererOwnedBytes,
+    )
+}
+
+/** Production-owner actions plus read-only scalars for the eventual ArView hook. */
+internal interface VisibilitySmallSceneProductHooks {
+    fun rendererUnavailable() { error("renderer-unavailable production hook is not wired") }
+    fun rendererRecovered() { error("renderer-recovered production hook is not wired") }
+    fun guidanceTerminal() { error("guidance-terminal production hook is not wired") }
+    fun pause() { error("pause production hook is not wired") }
+    fun resume() { error("resume production hook is not wired") }
+    fun snapshot(): VisibilitySmallSceneReceiptScalars = VisibilitySmallSceneReceiptScalars()
+
+    companion object {
+        val NONE: VisibilitySmallSceneProductHooks = object : VisibilitySmallSceneProductHooks {}
+    }
+}
+
+/** Scalar product-owned values copied into a scenario receipt; never writable by the channel. */
+internal data class VisibilitySmallSceneReceiptScalars(
+    val geometryRevision: Long = 0L,
+    val lineageRevision: Long = 0L,
+    val durableCaptureRevision: Long = 0L,
+    val coverageRevision: Long = 0L,
+    val styleRevision: Long = 0L,
+    val targetSurfaceId: Long? = null,
+    val rendererRows: Int = 0,
+    val automaticEligible: Boolean = false,
+    val guidanceStatus: String = "starting",
+    val rootIsolateSurfaceBytes: Long = 0L,
+    val resourceBalance: Long? = null,
+    val rootIsolateImageBytes: Long = 0L,
+    val rendererOwnedBytes: Long = 0L,
+) {
+    init {
+        require(geometryRevision >= 0L)
+        require(lineageRevision >= 0L)
+        require(durableCaptureRevision >= 0L)
+        require(coverageRevision >= 0L)
+        require(styleRevision >= 0L)
+        require(targetSurfaceId == null || targetSurfaceId >= 0L)
+        require(rendererRows >= 0)
+        require(guidanceStatus.length in 1..64)
+        require(guidanceStatus.all { it.code in 0x21..0x7e })
+        require(rootIsolateSurfaceBytes >= 0L)
+        require(resourceBalance == null || resourceBalance >= 0L)
+        require(rootIsolateImageBytes >= 0L)
+        require(rendererOwnedBytes >= 0L)
+    }
+}

@@ -6,6 +6,8 @@ export 'package:ar_flutter_plugin_2/managers/ar_capture_manager.dart';
 export 'package:ar_flutter_plugin_2/managers/ar_anchor_manager.dart';
 export 'package:ar_flutter_plugin_2/managers/ar_object_manager.dart';
 export 'package:ar_flutter_plugin_2/managers/ar_visibility_grid_v2_control.dart';
+export 'package:ar_flutter_plugin_2/managers/ar_visibility_pressure_receipt.dart';
+export 'package:ar_flutter_plugin_2/managers/ar_visibility_synthetic_scene.dart';
 export 'package:ar_flutter_plugin_2/managers/ar_visibility_surface_stream.dart';
 export 'package:ar_flutter_plugin_2/models/ar_coverage_renderer.dart';
 export 'package:ar_flutter_plugin_2/managers/ar_location_manager.dart';

@@ -52,6 +52,12 @@ internal class AndroidVisibilityGridRuntime(
     private var depthHealth = VisibilitySourceHealth.UNSUPPORTED
     private var depthCapability = VisibilityDepthCapability.UNSUPPORTED
     private var syntheticSource = false
+    private var offeredFeatureObservations = 0L
+    private var offeredDepthObservations = 0L
+    private var droppedFeatureObservations = 0L
+    private var droppedDepthObservations = 0L
+    private var maximumFeatureSamples = 0
+    private var maximumDepthSamples = 0
     private var copiedFeatureObservations = 0L
     private var copiedDepthObservations = 0L
     private var admittedFeatureObservations = 0L
@@ -108,7 +114,10 @@ internal class AndroidVisibilityGridRuntime(
             beforeLaneDiscardResidentPublication(VisibilityObservationSource.SYNTHETIC_FEATURE)
         },
         onReplacement = { synchronized(lock) { replacedFeatureObservations++ } },
-        onStale = { synchronized(lock) { staleGenerationObservations++ } },
+        onStale = { synchronized(lock) {
+            staleGenerationObservations++
+            droppedFeatureObservations++
+        } },
         onResidentBytesChanged = { bytes -> updateResidentBytes(featureBytes = bytes) },
     )
     private val depthLane = LatestObservationLane(
@@ -124,7 +133,10 @@ internal class AndroidVisibilityGridRuntime(
             beforeLaneDiscardResidentPublication(VisibilityObservationSource.SYNTHETIC_DEPTH)
         },
         onReplacement = { synchronized(lock) { replacedDepthObservations++ } },
-        onStale = { synchronized(lock) { staleGenerationObservations++ } },
+        onStale = { synchronized(lock) {
+            staleGenerationObservations++
+            droppedDepthObservations++
+        } },
         onResidentBytesChanged = { bytes -> updateResidentBytes(depthBytes = bytes) },
     )
 
@@ -153,6 +165,9 @@ internal class AndroidVisibilityGridRuntime(
                     synchronized(lock) {
                         lifecycleDiscardedObservations = Math.addExact(
                             lifecycleDiscardedObservations, discarded,
+                        )
+                        droppedDepthObservations = Math.addExact(
+                            droppedDepthObservations, discarded,
                         )
                     }
                 }
@@ -216,24 +231,33 @@ internal class AndroidVisibilityGridRuntime(
         callbackCopyNs: Long = 0,
     ): Boolean = lifecycleLock.read {
         synchronized(lock) {
+            offeredFeatureObservations++
+            maximumFeatureSamples = maxOf(maximumFeatureSamples, observation.samples.size)
             if (paused) {
                 pausedObservationRejections++
+                droppedFeatureObservations++
                 return@read false
             }
-            if (featureHealth == VisibilitySourceHealth.FAILED) return@read false
+            if (featureHealth == VisibilitySourceHealth.FAILED) {
+                droppedFeatureObservations++
+                return@read false
+            }
             if (closed || !isStructurallyValid(observation) ||
                 observation.samples.size > featureSampleCapacity() ||
                 (callbackCopyBudgetDegraded && !isCaptureSafe())
             ) {
                 invalidFeatureObservations++
+                droppedFeatureObservations++
                 return@read false
             }
             if (observation.frame.sourceTimestampNs <= featureLastCopiedTimestampNs) {
                 duplicateFeatureObservations++
+                droppedFeatureObservations++
                 return@read false
             }
             if (ownership() != observation.ownership) {
                 staleGenerationObservations++
+                droppedFeatureObservations++
                 return@read false
             }
             featureLastCopiedTimestampNs = observation.frame.sourceTimestampNs
@@ -253,24 +277,33 @@ internal class AndroidVisibilityGridRuntime(
         callbackCopyNs: Long = 0,
     ): Boolean = lifecycleLock.read {
         synchronized(lock) {
+            offeredDepthObservations++
+            maximumDepthSamples = maxOf(maximumDepthSamples, observation.samples.size)
             if (paused) {
                 pausedObservationRejections++
+                droppedDepthObservations++
                 return@read false
             }
-            if (depthHealth == VisibilitySourceHealth.FAILED) return@read false
+            if (depthHealth == VisibilitySourceHealth.FAILED) {
+                droppedDepthObservations++
+                return@read false
+            }
             if (closed || callbackCopyBudgetDegraded ||
                 depthCapability == VisibilityDepthCapability.UNSUPPORTED ||
                 !isStructurallyValid(observation)
             ) {
                 invalidDepthObservations++
+                droppedDepthObservations++
                 return@read false
             }
             if (observation.frame.sourceTimestampNs <= depthLastCopiedTimestampNs) {
                 duplicateDepthObservations++
+                droppedDepthObservations++
                 return@read false
             }
             if (ownership() != observation.ownership) {
                 staleGenerationObservations++
+                droppedDepthObservations++
                 return@read false
             }
             depthLastCopiedTimestampNs = observation.frame.sourceTimestampNs
@@ -371,8 +404,13 @@ internal class AndroidVisibilityGridRuntime(
         // Mapper invalidation happens before lane drain so a callback which
         // already crossed deliverFeature cannot commit behind the pause cut.
         mapper.pause()
-        val discarded = featureLane.pauseAndDiscard() + depthLane.pauseAndDiscard()
-        synchronized(lock) { lifecycleDiscardedObservations += discarded }
+        val featureDiscarded = featureLane.pauseAndDiscard()
+        val depthDiscarded = depthLane.pauseAndDiscard()
+        synchronized(lock) {
+            lifecycleDiscardedObservations += featureDiscarded + depthDiscarded
+            droppedFeatureObservations += featureDiscarded
+            droppedDepthObservations += depthDiscarded
+        }
     }
 
     /** Resumes the exact paused cut, or fences and rolls over to its replacement. */
@@ -386,11 +424,14 @@ internal class AndroidVisibilityGridRuntime(
         if (previous == current) {
             synchronized(lock) { sameCutResumeCount++ }
         } else {
-            val discarded = featureLane.pauseAndDiscard() + depthLane.pauseAndDiscard()
+            val featureDiscarded = featureLane.pauseAndDiscard()
+            val depthDiscarded = depthLane.pauseAndDiscard()
             val ingressBefore = mapper.snapshot().residentObservations
             mapper.rollover(current)
             synchronized(lock) {
-                lifecycleDiscardedObservations += discarded
+                lifecycleDiscardedObservations += featureDiscarded + depthDiscarded
+                droppedFeatureObservations += featureDiscarded
+                droppedDepthObservations += depthDiscarded
                 rolloverDiscardedIngressObservations += ingressBefore
                 ownershipRolloverCount++
                 featureLastCopiedTimestampNs = Long.MIN_VALUE
@@ -413,6 +454,14 @@ internal class AndroidVisibilityGridRuntime(
 
     fun snapshot(): VisibilityObservationHealth = synchronized(lock) {
         VisibilityObservationHealth(
+            offeredFeatureObservations = offeredFeatureObservations,
+            offeredDepthObservations = offeredDepthObservations,
+            droppedFeatureObservations = droppedFeatureObservations,
+            droppedDepthObservations = droppedDepthObservations,
+            maximumFeatureSamples = maximumFeatureSamples,
+            maximumDepthSamples = maximumDepthSamples,
+            featureMaximumHz = 1_000_000_000L / featureIntervalNs,
+            depthMaximumHz = 1_000_000_000L / depthIntervalNs,
             featureHealth = featureHealth,
             depthHealth = depthHealth,
             depthCapability = depthCapability,
@@ -555,8 +604,14 @@ internal class AndroidVisibilityGridRuntime(
             }
         }
         when (terminal) {
-            1 -> synchronized(lock) { lifecycleDiscardedObservations++ }
-            2 -> synchronized(lock) { staleGenerationObservations++ }
+            1 -> synchronized(lock) {
+                lifecycleDiscardedObservations++
+                droppedFeatureObservations++
+            }
+            2 -> synchronized(lock) {
+                staleGenerationObservations++
+                droppedFeatureObservations++
+            }
             else -> {
                 mapper.admitFeature(observation)
                 recordMapperAdmissionDelta(mapper.snapshot())
@@ -576,8 +631,14 @@ internal class AndroidVisibilityGridRuntime(
             }
         }
         when (terminal) {
-            1 -> synchronized(lock) { lifecycleDiscardedObservations++ }
-            2 -> synchronized(lock) { staleGenerationObservations++ }
+            1 -> synchronized(lock) {
+                lifecycleDiscardedObservations++
+                droppedDepthObservations++
+            }
+            2 -> synchronized(lock) {
+                staleGenerationObservations++
+                droppedDepthObservations++
+            }
             else -> {
                 mapper.admitDepth(observation)
                 recordMapperAdmissionDelta(mapper.snapshot())
@@ -608,9 +669,14 @@ internal class AndroidVisibilityGridRuntime(
         }
         val drainFeature = feature || bothUnusable
         val drainDepth = depth || bothUnusable
-        val discarded = (if (drainFeature) featureLane.pauseAndDiscard() else 0) +
-            (if (drainDepth) depthLane.pauseAndDiscard() else 0)
-        synchronized(lock) { lifecycleDiscardedObservations = Math.addExact(lifecycleDiscardedObservations, discarded) }
+        val featureDiscarded = if (drainFeature) featureLane.pauseAndDiscard() else 0
+        val depthDiscarded = if (drainDepth) depthLane.pauseAndDiscard() else 0
+        val discarded = featureDiscarded + depthDiscarded
+        synchronized(lock) {
+            lifecycleDiscardedObservations = Math.addExact(lifecycleDiscardedObservations, discarded)
+            droppedFeatureObservations = Math.addExact(droppedFeatureObservations, featureDiscarded)
+            droppedDepthObservations = Math.addExact(droppedDepthObservations, depthDiscarded)
+        }
         return UnusableIngressDrain(drainFeature, drainDepth)
     }
 
@@ -637,6 +703,14 @@ internal class AndroidVisibilityGridRuntime(
 }
 
 internal data class VisibilityObservationHealth(
+    val offeredFeatureObservations: Long,
+    val offeredDepthObservations: Long,
+    val droppedFeatureObservations: Long,
+    val droppedDepthObservations: Long,
+    val maximumFeatureSamples: Int,
+    val maximumDepthSamples: Int,
+    val featureMaximumHz: Long,
+    val depthMaximumHz: Long,
     val featureHealth: VisibilitySourceHealth,
     val depthHealth: VisibilitySourceHealth,
     val depthCapability: VisibilityDepthCapability,
@@ -695,6 +769,14 @@ internal data class VisibilityObservationHealth(
 
     fun toWireMap(): Map<String, Any> = mapOf(
         "version" to VISIBILITY_OBSERVATION_VERSION,
+        "offeredFeatureObservations" to offeredFeatureObservations,
+        "offeredDepthObservations" to offeredDepthObservations,
+        "droppedFeatureObservations" to droppedFeatureObservations,
+        "droppedDepthObservations" to droppedDepthObservations,
+        "maximumFeatureSamples" to maximumFeatureSamples,
+        "maximumDepthSamples" to maximumDepthSamples,
+        "featureMaximumHz" to featureMaximumHz,
+        "depthMaximumHz" to depthMaximumHz,
         "featureHealth" to featureHealth.wireName,
         "depthHealth" to depthHealth.wireName,
         "depthCapability" to depthCapability.wireName,

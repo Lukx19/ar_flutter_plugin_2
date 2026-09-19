@@ -300,6 +300,24 @@ class VisibilityGridV2Binding internal constructor(
         }
     }
 
+    /** Read-only authoritative cut for scalar diagnostics owned by this binding. */
+    internal fun currentCommittedBaseline(): CommittedBaselineV1 {
+        replacementBinding?.let { return it.currentCommittedBaseline() }
+        return synchronized(publicationFence) {
+            val sessionId = activeSessionId ?: return@synchronized CommittedBaselineV1.ZERO
+            val captureGroupId = activeCaptureGroupId
+                ?: return@synchronized CommittedBaselineV1.ZERO
+            CommittedBaselineAuthority.snapshot(
+                CommittedBaselineScopeV1(
+                    sessionId = sessionId,
+                    captureGroupId = captureGroupId,
+                    sessionGeneration = activeSessionGeneration,
+                    groupGeneration = activeGroupGeneration,
+                ),
+            )
+        }
+    }
+
     internal fun attachObservationRuntime(runtime: AndroidVisibilityGridRuntime) {
         observationRuntime = runtime
         replacementBinding?.attachObservationRuntime(runtime)
