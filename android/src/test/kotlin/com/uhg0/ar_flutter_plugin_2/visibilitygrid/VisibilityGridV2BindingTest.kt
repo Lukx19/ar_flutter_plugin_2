@@ -16,6 +16,8 @@ import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.StartRequestCodecV2
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.RendererStyleCommandV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.RendererStyleCutPayloadV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.TransactionResponseProfileV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.TransactionResponseCodecV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.TransactionChunkFrameV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.Uuid
 import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationMode
 import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationPage
@@ -1437,6 +1439,91 @@ class VisibilityGridV2BindingTest {
             assertTrue(start.errorMessage?.contains("not correlated") == true)
             assertEquals(null, binding.currentObservationOwnership())
         } finally { binding.dispose() }
+    }
+
+    @Test
+    fun `negotiated response ceiling frames bootstrap and subsequent multichunk delta`() {
+        val messenger = MethodTestMessenger()
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 128,
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
+            postToMain = { it() },
+        )
+        try {
+            val snapshot = binding.snapshot()
+            val qualifier = snapshot.nativeStreamToken + snapshot.workerBindingToken
+            val start = RecordingResult()
+            MethodChannel(messenger, "visibility_grid_v2_control_128").invokeMethod(
+                "start", qualifier + ControlCodec.encodeRequest(startRequest()), start,
+            )
+            assertTrue(start.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(1, start.successCount)
+            val receipt = ControlCodec.decodeResponse(
+                stripQualifier(start.successValue as ByteArray, qualifier),
+            )
+            val ceiling = ByteBuffer.wrap(receipt.payload)
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN).getInt(64)
+            assertEquals(4096, ceiling)
+            var sequence = 1L
+            fun exchange(transaction: Long, geometry: Long, lineage: Long): PacketCodec.Response {
+                val reply = RecordingBinaryReply()
+                messenger.send(
+                    "visibility_surface_stream_128",
+                    ByteBuffer.wrap(qualifier + PacketCodec.encodeRequest(PacketCodec.Request(
+                        requestFlags = 0,
+                        streamToken = receipt.streamToken,
+                        acknowledgedTransactionId = transaction,
+                        acknowledgedGeometryRevision = geometry,
+                        acknowledgedLineageRevision = lineage,
+                        nextStyleRevision = 0,
+                        maximumResponseBytes = ceiling,
+                        styleRecords = emptyList(),
+                        commandBytes = byteArrayOf(),
+                        requestSequence = sequence++,
+                    ))),
+                    reply,
+                )
+                assertTrue(reply.completed.await(2, TimeUnit.SECONDS))
+                val bytes = stripQualifier(requireNotNull(reply.bytes), qualifier)
+                assertTrue("Response exceeded negotiated ceiling", bytes.size <= ceiling)
+                return PacketCodec.decodeResponse(bytes).also {
+                    assertEquals("Unexpected protocol error", 0, it.errorId)
+                }
+            }
+            assertEquals(2, exchange(0, 0, 0).messageKind)
+            assertEquals(4, exchange(0, 0, 0).messageKind)
+            assertEquals(0, exchange(1, 1, 1).messageKind)
+            assertEquals(1L, requireNotNull(binding.committedEmptyBaseline()).transactionId)
+
+            val selector = CurrentDeltaSelectorV1(2, 2, 1)
+            val payload = ByteArray(10_000) { (it % 251).toByte() }
+            binding.queueCommittedCurrentDelta(
+                CurrentDeltaSourceV1 { requested ->
+                    CurrentDeltaReceiptV1(selector, 1, payload, ByteArray(32) { 7 })
+                        .takeIf { requested == selector }
+                },
+                selector,
+            )
+            assertEquals(2, exchange(1, 1, 1).messageKind)
+            val rebuilt = java.io.ByteArrayOutputStream()
+            val chunkCount = TransactionResponseProfileV1(ceiling).chunkCount(payload.size)
+            assertTrue(chunkCount > 1)
+            repeat(chunkCount) {
+                val chunk = TransactionResponseCodecV1.decodeFrame(exchange(1, 1, 1))
+                    as TransactionChunkFrameV1
+                rebuilt.write(chunk.value.bytes)
+            }
+            assertArrayEquals(payload, rebuilt.toByteArray())
+            assertEquals(4, exchange(1, 1, 1).messageKind)
+            val acknowledged = exchange(2, 2, 1)
+            assertEquals(0, acknowledged.messageKind)
+            assertEquals(2L, acknowledged.transactionId)
+            assertEquals(2L, acknowledged.targetGeometryRevision)
+            assertEquals(1L, acknowledged.targetLineageRevision)
+        } finally {
+            binding.dispose()
+        }
     }
 
     @Test

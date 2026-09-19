@@ -398,7 +398,7 @@ class VisibilityGridV2Binding internal constructor(
         streamChannel.queueCurrentDelta(
             CurrentDeltaSourceV1 { requested -> receipt.takeIf { requested == selector } },
             selector,
-            TransactionResponseProfileV1.ordinary,
+            negotiatedOrdinaryResponseProfile(),
         )
         pendingPublicationCut = candidate
         return CurrentDeltaQueueResult.QUEUED
@@ -1175,6 +1175,7 @@ class VisibilityGridV2Binding internal constructor(
             initialTransactionQueued = true
             return
         }
+        val responseProfile = negotiatedOrdinaryResponseProfile()
         streamChannel.queueStructuralTransaction(
             StructuralTransactionProducerV1.produce(
                 transactionId = 1,
@@ -1182,8 +1183,9 @@ class VisibilityGridV2Binding internal constructor(
                 targetGeometryRevision = baseline.geometryRevision + 1,
                 targetLineageRevision = baseline.lineageRevision + 1,
                 bytes = byteArrayOf(),
+                responseProfile = responseProfile,
             ),
-            TransactionResponseProfileV1.ordinary,
+            responseProfile,
         )
         expectedEmptyBootstrap = CurrentDeltaSelectorV1(
             transactionId = 1,
@@ -1192,6 +1194,12 @@ class VisibilityGridV2Binding internal constructor(
         )
         initialTransactionQueued = true
     }
+
+    private fun negotiatedOrdinaryResponseProfile() = TransactionResponseProfileV1(
+        requireNotNull(lifecycle.successfulStartConfiguration()) {
+            "Structural delivery requires an accepted START configuration"
+        }.requestedOrdinaryResponseBytes,
+    )
 
     /**
      * Fences one worker binding and creates a fresh binding on the same view.
