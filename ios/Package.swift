@@ -3,7 +3,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "VisibilityGridCoreValidation",
+    name: "PluginDeclarationValidation",
     targets: [
         .target(
             name: "ar_flutter_plugin_2",
@@ -15,27 +15,11 @@ let package = Package(
                 "IosARView.swift",
                 "IosARViewFactory.swift",
                 "JWTGenerator.swift",
-                "SceneDepthAdapter.swift",
                 "Serialization",
-                "SwiftArFlutterPlugin.swift",
-                "VisibilityGridChannel.swift",
-                "VisibilityGridRenderer.swift"
+                "SwiftArFlutterPlugin.swift"
             ],
             sources: [
-                "VisibilityGridAssociation.swift",
-                "VisibilityGridCore.swift",
-                "VisibilityGridTypes.swift",
-                "PortableVisibilityInterfaces.swift"
-            ]
-        ),
-        .testTarget(
-            name: "VisibilityGridCoreTests",
-            dependencies: ["ar_flutter_plugin_2"],
-            path: "Tests",
-            exclude: ["VisibilityGridDepthRendererLifecycleTests.swift"],
-            sources: [
-                "VisibilityGridCoreTests.swift",
-                "VisibilityGridDepthCoreTests.swift",
+                "CaptureIntentInterfaces.swift"
             ]
         )
     ],

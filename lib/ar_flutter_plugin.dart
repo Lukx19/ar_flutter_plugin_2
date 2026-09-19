@@ -5,10 +5,9 @@ export 'package:ar_flutter_plugin_2/managers/ar_session_manager.dart';
 export 'package:ar_flutter_plugin_2/managers/ar_capture_manager.dart';
 export 'package:ar_flutter_plugin_2/managers/ar_anchor_manager.dart';
 export 'package:ar_flutter_plugin_2/managers/ar_object_manager.dart';
-export 'package:ar_flutter_plugin_2/managers/ar_point_cloud_manager.dart';
-export 'package:ar_flutter_plugin_2/managers/ar_visibility_grid_manager.dart';
 export 'package:ar_flutter_plugin_2/managers/ar_visibility_grid_v2_control.dart';
 export 'package:ar_flutter_plugin_2/managers/ar_visibility_surface_stream.dart';
+export 'package:ar_flutter_plugin_2/models/ar_coverage_renderer.dart';
 export 'package:ar_flutter_plugin_2/managers/ar_location_manager.dart';
 
 // Camera Capabilities API
@@ -19,8 +18,6 @@ export 'package:ar_flutter_plugin_2/models/ar_capture_config.dart';
 export 'package:ar_flutter_plugin_2/models/ar_capture_result.dart';
 export 'package:ar_flutter_plugin_2/models/ar_frame_pose.dart';
 export 'package:ar_flutter_plugin_2/models/ar_camera_intrinsics.dart';
-export 'package:ar_flutter_plugin_2/models/ar_point_cloud.dart';
-export 'package:ar_flutter_plugin_2/models/ar_visibility_grid.dart';
 export 'package:ar_flutter_plugin_2/models/camera_resolution.dart';
 export 'package:ar_flutter_plugin_2/models/focal_length.dart';
 export 'package:ar_flutter_plugin_2/models/image_size.dart';

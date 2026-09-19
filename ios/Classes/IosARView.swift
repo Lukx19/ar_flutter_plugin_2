@@ -12,7 +12,6 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
     let objectManagerChannel: FlutterMethodChannel
     let anchorManagerChannel: FlutterMethodChannel
     let captureChannel: FlutterMethodChannel
-    let visibilityGridChannel: VisibilityGridChannel
     var showPlanes = false
     var planeCount = 0
     var customPlaneTexturePath: String? = nil
@@ -52,11 +51,6 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
         self.objectManagerChannel = FlutterMethodChannel(name: "arobjects_\(viewId)", binaryMessenger: messenger)
         self.anchorManagerChannel = FlutterMethodChannel(name: "aranchors_\(viewId)", binaryMessenger: messenger)
         self.captureChannel = FlutterMethodChannel(name: "arcapture_\(viewId)", binaryMessenger: messenger)
-        self.visibilityGridChannel = VisibilityGridChannel(
-            messenger: messenger,
-            viewId: viewId,
-            rootNode: createdSceneView.scene.rootNode
-        )
         super.init()
 
         let configuration = ARWorldTrackingConfiguration() // Create default configuration before initializeARView is called
@@ -81,7 +75,6 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
                 self.objectManagerChannel.setMethodCallHandler(nil)
                 self.anchorManagerChannel.setMethodCallHandler(nil)
                 self.captureChannel.setMethodCallHandler(nil)
-                self.visibilityGridChannel.dispose()
                 result(nil)
             }
 
@@ -420,7 +413,6 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
     }
     
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        visibilityGridChannel.onFrame(frame)
         if (arcoreMode) {
             do {
                 try arcoreSession!.update(frame)
@@ -431,18 +423,15 @@ class IosARView: NSObject, FlutterPlatformView, ARSCNViewDelegate, UIGestureReco
     }
 
     func sessionWasInterrupted(_ session: ARSession) {
-        visibilityGridChannel.pause()
     }
 
     func sessionInterruptionEnded(_ session: ARSession) {
-        visibilityGridChannel.resume()
     }
 
     func session(
         _ session: ARSession,
         didFailWithError error: Error
     ) {
-        visibilityGridChannel.pause()
     }
 
     func addNode(dict_node: Dictionary<String, Any>, dict_anchor: Dictionary<String, Any>? = nil) -> Future<Bool, Never> {
@@ -877,7 +866,6 @@ extension IosARView: ARCoachingOverlayViewDelegate {
     
     func coachingOverlayViewDidRequestSessionReset(_ coachingOverlayView: ARCoachingOverlayView) {
         // Reset the session.
-        self.visibilityGridChannel.resetSession()
         self.sceneView.session.run(configuration, options: [.resetTracking])
     }
 }
