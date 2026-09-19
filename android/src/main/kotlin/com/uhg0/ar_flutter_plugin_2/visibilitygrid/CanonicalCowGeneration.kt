@@ -6,8 +6,6 @@ import java.io.DataOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.nio.channels.FileChannel
-import java.nio.file.StandardOpenOption
 import java.security.MessageDigest
 
 private data class CowIndexMemoryReceipt(
@@ -551,8 +549,7 @@ internal class CanonicalCowGeneration private constructor(
             a.kind == b.kind && a.page == b.page && a.minimumKey == b.minimumKey && a.maximumKey == b.maximumKey && a.offset == b.offset && a.length == b.length && a.count == b.count && a.hash.contentEquals(b.hash)
         }
         internal fun sync(directory: File) {
-            if (!System.getProperty("os.name").orEmpty().startsWith("Windows", true))
-                FileChannel.open(directory.toPath(), StandardOpenOption.READ).use { it.force(true) }
+            VisibilityGridDirectorySync.sync(directory)
         }
     }
 }

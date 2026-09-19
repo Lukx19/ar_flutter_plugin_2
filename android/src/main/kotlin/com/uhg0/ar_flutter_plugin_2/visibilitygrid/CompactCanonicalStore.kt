@@ -5,10 +5,8 @@ import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetCandidateReservationV2
 import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetReservationV2
 import java.io.File
 import java.io.RandomAccessFile
-import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
-import java.nio.file.StandardOpenOption
 
 internal interface CanonicalFeaturePlanningView {
     val cut: CompactCanonicalCut
@@ -1311,13 +1309,13 @@ private constructor(
                 budget.verifyCandidate(requireNotNull(reservation), staging)
                 if (fault == CompactCanonicalMigrationFault.AFTER_ROOT_SYNC) error("fault")
                 if (fault == CompactCanonicalMigrationFault.BEFORE_STAGING_SYNC) error("fault")
-                syncDirectory(staging)
+                VisibilityGridDirectorySync.sync(staging)
                 if (fault == CompactCanonicalMigrationFault.AFTER_STAGING_SYNC) error("fault")
                 if (fault == CompactCanonicalMigrationFault.BEFORE_RENAME) error("fault")
                 budget.publishCandidate(requireNotNull(reservation), staging, target)
                 published = true
                 if (fault == CompactCanonicalMigrationFault.AFTER_RENAME) error("fault")
-                syncDirectory(directory)
+                VisibilityGridDirectorySync.sync(directory)
                 if (fault == CompactCanonicalMigrationFault.AFTER_PARENT_SYNC) error("fault")
                 val actual = budget.allocatedBytes(target)
                 budget.commit(requireNotNull(reservation), actual)
@@ -1553,11 +1551,6 @@ private constructor(
                 legacy.supportCount <= configuration.surfaceCapacity + configuration.lineageCapacity
             )
             require(legacy.baseline == configuration.seededEmptyBaseline)
-        }
-
-        private fun syncDirectory(directory: File) {
-            if (!(System.getProperty("os.name") ?: "").startsWith("Windows", true))
-                FileChannel.open(directory.toPath(), StandardOpenOption.READ).use { it.force(true) }
         }
 
         private fun candidateDirectory(parent: File, group: SurfaceGroup) =

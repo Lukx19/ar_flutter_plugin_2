@@ -7,10 +7,8 @@ import java.io.DataOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
-import java.nio.file.StandardOpenOption
 import java.security.MessageDigest
 
 /**
@@ -423,8 +421,7 @@ internal class PrivateRootSelector(
         private fun round(bytes: Long, unit: Long) = if (bytes == 0L) 0L else Math.multiplyExact((bytes - 1L) / unit + 1L, unit)
         private fun phasePeakBytes(roots: Int) = Math.addExact(FIXED_PHASE_BYTES, Math.multiplyExact(roots.toLong(), ROOT_RUNTIME_BYTES))
         private fun sync(directory: File) {
-            if (!System.getProperty("os.name").orEmpty().startsWith("Windows", true))
-                FileChannel.open(directory.toPath(), StandardOpenOption.READ).use { it.force(true) }
+            VisibilityGridDirectorySync.sync(directory)
         }
         private fun hash(bytes: ByteArray) = CanonicalReceiptBytes(MessageDigest.getInstance("SHA-256").digest(bytes))
         private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }

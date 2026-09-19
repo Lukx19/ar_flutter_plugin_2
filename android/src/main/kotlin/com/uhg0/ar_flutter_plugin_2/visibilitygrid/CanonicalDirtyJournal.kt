@@ -9,10 +9,8 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
-import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
-import java.nio.file.StandardOpenOption
 import java.security.MessageDigest
 import java.security.DigestInputStream
 import java.security.DigestOutputStream
@@ -217,14 +215,14 @@ internal class CanonicalDirtyJournal private constructor(
             syncCandidateFiles(staging, files.keys)
             inject(fault, kind.afterFsync)
             budget.verifyCandidate(requireNotNull(token), staging)
-            syncDirectory(staging)
+            VisibilityGridDirectorySync.sync(staging)
             inject(fault, kind.beforePublish)
             budget.publishCandidate(requireNotNull(token), staging, target)
             published = true
             inject(fault, kind.afterPublish)
             budget.verifyCandidate(requireNotNull(token), target)
             inject(fault, kind.beforeParentSync)
-            syncDirectory(directory)
+            VisibilityGridDirectorySync.sync(directory)
             inject(fault, kind.afterParentSync)
             inject(fault, kind.beforeBudgetCommit)
             budget.commit(requireNotNull(token), budget.allocatedBytes(target))
@@ -299,11 +297,6 @@ internal class CanonicalDirtyJournal private constructor(
         private fun roundPhysical(bytes: Long, unit: Long): Long {
             require(bytes >= 0 && unit > 0)
             return if (bytes == 0L) 0L else Math.multiplyExact((bytes - 1L) / unit + 1L, unit)
-        }
-
-        private fun syncDirectory(directory: File) {
-            if (!System.getProperty("os.name").orEmpty().startsWith("Windows", true))
-                FileChannel.open(directory.toPath(), StandardOpenOption.READ).use { it.force(true) }
         }
 
     }

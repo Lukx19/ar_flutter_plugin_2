@@ -424,13 +424,19 @@ internal class VisibilityGridIntegration(
         if (ownership() != expected) { fenced++; return null }
         val group = SurfaceGroup(expected.captureGroupId)
         val runtimeResources = resourcesForGroup(group)
-        val opened = if (CanonicalActivationSelector.hasDurableSelector(group, runtimeResources.directory)) {
+        val openResult = if (CanonicalActivationSelector.hasDurableSelector(group, runtimeResources.directory)) {
             runtimeResources.reopen()
         } else {
             runtimeResources.openInitial(seeded)
-        } as? SurfaceOwnershipOpenResult.Opened ?: run {
+        }
+        val opened = openResult as? SurfaceOwnershipOpenResult.Opened ?: run {
             runtimeResources.close()
             rejected++
+            val refusal = (openResult as SurfaceOwnershipOpenResult.Refused).reason
+            receipt = receipt.copy(
+                status = refusal.integrationStatus,
+                rejected = rejected,
+            )
             return null
         }
         resources = runtimeResources
@@ -1569,6 +1575,14 @@ private fun canonicalOperation(bytes: ByteArray): String = try {
 } catch (_: Exception) {
     "invalid"
 }
+
+private val SurfaceOwnershipRestoreRefusal.integrationStatus: String
+    get() = when (this) {
+        SurfaceOwnershipRestoreRefusal.INVALID_CONFIGURATION -> "openRefusedInvalidConfiguration"
+        SurfaceOwnershipRestoreRefusal.CORRUPT -> "openRefusedCorrupt"
+        SurfaceOwnershipRestoreRefusal.FORK -> "openRefusedFork"
+        SurfaceOwnershipRestoreRefusal.DURABILITY_FAILURE -> "openRefusedDurabilityFailure"
+    }
 
 /** Composes column-major GL transforms only when the finite affine contract survives. */
 private fun composeGroupFromCamera(

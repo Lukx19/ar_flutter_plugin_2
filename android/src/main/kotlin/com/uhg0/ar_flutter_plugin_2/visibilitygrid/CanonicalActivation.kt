@@ -8,10 +8,8 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
-import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
-import java.nio.file.StandardOpenOption
 import java.security.MessageDigest
 
 /**
@@ -1332,8 +1330,9 @@ internal object CanonicalActivationSelector {
         if (fault == expected) throw CanonicalAdjacentProcessCrash(fault)
     }
     private fun sync(parent: File, stage: CanonicalActivationSyncStage) {
-        val physical = !System.getProperty("os.name").orEmpty().startsWith("Windows", true)
-        if (physical) FileChannel.open(parent.toPath(), StandardOpenOption.READ).use { it.force(true) }
+        val physical = VisibilityGridDirectorySync.backend() !=
+            VisibilityGridDirectorySync.Backend.WINDOWS_NO_OP
+        VisibilityGridDirectorySync.sync(parent)
         CanonicalActivationTestHooks.onDirectorySync?.invoke(stage, physical)
     }
     private fun round(bytes: Long, unit: Long) = if (bytes == 0L) 0L else Math.multiplyExact((bytes - 1L) / unit + 1L, unit)

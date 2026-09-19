@@ -8,10 +8,8 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.nio.file.AtomicMoveNotSupportedException
-import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
-import java.nio.file.StandardOpenOption
 import java.security.MessageDigest
 
 /**
@@ -1319,10 +1317,7 @@ private fun canonicalJournalEntryBytes(result: CanonicalTransactionResult.Accept
 
 private fun checkedAdd(left: Long, right: Long): Long? = try { Math.addExact(left, right) } catch (_: ArithmeticException) { null }
 private fun syncOwnershipDirectory(directory: File) {
-    // Android/Linux supports directory fsync. The Windows JVM test adapter has
-    // atomic rename semantics but does not expose directory descriptors.
-    if ((System.getProperty("os.name") ?: "").startsWith("Windows", ignoreCase = true)) return
-    FileChannel.open(directory.toPath(), StandardOpenOption.READ).use { it.force(true) }
+    VisibilityGridDirectorySync.sync(directory)
 }
 
 private fun boundedCount(value: Int, maximum: Int): Int {

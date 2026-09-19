@@ -31,6 +31,52 @@ import org.openjdk.jol.info.GraphLayout
 /** Locks Option A's BINDING-LIFECYCLE-ACK seeded CREATE cut without a Flutter payload seam. */
 class VisibilityGridIntegrationTest {
     @Test
+    fun `canonical open refusal publishes a bounded durability reason`() {
+        val directory = Files.createTempDirectory("canonical-surface-open-refusal").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val viewId = 2151
+        val binding = VisibilityGridV2Binding(
+            messenger,
+            viewId,
+            CommittedBaselineAuthority(),
+            postToMain = { it() },
+        )
+        val integration = VisibilityGridIntegration(
+            binding,
+            binding::currentObservationOwnership,
+            directory,
+            resourcesForGroup = { group ->
+                CanonicalRuntimeResources.open(
+                    directory,
+                    group,
+                    coordinator,
+                    SurfaceOwnershipConfiguration(surfaceCapacity = 0),
+                )
+            },
+        )
+        try {
+            val stream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            integration.admitFeature(
+                feature(requireNotNull(binding.currentObservationOwnership()), 11),
+            )
+
+            val receipt = integration.integrationReceipt()
+            assertEquals("openRefusedDurabilityFailure", receipt.status)
+            assertEquals(1, receipt.rejected)
+            assertEquals(0, integration.pressureSnapshot().canonicalOwnedBytes)
+        } finally {
+            integration.close()
+            binding.dispose()
+            coordinator.close()
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `combined ingress bounds depth lookup and commits admitted canonical renderer cuts`() {
         val directory = Files.createTempDirectory("canonical-surface-combined-pressure").toFile()
         val coordinator = budget(directory)
