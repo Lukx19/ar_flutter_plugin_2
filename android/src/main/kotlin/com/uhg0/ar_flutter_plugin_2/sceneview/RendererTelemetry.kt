@@ -144,14 +144,14 @@ internal class RendererTelemetry {
         require(owner.isNotBlank())
         require(bytes >= 0)
         val previous = allocationsByOwner.put(owner, bytes)
-        if (ownedBufferBytes > RENDERER_INSTANTANEOUS_LIMIT_BYTES) {
+        if (ownedBufferBytes > RENDERER_COMBINED_LIMIT_BYTES) {
             if (previous == null) {
                 allocationsByOwner.remove(owner)
             } else {
                 allocationsByOwner[owner] = previous
             }
             throw IllegalStateException(
-                "renderer-owned buffers exceed $RENDERER_INSTANTANEOUS_LIMIT_BYTES bytes",
+                "renderer-owned buffers exceed $RENDERER_COMBINED_LIMIT_BYTES bytes",
             )
         }
         peakOwnedBufferBytes = maxOf(peakOwnedBufferBytes, ownedBufferBytes)
@@ -284,8 +284,12 @@ internal class RendererTelemetry {
         "gpuCounterStatus" to "unavailable: Filament driver counters are not exposed",
         "ordinaryUploadLimitBytes" to ORDINARY_UPLOAD_LIMIT_BYTES,
         "rendererAllocationLimitBytes" to RENDERER_ALLOCATION_LIMIT_BYTES,
-        "rendererInstantaneousLimitBytes" to RENDERER_INSTANTANEOUS_LIMIT_BYTES,
-        "rendererTransitionReserveBytes" to CoverageRendererLimits.TRANSITION_RESERVE_BYTES,
+        "rendererCombinedLimitBytes" to RENDERER_COMBINED_LIMIT_BYTES,
+        "rendererTransitionHeadroomBytes" to CoverageRendererLimits.TRANSITION_HEADROOM_BYTES,
+        // Preserve the established diagnostics keys while publishing the
+        // semantically named combined ceiling and headroom above.
+        "rendererInstantaneousLimitBytes" to RENDERER_COMBINED_LIMIT_BYTES,
+        "rendererTransitionReserveBytes" to CoverageRendererLimits.TRANSITION_HEADROOM_BYTES,
         "ownedBufferBytesByOwner" to allocationsByOwner.toMap(),
         "semanticCentroidCount" to (presentationCounts["semanticCentroidCount"] ?: 0),
         "semanticCubeCount" to (presentationCounts["semanticCubeCount"] ?: 0),
@@ -352,11 +356,14 @@ internal class RendererTelemetry {
 
     internal companion object {
         const val ORDINARY_UPLOAD_LIMIT_BYTES = 64 * 1024
-        /** One-generation admission ceiling; coexistence uses the transition ceiling. */
+        /** One-generation admission ceiling; candidate admission remains stricter than coexistence. */
         const val RENDERER_ALLOCATION_LIMIT_BYTES =
             CoverageRendererLimits.ACTIVE_RENDERER_OWNED_LIMIT_BYTES
-        const val RENDERER_INSTANTANEOUS_LIMIT_BYTES =
-            CoverageRendererLimits.INSTANTANEOUS_TRANSITION_LIMIT_BYTES
+        const val RENDERER_COMBINED_LIMIT_BYTES =
+            CoverageRendererLimits.COMBINED_RENDERER_OWNED_LIMIT_BYTES
+        /** @deprecated use [RENDERER_COMBINED_LIMIT_BYTES]. */
+        @Deprecated("Use RENDERER_COMBINED_LIMIT_BYTES")
+        const val RENDERER_INSTANTANEOUS_LIMIT_BYTES = RENDERER_COMBINED_LIMIT_BYTES
         private val fencedDestroyedUploadCallbacks = AtomicInteger()
     }
 }
@@ -369,6 +376,8 @@ private fun CoverageRendererOwnershipReceipt.asMap(): Map<String, Any> = mapOf(
     "stagingBytes" to stagingBytes,
     "meshBytes" to meshBytes,
     "totalBytes" to totalBytes,
+    "combinedRendererOwnedLimitBytes" to combinedRendererOwnedLimitBytes,
+    "transitionHeadroomBytes" to transitionHeadroomBytes,
 )
 
 private fun Int?.orZero(): Int = this ?: 0

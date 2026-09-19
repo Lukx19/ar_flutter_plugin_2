@@ -332,7 +332,7 @@ class CoverageRendererSelectionTest {
     }
 
     @Test
-    fun `cube to centroid replacement clears first and restores ledger after one release each`() {
+    fun `cube to centroid replacement coexists and restores ledger after one release each`() {
         val telemetry = RendererTelemetry()
         val ledger = CoverageRendererAllocationLedger(telemetry)
         val events = mutableListOf<String>()
@@ -383,12 +383,12 @@ class CoverageRendererSelectionTest {
         factory.clear()
 
         assertEquals(
-            listOf("create:CUBES", "clear-first", "release:CUBES", "create:CENTROIDS", "release:CENTROIDS"),
+            listOf("create:CUBES", "create:CENTROIDS", "release:CUBES", "release:CENTROIDS"),
             events,
         )
         assertTrue(
             (telemetry.snapshot().getValue("peakOwnedBufferBytes") as Int) <=
-                CoverageRendererLimits.INSTANTANEOUS_TRANSITION_LIMIT_BYTES,
+                CoverageRendererLimits.COMBINED_RENDERER_OWNED_LIMIT_BYTES,
         )
         assertEquals(0, telemetry.snapshot().getValue("ownedBufferBytes"))
     }
@@ -452,7 +452,7 @@ class CoverageRendererSelectionTest {
         val candidate = ledger.admitResourceReplacement(VoxelRenderMode.CENTROIDS).candidateBytes
         telemetry.setOwnedBufferBytes(
             "existing-generation",
-            CoverageRendererLimits.INSTANTANEOUS_TRANSITION_LIMIT_BYTES - candidate + 1,
+            CoverageRendererLimits.COMBINED_RENDERER_OWNED_LIMIT_BYTES - candidate + 1,
         )
 
         val admission = ledger.admitResourceReplacement(VoxelRenderMode.CENTROIDS)
@@ -461,7 +461,7 @@ class CoverageRendererSelectionTest {
             admission.candidateBytes <= CoverageRendererLimits.ACTIVE_RENDERER_OWNED_LIMIT_BYTES,
         )
         assertTrue(
-            admission.combinedBytes > CoverageRendererLimits.INSTANTANEOUS_TRANSITION_LIMIT_BYTES,
+            admission.combinedBytes > CoverageRendererLimits.COMBINED_RENDERER_OWNED_LIMIT_BYTES,
         )
     }
 
@@ -473,7 +473,7 @@ class CoverageRendererSelectionTest {
 
         telemetry.setOwnedBufferBytes(
             "existing-generation",
-            CoverageRendererLimits.INSTANTANEOUS_TRANSITION_LIMIT_BYTES - candidate,
+            CoverageRendererLimits.COMBINED_RENDERER_OWNED_LIMIT_BYTES - candidate,
         )
         assertEquals(
             CoverageRendererTransitionStrategy.COEXIST,
@@ -483,7 +483,7 @@ class CoverageRendererSelectionTest {
         telemetry.removeOwner("existing-generation")
         telemetry.setOwnedBufferBytes(
             "existing-generation",
-            CoverageRendererLimits.INSTANTANEOUS_TRANSITION_LIMIT_BYTES - candidate + 1,
+            CoverageRendererLimits.COMBINED_RENDERER_OWNED_LIMIT_BYTES - candidate + 1,
         )
         assertEquals(
             CoverageRendererTransitionStrategy.CLEAR_FIRST,
@@ -596,7 +596,24 @@ class CoverageRendererSelectionTest {
         val receipt = CoverageRendererLimits.ownershipReceipt(VoxelRenderMode.CUBES)
 
         assertEquals(14 * 1024 * 1024, CoverageRendererLimits.ACTIVE_RENDERER_OWNED_LIMIT_BYTES)
-        assertEquals(18 * 1024 * 1024, CoverageRendererLimits.INSTANTANEOUS_TRANSITION_LIMIT_BYTES)
+        assertEquals(32 * 1024 * 1024, CoverageRendererLimits.COMBINED_RENDERER_OWNED_LIMIT_BYTES)
+        assertEquals(
+            18 * 1024 * 1024,
+            CoverageRendererLimits.TRANSITION_HEADROOM_BYTES,
+        )
+        assertEquals(
+            CoverageRendererLimits.COMBINED_RENDERER_OWNED_LIMIT_BYTES -
+                CoverageRendererLimits.ACTIVE_RENDERER_OWNED_LIMIT_BYTES,
+            CoverageRendererLimits.TRANSITION_HEADROOM_BYTES,
+        )
+        assertEquals(
+            CoverageRendererLimits.COMBINED_RENDERER_OWNED_LIMIT_BYTES,
+            receipt.combinedRendererOwnedLimitBytes,
+        )
+        assertEquals(
+            CoverageRendererLimits.TRANSITION_HEADROOM_BYTES,
+            receipt.transitionHeadroomBytes,
+        )
         assertEquals(5_403_936, receipt.canonicalStateBytes)
         assertEquals(800_000, receipt.mutableProjectionSelectorBytes)
         assertEquals(640_100, receipt.descriptorBackingBytes)
@@ -626,6 +643,10 @@ class CoverageRendererSelectionTest {
         assertEquals(receipt, admission.ownershipReceipt)
         assertEquals(receipt.totalBytes, admission.candidateBytes)
         assertEquals(receipt.totalBytes, telemetry.snapshot().getValue("lastAdmissionOwnershipBytes"))
+        @Suppress("UNCHECKED_CAST")
+        val receiptMap = telemetry.snapshot().getValue("lastAdmissionOwnershipReceipt") as Map<String, Any>
+        assertEquals(32 * 1024 * 1024, receiptMap.getValue("combinedRendererOwnedLimitBytes"))
+        assertEquals(18 * 1024 * 1024, receiptMap.getValue("transitionHeadroomBytes"))
 
         val rejected = admission
             .let { CoverageRendererAllocationLedger(RendererTelemetry()) }
@@ -866,7 +887,7 @@ class CoverageRendererSelectionTest {
 
         telemetry.setOwnedBufferBytes(
             "exact-transition-reservation",
-            CoverageRendererLimits.INSTANTANEOUS_TRANSITION_LIMIT_BYTES -
+            CoverageRendererLimits.COMBINED_RENDERER_OWNED_LIMIT_BYTES -
                 CoverageRendererLimits.maximumActiveRendererBytes,
         )
         assertThrows(IllegalStateException::class.java) {

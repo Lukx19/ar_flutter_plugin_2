@@ -41,18 +41,27 @@ class RendererTelemetryTest {
     }
 
     @Test
-    fun `telemetry rejects a renderer-owned allocation above the instantaneous transition cap`() {
+    fun `telemetry rejects a renderer-owned allocation above the combined transition cap`() {
         val telemetry = RendererTelemetry()
         telemetry.setOwnedBufferBytes("centroids", 20_000 * 36)
 
         assertThrows(IllegalStateException::class.java) {
             telemetry.setOwnedBufferBytes(
                 "cubes",
-                RendererTelemetry.RENDERER_INSTANTANEOUS_LIMIT_BYTES,
+                RendererTelemetry.RENDERER_COMBINED_LIMIT_BYTES,
             )
         }
 
         assertEquals(20_000 * 36, telemetry.snapshot().getValue("ownedBufferBytes"))
+    }
+
+    @Test
+    fun `telemetry exposes exact renderer ceilings and transition headroom`() {
+        val snapshot = RendererTelemetry().snapshot()
+
+        assertEquals(14 * 1024 * 1024, snapshot.getValue("rendererAllocationLimitBytes"))
+        assertEquals(32 * 1024 * 1024, snapshot.getValue("rendererCombinedLimitBytes"))
+        assertEquals(18 * 1024 * 1024, snapshot.getValue("rendererTransitionHeadroomBytes"))
     }
 
     @Test

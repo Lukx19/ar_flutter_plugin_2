@@ -14,6 +14,7 @@ import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageRendererResourceFactory
 import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageRendererLimits
 import com.uhg0.ar_flutter_plugin_2.sceneview.RendererTelemetry
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.LongRowIndex
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.QUALIFIED_RENDERER_STYLE_CUT_MAX_ROWS
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridRendererState
 import java.io.File
 import java.nio.ByteBuffer
@@ -321,7 +322,11 @@ internal object RendererT5ReceiptCampaign {
         // The projection owns one canonical centroid-capacity state across
         // lazy mesh modes; mode resources are the only capacity-specific
         // allocation in this ledger.
-        val canonicalState = VisibilityGridRendererState(CoverageRendererLimits.CENTROID_CAPACITY)
+        val canonicalState = VisibilityGridRendererState(
+            capacity = QUALIFIED_RENDERER_STYLE_CUT_MAX_ROWS,
+            retainWorldPositions = false,
+            retainCanonicalNormalMetadata = false,
+        )
         assertEquals(
             CoverageRendererLimits.rendererStateBytes(VoxelRenderMode.CUBES),
             canonicalState.ownedStorageBytes,
@@ -341,7 +346,7 @@ internal object RendererT5ReceiptCampaign {
         boundaryLedger.installCubeResources("active", CoverageRendererLimits.CUBE_CAPACITY)
         boundaryTelemetry.setOwnedBufferBytes(
             "exact-transition-reservation",
-            RendererTelemetry.RENDERER_INSTANTANEOUS_LIMIT_BYTES - maximum,
+            RendererTelemetry.RENDERER_COMBINED_LIMIT_BYTES - maximum,
         )
         val limitPlusOneRejected = runCatching {
             boundaryTelemetry.setOwnedBufferBytes(
@@ -359,14 +364,23 @@ internal object RendererT5ReceiptCampaign {
         )
         val peakAfterReplacement = telemetry.snapshot().getValue("peakOwnedBufferBytes") as Int
         assertTrue(peakAfterReplacement >= maximum)
-        assertTrue(peakAfterReplacement <= CoverageRendererLimits.INSTANTANEOUS_TRANSITION_LIMIT_BYTES)
+        assertTrue(peakAfterReplacement <= CoverageRendererLimits.COMBINED_RENDERER_OWNED_LIMIT_BYTES)
+        @Suppress("UNCHECKED_CAST")
+        val admissionReceipt = telemetry.snapshot().getValue("lastAdmissionOwnershipReceipt") as Map<String, Any>
         resources.clear()
         return buildJsonObject {
             put("maximumActiveRendererBytes", maximum)
             put("rendererOwnedBufferLimitBytes", RendererTelemetry.RENDERER_ALLOCATION_LIMIT_BYTES)
-            put("rendererInstantaneousLimitBytes", RendererTelemetry.RENDERER_INSTANTANEOUS_LIMIT_BYTES)
-            put("rendererTransitionReserveBytes", CoverageRendererLimits.TRANSITION_RESERVE_BYTES)
-            put("limitPlusOneBytes", RendererTelemetry.RENDERER_INSTANTANEOUS_LIMIT_BYTES + 1)
+            put("rendererCombinedLimitBytes", RendererTelemetry.RENDERER_COMBINED_LIMIT_BYTES)
+            put("rendererTransitionHeadroomBytes", CoverageRendererLimits.TRANSITION_HEADROOM_BYTES)
+            put("rendererInstantaneousLimitBytes", RendererTelemetry.RENDERER_COMBINED_LIMIT_BYTES)
+            put("rendererTransitionReserveBytes", CoverageRendererLimits.TRANSITION_HEADROOM_BYTES)
+            put("lastAdmissionOwnershipReceipt", buildJsonObject {
+                admissionReceipt.forEach { (key, value) ->
+                    put(key, (value as Number).toInt())
+                }
+            })
+            put("limitPlusOneBytes", RendererTelemetry.RENDERER_COMBINED_LIMIT_BYTES + 1)
             put("limitPlusOneRejected", limitPlusOneRejected)
             put("peakAfterReplacementBytes", peakAfterReplacement)
         }
@@ -421,6 +435,8 @@ internal object RendererT5ReceiptCampaign {
                     JsonPrimitive(CoverageRendererLimits.maximumActiveRendererBytes),
                 ),
             )
+            add(assertion("combined-renderer-limit", ledger.getValue("rendererCombinedLimitBytes"), JsonPrimitive(32 * 1024 * 1024)))
+            add(assertion("transition-headroom", ledger.getValue("rendererTransitionHeadroomBytes"), JsonPrimitive(18 * 1024 * 1024)))
             add(assertion("limit-plus-one-rejected", ledger.getValue("limitPlusOneRejected"), JsonPrimitive(true)))
             add(assertion("upload-completion-nonzero", callbacks.getValue("completedUploadCount"), JsonPrimitive(0), "greaterThan"))
             add(assertion("no-late-callbacks", callbacks.getValue("completionCountAfterDestroyAndLateCallbacks"), JsonPrimitive(1)))

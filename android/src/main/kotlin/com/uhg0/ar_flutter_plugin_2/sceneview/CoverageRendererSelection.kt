@@ -19,6 +19,8 @@ internal data class CoverageRendererOwnershipReceipt(
     val pageReaderCapturedMappingBytes: Int,
     val stagingBytes: Int,
     val meshBytes: Int,
+    val combinedRendererOwnedLimitBytes: Int = CoverageRendererLimits.COMBINED_RENDERER_OWNED_LIMIT_BYTES,
+    val transitionHeadroomBytes: Int = CoverageRendererLimits.TRANSITION_HEADROOM_BYTES,
 ) {
     init {
         require(canonicalStateBytes >= 0)
@@ -27,6 +29,8 @@ internal data class CoverageRendererOwnershipReceipt(
         require(pageReaderCapturedMappingBytes >= 0)
         require(stagingBytes >= 0)
         require(meshBytes >= 0)
+        require(combinedRendererOwnedLimitBytes >= 0)
+        require(transitionHeadroomBytes >= 0)
     }
 
     val totalBytes: Int
@@ -63,12 +67,18 @@ internal object CoverageRendererLimits {
     /** Maximum renderer-owned CPU/native buffers for one mounted generation. */
     const val ACTIVE_RENDERER_OWNED_LIMIT_BYTES = 14 * 1024 * 1024
 
-    /** Capacity reserved for replacement bookkeeping and rollback. */
-    const val TRANSITION_RESERVE_BYTES = 4 * 1024 * 1024
+    /** Combined renderer-owned ceiling while generations coexist in transition. */
+    const val COMBINED_RENDERER_OWNED_LIMIT_BYTES = 32 * 1024 * 1024
 
-    /** Maximum instantaneous ownership while two generations coexist. */
-    const val INSTANTANEOUS_TRANSITION_LIMIT_BYTES =
-        ACTIVE_RENDERER_OWNED_LIMIT_BYTES + TRANSITION_RESERVE_BYTES
+    /** Derived replacement headroom between one-generation and combined limits. */
+    const val TRANSITION_HEADROOM_BYTES =
+        COMBINED_RENDERER_OWNED_LIMIT_BYTES - ACTIVE_RENDERER_OWNED_LIMIT_BYTES
+    /** @deprecated use [COMBINED_RENDERER_OWNED_LIMIT_BYTES]. */
+    @Deprecated("Use COMBINED_RENDERER_OWNED_LIMIT_BYTES")
+    const val INSTANTANEOUS_TRANSITION_LIMIT_BYTES = COMBINED_RENDERER_OWNED_LIMIT_BYTES
+    /** @deprecated use [TRANSITION_HEADROOM_BYTES]. */
+    @Deprecated("Use TRANSITION_HEADROOM_BYTES")
+    const val TRANSITION_RESERVE_BYTES = TRANSITION_HEADROOM_BYTES
     /** Maximum one-page descriptor/upload staging retained by a mesh. */
     const val PAGE_STAGING_BYTES = 64 * 1024
 
@@ -205,7 +215,7 @@ internal class CoverageRendererAllocationLedger(
             strategy = when {
                 candidateBytes > CoverageRendererLimits.ACTIVE_RENDERER_OWNED_LIMIT_BYTES ->
                     CoverageRendererTransitionStrategy.REJECT
-                combinedBytes <= CoverageRendererLimits.INSTANTANEOUS_TRANSITION_LIMIT_BYTES ->
+                combinedBytes <= CoverageRendererLimits.COMBINED_RENDERER_OWNED_LIMIT_BYTES ->
                     CoverageRendererTransitionStrategy.COEXIST
                 else -> CoverageRendererTransitionStrategy.CLEAR_FIRST
             },
