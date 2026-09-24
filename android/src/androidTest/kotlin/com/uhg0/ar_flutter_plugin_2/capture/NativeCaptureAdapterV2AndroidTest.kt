@@ -35,16 +35,21 @@ class NativeCaptureAdapterV2AndroidTest {
         var surface: Surface? = null
         var binding: NativeCaptureBindingV2? = null
         var manager: SharedCameraManager? = null
+        val recoveryReady = CountDownLatch(1)
         try {
             onMain {
                 flutterEngine = FlutterEngine(context)
                 texture = SurfaceTexture(0)
                 surface = Surface(checkNotNull(texture))
-                binding = NativeCaptureBindingV2(context, CaptureSafetySignalV2())
+                binding = NativeCaptureBindingV2(context, CaptureSafetySignalV2(), events = {
+                    if (it.kind == NativeCaptureEventKindV2.READY) recoveryReady.countDown()
+                })
                 manager = testManager(context, checkNotNull(flutterEngine), checkNotNull(surface))
                 checkNotNull(binding).attachSharedCamera(checkNotNull(manager))
             }
             val activeBinding = checkNotNull(binding)
+            onMain { activeBinding.replayRecovery() }
+            assertTrue(recoveryReady.await(5, TimeUnit.SECONDS))
             val runId = System.nanoTime().toString()
             val faults = listOf("camera", "malformed", "store", "valid")
             faults.forEachIndexed { index, fault ->
@@ -112,14 +117,17 @@ class NativeCaptureAdapterV2AndroidTest {
         var manager: SharedCameraManager? = null
         var syntheticCancels = 0
         var mainResourcesClosed = false
+        val recoveryReady = CountDownLatch(1)
         try {
             onMain {
                 assertTrue(Looper.myLooper() === Looper.getMainLooper())
                 flutterEngine = FlutterEngine(context)
                 texture = SurfaceTexture(0)
                 surface = Surface(checkNotNull(texture))
-                binding = NativeCaptureBindingV2(context, signal)
-                assertTrue(captureRoot.isDirectory)
+                binding = NativeCaptureBindingV2(context, signal, events = {
+                    if (it.kind == NativeCaptureEventKindV2.READY) recoveryReady.countDown()
+                })
+                assertFalse(captureRoot.exists())
                 manager = SharedCameraManager(
                     context = context,
                     methodChannel = MethodChannel(checkNotNull(flutterEngine).dartExecutor.binaryMessenger, "native-capture-v2-test"),
@@ -143,6 +151,10 @@ class NativeCaptureAdapterV2AndroidTest {
             }
             val activeBinding = checkNotNull(binding)
             val activeManager = checkNotNull(manager)
+            onMain { activeBinding.replayRecovery() }
+            assertTrue(recoveryReady.await(5, TimeUnit.SECONDS))
+            assertTrue(captureRoot.isDirectory)
+            val activeAdapter = onMainValue(activeBinding::syntheticAdapterForTest)
             val runId = System.nanoTime().toString()
             val paused = request("$runId-paused")
             onMain { activeBinding.admit(paused) }
@@ -153,7 +165,8 @@ class NativeCaptureAdapterV2AndroidTest {
                 assertFalse(signal.isCaptureSafe())
                 activeBinding.snapshot()
             }
-            assertEquals(1L, pausedSnapshot.abandoned)
+            assertEquals(0L, pausedSnapshot.abandoned)
+            assertEquals(1L, pausedSnapshot.unknownQueries)
             val lateAfterPause = TrackingInput("jpeg".toByteArray())
             postComponents(callbackThread, pausedOwner, lateAfterPause)
             assertEquals(1, lateAfterPause.closeCalls)
@@ -191,9 +204,10 @@ class NativeCaptureAdapterV2AndroidTest {
             val lateAfterDispose = TrackingInput("jpeg".toByteArray())
             postComponents(callbackThread, disposedOwner, lateAfterDispose)
             assertEquals(1, lateAfterDispose.closeCalls)
-            val disposedSnapshot = onMainValue(activeBinding::snapshot)
+            val disposedSnapshot = onMainValue(activeAdapter::snapshot)
             assertEquals(2L, disposedSnapshot.lateCallbacks)
-            assertEquals(2L, disposedSnapshot.abandoned)
+            assertEquals(0L, disposedSnapshot.abandoned)
+            assertEquals(2L, disposedSnapshot.unknownQueries)
             assertEquals(3, syntheticCancels)
             // Snapshot is the only outward V2 projection and is scalar metadata.
             assertEquals(0, CaptureResourceSnapshotV2::class.java.declaredFields.count { it.type == ByteArray::class.java })
@@ -241,10 +255,20 @@ class NativeCaptureAdapterV2AndroidTest {
 
     private fun request(suffix: String): CaptureCommitRequest {
         val cut = CaptureLifecycleCut("session-$suffix", 1, "group", 1, "ar", "view", 1, "binding", 1, 1)
+        val maximumBytes = 128L
+        val workingBytes = 128L
         val accepted = CaptureAcceptedAttempt(
             CaptureAttemptIdentity("attempt-$suffix", "commit-$suffix", 1, cut), CaptureLane.MANUAL,
-            CaptureComponentProfile("jpeg", setOf(CaptureComponentKind.JPEG), 128, 128),
-            CaptureReservationLiability(0, 128, 1, 1, 0, true), digest("intent-$suffix"), digest("accepted-$suffix"),
+            CaptureComponentProfile("jpeg", setOf(CaptureComponentKind.JPEG), maximumBytes, workingBytes),
+            CaptureReservationLiability(
+                workingBytes,
+                NativeCaptureReservationBoundsV2.physicalBytes(maximumBytes, 1),
+                1,
+                1,
+                NativeCaptureReservationBoundsV2.rollbackBytes(maximumBytes),
+                true,
+            ),
+            digest("intent-$suffix"), digest("accepted-$suffix"),
         )
         val bytes = "jpeg".toByteArray()
         return CaptureCommitRequest(
