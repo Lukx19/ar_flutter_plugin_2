@@ -122,7 +122,6 @@ internal class SceneViewHost(
     // applied directly to the retained mesh; making the whole ARSceneView
     // recompose at the acquisition rate causes camera/overlay frame jitter.
     private val coverageRenderConfig = mutableStateOf<PointCloudNativeConfig?>(null)
-    private val rawPointSnapshotRef = AtomicReference<CoveragePointRenderSnapshot?>()
     private val coverageMeshRef = AtomicReference<CoveragePointMeshBinding?>()
     /** Owner lifetime key; source renderer generations remain upstream-owned. */
     private val coverageResourceEpoch = mutableStateOf(0L)
@@ -195,7 +194,7 @@ internal class SceneViewHost(
                         glyphCount,
                     )
                 }
-                coverageMeshRef.get()?.updateCoverage(null, mode.toVoxelRenderMode())
+                coverageMeshRef.get()?.updateCoverage(mode.toVoxelRenderMode())
             },
             onPresentationDescriptorChanged = { descriptor, mode, token ->
                 val glyphCount = coverageRendererOwner.status().residentGlyphCount
@@ -580,7 +579,7 @@ internal class SceneViewHost(
                                     CoverageActivePointNode(engine, materialLoader, rendererTelemetry, coverage, token)
                                         ?.let { active ->
                                             NodeLifecycle(active.node) {
-                                                CoverageActiveBindingEffect(active.binding, coverage, token, rawPointSnapshotRef.get(), coverageMeshRef, onCoverageRendererMounted)
+                                                CoverageActiveBindingEffect(active.binding, coverage, token, coverageMeshRef, onCoverageRendererMounted)
                                             }
                                         }
                                 }
@@ -589,7 +588,7 @@ internal class SceneViewHost(
                                     CoverageActiveCentroidNode(engine, materialLoader, rendererTelemetry, coverage, token)
                                         ?.let { active ->
                                             NodeLifecycle(active.node) {
-                                                CoverageActiveBindingEffect(active.binding, coverage, token, rawPointSnapshotRef.get(), coverageMeshRef, onCoverageRendererMounted)
+                                                CoverageActiveBindingEffect(active.binding, coverage, token, coverageMeshRef, onCoverageRendererMounted)
                                             }
                                         }
                                 }
@@ -598,7 +597,7 @@ internal class SceneViewHost(
                                     CoverageActiveCubeNode(engine, materialLoader, rendererTelemetry, coverage, token)
                                         ?.let { active ->
                                             NodeLifecycle(active.node) {
-                                                CoverageActiveBindingEffect(active.binding, coverage, token, rawPointSnapshotRef.get(), coverageMeshRef, onCoverageRendererMounted)
+                                                CoverageActiveBindingEffect(active.binding, coverage, token, coverageMeshRef, onCoverageRendererMounted)
                                             }
                                         }
                                 }
@@ -924,11 +923,6 @@ internal class SceneViewHost(
     ): T? = runCatching { create() }
         .onFailure { rendererTelemetry.recordResourceFailure() }
         .getOrNull()
-
-    fun updateRawPointCloud(snapshot: CoveragePointRenderSnapshot?) {
-        rawPointSnapshotRef.set(snapshot)
-        coverageMeshRef.get()?.updateRawPoints(snapshot)
-    }
 
     fun resume() {
         checkNotDisposed()
@@ -1460,21 +1454,18 @@ internal class SceneViewHost(
         binding: CoveragePointMeshBinding,
         coverage: PointCloudNativeConfig,
         token: CoverageResourceToken?,
-        rawSnapshot: CoveragePointRenderSnapshot?,
         coverageMeshRef: AtomicReference<CoveragePointMeshBinding?>,
         onCoverageRendererMounted: (Boolean, Long) -> Unit,
     ) {
         SideEffect {
-            binding.updateCoverage(null, coverage.voxelRenderMode)
-            binding.updateRawPoints(rawSnapshot)
+            binding.updateCoverage(coverage.voxelRenderMode)
         }
         DisposableEffect(binding) {
             // NodeLifecycle's attach effect is registered before this nested
             // content effect. Queue the retained reset for this exact resource
             // generation, then publish its frame binding; a stale outgoing
             // composition cannot revive or replace it.
-            binding.updateCoverage(null, coverage.voxelRenderMode)
-            binding.updateRawPoints(rawSnapshot)
+            binding.updateCoverage(coverage.voxelRenderMode)
             if (binding.attachAfterNodeLifecycle {
                     coverageMeshRef.set(binding)
                 }
@@ -1659,7 +1650,6 @@ internal class SceneViewHost(
         private val cancelRendererFrame: () -> Unit,
         private val onUploadFailure: () -> Unit,
     ) {
-        private var latestRawPointSnapshot: CoveragePointRenderSnapshot? = null
         private var latestPresentationDescriptor: BoundedCoveragePresentation? = null
         @Volatile private var attached = false
         @Volatile private var disposed = false
@@ -1677,12 +1667,9 @@ internal class SceneViewHost(
             target.node = null
         }
 
-        fun updateCoverage(
-            snapshot: CoveragePointRenderSnapshot?,
-            requestedMode: VoxelRenderMode = mode,
-        ) {
+        fun updateCoverage(requestedMode: VoxelRenderMode = mode) {
             if (disposed || requestedMode != mode) return
-            if (attached && mode != VoxelRenderMode.POINTS) updateActiveTarget()
+            if (attached) updateActiveTarget()
         }
 
         fun updateCoverageDescriptor(
@@ -1691,13 +1678,7 @@ internal class SceneViewHost(
         ) {
             if (disposed || requestedMode != mode) return
             latestPresentationDescriptor = descriptor
-            if (attached && mode != VoxelRenderMode.POINTS) updateActiveTarget()
-        }
-
-        fun updateRawPoints(snapshot: CoveragePointRenderSnapshot?) {
-            if (disposed) return
-            latestRawPointSnapshot = snapshot?.boundedForMesh(VoxelRenderMode.POINTS)
-            if (attached && mode == VoxelRenderMode.POINTS) updateActiveTarget()
+            if (attached) updateActiveTarget()
         }
 
         fun onRendererFrame() {
@@ -1725,36 +1706,28 @@ internal class SceneViewHost(
         private fun updateActiveTarget() {
             if (disposed) return
             val currentNode = target.node ?: return
-            if (mode != VoxelRenderMode.POINTS) {
-                val descriptor = latestPresentationDescriptor ?: readCoverageDescriptor()
-                if (descriptor != null) {
-                    when (val resources = target.resources) {
-                        is CoveragePointMeshResources -> resources.updateDescriptor(
-                            node = currentNode,
-                            descriptor = descriptor,
-                            materialInstance = target.materialInstance,
-                            pointSizePx = pointSizePx,
-                        )
-                        is CoverageCubeMeshResources -> resources.updateDescriptor(
-                            node = currentNode,
-                            descriptor = descriptor,
-                            materialInstance = target.materialInstance,
-                            pointSizePx = pointSizePx,
-                        )
-                        else -> Unit
-                    }
-                    if (target.resources is CoveragePointMeshResources ||
-                        target.resources is CoverageCubeMeshResources
-                    ) return
+            val descriptor = latestPresentationDescriptor ?: readCoverageDescriptor()
+            if (descriptor != null) {
+                when (val resources = target.resources) {
+                    is CoveragePointMeshResources -> resources.updateDescriptor(
+                        node = currentNode,
+                        descriptor = descriptor,
+                        materialInstance = target.materialInstance,
+                        pointSizePx = pointSizePx,
+                    )
+                    is CoverageCubeMeshResources -> resources.updateDescriptor(
+                        node = currentNode,
+                        descriptor = descriptor,
+                        materialInstance = target.materialInstance,
+                        pointSizePx = pointSizePx,
+                    )
+                    else -> Unit
                 }
+                if (target.resources is CoveragePointMeshResources ||
+                    target.resources is CoverageCubeMeshResources
+                ) return
             }
-            val snapshot = when (mode) {
-                VoxelRenderMode.POINTS -> latestRawPointSnapshot
-                VoxelRenderMode.CENTROIDS,
-                VoxelRenderMode.CUBES -> (latestPresentationDescriptor
-                    ?: readCoverageDescriptor())?.toLegacySnapshot()
-                    ?: readCoverageSnapshot()
-            }
+            val snapshot = descriptor?.toLegacySnapshot() ?: readCoverageSnapshot()
             if (snapshot == null) {
                 target.resources.hide(currentNode)
                 return
@@ -1775,7 +1748,6 @@ internal class SceneViewHost(
             cancelRendererFrame()
             target.resources.setOnUploadPageReleased {}
             target.node = null
-            latestRawPointSnapshot = null
             latestPresentationDescriptor = null
         }
 
@@ -1793,7 +1765,6 @@ internal class SceneViewHost(
             // destroy is safe because every resource destroy is idempotent.
             disposeCoverageResourcesForReplacement(target.node, target.resources)
             target.node = null
-            latestRawPointSnapshot = null
             latestPresentationDescriptor = null
         }
     }
@@ -1818,17 +1789,6 @@ internal data class SceneRendererPressureSnapshot(
     val renderer: RendererPressureSnapshot,
     val pages: RendererPageFramePressureSnapshot,
 )
-
-private fun CoveragePointRenderSnapshot.boundedForMesh(
-    mode: VoxelRenderMode,
-): CoveragePointRenderSnapshot {
-    val capacity = mode.toDefaultCoveragePresentationMode().presentationCapacity
-    return if (this.capacity == capacity && count <= capacity) {
-        this
-    } else {
-        boundedForPresentation(capacity)
-    }
-}
 
 internal fun selectVisibilityGridDepthMode(
     isSupported: (Config.DepthMode) -> Boolean,

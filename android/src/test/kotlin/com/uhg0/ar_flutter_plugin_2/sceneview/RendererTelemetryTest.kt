@@ -8,6 +8,15 @@ import org.junit.Test
 
 class RendererTelemetryTest {
     @Test
+    fun `resident telemetry rejects glyphs beyond the presentation cap`() {
+        val telemetry = RendererTelemetry()
+        assertThrows(IllegalArgumentException::class.java) {
+            telemetry.setResidentPresentation(300, CoverageRendererLimits.GLYPH_CAPACITY + 1)
+        }
+        assertEquals(0, telemetry.snapshot().getValue("residentGlyphCount"))
+    }
+
+    @Test
     fun `telemetry retains owned buffer peak after a renderer replacement`() {
         val telemetry = RendererTelemetry()
         telemetry.setOwnedBufferBytes("points", 2_304)

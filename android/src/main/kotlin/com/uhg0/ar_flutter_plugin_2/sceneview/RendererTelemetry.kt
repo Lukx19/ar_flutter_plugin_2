@@ -96,6 +96,7 @@ internal class RendererTelemetry {
     fun setResidentPresentation(rowCount: Int, glyphCount: Int) {
         require(rowCount >= 0)
         require(glyphCount in 0..rowCount)
+        require(glyphCount <= CoverageRendererLimits.GLYPH_CAPACITY)
         residentRowCount = rowCount
         residentGlyphCount = glyphCount
     }

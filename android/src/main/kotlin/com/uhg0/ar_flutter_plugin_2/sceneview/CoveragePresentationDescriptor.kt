@@ -6,8 +6,10 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererGlyph
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRowsQualifier
 import com.uhg0.ar_flutter_plugin_2.pointcloud.rangeOnly
+import java.util.PriorityQueue
 
 /** One bounded geometry/style page borrowed by a mesh upload. */
 internal data class CoveragePresentationPage(
@@ -57,15 +59,37 @@ private class PresentationBacking(
         require(styleTable.size == surfaceIdTable.size * COVERAGE_RENDERER_STYLE_ROW_BYTES)
         require(surfaceIdTable.toSet().size == surfaceIdTable.size)
         require(sourceSlotTable.all { it >= 0 && it < sourceCount })
+        val bestGlyphRows = PriorityQueue<Int>(CoverageRendererLimits.GLYPH_CAPACITY) { first, second ->
+            compareGlyphPriority(second, first)
+        }
         repeat(surfaceIdTable.size) { index ->
-            glyphPrefix[index + 1] = glyphPrefix[index] +
-                if (CoverageRendererStyleRowV1.decode(
-                        styleTable,
-                        index * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-                    ).glyph != com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererGlyph.NONE
-                ) 1 else 0
+            if (styleAt(index).glyph == CoverageRendererGlyph.NONE) return@repeat
+            if (bestGlyphRows.size < CoverageRendererLimits.GLYPH_CAPACITY) {
+                bestGlyphRows.add(index)
+            } else if (compareGlyphPriority(index, checkNotNull(bestGlyphRows.peek())) < 0) {
+                bestGlyphRows.remove()
+                bestGlyphRows.add(index)
+            }
+        }
+        val retainedGlyphRows = bestGlyphRows.toIntArray().sortedArray()
+        repeat(surfaceIdTable.size) { index ->
+            val style = styleAt(index)
+            val retained = style.glyph != CoverageRendererGlyph.NONE &&
+                retainedGlyphRows.binarySearch(index) >= 0
+            if (style.glyph != CoverageRendererGlyph.NONE && !retained) {
+                style.copy(glyph = CoverageRendererGlyph.NONE).encode()
+                    .copyInto(styleTable, index * COVERAGE_RENDERER_STYLE_ROW_BYTES)
+            }
+            glyphPrefix[index + 1] = glyphPrefix[index] + if (retained) 1 else 0
         }
     }
+
+    private fun styleAt(index: Int): CoverageRendererStyleRowV1 =
+        CoverageRendererStyleRowV1.decode(styleTable, index * COVERAGE_RENDERER_STYLE_ROW_BYTES)
+
+    private fun compareGlyphPriority(first: Int, second: Int): Int = compareCoverageStylePriority(
+        styleAt(first), surfaceIdTable[first], styleAt(second), surfaceIdTable[second],
+    )
 
     val count: Int get() = surfaceIdTable.size
 

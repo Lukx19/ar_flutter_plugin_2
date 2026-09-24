@@ -169,14 +169,24 @@ internal class CoveragePresentationPlan(
 internal fun compareCoverageRows(
     first: VisibilityRendererRow,
     second: VisibilityRendererRow,
+): Int = compareCoverageStylePriority(
+    first.style, first.surfaceId, second.style, second.surfaceId,
+)
+
+/** Shared deterministic priority for bounded row and glyph presentation. */
+internal fun compareCoverageStylePriority(
+    firstStyle: CoverageRendererStyleRowV1,
+    firstSurfaceId: Long,
+    secondStyle: CoverageRendererStyleRowV1,
+    secondSurfaceId: Long,
 ): Int {
-    val target = targetRank(first.style).compareTo(targetRank(second.style))
+    val target = targetRank(firstStyle).compareTo(targetRank(secondStyle))
     if (target != 0) return -target
-    val need = needRank(first.style).compareTo(needRank(second.style))
+    val need = needRank(firstStyle).compareTo(needRank(secondStyle))
     if (need != 0) return -need
-    val residency = residencyRank(first.style).compareTo(residencyRank(second.style))
+    val residency = residencyRank(firstStyle).compareTo(residencyRank(secondStyle))
     if (residency != 0) return -residency
-    return first.surfaceId.compareTo(second.surfaceId)
+    return firstSurfaceId.compareTo(secondSurfaceId)
 }
 
 private fun targetRank(style: CoverageRendererStyleRowV1): Int =
@@ -419,6 +429,7 @@ internal class NativeCoverageRendererOwner(
     private var unavailable = false
     private var disposed = false
     private var recoveryPending = false
+    private var recoveryRequestOutstanding = false
     private var lowMemoryPressure = false
     private var lifecyclePaused = false
     private var controlsConfigured = false
@@ -889,6 +900,7 @@ internal class NativeCoverageRendererOwner(
         lifecyclePaused = true
         unavailable = true
         recoveryPending = true
+        recoveryRequestOutstanding = false
     }
 
     @Synchronized
@@ -905,7 +917,7 @@ internal class NativeCoverageRendererOwner(
                 selectedRowCount = 0,
             )
         }
-        if (!unavailable || !recoveryPending) {
+        if (!unavailable || !recoveryPending || recoveryRequestOutstanding) {
             val current = latest
             return RendererRecoveryReceipt(
                 recovered = false,
@@ -923,6 +935,7 @@ internal class NativeCoverageRendererOwner(
         lifecyclePaused = false
         unavailable = !resourceMounted
         recoveryPending = !resourceMounted
+        recoveryRequestOutstanding = current != null && !resourceMounted
         return RendererRecoveryReceipt(
             // A recovery receipt means the latest committed cut is eligible
             // for a fresh resource generation. Mount/upload availability is
@@ -944,6 +957,7 @@ internal class NativeCoverageRendererOwner(
         lifecyclePaused = true
         unavailable = true
         recoveryPending = false
+        recoveryRequestOutstanding = false
         latest = null
         presentationPlan = null
         latestPresentationDescriptor = null
@@ -958,6 +972,7 @@ internal class NativeCoverageRendererOwner(
         resourceMounted = true
         unavailable = lifecyclePaused
         recoveryPending = lifecyclePaused
+        recoveryRequestOutstanding = false
         return true
     }
 
@@ -998,6 +1013,7 @@ internal class NativeCoverageRendererOwner(
         resourceMounted = true
         unavailable = lifecyclePaused
         recoveryPending = lifecyclePaused
+        recoveryRequestOutstanding = false
         lowMemoryPressure = false
         onResourceLifecycleChanged(token, true)
         return true
@@ -1014,6 +1030,7 @@ internal class NativeCoverageRendererOwner(
         resourceMounted = false
         unavailable = true
         recoveryPending = true
+        recoveryRequestOutstanding = false
         lowMemoryPressure = true
         resourceFailureCount++
         resourceToken?.let { onResourceLifecycleChanged(it, false) }
@@ -1028,6 +1045,7 @@ internal class NativeCoverageRendererOwner(
         resourceMounted = false
         unavailable = true
         recoveryPending = true
+        recoveryRequestOutstanding = false
         lowMemoryPressure = false
         resourceFailureCount++
         return true
@@ -1040,6 +1058,7 @@ internal class NativeCoverageRendererOwner(
         resourceMounted = false
         unavailable = true
         recoveryPending = true
+        recoveryRequestOutstanding = false
         lowMemoryPressure = false
         resourceFailureCount++
         onResourceLifecycleChanged(token, false)
@@ -1064,6 +1083,7 @@ internal class NativeCoverageRendererOwner(
         resourceMounted = false
         unavailable = true
         recoveryPending = true
+        recoveryRequestOutstanding = false
         lowMemoryPressure = false
         onResourceLifecycleChanged(token, false)
         return true
@@ -1079,6 +1099,7 @@ internal class NativeCoverageRendererOwner(
         resourceMounted = true
         unavailable = lifecyclePaused
         recoveryPending = lifecyclePaused
+        recoveryRequestOutstanding = false
         lowMemoryPressure = false
         onResourceLifecycleChanged(token, true)
         notifyPresentationChanged()

@@ -269,6 +269,26 @@ class CoverageRendererOwnerTest {
     }
 
     @Test
+    fun `duplicate resume while replacement is pending keeps one resource token`() {
+        val owner = NativeCoverageRendererOwner()
+        owner.install(snapshot())
+        val oldToken = checkNotNull(owner.issueResourceToken())
+        assertTrue(owner.markResourceFailure(oldToken))
+
+        assertTrue(owner.resume().recovered)
+        val replacement = checkNotNull(owner.requestResourceReplacement())
+        assertFalse(owner.resume().recovered)
+        assertEquals(replacement, owner.currentResourceToken())
+        assertFalse(owner.markResourceMounted(oldToken))
+        assertTrue(owner.markResourceMounted(replacement))
+        assertFalse(owner.status().rendererUnavailable)
+
+        assertTrue(owner.markResourceFailure(replacement))
+        assertTrue(owner.resume().recovered)
+        assertTrue(checkNotNull(owner.requestResourceReplacement()).epoch > replacement.epoch)
+    }
+
+    @Test
     fun `stale hit receipt rejects an old revision without exposing rows`() {
         val owner = NativeCoverageRendererOwner()
         owner.install(snapshot())
@@ -375,6 +395,35 @@ class CoverageRendererOwnerTest {
         val recovery = owner.resume()
         assertEquals(3, recovery.rowCount)
         assertEquals(3, recovery.selectedRowCount)
+    }
+
+    @Test
+    fun `raw mode borrows the committed bounded descriptor through recovery`() {
+        val owner = NativeCoverageRendererOwner()
+        val committed = descriptorForReceipt(CoverageRendererLimits.RAW_POINT_CAPACITY + 1)
+        owner.installPresentation(
+            committed,
+            PointCloudNativeConfig(
+                renderCapacity = committed.count,
+                voxelRenderMode = VoxelRenderMode.CENTROIDS,
+                rendererGeneration = committed.qualifier.rendererGeneration,
+            ),
+        )
+        owner.setControls(CoverageRendererControls(true, CoveragePresentationMode.RAW_FEATURES, CoverageRendererPalette.COVERAGE))
+        val raw = checkNotNull(owner.presentationDescriptor())
+        assertEquals(CoverageRendererLimits.RAW_POINT_CAPACITY, raw.count)
+        assertEquals(committed.qualifier, raw.qualifier)
+        assertTrue(raw.withPage(raw.qualifier, 0, 512) { page ->
+            assertEquals(512, page.count)
+            assertEquals(1L, page.surfaceIds.first())
+        })
+
+        val oldToken = checkNotNull(owner.issueResourceToken())
+        assertTrue(owner.markResourceFailure(oldToken))
+        assertTrue(owner.resume().recovered)
+        val replacement = checkNotNull(owner.requestResourceReplacement())
+        assertTrue(owner.markResourceMounted(replacement))
+        assertEquals(raw.selectedSurfaceIds.toList(), checkNotNull(owner.presentationDescriptor()).selectedSurfaceIds.toList())
     }
 
     @Test
