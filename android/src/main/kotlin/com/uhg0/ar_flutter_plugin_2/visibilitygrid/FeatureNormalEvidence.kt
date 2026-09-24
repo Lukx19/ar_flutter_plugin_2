@@ -75,7 +75,13 @@ internal object FeatureNormalMath {
         val q15Squared = BigInteger.valueOf(32_767L * 32_767L)
         return components.mapIndexed { index, component ->
             val numerator = squared[index].multiply(q15Squared)
-            val q = integerSqrt(numerator.divide(length2).longValueExact())
+            // squared[index] <= length2, so this quotient is always in
+            // 0..32_767^2 and is exactly representable by Long. Avoid
+            // BigInteger.longValueExact(): it is absent on supported Android
+            // API levels even though the JVM test runtime provides it.
+            val scaledSquared = numerator.divide(length2)
+            check(scaledSquared.signum() >= 0 && scaledSquared.bitLength() <= 30)
+            val q = integerSqrt(scaledSquared.toLong())
             val next = BigInteger.valueOf(2L * q + 1L)
             val comparison = numerator.shiftLeft(2).compareTo(length2.multiply(next.pow(2)))
             val rounded = if (comparison > 0 || (comparison == 0 && (q and 1L) == 1L)) q + 1L else q

@@ -1,11 +1,15 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineAuthority
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlCodec
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlOperation
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlRequest
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaReceiptV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.PacketCodec
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.RendererStyleCommandV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.RendererStyleCutPayloadV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.StartRequestCodecV2
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.TransactionResponseProfileV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.TransactionChunkFrameV1
@@ -22,8 +26,10 @@ import java.nio.file.Files
 import java.security.MessageDigest
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.openjdk.jol.info.GraphLayout
@@ -65,10 +71,159 @@ class VisibilityGridIntegrationTest {
             )
 
             val receipt = integration.integrationReceipt()
-            assertEquals("openRefusedDurabilityFailure", receipt.status)
+            assertEquals("openRefusedDurabilityFailureBootstrapCandidate", receipt.status)
             assertEquals(1, receipt.rejected)
             assertEquals(0, integration.pressureSnapshot().canonicalOwnedBytes)
         } finally {
+            integration.close()
+            binding.dispose()
+            coordinator.close()
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `canonical open diagnostics are fixed bounded stage values`() {
+        val statuses = CanonicalRuntimeOpenFailureStage.entries.map { stage ->
+            canonicalRuntimeOpenFailureStatus(
+                SurfaceOwnershipRestoreRefusal.DURABILITY_FAILURE,
+                stage,
+            )
+        }
+
+        assertEquals(
+            listOf(
+                "openRefusedDurabilityFailureBootstrapCandidate",
+                "openRefusedDurabilityFailureActivationPreparation",
+                "openRefusedDurabilityFailureActivationAuthorityOpen",
+                "openRefusedDurabilityFailureBaseAuthorityOpen",
+                "openRefusedDurabilityFailureCommitStoreOpen",
+                "openRefusedDurabilityFailureCurrentReopen",
+                "openRefusedDurabilityFailureFeatureRouteHydration",
+            ),
+            statuses,
+        )
+        assertTrue(statuses.all { it.length <= 64 })
+        assertEquals(
+            "openRefusedFork",
+            canonicalRuntimeOpenFailureStatus(SurfaceOwnershipRestoreRefusal.FORK, null),
+        )
+    }
+
+    @Test
+    fun `pressure snapshot does not wait behind active feature planning`() {
+        val directory = Files.createTempDirectory("canonical-pressure-active-planning").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val viewId = 2154
+        val binding = VisibilityGridV2Binding(
+            messenger,
+            viewId,
+            CommittedBaselineAuthority(),
+            postToMain = { it() },
+        )
+        val integration = VisibilityGridIntegration(
+            binding,
+            binding::currentObservationOwnership,
+            directory,
+            resourcesForGroup = resources(directory, coordinator),
+        )
+        val planningEntered = CountDownLatch(1)
+        val releasePlanning = CountDownLatch(1)
+        val blockOneRouteRead = AtomicBoolean(true)
+        try {
+            val stream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            val ownership = requireNotNull(binding.currentObservationOwnership())
+            integration.admitFeature(feature(ownership, 10))
+            val staged = integration.integrationReceipt()
+            assertEquals("pendingAck", staged.status)
+
+            var sequence = 3L
+            var ended = false
+            repeat(64) {
+                if (!ended) {
+                    ended = exchange(
+                        messenger,
+                        viewId,
+                        stream,
+                        ++sequence,
+                        1,
+                        1,
+                        1,
+                    ).first.messageKind == 4
+                }
+            }
+            assertTrue("initial transaction reached END", ended)
+            assertEquals(
+                0,
+                exchange(
+                    messenger,
+                    viewId,
+                    stream,
+                    ++sequence,
+                    staged.transactionId,
+                    staged.geometryRevision,
+                    staged.lineageRevision,
+                ).first.messageKind,
+            )
+            await { integration.integrationReceipt().status == "acknowledged" }
+            val completed = integration.pressureSnapshot()
+            assertTrue(completed.canonicalSurfaceHighWater > 0)
+            assertTrue(completed.canonicalOwnedBytes > 0)
+
+            CanonicalRuntimeCurrentTestHooks.failFeatureRouteRead = { phase ->
+                if (phase == "row" && blockOneRouteRead.compareAndSet(true, false)) {
+                    planningEntered.countDown()
+                    check(releasePlanning.await(10, TimeUnit.SECONDS))
+                }
+                false
+            }
+            var admissionFailure: Throwable? = null
+            val admissionFinished = CountDownLatch(1)
+            val admissionThread = Thread {
+                try {
+                    integration.admitFeature(feature(ownership, 20, cameraX = 0.05))
+                } catch (failure: Throwable) {
+                    admissionFailure = failure
+                } finally {
+                    admissionFinished.countDown()
+                }
+            }
+            admissionThread.start()
+            assertTrue("feature planning reached its routed read", planningEntered.await(5, TimeUnit.SECONDS))
+
+            var inFlightPressure: CanonicalVisibilityPressureSnapshot? = null
+            val pressureFinished = CountDownLatch(1)
+            val pressureThread = Thread {
+                try {
+                    inFlightPressure = integration.pressureSnapshot()
+                } finally {
+                    pressureFinished.countDown()
+                }
+            }
+            pressureThread.start()
+            try {
+                assertTrue(
+                    "pressure snapshot waited behind the active canonical planning lease",
+                    pressureFinished.await(1, TimeUnit.SECONDS),
+                )
+                val sampled = requireNotNull(inFlightPressure)
+                assertEquals(completed.canonicalSurfaceHighWater, sampled.canonicalSurfaceHighWater)
+                assertEquals(completed.associationHighWater, sampled.associationHighWater)
+                assertEquals(completed.canonicalOwnedBytes, sampled.canonicalOwnedBytes)
+            } finally {
+                releasePlanning.countDown()
+                pressureThread.join(5_000)
+                admissionThread.join(5_000)
+            }
+            assertTrue("feature admission did not finish", admissionFinished.await(1, TimeUnit.SECONDS))
+            admissionFailure?.let { throw AssertionError("feature admission failed", it) }
+        } finally {
+            CanonicalRuntimeCurrentTestHooks.failFeatureRouteRead = null
+            releasePlanning.countDown()
             integration.close()
             binding.dispose()
             coordinator.close()
@@ -214,7 +369,7 @@ class VisibilityGridIntegrationTest {
     }
 
     @Test
-    fun `small scene fixture advances the real canonical renderer`() {
+    fun `small scene fixture recovers a mapper task failure and advances the real canonical renderer`() {
         val directory = Files.createTempDirectory("canonical-surface-small-scene").toFile()
         val coordinator = budget(directory)
         val messenger = MethodTestMessenger()
@@ -222,10 +377,16 @@ class VisibilityGridIntegrationTest {
         val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
         val scheduler = PressureObservationScheduler()
         val projection = NativeRendererProjection(render = { _, _ -> })
+        val failFirstAdmission = AtomicBoolean(true)
         val integration = VisibilityGridIntegration(
             binding, binding::currentObservationOwnership, directory,
             resourcesForGroup = resources(directory, coordinator),
             renderer = projection,
+            beforeAdmission = {
+                if (failFirstAdmission.compareAndSet(true, false)) {
+                    error("deterministic mapper task failure")
+                }
+            },
         )
         val runtime = AndroidVisibilityGridRuntime(
             binding::currentObservationOwnership,
@@ -256,6 +417,8 @@ class VisibilityGridIntegrationTest {
 
             assertEquals(12L, runtime.snapshot().copiedFeatureObservations)
             assertEquals(10L, runtime.snapshot().replacedFeatureObservations)
+            assertEquals(1L, runtime.snapshot().staleGenerationObservations)
+            assertEquals(1L, runtime.snapshot().droppedFeatureObservations)
             assertTrue(integration.integrationReceipt().geometryRevision > 1)
             assertTrue(projection.currentRowCount() > 0)
             assertEquals(1L, runtime.snapshot().admittedFeatureObservations)
@@ -358,6 +521,699 @@ class VisibilityGridIntegrationTest {
         assertEquals(1, descriptors.single().qualifier.geometryRevision)
         assertEquals(0, descriptors.single().count)
         projection.close()
+    }
+
+    @Test
+    fun `first material style cut advances every bootstrap revision lane`() {
+        val projection = NativeRendererProjection(render = { _, _ -> })
+        val ownership = rendererOwnership()
+        val bootstrap = QualifiedRendererStyleCut(
+            ownership = ownership,
+            transactionId = 1,
+            geometryRevision = 1,
+            lineageRevision = 1,
+            semanticRevision = 1,
+            coverageRevision = 1,
+            styleRevision = 1,
+            residencyRevision = 1,
+            targetRevision = 1,
+            reset = true,
+            surfaceIds = LongArray(0),
+            styleRows = ByteArray(0),
+            targetSurfaceId = null,
+            targetDirectionIndex = null,
+        )
+        assertEquals(
+            RendererStyleCutResult.Applied(1, 1, 0, null),
+            projection.applyStyleCut(bootstrap),
+        )
+        val reopenedBootstrap = CommittedGeometryCut(
+            ownership = ownership,
+            transactionId = 1,
+            baseGeometryRevision = 0,
+            geometryRevision = 1,
+            lineageRevision = 1,
+            reset = true,
+            upserts = emptyList(),
+            removedSurfaceIds = LongArray(0),
+        )
+        projection.beginRebuild(reopenedBootstrap)
+        projection.finishRebuild(reopenedBootstrap)
+        assertEquals(
+            RendererProjectionResult.Applied(1),
+            projection.applyGeometry(
+                CommittedGeometryCut(
+                    ownership = ownership,
+                    transactionId = 2,
+                    baseGeometryRevision = 1,
+                    geometryRevision = 2,
+                    lineageRevision = 1,
+                    reset = false,
+                    upserts = listOf(row(1, 0)),
+                    removedSurfaceIds = LongArray(0),
+                ),
+            ),
+        )
+
+        assertEquals(
+            RendererStyleCutResult.Applied(2, 2, 1, null),
+            projection.applyStyleCut(
+                bootstrap.copy(
+                    transactionId = 2,
+                    geometryRevision = 2,
+                    semanticRevision = 2,
+                    coverageRevision = 2,
+                    styleRevision = 2,
+                    residencyRevision = 2,
+                    targetRevision = 2,
+                    surfaceIds = longArrayOf(1),
+                    styleRows = CoverageRendererStyleRowV1(
+                        semanticGeneration = 2,
+                        styleGeneration = 2,
+                    ).encode(),
+                ),
+            ),
+        )
+
+        val replacementOwnership = ownership.copy(bindingGeneration = 2)
+        val replacementBootstrap = CommittedGeometryCut(
+            ownership = replacementOwnership,
+            transactionId = 1,
+            baseGeometryRevision = 0,
+            geometryRevision = 1,
+            lineageRevision = 1,
+            reset = true,
+            upserts = emptyList(),
+            removedSurfaceIds = LongArray(0),
+        )
+        projection.beginRebuild(replacementBootstrap)
+        projection.finishRebuild(replacementBootstrap)
+        assertEquals(
+            RendererStyleCutResult.Applied(1, 1, 0, null),
+            projection.applyStyleCut(bootstrap.copy(ownership = replacementOwnership)),
+        )
+        projection.close()
+    }
+
+    @Test
+    fun `retained canonical cut rebind changes only binding ownership and transaction`() {
+        val rendered = mutableListOf<com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot>()
+        val projection = NativeRendererProjection(
+            render = { snapshot, _ -> snapshot?.let(rendered::add) },
+        )
+        val previous = rendererOwnership()
+        val retained = CommittedGeometryCut(
+            ownership = previous,
+            transactionId = 84,
+            baseGeometryRevision = 0,
+            geometryRevision = 85,
+            lineageRevision = 9,
+            reset = true,
+            upserts = emptyList(),
+            removedSurfaceIds = LongArray(0),
+        )
+        projection.beginRebuild(retained)
+        projection.appendRebuildPage(retained.withUpserts(listOf(row(7, 3))))
+        projection.finishRebuild(retained)
+        val firstStyle = QualifiedRendererStyleCut(
+            ownership = previous,
+            transactionId = 84,
+            geometryRevision = 85,
+            lineageRevision = 9,
+            semanticRevision = 1,
+            coverageRevision = 1,
+            styleRevision = 1,
+            residencyRevision = 1,
+            targetRevision = 1,
+            reset = true,
+            surfaceIds = longArrayOf(7),
+            styleRows = CoverageRendererStyleRowV1(
+                semanticGeneration = 1,
+                styleGeneration = 1,
+            ).encode(),
+            targetSurfaceId = null,
+            targetDirectionIndex = null,
+        )
+        assertEquals(RendererStyleCutResult.Applied(1, 1, 1, null), projection.applyStyleCut(firstStyle))
+        val renderedCountBeforeRebind = rendered.size
+        val retainedSurfaceIds = rendered.last().surfaceIds.copyOf()
+        val retainedStyleRows = rendered.last().styleRows.copyOf()
+        val replacement = previous.copy(
+            nativeStreamToken = "07".repeat(16),
+            workerBindingToken = "08".repeat(16),
+            bindingGeneration = 2,
+            lifecycleSequence = 2,
+            operationGeneration = 2,
+        )
+        val authoritative = CommittedBaselineV1(84, 85, 9, 1)
+
+        assertFalse(
+            projection.rebindRetainedCanonicalCut(
+                RetainedRendererBindingCut(previous, replacement, authoritative.copy(geometryRevision = 86)),
+            ),
+        )
+        assertEquals(RendererStyleCutResult.Replayed(1), projection.applyStyleCut(firstStyle))
+        assertTrue(
+            projection.rebindRetainedCanonicalCut(
+                RetainedRendererBindingCut(previous, replacement, authoritative),
+            ),
+        )
+        assertEquals(renderedCountBeforeRebind, rendered.size)
+        assertArrayEquals(retainedSurfaceIds, rendered.last().surfaceIds)
+        assertArrayEquals(retainedStyleRows, rendered.last().styleRows)
+        assertEquals(
+            RendererStyleCutResult.Applied(2, 2, 1, null),
+            projection.applyStyleCut(
+                firstStyle.copy(
+                    ownership = replacement,
+                    transactionId = 0,
+                    semanticRevision = 2,
+                    coverageRevision = 2,
+                    styleRevision = 2,
+                    residencyRevision = 2,
+                    targetRevision = 2,
+                    styleRows = CoverageRendererStyleRowV1(
+                        semanticGeneration = 2,
+                        styleGeneration = 2,
+                    ).encode(),
+                ),
+            ),
+        )
+        assertEquals(2, projection.pressureRevisions().styleRevision)
+        assertArrayEquals(longArrayOf(7), rendered.last().surfaceIds)
+        projection.close()
+    }
+
+    @Test
+    fun `replacement START completes pending exact ACK and rebinds retained renderer cut`() {
+        val directory = Files.createTempDirectory("canonical-surface-retained-rebind").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val authority = CommittedBaselineAuthority()
+        val viewId = 2153
+        val rendered = mutableListOf<com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot>()
+        val projection = NativeRendererProjection(render = { snapshot, _ -> snapshot?.let(rendered::add) })
+        val blockAdmission = AtomicBoolean(false)
+        val blockedAdmissionEntered = CountDownLatch(1)
+        val releaseBlockedAdmission = CountDownLatch(1)
+        val blockedAdmissionFinished = CountDownLatch(1)
+        val binding = VisibilityGridV2Binding(
+            messenger,
+            viewId,
+            authority,
+            postToMain = { it() },
+            onRendererStyleCut = projection::applyStyleCut,
+        )
+        val integration = VisibilityGridIntegration(
+            binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = resources(directory, coordinator),
+            renderer = projection,
+            beforeAdmission = {
+                if (blockAdmission.get()) {
+                    blockedAdmissionEntered.countDown()
+                    check(releaseBlockedAdmission.await(10, TimeUnit.SECONDS))
+                }
+            },
+        )
+        try {
+            val originalStream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, originalStream, 1, 0, 0, 0)
+            exchange(messenger, viewId, originalStream, 2, 0, 0, 0)
+            exchange(messenger, viewId, originalStream, 3, 1, 1, 1)
+            val originalOwnership = requireNotNull(binding.currentObservationOwnership())
+            val bootstrapBaseline = binding.currentCommittedBaseline()
+            assertEquals(1, bootstrapBaseline.transactionId)
+            assertEquals(1, bootstrapBaseline.geometryRevision)
+            assertEquals(1, bootstrapBaseline.lineageRevision)
+            assertEquals(0, bootstrapBaseline.styleRevision)
+            val scope = com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineScopeV1.from(startRequest())
+            integration.admitFeature(feature(originalOwnership, 10))
+            assertEquals("pendingAck", integration.integrationReceipt().status)
+            val preAckAuthoritative = authority.snapshot(scope)
+            assertEquals(1, preAckAuthoritative.transactionId)
+            assertFalse(
+                projection.canRebindRetainedCanonicalCut(
+                    RetainedRendererBindingCut(
+                        previousOwnership = originalOwnership,
+                        nextOwnership = originalOwnership.copy(
+                            nativeStreamToken = "07".repeat(16),
+                            workerBindingToken = "08".repeat(16),
+                            bindingGeneration = originalOwnership.bindingGeneration + 1,
+                            lifecycleSequence = originalOwnership.lifecycleSequence + 1,
+                            operationGeneration = originalOwnership.operationGeneration + 1,
+                        ),
+                        authoritativeBaseline = preAckAuthoritative,
+                    ),
+                ),
+            )
+
+            exchange(messenger, viewId, originalStream, 4, 1, 1, 1)
+            exchange(messenger, viewId, originalStream, 5, 1, 1, 1)
+            exchange(messenger, viewId, originalStream, 6, 1, 1, 1)
+            val styleSurfaceIds = rendered.last().surfaceIds.copyOf().also(LongArray::sort)
+            fun liveStyle(revision: Long) = RendererStyleCutPayloadV1(
+                captureGroupId = uuid(40).bytes,
+                bindingGeneration = originalOwnership.bindingGeneration,
+                groupGeneration = originalOwnership.groupGeneration,
+                transactionId = 2,
+                geometryRevision = 2,
+                lineageRevision = 1,
+                semanticRevision = revision,
+                coverageRevision = revision,
+                styleRevision = revision,
+                residencyRevision = revision,
+                targetRevision = revision,
+                reset = true,
+                surfaceIds = styleSurfaceIds,
+                styleRows = ByteArray(styleSurfaceIds.size * 16).also { rows ->
+                    styleSurfaceIds.indices.forEach { index ->
+                        CoverageRendererStyleRowV1(
+                            semanticGeneration = revision,
+                            styleGeneration = revision,
+                        ).encode().copyInto(rows, index * 16)
+                    }
+                },
+            )
+            exchange(messenger, viewId, originalStream, 7, 2, 2, 1)
+            assertEquals(binding.currentCommittedBaseline(), authority.snapshot(scope))
+            val initialLiveStyle = liveStyle(1)
+            val initialStyleResponse = exchange(
+                messenger, viewId, originalStream, 8, 2, 2, 1,
+                nextStyleRevision = 1,
+                commandBytes = RendererStyleCommandV1.encodePages(initialLiveStyle).single(),
+            ).first
+            assertEquals(0, initialStyleResponse.errorId)
+            assertEquals(1, initialStyleResponse.acceptedStyleRevision)
+            exchange(messenger, viewId, originalStream, 9, 2, 2, 1, nextStyleRevision = 1)
+            val advancedStyleResponse = exchange(
+                messenger, viewId, originalStream, 10, 2, 2, 1,
+                nextStyleRevision = 2,
+                commandBytes = RendererStyleCommandV1.encodePages(liveStyle(2)).single(),
+            ).first
+            assertEquals(0, advancedStyleResponse.errorId)
+            assertEquals(2, advancedStyleResponse.acceptedStyleRevision)
+            exchange(messenger, viewId, originalStream, 11, 2, 2, 1, nextStyleRevision = 2)
+            val authoritative = binding.currentCommittedBaseline()
+            assertEquals(2, authoritative.transactionId)
+            assertEquals(2, authoritative.geometryRevision)
+            assertEquals(1, authoritative.lineageRevision)
+            assertEquals(2, authoritative.styleRevision)
+            assertEquals(
+                authoritative,
+                authority.snapshot(com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineScopeV1.from(startRequest())),
+            )
+            val renderedCountBeforeReplacement = rendered.size
+            blockAdmission.set(true)
+            Thread {
+                try {
+                    integration.admitFeature(feature(originalOwnership, 11))
+                } finally {
+                    blockedAdmissionFinished.countDown()
+                }
+            }.start()
+            assertTrue(blockedAdmissionEntered.await(2, TimeUnit.SECONDS))
+
+            val control = MethodChannel(messenger, "visibility_grid_v2_control_$viewId")
+            val abandon = RecordingResult()
+            control.invokeMethod("abandonBinding", originalStream.qualifier, abandon)
+            assertTrue(abandon.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(1, abandon.successCount)
+
+            val replacementSnapshot = RecordingResult()
+            control.invokeMethod("bindingSnapshot", null, replacementSnapshot)
+            assertTrue(replacementSnapshot.completed.await(2, TimeUnit.SECONDS))
+            val replacementMap = replacementSnapshot.successValue as Map<*, *>
+            val replacementQualifier = (replacementMap["nativeStreamToken"] as ByteArray) +
+                (replacementMap["workerBindingToken"] as ByteArray)
+            val replacementStart = RecordingResult()
+            control.invokeMethod(
+                "start",
+                replacementQualifier + ControlCodec.encodeRequest(
+                    startRequest().copy(payload = restoredStartPayload(authoritative)),
+                ),
+                replacementStart,
+            )
+            assertFalse(replacementStart.completed.await(2_200, TimeUnit.MILLISECONDS))
+            assertEquals(null, binding.currentObservationOwnership())
+            releaseBlockedAdmission.countDown()
+            assertTrue(blockedAdmissionFinished.await(2, TimeUnit.SECONDS))
+            assertTrue(replacementStart.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(
+                "start error=${replacementStart.errorCode}:${replacementStart.errorMessage}",
+                1,
+                replacementStart.successCount,
+            )
+            val replacementResponse = ControlCodec.decodeResponse(
+                strip(replacementStart.successValue as ByteArray, replacementQualifier),
+            )
+            assertEquals("replacement START payload=${replacementResponse.payload.toList()}", 0, replacementResponse.outcome)
+
+            val replacementOwnership = requireNotNull(binding.currentObservationOwnership())
+            assertTrue(replacementOwnership.bindingGeneration > originalOwnership.bindingGeneration)
+            assertEquals("rendererRebound", integration.integrationReceipt().status)
+            assertEquals(0, integration.integrationReceipt().transactionId)
+            assertEquals(renderedCountBeforeReplacement, rendered.size)
+            assertEquals(0, requireNotNull(binding.committedEmptyBaseline()).transactionId)
+            val reboundReceipt = integration.integrationReceipt()
+            val reboundPressure = projection.pressureRevisions()
+            val fencedBefore = integration.snapshot().rolloverDiscardedObservations
+            integration.admitFeature(feature(originalOwnership, 11))
+            assertEquals(fencedBefore + 1, integration.snapshot().rolloverDiscardedObservations)
+            assertEquals(reboundReceipt.geometryRevision, integration.integrationReceipt().geometryRevision)
+            assertEquals(reboundReceipt.rendererRows, integration.integrationReceipt().rendererRows)
+            assertEquals(reboundPressure, projection.pressureRevisions())
+            assertEquals(renderedCountBeforeReplacement, rendered.size)
+            integration.rollover(replacementOwnership)
+            integration.resume()
+            assertEquals("rendererRebound", integration.integrationReceipt().status)
+            assertEquals(renderedCountBeforeReplacement, rendered.size)
+
+            val surfaceIds = rendered.last().surfaceIds.copyOf().also(LongArray::sort)
+            val replacementStream = Stream(replacementQualifier, replacementResponse.streamToken)
+            val replacementStyle = liveStyle(3).copy(
+                bindingGeneration = replacementOwnership.bindingGeneration,
+                transactionId = 0,
+                surfaceIds = surfaceIds,
+            )
+            val replacementStyleResponse = exchange(
+                messenger, viewId, replacementStream, 1, 0, 2, 1,
+                nextStyleRevision = 3,
+                commandBytes = RendererStyleCommandV1.encodePages(replacementStyle).single(),
+            ).first
+            assertEquals(0, replacementStyleResponse.errorId)
+            assertEquals(3, replacementStyleResponse.acceptedStyleRevision)
+            exchange(messenger, viewId, replacementStream, 2, 0, 2, 1, nextStyleRevision = 3)
+            val secondAuthoritative = authoritative.copy(styleRevision = 3)
+            assertEquals(secondAuthoritative, authority.snapshot(scope))
+            assertEquals(2, binding.currentCommittedBaseline().transactionId)
+            assertEquals(3, binding.currentCommittedBaseline().styleRevision)
+            val renderedCountBeforeSecondReplacement = rendered.size
+
+            val secondAbandon = RecordingResult()
+            control.invokeMethod("abandonBinding", replacementQualifier, secondAbandon)
+            assertTrue(secondAbandon.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(1, secondAbandon.successCount)
+            val secondSnapshot = RecordingResult()
+            control.invokeMethod("bindingSnapshot", null, secondSnapshot)
+            assertTrue(secondSnapshot.completed.await(2, TimeUnit.SECONDS))
+            val secondMap = secondSnapshot.successValue as Map<*, *>
+            val secondQualifier = (secondMap["nativeStreamToken"] as ByteArray) +
+                (secondMap["workerBindingToken"] as ByteArray)
+            val secondStart = RecordingResult()
+            control.invokeMethod(
+                "start",
+                secondQualifier + ControlCodec.encodeRequest(
+                    startRequest().copy(payload = restoredStartPayload(secondAuthoritative)),
+                ),
+                secondStart,
+            )
+            assertTrue(secondStart.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(
+                "start error=${secondStart.errorCode}:${secondStart.errorMessage}",
+                1,
+                secondStart.successCount,
+            )
+            val secondOwnership = requireNotNull(binding.currentObservationOwnership())
+            assertTrue(secondOwnership.bindingGeneration > replacementOwnership.bindingGeneration)
+            assertEquals("rendererRebound", integration.integrationReceipt().status)
+            assertEquals(0, integration.integrationReceipt().transactionId)
+            assertEquals(3, projection.pressureRevisions().styleRevision)
+            assertEquals(renderedCountBeforeSecondReplacement, rendered.size)
+            val secondFencedBefore = integration.snapshot().rolloverDiscardedObservations
+            integration.admitFeature(feature(replacementOwnership, 12))
+            assertEquals(
+                secondFencedBefore + 1,
+                integration.snapshot().rolloverDiscardedObservations,
+            )
+        } finally {
+            releaseBlockedAdmission.countDown()
+            integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `cold empty replacement before initial style apply retains zero style and accepts replacement cut`() {
+        val directory = Files.createTempDirectory("canonical-surface-cold-empty-before-style").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val authority = CommittedBaselineAuthority()
+        val viewId = 2155
+        val rendered = mutableListOf<com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot>()
+        val projection = NativeRendererProjection(render = { snapshot, _ -> snapshot?.let(rendered::add) })
+        val binding = VisibilityGridV2Binding(
+            messenger,
+            viewId,
+            authority,
+            postToMain = { it() },
+            onRendererStyleCut = projection::applyStyleCut,
+        )
+        val integration = VisibilityGridIntegration(
+            binding,
+            binding::currentObservationOwnership,
+            directory,
+            resourcesForGroup = resources(directory, coordinator),
+            renderer = projection,
+        )
+        try {
+            val originalStream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, originalStream, 1, 0, 0, 0)
+            exchange(messenger, viewId, originalStream, 2, 0, 0, 0)
+            exchange(messenger, viewId, originalStream, 3, 1, 1, 1)
+            val originalOwnership = requireNotNull(binding.currentObservationOwnership())
+            val authoritative = binding.currentCommittedBaseline()
+            assertEquals(1, authoritative.transactionId)
+            assertEquals(1, authoritative.geometryRevision)
+            assertEquals(1, authoritative.lineageRevision)
+            assertEquals(0, authoritative.styleRevision)
+            assertEquals("idle", integration.integrationReceipt().status)
+            assertEquals(0, projection.currentRowCount())
+            assertEquals(0, projection.pressureRevisions().styleRevision)
+
+            val control = MethodChannel(messenger, "visibility_grid_v2_control_$viewId")
+            val abandon = RecordingResult()
+            control.invokeMethod("abandonBinding", originalStream.qualifier, abandon)
+            assertTrue(abandon.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(1, abandon.successCount)
+
+            val (replacementStream, replacementResponse) = startRestored(
+                messenger,
+                viewId,
+                authoritative,
+            )
+            val replacementOwnership = requireNotNull(binding.currentObservationOwnership())
+            assertTrue(replacementOwnership.bindingGeneration > originalOwnership.bindingGeneration)
+            assertEquals(0, replacementResponse.nativeTransactionId)
+            assertEquals(0, acceptedStyleRevision(replacementResponse.payload))
+            assertEquals("rendererRebound", integration.integrationReceipt().status)
+            assertEquals(0, integration.integrationReceipt().transactionId)
+            assertEquals(0, rendered.size)
+
+            val replacementStyle = emptyBootstrapStyle(replacementOwnership, 0, 1)
+            val accepted = exchange(
+                messenger,
+                viewId,
+                replacementStream,
+                1,
+                0,
+                1,
+                1,
+                nextStyleRevision = 1,
+                commandBytes = RendererStyleCommandV1.encodePages(replacementStyle).single(),
+            ).first
+            assertEquals(0, accepted.errorId)
+            assertEquals(1, accepted.acceptedStyleRevision)
+            exchange(messenger, viewId, replacementStream, 2, 0, 1, 1, nextStyleRevision = 1)
+            assertEquals(1, binding.currentCommittedBaseline().styleRevision)
+            assertEquals(1, projection.pressureRevisions().styleRevision)
+
+            val staleReply = RecordingBinaryReply()
+            messenger.send(
+                "visibility_surface_stream_$viewId",
+                ByteBuffer.wrap(
+                    originalStream.qualifier + PacketCodec.encodeRequest(
+                        PacketCodec.Request(
+                            0, originalStream.token, 1, 1, 1, 0,
+                            TransactionResponseProfileV1.ordinary.responseCeilingBytes,
+                            emptyList(), byteArrayOf(), 4,
+                        ),
+                    ),
+                ),
+                staleReply,
+            )
+            assertTrue(staleReply.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(null, staleReply.bytes)
+            assertEquals(1, projection.pressureRevisions().styleRevision)
+        } finally {
+            integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `cold empty replacement after initial style apply reports retained style without rerender`() {
+        val directory = Files.createTempDirectory("canonical-surface-cold-empty-after-style").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val authority = CommittedBaselineAuthority()
+        val viewId = 2156
+        val rendered = mutableListOf<com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot>()
+        val projection = NativeRendererProjection(render = { snapshot, _ -> snapshot?.let(rendered::add) })
+        val binding = VisibilityGridV2Binding(
+            messenger,
+            viewId,
+            authority,
+            postToMain = { it() },
+            onRendererStyleCut = projection::applyStyleCut,
+        )
+        val integration = VisibilityGridIntegration(
+            binding,
+            binding::currentObservationOwnership,
+            directory,
+            resourcesForGroup = resources(directory, coordinator),
+            renderer = projection,
+        )
+        try {
+            val originalStream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, originalStream, 1, 0, 0, 0)
+            exchange(messenger, viewId, originalStream, 2, 0, 0, 0)
+            exchange(messenger, viewId, originalStream, 3, 1, 1, 1)
+            val originalOwnership = requireNotNull(binding.currentObservationOwnership())
+            val initialStyle = emptyBootstrapStyle(originalOwnership, 1, 1)
+            val applied = exchange(
+                messenger,
+                viewId,
+                originalStream,
+                4,
+                1,
+                1,
+                1,
+                nextStyleRevision = 1,
+                commandBytes = RendererStyleCommandV1.encodePages(initialStyle).single(),
+            ).first
+            assertEquals(1, applied.acceptedStyleRevision)
+            val authoritative = binding.currentCommittedBaseline()
+            assertEquals(1, authoritative.transactionId)
+            assertEquals(1, authoritative.styleRevision)
+            assertEquals(1, projection.pressureRevisions().styleRevision)
+            val renderedBeforeReplacement = rendered.size
+
+            val control = MethodChannel(messenger, "visibility_grid_v2_control_$viewId")
+            val abandon = RecordingResult()
+            control.invokeMethod("abandonBinding", originalStream.qualifier, abandon)
+            assertTrue(abandon.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(1, abandon.successCount)
+
+            val (_, replacementResponse) = startRestored(
+                messenger,
+                viewId,
+                authoritative,
+            )
+            val replacementOwnership = requireNotNull(binding.currentObservationOwnership())
+            assertTrue(replacementOwnership.bindingGeneration > originalOwnership.bindingGeneration)
+            assertEquals(0, replacementResponse.nativeTransactionId)
+            assertEquals(1, acceptedStyleRevision(replacementResponse.payload))
+            assertEquals("rendererRebound", integration.integrationReceipt().status)
+            assertEquals(0, integration.integrationReceipt().transactionId)
+            assertEquals(1, projection.pressureRevisions().styleRevision)
+            assertEquals(renderedBeforeReplacement, rendered.size)
+        } finally {
+            integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `replacement START timeout refuses ownership while integration lane remains blocked`() {
+        val directory = Files.createTempDirectory("canonical-surface-retained-rebind-timeout").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val authority = CommittedBaselineAuthority()
+        val viewId = 2154
+        val projection = NativeRendererProjection(render = { _, _ -> })
+        val blockAdmission = AtomicBoolean(false)
+        val blockedAdmissionEntered = CountDownLatch(1)
+        val releaseBlockedAdmission = CountDownLatch(1)
+        val blockedAdmissionFinished = CountDownLatch(1)
+        val binding = VisibilityGridV2Binding(
+            messenger,
+            viewId,
+            authority,
+            postToMain = { it() },
+            onRendererStyleCut = projection::applyStyleCut,
+        )
+        val integration = VisibilityGridIntegration(
+            binding,
+            binding::currentObservationOwnership,
+            directory,
+            resourcesForGroup = resources(directory, coordinator),
+            renderer = projection,
+            beforeAdmission = {
+                if (blockAdmission.get()) {
+                    blockedAdmissionEntered.countDown()
+                    check(releaseBlockedAdmission.await(10, TimeUnit.SECONDS))
+                }
+            },
+            retainedRebindDrainTimeoutMilliseconds = 50,
+        )
+        try {
+            val originalStream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, originalStream, 1, 0, 0, 0)
+            exchange(messenger, viewId, originalStream, 2, 0, 0, 0)
+            exchange(messenger, viewId, originalStream, 3, 1, 1, 1)
+            val originalOwnership = requireNotNull(binding.currentObservationOwnership())
+            integration.admitFeature(feature(originalOwnership, 10))
+            exchange(messenger, viewId, originalStream, 4, 1, 1, 1)
+            exchange(messenger, viewId, originalStream, 5, 1, 1, 1)
+            exchange(messenger, viewId, originalStream, 6, 1, 1, 1)
+            exchange(messenger, viewId, originalStream, 7, 2, 2, 1)
+            await { integration.integrationReceipt().status == "acknowledged" }
+            val authoritative = binding.currentCommittedBaseline()
+            val receiptBeforeReplacement = integration.integrationReceipt()
+            val fencedBefore = integration.snapshot().rolloverDiscardedObservations
+
+            blockAdmission.set(true)
+            Thread {
+                try {
+                    integration.admitFeature(feature(originalOwnership, 11))
+                } finally {
+                    blockedAdmissionFinished.countDown()
+                }
+            }.start()
+            assertTrue(blockedAdmissionEntered.await(2, TimeUnit.SECONDS))
+
+            val control = MethodChannel(messenger, "visibility_grid_v2_control_$viewId")
+            val abandon = RecordingResult()
+            control.invokeMethod("abandonBinding", originalStream.qualifier, abandon)
+            assertTrue(abandon.completed.await(2, TimeUnit.SECONDS))
+            val replacementSnapshot = RecordingResult()
+            control.invokeMethod("bindingSnapshot", null, replacementSnapshot)
+            assertTrue(replacementSnapshot.completed.await(2, TimeUnit.SECONDS))
+            val replacementMap = replacementSnapshot.successValue as Map<*, *>
+            val replacementQualifier = (replacementMap["nativeStreamToken"] as ByteArray) +
+                (replacementMap["workerBindingToken"] as ByteArray)
+            val replacementStart = RecordingResult()
+            control.invokeMethod(
+                "start",
+                replacementQualifier + ControlCodec.encodeRequest(
+                    startRequest().copy(payload = restoredStartPayload(authoritative)),
+                ),
+                replacementStart,
+            )
+            assertTrue(replacementStart.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(0, replacementStart.successCount)
+            assertEquals("VG_PROTOCOL_INVALID", replacementStart.errorCode)
+            assertEquals(null, binding.currentObservationOwnership())
+            assertEquals(receiptBeforeReplacement, integration.integrationReceipt())
+
+            releaseBlockedAdmission.countDown()
+            assertTrue(blockedAdmissionFinished.await(2, TimeUnit.SECONDS))
+            assertEquals(
+                fencedBefore + 1,
+                integration.snapshot().rolloverDiscardedObservations,
+            )
+            assertEquals(null, binding.currentObservationOwnership())
+        } finally {
+            releaseBlockedAdmission.countDown()
+            integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+        }
     }
 
     @Test
@@ -2047,6 +2903,63 @@ class VisibilityGridIntegrationTest {
         return Stream(qualifier, response.streamToken)
     }
 
+    private fun startRestored(
+        messenger: MethodTestMessenger,
+        viewId: Int,
+        baseline: CommittedBaselineV1,
+    ): Pair<Stream, com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlResponse> {
+        val control = MethodChannel(messenger, "visibility_grid_v2_control_$viewId")
+        val snapshotResult = RecordingResult()
+        control.invokeMethod("bindingSnapshot", null, snapshotResult)
+        assertTrue(snapshotResult.completed.await(2, TimeUnit.SECONDS))
+        val snapshot = snapshotResult.successValue as Map<*, *>
+        val qualifier = (snapshot["nativeStreamToken"] as ByteArray) +
+            (snapshot["workerBindingToken"] as ByteArray)
+        val result = RecordingResult()
+        control.invokeMethod(
+            "start",
+            qualifier + ControlCodec.encodeRequest(
+                startRequest().copy(payload = restoredStartPayload(baseline)),
+            ),
+            result,
+        )
+        assertTrue(result.completed.await(2, TimeUnit.SECONDS))
+        assertEquals(
+            "start error=${result.errorCode}:${result.errorMessage}",
+            1,
+            result.successCount,
+        )
+        val response = ControlCodec.decodeResponse(
+            strip(result.successValue as ByteArray, qualifier),
+        )
+        assertEquals(0, response.outcome)
+        return Stream(qualifier, response.streamToken) to response
+    }
+
+    private fun acceptedStyleRevision(payload: ByteArray): Long =
+        ByteBuffer.wrap(payload).order(java.nio.ByteOrder.LITTLE_ENDIAN).getLong(136)
+
+    private fun emptyBootstrapStyle(
+        ownership: VisibilityObservationOwnership,
+        transactionId: Long,
+        revision: Long,
+    ) = RendererStyleCutPayloadV1(
+        captureGroupId = uuid(40).bytes,
+        bindingGeneration = ownership.bindingGeneration,
+        groupGeneration = ownership.groupGeneration,
+        transactionId = transactionId,
+        geometryRevision = 1,
+        lineageRevision = 1,
+        semanticRevision = revision,
+        coverageRevision = revision,
+        styleRevision = revision,
+        residencyRevision = revision,
+        targetRevision = revision,
+        reset = true,
+        surfaceIds = longArrayOf(),
+        styleRows = byteArrayOf(),
+    )
+
     private fun exchange(
         messenger: MethodTestMessenger,
         viewId: Int,
@@ -2055,12 +2968,14 @@ class VisibilityGridIntegrationTest {
         transaction: Long,
         geometry: Long,
         lineage: Long,
+        nextStyleRevision: Long = 0,
+        commandBytes: ByteArray = byteArrayOf(),
     ): Pair<PacketCodec.Response, ByteArray> {
         val request = stream.qualifier + PacketCodec.encodeRequest(
             PacketCodec.Request(
-                0, stream.token, transaction, geometry, lineage, 0,
+                0, stream.token, transaction, geometry, lineage, nextStyleRevision,
                 TransactionResponseProfileV1.ordinary.responseCeilingBytes,
-                emptyList(), byteArrayOf(), sequence,
+                emptyList(), commandBytes, sequence,
             ),
         )
         val reply = RecordingBinaryReply()
@@ -2245,6 +3160,15 @@ class VisibilityGridIntegrationTest {
         ControlOperation.START, 0, uuid(1), uuid(20), uuid(40), 3, 4, 5, 0,
         StartRequestCodecV2.defaultPayload(),
     )
+
+    private fun restoredStartPayload(baseline: CommittedBaselineV1): ByteArray =
+        StartRequestCodecV2.defaultPayload().also { bytes ->
+            val data = ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            data.put(7, 1)
+            baseline.resultRevisionCut().take(10).forEachIndexed { index, revision ->
+                data.putLong(56 + index * Long.SIZE_BYTES, revision)
+            }
+        }
 
     private fun uuid(seed: Int): Uuid {
         val bytes = ByteArray(16) { (seed + it).toByte() }

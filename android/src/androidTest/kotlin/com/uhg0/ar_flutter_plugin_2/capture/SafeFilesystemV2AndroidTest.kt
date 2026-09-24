@@ -4,7 +4,9 @@ import android.system.Os
 import androidx.test.platform.app.InstrumentationRegistry
 import java.io.File
 import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
 
@@ -19,12 +21,18 @@ class SafeFilesystemV2AndroidTest {
         try {
             val files = SafeFilesystemV2(root, DurableStoreFaultInjectorV2 { }, AndroidDescriptorFilesystemV2())
             try {
+                assertTrue(
+                    "reservation quantum must cover the retained directory entry",
+                    files.allocationUnit(root) >= files.allocatedLength(root),
+                )
                 val accepted = files.child("sessions", "session", "attempts", "attempt", "accepted.properties")
                 val pointer = files.child("sessions", "session", "root-A.ptr")
                 files.writeExclusive(accepted, "accepted\n".toByteArray(), DurableStoreFaultPointV2.ACCEPTED_RECORD)
                 files.atomicReplace(pointer, "pointer\n".toByteArray(), DurableStoreFaultPointV2.POINTER_SLOT_REPLACE)
                 assertArrayEquals("accepted\n".toByteArray(), files.readBytes(accepted))
                 assertArrayEquals("pointer\n".toByteArray(), files.readBytes(pointer))
+                val firstRootListing = files.list(root).map(File::getName)
+                assertEquals(firstRootListing, files.list(root).map(File::getName))
 
                 val retained = File(root, "sessions-retained")
                 check(outside.mkdir())

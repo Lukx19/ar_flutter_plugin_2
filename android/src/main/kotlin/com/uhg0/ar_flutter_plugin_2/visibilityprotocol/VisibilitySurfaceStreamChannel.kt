@@ -100,6 +100,8 @@ class VisibilitySurfaceStreamChannel(
     private val onStructuralTransactionAcknowledged: ((CommittedBaselineV1) -> Unit)? = null,
     private val admitRendererStylePage: ((RendererStyleCommandV1.Page) -> Boolean)? = null,
     private val onRendererStyleCut: ((RendererStyleCutPayloadV1) -> RendererStyleCommandApplyResultV1)? = null,
+    private val onCommittedBaselineAdvanced:
+        ((CommittedBaselineV1, CommittedBaselineV1) -> Unit)? = null,
 ) {
     init {
         require(initialNextExpectedSequence in 1..Long.MAX_VALUE) {
@@ -435,8 +437,12 @@ class VisibilitySurfaceStreamChannel(
                         var publicationClaimedReply = false
                         var commitPublicationStalled = false
                         var acknowledgedStructuralBaseline: CommittedBaselineV1? = null
+                        // Owner telemetry can take the binding monitor. Keep it
+                        // outside the stream monitor because current-delta
+                        // publication acquires those monitors in the opposite
+                        // order (binding, then stream).
+                        onExecutorOperation?.invoke("exchange")
                         val response = synchronized(this) {
-                            onExecutorOperation?.invoke("exchange")
                             beforeWorkerProcessing?.invoke()
                             if (disposed.get()) {
                                 if (pendingReply.tryClaim()) {
@@ -587,11 +593,14 @@ class VisibilitySurfaceStreamChannel(
                                                                     committedBaseline = committedBaseline.copy(
                                                                         styleRevision = applied.acceptedStyleRevision,
                                                                     )
-                                                                    controlLifecycle?.setCommittedBaseline(committedBaseline)
+                                                                    controlLifecycle?.setCommittedBaselineLocally(
+                                                                        committedBaseline,
+                                                                    )
                                                                 }
                                                             }
                                                         }
                                                         if (request.styleRecords.isNotEmpty()) {
+                                                            val previousBaseline = committedBaseline
                                                             committedBaseline = committedBaseline.copy(
                                                                 styleRevision = StyleRevisionSemantics.committedRevision(
                                                                     committedBaseline.styleRevision,
@@ -599,7 +608,13 @@ class VisibilitySurfaceStreamChannel(
                                                                     true,
                                                                 ),
                                                             )
-                                                            controlLifecycle?.setCommittedBaseline(committedBaseline)
+                                                            onCommittedBaselineAdvanced?.invoke(
+                                                                previousBaseline,
+                                                                committedBaseline,
+                                                            )
+                                                            controlLifecycle?.setCommittedBaselineLocally(
+                                                                committedBaseline,
+                                                            )
                                                         }
                                                         nextStructuralResponse(request)
                                                     }
@@ -863,7 +878,8 @@ class VisibilitySurfaceStreamChannel(
     }
 
     private fun pendingCommitBaseline(): CommittedBaselineV1 =
-        queuedTransactionBaseline ?: committedBaseline
+        queuedTransactionBaseline?.copy(styleRevision = committedBaseline.styleRevision)
+            ?: committedBaseline
 
     private data class AbandonClaim(
         val won: Boolean,

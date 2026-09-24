@@ -8,6 +8,37 @@ import org.junit.Test
 
 class PoseDataExtractorTest {
     @Test
+    fun `finite debug camera phases use one tracked native pose for stream and exposure`() {
+        val extractor = PoseDataExtractor()
+        assertTrue(!extractor.beginDebugFixture())
+        extractor.addSample(sample(timestampNs = 1L, positionX = 2f))
+        assertTrue(extractor.beginDebugFixture())
+
+        extractor.setDebugFixtureManualView()
+        val manual = extractor.applyDebugFixture(
+            sample(timestampNs = 2L, positionX = 30f, isTracking = false),
+        )
+        assertEquals(2.24f, manual.position[0], 0.0001f)
+        assertEquals(2.24f, manual.transform[12], 0.0001f)
+        assertTrue(manual.isTracking)
+        assertEquals(2.24, extractor.debugFixtureTransform()!![12], 0.0001)
+
+        extractor.setDebugFixtureAutomaticRevisit()
+        val automatic = extractor.applyDebugFixture(
+            sample(timestampNs = 3L, positionX = -50f, isTracking = false),
+        )
+        assertEquals(2f, automatic.position[0], 0.0001f)
+        assertEquals(2f, automatic.transform[12], 0.0001f)
+        extractor.clearDebugFixture()
+        assertNull(extractor.debugFixtureTransform())
+        assertEquals(
+            -50f,
+            extractor.applyDebugFixture(sample(timestampNs = 4L, positionX = -50f)).position[0],
+            0.0001f,
+        )
+    }
+
+    @Test
     fun `tracking readiness waits for an observed tracking pose`() {
         val extractor = PoseDataExtractor()
         extractor.addSample(sample(timestampNs = 1_000_000L, isTracking = false))

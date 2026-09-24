@@ -21,25 +21,30 @@ internal class CanonicalRuntimeResources private constructor(
     private val budget = CoordinatorStorageBudget(coordinator)
     private var owner: SurfaceOwnership? = null
     private var current: CurrentLease? = null
+    private var lastOpenFailureStage: CanonicalRuntimeOpenFailureStage? = null
     private var closed = false
 
     fun openInitial(baseline: committedEmptyBaseline): SurfaceOwnershipOpenResult {
         checkOpen()
         check(owner == null)
         check(!CanonicalActivationSelector.hasDurableSelector(group, directory))
+        lastOpenFailureStage = null
         val configuration = this.configuration.copy(seededEmptyBaseline = baseline)
         if (CompactCanonicalStore.prepareEmptyV6Bootstrap(
                 group, directory, budget, baseline, configuration,
             )
             !is CompactCanonicalMigrationResult.Prepared
-        ) return SurfaceOwnershipOpenResult.Refused(SurfaceOwnershipRestoreRefusal.DURABILITY_FAILURE)
+        ) return openFailure(CanonicalRuntimeOpenFailureStage.BOOTSTRAP_CANDIDATE)
         val plan = (CanonicalActivation.prepareEmptyV6(
             group, directory, budget, baseline, configuration,
         )
             as? CanonicalActivationPreparation.Prepared)?.plan
-            ?: return SurfaceOwnershipOpenResult.Refused(SurfaceOwnershipRestoreRefusal.DURABILITY_FAILURE)
+            ?: return openFailure(CanonicalRuntimeOpenFailureStage.ACTIVATION_PREPARATION)
         val opened = SurfaceOwnership.open(group, directory, budget, plan, configuration)
-        if (opened !is SurfaceOwnershipOpenResult.Opened) return opened
+        if (opened !is SurfaceOwnershipOpenResult.Opened) {
+            lastOpenFailureStage = CanonicalRuntimeOpenFailureStage.ACTIVATION_AUTHORITY_OPEN
+            return opened
+        }
         owner = opened.ownership
         if (!warmCurrent()) {
             opened.ownership.close(); owner = null
@@ -52,11 +57,15 @@ internal class CanonicalRuntimeResources private constructor(
     fun reopen(): SurfaceOwnershipOpenResult {
         checkOpen()
         check(owner == null)
+        lastOpenFailureStage = null
         if (!CanonicalActivationSelector.hasDurableSelector(group, directory)) {
             return SurfaceOwnershipOpenResult.Refused(SurfaceOwnershipRestoreRefusal.CORRUPT)
         }
         val opened = SurfaceOwnership.open(group, directory, budget, configuration)
-        if (opened !is SurfaceOwnershipOpenResult.Opened) return opened
+        if (opened !is SurfaceOwnershipOpenResult.Opened) {
+            lastOpenFailureStage = CanonicalRuntimeOpenFailureStage.ACTIVATION_AUTHORITY_OPEN
+            return opened
+        }
         owner = opened.ownership
         if (!warmCurrent()) {
             opened.ownership.close(); owner = null
@@ -64,6 +73,10 @@ internal class CanonicalRuntimeResources private constructor(
         }
         return opened
     }
+
+    /** Fixed, bounded integration telemetry for the most recent failed open attempt. */
+    internal fun integrationOpenFailureStatus(reason: SurfaceOwnershipRestoreRefusal): String =
+        canonicalRuntimeOpenFailureStatus(reason, lastOpenFailureStage)
 
     fun owner(): SurfaceOwnership = requireNotNull(owner) { "canonical surface runtime authority is unavailable" }
 
@@ -294,22 +307,44 @@ internal class CanonicalRuntimeResources private constructor(
     }
 
     private fun materializeCurrent(): CurrentLease? {
-        val base = (openGenerationZero() as? CompactCanonicalOpenResult.Opened)?.store ?: return null
-        val store = CanonicalCommitStore.open(directory, budget) ?: run { base.close(); return null }
+        val base = (openGenerationZero() as? CompactCanonicalOpenResult.Opened)?.store
+            ?: return materializationFailure(CanonicalRuntimeOpenFailureStage.BASE_AUTHORITY_OPEN)
+        val store = CanonicalCommitStore.open(directory, budget) ?: run {
+            base.close()
+            return materializationFailure(CanonicalRuntimeOpenFailureStage.COMMIT_STORE_OPEN)
+        }
         val retained = retainedCurrentReceipt()
         return try {
             when (val selected = store.reopen(base, retained)) {
                 is CanonicalReopenResult.GenerationZero ->
-                    CurrentLease.create(base.scalarView(directory), selected.view, base, null, configuration.surfaceCapacity)
+                    CurrentLease.create(
+                        base.scalarView(directory), selected.view, base, null, configuration.surfaceCapacity,
+                    ) ?: materializationFailure(CanonicalRuntimeOpenFailureStage.FEATURE_ROUTE_HYDRATION)
                 is CanonicalReopenResult.Selected -> {
                     val scalar = selected.commit.view.scalarView(directory)
-                    CurrentLease.create(scalar, selected.commit.view, base, selected.commit, configuration.surfaceCapacity)
+                    CurrentLease.create(
+                        scalar, selected.commit.view, base, selected.commit, configuration.surfaceCapacity,
+                    ) ?: materializationFailure(CanonicalRuntimeOpenFailureStage.FEATURE_ROUTE_HYDRATION)
                 }
-                is CanonicalReopenResult.Refused -> { base.close(); null }
+                is CanonicalReopenResult.Refused -> {
+                    base.close()
+                    materializationFailure(CanonicalRuntimeOpenFailureStage.CURRENT_REOPEN)
+                }
             }
         } catch (_: Throwable) {
-            base.close(); null
+            base.close()
+            materializationFailure(CanonicalRuntimeOpenFailureStage.CURRENT_REOPEN)
         } finally { store.close() }
+    }
+
+    private fun materializationFailure(stage: CanonicalRuntimeOpenFailureStage): CurrentLease? {
+        lastOpenFailureStage = stage
+        return null
+    }
+
+    private fun openFailure(stage: CanonicalRuntimeOpenFailureStage): SurfaceOwnershipOpenResult.Refused {
+        lastOpenFailureStage = stage
+        return SurfaceOwnershipOpenResult.Refused(SurfaceOwnershipRestoreRefusal.DURABILITY_FAILURE)
     }
 
     /** Rebuilds from the lifecycle-owned authenticated complete current. */
@@ -1166,3 +1201,27 @@ internal data class CanonicalRendererPage(
     val rows: List<CommittedGeometryRow>,
     val nextCursor: Long?,
 )
+
+/** Bounded semantic phases for a canonical runtime open; never contains exception or path data. */
+internal enum class CanonicalRuntimeOpenFailureStage(val statusSuffix: String) {
+    BOOTSTRAP_CANDIDATE("BootstrapCandidate"),
+    ACTIVATION_PREPARATION("ActivationPreparation"),
+    ACTIVATION_AUTHORITY_OPEN("ActivationAuthorityOpen"),
+    BASE_AUTHORITY_OPEN("BaseAuthorityOpen"),
+    COMMIT_STORE_OPEN("CommitStoreOpen"),
+    CURRENT_REOPEN("CurrentReopen"),
+    FEATURE_ROUTE_HYDRATION("FeatureRouteHydration"),
+}
+
+internal fun canonicalRuntimeOpenFailureStatus(
+    reason: SurfaceOwnershipRestoreRefusal,
+    stage: CanonicalRuntimeOpenFailureStage?,
+): String {
+    val reasonStatus = when (reason) {
+        SurfaceOwnershipRestoreRefusal.INVALID_CONFIGURATION -> "openRefusedInvalidConfiguration"
+        SurfaceOwnershipRestoreRefusal.CORRUPT -> "openRefusedCorrupt"
+        SurfaceOwnershipRestoreRefusal.FORK -> "openRefusedFork"
+        SurfaceOwnershipRestoreRefusal.DURABILITY_FAILURE -> "openRefusedDurabilityFailure"
+    }
+    return reasonStatus + (stage?.statusSuffix ?: "")
+}

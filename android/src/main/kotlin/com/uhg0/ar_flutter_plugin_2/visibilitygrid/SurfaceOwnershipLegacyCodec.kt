@@ -995,7 +995,7 @@ internal object SurfaceOwnershipLegacyCodec {
                 val header = skipInlineReceipt(data, configuration, group, Long.MAX_VALUE)
                 val digest = MessageDigest.getInstance("SHA-256")
                 val length = copyV2CanonicalReceipt(file, recordOffset, group, configuration, output = java.security.DigestOutputStream(
-                    java.io.OutputStream.nullOutputStream(), digest,
+                    LegacyDiscardingOutputStream, digest,
                 ))
                 val canonicalHash = CanonicalReceiptBytes(digest.digest())
                 visitor(
@@ -1460,5 +1460,11 @@ private fun RandomAccessFile.dataInput(): DataInputStream =
                 this@dataInput.read(bytes, offset, length)
         }
     )
+
+/** Allocation-free API 30-compatible sink used while hashing legacy receipts. */
+private object LegacyDiscardingOutputStream : java.io.OutputStream() {
+    override fun write(value: Int) = Unit
+    override fun write(bytes: ByteArray, offset: Int, length: Int) = Unit
+}
 
 private fun ByteArray.hex(): String = joinToString("") { "%02x".format(it) }

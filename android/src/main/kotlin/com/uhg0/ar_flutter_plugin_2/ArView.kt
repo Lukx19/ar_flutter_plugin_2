@@ -220,7 +220,17 @@ internal class ArView(
         isDebuggable = isDebuggable,
         runtime = visibilityObservationRuntime,
         ownership = visibilityGridV2Binding::currentObservationOwnership,
+        referencePose = ::visibilitySmallSceneReferencePose,
         productHooks = object : VisibilitySmallSceneProductHooks {
+            override fun beginPoseFixture(): Boolean = captureSession.beginDebugPoseFixture()
+
+            override fun manualViewPose() = captureSession.setDebugPoseManualView()
+
+            override fun automaticRevisitPose() =
+                captureSession.setDebugPoseAutomaticRevisit()
+
+            override fun clearPoseFixture() = captureSession.clearDebugPoseFixture()
+
             override fun rendererUnavailable() {
                 sceneHost.onLowMemoryPressure()
             }
@@ -257,6 +267,14 @@ internal class ArView(
         return VisibilityPressureOwnerScalars.fromNativeOwners(canonical, scene.renderer, scene.pages)
     }
 
+    private fun visibilitySmallSceneReferencePose(): DoubleArray? {
+        captureSession.debugPoseFixtureTransform()?.let { return it }
+        val pose = sceneHost.latestFrame?.camera?.pose ?: return null
+        val matrix = FloatArray(16)
+        pose.toMatrix(matrix, 0)
+        return DoubleArray(matrix.size) { matrix[it].toDouble() }
+    }
+
     private fun visibilitySmallSceneReceiptScalars(): VisibilitySmallSceneReceiptScalars {
         val integration = visibilityObservationMappingAdmission.integrationReceipt()
         val baseline = visibilityGridV2Binding.currentCommittedBaseline()
@@ -267,7 +285,10 @@ internal class ArView(
         return VisibilitySmallSceneReceiptScalars(
             geometryRevision = maxOf(integration.geometryRevision, baseline.geometryRevision),
             lineageRevision = maxOf(integration.lineageRevision, baseline.lineageRevision),
-            durableCaptureRevision = baseline.captureRevision,
+            durableCaptureRevision = maxOf(
+                baseline.captureRevision,
+                captureSession.durableCaptureRevisionV2(),
+            ),
             coverageRevision = maxOf(baseline.coverageRevision, pressure.coverageRevision),
             styleRevision = maxOf(baseline.styleRevision, renderer.styleRevision),
             targetSurfaceId = targetSurfaceId,

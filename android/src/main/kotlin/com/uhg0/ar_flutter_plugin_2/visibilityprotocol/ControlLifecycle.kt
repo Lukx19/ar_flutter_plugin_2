@@ -15,6 +15,7 @@ class ControlLifecycle(
     private val maximumResponseBytes: Int = ControlCodec.hardCeilingBytes,
     private val CommittedBaselineAuthority: CommittedBaselineAuthority? = null,
     initialCommittedBaseline: CommittedBaselineV1 = CommittedBaselineV1.ZERO,
+    initialCommittedScope: CommittedBaselineScopeV1? = null,
 ) {
     enum class State { IDLE, ACTIVE, ABANDONED, STOPPED }
 
@@ -67,6 +68,7 @@ class ControlLifecycle(
     private var nextStreamToken = 1L
     private var activeStreamToken = 0L
     private var committedBaseline = initialCommittedBaseline
+    private var baselineScope = initialCommittedScope
     private var activeScope: CommittedBaselineScopeV1? = null
     private data class Receipt(val request: ByteArray, val response: ByteArray, val id: Uuid)
 
@@ -84,6 +86,12 @@ class ControlLifecycle(
     fun setCommittedBaseline(value: CommittedBaselineV1) {
         committedBaseline = value
         activeScope?.let { scope -> CommittedBaselineAuthority?.publish(scope, value) }
+    }
+
+    /** Mirrors a cut whose process-wide authority was already advanced by its owning binding. */
+    @Synchronized
+    fun setCommittedBaselineLocally(value: CommittedBaselineV1) {
+        committedBaseline = value
     }
 
     /** Returns null when a stream request may use this active binding token. */
@@ -199,13 +207,16 @@ class ControlLifecycle(
         if (state != State.IDLE) return error(request, ControlError.LIFECYCLE_STATE_INVALID)
         val configuration = StartRequestCodecV2.decode(request.payload)
         metrics.recordUnsupportedDesiredCapabilityBits(configuration.desiredCapabilities)
-        activeScope = CommittedBaselineScopeV1.from(request)
-        val persistedBaseline = CommittedBaselineAuthority?.snapshot(activeScope!!)
+        val requestedScope = CommittedBaselineScopeV1.from(request)
+        activeScope = requestedScope
+        val persistedBaseline = CommittedBaselineAuthority?.snapshot(requestedScope)
             ?: CommittedBaselineV1.ZERO
         val availableBaseline = if (persistedBaseline != CommittedBaselineV1.ZERO) {
             persistedBaseline
-        } else {
+        } else if (baselineScope == null || baselineScope == requestedScope) {
             committedBaseline
+        } else {
+            CommittedBaselineV1.ZERO
         }
         if (configuration.minimumMinor > StartRequestCodecV2.supportedMinor ||
             configuration.maximumMinor < StartRequestCodecV2.supportedMinor) {
@@ -225,6 +236,7 @@ class ControlLifecycle(
         } else {
             CommittedBaselineV1.ZERO
         }).let(CommittedBaselineV1::forFreshBinding)
+        baselineScope = requestedScope
         activeStartConfiguration = configuration
         activeStreamToken = nextStreamToken++
         state = State.ACTIVE

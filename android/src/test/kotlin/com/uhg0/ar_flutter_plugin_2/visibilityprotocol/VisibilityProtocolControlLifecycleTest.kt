@@ -441,6 +441,30 @@ class VisibilityProtocolControlLifecycleTest {
     }
 
     @Test
+    fun `binding seed from prior group cannot conflict with fresh group start`() {
+        val oldStart = request(ControlOperation.START, 0, 74)
+        val freshStart = request(ControlOperation.START, 0, 75).copy(
+            sessionId = uuid(80),
+            captureGroupId = uuid(90),
+        )
+        val lifecycle = ControlLifecycle(
+            initialCommittedBaseline = CommittedBaselineV1(51, 52, 53, 54),
+            initialCommittedScope = CommittedBaselineScopeV1.from(oldStart),
+        )
+
+        val response = ControlCodec.decodeResponse(
+            lifecycle.handle(freshStart, ControlCodec.encodeRequest(freshStart)),
+        )
+
+        assertEquals(0, response.outcome)
+        val result = ByteBuffer.wrap(response.payload).order(ByteOrder.LITTLE_ENDIAN)
+        assertEquals(0L, result.getLong(96))
+        assertEquals(0L, result.getLong(104))
+        assertEquals(0L, result.getLong(136))
+        assertEquals(CommittedBaselineV1.ZERO, lifecycle.committedBaseline())
+    }
+
+    @Test
     fun `baseline authority survives same group replacement with a new coverage epoch`() {
         val authority = CommittedBaselineAuthority()
         val firstLifecycle = ControlLifecycle(CommittedBaselineAuthority = authority)

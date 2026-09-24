@@ -35,15 +35,19 @@ void main() {
     expect(arm.sequence, 1);
     final wall = await scene.emit(ARVisibilitySyntheticSceneStep.wall);
     expect(wall.sequence, 2);
+    final revisit = await scene.emit(
+      ARVisibilitySyntheticSceneStep.automaticRevisit,
+    );
+    expect(revisit.sequence, 3);
     final fault = await scene.setFault(
       ARVisibilitySyntheticFault.rendererUnavailable,
     );
-    expect(fault.sequence, 3);
+    expect(fault.sequence, 4);
     await scene.dispose();
 
     expect(
       calls.map((call) => call.method),
-      <String>['arm', 'emit', 'setFault', 'disarm'],
+      <String>['arm', 'emit', 'emit', 'setFault', 'disarm'],
     );
     expect((calls[0].arguments as Map)['depthCapability'], 'automatic');
     expect((calls[0].arguments as Map)['expectedBindingGeneration'], 4);
@@ -51,14 +55,66 @@ void main() {
     expect((calls[1].arguments as Map)['step'], 'wall');
     expect((calls[1].arguments as Map)['scenarioId'], 'small-scene-primary');
     expect((calls[1].arguments as Map)['sequence'], 2);
-    expect((calls[2].arguments as Map)['fault'], 'rendererUnavailable');
+    expect((calls[2].arguments as Map)['step'], 'automaticRevisit');
     expect((calls[2].arguments as Map)['sequence'], 3);
-    expect((calls[3].arguments as Map)['scenarioId'], 'small-scene-primary');
+    expect((calls[3].arguments as Map)['fault'], 'rendererUnavailable');
     expect((calls[3].arguments as Map)['sequence'], 4);
+    expect((calls[4].arguments as Map)['scenarioId'], 'small-scene-primary');
+    expect((calls[4].arguments as Map)['sequence'], 5);
     await expectLater(
       scene.snapshot(),
       throwsA(isA<StateError>()),
     );
+  });
+
+  test('prepare is idempotent and leaves exact ARM at sequence one', () async {
+    const channel = MethodChannel('visibility_scenario_v2_21');
+    final calls = <MethodCall>[];
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      calls.add(call);
+      if (call.method == 'prepare') return null;
+      final arguments = Map<Object?, Object?>.from(call.arguments! as Map);
+      return _receipt(sequence: arguments['sequence']! as int);
+    });
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null),
+    );
+
+    final scene = ARVisibilitySyntheticScene(21, channel: channel);
+    await scene.prepare(ARVisibilitySyntheticDepthCapability.automatic);
+    await scene.prepare(ARVisibilitySyntheticDepthCapability.automatic);
+    await expectLater(
+      scene.prepare(ARVisibilitySyntheticDepthCapability.rawDepth),
+      throwsA(isA<StateError>()),
+    );
+    await expectLater(
+      scene.arm(
+        scenarioId: 'small-scene-primary',
+        depthCapability: ARVisibilitySyntheticDepthCapability.rawDepth,
+        expectedBindingGeneration: 4,
+        expectedGroupGeneration: 7,
+      ),
+      throwsA(isA<StateError>()),
+    );
+    final armed = await scene.arm(
+      scenarioId: 'small-scene-primary',
+      depthCapability: ARVisibilitySyntheticDepthCapability.automatic,
+      expectedBindingGeneration: 4,
+      expectedGroupGeneration: 7,
+    );
+    expect(armed.sequence, 1);
+
+    expect(calls.map((call) => call.method),
+        <String>['prepare', 'prepare', 'arm']);
+    expect((calls[0].arguments as Map).keys, <Object?>['depthCapability']);
+    expect((calls[0].arguments as Map)['depthCapability'], 'automatic');
+    expect((calls[1].arguments as Map)['depthCapability'], 'automatic');
+    expect((calls[2].arguments as Map)['sequence'], 1);
+    expect((calls[2].arguments as Map)['expectedBindingGeneration'], 4);
+    expect((calls[2].arguments as Map)['expectedGroupGeneration'], 7);
+    await scene.dispose();
   });
 
   test('receipt codec rejects non-scalar and unknown fields', () {

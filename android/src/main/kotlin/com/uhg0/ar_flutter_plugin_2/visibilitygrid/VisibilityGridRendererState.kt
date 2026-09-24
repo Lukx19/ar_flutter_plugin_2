@@ -201,6 +201,61 @@ class VisibilityGridRendererState(
         @Synchronized get() = targetDirectionIndexValue
 
     /**
+     * Moves an already-installed canonical cut to a replacement stream binding.
+     * Every durable and renderer revision must still name the exact retained
+     * cut; only binding-scoped ownership and the stream-local transaction are
+     * allowed to change.
+     */
+    @Synchronized
+    internal fun canRebindRetainedCanonicalCut(
+        previousOwnership: VisibilityObservationOwnership,
+        nextOwnership: VisibilityObservationOwnership,
+        previousTransactionId: Long,
+        geometryRevision: Long,
+        lineageRevision: Long,
+        styleRevision: Long,
+    ): Boolean = !(
+        disposed || group == null || installedOwnership != previousOwnership ||
+            installedTransactionId != previousTransactionId ||
+            this.geometryRevision != geometryRevision ||
+            installedLineageRevision != lineageRevision ||
+            semanticRevision != styleRevision ||
+            coverageRevision != styleRevision ||
+            this.styleRevision != styleRevision ||
+            residencyRevision != styleRevision ||
+            targetRevision != styleRevision ||
+            !previousOwnership.sameCanonicalScopeAs(nextOwnership) ||
+            nextOwnership.bindingGeneration <= previousOwnership.bindingGeneration ||
+            nextOwnership.lifecycleSequence <= previousOwnership.lifecycleSequence
+    )
+
+    @Synchronized
+    internal fun rebindRetainedCanonicalCut(
+        previousOwnership: VisibilityObservationOwnership,
+        nextOwnership: VisibilityObservationOwnership,
+        previousTransactionId: Long,
+        geometryRevision: Long,
+        lineageRevision: Long,
+        styleRevision: Long,
+    ): Boolean {
+        if (!canRebindRetainedCanonicalCut(
+                previousOwnership,
+                nextOwnership,
+                previousTransactionId,
+                geometryRevision,
+                lineageRevision,
+                styleRevision,
+            )
+        ) return false
+
+        installedOwnership = nextOwnership
+        installedGroupId = nextOwnership.captureGroupId
+        installedGroupGeneration = nextOwnership.groupGeneration
+        installedTransactionId = 0L
+        return true
+    }
+
+    /**
      * Borrows the canonical rows without materialising a renderer snapshot.
      * The view is intentionally created inside the synchronized section and
      * is valid only for the duration of [block].
@@ -392,6 +447,7 @@ class VisibilityGridRendererState(
         ownership: VisibilityObservationOwnership? = null,
         transactionId: Long = 0L,
         lineageRevision: Long = 0L,
+        preserveStyleRevisionLedger: Boolean = false,
     ) {
         ensureActive()
         require(geometryRevision >= 0)
@@ -407,7 +463,17 @@ class VisibilityGridRendererState(
         this.installedGroupGeneration = config.groupGeneration.toLong()
         this.installedTransactionId = transactionId
         this.installedLineageRevision = lineageRevision
-        resetStyleCutState()
+        if (preserveStyleRevisionLedger) {
+            // A same-owner canonical rebuild replaces every row, but the
+            // worker's next style cut must still advance from the last
+            // accepted protocol revision. The row-specific receipt and target
+            // cannot survive that rebuild.
+            targetSurfaceIdValue = null
+            targetDirectionIndexValue = null
+            lastStyleCut = null
+        } else {
+            resetStyleCutState()
+        }
         ignoredVisibilityKeyCount = 0
         rows.forEach(::admitCandidate)
         dirtyRows.addRange(count)
@@ -1300,6 +1366,18 @@ class VisibilityGridRendererState(
         return true
     }
 }
+
+private fun VisibilityObservationOwnership.sameCanonicalScopeAs(
+    other: VisibilityObservationOwnership,
+): Boolean = sessionId == other.sessionId &&
+    sessionGeneration == other.sessionGeneration &&
+    captureGroupId == other.captureGroupId &&
+    groupGeneration == other.groupGeneration &&
+    coverageEpoch == other.coverageEpoch &&
+    arSessionIdentity == other.arSessionIdentity &&
+    viewInstanceId == other.viewInstanceId &&
+    viewGeneration == other.viewGeneration &&
+    groupFrame == other.groupFrame
 
 /** One snapshot retained across the explicit SceneViewHost handoff boundary. */
 internal data class RendererSnapshotOwnershipReceipt(

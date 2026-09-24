@@ -144,6 +144,8 @@ class VisibilityGridV2Binding internal constructor(
     @Volatile private var acknowledgedPublicationCut: AcknowledgedCut? = null
     @Volatile private var pendingPublicationCut: CurrentDeltaCut? = null
     @Volatile private var acknowledgementListener: ((CurrentDeltaSelectorV1) -> Unit)? = null
+    @Volatile private var retainedRendererRebindListener:
+        ((VisibilityObservationOwnership, committedEmptyBaseline, CommittedBaselineV1) -> Boolean)? = null
     private var acceptedControls = 0L
     private var closedResources = 0L
     private var activeControlRequestId: Uuid? = null
@@ -168,6 +170,16 @@ class VisibilityGridV2Binding internal constructor(
     private fun newLifecycle() = ControlLifecycle(
         CommittedBaselineAuthority = CommittedBaselineAuthority,
         initialCommittedBaseline = initialCommittedBaselineSeed,
+        initialCommittedScope = activeSessionIdSeed?.let { sessionId ->
+            activeCaptureGroupIdSeed?.let { captureGroupId ->
+                CommittedBaselineScopeV1(
+                    sessionId,
+                    captureGroupId,
+                    activeSessionGenerationSeed,
+                    activeGroupGenerationSeed,
+                )
+            }
+        },
     )
 
     private fun newStreamChannel() = VisibilitySurfaceStreamChannel(
@@ -197,7 +209,30 @@ class VisibilityGridV2Binding internal constructor(
         debugTransportProbe = issue98Probe,
         admitRendererStylePage = ::admitRendererStylePage,
         onRendererStyleCut = ::applyRendererStyleCutCommand,
+        onCommittedBaselineAdvanced = ::publishCommittedBaselineAdvance,
     )
+
+    /** Keeps the process-scoped replacement authority aligned with accepted style-only cuts. */
+    private fun publishCommittedBaselineAdvance(
+        previousBaseline: CommittedBaselineV1,
+        baseline: CommittedBaselineV1,
+    ) = synchronized(publicationFence) {
+        check(!disposed.get() && replacementBinding == null) {
+            "Abandoned binding cannot advance the committed baseline"
+        }
+        val session = requireNotNull(activeSessionId)
+        val group = requireNotNull(activeCaptureGroupId)
+        check(CommittedBaselineAuthority.publishAdjacentStyle(
+            CommittedBaselineScopeV1(
+                session,
+                group,
+                activeSessionGeneration,
+                activeGroupGeneration,
+            ),
+            previousBaseline,
+            baseline,
+        )) { "Style cut does not advance the exact authoritative canonical baseline" }
+    }
 
     init {
         cleanupAuthority.publishCurrent(currentIdentity())
@@ -266,7 +301,7 @@ class VisibilityGridV2Binding internal constructor(
             312L + // Method/Basic channels, handlers and codecs
             24L + 32L + 40L + 48L + 40L + // binding nested scalar owners
             34L * 16L + // bounded atomic/counter wrappers across binding/stream/telemetry
-            13L * 40L + // stream callbacks/method references owned by this binding
+            15L * 40L + // stream callbacks/method references owned by this binding
             7L * 32L + // bounded deques/maps/sets and their empty envelopes
             16L + // executor capability (thread infrastructure is platform-managed, not retained payload)
             identityPayload + tracePayload + transportPayload
@@ -279,25 +314,30 @@ class VisibilityGridV2Binding internal constructor(
             val frame = activeGroupFrame ?: return@synchronized null
             val baseline = acknowledgedEmptyBaseline
             if (disposed.get() || !initialTransactionQueued || baseline == null) return@synchronized null
-            val sessionId = activeSessionId ?: return@synchronized null
-            val captureGroupId = activeCaptureGroupId ?: return@synchronized null
-            VisibilityObservationOwnership(
-                sessionId = sessionId.hex(),
-                sessionGeneration = activeSessionGeneration,
-                captureGroupId = captureGroupId.hex(),
-                groupGeneration = activeGroupGeneration,
-                coverageEpoch = activeCoverageEpoch,
-                arSessionIdentity = arSessionIdentity.hex(),
-                viewInstanceId = viewInstanceId.hex(),
-                viewGeneration = viewGeneration,
-                nativeStreamToken = nativeStreamToken.hex(),
-                workerBindingToken = workerBindingToken.hex(),
-                bindingGeneration = currentBindingGeneration,
-                lifecycleSequence = lifecycleSequence,
-                operationGeneration = operationGeneration,
-                groupFrame = frame,
-            )
+            observationOwnership(frame)
         }
+    }
+
+    /** Builds the ownership prepared by START; publication readiness is checked by the caller. */
+    private fun observationOwnership(frame: VisibilityGroupFrame): VisibilityObservationOwnership {
+        val sessionId = requireNotNull(activeSessionId)
+        val captureGroupId = requireNotNull(activeCaptureGroupId)
+        return VisibilityObservationOwnership(
+            sessionId = sessionId.hex(),
+            sessionGeneration = activeSessionGeneration,
+            captureGroupId = captureGroupId.hex(),
+            groupGeneration = activeGroupGeneration,
+            coverageEpoch = activeCoverageEpoch,
+            arSessionIdentity = arSessionIdentity.hex(),
+            viewInstanceId = viewInstanceId.hex(),
+            viewGeneration = viewGeneration,
+            nativeStreamToken = nativeStreamToken.hex(),
+            workerBindingToken = workerBindingToken.hex(),
+            bindingGeneration = currentBindingGeneration,
+            lifecycleSequence = lifecycleSequence,
+            operationGeneration = operationGeneration,
+            groupFrame = frame,
+        )
     }
 
     /** Read-only authoritative cut for scalar diagnostics owned by this binding. */
@@ -338,6 +378,15 @@ class VisibilityGridV2Binding internal constructor(
         acknowledgementListener = listener
     }
 
+    @Synchronized
+    internal fun attachRetainedRendererRebindListener(
+        listener: (VisibilityObservationOwnership, committedEmptyBaseline, CommittedBaselineV1) -> Boolean,
+    ) {
+        check(retainedRendererRebindListener == null) { "retained renderer rebind listener already attached" }
+        retainedRendererRebindListener = listener
+        replacementBinding?.attachRetainedRendererRebindListener(listener)
+    }
+
     /**
      * Queues the exact adjacent durable receipt, or proves an in-flight retry
      * is byte-identical without disturbing the stream's current transaction.
@@ -347,6 +396,7 @@ class VisibilityGridV2Binding internal constructor(
         source: CurrentDeltaSourceV1,
         selector: CurrentDeltaSelectorV1,
     ): CurrentDeltaQueueResult {
+        replacementBinding?.let { return it.queueCommittedCurrentDelta(source, selector) }
         check(!disposed.get() && replacementBinding == null) { "V2 binding is not current" }
         check(lifecycle.state() == ControlLifecycle.State.ACTIVE) {
             "V2 observation cut is unavailable"
@@ -441,9 +491,16 @@ class VisibilityGridV2Binding internal constructor(
      */
     private fun applyRendererStyleCutCommand(
         command: RendererStyleCutPayloadV1,
-    ): RendererStyleCommandApplyResultV1 {
-        val ownership = currentObservationOwnership()
+    ): RendererStyleCommandApplyResultV1 = synchronized(publicationFence) {
+        check(!disposed.get() && replacementBinding == null) {
+            "Abandoned binding cannot apply a renderer-style cut"
+        }
+        val frame = activeGroupFrame
             ?: throw IllegalArgumentException("Renderer-style cut has no active ownership")
+        check(initialTransactionQueued && acknowledgedEmptyBaseline != null) {
+            "Renderer-style cut has no acknowledged binding baseline"
+        }
+        val ownership = observationOwnership(frame)
         require(command.bindingGeneration == ownership.bindingGeneration) {
             "Renderer-style cut binding generation is stale"
         }
@@ -453,6 +510,11 @@ class VisibilityGridV2Binding internal constructor(
         require(command.captureGroupId.contentEquals(parseUuid(ownership.captureGroupId).bytes)) {
             "Renderer-style cut capture group identity is stale"
         }
+        val previousBaseline = lifecycle.committedBaseline()
+        require(command.transactionId == previousBaseline.transactionId &&
+            command.geometryRevision == previousBaseline.geometryRevision &&
+            command.lineageRevision == previousBaseline.lineageRevision
+        ) { "Renderer-style cut canonical baseline is stale" }
         val qualified = QualifiedRendererStyleCut(
             ownership = ownership,
             transactionId = command.transactionId,
@@ -483,7 +545,10 @@ class VisibilityGridV2Binding internal constructor(
                 )
             }
         }
-        return RendererStyleCommandApplyResultV1(command.styleRevision)
+        val nextBaseline = previousBaseline.copy(styleRevision = command.styleRevision)
+        publishCommittedBaselineAdvance(previousBaseline, nextBaseline)
+        lifecycle.setCommittedBaselineLocally(nextBaseline)
+        RendererStyleCommandApplyResultV1(command.styleRevision)
     }
 
     /** Rejects stale inner qualifiers before they can reserve page staging. */
@@ -812,8 +877,15 @@ class VisibilityGridV2Binding internal constructor(
                 executor.execute {
                     recordExecutorOperation("control:binding_snapshot")
                     val snapshot = snapshot()
+                    val observationOwnershipReady = currentObservationOwnership() != null
                     post {
-                        if (pending.tryClaim()) pending.result.success(snapshot.toMap())
+                        if (pending.tryClaim()) {
+                            pending.result.success(
+                                snapshot.toMap() + mapOf(
+                                    "observationOwnershipReady" to observationOwnershipReady,
+                                ),
+                            )
+                        }
                     }
                 }
             } catch (_: RejectedExecutionException) {
@@ -838,8 +910,15 @@ class VisibilityGridV2Binding internal constructor(
                 executor.execute {
                     recordExecutorOperation("control:claim_binding_lease")
                     val snapshot = snapshot()
+                    val observationOwnershipReady = currentObservationOwnership() != null
                     post {
-                        if (pending.tryClaim()) pending.result.success(snapshot.toMap())
+                        if (pending.tryClaim()) {
+                            pending.result.success(
+                                snapshot.toMap() + mapOf(
+                                    "observationOwnershipReady" to observationOwnershipReady,
+                                ),
+                            )
+                        }
                     }
                 }
             } catch (_: RejectedExecutionException) {
@@ -981,7 +1060,8 @@ class VisibilityGridV2Binding internal constructor(
                         }
                         debugRecoverySeam.afterRestoredStartQualification(request)
                         beforeControlPublication?.invoke()
-                        synchronized(publicationFence) {
+                        var retainedRendererRebind: PendingRetainedRendererRebind? = null
+                        val qualified = synchronized(publicationFence) {
                             checkCurrentBinding(admission.generation, admission.qualifier)
                             if (
                                 wasIdle && operation == ControlOperation.START &&
@@ -1003,14 +1083,18 @@ class VisibilityGridV2Binding internal constructor(
                                 activeSessionGeneration = request.sessionGeneration
                                 activeGroupGeneration = request.groupGeneration
                                 activeCoverageEpoch = request.coverageEpoch
-                                queueInitialTransaction(lifecycle.committedBaseline())
+                                retainedRendererRebind = queueInitialTransaction(lifecycle.committedBaseline())
                             }
                             if (operation == ControlOperation.STOP && decoded.outcome == 0) {
                                 activeGroupFrame = null
                             }
-                            acceptedControls++
+                            if (retainedRendererRebind == null) acceptedControls++
                             qualify(response)
                         }
+                        retainedRendererRebind?.let {
+                            completeRetainedRendererRebind(admission, it)
+                        }
+                        qualified
                     }
                 }
                 post {
@@ -1109,8 +1193,7 @@ class VisibilityGridV2Binding internal constructor(
         )
     }
 
-    @Synchronized
-    private fun queueInitialTransaction(baseline: CommittedBaselineV1) {
+    private fun queueInitialTransaction(baseline: CommittedBaselineV1): PendingRetainedRendererRebind? {
         check(!initialTransactionQueued) { "Initial transaction already queued" }
         check(baseline.transactionId == 0L) {
             "A fresh binding must allocate transaction 1 from cursor zero"
@@ -1164,16 +1247,19 @@ class VisibilityGridV2Binding internal constructor(
                 targetGeometryRevision = baseline.geometryRevision,
                 targetLineageRevision = baseline.lineageRevision,
             )
-            acknowledgedEmptyBaseline = committedEmptyBaseline(
+            val freshBaseline = committedEmptyBaseline(
                 bindingIdentity = "${session.hex()}:${group.hex()}:$currentBindingGeneration:$lifecycleSequence",
                 groupIdentity = group.hex(),
                 transactionId = selector.transactionId,
                 geometryRevision = selector.targetGeometryRevision,
                 lineageRevision = selector.targetLineageRevision,
             )
-            acknowledgedPublicationCut = selector
-            initialTransactionQueued = true
-            return
+            return PendingRetainedRendererRebind(
+                nextOwnership = observationOwnership(requireNotNull(activeGroupFrame)),
+                freshBaseline = freshBaseline,
+                authoritativeBaseline = authoritative,
+                acknowledgedCut = selector,
+            )
         }
         val responseProfile = negotiatedOrdinaryResponseProfile()
         streamChannel.queueStructuralTransaction(
@@ -1193,6 +1279,35 @@ class VisibilityGridV2Binding internal constructor(
             targetLineageRevision = baseline.lineageRevision + 1,
         )
         initialTransactionQueued = true
+        return null
+    }
+
+    /**
+     * Rebinds outside the binding monitor/publication fence, then publishes the replacement cut
+     * atomically. A refusal therefore leaves no replacement baseline or observation ownership live.
+     */
+    private fun completeRetainedRendererRebind(
+        admission: ControlAdmission,
+        pending: PendingRetainedRendererRebind,
+    ) {
+        val rebound = retainedRendererRebindListener?.invoke(
+            pending.nextOwnership,
+            pending.freshBaseline,
+            pending.authoritativeBaseline,
+        ) ?: true
+        check(rebound) {
+            "Retained canonical renderer cut does not match the authenticated baseline"
+        }
+        synchronized(publicationFence) {
+            checkCurrentBinding(admission.generation, admission.qualifier)
+            check(!initialTransactionQueued && acknowledgedEmptyBaseline == null &&
+                acknowledgedPublicationCut == null
+            ) { "Replacement renderer rebind raced baseline publication" }
+            acknowledgedEmptyBaseline = pending.freshBaseline
+            acknowledgedPublicationCut = pending.acknowledgedCut
+            initialTransactionQueued = true
+            acceptedControls++
+        }
     }
 
     private fun negotiatedOrdinaryResponseProfile() = TransactionResponseProfileV1(
@@ -1228,6 +1343,16 @@ class VisibilityGridV2Binding internal constructor(
             lifecycle = ControlLifecycle(
                 CommittedBaselineAuthority = CommittedBaselineAuthority,
                 initialCommittedBaseline = lifecycle.committedBaseline(),
+                initialCommittedScope = activeSessionId?.let { sessionId ->
+                    activeCaptureGroupId?.let { captureGroupId ->
+                        CommittedBaselineScopeV1(
+                            sessionId,
+                            captureGroupId,
+                            activeSessionGeneration,
+                            activeGroupGeneration,
+                        )
+                    }
+                },
             )
             currentBindingGeneration = nextBindingGeneration.incrementAndGet()
             activeGroupFrame = null
@@ -1315,9 +1440,11 @@ class VisibilityGridV2Binding internal constructor(
             cleanupAuthority = cleanupAuthority,
             initialCommittedBaselineSeed = lifecycle.committedBaseline(),
             onRendererStyleCut = onRendererStyleCut,
+            coverageRendererOwner = coverageRendererOwner,
         ).also { replacement ->
             observationRuntime?.let(replacement::attachObservationRuntime)
             acknowledgementListener?.let(replacement::attachPublicationAcknowledgementListener)
+            retainedRendererRebindListener?.let(replacement::attachRetainedRendererRebindListener)
         }
         return oldSnapshot.withCleanupBalances(
             closedBefore = closedBefore,
@@ -1573,6 +1700,13 @@ class VisibilityGridV2Binding internal constructor(
         }
     }
 
+    private data class PendingRetainedRendererRebind(
+        val nextOwnership: VisibilityObservationOwnership,
+        val freshBaseline: committedEmptyBaseline,
+        val authoritativeBaseline: CommittedBaselineV1,
+        val acknowledgedCut: AcknowledgedCut,
+    )
+
     private fun nextPortableOrdinal(value: Long): Long {
         check(value < Long.MAX_VALUE) { "canonical surface current delta requires binding rollover" }
         return value + 1
@@ -1801,11 +1935,13 @@ private fun Number.toExactLong(key: String): Long = when (this) {
         } catch (_: NumberFormatException) {
             error("V2 receipt field $key is not an exact integer")
         }
-        try {
-            decimal.longValueExact()
-        } catch (_: ArithmeticException) {
+        if (decimal.remainder(BigDecimal.ONE).signum() != 0 ||
+            decimal < BigDecimal.valueOf(Long.MIN_VALUE) ||
+            decimal > BigDecimal.valueOf(Long.MAX_VALUE)
+        ) {
             error("V2 receipt field $key is not an exact signed-64-bit integer")
         }
+        decimal.toLong()
     }
 }
 

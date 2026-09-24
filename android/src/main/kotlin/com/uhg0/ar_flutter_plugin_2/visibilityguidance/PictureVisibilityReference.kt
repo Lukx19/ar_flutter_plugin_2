@@ -24,7 +24,7 @@ data class PictureVisibilityCamera(
     val isValid: Boolean
         get() = model == "rectified_pinhole_q24_8_v1" &&
             imageWidth in 1..16384 && imageHeight in 1..16384 &&
-            fxQ8 in 1..65535 && fyQ8 in 1..65535 &&
+            fxQ8 in 1..65535 * 256 && fyQ8 in 1..65535 * 256 &&
             cxQ8 in 0..imageWidth * 256 && cyQ8 in 0..imageHeight * 256 &&
             nearMm == 100 && farMm == 3000 &&
             imageOrientation == "top_left_x_right_y_down_v1" &&

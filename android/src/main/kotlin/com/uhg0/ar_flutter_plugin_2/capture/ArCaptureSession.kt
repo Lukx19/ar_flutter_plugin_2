@@ -26,6 +26,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -63,11 +64,16 @@ internal class ArCaptureSession(
     private val nativeCaptureSerialOwnerV2 = NativeCaptureSerialOwnerV2(
         completionExecutor = Executor { command -> mainHandler.post(command) },
     )
+    private val nativeDurableCaptureRevisionV2 = AtomicLong(0L)
     // Constructed per view now; #102 only provides a future native admission caller.
     private val nativeCaptureBindingV2 = NativeCaptureBindingV2(
         sceneHost.context,
         captureSafetySignalV2,
         events = { event ->
+            if (event.kind == NativeCaptureEventKindV2.COMMITTED) {
+                val revision = checkNotNull(event.captureRevision)
+                nativeDurableCaptureRevisionV2.accumulateAndGet(revision, ::maxOf)
+            }
             mainHandler.post {
                 if (!disposed.get()) {
                     captureChannel.invokeMethod("onNativeCaptureV2Event", NativeCaptureWireV2.event(event))
@@ -767,12 +773,26 @@ internal class ArCaptureSession(
         NativeCaptureEventV2(NativeCaptureEventKindV2.HEALTH, resources = nativeCaptureBindingV2.snapshot()),
     )
 
+    fun durableCaptureRevisionV2(): Long = nativeDurableCaptureRevisionV2.get()
+
     fun replayNativeCaptureRecoveryV2(): List<Map<String, Any?>> =
         nativeCaptureBindingV2.replayRecovery().map(NativeCaptureWireV2::event)
 
     fun acknowledgeNativeCaptureTerminalV2(attemptId: String) {
         nativeCaptureBindingV2.acknowledgeTerminal(attemptId)
     }
+
+    internal fun beginDebugPoseFixture(): Boolean = poseDataExtractor.beginDebugFixture()
+
+    internal fun setDebugPoseManualView() = poseDataExtractor.setDebugFixtureManualView()
+
+    internal fun setDebugPoseAutomaticRevisit() =
+        poseDataExtractor.setDebugFixtureAutomaticRevisit()
+
+    internal fun debugPoseFixtureTransform(): DoubleArray? =
+        poseDataExtractor.debugFixtureTransform()
+
+    internal fun clearDebugPoseFixture() = poseDataExtractor.clearDebugFixture()
 
     fun advanceNativeCaptureRecoveryV2() = nativeCaptureBindingV2.forceRecoveryForDebug()
 

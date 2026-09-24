@@ -96,6 +96,35 @@ class CommittedBaselineAuthority {
         values[scope] = next
     }
 
+    /**
+     * Advances only the style lane of the exact authoritative canonical cut.
+     * A replacement binding may use transaction zero locally, so the process
+     * authority deliberately preserves its prior canonical transaction ID.
+     */
+    @Synchronized
+    fun publishAdjacentStyle(
+        scope: CommittedBaselineScopeV1,
+        expectedBindingBaseline: CommittedBaselineV1,
+        nextBindingBaseline: CommittedBaselineV1,
+    ): Boolean {
+        val authoritative = values[scope] ?: return false
+        val nextIsAdjacentBindingStyle = try {
+            nextBindingBaseline.styleRevision == Math.addExact(expectedBindingBaseline.styleRevision, 1L)
+        } catch (_: ArithmeticException) {
+            false
+        }
+        if (!nextIsAdjacentBindingStyle ||
+            nextBindingBaseline.copy(styleRevision = expectedBindingBaseline.styleRevision) !=
+            expectedBindingBaseline ||
+            expectedBindingBaseline.copy(
+                transactionId = authoritative.transactionId,
+                styleRevision = authoritative.styleRevision,
+            ) != authoritative
+        ) return false
+        values[scope] = authoritative.copy(styleRevision = nextBindingBaseline.styleRevision)
+        return true
+    }
+
     /** Atomically records the authoritative COMMIT outcome and baseline. */
     @Synchronized
     fun publishCommit(

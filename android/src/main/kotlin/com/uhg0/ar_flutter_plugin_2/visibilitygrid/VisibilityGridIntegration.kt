@@ -3,6 +3,7 @@ package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaReceiptV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaSelectorV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaSourceV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageCommittedRows
@@ -19,6 +20,7 @@ import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.File
 import java.util.concurrent.ExecutorService
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
@@ -119,6 +121,7 @@ internal class VisibilityGridIntegration(
     private val afterLifecycleFence: () -> Unit = {},
     private val executor: ExecutorService = Executors.newSingleThreadExecutor(),
     private val ownsExecutor: Boolean = true,
+    private val retainedRebindDrainTimeoutMilliseconds: Long = 30_000L,
 ) : VisibilityObservationMapper {
     private val lock = Any()
     private val publicationGate = Any()
@@ -157,7 +160,90 @@ internal class VisibilityGridIntegration(
     @Volatile private var receipt = VisibilityGridIntegrationReceipt.empty()
 
     init {
+        require(retainedRebindDrainTimeoutMilliseconds > 0L)
         binding.attachPublicationAcknowledgementListener(::acknowledge)
+        binding.attachRetainedRendererRebindListener(::rebindRetainedCanonicalCut)
+    }
+
+    /** Authenticates and installs one replacement binding over the exact retained cut. */
+    private fun rebindRetainedCanonicalCut(
+        nextOwnership: VisibilityObservationOwnership,
+        freshBaseline: committedEmptyBaseline,
+        authoritativeBaseline: CommittedBaselineV1,
+    ): Boolean {
+        drain(retainedRebindDrainTimeoutMilliseconds)
+        return synchronized(lock) {
+            if (closed || freshBaseline.transactionId != 0L ||
+                freshBaseline.geometryRevision != authoritativeBaseline.geometryRevision ||
+                freshBaseline.lineageRevision != authoritativeBaseline.lineageRevision
+            ) return@synchronized false
+
+            val previousOwnership = cut
+            if (previousOwnership == null) {
+                if (resources != null || owner != null || kernel != null || depthKernel != null ||
+                    pending != null || pendingQueued || pendingRendererApplied ||
+                    pendingRendererRebuild != null || pendingCanonicalAcknowledgement != null ||
+                    authoritativeBaseline.geometryRevision != 1L ||
+                    authoritativeBaseline.lineageRevision != 1L ||
+                    !renderer.rebindRetainedEmptyCanonicalCut(
+                        nextOwnership,
+                        authoritativeBaseline,
+                    )
+                ) return@synchronized false
+
+                // Canonical storage intentionally remains lazy until the first
+                // observation.  The replacement binding owns the authenticated
+                // empty cut now, while ensureOpened will create the integration
+                // resources directly against that replacement ownership.
+                receipt = receipt.copy(
+                    status = "rendererRebound",
+                    bindingGeneration = nextOwnership.bindingGeneration,
+                    sessionGeneration = nextOwnership.sessionGeneration,
+                    groupGeneration = nextOwnership.groupGeneration,
+                    transactionId = 0L,
+                    geometryRevision = authoritativeBaseline.geometryRevision,
+                    lineageRevision = authoritativeBaseline.lineageRevision,
+                )
+                return@synchronized true
+            }
+            val rebindCut = RetainedRendererBindingCut(
+                previousOwnership = previousOwnership,
+                nextOwnership = nextOwnership,
+                authoritativeBaseline = authoritativeBaseline,
+                previousBindingTransactionId = receipt.transactionId,
+            )
+            if (!renderer.canRebindRetainedCanonicalCut(rebindCut)) return@synchronized false
+
+            val exactPending = pending
+            if (exactPending != null) {
+                if (exactPending.transactionId != authoritativeBaseline.transactionId ||
+                    exactPending.targetGeometryRevision != authoritativeBaseline.geometryRevision ||
+                    exactPending.targetLineageRevision != authoritativeBaseline.lineageRevision ||
+                    !pendingQueued || !pendingRendererApplied
+                ) return@synchronized false
+                pendingBindingAcknowledged = true
+                finishPendingAcknowledgement(exactPending)
+                if (pending != null) return@synchronized false
+            }
+
+            check(renderer.rebindRetainedCanonicalCut(rebindCut)) {
+                "Preflighted retained renderer cut changed during synchronous rebind"
+            }
+
+            cut = nextOwnership
+            baseline = freshBaseline
+            nextTransactionId = 1L
+            receipt = receipt.copy(
+                status = "rendererRebound",
+                bindingGeneration = nextOwnership.bindingGeneration,
+                sessionGeneration = nextOwnership.sessionGeneration,
+                groupGeneration = nextOwnership.groupGeneration,
+                transactionId = 0L,
+                geometryRevision = authoritativeBaseline.geometryRevision,
+                lineageRevision = authoritativeBaseline.lineageRevision,
+            )
+            true
+        }
     }
 
     override fun admitFeature(observation: VisibilityFeatureObservation) = mutate(observation.ownership) {
@@ -257,14 +343,16 @@ internal class VisibilityGridIntegration(
         }
         afterLifecycleFence()
         drain()
-        synchronized(lock) {
+        val alreadyRebound = synchronized(lock) {
             if (closed || this.ownership() != ownership) return
+            if (cut == ownership) return@synchronized true
             closeOwner()
             cut = null
             baseline = null
             receipt = VisibilityGridIntegrationReceipt.empty()
+            false
         }
-        renderer.clear()
+        if (!alreadyRebound) renderer.clear()
     }
 
     override fun snapshot(): VisibilityMappingAdmissionHealth = synchronized(lock) {
@@ -289,7 +377,11 @@ internal class VisibilityGridIntegration(
 
     /** Fixed native-owner scalars for the debug pressure receipt. */
     internal fun pressureSnapshot(): CanonicalVisibilityPressureSnapshot = synchronized(lock) {
-        recordCanonicalPressureHighWater()
+        // A debug snapshot must not make the platform thread wait behind the
+        // canonical lease currently borrowed by an admitted mapper task. The
+        // last completed high-water remains authoritative until that task
+        // leaves the lane; idle snapshots and close refresh it exactly.
+        if (active == 0) recordCanonicalPressureHighWater()
         val rendererPressure = renderer.pressureRevisions()
         CanonicalVisibilityPressureSnapshot(
             geometryRevision = receipt.geometryRevision,
@@ -389,7 +481,7 @@ internal class VisibilityGridIntegration(
             synchronized(lock) { fenced++ }
             return
         }
-        executor.submit {
+        val future = executor.submit {
             synchronized(lock) { active++ }
             try {
                 beforeAdmission()
@@ -403,7 +495,20 @@ internal class VisibilityGridIntegration(
             } finally {
                 synchronized(lock) { active-- }
             }
-        }.get()
+        }
+        try {
+            future.get()
+        } catch (failure: ExecutionException) {
+            val cause = failure.cause ?: failure
+            // Preserve the mapper's failure type for the lane's existing
+            // stale-cut recovery. Future.get otherwise hides every failure
+            // behind a checked ExecutionException and strands the lane.
+            when (cause) {
+                is RuntimeException -> throw cause
+                is Error -> throw cause
+                else -> throw IllegalStateException("visibility admission failed", cause)
+            }
+        }
     }
 
     private fun isFenced(expected: VisibilityObservationOwnership): Boolean =
@@ -430,11 +535,12 @@ internal class VisibilityGridIntegration(
             runtimeResources.openInitial(seeded)
         }
         val opened = openResult as? SurfaceOwnershipOpenResult.Opened ?: run {
+            val refusal = (openResult as SurfaceOwnershipOpenResult.Refused).reason
+            val failureStatus = runtimeResources.integrationOpenFailureStatus(refusal)
             runtimeResources.close()
             rejected++
-            val refusal = (openResult as SurfaceOwnershipOpenResult.Refused).reason
             receipt = receipt.copy(
-                status = refusal.integrationStatus,
+                status = failureStatus,
                 rejected = rejected,
             )
             return null
@@ -1119,7 +1225,9 @@ internal class VisibilityGridIntegration(
         pendingCanonicalAcknowledgement = null
     }
 
-    private fun drain() { executor.submit {}.get(2, TimeUnit.SECONDS) }
+    private fun drain(timeoutMilliseconds: Long = 2_000L) {
+        executor.submit {}.get(timeoutMilliseconds, TimeUnit.MILLISECONDS)
+    }
 }
 
 internal data class RuntimeOwnerMemoryReceipt(
@@ -1164,6 +1272,12 @@ internal interface CommittedRendererProjection : AutoCloseable {
     fun applyGeometry(cut: CommittedGeometryCut): RendererProjectionResult
     fun applyStyleCut(cut: QualifiedRendererStyleCut): RendererStyleCutResult =
         RendererStyleCutResult.Rejected(RendererStyleCutRejection.CLOSED)
+    fun canRebindRetainedCanonicalCut(cut: RetainedRendererBindingCut): Boolean = false
+    fun rebindRetainedCanonicalCut(cut: RetainedRendererBindingCut): Boolean = false
+    fun rebindRetainedEmptyCanonicalCut(
+        nextOwnership: VisibilityObservationOwnership,
+        authoritativeBaseline: CommittedBaselineV1,
+    ): Boolean = false
     fun currentRowCount(): Int = 0
     /** Borrow canonical rows synchronously; no source snapshot is retained. */
     fun withCommittedRows(
@@ -1186,6 +1300,13 @@ internal interface CommittedRendererProjection : AutoCloseable {
         }
     }
 }
+
+internal data class RetainedRendererBindingCut(
+    val previousOwnership: VisibilityObservationOwnership,
+    val nextOwnership: VisibilityObservationOwnership,
+    val authoritativeBaseline: CommittedBaselineV1,
+    val previousBindingTransactionId: Long = authoritativeBaseline.transactionId,
+)
 
 private val NO_PRESENTATION_PUBLISHER:
     (BoundedCoveragePresentation?, PointCloudNativeConfig?) -> Unit = { _, _ -> }
@@ -1296,6 +1417,73 @@ internal class NativeRendererProjection(
         return result
     }
 
+    @Synchronized
+    override fun canRebindRetainedCanonicalCut(cut: RetainedRendererBindingCut): Boolean {
+        if (closed || rebuildCut != null || activeOwnership != cut.previousOwnership ||
+            activeRenderConfig == null || activeLineageRevision != cut.authoritativeBaseline.lineageRevision ||
+            activeTransactionId != cut.previousBindingTransactionId
+        ) return false
+        return state.canRebindRetainedCanonicalCut(
+            previousOwnership = cut.previousOwnership,
+            nextOwnership = cut.nextOwnership,
+            previousTransactionId = cut.previousBindingTransactionId,
+            geometryRevision = cut.authoritativeBaseline.geometryRevision,
+            lineageRevision = cut.authoritativeBaseline.lineageRevision,
+            styleRevision = cut.authoritativeBaseline.styleRevision,
+        )
+    }
+
+    @Synchronized
+    override fun rebindRetainedCanonicalCut(cut: RetainedRendererBindingCut): Boolean {
+        if (!canRebindRetainedCanonicalCut(cut)) return false
+        check(state.rebindRetainedCanonicalCut(
+            previousOwnership = cut.previousOwnership,
+            nextOwnership = cut.nextOwnership,
+            previousTransactionId = cut.previousBindingTransactionId,
+            geometryRevision = cut.authoritativeBaseline.geometryRevision,
+            lineageRevision = cut.authoritativeBaseline.lineageRevision,
+            styleRevision = cut.authoritativeBaseline.styleRevision,
+        ))
+        activeOwnership = cut.nextOwnership
+        activeTransactionId = 0L
+        return true
+    }
+
+    /**
+     * Rebinds the bootstrap-empty canonical cut before integration ingress has
+     * opened its lazy durable owner.  Style zero has no renderer owner yet;
+     * a nonzero style must already be the exact empty cut owned by the old
+     * binding and is rebound without rendering or mutating row/style bytes.
+     */
+    @Synchronized
+    override fun rebindRetainedEmptyCanonicalCut(
+        nextOwnership: VisibilityObservationOwnership,
+        authoritativeBaseline: CommittedBaselineV1,
+    ): Boolean {
+        if (closed || rebuildCut != null || currentRowCount() != 0 ||
+            authoritativeBaseline.transactionId != 1L ||
+            authoritativeBaseline.geometryRevision != 1L ||
+            authoritativeBaseline.lineageRevision != 1L
+        ) return false
+
+        val previousOwnership = activeOwnership
+        if (previousOwnership == null) {
+            return activeRenderConfig == null && authoritativeBaseline.styleRevision == 0L &&
+                state.currentStyleRevision == 0L
+        }
+        if (activeRenderConfig == null || activeTransactionId != 1L ||
+            activeLineageRevision != 1L
+        ) return false
+        return rebindRetainedCanonicalCut(
+            RetainedRendererBindingCut(
+                previousOwnership = previousOwnership,
+                nextOwnership = nextOwnership,
+                authoritativeBaseline = authoritativeBaseline,
+                previousBindingTransactionId = activeTransactionId,
+            ),
+        )
+    }
+
     /**
      * The worker publishes its initial empty style cut immediately after the
      * empty START bootstrap, before the first observation opens the canonical
@@ -1304,7 +1492,8 @@ internal class NativeRendererProjection(
      */
     private fun seedEmptyBootstrap(cut: QualifiedRendererStyleCut) {
         if (activeRenderConfig != null || activeOwnership != null || rebuildCut != null ||
-            cut.transactionId != 1L || cut.geometryRevision != 1L || cut.lineageRevision != 1L ||
+            cut.transactionId !in 0L..1L ||
+            cut.geometryRevision != 1L || cut.lineageRevision != 1L ||
             !cut.reset || cut.surfaceIds.isNotEmpty() || cut.styleRows.isNotEmpty() ||
             cut.targetSurfaceId != null || cut.targetDirectionIndex != null ||
             cut.semanticRevision != 1L || cut.coverageRevision != 1L ||
@@ -1350,6 +1539,7 @@ internal class NativeRendererProjection(
     ) {
         check(!closed)
         require(cut.reset)
+        val preserveStyleRevisionLedger = activeOwnership == cut.ownership
         val frame = cut.ownership.groupFrame
         state.startCanonicalGroup(
             config = VisibilityGridGroupConfig(
@@ -1368,6 +1558,7 @@ internal class NativeRendererProjection(
             ownership = cut.ownership,
             transactionId = cut.transactionId,
             lineageRevision = cut.lineageRevision,
+            preserveStyleRevisionLedger = preserveStyleRevisionLedger,
         )
         rebuildCut = cut
     }
@@ -1575,14 +1766,6 @@ private fun canonicalOperation(bytes: ByteArray): String = try {
 } catch (_: Exception) {
     "invalid"
 }
-
-private val SurfaceOwnershipRestoreRefusal.integrationStatus: String
-    get() = when (this) {
-        SurfaceOwnershipRestoreRefusal.INVALID_CONFIGURATION -> "openRefusedInvalidConfiguration"
-        SurfaceOwnershipRestoreRefusal.CORRUPT -> "openRefusedCorrupt"
-        SurfaceOwnershipRestoreRefusal.FORK -> "openRefusedFork"
-        SurfaceOwnershipRestoreRefusal.DURABILITY_FAILURE -> "openRefusedDurabilityFailure"
-    }
 
 /** Composes column-major GL transforms only when the finite affine contract survives. */
 private fun composeGroupFromCamera(

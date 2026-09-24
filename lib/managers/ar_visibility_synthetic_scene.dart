@@ -16,7 +16,8 @@ enum ARVisibilitySyntheticSceneStep {
   wall('wall'),
   corner('corner'),
   foregroundOccluder('foregroundOccluder'),
-  secondView('secondView');
+  secondView('secondView'),
+  automaticRevisit('automaticRevisit');
 
   const ARVisibilitySyntheticSceneStep(this.wireName);
 
@@ -155,6 +156,7 @@ final class ARVisibilitySyntheticScene {
   final MethodChannel _channel;
   int _nextSequence = 1;
   String? _scenarioId;
+  ARVisibilitySyntheticDepthCapability? _preparedDepthCapability;
   bool _armed = false;
   bool _disposed = false;
   bool _disposeRequested = false;
@@ -182,6 +184,12 @@ final class ARVisibilitySyntheticScene {
     }
     return _runExclusive(() async {
       if (_armed) throw StateError('Synthetic scene is already armed.');
+      final prepared = _preparedDepthCapability;
+      if (prepared != null && prepared != depthCapability) {
+        throw StateError(
+          'Depth capability does not match the prepared synthetic source.',
+        );
+      }
       final receipt = await _invokeReceipt(
         'arm',
         <String, Object?>{
@@ -199,6 +207,29 @@ final class ARVisibilitySyntheticScene {
       return receipt;
     });
   }
+
+  /// Fences real native observation callbacks before ownership is available.
+  ///
+  /// Preparation is idempotent for one capability and does not consume the
+  /// finite scene sequence. [arm] remains sequence 1 and validates the exact
+  /// binding and group generations once native ownership is published.
+  Future<void> prepare(
+    ARVisibilitySyntheticDepthCapability depthCapability,
+  ) =>
+      _runExclusive(() async {
+        if (_armed) throw StateError('Synthetic scene is already armed.');
+        final prepared = _preparedDepthCapability;
+        if (prepared != null && prepared != depthCapability) {
+          throw StateError(
+            'Depth capability does not match the prepared synthetic source.',
+          );
+        }
+        await _channel.invokeMethod<void>(
+          'prepare',
+          <String, Object?>{'depthCapability': depthCapability.wireName},
+        );
+        _preparedDepthCapability = depthCapability;
+      });
 
   Future<ARVisibilitySyntheticReceipt> emit(
     ARVisibilitySyntheticSceneStep step,

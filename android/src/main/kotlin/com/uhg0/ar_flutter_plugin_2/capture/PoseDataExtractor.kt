@@ -47,6 +47,8 @@ class PoseDataExtractor(private val capacity: Int = 120) {
 
     private val lock = Object()
     private val poses = mutableListOf<CachedPose>()
+    private var debugFixtureAnchor: CachedPose? = null
+    private var debugFixtureOffsetX = 0.0f
 
     companion object {
         const val OPENCV_CONVENTION = "opencv_c2w_v1"
@@ -80,7 +82,7 @@ class PoseDataExtractor(private val capacity: Int = 120) {
         }
 
         addSample(
-            CachedPose(
+            applyDebugFixture(CachedPose(
                 position = floatArrayOf(pose.tx(), pose.ty(), pose.tz()),
                 rotationQuaternion = pose.rotationQuaternion.clone(),
                 transform = transform,
@@ -90,7 +92,25 @@ class PoseDataExtractor(private val capacity: Int = 120) {
                 confidence = if (camera.trackingState == TrackingState.TRACKING) 1.0f else 0.0f,
                 trackingState = trackingState,
                 observedTimestampNs = System.nanoTime(),
-            ),
+            )),
+        )
+    }
+
+    internal fun applyDebugFixture(raw: CachedPose): CachedPose {
+        val fixture = synchronized(lock) {
+            debugFixtureAnchor?.let { it to debugFixtureOffsetX }
+        } ?: return raw
+        val position = fixture.first.position.clone()
+        val transform = fixture.first.transform.clone()
+        position[0] += fixture.second
+        transform[12] += fixture.second
+        return raw.copy(
+            position = position,
+            rotationQuaternion = fixture.first.rotationQuaternion.clone(),
+            transform = transform,
+            isTracking = true,
+            confidence = 1.0f,
+            trackingState = "tracking",
         )
     }
 
@@ -110,6 +130,35 @@ class PoseDataExtractor(private val capacity: Int = 120) {
     }
 
     fun latest(): CachedPose? = synchronized(lock) { poses.lastOrNull() }
+
+    internal fun beginDebugFixture(): Boolean = synchronized(lock) {
+        val anchor = poses.lastOrNull { it.isTracking } ?: return@synchronized false
+        debugFixtureAnchor = anchor
+        debugFixtureOffsetX = 0.0f
+        true
+    }
+
+    internal fun setDebugFixtureManualView() = synchronized(lock) {
+        check(debugFixtureAnchor != null) { "synthetic pose fixture is not active" }
+        debugFixtureOffsetX = 0.24f
+    }
+
+    internal fun setDebugFixtureAutomaticRevisit() = synchronized(lock) {
+        check(debugFixtureAnchor != null) { "synthetic pose fixture is not active" }
+        debugFixtureOffsetX = 0.0f
+    }
+
+    internal fun debugFixtureTransform(): DoubleArray? = synchronized(lock) {
+        val anchor = debugFixtureAnchor ?: return@synchronized null
+        val transform = anchor.transform.clone()
+        transform[12] += debugFixtureOffsetX
+        DoubleArray(transform.size) { transform[it].toDouble() }
+    }
+
+    internal fun clearDebugFixture() = synchronized(lock) {
+        debugFixtureAnchor = null
+        debugFixtureOffsetX = 0.0f
+    }
 
     fun alignmentDiagnostics(captureTiming: CaptureTiming): String = synchronized(lock) {
         val tracked = poses.filter { it.isTracking }

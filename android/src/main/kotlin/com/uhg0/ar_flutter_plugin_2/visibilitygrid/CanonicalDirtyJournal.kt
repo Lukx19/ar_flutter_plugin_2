@@ -561,10 +561,10 @@ internal data class DirtyIntentHeader(
                     val baseline = if (input.readBoolean()) committedEmptyBaseline(
                         input.readUTF(), input.readUTF(), input.readLong(), input.readLong(), input.readLong(),
                     ) else null
-                    val root = CanonicalReceiptBytes(input.readNBytes(32)); val sourceHash = CanonicalReceiptBytes(input.readNBytes(32))
-                    val command = CanonicalReceiptBytes(input.readNBytes(32)); val fingerprint = CanonicalReceiptBytes(input.readNBytes(32))
+                    val root = CanonicalReceiptBytes(input.readExactBytes(32)); val sourceHash = CanonicalReceiptBytes(input.readExactBytes(32))
+                    val command = CanonicalReceiptBytes(input.readExactBytes(32)); val fingerprint = CanonicalReceiptBytes(input.readExactBytes(32))
                     val targetHigh = input.readLong(); val targetLive = input.readInt(); val targetSource = input.readInt(); val targetSupport = input.readInt(); val targetEdges = input.readInt()
-                    val targetGeometry = input.readLong(); val targetLineage = input.readLong(); val walLength = input.readLong(); val walHash = CanonicalReceiptBytes(input.readNBytes(32)); val currentLength = input.readLong(); val currentHash = CanonicalReceiptBytes(input.readNBytes(32))
+                    val targetGeometry = input.readLong(); val targetLineage = input.readLong(); val walLength = input.readLong(); val walHash = CanonicalReceiptBytes(input.readExactBytes(32)); val currentLength = input.readLong(); val currentHash = CanonicalReceiptBytes(input.readExactBytes(32))
                     val prototype = DirtyIntentHeader(CompactCanonicalCut(group, profile, geometry, lineage, high, live, source, support, edges, baseline, root, sourceHash), command, fingerprint, targetHigh, targetLive, targetSource, targetSupport, targetEdges, targetGeometry, targetLineage, walLength, walHash, currentLength, currentHash, 0)
                     prototype.requireValid()
                     val offset = file.length() - 32 - walLength
@@ -580,7 +580,7 @@ internal data class DirtyIntentHeader(
                     }
                     require(walDigest.digest().contentEquals(walHash.toByteArray()))
                     require(input.read() == -1)
-                    val expected = digest.digest(); val trailer = raw.readNBytes(32); require(trailer.contentEquals(expected) && raw.read() == -1)
+                    val expected = digest.digest(); val trailer = raw.readExactBytes(32); require(trailer.contentEquals(expected) && raw.read() == -1)
                     return prototype.copy(walOffset = offset)
             }
         }
@@ -641,5 +641,17 @@ internal class BoundedInputStream(delegate: InputStream, skip: Long, private var
     override fun read(): Int = if (remaining == 0L) -1 else source.read().also { if (it >= 0) remaining-- }
     override fun read(bytes: ByteArray, offset: Int, length: Int): Int { if (remaining == 0L) return -1; val count = source.read(bytes, offset, minOf(length.toLong(), remaining).toInt()); if (count > 0) remaining -= count; return count }
     override fun close() = source.close()
+}
+/** Exact Java 8 / Android-compatible replacement for InputStream.readNBytes. */
+internal fun InputStream.readExactBytes(count: Int): ByteArray {
+    require(count >= 0)
+    return ByteArray(count).also { bytes ->
+        var offset = 0
+        while (offset < count) {
+            val read = read(bytes, offset, count - offset)
+            require(read > 0)
+            offset += read
+        }
+    }
 }
 private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }

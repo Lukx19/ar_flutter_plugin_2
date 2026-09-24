@@ -19,6 +19,7 @@ internal class VisibilitySmallSceneDebugChannel(
     private val isDebuggable: Boolean,
     private val runtime: AndroidVisibilityGridRuntime,
     private val ownership: () -> VisibilityObservationOwnership?,
+    private val referencePose: () -> DoubleArray? = { null },
     private val productHooks: VisibilitySmallSceneProductHooks =
         VisibilitySmallSceneProductHooks.NONE,
 ) : MethodChannel.MethodCallHandler {
@@ -27,6 +28,7 @@ internal class VisibilitySmallSceneDebugChannel(
     private val lock = Any()
 
     private var scenarioId: String? = null
+    private var preparedDepthCapability: VisibilityDepthCapability? = null
     private var lastSequence = 0L
     private val acceptedCommands = LinkedHashMap<Long, AcceptedSmallSceneCommand>()
     private var completedDisarm: AcceptedSmallSceneCommand? = null
@@ -50,6 +52,10 @@ internal class VisibilitySmallSceneDebugChannel(
             synchronized(lock) {
                 check(!disposed) { "synthetic scene channel is disposed" }
                 when (call.method) {
+                    "prepare" -> {
+                        prepare(call)
+                        result.success(null)
+                    }
                     "arm" -> result.success(arm(call))
                     "emit" -> result.success(runStep(call, parseStep(call.argument<String>("step"))))
                     "setFault" -> result.success(runFault(call))
@@ -69,17 +75,39 @@ internal class VisibilitySmallSceneDebugChannel(
             if (disposed) return
             disposed = true
             scenarioId = null
+            preparedDepthCapability = null
             lastSequence = 0L
             acceptedCommands.clear()
             completedDisarm = null
             runtimePausedByDisarm = false
+            productHooks.clearPoseFixture()
         }
         channel.setMethodCallHandler(null)
+    }
+
+    /**
+     * Fences real producer callbacks before observation ownership is published.
+     *
+     * This deliberately has no scenario identity or sequence: ARM remains the
+     * first retained command and still validates the exact ownership cut.
+     */
+    private fun prepare(call: MethodCall) {
+        check(scenarioId == null) { "synthetic scene is already armed" }
+        val capability = parseCapability(call.argument<String>("depthCapability"))
+        val prepared = preparedDepthCapability
+        check(prepared == null || prepared == capability) {
+            "depth capability does not match the prepared synthetic source"
+        }
+        source.setDepthCapability(capability)
+        preparedDepthCapability = capability
     }
 
     private fun arm(call: MethodCall): Map<String, Any?> {
         val requestedScenario = call.requiredScenarioId()
         val capability = parseCapability(call.argument<String>("depthCapability"))
+        check(preparedDepthCapability == null || preparedDepthCapability == capability) {
+            "depth capability does not match the prepared synthetic source"
+        }
         val sequence = call.requiredSequence()
         val expectedBindingGeneration =
             call.requiredPositiveLong("expectedBindingGeneration")
@@ -99,7 +127,9 @@ internal class VisibilitySmallSceneDebugChannel(
         }
         check(scenarioId == null) { "a scenario is already armed" }
         check(sequence == 1L) { "ARM must use sequence 1" }
-        val current = checkNotNull(runtimeOwnership())
+        val current = checkNotNull(runtimeOwnership()) {
+            "native observation ownership is not ready"
+        }
         check(expectedBindingGeneration == current.bindingGeneration) {
             "binding generation does not match"
         }
@@ -122,11 +152,46 @@ internal class VisibilitySmallSceneDebugChannel(
     private fun runStep(call: MethodCall, step: SmallSceneStep): Map<String, Any?> =
         runCommand(call, step.wireName) {
             when (step) {
-                SmallSceneStep.POPULATE_WALL -> emitFixture(intArrayOf(0, 1, 2, 3), 1_000_000_000L)
+                SmallSceneStep.POPULATE_WALL -> {
+                    val current = checkNotNull(runtimeOwnership()) {
+                        "native observation ownership is not ready"
+                    }
+                    check(productHooks.beginPoseFixture()) {
+                        "live tracked pose is not ready for the synthetic camera fixture"
+                    }
+                    val pose = checkNotNull(referencePose()) {
+                        "live reference pose is not ready for the wall fixture"
+                    }
+                    source.anchor(pose, current.groupFrame)
+                    emitFixture(intArrayOf(0, 1, 2, 3), 1_000_000_000L)
+                }
                 SmallSceneStep.POPULATE_CORNER -> emitFixture(intArrayOf(4, 5, 6, 7), 2_000_000_000L)
                 SmallSceneStep.ADD_FOREGROUND_OCCLUDER ->
                     emitFixture(intArrayOf(8, 9, 10, 11), 3_000_000_000L)
-                SmallSceneStep.SECOND_VIEW -> emitFixture(intArrayOf(20, 21, 22, 23), 4_000_000_000L)
+                SmallSceneStep.SECOND_VIEW -> {
+                    runtime.awaitDebugFixtureIdle()
+                    productHooks.manualViewPose()
+                    val current = checkNotNull(runtimeOwnership()) {
+                        "native observation ownership is not ready"
+                    }
+                    val commandPose = checkNotNull(referencePose()) {
+                        "live reference pose is not ready for SECOND_VIEW"
+                    }.copyOf()
+                    VisibilityCameraPose.copyOf(commandPose)
+                    source.anchor(commandPose, current.groupFrame)
+                    // Keep the committed-picture acceptance fixture on the
+                    // exact optical axis of the command-time camera. The
+                    // external journey supplies the distinct translated
+                    // viewpoint; an additional lateral marker offset only
+                    // makes centroid rounding and capture-time pose alignment
+                    // unnecessarily fragile.
+                    emitFixture(
+                        markers = intArrayOf(20),
+                        firstTimestampNs = 4_000_000_000L,
+                        lateralMarker = 0,
+                    )
+                }
+                SmallSceneStep.AUTOMATIC_REVISIT -> productHooks.automaticRevisitPose()
                 else -> error("step is not an observation fixture")
             }
         }
@@ -169,6 +234,7 @@ internal class VisibilitySmallSceneDebugChannel(
         val receipt = runCommand(call, SmallSceneStep.DISARM.wireName) {
             runtime.pause()
             runtimePausedByDisarm = true
+            productHooks.clearPoseFixture()
         }
         completedDisarm = checkNotNull(acceptedCommands[sequence])
         scenarioId = null
@@ -200,12 +266,16 @@ internal class VisibilitySmallSceneDebugChannel(
         return rememberReceipt(sequence, commandKey)
     }
 
-    private fun emitFixture(markers: IntArray, firstTimestampNs: Long) {
+    private fun emitFixture(
+        markers: IntArray,
+        firstTimestampNs: Long,
+        lateralMarker: Int? = null,
+    ) {
         var featureTimestamp = firstTimestampNs
         var depthTimestamp = firstTimestampNs
         markers.forEach { marker ->
-            source.emitFeature(featureTimestamp, marker)
-            source.emitDepth(depthTimestamp, marker)
+            source.emitFeature(featureTimestamp, marker, lateralMarker ?: marker)
+            source.emitDepth(depthTimestamp, marker, lateralMarker ?: marker)
             featureTimestamp += FEATURE_INTERVAL_NS
             depthTimestamp += DEPTH_INTERVAL_NS
         }
@@ -291,6 +361,7 @@ internal class VisibilitySmallSceneDebugChannel(
         "corner" -> SmallSceneStep.POPULATE_CORNER
         "foregroundOccluder" -> SmallSceneStep.ADD_FOREGROUND_OCCLUDER
         "secondView" -> SmallSceneStep.SECOND_VIEW
+        "automaticRevisit" -> SmallSceneStep.AUTOMATIC_REVISIT
         else -> error("unknown synthetic scene step")
     }
 
@@ -319,6 +390,7 @@ internal enum class SmallSceneStep(val wireName: String) {
     POPULATE_CORNER("corner"),
     ADD_FOREGROUND_OCCLUDER("foregroundOccluder"),
     SECOND_VIEW("secondView"),
+    AUTOMATIC_REVISIT("automaticRevisit"),
     RENDERER_LOSS("rendererUnavailable"),
     RENDERER_RESTORE("rendererRecovered"),
     GUIDANCE_FAILURE("guidanceTerminal"),
@@ -391,6 +463,10 @@ internal data class SmallSceneScenarioReceipt(
 
 /** Production-owner actions plus read-only scalars for the eventual ArView hook. */
 internal interface VisibilitySmallSceneProductHooks {
+    fun beginPoseFixture(): Boolean = true
+    fun manualViewPose() {}
+    fun automaticRevisitPose() {}
+    fun clearPoseFixture() {}
     fun rendererUnavailable() { error("renderer-unavailable production hook is not wired") }
     fun rendererRecovered() { error("renderer-recovered production hook is not wired") }
     fun guidanceTerminal() { error("guidance-terminal production hook is not wired") }

@@ -15,6 +15,38 @@ import org.junit.Test
 
 class FeatureFusionGuidanceVectorTest {
     @Test
+    fun `physical-camera focal lengths retain their Q24_8 pixel range`() {
+        val camera = PictureVisibilityCamera(
+            imageWidth = 640,
+            imageHeight = 480,
+            fxQ8 = 1200 * 256,
+            fyQ8 = 1180 * 256,
+            cxQ8 = 320 * 256,
+            cyQ8 = 240 * 256,
+            groupFromCameraTranslationMm = VoxelKey(50, 50, 0),
+            cameraFromGroupRotationQ30 = listOf(
+                1L shl 30, 0, 0,
+                0, 1L shl 30, 0,
+                0, 0, 1L shl 30,
+            ),
+        )
+        val surface = PictureVisibilitySurface(
+            surfaceId = 7,
+            key = VoxelKey(0, 0, -10),
+            normal = Q15Vector(0, 0, 32767),
+            normalConfidence = 200,
+        )
+
+        val evaluation = PictureVisibilityEvaluator.evaluate(camera, surface)
+
+        assertTrue(camera.isValid)
+        assertEquals(PictureVisibilityRejection.APPROVED, evaluation.rejection)
+        assertEquals(950, evaluation.depthMm)
+        assertEquals(camera.cxQ8, evaluation.projectedUQ8)
+        assertEquals(camera.cyQ8, evaluation.projectedVQ8)
+    }
+
+    @Test
     fun `synthetic feature fusion guidance vector matches the fixed-point reference`() {
         val root = fixture()
         val cameraJson = root.getValue("camera").jsonObject

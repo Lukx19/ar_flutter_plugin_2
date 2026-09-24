@@ -120,6 +120,160 @@ class VisibilityGridV2BindingTest {
     }
 
     @Test
+    fun `abandon replacement preserves exact renderer owner for status and controls`() {
+        val messenger = MethodTestMessenger()
+        val owner = NativeCoverageRendererOwner()
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 2143,
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
+            postToMain = { it() },
+            coverageRendererOwner = owner,
+        )
+        try {
+            val original = binding.snapshot()
+            val qualifier = original.nativeStreamToken + original.workerBindingToken
+            val channel = MethodChannel(messenger, "visibility_grid_v2_control_2143")
+            val abandoned = RecordingResult()
+            channel.invokeMethod("abandonBinding", qualifier, abandoned)
+            assertTrue(abandoned.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(1, abandoned.successCount)
+
+            val status = RecordingResult()
+            channel.invokeMethod("rendererStatus", null, status)
+            assertTrue(status.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(1, status.successCount)
+            val statusMap = status.successValue as Map<*, *>
+            assertEquals(false, statusMap["rendererUnavailable"])
+            assertEquals(true, statusMap["visible"])
+
+            val controls = RecordingResult()
+            channel.invokeMethod(
+                "setRendererControls",
+                mapOf(
+                    "visible" to false,
+                    "mode" to CoveragePresentationMode.SEMANTIC_CENTROIDS.wireName,
+                    "palette" to "coverage",
+                ),
+                controls,
+            )
+            assertTrue(controls.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(1, controls.successCount)
+            val controlReceipt = controls.successValue as Map<*, *>
+            assertEquals(true, controlReceipt["accepted"])
+            assertEquals(false, controlReceipt["rendererUnavailable"])
+            assertEquals(false, owner.status().visible)
+        } finally {
+            binding.dispose()
+        }
+    }
+
+    @Test
+    fun `original binding current delta forwards to replacement after bootstrap`() {
+        val messenger = MethodTestMessenger()
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 2144,
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
+            postToMain = { it() },
+        )
+        try {
+            val original = binding.snapshot()
+            val oldQualifier = original.nativeStreamToken + original.workerBindingToken
+            val channel = MethodChannel(messenger, "visibility_grid_v2_control_2144")
+            val abandoned = RecordingResult()
+            channel.invokeMethod("abandonBinding", oldQualifier, abandoned)
+            assertTrue(abandoned.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(1, abandoned.successCount)
+
+            val replacementResult = RecordingResult()
+            channel.invokeMethod("bindingSnapshot", null, replacementResult)
+            assertTrue(replacementResult.completed.await(2, TimeUnit.SECONDS))
+            val replacement = replacementResult.successValue as Map<*, *>
+            val qualifier = (replacement["nativeStreamToken"] as ByteArray) +
+                (replacement["workerBindingToken"] as ByteArray)
+            assertFalse(oldQualifier.contentEquals(qualifier))
+
+            val start = RecordingResult()
+            channel.invokeMethod(
+                "start",
+                qualifier + ControlCodec.encodeRequest(startRequest()),
+                start,
+            )
+            assertTrue(start.completed.await(2, TimeUnit.SECONDS))
+            assertEquals("start error=${start.errorCode}:${start.errorMessage}", 1, start.successCount)
+            val streamToken = ControlCodec.decodeResponse(
+                stripQualifier(start.successValue as ByteArray, qualifier),
+            ).streamToken
+
+            fun exchange(
+                sequence: Long,
+                transaction: Long,
+                geometry: Long,
+                lineage: Long,
+            ): PacketCodec.Response {
+                val reply = RecordingBinaryReply()
+                messenger.send(
+                    "visibility_surface_stream_2144",
+                    ByteBuffer.wrap(
+                        qualifier + PacketCodec.encodeRequest(
+                            PacketCodec.Request(
+                                requestFlags = 0,
+                                streamToken = streamToken,
+                                acknowledgedTransactionId = transaction,
+                                acknowledgedGeometryRevision = geometry,
+                                acknowledgedLineageRevision = lineage,
+                                nextStyleRevision = 0,
+                                maximumResponseBytes =
+                                    TransactionResponseProfileV1.ordinary.responseCeilingBytes,
+                                styleRecords = emptyList(),
+                                commandBytes = byteArrayOf(),
+                                requestSequence = sequence,
+                            ),
+                        ),
+                    ),
+                    reply,
+                )
+                assertTrue(reply.completed.await(2, TimeUnit.SECONDS))
+                return PacketCodec.decodeResponse(
+                    stripQualifier(requireNotNull(reply.bytes), qualifier),
+                )
+            }
+
+            assertEquals(2, exchange(1, 0, 0, 0).messageKind)
+            assertEquals(4, exchange(2, 0, 0, 0).messageKind)
+            assertEquals(0, exchange(3, 1, 1, 1).messageKind)
+
+            val selector = CurrentDeltaSelectorV1(2, 2, 1)
+            val payload = byteArrayOf(2, 7, 1)
+            assertEquals(
+                CurrentDeltaQueueResult.QUEUED,
+                binding.queueCommittedCurrentDelta(
+                    CurrentDeltaSourceV1 { requested ->
+                        CurrentDeltaReceiptV1(selector, 1, payload, ByteArray(32) { 2 })
+                            .takeIf { requested == selector }
+                    },
+                    selector,
+                ),
+            )
+            val begin = exchange(4, 1, 1, 1)
+            assertEquals(2, begin.messageKind)
+            assertEquals(2L, begin.transactionId)
+            assertEquals(1L, begin.baseGeometryRevision)
+            assertEquals(2L, begin.targetGeometryRevision)
+            assertEquals(1L, begin.targetLineageRevision)
+            val body = exchange(5, 1, 1, 1)
+            assertEquals(3, body.messageKind)
+            assertArrayEquals(
+                payload,
+                (TransactionResponseCodecV1.decodeFrame(body) as TransactionChunkFrameV1).value.bytes,
+            )
+        } finally {
+            binding.dispose()
+        }
+    }
+
+    @Test
     fun `renderer style command is qualified by active binding and group before callback`() {
         val messenger = MethodTestMessenger()
         var applied: QualifiedRendererStyleCut? = null
@@ -381,6 +535,14 @@ class VisibilityGridV2BindingTest {
             messenger, 2130, CommittedBaselineAuthority(), postToMain = { it() },
         )
         try {
+            val channel = MethodChannel(messenger, "visibility_grid_v2_control_2130")
+            fun observationOwnershipReady(): Boolean {
+                val result = RecordingResult()
+                channel.invokeMethod("bindingSnapshot", null, result)
+                assertTrue(result.completed.await(2, TimeUnit.SECONDS))
+                assertEquals(1, result.successCount)
+                return (result.successValue as Map<*, *>)["observationOwnershipReady"] as Boolean
+            }
             val groupFromWorld = doubleArrayOf(
                 1.0, 0.0, 0.0, 0.0,
                 0.0, 1.0, 0.0, 0.0,
@@ -398,13 +560,14 @@ class VisibilityGridV2BindingTest {
             val request = startRequest().copy(payload = payload)
             val snapshot = binding.snapshot()
             val result = RecordingResult()
-            MethodChannel(messenger, "visibility_grid_v2_control_2130").invokeMethod(
+            channel.invokeMethod(
                 "start",
                 snapshot.nativeStreamToken + snapshot.workerBindingToken + ControlCodec.encodeRequest(request),
                 result,
             )
             assertTrue(result.completed.await(2, TimeUnit.SECONDS))
             assertEquals("start error=${result.errorCode}:${result.errorMessage}", 1, result.successCount)
+            assertFalse(observationOwnershipReady())
             val qualifier = snapshot.nativeStreamToken + snapshot.workerBindingToken
             val stream = ControlCodec.decodeResponse(stripQualifier(result.successValue as ByteArray, qualifier))
             fun exchange(sequence: Long, transaction: Long, geometry: Long, lineage: Long) {
@@ -423,6 +586,7 @@ class VisibilityGridV2BindingTest {
             exchange(1, 0, 0, 0)
             exchange(2, 0, 0, 0)
             exchange(3, 1, 1, 1)
+            assertTrue(observationOwnershipReady())
 
             val frame = requireNotNull(binding.currentObservationOwnership()).groupFrame
             assertEquals(groupFromWorld.toList(), frame.groupFromWorldGl)
@@ -528,6 +692,57 @@ class VisibilityGridV2BindingTest {
             assertEquals(85, begin.baseGeometryRevision)
             assertEquals(86, begin.targetGeometryRevision)
         } finally { binding.dispose() }
+    }
+
+    @Test
+    fun `failed retained renderer rebind never publishes replacement readiness`() {
+        val request = startRequest()
+
+        fun verifyFailure(
+            viewId: Int,
+            listener: (VisibilityObservationOwnership, committedEmptyBaseline, CommittedBaselineV1) -> Boolean,
+        ) {
+            val messenger = MethodTestMessenger()
+            val authority = CommittedBaselineAuthority().also {
+                it.publish(
+                    CommittedBaselineScopeV1.from(request),
+                    CommittedBaselineV1(
+                        transactionId = 84,
+                        geometryRevision = 85,
+                        lineageRevision = 9,
+                        styleRevision = 7,
+                    ),
+                )
+            }
+            val binding = VisibilityGridV2Binding(
+                messenger = messenger,
+                viewId = viewId,
+                CommittedBaselineAuthority = authority,
+                postToMain = { it() },
+            )
+            try {
+                binding.attachRetainedRendererRebindListener(listener)
+                val snapshot = binding.snapshot()
+                val qualifier = snapshot.nativeStreamToken + snapshot.workerBindingToken
+                val result = RecordingResult()
+                MethodChannel(messenger, "visibility_grid_v2_control_$viewId").invokeMethod(
+                    "start",
+                    qualifier + ControlCodec.encodeRequest(request),
+                    result,
+                )
+                assertTrue(result.completed.await(2, TimeUnit.SECONDS))
+                assertEquals(1, result.errorCount)
+                assertEquals(null, binding.currentObservationOwnership())
+                assertEquals(null, binding.committedEmptyBaseline())
+                assertFalse(binding.snapshot().initialTransactionQueued)
+                assertEquals(0, binding.snapshot().acceptedControls)
+            } finally {
+                binding.dispose()
+            }
+        }
+
+        verifyFailure(2129) { _, _, _ -> false }
+        verifyFailure(2130) { _, _, _ -> error("renderer rebind listener failed") }
     }
 
     @Test

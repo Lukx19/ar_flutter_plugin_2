@@ -15,6 +15,102 @@ import org.junit.Test
 
 class AndroidVisibilityGridRuntimeTest {
     @Test
+    fun `synthetic source fences claimed late real callbacks without poisoning copy budget`() {
+        val cut = AtomicReference(ownership())
+        val mapper = AndroidVisibilityGridMappingAdmission(cut::get)
+        val runtime = runtime(cut, mapper)
+        try {
+            runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            assertTrue(runtime.shouldCopyFeature(1))
+            assertTrue(runtime.shouldCopyDepth(1))
+
+            runtime.configureSyntheticSource(VisibilityDepthCapability.AUTOMATIC)
+            assertFalse(runtime.shouldCopyFeature(2))
+            assertFalse(runtime.shouldCopyDepth(2))
+            assertFalse(
+                runtime.offerFeature(
+                    feature(
+                        cut.get(),
+                        1,
+                        1,
+                        VisibilityObservationSource.ARCORE_FEATURE,
+                    ),
+                    callbackCopyNs = 32_000_000,
+                ),
+            )
+            assertFalse(
+                runtime.offerDepth(
+                    depth(
+                        cut.get(),
+                        1,
+                        1,
+                        VisibilityObservationSource.ARCORE_RAW_DEPTH,
+                    ),
+                    callbackCopyNs = 32_000_000,
+                ),
+            )
+            assertEquals("withinBudget", runtime.snapshot().callbackCopyBudgetState)
+            assertEquals(0, mapper.snapshot().admittedFeatures)
+            assertEquals(0, mapper.snapshot().admittedDepths)
+
+            assertTrue(runtime.offerFeature(feature(cut.get(), 2, 1)))
+            assertTrue(runtime.offerDepth(depth(cut.get(), 2, 1)))
+            runtime.awaitDebugFixtureIdle()
+            assertEquals(1, mapper.snapshot().admittedFeatures)
+            assertEquals(1, mapper.snapshot().admittedDepths)
+        } finally {
+            runtime.close()
+        }
+    }
+
+    @Test
+    fun `debug fixture idle boundary drains scheduled work from both latest lanes`() {
+        val cut = AtomicReference(ownership())
+        val scheduler = Executors.newSingleThreadScheduledExecutor()
+        val blockerEntered = CountDownLatch(1)
+        val blockerRelease = CountDownLatch(1)
+        scheduler.execute {
+            blockerEntered.countDown()
+            blockerRelease.await(2, TimeUnit.SECONDS)
+        }
+        assertTrue(blockerEntered.await(1, TimeUnit.SECONDS))
+        val mapper = AndroidVisibilityGridMappingAdmission(cut::get)
+        val runtime = AndroidVisibilityGridRuntime(
+            ownership = cut::get,
+            mapper = mapper,
+            scheduler = scheduler,
+            featureIntervalNs = 1,
+            depthIntervalNs = 1,
+            ownsScheduler = true,
+        )
+        val firstBoundaryReturned = CountDownLatch(1)
+        try {
+            runtime.configureSyntheticSource(VisibilityDepthCapability.AUTOMATIC)
+            assertTrue(runtime.offerFeature(feature(cut.get(), 1, 1)))
+            assertTrue(runtime.offerDepth(depth(cut.get(), 1, 1)))
+            Thread {
+                runtime.awaitDebugFixtureIdle()
+                firstBoundaryReturned.countDown()
+            }.start()
+
+            assertFalse(firstBoundaryReturned.await(25, TimeUnit.MILLISECONDS))
+            blockerRelease.countDown()
+            assertTrue(firstBoundaryReturned.await(2, TimeUnit.SECONDS))
+            assertEquals(1, mapper.snapshot().admittedFeatures)
+            assertEquals(1, mapper.snapshot().admittedDepths)
+
+            assertTrue(runtime.offerFeature(feature(cut.get(), 2, 2)))
+            assertTrue(runtime.offerDepth(depth(cut.get(), 2, 2)))
+            runtime.awaitDebugFixtureIdle()
+            assertEquals(2, mapper.snapshot().admittedFeatures)
+            assertEquals(2, mapper.snapshot().admittedDepths)
+        } finally {
+            blockerRelease.countDown()
+            runtime.close()
+        }
+    }
+
+    @Test
     fun `pause discards queued copied values and rejects paused callbacks`() {
         val cut = AtomicReference(ownership())
         val scheduler = Executors.newSingleThreadScheduledExecutor()
@@ -1063,13 +1159,14 @@ class AndroidVisibilityGridRuntimeTest {
         cut: VisibilityObservationOwnership,
         timestampNs: Long,
         marker: Int,
+        source: VisibilityObservationSource = VisibilityObservationSource.SYNTHETIC_FEATURE,
     ): VisibilityFeatureObservation {
         val samples = VisibilityFeatureObservation.copySamples(
             listOf(VisibilityFeatureSample(marker, 0.0, 0.0, -1.0, 1.0)),
         )
         return VisibilityFeatureObservation(
             ownership = cut,
-            frame = frame(VisibilityObservationSource.SYNTHETIC_FEATURE, timestampNs),
+            frame = frame(source, timestampNs),
             samples = samples,
             sourceRejectedSamples = 0,
             payloadBytes = VisibilityFeatureObservation.FEATURE_FIXED_BYTES +
@@ -1081,13 +1178,14 @@ class AndroidVisibilityGridRuntimeTest {
         cut: VisibilityObservationOwnership,
         timestampNs: Long,
         marker: Int,
+        source: VisibilityObservationSource = VisibilityObservationSource.SYNTHETIC_DEPTH,
     ): VisibilityDepthObservation {
         val samples = VisibilityDepthObservation.copySamples(
             listOf(VisibilityDepthSample(marker.mod(16), marker.mod(12), 1_000, 255)),
         )
         return VisibilityDepthObservation(
             ownership = cut,
-            frame = frame(VisibilityObservationSource.SYNTHETIC_DEPTH, timestampNs),
+            frame = frame(source, timestampNs),
             samples = samples,
             sourceRejectedSamples = 0,
             payloadBytes = VisibilityDepthObservation.DEPTH_FIXED_BYTES +
@@ -1108,7 +1206,10 @@ class AndroidVisibilityGridRuntimeTest {
         imageOrientation = "landscape_right_x_right_y_down_v1",
         pose = VisibilityCameraPose.copyOf(identityVisibilityGridTransform()),
         intrinsics = VisibilityCameraIntrinsics(16, 12, 10.0, 10.0, 8.0, 6.0),
-        depthCapability = if (source == VisibilityObservationSource.SYNTHETIC_DEPTH) {
+        depthCapability = if (
+            source == VisibilityObservationSource.SYNTHETIC_DEPTH ||
+            source == VisibilityObservationSource.ARCORE_RAW_DEPTH
+        ) {
             VisibilityDepthCapability.RAW_DEPTH
         } else {
             VisibilityDepthCapability.UNSUPPORTED

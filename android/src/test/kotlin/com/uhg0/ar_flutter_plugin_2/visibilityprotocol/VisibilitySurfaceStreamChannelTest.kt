@@ -12,7 +12,9 @@ import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.ReentrantLock
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -21,6 +23,135 @@ import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class VisibilitySurfaceStreamChannelTest {
+    @Test
+    fun `executor observer enters binding owner before the stream monitor`() {
+        val messenger = TestMessenger(142)
+        val bindingOwner = ReentrantLock()
+        val ownerHeld = CountDownLatch(1)
+        val callbackEntered = CountDownLatch(1)
+        val queueAttempted = CountDownLatch(1)
+        val queueCompleted = CountDownLatch(1)
+        val callbackAcquiredOwner = AtomicBoolean(false)
+        val queueSucceeded = AtomicBoolean(false)
+        lateinit var binding: VisibilitySurfaceStreamChannel
+        binding = VisibilitySurfaceStreamChannel(
+            messenger = messenger,
+            viewId = 142,
+            onExecutorOperation = {
+                callbackEntered.countDown()
+                check(queueAttempted.await(2, TimeUnit.SECONDS))
+                if (bindingOwner.tryLock(1, TimeUnit.SECONDS)) {
+                    try {
+                        callbackAcquiredOwner.set(true)
+                    } finally {
+                        bindingOwner.unlock()
+                    }
+                }
+            },
+        )
+        val queueThread = Thread {
+            bindingOwner.lock()
+            try {
+                ownerHeld.countDown()
+                check(callbackEntered.await(2, TimeUnit.SECONDS))
+                queueAttempted.countDown()
+                binding.queueStructuralTransaction(
+                    StructuralTransactionProducerV1.produce(
+                        transactionId = 1,
+                        baseGeometryRevision = 0,
+                        targetGeometryRevision = 1,
+                        targetLineageRevision = 1,
+                        bytes = byteArrayOf(),
+                    ),
+                    minimumResponseProfile,
+                )
+                queueSucceeded.set(true)
+            } finally {
+                bindingOwner.unlock()
+                queueCompleted.countDown()
+            }
+        }.apply {
+            isDaemon = true
+            start()
+        }
+        try {
+            assertTrue(ownerHeld.await(2, TimeUnit.SECONDS))
+            PacketCodec.decodeResponse(messenger.exchange(request(1, 142)))
+            assertTrue(queueCompleted.await(2, TimeUnit.SECONDS))
+            assertTrue(queueSucceeded.get())
+            assertTrue(callbackAcquiredOwner.get())
+        } finally {
+            binding.dispose()
+        }
+    }
+
+    @Test
+    fun `COMMIT publication inherits style accepted on the same request`() {
+        val messenger = TestMessenger(139)
+        var published: CommittedBaselineV1? = null
+        val binding = VisibilitySurfaceStreamChannel(
+            messenger = messenger,
+            viewId = 139,
+            onRendererStyleCut = { cut -> RendererStyleCommandApplyResultV1(cut.styleRevision) },
+            onCommitPublished = { _, baseline -> published = baseline },
+        )
+        try {
+            binding.queueStructuralTransaction(
+                StructuralTransactionProducerV1.produce(
+                    transactionId = 1,
+                    baseGeometryRevision = 0,
+                    targetGeometryRevision = 1,
+                    targetLineageRevision = 1,
+                    bytes = byteArrayOf(),
+                ),
+                minimumResponseProfile,
+            )
+            val begin = PacketCodec.decodeResponse(messenger.exchange(request(1, 139)))
+            assertEquals(2, begin.messageKind)
+            val stylePage = RendererStyleCommandV1.encodePages(
+                RendererStyleCutPayloadV1(
+                    captureGroupId = ByteArray(16) { (it + 1).toByte() },
+                    bindingGeneration = 1,
+                    groupGeneration = 1,
+                    transactionId = 0,
+                    geometryRevision = 0,
+                    lineageRevision = 0,
+                    semanticRevision = 1,
+                    coverageRevision = 1,
+                    styleRevision = 1,
+                    residencyRevision = 1,
+                    targetRevision = 1,
+                    reset = true,
+                    surfaceIds = longArrayOf(1),
+                    styleRows = ByteArray(RendererStyleCommandV1.STYLE_ROW_BYTES),
+                ),
+            ).single()
+            val commit = PacketCodec.decodeResponse(
+                messenger.exchange(
+                    PacketCodec.encodeRequest(
+                        PacketCodec.Request(
+                            requestFlags = 0,
+                            streamToken = 139,
+                            acknowledgedTransactionId = 0,
+                            acknowledgedGeometryRevision = 0,
+                            acknowledgedLineageRevision = 0,
+                            nextStyleRevision = 1,
+                            maximumResponseBytes = PacketCodec.responseMinimumBytes,
+                            styleRecords = emptyList(),
+                            commandBytes = stylePage,
+                            requestSequence = 2,
+                        ),
+                    ),
+                ),
+            )
+            assertEquals(4, commit.messageKind)
+            assertEquals(1, commit.acceptedStyleRevision)
+            assertEquals(CommittedBaselineV1(1, 1, 1, 1), published)
+        } finally {
+            binding.dispose()
+        }
+    }
+
     @Test
     fun `renderer style pages stage until final and replay exact response without callback replay`() {
         val messenger = TestMessenger(140)

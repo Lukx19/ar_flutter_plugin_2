@@ -191,6 +191,21 @@ internal class AndroidVisibilityGridRuntime(
         setDepthCapability(capability)
     }
 
+    /**
+     * Waits until both copied-observation lanes have delivered all resident work.
+     *
+     * This is an internal debug-fixture boundary, not a production frame-path
+     * primitive. It lets a deterministic synthetic scene preserve two camera
+     * viewpoints without replacing the first one in the latest-only lanes.
+     */
+    fun awaitDebugFixtureIdle() {
+        check(isSyntheticSource()) { "debug fixture idle requires the synthetic source" }
+        lifecycleLock.read {
+            featureLane.awaitIdle()
+            depthLane.awaitIdle()
+        }
+    }
+
     fun isSyntheticSource(): Boolean = synchronized(lock) { syntheticSource }
 
     fun featureSampleCapacity(): Int = synchronized(lock) {
@@ -202,6 +217,7 @@ internal class AndroidVisibilityGridRuntime(
     }
 
     fun shouldCopyFeature(timestampNs: Long): Boolean = synchronized(lock) {
+        if (syntheticSource) return@synchronized false
         if (featureHealth == VisibilitySourceHealth.FAILED) return@synchronized false
         if (callbackCopyBudgetDegraded && !isCaptureSafe()) return@synchronized false
         claimCopy(
@@ -219,7 +235,8 @@ internal class AndroidVisibilityGridRuntime(
     }
 
     fun shouldCopyDepth(timestampNs: Long): Boolean = synchronized(lock) {
-        !callbackCopyBudgetDegraded && depthCapability != VisibilityDepthCapability.UNSUPPORTED &&
+        !syntheticSource && !callbackCopyBudgetDegraded &&
+            depthCapability != VisibilityDepthCapability.UNSUPPORTED &&
             depthHealth != VisibilitySourceHealth.FAILED &&
             claimCopy(timestampNs, depthLastCopyAttemptTimestampNs, depthIntervalNs).also {
                 if (it) depthLastCopyAttemptTimestampNs = timestampNs
@@ -233,6 +250,11 @@ internal class AndroidVisibilityGridRuntime(
         synchronized(lock) {
             offeredFeatureObservations++
             maximumFeatureSamples = maxOf(maximumFeatureSamples, observation.samples.size)
+            if (syntheticSource && observation.frame.source == VisibilityObservationSource.ARCORE_FEATURE) {
+                invalidFeatureObservations++
+                droppedFeatureObservations++
+                return@read false
+            }
             if (paused) {
                 pausedObservationRejections++
                 droppedFeatureObservations++
@@ -279,6 +301,11 @@ internal class AndroidVisibilityGridRuntime(
         synchronized(lock) {
             offeredDepthObservations++
             maximumDepthSamples = maxOf(maximumDepthSamples, observation.samples.size)
+            if (syntheticSource && observation.frame.source == VisibilityObservationSource.ARCORE_RAW_DEPTH) {
+                invalidDepthObservations++
+                droppedDepthObservations++
+                return@read false
+            }
             if (paused) {
                 pausedObservationRejections++
                 droppedDepthObservations++
@@ -1087,7 +1114,9 @@ private class LatestObservationLane<T : Any>(
     }
 
     fun awaitIdle() = synchronized(lock) {
-        while (running || accountingPending) (lock as java.lang.Object).wait()
+        while (scheduled || current != null || latest != null || running || accountingPending) {
+            (lock as java.lang.Object).wait()
+        }
     }
 
     private fun scheduleLocked(delayNs: Long) {

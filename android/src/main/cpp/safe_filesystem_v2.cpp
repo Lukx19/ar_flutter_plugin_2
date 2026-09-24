@@ -30,8 +30,10 @@ std::vector<std::string> strings(JNIEnv* env, jobjectArray values) {
 }
 
 int directory_at(JNIEnv* env, int root, const std::vector<std::string>& segments, bool create) {
-    int current = dup(root);
-    if (current < 0) { fail(env, "dup root fd"); return -1; }
+    // dup() shares the root directory's open-file-description offset. A
+    // fdopendir/readdir on that duplicate would consume future root listings.
+    int current = openat(root, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (current < 0) { fail(env, "reopen root fd"); return -1; }
     for (const auto& segment : segments) {
         if (create && mkdirat(current, segment.c_str(), 0700) < 0 && errno != EEXIST) {
             fail(env, "mkdirat"); close(current); return -1;
@@ -101,8 +103,15 @@ jlong allocation_unit_of(JNIEnv* env, jobject, jlong root, jobjectArray path) {
     }
     struct statvfs value{};
     if (fstatvfs(fd, &value) < 0) { fail(env, "fstatvfs allocation unit"); if (owned >= 0) close(owned); return -1; }
+    struct stat retained{};
+    if (fstat(fd, &retained) < 0) { fail(env, "fstat allocation unit"); if (owned >= 0) close(owned); return -1; }
     if (owned >= 0) close(owned);
-    return static_cast<jlong>(value.f_frsize > 0 ? value.f_frsize : value.f_bsize);
+    const auto filesystem_unit = static_cast<jlong>(value.f_frsize > 0 ? value.f_frsize : value.f_bsize);
+    const auto retained_bytes = static_cast<jlong>(retained.st_blocks) * 512L;
+    // The reservation quantum must bound retained bytes, not merely the logical
+    // statvfs fragment. App-private Android filesystems can retain two fragments
+    // for a one-fragment entry (for example, 8 KiB while f_frsize is 4 KiB).
+    return std::max(filesystem_unit, retained_bytes);
 }
 
 jlong open_relative(JNIEnv* env, int root, jobjectArray path, int flags, bool create_parents) {

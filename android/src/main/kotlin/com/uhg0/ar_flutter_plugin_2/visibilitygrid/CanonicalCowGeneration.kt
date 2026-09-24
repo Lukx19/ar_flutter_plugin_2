@@ -1384,7 +1384,7 @@ private fun checkedInput(file: File): DataInputStream {
             val count = input.read(scratch, 0, minOf(scratch.size.toLong(), remaining).toInt())
             require(count > 0); digest.update(scratch, 0, count); remaining -= count
         }
-        require(input.readNBytes(32).contentEquals(digest.digest()) && input.read() == -1)
+        require(input.readExactBytes(32).contentEquals(digest.digest()) && input.read() == -1)
     }
     return DataInputStream(BufferedInputStream(BoundedInputStream(FileInputStream(file), 0, bodyLength), PreparedIntentVisitorResources.STREAMING_SCRATCH_BYTES))
 }
