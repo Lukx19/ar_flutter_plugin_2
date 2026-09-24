@@ -1379,7 +1379,7 @@ private fun VisibilityObservationOwnership.sameCanonicalScopeAs(
     viewGeneration == other.viewGeneration &&
     groupFrame == other.groupFrame
 
-/** One snapshot retained across the explicit SceneViewHost handoff boundary. */
+/** Portable ownership diagnostic for the legacy full-snapshot handoff. */
 internal data class RendererSnapshotOwnershipReceipt(
     val snapshotObjectBytes: Long,
     val primaryArrayBytes: Long,
@@ -1393,23 +1393,21 @@ internal data class RendererSnapshotOwnershipReceipt(
     companion object {
         private fun alignedArray(payload: Long) = ((16L + payload + 7L) / 8L) * 8L
         private fun listBytes(count: Int) = if (count == 0) 0L else 24L + alignedArray(count * 4L)
-        private fun arrays(rows: Int) = alignedArray(rows * Long.SIZE_BYTES.toLong()) +
+        private fun arrays(rows: Int) = 2L * alignedArray(rows * Long.SIZE_BYTES.toLong()) +
             alignedArray(rows * 3L * Float.SIZE_BYTES) + alignedArray(rows * Int.SIZE_BYTES.toLong()) +
             alignedArray(rows * COVERAGE_RENDERER_STYLE_ROW_BYTES.toLong()) + alignedArray(9L * Float.SIZE_BYTES)
-        private fun span(rows: Int) = 32L + alignedArray(rows * 3L * Float.SIZE_BYTES) +
-            alignedArray(rows * Int.SIZE_BYTES.toLong()) +
-            alignedArray(rows * COVERAGE_RENDERER_STYLE_ROW_BYTES.toLong())
+        private fun rangeOnlySpan() = 32L + 3L * alignedArray(0L)
 
         fun fullResync(rows: Int) = RendererSnapshotOwnershipReceipt(
-            56L, arrays(rows), 40L, listBytes(if (rows == 0) 0 else 1),
-            if (rows == 0) 0L else span(rows),
+            112L, arrays(rows), 40L, listBytes(if (rows == 0) 0 else 1),
+            if (rows == 0) 0L else rangeOnlySpan(),
         )
 
         /** Worst legal sparse dirty set: alternating rows, one row per span. */
         fun maximumSparse(rows: Int): RendererSnapshotOwnershipReceipt {
             val spans = (rows + 1) / 2
             return RendererSnapshotOwnershipReceipt(
-                56L, arrays(rows), 40L, listBytes(spans), spans * span(1),
+                112L, arrays(rows), 40L, listBytes(spans), spans * rangeOnlySpan(),
             )
         }
     }
@@ -1419,6 +1417,7 @@ internal fun CoveragePointRenderSnapshot.ownershipReceipt(): RendererSnapshotOwn
     val spans = update?.spans.orEmpty()
     fun alignedArray(payload: Long) = ((16L + payload + 7L) / 8L) * 8L
     val primary = alignedArray(keys.size * Long.SIZE_BYTES.toLong()) +
+        alignedArray(surfaceIds.size * Long.SIZE_BYTES.toLong()) +
         alignedArray(positions.size * Float.SIZE_BYTES.toLong()) +
         alignedArray(colors.size * Int.SIZE_BYTES.toLong()) + alignedArray(styleRows.size.toLong()) +
         alignedArray(gridRotationWorld.size * Float.SIZE_BYTES.toLong())
@@ -1427,5 +1426,5 @@ internal fun CoveragePointRenderSnapshot.ownershipReceipt(): RendererSnapshotOwn
         32L + alignedArray(span.positions.size * Float.SIZE_BYTES.toLong()) +
             alignedArray(span.colors.size * Int.SIZE_BYTES.toLong()) + alignedArray(span.styleRows.size.toLong())
     }
-    return RendererSnapshotOwnershipReceipt(56L, primary, if (update == null) 0L else 40L, list, spanBytes)
+    return RendererSnapshotOwnershipReceipt(112L, primary, if (update == null) 0L else 40L, list, spanBytes)
 }

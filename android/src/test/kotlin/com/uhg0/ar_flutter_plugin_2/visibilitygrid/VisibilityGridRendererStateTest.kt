@@ -278,7 +278,12 @@ class VisibilityGridRendererStateTest {
             ),
             snapshot.colors,
         )
-        assertArrayEquals(snapshot.styleRows, snapshot.update!!.spans.single().styleRows)
+        val dirty = snapshot.update!!.spans.single()
+        assertEquals(0, dirty.startSlot)
+        assertEquals(keys.size, dirty.rowCount)
+        assertTrue(dirty.positions.isEmpty())
+        assertTrue(dirty.colors.isEmpty())
+        assertTrue(dirty.styleRows.isEmpty())
     }
 
     @Test
@@ -317,7 +322,8 @@ class VisibilityGridRendererStateTest {
 
         val update = checkNotNull(retry.update)
         assertTrue(update.reset)
-        assertEquals(1, update.spans.single().positions.size / 3)
+        assertEquals(1, update.spans.single().rowCount)
+        assertTrue(update.spans.single().positions.isEmpty())
         assertEquals(1, state.currentGeometryRevision)
         assertEquals(0, state.currentVisibilityRevision)
     }
