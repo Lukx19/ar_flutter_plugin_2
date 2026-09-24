@@ -7,6 +7,7 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererGlyph
+import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_NO_DIRECTION
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRowsQualifier
 import com.uhg0.ar_flutter_plugin_2.pointcloud.rangeOnly
 import java.util.PriorityQueue
@@ -77,7 +78,10 @@ private class PresentationBacking(
             val retained = style.glyph != CoverageRendererGlyph.NONE &&
                 retainedGlyphRows.binarySearch(index) >= 0
             if (style.glyph != CoverageRendererGlyph.NONE && !retained) {
-                style.copy(glyph = CoverageRendererGlyph.NONE).encode()
+                style.copy(
+                    glyph = CoverageRendererGlyph.NONE,
+                    directionBin = COVERAGE_RENDERER_NO_DIRECTION,
+                ).encode()
                     .copyInto(styleTable, index * COVERAGE_RENDERER_STYLE_ROW_BYTES)
             }
             glyphPrefix[index + 1] = glyphPrefix[index] + if (retained) 1 else 0

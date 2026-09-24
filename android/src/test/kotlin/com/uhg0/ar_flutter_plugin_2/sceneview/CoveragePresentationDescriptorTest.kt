@@ -8,6 +8,7 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererTarget
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRowsQualifier
 import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
+import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_NO_DIRECTION
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -23,7 +24,8 @@ class CoveragePresentationDescriptorTest {
         val committedStyles = ByteArray(ids.size * COVERAGE_RENDERER_STYLE_ROW_BYTES)
         repeat(ids.size) { index ->
             CoverageRendererStyleRowV1(
-                glyph = CoverageRendererGlyph.NORMAL,
+                glyph = if (index == ids.lastIndex) CoverageRendererGlyph.DESIRED_DIRECTION else CoverageRendererGlyph.VIEW_ROSE,
+                directionBin = index % 24,
                 target = if (index == ids.lastIndex) CoverageRendererTarget.PRIMARY else CoverageRendererTarget.NONE,
                 coverage = if (index == ids.lastIndex - 1) CoverageRendererCoverage.UNCOVERED else CoverageRendererCoverage.COMPLETE,
             ).encode().copyInto(committedStyles, index * COVERAGE_RENDERER_STYLE_ROW_BYTES)
@@ -59,9 +61,11 @@ class CoveragePresentationDescriptorTest {
         assertEquals(ids.toList(), descriptor.selectedSurfaceIds.toList())
         assertEquals(CoverageRendererLimits.GLYPH_CAPACITY, descriptor.glyphCount)
         assertEquals(CoverageRendererGlyph.NONE, CoverageRendererStyleRowV1.decode(descriptor.styleRows, 255 * COVERAGE_RENDERER_STYLE_ROW_BYTES).glyph)
-        assertEquals(CoverageRendererGlyph.NORMAL, CoverageRendererStyleRowV1.decode(descriptor.styleRows, 298 * COVERAGE_RENDERER_STYLE_ROW_BYTES).glyph)
-        assertEquals(CoverageRendererGlyph.NORMAL, CoverageRendererStyleRowV1.decode(descriptor.styleRows, 299 * COVERAGE_RENDERER_STYLE_ROW_BYTES).glyph)
-        assertEquals(CoverageRendererGlyph.NORMAL, CoverageRendererStyleRowV1.decode(committedStyles, 255 * COVERAGE_RENDERER_STYLE_ROW_BYTES).glyph)
+        assertEquals(COVERAGE_RENDERER_NO_DIRECTION, CoverageRendererStyleRowV1.decode(descriptor.styleRows, 255 * COVERAGE_RENDERER_STYLE_ROW_BYTES).directionBin)
+        assertEquals(CoverageRendererGlyph.VIEW_ROSE, CoverageRendererStyleRowV1.decode(descriptor.styleRows, 298 * COVERAGE_RENDERER_STYLE_ROW_BYTES).glyph)
+        assertEquals(CoverageRendererGlyph.DESIRED_DIRECTION, CoverageRendererStyleRowV1.decode(descriptor.styleRows, 299 * COVERAGE_RENDERER_STYLE_ROW_BYTES).glyph)
+        assertEquals(CoverageRendererGlyph.VIEW_ROSE, CoverageRendererStyleRowV1.decode(committedStyles, 255 * COVERAGE_RENDERER_STYLE_ROW_BYTES).glyph)
+        assertEquals(255 % 24, CoverageRendererStyleRowV1.decode(committedStyles, 255 * COVERAGE_RENDERER_STYLE_ROW_BYTES).directionBin)
         assertTrue(descriptor.withPage(qualifier, 0, 300) { page ->
             val visibleGlyphs = (0 until page.count).count { index ->
                 CoverageRendererStyleRowV1.decode(page.styleRows, index * COVERAGE_RENDERER_STYLE_ROW_BYTES).glyph != CoverageRendererGlyph.NONE
