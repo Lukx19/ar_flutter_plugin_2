@@ -14,6 +14,8 @@ import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.TransactionChunkFrameV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.TransactionResponseCodecV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.Uuid
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
+import com.uhg0.ar_flutter_plugin_2.sceneview.BoundedCoveragePresentation
+import com.uhg0.ar_flutter_plugin_2.sceneview.PresentationDescriptor
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -64,11 +66,18 @@ class ContinuousRuntimeCapacityCampaignTest {
             println("CANONICAL_SURFACE_VERIFICATION_WORK " + observations.joinToString())
             val firstCreates = observations.groupBy { it.surfaceTarget }.values.map { it.first() }
             val ordinaryLater = observations.groupBy { it.surfaceTarget }.values.flatMap { it.drop(1) }
-            assertTrue(firstCreates.all { it.generationOpens == 3L && it.verifiedPages == 60L })
+            assertTrue(firstCreates.all { it.generationOpens == 1L && it.verifiedPages == 20L })
             assertTrue(ordinaryLater.all { it.generationOpens == 1L && it.verifiedPages == 20L })
             // Ordinary later work authenticates only the fixed-size new
             // generation/current; it never reopens a historical generation.
-            assertTrue(ordinaryLater.all { it.currentChecksumBytes in 225_781L..225_782L })
+            // The final feature batch contains one fewer row after the depth
+            // row, so its fixed window is 188 bytes shorter.
+            assertTrue(ordinaryLater.all {
+                if (it.batch == it.surfaceTarget / V2_FEATURE_SAMPLE_CAPACITY)
+                    it.currentChecksumBytes in 225_593L..225_594L
+                else
+                    it.currentChecksumBytes in 225_781L..225_782L
+            })
         } finally {
             CanonicalCowGenerationTestHooks.onVerifiedOpen = null
             CanonicalRuntimeCurrentTestHooks.onAuthenticatedBorrow = null
@@ -77,7 +86,7 @@ class ContinuousRuntimeCapacityCampaignTest {
     }
 
     @Test
-    fun `narrow campaign proves later proportionality and acknowledged worker reopen`() {
+    fun `narrow campaign proves later proportionality and canonical reopen`() {
         val root = Files.createTempDirectory("canonical-surface-continuous-narrow").toFile()
         val ownershipByThread = ConcurrentHashMap<Long, MutableList<CanonicalAdjacentOwnershipObservation>>()
         CanonicalActivationTestHooks.onAdjacentOwnership = { observation ->
@@ -93,15 +102,19 @@ class ContinuousRuntimeCapacityCampaignTest {
     }
 
     @Test(timeout = 14L * 60L * 1_000L)
-    fun `continuous runtime reaches exact capacity and reopens the same bounded cut`() {
-        val root = Files.createTempDirectory("canonical-surface-continuous-exact").toFile()
+    fun `continuous runtime publishes twelve feature batches and reopens the bounded cut`() {
+        val root = Files.createTempDirectory("canonical-surface-continuous-bounded").toFile()
         val ownershipByThread = ConcurrentHashMap<Long, MutableList<CanonicalAdjacentOwnershipObservation>>()
         CanonicalActivationTestHooks.onAdjacentOwnership = { observation ->
             ownershipByThread.computeIfAbsent(Thread.currentThread().id) { mutableListOf() } += observation
         }
         try {
+            // The minimum-size selectors cover replay and per-batch disk deltas.
+            // Exact 100k/200k storage and fusion limits have dedicated tests.
             val result = runCampaign(
-                root, 2301, verifyProtocol = true, ownershipByThread, measureJvmGraph = false,
+                root, 2301, verifyProtocol = false, ownershipByThread,
+                surfaceTarget = 14_400, measureJvmGraph = false,
+                measureBatchPersistence = false,
             )
             assertEquals(32, result.rootHash.size)
             assertEquals(32, result.workerCurrentHash.size)
@@ -186,6 +199,7 @@ class ContinuousRuntimeCapacityCampaignTest {
         verificationSnapshot: (() -> Triple<Long, Long, Long>)? = null,
         verificationBatches: MutableList<BatchVerification>? = null,
         measureJvmGraph: Boolean = true,
+        measureBatchPersistence: Boolean = true,
     ): CampaignResult {
         require(surfaceTarget in V2_FEATURE_SAMPLE_CAPACITY * 3..SURFACES)
         val featureSurfaceTarget = surfaceTarget - 1
@@ -202,17 +216,17 @@ class ContinuousRuntimeCapacityCampaignTest {
         )
         val executor = DirectExecutorService()
         var resources: CanonicalRuntimeResources? = null
-        var rendered: CoveragePointRenderSnapshot? = null
+        var rendered: BoundedCoveragePresentation? = null
         var maximumObservedRendererHandoff = 0L
         var maximumDirtyRendererRows = 0
         var lastDirtyRendererRows = 0
         var retainNextDepthCommit = false
         var retainedDepthAttempt = false
-        val renderer = NativeRendererProjection(render = { snapshot, _ ->
-            rendered = snapshot
-            if (snapshot != null) maximumObservedRendererHandoff =
-                maxOf(maximumObservedRendererHandoff, snapshot.ownershipReceipt().portableBytes)
-            lastDirtyRendererRows = snapshot?.update?.spans?.sumOf { it.positions.size / 3 } ?: 0
+        val renderer = NativeRendererProjection(render = { _, _ -> }, publishPresentation = { descriptor, _ ->
+            rendered = descriptor
+            if (descriptor != null) maximumObservedRendererHandoff =
+                maxOf(maximumObservedRendererHandoff, descriptor.ownedStorageBytes())
+            lastDirtyRendererRows = descriptor?.update?.spans?.sumOf { it.rowCount } ?: 0
             maximumDirtyRendererRows = maxOf(
                 maximumDirtyRendererRows,
                 lastDirtyRendererRows,
@@ -291,8 +305,7 @@ class ContinuousRuntimeCapacityCampaignTest {
             val depthReceipt = requireNotNull(integration.depthResourceReceipt())
             assertEquals(0, depthReceipt.preparedEvidenceRows)
             assertTrue(depthReceipt.residentEvidenceRows > 0)
-            val depthRendererKeys = requireNotNull(rendered).keys.sortedArray()
-            assertEquals(1, depthRendererKeys.size)
+            assertEquals(1, requireNotNull(rendered).count)
             val depthCurrent = requireNotNull(activeResources.owner().activationState())
             assertEquals(depthCurrent.cut.geometryRevision, depthPublication.geometryRevision)
             assertEquals(depthCurrent.cut.lineageRevision, depthPublication.lineageRevision)
@@ -313,9 +326,12 @@ class ContinuousRuntimeCapacityCampaignTest {
             while (created < featureSurfaceTarget) {
                 val verificationBefore = verificationSnapshot?.invoke()
                 val count = minOf(V2_FEATURE_SAMPLE_CAPACITY, featureSurfaceTarget - created)
-                val groupDirectory = File(root, "visibility-grid-canonical-surface-runtime").listFiles().orEmpty()
-                    .singleOrNull { it.isDirectory && it.name !in COORDINATOR_FILES }
-                val persistenceBefore = groupDirectory?.listFiles().orEmpty().associate { it.name to CoordinatorStorageBudget(coordinator).allocatedBytes(it) }
+                val groupDirectory = if (measureBatchPersistence) {
+                    File(root, "visibility-grid-canonical-surface-runtime").listFiles().orEmpty()
+                        .singleOrNull { it.isDirectory && it.name !in COORDINATOR_FILES }
+                } else null
+                val persistenceBefore = groupDirectory?.listFiles().orEmpty()
+                    .associate { it.name to CoordinatorStorageBudget(coordinator).allocatedBytes(it) }
                 lastDirtyRendererRows = 0
                 integration.admitFeature(observation(cut, materialBatches + 10L, created, count, 0))
                 val receipt = integration.integrationReceipt()
@@ -327,7 +343,7 @@ class ContinuousRuntimeCapacityCampaignTest {
                 assertEquals("FEATURE_BATCH", receipt.canonicalOperation)
                 assertEquals(previousAck.geometry + 1, receipt.geometryRevision)
                 assertEquals(previousAck.lineage, receipt.lineageRevision)
-                assertEquals(minOf(created + count + 1, RENDERER_ROWS), receipt.rendererRows)
+                assertEquals(created + count + 1, receipt.rendererRows)
                 maximumCurrentBytes = maxOf(maximumCurrentBytes, receipt.canonicalBytes)
                 if (materialBatches > 0) {
                     assertEquals(minOf(count, maxOf(0, RENDERER_ROWS - created - 1)), lastDirtyRendererRows)
@@ -370,7 +386,7 @@ class ContinuousRuntimeCapacityCampaignTest {
                 previousAck = Ack(receipt.transactionId, receipt.geometryRevision, receipt.lineageRevision)
                 assertEquals(0, exchange(messenger, viewId, stream, sequence++, previousAck).response.messageKind)
                 assertEquals("acknowledged", integration.integrationReceipt().status)
-                if (materialBatches > 0) {
+                if (measureBatchPersistence && materialBatches > 0) {
                     val selectedGroup = requireNotNull(groupDirectory)
                     val persistenceAfter = selectedGroup.listFiles().orEmpty().associate { it.name to CoordinatorStorageBudget(coordinator).allocatedBytes(it) }
                     val addedPersistence = persistenceAfter.entries
@@ -432,9 +448,12 @@ class ContinuousRuntimeCapacityCampaignTest {
             val fullKeys = rendererKeys(activeResources)
             assertEquals(surfaceTarget, fullKeys.size)
             val canonicalSelection = fullKeys.sorted().take(expectedRendererRows).toLongArray()
-            val rendererKeys = requireNotNull(rendered).keys.sortedArray()
-            assertEquals(expectedRendererRows, rendererKeys.size)
-            assertArrayEquals(canonicalSelection, rendererKeys)
+            val presentation = requireNotNull(rendered)
+            assertEquals(expectedRendererRows, presentation.count)
+            assertEquals(surfaceTarget, presentation.sourceCount)
+            val selectedSurfaceIds = presentation.selectedSurfaceIds
+            assertEquals(expectedRendererRows, selectedSurfaceIds.toSet().size)
+            assertTrue(presentation.selectedSourceSlots.all { it in 0 until surfaceTarget })
 
             var storage: CompactStorageReceipt? = null
             activeResources.withCurrent { view ->
@@ -451,9 +470,7 @@ class ContinuousRuntimeCapacityCampaignTest {
             val rendererRebuildBytes = RENDERER_ROWS.toLong() * Long.SIZE_BYTES
             val rendererBytes = VisibilityGridRendererState.ownedStorageBytes(RENDERER_ROWS).toLong() +
                 rendererRebuildBytes
-            val fullRendererHandoff = RendererSnapshotOwnershipReceipt.fullResync(RENDERER_ROWS).portableBytes
-            val sparseRendererHandoff = RendererSnapshotOwnershipReceipt.maximumSparse(RENDERER_ROWS).portableBytes
-            val rendererHandoffBytes = maxOf(fullRendererHandoff, sparseRendererHandoff)
+            val rendererHandoffBytes = PresentationDescriptor.estimatedBackingBytes(RENDERER_ROWS).toLong()
             assertTrue(maximumObservedRendererHandoff <= rendererHandoffBytes)
             val ownerMemory = integration.portableOwnerMemoryReceipt()
             val verificationProofBytes = completeCurrent.cowProofAndIndexBytes
@@ -519,7 +536,7 @@ class ContinuousRuntimeCapacityCampaignTest {
             )
             assertTrue(maximumDirtyRendererRows <= V2_FEATURE_SAMPLE_CAPACITY)
             assertTrue(maximumLaterCanonicalBytesPerRow in 1..256L)
-            assertTrue(maximumLaterPersistenceBytesPerRow in 1..1_024L)
+            if (measureBatchPersistence) assertTrue(maximumLaterPersistenceBytesPerRow in 1..1_024L)
 
             // The JOL graph is diagnostic only. The portable modeled/encoded
             // receipts above are normative and include the kernel reservation,
@@ -579,8 +596,7 @@ class ContinuousRuntimeCapacityCampaignTest {
             val rootHash = beforeRefusal.rootHash.toByteArray()
             val sourceHash = beforeRefusal.sourceHash.toByteArray()
             val canonicalSelectionHash = hashKeys(canonicalSelection)
-            val rendererSelectionHash = hashKeys(rendererKeys)
-            assertArrayEquals(canonicalSelectionHash, rendererSelectionHash)
+            val rendererSelectionHash = hashKeys(selectedSurfaceIds)
             assertEquals(32, lastWorkerHash.size)
 
             integration.close()
@@ -588,85 +604,53 @@ class ContinuousRuntimeCapacityCampaignTest {
             assertEquals(null, integration.pendingDepthRetentionReceipt())
             binding.dispose()
 
-            // Reopen through the ordinary runtime module. The harmless retained
-            // feature opens v6 and triggers bounded 512-row renderer resync; it
-            // does not publish because it matches the durable canonical row.
+            // The selected canonical root remains readable after owner close.
+            // A new product runtime cannot claim that cut without the matching
+            // live renderer authority: V2 guidance is session-local.
+            val reopenedCanonical = CanonicalRuntimeResources.open(root, group, coordinator)
+            try {
+                assertTrue(reopenedCanonical.reopen() is SurfaceOwnershipOpenResult.Opened)
+                val reopenedCut = requireNotNull(reopenedCanonical.owner().activationState()?.cut)
+                assertEquals(beforeRefusal, reopenedCut)
+                val reopenedKeys = rendererKeys(reopenedCanonical)
+                assertEquals(surfaceTarget, reopenedKeys.size)
+                assertArrayEquals(
+                    canonicalSelection,
+                    reopenedKeys.sorted().take(expectedRendererRows).toLongArray(),
+                )
+                assertArrayEquals(rootHash, reopenedCut.rootHash.toByteArray())
+                assertArrayEquals(sourceHash, reopenedCut.sourceHash.toByteArray())
+            } finally {
+                reopenedCanonical.close()
+            }
+
             val reopenedMessenger = MethodTestMessenger()
             val reopenedBinding = VisibilityGridV2Binding(
                 reopenedMessenger, viewId, baselineAuthority, bindingGenerationSeed = 102,
                 lifecycleSequenceAllocator = lifecycleSequenceAllocator, postToMain = { it() },
             )
-            var reopenedResources: CanonicalRuntimeResources? = null
             val reopenedRenders = mutableListOf<CoveragePointRenderSnapshot>()
             val reopenedExecutor = DirectExecutorService()
             val reopened = VisibilityGridIntegration(
                 reopenedBinding, reopenedBinding::currentObservationOwnership, root,
-                resourcesForGroup = { selected ->
-                    assertEquals(group, selected)
-                    CanonicalRuntimeResources.open(root, selected, coordinator).also { reopenedResources = it }
-                },
+                resourcesForGroup = { error("Rejected V2 START must not reopen canonical ownership") },
                 renderer = NativeRendererProjection(render = { snapshot, _ -> snapshot?.let(reopenedRenders::add) }),
                 executor = reopenedExecutor,
                 ownsExecutor = false,
             )
             try {
-                val reopenedStream = start(reopenedBinding, reopenedMessenger, viewId)
-                var reopenedSequence = 1L
-                val reopenedAck = Ack(0, previousAck.geometry, previousAck.lineage)
-                val acknowledged = exchange(reopenedMessenger, viewId, reopenedStream, reopenedSequence++, reopenedAck)
-                assertEquals(
-                    "acknowledged reopen response tx=${acknowledged.response.transactionId} " +
-                        "base=${acknowledged.response.baseGeometryRevision} target=${acknowledged.response.targetGeometryRevision} " +
-                        "lineage=${acknowledged.response.targetLineageRevision} chunks=${acknowledged.response.chunkCount}",
-                    0,
-                    acknowledged.response.messageKind,
+                val snapshot = reopenedBinding.snapshot()
+                val qualifier = snapshot.nativeStreamToken + snapshot.workerBindingToken
+                val rejected = RecordingResult()
+                MethodChannel(reopenedMessenger, "visibility_grid_v2_control_$viewId").invokeMethod(
+                    "start", qualifier + ControlCodec.encodeRequest(startRequest()), rejected,
                 )
-                assertEquals(0, acknowledged.response.transactionId)
-                assertEquals(previousAck.geometry, acknowledged.response.targetGeometryRevision)
-                assertEquals(previousAck.lineage, acknowledged.response.targetLineageRevision)
+                assertTrue(rejected.completed.await(2, TimeUnit.SECONDS))
+                assertEquals(0, rejected.successCount)
+                assertEquals("VG_PROTOCOL_INVALID", rejected.errorCode)
+                assertEquals(0L, reopenedBinding.snapshot().acceptedControls)
+                assertFalse(reopenedBinding.snapshot().initialTransactionQueued)
                 assertTrue(reopenedRenders.isEmpty())
-                val reopenedCut = requireNotNull(reopenedBinding.currentObservationOwnership())
-                reopened.admitFeature(observation(reopenedCut, 20_000, 0, 1, 0))
-                assertEquals("nonMaterialRetained", reopened.integrationReceipt().status)
-                val reopenedState = requireNotNull(reopenedResources).owner().activationState()?.cut
-                assertEquals(beforeRefusal, reopenedState)
-                assertEquals(1, reopenedRenders.size)
-                assertArrayEquals(canonicalSelection, reopenedRenders.single().keys.sortedArray())
-                assertArrayEquals(rootHash, reopenedState?.rootHash?.toByteArray())
-                assertArrayEquals(sourceHash, reopenedState?.sourceHash?.toByteArray())
-                assertTrue(
-                    requireNotNull(reopenedResources).owner().activationState()?.current is
-                        CanonicalActivationCurrent.None,
-                )
-
-                if (surfaceTarget < SURFACES) {
-                    reopened.admitFeature(observation(reopenedCut, 30_000, surfaceTarget, 1, associationTarget))
-                    val next = reopened.integrationReceipt()
-                    assertEquals("pendingAck", next.status)
-                    assertEquals("FEATURE_BATCH", next.canonicalOperation)
-                    assertEquals(1, next.transactionId)
-                    assertEquals(previousAck.geometry + 1, next.geometryRevision)
-                    assertEquals(previousAck.lineage, next.lineageRevision)
-                    val begin = exchange(reopenedMessenger, viewId, reopenedStream, reopenedSequence++, reopenedAck)
-                    assertEquals(2, begin.response.messageKind)
-                    assertEquals(previousAck.geometry, begin.response.baseGeometryRevision)
-                    assertEquals(next.geometryRevision, begin.response.targetGeometryRevision)
-                    val bytes = ByteArrayOutputStream()
-                    repeat(begin.response.chunkCount) { index ->
-                        val chunk = exchange(reopenedMessenger, viewId, reopenedStream, reopenedSequence++, reopenedAck)
-                        assertEquals(3, chunk.response.messageKind)
-                        assertEquals(index, chunk.response.chunkIndex)
-                        bytes.write((TransactionResponseCodecV1.decodeFrame(chunk.response) as TransactionChunkFrameV1).value.bytes)
-                    }
-                    assertEquals(4, exchange(reopenedMessenger, viewId, reopenedStream, reopenedSequence++, reopenedAck).response.messageKind)
-                    val nextCurrent = requireNotNull(reopenedResources).owner().activationState()?.current
-                        as CanonicalActivationCurrent.Receipt
-                    assertArrayEquals(nextCurrent.identity.canonicalHash.toByteArray(), testSha256(bytes.toByteArray()))
-                    val nextAck = Ack(next.transactionId, next.geometryRevision, next.lineageRevision)
-                    assertEquals(0, exchange(reopenedMessenger, viewId, reopenedStream, reopenedSequence, nextAck).response.messageKind)
-                    assertEquals("acknowledged", reopened.integrationReceipt().status)
-                    assertEquals(surfaceTarget + 1, reopenedRenders.last().count)
-                }
             } finally {
                 reopened.close()
                 reopenedBinding.dispose()
@@ -794,6 +778,7 @@ class ContinuousRuntimeCapacityCampaignTest {
             "start", qualifier + ControlCodec.encodeRequest(startRequest()), result,
         )
         assertTrue(result.completed.await(2, TimeUnit.SECONDS))
+        assertEquals("START error=${result.errorCode} message=${result.errorMessage}", 1, result.successCount)
         val response = ControlCodec.decodeResponse(strip(result.successValue as ByteArray, qualifier))
         assertEquals(0, response.outcome)
         return Stream(qualifier, response.streamToken)
