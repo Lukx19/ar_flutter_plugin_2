@@ -148,6 +148,7 @@ internal class VisibilityGridIntegration(
     private var pendingCanonicalAcknowledgement: CanonicalAcknowledgement? = null
     private var pendingDepthCommit: PendingDepthCommit? = null
     private var lastDepthLookupReceipt: BoundedCanonicalLookupReceipt? = null
+    private var lastDepthAdmissionStatus: String? = null
     private var canonicalSurfaceHighWater = 0L
     private var associationHighWater = 0L
     private var canonicalOwnedBytesHighWater = 0L
@@ -315,6 +316,7 @@ internal class VisibilityGridIntegration(
             ensureOpened(observation.ownership) ?: return@mutate
             if (drainPendingPublication() == PendingPublicationGateResult.REJECTED) return@mutate
             admitDepthLocked(observation)
+            lastDepthAdmissionStatus = receipt.status
         }
     }
 
@@ -374,6 +376,8 @@ internal class VisibilityGridIntegration(
     }
 
     fun integrationReceipt(): VisibilityGridIntegrationReceipt = synchronized(lock) { receipt }
+
+    internal fun lastDepthAdmissionStatus(): String? = synchronized(lock) { lastDepthAdmissionStatus }
 
     /** Fixed native-owner scalars for the debug pressure receipt. */
     internal fun pressureSnapshot(): CanonicalVisibilityPressureSnapshot = synchronized(lock) {
@@ -1222,6 +1226,7 @@ internal class VisibilityGridIntegration(
         depthKernel?.close()
         depthKernel = null
         lastDepthLookupReceipt = null
+        lastDepthAdmissionStatus = null
         pendingCanonicalAcknowledgement = null
     }
 

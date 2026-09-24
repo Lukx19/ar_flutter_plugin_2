@@ -168,6 +168,12 @@ internal class VisibilitySmallSceneDebugChannel(
                 SmallSceneStep.POPULATE_CORNER -> emitFixture(intArrayOf(4, 5, 6, 7), 2_000_000_000L)
                 SmallSceneStep.ADD_FOREGROUND_OCCLUDER ->
                     emitFixture(intArrayOf(8, 9, 10, 11), 3_000_000_000L)
+                SmallSceneStep.DEPTH_AFTER_PUBLICATION -> {
+                    runtime.awaitDebugFixtureIdle()
+                    check(source.emitDepth(4_000_000_000L, 0, 0)) {
+                        "post-publication depth observation was rejected at copied ingress"
+                    }
+                }
                 SmallSceneStep.SECOND_VIEW -> {
                     runtime.awaitDebugFixtureIdle()
                     productHooks.manualViewPose()
@@ -187,7 +193,7 @@ internal class VisibilitySmallSceneDebugChannel(
                     // unnecessarily fragile.
                     emitFixture(
                         markers = intArrayOf(20),
-                        firstTimestampNs = 4_000_000_000L,
+                        firstTimestampNs = 5_000_000_000L,
                         lateralMarker = 0,
                     )
                 }
@@ -309,6 +315,9 @@ internal class VisibilitySmallSceneDebugChannel(
             sequence = sequence,
             acceptedFeatureObservations = health.copiedFeatureObservations,
             acceptedDepthObservations = health.copiedDepthObservations,
+            admittedFeatureObservations = health.admittedFeatureObservations,
+            admittedDepthObservations = health.admittedDepthObservations,
+            integrationStatus = provided.integrationStatus,
             geometryRevision = provided.geometryRevision,
             lineageRevision = provided.lineageRevision,
             durableCaptureRevision = provided.durableCaptureRevision,
@@ -360,6 +369,7 @@ internal class VisibilitySmallSceneDebugChannel(
         "wall" -> SmallSceneStep.POPULATE_WALL
         "corner" -> SmallSceneStep.POPULATE_CORNER
         "foregroundOccluder" -> SmallSceneStep.ADD_FOREGROUND_OCCLUDER
+        "depthAfterPublication" -> SmallSceneStep.DEPTH_AFTER_PUBLICATION
         "secondView" -> SmallSceneStep.SECOND_VIEW
         "automaticRevisit" -> SmallSceneStep.AUTOMATIC_REVISIT
         else -> error("unknown synthetic scene step")
@@ -389,6 +399,7 @@ internal enum class SmallSceneStep(val wireName: String) {
     POPULATE_WALL("wall"),
     POPULATE_CORNER("corner"),
     ADD_FOREGROUND_OCCLUDER("foregroundOccluder"),
+    DEPTH_AFTER_PUBLICATION("depthAfterPublication"),
     SECOND_VIEW("secondView"),
     AUTOMATIC_REVISIT("automaticRevisit"),
     RENDERER_LOSS("rendererUnavailable"),
@@ -418,6 +429,9 @@ internal data class SmallSceneScenarioReceipt(
     val callbackCopyP95Micros: Long = 0L,
     val rootIsolateImageBytes: Long = 0L,
     val rendererOwnedBytes: Long = 0L,
+    val admittedFeatureObservations: Long = 0L,
+    val admittedDepthObservations: Long = 0L,
+    val integrationStatus: String = "starting",
 ) {
     init {
         require(scenarioId.isNotEmpty() && scenarioId.length <= 64)
@@ -437,6 +451,9 @@ internal data class SmallSceneScenarioReceipt(
         require(callbackCopyP95Micros >= 0L)
         require(rootIsolateImageBytes >= 0L)
         require(rendererOwnedBytes >= 0L)
+        require(admittedFeatureObservations >= 0L)
+        require(admittedDepthObservations >= 0L)
+        require(integrationStatus.isNotEmpty() && integrationStatus.length <= 64)
     }
 
     fun toMap(): Map<String, Any?> = mapOf(
@@ -458,6 +475,9 @@ internal data class SmallSceneScenarioReceipt(
         "callbackCopyP95Micros" to callbackCopyP95Micros,
         "rootIsolateImageBytes" to rootIsolateImageBytes,
         "rendererOwnedBytes" to rendererOwnedBytes,
+        "admittedFeatureObservations" to admittedFeatureObservations,
+        "admittedDepthObservations" to admittedDepthObservations,
+        "integrationStatus" to integrationStatus,
     )
 }
 
@@ -494,6 +514,7 @@ internal data class VisibilitySmallSceneReceiptScalars(
     val resourceBalance: Long? = null,
     val rootIsolateImageBytes: Long = 0L,
     val rendererOwnedBytes: Long = 0L,
+    val integrationStatus: String = "starting",
 ) {
     init {
         require(geometryRevision >= 0L)

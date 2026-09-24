@@ -16,6 +16,7 @@ enum ARVisibilitySyntheticSceneStep {
   wall('wall'),
   corner('corner'),
   foregroundOccluder('foregroundOccluder'),
+  depthAfterPublication('depthAfterPublication'),
   secondView('secondView'),
   automaticRevisit('automaticRevisit');
 
@@ -42,6 +43,9 @@ final class ARVisibilitySyntheticReceipt {
     required this.sequence,
     required this.acceptedFeatureObservations,
     required this.acceptedDepthObservations,
+    required this.admittedFeatureObservations,
+    required this.admittedDepthObservations,
+    required this.integrationStatus,
     required this.geometryRevision,
     required this.lineageRevision,
     required this.durableCaptureRevision,
@@ -62,6 +66,9 @@ final class ARVisibilitySyntheticReceipt {
   final int sequence;
   final int acceptedFeatureObservations;
   final int acceptedDepthObservations;
+  final int admittedFeatureObservations;
+  final int admittedDepthObservations;
+  final String integrationStatus;
   final int geometryRevision;
   final int lineageRevision;
   final int durableCaptureRevision;
@@ -82,6 +89,9 @@ final class ARVisibilitySyntheticReceipt {
         'sequence': sequence,
         'acceptedFeatureObservations': acceptedFeatureObservations,
         'acceptedDepthObservations': acceptedDepthObservations,
+        'admittedFeatureObservations': admittedFeatureObservations,
+        'admittedDepthObservations': admittedDepthObservations,
+        'integrationStatus': integrationStatus,
         'geometryRevision': geometryRevision,
         'lineageRevision': lineageRevision,
         'durableCaptureRevision': durableCaptureRevision,
@@ -105,6 +115,9 @@ final class ARVisibilitySyntheticReceipt {
       'sequence',
       'acceptedFeatureObservations',
       'acceptedDepthObservations',
+      'admittedFeatureObservations',
+      'admittedDepthObservations',
+      'integrationStatus',
       'geometryRevision',
       'lineageRevision',
       'durableCaptureRevision',
@@ -130,6 +143,11 @@ final class ARVisibilitySyntheticReceipt {
           _nonNegativeInt(map, 'acceptedFeatureObservations'),
       acceptedDepthObservations:
           _nonNegativeInt(map, 'acceptedDepthObservations'),
+      admittedFeatureObservations:
+          _nonNegativeInt(map, 'admittedFeatureObservations'),
+      admittedDepthObservations:
+          _nonNegativeInt(map, 'admittedDepthObservations'),
+      integrationStatus: _string(map, 'integrationStatus'),
       geometryRevision: _nonNegativeInt(map, 'geometryRevision'),
       lineageRevision: _nonNegativeInt(map, 'lineageRevision'),
       durableCaptureRevision: _nonNegativeInt(map, 'durableCaptureRevision'),

@@ -299,6 +299,8 @@ internal class ArView(
             resourceBalance = observation.resourceBalance,
             rootIsolateImageBytes = 0,
             rendererOwnedBytes = pressure.rendererOwnedBytes,
+            integrationStatus = visibilityObservationMappingAdmission.lastDepthAdmissionStatus()
+                ?: integration.status,
         )
     }
 
