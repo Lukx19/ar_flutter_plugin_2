@@ -672,6 +672,15 @@ class VisibilityGridIntegrationTest {
                 RetainedRendererBindingCut(previous, replacement, authoritative.copy(geometryRevision = 86)),
             ),
         )
+        assertFalse(
+            projection.rebindRetainedCanonicalCut(
+                RetainedRendererBindingCut(
+                    previous,
+                    replacement.copy(groupGeneration = previous.groupGeneration + 1),
+                    authoritative,
+                ),
+            ),
+        )
         assertEquals(RendererStyleCutResult.Replayed(1), projection.applyStyleCut(firstStyle))
         assertTrue(
             projection.rebindRetainedCanonicalCut(
