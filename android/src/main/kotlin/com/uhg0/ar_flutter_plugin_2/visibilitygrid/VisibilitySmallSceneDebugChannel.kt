@@ -174,6 +174,24 @@ internal class VisibilitySmallSceneDebugChannel(
                         "post-publication depth observation was rejected at copied ingress"
                     }
                 }
+                SmallSceneStep.OVER_OFFER -> {
+                    // Four times the ordinary producer cadence, with bounded
+                    // finite input and no direct product-state mutation.
+                    repeat(16) { index ->
+                        source.emitFeature(
+                            4_500_000_000L + index * (FEATURE_INTERVAL_NS / 4),
+                            100 + index,
+                            index % 4,
+                        )
+                        if (index % 2 == 0) {
+                            source.emitDepth(
+                                4_500_000_000L + (index / 2) * (DEPTH_INTERVAL_NS / 4),
+                                100 + index,
+                                index % 4,
+                            )
+                        }
+                    }
+                }
                 SmallSceneStep.SECOND_VIEW -> {
                     runtime.awaitDebugFixtureIdle()
                     productHooks.manualViewPose()
@@ -370,6 +388,7 @@ internal class VisibilitySmallSceneDebugChannel(
         "corner" -> SmallSceneStep.POPULATE_CORNER
         "foregroundOccluder" -> SmallSceneStep.ADD_FOREGROUND_OCCLUDER
         "depthAfterPublication" -> SmallSceneStep.DEPTH_AFTER_PUBLICATION
+        "overOffer" -> SmallSceneStep.OVER_OFFER
         "secondView" -> SmallSceneStep.SECOND_VIEW
         "automaticRevisit" -> SmallSceneStep.AUTOMATIC_REVISIT
         else -> error("unknown synthetic scene step")
@@ -400,6 +419,7 @@ internal enum class SmallSceneStep(val wireName: String) {
     POPULATE_CORNER("corner"),
     ADD_FOREGROUND_OCCLUDER("foregroundOccluder"),
     DEPTH_AFTER_PUBLICATION("depthAfterPublication"),
+    OVER_OFFER("overOffer"),
     SECOND_VIEW("secondView"),
     AUTOMATIC_REVISIT("automaticRevisit"),
     RENDERER_LOSS("rendererUnavailable"),

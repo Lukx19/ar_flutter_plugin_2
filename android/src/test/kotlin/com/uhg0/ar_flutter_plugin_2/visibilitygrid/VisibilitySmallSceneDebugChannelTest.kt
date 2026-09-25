@@ -524,6 +524,64 @@ class VisibilitySmallSceneDebugChannelTest {
     }
 
     @Test
+    fun `finite over-offer step reports copied observations without product credit`() {
+        val messenger = MethodTestMessenger()
+        val cut = AtomicReference(ownership())
+        val runtime = AndroidVisibilityGridRuntime(
+            ownership = cut::get,
+            mapper = AndroidVisibilityGridMappingAdmission(cut::get),
+            scheduler = Executors.newScheduledThreadPool(2),
+            ownsScheduler = true,
+        )
+        val channel = VisibilitySmallSceneDebugChannel(
+            messenger = messenger,
+            viewId = 76,
+            isDebuggable = true,
+            runtime = runtime,
+            ownership = cut::get,
+            referencePose = ::identityMatrix,
+            productHooks = object : VisibilitySmallSceneProductHooks {
+                override fun beginPoseFixture() = true
+                override fun snapshot() = VisibilitySmallSceneReceiptScalars(
+                    geometryRevision = 1,
+                    lineageRevision = 1,
+                    durableCaptureRevision = 0,
+                    coverageRevision = 0,
+                )
+            },
+        )
+        val method = MethodChannel(messenger, "visibility_scenario_v2_76")
+        try {
+            invoke(method, "arm", mapOf(
+                "scenarioId" to "over-offer",
+                "depthCapability" to "automatic",
+                "sequence" to 1L,
+                "expectedBindingGeneration" to 1L,
+                "expectedGroupGeneration" to 1L,
+            ))
+            val wall = invoke(method, "emit", mapOf(
+                "scenarioId" to "over-offer", "step" to "wall", "sequence" to 2L,
+            ))
+            val offered = invoke(method, "emit", mapOf(
+                "scenarioId" to "over-offer", "step" to "overOffer", "sequence" to 3L,
+            ))
+            assertEquals(3L, offered["sequence"])
+            assertTrue((offered["acceptedFeatureObservations"] as Long) >
+                (wall["acceptedFeatureObservations"] as Long))
+            assertTrue((offered["acceptedDepthObservations"] as Long) >
+                (wall["acceptedDepthObservations"] as Long))
+            assertEquals(0L, offered["durableCaptureRevision"])
+            assertEquals(0L, offered["coverageRevision"])
+            assertEquals(offered, invoke(method, "emit", mapOf(
+                "scenarioId" to "over-offer", "step" to "overOffer", "sequence" to 3L,
+            )))
+        } finally {
+            channel.dispose()
+            runtime.close()
+        }
+    }
+
+    @Test
     fun `release build and unwired product faults cannot mutate scenario state`() {
         val messenger = MethodTestMessenger()
         val cut = AtomicReference(ownership())
@@ -713,7 +771,7 @@ class VisibilitySmallSceneDebugChannelTest {
         arguments: Map<String, Any?>,
     ): Map<*, *> {
         val result = invokeResult(channel, method, arguments)
-        assertEquals(1, result.successCount)
+        assertEquals("${result.errorCode}: ${result.errorMessage}", 1, result.successCount)
         return result.successValue as Map<*, *>
     }
 

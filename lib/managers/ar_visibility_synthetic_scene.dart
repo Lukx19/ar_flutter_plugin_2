@@ -17,6 +17,7 @@ enum ARVisibilitySyntheticSceneStep {
   corner('corner'),
   foregroundOccluder('foregroundOccluder'),
   depthAfterPublication('depthAfterPublication'),
+  overOffer('overOffer'),
   secondView('secondView'),
   automaticRevisit('automaticRevisit');
 

@@ -35,19 +35,21 @@ void main() {
     expect(arm.sequence, 1);
     final wall = await scene.emit(ARVisibilitySyntheticSceneStep.wall);
     expect(wall.sequence, 2);
+    final overOffer = await scene.emit(ARVisibilitySyntheticSceneStep.overOffer);
+    expect(overOffer.sequence, 3);
     final revisit = await scene.emit(
       ARVisibilitySyntheticSceneStep.automaticRevisit,
     );
-    expect(revisit.sequence, 3);
+    expect(revisit.sequence, 4);
     final fault = await scene.setFault(
       ARVisibilitySyntheticFault.rendererUnavailable,
     );
-    expect(fault.sequence, 4);
+    expect(fault.sequence, 5);
     await scene.dispose();
 
     expect(
       calls.map((call) => call.method),
-      <String>['arm', 'emit', 'emit', 'setFault', 'disarm'],
+      <String>['arm', 'emit', 'emit', 'emit', 'setFault', 'disarm'],
     );
     expect((calls[0].arguments as Map)['depthCapability'], 'automatic');
     expect((calls[0].arguments as Map)['expectedBindingGeneration'], 4);
@@ -55,12 +57,14 @@ void main() {
     expect((calls[1].arguments as Map)['step'], 'wall');
     expect((calls[1].arguments as Map)['scenarioId'], 'small-scene-primary');
     expect((calls[1].arguments as Map)['sequence'], 2);
-    expect((calls[2].arguments as Map)['step'], 'automaticRevisit');
+    expect((calls[2].arguments as Map)['step'], 'overOffer');
     expect((calls[2].arguments as Map)['sequence'], 3);
-    expect((calls[3].arguments as Map)['fault'], 'rendererUnavailable');
+    expect((calls[3].arguments as Map)['step'], 'automaticRevisit');
     expect((calls[3].arguments as Map)['sequence'], 4);
-    expect((calls[4].arguments as Map)['scenarioId'], 'small-scene-primary');
+    expect((calls[4].arguments as Map)['fault'], 'rendererUnavailable');
     expect((calls[4].arguments as Map)['sequence'], 5);
+    expect((calls[5].arguments as Map)['scenarioId'], 'small-scene-primary');
+    expect((calls[5].arguments as Map)['sequence'], 6);
     await expectLater(
       scene.snapshot(),
       throwsA(isA<StateError>()),
