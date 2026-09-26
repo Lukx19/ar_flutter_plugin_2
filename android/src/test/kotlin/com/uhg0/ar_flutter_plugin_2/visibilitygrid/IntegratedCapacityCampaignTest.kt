@@ -3,6 +3,8 @@ package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 import com.uhg0.ar_flutter_plugin_2.capture.JvmDescriptorFilesystemV2
 import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetCoordinatorV2
 import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetPolicyV2
+import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageRendererLimits
+import com.uhg0.ar_flutter_plugin_2.sceneview.PressureRendererResources
 import java.io.File
 import java.nio.file.Files
 import org.junit.Assert.assertEquals
@@ -14,7 +16,10 @@ class IntegratedCapacityCampaignTest {
     @Test
     fun `constructed maximum profile survives ACK adjacent coexistence within fixed limits`() {
         val directory = Files.createTempDirectory("canonical-surface-integrated-maximum").toFile()
+        val depthKernel = DepthEvidenceKernel()
+        val renderer = PressureRendererResources()
         try {
+            renderer.openCycle(0)
             val group = SurfaceGroup("integrated-maximum")
             CanonicalStoreMigrationTest().writeMaximumV3Fixture(
                 directory, group, version = 5, includeCanonicalCurrent = true,
@@ -113,12 +118,12 @@ class IntegratedCapacityCampaignTest {
                         )
                         val ownerBytes = GraphLayout.parseInstance(owner, before, after).totalSize()
                         val maximumPendingDepth = PendingDepthRetentionReceipt.maximumModeled()
-                        val depthKernel = DepthEvidenceKernel()
-                        val depthResources = try {
-                            depthKernel.resourceReceipt()
-                        } finally {
-                            depthKernel.close()
-                        }
+                        val depthResources = depthKernel.resourceReceipt()
+                        val rendererResources = renderer.telemetry.pressureSnapshot()
+                        assertEquals(13_197_572, rendererResources.rendererOwnedBytes)
+                        assertTrue(rendererResources.rendererOwnedBytes <= CoverageRendererLimits.ACTIVE_RENDERER_OWNED_LIMIT_BYTES)
+                        assertTrue(renderer.peakTransitionBytes <= CoverageRendererLimits.COMBINED_RENDERER_OWNED_LIMIT_BYTES)
+                        assertEquals(64L * 1024L, rendererResources.maxUploadBytesPerFrame)
                         assertTrue(maximumPendingDepth.totalBytes <= maximumPendingDepth.budgetBytes)
                         assertTrue(maximumPendingDepth.mutationPlanBytes > 0)
                         assertTrue(maximumPendingDepth.geometryCutBytes > 0)
@@ -186,6 +191,8 @@ class IntegratedCapacityCampaignTest {
                                 "commitReopenOwner=$commitReopenOwnerBytes " +
                                 "depthKernelMaximum=${depthResources.modeledMaximumSemanticStateBytes} " +
                                 "pendingDepthMaximum=${maximumPendingDepth.totalBytes} " +
+                                "rendererActive=${rendererResources.rendererOwnedBytes} " +
+                                "rendererTransition=${renderer.peakTransitionBytes} " +
                                 "sharedPhase=$sharedPhaseBytes completePeak=$completePeakBytes " +
                                 "directory=${storage.directoryBytes} committed=${coordinator.committedBytes()} " +
                                 "chargedPhysical=$chargedPhysicalBytes",
@@ -193,7 +200,19 @@ class IntegratedCapacityCampaignTest {
                     } finally { owner.close() }
                 } finally { base.close() }
             }
-        } finally { directory.deleteRecursively() }
+        } finally {
+            depthKernel.close()
+            renderer.closeCycle()
+            val finalRenderer = renderer.telemetry.pressureSnapshot()
+            assertEquals(0, finalRenderer.rendererOwnedBytes)
+            assertEquals(finalRenderer.rendererResourcesAcquired, finalRenderer.rendererResourcesReleased)
+            assertEquals(finalRenderer.buffersAcquired, finalRenderer.buffersReleased)
+            assertEquals(finalRenderer.callbacksAcquired, finalRenderer.callbacksReleased)
+            val finalPages = renderer.pages.pressureSnapshot()
+            assertEquals(0, finalPages.pendingTransactions)
+            assertEquals(finalPages.pagesAcquired, finalPages.pagesReleased)
+            directory.deleteRecursively()
+        }
     }
 
     private companion object {
