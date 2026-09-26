@@ -13,6 +13,32 @@ import org.junit.Test
 
 class VisibilitySmallSceneDebugChannelTest {
     @Test
+    fun `synthetic callback pressure sheds supported depth while capture remains safe`() {
+        val cut = ownership(identityMatrix(), identityMatrix())
+        val runtime = AndroidVisibilityGridRuntime(
+            ownership = { cut },
+            mapper = RecordingVisibilityMapper(),
+            scheduler = Executors.newSingleThreadScheduledExecutor(),
+            ownsScheduler = true,
+            callbackCopySampleCapacity = 2,
+            captureSafe = VisibilityCaptureSafePredicate { true },
+        )
+        val source = SyntheticVisibilityObservationSource(runtime) { cut }
+        try {
+            source.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            assertTrue(source.emitFeature(1_000_000_000L, callbackCopyNs = 2_100_000L))
+            assertEquals(VisibilitySourceHealth.TRANSIENT_UNAVAILABLE, runtime.snapshot().depthHealth)
+            assertEquals(VisibilityDepthCapability.AUTOMATIC, runtime.snapshot().depthCapability)
+            assertEquals(1_000, runtime.featureSampleCapacity())
+            assertFalse(source.emitDepth(1_000_000_001L))
+            assertTrue(source.emitFeature(2_000_000_000L, callbackCopyNs = 1_000_000L))
+            assertTrue(runtime.snapshot().captureSafe)
+        } finally {
+            runtime.close()
+        }
+    }
+
+    @Test
     fun `synthetic fixture aligns feature geometry to the armed ownership group`() {
         val groupFromWorld = identityMatrix().also {
             it[12] = -2.0
@@ -69,7 +95,7 @@ class VisibilitySmallSceneDebugChannelTest {
     }
 
     @Test
-    fun `wall and second view each use their exact live command pose`() {
+    fun `wall and second view use exact pose then severe pressure sheds depth`() {
         val messenger = MethodTestMessenger()
         val groupFromWorld = identityMatrix().also {
             it[12] = -2.0
@@ -90,6 +116,7 @@ class VisibilitySmallSceneDebugChannelTest {
             featureIntervalNs = 1,
             depthIntervalNs = 1,
             ownsScheduler = true,
+            captureSafe = VisibilityCaptureSafePredicate { true },
         )
         val armedPose = doubleArrayOf(
             0.0, 1.0, 0.0, 0.0,
@@ -185,6 +212,24 @@ class VisibilitySmallSceneDebugChannelTest {
             assertEquals(640, depth.samples.single().x)
             assertEquals(480, depth.samples.single().y)
             assertEquals(1_000, depth.samples.single().depthMillimeters)
+            val beforePressure = runtime.snapshot()
+            invoke(
+                method,
+                "emit",
+                mapOf(
+                    "scenarioId" to "refreshed-second-view",
+                    "step" to "severePressure",
+                    "sequence" to 4L,
+                ),
+            )
+            val severe = runtime.snapshot()
+            assertEquals("severeDepthShedCaptureSafeFeature1Hz", severe.callbackCopyBudgetState)
+            assertEquals(VisibilityDepthCapability.AUTOMATIC, severe.depthCapability)
+            assertEquals(VisibilitySourceHealth.TRANSIENT_UNAVAILABLE, severe.depthHealth)
+            assertTrue(severe.callbackCopyDepthSheds > beforePressure.callbackCopyDepthSheds)
+            assertTrue(severe.copiedFeatureObservations > beforePressure.copiedFeatureObservations)
+            assertTrue(severe.droppedDepthObservations > beforePressure.droppedDepthObservations)
+            assertEquals(1_000, runtime.featureSampleCapacity())
         } finally {
             channel.dispose()
             runtime.close()

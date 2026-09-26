@@ -215,6 +215,32 @@ internal class VisibilitySmallSceneDebugChannel(
                         lateralMarker = 0,
                     )
                 }
+                SmallSceneStep.SEVERE_PRESSURE -> {
+                    runtime.awaitDebugFixtureIdle()
+                    check(runtime.snapshot().captureSafe) {
+                        "severe feature-only pressure requires a live capture-safe owner"
+                    }
+                    // The production p95 window can already contain a full
+                    // history of fast AR callbacks. Supply only enough slow
+                    // callbacks to cross that rolling percentile.
+                    for (sample in 0 until 32) {
+                        check(source.emitFeature(
+                            6_000_000_000L + sample,
+                            marker = 40,
+                            lateralMarker = 0,
+                            callbackCopyNs = 2_100_000L,
+                        )) { "synthetic over-budget callback was not copied" }
+                        if (runtime.snapshot().callbackCopyBudgetState ==
+                            "severeDepthShedCaptureSafeFeature1Hz") break
+                    }
+                    check(runtime.snapshot().callbackCopyBudgetState ==
+                        "severeDepthShedCaptureSafeFeature1Hz") {
+                        "over-budget callback did not trigger capture-safe depth shedding"
+                    }
+                    check(!source.emitDepth(6_000_001_000L, marker = 40, lateralMarker = 0)) {
+                        "depth must stop before capture-safe feature intake"
+                    }
+                }
                 SmallSceneStep.AUTOMATIC_REVISIT -> productHooks.automaticRevisitPose()
                 else -> error("step is not an observation fixture")
             }
@@ -390,6 +416,7 @@ internal class VisibilitySmallSceneDebugChannel(
         "depthAfterPublication" -> SmallSceneStep.DEPTH_AFTER_PUBLICATION
         "overOffer" -> SmallSceneStep.OVER_OFFER
         "secondView" -> SmallSceneStep.SECOND_VIEW
+        "severePressure" -> SmallSceneStep.SEVERE_PRESSURE
         "automaticRevisit" -> SmallSceneStep.AUTOMATIC_REVISIT
         else -> error("unknown synthetic scene step")
     }
@@ -421,6 +448,7 @@ internal enum class SmallSceneStep(val wireName: String) {
     DEPTH_AFTER_PUBLICATION("depthAfterPublication"),
     OVER_OFFER("overOffer"),
     SECOND_VIEW("secondView"),
+    SEVERE_PRESSURE("severePressure"),
     AUTOMATIC_REVISIT("automaticRevisit"),
     RENDERER_LOSS("rendererUnavailable"),
     RENDERER_RESTORE("rendererRecovered"),

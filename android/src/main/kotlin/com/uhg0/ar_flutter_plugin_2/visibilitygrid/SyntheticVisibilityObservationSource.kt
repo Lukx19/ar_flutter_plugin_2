@@ -25,7 +25,9 @@ internal class SyntheticVisibilityObservationSource(
         timestampNs: Long,
         marker: Int = 0,
         lateralMarker: Int = marker,
+        callbackCopyNs: Long = 0,
     ): Boolean {
+        require(callbackCopyNs >= 0)
         val cut = ownership() ?: return false
         val frame = syntheticFrame(
             source = VisibilityObservationSource.SYNTHETIC_FEATURE,
@@ -52,6 +54,7 @@ internal class SyntheticVisibilityObservationSource(
                 payloadBytes = VisibilityFeatureObservation.FEATURE_FIXED_BYTES +
                     samples.size * VisibilityFeatureObservation.FEATURE_SAMPLE_BYTES,
             ),
+            callbackCopyNs,
         )
     }
 
