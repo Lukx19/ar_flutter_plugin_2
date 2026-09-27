@@ -65,6 +65,7 @@ internal class ArCaptureSession(
         completionExecutor = Executor { command -> mainHandler.post(command) },
     )
     private val nativeDurableCaptureRevisionV2 = AtomicLong(0L)
+    private val syntheticCaptureCompletion = SyntheticCaptureCompletionGate()
     // Constructed per view now; #102 only provides a future native admission caller.
     private val nativeCaptureBindingV2 = NativeCaptureBindingV2(
         sceneHost.context,
@@ -796,6 +797,8 @@ internal class ArCaptureSession(
 
     fun advanceNativeCaptureRecoveryV2() = nativeCaptureBindingV2.forceRecoveryForDebug()
 
+    fun completeDebugNativeCaptureV2(): Boolean = syntheticCaptureCompletion.complete()
+
     fun notifyNativeCaptureLifecycleV2(
         event: String,
         onCompleted: (Result<Unit>) -> Unit,
@@ -813,14 +816,15 @@ internal class ArCaptureSession(
     }
 
     fun installDebugNativeCaptureSyntheticV2(fault: String?): Boolean {
-        require(fault == null || fault in setOf("camera", "hang", "malformed", "store")) {
+        require(fault == null || fault in setOf("camera", "hang", "malformed", "store", "deferred")) {
             "Unsupported synthetic V2 capture fault"
         }
         return nativeCaptureBindingV2.installSyntheticExposureHookForTest(
-            request = { qualifier, required, callback ->
+            request = request@{ qualifier, required, callback ->
                 when (fault) {
                     "camera" -> callback.onFailure(qualifier, "synthetic-camera")
                     "hang" -> Unit
+                    "deferred" -> return@request syntheticCaptureCompletion.hold(qualifier, required, callback)
                     "malformed" -> callback.onComponents(
                         SharedCameraComponentSetV2(
                             qualifier,
@@ -854,6 +858,7 @@ internal class ArCaptureSession(
                 }
                 true
             },
+            cancel = syntheticCaptureCompletion::cancel,
         )
     }
 
@@ -894,6 +899,7 @@ internal class ArCaptureSession(
     }
 
     private fun disposeMainResources() {
+        syntheticCaptureCompletion.clear()
         byteCache.dispose()
         sharedCameraManager?.let { manager ->
             nativeCaptureBindingV2.detachSharedCamera(manager)

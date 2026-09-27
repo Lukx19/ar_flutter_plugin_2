@@ -614,6 +614,12 @@ class ARCaptureManager {
   Future<void> debugAdvanceNativeCaptureRecoveryV2() =>
       _channel.invokeMethod<void>('debugNativeCaptureV2AdvanceRecovery');
 
+  @visibleForTesting
+  Future<bool> debugCompleteDeferredNativeCaptureV2() async =>
+      await _channel
+          .invokeMethod<bool>('debugNativeCaptureV2CompleteDeferred') ??
+      false;
+
   /// Get camera intrinsics data (unified for both AR tracking and capture)
   Future<ARCameraIntrinsics?> getCameraIntrinsics() async {
     _throwIfDisposed();

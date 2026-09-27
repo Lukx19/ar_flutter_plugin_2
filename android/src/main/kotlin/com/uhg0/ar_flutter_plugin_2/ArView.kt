@@ -856,6 +856,11 @@ internal class ArView(
                     if (!debuggable) result.error("DEBUG_ONLY", "Synthetic V2 recovery is unavailable in release builds", null)
                     else { captureSession.advanceNativeCaptureRecoveryV2(); result.success(true) }
                 }
+                "debugNativeCaptureV2CompleteDeferred" -> {
+                    val debuggable = root.context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+                    if (!debuggable) result.error("DEBUG_ONLY", "Synthetic V2 completion is unavailable in release builds", null)
+                    else result.success(captureSession.completeDebugNativeCaptureV2())
+                }
                 "getPerformanceSnapshot" -> result.success(captureSession.getPerformanceSnapshot())
                 "getCameraIntrinsics" -> result.success(captureSession.getCameraIntrinsics())
                 "getImageData" -> result.success(captureSession.getImageData(
