@@ -174,6 +174,30 @@ internal class VisibilitySmallSceneDebugChannel(
                         "post-publication depth observation was rejected at copied ingress"
                     }
                 }
+                SmallSceneStep.DEPTH_COMMIT_PREPARE -> {
+                    runtime.awaitDebugFixtureIdle()
+                    repeat(3) { index ->
+                        check(source.emitDepth(6_000_000_000L + index * DEPTH_INTERVAL_NS, 30, 30)) {
+                            "preparatory depth observation was rejected at copied ingress"
+                        }
+                        runtime.awaitDebugFixtureIdle()
+                    }
+                }
+                SmallSceneStep.DEPTH_COMMIT_FAULT -> {
+                    runtime.awaitDebugFixtureIdle()
+                    check(source.emitDepth(7_000_000_000L, 30, 30)) {
+                        "faulted depth observation was rejected at copied ingress"
+                    }
+                }
+                SmallSceneStep.DEPTH_COMMIT_RETRY -> {
+                    runtime.awaitDebugFixtureIdle()
+                    // Either observation lane can retry the retained depth
+                    // mutation. A feature wake avoids staging new depth
+                    // evidence while the previous depth cut is retained.
+                    check(source.emitFeature(7_250_000_000L, 31, 30)) {
+                        "feature wake for retained depth commit was rejected at copied ingress"
+                    }
+                }
                 SmallSceneStep.OVER_OFFER -> {
                     // Four times the ordinary producer cadence, with bounded
                     // finite input and no direct product-state mutation.
@@ -251,6 +275,7 @@ internal class VisibilitySmallSceneDebugChannel(
             "rendererUnavailable" -> SmallSceneFault.RENDERER_UNAVAILABLE
             "rendererRecovered" -> SmallSceneFault.RENDERER_RECOVERED
             "guidanceTerminal" -> SmallSceneFault.GUIDANCE_TERMINAL
+            "canonicalRetryableDepthCommit" -> SmallSceneFault.CANONICAL_RETRYABLE_DEPTH_COMMIT
             else -> error("unknown synthetic scene fault")
         }
         return runCommand(call, fault.wireName) {
@@ -258,6 +283,8 @@ internal class VisibilitySmallSceneDebugChannel(
                 SmallSceneFault.RENDERER_UNAVAILABLE -> productHooks.rendererUnavailable()
                 SmallSceneFault.RENDERER_RECOVERED -> productHooks.rendererRecovered()
                 SmallSceneFault.GUIDANCE_TERMINAL -> productHooks.guidanceTerminal()
+                SmallSceneFault.CANONICAL_RETRYABLE_DEPTH_COMMIT ->
+                    productHooks.canonicalRetryableDepthCommit()
             }
         }
     }
@@ -414,6 +441,9 @@ internal class VisibilitySmallSceneDebugChannel(
         "corner" -> SmallSceneStep.POPULATE_CORNER
         "foregroundOccluder" -> SmallSceneStep.ADD_FOREGROUND_OCCLUDER
         "depthAfterPublication" -> SmallSceneStep.DEPTH_AFTER_PUBLICATION
+        "depthCommitPrepare" -> SmallSceneStep.DEPTH_COMMIT_PREPARE
+        "depthCommitFault" -> SmallSceneStep.DEPTH_COMMIT_FAULT
+        "depthCommitRetry" -> SmallSceneStep.DEPTH_COMMIT_RETRY
         "overOffer" -> SmallSceneStep.OVER_OFFER
         "secondView" -> SmallSceneStep.SECOND_VIEW
         "severePressure" -> SmallSceneStep.SEVERE_PRESSURE
@@ -425,6 +455,7 @@ internal class VisibilitySmallSceneDebugChannel(
         RENDERER_UNAVAILABLE("rendererUnavailable"),
         RENDERER_RECOVERED("rendererRecovered"),
         GUIDANCE_TERMINAL("guidanceTerminal"),
+        CANONICAL_RETRYABLE_DEPTH_COMMIT("canonicalRetryableDepthCommit"),
     }
 
     companion object {
@@ -446,6 +477,9 @@ internal enum class SmallSceneStep(val wireName: String) {
     POPULATE_CORNER("corner"),
     ADD_FOREGROUND_OCCLUDER("foregroundOccluder"),
     DEPTH_AFTER_PUBLICATION("depthAfterPublication"),
+    DEPTH_COMMIT_PREPARE("depthCommitPrepare"),
+    DEPTH_COMMIT_FAULT("depthCommitFault"),
+    DEPTH_COMMIT_RETRY("depthCommitRetry"),
     OVER_OFFER("overOffer"),
     SECOND_VIEW("secondView"),
     SEVERE_PRESSURE("severePressure"),
@@ -538,6 +572,9 @@ internal interface VisibilitySmallSceneProductHooks {
     fun rendererUnavailable() { error("renderer-unavailable production hook is not wired") }
     fun rendererRecovered() { error("renderer-recovered production hook is not wired") }
     fun guidanceTerminal() { error("guidance-terminal production hook is not wired") }
+    fun canonicalRetryableDepthCommit() {
+        error("canonical retryable-depth-commit production hook is not wired")
+    }
     fun pause() { error("pause production hook is not wired") }
     fun resume() { error("resume production hook is not wired") }
     fun snapshot(): VisibilitySmallSceneReceiptScalars = VisibilitySmallSceneReceiptScalars()

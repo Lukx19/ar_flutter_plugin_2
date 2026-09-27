@@ -17,6 +17,9 @@ enum ARVisibilitySyntheticSceneStep {
   corner('corner'),
   foregroundOccluder('foregroundOccluder'),
   depthAfterPublication('depthAfterPublication'),
+  depthCommitPrepare('depthCommitPrepare'),
+  depthCommitFault('depthCommitFault'),
+  depthCommitRetry('depthCommitRetry'),
   overOffer('overOffer'),
   severePressure('severePressure'),
   secondView('secondView'),
@@ -31,7 +34,8 @@ enum ARVisibilitySyntheticSceneStep {
 enum ARVisibilitySyntheticFault {
   rendererUnavailable('rendererUnavailable'),
   rendererRecovered('rendererRecovered'),
-  guidanceTerminal('guidanceTerminal');
+  guidanceTerminal('guidanceTerminal'),
+  canonicalRetryableDepthCommit('canonicalRetryableDepthCommit');
 
   const ARVisibilitySyntheticFault(this.wireName);
 

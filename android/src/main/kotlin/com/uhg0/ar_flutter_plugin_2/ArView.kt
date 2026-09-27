@@ -48,6 +48,7 @@ import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityCaptureSafePredicat
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityPressureOwnerScalars
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilitySmallSceneDebugChannel
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilitySmallSceneProductHooks
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityCanonicalFaultGate
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilitySmallSceneReceiptScalars
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineAuthority
 import com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraCapabilityQuerier
@@ -144,6 +145,7 @@ internal class ArView(
         coverageRendererOwner = sceneHost.coverageRendererOwner,
     )
     private val visibilityObservationDebugGate = VisibilityObservationDebugGate()
+    private val visibilityCanonicalFaultGate = VisibilityCanonicalFaultGate(isDebuggable)
     // #101 owns this native proof only.  It remains false until an internal
     // V2 capture owner binds one exact durable attempt/cut; Dart cannot enable it.
     private val captureSafetySignalV2 = CaptureSafetySignalV2()
@@ -161,6 +163,7 @@ internal class ArView(
             CanonicalRuntimeResources.open(context.filesDir, group, visibilityStorageBudgetCoordinator)
         },
         renderer = visibilityRendererProjection,
+        commitCanonical = visibilityCanonicalFaultGate::commit,
         beforeAdmission = visibilityObservationDebugGate::awaitIfArmed,
     )
     private val visibilityObservationRuntime = AndroidVisibilityGridRuntime(
@@ -244,6 +247,10 @@ internal class ArView(
                 visibilityObservationRuntime.setDepthCapability(
                     com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityDepthCapability.UNSUPPORTED,
                 )
+            }
+
+            override fun canonicalRetryableDepthCommit() {
+                visibilityCanonicalFaultGate.armRetryableDepthCommit()
             }
 
             override fun pause() {

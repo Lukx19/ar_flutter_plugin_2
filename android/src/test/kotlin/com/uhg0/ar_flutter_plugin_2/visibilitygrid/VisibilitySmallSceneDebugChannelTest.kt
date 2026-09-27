@@ -664,6 +664,16 @@ class VisibilitySmallSceneDebugChannelTest {
         )
         assertEquals(1, releaseResult.errorCount)
         assertEquals("VG_SCENARIO_UNAVAILABLE", releaseResult.errorCode)
+        val releaseFault = invokeResult(
+            MethodChannel(messenger, "visibility_scenario_v2_72"),
+            "setFault",
+            mapOf(
+                "scenarioId" to "release-rejected",
+                "fault" to "canonicalRetryableDepthCommit",
+                "sequence" to 1L,
+            ),
+        )
+        assertEquals("VG_SCENARIO_UNAVAILABLE", releaseFault.errorCode)
         assertEquals(0L, runtime.snapshot().copiedFeatureObservations)
 
         val debugChannel = VisibilitySmallSceneDebugChannel(
@@ -726,6 +736,7 @@ class VisibilitySmallSceneDebugChannelTest {
         var rendererLosses = 0
         var rendererRecoveries = 0
         var guidanceFailures = 0
+        var canonicalFaultArms = 0
         var lifecyclePauses = 0
         var lifecycleResumes = 0
         val channel = VisibilitySmallSceneDebugChannel(
@@ -738,6 +749,7 @@ class VisibilitySmallSceneDebugChannelTest {
                 override fun rendererUnavailable() { rendererLosses++ }
                 override fun rendererRecovered() { rendererRecoveries++ }
                 override fun guidanceTerminal() { guidanceFailures++ }
+                override fun canonicalRetryableDepthCommit() { canonicalFaultArms++ }
                 override fun pause() { lifecyclePauses++ }
                 override fun resume() { lifecycleResumes++ }
             },
@@ -796,12 +808,22 @@ class VisibilitySmallSceneDebugChannelTest {
             )
             invoke(
                 method,
+                "setFault",
+                mapOf(
+                    "scenarioId" to "small-scene-faults",
+                    "fault" to "canonicalRetryableDepthCommit",
+                    "sequence" to 5L,
+                ),
+            )
+            invoke(
+                method,
                 "pauseResume",
-                mapOf("scenarioId" to "small-scene-faults", "sequence" to 5L),
+                mapOf("scenarioId" to "small-scene-faults", "sequence" to 6L),
             )
             assertEquals(1, rendererLosses)
             assertEquals(1, rendererRecoveries)
             assertEquals(1, guidanceFailures)
+            assertEquals(1, canonicalFaultArms)
             assertEquals(1, lifecyclePauses)
             assertEquals(1, lifecycleResumes)
         } finally {

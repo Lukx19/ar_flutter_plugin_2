@@ -240,6 +240,7 @@ class VisibilityGridIntegrationTest {
         val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
         val scheduler = PressureObservationScheduler()
         val depthCommitAttempts = mutableListOf<PreparedCanonicalMutation>()
+        val canonicalFault = VisibilityCanonicalFaultGate(isDebuggable = true)
         var publishedPages = 0
         var publishedRows = 0
         val projection = NativeRendererProjection(
@@ -268,13 +269,8 @@ class VisibilityGridIntegrationTest {
             commitCanonical = { resources, mutation ->
                 if (mutation.kind == PreparedMutationKind.DEPTH_BATCH) {
                     depthCommitAttempts += mutation
-                    if (depthCommitAttempts.size == 1) {
-                        CanonicalAdjacentCommitResult.Refused(
-                            CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE,
-                            disposition = PreparedMutationDisposition.RETRYABLE,
-                        )
-                    } else resources.commitAdjacent(mutation)
-                } else resources.commitAdjacent(mutation)
+                }
+                canonicalFault.commit(resources, mutation)
             },
         )
         val runtime = AndroidVisibilityGridRuntime(binding::currentObservationOwnership,
@@ -348,6 +344,7 @@ class VisibilityGridIntegrationTest {
                 val rendererRowsBeforeFault = projection.currentRowCount()
                 val publishedPagesBeforeFault = publishedPages
                 val publishedRowsBeforeFault = publishedRows
+                canonicalFault.armRetryableDepthCommit()
                 assertTrue(runtime.offerDepth(depth(cut, timestamp + 1), 1_500_000))
                 scheduler.advanceBy(250_000_000)
                 assertEquals("depthCommitRetryPending", integration.integrationReceipt().status)
@@ -358,7 +355,9 @@ class VisibilityGridIntegrationTest {
                 assertEquals(0, runtime.snapshot().admittedDepthObservations)
                 assertTrue(requireNotNull(integration.pendingDepthRetentionReceipt()).totalBytes <=
                     requireNotNull(integration.pendingDepthRetentionReceipt()).budgetBytes)
-                assertTrue(runtime.offerDepth(depth(cut, timestamp + 2), 1_500_000))
+                // A feature wake retries the retained depth mutation without
+                // adding a second depth batch while its first cut is pending.
+                assertTrue(runtime.offerFeature(feature(cut, timestamp + 2), 1_500_000))
                 scheduler.advanceBy(250_000_000)
                 assertEquals(2, depthCommitAttempts.size)
                 assertTrue(depthCommitAttempts[0] === depthCommitAttempts[1])
