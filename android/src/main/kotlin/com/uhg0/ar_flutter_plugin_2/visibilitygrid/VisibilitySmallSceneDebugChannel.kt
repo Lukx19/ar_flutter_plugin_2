@@ -216,6 +216,24 @@ internal class VisibilitySmallSceneDebugChannel(
                         }
                     }
                 }
+                SmallSceneStep.MAXIMUM_SAMPLES -> {
+                    runtime.awaitDebugFixtureIdle()
+                    val (featureAccepted, depthAccepted) = source.emitMaximumSamples(
+                        featureTimestampNs = 8_000_000_000L,
+                        depthTimestampNs = 8_250_000_000L,
+                    )
+                    check(featureAccepted && depthAccepted) {
+                        "maximum synthetic feature/depth observations were not copied"
+                    }
+                    runtime.awaitDebugFixtureIdle()
+                }
+                SmallSceneStep.MAXIMUM_DEPTH_RETRY -> {
+                    runtime.awaitDebugFixtureIdle()
+                    check(source.emitMaximumDepth(8_500_000_000L)) {
+                        "fresh maximum synthetic depth observation was not copied"
+                    }
+                    runtime.awaitDebugFixtureIdle()
+                }
                 SmallSceneStep.SECOND_VIEW -> {
                     runtime.awaitDebugFixtureIdle()
                     productHooks.manualViewPose()
@@ -448,6 +466,8 @@ internal class VisibilitySmallSceneDebugChannel(
         "depthCommitFault" -> SmallSceneStep.DEPTH_COMMIT_FAULT
         "depthCommitRetry" -> SmallSceneStep.DEPTH_COMMIT_RETRY
         "overOffer" -> SmallSceneStep.OVER_OFFER
+        "maximumSamples" -> SmallSceneStep.MAXIMUM_SAMPLES
+        "maximumDepthRetry" -> SmallSceneStep.MAXIMUM_DEPTH_RETRY
         "secondView" -> SmallSceneStep.SECOND_VIEW
         "severePressure" -> SmallSceneStep.SEVERE_PRESSURE
         "automaticRevisit" -> SmallSceneStep.AUTOMATIC_REVISIT
@@ -485,6 +505,8 @@ internal enum class SmallSceneStep(val wireName: String) {
     DEPTH_COMMIT_FAULT("depthCommitFault"),
     DEPTH_COMMIT_RETRY("depthCommitRetry"),
     OVER_OFFER("overOffer"),
+    MAXIMUM_SAMPLES("maximumSamples"),
+    MAXIMUM_DEPTH_RETRY("maximumDepthRetry"),
     SECOND_VIEW("secondView"),
     SEVERE_PRESSURE("severePressure"),
     AUTOMATIC_REVISIT("automaticRevisit"),

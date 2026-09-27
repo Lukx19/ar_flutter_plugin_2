@@ -21,6 +21,8 @@ enum ARVisibilitySyntheticSceneStep {
   depthCommitFault('depthCommitFault'),
   depthCommitRetry('depthCommitRetry'),
   overOffer('overOffer'),
+  maximumSamples('maximumSamples'),
+  maximumDepthRetry('maximumDepthRetry'),
   severePressure('severePressure'),
   secondView('secondView'),
   automaticRevisit('automaticRevisit');

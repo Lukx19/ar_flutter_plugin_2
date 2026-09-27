@@ -90,6 +90,68 @@ internal class SyntheticVisibilityObservationSource(
         )
     }
 
+    /** Exercises both per-observation sample ceilings without expanding the scene. */
+    fun emitMaximumSamples(featureTimestampNs: Long, depthTimestampNs: Long): Pair<Boolean, Boolean> =
+        emitMaximumFeature(featureTimestampNs) to emitMaximumDepth(depthTimestampNs)
+
+    /** Drives the full feature source through a host or emulator integration owner. */
+    fun emitMaximumFeature(featureTimestampNs: Long): Boolean {
+        val cut = ownership() ?: return false
+        val featureSamples = VisibilityFeatureObservation.copySamples(
+            List(V2_FEATURE_SAMPLE_CAPACITY) { index ->
+                val local = localToGroup(
+                    0.30 + (index % 40).toDouble() / 4_000.0,
+                    (index / 40).toDouble() / 4_000.0,
+                    -1.0,
+                )
+                VisibilityFeatureSample(
+                    id = 100_000 + index,
+                    xWorld = local[0],
+                    yWorld = local[1],
+                    zWorld = local[2],
+                    confidence = 1.0,
+                )
+            },
+        )
+        return runtime.offerFeature(
+            VisibilityFeatureObservation(
+                ownership = cut,
+                frame = syntheticFrame(VisibilityObservationSource.SYNTHETIC_FEATURE, featureTimestampNs),
+                samples = featureSamples,
+                sourceRejectedSamples = 0,
+                payloadBytes = VisibilityFeatureObservation.FEATURE_FIXED_BYTES +
+                    featureSamples.size * VisibilityFeatureObservation.FEATURE_SAMPLE_BYTES,
+            ),
+        )
+    }
+
+    /** A fresh maximum-depth offer after a prior exact canonical ACK. */
+    fun emitMaximumDepth(timestampNs: Long): Boolean {
+        val cut = ownership() ?: return false
+        val depthSamples = VisibilityDepthObservation.copySamples(
+            List(V2_DEPTH_SAMPLE_CAPACITY) { index ->
+                VisibilityDepthSample(
+                    x = SYNTHETIC_PRINCIPAL_X - 24 + index % 48,
+                    y = SYNTHETIC_PRINCIPAL_Y - 16 + index / 48,
+                    // This near-field batch probes the 1,536-sample ceiling;
+                    // bounded canonical work can still refuse it.
+                    depthMillimeters = MAXIMUM_SAMPLE_DEPTH_MILLIMETERS,
+                    confidence = 255,
+                )
+            },
+        )
+        return runtime.offerDepth(
+            VisibilityDepthObservation(
+                ownership = cut,
+                frame = syntheticFrame(VisibilityObservationSource.SYNTHETIC_DEPTH, timestampNs),
+                samples = depthSamples,
+                sourceRejectedSamples = 0,
+                payloadBytes = VisibilityDepthObservation.DEPTH_FIXED_BYTES +
+                    depthSamples.size * VisibilityDepthObservation.DEPTH_SAMPLE_BYTES,
+            ),
+        )
+    }
+
     private fun syntheticFrame(
         source: VisibilityObservationSource,
         timestampNs: Long,
@@ -146,5 +208,6 @@ internal class SyntheticVisibilityObservationSource(
         const val SYNTHETIC_PRINCIPAL_X = 640
         const val SYNTHETIC_PRINCIPAL_Y = 480
         const val SYNTHETIC_DEPTH_MILLIMETERS = 1000
+        const val MAXIMUM_SAMPLE_DEPTH_MILLIMETERS = 300
     }
 }

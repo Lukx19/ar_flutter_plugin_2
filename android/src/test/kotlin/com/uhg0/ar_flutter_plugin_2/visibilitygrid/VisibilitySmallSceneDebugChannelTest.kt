@@ -13,6 +13,37 @@ import org.junit.Test
 
 class VisibilitySmallSceneDebugChannelTest {
     @Test
+    fun `synthetic AR observations admit exact maximum feature and depth samples`() {
+        val cut = ownership(identityMatrix(), identityMatrix())
+        val mapper = RecordingVisibilityMapper()
+        val runtime = AndroidVisibilityGridRuntime(
+            ownership = { cut },
+            mapper = mapper,
+            scheduler = Executors.newScheduledThreadPool(2),
+            featureIntervalNs = 1,
+            depthIntervalNs = 1,
+            ownsScheduler = true,
+        )
+        val source = SyntheticVisibilityObservationSource(runtime) { cut }
+        try {
+            source.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            assertEquals(true to true, source.emitMaximumSamples(1_000_000_000L, 1_250_000_000L))
+            assertTrue(mapper.featureLatch.await(2, TimeUnit.SECONDS))
+            assertTrue(mapper.depthLatch.await(2, TimeUnit.SECONDS))
+            runtime.awaitDebugFixtureIdle()
+            assertEquals(V2_FEATURE_SAMPLE_CAPACITY, checkNotNull(mapper.feature).samples.size)
+            assertTrue(checkNotNull(mapper.feature).samples.all { it.xWorld in 0.30..0.31 })
+            assertEquals(V2_DEPTH_SAMPLE_CAPACITY, checkNotNull(mapper.depth).samples.size)
+            assertTrue(checkNotNull(mapper.depth).samples.all { it.depthMillimeters == 300 })
+            assertEquals(V2_FEATURE_SAMPLE_CAPACITY, runtime.snapshot().maximumFeatureSamples)
+            assertEquals(V2_DEPTH_SAMPLE_CAPACITY, runtime.snapshot().maximumDepthSamples)
+        } finally {
+            runtime.close()
+        }
+        assertEquals(0, runtime.snapshot().residentPayloadBytes)
+    }
+
+    @Test
     fun `synthetic callback pressure sheds supported depth while capture remains safe`() {
         val cut = ownership(identityMatrix(), identityMatrix())
         val runtime = AndroidVisibilityGridRuntime(

@@ -41,15 +41,23 @@ void main() {
       ARVisibilitySyntheticSceneStep.automaticRevisit,
     );
     expect(revisit.sequence, 4);
+    final maximum = await scene.emit(
+      ARVisibilitySyntheticSceneStep.maximumSamples,
+    );
+    expect(maximum.sequence, 5);
+    final depthRetry = await scene.emit(
+      ARVisibilitySyntheticSceneStep.maximumDepthRetry,
+    );
+    expect(depthRetry.sequence, 6);
     final fault = await scene.setFault(
       ARVisibilitySyntheticFault.rendererUnavailable,
     );
-    expect(fault.sequence, 5);
+    expect(fault.sequence, 7);
     await scene.dispose();
 
     expect(
       calls.map((call) => call.method),
-      <String>['arm', 'emit', 'emit', 'emit', 'setFault', 'disarm'],
+      <String>['arm', 'emit', 'emit', 'emit', 'emit', 'emit', 'setFault', 'disarm'],
     );
     expect((calls[0].arguments as Map)['depthCapability'], 'automatic');
     expect((calls[0].arguments as Map)['expectedBindingGeneration'], 4);
@@ -61,10 +69,14 @@ void main() {
     expect((calls[2].arguments as Map)['sequence'], 3);
     expect((calls[3].arguments as Map)['step'], 'automaticRevisit');
     expect((calls[3].arguments as Map)['sequence'], 4);
-    expect((calls[4].arguments as Map)['fault'], 'rendererUnavailable');
+    expect((calls[4].arguments as Map)['step'], 'maximumSamples');
     expect((calls[4].arguments as Map)['sequence'], 5);
-    expect((calls[5].arguments as Map)['scenarioId'], 'small-scene-primary');
+    expect((calls[5].arguments as Map)['step'], 'maximumDepthRetry');
     expect((calls[5].arguments as Map)['sequence'], 6);
+    expect((calls[6].arguments as Map)['fault'], 'rendererUnavailable');
+    expect((calls[6].arguments as Map)['sequence'], 7);
+    expect((calls[7].arguments as Map)['scenarioId'], 'small-scene-primary');
+    expect((calls[7].arguments as Map)['sequence'], 8);
     await expectLater(
       scene.snapshot(),
       throwsA(isA<StateError>()),

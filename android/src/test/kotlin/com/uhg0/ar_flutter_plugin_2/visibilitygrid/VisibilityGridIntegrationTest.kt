@@ -232,6 +232,74 @@ class VisibilityGridIntegrationTest {
     }
 
     @Test
+    fun `synthetic AR source reaches canonical renderer and exact ACK without emulator`() {
+        val directory = Files.createTempDirectory("canonical-synthetic-source-journey").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val viewId = 2160
+        val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+        val scheduler = PressureObservationScheduler()
+        val projection = NativeRendererProjection(render = { _, _ -> })
+        val integration = VisibilityGridIntegration(
+            binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = resources(directory, coordinator), renderer = projection,
+        )
+        val runtime = AndroidVisibilityGridRuntime(binding::currentObservationOwnership,
+            integration, scheduler, nanoTime = { scheduler.nowNs })
+        try {
+            val stream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            val cut = requireNotNull(binding.currentObservationOwnership())
+            val source = SyntheticVisibilityObservationSource(runtime, binding::currentObservationOwnership)
+            source.anchor(identityVisibilityGridTransform(), cut.groupFrame)
+            source.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            assertTrue(source.emitMaximumFeature(scheduler.nowNs))
+            scheduler.advanceBy(0)
+            val pending = integration.integrationReceipt()
+            assertEquals("pendingAck", pending.status)
+            assertEquals(1, runtime.snapshot().admittedFeatureObservations)
+            assertEquals(V2_FEATURE_SAMPLE_CAPACITY, runtime.snapshot().maximumFeatureSamples)
+            assertTrue(integration.pressureSnapshot().associationHighWater >= V2_FEATURE_SAMPLE_CAPACITY)
+            assertTrue(projection.currentRowCount() > 0)
+            var sequence = 3L
+            var ended = false
+            repeat(256) {
+                if (!ended) {
+                    ended = exchange(messenger, viewId, stream, ++sequence, 1, 1, 1).first.messageKind == 4
+                }
+            }
+            assertTrue("synthetic feature cut reached END", ended)
+            assertEquals(0, exchange(messenger, viewId, stream, ++sequence,
+                pending.transactionId, pending.geometryRevision, pending.lineageRevision).first.messageKind)
+            await { integration.integrationReceipt().status == "acknowledged" }
+            val rendererRows = projection.currentRowCount()
+            assertTrue(source.emitMaximumDepth(scheduler.nowNs + 250_000_000L))
+            scheduler.advanceBy(0)
+            assertEquals(V2_DEPTH_SAMPLE_CAPACITY, runtime.snapshot().maximumDepthSamples)
+            assertEquals("depthLookupRefused", integration.integrationReceipt().status)
+            assertEquals(0, runtime.snapshot().admittedDepthObservations)
+            assertEquals(pending.geometryRevision, integration.integrationReceipt().geometryRevision)
+            assertEquals(rendererRows, projection.currentRowCount())
+            val lookup = requireNotNull(integration.depthLookupReceipt())
+            assertTrue(lookup.refusedByLimit)
+            assertEquals(8L * 1024L * 1024L, lookup.bytesRead)
+            assertTrue(source.emitDepth(scheduler.nowNs + 500_000_000L))
+            scheduler.advanceBy(250_000_000L)
+            assertEquals(1, runtime.snapshot().admittedDepthObservations)
+            assertTrue(projection.currentRowCount() >= rendererRows)
+        } finally {
+            runtime.close()
+            assertEquals(0, runtime.snapshot().residentPayloadBytes)
+            assertEquals(0, projection.currentRowCount())
+            binding.dispose()
+            coordinator.close()
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `combined ingress bounds depth lookup and retries canonical fault without partial renderer cut`() {
         val directory = Files.createTempDirectory("canonical-surface-combined-pressure").toFile()
         val coordinator = budget(directory)
@@ -338,6 +406,10 @@ class VisibilityGridIntegrationTest {
                 // Refusal must preserve the feature cut; do not fabricate a
                 // successful maximum-depth admission in the receipt.
                 assertEquals("depthLookupRefused", integration.integrationReceipt().status)
+                val boundedLookup = requireNotNull(integration.depthLookupReceipt())
+                assertEquals(65_537, boundedLookup.directLookups)
+                assertEquals(0, boundedLookup.rayCellVisits)
+                assertEquals(0L, boundedLookup.bytesRead)
                 assertEquals(2, integration.integrationReceipt().geometryRevision)
                 assertEquals(0, runtime.snapshot().admittedDepthObservations)
                 assertTrue(requireNotNull(integration.depthLookupReceipt()).bytesRead <= 8L * 1024L * 1024L)
