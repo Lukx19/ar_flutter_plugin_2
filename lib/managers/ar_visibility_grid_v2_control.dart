@@ -1213,6 +1213,17 @@ final class ARVisibilityGridV2Control {
     );
   }
 
+  /// Refuses one qualified continuation page after accepting its first style
+  /// page. Available only in a debuggable Android build.
+  Future<bool> configureDebugV2StyleContinuationRefusal() async {
+    await _bindingReady;
+    return _armV2DebugControl(
+      _channel,
+      'configureDebugV2StyleContinuationRefusal',
+      'V2 debug style refusal returned an invalid arm receipt.',
+    );
+  }
+
   /// Arms the debug-only COMMIT-publication stall used by the Android T6
   /// recovery tracer.
   ///

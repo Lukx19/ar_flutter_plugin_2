@@ -555,12 +555,13 @@ class VisibilityGridV2Binding internal constructor(
     private fun admitRendererStylePage(page: RendererStyleCommandV1.Page): Boolean {
         val ownership = currentObservationOwnership() ?: return false
         val baseline = lifecycle.committedBaseline()
-        return page.bindingGeneration == ownership.bindingGeneration &&
+        val qualified = page.bindingGeneration == ownership.bindingGeneration &&
             page.groupGeneration == ownership.groupGeneration &&
             page.captureGroupId.contentEquals(parseUuid(ownership.captureGroupId).bytes) &&
             page.transactionId == baseline.transactionId &&
             page.geometryRevision == baseline.geometryRevision &&
             page.lineageRevision == baseline.lineageRevision
+        return qualified && debugRecoverySeam.admitStylePage(page)
     }
 
     private fun rendererStatusMap(): Map<String, Any> {
@@ -734,6 +735,14 @@ class VisibilityGridV2Binding internal constructor(
                 result.error("VG_PROTOCOL_INVALID", "V2 recovery seam is debug-only", null)
             } else {
                 result.success(debugRecoverySeam.arm())
+            }
+            return
+        }
+        if (call.method == "configureDebugV2StyleContinuationRefusal") {
+            if (!isDebuggable) {
+                result.error("VG_PROTOCOL_INVALID", "V2 recovery seam is debug-only", null)
+            } else {
+                result.success(debugRecoverySeam.armStyleContinuationRefusal())
             }
             return
         }
@@ -1987,6 +1996,34 @@ internal class VisibilityGridV2DebugRecoverySeam {
     private var restoredStartPhase = false
     private var recoveryTraceActive = false
     private var replacementSeeded = false
+    private var styleContinuationRefusal = false
+    private var styleFirstPageSeen = false
+
+    fun armStyleContinuationRefusal(): Map<String, Any> = synchronized(lock) {
+        check(!styleContinuationRefusal) { "V2 style continuation refusal is already armed" }
+        trace.clear()
+        styleContinuationRefusal = true
+        styleFirstPageSeen = false
+        appendTrace("armed:style-continuation")
+        mapOf("armed" to true)
+    }
+
+    fun admitStylePage(page: RendererStyleCommandV1.Page): Boolean = synchronized(lock) {
+        if (!styleContinuationRefusal) return true
+        if (page.pageCount <= 1) return true
+        if (page.pageIndex == 0) {
+            styleFirstPageSeen = true
+            appendTrace("accepted:style-first-page")
+            return true
+        }
+        if (page.pageIndex == 1 && styleFirstPageSeen) {
+            styleContinuationRefusal = false
+            styleFirstPageSeen = false
+            appendTrace("refused:style-continuation")
+            return false
+        }
+        true
+    }
 
     fun arm(): Map<String, Any> = synchronized(lock) {
         check(exchangeGate == null) { "V2 recovery seam is already armed" }

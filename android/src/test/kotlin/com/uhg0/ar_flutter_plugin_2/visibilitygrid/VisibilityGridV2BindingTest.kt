@@ -45,6 +45,67 @@ import org.junit.Test
 
 class VisibilityGridV2BindingTest {
     @Test
+    fun `style continuation fault control is rejected outside debuggable bindings`() {
+        val messenger = MethodTestMessenger()
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 2148,
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
+            postToMain = { task -> task() },
+            isDebuggable = false,
+        )
+        try {
+            val result = RecordingResult()
+            MethodChannel(messenger, "visibility_grid_v2_control_2148").invokeMethod(
+                "configureDebugV2StyleContinuationRefusal",
+                null,
+                result,
+            )
+            assertTrue(result.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(0, result.successCount)
+            assertEquals(1, result.errorCount)
+            assertEquals("VG_PROTOCOL_INVALID", result.errorCode)
+        } finally {
+            binding.dispose()
+        }
+    }
+
+    @Test
+    fun `debug style continuation refusal accepts first page refuses once then disarms`() {
+        val seam = VisibilityGridV2DebugRecoverySeam()
+        val cut = RendererStyleCutPayloadV1(
+            captureGroupId = ByteArray(16) { 1 },
+            bindingGeneration = 1,
+            groupGeneration = 1,
+            transactionId = 1,
+            geometryRevision = 1,
+            lineageRevision = 1,
+            semanticRevision = 1,
+            coverageRevision = 1,
+            styleRevision = 1,
+            residencyRevision = 1,
+            targetRevision = 1,
+            reset = true,
+            surfaceIds = longArrayOf(1, 2),
+            styleRows = ByteArray(32),
+        )
+        val pages = RendererStyleCommandV1.encodePages(
+            cut,
+            maxPageBytes = RendererStyleCommandV1.HEADER_BYTES + RendererStyleCommandV1.RECORD_BYTES,
+        ).map(RendererStyleCommandV1::decode)
+        assertEquals(2, pages.size)
+        assertEquals(true, seam.armStyleContinuationRefusal()["armed"])
+        assertTrue(seam.admitStylePage(pages[0]))
+        assertFalse(seam.admitStylePage(pages[1]))
+        assertTrue(seam.admitStylePage(pages[1]))
+        val trace = seam.snapshot()["trace"] as List<*>
+        assertEquals(
+            listOf("armed:style-continuation", "accepted:style-first-page", "refused:style-continuation"),
+            trace,
+        )
+    }
+
+    @Test
     fun `renderer control wire preserves nonzero descriptor selected row receipt`() {
         val messenger = MethodTestMessenger()
         val qualifier = CoverageRowsQualifier(1L, 1L, 1L, 1L, 1L, 1L)
