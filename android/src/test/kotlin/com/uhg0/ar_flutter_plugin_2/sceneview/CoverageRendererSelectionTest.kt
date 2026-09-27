@@ -577,6 +577,46 @@ class CoverageRendererSelectionTest {
     }
 
     @Test
+    fun `debug allocation fault enters real factory failure and is consumed once`() {
+        val events = mutableListOf<String>()
+        val factory = CoverageRendererResourceFactory(
+            onCreationFailure = { events += "failed" },
+            onAcquisition = { events += "acquired" },
+            onDisposal = { events += "disposed" },
+        )
+        val first = factory.replacePoint(
+            VoxelRenderMode.CENTROIDS,
+            2,
+            "current",
+            create = { _, _, _ -> "current" },
+            release = { events += "released" },
+        )
+        assertEquals("current", first)
+        factory.armDebugAllocationFailure()
+        val failed = factory.replaceCube(
+            2,
+            "replacement",
+            create = { _, _, _ -> error("real creator should not run") },
+            release = { events += "released-replacement" },
+        )
+        assertNull(failed)
+        assertEquals(listOf("acquired", "failed"), events)
+        val recovered = factory.replaceCube(
+            2,
+            "recovered",
+            create = { _, _, _ -> "recovered" },
+            release = { events += "released-recovered" },
+        )
+        assertEquals("recovered", recovered)
+        assertEquals(listOf("acquired", "failed", "acquired", "released", "disposed"), events)
+        factory.clear()
+        assertEquals(
+            listOf("acquired", "failed", "acquired", "released", "disposed", "released-recovered", "disposed"),
+            events,
+        )
+    }
+
+    @Test
     fun `renderer lazy mode resource peaks stay within the active fourteen MiB cap`() {
         assertEquals(2_000, CoverageRendererLimits.RAW_POINT_CAPACITY)
         assertEquals(20_000, CoverageRendererLimits.CENTROID_CAPACITY)

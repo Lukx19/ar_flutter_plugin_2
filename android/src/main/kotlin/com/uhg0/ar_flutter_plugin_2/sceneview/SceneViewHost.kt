@@ -947,6 +947,12 @@ internal class SceneViewHost(
         rendererPaused = false
     }
 
+    /** Arms one failed resource creation for the debug synthetic scene. */
+    fun armDebugCoverageAllocationFailure() {
+        checkNotDisposed()
+        coverageResourceFactory.armDebugAllocationFailure()
+    }
+
     /** Prevents new resume calls while a late in-flight ARCore resume drains. */
     fun blockFutureResumes() {
         futureResumesBlocked = true

@@ -276,6 +276,7 @@ internal class VisibilitySmallSceneDebugChannel(
             "rendererRecovered" -> SmallSceneFault.RENDERER_RECOVERED
             "guidanceTerminal" -> SmallSceneFault.GUIDANCE_TERMINAL
             "canonicalRetryableDepthCommit" -> SmallSceneFault.CANONICAL_RETRYABLE_DEPTH_COMMIT
+            "rendererAllocationFailure" -> SmallSceneFault.RENDERER_ALLOCATION_FAILURE
             else -> error("unknown synthetic scene fault")
         }
         return runCommand(call, fault.wireName) {
@@ -285,6 +286,8 @@ internal class VisibilitySmallSceneDebugChannel(
                 SmallSceneFault.GUIDANCE_TERMINAL -> productHooks.guidanceTerminal()
                 SmallSceneFault.CANONICAL_RETRYABLE_DEPTH_COMMIT ->
                     productHooks.canonicalRetryableDepthCommit()
+                SmallSceneFault.RENDERER_ALLOCATION_FAILURE ->
+                    productHooks.rendererAllocationFailure()
             }
         }
     }
@@ -456,6 +459,7 @@ internal class VisibilitySmallSceneDebugChannel(
         RENDERER_RECOVERED("rendererRecovered"),
         GUIDANCE_TERMINAL("guidanceTerminal"),
         CANONICAL_RETRYABLE_DEPTH_COMMIT("canonicalRetryableDepthCommit"),
+        RENDERER_ALLOCATION_FAILURE("rendererAllocationFailure"),
     }
 
     companion object {
@@ -574,6 +578,9 @@ internal interface VisibilitySmallSceneProductHooks {
     fun guidanceTerminal() { error("guidance-terminal production hook is not wired") }
     fun canonicalRetryableDepthCommit() {
         error("canonical retryable-depth-commit production hook is not wired")
+    }
+    fun rendererAllocationFailure() {
+        error("renderer-allocation-failure production hook is not wired")
     }
     fun pause() { error("pause production hook is not wired") }
     fun resume() { error("resume production hook is not wired") }

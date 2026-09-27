@@ -253,6 +253,10 @@ internal class ArView(
                 visibilityCanonicalFaultGate.armRetryableDepthCommit()
             }
 
+            override fun rendererAllocationFailure() {
+                sceneHost.armDebugCoverageAllocationFailure()
+            }
+
             override fun pause() {
                 captureSafetySignalV2.invalidateLifecycleForViewPause()
                 sceneHost.pause()

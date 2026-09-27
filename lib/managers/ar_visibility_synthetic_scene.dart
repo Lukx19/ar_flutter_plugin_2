@@ -35,7 +35,8 @@ enum ARVisibilitySyntheticFault {
   rendererUnavailable('rendererUnavailable'),
   rendererRecovered('rendererRecovered'),
   guidanceTerminal('guidanceTerminal'),
-  canonicalRetryableDepthCommit('canonicalRetryableDepthCommit');
+  canonicalRetryableDepthCommit('canonicalRetryableDepthCommit'),
+  rendererAllocationFailure('rendererAllocationFailure');
 
   const ARVisibilitySyntheticFault(this.wireName);
 

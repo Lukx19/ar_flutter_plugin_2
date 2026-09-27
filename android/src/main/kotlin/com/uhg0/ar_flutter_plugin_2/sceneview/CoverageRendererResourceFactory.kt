@@ -1,6 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.sceneview
 
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
+import java.util.concurrent.atomic.AtomicBoolean
 
 internal enum class CoverageRendererTransitionStrategy {
     COEXIST,
@@ -62,9 +63,17 @@ internal class CoverageRendererResourceFactory(
     private val onCreationFailure: (CoverageRendererResourceTransition) -> Unit = {},
     private val onDisposed: (CoverageResourceToken?) -> Unit = {},
 ) {
+    private val debugFailNextAllocation = AtomicBoolean(false)
     private var active: Any? = null
     private var releaseActive: ((Any) -> Unit)? = null
     private var activeToken: CoverageResourceToken? = null
+
+    /** One-shot debug fixture at the real resource creation seam. */
+    fun armDebugAllocationFailure() {
+        check(debugFailNextAllocation.compareAndSet(false, true)) {
+            "renderer allocation fault is already armed"
+        }
+    }
 
     @Suppress("UNCHECKED_CAST")
     fun <T : Any> replacePoint(
@@ -130,6 +139,9 @@ internal class CoverageRendererResourceFactory(
         // made the old resource unavailable, so its failure remains fenced.
         val resourceOwner = token?.let { "$owner-epoch-${it.epoch}" } ?: owner
         val next = try {
+            if (debugFailNextAllocation.compareAndSet(true, false)) {
+                error("debug renderer allocation failure")
+            }
             // Token-qualified names keep both generations visible to the
             // allocation ledger during a coexistence transaction. Legacy
             // callers without a token retain their existing owner names.
