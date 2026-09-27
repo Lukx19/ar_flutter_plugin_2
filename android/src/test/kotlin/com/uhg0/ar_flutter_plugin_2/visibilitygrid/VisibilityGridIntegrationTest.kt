@@ -232,13 +232,14 @@ class VisibilityGridIntegrationTest {
     }
 
     @Test
-    fun `combined ingress bounds depth lookup and commits admitted canonical renderer cuts`() {
+    fun `combined ingress bounds depth lookup and retries canonical fault without partial renderer cut`() {
         val directory = Files.createTempDirectory("canonical-surface-combined-pressure").toFile()
         val coordinator = budget(directory)
         val messenger = MethodTestMessenger()
         val viewId = 2148
         val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
         val scheduler = PressureObservationScheduler()
+        val depthCommitAttempts = mutableListOf<PreparedCanonicalMutation>()
         var publishedPages = 0
         var publishedRows = 0
         val projection = NativeRendererProjection(
@@ -264,6 +265,17 @@ class VisibilityGridIntegrationTest {
             resourcesForGroup = resources(directory, coordinator),
             renderer = projection,
             depthKernelFactory = { DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 1)) },
+            commitCanonical = { resources, mutation ->
+                if (mutation.kind == PreparedMutationKind.DEPTH_BATCH) {
+                    depthCommitAttempts += mutation
+                    if (depthCommitAttempts.size == 1) {
+                        CanonicalAdjacentCommitResult.Refused(
+                            CanonicalAdjacentCommitRefusal.DURABILITY_FAILURE,
+                            disposition = PreparedMutationDisposition.RETRYABLE,
+                        )
+                    } else resources.commitAdjacent(mutation)
+                } else resources.commitAdjacent(mutation)
+            },
         )
         val runtime = AndroidVisibilityGridRuntime(binding::currentObservationOwnership,
             integration, scheduler, nanoTime = { scheduler.nowNs })
@@ -333,10 +345,37 @@ class VisibilityGridIntegrationTest {
                 assertEquals(2, integration.integrationReceipt().geometryRevision)
                 assertEquals(0, runtime.snapshot().admittedDepthObservations)
                 assertTrue(requireNotNull(integration.depthLookupReceipt()).bytesRead <= 8L * 1024L * 1024L)
+                val rendererRowsBeforeFault = projection.currentRowCount()
+                val publishedPagesBeforeFault = publishedPages
+                val publishedRowsBeforeFault = publishedRows
                 assertTrue(runtime.offerDepth(depth(cut, timestamp + 1), 1_500_000))
                 scheduler.advanceBy(250_000_000)
+                assertEquals("depthCommitRetryPending", integration.integrationReceipt().status)
+                assertEquals(2, integration.integrationReceipt().geometryRevision)
+                assertEquals(rendererRowsBeforeFault, projection.currentRowCount())
+                assertEquals(publishedPagesBeforeFault, publishedPages)
+                assertEquals(publishedRowsBeforeFault, publishedRows)
+                assertEquals(0, runtime.snapshot().admittedDepthObservations)
+                assertTrue(requireNotNull(integration.pendingDepthRetentionReceipt()).totalBytes <=
+                    requireNotNull(integration.pendingDepthRetentionReceipt()).budgetBytes)
+                assertTrue(runtime.offerDepth(depth(cut, timestamp + 2), 1_500_000))
+                scheduler.advanceBy(250_000_000)
+                assertEquals(2, depthCommitAttempts.size)
+                assertTrue(depthCommitAttempts[0] === depthCommitAttempts[1])
+                assertEquals("pendingAck", integration.integrationReceipt().status)
+                assertEquals(3, integration.integrationReceipt().geometryRevision)
+                assertEquals(1, runtime.snapshot().admittedDepthObservations)
+                assertEquals(null, integration.pendingDepthRetentionReceipt())
+                assertTrue(projection.currentRowCount() > rendererRowsBeforeFault)
+                assertEquals(publishedRowsBeforeFault + projection.currentRowCount(), publishedRows)
+                assertEquals(publishedPagesBeforeFault +
+                    (projection.currentRowCount() + 511) / 512, publishedPages)
                 acknowledge()
                 scheduler.advanceBy(250_000_000)
+                assertEquals(2, depthCommitAttempts.size)
+                assertEquals(publishedRowsBeforeFault + projection.currentRowCount(), publishedRows)
+                assertEquals(publishedPagesBeforeFault +
+                    (projection.currentRowCount() + 511) / 512, publishedPages)
             }
             assertEquals(1, runtime.snapshot().admittedFeatureObservations)
             assertEquals(1, runtime.snapshot().admittedDepthObservations)
