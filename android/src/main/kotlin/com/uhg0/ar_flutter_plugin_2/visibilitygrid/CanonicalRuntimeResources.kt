@@ -80,6 +80,16 @@ internal class CanonicalRuntimeResources private constructor(
 
     fun owner(): SurfaceOwnership = requireNotNull(owner) { "canonical surface runtime authority is unavailable" }
 
+    private fun isDurablyCurrent(lease: CurrentLease): Boolean {
+        val held = owner?.activationState() ?: return false
+        if (!lease.isCurrent(held.cut)) return false
+        val selected = CanonicalActivationSelector.reopenAuthenticatedCurrent(
+            group, directory, budget, held.cut,
+        ) as? CanonicalActivationResult.Active ?: return false
+        return selected.state.cut == held.cut &&
+            selected.state.identity == held.identity &&
+            selected.state.currentState == held.currentState
+    }
     private fun openGenerationZero(): CompactCanonicalOpenResult {
         checkOpen()
         return CompactCanonicalStore.openV6(group, directory, budget, configuration)
@@ -167,7 +177,7 @@ internal class CanonicalRuntimeResources private constructor(
         if (expected.geometryRevision != lease.scalarView.cut.geometryRevision ||
             expected.lineageRevision != lease.scalarView.cut.lineageRevision
         ) return onFailure(CompleteCurrentBorrowFailure.REVISION_CONFLICT)
-        if (!lease.isCurrent(owner?.activationState()?.cut)) {
+        if (!isDurablyCurrent(lease)) {
             invalidateCurrent()
             return onFailure(CompleteCurrentBorrowFailure.CURRENT_UNAVAILABLE)
         }
@@ -203,7 +213,7 @@ internal class CanonicalRuntimeResources private constructor(
         // Feature-local correlation identifies associations only. Canonical
         // occupancy, normals, identity and allocation provenance always come
         // from the lifecycle-owned complete authority.
-        if (!lease.isCurrent(owner?.activationState()?.cut)) {
+        if (!isDurablyCurrent(lease)) {
             invalidateCurrent(); return null
         }
         val view = lease.featurePlanningView(budget)
@@ -220,7 +230,7 @@ internal class CanonicalRuntimeResources private constructor(
         view: CanonicalStateView,
         block: (CanonicalStateView) -> T,
     ): T? {
-        if (!lease.isCurrent(owner?.activationState()?.cut) || view.cut != lease.scalarView.cut) {
+        if (!isDurablyCurrent(lease) || view.cut != lease.scalarView.cut) {
             invalidateCurrent(); return null
         }
         return attachRetainedPublishedAuthority(lease, block(view))
@@ -440,7 +450,7 @@ internal class CanonicalRuntimeResources private constructor(
         if (lease.scalarView.cut.let {
                 it.geometryRevision != expected.geometryRevision ||
                     it.lineageRevision != expected.lineageRevision
-            } || !lease.isCurrent(owner?.activationState()?.cut)
+            } || !isDurablyCurrent(lease)
         ) {
             invalidateCurrent()
             return false
@@ -448,7 +458,7 @@ internal class CanonicalRuntimeResources private constructor(
         val page = runCatching { readRendererPage(cursor, limit) }.getOrNull() ?: return false
         block(page)
         val finalCut = lease.scalarView.cut
-        return current === lease && lease.isCurrent(owner?.activationState()?.cut) &&
+        return current === lease && isDurablyCurrent(lease) &&
             finalCut.geometryRevision == expected.geometryRevision &&
             finalCut.lineageRevision == expected.lineageRevision
     }

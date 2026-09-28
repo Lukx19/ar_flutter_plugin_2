@@ -411,7 +411,17 @@ internal object CanonicalActivationSelector {
         budget: CanonicalStorageBudget,
         cut: CompactCanonicalCut,
     ): CanonicalActivationResult = withGroupLock(parent, group) {
-        reopenLocked(group, parent, budget, authenticatedCut = cut)
+        // A surviving activation attempt means the selected authority has not
+        // been reconciled. Live borrows must not infer current from file presence.
+        val attemptPrefix = "canonical-surface-activation-${group.hash.hex()}-attempt-"
+        if (parent.listFiles().orEmpty().any {
+                it.name.startsWith(attemptPrefix) && it.name.endsWith(".attempt")
+            }) return@withGroupLock CanonicalActivationResult.Refused(
+            CanonicalActivationSelectorRefusal.DURABILITY_FAILURE,
+        )
+        // The held payload was authenticated when materialized. Rehashing it on
+        // every renderer/worker borrow would make read cost grow with capture history.
+        reopenLocked(group, parent, budget, authenticatedCut = cut, verifyCurrentPayload = false)
     }
 
     /**
@@ -1018,6 +1028,7 @@ internal object CanonicalActivationSelector {
         budget: CanonicalStorageBudget,
         boundBase: CanonicalStateView? = null,
         authenticatedCut: CompactCanonicalCut? = null,
+        verifyCurrentPayload: Boolean = true,
     ): CanonicalActivationResult {
         val selectorFile = selectorFile(parent, group)
         if (!selectorFile.exists()) return CanonicalActivationResult.Legacy
@@ -1054,7 +1065,10 @@ internal object CanonicalActivationSelector {
         if (v6Cut != root.cut) return CanonicalActivationResult.Refused(CanonicalActivationSelectorRefusal.FORKED_SELECTOR)
         val current = (root.current as? CurrentRecord.Unacknowledged)?.let { record ->
             val file = currentFile(parent, group, record)
-            if (!verifyCurrent(file, record.identity)) return CanonicalActivationResult.Refused(
+            val currentUnavailable = if (verifyCurrentPayload) {
+                !verifyCurrent(file, record.identity)
+            } else !file.isFile || file.length() != record.identity.canonicalLength
+            if (currentUnavailable) return CanonicalActivationResult.Refused(
                 CanonicalActivationSelectorRefusal.CORRUPT_CURRENT,
             )
             CanonicalActivationCurrent.Receipt(record.identity, CanonicalCurrentSource.fromFile(file))

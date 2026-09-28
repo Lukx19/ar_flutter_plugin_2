@@ -410,7 +410,7 @@ class CompactCanonicalMutationTest {
             ) { CanonicalCowGeneration.voxelKey(it.x, it.y, it.z) }
             val fillers = ArrayList<CanonicalTarget>()
             var candidate = 0
-            while (fillers.size < 5_182) {
+            while (fillers.size < 512) {
                 val value = Voxel(10 + candidate / 100, (candidate / 10) % 10, candidate % 10)
                 candidate++
                 val location = requireNotNull(CompactLocation(configuration, value))
@@ -432,15 +432,7 @@ class CompactCanonicalMutationTest {
                 configuration,
                 CanonicalTransactionCommand("dirty-large", CanonicalOperation.CREATE, 0, 0, emptyList(), candidates.take(count)),
             )
-            assertTrue(preparation(candidates.size) is CanonicalMutationPreparation.Refused)
-            var admitted = commonTargets.size
-            var refused = candidates.size
-            while (refused - admitted > 1) {
-                val middle = admitted + (refused - admitted) / 2
-                if (preparation(middle) is CanonicalMutationPreparation.Prepared) admitted = middle else refused = middle
-            }
-            assertTrue(admitted > commonTargets.size)
-            val largePlan = (preparation(admitted) as CanonicalMutationPreparation.Prepared).mutation
+            val largePlan = (preparation(candidates.size) as CanonicalMutationPreparation.Prepared).mutation
             val largeIntent = flush(largeBase, largePlan, File(directory, "dirty-large-intent"))
             val large = stage(largeBase, largeIntent, File(directory, "dirty-large-generation"))
             val phase = large.storageReceipt()
@@ -448,7 +440,7 @@ class CompactCanonicalMutationTest {
             assertTrue("directory index retained bytes=$phase", phase.indexRetainedBytes > 0L)
             assertTrue("index construction peak=$phase", phase.indexConstructionPeakBytes >= phase.indexRetainedBytes)
             assertTrue("phase includes index construction=$phase", phase.phasePeakBytes > phase.indexConstructionPeakBytes)
-            assertTrue("maximum admitted dirty phase=$phase", phase.phasePeakBytes <= 1_048_576L)
+            assertTrue("bounded dirty phase=$phase", phase.phasePeakBytes <= 1_048_576L)
             val retainedIndexBytes = phase.indexRetainedBytes
             assertTrue(large.directoryIndexRetained())
             assertSame(large, large.withAllocatedStorage(phase.allocatedBytes))

@@ -30,7 +30,7 @@ class FeatureFusionKernelTest {
         assertArrayEquals(candidateA, actual)
         assertFalse("Candidate B consolidation must remain rejected", candidateB.contentEquals(actual))
         assertFalse("Candidate C averaging must remain rejected", candidateC.contentEquals(actual))
-        assertEquals("957ad2856b197eaad44e42db72a444cc9b6c516fa746a225329aaada0fb8ac85", testSha256Hex(resourceBytes("feature_fusion_fusion_vector_v1.json")))
+        assertEquals("53b387a08dc0ad2488b77d50677b905881f53e56f335be8265f98c3d2b89b9e7", testSha256Hex(resourceBytes("feature_fusion_fusion_vector_v1.json")))
     }
 
     @Test

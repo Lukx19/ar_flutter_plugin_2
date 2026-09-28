@@ -940,6 +940,58 @@ class BoundedCanonicalDepthLookupTest {
     }
 
     @Test
+    fun `live current refuses corrupt replaced and pending selectors before callbacks`() {
+        for (damage in listOf("corrupt", "replaced", "pending")) {
+            val root = Files.createTempDirectory("bounded-canonical-depth-live-$damage").toFile()
+            val coordinator = coordinator(root)
+            val group = SurfaceGroup("d".repeat(32))
+            val resources = CanonicalRuntimeResources.open(root, group, coordinator)
+            try {
+                assertTrue(resources.openInitial(committedEmptyBaseline("binding", group.value, 1, 1, 1)) is SurfaceOwnershipOpenResult.Opened)
+                val selector = resources.groupDirectory.listFiles().orEmpty().single { it.name.endsWith(".selector") }
+                val earlierSelector = selector.readBytes()
+                val created = resources.prepareEvidenceBatch(
+                    CanonicalEvidenceBatchCommand(
+                        "live-selector-$damage", 1, 1,
+                        listOf(DepthEvidenceChange.Create(CanonicalTarget(voxel = Voxel(8, 0, 0), normalOctX = 1, normalOctY = 1, normalConfidence = 200))),
+                    ),
+                ) as CanonicalMutationPreparation.Prepared
+                assertTrue(resources.commitAdjacent(created.mutation) is CanonicalAdjacentCommitResult.Committed)
+                val before = requireNotNull(resources.owner().activationState())
+                when (damage) {
+                    "corrupt" -> selector.writeBytes(selector.readBytes().also { it[0] = (it[0].toInt() xor 0xff).toByte() })
+                    "replaced" -> selector.writeBytes(earlierSelector)
+                    else -> File(resources.groupDirectory, selector.name.removeSuffix(".selector") + "-attempt-stale.attempt")
+                        .writeBytes(byteArrayOf(1))
+                }
+                if (damage == "replaced") {
+                    val firstLookup = resources.withBoundedCurrent(
+                        BoundedCanonicalLookupRequest(before.cut.geometryRevision, before.cut.lineageRevision, 1, 0, 1, 4096),
+                    ) { error("replaced selector must not borrow bounded current") }
+                    assertEquals(BoundedCanonicalLookupReason.CURRENT_UNAVAILABLE, (firstLookup as BoundedCanonicalLookupResult.Refused).reason)
+                }
+                if (damage == "pending") {
+                    assertTrue(!resources.withRendererPage(before.cut.geometryRevision, before.cut.lineageRevision, 0) {
+                        error("pending selector must not borrow renderer page")
+                    })
+                }
+                assertTrue(resources.withCurrent { error("$damage must not borrow current") } == null)
+                val lookup = resources.withBoundedCurrent(
+                    BoundedCanonicalLookupRequest(before.cut.geometryRevision, before.cut.lineageRevision, 1, 0, 1, 4096),
+                ) { error("$damage must not borrow bounded current") }
+                assertEquals(BoundedCanonicalLookupReason.CURRENT_UNAVAILABLE, (lookup as BoundedCanonicalLookupResult.Refused).reason)
+                assertTrue(!resources.withRendererPage(before.cut.geometryRevision, before.cut.lineageRevision, 0) {
+                    error("$damage must not borrow renderer page")
+                })
+                assertTrue(before == resources.owner().activationState())
+            } finally {
+                resources.close()
+                coordinator.close()
+                root.deleteRecursively()
+            }
+        }
+    }
+    @Test
     fun `surface lookup reports exact outgoing lineage count`() {
         val root = Files.createTempDirectory("bounded-canonical-depth-lineage").toFile()
         val coordinator = coordinator(root)

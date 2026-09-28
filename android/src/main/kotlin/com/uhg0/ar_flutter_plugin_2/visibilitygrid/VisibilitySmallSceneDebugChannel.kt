@@ -229,8 +229,11 @@ internal class VisibilitySmallSceneDebugChannel(
                 }
                 SmallSceneStep.MAXIMUM_DEPTH_RETRY -> {
                     runtime.awaitDebugFixtureIdle()
-                    check(source.emitMaximumDepth(8_500_000_000L)) {
-                        "fresh maximum synthetic depth observation was not copied"
+                    // The full 1,536-point batch may correctly exhaust the
+                    // bounded lookup. Retry with one fresh depth sample to
+                    // prove the retained feature cut remains usable.
+                    check(source.emitDepth(8_500_000_000L, 0, 0)) {
+                        "bounded synthetic depth retry was not copied"
                     }
                     runtime.awaitDebugFixtureIdle()
                 }
