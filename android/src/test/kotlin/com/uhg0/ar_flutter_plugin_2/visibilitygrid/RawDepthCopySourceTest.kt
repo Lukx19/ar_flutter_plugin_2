@@ -51,6 +51,37 @@ class RawDepthCopySourceTest {
     }
 
     @Test
+    fun `large depth image samples across the frame without reading every pixel`() {
+        var depthReads = 0
+        var confidenceReads = 0
+        val depth = FakeRawDepthImage(width = 2_000, height = 2_000) { _, _ ->
+            depthReads++
+            1_000
+        }
+        val confidence = FakeRawDepthImage(width = 2_000, height = 2_000) { _, _ ->
+            confidenceReads++
+            255
+        }
+        val source = RawDepthCopySource(
+            acquirer = FakePairedAcquirer(depth, confidence),
+            maxCopiedPixels = V2_DEPTH_SAMPLE_CAPACITY,
+        )
+
+        val result = source.acquire(metadata(width = 2_000, height = 2_000))
+
+        assertTrue(result is DepthAcquisitionResult.Observation)
+        val samples = (result as DepthAcquisitionResult.Observation).value.samples
+        assertEquals(V2_DEPTH_SAMPLE_CAPACITY, samples.size)
+        assertEquals(DepthPixelSample(0, 0, 1_000, 255), samples.first())
+        assertTrue(samples.maxOf { it.y } >= 1_998)
+        assertTrue(samples.map { it.x }.toSet().size > 100)
+        assertTrue(depthReads <= V2_DEPTH_SAMPLE_CAPACITY * 5)
+        assertEquals(V2_DEPTH_SAMPLE_CAPACITY, confidenceReads)
+        assertEquals(1, depth.closeCount)
+        assertEquals(1, confidence.closeCount)
+    }
+
+    @Test
     fun `resource telemetry balances partial and complete paired acquisition`() {
         var acquired = 0
         var closed = 0
