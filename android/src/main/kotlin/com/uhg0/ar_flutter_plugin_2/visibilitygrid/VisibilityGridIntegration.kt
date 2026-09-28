@@ -453,14 +453,16 @@ internal class VisibilityGridIntegration(
 
     private fun recordCanonicalPressureHighWater() {
         val feature = kernel?.resourceReceipt() ?: return
+        val currentCut = owner?.activationState()?.cut
         canonicalSurfaceHighWater = maxOf(
             canonicalSurfaceHighWater,
             feature.surfaceCount.toLong(),
-            owner?.activationState()?.cut?.liveSurfaceCount?.toLong() ?: 0,
+            currentCut?.liveSurfaceCount?.toLong() ?: 0,
         )
         associationHighWater = maxOf(
             associationHighWater,
             feature.associationCount.toLong(),
+            currentCut?.lineageCount?.toLong() ?: 0,
         )
         // Count retained ownership, not just populated feature tuples. Depth
         // evidence rows live inside fixed arrays, so their logical row bytes

@@ -110,6 +110,80 @@ class VisibilityGridIntegrationTest {
         )
     }
 
+    @Test(timeout = 14L * 60L * 1_000L)
+    fun `maximum canonical cut reopens through live binding and renderer admission`() {
+        val directory = Files.createTempDirectory("canonical-maximum-binding-admission").toFile()
+        val coordinator = StorageBudgetCoordinatorV2(
+            File(directory, "visibility-grid-canonical-surface-runtime"),
+            StorageBudgetPolicyV2(256L * 1024L * 1024L, 0),
+            JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L }),
+        ) { 512L * 1024L * 1024L }
+        val messenger = MethodTestMessenger()
+        val viewId = 2155
+        val binding = VisibilityGridV2Binding(
+            messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() },
+        )
+        val projection = NativeRendererProjection(render = { _, _ -> })
+        var integration: VisibilityGridIntegration? = null
+        var activeResources: CanonicalRuntimeResources? = null
+        try {
+            val stream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            val ownership = requireNotNull(binding.currentObservationOwnership())
+            val group = SurfaceGroup(ownership.captureGroupId)
+            val groupDirectory = File(
+                directory,
+                "visibility-grid-canonical-surface-runtime/${group.value}",
+            ).also { assertTrue(it.mkdirs()) }
+            CanonicalStoreMigrationTest().writeMaximumV3Fixture(
+                groupDirectory, group, version = 5, includeCanonicalCurrent = true,
+                geometryRevision = 2, lineageRevision = 1,
+            )
+            val storage = CoordinatorStorageBudget(coordinator)
+            assertTrue(
+                CompactCanonicalStore.prepareV6SiblingMigration(group, groupDirectory, storage)
+                    is CompactCanonicalMigrationResult.Prepared,
+            )
+            (CompactCanonicalStore.openV6(group, groupDirectory, storage)
+                as CompactCanonicalOpenResult.Opened).store.use { base ->
+                assertEquals(100_000, base.cut.liveSurfaceCount)
+                val plan = (CanonicalActivation.prepare(group, groupDirectory, storage)
+                    as CanonicalActivationPreparation.Prepared).plan
+                (SurfaceOwnership.open(group, groupDirectory, storage, plan)
+                    as SurfaceOwnershipOpenResult.Opened).ownership.close()
+            }
+
+            integration = VisibilityGridIntegration(
+                binding, binding::currentObservationOwnership, directory,
+                resourcesForGroup = { candidate ->
+                    CanonicalRuntimeResources.open(directory, candidate, coordinator).also {
+                        activeResources = it
+                    }
+                },
+                renderer = projection,
+            )
+            integration.admitFeature(feature(ownership, 11))
+            val pressure = integration.pressureSnapshot()
+            assertEquals(100_000, pressure.canonicalSurfaceHighWater)
+            assertEquals(200_000, pressure.associationHighWater)
+            assertEquals("receipt=${integration.integrationReceipt()}", 100_000, integration.integrationReceipt().rendererRows)
+            val firstPage = requireNotNull(activeResources).readRendererPage(0, 512)
+            assertEquals(512, firstPage?.rows?.size)
+            assertEquals(0xffff, firstPage?.rows?.first()?.lineageCount)
+            val lastPage = requireNotNull(activeResources).readRendererPage(0x8000_0000L, 512)
+            assertEquals(listOf(0xffff_ffffL), lastPage?.rows?.map { it.surfaceId })
+            assertTrue(pressure.canonicalOwnedBytes <= 64L * 1024L * 1024L)
+        } finally {
+            integration?.close()
+            projection.close()
+            binding.dispose()
+            coordinator.close()
+            directory.deleteRecursively()
+        }
+    }
+
     @Test
     fun `pressure snapshot does not wait behind active feature planning`() {
         val directory = Files.createTempDirectory("canonical-pressure-active-planning").toFile()

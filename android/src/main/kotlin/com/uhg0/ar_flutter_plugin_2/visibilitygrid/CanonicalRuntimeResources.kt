@@ -3,6 +3,10 @@ package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 import com.uhg0.ar_flutter_plugin_2.capture.StorageBudgetCoordinatorV2
 import java.io.File
 
+// Canonical lineage can reach 200k associations; the renderer style row has
+// a 16-bit lineage field. Saturate only the display value, not the authority.
+private fun rendererLineageCount(canonicalCount: Int): Int = minOf(canonicalCount, 0xffff)
+
 /**
  * The one group-owned runtime capability for durable canonical surface work.
  *
@@ -378,7 +382,7 @@ internal class CanonicalRuntimeResources private constructor(
                     voxel = row.voxel,
                     packedNormal = row.packedNormal,
                     normalConfidence = row.normalConfidence,
-                    lineageCount = view.cut.lineageCount,
+                    lineageCount = rendererLineageCount(view.cut.lineageCount),
                 )
                 rendered++
                 if (page.size == 512) {
@@ -410,6 +414,24 @@ internal class CanonicalRuntimeResources private constructor(
         val view = lease.completeView
         return run {
             require(cursor in 0 until view.cut.nextSurfaceIdHighWater && limit in 1..512)
+            if (view.cut.nextSurfaceIdHighWater > Int.MAX_VALUE.toLong()) {
+                val ids = lease.sparseIds() ?: return null
+                var index = ids.binarySearch(cursor + 1).let { if (it < 0) -it - 1 else it }
+                val rows = ArrayList<CommittedGeometryRow>(limit)
+                while (index < ids.size && rows.size < limit) {
+                    val row = view.findById(SurfaceId(ids[index++])) ?: return null
+                    rows += CommittedGeometryRow(
+                        surfaceId = row.id.value,
+                        voxel = row.voxel,
+                        packedNormal = row.packedNormal,
+                        normalConfidence = row.normalConfidence,
+                        lineageCount = rendererLineageCount(view.cut.lineageCount),
+                    )
+                }
+                return CanonicalRendererPage(
+                    view.cut, rows, ids.getOrNull(index - 1)?.takeIf { index < ids.size },
+                )
+            }
             val rows = ArrayList<CommittedGeometryRow>(limit)
             var id = cursor + 1
             while (id < view.cut.nextSurfaceIdHighWater && rows.size < limit) {
@@ -419,7 +441,7 @@ internal class CanonicalRuntimeResources private constructor(
                         voxel = row.voxel,
                         packedNormal = row.packedNormal,
                         normalConfidence = row.normalConfidence,
-                        lineageCount = view.cut.lineageCount,
+                        lineageCount = rendererLineageCount(view.cut.lineageCount),
                     )
                 }
                 id++
@@ -523,13 +545,37 @@ internal class CanonicalRuntimeResources private constructor(
         var commit: CanonicalPublishedCommit?,
         private val featureRoutes: CanonicalFeaturePlanningRoutes,
     ) : AutoCloseable {
+        private var sortedSparseIds: LongArray? = null
+
+        @Synchronized fun sparseIds(): LongArray? {
+            if (scalarView.cut.nextSurfaceIdHighWater <= Int.MAX_VALUE.toLong()) return null
+            sortedSparseIds?.let { return it }
+            return featureRoutes.copySortedSurfaceIds(scalarView.cut.liveSurfaceCount)?.also {
+                sortedSparseIds = it
+            }
+        }
+
         fun featurePlanningView(budget: FeaturePlanningReadBudget): RoutedFeaturePlanningView =
             featureRoutes.view(scalarView.cut, base, commit, budget)
         fun featurePlanningMemoryReceipt(maximumTouches: Int) = featureRoutes.memoryReceipt(maximumTouches)
         fun copyOccupiedKeys(): LongArray? = featureRoutes.copyOccupiedKeys(scalarView.cut.liveSurfaceCount)
         fun foldCurrentRows(sink: (CompactSurface, CanonicalReceiptBytes) -> Boolean): Boolean {
             val highWater = scalarView.cut.nextSurfaceIdHighWater
-            if (highWater !in 1..(Int.MAX_VALUE.toLong())) return false
+            if (highWater < 1L) return false
+            // Canonical IDs can reach UINT32_MAX while only 100k surfaces are live.
+            // Walk retained route identities instead of billions of empty ID windows.
+            if (highWater > Int.MAX_VALUE.toLong()) {
+                val ids = sparseIds() ?: return false
+                for (idValue in ids) {
+                    val id = SurfaceId(idValue)
+                    val row = completeView.findById(id) ?: return false
+                    if (!featureRoutes.contains(row.voxel, row.id)) return false
+                    val source = (completeView.readSourceById(id) as? CanonicalPageRead.Complete)?.value
+                        ?: return false
+                    if (!sink(row, source.allocationFingerprint)) return false
+                }
+                return true
+            }
             val scratch = CurrentRowFoldScratch()
             val published = commit
             var emitted = 0
@@ -577,17 +623,21 @@ internal class CanonicalRuntimeResources private constructor(
                 Math.addExact(baseReceipt.residentTotalBytes, it.lifecycleConstructionPeakBytes)
             } ?: 0L
             val routing = featureRoutes.memoryReceipt(0)
+            val sparseIdBytes = sortedSparseIds?.let {
+                Math.addExact(16L, Math.multiplyExact(it.size.toLong(), Long.SIZE_BYTES.toLong()))
+            } ?: 0L
+            val routingRetained = Math.addExact(routing.routeRetainedBytes, sparseIdBytes)
             return CanonicalCompleteCurrentLeaseReceipt(
                 baseReceipt,
                 cowRetained,
-                routing.routeRetainedBytes,
-                Math.addExact(retainedTotal, routing.routeRetainedBytes),
+                routingRetained,
+                Math.addExact(retainedTotal, routingRetained),
                 maxOf(
-                    Math.addExact(baseReceipt.peakWithScratchBytes, routing.routeRetainedBytes),
+                    Math.addExact(baseReceipt.peakWithScratchBytes, routingRetained),
                     cowConstruction,
                     Math.addExact(
                         retainedTotal,
-                        Math.addExact(routing.routeRetainedBytes, routing.lifecycleConstructionScratchBytes),
+                        Math.addExact(routingRetained, routing.lifecycleConstructionScratchBytes),
                     ),
                 ),
             )
@@ -595,6 +645,7 @@ internal class CanonicalRuntimeResources private constructor(
         fun isCurrent(cut: CompactCanonicalCut?): Boolean =
             cut != null && cut == scalarView.cut && cut == completeView.cut
         override fun close() {
+            sortedSparseIds = null
             featureRoutes.close()
             commit?.close(); commit = null; base.close()
         }
@@ -643,6 +694,21 @@ private class CanonicalFeaturePlanningRoutes private constructor(private val cap
         }
         return occupied.takeIf { size == expectedLiveCount }
     }
+    fun copySortedSurfaceIds(expectedLiveCount: Int): LongArray? {
+        if (closed || expectedLiveCount !in 0..capacity) return null
+        val ids = LongArray(expectedLiveCount)
+        var size = 0
+        for (slot in tokens.indices) if (tokens[slot] != 0) {
+            if (size >= ids.size) return null
+            ids[size++] = surfaceIds[tokens[slot] - 1]
+        }
+        if (size != expectedLiveCount) return null
+        ids.sort()
+        if (ids.any { it <= 0L }) return null
+        for (index in 1 until ids.size) if (ids[index] == ids[index - 1]) return null
+        return ids
+    }
+
 
     fun contains(voxel: Voxel, id: SurfaceId): Boolean {
         if (closed) return false
@@ -843,17 +909,23 @@ private class CanonicalFeaturePlanningRoutes private constructor(private val cap
     companion object {
         fun build(base: CompactCanonicalStore, commit: CanonicalPublishedCommit?, capacity: Int): CanonicalFeaturePlanningRoutes? {
             val routes = CanonicalFeaturePlanningRoutes(capacity)
-            var id = 1L
-            while (id < base.cut.nextSurfaceIdHighWater) {
-                val row = base.findById(SurfaceId(id++)) ?: continue
-                val source = (base.readSourceById(row.id) as? CanonicalPageRead.Complete)?.value ?: run {
-                    routes.close(); return null
+            var cursor = 0
+            while (cursor < base.cut.liveSurfaceCount) {
+                val page = base.readRendererPage(
+                    cursor, minOf(512, base.cut.liveSurfaceCount - cursor),
+                )
+                if (page.rows.isEmpty()) { routes.close(); return null }
+                for (row in page.rows) {
+                    val source = (base.readSourceById(row.id) as? CanonicalPageRead.Complete)?.value ?: run {
+                        routes.close(); return null
+                    }
+                    val descriptor = routes.acquire() ?: run { routes.close(); return null }
+                    routes.rowProviders[descriptor] = FeatureRouteProviderToken.BASE
+                    routes.sourceProviders[descriptor] = FeatureRouteProviderToken.BASE
+                    routes.surfaceIds[descriptor] = row.id.value
+                    routes.put(packVisibilityGridKey(row.voxel.x, row.voxel.y, row.voxel.z), descriptor)
                 }
-                val descriptor = routes.acquire() ?: run { routes.close(); return null }
-                routes.rowProviders[descriptor] = FeatureRouteProviderToken.BASE
-                routes.sourceProviders[descriptor] = FeatureRouteProviderToken.BASE
-                routes.surfaceIds[descriptor] = row.id.value
-                routes.put(packVisibilityGridKey(row.voxel.x, row.voxel.y, row.voxel.z), descriptor)
+                cursor += page.rows.size
             }
             commit?.let { published ->
                 for (ordinal in 0 until published.routingGenerationCount()) {

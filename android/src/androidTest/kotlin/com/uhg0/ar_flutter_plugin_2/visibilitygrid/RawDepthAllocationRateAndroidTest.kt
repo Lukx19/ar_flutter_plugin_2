@@ -1,0 +1,127 @@
+package com.uhg0.ar_flutter_plugin_2.visibilitygrid
+
+import android.os.Debug
+import android.os.SystemClock
+import android.util.Log
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import org.junit.runner.RunWith
+
+@RunWith(AndroidJUnit4::class)
+class RawDepthAllocationRateAndroidTest {
+    @Test(timeout = 50_000)
+    fun largeDepthSelectionReportsPerMinuteAllocationRate() {
+        val closed = AtomicInteger()
+        val published = AtomicInteger()
+        val minimumSamples = AtomicInteger(Int.MAX_VALUE)
+        val metadata = RawDepthFrameMetadata(
+            timestampNs = 1,
+            groupGeneration = 1,
+            sessionGeneration = 1,
+            tracking = true,
+            width = 2_000,
+            height = 2_000,
+            intrinsics = DepthIntrinsics(1_000.0, 1_000.0, 1_000.0, 1_000.0),
+            worldFromCameraGl = DoubleArray(16) { if (it % 5 == 0) 1.0 else 0.0 },
+        )
+        var completion = CountDownLatch(1)
+        val processor = BoundedDepthObservationProcessor<PreparedRawDepthFrame, DepthAcquisitionResult>(
+            process = PreparedRawDepthFrame::process,
+            publish = { result, _ ->
+                val observation = result as DepthAcquisitionResult.Observation
+                minimumSamples.getAndUpdate { minOf(it, observation.value.samples.size) }
+                if (observation.value.samples.any { it.depthMillimeters == 500 }) {
+                    published.incrementAndGet()
+                }
+                completion.countDown()
+            },
+        )
+        fun frame() = PreparedRawDepthFrame(
+            metadata,
+            SyntheticImage(2_000, 2_000, closed, foreground = true),
+            SyntheticImage(2_000, 2_000, closed, foreground = false),
+            V2_DEPTH_SAMPLE_CAPACITY,
+        )
+        try {
+            repeat(2) {
+                completion = CountDownLatch(1)
+                assertTrue(processor.offer(frame(), 0))
+                assertTrue(completion.await(2, TimeUnit.SECONDS))
+                assertTrue(processor.awaitIdle(2_000))
+            }
+            val allocatedBefore = artStat("art.gc.bytes-allocated")
+            val freedBefore = artStat("art.gc.bytes-freed")
+            val gcBefore = artStat("art.gc.gc-count")
+            val nativeBefore = Debug.getNativeHeapAllocatedSize()
+            var nativePeak = nativeBefore
+            val started = SystemClock.elapsedRealtime()
+            var accepted = 0
+            var dropped = 0
+            repeat(120) { index ->
+                completion = CountDownLatch(1)
+                if (processor.offer(frame(), 0)) {
+                    accepted++
+                    assertTrue(completion.await(2, TimeUnit.SECONDS))
+                } else {
+                    dropped++
+                }
+                if (index % 20 == 19) {
+                    nativePeak = maxOf(nativePeak, Debug.getNativeHeapAllocatedSize())
+                }
+                val nextOffer = started + (index + 1) * 250L
+                SystemClock.sleep(maxOf(0L, nextOffer - SystemClock.elapsedRealtime()))
+            }
+            assertTrue(processor.awaitIdle(2_000))
+            val elapsed = SystemClock.elapsedRealtime() - started
+            val allocated = artStat("art.gc.bytes-allocated") - allocatedBefore
+            val freed = artStat("art.gc.bytes-freed") - freedBefore
+            val nativeAfter = Debug.getNativeHeapAllocatedSize()
+            assertTrue(elapsed in 30_000..50_000)
+            assertTrue(accepted > 0)
+            assertEquals(120, accepted + dropped)
+            assertEquals(accepted + 2, published.get())
+            assertEquals(244, closed.get())
+            assertTrue("minimum retained samples ${minimumSamples.get()}", minimumSamples.get() >= 1_400)
+            assertTrue(allocated >= 0 && freed >= 0)
+            val allocationRate = allocated * 60_000 / elapsed
+            // The full-slot primitive-read emulator baseline was 9.9 MiB/min
+            // at four Hz. This guard catches per-pixel boxing before a future
+            // pooled observation representation reduces sample churn.
+            assertTrue("ART allocation rate $allocationRate", allocationRate <= 32L * 1024L * 1024L)
+            Log.i(
+                "RawDepthAllocationRate",
+                "depth_2000x2000_duration_ms=$elapsed offered=120 accepted=$accepted dropped=$dropped " +
+                    "minimum_retained_samples=${minimumSamples.get()} " +
+                    "art_allocated_bytes_per_minute=$allocationRate " +
+                    "art_freed_bytes_per_minute=${freed * 60_000 / elapsed} " +
+                    "art_gc_count=${artStat("art.gc.gc-count") - gcBefore} " +
+                    "native_heap_start_bytes=$nativeBefore native_heap_end_bytes=$nativeAfter " +
+                    "native_heap_peak_sample_bytes=$nativePeak",
+            )
+        } finally {
+            processor.close()
+        }
+    }
+
+    private fun artStat(name: String): Long = Debug.getRuntimeStat(name)!!.toLong()
+
+    private class SyntheticImage(
+        override val width: Int,
+        override val height: Int,
+        private val closed: AtomicInteger,
+        private val foreground: Boolean,
+    ) : RawDepthImage {
+        private val wasClosed = AtomicBoolean()
+        override fun unsignedValue(x: Int, y: Int): Int =
+            if (!foreground) 255 else if ((x / 32) % 2 == 0) 500 else 1_000
+        override fun close() {
+            if (wasClosed.compareAndSet(false, true)) closed.incrementAndGet()
+        }
+    }
+}

@@ -41,7 +41,7 @@ class RawDepthCopySourceTest {
         val result = source.acquire(metadata(width = 100, height = 100))
 
         assertTrue(result is DepthAcquisitionResult.Observation)
-        assertEquals(64, (result as DepthAcquisitionResult.Observation).value.samples.size)
+        assertTrue((result as DepthAcquisitionResult.Observation).value.samples.size in 1..64)
         assertEquals(
             DepthImageOrientation.LANDSCAPE_RIGHT,
             result.value.imageOrientation,
@@ -51,7 +51,7 @@ class RawDepthCopySourceTest {
     }
 
     @Test
-    fun `large depth image samples across the frame without reading every pixel`() {
+    fun `large depth image scans pixels with bounded retained samples`() {
         var depthReads = 0
         var confidenceReads = 0
         val depth = FakeRawDepthImage(width = 2_000, height = 2_000) { _, _ ->
@@ -71,14 +71,108 @@ class RawDepthCopySourceTest {
 
         assertTrue(result is DepthAcquisitionResult.Observation)
         val samples = (result as DepthAcquisitionResult.Observation).value.samples
-        assertEquals(V2_DEPTH_SAMPLE_CAPACITY, samples.size)
+        assertTrue(samples.size in 1_400..V2_DEPTH_SAMPLE_CAPACITY)
         assertEquals(DepthPixelSample(0, 0, 1_000, 255), samples.first())
-        assertTrue(samples.maxOf { it.y } >= 1_998)
-        assertTrue(samples.map { it.x }.toSet().size > 100)
-        assertTrue(depthReads <= V2_DEPTH_SAMPLE_CAPACITY * 5)
-        assertEquals(V2_DEPTH_SAMPLE_CAPACITY, confidenceReads)
+        assertTrue(samples.maxOf { it.y } >= 1_995)
+        assertTrue(samples.maxOf { it.x } >= 1_990)
+        assertTrue(depthReads in 4_000_000..4_200_000)
+        assertTrue(confidenceReads in 4_000_000..4_100_000)
         assertEquals(1, depth.closeCount)
         assertEquals(1, confidence.closeCount)
+    }
+
+    @Test
+    fun `small foreground patch survives large image depth selection`() {
+        val depth = FakeRawDepthImage(width = 2_000, height = 2_000) { x, y ->
+            if (x in 990..1_001 && y in 990..1_001) 500 else 1_000
+        }
+        val confidence = FakeRawDepthImage(width = 2_000, height = 2_000, value = 255)
+        val source = RawDepthCopySource(
+            acquirer = FakePairedAcquirer(depth, confidence),
+            maxCopiedPixels = V2_DEPTH_SAMPLE_CAPACITY,
+        )
+
+        val result = source.acquire(metadata(width = 2_000, height = 2_000))
+            as DepthAcquisitionResult.Observation
+        assertTrue(result.value.samples.size <= V2_DEPTH_SAMPLE_CAPACITY)
+        assertTrue(result.value.samples.any { sample ->
+            sample.x in 991..1_000 && sample.y in 991..1_000 &&
+                sample.depthMillimeters == 500
+        })
+        assertEquals(1, depth.closeCount)
+        assertEquals(1, confidence.closeCount)
+    }
+
+    @Test
+    fun `isolated near noise does not hide a small foreground patch`() {
+        val depth = FakeRawDepthImage(width = 2_000, height = 2_000) { x, y ->
+            when {
+                x == 970 && y == 970 -> 200
+                x in 990..1_001 && y in 980..991 -> 500
+                else -> 1_000
+            }
+        }
+        val confidence = FakeRawDepthImage(width = 2_000, height = 2_000, value = 255)
+        val source = RawDepthCopySource(
+            acquirer = FakePairedAcquirer(depth, confidence),
+            maxCopiedPixels = V2_DEPTH_SAMPLE_CAPACITY,
+        )
+        val result = source.acquire(metadata(width = 2_000, height = 2_000))
+            as DepthAcquisitionResult.Observation
+        assertTrue(result.value.samples.any { sample ->
+            sample.depthMillimeters == 500 && sample.x in 991..1_000 && sample.y in 981..990
+        })
+        assertTrue(result.value.samples.none { it.depthMillimeters == 200 })
+    }
+
+    @Test
+    fun `two small surfaces in one tile both survive bounded selection`() {
+        val depth = FakeRawDepthImage(width = 2_000, height = 2_000) { x, y ->
+            when {
+                x in 980..991 && y in 980..991 -> 500
+                x in 1_005..1_016 && y in 980..991 -> 700
+                else -> 1_000
+            }
+        }
+        val source = RawDepthCopySource(
+            acquirer = FakePairedAcquirer(
+                depth, FakeRawDepthImage(width = 2_000, height = 2_000, value = 255),
+            ),
+            maxCopiedPixels = V2_DEPTH_SAMPLE_CAPACITY,
+        )
+
+        val result = source.acquire(metadata(width = 2_000, height = 2_000))
+            as DepthAcquisitionResult.Observation
+        assertTrue(result.value.samples.size <= V2_DEPTH_SAMPLE_CAPACITY)
+        assertTrue(result.value.samples.any { it.depthMillimeters == 500 })
+        assertTrue(result.value.samples.any { it.depthMillimeters == 700 })
+    }
+
+    @Test
+    fun `two thousand pixel depth selection finishes within one second`() {
+        val source = RawDepthCopySource(
+            acquirer = object : PairedRawDepthAcquirer {
+                override fun acquireDepth(): RawDepthImage =
+                    FakeRawDepthImage(2_000, 2_000) { x, y ->
+                        if (x in 990..1_001 && y in 990..1_001) 500 else 1_000
+                    }
+
+                override fun acquireConfidence(): RawDepthImage =
+                    FakeRawDepthImage(2_000, 2_000, 255)
+            },
+            maxCopiedPixels = V2_DEPTH_SAMPLE_CAPACITY,
+        )
+        val frame = metadata(width = 2_000, height = 2_000)
+        repeat(2) { source.acquire(frame) }
+        val durations = (1..3).map {
+            val started = System.nanoTime()
+            val result = source.acquire(frame) as DepthAcquisitionResult.Observation
+            assertTrue(result.value.samples.any { it.depthMillimeters == 500 })
+            System.nanoTime() - started
+        }
+        val worstMillis = durations.max() / 1_000_000.0
+        println("depth_selection_2000x2000_worst_ms=$worstMillis")
+        assertTrue("Depth selection took ${worstMillis}ms", worstMillis < 1_000.0)
     }
 
     @Test

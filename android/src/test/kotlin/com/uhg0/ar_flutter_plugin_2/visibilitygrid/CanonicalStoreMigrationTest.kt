@@ -587,6 +587,8 @@ class CanonicalStoreMigrationTest {
         version: Int = 3,
         unsortedSources: Boolean = false,
         includeCanonicalCurrent: Boolean = false,
+        geometryRevision: Long = 4,
+        lineageRevision: Long = 3,
     ) {
         require(version in 3..5)
         require(!includeCanonicalCurrent || version >= 4)
@@ -628,8 +630,8 @@ class CanonicalStoreMigrationTest {
                 )
             }
             out.writeInt(0)
-            out.writeLong(4)
-            out.writeLong(3)
+            out.writeLong(geometryRevision)
+            out.writeLong(lineageRevision)
             out.writeInt(100_000)
             repeat(100_000) { targetIndex ->
                 out.writeLong(maximumRowId(targetIndex))
@@ -654,7 +656,7 @@ class CanonicalStoreMigrationTest {
                 out.writeLong(2)
             }
             if (includeCanonicalCurrent) {
-                val canonical = maximumCanonicalReceipt(group)
+                val canonical = maximumCanonicalReceipt(group, geometryRevision, lineageRevision)
                 out.writeInt(1)
                 out.write(ByteArray(32) { 0x61 })
                 out.write(ByteArray(32) { 0x62 })
@@ -668,12 +670,17 @@ class CanonicalStoreMigrationTest {
         }
     }
 
-    private fun maximumCanonicalReceipt(group: SurfaceGroup) =
+    private fun maximumCanonicalReceipt(
+        group: SurfaceGroup,
+        geometryRevision: Long,
+        lineageRevision: Long,
+    ) =
         java.io.ByteArrayOutputStream().use { raw ->
             DataOutputStream(raw).use { out ->
                 out.writeInt(0x4d334352); out.writeInt(1); out.writeUTF(group.value)
                 out.writeUTF("maximum-current"); out.writeInt(CanonicalOperation.RELOCATION.ordinal)
-                out.writeLong(4); out.writeLong(3); out.writeLong(0x1_0000_0000L); out.writeInt(100_000)
+                out.writeLong(geometryRevision); out.writeLong(lineageRevision)
+                out.writeLong(0x1_0000_0000L); out.writeInt(100_000)
                 repeat(4) { out.writeInt(0) }
             }
             raw.toByteArray()

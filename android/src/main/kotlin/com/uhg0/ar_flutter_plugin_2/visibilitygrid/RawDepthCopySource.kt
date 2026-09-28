@@ -99,28 +99,126 @@ class RawDepthCopySource(
         depth: RawDepthImage,
         confidence: RawDepthImage,
     ): DepthAcquisitionResult.Observation {
-        val pixelCount = depth.width * depth.height
-        val stride = maxOf(1, (pixelCount + maxCopiedPixels - 1) / maxCopiedPixels)
+        require(depth.width in 1..16_384 && depth.height in 1..16_384)
+        val pixelCount = Math.multiplyExact(depth.width, depth.height)
         val samples = ArrayList<DepthPixelSample>(minOf(pixelCount, maxCopiedPixels))
         var rejected = 0
-        var index = 0
-        while (index < pixelCount && samples.size < maxCopiedPixels) {
-            val x = index % depth.width
-            val y = index / depth.width
-            val depthMillimeters = depth.unsignedValue(x, y)
-            val confidenceValue = confidence.unsignedValue(x, y)
-            if (isDiscontinuity(depth, x, y, depthMillimeters)) {
-                rejected++
-            } else {
-                samples +=
-                    DepthPixelSample(
-                        x = x,
-                        y = y,
-                        depthMillimeters = depthMillimeters,
-                        confidence = confidenceValue,
-                    )
+        if (pixelCount <= maxCopiedPixels) {
+            for (y in 0 until depth.height) {
+                for (x in 0 until depth.width) {
+                    val depthMillimeters = depth.unsignedValue(x, y)
+                    val confidenceValue = confidence.unsignedValue(x, y)
+                    if (depthMillimeters == 0 || confidenceValue == 0 ||
+                        isDiscontinuity(depth, x, y, depthMillimeters)
+                    ) {
+                        rejected++
+                    } else {
+                        samples += DepthPixelSample(x, y, depthMillimeters, confidenceValue)
+                    }
+                }
             }
-            index += stride
+        } else {
+            // Each tile keeps a near point and a distinct second surface when
+            // present, otherwise a far background point.
+            // Scan the source once so a small object between fixed sample centers
+            // can contribute without retaining one object per image pixel.
+            val tileBudget = maxOf(1, maxCopiedPixels / 2)
+            val columns = kotlin.math.sqrt(
+                tileBudget.toDouble() * depth.width / depth.height,
+            ).toInt().coerceIn(1, minOf(depth.width, tileBudget))
+            val rows = minOf(depth.height, maxOf(1, tileBudget / columns))
+            for (tileY in 0 until rows) {
+                val top = tileY * depth.height / rows
+                val bottom = (tileY + 1) * depth.height / rows
+                for (tileX in 0 until columns) {
+                    val left = tileX * depth.width / columns
+                    val right = (tileX + 1) * depth.width / columns
+                    var nearDepth = Int.MAX_VALUE
+                    var nearX = -1
+                    var nearY = -1
+                    var secondDepth = Int.MAX_VALUE
+                    var secondX = -1
+                    var secondY = -1
+                    var farDepth = 0
+                    var farX = -1
+                    var farY = -1
+                    for (y in top until bottom) {
+                        for (x in left until right) {
+                            val value = depth.unsignedValue(x, y)
+                            val certainty = confidence.unsignedValue(x, y)
+                            if (value == 0 || certainty == 0) {
+                                rejected++
+                                continue
+                            }
+                            if (value < nearDepth) {
+                                if (nearDepth != Int.MAX_VALUE &&
+                                    nearDepth - value > discontinuityThresholdMillimeters &&
+                                    nearDepth < secondDepth
+                                ) {
+                                    secondDepth = nearDepth
+                                    secondX = nearX
+                                    secondY = nearY
+                                }
+                                nearDepth = value
+                                nearX = x
+                                nearY = y
+                            } else if (value - nearDepth > discontinuityThresholdMillimeters &&
+                                value < secondDepth
+                            ) {
+                                secondDepth = value
+                                secondX = x
+                                secondY = y
+                            }
+                            if (value >= farDepth) {
+                                farDepth = value
+                                farX = x
+                                farY = y
+                            }
+                        }
+                    }
+                    var selectedNear: DepthPixelSample? = null
+                    if (nearX >= 0) {
+                        selectedNear = stableSample(
+                            depth, confidence, nearX, nearY, nearDepth,
+                            left, top, right, bottom,
+                        )
+                        if (selectedNear == null) {
+                            rejected++
+                            if (secondX >= 0) {
+                                selectedNear = stableSample(
+                                    depth, confidence, secondX, secondY, secondDepth,
+                                    left, top, right, bottom,
+                                )
+                                if (selectedNear == null) rejected++
+                            }
+                        }
+                        selectedNear?.let(samples::add)
+                    }
+                    if (farX >= 0 && samples.size < maxCopiedPixels) {
+                        // Spend the second slot on another stable foreground
+                        // surface when a tile contains two small objects.
+                        // Background depth remains represented by adjacent tiles.
+                        var second: DepthPixelSample? = null
+                        if (secondX >= 0 &&
+                            farDepth - secondDepth > discontinuityThresholdMillimeters &&
+                            selectedNear?.let { it.x != secondX || it.y != secondY } != false
+                        ) {
+                            second = stableSample(
+                                depth, confidence, secondX, secondY, secondDepth,
+                                left, top, right, bottom,
+                            )
+                            if (second == null) rejected++
+                        }
+                        val farther = second ?: stableSample(
+                            depth, confidence, farX, farY, farDepth,
+                            left, top, right, bottom,
+                        )
+                        if (farther == null) rejected++ else if (
+                            selectedNear?.let { it.x != farther.x || it.y != farther.y } != false
+                        ) samples += farther
+                    }
+                }
+            }
         }
         return DepthAcquisitionResult.Observation(
             DepthObservation(
@@ -137,6 +235,31 @@ class RawDepthCopySource(
                 imageOrientation = metadata.imageOrientation,
             ),
         )
+    }
+
+    private fun stableSample(
+        depth: RawDepthImage,
+        confidence: RawDepthImage,
+        x: Int,
+        y: Int,
+        targetDepth: Int,
+        left: Int,
+        top: Int,
+        right: Int,
+        bottom: Int,
+    ): DepthPixelSample? {
+        for (candidateY in maxOf(top, y - 2) until minOf(bottom, y + 3)) {
+            for (candidateX in maxOf(left, x - 2) until minOf(right, x + 3)) {
+                val value = depth.unsignedValue(candidateX, candidateY)
+                if (value == 0 || kotlin.math.abs(value - targetDepth) >
+                    discontinuityThresholdMillimeters / 2
+                ) continue
+                val certainty = confidence.unsignedValue(candidateX, candidateY)
+                if (certainty == 0 || isDiscontinuity(depth, candidateX, candidateY, value)) continue
+                return DepthPixelSample(candidateX, candidateY, value, certainty)
+            }
+        }
+        return null
     }
 
     private fun isDiscontinuity(

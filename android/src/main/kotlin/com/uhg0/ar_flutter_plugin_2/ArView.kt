@@ -8,6 +8,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.widget.FrameLayout
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
@@ -42,6 +43,7 @@ import com.uhg0.ar_flutter_plugin_2.visibilitygrid.NativeRendererProjection
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.CanonicalRuntimeResources
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.AndroidVisibilityGridRuntime
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.ArCoreVisibilityObservationSource
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.DepthObservationPauseGate
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityObservationDebugChannel
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityObservationDebugGate
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityCaptureSafePredicate
@@ -175,6 +177,10 @@ internal class ArView(
         runtime = visibilityObservationRuntime,
         ownership = visibilityGridV2Binding::currentObservationOwnership,
         depthMode = sceneHost::visibilityGridDepthMode,
+    )
+    private val depthPauseGate = DepthObservationPauseGate(
+        suspendDepth = visibilityObservationSource::suspendDepth,
+        resumeDepth = visibilityObservationSource::resumeDepth,
     )
     private val visibilityObservationDebugChannel = VisibilityObservationDebugChannel(
         messenger = messenger,
@@ -389,6 +395,7 @@ internal class ArView(
         captureChannel.setMethodCallHandler(null)
         visibilitySmallSceneDebugChannel.dispose()
         visibilityObservationDebugChannel.dispose()
+        visibilityObservationSource.close()
         visibilityObservationRuntime.close()
         visibilityStorageBudgetCoordinator.close()
         visibilityGridV2Binding.dispose()
@@ -427,24 +434,38 @@ internal class ArView(
     }
 
     private fun prepareCapturePause(onCompleted: (Result<Unit>) -> Unit) {
+        depthPauseGate.begin()
         capturePauseOperations += 1
-        if (!captureSession.prepareNativeCaptureForPause { result ->
-                if (result.isSuccess) {
-                    sceneHost.pause()
-                    visibilityObservationRuntime.pause()
-                    captureSafetySignalV2.invalidateAll()
-                    captureSession.finishSharedCameraPause()
+        val settled = AtomicBoolean(false)
+        fun finish(preparation: Result<Unit>) {
+            if (!settled.compareAndSet(false, true)) return
+            val terminal = if (preparation.isSuccess) runCatching {
+                check(visibilityObservationSource.awaitDepthIdle(1_000)) {
+                    "Depth image did not drain before pause"
                 }
-                onCompleted(result)
+                sceneHost.pause()
+                visibilityObservationRuntime.pause()
+                captureSafetySignalV2.invalidateAll()
+                captureSession.finishSharedCameraPause()
+                Unit
+            } else preparation
+            depthPauseGate.complete(terminal.isSuccess)
+            try {
+                onCompleted(terminal)
+            } finally {
                 capturePauseOperations -= 1
                 if (capturePauseOperations == 0) {
                     afterCapturePauseCallbacks.toList().forEach { it() }
                     afterCapturePauseCallbacks.clear()
                 }
             }
-        ) {
-            capturePauseOperations -= 1
-            onCompleted(Result.failure(IllegalStateException("Native capture durable owner is closing")))
+        }
+        try {
+            if (!captureSession.prepareNativeCaptureForPause(::finish)) {
+                finish(Result.failure(IllegalStateException("Native capture durable owner is closing")))
+            }
+        } catch (error: Exception) {
+            finish(Result.failure(error))
         }
     }
 
@@ -570,6 +591,7 @@ internal class ArView(
                             if (clearFlutterPause) sessionPausedByFlutter = false
                             if (!sessionPausedByFlutter) {
                                 visibilityObservationRuntime.resume()
+                                depthPauseGate.resumed()
                                 captureSession.onSessionResumed()
                             }
                         }

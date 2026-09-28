@@ -23,6 +23,22 @@ internal sealed interface VisibilityDepthCopyResult {
     data class Rejected(val reason: String) : VisibilityDepthCopyResult
 }
 
+internal sealed interface PreparedVisibilityDepthResult {
+    data class Ready(val frame: PreparedVisibilityDepthFrame) : PreparedVisibilityDepthResult
+    data object TransientUnavailable : PreparedVisibilityDepthResult
+    data class Rejected(val reason: String) : PreparedVisibilityDepthResult
+}
+
+internal class PreparedVisibilityDepthFrame(
+    val raw: PreparedRawDepthFrame,
+    val ownership: VisibilityObservationOwnership,
+    val depthCapability: VisibilityDepthCapability,
+    val frameSequence: Long,
+    val frameTimestampNs: Long,
+) : AutoCloseable {
+    override fun close() = raw.close()
+}
+
 internal sealed interface VisibilityFeatureSamplesCopyResult {
     data class Samples(
         val values: List<VisibilityFeatureSample>,
@@ -157,66 +173,106 @@ internal class ArCoreVisibilityObservationAdapter(
         if (depthCapability == VisibilityDepthCapability.UNSUPPORTED) {
             return VisibilityDepthCopyResult.Rejected("depth is unsupported")
         }
-        return when (
-            val result = ArCoreRawDepthSource(
-                maxCopiedPixels = V2_DEPTH_SAMPLE_CAPACITY,
-                onResourceAcquired = resourceAcquired,
-                onResourceClosed = resourceClosed,
-            ).acquire(frame, ownership.groupGeneration, ownership.sessionGeneration)
-        ) {
-            is DepthAcquisitionResult.Observation -> {
-                try {
-                    val source = result.value
-                    val copied = VisibilityDepthObservation.copySamples(
-                        source.samples.map {
-                            VisibilityDepthSample(
-                                x = it.x,
-                                y = it.y,
-                                depthMillimeters = it.depthMillimeters,
-                                confidence = it.confidence,
-                            )
-                        },
-                    )
-                    if (copied.isEmpty()) {
-                        VisibilityDepthCopyResult.Rejected("depth observation has no valid samples")
-                    } else {
-                        VisibilityDepthCopyResult.Observation(
-                            VisibilityDepthObservation(
-                                ownership = ownership,
-                                frame = VisibilityObservationFrame(
-                                    source = VisibilityObservationSource.ARCORE_RAW_DEPTH,
-                                    frameSequence = frameSequence,
-                                    frameTimestampNs = frame.timestamp,
-                                    sourceTimestampNs = source.timestampNs,
-                                    cameraIdentity = "arcore-rear-camera",
-                                    tracking = source.tracking,
-                                    imageOrientation = "landscape_right_x_right_y_down_v1",
-                                    pose = VisibilityCameraPose.copyOf(source.worldFromCameraGl),
-                                    intrinsics = VisibilityCameraIntrinsics(
-                                        imageWidth = source.width,
-                                        imageHeight = source.height,
-                                        fx = source.intrinsics.fx,
-                                        fy = source.intrinsics.fy,
-                                        cx = source.intrinsics.cx,
-                                        cy = source.intrinsics.cy,
-                                    ),
-                                    depthCapability = depthCapability,
-                                ),
-                                samples = copied,
-                                sourceRejectedSamples = source.sourceRejectedPixels,
-                                payloadBytes = VisibilityDepthObservation.DEPTH_FIXED_BYTES +
-                                    copied.size * VisibilityDepthObservation.DEPTH_SAMPLE_BYTES,
-                            ),
-                        )
-                    }
-                } catch (error: IllegalArgumentException) {
-                    VisibilityDepthCopyResult.Rejected(error.message ?: "invalid depth metadata")
-                }
-            }
-            DepthAcquisitionResult.TransientUnavailable ->
-                VisibilityDepthCopyResult.TransientUnavailable
-            is DepthAcquisitionResult.Failure -> VisibilityDepthCopyResult.Rejected(result.reason)
+        val result = ArCoreRawDepthSource(
+            maxCopiedPixels = V2_DEPTH_SAMPLE_CAPACITY,
+            onResourceAcquired = resourceAcquired,
+            onResourceClosed = resourceClosed,
+        ).acquire(frame, ownership.groupGeneration, ownership.sessionGeneration)
+        return convertDepthResult(
+            result, ownership, depthCapability, frameSequence, frame.timestamp,
+        )
+    }
+
+    fun prepareDepth(
+        frame: Frame,
+        ownership: VisibilityObservationOwnership,
+        depthCapability: VisibilityDepthCapability,
+        frameSequence: Long,
+    ): PreparedVisibilityDepthResult {
+        if (depthCapability == VisibilityDepthCapability.UNSUPPORTED) {
+            return PreparedVisibilityDepthResult.Rejected("depth is unsupported")
         }
+        return when (val result = ArCoreRawDepthSource(
+            maxCopiedPixels = V2_DEPTH_SAMPLE_CAPACITY,
+            onResourceAcquired = resourceAcquired,
+            onResourceClosed = resourceClosed,
+        ).prepare(frame, ownership.groupGeneration, ownership.sessionGeneration)) {
+            is PreparedRawDepthResult.Ready -> PreparedVisibilityDepthResult.Ready(
+                PreparedVisibilityDepthFrame(
+                    result.frame, ownership, depthCapability, frameSequence, frame.timestamp,
+                ),
+            )
+            PreparedRawDepthResult.TransientUnavailable ->
+                PreparedVisibilityDepthResult.TransientUnavailable
+            is PreparedRawDepthResult.Failure -> PreparedVisibilityDepthResult.Rejected(result.reason)
+        }
+    }
+
+    fun finishDepth(prepared: PreparedVisibilityDepthFrame): VisibilityDepthCopyResult =
+        convertDepthResult(
+            prepared.raw.process(), prepared.ownership, prepared.depthCapability,
+            prepared.frameSequence, prepared.frameTimestampNs,
+        )
+
+    private fun convertDepthResult(
+        result: DepthAcquisitionResult,
+        ownership: VisibilityObservationOwnership,
+        depthCapability: VisibilityDepthCapability,
+        frameSequence: Long,
+        frameTimestampNs: Long,
+    ): VisibilityDepthCopyResult = when (result) {
+        is DepthAcquisitionResult.Observation -> {
+            try {
+                val source = result.value
+                val copied = VisibilityDepthObservation.copySamples(
+                    source.samples.map {
+                        VisibilityDepthSample(
+                            x = it.x,
+                            y = it.y,
+                            depthMillimeters = it.depthMillimeters,
+                            confidence = it.confidence,
+                        )
+                    },
+                )
+                if (copied.isEmpty()) {
+                    VisibilityDepthCopyResult.Rejected("depth observation has no valid samples")
+                } else {
+                    VisibilityDepthCopyResult.Observation(
+                        VisibilityDepthObservation(
+                            ownership = ownership,
+                            frame = VisibilityObservationFrame(
+                                source = VisibilityObservationSource.ARCORE_RAW_DEPTH,
+                                frameSequence = frameSequence,
+                                frameTimestampNs = frameTimestampNs,
+                                sourceTimestampNs = source.timestampNs,
+                                cameraIdentity = "arcore-rear-camera",
+                                tracking = source.tracking,
+                                imageOrientation = "landscape_right_x_right_y_down_v1",
+                                pose = VisibilityCameraPose.copyOf(source.worldFromCameraGl),
+                                intrinsics = VisibilityCameraIntrinsics(
+                                    imageWidth = source.width,
+                                    imageHeight = source.height,
+                                    fx = source.intrinsics.fx,
+                                    fy = source.intrinsics.fy,
+                                    cx = source.intrinsics.cx,
+                                    cy = source.intrinsics.cy,
+                                ),
+                                depthCapability = depthCapability,
+                            ),
+                            samples = copied,
+                            sourceRejectedSamples = source.sourceRejectedPixels,
+                            payloadBytes = VisibilityDepthObservation.DEPTH_FIXED_BYTES +
+                                copied.size * VisibilityDepthObservation.DEPTH_SAMPLE_BYTES,
+                        ),
+                    )
+                }
+            } catch (error: IllegalArgumentException) {
+                VisibilityDepthCopyResult.Rejected(error.message ?: "invalid depth metadata")
+            }
+        }
+        DepthAcquisitionResult.TransientUnavailable ->
+            VisibilityDepthCopyResult.TransientUnavailable
+        is DepthAcquisitionResult.Failure -> VisibilityDepthCopyResult.Rejected(result.reason)
     }
 
     private fun cameraFrame(
@@ -271,6 +327,32 @@ internal class ArCoreVisibilityObservationSource(
         resourceAcquired = runtime::recordProducerResourceAcquired,
         resourceClosed = runtime::recordProducerResourceClosed,
     )
+    private val depthProcessor = BoundedDepthObservationProcessor<
+        PreparedVisibilityDepthFrame, VisibilityDepthCopyResult
+    >(
+        process = adapter::finishDepth,
+        publish = { result, callbackCopyNs ->
+            when (result) {
+                is VisibilityDepthCopyResult.Observation ->
+                    runtime.offerDepth(result.value, callbackCopyNs)
+                VisibilityDepthCopyResult.TransientUnavailable ->
+                    runtime.recordDepthTransientUnavailable()
+                is VisibilityDepthCopyResult.Rejected -> runtime.recordDepthFailure()
+            }
+        },
+        onFailure = { runtime.recordDepthFailure() },
+    )
+
+    private val depthAdmissionLock = Any()
+    private var depthSuspended = false
+
+    fun suspendDepth() = synchronized(depthAdmissionLock) { depthSuspended = true }
+
+    fun resumeDepth() = synchronized(depthAdmissionLock) { depthSuspended = false }
+
+    fun awaitDepthIdle(timeoutMillis: Long): Boolean = depthProcessor.awaitIdle(timeoutMillis)
+
+    fun close() = depthProcessor.close()
 
     fun onFrame(frame: Frame) {
         if (runtime.isSyntheticSource()) return
@@ -297,14 +379,16 @@ internal class ArCoreVisibilityObservationSource(
                 is VisibilityFeatureCopyResult.Rejected -> runtime.recordFeatureFailure()
             }
         }
-        if (runtime.shouldCopyDepth(frame.timestamp)) {
-            val started = System.nanoTime()
-            when (val result = adapter.copyDepth(frame, cut, capability, sequence)) {
-                is VisibilityDepthCopyResult.Observation ->
-                    runtime.offerDepth(result.value, System.nanoTime() - started)
-                VisibilityDepthCopyResult.TransientUnavailable ->
-                    runtime.recordDepthTransientUnavailable()
-                is VisibilityDepthCopyResult.Rejected -> runtime.recordDepthFailure()
+        synchronized(depthAdmissionLock) {
+            if (!depthSuspended && runtime.shouldCopyDepth(frame.timestamp)) {
+                val started = System.nanoTime()
+                when (val result = adapter.prepareDepth(frame, cut, capability, sequence)) {
+                    is PreparedVisibilityDepthResult.Ready ->
+                        depthProcessor.offer(result.frame, System.nanoTime() - started)
+                    PreparedVisibilityDepthResult.TransientUnavailable ->
+                        runtime.recordDepthTransientUnavailable()
+                    is PreparedVisibilityDepthResult.Rejected -> runtime.recordDepthFailure()
+                }
             }
         }
     }
