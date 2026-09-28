@@ -25,10 +25,10 @@ class RawDepthSelectionAndroidTest {
             depthPixels.putShort(index * 2, 1_000.toShort())
             confidencePixels.put(index, 255.toByte())
         }
-        for (y in 980..991) for (x in 980..991) {
+        for (y in 980..982) for (x in 980..982) {
             depthPixels.putShort((y * width + x) * 2, 500.toShort())
         }
-        for (y in 980..991) for (x in 1_005..1_016) {
+        for (y in 980..982) for (x in 1_005..1_007) {
             depthPixels.putShort((y * width + x) * 2, 700.toShort())
         }
         val source = RawDepthCopySource(
