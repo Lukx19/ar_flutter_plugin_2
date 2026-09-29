@@ -118,15 +118,17 @@ class RawDepthCopySource(
                 }
             }
         } else {
-            // Each tile keeps a near point and a distinct second surface when
-            // present, otherwise a far background point.
-            // Scan the source once so a small object between fixed sample centers
-            // can contribute without retaining one object per image pixel.
-            val tileBudget = maxOf(1, maxCopiedPixels / 2)
+            // Reserve one spatial representative per tile, then spend spare
+            // slots on distinct depth layers. Flat tiles no longer consume a
+            // second slot that a small foreground surface elsewhere needs.
+            // The full source is scanned once without a per-pixel object array.
+            val tileBudget = maxOf(1, maxCopiedPixels * 3 / 4)
             val columns = kotlin.math.sqrt(
                 tileBudget.toDouble() * depth.width / depth.height,
             ).toInt().coerceIn(1, minOf(depth.width, tileBudget))
             val rows = minOf(depth.height, maxOf(1, tileBudget / columns))
+            val secondLayer = ArrayList<DepthPixelSample>()
+            val thirdLayer = ArrayList<DepthPixelSample>()
             for (tileY in 0 until rows) {
                 val top = tileY * depth.height / rows
                 val bottom = (tileY + 1) * depth.height / rows
@@ -139,9 +141,9 @@ class RawDepthCopySource(
                     var secondDepth = Int.MAX_VALUE
                     var secondX = -1
                     var secondY = -1
-                    var farDepth = 0
-                    var farX = -1
-                    var farY = -1
+                    var thirdDepth = Int.MAX_VALUE
+                    var thirdX = -1
+                    var thirdY = -1
                     for (y in top until bottom) {
                         for (x in left until right) {
                             val value = depth.unsignedValue(x, y)
@@ -152,9 +154,11 @@ class RawDepthCopySource(
                             }
                             if (value < nearDepth) {
                                 if (nearDepth != Int.MAX_VALUE &&
-                                    nearDepth - value > discontinuityThresholdMillimeters &&
-                                    nearDepth < secondDepth
+                                    nearDepth - value > discontinuityThresholdMillimeters
                                 ) {
+                                    thirdDepth = secondDepth
+                                    thirdX = secondX
+                                    thirdY = secondY
                                     secondDepth = nearDepth
                                     secondX = nearX
                                     secondY = nearY
@@ -165,14 +169,23 @@ class RawDepthCopySource(
                             } else if (value - nearDepth > discontinuityThresholdMillimeters &&
                                 value < secondDepth
                             ) {
+                                if (secondDepth != Int.MAX_VALUE &&
+                                    secondDepth - value > discontinuityThresholdMillimeters
+                                ) {
+                                    thirdDepth = secondDepth
+                                    thirdX = secondX
+                                    thirdY = secondY
+                                }
                                 secondDepth = value
                                 secondX = x
                                 secondY = y
-                            }
-                            if (value >= farDepth) {
-                                farDepth = value
-                                farX = x
-                                farY = y
+                            } else if (secondDepth != Int.MAX_VALUE &&
+                                value - secondDepth > discontinuityThresholdMillimeters &&
+                                value < thirdDepth
+                            ) {
+                                thirdDepth = value
+                                thirdX = x
+                                thirdY = y
                             }
                         }
                     }
@@ -191,32 +204,44 @@ class RawDepthCopySource(
                                 )
                                 if (selectedNear == null) rejected++
                             }
+                            if (selectedNear == null && thirdX >= 0) {
+                                selectedNear = stableSample(
+                                    depth, confidence, thirdX, thirdY, thirdDepth,
+                                    left, top, right, bottom,
+                                )
+                                if (selectedNear == null) rejected++
+                            }
                         }
                         selectedNear?.let(samples::add)
                     }
-                    if (farX >= 0 && samples.size < maxCopiedPixels) {
-                        // Spend the second slot on another stable foreground
-                        // surface when a tile contains two small objects.
-                        // Background depth remains represented by adjacent tiles.
-                        var second: DepthPixelSample? = null
-                        if (secondX >= 0 &&
-                            farDepth - secondDepth > discontinuityThresholdMillimeters &&
-                            selectedNear?.let { it.x != secondX || it.y != secondY } != false
-                        ) {
-                            second = stableSample(
+                    if (secondX >= 0 && secondDepth - nearDepth >
+                        discontinuityThresholdMillimeters
+                    ) {
+                        val second = stableSample(
                                 depth, confidence, secondX, secondY, secondDepth,
                                 left, top, right, bottom,
                             )
-                            if (second == null) rejected++
+                        if (second == null) rejected++ else if (second != selectedNear) {
+                            secondLayer += second
                         }
-                        val farther = second ?: stableSample(
-                            depth, confidence, farX, farY, farDepth,
+                    }
+                    if (thirdX >= 0 && thirdDepth - secondDepth >
+                        discontinuityThresholdMillimeters
+                    ) {
+                        val third = stableSample(
+                            depth, confidence, thirdX, thirdY, thirdDepth,
                             left, top, right, bottom,
                         )
-                        if (farther == null) rejected++ else if (
-                            selectedNear?.let { it.x != farther.x || it.y != farther.y } != false
-                        ) samples += farther
+                        if (third == null) rejected++ else if (third != selectedNear) {
+                            thirdLayer += third
+                        }
                     }
+                }
+            }
+            for (layer in listOf(secondLayer, thirdLayer)) {
+                for (sample in layer) {
+                    if (samples.size == maxCopiedPixels) break
+                    samples += sample
                 }
             }
         }

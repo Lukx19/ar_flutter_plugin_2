@@ -71,10 +71,10 @@ class RawDepthCopySourceTest {
 
         assertTrue(result is DepthAcquisitionResult.Observation)
         val samples = (result as DepthAcquisitionResult.Observation).value.samples
-        assertTrue(samples.size in 1_400..V2_DEPTH_SAMPLE_CAPACITY)
+        assertTrue(samples.size in 1_000..V2_DEPTH_SAMPLE_CAPACITY)
         assertEquals(DepthPixelSample(0, 0, 1_000, 255), samples.first())
-        assertTrue(samples.maxOf { it.y } >= 1_995)
-        assertTrue(samples.maxOf { it.x } >= 1_990)
+        assertTrue(samples.maxOf { it.y } >= 1_900)
+        assertTrue(samples.maxOf { it.x } >= 1_900)
         assertTrue(depthReads in 4_000_000..4_200_000)
         assertTrue(confidenceReads in 4_000_000..4_100_000)
         assertEquals(1, depth.closeCount)
@@ -146,6 +146,33 @@ class RawDepthCopySourceTest {
         assertTrue(result.value.samples.size <= V2_DEPTH_SAMPLE_CAPACITY)
         assertTrue(result.value.samples.any { it.depthMillimeters == 500 })
         assertTrue(result.value.samples.any { it.depthMillimeters == 700 })
+    }
+
+    @Test
+    fun `three adjacent tiny surfaces survive content-aware depth selection`() {
+        val depth = FakeRawDepthImage(width = 2_000, height = 2_000) { x, y ->
+            when {
+                x in 969..971 && y in 970..972 -> 400
+                x in 995..997 && y in 970..972 -> 600
+                x in 1_020..1_022 && y in 970..972 -> 800
+                else -> 1_000
+            }
+        }
+        val source = RawDepthCopySource(
+            acquirer = FakePairedAcquirer(
+                depth, FakeRawDepthImage(width = 2_000, height = 2_000, value = 255),
+            ),
+            maxCopiedPixels = V2_DEPTH_SAMPLE_CAPACITY,
+        )
+
+        val result = source.acquire(metadata(width = 2_000, height = 2_000))
+            as DepthAcquisitionResult.Observation
+        assertTrue(result.value.samples.size <= V2_DEPTH_SAMPLE_CAPACITY)
+        for (foregroundDepth in listOf(400, 600, 800)) {
+            assertTrue("Missing ${foregroundDepth}mm foreground", result.value.samples.any {
+                it.depthMillimeters == foregroundDepth
+            })
+        }
     }
 
     @Test

@@ -25,11 +25,14 @@ class RawDepthSelectionAndroidTest {
             depthPixels.putShort(index * 2, 1_000.toShort())
             confidencePixels.put(index, 255.toByte())
         }
-        for (y in 980..982) for (x in 980..982) {
-            depthPixels.putShort((y * width + x) * 2, 500.toShort())
+        for (y in 970..972) for (x in 969..971) {
+            depthPixels.putShort((y * width + x) * 2, 400.toShort())
         }
-        for (y in 980..982) for (x in 1_005..1_007) {
-            depthPixels.putShort((y * width + x) * 2, 700.toShort())
+        for (y in 970..972) for (x in 995..997) {
+            depthPixels.putShort((y * width + x) * 2, 600.toShort())
+        }
+        for (y in 970..972) for (x in 1_020..1_022) {
+            depthPixels.putShort((y * width + x) * 2, 800.toShort())
         }
         val source = RawDepthCopySource(
             acquirer = object : PairedRawDepthAcquirer {
@@ -61,8 +64,9 @@ class RawDepthSelectionAndroidTest {
             val started = SystemClock.elapsedRealtimeNanos()
             val observation = source.acquire(metadata) as DepthAcquisitionResult.Observation
             assertTrue(observation.value.samples.size <= V2_DEPTH_SAMPLE_CAPACITY)
-            assertTrue(observation.value.samples.any { it.depthMillimeters == 500 })
-            assertTrue(observation.value.samples.any { it.depthMillimeters == 700 })
+            assertTrue(observation.value.samples.any { it.depthMillimeters == 400 })
+            assertTrue(observation.value.samples.any { it.depthMillimeters == 600 })
+            assertTrue(observation.value.samples.any { it.depthMillimeters == 800 })
             SystemClock.elapsedRealtimeNanos() - started
         }
         val worstMillis = durations.max() / 1_000_000.0
