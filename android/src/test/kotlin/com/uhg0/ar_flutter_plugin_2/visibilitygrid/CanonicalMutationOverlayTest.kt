@@ -217,13 +217,14 @@ class CanonicalMutationOverlayTest {
         assertTrue(maximum.work.constructionPeakBytes <= CompactCanonicalStore.JOURNAL_RESERVE_BYTES)
         assertEquals(
             maximum.work.fixedOwnerBytes + maximum.work.rowArrayBytes + maximum.work.removedArrayBytes +
-                maximum.work.supportArrayBytes,
+                maximum.work.supportArrayBytes + maximum.work.removedRouteBytes,
             maximum.work.retainedPlanBytes,
         )
         assertEquals(
             maximum.work.fixedOwnerBytes + maximum.work.writerScratchBytes + maximum.work.planningPageScratchBytes +
                 maximum.work.rowConstructionBytes + maximum.work.removedConstructionBytes +
-                maximum.work.supportConstructionArrayPeakBytes + maximum.work.supportHashBytes,
+                maximum.work.supportConstructionArrayPeakBytes + maximum.work.supportHashBytes +
+                maximum.work.removedRouteBytes,
             maximum.work.constructionPeakBytes,
         )
         val planGraph = GraphLayout.parseInstance(maximum).totalSize()
@@ -358,9 +359,9 @@ class CanonicalMutationOverlayTest {
         const val EXPECTED_ONE_ROW_ENCODED_BYTES = 244
         const val EXPECTED_ONE_ROW_STAGING_BYTES = 73_788L
         const val EXPECTED_MAX_ENCODED_BYTES = 557_325
-        const val EXPECTED_MAX_RETAINED_BYTES = 499_780L
+        const val EXPECTED_MAX_RETAINED_BYTES = 499_876L
         const val EXPECTED_WRITER_SCRATCH_BYTES = 65_536L
-        const val EXPECTED_MAX_CONSTRUCTION_PEAK_BYTES = 942_376L
+        const val EXPECTED_MAX_CONSTRUCTION_PEAK_BYTES = 942_472L
     }
     private fun rows(plan: PreparedCanonicalMutation) = mutableListOf<PreparedRow>().also { values -> plan.visitDirtyRows { values += it; true } }
     private fun support(plan: PreparedCanonicalMutation) = mutableListOf<PreparedSupport>().also { values -> plan.visitDirtySupport { values += it; true } }

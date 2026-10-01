@@ -35,7 +35,8 @@ void main() {
     expect(arm.sequence, 1);
     final wall = await scene.emit(ARVisibilitySyntheticSceneStep.wall);
     expect(wall.sequence, 2);
-    final overOffer = await scene.emit(ARVisibilitySyntheticSceneStep.overOffer);
+    final overOffer =
+        await scene.emit(ARVisibilitySyntheticSceneStep.overOffer);
     expect(overOffer.sequence, 3);
     final revisit = await scene.emit(
       ARVisibilitySyntheticSceneStep.automaticRevisit,
@@ -57,7 +58,16 @@ void main() {
 
     expect(
       calls.map((call) => call.method),
-      <String>['arm', 'emit', 'emit', 'emit', 'emit', 'emit', 'setFault', 'disarm'],
+      <String>[
+        'arm',
+        'emit',
+        'emit',
+        'emit',
+        'emit',
+        'emit',
+        'setFault',
+        'disarm'
+      ],
     );
     expect((calls[0].arguments as Map)['depthCapability'], 'automatic');
     expect((calls[0].arguments as Map)['expectedBindingGeneration'], 4);
@@ -131,6 +141,96 @@ void main() {
     expect((calls[2].arguments as Map)['expectedBindingGeneration'], 4);
     expect((calls[2].arguments as Map)['expectedGroupGeneration'], 7);
     await scene.dispose();
+  });
+
+  test('sphere views retain one scenario and adjacent command sequence',
+      () async {
+    const channel = MethodChannel('visibility_scenario_v2_42');
+    final calls = <MethodCall>[];
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      calls.add(call);
+      final arguments = Map<Object?, Object?>.from(call.arguments! as Map);
+      return _receipt(
+        scenarioId: arguments['scenarioId']! as String,
+        sequence: arguments['sequence']! as int,
+      );
+    });
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null),
+    );
+
+    final scene = ARVisibilitySyntheticScene(42, channel: channel);
+    await scene.arm(
+      scenarioId: 'rotating-sphere-one-session',
+      depthCapability: ARVisibilitySyntheticDepthCapability.automatic,
+      expectedBindingGeneration: 4,
+      expectedGroupGeneration: 7,
+    );
+    expect(() => scene.emitSphereView(-1), throwsRangeError);
+    expect(() => scene.emitSphereView(20), throwsRangeError);
+    expect((await scene.emitSphereView(0)).sequence, 2);
+    expect((await scene.emitSphereView(19)).sequence, 3);
+    await scene.dispose();
+
+    expect(calls.map((call) => call.method),
+        <String>['arm', 'sphereView', 'sphereView', 'disarm']);
+    expect((calls[1].arguments as Map)['viewIndex'], 0);
+    expect((calls[2].arguments as Map)['viewIndex'], 19);
+    expect((calls[2].arguments as Map)['scenarioId'],
+        'rotating-sphere-one-session');
+    expect((calls[2].arguments as Map)['sequence'], 3);
+  });
+
+  test('sphere feature and depth phases retain one scenario and sequence',
+      () async {
+    const channel = MethodChannel('visibility_scenario_v2_43');
+    final calls = <MethodCall>[];
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      calls.add(call);
+      final arguments = Map<Object?, Object?>.from(call.arguments! as Map);
+      return _receipt(
+        scenarioId: arguments['scenarioId']! as String,
+        sequence: arguments['sequence']! as int,
+      );
+    });
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null),
+    );
+
+    final scene = ARVisibilitySyntheticScene(43, channel: channel);
+    await scene.arm(
+      scenarioId: 'rotating-sphere-phased',
+      depthCapability: ARVisibilitySyntheticDepthCapability.automatic,
+      expectedBindingGeneration: 4,
+      expectedGroupGeneration: 7,
+    );
+    expect((await scene.emitSphereFeatureView(0)).sequence, 2);
+    expect((await scene.emitSphereDepthView(0)).sequence, 3);
+    expect((await scene.emitSphereFeatureView(1)).sequence, 4);
+    expect((await scene.emitSphereDepthView(1)).sequence, 5);
+    await scene.dispose();
+
+    expect(
+      calls.map((call) => call.method),
+      <String>[
+        'arm',
+        'sphereFeatureView',
+        'sphereDepthView',
+        'sphereFeatureView',
+        'sphereDepthView',
+        'disarm',
+      ],
+    );
+    expect((calls[1].arguments as Map)['viewIndex'], 0);
+    expect((calls[2].arguments as Map)['viewIndex'], 0);
+    expect((calls[3].arguments as Map)['viewIndex'], 1);
+    expect((calls[4].arguments as Map)['viewIndex'], 1);
+    expect((calls[4].arguments as Map)['scenarioId'], 'rotating-sphere-phased');
+    expect((calls[4].arguments as Map)['sequence'], 5);
   });
 
   test('receipt codec rejects non-scalar and unknown fields', () {

@@ -30,6 +30,8 @@ internal class VisibilitySmallSceneDebugChannel(
     private var scenarioId: String? = null
     private var preparedDepthCapability: VisibilityDepthCapability? = null
     private var lastSequence = 0L
+    private var nextSphereView = 0
+    private var sphereDepthPending = false
     private val acceptedCommands = LinkedHashMap<Long, AcceptedSmallSceneCommand>()
     private var completedDisarm: AcceptedSmallSceneCommand? = null
     private var runtimePausedByDisarm = false
@@ -58,6 +60,9 @@ internal class VisibilitySmallSceneDebugChannel(
                     }
                     "arm" -> result.success(arm(call))
                     "emit" -> result.success(runStep(call, parseStep(call.argument<String>("step"))))
+                    "sphereView" -> result.success(runSphereView(call))
+                    "sphereFeatureView" -> result.success(runSpherePhase(call, featurePhase = true))
+                    "sphereDepthView" -> result.success(runSpherePhase(call, featurePhase = false))
                     "setFault" -> result.success(runFault(call))
                     "pauseResume" -> result.success(runPauseResume(call))
                     "snapshot" -> result.success(runCommand(call, "SNAPSHOT") {})
@@ -77,6 +82,8 @@ internal class VisibilitySmallSceneDebugChannel(
             scenarioId = null
             preparedDepthCapability = null
             lastSequence = 0L
+            nextSphereView = 0
+            sphereDepthPending = false
             acceptedCommands.clear()
             completedDisarm = null
             runtimePausedByDisarm = false
@@ -144,6 +151,8 @@ internal class VisibilitySmallSceneDebugChannel(
         source.setDepthCapability(capability)
         scenarioId = requestedScenario
         lastSequence = sequence
+        nextSphereView = 0
+        sphereDepthPending = false
         acceptedCommands.clear()
         completedDisarm = null
         return rememberReceipt(sequence, commandKey)
@@ -229,7 +238,7 @@ internal class VisibilitySmallSceneDebugChannel(
                 }
                 SmallSceneStep.MAXIMUM_DEPTH_RETRY -> {
                     runtime.awaitDebugFixtureIdle()
-                    // The full 1,536-point batch may correctly exhaust the
+                    // The full 4,096-point batch may correctly exhaust the
                     // bounded lookup. Retry with one fresh depth sample to
                     // prove the retained feature cut remains usable.
                     check(source.emitDepth(8_500_000_000L, 0, 0)) {
@@ -291,6 +300,103 @@ internal class VisibilitySmallSceneDebugChannel(
             }
         }
 
+    private fun runSphereView(call: MethodCall): Map<String, Any?> {
+        val viewIndex = call.argument<Int>("viewIndex")
+            ?: error("sphere view index is required")
+        require(viewIndex in 0 until SYNTHETIC_SPHERE_VIEW_COUNT) {
+            "sphere view index is outside the finite sweep"
+        }
+        return runCommand(call, "sphereView:$viewIndex") {
+            check(!sphereDepthPending) {
+                "sphere feature phase must be followed by its depth phase"
+            }
+            check(viewIndex == nextSphereView) {
+                "sphere views must advance from $nextSphereView"
+            }
+            if (viewIndex == 0) {
+                val current = checkNotNull(runtimeOwnership()) {
+                    "native observation ownership is not ready"
+                }
+                check(productHooks.beginPoseFixture()) {
+                    "live tracked pose is not ready for the sphere fixture"
+                }
+                source.anchor(checkNotNull(referencePose()), current.groupFrame)
+            }
+            runtime.awaitDebugFixtureIdle()
+            val timestamp = 10_000_000_000L + viewIndex * 1_000_000_000L
+            val (feature, depth) = source.emitSphereView(
+                viewIndex, timestamp, timestamp + DEPTH_INTERVAL_NS,
+            )
+            check(feature && depth) {
+                val health = runtime.snapshot()
+                "sphere view $viewIndex was not copied: feature=$feature depth=$depth " +
+                    "depthHealth=${health.depthHealth} capability=${health.depthCapability} " +
+                    "dropped=${health.droppedDepthObservations} invalid=${health.invalidDepthObservations} " +
+                    "duplicate=${health.duplicateDepthObservations} stale=${health.staleGenerationObservations}"
+            }
+            runtime.awaitDebugFixtureIdle()
+            nextSphereView++
+        }
+    }
+
+    private fun runSpherePhase(
+        call: MethodCall,
+        featurePhase: Boolean,
+    ): Map<String, Any?> {
+        val viewIndex = call.argument<Int>("viewIndex")
+            ?: error("sphere view index is required")
+        require(viewIndex in 0 until SYNTHETIC_SPHERE_VIEW_COUNT) {
+            "sphere view index is outside the finite sweep"
+        }
+        val phaseName = if (featurePhase) "feature" else "depth"
+        val commandName = if (featurePhase) "sphereFeatureView" else "sphereDepthView"
+        return runCommand(call, "$commandName:$viewIndex") {
+            check(sphereDepthPending == !featurePhase) {
+                if (featurePhase) {
+                    "sphere depth phase must be emitted before the next feature phase"
+                } else {
+                    "sphere feature phase must be emitted before the depth phase"
+                }
+            }
+            check(viewIndex == nextSphereView) {
+                "sphere $phaseName view must advance from $nextSphereView"
+            }
+            if (viewIndex == 0 && featurePhase) {
+                val current = checkNotNull(runtimeOwnership()) {
+                    "native observation ownership is not ready"
+                }
+                check(productHooks.beginPoseFixture()) {
+                    "live tracked pose is not ready for the sphere fixture"
+                }
+                source.anchor(checkNotNull(referencePose()), current.groupFrame)
+            }
+            runtime.awaitDebugFixtureIdle()
+            val timestamp = 10_000_000_000L + viewIndex * 1_000_000_000L
+            val (feature, depth) = source.emitSphereView(
+                viewIndex = viewIndex,
+                featureTimestampNs = timestamp,
+                depthTimestampNs = timestamp + DEPTH_INTERVAL_NS,
+                includeFeature = featurePhase,
+                includeDepth = !featurePhase,
+            )
+            val copied = if (featurePhase) feature else depth
+            check(copied) {
+                val health = runtime.snapshot()
+                "sphere $phaseName view $viewIndex was not copied: feature=$feature depth=$depth " +
+                    "depthHealth=${health.depthHealth} capability=${health.depthCapability} " +
+                    "dropped=${health.droppedDepthObservations} invalid=${health.invalidDepthObservations} " +
+                    "duplicate=${health.duplicateDepthObservations} stale=${health.staleGenerationObservations}"
+            }
+            runtime.awaitDebugFixtureIdle()
+            if (featurePhase) {
+                sphereDepthPending = true
+            } else {
+                sphereDepthPending = false
+                nextSphereView++
+            }
+        }
+    }
+
     private fun runFault(call: MethodCall): Map<String, Any?> {
         val fault = when (call.argument<String>("fault")) {
             "rendererUnavailable" -> SmallSceneFault.RENDERER_UNAVAILABLE
@@ -340,6 +446,8 @@ internal class VisibilitySmallSceneDebugChannel(
         completedDisarm = checkNotNull(acceptedCommands[sequence])
         scenarioId = null
         lastSequence = 0L
+        nextSphereView = 0
+        sphereDepthPending = false
         acceptedCommands.clear()
         return receipt
     }
@@ -487,7 +595,10 @@ internal class VisibilitySmallSceneDebugChannel(
 
     companion object {
         private const val SCENARIO_ID_MAX_LENGTH = 64
-        private const val MAX_COMMAND_SEQUENCE = 32L
+        // Twenty views need at least 120 commands for paired emissions,
+        // baseline reads, and admission reads; capture and bounded retries
+        // also use this journal. Keep the debug replay log finite at 256.
+        private const val MAX_COMMAND_SEQUENCE = 256L
         private const val FEATURE_INTERVAL_NS = 125_000_000L
         private const val DEPTH_INTERVAL_NS = 250_000_000L
     }

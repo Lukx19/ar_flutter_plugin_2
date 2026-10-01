@@ -27,7 +27,7 @@ class CoveragePointUploadCoordinatorTest {
     }
 
     @Test
-    fun `driver completion requests one later renderer frame`() {
+    fun `submission kick requests one later renderer frame`() {
         val uploader = FakeUploader()
         var releasedPages = 0
         val coordinator = CoveragePointUploadCoordinator(
@@ -44,30 +44,30 @@ class CoveragePointUploadCoordinatorTest {
     }
 
     @Test
-    fun `each bounded page completes its driver submission fence after both point buffers are queued`() {
+    fun `each bounded page kicks submission after both point buffers are queued`() {
         val uploader = FakeUploader()
         val coordinator = CoveragePointUploadCoordinator(capacity = 2, uploader = uploader)
 
         coordinator.submit(snapshot(1, 1f))
         coordinator.onRendererFrame()
 
-        // The coordinator completes the concrete bounded submission before
+        // The coordinator kicks the concrete bounded submission before
         // waiting for Filament's independent ownership callbacks.
-        assertEquals(1, uploader.submissionFenceCount)
+        assertEquals(1, uploader.submissionKickCount)
         uploader.completeAll()
         coordinator.onRendererFrame()
-        assertEquals(1, uploader.submissionFenceCount)
+        assertEquals(1, uploader.submissionKickCount)
     }
 
     @Test
-    fun `destroyed coordinator fences and reports callbacks without completing its upload`() {
+    fun `destroyed coordinator reports callbacks without completing its upload`() {
         val uploader = FakeUploader()
-        var fencedCallbacks = 0
+        var callbacksAfterDestroy = 0
         var completedUploads = 0
         val coordinator = CoveragePointUploadCoordinator(
             capacity = 2,
             uploader = uploader,
-            onDestroyedUploadCallback = { fencedCallbacks++ },
+            onDestroyedUploadCallback = { callbacksAfterDestroy++ },
             onUploadCompleted = { completedUploads++ },
         )
 
@@ -76,8 +76,8 @@ class CoveragePointUploadCoordinatorTest {
         coordinator.destroy()
         uploader.completeAll()
 
-        assertEquals("both Filament buffers are fenced after destruction", 2, fencedCallbacks)
-        assertEquals("a fenced callback cannot complete the destroyed upload", 0, completedUploads)
+        assertEquals("both Filament buffer callbacks arrive after destruction", 2, callbacksAfterDestroy)
+        assertEquals("a late callback cannot complete the destroyed upload", 0, completedUploads)
     }
 
     @Test
@@ -439,7 +439,7 @@ private class FakeUploader : CoveragePointVertexUploader {
     val pendingCallbacks = mutableListOf<() -> Unit>()
     val positionOffsets = mutableListOf<Int>()
     val colorOffsets = mutableListOf<Int>()
-    var submissionFenceCount = 0
+    var submissionKickCount = 0
 
     override fun uploadPositions(
         buffer: FloatBuffer,
@@ -467,8 +467,8 @@ private class FakeUploader : CoveragePointVertexUploader {
         pendingCallbacks += onConsumed
     }
 
-    override fun completeSubmissionFence() {
-        submissionFenceCount++
+    override fun kickSubmission() {
+        submissionKickCount++
     }
 
     fun completeNext() {

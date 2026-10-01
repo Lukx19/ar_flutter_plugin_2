@@ -370,6 +370,8 @@ final class ARNativeCaptureEventV2 {
     this.captureId,
     this.captureRevision,
     this.manifestId,
+    this.jpegSizeBytes,
+    this.dngSizeBytes,
     this.reason,
     this.health,
     this.recoveryContext,
@@ -423,22 +425,35 @@ final class ARNativeCaptureEventV2 {
         return ARNativeCaptureEventV2(
             kind: kind, reason: _nonEmptyString(map, 'reason'));
       case ARNativeCaptureEventKindV2.committed:
-        _requireExactKeys(map, const {
+        _requireExactKeys(map, {
           'wireVersion',
           'kind',
           'attemptId',
           'captureId',
           'captureRevision',
           'manifestId',
+          if (map.containsKey('jpegSizeBytes')) 'jpegSizeBytes',
+          if (map.containsKey('dngSizeBytes')) 'dngSizeBytes',
           'reason',
           'recoveryContext',
         });
+        final jpegSizeBytes = map.containsKey('jpegSizeBytes')
+            ? _positiveInteger(map, 'jpegSizeBytes')
+            : null;
+        final dngSizeBytes = map.containsKey('dngSizeBytes')
+            ? _positiveInteger(map, 'dngSizeBytes')
+            : null;
+        if (dngSizeBytes != null && jpegSizeBytes == null) {
+          throw const FormatException('DNG component requires its JPEG size.');
+        }
         return ARNativeCaptureEventV2(
           kind: kind,
           attemptId: _nonEmptyString(map, 'attemptId'),
           captureId: _nonEmptyString(map, 'captureId'),
           captureRevision: _integer(map, 'captureRevision'),
           manifestId: _nonEmptyString(map, 'manifestId'),
+          jpegSizeBytes: jpegSizeBytes,
+          dngSizeBytes: dngSizeBytes,
           reason: _nonEmptyString(map, 'reason'),
           recoveryContext: ARNativeCaptureRecoveryContextV2.fromMap(
               Map<String, dynamic>.from(map['recoveryContext'] as Map)),
@@ -481,6 +496,8 @@ final class ARNativeCaptureEventV2 {
   final String? captureId;
   final int? captureRevision;
   final String? manifestId;
+  final int? jpegSizeBytes;
+  final int? dngSizeBytes;
   final String? reason;
   final ARNativeCaptureHealthV2? health;
   final ARNativeCaptureRecoveryContextV2? recoveryContext;
@@ -535,6 +552,14 @@ int _integer(Map<String, dynamic> map, String key) {
   final value = map[key];
   if (value is! int || value < 0) {
     throw FormatException('$key must be a non-negative integer.');
+  }
+  return value;
+}
+
+int _positiveInteger(Map<String, dynamic> map, String key) {
+  final value = _integer(map, key);
+  if (value == 0) {
+    throw FormatException('$key must be a positive integer.');
   }
   return value;
 }

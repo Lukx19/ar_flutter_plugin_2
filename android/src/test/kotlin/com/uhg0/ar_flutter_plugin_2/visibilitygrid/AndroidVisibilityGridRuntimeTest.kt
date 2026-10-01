@@ -388,6 +388,40 @@ class AndroidVisibilityGridRuntimeTest {
     }
 
     @Test
+    fun `unsafe callback pressure probes feature after cooldown before reopening depth`() {
+        val cut = AtomicReference(ownership())
+        val clock = AtomicLong(1)
+        val runtime = AndroidVisibilityGridRuntime(
+            ownership = cut::get,
+            mapper = AndroidVisibilityGridMappingAdmission(cut::get),
+            scheduler = Executors.newScheduledThreadPool(2),
+            nanoTime = clock::get,
+            featureIntervalNs = 125_000_000,
+            depthIntervalNs = 250_000_000,
+            ownsScheduler = true,
+            callbackCopySampleCapacity = 2,
+            captureSafe = VisibilityCaptureSafePredicate { false },
+        )
+        try {
+            runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            assertTrue(runtime.shouldCopyFeature(1))
+            assertTrue(runtime.offerFeature(feature(cut.get(), 1, 1), 2_000_001))
+            assertFalse(runtime.shouldCopyFeature(2))
+            assertFalse(runtime.shouldCopyDepth(2))
+
+            clock.addAndGet(30_000_000_000)
+            assertTrue(runtime.shouldCopyFeature(2_000_000_000))
+            assertEquals(V2_FEATURE_SAMPLE_CAPACITY, runtime.featureSampleCapacity())
+            assertTrue(runtime.offerFeature(feature(cut.get(), 2_000_000_000, 2), 0))
+
+            assertEquals("withinBudget", runtime.snapshot().callbackCopyBudgetState)
+            assertTrue(runtime.shouldCopyDepth(2_000_000_000))
+        } finally {
+            runtime.close()
+        }
+    }
+
+    @Test
     fun `copy cadence claims exact independent moving source intervals`() {
         val runtime = AndroidVisibilityGridRuntime(
             ownership = { ownership() },
@@ -453,6 +487,41 @@ class AndroidVisibilityGridRuntimeTest {
             assertEquals("healthy", health.totalGridHealth)
         } finally {
             featureRelease.countDown()
+            runtime.close()
+        }
+    }
+
+    @Test
+    fun `depth copy waits for prior depth mapping to finish`() {
+        val cut = AtomicReference(ownership())
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val mapped = AtomicLong()
+        val runtime = runtime(
+            cut = cut,
+            mapper = object : VisibilityObservationMapper {
+                override fun admitFeature(observation: VisibilityFeatureObservation) = Unit
+                override fun admitDepth(observation: VisibilityDepthObservation) {
+                    entered.countDown()
+                    release.await(2, TimeUnit.SECONDS)
+                    mapped.incrementAndGet()
+                }
+                override fun snapshot() = VisibilityMappingAdmissionHealth.empty().copy(
+                    admittedDepths = mapped.get(),
+                )
+            },
+        )
+        try {
+            runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            assertTrue(runtime.shouldCopyDepth(1_000_000_000L))
+            assertTrue(runtime.offerDepth(depth(cut.get(), 1_000_000_000L, 1)))
+            assertTrue(entered.await(1, TimeUnit.SECONDS))
+            assertFalse(runtime.shouldCopyDepth(1_500_000_000L))
+            release.countDown()
+            await { runtime.snapshot().admittedDepthObservations == 1L }
+            assertTrue(runtime.shouldCopyDepth(1_500_000_000L))
+        } finally {
+            release.countDown()
             runtime.close()
         }
     }
@@ -748,6 +817,42 @@ class AndroidVisibilityGridRuntimeTest {
             assertEquals("failed", neither.snapshot().totalGridHealth)
         } finally {
             neither.close()
+        }
+    }
+
+    @Test
+    fun `depth transient keeps a recent valid source healthy and expires after freshness window`() {
+        val cut = AtomicReference(ownership())
+        val clock = AtomicLong(100)
+        val runtime = AndroidVisibilityGridRuntime(
+            ownership = cut::get,
+            mapper = AndroidVisibilityGridMappingAdmission(cut::get),
+            scheduler = Executors.newScheduledThreadPool(2),
+            nanoTime = clock::get,
+            featureIntervalNs = 1_000_000,
+            depthIntervalNs = 1_000_000,
+            ownsScheduler = true,
+        )
+        try {
+            runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            assertTrue(runtime.offerDepth(depth(cut.get(), 1, 1)))
+
+            runtime.recordDepthTransientUnavailable()
+            assertEquals(VisibilitySourceHealth.HEALTHY, runtime.snapshot().depthHealth)
+
+            clock.addAndGet(AndroidVisibilityGridRuntime.DEPTH_HEALTHY_FRESHNESS_WINDOW_NS - 1)
+            runtime.recordDepthTransientUnavailable()
+            assertEquals(VisibilitySourceHealth.HEALTHY, runtime.snapshot().depthHealth)
+
+            clock.incrementAndGet()
+            runtime.recordDepthTransientUnavailable()
+            assertEquals(
+                "A retained depth map must become stale after the freshness window",
+                VisibilitySourceHealth.TRANSIENT_UNAVAILABLE,
+                runtime.snapshot().depthHealth,
+            )
+        } finally {
+            runtime.close()
         }
     }
 

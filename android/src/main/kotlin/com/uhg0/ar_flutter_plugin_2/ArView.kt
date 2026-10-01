@@ -177,6 +177,11 @@ internal class ArView(
         runtime = visibilityObservationRuntime,
         ownership = visibilityGridV2Binding::currentObservationOwnership,
         depthMode = sceneHost::visibilityGridDepthMode,
+        depthIntakeAllowed = {
+            sceneHost.depthIntakeFrameHealthy() &&
+                !captureSession.nativeCaptureWorkPendingV2() &&
+                !visibilityObservationMappingAdmission.hasPendingPublicationForIngress()
+        },
     )
     private val depthPauseGate = DepthObservationPauseGate(
         suspendDepth = visibilityObservationSource::suspendDepth,
@@ -378,9 +383,12 @@ internal class ArView(
         prepareForDispose { result ->
             if (result.isFailure) {
                 Log.e("ArView", "Native capture disposal fence failed", result.exceptionOrNull())
-                // Fail closed and preserve ARCore-pause-before-Camera2 cleanup.
+                // ARCore may already have invalidated this shared session.
+                // A second pause must not abort native owner cleanup.
                 captureSafetySignalV2.invalidateAll()
-                sceneHost.pause()
+                runCatching { sceneHost.pause() }.onFailure { error ->
+                    Log.e("ArView", "ARCore pause failed during disposal", error)
+                }
                 visibilityObservationRuntime.pause()
                 captureSession.finishSharedCameraPause()
             }
@@ -843,6 +851,23 @@ internal class ArView(
                     if (!accepted) result.error("NATIVE_CAPTURE_V2_CLOSED", "Native capture durable owner is closing", null)
                 }
                 "getNativeCaptureHealthV2" -> result.success(captureSession.nativeCaptureHealthV2())
+                "materializeNativeCapturePreview" -> scope.launch {
+                    try {
+                        val manifestId = call.argument<String>("manifestId")
+                            ?: throw IllegalArgumentException("manifestId is required")
+                        val captureId = call.argument<String>("captureId")
+                            ?: throw IllegalArgumentException("captureId is required")
+                        result.success(withContext(Dispatchers.IO) {
+                            captureSession.materializeNativeCapturePreview(manifestId, captureId)
+                        })
+                    } catch (error: CaptureSessionException) {
+                        result.error(error.code, error.message, null)
+                    } catch (error: IllegalArgumentException) {
+                        result.error("CONFIG_INVALID", error.message, null)
+                    } catch (error: Exception) {
+                        result.error("CAPTURE_FAILED", error.message, null)
+                    }
+                }
                 "replayNativeCaptureRecoveryV2" -> result.success(captureSession.replayNativeCaptureRecoveryV2())
                 "acknowledgeNativeCaptureTerminalV2" -> {
                     captureSession.acknowledgeNativeCaptureTerminalV2(

@@ -30,6 +30,8 @@ internal object NativeCaptureWireV2 {
         value.captureId?.let { put("captureId", it) }
         value.captureRevision?.let { put("captureRevision", it) }
         value.manifestId?.let { put("manifestId", it) }
+        value.jpegSizeBytes?.let { put("jpegSizeBytes", it) }
+        value.dngSizeBytes?.let { put("dngSizeBytes", it) }
         value.reason?.let { put("reason", it) }
         value.recoveryContext?.let { put("recoveryContext", encodeRecoveryContext(it)) }
         value.resources?.let { resources ->

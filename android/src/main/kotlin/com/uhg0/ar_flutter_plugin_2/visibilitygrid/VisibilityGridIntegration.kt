@@ -31,6 +31,28 @@ private data class PendingDepthCommit(
     val ownership: VisibilityObservationOwnership,
     val mutation: PreparedCanonicalMutation,
     val geometryCut: CommittedGeometryCut,
+    val sequence: Long,
+    val admissionStartedNs: Long,
+    val lookupMicros: Long,
+    val mutationStartedNs: Long,
+)
+
+private data class PendingDepthAdmissionTiming(
+    val sequence: Long,
+    val admissionStartedNs: Long,
+    val lookupMicros: Long,
+    val mutationMicros: Long,
+    val publicationStartedNs: Long,
+)
+
+private data class PendingFeatureAdmissionTiming(
+    val sequence: Long,
+    val admissionStartedNs: Long,
+    val planningMicros: Long,
+    val mutationMicros: Long,
+    val serializationMicros: Long,
+    val publicationStartedNs: Long,
+    val publicationMicros: Long,
 )
 
 private data class PendingRendererRebuild(
@@ -138,6 +160,7 @@ internal class VisibilityGridIntegration(
     private var batchSequence = 0L
     private var nextTransactionId = 0L
     private var pending: CurrentDeltaSelectorV1? = null
+    @Volatile private var pendingPublicationForIngress = false
     private var pendingQueued = false
     private var pendingGeometryCut: CommittedGeometryCut? = null
     private var pendingRendererApplied = false
@@ -147,6 +170,21 @@ internal class VisibilityGridIntegration(
     private var pendingRendererRows = 0
     private var pendingCanonicalAcknowledgement: CanonicalAcknowledgement? = null
     private var pendingDepthCommit: PendingDepthCommit? = null
+    @Volatile private var pendingDepthTiming: PendingDepthAdmissionTiming? = null
+    @Volatile private var pendingFeatureTiming: PendingFeatureAdmissionTiming? = null
+    private var depthTimingCompletedCount = 0L
+    private var depthTimingSequence = 0L
+    private var depthTimingLookupMicros = 0L
+    private var depthTimingMutationMicros = 0L
+    private var depthTimingPublicationAckMicros = 0L
+    private var depthTimingEndToEndMicros = 0L
+    private var featureTimingCompletedCount = 0L
+    private var featureTimingSequence = 0L
+    private var featureTimingPlanningMicros = 0L
+    private var featureTimingMutationMicros = 0L
+    private var featureTimingSerializationMicros = 0L
+    private var featureTimingPublicationMicros = 0L
+    private var featureTimingEndToEndMicros = 0L
     private var lastDepthLookupReceipt: BoundedCanonicalLookupReceipt? = null
     private var lastDepthAdmissionStatus: String? = null
     private var canonicalSurfaceHighWater = 0L
@@ -253,6 +291,8 @@ internal class VisibilityGridIntegration(
         if (retryPendingDepthCommit(observation.ownership)) return@mutate
         ensureOpened(observation.ownership) ?: return@mutate
         if (drainPendingPublication() == PendingPublicationGateResult.REJECTED) return@mutate
+        val admissionStartedNs = System.nanoTime()
+        val featureSequence = ++batchSequence
         // This adapter is the only CAPTURE-INGRESS-to-canonical surface conversion point.  It creates
         // fixed camera/sample evidence before the kernel can mutate anything.
         val normalEvidence = (FeatureNormalEvidence.from(observation) as? FeatureNormalEvidence.Conversion.Accepted)
@@ -263,7 +303,7 @@ internal class VisibilityGridIntegration(
             }
         val fused = requireNotNull(kernel).prepare(
             FeatureFusionBatch(
-                sequence = ++batchSequence,
+                sequence = featureSequence,
                 timestampNs = observation.frame.sourceTimestampNs,
                 observations = observation.samples.zip(normalEvidence.evidence).map { (sample, normal) ->
                     FeatureFusionEvidence(sample.xWorld, sample.yWorld, sample.zWorld, 2, sample.id, normal)
@@ -279,13 +319,22 @@ internal class VisibilityGridIntegration(
             requireNotNull(kernel).discardPrepared()
             return@mutate
         }
+        val featureTiming = PendingFeatureAdmissionTiming(
+            sequence = featureSequence,
+            admissionStartedNs = admissionStartedNs,
+            planningMicros = elapsedMicros(admissionStartedNs, System.nanoTime()),
+            mutationMicros = 0L,
+            serializationMicros = 0L,
+            publicationStartedNs = 0L,
+            publicationMicros = 0L,
+        )
         val state = requireNotNull(owner).activationState()
         if (state?.current == CanonicalActivationCurrent.None &&
             state.cut.liveSurfaceCount == 0
         ) {
-            publishInitialV6Create(observation.ownership, accepted.delta)
+            publishInitialV6Create(observation.ownership, accepted.delta, featureTiming)
         } else {
-            publishMaterialBatch(observation.ownership, accepted.delta)
+            publishMaterialBatch(observation.ownership, accepted.delta, featureTiming)
         }
     }
 
@@ -315,7 +364,7 @@ internal class VisibilityGridIntegration(
             if (retryPendingDepthCommit(observation.ownership)) return@mutate
             ensureOpened(observation.ownership) ?: return@mutate
             if (drainPendingPublication() == PendingPublicationGateResult.REJECTED) return@mutate
-            admitDepthLocked(observation)
+            admitDepthLocked(observation, System.nanoTime())
             lastDepthAdmissionStatus = receipt.status
         }
     }
@@ -375,7 +424,61 @@ internal class VisibilityGridIntegration(
         )
     }
 
+    override fun depthAdmissionTiming(): VisibilityDepthAdmissionTiming = synchronized(lock) {
+        val pending = pendingDepthTiming
+        if (pending == null) {
+            return@synchronized VisibilityDepthAdmissionTiming(
+                completedCount = depthTimingCompletedCount,
+                sequence = depthTimingSequence,
+                lookupMicros = depthTimingLookupMicros,
+                mutationMicros = depthTimingMutationMicros,
+                publicationAckMicros = depthTimingPublicationAckMicros,
+                endToEndMicros = depthTimingEndToEndMicros,
+                pendingPublicationAck = false,
+            )
+        }
+        val now = System.nanoTime()
+        VisibilityDepthAdmissionTiming(
+            completedCount = depthTimingCompletedCount,
+            sequence = pending.sequence,
+            lookupMicros = pending.lookupMicros,
+            mutationMicros = pending.mutationMicros,
+            publicationAckMicros = elapsedMicros(pending.publicationStartedNs, now),
+            endToEndMicros = elapsedMicros(pending.admissionStartedNs, now),
+            pendingPublicationAck = true,
+        )
+    }
+
+    override fun featureAdmissionTiming(): VisibilityFeatureAdmissionTiming = synchronized(lock) {
+        val pending = pendingFeatureTiming
+        if (pending == null) {
+            return@synchronized VisibilityFeatureAdmissionTiming(
+                completedCount = featureTimingCompletedCount,
+                sequence = featureTimingSequence,
+                planningMicros = featureTimingPlanningMicros,
+                mutationMicros = featureTimingMutationMicros,
+                serializationMicros = featureTimingSerializationMicros,
+                publicationMicros = featureTimingPublicationMicros,
+                endToEndMicros = featureTimingEndToEndMicros,
+                pendingPublicationAck = false,
+            )
+        }
+        VisibilityFeatureAdmissionTiming(
+            completedCount = featureTimingCompletedCount,
+            sequence = pending.sequence,
+            planningMicros = pending.planningMicros,
+            mutationMicros = pending.mutationMicros,
+            serializationMicros = pending.serializationMicros,
+            publicationMicros = pending.publicationMicros,
+            endToEndMicros = elapsedMicros(pending.admissionStartedNs, System.nanoTime()),
+            pendingPublicationAck = true,
+        )
+    }
+
     fun integrationReceipt(): VisibilityGridIntegrationReceipt = synchronized(lock) { receipt }
+
+    /** Frame-thread check with no mapper lock or disk access. */
+    fun hasPendingPublicationForIngress(): Boolean = pendingPublicationForIngress
 
     internal fun lastDepthAdmissionStatus(): String? = synchronized(lock) { lastDepthAdmissionStatus }
 
@@ -564,7 +667,12 @@ internal class VisibilityGridIntegration(
         // through the same bounded V2 receipt path before a later batch is admitted.
         opened.ownership.activationState()?.let { state ->
             if (state.currentState is CanonicalCurrentState.Unacknowledged) {
-                val rebuilt = rebuildCanonicalRenderer(expected, state)
+                // The selected current is replayed as the next V2 transaction.
+                // Its renderer qualifier must match that queued transaction;
+                // transaction zero is stale after the empty baseline cut.
+                val rebuilt = rebuildCanonicalRenderer(
+                    expected, state, transactionId = nextTransactionId,
+                )
                 publishV6Current(
                     expected, state,
                     rendererAlreadyCurrentRows = rebuilt?.rowCount,
@@ -584,7 +692,10 @@ internal class VisibilityGridIntegration(
         return seeded
     }
 
-    private fun admitDepthLocked(observation: VisibilityDepthObservation) {
+    private fun admitDepthLocked(
+        observation: VisibilityDepthObservation,
+        admissionStartedNs: Long,
+    ) {
         val depth = requireNotNull(depthKernel)
         val groupFrame = observation.ownership.groupFrame
         val groupFromCamera = composeGroupFromCamera(
@@ -613,6 +724,7 @@ internal class VisibilityGridIntegration(
             return
         }
         var featureSources: DepthFeatureSourceTable? = null
+        val lookupStartedNs = System.nanoTime()
         val lookup = requireNotNull(resources).withBoundedCurrent(
             BoundedCanonicalLookupRequest(
                 expectedGeometryRevision = currentCut.geometryRevision,
@@ -620,7 +732,13 @@ internal class VisibilityGridIntegration(
                 maximumDirectLookups = 100_000,
                 maximumRayCellVisits = 65_536,
                 maximumPageReads = 65_536,
-                maximumBytesRead = 8L * 1024L * 1024L,
+                // A two-metre room ray can cross well over 1,000 grid cells.
+                // The bounded lookup charges each 16 KiB page read; measured
+                // 8 and 16 MiB limits refused the first two-metre ray before
+                // its endpoint. Authenticated-cut lookup reuse keeps the
+                // populated 2000x2000 fixture below 20 MiB of page reads;
+                // retain this finite streaming I/O ceiling.
+                maximumBytesRead = 64L * 1024L * 1024L,
             ),
         ) { view ->
             val result = depth.prepare(batch, view)
@@ -629,6 +747,7 @@ internal class VisibilityGridIntegration(
             }
             result
         }
+        val lookupMicros = elapsedMicros(lookupStartedNs, System.nanoTime())
         lastDepthLookupReceipt = lookup.receipt
         val accepted = (lookup as? BoundedCanonicalLookupResult.Completed)?.value
             as? DepthEvidenceResult.Accepted ?: run {
@@ -648,9 +767,17 @@ internal class VisibilityGridIntegration(
             requireNotNull(kernel).applyPreparedCanonicalRemap()
             check(depth.applyPrepared() is DepthEvidenceApplyResult.Applied)
             admittedDepths++
+            recordDepthTiming(
+                sequence = batch.sequence,
+                lookupMicros = lookupMicros,
+                mutationMicros = 0L,
+                publicationAckMicros = 0L,
+                endToEndMicros = elapsedMicros(admissionStartedNs, System.nanoTime()),
+            )
             receipt = receipt.copy(status = "nonMaterialRetained")
             return
         }
+        val mutationStartedNs = System.nanoTime()
         val preparation = requireNotNull(resources).prepareEvidenceBatch(
             CanonicalEvidenceBatchCommand(
                 commandId = "${observation.ownership.bindingGeneration}:${observation.ownership.lifecycleSequence}:depth:${batchSequence}",
@@ -695,11 +822,20 @@ internal class VisibilityGridIntegration(
             return
         }
         val committedResult = commitCanonical(requireNotNull(resources), prepared.mutation)
+        val mutationMicros = elapsedMicros(mutationStartedNs, System.nanoTime())
         val state = (committedResult as? CanonicalAdjacentCommitResult.Committed)?.state ?: run {
             if (committedResult is CanonicalAdjacentCommitResult.Refused &&
                 committedResult.disposition == PreparedMutationDisposition.RETRYABLE
             ) {
-                val retained = PendingDepthCommit(observation.ownership, prepared.mutation, geometryCut)
+                val retained = PendingDepthCommit(
+                    ownership = observation.ownership,
+                    mutation = prepared.mutation,
+                    geometryCut = geometryCut,
+                    sequence = batch.sequence,
+                    admissionStartedNs = admissionStartedNs,
+                    lookupMicros = lookupMicros,
+                    mutationStartedNs = mutationStartedNs,
+                )
                 val retention = retentionReceipt(retained)
                 if (retention == null || retention.totalBytes > retention.budgetBytes) {
                     retained.mutation.discard()
@@ -724,7 +860,18 @@ internal class VisibilityGridIntegration(
         requireNotNull(kernel).applyPreparedCanonicalRemap()
         check(depth.applyPrepared() is DepthEvidenceApplyResult.Applied)
         admittedDepths++
-        publishV6Current(observation.ownership, state, prebuiltGeometryCut = geometryCut)
+        publishV6Current(
+            observation.ownership,
+            state,
+            prebuiltGeometryCut = geometryCut,
+            depthTiming = PendingDepthAdmissionTiming(
+                sequence = batch.sequence,
+                admissionStartedNs = admissionStartedNs,
+                lookupMicros = lookupMicros,
+                mutationMicros = mutationMicros,
+                publicationStartedNs = System.nanoTime(),
+            ),
+        )
     }
 
     /** Retries one retained canonical depth capability and always gates the triggering observation. */
@@ -742,7 +889,21 @@ internal class VisibilityGridIntegration(
                 requireNotNull(kernel).applyPreparedCanonicalRemap()
                 check(requireNotNull(depthKernel).applyPrepared() is DepthEvidenceApplyResult.Applied)
                 admittedDepths++
-                publishV6Current(pendingDepth.ownership, result.state, prebuiltGeometryCut = pendingDepth.geometryCut)
+                publishV6Current(
+                    pendingDepth.ownership,
+                    result.state,
+                    prebuiltGeometryCut = pendingDepth.geometryCut,
+                    depthTiming = PendingDepthAdmissionTiming(
+                        sequence = pendingDepth.sequence,
+                        admissionStartedNs = pendingDepth.admissionStartedNs,
+                        lookupMicros = pendingDepth.lookupMicros,
+                        mutationMicros = elapsedMicros(
+                            pendingDepth.mutationStartedNs,
+                            System.nanoTime(),
+                        ),
+                        publicationStartedNs = System.nanoTime(),
+                    ),
+                )
             }
             is CanonicalAdjacentCommitResult.Refused -> {
                 rejected++
@@ -798,15 +959,24 @@ internal class VisibilityGridIntegration(
     private fun publishInitialV6Create(
         expected: VisibilityObservationOwnership,
         changes: List<FeatureFusionChange>,
+        featureTiming: PendingFeatureAdmissionTiming,
     ) {
         val targets = changes.mapNotNull { (it as? FeatureFusionChange.Upsert)?.candidate }
             .mapNotNull(FeatureFusionCandidate::primaryCanonicalTarget)
         if (targets.isEmpty()) {
             check(requireNotNull(kernel).prepareCanonicalApplication(emptyList()))
             requireNotNull(kernel).applyPrepared()
+            recordFeatureTiming(
+                timing = featureTiming,
+                mutationMicros = 0L,
+                serializationMicros = 0L,
+                publicationMicros = 0L,
+                endToEndMicros = elapsedMicros(featureTiming.admissionStartedNs, System.nanoTime()),
+            )
             receipt = receipt.copy(status = "nonMaterialRetained")
             return
         }
+        val mutationStartedNs = System.nanoTime()
         val activeOwner = requireNotNull(owner)
         val preparation = requireNotNull(resources).withCurrent {
             activeOwner.prepareAdjacentMutation(it, CanonicalTransactionCommand(
@@ -837,14 +1007,21 @@ internal class VisibilityGridIntegration(
             receipt = receipt.copy(status = "canonicalCommitRefused", rejected = rejected)
             return
         }
+        val mutationMicros = elapsedMicros(mutationStartedNs, System.nanoTime())
         committedFeatures++
         requireNotNull(kernel).applyPrepared()
-        publishV6Current(expected, state, prepared.mutation)
+        publishV6Current(
+            expected,
+            state,
+            prepared.mutation,
+            featureTiming = featureTiming.copy(mutationMicros = mutationMicros),
+        )
     }
 
     private fun publishMaterialBatch(
         expected: VisibilityObservationOwnership,
         changes: List<FeatureFusionChange>,
+        featureTiming: PendingFeatureAdmissionTiming,
     ) {
         // An accepted kernel batch with no material delta needs no canonical
         // authority at all. In particular, do not turn a no-op refinement into
@@ -852,9 +1029,17 @@ internal class VisibilityGridIntegration(
         if (changes.isEmpty()) {
             check(requireNotNull(kernel).prepareCanonicalApplication(emptyList()))
             requireNotNull(kernel).applyPrepared()
+            recordFeatureTiming(
+                timing = featureTiming,
+                mutationMicros = 0L,
+                serializationMicros = 0L,
+                publicationMicros = 0L,
+                endToEndMicros = elapsedMicros(featureTiming.admissionStartedNs, System.nanoTime()),
+            )
             receipt = receipt.copy(status = "nonMaterialRetained")
             return
         }
+        val mutationStartedNs = System.nanoTime()
         val activeOwner = requireNotNull(owner)
         val preparation = requireNotNull(resources).withFeaturePlanningCurrent(changes.size) {
             activeOwner.prepareAdjacentMutation(
@@ -892,6 +1077,7 @@ internal class VisibilityGridIntegration(
             receipt = receipt.copy(status = "batchCommitRefused", rejected = rejected)
             return
         }
+        val mutationMicros = elapsedMicros(mutationStartedNs, System.nanoTime())
         committedFeatures++
         requireNotNull(kernel).applyPrepared()
         if (isFenced(expected)) {
@@ -899,7 +1085,12 @@ internal class VisibilityGridIntegration(
             receipt = receipt.copy(status = "publicationDeferred", fenced = fenced)
             return
         }
-        publishV6Current(expected, committedState, prepared.mutation)
+        publishV6Current(
+            expected,
+            committedState,
+            prepared.mutation,
+            featureTiming = featureTiming.copy(mutationMicros = mutationMicros),
+        )
     }
 
     private fun canonicalAssignments(
@@ -980,16 +1171,20 @@ internal class VisibilityGridIntegration(
         rendererRebuildRequired: Boolean = false,
         rendererRebuildHydratesKernel: Boolean = false,
         prebuiltGeometryCut: CommittedGeometryCut? = null,
+        depthTiming: PendingDepthAdmissionTiming? = null,
+        featureTiming: PendingFeatureAdmissionTiming? = null,
     ) {
         val current = state.current as? CanonicalActivationCurrent.Receipt ?: run {
             rejected++
             receipt = receipt.copy(status = "currentMissing", rejected = rejected)
             return
         }
+        val serializationStartedNs = System.nanoTime()
         val canonicalBytes = ByteArrayOutputStream().use { output ->
             current.source.writeTo(output)
             output.toByteArray()
         }
+        val serializationMicros = elapsedMicros(serializationStartedNs, System.nanoTime())
         if (canonicalBytes.size.toLong() != current.identity.canonicalLength) {
             rejected++
             receipt = receipt.copy(status = "currentCorrupt", rejected = rejected)
@@ -1020,6 +1215,7 @@ internal class VisibilityGridIntegration(
             state.cut.lineageRevision,
         )
         pending = selector
+        pendingPublicationForIngress = true
         pendingQueued = false
         pendingGeometryCut = geometryCut
         pendingRendererApplied = rendererAlreadyCurrentRows != null
@@ -1030,6 +1226,11 @@ internal class VisibilityGridIntegration(
         pendingBindingAcknowledged = false
         pendingEarlyAcknowledged = false
         pendingRendererRows = rendererAlreadyCurrentRows ?: 0
+        pendingDepthTiming = depthTiming
+        pendingFeatureTiming = featureTiming?.copy(
+            serializationMicros = serializationMicros,
+            publicationStartedNs = System.nanoTime(),
+        )
         committed++
         receipt = VisibilityGridIntegrationReceipt(
             "pendingAck", expected.bindingGeneration, expected.sessionGeneration,
@@ -1038,6 +1239,17 @@ internal class VisibilityGridIntegration(
             committed, rejected, fenced, canonicalOperation(canonicalBytes),
         )
         retryPendingQueue()
+        if (pending == selector) {
+            val pendingTiming = pendingFeatureTiming
+            if (pendingTiming != null) {
+                pendingFeatureTiming = pendingTiming.copy(
+                    publicationMicros = elapsedMicros(
+                        pendingTiming.publicationStartedNs,
+                        System.nanoTime(),
+                    ),
+                )
+            }
+        }
     }
 
     /** Idempotently correlates the already-retained durable current to V2. */
@@ -1196,8 +1408,27 @@ internal class VisibilityGridIntegration(
                 return
             }
         }
+        pendingDepthTiming?.let { timing ->
+            recordDepthTiming(
+                sequence = timing.sequence,
+                lookupMicros = timing.lookupMicros,
+                mutationMicros = timing.mutationMicros,
+                publicationAckMicros = elapsedMicros(timing.publicationStartedNs, System.nanoTime()),
+                endToEndMicros = elapsedMicros(timing.admissionStartedNs, System.nanoTime()),
+            )
+        }
+        pendingFeatureTiming?.let { timing ->
+            recordFeatureTiming(
+                timing = timing,
+                mutationMicros = timing.mutationMicros,
+                serializationMicros = timing.serializationMicros,
+                publicationMicros = timing.publicationMicros,
+                endToEndMicros = elapsedMicros(timing.admissionStartedNs, System.nanoTime()),
+            )
+        }
         retainedDelta.acknowledge(selector)
         pending = null
+        pendingPublicationForIngress = false
         pendingQueued = false
         pendingGeometryCut = null
         pendingRendererApplied = false
@@ -1206,6 +1437,8 @@ internal class VisibilityGridIntegration(
         pendingEarlyAcknowledged = false
         pendingRendererRows = 0
         pendingCanonicalAcknowledgement = null
+        pendingDepthTiming = null
+        pendingFeatureTiming = null
         receipt = receipt.copy(status = "acknowledged")
     }
 
@@ -1214,6 +1447,7 @@ internal class VisibilityGridIntegration(
         discardPendingDepthCommit()
         retainedDelta.clear()
         pending = null
+        pendingPublicationForIngress = false
         pendingQueued = false
         pendingGeometryCut = null
         pendingRendererApplied = false
@@ -1230,7 +1464,65 @@ internal class VisibilityGridIntegration(
         lastDepthLookupReceipt = null
         lastDepthAdmissionStatus = null
         pendingCanonicalAcknowledgement = null
+        pendingDepthTiming = null
+        pendingFeatureTiming = null
     }
+
+    private fun recordDepthTiming(
+        sequence: Long,
+        lookupMicros: Long,
+        mutationMicros: Long,
+        publicationAckMicros: Long,
+        endToEndMicros: Long,
+    ) = synchronized(lock) {
+        depthTimingCompletedCount = minOf(
+            VisibilityDepthAdmissionTiming.MAX_COMPLETED_COUNT,
+            depthTimingCompletedCount + 1L,
+        )
+        depthTimingSequence = sequence.coerceAtLeast(0L)
+        depthTimingLookupMicros = lookupMicros.coerceIn(0L, VisibilityDepthAdmissionTiming.MAX_ELAPSED_MICROS)
+        depthTimingMutationMicros = mutationMicros.coerceIn(0L, VisibilityDepthAdmissionTiming.MAX_ELAPSED_MICROS)
+        depthTimingPublicationAckMicros = publicationAckMicros.coerceIn(0L, VisibilityDepthAdmissionTiming.MAX_ELAPSED_MICROS)
+        depthTimingEndToEndMicros = endToEndMicros.coerceIn(0L, VisibilityDepthAdmissionTiming.MAX_ELAPSED_MICROS)
+    }
+
+    private fun recordFeatureTiming(
+        timing: PendingFeatureAdmissionTiming,
+        mutationMicros: Long,
+        serializationMicros: Long,
+        publicationMicros: Long,
+        endToEndMicros: Long,
+    ) = synchronized(lock) {
+        featureTimingCompletedCount = minOf(
+            VisibilityFeatureAdmissionTiming.MAX_COMPLETED_COUNT,
+            featureTimingCompletedCount + 1L,
+        )
+        featureTimingSequence = timing.sequence.coerceAtLeast(0L)
+        featureTimingPlanningMicros = timing.planningMicros.coerceIn(
+            0L,
+            VisibilityFeatureAdmissionTiming.MAX_ELAPSED_MICROS,
+        )
+        featureTimingMutationMicros = mutationMicros.coerceIn(
+            0L,
+            VisibilityFeatureAdmissionTiming.MAX_ELAPSED_MICROS,
+        )
+        featureTimingSerializationMicros = serializationMicros.coerceIn(
+            0L,
+            VisibilityFeatureAdmissionTiming.MAX_ELAPSED_MICROS,
+        )
+        featureTimingPublicationMicros = publicationMicros.coerceIn(
+            0L,
+            VisibilityFeatureAdmissionTiming.MAX_ELAPSED_MICROS,
+        )
+        featureTimingEndToEndMicros = endToEndMicros.coerceIn(
+            0L,
+            VisibilityFeatureAdmissionTiming.MAX_ELAPSED_MICROS,
+        )
+    }
+
+    private fun elapsedMicros(startNs: Long, endNs: Long): Long =
+        ((endNs - startNs).coerceAtLeast(0L) / 1_000L)
+            .coerceAtMost(VisibilityDepthAdmissionTiming.MAX_ELAPSED_MICROS)
 
     private fun drain(timeoutMilliseconds: Long = 2_000L) {
         executor.submit {}.get(timeoutMilliseconds, TimeUnit.MILLISECONDS)

@@ -11,7 +11,7 @@ import org.junit.Test
 
 class CoverageCubeUploadCoordinatorTest {
     @Test
-    fun `cube driver completion requests one later renderer frame`() {
+    fun `cube submission kick requests one later renderer frame`() {
         val uploader = FakeCubeUploader()
         var releasedPages = 0
         val coordinator = CoverageCubeMeshResources.CoverageCubeUploadCoordinator(
@@ -29,7 +29,7 @@ class CoverageCubeUploadCoordinatorTest {
     }
 
     @Test
-    fun `each bounded page completes its driver submission fence after both cube buffers are queued`() {
+    fun `each bounded page kicks submission after both cube buffers are queued`() {
         val uploader = FakeCubeUploader()
         val coordinator = CoverageCubeMeshResources.CoverageCubeUploadCoordinator(
             capacity = 1,
@@ -40,22 +40,22 @@ class CoverageCubeUploadCoordinatorTest {
         coordinator.submit(cubeSnapshot(1, floatArrayOf(1f, 1f, 1f)))
         coordinator.onRendererFrame()
 
-        assertEquals(1, uploader.submissionFenceCount)
+        assertEquals(1, uploader.submissionKickCount)
         uploader.completeAll()
         coordinator.onRendererFrame()
-        assertEquals(1, uploader.submissionFenceCount)
+        assertEquals(1, uploader.submissionKickCount)
     }
 
     @Test
-    fun `destroyed cube coordinator fences and reports callbacks without completing its upload`() {
+    fun `destroyed cube coordinator reports callbacks without completing its upload`() {
         val uploader = FakeCubeUploader()
-        var fencedCallbacks = 0
+        var callbacksAfterDestroy = 0
         var completedUploads = 0
         val coordinator = CoverageCubeMeshResources.CoverageCubeUploadCoordinator(
             capacity = 1,
             halfSize = 0.5f,
             uploader = uploader,
-            onDestroyedUploadCallback = { fencedCallbacks++ },
+            onDestroyedUploadCallback = { callbacksAfterDestroy++ },
             onUploadCompleted = { completedUploads++ },
         )
 
@@ -64,8 +64,8 @@ class CoverageCubeUploadCoordinatorTest {
         coordinator.destroy()
         uploader.completeAll()
 
-        assertEquals("both Filament buffers are fenced after destruction", 2, fencedCallbacks)
-        assertEquals("a fenced callback cannot complete the destroyed upload", 0, completedUploads)
+        assertEquals("both Filament buffer callbacks arrive after destruction", 2, callbacksAfterDestroy)
+        assertEquals("a late callback cannot complete the destroyed upload", 0, completedUploads)
     }
 
     @Test
@@ -394,7 +394,7 @@ private class FakeCubeUploader : CoverageCubeMeshResources.CoverageCubeVertexUpl
     val colorSubmissions = mutableListOf<ByteArray>()
     val positionElementCounts = mutableListOf<Int>()
     val colorByteCounts = mutableListOf<Int>()
-    var submissionFenceCount = 0
+    var submissionKickCount = 0
     val positionOffsets = mutableListOf<Int>()
     val colorOffsets = mutableListOf<Int>()
     private val pendingCallbacks = mutableListOf<() -> Unit>()
@@ -427,8 +427,8 @@ private class FakeCubeUploader : CoverageCubeMeshResources.CoverageCubeVertexUpl
         pendingCallbacks += onConsumed
     }
 
-    override fun completeSubmissionFence() {
-        submissionFenceCount++
+    override fun kickSubmission() {
+        submissionKickCount++
     }
 
     fun completeAll() {

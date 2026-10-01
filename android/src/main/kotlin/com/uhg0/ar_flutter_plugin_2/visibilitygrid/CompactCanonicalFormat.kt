@@ -198,12 +198,25 @@ internal object CompactCanonicalFormat {
             val z = IntArray(configuration.surfaceCapacity)
             val normals = ShortArray(configuration.surfaceCapacity)
             val confidence = ByteArray(configuration.surfaceCapacity)
+            val regionX = IntArray(rows)
+            val regionY = IntArray(rows)
+            val regionZ = IntArray(rows)
+            val page = IntArray(rows)
+            val perRegion = configuration.regionMicrometers / configuration.voxelMicrometers
+            val perPage = configuration.pageMicrometers / configuration.voxelMicrometers
             repeat(rows) { index ->
                 ids[index] = input.readInt(); x[index] = input.readInt(); y[index] = input.readInt(); z[index] = input.readInt()
                 normals[index] = input.readShort(); confidence[index] = input.readByte()
                 require(ids[index] != 0)
                 require(index == 0 || unsignedCompare(unsigned(ids[index - 1]), unsigned(ids[index])) < 0)
-                require(CompactLocation(configuration, Voxel(x[index], y[index], z[index])) != null)
+                regionX[index] = Math.floorDiv(x[index], perRegion)
+                regionY[index] = Math.floorDiv(y[index], perRegion)
+                regionZ[index] = Math.floorDiv(z[index], perRegion)
+                val pageX = Math.floorMod(x[index], perRegion) / perPage
+                val pageY = Math.floorMod(y[index], perRegion) / perPage
+                val pageZ = Math.floorMod(z[index], perRegion) / perPage
+                require(pageX in 0..2 && pageY in 0..2 && pageZ in 0..2)
+                page[index] = pageX + 3 * (pageY + 3 * pageZ)
             }
             val pageOrder = IntArray(configuration.surfaceCapacity) { it }
             val idOrder = IntArray(configuration.surfaceCapacity) { it }
@@ -212,7 +225,12 @@ internal object CompactCanonicalFormat {
                 compareVoxel(x[a], y[a], z[a], x[b], y[b], z[b])
             }
             pageOrder.sortIndices(rows) { a, b ->
-                compareLocationThenVoxel(configuration, x, y, z, a, b)
+                val location = compareLocation(
+                    regionX[a], regionY[a], regionZ[a], page[a],
+                    regionX[b], regionY[b], regionZ[b], page[b],
+                )
+                if (location != 0) location
+                else compareVoxel(x[a], y[a], z[a], x[b], y[b], z[b])
             }
             repeat(rows - 1) { index ->
                 val left = voxelOrder[index]

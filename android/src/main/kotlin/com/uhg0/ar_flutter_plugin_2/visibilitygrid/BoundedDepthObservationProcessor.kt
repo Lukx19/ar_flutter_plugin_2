@@ -17,6 +17,9 @@ internal class BoundedDepthObservationProcessor<T : AutoCloseable, R>(
     private var busy = false
     private var closed = false
 
+    /** Cheap callback preflight; offer remains the final ownership gate. */
+    fun canAccept(): Boolean = synchronized(lock) { !closed && !busy }
+
     /** Takes ownership of [frame] on either acceptance or refusal. */
     fun offer(frame: T, callbackCopyNs: Long): Boolean {
         require(callbackCopyNs >= 0)

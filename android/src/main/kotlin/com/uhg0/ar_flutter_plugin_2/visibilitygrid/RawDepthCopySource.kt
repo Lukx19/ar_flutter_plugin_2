@@ -15,7 +15,14 @@ interface RawDepthImage : AutoCloseable {
 interface PairedRawDepthAcquirer {
     fun acquireDepth(): RawDepthImage
 
-    fun acquireConfidence(): RawDepthImage
+    /**
+     * Returns the source confidence image when the depth API provides one.
+     *
+     * ARCore's predicted depth image is dense but has no paired confidence
+     * plane. A null confidence therefore means that non-zero predicted depth
+     * is the validity signal and the selector supplies its source confidence.
+     */
+    fun acquireConfidence(): RawDepthImage?
 }
 
 class DepthNotYetAvailableException : RuntimeException()
@@ -63,11 +70,11 @@ class RawDepthCopySource(
         var confidence: RawDepthImage? = null
         return try {
             depth = acquirer.acquireDepth().also { onResourceAcquired() }
-            confidence = acquirer.acquireConfidence().also { onResourceAcquired() }
+            confidence = acquirer.acquireConfidence()?.also { onResourceAcquired() }
             val metadata = metadataForDimensions(depth.width, depth.height)
             if (
-                depth.width != confidence.width ||
-                depth.height != confidence.height ||
+                (confidence != null && depth.width != confidence.width) ||
+                (confidence != null && depth.height != confidence.height) ||
                 depth.width != metadata.width ||
                 depth.height != metadata.height
             ) {
@@ -97,7 +104,7 @@ class RawDepthCopySource(
     private fun copyObservation(
         metadata: RawDepthFrameMetadata,
         depth: RawDepthImage,
-        confidence: RawDepthImage,
+        confidence: RawDepthImage?,
     ): DepthAcquisitionResult.Observation {
         require(depth.width in 1..16_384 && depth.height in 1..16_384)
         val pixelCount = Math.multiplyExact(depth.width, depth.height)
@@ -107,7 +114,8 @@ class RawDepthCopySource(
             for (y in 0 until depth.height) {
                 for (x in 0 until depth.width) {
                     val depthMillimeters = depth.unsignedValue(x, y)
-                    val confidenceValue = confidence.unsignedValue(x, y)
+                    val confidenceValue = confidence?.unsignedValue(x, y)
+                        ?: PREDICTED_DEPTH_CONFIDENCE
                     if (depthMillimeters == 0 || confidenceValue == 0 ||
                         isDiscontinuity(depth, x, y, depthMillimeters)
                     ) {
@@ -122,6 +130,8 @@ class RawDepthCopySource(
             // slots on distinct depth layers. Flat tiles no longer consume a
             // second slot that a small foreground surface elsewhere needs.
             // The full source is scanned once without a per-pixel object array.
+            // Reserve most of the envelope for spatial coverage and leave
+            // room for second and third layers in mixed-depth tiles.
             val tileBudget = maxOf(1, maxCopiedPixels * 3 / 4)
             val columns = kotlin.math.sqrt(
                 tileBudget.toDouble() * depth.width / depth.height,
@@ -147,7 +157,8 @@ class RawDepthCopySource(
                     for (y in top until bottom) {
                         for (x in left until right) {
                             val value = depth.unsignedValue(x, y)
-                            val certainty = confidence.unsignedValue(x, y)
+                            val certainty = confidence?.unsignedValue(x, y)
+                                ?: PREDICTED_DEPTH_CONFIDENCE
                             if (value == 0 || certainty == 0) {
                                 rejected++
                                 continue
@@ -264,7 +275,7 @@ class RawDepthCopySource(
 
     private fun stableSample(
         depth: RawDepthImage,
-        confidence: RawDepthImage,
+        confidence: RawDepthImage?,
         x: Int,
         y: Int,
         targetDepth: Int,
@@ -279,7 +290,8 @@ class RawDepthCopySource(
                 if (value == 0 || kotlin.math.abs(value - targetDepth) >
                     discontinuityThresholdMillimeters / 2
                 ) continue
-                val certainty = confidence.unsignedValue(candidateX, candidateY)
+                val certainty = confidence?.unsignedValue(candidateX, candidateY)
+                    ?: PREDICTED_DEPTH_CONFIDENCE
                 if (certainty == 0 || isDiscontinuity(depth, candidateX, candidateY, value)) continue
                 return DepthPixelSample(candidateX, candidateY, value, certainty)
             }
@@ -303,3 +315,5 @@ class RawDepthCopySource(
             (y + 1 < depth.height && differs(depth.unsignedValue(x, y + 1)))
     }
 }
+
+private const val PREDICTED_DEPTH_CONFIDENCE = 255

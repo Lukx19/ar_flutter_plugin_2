@@ -268,6 +268,52 @@ final class ARVisibilitySyntheticScene {
         ),
       );
 
+  /// Emits one of 20 overlapping directions in the same synthetic map session.
+  Future<ARVisibilitySyntheticReceipt> emitSphereView(int viewIndex) {
+    _validateSphereViewIndex(viewIndex);
+    return _runArmedExclusive(
+      () => _invokeSequenced(
+        'sphereView',
+        <String, Object?>{'viewIndex': viewIndex},
+      ),
+    );
+  }
+
+  /// Emits the feature observation phase for one of 20 bounded directions.
+  ///
+  /// Pair this with [emitSphereDepthView] for the same [viewIndex]. The
+  /// native fixture keeps both phases in one map session and requires the
+  /// feature phase before its matching depth phase.
+  Future<ARVisibilitySyntheticReceipt> emitSphereFeatureView(int viewIndex) {
+    return _emitSpherePhase('sphereFeatureView', viewIndex);
+  }
+
+  /// Emits the depth observation phase for one of 20 bounded directions.
+  ///
+  /// This must follow [emitSphereFeatureView] for the same [viewIndex].
+  Future<ARVisibilitySyntheticReceipt> emitSphereDepthView(int viewIndex) {
+    return _emitSpherePhase('sphereDepthView', viewIndex);
+  }
+
+  Future<ARVisibilitySyntheticReceipt> _emitSpherePhase(
+    String method,
+    int viewIndex,
+  ) {
+    _validateSphereViewIndex(viewIndex);
+    return _runArmedExclusive(
+      () => _invokeSequenced(
+        method,
+        <String, Object?>{'viewIndex': viewIndex},
+      ),
+    );
+  }
+
+  static void _validateSphereViewIndex(int viewIndex) {
+    if (viewIndex < 0 || viewIndex >= 20) {
+      throw RangeError.range(viewIndex, 0, 19, 'viewIndex');
+    }
+  }
+
   Future<ARVisibilitySyntheticReceipt> setFault(
     ARVisibilitySyntheticFault fault,
   ) =>

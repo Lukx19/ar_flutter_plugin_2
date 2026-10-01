@@ -19,6 +19,7 @@ data class StorageBudgetReservationV2(
     val pointerRootBeforeBytes: Long? = null,
     val pointerSlotBeforeBytes: Long? = null,
     val pointerSelectorBeforeBytes: Long? = null,
+    /** Prewrite estimate; the committed charge is measured after publication. */
     val pointerCommitBytes: Long? = null,
 )
 
@@ -275,7 +276,6 @@ class StorageBudgetCoordinatorV2(
             return@withAuthority
         }
         if (current.pointerPublicationId != null) {
-            require(actualBytes == current.pointerCommitBytes)
             commitPointerLocked(current, actualBytes)
             return@withAuthority
         }
@@ -463,8 +463,8 @@ class StorageBudgetCoordinatorV2(
                 }
                 if (lines.size == 10) {
                     val state = lines[9].split(':')
-                    val actual = requireNotNull(reservation.pointerCommitBytes)
-                    require(state.size == 3 && state[0] == "COMMITTING" && state[1].toLongOrNull() == actual)
+                    val actual = state.getOrNull(1)?.toLongOrNull()
+                    require(state.size == 3 && state[0] == "COMMITTING" && actual != null && actual in 0..reservation.bytes)
                     val previous = state[2].toLongOrNull() ?: error("Corrupt pointer commit revision")
                     require(committed in setOf(previous, Math.addExact(previous, actual)))
                     if (committed == previous) {
@@ -557,7 +557,7 @@ class StorageBudgetCoordinatorV2(
         liveCandidateTokens -= value.token
     }
     private fun commitPointerLocked(value: StorageBudgetReservationV2, actualBytes: Long) {
-        require(value.pointerPublicationId != null && actualBytes == value.pointerCommitBytes && actualBytes in 0..value.bytes)
+        require(value.pointerPublicationId != null && actualBytes in 0..value.bytes)
         val other = reservedBytesLocked() - value.bytes
         val violatesFreeFloor = actualBytes > freeBytes() - policy.freeSpaceFloorBytes - other
         require(actualBytes <= policy.quotaBytes - committed && !violatesFreeFloor)

@@ -43,6 +43,8 @@ class DurableSessionStoreV2(
         val manifestId: String? = null,
         val reason: String,
         val recoveryContext: NativeCaptureRecoveryContextV2? = null,
+        val jpegSizeBytes: Long? = null,
+        val dngSizeBytes: Long? = null,
     )
     private val mutex = Any()
     private val files = SafeFilesystemV2(root, faults, filesystemBackend)
@@ -53,6 +55,46 @@ class DurableSessionStoreV2(
     init {
         try { files.ensureDirectory(sessionRoot) }
         catch (error: Throwable) { files.close(); throw error }
+    }
+
+    /**
+     * Materializes one committed JPEG into an app-private preview cache.
+     *
+     * V2 keeps the durable asset under the native store.  The UI needs a
+     * displayable image, but it must not receive a durable-store path or make
+     * the capture payload part of the Dart ownership protocol.  The caller
+     * supplies a cache target owned by the plugin; this method only accepts
+     * the immutable manifest and capture hashes published in the terminal
+     * event and copies the matching retained asset.
+     */
+    internal fun materializeJpegPreview(
+        manifestId: String,
+        captureId: String,
+        target: File,
+    ): Boolean = synchronized(mutex) {
+        if (!SAFE_HASH.matches(manifestId) || !SAFE_HASH.matches(captureId)) return@synchronized false
+        val locations = sessionRoot.listFiles()
+            ?.asSequence()
+            ?.filter { it.isDirectory }
+            .orEmpty()
+        var source: File? = null
+        for (location in locations) {
+            if (manifestId !in retainedRootHashes(location)) continue
+            val rootFile = path(location, "objects", "$manifestId.root")
+            val jpegHash = files.readLines(rootFile)
+                .firstOrNull { it.startsWith("component=JPEG:") }
+                ?.substringAfterLast(':')
+                ?.takeIf(SAFE_HASH::matches)
+                ?: continue
+            val asset = path(location, "assets", captureId)
+            source = path(asset, "jpeg.$jpegHash.blob").takeIf(files::isFile)
+            if (source != null) break
+        }
+        val selectedSource = source ?: return@synchronized false
+        target.parentFile?.mkdirs()
+        if (target.isFile && target.length() > 0L) return@synchronized true
+        selectedSource.copyTo(target, overwrite = true)
+        target.isFile && target.length() > 0L
     }
 
     /** Closes only this store's owned bound filesystem; the injected budget is borrowed. */
@@ -183,7 +225,9 @@ class DurableSessionStoreV2(
             faults.at(DurableStoreFaultPointV2.ROOT_WRITE)
             writeImmutable(path(location, "objects", "$rootHash.root"), rootBytes)
             faults.at(DurableStoreFaultPointV2.ROOT_FILE_SYNC)
-            val terminal = CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, request.accepted.identity, requestHash, "committed", captureId, revision, rootHash)
+            val jpegSizeBytes = request.components.single { it.kind == CaptureComponentKind.JPEG }.byteLength
+            val dngSizeBytes = request.components.singleOrNull { it.kind == CaptureComponentKind.DNG }?.byteLength
+            val terminal = CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, request.accepted.identity, requestHash, "committed", captureId, revision, rootHash, jpegSizeBytes, dngSizeBytes)
             val committed = CaptureReceipt(request.accepted.identity, CaptureAttemptPhase.COMMITTED_PICTURE, requestHash, receiptHash(requestHash, rootHash), true, terminal)
             // Receipt is durable before, and independently validates, the pointer switch.
             faults.at(DurableStoreFaultPointV2.RECEIPT_WRITE)
@@ -255,7 +299,9 @@ class DurableSessionStoreV2(
             faults.at(DurableStoreFaultPointV2.ROOT_WRITE)
             writeImmutable(path(location, "objects", "$rootHash.root"), rootBytes)
             faults.at(DurableStoreFaultPointV2.ROOT_FILE_SYNC)
-            val terminal = CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, identity, requestHash, "committed", captureId, revision, rootHash)
+            val jpegSizeBytes = request.components.single { it.kind == CaptureComponentKind.JPEG }.byteLength
+            val dngSizeBytes = request.components.singleOrNull { it.kind == CaptureComponentKind.DNG }?.byteLength
+            val terminal = CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, identity, requestHash, "committed", captureId, revision, rootHash, jpegSizeBytes, dngSizeBytes)
             val committed = CaptureReceipt(identity, CaptureAttemptPhase.COMMITTED_PICTURE, requestHash, receiptHash(requestHash, rootHash), true, terminal)
             faults.at(DurableStoreFaultPointV2.RECEIPT_WRITE)
             writePropertiesExclusive(
@@ -454,6 +500,8 @@ class DurableSessionStoreV2(
                             value.getProperty("rootHash"),
                             "recovered-committed",
                             acceptedValues.recoveryContext(),
+                            terminalComponentSize(session, value, CaptureComponentKind.JPEG),
+                            terminalComponentSize(session, value, CaptureComponentKind.DNG),
                         )
                     } else if (value.getProperty("kind") == CaptureTerminalKind.ABANDONED_ATTEMPT.name) {
                         RecoveryProjectionV2(
@@ -582,11 +630,20 @@ class DurableSessionStoreV2(
         val value = readProperties(file)
         val kind = value.getProperty("kind") ?: return null
         if (kind == CaptureTerminalKind.COMMITTED_PICTURE.name && value.getProperty("rootHash") !in retainedRootHashes(location)) return null
-        val terminal = if (kind == CaptureTerminalKind.COMMITTED_PICTURE.name) CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, identity, value.getProperty("requestHash"), "committed", value.getProperty("captureId"), value.getProperty("revision").toLong(), value.getProperty("rootHash"))
+        val terminal = if (kind == CaptureTerminalKind.COMMITTED_PICTURE.name) CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, identity, value.getProperty("requestHash"), "committed", value.getProperty("captureId"), value.getProperty("revision").toLong(), value.getProperty("rootHash"), terminalComponentSize(location, value, CaptureComponentKind.JPEG), terminalComponentSize(location, value, CaptureComponentKind.DNG))
         else CaptureTerminal(CaptureTerminalKind.ABANDONED_ATTEMPT, identity, value.getProperty("requestHash"), value.getProperty("reason", "abandoned"))
         return CaptureReceipt(identity, if (terminal.kind == CaptureTerminalKind.COMMITTED_PICTURE) CaptureAttemptPhase.COMMITTED_PICTURE else CaptureAttemptPhase.ABANDONED_ATTEMPT, value.getProperty("requestHash"), value.getProperty("receiptHash"), true, terminal)
     }
     private fun acceptedReceipt(attempt: CaptureAcceptedAttempt) = CaptureReceipt(attempt.identity, CaptureAttemptPhase.RESERVED_ACCEPTED, acceptedHash(attempt), attempt.acceptedReceiptHash.hex(), true)
+    /** Legacy receipts omitted DNG sizes; the retained hash-validated root still records the exact set. */
+    private fun terminalComponentSize(location: File, receipt: Properties, kind: CaptureComponentKind): Long? {
+        val property = if (kind == CaptureComponentKind.JPEG) "jpegSizeBytes" else "dngSizeBytes"
+        receipt.getProperty(property)?.let { return it.toLong().also { size -> require(size > 0) } }
+        val rootHash = receipt.getProperty("rootHash") ?: return null
+        val root = path(location, "objects", "$rootHash.root")
+        return files.readLines(root).singleOrNull { it.startsWith("component=${kind.name}:") }
+            ?.substringAfter(':')?.substringBefore(':')?.toLong()?.also { require(it > 0) }
+    }
     private fun acceptedHash(attempt: CaptureAcceptedAttempt) = sha256("${attempt.identity.commitId}|${attempt.identity.attemptId}|${attempt.reservation.totalStoreLiability}|${attempt.canonicalIntentHash.hex()}".toByteArray()).hex()
 
     private fun templateHash(template: CapturePostOutputTemplateV2) = sha256(
@@ -643,7 +700,7 @@ class DurableSessionStoreV2(
     private fun reservationOwner(identity: CaptureAttemptIdentity) = "capture:${safe(identity.lifecycleCut.sessionId)}:${safe(identity.commitId)}"
     private fun receiptHash(requestHash: String, rootHash: String) = sha256("$requestHash|$rootHash".toByteArray()).hex()
     private fun rootRecord(request: CaptureCommitRequest, requestHash: String, revision: Long, staged: List<Staged>, prior: RootPointer?) = buildString { append("schema=5\nrevision=$revision\nrequest=$requestHash\nprevious=${prior?.rootHash ?: "-"}\nsecondPrevious=${prior?.previousHash ?: "-"}\n"); staged.sortedBy { it.kind.ordinal }.forEach { append("component=${it.kind}:${it.descriptor.byteLength}:${it.descriptor.sha256.hex()}\n") } }.toByteArray(StandardCharsets.UTF_8)
-    private fun receiptProperties(receipt: CaptureReceipt, rootHash: String) = Properties().apply { setProperty("kind", receipt.terminal!!.kind.name); setProperty("requestHash", receipt.requestHash); setProperty("receiptHash", receipt.receiptHash); setProperty("rootHash", rootHash); setProperty("reason", receipt.terminal.reason); receipt.terminal.captureId?.let { setProperty("captureId", it) }; receipt.terminal.captureRevision?.let { setProperty("revision", it.toString()) } }
+    private fun receiptProperties(receipt: CaptureReceipt, rootHash: String) = Properties().apply { setProperty("kind", receipt.terminal!!.kind.name); setProperty("requestHash", receipt.requestHash); setProperty("receiptHash", receipt.receiptHash); setProperty("rootHash", rootHash); setProperty("reason", receipt.terminal.reason); receipt.terminal.captureId?.let { setProperty("captureId", it) }; receipt.terminal.captureRevision?.let { setProperty("revision", it.toString()) }; receipt.terminal.jpegSizeBytes?.let { setProperty("jpegSizeBytes", it.toString()) }; receipt.terminal.dngSizeBytes?.let { setProperty("dngSizeBytes", it.toString()) } }
 
     private fun replayReceiptBeforeExposure(location: File, request: CaptureCommitRequest): CaptureReceipt? {
         val prior = receipt(location, request.accepted.identity) ?: return null

@@ -121,6 +121,67 @@ jlong open_relative(JNIEnv* env, int root, jobjectArray path, int flags, bool cr
 }
 jlong open_read(JNIEnv* env, jobject, jlong root, jobjectArray path) { return open_relative(env, root, path, O_RDONLY, false); }
 jlong create_exclusive(JNIEnv* env, jobject, jlong root, jobjectArray path) { return open_relative(env, root, path, O_WRONLY | O_CREAT | O_EXCL, true); }
+void allocate_exclusive(JNIEnv* env, jobject, jlong root, jobjectArray path, jlong bytes) {
+    if (bytes <= 0) { errno = EINVAL; fail(env, "invalid allocation size"); return; }
+
+    const off_t length = static_cast<off_t>(bytes);
+    if (length < 0 || static_cast<jlong>(length) != bytes) {
+        errno = EOVERFLOW;
+        fail(env, "allocation size overflow");
+        return;
+    }
+
+    int fd = static_cast<int>(open_relative(env, root, path, O_WRONLY | O_CREAT | O_EXCL, true));
+    if (fd < 0) return;
+
+    // posix_fallocate reserves real blocks without copying a zero-filled
+    // multi-megabyte buffer through the JNI bridge. This is the durable
+    // reservation path, so keep the fsync below even when allocation itself
+    // completes synchronously.
+    int result = posix_fallocate(fd, 0, length);
+    if (result != 0 && result != ENOSYS && result != EOPNOTSUPP && result != ENOTSUP) {
+        errno = result;
+        fail(env, "posix_fallocate");
+        close(fd);
+        return;
+    }
+
+    // Some Android filesystems do not implement posix_fallocate. Preserve the
+    // old physically-backed behavior there rather than silently creating a
+    // sparse reservation.
+    if (result != 0) {
+        std::vector<char> buffer(64 * 1024, 0);
+        jlong remaining = bytes;
+        while (remaining > 0) {
+            const size_t count = static_cast<size_t>(std::min<jlong>(remaining, buffer.size()));
+            size_t written = 0;
+            while (written < count) {
+                const ssize_t value = write(fd, buffer.data() + written, count - written);
+                if (value < 0) {
+                    if (errno == EINTR) continue;
+                    fail(env, "write allocation");
+                    close(fd);
+                    return;
+                }
+                if (value == 0) {
+                    errno = EIO;
+                    fail(env, "write allocation");
+                    close(fd);
+                    return;
+                }
+                written += static_cast<size_t>(value);
+            }
+            remaining -= static_cast<jlong>(count);
+        }
+    }
+
+    if (fsync(fd) < 0) {
+        fail(env, "fsync allocation");
+        close(fd);
+        return;
+    }
+    close(fd);
+}
 
 jint read_fd(JNIEnv* env, jobject, jlong fd, jbyteArray bytes, jint offset, jint count) {
     std::vector<jbyte> buffer(count); ssize_t value = read(fd, buffer.data(), count);
@@ -168,6 +229,7 @@ JNINativeMethod methods[] = {
     {"nativeAllocatedBlocks", "(J[Ljava/lang/String;)J", reinterpret_cast<void*>(allocated_size_of)},
     {"nativeAllocationUnit", "(J[Ljava/lang/String;)J", reinterpret_cast<void*>(allocation_unit_of)},
     {"nativeOpenRead", "(J[Ljava/lang/String;)J", reinterpret_cast<void*>(open_read)}, {"nativeCreateExclusive", "(J[Ljava/lang/String;)J", reinterpret_cast<void*>(create_exclusive)},
+    {"nativeAllocateExclusive", "(J[Ljava/lang/String;J)V", reinterpret_cast<void*>(allocate_exclusive)},
     {"nativeRead", "(J[BII)I", reinterpret_cast<void*>(read_fd)}, {"nativeWrite", "(J[BII)V", reinterpret_cast<void*>(write_fd)}, {"nativeSync", "(J)V", reinterpret_cast<void*>(sync_fd)},
     {"nativeAtomicReplace", "(J[Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V", reinterpret_cast<void*>(atomic_replace)},
     {"nativeAtomicMove", "(J[Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;)V", reinterpret_cast<void*>(atomic_move)},

@@ -317,7 +317,7 @@ class DepthEvidenceKernelTest {
             FakeCanonicalView(),
         ) as DepthEvidenceResult.Accepted
 
-        assertEquals(expectedAccepted(1, acceptedSamples = 32, rayVisits = 992, virtualWork = 1_025), result)
+        assertEquals(expectedAccepted(1, acceptedSamples = 32, rayVisits = 31, virtualWork = 64), result)
     }
 
     @Test
@@ -330,7 +330,7 @@ class DepthEvidenceKernelTest {
             FakeCanonicalView(),
         ) as DepthEvidenceResult.Accepted
 
-        assertEquals(expectedAccepted(1, acceptedSamples = 64, rayVisits = 1_984, virtualWork = 2_049), result)
+        assertEquals(expectedAccepted(1, acceptedSamples = 64, rayVisits = 31, virtualWork = 96), result)
     }
 
     @Test
@@ -1151,7 +1151,7 @@ class DepthEvidenceKernelTest {
         }
 
         assertEquals(
-            DepthEvidenceResourceReceipt(2, 64, 0, 0, 2, 2_160, false, 2_546_760, 2_548_920),
+            DepthEvidenceResourceReceipt(2, 64, 0, 0, 2, 2_160, false, 2_628_680, 2_630_840, 16 * 1024 * 1024),
             kernel.resourceReceipt(),
         )
     }
@@ -1176,12 +1176,12 @@ class DepthEvidenceKernelTest {
             expectedAccepted(
                 1,
                 acceptedSamples = V2_DEPTH_SAMPLE_CAPACITY,
-                rayVisits = 16_896,
-                virtualWork = 18_433,
+                rayVisits = 11,
+                virtualWork = 4_108,
             ),
             result,
         )
-        assertEquals(12_676_816, kernel.resourceReceipt().fixedPrimitiveBytes)
+        assertEquals(12_958_416, kernel.resourceReceipt().fixedPrimitiveBytes)
         kernel.discardPrepared()
     }
 

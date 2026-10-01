@@ -51,6 +51,52 @@ class RawDepthCopySourceTest {
     }
 
     @Test
+    fun `dense predicted depth is accepted without a confidence plane`() {
+        val depth = FakeRawDepthImage(width = 4, height = 3, value = 1_000)
+        val result = RawDepthCopySource(
+            acquirer = FakePairedAcquirer(depth = depth, confidence = null),
+        ).acquire(metadata()) as DepthAcquisitionResult.Observation
+
+        assertEquals(12, result.value.samples.size)
+        assertTrue(result.value.samples.all { it.confidence == 255 })
+        assertEquals(0, result.value.sourceRejectedPixels)
+        assertEquals(1, depth.closeCount)
+    }
+
+    @Test
+    fun `paired raw depth and confidence images both count as native resources`() {
+        var acquired = 0
+        var released = 0
+        val depth = FakeRawDepthImage(width = 4, height = 3, value = 1_000)
+        val confidence = FakeRawDepthImage(width = 4, height = 3, value = 255)
+        val source = RawDepthCopySource(
+            acquirer = FakePairedAcquirer(depth, confidence),
+            onResourceAcquired = { acquired++ },
+            onResourceClosed = { released++ },
+        )
+
+        assertTrue(source.acquire(metadata()) is DepthAcquisitionResult.Observation)
+        assertEquals(2, acquired)
+        assertEquals(2, released)
+        assertEquals(1, depth.closeCount)
+        assertEquals(1, confidence.closeCount)
+    }
+
+    @Test
+    fun `zero confidence rejects the corresponding raw depth sample`() {
+        val depth = FakeRawDepthImage(width = 2, height = 1, value = 1_000)
+        val confidence = FakeRawDepthImage(width = 2, height = 1) { x, _ ->
+            if (x == 0) 0 else 255
+        }
+        val result = RawDepthCopySource(
+            acquirer = FakePairedAcquirer(depth, confidence),
+        ).acquire(metadata(width = 2, height = 1)) as DepthAcquisitionResult.Observation
+
+        assertEquals(listOf(DepthPixelSample(1, 0, 1_000, 255)), result.value.samples)
+        assertEquals(1, result.value.sourceRejectedPixels)
+    }
+
+    @Test
     fun `large depth image scans pixels with bounded retained samples`() {
         var depthReads = 0
         var confidenceReads = 0
@@ -318,9 +364,9 @@ class RawDepthCopySourceTest {
         override fun acquireDepth(): RawDepthImage =
             depth ?: throw IllegalStateException("depth failed")
 
-        override fun acquireConfidence(): RawDepthImage {
+        override fun acquireConfidence(): RawDepthImage? {
             confidenceFailure?.let { throw it }
-            return confidence ?: throw IllegalStateException("confidence failed")
+            return confidence
         }
     }
 

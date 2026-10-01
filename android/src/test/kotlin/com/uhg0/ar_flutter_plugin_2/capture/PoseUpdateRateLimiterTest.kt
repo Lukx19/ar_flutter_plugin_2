@@ -15,11 +15,12 @@ class PoseUpdateRateLimiterTest {
     }
 
     @Test
-    fun `preserves stable ordering for nondecreasing timestamps`() {
+    fun `suppresses duplicate and out of order timestamps`() {
         val limiter = PoseUpdateRateLimiter(maxRateHz = 30)
 
         assertTrue(limiter.shouldEmit(1_000_000_000L))
-        assertTrue(limiter.shouldEmit(1_000_000_000L))
+        assertFalse(limiter.shouldEmit(1_000_000_000L))
+        assertFalse(limiter.shouldEmit(999_000_000L))
         assertTrue(limiter.shouldEmit(1_040_000_000L))
         assertFalse(limiter.shouldEmit(1_050_000_000L))
         assertTrue(limiter.shouldEmit(1_080_000_000L))

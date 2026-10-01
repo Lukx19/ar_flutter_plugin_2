@@ -609,7 +609,11 @@ private class CowSortedPageWriter(
                     val bucket = bucket(bytes, byteIndex)
                     out.seek(offsets[bucket]); out.write(bytes); offsets[bucket] += recordBytes
                 }
-                out.fd.sync()
+                // These radix spools are staging-only and are never named by
+                // the generation manifest. The final fragment pages are
+                // synced by CowPageWriter, followed by the staging-directory
+                // sync before publication, so syncing every temporary pass
+                // adds latency without strengthening the durable cut.
             }
         }
     }

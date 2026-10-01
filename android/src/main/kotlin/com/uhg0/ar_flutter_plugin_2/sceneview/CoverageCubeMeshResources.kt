@@ -525,8 +525,8 @@ internal class CoverageCubeMeshResources(
             }
             // Submit the paired position/color page as one bounded unit. The
             // direct buffers remain owned until Filament delivers both real
-            // consumption callbacks.
-            uploader.completeSubmissionFence()
+            // consumption callbacks; the kick itself does not wait.
+            uploader.kickSubmission()
         }
 
         private fun writeRange(
@@ -707,8 +707,8 @@ internal class CoverageCubeMeshResources(
             onConsumed: () -> Unit,
         )
 
-        /** Completes this bounded paired page's driver submission. */
-        fun completeSubmissionFence() = Unit
+        /** Kicks this bounded paired page's driver submission without waiting. */
+        fun kickSubmission() = Unit
     }
 
     private class FilamentCoverageCubeVertexUploader(
@@ -751,8 +751,8 @@ internal class CoverageCubeMeshResources(
             )
         }
 
-        override fun completeSubmissionFence() {
-            engine.flushAndWait()
+        override fun kickSubmission() {
+            engine.flush()
         }
     }
 }

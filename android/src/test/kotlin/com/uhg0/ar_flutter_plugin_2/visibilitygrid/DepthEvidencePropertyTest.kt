@@ -221,7 +221,7 @@ class DepthEvidencePropertyTest {
     fun `maximum configured ownership remains within the semantic state budget`() {
         val receipt = DepthEvidenceKernel(
             DepthEvidenceConfiguration(
-                sampleCapacity = 1_536,
+                sampleCapacity = V2_DEPTH_SAMPLE_CAPACITY,
                 rayVisitCapacity = 65_536,
                 surfaceCapacity = 100_000,
             ),
@@ -234,10 +234,11 @@ class DepthEvidencePropertyTest {
                 preparedEvidenceRows = 0,
                 preparedResidentBytes = 0,
                 evidenceRowCapacity = 100_000,
-                fixedPrimitiveBytes = 12_676_816,
+                fixedPrimitiveBytes = 12_958_416,
                 closed = false,
-                maximumAcceptedOutputReserveBytes = 2_546_760,
-                modeledMaximumSemanticStateBytes = 15_223_576,
+                maximumAcceptedOutputReserveBytes = 2_628_680,
+                modeledMaximumSemanticStateBytes = 15_587_096,
+                semanticStateBudgetBytes = 16 * 1024 * 1024,
             ),
             receipt,
         )
@@ -250,7 +251,7 @@ class DepthEvidencePropertyTest {
                 (16 + (65_536 + V2_DEPTH_SAMPLE_CAPACITY)) +
                 (16 + (65_536 + V2_DEPTH_SAMPLE_CAPACITY) * 4) +
                 96 + (56 + 104 + 40)
-        assertEquals(2_546_760, maximumMixedPacketBytes)
+        assertEquals(2_628_680, maximumMixedPacketBytes)
         assertEquals(maximumMixedPacketBytes, receipt.maximumAcceptedOutputReserveBytes)
         assertTrue(receipt.modeledMaximumSemanticStateBytes <= 16 * 1024 * 1024)
         assertThrows(IllegalArgumentException::class.java) {
@@ -291,10 +292,10 @@ class DepthEvidencePropertyTest {
     }
 
     @Test
-    fun `reverse ordered maximum endpoint packet remains inside work and output headroom`() {
-        val capacity = V2_DEPTH_SAMPLE_CAPACITY
+    fun `reverse ordered wide endpoint packet remains inside work and output headroom`() {
         val width = 48
         val height = 32
+        val capacity = width * height
         val samples = List(capacity) { index ->
             VisibilityDepthSample(index % width, index / width, 200, 255)
         }
@@ -340,8 +341,8 @@ class DepthEvidencePropertyTest {
             DepthEvidenceWorkReceipt(capacity, capacity, 38_336, 0, 101_312),
             result.work,
         )
-        assertEquals(2_546_760, kernel.resourceReceipt().maximumAcceptedOutputReserveBytes)
-        assertEquals(15_223_576, kernel.resourceReceipt().modeledMaximumSemanticStateBytes)
+        assertEquals(2_628_680, kernel.resourceReceipt().maximumAcceptedOutputReserveBytes)
+        assertEquals(15_587_096, kernel.resourceReceipt().modeledMaximumSemanticStateBytes)
     }
 
     @Test
@@ -429,12 +430,12 @@ class DepthEvidencePropertyTest {
             second.work,
         )
         assertTrue(second.work.virtualWorkUnits < 4_000_000)
-        assertEquals(2_546_760, kernel.resourceReceipt().maximumAcceptedOutputReserveBytes)
-        assertEquals(15_223_576, kernel.resourceReceipt().modeledMaximumSemanticStateBytes)
+        assertEquals(2_628_680, kernel.resourceReceipt().maximumAcceptedOutputReserveBytes)
+        assertEquals(15_587_096, kernel.resourceReceipt().modeledMaximumSemanticStateBytes)
     }
 
     @Test
-    fun `second valid sample refuses after first ray consumes the exact global visit budget`() {
+    fun `duplicate endpoint reuses the exact global ray visit budget`() {
         val cameraZ = 3_997.5
         val frame = VisibilityGroupFrame.copyOf(
             identity().toDoubleArray(), identity().toDoubleArray(), 122, 100_000,
@@ -451,17 +452,10 @@ class DepthEvidencePropertyTest {
         kernel.applyPrepared()
         val before = kernel.resourceReceipt()
 
-        assertEquals(
-            DepthEvidenceResult.Refused(
-                DepthEvidenceRefusal.RAY_VISIT_CAPACITY,
-                attemptReceipt(
-                    2, acceptedSamples = 1, rayVisits = 65_536, touchedRows = 1,
-                    capacityRefusals = 1, virtualWork = 65_538,
-                ),
-            ),
-            kernel.prepare(batch(2, listOf(sample, sample)), view),
-        )
-        assertEquals(0, kernel.resourceReceipt().preparedEvidenceRows)
+        val repeated = kernel.prepare(batch(2, listOf(sample, sample)), view) as DepthEvidenceResult.Accepted
+        assertEquals(2, repeated.receipt.acceptedSamples)
+        assertEquals(65_536, repeated.receipt.rayVisits)
+        kernel.discardPrepared()
         assertEquals(before, kernel.resourceReceipt())
         assertEquals(DepthEvidenceApplyResult.NoPrepared(committed.receipt), kernel.applyPrepared())
         assertTrue(kernel.prepare(batch(2, listOf(sample)), view) is DepthEvidenceResult.Accepted)
@@ -528,15 +522,15 @@ class DepthEvidencePropertyTest {
             DepthEvidenceResult.Refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED, attemptReceipt(4)),
             kernel.prepare(batch(4), view),
         )
-        assertEquals(12_676_816, kernel.resourceReceipt().fixedPrimitiveBytes)
-        assertEquals(15_223_576, kernel.resourceReceipt().modeledMaximumSemanticStateBytes)
+        assertEquals(12_958_416, kernel.resourceReceipt().fixedPrimitiveBytes)
+        assertEquals(15_587_096, kernel.resourceReceipt().modeledMaximumSemanticStateBytes)
     }
 
     @Test
-    fun `maximum source and target packet remains immutable after kernel close`() {
-        val capacity = V2_DEPTH_SAMPLE_CAPACITY
+    fun `wide source and target packet remains immutable after kernel close`() {
         val width = 48
         val height = 32
+        val capacity = width * height
         val frame = VisibilityGroupFrame.copyOf(
             identity().toDoubleArray(), identity().toDoubleArray(), 100_000, 100_000,
         )
@@ -599,7 +593,7 @@ class DepthEvidencePropertyTest {
         assertEquals(hashBeforeClose, result.changes.hashCode())
         assertEquals(firstBeforeClose, result.changes.first())
         assertEquals(lastBeforeClose, result.changes.last())
-        assertEquals(2_546_760, DepthEvidenceKernel().resourceReceipt().maximumAcceptedOutputReserveBytes)
+        assertEquals(2_628_680, DepthEvidenceKernel().resourceReceipt().maximumAcceptedOutputReserveBytes)
     }
 
     @Test

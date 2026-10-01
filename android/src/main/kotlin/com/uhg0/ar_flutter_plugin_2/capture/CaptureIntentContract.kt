@@ -275,10 +275,14 @@ data class CaptureTerminal(
     val captureId: String? = null,
     val captureRevision: Long? = null,
     val manifestId: String? = null,
+    val jpegSizeBytes: Long? = null,
+    val dngSizeBytes: Long? = null,
 ) {
     init {
         require(canonicalTerminalHash.isNotEmpty() && reason.isNotEmpty())
         require(captureRevision == null || captureRevision >= 0)
+        require(jpegSizeBytes == null || jpegSizeBytes > 0)
+        require(dngSizeBytes == null || (dngSizeBytes > 0 && jpegSizeBytes != null))
         require((kind == CaptureTerminalKind.COMMITTED_PICTURE) == (captureId != null && captureRevision != null && manifestId != null))
     }
 }

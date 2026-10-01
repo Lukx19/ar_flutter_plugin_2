@@ -626,6 +626,29 @@ class CanonicalAcknowledgementTest {
     }
 
     @Test
+    fun `adjacent camera cuts survive six measured allocation cycles`() {
+        val fixture = activated("measured-cycles")
+        try {
+            fixture.budget.emulateMeasuredAllocation(fixture.directory)
+            repeat(6) { cycle ->
+                val state = requireNotNull(fixture.owner.activationState())
+                val current = state.current as CanonicalActivationCurrent.Receipt
+                assertTrue(fixture.owner.acknowledgeCanonicalCurrent(
+                    CanonicalAcknowledgement(
+                        current.identity.commandHash, state.cut.geometryRevision,
+                        state.cut.lineageRevision,
+                    ),
+                ) is CanonicalAcknowledgementResult.Acknowledged)
+                val result = fixture.owner.commitAdjacentCanonicalMutation(
+                    adjacentPlan(fixture, state, cycle + 2),
+                )
+                assertTrue("cycle=$cycle result=$result", result is CanonicalAdjacentCommitResult.Committed)
+            }
+            assertEquals(0L, fixture.budget.reservedBytes)
+        } finally { fixture.directory.deleteRecursively() }
+    }
+
+    @Test
     fun `adjacent activation selector process cuts settle exact durable reservations`() {
         CanonicalAdjacentFault.entries.forEachIndexed { index, fault ->
             val fixture = activated("adjacent-pointer-$index")
@@ -813,10 +836,9 @@ class CanonicalAcknowledgementTest {
         }
     }
 
-    private fun activated(suffix: String): Fixture {
+    private fun activated(suffix: String, budget: CountingBudget = CountingBudget()): Fixture {
         val directory = Files.createTempDirectory("canonical-surface-ack-$suffix").toFile()
         val group = SurfaceGroup("ack-$suffix")
-        val budget = CountingBudget()
         val legacy = opened(SurfaceOwnership.open(group, directory))
         val id = (legacy.apply(SurfaceOwnershipCommand("seed", listOf(candidate(0)))) as SurfaceOwnershipResult.Accepted).owners.single().id
         legacy.transact(CanonicalTransactionCommand("current", CanonicalOperation.RELOCATION, 0, 0, listOf(id), listOf(CanonicalTarget(id, Voxel(1, 0, 0), 0, 0, 192))))
@@ -880,6 +902,16 @@ class CanonicalAcknowledgementTest {
     private fun opened(result: SurfaceOwnershipOpenResult) = (result as SurfaceOwnershipOpenResult.Opened).ownership
     private data class Fixture(val directory: File, val group: SurfaceGroup, val budget: CountingBudget, val id: SurfaceId, val owner: SurfaceOwnership)
     private class CountingBudget : ExclusiveFakeStorageBudget() {
+        private var reportedUnit = 4_096L
+        private var measuredUnit = 4_096L
+        private val existingAllocation = hashMapOf<String, Long>()
+        fun emulateMeasuredAllocation(parent: File) {
+            parent.walkTopDown().forEach { file ->
+                existingAllocation[file.absolutePath] = measured(file)
+            }
+            reportedUnit = 12_288L
+            measuredUnit = 8_192L
+        }
         private data class Token(val id: Int, val bytes: Long)
         private var next = 0
         private val outstanding = linkedMapOf<Token, Long>()
@@ -914,7 +946,17 @@ class CanonicalAcknowledgementTest {
             committedBytes -= bytes
             return bytes
         }
-        override fun allocationUnitBytes(path: File) = 4_096L
+        override fun allocationUnitBytes(path: File) = reportedUnit
+        private fun measured(file: File): Long {
+            existingAllocation[file.absolutePath]?.let { return it }
+            if (file.isDirectory) return measuredUnit
+            return if (file.length() == 0L) 0L
+            else ((file.length() - 1L) / measuredUnit + 1L) * measuredUnit
+        }
+        override fun allocatedBytes(path: File): Long {
+            if (!path.exists()) return 0L
+            return if (path.isDirectory) path.walkTopDown().sumOf(::measured) else measured(path)
+        }
         private fun forget(token: Any) { attempts.values.forEach { it.removeIf { value -> value.token == token } } }
     }
 }

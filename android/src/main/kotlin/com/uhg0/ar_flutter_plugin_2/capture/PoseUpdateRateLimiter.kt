@@ -16,7 +16,12 @@ internal class PoseUpdateRateLimiter(
         val previousTimestampNs = lastPoseUpdateTimestampNs
         if (
             previousTimestampNs != null &&
-                timestampNs > previousTimestampNs &&
+                timestampNs <= previousTimestampNs
+        ) {
+            return false
+        }
+        if (
+            previousTimestampNs != null &&
                 timestampNs - previousTimestampNs < minPoseUpdateIntervalNs
         ) {
             return false

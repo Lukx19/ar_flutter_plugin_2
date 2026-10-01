@@ -176,21 +176,35 @@ class StorageBudgetCoordinatorV2Test {
         val reservation = first.reservePointerPublication(
             "canonical-surface:canonical:selector", "a".repeat(64), 1,
             rootBeforeBytes = 0L, slotBeforeBytes = 4_096L, selectorBeforeBytes = 4_096L,
-            commitBytes = 4_096L, maximumPhysicalBytes = 32_768L,
+            commitBytes = 20_480L, maximumPhysicalBytes = 32_768L,
         )!!
         val metadata = File(root, "reservations-v2/${reservation.token}.reservation")
-        metadata.appendText("COMMITTING:4096:0\n")
+        metadata.appendText("COMMITTING:8192:0\n")
         first.close()
 
         StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 10_000_000 }.use { restarted ->
-            assertEquals(4_096L, restarted.committedBytes())
+            assertEquals(8_192L, restarted.committedBytes())
             assertEquals(0L, restarted.reservedBytes())
             assertTrue(!metadata.exists())
             assertTrue(!File(root, "reservations-v2/${reservation.token}.allocation").exists())
         }
         StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 10_000_000 }.use { repeated ->
-            assertEquals(4_096L, repeated.committedBytes())
+            assertEquals(8_192L, repeated.committedBytes())
             assertEquals(0L, repeated.reservedBytes())
+        }
+    }
+
+    @Test fun `pointer commit charges measured bytes within its durable reservation`() {
+        val root = directory()
+        StorageBudgetCoordinatorV2(root, StorageBudgetPolicyV2(1_000_000, 0), physicalFilesystem()) { 10_000_000 }.use { coordinator ->
+            val reservation = coordinator.reservePointerPublication(
+                "canonical-surface:canonical:selector", "b".repeat(64), 0,
+                rootBeforeBytes = 0L, slotBeforeBytes = 8_192L, selectorBeforeBytes = 8_192L,
+                commitBytes = 20_480L, maximumPhysicalBytes = 32_768L,
+            )!!
+            coordinator.commit(reservation, 8_192L)
+            assertEquals(8_192L, coordinator.committedBytes())
+            assertEquals(0L, coordinator.reservedBytes())
         }
     }
 

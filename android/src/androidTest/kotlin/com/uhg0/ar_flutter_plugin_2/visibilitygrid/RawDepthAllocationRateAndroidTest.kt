@@ -90,10 +90,11 @@ class RawDepthAllocationRateAndroidTest {
             assertTrue("minimum retained samples ${minimumSamples.get()}", minimumSamples.get() >= 1_400)
             assertTrue(allocated >= 0 && freed >= 0)
             val allocationRate = allocated * 60_000 / elapsed
-            // The full-slot primitive-read emulator baseline was 9.9 MiB/min
-            // at four Hz. This guard catches per-pixel boxing before a future
-            // pooled observation representation reduces sample churn.
-            assertTrue("ART allocation rate $allocationRate", allocationRate <= 32L * 1024L * 1024L)
+            // The 4,096-slot content-aware selector measured 51,696,931
+            // bytes/min at four Hz on API 30. The 64 MiB/min guard allows
+            // this density while still catching per-pixel boxing; pooled
+            // observations remain a later allocation improvement.
+            assertTrue("ART allocation rate $allocationRate", allocationRate <= 64L * 1024L * 1024L)
             Log.i(
                 "RawDepthAllocationRate",
                 "depth_2000x2000_duration_ms=$elapsed offered=120 accepted=$accepted dropped=$dropped " +
@@ -109,7 +110,143 @@ class RawDepthAllocationRateAndroidTest {
         }
     }
 
+    @Test(timeout = 50_000)
+    fun depthSelectionMappingFusionAndCanonicalPreparationReportSeparateRate() {
+        val closed = AtomicInteger()
+        val published = AtomicInteger()
+        val minimumSamples = AtomicInteger(Int.MAX_VALUE)
+        val completion = CountDownLatch(1)
+        val sequence = AtomicInteger()
+        val identity = identityTransform()
+        val groupFrame = VisibilityGroupFrame.copyOf(identity, identity, 100_000, 100_000)
+        val canonical = emptyCanonicalView()
+        val kernel = DepthEvidenceKernel()
+        val metadata = RawDepthFrameMetadata(
+            timestampNs = 1,
+            groupGeneration = 1,
+            sessionGeneration = 1,
+            tracking = true,
+            width = 2_000,
+            height = 2_000,
+            intrinsics = DepthIntrinsics(1_000.0, 1_000.0, 1_000.0, 1_000.0),
+            worldFromCameraGl = identity,
+        )
+        fun frame() = PreparedRawDepthFrame(
+            metadata,
+            SyntheticImage(2_000, 2_000, closed, foreground = true),
+            SyntheticImage(2_000, 2_000, closed, foreground = false),
+            V2_DEPTH_SAMPLE_CAPACITY,
+        )
+        val processor = BoundedDepthObservationProcessor<PreparedRawDepthFrame, DepthAcquisitionResult>(
+            process = { prepared ->
+                val observation = prepared.process() as DepthAcquisitionResult.Observation
+                val value = observation.value
+                val batch = DepthEvidenceBatch(
+                    sequence.incrementAndGet().toLong(),
+                    value.timestampNs,
+                    groupFrame,
+                    identity.toList(),
+                    VisibilityCameraIntrinsics(2_000, 2_000, 1_000.0, 1_000.0, 1_000.0, 1_000.0),
+                    value.samples.map {
+                        VisibilityDepthSample(it.x, it.y, it.depthMillimeters, it.confidence)
+                    },
+                    value.sourceRejectedPixels,
+                )
+                val result = kernel.prepare(batch, canonical)
+                check(result is DepthEvidenceResult.Accepted) { "mapping/fusion preparation refused: $result" }
+                kernel.discardPrepared()
+                observation
+            },
+            publish = { result, _ ->
+                val observation = result as DepthAcquisitionResult.Observation
+                minimumSamples.getAndUpdate { minOf(it, observation.value.samples.size) }
+                published.incrementAndGet()
+                completion.countDown()
+            },
+        )
+        try {
+            repeat(2) {
+                assertTrue(processor.offer(frame(), 0))
+                assertTrue(completion.await(2, TimeUnit.SECONDS))
+                assertTrue(processor.awaitIdle(2_000))
+            }
+            val allocatedBefore = artStat("art.gc.bytes-allocated")
+            val freedBefore = artStat("art.gc.bytes-freed")
+            val gcBefore = artStat("art.gc.gc-count")
+            val nativeBefore = Debug.getNativeHeapAllocatedSize()
+            var nativePeak = nativeBefore
+            val started = SystemClock.elapsedRealtime()
+            var accepted = 0
+            var dropped = 0
+            repeat(120) { index ->
+                if (processor.offer(frame(), 0)) {
+                    accepted++
+                    assertTrue(completion.await(2, TimeUnit.SECONDS))
+                } else {
+                    dropped++
+                }
+                if (index % 20 == 19) {
+                    nativePeak = maxOf(nativePeak, Debug.getNativeHeapAllocatedSize())
+                }
+                val nextOffer = started + (index + 1) * 250L
+                SystemClock.sleep(maxOf(0L, nextOffer - SystemClock.elapsedRealtime()))
+            }
+            assertTrue(processor.awaitIdle(2_000))
+            val elapsed = SystemClock.elapsedRealtime() - started
+            val allocated = artStat("art.gc.bytes-allocated") - allocatedBefore
+            val freed = artStat("art.gc.bytes-freed") - freedBefore
+            val nativeAfter = Debug.getNativeHeapAllocatedSize()
+            assertTrue(elapsed in 30_000..50_000)
+            assertTrue(accepted > 0)
+            assertEquals(120, accepted + dropped)
+            assertEquals(accepted + 2, published.get())
+            assertEquals(244, closed.get())
+            assertTrue("minimum retained samples ${minimumSamples.get()}", minimumSamples.get() >= 1_400)
+            assertTrue(allocated >= 0 && freed >= 0)
+            val allocationRate = allocated * 60_000 / elapsed
+            // This is intentionally a separate guard from selection-only
+            // allocation: it includes depth mapping, ray traversal, fusion,
+            // and canonical preparation. The tablet baseline was
+            // 548,598,050 bytes/min; keep a small diagnostic margin while
+            // the future pooled representation is still unimplemented.
+            val currentBaselineGuard = 600L * 1024L * 1024L
+            Log.i(
+                "RawDepthAllocationRate",
+                "depth_2000x2000_full_processing_duration_ms=$elapsed offered=120 " +
+                    "accepted=$accepted dropped=$dropped minimum_retained_samples=${minimumSamples.get()} " +
+                    "art_allocated_bytes_per_minute=$allocationRate " +
+                    "art_freed_bytes_per_minute=${freed * 60_000 / elapsed} " +
+                    "art_gc_count=${artStat("art.gc.gc-count") - gcBefore} " +
+                    "native_heap_start_bytes=$nativeBefore native_heap_end_bytes=$nativeAfter " +
+                    "native_heap_peak_sample_bytes=$nativePeak " +
+                    "current_baseline_guard_bytes_per_minute=$currentBaselineGuard",
+            )
+            assertTrue("ART full processing allocation rate $allocationRate",
+                allocationRate <= currentBaselineGuard)
+        } finally {
+            processor.close()
+            kernel.close()
+        }
+    }
+
     private fun artStat(name: String): Long = Debug.getRuntimeStat(name)!!.toLong()
+
+    private fun identityTransform() = DoubleArray(16) { if (it % 5 == 0) 1.0 else 0.0 }
+
+    private fun emptyCanonicalView() = object : BoundedCanonicalSurfaceView {
+        override val revisionPair = CanonicalRevisionPair(0, 0)
+        override val surfaceCount = 0
+        override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? = null
+        override fun findSurfaceAt(voxel: Voxel): AddressedCanonicalSurface? = null
+        override fun visitRayCells(
+            startGroupMm: DepthPointMm,
+            endpointGroupMm: DepthPointMm,
+            maximumVisits: Int,
+            visitor: (Voxel, DepthCanonicalSurface?) -> Boolean,
+        ): DepthRayVisitResult = DepthRaySupercover.visit(
+            startGroupMm, endpointGroupMm, 100_000, maximumVisits,
+        ) { voxel -> visitor(voxel, null) }
+    }
 
     private class SyntheticImage(
         override val width: Int,

@@ -525,6 +525,34 @@ void main() {
     await captureManager.dispose();
   });
 
+  test('legacy preview resolution uses the read-only store channel', () async {
+    const previewChannel = MethodChannel(
+      'ar_flutter_plugin_2/native_capture_preview',
+    );
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    addTearDown(() => messenger.setMockMethodCallHandler(previewChannel, null));
+    messenger.setMockMethodCallHandler(previewChannel, (call) async {
+      expect(call.method, 'materializeNativeCapturePreview');
+      expect(call.arguments, <String, String>{
+        'manifestId': List.filled(64, 'a').join(),
+        'captureId': List.filled(64, 'b').join(),
+      });
+      return '/data/user/0/com.capture3d/files/capture-v2-previews/photo.jpg';
+    });
+
+    final result =
+        await ARCaptureManager.materializeNativeCapturePreviewFromStore(
+          manifestId: List.filled(64, 'a').join(),
+          captureId: List.filled(64, 'b').join(),
+        );
+
+    expect(
+      result,
+      '/data/user/0/com.capture3d/files/capture-v2-previews/photo.jpg',
+    );
+  });
+
   tearDown(() {
     ARCaptureManager.debugIsSupportedOverride = null;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger

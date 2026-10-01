@@ -54,11 +54,12 @@ internal class VisibilityGroupFrame private constructor(
 
 internal const val VISIBILITY_OBSERVATION_VERSION = "visibility_observation_v2"
 internal const val V2_FEATURE_SAMPLE_CAPACITY = 1_200
-internal const val V2_DEPTH_SAMPLE_CAPACITY = 1_536
+internal const val V2_DEPTH_SAMPLE_CAPACITY = 4_096
 internal const val V2_SENSOR_HANDOFF_CAPACITY_BYTES = 1_048_576L
 
 internal enum class VisibilityObservationSource(val wireName: String) {
     ARCORE_FEATURE("arcoreFeature"),
+    /** ARCore depth: sparse sensor depth with confidence or dense predicted depth. */
     ARCORE_RAW_DEPTH("arcoreRawDepth"),
     SYNTHETIC_FEATURE("syntheticFeature"),
     SYNTHETIC_DEPTH("syntheticDepth"),
@@ -279,7 +280,121 @@ internal interface VisibilityObservationMapper : AutoCloseable {
 
     fun snapshot(): VisibilityMappingAdmissionHealth = VisibilityMappingAdmissionHealth.empty()
 
+    /** Debug-only scalar timing for the latest canonical depth transaction. */
+    fun depthAdmissionTiming(): VisibilityDepthAdmissionTiming =
+        VisibilityDepthAdmissionTiming.empty()
+
+    /** Debug-only scalar timing for the latest canonical feature transaction. */
+    fun featureAdmissionTiming(): VisibilityFeatureAdmissionTiming =
+        VisibilityFeatureAdmissionTiming.empty()
+
     override fun close() = Unit
+}
+
+/**
+ * Bounded timing evidence for one depth admission.
+ *
+ * This deliberately contains only scalar counters and elapsed microseconds;
+ * no samples, rows, receipts, or image-backed objects cross the debug seam.
+ * A pending record exposes the publication-to-ACK wait observed so far.
+ */
+internal data class VisibilityDepthAdmissionTiming(
+    val completedCount: Long,
+    val sequence: Long,
+    val lookupMicros: Long,
+    val mutationMicros: Long,
+    val publicationAckMicros: Long,
+    val endToEndMicros: Long,
+    val pendingPublicationAck: Boolean,
+) {
+    init {
+        require(completedCount in 0..MAX_COMPLETED_COUNT)
+        require(sequence >= 0L)
+        require(lookupMicros in 0..MAX_ELAPSED_MICROS)
+        require(mutationMicros in 0..MAX_ELAPSED_MICROS)
+        require(publicationAckMicros in 0..MAX_ELAPSED_MICROS)
+        require(endToEndMicros in 0..MAX_ELAPSED_MICROS)
+    }
+
+    fun toWireMap(): Map<String, Any> = mapOf(
+        "completedCount" to completedCount,
+        "sequence" to sequence,
+        "lookupMicros" to lookupMicros,
+        "mutationMicros" to mutationMicros,
+        "publicationAckMicros" to publicationAckMicros,
+        "endToEndMicros" to endToEndMicros,
+        "pendingPublicationAck" to pendingPublicationAck,
+    )
+
+    companion object {
+        const val MAX_COMPLETED_COUNT = 1_000_000L
+        const val MAX_ELAPSED_MICROS = 600_000_000L
+
+        fun empty() = VisibilityDepthAdmissionTiming(
+            completedCount = 0L,
+            sequence = 0L,
+            lookupMicros = 0L,
+            mutationMicros = 0L,
+            publicationAckMicros = 0L,
+            endToEndMicros = 0L,
+            pendingPublicationAck = false,
+        )
+    }
+}
+
+/**
+ * Bounded timing evidence for one feature admission.
+ *
+ * Only scalar stage durations cross the debug seam. Publication ends after the
+ * native queue and renderer have accepted the pending current, before the
+ * separate exact ACK exchange completes.
+ */
+internal data class VisibilityFeatureAdmissionTiming(
+    val completedCount: Long,
+    val sequence: Long,
+    val planningMicros: Long,
+    val mutationMicros: Long,
+    val serializationMicros: Long,
+    val publicationMicros: Long,
+    val endToEndMicros: Long,
+    val pendingPublicationAck: Boolean,
+) {
+    init {
+        require(completedCount in 0..MAX_COMPLETED_COUNT)
+        require(sequence >= 0L)
+        require(planningMicros in 0..MAX_ELAPSED_MICROS)
+        require(mutationMicros in 0..MAX_ELAPSED_MICROS)
+        require(serializationMicros in 0..MAX_ELAPSED_MICROS)
+        require(publicationMicros in 0..MAX_ELAPSED_MICROS)
+        require(endToEndMicros in 0..MAX_ELAPSED_MICROS)
+    }
+
+    fun toWireMap(): Map<String, Any> = mapOf(
+        "completedCount" to completedCount,
+        "sequence" to sequence,
+        "planningMicros" to planningMicros,
+        "mutationMicros" to mutationMicros,
+        "serializationMicros" to serializationMicros,
+        "publicationMicros" to publicationMicros,
+        "endToEndMicros" to endToEndMicros,
+        "pendingPublicationAck" to pendingPublicationAck,
+    )
+
+    companion object {
+        const val MAX_COMPLETED_COUNT = 1_000_000L
+        const val MAX_ELAPSED_MICROS = 600_000_000L
+
+        fun empty() = VisibilityFeatureAdmissionTiming(
+            completedCount = 0L,
+            sequence = 0L,
+            planningMicros = 0L,
+            mutationMicros = 0L,
+            serializationMicros = 0L,
+            publicationMicros = 0L,
+            endToEndMicros = 0L,
+            pendingPublicationAck = false,
+        )
+    }
 }
 
 /**

@@ -6,9 +6,9 @@ import org.junit.Test
 
 class VisibilityGridDepthModeTest {
     @Test
-    fun `raw depth is preferred before automatic and feature-only fallback`() {
+    fun `automatic predicted depth is preferred before raw and feature-only fallback`() {
         assertEquals(
-            Config.DepthMode.RAW_DEPTH_ONLY,
+            Config.DepthMode.AUTOMATIC,
             selectVisibilityGridDepthMode { true },
         )
         assertEquals(

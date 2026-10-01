@@ -1,6 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
 import android.media.Image
+import com.google.ar.core.Config
 import com.google.ar.core.Frame
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.NotYetAvailableException
@@ -16,7 +17,7 @@ internal sealed interface PreparedRawDepthResult {
 internal class PreparedRawDepthFrame(
     val metadata: RawDepthFrameMetadata,
     private val depth: RawDepthImage,
-    private val confidence: RawDepthImage,
+    private val confidence: RawDepthImage?,
     private val maxCopiedPixels: Int,
 ) : AutoCloseable {
     private val processing = AtomicBoolean(false)
@@ -38,7 +39,7 @@ internal class PreparedRawDepthFrame(
         // A refused offer never reaches process(); only that path closes here.
         if (!processing.compareAndSet(false, true)) return
         try {
-            confidence.close()
+            confidence?.close()
         } finally {
             depth.close()
         }
@@ -49,14 +50,22 @@ class ArCoreRawDepthSource(
     private val maxCopiedPixels: Int = 4_096,
     private val onResourceAcquired: () -> Unit = {},
     private val onResourceClosed: () -> Unit = {},
+    private val depthMode: Config.DepthMode = Config.DepthMode.RAW_DEPTH_ONLY,
 ) {
+    init {
+        require(depthMode == Config.DepthMode.RAW_DEPTH_ONLY ||
+            depthMode == Config.DepthMode.AUTOMATIC) {
+            "ARCore depth source requires an enabled depth mode"
+        }
+    }
+
     fun acquire(
         frame: Frame,
         groupGeneration: Long,
         sessionGeneration: Long,
     ): DepthAcquisitionResult {
         val source = RawDepthCopySource(
-            acquirer = ArCorePairedRawDepthAcquirer(frame),
+            acquirer = ArCorePairedRawDepthAcquirer(frame, depthMode),
             maxCopiedPixels = maxCopiedPixels,
             onResourceAcquired = onResourceAcquired,
             onResourceClosed = onResourceClosed,
@@ -72,16 +81,19 @@ class ArCoreRawDepthSource(
         groupGeneration: Long,
         sessionGeneration: Long,
     ): PreparedRawDepthResult {
-        val acquirer = ArCorePairedRawDepthAcquirer(frame)
+        val acquirer = ArCorePairedRawDepthAcquirer(frame, depthMode)
         var depth: RawDepthImage? = null
         var confidence: RawDepthImage? = null
         var accepted = false
         return try {
             depth = ManagedRawDepthImage(acquirer.acquireDepth(), onResourceClosed)
             onResourceAcquired()
-            confidence = ManagedRawDepthImage(acquirer.acquireConfidence(), onResourceClosed)
-            onResourceAcquired()
-            if (depth.width != confidence.width || depth.height != confidence.height) {
+            confidence = acquirer.acquireConfidence()?.let {
+                ManagedRawDepthImage(it, onResourceClosed).also { onResourceAcquired() }
+            }
+            if ((confidence != null && depth.width != confidence.width) ||
+                (confidence != null && depth.height != confidence.height)
+            ) {
                 PreparedRawDepthResult.Failure("mismatched depth image dimensions")
             } else {
                 val metadata = metadata(
@@ -89,7 +101,12 @@ class ArCoreRawDepthSource(
                 )
                 accepted = true
                 PreparedRawDepthResult.Ready(
-                    PreparedRawDepthFrame(metadata, depth, confidence, maxCopiedPixels),
+                    PreparedRawDepthFrame(
+                        metadata,
+                        depth,
+                        confidence,
+                        maxCopiedPixels,
+                    ),
                 )
             }
         } catch (_: DepthNotYetAvailableException) {
@@ -159,12 +176,31 @@ private class ManagedRawDepthImage(
 
 private class ArCorePairedRawDepthAcquirer(
     private val frame: Frame,
+    private val depthMode: Config.DepthMode,
 ) : PairedRawDepthAcquirer {
+    /**
+     * AUTOMATIC is the product path for devices without a depth sensor. It
+     * exposes ARCore's dense predicted depth image, whereas RAW_DEPTH_ONLY
+     * exposes the sparse raw sensor image. The two APIs have different
+     * confidence contracts, so they must not share the acquisition choice.
+     */
     override fun acquireDepth(): RawDepthImage =
-        acquireImage { frame.acquireRawDepthImage16Bits() }
+        acquireImage {
+            when (depthMode) {
+                Config.DepthMode.AUTOMATIC -> frame.acquireDepthImage16Bits()
+                Config.DepthMode.RAW_DEPTH_ONLY -> frame.acquireRawDepthImage16Bits()
+                Config.DepthMode.DISABLED -> error("depth source is disabled")
+            }
+        }
 
-    override fun acquireConfidence(): RawDepthImage =
-        acquireImage { frame.acquireRawDepthConfidenceImage() }
+    override fun acquireConfidence(): RawDepthImage? =
+        if (depthMode == Config.DepthMode.RAW_DEPTH_ONLY) {
+            acquireImage { frame.acquireRawDepthConfidenceImage() }
+        } else {
+            // The dense predicted-depth API has no confidence plane. The
+            // bounded selector treats non-zero predicted values as valid.
+            null
+        }
 
     private fun acquireImage(block: () -> Image): RawDepthImage =
         try {

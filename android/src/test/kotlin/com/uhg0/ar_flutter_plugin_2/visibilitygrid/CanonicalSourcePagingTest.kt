@@ -16,6 +16,11 @@ class CanonicalSourcePagingTest {
         val decoded = CanonicalPageCache.decodeSources(bytes)
 
         assertEquals(ids, decoded.map { it.id.value })
+        ids.forEachIndexed { index, id ->
+            assertEquals(decoded[index], CanonicalPageCache.decodeSourceById(bytes, id))
+        }
+        assertEquals(null, CanonicalPageCache.decodeSourceById(bytes, 0x7fff_fffeL))
+        assertEquals(null, CanonicalPageCache.decodeSourceById(bytes, 0x8000_0001L))
         decoded.forEachIndexed { index, source ->
             assertArrayEquals(
                 ByteArray(32) { (index * 41 + it).toByte() },

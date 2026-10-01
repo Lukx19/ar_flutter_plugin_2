@@ -55,7 +55,16 @@ internal class BoundedCanonicalCurrentView internal constructor(
     private val delegate: CanonicalStateView,
     private val request: BoundedCanonicalLookupRequest,
     private val voxelMicrometers: Int,
+    reuseAuthenticatedSurfaceReads: Boolean = false,
 ) : BoundedCanonicalSurfaceView {
+    // Only authenticated immutable current cuts opt in. Fault-injection views
+    // intentionally keep every read observable to the kernel tests.
+    private val byVoxel = if (reuseAuthenticatedSurfaceReads) {
+        HashMap<Voxel, AddressedCanonicalSurface>()
+    } else null
+    private val byId = if (reuseAuthenticatedSurfaceReads) {
+        HashMap<SurfaceId, DepthCanonicalSurface>()
+    } else null
     private var directLookups = 0L
     private var rayCellVisits = 0L
     private var pageReads = 0L
@@ -71,20 +80,25 @@ internal class BoundedCanonicalCurrentView internal constructor(
 
     override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? {
         if (!chargeDirectLookup()) return null
+        byId?.get(id)?.let { return it }
         val row = readDirect { remainingPages, remainingBytes ->
             delegate.findByIdBounded(id, remainingPages, remainingBytes)
         } ?: return null
         if (refusedByLimit || failureReason != null) return null
-        return surface(row)
+        return surface(row)?.also { remember(it) }
     }
 
     override fun findSurfaceAt(voxel: Voxel): AddressedCanonicalSurface? {
         if (!chargeDirectLookup()) return null
+        byVoxel?.get(voxel)?.let { return it }
         val row = readDirect { remainingPages, remainingBytes ->
             delegate.findByVoxelBounded(voxel, remainingPages, remainingBytes)
         } ?: return null
         if (refusedByLimit || failureReason != null || row.voxel != voxel) return null
-        return surface(row)?.let { AddressedCanonicalSurface(voxel, it) }
+        return surface(row)?.let { surface ->
+            remember(surface)
+            AddressedCanonicalSurface(voxel, surface)
+        }
     }
 
     override fun visitRayCells(
@@ -107,9 +121,7 @@ internal class BoundedCanonicalCurrentView internal constructor(
             startGroupMm, endpointGroupMm, voxelMicrometers, allowed,
         ) { voxel ->
             rayCellVisits++
-            val row = lookupVoxelForRay(voxel)
-            if (refusedByLimit || failureReason != null) return@visit false
-            val surface = row?.let(::surface)
+            val surface = lookupSurfaceForRay(voxel)
             if (refusedByLimit || failureReason != null) return@visit false
             visitor(voxel, surface)
         }
@@ -148,9 +160,25 @@ internal class BoundedCanonicalCurrentView internal constructor(
         return true
     }
 
-    private fun lookupVoxelForRay(voxel: Voxel): CompactSurface? {
-        return readDirect { remainingPages, remainingBytes ->
+    private fun lookupSurfaceForRay(voxel: Voxel): DepthCanonicalSurface? {
+        byVoxel?.get(voxel)?.let { return it.surface }
+        val row = readDirect { remainingPages, remainingBytes ->
             delegate.findByVoxelBounded(voxel, remainingPages, remainingBytes)
+        } ?: return null
+        if (refusedByLimit || failureReason != null) return null
+        if (row.voxel != voxel) {
+            failureReason = BoundedCanonicalLookupReason.CANONICAL_READ_FAILURE
+            return null
+        }
+        return surface(row)?.also(::remember)
+    }
+
+    private fun remember(surface: DepthCanonicalSurface) {
+        byId?.let { if (it.size < MAX_CACHED_SURFACES) it[surface.id] = surface }
+        byVoxel?.let {
+            if (it.size < MAX_CACHED_SURFACES) {
+                it[surface.voxel] = AddressedCanonicalSurface(surface.voxel, surface)
+            }
         }
     }
 
@@ -265,5 +293,6 @@ internal class BoundedCanonicalCurrentView internal constructor(
 
     private companion object {
         const val MAX_LINEAGE_COUNT = 0xffff
+        const val MAX_CACHED_SURFACES = 8_192
     }
 }

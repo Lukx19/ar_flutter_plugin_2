@@ -853,8 +853,7 @@ private constructor(
                 byteReadWork += page.bytesRead
                 val value =
                     try {
-                        CanonicalPageCache.decodeSources(page.value)
-                            .binarySearchUnsigned(id.value)
+                        CanonicalPageCache.decodeSourceById(page.value, id.value)
                     } catch (_: Exception) {
                         return CanonicalPageRead.Refused(CompactCanonicalRefusal.CORRUPT)
                     }

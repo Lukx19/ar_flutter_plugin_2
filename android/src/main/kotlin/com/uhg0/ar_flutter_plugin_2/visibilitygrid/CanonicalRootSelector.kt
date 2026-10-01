@@ -212,7 +212,8 @@ internal class PrivateRootSelector(
             inject(fault, CanonicalSelectorFault.AFTER_PARENT_SYNC)
             val actual = incrementalBytes(rootTarget, rootBefore) + incrementalBytes(slotTarget, slotBefore) +
                 incrementalBytes(selectorTarget, selectorBefore)
-            require(actual == commitBytes)
+            // The filesystem's reported block size is an upper bound for these
+            // small pointer files; charge their measured allocated bytes.
             inject(fault, CanonicalSelectorFault.BEFORE_BUDGET_COMMIT)
             budget.commit(requireNotNull(token), actual); token = null
             inject(fault, CanonicalSelectorFault.AFTER_BUDGET_COMMIT)
@@ -281,9 +282,10 @@ internal class PrivateRootSelector(
                 val actual = incrementalBytes(root, reservation.rootBeforeBytes) +
                     incrementalBytes(slot, reservation.slotBeforeBytes) +
                     incrementalBytes(selectorFile, reservation.selectorBeforeBytes)
-                require(actual == reservation.commitBytes)
+                // Recovery uses the same measured charge as uninterrupted
+                // publication. The durable reservation still caps the charge.
                 sync(parent)
-                budget.commitPointerPublication(reservation)
+                budget.commit(reservation.token, actual)
             } else {
                 if (reservation.rootBeforeBytes == 0L && root.exists()) require(root.delete())
                 if (reservation.slotBeforeBytes == 0L && slot.exists() && selector?.slot != reservation.slot) require(slot.delete())

@@ -296,7 +296,7 @@ class CombinedVisibilityPressureTest {
     ): VisibilityDepthObservation {
         val samples = VisibilityDepthObservation.copySamples(
             List(count) { index ->
-                VisibilityDepthSample(index % 48, index / 48, 1_000, 255)
+                VisibilityDepthSample(index % 64, index / 64, 1_000, 255)
             },
         )
         return VisibilityDepthObservation(
@@ -319,7 +319,7 @@ class CombinedVisibilityPressureTest {
             tracking = true,
             imageOrientation = "landscape_right_x_right_y_down_v1",
             pose = VisibilityCameraPose.copyOf(identityVisibilityGridTransform()),
-            intrinsics = VisibilityCameraIntrinsics(48, 32, 40.0, 40.0, 24.0, 16.0),
+            intrinsics = VisibilityCameraIntrinsics(64, 64, 40.0, 40.0, 32.0, 32.0),
             depthCapability = if (source == VisibilityObservationSource.SYNTHETIC_DEPTH) {
                 VisibilityDepthCapability.RAW_DEPTH
             } else {

@@ -337,6 +337,13 @@ internal class DepthEvidenceKernel(
                 stageOccupiedPointY[endpointIndex] = endpoint.y
                 stageOccupiedPointZ[endpointIndex] = endpoint.z
             }
+            // The map stores evidence by voxel. Repeated endpoints in one
+            // camera frame share a voxel-scale ray; retain the representative
+            // endpoint and count the sample without walking that ray again.
+            if (hadOccupied) {
+                acceptedSamples = checkedAdd(acceptedSamples, 1)
+                continue
+            }
             var rayResult: DepthRayVisitResult
             val remaining = configuration.rayVisitCapacity - visits
             if (remaining < 0) return refuseAttempt(DepthEvidenceRefusal.RAY_VISIT_CAPACITY)

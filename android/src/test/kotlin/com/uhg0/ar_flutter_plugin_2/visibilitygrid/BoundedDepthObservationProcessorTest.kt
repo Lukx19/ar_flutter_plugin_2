@@ -29,9 +29,11 @@ class BoundedDepthObservationProcessorTest {
             },
         )
         try {
+            assertTrue(processor.canAccept())
             val first = AutoCloseable { firstClosed.incrementAndGet() }
             assertTrue(processor.offer(first, callbackCopyNs = 800))
             assertTrue(processing.await(2, TimeUnit.SECONDS))
+            assertFalse(processor.canAccept())
             val next = AutoCloseable { nextClosed.incrementAndGet() }
             assertFalse(processor.offer(next, callbackCopyNs = 800))
             assertEquals(1, nextClosed.get())
@@ -40,6 +42,7 @@ class BoundedDepthObservationProcessorTest {
             assertTrue(processor.awaitIdle(2_000))
             assertEquals(1, firstClosed.get())
             assertEquals(1, published.get())
+            assertTrue(processor.canAccept())
             val resumedClosed = AtomicInteger()
             assertTrue(processor.offer(AutoCloseable { resumedClosed.incrementAndGet() }, 800))
             assertTrue(processor.awaitIdle(2_000))
@@ -48,6 +51,7 @@ class BoundedDepthObservationProcessorTest {
         } finally {
             release.countDown()
             processor.close()
+            assertFalse(processor.canAccept())
         }
     }
 }

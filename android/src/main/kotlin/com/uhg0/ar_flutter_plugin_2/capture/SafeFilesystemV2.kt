@@ -45,6 +45,20 @@ interface DescriptorFilesystemV2 : AutoCloseable {
     fun allocationUnit(segments: List<String>): Long = 4_096L
     fun openRead(segments: List<String>): DescriptorFileV2
     fun createExclusive(segments: List<String>): DescriptorFileV2
+    /** Creates a physically-backed file of exactly [bytes] bytes. */
+    fun allocateExclusive(segments: List<String>, bytes: Long) {
+        require(bytes > 0)
+        val buffer = ByteArray(64 * 1024)
+        createExclusive(segments).use { descriptor ->
+            var remaining = bytes
+            while (remaining > 0) {
+                val count = minOf(buffer.size.toLong(), remaining).toInt()
+                descriptor.write(buffer, 0, count)
+                remaining -= count
+            }
+            descriptor.sync()
+        }
+    }
     fun atomicReplace(parent: List<String>, from: String, to: String)
     fun atomicMove(fromParent: List<String>, from: String, toParent: List<String>, to: String)
     fun delete(segments: List<String>)
@@ -65,6 +79,7 @@ object AndroidDescriptorNativeV2 {
     external fun nativeAllocationUnit(root: Long, segments: Array<String>): Long
     external fun nativeOpenRead(root: Long, segments: Array<String>): Long
     external fun nativeCreateExclusive(root: Long, segments: Array<String>): Long
+    external fun nativeAllocateExclusive(root: Long, segments: Array<String>, bytes: Long)
     external fun nativeRead(descriptor: Long, bytes: ByteArray, offset: Int, count: Int): Int
     external fun nativeWrite(descriptor: Long, bytes: ByteArray, offset: Int, count: Int)
     external fun nativeSync(descriptor: Long)
@@ -108,6 +123,9 @@ class AndroidDescriptorFilesystemV2 private constructor(private val rootDescript
         withRoot { AndroidNativeFileV2(AndroidDescriptorNativeV2.nativeOpenRead(it, segments.toTypedArray())) }
     override fun createExclusive(segments: List<String>): DescriptorFileV2 =
         withRoot { AndroidNativeFileV2(AndroidDescriptorNativeV2.nativeCreateExclusive(it, segments.toTypedArray())) }
+    override fun allocateExclusive(segments: List<String>, bytes: Long) = withRoot {
+        AndroidDescriptorNativeV2.nativeAllocateExclusive(it, segments.toTypedArray(), bytes)
+    }
     override fun atomicReplace(parent: List<String>, from: String, to: String) = withRoot { AndroidDescriptorNativeV2.nativeAtomicReplace(it, parent.toTypedArray(), from, to) }
     override fun atomicMove(fromParent: List<String>, from: String, toParent: List<String>, to: String) = withRoot { AndroidDescriptorNativeV2.nativeAtomicMove(it, fromParent.toTypedArray(), from, toParent.toTypedArray(), to) }
     override fun delete(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeDelete(it, segments.toTypedArray()) }
@@ -317,9 +335,7 @@ class SafeFilesystemV2(
         }; return length to digest.digest()
     }
     fun allocateExclusive(file: File, bytes: Long) {
-        require(bytes > 0); prepareParent(file); val buffer = ByteArray(64 * 1024); backend.createExclusive(relative(file)).use { descriptor ->
-            var remaining = bytes; while (remaining > 0) { val count = minOf(buffer.size.toLong(), remaining).toInt(); descriptor.write(buffer, 0, count); remaining -= count }; descriptor.sync()
-        }; check(length(file) == bytes); syncParent(file)
+        require(bytes > 0); prepareParent(file); backend.allocateExclusive(relative(file), bytes); check(length(file) == bytes); syncParent(file)
     }
     fun delete(file: File, point: DurableStoreFaultPointV2) { fault.at(point); backend.delete(relative(file)); backend.syncDirectory(parentSegments(file)) }
     fun deleteTree(directory: File, point: DurableStoreFaultPointV2) {

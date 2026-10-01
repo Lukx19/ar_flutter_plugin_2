@@ -48,11 +48,13 @@ void main() {
       'captureId': 'capture',
       'captureRevision': 2,
       'manifestId': 'manifest',
+      'jpegSizeBytes': 4659553,
       'reason': 'committed',
       'recoveryContext': _admission().recoveryContext.toMap(),
     });
     expect(committed.isTerminal, isTrue);
     expect(committed.captureRevision, 2);
+    expect(committed.jpegSizeBytes, 4659553);
 
     final recoveryFailed = ARNativeCaptureEventV2.fromMap({
       'wireVersion': nativeCaptureV2WireVersion,
@@ -68,6 +70,36 @@ void main() {
       'reason': 'native-owner-ready',
     });
     expect(ready.kind, ARNativeCaptureEventKindV2.ready);
+  });
+
+  test(
+      'paired terminal reports exact component sizes and rejects partial sizes',
+      () {
+    final map = <String, dynamic>{
+      'wireVersion': nativeCaptureV2WireVersion,
+      'kind': 'committed',
+      'attemptId': 'paired-attempt',
+      'captureId': 'paired-capture',
+      'captureRevision': 3,
+      'manifestId': 'paired-manifest',
+      'jpegSizeBytes': 123,
+      'dngSizeBytes': 456,
+      'reason': 'recovered-committed',
+      'recoveryContext': _admission().recoveryContext.toMap(),
+    };
+    final event = ARNativeCaptureEventV2.fromMap(map);
+    expect(event.jpegSizeBytes, 123);
+    expect(event.dngSizeBytes, 456);
+    for (final field in ['jpegSizeBytes', 'dngSizeBytes']) {
+      expect(
+        () => ARNativeCaptureEventV2.fromMap({...map, field: 0}),
+        throwsFormatException,
+      );
+    }
+    expect(
+      () => ARNativeCaptureEventV2.fromMap({...map}..remove('jpegSizeBytes')),
+      throwsFormatException,
+    );
   });
 
   test('rejects non-qualified profiles and unbacked reservations', () {

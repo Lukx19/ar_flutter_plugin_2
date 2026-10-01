@@ -1252,7 +1252,10 @@ class VisibilitySurfaceStreamChannel(
         const val TERMINAL_DRAIN_REQUEST_FLAG = 1 shl 5
         const val STREAM_BINDING_ABANDONED_ERROR_ID = 142
         const val WORKER_BINDING_LOST_ERROR_ID = 144
-        const val DEFAULT_WORKER_TIMEOUT_MILLIS = 2_000L
+        // Match the production Dart exchange deadline. A 1,200-sample
+        // admission reached 14.3 s under emulator capture/renderer contention;
+        // the former 2 s watchdog abandoned otherwise valid exact ACK work.
+        const val DEFAULT_WORKER_TIMEOUT_MILLIS = 20_000L
         const val MAIN_HANDLER_CLEAR_TIMEOUT_MILLIS = 2_000L
     }
 }

@@ -280,6 +280,33 @@ class CameraFlashState {
 class ARCaptureManager {
   @visibleForTesting
   static bool? debugIsSupportedOverride;
+  static const MethodChannel _nativeCapturePreviewChannel = MethodChannel(
+    'ar_flutter_plugin_2/native_capture_preview',
+  );
+
+  /// Resolves a committed native V2 JPEG without requiring a live AR view.
+  ///
+  /// This is read-only native-store access for History/detail rendering. The
+  /// returned persistent app-private path is a display copy; the native URI
+  /// remains the durable capture reference.
+  static Future<String?> materializeNativeCapturePreviewFromStore({
+    required String manifestId,
+    required String captureId,
+  }) async {
+    try {
+      return await _nativeCapturePreviewChannel.invokeMethod<String>(
+        'materializeNativeCapturePreview',
+        <String, String>{
+          'manifestId': manifestId,
+          'captureId': captureId,
+        },
+      );
+    } on MissingPluginException {
+      return null;
+    } on PlatformException {
+      return null;
+    }
+  }
 
   late MethodChannel _channel;
   final ARSessionManager _sessionManager;
@@ -549,6 +576,33 @@ class ARCaptureManager {
     final event = ARNativeCaptureEventV2.fromMap(_deepCastMap(value));
     return event.health ??
         (throw const FormatException('Native V2 health payload was missing.'));
+  }
+
+  /// Resolves a committed native V2 JPEG into the plugin's app-private cache.
+  ///
+  /// The returned path is an app-private persistent display copy. The durable
+  /// V2 store remains native-owned and the terminal URI stays an opaque
+  /// reference in the capture model.
+  Future<String?> materializeNativeCapturePreview({
+    required String manifestId,
+    required String captureId,
+  }) async {
+    _throwIfDisposed();
+    await _ensureInitialized();
+    try {
+      return await _channel.invokeMethod<String>(
+        'materializeNativeCapturePreview',
+        <String, String>{
+          'manifestId': manifestId,
+          'captureId': captureId,
+        },
+      );
+    } on PlatformException catch (error) {
+      throw _captureExceptionFromPlatformException(
+        error,
+        operation: 'materialize native capture preview',
+      );
+    }
   }
 
   Future<List<ARNativeCaptureEventV2>> replayNativeCaptureRecoveryV2() async {
@@ -2099,6 +2153,8 @@ class ARCaptureManager {
       'captureId': event.captureId,
       'captureRevision': event.captureRevision,
       'manifestId': event.manifestId,
+      'jpegSizeBytes': event.jpegSizeBytes,
+      'dngSizeBytes': event.dngSizeBytes,
       'reason': event.reason,
       'recoveryContext': event.recoveryContext?.toMap(),
     });

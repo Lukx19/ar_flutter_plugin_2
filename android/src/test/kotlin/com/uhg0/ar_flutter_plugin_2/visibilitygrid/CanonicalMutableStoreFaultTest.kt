@@ -14,6 +14,24 @@ import org.junit.Test
 
 class CanonicalMutableStoreFaultTest {
     @Test
+    fun `pointer publication charges measured bytes when reported block size exceeds allocation`() {
+        val parent = Files.createTempDirectory("canonical-surface-measured-pointer-").toFile()
+        try {
+            val base = EmptyView("measured-pointer")
+            val budget = MeasuredAllocationBudget()
+            val store = requireNotNull(CanonicalCommitStore.open(parent, budget))
+            val committed = store.commit(plan(base, "first-view", 0), base)
+                as CanonicalCommitResult.Committed
+            committed.commit.close()
+            val reopened = store.reopen(base) as CanonicalReopenResult.Selected
+            assertEquals(1, reopened.commit.view.cut.liveSurfaceCount)
+            reopened.commit.close()
+            assertTrue(budget.charges.contains(24_576L))
+            store.close()
+        } finally { parent.deleteRecursively() }
+    }
+
+    @Test
     fun `process reopen replays exact current and blocks distinct work before any durable change`() {
         val parent = Files.createTempDirectory("canonical-surface-current-pending-").toFile()
         try {
@@ -255,6 +273,22 @@ class CanonicalMutableStoreFaultTest {
         override fun commitBytes(token: Any, actualBytes: Long) = Unit
         override fun releaseBytes(token: Any) = Unit
         override fun allocationUnitBytes(path: File) = 4_096L
+    }
+
+    private class MeasuredAllocationBudget : ExclusiveFakeStorageBudget() {
+        val charges = mutableListOf<Long>()
+        override fun reserveBytes(bytes: Long): Any = bytes
+        override fun commitBytes(token: Any, actualBytes: Long) {
+            require(actualBytes in 0..(token as Long))
+            charges += actualBytes
+        }
+        override fun releaseBytes(token: Any) = Unit
+        override fun allocationUnitBytes(path: File) = 12_288L
+        override fun allocatedBytes(path: File): Long {
+            if (!path.exists()) return 0L
+            fun measured(file: File) = if (file.isDirectory) 8_192L else round(file.length(), 8_192L)
+            return if (path.isDirectory) path.walkTopDown().sumOf(::measured) else measured(path)
+        }
     }
 
     companion object {

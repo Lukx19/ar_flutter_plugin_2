@@ -135,7 +135,11 @@ internal class CanonicalRuntimeResources private constructor(
                 )
             },
         ) { view ->
-            val bounded = BoundedCanonicalCurrentView(view, request, configuration.voxelMicrometers)
+            val routed = requireNotNull(current).depthLookupView(view)
+            val bounded = BoundedCanonicalCurrentView(
+                routed, request, configuration.voxelMicrometers,
+                reuseAuthenticatedSurfaceReads = true,
+            )
             bounded.result(block(bounded))
         }
     }
@@ -557,6 +561,8 @@ internal class CanonicalRuntimeResources private constructor(
 
         fun featurePlanningView(budget: FeaturePlanningReadBudget): RoutedFeaturePlanningView =
             featureRoutes.view(scalarView.cut, base, commit, budget)
+        fun depthLookupView(view: CanonicalStateView): CanonicalStateView =
+            RoutedCanonicalDepthView(view, featureRoutes, base, commit)
         fun featurePlanningMemoryReceipt(maximumTouches: Int) = featureRoutes.memoryReceipt(maximumTouches)
         fun copyOccupiedKeys(): LongArray? = featureRoutes.copyOccupiedKeys(scalarView.cut.liveSurfaceCount)
         fun foldCurrentRows(sink: (CompactSurface, CanonicalReceiptBytes) -> Boolean): Boolean {
@@ -819,6 +825,29 @@ private class CanonicalFeaturePlanningRoutes private constructor(private val cap
             is RoutedProviderResult.Refused -> return RoutedFeatureRead.Failed(row.work + read.work)
         }
         return RoutedFeatureRead.Found(row.value, source.value, row.work + source.work)
+    }
+
+    fun resolveSurface(
+        voxel: Voxel,
+        base: CanonicalStateView,
+        commit: CanonicalPublishedCommit?,
+        maximumPageReads: Long,
+        maximumBytesRead: Long,
+    ): CanonicalBoundedReadResult<CompactSurface?> {
+        val descriptor = descriptor(packVisibilityGridKey(voxel.x, voxel.y, voxel.z))
+            ?: return CanonicalBoundedReadResult.Complete(null, CanonicalReadWork.ZERO)
+        val requiredPages = if (FeatureRouteProviderToken.isBase(rowProviders[descriptor])) 1L else 2L
+        if (maximumPageReads < requiredPages ||
+            maximumBytesRead < requiredPages * CanonicalPageCache.PAGE_BYTES
+        ) return CanonicalBoundedReadResult.Refused(
+            CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED, CanonicalReadWork.ZERO,
+        )
+        return when (val read = providerSurface(rowProviders[descriptor], voxel, base, commit)) {
+            is RoutedProviderResult.Complete -> CanonicalBoundedReadResult.Complete(read.value, read.work)
+            is RoutedProviderResult.Refused -> CanonicalBoundedReadResult.Refused(
+                CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE, read.work,
+            )
+        }
     }
 
     private fun providerSurface(token: Int, voxel: Voxel, base: CanonicalStateView, commit: CanonicalPublishedCommit?): RoutedProviderResult<CompactSurface> {
@@ -1107,6 +1136,21 @@ internal data class CanonicalFeatureRouteDeltaMemoryReceipt(
     val dirtyRoutes: Int,
     val retainedBytes: Long,
 )
+
+/** Reuses the authenticated current route index for sparse depth rays. */
+private class RoutedCanonicalDepthView(
+    private val delegate: CanonicalStateView,
+    private val routes: CanonicalFeaturePlanningRoutes,
+    private val base: CanonicalStateView,
+    private val commit: CanonicalPublishedCommit?,
+) : CanonicalStateView by delegate {
+    override fun findByVoxelBounded(
+        voxel: Voxel,
+        maximumPageReads: Long,
+        maximumBytesRead: Long,
+    ): CanonicalBoundedReadResult<CompactSurface?> =
+        routes.resolveSurface(voxel, base, commit, maximumPageReads, maximumBytesRead)
+}
 
 private class RoutedFeaturePlanningView(
     override val cut: CompactCanonicalCut,

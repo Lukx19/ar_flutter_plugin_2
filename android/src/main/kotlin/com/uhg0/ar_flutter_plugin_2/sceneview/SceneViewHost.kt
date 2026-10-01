@@ -134,6 +134,7 @@ internal class SceneViewHost(
     private val engineRef = AtomicReference<Engine?>()
     private val cameraStreamRef = AtomicReference<ARCameraStream?>()
     private val frameCadenceTracker = FrameCadenceTracker()
+    private val cameraFrameCadenceTracker = FrameCadenceTracker()
     private val rendererTelemetry = RendererTelemetry()
     private val rendererAllocationLedger = CoverageRendererAllocationLedger(rendererTelemetry)
     private val coverageResourceFactory = CoverageRendererResourceFactory(
@@ -478,6 +479,7 @@ internal class SceneViewHost(
                         rendererTelemetry.beginRendererFrame()
                         coverageMeshRef.get()?.onRendererFrame()
                         frameCadenceTracker.record(System.nanoTime())
+                        cameraFrameCadenceTracker.record(frame.timestamp)
                     }
                     sessionRef.set(session)
                     frameRef.set(frame)
@@ -1053,9 +1055,23 @@ internal class SceneViewHost(
         return firstSurfaceId < secondSurfaceId
     }
 
+    /** O(1) ownership and bounded cadence checks for depth image intake. */
+    fun depthIntakeFrameHealthy(): Boolean =
+        frameCadenceTracker.healthyForDepthIntake() &&
+            cameraFrameCadenceTracker.healthyForDepthIntake()
+
     fun rendererPerformanceSnapshot(): Map<String, Any> {
         val status = coverageRendererOwner.status()
+        val cameraCadence = cameraFrameCadenceTracker.snapshot()
         return frameCadenceTracker.snapshot() + rendererTelemetry.snapshot() + mapOf(
+            "cameraFrameSampleCount" to cameraCadence.getValue("sampleCount"),
+            "cameraMedianFrameIntervalMs" to cameraCadence.getValue("medianFrameIntervalMs"),
+            "cameraMedianFps" to cameraCadence.getValue("medianFps"),
+            "cameraP95FrameIntervalMs" to cameraCadence.getValue("p95FrameIntervalMs"),
+            "cameraP99FrameIntervalMs" to cameraCadence.getValue("p99FrameIntervalMs"),
+            "cameraMaxFrameIntervalMs" to cameraCadence.getValue("maxFrameIntervalMs"),
+            "cameraFrameGapsOver50Ms" to cameraCadence.getValue("frameGapsOver50Ms"),
+            "cameraFrameGapsOver100Ms" to cameraCadence.getValue("frameGapsOver100Ms"),
             "rendererUnavailable" to status.rendererUnavailable,
             "rendererPresentationMode" to status.mode.wireName,
             "rendererPresentationVisible" to status.visible,

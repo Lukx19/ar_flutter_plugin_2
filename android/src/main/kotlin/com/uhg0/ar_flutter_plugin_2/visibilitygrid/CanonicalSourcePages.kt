@@ -125,6 +125,37 @@ internal class CanonicalPageCache(private val file: File) : AutoCloseable {
                 List(count) { readSource(input) }
             }
 
+        /** Finds one source in an authenticated fixed page without decoding its neighbors. */
+        fun decodeSourceById(bytes: ByteArray, id: Long): PagedSource? {
+            require(bytes.size == PAGE_BYTES)
+            fun intAt(offset: Int): Int =
+                ((bytes[offset].toInt() and 0xff) shl 24) or
+                    ((bytes[offset + 1].toInt() and 0xff) shl 16) or
+                    ((bytes[offset + 2].toInt() and 0xff) shl 8) or
+                    (bytes[offset + 3].toInt() and 0xff)
+            require(intAt(0) == PAGE_MAGIC && intAt(4) == PAGE_VERSION)
+            require((bytes[8].toInt() and 0xff) == CanonicalPageKind.SOURCE.wire)
+            require(intAt(9) >= 0)
+            val count = ((bytes[13].toInt() and 0xff) shl 8) or
+                (bytes[14].toInt() and 0xff)
+            require(count in 1..MAX_RECORDS && 15 + count * 51 <= bytes.size)
+            var low = 0
+            var high = count - 1
+            while (low <= high) {
+                val middle = (low + high) ushr 1
+                val offset = 15 + middle * 51
+                val comparison = unsignedCompare(unsigned(intAt(offset)), id)
+                when {
+                    comparison < 0 -> low = middle + 1
+                    comparison > 0 -> high = middle - 1
+                    else -> return DataInputStream(ByteArrayInputStream(bytes, offset, 51)).use {
+                        readSource(it)
+                    }
+                }
+            }
+            return null
+        }
+
         fun decodeSupports(bytes: ByteArray): List<PagedSupport> =
             decodePage(bytes, CanonicalPageKind.SUPPORT) { input, count ->
                 List(count) {

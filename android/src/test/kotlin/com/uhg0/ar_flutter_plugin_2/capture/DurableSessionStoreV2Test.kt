@@ -5,6 +5,7 @@ import java.io.File
 import java.security.MessageDigest
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -28,11 +29,114 @@ class DurableSessionStoreV2Test {
 
         val committed = store.commitStreamed(request, streams("jpeg".toByteArray()))
         assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, committed.phase)
+        assertEquals(4L, committed.terminal?.jpegSizeBytes)
         assertEquals(0, budget.reservedBytes())
         assertEquals(committed.requestHash, store.commitStreamed(request, streams("jpeg".toByteArray())).requestHash)
 
         val recovered = store(root, budget(root))
-        assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, recovered.queryReceipt(request.accepted.identity)?.phase)
+        val recoveredReceipt = recovered.queryReceipt(request.accepted.identity)
+        assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, recoveredReceipt?.phase)
+        assertEquals(4L, recoveredReceipt?.terminal?.jpegSizeBytes)
+    }
+
+    @Test fun `jpeg dng component sizes survive streamed commit replay restart startup projection and legacy receipts`() {
+        for (postOutput in listOf(false, true)) {
+            val root = directory()
+            val jpeg = "jpeg-component".toByteArray()
+            val dng = "raw-dng-component".toByteArray()
+            val request = request("paired-commit", "paired-attempt", jpeg, dng = dng)
+            assertEquals(setOf(CaptureComponentKind.JPEG, CaptureComponentKind.DNG), request.accepted.profile.requiredComponents)
+            val budget = budget(root)
+            val store = store(root, budget)
+            val streams = listOf(
+                CaptureComponentStreamV2(CaptureComponentKind.JPEG, ByteArrayInputStream(jpeg)),
+                CaptureComponentStreamV2(CaptureComponentKind.DNG, ByteArrayInputStream(dng)),
+            )
+            val committed = if (postOutput) {
+                val template = CapturePostOutputTemplateV2(request.accepted, request.poseRecordHash,
+                    request.cameraModelHash, request.validationRecordHash, request.ledgerRecordHash)
+                store.acceptCaptureBeforeExposure(request)
+                store.commitStreamedFinalized(template, request.exposureTimestampNanoseconds, streams)
+            } else {
+                store.acceptCaptureBeforeExposure(request)
+                store.commitStreamed(request, streams)
+            }
+            assertEquals(jpeg.size.toLong(), committed.terminal!!.jpegSizeBytes)
+            assertEquals(dng.size.toLong(), committed.terminal!!.dngSizeBytes)
+            store.close()
+            budget.close()
+
+            val restarted = store(root, budget(root))
+            val recovered = restarted.queryReceipt(request.accepted.identity)!!.terminal!!
+            assertEquals(committed.terminal, recovered)
+            val replay = if (postOutput) {
+                val template = CapturePostOutputTemplateV2(request.accepted, request.poseRecordHash,
+                    request.cameraModelHash, request.validationRecordHash, request.ledgerRecordHash)
+                restarted.commitStreamedFinalized(template, request.exposureTimestampNanoseconds, emptyList())
+            } else {
+                restarted.commitStreamed(request, emptyList())
+            }
+            assertEquals(committed.terminal, replay.terminal)
+            val projection = restarted.recoverAndProject().single()
+            assertEquals(jpeg.size.toLong(), projection.jpegSizeBytes)
+            assertEquals(dng.size.toLong(), projection.dngSizeBytes)
+            // Receipts written before component accounting still have authoritative root descriptors.
+            val receipt = File(root, "store").walkTopDown().single { it.name == "receipt.properties" }
+            val properties = java.util.Properties().apply { receipt.inputStream().use(::load) }
+            properties.remove("dngSizeBytes")
+            properties.remove("jpegSizeBytes")
+            receipt.outputStream().use { properties.store(it, null) }
+            assertEquals(recovered, restarted.queryReceipt(request.accepted.identity)!!.terminal)
+            val legacyProjection = restarted.recoverAndProject().single()
+            assertEquals(jpeg.size.toLong(), legacyProjection.jpegSizeBytes)
+            assertEquals(dng.size.toLong(), legacyProjection.dngSizeBytes)
+            restarted.close()
+        }
+    }
+
+    @Test fun `retained committed jpeg materializes to an app preview target`() {
+        val root = directory(); val budget = budget(root); val store = store(root, budget)
+        val jpeg = "preview-jpeg".toByteArray()
+        val request = request("preview-commit", "preview-attempt", jpeg)
+        store.acceptBeforeExposure(request.accepted)
+        val receipt = store.commitStreamed(request, streams(jpeg))
+        val terminal = requireNotNull(receipt.terminal)
+        val manifestId = requireNotNull(terminal.manifestId)
+        val captureId = requireNotNull(terminal.captureId)
+        val target = File(root, "preview-cache/photo.jpg")
+
+        assertTrue(store.materializeJpegPreview(manifestId, captureId, target))
+        assertArrayEquals(jpeg, target.readBytes())
+        assertFalse(store.materializeJpegPreview("not-a-manifest", captureId, File(root, "bad.jpg")))
+        assertFalse(store.materializeJpegPreview(manifestId, "not-a-capture", File(root, "bad-2.jpg")))
+    }
+
+    @Test fun `read-only preview reader validates the durable jpeg before copying`() {
+        val root = directory(); val budget = budget(root); val store = store(root, budget)
+        val jpeg = "reader-preview-jpeg".toByteArray()
+        val request = request("reader-commit", "reader-attempt", jpeg)
+        store.acceptBeforeExposure(request.accepted)
+        val receipt = store.commitStreamed(request, streams(jpeg))
+        val terminal = requireNotNull(receipt.terminal)
+        val manifestId = requireNotNull(terminal.manifestId)
+        val captureId = requireNotNull(terminal.captureId)
+        val reader = NativeCapturePreviewReaderV2(File(root, "store"))
+        val target = File(root, "preview-cache/reader.jpg")
+
+        assertTrue(reader.materializeJpegPreview(manifestId, captureId, target))
+        assertArrayEquals(jpeg, target.readBytes())
+        assertTrue(reader.materializeJpegPreview(manifestId, captureId, target))
+
+        target.writeBytes("stale-preview".toByteArray())
+        assertTrue(reader.materializeJpegPreview(manifestId, captureId, target))
+        assertArrayEquals(jpeg, target.readBytes())
+
+        target.delete()
+        val asset = File(root, "store").walkTopDown()
+            .first { it.name.startsWith("jpeg.") && it.name.endsWith(".blob") }
+        asset.writeBytes("tampered".toByteArray())
+        assertFalse(reader.materializeJpegPreview(manifestId, captureId, target))
+        assertFalse(target.exists())
     }
 
     @Test fun `changed bytes conflict without moving selected root and abandonment releases once for later success`() {
@@ -399,13 +503,17 @@ class DurableSessionStoreV2Test {
         secondBudget.close()
     }
 
-    private fun request(commit: String, attempt: String, jpeg: ByteArray, session: String = "session-1"): CaptureCommitRequest {
+    private fun request(commit: String, attempt: String, jpeg: ByteArray, session: String = "session-1", dng: ByteArray? = null): CaptureCommitRequest {
         val identity = CaptureAttemptIdentity(attempt, commit, 1, CaptureLifecycleCut(session, 1, "group-1", 1, "ar-1", "view-1", 1, "binding-1", 1, 1))
-        val profile = CaptureComponentProfile("jpeg", setOf(CaptureComponentKind.JPEG), 64, 64)
-        val accepted = CaptureAcceptedAttempt(identity, CaptureLane.MANUAL, profile, CaptureReservationLiability(0, 64, 1, 1, 0, true), digest("intent"), digest("accepted"))
+        val kinds = if (dng == null) setOf(CaptureComponentKind.JPEG) else setOf(CaptureComponentKind.JPEG, CaptureComponentKind.DNG)
+        val profile = CaptureComponentProfile(if (dng == null) "jpeg" else "raw+jpeg", kinds, 64, 64)
+        val accepted = CaptureAcceptedAttempt(identity, CaptureLane.MANUAL, profile, CaptureReservationLiability(0, 64L * kinds.size, kinds.size.toLong(), 1, 0, true), digest("intent"), digest("accepted"))
         return CaptureCommitRequest(
             accepted,
-            listOf(CaptureComponentDescriptor(CaptureComponentKind.JPEG, jpeg.size.toLong(), sha(jpeg), "object")),
+            listOfNotNull(
+                CaptureComponentDescriptor(CaptureComponentKind.JPEG, jpeg.size.toLong(), sha(jpeg), "object"),
+                dng?.let { CaptureComponentDescriptor(CaptureComponentKind.DNG, it.size.toLong(), sha(it), "dng-object") },
+            ),
             1,
             digest("pose"), digest("camera"), digest("validation"), digest("ledger"),
             NativeCaptureRecoveryContextV2(

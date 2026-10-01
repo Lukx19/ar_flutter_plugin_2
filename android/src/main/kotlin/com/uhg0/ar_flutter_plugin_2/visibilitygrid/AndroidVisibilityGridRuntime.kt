@@ -50,6 +50,12 @@ internal class AndroidVisibilityGridRuntime(
     private var depthLastCopyAttemptTimestampNs = Long.MIN_VALUE
     private var featureHealth = VisibilitySourceHealth.CONFIGURED
     private var depthHealth = VisibilitySourceHealth.UNSUPPORTED
+    /**
+     * Monotonic time at which a usable depth observation was last copied.
+     * Motion based depth can return NotYetAvailable while the camera is
+     * stationary, so retain the healthy state for a bounded freshness window.
+     */
+    private var depthLastHealthyNs = Long.MIN_VALUE
     private var depthCapability = VisibilityDepthCapability.UNSUPPORTED
     private var syntheticSource = false
     private var offeredFeatureObservations = 0L
@@ -75,6 +81,12 @@ internal class AndroidVisibilityGridRuntime(
     private var depthTransientUnavailable = 0L
     private var featureFailures = 0L
     private var depthFailures = 0L
+    private var depthPreparationReady = 0L
+    private var depthPreparationTransient = 0L
+    private var depthPreparationRejected = 0L
+    private var depthProcessorBusyDrops = 0L
+    private var depthProcessingTransient = 0L
+    private var depthProcessingRejected = 0L
     private var acquiredProducerResources = 0L
     private var closedProducerResources = 0L
     private var residentPayloadBytes = 0L
@@ -88,6 +100,8 @@ internal class AndroidVisibilityGridRuntime(
     private var callbackCopyDepthSheds = 0L
     private var callbackCopyFeatureSheds = 0L
     private var lastCallbackCopyBudgetBreachNs = Long.MIN_VALUE
+    private var lastCallbackRecoveryProbeNs = Long.MIN_VALUE
+    private var callbackRecoveryProbeInFlight = false
     private var pausedObservationRejections = 0L
     private var lifecycleDiscardedObservations = 0L
     private var pauseCount = 0L
@@ -157,6 +171,7 @@ internal class AndroidVisibilityGridRuntime(
                 lifecycleLock.write {
                     synchronized(lock) {
                         depthCapability = capability
+                        depthLastHealthyNs = Long.MIN_VALUE
                         if (depthHealth != VisibilitySourceHealth.FAILED) {
                             depthHealth = VisibilitySourceHealth.UNSUPPORTED
                         }
@@ -211,6 +226,7 @@ internal class AndroidVisibilityGridRuntime(
     fun featureSampleCapacity(): Int = synchronized(lock) {
         when {
             !callbackCopyBudgetDegraded -> V2_FEATURE_SAMPLE_CAPACITY
+            callbackRecoveryProbeInFlight -> V2_FEATURE_SAMPLE_CAPACITY
             isCaptureSafe() -> 1_000
             else -> 0
         }
@@ -219,28 +235,42 @@ internal class AndroidVisibilityGridRuntime(
     fun shouldCopyFeature(timestampNs: Long): Boolean = synchronized(lock) {
         if (syntheticSource) return@synchronized false
         if (featureHealth == VisibilitySourceHealth.FAILED) return@synchronized false
-        if (callbackCopyBudgetDegraded && !isCaptureSafe()) return@synchronized false
+        val unsafeRecoveryProbe = callbackCopyBudgetDegraded && !isCaptureSafe()
+        val now = if (unsafeRecoveryProbe) nanoTime() else Long.MIN_VALUE
+        if (unsafeRecoveryProbe && !callbackRecoveryProbeReady(now)) return@synchronized false
         claimCopy(
             timestampNs,
             featureLastCopyAttemptTimestampNs,
-            if (callbackCopyBudgetDegraded && isCaptureSafe()) {
+            if (callbackCopyBudgetDegraded) {
                 maxOf(featureIntervalNs, SEVERE_FEATURE_INTERVAL_NS)
-            } else if (callbackCopyBudgetDegraded) {
-                Long.MAX_VALUE
-            }
-            else featureIntervalNs,
+            } else featureIntervalNs,
         ).also {
-            if (it) featureLastCopyAttemptTimestampNs = timestampNs
+            if (it) {
+                featureLastCopyAttemptTimestampNs = timestampNs
+                if (unsafeRecoveryProbe) {
+                    callbackCopySamples.clear()
+                    lastCallbackRecoveryProbeNs = now
+                    callbackRecoveryProbeInFlight = true
+                }
+            }
         }
     }
 
-    fun shouldCopyDepth(timestampNs: Long): Boolean = synchronized(lock) {
-        !syntheticSource && !callbackCopyBudgetDegraded &&
-            depthCapability != VisibilityDepthCapability.UNSUPPORTED &&
-            depthHealth != VisibilitySourceHealth.FAILED &&
-            claimCopy(timestampNs, depthLastCopyAttemptTimestampNs, depthIntervalNs).also {
-                if (it) depthLastCopyAttemptTimestampNs = timestampNs
-            }
+    fun shouldCopyDepth(timestampNs: Long): Boolean {
+        // The mapper owns a single depth publication lane. Copying another
+        // full image while it is still mapping or awaiting delivery only
+        // creates replaceable work and competes with the camera callback.
+        // Check the lane outside the runtime lock: replacement callbacks take
+        // the lane lock before updating runtime counters.
+        if (depthLane.hasOutstandingWork()) return false
+        return synchronized(lock) {
+            !syntheticSource && !callbackCopyBudgetDegraded &&
+                depthCapability != VisibilityDepthCapability.UNSUPPORTED &&
+                depthHealth != VisibilitySourceHealth.FAILED &&
+                claimCopy(timestampNs, depthLastCopyAttemptTimestampNs, depthIntervalNs).also {
+                    if (it) depthLastCopyAttemptTimestampNs = timestampNs
+                }
+        }
     }
 
     fun offerFeature(
@@ -266,7 +296,7 @@ internal class AndroidVisibilityGridRuntime(
             }
             if (closed || !isStructurallyValid(observation) ||
                 observation.samples.size > featureSampleCapacity() ||
-                (callbackCopyBudgetDegraded && !isCaptureSafe())
+                (callbackCopyBudgetDegraded && !isCaptureSafe() && !callbackRecoveryProbeInFlight)
             ) {
                 invalidFeatureObservations++
                 droppedFeatureObservations++
@@ -335,6 +365,7 @@ internal class AndroidVisibilityGridRuntime(
             }
             depthLastCopiedTimestampNs = observation.frame.sourceTimestampNs
             depthHealth = VisibilitySourceHealth.HEALTHY
+            depthLastHealthyNs = nanoTime()
             depthFailures = 0
             recordOwnership(observation.ownership)
             copiedDepthObservations++
@@ -346,16 +377,43 @@ internal class AndroidVisibilityGridRuntime(
     }
 
     fun recordFeatureTransientUnavailable() = synchronized(lock) {
+        callbackRecoveryProbeInFlight = false
         featureTransientUnavailable++
         if (featureHealth != VisibilitySourceHealth.FAILED) {
             featureHealth = VisibilitySourceHealth.TRANSIENT_UNAVAILABLE
         }
     }
 
+    fun recordDepthPreparationReady() = synchronized(lock) {
+        depthPreparationReady++
+    }
+
+    fun recordDepthPreparationTransient() = synchronized(lock) {
+        depthPreparationTransient++
+    }
+
+    fun recordDepthPreparationRejected() = synchronized(lock) {
+        depthPreparationRejected++
+    }
+
+    fun recordDepthProcessorBusyDrop() = synchronized(lock) {
+        depthProcessorBusyDrops++
+    }
+
+    fun recordDepthProcessingTransient() = synchronized(lock) {
+        depthProcessingTransient++
+    }
+
+    fun recordDepthProcessingRejected() = synchronized(lock) {
+        depthProcessingRejected++
+    }
+
     fun recordDepthTransientUnavailable() = synchronized(lock) {
         if (depthCapability != VisibilityDepthCapability.UNSUPPORTED) {
             depthTransientUnavailable++
-            if (depthHealth != VisibilitySourceHealth.FAILED) {
+            if (depthHealth != VisibilitySourceHealth.FAILED &&
+                !hasFreshDepthObservation(nanoTime())
+            ) {
                 depthHealth = VisibilitySourceHealth.TRANSIENT_UNAVAILABLE
             }
         }
@@ -364,6 +422,7 @@ internal class AndroidVisibilityGridRuntime(
     fun recordFeatureFailure() {
         val drain = lifecycleLock.write {
             synchronized(lock) {
+                callbackRecoveryProbeInFlight = false
                 featureFailures++
                 featureHealth = VisibilitySourceHealth.FAILED
             }
@@ -465,6 +524,7 @@ internal class AndroidVisibilityGridRuntime(
                 depthLastCopiedTimestampNs = Long.MIN_VALUE
                 featureLastCopyAttemptTimestampNs = Long.MIN_VALUE
                 depthLastCopyAttemptTimestampNs = Long.MIN_VALUE
+                depthLastHealthyNs = Long.MIN_VALUE
                 recordOwnership(current)
             }
         }
@@ -507,6 +567,12 @@ internal class AndroidVisibilityGridRuntime(
             depthTransientUnavailable = depthTransientUnavailable,
             featureFailures = featureFailures,
             depthFailures = depthFailures,
+            depthPreparationReady = depthPreparationReady,
+            depthPreparationTransient = depthPreparationTransient,
+            depthPreparationRejected = depthPreparationRejected,
+            depthProcessorBusyDrops = depthProcessorBusyDrops,
+            depthProcessingTransient = depthProcessingTransient,
+            depthProcessingRejected = depthProcessingRejected,
             acquiredProducerResources = acquiredProducerResources,
             closedProducerResources = closedProducerResources,
             residentPayloadBytes = residentPayloadBytes,
@@ -554,8 +620,17 @@ internal class AndroidVisibilityGridRuntime(
         if (ownsScheduler) scheduler.shutdownNow()
     }
 
-    fun snapshotWireMap(): Map<String, Any> =
-        snapshot().toWireMap() + mapOf("mappingIngress" to mapper.snapshot().toWireMap())
+    fun snapshotWireMap(): Map<String, Any> {
+        val publication = (mapper as? VisibilityGridIntegration)?.integrationReceipt()
+        return snapshot().toWireMap() + mapOf(
+            "mappingIngress" to mapper.snapshot().toWireMap(),
+            "mappingPublicationStatus" to (publication?.status ?: "unavailable"),
+            "mappingRejected" to (publication?.rejected ?: 0L),
+            "mappingFenced" to (publication?.fenced ?: 0L),
+            "depthAdmissionTiming" to mapper.depthAdmissionTiming().toWireMap(),
+            "featureAdmissionTiming" to mapper.featureAdmissionTiming().toWireMap(),
+        )
+    }
 
     private fun updateResidentBytes(
         featureBytes: Long? = null,
@@ -591,13 +666,14 @@ internal class AndroidVisibilityGridRuntime(
     }
 
     private fun recordCallbackCopy(value: Long) {
+        callbackRecoveryProbeInFlight = false
         callbackCopySamples.record(value)
         val p95 = callbackCopySamples.p95()
         val now = nanoTime()
         if (p95 > callbackCopyBudgetNs) {
-            lastCallbackCopyBudgetBreachNs = now
             callbackCopyBudgetBreaches++
             if (!callbackCopyBudgetDegraded) {
+                lastCallbackCopyBudgetBreachNs = now
                 callbackCopyBudgetDegraded = true
                 callbackCopyDepthSheds++
                 if (!isCaptureSafe()) callbackCopyFeatureSheds++
@@ -616,7 +692,11 @@ internal class AndroidVisibilityGridRuntime(
             if (depthCapability != VisibilityDepthCapability.UNSUPPORTED &&
                 depthHealth != VisibilitySourceHealth.FAILED
             ) {
-                depthHealth = VisibilitySourceHealth.CONFIGURED
+                depthHealth = if (hasFreshDepthObservation(now)) {
+                    VisibilitySourceHealth.HEALTHY
+                } else {
+                    VisibilitySourceHealth.CONFIGURED
+                }
             }
         }
     }
@@ -719,7 +799,26 @@ internal class AndroidVisibilityGridRuntime(
     companion object {
         const val TERMINAL_FAILURE_THRESHOLD = 3
         const val CALLBACK_COPY_BUDGET_NS = 2_000_000L
+        const val CALLBACK_COPY_RECOVERY_PROBE_INTERVAL_NS = 1_000_000_000L
         const val SEVERE_FEATURE_INTERVAL_NS = 1_000_000_000L
+        const val DEPTH_HEALTHY_FRESHNESS_WINDOW_NS = 10_000_000_000L
+    }
+
+    private fun hasFreshDepthObservation(nowNs: Long): Boolean {
+        val lastHealthyNs = depthLastHealthyNs
+        if (lastHealthyNs == Long.MIN_VALUE) return false
+        val ageNs = nowNs - lastHealthyNs
+        return ageNs >= 0 && ageNs < DEPTH_HEALTHY_FRESHNESS_WINDOW_NS
+    }
+
+    private fun callbackRecoveryProbeReady(nowNs: Long): Boolean {
+        val breachNs = lastCallbackCopyBudgetBreachNs
+        if (!callbackCopyBudgetDegraded || breachNs == Long.MIN_VALUE) return false
+        val sinceBreachNs = nowNs - breachNs
+        if (sinceBreachNs < callbackCopyRecoveryNs) return false
+        val probeNs = lastCallbackRecoveryProbeNs
+        return probeNs == Long.MIN_VALUE ||
+            nowNs - probeNs >= CALLBACK_COPY_RECOVERY_PROBE_INTERVAL_NS
     }
 
     private fun isCaptureSafe(): Boolean = try {
@@ -756,6 +855,12 @@ internal data class VisibilityObservationHealth(
     val depthTransientUnavailable: Long,
     val featureFailures: Long,
     val depthFailures: Long,
+    val depthPreparationReady: Long,
+    val depthPreparationTransient: Long,
+    val depthPreparationRejected: Long,
+    val depthProcessorBusyDrops: Long,
+    val depthProcessingTransient: Long,
+    val depthProcessingRejected: Long,
     val acquiredProducerResources: Long,
     val closedProducerResources: Long,
     val residentPayloadBytes: Long,
@@ -823,6 +928,12 @@ internal data class VisibilityObservationHealth(
         "depthTransientUnavailable" to depthTransientUnavailable,
         "featureFailures" to featureFailures,
         "depthFailures" to depthFailures,
+        "depthPreparationReady" to depthPreparationReady,
+        "depthPreparationTransient" to depthPreparationTransient,
+        "depthPreparationRejected" to depthPreparationRejected,
+        "depthProcessorBusyDrops" to depthProcessorBusyDrops,
+        "depthProcessingTransient" to depthProcessingTransient,
+        "depthProcessingRejected" to depthProcessingRejected,
         "acquiredProducerResources" to acquiredProducerResources,
         "closedProducerResources" to closedProducerResources,
         "resourceBalance" to resourceBalance,
@@ -1073,6 +1184,10 @@ private class LatestObservationLane<T : Any>(
                 (latest?.let(payloadBytes) ?: 0).toLong()
         }
 
+    fun hasOutstandingWork(): Boolean = synchronized(lock) {
+        current != null || latest != null || scheduled || running || accountingPending
+    }
+
     fun offer(value: T) {
         synchronized(lock) {
             if (closed) return
@@ -1185,6 +1300,11 @@ private class BoundedLatencySamples(capacity: Int) {
         values[next] = value.coerceAtLeast(0)
         next = (next + 1) % values.size
         count = minOf(count + 1, values.size)
+    }
+
+    fun clear() {
+        count = 0
+        next = 0
     }
 
     fun p95(): Long {

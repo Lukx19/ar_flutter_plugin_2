@@ -1068,8 +1068,16 @@ internal class MutableCanonicalOverlay private constructor(
         }
         val vacated = structuralSources
         targets.forEach { target ->
-            directLookups++
-            val occupied = view.findByVoxel(target.voxel)
+            // A refine target names its existing source and must stay in the
+            // same voxel. That source row was already authenticated above;
+            // reuse it instead of reading the same canonical voxel page again.
+            // Relocations and allocations still perform the authoritative
+            // voxel lookup because their target may be newly occupied.
+            val namedSource = target.id?.let(sourceRows::get)
+            val occupied = if (namedSource?.voxel == target.voxel) namedSource else {
+                directLookups++
+                view.findByVoxel(target.voxel)
+            }
             if (occupied != null && occupied.id !in vacated && occupied.id != target.id) {
                 return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
             }

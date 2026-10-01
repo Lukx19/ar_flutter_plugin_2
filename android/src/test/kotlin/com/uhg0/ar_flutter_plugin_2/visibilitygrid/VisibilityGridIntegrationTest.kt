@@ -25,8 +25,10 @@ import java.nio.ByteBuffer
 import java.nio.file.Files
 import java.security.MessageDigest
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -123,7 +125,11 @@ class VisibilityGridIntegrationTest {
         val binding = VisibilityGridV2Binding(
             messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() },
         )
-        val projection = NativeRendererProjection(render = { _, _ -> })
+        val presentations = mutableListOf<com.uhg0.ar_flutter_plugin_2.sceneview.BoundedCoveragePresentation>()
+        val projection = NativeRendererProjection(
+            render = { _, _ -> },
+            publishPresentation = { descriptor, _ -> descriptor?.let(presentations::add) },
+        )
         var integration: VisibilityGridIntegration? = null
         var activeResources: CanonicalRuntimeResources? = null
         try {
@@ -169,6 +175,12 @@ class VisibilityGridIntegrationTest {
             assertEquals(100_000, pressure.canonicalSurfaceHighWater)
             assertEquals(200_000, pressure.associationHighWater)
             assertEquals("receipt=${integration.integrationReceipt()}", 100_000, integration.integrationReceipt().rendererRows)
+            val presentation = requireNotNull(presentations.lastOrNull())
+            assertEquals(20_000, presentation.count)
+            assertEquals(
+                integration.integrationReceipt().transactionId,
+                presentation.qualifier.transactionId,
+            )
             val firstPage = requireNotNull(activeResources).readRendererPage(0, 512)
             assertEquals(512, firstPage?.rows?.size)
             assertEquals(0xffff, firstPage?.rows?.first()?.lineageCount)
@@ -352,17 +364,209 @@ class VisibilityGridIntegrationTest {
             assertTrue(source.emitMaximumDepth(scheduler.nowNs + 250_000_000L))
             scheduler.advanceBy(0)
             assertEquals(V2_DEPTH_SAMPLE_CAPACITY, runtime.snapshot().maximumDepthSamples)
-            assertEquals("depthLookupRefused", integration.integrationReceipt().status)
-            assertEquals(0, runtime.snapshot().admittedDepthObservations)
+            assertEquals("nonMaterialRetained", integration.integrationReceipt().status)
+            assertEquals(1, runtime.snapshot().admittedDepthObservations)
             assertEquals(pending.geometryRevision, integration.integrationReceipt().geometryRevision)
             assertEquals(rendererRows, projection.currentRowCount())
             val lookup = requireNotNull(integration.depthLookupReceipt())
-            assertTrue(lookup.refusedByLimit)
-            assertEquals(8L * 1024L * 1024L, lookup.bytesRead)
+            assertFalse("maximum depth lookup receipt: $lookup", lookup.refusedByLimit)
+            assertTrue(lookup.bytesRead <= 64L * 1024L * 1024L)
             assertTrue(source.emitDepth(scheduler.nowNs + 500_000_000L))
             scheduler.advanceBy(250_000_000L)
-            assertEquals(1, runtime.snapshot().admittedDepthObservations)
+            assertEquals(2, runtime.snapshot().admittedDepthObservations)
             assertTrue(projection.currentRowCount() >= rendererRows)
+        } finally {
+            runtime.close()
+            assertEquals(0, runtime.snapshot().residentPayloadBytes)
+            assertEquals(0, projection.currentRowCount())
+            binding.dispose()
+            coordinator.close()
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test(timeout = 90_000L)
+    fun `material 2000x2000 depth maps commit and acknowledge at bounded cadence`() {
+        val directory = Files.createTempDirectory("material-depth-map-throughput").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val viewId = 2177
+        val binding = VisibilityGridV2Binding(
+            messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() },
+        )
+        val scheduler = PressureObservationScheduler()
+        val projection = NativeRendererProjection(render = { _, _ -> })
+        val canonicalCommitMicros = ArrayList<Long>(3)
+        val integration = VisibilityGridIntegration(
+            binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = resources(directory, coordinator),
+            renderer = projection,
+            // This fixture measures a material canonical commit for each map;
+            // production still requires four independent occupied votes.
+            depthKernelFactory = {
+                DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 1))
+            },
+            commitCanonical = { resources, mutation ->
+                val startedNs = System.nanoTime()
+                resources.commitAdjacent(mutation).also {
+                    canonicalCommitMicros += elapsedMicros(startedNs, System.nanoTime())
+                }
+            },
+        )
+        val runtime = AndroidVisibilityGridRuntime(
+            binding::currentObservationOwnership,
+            integration,
+            scheduler,
+            nanoTime = { scheduler.nowNs },
+        )
+        try {
+            val stream = start(
+                binding,
+                messenger,
+                viewId,
+                startRequestWithVoxelSize(100_000),
+            )
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            runtime.setDepthCapability(VisibilityDepthCapability.RAW_DEPTH)
+            val ownership = requireNotNull(binding.currentObservationOwnership())
+
+            var streamSequence = 3L
+            var transaction = 1L
+            var geometry = 1L
+            var lineage = 1L
+            fun acknowledge(staged: VisibilityGridIntegrationReceipt) {
+                assertEquals("pendingAck", staged.status)
+                var ended = false
+                repeat(256) {
+                    if (!ended) {
+                        ended = exchange(
+                            messenger,
+                            viewId,
+                            stream,
+                            ++streamSequence,
+                            transaction,
+                            geometry,
+                            lineage,
+                        ).first.messageKind == 4
+                    }
+                }
+                assertTrue("bounded material map reached END", ended)
+                transaction = staged.transactionId
+                geometry = staged.geometryRevision
+                lineage = staged.lineageRevision
+                assertEquals(
+                    0,
+                    exchange(
+                        messenger,
+                        viewId,
+                        stream,
+                        ++streamSequence,
+                        transaction,
+                        geometry,
+                        lineage,
+                    ).first.messageKind,
+                )
+                await { integration.integrationReceipt().status == "acknowledged" }
+            }
+
+            var timestampNs = 1_000_000_000L
+            val timings = ArrayList<VisibilityDepthAdmissionTiming>(3)
+            val selectionMicros = ArrayList<Long>(3)
+            var admittedMaps = 0
+            for (mapIndex in 0 until 3) {
+                val source = materialDepthSource(mapIndex)
+                val startedNs = System.nanoTime()
+                val selected = source.acquire(materialDepthMetadata(timestampNs))
+                selectionMicros += elapsedMicros(startedNs, System.nanoTime())
+                val copied = selected as? DepthAcquisitionResult.Observation
+                    ?: error("material depth source did not produce an observation")
+                assertEquals(2_000, copied.value.width)
+                assertEquals(2_000, copied.value.height)
+                assertTrue(
+                    "spatial/detail selection ${copied.value.samples.size}",
+                    copied.value.samples.size in 3_000..V2_DEPTH_SAMPLE_CAPACITY,
+                )
+                assertTrue(copied.value.samples.any { it.depthMillimeters == 300 })
+                assertTrue(copied.value.samples.any { it.depthMillimeters == 400 })
+                assertTrue(copied.value.samples.any { it.depthMillimeters == 600 })
+                val samples = copied.value.samples.map {
+                    VisibilityDepthSample(it.x, it.y, it.depthMillimeters, it.confidence)
+                }
+                val observation = VisibilityDepthObservation(
+                    ownership = ownership,
+                    frame = VisibilityObservationFrame(
+                        VisibilityObservationSource.ARCORE_RAW_DEPTH,
+                        timestampNs,
+                        timestampNs,
+                        timestampNs,
+                        "material-depth-camera",
+                        true,
+                        "landscape_right_x_right_y_down_v1",
+                        VisibilityCameraPose.copyOf(identityVisibilityGridTransform()),
+                        VisibilityCameraIntrinsics(
+                            2_000, 2_000, 1_000.0, 1_000.0, 1_000.0, 1_000.0,
+                        ),
+                        VisibilityDepthCapability.RAW_DEPTH,
+                    ),
+                    samples = samples,
+                    sourceRejectedSamples = copied.value.sourceRejectedPixels,
+                    payloadBytes = VisibilityDepthObservation.DEPTH_FIXED_BYTES +
+                        samples.size * VisibilityDepthObservation.DEPTH_SAMPLE_BYTES,
+                )
+                val rendererRowsBeforeMap = projection.currentRowCount()
+                assertTrue(runtime.offerDepth(observation, 0))
+                scheduler.advanceBy(0)
+                val pending = integration.integrationReceipt()
+                assertEquals("depth map $mapIndex lookup=${integration.depthLookupReceipt()}", "pendingAck", pending.status)
+                val pendingTiming = integration.depthAdmissionTiming()
+                assertTrue(pendingTiming.pendingPublicationAck)
+                acknowledge(pending)
+                scheduler.advanceBy(0)
+                val timing = integration.depthAdmissionTiming()
+                assertTrue(timing.completedCount > 0L)
+                assertTrue(timing.sequence > 0L)
+                assertFalse(timing.pendingPublicationAck)
+                if (mapIndex > 0) {
+                    assertTrue(
+                        "populated map reread ${integration.depthLookupReceipt()}",
+                        requireNotNull(integration.depthLookupReceipt()).bytesRead <= 32L * 1024L * 1024L,
+                    )
+                }
+                assertTrue(integration.pendingDepthRetentionReceipt() == null)
+                assertEquals("acknowledged", integration.integrationReceipt().status)
+                assertTrue(
+                    "material rows did not grow before=$rendererRowsBeforeMap " +
+                        "after=${projection.currentRowCount()} receipt=${integration.integrationReceipt()} " +
+                        "depth=${integration.depthLookupReceipt()}",
+                    projection.currentRowCount() > rendererRowsBeforeMap,
+                )
+                admittedMaps++
+                timings += timing
+                val acquisitionAndAckMicros = selectionMicros.last() + timing.endToEndMicros
+                println(
+                    "materialMap[$mapIndex] selected=${samples.size} " +
+                        "acquisitionAndAckMicros=$acquisitionAndAckMicros timing=$timing " +
+                        "lookup=${integration.depthLookupReceipt()} " +
+                        "receipt=${integration.integrationReceipt()} " +
+                        "commitMicros=${canonicalCommitMicros.last()} " +
+                        "rendererRows=${projection.currentRowCount()}",
+                )
+                if (mapIndex < 2) {
+                    Thread.sleep(3_000L)
+                }
+                timestampNs += 3_000_000_000L
+            }
+            assertEquals(admittedMaps.toLong(), runtime.snapshot().admittedDepthObservations)
+            assertEquals(3, admittedMaps)
+            assertEquals(0L, runtime.snapshot().residentPayloadBytes)
+            assertEquals(admittedMaps, timings.size)
+            assertTrue(selectionMicros.all { it >= 0L })
+            println(
+                "materialDepthMap2000x2000 selectionMicros=$selectionMicros " +
+                    "admissionTimings=$timings rendererRows=${projection.currentRowCount()}",
+            )
         } finally {
             runtime.close()
             assertEquals(0, runtime.snapshot().residentPayloadBytes)
@@ -447,7 +651,7 @@ class VisibilityGridIntegrationTest {
             }
             val cut = requireNotNull(binding.currentObservationOwnership())
             runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
-            repeat(1) { cycle ->
+            repeat(1) {
                 val timestamp = scheduler.nowNs
                 val featureFrame = feature(cut, timestamp).frame
                 val featureSamples = List(V2_FEATURE_SAMPLE_CAPACITY) { index ->
@@ -464,12 +668,12 @@ class VisibilityGridIntegrationTest {
                 scheduler.advanceBy(0)
                 acknowledge()
                 val depthSamples = List(V2_DEPTH_SAMPLE_CAPACITY) { index ->
-                    VisibilityDepthSample(index % 48, index / 48, 1_000 + cycle * 100, 255)
+                    VisibilityDepthSample(index % 64, index / 64, 8_000, 255)
                 }
                 assertTrue(runtime.offerDepth(VisibilityDepthObservation(
                     ownership = cut,
                     frame = depth(cut, timestamp).frame.copy(
-                        intrinsics = VisibilityCameraIntrinsics(48, 32, 40.0, 40.0, 24.0, 16.0)),
+                        intrinsics = VisibilityCameraIntrinsics(64, 64, 40.0, 40.0, 32.0, 32.0)),
                     samples = depthSamples, sourceRejectedSamples = 0,
                     payloadBytes = VisibilityDepthObservation.DEPTH_FIXED_BYTES +
                         depthSamples.size * VisibilityDepthObservation.DEPTH_SAMPLE_BYTES,
@@ -486,7 +690,7 @@ class VisibilityGridIntegrationTest {
                 assertEquals(0L, boundedLookup.bytesRead)
                 assertEquals(2, integration.integrationReceipt().geometryRevision)
                 assertEquals(0, runtime.snapshot().admittedDepthObservations)
-                assertTrue(requireNotNull(integration.depthLookupReceipt()).bytesRead <= 8L * 1024L * 1024L)
+                assertTrue(requireNotNull(integration.depthLookupReceipt()).bytesRead <= 64L * 1024L * 1024L)
                 val rendererRowsBeforeFault = projection.currentRowCount()
                 val publishedPagesBeforeFault = publishedPages
                 val publishedRowsBeforeFault = publishedRows
@@ -515,6 +719,11 @@ class VisibilityGridIntegrationTest {
                 assertEquals(publishedRowsBeforeFault + projection.currentRowCount(), publishedRows)
                 assertEquals(publishedPagesBeforeFault +
                     (projection.currentRowCount() + 511) / 512, publishedPages)
+                val pendingDepthTiming = integration.depthAdmissionTiming()
+                assertEquals(0L, pendingDepthTiming.completedCount)
+                assertTrue(pendingDepthTiming.pendingPublicationAck)
+                assertTrue("publication ACK timing $pendingDepthTiming",
+                    pendingDepthTiming.publicationAckMicros >= 0L)
                 acknowledge()
                 scheduler.advanceBy(250_000_000)
                 assertEquals(2, depthCommitAttempts.size)
@@ -522,6 +731,16 @@ class VisibilityGridIntegrationTest {
                 assertEquals(publishedPagesBeforeFault +
                     (projection.currentRowCount() + 511) / 512, publishedPages)
             }
+            val depthTiming = integration.depthAdmissionTiming()
+            assertEquals(1L, depthTiming.completedCount)
+            assertFalse(depthTiming.pendingPublicationAck)
+            assertTrue("lookup timing $depthTiming", depthTiming.lookupMicros >= 0L)
+            assertTrue("mutation timing $depthTiming", depthTiming.mutationMicros >= 0L)
+            assertTrue("publication ACK timing $depthTiming", depthTiming.publicationAckMicros >= 0L)
+            assertTrue("end-to-end timing $depthTiming", depthTiming.endToEndMicros >= 0L)
+            val timingWire = runtime.snapshotWireMap()["depthAdmissionTiming"]
+            assertTrue(timingWire is Map<*, *>)
+            assertTrue((timingWire as Map<*, *>).values.all { it is Number || it is Boolean })
             assertEquals(1, runtime.snapshot().admittedFeatureObservations)
             assertEquals(1, runtime.snapshot().admittedDepthObservations)
             assertTrue(integration.pressureSnapshot().canonicalSurfaceHighWater > 0)
@@ -609,6 +828,95 @@ class VisibilityGridIntegrationTest {
         } finally {
             runtime.close()
             assertEquals(0, projection.currentRowCount())
+            binding.dispose()
+            coordinator.close()
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test(timeout = 240_000)
+    fun `stationary camera sphere sweep advances one canonical map and renderer`() {
+        val directory = Files.createTempDirectory("canonical-sphere-sweep").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val viewId = 2192
+        val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+        val projection = NativeRendererProjection(render = { _, _ -> })
+        val scheduler = Executors.newScheduledThreadPool(2)
+        val clock = AtomicLong(1_000_000_000L)
+        val mapperExecutor = Executors.newSingleThreadExecutor()
+        val integration = VisibilityGridIntegration(
+            binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = resources(directory, coordinator), renderer = projection,
+            executor = mapperExecutor, ownsExecutor = false,
+        )
+        val runtime = AndroidVisibilityGridRuntime(
+            binding::currentObservationOwnership, integration, scheduler, nanoTime = clock::get,
+        )
+        try {
+            val stream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            var sequence = 4L
+            var acknowledgedTransaction = 1L
+            var acknowledgedGeometry = 1L
+            var acknowledgedLineage = 1L
+            fun acknowledgeMaterialCut() {
+                val receipt = integration.integrationReceipt()
+                if (receipt.status != "pendingAck") return
+                assertTrue(integration.hasPendingPublicationForIngress())
+                val begin = exchange(messenger, viewId, stream, sequence++, acknowledgedTransaction,
+                    acknowledgedGeometry, acknowledgedLineage).first
+                assertEquals(2, begin.messageKind)
+                repeat(begin.chunkCount) {
+                    assertEquals(3, exchange(messenger, viewId, stream, sequence++, acknowledgedTransaction,
+                        acknowledgedGeometry, acknowledgedLineage).first.messageKind)
+                }
+                assertEquals(4, exchange(messenger, viewId, stream, sequence++, acknowledgedTransaction,
+                    acknowledgedGeometry, acknowledgedLineage).first.messageKind)
+                acknowledgedTransaction = receipt.transactionId
+                acknowledgedGeometry = receipt.geometryRevision
+                acknowledgedLineage = receipt.lineageRevision
+                assertEquals(0, exchange(messenger, viewId, stream, sequence++, acknowledgedTransaction,
+                    acknowledgedGeometry, acknowledgedLineage).first.messageKind)
+                mapperExecutor.submit {}.get(10, TimeUnit.SECONDS)
+                assertEquals("acknowledged", integration.integrationReceipt().status)
+                assertFalse(integration.hasPendingPublicationForIngress())
+            }
+            val source = SyntheticVisibilityObservationSource(runtime, binding::currentObservationOwnership)
+            source.anchor(identityVisibilityGridTransform(), requireNotNull(binding.currentObservationOwnership()).groupFrame)
+            source.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            val depthViews = (0 until SYNTHETIC_SPHERE_VIEW_COUNT).toSet()
+            var admittedDepths = 0L
+            for (view in 0 until SYNTHETIC_SPHERE_VIEW_COUNT) {
+                val timestamp = 1_000_000_000L + view * 1_000_000_000L
+                clock.set(timestamp)
+                assertTrue("feature view $view", source.emitSphereView(view, timestamp,
+                    timestamp + 250_000_000L, includeDepth = false).first)
+                runtime.awaitDebugFixtureIdle()
+                acknowledgeMaterialCut()
+                if (view in depthViews) {
+                    clock.set(timestamp + 250_000_000L)
+                    assertTrue("depth view $view", source.emitSphereView(view, timestamp,
+                        timestamp + 250_000_000L, includeFeature = false).second)
+                    runtime.awaitDebugFixtureIdle()
+                    acknowledgeMaterialCut()
+                    admittedDepths++
+                    assertEquals("depth view $view status ${integration.integrationReceipt().status} lookup ${integration.depthLookupReceipt()}",
+                        admittedDepths, runtime.snapshot().admittedDepthObservations)
+                }
+            }
+            val receipt = integration.integrationReceipt()
+            assertTrue("surface count ${receipt.rendererRows}", receipt.rendererRows > 100)
+            assertTrue(projection.currentRowCount() > 100)
+            assertTrue(integration.pressureSnapshot().associationHighWater > 1_000)
+            assertEquals(SYNTHETIC_SPHERE_VIEW_COUNT.toLong(), runtime.snapshot().admittedFeatureObservations)
+            assertEquals(depthViews.size.toLong(), runtime.snapshot().admittedDepthObservations)
+            assertTrue(acknowledgedTransaction > SYNTHETIC_SPHERE_VIEW_COUNT)
+        } finally {
+            runtime.close()
+            mapperExecutor.shutdownNow()
             binding.dispose()
             coordinator.close()
             directory.deleteRecursively()
@@ -3083,12 +3391,17 @@ class VisibilityGridIntegrationTest {
         val token: Long,
     )
 
-    private fun start(binding: VisibilityGridV2Binding, messenger: MethodTestMessenger, viewId: Int): Stream {
+    private fun start(
+        binding: VisibilityGridV2Binding,
+        messenger: MethodTestMessenger,
+        viewId: Int,
+        request: ControlRequest = startRequest(),
+    ): Stream {
         val snapshot = binding.snapshot()
         val qualifier = snapshot.nativeStreamToken + snapshot.workerBindingToken
         val result = RecordingResult()
         MethodChannel(messenger, "visibility_grid_v2_control_$viewId").invokeMethod(
-            "start", qualifier + ControlCodec.encodeRequest(startRequest()), result,
+            "start", qualifier + ControlCodec.encodeRequest(request), result,
         )
         assertTrue(result.completed.await(2, TimeUnit.SECONDS))
         val response = ControlCodec.decodeResponse(strip(result.successValue as ByteArray, qualifier))
@@ -3353,6 +3666,53 @@ class VisibilityGridIntegrationTest {
         ControlOperation.START, 0, uuid(1), uuid(20), uuid(40), 3, 4, 5, 0,
         StartRequestCodecV2.defaultPayload(),
     )
+
+    private fun startRequestWithVoxelSize(voxelSizeMicrometres: Int): ControlRequest =
+        startRequest().copy(
+            payload = startRequest().payload.copyOf().also { payload ->
+                ByteBuffer.wrap(payload).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                    .putInt(36, voxelSizeMicrometres)
+            },
+        )
+
+    private fun materialDepthMetadata(timestampNs: Long) = RawDepthFrameMetadata(
+        timestampNs = timestampNs,
+        groupGeneration = 1,
+        sessionGeneration = 1,
+        tracking = true,
+        width = 2_000,
+        height = 2_000,
+        intrinsics = DepthIntrinsics(1_000.0, 1_000.0, 1_000.0, 1_000.0),
+        worldFromCameraGl = identityVisibilityGridTransform(),
+    )
+
+    private fun materialDepthSource(mapIndex: Int): RawDepthCopySource {
+        val foregroundX = 967 + mapIndex * 250
+        val foregroundY = 968 + mapIndex * 250
+        fun depthAt(x: Int, y: Int): Int = when {
+            x in foregroundX..foregroundX + 8 && y in foregroundY..foregroundY + 8 -> 400
+            x in foregroundX + 26..foregroundX + 34 && y in foregroundY..foregroundY + 8 -> 600
+            x in foregroundX + 51..foregroundX + 59 && y in foregroundY..foregroundY + 8 -> 300
+            x in 700..1_300 && y in 700..1_300 -> 900
+            else -> 1_200
+        }
+        fun image(value: (Int, Int) -> Int): RawDepthImage = object : RawDepthImage {
+            override val width = 2_000
+            override val height = 2_000
+            override fun unsignedValue(x: Int, y: Int): Int = value(x, y)
+            override fun close() = Unit
+        }
+        return RawDepthCopySource(
+            acquirer = object : PairedRawDepthAcquirer {
+                override fun acquireDepth() = image(::depthAt)
+                override fun acquireConfidence() = image { _, _ -> 255 }
+            },
+            maxCopiedPixels = V2_DEPTH_SAMPLE_CAPACITY,
+        )
+    }
+
+    private fun elapsedMicros(startedNs: Long, finishedNs: Long): Long =
+        ((finishedNs - startedNs).coerceAtLeast(0L) / 1_000L)
 
     private fun restoredStartPayload(baseline: CommittedBaselineV1): ByteArray =
         StartRequestCodecV2.defaultPayload().also { bytes ->

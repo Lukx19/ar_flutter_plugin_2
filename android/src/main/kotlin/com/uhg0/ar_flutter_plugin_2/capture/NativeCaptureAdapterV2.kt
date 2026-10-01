@@ -1,6 +1,8 @@
 package com.uhg0.ar_flutter_plugin_2.capture
 
 import android.content.Context
+import android.os.SystemClock
+import android.util.Log
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityCaptureSafePredicate
 import java.io.InputStream
 import java.util.concurrent.Executor
@@ -97,6 +99,8 @@ internal data class NativeCaptureEventV2(
     val captureId: String? = null,
     val captureRevision: Long? = null,
     val manifestId: String? = null,
+    val jpegSizeBytes: Long? = null,
+    val dngSizeBytes: Long? = null,
     val reason: String? = null,
     val resources: CaptureResourceSnapshotV2? = null,
     val recoveryContext: NativeCaptureRecoveryContextV2? = null,
@@ -258,6 +262,8 @@ internal class NativeCaptureRecoveryDispatcherV2(
         captureId = captureId,
         captureRevision = captureRevision,
         manifestId = manifestId,
+        jpegSizeBytes = jpegSizeBytes,
+        dngSizeBytes = dngSizeBytes,
         reason = reason,
         recoveryContext = recoveryContext,
     )
@@ -464,6 +470,7 @@ internal class NativeCaptureBindingV2(
     private val nowMs: () -> Long = System::currentTimeMillis,
     private val events: (NativeCaptureEventV2) -> Unit = {},
 ) : AutoCloseable {
+    private val appContext = context.applicationContext
     private val lock = Any()
     private val rootResourcesDelegate = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
         createNativeCaptureRootResourcesV2(context)
@@ -555,6 +562,11 @@ internal class NativeCaptureBindingV2(
     fun replayRecovery(): List<NativeCaptureEventV2> = recoveryForOperation().replaySnapshot()
     fun acknowledgeTerminal(attemptId: String) = recoveryForOperation().acknowledgeTerminal(attemptId)
     fun snapshot() = adapterForOperation().snapshot()
+
+    /** Returns an app-private preview path for a retained committed JPEG. */
+    fun materializeJpegPreview(manifestId: String, captureId: String): String? {
+        return NativeCapturePreviewOwnerV2(appContext.filesDir).materialize(manifestId, captureId)
+    }
 
     /** Native instrumentation seam; it is never registered with a Flutter channel. */
     internal fun syntheticAdapterForTest(): NativeCaptureAdapterV2 = adapterForOperation()
@@ -774,6 +786,13 @@ internal class NativeCaptureAdapterV2(
     private val nowMs: () -> Long = System::currentTimeMillis,
     private val events: (NativeCaptureEventV2) -> Unit = {},
 ) : AutoCloseable {
+    private fun captureLatencyLog(stage: String, attemptId: String) {
+        Log.i(
+            "CaptureLatency",
+            "stage=$stage attemptId=$attemptId elapsedRealtimeNs=${SystemClock.elapsedRealtimeNanos()}",
+        )
+    }
+
     private data class Work(
         val request: CaptureCommitRequest,
         val acceptedReceipt: CaptureReceipt,
@@ -809,6 +828,7 @@ internal class NativeCaptureAdapterV2(
     private var nextExposureGeneration = 0L
 
     fun admit(request: CaptureCommitRequest): CaptureReceipt = admissionLock.withLock { lock.withLock {
+        captureLatencyLog("native_admit_start", request.accepted.identity.attemptId)
         check(!closed && !closing) { "NativeCaptureAdapterV2 is closed" }
         val admissionLifecycleGeneration = lifecycleGeneration
         val admissionAutomaticLifecycleGeneration = automaticLifecycleGeneration
@@ -832,6 +852,7 @@ internal class NativeCaptureAdapterV2(
             return@withLock abandonLocked(request, "durable-replay-no-reexposure")
         }
         check(!lifecycleCutDuringAdmission() && !closing) { "lifecycle-cut-during-admission" }
+        captureLatencyLog("native_preexposure_start", accepted.identity.attemptId)
 
         // Capacity and protected-manual priority are settled before durable
         // acceptance. A waiting automatic owner is optional and yields to a
@@ -854,6 +875,7 @@ internal class NativeCaptureAdapterV2(
             scheduler.running?.let { next -> work[next.identity]?.let(::startLocked) }
             throw error
         }
+        captureLatencyLog("native_preexposure_accepted", accepted.identity.attemptId)
         if (lifecycleCutDuringAdmission() || closing) {
             scheduler.release(accepted.identity)
             val terminal = CaptureTerminal(
@@ -1028,6 +1050,7 @@ internal class NativeCaptureAdapterV2(
         var requested = false
         var propagatedSubmissionFailure: Throwable? = null
         try {
+            captureLatencyLog("native_camera_request_start", value.request.accepted.identity.attemptId)
             try {
                 requested = externalCallLocked {
                     exposure.requestExposure(value.qualifier, value.request.accepted.profile.requiredComponents, callback)
@@ -1068,6 +1091,7 @@ internal class NativeCaptureAdapterV2(
                 )
                 return
             }
+            captureLatencyLog("native_camera_request_accepted", value.request.accepted.identity.attemptId)
             countExposureLocked(value)
             when {
                 pendingLifecycleReason != null -> {
@@ -1355,6 +1379,8 @@ internal class NativeCaptureAdapterV2(
                 captureId = terminal.captureId,
                 captureRevision = terminal.captureRevision,
                 manifestId = terminal.manifestId,
+                jpegSizeBytes = terminal.jpegSizeBytes,
+                dngSizeBytes = terminal.dngSizeBytes,
                 reason = terminal.reason,
                 recoveryContext = recoveryContext,
             ),

@@ -382,6 +382,8 @@ class NativeCaptureAdapterV2Test {
                         captureRevision = 1,
                         manifestId = "manifest",
                         reason = "recovered-committed",
+                        jpegSizeBytes = 123,
+                        dngSizeBytes = 456,
                     ),
                 )
             },
@@ -393,6 +395,9 @@ class NativeCaptureAdapterV2Test {
         assertTrue(recovered.await(5, TimeUnit.SECONDS))
         assertTrue(dispatcher.isReady())
         assertEquals(listOf("recovered"), dispatcher.replaySnapshot().map { it.attemptId })
+        assertEquals(123L, dispatcher.replaySnapshot().single().jpegSizeBytes)
+        assertEquals(456L, dispatcher.replaySnapshot().single().dngSizeBytes)
+        assertEquals(456L, NativeCaptureWireV2.event(events.single())["dngSizeBytes"])
         dispatcher.emitLive(NativeCaptureEventV2(NativeCaptureEventKindV2.ACCEPTED, "live"))
         assertEquals(
             listOf(NativeCaptureEventKindV2.COMMITTED, NativeCaptureEventKindV2.ACCEPTED),
@@ -472,7 +477,8 @@ class NativeCaptureAdapterV2Test {
         permutations.forEach { (order, commits) ->
             val store = FakeStore()
             val camera = FakeExposure()
-            val adapter = NativeCaptureAdapterV2(store, camera)
+            val events = mutableListOf<NativeCaptureEventV2>()
+            val adapter = NativeCaptureAdapterV2(store, camera, events = events::add)
             val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG, CaptureComponentKind.DNG))
             adapter.admit(request)
             val qualifier = camera.requests.single().first
@@ -482,6 +488,12 @@ class NativeCaptureAdapterV2Test {
                 if (commits) CaptureTerminalKind.COMMITTED_PICTURE else CaptureTerminalKind.ABANDONED_ATTEMPT,
                 store.terminals.single().terminal?.kind,
             )
+            if (commits) {
+                val event = events.single { it.kind == NativeCaptureEventKindV2.COMMITTED }
+                assertEquals(bytes(CaptureComponentKind.JPEG).size.toLong(), event.jpegSizeBytes)
+                assertEquals(bytes(CaptureComponentKind.DNG).size.toLong(), event.dngSizeBytes)
+                assertEquals(event.dngSizeBytes, NativeCaptureWireV2.event(event)["dngSizeBytes"])
+            }
 
             val late = CloseTrackingInputStream(byteArrayOf(1))
             camera.callback!!.onComponents(SharedCameraComponentSetV2(
@@ -2084,7 +2096,9 @@ class NativeCaptureAdapterV2Test {
                 throw DurableStoreConflictV2("injected store rejection")
             }
             streams.forEach { it.input.use { source -> while (source.read() >= 0) {} } }
-            val terminal = CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, request.accepted.identity, "commit", "committed", "capture", 1, "root")
+            val terminal = CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, request.accepted.identity, "commit", "committed", "capture", 1, "root",
+                jpegSizeBytes = request.components.single { it.kind == CaptureComponentKind.JPEG }.byteLength,
+                dngSizeBytes = request.components.singleOrNull { it.kind == CaptureComponentKind.DNG }?.byteLength)
             return CaptureReceipt(request.accepted.identity, CaptureAttemptPhase.COMMITTED_PICTURE, "commit", "receipt", true, terminal).also(terminals::add)
         }
         override fun queryReceipt(identity: CaptureAttemptIdentity): CaptureReceipt? =

@@ -1,5 +1,13 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
+import kotlin.math.PI
+import kotlin.math.cos
+import kotlin.math.roundToInt
+import kotlin.math.sin
+import kotlin.math.sqrt
+
+internal const val SYNTHETIC_SPHERE_VIEW_COUNT = 20
+
 /** Deterministic copied-source emitter shared by JVM and debug emulator gates. */
 internal class SyntheticVisibilityObservationSource(
     private val runtime: AndroidVisibilityGridRuntime,
@@ -8,12 +16,16 @@ internal class SyntheticVisibilityObservationSource(
     private var sequence = 0L
     private var worldFromCameraGl = identityVisibilityGridTransform()
     private var groupFromCameraGl = identityVisibilityGridTransform()
+    private var sweepAnchorWorldFromCameraGl = identityVisibilityGridTransform()
+    private var sweepGroupFromWorldGl = identityVisibilityGridTransform().toList()
 
     /** Anchors feature geometry to the active group and depth to one exact AR world pose. */
     fun anchor(worldFromCameraGl: DoubleArray, groupFrame: VisibilityGroupFrame) {
         VisibilityCameraPose.copyOf(worldFromCameraGl)
         this.worldFromCameraGl = worldFromCameraGl.copyOf()
         groupFromCameraGl = compose(groupFrame.groupFromWorldGl, worldFromCameraGl)
+        sweepAnchorWorldFromCameraGl = worldFromCameraGl.copyOf()
+        sweepGroupFromWorldGl = groupFrame.groupFromWorldGl
         VisibilityCameraPose.copyOf(groupFromCameraGl)
     }
 
@@ -133,8 +145,8 @@ internal class SyntheticVisibilityObservationSource(
                 VisibilityDepthSample(
                     x = SYNTHETIC_PRINCIPAL_X - 24 + index % 48,
                     y = SYNTHETIC_PRINCIPAL_Y - 16 + index / 48,
-                    // This near-field batch probes the 1,536-sample ceiling;
-                    // bounded canonical work can still refuse it.
+                    // This near-field batch probes the full selected-sample
+                    // ceiling through bounded canonical work.
                     depthMillimeters = MAXIMUM_SAMPLE_DEPTH_MILLIMETERS,
                     confidence = 255,
                 )
@@ -152,9 +164,106 @@ internal class SyntheticVisibilityObservationSource(
         )
     }
 
+    /** One bounded camera view of a two-metre spherical room around the anchor. */
+    fun emitSphereView(
+        viewIndex: Int,
+        featureTimestampNs: Long,
+        depthTimestampNs: Long,
+        includeFeature: Boolean = true,
+        includeDepth: Boolean = true,
+    ): Pair<Boolean, Boolean> {
+        require(viewIndex in 0 until SYNTHETIC_SPHERE_VIEW_COUNT)
+        // Six headings per ring overlap at the sampled horizontal FOV.
+        // Three 45-degree elevation steps plus both poles cover the sphere.
+        val yaw = if (viewIndex < 18) ((viewIndex % 6) + 0.5) * PI / 3.0 else 0.0
+        val pitch = when (viewIndex) {
+            18 -> -PI / 2.0
+            19 -> PI / 2.0
+            else -> ((viewIndex / 6) - 1) * PI / 4.0
+        }
+        val cosYaw = cos(yaw)
+        val sinYaw = sin(yaw)
+        val cosPitch = cos(pitch)
+        val sinPitch = sin(pitch)
+        val relative = doubleArrayOf(
+            cosYaw, 0.0, sinYaw, 0.0,
+            -sinYaw * sinPitch, cosPitch, cosYaw * sinPitch, 0.0,
+            -sinYaw * cosPitch, -sinPitch, cosYaw * cosPitch, 0.0,
+            0.25 * sin(viewIndex * 1.7),
+            0.20 * cos(viewIndex * 1.3),
+            0.15 * sin(viewIndex * 0.9),
+            1.0,
+        )
+        val worldPose = compose(sweepAnchorWorldFromCameraGl.toList(), relative)
+        val groupPose = compose(sweepGroupFromWorldGl, worldPose)
+        val center = sweepAnchorWorldFromCameraGl
+        val featureSamples = ArrayList<VisibilityFeatureSample>(64)
+        val depthSamples = ArrayList<VisibilityDepthSample>(8)
+        for (sample in 0 until 64) {
+            val pixelX = 40 + (sample % 8) * 171
+            val pixelY = 60 + (sample / 8) * 120
+            val cameraRay = doubleArrayOf(
+                (pixelX - SYNTHETIC_PRINCIPAL_X) / SPHERE_FOCAL_LENGTH,
+                (SYNTHETIC_PRINCIPAL_Y - pixelY) / SPHERE_FOCAL_LENGTH,
+                -1.0,
+            )
+            val rayLength = sqrt(cameraRay.sumOf { it * it })
+            val ray = DoubleArray(3) { cameraRay[it] / rayLength }
+            val worldRay = DoubleArray(3) { axis ->
+                worldPose[axis] * ray[0] + worldPose[4 + axis] * ray[1] + worldPose[8 + axis] * ray[2]
+            }
+            val offset = DoubleArray(3) { worldPose[12 + it] - center[12 + it] }
+            val dot = (0..2).sumOf { offset[it] * worldRay[it] }
+            val offsetSquared = offset.sumOf { it * it }
+            val distance = -dot + sqrt(dot * dot + SPHERE_RADIUS_METERS * SPHERE_RADIUS_METERS - offsetSquared)
+            val world = DoubleArray(3) { worldPose[12 + it] + distance * worldRay[it] }
+            val group = DoubleArray(3) { axis ->
+                sweepGroupFromWorldGl[axis] * world[0] +
+                    sweepGroupFromWorldGl[4 + axis] * world[1] +
+                    sweepGroupFromWorldGl[8 + axis] * world[2] +
+                    sweepGroupFromWorldGl[12 + axis]
+            }
+            featureSamples += VisibilityFeatureSample(
+                id = 200_000 + viewIndex * 64 + sample,
+                xWorld = group[0], yWorld = group[1], zWorld = group[2], confidence = 1.0,
+            )
+            if (sample % 8 == 4) {
+                depthSamples += VisibilityDepthSample(
+                    x = pixelX, y = pixelY,
+                    depthMillimeters = (distance / rayLength * 1000.0).roundToInt(),
+                    confidence = 255,
+                )
+            }
+        }
+        val cut = ownership() ?: return false to false
+        val feature = includeFeature && runtime.offerFeature(
+            VisibilityFeatureObservation(
+                ownership = cut,
+                frame = syntheticFrame(VisibilityObservationSource.SYNTHETIC_FEATURE, featureTimestampNs, groupPose, SPHERE_FOCAL_LENGTH),
+                samples = featureSamples,
+                sourceRejectedSamples = 0,
+                payloadBytes = VisibilityFeatureObservation.FEATURE_FIXED_BYTES +
+                    featureSamples.size * VisibilityFeatureObservation.FEATURE_SAMPLE_BYTES,
+            ),
+        )
+        val depth = includeDepth && runtime.offerDepth(
+            VisibilityDepthObservation(
+                ownership = cut,
+                frame = syntheticFrame(VisibilityObservationSource.SYNTHETIC_DEPTH, depthTimestampNs, worldPose, SPHERE_FOCAL_LENGTH),
+                samples = depthSamples,
+                sourceRejectedSamples = 0,
+                payloadBytes = VisibilityDepthObservation.DEPTH_FIXED_BYTES +
+                    depthSamples.size * VisibilityDepthObservation.DEPTH_SAMPLE_BYTES,
+            ),
+        )
+        return feature to depth
+    }
+
     private fun syntheticFrame(
         source: VisibilityObservationSource,
         timestampNs: Long,
+        pose: DoubleArray? = null,
+        focalLength: Double = SYNTHETIC_FOCAL_LENGTH,
     ): VisibilityObservationFrame = VisibilityObservationFrame(
         source = source,
         frameSequence = sequence++,
@@ -164,7 +273,7 @@ internal class SyntheticVisibilityObservationSource(
         tracking = true,
         imageOrientation = "landscape_right_x_right_y_down_v1",
         pose = VisibilityCameraPose.copyOf(
-            if (source == VisibilityObservationSource.SYNTHETIC_FEATURE) {
+            pose ?: if (source == VisibilityObservationSource.SYNTHETIC_FEATURE) {
                 groupFromCameraGl
             } else {
                 worldFromCameraGl
@@ -173,8 +282,8 @@ internal class SyntheticVisibilityObservationSource(
         intrinsics = VisibilityCameraIntrinsics(
             imageWidth = SYNTHETIC_IMAGE_WIDTH,
             imageHeight = SYNTHETIC_IMAGE_HEIGHT,
-            fx = SYNTHETIC_FOCAL_LENGTH,
-            fy = SYNTHETIC_FOCAL_LENGTH,
+            fx = focalLength,
+            fy = focalLength,
             cx = SYNTHETIC_PRINCIPAL_X.toDouble(),
             cy = SYNTHETIC_PRINCIPAL_Y.toDouble(),
         ),
@@ -209,5 +318,7 @@ internal class SyntheticVisibilityObservationSource(
         const val SYNTHETIC_PRINCIPAL_Y = 480
         const val SYNTHETIC_DEPTH_MILLIMETERS = 1000
         const val MAXIMUM_SAMPLE_DEPTH_MILLIMETERS = 300
+        const val SPHERE_RADIUS_METERS = 2.0
+        const val SPHERE_FOCAL_LENGTH = 1000.0
     }
 }

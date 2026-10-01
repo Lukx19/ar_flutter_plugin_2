@@ -6,12 +6,150 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.roundToInt
+import kotlin.math.sqrt
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VisibilitySmallSceneDebugChannelTest {
+    @Test
+    fun `synthetic sphere sweep covers every viewing sector within a one metre camera volume`() {
+        val cut = ownership(identityMatrix(), identityMatrix())
+        val mapper = RecordingVisibilityMapper()
+        val runtime = AndroidVisibilityGridRuntime(
+            ownership = { cut },
+            mapper = mapper,
+            scheduler = Executors.newScheduledThreadPool(2),
+            featureIntervalNs = 1,
+            depthIntervalNs = 1,
+            ownsScheduler = true,
+        )
+        val source = SyntheticVisibilityObservationSource(runtime) { cut }
+        val seen = HashSet<Int>()
+        try {
+            source.anchor(identityMatrix(), cut.groupFrame)
+            source.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            for (view in 0 until SYNTHETIC_SPHERE_VIEW_COUNT) {
+                val timestamp = 1_000_000_000L + view * 1_000_000_000L
+                assertEquals(true to true, source.emitSphereView(view, timestamp, timestamp + 250_000_000L))
+                runtime.awaitDebugFixtureIdle()
+                val feature = checkNotNull(mapper.feature)
+                val depth = checkNotNull(mapper.depth)
+                assertEquals(64, feature.samples.size)
+                assertEquals(8, depth.samples.size)
+                val pose = feature.frame.pose.worldFromCameraGl
+                val displacement = sqrt(pose[12] * pose[12] + pose[13] * pose[13] + pose[14] * pose[14])
+                assertTrue(displacement <= 0.5)
+                val centre = feature.samples.reduce { left, right ->
+                    left.copy(
+                        xWorld = left.xWorld + right.xWorld,
+                        yWorld = left.yWorld + right.yWorld,
+                        zWorld = left.zWorld + right.zWorld,
+                    )
+                }
+                val x = centre.xWorld / feature.samples.size
+                val y = centre.yWorld / feature.samples.size
+                val z = centre.zWorld / feature.samples.size
+                assertTrue(feature.samples.all { sample ->
+                    abs(sqrt(sample.xWorld * sample.xWorld +
+                        sample.yWorld * sample.yWorld + sample.zWorld * sample.zWorld) - 2.0) < 1e-6
+                })
+                assertTrue(x * -pose[8] + y * -pose[9] + z * -pose[10] > 1.0)
+                if (view == 0) {
+                    val cameraAngles = feature.samples.map { sample ->
+                        val dx = sample.xWorld - pose[12]
+                        val dy = sample.yWorld - pose[13]
+                        val dz = sample.zWorld - pose[14]
+                        val cameraX = pose[0] * dx + pose[1] * dy + pose[2] * dz
+                        val cameraY = pose[4] * dx + pose[5] * dy + pose[6] * dz
+                        val cameraZ = pose[8] * dx + pose[9] * dy + pose[10] * dz
+                        atan2(cameraX, -cameraZ) to atan2(cameraY, -cameraZ)
+                    }
+                    val horizontal = cameraAngles.map { it.first }
+                    val vertical = cameraAngles.map { it.second }
+                    assertTrue(horizontal.max() - horizontal.min() >= PI / 3.0)
+                    assertTrue(vertical.max() - vertical.min() >= PI / 4.0)
+                }
+                val pitch = atan2(-pose[9], sqrt(pose[8] * pose[8] + pose[10] * pose[10]))
+                if (view < 18) {
+                    val yaw = (atan2(-pose[8], pose[10]) + 2 * PI) % (2 * PI)
+                    val ring = ((pitch + PI / 4) / (PI / 4)).roundToInt().coerceIn(0, 2)
+                    val sector = ((yaw - PI / 6) / (PI / 3)).roundToInt().mod(6)
+                    seen += ring * 6 + sector
+                } else {
+                    assertTrue(abs(pitch) > PI * 0.49)
+                }
+            }
+            assertEquals(18, seen.size)
+        } finally {
+            runtime.close()
+        }
+    }
+
+    @Test
+    fun `synthetic sphere feature and depth phases commit one pair per view`() {
+        val cut = ownership(identityMatrix(), identityMatrix())
+        val runtime = AndroidVisibilityGridRuntime(
+            ownership = { cut },
+            mapper = RecordingVisibilityMapper(),
+            scheduler = Executors.newScheduledThreadPool(2),
+            featureIntervalNs = 1,
+            depthIntervalNs = 1,
+            ownsScheduler = true,
+        )
+        val messenger = MethodTestMessenger()
+        val channel = VisibilitySmallSceneDebugChannel(
+            messenger = messenger,
+            viewId = 91,
+            isDebuggable = true,
+            runtime = runtime,
+            ownership = { cut },
+            referencePose = ::identityMatrix,
+        )
+        val method = MethodChannel(messenger, "visibility_scenario_v2_91")
+        try {
+            invoke(method, "arm", mapOf(
+                "scenarioId" to "phased-sphere",
+                "depthCapability" to "automatic",
+                "sequence" to 1L,
+                "expectedBindingGeneration" to 1L,
+                "expectedGroupGeneration" to 1L,
+            ))
+            val feature0 = invoke(method, "sphereFeatureView", mapOf(
+                "scenarioId" to "phased-sphere", "viewIndex" to 0, "sequence" to 2L,
+            ))
+            val depth0 = invoke(method, "sphereDepthView", mapOf(
+                "scenarioId" to "phased-sphere", "viewIndex" to 0, "sequence" to 3L,
+            ))
+            assertTrue((feature0["acceptedFeatureObservations"] as Long) > 0L)
+            assertEquals(feature0["acceptedFeatureObservations"], depth0["acceptedFeatureObservations"])
+            assertTrue((depth0["acceptedDepthObservations"] as Long) > 0L)
+
+            val feature1 = invoke(method, "sphereFeatureView", mapOf(
+                "scenarioId" to "phased-sphere", "viewIndex" to 1, "sequence" to 4L,
+            ))
+            val depth1 = invoke(method, "sphereDepthView", mapOf(
+                "scenarioId" to "phased-sphere", "viewIndex" to 1, "sequence" to 5L,
+            ))
+            assertTrue((feature1["acceptedFeatureObservations"] as Long) >
+                (feature0["acceptedFeatureObservations"] as Long))
+            assertTrue((depth1["acceptedDepthObservations"] as Long) >
+                (depth0["acceptedDepthObservations"] as Long))
+            assertEquals(5L, depth1["sequence"])
+            invoke(method, "disarm", mapOf(
+                "scenarioId" to "phased-sphere", "sequence" to 6L,
+            ))
+        } finally {
+            channel.dispose()
+            runtime.close()
+        }
+    }
+
     @Test
     fun `synthetic AR observations admit exact maximum feature and depth samples`() {
         val cut = ownership(identityMatrix(), identityMatrix())

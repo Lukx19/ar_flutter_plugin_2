@@ -294,12 +294,11 @@ internal interface CoveragePointVertexUploader {
     )
 
     /**
-     * Completes submission of this bounded paired page to Filament's command
-     * stream. The ownership callbacks remain the only release/completion
-     * signal; this fence merely guarantees the driver has consumed the queued
-     * transfer commands instead of waiting on an incidental later draw.
+     * Kicks submission of this bounded paired page to Filament's command
+     * stream without waiting for the driver. The ownership callbacks remain
+     * the only release/completion signal for the direct buffers.
      */
-    fun completeSubmissionFence() = Unit
+    fun kickSubmission() = Unit
 }
 
 internal class CoveragePointUploadCoordinator(
@@ -474,10 +473,10 @@ internal class CoveragePointUploadCoordinator(
             startSlot * CoveragePointMeshResources.COLOR_COMPONENTS,
             (endSlot - startSlot) * CoveragePointMeshResources.COLOR_COMPONENTS,
         ) { consumed(uploadId, COLOR_CALLBACK) }
-        // setBufferAt queues transfer work. Complete this <=64KiB paired page
-        // so Filament can dispatch its actual ownership callbacks without
-        // depending on an incidental later scene draw.
-        uploader.completeSubmissionFence()
+        // setBufferAt queues transfer work. Kick this <=64KiB paired page so
+        // Filament can dispatch its actual ownership callbacks without
+        // blocking the render thread or depending on an incidental later draw.
+        uploader.kickSubmission()
     }
 
     private fun consumed(uploadId: Long, callbackBit: Int) {
@@ -588,7 +587,7 @@ private class FilamentCoveragePointVertexUploader(
         )
     }
 
-    override fun completeSubmissionFence() {
-        engine.flushAndWait()
+    override fun kickSubmission() {
+        engine.flush()
     }
 }

@@ -7,6 +7,7 @@ import java.io.File
 import java.nio.file.Files
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -871,7 +872,7 @@ class BoundedCanonicalDepthLookupTest {
                 BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 1, 0, Int.MAX_VALUE, Long.MAX_VALUE),
             ) { it.findSurfaceAt(Voxel(3, 0, 0)) }
             assertEquals(SurfaceId(1), (voxelResult as BoundedCanonicalLookupResult.Completed).value?.surface?.id)
-            assertEquals(BoundedCanonicalLookupReceipt(1, 0, 4, 65_536, false), voxelResult.receipt)
+            assertEquals(BoundedCanonicalLookupReceipt(1, 0, 3, 49_152, false), voxelResult.receipt)
 
             val refused = resources.withBoundedCurrent(
                 BoundedCanonicalLookupRequest(cut.geometryRevision, cut.lineageRevision, 1, 0, 1, CanonicalCowGeneration.PAGE_BYTES.toLong()),
@@ -975,7 +976,7 @@ class BoundedCanonicalDepthLookupTest {
                         error("pending selector must not borrow renderer page")
                     })
                 }
-                assertTrue(resources.withCurrent { error("$damage must not borrow current") } == null)
+                assertNull(resources.withCurrent { error("$damage must not borrow current") })
                 val lookup = resources.withBoundedCurrent(
                     BoundedCanonicalLookupRequest(before.cut.geometryRevision, before.cut.lineageRevision, 1, 0, 1, 4096),
                 ) { error("$damage must not borrow bounded current") }
@@ -1046,10 +1047,10 @@ class BoundedCanonicalDepthLookupTest {
             assertEquals(100_000, largeCut.liveSurfaceCount)
 
             val smallResult = small.runtime.withBoundedCurrent(
-                BoundedCanonicalLookupRequest(smallCut.geometryRevision, smallCut.lineageRevision, 1, 0, 0, 0),
+                BoundedCanonicalLookupRequest(smallCut.geometryRevision, smallCut.lineageRevision, 1, 0, 1, CanonicalPageCache.PAGE_BYTES.toLong()),
             ) { it.findSurfaceAt(Voxel(0, 0, 0)) }
             val largeResult = large.runtime.withBoundedCurrent(
-                BoundedCanonicalLookupRequest(largeCut.geometryRevision, largeCut.lineageRevision, 1, 0, 0, 0),
+                BoundedCanonicalLookupRequest(largeCut.geometryRevision, largeCut.lineageRevision, 1, 0, 1, CanonicalPageCache.PAGE_BYTES.toLong()),
             ) { it.findSurfaceAt(Voxel(0, 0, 0)) }
 
             assertEquals(smallResult, largeResult)
@@ -1084,6 +1085,29 @@ class BoundedCanonicalDepthLookupTest {
         assertEquals(BoundedCanonicalLookupReceipt(1, 0, 1, 0, true), refused.receipt)
         assertEquals(1, view.lineageReadAttempts)
         assertEquals(0, view.lineageReadStarts)
+    }
+
+    @Test
+    fun `authenticated current reuses a surface read while retaining direct lookup limit`() {
+        val view = MeteredCanonicalLookupView(pageReadDelta = 1, byteReadDelta = 16_384)
+        val bounded = BoundedCanonicalCurrentView(
+            view,
+            BoundedCanonicalLookupRequest(1, 1, 3, 0, 2, 32_768),
+            100_000,
+            reuseAuthenticatedSurfaceReads = true,
+        )
+        val id = SurfaceId(1)
+
+        val first = bounded.findSurfaceById(id)
+        assertEquals(first, bounded.findSurfaceById(id))
+        assertEquals(first, bounded.findSurfaceById(id))
+        assertEquals(1, view.lineageReadAttempts)
+        assertEquals(
+            BoundedCanonicalLookupReceipt(3, 0, 2, 32_768, false),
+            (bounded.result(first) as BoundedCanonicalLookupResult.Completed).receipt,
+        )
+        assertEquals(null, bounded.findSurfaceById(id))
+        assertTrue(bounded.result(first) is BoundedCanonicalLookupResult.Refused)
     }
 
     @Test

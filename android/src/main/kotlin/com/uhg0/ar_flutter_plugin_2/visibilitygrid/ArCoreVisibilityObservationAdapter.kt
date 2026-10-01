@@ -177,6 +177,7 @@ internal class ArCoreVisibilityObservationAdapter(
             maxCopiedPixels = V2_DEPTH_SAMPLE_CAPACITY,
             onResourceAcquired = resourceAcquired,
             onResourceClosed = resourceClosed,
+            depthMode = depthCapability.toArCoreDepthMode(),
         ).acquire(frame, ownership.groupGeneration, ownership.sessionGeneration)
         return convertDepthResult(
             result, ownership, depthCapability, frameSequence, frame.timestamp,
@@ -196,6 +197,7 @@ internal class ArCoreVisibilityObservationAdapter(
             maxCopiedPixels = V2_DEPTH_SAMPLE_CAPACITY,
             onResourceAcquired = resourceAcquired,
             onResourceClosed = resourceClosed,
+            depthMode = depthCapability.toArCoreDepthMode(),
         ).prepare(frame, ownership.groupGeneration, ownership.sessionGeneration)) {
             is PreparedRawDepthResult.Ready -> PreparedVisibilityDepthResult.Ready(
                 PreparedVisibilityDepthFrame(
@@ -221,55 +223,9 @@ internal class ArCoreVisibilityObservationAdapter(
         frameSequence: Long,
         frameTimestampNs: Long,
     ): VisibilityDepthCopyResult = when (result) {
-        is DepthAcquisitionResult.Observation -> {
-            try {
-                val source = result.value
-                val copied = VisibilityDepthObservation.copySamples(
-                    source.samples.map {
-                        VisibilityDepthSample(
-                            x = it.x,
-                            y = it.y,
-                            depthMillimeters = it.depthMillimeters,
-                            confidence = it.confidence,
-                        )
-                    },
-                )
-                if (copied.isEmpty()) {
-                    VisibilityDepthCopyResult.Rejected("depth observation has no valid samples")
-                } else {
-                    VisibilityDepthCopyResult.Observation(
-                        VisibilityDepthObservation(
-                            ownership = ownership,
-                            frame = VisibilityObservationFrame(
-                                source = VisibilityObservationSource.ARCORE_RAW_DEPTH,
-                                frameSequence = frameSequence,
-                                frameTimestampNs = frameTimestampNs,
-                                sourceTimestampNs = source.timestampNs,
-                                cameraIdentity = "arcore-rear-camera",
-                                tracking = source.tracking,
-                                imageOrientation = "landscape_right_x_right_y_down_v1",
-                                pose = VisibilityCameraPose.copyOf(source.worldFromCameraGl),
-                                intrinsics = VisibilityCameraIntrinsics(
-                                    imageWidth = source.width,
-                                    imageHeight = source.height,
-                                    fx = source.intrinsics.fx,
-                                    fy = source.intrinsics.fy,
-                                    cx = source.intrinsics.cx,
-                                    cy = source.intrinsics.cy,
-                                ),
-                                depthCapability = depthCapability,
-                            ),
-                            samples = copied,
-                            sourceRejectedSamples = source.sourceRejectedPixels,
-                            payloadBytes = VisibilityDepthObservation.DEPTH_FIXED_BYTES +
-                                copied.size * VisibilityDepthObservation.DEPTH_SAMPLE_BYTES,
-                        ),
-                    )
-                }
-            } catch (error: IllegalArgumentException) {
-                VisibilityDepthCopyResult.Rejected(error.message ?: "invalid depth metadata")
-            }
-        }
+        is DepthAcquisitionResult.Observation -> convertDepthObservationResult(
+            result.value, ownership, depthCapability, frameSequence, frameTimestampNs,
+        )
         DepthAcquisitionResult.TransientUnavailable ->
             VisibilityDepthCopyResult.TransientUnavailable
         is DepthAcquisitionResult.Failure -> VisibilityDepthCopyResult.Rejected(result.reason)
@@ -310,6 +266,73 @@ internal class ArCoreVisibilityObservationAdapter(
     }
 }
 
+/**
+ * Converts a copied ARCore depth observation while preserving the transient
+ * nature of an all-invalid frame. Motion-based ARCore depth can legitimately
+ * return an image whose depth/confidence pixels are all zero until parallax
+ * establishes a prediction; that frame must not terminally disable depth.
+ */
+internal fun convertDepthObservationResult(
+    source: DepthObservation,
+    ownership: VisibilityObservationOwnership,
+    depthCapability: VisibilityDepthCapability,
+    frameSequence: Long,
+    frameTimestampNs: Long,
+): VisibilityDepthCopyResult {
+    return try {
+        val copied = VisibilityDepthObservation.copySamples(
+            source.samples.map {
+                VisibilityDepthSample(
+                    x = it.x,
+                    y = it.y,
+                    depthMillimeters = it.depthMillimeters,
+                    confidence = it.confidence,
+                )
+            },
+        )
+        if (copied.isEmpty()) {
+            VisibilityDepthCopyResult.TransientUnavailable
+        } else {
+            VisibilityDepthCopyResult.Observation(
+                VisibilityDepthObservation(
+                    ownership = ownership,
+                    frame = VisibilityObservationFrame(
+                        source = VisibilityObservationSource.ARCORE_RAW_DEPTH,
+                        frameSequence = frameSequence,
+                        frameTimestampNs = frameTimestampNs,
+                        sourceTimestampNs = source.timestampNs,
+                        cameraIdentity = "arcore-rear-camera",
+                        tracking = source.tracking,
+                        imageOrientation = "landscape_right_x_right_y_down_v1",
+                        pose = VisibilityCameraPose.copyOf(source.worldFromCameraGl),
+                        intrinsics = VisibilityCameraIntrinsics(
+                            imageWidth = source.width,
+                            imageHeight = source.height,
+                            fx = source.intrinsics.fx,
+                            fy = source.intrinsics.fy,
+                            cx = source.intrinsics.cx,
+                            cy = source.intrinsics.cy,
+                        ),
+                        depthCapability = depthCapability,
+                    ),
+                    samples = copied,
+                    sourceRejectedSamples = source.sourceRejectedPixels,
+                    payloadBytes = VisibilityDepthObservation.DEPTH_FIXED_BYTES +
+                        copied.size * VisibilityDepthObservation.DEPTH_SAMPLE_BYTES,
+                ),
+            )
+        }
+    } catch (error: IllegalArgumentException) {
+        VisibilityDepthCopyResult.Rejected(error.message ?: "invalid depth metadata")
+    }
+}
+
+private fun VisibilityDepthCapability.toArCoreDepthMode(): Config.DepthMode = when (this) {
+    VisibilityDepthCapability.RAW_DEPTH -> Config.DepthMode.RAW_DEPTH_ONLY
+    VisibilityDepthCapability.AUTOMATIC -> Config.DepthMode.AUTOMATIC
+    VisibilityDepthCapability.UNSUPPORTED -> Config.DepthMode.DISABLED
+}
+
 internal fun Config.DepthMode.toVisibilityDepthCapability(): VisibilityDepthCapability = when (this) {
     Config.DepthMode.RAW_DEPTH_ONLY -> VisibilityDepthCapability.RAW_DEPTH
     Config.DepthMode.AUTOMATIC -> VisibilityDepthCapability.AUTOMATIC
@@ -321,6 +344,7 @@ internal class ArCoreVisibilityObservationSource(
     private val runtime: AndroidVisibilityGridRuntime,
     private val ownership: () -> VisibilityObservationOwnership?,
     private val depthMode: () -> Config.DepthMode,
+    private val depthIntakeAllowed: () -> Boolean = { true },
 ) {
     private var frameSequence = 0L
     private val adapter = ArCoreVisibilityObservationAdapter(
@@ -335,16 +359,27 @@ internal class ArCoreVisibilityObservationSource(
             when (result) {
                 is VisibilityDepthCopyResult.Observation ->
                     runtime.offerDepth(result.value, callbackCopyNs)
-                VisibilityDepthCopyResult.TransientUnavailable ->
+                VisibilityDepthCopyResult.TransientUnavailable -> {
+                    runtime.recordDepthProcessingTransient()
                     runtime.recordDepthTransientUnavailable()
-                is VisibilityDepthCopyResult.Rejected -> runtime.recordDepthFailure()
+                }
+                is VisibilityDepthCopyResult.Rejected -> {
+                    runtime.recordDepthProcessingRejected()
+                    runtime.recordDepthFailure()
+                }
             }
         },
-        onFailure = { runtime.recordDepthFailure() },
+        onFailure = {
+            runtime.recordDepthProcessingRejected()
+            runtime.recordDepthFailure()
+        },
     )
 
     private val depthAdmissionLock = Any()
     private var depthSuspended = false
+    private val depthNovelty = DepthViewNoveltyGate()
+    private val depthTranslation = FloatArray(3)
+    private val depthRotation = FloatArray(4)
 
     fun suspendDepth() = synchronized(depthAdmissionLock) { depthSuspended = true }
 
@@ -380,16 +415,72 @@ internal class ArCoreVisibilityObservationSource(
             }
         }
         synchronized(depthAdmissionLock) {
-            if (!depthSuspended && runtime.shouldCopyDepth(frame.timestamp)) {
+            if (!depthSuspended && depthIntakeAllowed()) {
+                if (!depthProcessor.canAccept()) {
+                    runtime.recordDepthProcessorBusyDrop()
+                    return@synchronized
+                }
+                val pose = frame.camera.pose
+                pose.getTranslation(depthTranslation, 0)
+                pose.getRotationQuaternion(depthRotation, 0)
+                if (!depthNovelty.isNovel(frame.timestamp, depthTranslation, depthRotation) ||
+                    !runtime.shouldCopyDepth(frame.timestamp)
+                ) return@synchronized
                 val started = System.nanoTime()
                 when (val result = adapter.prepareDepth(frame, cut, capability, sequence)) {
-                    is PreparedVisibilityDepthResult.Ready ->
-                        depthProcessor.offer(result.frame, System.nanoTime() - started)
-                    PreparedVisibilityDepthResult.TransientUnavailable ->
+                    is PreparedVisibilityDepthResult.Ready -> {
+                        runtime.recordDepthPreparationReady()
+                        if (depthProcessor.offer(result.frame, System.nanoTime() - started)) {
+                            depthNovelty.remember(frame.timestamp, depthTranslation, depthRotation)
+                        } else {
+                            runtime.recordDepthProcessorBusyDrop()
+                        }
+                    }
+                    PreparedVisibilityDepthResult.TransientUnavailable -> {
+                        runtime.recordDepthPreparationTransient()
                         runtime.recordDepthTransientUnavailable()
-                    is PreparedVisibilityDepthResult.Rejected -> runtime.recordDepthFailure()
+                    }
+                    is PreparedVisibilityDepthResult.Rejected -> {
+                        runtime.recordDepthPreparationRejected()
+                        runtime.recordDepthFailure()
+                    }
                 }
             }
         }
+    }
+
+}
+
+/** Admits changed viewpoints promptly and refreshes a static view after three seconds. */
+internal class DepthViewNoveltyGate {
+    private var lastTimestampNs = Long.MIN_VALUE
+    private val lastTranslation = FloatArray(3)
+    private val lastRotation = FloatArray(4)
+
+    fun isNovel(timestampNs: Long, translation: FloatArray, rotation: FloatArray): Boolean {
+        if (lastTimestampNs == Long.MIN_VALUE || timestampNs <= lastTimestampNs ||
+            timestampNs - lastTimestampNs >= MAX_STATIC_AGE_NS
+        ) return true
+        val dx = translation[0] - lastTranslation[0]
+        val dy = translation[1] - lastTranslation[1]
+        val dz = translation[2] - lastTranslation[2]
+        if (dx * dx + dy * dy + dz * dz >= MIN_TRANSLATION_METERS_SQUARED) return true
+        val dot = kotlin.math.abs(
+            rotation[0] * lastRotation[0] + rotation[1] * lastRotation[1] +
+                rotation[2] * lastRotation[2] + rotation[3] * lastRotation[3],
+        )
+        return dot < MIN_ROTATION_DOT
+    }
+
+    fun remember(timestampNs: Long, translation: FloatArray, rotation: FloatArray) {
+        lastTimestampNs = timestampNs
+        translation.copyInto(lastTranslation, endIndex = 3)
+        rotation.copyInto(lastRotation, endIndex = 4)
+    }
+
+    private companion object {
+        const val MAX_STATIC_AGE_NS = 3_000_000_000L
+        const val MIN_TRANSLATION_METERS_SQUARED = 0.05f * 0.05f
+        const val MIN_ROTATION_DOT = 0.9990482f // cos(5 degrees / 2)
     }
 }
