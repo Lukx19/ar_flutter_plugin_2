@@ -11,6 +11,55 @@ import org.junit.Test
 
 class VisibilityObservationDebugChannelTest {
     @Test
+    fun `pressure diagnostics return from the caller while mapping state is busy`() {
+        val messenger = MethodTestMessenger()
+        val runtime = AndroidVisibilityGridRuntime(
+            ownership = { null },
+            mapper = object : VisibilityObservationMapper {
+                override fun admitFeature(observation: VisibilityFeatureObservation) = Unit
+                override fun admitDepth(observation: VisibilityDepthObservation) = Unit
+            },
+            scheduler = Executors.newSingleThreadScheduledExecutor(),
+            ownsScheduler = true,
+        )
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val caller = Executors.newSingleThreadExecutor()
+        val channel = VisibilityObservationDebugChannel(
+            messenger = messenger,
+            viewId = 77,
+            isDebuggable = true,
+            runtime = runtime,
+            ownership = { null },
+            gate = VisibilityObservationDebugGate(),
+            pressureOwners = {
+                entered.countDown()
+                release.await(2, TimeUnit.SECONDS)
+                VisibilityPressureOwnerScalars()
+            },
+        )
+        try {
+            val result = RecordingResult()
+            val returned = caller.submit {
+                MethodChannel(messenger, "visibility_observation_v2_77").invokeMethod(
+                    "pressureSnapshot", null, result,
+                )
+            }
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            returned.get(200, TimeUnit.MILLISECONDS)
+            assertFalse(result.completed.await(100, TimeUnit.MILLISECONDS))
+            release.countDown()
+            assertTrue(result.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(1, result.successCount)
+        } finally {
+            release.countDown()
+            channel.dispose()
+            caller.shutdownNow()
+            runtime.close()
+        }
+    }
+
+    @Test
     fun `disposing an active allocation workload waits for its last offer`() {
         val messenger = MethodTestMessenger()
         val ownership = VisibilityObservationOwnership(

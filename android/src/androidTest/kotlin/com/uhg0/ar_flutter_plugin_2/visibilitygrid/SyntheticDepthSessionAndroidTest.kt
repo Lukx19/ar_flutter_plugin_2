@@ -42,7 +42,7 @@ class SyntheticDepthSessionAndroidTest {
             StorageBudgetPolicyV2(64L * 1024 * 1024, 0),
             AndroidDescriptorFilesystemV2(),
         )
-        val resources = CanonicalRuntimeResources.open(root, group, coordinator)
+        val resources = CanonicalRuntimeResources.openLive(root, group, coordinator)
         val kernel = DepthEvidenceKernel(
             DepthEvidenceConfiguration(occupiedEvidenceToShow = 1),
         )
@@ -105,6 +105,7 @@ class SyntheticDepthSessionAndroidTest {
                     sourceRejectedSamples = selected.value.sourceRejectedPixels,
                 )
                 val fusionStartedNs = System.nanoTime()
+                assertTrue("map $mapIndex spatial window refused", resources.updateSpatialWindow(batch))
                 val currentCut = requireNotNull(resources.owner().activationState()).cut
                 val lookup = resources.withBoundedCurrent(
                     BoundedCanonicalLookupRequest(
@@ -210,6 +211,7 @@ class SyntheticDepthSessionAndroidTest {
             assertEquals(MAP_COUNT, preparationMicros.size)
             assertEquals(MAP_COUNT, commitMicros.size)
             assertEquals(MAP_COUNT, ackMicros.size)
+            assertTrue("depth integration exceeded three seconds: $endToEndMicros", targetMet)
             assertTrue("canonical runtime retained payload", resources.retainedCompleteCurrentMemoryReceipt() != null)
         } finally {
             kernel.close()

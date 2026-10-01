@@ -162,7 +162,7 @@ internal class ArView(
         ownership = visibilityGridV2Binding::currentObservationOwnership,
         directory = context.filesDir,
         resourcesForGroup = { group ->
-            CanonicalRuntimeResources.open(context.filesDir, group, visibilityStorageBudgetCoordinator)
+            CanonicalRuntimeResources.openLive(context.filesDir, group, visibilityStorageBudgetCoordinator)
         },
         renderer = visibilityRendererProjection,
         commitCanonical = visibilityCanonicalFaultGate::commit,

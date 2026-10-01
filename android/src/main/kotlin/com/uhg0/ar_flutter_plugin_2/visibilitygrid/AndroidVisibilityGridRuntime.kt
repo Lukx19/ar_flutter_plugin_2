@@ -621,12 +621,28 @@ internal class AndroidVisibilityGridRuntime(
     }
 
     fun snapshotWireMap(): Map<String, Any> {
-        val publication = (mapper as? VisibilityGridIntegration)?.integrationReceipt()
+        val integration = mapper as? VisibilityGridIntegration
+        val publication = integration?.integrationReceipt()
+        val depthEvidence = integration?.lastDepthEvidenceReceipt()
         return snapshot().toWireMap() + mapOf(
             "mappingIngress" to mapper.snapshot().toWireMap(),
             "mappingPublicationStatus" to (publication?.status ?: "unavailable"),
             "mappingRejected" to (publication?.rejected ?: 0L),
             "mappingFenced" to (publication?.fenced ?: 0L),
+            "depthEvidence" to if (depthEvidence == null) emptyMap<String, Any>() else mapOf(
+                "acceptedSamples" to depthEvidence.acceptedSamples,
+                "rejectedSamples" to depthEvidence.rejectedSamples,
+                "rayVisits" to depthEvidence.rayVisits,
+                "touchedEvidenceRows" to depthEvidence.touchedEvidenceRows,
+                "independentDirectionVotes" to depthEvidence.independentDirectionVotes,
+                "createCount" to depthEvidence.createCount,
+                "refineCount" to depthEvidence.refineCount,
+                "relocateCount" to depthEvidence.relocateCount,
+                "mergeCount" to depthEvidence.mergeCount,
+                "splitCount" to depthEvidence.splitCount,
+                "replaceCount" to depthEvidence.replaceCount,
+                "removeCount" to depthEvidence.removeCount,
+            ),
             "depthAdmissionTiming" to mapper.depthAdmissionTiming().toWireMap(),
             "featureAdmissionTiming" to mapper.featureAdmissionTiming().toWireMap(),
         )

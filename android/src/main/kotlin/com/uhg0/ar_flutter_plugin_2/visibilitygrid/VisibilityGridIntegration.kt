@@ -187,6 +187,7 @@ internal class VisibilityGridIntegration(
     private var featureTimingEndToEndMicros = 0L
     private var lastDepthLookupReceipt: BoundedCanonicalLookupReceipt? = null
     private var lastDepthAdmissionStatus: String? = null
+    private var lastDepthEvidenceReceipt: DepthEvidenceReceipt? = null
     private var canonicalSurfaceHighWater = 0L
     private var associationHighWater = 0L
     private var canonicalOwnedBytesHighWater = 0L
@@ -482,6 +483,10 @@ internal class VisibilityGridIntegration(
 
     internal fun lastDepthAdmissionStatus(): String? = synchronized(lock) { lastDepthAdmissionStatus }
 
+    internal fun lastDepthEvidenceReceipt(): DepthEvidenceReceipt? = synchronized(lock) {
+        lastDepthEvidenceReceipt
+    }
+
     /** Fixed native-owner scalars for the debug pressure receipt. */
     internal fun pressureSnapshot(): CanonicalVisibilityPressureSnapshot = synchronized(lock) {
         // A debug snapshot must not make the platform thread wait behind the
@@ -638,7 +643,7 @@ internal class VisibilityGridIntegration(
         if (ownership() != expected) { fenced++; return null }
         val group = SurfaceGroup(expected.captureGroupId)
         val runtimeResources = resourcesForGroup(group)
-        val openResult = if (CanonicalActivationSelector.hasDurableSelector(group, runtimeResources.directory)) {
+        val openResult = if (!runtimeResources.usesSessionMemory && CanonicalActivationSelector.hasDurableSelector(group, runtimeResources.directory)) {
             runtimeResources.reopen()
         } else {
             runtimeResources.openInitial(seeded)
@@ -725,6 +730,12 @@ internal class VisibilityGridIntegration(
         }
         var featureSources: DepthFeatureSourceTable? = null
         val lookupStartedNs = System.nanoTime()
+        if (!requireNotNull(resources).updateSpatialWindow(batch)) {
+            depth.discardPrepared()
+            rejected++
+            receipt = receipt.copy(status = "depthSpatialWindowRefused", rejected = rejected)
+            return
+        }
         val lookup = requireNotNull(resources).withBoundedCurrent(
             BoundedCanonicalLookupRequest(
                 expectedGeometryRevision = currentCut.geometryRevision,
@@ -756,6 +767,7 @@ internal class VisibilityGridIntegration(
             receipt = receipt.copy(status = "depthLookupRefused", rejected = rejected)
             return
         }
+        lastDepthEvidenceReceipt = accepted.receipt
         if (accepted.changes.isEmpty()) {
             val remap = requireNotNull(kernel).prepareCanonicalRemap(emptyList())
             if (remap !is FeatureCanonicalRemapPreparation.Prepared) {
@@ -1463,6 +1475,7 @@ internal class VisibilityGridIntegration(
         depthKernel = null
         lastDepthLookupReceipt = null
         lastDepthAdmissionStatus = null
+        lastDepthEvidenceReceipt = null
         pendingCanonicalAcknowledgement = null
         pendingDepthTiming = null
         pendingFeatureTiming = null

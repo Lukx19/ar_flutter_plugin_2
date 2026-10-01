@@ -238,7 +238,7 @@ internal object CanonicalAuthorityLeaseRegistry {
     @Synchronized internal fun isActive(lease: CanonicalAuthorityLease) = entries.containsKey(lease)
 }
 
-/** Scalar authority identity; it deliberately owns no complete canonical store. */
+/** Process-local authority with an exact group/parent identity for owner-issued mutation leases. */
 internal interface ScalarCanonicalAuthority : CanonicalStateView {
     val authorityParentKey: String
 }

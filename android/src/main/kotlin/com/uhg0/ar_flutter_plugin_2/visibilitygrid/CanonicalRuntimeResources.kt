@@ -21,16 +21,30 @@ internal class CanonicalRuntimeResources private constructor(
     val groupDirectory: File,
     coordinator: StorageBudgetCoordinatorV2,
     private val configuration: SurfaceOwnershipConfiguration = SurfaceOwnershipConfiguration(),
+    internal val usesSessionMemory: Boolean = false,
 ) : AutoCloseable {
     private val budget = CoordinatorStorageBudget(coordinator)
     private var owner: SurfaceOwnership? = null
     private var current: CurrentLease? = null
     private var lastOpenFailureStage: CanonicalRuntimeOpenFailureStage? = null
     private var closed = false
+    private var session: SessionCanonicalMemoryState? = null
+    private var spatial: LiveSurfaceSpatialCache? = null
 
     fun openInitial(baseline: committedEmptyBaseline): SurfaceOwnershipOpenResult {
         checkOpen()
         check(owner == null)
+        if (usesSessionMemory) {
+            if (!configuration.isValid) return SurfaceOwnershipOpenResult.Refused(SurfaceOwnershipRestoreRefusal.INVALID_CONFIGURATION)
+            if (baseline.groupIdentity != group.value) return SurfaceOwnershipOpenResult.Refused(SurfaceOwnershipRestoreRefusal.FORK)
+            val seeded = configuration.copy(seededEmptyBaseline = baseline)
+            val state = SessionCanonicalMemoryState(group, seeded, directory.absoluteFile.toPath().normalize().toString())
+            val opened = SurfaceOwnership.session(group, directory, seeded, state)
+            session = state
+            spatial = LiveSurfaceSpatialCache(configuration.surfaceCapacity, configuration.voxelMicrometers)
+            owner = (opened as SurfaceOwnershipOpenResult.Opened).ownership
+            return opened
+        }
         check(!CanonicalActivationSelector.hasDurableSelector(group, directory))
         lastOpenFailureStage = null
         val configuration = this.configuration.copy(seededEmptyBaseline = baseline)
@@ -61,6 +75,7 @@ internal class CanonicalRuntimeResources private constructor(
     fun reopen(): SurfaceOwnershipOpenResult {
         checkOpen()
         check(owner == null)
+        if (usesSessionMemory) return SurfaceOwnershipOpenResult.Refused(SurfaceOwnershipRestoreRefusal.CORRUPT)
         lastOpenFailureStage = null
         if (!CanonicalActivationSelector.hasDurableSelector(group, directory)) {
             return SurfaceOwnershipOpenResult.Refused(SurfaceOwnershipRestoreRefusal.CORRUPT)
@@ -102,6 +117,7 @@ internal class CanonicalRuntimeResources private constructor(
     /** Borrows exactly the selector-named v6 cut for one bounded operation. */
     @Synchronized fun <T> withCurrent(block: (CanonicalStateView) -> T): T? {
         checkOpen()
+        session?.let { return block(it) }
         val lease = current ?: return null
         return authenticatedBorrow(lease, lease.completeView, block)
     }
@@ -125,6 +141,16 @@ internal class CanonicalRuntimeResources private constructor(
                 BoundedCanonicalLookupReason.CURRENT_UNAVAILABLE,
                 BoundedCanonicalLookupReceipt(0, 0, 0, 0, false),
             )
+        }
+        session?.let { state ->
+            if (state.cut.geometryRevision != request.expectedGeometryRevision ||
+                state.cut.lineageRevision != request.expectedLineageRevision) return BoundedCanonicalLookupResult.Refused(
+                BoundedCanonicalLookupReason.REVISION_CONFLICT, BoundedCanonicalLookupReceipt(0, 0, 0, 0, false),
+            )
+            val cache = spatial
+            val view = if (cache == null) state else SpatialCanonicalLookupView(state, cache)
+            val bounded = BoundedCanonicalCurrentView(view, request, configuration.voxelMicrometers)
+            return bounded.result(block(bounded))
         }
         return withAuthenticatedCompleteCurrent(
             CanonicalRevisionPair(request.expectedGeometryRevision, request.expectedLineageRevision),
@@ -150,6 +176,7 @@ internal class CanonicalRuntimeResources private constructor(
         command: CanonicalEvidenceBatchCommand,
     ): CanonicalMutationPreparation {
         checkOpen()
+        session?.let { return owner().prepareAdjacentMutation(it, command) }
         return withAuthenticatedCompleteCurrent(
             CanonicalRevisionPair(command.expectedGeometryRevision, command.expectedLineageRevision),
             onFailure = { failure ->
@@ -217,6 +244,7 @@ internal class CanonicalRuntimeResources private constructor(
         block: (CanonicalFeaturePlanningView) -> T,
     ): T? {
         checkOpen()
+        session?.let { return block(it) }
         val lease = current ?: return null
         // Feature-local correlation identifies associations only. Canonical
         // occupancy, normals, identity and allocation provenance always come
@@ -259,6 +287,14 @@ internal class CanonicalRuntimeResources private constructor(
         faults: CanonicalCommitFaults = CanonicalCommitFaults(),
     ): CanonicalAdjacentCommitResult {
         checkOpen()
+        session?.let {
+            val result = owner().commitAdjacentCanonicalMutation(plan, faults)
+            if (result is CanonicalAdjacentCommitResult.Committed) {
+                plan.visitRemovedSurfaceIds { id -> spatial?.remove(id); true }
+                plan.visitDirtyRows { row -> spatial?.upsert(row.id, row.voxel); true }
+            }
+            return result
+        }
         val lease = current ?: return CanonicalAdjacentCommitResult.Refused(
             CanonicalAdjacentCommitRefusal.NO_ACTIVE_AUTHORITY,
         )
@@ -286,15 +322,33 @@ internal class CanonicalRuntimeResources private constructor(
 
     @Synchronized internal fun retainedCurrentProofBytes(): Long = current?.commit?.retainedProofBytes() ?: 0L
     @Synchronized internal fun retainedScalarMemoryReceipt(): ScalarCanonicalMemoryReceipt? =
-        current?.scalarView?.scalarMemoryReceipt
+        session?.let { ScalarCanonicalMemoryReceipt.measure(it.authorityParentKey, it.cut) } ?: current?.scalarView?.scalarMemoryReceipt
     @Synchronized internal fun retainedCompleteCurrentMemoryReceipt(): CompactRetainedMemoryReceipt? =
-        current?.completeView?.retainedMemoryReceipt()
+        session?.let { sessionMemoryReceipt(it) } ?: current?.completeView?.retainedMemoryReceipt()
     @Synchronized internal fun completeCurrentLeaseReceipt(): CanonicalCompleteCurrentLeaseReceipt? =
-        current?.resourceReceipt()
+        session?.let {
+            val memory = sessionMemoryReceipt(it)
+            CanonicalCompleteCurrentLeaseReceipt(memory, 0, 0, memory.residentTotalBytes, memory.peakWithScratchBytes)
+        } ?: current?.resourceReceipt()
     @Synchronized internal fun featurePlanningMemoryReceipt(maximumTouches: Int): CanonicalFeaturePlanningMemoryReceipt? =
-        current?.featurePlanningMemoryReceipt(maximumTouches)
+        session?.let { CanonicalFeaturePlanningMemoryReceipt(0, 0, 0, 0) } ?: current?.featurePlanningMemoryReceipt(maximumTouches)
     @Synchronized internal fun currentRowFoldScratchBytes(): Long? =
-        current?.let { CurrentRowFoldScratch.memoryBytes() }
+        if (session != null) 0L else current?.let { CurrentRowFoldScratch.memoryBytes() }
+
+    private fun sessionMemoryReceipt(state: SessionCanonicalMemoryState): CompactRetainedMemoryReceipt =
+        state.retainedMemoryReceipt().let { it.copy(cacheMetadataBytes = it.cacheMetadataBytes + (spatial?.retainedPrimitiveBytes ?: 0)) }
+
+    /** Frustum refresh is worker-only and reuses one spatial candidate buffer. */
+    @Synchronized internal fun updateSpatialWindow(batch: DepthEvidenceBatch): Boolean {
+        checkOpen()
+        val cache = spatial ?: return true
+        if (!cache.updateWindow(batch.groupFromCameraGl, batch.intrinsics, 8_000.0)) return false
+        // Dirty rows have already been written to packed session authority at
+        // commit. Movement can release their cold working-set markers without
+        // another geometry copy, file write, or loss of canonical history.
+        cache.flushCold { _, _ -> true }
+        return true
+    }
 
     internal fun portableOwnerBytes(): Long =
         40L + // CanonicalRuntimeResources
@@ -374,6 +428,23 @@ internal class CanonicalRuntimeResources private constructor(
     ): CompactCanonicalCut? {
         checkOpen()
         require(rendererLimit >= 0)
+        session?.let { state ->
+            val page = ArrayList<CommittedGeometryRow>(512)
+            var rendered = 0
+            val complete = state.visitRows { row, fingerprint ->
+                if (hydrateKernel && !kernel.hydrateCanonicalSurface(row, fingerprint)) return@visitRows false
+                if (rendered < rendererLimit) {
+                    page += CommittedGeometryRow(row.id.value, row.voxel, row.packedNormal, row.normalConfidence,
+                        rendererLineageCount(state.cut.lineageCount))
+                    rendered++
+                    if (page.size == 512) { sink(CanonicalRendererPage(state.cut, page.toList(), null)); page.clear() }
+                }
+                true
+            }
+            if (!complete) return null
+            if (page.isNotEmpty()) sink(CanonicalRendererPage(state.cut, page.toList(), null))
+            return state.cut
+        }
         val lease = current ?: return null
         val view = lease.completeView
         var rendered = 0
@@ -414,6 +485,7 @@ internal class CanonicalRuntimeResources private constructor(
     /** One bounded renderer page from the active v6 root for restart rebuild. */
     fun readRendererPage(cursor: Long, limit: Int = 512): CanonicalRendererPage? {
         checkOpen()
+        session?.let { return it.rendererPage(cursor, limit) }
         val lease = current ?: return null
         val view = lease.completeView
         return run {
@@ -471,6 +543,12 @@ internal class CanonicalRuntimeResources private constructor(
         block: (CanonicalRendererPage) -> Unit,
     ): Boolean {
         if (limit !in 1..512 || closed) return false
+        session?.let { state ->
+            if (state.cut.geometryRevision != expectedGeometryRevision || state.cut.lineageRevision != expectedLineageRevision) return false
+            val page = state.rendererPage(cursor, limit) ?: return false
+            block(page)
+            return session === state && state.cut.geometryRevision == expectedGeometryRevision && state.cut.lineageRevision == expectedLineageRevision
+        }
         val lease = current ?: return false
         val expected = CanonicalRevisionPair(expectedGeometryRevision, expectedLineageRevision)
         if (lease.scalarView.cut.let {
@@ -492,6 +570,7 @@ internal class CanonicalRuntimeResources private constructor(
     /** Test/diagnostic recovery projection in one cold verified scope. */
     internal fun readAllRendererKeys(): LongArray? {
         checkOpen()
+        session?.let { return it.occupiedKeys() }
         val lease = current ?: return null
         return lease.copyOccupiedKeys()
     }
@@ -501,6 +580,8 @@ internal class CanonicalRuntimeResources private constructor(
         closed = true
         try { owner?.close() } finally { invalidateCurrent() }
         owner = null
+        session = null
+        spatial = null
     }
 
     private fun checkOpen() = check(!closed) { "canonical surface runtime resources are closed" }
@@ -513,6 +594,7 @@ internal class CanonicalRuntimeResources private constructor(
             group: SurfaceGroup,
             coordinator: StorageBudgetCoordinatorV2,
             configuration: SurfaceOwnershipConfiguration = SurfaceOwnershipConfiguration(),
+            sessionMemory: Boolean = false,
         ): CanonicalRuntimeResources {
             val normalizedRoot = root.absoluteFile.toPath().normalize().toFile()
             val groupName = group.value.lowercase()
@@ -527,8 +609,12 @@ internal class CanonicalRuntimeResources private constructor(
             require(groupDirectory.mkdirs() || groupDirectory.isDirectory)
             // Every canonical selector, root, current and candidate lives under the normalized
             // group root while the borrowed coordinator accounts them from its shared ancestor.
-            return CanonicalRuntimeResources(group, groupDirectory, groupDirectory, coordinator, configuration)
+            return CanonicalRuntimeResources(group, groupDirectory, groupDirectory, coordinator, configuration, sessionMemory)
         }
+
+        fun openLive(root: File, group: SurfaceGroup, coordinator: StorageBudgetCoordinatorV2,
+            configuration: SurfaceOwnershipConfiguration = SurfaceOwnershipConfiguration()) =
+            open(root, group, coordinator, configuration, sessionMemory = true)
     }
 
     private enum class CompleteCurrentBorrowFailure {

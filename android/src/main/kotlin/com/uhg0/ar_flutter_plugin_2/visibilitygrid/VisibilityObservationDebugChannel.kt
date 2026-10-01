@@ -60,6 +60,12 @@ internal class VisibilityObservationDebugChannel(
 ) : MethodChannel.MethodCallHandler {
     private val channel = MethodChannel(messenger, "visibility_observation_v2_$viewId")
     private val source = SyntheticVisibilityObservationSource(runtime, ownership)
+    // Diagnostic reads can wait behind a canonical mutation for seconds. Keep
+    // that wait off the platform thread so probing a live camera cannot stall
+    // its preview. This executor exists only in debuggable builds.
+    private val snapshotExecutor = if (isDebuggable) Executors.newSingleThreadExecutor { task ->
+        Thread(task, "visibility-debug-snapshot").apply { isDaemon = true }
+    } else null
     private var allocationWorkload: ScheduledExecutorService? = null
     private var allocationWorkloadTask: ScheduledFuture<*>? = null
     private val workloadFeatureOffers = AtomicLong()
@@ -111,15 +117,15 @@ internal class VisibilityObservationDebugChannel(
                     gate.release()
                     result.success(true)
                 }
-                "snapshot" -> result.success(
-                    runtime.snapshotWireMap() + mapOf("mappingStalled" to gate.stalled()),
-                )
-                "pressureSnapshot" -> result.success(
+                "snapshot" -> dispatchSnapshot(result) {
+                    runtime.snapshotWireMap() + mapOf("mappingStalled" to gate.stalled())
+                }
+                "pressureSnapshot" -> dispatchSnapshot(result) {
                     VisibilityPressureReceipt.capture(
                         runtime.snapshot(),
                         pressureOwners(),
-                    ).toWireMap(),
-                )
+                    ).toWireMap()
+                }
                 "allocationSnapshot" -> result.success(mapOf(
                     "elapsedRealtimeMs" to SystemClock.elapsedRealtime(),
                     "artAllocatedBytes" to Debug.getRuntimeStat("art.gc.bytes-allocated")!!.toLong(),
@@ -186,6 +192,7 @@ internal class VisibilityObservationDebugChannel(
 
     fun dispose() {
         gate.release()
+        snapshotExecutor?.shutdownNow()
         val executor = allocationWorkload
         if (executor != null) {
             allocationWorkloadTask?.cancel(false)
@@ -197,6 +204,16 @@ internal class VisibilityObservationDebugChannel(
         allocationWorkloadTask = null
         allocationWorkload = null
         channel.setMethodCallHandler(null)
+    }
+
+    private fun dispatchSnapshot(result: MethodChannel.Result, read: () -> Any) {
+        requireNotNull(snapshotExecutor).execute {
+            try {
+                result.success(read())
+            } catch (error: Exception) {
+                result.error("VG_PROTOCOL_INVALID", error.message, null)
+            }
+        }
     }
 
     private fun MethodCall.requiredTimestamp(): Long =

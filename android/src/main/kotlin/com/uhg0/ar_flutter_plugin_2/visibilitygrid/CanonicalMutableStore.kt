@@ -34,6 +34,8 @@ private class CanonicalMutableStore(
     private val budget: CanonicalStorageBudget,
 ) : CanonicalCommitStore {
     private var closed = false
+    /** Reuses bounded sorted-record buffers across the dry-run and real write. */
+    private val sortedScratch = CowSortedPageScratchPool()
 
     @Synchronized
     private fun stage(
@@ -47,7 +49,7 @@ private class CanonicalMutableStore(
         if (identity.sourceCut != baseView.cut) return refused(CanonicalCowRefusal.STALE_BASE)
         // Collapse dry-run metadata to scalars in this expression scope. Its
         // manifest graph is unreachable before the real writer constructs one.
-        val preflight = CowStreamingWriter.dryRun(intent, baseView)?.let { CowPreflight.from(identity, it) }
+        val preflight = CowStreamingWriter.dryRun(intent, baseView, sortedScratch)?.let { CowPreflight.from(identity, it) }
             ?: return refused(CanonicalCowRefusal.INVALID_INTENT)
         if (preflight.phasePeakBytes > CompactCanonicalStore.JOURNAL_RESERVE_BYTES ||
             preflight.directoryFileBytes > CanonicalCowGeneration.DIRECTORY_LIMIT_BYTES ||
@@ -88,7 +90,8 @@ private class CanonicalMutableStore(
             budget.verifyCandidate(token, staging)
             inject(fault, CanonicalCowFault.BEFORE_FRAGMENT_WRITE)
             val currentFile = File(staging, CanonicalCowGeneration.CURRENT_UNACKED_FILE)
-            val written = CowStreamingWriter.write(intent, baseView, staging, currentFile, fault) ?: return refused(CanonicalCowRefusal.INVALID_INTENT)
+            val written = CowStreamingWriter.write(intent, baseView, staging, currentFile, fault, sortedScratch)
+                ?: return refused(CanonicalCowRefusal.INVALID_INTENT)
             if (written.pageCounts != preflight.pageCounts || written.current != preflight.current) return refused(CanonicalCowRefusal.CORRUPT_GENERATION)
             val root = MutableSemanticRoot(
                 identity.sourceCut, identity.commandId, identity.kind, identity.commandHash, identity.commandFingerprint,
@@ -271,7 +274,7 @@ private class CanonicalMutableStore(
     }
 
     @Synchronized
-    override fun close() { closed = true }
+    override fun close() { closed = true; sortedScratch.clear() }
     private fun refused(reason: CanonicalCowRefusal) = CanonicalCowStageResult.Refused(reason, CowStorageReceipt(0, 0, CanonicalCowGeneration.FIXED_PHASE_BYTES))
     private fun inject(requested: CanonicalCowFault?, point: CanonicalCowFault) {
         if (requested == point) error("fault:$point")
@@ -392,9 +395,14 @@ private data class CowPreflight(
 }
 
 /** Uses only #121's scalar callbacks.  A fragment page is the largest retained write state. */
-private class CowStreamingWriter private constructor(private val directory: File?, private val base: CanonicalStateView, private val fault: CanonicalCowFault?) : PreparedIntentVisitor {
+private class CowStreamingWriter private constructor(
+    private val directory: File?,
+    private val base: CanonicalStateView,
+    private val fault: CanonicalCowFault?,
+    private val sortedScratch: CowSortedPageScratchPool,
+) : PreparedIntentVisitor {
     private val writers: Map<CowFragmentKind, CowRecordWriter> = CowFragmentKind.entries.associateWith { kind ->
-        if (kind in SORTED_KINDS) CowSortedPageWriter(directory, kind, fault) else CowPageWriter(directory, kind, fault)
+        if (kind in SORTED_KINDS) CowSortedPageWriter(directory, kind, fault, sortedScratch) else CowPageWriter(directory, kind, fault)
     }
     private var identity: PreparedIntentIdentity? = null
     private var terminal: PreparedIntentCurrentReceipt? = null
@@ -463,9 +471,19 @@ private class CowStreamingWriter private constructor(private val directory: File
         )
     }
     companion object {
-        fun dryRun(intent: PreparedIntent, base: CanonicalStateView): CowWriteReceipt? { val writer = CowStreamingWriter(null, base, null); return if (intent.visit(writer) is PreparedIntentVisitResult.Complete) writer.finish() else null }
-        fun write(intent: PreparedIntent, base: CanonicalStateView, directory: File, current: File, fault: CanonicalCowFault?): CowWriteReceipt? {
-            val writer = CowStreamingWriter(directory, base, fault)
+        fun dryRun(intent: PreparedIntent, base: CanonicalStateView, sortedScratch: CowSortedPageScratchPool): CowWriteReceipt? {
+            val writer = CowStreamingWriter(null, base, null, sortedScratch)
+            return if (intent.visit(writer) is PreparedIntentVisitResult.Complete) writer.finish() else null
+        }
+        fun write(
+            intent: PreparedIntent,
+            base: CanonicalStateView,
+            directory: File,
+            current: File,
+            fault: CanonicalCowFault?,
+            sortedScratch: CowSortedPageScratchPool,
+        ): CowWriteReceipt? {
+            val writer = CowStreamingWriter(directory, base, fault, sortedScratch)
             return FileOutputStream(current, false).use { output ->
                 val result = intent.visitCurrent(writer, output)
                 output.fd.sync()
@@ -482,6 +500,72 @@ private class CowStreamingWriter private constructor(private val directory: File
     }
 }
 
+/**
+ * Process-local pool for the small, bounded arrays used while preparing a
+ * sorted fragment.  A pool is owned by one canonical store, so a buffer is
+ * never returned while a writer can still use it.  Large external-sort
+ * batches do not retain their full record stream here.
+ */
+internal class CowSortedPageScratchPool {
+    private val available = ArrayDeque<ByteArray>()
+    private var availableBytes = 0
+
+    @Synchronized
+    fun acquire(minimumBytes: Int): ByteArray {
+        val candidate = available.firstOrNull { it.size >= minimumBytes }
+        if (candidate != null) {
+            available.remove(candidate)
+            availableBytes -= candidate.size
+            return candidate
+        }
+        return ByteArray(minimumBytes)
+    }
+
+    @Synchronized
+    fun release(bytes: ByteArray?) {
+        if (bytes == null || bytes.isEmpty() || bytes.size > CowSortedPageWriter.MAX_RETAINED_POOL_BYTES) return
+        if (available.size >= CowSortedPageWriter.MAX_RETAINED_BUFFERS) return
+        if (availableBytes > CowSortedPageWriter.MAX_RETAINED_POOL_BYTES - bytes.size) return
+        available.addLast(bytes)
+        availableBytes += bytes.size
+    }
+
+    @Synchronized
+    fun clear() { available.clear(); availableBytes = 0 }
+
+    @Synchronized
+    fun retainedBufferCount() = available.size
+
+    @Synchronized
+    fun retainedBytes() = availableBytes
+}
+
+/** Fixed-size output used by every record in a writer; it allocates no stream per callback. */
+private class FixedRecordOutput : OutputStream() {
+    private var bytes: ByteArray? = null
+    private var position = 0
+    private var limit = 0
+
+    fun reset(target: ByteArray, offset: Int, length: Int) {
+        bytes = target
+        position = offset
+        limit = offset + length
+    }
+
+    val written get() = position
+
+    override fun write(value: Int) {
+        check(position < limit)
+        requireNotNull(bytes)[position++] = value.toByte()
+    }
+
+    override fun write(value: ByteArray, offset: Int, length: Int) {
+        check(length >= 0 && position + length <= limit)
+        value.copyInto(requireNotNull(bytes), position, offset, offset + length)
+        position += length
+    }
+}
+
 private interface CowRecordWriter {
     val kind: CowFragmentKind
     val pages: Int
@@ -493,15 +577,19 @@ private interface CowRecordWriter {
 
 private class CowPageWriter(private val directory: File?, override val kind: CowFragmentKind, private val fault: CanonicalCowFault?) : CowRecordWriter {
     private var bytes = ByteArray(CanonicalCowGeneration.PAGE_BYTES); private var count = 0; private var position = 12
+    private val recordOutput = FixedRecordOutput()
+    private val recordStream = DataOutputStream(recordOutput)
     private val entries = ArrayList<CowDirectoryEntry>(); override var pages = 0; private var failed = false; private var minimum = Long.MAX_VALUE; private var maximum = Long.MIN_VALUE
     override fun record(key: Long, write: (DataOutputStream) -> Unit): Boolean {
         if (failed) return false
         if (count == kind.recordsPerPage) flush()
         return try {
             // Record encoding is fixed-size; encode directly into the owned 16 KiB page.
-            val stream = object : java.io.OutputStream() { override fun write(value: Int) { bytes[position++] = value.toByte() }; override fun write(value: ByteArray, offset: Int, length: Int) { value.copyInto(bytes, position, offset, offset + length); position += length } }
-            DataOutputStream(stream).use { write(it) }
-            require(position == 12 + (count + 1) * kind.recordBytes)
+            val start = position
+            recordOutput.reset(bytes, start, kind.recordBytes)
+            write(recordStream)
+            position = recordOutput.written
+            require(position == start + kind.recordBytes)
             if (count == 0) { minimum = key; maximum = key }
             else {
                 if (java.lang.Long.compareUnsigned(key, minimum) < 0) minimum = key
@@ -510,6 +598,23 @@ private class CowPageWriter(private val directory: File?, override val kind: Cow
             count++; true
         } catch (_: Exception) { failed = true; false }
     }
+
+    /** Writes an already encoded payload without allocating a callback stream or payload array. */
+    fun recordEncoded(key: Long, payload: ByteArray, offset: Int): Boolean = try {
+        if (failed) return false
+        if (count == kind.recordsPerPage) flush()
+        val start = position
+        payload.copyInto(bytes, start, offset, offset + kind.recordBytes)
+        position = start + kind.recordBytes
+        require(position == 12 + (count + 1) * kind.recordBytes)
+        if (count == 0) { minimum = key; maximum = key }
+        else {
+            if (java.lang.Long.compareUnsigned(key, minimum) < 0) minimum = key
+            if (java.lang.Long.compareUnsigned(key, maximum) > 0) maximum = key
+        }
+        count++
+        true
+    } catch (_: Exception) { failed = true; false }
     override fun finish(): List<CowDirectoryEntry>? { if (failed) return null; if (count > 0) flush(); return if (failed) null else entries }
     private fun flush() {
         if (count == 0 || failed) return
@@ -525,100 +630,268 @@ private class CowPageWriter(private val directory: File?, override val kind: Cow
                 }
             }
             entries += CowDirectoryEntry(kind, pages, minimum, maximum, pages.toLong() * CanonicalCowGeneration.PAGE_BYTES, CanonicalCowGeneration.PAGE_BYTES, count, hash); pages++
-            bytes = ByteArray(CanonicalCowGeneration.PAGE_BYTES); count = 0; position = 12; minimum = Long.MAX_VALUE; maximum = Long.MIN_VALUE
+            // The page has already been hashed and written. Clear only the
+            // old record region and retain the page allocation for the next
+            // fragment page; the header is rewritten at the next flush.
+            java.util.Arrays.fill(bytes, 12, bytes.size, 0)
+            count = 0; position = 12; minimum = Long.MAX_VALUE; maximum = Long.MIN_VALUE
         } catch (_: Exception) { failed = true }
     }
 }
 
-/** Stable external radix sort: two pre-reserved spools, fixed counters, and one fragment page. */
-private class CowSortedPageWriter(
-    private val directory: File?, override val kind: CowFragmentKind, private val fault: CanonicalCowFault?,
+/**
+ * Stable radix sort for canonical indexes.  Bounded fragments stay in two
+ * reusable in-memory buffers; large fragments retain the external two-spool
+ * implementation so the commit remains bounded by the storage reservation.
+ */
+internal class CowSortedPageWriter(
+    private val directory: File?,
+    override val kind: CowFragmentKind,
+    private val fault: CanonicalCowFault?,
+    private val scratch: CowSortedPageScratchPool,
+    private val inMemoryRecordLimit: Int = IN_MEMORY_RECORD_LIMIT,
 ) : CowRecordWriter {
     private val recordBytes = 8 + kind.recordBytes
     private val spoolAName = "${kind.file}.sort-a"
     private val spoolBName = "${kind.file}.sort-b"
     private val spoolA = directory?.let { File(it, spoolAName) }
     private val spoolB = directory?.let { File(it, spoolBName) }
-    private var output = spoolA?.let { java.io.RandomAccessFile(it, "rw").also { file -> file.setLength(0) } }
+    private var output: java.io.RandomAccessFile? = null
     private var records = 0
     private var failed = false
+    private var external = false
+    private var released = false
+    private var recordBuffer: ByteArray? = null
+    private var sortBuffer: ByteArray? = null
+    private var externalPayload: ByteArray? = null
+    private var radixBytes: ByteArray? = null
+    private var radixCounts: LongArray? = null
+    private var radixOffsets: LongArray? = null
+    private val recordOutput = FixedRecordOutput()
+    private val recordStream = DataOutputStream(recordOutput)
     override val pages get() = if (records == 0) 0 else (records - 1) / kind.recordsPerPage + 1
+
     override fun record(key: Long, write: (DataOutputStream) -> Unit): Boolean = try {
         if (failed) return false
-        val payload = ByteArray(kind.recordBytes)
-        val sink = object : java.io.OutputStream() {
-            var position = 0
-            override fun write(value: Int) { payload[position++] = value.toByte() }
-            override fun write(value: ByteArray, offset: Int, length: Int) { value.copyInto(payload, position, offset, offset + length); position += length }
+        if (!external && directory != null && records >= inMemoryRecordLimit) switchToExternal()
+        if (external) {
+            val payload = requireNotNull(externalPayload)
+            recordOutput.reset(payload, 0, kind.recordBytes)
+            write(recordStream)
+            require(recordOutput.written == kind.recordBytes)
+            requireNotNull(output).writeLong(key)
+            requireNotNull(output).write(payload, 0, kind.recordBytes)
+        } else {
+            val payload = if (directory == null) {
+                val candidate = externalPayload ?: ByteArray(kind.recordBytes).also { externalPayload = it }
+                candidate
+            } else {
+                ensureRecordCapacity(records + 1)
+                requireNotNull(recordBuffer)
+            }
+            val offset = if (directory == null) 0 else records * recordBytes + 8
+            recordOutput.reset(payload, offset, kind.recordBytes)
+            write(recordStream)
+            require(recordOutput.written == offset + kind.recordBytes)
+            if (directory != null) writeLong(recordBuffer!!, records * recordBytes, key)
         }
-        DataOutputStream(sink).use(write)
-        require(sink.position == payload.size)
-        output?.run { writeLong(key); write(payload) }
         records++
         true
     } catch (_: Exception) { failed = true; false }
+
     override fun temporaryFiles(): Map<String, Long> {
-        if (records == 0) return emptyMap()
+        if (records == 0 || (!external && records <= inMemoryRecordLimit)) return emptyMap()
         val bytes = records.toLong() * recordBytes
         return mapOf(spoolAName to bytes, spoolBName to bytes)
     }
+
     override fun abort() {
         try { output?.close() } catch (_: Exception) { }
         output = null
+        releaseBuffers()
     }
+
     override fun finish(): List<CowDirectoryEntry>? {
         if (failed) return null
-        if (directory == null) return List(pages) { page ->
-            val count = minOf(kind.recordsPerPage, records - page * kind.recordsPerPage)
-            CowDirectoryEntry(kind, page, 0, 0, page.toLong() * CanonicalCowGeneration.PAGE_BYTES, CanonicalCowGeneration.PAGE_BYTES, count, ByteArray(32))
-        }
-        return try {
-            output?.fd?.sync(); output?.close(); output = null
-            val byteOrder = (27 downTo 20) + (19 downTo 16) + (15 downTo 12) + (11 downTo 8) + (7 downTo 0)
-            byteOrder.forEachIndexed { pass, byteIndex ->
-                val input = if (pass % 2 == 0) requireNotNull(spoolA) else requireNotNull(spoolB)
-                val target = if (pass % 2 == 0) requireNotNull(spoolB) else requireNotNull(spoolA)
-                radixPass(input, target, byteIndex)
-            }
-            val pageWriter = CowPageWriter(directory, kind, fault)
-            java.io.RandomAccessFile(requireNotNull(spoolA), "r").use { sorted ->
-                repeat(records) {
-                    val key = sorted.readLong(); val payload = ByteArray(kind.recordBytes).also(sorted::readFully)
-                    require(pageWriter.record(key) { it.write(payload) })
-                }
-            }
-            val entries = pageWriter.finish() ?: return null
-            require(spoolA.delete() && requireNotNull(spoolB).delete())
-            entries
+        if (directory == null) return try {
+            dummyEntries().also { releaseBuffers() }
         } catch (_: Exception) { failed = true; null }
-    }
-    private fun radixPass(inputFile: File, outputFile: File, byteIndex: Int) {
-        val counts = LongArray(256)
-        java.io.RandomAccessFile(inputFile, "r").use { input ->
-            val bytes = ByteArray(recordBytes)
-            repeat(records) { input.readFully(bytes); counts[bucket(bytes, byteIndex)]++ }
+        return try {
+            val entries = if (external) finishExternal() else finishInMemory()
+            releaseBuffers()
+            entries
+        } catch (_: Exception) {
+            failed = true
+            abort()
+            null
         }
-        val offsets = LongArray(256); var next = 0L
+    }
+
+    private fun finishInMemory(): List<CowDirectoryEntry> {
+        if (records == 0) return emptyList()
+        val sorted = sortInMemory()
+        val pageWriter = CowPageWriter(requireNotNull(directory), kind, fault)
+        repeat(records) { index ->
+            val offset = index * recordBytes
+            val key = readLong(sorted, offset)
+            require(pageWriter.recordEncoded(key, sorted, offset + 8))
+        }
+        return pageWriter.finish() ?: error("page write failed")
+    }
+
+    private fun finishExternal(): List<CowDirectoryEntry> {
+        output?.fd?.sync()
+        output?.close(); output = null
+        BYTE_ORDER.forEachIndexed { pass, byteIndex ->
+            val input = if (pass % 2 == 0) requireNotNull(spoolA) else requireNotNull(spoolB)
+            val target = if (pass % 2 == 0) requireNotNull(spoolB) else requireNotNull(spoolA)
+            radixPass(input, target, byteIndex)
+        }
+        val pageWriter = CowPageWriter(requireNotNull(directory), kind, fault)
+        val payload = externalPayload ?: ByteArray(kind.recordBytes).also { externalPayload = it }
+        java.io.RandomAccessFile(requireNotNull(spoolA), "r").use { sorted ->
+            repeat(records) {
+                val key = sorted.readLong()
+                sorted.readFully(payload)
+                require(pageWriter.recordEncoded(key, payload, 0))
+            }
+        }
+        val entries = pageWriter.finish() ?: error("page write failed")
+        require(requireNotNull(spoolA).delete() && requireNotNull(spoolB).delete())
+        return entries
+    }
+
+    private fun sortInMemory(): ByteArray {
+        var input = requireNotNull(recordBuffer)
+        var target = sortBuffer ?: scratch.acquire(input.size).also { sortBuffer = it }
+        val counts = IntArray(256)
+        val offsets = IntArray(256)
+        BYTE_ORDER.forEach { byteIndex ->
+            java.util.Arrays.fill(counts, 0)
+            repeat(records) { index ->
+                val offset = index * recordBytes
+                counts[bucket(input, offset, byteIndex)]++
+            }
+            var next = 0
+            counts.indices.forEach { bucket ->
+                offsets[bucket] = next
+                next += counts[bucket]
+            }
+            repeat(records) { index ->
+                val sourceOffset = index * recordBytes
+                val bucket = bucket(input, sourceOffset, byteIndex)
+                val targetOffset = offsets[bucket]++ * recordBytes
+                input.copyInto(target, targetOffset, sourceOffset, sourceOffset + recordBytes)
+            }
+            val swap = input
+            input = target
+            target = swap
+        }
+        // There are 28 passes, so the sorted result is back in recordBuffer.
+        recordBuffer = input
+        sortBuffer = target
+        return input
+    }
+
+    private fun ensureRecordCapacity(requiredRecords: Int) {
+        val requiredBytes = Math.multiplyExact(requiredRecords, recordBytes)
+        val current = recordBuffer
+        if (current != null && current.size >= requiredBytes) return
+        val nextBytes = maxOf(requiredBytes, current?.size?.times(2) ?: recordBytes)
+        val next = scratch.acquire(nextBytes)
+        if (current != null && records > 0) current.copyInto(next, 0, 0, records * recordBytes)
+        scratch.release(current)
+        recordBuffer = next
+    }
+
+    private fun switchToExternal() {
+        if (external || directory == null) return
+        external = true
+        externalPayload = ByteArray(kind.recordBytes)
+        val file = requireNotNull(spoolA)
+        file.parentFile?.mkdirs()
+        output = java.io.RandomAccessFile(file, "rw").also { it.setLength(0) }
+        val buffered = recordBuffer
+        if (buffered != null && records > 0) requireNotNull(output).write(buffered, 0, records * recordBytes)
+        scratch.release(buffered)
+        recordBuffer = null
+    }
+
+    private fun releaseBuffers() {
+        if (released) return
+        released = true
+        scratch.release(recordBuffer)
+        scratch.release(sortBuffer)
+        recordBuffer = null
+        sortBuffer = null
+        externalPayload = null
+        radixBytes = null
+        radixCounts = null
+        radixOffsets = null
+    }
+
+    private fun dummyEntries(): List<CowDirectoryEntry> = List(pages) { page ->
+        val count = minOf(kind.recordsPerPage, records - page * kind.recordsPerPage)
+        CowDirectoryEntry(kind, page, 0, 0, page.toLong() * CanonicalCowGeneration.PAGE_BYTES, CanonicalCowGeneration.PAGE_BYTES, count, ByteArray(32))
+    }
+
+    private fun radixPass(inputFile: File, outputFile: File, byteIndex: Int) {
+        val bytes = radixBytes ?: ByteArray(recordBytes).also { radixBytes = it }
+        val counts = radixCounts ?: LongArray(256).also { radixCounts = it }
+        val offsets = radixOffsets ?: LongArray(256).also { radixOffsets = it }
+        java.util.Arrays.fill(counts, 0L)
+        java.io.RandomAccessFile(inputFile, "r").use { input ->
+            repeat(records) { input.readFully(bytes); counts[bucket(bytes, 0, byteIndex)]++ }
+        }
+        var next = 0L
         counts.indices.forEach { bucket -> offsets[bucket] = next; next += counts[bucket] * recordBytes }
         java.io.RandomAccessFile(inputFile, "r").use { input ->
             java.io.RandomAccessFile(outputFile, "rw").use { out ->
                 out.setLength(records.toLong() * recordBytes)
-                val bytes = ByteArray(recordBytes)
                 repeat(records) {
                     input.readFully(bytes)
-                    val bucket = bucket(bytes, byteIndex)
+                    val bucket = bucket(bytes, 0, byteIndex)
                     out.seek(offsets[bucket]); out.write(bytes); offsets[bucket] += recordBytes
                 }
-                // These radix spools are staging-only and are never named by
-                // the generation manifest. The final fragment pages are
-                // synced by CowPageWriter, followed by the staging-directory
-                // sync before publication, so syncing every temporary pass
-                // adds latency without strengthening the durable cut.
             }
         }
     }
-    private fun bucket(bytes: ByteArray, byteIndex: Int): Int =
-        (bytes[byteIndex].toInt() and 0xff) xor if (byteIndex == 8 || byteIndex == 12 || byteIndex == 16) 0x80 else 0
+
+    private fun bucket(bytes: ByteArray, offset: Int, byteIndex: Int): Int =
+        (bytes[offset + byteIndex].toInt() and 0xff) xor if (byteIndex == 8 || byteIndex == 12 || byteIndex == 16) 0x80 else 0
+
+    companion object {
+        /**
+         * Total owned array budget stays within the existing 1 MiB canonical
+         * phase envelope.  The live bounded
+         * case owns at most four sorted record streams of
+         * `4,096 * (8 + 20) = 114,688` bytes, one active sort buffer of the
+         * same size, twelve 16 KiB page buffers, a 128 KiB reusable pool, and
+         * roughly 16 KiB of radix/callback scalars.  That is 917,504 bytes,
+         * below `CompactCanonicalStore.JOURNAL_RESERVE_BYTES`.  Writers finish
+         * sorted fragments sequentially, so only one sort buffer is live;
+         * larger fragments switch to the external path and release their
+         * record buffer before sorting.
+         */
+        const val IN_MEMORY_RECORD_LIMIT = 4_096
+        const val MAX_RETAINED_POOL_BYTES = 128 * 1024
+        const val MAX_RETAINED_BUFFERS = 2
+        private val BYTE_ORDER = intArrayOf(
+            27, 26, 25, 24, 23, 22, 21, 20,
+            19, 18, 17, 16, 15, 14, 13, 12,
+            11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
+        )
+
+        private fun writeLong(bytes: ByteArray, offset: Int, value: Long) {
+            for (shift in 56 downTo 0 step 8) bytes[offset + (56 - shift) / 8] = (value ushr shift).toByte()
+        }
+
+        private fun readLong(bytes: ByteArray, offset: Int): Long {
+            var value = 0L
+            for (index in 0 until 8) value = (value shl 8) or (bytes[offset + index].toLong() and 0xffL)
+            return value
+        }
+    }
 }
 
 private fun MutableSemanticRoot.matches(identity: PreparedIntentIdentity, current: PreparedIntentCurrentReceipt) =

@@ -124,6 +124,44 @@ class CanonicalEvidenceBatchTest {
     }
 
     @Test
+    fun `support heavy multi source mutation refuses before caching support values`() {
+        val supports = (1L..2L).associateWith { target ->
+            (1L..5_000L).map { offset ->
+                val id = 2L + (target - 1L) * 5_000L + offset
+                PagedSupport(
+                    SurfaceId(target),
+                    PagedSource(
+                        SurfaceId(id), Voxel(offset.toInt(), target.toInt(), 0), 0, 192,
+                        CanonicalReceiptBytes(ByteArray(32) { id.toByte() }),
+                    ),
+                )
+            }
+        }
+        val view = TestView(
+            listOf(surface(1, 0), surface(2, 1)), high = 10_003, geometry = 7, lineage = 5,
+            supportBySource = supports, supportCount = 10_000,
+        )
+        val cut = view.cut
+        val preparation = MutableCanonicalOverlay.prepare(
+            view, SurfaceOwnershipConfiguration(),
+            CanonicalEvidenceBatchCommand(
+                "support-heavy-relocation", 7, 5,
+                (1L..2L).map { id ->
+                    DepthEvidenceChange.Relocate(
+                        SurfaceId(id), CanonicalTarget(SurfaceId(id), Voxel(id.toInt() + 10, 0, 0), 0, 0, 192),
+                    )
+                },
+            ),
+        ) as CanonicalMutationPreparation.Refused
+        assertEquals(CanonicalMutationRefusal.JOURNAL_EXHAUSTED, preparation.reason)
+        assertEquals(cut, view.cut)
+        assertEquals(0, preparation.preflightWork.ownerConstructions)
+        assertEquals(0, view.sourceMaterializationReads)
+        assertEquals(2, view.supportPageReads)
+        assertTrue(view.supportStreamRecords in 5_000 until 10_000)
+    }
+
+    @Test
     fun `small journal budget refuses before source support materialization`() {
         val view = TestView(
             listOf(surface(1, 0)),
@@ -303,7 +341,7 @@ class CanonicalEvidenceBatchTest {
     }
 
     @Test
-    fun `support page work is included for every streaming pass`() {
+    fun `admitted support values are cached after bounded count and reused by payload`() {
         val support = PagedSupport(
             SurfaceId(1),
             PagedSource(
@@ -332,8 +370,11 @@ class CanonicalEvidenceBatchTest {
         ) as CanonicalMutationPreparation.Prepared
         val plan = preparation.mutation
         try {
-            assertEquals(6, plan.work.sourcePageFaults)
-            assertEquals(51, plan.work.sourceBytesRead)
+            assertEquals(4, plan.work.sourcePageFaults)
+            assertEquals(34, plan.work.sourceBytesRead)
+            assertEquals(2, view.supportPageReads)
+            assertEquals(2, view.supportStreamRecords)
+            assertEquals(1, view.sourceMaterializationReads)
         } finally {
             plan.discard()
         }
@@ -366,6 +407,7 @@ class CanonicalEvidenceBatchTest {
         private val supportBySource: Map<Long, List<PagedSupport>> = emptyMap(),
         private val supportPageFaults: Int = 0,
         private val supportBytesRead: Int = 0,
+        private val supportCount: Int = rows.size,
     ) : CanonicalStateView {
         var sourceMaterializationReads = 0
         var supportPageReads = 0
@@ -374,7 +416,7 @@ class CanonicalEvidenceBatchTest {
         private val byVoxel = rows.associateBy { it.voxel }
         override val cut = CompactCanonicalCut(
             SurfaceGroup("depth-batch"), CompactCanonicalStore.PROFILE,
-            geometry, lineage, high, rows.size, rows.size, rows.size, lineage.toInt(),
+            geometry, lineage, high, rows.size, rows.size, supportCount, lineage.toInt(),
             null, CanonicalReceiptBytes(ByteArray(32)), CanonicalReceiptBytes(ByteArray(32) { 1 }),
         )
 
@@ -400,8 +442,14 @@ class CanonicalEvidenceBatchTest {
         ): SourceSupportRead {
             supportPageReads++
             var delivered = 0
-            for (support in supportBySource[target.value].orEmpty().drop(cursor?.offset ?: 0)) {
-                if (!sink(support)) break
+            val start = cursor?.offset ?: 0
+            for (support in supportBySource[target.value].orEmpty().drop(start)) {
+                if (!sink(support)) {
+                    return SourceSupportRead.Complete(
+                        delivered, SourceSupportCursor(cut.rootHash, target, 0, start + delivered),
+                        supportPageFaults, supportBytesRead,
+                    )
+                }
                 delivered++
                 supportStreamRecords++
             }

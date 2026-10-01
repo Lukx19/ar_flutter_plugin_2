@@ -28,6 +28,7 @@ internal class SurfaceOwnership private constructor(
     private var activation: CanonicalActivationState? = null,
     private val v6Parent: File? = null,
     private val v6Budget: CanonicalStorageBudget? = null,
+    private val sessionState: SessionCanonicalMemoryState? = null,
 ) {
     private var legacyLeaseRelease: (() -> Unit)? = null
     private val rowsById = restored.rows.associateByTo(linkedMapOf()) { it.id.value }
@@ -241,7 +242,7 @@ internal class SurfaceOwnership private constructor(
 
     /** Bounded activation state; all activation/closed access linearizes on this owner monitor. */
     @Synchronized
-    internal fun activationState(): CanonicalActivationState? = if (closed) null else activation
+    internal fun activationState(): CanonicalActivationState? = if (closed) null else sessionState?.activationState() ?: activation
 
     /**
      * The only canonical-owner ACK seam.  It is deliberately not connected to a
@@ -254,6 +255,7 @@ internal class SurfaceOwnership private constructor(
         fault: CanonicalAcknowledgementFault? = null,
     ): CanonicalAcknowledgementResult {
         if (closed) return CanonicalAcknowledgementResult.NoOp(CanonicalAcknowledgementNoOp.CLOSED)
+        sessionState?.let { return it.acknowledge(acknowledgement) }
         val parent = v6Parent ?: return CanonicalAcknowledgementResult.NoOp(CanonicalAcknowledgementNoOp.NO_CURRENT)
         val budget = v6Budget ?: return CanonicalAcknowledgementResult.NoOp(CanonicalAcknowledgementNoOp.NO_CURRENT)
         val authenticatedCut = activation?.cut
@@ -273,6 +275,7 @@ internal class SurfaceOwnership private constructor(
         plan: PreparedCanonicalMutation,
         faults: CanonicalCommitFaults = CanonicalCommitFaults(),
     ): CanonicalAdjacentCommitResult {
+        sessionState?.let { return commitSessionMutation(it, plan) }
         val parent: File
         val budget: CanonicalStorageBudget
         synchronized(this) {
@@ -330,6 +333,44 @@ internal class SurfaceOwnership private constructor(
                     ) result.copy(disposition = PreparedMutationDisposition.TERMINAL) else result
                 }
             }
+        } catch (failure: Throwable) {
+            plan.finish(PreparedMutationFinish.TERMINAL)
+            throw failure
+        }
+    }
+
+    /** Live session geometry has process-local authority; photo durability is independent. */
+    @Synchronized
+    private fun commitSessionMutation(
+        state: SessionCanonicalMemoryState,
+        plan: PreparedCanonicalMutation,
+    ): CanonicalAdjacentCommitResult {
+        if (closed) {
+            plan.discard()
+            return CanonicalAdjacentCommitResult.Refused(CanonicalAdjacentCommitRefusal.NO_ACTIVE_AUTHORITY)
+        }
+        when (plan.claim()) {
+            PreparedMutationClaimResult.Claimed -> Unit
+            PreparedMutationClaimResult.AlreadyInFlight -> return CanonicalAdjacentCommitResult.Refused(
+                CanonicalAdjacentCommitRefusal.PLAN_IN_FLIGHT, disposition = PreparedMutationDisposition.RETRYABLE,
+            )
+            PreparedMutationClaimResult.Terminal -> return CanonicalAdjacentCommitResult.Refused(CanonicalAdjacentCommitRefusal.PLAN_DISCARDED)
+        }
+        val resolved = CanonicalAuthorityLeaseRegistry.resolve(
+            plan.authorityLease, group, requireNotNull(v6Parent), adjacentOwnerCapability,
+        ) as? CanonicalAuthorityLeaseResolution.Resolved
+        if (resolved == null || resolved.authority !== state) {
+            plan.finish(PreparedMutationFinish.TERMINAL)
+            return CanonicalAdjacentCommitResult.Refused(CanonicalAdjacentCommitRefusal.INVALID_AUTHORITY_LEASE)
+        }
+        return try {
+            val result = state.commit(plan)
+            plan.finish(when (result) {
+                is CanonicalAdjacentCommitResult.Committed -> PreparedMutationFinish.SUCCESS
+                is CanonicalAdjacentCommitResult.Refused -> if (result.disposition == PreparedMutationDisposition.RETRYABLE)
+                    PreparedMutationFinish.RETRYABLE else PreparedMutationFinish.TERMINAL
+            })
+            result
         } catch (failure: Throwable) {
             plan.finish(PreparedMutationFinish.TERMINAL)
             throw failure
@@ -418,6 +459,7 @@ internal class SurfaceOwnership private constructor(
             }
             abandoned.forEach(PreparedCanonicalMutation::discard)
             store?.close()
+            sessionState?.close()
         } finally {
             legacyLeaseRelease?.invoke()
             legacyLeaseRelease = null
@@ -613,6 +655,16 @@ internal class SurfaceOwnership private constructor(
     }
 
     companion object {
+        /** Fresh non-resumable session authority, with no durable selector. */
+        internal fun session(
+            group: SurfaceGroup,
+            directory: File,
+            configuration: SurfaceOwnershipConfiguration,
+            state: SessionCanonicalMemoryState,
+        ): SurfaceOwnershipOpenResult = SurfaceOwnershipOpenResult.Opened(
+            SurfaceOwnership(group, configuration, null, activeRestored(state.cut),
+                state.activationState(), directory, null, state),
+        )
         private const val MAX_COMMAND_BYTES = 256
         private const val MAX_HIGH_WATER = 0x1_0000_0000L
 

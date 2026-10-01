@@ -19,24 +19,40 @@ internal object DepthRaySupercover {
         val end = DepthVoxelAddressing.quantize(endpoint, voxelSizeMicrometres)
             ?: return DepthRayVisitResult(0, arithmeticOverflow = true)
         val size = voxelSizeMicrometres.toDouble() / 1_000.0
-        val delta = doubleArrayOf(endpoint.x - camera.x, endpoint.y - camera.y, endpoint.z - camera.z)
-        if (!size.isFinite() || delta.any { !it.isFinite() }) {
+        val deltaX = endpoint.x - camera.x
+        val deltaY = endpoint.y - camera.y
+        val deltaZ = endpoint.z - camera.z
+        if (!size.isFinite() || !deltaX.isFinite() || !deltaY.isFinite() || !deltaZ.isFinite()) {
             return DepthRayVisitResult(0, arithmeticOverflow = true)
         }
-        val current = intArrayOf(start.x, start.y, start.z)
-        val target = intArrayOf(end.x, end.y, end.z)
-        val step = IntArray(3) { axis -> delta[axis].compareTo(0.0) }
-        val startPoint = doubleArrayOf(camera.x, camera.y, camera.z)
-        val tDelta = DoubleArray(3) { axis ->
-            if (step[axis] == 0) Double.POSITIVE_INFINITY else size / kotlin.math.abs(delta[axis])
+        // Keep the traversal state in scalars. This method is called once per
+        // selected depth endpoint, so per-ray coordinate arrays become a
+        // substantial allocation source on a populated 2,000 x 2,000 map.
+        // The explicit axis order below preserves the previous array-based
+        // implementation's tie breaking (x, then y, then z).
+        var currentX = start.x
+        var currentY = start.y
+        var currentZ = start.z
+        val targetX = end.x
+        val targetY = end.y
+        val targetZ = end.z
+        val stepX = deltaX.compareTo(0.0)
+        val stepY = deltaY.compareTo(0.0)
+        val stepZ = deltaZ.compareTo(0.0)
+        val tDeltaX = if (stepX == 0) Double.POSITIVE_INFINITY else size / kotlin.math.abs(deltaX)
+        val tDeltaY = if (stepY == 0) Double.POSITIVE_INFINITY else size / kotlin.math.abs(deltaY)
+        val tDeltaZ = if (stepZ == 0) Double.POSITIVE_INFINITY else size / kotlin.math.abs(deltaZ)
+        var tMaxX = if (stepX == 0) Double.POSITIVE_INFINITY else {
+            val boundary = (currentX + if (stepX > 0) 1 else 0) * size
+            (boundary - camera.x) / deltaX
         }
-        val tMax = DoubleArray(3) { axis ->
-            if (step[axis] == 0) {
-                Double.POSITIVE_INFINITY
-            } else {
-                val boundary = (current[axis] + if (step[axis] > 0) 1 else 0) * size
-                (boundary - startPoint[axis]) / delta[axis]
-            }
+        var tMaxY = if (stepY == 0) Double.POSITIVE_INFINITY else {
+            val boundary = (currentY + if (stepY > 0) 1 else 0) * size
+            (boundary - camera.y) / deltaY
+        }
+        var tMaxZ = if (stepZ == 0) Double.POSITIVE_INFINITY else {
+            val boundary = (currentZ + if (stepZ > 0) 1 else 0) * size
+            (boundary - camera.z) / deltaZ
         }
         var visited = 0
         fun emit(voxel: Voxel): Int {
@@ -49,26 +65,22 @@ internal object DepthRaySupercover {
                 CAPACITY_STOP -> return DepthRayVisitResult(visited, truncated = true)
                 VISITOR_STOP -> return DepthRayVisitResult(visited)
             }
-            while (!current.contentEquals(target)) {
-                val crossing = (0..2)
-                    .asSequence()
-                    .filter { current[it] != target[it] }
-                    .minOfOrNull { tMax[it] }
-                    ?: return DepthRayVisitResult(visited, arithmeticOverflow = true)
+            while (currentX != targetX || currentY != targetY || currentZ != targetZ) {
+                var crossing = Double.POSITIVE_INFINITY
+                if (currentX != targetX && tMaxX < crossing) crossing = tMaxX
+                if (currentY != targetY && tMaxY < crossing) crossing = tMaxY
+                if (currentZ != targetZ && tMaxZ < crossing) crossing = tMaxZ
                 if (!crossing.isFinite()) return DepthRayVisitResult(visited, arithmeticOverflow = true)
                 var tiedMask = 0
-                for (axis in 0..2) {
-                    if (current[axis] != target[axis] && tMax[axis] == crossing) {
-                        tiedMask = tiedMask or (1 shl axis)
-                    }
-                }
+                if (currentX != targetX && tMaxX == crossing) tiedMask = tiedMask or 1
+                if (currentY != targetY && tMaxY == crossing) tiedMask = tiedMask or 2
+                if (currentZ != targetZ && tMaxZ == crossing) tiedMask = tiedMask or 4
                 for (subset in 1..7) {
                     if (subset and tiedMask != subset) continue
-                    val next = current.copyOf()
-                    for (axis in 0..2) if (subset and (1 shl axis) != 0) {
-                        next[axis] = Math.addExact(next[axis], step[axis])
-                    }
-                    val voxel = Voxel(next[0], next[1], next[2])
+                    val nextX = if (subset and 1 != 0) Math.addExact(currentX, stepX) else currentX
+                    val nextY = if (subset and 2 != 0) Math.addExact(currentY, stepY) else currentY
+                    val nextZ = if (subset and 4 != 0) Math.addExact(currentZ, stepZ) else currentZ
+                    val voxel = Voxel(nextX, nextY, nextZ)
                     if (!DepthVoxelAddressing.contains(voxel)) {
                         return DepthRayVisitResult(visited, arithmeticOverflow = true)
                     }
@@ -77,9 +89,17 @@ internal object DepthRaySupercover {
                         VISITOR_STOP -> return DepthRayVisitResult(visited)
                     }
                 }
-                for (axis in 0..2) if (tiedMask and (1 shl axis) != 0) {
-                    current[axis] = Math.addExact(current[axis], step[axis])
-                    tMax[axis] += tDelta[axis]
+                if (tiedMask and 1 != 0) {
+                    currentX = Math.addExact(currentX, stepX)
+                    tMaxX += tDeltaX
+                }
+                if (tiedMask and 2 != 0) {
+                    currentY = Math.addExact(currentY, stepY)
+                    tMaxY += tDeltaY
+                }
+                if (tiedMask and 4 != 0) {
+                    currentZ = Math.addExact(currentZ, stepZ)
+                    tMaxZ += tDeltaZ
                 }
             }
         } catch (_: ArithmeticException) {

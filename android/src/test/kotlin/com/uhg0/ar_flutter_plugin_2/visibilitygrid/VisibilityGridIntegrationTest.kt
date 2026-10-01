@@ -847,7 +847,7 @@ class VisibilityGridIntegrationTest {
         val mapperExecutor = Executors.newSingleThreadExecutor()
         val integration = VisibilityGridIntegration(
             binding, binding::currentObservationOwnership, directory,
-            resourcesForGroup = resources(directory, coordinator), renderer = projection,
+            resourcesForGroup = { group -> CanonicalRuntimeResources.openLive(directory, group, coordinator) }, renderer = projection,
             executor = mapperExecutor, ownsExecutor = false,
         )
         val runtime = AndroidVisibilityGridRuntime(

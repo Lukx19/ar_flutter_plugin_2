@@ -30,6 +30,54 @@ internal class MutableCanonicalOverlay private constructor(
     private var ownerConstructions = 0
     private var removalGraphAllocations = 0
 
+    /**
+     * Read-only values borrowed from one authenticated depth preparation cut.
+     * Preflight and materialization run back-to-back over the same immutable
+     * view, so retaining these bounded touched values avoids decoding the same
+     * canonical pages twice without extending their lifetime past preparation.
+     */
+    private class DepthBatchReadCache {
+        private val rowsById = HashMap<SurfaceId, CompactSurface?>()
+        private val rowsByVoxel = HashMap<Voxel, CompactSurface?>()
+        private val sourcesById = HashMap<SurfaceId, PagedSource?>()
+        private val supportsBySource = HashMap<SurfaceId, SupportDetails?>()
+
+        fun findById(id: SurfaceId, load: () -> CompactSurface?): CompactSurface? {
+            if (rowsById.containsKey(id)) return rowsById[id]
+            return load().also { rowsById[id] = it }
+        }
+
+        fun findByVoxel(voxel: Voxel, load: () -> CompactSurface?): CompactSurface? {
+            if (rowsByVoxel.containsKey(voxel)) return rowsByVoxel[voxel]
+            return load().also { rowsByVoxel[voxel] = it }
+        }
+
+        fun readSourceById(
+            id: SurfaceId,
+            load: () -> CanonicalPageRead<PagedSource?>,
+        ): CanonicalPageRead<PagedSource?> {
+            if (sourcesById.containsKey(id)) {
+                return CanonicalPageRead.Complete(sourcesById[id], 0, 0)
+            }
+            val read = load()
+            if (read is CanonicalPageRead.Complete) sourcesById[id] = read.value
+            return read
+        }
+
+        fun supports(
+            source: SurfaceId,
+            load: () -> SupportDetails?,
+        ): SupportDetails? {
+            if (supportsBySource.containsKey(source)) return supportsBySource[source]
+            return load().also { supportsBySource[source] = it }
+        }
+    }
+
+    private data class SupportDetails(
+        val values: List<ImmutableSourceSupport>,
+        val records: Int,
+    )
+
     private fun state() = CanonicalStateReceipt(
         view.cut.geometryRevision,
         view.cut.lineageRevision,
@@ -465,14 +513,10 @@ internal class MutableCanonicalOverlay private constructor(
         return SupportRead.Complete(records)
     }
 
-    private fun readAllocationFingerprint(id: SurfaceId): ByteArray? =
-        when (val read = view.readSourceById(id)) {
+    private fun readAllocationFingerprint(id: SurfaceId, cache: DepthBatchReadCache? = null): ByteArray? =
+        when (val read = readSourcePage(id, cache)) {
             is CanonicalPageRead.Refused -> null
-            is CanonicalPageRead.Complete -> {
-                pageFaults += read.pageFaults
-                bytesRead += read.bytesRead
-                read.value?.allocationFingerprint?.toByteArray()
-            }
+            is CanonicalPageRead.Complete -> read.value?.allocationFingerprint?.toByteArray()
         }
 
     private fun packed(target: CanonicalTarget): Pair<Int, Int>? =
@@ -633,6 +677,7 @@ internal class MutableCanonicalOverlay private constructor(
     private fun depthBatchPreflight(
         command: CanonicalEvidenceBatchCommand,
         scalars: DepthBatchScalars,
+        cache: DepthBatchReadCache,
     ): DepthBatchPreflightResult {
         val journalLimit = minOf(
             CompactCanonicalStore.JOURNAL_RESERVE_BYTES,
@@ -643,6 +688,8 @@ internal class MutableCanonicalOverlay private constructor(
         if (minimumPlannerBytes > journalLimit) {
             return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
         }
+        val supportRecordLimit = (journalLimit - minimumPlannerBytes) /
+            (DEPTH_SUPPORT_DETAILS_BYTES_PER_RECORD + DEPTH_SUPPORT_SCRATCH_BYTES_PER_RECORD)
         val sourceIds = try { DepthEvidenceIdTable.forExpected(scalars.sourceReferences) }
         catch (_: ArithmeticException) { return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED) }
         val structuralSourceIds = try { DepthEvidenceIdTable.forExpected(scalars.sourceReferences) }
@@ -667,7 +714,9 @@ internal class MutableCanonicalOverlay private constructor(
                     supportSourceIds.add(source.value)
                 }
                 directLookups++
-                if (source.value !in 1 until UINT32_END || view.findById(source) == null) {
+                if (source.value !in 1 until UINT32_END ||
+                    cache.findById(source) { view.findById(source) } == null
+                ) {
                     return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.UNKNOWN_IDENTITY)
                 }
             }
@@ -698,13 +747,14 @@ internal class MutableCanonicalOverlay private constructor(
                     return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.UNKNOWN_IDENTITY)
                 }
                 directLookups++
-                val occupied = view.findByVoxel(target.voxel)
+                val occupied = cache.findByVoxel(target.voxel) { view.findByVoxel(target.voxel) }
                 if (occupied != null && !structuralSourceIds.contains(occupied.id.value) && occupied.id != target.id) {
                     return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
                 }
                 if (change.operationKind == DepthBatchOperationKind.REFINE) {
                     directLookups++
-                    val source = view.findById(change.sourceAt(0))
+                    val sourceId = change.sourceAt(0)
+                    val source = cache.findById(sourceId) { view.findById(sourceId) }
                         ?: return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.UNKNOWN_IDENTITY)
                     if (source.voxel != target.voxel) {
                         return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
@@ -733,9 +783,13 @@ internal class MutableCanonicalOverlay private constructor(
                     streamRefusal = CanonicalMutationRefusal.LINEAGE_EXHAUSTED
                     return false
                 }
-                val supports = streamSupportCount(source)
+                val remainingSupports = supportRecordLimit - supportValueCapacity
+                val supports = streamSupportCount(source, remainingSupports)
                 if (supports == null) {
                     streamRefusal = CanonicalMutationRefusal.SOURCE_READ_FAILURE
+                    false
+                } else if (supports > remainingSupports) {
+                    streamRefusal = CanonicalMutationRefusal.JOURNAL_EXHAUSTED
                     false
                 } else {
                     removedSupportRecords = try { Math.addExact(removedSupportRecords, supports) }
@@ -750,13 +804,12 @@ internal class MutableCanonicalOverlay private constructor(
                         return false
                     }
                     if (supports == 0L && supportSourceIds.contains(source.value)) {
-                        when (val fallback = view.readSourceById(source)) {
+                        when (val fallback = readSourcePage(source, cache)) {
                             is CanonicalPageRead.Refused -> {
                                 streamRefusal = CanonicalMutationRefusal.SOURCE_READ_FAILURE
                                 return false
                             }
                             is CanonicalPageRead.Complete -> {
-                                pageFaults += fallback.pageFaults; bytesRead += fallback.bytesRead
                                 if (fallback.value == null) {
                                     streamRefusal = CanonicalMutationRefusal.UNKNOWN_IDENTITY
                                     return false
@@ -808,34 +861,31 @@ internal class MutableCanonicalOverlay private constructor(
                 var unionSize = 0
                 for (sourceIndex in 0 until change.sourceCount) {
                     val source = change.sourceAt(sourceIndex)
-                    var streamed = 0L
-                    val streamOk = streamSourceSupports(source) { support ->
-                        streamed = try { Math.addExact(streamed, 1L) }
-                        catch (_: ArithmeticException) {
-                            exactRefusal = CanonicalMutationRefusal.JOURNAL_EXHAUSTED
-                            return@streamSourceSupports false
-                        }
-                        val value = support.source.id.value
+                    val details = readRawSupportDetails(source, cache)
+                    if (details == null) {
+                        exactRefusal = CanonicalMutationRefusal.SOURCE_READ_FAILURE
+                        break
+                    }
+                    for (support in details.values) {
+                        val value = support.id.value
                         if (value <= 0L) {
                             exactRefusal = CanonicalMutationRefusal.SOURCE_READ_FAILURE
-                            return@streamSourceSupports false
+                            break
                         }
                         if (unionSize >= supportIds.size) {
                             exactRefusal = CanonicalMutationRefusal.JOURNAL_EXHAUSTED
-                            return@streamSourceSupports false
+                            break
                         }
                         supportIds[unionSize++] = value
-                        true
                     }
-                    if (!streamOk || exactRefusal != null) break
-                    if (streamed == 0L) {
-                        when (val fallback = view.readSourceById(source)) {
+                    if (exactRefusal != null) break
+                    if (details.records == 0) {
+                        when (val fallback = readSourcePage(source, cache)) {
                             is CanonicalPageRead.Refused -> {
                                 exactRefusal = CanonicalMutationRefusal.SOURCE_READ_FAILURE
                                 break
                             }
                             is CanonicalPageRead.Complete -> {
-                                pageFaults += fallback.pageFaults; bytesRead += fallback.bytesRead
                                 val value = fallback.value?.id?.value
                                 if (value == null || value <= 0L) {
                                     exactRefusal = CanonicalMutationRefusal.UNKNOWN_IDENTITY
@@ -928,6 +978,10 @@ internal class MutableCanonicalOverlay private constructor(
         bytes = Math.addExact(bytes, Math.multiplyExact(scalars.removedRows.toLong(), REMOVED_CONSTRUCTION_BYTES_PER_RECORD))
         bytes = Math.addExact(bytes, Math.multiplyExact(supportRecords, DEPTH_SUPPORT_DETAILS_BYTES_PER_RECORD))
         bytes = Math.addExact(bytes, Math.multiplyExact(supportRecords, DEPTH_SUPPORT_SCRATCH_BYTES_PER_RECORD))
+        // Lists, cache nodes/keys and reference-table growth survive through
+        // payload construction, including empty source-support lists.
+        bytes = Math.addExact(bytes, DEPTH_SUPPORT_CACHE_FIXED_BYTES)
+        bytes = Math.addExact(bytes, Math.multiplyExact(scalars.removedRows.toLong(), DEPTH_SUPPORT_CACHE_ENTRY_BYTES))
         bytes = Math.addExact(bytes, Math.multiplyExact(supportPairs, PREPARED_SUPPORT_CONSTRUCTION_BYTES_PER_RECORD))
         bytes = Math.addExact(bytes, Math.multiplyExact(scalars.lineageEdges, PREPARED_LINEAGE_CONSTRUCTION_BYTES_PER_RECORD))
         bytes = Math.addExact(bytes, Math.multiplyExact(DepthEvidenceIdTable.bytesForExpected(scalars.sourceReferences), 3L))
@@ -963,8 +1017,12 @@ internal class MutableCanonicalOverlay private constructor(
     private fun streamSourceSupports(source: SurfaceId, sink: (PagedSupport) -> Boolean): Boolean {
         var cursor: SourceSupportCursor? = null
         var pages = 0L
+        var cancelled = false
+        val boundedSink: (PagedSupport) -> Boolean = { support ->
+            sink(support).also { accepted -> if (!accepted) cancelled = true }
+        }
         do {
-            val read = completeView().visitSourceSupport(source, cursor, sink)
+            val read = completeView().visitSourceSupport(source, cursor, boundedSink)
             when (read) {
                 is SourceSupportRead.Refused -> return false
                 is SourceSupportRead.Complete -> {
@@ -974,6 +1032,9 @@ internal class MutableCanonicalOverlay private constructor(
                     } catch (_: ArithmeticException) {
                         return false
                     }
+                    // A declined record may return a resume cursor at that
+                    // same record. The caller deliberately ended the scan.
+                    if (cancelled) return true
                     cursor = read.nextCursor
                     pages = try { Math.addExact(pages, 1L) } catch (_: ArithmeticException) { Long.MAX_VALUE }
                     if (pages > view.cut.supportCount.toLong() + 1L) return false
@@ -983,13 +1044,64 @@ internal class MutableCanonicalOverlay private constructor(
         return true
     }
 
-    private fun streamSupportCount(source: SurfaceId): Long? {
+    private fun streamSupportCount(source: SurfaceId, maximumRecords: Long): Long? {
         var count = 0L
         val complete = streamSourceSupports(source) {
             count = try { Math.addExact(count, 1L) } catch (_: ArithmeticException) { Long.MAX_VALUE }
-            count <= sourceCapacity()
+            count <= sourceCapacity() && count <= maximumRecords
         }
         return if (complete && count <= sourceCapacity()) count else null
+    }
+
+    /**
+     * Materializes one source's raw support records for the current depth
+     * preparation cut. The bounded result is shared by preflight and payload
+     * construction; a zero-record result intentionally remains distinct from
+     * the allocation-source fallback used by the depth protocol.
+     */
+    private fun readRawSupportDetails(source: SurfaceId, cache: DepthBatchReadCache): SupportDetails? =
+        cache.supports(source) {
+            var cursor: SourceSupportCursor? = null
+            val values = ArrayList<ImmutableSourceSupport>()
+            var records = 0
+            var pages = 0L
+            var failed = false
+            do {
+                val read = completeView().visitSourceSupport(source, cursor) { support ->
+                    records++
+                    if (records > sourceCapacity().coerceAtMost(Int.MAX_VALUE.toLong())) {
+                        failed = true
+                        false
+                    } else {
+                        values += support.source.toImmutableSupport()
+                        true
+                    }
+                }
+                when (read) {
+                    is SourceSupportRead.Refused -> failed = true
+                    is SourceSupportRead.Complete -> {
+                        pageFaults += read.pageFaults
+                        bytesRead += read.bytesRead
+                        cursor = read.nextCursor
+                        pages = try { Math.addExact(pages, 1L) } catch (_: ArithmeticException) { Long.MAX_VALUE }
+                        if (pages > view.cut.supportCount.toLong() + 1L) failed = true
+                    }
+                }
+            } while (!failed && cursor != null)
+            if (failed) null else SupportDetails(Collections.unmodifiableList(values), records)
+        }
+
+    private fun readSourcePage(
+        source: SurfaceId,
+        cache: DepthBatchReadCache? = null,
+    ): CanonicalPageRead<PagedSource?> {
+        val read = cache?.readSourceById(source) { view.readSourceById(source) }
+            ?: view.readSourceById(source)
+        if (read is CanonicalPageRead.Complete) {
+            pageFaults += read.pageFaults
+            bytesRead += read.bytesRead
+        }
+        return read
     }
 
     private fun prepareEvidenceBatch(command: CanonicalEvidenceBatchCommand): CanonicalMutationPreparation {
@@ -1006,7 +1118,8 @@ internal class MutableCanonicalOverlay private constructor(
         if (command.changes.size > configuration.surfaceCapacity + configuration.lineageCapacity) {
             return refuse(CanonicalMutationRefusal.CAPACITY)
         }
-        val preflight = when (val result = depthBatchPreflight(command, scalars)) {
+        val readCache = DepthBatchReadCache()
+        val preflight = when (val result = depthBatchPreflight(command, scalars, readCache)) {
             is DepthBatchPreflightResult.Refused -> return refuse(result.reason)
             is DepthBatchPreflightResult.Complete -> result.value
         }
@@ -1056,7 +1169,8 @@ internal class MutableCanonicalOverlay private constructor(
         val sourceRows = HashMap<SurfaceId, CompactSurface>(sources.size)
         sources.forEach { source ->
             directLookups++
-            val row = view.findById(source) ?: return refuse(CanonicalMutationRefusal.UNKNOWN_IDENTITY)
+            val row = readCache.findById(source) { view.findById(source) }
+                ?: return refuse(CanonicalMutationRefusal.UNKNOWN_IDENTITY)
             sourceRows[source] = row
         }
         operations.filter { it.kind == DepthBatchOperationKind.REFINE }.forEach { operation ->
@@ -1076,7 +1190,7 @@ internal class MutableCanonicalOverlay private constructor(
             val namedSource = target.id?.let(sourceRows::get)
             val occupied = if (namedSource?.voxel == target.voxel) namedSource else {
                 directLookups++
-                view.findByVoxel(target.voxel)
+                readCache.findByVoxel(target.voxel) { view.findByVoxel(target.voxel) }
             }
             if (occupied != null && occupied.id !in vacated && occupied.id != target.id) {
                 return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
@@ -1092,34 +1206,17 @@ internal class MutableCanonicalOverlay private constructor(
 
         val removedLineageRecords = preflight.removedLineageRecords
 
-        data class SupportDetails(val values: List<ImmutableSourceSupport>, val records: Int)
         val details = HashMap<SurfaceId, SupportDetails>()
         fun readDetails(source: SurfaceId): SupportDetails? {
             details[source]?.let { return it }
-            var cursor: SourceSupportCursor? = null
-            val values = ArrayList<ImmutableSourceSupport>()
-            var records = 0
-            var pages = 0L
-            do {
-                val read = completeView().visitSourceSupport(source, cursor) { support ->
-                    records++
-                    if (records > sourceCapacity().coerceAtMost(Int.MAX_VALUE.toLong())) return@visitSourceSupport false
-                    values += support.source.toImmutableSupport()
-                    true
-                }
-                when (read) {
-                    is SourceSupportRead.Refused -> return null
-                    is SourceSupportRead.Complete -> {
-                        pageFaults += read.pageFaults; bytesRead += read.bytesRead; cursor = read.nextCursor
-                        if (++pages > view.cut.supportCount.toLong() + 1L) return null
-                    }
-                }
-            } while (cursor != null)
-            if (values.isEmpty()) {
-                val sourceValue = readAllocationSource(source) ?: return null
-                values += sourceValue.toImmutableSupport()
+            val raw = readRawSupportDetails(source, readCache) ?: return null
+            val values = if (raw.values.isEmpty()) {
+                val sourceValue = readAllocationSource(source, readCache) ?: return null
+                listOf(sourceValue.toImmutableSupport())
+            } else {
+                raw.values
             }
-            return SupportDetails(Collections.unmodifiableList(values), records).also { details[source] = it }
+            return SupportDetails(values, raw.records).also { details[source] = it }
         }
         structuralSources.forEach { source -> if (readDetails(source) == null) return refuse(CanonicalMutationRefusal.SOURCE_READ_FAILURE) }
 
@@ -1138,7 +1235,7 @@ internal class MutableCanonicalOverlay private constructor(
                 ?: return refuse(CanonicalMutationRefusal.INVALID_OWNERSHIP)
             val normal = packed(target) ?: return refuse(CanonicalMutationRefusal.INVALID_NORMAL)
             val id = SurfaceId(allocatedIds[index])
-            val fingerprint = if (target.id == null) commandHash else readAllocationFingerprint(id)
+            val fingerprint = if (target.id == null) commandHash else readAllocationFingerprint(id, readCache)
                 ?: return refuse(CanonicalMutationRefusal.SOURCE_READ_FAILURE)
             rows += SurfaceOwner(id, view.cut.group, target.voxel, location.region, location.page,
                 normal.first, normal.second, fingerprint)
@@ -1266,12 +1363,10 @@ internal class MutableCanonicalOverlay private constructor(
         )
     }
 
-    private fun readAllocationSource(id: SurfaceId): PagedSource? =
-        when (val read = view.readSourceById(id)) {
+    private fun readAllocationSource(id: SurfaceId, cache: DepthBatchReadCache? = null): PagedSource? =
+        when (val read = readSourcePage(id, cache)) {
             is CanonicalPageRead.Refused -> null
-            is CanonicalPageRead.Complete -> {
-                pageFaults += read.pageFaults; bytesRead += read.bytesRead; read.value
-            }
+            is CanonicalPageRead.Complete -> read.value
         }
 
     private fun PagedSource.toImmutableSupport() =
@@ -1298,6 +1393,8 @@ internal class MutableCanonicalOverlay private constructor(
         private const val DEPTH_OPERATION_GRAPH_BYTES = 64L
         private const val DEPTH_SUPPORT_DETAILS_BYTES_PER_RECORD = 128L
         private const val DEPTH_SUPPORT_SCRATCH_BYTES_PER_RECORD = 8L
+        private const val DEPTH_SUPPORT_CACHE_FIXED_BYTES = 64L
+        private const val DEPTH_SUPPORT_CACHE_ENTRY_BYTES = 128L
 
         fun prepare(view: CanonicalStateView, configuration: SurfaceOwnershipConfiguration, command: FeatureMutationCommand) =
             MutableCanonicalOverlay(view, configuration).prepareFeature(command)
