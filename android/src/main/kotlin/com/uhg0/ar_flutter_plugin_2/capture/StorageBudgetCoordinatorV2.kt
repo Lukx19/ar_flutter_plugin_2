@@ -591,7 +591,7 @@ class StorageBudgetCoordinatorV2(
     private fun verifiedReclaimFile(reclaimId: String) =
         files.child("reclaims-v2", "verified-$reclaimId.reclaim")
     private fun sha256(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes)
-    private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
+    private fun ByteArray.hex() = toCaptureHashHex()
 
     private fun candidateRelativePath(candidate: File): String {
         val root = requireNotNull(ledger.parentFile).absoluteFile.toPath().normalize()

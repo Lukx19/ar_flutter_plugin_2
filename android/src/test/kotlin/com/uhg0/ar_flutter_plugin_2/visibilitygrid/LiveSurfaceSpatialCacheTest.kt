@@ -4,6 +4,74 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class LiveSurfaceSpatialCacheTest {
+    @Test fun `empty child certificates require the exact completely indexed cut`() {
+        val cache = LiveSurfaceSpatialCache(16, 100_000)
+        assertFalse(cache.isKnownEmptyBlock(0, 0, 0, 0, 0))
+        cache.certifyCurrent(0, 0)
+        assertTrue(cache.isKnownEmptyBlock(0, 0, 0, 0, 0))
+        cache.upsert(SurfaceId(1), Voxel(0, 0, 0))
+        assertFalse(cache.isKnownEmptyBlock(1, 0, 0, 0, 0))
+        cache.certifyCurrent(1, 0)
+        assertFalse(cache.isKnownEmptyBlock(0, 0, 0, 1, 0))
+        assertTrue(cache.isKnownEmptyBlock(1, 0, 0, 1, 0, 2))
+        assertFalse(cache.isKnownEmptyBlock(1, 0, 0, 0, 0))
+        assertFalse(cache.isKnownEmptyBlock(1, 0, 0, 1, 1))
+        // Same-parent movement must add the new child even when no block chain changes.
+        cache.upsert(SurfaceId(1), Voxel(4, 0, 0))
+        cache.certifyCurrent(2, 0)
+        assertFalse(cache.isKnownEmptyBlock(1, 0, 0, 2, 0))
+        cache.remove(SurfaceId(1))
+        cache.certifyCurrent(3, 0)
+        assertTrue(cache.isKnownEmptyBlock(1, 0, 0, 3, 0))
+        val replacement = LiveSurfaceSpatialCache(16, 100_000)
+        replacement.upsert(SurfaceId(1), Voxel(0, 0, 0))
+        replacement.certifyCurrent(0, 0)
+        assertTrue(replacement.isKnownEmptyBlock(1, 0, 0, 0, 0, 2))
+    }
+
+    @Test fun `partially occupied signed parents certify only empty voxel and two voxel children`() {
+        for (origin in listOf(0, -4)) {
+            val cache = LiveSurfaceSpatialCache(16, 100_000)
+            cache.upsert(SurfaceId(1), Voxel(origin + 3, origin + 3, origin + 3))
+            cache.certifyCurrent(1, 0)
+            assertFalse(cache.isKnownEmptyBlock(Math.floorDiv(origin, 4), Math.floorDiv(origin, 4), Math.floorDiv(origin, 4), 1, 0))
+            for (x in origin until origin + 4) for (y in origin until origin + 4) for (z in origin until origin + 4) {
+                assertEquals(x != origin + 3 || y != origin + 3 || z != origin + 3,
+                    cache.isKnownEmptyBlock(x, y, z, 1, 0, 1))
+            }
+            val first = Math.floorDiv(origin, 2)
+            for (x in first..first + 1) for (y in first..first + 1) for (z in first..first + 1) {
+                assertEquals(x != first + 1 || y != first + 1 || z != first + 1,
+                    cache.isKnownEmptyBlock(x, y, z, 1, 0, 2))
+            }
+        }
+    }
+
+    @Test fun `shared child masks remain conservative through collisions deletion reuse and backshift`() {
+        val cache = LiveSurfaceSpatialCache(128, 100_000)
+        val bytes = cache.retainedPrimitiveBytes
+        val occupied = mutableMapOf<SurfaceId, Voxel>()
+        repeat(24) { pass ->
+            repeat(128) { index ->
+                val id = SurfaceId(index + 1L)
+                if (index % 3 == 0) cache.remove(id)
+                val voxel = Voxel(
+                    ((index * 17 + pass * 131) % 4_096 - 2_048) * 16 + (index % 4) * 4,
+                    ((index * 11 + pass) % 17 - 8) * 16 + ((index / 4) % 4) * 4,
+                    (pass - 12) * 16 + ((index / 16) % 4) * 4,
+                )
+                occupied[id] = voxel
+                cache.upsert(id, voxel)
+            }
+            cache.certifyCurrent(pass.toLong(), pass.toLong())
+            for ((_, voxel) in occupied) assertFalse("pass=$pass voxel=$voxel", cache.isKnownEmptyBlock(
+                Math.floorDiv(voxel.x, 4), Math.floorDiv(voxel.y, 4), Math.floorDiv(voxel.z, 4),
+                pass.toLong(), pass.toLong(),
+            ))
+            assertEquals(bytes, cache.retainedPrimitiveBytes)
+        }
+    }
+
     private val camera = VisibilityCameraIntrinsics(640, 480, 500.0, 500.0, 320.0, 240.0)
     private fun pose(x: Double = 0.0, reverse: Boolean = false): List<Double> = listOf(
         if (reverse) -1.0 else 1.0, 0.0, 0.0, 0.0,
@@ -88,7 +156,7 @@ class LiveSurfaceSpatialCacheTest {
 
     @Test fun `full cache reuses vacated block buckets during repeated row movement`() {
         val cache = LiveSurfaceSpatialCache(100_000, 100_000)
-        assertTrue(cache.retainedPrimitiveBytes < 7L * 1024 * 1024)
+        assertEquals(7_747_176L, cache.retainedPrimitiveBytes)
         repeat(100_000) { i -> cache.upsert(SurfaceId(i + 1L), Voxel(i * 16, 0, 0)) }
         // Deliberately move every row before refreshing the window. Old empty
         // buckets must not accumulate and exhaust the smaller primitive table.

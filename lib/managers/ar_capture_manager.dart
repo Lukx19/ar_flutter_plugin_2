@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -384,6 +383,15 @@ class ARCaptureManager {
     return _initializationFuture ??= _initializePlatformChannel();
   }
 
+  /// Wait for native shared-camera initialization and recovery ordering before
+  /// issuing a runtime control request. Concurrent controls share the existing
+  /// initialization future instead of starting another native startup path.
+  Future<void> _ensureRuntimeControlsInitialized() async {
+    if (isEnabled) {
+      await _ensureInitialized();
+    }
+  }
+
   Future<void> _initializePlatformChannel() async {
     try {
       // Validate configuration before initializing
@@ -492,13 +500,29 @@ class ARCaptureManager {
     }
   }
 
-  /// Returns a lightweight native resource snapshot for release diagnostics.
-  Future<Map<String, dynamic>?> getPerformanceSnapshot() async {
+  /// Returns current capture counters, scratch, heap and safety fields.
+  /// Android process PSS, file-descriptor and Java-thread counts are diagnostic
+  /// cached values: demand refresh at most every 5 s, null before the first
+  /// sample or once older than 10 s. `processTelemetryAgeMs` and refresh flags
+  /// describe freshness; thread count still uses Java getAllStackTraces size.
+  /// Debug timing arguments are ignored on non-debuggable Android builds.
+  /// Reset before measurement; serialize timing records only after its counters
+  /// are frozen. Ordinary calls neither reset nor serialize the timing ledger.
+  Future<Map<String, dynamic>?> getPerformanceSnapshot({
+    bool resetDiagnosticTiming = false,
+    bool includeDiagnosticTiming = false,
+  }) async {
     _throwIfDisposed();
     try {
       await _ensureInitialized();
       final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
         'getPerformanceSnapshot',
+        (resetDiagnosticTiming || includeDiagnosticTiming)
+            ? <String, bool>{
+                'resetDiagnosticTiming': resetDiagnosticTiming,
+                'includeDiagnosticTiming': includeDiagnosticTiming,
+              }
+            : null,
       );
       return result == null ? null : _deepCastMap(result);
     } on PlatformException catch (error) {
@@ -664,6 +688,41 @@ class ARCaptureManager {
     }
   }
 
+  /// Seeds one bounded, generation-fenced pose for the debug-only tablet
+  /// campaign. The native response remains tagged as synthetic and never
+  /// changes the ordinary ARCore tracking stream.
+  Future<ARFramePose> debugBeginSyntheticPoseFixture({
+    required int bindingGeneration,
+    required int groupGeneration,
+  }) async {
+    _throwIfDisposed();
+    if (bindingGeneration <= 0) {
+      throw ArgumentError.value(bindingGeneration, 'bindingGeneration');
+    }
+    if (groupGeneration <= 0) {
+      throw ArgumentError.value(groupGeneration, 'groupGeneration');
+    }
+    await _ensureInitialized();
+    final raw = await _channel.invokeMethod<Object?>(
+      'debugSyntheticPoseFixture',
+      <String, Object?>{
+        'bindingGeneration': bindingGeneration,
+        'groupGeneration': groupGeneration,
+      },
+    );
+    final pose = ARFramePose.fromMap(_deepCastMap(raw));
+    if (pose.poseSource != 'synthetic') {
+      throw const FormatException(
+          'Synthetic pose fixture response was missing its source tag.');
+    }
+    return pose;
+  }
+
+  Future<void> debugClearSyntheticPoseFixture() async {
+    _throwIfDisposed();
+    await _channel.invokeMethod<void>('debugClearSyntheticPoseFixture');
+  }
+
   @visibleForTesting
   Future<void> debugAdvanceNativeCaptureRecoveryV2() =>
       _channel.invokeMethod<void>('debugNativeCaptureV2AdvanceRecovery');
@@ -826,6 +885,7 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       // Validate against supported ISO range from capabilities
       final supportedISORange = await getSupportedISORange();
       if (supportedISORange != null && supportedISORange.isNotEmpty) {
@@ -870,6 +930,7 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       // Validate against supported exposure range from capabilities
       final supportedRange = await getSupportedExposureRange();
       if (supportedRange != null && supportedRange.isNotEmpty) {
@@ -919,6 +980,7 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       return await _channel.invokeMethod('getCurrentISO');
     } on PlatformException catch (e) {
       throw _captureExceptionFromPlatformException(
@@ -933,6 +995,7 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final int? microseconds = await _channel.invokeMethod(
         'getCurrentExposureTime',
       );
@@ -953,6 +1016,7 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final List<dynamic>? result = await _channel.invokeMethod(
         'getSupportedISORange',
       );
@@ -970,6 +1034,7 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
         'getSupportedExposureRange',
       );
@@ -993,6 +1058,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final bool result = await _channel.invokeMethod(
         'setAutoExposureEnabled',
         {'enabled': enabled},
@@ -1019,6 +1085,7 @@ class ARCaptureManager {
     }
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
         'getCurrentExposureState',
       );
@@ -1045,6 +1112,7 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
         'getExposureCompensationInfo',
       );
@@ -1067,6 +1135,7 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
         'setExposureCompensation',
         {'evStep': evStep},
@@ -1092,6 +1161,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final bool result = await _channel.invokeMethod('lockExposure');
 
       return result;
@@ -1108,6 +1178,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final bool result = await _channel.invokeMethod('unlockExposure');
 
       return result;
@@ -1133,6 +1204,7 @@ class ARCaptureManager {
     distance = distance.clamp(0.0, 1.0);
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
         'setFocusDistance',
         {'distance': distance},
@@ -1158,6 +1230,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final bool result = await _channel.invokeMethod('setAutofocusEnabled', {
         'enabled': enabled,
       });
@@ -1176,6 +1249,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final bool result = await _channel.invokeMethod('focusAtPoint', {
         'x': screenPoint.dx,
         'y': screenPoint.dy,
@@ -1203,6 +1277,7 @@ class ARCaptureManager {
     }
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
         'getCurrentFocusState',
       );
@@ -1230,6 +1305,7 @@ class ARCaptureManager {
     if (!isEnabled) return [FocusMode.auto];
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final List<dynamic> result = await _channel.invokeMethod(
         'getSupportedFocusModes',
       );
@@ -1254,6 +1330,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final bool result = await _channel.invokeMethod('setFocusMode', {
         'mode': mode.name,
       });
@@ -1277,6 +1354,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final bool result = await _channel.invokeMethod('setWhiteBalanceMode', {
         'mode': mode.name,
       });
@@ -1295,6 +1373,7 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       // Validate against supported temperature range
       final supportedRange = await getSupportedColorTemperatureRange();
       if (supportedRange != null && supportedRange.isNotEmpty) {
@@ -1342,6 +1421,7 @@ class ARCaptureManager {
     }
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
         'getCurrentWhiteBalanceState',
       );
@@ -1370,6 +1450,7 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
         'getSupportedColorTemperatureRange',
       );
@@ -1393,6 +1474,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final bool result = await _channel.invokeMethod('lockWhiteBalance');
 
       return result;
@@ -1409,6 +1491,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final bool result = await _channel.invokeMethod('unlockWhiteBalance');
 
       return result;
@@ -1425,6 +1508,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final bool result = await _channel.invokeMethod(
         'setWhiteBalanceFromPoint',
         {'x': screenPoint.dx, 'y': screenPoint.dy},
@@ -1444,6 +1528,7 @@ class ARCaptureManager {
     if (!isEnabled) return [WhiteBalanceMode.auto];
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final List<dynamic> result = await _channel.invokeMethod(
         'getSupportedWhiteBalanceModes',
       );
@@ -1472,6 +1557,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       // Check flash availability first
       final isAvailable = await isFlashAvailable();
       if (!isAvailable && mode != FlashMode.off) {
@@ -1504,6 +1590,7 @@ class ARCaptureManager {
     }
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
         'getCurrentFlashState',
       );
@@ -1530,6 +1617,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       return await _channel.invokeMethod('isFlashAvailable');
     } on PlatformException catch (e) {
       throw _captureExceptionFromPlatformException(
@@ -1544,6 +1632,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       // Check flash availability first
       if (enabled && !await isFlashAvailable()) {
         debugPrint('Flash not available, cannot enable torch');
@@ -1802,7 +1891,6 @@ class ARCaptureManager {
           break;
         case QuickProfileType.auto:
         case QuickProfileType.macro:
-        default:
           // Use auto settings for unsupported types
           return await _applyAutoProfile();
       }

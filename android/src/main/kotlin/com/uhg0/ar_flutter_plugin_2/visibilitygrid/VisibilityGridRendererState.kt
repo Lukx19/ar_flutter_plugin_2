@@ -276,18 +276,47 @@ class VisibilityGridRendererState(
             override val capacity: Int get() = this@VisibilityGridRendererState.capacity
             override val qualifier: CoverageRowsQualifier = expected
 
+            override fun surfaceIdAt(index: Int): Long { require(index in 0 until count); return surfaceIds[index] }
+            override fun keyAt(index: Int): Long { require(index in 0 until count); return voxelKeys[index] }
+            override fun positionComponentAt(index: Int, component: Int): Float {
+                require(index in 0 until count)
+                return positionComponent(index, component)
+            }
+            override fun colorAt(index: Int): Int {
+                require(index in 0 until count)
+                return this@VisibilityGridRendererState.colorAt(index)
+            }
+            override fun styleFlagsAt(index: Int): Int {
+                require(index in 0 until count)
+                val offset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
+                CoverageRendererStyleRowV1.validateEncoded(styleRows, offset)
+                return styleRows[offset + 1].toInt() and 0xff
+            }
+            override fun copyStyleAt(index: Int, destination: ByteArray, offset: Int) {
+                require(index in 0 until count)
+                val source = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
+                CoverageRendererStyleRowV1.validateEncoded(styleRows, source)
+                styleRows.copyInto(destination, offset, source, source + COVERAGE_RENDERER_STYLE_ROW_BYTES)
+            }
+            override fun packedNormalAt(index: Int): Int {
+                require(index in 0 until count)
+                return if (retainCanonicalNormalMetadata) packedNormals[index] else 0
+            }
+            override fun normalConfidenceAt(index: Int): Int {
+                require(index in 0 until count)
+                return if (retainCanonicalNormalMetadata) normalConfidences[index] else 0
+            }
             override fun rowAt(index: Int): CoverageCommittedRow {
                 require(index in 0 until count)
-                val position = index * POSITION_COMPONENTS
-                val styleOffset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
+                val style = CoverageRendererStyleRowV1.decode(styleRows, index * COVERAGE_RENDERER_STYLE_ROW_BYTES)
                 return CoverageCommittedRow(
                     surfaceId = surfaceIds[index],
                     key = voxelKeys[index],
                     x = positionComponent(index, 0),
                     y = positionComponent(index, 1),
                     z = positionComponent(index, 2),
-                    color = colorAt(index),
-                    style = CoverageRendererStyleRowV1.decode(styleRows, styleOffset),
+                    color = if (retainWorldPositions) colors[index] else style.packedColor(),
+                    style = style,
                 )
             }
         }
@@ -898,11 +927,12 @@ class VisibilityGridRendererState(
                 source * COVERAGE_RENDERER_STYLE_ROW_BYTES,
                 (source + 1) * COVERAGE_RENDERER_STYLE_ROW_BYTES,
             )
-            CoverageRendererStyleRowV1.decode(styles, destination * COVERAGE_RENDERER_STYLE_ROW_BYTES)
-                .copy(palette = palette).encode().copyInto(
-                    styles,
-                    destination * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-                )
+            val styleOffset = destination * COVERAGE_RENDERER_STYLE_ROW_BYTES
+            CoverageRendererStyleRowV1.validateEncoded(styles, styleOffset)
+            if ((styles[styleOffset + 2].toInt() and 0xf) != palette.code) {
+                CoverageRendererStyleRowV1.decode(styles, styleOffset)
+                    .copy(palette = palette).encodeInto(styles, styleOffset)
+            }
         }
         val pageReader: (CoverageRowsQualifier, Int, Int) -> CoveragePresentationPage? =
             { pageExpected, start, maximum ->
@@ -917,21 +947,18 @@ class VisibilityGridRendererState(
                     repeat(pageCount) { offset ->
                         val destination = start + offset
                         val source = slots[destination]
-                        val row = rows.rowAt(source)
-                        pageIds[offset] = row.surfaceId
-                        pagePositions[offset * 3] = row.x
-                        pagePositions[offset * 3 + 1] = row.y
-                        pagePositions[offset * 3 + 2] = row.z
+                        val surfaceId = rows.surfaceIdAt(source)
+                        pageIds[offset] = surfaceId
+                        pagePositions[offset * 3] = rows.positionComponentAt(source, 0)
+                        pagePositions[offset * 3 + 1] = rows.positionComponentAt(source, 1)
+                        pagePositions[offset * 3 + 2] = rows.positionComponentAt(source, 2)
                         styles.copyInto(
                             pageStyles,
                             offset * COVERAGE_RENDERER_STYLE_ROW_BYTES,
                             destination * COVERAGE_RENDERER_STYLE_ROW_BYTES,
                             (destination + 1) * COVERAGE_RENDERER_STYLE_ROW_BYTES,
                         )
-                        pageColors[offset] = CoverageRendererStyleRowV1.decode(
-                            pageStyles,
-                            offset * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-                        ).packedColor()
+                        pageColors[offset] = CoverageRendererStyleRowV1.validatedPackedColor(pageStyles, offset * COVERAGE_RENDERER_STYLE_ROW_BYTES)
                     }
                     page = CoveragePresentationPage(
                         startSlot = start,
@@ -1013,7 +1040,7 @@ class VisibilityGridRendererState(
             lineageCounts[row] = lineageCount
         }
         val initialStyle = CoverageRendererStyleRowV1()
-        initialStyle.encode().copyInto(styleRows, row * COVERAGE_RENDERER_STYLE_ROW_BYTES)
+        initialStyle.encodeInto(styleRows, row * COVERAGE_RENDERER_STYLE_ROW_BYTES)
         setColor(row, initialStyle.packedColor())
         writePosition(row, voxelKey)
         rowsByIdentity[identity] = row
@@ -1140,11 +1167,11 @@ class VisibilityGridRendererState(
         require(component in 0..2)
         if (retainWorldPositions) return positions[row * 3 + component]
         val active = checkNotNull(group)
-        val coordinates = unpackVisibilityGridKey(voxelKeys[row])
+        val key = voxelKeys[row]
         val half = active.voxelSizeMeters / 2.0
-        val x = coordinates[0] * active.voxelSizeMeters + half
-        val y = coordinates[1] * active.voxelSizeMeters + half
-        val z = coordinates[2] * active.voxelSizeMeters + half
+        val x = visibilityGridCoordinate(key, 0) * active.voxelSizeMeters + half
+        val y = visibilityGridCoordinate(key, 1) * active.voxelSizeMeters + half
+        val z = visibilityGridCoordinate(key, 2) * active.voxelSizeMeters + half
         val matrix = active.worldFromGroupGl
         return when (component) {
             0 -> (matrix[0] * x + matrix[4] * y + matrix[8] * z + matrix[12]).toFloat()
@@ -1156,10 +1183,7 @@ class VisibilityGridRendererState(
     private fun colorAt(row: Int): Int = if (retainWorldPositions) {
         colors[row]
     } else {
-        CoverageRendererStyleRowV1.decode(
-            styleRows,
-            row * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-        ).packedColor()
+        CoverageRendererStyleRowV1.validatedPackedColor(styleRows, row * COVERAGE_RENDERER_STYLE_ROW_BYTES)
     }
 
     private fun setColor(row: Int, value: Int) {
@@ -1179,11 +1203,10 @@ class VisibilityGridRendererState(
     private fun writePosition(row: Int, key: Long) {
         if (!retainWorldPositions) return
         val active = checkNotNull(group)
-        val coordinates = unpackVisibilityGridKey(key)
         val half = active.voxelSizeMeters / 2.0
-        val x = coordinates[0] * active.voxelSizeMeters + half
-        val y = coordinates[1] * active.voxelSizeMeters + half
-        val z = coordinates[2] * active.voxelSizeMeters + half
+        val x = visibilityGridCoordinate(key, 0) * active.voxelSizeMeters + half
+        val y = visibilityGridCoordinate(key, 1) * active.voxelSizeMeters + half
+        val z = visibilityGridCoordinate(key, 2) * active.voxelSizeMeters + half
         val matrix = active.worldFromGroupGl
         positions[row * 3] =
             (matrix[0] * x + matrix[4] * y + matrix[8] * z + matrix[12]).toFloat()

@@ -1,20 +1,91 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
 import java.util.Collections
+import java.util.AbstractList
 import kotlin.math.floor
 
 /** Candidate-A feature fusion behind one state-owning admission interface. */
 internal class FeatureFusionKernel(
     private val operations: FeatureFusionOperations = JvmFeatureFusionOperations,
 ) {
+    /**
+     * Resolves an exact canonical allocation receipt from the source authority.
+     * The caller supplies the cut and binding generation captured when the
+     * kernel was attached; an authority that has moved on must return null.
+     * Implementations run on the serial canonical lane and must not retain a
+     * lease or allocate a source-sized index of their own.
+     */
+    internal fun interface CanonicalFingerprintResolver {
+        fun resolve(
+            sourceId: Long,
+            expectedGeometryRevision: Long,
+            expectedLineageRevision: Long,
+            expectedGeneration: Long,
+        ): CanonicalReceiptBytes?
+    }
+
+    private var fingerprintResolver: CanonicalFingerprintResolver? = null
+    private var fingerprintGeometryRevision = 0L
+    private var fingerprintLineageRevision = 0L
+    private var fingerprintGeneration = 0L
+    /**
+     * Direct kernels in the pure reference tests have no canonical authority.
+     * This sparse fallback is cleared as soon as production binds a resolver;
+     * it is deliberately not part of the production steady-state ownership.
+     */
+    private val fixtureCurrentFingerprintBacking = HashMap<Int, CanonicalReceiptBytes>()
+    private val fixtureHistoricalFingerprintBacking = HashMap<Int, CanonicalReceiptBytes>()
+
+    /** Binds a cut-scoped source authority before the first production admission. */
+    @Synchronized
+    internal fun bindCanonicalFingerprintResolver(
+        resolver: CanonicalFingerprintResolver,
+        geometryRevision: Long,
+        lineageRevision: Long,
+        generation: Long,
+    ) {
+        require(geometryRevision >= 0L && lineageRevision >= 0L && generation >= 0L)
+        fingerprintResolver = resolver
+        fingerprintGeometryRevision = geometryRevision
+        fingerprintLineageRevision = lineageRevision
+        fingerprintGeneration = generation
+        fixtureCurrentFingerprintBacking.clear()
+        fixtureHistoricalFingerprintBacking.clear()
+    }
+
     private val normalEncoder = FeatureNormalOctEncoder()
+    /*
+     * Packed ingress is consumed through these bounded primitive columns.  The
+     * columns are owned by this serial kernel and are only live while
+     * preparePacked is staging; no FeatureFusionEvidence or
+     * FeatureNormalEvidence object is created for a packed point.
+     */
+    private val packedVoxelX = IntArray(V2_FEATURE_SAMPLE_CAPACITY)
+    private val packedVoxelY = IntArray(V2_FEATURE_SAMPLE_CAPACITY)
+    private val packedVoxelZ = IntArray(V2_FEATURE_SAMPLE_CAPACITY)
+    private val packedSupportIds = IntArray(V2_FEATURE_SAMPLE_CAPACITY)
+    private val packedSignedWeights = IntArray(V2_FEATURE_SAMPLE_CAPACITY)
+    private val packedAxisXQ15 = IntArray(V2_FEATURE_SAMPLE_CAPACITY)
+    private val packedAxisYQ15 = IntArray(V2_FEATURE_SAMPLE_CAPACITY)
+    private val packedAxisZQ15 = IntArray(V2_FEATURE_SAMPLE_CAPACITY)
+    private val packedPositiveSide = BooleanArray(V2_FEATURE_SAMPLE_CAPACITY)
+    private val packedSupportQ13 = IntArray(V2_FEATURE_SAMPLE_CAPACITY)
+    private val packedOrder = IntArray(V2_FEATURE_SAMPLE_CAPACITY)
+    private var packedNormalizedCount = 0
+    private val packedDirectionCacheKeys = LongArray(PACKED_DIRECTION_CACHE_CAPACITY) { Long.MIN_VALUE }
+    private val packedDirectionCacheDirect = IntArray(PACKED_DIRECTION_CACHE_CAPACITY)
+    private val packedDirectionCacheOpposite = IntArray(PACKED_DIRECTION_CACHE_CAPACITY)
+    private val packedDirectionScratch = IntArray(3)
+    private val packedNegatedDirectionScratch = IntArray(3)
+    private val packedNormalizedEvidence = PackedNormalizedEvidenceList()
+
     /** Stages one immutable batch without changing retained state. */
     internal fun prepare(batch: FeatureFusionBatch): FeatureFusionResult {
         check(pending == null) { "a prepared kernel batch is already outstanding" }
         val staged = try {
             when (val normalization = normalize(batch)) {
                 is Normalization.Refused -> return refused(normalization.reason)
-                is Normalization.Accepted -> stage(normalization.evidence, batch)
+                is Normalization.Accepted -> stage(normalization.evidence, batch.sequence, batch.timestampNs)
             }
         } catch (_: FeatureFusionAllocationFailure) {
             return refused(FeatureFusionRefusal.ALLOCATION)
@@ -25,6 +96,35 @@ internal class FeatureFusionKernel(
         staged as Staging.Accepted
 
         pending = PendingApplication(staged, batch.sequence, batch.timestampNs)
+        return staged.result
+    }
+
+    /** Stages a packed producer lease without materialising per-point model objects. */
+    internal fun preparePacked(
+        observation: VisibilityFeatureObservation,
+        sequence: Long = observation.frame.frameSequence,
+    ): FeatureFusionResult {
+        val packed = observation.packedSamples ?: return refused(FeatureFusionRefusal.INVALID_NORMAL_EVIDENCE)
+        check(pending == null) { "a prepared kernel batch is already outstanding" }
+        val normalized = try {
+            normalizePacked(observation, sequence)
+        } catch (_: FeatureFusionAllocationFailure) {
+            return refused(FeatureFusionRefusal.ALLOCATION)
+        } catch (_: OutOfMemoryError) {
+            return refused(FeatureFusionRefusal.ALLOCATION)
+        }
+        if (normalized is Normalization.Refused) return refused(normalized.reason)
+        val acceptedNormalization = normalized as Normalization.Accepted
+        val staged = try {
+            stage(acceptedNormalization.evidence, sequence, observation.frame.sourceTimestampNs)
+        } catch (_: FeatureFusionAllocationFailure) {
+            return refused(FeatureFusionRefusal.ALLOCATION)
+        } catch (_: OutOfMemoryError) {
+            return refused(FeatureFusionRefusal.ALLOCATION)
+        }
+        if (staged is Staging.Refused) return refused(staged.reason)
+        staged as Staging.Accepted
+        pending = PendingApplication(staged, sequence, observation.frame.sourceTimestampNs)
         return staged.result
     }
 
@@ -84,10 +184,15 @@ internal class FeatureFusionKernel(
             val slot = prepared.slots[index]
             canonicalIds[slot] = prepared.targetIds[index].toInt()
             if (prepared.hasCanonicalMetadata[index]) {
-                prepared.fingerprints.copyInto(
-                    canonicalAllocationFingerprints, slot * HASH_BYTES,
-                    index * HASH_BYTES, (index + 1) * HASH_BYTES,
-                )
+                currentFingerprintSourceIds[slot] = prepared.targetIds[index].toInt()
+                if (fingerprintResolver == null) {
+                    rememberFixtureCurrentFingerprint(
+                        slot,
+                        CanonicalReceiptBytes(prepared.fingerprints.copyOfRange(
+                            index * HASH_BYTES, (index + 1) * HASH_BYTES,
+                        )),
+                    )
+                }
                 accumulatedWeights[slot] = encodeWeightAndCanonical(
                     retainedWeight(slot), prepared.packedNormals[index], prepared.normalConfidences[index],
                 )
@@ -133,6 +238,9 @@ internal class FeatureFusionKernel(
                 (canonicalIds[slot].toLong() and UINT32_MASK) != previous
             ) {
                 return CanonicalRemapStage.Refused(FeatureCanonicalRemapRefusal.STALE_PREVIOUS_ID)
+            }
+            if (canonicalCorrelation(slot) == null || featureEvidenceAllocationFingerprint(slot) == null) {
+                return CanonicalRemapStage.Refused(FeatureCanonicalRemapRefusal.CANONICAL_PROVENANCE)
             }
             val target = remap.nextSurfaceId?.value ?: 0L
             if (target !in 0L..UINT32_MASK || (remap.nextSurfaceId != null && target == 0L)) {
@@ -268,22 +376,30 @@ internal class FeatureFusionKernel(
         for ((assignmentIndex, assignment) in assignments.withIndex()) {
             if (canonicalIds[assignment.kernelSlot] == 0) {
                 canonicalIds[assignment.kernelSlot] = assignment.id.value.toInt()
-                requireNotNull(prepared.canonicalFingerprints).copyInto(
-                    featureEvidenceAllocationFingerprints,
-                    assignment.kernelSlot * HASH_BYTES,
-                    assignmentIndex * HASH_BYTES,
-                    (assignmentIndex + 1) * HASH_BYTES,
-                )
+            }
+            if (featureEvidenceSourceIds[assignment.kernelSlot] == 0) {
+                featureEvidenceSourceIds[assignment.kernelSlot] = assignment.id.value.toInt()
+                if (fingerprintResolver == null) {
+                    rememberFixtureHistoricalFingerprint(
+                        assignment.kernelSlot,
+                        CanonicalReceiptBytes(requireNotNull(prepared.canonicalFingerprints).copyOfRange(
+                            assignmentIndex * HASH_BYTES, (assignmentIndex + 1) * HASH_BYTES,
+                        )),
+                    )
+                }
             }
             accumulatedWeights[assignment.kernelSlot] = encodeWeightAndCanonical(
                 retainedWeight(assignment.kernelSlot), assignment.packedNormal, assignment.normalConfidence,
             )
-            requireNotNull(prepared.canonicalFingerprints).copyInto(
-                canonicalAllocationFingerprints,
-                assignment.kernelSlot * HASH_BYTES,
-                assignmentIndex * HASH_BYTES,
-                (assignmentIndex + 1) * HASH_BYTES,
-            )
+            currentFingerprintSourceIds[assignment.kernelSlot] = assignment.id.value.toInt()
+            if (fingerprintResolver == null) {
+                rememberFixtureCurrentFingerprint(
+                    assignment.kernelSlot,
+                    CanonicalReceiptBytes(requireNotNull(prepared.canonicalFingerprints).copyOfRange(
+                        assignmentIndex * HASH_BYTES, (assignmentIndex + 1) * HASH_BYTES,
+                    )),
+                )
+            }
         }
         lastSequence = prepared.sequence
         lastTimestampNs = prepared.timestampNs
@@ -352,7 +468,145 @@ internal class FeatureFusionKernel(
         }
     }
 
-    private fun stage(evidence: List<NormalizedEvidence>, batch: FeatureFusionBatch): Staging = try {
+    /**
+     * Packed feature normalization writes directly into the kernel's bounded
+     * primitive columns.  The staging list is a scalar view over those columns
+     * and is consumed synchronously; it never owns the producer lease.
+     */
+    private fun normalizePacked(
+        observation: VisibilityFeatureObservation,
+        sequence: Long,
+    ): Normalization {
+        val packed = observation.packedSamples ?: return Normalization.Refused(FeatureFusionRefusal.INVALID_NORMAL_EVIDENCE)
+        if (sequence <= lastSequence || observation.frame.sourceTimestampNs <= lastTimestampNs || observation.frame.sourceTimestampNs < 0L) {
+            return Normalization.Refused(FeatureFusionRefusal.STALE_BATCH)
+        }
+        if (packed.count > ASSOCIATION_CAPACITY || packed.count > V2_FEATURE_SAMPLE_CAPACITY) {
+            return Normalization.Refused(FeatureFusionRefusal.ASSOCIATION_CAPACITY)
+        }
+        return operations.allocate(FeatureFusionAllocationCut.NORMALIZATION) {
+            packedNormalizedCount = packed.count
+            packedDirectionCacheKeys.fill(Long.MIN_VALUE)
+            val pose = observation.frame.pose.worldFromCameraGl
+            val cameraX = FeatureNormalEvidence.intMillimeters(pose[12])
+                ?: return@allocate Normalization.Refused(FeatureFusionRefusal.INVALID_NORMAL_EVIDENCE)
+            val cameraY = FeatureNormalEvidence.intMillimeters(pose[13])
+                ?: return@allocate Normalization.Refused(FeatureFusionRefusal.INVALID_NORMAL_EVIDENCE)
+            val cameraZ = FeatureNormalEvidence.intMillimeters(pose[14])
+                ?: return@allocate Normalization.Refused(FeatureFusionRefusal.INVALID_NORMAL_EVIDENCE)
+            for (index in 0 until packed.count) {
+                val sampleXWorld = packed.xWorldAt(index)
+                val sampleYWorld = packed.yWorldAt(index)
+                val sampleZWorld = packed.zWorldAt(index)
+                val x = quantize(sampleXWorld)
+                    ?: return@allocate Normalization.Refused(quantizationRefusal(sampleXWorld))
+                val y = quantize(sampleYWorld)
+                    ?: return@allocate Normalization.Refused(quantizationRefusal(sampleYWorld))
+                val z = quantize(sampleZWorld)
+                    ?: return@allocate Normalization.Refused(quantizationRefusal(sampleZWorld))
+                val sampleX = FeatureNormalEvidence.intMillimeters(sampleXWorld)
+                    ?: return@allocate Normalization.Refused(FeatureFusionRefusal.INVALID_NORMAL_EVIDENCE)
+                val sampleY = FeatureNormalEvidence.intMillimeters(sampleYWorld)
+                    ?: return@allocate Normalization.Refused(FeatureFusionRefusal.INVALID_NORMAL_EVIDENCE)
+                val sampleZ = FeatureNormalEvidence.intMillimeters(sampleZWorld)
+                    ?: return@allocate Normalization.Refused(FeatureFusionRefusal.INVALID_NORMAL_EVIDENCE)
+                val confidence = FeatureNormalEvidence.q15(packed.confidenceAt(index))
+                    ?: return@allocate Normalization.Refused(FeatureFusionRefusal.INVALID_NORMAL_EVIDENCE)
+                if (sampleX == cameraX && sampleY == cameraY && sampleZ == cameraZ) {
+                    return@allocate Normalization.Refused(FeatureFusionRefusal.INVALID_NORMAL_EVIDENCE)
+                }
+                packedDirectionScratch.fill(0)
+                if (!FeatureNormalMath.normalizeQ15Into(
+                        cameraX.toLong() - sampleX,
+                        cameraY.toLong() - sampleY,
+                        cameraZ.toLong() - sampleZ,
+                        packedDirectionScratch,
+                    )
+                ) return@allocate Normalization.Refused(FeatureFusionRefusal.INVALID_NORMAL_EVIDENCE)
+                packedNegatedDirectionScratch[0] = -packedDirectionScratch[0]
+                packedNegatedDirectionScratch[1] = -packedDirectionScratch[1]
+                packedNegatedDirectionScratch[2] = -packedDirectionScratch[2]
+                val cacheKey = packedDirectionKey(packedDirectionScratch)
+                val cacheSlot = findPackedDirectionCacheSlot(cacheKey)
+                val directCode: Int
+                val oppositeCode: Int
+                if (packedDirectionCacheKeys[cacheSlot] == Long.MIN_VALUE) {
+                    directCode = normalEncoder.encode(packedDirectionScratch)
+                    oppositeCode = normalEncoder.encode(packedNegatedDirectionScratch)
+                    packedDirectionCacheKeys[cacheSlot] = cacheKey
+                    packedDirectionCacheDirect[cacheSlot] = directCode
+                    packedDirectionCacheOpposite[cacheSlot] = oppositeCode
+                } else {
+                    directCode = packedDirectionCacheDirect[cacheSlot]
+                    oppositeCode = packedDirectionCacheOpposite[cacheSlot]
+                }
+                val positive = directCode <= oppositeCode
+                val direction = if (positive) packedDirectionScratch else packedNegatedDirectionScratch
+                packedVoxelX[index] = x
+                packedVoxelY[index] = y
+                packedVoxelZ[index] = z
+                packedSupportIds[index] = packed.idAt(index)
+                packedSignedWeights[index] = 2
+                packedAxisXQ15[index] = direction[0]
+                packedAxisYQ15[index] = direction[1]
+                packedAxisZQ15[index] = direction[2]
+                packedPositiveSide[index] = positive
+                packedSupportQ13[index] = FeatureNormalMath.confidenceQ13(confidence)
+                packedOrder[index] = index
+            }
+            sortPackedOrder()
+            Normalization.Accepted(packedNormalizedEvidence)
+        }
+    }
+
+    private fun sortPackedOrder() {
+        for (index in 1 until packedNormalizedCount) {
+            val value = packedOrder[index]
+            var insertion = index
+            while (insertion > 0 && comparePacked(value, packedOrder[insertion - 1]) < 0) {
+                packedOrder[insertion] = packedOrder[insertion - 1]
+                insertion--
+            }
+            packedOrder[insertion] = value
+        }
+    }
+
+    private fun comparePacked(left: Int, right: Int): Int {
+        fun compare(a: Int, b: Int): Int = a.compareTo(b)
+        compare(packedVoxelX[left], packedVoxelX[right]).takeIf { it != 0 }?.let { return it }
+        compare(packedVoxelY[left], packedVoxelY[right]).takeIf { it != 0 }?.let { return it }
+        compare(packedVoxelZ[left], packedVoxelZ[right]).takeIf { it != 0 }?.let { return it }
+        compare(packedSupportIds[left], packedSupportIds[right]).takeIf { it != 0 }?.let { return it }
+        compare(packedSignedWeights[left], packedSignedWeights[right]).takeIf { it != 0 }?.let { return it }
+        compare(packedAxisXQ15[left], packedAxisXQ15[right]).takeIf { it != 0 }?.let { return it }
+        compare(packedAxisYQ15[left], packedAxisYQ15[right]).takeIf { it != 0 }?.let { return it }
+        compare(packedAxisZQ15[left], packedAxisZQ15[right]).takeIf { it != 0 }?.let { return it }
+        packedPositiveSide[left].compareTo(packedPositiveSide[right]).takeIf { it != 0 }?.let { return it }
+        return compare(packedSupportQ13[left], packedSupportQ13[right])
+    }
+
+    private fun packedDirectionKey(vector: IntArray): Long =
+        ((vector[0].toLong() and 0xffffL) shl 32) or
+            ((vector[1].toLong() and 0xffffL) shl 16) or
+            (vector[2].toLong() and 0xffffL)
+
+    private fun findPackedDirectionCacheSlot(key: Long): Int {
+        var slot = packedDirectionHash(key) and (PACKED_DIRECTION_CACHE_CAPACITY - 1)
+        while (true) {
+            val current = packedDirectionCacheKeys[slot]
+            if (current == Long.MIN_VALUE || current == key) return slot
+            slot = (slot + 1) and (PACKED_DIRECTION_CACHE_CAPACITY - 1)
+        }
+    }
+
+    private fun packedDirectionHash(value: Long): Int {
+        var mixed = value xor (value ushr 33)
+        mixed *= -49064778989728563L
+        mixed = mixed xor (mixed ushr 33)
+        return mixed.toInt()
+    }
+
+    private fun stage(evidence: List<NormalizedEvidence>, sequence: Long, timestampNs: Long): Staging = try {
         operations.allocate(FeatureFusionAllocationCut.PREFLIGHT) {
             val nextAssociations = addOrRefuse(associationCount, evidence.size)
                 ?: return@allocate Staging.Refused(FeatureFusionRefusal.CHECKED_ARITHMETIC)
@@ -368,6 +622,10 @@ internal class FeatureFusionKernel(
                 if (projected == null) {
                     val existing = findSlot(item.key)
                     if (existing >= 0) {
+                        if (canonicalIds[existing] != 0 &&
+                            (canonicalCorrelation(existing) == null ||
+                                featureEvidenceAllocationFingerprint(existing) == null)
+                        ) return@allocate Staging.Refused(FeatureFusionRefusal.CANONICAL_PROVENANCE)
                         projected = ProjectedSurface(existing, item.key, retainedWeight(existing), observationCount(observationCounts[existing]), active[existing], false,
                             axisXQ13[existing], axisYQ13[existing], axisZQ13[existing], positiveSupportQ13[existing], negativeSupportQ13[existing],
                             primarySide(observationCounts[existing]))
@@ -409,12 +667,17 @@ internal class FeatureFusionKernel(
                 updatesByKey.values.forEach { projected ->
                     val wasActive = !projected.isNew && active[projected.slot]
                     when {
-                        projected.isActive && (!wasActive || hasMaterialChange(projected, axisOctCodes)) ->
+                        projected.isActive && (!wasActive || hasMaterialChange(projected, axisOctCodes)) -> {
+                            val correlation = canonicalCorrelation(projected.slot)
+                            if (canonicalIds[projected.slot] != 0 && correlation == null) {
+                                return@allocate Staging.Refused(FeatureFusionRefusal.CANONICAL_PROVENANCE)
+                            }
                             delta += FeatureFusionChange.Upsert(
                                 candidate(projected, axisOctCodes),
                                 projected.slot,
-                                canonicalCorrelation(projected.slot),
+                                correlation,
                             )
+                        }
                         wasActive && !projected.isActive ->
                             delta += FeatureFusionChange.Removal(projected.key.x, projected.key.y, projected.key.z)
                     }
@@ -527,7 +790,9 @@ internal class FeatureFusionKernel(
         for (assignment in assignments) {
             val slot = assignment.kernelSlot
             if (slot !in 0 until surfaceCount || !seenSlots.add(slot) ||
-                surfaceKeys[slot] != packVisibilityGridKey(assignment.x, assignment.y, assignment.z)
+                surfaceKeys[slot] != packVisibilityGridKey(assignment.x, assignment.y, assignment.z) ||
+                assignment.id.value !in 1L..UINT32_MASK || assignment.allocationFingerprint.size != HASH_BYTES ||
+                assignment.packedNormal !in 0..0xffff || assignment.normalConfidence !in 0..255
             ) return false
             val encoded = assignment.id.value.toInt()
             val retained = canonicalIds[slot]
@@ -536,25 +801,30 @@ internal class FeatureFusionKernel(
         for (assignment in assignments) {
             if (canonicalIds[assignment.kernelSlot] == 0) {
                 canonicalIds[assignment.kernelSlot] = assignment.id.value.toInt()
-                assignment.allocationFingerprint.toByteArray().copyInto(
-                    featureEvidenceAllocationFingerprints,
-                    assignment.kernelSlot * HASH_BYTES,
-                )
+            }
+            if (featureEvidenceSourceIds[assignment.kernelSlot] == 0) {
+                featureEvidenceSourceIds[assignment.kernelSlot] = assignment.id.value.toInt()
+                rememberFixtureHistoricalFingerprint(assignment.kernelSlot, assignment.allocationFingerprint)
             }
             accumulatedWeights[assignment.kernelSlot] = encodeWeightAndCanonical(
                 retainedWeight(assignment.kernelSlot), assignment.packedNormal, assignment.normalConfidence,
             )
-            assignment.allocationFingerprint.toByteArray().copyInto(
-                canonicalAllocationFingerprints,
-                assignment.kernelSlot * HASH_BYTES,
-            )
+            currentFingerprintSourceIds[assignment.kernelSlot] = assignment.id.value.toInt()
+            rememberFixtureCurrentFingerprint(assignment.kernelSlot, assignment.allocationFingerprint)
         }
         return true
     }
 
     /** Hydrates one cold-recovery row before ordinary admissions resume. */
     internal fun hydrateCanonicalSurface(row: CompactSurface, fingerprint: CanonicalReceiptBytes): Boolean {
-        if (row.id.value !in 1..UINT32_MASK || fingerprint.size != HASH_BYTES) return false
+        if (row.id.value !in 1..UINT32_MASK || fingerprint.size != HASH_BYTES ||
+            row.packedNormal !in 0..0xffff || row.normalConfidence !in 0..255
+        ) return false
+        fingerprintResolver?.let { resolver ->
+            if (resolveCanonicalFingerprint(resolver, row.id.value, fingerprintGeometryRevision,
+                    fingerprintLineageRevision, fingerprintGeneration) != fingerprint
+            ) return false
+        }
         val key = VoxelKey(row.voxel.x, row.voxel.y, row.voxel.z)
         if (findSlot(key) >= 0 || surfaceCount >= SURFACE_CAPACITY) return false
         val octX = (row.packedNormal ushr 8).toByte().toInt()
@@ -589,12 +859,10 @@ internal class FeatureFusionKernel(
         if (kernelSlot !in 0 until surfaceCount) return null
         val encodedId = canonicalIds[kernelSlot]
         if (encodedId == 0) return null
+        val fingerprint = resolveCurrentFingerprint(kernelSlot, currentFingerprintSourceIds[kernelSlot]) ?: return null
         return CanonicalFeatureCorrelation(
             SurfaceId(encodedId.toLong() and UINT32_MASK),
-            CanonicalReceiptBytes(canonicalAllocationFingerprints.copyOfRange(
-                kernelSlot * HASH_BYTES,
-                (kernelSlot + 1) * HASH_BYTES,
-            )),
+            fingerprint,
             retainedPackedNormal(kernelSlot),
             retainedConfidence(kernelSlot),
         )
@@ -603,10 +871,68 @@ internal class FeatureFusionKernel(
     /** Immutable allocation provenance recorded when this feature slot first gained canonical identity. */
     internal fun featureEvidenceAllocationFingerprint(kernelSlot: Int): CanonicalReceiptBytes? {
         if (kernelSlot !in 0 until surfaceCount || canonicalIds[kernelSlot] == 0) return null
-        return CanonicalReceiptBytes(featureEvidenceAllocationFingerprints.copyOfRange(
-            kernelSlot * HASH_BYTES,
-            (kernelSlot + 1) * HASH_BYTES,
-        ))
+        return resolveHistoricalFingerprint(kernelSlot, featureEvidenceSourceIds[kernelSlot])
+    }
+
+    private fun resolveCurrentFingerprint(kernelSlot: Int, encodedSourceId: Int): CanonicalReceiptBytes? {
+        if (encodedSourceId == 0) return null
+        val sourceId = encodedSourceId.toLong() and UINT32_MASK
+        val resolver = fingerprintResolver
+        return if (resolver == null) {
+            fixtureCurrentFingerprintBacking[kernelSlot]
+        } else {
+            resolveCanonicalFingerprint(resolver,
+                sourceId,
+                fingerprintGeometryRevision,
+                fingerprintLineageRevision,
+                fingerprintGeneration,
+            )
+        }
+    }
+
+    private fun resolveHistoricalFingerprint(kernelSlot: Int, encodedSourceId: Int): CanonicalReceiptBytes? {
+        if (encodedSourceId == 0) return null
+        val sourceId = encodedSourceId.toLong() and UINT32_MASK
+        val resolver = fingerprintResolver
+        return if (resolver == null) {
+            fixtureHistoricalFingerprintBacking[kernelSlot]
+        } else {
+            resolveCanonicalFingerprint(resolver,
+                sourceId,
+                fingerprintGeometryRevision,
+                fingerprintLineageRevision,
+                fingerprintGeneration,
+            )
+        }
+    }
+
+    private fun resolveCanonicalFingerprint(
+        resolver: CanonicalFingerprintResolver,
+        sourceId: Long,
+        geometryRevision: Long,
+        lineageRevision: Long,
+        generation: Long,
+    ): CanonicalReceiptBytes? = try {
+        resolver.resolve(sourceId, geometryRevision, lineageRevision, generation)
+            ?.takeIf { it.size == HASH_BYTES }
+    } catch (_: Exception) {
+        // An unavailable/corrupt authority refuses preparation. No canonical
+        // write or retained feature mutation has occurred at this boundary.
+        null
+    }
+
+    private fun rememberFixtureCurrentFingerprint(kernelSlot: Int, fingerprint: CanonicalReceiptBytes) {
+        if (fingerprintResolver == null) {
+            require(fingerprint.size == HASH_BYTES)
+            fixtureCurrentFingerprintBacking[kernelSlot] = fingerprint
+        }
+    }
+
+    private fun rememberFixtureHistoricalFingerprint(kernelSlot: Int, fingerprint: CanonicalReceiptBytes) {
+        if (fingerprintResolver == null) {
+            require(fingerprint.size == HASH_BYTES)
+            fixtureHistoricalFingerprintBacking.putIfAbsent(kernelSlot, fingerprint)
+        }
     }
 
     /** Resolves one retained feature slot by its exact voxel and canonical identity. */
@@ -650,16 +976,25 @@ internal class FeatureFusionKernel(
     /** Portable retained ownership: concrete array capacities plus the scalar owner/header. */
     internal fun normalEncoderPortableBytes(): Int = normalEncoder.portableBytes()
 
-    private fun retainedOwnerBytes(): Int = 160 + normalEncoder.portableBytes() +
-        16 * ARRAY_HEADER_BYTES.toInt() +
+    // Kernel fields, two empty fixture maps, operation adapter and alignment;
+    // the independent constructed-graph regression verifies this envelope.
+    private fun retainedOwnerBytes(): Int = 384 + normalEncoder.portableBytes() +
+        32 * ARRAY_HEADER_BYTES.toInt() +
         surfaceKeys.size * Long.SIZE_BYTES +
-        canonicalAllocationFingerprints.size + featureEvidenceAllocationFingerprints.size +
+        (fixtureCurrentFingerprintBacking.size + fixtureHistoricalFingerprintBacking.size) *
+            256 + // Fixture-only map nodes, keys, receipt bytes and backing slots.
         active.size + Int.SIZE_BYTES * (
-            canonicalIds.size + accumulatedWeights.size + observationCounts.size +
+            canonicalIds.size + currentFingerprintSourceIds.size + featureEvidenceSourceIds.size +
+            accumulatedWeights.size + observationCounts.size +
                 axisXQ13.size + axisYQ13.size + axisZQ13.size + positiveSupportQ13.size +
                 negativeSupportQ13.size + evidenceWeights.size + evidenceSupportIds.size +
-                associationSlots.size + hashSlots.size
-            )
+                associationSlots.size + hashSlots.size +
+                packedVoxelX.size + packedVoxelY.size + packedVoxelZ.size + packedSupportIds.size +
+                packedSignedWeights.size + packedAxisXQ15.size + packedAxisYQ15.size +
+                packedAxisZQ15.size + packedSupportQ13.size + packedOrder.size +
+                packedDirectionCacheDirect.size + packedDirectionCacheOpposite.size +
+                packedDirectionScratch.size + packedNegatedDirectionScratch.size
+            ) + packedPositiveSide.size + packedDirectionCacheKeys.size * Long.SIZE_BYTES
 
     private fun hash(key: VoxelKey): Int {
         var value = key.x * 73856093 xor key.y * 19349663 xor key.z * 83492791
@@ -720,6 +1055,22 @@ internal class FeatureFusionKernel(
     private data class VoxelKey(val x: Int, val y: Int, val z: Int)
     private data class DirectionKey(val x: Int, val y: Int, val z: Int)
     private data class NormalizedEvidence(val key: VoxelKey, val signedWeight: Int, val supportId: Int, val axisDirectionQ15: IntArray, val positiveSide: Boolean, val supportQ13: Int)
+    private inner class PackedNormalizedEvidenceList : AbstractList<NormalizedEvidence>() {
+        override val size: Int get() = packedNormalizedCount
+
+        override fun get(index: Int): NormalizedEvidence {
+            require(index in 0 until packedNormalizedCount)
+            val source = packedOrder[index]
+            return NormalizedEvidence(
+                VoxelKey(packedVoxelX[source], packedVoxelY[source], packedVoxelZ[source]),
+                packedSignedWeights[source],
+                packedSupportIds[source],
+                intArrayOf(packedAxisXQ15[source], packedAxisYQ15[source], packedAxisZQ15[source]),
+                packedPositiveSide[source],
+                packedSupportQ13[source],
+            )
+        }
+    }
     private data class ProjectedAssociation(val slot: Int, val weight: Int, val supportId: Int)
     private data class ProjectedSurface(
         val slot: Int, val key: VoxelKey, val weight: Int, val observationCount: Int, val isActive: Boolean, val isNew: Boolean,
@@ -780,8 +1131,10 @@ internal class FeatureFusionKernel(
     private val canonicalIds = IntArray(SURFACE_CAPACITY)
     // Canonical association provenance is mutable after replacement, while the
     // per-slot feature-evidence provenance is installed once and stays immutable.
-    private val canonicalAllocationFingerprints = ByteArray(SURFACE_CAPACITY * HASH_BYTES)
-    private val featureEvidenceAllocationFingerprints = ByteArray(SURFACE_CAPACITY * HASH_BYTES)
+    /** Source whose exact receipt the current canonical identity uses. */
+    private val currentFingerprintSourceIds = IntArray(SURFACE_CAPACITY)
+    /** Immutable source identity from the first canonical assignment. */
+    private val featureEvidenceSourceIds = IntArray(SURFACE_CAPACITY)
     private val accumulatedWeights = IntArray(SURFACE_CAPACITY)
     private val observationCounts = IntArray(SURFACE_CAPACITY)
     private val active = BooleanArray(SURFACE_CAPACITY)
@@ -824,7 +1177,9 @@ internal class FeatureFusionKernel(
         const val ASSOCIATION_CAPACITY = 200_000
         const val HASH_SLOTS = 262_144
         const val HASH_MASK = HASH_SLOTS - 1
-        const val CANONICAL_SURFACE_TUPLE_SHARE_BYTES = 14_888_912
+        // Fixed owner receipt after accounting for every array header and the
+        // two reusable three-component direction scratch buffers.
+        const val CANONICAL_SURFACE_TUPLE_SHARE_BYTES = 9_371_384
         const val HASH_BYTES = 32
         const val UINT32_MASK = 0xffff_ffffL
         const val HYDRATED_AXIS_SCALE = 1_024
@@ -833,6 +1188,7 @@ internal class FeatureFusionKernel(
         const val EVIDENCE_SATURATION = 127
         const val OBSERVATION_COUNT_MASK = (1 shl 18) - 1
         const val OBSERVATION_PRIMARY_SHIFT = 30
+        private const val PACKED_DIRECTION_CACHE_CAPACITY = 2_048
         const val VOXEL_METERS = 0.1
         const val VOXEL_MIN = -(1 shl 20).toDouble()
         const val VOXEL_MAX = ((1 shl 20) - 1).toDouble()
@@ -945,6 +1301,7 @@ internal sealed interface FeatureCanonicalRemapPreparation {
     data class Refused(val reason: FeatureCanonicalRemapRefusal) : FeatureCanonicalRemapPreparation
 }
 internal enum class FeatureCanonicalRemapRefusal {
+    CANONICAL_PROVENANCE,
     PREPARED_BUSY,
     CAPACITY,
     INVALID_SLOT,
@@ -959,6 +1316,7 @@ internal data class FeatureFusionResourceReceipt(val surfaceCount: Int, val asso
 internal data class FeatureFusionWorkReceipt(val distinctTouchedVoxelCount: Int, val emittedEventCount: Int)
 
 internal enum class FeatureFusionRefusal {
+    CANONICAL_PROVENANCE,
     STALE_BATCH,
     NON_FINITE_COORDINATE,
     COORDINATE_OUT_OF_RANGE,

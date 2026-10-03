@@ -41,4 +41,25 @@ void main() {
     expect(pose.trackingPose, isNull);
     expect(pose.toMap().containsKey('trackingPose'), isFalse);
   });
+
+  test('synthetic pose provenance survives the wire round trip', () {
+    final pose = ARFramePose.fromMap({
+      'position': {'x': 0.0, 'y': 0.0, 'z': 0.0},
+      'rotation': {'x': 0.0, 'y': 0.0, 'z': 0.0, 'w': 1.0},
+      'transform': Matrix4.identity().storage.toList(),
+      'timestampMs': 123,
+      'sensorTimestampNs': 456,
+      'confidence': 1.0,
+      'isTracking': true,
+      'trackingState': 'synthetic',
+      'poseSource': 'synthetic',
+      'wireVersion': poseBatchWireVersion,
+      'sequence': 1,
+    });
+
+    final roundTripped = ARFramePose.fromMap(pose.toMap());
+    expect(roundTripped.poseSource, 'synthetic');
+    expect(roundTripped.trackingState, 'synthetic');
+    expect(roundTripped.sequence, 1);
+  });
 }

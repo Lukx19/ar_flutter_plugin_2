@@ -13,10 +13,28 @@ private fun openAddressCapacity(expected: Int): Int {
 
 /** Primitive open-addressed identity table used only during batch admission. */
 internal class DepthEvidenceIdTable private constructor(
-    private val keys: LongArray,
-    private val occupied: BooleanArray,
+    private var keys: LongArray,
+    private var occupied: BooleanArray,
 ) {
     val allocatedBytes: Long get() = keys.size * 9L + TABLE_BYTES
+
+    /** Clears this bounded table and grows it only when a larger batch needs it. */
+    internal fun reset(expected: Int): Boolean {
+        val required = openAddressCapacity(expected)
+        val grew = keys.size < required
+        if (grew) {
+            keys = LongArray(required)
+            occupied = BooleanArray(required)
+        } else {
+            occupied.fill(false)
+        }
+        return grew
+    }
+
+    internal fun clearStorage() {
+        keys = LongArray(0)
+        occupied = BooleanArray(0)
+    }
 
     fun add(value: Long): Boolean {
         var slot = mix(value).toInt() and (keys.size - 1)
@@ -59,12 +77,34 @@ internal class DepthEvidenceIdTable private constructor(
 
 /** Primitive open-addressed voxel table used to reject duplicate targets. */
 internal class DepthEvidenceVoxelTable private constructor(
-    private val x: IntArray,
-    private val y: IntArray,
-    private val z: IntArray,
-    private val occupied: BooleanArray,
+    private var x: IntArray,
+    private var y: IntArray,
+    private var z: IntArray,
+    private var occupied: BooleanArray,
 ) {
     val allocatedBytes: Long get() = x.size * 13L + TABLE_BYTES
+
+    /** Clears this bounded table and grows it only when a larger batch needs it. */
+    internal fun reset(expected: Int): Boolean {
+        val required = openAddressCapacity(expected)
+        val grew = x.size < required
+        if (grew) {
+            x = IntArray(required)
+            y = IntArray(required)
+            z = IntArray(required)
+            occupied = BooleanArray(required)
+        } else {
+            occupied.fill(false)
+        }
+        return grew
+    }
+
+    internal fun clearStorage() {
+        x = IntArray(0)
+        y = IntArray(0)
+        z = IntArray(0)
+        occupied = BooleanArray(0)
+    }
 
     fun add(voxel: Voxel): Boolean {
         var slot = mix(voxel).toInt() and (x.size - 1)

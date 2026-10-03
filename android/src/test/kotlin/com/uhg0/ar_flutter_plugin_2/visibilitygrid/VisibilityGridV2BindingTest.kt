@@ -649,7 +649,17 @@ class VisibilityGridV2BindingTest {
             exchange(3, 1, 1, 1)
             assertTrue(observationOwnershipReady())
 
-            val frame = requireNotNull(binding.currentObservationOwnership()).groupFrame
+            val ownership = requireNotNull(binding.currentObservationOwnership())
+            fun formattedHex(bytes: ByteArray): String =
+                bytes.joinToString("") { "%02x".format(it.toInt() and 0xff) }
+            assertEquals(formattedHex(request.sessionId.bytes), ownership.sessionId)
+            assertEquals(formattedHex(request.captureGroupId.bytes), ownership.captureGroupId)
+            assertEquals(formattedHex(snapshot.arSessionIdentity), ownership.arSessionIdentity)
+            assertEquals(formattedHex(snapshot.viewInstanceId), ownership.viewInstanceId)
+            assertEquals(formattedHex(snapshot.nativeStreamToken), ownership.nativeStreamToken)
+            assertEquals(formattedHex(snapshot.workerBindingToken), ownership.workerBindingToken)
+            repeat(3) { assertEquals(ownership, binding.currentObservationOwnership()) }
+            val frame = ownership.groupFrame
             assertEquals(groupFromWorld.toList(), frame.groupFromWorldGl)
             assertEquals(worldFromGroup.toList(), frame.worldFromGroupGl)
             assertEquals(1_000, frame.voxelSizeMicrometres)

@@ -10,6 +10,9 @@ import java.nio.IntBuffer
 internal sealed interface VisibilityFeatureCopyResult {
     data class Observation(val value: VisibilityFeatureObservation) : VisibilityFeatureCopyResult
 
+    /** Packed observation whose lease must be transferred or closed by the consumer. */
+    data class PackedObservation(val value: VisibilityFeatureObservation) : VisibilityFeatureCopyResult
+
     data object TransientUnavailable : VisibilityFeatureCopyResult
 
     data class Rejected(val reason: String) : VisibilityFeatureCopyResult
@@ -17,6 +20,40 @@ internal sealed interface VisibilityFeatureCopyResult {
 
 internal sealed interface VisibilityDepthCopyResult {
     data class Observation(val value: VisibilityDepthObservation) : VisibilityDepthCopyResult
+
+    data class PackedObservation(
+        val metadata: RawDepthFrameMetadata,
+        val lease: DepthSamplesLease,
+        val ownership: VisibilityObservationOwnership,
+        val depthCapability: VisibilityDepthCapability,
+        val frameSequence: Long,
+        val frameTimestampNs: Long,
+    ) : VisibilityDepthCopyResult {
+        fun toObservation(): VisibilityDepthObservation = VisibilityDepthObservation.fromPacked(
+            ownership = ownership,
+            frame = VisibilityObservationFrame(
+                source = VisibilityObservationSource.ARCORE_RAW_DEPTH,
+                frameSequence = frameSequence,
+                frameTimestampNs = frameTimestampNs,
+                sourceTimestampNs = metadata.timestampNs,
+                cameraIdentity = "arcore-rear-camera",
+                tracking = metadata.tracking,
+                imageOrientation = "landscape_right_x_right_y_down_v1",
+                pose = VisibilityCameraPose.copyOf(metadata.worldFromCameraGl),
+                intrinsics = VisibilityCameraIntrinsics(
+                    imageWidth = metadata.width,
+                    imageHeight = metadata.height,
+                    fx = metadata.intrinsics.fx,
+                    fy = metadata.intrinsics.fy,
+                    cx = metadata.intrinsics.cx,
+                    cy = metadata.intrinsics.cy,
+                ),
+                depthCapability = depthCapability,
+            ),
+            packedSamples = lease.samples,
+            sourceRejectedSamples = lease.samples.rejectedCount,
+        )
+    }
 
     data object TransientUnavailable : VisibilityDepthCopyResult
 
@@ -44,6 +81,8 @@ internal sealed interface VisibilityFeatureSamplesCopyResult {
         val values: List<VisibilityFeatureSample>,
         val sourceRejectedSamples: Int,
     ) : VisibilityFeatureSamplesCopyResult
+
+    data class Packed(val lease: FeatureSamplesLease) : VisibilityFeatureSamplesCopyResult
 
     data object TransientUnavailable : VisibilityFeatureSamplesCopyResult
 
@@ -94,12 +133,57 @@ internal fun copyVisibilityFeatureSamples(
     }
 }
 
+/** Copies point-cloud columns directly into a producer-owned lease. */
+internal fun copyVisibilityFeatureSamplesPacked(
+    sourceIds: IntBuffer,
+    sourcePoints: FloatBuffer,
+    minimumFeatureConfidence: Double,
+    lease: FeatureSamplesLease,
+    maxCopiedSamples: Int = V2_FEATURE_SAMPLE_CAPACITY,
+): VisibilityFeatureSamplesCopyResult {
+    require(minimumFeatureConfidence.isFinite() && minimumFeatureConfidence in 0.0..1.0)
+    require(maxCopiedSamples in 1..V2_FEATURE_SAMPLE_CAPACITY)
+    val ids = sourceIds.duplicate()
+    val points = sourcePoints.duplicate()
+    if (points.remaining().toLong() != ids.remaining().toLong() * 4L) {
+        lease.close()
+        return VisibilityFeatureSamplesCopyResult.Rejected("feature buffers have mismatched lengths")
+    }
+    lease.clear()
+    var rejected = 0
+    while (ids.hasRemaining()) {
+        val id = ids.get()
+        val x = points.get().toDouble()
+        val y = points.get().toDouble()
+        val z = points.get().toDouble()
+        val confidence = points.get().toDouble()
+        if (id < 0 || !x.isFinite() || !y.isFinite() || !z.isFinite() ||
+            !confidence.isFinite() || confidence !in 0.0..1.0 ||
+            confidence < minimumFeatureConfidence || lease.producerCountForFill() >= maxCopiedSamples ||
+            !lease.acceptId(id) ||
+            !lease.append(id, x, y, z, confidence)
+        ) {
+            rejected++
+        }
+    }
+    lease.reject(rejected)
+    return if (lease.samples.count == 0) {
+        lease.close()
+        VisibilityFeatureSamplesCopyResult.TransientUnavailable
+    } else {
+        VisibilityFeatureSamplesCopyResult.Packed(lease)
+    }
+}
+
 /** Copies all ARCore-owned data before returning to the frame callback. */
 internal class ArCoreVisibilityObservationAdapter(
     private val resourceAcquired: () -> Unit,
     private val resourceClosed: () -> Unit,
     private val minimumFeatureConfidence: Double = 0.30,
 ) {
+    private val featureSamplePool = FeatureSamplesLeasePool()
+    private val depthSamplePool = DepthSamplesLeasePool()
+
     init {
         require(minimumFeatureConfidence.isFinite() && minimumFeatureConfidence in 0.0..1.0)
     }
@@ -136,6 +220,10 @@ internal class ArCoreVisibilityObservationAdapter(
                     VisibilityFeatureCopyResult.TransientUnavailable
                 is VisibilityFeatureSamplesCopyResult.Rejected ->
                     VisibilityFeatureCopyResult.Rejected(samples.reason)
+                is VisibilityFeatureSamplesCopyResult.Packed -> {
+                    samples.lease.close()
+                    VisibilityFeatureCopyResult.Rejected("packed feature copy requires the packed adapter")
+                }
                 is VisibilityFeatureSamplesCopyResult.Samples ->
                     VisibilityFeatureCopyResult.Observation(
                         VisibilityFeatureObservation(
@@ -164,6 +252,73 @@ internal class ArCoreVisibilityObservationAdapter(
         }
     }
 
+    /** Packed production handoff; the immutable list path remains the fixture adapter. */
+    fun copyFeaturePacked(
+        frame: Frame,
+        ownership: VisibilityObservationOwnership,
+        depthCapability: VisibilityDepthCapability,
+        frameSequence: Long,
+        maxCopiedSamples: Int = V2_FEATURE_SAMPLE_CAPACITY,
+    ): VisibilityFeatureCopyResult {
+        require(maxCopiedSamples in 1..V2_FEATURE_SAMPLE_CAPACITY)
+        val pointCloud = try {
+            frame.acquirePointCloud().also { resourceAcquired() }
+        } catch (_: NotYetAvailableException) {
+            return VisibilityFeatureCopyResult.TransientUnavailable
+        } catch (error: RuntimeException) {
+            return VisibilityFeatureCopyResult.Rejected(error.message ?: "point cloud acquisition failed")
+        }
+        var lease: FeatureSamplesLease? = null
+        return try {
+            val sourceTimestamp = pointCloud.timestamp
+            if (sourceTimestamp <= 0 || frame.timestamp <= 0) {
+                return VisibilityFeatureCopyResult.Rejected("feature timestamp is not positive")
+            }
+            lease = featureSamplePool.tryAcquire(ownership)
+                ?: return VisibilityFeatureCopyResult.Rejected("feature sample pool exhausted")
+            when (
+                val samples = copyVisibilityFeatureSamplesPacked(
+                    sourceIds = pointCloud.ids,
+                    sourcePoints = pointCloud.points,
+                    minimumFeatureConfidence = minimumFeatureConfidence,
+                    lease = lease,
+                    maxCopiedSamples = maxCopiedSamples,
+                )
+            ) {
+                VisibilityFeatureSamplesCopyResult.TransientUnavailable ->
+                    VisibilityFeatureCopyResult.TransientUnavailable
+                is VisibilityFeatureSamplesCopyResult.Rejected ->
+                    VisibilityFeatureCopyResult.Rejected(samples.reason)
+                is VisibilityFeatureSamplesCopyResult.Packed ->
+                    VisibilityFeatureCopyResult.PackedObservation(
+                        VisibilityFeatureObservation.fromPacked(
+                            ownership = ownership,
+                            frame = cameraFrame(
+                                frame = frame,
+                                source = VisibilityObservationSource.ARCORE_FEATURE,
+                                sourceTimestampNs = sourceTimestamp,
+                                frameSequence = frameSequence,
+                                depthCapability = depthCapability,
+                            ),
+                            packedSamples = samples.lease.samples,
+                            sourceRejectedSamples = samples.lease.samples.rejectedCount,
+                        ),
+                    )
+                is VisibilityFeatureSamplesCopyResult.Samples ->
+                    error("packed feature copy returned immutable samples")
+            }
+        } catch (error: IllegalArgumentException) {
+            lease?.close()
+            VisibilityFeatureCopyResult.Rejected(error.message ?: "invalid feature metadata")
+        } catch (error: RuntimeException) {
+            lease?.close()
+            VisibilityFeatureCopyResult.Rejected(error.message ?: "feature copy failed")
+        } finally {
+            pointCloud.release()
+            resourceClosed()
+        }
+    }
+
     fun copyDepth(
         frame: Frame,
         ownership: VisibilityObservationOwnership,
@@ -182,6 +337,43 @@ internal class ArCoreVisibilityObservationAdapter(
         return convertDepthResult(
             result, ownership, depthCapability, frameSequence, frame.timestamp,
         )
+    }
+
+    /** Packed production handoff; images are closed before the result returns. */
+    fun copyDepthPacked(
+        frame: Frame,
+        ownership: VisibilityObservationOwnership,
+        depthCapability: VisibilityDepthCapability,
+        frameSequence: Long,
+    ): VisibilityDepthCopyResult {
+        if (depthCapability == VisibilityDepthCapability.UNSUPPORTED) {
+            return VisibilityDepthCopyResult.Rejected("depth is unsupported")
+        }
+        val result = ArCoreRawDepthSource(
+            maxCopiedPixels = V2_DEPTH_SAMPLE_CAPACITY,
+            onResourceAcquired = resourceAcquired,
+            onResourceClosed = resourceClosed,
+            depthMode = depthCapability.toArCoreDepthMode(),
+        ).acquirePacked(
+            frame = frame,
+            ownership = ownership,
+            pool = depthSamplePool,
+        )
+        return when (result) {
+            is PackedDepthAcquisitionResult.Observation ->
+                VisibilityDepthCopyResult.PackedObservation(
+                    result.metadata,
+                    result.lease,
+                    ownership,
+                    depthCapability,
+                    frameSequence,
+                    frame.timestamp,
+                )
+            PackedDepthAcquisitionResult.TransientUnavailable ->
+                VisibilityDepthCopyResult.TransientUnavailable
+            is PackedDepthAcquisitionResult.Failure ->
+                VisibilityDepthCopyResult.Rejected(result.reason)
+        }
     }
 
     fun prepareDepth(
@@ -215,6 +407,37 @@ internal class ArCoreVisibilityObservationAdapter(
             prepared.raw.process(), prepared.ownership, prepared.depthCapability,
             prepared.frameSequence, prepared.frameTimestampNs,
         )
+
+    fun finishDepthPacked(prepared: PreparedVisibilityDepthFrame): VisibilityDepthCopyResult =
+        when (val result = prepared.raw.processPacked(
+            depthSamplePool,
+            SampleLeaseGeneration.from(prepared.ownership),
+        )) {
+            is PackedDepthAcquisitionResult.Observation ->
+                VisibilityDepthCopyResult.PackedObservation(
+                    result.metadata,
+                    result.lease,
+                    prepared.ownership,
+                    prepared.depthCapability,
+                    prepared.frameSequence,
+                    prepared.frameTimestampNs,
+                )
+            PackedDepthAcquisitionResult.TransientUnavailable ->
+                VisibilityDepthCopyResult.TransientUnavailable
+            is PackedDepthAcquisitionResult.Failure ->
+                VisibilityDepthCopyResult.Rejected(result.reason)
+        }
+
+    internal fun closePackedPools() {
+        featureSamplePool.close()
+        depthSamplePool.close()
+    }
+
+    /** Debug-only ownership receipt; it never acquires or retains a lease. */
+    internal fun packedLeaseReceipts(): Map<String, SampleLeasePoolReceipt> = mapOf(
+        "feature" to featureSamplePool.receipt(),
+        "depth" to depthSamplePool.receipt(),
+    )
 
     private fun convertDepthResult(
         result: DepthAcquisitionResult,
@@ -262,6 +485,37 @@ internal class ArCoreVisibilityObservationAdapter(
                 cy = principal[1].toDouble(),
             ),
             depthCapability = depthCapability,
+        )
+    }
+
+    private fun rawDepthMetadata(
+        frame: Frame,
+        ownership: VisibilityObservationOwnership,
+        width: Int,
+        height: Int,
+    ): RawDepthFrameMetadata {
+        val intrinsics = frame.camera.imageIntrinsics
+        val focal = intrinsics.focalLength
+        val principal = intrinsics.principalPoint
+        val dimensions = intrinsics.imageDimensions
+        val pose = FloatArray(16)
+        frame.camera.pose.toMatrix(pose, 0)
+        val scaleX = width.toDouble() / dimensions[0]
+        val scaleY = height.toDouble() / dimensions[1]
+        return RawDepthFrameMetadata(
+            timestampNs = frame.timestamp,
+            groupGeneration = ownership.groupGeneration,
+            sessionGeneration = ownership.sessionGeneration,
+            tracking = frame.camera.trackingState == TrackingState.TRACKING,
+            width = width,
+            height = height,
+            intrinsics = DepthIntrinsics(
+                fx = focal[0] * scaleX,
+                fy = focal[1] * scaleY,
+                cx = principal[0] * scaleX,
+                cy = principal[1] * scaleY,
+            ),
+            worldFromCameraGl = DoubleArray(16) { pose[it].toDouble() },
         )
     }
 }
@@ -354,11 +608,14 @@ internal class ArCoreVisibilityObservationSource(
     private val depthProcessor = BoundedDepthObservationProcessor<
         PreparedVisibilityDepthFrame, VisibilityDepthCopyResult
     >(
-        process = adapter::finishDepth,
+        process = adapter::finishDepthPacked,
         publish = { result, callbackCopyNs ->
             when (result) {
                 is VisibilityDepthCopyResult.Observation ->
                     runtime.offerDepth(result.value, callbackCopyNs)
+                is VisibilityDepthCopyResult.PackedObservation -> {
+                    runtime.offerDepth(result.toObservation(), callbackCopyNs)
+                }
                 VisibilityDepthCopyResult.TransientUnavailable -> {
                     runtime.recordDepthProcessingTransient()
                     runtime.recordDepthTransientUnavailable()
@@ -387,7 +644,12 @@ internal class ArCoreVisibilityObservationSource(
 
     fun awaitDepthIdle(timeoutMillis: Long): Boolean = depthProcessor.awaitIdle(timeoutMillis)
 
-    fun close() = depthProcessor.close()
+    internal fun packedLeaseReceipts(): Map<String, SampleLeasePoolReceipt> = adapter.packedLeaseReceipts()
+
+    fun close() {
+        depthProcessor.close()
+        adapter.closePackedPools()
+    }
 
     fun onFrame(frame: Frame) {
         if (runtime.isSyntheticSource()) return
@@ -399,7 +661,7 @@ internal class ArCoreVisibilityObservationSource(
         if (runtime.shouldCopyFeature(frame.timestamp)) {
             val started = System.nanoTime()
             when (
-                val result = adapter.copyFeature(
+                val result = adapter.copyFeaturePacked(
                     frame,
                     cut,
                     capability,
@@ -409,6 +671,9 @@ internal class ArCoreVisibilityObservationSource(
             ) {
                 is VisibilityFeatureCopyResult.Observation ->
                     runtime.offerFeature(result.value, System.nanoTime() - started)
+                is VisibilityFeatureCopyResult.PackedObservation -> {
+                    runtime.offerFeature(result.value, System.nanoTime() - started)
+                }
                 VisibilityFeatureCopyResult.TransientUnavailable ->
                     runtime.recordFeatureTransientUnavailable()
                 is VisibilityFeatureCopyResult.Rejected -> runtime.recordFeatureFailure()

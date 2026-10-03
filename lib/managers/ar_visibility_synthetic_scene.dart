@@ -58,6 +58,8 @@ final class ARVisibilitySyntheticReceipt {
     required this.geometryRevision,
     required this.lineageRevision,
     required this.durableCaptureRevision,
+    required this.nativeMaxObservedCaptureRevision,
+    required this.visibilityBaselineCaptureRevision,
     required this.coverageRevision,
     required this.styleRevision,
     required this.targetSurfaceId,
@@ -81,6 +83,8 @@ final class ARVisibilitySyntheticReceipt {
   final int geometryRevision;
   final int lineageRevision;
   final int durableCaptureRevision;
+  final int nativeMaxObservedCaptureRevision;
+  final int visibilityBaselineCaptureRevision;
   final int coverageRevision;
   final int styleRevision;
   final int? targetSurfaceId;
@@ -104,6 +108,8 @@ final class ARVisibilitySyntheticReceipt {
         'geometryRevision': geometryRevision,
         'lineageRevision': lineageRevision,
         'durableCaptureRevision': durableCaptureRevision,
+        'nativeMaxObservedCaptureRevision': nativeMaxObservedCaptureRevision,
+        'visibilityBaselineCaptureRevision': visibilityBaselineCaptureRevision,
         'coverageRevision': coverageRevision,
         'styleRevision': styleRevision,
         'targetSurfaceId': targetSurfaceId,
@@ -130,6 +136,8 @@ final class ARVisibilitySyntheticReceipt {
       'geometryRevision',
       'lineageRevision',
       'durableCaptureRevision',
+      'nativeMaxObservedCaptureRevision',
+      'visibilityBaselineCaptureRevision',
       'coverageRevision',
       'styleRevision',
       'targetSurfaceId',
@@ -160,6 +168,10 @@ final class ARVisibilitySyntheticReceipt {
       geometryRevision: _nonNegativeInt(map, 'geometryRevision'),
       lineageRevision: _nonNegativeInt(map, 'lineageRevision'),
       durableCaptureRevision: _nonNegativeInt(map, 'durableCaptureRevision'),
+      nativeMaxObservedCaptureRevision:
+          _nonNegativeInt(map, 'nativeMaxObservedCaptureRevision'),
+      visibilityBaselineCaptureRevision:
+          _nonNegativeInt(map, 'visibilityBaselineCaptureRevision'),
       coverageRevision: _nonNegativeInt(map, 'coverageRevision'),
       styleRevision: _nonNegativeInt(map, 'styleRevision'),
       targetSurfaceId: _nullableNonNegativeInt(map, 'targetSurfaceId'),

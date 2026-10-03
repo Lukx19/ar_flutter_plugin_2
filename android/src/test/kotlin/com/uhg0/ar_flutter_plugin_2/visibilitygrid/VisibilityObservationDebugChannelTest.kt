@@ -11,13 +11,46 @@ import org.junit.Test
 
 class VisibilityObservationDebugChannelTest {
     @Test
+    fun `finite dense campaign rejects missing partial and overflowing variant ranges`() {
+        val messenger = MethodTestMessenger()
+        val runtime = AndroidVisibilityGridRuntime(
+            ownership = { null },
+            mapper = object : VisibilityObservationMapper {
+                override fun admitFeature(observation: VisibilityFeatureObservation) = observation.close()
+                override fun admitDepth(observation: VisibilityDepthObservation) = observation.close()
+            },
+        )
+        val channel = VisibilityObservationDebugChannel(
+            messenger = messenger, viewId = 79, isDebuggable = true,
+            runtime = runtime, ownership = { null }, gate = VisibilityObservationDebugGate(),
+        )
+        try {
+            for ((offset, count) in listOf(-1L to 24L, 25L to 24L, 6L to 480L,
+                0L to 25L, 0L to null, 4_294_967_296L to 24L)) {
+                val result = RecordingResult()
+                MethodChannel(messenger, "visibility_observation_v2_79").invokeMethod(
+                    "startAllocationWorkload", mapOf("denseDepthGrids" to true,
+                        "depthVariantOffset" to offset, "maximumFeatureOffers" to count), result,
+                )
+                assertTrue(result.completed.await(2, TimeUnit.SECONDS))
+                assertEquals(0, result.successCount)
+                assertEquals(1, result.errorCount)
+            }
+            assertEquals(0L, runtime.snapshot().offeredDepthObservations)
+        } finally {
+            channel.dispose()
+            runtime.close()
+        }
+    }
+
+    @Test
     fun `pressure diagnostics return from the caller while mapping state is busy`() {
         val messenger = MethodTestMessenger()
         val runtime = AndroidVisibilityGridRuntime(
             ownership = { null },
             mapper = object : VisibilityObservationMapper {
-                override fun admitFeature(observation: VisibilityFeatureObservation) = Unit
-                override fun admitDepth(observation: VisibilityDepthObservation) = Unit
+                override fun admitFeature(observation: VisibilityFeatureObservation) = observation.close()
+                override fun admitDepth(observation: VisibilityDepthObservation) = observation.close()
             },
             scheduler = Executors.newSingleThreadScheduledExecutor(),
             ownsScheduler = true,
@@ -83,12 +116,13 @@ class VisibilityObservationDebugChannelTest {
         val runtime = AndroidVisibilityGridRuntime(
             ownership = { ownership },
             mapper = object : VisibilityObservationMapper {
-                override fun admitFeature(observation: VisibilityFeatureObservation) = Unit
-                override fun admitDepth(observation: VisibilityDepthObservation) = Unit
+                override fun admitFeature(observation: VisibilityFeatureObservation) = observation.close()
+                override fun admitDepth(observation: VisibilityDepthObservation) = observation.close()
             },
             scheduler = Executors.newSingleThreadScheduledExecutor(),
             ownsScheduler = true,
         )
+        runtime.configureSyntheticSource(VisibilityDepthCapability.AUTOMATIC)
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
         val disposer = Executors.newSingleThreadExecutor()
@@ -134,6 +168,11 @@ class VisibilityObservationDebugChannelTest {
             assertEquals(1L, offersAfterDispose)
             Thread.sleep(250)
             assertEquals(offersAfterDispose, runtime.snapshot().offeredFeatureObservations)
+            runtime.awaitDebugFixtureIdle()
+            for (pool in channel.samplePoolReceipts().values) {
+                assertEquals(0, pool.outstanding)
+                assertEquals(0L, pool.primitiveBytes)
+            }
         } finally {
             release.countDown()
             channel.dispose()
@@ -148,9 +187,9 @@ class VisibilityObservationDebugChannelTest {
         val runtime = AndroidVisibilityGridRuntime(
             ownership = { null },
             mapper = object : VisibilityObservationMapper {
-                override fun admitFeature(observation: VisibilityFeatureObservation) = Unit
+                override fun admitFeature(observation: VisibilityFeatureObservation) = observation.close()
 
-                override fun admitDepth(observation: VisibilityDepthObservation) = Unit
+                override fun admitDepth(observation: VisibilityDepthObservation) = observation.close()
             },
             scheduler = Executors.newSingleThreadScheduledExecutor(),
             ownsScheduler = true,

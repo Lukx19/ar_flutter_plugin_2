@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:ar_flutter_plugin_2/managers/ar_visibility_surface_stream.dart';
 import 'package:flutter/services.dart';
@@ -13,7 +12,8 @@ void main() {
       'visibility_surface_stream_test',
       const BinaryCodec(),
     );
-    channel.setMockMessageHandler((_) async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockDecodedMessageHandler<ByteData?>(channel, (_) async {
       final bytes = Uint8List.fromList(<int>[0, 0x11, 0x22, 0x33, 0]);
       return ByteData.sublistView(bytes, 1, 4);
     });
@@ -25,7 +25,8 @@ void main() {
     );
 
     await stream.dispose();
-    channel.setMockMessageHandler(null);
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockDecodedMessageHandler<ByteData?>(channel, null);
   });
 
   test('timeout fences the binding and preserves an immutable attempt',
@@ -35,7 +36,8 @@ void main() {
       'visibility_surface_stream_timeout',
       const BinaryCodec(),
     );
-    channel.setMockMessageHandler((message) async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockDecodedMessageHandler<ByteData?>(channel, (message) async {
       expect(message, isNotNull);
       return pending.future;
     });
@@ -59,17 +61,22 @@ void main() {
       throwsA(isA<ARVisibilitySurfaceStreamUnknownOutcome>()),
     );
 
+    pending.complete(ByteData.sublistView(Uint8List.fromList(<int>[6])));
+    await stream.callbacksDrained;
     await stream.dispose();
-    channel.setMockMessageHandler(null);
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockDecodedMessageHandler<ByteData?>(channel, null);
   });
 
-  test('dispose waits for an accepted invocation before returning', () async {
+  test('dispose fences without waiting and exposes callback drain', () async {
     final pending = Completer<ByteData?>();
     final channel = BasicMessageChannel<ByteData?>(
       'visibility_surface_stream_dispose_wait',
       const BinaryCodec(),
     );
-    channel.setMockMessageHandler((_) => pending.future);
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockDecodedMessageHandler<ByteData?>(
+            channel, (_) => pending.future);
 
     final stream = ARVisibilitySurfaceStream(0, channel: channel);
     final exchange = stream.exchange(Uint8List.fromList(<int>[1]));
@@ -78,14 +85,22 @@ void main() {
     var disposed = false;
     final dispose = stream.dispose().then<void>((_) => disposed = true);
     await Future<void>.delayed(Duration.zero);
-    expect(disposed, isFalse);
+    expect(disposed, isTrue);
+    var drained = false;
+    final callbacksDrained = stream.callbacksDrained.then<void>((_) {
+      drained = true;
+    });
+    await Future<void>.delayed(Duration.zero);
+    expect(drained, isFalse);
 
     pending.complete(ByteData.sublistView(Uint8List.fromList(<int>[2])));
     expect(await exchange, orderedEquals(<int>[2]));
+    await callbacksDrained;
+    expect(drained, isTrue);
     await dispose;
-    expect(disposed, isTrue);
 
-    channel.setMockMessageHandler(null);
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockDecodedMessageHandler<ByteData?>(channel, null);
   });
 
   test('concurrent callers enter the platform channel one at a time', () async {
@@ -98,7 +113,8 @@ void main() {
       'visibility_surface_stream_serial',
       const BinaryCodec(),
     );
-    channel.setMockMessageHandler((_) async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockDecodedMessageHandler<ByteData?>(channel, (_) async {
       calls++;
       active++;
       if (active > peakActive) peakActive = active;
@@ -121,6 +137,7 @@ void main() {
     expect(peakActive, 1);
 
     await stream.dispose();
-    channel.setMockMessageHandler(null);
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockDecodedMessageHandler<ByteData?>(channel, null);
   });
 }

@@ -8,6 +8,9 @@ import 'package:flutter/services.dart';
 
 import 'ar_visibility_surface_stream.dart';
 
+const int _visibilityWorkerRequestCeilingBytes = 16 * 1024;
+const int _visibilityWorkerResponseCeilingBytes = 64 * 1024;
+
 /// Bounded native presentation modes. Structural renderer rows never cross
 /// this transport; only scalar controls, status, and hit receipts do.
 enum ARCoveragePresentationMode {
@@ -1824,11 +1827,18 @@ final class ARVisibilityGridV2WorkerBinding {
   Future<Uint8List> exchange(
     Uint8List request, {
     Duration? timeout,
-  }) async {
+  }) {
     _ensureOpen();
     final operation = _streamChannel.send(
       ByteData.sublistView(_qualify(request)),
     );
+    return _awaitStreamResponse(operation, timeout: timeout);
+  }
+
+  Future<Uint8List> _awaitStreamResponse(
+    Future<ByteData?> operation, {
+    Duration? timeout,
+  }) async {
     ByteData? response;
     try {
       response =
@@ -1843,12 +1853,11 @@ final class ARVisibilityGridV2WorkerBinding {
     if (response == null) {
       throw StateError('V2 stream returned no response.');
     }
-    return _authenticate(Uint8List.fromList(
-      response.buffer.asUint8List(
-        response.offsetInBytes,
-        response.lengthInBytes,
-      ),
-    ));
+    final responseBytes = response.buffer.asUint8List(
+      response.offsetInBytes,
+      response.lengthInBytes,
+    );
+    return _authenticate(responseBytes);
   }
 
   /// Invokes native `bindingSnapshot` and reads bounded scalar telemetry on
@@ -1967,22 +1976,40 @@ final class ARVisibilityGridV2WorkerBinding {
       _bindingQualifier ??
       (throw StateError('V2 worker binding has not claimed native tokens.'));
 
-  Uint8List _qualify(Uint8List payload) => Uint8List.fromList(<int>[
-        ..._requireQualifier(),
-        ...payload,
-      ]);
+  Uint8List _qualify(Uint8List payload) {
+    if (payload.length > _visibilityWorkerRequestCeilingBytes) {
+      throw RangeError.range(
+        payload.length,
+        0,
+        _visibilityWorkerRequestCeilingBytes,
+        'payload',
+        'V2 worker request exceeds its 16 KiB ceiling.',
+      );
+    }
+    final qualifier = _requireQualifier();
+    final qualified = Uint8List(qualifier.length + payload.length);
+    qualified.setRange(0, qualifier.length, qualifier);
+    qualified.setRange(qualifier.length, qualified.length, payload);
+    return qualified;
+  }
 
   Uint8List _authenticate(Uint8List response) {
     final qualifier = _requireQualifier();
     if (response.length < qualifier.length) {
       throw StateError('V2 response omitted its binding qualifier.');
     }
+    if (response.length - qualifier.length >
+        _visibilityWorkerResponseCeilingBytes) {
+      throw StateError('V2 response exceeds its 64 KiB ceiling.');
+    }
     for (var index = 0; index < qualifier.length; index++) {
       if (response[index] != qualifier[index]) {
         throw StateError('V2 response used a stale binding qualifier.');
       }
     }
-    return Uint8List.fromList(response.sublist(qualifier.length));
+    return Uint8List.fromList(
+      Uint8List.sublistView(response, qualifier.length),
+    );
   }
 }
 

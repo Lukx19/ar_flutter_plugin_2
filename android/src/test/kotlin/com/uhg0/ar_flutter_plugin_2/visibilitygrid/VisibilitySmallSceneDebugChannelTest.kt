@@ -18,6 +18,213 @@ import org.junit.Test
 
 class VisibilitySmallSceneDebugChannelTest {
     @Test
+    fun `synthetic pool receipt waits for native lane ownership to drain`() {
+        val cut = ownership()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val runtime = AndroidVisibilityGridRuntime(
+            ownership = { cut },
+            mapper = object : VisibilityObservationMapper {
+                override fun admitFeature(observation: VisibilityFeatureObservation) {
+                    entered.countDown()
+                    check(release.await(2, TimeUnit.SECONDS)) {
+                        "feature mapper did not receive the release fence"
+                    }
+                    observation.close()
+                }
+
+                override fun admitDepth(observation: VisibilityDepthObservation) =
+                    observation.close()
+            },
+            scheduler = Executors.newSingleThreadScheduledExecutor(),
+            ownsScheduler = true,
+        )
+        val source = SyntheticVisibilityObservationSource(runtime) { cut }
+        val receiptReader = Executors.newSingleThreadExecutor()
+        try {
+            source.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            assertTrue(source.emitFeature(1_000_000_000L, marker = 0))
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+
+            val receipt = receiptReader.submit<SampleLeasePoolReceipt> {
+                source.awaitSyntheticIdle()
+                source.packedLeaseReceipts().getValue("feature")
+            }
+            Thread.sleep(100)
+            assertFalse(receipt.isDone)
+            release.countDown()
+            assertEquals(0, receipt.get(2, TimeUnit.SECONDS).outstanding)
+        } finally {
+            release.countDown()
+            source.close()
+            receiptReader.shutdownNow()
+            runtime.close()
+        }
+    }
+
+    @Test
+    fun `dense campaign preserves twenty distinct measured views after five warm views`() {
+        val cut = ownership()
+        val mapper = RecordingVisibilityMapper()
+        val runtime = AndroidVisibilityGridRuntime(
+            ownership = { cut }, mapper = mapper,
+            scheduler = Executors.newScheduledThreadPool(2), depthIntervalNs = 1,
+        )
+        val source = SyntheticVisibilityObservationSource(runtime) { cut }
+        try {
+            source.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            source.prepareDenseDepthGrids(campaignVariants = true)
+            repeat(25) { index ->
+                assertTrue(source.emitCampaignFeatureFrame(1_000_000_000L + index * 3_000_000_000L, index))
+                assertTrue(source.emitDenseDepthGrid(1_000_000_000L + index * 3_000_000_000L, index, campaignVariants = true))
+                runtime.awaitDebugFixtureIdle()
+            }
+            val stablePoints = HashMap<Int, VisibilityFeatureSample>()
+            assertEquals(25, mapper.features.size)
+            mapper.features.forEachIndexed { index, feature ->
+                val cameraX = feature.frame.pose.worldFromCameraGl[12]
+                assertEquals(mapper.depths[index].frame.pose.worldFromCameraGl, feature.frame.pose.worldFromCameraGl)
+                assertEquals(5, feature.samples.size)
+                assertEquals(5, feature.samples.map { it.id }.toSet().size)
+                feature.samples.forEach { sample ->
+                    stablePoints.putIfAbsent(sample.id, sample)?.let { assertEquals(it, sample) }
+                    val depth = -sample.zWorld
+                    val pixelX = 640 + 2_000 * (sample.xWorld - cameraX) / depth
+                    val pixelY = 480 - 2_000 * sample.yWorld / depth
+                    assertTrue(pixelX in 0.0..1279.0 && pixelY in 0.0..959.0)
+                    assertEquals(1.0, depth, 0.000001)
+                    val patchCrossingY = sample.yWorld * 0.75 / depth
+                    assertTrue("foreground must not occlude $sample", patchCrossingY > 0.10)
+                }
+            }
+            val positions = mapper.depths.map { it.frame.pose.worldFromCameraGl[12] }
+            assertEquals(25, positions.distinct().size)
+            assertEquals(-0.48, positions.first(), 0.000001)
+            assertEquals(-0.40, positions[4], 0.000001)
+            assertEquals(-0.38, positions[5], 0.000001)
+            assertEquals(0.38, positions.last(), 0.000001)
+            assertTrue(positions.last() - positions.first() < 1.0)
+            for (observation in mapper.depths) {
+                assertEquals(4_096, observation.samples.size)
+                val cameraX = observation.frame.pose.worldFromCameraGl[12]
+                observation.samples.forEach { sample ->
+                    val inPatch = abs((sample.x - 640) / 2_000.0 * 0.75 + cameraX) < 0.10 &&
+                        abs((sample.y - 480) / 2_000.0 * 0.75) < 0.10
+                    assertEquals(if (inPatch) 750 else 1_000, sample.depthMillimeters)
+                    assertEquals(255, sample.confidence)
+                }
+            }
+            org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+                source.emitDenseDepthGrid(99_000_000_000L, 25, campaignVariants = true)
+            }
+        } finally {
+            source.close()
+            runtime.close()
+        }
+    }
+
+    @Test
+    fun `complete campaign feature frames settle under permutations and whole frame coalescing`() {
+        val cut = ownership()
+        val mapper = RecordingVisibilityMapper()
+        val runtime = AndroidVisibilityGridRuntime(ownership = { cut }, mapper = mapper,
+            featureIntervalNs = 1)
+        val source = SyntheticVisibilityObservationSource(runtime) { cut }
+        val pool = FeatureSamplesLeasePool(capacity = 5)
+        fun permutations(values: List<Int>): List<List<Int>> = if (values.isEmpty()) listOf(emptyList()) else
+            values.flatMap { head -> permutations(values - head).map { listOf(head) + it } }
+        val orders = permutations((0..4).toList())
+        try {
+            source.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            source.prepareDenseDepthGrids(campaignVariants = true)
+            for (variant in listOf(0, 5, 12, 24)) {
+                assertTrue(source.emitCampaignFeatureFrame((variant + 1L) * 1_000_000_000L, variant))
+                runtime.awaitDebugFixtureIdle()
+                val recorded = requireNotNull(mapper.feature)
+                val kernel = FeatureFusionKernel()
+                var sequence = 0L
+                var materialFrames = 0
+                for (frameIndex in 0 until orders.size + 8) {
+                    // Dropping complete source frames advances time and sequence without
+                    // changing the five-point evidence distribution of an admitted frame.
+                    sequence += if (frameIndex % 3 == 0) 5L else 1L
+                    val lease = requireNotNull(pool.tryAcquire(cut))
+                    for (slot in orders[frameIndex % orders.size]) {
+                        val point = recorded.samples[slot]
+                        assertTrue(lease.acceptId(point.id))
+                        assertTrue(lease.append(point.id, point.xWorld, point.yWorld, point.zWorld, point.confidence))
+                    }
+                    val observation = VisibilityFeatureObservation.fromPacked(cut,
+                        recorded.frame.copy(sourceTimestampNs = sequence * 125_000_000L), lease.samples, 0)
+                    try {
+                        val result = kernel.preparePacked(observation, sequence) as FeatureFusionResult.Accepted
+                        if (result.delta.isNotEmpty()) materialFrames++
+                        if (frameIndex >= 8) assertTrue("variant=$variant frame=$frameIndex delta=${result.delta}", result.delta.isEmpty())
+                        assertTrue(kernel.prepareCanonicalApplication(emptyList()))
+                        kernel.applyPrepared()
+                    } finally {
+                        observation.close()
+                    }
+                }
+                assertTrue("fixture must exercise real material fusion", materialFrames > 0)
+            }
+            assertEquals(0, pool.leasedCount())
+        } finally {
+            source.close()
+            runtime.close()
+            pool.close()
+        }
+    }
+
+    @Test
+    fun `dense depth grids copy primitive leased samples and preserve a fixed foreground patch`() {
+        val cut = ownership()
+        val mapper = RecordingVisibilityMapper()
+        val runtime = AndroidVisibilityGridRuntime(
+            ownership = { cut },
+            mapper = mapper,
+            scheduler = Executors.newScheduledThreadPool(2),
+            depthIntervalNs = 1,
+            ownsScheduler = true,
+        )
+        val source = SyntheticVisibilityObservationSource(runtime) { cut }
+        try {
+            source.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            source.prepareDenseDepthGrids()
+            for (index in 0..5) {
+                assertTrue(source.emitDenseDepthGrid(1_000_000_000L + index * 3_000_000_000L, index % 5))
+                runtime.awaitDebugFixtureIdle()
+            }
+            assertEquals(6, mapper.depths.size)
+            for (observation in mapper.depths) {
+                assertEquals(4_096, observation.samples.size)
+                assertTrue(observation.samples.all { it.confidence == 255 })
+                val cameraX = observation.frame.pose.worldFromCameraGl[12]
+                assertTrue(abs(cameraX) <= 0.08)
+                val patch = observation.samples.filter { it.depthMillimeters == 750 }
+                assertTrue(patch.isNotEmpty())
+                assertTrue(patch.all {
+                    abs((it.x - 640) / 2_000.0 * 0.75 + cameraX) < 0.10 &&
+                        abs((it.y - 480) / 2_000.0 * 0.75) < 0.10
+                })
+            }
+            // The mapper copies primitive lease values before closing each observation.
+            val first = mapper.depths.first().samples
+            val revisit = mapper.depths.last().samples
+            assertFalse(first === revisit)
+            assertTrue(first.all { it.confidence == 255 })
+            assertTrue(revisit.all { it.confidence == 255 })
+            assertTrue(first.any { it.depthMillimeters == 750 })
+            assertTrue(revisit.any { it.depthMillimeters == 750 })
+        } finally {
+            runtime.close()
+        }
+        // The history remains valid after the producer leases have drained.
+        assertEquals(4_096, mapper.depths.first().samples.size)
+        assertEquals(4_096, mapper.depths.last().samples.size)
+    }
+
+    @Test
     fun `synthetic sphere sweep covers every viewing sector within a one metre camera volume`() {
         val cut = ownership(identityMatrix(), identityMatrix())
         val mapper = RecordingVisibilityMapper()
@@ -179,6 +386,48 @@ class VisibilitySmallSceneDebugChannelTest {
             runtime.close()
         }
         assertEquals(0, runtime.snapshot().residentPayloadBytes)
+    }
+
+    @Test
+    fun `synthetic maximum samples advance timestamps after the full sphere sweep`() {
+        val cut = ownership(identityMatrix(), identityMatrix())
+        val mapper = RecordingVisibilityMapper()
+        val runtime = AndroidVisibilityGridRuntime(
+            ownership = { cut },
+            mapper = mapper,
+            scheduler = Executors.newScheduledThreadPool(2),
+            featureIntervalNs = 1,
+            depthIntervalNs = 1,
+            ownsScheduler = true,
+        )
+        val source = SyntheticVisibilityObservationSource(runtime) { cut }
+        try {
+            source.anchor(identityMatrix(), cut.groupFrame)
+            source.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            for (view in 0 until SYNTHETIC_SPHERE_VIEW_COUNT) {
+                val timestamp = 10_000_000_000L + view * 1_000_000_000L
+                assertEquals(true to true, source.emitSphereView(
+                    view,
+                    timestamp,
+                    timestamp + 250_000_000L,
+                ))
+                runtime.awaitDebugFixtureIdle()
+            }
+
+            // The command's legacy 8-second request must be advanced above
+            // the sphere's last copied timestamps without weakening runtime
+            // duplicate and out-of-order rejection.
+            assertEquals(true to true, source.emitMaximumSamples(8_000_000_000L, 8_250_000_000L))
+            runtime.awaitDebugFixtureIdle()
+            assertEquals(V2_FEATURE_SAMPLE_CAPACITY, checkNotNull(mapper.feature).samples.size)
+            assertEquals(V2_DEPTH_SAMPLE_CAPACITY, checkNotNull(mapper.depth).samples.size)
+            assertTrue(checkNotNull(mapper.feature).frame.sourceTimestampNs > 29_000_000_000L)
+            assertTrue(checkNotNull(mapper.depth).frame.sourceTimestampNs > 29_250_000_000L)
+            assertEquals(0, runtime.snapshot().duplicateFeatureObservations)
+            assertEquals(0, runtime.snapshot().duplicateDepthObservations)
+        } finally {
+            runtime.close()
+        }
     }
 
     @Test
@@ -1086,26 +1335,99 @@ class VisibilitySmallSceneDebugChannelTest {
     }
 }
 
+private data class RecordedFeatureObservation(
+    val ownership: VisibilityObservationOwnership,
+    val frame: VisibilityObservationFrame,
+    val samples: List<VisibilityFeatureSample>,
+    val sourceRejectedSamples: Int,
+    val payloadBytes: Int,
+)
+
+private data class RecordedDepthObservation(
+    val ownership: VisibilityObservationOwnership,
+    val frame: VisibilityObservationFrame,
+    val samples: List<VisibilityDepthSample>,
+    val sourceRejectedSamples: Int,
+    val payloadBytes: Int,
+)
+
 private class RecordingVisibilityMapper(
     expectedFeatures: Int = 1,
     expectedDepths: Int = 1,
 ) : VisibilityObservationMapper {
     val featureLatch = CountDownLatch(expectedFeatures)
     val depthLatch = CountDownLatch(expectedDepths)
-    val features = CopyOnWriteArrayList<VisibilityFeatureObservation>()
-    val depths = CopyOnWriteArrayList<VisibilityDepthObservation>()
-    var feature: VisibilityFeatureObservation? = null
-    var depth: VisibilityDepthObservation? = null
+    val features = CopyOnWriteArrayList<RecordedFeatureObservation>()
+    val depths = CopyOnWriteArrayList<RecordedDepthObservation>()
+    var feature: RecordedFeatureObservation? = null
+    var depth: RecordedDepthObservation? = null
 
     override fun admitFeature(observation: VisibilityFeatureObservation) {
-        features.add(observation)
-        feature = observation
+        val recorded = try {
+            copyFeature(observation)
+        } finally {
+            observation.close()
+        }
+        features.add(recorded)
+        feature = recorded
         featureLatch.countDown()
     }
 
     override fun admitDepth(observation: VisibilityDepthObservation) {
-        depths.add(observation)
-        depth = observation
+        val recorded = try {
+            copyDepth(observation)
+        } finally {
+            observation.close()
+        }
+        depths.add(recorded)
+        depth = recorded
         depthLatch.countDown()
+    }
+
+    private fun copyFeature(observation: VisibilityFeatureObservation): RecordedFeatureObservation {
+        val packed = observation.packedSamples
+        val samples = if (packed == null) {
+            observation.samples.toList()
+        } else {
+            List(packed.count) { index ->
+                VisibilityFeatureSample(
+                    id = packed.idAt(index),
+                    xWorld = packed.xWorldAt(index),
+                    yWorld = packed.yWorldAt(index),
+                    zWorld = packed.zWorldAt(index),
+                    confidence = packed.confidenceAt(index),
+                )
+            }
+        }
+        return RecordedFeatureObservation(
+            ownership = observation.ownership,
+            frame = observation.frame,
+            samples = samples,
+            sourceRejectedSamples = observation.sourceRejectedSamples,
+            payloadBytes = observation.payloadBytes,
+        )
+    }
+
+    private fun copyDepth(observation: VisibilityDepthObservation): RecordedDepthObservation {
+        val packed = observation.packedSamples
+        val samples = if (packed == null) {
+            observation.samples.toList()
+        } else {
+            List(packed.count) { index ->
+                VisibilityDepthSample(
+                    x = packed.xAt(index),
+                    y = packed.yAt(index),
+                    depthMillimeters = packed.depthMillimetresAt(index),
+                    confidence = packed.confidenceAt(index),
+                )
+            }
+        }
+        return RecordedDepthObservation(
+            ownership = observation.ownership,
+            frame = observation.frame,
+            samples = samples,
+            sourceRejectedSamples = observation.sourceRejectedSamples,
+            payloadBytes = observation.payloadBytes,
+        )
     }
 }

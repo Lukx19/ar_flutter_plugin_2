@@ -17,6 +17,37 @@ import org.junit.Test
 
 class CoveragePresentationDescriptorTest {
     @Test
+    fun `scalar glyph and color reads preserve all decoder validation including malformed none rows`() {
+        val original = CoverageRendererStyleRowV1().encode()
+        for (palette in CoverageRendererPalette.entries) {
+            val baseline = CoverageRendererStyleRowV1(palette = palette).encode()
+            for (offset in baseline.indices) for (value in 0..255) {
+                val bytes = baseline.copyOf().also { it[offset] = value.toByte() }
+                val decoded = runCatching { CoverageRendererStyleRowV1.decode(bytes) }
+                val scalar = runCatching { CoverageRendererStyleRowV1.validatedGlyph(bytes) }
+                val color = runCatching { CoverageRendererStyleRowV1.validatedPackedColor(bytes) }
+                assertEquals("palette=$palette offset=$offset value=$value", decoded.isSuccess, scalar.isSuccess)
+                assertEquals(decoded.isSuccess, color.isSuccess)
+                if (decoded.isSuccess) {
+                    assertEquals(decoded.getOrThrow().glyph, scalar.getOrThrow())
+                    assertEquals(decoded.getOrThrow().packedColor(), color.getOrThrow())
+                }
+            }
+        }
+        val malformedNone = original.copyOf().also { it[5] = 1 }
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            PresentationDescriptor.create(
+                qualifier = CoverageRowsQualifier(1, 1, 1, 1, 1, 1),
+                mode = CoveragePresentationMode.SEMANTIC_CENTROIDS,
+                enabled = true, capacity = 1, sourceCapacity = 1, sourceCount = 1,
+                palette = CoverageRendererPalette.COVERAGE, paletteEpoch = 0,
+                selectedSurfaceIds = longArrayOf(1), selectedSourceSlots = intArrayOf(0),
+                styleRows = malformedNone, update = null, pageReader = { _, _, _ -> null },
+            )
+        }
+    }
+
+    @Test
     fun `glyph presentation keeps the highest priority 256 committed candidates`() {
         val qualifier = CoverageRowsQualifier(2, 3, 0, 4, 5, 6)
         val ids = LongArray(300) { it + 1L }

@@ -234,11 +234,18 @@ void main() {
   });
 
   test('receipt codec rejects non-scalar and unknown fields', () {
-    final valid = _receipt();
-    expect(
-      ARVisibilitySyntheticReceipt.fromMap(valid),
-      isA<ARVisibilitySyntheticReceipt>(),
-    );
+    final valid = <String, Object?>{
+      ..._receipt(),
+      'durableCaptureRevision': 1,
+      'nativeMaxObservedCaptureRevision': 0,
+      'visibilityBaselineCaptureRevision': 1,
+    };
+    final decoded = ARVisibilitySyntheticReceipt.fromMap(valid);
+    expect(decoded.durableCaptureRevision, 1);
+    expect(decoded.nativeMaxObservedCaptureRevision, 0);
+    expect(decoded.visibilityBaselineCaptureRevision, 1);
+    expect(decoded.toMap()['nativeMaxObservedCaptureRevision'], 0);
+    expect(decoded.toMap()['visibilityBaselineCaptureRevision'], 1);
     expect(
       () => ARVisibilitySyntheticReceipt.fromMap(<String, Object?>{
         ...valid,
@@ -402,6 +409,8 @@ Map<String, Object?> _receipt({
     'geometryRevision': 3,
     'lineageRevision': 2,
     'durableCaptureRevision': 1,
+    'nativeMaxObservedCaptureRevision': 1,
+    'visibilityBaselineCaptureRevision': 1,
     'coverageRevision': 1,
     'styleRevision': 1,
     'targetSurfaceId': null,

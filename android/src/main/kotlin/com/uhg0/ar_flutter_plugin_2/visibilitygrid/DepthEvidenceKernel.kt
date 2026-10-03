@@ -79,12 +79,18 @@ internal class DepthEvidenceKernel(
     private var stageChangeSource = IntArray(stageCapacity)
     private var stageChangeTarget = IntArray(stageCapacity)
     private var stageChangeComponent = IntArray(stageCapacity)
+    private var stageKindCounts = IntArray(7)
+    // Reused scratch for source IDs retired by the canonical mutation that
+    // consumed the pending evidence packet.
+    private var stageRetiredSourceIds = IntArray(tableCapacity)
     private var stageCount = 0
     private var stageRelationCount = 0
     private var stageRelationAdmissionWork = 0
     private var stageOrderedSourceCount = 0
     private var stageOrderedTargetCount = 0
     private var stageChangeCount = 0
+    private val canonicalScratch = CanonicalSurfaceScratch()
+    private val canonicalSourceScratch = CanonicalSurfaceScratch()
 
     private var residentRows = 0
     private var lastSequence = Long.MIN_VALUE
@@ -104,62 +110,87 @@ internal class DepthEvidenceKernel(
     /** Stages one batch without changing retained evidence. */
     @Synchronized
     fun prepare(batch: DepthEvidenceBatch, surfaces: BoundedCanonicalSurfaceView): DepthEvidenceResult = try {
-        prepareLocked(batch, surfaces)
+        prepareLocked(batch, batch, surfaces)
     } catch (_: DepthLookupFailure) {
         resetStage()
         refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED, batch)
     }
 
-    private fun prepareLocked(batch: DepthEvidenceBatch, surfaces: BoundedCanonicalSurfaceView): DepthEvidenceResult {
-        if (closed) return refused(DepthEvidenceRefusal.CLOSED, batch)
-        if (pending != null) return refused(DepthEvidenceRefusal.PREPARED_BUSY, batch)
-        if (!batch.tracking) return refused(DepthEvidenceRefusal.NOT_TRACKING, batch)
-        if (batch.sequence <= lastSequence || batch.sourceTimestampNs <= lastTimestampNs) {
-            return refused(DepthEvidenceRefusal.DUPLICATE_TIMESTAMP, batch)
+    /**
+     * Stages a borrowed depth lease without materializing one object per sample.
+     * The metadata is copied by the admission owner. Preparation copies only
+     * the bounded primitive result into the kernel workspace, so the caller
+     * may close the lease as soon as this method returns.
+     */
+    @Synchronized
+    fun prepare(
+        samples: BorrowedDepthSamples,
+        metadata: DepthEvidenceMetadata,
+        surfaces: BoundedCanonicalSurfaceView,
+    ): DepthEvidenceResult = try {
+        prepareLocked(metadata, samples, surfaces)
+    } catch (_: DepthLookupFailure) {
+        resetStage()
+        refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED, metadata)
+    }
+
+    private fun prepareLocked(
+        metadata: DepthEvidenceMetadataView,
+        samples: DepthEvidenceSampleAccess,
+        surfaces: BoundedCanonicalSurfaceView,
+    ): DepthEvidenceResult {
+        if (closed) return refused(DepthEvidenceRefusal.CLOSED, metadata)
+        if (pending != null) return refused(DepthEvidenceRefusal.PREPARED_BUSY, metadata)
+        if (!metadata.tracking) return refused(DepthEvidenceRefusal.NOT_TRACKING, metadata)
+        if (metadata.sequence <= lastSequence || metadata.sourceTimestampNs <= lastTimestampNs) {
+            return refused(DepthEvidenceRefusal.DUPLICATE_TIMESTAMP, metadata)
         }
-        if (batch.sequence < 0L || batch.sourceTimestampNs <= 0L ||
-            !isAffine(batch.groupFromCameraGl) ||
-            activeFrame?.let { it != batch.groupFrame } == true
-        ) return refused(DepthEvidenceRefusal.INVALID_FRAME, batch)
+        if (metadata.sequence < 0L || metadata.sourceTimestampNs <= 0L ||
+            !isAffine(metadata.groupFromCameraGl) ||
+            activeFrame?.let { it != metadata.groupFrame } == true
+        ) return refused(DepthEvidenceRefusal.INVALID_FRAME, metadata)
         val revisionPair = canonicalAccess { surfaces.revisionPair }
         if (revisionPair.geometryRevision < 0L || revisionPair.lineageRevision < 0L ||
             revisionPair.geometryRevision == Long.MAX_VALUE || revisionPair.lineageRevision == Long.MAX_VALUE
-        ) return refused(DepthEvidenceRefusal.STALE_CANONICAL_CUT, batch)
-        if (batch.samples.size > configuration.sampleCapacity) {
-            return refused(DepthEvidenceRefusal.SAMPLE_CAPACITY, batch)
+        ) return refused(DepthEvidenceRefusal.STALE_CANONICAL_CUT, metadata)
+        if (samples.count > configuration.sampleCapacity) {
+            return refused(DepthEvidenceRefusal.SAMPLE_CAPACITY, metadata)
         }
-        val surfaceCapacity = minOf(configuration.surfaceCapacity, batch.groupFrame.modelCapacity)
-        if (batch.sourceRejectedSamples < 0 || canonicalAccess { surfaces.surfaceCount } !in 0..surfaceCapacity) {
-            return refused(if (batch.sourceRejectedSamples < 0) {
+        if (samples.rejectedCount != metadata.sourceRejectedSamples) {
+            return refused(DepthEvidenceRefusal.INVALID_SAMPLE, metadata)
+        }
+        val surfaceCapacity = minOf(configuration.surfaceCapacity, metadata.groupFrame.modelCapacity)
+        if (metadata.sourceRejectedSamples < 0 || canonicalAccess { surfaces.surfaceCount } !in 0..surfaceCapacity) {
+            return refused(if (metadata.sourceRejectedSamples < 0) {
                 DepthEvidenceRefusal.INVALID_SAMPLE
             } else {
                 DepthEvidenceRefusal.SURFACE_CAPACITY
-            }, batch)
+            }, metadata)
         }
 
-        val cameraGroup = transform(batch.groupFromCameraGl, DepthPointMm(0.0, 0.0, 0.0))
-            ?: return refused(DepthEvidenceRefusal.INVALID_FRAME, batch)
+        val cameraGroup = transform(metadata.groupFromCameraGl, DepthPointMm(0.0, 0.0, 0.0))
+            ?: return refused(DepthEvidenceRefusal.INVALID_FRAME, metadata)
         val staged = try {
-            stage(batch, surfaces, cameraGroup, revisionPair)
+            stage(metadata, samples, surfaces, cameraGroup, revisionPair)
         } catch (_: ArithmeticException) {
-            return refused(DepthEvidenceRefusal.ARITHMETIC_OVERFLOW, batch)
+            return refused(DepthEvidenceRefusal.ARITHMETIC_OVERFLOW, metadata)
         } catch (_: DuplicateTargetFailure) {
-            return refused(DepthEvidenceRefusal.DUPLICATE_TARGET, batch)
+            return refused(DepthEvidenceRefusal.DUPLICATE_TARGET, metadata)
         } catch (_: SourceOverlapFailure) {
-            return refused(DepthEvidenceRefusal.SOURCE_OVERLAP, batch)
+            return refused(DepthEvidenceRefusal.SOURCE_OVERLAP, metadata)
         } catch (_: StageCapacityFailure) {
-            return refused(DepthEvidenceRefusal.SURFACE_CAPACITY, batch)
+            return refused(DepthEvidenceRefusal.SURFACE_CAPACITY, metadata)
         }
         if (staged is Staged.Refused) {
             resetStage()
-            return refused(staged.reason, batch, staged.receipt)
+            return refused(staged.reason, metadata, staged.receipt)
         }
 
         val accepted = staged as Staged.Accepted
         val revisionAfterPlanning = canonicalAccess { surfaces.revisionPair }
         if (revisionAfterPlanning != revisionPair) {
             resetStage()
-            return refused(DepthEvidenceRefusal.STALE_CANONICAL_CUT, batch)
+            return refused(DepthEvidenceRefusal.STALE_CANONICAL_CUT, metadata)
         }
         pending = Pending(accepted.result.receipt, stageCount, accepted.frame)
         return accepted.result
@@ -167,9 +198,37 @@ internal class DepthEvidenceKernel(
 
     /** Installs the previously staged primitive evidence exactly once. */
     @Synchronized
-    fun applyPrepared(): DepthEvidenceApplyResult {
+    fun applyPrepared(canonicalMutation: PreparedCanonicalMutation? = null): DepthEvidenceApplyResult {
         if (closed) return DepthEvidenceApplyResult.NoPrepared(lastReceipt)
         val staged = pending ?: return DepthEvidenceApplyResult.NoPrepared(lastReceipt)
+        val retiredSourceCount = if (canonicalMutation == null) {
+            0
+        } else {
+            var count = 0
+            canonicalMutation.visitRemovedSurfaceIds { id ->
+                check(count < stageRetiredSourceIds.size)
+                stageRetiredSourceIds[count++] = id.value.toInt()
+                true
+            }
+            count
+        }
+        return applyPreparedInternal(staged, retiredSourceCount)
+    }
+
+    /** Test and adapter seam for an already known retired-ID set. */
+    @Synchronized
+    internal fun applyPrepared(retiredSourceIds: LongArray): DepthEvidenceApplyResult {
+        if (closed) return DepthEvidenceApplyResult.NoPrepared(lastReceipt)
+        val staged = pending ?: return DepthEvidenceApplyResult.NoPrepared(lastReceipt)
+        check(retiredSourceIds.size <= stageRetiredSourceIds.size)
+        retiredSourceIds.forEachIndexed { index, id ->
+            require(id in 1L..0xffff_ffffL)
+            stageRetiredSourceIds[index] = id.toInt()
+        }
+        return applyPreparedInternal(staged, retiredSourceIds.size)
+    }
+
+    private fun applyPreparedInternal(staged: Pending, retiredSourceCount: Int): DepthEvidenceApplyResult {
         for (index in 0 until staged.stageCount) {
             val row = findRow(stageX[index], stageY[index], stageZ[index])
             val resident = if (row == EMPTY_ROW) {
@@ -179,6 +238,7 @@ internal class DepthEvidenceKernel(
             }
             writeStage(resident, index)
         }
+        if (retiredSourceCount > 0) clearRetiredEvidenceSources(retiredSourceCount)
         lastSequence = staged.receipt.sequence
         lastTimestampNs = staged.receipt.sourceTimestampNs
         activeFrame = staged.frame
@@ -187,6 +247,38 @@ internal class DepthEvidenceKernel(
         pending = null
         resetStage()
         return DepthEvidenceApplyResult.Applied(lastReceipt)
+    }
+
+    /** Removes canonical source identities retired by the just-committed cut. */
+    private fun clearRetiredEvidenceSources(retiredSourceCount: Int) {
+        java.util.Arrays.sort(stageRetiredSourceIds, 0, retiredSourceCount)
+        for (row in hashRows.indices) {
+            if (hashRows[row] == EMPTY_ROW) continue
+            val resident = hashRows[row]
+            val sourceId = rowSourceId[resident]
+            if (sourceId == 0 ||
+                binarySearch(stageRetiredSourceIds, retiredSourceCount, sourceId) < 0
+            ) continue
+            rowSourceId[resident] = 0
+            rowSourceKey[resident] = rowVoxelKey[resident]
+            rowPackedNormal[resident] = 0
+            rowNormalConfidence[resident] = 0
+            rowLineageCount[resident] = 0
+        }
+    }
+
+    private fun binarySearch(values: IntArray, count: Int, value: Int): Int {
+        var low = 0
+        var high = count - 1
+        while (low <= high) {
+            val middle = (low + high) ushr 1
+            when (Integer.compare(values[middle], value)) {
+                0 -> return middle
+                -1 -> low = middle + 1
+                else -> high = middle - 1
+            }
+        }
+        return -1
     }
 
     /** Drops the staged packet and leaves all retained primitive state untouched. */
@@ -269,29 +361,33 @@ internal class DepthEvidenceKernel(
         stageChangeSource = IntArray(0)
         stageChangeTarget = IntArray(0)
         stageChangeComponent = IntArray(0)
+        stageKindCounts = IntArray(0)
+        stageRetiredSourceIds = IntArray(0)
         residentRows = 0
         activeFrame = null
         closed = true
     }
 
     private fun stage(
-        batch: DepthEvidenceBatch,
+        metadata: DepthEvidenceMetadataView,
+        samples: DepthEvidenceSampleAccess,
         surfaces: BoundedCanonicalSurfaceView,
         cameraGroup: DepthPointMm,
         revisionPair: CanonicalRevisionPair,
     ): Staged {
         resetStage()
+        val evidenceIndexWork = if (surfaces.supportsEmptyBlockSkipping) rebuildEvidenceBlocks() else 0
         var acceptedSamples = 0
-        var rejectedSamples = batch.sourceRejectedSamples
+        var rejectedSamples = metadata.sourceRejectedSamples
         var visits = 0
         var overflowCount = 0
         fun refuseAttempt(reason: DepthEvidenceRefusal, attemptedVisits: Int = visits): Staged.Refused {
-            val work = checkedAdd(acceptedSamples, checkedAdd(attemptedVisits, stageCount))
+            val work = checkedAdd(evidenceIndexWork, checkedAdd(acceptedSamples, checkedAdd(attemptedVisits, stageCount)))
             return Staged.Refused(
                 reason,
                 DepthEvidenceReceipt(
-                    sequence = batch.sequence,
-                    sourceTimestampNs = batch.sourceTimestampNs,
+                    sequence = metadata.sequence,
+                    sourceTimestampNs = metadata.sourceTimestampNs,
                     acceptedSamples = acceptedSamples,
                     rejectedSamples = rejectedSamples,
                     rayVisits = attemptedVisits,
@@ -303,34 +399,55 @@ internal class DepthEvidenceKernel(
             )
         }
 
-        for (sample in batch.samples) {
-            if (sample.x !in 0 until batch.intrinsics.imageWidth ||
-                sample.y !in 0 until batch.intrinsics.imageHeight ||
-                sample.confidence < configuration.confidenceMinimum ||
-                sample.depthMillimeters !in configuration.minimumDepthMillimetres..configuration.maximumDepthMillimetres
+        for (sampleIndex in 0 until samples.count) {
+            val x = samples.xAt(sampleIndex)
+            val y = samples.yAt(sampleIndex)
+            val depthMillimetres = samples.depthMillimetresAt(sampleIndex)
+            val confidence = samples.confidenceAt(sampleIndex)
+            if (x !in 0 until metadata.intrinsics.imageWidth ||
+                y !in 0 until metadata.intrinsics.imageHeight ||
+                confidence < configuration.confidenceMinimum ||
+                depthMillimetres !in configuration.minimumDepthMillimetres..configuration.maximumDepthMillimetres
             ) {
                 rejectedSamples = checkedAdd(rejectedSamples, 1)
                 continue
             }
             val cameraPoint = DepthPointMm(
-                (sample.x - batch.intrinsics.cx) * sample.depthMillimeters / batch.intrinsics.fx,
-                -(sample.y - batch.intrinsics.cy) * sample.depthMillimeters / batch.intrinsics.fy,
-                -sample.depthMillimeters.toDouble(),
+                (x - metadata.intrinsics.cx) * depthMillimetres / metadata.intrinsics.fx,
+                -(y - metadata.intrinsics.cy) * depthMillimetres / metadata.intrinsics.fy,
+                -depthMillimetres.toDouble(),
             )
             if (!cameraPoint.isFinite()) {
                 rejectedSamples = checkedAdd(rejectedSamples, 1)
                 continue
             }
-            val endpoint = transform(batch.groupFromCameraGl, cameraPoint)
+            val endpoint = transform(metadata.groupFromCameraGl, cameraPoint)
                 ?: throw ArithmeticException("non-finite depth transform")
-            val endpointVoxel = DepthVoxelAddressing.quantize(endpoint, batch.groupFrame.voxelSizeMicrometres)
+            val endpointVoxel = DepthVoxelAddressing.quantize(endpoint, metadata.groupFrame.voxelSizeMicrometres)
                 ?: return refuseAttempt(DepthEvidenceRefusal.ARITHMETIC_OVERFLOW)
-            val endpointLookup = canonicalAccess { surfaces.findSurfaceAt(endpointVoxel) }
-            if (endpointLookup != null) validateCanonicalSurface(surfaces, endpointVoxel, endpointLookup)
-            val endpointSurface = endpointLookup?.surface
-            val priorEndpointIndex = stageFind(endpointVoxel)
+            val endpointFound = canonicalAccess {
+                surfaces.findSurfaceAtInto(endpointVoxel.x, endpointVoxel.y, endpointVoxel.z, canonicalScratch)
+            }
+            val endpointId = if (endpointFound) canonicalScratch.id else 0L
+            val endpointVoxelX = if (endpointFound) canonicalScratch.addressedVoxelX else endpointVoxel.x
+            val endpointVoxelY = if (endpointFound) canonicalScratch.addressedVoxelY else endpointVoxel.y
+            val endpointVoxelZ = if (endpointFound) canonicalScratch.addressedVoxelZ else endpointVoxel.z
+            val endpointSourceVoxelX = if (endpointFound) canonicalScratch.voxelX else endpointVoxel.x
+            val endpointSourceVoxelY = if (endpointFound) canonicalScratch.voxelY else endpointVoxel.y
+            val endpointSourceVoxelZ = if (endpointFound) canonicalScratch.voxelZ else endpointVoxel.z
+            val endpointPackedNormal = if (endpointFound) canonicalScratch.packedNormal else 0
+            val endpointNormalConfidence = if (endpointFound) canonicalScratch.normalConfidence else 0
+            val endpointLineageCount = if (endpointFound) canonicalScratch.lineageCount else 0
+            if (endpointFound) validateCanonicalSurface(
+                surfaces, endpointVoxel.x, endpointVoxel.y, endpointVoxel.z, canonicalScratch,
+            )
+            val priorEndpointIndex = stageFind(endpointVoxelX, endpointVoxelY, endpointVoxelZ)
             val hadOccupied = priorEndpointIndex != EMPTY_ROW && stageHasOccupied[priorEndpointIndex]
-            val endpointIndex = stageIndex(endpointVoxel, endpointSurface)
+            val endpointIndex = stageIndex(
+                endpointVoxelX, endpointVoxelY, endpointVoxelZ,
+                endpointId, endpointSourceVoxelX, endpointSourceVoxelY, endpointSourceVoxelZ,
+                endpointPackedNormal, endpointNormalConfidence, endpointLineageCount,
+            )
             stageHasOccupied[endpointIndex] = true
             if (!hadOccupied || comparePoint(endpoint, occupiedPoint(endpointIndex)) < 0) {
                 stageOccupiedPointX[endpointIndex] = endpoint.x
@@ -348,18 +465,46 @@ internal class DepthEvidenceKernel(
             val remaining = configuration.rayVisitCapacity - visits
             if (remaining < 0) return refuseAttempt(DepthEvidenceRefusal.RAY_VISIT_CAPACITY)
             try {
-                rayResult = visitRayCells(cameraGroup, endpoint, batch.groupFrame, remaining) { voxel ->
-                    val lookup = if (voxel == endpointVoxel) endpointLookup else canonicalAccess { surfaces.findSurfaceAt(voxel) }
-                    if (!voxelInRange(voxel)) return@visitRayCells false
-                    if (lookup != null) validateCanonicalSurface(surfaces, voxel, lookup)
-                    val surface = lookup?.surface
-                    val candidateIndex = if (surface != null) stageIndex(voxel, surface) else stageFind(voxel)
-                    val cellCenter = center(voxel, batch.groupFrame)
-                    if (isFreeEvidence(cameraGroup, endpoint, endpointVoxel, voxel, cellCenter, batch.groupFrame)) {
-                        val retained = findRow(voxel) != EMPTY_ROW
+                rayResult = visitRayCellsInto(
+                    surfaces,
+                    cameraGroup,
+                    endpoint,
+                    metadata.groupFrame,
+                    remaining,
+                    endpointVoxel.x,
+                    endpointVoxel.y,
+                    endpointVoxel.z,
+                    endpointFound,
+                    endpointId,
+                    endpointSourceVoxelX,
+                    endpointSourceVoxelY,
+                    endpointSourceVoxelZ,
+                    endpointPackedNormal,
+                    endpointNormalConfidence,
+                    endpointLineageCount,
+                ) { xCell, yCell, zCell, lookup ->
+                    if (!voxelInRange(xCell, yCell, zCell)) return@visitRayCellsInto false
+                    val found = lookup.present
+                    if (found) validateCanonicalSurface(surfaces, xCell, yCell, zCell, lookup)
+                    val candidateIndex = if (found) stageIndex(
+                        xCell, yCell, zCell, lookup.id, lookup.voxelX, lookup.voxelY, lookup.voxelZ,
+                        lookup.packedNormal, lookup.normalConfidence, lookup.lineageCount,
+                    ) else stageFind(xCell, yCell, zCell)
+                    val centerX = centerCoordinate(xCell, metadata.groupFrame)
+                    val centerY = centerCoordinate(yCell, metadata.groupFrame)
+                    val centerZ = centerCoordinate(zCell, metadata.groupFrame)
+                    if (isFreeEvidence(
+                            cameraGroup, endpoint, endpointVoxelX, endpointVoxelY, endpointVoxelZ,
+                            xCell, yCell, zCell, centerX, centerY, centerZ, metadata.groupFrame,
+                        )
+                    ) {
+                        val retained = findRow(xCell, yCell, zCell) != EMPTY_ROW
                         if (candidateIndex != EMPTY_ROW || retained) {
-                            val index = if (candidateIndex != EMPTY_ROW) candidateIndex else stageIndex(voxel, null)
-                            val direction = directionBin(cameraGroup, cellCenter)
+                            val index = if (candidateIndex != EMPTY_ROW) candidateIndex else stageIndex(xCell, yCell, zCell, 0L, 0, 0, 0, 0, 0, 0)
+                            val direction = directionBin(
+                                cameraGroup.x, cameraGroup.y, cameraGroup.z,
+                                centerX, centerY, centerZ,
+                            )
                             stageFreeBin[index] = if (stageFreeBinValue(index) == NO_DIRECTION) {
                                 direction.toByte()
                             } else {
@@ -377,19 +522,19 @@ internal class DepthEvidenceKernel(
             if (rayResult.arithmeticOverflow) {
                 return refuseAttempt(
                     DepthEvidenceRefusal.ARITHMETIC_OVERFLOW,
-                    checkedAdd(visits, rayResult.visitedCells),
+                    checkedAdd(visits, rayResult.workUnits),
                 )
             }
             if (rayResult.truncated ||
-                rayResult.visitedCells < 0 || rayResult.visitedCells > remaining
+                rayResult.workUnits < 0 || rayResult.workUnits > remaining
             ) return refuseAttempt(
                 DepthEvidenceRefusal.RAY_VISIT_CAPACITY,
-                checkedAdd(visits, rayResult.visitedCells),
+                checkedAdd(visits, rayResult.workUnits),
             )
-            visits = checkedAdd(visits, rayResult.visitedCells)
+            visits = checkedAdd(visits, rayResult.workUnits)
             acceptedSamples = checkedAdd(acceptedSamples, 1)
         }
-        if (acceptedSamples == 0 && batch.samples.isNotEmpty()) {
+        if (acceptedSamples == 0 && samples.count > 0) {
             return refuseAttempt(DepthEvidenceRefusal.INVALID_SAMPLE)
         }
         var directionVotes = 0
@@ -397,13 +542,13 @@ internal class DepthEvidenceKernel(
         for (index in 0 until stageCount) {
             if (stageHasOccupied[index]) {
                 val updated = increment(stageOccupiedValue(index))
-                stageOccupied[index] = updated.first.toByte()
-                if (updated.second) overflowCount = checkedAdd(overflowCount, 1)
+                stageOccupied[index] = (updated and 0xff).toByte()
+                if (updated ushr 8 != 0) overflowCount = checkedAdd(overflowCount, 1)
             }
             if (stageFreeBinValue(index) != NO_DIRECTION) {
                 val updated = increment(stageFreeValue(index))
-                stageFree[index] = updated.first.toByte()
-                if (updated.second) overflowCount = checkedAdd(overflowCount, 1)
+                stageFree[index] = (updated and 0xff).toByte()
+                if (updated ushr 8 != 0) overflowCount = checkedAdd(overflowCount, 1)
                 val bit = 1 shl stageFreeBinValue(index)
                 if (stageDirections[index] and bit == 0) {
                     stageDirections[index] = stageDirections[index] or bit
@@ -422,20 +567,20 @@ internal class DepthEvidenceKernel(
         }
         val projection = projectedSurfaceCount(canonicalAccess { surfaces.surfaceCount })
         if (projection.count < 0) throw DepthLookupFailure()
-        if (residentRows + newRows > minOf(configuration.surfaceCapacity, batch.groupFrame.modelCapacity) ||
-            projection.count > minOf(configuration.surfaceCapacity, batch.groupFrame.modelCapacity)
+        if (residentRows + newRows > minOf(configuration.surfaceCapacity, metadata.groupFrame.modelCapacity) ||
+            projection.count > minOf(configuration.surfaceCapacity, metadata.groupFrame.modelCapacity)
         ) {
             return refuseAttempt(DepthEvidenceRefusal.SURFACE_CAPACITY)
         }
-        val immutableChanges = materializeChanges(cameraGroup, batch.groupFrame)
+        val immutableChanges = materializeChanges(cameraGroup, metadata.groupFrame)
         val kindCounts = kindCounts(stageChangeKind, stageChangeCount)
         val virtualWork = checkedAdd(
             checkedAdd(orderingWork, checkedAdd(planningWork, checkedAdd(validation.work, projection.work))),
-            checkedAdd(stageRelationAdmissionWork, checkedAdd(acceptedSamples, checkedAdd(visits, stageCount))),
+            checkedAdd(evidenceIndexWork, checkedAdd(stageRelationAdmissionWork, checkedAdd(acceptedSamples, checkedAdd(visits, stageCount)))),
         )
         val receipt = DepthEvidenceReceipt(
-            sequence = batch.sequence,
-            sourceTimestampNs = batch.sourceTimestampNs,
+            sequence = metadata.sequence,
+            sourceTimestampNs = metadata.sourceTimestampNs,
             acceptedSamples = acceptedSamples,
             rejectedSamples = rejectedSamples,
             rayVisits = visits,
@@ -471,7 +616,7 @@ internal class DepthEvidenceKernel(
                 work,
             ),
             stageCount,
-            batch.groupFrame,
+            metadata.groupFrame,
         )
     }
 
@@ -868,39 +1013,86 @@ internal class DepthEvidenceKernel(
         camera, endpoint, frame.voxelSizeMicrometres, maximumVisits, visitor,
     )
 
+    private fun visitRayCellsInto(
+        surfaces: BoundedCanonicalSurfaceView,
+        camera: DepthPointMm,
+        endpoint: DepthPointMm,
+        frame: VisibilityGroupFrame,
+        maximumVisits: Int,
+        endpointVoxelX: Int,
+        endpointVoxelY: Int,
+        endpointVoxelZ: Int,
+        endpointFound: Boolean,
+        endpointId: Long,
+        endpointSourceVoxelX: Int,
+        endpointSourceVoxelY: Int,
+        endpointSourceVoxelZ: Int,
+        endpointPackedNormal: Int,
+        endpointNormalConfidence: Int,
+        endpointLineageCount: Int,
+        visitor: (Int, Int, Int, CanonicalSurfaceScratch) -> Boolean,
+    ): DepthRayVisitResult = DepthRaySupercover.visitCoordinates(
+        camera, endpoint, frame.voxelSizeMicrometres, maximumVisits,
+        emptyBlock = if (surfaces.supportsEmptyBlockSkipping) { x, y, z, size ->
+            !hasEvidenceBlock(x, y, z, size) && surfaces.isKnownEmptyBlock(x, y, z, size)
+        } else null,
+    ) { x, y, z ->
+        if (x == endpointVoxelX && y == endpointVoxelY && z == endpointVoxelZ) {
+            if (endpointFound) {
+                canonicalScratch.setAddressed(
+                    endpointId,
+                    endpointVoxelX, endpointVoxelY, endpointVoxelZ,
+                    endpointSourceVoxelX, endpointSourceVoxelY, endpointSourceVoxelZ,
+                    endpointPackedNormal, endpointNormalConfidence, endpointLineageCount,
+                )
+            } else {
+                canonicalScratch.clear()
+            }
+        } else if (!surfaces.findSurfaceAtInto(x, y, z, canonicalScratch)) {
+            canonicalScratch.clear()
+        }
+        visitor(x, y, z, canonicalScratch)
+    }
+
     private fun isFreeEvidence(
         camera: DepthPointMm,
         endpoint: DepthPointMm,
-        endpointVoxel: Voxel,
-        voxel: Voxel,
-        cellCenter: DepthPointMm,
+        endpointVoxelX: Int,
+        endpointVoxelY: Int,
+        endpointVoxelZ: Int,
+        voxelX: Int,
+        voxelY: Int,
+        voxelZ: Int,
+        cellCenterX: Double,
+        cellCenterY: Double,
+        cellCenterZ: Double,
         frame: VisibilityGroupFrame,
     ): Boolean {
-        if (voxel == endpointVoxel) return false
-        if (frame.voxelSizeMicrometres <= 0 || !voxelInRange(voxel)) return false
+        if (voxelX == endpointVoxelX && voxelY == endpointVoxelY && voxelZ == endpointVoxelZ) return false
+        if (frame.voxelSizeMicrometres <= 0 || !voxelInRange(voxelX, voxelY, voxelZ)) return false
         val dx = endpoint.x - camera.x
         val dy = endpoint.y - camera.y
         val dz = endpoint.z - camera.z
         val length2 = dx * dx + dy * dy + dz * dz
         if (!length2.isFinite() || length2 <= 0.0) return false
-        val toCellX = cellCenter.x - camera.x
-        val toCellY = cellCenter.y - camera.y
-        val toCellZ = cellCenter.z - camera.z
+        val toCellX = cellCenterX - camera.x
+        val toCellY = cellCenterY - camera.y
+        val toCellZ = cellCenterZ - camera.z
         val projection = (toCellX * dx + toCellY * dy + toCellZ * dz) / length2
         if (!projection.isFinite() || projection < 0.0 || projection > 1.0) return false
         val closestX = camera.x + projection * dx
         val closestY = camera.y + projection * dy
         val closestZ = camera.z + projection * dz
-        val offX = cellCenter.x - closestX
-        val offY = cellCenter.y - closestY
-        val offZ = cellCenter.z - closestZ
+        val offX = cellCenterX - closestX
+        val offY = cellCenterY - closestY
+        val offZ = cellCenterZ - closestZ
         val size = frame.voxelSizeMicrometres.toDouble() / 1_000.0
         val halfDiagonal = size * sqrt(3.0) * 0.5
         val projectionExtent = halfDiagonal / sqrt(length2)
         if (projection + projectionExtent < 0.0 || projection - projectionExtent > 1.0) return false
-        val voxelMinX = voxel.x * size
-        val voxelMinY = voxel.y * size
-        val voxelMinZ = voxel.z * size
+        val voxelMinX = voxelX * size
+        val voxelMinY = voxelY * size
+        val voxelMinZ = voxelZ * size
         val voxelMaxX = voxelMinX + size
         val voxelMaxY = voxelMinY + size
         val voxelMaxZ = voxelMinZ + size
@@ -926,15 +1118,25 @@ internal class DepthEvidenceKernel(
 
     private fun validateCanonicalSurface(
         surfaces: BoundedCanonicalSurfaceView,
-        addressedVoxel: Voxel,
-        lookup: AddressedCanonicalSurface,
+        addressedX: Int,
+        addressedY: Int,
+        addressedZ: Int,
+        lookup: CanonicalSurfaceScratch,
     ) {
-        if (lookup.addressedVoxel != addressedVoxel) throw DepthLookupFailure()
+        if (!lookup.present || lookup.addressedVoxelX != addressedX ||
+            lookup.addressedVoxelY != addressedY || lookup.addressedVoxelZ != addressedZ
+        ) throw DepthLookupFailure()
         if (canonicalAccess { surfaces.surfaceCount } == 0) throw DepthLookupFailure()
-        val surface = lookup.surface
-        val canonical = canonicalAccess { surfaces.findSurfaceById(surface.id) } ?: throw DepthLookupFailure()
-        if (canonical.id != surface.id || !voxelInRange(surface.voxel)) throw DepthLookupFailure()
-        if (canonical.voxel != surface.voxel) throw DuplicateTargetFailure()
+        val surfaceId = lookup.id
+        val surfaceX = lookup.voxelX
+        val surfaceY = lookup.voxelY
+        val surfaceZ = lookup.voxelZ
+        if (!voxelInRange(surfaceX, surfaceY, surfaceZ)) throw DepthLookupFailure()
+        val canonicalFound = canonicalAccess { surfaces.findSurfaceByIdInto(surfaceId, canonicalSourceScratch) }
+        if (!canonicalFound || canonicalSourceScratch.id != surfaceId) throw DepthLookupFailure()
+        if (canonicalSourceScratch.voxelX != surfaceX || canonicalSourceScratch.voxelY != surfaceY ||
+            canonicalSourceScratch.voxelZ != surfaceZ
+        ) throw DuplicateTargetFailure()
     }
 
     private fun validateEmittedSource(surfaces: BoundedCanonicalSurfaceView, sourceId: Long) {
@@ -990,23 +1192,38 @@ internal class DepthEvidenceKernel(
         }
     }
 
-    private fun stageIndex(voxel: Voxel, surface: DepthCanonicalSurface?): Int {
-        var index = stageFind(voxel)
+    private fun stageIndex(
+        x: Int,
+        y: Int,
+        z: Int,
+        surfaceId: Long,
+        surfaceX: Int,
+        surfaceY: Int,
+        surfaceZ: Int,
+        surfacePackedNormal: Int,
+        surfaceNormalConfidence: Int,
+        surfaceLineageCount: Int,
+    ): Int {
+        var index = stageFind(x, y, z)
         if (index != EMPTY_ROW) {
-            if (surface != null) stageAttach(index, surface)
+            if (surfaceId != 0L) stageAttach(
+                index, surfaceId, surfaceX, surfaceY, surfaceZ,
+                surfacePackedNormal, surfaceNormalConfidence, surfaceLineageCount,
+            )
             return index
         }
         if (stageCount >= stageCapacity) throw StageCapacityFailure()
         index = stageCount++
-        stageX[index] = voxel.x
-        stageY[index] = voxel.y
-        stageZ[index] = voxel.z
+        stageX[index] = x
+        stageY[index] = y
+        stageZ[index] = z
+        markEvidenceBlock(x, y, z)
         stageOccupied[index] = 0
         stageFree[index] = 0
         stageDirections[index] = 0
         stageContradicted[index] = false
         stageSourceId[index] = 0
-        stageSourceKey[index] = packVisibilityGridKey(voxel.x, voxel.y, voxel.z)
+        stageSourceKey[index] = packVisibilityGridKey(x, y, z)
         stagePackedNormal[index] = 0
         stageNormalConfidence[index] = 0
         stagePublished[index] = false
@@ -1019,7 +1236,7 @@ internal class DepthEvidenceKernel(
         stageOccupiedPointY[index] = 0.0
         stageOccupiedPointZ[index] = 0.0
         stageFreeBin[index] = NO_DIRECTION.toByte()
-        val resident = findRow(voxel.x, voxel.y, voxel.z)
+        val resident = findRow(x, y, z)
         if (resident != EMPTY_ROW) {
             stageOccupied[index] = rowOccupied[resident]
             stageFree[index] = rowFree[resident]
@@ -1032,23 +1249,35 @@ internal class DepthEvidenceKernel(
             stageNormalConfidence[index] = rowNormalConfidence[resident]
             stageLineageCount[index] = rowLineageCount[resident]
         }
-        var slot = stageHash(packVisibilityGridKey(voxel.x, voxel.y, voxel.z))
+        var slot = stageHash(packVisibilityGridKey(x, y, z))
         while (stageHashRows[slot] != EMPTY_ROW) slot = (slot + 1) and (stageHashCapacity - 1)
         stageHashRows[slot] = index
-        if (surface != null) stageAttach(index, surface)
+        if (surfaceId != 0L) stageAttach(
+            index, surfaceId, surfaceX, surfaceY, surfaceZ,
+            surfacePackedNormal, surfaceNormalConfidence, surfaceLineageCount,
+        )
         return index
     }
 
-    private fun stageAttach(index: Int, surface: DepthCanonicalSurface) {
+    private fun stageAttach(
+        index: Int,
+        surfaceId: Long,
+        surfaceX: Int,
+        surfaceY: Int,
+        surfaceZ: Int,
+        surfacePackedNormal: Int,
+        surfaceNormalConfidence: Int,
+        surfaceLineageCount: Int,
+    ) {
         val prior = stageSourceIdValue(index)
-        stageAddRelation(index, surface.id.value)
-        if (prior == 0L || surface.id.value < prior) {
-            if (prior != 0L && surface.id.value != prior) stageChangeSource[index] = prior.toInt()
-            stageSourceId[index] = surface.id.value.toInt()
-            stageSourceKey[index] = packVisibilityGridKey(surface.voxel.x, surface.voxel.y, surface.voxel.z)
-            stagePackedNormal[index] = surface.packedNormal.toShort()
-            stageNormalConfidence[index] = surface.normalConfidence.toByte()
-            stageLineageCount[index] = surface.lineageCount.toShort()
+        stageAddRelation(index, surfaceId)
+        if (prior == 0L || surfaceId < prior) {
+            if (prior != 0L && surfaceId != prior) stageChangeSource[index] = prior.toInt()
+            stageSourceId[index] = surfaceId.toInt()
+            stageSourceKey[index] = packVisibilityGridKey(surfaceX, surfaceY, surfaceZ)
+            stagePackedNormal[index] = surfacePackedNormal.toShort()
+            stageNormalConfidence[index] = surfaceNormalConfidence.toByte()
+            stageLineageCount[index] = surfaceLineageCount.toShort()
             stagePublished[index] = false
         }
     }
@@ -1241,6 +1470,40 @@ internal class DepthEvidenceKernel(
         return Math.multiplyExact(count, Int.SIZE_BYTES * 2)
     }
 
+    /** Planning has not begun: its order array temporarily owns a conservative block bitset. */
+    private fun rebuildEvidenceBlocks(): Int {
+        java.util.Arrays.fill(stageComponentOrder, 0, Integer.highestOneBit(stageCapacity), 0)
+        val mask = (1L shl 21) - 1L
+        for (row in 0 until residentRows) {
+            val key = rowVoxelKey[row]
+            markEvidenceBlock(
+                ((key ushr 42) and mask).toInt() + VOXEL_COORDINATE_MIN,
+                ((key ushr 21) and mask).toInt() + VOXEL_COORDINATE_MIN,
+                (key and mask).toInt() + VOXEL_COORDINATE_MIN,
+            )
+        }
+        return residentRows
+    }
+
+    private fun evidenceBlockWord(x: Int, y: Int, z: Int, size: Int): Int =
+        (depthBlockHash(depthBlockParentKey(x, y, z, size)) and (Integer.highestOneBit(stageCapacity) / 2 - 1)) * 2
+
+    private fun markEvidenceBlock(x: Int, y: Int, z: Int) {
+        if (stageCapacity < 2) return
+        val word = evidenceBlockWord(x, y, z, 1)
+        val bits = depthBlockQueryMask(x, y, z, 1)
+        stageComponentOrder[word] = stageComponentOrder[word] or bits.toInt()
+        stageComponentOrder[word + 1] = stageComponentOrder[word + 1] or (bits ushr 32).toInt()
+    }
+
+    private fun hasEvidenceBlock(x: Int, y: Int, z: Int, size: Int): Boolean {
+        if (stageCapacity < 2) return true
+        val word = evidenceBlockWord(x, y, z, size)
+        val bits = depthBlockQueryMask(x, y, z, size)
+        return stageComponentOrder[word] and bits.toInt() != 0 ||
+            stageComponentOrder[word + 1] and (bits ushr 32).toInt() != 0
+    }
+
     private fun resetStage() {
         java.util.Arrays.fill(stageHashRows, EMPTY_ROW)
         java.util.Arrays.fill(stageFreeBin, NO_DIRECTION.toByte())
@@ -1300,12 +1563,12 @@ internal class DepthEvidenceKernel(
 
     private fun refused(
         reason: DepthEvidenceRefusal,
-        batch: DepthEvidenceBatch,
+        metadata: DepthEvidenceMetadataView,
         attempt: DepthEvidenceReceipt? = null,
     ): DepthEvidenceResult.Refused {
         val base = attempt ?: DepthEvidenceReceipt(
-            sequence = batch.sequence,
-            sourceTimestampNs = batch.sourceTimestampNs,
+            sequence = metadata.sequence,
+            sourceTimestampNs = metadata.sourceTimestampNs,
         )
         val receipt = if (reason == DepthEvidenceRefusal.SAMPLE_CAPACITY ||
             reason == DepthEvidenceRefusal.RAY_VISIT_CAPACITY ||
@@ -1320,7 +1583,8 @@ internal class DepthEvidenceKernel(
         return DepthEvidenceResult.Refused(reason, receipt)
     }
 
-    private fun kindCounts(kinds: ByteArray, count: Int): IntArray = IntArray(7).also { counts ->
+    private fun kindCounts(kinds: ByteArray, count: Int): IntArray = stageKindCounts.also { counts ->
+        counts.fill(0)
         for (index in 0 until count) when (kinds[index].toInt()) {
             CHANGE_CREATE -> counts[0]++
             CHANGE_REFINE -> counts[1]++
@@ -1346,18 +1610,28 @@ internal class DepthEvidenceKernel(
     }
 
     private fun directionDot(first: Int, second: Int): Double {
-        fun vector(bin: Int): DoubleArray {
-            val elevation = when (bin / 8) { 0 -> -PI / 4.0; 1 -> 0.0; else -> PI / 4.0 }
-            val azimuth = -PI + (bin % 8 + 0.5) * PI / 4.0
-            val horizontal = kotlin.math.cos(elevation)
-            return doubleArrayOf(kotlin.math.sin(azimuth) * horizontal, kotlin.math.sin(elevation), -kotlin.math.cos(azimuth) * horizontal)
-        }
-        val left = vector(first); val right = vector(second)
-        return left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
+        val leftElevation = when (first / 8) { 0 -> -PI / 4.0; 1 -> 0.0; else -> PI / 4.0 }
+        val rightElevation = when (second / 8) { 0 -> -PI / 4.0; 1 -> 0.0; else -> PI / 4.0 }
+        val leftAzimuth = -PI + (first % 8 + 0.5) * PI / 4.0
+        val rightAzimuth = -PI + (second % 8 + 0.5) * PI / 4.0
+        return kotlin.math.sin(leftElevation) * kotlin.math.sin(rightElevation) +
+            kotlin.math.cos(leftElevation) * kotlin.math.cos(rightElevation) *
+            kotlin.math.cos(leftAzimuth - rightAzimuth)
     }
 
     private fun directionBin(camera: DepthPointMm, endpoint: DepthPointMm): Int {
-        val x = endpoint.x - camera.x; val y = endpoint.y - camera.y; val z = endpoint.z - camera.z
+        return directionBin(camera.x, camera.y, camera.z, endpoint.x, endpoint.y, endpoint.z)
+    }
+
+    private fun directionBin(
+        cameraX: Double,
+        cameraY: Double,
+        cameraZ: Double,
+        endpointX: Double,
+        endpointY: Double,
+        endpointZ: Double,
+    ): Int {
+        val x = endpointX - cameraX; val y = endpointY - cameraY; val z = endpointZ - cameraZ
         val length = sqrt(x * x + y * y + z * z)
         if (!length.isFinite() || length <= 0.0) return 0
         val azimuth = atan2(x, -z)
@@ -1368,9 +1642,13 @@ internal class DepthEvidenceKernel(
     }
 
     private fun center(voxel: Voxel, frame: VisibilityGroupFrame): DepthPointMm {
-        val size = frame.voxelSizeMicrometres.toDouble() / 1_000.0
-        return DepthPointMm((voxel.x + 0.5) * size, (voxel.y + 0.5) * size, (voxel.z + 0.5) * size)
+        return DepthPointMm(
+            centerCoordinate(voxel.x, frame), centerCoordinate(voxel.y, frame), centerCoordinate(voxel.z, frame),
+        )
     }
+
+    private fun centerCoordinate(coordinate: Int, frame: VisibilityGroupFrame): Double =
+        (coordinate + 0.5) * frame.voxelSizeMicrometres.toDouble() / 1_000.0
 
     private fun transform(matrix: List<Double>, pointMm: DepthPointMm): DepthPointMm? {
         val x = pointMm.x / 1_000.0; val y = pointMm.y / 1_000.0; val z = pointMm.z / 1_000.0
@@ -1404,9 +1682,13 @@ internal class DepthEvidenceKernel(
         kotlin.math.abs(matrix[3]) <= 1e-6 && kotlin.math.abs(matrix[7]) <= 1e-6 &&
         kotlin.math.abs(matrix[11]) <= 1e-6 && kotlin.math.abs(matrix[15] - 1.0) <= 1e-6
 
-    private fun voxelInRange(voxel: Voxel): Boolean = DepthVoxelAddressing.contains(voxel)
+    private fun voxelInRange(voxel: Voxel): Boolean = voxelInRange(voxel.x, voxel.y, voxel.z)
 
-    private fun increment(value: Int): Pair<Int, Boolean> = if (value >= 255) 255 to true else value + 1 to false
+    private fun voxelInRange(x: Int, y: Int, z: Int): Boolean =
+        DepthVoxelAddressing.contains(x, y, z)
+
+    /** Packs the saturated byte value and overflow bit into one scalar. */
+    private fun increment(value: Int): Int = if (value >= 255) 255 or (1 shl 8) else value + 1
 
     private fun checkedAdd(left: Int, right: Int): Int = Math.addExact(left, right)
 
@@ -1442,6 +1724,8 @@ internal class DepthEvidenceKernel(
         stageComponentRank,
         stageComponent, stagePositive, stageRemoval, stageChangeKind,
         stageChangeSource, stageChangeTarget, stageChangeComponent,
+        stageKindCounts,
+        stageRetiredSourceIds,
     )
 
     private fun fixedPrimitiveBytes(): Int = Math.toIntExact(

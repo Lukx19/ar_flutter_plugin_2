@@ -775,8 +775,8 @@ class DurableSessionStoreV2(
     private fun path(base: File, vararg names: String): File = files.child(*(relative(base) + names))
     private fun safe(value: String) = sha256(value.toByteArray()).hex()
     private fun sha256(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes)
-    private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
-    private fun List<Int>.hex() = joinToString("") { "%02x".format(it) }
+    private fun ByteArray.hex() = toCaptureHashHex()
+    private fun List<Int>.hex() = toCaptureHashHex()
     private data class Staged(val kind: CaptureComponentKind, val file: File, val descriptor: CaptureComponentDescriptor)
     private data class RootPointer(val revision: Long, val rootHash: String, val commitId: String, val slot: String = "", val previousHash: String? = null)
     private companion object {

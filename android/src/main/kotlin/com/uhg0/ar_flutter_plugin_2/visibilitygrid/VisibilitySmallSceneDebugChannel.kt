@@ -224,6 +224,12 @@ internal class VisibilitySmallSceneDebugChannel(
                             )
                         }
                     }
+                    // The finite offer intentionally exercises latest-only
+                    // replacement. Settle both lanes before the command
+                    // receipt snapshots copied counters; otherwise the
+                    // preceding wall command can still hold every bounded
+                    // producer slot and make this receipt timing-dependent.
+                    runtime.awaitDebugFixtureIdle()
                 }
                 SmallSceneStep.MAXIMUM_SAMPLES -> {
                     runtime.awaitDebugFixtureIdle()
@@ -241,7 +247,7 @@ internal class VisibilitySmallSceneDebugChannel(
                     // The full 4,096-point batch may correctly exhaust the
                     // bounded lookup. Retry with one fresh depth sample to
                     // prove the retained feature cut remains usable.
-                    check(source.emitDepth(8_500_000_000L, 0, 0)) {
+                    check(source.emitMonotonicDepth(8_500_000_000L, 0, 0)) {
                         "bounded synthetic depth retry was not copied"
                     }
                     runtime.awaitDebugFixtureIdle()
@@ -524,6 +530,8 @@ internal class VisibilitySmallSceneDebugChannel(
             geometryRevision = provided.geometryRevision,
             lineageRevision = provided.lineageRevision,
             durableCaptureRevision = provided.durableCaptureRevision,
+            nativeMaxObservedCaptureRevision = provided.nativeMaxObservedCaptureRevision,
+            visibilityBaselineCaptureRevision = provided.visibilityBaselineCaptureRevision,
             coverageRevision = provided.coverageRevision,
             styleRevision = provided.styleRevision,
             targetSurfaceId = provided.targetSurfaceId,
@@ -640,6 +648,10 @@ internal data class SmallSceneScenarioReceipt(
     val geometryRevision: Long,
     val lineageRevision: Long,
     val durableCaptureRevision: Long,
+    /** Maximum native capture revision observed across current and recovered sessions. */
+    val nativeMaxObservedCaptureRevision: Long,
+    /** Startup capture revision retained by the visibility binding baseline. */
+    val visibilityBaselineCaptureRevision: Long,
     val coverageRevision: Long,
     val styleRevision: Long,
     val targetSurfaceId: Long?,
@@ -663,6 +675,8 @@ internal data class SmallSceneScenarioReceipt(
         require(geometryRevision >= 0L)
         require(lineageRevision >= 0L)
         require(durableCaptureRevision >= 0L)
+        require(nativeMaxObservedCaptureRevision >= 0L)
+        require(visibilityBaselineCaptureRevision >= 0L)
         require(coverageRevision >= 0L)
         require(styleRevision >= 0L)
         require(targetSurfaceId == null || targetSurfaceId >= 0L)
@@ -686,6 +700,8 @@ internal data class SmallSceneScenarioReceipt(
         "geometryRevision" to geometryRevision,
         "lineageRevision" to lineageRevision,
         "durableCaptureRevision" to durableCaptureRevision,
+        "nativeMaxObservedCaptureRevision" to nativeMaxObservedCaptureRevision,
+        "visibilityBaselineCaptureRevision" to visibilityBaselineCaptureRevision,
         "coverageRevision" to coverageRevision,
         "styleRevision" to styleRevision,
         "targetSurfaceId" to targetSurfaceId,
@@ -732,6 +748,8 @@ internal data class VisibilitySmallSceneReceiptScalars(
     val geometryRevision: Long = 0L,
     val lineageRevision: Long = 0L,
     val durableCaptureRevision: Long = 0L,
+    val nativeMaxObservedCaptureRevision: Long = 0L,
+    val visibilityBaselineCaptureRevision: Long = 0L,
     val coverageRevision: Long = 0L,
     val styleRevision: Long = 0L,
     val targetSurfaceId: Long? = null,
@@ -748,6 +766,8 @@ internal data class VisibilitySmallSceneReceiptScalars(
         require(geometryRevision >= 0L)
         require(lineageRevision >= 0L)
         require(durableCaptureRevision >= 0L)
+        require(nativeMaxObservedCaptureRevision >= 0L)
+        require(visibilityBaselineCaptureRevision >= 0L)
         require(coverageRevision >= 0L)
         require(styleRevision >= 0L)
         require(targetSurfaceId == null || targetSurfaceId >= 0L)

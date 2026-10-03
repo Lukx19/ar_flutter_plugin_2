@@ -51,6 +51,56 @@ class RawDepthCopySourceTest {
     }
 
     @Test
+    fun `packed selection transfers one lease and closes it exactly once`() {
+        val depth = FakeRawDepthImage(width = 4, height = 3, value = 1_000)
+        val confidence = FakeRawDepthImage(width = 4, height = 3, value = 255)
+        val pool = DepthSamplesLeasePool(capacity = 64)
+        val result = RawDepthCopySource(
+            acquirer = FakePairedAcquirer(depth, confidence),
+            maxCopiedPixels = 64,
+        ).acquirePacked(
+            metadataForDimensions = { width, height -> metadata(width, height) },
+            pool = pool,
+            generation = SampleLeaseGeneration(1, 2, 3, 4),
+        )
+
+        assertTrue(result is PackedDepthAcquisitionResult.Observation)
+        val lease = (result as PackedDepthAcquisitionResult.Observation).lease
+        assertEquals(12, lease.samples.count)
+        assertEquals(0, lease.samples.xAt(0))
+        assertEquals(1_000, lease.samples.depthMillimetresAt(11))
+        assertEquals(1, pool.leasedCount())
+        assertEquals(1, depth.closeCount)
+        assertEquals(1, confidence.closeCount)
+        lease.close()
+        lease.close()
+        assertEquals(0, pool.leasedCount())
+        assertThrows(IllegalStateException::class.java) { lease.samples.count }
+        pool.close()
+    }
+
+    @Test
+    fun `packed all-invalid depth remains transient and releases its slot`() {
+        val depth = FakeRawDepthImage(width = 4, height = 3, value = 0)
+        val confidence = FakeRawDepthImage(width = 4, height = 3, value = 255)
+        val pool = DepthSamplesLeasePool(capacity = 64)
+        val result = RawDepthCopySource(
+            acquirer = FakePairedAcquirer(depth, confidence),
+            maxCopiedPixels = 64,
+        ).acquirePacked(
+            metadataForDimensions = { width, height -> metadata(width, height) },
+            pool = pool,
+            generation = SampleLeaseGeneration(1, 2, 3, 4),
+        )
+
+        assertTrue(result === PackedDepthAcquisitionResult.TransientUnavailable)
+        assertEquals(0, pool.leasedCount())
+        assertEquals(1, depth.closeCount)
+        assertEquals(1, confidence.closeCount)
+        pool.close()
+    }
+
+    @Test
     fun `dense predicted depth is accepted without a confidence plane`() {
         val depth = FakeRawDepthImage(width = 4, height = 3, value = 1_000)
         val result = RawDepthCopySource(

@@ -4,7 +4,9 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererCoverage
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererResidency
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererTarget
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridRendererState
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageCommittedRow
@@ -138,6 +140,141 @@ class CoverageRendererSelectionTest {
                 style = CoverageRendererStyleRowV1(),
             )
         }
+    }
+
+    private class FixedStreamRows(
+        private val values: MutableList<CoverageCommittedRow>,
+    ) : CoverageCommittedRows {
+        var styleRevision: Long = 1L
+        override val count: Int get() = values.size
+        override val capacity: Int get() = values.size
+        override val qualifier: CoverageRowsQualifier
+            get() = CoverageRowsQualifier(1L, 1L, 1L, 1L, 1L, styleRevision)
+
+        override fun rowAt(index: Int): CoverageCommittedRow = values[index]
+
+        fun append(row: CoverageCommittedRow) {
+            values += row
+        }
+
+        fun replace(index: Int, row: CoverageCommittedRow) {
+            values[index] = row
+        }
+    }
+
+    @Test
+    fun `streamed selector preserves target need residency and identity ordering over capacity`() {
+        val rows = FixedStreamRows(
+            mutableListOf(
+                committedRow(
+                    400L,
+                    40L,
+                    CoverageRendererStyleRowV1(
+                        coverage = CoverageRendererCoverage.PARTIAL,
+                        target = CoverageRendererTarget.PRIMARY,
+                    ),
+                ),
+                committedRow(
+                    300L,
+                    30L,
+                    CoverageRendererStyleRowV1(
+                        coverage = CoverageRendererCoverage.UNCOVERED,
+                        residency = CoverageRendererResidency.ACTIVE_L0,
+                        target = CoverageRendererTarget.PRIMARY,
+                    ),
+                ),
+                committedRow(
+                    250L,
+                    25L,
+                    CoverageRendererStyleRowV1(
+                        coverage = CoverageRendererCoverage.UNCOVERED,
+                        residency = CoverageRendererResidency.WARM_L1,
+                        target = CoverageRendererTarget.PRIMARY,
+                    ),
+                ),
+                committedRow(
+                    220L,
+                    22L,
+                    CoverageRendererStyleRowV1(
+                        coverage = CoverageRendererCoverage.COMPLETE,
+                        target = CoverageRendererTarget.PRIMARY,
+                    ),
+                ),
+                committedRow(60L, 6L, CoverageRendererStyleRowV1()),
+                committedRow(50L, 5L, CoverageRendererStyleRowV1()),
+                committedRow(40L, 4L, CoverageRendererStyleRowV1()),
+                committedRow(10L, 1L, CoverageRendererStyleRowV1()),
+            ),
+        )
+        val selector = CoveragePresentationSelector(4)
+
+        val initial = selector.select(rows, requestedCapacity = 4, forceReset = true)
+
+        assertArrayEquals(longArrayOf(300L, 250L, 400L, 220L), initial.surfaceIds)
+
+        rows.replace(
+            7,
+            committedRow(
+                450L,
+                45L,
+                CoverageRendererStyleRowV1(target = CoverageRendererTarget.HALO),
+            ),
+        )
+        rows.styleRevision = 2L
+        val promoted = selector.select(rows, requestedCapacity = 4, forceReset = false)
+
+        assertArrayEquals(longArrayOf(450L, 300L, 250L, 400L), promoted.surfaceIds)
+
+        val tieRows = FixedStreamRows(
+            mutableListOf(
+                committedRow(30L, 300L, CoverageRendererStyleRowV1()),
+                committedRow(10L, 100L, CoverageRendererStyleRowV1()),
+                committedRow(20L, 200L, CoverageRendererStyleRowV1()),
+            ),
+        )
+        val tieSelection = CoveragePresentationSelector(2).select(
+            tieRows,
+            requestedCapacity = 2,
+            forceReset = true,
+        )
+
+        assertArrayEquals(longArrayOf(10L, 20L), tieSelection.surfaceIds)
+    }
+
+    private fun committedRow(
+        surfaceId: Long,
+        key: Long,
+        style: CoverageRendererStyleRowV1,
+    ): CoverageCommittedRow = CoverageCommittedRow(
+        surfaceId = surfaceId,
+        key = key,
+        x = surfaceId.toFloat(),
+        y = 0f,
+        z = 0f,
+        color = style.packedColor(),
+        style = style,
+    )
+
+    @Test
+    fun `streamed selector appends after a partial initial fill without reusing selected destinations`() {
+        val rows = FixedStreamRows(
+            mutableListOf(
+                committedRow(10L, 10L, CoverageRendererStyleRowV1()),
+                committedRow(20L, 20L, CoverageRendererStyleRowV1()),
+            ),
+        )
+        val selector = CoveragePresentationSelector(4)
+
+        selector.select(rows, requestedCapacity = 4, forceReset = true)
+        rows.append(committedRow(30L, 30L, CoverageRendererStyleRowV1()))
+        rows.append(committedRow(40L, 40L, CoverageRendererStyleRowV1()))
+
+        val grown = selector.select(rows, requestedCapacity = 4, forceReset = false)
+
+        assertArrayEquals(longArrayOf(10L, 20L, 30L, 40L), grown.surfaceIds)
+        assertEquals(false, checkNotNull(grown.update).reset)
+        assertEquals(2, grown.update!!.spans.single().startSlot)
+        assertEquals(2, grown.update!!.spans.single().rowCount)
     }
 
     @Test
@@ -304,6 +441,170 @@ class CoverageRendererSelectionTest {
         )
 
         assertEquals(listOf("coverage-points-epoch-1", "coverage-points-epoch-2"), owners)
+    }
+
+    @Test
+    fun `coexisting token resource remains charged until its node releases the token`() {
+        val firstToken = CoverageResourceToken(1L, 7L, CoveragePresentationMode.RAW_FEATURES)
+        val secondToken = CoverageResourceToken(2L, 7L, CoveragePresentationMode.RAW_FEATURES)
+        val released = mutableListOf<String>()
+        val disposed = mutableListOf<CoverageResourceToken?>()
+        var disposalCount = 0
+        val factory = CoverageRendererResourceFactory(
+            onDisposal = { disposalCount++ },
+            onDisposed = { disposed += it },
+        )
+
+        factory.replacePoint(
+            VoxelRenderMode.POINTS,
+            1,
+            "coverage-points",
+            token = firstToken,
+            create = { _, _, _ -> "old" },
+            release = { value: String -> released += value },
+        )
+        factory.replacePoint(
+            VoxelRenderMode.POINTS,
+            1,
+            "coverage-points",
+            token = secondToken,
+            create = { _, _, _ -> "new" },
+            release = { value: String -> released += value },
+        )
+
+        assertEquals(emptyList<String>(), released)
+        assertEquals(0, disposalCount)
+        assertTrue(factory.releaseResource(firstToken))
+        assertEquals(listOf("old"), released)
+        assertEquals(listOf(firstToken), disposed)
+        assertEquals(1, disposalCount)
+
+        assertTrue(factory.releaseResource(secondToken))
+        assertEquals(listOf("old", "new"), released)
+        assertEquals(listOf(firstToken, secondToken), disposed)
+        assertEquals(2, disposalCount)
+        assertTrue(!factory.releaseResource(firstToken))
+    }
+
+    @Test
+    fun `clear drains retired token resources during shutdown`() {
+        val firstToken = CoverageResourceToken(1L, 8L, CoveragePresentationMode.RAW_FEATURES)
+        val secondToken = CoverageResourceToken(2L, 8L, CoveragePresentationMode.RAW_FEATURES)
+        val released = mutableListOf<String>()
+        val factory = CoverageRendererResourceFactory()
+
+        factory.replacePoint(
+            VoxelRenderMode.POINTS,
+            1,
+            "coverage-points",
+            token = firstToken,
+            create = { _, _, _ -> "old" },
+            release = { value: String -> released += value },
+        )
+        factory.replacePoint(
+            VoxelRenderMode.POINTS,
+            1,
+            "coverage-points",
+            token = secondToken,
+            create = { _, _, _ -> "new" },
+            release = { value: String -> released += value },
+        )
+
+        factory.clear()
+
+        assertEquals(listOf("new", "old"), released)
+        assertTrue(!factory.releaseResource(firstToken))
+        assertTrue(!factory.releaseResource(secondToken))
+    }
+
+    @Test
+    fun `clear keeps a mounted retired resource until its node detaches`() {
+        val firstToken = CoverageResourceToken(1L, 9L, CoveragePresentationMode.RAW_FEATURES)
+        val secondToken = CoverageResourceToken(2L, 9L, CoveragePresentationMode.RAW_FEATURES)
+        val released = mutableListOf<String>()
+        val factory = CoverageRendererResourceFactory()
+
+        factory.replacePoint(
+            VoxelRenderMode.POINTS,
+            1,
+            "coverage-points",
+            token = firstToken,
+            create = { _, _, _ -> "old" },
+            release = { value: String -> released += value },
+        )
+        assertTrue(factory.markResourceMounted(firstToken))
+        factory.replacePoint(
+            VoxelRenderMode.POINTS,
+            1,
+            "coverage-points",
+            token = secondToken,
+            create = { _, _, _ -> "new" },
+            release = { value: String -> released += value },
+        )
+
+        factory.clear()
+
+        assertEquals(listOf("new"), released)
+        assertTrue(factory.releaseResource(firstToken))
+        assertEquals(listOf("new", "old"), released)
+    }
+
+    @Test
+    fun `coexist admission includes every retired generation in its current charge`() {
+        val telemetry = RendererTelemetry()
+        val ledger = CoverageRendererAllocationLedger(telemetry)
+        val admissions = mutableListOf<CoverageRendererResourceAdmission>()
+        val firstToken = CoverageResourceToken(1L, 10L, CoveragePresentationMode.RAW_FEATURES)
+        val secondToken = CoverageResourceToken(2L, 10L, CoveragePresentationMode.SEMANTIC_CENTROIDS)
+        val thirdToken = CoverageResourceToken(3L, 10L, CoveragePresentationMode.SEMANTIC_CUBES)
+        val factory = CoverageRendererResourceFactory(
+            admit = { mode, _ ->
+                ledger.admitResourceReplacement(mode).also { admissions += it }
+            },
+        )
+
+        fun create(mode: VoxelRenderMode, capacity: Int, owner: String): String {
+            when (mode) {
+                VoxelRenderMode.CUBES -> ledger.installCubeResources(owner, capacity)
+                else -> ledger.installPointResources(owner, capacity)
+            }
+            return owner
+        }
+        fun release(owner: String) {
+            if (owner.startsWith("coverage-cubes")) ledger.releaseCubeResources(owner)
+            else ledger.releasePointResources(owner)
+        }
+
+        factory.replacePoint(
+            VoxelRenderMode.POINTS,
+            CoverageRendererLimits.RAW_POINT_CAPACITY,
+            "coverage-points",
+            token = firstToken,
+            create = { mode, capacity, owner -> create(mode, capacity, owner) },
+            release = ::release,
+        )
+        factory.replacePoint(
+            VoxelRenderMode.CENTROIDS,
+            CoverageRendererLimits.CENTROID_CAPACITY,
+            "coverage-centroids",
+            token = secondToken,
+            create = { mode, capacity, owner -> create(mode, capacity, owner) },
+            release = ::release,
+        )
+        factory.replaceCube(
+            CoverageRendererLimits.CUBE_CAPACITY,
+            "coverage-cubes",
+            token = thirdToken,
+            create = { mode, capacity, owner -> create(mode, capacity, owner) },
+            release = ::release,
+        )
+
+        assertEquals(3, admissions.size)
+        assertTrue(admissions[1].currentBytes > admissions[0].currentBytes)
+        assertTrue(admissions[2].currentBytes > admissions[1].currentBytes)
+        assertTrue(factory.releaseResource(firstToken))
+        factory.clear()
+        assertEquals(0, telemetry.ownedBufferBytesSnapshot())
     }
 
     @Test

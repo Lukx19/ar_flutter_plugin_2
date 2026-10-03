@@ -39,6 +39,51 @@ class PoseDataExtractorTest {
     }
 
     @Test
+    fun `synthetic fixture is tagged bounded and cleared without a tracked anchor`() {
+        val extractor = PoseDataExtractor()
+
+        val seeded = extractor.beginSyntheticDebugFixture(
+            bindingGeneration = 7L,
+            groupGeneration = 11L,
+        )
+
+        assertTrue(seeded.isTracking)
+        assertEquals(PoseDataExtractor.SYNTHETIC_POSE_SOURCE, seeded.poseSource)
+        assertEquals(7L, seeded.fixtureBindingGeneration)
+        assertEquals(11L, seeded.fixtureGroupGeneration)
+        assertTrue(extractor.beginDebugFixture())
+        assertEquals(
+            PoseDataExtractor.SYNTHETIC_POSE_SOURCE,
+            extractor.latest()!!.poseSource,
+        )
+
+        extractor.clearDebugFixture()
+
+        assertNull(extractor.latest())
+        assertTrue(!extractor.awaitTrackingPose(timeoutMs = 0L))
+    }
+
+    @Test
+    fun `synthetic fixture rejects an ownership generation change`() {
+        val extractor = PoseDataExtractor()
+        extractor.beginSyntheticDebugFixture(
+            bindingGeneration = 7L,
+            groupGeneration = 11L,
+        )
+
+        var rejected = false
+        try {
+            extractor.beginSyntheticDebugFixture(
+                bindingGeneration = 8L,
+                groupGeneration = 11L,
+            )
+        } catch (_: IllegalStateException) {
+            rejected = true
+        }
+        assertTrue(rejected)
+    }
+
+    @Test
     fun `tracking readiness waits for an observed tracking pose`() {
         val extractor = PoseDataExtractor()
         extractor.addSample(sample(timestampNs = 1_000_000L, isTracking = false))

@@ -200,7 +200,7 @@ class SyntheticDepthSessionAndroidTest {
                     "preparation_allocated_bytes=$preparationAllocatedBytes " +
                     "commit_allocated_bytes=$commitAllocatedBytes " +
                     "ack_us=$ackMicros end_to_end_us=$endToEndMicros " +
-                    "max_end_to_end_us=$maxEndToEndMicros three_second_target_met=$targetMet " +
+                    "max_end_to_end_us=$maxEndToEndMicros one_second_target_met=$targetMet " +
                     "campaign_duration_ms=$campaignDurationMs " +
                     "art_allocated_campaign_bytes=$allocatedCampaignBytes " +
                     "map_allocated_bytes=$mapAllocatedBytes map_gc_counts=$mapGcCounts",
@@ -211,7 +211,7 @@ class SyntheticDepthSessionAndroidTest {
             assertEquals(MAP_COUNT, preparationMicros.size)
             assertEquals(MAP_COUNT, commitMicros.size)
             assertEquals(MAP_COUNT, ackMicros.size)
-            assertTrue("depth integration exceeded three seconds: $endToEndMicros", targetMet)
+            assertTrue("isolated depth integration exceeded one second: $endToEndMicros", targetMet)
             assertTrue("canonical runtime retained payload", resources.retainedCompleteCurrentMemoryReceipt() != null)
         } finally {
             kernel.close()
@@ -282,7 +282,7 @@ class SyntheticDepthSessionAndroidTest {
         const val IMAGE_WIDTH = 2_000
         const val IMAGE_HEIGHT = 2_000
         const val MAP_COUNT = 3
-        const val DEPTH_FRESHNESS_TARGET_MICROS = 3_000_000L
+        const val DEPTH_FRESHNESS_TARGET_MICROS = 1_000_000L
         const val TAG = "SyntheticDepthSession"
     }
 }

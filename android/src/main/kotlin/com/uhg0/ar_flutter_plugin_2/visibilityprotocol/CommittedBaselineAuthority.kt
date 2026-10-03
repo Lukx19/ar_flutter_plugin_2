@@ -1,5 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.visibilityprotocol
 
+import com.uhg0.ar_flutter_plugin_2.util.toLowercaseHex
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineV1
 /**
  * Process-scoped owner for the last native committed cut.
@@ -204,6 +205,4 @@ private fun CommittedBaselineV1.toMap(): Map<String, Any?> = mapOf(
     "worldFromGroupIdentity" to worldFromGroupIdentity,
 )
 
-private fun Uuid.hex(): String = bytes.joinToString("") { byte ->
-    "%02x".format(byte.toInt() and 0xff)
-}
+private fun Uuid.hex(): String = bytes.toLowercaseHex()

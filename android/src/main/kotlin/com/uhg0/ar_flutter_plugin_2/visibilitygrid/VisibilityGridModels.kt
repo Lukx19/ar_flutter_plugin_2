@@ -148,3 +148,10 @@ fun unpackVisibilityGridKey(key: Long): IntArray {
         (key and mask).toInt() - VOXEL_COORDINATE_BIAS.toInt(),
     )
 }
+
+/** One signed coordinate without allocating the legacy three-coordinate adapter. */
+internal fun visibilityGridCoordinate(key: Long, component: Int): Int {
+    require(component in 0..2)
+    return ((key ushr ((2 - component) * 21)) and ((1L shl 21) - 1)).toInt() -
+        VOXEL_COORDINATE_BIAS.toInt()
+}

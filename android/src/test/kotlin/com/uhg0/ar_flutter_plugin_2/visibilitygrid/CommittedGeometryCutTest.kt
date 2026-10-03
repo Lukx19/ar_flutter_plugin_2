@@ -64,6 +64,25 @@ class CommittedGeometryCutTest {
     }
 
     @Test
+    fun `cut validates disjoint unsigned identities through the maximum surface ID`() {
+        val rows = listOf(row(0xffff_ffffL, 1), row(1, 2), row(0x8000_0000L, 3))
+        val removals = longArrayOf(0xffff_fffeL, 0x7fff_ffffL)
+        val accepted = cut(upserts = rows, removals = removals)
+        assertEquals(rows, accepted.upserts)
+        assertEquals(removals.toList(), accepted.removedSurfaceIds.toList())
+
+        assertThrows(IllegalArgumentException::class.java) {
+            cut(upserts = rows, removals = longArrayOf(0xffff_ffffL))
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            cut(upserts = rows, removals = longArrayOf(0xffff_fffeL, 0xffff_fffeL))
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            cut(removals = longArrayOf(0x1_0000_0000L))
+        }
+    }
+
+    @Test
     fun `group frame rejects zero capacity and asymmetric approximate inverses`() {
         val identity = identityVisibilityGridTransform()
         assertThrows(IllegalArgumentException::class.java) {

@@ -63,10 +63,25 @@ internal class CoverageRendererResourceFactory(
     private val onCreationFailure: (CoverageRendererResourceTransition) -> Unit = {},
     private val onDisposed: (CoverageResourceToken?) -> Unit = {},
 ) {
+    private data class RetiredResource(
+        val resource: Any,
+        val release: (Any) -> Unit,
+        val token: CoverageResourceToken,
+        var mounted: Boolean,
+    )
+
     private val debugFailNextAllocation = AtomicBoolean(false)
     private var active: Any? = null
     private var releaseActive: ((Any) -> Unit)? = null
     private var activeToken: CoverageResourceToken? = null
+    private var activeMounted = false
+    /**
+     * A replacement can be installed while Compose still owns the outgoing
+     * node. Keep that generation charged until its node has detached and
+     * explicitly releases its token. Tokenless callers retain the historical
+     * immediate-release behavior because they have no lifecycle identity.
+     */
+    private val retiredResources = LinkedHashMap<CoverageResourceToken, RetiredResource>()
 
     /** One-shot debug fixture at the real resource creation seam. */
     fun armDebugAllocationFailure() {
@@ -108,6 +123,7 @@ internal class CoverageRendererResourceFactory(
         val prior = active
         val priorRelease = releaseActive
         val priorToken = activeToken
+        val priorMounted = activeMounted
         val admission = admit(mode, capacity)
         val transition = CoverageRendererResourceTransition(
             admission = admission,
@@ -126,12 +142,16 @@ internal class CoverageRendererResourceFactory(
         }
         if (admission.strategy == CoverageRendererTransitionStrategy.CLEAR_FIRST && prior != null) {
             onClearFirst(transition)
+            val stillActive = active === prior && releaseActive === priorRelease
             active = null
             releaseActive = null
             activeToken = null
-            priorRelease?.invoke(prior)
-            onDisposal()
-            onDisposed(priorToken)
+            activeMounted = false
+            if (stillActive) {
+                priorRelease?.invoke(prior)
+                onDisposal()
+                onDisposed(priorToken)
+            }
         }
         // Coexistence is transactional: retain the current owner until the
         // new resource exists and can be installed. A failed allocation then
@@ -161,15 +181,65 @@ internal class CoverageRendererResourceFactory(
         active = next
         releaseActive = { value -> release(value as T) }
         activeToken = transition.token
+        activeMounted = false
         if (prior != null && priorRelease != null &&
             admission.strategy == CoverageRendererTransitionStrategy.COEXIST
         ) {
             onReplacement()
-            priorRelease(prior)
-            onDisposal()
-            onDisposed(priorToken)
+            if (priorToken != null) {
+                check(retiredResources[priorToken] == null) {
+                    "resource token was replaced before its node detached: $priorToken"
+                }
+                retiredResources[priorToken] = RetiredResource(
+                    resource = prior,
+                    release = priorRelease,
+                    token = priorToken,
+                    mounted = priorMounted,
+                )
+            } else {
+                priorRelease(prior)
+                onDisposal()
+                onDisposed(null)
+            }
         }
         return next
+    }
+
+    /**
+     * Releases a token after its SceneView node has detached and destroyed its
+     * renderable. The method is idempotent so late Compose disposal callbacks
+     * cannot release a newer generation.
+     */
+    fun releaseResource(token: CoverageResourceToken): Boolean {
+        if (activeToken == token && active != null && releaseActive != null) {
+            val resource = active
+            val release = checkNotNull(releaseActive)
+            active = null
+            releaseActive = null
+            activeToken = null
+            activeMounted = false
+            release(checkNotNull(resource))
+            onDisposal()
+            onDisposed(token)
+            return true
+        }
+
+        val retired = retiredResources.remove(token) ?: return false
+        retired.release(retired.resource)
+        onDisposal()
+        onDisposed(retired.token)
+        return true
+    }
+
+    /** Records the attach point so shutdown can retain mounted retired nodes. */
+    fun markResourceMounted(token: CoverageResourceToken): Boolean {
+        if (activeToken == token && active != null) {
+            activeMounted = true
+            return true
+        }
+        val retired = retiredResources[token] ?: return false
+        retired.mounted = true
+        return true
     }
 
     fun clear() {
@@ -179,10 +249,26 @@ internal class CoverageRendererResourceFactory(
         active = null
         releaseActive = null
         activeToken = null
-        if (prior != null && priorRelease != null) {
+        val priorMounted = activeMounted
+        activeMounted = false
+        if (prior != null && priorRelease != null && priorToken != null && priorMounted) {
+            retiredResources[priorToken] = RetiredResource(
+                resource = prior,
+                release = priorRelease,
+                token = priorToken,
+                mounted = true,
+            )
+        } else if (prior != null && priorRelease != null) {
             priorRelease(prior)
             onDisposal()
             onDisposed(priorToken)
+        }
+        val unmounted = retiredResources.values.filterNot { it.mounted }
+        unmounted.forEach { resource ->
+            retiredResources.remove(resource.token)
+            resource.release(resource.resource)
+            onDisposal()
+            onDisposed(resource.token)
         }
     }
 }

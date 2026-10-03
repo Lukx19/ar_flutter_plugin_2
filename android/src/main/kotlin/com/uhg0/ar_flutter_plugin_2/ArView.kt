@@ -40,6 +40,7 @@ import com.uhg0.ar_flutter_plugin_2.sceneview.resolveNodeUri
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridV2Binding
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridIntegration
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.NativeRendererProjection
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.RendererPublicationTimingScope
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.CanonicalRuntimeResources
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.AndroidVisibilityGridRuntime
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.ArCoreVisibilityObservationSource
@@ -105,6 +106,7 @@ internal class ArView(
     private val pendingCloudOperations = mutableSetOf<() -> Unit>()
     private val isDebuggable =
         context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+    private val mapperFailureProbeLogged = AtomicBoolean(false)
 
     private enum class ResumeTerminal {
         SUCCESS,
@@ -137,6 +139,32 @@ internal class ArView(
         NativeRendererProjection(
             render = sceneHost::updateCoverageRenderer,
             publishPresentation = sceneHost::updateCoveragePresentation,
+            publishTimingScope = RendererPublicationTimingScope.MAILBOX_ENQUEUE,
+            timingSink = if (isDebuggable) {
+                { timing ->
+                    Log.d(
+                        "VisibilityRendererTiming",
+                        "style=${timing.styleRevision} " +
+                            "requestedRows=${timing.requestedRows} " +
+                            "sourceRows=${timing.sourceRows} " +
+                            "selectedRows=${timing.selectedRows} " +
+                            "stateApplyMicros=${timing.stateApplyMicros} " +
+                            "stateApplyAllocatedBytes=${timing.stateApplyAllocatedBytes} " +
+                            "selectionMicros=${timing.selectionMicros} " +
+                            "selectionAllocatedBytes=${timing.selectionAllocatedBytes} " +
+                            "descriptorMicros=${timing.descriptorMicros} " +
+                            "descriptorAllocatedBytes=${timing.descriptorAllocatedBytes} " +
+                            "publishMicros=${timing.publishMicros} " +
+                            "publishAllocatedBytes=${timing.publishAllocatedBytes} " +
+                            "publishTimingScope=${timing.publishTimingScope.wireName} " +
+                            "allocationScope=${timing.allocationScope} " +
+                            "callbackAllocatedBytes=${timing.callbackAllocatedBytes} " +
+                            "callbackMicros=${timing.callbackMicros}",
+                    )
+                }
+            } else {
+                null
+            },
         )
     private val visibilityGridV2Binding = VisibilityGridV2Binding(
         messenger = messenger,
@@ -167,11 +195,19 @@ internal class ArView(
         renderer = visibilityRendererProjection,
         commitCanonical = visibilityCanonicalFaultGate::commit,
         beforeAdmission = visibilityObservationDebugGate::awaitIfArmed,
+        allocationCounter = if (isDebuggable) {
+            { android.os.Debug.getRuntimeStat("art.gc.bytes-allocated")?.toLongOrNull() }
+        } else null,
     )
     private val visibilityObservationRuntime = AndroidVisibilityGridRuntime(
         ownership = visibilityGridV2Binding::currentObservationOwnership,
         mapper = visibilityObservationMappingAdmission,
         captureSafe = captureSafetySignalV2,
+        onMapperFailure = { error ->
+            if (isDebuggable && mapperFailureProbeLogged.compareAndSet(false, true)) {
+                Log.e("MAPPER-PROBE", "First visibility mapper failure", error)
+            }
+        },
     )
     private val visibilityObservationSource = ArCoreVisibilityObservationSource(
         runtime = visibilityObservationRuntime,
@@ -179,8 +215,7 @@ internal class ArView(
         depthMode = sceneHost::visibilityGridDepthMode,
         depthIntakeAllowed = {
             sceneHost.depthIntakeFrameHealthy() &&
-                !captureSession.nativeCaptureWorkPendingV2() &&
-                !visibilityObservationMappingAdmission.hasPendingPublicationForIngress()
+                !captureSession.nativeCaptureWorkPendingV2()
         },
     )
     private val depthPauseGate = DepthObservationPauseGate(
@@ -195,6 +230,7 @@ internal class ArView(
         ownership = visibilityGridV2Binding::currentObservationOwnership,
         gate = visibilityObservationDebugGate,
         pressureOwners = ::visibilityPressureOwnerScalars,
+        physicalSamplePools = visibilityObservationSource::packedLeaseReceipts,
     )
 
     init {
@@ -311,6 +347,8 @@ internal class ArView(
                 baseline.captureRevision,
                 captureSession.durableCaptureRevisionV2(),
             ),
+            nativeMaxObservedCaptureRevision = captureSession.durableCaptureRevisionV2(),
+            visibilityBaselineCaptureRevision = baseline.captureRevision,
             coverageRevision = maxOf(baseline.coverageRevision, pressure.coverageRevision),
             styleRevision = maxOf(baseline.styleRevision, renderer.styleRevision),
             targetSurfaceId = targetSurfaceId,
@@ -514,7 +552,15 @@ internal class ArView(
                     anchorRecords[call.argument<String>("anchorId")]?.transform?.matrix,
                 )
                 "getRendererPerformanceSnapshot" ->
-                    result.success(sceneHost.rendererPerformanceSnapshot())
+                    result.success(
+                        sceneHost.rendererPerformanceSnapshot(
+                            beginMeasurementWindow =
+                                isDebuggable && call.argument<Boolean>("beginWindow") == true,
+                            captureDiagnosticTiming = isDebuggable && call.argument<Boolean>("captureDiagnosticTiming") == true,
+                            freezeDiagnosticTiming = isDebuggable && call.argument<Boolean>("freezeDiagnosticTiming") == true,
+                            includeDiagnosticTiming = isDebuggable && call.argument<Boolean>("includeDiagnosticTiming") == true,
+                        ),
+                    )
                 "snapshot" -> sceneHost.snapshot { snapshot ->
                     snapshot.fold(result::success) {
                         result.error("SNAPSHOT_ERROR", it.message, null)
@@ -908,7 +954,43 @@ internal class ArView(
                     if (!debuggable) result.error("DEBUG_ONLY", "Synthetic V2 completion is unavailable in release builds", null)
                     else result.success(captureSession.completeDebugNativeCaptureV2())
                 }
-                "getPerformanceSnapshot" -> result.success(captureSession.getPerformanceSnapshot())
+                "debugSyntheticPoseFixture" -> {
+                    val debuggable = root.context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+                    if (!debuggable) {
+                        result.error("DEBUG_ONLY", "Synthetic pose fixtures are unavailable in release builds", null)
+                    } else {
+                        val bindingGeneration = call.argument<Number>("bindingGeneration")?.toLong()
+                            ?: throw IllegalArgumentException("bindingGeneration is required")
+                        val groupGeneration = call.argument<Number>("groupGeneration")?.toLong()
+                            ?: throw IllegalArgumentException("groupGeneration is required")
+                        val ownership = visibilityGridV2Binding.currentObservationOwnership()
+                            ?: throw IllegalStateException("visibility observation ownership is not ready")
+                        check(ownership.bindingGeneration == bindingGeneration) {
+                            "binding generation does not match current observation ownership"
+                        }
+                        check(ownership.groupGeneration == groupGeneration) {
+                            "group generation does not match current observation ownership"
+                        }
+                        result.success(
+                            captureSession.beginDebugSyntheticPoseFixture(
+                                bindingGeneration = bindingGeneration,
+                                groupGeneration = groupGeneration,
+                            ),
+                        )
+                    }
+                }
+                "debugClearSyntheticPoseFixture" -> {
+                    val debuggable = root.context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+                    if (!debuggable) result.error("DEBUG_ONLY", "Synthetic pose fixtures are unavailable in release builds", null)
+                    else {
+                        captureSession.clearDebugPoseFixture()
+                        result.success(true)
+                    }
+                }
+                "getPerformanceSnapshot" -> result.success(captureSession.getPerformanceSnapshot(
+                    resetDiagnosticTiming = isDebuggable && call.argument<Boolean>("resetDiagnosticTiming") == true,
+                    includeDiagnosticTiming = isDebuggable && call.argument<Boolean>("includeDiagnosticTiming") == true,
+                ))
                 "getCameraIntrinsics" -> result.success(captureSession.getCameraIntrinsics())
                 "getImageData" -> result.success(captureSession.getImageData(
                     call.argument<String>("imageId") ?: throw IllegalArgumentException("imageId is required"),

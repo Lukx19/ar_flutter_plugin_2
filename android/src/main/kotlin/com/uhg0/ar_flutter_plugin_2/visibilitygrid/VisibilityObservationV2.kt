@@ -206,18 +206,31 @@ internal class VisibilityFeatureObservation(
     samples: List<VisibilityFeatureSample>,
     val sourceRejectedSamples: Int,
     val payloadBytes: Int,
-) {
+    internal val packedSamples: BorrowedFeatureSamples? = null,
+) : AutoCloseable {
     val samples: List<VisibilityFeatureSample> = copySamples(samples)
+    val sampleCount: Int get() = packedSamples?.count ?: samples.size
 
     init {
         require(version == VISIBILITY_OBSERVATION_VERSION)
         require(frame.source == VisibilityObservationSource.ARCORE_FEATURE ||
             frame.source == VisibilityObservationSource.SYNTHETIC_FEATURE)
-        require(samples.isNotEmpty() && samples.size <= V2_FEATURE_SAMPLE_CAPACITY)
+        require(sampleCount in 1..V2_FEATURE_SAMPLE_CAPACITY)
+        require(packedSamples == null || samples.isEmpty())
+        require(packedSamples == null || packedSamples.matches(ownership))
+        require(packedSamples == null || sourceRejectedSamples == packedSamples.rejectedCount)
         require(samples.all(VisibilityFeatureSample::isValid))
         require(samples.map(VisibilityFeatureSample::id).distinct().size == samples.size)
         require(sourceRejectedSamples >= 0)
-        require(payloadBytes == FEATURE_FIXED_BYTES + samples.size * FEATURE_SAMPLE_BYTES)
+        require(payloadBytes == FEATURE_FIXED_BYTES + sampleCount * FEATURE_SAMPLE_BYTES)
+    }
+
+    internal fun closePackedSamples() {
+        packedSamples?.close()
+    }
+
+    override fun close() {
+        closePackedSamples()
     }
 
     companion object {
@@ -226,6 +239,20 @@ internal class VisibilityFeatureObservation(
 
         fun copySamples(samples: List<VisibilityFeatureSample>): List<VisibilityFeatureSample> =
             Collections.unmodifiableList(ArrayList(samples))
+
+        fun fromPacked(
+            ownership: VisibilityObservationOwnership,
+            frame: VisibilityObservationFrame,
+            packedSamples: BorrowedFeatureSamples,
+            sourceRejectedSamples: Int,
+        ): VisibilityFeatureObservation = VisibilityFeatureObservation(
+            ownership = ownership,
+            frame = frame,
+            samples = emptyList(),
+            sourceRejectedSamples = sourceRejectedSamples,
+            payloadBytes = FEATURE_FIXED_BYTES + packedSamples.count * FEATURE_SAMPLE_BYTES,
+            packedSamples = packedSamples,
+        )
     }
 }
 
@@ -236,21 +263,38 @@ internal class VisibilityDepthObservation(
     samples: List<VisibilityDepthSample>,
     val sourceRejectedSamples: Int,
     val payloadBytes: Int,
-) {
+    internal val packedSamples: BorrowedDepthSamples? = null,
+) : AutoCloseable {
+    internal var debugOfferLedger: DepthOfferTimingLedger? = null
+    internal var debugOfferId: Long = 0
+    internal fun finishDebugOffer(state: Int) { debugOfferLedger?.finish(debugOfferId, state) }
     val samples: List<VisibilityDepthSample> = copySamples(samples)
+    val sampleCount: Int get() = packedSamples?.count ?: samples.size
 
     init {
         require(version == VISIBILITY_OBSERVATION_VERSION)
         require(frame.source == VisibilityObservationSource.ARCORE_RAW_DEPTH ||
             frame.source == VisibilityObservationSource.SYNTHETIC_DEPTH)
-        require(samples.size <= V2_DEPTH_SAMPLE_CAPACITY)
+        require(sampleCount <= V2_DEPTH_SAMPLE_CAPACITY)
+        require(packedSamples == null || samples.isEmpty())
+        require(packedSamples == null || packedSamples.matches(ownership))
+        require(packedSamples == null || sourceRejectedSamples == packedSamples.rejectedCount)
         require(samples.all {
             it.x in 0 until frame.intrinsics.imageWidth &&
                 it.y in 0 until frame.intrinsics.imageHeight &&
                 it.depthMillimeters in 0..65_535 && it.confidence in 0..255
         })
         require(sourceRejectedSamples >= 0)
-        require(payloadBytes == DEPTH_FIXED_BYTES + samples.size * DEPTH_SAMPLE_BYTES)
+        require(payloadBytes == DEPTH_FIXED_BYTES + sampleCount * DEPTH_SAMPLE_BYTES)
+    }
+
+    internal fun closePackedSamples() {
+        packedSamples?.close()
+    }
+
+    override fun close() {
+        debugOfferLedger?.refuseUnretained(debugOfferId)
+        closePackedSamples()
     }
 
     companion object {
@@ -261,6 +305,23 @@ internal class VisibilityDepthObservation(
             require(samples.size <= V2_DEPTH_SAMPLE_CAPACITY)
             return Collections.unmodifiableList(ArrayList(samples))
         }
+
+        fun fromPacked(
+            ownership: VisibilityObservationOwnership,
+            frame: VisibilityObservationFrame,
+            packedSamples: BorrowedDepthSamples,
+            sourceRejectedSamples: Int,
+        ): VisibilityDepthObservation {
+            require(packedSamples.count > 0)
+            return VisibilityDepthObservation(
+                ownership = ownership,
+                frame = frame,
+                samples = emptyList(),
+                sourceRejectedSamples = sourceRejectedSamples,
+                payloadBytes = DEPTH_FIXED_BYTES + packedSamples.count * DEPTH_SAMPLE_BYTES,
+                packedSamples = packedSamples,
+            )
+        }
     }
 }
 
@@ -268,6 +329,17 @@ internal interface VisibilityObservationMapper : AutoCloseable {
     fun admitFeature(observation: VisibilityFeatureObservation)
 
     fun admitDepth(observation: VisibilityDepthObservation)
+
+    /**
+     * Gives a mapper with a retained latest-depth slot a chance to release
+     * that slot before the source lane accepts another resident value.
+     * Ordinary mapper implementations have no retained handoff and keep the
+     * no-op default.
+     */
+    fun beforeDepthObservationOffer(laneHasOutstandingWork: Boolean) = Unit
+
+    /** Mapper-owned depth payload retained outside the source lane. */
+    fun retainedDepthPayloadBytes(): Long = 0L
 
     /** Invalidates admitted-but-not-committed work before a lifecycle pause. */
     fun pause() = Unit

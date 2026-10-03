@@ -22,10 +22,16 @@ internal class LiveSurfaceSpatialCache(
     private var dirtyCount = 0
     private val selected = LongArray(capacity)
     private val selectedBlocks = LongArray(tableSize)
+    // Stable four-voxel parent hashing shares 64 voxel bits between buckets. Bits
+    // only accumulate during this group's lifetime: collisions/churn can
+    // cause extra traversal but cannot certify an occupied child as empty.
+    private val occupiedChildren = LongArray(maxOf(1, tableSize / 2))
     private var selectionEpoch = 0L
     private var indexedRevision = 0L
     private var selectedRevision = -1L
     private var selectedFrustum = -1L
+    private var certifiedGeometryRevision = -1L
+    private var certifiedLineageRevision = -1L
     private val frustum = ExpandedSurfaceFrustum()
     var selectedCount = 0; private set
     var lastBlockProbes = 0; private set
@@ -33,13 +39,19 @@ internal class LiveSurfaceSpatialCache(
     var flushedBlocks = 0L; private set
     val hasWindow: Boolean get() = frustum.valid && selectedFrustum >= 0
     private val blockMm = voxelMicrometers / 1_000.0 * blockVoxels
-    val retainedPrimitiveBytes: Long = tableSize.toLong() * (8 + 4 + 4 + 4 + 8 + 1 + 4 + 4 + 4 + 8) + capacity.toLong() * 8 + 320
+    val retainedPrimitiveBytes: Long = tableSize.toLong() * (8 + 4 + 4 + 4 + 8 + 1 + 4 + 4 + 4 + 8) + capacity.toLong() * 8 + occupiedChildren.size.toLong() * 8 + 360
 
     init { require(capacity in 1..100_000 && voxelMicrometers > 0 && blockVoxels > 0) }
 
     fun upsert(id: SurfaceId, voxel: Voxel) {
+        invalidateCertificate()
         val slot = idSlot(id.value, true)
         val key = blockKey(Math.floorDiv(voxel.x, blockVoxels), Math.floorDiv(voxel.y, blockVoxels), Math.floorDiv(voxel.z, blockVoxels))
+        if (blockVoxels == 16) {
+            val parent = depthBlockParentKey(voxel.x, voxel.y, voxel.z, 1)
+            val maskSlot = depthBlockHash(parent) and (occupiedChildren.size - 1)
+            occupiedChildren[maskSlot] = occupiedChildren[maskSlot] or depthBlockQueryMask(voxel.x, voxel.y, voxel.z, 1)
+        }
         val existingBlock = blockSlot(key, false)
         if (ids[slot] == id.value && rowBlocks[slot] == existingBlock) { markDirty(existingBlock); return }
         if (ids[slot] == id.value) unlink(slot)
@@ -55,11 +67,44 @@ internal class LiveSurfaceSpatialCache(
     }
 
     fun remove(id: SurfaceId) {
+        invalidateCertificate()
         val slot = idSlot(id.value, false)
         if (slot < 0) return
         unlink(slot)
         eraseRowBucket(slot)
         indexedRevision++
+    }
+
+    fun invalidateCertificate() {
+        certifiedGeometryRevision = -1L
+        certifiedLineageRevision = -1L
+    }
+
+    /** Called only by the serial owner after the entire committed delta reached this index. */
+    fun certifyCurrent(geometryRevision: Long, lineageRevision: Long) {
+        require(geometryRevision >= 0 && lineageRevision >= 0)
+        certifiedGeometryRevision = geometryRevision
+        certifiedLineageRevision = lineageRevision
+    }
+
+    /** All canonical rows count, including rows outside the current sensor frustum. */
+    fun isKnownEmptyBlock(blockX: Int, blockY: Int, blockZ: Int, geometryRevision: Long, lineageRevision: Long, queryVoxels: Int = 4): Boolean {
+        if (queryVoxels != 1 && queryVoxels != 2 && queryVoxels != 4) return false
+        val size = queryVoxels
+        if (geometryRevision != certifiedGeometryRevision || lineageRevision != certifiedLineageRevision ||
+            geometryRevision < 0 || blockVoxels % size != 0
+        ) return false
+        val x = Math.floorDiv(blockX, blockVoxels / size)
+        val y = Math.floorDiv(blockY, blockVoxels / size)
+        val z = Math.floorDiv(blockZ, blockVoxels / size)
+        if (minOf(x, y, z) < MIN_BLOCK || maxOf(x, y, z) > MAX_BLOCK) return false
+        val key = blockKey(x, y, z)
+        val block = blockSlot(key, false)
+        if (block < 0 || heads[block] < 0) return true
+        if (blockVoxels != 16) return false
+        val parent = depthBlockParentKey(blockX, blockY, blockZ, size)
+        val bits = occupiedChildren[depthBlockHash(parent) and (occupiedChildren.size - 1)]
+        return bits and depthBlockQueryMask(blockX, blockY, blockZ, size) == 0L
     }
 
     fun updateWindow(matrix: List<Double>, intrinsics: VisibilityCameraIntrinsics, maximumDepthMm: Double): Boolean {
@@ -96,12 +141,16 @@ internal class LiveSurfaceSpatialCache(
     }
 
     fun contains(voxel: Voxel): Boolean {
+        return contains(voxel.x, voxel.y, voxel.z)
+    }
+
+    fun contains(x: Int, y: Int, z: Int): Boolean {
         if (!hasWindow || selectedRevision != indexedRevision) return false
-        val block = blockSlot(blockKey(Math.floorDiv(voxel.x, blockVoxels), Math.floorDiv(voxel.y, blockVoxels),
-            Math.floorDiv(voxel.z, blockVoxels)), false)
+        val block = blockSlot(blockKey(Math.floorDiv(x, blockVoxels), Math.floorDiv(y, blockVoxels),
+            Math.floorDiv(z, blockVoxels)), false)
         if (block < 0 || selectedBlocks[block] != selectionEpoch) return false
         val mm = voxelMicrometers / 1_000.0
-        return frustum.intersects(voxel.x * mm, voxel.y * mm, voxel.z * mm, mm)
+        return frustum.intersects(x * mm, y * mm, z * mm, mm)
     }
 
     /** Borrowed IDs are valid only until the next index/window change on this worker. */

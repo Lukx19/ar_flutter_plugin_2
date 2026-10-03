@@ -11,9 +11,43 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 class CoverageDescriptorPageSequencerTest {
+    @Test
+    fun `worker publication cannot mutate renderer owned pages and hands off the latest cut`() {
+        val mailbox = CoverageRendererPublicationMailbox<BoundedCoveragePresentation>()
+        val sequencer = CoverageDescriptorPageSequencer()
+        sequencer.replace(descriptor(count = 600))
+        val active = checkNotNull(sequencer.nextPage())
+        val successor = descriptor(count = 2)
+        val producer = Executors.newSingleThreadExecutor()
+        try {
+            producer.submit {
+                assertThrows(IllegalStateException::class.java) { sequencer.replace(successor) }
+                assertThrows(IllegalStateException::class.java) { sequencer.clear() }
+                assertThrows(IllegalStateException::class.java) { sequencer.nextPage() }
+                assertThrows(IllegalStateException::class.java) { sequencer.release(active.ticket) }
+                assertThrows(IllegalStateException::class.java) { sequencer.hasInFlightPage }
+                assertTrue(mailbox.offer(successor))
+            }.get(2, TimeUnit.SECONDS)
+
+            // Taking the immutable cut never transfers the active upload's
+            // ownership to its producer, and does not release that page.
+            sequencer.replace(checkNotNull(mailbox.take()).value)
+            assertNull(sequencer.nextPage())
+            sequencer.release(active.ticket)
+            val replacement = checkNotNull(sequencer.nextPage())
+            assertEquals(2, replacement.page.count)
+            assertTrue(replacement.reset)
+        } finally {
+            producer.shutdownNow()
+        }
+    }
+
     @Test
     fun `baseline is a full reset and every page is bounded`() {
         val descriptor = descriptor(count = 1_025)

@@ -11,6 +11,8 @@ import kotlinx.serialization.json.int
 import kotlinx.serialization.json.long
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 class VisibilityProtocolGoldenVectorTest {
@@ -39,6 +41,15 @@ class VisibilityProtocolGoldenVectorTest {
         assertEquals(request.requestSequence, decodedRequest.requestSequence)
         assertArrayEquals(request.styleRecords.single(), decodedRequest.styleRecords.single())
         assertArrayEquals(request.commandBytes, decodedRequest.commandBytes)
+        val guardedRequest = ByteArray(requestBytes.size + 4) { 0x5a }
+        assertEquals(requestBytes.size, PacketCodec.encodeRequestInto(request, guardedRequest, 2))
+        assertArrayEquals(requestBytes, guardedRequest.copyOfRange(2, guardedRequest.size - 2))
+        assertTrue(guardedRequest.take(2).all { it == 0x5a.toByte() })
+        assertTrue(guardedRequest.takeLast(2).all { it == 0x5a.toByte() })
+        try {
+            PacketCodec.encodeRequestInto(request, ByteArray(requestBytes.size - 1))
+            fail("Short request destination accepted")
+        } catch (_: IllegalArgumentException) { }
 
         val responseSpec = root.getValue("response").jsonObject
         val response = PacketCodec.noChanges(
@@ -58,6 +69,11 @@ class VisibilityProtocolGoldenVectorTest {
         assertEquals(response.requestSequence, decodedResponse.requestSequence)
         assertEquals(response.nextExpectedRequestSequence, decodedResponse.nextExpectedRequestSequence)
         assertArrayEquals(responseBytes, PacketCodec.encodeResponse(decodedResponse, 4096))
+        val guardedResponse = ByteArray(responseBytes.size + 4) { 0x5a }
+        assertEquals(responseBytes.size, PacketCodec.encodeResponseInto(response, 4096, guardedResponse, 2))
+        assertArrayEquals(responseBytes, guardedResponse.copyOfRange(2, guardedResponse.size - 2))
+        assertTrue(guardedResponse.take(2).all { it == 0x5a.toByte() })
+        assertTrue(guardedResponse.takeLast(2).all { it == 0x5a.toByte() })
     }
 
     private fun fixture(): JsonObject =

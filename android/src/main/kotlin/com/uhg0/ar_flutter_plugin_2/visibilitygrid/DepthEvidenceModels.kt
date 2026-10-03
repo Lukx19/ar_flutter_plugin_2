@@ -31,19 +31,61 @@ internal data class DepthEvidenceConfiguration(
     }
 }
 
+/** Scalar-only sample access used by immutable fixtures and leased input. */
+internal interface DepthEvidenceSampleAccess {
+    val count: Int
+    val rejectedCount: Int
+
+    fun xAt(index: Int): Int
+    fun yAt(index: Int): Int
+    fun depthMillimetresAt(index: Int): Int
+    fun confidenceAt(index: Int): Int
+}
+
+/** Metadata required by the depth kernel without retaining input samples. */
+internal interface DepthEvidenceMetadataView {
+    val sequence: Long
+    val sourceTimestampNs: Long
+    val groupFrame: VisibilityGroupFrame
+    val groupFromCameraGl: List<Double>
+    val intrinsics: VisibilityCameraIntrinsics
+    val sourceRejectedSamples: Int
+    val tracking: Boolean
+}
+
+/** Immutable metadata companion for a borrowed depth sample lease. */
+internal class DepthEvidenceMetadata(
+    override val sequence: Long,
+    override val sourceTimestampNs: Long,
+    override val groupFrame: VisibilityGroupFrame,
+    groupFromCameraGl: List<Double>,
+    override val intrinsics: VisibilityCameraIntrinsics,
+    override val sourceRejectedSamples: Int,
+    override val tracking: Boolean = true,
+) : DepthEvidenceMetadataView {
+    override val groupFromCameraGl: List<Double> = immutableMatrix(groupFromCameraGl)
+}
+
 /** Immutable input copied by the admission owner before this kernel is called. */
 internal class DepthEvidenceBatch(
-    val sequence: Long,
-    val sourceTimestampNs: Long,
-    val groupFrame: VisibilityGroupFrame,
+    override val sequence: Long,
+    override val sourceTimestampNs: Long,
+    override val groupFrame: VisibilityGroupFrame,
     groupFromCameraGl: List<Double>,
-    val intrinsics: VisibilityCameraIntrinsics,
+    override val intrinsics: VisibilityCameraIntrinsics,
     samples: List<VisibilityDepthSample>,
-    val sourceRejectedSamples: Int,
-    val tracking: Boolean = true,
-) {
-    val groupFromCameraGl: List<Double> = immutableMatrix(groupFromCameraGl)
+    override val sourceRejectedSamples: Int,
+    override val tracking: Boolean = true,
+) : DepthEvidenceMetadataView, DepthEvidenceSampleAccess {
+    override val groupFromCameraGl: List<Double> = immutableMatrix(groupFromCameraGl)
     val samples: List<VisibilityDepthSample> = immutableDepthSamples(samples)
+
+    override val count: Int get() = samples.size
+    override val rejectedCount: Int get() = sourceRejectedSamples
+    override fun xAt(index: Int): Int = samples[index].x
+    override fun yAt(index: Int): Int = samples[index].y
+    override fun depthMillimetresAt(index: Int): Int = samples[index].depthMillimeters
+    override fun confidenceAt(index: Int): Int = samples[index].confidence
 
     fun copy(
         sequence: Long = this.sequence,
@@ -104,7 +146,11 @@ internal data class DepthRayVisitResult(
     val visitedCells: Int,
     val truncated: Boolean = false,
     val arithmeticOverflow: Boolean = false,
-)
+    val emptyBlockVisits: Int = 0,
+) {
+    /** Each certified empty segment costs one bounded traversal unit. */
+    val workUnits: Int get() = visitedCells + emptyBlockVisits
+}
 
 internal data class DepthCanonicalSurface(
     val id: SurfaceId,
@@ -126,6 +172,95 @@ internal data class AddressedCanonicalSurface(
     val surface: DepthCanonicalSurface,
 )
 
+/** Reusable scalar destination for one canonical lookup. */
+internal class CanonicalSurfaceScratch {
+    var present: Boolean = false
+        private set
+    var id: Long = 0L
+        private set
+    var voxelX: Int = 0
+        private set
+    var voxelY: Int = 0
+        private set
+    var voxelZ: Int = 0
+        private set
+    /** Address queried by a voxel lookup; may differ from the source voxel. */
+    var addressedVoxelX: Int = 0
+        private set
+    var addressedVoxelY: Int = 0
+        private set
+    var addressedVoxelZ: Int = 0
+        private set
+    var packedNormal: Int = 0
+        private set
+    var normalConfidence: Int = 0
+        private set
+    var lineageCount: Int = 0
+        private set
+
+    internal fun clear() {
+        present = false
+        id = 0L
+        voxelX = 0
+        voxelY = 0
+        voxelZ = 0
+        addressedVoxelX = 0
+        addressedVoxelY = 0
+        addressedVoxelZ = 0
+        packedNormal = 0
+        normalConfidence = 0
+        lineageCount = 0
+    }
+
+    internal fun set(
+        id: Long,
+        voxelX: Int,
+        voxelY: Int,
+        voxelZ: Int,
+        packedNormal: Int,
+        normalConfidence: Int,
+        lineageCount: Int,
+    ) {
+        require(id in 1L..0xffff_ffffL)
+        require(packedNormal in 0..0xffff)
+        require(normalConfidence in 0..255)
+        require(lineageCount in 0..0xffff)
+        this.present = true
+        this.id = id
+        this.voxelX = voxelX
+        this.voxelY = voxelY
+        this.voxelZ = voxelZ
+        this.addressedVoxelX = voxelX
+        this.addressedVoxelY = voxelY
+        this.addressedVoxelZ = voxelZ
+        this.packedNormal = packedNormal
+        this.normalConfidence = normalConfidence
+        this.lineageCount = lineageCount
+    }
+
+    /** Writes a row with distinct queried address and canonical source voxel. */
+    internal fun setAddressed(
+        id: Long,
+        addressedVoxelX: Int,
+        addressedVoxelY: Int,
+        addressedVoxelZ: Int,
+        sourceVoxelX: Int,
+        sourceVoxelY: Int,
+        sourceVoxelZ: Int,
+        packedNormal: Int,
+        normalConfidence: Int,
+        lineageCount: Int,
+    ) {
+        set(
+            id, sourceVoxelX, sourceVoxelY, sourceVoxelZ,
+            packedNormal, normalConfidence, lineageCount,
+        )
+        this.addressedVoxelX = addressedVoxelX
+        this.addressedVoxelY = addressedVoxelY
+        this.addressedVoxelZ = addressedVoxelZ
+    }
+}
+
 /**
  * One immutable canonical-cut version. Implementations publish and read this pair atomically.
  * Both coordinates are monotonic, and every visible canonical mutation advances at least one.
@@ -139,10 +274,46 @@ internal interface BoundedCanonicalSurfaceView {
     val revisionPair: CanonicalRevisionPair
     val surfaceCount: Int
 
+    /** Optional, cut-qualified certificate for aligned 1/2/4-voxel blocks. Unknown means occupied. */
+    val supportsEmptyBlockSkipping: Boolean get() = false
+    fun isKnownEmptyBlock(blockX: Int, blockY: Int, blockZ: Int, blockVoxels: Int = 4): Boolean = false
+
     /** Returns only a directly addressed row; implementations must not enumerate rows. */
     fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface?
 
     fun findSurfaceAt(voxel: Voxel): AddressedCanonicalSurface?
+
+    /** Scalar lookup used by the depth workspace; implementations may reuse [scratch]. */
+    fun findSurfaceAtInto(x: Int, y: Int, z: Int, scratch: CanonicalSurfaceScratch): Boolean {
+        val addressed = findSurfaceAt(Voxel(x, y, z))
+        if (addressed == null) {
+            scratch.clear()
+            return false
+        }
+        val surface = addressed.surface
+        require(addressed.addressedVoxel == Voxel(x, y, z))
+        scratch.setAddressed(
+            surface.id.value,
+            addressed.addressedVoxel.x, addressed.addressedVoxel.y, addressed.addressedVoxel.z,
+            surface.voxel.x, surface.voxel.y, surface.voxel.z,
+            surface.packedNormal, surface.normalConfidence, surface.lineageCount,
+        )
+        return true
+    }
+
+    /** Scalar identity validation used by the depth workspace. */
+    fun findSurfaceByIdInto(id: Long, scratch: CanonicalSurfaceScratch): Boolean {
+        val surface = findSurfaceById(SurfaceId(id))
+        if (surface == null) {
+            scratch.clear()
+            return false
+        }
+        scratch.set(
+            surface.id.value, surface.voxel.x, surface.voxel.y, surface.voxel.z,
+            surface.packedNormal, surface.normalConfidence, surface.lineageCount,
+        )
+        return true
+    }
 
     fun visitRayCells(
         startGroupMm: DepthPointMm,
@@ -150,6 +321,24 @@ internal interface BoundedCanonicalSurfaceView {
         maximumVisits: Int,
         visitor: (Voxel, DepthCanonicalSurface?) -> Boolean,
     ): DepthRayVisitResult
+
+    /** Scalar supercover seam used by the reusable fusion workspace. */
+    fun visitRayCellsInto(
+        startGroupMm: DepthPointMm,
+        endpointGroupMm: DepthPointMm,
+        maximumVisits: Int,
+        scratch: CanonicalSurfaceScratch,
+        visitor: (Int, Int, Int, CanonicalSurfaceScratch) -> Boolean,
+    ): DepthRayVisitResult = visitRayCells(
+        startGroupMm, endpointGroupMm, maximumVisits,
+    ) { voxel, surface ->
+        if (surface == null) scratch.clear() else scratch.setAddressed(
+            surface.id.value, voxel.x, voxel.y, voxel.z,
+            surface.voxel.x, surface.voxel.y, surface.voxel.z,
+            surface.packedNormal, surface.normalConfidence, surface.lineageCount,
+        )
+        visitor(voxel.x, voxel.y, voxel.z, scratch)
+    }
 }
 
 internal sealed interface DepthEvidenceChange {
@@ -266,6 +455,7 @@ internal data class DepthEvidenceReceipt(
     val sourceTimestampNs: Long = 0,
     val acceptedSamples: Int = 0,
     val rejectedSamples: Int = 0,
+    /** Bounded traversal units: fine cells plus certified empty block segments. */
     val rayVisits: Int = 0,
     val touchedEvidenceRows: Int = 0,
     val independentDirectionVotes: Int = 0,

@@ -1,5 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
+import android.os.Debug
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaReceiptV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaSelectorV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CurrentDeltaSourceV1
@@ -15,19 +16,28 @@ import com.uhg0.ar_flutter_plugin_2.sceneview.BoundedCoveragePresentation
 import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationMode
 import com.uhg0.ar_flutter_plugin_2.sceneview.PresentationDescriptor
 import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationSelector
-import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.File
+import java.io.InputStream
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 private enum class PendingPublicationGateResult { READY, REJECTED }
 
+private const val DEFERRED_DEPTH_OBSERVATION_OWNER_BYTES = 64L
+// Portable object header + two Longs + eighteen Ints; accepted receipts alias
+// the kernel's prepared/committed output and are already covered by its reserve.
+internal const val RETAINED_DEPTH_REFUSAL_RECEIPT_BYTES = 104L
+internal const val VISIBILITY_GRID_INTEGRATION_SCALAR_OWNER_BYTES = 364L
+private const val UNAVAILABLE_ALLOCATION_BYTES = -1L
+
 private data class PendingDepthCommit(
+    val offerLedger: DepthOfferTimingLedger?,
+    val offerId: Long,
     val ownership: VisibilityObservationOwnership,
     val mutation: PreparedCanonicalMutation,
     val geometryCut: CommittedGeometryCut,
@@ -35,14 +45,26 @@ private data class PendingDepthCommit(
     val admissionStartedNs: Long,
     val lookupMicros: Long,
     val mutationStartedNs: Long,
+    val lookupAllocatedBytes: Long,
+    val mutationStartedAllocatedBytes: Long,
+)
+
+private data class DeferredDepthObservation(
+    val observation: VisibilityDepthObservation,
+    val admissionStartedNs: Long,
 )
 
 private data class PendingDepthAdmissionTiming(
+    val offerLedger: DepthOfferTimingLedger?,
+    val offerId: Long,
     val sequence: Long,
     val admissionStartedNs: Long,
     val lookupMicros: Long,
     val mutationMicros: Long,
     val publicationStartedNs: Long,
+    val lookupAllocatedBytes: Long,
+    val mutationAllocatedBytes: Long,
+    val publicationStartedAllocatedBytes: Long,
 )
 
 private data class PendingFeatureAdmissionTiming(
@@ -53,6 +75,11 @@ private data class PendingFeatureAdmissionTiming(
     val serializationMicros: Long,
     val publicationStartedNs: Long,
     val publicationMicros: Long,
+    val planningAllocatedBytes: Long,
+    val mutationAllocatedBytes: Long,
+    val serializationAllocatedBytes: Long,
+    val publicationStartedAllocatedBytes: Long,
+    val publicationAllocatedBytes: Long,
 )
 
 private data class PendingRendererRebuild(
@@ -81,7 +108,7 @@ internal data class PendingDepthRetentionReceipt(
     val budgetBytes: Long = BUDGET_BYTES,
 ) {
     companion object {
-        const val PENDING_OWNER_SCALAR_BYTES = 40L
+        const val PENDING_OWNER_SCALAR_BYTES = 56L
         const val BUDGET_BYTES = 32L * 1024L * 1024L
         private const val MAXIMUM_ROWS = 100_000
         private const val DEPTH_EVIDENCE_ROW_BYTES = 32L
@@ -119,6 +146,24 @@ internal data class PendingDepthRetentionReceipt(
     }
 }
 
+internal data class DepthPublicationDeferralSnapshot(
+    val deferred: Long,
+    val replaced: Long,
+    val retried: Long,
+    val fenced: Long,
+    val released: Long,
+    val pendingPayloadBytes: Long,
+) {
+    fun toWireMap(): Map<String, Any> = mapOf(
+        "deferred" to deferred,
+        "replaced" to replaced,
+        "retried" to retried,
+        "fenced" to fenced,
+        "released" to released,
+        "pendingPayloadBytes" to pendingPayloadBytes,
+    )
+}
+
 /**
  * One group-local canonical surface module behind the capture ingress mapper seam.
  *
@@ -144,6 +189,12 @@ internal class VisibilityGridIntegration(
     private val executor: ExecutorService = Executors.newSingleThreadExecutor(),
     private val ownsExecutor: Boolean = true,
     private val retainedRebindDrainTimeoutMilliseconds: Long = 30_000L,
+    /**
+     * Optional debug-only ART counter. A null provider keeps the hot mapper
+     * path free of Debug.getRuntimeStat calls in ordinary builds. The provider
+     * is supplied by the debuggable host when attribution is requested.
+     */
+    private val allocationCounter: (() -> Long?)? = null,
 ) : VisibilityObservationMapper {
     private val lock = Any()
     private val publicationGate = Any()
@@ -170,6 +221,19 @@ internal class VisibilityGridIntegration(
     private var pendingRendererRows = 0
     private var pendingCanonicalAcknowledgement: CanonicalAcknowledgement? = null
     private var pendingDepthCommit: PendingDepthCommit? = null
+    /**
+     * One replaceable deferred depth value. The producer callback may clear
+     * this slot while the integration executor is busy; keep that transfer
+     * lock-free so frame ingress never waits for canonical work.
+     */
+    private val deferredDepthObservation = AtomicReference<DeferredDepthObservation?>(null)
+    private val deferredDepthIngressReplacedCount = AtomicLong(0L)
+    private val deferredDepthIngressReleasedCount = AtomicLong(0L)
+    private var deferredDepthCount = 0L
+    private var deferredDepthReplacedCount = 0L
+    private var deferredDepthRetriedCount = 0L
+    private var deferredDepthFencedCount = 0L
+    private var deferredDepthReleasedCount = 0L
     @Volatile private var pendingDepthTiming: PendingDepthAdmissionTiming? = null
     @Volatile private var pendingFeatureTiming: PendingFeatureAdmissionTiming? = null
     private var depthTimingCompletedCount = 0L
@@ -178,6 +242,15 @@ internal class VisibilityGridIntegration(
     private var depthTimingMutationMicros = 0L
     private var depthTimingPublicationAckMicros = 0L
     private var depthTimingEndToEndMicros = 0L
+    private var depthTimingLookupAllocatedBytes = -1L
+    private var depthTimingMutationAllocatedBytes = -1L
+    private var depthTimingPublicationAckAllocatedBytes = -1L
+    private var depthTimingLookupAllocatedBytesTotal = 0L
+    private var depthTimingLookupAllocationSamples = 0L
+    private var depthTimingMutationAllocatedBytesTotal = 0L
+    private var depthTimingMutationAllocationSamples = 0L
+    private var depthTimingPublicationAckAllocatedBytesTotal = 0L
+    private var depthTimingPublicationAckAllocationSamples = 0L
     private var featureTimingCompletedCount = 0L
     private var featureTimingSequence = 0L
     private var featureTimingPlanningMicros = 0L
@@ -185,9 +258,26 @@ internal class VisibilityGridIntegration(
     private var featureTimingSerializationMicros = 0L
     private var featureTimingPublicationMicros = 0L
     private var featureTimingEndToEndMicros = 0L
+    private var featureTimingPlanningAllocatedBytes = -1L
+    private var featureTimingMutationAllocatedBytes = -1L
+    private var featureTimingSerializationAllocatedBytes = -1L
+    private var featureTimingPublicationAllocatedBytes = -1L
+    private var featureTimingPlanningAllocatedBytesTotal = 0L
+    private var featureTimingPlanningAllocationSamples = 0L
+    private var featureTimingMutationAllocatedBytesTotal = 0L
+    private var featureTimingMutationAllocationSamples = 0L
+    private var featureTimingSerializationAllocatedBytesTotal = 0L
+    private var featureTimingSerializationAllocationSamples = 0L
+    private var featureTimingPublicationAllocatedBytesTotal = 0L
+    private var featureTimingPublicationAllocationSamples = 0L
     private var lastDepthLookupReceipt: BoundedCanonicalLookupReceipt? = null
-    private var lastDepthAdmissionStatus: String? = null
+    private var lastDepthLookupReason: BoundedCanonicalLookupReason? = null
+    private var lastDepthEvidenceRefusal: DepthEvidenceRefusal? = null
+    @Volatile private var lastDepthAdmissionStatus: String? = null
     private var lastDepthEvidenceReceipt: DepthEvidenceReceipt? = null
+    private var lastDepthSelectedSamples = 0
+    private var lastDepthSourceRejectedSamples = 0
+    private var lastDepthLeaseRejectedSamples = -1
     private var canonicalSurfaceHighWater = 0L
     private var associationHighWater = 0L
     private var canonicalOwnedBytesHighWater = 0L
@@ -223,6 +313,7 @@ internal class VisibilityGridIntegration(
                 if (resources != null || owner != null || kernel != null || depthKernel != null ||
                     pending != null || pendingQueued || pendingRendererApplied ||
                     pendingRendererRebuild != null || pendingCanonicalAcknowledgement != null ||
+                    deferredDepthObservation.get() != null ||
                     authoritativeBaseline.geometryRevision != 1L ||
                     authoritativeBaseline.lineageRevision != 1L ||
                     !renderer.rebindRetainedEmptyCanonicalCut(
@@ -262,7 +353,8 @@ internal class VisibilityGridIntegration(
                     !pendingQueued || !pendingRendererApplied
                 ) return@synchronized false
                 pendingBindingAcknowledged = true
-                finishPendingAcknowledgement(exactPending)
+                finishPendingAcknowledgement(exactPending, drainDeferredDepth = false)
+                releaseDeferredDepth(fenced = true)
                 if (pending != null) return@synchronized false
             }
 
@@ -286,7 +378,9 @@ internal class VisibilityGridIntegration(
         }
     }
 
-    override fun admitFeature(observation: VisibilityFeatureObservation) = mutate(observation.ownership) {
+    override fun admitFeature(observation: VisibilityFeatureObservation) {
+        try {
+            mutate(observation.ownership) {
         if (isFenced(observation.ownership)) return@mutate
         if (drainPendingPublication() == PendingPublicationGateResult.REJECTED) return@mutate
         if (retryPendingDepthCommit(observation.ownership)) return@mutate
@@ -294,23 +388,32 @@ internal class VisibilityGridIntegration(
         if (drainPendingPublication() == PendingPublicationGateResult.REJECTED) return@mutate
         val admissionStartedNs = System.nanoTime()
         val featureSequence = ++batchSequence
+        val planningStartedAllocatedBytes = allocationNow()
         // This adapter is the only CAPTURE-INGRESS-to-canonical surface conversion point.  It creates
         // fixed camera/sample evidence before the kernel can mutate anything.
-        val normalEvidence = (FeatureNormalEvidence.from(observation) as? FeatureNormalEvidence.Conversion.Accepted)
-            ?: run {
-                rejected++
-                receipt = receipt.copy(status = "normalEvidenceRefused", rejected = rejected)
-                return@mutate
-            }
-        val fused = requireNotNull(kernel).prepare(
-            FeatureFusionBatch(
-                sequence = featureSequence,
-                timestampNs = observation.frame.sourceTimestampNs,
-                observations = observation.samples.zip(normalEvidence.evidence).map { (sample, normal) ->
-                    FeatureFusionEvidence(sample.xWorld, sample.yWorld, sample.zWorld, 2, sample.id, normal)
-                },
-            ),
-        )
+        val fused = if (observation.packedSamples != null) {
+            requireNotNull(kernel).preparePacked(observation, featureSequence)
+        } else {
+            val normalEvidence = (FeatureNormalEvidence.from(observation) as? FeatureNormalEvidence.Conversion.Accepted)
+                ?: run {
+                    rejected++
+                    receipt = receipt.copy(status = "normalEvidenceRefused", rejected = rejected)
+                    return@mutate
+                }
+            requireNotNull(kernel).prepare(
+                FeatureFusionBatch(
+                    sequence = featureSequence,
+                    timestampNs = observation.frame.sourceTimestampNs,
+                    observations = observation.samples.zip(normalEvidence.evidence).map { (sample, normal) ->
+                        FeatureFusionEvidence(sample.xWorld, sample.yWorld, sample.zWorld, 2, sample.id, normal)
+                    },
+                ),
+            )
+        }
+        val planningAllocatedBytes = allocationDelta(
+            planningStartedAllocatedBytes,
+            allocationNow(),
+        ) ?: UNAVAILABLE_ALLOCATION_BYTES
         val accepted = fused as? FeatureFusionResult.Accepted ?: run {
             rejected++
             receipt = receipt.copy(status = "kernelRefused", rejected = rejected)
@@ -328,6 +431,11 @@ internal class VisibilityGridIntegration(
             serializationMicros = 0L,
             publicationStartedNs = 0L,
             publicationMicros = 0L,
+            planningAllocatedBytes = planningAllocatedBytes,
+            mutationAllocatedBytes = UNAVAILABLE_ALLOCATION_BYTES,
+            serializationAllocatedBytes = UNAVAILABLE_ALLOCATION_BYTES,
+            publicationStartedAllocatedBytes = UNAVAILABLE_ALLOCATION_BYTES,
+            publicationAllocatedBytes = UNAVAILABLE_ALLOCATION_BYTES,
         )
         val state = requireNotNull(owner).activationState()
         if (state?.current == CanonicalActivationCurrent.None &&
@@ -336,6 +444,10 @@ internal class VisibilityGridIntegration(
             publishInitialV6Create(observation.ownership, accepted.delta, featureTiming)
         } else {
             publishMaterialBatch(observation.ownership, accepted.delta, featureTiming)
+        }
+            }
+        } finally {
+            observation.close()
         }
     }
 
@@ -359,14 +471,38 @@ internal class VisibilityGridIntegration(
 
     /** Depth and feature ingress share the same serialized publication lane. */
     override fun admitDepth(observation: VisibilityDepthObservation) {
-        mutate(observation.ownership) {
+        var retainedByMapper = false
+        try {
+            mutate(observation.ownership) {
             if (isFenced(observation.ownership)) return@mutate
+            if (pending != null) {
+                // Once the exact structural ACK is known, a depth turn must
+                // first finish any renderer recovery for that same cut. This
+                // preserves the one publication lane without leaving a
+                // renderer rebuild stranded behind the newest depth slot.
+                val acknowledged = synchronized(lock) { pendingBindingAcknowledged }
+                if (!acknowledged) {
+                    retainedByMapper = deferDepthUntilPublicationAcknowledgement(observation)
+                    return@mutate
+                }
+                if (drainPendingPublication() == PendingPublicationGateResult.REJECTED) {
+                    return@mutate
+                }
+            }
             if (drainPendingPublication() == PendingPublicationGateResult.REJECTED) return@mutate
             if (retryPendingDepthCommit(observation.ownership)) return@mutate
             ensureOpened(observation.ownership) ?: return@mutate
-            if (drainPendingPublication() == PendingPublicationGateResult.REJECTED) return@mutate
+            if (drainPendingPublication() == PendingPublicationGateResult.REJECTED) {
+                if (pending != null) {
+                    retainedByMapper = deferDepthUntilPublicationAcknowledgement(observation)
+                }
+                return@mutate
+            }
             admitDepthLocked(observation, System.nanoTime())
             lastDepthAdmissionStatus = receipt.status
+            }
+        } finally {
+            if (!retainedByMapper) observation.close()
         }
     }
 
@@ -377,7 +513,10 @@ internal class VisibilityGridIntegration(
         }
         afterLifecycleFence()
         drain()
-        synchronized(lock) { discardPendingDepthCommit() }
+        synchronized(lock) {
+            discardPendingDepthCommit()
+            releaseDeferredDepth(fenced = true)
+        }
     }
 
     override fun resume() {
@@ -483,8 +622,56 @@ internal class VisibilityGridIntegration(
 
     internal fun lastDepthAdmissionStatus(): String? = synchronized(lock) { lastDepthAdmissionStatus }
 
-    internal fun lastDepthEvidenceReceipt(): DepthEvidenceReceipt? = synchronized(lock) {
-        lastDepthEvidenceReceipt
+    /**
+     * Keeps the source lane's current/latest contract end to end. When a new
+     * copied depth value is about to enter an already resident lane, release
+     * the older mapper slot first; the lane then owns at most current+latest.
+     */
+    override fun beforeDepthObservationOffer(laneHasOutstandingWork: Boolean) {
+        if (!laneHasOutstandingWork) return
+        // The source lane has its own current/latest slots. Atomically hand
+        // off the mapper's latest slot before that lane accepts another value;
+        // this keeps one deferred payload from becoming a third retained map.
+        val deferred = deferredDepthObservation.getAndSet(null) ?: return
+        deferredDepthIngressReplacedCount.incrementAndGet()
+        deferredDepthIngressReleasedCount.incrementAndGet()
+        deferred.observation.finishDebugOffer(DepthOfferTimingLedger.REPLACED)
+        deferred.observation.close()
+        lastDepthAdmissionStatus = "depthPublicationDeferredReplacedByLatestIngress"
+    }
+
+    override fun retainedDepthPayloadBytes(): Long =
+        deferredDepthObservation.get()?.observation?.payloadBytes?.toLong() ?: 0L
+
+    /** Latest kernel preparation attempt, not a claim of canonical admission. */
+    internal fun depthEvidenceDiagnostics(): Map<String, Any> = synchronized(lock) {
+        val evidence = lastDepthEvidenceReceipt
+        val counts = mapOf(
+            "selectedSamples" to lastDepthSelectedSamples,
+            "sourceRejectedSamples" to lastDepthSourceRejectedSamples,
+            // This is the lease's copy of the source rejection count, not
+            // additional kernel rejection. -1 means no packed lease exists.
+            "leaseRejectedSamples" to lastDepthLeaseRejectedSamples,
+            "preparationOutcome" to when {
+                evidence == null -> "none"
+                lastDepthEvidenceRefusal != null -> "refused"
+                else -> "prepared"
+            },
+        )
+        if (evidence == null) counts else counts + mapOf(
+            "acceptedSamples" to evidence.acceptedSamples,
+            "rejectedSamples" to evidence.rejectedSamples,
+            "rayVisits" to evidence.rayVisits,
+            "touchedEvidenceRows" to evidence.touchedEvidenceRows,
+            "independentDirectionVotes" to evidence.independentDirectionVotes,
+            "createCount" to evidence.createCount,
+            "refineCount" to evidence.refineCount,
+            "relocateCount" to evidence.relocateCount,
+            "mergeCount" to evidence.mergeCount,
+            "splitCount" to evidence.splitCount,
+            "replaceCount" to evidence.replaceCount,
+            "removeCount" to evidence.removeCount,
+        )
     }
 
     /** Fixed native-owner scalars for the debug pressure receipt. */
@@ -511,12 +698,99 @@ internal class VisibilityGridIntegration(
         pendingDepthCommit?.let(::retentionReceipt)
     }
 
+    internal fun depthPublicationDeferralSnapshot(): DepthPublicationDeferralSnapshot = synchronized(lock) {
+        DepthPublicationDeferralSnapshot(
+            deferred = deferredDepthCount,
+            replaced = deferredDepthReplacedCount + deferredDepthIngressReplacedCount.get(),
+            retried = deferredDepthRetriedCount,
+            fenced = deferredDepthFencedCount,
+            released = deferredDepthReleasedCount + deferredDepthIngressReleasedCount.get(),
+            pendingPayloadBytes = deferredDepthObservation.get()?.observation?.payloadBytes?.toLong() ?: 0L,
+        )
+    }
+
     internal fun depthResourceReceipt(): DepthEvidenceResourceReceipt? = synchronized(lock) {
         depthKernel?.resourceReceipt()
     }
 
+    /** Scalar debug evidence; callers sample this off the platform/render lane. */
+    internal fun allocationWorkspaceReceipt(): Map<String, Long> = synchronized(lock) {
+        buildMap {
+            resources?.preparationWorkspaceReceipt()?.let {
+                put("canonicalPreparationOwnedCapacityBytes", it.ownedCapacityBytes)
+                put("canonicalPreparationGrowthEvents", it.growthEvents)
+            }
+            depthKernel?.resourceReceipt()?.let {
+                put("depthFixedPrimitiveBytes", it.fixedPrimitiveBytes.toLong())
+                put("depthResidentEvidenceBytes", it.residentBytes.toLong())
+                put("depthPreparedResidentBytes", it.preparedResidentBytes.toLong())
+                put("depthModeledMaximumSemanticBytes", it.modeledMaximumSemanticStateBytes.toLong())
+            }
+            kernel?.resourceReceipt()?.let {
+                put("featureOwnedTupleBytes", it.assignedTupleShareBytes.toLong())
+            }
+            put("mapperAllocationAttributionEnabled", if (allocationCounter == null) 0L else 1L)
+            put("mapperDepthLookupAllocatedBytes", depthTimingLookupAllocatedBytes)
+            put("mapperDepthMutationAllocatedBytes", depthTimingMutationAllocatedBytes)
+            put("mapperDepthPublicationAckAllocatedBytes", depthTimingPublicationAckAllocatedBytes)
+            put("mapperFeaturePlanningAllocatedBytes", featureTimingPlanningAllocatedBytes)
+            put("mapperFeatureMutationAllocatedBytes", featureTimingMutationAllocatedBytes)
+            put("mapperFeatureSerializationAllocatedBytes", featureTimingSerializationAllocatedBytes)
+            put("mapperFeaturePublicationAllocatedBytes", featureTimingPublicationAllocatedBytes)
+            put("mapperDepthLookupAllocatedBytesTotal", reportedAllocationTotal(
+                depthTimingLookupAllocatedBytesTotal,
+                depthTimingLookupAllocationSamples,
+            ))
+            put("mapperDepthLookupAllocationSamples", depthTimingLookupAllocationSamples)
+            put("mapperDepthMutationAllocatedBytesTotal", reportedAllocationTotal(
+                depthTimingMutationAllocatedBytesTotal,
+                depthTimingMutationAllocationSamples,
+            ))
+            put("mapperDepthMutationAllocationSamples", depthTimingMutationAllocationSamples)
+            put("mapperDepthPublicationAckAllocatedBytesTotal", reportedAllocationTotal(
+                depthTimingPublicationAckAllocatedBytesTotal,
+                depthTimingPublicationAckAllocationSamples,
+            ))
+            put("mapperDepthPublicationAckAllocationSamples", depthTimingPublicationAckAllocationSamples)
+            put("mapperFeaturePlanningAllocatedBytesTotal", reportedAllocationTotal(
+                featureTimingPlanningAllocatedBytesTotal,
+                featureTimingPlanningAllocationSamples,
+            ))
+            put("mapperFeaturePlanningAllocationSamples", featureTimingPlanningAllocationSamples)
+            put("mapperFeatureMutationAllocatedBytesTotal", reportedAllocationTotal(
+                featureTimingMutationAllocatedBytesTotal,
+                featureTimingMutationAllocationSamples,
+            ))
+            put("mapperFeatureMutationAllocationSamples", featureTimingMutationAllocationSamples)
+            put("mapperFeatureSerializationAllocatedBytesTotal", reportedAllocationTotal(
+                featureTimingSerializationAllocatedBytesTotal,
+                featureTimingSerializationAllocationSamples,
+            ))
+            put("mapperFeatureSerializationAllocationSamples", featureTimingSerializationAllocationSamples)
+            put("mapperFeaturePublicationAllocatedBytesTotal", reportedAllocationTotal(
+                featureTimingPublicationAllocatedBytesTotal,
+                featureTimingPublicationAllocationSamples,
+            ))
+            put("mapperFeaturePublicationAllocationSamples", featureTimingPublicationAllocationSamples)
+        }
+    }
+
     internal fun depthLookupReceipt(): BoundedCanonicalLookupReceipt? = synchronized(lock) {
         lastDepthLookupReceipt
+    }
+
+    /** Bounded scalar provenance for a refused or completed depth lookup. */
+    internal fun depthLookupDiagnostics(): Map<String, Any> = synchronized(lock) {
+        val lookup = lastDepthLookupReceipt ?: return@synchronized emptyMap()
+        mapOf(
+            "directLookups" to lookup.directLookups,
+            "rayCellVisits" to lookup.rayCellVisits,
+            "pageReads" to lookup.pageReads,
+            "bytesRead" to lookup.bytesRead,
+            "refusedByLimit" to lookup.refusedByLimit,
+            "boundedReason" to (lastDepthLookupReason?.name ?: "none"),
+            "evidenceReason" to (lastDepthEvidenceRefusal?.name ?: "none"),
+        )
     }
 
     internal fun pendingPublicationGeometryCut(): CommittedGeometryCut? = synchronized(lock) { pendingGeometryCut }
@@ -524,16 +798,29 @@ internal class VisibilityGridIntegration(
     /** Portable scalar owners only; kernel/renderer arrays and phase buffers are named separately. */
     internal fun portableOwnerMemoryReceipt(): RuntimeOwnerMemoryReceipt = synchronized(lock) {
         RuntimeOwnerMemoryReceipt(
-            // Renderer-rebuild and depth-lookup references plus the early-ACK
-            // scalar were added after the locked 152-byte owner model.
-            integrationObjectBytes = 176,
-            integrationReceiptBytes = 104,
+            // Renderer-rebuild, depth-lookup, and bounded deferred-depth
+            // references plus the early-ACK scalar are part of this owner.
+            // The attribution provider reference, seven latest allocation
+            // scalars, seven cumulative totals and seven sample counts add
+            // 176 bytes even when counter collection is disabled.
+            // Three latest-attempt input counts add twelve fixed scalar bytes.
+            integrationObjectBytes = VISIBILITY_GRID_INTEGRATION_SCALAR_OWNER_BYTES,
+            integrationReceiptBytes = 104 +
+                (if (pendingDepthTiming != null) 40L else 0L) +
+                (if (pendingFeatureTiming != null) 40L else 0L) +
+                (if (pendingDepthCommit != null) 32L else 0L),
             retainedDeltaOwnerBytes = 16,
             pendingRendererRebuildBytes = pendingRendererRebuild?.let {
                 PendingRendererRebuild.PORTABLE_BYTES
             } ?: 0,
             retainedDepthLookupReceiptBytes = lastDepthLookupReceipt?.let {
                 BoundedCanonicalLookupReceipt.PORTABLE_BYTES
+            } ?: 0,
+            retainedDepthRefusalReceiptBytes = if (
+                lastDepthEvidenceReceipt != null && lastDepthEvidenceRefusal != null
+            ) RETAINED_DEPTH_REFUSAL_RECEIPT_BYTES else 0,
+            deferredDepthObservationBytes = deferredDepthObservation.get()?.let {
+                DEFERRED_DEPTH_OBSERVATION_OWNER_BYTES + it.observation.payloadBytes.toLong()
             } ?: 0,
             runtimeOwnerBytes = resources?.portableOwnerBytes() ?: 0,
             bindingOwnerBytes = binding.portableOwnerBytes(),
@@ -661,7 +948,7 @@ internal class VisibilityGridIntegration(
         }
         resources = runtimeResources
         owner = opened.ownership
-        kernel = featureKernelFactory()
+        kernel = createBoundFeatureKernel(runtimeResources)
         depthKernel = depthKernelFactory(expected.groupFrame)
         cut = expected
         baseline = seeded
@@ -685,7 +972,7 @@ internal class VisibilityGridIntegration(
                     rendererRebuildHydratesKernel = rebuilt == null,
                 )
             } else {
-                if (rebuildCanonicalRenderer(expected, state) == null) {
+                if (rebuildCanonicalRenderer(expected, state, transactionId = seeded.transactionId) == null) {
                     pendingRendererRebuild = PendingRendererRebuild(
                         expected, 0, state.cut.geometryRevision, state.cut.lineageRevision, true,
                     )
@@ -701,6 +988,12 @@ internal class VisibilityGridIntegration(
         observation: VisibilityDepthObservation,
         admissionStartedNs: Long,
     ) {
+        // Release the prior diagnostic receipt before preparing another result.
+        // Input counts come from existing metadata/columns, with no sample scan.
+        clearDepthAttemptDiagnostics()
+        lastDepthSelectedSamples = observation.sampleCount
+        lastDepthSourceRejectedSamples = observation.sourceRejectedSamples
+        lastDepthLeaseRejectedSamples = observation.packedSamples?.rejectedCount ?: -1
         val depth = requireNotNull(depthKernel)
         val groupFrame = observation.ownership.groupFrame
         val groupFromCamera = composeGroupFromCamera(
@@ -712,16 +1005,33 @@ internal class VisibilityGridIntegration(
             receipt = receipt.copy(status = "depthFrameRefused", rejected = rejected)
             return
         }
-        val batch = DepthEvidenceBatch(
-            sequence = ++batchSequence,
-            sourceTimestampNs = observation.frame.sourceTimestampNs,
-            groupFrame = groupFrame,
-            groupFromCameraGl = groupFromCamera,
-            intrinsics = observation.frame.intrinsics,
-            samples = observation.samples,
-            sourceRejectedSamples = observation.sourceRejectedSamples,
-            tracking = observation.frame.tracking,
-        )
+        val batchSequenceValue = ++batchSequence
+        val batch: DepthEvidenceBatch?
+        val metadata: DepthEvidenceMetadata?
+        if (observation.packedSamples == null) {
+            batch = DepthEvidenceBatch(
+                sequence = batchSequenceValue,
+                sourceTimestampNs = observation.frame.sourceTimestampNs,
+                groupFrame = groupFrame,
+                groupFromCameraGl = groupFromCamera,
+                intrinsics = observation.frame.intrinsics,
+                samples = observation.samples,
+                sourceRejectedSamples = observation.sourceRejectedSamples,
+                tracking = observation.frame.tracking,
+            )
+            metadata = null
+        } else {
+            batch = null
+            metadata = DepthEvidenceMetadata(
+                sequence = batchSequenceValue,
+                sourceTimestampNs = observation.frame.sourceTimestampNs,
+                groupFrame = groupFrame,
+                groupFromCameraGl = groupFromCamera,
+                intrinsics = observation.frame.intrinsics,
+                sourceRejectedSamples = observation.sourceRejectedSamples,
+                tracking = observation.frame.tracking,
+            )
+        }
         val currentCut = requireNotNull(owner).activationState()?.cut ?: run {
             depth.discardPrepared()
             rejected++
@@ -730,7 +1040,10 @@ internal class VisibilityGridIntegration(
         }
         var featureSources: DepthFeatureSourceTable? = null
         val lookupStartedNs = System.nanoTime()
-        if (!requireNotNull(resources).updateSpatialWindow(batch)) {
+        val lookupStartedAllocatedBytes = allocationNow()
+        val spatialMetadata: DepthEvidenceMetadataView = batch ?: metadata
+            ?: error("depth evidence metadata is missing")
+        if (!requireNotNull(resources).updateSpatialWindow(spatialMetadata)) {
             depth.discardPrepared()
             rejected++
             receipt = receipt.copy(status = "depthSpatialWindowRefused", rejected = rejected)
@@ -752,14 +1065,35 @@ internal class VisibilityGridIntegration(
                 maximumBytesRead = 64L * 1024L * 1024L,
             ),
         ) { view ->
-            val result = depth.prepare(batch, view)
+            val result = if (batch != null) {
+                depth.prepare(batch, view)
+            } else {
+                depth.prepare(requireNotNull(observation.packedSamples), requireNotNull(metadata), view)
+            }
             if (result is DepthEvidenceResult.Accepted && result.changes.isNotEmpty()) {
                 featureSources = collectDepthFeatureSources(requireNotNull(kernel), view, result.changes)
             }
             result
         }
+        val lookupAllocatedBytes = allocationDelta(
+            lookupStartedAllocatedBytes,
+            allocationNow(),
+        ) ?: UNAVAILABLE_ALLOCATION_BYTES
         val lookupMicros = elapsedMicros(lookupStartedNs, System.nanoTime())
         lastDepthLookupReceipt = lookup.receipt
+        lastDepthLookupReason = (lookup as? BoundedCanonicalLookupResult.Refused)?.reason
+        lastDepthEvidenceRefusal = when (lookup) {
+            is BoundedCanonicalLookupResult.Completed ->
+                (lookup.value as? DepthEvidenceResult.Refused)?.reason
+            is BoundedCanonicalLookupResult.Refused -> null
+        }
+        lastDepthEvidenceReceipt = when (val result =
+            (lookup as? BoundedCanonicalLookupResult.Completed)?.value
+        ) {
+            is DepthEvidenceResult.Accepted -> result.receipt
+            is DepthEvidenceResult.Refused -> result.receipt
+            null -> null
+        }
         val accepted = (lookup as? BoundedCanonicalLookupResult.Completed)?.value
             as? DepthEvidenceResult.Accepted ?: run {
             depth.discardPrepared()
@@ -767,7 +1101,6 @@ internal class VisibilityGridIntegration(
             receipt = receipt.copy(status = "depthLookupRefused", rejected = rejected)
             return
         }
-        lastDepthEvidenceReceipt = accepted.receipt
         if (accepted.changes.isEmpty()) {
             val remap = requireNotNull(kernel).prepareCanonicalRemap(emptyList())
             if (remap !is FeatureCanonicalRemapPreparation.Prepared) {
@@ -780,16 +1113,21 @@ internal class VisibilityGridIntegration(
             check(depth.applyPrepared() is DepthEvidenceApplyResult.Applied)
             admittedDepths++
             recordDepthTiming(
-                sequence = batch.sequence,
+                sequence = batchSequenceValue,
                 lookupMicros = lookupMicros,
                 mutationMicros = 0L,
                 publicationAckMicros = 0L,
                 endToEndMicros = elapsedMicros(admissionStartedNs, System.nanoTime()),
+                lookupAllocatedBytes = lookupAllocatedBytes,
+                mutationAllocatedBytes = UNAVAILABLE_ALLOCATION_BYTES,
+                publicationAckAllocatedBytes = UNAVAILABLE_ALLOCATION_BYTES,
             )
             receipt = receipt.copy(status = "nonMaterialRetained")
+            observation.finishDebugOffer(DepthOfferTimingLedger.NON_MATERIAL)
             return
         }
         val mutationStartedNs = System.nanoTime()
+        val mutationStartedAllocatedBytes = allocationNow()
         val preparation = requireNotNull(resources).prepareEvidenceBatch(
             CanonicalEvidenceBatchCommand(
                 commandId = "${observation.ownership.bindingGeneration}:${observation.ownership.lifecycleSequence}:depth:${batchSequence}",
@@ -834,19 +1172,27 @@ internal class VisibilityGridIntegration(
             return
         }
         val committedResult = commitCanonical(requireNotNull(resources), prepared.mutation)
+        val mutationAllocatedBytes = allocationDelta(
+            mutationStartedAllocatedBytes,
+            allocationNow(),
+        ) ?: UNAVAILABLE_ALLOCATION_BYTES
         val mutationMicros = elapsedMicros(mutationStartedNs, System.nanoTime())
         val state = (committedResult as? CanonicalAdjacentCommitResult.Committed)?.state ?: run {
             if (committedResult is CanonicalAdjacentCommitResult.Refused &&
                 committedResult.disposition == PreparedMutationDisposition.RETRYABLE
             ) {
                 val retained = PendingDepthCommit(
+                    offerLedger = observation.debugOfferLedger,
+                    offerId = observation.debugOfferId,
                     ownership = observation.ownership,
                     mutation = prepared.mutation,
                     geometryCut = geometryCut,
-                    sequence = batch.sequence,
+                    sequence = batchSequenceValue,
                     admissionStartedNs = admissionStartedNs,
                     lookupMicros = lookupMicros,
                     mutationStartedNs = mutationStartedNs,
+                    lookupAllocatedBytes = lookupAllocatedBytes,
+                    mutationStartedAllocatedBytes = mutationStartedAllocatedBytes,
                 )
                 val retention = retentionReceipt(retained)
                 if (retention == null || retention.totalBytes > retention.budgetBytes) {
@@ -857,6 +1203,7 @@ internal class VisibilityGridIntegration(
                     receipt = receipt.copy(status = "depthCommitRetentionRefused", rejected = rejected)
                     return
                 }
+                observation.debugOfferLedger?.stage(observation.debugOfferId, DepthOfferTimingLedger.COMMIT_PENDING)
                 pendingDepthCommit = retained
                 rejected++
                 receipt = receipt.copy(status = "depthCommitRetryPending", rejected = rejected)
@@ -869,19 +1216,25 @@ internal class VisibilityGridIntegration(
             receipt = receipt.copy(status = "depthCommitRefused", rejected = rejected)
             return
         }
+        refreshFeatureFingerprintResolver()
         requireNotNull(kernel).applyPreparedCanonicalRemap()
-        check(depth.applyPrepared() is DepthEvidenceApplyResult.Applied)
+        check(depth.applyPrepared(prepared.mutation) is DepthEvidenceApplyResult.Applied)
         admittedDepths++
         publishV6Current(
             observation.ownership,
             state,
             prebuiltGeometryCut = geometryCut,
             depthTiming = PendingDepthAdmissionTiming(
-                sequence = batch.sequence,
+                offerLedger = observation.debugOfferLedger,
+                offerId = observation.debugOfferId,
+                sequence = batchSequenceValue,
                 admissionStartedNs = admissionStartedNs,
                 lookupMicros = lookupMicros,
                 mutationMicros = mutationMicros,
                 publicationStartedNs = System.nanoTime(),
+                lookupAllocatedBytes = lookupAllocatedBytes,
+                mutationAllocatedBytes = mutationAllocatedBytes,
+                publicationStartedAllocatedBytes = allocationNow(),
             ),
         )
     }
@@ -895,17 +1248,21 @@ internal class VisibilityGridIntegration(
             receipt = receipt.copy(status = "depthCommitFenced", fenced = fenced)
             return true
         }
+        val retryMutationStartedAllocatedBytes = allocationNow()
         when (val result = commitCanonical(requireNotNull(resources), pendingDepth.mutation)) {
             is CanonicalAdjacentCommitResult.Committed -> {
                 pendingDepthCommit = null
+                refreshFeatureFingerprintResolver()
                 requireNotNull(kernel).applyPreparedCanonicalRemap()
-                check(requireNotNull(depthKernel).applyPrepared() is DepthEvidenceApplyResult.Applied)
+                check(requireNotNull(depthKernel).applyPrepared(pendingDepth.mutation) is DepthEvidenceApplyResult.Applied)
                 admittedDepths++
                 publishV6Current(
                     pendingDepth.ownership,
                     result.state,
                     prebuiltGeometryCut = pendingDepth.geometryCut,
                     depthTiming = PendingDepthAdmissionTiming(
+                        offerLedger = pendingDepth.offerLedger,
+                        offerId = pendingDepth.offerId,
                         sequence = pendingDepth.sequence,
                         admissionStartedNs = pendingDepth.admissionStartedNs,
                         lookupMicros = pendingDepth.lookupMicros,
@@ -914,6 +1271,12 @@ internal class VisibilityGridIntegration(
                             System.nanoTime(),
                         ),
                         publicationStartedNs = System.nanoTime(),
+                        lookupAllocatedBytes = pendingDepth.lookupAllocatedBytes,
+                        mutationAllocatedBytes = allocationDelta(
+                            retryMutationStartedAllocatedBytes,
+                            allocationNow(),
+                        ) ?: UNAVAILABLE_ALLOCATION_BYTES,
+                        publicationStartedAllocatedBytes = allocationNow(),
                     ),
                 )
             }
@@ -933,6 +1296,7 @@ internal class VisibilityGridIntegration(
     private fun discardPendingDepthCommit() {
         val pendingDepth = pendingDepthCommit ?: return
         pendingDepthCommit = null
+        pendingDepth.offerLedger?.finish(pendingDepth.offerId, DepthOfferTimingLedger.REFUSED)
         pendingDepth.mutation.discard()
         kernel?.discardPreparedCanonicalRemap()
         depthKernel?.discardPrepared()
@@ -989,6 +1353,7 @@ internal class VisibilityGridIntegration(
             return
         }
         val mutationStartedNs = System.nanoTime()
+        val mutationStartedAllocatedBytes = allocationNow()
         val activeOwner = requireNotNull(owner)
         val preparation = requireNotNull(resources).withCurrent {
             activeOwner.prepareAdjacentMutation(it, CanonicalTransactionCommand(
@@ -1019,14 +1384,22 @@ internal class VisibilityGridIntegration(
             receipt = receipt.copy(status = "canonicalCommitRefused", rejected = rejected)
             return
         }
+        val mutationAllocatedBytes = allocationDelta(
+            mutationStartedAllocatedBytes,
+            allocationNow(),
+        ) ?: UNAVAILABLE_ALLOCATION_BYTES
         val mutationMicros = elapsedMicros(mutationStartedNs, System.nanoTime())
         committedFeatures++
+        refreshFeatureFingerprintResolver()
         requireNotNull(kernel).applyPrepared()
         publishV6Current(
             expected,
             state,
             prepared.mutation,
-            featureTiming = featureTiming.copy(mutationMicros = mutationMicros),
+            featureTiming = featureTiming.copy(
+                mutationMicros = mutationMicros,
+                mutationAllocatedBytes = mutationAllocatedBytes,
+            ),
         )
     }
 
@@ -1052,6 +1425,7 @@ internal class VisibilityGridIntegration(
             return
         }
         val mutationStartedNs = System.nanoTime()
+        val mutationStartedAllocatedBytes = allocationNow()
         val activeOwner = requireNotNull(owner)
         val preparation = requireNotNull(resources).withFeaturePlanningCurrent(changes.size) {
             activeOwner.prepareAdjacentMutation(
@@ -1089,8 +1463,13 @@ internal class VisibilityGridIntegration(
             receipt = receipt.copy(status = "batchCommitRefused", rejected = rejected)
             return
         }
+        val mutationAllocatedBytes = allocationDelta(
+            mutationStartedAllocatedBytes,
+            allocationNow(),
+        ) ?: UNAVAILABLE_ALLOCATION_BYTES
         val mutationMicros = elapsedMicros(mutationStartedNs, System.nanoTime())
         committedFeatures++
+        refreshFeatureFingerprintResolver()
         requireNotNull(kernel).applyPrepared()
         if (isFenced(expected)) {
             fenced++
@@ -1101,7 +1480,10 @@ internal class VisibilityGridIntegration(
             expected,
             committedState,
             prepared.mutation,
-            featureTiming = featureTiming.copy(mutationMicros = mutationMicros),
+            featureTiming = featureTiming.copy(
+                mutationMicros = mutationMicros,
+                mutationAllocatedBytes = mutationAllocatedBytes,
+            ),
         )
     }
 
@@ -1189,38 +1571,43 @@ internal class VisibilityGridIntegration(
         val current = state.current as? CanonicalActivationCurrent.Receipt ?: run {
             rejected++
             receipt = receipt.copy(status = "currentMissing", rejected = rejected)
-            return
-        }
-        val serializationStartedNs = System.nanoTime()
-        val canonicalBytes = ByteArrayOutputStream().use { output ->
-            current.source.writeTo(output)
-            output.toByteArray()
-        }
-        val serializationMicros = elapsedMicros(serializationStartedNs, System.nanoTime())
-        if (canonicalBytes.size.toLong() != current.identity.canonicalLength) {
-            rejected++
-            receipt = receipt.copy(status = "currentCorrupt", rejected = rejected)
+            depthTiming?.offerLedger?.finish(depthTiming.offerId, DepthOfferTimingLedger.REFUSED)
             return
         }
         val selector = CurrentDeltaSelectorV1(
-            transactionId = nextTransactionId++,
+            transactionId = nextTransactionId,
             targetGeometryRevision = state.cut.geometryRevision,
             targetLineageRevision = state.cut.lineageRevision,
         )
+        val serializationStartedNs = System.nanoTime()
+        val serializationStartedAllocatedBytes = allocationNow()
+        val serializedCurrent = CurrentDeltaReceiptV1.serialize(
+            selector,
+            state.cut.geometryRevision - 1,
+            current.identity.canonicalLength,
+            current.identity.commandHash.toByteArray(),
+            current.source::writeTo,
+        )
+        val serializationAllocatedBytes = allocationDelta(
+            serializationStartedAllocatedBytes,
+            allocationNow(),
+        ) ?: UNAVAILABLE_ALLOCATION_BYTES
+        val serializationMicros = elapsedMicros(serializationStartedNs, System.nanoTime())
+        if (serializedCurrent == null) {
+            rejected++
+            receipt = receipt.copy(status = "currentCorrupt", rejected = rejected)
+            depthTiming?.offerLedger?.finish(depthTiming.offerId, DepthOfferTimingLedger.REFUSED)
+            return
+        }
+        nextTransactionId++
         if (isFenced(expected)) {
             fenced++
             receipt = receipt.copy(status = "publicationDeferred", fenced = fenced)
+            depthTiming?.offerLedger?.finish(depthTiming.offerId, DepthOfferTimingLedger.REFUSED)
             return
         }
         val geometryCut = prebuiltGeometryCut ?: mutation?.toCommittedGeometryCut(expected, selector.transactionId)
-        retainedDelta.retain(
-            CurrentDeltaReceiptV1(
-                selector,
-                state.cut.geometryRevision - 1,
-                canonicalBytes,
-                current.identity.commandHash.toByteArray(),
-            ),
-        )
+        retainedDelta.retain(serializedCurrent)
         pendingCanonicalAcknowledgement = CanonicalAcknowledgement(
             current.identity.commandHash,
             state.cut.geometryRevision,
@@ -1238,17 +1625,20 @@ internal class VisibilityGridIntegration(
         pendingBindingAcknowledged = false
         pendingEarlyAcknowledged = false
         pendingRendererRows = rendererAlreadyCurrentRows ?: 0
+        depthTiming?.offerLedger?.published(depthTiming.offerId, selector)
         pendingDepthTiming = depthTiming
         pendingFeatureTiming = featureTiming?.copy(
             serializationMicros = serializationMicros,
             publicationStartedNs = System.nanoTime(),
+            serializationAllocatedBytes = serializationAllocatedBytes,
+            publicationStartedAllocatedBytes = allocationNow(),
         )
         committed++
         receipt = VisibilityGridIntegrationReceipt(
             "pendingAck", expected.bindingGeneration, expected.sessionGeneration,
             expected.groupGeneration, selector.transactionId, state.cut.geometryRevision,
-            state.cut.lineageRevision, canonicalBytes.size, pendingRendererRows,
-            committed, rejected, fenced, canonicalOperation(canonicalBytes),
+            state.cut.lineageRevision, serializedCurrent.byteCount, pendingRendererRows,
+            committed, rejected, fenced, canonicalOperation(serializedCurrent.openStream()),
         )
         retryPendingQueue()
         if (pending == selector) {
@@ -1259,6 +1649,10 @@ internal class VisibilityGridIntegration(
                         pendingTiming.publicationStartedNs,
                         System.nanoTime(),
                     ),
+                    publicationAllocatedBytes = allocationDelta(
+                        pendingTiming.publicationStartedAllocatedBytes,
+                        allocationNow(),
+                    ) ?: UNAVAILABLE_ALLOCATION_BYTES,
                 )
             }
         }
@@ -1284,6 +1678,11 @@ internal class VisibilityGridIntegration(
             }
         }
         if (!pendingRendererApplied) {
+            if (!pendingBindingAcknowledged &&
+                binding.rendererPublicationAwaitingStructuralAcknowledgement()
+            ) {
+                return false
+            }
             val rebuild = pendingRendererRebuild
             if (rebuild != null) {
                 val success = retryRendererRebuild(rebuild)
@@ -1376,10 +1775,28 @@ internal class VisibilityGridIntegration(
         if (state.cut.geometryRevision != rebuild.geometryRevision ||
             state.cut.lineageRevision != rebuild.lineageRevision
         ) return null
-        if (rebuild.hydrateKernel) kernel = featureKernelFactory()
+        if (rebuild.hydrateKernel) kernel = createBoundFeatureKernel(requireNotNull(resources))
         return rebuildCanonicalRenderer(
             rebuild.ownership, state, rebuild.transactionId, rebuild.hydrateKernel,
         )
+    }
+
+    /** Creates a kernel only after its exact canonical fingerprint source is bound. */
+    private fun createBoundFeatureKernel(runtimeResources: CanonicalRuntimeResources): FeatureFusionKernel {
+        val created = featureKernelFactory()
+        check(runtimeResources.bindFeatureFingerprintResolver(created)) {
+            "canonical fingerprint authority unavailable while creating feature kernel"
+        }
+        return created
+    }
+
+    /** Refreshes the kernel qualifier after a canonical successor is installed. */
+    private fun refreshFeatureFingerprintResolver() {
+        val activeResources = resources ?: return
+        val activeKernel = kernel ?: return
+        check(activeResources.bindFeatureFingerprintResolver(activeKernel)) {
+            "canonical fingerprint authority unavailable after canonical commit"
+        }
     }
 
     private fun CommittedGeometryCut.toPendingRendererRebuild(hydrateKernel: Boolean) = PendingRendererRebuild(
@@ -1398,10 +1815,12 @@ internal class VisibilityGridIntegration(
                         return@synchronized
                     }
                     if (!pendingRendererApplied) {
-                        receipt = receipt.copy(
-                            status = if (pendingRendererRebuild != null) "rendererRebuildPending" else "rendererRetryPending",
-                        )
-                        return@synchronized
+                        if (!retryPendingQueue()) {
+                            receipt = receipt.copy(
+                                status = if (pendingRendererRebuild != null) "rendererRebuildPending" else "rendererRetryPending",
+                            )
+                            return@synchronized
+                        }
                     }
                     finishPendingAcknowledgement(selector)
                 }
@@ -1409,7 +1828,71 @@ internal class VisibilityGridIntegration(
         }
     }
 
-    private fun finishPendingAcknowledgement(selector: CurrentDeltaSelectorV1) {
+    /** Retains one newest depth view while an exact structural publication owns the lane. */
+    private fun deferDepthUntilPublicationAcknowledgement(observation: VisibilityDepthObservation): Boolean {
+        synchronized(lock) {
+            if (closed || paused || ownership() != observation.ownership || isFenced(observation.ownership)) {
+                // No slot was acquired for this observation, so there is no
+                // retained payload to release or count as fenced. The mapper's
+                // ordinary fenced counter records this admission refusal.
+                return false
+            }
+            observation.debugOfferLedger?.stage(observation.debugOfferId, DepthOfferTimingLedger.DEFERRED)
+            val retained = DeferredDepthObservation(observation, System.nanoTime())
+            val replaced = deferredDepthObservation.getAndSet(retained)
+            if (replaced != null) {
+                deferredDepthReplacedCount++
+                deferredDepthReleasedCount++
+                replaced.observation.finishDebugOffer(DepthOfferTimingLedger.REPLACED)
+                replaced.observation.close()
+            }
+            deferredDepthCount++
+            lastDepthAdmissionStatus = "depthPublicationDeferred"
+            return true
+        }
+    }
+
+    /** Drops the retained slot exactly once, accounting for its ownership release. */
+    private fun releaseDeferredDepth(fenced: Boolean) {
+        val deferred = deferredDepthObservation.getAndSet(null) ?: return
+        deferredDepthReleasedCount++
+        if (fenced) deferredDepthFencedCount++
+        deferred.observation.finishDebugOffer(DepthOfferTimingLedger.LIFECYCLE)
+        deferred.observation.close()
+    }
+
+    /** Gives one retained depth turn to the canonical lane after its exact ACK. */
+    private fun retryDeferredDepth(expected: VisibilityObservationOwnership) {
+        val deferred = deferredDepthObservation.get() ?: return
+        if (deferred.observation.ownership != expected || isFenced(expected)) {
+            releaseDeferredDepth(fenced = true)
+            lastDepthAdmissionStatus = "depthPublicationFenced"
+            return
+        }
+        // A prior depth durability retry may still own the prepared mutation.
+        // Let it make one progress attempt first; keep this latest observation
+        // in the single slot if that attempt publishes another current or
+        // remains retryable.
+        if (pendingDepthCommit != null) {
+            retryPendingDepthCommit(expected)
+            if (pendingDepthCommit != null || pending != null) return
+        }
+        if (!deferredDepthObservation.compareAndSet(deferred, null)) return
+        deferredDepthRetriedCount++
+        try {
+            deferred.observation.debugOfferLedger?.stage(deferred.observation.debugOfferId, DepthOfferTimingLedger.ADMITTING)
+            admitDepthLocked(deferred.observation, deferred.admissionStartedNs)
+        } finally {
+            deferredDepthReleasedCount++
+            deferred.observation.close()
+        }
+        lastDepthAdmissionStatus = receipt.status
+    }
+
+    private fun finishPendingAcknowledgement(
+        selector: CurrentDeltaSelectorV1,
+        drainDeferredDepth: Boolean = true,
+    ) {
         if (pending != selector || !pendingBindingAcknowledged || !pendingRendererApplied) return
         val acknowledgement = requireNotNull(pendingCanonicalAcknowledgement)
         when (val result = requireNotNull(owner).acknowledgeCanonicalCurrent(acknowledgement)) {
@@ -1420,13 +1903,24 @@ internal class VisibilityGridIntegration(
                 return
             }
         }
+        // The stream clears its structural ACK marker before invoking this
+        // serialized listener. Keep successor style pages fenced until the
+        // renderer cut has actually been installed on this same lane.
+        binding.markRendererPublicationApplied(selector)
         pendingDepthTiming?.let { timing ->
+            timing.offerLedger?.complete(timing.offerId, selector)
             recordDepthTiming(
                 sequence = timing.sequence,
                 lookupMicros = timing.lookupMicros,
                 mutationMicros = timing.mutationMicros,
                 publicationAckMicros = elapsedMicros(timing.publicationStartedNs, System.nanoTime()),
                 endToEndMicros = elapsedMicros(timing.admissionStartedNs, System.nanoTime()),
+                lookupAllocatedBytes = timing.lookupAllocatedBytes,
+                mutationAllocatedBytes = timing.mutationAllocatedBytes,
+                publicationAckAllocatedBytes = allocationDelta(
+                    timing.publicationStartedAllocatedBytes,
+                    allocationNow(),
+                ) ?: UNAVAILABLE_ALLOCATION_BYTES,
             )
         }
         pendingFeatureTiming?.let { timing ->
@@ -1439,6 +1933,11 @@ internal class VisibilityGridIntegration(
             )
         }
         retainedDelta.acknowledge(selector)
+        // Keep the rows installed for this acknowledged cut in the public
+        // receipt. The pending scalar is cleared below for the next cut, so
+        // copying only the status here would make a populated projection
+        // report rendererRows=0 after every exact ACK.
+        val acknowledgedRendererRows = pendingRendererRows
         pending = null
         pendingPublicationForIngress = false
         pendingQueued = false
@@ -1451,12 +1950,21 @@ internal class VisibilityGridIntegration(
         pendingCanonicalAcknowledgement = null
         pendingDepthTiming = null
         pendingFeatureTiming = null
-        receipt = receipt.copy(status = "acknowledged")
+        receipt = receipt.copy(
+            status = "acknowledged",
+            rendererRows = acknowledgedRendererRows,
+        )
+        if (drainDeferredDepth) {
+            val acknowledgedOwnership = cut
+            if (acknowledgedOwnership != null) retryDeferredDepth(acknowledgedOwnership)
+        }
     }
 
     private fun closeOwner() {
+        pendingDepthTiming?.let { it.offerLedger?.finish(it.offerId, DepthOfferTimingLedger.RESET) }
         recordCanonicalPressureHighWater()
         discardPendingDepthCommit()
+        releaseDeferredDepth(fenced = true)
         retainedDelta.clear()
         pending = null
         pendingPublicationForIngress = false
@@ -1473,12 +1981,21 @@ internal class VisibilityGridIntegration(
         kernel = null
         depthKernel?.close()
         depthKernel = null
-        lastDepthLookupReceipt = null
         lastDepthAdmissionStatus = null
-        lastDepthEvidenceReceipt = null
+        clearDepthAttemptDiagnostics()
         pendingCanonicalAcknowledgement = null
         pendingDepthTiming = null
         pendingFeatureTiming = null
+    }
+
+    private fun clearDepthAttemptDiagnostics() {
+        lastDepthLookupReceipt = null
+        lastDepthLookupReason = null
+        lastDepthEvidenceRefusal = null
+        lastDepthEvidenceReceipt = null
+        lastDepthSelectedSamples = 0
+        lastDepthSourceRejectedSamples = 0
+        lastDepthLeaseRejectedSamples = -1
     }
 
     private fun recordDepthTiming(
@@ -1487,6 +2004,9 @@ internal class VisibilityGridIntegration(
         mutationMicros: Long,
         publicationAckMicros: Long,
         endToEndMicros: Long,
+        lookupAllocatedBytes: Long = UNAVAILABLE_ALLOCATION_BYTES,
+        mutationAllocatedBytes: Long = UNAVAILABLE_ALLOCATION_BYTES,
+        publicationAckAllocatedBytes: Long = UNAVAILABLE_ALLOCATION_BYTES,
     ) = synchronized(lock) {
         depthTimingCompletedCount = minOf(
             VisibilityDepthAdmissionTiming.MAX_COMPLETED_COUNT,
@@ -1497,6 +2017,30 @@ internal class VisibilityGridIntegration(
         depthTimingMutationMicros = mutationMicros.coerceIn(0L, VisibilityDepthAdmissionTiming.MAX_ELAPSED_MICROS)
         depthTimingPublicationAckMicros = publicationAckMicros.coerceIn(0L, VisibilityDepthAdmissionTiming.MAX_ELAPSED_MICROS)
         depthTimingEndToEndMicros = endToEndMicros.coerceIn(0L, VisibilityDepthAdmissionTiming.MAX_ELAPSED_MICROS)
+        depthTimingLookupAllocatedBytes = lookupAllocatedBytes
+        depthTimingMutationAllocatedBytes = mutationAllocatedBytes
+        depthTimingPublicationAckAllocatedBytes = publicationAckAllocatedBytes
+        if (lookupAllocatedBytes >= 0L) {
+            depthTimingLookupAllocatedBytesTotal = addAllocationTotal(
+                depthTimingLookupAllocatedBytesTotal,
+                lookupAllocatedBytes,
+            )
+            depthTimingLookupAllocationSamples++
+        }
+        if (mutationAllocatedBytes >= 0L) {
+            depthTimingMutationAllocatedBytesTotal = addAllocationTotal(
+                depthTimingMutationAllocatedBytesTotal,
+                mutationAllocatedBytes,
+            )
+            depthTimingMutationAllocationSamples++
+        }
+        if (publicationAckAllocatedBytes >= 0L) {
+            depthTimingPublicationAckAllocatedBytesTotal = addAllocationTotal(
+                depthTimingPublicationAckAllocatedBytesTotal,
+                publicationAckAllocatedBytes,
+            )
+            depthTimingPublicationAckAllocationSamples++
+        }
     }
 
     private fun recordFeatureTiming(
@@ -1531,7 +2075,54 @@ internal class VisibilityGridIntegration(
             0L,
             VisibilityFeatureAdmissionTiming.MAX_ELAPSED_MICROS,
         )
+        featureTimingPlanningAllocatedBytes = timing.planningAllocatedBytes
+        featureTimingMutationAllocatedBytes = timing.mutationAllocatedBytes
+        featureTimingSerializationAllocatedBytes = timing.serializationAllocatedBytes
+        featureTimingPublicationAllocatedBytes = timing.publicationAllocatedBytes
+        if (timing.planningAllocatedBytes >= 0L) {
+            featureTimingPlanningAllocatedBytesTotal = addAllocationTotal(
+                featureTimingPlanningAllocatedBytesTotal,
+                timing.planningAllocatedBytes,
+            )
+            featureTimingPlanningAllocationSamples++
+        }
+        if (timing.mutationAllocatedBytes >= 0L) {
+            featureTimingMutationAllocatedBytesTotal = addAllocationTotal(
+                featureTimingMutationAllocatedBytesTotal,
+                timing.mutationAllocatedBytes,
+            )
+            featureTimingMutationAllocationSamples++
+        }
+        if (timing.serializationAllocatedBytes >= 0L) {
+            featureTimingSerializationAllocatedBytesTotal = addAllocationTotal(
+                featureTimingSerializationAllocatedBytesTotal,
+                timing.serializationAllocatedBytes,
+            )
+            featureTimingSerializationAllocationSamples++
+        }
+        if (timing.publicationAllocatedBytes >= 0L) {
+            featureTimingPublicationAllocatedBytesTotal = addAllocationTotal(
+                featureTimingPublicationAllocatedBytesTotal,
+                timing.publicationAllocatedBytes,
+            )
+            featureTimingPublicationAllocationSamples++
+        }
     }
+
+    private fun allocationNow(): Long = allocationCounter?.invoke() ?: UNAVAILABLE_ALLOCATION_BYTES
+
+    private fun allocationDelta(before: Long, after: Long): Long =
+        if (before < 0L || after < before) {
+            UNAVAILABLE_ALLOCATION_BYTES
+        } else {
+            after - before
+        }
+
+    private fun reportedAllocationTotal(total: Long, samples: Long): Long =
+        if (samples == 0L) UNAVAILABLE_ALLOCATION_BYTES else total
+
+    private fun addAllocationTotal(total: Long, delta: Long): Long =
+        if (delta < 0L || Long.MAX_VALUE - total < delta) Long.MAX_VALUE else total + delta
 
     private fun elapsedMicros(startNs: Long, endNs: Long): Long =
         ((endNs - startNs).coerceAtLeast(0L) / 1_000L)
@@ -1548,6 +2139,8 @@ internal data class RuntimeOwnerMemoryReceipt(
     val retainedDeltaOwnerBytes: Long,
     val pendingRendererRebuildBytes: Long,
     val retainedDepthLookupReceiptBytes: Long,
+    val retainedDepthRefusalReceiptBytes: Long,
+    val deferredDepthObservationBytes: Long,
     val runtimeOwnerBytes: Long,
     val bindingOwnerBytes: Long,
     val coordinatorOwnerBytes: Long,
@@ -1559,6 +2152,8 @@ internal data class RuntimeOwnerMemoryReceipt(
         retainedDeltaOwnerBytes,
         pendingRendererRebuildBytes,
         retainedDepthLookupReceiptBytes,
+        retainedDepthRefusalReceiptBytes,
+        deferredDepthObservationBytes,
         runtimeOwnerBytes,
         bindingOwnerBytes,
         coordinatorOwnerBytes,
@@ -1636,12 +2231,94 @@ internal enum class RendererProjectionRefusal {
     CLOSED,
 }
 
+/** Identifies the work performed by the publisher callback being timed. */
+internal enum class RendererPublicationTimingScope(val wireName: String) {
+    SYNCHRONOUS_CALLBACK("synchronous-publisher-callback"),
+    MAILBOX_ENQUEUE("mailbox-enqueue"),
+}
+
+/**
+ * One coarse renderer callback timing receipt. Production projections leave
+ * the sink null and do not sample clocks or allocate timing receipts. Enqueue
+ * timing excludes later main application, page uploads and GPU execution.
+ */
+internal data class RendererProjectionTiming(
+    val styleRevision: Long,
+    val requestedRows: Int,
+    val sourceRows: Int,
+    val selectedRows: Int,
+    val stateApplyMicros: Long,
+    val stateApplyAllocatedBytes: Long?,
+    val selectionMicros: Long,
+    val selectionAllocatedBytes: Long?,
+    val descriptorMicros: Long,
+    val descriptorAllocatedBytes: Long?,
+    val publishMicros: Long,
+    val publishAllocatedBytes: Long?,
+    val callbackMicros: Long,
+    val callbackAllocatedBytes: Long?,
+    val publishTimingScope: RendererPublicationTimingScope,
+) {
+    val allocationScope: String get() = "inclusive-process-counter-window-may-overlap-main"
+}
+
+private class RendererProjectionTimingCapture(
+    val startedNs: Long,
+    val styleRevision: Long,
+    val requestedRows: Int,
+    val startedAllocatedBytes: Long?,
+    val publishTimingScope: RendererPublicationTimingScope,
+    var sourceRows: Int = 0,
+    var selectedRows: Int = 0,
+    var stateApplyMicros: Long = 0L,
+    var stateApplyAllocatedBytes: Long? = null,
+    var selectionMicros: Long = 0L,
+    var selectionAllocatedBytes: Long? = null,
+    var descriptorMicros: Long = 0L,
+    var descriptorAllocatedBytes: Long? = null,
+    var publishMicros: Long = 0L,
+    var publishAllocatedBytes: Long? = null,
+) {
+    fun receipt(): RendererProjectionTiming = RendererProjectionTiming(
+        styleRevision = styleRevision,
+        requestedRows = requestedRows,
+        sourceRows = sourceRows,
+        selectedRows = selectedRows,
+        stateApplyMicros = stateApplyMicros,
+        stateApplyAllocatedBytes = stateApplyAllocatedBytes,
+        selectionMicros = selectionMicros,
+        selectionAllocatedBytes = selectionAllocatedBytes,
+        descriptorMicros = descriptorMicros,
+        descriptorAllocatedBytes = descriptorAllocatedBytes,
+        publishMicros = publishMicros,
+        publishAllocatedBytes = publishAllocatedBytes,
+        publishTimingScope = publishTimingScope,
+        callbackMicros = elapsedMicros(startedNs),
+        callbackAllocatedBytes = allocatedDelta(
+            startedAllocatedBytes,
+            artAllocatedBytes(),
+        ),
+    )
+
+    private fun elapsedMicros(startNs: Long): Long =
+        ((System.nanoTime() - startNs).coerceAtLeast(0L) / 1_000L)
+}
+
+private fun artAllocatedBytes(): Long? =
+    Debug.getRuntimeStat("art.gc.bytes-allocated")?.toLongOrNull()
+
+private fun allocatedDelta(before: Long?, after: Long?): Long? =
+    if (before == null || after == null) null else (after - before).coerceAtLeast(0L)
+
 /** Dedicated V2 adapter over the existing bounded native renderer state. */
 internal class NativeRendererProjection(
     private val render: (CoveragePointRenderSnapshot?, PointCloudNativeConfig?) -> Unit,
     capacity: Int = QUALIFIED_RENDERER_STYLE_CUT_MAX_ROWS,
     private val publishPresentation: (BoundedCoveragePresentation?, PointCloudNativeConfig?) -> Unit =
         NO_PRESENTATION_PUBLISHER,
+    private val timingSink: ((RendererProjectionTiming) -> Unit)? = null,
+    private val publishTimingScope: RendererPublicationTimingScope =
+        RendererPublicationTimingScope.SYNCHRONOUS_CALLBACK,
 ) : CommittedRendererProjection {
     // Canonical projection retains IDs/keys/normals/style only. World
     // positions and packed colors are borrowed into bounded page staging.
@@ -1721,10 +2398,40 @@ internal class NativeRendererProjection(
     @Synchronized
     override fun applyStyleCut(cut: QualifiedRendererStyleCut): RendererStyleCutResult {
         if (closed) return RendererStyleCutResult.Rejected(RendererStyleCutRejection.CLOSED)
+        val timingStartedNs = timingSink?.let { System.nanoTime() } ?: 0L
+        val timingStartedAllocatedBytes = if (timingStartedNs == 0L) null else artAllocatedBytes()
         seedEmptyBootstrap(cut)
+        val stateApplyStartedNs = if (timingStartedNs == 0L) 0L else System.nanoTime()
+        val stateApplyStartedAllocatedBytes =
+            if (timingStartedNs == 0L) null else artAllocatedBytes()
         val result = state.applyStyleCut(cut)
+        val stateApplyMicros = if (stateApplyStartedNs == 0L) {
+            0L
+        } else {
+            ((System.nanoTime() - stateApplyStartedNs).coerceAtLeast(0L) / 1_000L)
+        }
+        val stateApplyAllocatedBytes = allocatedDelta(
+            stateApplyStartedAllocatedBytes,
+            if (timingStartedNs == 0L) null else artAllocatedBytes(),
+        )
         if (result is RendererStyleCutResult.Applied) {
-            emitPresentation(checkNotNull(activeRenderConfig), forceReset = cut.reset)
+            emitPresentation(
+                checkNotNull(activeRenderConfig),
+                forceReset = cut.reset,
+                timing = if (timingStartedNs == 0L) {
+                    null
+                } else {
+                    RendererProjectionTimingCapture(
+                        startedNs = timingStartedNs,
+                        styleRevision = cut.styleRevision,
+                        requestedRows = cut.surfaceIds.size,
+                        startedAllocatedBytes = timingStartedAllocatedBytes,
+                        publishTimingScope = publishTimingScope,
+                        stateApplyMicros = stateApplyMicros,
+                        stateApplyAllocatedBytes = stateApplyAllocatedBytes,
+                    )
+                },
+            )
         }
         return result
     }
@@ -1952,57 +2659,124 @@ internal class NativeRendererProjection(
 
     /** Builds an immutable bounded descriptor and keeps the raw snapshot as a test adapter. */
     @Synchronized
-    private fun emitPresentation(config: PointCloudNativeConfig, forceReset: Boolean) {
-        if (publishPresentation === NO_PRESENTATION_PUBLISHER) {
-            render(state.snapshot(), config)
-            return
-        }
-        val ownership = activeOwnership
-        if (ownership == null) {
-            publishPresentation(null, config)
-            return
-        }
-        val qualifier = CoverageRowsQualifier(
-            bindingGeneration = ownership.bindingGeneration,
-            groupGeneration = ownership.groupGeneration,
-            rendererGeneration = config.rendererGeneration,
-            transactionId = activeTransactionId,
-            geometryRevision = state.currentGeometryRevision,
-            styleRevision = state.currentStyleRevision,
-        )
-        val sourceUpdate = state.takePresentationUpdate()
-        var selected = false
-        var presentationUpdate: CoveragePointRenderUpdate? = null
-        state.withCommittedRows(qualifier) { rows ->
-            // Selection scans the canonical source once and retains only
-            // bounded destination/source-slot identities in the selector.
-            presentationUpdate = presentationSelector.selectRows(
-                rows = rows,
-                requestedCapacity = CoveragePresentationMode.SEMANTIC_CENTROIDS.presentationCapacity,
-                forceReset = forceReset,
-                sourceUpdate = sourceUpdate,
-                enabled = config.enabled,
+    private fun emitPresentation(
+        config: PointCloudNativeConfig,
+        forceReset: Boolean,
+        timing: RendererProjectionTimingCapture? = null,
+    ) {
+        try {
+            if (publishPresentation === NO_PRESENTATION_PUBLISHER) {
+                val publishStartedNs = if (timing == null) 0L else System.nanoTime()
+                val publishStartedAllocatedBytes =
+                    if (timing == null) null else artAllocatedBytes()
+                render(state.snapshot(), config)
+                timing?.publishMicros = elapsedMicros(publishStartedNs)
+                timing?.publishAllocatedBytes = allocatedDelta(
+                    publishStartedAllocatedBytes,
+                    if (timing == null) null else artAllocatedBytes(),
+                )
+                timing?.sourceRows = currentRowCount()
+                return
+            }
+            val ownership = activeOwnership
+            if (ownership == null) {
+                val publishStartedNs = if (timing == null) 0L else System.nanoTime()
+                val publishStartedAllocatedBytes =
+                    if (timing == null) null else artAllocatedBytes()
+                publishPresentation(null, config)
+                timing?.publishMicros = elapsedMicros(publishStartedNs)
+                timing?.publishAllocatedBytes = allocatedDelta(
+                    publishStartedAllocatedBytes,
+                    if (timing == null) null else artAllocatedBytes(),
+                )
+                timing?.sourceRows = currentRowCount()
+                return
+            }
+            val qualifier = CoverageRowsQualifier(
+                bindingGeneration = ownership.bindingGeneration,
+                groupGeneration = ownership.groupGeneration,
+                rendererGeneration = config.rendererGeneration,
+                transactionId = activeTransactionId,
+                geometryRevision = state.currentGeometryRevision,
+                styleRevision = state.currentStyleRevision,
             )
-            selected = true
+            val selectionStartedNs = if (timing == null) 0L else System.nanoTime()
+            val selectionStartedAllocatedBytes =
+                if (timing == null) null else artAllocatedBytes()
+            val sourceUpdate = state.takePresentationUpdate()
+            var selected = false
+            var presentationUpdate: CoveragePointRenderUpdate? = null
+            state.withCommittedRows(qualifier) { rows ->
+                // Selection scans the canonical source once and retains only
+                // bounded destination/source-slot identities in the selector.
+                presentationUpdate = presentationSelector.selectRows(
+                    rows = rows,
+                    requestedCapacity = CoveragePresentationMode.SEMANTIC_CENTROIDS.presentationCapacity,
+                    forceReset = forceReset,
+                    sourceUpdate = sourceUpdate,
+                    enabled = config.enabled,
+                )
+                selected = true
+            }
+            timing?.selectionMicros = elapsedMicros(selectionStartedNs)
+            timing?.selectionAllocatedBytes = allocatedDelta(
+                selectionStartedAllocatedBytes,
+                if (timing == null) null else artAllocatedBytes(),
+            )
+            timing?.sourceRows = currentRowCount()
+            timing?.selectedRows = presentationSelector.selectedCount()
+            if (!selected) {
+                val publishStartedNs = if (timing == null) 0L else System.nanoTime()
+                val publishStartedAllocatedBytes =
+                    if (timing == null) null else artAllocatedBytes()
+                publishPresentation(null, config)
+                timing?.publishMicros = elapsedMicros(publishStartedNs)
+                timing?.publishAllocatedBytes = allocatedDelta(
+                    publishStartedAllocatedBytes,
+                    if (timing == null) null else artAllocatedBytes(),
+                )
+                return
+            }
+            val slots = IntArray(presentationSelector.selectedCount()) { index ->
+                presentationSelector.selectedSourceSlot(index)
+            }
+            val descriptorStartedNs = if (timing == null) 0L else System.nanoTime()
+            val descriptorStartedAllocatedBytes =
+                if (timing == null) null else artAllocatedBytes()
+            val descriptor = state.presentationDescriptor(
+                expected = qualifier,
+                mode = CoveragePresentationMode.SEMANTIC_CENTROIDS,
+                enabled = config.enabled,
+                selectedSourceSlots = slots,
+                palette = CoverageRendererPalette.COVERAGE,
+                update = presentationUpdate ?: sourceUpdate,
+            )
+            timing?.descriptorMicros = elapsedMicros(descriptorStartedNs)
+            timing?.descriptorAllocatedBytes = allocatedDelta(
+                descriptorStartedAllocatedBytes,
+                if (timing == null) null else artAllocatedBytes(),
+            )
+            activePresentation = descriptor
+            val publishStartedNs = if (timing == null) 0L else System.nanoTime()
+            val publishStartedAllocatedBytes =
+                if (timing == null) null else artAllocatedBytes()
+            publishPresentation(descriptor, config)
+            timing?.publishMicros = elapsedMicros(publishStartedNs)
+            timing?.publishAllocatedBytes = allocatedDelta(
+                publishStartedAllocatedBytes,
+                if (timing == null) null else artAllocatedBytes(),
+            )
+        } finally {
+            timing?.let { capture ->
+                timingSink?.let { sink ->
+                    runCatching { sink(capture.receipt()) }
+                }
+            }
         }
-        if (!selected) {
-            publishPresentation(null, config)
-            return
-        }
-        val slots = IntArray(presentationSelector.selectedCount()) { index ->
-            presentationSelector.selectedSourceSlot(index)
-        }
-        val descriptor = state.presentationDescriptor(
-            expected = qualifier,
-            mode = CoveragePresentationMode.SEMANTIC_CENTROIDS,
-            enabled = config.enabled,
-            selectedSourceSlots = slots,
-            palette = CoverageRendererPalette.COVERAGE,
-            update = presentationUpdate ?: sourceUpdate,
-        )
-        activePresentation = descriptor
-        publishPresentation(descriptor, config)
     }
+
+    private fun elapsedMicros(startNs: Long): Long =
+        if (startNs == 0L) 0L else ((System.nanoTime() - startNs).coerceAtLeast(0L) / 1_000L)
 
     @Synchronized
     internal fun presentationDescriptor(): BoundedCoveragePresentation? = activePresentation
@@ -2068,8 +2842,8 @@ internal data class RendererProjectionPressureSnapshot(
     val styleRevision: Long = 0,
 )
 
-private fun canonicalOperation(bytes: ByteArray): String = try {
-    DataInputStream(ByteArrayInputStream(bytes)).use { input ->
+private fun canonicalOperation(stream: InputStream): String = try {
+    DataInputStream(stream).use { input ->
         require(input.readInt() == 0x4d334350 && input.readInt() in 2..3)
         input.readFully(ByteArray(32))
         input.readUTF()

@@ -621,6 +621,8 @@ class VisibilitySurfaceStreamChannelTest {
             bytes = byteArrayOf(1, 2, 3, 4, 5),
         )
         binding.queueStructuralTransaction(frames, minimumResponseProfile)
+        // Public frame callers still own mutable arrays after queueing.
+        (frames[1] as TransactionChunkFrameV1).value.bytes.fill(99)
 
         val responses = frames.indices.map { index ->
             messenger.exchange(request(sequence = index.toLong() + 1, token = 27))
@@ -630,6 +632,9 @@ class VisibilitySurfaceStreamChannelTest {
             val frame = TransactionResponseCodecV1.decodeFrame(response)
             assertEquals(frames[index]::class, frame::class)
             assertEquals(index.toLong() + 1, response.requestSequence)
+            if (frame is TransactionChunkFrameV1) {
+                assertArrayEquals(byteArrayOf(1, 2, 3, 4, 5), frame.value.bytes)
+            }
         }
         assertArrayEquals(
             responses.last(),
@@ -650,6 +655,409 @@ class VisibilitySurfaceStreamChannelTest {
         assertEquals(PacketCodec.noChangesMessageKind, acknowledgement.messageKind)
         assertEquals(1L, acknowledgement.transactionId)
         binding.dispose()
+    }
+
+    @Test
+    fun `structural acknowledgement clears a style page staged with the frame`() {
+        val messenger = TestMessenger(144)
+        var callbackCount = 0
+        val binding = VisibilitySurfaceStreamChannel(
+            messenger,
+            144,
+            onRendererStyleCut = { cut ->
+                callbackCount++
+                RendererStyleCommandApplyResultV1(cut.styleRevision)
+            },
+        )
+        try {
+            val profile = TransactionResponseProfileV1.ordinary
+            binding.queueStructuralTransaction(
+                StructuralTransactionProducerV1.produce(
+                    transactionId = 1,
+                    baseGeometryRevision = 0,
+                    targetGeometryRevision = 1,
+                    targetLineageRevision = 1,
+                    bytes = byteArrayOf(),
+                    responseProfile = profile,
+                ),
+                profile,
+            )
+            val stylePages = RendererStyleCommandV1.encodePages(
+                RendererStyleCutPayloadV1(
+                    captureGroupId = ByteArray(16) { (it + 1).toByte() },
+                    bindingGeneration = 1,
+                    groupGeneration = 1,
+                    transactionId = 1,
+                    geometryRevision = 1,
+                    lineageRevision = 1,
+                    semanticRevision = 1,
+                    coverageRevision = 1,
+                    styleRevision = 1,
+                    residencyRevision = 1,
+                    targetRevision = 1,
+                    reset = true,
+                    surfaceIds = longArrayOf(1, 2),
+                    styleRows = ByteArray(2 * RendererStyleCommandV1.STYLE_ROW_BYTES),
+                ),
+                maxPageBytes = RendererStyleCommandV1.HEADER_BYTES +
+                    RendererStyleCommandV1.RECORD_BYTES,
+            )
+
+            val first = PacketCodec.decodeResponse(
+                messenger.exchange(
+                    styleRequest(
+                        token = 144,
+                        sequence = 1,
+                        commandBytes = stylePages[0],
+                    ),
+                ),
+            )
+            assertEquals(TransactionResponseCodecV1.beginMessageKind, first.messageKind)
+            assertEquals(0, callbackCount)
+
+            val commit = PacketCodec.decodeResponse(
+                messenger.exchange(
+                    request(
+                        sequence = 2,
+                        token = 144,
+                        maximumResponseBytes = PacketCodec.responseMaximumBytes,
+                    ),
+                ),
+            )
+            assertEquals(TransactionResponseCodecV1.commitMessageKind, commit.messageKind)
+
+            val acknowledgement = PacketCodec.decodeResponse(
+                messenger.exchange(
+                    request(
+                        sequence = 3,
+                        token = 144,
+                        acknowledgedTransaction = 1,
+                        acknowledgedGeometry = 1,
+                        acknowledgedLineage = 1,
+                    ),
+                ),
+            )
+            assertEquals(PacketCodec.noChangesMessageKind, acknowledgement.messageKind)
+            assertEquals(1L, acknowledgement.transactionId)
+            assertEquals(0, callbackCount)
+
+            val replay = PacketCodec.decodeResponse(
+                messenger.exchange(
+                    styleRequest(
+                        token = 144,
+                        sequence = 4,
+                        acknowledgedTransaction = 1,
+                        acknowledgedGeometry = 1,
+                        acknowledgedLineage = 1,
+                        commandBytes = stylePages[0],
+                    ),
+                ),
+            )
+            assertEquals(PacketCodec.noChangesMessageKind, replay.messageKind)
+            assertEquals(0, replay.errorId)
+            assertEquals(0L, replay.acceptedStyleRevision)
+            assertEquals(0, callbackCount)
+
+            val finalPage = PacketCodec.decodeResponse(
+                messenger.exchange(
+                    styleRequest(
+                        token = 144,
+                        sequence = 5,
+                        acknowledgedTransaction = 1,
+                        acknowledgedGeometry = 1,
+                        acknowledgedLineage = 1,
+                        commandBytes = stylePages[1],
+                    ),
+                ),
+            )
+            assertEquals(PacketCodec.noChangesMessageKind, finalPage.messageKind)
+            assertEquals(0, finalPage.errorId)
+            assertEquals(1L, finalPage.acceptedStyleRevision)
+            assertEquals(1, callbackCount)
+        } finally {
+            binding.dispose()
+        }
+    }
+
+    @Test
+    fun `style page on exact structural acknowledgement retries the committed style revision`() {
+        val messenger = TestMessenger(146)
+        var callbackCount = 0
+        var admissionAttempts = 0
+        val binding = VisibilitySurfaceStreamChannel(
+            messenger,
+            146,
+            admitRendererStylePage = { admissionAttempts++ > 0 },
+            onRendererStyleCut = { cut ->
+                callbackCount++
+                RendererStyleCommandApplyResultV1(cut.styleRevision)
+            },
+        )
+        try {
+            binding.setCommittedBaseline(
+                transactionId = 9,
+                geometryRevision = 10,
+                lineageRevision = 11,
+                styleRevision = 2,
+            )
+            val profile = TransactionResponseProfileV1.ordinary
+            binding.queueStructuralTransaction(
+                StructuralTransactionProducerV1.produce(
+                    transactionId = 10,
+                    baseGeometryRevision = 10,
+                    targetGeometryRevision = 12,
+                    targetLineageRevision = 13,
+                    bytes = byteArrayOf(),
+                    responseProfile = profile,
+                ),
+                profile,
+            )
+            val cut = RendererStyleCutPayloadV1(
+                captureGroupId = ByteArray(16) { (it + 1).toByte() },
+                bindingGeneration = 1,
+                groupGeneration = 1,
+                transactionId = 10,
+                geometryRevision = 12,
+                lineageRevision = 13,
+                semanticRevision = 1,
+                coverageRevision = 1,
+                styleRevision = 2,
+                residencyRevision = 1,
+                targetRevision = 1,
+                reset = true,
+                surfaceIds = longArrayOf(1),
+                styleRows = ByteArray(RendererStyleCommandV1.STYLE_ROW_BYTES),
+            )
+            val page = RendererStyleCommandV1.encodePages(cut).single()
+
+            assertEquals(
+                TransactionResponseCodecV1.beginMessageKind,
+                PacketCodec.decodeResponse(
+                    messenger.exchange(
+                        request(
+                            sequence = 1,
+                            token = 146,
+                            acknowledgedTransaction = 9,
+                            acknowledgedGeometry = 10,
+                            acknowledgedLineage = 11,
+                            styleRevision = 2,
+                            maximumResponseBytes = PacketCodec.responseMaximumBytes,
+                        ),
+                    ),
+                ).messageKind,
+            )
+            assertEquals(
+                TransactionResponseCodecV1.commitMessageKind,
+                PacketCodec.decodeResponse(
+                    messenger.exchange(
+                        request(
+                            sequence = 2,
+                            token = 146,
+                            acknowledgedTransaction = 9,
+                            acknowledgedGeometry = 10,
+                            acknowledgedLineage = 11,
+                            styleRevision = 2,
+                            maximumResponseBytes = PacketCodec.responseMaximumBytes,
+                        ),
+                    ),
+                ).messageKind,
+            )
+
+            val refusal = PacketCodec.decodeResponse(
+                messenger.exchange(
+                    styleRequest(
+                        token = 146,
+                        sequence = 3,
+                        acknowledgedTransaction = 10,
+                        acknowledgedGeometry = 12,
+                        acknowledgedLineage = 13,
+                        styleRevision = 2,
+                        commandBytes = page,
+                    ),
+                ),
+            )
+            assertEquals(255, refusal.messageKind)
+            assertEquals(34, refusal.errorId)
+            assertEquals(3L, refusal.nextExpectedRequestSequence)
+            assertEquals(2L, refusal.acceptedStyleRevision)
+
+            val response = PacketCodec.decodeResponse(
+                messenger.exchange(
+                    styleRequest(
+                        token = 146,
+                        sequence = 3,
+                        acknowledgedTransaction = 10,
+                        acknowledgedGeometry = 12,
+                        acknowledgedLineage = 13,
+                        styleRevision = 2,
+                        commandBytes = page,
+                    ),
+                ),
+            )
+            assertEquals(PacketCodec.noChangesMessageKind, response.messageKind)
+            assertEquals(0, response.errorId)
+            assertEquals(2L, response.acceptedStyleRevision)
+            assertEquals(1, callbackCount)
+        } finally {
+            binding.dispose()
+        }
+    }
+
+    @Test
+    fun `current style cut keeps priority through its acknowledgement before queued geometry`() {
+        val messenger = TestMessenger(145)
+        var callbackCount = 0
+        var commitPublicationCount = 0
+        val binding = VisibilitySurfaceStreamChannel(
+            messenger,
+            145,
+            onRendererStyleCut = { cut ->
+                callbackCount++
+                RendererStyleCommandApplyResultV1(cut.styleRevision)
+            },
+            onCommitPublished = { _, _ -> commitPublicationCount++ },
+        )
+        try {
+            val profile = TransactionResponseProfileV1.ordinary
+            binding.queueStructuralTransaction(
+                StructuralTransactionProducerV1.produce(
+                    transactionId = 1,
+                    baseGeometryRevision = 0,
+                    targetGeometryRevision = 1,
+                    targetLineageRevision = 1,
+                    bytes = byteArrayOf(),
+                    responseProfile = profile,
+                ),
+                profile,
+            )
+            val stylePages = RendererStyleCommandV1.encodePages(
+                RendererStyleCutPayloadV1(
+                    captureGroupId = ByteArray(16) { (it + 1).toByte() },
+                    bindingGeneration = 1,
+                    groupGeneration = 1,
+                    transactionId = 0,
+                    geometryRevision = 0,
+                    lineageRevision = 0,
+                    semanticRevision = 1,
+                    coverageRevision = 1,
+                    styleRevision = 1,
+                    residencyRevision = 1,
+                    targetRevision = 1,
+                    reset = true,
+                    surfaceIds = longArrayOf(1, 2),
+                    styleRows = ByteArray(2 * RendererStyleCommandV1.STYLE_ROW_BYTES),
+                ),
+                maxPageBytes = RendererStyleCommandV1.HEADER_BYTES +
+                    RendererStyleCommandV1.RECORD_BYTES,
+            )
+
+            val firstPage = PacketCodec.decodeResponse(
+                messenger.exchange(
+                    styleRequest(
+                        token = 145,
+                        sequence = 1,
+                        commandBytes = stylePages[0],
+                    ),
+                ),
+            )
+            assertEquals(PacketCodec.noChangesMessageKind, firstPage.messageKind)
+            assertEquals(0L, firstPage.acceptedStyleRevision)
+            assertEquals(0, callbackCount)
+
+            val finalPage = PacketCodec.decodeResponse(
+                messenger.exchange(
+                    styleRequest(
+                        token = 145,
+                        sequence = 2,
+                        commandBytes = stylePages[1],
+                    ),
+                ),
+            )
+            assertEquals(PacketCodec.noChangesMessageKind, finalPage.messageKind)
+            assertEquals(1L, finalPage.acceptedStyleRevision)
+            assertEquals(1, callbackCount)
+
+            val styleAcknowledgement = PacketCodec.decodeResponse(
+                messenger.exchange(
+                    styleRequest(
+                        token = 145,
+                        sequence = 3,
+                        commandBytes = byteArrayOf(),
+                    ),
+                ),
+            )
+            assertEquals(PacketCodec.noChangesMessageKind, styleAcknowledgement.messageKind)
+            assertEquals(1L, styleAcknowledgement.acceptedStyleRevision)
+            assertEquals(0, commitPublicationCount)
+
+            val geometryBegin = PacketCodec.decodeResponse(
+                messenger.exchange(
+                    request(
+                        sequence = 4,
+                        token = 145,
+                        styleRevision = 1,
+                        maximumResponseBytes = PacketCodec.responseMaximumBytes,
+                    ),
+                ),
+            )
+            assertEquals(TransactionResponseCodecV1.beginMessageKind, geometryBegin.messageKind)
+
+            val geometryCommit = PacketCodec.decodeResponse(
+                messenger.exchange(
+                    request(
+                        sequence = 5,
+                        token = 145,
+                        styleRevision = 1,
+                        maximumResponseBytes = PacketCodec.responseMaximumBytes,
+                    ),
+                ),
+            )
+            assertEquals(TransactionResponseCodecV1.commitMessageKind, geometryCommit.messageKind)
+            assertEquals(1, commitPublicationCount)
+        } finally {
+            binding.dispose()
+        }
+    }
+
+    @Test
+    fun `structural checksum preserves empty and byte-complete payloads across chunk boundaries`() {
+        val profile = minimumResponseProfile
+        val sizes = intArrayOf(0, 256, profile.chunkPayloadBytes, profile.chunkPayloadBytes + 257)
+        for (size in sizes) {
+            val messenger = TestMessenger(144)
+            val binding = VisibilitySurfaceStreamChannel(messenger, 144)
+            try {
+                val frames = StructuralTransactionProducerV1.produce(
+                    transactionId = 1,
+                    baseGeometryRevision = 0,
+                    targetGeometryRevision = 1,
+                    targetLineageRevision = 1,
+                    bytes = ByteArray(size) { it.toByte() },
+                    responseProfile = profile,
+                )
+                val expectedBegin = (frames.first() as TransactionBeginFrameV1).value
+                // Independent IEEE CRC-32 vectors, including every signed-byte value.
+                if (size == 0) assertEquals(0L, expectedBegin.payloadChecksum)
+                if (size == 256) assertEquals(0x29058c73L, expectedBegin.payloadChecksum)
+                if (size > profile.chunkPayloadBytes) {
+                    val secondChunk = (frames[2] as TransactionChunkFrameV1).value
+                    val original = secondChunk.bytes[0]
+                    secondChunk.bytes[0] = (original.toInt() xor 1).toByte()
+                    assertThrows(IllegalArgumentException::class.java) {
+                        binding.queueStructuralTransaction(frames, profile)
+                    }
+                    assertTrue(binding.canQueueStructuralTransaction())
+                    secondChunk.bytes[0] = original
+                }
+                binding.queueStructuralTransaction(frames, profile)
+                val delivered = TransactionResponseCodecV1.decodeFrame(
+                    PacketCodec.decodeResponse(messenger.exchange(request(1, 144))),
+                ) as TransactionBeginFrameV1
+                assertEquals(expectedBegin, delivered.value)
+            } finally {
+                binding.dispose()
+            }
+        }
     }
 
     @Test
@@ -819,6 +1227,61 @@ class VisibilitySurfaceStreamChannelTest {
         )
         assertEquals(PacketCodec.noChangesMessageKind, acknowledged.messageKind)
         binding.dispose()
+    }
+
+    @Test
+    fun `serialized current owns exact chunks through replay and ACK across later serialization`() {
+        val profile = minimumResponseProfile
+        val original = ByteArray(profile.chunkPayloadBytes + 17) { it.toByte() }
+        val source = original.copyOf()
+        val selector = CurrentDeltaSelectorV1(1, 1, 1)
+        val receipt = requireNotNull(CurrentDeltaReceiptV1.serialize(
+            selector, 0, source.size.toLong(), ByteArray(32),
+        ) { it.write(source) })
+        val messenger = TestMessenger(145)
+        val binding = VisibilitySurfaceStreamChannel(messenger, 145)
+        try {
+            binding.queueCurrentDelta(CurrentDeltaSourceV1 { receipt }, selector, profile)
+            source.fill(99)
+            receipt.bytes.fill(99)
+            val nextSelector = CurrentDeltaSelectorV1(2, 2, 2)
+            val next = requireNotNull(CurrentDeltaReceiptV1.serialize(
+                nextSelector, 1, source.size.toLong(), ByteArray(32),
+            ) { it.write(source) })
+            val expected = StructuralTransactionProducerV1.produce(1, 0, 1, 1, original, profile)
+            expected.forEachIndexed { index, frame ->
+                val request = request(index.toLong() + 1, 145)
+                val packet = messenger.exchange(request)
+                assertArrayEquals(packet, messenger.exchange(request))
+                when (val actual = TransactionResponseCodecV1.decodeFrame(PacketCodec.decodeResponse(packet))) {
+                    is TransactionBeginFrameV1 -> assertEquals((frame as TransactionBeginFrameV1).value, actual.value)
+                    is TransactionChunkFrameV1 -> {
+                        val chunk = (frame as TransactionChunkFrameV1).value
+                        assertEquals(chunk.chunkIndex, actual.value.chunkIndex)
+                        assertEquals(chunk.offset, actual.value.offset)
+                        assertArrayEquals(chunk.bytes, actual.value.bytes)
+                    }
+                    is TransactionCommitFrameV1 -> assertEquals((frame as TransactionCommitFrameV1).value, actual.value)
+                }
+            }
+            assertTrue(binding.hasExactQueuedCurrentDelta(receipt))
+            val changed = CurrentDeltaReceiptV1(selector, 0, source, ByteArray(32))
+            assertTrue(!binding.hasExactQueuedCurrentDelta(changed))
+            assertThrows(IllegalArgumentException::class.java) {
+                binding.queueCurrentDelta(CurrentDeltaSourceV1 { next }, nextSelector, profile)
+            }
+            val acknowledged = PacketCodec.decodeResponse(messenger.exchange(request(
+                expected.size.toLong() + 1, 145,
+                acknowledgedTransaction = 1, acknowledgedGeometry = 1, acknowledgedLineage = 1,
+            )))
+            assertEquals(PacketCodec.noChangesMessageKind, acknowledged.messageKind)
+            assertTrue(!binding.hasExactQueuedCurrentDelta(receipt))
+            binding.queueCurrentDelta(CurrentDeltaSourceV1 { next }, nextSelector, profile)
+            assertArrayEquals(original, receipt.bytes)
+            assertArrayEquals(source, next.bytes)
+        } finally {
+            binding.dispose()
+        }
     }
 
     @Test
@@ -1827,6 +2290,31 @@ class VisibilitySurfaceStreamChannelTest {
                 maximumResponseBytes = maximumResponseBytes,
                 styleRecords = styleRecords,
                 commandBytes = byteArrayOf(),
+                requestSequence = sequence,
+            ),
+        )
+
+    private fun styleRequest(
+        sequence: Long,
+        token: Long,
+        commandBytes: ByteArray,
+        acknowledgedTransaction: Long = 0,
+        acknowledgedGeometry: Long = 0,
+        acknowledgedLineage: Long = 0,
+        styleRevision: Long = 1,
+        maximumResponseBytes: Int = PacketCodec.responseMaximumBytes,
+    ): ByteArray =
+        PacketCodec.encodeRequest(
+            PacketCodec.Request(
+                requestFlags = 0,
+                streamToken = token,
+                acknowledgedTransactionId = acknowledgedTransaction,
+                acknowledgedGeometryRevision = acknowledgedGeometry,
+                acknowledgedLineageRevision = acknowledgedLineage,
+                nextStyleRevision = styleRevision,
+                maximumResponseBytes = maximumResponseBytes,
+                styleRecords = emptyList(),
+                commandBytes = commandBytes,
                 requestSequence = sequence,
             ),
         )

@@ -31,12 +31,14 @@ internal class AndroidVisibilityGridRuntime(
     private val beforeLaneDelivery: (VisibilityObservationSource) -> Unit = {},
     private val afterLaneDelivery: (VisibilityObservationSource) -> Unit = {},
     private val afterMapperAdmission: () -> Unit = {},
+    private val onMapperFailure: (RuntimeException) -> Unit = {},
     private val beforeDepthCapabilityFence: () -> Unit = {},
     private val afterDepthCapabilityInvalidated: () -> Unit = {},
     private val afterTerminalIngressInvalidated: () -> Unit = {},
     private val beforeLaneResidentPublication: (VisibilityObservationSource) -> Unit = {},
     private val afterLaneResidentPublication: (VisibilityObservationSource) -> Unit = {},
     private val beforeLaneDiscardResidentPublication: (VisibilityObservationSource) -> Unit = {},
+    private val debugDepthOfferNanoTime: () -> Long = System::nanoTime,
 ) : AutoCloseable {
     private val lock = Any()
     private val depthCapabilityTransitionLock = Any()
@@ -58,6 +60,7 @@ internal class AndroidVisibilityGridRuntime(
     private var depthLastHealthyNs = Long.MIN_VALUE
     private var depthCapability = VisibilityDepthCapability.UNSUPPORTED
     private var syntheticSource = false
+    @Volatile private var depthOfferTiming: DepthOfferTimingLedger? = null
     private var offeredFeatureObservations = 0L
     private var offeredDepthObservations = 0L
     private var droppedFeatureObservations = 0L
@@ -87,6 +90,8 @@ internal class AndroidVisibilityGridRuntime(
     private var depthProcessorBusyDrops = 0L
     private var depthProcessingTransient = 0L
     private var depthProcessingRejected = 0L
+    private var mappingRuntimeFailureCount = 0L
+    private var lastMappingFailureClass: String? = null
     private var acquiredProducerResources = 0L
     private var closedProducerResources = 0L
     private var residentPayloadBytes = 0L
@@ -132,6 +137,10 @@ internal class AndroidVisibilityGridRuntime(
             staleGenerationObservations++
             droppedFeatureObservations++
         } },
+        onMapperFailure = { observation, error ->
+            recordMapperRuntimeFailure(observation.ownership, error)
+        },
+        onDiscard = { it.close() },
         onResidentBytesChanged = { bytes -> updateResidentBytes(featureBytes = bytes) },
     )
     private val depthLane = LatestObservationLane(
@@ -146,11 +155,18 @@ internal class AndroidVisibilityGridRuntime(
         beforeDiscardResidentPublication = {
             beforeLaneDiscardResidentPublication(VisibilityObservationSource.SYNTHETIC_DEPTH)
         },
-        onReplacement = { synchronized(lock) { replacedDepthObservations++ } },
+        onReplacement = {
+            it.finishDebugOffer(DepthOfferTimingLedger.REPLACED)
+            synchronized(lock) { replacedDepthObservations++ }
+        },
         onStale = { synchronized(lock) {
             staleGenerationObservations++
             droppedDepthObservations++
         } },
+        onMapperFailure = { observation, error ->
+            recordMapperRuntimeFailure(observation.ownership, error)
+        },
+        onDiscard = { it.close() },
         onResidentBytesChanged = { bytes -> updateResidentBytes(depthBytes = bytes) },
     )
 
@@ -202,7 +218,10 @@ internal class AndroidVisibilityGridRuntime(
     }
 
     fun configureSyntheticSource(capability: VisibilityDepthCapability) {
-        synchronized(lock) { syntheticSource = true }
+        synchronized(lock) {
+            syntheticSource = true
+            if (depthOfferTiming == null) depthOfferTiming = DepthOfferTimingLedger(debugDepthOfferNanoTime)
+        }
         setDepthCapability(capability)
     }
 
@@ -279,37 +298,43 @@ internal class AndroidVisibilityGridRuntime(
     ): Boolean = lifecycleLock.read {
         synchronized(lock) {
             offeredFeatureObservations++
-            maximumFeatureSamples = maxOf(maximumFeatureSamples, observation.samples.size)
+            maximumFeatureSamples = maxOf(maximumFeatureSamples, observation.sampleCount)
             if (syntheticSource && observation.frame.source == VisibilityObservationSource.ARCORE_FEATURE) {
                 invalidFeatureObservations++
                 droppedFeatureObservations++
+                observation.close()
                 return@read false
             }
             if (paused) {
                 pausedObservationRejections++
                 droppedFeatureObservations++
+                observation.close()
                 return@read false
             }
             if (featureHealth == VisibilitySourceHealth.FAILED) {
                 droppedFeatureObservations++
+                observation.close()
                 return@read false
             }
             if (closed || !isStructurallyValid(observation) ||
-                observation.samples.size > featureSampleCapacity() ||
+                observation.sampleCount > featureSampleCapacity() ||
                 (callbackCopyBudgetDegraded && !isCaptureSafe() && !callbackRecoveryProbeInFlight)
             ) {
                 invalidFeatureObservations++
                 droppedFeatureObservations++
+                observation.close()
                 return@read false
             }
             if (observation.frame.sourceTimestampNs <= featureLastCopiedTimestampNs) {
                 duplicateFeatureObservations++
                 droppedFeatureObservations++
+                observation.close()
                 return@read false
             }
             if (ownership() != observation.ownership) {
                 staleGenerationObservations++
                 droppedFeatureObservations++
+                observation.close()
                 return@read false
             }
             featureLastCopiedTimestampNs = observation.frame.sourceTimestampNs
@@ -319,61 +344,85 @@ internal class AndroidVisibilityGridRuntime(
             copiedFeatureObservations++
             recordCallbackCopy(callbackCopyNs)
         }
-        beforeLaneEnqueue(observation.frame.source)
-        featureLane.offer(observation)
+        try {
+            beforeLaneEnqueue(observation.frame.source)
+            featureLane.offer(observation)
+        } catch (error: RuntimeException) {
+            observation.close()
+            throw error
+        }
         true
     }
 
     fun offerDepth(
         observation: VisibilityDepthObservation,
         callbackCopyNs: Long = 0,
-    ): Boolean = lifecycleLock.read {
-        synchronized(lock) {
-            offeredDepthObservations++
-            maximumDepthSamples = maxOf(maximumDepthSamples, observation.samples.size)
-            if (syntheticSource && observation.frame.source == VisibilityObservationSource.ARCORE_RAW_DEPTH) {
-                invalidDepthObservations++
-                droppedDepthObservations++
-                return@read false
-            }
-            if (paused) {
-                pausedObservationRejections++
-                droppedDepthObservations++
-                return@read false
-            }
-            if (depthHealth == VisibilitySourceHealth.FAILED) {
-                droppedDepthObservations++
-                return@read false
-            }
-            if (closed || callbackCopyBudgetDegraded ||
-                depthCapability == VisibilityDepthCapability.UNSUPPORTED ||
-                !isStructurallyValid(observation)
-            ) {
-                invalidDepthObservations++
-                droppedDepthObservations++
-                return@read false
-            }
-            if (observation.frame.sourceTimestampNs <= depthLastCopiedTimestampNs) {
-                duplicateDepthObservations++
-                droppedDepthObservations++
-                return@read false
-            }
-            if (ownership() != observation.ownership) {
-                staleGenerationObservations++
-                droppedDepthObservations++
-                return@read false
-            }
-            depthLastCopiedTimestampNs = observation.frame.sourceTimestampNs
-            depthHealth = VisibilitySourceHealth.HEALTHY
-            depthLastHealthyNs = nanoTime()
-            depthFailures = 0
-            recordOwnership(observation.ownership)
-            copiedDepthObservations++
-            recordCallbackCopy(callbackCopyNs)
+    ): Boolean {
+        depthOfferTiming?.let { ledger ->
+            observation.debugOfferLedger = ledger
+            observation.debugOfferId = ledger.start(observation.frame.sourceTimestampNs)
         }
-        beforeLaneEnqueue(observation.frame.source)
-        depthLane.offer(observation)
-        true
+        return lifecycleLock.read {
+            synchronized(lock) {
+                offeredDepthObservations++
+                maximumDepthSamples = maxOf(maximumDepthSamples, observation.sampleCount)
+                if (syntheticSource && observation.frame.source == VisibilityObservationSource.ARCORE_RAW_DEPTH) {
+                    invalidDepthObservations++
+                    droppedDepthObservations++
+                    observation.close()
+                    return@read false
+                }
+                if (paused) {
+                    pausedObservationRejections++
+                    droppedDepthObservations++
+                    observation.close()
+                    return@read false
+                }
+                if (depthHealth == VisibilitySourceHealth.FAILED) {
+                    droppedDepthObservations++
+                    observation.close()
+                    return@read false
+                }
+                if (closed || callbackCopyBudgetDegraded ||
+                    depthCapability == VisibilityDepthCapability.UNSUPPORTED ||
+                    !isStructurallyValid(observation)
+                ) {
+                    invalidDepthObservations++
+                    droppedDepthObservations++
+                    observation.close()
+                    return@read false
+                }
+                if (observation.frame.sourceTimestampNs <= depthLastCopiedTimestampNs) {
+                    duplicateDepthObservations++
+                    droppedDepthObservations++
+                    observation.close()
+                    return@read false
+                }
+                if (ownership() != observation.ownership) {
+                    staleGenerationObservations++
+                    droppedDepthObservations++
+                    observation.close()
+                    return@read false
+                }
+                depthLastCopiedTimestampNs = observation.frame.sourceTimestampNs
+                depthHealth = VisibilitySourceHealth.HEALTHY
+                depthLastHealthyNs = nanoTime()
+                depthFailures = 0
+                recordOwnership(observation.ownership)
+                copiedDepthObservations++
+                recordCallbackCopy(callbackCopyNs)
+            }
+            try {
+                beforeLaneEnqueue(observation.frame.source)
+                depthLane.offer(observation) { laneHasOutstandingWork ->
+                    mapper.beforeDepthObservationOffer(laneHasOutstandingWork)
+                }
+            } catch (error: RuntimeException) {
+                observation.close()
+                throw error
+            }
+            true
+        }
     }
 
     fun recordFeatureTransientUnavailable() = synchronized(lock) {
@@ -487,6 +536,7 @@ internal class AndroidVisibilityGridRuntime(
             true
         }
         if (!claimed) return
+        depthOfferTiming?.finishActive(DepthOfferTimingLedger.LIFECYCLE)
         // Mapper invalidation happens before lane drain so a callback which
         // already crossed deliverFeature cannot commit behind the pause cut.
         mapper.pause()
@@ -539,72 +589,86 @@ internal class AndroidVisibilityGridRuntime(
         true
     }
 
-    fun snapshot(): VisibilityObservationHealth = synchronized(lock) {
-        VisibilityObservationHealth(
-            offeredFeatureObservations = offeredFeatureObservations,
-            offeredDepthObservations = offeredDepthObservations,
-            droppedFeatureObservations = droppedFeatureObservations,
-            droppedDepthObservations = droppedDepthObservations,
-            maximumFeatureSamples = maximumFeatureSamples,
-            maximumDepthSamples = maximumDepthSamples,
-            featureMaximumHz = 1_000_000_000L / featureIntervalNs,
-            depthMaximumHz = 1_000_000_000L / depthIntervalNs,
-            featureHealth = featureHealth,
-            depthHealth = depthHealth,
-            depthCapability = depthCapability,
-            copiedFeatureObservations = copiedFeatureObservations,
-            copiedDepthObservations = copiedDepthObservations,
-            admittedFeatureObservations = admittedFeatureObservations,
-            admittedDepthObservations = admittedDepthObservations,
-            invalidFeatureObservations = invalidFeatureObservations,
-            invalidDepthObservations = invalidDepthObservations,
-            duplicateFeatureObservations = duplicateFeatureObservations,
-            duplicateDepthObservations = duplicateDepthObservations,
-            staleGenerationObservations = staleGenerationObservations,
-            replacedFeatureObservations = replacedFeatureObservations,
-            replacedDepthObservations = replacedDepthObservations,
-            featureTransientUnavailable = featureTransientUnavailable,
-            depthTransientUnavailable = depthTransientUnavailable,
-            featureFailures = featureFailures,
-            depthFailures = depthFailures,
-            depthPreparationReady = depthPreparationReady,
-            depthPreparationTransient = depthPreparationTransient,
-            depthPreparationRejected = depthPreparationRejected,
-            depthProcessorBusyDrops = depthProcessorBusyDrops,
-            depthProcessingTransient = depthProcessingTransient,
-            depthProcessingRejected = depthProcessingRejected,
-            acquiredProducerResources = acquiredProducerResources,
-            closedProducerResources = closedProducerResources,
-            residentPayloadBytes = residentPayloadBytes,
-            peakResidentPayloadBytes = peakResidentPayloadBytes,
-            callbackCopyP95Ns = callbackCopySamples.p95(),
-            callbackCopyBudgetState = if (callbackCopyBudgetDegraded && isCaptureSafe()) {
-                "severeDepthShedCaptureSafeFeature1Hz"
-            } else if (callbackCopyBudgetDegraded) {
-                "severeMapIntakePausedCaptureUnsafe"
-            } else {
-                "withinBudget"
-            },
-            callbackCopyBudgetBreaches = callbackCopyBudgetBreaches,
-            callbackCopyBudgetRecoveries = callbackCopyBudgetRecoveries,
-            callbackCopyDepthSheds = callbackCopyDepthSheds,
-            callbackCopyFeatureSheds = callbackCopyFeatureSheds,
-            captureSafe = isCaptureSafe(),
-            paused = paused,
-            pausedObservationRejections = pausedObservationRejections,
-            lifecycleDiscardedObservations = lifecycleDiscardedObservations,
-            pauseCount = pauseCount,
-            resumeCount = resumeCount,
-            sameCutResumeCount = sameCutResumeCount,
-            ownershipRolloverCount = ownershipRolloverCount,
-            rolloverDiscardedIngressObservations = rolloverDiscardedIngressObservations,
-            admittedBindingGeneration = admittedBindingGeneration,
-            admittedSessionGeneration = admittedSessionGeneration,
-            admittedGroupGeneration = admittedGroupGeneration,
-            admittedLifecycleSequence = admittedLifecycleSequence,
-            admittedOperationGeneration = admittedOperationGeneration,
-            syntheticSource = syntheticSource,
-        )
+    fun snapshot(): VisibilityObservationHealth {
+        // The mapper may release its bounded deferred-depth slot on the ACK
+        // executor without a lane callback. Read its lock-free health and
+        // deferred slot before taking the runtime lock; the mapper's admission
+        // executor may be publishing at the same time.
+        val mapperHealth = mapper.snapshot()
+        val retainedDepthPayloadBytes = mapper.retainedDepthPayloadBytes()
+        return synchronized(lock) {
+            recordMapperAdmissionDeltaLocked(mapperHealth)
+            residentPayloadBytes = featureResidentPayloadBytes +
+                depthResidentPayloadBytes + retainedDepthPayloadBytes
+            peakResidentPayloadBytes = maxOf(peakResidentPayloadBytes, residentPayloadBytes)
+            VisibilityObservationHealth(
+                offeredFeatureObservations = offeredFeatureObservations,
+                offeredDepthObservations = offeredDepthObservations,
+                droppedFeatureObservations = droppedFeatureObservations,
+                droppedDepthObservations = droppedDepthObservations,
+                maximumFeatureSamples = maximumFeatureSamples,
+                maximumDepthSamples = maximumDepthSamples,
+                featureMaximumHz = 1_000_000_000L / featureIntervalNs,
+                depthMaximumHz = 1_000_000_000L / depthIntervalNs,
+                featureHealth = featureHealth,
+                depthHealth = depthHealth,
+                depthCapability = depthCapability,
+                copiedFeatureObservations = copiedFeatureObservations,
+                copiedDepthObservations = copiedDepthObservations,
+                admittedFeatureObservations = admittedFeatureObservations,
+                admittedDepthObservations = admittedDepthObservations,
+                invalidFeatureObservations = invalidFeatureObservations,
+                invalidDepthObservations = invalidDepthObservations,
+                duplicateFeatureObservations = duplicateFeatureObservations,
+                duplicateDepthObservations = duplicateDepthObservations,
+                staleGenerationObservations = staleGenerationObservations,
+                replacedFeatureObservations = replacedFeatureObservations,
+                replacedDepthObservations = replacedDepthObservations,
+                featureTransientUnavailable = featureTransientUnavailable,
+                depthTransientUnavailable = depthTransientUnavailable,
+                featureFailures = featureFailures,
+                depthFailures = depthFailures,
+                depthPreparationReady = depthPreparationReady,
+                depthPreparationTransient = depthPreparationTransient,
+                depthPreparationRejected = depthPreparationRejected,
+                depthProcessorBusyDrops = depthProcessorBusyDrops,
+                depthProcessingTransient = depthProcessingTransient,
+                depthProcessingRejected = depthProcessingRejected,
+                mappingRuntimeFailureCount = mappingRuntimeFailureCount,
+                lastMappingFailureClass = lastMappingFailureClass,
+                acquiredProducerResources = acquiredProducerResources,
+                closedProducerResources = closedProducerResources,
+                residentPayloadBytes = residentPayloadBytes,
+                peakResidentPayloadBytes = peakResidentPayloadBytes,
+                callbackCopyP95Ns = callbackCopySamples.p95(),
+                callbackCopyBudgetState = if (callbackCopyBudgetDegraded && isCaptureSafe()) {
+                    "severeDepthShedCaptureSafeFeature1Hz"
+                } else if (callbackCopyBudgetDegraded) {
+                    "severeMapIntakePausedCaptureUnsafe"
+                } else {
+                    "withinBudget"
+                },
+                callbackCopyBudgetBreaches = callbackCopyBudgetBreaches,
+                callbackCopyBudgetRecoveries = callbackCopyBudgetRecoveries,
+                callbackCopyDepthSheds = callbackCopyDepthSheds,
+                callbackCopyFeatureSheds = callbackCopyFeatureSheds,
+                captureSafe = isCaptureSafe(),
+                paused = paused,
+                pausedObservationRejections = pausedObservationRejections,
+                lifecycleDiscardedObservations = lifecycleDiscardedObservations,
+                pauseCount = pauseCount,
+                resumeCount = resumeCount,
+                sameCutResumeCount = sameCutResumeCount,
+                ownershipRolloverCount = ownershipRolloverCount,
+                rolloverDiscardedIngressObservations = rolloverDiscardedIngressObservations,
+                admittedBindingGeneration = admittedBindingGeneration,
+                admittedSessionGeneration = admittedSessionGeneration,
+                admittedGroupGeneration = admittedGroupGeneration,
+                admittedLifecycleSequence = admittedLifecycleSequence,
+                admittedOperationGeneration = admittedOperationGeneration,
+                syntheticSource = syntheticSource,
+            )
+        }
     }
 
     override fun close() {
@@ -613,6 +677,7 @@ internal class AndroidVisibilityGridRuntime(
                 if (closed) return
                 closed = true
             }
+            depthOfferTiming?.finishActive(DepthOfferTimingLedger.LIFECYCLE)
             featureLane.close()
             depthLane.close()
             mapper.close()
@@ -623,42 +688,60 @@ internal class AndroidVisibilityGridRuntime(
     fun snapshotWireMap(): Map<String, Any> {
         val integration = mapper as? VisibilityGridIntegration
         val publication = integration?.integrationReceipt()
-        val depthEvidence = integration?.lastDepthEvidenceReceipt()
+        val depthEvidence = integration?.depthEvidenceDiagnostics()
+        val depthPublicationDeferral = integration?.depthPublicationDeferralSnapshot()
+        val depthLookup = integration?.depthLookupDiagnostics()
         return snapshot().toWireMap() + mapOf(
             "mappingIngress" to mapper.snapshot().toWireMap(),
             "mappingPublicationStatus" to (publication?.status ?: "unavailable"),
             "mappingRejected" to (publication?.rejected ?: 0L),
             "mappingFenced" to (publication?.fenced ?: 0L),
-            "depthEvidence" to if (depthEvidence == null) emptyMap<String, Any>() else mapOf(
-                "acceptedSamples" to depthEvidence.acceptedSamples,
-                "rejectedSamples" to depthEvidence.rejectedSamples,
-                "rayVisits" to depthEvidence.rayVisits,
-                "touchedEvidenceRows" to depthEvidence.touchedEvidenceRows,
-                "independentDirectionVotes" to depthEvidence.independentDirectionVotes,
-                "createCount" to depthEvidence.createCount,
-                "refineCount" to depthEvidence.refineCount,
-                "relocateCount" to depthEvidence.relocateCount,
-                "mergeCount" to depthEvidence.mergeCount,
-                "splitCount" to depthEvidence.splitCount,
-                "replaceCount" to depthEvidence.replaceCount,
-                "removeCount" to depthEvidence.removeCount,
-            ),
+            "depthEvidence" to (depthEvidence ?: emptyMap<String, Any>()),
+            "depthLookup" to (depthLookup ?: emptyMap<String, Any>()),
             "depthAdmissionTiming" to mapper.depthAdmissionTiming().toWireMap(),
+            "depthOfferTiming" to (depthOfferTiming?.snapshot() ?: emptyMap<String, Any>()),
+            "depthPublicationDeferral" to (depthPublicationDeferral?.toWireMap() ?: emptyMap<String, Any>()),
             "featureAdmissionTiming" to mapper.featureAdmissionTiming().toWireMap(),
+            "allocationWorkspaces" to (integration?.allocationWorkspaceReceipt() ?: emptyMap<String, Long>()),
         )
     }
 
     private fun updateResidentBytes(
         featureBytes: Long? = null,
         depthBytes: Long? = null,
-    ) = synchronized(lock) {
-        if (featureBytes != null) featureResidentPayloadBytes = featureBytes
-        if (depthBytes != null) depthResidentPayloadBytes = depthBytes
-        residentPayloadBytes = featureResidentPayloadBytes + depthResidentPayloadBytes
-        require(residentPayloadBytes <= V2_SENSOR_HANDOFF_CAPACITY_BYTES) {
-            "V2 sensor handoff exceeded its one MiB owner budget"
+    ) {
+        // This callback can run on the source lane while canonical admission
+        // is holding the mapper lock. The deferred-depth slot is atomic, so
+        // sample it before entering the runtime lock.
+        val retainedDepthPayloadBytes = mapper.retainedDepthPayloadBytes()
+        synchronized(lock) {
+            if (featureBytes != null) featureResidentPayloadBytes = featureBytes
+            if (depthBytes != null) depthResidentPayloadBytes = depthBytes
+            val sourceResidentPayloadBytes = featureResidentPayloadBytes + depthResidentPayloadBytes
+            residentPayloadBytes = sourceResidentPayloadBytes + retainedDepthPayloadBytes
+            require(sourceResidentPayloadBytes <= V2_SENSOR_HANDOFF_CAPACITY_BYTES) {
+                "V2 sensor handoff exceeded its one MiB owner budget"
+            }
+            peakResidentPayloadBytes = maxOf(peakResidentPayloadBytes, residentPayloadBytes)
         }
-        peakResidentPayloadBytes = maxOf(peakResidentPayloadBytes, residentPayloadBytes)
+    }
+
+    private fun recordMapperRuntimeFailure(
+        observationOwnership: VisibilityObservationOwnership,
+        error: RuntimeException,
+    ) {
+        val shouldProbe = synchronized(lock) {
+            // A changed ownership cut is a stale observation, even when the
+            // mapper's own check reports it as a RuntimeException.
+            if (ownership() != observationOwnership) {
+                false
+            } else {
+                mappingRuntimeFailureCount++
+                lastMappingFailureClass = error::class.java.name.take(MAX_FAILURE_CLASS_LENGTH)
+                true
+            }
+        }
+        if (shouldProbe) onMapperFailure(error)
     }
 
     private fun claimCopy(timestampNs: Long, previous: Long, interval: Long): Boolean =
@@ -667,11 +750,11 @@ internal class AndroidVisibilityGridRuntime(
 
     private fun isStructurallyValid(observation: VisibilityFeatureObservation): Boolean =
         observation.payloadBytes <= V2_SENSOR_HANDOFF_CAPACITY_BYTES / 2 &&
-            observation.frame.tracking && observation.samples.isNotEmpty()
+            observation.frame.tracking && observation.sampleCount > 0
 
     private fun isStructurallyValid(observation: VisibilityDepthObservation): Boolean =
         observation.payloadBytes <= V2_SENSOR_HANDOFF_CAPACITY_BYTES / 2 &&
-            observation.frame.tracking && observation.samples.isNotEmpty()
+            observation.frame.tracking && observation.sampleCount > 0
 
     private fun recordOwnership(value: VisibilityObservationOwnership) {
         admittedBindingGeneration = value.bindingGeneration
@@ -730,10 +813,12 @@ internal class AndroidVisibilityGridRuntime(
             1 -> synchronized(lock) {
                 lifecycleDiscardedObservations++
                 droppedFeatureObservations++
+                observation.close()
             }
             2 -> synchronized(lock) {
                 staleGenerationObservations++
                 droppedFeatureObservations++
+                observation.close()
             }
             else -> {
                 mapper.admitFeature(observation)
@@ -744,6 +829,7 @@ internal class AndroidVisibilityGridRuntime(
     }
 
     private fun deliverDepth(observation: VisibilityDepthObservation) = lifecycleLock.read {
+        observation.debugOfferLedger?.stage(observation.debugOfferId, DepthOfferTimingLedger.ADMITTING)
         val terminal = synchronized(lock) {
             when {
                 closed || paused -> 1
@@ -757,10 +843,12 @@ internal class AndroidVisibilityGridRuntime(
             1 -> synchronized(lock) {
                 lifecycleDiscardedObservations++
                 droppedDepthObservations++
+                observation.close()
             }
             2 -> synchronized(lock) {
                 staleGenerationObservations++
                 droppedDepthObservations++
+                observation.close()
             }
             else -> {
                 mapper.admitDepth(observation)
@@ -772,6 +860,10 @@ internal class AndroidVisibilityGridRuntime(
 
     /** Mapper counters are authoritative; either lane may finish staged work from the other. */
     private fun recordMapperAdmissionDelta(after: VisibilityMappingAdmissionHealth) = synchronized(lock) {
+        recordMapperAdmissionDeltaLocked(after)
+    }
+
+    private fun recordMapperAdmissionDeltaLocked(after: VisibilityMappingAdmissionHealth) {
         val features = if (after.admittedFeatures > accountedMapperFeatures) {
             Math.subtractExact(after.admittedFeatures, accountedMapperFeatures)
         } else 0L
@@ -818,6 +910,7 @@ internal class AndroidVisibilityGridRuntime(
         const val CALLBACK_COPY_RECOVERY_PROBE_INTERVAL_NS = 1_000_000_000L
         const val SEVERE_FEATURE_INTERVAL_NS = 1_000_000_000L
         const val DEPTH_HEALTHY_FRESHNESS_WINDOW_NS = 10_000_000_000L
+        private const val MAX_FAILURE_CLASS_LENGTH = 128
     }
 
     private fun hasFreshDepthObservation(nowNs: Long): Boolean {
@@ -877,6 +970,8 @@ internal data class VisibilityObservationHealth(
     val depthProcessorBusyDrops: Long,
     val depthProcessingTransient: Long,
     val depthProcessingRejected: Long,
+    val mappingRuntimeFailureCount: Long,
+    val lastMappingFailureClass: String?,
     val acquiredProducerResources: Long,
     val closedProducerResources: Long,
     val residentPayloadBytes: Long,
@@ -950,6 +1045,8 @@ internal data class VisibilityObservationHealth(
         "depthProcessorBusyDrops" to depthProcessorBusyDrops,
         "depthProcessingTransient" to depthProcessingTransient,
         "depthProcessingRejected" to depthProcessingRejected,
+        "mappingRuntimeFailureCount" to mappingRuntimeFailureCount,
+        "lastMappingFailureClass" to (lastMappingFailureClass ?: "none"),
         "acquiredProducerResources" to acquiredProducerResources,
         "closedProducerResources" to closedProducerResources,
         "resourceBalance" to resourceBalance,
@@ -1004,33 +1101,41 @@ internal class AndroidVisibilityGridMappingAdmission(
     override fun admitFeature(observation: VisibilityFeatureObservation) {
         check(ownership() == observation.ownership) { "stale V2 feature mapping admission" }
         beforeAdmission()
+        var replaced: VisibilityFeatureObservation? = null
         synchronized(lock) {
             check(ownership() == observation.ownership) { "stale V2 feature mapping admission" }
-            if (feature != null) replacedFeatures++
+            replaced = feature
+            if (replaced != null) replacedFeatures++
             feature = observation
             admittedFeatures++
             lastReceipt = VisibilityMappingAdmissionReceipt.from(observation)
             recordPeak()
         }
+        replaced?.close()
     }
 
     override fun admitDepth(observation: VisibilityDepthObservation) {
         check(ownership() == observation.ownership) { "stale V2 depth mapping admission" }
         beforeAdmission()
+        var replaced: VisibilityDepthObservation? = null
         synchronized(lock) {
             check(ownership() == observation.ownership) { "stale V2 depth mapping admission" }
-            if (depth != null) replacedDepths++
+            replaced = depth
+            if (replaced != null) replacedDepths++
             depth = observation
             admittedDepths++
             lastReceipt = VisibilityMappingAdmissionReceipt.from(observation)
             recordPeak()
         }
+        replaced?.close()
     }
 
     override fun rollover(ownership: VisibilityObservationOwnership) = synchronized(lock) {
         check(this.ownership() == ownership) { "stale V2 mapping rollover" }
         rolloverDiscardedObservations += (if (feature != null) 1 else 0) +
             (if (depth != null) 1 else 0)
+        feature?.close()
+        depth?.close()
         feature = null
         depth = null
         lastReceipt = null
@@ -1059,6 +1164,8 @@ internal class AndroidVisibilityGridMappingAdmission(
     }
 
     override fun close() = synchronized(lock) {
+        feature?.close()
+        depth?.close()
         feature = null
         depth = null
     }
@@ -1104,7 +1211,7 @@ internal data class VisibilityMappingAdmissionReceipt(
             source = value.frame.source.wireName,
             sourceTimestampNs = value.frame.sourceTimestampNs,
             frameSequence = value.frame.frameSequence,
-            sampleCount = value.samples.size,
+            sampleCount = value.sampleCount,
             payloadBytes = value.payloadBytes,
             depthCapability = value.frame.depthCapability.wireName,
             sessionGeneration = value.ownership.sessionGeneration,
@@ -1118,7 +1225,7 @@ internal data class VisibilityMappingAdmissionReceipt(
             source = value.frame.source.wireName,
             sourceTimestampNs = value.frame.sourceTimestampNs,
             frameSequence = value.frame.frameSequence,
-            sampleCount = value.samples.size,
+            sampleCount = value.sampleCount,
             payloadBytes = value.payloadBytes,
             depthCapability = value.frame.depthCapability.wireName,
             sessionGeneration = value.ownership.sessionGeneration,
@@ -1179,8 +1286,10 @@ private class LatestObservationLane<T : Any>(
     private val beforeResidentPublication: (T) -> Unit,
     private val afterResidentPublication: (T) -> Unit,
     private val beforeDiscardResidentPublication: () -> Unit,
-    private val onReplacement: () -> Unit,
+    private val onReplacement: (T) -> Unit,
     private val onStale: () -> Unit,
+    private val onMapperFailure: (T, RuntimeException) -> Unit,
+    private val onDiscard: (T) -> Unit,
     private val onResidentBytesChanged: (Long) -> Unit,
 ) {
     private val lock = Any()
@@ -1204,42 +1313,62 @@ private class LatestObservationLane<T : Any>(
         current != null || latest != null || scheduled || running || accountingPending
     }
 
-    fun offer(value: T) {
+    fun offer(value: T, beforeOffer: ((Boolean) -> Unit)? = null) {
+        var discarded: T? = null
         synchronized(lock) {
-            if (closed) return
+            if (closed) {
+                discarded = value
+                return@synchronized
+            }
+            beforeOffer?.invoke(
+                current != null || latest != null || scheduled || running || accountingPending,
+            )
             if (current == null && !scheduled) {
                 current = value
                 scheduled = true
                 scheduleLocked(0)
             } else {
-                if (latest != null) onReplacement()
+                latest?.let(onReplacement)
+                discarded = latest
                 latest = value
             }
         }
+        discarded?.let(onDiscard)
         publishResidentBytes()
     }
 
     fun close() {
+        val discarded: List<T>
         synchronized(lock) {
             closed = true
             scheduleEpoch++
-            current = null
+            discarded = buildList {
+                if (!running) current?.let(::add)
+                latest?.let(::add)
+            }
+            if (!running) current = null
             latest = null
         }
+        discarded.forEach(onDiscard)
         publishResidentBytes()
     }
 
     /** Drops every copied value that has not entered mapper admission. */
     fun pauseAndDiscard(): Long {
+        val discardedValues: List<T>
         val discarded = synchronized(lock) {
-            val count = (if (!running && current != null) 1 else 0) +
-                (if (latest != null) 1 else 0)
+            discardedValues = buildList {
+                if (!running) current?.let(::add)
+                latest?.let(::add)
+            }
+            val count = discardedValues.size
             if (!running) current = null
             latest = null
             if (!running) scheduled = false
             scheduleEpoch++
             count.toLong()
         }
+        discardedValues.forEach(onDiscard)
         publishResidentBytes(beforeDiscardResidentPublication)
         return discarded
     }
@@ -1260,15 +1389,24 @@ private class LatestObservationLane<T : Any>(
             if (closed || epoch != scheduleEpoch) return
             current?.also { running = true } ?: return
         }
+        var delivered = false
         try {
             deliver(value)
-        } catch (_: RuntimeException) {
+            delivered = true
+        } catch (error: RuntimeException) {
             // The exact cut is rechecked by the mapper. A cut changing between
             // lane qualification and mapper admission is a stale observation,
             // not a scheduler failure that may wedge the source forever.
+            onMapperFailure(value, error)
             onStale()
         }
-        afterDelivery(value)
+        if (!delivered) onDiscard(value)
+        try {
+            afterDelivery(value)
+        } catch (_: RuntimeException) {
+            if (delivered) onDiscard(value)
+            onStale()
+        }
         val nextDelay = synchronized(lock) {
             lastDeliveryNs = nanoTime()
             running = false

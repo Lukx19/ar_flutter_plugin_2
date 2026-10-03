@@ -15,6 +15,69 @@ import org.junit.Test
 
 class AndroidVisibilityGridRuntimeTest {
     @Test
+    fun `mapper throw is surfaced as bounded failure telemetry`() {
+        val cut = AtomicReference(ownership())
+        val mapperFailure = AtomicReference<RuntimeException?>(null)
+        val runtime = runtime(
+            cut = cut,
+            mapper = object : VisibilityObservationMapper {
+                override fun admitFeature(observation: VisibilityFeatureObservation) {
+                    throw IllegalStateException("injected mapper failure")
+                }
+
+                override fun admitDepth(observation: VisibilityDepthObservation) = Unit
+            },
+            onMapperFailure = mapperFailure::set,
+        )
+        try {
+            runtime.configureSyntheticSource(VisibilityDepthCapability.AUTOMATIC)
+            assertTrue(runtime.offerFeature(feature(cut.get(), 1, 1)))
+            runtime.awaitDebugFixtureIdle()
+
+            val health = runtime.snapshot()
+            assertEquals(1L, health.mappingRuntimeFailureCount)
+            assertEquals("java.lang.IllegalStateException", health.lastMappingFailureClass)
+            assertEquals("injected mapper failure", mapperFailure.get()?.message)
+            assertEquals(1L, health.staleGenerationObservations)
+            assertEquals(0L, health.admittedFeatureObservations)
+        } finally {
+            runtime.close()
+        }
+    }
+
+    @Test
+    fun `mapper throw after ownership rollover remains stale telemetry`() {
+        val cut = AtomicReference(ownership())
+        val replacement = cut.get().copy(sessionGeneration = 2)
+        val mapperFailure = AtomicReference<RuntimeException?>(null)
+        val runtime = runtime(
+            cut = cut,
+            mapper = object : VisibilityObservationMapper {
+                override fun admitFeature(observation: VisibilityFeatureObservation) {
+                    cut.set(replacement)
+                    throw IllegalStateException("injected stale mapper failure")
+                }
+
+                override fun admitDepth(observation: VisibilityDepthObservation) = Unit
+            },
+            onMapperFailure = mapperFailure::set,
+        )
+        try {
+            runtime.configureSyntheticSource(VisibilityDepthCapability.AUTOMATIC)
+            assertTrue(runtime.offerFeature(feature(cut.get(), 1, 1)))
+            runtime.awaitDebugFixtureIdle()
+
+            val health = runtime.snapshot()
+            assertEquals(0L, health.mappingRuntimeFailureCount)
+            assertEquals(null, health.lastMappingFailureClass)
+            assertEquals(null, mapperFailure.get())
+            assertEquals(1L, health.staleGenerationObservations)
+        } finally {
+            runtime.close()
+        }
+    }
+
+    @Test
     fun `synthetic source fences claimed late real callbacks without poisoning copy budget`() {
         val cut = AtomicReference(ownership())
         val mapper = AndroidVisibilityGridMappingAdmission(cut::get)
@@ -1219,6 +1282,7 @@ class AndroidVisibilityGridRuntimeTest {
         mapper: VisibilityObservationMapper = AndroidVisibilityGridMappingAdmission(cut::get),
         intervalNs: Long = 1_000_000,
         afterMapperAdmission: () -> Unit = {},
+        onMapperFailure: (RuntimeException) -> Unit = {},
         beforeDepthCapabilityFence: () -> Unit = {},
         beforeLaneDelivery: (VisibilityObservationSource) -> Unit = {},
         afterDepthCapabilityInvalidated: () -> Unit = {},
@@ -1233,6 +1297,7 @@ class AndroidVisibilityGridRuntimeTest {
         depthIntervalNs = intervalNs,
         ownsScheduler = true,
         afterMapperAdmission = afterMapperAdmission,
+        onMapperFailure = onMapperFailure,
         beforeDepthCapabilityFence = beforeDepthCapabilityFence,
         beforeLaneDelivery = beforeLaneDelivery,
         afterDepthCapabilityInvalidated = afterDepthCapabilityInvalidated,

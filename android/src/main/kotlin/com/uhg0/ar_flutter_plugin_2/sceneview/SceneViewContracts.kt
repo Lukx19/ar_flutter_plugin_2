@@ -1,14 +1,28 @@
 package com.uhg0.ar_flutter_plugin_2.sceneview
 
 import android.content.Context
+import androidx.compose.ui.platform.ViewCompositionStrategy
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.LifecycleRegistry
 import com.google.android.filament.Engine
 import com.google.android.filament.Stream
 import com.google.android.filament.Texture
 import com.google.ar.core.Config
 import com.google.ar.core.Frame
 import com.google.ar.core.Session
+import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
 import java.io.File
 import kotlin.math.sqrt
+
+/**
+ * Coverage visibility is a draw-state change. Keep the mesh subtree mounted
+ * while a coverage configuration exists so hiding it cannot report a resource
+ * failure and strand a later show command.
+ */
+internal fun shouldComposeCoverageRenderer(config: PointCloudNativeConfig?): Boolean =
+    config != null
 
 /** SceneView-independent transform payload. Matrices use Flutter's column-major order. */
 internal data class PluginTransform(
@@ -213,6 +227,128 @@ internal class SceneViewHostOwnership {
         disposed = true
         disposeCount += 1
         return true
+    }
+}
+
+/**
+ * Platform views can be detached while Flutter swaps a shared-camera surface.
+ * Keep Compose-owned Filament resources until the view-tree lifecycle ends;
+ * [SceneViewHost.dispose] is the explicit terminal teardown fence.
+ */
+internal fun sceneViewCompositionStrategy(): ViewCompositionStrategy =
+    ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed
+
+/**
+ * Gives ARSceneView a lifecycle that is paused before its Compose resources
+ * are released. The SceneView frame loop checks its resumed state immediately
+ * before calling Filament; mirroring the host lifecycle through this owner
+ * makes the pause and renderer destruction one ordered ownership boundary.
+ */
+internal class SceneViewRenderLifecycle(
+    private val parentLifecycle: Lifecycle,
+    private val onTransition: (String) -> Unit = {},
+) : LifecycleOwner {
+    private val registry = LifecycleRegistry(this)
+    private var terminal = false
+    private val parentObserver = LifecycleEventObserver { _, event ->
+        if (terminal) return@LifecycleEventObserver
+        if (event == Lifecycle.Event.ON_DESTROY) {
+            // The host owns the Compose disposal callback. Stop frame
+            // production here, then let the host cancel the ARSceneView
+            // composition before calling destroyAfterComposition().
+            pauseForTeardown()
+        } else {
+            handleParentEvent(event)
+        }
+    }
+
+    init {
+        parentLifecycle.addObserver(parentObserver)
+    }
+
+    override val lifecycle: Lifecycle
+        get() = registry
+
+    /** Stops ARSceneView's render loop while Compose still owns its resources. */
+    fun pauseForTeardown() {
+        if (terminal) return
+        when {
+            registry.currentState.isAtLeast(Lifecycle.State.RESUMED) -> {
+                handleRenderEvent(Lifecycle.Event.ON_PAUSE, "pause")
+                handleRenderEvent(Lifecycle.Event.ON_STOP, "pause")
+            }
+            registry.currentState.isAtLeast(Lifecycle.State.STARTED) ->
+                handleRenderEvent(Lifecycle.Event.ON_STOP, "pause")
+        }
+    }
+
+    /** Resumes after a transient platform-view detach without recreating state. */
+    fun resumeAfterTransientDetach() {
+        if (terminal) return
+        val parentState = parentLifecycle.currentState
+        if (parentState.isAtLeast(Lifecycle.State.STARTED) &&
+            !registry.currentState.isAtLeast(Lifecycle.State.STARTED)
+        ) {
+            handleRenderEvent(Lifecycle.Event.ON_START, "resume")
+        }
+        if (parentState.isAtLeast(Lifecycle.State.RESUMED) &&
+            !registry.currentState.isAtLeast(Lifecycle.State.RESUMED)
+        ) {
+            handleRenderEvent(Lifecycle.Event.ON_RESUME, "resume")
+        }
+    }
+
+    /** Called after Compose has cancelled ARSceneView's frame coroutine. */
+    fun destroyAfterComposition() {
+        if (terminal) return
+        pauseForTeardown()
+        if (registry.currentState != Lifecycle.State.DESTROYED) {
+            handleRenderEvent(Lifecycle.Event.ON_DESTROY, "destroyAfterComposition")
+        }
+        terminal = true
+        parentLifecycle.removeObserver(parentObserver)
+    }
+
+    private fun handleParentEvent(event: Lifecycle.Event) {
+        handleRenderEvent(event, "parent")
+    }
+
+    private fun handleRenderEvent(event: Lifecycle.Event, source: String) {
+        val before = registry.currentState
+        registry.handleLifecycleEvent(event)
+        val after = registry.currentState
+        onTransition(
+            "source=$source event=$event before=$before after=$after " +
+                "parent=${parentLifecycle.currentState}",
+        )
+    }
+}
+
+/**
+ * Defers terminal Compose disposal until a later display frame. A queued
+ * ARSceneView BroadcastFrameClock continuation can then finish against the
+ * live Filament engine before its SceneRenderer and Engine effects are torn
+ * down.
+ */
+internal class SceneViewCompositionDisposalGate(
+    private val scheduleOnNextFrame: ((() -> Unit) -> Unit),
+    private val disposeComposition: () -> Unit,
+) {
+    private var requested = false
+
+    @Synchronized
+    fun request() {
+        if (requested) return
+        requested = true
+        scheduleOnNextFrame {
+            val shouldDispose = synchronized(this) {
+                if (!requested) false else {
+                    requested = false
+                    true
+                }
+            }
+            if (shouldDispose) disposeComposition()
+        }
     }
 }
 

@@ -17,6 +17,17 @@ import org.openjdk.jol.info.GraphLayout
 
 class VisibilityGridRendererStateTest {
     @Test
+    fun `scalar voxel coordinates preserve signed boundaries and component validation`() {
+        val coordinates = intArrayOf(-1_048_576, -1, 0, 1, 1_048_575)
+        for (x in coordinates) for (y in coordinates) for (z in coordinates) {
+            val key = packVisibilityGridKey(x, y, z)
+            assertArrayEquals(intArrayOf(x, y, z), intArrayOf(
+                visibilityGridCoordinate(key, 0), visibilityGridCoordinate(key, 1), visibilityGridCoordinate(key, 2)))
+        }
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) { visibilityGridCoordinate(0, -1) }
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) { visibilityGridCoordinate(0, 3) }
+    }
+    @Test
     fun `renderer retains only exact group geometry after consuming restored keys`() {
         val keys = LongArray(100) { packVisibilityGridKey(it, 0, 0) }
         val config = group(keys.size).copy(restoredGeometryRevision = 1, restoredKeys = keys)

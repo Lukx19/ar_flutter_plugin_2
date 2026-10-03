@@ -102,6 +102,13 @@ object PacketCodec {
     )
 
     fun encodeRequest(request: Request): ByteArray {
+        val size = requestHeaderBytes.toLong() + request.styleRecords.size.toLong() * styleRecordBytes + request.commandBytes.size
+        require(size <= requestCeilingBytes) { "Request exceeds the 16 KiB ceiling" }
+        return ByteArray(size.toInt()).also { encodeRequestInto(request, it) }
+    }
+
+    /** Caller-private destination is borrowed only for this synchronous call. */
+    fun encodeRequestInto(request: Request, destination: ByteArray, destinationOffset: Int = 0): Int {
         validateOrdinal(request.streamToken, "streamToken")
         validateOrdinal(request.requestSequence, "requestSequence")
         validateOrdinal(request.acknowledgedTransactionId, "acknowledgedTransactionId", true)
@@ -120,9 +127,9 @@ object PacketCodec {
         val packetBytes = requestHeaderBytes + payloadBytes
         require(packetBytes <= requestCeilingBytes) { "Request exceeds the 16 KiB ceiling" }
         require(commandBytes <= 0xffff) { "Command section is too large" }
-        val packet = ByteArray(packetBytes)
-        val data = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
-        packet.writeMagic("VGR2")
+        require(destinationOffset >= 0 && destinationOffset <= destination.size - packetBytes) { "Request destination is too small" }
+        val data = ByteBuffer.wrap(destination, destinationOffset, packetBytes).slice().order(ByteOrder.LITTLE_ENDIAN)
+        data.put(0, 0x56.toByte()); data.put(1, 0x47.toByte()); data.put(2, 0x52.toByte()); data.put(3, 0x32.toByte())
         data.putShort(4, 2)
         data.putShort(6, requestHeaderBytes.toShort())
         data.putShort(8, request.requestFlags.toShort())
@@ -139,14 +146,14 @@ object PacketCodec {
         data.putLong(64, request.requestSequence)
         data.putInt(72, 0)
         data.putInt(76, 0)
-        var offset = requestHeaderBytes
+        var offset = destinationOffset + requestHeaderBytes
         request.styleRecords.forEach { record ->
-            record.copyInto(packet, offset)
+            record.copyInto(destination, offset)
             offset += record.size
         }
-        request.commandBytes.copyInto(packet, offset)
-        data.putInt(72, crc32(packet, 72))
-        return packet
+        request.commandBytes.copyInto(destination, offset)
+        data.putInt(72, crc32(destination, 72, destinationOffset, packetBytes))
+        return packetBytes
     }
 
     fun decodeRequest(packet: ByteArray): Request {
@@ -203,6 +210,12 @@ object PacketCodec {
     }
 
     fun encodeResponse(response: Response, maximumBytes: Int): ByteArray {
+        val size = responseHeaderBytes.toLong() + response.payload.size + response.diagnostic.size
+        require(size <= maximumBytes && size <= catchUpMaximumBytes) { "Response exceeds negotiated or hard ceiling" }
+        return ByteArray(size.toInt()).also { encodeResponseInto(response, maximumBytes, it) }
+    }
+
+    fun encodeResponseInto(response: Response, maximumBytes: Int, destination: ByteArray, destinationOffset: Int = 0): Int {
         validateResponse(response)
         require(response.resultFlags in 0..0x1f)
         require(response.errorId in 0..0xffff)
@@ -221,14 +234,14 @@ object PacketCodec {
         require(response.lineageCount in 0..0xffff)
         require(response.regionResultCount in 0..0xffff)
         require(response.diagnostic.size <= 1024) { "Response diagnostic exceeds 1 KiB" }
-        val body = response.payload + response.diagnostic
-        val packetBytes = responseHeaderBytes + body.size
+        val bodyBytes = response.payload.size + response.diagnostic.size
+        val packetBytes = responseHeaderBytes + bodyBytes
         require(packetBytes <= maximumBytes && packetBytes <= catchUpMaximumBytes) {
             "Response exceeds negotiated or hard ceiling"
         }
-        val packet = ByteArray(packetBytes)
-        val data = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
-        packet.writeMagic("VGS2")
+        require(destinationOffset >= 0 && destinationOffset <= destination.size - packetBytes) { "Response destination is too small" }
+        val data = ByteBuffer.wrap(destination, destinationOffset, packetBytes).slice().order(ByteOrder.LITTLE_ENDIAN)
+        data.put(0, 0x56.toByte()); data.put(1, 0x47.toByte()); data.put(2, 0x53.toByte()); data.put(3, 0x32.toByte())
         data.putShort(4, 2)
         data.putShort(6, responseHeaderBytes.toShort())
         data.put(8, response.messageKind.toByte())
@@ -253,12 +266,13 @@ object PacketCodec {
         data.putShort(94, response.removalCount.toShort())
         data.putShort(96, response.lineageCount.toShort())
         data.putShort(98, response.regionResultCount.toShort())
-        data.putInt(100, body.size)
+        data.putInt(100, bodyBytes)
         data.putInt(104, 0)
         data.putInt(108, 0)
-        body.copyInto(packet, responseHeaderBytes)
-        data.putInt(104, crc32(packet, 104))
-        return packet
+        response.payload.copyInto(destination, destinationOffset + responseHeaderBytes)
+        response.diagnostic.copyInto(destination, destinationOffset + responseHeaderBytes + response.payload.size)
+        data.putInt(104, crc32(destination, 104, destinationOffset, packetBytes))
+        return packetBytes
     }
 
     fun decodeResponse(packet: ByteArray): Response {
@@ -483,9 +497,10 @@ object PacketCodec {
     private fun ByteArray.magicIs(value: String): Boolean =
         value.toByteArray(Charsets.US_ASCII).contentEquals(copyOfRange(0, 4))
 
-    private fun crc32(bytes: ByteArray, zeroOffset: Int): Int {
+    private fun crc32(bytes: ByteArray, zeroOffset: Int, start: Int = 0, length: Int = bytes.size): Int {
         var crc = -1
-        bytes.forEachIndexed { index, original ->
+        for (index in 0 until length) {
+            val original = bytes[start + index]
             val byte = if (index in zeroOffset until zeroOffset + 4) 0 else original.toInt() and 0xff
             crc = crc xor byte
             repeat(8) {

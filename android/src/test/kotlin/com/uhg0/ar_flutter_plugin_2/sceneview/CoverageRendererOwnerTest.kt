@@ -852,6 +852,37 @@ class CoverageRendererOwnerTest {
     }
 
     @Test
+    fun `visibility controls round trip without replacing mounted resources`() {
+        val owner = NativeCoverageRendererOwner()
+        owner.install(snapshot())
+        val token = checkNotNull(owner.issueResourceToken())
+
+        val hidden = owner.setControls(
+            CoverageRendererControls(
+                visible = false,
+                mode = CoveragePresentationMode.SEMANTIC_CENTROIDS,
+                palette = CoverageRendererPalette.COVERAGE,
+            ),
+        )
+        assertTrue(hidden.accepted)
+        assertFalse(hidden.visible)
+        assertFalse(owner.status().rendererUnavailable)
+        assertEquals(token, owner.currentResourceToken())
+
+        val shown = owner.setControls(
+            CoverageRendererControls(
+                visible = true,
+                mode = CoveragePresentationMode.SEMANTIC_CENTROIDS,
+                palette = CoverageRendererPalette.COVERAGE,
+            ),
+        )
+        assertTrue(shown.accepted)
+        assertTrue(shown.visible)
+        assertFalse(owner.status().rendererUnavailable)
+        assertEquals(token, owner.currentResourceToken())
+    }
+
+    @Test
     fun `late resource callbacks cannot clear a replacement owner lifetime`() {
         val owner = NativeCoverageRendererOwner()
         owner.install(snapshot(rendererGeneration = 9L))

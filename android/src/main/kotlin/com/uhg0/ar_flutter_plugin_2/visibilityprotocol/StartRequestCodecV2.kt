@@ -1,5 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.visibilityprotocol
 
+import com.uhg0.ar_flutter_plugin_2.util.toLowercaseHex
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlValidationFailure
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -14,7 +15,7 @@ internal fun matrixValues(data: ByteBuffer, offset: Int): List<Double> =
     Collections.unmodifiableList(List(16) { index -> data.getDouble(offset + index * 8) })
 
 internal fun hashIdentity(bytes: ByteArray): String =
-    bytes.joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+    bytes.toLowercaseHex()
 
 private val A_EMPTY_HASH_WIRE_IDENTITY = "00".repeat(32)
 

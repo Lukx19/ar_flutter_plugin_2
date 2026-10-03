@@ -7,6 +7,116 @@ import java.util.Arrays
 import java.util.Collections
 
 /**
+ * Read-only values borrowed from one authenticated depth preparation cut.
+ * The cache is owned by the serial preparation workspace so warm batches can
+ * clear and refill the same bounded maps without retaining a prior cut.
+ */
+internal class DepthBatchReadCache {
+    private var rowsById = HashMap<SurfaceId, CompactSurface?>()
+    private var rowsByVoxel = HashMap<Voxel, CompactSurface?>()
+    private var sourcesById = HashMap<SurfaceId, PagedSource?>()
+    private var supportsBySource = HashMap<SurfaceId, DepthBatchSupportDetails?>()
+    private var supportValuesBySource = HashMap<SurfaceId, ArrayList<ImmutableSourceSupport>>()
+    private var reusableSupportValues = ArrayList<ArrayList<ImmutableSourceSupport>>()
+    private var maxRowsById = 0
+    private var maxRowsByVoxel = 0
+    private var maxSourcesById = 0
+    private var maxSupportsBySource = 0
+    private var maxSupportValueSlots = 0
+
+    internal fun clear() {
+        rowsById.clear()
+        rowsByVoxel.clear()
+        sourcesById.clear()
+        supportsBySource.clear()
+        supportValuesBySource.values.forEach {
+            it.clear()
+            reusableSupportValues += it
+        }
+        supportValuesBySource.clear()
+    }
+
+    internal fun clearStorage() {
+        rowsById = HashMap()
+        rowsByVoxel = HashMap()
+        sourcesById = HashMap()
+        supportsBySource = HashMap()
+        supportValuesBySource = HashMap()
+        reusableSupportValues = ArrayList()
+        maxRowsById = 0
+        maxRowsByVoxel = 0
+        maxSourcesById = 0
+        maxSupportsBySource = 0
+        maxSupportValueSlots = 0
+    }
+
+    fun findById(id: SurfaceId, load: () -> CompactSurface?): CompactSurface? {
+        if (rowsById.containsKey(id)) return rowsById[id]
+        return load().also {
+            rowsById[id] = it
+            maxRowsById = maxOf(maxRowsById, rowsById.size)
+        }
+    }
+
+    fun findByVoxel(voxel: Voxel, load: () -> CompactSurface?): CompactSurface? {
+        if (rowsByVoxel.containsKey(voxel)) return rowsByVoxel[voxel]
+        return load().also {
+            rowsByVoxel[voxel] = it
+            maxRowsByVoxel = maxOf(maxRowsByVoxel, rowsByVoxel.size)
+        }
+    }
+
+    fun readSourceById(
+        id: SurfaceId,
+        load: () -> CanonicalPageRead<PagedSource?>,
+    ): CanonicalPageRead<PagedSource?> {
+        if (sourcesById.containsKey(id)) {
+            return CanonicalPageRead.Complete(sourcesById[id], 0, 0)
+        }
+        val read = load()
+            if (read is CanonicalPageRead.Complete) {
+                sourcesById[id] = read.value
+                maxSourcesById = maxOf(maxSourcesById, sourcesById.size)
+            }
+        return read
+    }
+
+    fun supports(
+        source: SurfaceId,
+        load: () -> DepthBatchSupportDetails?,
+    ): DepthBatchSupportDetails? {
+        if (supportsBySource.containsKey(source)) return supportsBySource[source]
+        return load().also {
+            supportsBySource[source] = it
+            maxSupportsBySource = maxOf(maxSupportsBySource, supportsBySource.size)
+            maxSupportValueSlots = maxOf(maxSupportValueSlots, it?.values?.size ?: 0)
+        }
+    }
+
+    /** Returns reusable value storage for one source; callers clear/fill it. */
+    fun supportValues(source: SurfaceId): ArrayList<ImmutableSourceSupport> =
+        supportValuesBySource.getOrPut(source) {
+            if (reusableSupportValues.isEmpty()) ArrayList() else reusableSupportValues.removeAt(reusableSupportValues.lastIndex)
+        }.also { it.clear() }
+
+    internal fun retainedBytes(): Long =
+            256L + (maxRowsById + maxRowsByVoxel + maxSourcesById) * 64L +
+            maxSupportsBySource * 128L + maxSupportValueSlots * 64L
+}
+
+internal data class DepthBatchSupportDetails(
+    val values: List<ImmutableSourceSupport>,
+    val records: Int,
+)
+
+internal data class DepthBatchOperation(
+    val kind: DepthBatchOperationKind,
+    val sources: List<SurfaceId>,
+    val targets: IntArray,
+    val liveDelta: Int,
+)
+
+/**
  * Private, bounded mutation overlay for the immutable v6 reader.
  *
  * The overlay deliberately owns only dirty rows and the evidence needed to
@@ -18,6 +128,7 @@ import java.util.Collections
 internal class MutableCanonicalOverlay private constructor(
     private val view: CanonicalFeaturePlanningView,
     private val configuration: SurfaceOwnershipConfiguration,
+    private val preparationWorkspace: CanonicalPreparationWorkspace = CanonicalPreparationWorkspace(),
 ) {
     private fun completeView(): CanonicalStateView = view as? CanonicalStateView
         ?: error("complete canonical view required outside feature planning")
@@ -30,54 +141,6 @@ internal class MutableCanonicalOverlay private constructor(
     private var ownerConstructions = 0
     private var removalGraphAllocations = 0
 
-    /**
-     * Read-only values borrowed from one authenticated depth preparation cut.
-     * Preflight and materialization run back-to-back over the same immutable
-     * view, so retaining these bounded touched values avoids decoding the same
-     * canonical pages twice without extending their lifetime past preparation.
-     */
-    private class DepthBatchReadCache {
-        private val rowsById = HashMap<SurfaceId, CompactSurface?>()
-        private val rowsByVoxel = HashMap<Voxel, CompactSurface?>()
-        private val sourcesById = HashMap<SurfaceId, PagedSource?>()
-        private val supportsBySource = HashMap<SurfaceId, SupportDetails?>()
-
-        fun findById(id: SurfaceId, load: () -> CompactSurface?): CompactSurface? {
-            if (rowsById.containsKey(id)) return rowsById[id]
-            return load().also { rowsById[id] = it }
-        }
-
-        fun findByVoxel(voxel: Voxel, load: () -> CompactSurface?): CompactSurface? {
-            if (rowsByVoxel.containsKey(voxel)) return rowsByVoxel[voxel]
-            return load().also { rowsByVoxel[voxel] = it }
-        }
-
-        fun readSourceById(
-            id: SurfaceId,
-            load: () -> CanonicalPageRead<PagedSource?>,
-        ): CanonicalPageRead<PagedSource?> {
-            if (sourcesById.containsKey(id)) {
-                return CanonicalPageRead.Complete(sourcesById[id], 0, 0)
-            }
-            val read = load()
-            if (read is CanonicalPageRead.Complete) sourcesById[id] = read.value
-            return read
-        }
-
-        fun supports(
-            source: SurfaceId,
-            load: () -> SupportDetails?,
-        ): SupportDetails? {
-            if (supportsBySource.containsKey(source)) return supportsBySource[source]
-            return load().also { supportsBySource[source] = it }
-        }
-    }
-
-    private data class SupportDetails(
-        val values: List<ImmutableSourceSupport>,
-        val records: Int,
-    )
-
     private fun state() = CanonicalStateReceipt(
         view.cut.geometryRevision,
         view.cut.lineageRevision,
@@ -85,8 +148,9 @@ internal class MutableCanonicalOverlay private constructor(
         view.cut.liveSurfaceCount,
     )
 
-    private fun refuse(reason: CanonicalMutationRefusal) =
-        CanonicalMutationPreparation.Refused(
+    private fun refuse(reason: CanonicalMutationRefusal): CanonicalMutationPreparation {
+        preparationWorkspace.recordDepthUsage()
+        return CanonicalMutationPreparation.Refused(
             reason,
             state(),
             CanonicalMutationPreflightWork(
@@ -96,6 +160,7 @@ internal class MutableCanonicalOverlay private constructor(
                 removalGraphAllocations,
             ),
         )
+    }
 
     private fun prepareFeature(command: FeatureMutationCommand): CanonicalMutationPreparation {
         if (!validCommandId(command.commandId) ||
@@ -321,7 +386,7 @@ internal class MutableCanonicalOverlay private constructor(
         if (finalSourceCount > sourceCapacity() || finalSourceCount > Int.MAX_VALUE) return refuse(CanonicalMutationRefusal.LINEAGE_EXHAUSTED)
 
         val edgeCardinality = minimumEdges
-        val sourceSupport = BoundedSupportAccumulator(supportLimit)
+        val sourceSupport = preparationWorkspace.depthSupportAccumulator(supportLimit)
         var removedSupports = 0L
         for (source in sources) {
             when (val read = readSupport(source, sourceSupport)) {
@@ -396,6 +461,7 @@ internal class MutableCanonicalOverlay private constructor(
         lineagePairs: PreparedLineageTable? = null,
         removedLineageRecords: Int = 0,
     ): CanonicalMutationPreparation {
+        preparationWorkspace.recordDepthUsage()
         val rowTable = PreparedRowTable.from(rows)
         val removedIds = LongArray(removed.size) { removed[it].value }.also { it.sort() }
         val removedRoutes = if (removedIds.isEmpty()) PreparedRemovedRouteTable.EMPTY else {
@@ -453,8 +519,13 @@ internal class MutableCanonicalOverlay private constructor(
             planningConstructionPeakBytes,
             Math.addExact(retainedPlanBytes, routeDeltaConstructionBytes),
         )
-        if (sharedReserveBytes > CompactCanonicalStore.JOURNAL_RESERVE_BYTES ||
-            constructionPeakBytes > CompactCanonicalStore.JOURNAL_RESERVE_BYTES
+        val mutationReserveBytes = if (kind == PreparedMutationKind.DEPTH_BATCH) {
+            DEPTH_PLANNER_RESERVE_BYTES
+        } else {
+            CompactCanonicalStore.JOURNAL_RESERVE_BYTES
+        }
+        if (sharedReserveBytes > mutationReserveBytes ||
+            constructionPeakBytes > mutationReserveBytes
         ) return refuse(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
         val authority = authorityWork()
         val rowConstructionBytes = rows.size * ROW_CONSTRUCTION_BYTES_PER_RECORD
@@ -672,32 +743,30 @@ internal class MutableCanonicalOverlay private constructor(
      * Performs the depth planner's admission pass without retaining a graph of
      * operations, source rows, targets, or support values. The support-ID
      * scratch array is allocated only after the fixed planner bound and the
-     * streamed source cardinalities have both fit the effective journal limit.
+     * streamed source cardinalities have both fit the bounded planner reserve.
      */
     private fun depthBatchPreflight(
         command: CanonicalEvidenceBatchCommand,
         scalars: DepthBatchScalars,
         cache: DepthBatchReadCache,
+        workspace: CanonicalPreparationWorkspace,
     ): DepthBatchPreflightResult {
-        val journalLimit = minOf(
-            CompactCanonicalStore.JOURNAL_RESERVE_BYTES,
-            configuration.changeJournalByteCapacity.toLong(),
-        )
-        val minimumPlannerBytes = depthPlannerBytes(scalars, 0L, 0L, command.commandId)
+        val minimumJournalBytes = depthPlannerWireBytes(scalars, 0L, command.commandId)
             ?: return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
-        if (minimumPlannerBytes > journalLimit) {
+        if (!journalFits(minimumJournalBytes)) {
             return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
         }
-        val supportRecordLimit = (journalLimit - minimumPlannerBytes) /
+        val minimumPlannerBytes = depthPlannerBytes(scalars, 0L, 0L, command.commandId)
+            ?: return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
+        if (minimumPlannerBytes > DEPTH_PLANNER_RESERVE_BYTES) {
+            return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
+        }
+        val supportRecordLimit = (DEPTH_PLANNER_RESERVE_BYTES - minimumPlannerBytes) /
             (DEPTH_SUPPORT_DETAILS_BYTES_PER_RECORD + DEPTH_SUPPORT_SCRATCH_BYTES_PER_RECORD)
-        val sourceIds = try { DepthEvidenceIdTable.forExpected(scalars.sourceReferences) }
-        catch (_: ArithmeticException) { return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED) }
-        val structuralSourceIds = try { DepthEvidenceIdTable.forExpected(scalars.sourceReferences) }
-            catch (_: ArithmeticException) { return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED) }
-        val supportSourceIds = try { DepthEvidenceIdTable.forExpected(scalars.sourceReferences) }
-            catch (_: ArithmeticException) { return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED) }
-        val targetVoxels = try { DepthEvidenceVoxelTable.forExpected(scalars.targetRows) }
-        catch (_: ArithmeticException) { return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED) }
+        val sourceIds = workspace.depthSourceIds
+        val structuralSourceIds = workspace.depthStructuralSourceIds
+        val supportSourceIds = workspace.depthSupportSourceIds
+        val targetVoxels = workspace.depthTargetVoxels
 
         // Validate every source reference and duplicate source identity before
         // any operation/source/target collection is constructed.
@@ -848,10 +917,10 @@ internal class MutableCanonicalOverlay private constructor(
 
         val scratchBytes = depthPlannerBytes(scalars, supportValueCapacity, 0L, command.commandId)
             ?: return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
-        if (scratchBytes > journalLimit) {
+        if (scratchBytes > DEPTH_PLANNER_RESERVE_BYTES) {
             return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
         }
-        val supportIds = LongArray(supportValueCapacity.toInt())
+        val supportIds = workspace.depthSupportIds(supportValueCapacity.toInt())
         var supportPairCount = 0L
         var exactRefusal: CanonicalMutationRefusal? = null
         command.changes.forEach { change ->
@@ -946,7 +1015,11 @@ internal class MutableCanonicalOverlay private constructor(
 
         val plannedBytes = depthPlannerBytes(scalars, supportValueCapacity, supportPairCount, command.commandId)
             ?: return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
-        if (plannedBytes > journalLimit) {
+        val plannedWireBytes = depthPlannerWireBytes(scalars, supportPairCount, command.commandId)
+            ?: return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
+        if (plannedBytes > DEPTH_PLANNER_RESERVE_BYTES ||
+            !journalFits(plannedWireBytes)
+        ) {
             return DepthBatchPreflightResult.Refused(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
         }
         return DepthBatchPreflightResult.Complete(
@@ -962,36 +1035,100 @@ internal class MutableCanonicalOverlay private constructor(
         supportPairs: Long,
         commandId: String,
     ): Long? = try {
-        val wal = Math.addExact(
+        val wal = depthPlannerWireBytes(scalars, supportPairs, commandId) ?: return null
+        // The scalar admission tables and the exact prepared mutation are
+        // separate phases. Summing both phases rejects valid dense batches
+        // even though the tables are eligible for collection before payload
+        // construction begins. Keep the peak of each phase, then add the
+        // encoded journal record and caller-owned command that must coexist
+        // with the selected phase.
+        val commandBytes = depthCommandOwnerBytes(scalars, commandId) ?: return null
+        val retainedCommandBytes = depthCommandRetainedBytes(scalars, commandId) ?: return null
+        var scalarBytes = Math.addExact(PLAN_FIXED_OWNER_BYTES, WRITER_SCRATCH_BYTES)
+        scalarBytes = Math.addExact(scalarBytes, PLANNING_PAGE_SCRATCH_BYTES)
+        scalarBytes = Math.addExact(scalarBytes, commandBytes)
+        scalarBytes = Math.addExact(scalarBytes, Math.multiplyExact(supportRecords, DEPTH_SUPPORT_DETAILS_BYTES_PER_RECORD))
+        scalarBytes = Math.addExact(scalarBytes, Math.multiplyExact(supportRecords, DEPTH_SUPPORT_SCRATCH_BYTES_PER_RECORD))
+        // Lists, cache nodes/keys and reference-table growth survive through
+        // scalar admission, including empty source-support lists. The
+        // caller-owned command and this bounded read cache are both charged.
+        scalarBytes = Math.addExact(scalarBytes, DEPTH_SUPPORT_CACHE_FIXED_BYTES)
+        scalarBytes = Math.addExact(scalarBytes, Math.multiplyExact(scalars.removedRows.toLong(), DEPTH_SUPPORT_CACHE_ENTRY_BYTES))
+        scalarBytes = Math.addExact(scalarBytes, depthReadCacheBytes(scalars))
+        scalarBytes = Math.addExact(scalarBytes, Math.multiplyExact(DepthEvidenceIdTable.bytesForExpected(scalars.sourceReferences), 3L))
+        scalarBytes = Math.addExact(scalarBytes, DepthEvidenceVoxelTable.bytesForExpected(scalars.targetRows))
+
+        var constructionBytes = Math.addExact(PLAN_FIXED_OWNER_BYTES, WRITER_SCRATCH_BYTES)
+        constructionBytes = Math.addExact(constructionBytes, PLANNING_PAGE_SCRATCH_BYTES)
+        // CanonicalTarget and SurfaceId values are shared with the operation
+        // and target collections below; retain the command/list objects once
+        // instead of double charging those values during construction.
+        constructionBytes = Math.addExact(constructionBytes, retainedCommandBytes)
+        constructionBytes = Math.addExact(constructionBytes, Math.multiplyExact(scalars.sourceReferences.toLong(), DEPTH_SOURCE_GRAPH_BYTES))
+        constructionBytes = Math.addExact(constructionBytes, Math.multiplyExact(scalars.targetRows.toLong(), DEPTH_TARGET_GRAPH_BYTES))
+        constructionBytes = Math.addExact(constructionBytes, Math.multiplyExact(scalars.operationCount.toLong(), DEPTH_OPERATION_GRAPH_BYTES))
+        constructionBytes = Math.addExact(constructionBytes, Math.multiplyExact(scalars.targetRows.toLong(), 60L))
+        constructionBytes = Math.addExact(constructionBytes, Math.multiplyExact(scalars.removedRows.toLong(), 8L))
+        constructionBytes = Math.addExact(constructionBytes, Math.multiplyExact(supportPairs, 68L))
+        constructionBytes = Math.addExact(constructionBytes, 64L)
+        constructionBytes = Math.addExact(constructionBytes, Math.multiplyExact(scalars.lineageEdges, 16L))
+        constructionBytes = Math.addExact(constructionBytes, 40L)
+        constructionBytes = Math.addExact(constructionBytes, Math.multiplyExact(scalars.targetRows.toLong(), ROW_CONSTRUCTION_BYTES_PER_RECORD))
+        constructionBytes = Math.addExact(constructionBytes, Math.multiplyExact(scalars.removedRows.toLong(), REMOVED_CONSTRUCTION_BYTES_PER_RECORD))
+        constructionBytes = Math.addExact(constructionBytes, Math.multiplyExact(supportRecords, DEPTH_SUPPORT_DETAILS_BYTES_PER_RECORD))
+        constructionBytes = Math.addExact(constructionBytes, Math.multiplyExact(scalars.removedRows.toLong(), DEPTH_SUPPORT_CACHE_ENTRY_BYTES))
+        constructionBytes = Math.addExact(constructionBytes, depthReadCacheBytes(scalars))
+        constructionBytes = Math.addExact(constructionBytes, Math.multiplyExact(supportPairs, PREPARED_SUPPORT_CONSTRUCTION_BYTES_PER_RECORD))
+        constructionBytes = Math.addExact(constructionBytes, Math.multiplyExact(scalars.lineageEdges, PREPARED_LINEAGE_CONSTRUCTION_BYTES_PER_RECORD))
+        Math.addExact(maxOf(scalarBytes, constructionBytes), wal)
+    } catch (_: ArithmeticException) { null }
+
+    private fun depthPlannerWireBytes(
+        scalars: DepthBatchScalars,
+        supportPairs: Long,
+        commandId: String,
+    ): Long? = try {
+        Math.addExact(
             encodedRecordBytes(
                 scalars.targetRows, scalars.removedRows, supportPairs,
                 scalars.allocatedRows.toLong(), scalars.lineageEdges, commandId,
             ) ?: return null,
             4L,
         )
-        var bytes = Math.addExact(PLAN_FIXED_OWNER_BYTES, WRITER_SCRATCH_BYTES)
-        bytes = Math.addExact(bytes, PLANNING_PAGE_SCRATCH_BYTES)
-        bytes = Math.addExact(bytes, Math.multiplyExact(scalars.sourceReferences.toLong(), DEPTH_SOURCE_GRAPH_BYTES))
-        bytes = Math.addExact(bytes, Math.multiplyExact(scalars.targetRows.toLong(), DEPTH_TARGET_GRAPH_BYTES))
-        bytes = Math.addExact(bytes, Math.multiplyExact(scalars.operationCount.toLong(), DEPTH_OPERATION_GRAPH_BYTES))
-        bytes = Math.addExact(bytes, Math.multiplyExact(scalars.targetRows.toLong(), ROW_CONSTRUCTION_BYTES_PER_RECORD))
-        bytes = Math.addExact(bytes, Math.multiplyExact(scalars.removedRows.toLong(), REMOVED_CONSTRUCTION_BYTES_PER_RECORD))
-        bytes = Math.addExact(bytes, Math.multiplyExact(supportRecords, DEPTH_SUPPORT_DETAILS_BYTES_PER_RECORD))
-        bytes = Math.addExact(bytes, Math.multiplyExact(supportRecords, DEPTH_SUPPORT_SCRATCH_BYTES_PER_RECORD))
-        // Lists, cache nodes/keys and reference-table growth survive through
-        // payload construction, including empty source-support lists.
-        bytes = Math.addExact(bytes, DEPTH_SUPPORT_CACHE_FIXED_BYTES)
-        bytes = Math.addExact(bytes, Math.multiplyExact(scalars.removedRows.toLong(), DEPTH_SUPPORT_CACHE_ENTRY_BYTES))
-        bytes = Math.addExact(bytes, Math.multiplyExact(supportPairs, PREPARED_SUPPORT_CONSTRUCTION_BYTES_PER_RECORD))
-        bytes = Math.addExact(bytes, Math.multiplyExact(scalars.lineageEdges, PREPARED_LINEAGE_CONSTRUCTION_BYTES_PER_RECORD))
-        bytes = Math.addExact(bytes, Math.multiplyExact(DepthEvidenceIdTable.bytesForExpected(scalars.sourceReferences), 3L))
-        bytes = Math.addExact(bytes, DepthEvidenceVoxelTable.bytesForExpected(scalars.targetRows))
-        bytes = Math.addExact(bytes, Math.multiplyExact(supportPairs, 68L))
-        bytes = Math.addExact(bytes, 64L)
-        bytes = Math.addExact(bytes, Math.multiplyExact(scalars.lineageEdges, 16L))
-        bytes = Math.addExact(bytes, 40L)
-        Math.addExact(bytes, wal)
     } catch (_: ArithmeticException) { null }
+
+    /**
+     * Caller-owned command values remain reachable while scalar admission
+     * tables are released and the prepared mutation is constructed. Count the
+     * copied change list, source references, and target values in both phase
+     * peaks instead of treating the encoded wire record as their only owner.
+     */
+    private fun depthCommandOwnerBytes(
+        scalars: DepthBatchScalars,
+        commandId: String,
+    ): Long? = try {
+        var bytes = depthCommandRetainedBytes(scalars, commandId) ?: return null
+        bytes = Math.addExact(bytes, Math.multiplyExact(scalars.sourceReferences.toLong(), DEPTH_COMMAND_SOURCE_BYTES))
+        Math.addExact(bytes, Math.multiplyExact(scalars.targetRows.toLong(), DEPTH_COMMAND_TARGET_BYTES))
+    } catch (_: ArithmeticException) { null }
+
+    private fun depthCommandRetainedBytes(
+        scalars: DepthBatchScalars,
+        commandId: String,
+    ): Long? = try {
+        var bytes = Math.addExact(DEPTH_COMMAND_FIXED_BYTES, modifiedUtf8Length(commandId))
+        Math.addExact(bytes, Math.multiplyExact(scalars.operationCount.toLong(), DEPTH_COMMAND_OPERATION_BYTES))
+    } catch (_: ArithmeticException) { null }
+
+    private fun depthReadCacheBytes(scalars: DepthBatchScalars): Long = try {
+        Math.addExact(
+            DEPTH_READ_CACHE_FIXED_BYTES,
+            Math.multiplyExact(
+                Math.addExact(scalars.sourceReferences.toLong(), scalars.targetRows.toLong()),
+                DEPTH_READ_CACHE_ENTRY_BYTES,
+            ),
+        )
+    } catch (_: ArithmeticException) { Long.MAX_VALUE }
 
     private fun streamLineageCount(source: SurfaceId): Long? {
         var cursor: LineageCursor? = null
@@ -1059,10 +1196,10 @@ internal class MutableCanonicalOverlay private constructor(
      * construction; a zero-record result intentionally remains distinct from
      * the allocation-source fallback used by the depth protocol.
      */
-    private fun readRawSupportDetails(source: SurfaceId, cache: DepthBatchReadCache): SupportDetails? =
+    private fun readRawSupportDetails(source: SurfaceId, cache: DepthBatchReadCache): DepthBatchSupportDetails? =
         cache.supports(source) {
             var cursor: SourceSupportCursor? = null
-            val values = ArrayList<ImmutableSourceSupport>()
+            val values = cache.supportValues(source)
             var records = 0
             var pages = 0L
             var failed = false
@@ -1088,7 +1225,7 @@ internal class MutableCanonicalOverlay private constructor(
                     }
                 }
             } while (!failed && cursor != null)
-            if (failed) null else SupportDetails(Collections.unmodifiableList(values), records)
+            if (failed) null else DepthBatchSupportDetails(Collections.unmodifiableList(values), records)
         }
 
     private fun readSourcePage(
@@ -1118,24 +1255,30 @@ internal class MutableCanonicalOverlay private constructor(
         if (command.changes.size > configuration.surfaceCapacity + configuration.lineageCapacity) {
             return refuse(CanonicalMutationRefusal.CAPACITY)
         }
-        val readCache = DepthBatchReadCache()
-        val preflight = when (val result = depthBatchPreflight(command, scalars, readCache)) {
+        try {
+            preparationWorkspace.resetDepthFor(scalars.sourceReferences, scalars.targetRows)
+        } catch (_: ArithmeticException) {
+            return refuse(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
+        }
+        val readCache = preparationWorkspace.depthReadCache
+        val preflight = when (val result = depthBatchPreflight(command, scalars, readCache, preparationWorkspace)) {
             is DepthBatchPreflightResult.Refused -> return refuse(result.reason)
             is DepthBatchPreflightResult.Complete -> result.value
         }
 
-        data class Operation(
-            val kind: DepthBatchOperationKind,
-            val sources: List<SurfaceId>,
-            val targets: IntArray,
-            val liveDelta: Int,
-        )
-        val operations = ArrayList<Operation>(command.changes.size)
-        val sources = ArrayList<SurfaceId>(scalars.sourceReferences)
-        val structuralSources = HashSet<SurfaceId>(scalars.sourceReferences)
-        val targets = ArrayList<CanonicalTarget>(scalars.targetRows)
-        val sourceSeen = HashSet<SurfaceId>(scalars.sourceReferences)
-        val targetVoxels = HashSet<Voxel>(scalars.targetRows)
+        val operations = preparationWorkspace.depthOperations
+        val sources = preparationWorkspace.depthSources
+        val structuralSources = preparationWorkspace.depthStructuralSources
+        val targets = preparationWorkspace.depthTargets
+        val sourceSeen = preparationWorkspace.depthSourceSeen
+        val targetVoxels = preparationWorkspace.depthTargetVoxelsSet
+        operations.clear()
+        sources.clear()
+        structuralSources.clear()
+        targets.clear()
+        sourceSeen.clear()
+        targetVoxels.clear()
+        preparationWorkspace.depthOperationSources.forEach { it.clear() }
         fun addSource(source: SurfaceId, structural: Boolean): Boolean {
             if (!sourceSeen.add(source)) return false
             sources += source
@@ -1147,9 +1290,13 @@ internal class MutableCanonicalOverlay private constructor(
             targets += target
             return targets.lastIndex
         }
-        for (change in command.changes) {
+        for ((changeIndex, change) in command.changes.withIndex()) {
             val kind = change.operationKind
-            val operationSources = ArrayList<SurfaceId>(change.sourceCount)
+            val operationSources = if (changeIndex < preparationWorkspace.depthOperationSources.size) {
+                preparationWorkspace.depthOperationSources[changeIndex].also { it.clear() }
+            } else {
+                ArrayList<SurfaceId>(change.sourceCount).also { preparationWorkspace.depthOperationSources += it }
+            }
             for (sourceIndex in 0 until change.sourceCount) {
                 val source = change.sourceAt(sourceIndex)
                 if (!addSource(source, kind.structural)) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
@@ -1161,12 +1308,13 @@ internal class MutableCanonicalOverlay private constructor(
                 if (target < 0) return refuse(CanonicalMutationRefusal.OWNERSHIP_CONFLICT)
                 operationTargets[targetIndex] = target
             }
-            operations += Operation(kind, operationSources, operationTargets, change.liveDelta)
+            operations += DepthBatchOperation(kind, operationSources, operationTargets, change.liveDelta)
         }
         if (sources.size > configuration.surfaceCapacity + configuration.lineageCapacity) {
             return refuse(CanonicalMutationRefusal.CAPACITY)
         }
-        val sourceRows = HashMap<SurfaceId, CompactSurface>(sources.size)
+        val sourceRows = preparationWorkspace.depthSourceRows
+        sourceRows.clear()
         sources.forEach { source ->
             directLookups++
             val row = readCache.findById(source) { view.findById(source) }
@@ -1206,8 +1354,8 @@ internal class MutableCanonicalOverlay private constructor(
 
         val removedLineageRecords = preflight.removedLineageRecords
 
-        val details = HashMap<SurfaceId, SupportDetails>()
-        fun readDetails(source: SurfaceId): SupportDetails? {
+        val details = preparationWorkspace.depthSupportDetails.also { it.clear() }
+        fun readDetails(source: SurfaceId): DepthBatchSupportDetails? {
             details[source]?.let { return it }
             val raw = readRawSupportDetails(source, readCache) ?: return null
             val values = if (raw.values.isEmpty()) {
@@ -1216,20 +1364,21 @@ internal class MutableCanonicalOverlay private constructor(
             } else {
                 raw.values
             }
-            return SupportDetails(values, raw.records).also { details[source] = it }
+            return DepthBatchSupportDetails(values, raw.records).also { details[source] = it }
         }
         structuralSources.forEach { source -> if (readDetails(source) == null) return refuse(CanonicalMutationRefusal.SOURCE_READ_FAILURE) }
 
         val overlay = this
         val commandHash = overlayHash(command.commandId.encodeToByteArray())
-        val allocatedIds = LongArray(targets.size)
+        val allocatedIds = preparationWorkspace.depthAllocatedIds(targets.size)
         var next = view.cut.nextSurfaceIdHighWater
         targets.forEachIndexed { index, target ->
             allocatedIds[index] = target.id?.value ?: next++
         }
         val high = checkedHighWater(view.cut.nextSurfaceIdHighWater, targets.count { it.id == null })
             ?: return refuse(CanonicalMutationRefusal.EXHAUSTED)
-        val rows = ArrayList<SurfaceOwner>(targets.size)
+        val rows = preparationWorkspace.depthRows
+        rows.clear()
         targets.forEachIndexed { index, target ->
             val location = CompactLocation(configuration, target.voxel)
                 ?: return refuse(CanonicalMutationRefusal.INVALID_OWNERSHIP)
@@ -1280,12 +1429,15 @@ internal class MutableCanonicalOverlay private constructor(
                 ),
             )
         } catch (_: ArithmeticException) { return refuse(CanonicalMutationRefusal.JOURNAL_EXHAUSTED) }
-        if (preflightRetainedBytes > CompactCanonicalStore.JOURNAL_RESERVE_BYTES - WRITER_SCRATCH_BYTES ||
-            preflightConstructionBytes > CompactCanonicalStore.JOURNAL_RESERVE_BYTES
+        if (preflightRetainedBytes > DEPTH_PLANNER_RESERVE_BYTES - WRITER_SCRATCH_BYTES ||
+            preflightConstructionBytes > DEPTH_PLANNER_RESERVE_BYTES
         ) return refuse(CanonicalMutationRefusal.JOURNAL_EXHAUSTED)
-        val supportPairs = ArrayList<PreparedSupport>(supportPairCount.toInt())
-        val lineagePairs = ArrayList<LineageEdge>(scalars.lineageEdges.toInt())
-        val removedSupportTargets = HashSet<SurfaceId>()
+        val supportPairs = preparationWorkspace.depthSupportPairs
+        val lineagePairs = preparationWorkspace.depthLineagePairs
+        val removedSupportTargets = preparationWorkspace.depthRemovedSupportTargets
+        supportPairs.clear()
+        lineagePairs.clear()
+        removedSupportTargets.clear()
         fun addSupport(targetIndex: Int, source: ImmutableSourceSupport) {
             supportPairs += PreparedSupport(SurfaceId(allocatedIds[targetIndex]), source)
         }
@@ -1391,21 +1543,45 @@ internal class MutableCanonicalOverlay private constructor(
         private const val DEPTH_SOURCE_GRAPH_BYTES = 48L
         private const val DEPTH_TARGET_GRAPH_BYTES = 32L
         private const val DEPTH_OPERATION_GRAPH_BYTES = 64L
+        // The immutable command is owned by the caller and survives both
+        // planner phases. These terms cover its list/object graph separately
+        // from the encoded record and the materialized mutation graph.
+        private const val DEPTH_COMMAND_FIXED_BYTES = 256L
+        private const val DEPTH_COMMAND_OPERATION_BYTES = 32L
+        private const val DEPTH_COMMAND_SOURCE_BYTES = 8L
+        private const val DEPTH_COMMAND_TARGET_BYTES = 60L
+        // Planner workspace is transient and can outlive the one MiB wire
+        // record while the authenticated read cache is borrowed. Four MiB is
+        // the bounded cardinality allowance for a dense 4,096-target batch;
+        // the wire record remains constrained by JOURNAL_RESERVE_BYTES and
+        // caller config.
+        private const val DEPTH_PLANNER_RESERVE_BYTES = 4L * 1_048_576L
+        private const val DEPTH_READ_CACHE_FIXED_BYTES = 256L
+        private const val DEPTH_READ_CACHE_ENTRY_BYTES = 64L
         private const val DEPTH_SUPPORT_DETAILS_BYTES_PER_RECORD = 128L
         private const val DEPTH_SUPPORT_SCRATCH_BYTES_PER_RECORD = 8L
         private const val DEPTH_SUPPORT_CACHE_FIXED_BYTES = 64L
         private const val DEPTH_SUPPORT_CACHE_ENTRY_BYTES = 128L
 
-        fun prepare(view: CanonicalStateView, configuration: SurfaceOwnershipConfiguration, command: FeatureMutationCommand) =
-            MutableCanonicalOverlay(view, configuration).prepareFeature(command)
+        fun prepare(
+            view: CanonicalStateView,
+            configuration: SurfaceOwnershipConfiguration,
+            command: FeatureMutationCommand,
+            workspace: CanonicalPreparationWorkspace = CanonicalPreparationWorkspace(),
+        ) = MutableCanonicalOverlay(view, configuration, workspace).prepareFeature(command)
 
-        fun prepare(view: CanonicalStateView, configuration: SurfaceOwnershipConfiguration, command: CanonicalTransactionCommand) =
-            MutableCanonicalOverlay(view, configuration).prepareStructural(command)
+        fun prepare(
+            view: CanonicalStateView,
+            configuration: SurfaceOwnershipConfiguration,
+            command: CanonicalTransactionCommand,
+            workspace: CanonicalPreparationWorkspace = CanonicalPreparationWorkspace(),
+        ) = MutableCanonicalOverlay(view, configuration, workspace).prepareStructural(command)
 
         fun prepare(
             view: CanonicalFeaturePlanningView,
             configuration: SurfaceOwnershipConfiguration,
             command: CanonicalFeatureBatchCommand,
+            workspace: CanonicalPreparationWorkspace = CanonicalPreparationWorkspace(),
         ): CanonicalMutationPreparation {
             if (!validCommandId(command.commandId)) return featureBatchRefusal(
                 view.cut, CanonicalMutationRefusal.INVALID_COMMAND,
@@ -1431,14 +1607,15 @@ internal class MutableCanonicalOverlay private constructor(
                     view.cut.nextSurfaceIdHighWater, view.cut.liveSurfaceCount,
                 ),
             )
-            return MutableCanonicalOverlay(view, configuration).prepareFeatureBatch(command, accepted)
+            return MutableCanonicalOverlay(view, configuration, workspace).prepareFeatureBatch(command, accepted)
         }
 
         fun prepare(
             view: CanonicalStateView,
             configuration: SurfaceOwnershipConfiguration,
             command: CanonicalEvidenceBatchCommand,
-        ): CanonicalMutationPreparation = MutableCanonicalOverlay(view, configuration).prepareEvidenceBatch(command)
+            workspace: CanonicalPreparationWorkspace = CanonicalPreparationWorkspace(),
+        ): CanonicalMutationPreparation = MutableCanonicalOverlay(view, configuration, workspace).prepareEvidenceBatch(command)
 
         internal fun featureBatchBudget(
             configuration: SurfaceOwnershipConfiguration,
@@ -1560,7 +1737,7 @@ private sealed interface DepthBatchPreflightResult {
 }
 
 private typealias DepthBatchSupportMode = DepthEvidenceSupportMode
-private typealias DepthBatchOperationKind = DepthEvidenceOperationKind
+internal typealias DepthBatchOperationKind = DepthEvidenceOperationKind
 
 /** One depth-kernel delta admitted as one canonical surface transaction. */
 internal class CanonicalEvidenceBatchCommand(
@@ -2079,16 +2256,54 @@ internal class PreparedSourceTable(
     }
 }
 
-private class BoundedSupportAccumulator(val limit: Int) {
-    private var capacity = if (limit == 0) 0 else 1
+internal class BoundedSupportAccumulator(initialLimit: Int = 0) {
+    private var limit = 0
+    private var capacity = 0
     private var ids = LongArray(capacity)
     private var x = IntArray(capacity); private var y = IntArray(capacity); private var z = IntArray(capacity)
     private var normal = IntArray(capacity); private var confidence = IntArray(capacity)
     private var fingerprints = ByteArray(capacity * 32)
-    private val hash = IntArray(hashCapacity(limit))
-    private val mask = hash.size - 1
+    private var hash = IntArray(hashCapacity(0))
+    private var mask = hash.size - 1
     var size = 0
         private set
+
+    init { reset(initialLimit) }
+
+    /** Clears this bounded accumulator and grows storage only for a larger limit. */
+    internal fun reset(newLimit: Int): Boolean {
+        require(newLimit >= 0)
+        val requiredHash = hashCapacity(newLimit)
+        val grew = capacity < (if (newLimit == 0) 0 else 1) || hash.size < requiredHash
+        limit = newLimit
+        if (hash.size < requiredHash) hash = IntArray(requiredHash)
+        else hash.fill(0)
+        mask = hash.size - 1
+        if (newLimit > capacity) {
+            val next = maxOf(1, newLimit.coerceAtMost(Int.MAX_VALUE))
+            ids = LongArray(next); x = IntArray(next); y = IntArray(next); z = IntArray(next)
+            normal = IntArray(next); confidence = IntArray(next); fingerprints = ByteArray(next * 32)
+            capacity = next
+        }
+        size = 0
+        return grew
+    }
+
+    internal fun retainedBytes(): Long =
+        ids.size * 8L + (x.size + y.size + z.size + normal.size + confidence.size) * 4L +
+            fingerprints.size + hash.size * 4L
+
+    internal fun clearStorage() {
+        limit = 0
+        capacity = 0
+        ids = LongArray(0)
+        x = IntArray(0); y = IntArray(0); z = IntArray(0)
+        normal = IntArray(0); confidence = IntArray(0)
+        fingerprints = ByteArray(0)
+        hash = IntArray(2)
+        mask = 1
+        size = 0
+    }
 
     fun add(source: PagedSource): Boolean {
         var slot = mix(source.id.value) and mask
@@ -2110,7 +2325,11 @@ private class BoundedSupportAccumulator(val limit: Int) {
 
     fun freeze(): PreparedSourceTable {
         sort(0, size - 1)
-        return PreparedSourceTable(ids, x, y, z, normal, confidence, fingerprints, size, limit, hash.size * 4L)
+        return PreparedSourceTable(
+            ids.copyOf(size), x.copyOf(size), y.copyOf(size), z.copyOf(size),
+            normal.copyOf(size), confidence.copyOf(size), fingerprints.copyOf(size * 32),
+            size, limit, hash.size * 4L,
+        )
     }
 
     private fun ensureCapacity(required: Int) {

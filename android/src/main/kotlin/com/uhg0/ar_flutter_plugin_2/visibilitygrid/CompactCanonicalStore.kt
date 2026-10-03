@@ -46,6 +46,50 @@ internal interface CanonicalStateView : CanonicalFeaturePlanningView, AutoClosea
     ): CanonicalBoundedReadResult<CompactSurface?> =
         CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.CANONICAL_READ_FAILURE)
 
+    /** Scalar bounded lookup destination for depth admission. */
+    fun findByVoxelBoundedInto(
+        x: Int,
+        y: Int,
+        z: Int,
+        maximumPageReads: Long,
+        maximumBytesRead: Long,
+        scratch: CanonicalSurfaceScratch,
+    ): CanonicalBoundedReadResult<Boolean> {
+        val result = findByVoxelBounded(Voxel(x, y, z), maximumPageReads, maximumBytesRead)
+        return when (result) {
+            is CanonicalBoundedReadResult.Complete -> {
+                val row = result.value
+                if (row == null) scratch.clear() else scratch.set(
+                    row.id.value, row.voxel.x, row.voxel.y, row.voxel.z,
+                    row.packedNormal, row.normalConfidence, 0,
+                )
+                CanonicalBoundedReadResult.Complete(row != null, result.work)
+            }
+            is CanonicalBoundedReadResult.Refused -> CanonicalBoundedReadResult.Refused(result.reason, result.work)
+        }
+    }
+
+    /** Scalar identity lookup destination for depth validation. */
+    fun findByIdBoundedInto(
+        id: Long,
+        maximumPageReads: Long,
+        maximumBytesRead: Long,
+        scratch: CanonicalSurfaceScratch,
+    ): CanonicalBoundedReadResult<Boolean> {
+        val result = findByIdBounded(SurfaceId(id), maximumPageReads, maximumBytesRead)
+        return when (result) {
+            is CanonicalBoundedReadResult.Complete -> {
+                val row = result.value
+                if (row == null) scratch.clear() else scratch.set(
+                    row.id.value, row.voxel.x, row.voxel.y, row.voxel.z,
+                    row.packedNormal, row.normalConfidence, 0,
+                )
+                CanonicalBoundedReadResult.Complete(row != null, result.work)
+            }
+            is CanonicalBoundedReadResult.Refused -> CanonicalBoundedReadResult.Refused(result.reason, result.work)
+        }
+    }
+
     fun readPage(region: StorageRegion, page: Int, cursor: Int, limit: Int): CompactPage
 
     override fun readSourceById(id: SurfaceId): CanonicalPageRead<PagedSource?>
@@ -806,6 +850,82 @@ private constructor(
         CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED)
     } else CanonicalBoundedReadResult.Complete(findByVoxel(voxel), CanonicalReadWork.ZERO)
 
+    override fun findByVoxelBoundedInto(
+        x: Int,
+        y: Int,
+        z: Int,
+        maximumPageReads: Long,
+        maximumBytesRead: Long,
+        scratch: CanonicalSurfaceScratch,
+    ): CanonicalBoundedReadResult<Boolean> {
+        if (maximumPageReads < 0L || maximumBytesRead < 0L) {
+            return CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED)
+        }
+        if (closed) {
+            scratch.clear()
+            return CanonicalBoundedReadResult.Complete(false, CanonicalReadWork.ZERO)
+        }
+        var low = 0
+        var high = rowCount - 1
+        while (low <= high) {
+            inspectedRowWork++
+            val mid = (low + high) ushr 1
+            val slot = voxelOrder[mid]
+            when (val comparison = compareVoxel(rowX[slot], rowY[slot], rowZ[slot], x, y, z)) {
+                in Int.MIN_VALUE until 0 -> low = mid + 1
+                in 1..Int.MAX_VALUE -> high = mid - 1
+                else -> {
+                    scratch.set(
+                        unsigned(rowId[slot]), rowX[slot], rowY[slot], rowZ[slot],
+                        rowNormal[slot].toInt() and 0xffff,
+                        rowConfidence[slot].toInt() and 0xff,
+                        lineageCountFor(unsigned(rowId[slot])),
+                    )
+                    return CanonicalBoundedReadResult.Complete(true, CanonicalReadWork.ZERO)
+                }
+            }
+        }
+        scratch.clear()
+        return CanonicalBoundedReadResult.Complete(false, CanonicalReadWork.ZERO)
+    }
+
+    override fun findByIdBoundedInto(
+        id: Long,
+        maximumPageReads: Long,
+        maximumBytesRead: Long,
+        scratch: CanonicalSurfaceScratch,
+    ): CanonicalBoundedReadResult<Boolean> {
+        if (maximumPageReads < 0L || maximumBytesRead < 0L) {
+            return CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED)
+        }
+        if (closed || id !in 1L..UINT32_MAX) {
+            scratch.clear()
+            return CanonicalBoundedReadResult.Complete(false, CanonicalReadWork.ZERO)
+        }
+        var low = 0
+        var high = rowCount - 1
+        while (low <= high) {
+            inspectedRowWork++
+            val mid = (low + high) ushr 1
+            val slot = idOrder[mid]
+            when (unsignedCompare(unsigned(rowId[slot]), id)) {
+                in Int.MIN_VALUE until 0 -> low = mid + 1
+                in 1..Int.MAX_VALUE -> high = mid - 1
+                else -> {
+                    scratch.set(
+                        unsigned(rowId[slot]), rowX[slot], rowY[slot], rowZ[slot],
+                        rowNormal[slot].toInt() and 0xffff,
+                        rowConfidence[slot].toInt() and 0xff,
+                        lineageCountFor(id),
+                    )
+                    return CanonicalBoundedReadResult.Complete(true, CanonicalReadWork.ZERO)
+                }
+            }
+        }
+        scratch.clear()
+        return CanonicalBoundedReadResult.Complete(false, CanonicalReadWork.ZERO)
+    }
+
     override fun readPage(
         region: StorageRegion,
         page: Int,
@@ -1028,6 +1148,18 @@ private constructor(
             rowNormal[slot].toInt() and 0xffff,
             rowConfidence[slot].toInt() and 0xff,
         )
+
+    private fun lineageCountFor(id: Long): Int {
+        var low = 0
+        var high = lineageSource.size
+        while (low < high) {
+            val middle = (low + high) ushr 1
+            if (unsignedCompare(unsigned(lineageSource[middle]), id) < 0) low = middle + 1 else high = middle
+        }
+        var count = 0
+        while (low + count < lineageSource.size && unsigned(lineageSource[low + count]) == id) count++
+        return count.coerceAtMost(0xffff)
+    }
 
     private fun entry(index: Int) = directory.entry(index)
 

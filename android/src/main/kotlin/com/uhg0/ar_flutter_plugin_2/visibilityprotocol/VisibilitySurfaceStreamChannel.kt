@@ -18,6 +18,7 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.ArrayDeque
+import java.util.zip.CRC32
 
 /** Small seam so lifecycle deadlines are deterministic in the JVM corpus. */
 fun interface TimeoutHandle {
@@ -141,6 +142,15 @@ class VisibilitySurfaceStreamChannel(
     private val structuralFrames = ArrayDeque<TransactionFrameV1>()
     private var structuralFrameCursor = 0
     private var queuedResponseProfile: TransactionResponseProfileV1? = null
+    /**
+     * A renderer cut that has started owns the next few stream turns.  A
+     * queued structural frame remains retained until the style pages and the
+     * final empty acknowledgement have completed.  Without this small lease,
+     * each style continuation can return the next geometry frame and a busy
+     * observation producer can starve the picture cut indefinitely.
+     */
+    @Volatile private var rendererStylePriority = false
+    @Volatile private var rendererStyleAcknowledgementPending = false
     @Volatile private var committedBaseline =
         controlLifecycle?.committedBaseline() ?: CommittedBaselineV1.ZERO
     @Volatile private var queuedTransactionBaseline: CommittedBaselineV1? = null
@@ -222,30 +232,25 @@ class VisibilitySurfaceStreamChannel(
      * without making another payload copy or exposing frame storage.
      */
     internal fun hasExactQueuedCurrentDelta(
-        selector: CurrentDeltaSelectorV1,
-        baseGeometryRevision: Long,
-        bytes: ByteArray,
+        receipt: CurrentDeltaReceiptV1,
     ): Boolean = synchronized(structuralFrames) {
+        val selector = receipt.selector
         val begin = (structuralFrames.firstOrNull() as? TransactionBeginFrameV1)?.value
             ?: return@synchronized false
         if (begin.transactionId != selector.transactionId ||
-            begin.baseGeometryRevision != baseGeometryRevision ||
+            begin.baseGeometryRevision != receipt.baseGeometryRevision ||
             begin.targetGeometryRevision != selector.targetGeometryRevision ||
             begin.targetLineageRevision != selector.targetLineageRevision ||
-            begin.totalBytes != bytes.size
+            begin.totalBytes != receipt.byteCount
         ) return@synchronized false
         var offset = 0
-        structuralFrames.drop(1).dropLast(1).forEach { frame ->
-            val chunk = (frame as? TransactionChunkFrameV1)?.value
-                ?: return@synchronized false
-            if (offset + chunk.bytes.size > bytes.size ||
-                chunk.bytes.indices.any { index -> bytes[offset + index] != chunk.bytes[index] }
-            ) {
-                return@synchronized false
-            }
+        for (frame in structuralFrames) {
+            if (frame !is TransactionChunkFrameV1) continue
+            val chunk = frame.value
+            if (!receipt.matchesPayloadRange(offset, chunk.bytes)) return@synchronized false
             offset += chunk.bytes.size
         }
-        offset == bytes.size
+        offset == receipt.byteCount
     }
 
     /**
@@ -256,6 +261,12 @@ class VisibilitySurfaceStreamChannel(
     fun queueStructuralTransaction(
         frames: List<TransactionFrameV1>,
         responseProfile: TransactionResponseProfileV1,
+    ) = queueStructuralTransaction(frames, responseProfile, snapshotForeignFrames = true)
+
+    private fun queueStructuralTransaction(
+        frames: List<TransactionFrameV1>,
+        responseProfile: TransactionResponseProfileV1,
+        snapshotForeignFrames: Boolean,
     ) {
         require(frames.isNotEmpty()) { "A structural transaction cannot be empty" }
         synchronized(this) {
@@ -263,7 +274,8 @@ class VisibilitySurfaceStreamChannel(
             validateStructuralTransaction(frames, responseProfile)
             synchronized(structuralFrames) {
                 check(structuralFrames.isEmpty()) { "A structural transaction is already queued" }
-                frames.map(::copyStructuralFrame).forEach { structuralFrames.addLast(it) }
+                val retainedFrames = if (snapshotForeignFrames) frames.map(::copyStructuralFrame) else frames
+                retainedFrames.forEach { structuralFrames.addLast(it) }
                 structuralFrameCursor = 0
                 queuedResponseProfile = responseProfile
                 telemetry.retainedStructuralStaging(structuralPayloadBytes())
@@ -277,7 +289,7 @@ class VisibilitySurfaceStreamChannel(
         }
     }
 
-    /** Selects, snapshots, frames, and queues exactly one named current delta. */
+    /** Selects one immutable receipt and transfers freshly produced frames to the queue. */
     fun queueCurrentDelta(
         source: CurrentDeltaSourceV1,
         selector: CurrentDeltaSelectorV1,
@@ -287,16 +299,12 @@ class VisibilitySurfaceStreamChannel(
             "The named current delta is not retained"
         }
         require(receipt.selector == selector) { "Current-delta source returned a different receipt" }
+        // These new chunk arrays have never crossed a caller boundary. Their
+        // only owner becomes this queue, which retains them through exact ACK.
         queueStructuralTransaction(
-            StructuralTransactionProducerV1.produce(
-                transactionId = selector.transactionId,
-                baseGeometryRevision = receipt.baseGeometryRevision,
-                targetGeometryRevision = selector.targetGeometryRevision,
-                targetLineageRevision = selector.targetLineageRevision,
-                bytes = receipt.bytes,
-                responseProfile = responseProfile,
-            ),
+            receipt.produceFrames(responseProfile),
             responseProfile,
+            snapshotForeignFrames = false,
         )
     }
 
@@ -470,7 +478,7 @@ class VisibilitySurfaceStreamChannel(
                                                 throw BindingError(REPLAY_CONFLICT_ERROR_ID)
                                             }
                                             telemetry.replayed()
-                                            lastResponse!!.copyOf()
+                                            lastResponse!!
                                         }
                                         previousSequence != null && request.requestSequence <= previousSequence -> {
                                             throw BindingError(STALE_SEQUENCE_ERROR_ID)
@@ -491,7 +499,15 @@ class VisibilitySurfaceStreamChannel(
                                                 !isValidResyncRequest(request)) {
                                                 throw BindingError(TRANSACTION_STATE_ERROR_ID)
                                             }
-                                            val hasCommitFrame = nextStructuralFrame() is TransactionCommitFrameV1
+                                            val styleAcknowledgementRequest =
+                                                rendererStylePriority &&
+                                                    rendererStyleAcknowledgementPending &&
+                                                    request.commandBytes.isEmpty() &&
+                                                    request.nextStyleRevision == committedBaseline.styleRevision
+                                            val hasCommitFrame =
+                                                nextStructuralFrame() is TransactionCommitFrameV1 &&
+                                                    request.commandBytes.isEmpty() &&
+                                                    !styleAcknowledgementRequest
                                             if (hasCommitFrame) {
                                                 beforeAuthorityPublication?.invoke()
                                             }
@@ -499,10 +515,7 @@ class VisibilitySurfaceStreamChannel(
                                                 if (disposed.get() || bindingAbandoned.get()) {
                                                     throw BindingError(STREAM_BINDING_ABANDONED_ERROR_ID)
                                                 }
-                                                val publishesCommit = nextStructuralFrame() is TransactionCommitFrameV1
-                                                if (publishesCommit) {
-                                                    afterAuthorityPublicationFenceAcquired?.invoke()
-                                                }
+                                                var publishesCommit = false
                                                 controlLifecycle?.let {
                                                     committedBaseline = it.committedBaseline()
                                                 }
@@ -515,17 +528,11 @@ class VisibilitySurfaceStreamChannel(
                                                     ) {
                                                         throw BindingError(MALFORMED_PACKET_ERROR_ID)
                                                     }
-                                                    RendererStyleCommandV1.decode(request.commandBytes).also { page ->
-                                                        if (admitRendererStylePage?.invoke(page) == false ||
-                                                            request.nextStyleRevision != page.styleRevision ||
-                                                            !rendererStyleStaging.canAccept(
-                                                                page,
-                                                                committedBaseline.styleRevision,
-                                                            )
-                                                        ) {
-                                                            throw BindingError(TRANSACTION_STATE_ERROR_ID)
-                                                        }
-                                                    }
+                                                    // Decode before the structural ACK, but defer all style
+                                                    // admission until after that ACK has cleared the previous
+                                                    // renderer staging. A style page can describe the current
+                                                    // style revision on the newly acknowledged geometry cut.
+                                                    RendererStyleCommandV1.decode(request.commandBytes)
                                                 } else {
                                                     null
                                                 }
@@ -533,6 +540,52 @@ class VisibilitySurfaceStreamChannel(
                                                 if (!requiresResync) {
                                                     acknowledgedStructuralBaseline =
                                                         acknowledgePendingStructuralTransaction(request)
+                                                }
+                                                rendererStyleCommand?.let { page ->
+                                                    val acknowledgedCutMatches =
+                                                        page.transactionId == committedBaseline.transactionId &&
+                                                            page.geometryRevision == committedBaseline.geometryRevision &&
+                                                            page.lineageRevision == committedBaseline.lineageRevision &&
+                                                            (acknowledgedStructuralBaseline != null ||
+                                                                (request.acknowledgedTransactionId ==
+                                                                    committedBaseline.transactionId &&
+                                                                    request.acknowledgedGeometryRevision ==
+                                                                        committedBaseline.geometryRevision &&
+                                                                    request.acknowledgedLineageRevision ==
+                                                                        committedBaseline.lineageRevision &&
+                                                                    request.nextStyleRevision ==
+                                                                        committedBaseline.styleRevision))
+                                                    if (admitRendererStylePage?.invoke(page) == false ||
+                                                        request.nextStyleRevision != page.styleRevision ||
+                                                        !rendererStyleStaging.canAccept(
+                                                            page,
+                                                            committedBaseline.styleRevision,
+                                                            allowCurrentRevisionForGeometryCut = acknowledgedCutMatches,
+                                                        )
+                                                    ) {
+                                                        throw BindingError(TRANSACTION_STATE_ERROR_ID)
+                                                    }
+                                                }
+                                                val styleMatchesCommittedBaseline = rendererStyleCommand?.let { page ->
+                                                    page.transactionId == committedBaseline.transactionId &&
+                                                        page.geometryRevision == committedBaseline.geometryRevision &&
+                                                        page.lineageRevision == committedBaseline.lineageRevision
+                                                } == true
+                                                val stylePageNeedsPriority = rendererStyleCommand?.let { page ->
+                                                    page.pageCount > 1 || page.pageIndex > 0
+                                                } == true
+                                                val deferStructuralForStyle =
+                                                    !requiresResync &&
+                                                        ((styleMatchesCommittedBaseline && stylePageNeedsPriority) ||
+                                                            (rendererStylePriority &&
+                                                                rendererStyleAcknowledgementPending &&
+                                                                request.commandBytes.isEmpty() &&
+                                                                request.nextStyleRevision == committedBaseline.styleRevision))
+                                                publishesCommit =
+                                                    nextStructuralFrame() is TransactionCommitFrameV1 &&
+                                                        !deferStructuralForStyle
+                                                if (publishesCommit) {
+                                                    afterAuthorityPublicationFenceAcquired?.invoke()
                                                 }
                                                 val publicationBytes = PacketCodec.encodeResponse(
                                                     when {
@@ -574,12 +627,23 @@ class VisibilitySurfaceStreamChannel(
                                                     }
                                                     else -> {
                                                         // Prove the complete response path before a final style page
-                                                        // can invoke its irreversible renderer callback.
+                                                        // can invoke its irreversible renderer callback. The style
+                                                        // lease may defer returning that frame, but it still proves
+                                                        // that the retained structural response fits this request.
                                                         validateNextStructuralResponse(request)
                                                         rendererStyleCommand?.let { page ->
+                                                            if (styleMatchesCommittedBaseline && stylePageNeedsPriority) {
+                                                                rendererStylePriority = true
+                                                                if (page.pageIndex == 0) {
+                                                                    rendererStyleAcknowledgementPending = false
+                                                                }
+                                                            }
                                                             when (val staged = rendererStyleStaging.accept(page)) {
                                                                 is RendererStyleCommandStagingV1.Result.Progress -> Unit
                                                                 is RendererStyleCommandStagingV1.Result.Complete -> {
+                                                                    rendererStyleAcknowledgementPending =
+                                                                        styleMatchesCommittedBaseline &&
+                                                                            stylePageNeedsPriority
                                                                     val applied = onRendererStyleCut?.invoke(staged.cut)
                                                                         ?: throw IllegalStateException(
                                                                             "Renderer-style owner is unavailable",
@@ -616,7 +680,24 @@ class VisibilitySurfaceStreamChannel(
                                                                 committedBaseline,
                                                             )
                                                         }
-                                                        nextStructuralResponse(request)
+                                                        if (deferStructuralForStyle) {
+                                                            if (rendererStyleAcknowledgementPending &&
+                                                                request.commandBytes.isEmpty()) {
+                                                                rendererStyleAcknowledgementPending = false
+                                                                rendererStylePriority = false
+                                                            }
+                                                            PacketCodec.noChanges(
+                                                                streamToken = request.streamToken,
+                                                                requestSequence = request.requestSequence,
+                                                                nextExpectedRequestSequence = request.requestSequence + 1,
+                                                                transactionId = committedBaseline.transactionId,
+                                                                targetGeometryRevision = committedBaseline.geometryRevision,
+                                                                targetLineageRevision = committedBaseline.lineageRevision,
+                                                                acceptedStyleRevision = committedBaseline.styleRevision,
+                                                            )
+                                                        } else {
+                                                            nextStructuralResponse(request)
+                                                        }
                                                     }
                                                     },
                                                     request.maximumResponseBytes,
@@ -637,9 +718,11 @@ class VisibilitySurfaceStreamChannel(
                                             } else {
                                                 request.requestSequence + 1
                                             }
-                                            lastRequest = bytes.copyOf()
-                                            lastResponse = encoded.copyOf()
-                                            telemetry.allocated(bytes.size + encoded.size)
+                                            // Ingress owns bytes; qualify() copies the reply into
+                                            // platform storage. Neither private array is writable
+                                            // by the messenger, so replay needs no second clone.
+                                            lastRequest = bytes
+                                            lastResponse = encoded
                                             telemetry.retainedReplayCache(bytes.size, encoded.size)
                                             telemetry.accepted(bytes.size, encoded.size)
                                             encoded
@@ -647,6 +730,8 @@ class VisibilitySurfaceStreamChannel(
                                     }
                                 } catch (error: BindingError) {
                                     rendererStyleStaging.clear()
+                                    rendererStylePriority = false
+                                    rendererStyleAcknowledgementPending = false
                                     telemetry.rejected()
                                     val sequence = if (bytes.size >= PacketCodec.requestHeaderBytes) {
                                         ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getLong(64)
@@ -666,6 +751,8 @@ class VisibilitySurfaceStreamChannel(
                                     )
                                 } catch (_: Exception) {
                                     rendererStyleStaging.clear()
+                                    rendererStylePriority = false
+                                    rendererStyleAcknowledgementPending = false
                                     telemetry.malformed()
                                     val sequence = if (bytes.size >= PacketCodec.requestHeaderBytes) {
                                         ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getLong(64)
@@ -718,8 +805,8 @@ class VisibilitySurfaceStreamChannel(
 
     private fun authenticatedPayload(bytes: ByteArray): ByteArray? {
         val qualifier = bindingQualifier ?: return bytes
-        if (bytes.size < qualifier.size ||
-            !bytes.copyOfRange(0, qualifier.size).contentEquals(qualifier)) return null
+        if (bytes.size < qualifier.size) return null
+        for (index in qualifier.indices) if (bytes[index] != qualifier[index]) return null
         return bytes.copyOfRange(qualifier.size, bytes.size)
     }
 
@@ -860,6 +947,8 @@ class VisibilitySurfaceStreamChannel(
 
     private fun clearPreparedStaging() {
         rendererStyleStaging.clear()
+        rendererStylePriority = false
+        rendererStyleAcknowledgementPending = false
         lastRequest = null
         lastResponse = null
         resyncPending = false
@@ -1044,10 +1133,11 @@ class VisibilitySurfaceStreamChannel(
         require(begin.totalBytes in 0..StructuralTransactionLimits.MAX_STRUCTURAL_TRANSACTION_BYTES)
         require(begin.chunkCount in 0..StructuralTransactionLimits.MAX_CHUNK_COUNT)
         var totalBytes = 0
-        frames.drop(1).dropLast(1).forEachIndexed { index, frame ->
-            val chunk = (frame as? TransactionChunkFrameV1)?.value
+        val checksum = CRC32()
+        for (frameIndex in 1 until frames.lastIndex) {
+            val chunk = (frames[frameIndex] as? TransactionChunkFrameV1)?.value
                 ?: error("Structural transaction contains a non-CHUNK frame")
-            require(chunk.transactionId == begin.transactionId && chunk.chunkIndex == index)
+            require(chunk.transactionId == begin.transactionId && chunk.chunkIndex == frameIndex - 1)
             require(chunk.bytes.isNotEmpty())
             require(chunk.offset == null || chunk.offset == totalBytes)
             val expectedChunkBytes = minOf(responseProfile.chunkPayloadBytes, begin.totalBytes - totalBytes)
@@ -1056,12 +1146,11 @@ class VisibilitySurfaceStreamChannel(
             }
             totalBytes = Math.addExact(totalBytes, chunk.bytes.size)
             require(totalBytes <= begin.totalBytes)
+            checksum.update(chunk.bytes)
         }
         require(totalBytes == begin.totalBytes)
         require(commit.payloadChecksum == begin.payloadChecksum)
-        require(TransactionResponseCodecV1.payloadChecksum(
-            frames.drop(1).dropLast(1).flatMap { (it as TransactionChunkFrameV1).value.bytes.toList() }.toByteArray(),
-        ) == begin.payloadChecksum)
+        require(checksum.value == begin.payloadChecksum)
     }
 
     private fun structuralPayloadBytes(): Int = synchronized(structuralFrames) {
@@ -1094,6 +1183,13 @@ class VisibilitySurfaceStreamChannel(
             structuralFrames.clear()
             structuralFrameCursor = 0
             queuedResponseProfile = null
+            // A style page may have been admitted on the request that
+            // returned the structural frame.  The canonical ACK starts a new
+            // cut, so discard that incomplete renderer cut before the worker
+            // replays it against the acknowledged baseline.
+            rendererStyleStaging.clear()
+            rendererStylePriority = false
+            rendererStyleAcknowledgementPending = false
             telemetry.retainedStructuralStaging(0)
             controlLifecycle?.setCommittedBaseline(committedBaseline)
             return committedBaseline
@@ -1174,8 +1270,8 @@ class VisibilitySurfaceStreamChannel(
                 resyncPending = true
                 lastSequence = request.requestSequence
                 nextExpectedSequence = request.requestSequence + 1
-                lastRequest = bytes.copyOf()
-                lastResponse = response.copyOf()
+                lastRequest = bytes
+                lastResponse = response
                 telemetry.retainedReplayCache(bytes.size, response.size)
                 telemetry.accepted(bytes.size, response.size)
                 response

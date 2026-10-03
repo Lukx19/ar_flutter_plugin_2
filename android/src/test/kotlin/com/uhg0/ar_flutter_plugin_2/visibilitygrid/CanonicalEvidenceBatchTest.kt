@@ -58,6 +58,147 @@ class CanonicalEvidenceBatchTest {
     }
 
     @Test
+    fun `dense create and refine batch fits when admission phases do not overlap`() {
+        val rows = (1L..603L).map { id -> surface(id, id.toInt()) }
+        val creates = (0 until 819).map { index ->
+            DepthEvidenceChange.Create(
+                CanonicalTarget(null, Voxel(1_000 + index, 1, 0), 0, 0, 192),
+            )
+        }
+        val refines = (1L..603L).map { id ->
+            DepthEvidenceChange.Refine(
+                SurfaceId(id),
+                CanonicalTarget(SurfaceId(id), Voxel(id.toInt(), 0, 0), 0, 0, 192),
+            )
+        }
+        val preparation = MutableCanonicalOverlay.prepare(
+            TestView(rows, high = 604, geometry = 7, lineage = 5),
+            SurfaceOwnershipConfiguration(changeJournalByteCapacity = 1_048_576),
+            CanonicalEvidenceBatchCommand(
+                "dense-phase-peak", 7, 5, creates + refines,
+            ),
+        ) as CanonicalMutationPreparation.Prepared
+
+        try {
+            assertEquals(1_422, dirtyRows(preparation.mutation).size)
+            assertEquals(819, dirtySupport(preparation.mutation).size)
+        } finally {
+            preparation.mutation.discard()
+        }
+    }
+
+    @Test
+    fun `low overlap cardinality remains within the bounded planner reserve`() {
+        val refineCount = 729
+        val createCount = 826
+        val rows = (1L..refineCount.toLong()).map { id ->
+            CompactSurface(SurfaceId(id), gridVoxel((id - 1L).toInt(), 0), 0, 192)
+        }
+        val creates = (0 until createCount).map { index ->
+            DepthEvidenceChange.Create(
+                CanonicalTarget(null, gridVoxel(index, 1), 0, 0, 192),
+            )
+        }
+        val refines = (1L..refineCount.toLong()).map { id ->
+            DepthEvidenceChange.Refine(
+                SurfaceId(id),
+                CanonicalTarget(SurfaceId(id), gridVoxel((id - 1L).toInt(), 0), 0, 0, 192),
+            )
+        }
+        val preparation = MutableCanonicalOverlay.prepare(
+            TestView(rows, high = refineCount + 1L, geometry = 7, lineage = 5),
+            SurfaceOwnershipConfiguration(changeJournalByteCapacity = 1_048_576),
+            CanonicalEvidenceBatchCommand(
+                "dense-low-overlap", 7, 5, creates + refines,
+            ),
+        ) as CanonicalMutationPreparation.Prepared
+
+        try {
+            assertEquals(1_555, dirtyRows(preparation.mutation).size)
+            assertEquals(createCount, dirtySupport(preparation.mutation).size)
+        } finally {
+            preparation.mutation.discard()
+        }
+    }
+
+    @Test
+    fun `four thousand ninety six create changes fit the bounded planner reserve`() {
+        val count = 4_096
+        val changes = (0 until count).map { index ->
+            DepthEvidenceChange.Create(
+                CanonicalTarget(null, gridVoxel(index, 0), 0, 0, 192),
+            )
+        }
+        val workspace = CanonicalPreparationWorkspace()
+        val preparation = MutableCanonicalOverlay.prepare(
+            TestView(emptyList(), high = 1, geometry = 7, lineage = 5),
+            SurfaceOwnershipConfiguration(
+                surfaceCapacity = count,
+                lineageCapacity = count,
+                changeJournalByteCapacity = 1_048_576,
+            ),
+            CanonicalEvidenceBatchCommand("dense-create-4096", 7, 5, changes),
+            workspace,
+        ) as CanonicalMutationPreparation.Prepared
+
+        try {
+            assertEquals(count, dirtyRows(preparation.mutation).size)
+            assertEquals(count, dirtySupport(preparation.mutation).size)
+            assertTrue(workspace.ownedCapacityBytes <= 4L * 1024L * 1024L)
+        } finally {
+            preparation.mutation.discard()
+        }
+    }
+
+    @Test
+    fun `four thousand ninety six refine changes fit the bounded planner reserve`() {
+        val count = 4_096
+        val rows = (1L..count.toLong()).map { id ->
+            CompactSurface(SurfaceId(id), gridVoxel((id - 1L).toInt(), 0), 0, 192)
+        }
+        val supports = rows.associate { row ->
+            row.id.value to listOf(
+                PagedSupport(
+                    row.id,
+                    PagedSource(
+                        SurfaceId(10_000L + row.id.value), row.voxel, 0, 192,
+                        CanonicalReceiptBytes(ByteArray(32) { row.id.value.toByte() }),
+                    ),
+                ),
+            )
+        }
+        val changes = (1L..count.toLong()).map { id ->
+            DepthEvidenceChange.Refine(
+                SurfaceId(id),
+                CanonicalTarget(SurfaceId(id), gridVoxel((id - 1L).toInt(), 0), 0, 0, 192),
+            )
+        }
+        val preparation = MutableCanonicalOverlay.prepare(
+            TestView(
+                rows,
+                high = count + 1L,
+                geometry = 7,
+                lineage = 5,
+                supportBySource = supports,
+                supportCount = count,
+            ),
+            SurfaceOwnershipConfiguration(
+                surfaceCapacity = count,
+                lineageCapacity = count,
+                changeJournalByteCapacity = 1_048_576,
+            ),
+            CanonicalEvidenceBatchCommand("dense-refine-4096", 7, 5, changes),
+        ) as CanonicalMutationPreparation.Prepared
+
+        try {
+            assertEquals(count, dirtyRows(preparation.mutation).size)
+            assertTrue(dirtySupport(preparation.mutation).isEmpty())
+        } finally {
+            preparation.mutation.discard()
+        }
+    }
+
+    @Test
     fun `many removes refuse before planner scratch or source materialization`() {
         val rows = (1L..200L).map { surface(it, it.toInt()) }
         val view = TestView(rows, high = 201, geometry = 7, lineage = 5)
@@ -66,7 +207,10 @@ class CanonicalEvidenceBatchTest {
             SurfaceOwnershipConfiguration(
                 surfaceCapacity = 200,
                 lineageCapacity = 200,
-                changeJournalByteCapacity = 10_000,
+                // The planner reserve is independent of the encoded wire
+                // record. Keep this fixture below the unchanged wire limit
+                // so it still proves refusal before any planner scratch.
+                changeJournalByteCapacity = 1_000,
             ),
             CanonicalEvidenceBatchCommand(
                 "remove-scratch", 7, 5,
@@ -126,8 +270,8 @@ class CanonicalEvidenceBatchTest {
     @Test
     fun `support heavy multi source mutation refuses before caching support values`() {
         val supports = (1L..2L).associateWith { target ->
-            (1L..5_000L).map { offset ->
-                val id = 2L + (target - 1L) * 5_000L + offset
+            (1L..7_000L).map { offset ->
+                val id = 2L + (target - 1L) * 7_000L + offset
                 PagedSupport(
                     SurfaceId(target),
                     PagedSource(
@@ -138,8 +282,8 @@ class CanonicalEvidenceBatchTest {
             }
         }
         val view = TestView(
-            listOf(surface(1, 0), surface(2, 1)), high = 10_003, geometry = 7, lineage = 5,
-            supportBySource = supports, supportCount = 10_000,
+            listOf(surface(1, 0), surface(2, 1)), high = 14_003, geometry = 7, lineage = 5,
+            supportBySource = supports, supportCount = 14_000,
         )
         val cut = view.cut
         val preparation = MutableCanonicalOverlay.prepare(
@@ -157,8 +301,11 @@ class CanonicalEvidenceBatchTest {
         assertEquals(cut, view.cut)
         assertEquals(0, preparation.preflightWork.ownerConstructions)
         assertEquals(0, view.sourceMaterializationReads)
-        assertEquals(2, view.supportPageReads)
-        assertTrue(view.supportStreamRecords in 5_000 until 10_000)
+        assertEquals(4, view.supportPageReads)
+        // The enlarged phase reserve allows the first count pass to complete;
+        // exact support construction then streams the same two source pages
+        // once more before the modeled peak refuses the batch.
+        assertTrue(view.supportStreamRecords in 14_000..28_000)
     }
 
     @Test
@@ -380,7 +527,61 @@ class CanonicalEvidenceBatchTest {
         }
     }
 
+    @Test
+    fun `serial preparation workspace reuses depth tables after refusal and success`() {
+        val support = PagedSupport(
+            SurfaceId(1),
+            PagedSource(
+                SurfaceId(101), Voxel(4, 1, 0), 0, 192,
+                CanonicalReceiptBytes(ByteArray(32) { 7 }),
+            ),
+        )
+        val view = TestView(
+            listOf(surface(1, 0), surface(2, 1), surface(3, 2)),
+            high = 4,
+            geometry = 7,
+            lineage = 5,
+            supportBySource = mapOf(1L to listOf(support)),
+            supportPageFaults = 2,
+            supportBytesRead = 17,
+        )
+        val workspace = CanonicalPreparationWorkspace()
+        val command = CanonicalEvidenceBatchCommand(
+            "workspace-warm", 7, 5,
+            listOf(DepthEvidenceChange.Relocate(
+                SurfaceId(1), CanonicalTarget(SurfaceId(1), Voxel(10, 0, 0), 0, 0, 192),
+            )),
+        )
+        val refused = MutableCanonicalOverlay.prepare(
+            view, SurfaceOwnershipConfiguration(changeJournalByteCapacity = 200), command, workspace,
+        ) as CanonicalMutationPreparation.Refused
+        assertEquals(CanonicalMutationRefusal.JOURNAL_EXHAUSTED, refused.reason)
+        val firstGrowth = workspace.growthEvents
+        val firstCapacity = workspace.ownedCapacityBytes
+
+        val first = MutableCanonicalOverlay.prepare(
+            view, SurfaceOwnershipConfiguration(), command, workspace,
+        ) as CanonicalMutationPreparation.Prepared
+        first.mutation.discard()
+        val warmGrowth = workspace.growthEvents
+        val warmCapacity = workspace.ownedCapacityBytes
+        val second = MutableCanonicalOverlay.prepare(
+            view, SurfaceOwnershipConfiguration(), command, workspace,
+        ) as CanonicalMutationPreparation.Prepared
+        try {
+            assertTrue(workspace.growthEvents >= firstGrowth)
+            assertTrue(warmCapacity >= firstCapacity)
+            assertEquals(warmGrowth, workspace.growthEvents)
+            assertEquals(warmCapacity, workspace.ownedCapacityBytes)
+            assertEquals(1, dirtySupport(second.mutation).size)
+        } finally {
+            second.mutation.discard()
+        }
+    }
+
     private fun surface(id: Long, x: Int) = CompactSurface(SurfaceId(id), Voxel(x, 0, 0), 0, 192)
+
+    private fun gridVoxel(index: Int, z: Int): Voxel = Voxel(index % 64, index / 64, z)
 
     private fun dirtyRows(plan: PreparedCanonicalMutation) = mutableListOf<PreparedRow>().also { values ->
         plan.visitDirtyRows { values += it; true }

@@ -46,9 +46,67 @@ class DepthEvidenceKernelTest {
     }
 
     @Test
+    fun `scalar canonical adapter owns supercover and forwards addressed rows`() {
+        val addressed = surface(7, Voxel(0, 0, -1))
+        val adapter = CanonicalSurfaceRayViewAdapter(
+            FakeCanonicalView(mapOf(addressed.voxel to addressed)),
+            frame(),
+        )
+        val scratch = CanonicalSurfaceScratch()
+        val visits = mutableListOf<Voxel>()
+        val ids = mutableListOf<Long>()
+
+        val result = adapter.visitRayCellsInto(
+            DepthPointMm(50.0, 50.0, 50.0),
+            DepthPointMm(50.0, 50.0, -250.0),
+            3,
+            scratch,
+        ) { x, y, z, lookup ->
+            visits += Voxel(x, y, z)
+            ids += if (lookup.present) lookup.id else 0L
+            true
+        }
+
+        assertEquals(DepthRayVisitResult(3, truncated = true), result)
+        assertEquals(
+            listOf(Voxel(0, 0, 0), Voxel(0, 0, -1), Voxel(0, 0, -2)),
+            visits,
+        )
+        assertEquals(listOf(0L, 7L, 0L), ids)
+    }
+
+    @Test
     fun `prepare ignores canonical view traversal override`() {
         val result = DepthEvidenceKernel().prepare(depthBatchForFrame(1, frame(), identity()), FakeCanonicalView())
         assertEquals(expectedAccepted(1, rayVisits = 11, virtualWork = 13), result)
+    }
+
+    @Test
+    fun `packed lease preparation preserves immutable batch outcome`() {
+        val batch = depthBatchForFrame(1, frame(), identity())
+        val expected = DepthEvidenceKernel().prepare(batch, FakeCanonicalView())
+        val pool = DepthSamplesLeasePool(capacity = 16)
+        val lease = requireNotNull(pool.tryAcquire(SampleLeaseGeneration(1, 2, 3, 4)))
+        assertTrue(lease.append(0, 0, 1_000, 255))
+        val metadata = DepthEvidenceMetadata(
+            sequence = batch.sequence,
+            sourceTimestampNs = batch.sourceTimestampNs,
+            groupFrame = batch.groupFrame,
+            groupFromCameraGl = batch.groupFromCameraGl,
+            intrinsics = batch.intrinsics,
+            sourceRejectedSamples = batch.sourceRejectedSamples,
+            tracking = batch.tracking,
+        )
+        val kernel = DepthEvidenceKernel()
+        try {
+            val actual = kernel.prepare(lease.samples, metadata, FakeCanonicalView())
+            assertEquals(expected, actual)
+            kernel.discardPrepared()
+        } finally {
+            lease.close()
+            pool.close()
+            kernel.close()
+        }
     }
 
     @Test
@@ -664,6 +722,42 @@ class DepthEvidenceKernelTest {
     }
 
     @Test
+    fun `canonical retirement clears depth evidence source identities after merge commit`() {
+        val target = Voxel(0, 0, -10)
+        val old = surface(74, target)
+        val replacement = surface(75, target)
+        val kernel = DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 2))
+        kernel.prepare(
+            depthBatchForFrame(1, frame(), identity()),
+            FakeCanonicalView(surfaces = mapOf(target to old), idLookup = mapOf(old.id to old)),
+        )
+        kernel.applyPrepared()
+
+        val merged = kernel.prepare(
+            depthBatchForFrame(2, frame(), identity()),
+            FakeCanonicalView(
+                surfaces = mapOf(target to replacement),
+                idLookup = mapOf(old.id to old, replacement.id to replacement),
+            ),
+        ) as DepthEvidenceResult.Accepted
+        assertTrue(merged.changes.single() is DepthEvidenceChange.Merge)
+        kernel.applyPrepared(longArrayOf(old.id.value))
+
+        val next = kernel.prepare(
+            depthBatchForFrame(3, frame(), identity()),
+            FakeCanonicalView(
+                surfaces = mapOf(target to replacement),
+                idLookup = mapOf(replacement.id to replacement),
+            ),
+        )
+        assertTrue("retired source must not poison the next batch", next is DepthEvidenceResult.Accepted)
+        assertEquals(
+            DepthEvidenceApplyResult.Applied((next as DepthEvidenceResult.Accepted).receipt),
+            kernel.applyPrepared(),
+        )
+    }
+
+    @Test
     fun `address alias emits a resolvable relocated source`() {
         val addressed = Voxel(0, 0, -10)
         val canonical = surface(73, Voxel(3, 0, -10))
@@ -1151,7 +1245,7 @@ class DepthEvidenceKernelTest {
         }
 
         assertEquals(
-            DepthEvidenceResourceReceipt(2, 64, 0, 0, 2, 2_160, false, 2_628_680, 2_630_840, 16 * 1024 * 1024),
+            DepthEvidenceResourceReceipt(2, 64, 0, 0, 2, 2_232, false, 2_628_680, 2_630_912, 16 * 1024 * 1024),
             kernel.resourceReceipt(),
         )
     }
@@ -1181,7 +1275,7 @@ class DepthEvidenceKernelTest {
             ),
             result,
         )
-        assertEquals(12_958_416, kernel.resourceReceipt().fixedPrimitiveBytes)
+        assertEquals(13_358_480, kernel.resourceReceipt().fixedPrimitiveBytes)
         kernel.discardPrepared()
     }
 

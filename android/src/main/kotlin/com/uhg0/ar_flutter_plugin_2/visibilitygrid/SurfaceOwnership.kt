@@ -30,6 +30,8 @@ internal class SurfaceOwnership private constructor(
     private val v6Budget: CanonicalStorageBudget? = null,
     private val sessionState: SessionCanonicalMemoryState? = null,
 ) {
+    /** Serial planner storage retained across adjacent canonical preparations. */
+    private val preparationWorkspace = CanonicalPreparationWorkspace()
     private var legacyLeaseRelease: (() -> Unit)? = null
     private val rowsById = restored.rows.associateByTo(linkedMapOf()) { it.id.value }
     private val idByVoxel = restored.rows.associateTo(linkedMapOf()) { it.voxel to it.id.value }
@@ -383,7 +385,7 @@ internal class SurfaceOwnership private constructor(
         view: CanonicalStateView,
         command: FeatureMutationCommand,
     ): CanonicalMutationPreparation = bindAdjacentPreparation(
-        MutableCanonicalOverlay.prepare(view, configuration, command), view,
+        MutableCanonicalOverlay.prepare(view, configuration, command, preparationWorkspace), view,
     )
 
     @Synchronized
@@ -391,7 +393,7 @@ internal class SurfaceOwnership private constructor(
         view: CanonicalStateView,
         command: CanonicalTransactionCommand,
     ): CanonicalMutationPreparation = bindAdjacentPreparation(
-        MutableCanonicalOverlay.prepare(view, configuration, command), view,
+        MutableCanonicalOverlay.prepare(view, configuration, command, preparationWorkspace), view,
     )
 
     /** Private #128 seam: one kernel delta batch plans one adjacent v6 commit. */
@@ -400,7 +402,7 @@ internal class SurfaceOwnership private constructor(
         view: CanonicalFeaturePlanningView,
         command: CanonicalFeatureBatchCommand,
     ): CanonicalMutationPreparation = bindAdjacentPreparation(
-        MutableCanonicalOverlay.prepare(view, configuration, command), view.generationZeroAuthority,
+        MutableCanonicalOverlay.prepare(view, configuration, command, preparationWorkspace), view.generationZeroAuthority,
     )
 
     /** Public adjacent-authority seam for one immutable depth evidence batch. */
@@ -409,8 +411,15 @@ internal class SurfaceOwnership private constructor(
         view: CanonicalStateView,
         command: CanonicalEvidenceBatchCommand,
     ): CanonicalMutationPreparation = bindAdjacentPreparation(
-        MutableCanonicalOverlay.prepare(view, configuration, command), view,
+        MutableCanonicalOverlay.prepare(view, configuration, command, preparationWorkspace), view,
     )
+
+    @Synchronized
+    internal fun preparationWorkspaceReceipt(): CanonicalPreparationWorkspaceReceipt =
+        CanonicalPreparationWorkspaceReceipt(
+            preparationWorkspace.growthEvents,
+            preparationWorkspace.ownedCapacityBytes,
+        )
 
     private fun bindAdjacentPreparation(
         preparation: CanonicalMutationPreparation,
@@ -461,6 +470,7 @@ internal class SurfaceOwnership private constructor(
             store?.close()
             sessionState?.close()
         } finally {
+            preparationWorkspace.clear()
             legacyLeaseRelease?.invoke()
             legacyLeaseRelease = null
         }

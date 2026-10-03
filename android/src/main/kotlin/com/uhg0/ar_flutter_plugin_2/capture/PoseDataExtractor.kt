@@ -21,6 +21,9 @@ class PoseDataExtractor(private val capacity: Int = 120) {
         val confidence: Float,
         val trackingState: String,
         val observedTimestampNs: Long = timestampNs,
+        val poseSource: String = "liveAnchor",
+        val fixtureBindingGeneration: Long? = null,
+        val fixtureGroupGeneration: Long? = null,
     )
 
     data class CaptureTiming(
@@ -49,6 +52,9 @@ class PoseDataExtractor(private val capacity: Int = 120) {
     private val poses = mutableListOf<CachedPose>()
     private var debugFixtureAnchor: CachedPose? = null
     private var debugFixtureOffsetX = 0.0f
+    private var debugFixtureSource = LIVE_ANCHOR_POSE_SOURCE
+    private var debugFixtureBindingGeneration: Long? = null
+    private var debugFixtureGroupGeneration: Long? = null
 
     companion object {
         const val OPENCV_CONVENTION = "opencv_c2w_v1"
@@ -68,6 +74,8 @@ class PoseDataExtractor(private val capacity: Int = 120) {
         // around a still. Wait for a preferred bracket before using the
         // explicitly bounded nearest-pose fallback.
         const val OBSERVED_FRAME_WAIT_MS = 1_000L
+        const val LIVE_ANCHOR_POSE_SOURCE = "liveAnchor"
+        const val SYNTHETIC_POSE_SOURCE = "synthetic"
     }
 
     fun onFrame(frame: Frame) {
@@ -98,19 +106,30 @@ class PoseDataExtractor(private val capacity: Int = 120) {
 
     internal fun applyDebugFixture(raw: CachedPose): CachedPose {
         val fixture = synchronized(lock) {
-            debugFixtureAnchor?.let { it to debugFixtureOffsetX }
+            debugFixtureAnchor?.let {
+                DebugFixtureSnapshot(
+                    anchor = it,
+                    offsetX = debugFixtureOffsetX,
+                    source = debugFixtureSource,
+                    bindingGeneration = debugFixtureBindingGeneration,
+                    groupGeneration = debugFixtureGroupGeneration,
+                )
+            }
         } ?: return raw
-        val position = fixture.first.position.clone()
-        val transform = fixture.first.transform.clone()
-        position[0] += fixture.second
-        transform[12] += fixture.second
+        val position = fixture.anchor.position.clone()
+        val transform = fixture.anchor.transform.clone()
+        position[0] += fixture.offsetX
+        transform[12] += fixture.offsetX
         return raw.copy(
             position = position,
-            rotationQuaternion = fixture.first.rotationQuaternion.clone(),
+            rotationQuaternion = fixture.anchor.rotationQuaternion.clone(),
             transform = transform,
             isTracking = true,
             confidence = 1.0f,
             trackingState = "tracking",
+            poseSource = fixture.source,
+            fixtureBindingGeneration = fixture.bindingGeneration,
+            fixtureGroupGeneration = fixture.groupGeneration,
         )
     }
 
@@ -132,10 +151,71 @@ class PoseDataExtractor(private val capacity: Int = 120) {
     fun latest(): CachedPose? = synchronized(lock) { poses.lastOrNull() }
 
     internal fun beginDebugFixture(): Boolean = synchronized(lock) {
+        if (debugFixtureAnchor != null) return@synchronized true
         val anchor = poses.lastOrNull { it.isTracking } ?: return@synchronized false
         debugFixtureAnchor = anchor
         debugFixtureOffsetX = 0.0f
+        debugFixtureSource = LIVE_ANCHOR_POSE_SOURCE
+        debugFixtureBindingGeneration = null
+        debugFixtureGroupGeneration = null
         true
+    }
+
+    /**
+     * Seeds one bounded debug pose for a fully synthetic exposure campaign.
+     *
+     * This path is deliberately separate from [beginDebugFixture]: it never
+     * turns a real ARCore frame into a synthetic claim and requires the
+     * ownership generations supplied by the debug orchestration seam.
+     */
+    internal fun beginSyntheticDebugFixture(
+        bindingGeneration: Long,
+        groupGeneration: Long,
+    ): CachedPose = synchronized(lock) {
+        require(bindingGeneration > 0L) { "binding generation must be positive" }
+        require(groupGeneration > 0L) { "group generation must be positive" }
+        val current = debugFixtureAnchor
+        if (current != null) {
+            check(debugFixtureSource == SYNTHETIC_POSE_SOURCE) {
+                "a live pose fixture is already active"
+            }
+            check(debugFixtureBindingGeneration == bindingGeneration) {
+                "synthetic pose binding generation does not match"
+            }
+            check(debugFixtureGroupGeneration == groupGeneration) {
+                "synthetic pose group generation does not match"
+            }
+            return@synchronized current
+        }
+        val timestampNs = System.nanoTime()
+        val synthetic = CachedPose(
+            position = floatArrayOf(0.0f, 0.0f, 0.0f),
+            rotationQuaternion = floatArrayOf(0.0f, 0.0f, 0.0f, 1.0f),
+            transform = floatArrayOf(
+                1.0f, 0.0f, 0.0f, 0.0f,
+                0.0f, 1.0f, 0.0f, 0.0f,
+                0.0f, 0.0f, 1.0f, 0.0f,
+                0.0f, 0.0f, 0.0f, 1.0f,
+            ),
+            timestampNs = timestampNs,
+            systemTimestampMs = System.currentTimeMillis(),
+            isTracking = true,
+            confidence = 1.0f,
+            trackingState = "synthetic",
+            observedTimestampNs = timestampNs,
+            poseSource = SYNTHETIC_POSE_SOURCE,
+            fixtureBindingGeneration = bindingGeneration,
+            fixtureGroupGeneration = groupGeneration,
+        )
+        poses.add(synthetic)
+        while (poses.size > capacity) poses.removeAt(0)
+        debugFixtureAnchor = synthetic
+        debugFixtureOffsetX = 0.0f
+        debugFixtureSource = SYNTHETIC_POSE_SOURCE
+        debugFixtureBindingGeneration = bindingGeneration
+        debugFixtureGroupGeneration = groupGeneration
+        lock.notifyAll()
+        synthetic
     }
 
     internal fun setDebugFixtureManualView() = synchronized(lock) {
@@ -155,10 +235,24 @@ class PoseDataExtractor(private val capacity: Int = 120) {
         DoubleArray(transform.size) { transform[it].toDouble() }
     }
 
-    internal fun clearDebugFixture() = synchronized(lock) {
-        debugFixtureAnchor = null
-        debugFixtureOffsetX = 0.0f
+    internal fun clearDebugFixture() {
+        synchronized(lock) {
+            debugFixtureAnchor = null
+            debugFixtureOffsetX = 0.0f
+            debugFixtureSource = LIVE_ANCHOR_POSE_SOURCE
+            debugFixtureBindingGeneration = null
+            debugFixtureGroupGeneration = null
+            poses.removeAll { it.poseSource == SYNTHETIC_POSE_SOURCE }
+        }
     }
+
+    private data class DebugFixtureSnapshot(
+        val anchor: CachedPose,
+        val offsetX: Float,
+        val source: String,
+        val bindingGeneration: Long?,
+        val groupGeneration: Long?,
+    )
 
     fun alignmentDiagnostics(captureTiming: CaptureTiming): String = synchronized(lock) {
         val tracked = poses.filter { it.isTracking }
@@ -248,6 +342,9 @@ class PoseDataExtractor(private val capacity: Int = 120) {
             "confidence" to alignedPose.pose.confidence.toDouble(),
             "isTracking" to alignedPose.pose.isTracking,
             "trackingState" to alignedPose.pose.trackingState,
+            "poseSource" to alignedPose.pose.poseSource,
+            "fixtureBindingGeneration" to alignedPose.pose.fixtureBindingGeneration,
+            "fixtureGroupGeneration" to alignedPose.pose.fixtureGroupGeneration,
             "poseAlignment" to alignedPose.poseAlignment,
             "poseTimeErrorNs" to alignedPose.poseTimeErrorNs,
             "trackingPose" to mapOf(

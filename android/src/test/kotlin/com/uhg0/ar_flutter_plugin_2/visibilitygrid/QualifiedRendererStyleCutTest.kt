@@ -15,6 +15,85 @@ class QualifiedRendererStyleCutTest {
     private val activeOwnership = ownership()
 
     @Test
+    fun `scalar canonical borrow preserves rows normals and selector without materializing rows`() {
+        val state = VisibilityGridRendererState(2, retainWorldPositions = false)
+        val canonical = listOf(row(1, -2).copy(packedNormal = 1234, normalConfidence = 200),
+            row(2, 3).copy(packedNormal = 4321, normalConfidence = 150))
+        state.startCanonicalGroup(group(2), 7, canonical, activeOwnership, 9, 3)
+        val first = style(coverage = CoverageRendererCoverage.COMPLETE)
+        val second = style(coverage = CoverageRendererCoverage.PARTIAL)
+        assertTrue(state.applyStyleCut(cut(true, longArrayOf(1, 2), arrayOf(first, second))) is RendererStyleCutResult.Applied)
+        val qualifier = com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRowsQualifier(
+            activeOwnership.bindingGeneration, activeOwnership.groupGeneration, 0, 9, 7, 1)
+        assertTrue(state.withCommittedRows(qualifier) { rows ->
+            repeat(rows.count) { index ->
+                val row = rows.rowAt(index)
+                assertEquals(row.surfaceId, rows.surfaceIdAt(index))
+                assertEquals(row.key, rows.keyAt(index))
+                assertEquals(row.x, rows.positionComponentAt(index, 0), 0f)
+                assertEquals(row.y, rows.positionComponentAt(index, 1), 0f)
+                assertEquals(row.z, rows.positionComponentAt(index, 2), 0f)
+                assertEquals(row.color, rows.colorAt(index))
+                assertEquals(row.style.encode()[1].toInt() and 255, rows.styleFlagsAt(index))
+                val copied = ByteArray(18) { 99 }
+                rows.copyStyleAt(index, copied, 1)
+                assertEquals(99.toByte(), copied.first())
+                assertEquals(99.toByte(), copied.last())
+                assertArrayEquals(row.style.encode(), copied.copyOfRange(1, 17))
+                assertEquals(canonical[index].packedNormal, rows.packedNormalAt(index))
+                assertEquals(canonical[index].normalConfidence, rows.normalConfidenceAt(index))
+            }
+            val scalars = object : com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageCommittedRows by rows {
+                override fun rowAt(index: Int): com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageCommittedRow =
+                    error("production selector must use scalar borrowing")
+            }
+            val selector = com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationSelector(1)
+            val selected = selector.select(scalars, forceReset = true)
+            assertArrayEquals(longArrayOf(2), selected.surfaceIds)
+            assertArrayEquals(second.encode(), selected.styleRows)
+            assertEquals(second.packedColor(), selected.colors.single())
+        })
+        org.junit.Assert.assertFalse(state.withCommittedRows(qualifier.copy(geometryRevision = 8)) {
+            error("stale qualifier must not expose scalar values")
+        })
+        val descriptor = requireNotNull(state.presentationDescriptor(qualifier,
+            com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationMode.SEMANTIC_CENTROIDS,
+            true, intArrayOf(0, 1), com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette.COVERAGE))
+        assertTrue(descriptor.withPage(qualifier, 0, 2) { page ->
+            assertArrayEquals(intArrayOf(first.packedColor(), second.packedColor()), page.colors)
+            assertArrayEquals(floatArrayOf(-.15f, .05f, .05f, .35f, .05f, .05f), page.positions, .000001f)
+        })
+        state.dispose()
+    }
+    @Test
+    fun `equal palette descriptor preserves bytes and different palette preserves held snapshot`() {
+        val state = stateWithRows()
+        val first = style(coverage = CoverageRendererCoverage.COMPLETE)
+        val second = style(coverage = CoverageRendererCoverage.PARTIAL)
+        assertTrue(state.applyStyleCut(cut(true, longArrayOf(1, 2), arrayOf(first, second))) is RendererStyleCutResult.Applied)
+        val qualifier = com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRowsQualifier(
+            activeOwnership.bindingGeneration, activeOwnership.groupGeneration, 0, 9, 7, 1,
+        )
+        fun descriptor(palette: com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette) = requireNotNull(
+            state.presentationDescriptor(qualifier,
+                com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationMode.SEMANTIC_CENTROIDS,
+                true, intArrayOf(0, 1), palette),
+        )
+        val coverage = com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette.COVERAGE
+        val normal = com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette.NORMAL
+        val held = descriptor(coverage)
+        val heldBytes = held.styleRows
+        assertArrayEquals(styles(first, second), heldBytes)
+        val recolored = descriptor(normal)
+        assertArrayEquals(styles(first.copy(palette = normal), second.copy(palette = normal)), recolored.styleRows)
+        assertArrayEquals(heldBytes, held.styleRows)
+        assertTrue(held.withPage(qualifier, 0, 2) { page -> assertArrayEquals(heldBytes, page.styleRows) })
+        val edited = held.styleRows.also { it.fill(0) }
+        assertArrayEquals(heldBytes, held.styleRows)
+        assertTrue(edited.all { it == 0.toByte() })
+    }
+
+    @Test
     fun `accepted cut changes styles and exact replay is a no-op`() {
         val state = stateWithRows()
         state.snapshot() // consume the geometry upload before the style cut
@@ -88,7 +167,7 @@ class QualifiedRendererStyleCutTest {
         val snapshot = state.snapshot()
         val span = snapshot.update!!.spans.single()
         assertEquals(0, span.startSlot)
-        assertEquals(2, span.colors.size)
+        assertEquals(2, span.rowCount)
         assertEquals(
             style(semanticGeneration = 2, styleGeneration = 2,
                 coverage = CoverageRendererCoverage.COMPLETE),
@@ -140,7 +219,7 @@ class QualifiedRendererStyleCutTest {
         val cleared = state.snapshot()
         val span = cleared.update!!.spans.single()
         assertEquals(0, span.startSlot)
-        assertEquals(1, span.colors.size)
+        assertEquals(1, span.rowCount)
         assertEquals(
             style(semanticGeneration = 2, styleGeneration = 2,
                 coverage = CoverageRendererCoverage.COMPLETE),

@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
 import 'package:ar_flutter_plugin_2/datatypes/config_planedetection.dart';
 import 'package:ar_flutter_plugin_2/datatypes/image_format.dart';
@@ -27,7 +26,7 @@ void main() {
   const captureConfig = ARCaptureConfig(
     enableHighResCapture: true,
     resolution: CameraResolution(width: 640, height: 480),
-    format: ImageFormat.jpeg,
+    format: CaptureFormat.jpeg,
     maxCacheSize: 4,
     jpegQuality: 95,
   );
@@ -47,7 +46,9 @@ void main() {
   String? initializeErrorCode;
   String? initializeErrorMessage;
   dynamic initializeCaptureResponse;
+  Completer<dynamic>? initializeGate;
   Map<String, dynamic>? nativeAdmissionResponse;
+  Map<String, dynamic>? syntheticPoseResponse;
   bool debugSyntheticRouteInstalled = true;
 
   setUp(() {
@@ -67,7 +68,27 @@ void main() {
     initializeErrorCode = null;
     initializeErrorMessage = null;
     initializeCaptureResponse = <String, dynamic>{'mode': 'sharedCamera'};
+    initializeGate = null;
     nativeAdmissionResponse = null;
+    syntheticPoseResponse = <String, dynamic>{
+      'position': <String, dynamic>{'x': 0.0, 'y': 0.0, 'z': 0.0},
+      'rotation': <String, dynamic>{'x': 0.0, 'y': 0.0, 'z': 0.0, 'w': 1.0},
+      'transform': List<double>.generate(
+        16,
+        (index) => index == 0 || index == 5 || index == 10 || index == 15
+            ? 1.0
+            : 0.0,
+      ),
+      'convention': 'opencv_c2w_v1',
+      'timestampMs': 123,
+      'sensorTimestampNs': 456,
+      'confidence': 1.0,
+      'isTracking': true,
+      'trackingState': 'synthetic',
+      'poseSource': 'synthetic',
+      'wireVersion': 'pose_batch_v1',
+      'sequence': 1,
+    };
     debugSyntheticRouteInstalled = true;
     SharedPreferences.setMockInitialValues(<String, Object>{});
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
@@ -88,6 +109,9 @@ void main() {
               code: initializeErrorCode!,
               message: initializeErrorMessage,
             );
+          }
+          if (initializeGate != null) {
+            return initializeGate!.future;
           }
           isDisposed = false;
           return initializeCaptureResponse;
@@ -416,6 +440,10 @@ void main() {
           };
         case 'debugNativeCaptureV2Synthetic':
           return debugSyntheticRouteInstalled;
+        case 'debugSyntheticPoseFixture':
+          return syntheticPoseResponse;
+        case 'debugClearSyntheticPoseFixture':
+          return true;
         case 'admitNativeCaptureV2':
           return nativeAdmissionResponse;
         default:
@@ -453,6 +481,45 @@ void main() {
           'NATIVE_CAPTURE_V2_DEBUG_ROUTE_UNAVAILABLE',
         ),
       ),
+    );
+  });
+
+  test('synthetic pose facade preserves source and ownership generations',
+      () async {
+    final sessionManager = ARSessionManager(
+      42,
+      _FakeBuildContext(),
+      PlaneDetectionConfig.horizontal,
+    );
+    final captureManager = ARCaptureManager(
+      sessionManager,
+      captureConfig,
+      _FakeBuildContext(),
+    );
+
+    final pose = await captureManager.debugBeginSyntheticPoseFixture(
+      bindingGeneration: 7,
+      groupGeneration: 11,
+    );
+
+    expect(pose.poseSource, 'synthetic');
+    expect(
+      methodCalls.last.arguments,
+      <String, Object?>{'bindingGeneration': 7, 'groupGeneration': 11},
+    );
+    await captureManager.debugClearSyntheticPoseFixture();
+    expect(methodCalls.last.method, 'debugClearSyntheticPoseFixture');
+
+    syntheticPoseResponse = <String, dynamic>{
+      ...syntheticPoseResponse!,
+      'poseSource': 'liveAnchor',
+    };
+    await expectLater(
+      captureManager.debugBeginSyntheticPoseFixture(
+        bindingGeneration: 7,
+        groupGeneration: 11,
+      ),
+      throwsA(isA<FormatException>()),
     );
   });
 
@@ -543,9 +610,9 @@ void main() {
 
     final result =
         await ARCaptureManager.materializeNativeCapturePreviewFromStore(
-          manifestId: List.filled(64, 'a').join(),
-          captureId: List.filled(64, 'b').join(),
-        );
+      manifestId: List.filled(64, 'a').join(),
+      captureId: List.filled(64, 'b').join(),
+    );
 
     expect(
       result,
@@ -1059,6 +1126,41 @@ void main() {
     expect(state.currentExposureTime, const Duration(microseconds: 12500));
     expect(state.isAutoExposureEnabled, isFalse);
     expect(state.exposureMode, ExposureMode.manual);
+  });
+
+  test('runtime controls wait for shared-camera initialization', () async {
+    initializeGate = Completer<dynamic>();
+    final sessionManager = ARSessionManager(
+      42,
+      _FakeBuildContext(),
+      PlaneDetectionConfig.horizontal,
+    );
+    final captureManager = ARCaptureManager(
+      sessionManager,
+      captureConfig,
+      _FakeBuildContext(),
+    );
+
+    final stateFuture = captureManager.getCurrentExposureState();
+    await Future<void>.delayed(Duration.zero);
+
+    expect(
+      methodCalls.map((call) => call.method),
+      ['initializeCapture'],
+    );
+
+    initializeGate!.complete(initializeCaptureResponse);
+    final state = await stateFuture;
+
+    expect(state.currentISO, 320);
+    expect(
+      methodCalls.map((call) => call.method),
+      [
+        'initializeCapture',
+        'replayNativeCaptureRecoveryV2',
+        'getCurrentExposureState',
+      ],
+    );
   });
 
   test('toggles auto exposure through the per-view capture channel', () async {
@@ -2332,14 +2434,20 @@ void main() {
     const resolution = CameraResolution(width: 1920, height: 1080);
 
     await expectLater(
+      // Verify migration guidance at the deprecated compatibility boundary.
+      // ignore: deprecated_member_use_from_same_package
       captureManager.setResolution(resolution),
       throwsA(isA<UnsupportedError>()),
     );
     await expectLater(
+      // Verify migration guidance at the deprecated compatibility boundary.
+      // ignore: deprecated_member_use_from_same_package
       captureManager.getSupportedResolutions(),
       throwsA(isA<UnsupportedError>()),
     );
     await expectLater(
+      // Verify migration guidance at the deprecated compatibility boundary.
+      // ignore: deprecated_member_use_from_same_package
       captureManager.isResolutionSupported(resolution),
       throwsA(isA<UnsupportedError>()),
     );
@@ -2385,7 +2493,7 @@ void main() {
     const invalidModelConfig = ARCaptureConfig(
       enableHighResCapture: true,
       resolution: CameraResolution(width: 640, height: 480),
-      format: ImageFormat.jpeg,
+      format: CaptureFormat.jpeg,
       maxCacheSize: 0,
       jpegQuality: 95,
     );
@@ -2393,7 +2501,7 @@ void main() {
       enableHighResCapture: true,
       captureIntervalMs: 50,
       resolution: CameraResolution(width: 640, height: 480),
-      format: ImageFormat.jpeg,
+      format: CaptureFormat.jpeg,
       maxCacheSize: 4,
       jpegQuality: 95,
     );
@@ -2428,7 +2536,7 @@ void main() {
         enableHighResCapture: true,
         captureIntervalMs: 0,
         resolution: CameraResolution(width: 640, height: 480),
-        format: ImageFormat.jpeg,
+        format: CaptureFormat.jpeg,
         maxCacheSize: 4,
         jpegQuality: 95,
       );
@@ -2451,7 +2559,7 @@ void main() {
     const disabledConfig = ARCaptureConfig(
       enableHighResCapture: false,
       resolution: CameraResolution(width: 640, height: 480),
-      format: ImageFormat.jpeg,
+      format: CaptureFormat.jpeg,
       maxCacheSize: 4,
       jpegQuality: 95,
     );

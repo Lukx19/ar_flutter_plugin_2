@@ -205,7 +205,7 @@ class DepthEvidencePropertyTest {
     fun `resource receipt reports fixed primitive ownership and staged row bytes`() {
         val kernel = DepthEvidenceKernel(DepthEvidenceConfiguration(surfaceCapacity = 1))
         val before = kernel.resourceReceipt()
-        assertEquals(2_096, before.fixedPrimitiveBytes)
+        assertEquals(2_168, before.fixedPrimitiveBytes)
 
         val accepted = kernel.prepare(batch(1), PropertyView()) as DepthEvidenceResult.Accepted
         val staged = kernel.resourceReceipt()
@@ -234,10 +234,10 @@ class DepthEvidencePropertyTest {
                 preparedEvidenceRows = 0,
                 preparedResidentBytes = 0,
                 evidenceRowCapacity = 100_000,
-                fixedPrimitiveBytes = 12_958_416,
+                fixedPrimitiveBytes = 13_358_480,
                 closed = false,
                 maximumAcceptedOutputReserveBytes = 2_628_680,
-                modeledMaximumSemanticStateBytes = 15_587_096,
+                modeledMaximumSemanticStateBytes = 15_987_160,
                 semanticStateBudgetBytes = 16 * 1024 * 1024,
             ),
             receipt,
@@ -342,7 +342,7 @@ class DepthEvidencePropertyTest {
             result.work,
         )
         assertEquals(2_628_680, kernel.resourceReceipt().maximumAcceptedOutputReserveBytes)
-        assertEquals(15_587_096, kernel.resourceReceipt().modeledMaximumSemanticStateBytes)
+        assertEquals(15_987_160, kernel.resourceReceipt().modeledMaximumSemanticStateBytes)
     }
 
     @Test
@@ -431,7 +431,7 @@ class DepthEvidencePropertyTest {
         )
         assertTrue(second.work.virtualWorkUnits < 4_000_000)
         assertEquals(2_628_680, kernel.resourceReceipt().maximumAcceptedOutputReserveBytes)
-        assertEquals(15_587_096, kernel.resourceReceipt().modeledMaximumSemanticStateBytes)
+        assertEquals(15_987_160, kernel.resourceReceipt().modeledMaximumSemanticStateBytes)
     }
 
     @Test
@@ -522,8 +522,8 @@ class DepthEvidencePropertyTest {
             DepthEvidenceResult.Refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED, attemptReceipt(4)),
             kernel.prepare(batch(4), view),
         )
-        assertEquals(12_958_416, kernel.resourceReceipt().fixedPrimitiveBytes)
-        assertEquals(15_587_096, kernel.resourceReceipt().modeledMaximumSemanticStateBytes)
+        assertEquals(13_358_480, kernel.resourceReceipt().fixedPrimitiveBytes)
+        assertEquals(15_987_160, kernel.resourceReceipt().modeledMaximumSemanticStateBytes)
     }
 
     @Test

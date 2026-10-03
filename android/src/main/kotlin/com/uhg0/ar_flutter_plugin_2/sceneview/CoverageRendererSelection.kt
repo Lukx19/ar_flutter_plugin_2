@@ -5,7 +5,6 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderUpdate
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan
 import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
-import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageCommittedRow
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageCommittedRows
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridRendererState
@@ -433,11 +432,11 @@ internal class CoverageRendererAllocationLedger(
  * primitive source/key-to-presentation-slot tables, avoiding a 20k sort and
  * an 8k reset for every revision.
  *
- * The policy is deterministic: keep the lowest identities, with source-slot
- * order as the tie-breaker. New candidates can replace the current largest
- * identity. A replacement reuses the evicted row's destination, so every
- * retained row preserves its GPU destination and only the replacement row is
- * dirty.
+ * The policy is deterministic: keep the highest target/need/residency
+ * priority, then the lowest stable identities. New candidates can replace
+ * the current largest ranking. A replacement reuses the evicted row's
+ * destination, so every retained row preserves its GPU destination and only
+ * the replacement row is dirty.
  */
 internal class CoveragePresentationSelector(
     private val maximumCapacity: Int,
@@ -682,31 +681,62 @@ internal class CoveragePresentationSelector(
             freeDestinations[destination] = activeCapacity - destination - 1
             selectedSourceSlots[destination] = -1
         }
-        selectedCount = minOf(rows.count, activeCapacity)
-        val heap = IntArray(selectedCount)
+        val targetCount = minOf(rows.count, activeCapacity)
         var heapSize = 0
         for (source in 0 until rows.count) {
-            if (heapSize < selectedCount) {
-                heap[heapSize] = source
-                streamSiftUp(heap, heapSize, rows)
+            if (heapSize < targetCount) {
+                cacheStreamHeapRow(rows, source, heapSize)
+                streamSiftUp(heapSize)
                 heapSize++
-            } else if (selectedCount > 0 && compareCommittedRows(rows.rowAt(source), rows.rowAt(heap[0])) < 0) {
-                heap[0] = source
-                streamSiftDown(heap, 0, heapSize, rows)
+            } else if (targetCount > 0) {
+                if (compareStreamCandidate(rows, source, 0) < 0) {
+                    cacheStreamHeapRow(rows, source, 0)
+                    streamSiftDown(0, heapSize)
+                }
             }
         }
-        val selectedSources = IntArray(selectedCount)
-        for (destination in selectedCount - 1 downTo 0) {
-            selectedSources[destination] = heap[0]
-            heap[0] = heap[--heapSize]
-            if (heapSize > 0) streamSiftDown(heap, 0, heapSize, rows)
+        for (destination in targetCount - 1 downTo 0) {
+            val rootSource = selectedSourceSlots[0]
+            val rootKey = selectedKeys[0]
+            val rootSurfaceId = selectedSurfaceIds[0]
+            heapSize--
+            if (heapSize > 0) {
+                selectedSourceSlots[0] = selectedSourceSlots[heapSize]
+                selectedKeys[0] = selectedKeys[heapSize]
+                selectedSurfaceIds[0] = selectedSurfaceIds[heapSize]
+                freeDestinations[0] = freeDestinations[heapSize]
+                streamSiftDown(0, heapSize)
+            }
+            selectedSourceSlots[destination] = rootSource
+            selectedKeys[destination] = rootKey
+            selectedSurfaceIds[destination] = rootSurfaceId
         }
-        selectedCount = 0
-        selectedSources.forEach { source -> assignStreamSource(rows, source) }
+        freeDestinationCount = activeCapacity - targetCount
+        repeat(activeCapacity) { destination ->
+            freeDestinations[destination] = activeCapacity - destination - 1
+        }
+        selectedCount = targetCount
         rebuildIdentityLookup()
         streamInitialized = true
     }
 
+    /** Caches one bounded heap entry using arrays already owned by the selector. */
+    private fun cacheStreamHeapRow(rows: CoverageCommittedRows, source: Int, heapIndex: Int) {
+        selectedSourceSlots[heapIndex] = source
+        selectedKeys[heapIndex] = rows.keyAt(source)
+        selectedSurfaceIds[heapIndex] = rows.surfaceIdAt(source)
+        freeDestinations[heapIndex] = streamPriority(rows, source)
+    }
+
+    private fun compareStreamCandidate(rows: CoverageCommittedRows, source: Int, heapIndex: Int): Int {
+        val order = compareStreamPriority(
+            firstPriority = streamPriority(rows, source),
+            firstSurfaceId = rows.surfaceIdAt(source),
+            secondPriority = freeDestinations[heapIndex],
+            secondSurfaceId = selectedSurfaceIds[heapIndex],
+        )
+        return if (order != 0) order else rows.keyAt(source).compareTo(selectedKeys[heapIndex])
+    }
     private fun streamAcceptChanges(
         rows: CoverageCommittedRows,
         sourceUpdate: CoveragePointRenderUpdate?,
@@ -720,20 +750,21 @@ internal class CoveragePresentationSelector(
         sourceUpdate?.spans.orEmpty().forEach { span ->
             val end = minOf(span.endSlotExclusive, rows.count)
             for (source in span.startSlot until end) {
-                val row = rows.rowAt(source)
+                val surfaceId = rows.surfaceIdAt(source)
+                val key = rows.keyAt(source)
                 val destination = selectedDestinationForSource(source)
                 if (destination >= 0) {
                     // A source identity replacement invalidates the compact
                     // source-slot cut; recompute deterministically on the next
                     // call while preserving the current callback's safety.
-                    if (row.surfaceId != selectedSurfaceIds[destination] ||
-                        row.key != selectedKeys[destination]
+                    if (surfaceId != selectedSurfaceIds[destination] ||
+                        key != selectedKeys[destination]
                     ) {
                         streamInitialize(rows)
                         return true
                     }
-                    selectedKeys[destination] = row.key
-                    selectedSurfaceIds[destination] = row.surfaceId
+                    selectedKeys[destination] = key
+                    selectedSurfaceIds[destination] = surfaceId
                 } else {
                     considerStreamCandidate(rows, source)
                 }
@@ -751,16 +782,13 @@ internal class CoveragePresentationSelector(
         }
         if (selectedCount == 0) return
         val largestDestination = (0 until selectedCount).maxWithOrNull { first, second ->
-            compareCommittedRows(
-                rows.rowAt(selectedSourceSlots[first]),
-                rows.rowAt(selectedSourceSlots[second]),
-            )
+            compareStreamRows(rows, selectedSourceSlots[first], selectedSourceSlots[second])
         } ?: return
         val largestSource = selectedSourceSlots[largestDestination]
-        if (compareCommittedRows(rows.rowAt(source), rows.rowAt(largestSource)) < 0) {
+        if (compareStreamRows(rows, source, largestSource) < 0) {
             selectedSourceSlots[largestDestination] = source
-            selectedKeys[largestDestination] = rows.rowAt(source).key
-            selectedSurfaceIds[largestDestination] = rows.rowAt(source).surfaceId
+            selectedKeys[largestDestination] = rows.keyAt(source)
+            selectedSurfaceIds[largestDestination] = rows.surfaceIdAt(source)
             storage.markDirty(largestDestination)
         }
     }
@@ -768,10 +796,11 @@ internal class CoveragePresentationSelector(
     private fun assignStreamSource(rows: CoverageCommittedRows, source: Int): Int {
         check(freeDestinationCount > 0)
         val destination = freeDestinations[--freeDestinationCount]
-        val row = rows.rowAt(source)
+        val key = rows.keyAt(source)
+        val surfaceId = rows.surfaceIdAt(source)
         selectedSourceSlots[destination] = source
-        selectedKeys[destination] = row.key
-        selectedSurfaceIds[destination] = row.surfaceId
+        selectedKeys[destination] = key
+        selectedSurfaceIds[destination] = surfaceId
         selectedCount++
         return destination
     }
@@ -827,15 +856,15 @@ internal class CoveragePresentationSelector(
         val colors = IntArray(selectedCount)
         val styles = ByteArray(selectedCount * COVERAGE_RENDERER_STYLE_ROW_BYTES)
         repeat(selectedCount) { destination ->
-            val row = rows.rowAt(selectedSourceSlots[destination])
-            keys[destination] = row.key
-            surfaces[destination] = row.surfaceId
+            val source = selectedSourceSlots[destination]
+            keys[destination] = rows.keyAt(source)
+            surfaces[destination] = rows.surfaceIdAt(source)
             val offset = destination * CoveragePointMeshResources.POSITION_COMPONENTS
-            positions[offset] = row.x
-            positions[offset + 1] = row.y
-            positions[offset + 2] = row.z
-            colors[destination] = row.color
-            row.style.encode().copyInto(styles, destination * COVERAGE_RENDERER_STYLE_ROW_BYTES)
+            positions[offset] = rows.positionComponentAt(source, 0)
+            positions[offset + 1] = rows.positionComponentAt(source, 1)
+            positions[offset + 2] = rows.positionComponentAt(source, 2)
+            colors[destination] = rows.colorAt(source)
+            rows.copyStyleAt(source, styles, destination * COVERAGE_RENDERER_STYLE_ROW_BYTES)
         }
         val qualifier = rows.qualifier
         return CoveragePointRenderSnapshot(
@@ -864,62 +893,84 @@ internal class CoveragePresentationSelector(
         )
     }
 
-    private fun streamSiftUp(heap: IntArray, start: Int, rows: CoverageCommittedRows) {
+    private fun streamSiftUp(start: Int) {
         var child = start
         while (child > 0) {
             val parent = (child - 1) / 2
-            if (compareCommittedRows(rows.rowAt(heap[child]), rows.rowAt(heap[parent])) <= 0) return
-            val value = heap[parent]
-            heap[parent] = heap[child]
-            heap[child] = value
+            if (compareStreamHeapEntries(child, parent) <= 0) return
+            swapStreamHeapEntries(parent, child)
             child = parent
         }
     }
 
-    private fun streamSiftDown(heap: IntArray, start: Int, size: Int, rows: CoverageCommittedRows) {
+    private fun streamSiftDown(start: Int, size: Int) {
         var parent = start
         while (true) {
             val left = parent * 2 + 1
             if (left >= size) return
             val right = left + 1
             val child = if (right < size &&
-                compareCommittedRows(rows.rowAt(heap[right]), rows.rowAt(heap[left])) > 0
+                compareStreamHeapEntries(right, left) > 0
             ) right else left
-            if (compareCommittedRows(rows.rowAt(heap[child]), rows.rowAt(heap[parent])) <= 0) return
-            val value = heap[parent]
-            heap[parent] = heap[child]
-            heap[child] = value
+            if (compareStreamHeapEntries(child, parent) <= 0) return
+            swapStreamHeapEntries(parent, child)
             parent = child
         }
     }
 
-    private fun compareCommittedRows(first: CoverageCommittedRow, second: CoverageCommittedRow): Int {
-        val firstRenderer = VisibilityRendererRow(
-            surfaceId = first.surfaceId,
-            x = first.x,
-            y = first.y,
-            z = first.z,
-            semanticLabel = first.style.semantic,
-            coverageLabel = first.style.coverage,
-            targetDirectionIndex = first.style.directionBin.takeUnless { it == 0xff },
-            style = first.style,
+    private fun compareStreamHeapEntries(first: Int, second: Int): Int {
+        val order = compareStreamPriority(
+            firstPriority = freeDestinations[first],
+            firstSurfaceId = selectedSurfaceIds[first],
+            secondPriority = freeDestinations[second],
+            secondSurfaceId = selectedSurfaceIds[second],
         )
-        val secondRenderer = VisibilityRendererRow(
-            surfaceId = second.surfaceId,
-            x = second.x,
-            y = second.y,
-            z = second.z,
-            semanticLabel = second.style.semantic,
-            coverageLabel = second.style.coverage,
-            targetDirectionIndex = second.style.directionBin.takeUnless { it == 0xff },
-            style = second.style,
-        )
-        val order = compareCoverageRows(firstRenderer, secondRenderer)
-        if (order != 0) return order
-        val keyOrder = first.key.compareTo(second.key)
-        return if (keyOrder != 0) keyOrder else first.surfaceId.compareTo(second.surfaceId)
+        return if (order != 0) order else selectedKeys[first].compareTo(selectedKeys[second])
     }
 
+    private fun swapStreamHeapEntries(first: Int, second: Int) {
+        var intValue = selectedSourceSlots[first]
+        selectedSourceSlots[first] = selectedSourceSlots[second]
+        selectedSourceSlots[second] = intValue
+        var longValue = selectedKeys[first]
+        selectedKeys[first] = selectedKeys[second]
+        selectedKeys[second] = longValue
+        longValue = selectedSurfaceIds[first]
+        selectedSurfaceIds[first] = selectedSurfaceIds[second]
+        selectedSurfaceIds[second] = longValue
+        intValue = freeDestinations[first]
+        freeDestinations[first] = freeDestinations[second]
+        freeDestinations[second] = intValue
+    }
+
+    private fun streamPriority(rows: CoverageCommittedRows, source: Int): Int {
+        val flags = rows.styleFlagsAt(source)
+        return ((flags ushr 6) and 3) or
+            ((2 - ((flags ushr 2) and 3)) shl 4) or
+            ((2 - ((flags ushr 4) and 3)) shl 8)
+    }
+    private fun compareStreamPriority(
+        firstPriority: Int,
+        firstSurfaceId: Long,
+        secondPriority: Int,
+        secondSurfaceId: Long,
+    ): Int {
+        val target = (firstPriority and 0xf).compareTo(secondPriority and 0xf)
+        if (target != 0) return -target
+        val need = ((firstPriority ushr 4) and 0xf).compareTo((secondPriority ushr 4) and 0xf)
+        if (need != 0) return -need
+        val residency = ((firstPriority ushr 8) and 0xf)
+            .compareTo((secondPriority ushr 8) and 0xf)
+        if (residency != 0) return -residency
+        return firstSurfaceId.compareTo(secondSurfaceId)
+    }
+
+    private fun compareStreamRows(rows: CoverageCommittedRows, first: Int, second: Int): Int {
+        val order = compareStreamPriority(streamPriority(rows, first), rows.surfaceIdAt(first),
+            streamPriority(rows, second), rows.surfaceIdAt(second))
+        if (order != 0) return order
+        return rows.keyAt(first).compareTo(rows.keyAt(second))
+    }
     private fun initialize(snapshot: CoveragePointRenderSnapshot) {
         sourceSlotToDestination.fill(-1)
         freeDestinationCount = activeCapacity
@@ -1001,16 +1052,7 @@ internal class CoveragePresentationSelector(
             storage.sortedSurfaceIds[destination] = selectedSurfaceIds[destination]
             storage.sortedDestinations[destination] = destination
         }
-        val order = (0 until selectedCount).toMutableList()
-        order.sortBy { storage.sortedSurfaceIds[it] }
-        val ids = LongArray(selectedCount)
-        val destinations = IntArray(selectedCount)
-        order.forEachIndexed { index, original ->
-            ids[index] = storage.sortedSurfaceIds[original]
-            destinations[index] = storage.sortedDestinations[original]
-        }
-        ids.copyInto(storage.sortedSurfaceIds)
-        destinations.copyInto(storage.sortedDestinations)
+        storage.sortIdentityTable(selectedCount)
     }
 
     private fun applyDirtySpans(

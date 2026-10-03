@@ -40,6 +40,36 @@ internal data class FeatureNormalEvidence(
             return Conversion.Accepted(converted)
         }
 
+        /** Scalar packed handoff adapter used before the fusion workspace takes over. */
+        fun fromPacked(observation: VisibilityFeatureObservation): Conversion {
+            val packed = observation.packedSamples ?: return from(observation)
+            val pose = observation.frame.pose.worldFromCameraGl
+            val cameraX = intMillimeters(pose[12]) ?: return Conversion.Refused
+            val cameraY = intMillimeters(pose[13]) ?: return Conversion.Refused
+            val cameraZ = intMillimeters(pose[14]) ?: return Conversion.Refused
+            val converted = ArrayList<FeatureNormalEvidence>(packed.count)
+            for (index in 0 until packed.count) {
+                val xWorld = packed.xWorldAt(index)
+                val yWorld = packed.yWorldAt(index)
+                val zWorld = packed.zWorldAt(index)
+                val x = voxel(xWorld) ?: return Conversion.Refused
+                val y = voxel(yWorld) ?: return Conversion.Refused
+                val z = voxel(zWorld) ?: return Conversion.Refused
+                val sampleX = intMillimeters(xWorld) ?: return Conversion.Refused
+                val sampleY = intMillimeters(yWorld) ?: return Conversion.Refused
+                val sampleZ = intMillimeters(zWorld) ?: return Conversion.Refused
+                val confidence = q15(packed.confidenceAt(index)) ?: return Conversion.Refused
+                if (sampleX == cameraX && sampleY == cameraY && sampleZ == cameraZ) {
+                    return Conversion.Refused
+                }
+                converted += FeatureNormalEvidence(
+                    x, y, z, sampleX, sampleY, sampleZ,
+                    cameraX, cameraY, cameraZ, confidence,
+                )
+            }
+            return Conversion.Accepted(converted)
+        }
+
         /** Exact round-to-nearest, ties-to-even conversion with a checked Int result. */
         internal fun intMillimeters(meters: Double): Int? {
             if (!meters.isFinite()) return null
@@ -68,25 +98,41 @@ internal data class FeatureNormalEvidence(
 /** Exact C12 Q1.15 and signed-oct helpers. Kept free of floating normalization. */
 internal object FeatureNormalMath {
     fun normalizeQ15(x: Long, y: Long, z: Long): IntArray? {
-        val components = longArrayOf(x, y, z)
-        val squared = components.map { BigInteger.valueOf(it).pow(2) }
-        val length2 = squared.fold(BigInteger.ZERO, BigInteger::add)
-        if (length2 == BigInteger.ZERO) return null
+        val result = IntArray(3)
+        return result.takeIf { normalizeQ15Into(x, y, z, it) }
+    }
+
+    /** Exact scalar destination form used by the packed fusion workspace. */
+    internal fun normalizeQ15Into(x: Long, y: Long, z: Long, destination: IntArray): Boolean {
+        require(destination.size >= 3)
+        val squaredX = BigInteger.valueOf(x).pow(2)
+        val squaredY = BigInteger.valueOf(y).pow(2)
+        val squaredZ = BigInteger.valueOf(z).pow(2)
+        val length2 = squaredX.add(squaredY).add(squaredZ)
+        if (length2 == BigInteger.ZERO) return false
         val q15Squared = BigInteger.valueOf(32_767L * 32_767L)
-        return components.mapIndexed { index, component ->
-            val numerator = squared[index].multiply(q15Squared)
-            // squared[index] <= length2, so this quotient is always in
-            // 0..32_767^2 and is exactly representable by Long. Avoid
-            // BigInteger.longValueExact(): it is absent on supported Android
-            // API levels even though the JVM test runtime provides it.
-            val scaledSquared = numerator.divide(length2)
-            check(scaledSquared.signum() >= 0 && scaledSquared.bitLength() <= 30)
-            val q = integerSqrt(scaledSquared.toLong())
-            val next = BigInteger.valueOf(2L * q + 1L)
-            val comparison = numerator.shiftLeft(2).compareTo(length2.multiply(next.pow(2)))
-            val rounded = if (comparison > 0 || (comparison == 0 && (q and 1L) == 1L)) q + 1L else q
-            (if (component < 0L) -rounded else rounded).toInt()
-        }.toIntArray()
+        destination[0] = normalizeComponent(x, squaredX, length2, q15Squared)
+        destination[1] = normalizeComponent(y, squaredY, length2, q15Squared)
+        destination[2] = normalizeComponent(z, squaredZ, length2, q15Squared)
+        return true
+    }
+
+    private fun normalizeComponent(
+        component: Long,
+        squared: BigInteger,
+        length2: BigInteger,
+        q15Squared: BigInteger,
+    ): Int {
+        val numerator = squared.multiply(q15Squared)
+        // squared <= length2, so this quotient is always in 0..32_767^2
+        // and is exactly representable by Long on supported API levels.
+        val scaledSquared = numerator.divide(length2)
+        check(scaledSquared.signum() >= 0 && scaledSquared.bitLength() <= 30)
+        val q = integerSqrt(scaledSquared.toLong())
+        val next = BigInteger.valueOf(2L * q + 1L)
+        val comparison = numerator.shiftLeft(2).compareTo(length2.multiply(next.pow(2)))
+        val rounded = if (comparison > 0 || (comparison == 0 && (q and 1L) == 1L)) q + 1L else q
+        return (if (component < 0L) -rounded else rounded).toInt()
     }
 
     fun encodeOct(vector: IntArray): Int {

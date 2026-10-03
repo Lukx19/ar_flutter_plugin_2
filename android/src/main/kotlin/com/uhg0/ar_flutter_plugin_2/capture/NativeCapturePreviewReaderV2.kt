@@ -5,7 +5,6 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
-import java.security.MessageDigest
 
 /**
  * Read-only access to committed V2 JPEGs for History/detail screens.
@@ -17,6 +16,8 @@ import java.security.MessageDigest
 internal class NativeCapturePreviewReaderV2(
     private val storeRoot: File,
 ) {
+    private val copyWorkspace = CaptureCopyWorkspace()
+
     fun materializeJpegPreview(
         manifestId: String,
         captureId: String,
@@ -41,24 +42,18 @@ internal class NativeCapturePreviewReaderV2(
             if (isValidPreview(target, descriptor)) return true
             val partial = File(parent, "${target.name}.part")
             try {
-                val digest = MessageDigest.getInstance("SHA-256")
-                var copied = 0L
-                FileInputStream(source).use { input ->
+                val receipt = FileInputStream(source).use { input ->
                     FileOutputStream(partial).use { output ->
-                        val buffer = ByteArray(COPY_BUFFER_BYTES)
-                        while (true) {
-                            val count = input.read(buffer)
-                            if (count < 0) break
-                            if (count == 0) continue
-                            output.write(buffer, 0, count)
-                            digest.update(buffer, 0, count)
-                            copied += count
-                        }
+                        val copied = copyWorkspace.copy(
+                            read = { buffer, offset, count -> input.read(buffer, offset, count) },
+                            write = { buffer, offset, count -> output.write(buffer, offset, count) },
+                        )
                         output.fd.sync()
+                        copied
                     }
                 }
-                check(copied == descriptor.length)
-                check(digest.digest().hex() == descriptor.hash)
+                check(receipt.length == descriptor.length)
+                check(receipt.digest.hex() == descriptor.hash)
                 Files.move(
                     partial.toPath(),
                     target.toPath(),
@@ -153,25 +148,17 @@ internal class NativeCapturePreviewReaderV2(
     }
 
     private fun sha256(file: File): ByteArray {
-        val digest = MessageDigest.getInstance("SHA-256")
-        FileInputStream(file).use { input ->
-            val buffer = ByteArray(COPY_BUFFER_BYTES)
-            while (true) {
-                val count = input.read(buffer)
-                if (count < 0) break
-                if (count > 0) digest.update(buffer, 0, count)
-            }
+        return FileInputStream(file).use { input ->
+            copyWorkspace.digest { buffer, offset, count -> input.read(buffer, offset, count) }.digest
         }
-        return digest.digest()
     }
 
-    private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
+    private fun ByteArray.hex() = toCaptureHashHex()
 
     private data class Descriptor(val length: Long, val hash: String)
     private data class RootPointer(val revision: Long, val hash: String)
 
     private companion object {
-        const val COPY_BUFFER_BYTES = 64 * 1024
         const val MAX_ROOT_DEPTH = 2
         const val MAX_RETAINED_ROOTS = 3
         val HASH = Regex("[0-9a-f]{64}")

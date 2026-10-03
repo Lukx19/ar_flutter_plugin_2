@@ -907,6 +907,62 @@ void main() {
 
     expect(response, orderedEquals(canonicalError));
   });
+
+  test(
+      'worker stream bounds request before qualification and response before copy',
+      () async {
+    const controlChannel = MethodChannel('visibility_grid_v2_control_98');
+    const streamChannel = BasicMessageChannel<ByteData?>(
+      'visibility_surface_stream_98',
+      BinaryCodec(),
+    );
+    final nativeToken = Uint8List.fromList(List<int>.generate(16, (i) => i));
+    final workerToken =
+        Uint8List.fromList(List<int>.generate(16, (i) => i + 16));
+    var streamCalls = 0;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(controlChannel, (call) async {
+      if (call.method == 'claimBindingLease') {
+        return <String, Object?>{
+          'nativeStreamToken': nativeToken,
+          'workerBindingToken': workerToken,
+        };
+      }
+      throw PlatformException(code: 'unsupported');
+    });
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockDecodedMessageHandler<ByteData?>(streamChannel, (_) async {
+      streamCalls++;
+      return ByteData.sublistView(
+        Uint8List(32 + 64 * 1024 + 1),
+      );
+    });
+    addTearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(controlChannel, null);
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockDecodedMessageHandler<ByteData?>(streamChannel, null);
+    });
+
+    final binding = ARVisibilityGridV2WorkerBinding.connect(
+      rootIsolateToken: ServicesBinding.rootIsolateToken!,
+      viewId: 98,
+      controlChannel: controlChannel,
+      streamChannel: streamChannel,
+    );
+    await binding.captureCleanupAuthority();
+
+    expect(
+      () => binding.exchange(Uint8List(16 * 1024 + 1)),
+      throwsRangeError,
+    );
+    expect(streamCalls, 0);
+    await expectLater(
+      binding.exchange(Uint8List(1)),
+      throwsStateError,
+    );
+    expect(streamCalls, 1);
+  });
 }
 
 Map<String, Object?> _receiptMap({

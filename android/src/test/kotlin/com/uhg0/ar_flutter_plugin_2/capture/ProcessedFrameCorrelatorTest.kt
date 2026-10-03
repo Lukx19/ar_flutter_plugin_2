@@ -25,15 +25,38 @@ class ProcessedFrameCorrelatorTest {
     @Test
     fun `expires unmatched entries and remains bounded`() {
         var now = 0L
+        val discarded = mutableListOf<String>()
         val correlator =
-            ProcessedFrameCorrelator<String>(clockMs = { now }, timeoutMs = 10, maxPendingEntries = 2)
+            ProcessedFrameCorrelator<String>(
+                clockMs = { now },
+                timeoutMs = 10,
+                maxPendingEntries = 2,
+                onFrameDiscarded = { value -> discarded.add(value) },
+            )
         correlator.onFrame(1, "one")
         correlator.onFrame(2, "two")
         correlator.onFrame(3, "three")
         assertEquals(2 to 0, correlator.snapshot())
+        assertEquals(listOf("one"), discarded)
         now = 20
         correlator.onResult(metadata(4))
         assertEquals(0 to 1, correlator.snapshot())
+        assertEquals(listOf("one", "two", "three"), discarded)
+    }
+
+    @Test
+    fun `clear releases only unmatched frames`() {
+        val discarded = mutableListOf<String>()
+        val correlator = ProcessedFrameCorrelator<String>(
+            onFrameDiscarded = { value -> discarded.add(value) },
+        )
+
+        correlator.onFrame(1L, "frame")
+        correlator.onResult(metadata(1L))
+        correlator.onFrame(2L, "unmatched")
+        correlator.clear()
+
+        assertEquals(listOf("unmatched"), discarded)
     }
 
     private fun metadata(timestamp: Long = 42L) =

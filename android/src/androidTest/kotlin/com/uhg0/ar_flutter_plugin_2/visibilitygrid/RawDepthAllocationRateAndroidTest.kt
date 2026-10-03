@@ -20,6 +20,7 @@ class RawDepthAllocationRateAndroidTest {
         val closed = AtomicInteger()
         val published = AtomicInteger()
         val minimumSamples = AtomicInteger(Int.MAX_VALUE)
+        val packedPool = DepthSamplesLeasePool()
         val metadata = RawDepthFrameMetadata(
             timestampNs = 1,
             groupGeneration = 1,
@@ -31,14 +32,21 @@ class RawDepthAllocationRateAndroidTest {
             worldFromCameraGl = DoubleArray(16) { if (it % 5 == 0) 1.0 else 0.0 },
         )
         var completion = CountDownLatch(1)
-        val processor = BoundedDepthObservationProcessor<PreparedRawDepthFrame, DepthAcquisitionResult>(
-            process = PreparedRawDepthFrame::process,
+        val processor = BoundedDepthObservationProcessor<PreparedRawDepthFrame, PackedDepthAcquisitionResult>(
+            process = { prepared ->
+                prepared.processPacked(
+                    packedPool,
+                    SampleLeaseGeneration(1, metadata.sessionGeneration, metadata.groupGeneration, metadata.timestampNs),
+                )
+            },
             publish = { result, _ ->
-                val observation = result as DepthAcquisitionResult.Observation
-                minimumSamples.getAndUpdate { minOf(it, observation.value.samples.size) }
-                if (observation.value.samples.any { it.depthMillimeters == 500 }) {
+                val observation = result as PackedDepthAcquisitionResult.Observation
+                val samples = observation.lease.samples
+                minimumSamples.getAndUpdate { minOf(it, samples.count) }
+                if ((0 until samples.count).any { samples.depthMillimetresAt(it) == 500 }) {
                     published.incrementAndGet()
                 }
+                observation.lease.close()
                 completion.countDown()
             },
         )
@@ -49,7 +57,7 @@ class RawDepthAllocationRateAndroidTest {
             V2_DEPTH_SAMPLE_CAPACITY,
         )
         try {
-            repeat(2) {
+            repeat(10) {
                 completion = CountDownLatch(1)
                 assertTrue(processor.offer(frame(), 0))
                 assertTrue(completion.await(2, TimeUnit.SECONDS))
@@ -85,9 +93,9 @@ class RawDepthAllocationRateAndroidTest {
             assertTrue(elapsed in 30_000..50_000)
             assertTrue(accepted > 0)
             assertEquals(120, accepted + dropped)
-            assertEquals(accepted + 2, published.get())
-            assertEquals(244, closed.get())
-            assertTrue("minimum retained samples ${minimumSamples.get()}", minimumSamples.get() >= 1_400)
+            assertEquals(accepted + 10, published.get())
+            assertEquals(260, closed.get())
+            assertTrue("minimum retained samples ${minimumSamples.get()}", minimumSamples.get() > 1_536)
             assertTrue(allocated >= 0 && freed >= 0)
             val allocationRate = allocated * 60_000 / elapsed
             // The 4,096-slot content-aware selector measured 51,696,931
@@ -107,6 +115,7 @@ class RawDepthAllocationRateAndroidTest {
             )
         } finally {
             processor.close()
+            packedPool.close()
         }
     }
 
@@ -121,6 +130,7 @@ class RawDepthAllocationRateAndroidTest {
         val groupFrame = VisibilityGroupFrame.copyOf(identity, identity, 100_000, 100_000)
         val canonical = emptyCanonicalView()
         val kernel = DepthEvidenceKernel()
+        val packedPool = DepthSamplesLeasePool()
         val metadata = RawDepthFrameMetadata(
             timestampNs = 1,
             groupGeneration = 1,
@@ -137,35 +147,38 @@ class RawDepthAllocationRateAndroidTest {
             SyntheticImage(2_000, 2_000, closed, foreground = false),
             V2_DEPTH_SAMPLE_CAPACITY,
         )
-        val processor = BoundedDepthObservationProcessor<PreparedRawDepthFrame, DepthAcquisitionResult>(
+        val processor = BoundedDepthObservationProcessor<PreparedRawDepthFrame, PackedDepthAcquisitionResult>(
             process = { prepared ->
-                val observation = prepared.process() as DepthAcquisitionResult.Observation
-                val value = observation.value
-                val batch = DepthEvidenceBatch(
-                    sequence.incrementAndGet().toLong(),
-                    value.timestampNs,
+                val observation = prepared.processPacked(
+                    packedPool,
+                    SampleLeaseGeneration(1, metadata.sessionGeneration, metadata.groupGeneration, sequence.incrementAndGet().toLong()),
+                ) as PackedDepthAcquisitionResult.Observation
+                val samples = observation.lease.samples
+                val batchSequence = sequence.get().toLong()
+                val batch = DepthEvidenceMetadata(
+                    batchSequence,
+                    batchSequence,
                     groupFrame,
                     identity.toList(),
                     VisibilityCameraIntrinsics(2_000, 2_000, 1_000.0, 1_000.0, 1_000.0, 1_000.0),
-                    value.samples.map {
-                        VisibilityDepthSample(it.x, it.y, it.depthMillimeters, it.confidence)
-                    },
-                    value.sourceRejectedPixels,
+                    samples.rejectedCount,
+                    true,
                 )
-                val result = kernel.prepare(batch, canonical)
+                val result = kernel.prepare(samples, batch, canonical)
                 check(result is DepthEvidenceResult.Accepted) { "mapping/fusion preparation refused: $result" }
                 kernel.discardPrepared()
                 observation
             },
             publish = { result, _ ->
-                val observation = result as DepthAcquisitionResult.Observation
-                minimumSamples.getAndUpdate { minOf(it, observation.value.samples.size) }
+                val observation = result as PackedDepthAcquisitionResult.Observation
+                minimumSamples.getAndUpdate { minOf(it, observation.lease.samples.count) }
                 published.incrementAndGet()
+                observation.lease.close()
                 completion.countDown()
             },
         )
         try {
-            repeat(2) {
+            repeat(10) {
                 assertTrue(processor.offer(frame(), 0))
                 assertTrue(completion.await(2, TimeUnit.SECONDS))
                 assertTrue(processor.awaitIdle(2_000))
@@ -199,16 +212,16 @@ class RawDepthAllocationRateAndroidTest {
             assertTrue(elapsed in 30_000..50_000)
             assertTrue(accepted > 0)
             assertEquals(120, accepted + dropped)
-            assertEquals(accepted + 2, published.get())
-            assertEquals(244, closed.get())
-            assertTrue("minimum retained samples ${minimumSamples.get()}", minimumSamples.get() >= 1_400)
+            assertEquals(accepted + 10, published.get())
+            assertEquals(260, closed.get())
+            assertTrue("minimum retained samples ${minimumSamples.get()}", minimumSamples.get() > 1_536)
             assertTrue(allocated >= 0 && freed >= 0)
             val allocationRate = allocated * 60_000 / elapsed
             // This is intentionally a separate guard from selection-only
             // allocation: it includes depth mapping, ray traversal, fusion,
             // and canonical preparation. The tablet baseline was
             // 548,598,050 bytes/min; keep a small diagnostic margin while
-            // the future pooled representation is still unimplemented.
+            // the optimized owner is measured on this same fixed workload.
             val currentBaselineGuard = 600L * 1024L * 1024L
             Log.i(
                 "RawDepthAllocationRate",
@@ -225,6 +238,7 @@ class RawDepthAllocationRateAndroidTest {
                 allocationRate <= currentBaselineGuard)
         } finally {
             processor.close()
+            packedPool.close()
             kernel.close()
         }
     }
@@ -238,6 +252,14 @@ class RawDepthAllocationRateAndroidTest {
         override val surfaceCount = 0
         override fun findSurfaceById(id: SurfaceId): DepthCanonicalSurface? = null
         override fun findSurfaceAt(voxel: Voxel): AddressedCanonicalSurface? = null
+        override fun findSurfaceAtInto(x: Int, y: Int, z: Int, scratch: CanonicalSurfaceScratch): Boolean {
+            scratch.clear()
+            return false
+        }
+        override fun findSurfaceByIdInto(id: Long, scratch: CanonicalSurfaceScratch): Boolean {
+            scratch.clear()
+            return false
+        }
         override fun visitRayCells(
             startGroupMm: DepthPointMm,
             endpointGroupMm: DepthPointMm,

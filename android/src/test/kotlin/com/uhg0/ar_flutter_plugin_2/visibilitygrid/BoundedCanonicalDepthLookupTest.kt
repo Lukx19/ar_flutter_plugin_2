@@ -6,6 +6,7 @@ import com.uhg0.ar_flutter_plugin_2.capture.JvmDescriptorFilesystemV2
 import java.io.File
 import java.nio.file.Files
 import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -1108,6 +1109,65 @@ class BoundedCanonicalDepthLookupTest {
         )
         assertEquals(null, bounded.findSurfaceById(id))
         assertTrue(bounded.result(first) is BoundedCanonicalLookupResult.Refused)
+    }
+
+    @Test
+    fun `primitive authenticated cache preserves alias proof and resets at borrow epoch`() {
+        val cache = CanonicalBoundedSurfaceCache(entryCapacity = 4, tableCapacity = 8)
+        val source = CanonicalSurfaceScratch().also {
+            it.setAddressed(7, 11, 12, 13, 3, 4, 5, 0x0203, 177, 9)
+        }
+        cache.beginBorrow(CanonicalRevisionPair(4, 8))
+        cache.remember(source)
+
+        val byVoxel = CanonicalSurfaceScratch()
+        assertTrue(cache.readByVoxel(11, 12, 13, byVoxel))
+        assertEquals(7L, byVoxel.id)
+        assertEquals(11, byVoxel.addressedVoxelX)
+        assertEquals(12, byVoxel.addressedVoxelY)
+        assertEquals(13, byVoxel.addressedVoxelZ)
+        assertEquals(3, byVoxel.voxelX)
+        assertEquals(4, byVoxel.voxelY)
+        assertEquals(5, byVoxel.voxelZ)
+
+        val byId = CanonicalSurfaceScratch()
+        assertTrue(cache.readById(7, byId))
+        assertEquals(3, byId.voxelX)
+        assertEquals(4, byId.voxelY)
+        assertEquals(5, byId.voxelZ)
+
+        cache.beginBorrow(CanonicalRevisionPair(5, 9))
+        assertFalse(cache.readByVoxel(11, 12, 13, byVoxel))
+        assertFalse(cache.readById(7, byId))
+    }
+
+    @Test
+    fun `primitive authenticated cache reuses identity proof without hiding a later refusal`() {
+        val view = MeteredCanonicalLookupView(pageReadDelta = 1, byteReadDelta = 16_384)
+        val cache = CanonicalBoundedSurfaceCache(entryCapacity = 4, tableCapacity = 8)
+        val warm = BoundedCanonicalCurrentView(
+            view,
+            BoundedCanonicalLookupRequest(1, 1, 2, 0, 2, 32_768),
+            100_000,
+            surfaceCache = cache,
+        )
+        assertTrue(warm.findSurfaceByIdInto(1, CanonicalSurfaceScratch()))
+        assertTrue(warm.findSurfaceByIdInto(1, CanonicalSurfaceScratch()))
+        assertEquals(1, view.lineageReadAttempts)
+        assertEquals(BoundedCanonicalLookupReceipt(2, 0, 2, 32_768, false), warm.result(Unit).let {
+            (it as BoundedCanonicalLookupResult.Completed).receipt
+        })
+
+        val cold = BoundedCanonicalCurrentView(
+            view,
+            BoundedCanonicalLookupRequest(1, 1, 1, 0, 0, 0),
+            100_000,
+            surfaceCache = cache,
+        )
+        val refused = cold.result(cold.findSurfaceById(SurfaceId(1)))
+        assertTrue(refused is BoundedCanonicalLookupResult.Refused)
+        assertEquals(BoundedCanonicalLookupReason.LIMIT_EXHAUSTED, (refused as BoundedCanonicalLookupResult.Refused).reason)
+        assertEquals(BoundedCanonicalLookupReceipt(1, 0, 0, 0, true), refused.receipt)
     }
 
     @Test

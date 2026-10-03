@@ -2,11 +2,22 @@ package com.uhg0.ar_flutter_plugin_2.sceneview
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.LifecycleRegistry
+import androidx.arch.core.executor.ArchTaskExecutor
+import androidx.arch.core.executor.TaskExecutor
+import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
 
 class SceneViewContractsTest {
+    private class TestLifecycleOwner : LifecycleOwner {
+        override val lifecycle = LifecycleRegistry(this)
+    }
+
     @Test
     fun `node source mapping selects the correct SceneView loader scheme`() {
         val assetResolver: (String) -> String = { "flutter_assets/$it" }
@@ -154,5 +165,115 @@ class SceneViewContractsTest {
         assertEquals(1, ownership.createCount)
         assertEquals(1, ownership.disposeCount)
         assertThrows(IllegalStateException::class.java) { ownership.onCreate() }
+    }
+
+    @Test
+    fun `platform view composition survives transient detach`() {
+        assertSame(
+            androidx.compose.ui.platform.ViewCompositionStrategy
+                .DisposeOnViewTreeLifecycleDestroyed,
+            sceneViewCompositionStrategy(),
+        )
+    }
+
+    @Test
+    fun `hidden coverage keeps its composed renderer subtree mounted`() {
+        assertTrue(
+            shouldComposeCoverageRenderer(PointCloudNativeConfig(enabled = false)),
+        )
+        assertFalse(shouldComposeCoverageRenderer(null))
+    }
+
+    @Test
+    fun `render lifecycle pauses before terminal composition disposal`() {
+        val executor = ArchTaskExecutor.getInstance()
+        executor.setDelegate(object : TaskExecutor() {
+            override fun executeOnDiskIO(runnable: Runnable) = runnable.run()
+            override fun postToMainThread(runnable: Runnable) = runnable.run()
+            override fun isMainThread() = true
+        })
+        try {
+            val parent = TestLifecycleOwner()
+            parent.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
+            parent.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_START)
+            parent.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+            val render = SceneViewRenderLifecycle(parent.lifecycle)
+
+            assertEquals(Lifecycle.State.RESUMED, render.lifecycle.currentState)
+            render.pauseForTeardown()
+            assertEquals(Lifecycle.State.CREATED, render.lifecycle.currentState)
+
+            parent.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+            assertEquals(Lifecycle.State.CREATED, render.lifecycle.currentState)
+            render.resumeAfterTransientDetach()
+            assertEquals(Lifecycle.State.RESUMED, render.lifecycle.currentState)
+            render.pauseForTeardown()
+            render.destroyAfterComposition()
+            assertEquals(Lifecycle.State.DESTROYED, render.lifecycle.currentState)
+
+            val parentDestroying = TestLifecycleOwner()
+            parentDestroying.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
+            parentDestroying.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_START)
+            parentDestroying.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+            val renderDuringParentDestroy =
+                SceneViewRenderLifecycle(parentDestroying.lifecycle)
+            parentDestroying.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
+            assertEquals(
+                Lifecycle.State.CREATED,
+                renderDuringParentDestroy.lifecycle.currentState,
+            )
+            renderDuringParentDestroy.destroyAfterComposition()
+            assertEquals(
+                Lifecycle.State.DESTROYED,
+                renderDuringParentDestroy.lifecycle.currentState,
+            )
+        } finally {
+            executor.setDelegate(null)
+        }
+    }
+
+    @Test
+    fun `render lifecycle trace records parent and terminal transitions`() {
+        val executor = ArchTaskExecutor.getInstance()
+        executor.setDelegate(object : TaskExecutor() {
+            override fun executeOnDiskIO(runnable: Runnable) = runnable.run()
+            override fun postToMainThread(runnable: Runnable) = runnable.run()
+            override fun isMainThread() = true
+        })
+        try {
+            val parent = TestLifecycleOwner()
+            parent.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
+            val trace = mutableListOf<String>()
+            val render = SceneViewRenderLifecycle(parent.lifecycle) { trace += it }
+
+            parent.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_START)
+            parent.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+            render.pauseForTeardown()
+            render.destroyAfterComposition()
+
+            assertTrue(trace.any { it.contains("source=parent event=ON_START") })
+            assertTrue(trace.any { it.contains("source=parent event=ON_RESUME") })
+            assertTrue(trace.any { it.contains("source=pause event=ON_PAUSE") })
+            assertTrue(trace.any { it.contains("source=destroyAfterComposition event=ON_DESTROY") })
+        } finally {
+            executor.setDelegate(null)
+        }
+    }
+
+    @Test
+    fun `composition disposal waits for one frame and coalesces duplicate requests`() {
+        var scheduled: (() -> Unit)? = null
+        var disposalCount = 0
+        val gate = SceneViewCompositionDisposalGate(
+            scheduleOnNextFrame = { work -> scheduled = work },
+            disposeComposition = { disposalCount++ },
+        )
+
+        gate.request()
+        gate.request()
+
+        assertEquals(0, disposalCount)
+        checkNotNull(scheduled).invoke()
+        assertEquals(1, disposalCount)
     }
 }

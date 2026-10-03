@@ -4,6 +4,294 @@ import java.io.OutputStream
 import java.security.MessageDigest
 
 /**
+ * Receipt for the serial mutation workspace retained by the packed session
+ * authority. Growth is reported separately from the steady-state capacity so
+ * callers can distinguish warm-up from per-mutation churn.
+ */
+internal data class CanonicalPreparationWorkspaceReceipt(
+    val growthEvents: Long,
+    val ownedCapacityBytes: Long,
+)
+
+/**
+ * One encoded current buffer lease. The lease is deliberately qualified by
+ * the command and both canonical revisions; a transport consumer cannot
+ * mistake a byte buffer from another adjacent transaction for the current
+ * record. The session owner keeps the lease active until the next exact
+ * canonical replacement or lifecycle close.
+ */
+internal data class EncodedCurrentLease(
+    val bufferIndex: Int,
+    val epoch: Long,
+    val length: Int,
+    val transactionId: String,
+    val commandHash: CanonicalReceiptBytes,
+    val geometryRevision: Long,
+    val lineageRevision: Long,
+    val canonicalHash: CanonicalReceiptBytes,
+)
+
+/**
+ * Bounded, serial-only staging storage for one canonical mutation. The
+ * workspace owns only primitive scratch and is reset between commands; no
+ * command values or canonical authority are retained in it.
+ */
+internal class CanonicalPreparationWorkspace {
+    internal var rowIds = IntArray(0); private set
+    internal var voxelKeys = LongArray(0); private set
+    internal var removedIds = IntArray(0); private set
+    internal var sourceIds = IntArray(0); private set
+    internal var supportTargets = IntArray(0); private set
+    internal var supportSources = IntArray(0); private set
+    internal var lineageSources = IntArray(0); private set
+    internal var lineageTargets = IntArray(0); private set
+    internal val removedSet = CanonicalPreparationIdSet(0)
+    internal val rowIdsSet = CanonicalPreparationIdSet(0)
+    internal val sourceIdsSet = CanonicalPreparationIdSet(0)
+    /** Reusable depth planner tables owned by the same serial preparation lane. */
+    internal val depthReadCache = DepthBatchReadCache()
+    internal val depthSourceIds = DepthEvidenceIdTable.forExpected(0)
+    internal val depthStructuralSourceIds = DepthEvidenceIdTable.forExpected(0)
+    internal val depthSupportSourceIds = DepthEvidenceIdTable.forExpected(0)
+    internal val depthTargetVoxels = DepthEvidenceVoxelTable.forExpected(0)
+    internal var depthSupportDetails = HashMap<SurfaceId, DepthBatchSupportDetails>()
+    internal var depthOperations = ArrayList<DepthBatchOperation>()
+    internal var depthOperationSources = ArrayList<ArrayList<SurfaceId>>()
+    internal var depthSources = ArrayList<SurfaceId>()
+    internal var depthStructuralSources = HashSet<SurfaceId>()
+    internal var depthTargets = ArrayList<CanonicalTarget>()
+    internal var depthSourceSeen = HashSet<SurfaceId>()
+    internal var depthTargetVoxelsSet = HashSet<Voxel>()
+    internal var depthSourceRows = HashMap<SurfaceId, CompactSurface>()
+    private var depthAllocatedIds = LongArray(0)
+    internal var depthRows = ArrayList<SurfaceOwner>()
+    internal var depthSupportPairs = ArrayList<PreparedSupport>()
+    internal var depthLineagePairs = ArrayList<LineageEdge>()
+    internal var depthRemovedSupportTargets = HashSet<SurfaceId>()
+    private val depthSupportAccumulatorScratch = BoundedSupportAccumulator(0)
+    private var depthSupportIds = LongArray(0)
+    private var maximumDepthOperations = 0
+    private var maximumDepthOperationSources = 0
+    private var maximumDepthSources = 0
+    private var maximumDepthTargets = 0
+    private var maximumDepthSourceRows = 0
+    private var maximumDepthSupportDetails = 0
+    private var maximumDepthRows = 0
+    private var maximumDepthSupportPairs = 0
+    private var maximumDepthLineagePairs = 0
+    private var maximumDepthRemovedSupportTargets = 0
+    internal var growthEvents: Long = 0
+        private set
+
+    internal val ownedCapacityBytes: Long
+        get() = retainedBytes()
+
+    /** Resets the serial owner for a new command without retaining command values. */
+    internal fun resetFor(commandBounds: Int) = resetFor(
+        commandBounds, commandBounds, commandBounds, commandBounds, commandBounds,
+    )
+
+    internal fun resetFor(rows: Int, removed: Int, sources: Int, support: Int, lineage: Int) {
+        require(rows >= 0 && removed >= 0 && sources >= 0 && support >= 0 && lineage >= 0)
+        rowIds = grow(rowIds, rows); voxelKeys = grow(voxelKeys, rows)
+        removedIds = grow(removedIds, removed)
+        sourceIds = grow(sourceIds, sources)
+        supportTargets = grow(supportTargets, support); supportSources = grow(supportSources, support)
+        lineageSources = grow(lineageSources, lineage); lineageTargets = grow(lineageTargets, lineage)
+        if (removedSet.reset(removed)) growthEvents++
+        if (rowIdsSet.reset(rows)) growthEvents++
+        if (sourceIdsSet.reset(sources)) growthEvents++
+    }
+
+    /**
+     * Resets all bounded depth planning scratch before a new authenticated
+     * command. Prepared outputs copy their values before this storage is reused.
+     */
+    internal fun resetDepthFor(sourceReferences: Int, targetRows: Int) {
+        require(sourceReferences >= 0 && targetRows >= 0)
+        recordDepthUsage()
+        depthReadCache.clear()
+        depthSupportDetails.clear()
+        depthOperations.clear()
+        depthOperationSources.forEach { it.clear() }
+        depthOperationSources.clear()
+        depthSources.clear()
+        depthStructuralSources.clear()
+        depthTargets.clear()
+        depthSourceSeen.clear()
+        depthTargetVoxelsSet.clear()
+        depthSourceRows.clear()
+        depthRows.clear()
+        depthSupportPairs.clear()
+        depthLineagePairs.clear()
+        depthRemovedSupportTargets.clear()
+        if (depthSourceIds.reset(sourceReferences)) growthEvents++
+        if (depthStructuralSourceIds.reset(sourceReferences)) growthEvents++
+        if (depthSupportSourceIds.reset(sourceReferences)) growthEvents++
+        if (depthTargetVoxels.reset(targetRows)) growthEvents++
+        depthSupportAccumulatorScratch.reset(0)
+    }
+
+    /** Returns reusable support-ID storage and records growth separately. */
+    internal fun depthSupportIds(required: Int): LongArray {
+        require(required >= 0)
+        if (depthSupportIds.size < required) {
+            var size = maxOf(1, depthSupportIds.size)
+            while (size < required) size = if (size > Int.MAX_VALUE / 2) required else size shl 1
+            depthSupportIds = LongArray(size)
+            growthEvents++
+        }
+        return depthSupportIds
+    }
+
+    internal fun depthSupportAccumulator(limit: Int): BoundedSupportAccumulator {
+        if (depthSupportAccumulatorScratch.reset(limit)) growthEvents++
+        return depthSupportAccumulatorScratch
+    }
+
+    internal fun depthAllocatedIds(required: Int): LongArray {
+        require(required >= 0)
+        if (depthAllocatedIds.size < required) {
+            var size = maxOf(1, depthAllocatedIds.size)
+            while (size < required) size = if (size > Int.MAX_VALUE / 2) required else size shl 1
+            depthAllocatedIds = LongArray(size)
+            growthEvents++
+        }
+        return depthAllocatedIds
+    }
+
+    /** Records lower bounds for capacities held by cleared collection owners. */
+    internal fun recordDepthUsage() {
+        maximumDepthOperations = maxOf(maximumDepthOperations, depthOperations.size)
+        maximumDepthOperationSources = maxOf(
+            maximumDepthOperationSources,
+            depthOperationSources.sumOf { it.size },
+        )
+        maximumDepthSources = maxOf(maximumDepthSources, depthSources.size, depthSourceSeen.size)
+        maximumDepthTargets = maxOf(maximumDepthTargets, depthTargets.size, depthTargetVoxelsSet.size)
+        maximumDepthSourceRows = maxOf(maximumDepthSourceRows, depthSourceRows.size)
+        maximumDepthSupportDetails = maxOf(maximumDepthSupportDetails, depthSupportDetails.size)
+        maximumDepthRows = maxOf(maximumDepthRows, depthRows.size)
+        maximumDepthSupportPairs = maxOf(maximumDepthSupportPairs, depthSupportPairs.size)
+        maximumDepthLineagePairs = maxOf(maximumDepthLineagePairs, depthLineagePairs.size)
+        maximumDepthRemovedSupportTargets = maxOf(
+            maximumDepthRemovedSupportTargets,
+            depthRemovedSupportTargets.size,
+        )
+    }
+
+    /** Releases planner storage on terminal owner close. */
+    internal fun clear() {
+        rowIds = IntArray(0); voxelKeys = LongArray(0); removedIds = IntArray(0); sourceIds = IntArray(0)
+        supportTargets = IntArray(0); supportSources = IntArray(0)
+        lineageSources = IntArray(0); lineageTargets = IntArray(0)
+        removedSet.clearStorage(); rowIdsSet.clearStorage(); sourceIdsSet.clearStorage()
+        depthReadCache.clearStorage()
+        depthSourceIds.clearStorage(); depthStructuralSourceIds.clearStorage()
+        depthSupportSourceIds.clearStorage(); depthTargetVoxels.clearStorage()
+        depthSupportDetails = HashMap()
+        depthOperations = ArrayList()
+        depthOperationSources = ArrayList()
+        depthSources = ArrayList()
+        depthStructuralSources = HashSet()
+        depthTargets = ArrayList()
+        depthSourceSeen = HashSet()
+        depthTargetVoxelsSet = HashSet()
+        depthSourceRows = HashMap()
+        depthRows = ArrayList()
+        depthSupportPairs = ArrayList()
+        depthLineagePairs = ArrayList()
+        depthRemovedSupportTargets = HashSet()
+        depthSupportIds = LongArray(0)
+        depthAllocatedIds = LongArray(0)
+        depthSupportAccumulatorScratch.clearStorage()
+        maximumDepthOperations = 0; maximumDepthOperationSources = 0; maximumDepthSources = 0
+        maximumDepthTargets = 0; maximumDepthSourceRows = 0; maximumDepthRows = 0
+        maximumDepthSupportDetails = 0
+        maximumDepthSupportPairs = 0; maximumDepthLineagePairs = 0
+        maximumDepthRemovedSupportTargets = 0
+        growthEvents = 0
+    }
+
+    internal fun retainedBytes() = rowIds.size * 4L + voxelKeys.size * 8L + removedIds.size * 4L + sourceIds.size * 4L +
+        supportTargets.size * 4L + supportSources.size * 4L + lineageSources.size * 4L + lineageTargets.size * 4L +
+        removedSet.retainedBytes() + rowIdsSet.retainedBytes() + sourceIdsSet.retainedBytes() +
+        depthSourceIds.allocatedBytes + depthStructuralSourceIds.allocatedBytes +
+        depthSupportSourceIds.allocatedBytes + depthTargetVoxels.allocatedBytes +
+        depthSupportAccumulatorScratch.retainedBytes() + depthSupportIds.size * 8L + depthAllocatedIds.size * 8L + depthReadCache.retainedBytes() +
+        maximumDepthOperations * 64L + maximumDepthOperationSources * 8L +
+        maximumDepthSources * 16L + maximumDepthTargets * 64L + maximumDepthSourceRows * 64L +
+        maximumDepthSupportDetails * 128L +
+        maximumDepthRows * 96L + maximumDepthSupportPairs * 72L +
+        maximumDepthLineagePairs * 16L + maximumDepthRemovedSupportTargets * 16L
+
+    private fun grow(values: IntArray, required: Int): IntArray =
+        if (values.size >= required) values else IntArray(grown(values.size, required)).also { growthEvents++ }
+
+    private fun grow(values: LongArray, required: Int): LongArray =
+        if (values.size >= required) values else LongArray(grown(values.size, required)).also { growthEvents++ }
+
+    private fun grown(current: Int, required: Int): Int {
+        var result = maxOf(1, current)
+        while (result < required) result = if (result > Int.MAX_VALUE / 2) required else result shl 1
+        return result
+    }
+}
+
+internal class CanonicalPreparationIdSet(expected: Int) {
+    private var keys = IntArray(tableSizeFor(maxOf(1, expected)))
+    private val mask get() = keys.size - 1
+    var size = 0
+        private set
+
+    fun reset(expected: Int): Boolean {
+        val required = tableSizeFor(maxOf(1, expected))
+        val grew = keys.size < required
+        if (grew) keys = IntArray(required) else keys.fill(0)
+        size = 0
+        return grew
+    }
+
+    fun clearStorage() {
+        keys = IntArray(2)
+        size = 0
+    }
+
+    fun addRaw(value: Int): Boolean {
+        var slot = mix(value.toLong()) and mask
+        while (keys[slot] != 0) {
+            if (keys[slot] == value) return false
+            slot = (slot + 1) and mask
+        }
+        keys[slot] = value; size++; return true
+    }
+
+    fun containsRaw(value: Int): Boolean {
+        var slot = mix(value.toLong()) and mask
+        while (keys[slot] != 0) {
+            if (keys[slot] == value) return true
+            slot = (slot + 1) and mask
+        }
+        return false
+    }
+
+    fun retainedBytes() = keys.size * 4L
+
+    private fun tableSizeFor(capacity: Int): Int {
+        var size = 1
+        while (size.toLong() * 4L < capacity.toLong() * 5L) size = size shl 1
+        return size
+    }
+
+    private fun mix(value: Long): Int {
+        var mixed = value xor (value ushr 33)
+        mixed *= -49064778989728563L
+        mixed = mixed xor (mixed ushr 33)
+        return mixed.toInt()
+    }
+}
+
+/**
  * Process-local canonical authority for one live capture session.
  *
  * The durable adapter remains the separate storage and recovery authority. This
@@ -69,10 +357,10 @@ internal class SessionCanonicalMemoryState(
     )
     private var activeBufferIndex = 0
     private val currentDigest = MessageDigest.getInstance("SHA-256")
-    private var currentLength = 0
     private var currentGeneration = 0L
+    private var activeEncodedLease: EncodedCurrentLease? = null
     private var closed = false
-    private val stageWorkspace = MutationWorkspace()
+    private val stageWorkspace = CanonicalPreparationWorkspace()
 
     override var cut: CompactCanonicalCut = initialCut()
         private set
@@ -129,21 +417,23 @@ internal class SessionCanonicalMemoryState(
             rootHash = nextRoot,
             sourceHash = nextSource,
         )
-        currentGeneration++
-        currentLength = serialized.length
-        activeBufferIndex = serialized.bufferIndex
-        val sourceGeneration = currentGeneration
-        val sourceBufferIndex = activeBufferIndex
+        currentGeneration = serialized.lease.epoch
+        activeBufferIndex = serialized.lease.bufferIndex
+        activeEncodedLease = serialized.lease
+        val sourceLease = serialized.lease
         val identity = CanonicalCurrentIdentity(
             commandHash = plan.commandHash,
             commandFingerprint = plan.commandFingerprint,
-            canonicalLength = serialized.length.toLong(),
-            canonicalHash = serialized.hash,
+            canonicalLength = sourceLease.length.toLong(),
+            canonicalHash = sourceLease.canonicalHash,
         )
         val source = CanonicalCurrentSource { output ->
             synchronized(this) {
-                check(!closed && sourceGeneration == currentGeneration) { "session canonical current source is stale" }
-                output.write(currentBuffers[sourceBufferIndex], 0, currentLength)
+                check(!closed && activeEncodedLease == sourceLease) { "session canonical current source is stale" }
+                check(cut.geometryRevision == sourceLease.geometryRevision &&
+                    cut.lineageRevision == sourceLease.lineageRevision
+                ) { "session canonical current source revision is stale" }
+                output.write(currentBuffers[sourceLease.bufferIndex], 0, sourceLease.length)
             }
         }
         activation = CanonicalActivationState(
@@ -171,6 +461,13 @@ internal class SessionCanonicalMemoryState(
         }
         activation = activation.copy(currentState = CanonicalCurrentState.Acknowledged(identity))
         CanonicalAcknowledgementResult.Acknowledged(activation)
+    }
+
+    internal fun preparationWorkspaceReceipt(): CanonicalPreparationWorkspaceReceipt = synchronized(this) {
+        CanonicalPreparationWorkspaceReceipt(
+            stageWorkspace.growthEvents,
+            stageWorkspace.ownedCapacityBytes,
+        )
     }
 
     /** Visits the current rows without creating a row-sized object graph. */
@@ -233,6 +530,50 @@ internal class SessionCanonicalMemoryState(
 
     override fun findByVoxelBounded(voxel: Voxel, maximumPageReads: Long, maximumBytesRead: Long) =
         bounded(maximumPageReads, maximumBytesRead) { findByVoxel(voxel) }
+
+    override fun findByVoxelBoundedInto(
+        x: Int,
+        y: Int,
+        z: Int,
+        maximumPageReads: Long,
+        maximumBytesRead: Long,
+        scratch: CanonicalSurfaceScratch,
+    ): CanonicalBoundedReadResult<Boolean> = synchronized(this) {
+        if (maximumPageReads < 0L || maximumBytesRead < 0L) {
+            return@synchronized CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED)
+        }
+        val slot = voxelSlot(packVisibilityGridKey(x, y, z))
+        if (closed || slot == null || !rowUsed[slot]) {
+            scratch.clear()
+            return@synchronized CanonicalBoundedReadResult.Complete(false, CanonicalReadWork.ZERO)
+        }
+        scratch.set(
+            idValue(rowIds[slot]), rowX[slot], rowY[slot], rowZ[slot],
+            rowNormal(slot), rowConfidence(slot), countLineage(idValue(rowIds[slot])),
+        )
+        CanonicalBoundedReadResult.Complete(true, CanonicalReadWork.ZERO)
+    }
+
+    override fun findByIdBoundedInto(
+        id: Long,
+        maximumPageReads: Long,
+        maximumBytesRead: Long,
+        scratch: CanonicalSurfaceScratch,
+    ): CanonicalBoundedReadResult<Boolean> = synchronized(this) {
+        if (maximumPageReads < 0L || maximumBytesRead < 0L) {
+            return@synchronized CanonicalBoundedReadResult.Refused(CanonicalBoundedReadRefusal.LIMIT_EXHAUSTED)
+        }
+        val slot = idSlot(id)
+        if (closed || slot == null || !rowUsed[slot]) {
+            scratch.clear()
+            return@synchronized CanonicalBoundedReadResult.Complete(false, CanonicalReadWork.ZERO)
+        }
+        scratch.set(
+            idValue(rowIds[slot]), rowX[slot], rowY[slot], rowZ[slot],
+            rowNormal(slot), rowConfidence(slot), countLineage(id),
+        )
+        CanonicalBoundedReadResult.Complete(true, CanonicalReadWork.ZERO)
+    }
 
     override fun readPage(region: StorageRegion, page: Int, cursor: Int, limit: Int): CompactPage {
         if (closed || cursor < 0 || limit !in 1..512) return CompactPage(emptyList(), null, 0)
@@ -359,9 +700,11 @@ internal class SessionCanonicalMemoryState(
         if (!closed) {
             closed = true
             currentGeneration++
+            activeEncodedLease = null
             rowUsed.fill(false)
             voxelSlots.fill(0)
             sourceSlots.fill(0)
+            stageWorkspace.clear()
         }
     }
 
@@ -387,7 +730,7 @@ internal class SessionCanonicalMemoryState(
         var stagedNewRows = 0
         for (index in 0 until stage.rowCount) {
             val id = idValue(stage.rowIds[index])
-            if (idSlot(id) == null || stage.removedSet.contains(id)) stagedNewRows++
+            if (idSlot(id) == null || stage.removedSet.containsRaw(encodeId(id))) stagedNewRows++
         }
         val finalLive = cut.liveSurfaceCount - removedRows + stagedNewRows
         val finalSource = sourceCount + stage.sourceCount
@@ -403,9 +746,9 @@ internal class SessionCanonicalMemoryState(
         for (index in 0 until stage.rowCount) {
             val id = idValue(stage.rowIds[index])
             val old = idSlot(id)
-            if (old == null && id < cut.nextSurfaceIdHighWater && !stage.removedSet.contains(id)) return null
+            if (old == null && id < cut.nextSurfaceIdHighWater && !stage.removedSet.containsRaw(encodeId(id))) return null
             val occupied = voxelSlot(stage.voxelKeys[index])
-            if (occupied != null && idValue(rowIds[occupied]) != id && !stage.removedSet.contains(idValue(rowIds[occupied]))) return null
+            if (occupied != null && idValue(rowIds[occupied]) != id && !stage.removedSet.containsRaw(rowIds[occupied])) return null
             if (stage.hasNewSource(id) && sourceSlot(id) != null) return null
         }
         for (index in 0 until stage.supportCount) {
@@ -461,7 +804,17 @@ internal class SessionCanonicalMemoryState(
             plan.writeCurrentTo(output)
             currentDigest.reset()
             currentDigest.update(currentBuffers[stagingBufferIndex], 0, output.count)
-            SerializedCurrent(output.count, CanonicalReceiptBytes(currentDigest.digest()), stagingBufferIndex)
+            val canonicalHash = CanonicalReceiptBytes(currentDigest.digest())
+            SerializedCurrent(EncodedCurrentLease(
+                bufferIndex = stagingBufferIndex,
+                epoch = Math.addExact(currentGeneration, 1L),
+                length = output.count,
+                transactionId = plan.commandId,
+                commandHash = plan.commandHash,
+                geometryRevision = plan.targetGeometryRevision,
+                lineageRevision = plan.targetLineageRevision,
+                canonicalHash = canonicalHash,
+            ))
         } catch (_: BufferOverflow) {
             null
         }
@@ -699,13 +1052,13 @@ internal class SessionCanonicalMemoryState(
     }
     private fun voxelRemove(key: Long) = tableRemove(voxelKeys, voxelSlots, key)
 
-    private class MutationStage(val plan: PreparedCanonicalMutation, private val workspace: MutationWorkspace) {
+    private class MutationStage(val plan: PreparedCanonicalMutation, private val workspace: CanonicalPreparationWorkspace) {
         val expectedRows = plan.dirtyRowCount
         val expectedRemoved = plan.removedSurfaceCount
         val expectedSources = plan.work.dirtySourceRecords
         val expectedSupport = plan.work.dirtySupportRecords
         val expectedLineage = plan.work.dirtyLineageRecords
-        init { workspace.prepare(expectedRows, expectedRemoved, expectedSources, expectedSupport, expectedLineage) }
+        init { workspace.resetFor(expectedRows, expectedRemoved, expectedSources, expectedSupport, expectedLineage) }
         val rowIds get() = workspace.rowIds; val voxelKeys get() = workspace.voxelKeys
         val removedIds get() = workspace.removedIds
         val sourceIds get() = workspace.sourceIds
@@ -719,46 +1072,12 @@ internal class SessionCanonicalMemoryState(
         fun addSupport(value: PreparedSupport): Boolean { if (supportCount >= expectedSupport) return false; supportTargets[supportCount] = encodeId(value.target.value); supportSources[supportCount++] = encodeId(value.source.id.value); return true }
         fun addLineage(value: LineageEdge): Boolean { if (lineageCount >= expectedLineage) return false; lineageSources[lineageCount] = encodeId(value.source.value); lineageTargets[lineageCount++] = encodeId(value.target.value); return true }
         fun validCounts() = rowCount == expectedRows && removedCount == expectedRemoved && sourceCount == expectedSources && supportCount == expectedSupport && lineageCount == expectedLineage
-        fun hasNewSource(id: Long): Boolean = sourceIdsSet.contains(id)
+        fun hasNewSource(id: Long): Boolean = sourceIdsSet.containsRaw(encodeId(id))
     }
 
-    private class MutationWorkspace {
-        var rowIds = IntArray(0); var voxelKeys = LongArray(0)
-        var removedIds = IntArray(0)
-        var sourceIds = IntArray(0)
-        var supportTargets = IntArray(0); var supportSources = IntArray(0)
-        var lineageSources = IntArray(0); var lineageTargets = IntArray(0)
-        val removedSet = LongSet(0); val rowIdsSet = LongSet(0); val sourceIdsSet = LongSet(0)
-        fun prepare(rows: Int, removed: Int, sources: Int, support: Int, lineage: Int) {
-            rowIds = grow(rowIds, rows); voxelKeys = grow(voxelKeys, rows)
-            removedIds = grow(removedIds, removed)
-            sourceIds = grow(sourceIds, sources)
-            supportTargets = grow(supportTargets, support); supportSources = grow(supportSources, support)
-            lineageSources = grow(lineageSources, lineage); lineageTargets = grow(lineageTargets, lineage)
-            removedSet.reset(removed); rowIdsSet.reset(rows); sourceIdsSet.reset(sources)
-        }
-        fun retainedBytes() = rowIds.size * 4L + voxelKeys.size * 8L + removedIds.size * 4L + sourceIds.size * 4L +
-            supportTargets.size * 4L + supportSources.size * 4L + lineageSources.size * 4L + lineageTargets.size * 4L + removedSet.retainedBytes() + rowIdsSet.retainedBytes() + sourceIdsSet.retainedBytes()
-        private fun grow(values: IntArray, required: Int): IntArray = if (values.size >= required) values else IntArray(grown(values.size, required))
-        private fun grow(values: LongArray, required: Int): LongArray = if (values.size >= required) values else LongArray(grown(values.size, required))
-        private fun grow(values: ByteArray, required: Int): ByteArray = if (values.size >= required) values else ByteArray(grown(values.size, required))
-        private fun grown(current: Int, required: Int): Int { var result = maxOf(1, current); while (result < required) result = if (result > Int.MAX_VALUE / 2) required else result shl 1; return result }
-    }
-
-    private data class SerializedCurrent(val length: Int, val hash: CanonicalReceiptBytes, val bufferIndex: Int)
+    private data class SerializedCurrent(val lease: EncodedCurrentLease)
     private class BufferOverflow : RuntimeException()
     private class FixedBufferOutput(private val buffer: ByteArray) : OutputStream() { var count = 0; override fun write(value: Int) { if (count == buffer.size) throw BufferOverflow(); buffer[count++] = value.toByte() }; override fun write(bytes: ByteArray, offset: Int, length: Int) { if (length < 0 || count > buffer.size - length) throw BufferOverflow(); bytes.copyInto(buffer, count, offset, offset + length); count += length } }
-    private class LongSet(expected: Int) {
-        private var keys = IntArray(tableSizeFor(maxOf(1, expected)))
-        private val mask get() = keys.size - 1
-        var size = 0; private set
-        fun reset(expected: Int) { val required = tableSizeFor(maxOf(1, expected)); if (keys.size < required) keys = IntArray(required) else keys.fill(0); size = 0 }
-        fun add(value: Long): Boolean = addRaw(encodeId(value))
-        fun addRaw(value: Int): Boolean { var slot = mix(value.toLong()) and mask; while (keys[slot] != 0) { if (keys[slot] == value) return false; slot = (slot + 1) and mask }; keys[slot] = value; size++; return true }
-        fun contains(value: Long): Boolean = containsRaw(encodeId(value))
-        fun containsRaw(value: Int): Boolean { var slot = mix(value.toLong()) and mask; while (keys[slot] != 0) { if (keys[slot] == value) return true; slot = (slot + 1) and mask }; return false }
-        fun retainedBytes() = keys.size * 4L
-    }
     private class SourceChunk { val ids = IntArray(CHUNK_SIZE); val x = IntArray(CHUNK_SIZE); val y = IntArray(CHUNK_SIZE); val z = IntArray(CHUNK_SIZE); val normals = ShortArray(CHUNK_SIZE); val confidences = ByteArray(CHUNK_SIZE); val fingerprints = ByteArray(CHUNK_SIZE * FINGERPRINT_BYTES) }
     private class ChunkedIntColumn(capacity: Int) {
         private val chunks = arrayOfNulls<IntArray>(chunkCount(capacity))

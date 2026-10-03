@@ -53,8 +53,9 @@ internal class CommittedGeometryCut(
         }
         require(upserts.map { it.surfaceId }.toSet().size == upserts.size)
         require(removedSurfaceIds.all { it in 1 until 0x1_0000_0000L })
-        require(removedSurfaceIds.distinct().size == removedSurfaceIds.size)
-        require(upserts.none { it.surfaceId in removedSurfaceIds.toSet() }) {
+        val removedIds = removedSurfaceIds.toSet()
+        require(removedIds.size == removedSurfaceIds.size)
+        require(upserts.none { it.surfaceId in removedIds }) {
             "Committed geometry upsert and removal identities must be disjoint"
         }
     }

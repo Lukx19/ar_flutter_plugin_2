@@ -180,7 +180,9 @@ class ImageCacheManager(
     fun cacheImageBytes(imageId: String, imageBytes: ByteArray, format: Int): Boolean {
         return cacheImageAssets(
             imageId = imageId,
-            assets = mapOf(formatName(format) to CachedImageAsset(imageBytes.copyOf(), format)),
+            // cacheImageAssets takes the one immutable store copy. Keeping the
+            // producer buffer untouched here avoids a second full-image copy.
+            assets = mapOf(formatName(format) to CachedImageAsset(imageBytes, format)),
         )
     }
 
@@ -273,7 +275,10 @@ class ImageCacheManager(
         return commitReservedAssets(
             reservationToken = reservationToken,
             imageId = imageId,
-            assets = mapOf(formatName(format) to CachedImageAsset(imageBytes.copyOf(), format)),
+            // commitReservedAssets owns the immutable cache copy after the
+            // reservation is consumed; the caller may release its buffer once
+            // this method returns.
+            assets = mapOf(formatName(format) to CachedImageAsset(imageBytes, format)),
         )
     }
 
@@ -647,7 +652,7 @@ class ImageCacheManager(
 
     private fun sha256(bytes: ByteArray): String {
         val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
-        return digest.joinToString(separator = "") { byte -> "%02x".format(byte) }
+        return digest.toCaptureHashHex()
     }
 
     private fun notifyCapacityChanged() {

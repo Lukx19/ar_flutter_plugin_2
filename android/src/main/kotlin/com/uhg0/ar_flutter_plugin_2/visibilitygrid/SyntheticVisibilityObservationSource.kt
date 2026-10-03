@@ -7,17 +7,170 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 internal const val SYNTHETIC_SPHERE_VIEW_COUNT = 20
+internal const val SYNTHETIC_DENSE_CAMPAIGN_VARIANTS = 25
+internal const val SYNTHETIC_CAMPAIGN_FEATURE_SAMPLES = 5
+internal const val SYNTHETIC_CAMPAIGN_FEATURE_FIXTURE = "visibleBackgroundCatalog"
+
+internal fun syntheticDenseCampaignCameraX(variant: Int): Double {
+    require(variant in 0 until SYNTHETIC_DENSE_CAMPAIGN_VARIANTS)
+    return if (variant < 5) -0.48 + variant * 0.02 else -0.38 + (variant - 5) * 0.04
+}
 
 /** Deterministic copied-source emitter shared by JVM and debug emulator gates. */
 internal class SyntheticVisibilityObservationSource(
     private val runtime: AndroidVisibilityGridRuntime,
     private val ownership: () -> VisibilityObservationOwnership?,
-) {
+) : AutoCloseable {
     private var sequence = 0L
     private var worldFromCameraGl = identityVisibilityGridTransform()
     private var groupFromCameraGl = identityVisibilityGridTransform()
     private var sweepAnchorWorldFromCameraGl = identityVisibilityGridTransform()
     private var sweepGroupFromWorldGl = identityVisibilityGridTransform().toList()
+    private var cachedDepthGrids: List<List<VisibilityDepthSample>>? = null
+    private var cachedCampaignDepthGrids: List<List<VisibilityDepthSample>>? = null
+    private var campaignFeatureCoordinates: DoubleArray? = null
+    private var campaignFeatureFirstColumns: IntArray? = null
+    private var campaignCameraPoses: Array<DoubleArray>? = null
+    private var lastCopiedFeatureTimestampNs: Long? = null
+    private var lastCopiedDepthTimestampNs: Long? = null
+    private val featureLeasePool = FeatureSamplesLeasePool()
+    private val depthLeasePool = DepthSamplesLeasePool()
+
+    /**
+     * Fences the native latest-only lanes before an end-of-workload receipt.
+     *
+     * The producer scheduler can stop while a copied observation is still
+     * resident in the runtime. This is intentionally explicit instead of
+     * being hidden in [packedLeaseReceipts], because ordinary snapshots are
+     * also used while mapping stalls are being observed.
+     */
+    internal fun awaitSyntheticIdle() {
+        if (runtime.isSyntheticSource()) runtime.awaitDebugFixtureIdle()
+    }
+
+    internal fun packedLeaseReceipts(): Map<String, SampleLeasePoolReceipt> = mapOf(
+        "feature" to featureLeasePool.receipt(),
+        "depth" to depthLeasePool.receipt(),
+    )
+
+    /** Refuses new copies; active mapper borrows release their storage after drain. */
+    override fun close() {
+        featureLeasePool.close()
+        depthLeasePool.close()
+        cachedDepthGrids = null
+        cachedCampaignDepthGrids = null
+        campaignFeatureCoordinates = null
+        campaignFeatureFirstColumns = null
+        campaignCameraPoses = null
+    }
+
+    /** Prebuilds five legacy views or 25 finite campaign views of the fixed plane and patch. */
+    fun prepareDenseDepthGrids(campaignVariants: Boolean = false) {
+        val cut = requireNotNull(ownership())
+        anchor(cut.groupFrame.worldFromGroupGl.toDoubleArray(), cut.groupFrame)
+        if (campaignVariants && campaignFeatureCoordinates == null) prepareCampaignFeatures()
+        if (if (campaignVariants) cachedCampaignDepthGrids != null else cachedDepthGrids != null) return
+        val grids = List(if (campaignVariants) SYNTHETIC_DENSE_CAMPAIGN_VARIANTS else 5) { marker ->
+            val cameraX = if (campaignVariants) syntheticDenseCampaignCameraX(marker) else (marker - 2) * 0.04
+            VisibilityDepthObservation.copySamples(List(V2_DEPTH_SAMPLE_CAPACITY) { index ->
+                val x = 10 + index % 64 * 20
+                val y = 7 + index / 64 * 15
+                val patchX = (x - SYNTHETIC_PRINCIPAL_X) / SYNTHETIC_FOCAL_LENGTH * 0.75 + cameraX
+                val patchY = (y - SYNTHETIC_PRINCIPAL_Y) / SYNTHETIC_FOCAL_LENGTH * 0.75
+                VisibilityDepthSample(
+                    x = x,
+                    y = y,
+                    depthMillimeters = if (kotlin.math.abs(patchX) < 0.10 &&
+                        kotlin.math.abs(patchY) < 0.10) 750 else 1_000,
+                    confidence = 255,
+                )
+            })
+        }
+        if (campaignVariants) cachedCampaignDepthGrids = grids else cachedDepthGrids = grids
+    }
+
+    fun emitDenseDepthGrid(timestampNs: Long, marker: Int, campaignVariants: Boolean = false): Boolean {
+        require(marker in 0 until if (campaignVariants) SYNTHETIC_DENSE_CAMPAIGN_VARIANTS else 5)
+        val cut = ownership() ?: return false
+        val samples = requireNotNull(if (campaignVariants) cachedCampaignDepthGrids else cachedDepthGrids)[marker]
+        val pose = if (campaignVariants) requireNotNull(campaignCameraPoses)[marker] else worldFromCameraGl.copyOf()
+        val cameraX = if (campaignVariants) syntheticDenseCampaignCameraX(marker) else (marker - 2) * 0.04
+        if (!campaignVariants) for (axis in 0..2) pose[12 + axis] += pose[axis] * cameraX
+        val lease = depthLeasePool.tryAcquire(cut) ?: return false
+        lease.clear()
+        try {
+            samples.forEach { sample ->
+                check(lease.append(sample.x, sample.y, sample.depthMillimeters, sample.confidence))
+            }
+            val accepted = runtime.offerDepth(VisibilityDepthObservation.fromPacked(
+                ownership = cut,
+                frame = syntheticFrame(VisibilityObservationSource.SYNTHETIC_DEPTH, timestampNs, pose),
+                packedSamples = lease.samples,
+                sourceRejectedSamples = 0,
+            ))
+            if (accepted) lastCopiedDepthTimestampNs = timestampNs
+            return accepted
+        } catch (error: RuntimeException) {
+            lease.close()
+            throw error
+        }
+    }
+
+    /**
+     * A stable world catalog on the background wall. At y=.15 the ray crosses
+     * the foreground depth at y=.1125, outside its .10-metre half extent.
+     * Every frame contains the complete visible five-point selection, so
+     * latest-frame coalescing cannot bias a rotating one-point normal sample.
+     */
+    private fun prepareCampaignFeatures() {
+        val coordinates = DoubleArray(48 * 3)
+        repeat(48) { column ->
+            val local = localToGroup((-520 + column * 20) / 1_000.0, 0.15, -1.0)
+            local.copyInto(coordinates, column * 3)
+        }
+        val firstColumns = IntArray(SYNTHETIC_DENSE_CAMPAIGN_VARIANTS)
+        val poses = Array(SYNTHETIC_DENSE_CAMPAIGN_VARIANTS) { variant ->
+            val cameraX = syntheticDenseCampaignCameraX(variant)
+            val cameraMillimetres = (cameraX * 1_000).roundToInt()
+            firstColumns[variant] = (cameraMillimetres - 40 + 520) / 20
+            worldFromCameraGl.copyOf().also { pose ->
+                for (axis in 0..2) pose[12 + axis] += pose[axis] * cameraX
+            }
+        }
+        campaignFeatureCoordinates = coordinates
+        campaignFeatureFirstColumns = firstColumns
+        campaignCameraPoses = poses
+    }
+
+    fun emitCampaignFeatureFrame(timestampNs: Long, variant: Int): Boolean {
+        require(variant in 0 until SYNTHETIC_DENSE_CAMPAIGN_VARIANTS)
+        val cut = ownership() ?: return false
+        val coordinates = requireNotNull(campaignFeatureCoordinates)
+        val first = requireNotNull(campaignFeatureFirstColumns)[variant]
+        val pose = requireNotNull(campaignCameraPoses)[variant]
+        val lease = featureLeasePool.tryAcquire(cut) ?: return false
+        lease.clear()
+        try {
+            repeat(SYNTHETIC_CAMPAIGN_FEATURE_SAMPLES) { index ->
+                val column = first + index
+                val id = 300_000 + column
+                check(lease.acceptId(id))
+                check(lease.append(id, coordinates[column * 3], coordinates[column * 3 + 1],
+                    coordinates[column * 3 + 2], 1.0))
+            }
+            val accepted = runtime.offerFeature(VisibilityFeatureObservation.fromPacked(
+                ownership = cut,
+                frame = syntheticFrame(VisibilityObservationSource.SYNTHETIC_FEATURE, timestampNs, pose),
+                packedSamples = lease.samples,
+                sourceRejectedSamples = 0,
+            ))
+            if (accepted) lastCopiedFeatureTimestampNs = timestampNs
+            return accepted
+        } catch (error: RuntimeException) {
+            lease.close()
+            throw error
+        }
+    }
 
     /** Anchors feature geometry to the active group and depth to one exact AR world pose. */
     fun anchor(worldFromCameraGl: DoubleArray, groupFrame: VisibilityGroupFrame) {
@@ -46,28 +199,27 @@ internal class SyntheticVisibilityObservationSource(
             timestampNs = timestampNs,
         )
         val local = localToGroup(lateralMarker.toDouble() / 100.0, 0.0, -1.0)
-        val samples = VisibilityFeatureObservation.copySamples(
-            listOf(
-                VisibilityFeatureSample(
-                    id = marker.coerceAtLeast(0),
-                    xWorld = local[0],
-                    yWorld = local[1],
-                    zWorld = local[2],
-                    confidence = 1.0,
+        val lease = featureLeasePool.tryAcquire(cut) ?: return false
+        lease.clear()
+        val id = marker.coerceAtLeast(0)
+        try {
+            check(lease.acceptId(id))
+            check(lease.append(id, local[0], local[1], local[2], 1.0))
+            val accepted = runtime.offerFeature(
+                VisibilityFeatureObservation.fromPacked(
+                    ownership = cut,
+                    frame = frame,
+                    packedSamples = lease.samples,
+                    sourceRejectedSamples = 0,
                 ),
-            ),
-        )
-        return runtime.offerFeature(
-            VisibilityFeatureObservation(
-                ownership = cut,
-                frame = frame,
-                samples = samples,
-                sourceRejectedSamples = 0,
-                payloadBytes = VisibilityFeatureObservation.FEATURE_FIXED_BYTES +
-                    samples.size * VisibilityFeatureObservation.FEATURE_SAMPLE_BYTES,
-            ),
-            callbackCopyNs,
-        )
+                callbackCopyNs,
+            )
+            if (accepted) lastCopiedFeatureTimestampNs = timestampNs
+            return accepted
+        } catch (error: RuntimeException) {
+            lease.close()
+            throw error
+        }
     }
 
     fun emitDepth(
@@ -80,26 +232,27 @@ internal class SyntheticVisibilityObservationSource(
             source = VisibilityObservationSource.SYNTHETIC_DEPTH,
             timestampNs = timestampNs,
         )
-        val samples = VisibilityDepthObservation.copySamples(
-            listOf(
-                VisibilityDepthSample(
-                    x = SYNTHETIC_PRINCIPAL_X + lateralMarker.coerceAtLeast(0) * 20,
-                    y = SYNTHETIC_PRINCIPAL_Y,
-                    depthMillimeters = SYNTHETIC_DEPTH_MILLIMETERS,
-                    confidence = 255,
-                ),
-            ),
-        )
-        return runtime.offerDepth(
-            VisibilityDepthObservation(
+        val lease = depthLeasePool.tryAcquire(cut) ?: return false
+        lease.clear()
+        try {
+            check(lease.append(
+                SYNTHETIC_PRINCIPAL_X + lateralMarker.coerceAtLeast(0) * 20,
+                SYNTHETIC_PRINCIPAL_Y,
+                SYNTHETIC_DEPTH_MILLIMETERS,
+                255,
+            ))
+            val accepted = runtime.offerDepth(VisibilityDepthObservation.fromPacked(
                 ownership = cut,
                 frame = frame,
-                samples = samples,
+                packedSamples = lease.samples,
                 sourceRejectedSamples = 0,
-                payloadBytes = VisibilityDepthObservation.DEPTH_FIXED_BYTES +
-                    samples.size * VisibilityDepthObservation.DEPTH_SAMPLE_BYTES,
-            ),
-        )
+            ))
+            if (accepted) lastCopiedDepthTimestampNs = timestampNs
+            return accepted
+        } catch (error: RuntimeException) {
+            lease.close()
+            throw error
+        }
     }
 
     /** Exercises both per-observation sample ceilings without expanding the scene. */
@@ -109,60 +262,75 @@ internal class SyntheticVisibilityObservationSource(
     /** Drives the full feature source through a host or emulator integration owner. */
     fun emitMaximumFeature(featureTimestampNs: Long): Boolean {
         val cut = ownership() ?: return false
-        val featureSamples = VisibilityFeatureObservation.copySamples(
-            List(V2_FEATURE_SAMPLE_CAPACITY) { index ->
+        val copiedTimestampNs = nextFeatureTimestamp(featureTimestampNs)
+        val lease = featureLeasePool.tryAcquire(cut) ?: return false
+        try {
+            lease.clear()
+            for (index in 0 until V2_FEATURE_SAMPLE_CAPACITY) {
                 val local = localToGroup(
                     0.30 + (index % 40).toDouble() / 4_000.0,
                     (index / 40).toDouble() / 4_000.0,
                     -1.0,
                 )
-                VisibilityFeatureSample(
-                    id = 100_000 + index,
-                    xWorld = local[0],
-                    yWorld = local[1],
-                    zWorld = local[2],
-                    confidence = 1.0,
-                )
-            },
-        )
-        return runtime.offerFeature(
-            VisibilityFeatureObservation(
-                ownership = cut,
-                frame = syntheticFrame(VisibilityObservationSource.SYNTHETIC_FEATURE, featureTimestampNs),
-                samples = featureSamples,
-                sourceRejectedSamples = 0,
-                payloadBytes = VisibilityFeatureObservation.FEATURE_FIXED_BYTES +
-                    featureSamples.size * VisibilityFeatureObservation.FEATURE_SAMPLE_BYTES,
-            ),
-        )
+                val id = 100_000 + index
+                check(lease.acceptId(id))
+                check(lease.append(id, local[0], local[1], local[2], 1.0))
+            }
+            val accepted = runtime.offerFeature(
+                VisibilityFeatureObservation.fromPacked(
+                    ownership = cut,
+                    frame = syntheticFrame(VisibilityObservationSource.SYNTHETIC_FEATURE, copiedTimestampNs),
+                    packedSamples = lease.samples,
+                    sourceRejectedSamples = 0,
+                ),
+            )
+            if (accepted) lastCopiedFeatureTimestampNs = copiedTimestampNs
+            return accepted
+        } catch (error: RuntimeException) {
+            lease.close()
+            throw error
+        }
     }
 
     /** A fresh maximum-depth offer after a prior exact canonical ACK. */
     fun emitMaximumDepth(timestampNs: Long): Boolean {
         val cut = ownership() ?: return false
-        val depthSamples = VisibilityDepthObservation.copySamples(
-            List(V2_DEPTH_SAMPLE_CAPACITY) { index ->
-                VisibilityDepthSample(
-                    x = SYNTHETIC_PRINCIPAL_X - 24 + index % 48,
-                    y = SYNTHETIC_PRINCIPAL_Y - 16 + index / 48,
+        val copiedTimestampNs = nextDepthTimestamp(timestampNs)
+        val lease = depthLeasePool.tryAcquire(cut) ?: return false
+        try {
+            lease.clear()
+            for (index in 0 until V2_DEPTH_SAMPLE_CAPACITY) {
+                check(lease.append(
+                    SYNTHETIC_PRINCIPAL_X - 24 + index % 48,
+                    SYNTHETIC_PRINCIPAL_Y - 16 + index / 48,
                     // This near-field batch probes the full selected-sample
                     // ceiling through bounded canonical work.
-                    depthMillimeters = MAXIMUM_SAMPLE_DEPTH_MILLIMETERS,
-                    confidence = 255,
-                )
-            },
-        )
-        return runtime.offerDepth(
-            VisibilityDepthObservation(
-                ownership = cut,
-                frame = syntheticFrame(VisibilityObservationSource.SYNTHETIC_DEPTH, timestampNs),
-                samples = depthSamples,
-                sourceRejectedSamples = 0,
-                payloadBytes = VisibilityDepthObservation.DEPTH_FIXED_BYTES +
-                    depthSamples.size * VisibilityDepthObservation.DEPTH_SAMPLE_BYTES,
-            ),
-        )
+                    MAXIMUM_SAMPLE_DEPTH_MILLIMETERS,
+                    255,
+                ))
+            }
+            val accepted = runtime.offerDepth(
+                VisibilityDepthObservation.fromPacked(
+                    ownership = cut,
+                    frame = syntheticFrame(VisibilityObservationSource.SYNTHETIC_DEPTH, copiedTimestampNs),
+                    packedSamples = lease.samples,
+                    sourceRejectedSamples = 0,
+                ),
+            )
+            if (accepted) lastCopiedDepthTimestampNs = copiedTimestampNs
+            return accepted
+        } catch (error: RuntimeException) {
+            lease.close()
+            throw error
+        }
     }
+
+    /** Emits a retry after a maximum batch without regressing its source timestamp. */
+    fun emitMonotonicDepth(
+        timestampNs: Long,
+        marker: Int = 0,
+        lateralMarker: Int = marker,
+    ): Boolean = emitDepth(nextDepthTimestamp(timestampNs), marker, lateralMarker)
 
     /** One bounded camera view of a two-metre spherical room around the anchor. */
     fun emitSphereView(
@@ -197,9 +365,18 @@ internal class SyntheticVisibilityObservationSource(
         val worldPose = compose(sweepAnchorWorldFromCameraGl.toList(), relative)
         val groupPose = compose(sweepGroupFromWorldGl, worldPose)
         val center = sweepAnchorWorldFromCameraGl
-        val featureSamples = ArrayList<VisibilityFeatureSample>(64)
-        val depthSamples = ArrayList<VisibilityDepthSample>(8)
-        for (sample in 0 until 64) {
+        val cut = ownership() ?: return false to false
+        val featureLease = if (includeFeature) featureLeasePool.tryAcquire(cut) else null
+        val depthLease = if (includeDepth) depthLeasePool.tryAcquire(cut) else null
+        if ((includeFeature && featureLease == null) || (includeDepth && depthLease == null)) {
+            featureLease?.close()
+            depthLease?.close()
+            return false to false
+        }
+        featureLease?.clear()
+        depthLease?.clear()
+        try {
+            for (sample in 0 until 64) {
             val pixelX = 40 + (sample % 8) * 171
             val pixelY = 60 + (sample / 8) * 120
             val cameraRay = doubleArrayOf(
@@ -223,40 +400,45 @@ internal class SyntheticVisibilityObservationSource(
                     sweepGroupFromWorldGl[8 + axis] * world[2] +
                     sweepGroupFromWorldGl[12 + axis]
             }
-            featureSamples += VisibilityFeatureSample(
-                id = 200_000 + viewIndex * 64 + sample,
-                xWorld = group[0], yWorld = group[1], zWorld = group[2], confidence = 1.0,
-            )
+            featureLease?.let { lease ->
+                val id = 200_000 + viewIndex * 64 + sample
+                check(lease.acceptId(id))
+                check(lease.append(id, group[0], group[1], group[2], 1.0))
+            }
             if (sample % 8 == 4) {
-                depthSamples += VisibilityDepthSample(
-                    x = pixelX, y = pixelY,
-                    depthMillimeters = (distance / rayLength * 1000.0).roundToInt(),
-                    confidence = 255,
-                )
+                depthLease?.let { lease ->
+                    check(lease.append(
+                        pixelX, pixelY,
+                        (distance / rayLength * 1000.0).roundToInt(),
+                        255,
+                    ))
+                }
             }
         }
-        val cut = ownership() ?: return false to false
-        val feature = includeFeature && runtime.offerFeature(
-            VisibilityFeatureObservation(
-                ownership = cut,
-                frame = syntheticFrame(VisibilityObservationSource.SYNTHETIC_FEATURE, featureTimestampNs, groupPose, SPHERE_FOCAL_LENGTH),
-                samples = featureSamples,
-                sourceRejectedSamples = 0,
-                payloadBytes = VisibilityFeatureObservation.FEATURE_FIXED_BYTES +
-                    featureSamples.size * VisibilityFeatureObservation.FEATURE_SAMPLE_BYTES,
-            ),
-        )
-        val depth = includeDepth && runtime.offerDepth(
-            VisibilityDepthObservation(
-                ownership = cut,
-                frame = syntheticFrame(VisibilityObservationSource.SYNTHETIC_DEPTH, depthTimestampNs, worldPose, SPHERE_FOCAL_LENGTH),
-                samples = depthSamples,
-                sourceRejectedSamples = 0,
-                payloadBytes = VisibilityDepthObservation.DEPTH_FIXED_BYTES +
-                    depthSamples.size * VisibilityDepthObservation.DEPTH_SAMPLE_BYTES,
-            ),
-        )
-        return feature to depth
+            val feature = featureLease?.let { lease ->
+                runtime.offerFeature(VisibilityFeatureObservation.fromPacked(
+                    ownership = cut,
+                    frame = syntheticFrame(VisibilityObservationSource.SYNTHETIC_FEATURE, featureTimestampNs, groupPose, SPHERE_FOCAL_LENGTH),
+                    packedSamples = lease.samples,
+                    sourceRejectedSamples = 0,
+                ))
+            } ?: false
+            if (feature) lastCopiedFeatureTimestampNs = featureTimestampNs
+            val depth = depthLease?.let { lease ->
+                runtime.offerDepth(VisibilityDepthObservation.fromPacked(
+                    ownership = cut,
+                    frame = syntheticFrame(VisibilityObservationSource.SYNTHETIC_DEPTH, depthTimestampNs, worldPose, SPHERE_FOCAL_LENGTH),
+                    packedSamples = lease.samples,
+                    sourceRejectedSamples = 0,
+                ))
+            } ?: false
+            if (depth) lastCopiedDepthTimestampNs = depthTimestampNs
+            return feature to depth
+        } catch (error: RuntimeException) {
+            featureLease?.close()
+            depthLease?.close()
+            throw error
+        }
     }
 
     private fun syntheticFrame(
@@ -289,6 +471,20 @@ internal class SyntheticVisibilityObservationSource(
         ),
         depthCapability = runtime.snapshot().depthCapability,
     )
+
+    private fun nextFeatureTimestamp(requestedTimestampNs: Long): Long =
+        nextTimestamp(requestedTimestampNs, lastCopiedFeatureTimestampNs)
+
+    private fun nextDepthTimestamp(requestedTimestampNs: Long): Long =
+        nextTimestamp(requestedTimestampNs, lastCopiedDepthTimestampNs)
+
+    private fun nextTimestamp(requestedTimestampNs: Long, lastCopiedTimestampNs: Long?): Long {
+        val nextAfterLast = lastCopiedTimestampNs?.let {
+            if (it == Long.MAX_VALUE) Long.MAX_VALUE else it + 1L
+        }
+        return if (nextAfterLast == null) requestedTimestampNs else
+            maxOf(requestedTimestampNs, nextAfterLast)
+    }
 
     private fun localToGroup(x: Double, y: Double, z: Double): DoubleArray = doubleArrayOf(
         groupFromCameraGl[0] * x + groupFromCameraGl[4] * y + groupFromCameraGl[8] * z + groupFromCameraGl[12],

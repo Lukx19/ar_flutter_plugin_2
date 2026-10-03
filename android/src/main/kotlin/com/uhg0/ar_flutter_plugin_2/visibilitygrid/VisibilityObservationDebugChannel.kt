@@ -2,6 +2,8 @@ package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
 import android.os.Debug
 import android.os.SystemClock
+import com.uhg0.ar_flutter_plugin_2.performance.AllocationCounters
+import com.uhg0.ar_flutter_plugin_2.performance.AllocationWorkReceipt
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -57,6 +59,7 @@ internal class VisibilityObservationDebugChannel(
     private val allocationTimestampNs: () -> Long = {
         1_000_000_000_000_000_000L + SystemClock.elapsedRealtimeNanos()
     },
+    private val physicalSamplePools: (() -> Map<String, SampleLeasePoolReceipt>)? = null,
 ) : MethodChannel.MethodCallHandler {
     private val channel = MethodChannel(messenger, "visibility_observation_v2_$viewId")
     private val source = SyntheticVisibilityObservationSource(runtime, ownership)
@@ -72,11 +75,25 @@ internal class VisibilityObservationDebugChannel(
     private val workloadDepthOffers = AtomicLong()
     private val workloadFeatureAccepted = AtomicLong()
     private val workloadDepthAccepted = AtomicLong()
+    private var workloadFeatureFixture = "legacyRotatingPoint"
+    private var workloadFeatureSamplesPerOffer = 1
+    private var workloadFeatureMaterialCommitsBefore = 0L
     private val workloadError = AtomicReference<String?>(null)
+    private var allocationStage: Pair<String, AllocationCounters>? = null
+
+    private fun allocationCounters() = AllocationCounters(
+        SystemClock.elapsedRealtimeNanos(),
+        Debug.getRuntimeStat("art.gc.bytes-allocated")!!.toLong(),
+        Debug.getRuntimeStat("art.gc.bytes-freed")!!.toLong(),
+        Debug.getRuntimeStat("art.gc.gc-count")!!.toLong(),
+        Debug.getRuntimeStat("art.gc.gc-time")!!.toLong(),
+    )
 
     init {
         channel.setMethodCallHandler(this)
     }
+
+    internal fun samplePoolReceipts(): Map<String, SampleLeasePoolReceipt> = source.packedLeaseReceipts()
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         if (!isDebuggable) {
@@ -118,13 +135,43 @@ internal class VisibilityObservationDebugChannel(
                     result.success(true)
                 }
                 "snapshot" -> dispatchSnapshot(result) {
-                    runtime.snapshotWireMap() + mapOf("mappingStalled" to gate.stalled())
+                    runtime.snapshotWireMap() + mapOf(
+                        "mappingStalled" to gate.stalled(),
+                        "syntheticSamplePools" to samplePoolReceipts().mapValues { it.value.toWireMap() },
+                        "arCoreSamplePools" to physicalSamplePools?.invoke()?.mapValues { it.value.toWireMap() },
+                    )
                 }
                 "pressureSnapshot" -> dispatchSnapshot(result) {
                     VisibilityPressureReceipt.capture(
                         runtime.snapshot(),
                         pressureOwners(),
                     ).toWireMap()
+                }
+                "beginAllocationStage" -> {
+                    check(allocationStage == null) { "allocation stage already running" }
+                    val stage = requireNotNull(call.argument<String>("stage"))
+                    require(stage.isNotBlank() && stage.length <= 64) { "invalid allocation stage" }
+                    allocationStage = stage to allocationCounters()
+                    result.success(true)
+                }
+                "endAllocationStage" -> {
+                    val before = requireNotNull(allocationStage) { "allocation stage is absent" }
+                    require(call.argument<String>("stage") == before.first) { "allocation stage mismatch" }
+                    val after = allocationCounters()
+                    fun units(name: String) = call.argument<Number>(name)?.toLong() ?: 0L
+                    val receipt = AllocationWorkReceipt.between(before.first, before.second, after,
+                        units("completedUnits"), units("inputBytes"), units("selectedSamples"),
+                        units("ownedCapacityBytes"), Math.toIntExact(units("peakLeases")), units("growthEvents"))
+                    allocationStage = null
+                    val capacityObserved = listOf("ownedCapacityBytes", "peakLeases", "growthEvents")
+                        .all { call.argument<Number>(it) != null }
+                    result.success(receipt.toWireMap() + mapOf(
+                        "capacityObserved" to capacityObserved,
+                        "capacityScope" to if (capacityObserved) "callerReportedOwners" else "unobserved",
+                        "ownedCapacityBytes" to if (capacityObserved) receipt.ownedCapacityBytes else null,
+                        "peakLeases" to if (capacityObserved) receipt.peakLeases else null,
+                        "growthEvents" to if (capacityObserved) receipt.growthEvents else null,
+                    ))
                 }
                 "allocationSnapshot" -> result.success(mapOf(
                     "elapsedRealtimeMs" to SystemClock.elapsedRealtime(),
@@ -137,6 +184,24 @@ internal class VisibilityObservationDebugChannel(
                 ))
                 "startAllocationWorkload" -> {
                     check(allocationWorkload == null) { "allocation workload already running" }
+                    val denseDepthGrids = call.argument<Boolean>("denseDepthGrids") ?: false
+                    val maximumFeatureOffers = call.argument<Number>("maximumFeatureOffers")?.toLong()
+                    val depthVariantOffset = call.argument<Number>("depthVariantOffset")?.toLong()
+                    require(maximumFeatureOffers == null || maximumFeatureOffers in 1L..10_000L) {
+                        "maximum feature offers is outside the bounded fixture range"
+                    }
+                    if (depthVariantOffset != null) {
+                        require(denseDepthGrids && maximumFeatureOffers != null &&
+                            maximumFeatureOffers % 24L == 0L && depthVariantOffset in 0L until SYNTHETIC_DENSE_CAMPAIGN_VARIANTS.toLong() &&
+                            depthVariantOffset + maximumFeatureOffers / 24L <= SYNTHETIC_DENSE_CAMPAIGN_VARIANTS) {
+                            "dense campaign variants require a finite in-range sequence"
+                        }
+                    }
+                    if (denseDepthGrids) source.prepareDenseDepthGrids(campaignVariants = depthVariantOffset != null)
+                    val depthEveryFeatureOffers = if (denseDepthGrids) 24L else 2L
+                    workloadFeatureFixture = if (depthVariantOffset != null) SYNTHETIC_CAMPAIGN_FEATURE_FIXTURE else "legacyRotatingPoint"
+                    workloadFeatureSamplesPerOffer = if (depthVariantOffset != null) SYNTHETIC_CAMPAIGN_FEATURE_SAMPLES else 1
+                    workloadFeatureMaterialCommitsBefore = runtime.snapshot().admittedFeatureObservations
                     workloadFeatureOffers.set(0)
                     workloadDepthOffers.set(0)
                     workloadFeatureAccepted.set(0)
@@ -148,14 +213,25 @@ internal class VisibilityObservationDebugChannel(
                     allocationWorkload = executor
                     allocationWorkloadTask = executor.scheduleAtFixedRate({
                         try {
+                            if (maximumFeatureOffers != null && workloadFeatureOffers.get() >= maximumFeatureOffers) {
+                                return@scheduleAtFixedRate
+                            }
                             val offer = workloadFeatureOffers.getAndIncrement()
                             val timestampNs = allocationTimestampNs()
-                            if (source.emitFeature(timestampNs, (offer % 5).toInt())) {
+                            val featureAccepted = if (depthVariantOffset != null) {
+                                source.emitCampaignFeatureFrame(timestampNs, (depthVariantOffset + offer / 24L).toInt())
+                            } else source.emitFeature(timestampNs, (offer % 5).toInt())
+                            if (featureAccepted) {
                                 workloadFeatureAccepted.incrementAndGet()
                             }
-                            if (offer % 2L == 1L) {
-                                workloadDepthOffers.incrementAndGet()
-                                if (source.emitDepth(timestampNs + 1L, ((offer / 2L) % 5L).toInt())) {
+                            if (offer % depthEveryFeatureOffers == depthEveryFeatureOffers - 1L) {
+                                val depthOffer = workloadDepthOffers.getAndIncrement()
+                                val marker = if (depthVariantOffset != null) (depthVariantOffset + depthOffer).toInt()
+                                    else (depthOffer % 5L).toInt()
+                                val accepted = if (denseDepthGrids) {
+                                    source.emitDenseDepthGrid(timestampNs + 1L, marker, campaignVariants = depthVariantOffset != null)
+                                } else source.emitDepth(timestampNs + 1L, marker)
+                                if (accepted) {
                                     workloadDepthAccepted.incrementAndGet()
                                 }
                             }
@@ -175,10 +251,16 @@ internal class VisibilityObservationDebugChannel(
                     }
                     allocationWorkloadTask = null
                     allocationWorkload = null
+                    source.awaitSyntheticIdle()
                     result.success(mapOf(
                         "featureOffers" to workloadFeatureOffers.get(),
                         "depthOffers" to workloadDepthOffers.get(),
                         "featureAccepted" to workloadFeatureAccepted.get(),
+                        "featureFixture" to workloadFeatureFixture,
+                        "featureSamplesPerOffer" to workloadFeatureSamplesPerOffer,
+                        "featureAcceptedSamples" to Math.multiplyExact(workloadFeatureAccepted.get(), workloadFeatureSamplesPerOffer.toLong()),
+                        "featureMaterialCommits" to (runtime.snapshot().admittedFeatureObservations - workloadFeatureMaterialCommitsBefore),
+                        "featureMaterialCommitScope" to "canonicalCommitAtSourceDrainNotAckFence",
                         "depthAccepted" to workloadDepthAccepted.get(),
                         "error" to workloadError.get(),
                     ))
@@ -191,19 +273,26 @@ internal class VisibilityObservationDebugChannel(
     }
 
     fun dispose() {
+        allocationStage = null
         gate.release()
         snapshotExecutor?.shutdownNow()
-        val executor = allocationWorkload
-        if (executor != null) {
-            allocationWorkloadTask?.cancel(false)
-            executor.shutdownNow()
-            check(executor.awaitTermination(3L, TimeUnit.SECONDS)) {
-                "allocation workload did not terminate before view disposal"
+        try {
+            val executor = allocationWorkload
+            if (executor != null) {
+                allocationWorkloadTask?.cancel(false)
+                executor.shutdownNow()
+                check(executor.awaitTermination(3L, TimeUnit.SECONDS)) {
+                    "allocation workload did not terminate before view disposal"
+                }
             }
+        } finally {
+            allocationWorkloadTask = null
+            allocationWorkload = null
+            // Closing fences acquisition. Active mapper borrows keep their
+            // storage until the mapper releases them in its finally block.
+            source.close()
+            channel.setMethodCallHandler(null)
         }
-        allocationWorkloadTask = null
-        allocationWorkload = null
-        channel.setMethodCallHandler(null)
     }
 
     private fun dispatchSnapshot(result: MethodChannel.Result, read: () -> Any) {

@@ -18,6 +18,157 @@ import org.openjdk.jol.info.GraphLayout
 
 class FeatureFusionKernelTest {
     @Test
+    fun `hydration refuses unavailable authority before inserting a slot`() {
+        val kernel = kernel()
+        val fingerprint = CanonicalReceiptBytes(ByteArray(32) { 0x47 })
+        val row = CompactSurface(SurfaceId(17), Voxel(0, 0, 0), 0, 0)
+        kernel.bindCanonicalFingerprintResolver(
+            FeatureFusionKernel.CanonicalFingerprintResolver { _, _, _, _ -> null }, 5, 7, 11,
+        )
+        val prior = kernel.resourceReceipt()
+        assertFalse(kernel.hydrateCanonicalSurface(row, fingerprint))
+        assertEquals(prior, kernel.resourceReceipt())
+        kernel.bindCanonicalFingerprintResolver(
+            FeatureFusionKernel.CanonicalFingerprintResolver { id, _, _, _ -> fingerprint.takeIf { id == 17L } },
+            5, 7, 11,
+        )
+        assertTrue(kernel.hydrateCanonicalSurface(row, fingerprint))
+        assertEquals(1, kernel.resourceReceipt().surfaceCount)
+        assertEquals(fingerprint, kernel.canonicalCorrelation(0)?.allocationFingerprint)
+    }
+
+    @Test
+    fun `source authority preserves first evidence after remap and vacated reassignment`() {
+        val kernel = kernel()
+        val change = accepted(kernel, batch(1, listOf(evidence(0, 0, 0, 2, 1)))).delta.single()
+            as FeatureFusionChange.Upsert
+        val first = CanonicalReceiptBytes(ByteArray(32) { 0x17 })
+        val next = CanonicalReceiptBytes(ByteArray(32) { 0x18 })
+        val reassigned = CanonicalReceiptBytes(ByteArray(32) { 0x19 })
+        assertTrue(kernel.assignCanonicalCorrelations(listOf(change.assignment(SurfaceId(17), first))))
+        var calls = 0
+        val source = mapOf(17L to first, 18L to next, 19L to reassigned)
+        val resolver = FeatureFusionKernel.CanonicalFingerprintResolver { id, geometry, lineage, generation ->
+            assertEquals(5L, geometry)
+            assertEquals(7L, lineage)
+            assertEquals(11L, generation)
+            calls++
+            source[id]
+        }
+        kernel.bindCanonicalFingerprintResolver(resolver, 5, 7, 11)
+        assertTrue(kernel.prepareCanonicalRemap(CanonicalFeatureRemap(
+            change.kernelSlot, SurfaceId(17), SurfaceId(18), CanonicalFeatureProvenance(next, 0, 0),
+        )) is FeatureCanonicalRemapPreparation.Prepared)
+        calls = 0
+        kernel.applyPreparedCanonicalRemap()
+        assertEquals("post-commit application must not resolve authority", 0, calls)
+        assertEquals(next, kernel.canonicalCorrelation(change.kernelSlot)?.allocationFingerprint)
+        assertEquals(first, kernel.featureEvidenceAllocationFingerprint(change.kernelSlot))
+        assertTrue(kernel.prepareCanonicalRemap(
+            CanonicalFeatureRemap(change.kernelSlot, SurfaceId(18), null),
+        ) is FeatureCanonicalRemapPreparation.Prepared)
+        kernel.applyPreparedCanonicalRemap()
+        assertTrue(kernel.assignCanonicalCorrelations(listOf(change.assignment(SurfaceId(19), reassigned))))
+        assertEquals(reassigned, kernel.canonicalCorrelation(change.kernelSlot)?.allocationFingerprint)
+        assertEquals(first, kernel.featureEvidenceAllocationFingerprint(change.kernelSlot))
+    }
+
+    @Test
+    fun `missing malformed and failing authority refuse before feature or remap mutation`() {
+        val fingerprint = CanonicalReceiptBytes(ByteArray(32) { 0x27 })
+        val failures = listOf<FeatureFusionKernel.CanonicalFingerprintResolver>(
+            FeatureFusionKernel.CanonicalFingerprintResolver { _, _, _, _ -> null },
+            FeatureFusionKernel.CanonicalFingerprintResolver { _, _, _, _ -> CanonicalReceiptBytes(ByteArray(31)) },
+            FeatureFusionKernel.CanonicalFingerprintResolver { _, _, _, _ -> throw IllegalStateException("unavailable") },
+        )
+        for (failure in failures) {
+            val kernel = kernel()
+            val change = accepted(kernel, batch(1, listOf(evidence(0, 0, 0, 2, 1)))).delta.single()
+                as FeatureFusionChange.Upsert
+            assertTrue(kernel.assignCanonicalCorrelations(listOf(change.assignment(SurfaceId(17), fingerprint))))
+            kernel.bindCanonicalFingerprintResolver(failure, 5, 7, 11)
+            val prior = kernel.resourceReceipt()
+            val result = kernel.prepare(batch(2, listOf(evidence(0, 0, 0, 1, 2))))
+                as FeatureFusionResult.Refused
+            assertEquals(FeatureFusionRefusal.CANONICAL_PROVENANCE, result.reason)
+            assertEquals(prior, kernel.resourceReceipt())
+            val remap = kernel.prepareCanonicalRemap(CanonicalFeatureRemap(change.kernelSlot, SurfaceId(17), null))
+                as FeatureCanonicalRemapPreparation.Refused
+            assertEquals(FeatureCanonicalRemapRefusal.CANONICAL_PROVENANCE, remap.reason)
+            kernel.bindCanonicalFingerprintResolver(
+                FeatureFusionKernel.CanonicalFingerprintResolver { id, _, _, _ -> fingerprint.takeIf { id == 17L } },
+                5, 7, 11,
+            )
+            assertEquals(fingerprint, kernel.canonicalCorrelation(change.kernelSlot)?.allocationFingerprint)
+            assertEquals(fingerprint, kernel.featureEvidenceAllocationFingerprint(change.kernelSlot))
+            assertTrue(kernel.prepare(batch(2, listOf(evidence(0, 0, 0, 1, 2)))) is FeatureFusionResult.Accepted)
+            kernel.discardPrepared()
+            assertEquals(prior, kernel.resourceReceipt())
+        }
+    }
+
+    @Test
+    fun `packed feature staging matches list evidence and keeps old results after lease reuse`() {
+        val identity = doubleArrayOf(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+        val owner = VisibilityObservationOwnership(
+            "a".repeat(32), 1, "b".repeat(32), 1, 1, "c".repeat(32), "d".repeat(32),
+            1, "e".repeat(32), "f".repeat(32), 1, 1, 1,
+            VisibilityGroupFrame.copyOf(identity, identity, 100_000, 100_000),
+        )
+        val pool = FeatureSamplesLeasePool(capacity = 8)
+        val packedKernel = FeatureFusionKernel()
+        val listKernel = FeatureFusionKernel()
+        var first: FeatureFusionResult.Accepted? = null
+        var firstCopy: List<FeatureFusionChange>? = null
+        try {
+            for (sequence in 1L..3L) {
+                val samples = listOf(
+                    VisibilityFeatureSample(1, -0.12, 0.02, -1.02, 1.0),
+                    VisibilityFeatureSample(2, -0.11, 0.03, -1.01, 0.5),
+                    VisibilityFeatureSample(3, 0.02, 0.02, -1.02, 1.0),
+                    VisibilityFeatureSample(4, 0.12, 0.02, -1.22, 0.75),
+                )
+                val frame = VisibilityObservationFrame(
+                    VisibilityObservationSource.SYNTHETIC_FEATURE, sequence, sequence, sequence,
+                    "camera", true, "landscape_right_x_right_y_down_v1",
+                    VisibilityCameraPose.copyOf(identity),
+                    VisibilityCameraIntrinsics(2000, 2000, 1000.0, 1000.0, 1000.0, 1000.0),
+                    VisibilityDepthCapability.AUTOMATIC,
+                )
+                val observation = VisibilityFeatureObservation(ownership = owner, frame = frame,
+                    samples = samples, sourceRejectedSamples = 0,
+                    payloadBytes = VisibilityFeatureObservation.FEATURE_FIXED_BYTES + samples.size * VisibilityFeatureObservation.FEATURE_SAMPLE_BYTES)
+                val normals = (FeatureNormalEvidence.from(observation) as FeatureNormalEvidence.Conversion.Accepted).evidence
+                val expected = listKernel.accept(FeatureFusionBatch(sequence, sequence,
+                    samples.zip(normals).map { (sample, normal) ->
+                        FeatureFusionEvidence(sample.xWorld, sample.yWorld, sample.zWorld, 2, sample.id, normal)
+                    })) as FeatureFusionResult.Accepted
+                val lease = requireNotNull(pool.tryAcquire(owner))
+                samples.forEach { sample ->
+                    assertTrue(lease.acceptId(sample.id))
+                    assertTrue(lease.append(sample.id, sample.xWorld, sample.yWorld, sample.zWorld, sample.confidence))
+                }
+                val packed = VisibilityFeatureObservation.fromPacked(owner, frame, lease.samples, 0)
+                val actual = packedKernel.preparePacked(packed, sequence) as FeatureFusionResult.Accepted
+                assertEquals(expected, actual)
+                if (sequence == 1L) {
+                    assertEquals(3, actual.delta.size)
+                    first = actual
+                    firstCopy = actual.delta.toList()
+                }
+                assertTrue(packedKernel.prepareCanonicalApplication(emptyList()))
+                packedKernel.applyPrepared()
+                packed.close()
+            }
+            assertEquals(firstCopy, requireNotNull(first).delta)
+            assertEquals(0, pool.leasedCount())
+        } finally {
+            pool.close()
+        }
+    }
+
+    @Test
     fun `candidate A bytes match the immutable fusion lock and reject B and C`() {
         val root = fixture("feature_fusion_fusion_vector_v1.json")
         val observations = root.getValue("observations").jsonArray.map(::fusionEvidence)
@@ -293,6 +444,33 @@ class FeatureFusionKernelTest {
     }
 
     @Test
+    fun `canonical source IDs preserve current and historical receipts across identity remap chain`() {
+        val kernel = kernel()
+        val first = accepted(kernel, batch(1, listOf(evidence(0, 0, 0, 2, 1))))
+        val change = first.delta.single() as FeatureFusionChange.Upsert
+        val historical = CanonicalReceiptBytes(ByteArray(32) { 0x11 })
+        val replacement = CanonicalReceiptBytes(ByteArray(32) { 0x22 })
+        assertTrue(kernel.assignCanonicalCorrelations(listOf(
+            change.assignment(SurfaceId(17), historical),
+        )))
+        assertTrue(kernel.prepareCanonicalRemap(CanonicalFeatureRemap(
+            change.kernelSlot,
+            SurfaceId(17),
+            SurfaceId(42),
+            CanonicalFeatureProvenance(replacement, 0x0304, 211),
+        )) is FeatureCanonicalRemapPreparation.Prepared)
+        kernel.applyPreparedCanonicalRemap()
+        assertTrue(kernel.prepareCanonicalRemap(
+            CanonicalFeatureRemap(change.kernelSlot, SurfaceId(42), SurfaceId(99)),
+        ) is FeatureCanonicalRemapPreparation.Prepared)
+        kernel.applyPreparedCanonicalRemap()
+
+        assertEquals(SurfaceId(99), kernel.canonicalCorrelation(change.kernelSlot)?.id)
+        assertEquals(replacement, kernel.canonicalCorrelation(change.kernelSlot)?.allocationFingerprint)
+        assertEquals(historical, kernel.featureEvidenceAllocationFingerprint(change.kernelSlot))
+    }
+
+    @Test
     fun `canonical remap permits multiple feature slots to share one destination identity`() {
         val kernel = kernel()
         val accepted = accepted(kernel, batch(1, listOf(evidence(0, 0, 0, 2, 1), evidence(1, 0, 0, 2, 2))))
@@ -550,7 +728,7 @@ class FeatureFusionKernelTest {
         // retained kernel state. GraphLayout measures the active JVM object model.
         val layout = GraphLayout.parseInstance(kernel)
         val retainedBytes = layout.totalSize()
-        val primitivePayloadBytes = 14_888_204L
+        val primitivePayloadBytes = 9_370_196L
         val overheadBytes = retainedBytes - primitivePayloadBytes
         val implementationBytes = requireNotNull(
             javaClass.classLoader?.getResourceAsStream(
@@ -560,7 +738,7 @@ class FeatureFusionKernelTest {
         println("FEATURE_FUSION_RETAINED_ALLOCATION_RECEIPT implementationClassSha256=${testSha256Hex(implementationBytes)} retainedBytes=$retainedBytes primitivePayloadBytes=$primitivePayloadBytes objectAndArrayOverheadBytes=$overheadBytes assignedTupleShareBytes=${outcome.receipt.assignedTupleShareBytes}")
         assertTrue("JVM graph measurement must include headers/alignment", overheadBytes > 0)
         assertTrue(retainedBytes <= outcome.receipt.assignedTupleShareBytes)
-        assertEquals(14_888_912, outcome.receipt.assignedTupleShareBytes)
+        assertEquals(9_371_384, outcome.receipt.assignedTupleShareBytes)
     }
 
     private fun kernel() = FeatureFusionKernel()

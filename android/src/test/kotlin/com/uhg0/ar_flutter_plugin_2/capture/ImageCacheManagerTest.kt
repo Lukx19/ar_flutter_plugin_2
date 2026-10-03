@@ -26,7 +26,8 @@ class ImageCacheManagerTest {
         val cached = manager.cacheImageBytes("img-1", payload, ImageFormat.JPEG)
 
         assertTrue(cached)
-        assertArrayEquals(payload, manager.getImageData("img-1"))
+        payload[0] = 99
+        assertArrayEquals(byteArrayOf(1, 2, 3, 4), manager.getImageData("img-1"))
     }
 
     @Test

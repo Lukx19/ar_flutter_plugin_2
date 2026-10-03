@@ -183,6 +183,32 @@ class SessionCanonicalMemoryStateTest {
     }
 
     @Test
+    fun `serial preparation workspace reports warm growth separately from retained capacity`() {
+        val state = state()
+        try {
+            val first = commit(state, prepare(state, FeatureMutationCommand(
+                "workspace-seed", state.cut.geometryRevision, state.cut.lineageRevision,
+                target(null, 0),
+            )))
+            acknowledge(state, first)
+            val warm = state.preparationWorkspaceReceipt()
+            assertTrue(warm.growthEvents > 0)
+            assertTrue(warm.ownedCapacityBytes > 0)
+
+            val refined = commit(state, prepare(state, FeatureMutationCommand(
+                "workspace-refine", state.cut.geometryRevision, state.cut.lineageRevision,
+                target(SurfaceId(1), 0, normal = 1, confidence = 201),
+            )))
+            acknowledge(state, refined)
+            val repeated = state.preparationWorkspaceReceipt()
+            assertEquals(warm.growthEvents, repeated.growthEvents)
+            assertEquals(warm.ownedCapacityBytes, repeated.ownedCapacityBytes)
+        } finally {
+            state.close()
+        }
+    }
+
+    @Test
     fun `unsigned identity boundaries preserve lookup support lineage and ordered paging`() {
         for (firstId in listOf(0x7fffffffL, 0xfffffffdL)) {
             val state = state()

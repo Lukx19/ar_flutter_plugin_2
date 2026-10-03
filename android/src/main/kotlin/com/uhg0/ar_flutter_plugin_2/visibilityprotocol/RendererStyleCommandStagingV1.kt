@@ -106,7 +106,11 @@ class RendererStyleCommandStagingV1(
 
     /** Admission check that does not mutate or retain the page. */
     @Synchronized
-    fun canAccept(page: RendererStyleCommandV1.Page, committedStyleRevision: Long): Boolean {
+    fun canAccept(
+        page: RendererStyleCommandV1.Page,
+        committedStyleRevision: Long,
+        allowCurrentRevisionForGeometryCut: Boolean = false,
+    ): Boolean {
         expire(clockNanos())
         val key = Key(
             bindingIdentity = bindingKey,
@@ -117,7 +121,10 @@ class RendererStyleCommandStagingV1(
         )
         val nextRevision = committedStyleRevision.takeIf { it < Long.MAX_VALUE }?.plus(1L)
         return if (page.pageIndex == 0) {
-            page.styleRevision == nextRevision && stages.isEmpty()
+            (page.styleRevision == nextRevision ||
+                (allowCurrentRevisionForGeometryCut &&
+                    page.styleRevision == committedStyleRevision)) &&
+                stages.isEmpty()
         } else {
             page.styleRevision == nextRevision &&
                 stages.containsKey(key)
@@ -217,8 +224,10 @@ class RendererStyleCommandStagingV1(
                 residencyRevision = residencyRevision,
                 targetRevision = targetRevision,
                 reset = flags and RendererStyleCommandV1.RESET_FLAG != 0,
-                surfaceIds = ids.copyOf(stagedRows),
-                styleRows = styles.copyOf(stagedRows * RendererStyleCommandV1.STYLE_ROW_BYTES),
+                // These exact-size arrays belong exclusively to this terminal stage.
+                // accept removes the stage before publishing the completed cut.
+                surfaceIds = ids,
+                styleRows = styles,
                 targetSurfaceId = targetSurfaceId,
                 targetDirectionIndex = targetDirectionIndex,
             )

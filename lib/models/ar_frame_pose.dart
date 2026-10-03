@@ -75,6 +75,7 @@ class ARFramePose {
   final String? poseAlignment;
   final int? poseTimeErrorNs;
   final String? trackingState;
+  final String? poseSource;
   final String? wireVersion;
   final int? sequence;
 
@@ -91,6 +92,7 @@ class ARFramePose {
     this.poseAlignment,
     this.poseTimeErrorNs,
     this.trackingState,
+    this.poseSource,
     this.wireVersion,
     this.sequence,
   });
@@ -119,6 +121,7 @@ class ARFramePose {
       poseAlignment: map['poseAlignment'] as String?,
       poseTimeErrorNs: map['poseTimeErrorNs'] as int?,
       trackingState: map['trackingState'] as String?,
+      poseSource: map['poseSource'] as String?,
       wireVersion: map['wireVersion'] as String?,
       sequence: (map['sequence'] as num?)?.toInt(),
     );
@@ -147,6 +150,7 @@ class ARFramePose {
       if (poseAlignment != null) 'poseAlignment': poseAlignment,
       if (poseTimeErrorNs != null) 'poseTimeErrorNs': poseTimeErrorNs,
       if (trackingState != null) 'trackingState': trackingState,
+      if (poseSource != null) 'poseSource': poseSource,
       if (wireVersion != null) 'wireVersion': wireVersion,
       if (sequence != null) 'sequence': sequence,
     };
@@ -168,6 +172,7 @@ class ARFramePose {
         other.poseAlignment == poseAlignment &&
         other.poseTimeErrorNs == poseTimeErrorNs &&
         other.trackingState == trackingState &&
+        other.poseSource == poseSource &&
         other.wireVersion == wireVersion &&
         other.sequence == sequence;
   }
@@ -186,6 +191,7 @@ class ARFramePose {
       poseAlignment.hashCode ^
       poseTimeErrorNs.hashCode ^
       trackingState.hashCode ^
+      poseSource.hashCode ^
       wireVersion.hashCode ^
       sequence.hashCode;
 

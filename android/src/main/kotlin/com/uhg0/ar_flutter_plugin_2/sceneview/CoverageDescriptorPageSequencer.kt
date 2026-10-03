@@ -32,6 +32,14 @@ internal data class CoverageDescriptorPageSubmission(
  * descriptor-count-clipped range-only pages.
  */
 internal class CoverageDescriptorPageSequencer {
+    private val rendererThread = Thread.currentThread()
+
+    private fun checkRendererThread() {
+        check(Thread.currentThread() === rendererThread) {
+            "Coverage descriptor pages belong to their renderer thread"
+        }
+    }
+
     private data class PageWork(
         val descriptor: BoundedCoveragePresentation,
         val startSlot: Int,
@@ -61,6 +69,7 @@ internal class CoverageDescriptorPageSequencer {
         descriptor: BoundedCoveragePresentation?,
         rehydrate: Boolean = false,
     ) {
+        checkRendererThread()
         val previous = currentDescriptor
         val predecessorComplete = previous != null &&
             previous === completedDescriptor &&
@@ -103,6 +112,7 @@ internal class CoverageDescriptorPageSequencer {
 
     /** Clears queued work; an already submitted page still owns its ticket. */
     fun clear() {
+        checkRendererThread()
         currentDescriptor = null
         completedDescriptor = null
         failedDescriptor = null
@@ -111,6 +121,7 @@ internal class CoverageDescriptorPageSequencer {
 
     /** Returns the next page only when no previous page is still owned. */
     fun nextPage(): CoverageDescriptorPageSubmission? {
+        checkRendererThread()
         if (inFlightPage != null) return null
         while (pendingPages.isNotEmpty()) {
             val work = pendingPages.removeFirst()
@@ -139,6 +150,7 @@ internal class CoverageDescriptorPageSequencer {
 
     /** Releases only the currently owned page represented by [ticket]. */
     fun release(ticket: CoverageDescriptorPageTicket) {
+        checkRendererThread()
         val inFlight = inFlightPage ?: return
         if (ticket !== inFlight.ticket) return
         inFlightPage = null
@@ -151,7 +163,10 @@ internal class CoverageDescriptorPageSequencer {
     }
 
     val hasInFlightPage: Boolean
-        get() = inFlightPage != null
+        get() {
+            checkRendererThread()
+            return inFlightPage != null
+        }
 
     private fun mergeClippedRanges(
         spans: List<CoveragePointSpan>,

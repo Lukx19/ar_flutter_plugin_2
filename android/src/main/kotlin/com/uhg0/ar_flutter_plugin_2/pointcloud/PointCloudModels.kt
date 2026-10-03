@@ -1,8 +1,5 @@
 package com.uhg0.ar_flutter_plugin_2.pointcloud
 
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-
 const val COVERAGE_RENDERER_STYLE_ROW_BYTES = 16
 const val COVERAGE_RENDERER_MAX_STYLE_PATCH_ROWS = 2_048
 const val COVERAGE_RENDERER_NO_DIRECTION = 0xff
@@ -116,29 +113,35 @@ data class CoverageRendererStyleRowV1(
         )
     }
 
-    fun encode(): ByteArray =
-        ByteBuffer.allocate(COVERAGE_RENDERER_STYLE_ROW_BYTES)
-            .order(ByteOrder.LITTLE_ENDIAN)
-            .apply {
-                put(COVERAGE_RENDERER_STYLE_VERSION.toByte())
-                put(
-                    (semantic.code or
-                        (coverage.code shl 2) or
-                        (residency.code shl 4) or
-                        (target.code shl 6)).toByte(),
-                )
-                put((palette.code or (cut.code shl 4)).toByte())
-                put(
-                    (glyph.code or
-                        (age.code shl 2) or
-                        (sourceHealth.code shl 4)).toByte(),
-                )
-                put(directionBin.toByte())
-                put(0)
-                putShort(lineageCount.toShort())
-                putInt(semanticGeneration.toInt())
-                putInt(styleGeneration.toInt())
-            }.array()
+    /**
+     * Encodes one row into a fresh 16-byte buffer for compatibility callers.
+     * Hot paths should pass a caller-owned buffer to [encodeInto] so a style
+     * update does not allocate a temporary ByteBuffer and byte array per row.
+     */
+    fun encode(): ByteArray = ByteArray(COVERAGE_RENDERER_STYLE_ROW_BYTES).also { encodeInto(it) }
+
+    /** Writes this row directly into [destination], preserving bytes outside the row. */
+    fun encodeInto(destination: ByteArray, offset: Int = 0) {
+        require(offset >= 0 && destination.size - offset >= COVERAGE_RENDERER_STYLE_ROW_BYTES)
+        destination[offset] = COVERAGE_RENDERER_STYLE_VERSION.toByte()
+        destination[offset + 1] = (
+            semantic.code or
+                (coverage.code shl 2) or
+                (residency.code shl 4) or
+                (target.code shl 6)
+            ).toByte()
+        destination[offset + 2] = (palette.code or (cut.code shl 4)).toByte()
+        destination[offset + 3] = (
+            glyph.code or
+                (age.code shl 2) or
+                (sourceHealth.code shl 4)
+            ).toByte()
+        destination[offset + 4] = directionBin.toByte()
+        destination[offset + 5] = 0
+        putU16(destination, offset + 6, lineageCount)
+        putU32(destination, offset + 8, semanticGeneration)
+        putU32(destination, offset + 12, styleGeneration)
+    }
 
     /** Deterministic ARGB projection used by the current point/cube material. */
     fun packedColor(): Int {
@@ -195,6 +198,83 @@ data class CoverageRendererStyleRowV1(
     }
 
     companion object {
+        /** Full row validation without constructing a DTO, including rows with no glyph. */
+        internal fun validateEncoded(bytes: ByteArray, offset: Int = 0) {
+            require(offset >= 0 && bytes.size - offset >= COVERAGE_RENDERER_STYLE_ROW_BYTES)
+            require(bytes[offset].u8() == COVERAGE_RENDERER_STYLE_VERSION)
+            val semantics = bytes[offset + 1].u8()
+            semanticByCode(semantics and 3)
+            coverageByCode((semantics ushr 2) and 3)
+            residencyByCode((semantics ushr 4) and 3)
+            targetByCode((semantics ushr 6) and 3)
+            val paletteCut = bytes[offset + 2].u8()
+            paletteByCode(paletteCut and 15)
+            cutByCode((paletteCut ushr 4) and 7)
+            require(paletteCut and 128 == 0)
+            val glyphAgeHealth = bytes[offset + 3].u8()
+            val glyph = glyphByCode(glyphAgeHealth and 3)
+            ageByCode((glyphAgeHealth ushr 2) and 3)
+            sourceHealthByCode((glyphAgeHealth ushr 4) and 7)
+            require(glyphAgeHealth and 128 == 0)
+            val direction = bytes[offset + 4].u8()
+            val hasDirection = direction in 0..23
+            require(hasDirection || direction == COVERAGE_RENDERER_NO_DIRECTION)
+            require(when (glyph) {
+                CoverageRendererGlyph.NONE, CoverageRendererGlyph.NORMAL -> !hasDirection
+                CoverageRendererGlyph.DESIRED_DIRECTION, CoverageRendererGlyph.VIEW_ROSE -> hasDirection
+            })
+            require(bytes[offset + 5].u8() == 0)
+            // Remaining columns are unsigned u16/u32 values: every bit pattern
+            // is valid once the complete row extent has been checked above.
+        }
+
+        internal fun validatedGlyph(bytes: ByteArray, offset: Int = 0): CoverageRendererGlyph {
+            validateEncoded(bytes, offset)
+            return glyphByCode(bytes[offset + 3].u8() and 3)
+        }
+
+        /** Same validated color projection as [packedColor], without a row DTO. */
+        internal fun validatedPackedColor(bytes: ByteArray, offset: Int = 0): Int {
+            validateEncoded(bytes, offset)
+            val flags = bytes[offset + 1].u8()
+            val paletteCut = bytes[offset + 2].u8()
+            val glyphAgeHealth = bytes[offset + 3].u8()
+            when ((paletteCut ushr 4) and 7) {
+                1 -> return 0xff8d6e63.toInt()
+                2 -> return 0xff5c6bc0.toInt()
+                3 -> return 0xffffa000.toInt()
+                4 -> return 0xff616161.toInt()
+                5 -> return 0x00000000
+            }
+            return when (paletteCut and 15) {
+                0 -> 0xffffffff.toInt()
+                1 -> when ((flags ushr 2) and 3) {
+                    0 -> 0xffd50000.toInt(); 1 -> 0xffffab00.toInt(); else -> 0xff00c853.toInt()
+                }
+                2 -> 0xff42a5f5.toInt()
+                3 -> when (flags and 3) {
+                    0 -> 0xff1e88e5.toInt(); 1 -> 0xfffb8c00.toInt(); else -> 0xff8e24aa.toInt()
+                }
+                4 -> when (u16(bytes, offset + 6)) {
+                    0 -> 0xff78909c.toInt(); 1 -> 0xff3949ab.toInt(); else -> 0xff6a1b9a.toInt()
+                }
+                5 -> when ((glyphAgeHealth ushr 2) and 3) {
+                    0 -> 0xff26c6da.toInt(); 1 -> 0xff66bb6a.toInt()
+                    2 -> 0xffffca28.toInt(); else -> 0xff8d6e63.toInt()
+                }
+                6 -> when ((glyphAgeHealth ushr 4) and 7) {
+                    0 -> 0xff00c853.toInt(); 1 -> 0xff039be5.toInt(); 2 -> 0xffffa000.toInt()
+                    3 -> 0xffd50000.toInt(); else -> 0xff757575.toInt()
+                }
+                7 -> when ((flags ushr 4) and 3) {
+                    0 -> 0xff26a69a.toInt(); 1 -> 0xffffb300.toInt(); else -> 0xff78909c.toInt()
+                }
+                else -> when (bytes[offset + 4].u8() / 8) {
+                    0 -> 0xff5c6bc0.toInt(); 1 -> 0xff29b6f6.toInt(); else -> 0xff26a69a.toInt()
+                }
+            }
+        }
+
         /** A renderer packet may contain many rows, but only one committed cut. */
         fun hasCoherentGenerations(rows: Iterable<CoverageRendererStyleRowV1>): Boolean {
             var semanticGeneration: Long? = null
@@ -215,29 +295,26 @@ data class CoverageRendererStyleRowV1(
 
         fun decode(bytes: ByteArray, offset: Int = 0): CoverageRendererStyleRowV1 {
             require(offset >= 0 && bytes.size - offset >= COVERAGE_RENDERER_STYLE_ROW_BYTES)
-            val data = ByteBuffer.wrap(bytes, offset, COVERAGE_RENDERER_STYLE_ROW_BYTES)
-                .order(ByteOrder.LITTLE_ENDIAN)
-            require(data.get().toInt() and 0xff == COVERAGE_RENDERER_STYLE_VERSION)
-            val semanticBits = data.u8()
-            val semantic = enumByCode<CoverageRendererSemantic>(semanticBits and 0x3)
-            val coverage = enumByCode<CoverageRendererCoverage>((semanticBits ushr 2) and 0x3)
-            val residency = enumByCode<CoverageRendererResidency>((semanticBits ushr 4) and 0x3)
-            val target = enumByCode<CoverageRendererTarget>((semanticBits ushr 6) and 0x3)
-            val paletteCutBits = data.u8()
-            val palette = enumByCode<CoverageRendererPalette>(paletteCutBits and 0xf)
-            val cut = enumByCode<CoverageRendererCut>((paletteCutBits ushr 4) and 0x7)
+            require(bytes[offset].u8() == COVERAGE_RENDERER_STYLE_VERSION)
+            val semanticBits = bytes[offset + 1].u8()
+            val semantic = semanticByCode(semanticBits and 0x3)
+            val coverage = coverageByCode((semanticBits ushr 2) and 0x3)
+            val residency = residencyByCode((semanticBits ushr 4) and 0x3)
+            val target = targetByCode((semanticBits ushr 6) and 0x3)
+            val paletteCutBits = bytes[offset + 2].u8()
+            val palette = paletteByCode(paletteCutBits and 0xf)
+            val cut = cutByCode((paletteCutBits ushr 4) and 0x7)
             require(paletteCutBits and 0x80 == 0)
-            val glyphAgeHealthBits = data.u8()
-            val glyph = enumByCode<CoverageRendererGlyph>(glyphAgeHealthBits and 0x3)
-            val age = enumByCode<CoverageRendererAge>((glyphAgeHealthBits ushr 2) and 0x3)
-            val sourceHealth =
-                enumByCode<CoverageRendererSourceHealth>((glyphAgeHealthBits ushr 4) and 0x7)
+            val glyphAgeHealthBits = bytes[offset + 3].u8()
+            val glyph = glyphByCode(glyphAgeHealthBits and 0x3)
+            val age = ageByCode((glyphAgeHealthBits ushr 2) and 0x3)
+            val sourceHealth = sourceHealthByCode((glyphAgeHealthBits ushr 4) and 0x7)
             require(glyphAgeHealthBits and 0x80 == 0)
-            val directionBin = data.u8()
-            require(data.u8() == 0)
-            val lineageCount = data.short.toInt() and 0xffff
-            val semanticGeneration = data.int.toLong() and COVERAGE_RENDERER_U32_MAX
-            val styleGeneration = data.int.toLong() and COVERAGE_RENDERER_U32_MAX
+            val directionBin = bytes[offset + 4].u8()
+            require(bytes[offset + 5].u8() == 0)
+            val lineageCount = u16(bytes, offset + 6)
+            val semanticGeneration = u32(bytes, offset + 8)
+            val styleGeneration = u32(bytes, offset + 12)
             return CoverageRendererStyleRowV1(
                 semanticGeneration = semanticGeneration,
                 styleGeneration = styleGeneration,
@@ -255,26 +332,109 @@ data class CoverageRendererStyleRowV1(
             )
         }
 
-        private inline fun <reified T> enumByCode(code: Int): T where T : Enum<T> =
-            enumValues<T>().firstOrNull { enumCode(it) == code }
-                ?: throw IllegalArgumentException("Reserved renderer style enum code")
-
-        private fun enumCode(value: Enum<*>): Int = when (value) {
-            is CoverageRendererSemantic -> value.code
-            is CoverageRendererCoverage -> value.code
-            is CoverageRendererPalette -> value.code
-            is CoverageRendererCut -> value.code
-            is CoverageRendererResidency -> value.code
-            is CoverageRendererTarget -> value.code
-            is CoverageRendererGlyph -> value.code
-            is CoverageRendererAge -> value.code
-            is CoverageRendererSourceHealth -> value.code
-            else -> error("Unsupported renderer style enum")
+        private fun semanticByCode(code: Int): CoverageRendererSemantic = when (code) {
+            0 -> CoverageRendererSemantic.CONFIRMED
+            1 -> CoverageRendererSemantic.AMBIGUOUS
+            2 -> CoverageRendererSemantic.SUPPRESSED_DEBUG
+            else -> reservedStyleCode(code)
         }
+
+        private fun coverageByCode(code: Int): CoverageRendererCoverage = when (code) {
+            0 -> CoverageRendererCoverage.UNCOVERED
+            1 -> CoverageRendererCoverage.PARTIAL
+            2 -> CoverageRendererCoverage.COMPLETE
+            else -> reservedStyleCode(code)
+        }
+
+        private fun paletteByCode(code: Int): CoverageRendererPalette = when (code) {
+            0 -> CoverageRendererPalette.UNIFORM
+            1 -> CoverageRendererPalette.COVERAGE
+            2 -> CoverageRendererPalette.NORMAL
+            3 -> CoverageRendererPalette.OCCUPANCY
+            4 -> CoverageRendererPalette.LINEAGE
+            5 -> CoverageRendererPalette.AGE
+            6 -> CoverageRendererPalette.SOURCE_HEALTH
+            7 -> CoverageRendererPalette.RESIDENCY
+            8 -> CoverageRendererPalette.DIRECTION
+            else -> reservedStyleCode(code)
+        }
+
+        private fun cutByCode(code: Int): CoverageRendererCut = when (code) {
+            0 -> CoverageRendererCut.EXACT_CURRENT
+            1 -> CoverageRendererCut.STALE_DISPLAY
+            2 -> CoverageRendererCut.LOWER_BOUND
+            3 -> CoverageRendererCut.COVERAGE_PENDING
+            4 -> CoverageRendererCut.INDETERMINATE_HISTORY
+            5 -> CoverageRendererCut.UNAVAILABLE
+            else -> reservedStyleCode(code)
+        }
+
+        private fun residencyByCode(code: Int): CoverageRendererResidency = when (code) {
+            0 -> CoverageRendererResidency.ACTIVE_L0
+            1 -> CoverageRendererResidency.WARM_L1
+            2 -> CoverageRendererResidency.COLD_L2
+            else -> reservedStyleCode(code)
+        }
+
+        private fun targetByCode(code: Int): CoverageRendererTarget = when (code) {
+            0 -> CoverageRendererTarget.NONE
+            1 -> CoverageRendererTarget.PRIMARY
+            2 -> CoverageRendererTarget.HALO
+            else -> reservedStyleCode(code)
+        }
+
+        private fun glyphByCode(code: Int): CoverageRendererGlyph = when (code) {
+            0 -> CoverageRendererGlyph.NONE
+            1 -> CoverageRendererGlyph.NORMAL
+            2 -> CoverageRendererGlyph.DESIRED_DIRECTION
+            3 -> CoverageRendererGlyph.VIEW_ROSE
+            else -> reservedStyleCode(code)
+        }
+
+        private fun ageByCode(code: Int): CoverageRendererAge = when (code) {
+            0 -> CoverageRendererAge.FRESH
+            1 -> CoverageRendererAge.RECENT
+            2 -> CoverageRendererAge.AGING
+            3 -> CoverageRendererAge.OLD
+            else -> reservedStyleCode(code)
+        }
+
+        private fun sourceHealthByCode(code: Int): CoverageRendererSourceHealth = when (code) {
+            0 -> CoverageRendererSourceHealth.HEALTHY
+            1 -> CoverageRendererSourceHealth.FEATURE_ONLY
+            2 -> CoverageRendererSourceHealth.TRANSIENT_UNAVAILABLE
+            3 -> CoverageRendererSourceHealth.FAILED
+            4 -> CoverageRendererSourceHealth.UNSUPPORTED
+            else -> reservedStyleCode(code)
+        }
+
+        private fun reservedStyleCode(code: Int): Nothing =
+            throw IllegalArgumentException("Reserved renderer style enum code $code")
     }
 }
 
-private fun ByteBuffer.u8(): Int = get().toInt() and 0xff
+private fun Byte.u8(): Int = toInt() and 0xff
+
+private fun u16(bytes: ByteArray, offset: Int): Int =
+    bytes[offset].u8() or (bytes[offset + 1].u8() shl 8)
+
+private fun u32(bytes: ByteArray, offset: Int): Long =
+    bytes[offset].u8().toLong() or
+        (bytes[offset + 1].u8().toLong() shl 8) or
+        (bytes[offset + 2].u8().toLong() shl 16) or
+        (bytes[offset + 3].u8().toLong() shl 24)
+
+private fun putU16(bytes: ByteArray, offset: Int, value: Int) {
+    bytes[offset] = value.toByte()
+    bytes[offset + 1] = (value ushr 8).toByte()
+}
+
+private fun putU32(bytes: ByteArray, offset: Int, value: Long) {
+    bytes[offset] = value.toByte()
+    bytes[offset + 1] = (value ushr 8).toByte()
+    bytes[offset + 2] = (value ushr 16).toByte()
+    bytes[offset + 3] = (value ushr 24).toByte()
+}
 
 enum class VoxelRenderMode(val wireName: String) {
     POINTS("points"),
@@ -387,6 +547,27 @@ interface CoverageCommittedRows {
     val capacity: Int
     val qualifier: CoverageRowsQualifier
     fun rowAt(index: Int): CoverageCommittedRow
+
+    // Compatibility borrowers may materialize rowAt; production overrides these
+    // scalar/copy reads without creating rows, styles or coordinate arrays.
+    fun surfaceIdAt(index: Int): Long = rowAt(index).surfaceId
+    fun keyAt(index: Int): Long = rowAt(index).key
+    fun positionComponentAt(index: Int, component: Int): Float {
+        require(component in 0..2)
+        val row = rowAt(index)
+        return when (component) { 0 -> row.x; 1 -> row.y; else -> row.z }
+    }
+    fun colorAt(index: Int): Int = rowAt(index).color
+    /** Validated V1 semantic/coverage/residency/target bit fields (encoded byte1). */
+    fun styleFlagsAt(index: Int): Int = rowAt(index).style.let {
+        it.semantic.code or (it.coverage.code shl 2) or (it.residency.code shl 4) or (it.target.code shl 6)
+    }
+    fun copyStyleAt(index: Int, destination: ByteArray, offset: Int) {
+        rowAt(index).style.encodeInto(destination, offset)
+    }
+    /** Zero confidence explicitly marks unavailable canonical normal metadata. */
+    fun packedNormalAt(index: Int): Int { require(index in 0 until count); return 0 }
+    fun normalConfidenceAt(index: Int): Int { require(index in 0 until count); return 0 }
 
     /**
      * Visits canonical rows without creating a source-sized collection.  The
@@ -507,7 +688,7 @@ private fun recolorStyleBuffers(
     repeat(recoloredColors.size) { index ->
         val offset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
         val style = CoverageRendererStyleRowV1.decode(recoloredRows, offset).copy(palette = palette)
-        style.encode().copyInto(recoloredRows, offset)
+        style.encodeInto(recoloredRows, offset)
         recoloredColors[index] = style.packedColor()
     }
     return RecoloredStyleBuffers(recoloredRows, recoloredColors)

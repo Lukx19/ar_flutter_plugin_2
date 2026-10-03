@@ -2,6 +2,8 @@ package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
+import com.uhg0.ar_flutter_plugin_2.util.toLowercaseHex
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineAuthority
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineScopeV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommitReceiptQueryV1
@@ -143,6 +145,8 @@ class VisibilityGridV2Binding internal constructor(
      */
     @Volatile private var acknowledgedPublicationCut: AcknowledgedCut? = null
     @Volatile private var pendingPublicationCut: CurrentDeltaCut? = null
+    /** Exact structural ACK arrived; the integration still has to install its renderer cut. */
+    @Volatile private var pendingRendererPublication: CurrentDeltaSelectorV1? = null
     @Volatile private var acknowledgementListener: ((CurrentDeltaSelectorV1) -> Unit)? = null
     @Volatile private var retainedRendererRebindListener:
         ((VisibilityObservationOwnership, committedEmptyBaseline, CommittedBaselineV1) -> Boolean)? = null
@@ -408,7 +412,6 @@ class VisibilityGridV2Binding internal constructor(
             "The named current delta is not retained"
         }
         check(receipt.selector == selector) { "Current-delta source returned a different receipt" }
-        val bytes = receipt.bytes
         val candidate = CurrentDeltaCut(
             selector = selector,
             baseGeometryRevision = receipt.baseGeometryRevision,
@@ -416,11 +419,7 @@ class VisibilityGridV2Binding internal constructor(
         )
         pendingPublicationCut?.let { pending ->
             check(pending.matches(candidate) &&
-                streamChannel.hasExactQueuedCurrentDelta(
-                    selector,
-                    receipt.baseGeometryRevision,
-                    bytes,
-                )
+                streamChannel.hasExactQueuedCurrentDelta(receipt)
             ) { "canonical surface current delta replay is not byte-exact" }
             return CurrentDeltaQueueResult.ALREADY_QUEUED
         }
@@ -438,7 +437,7 @@ class VisibilityGridV2Binding internal constructor(
         }
         // A prior call may have thrown after the stream atomically installed
         // the exact frames but before this binding recorded its scalar cut.
-        if (streamChannel.hasExactQueuedCurrentDelta(selector, receipt.baseGeometryRevision, bytes)) {
+        if (streamChannel.hasExactQueuedCurrentDelta(receipt)) {
             pendingPublicationCut = candidate
             return CurrentDeltaQueueResult.RECOVERED_EXACT_QUEUE
         }
@@ -452,6 +451,41 @@ class VisibilityGridV2Binding internal constructor(
         )
         pendingPublicationCut = candidate
         return CurrentDeltaQueueResult.QUEUED
+    }
+
+    /**
+     * Renderer geometry must remain on the acknowledged cut until the worker
+     * has consumed the exact structural transaction.  A style page can be
+     * prepared from that acknowledged cut while the structural response is
+     * retained; publishing the successor geometry first would make the style
+     * callback reject its still-valid geometry revision.
+     */
+    internal fun rendererPublicationAwaitingStructuralAcknowledgement(): Boolean {
+        replacementBinding?.let {
+            return it.rendererPublicationAwaitingStructuralAcknowledgement()
+        }
+        return synchronized(this) { pendingPublicationCut != null }
+    }
+
+    /**
+     * A structural ACK reaches the stream before the serialized integration
+     * executor has installed the corresponding renderer cut. A style page
+     * naming that successor must retry against the same request sequence until
+     * that installation is complete.
+     */
+    internal fun rendererPublicationApplicationPending(): Boolean {
+        replacementBinding?.let {
+            return it.rendererPublicationApplicationPending()
+        }
+        return synchronized(publicationFence) { pendingRendererPublication != null }
+    }
+
+    /** Completes the renderer side of one exact structural publication. */
+    internal fun markRendererPublicationApplied(selector: CurrentDeltaSelectorV1) {
+        replacementBinding?.markRendererPublicationApplied(selector)
+        synchronized(publicationFence) {
+            if (pendingRendererPublication == selector) pendingRendererPublication = null
+        }
     }
 
     @Synchronized
@@ -479,6 +513,7 @@ class VisibilityGridV2Binding internal constructor(
         val pending = pendingPublicationCut ?: return
         if (pending.selector != selector) return
         pendingPublicationCut = null
+        pendingRendererPublication = selector
         acknowledgedPublicationCut = AcknowledgedCut.from(selector)
         acknowledgementListener?.invoke(selector)
     }
@@ -492,6 +527,26 @@ class VisibilityGridV2Binding internal constructor(
     private fun applyRendererStyleCutCommand(
         command: RendererStyleCutPayloadV1,
     ): RendererStyleCommandApplyResultV1 = synchronized(publicationFence) {
+        try {
+            applyRendererStyleCutCommandLocked(command)
+        } catch (error: RuntimeException) {
+            if (isDebuggable) {
+                Log.e(
+                    RENDERER_STYLE_TAG,
+                    "rendererStyle phase=failed tx=${command.transactionId} " +
+                        "geometry=${command.geometryRevision} lineage=${command.lineageRevision} " +
+                        "style=${command.styleRevision}",
+                    error,
+                )
+            }
+            throw error
+        }
+    }
+
+    private fun applyRendererStyleCutCommandLocked(
+        command: RendererStyleCutPayloadV1,
+    ): RendererStyleCommandApplyResultV1 {
+        val startedNs = System.nanoTime()
         check(!disposed.get() && replacementBinding == null) {
             "Abandoned binding cannot apply a renderer-style cut"
         }
@@ -515,6 +570,7 @@ class VisibilityGridV2Binding internal constructor(
             command.geometryRevision == previousBaseline.geometryRevision &&
             command.lineageRevision == previousBaseline.lineageRevision
         ) { "Renderer-style cut canonical baseline is stale" }
+        logRendererStylePhase(command, "qualified", startedNs)
         val qualified = QualifiedRendererStyleCut(
             ownership = ownership,
             transactionId = command.transactionId,
@@ -531,8 +587,23 @@ class VisibilityGridV2Binding internal constructor(
             targetSurfaceId = command.targetSurfaceId,
             targetDirectionIndex = command.targetDirectionIndex,
         )
-        when (val result = onRendererStyleCut?.invoke(qualified)
-            ?: throw IllegalStateException("Renderer-style owner is unavailable")) {
+        val result = try {
+            onRendererStyleCut?.invoke(qualified)
+                ?: throw IllegalStateException("Renderer-style owner is unavailable")
+        } catch (error: RuntimeException) {
+            if (isDebuggable) {
+                Log.e(
+                    RENDERER_STYLE_TAG,
+                    "rendererStyle phase=ownerApplyFailed " +
+                        "tx=${command.transactionId} geometry=${command.geometryRevision} " +
+                        "lineage=${command.lineageRevision} style=${command.styleRevision}",
+                    error,
+                )
+            }
+            throw error
+        }
+        logRendererStylePhase(command, "ownerApplied", startedNs)
+        when (result) {
             is RendererStyleCutResult.Applied -> require(
                 result.styleRevision == command.styleRevision,
             ) { "Renderer-style callback accepted a different style revision" }
@@ -545,16 +616,34 @@ class VisibilityGridV2Binding internal constructor(
                 )
             }
         }
+        logRendererStylePhase(command, "authorityPublished", startedNs)
         val nextBaseline = previousBaseline.copy(styleRevision = command.styleRevision)
         publishCommittedBaselineAdvance(previousBaseline, nextBaseline)
+        logRendererStylePhase(command, "baselineAdvanced", startedNs)
         lifecycle.setCommittedBaselineLocally(nextBaseline)
-        RendererStyleCommandApplyResultV1(command.styleRevision)
+        return RendererStyleCommandApplyResultV1(command.styleRevision)
+    }
+
+    private fun logRendererStylePhase(
+        command: RendererStyleCutPayloadV1,
+        phase: String,
+        startedNs: Long,
+    ) {
+        if (!isDebuggable) return
+        val elapsedMicros = ((System.nanoTime() - startedNs).coerceAtLeast(0L) / 1_000L)
+        Log.d(
+            RENDERER_STYLE_TAG,
+            "rendererStyle phase=$phase tx=${command.transactionId} " +
+                "geometry=${command.geometryRevision} lineage=${command.lineageRevision} " +
+                "style=${command.styleRevision} elapsedMicros=$elapsedMicros",
+        )
     }
 
     /** Rejects stale inner qualifiers before they can reserve page staging. */
     private fun admitRendererStylePage(page: RendererStyleCommandV1.Page): Boolean {
         val ownership = currentObservationOwnership() ?: return false
         val baseline = lifecycle.committedBaseline()
+        if (rendererPublicationApplicationPending()) return false
         val qualified = page.bindingGeneration == ownership.bindingGeneration &&
             page.groupGeneration == ownership.groupGeneration &&
             page.captureGroupId.contentEquals(parseUuid(ownership.captureGroupId).bytes) &&
@@ -1374,6 +1463,7 @@ class VisibilityGridV2Binding internal constructor(
         acknowledgedEmptyBaseline = null
         acknowledgedPublicationCut = null
         pendingPublicationCut = null
+        pendingRendererPublication = null
         acceptedControls = 0L
         activeControlRequestId = null
         synchronized(this) {
@@ -1597,13 +1687,9 @@ class VisibilityGridV2Binding internal constructor(
     private fun currentIdentity(): BindingIdentity =
         BindingIdentity(currentBindingGeneration, bindingQualifier())
 
-    private fun Uuid.hex(): String = bytes.joinToString("") { byte ->
-        "%02x".format(byte.toInt() and 0xff)
-    }
+    private fun Uuid.hex(): String = bytes.toLowercaseHex()
 
-    private fun ByteArray.hex(): String = joinToString("") { byte ->
-        "%02x".format(byte.toInt() and 0xff)
-    }
+    private fun ByteArray.hex(): String = toLowercaseHex()
 
     private fun Snapshot.toMap(): Map<String, Any?> = mapOf(
         "bindingGeneration" to bindingGeneration,
@@ -1900,6 +1986,7 @@ class VisibilityGridV2Binding internal constructor(
         val nextViewGeneration = AtomicLong()
         val nextLifecycleSequence = AtomicLong()
         const val MAX_EXECUTOR_TRACE = 16
+        const val RENDERER_STYLE_TAG = "VisibilityGridV2Binding"
         internal const val MAX_RETAINED_CLEANUP_TERMINALS = 8
         internal const val MAX_RETAINED_CLEANUP_LEASES = 8
         internal const val CLEANUP_LEASE_BYTES = 16
@@ -2277,13 +2364,11 @@ internal class VisibilityGridV2DebugRecoverySeam {
             "$sessionGeneration:$groupGeneration:$coverageEpoch"
 
     private fun VisibilityGridV2Binding.BindingIdentity.traceIdentity(): String =
-        "$generation:${qualifier.joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }}"
+        "$generation:${qualifier.toLowercaseHex()}"
 
     private fun VisibilityGridV2Binding.RecoveryGroupCut.cutIdentity(): String =
         "${sessionId?.hex()}:${captureGroupId?.hex()}:" +
             "$sessionGeneration:$groupGeneration:$coverageEpoch"
 
-    private fun Uuid.hex(): String = bytes.joinToString("") { byte ->
-        "%02x".format(byte.toInt() and 0xff)
-    }
+    private fun Uuid.hex(): String = bytes.toLowercaseHex()
 }

@@ -1,6 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.pointcloud
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertFalse
@@ -141,6 +142,73 @@ class PointCloudModelsTest {
 
         assertEquals(row, CoverageRendererStyleRowV1.decode(row.encode()))
         assertEquals(COVERAGE_RENDERER_STYLE_ROW_BYTES, row.encode().size)
+    }
+
+    @Test
+    fun `renderer style row matches the independent little endian wire vector`() {
+        val wire = byteArrayOf(
+            1,
+            0x95.toByte(),
+            0x48.toByte(),
+            0x1f.toByte(),
+            23,
+            0,
+            0xff.toByte(),
+            0xff.toByte(),
+            0xff.toByte(),
+            0xff.toByte(),
+            0xff.toByte(),
+            0xff.toByte(),
+            17,
+            0,
+            0,
+            0,
+        )
+
+        assertEquals(
+            CoverageRendererStyleRowV1(
+                semanticGeneration = 0xffff_ffffL,
+                styleGeneration = 17,
+                semantic = CoverageRendererSemantic.AMBIGUOUS,
+                coverage = CoverageRendererCoverage.PARTIAL,
+                palette = CoverageRendererPalette.DIRECTION,
+                cut = CoverageRendererCut.INDETERMINATE_HISTORY,
+                residency = CoverageRendererResidency.WARM_L1,
+                target = CoverageRendererTarget.HALO,
+                directionBin = 23,
+                glyph = CoverageRendererGlyph.VIEW_ROSE,
+                lineageCount = 0xffff,
+                age = CoverageRendererAge.OLD,
+                sourceHealth = CoverageRendererSourceHealth.FEATURE_ONLY,
+            ),
+            CoverageRendererStyleRowV1.decode(wire),
+        )
+    }
+
+    @Test
+    fun `renderer style row writes into a caller owned buffer`() {
+        val row = CoverageRendererStyleRowV1(
+            semanticGeneration = 0xffff_ffffL,
+            styleGeneration = 17,
+            semantic = CoverageRendererSemantic.AMBIGUOUS,
+            coverage = CoverageRendererCoverage.PARTIAL,
+            palette = CoverageRendererPalette.DIRECTION,
+            cut = CoverageRendererCut.INDETERMINATE_HISTORY,
+            residency = CoverageRendererResidency.WARM_L1,
+            target = CoverageRendererTarget.HALO,
+            directionBin = 23,
+            glyph = CoverageRendererGlyph.VIEW_ROSE,
+            lineageCount = 0xffff,
+            age = CoverageRendererAge.OLD,
+            sourceHealth = CoverageRendererSourceHealth.FEATURE_ONLY,
+        )
+        val destination = ByteArray(COVERAGE_RENDERER_STYLE_ROW_BYTES + 2) { 0x5a.toByte() }
+
+        row.encodeInto(destination, 1)
+
+        assertArrayEquals(row.encode(), destination.copyOfRange(1, destination.size - 1))
+        assertEquals(0x5a.toByte(), destination.first())
+        assertEquals(0x5a.toByte(), destination.last())
     }
 
     @Test

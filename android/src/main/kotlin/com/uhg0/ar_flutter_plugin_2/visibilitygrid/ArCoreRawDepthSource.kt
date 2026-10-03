@@ -35,6 +35,21 @@ internal class PreparedRawDepthFrame(
         return source.acquire(metadata)
     }
 
+    fun processPacked(
+        pool: DepthSamplesLeasePool,
+        generation: SampleLeaseGeneration,
+    ): PackedDepthAcquisitionResult {
+        val source = RawDepthCopySource(
+            acquirer = object : PairedRawDepthAcquirer {
+                override fun acquireDepth() = depth
+                override fun acquireConfidence() = confidence
+            },
+            maxCopiedPixels = maxCopiedPixels,
+        )
+        check(processing.compareAndSet(false, true))
+        return source.acquirePacked({ _, _ -> metadata }, pool, generation)
+    }
+
     override fun close() {
         // A refused offer never reaches process(); only that path closes here.
         if (!processing.compareAndSet(false, true)) return
@@ -73,6 +88,27 @@ class ArCoreRawDepthSource(
         return source.acquire { width, height ->
             metadata(frame, groupGeneration, sessionGeneration, width, height)
         }
+    }
+
+    /** Copies ARCore depth into an application-owned packed lease on this stack. */
+    internal fun acquirePacked(
+        frame: Frame,
+        ownership: VisibilityObservationOwnership,
+        pool: DepthSamplesLeasePool,
+    ): PackedDepthAcquisitionResult {
+        val source = RawDepthCopySource(
+            acquirer = ArCorePairedRawDepthAcquirer(frame, depthMode),
+            maxCopiedPixels = maxCopiedPixels,
+            onResourceAcquired = onResourceAcquired,
+            onResourceClosed = onResourceClosed,
+        )
+        return source.acquirePacked(
+            metadataForDimensions = { width, height ->
+                metadata(frame, ownership.groupGeneration, ownership.sessionGeneration, width, height)
+            },
+            pool = pool,
+            generation = SampleLeaseGeneration.from(ownership),
+        )
     }
 
     /** Acquires both ARCore images on the current frame; selection happens on a worker. */

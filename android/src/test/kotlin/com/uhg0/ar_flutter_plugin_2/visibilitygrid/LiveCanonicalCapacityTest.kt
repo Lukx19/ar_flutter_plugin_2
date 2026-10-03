@@ -94,17 +94,28 @@ class LiveCanonicalCapacityTest {
             val packedAuthorityAndSpatial = memory.residentTotalBytes
             val pendingPlanPeak = transientPeaks.maxOrNull()!!
             val ownerBytes = runtime.portableOwnerBytes() + runtime.portableCoordinatorOwnerBytes()
+            // Runtime/coordinator owners do not include the mapper itself.
+            // Reserve its complete scalar owner and one independently retained
+            // refusal receipt. Prepared receipt aliases remain in the depth
+            // output reserve; old diagnostic references clear before preparation.
+            val mapperScalarAndRefusalBytes = VISIBILITY_GRID_INTEGRATION_SCALAR_OWNER_BYTES +
+                RETAINED_DEPTH_REFUSAL_RECEIPT_BYTES
+            val ingressPoolBytes = packedIngressPoolBytes()
+            val featureKernel = FeatureFusionKernel()
+            assertTrue(runtime.bindFeatureFingerprintResolver(featureKernel))
+            val featureOwnerBytes = featureKernel.resourceReceipt().assignedTupleShareBytes.toLong()
             val projectedPeak = Math.addExact(
                 Math.addExact(packedAuthorityAndSpatial, DEPTH_MAXIMUM_SEMANTIC_BYTES),
                 Math.addExact(
-                    Math.addExact(CompactCanonicalStore.KERNEL_RETAINED_BYTES, pendingPlanPeak),
-                    ownerBytes,
+                    Math.addExact(featureOwnerBytes, pendingPlanPeak),
+                    Math.addExact(Math.addExact(ownerBytes, ingressPoolBytes), mapperScalarAndRefusalBytes),
                 ),
             )
             assertTrue(
                 "live maximum aggregate=$projectedPeak packed=$packedAuthorityAndSpatial " +
-                    "depth=$DEPTH_MAXIMUM_SEMANTIC_BYTES feature=${CompactCanonicalStore.KERNEL_RETAINED_BYTES} " +
-                    "pending=$pendingPlanPeak owners=$ownerBytes",
+                    "depth=$DEPTH_MAXIMUM_SEMANTIC_BYTES feature=$featureOwnerBytes " +
+                    "pending=$pendingPlanPeak owners=$ownerBytes ingressPools=$ingressPoolBytes " +
+                    "mapperScalarAndRefusal=$mapperScalarAndRefusalBytes",
                 projectedPeak <= NATIVE_AGGREGATE_LIMIT_BYTES,
             )
             println(
@@ -112,7 +123,8 @@ class LiveCanonicalCapacityTest {
                     "supports=${state.cut.supportCount} lineage=${state.cut.lineageCount} " +
                     "highWater=${state.cut.nextSurfaceIdHighWater} pages=${pageReceipt.pageCount} " +
                     "maxPageRows=${pageReceipt.maximumPageRows} packedSpatial=$packedAuthorityAndSpatial " +
-                    "pendingPlan=$pendingPlanPeak owners=$ownerBytes projectedPeak=$projectedPeak",
+                    "pendingPlan=$pendingPlanPeak feature=$featureOwnerBytes owners=$ownerBytes ingressPools=$ingressPoolBytes " +
+                    "mapperScalarAndRefusal=$mapperScalarAndRefusalBytes projectedPeak=$projectedPeak",
             )
         } finally {
             runtime.close()
@@ -273,6 +285,26 @@ class LiveCanonicalCapacityTest {
         )
     }
 
+    /** The two fixed producer slots and their maximum live lease metadata. */
+    private fun packedIngressPoolBytes(): Long {
+        val depthPool = DepthSamplesLeasePool()
+        val featurePool = FeatureSamplesLeasePool()
+        return try {
+            val depth = depthPool.receipt()
+            val feature = featurePool.receipt()
+            assertEquals(2, depth.slotCount)
+            assertEquals(0, depth.growthCount)
+            assertEquals(2, feature.slotCount)
+            assertEquals(0, feature.growthCount)
+            assertTrue(depth.portableMaximumOwnedBytes > depth.primitiveBytes)
+            assertTrue(feature.portableMaximumOwnedBytes > feature.primitiveBytes)
+            Math.addExact(depth.portableMaximumOwnedBytes, feature.portableMaximumOwnedBytes)
+        } finally {
+            depthPool.close()
+            featurePool.close()
+        }
+    }
+
     private fun readAndVerifyRendererPages(
         runtime: CanonicalRuntimeResources,
         cut: CompactCanonicalCut,
@@ -361,7 +393,7 @@ class LiveCanonicalCapacityTest {
         const val PAGE_LIMIT = 512
         const val JOURNAL_LIMIT_BYTES = 1_048_576L
         const val NATIVE_AGGREGATE_LIMIT_BYTES = 64L * 1024L * 1024L
-        const val DEPTH_MAXIMUM_SEMANTIC_BYTES = 15_587_096L
+        const val DEPTH_MAXIMUM_SEMANTIC_BYTES = 15_987_160L
         const val SPATIAL_PRIMITIVE_BYTES = 7_222_848L
         const val CURRENT_BUFFER_BYTES = 1_048_576L
     }

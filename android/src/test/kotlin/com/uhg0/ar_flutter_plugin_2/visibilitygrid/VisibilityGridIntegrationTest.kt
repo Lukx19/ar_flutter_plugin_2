@@ -348,7 +348,7 @@ class VisibilityGridIntegrationTest {
             assertEquals(1, runtime.snapshot().admittedFeatureObservations)
             assertEquals(V2_FEATURE_SAMPLE_CAPACITY, runtime.snapshot().maximumFeatureSamples)
             assertTrue(integration.pressureSnapshot().associationHighWater >= V2_FEATURE_SAMPLE_CAPACITY)
-            assertTrue(projection.currentRowCount() > 0)
+            assertEquals(0, projection.currentRowCount())
             var sequence = 3L
             var ended = false
             repeat(256) {
@@ -361,6 +361,7 @@ class VisibilityGridIntegrationTest {
                 pending.transactionId, pending.geometryRevision, pending.lineageRevision).first.messageKind)
             await { integration.integrationReceipt().status == "acknowledged" }
             val rendererRows = projection.currentRowCount()
+            assertTrue(rendererRows > 0)
             assertTrue(source.emitMaximumDepth(scheduler.nowNs + 250_000_000L))
             scheduler.advanceBy(0)
             assertEquals(V2_DEPTH_SAMPLE_CAPACITY, runtime.snapshot().maximumDepthSamples)
@@ -379,6 +380,148 @@ class VisibilityGridIntegrationTest {
             runtime.close()
             assertEquals(0, runtime.snapshot().residentPayloadBytes)
             assertEquals(0, projection.currentRowCount())
+            binding.dispose()
+            coordinator.close()
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test(timeout = 60_000L)
+    fun `complete campaign feature frames retain settled canonical publication under coalescing`() {
+        val directory = Files.createTempDirectory("canonical-complete-feature-frames").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val viewId = 2191
+        val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+        val scheduler = PressureObservationScheduler()
+        val projection = NativeRendererProjection(render = { _, _ -> })
+        val integration = VisibilityGridIntegration(binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = resources(directory, coordinator), renderer = projection)
+        val runtime = AndroidVisibilityGridRuntime(binding::currentObservationOwnership,
+            integration, scheduler, nanoTime = { scheduler.nowNs })
+        try {
+            val stream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            val source = SyntheticVisibilityObservationSource(runtime, binding::currentObservationOwnership)
+            source.anchor(identityVisibilityGridTransform(), requireNotNull(binding.currentObservationOwnership()).groupFrame)
+            source.prepareDenseDepthGrids(campaignVariants = true)
+            var sequence = 3L
+            var transaction = 1L
+            var geometry = 1L
+            var lineage = 1L
+            var settledGeometry = -1L
+            var settledAdmissions = -1L
+            repeat(32) { frameIndex ->
+                repeat(if (frameIndex % 3 == 0) 2 else 1) { queued ->
+                    assertTrue(source.emitCampaignFeatureFrame(scheduler.nowNs + queued + 1L, 12))
+                }
+                scheduler.advanceBy(500_000_000L)
+                val pending = integration.integrationReceipt()
+                if (pending.status == "pendingAck") {
+                    var ended = false
+                    repeat(256) {
+                        if (!ended) ended = exchange(messenger, viewId, stream, ++sequence,
+                            transaction, geometry, lineage).first.messageKind == 4
+                    }
+                    assertTrue("complete frame cut reached END", ended)
+                    transaction = pending.transactionId
+                    geometry = pending.geometryRevision
+                    lineage = pending.lineageRevision
+                    exchange(messenger, viewId, stream, ++sequence, transaction, geometry, lineage)
+                    await { integration.integrationReceipt().status == "acknowledged" }
+                }
+                if (frameIndex == 7) {
+                    settledGeometry = geometry
+                    settledAdmissions = runtime.snapshot().admittedFeatureObservations
+                    assertTrue(settledAdmissions > 0)
+                    assertTrue(projection.currentRowCount() > 0)
+                } else if (frameIndex > 7) {
+                    assertEquals("settled canonical revision at frame $frameIndex", settledGeometry, geometry)
+                    assertEquals(settledAdmissions, runtime.snapshot().admittedFeatureObservations)
+                }
+            }
+        } finally {
+            runtime.close()
+            binding.dispose()
+            coordinator.close()
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `renderer keeps acknowledged geometry while a style cut precedes its structural ACK`() {
+        val directory = Files.createTempDirectory("canonical-style-before-geometry-ack").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val viewId = 2161
+        val projection = NativeRendererProjection(render = { _, _ -> })
+        val binding = VisibilityGridV2Binding(
+            messenger,
+            viewId,
+            CommittedBaselineAuthority(),
+            postToMain = { it() },
+            onRendererStyleCut = projection::applyStyleCut,
+        )
+        val integration = VisibilityGridIntegration(
+            binding,
+            binding::currentObservationOwnership,
+            directory,
+            resourcesForGroup = resources(directory, coordinator),
+            renderer = projection,
+        )
+        try {
+            val stream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            val ownership = requireNotNull(binding.currentObservationOwnership())
+
+            integration.admitFeature(feature(ownership, 11))
+            val pending = integration.integrationReceipt()
+            assertEquals("pendingAck", pending.status)
+            assertEquals(0, projection.currentRowCount())
+
+            val style = emptyBootstrapStyle(ownership, transactionId = 1, revision = 1)
+            val styleResponse = exchange(
+                messenger,
+                viewId,
+                stream,
+                4,
+                transaction = 1,
+                geometry = 1,
+                lineage = 1,
+                nextStyleRevision = 1,
+                commandBytes = RendererStyleCommandV1.encodePages(style).single(),
+            ).first
+            assertEquals("style response=$styleResponse", 0, styleResponse.errorId)
+            assertEquals(1, styleResponse.acceptedStyleRevision)
+            assertEquals(2, styleResponse.messageKind)
+
+            var sequence = 5L
+            repeat(styleResponse.chunkCount) {
+                val chunk = exchange(
+                    messenger, viewId, stream, sequence++, 1, 1, 1,
+                    nextStyleRevision = 1,
+                ).first
+                assertEquals("chunk=$chunk", 3, chunk.messageKind)
+            }
+            val commit = exchange(
+                messenger, viewId, stream, sequence++, 1, 1, 1,
+                nextStyleRevision = 1,
+            ).first
+            assertEquals("commit=$commit", 4, commit.messageKind)
+            val acknowledgement = exchange(
+                messenger, viewId, stream, sequence++, 2, 2, 1,
+                nextStyleRevision = 1,
+            ).first
+            assertEquals("ack=$acknowledgement", 0, acknowledgement.messageKind)
+            await { integration.integrationReceipt().status == "acknowledged" }
+            assertEquals(1, projection.currentRowCount())
+            assertEquals(2L, integration.integrationReceipt().geometryRevision)
+        } finally {
+            integration.close()
             binding.dispose()
             coordinator.close()
             directory.deleteRecursively()
@@ -587,6 +730,7 @@ class VisibilityGridIntegrationTest {
         val scheduler = PressureObservationScheduler()
         val depthCommitAttempts = mutableListOf<PreparedCanonicalMutation>()
         val canonicalFault = VisibilityCanonicalFaultGate(isDebuggable = true)
+        val allocationCounter = AtomicLong(0L)
         var publishedPages = 0
         var publishedRows = 0
         val projection = NativeRendererProjection(
@@ -618,6 +762,7 @@ class VisibilityGridIntegrationTest {
                 }
                 canonicalFault.commit(resources, mutation)
             },
+            allocationCounter = { allocationCounter.addAndGet(128L) },
         )
         val runtime = AndroidVisibilityGridRuntime(binding::currentObservationOwnership,
             integration, scheduler, nanoTime = { scheduler.nowNs })
@@ -715,16 +860,16 @@ class VisibilityGridIntegrationTest {
                 assertEquals(3, integration.integrationReceipt().geometryRevision)
                 assertEquals(1, runtime.snapshot().admittedDepthObservations)
                 assertEquals(null, integration.pendingDepthRetentionReceipt())
-                assertTrue(projection.currentRowCount() > rendererRowsBeforeFault)
-                assertEquals(publishedRowsBeforeFault + projection.currentRowCount(), publishedRows)
-                assertEquals(publishedPagesBeforeFault +
-                    (projection.currentRowCount() + 511) / 512, publishedPages)
                 val pendingDepthTiming = integration.depthAdmissionTiming()
                 assertEquals(0L, pendingDepthTiming.completedCount)
                 assertTrue(pendingDepthTiming.pendingPublicationAck)
                 assertTrue("publication ACK timing $pendingDepthTiming",
                     pendingDepthTiming.publicationAckMicros >= 0L)
                 acknowledge()
+                 assertTrue(projection.currentRowCount() > rendererRowsBeforeFault)
+                 assertEquals(publishedRowsBeforeFault + projection.currentRowCount(), publishedRows)
+                 assertEquals(publishedPagesBeforeFault +
+                     (projection.currentRowCount() + 511) / 512, publishedPages)
                 scheduler.advanceBy(250_000_000)
                 assertEquals(2, depthCommitAttempts.size)
                 assertEquals(publishedRowsBeforeFault + projection.currentRowCount(), publishedRows)
@@ -738,6 +883,35 @@ class VisibilityGridIntegrationTest {
             assertTrue("mutation timing $depthTiming", depthTiming.mutationMicros >= 0L)
             assertTrue("publication ACK timing $depthTiming", depthTiming.publicationAckMicros >= 0L)
             assertTrue("end-to-end timing $depthTiming", depthTiming.endToEndMicros >= 0L)
+            val allocationReceipt = integration.allocationWorkspaceReceipt()
+            assertEquals(1L, allocationReceipt["mapperAllocationAttributionEnabled"])
+            assertTrue("depth lookup allocation $allocationReceipt",
+                requireNotNull(allocationReceipt["mapperDepthLookupAllocatedBytes"]) >= 0L)
+            assertTrue("depth mutation allocation $allocationReceipt",
+                requireNotNull(allocationReceipt["mapperDepthMutationAllocatedBytes"]) >= 0L)
+            assertTrue("depth ACK allocation $allocationReceipt",
+                requireNotNull(allocationReceipt["mapperDepthPublicationAckAllocatedBytes"]) >= 0L)
+            assertTrue("feature planning allocation $allocationReceipt",
+                requireNotNull(allocationReceipt["mapperFeaturePlanningAllocatedBytes"]) >= 0L)
+            assertTrue("feature mutation allocation $allocationReceipt",
+                requireNotNull(allocationReceipt["mapperFeatureMutationAllocatedBytes"]) >= 0L)
+            assertTrue("feature serialization allocation $allocationReceipt",
+                requireNotNull(allocationReceipt["mapperFeatureSerializationAllocatedBytes"]) >= 0L)
+            assertTrue("feature publication allocation $allocationReceipt",
+                requireNotNull(allocationReceipt["mapperFeaturePublicationAllocatedBytes"]) >= 0L)
+            listOf(
+                "mapperDepthLookupAllocatedBytes",
+                "mapperDepthMutationAllocatedBytes",
+                "mapperDepthPublicationAckAllocatedBytes",
+                "mapperFeaturePlanningAllocatedBytes",
+                "mapperFeatureMutationAllocatedBytes",
+                "mapperFeatureSerializationAllocatedBytes",
+                "mapperFeaturePublicationAllocatedBytes",
+            ).forEach { phase ->
+                val total = requireNotNull(allocationReceipt["${phase}Total"])
+                val samples = requireNotNull(allocationReceipt["${phase.removeSuffix("AllocatedBytes")}AllocationSamples"])
+                assertTrue("cumulative $phase total=$total samples=$samples", total >= 0L && samples > 0L)
+            }
             val timingWire = runtime.snapshotWireMap()["depthAdmissionTiming"]
             assertTrue(timingWire is Map<*, *>)
             assertTrue((timingWire as Map<*, *>).values.all { it is Number || it is Boolean })
@@ -806,25 +980,52 @@ class VisibilityGridIntegrationTest {
                 runtime,
                 binding::currentObservationOwnership,
             )
-            source.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
-            repeat(12) { marker ->
-                assertTrue(
-                    source.emitFeature(
-                        scheduler.nowNs + marker * 125_000_000L,
-                        marker = marker,
-                    ),
-                )
+            var sequence = 4L
+            var acknowledgedTransaction = 1L
+            var acknowledgedGeometry = 1L
+            var acknowledgedLineage = 1L
+            fun acknowledgeMaterialCut() {
+                val pending = integration.integrationReceipt()
+                if (pending.status != "pendingAck") return
+                val begin = exchange(messenger, viewId, stream, sequence++,
+                    acknowledgedTransaction, acknowledgedGeometry, acknowledgedLineage).first
+                assertEquals(2, begin.messageKind)
+                repeat(begin.chunkCount) {
+                    assertEquals(3, exchange(messenger, viewId, stream, sequence++,
+                        acknowledgedTransaction, acknowledgedGeometry, acknowledgedLineage).first.messageKind)
+                }
+                assertEquals(4, exchange(messenger, viewId, stream, sequence++,
+                    acknowledgedTransaction, acknowledgedGeometry, acknowledgedLineage).first.messageKind)
+                acknowledgedTransaction = pending.transactionId
+                acknowledgedGeometry = pending.geometryRevision
+                acknowledgedLineage = pending.lineageRevision
+                assertEquals(0, exchange(messenger, viewId, stream, sequence++,
+                    acknowledgedTransaction, acknowledgedGeometry, acknowledgedLineage).first.messageKind)
+                await { integration.integrationReceipt().status == "acknowledged" }
             }
+            source.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            assertTrue(source.emitFeature(scheduler.nowNs, marker = 0))
+            assertTrue(source.emitFeature(scheduler.nowNs + 125_000_000L, marker = 1))
+            // The packed source owns exactly two reusable leases. A third
+            // callback cannot borrow storage until the current mapper task
+            // drains, so the source refuses it without entering the runtime.
+            assertFalse(source.emitFeature(scheduler.nowNs + 250_000_000L, marker = 2))
             scheduler.advanceBy(0)
+            // The first delivery fails in the injected mapper seam. Its
+            // lease is released, allowing the refused callback to be retried.
+            assertTrue(source.emitFeature(scheduler.nowNs + 250_000_000L, marker = 2))
             scheduler.advanceBy(125_000_000)
+            acknowledgeMaterialCut()
+            scheduler.advanceBy(125_000_000)
+            acknowledgeMaterialCut()
 
-            assertEquals(12L, runtime.snapshot().copiedFeatureObservations)
-            assertEquals(10L, runtime.snapshot().replacedFeatureObservations)
+            assertEquals(3L, runtime.snapshot().copiedFeatureObservations)
+            assertEquals(0L, runtime.snapshot().replacedFeatureObservations)
             assertEquals(1L, runtime.snapshot().staleGenerationObservations)
             assertEquals(1L, runtime.snapshot().droppedFeatureObservations)
             assertTrue(integration.integrationReceipt().geometryRevision > 1)
             assertTrue(projection.currentRowCount() > 0)
-            assertEquals(1L, runtime.snapshot().admittedFeatureObservations)
+            assertEquals(2L, runtime.snapshot().admittedFeatureObservations)
         } finally {
             runtime.close()
             assertEquals(0, projection.currentRowCount())
@@ -971,9 +1172,12 @@ class VisibilityGridIntegrationTest {
     @Test
     fun `empty bootstrap style cut seeds an uninitialized renderer projection`() {
         val descriptors = mutableListOf<com.uhg0.ar_flutter_plugin_2.sceneview.BoundedCoveragePresentation>()
+        val timings = mutableListOf<RendererProjectionTiming>()
         val projection = NativeRendererProjection(
             render = { snapshot, _ -> check(snapshot == null) },
             publishPresentation = { descriptor, _ -> descriptor?.let(descriptors::add) },
+            timingSink = { timings += it },
+            publishTimingScope = RendererPublicationTimingScope.MAILBOX_ENQUEUE,
         )
         val ownership = rendererOwnership()
         val cut = QualifiedRendererStyleCut(
@@ -1012,6 +1216,13 @@ class VisibilityGridIntegrationTest {
         assertEquals(1, descriptors.single().qualifier.styleRevision)
         assertEquals(1, descriptors.single().qualifier.geometryRevision)
         assertEquals(0, descriptors.single().count)
+        val timing = timings.single()
+        assertEquals(RendererPublicationTimingScope.MAILBOX_ENQUEUE, timing.publishTimingScope)
+        assertEquals("mailbox-enqueue", timing.publishTimingScope.wireName)
+        assertEquals("inclusive-process-counter-window-may-overlap-main", timing.allocationScope)
+        assertTrue(timing.publishMicros >= 0L)
+        assertEquals(RendererStyleCutResult.Replayed(1), projection.applyStyleCut(cut))
+        assertEquals(1, timings.size)
         projection.close()
     }
 
@@ -1252,7 +1463,12 @@ class VisibilityGridIntegrationTest {
             assertEquals("pendingAck", integration.integrationReceipt().status)
             val preAckAuthoritative = authority.snapshot(scope)
             assertEquals(1, preAckAuthoritative.transactionId)
-            assertFalse(
+            // The structural publication fence keeps the renderer on the
+            // acknowledged cut until its exact ACK. The pre-ACK authority and
+            // renderer therefore still name the same retained cut, so the
+            // projection preflight is valid here; the integration's pending
+            // selector remains the separate publication gate.
+            assertTrue(
                 projection.canRebindRetainedCanonicalCut(
                     RetainedRendererBindingCut(
                         previousOwnership = originalOwnership,
@@ -1271,7 +1487,12 @@ class VisibilityGridIntegrationTest {
             exchange(messenger, viewId, originalStream, 4, 1, 1, 1)
             exchange(messenger, viewId, originalStream, 5, 1, 1, 1)
             exchange(messenger, viewId, originalStream, 6, 1, 1, 1)
-            val styleSurfaceIds = rendered.last().surfaceIds.copyOf().also(LongArray::sort)
+            exchange(messenger, viewId, originalStream, 7, 2, 2, 1)
+            await {
+                !binding.rendererPublicationApplicationPending() &&
+                    rendered.any { it.count > 0 }
+            }
+            val styleSurfaceIds = rendered.last { it.count > 0 }.surfaceIds.copyOf().also(LongArray::sort)
             fun liveStyle(revision: Long) = RendererStyleCutPayloadV1(
                 captureGroupId = uuid(40).bytes,
                 bindingGeneration = originalOwnership.bindingGeneration,
@@ -1295,7 +1516,6 @@ class VisibilityGridIntegrationTest {
                     }
                 },
             )
-            exchange(messenger, viewId, originalStream, 7, 2, 2, 1)
             assertEquals(binding.currentCommittedBaseline(), authority.snapshot(scope))
             val initialLiveStyle = liveStyle(1)
             val initialStyleResponse = exchange(
@@ -1852,9 +2072,7 @@ class VisibilityGridIntegrationTest {
             assertEquals(1, staged.lineageRevision)
             assertEquals("CREATE", staged.canonicalOperation)
             assertTrue(staged.canonicalBytes > 0)
-            assertEquals(2, rendered.size)
-            assertEquals(2L, rendered.last().update?.geometryRevision)
-            assertEquals(staged.rendererRows, rendered.last().count)
+            assertEquals(1, rendered.size)
 
             val first = exchange(messenger, 2106, stream, 4, 1, 1, 1)
             val replay = exchange(messenger, 2106, stream, 4, 1, 1, 1)
@@ -1868,10 +2086,118 @@ class VisibilityGridIntegrationTest {
                 Thread.sleep(5)
             }
             assertEquals("acknowledged", integration.integrationReceipt().status)
+            assertEquals(2, rendered.size)
+            assertEquals(2L, rendered.last().update?.geometryRevision)
+            assertTrue(rendered.last().count > 0)
             assertTrue(integration.integrationReceipt()::class.java.declaredFields.none { it.type == ByteArray::class.java })
             assertEquals(null, integration.snapshot().lastReceipt)
         } finally {
             integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `depth attempt diagnostics distinguish filtered samples from metadata mismatch and reset with ownership`() {
+        for (reset in listOf("replacement", "close")) {
+            val directory = Files.createTempDirectory("depth-attempt-diagnostics-$reset").toFile()
+            val coordinator = budget(directory)
+            val messenger = MethodTestMessenger()
+            val viewId = 2139
+            val binding = VisibilityGridV2Binding(
+                messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() },
+            )
+            var replacementOwnership: VisibilityObservationOwnership? = null
+            val integration = VisibilityGridIntegration(
+                binding, { replacementOwnership ?: binding.currentObservationOwnership() }, directory,
+                resourcesForGroup = resources(directory, coordinator),
+            )
+            val pool = DepthSamplesLeasePool()
+            try {
+                val stream = start(binding, messenger, viewId)
+                exchange(messenger, viewId, stream, 1, 0, 0, 0)
+                exchange(messenger, viewId, stream, 2, 0, 0, 0)
+                exchange(messenger, viewId, stream, 3, 1, 1, 1)
+                val cut = requireNotNull(binding.currentObservationOwnership())
+                fun admitPacked(timestamp: Long, depthMillimeters: Int, corruptRejectedCount: Boolean = false) {
+                    val lease = requireNotNull(pool.tryAcquire(cut))
+                    try {
+                        repeat(3) { x -> assertTrue(lease.append(x, 0, depthMillimeters, 255)) }
+                        lease.reject(7)
+                        val observation = VisibilityDepthObservation.fromPacked(
+                            ownership = cut,
+                            frame = depth(cut, timestamp).frame,
+                            packedSamples = lease.samples,
+                            sourceRejectedSamples = 7,
+                        )
+                        // Deliberately corrupt metadata agreement after the observation
+                        // constructor's check to exercise the kernel's own validation.
+                        if (corruptRejectedCount) lease.reject()
+                        integration.admitDepth(observation)
+                    } finally {
+                        lease.close()
+                    }
+                }
+                fun assertFiltered(admittedDepths: Long) {
+                    val evidence = integration.depthEvidenceDiagnostics()
+                    assertEquals("refused", evidence["preparationOutcome"])
+                    assertEquals(3, evidence["selectedSamples"])
+                    assertEquals(7, evidence["sourceRejectedSamples"])
+                    assertEquals(7, evidence["leaseRejectedSamples"])
+                    assertEquals(0, evidence["acceptedSamples"])
+                    assertEquals(10, evidence["rejectedSamples"])
+                    assertEquals(0, evidence["rayVisits"])
+                    assertEquals(0, evidence["touchedEvidenceRows"])
+                    assertEquals(0, requireNotNull(integration.depthLookupReceipt()).directLookups)
+                    assertEquals("INVALID_SAMPLE", integration.depthLookupDiagnostics()["evidenceReason"])
+                    assertEquals("depthLookupRefused", integration.integrationReceipt().status)
+                    assertEquals(admittedDepths, integration.snapshot().admittedDepths)
+                    assertEquals(104L, integration.portableOwnerMemoryReceipt().retainedDepthRefusalReceiptBytes)
+                }
+
+                admitPacked(10, 1)
+                assertFiltered(0)
+                admitPacked(11, 1_000)
+                val prepared = integration.depthEvidenceDiagnostics()
+                assertEquals("prepared", prepared["preparationOutcome"])
+                assertEquals(3, prepared["acceptedSamples"])
+                assertEquals(7, prepared["rejectedSamples"])
+                assertEquals(1L, integration.snapshot().admittedDepths)
+                assertEquals("none", integration.depthLookupDiagnostics()["evidenceReason"])
+                assertEquals(0L, integration.portableOwnerMemoryReceipt().retainedDepthRefusalReceiptBytes)
+                admitPacked(12, 1)
+                assertFiltered(1)
+
+                admitPacked(13, 1_000, corruptRejectedCount = true)
+                val mismatch = integration.depthEvidenceDiagnostics()
+                assertEquals("refused", mismatch["preparationOutcome"])
+                assertEquals(3, mismatch["selectedSamples"])
+                assertEquals(7, mismatch["sourceRejectedSamples"])
+                assertEquals(8, mismatch["leaseRejectedSamples"])
+                assertEquals(0, mismatch["acceptedSamples"])
+                assertEquals(0, mismatch["rejectedSamples"])
+                assertEquals(0, mismatch["rayVisits"])
+                assertEquals(0, requireNotNull(integration.depthLookupReceipt()).directLookups)
+                assertEquals("INVALID_SAMPLE", integration.depthLookupDiagnostics()["evidenceReason"])
+                assertEquals(1L, integration.snapshot().admittedDepths)
+
+                if (reset == "replacement") {
+                    val replacement = cut.copy(bindingGeneration = cut.bindingGeneration + 1)
+                    replacementOwnership = replacement
+                    integration.rollover(replacement)
+                } else {
+                    integration.close()
+                }
+                assertEquals(mapOf(
+                    "selectedSamples" to 0,
+                    "sourceRejectedSamples" to 0,
+                    "leaseRejectedSamples" to -1,
+                    "preparationOutcome" to "none",
+                ), integration.depthEvidenceDiagnostics())
+                assertEquals(emptyMap<String, Any>(), integration.depthLookupDiagnostics())
+                assertEquals(0L, integration.portableOwnerMemoryReceipt().retainedDepthRefusalReceiptBytes)
+            } finally {
+                integration.close(); pool.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+            }
         }
     }
 
@@ -1914,14 +2240,7 @@ class VisibilityGridIntegrationTest {
             assertEquals(2, staged.geometryRevision)
             assertEquals(1, staged.lineageRevision)
             assertEquals("DEPTH_BATCH", staged.canonicalOperation)
-            assertEquals(1, renderedCuts.size)
-            val rendererCut = renderedCuts.last()
-            assertEquals(staged.transactionId, rendererCut.transactionId)
-            assertEquals(staged.geometryRevision, rendererCut.geometryRevision)
-            assertEquals(staged.lineageRevision, rendererCut.lineageRevision)
-            assertEquals(cut, rendererCut.ownership)
-            assertEquals(1, rendererCut.upserts.size)
-            assertTrue(rendererCut.removedSurfaceIds.isEmpty())
+            assertEquals(0, renderedCuts.size)
             assertEquals(1L, integration.snapshot().admittedDepths)
             assertEquals(1, depthKernel.resourceReceipt().residentEvidenceRows)
 
@@ -1930,6 +2249,15 @@ class VisibilityGridIntegrationTest {
             exchange(messenger, viewId, stream, 6, 1, 1, 1)
             exchange(messenger, viewId, stream, 7, 2, 2, 1)
             await { integration.integrationReceipt().status == "acknowledged" }
+
+            assertEquals(1, renderedCuts.size)
+            val rendererCut = renderedCuts.last()
+            assertEquals(staged.transactionId, rendererCut.transactionId)
+            assertEquals(staged.geometryRevision, rendererCut.geometryRevision)
+            assertEquals(staged.lineageRevision, rendererCut.lineageRevision)
+            assertEquals(cut, rendererCut.ownership)
+            assertEquals(1, rendererCut.upserts.size)
+            assertTrue(rendererCut.removedSurfaceIds.isEmpty())
 
             val depthRow = renderedCuts.single().upserts.single()
             val voxelMeters = 0.1
@@ -1947,6 +2275,168 @@ class VisibilityGridIntegrationTest {
             assertTrue(refined.removedSurfaceIds.isEmpty())
         } finally {
             integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `blocked depth keeps only latest view and retries after feature acknowledgement`() {
+        val directory = Files.createTempDirectory("canonical-surface-runtime-depth-publication-deferral").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val viewId = 2131
+        val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+        lateinit var depthKernel: DepthEvidenceKernel
+        val renderedCuts = mutableListOf<CommittedGeometryCut>()
+        val integration = VisibilityGridIntegration(
+            binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = resources(directory, coordinator),
+            depthKernelFactory = {
+                DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 1)).also { depthKernel = it }
+            },
+            renderer = object : CommittedRendererProjection {
+                override fun applyGeometry(cut: CommittedGeometryCut): RendererProjectionResult {
+                    renderedCuts += cut
+                    return RendererProjectionResult.Applied(cut.upserts.size)
+                }
+            },
+        )
+        try {
+            val stream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            val cut = requireNotNull(binding.currentObservationOwnership())
+
+            integration.admitFeature(feature(cut, 10))
+            assertEquals("pendingAck", integration.integrationReceipt().status)
+            integration.admitDepth(depth(cut, 11, sampleX = 0))
+            await { integration.depthPublicationDeferralSnapshot().deferred == 1L }
+            integration.admitDepth(depth(cut, 12, sampleX = 1))
+            await { integration.depthPublicationDeferralSnapshot().deferred == 2L }
+
+            val deferred = integration.depthPublicationDeferralSnapshot()
+            assertEquals(2L, deferred.deferred)
+            assertEquals(1L, deferred.replaced)
+            assertEquals(0L, deferred.retried)
+            assertEquals(0L, deferred.fenced)
+            assertEquals(1L, deferred.released)
+            assertTrue(deferred.pendingPayloadBytes > 0L)
+            assertTrue(integration.portableOwnerMemoryReceipt().deferredDepthObservationBytes > 0L)
+            assertEquals(0L, integration.snapshot().admittedDepths)
+
+            exchange(messenger, viewId, stream, 4, 1, 1, 1)
+            exchange(messenger, viewId, stream, 5, 1, 1, 1)
+            exchange(messenger, viewId, stream, 6, 1, 1, 1)
+            exchange(messenger, viewId, stream, 7, 2, 2, 1)
+            await { integration.snapshot().admittedDepths == 1L }
+
+            val retried = integration.depthPublicationDeferralSnapshot()
+            assertEquals(1L, retried.retried)
+            assertEquals(0L, retried.pendingPayloadBytes)
+            assertEquals(0L, integration.portableOwnerMemoryReceipt().deferredDepthObservationBytes)
+            assertEquals(1L, integration.snapshot().admittedDepths)
+            assertEquals(3L, integration.integrationReceipt().transactionId)
+
+            exchange(messenger, viewId, stream, 8, 2, 2, 1)
+            exchange(messenger, viewId, stream, 9, 2, 2, 1)
+            exchange(messenger, viewId, stream, 10, 2, 2, 1)
+            exchange(messenger, viewId, stream, 11, 3, 3, 1)
+            await { integration.integrationReceipt().status == "acknowledged" }
+            assertEquals(2, renderedCuts.size)
+            assertEquals(0, depthKernel.resourceReceipt().preparedEvidenceRows)
+        } finally {
+            integration.close()
+            assertEquals(0L, integration.portableOwnerMemoryReceipt().deferredDepthObservationBytes)
+            binding.dispose(); coordinator.close(); directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `runtime and mapper keep depth payloads bounded while publication is blocked`() {
+        val offerClock = java.util.concurrent.atomic.AtomicLong(1_000L)
+        val directory = Files.createTempDirectory("canonical-surface-runtime-depth-lane-bound").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val viewId = 2132
+        val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+        lateinit var depthKernel: DepthEvidenceKernel
+        val integration = VisibilityGridIntegration(
+            binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = resources(directory, coordinator),
+            depthKernelFactory = {
+                DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 1)).also { depthKernel = it }
+            },
+        )
+        val runtime = AndroidVisibilityGridRuntime(
+            ownership = binding::currentObservationOwnership,
+            mapper = integration,
+            featureIntervalNs = 1L,
+            depthIntervalNs = 1_000_000L,
+            debugDepthOfferNanoTime = offerClock::get,
+            beforeLaneEnqueue = { source ->
+                if (source == VisibilityObservationSource.SYNTHETIC_DEPTH) {
+                    offerClock.addAndGet(1_000_000_000L)
+                }
+            },
+        )
+        try {
+            runtime.configureSyntheticSource(VisibilityDepthCapability.RAW_DEPTH)
+            val stream = start(binding, messenger, viewId)
+            exchange(messenger, viewId, stream, 1, 0, 0, 0)
+            exchange(messenger, viewId, stream, 2, 0, 0, 0)
+            exchange(messenger, viewId, stream, 3, 1, 1, 1)
+            val cut = requireNotNull(binding.currentObservationOwnership())
+
+            assertTrue(runtime.offerFeature(feature(cut, 10)))
+            await(timeoutMillis = 2_000L) { integration.integrationReceipt().status == "pendingAck" }
+            assertTrue(runtime.offerDepth(depth(cut, 11, sampleX = 0)))
+            await(timeoutMillis = 2_000L) { integration.depthPublicationDeferralSnapshot().deferred == 1L }
+            assertTrue(runtime.offerDepth(depth(cut, 12, sampleX = 1)))
+            assertTrue(runtime.offerDepth(depth(cut, 13, sampleX = 2)))
+            runtime.awaitDebugFixtureIdle()
+
+            val depthPayloadBytes = depth(cut, 14).payloadBytes.toLong()
+            val resident = runtime.snapshot()
+            assertTrue(resident.residentPayloadBytes <= depthPayloadBytes * 2L)
+            assertEquals(0L, integration.snapshot().admittedDepths)
+            val deferred = integration.depthPublicationDeferralSnapshot()
+            assertEquals(3L, deferred.deferred)
+            assertEquals(2L, deferred.replaced)
+            assertTrue(deferred.pendingPayloadBytes > 0L)
+            fun offerEntries(): List<Map<*, *>> =
+                ((runtime.snapshotWireMap()["depthOfferTiming"] as Map<*, *>)["entries"] as List<*>)
+                    .map { it as Map<*, *> }
+            assertEquals(listOf("replaced", "replaced", "deferred"), offerEntries().map { it["status"] })
+            assertTrue(offerEntries().all { it["endToEndMicros"] == -1L })
+            // Waiting behind the feature publication must remain in the depth offer clock.
+            offerClock.addAndGet(4_000_000_000L)
+
+            exchange(messenger, viewId, stream, 4, 1, 1, 1)
+            exchange(messenger, viewId, stream, 5, 1, 1, 1)
+            exchange(messenger, viewId, stream, 6, 1, 1, 1)
+            exchange(messenger, viewId, stream, 7, 2, 2, 1)
+            await(timeoutMillis = 2_000L) { integration.snapshot().admittedDepths == 1L }
+            assertEquals(0L, integration.retainedDepthPayloadBytes())
+            val admittedRuntime = runtime.snapshot()
+            assertEquals(1L, admittedRuntime.admittedDepthObservations)
+            assertEquals(0L, admittedRuntime.residentPayloadBytes)
+            assertEquals("publicationPending", offerEntries().last()["status"])
+            assertEquals(-1L, offerEntries().last()["endToEndMicros"])
+
+            exchange(messenger, viewId, stream, 8, 2, 2, 1)
+            exchange(messenger, viewId, stream, 9, 2, 2, 1)
+            exchange(messenger, viewId, stream, 10, 2, 2, 1)
+            exchange(messenger, viewId, stream, 11, 3, 3, 1)
+            await { integration.integrationReceipt().status == "acknowledged" }
+            assertEquals(0, depthKernel.resourceReceipt().preparedEvidenceRows)
+            assertEquals("completed", offerEntries().last()["status"])
+            assertEquals(5_000_000L, offerEntries().last()["endToEndMicros"])
+            assertEquals(3L, offerEntries().last()["targetGeometryRevision"])
+        } finally {
+            runtime.close()
+            integration.close()
+            assertEquals(0L, integration.retainedDepthPayloadBytes())
+            binding.dispose(); coordinator.close(); directory.deleteRecursively()
         }
     }
 
@@ -2009,7 +2499,10 @@ class VisibilityGridIntegrationTest {
 
             integration.admitDepth(depth(cut, 11))
 
+            // The inline executor applies the renderer cut before the queue
+            // callback returns, so the exact ACK is already terminal here.
             assertEquals("acknowledged", integration.integrationReceipt().status)
+            assertFalse(integration.hasPendingPublicationForIngress())
             assertEquals(1, queuedReceipts.size)
             assertEquals(1, projected.size)
             assertEquals(1, queuedCuts.size)
@@ -2067,8 +2560,8 @@ class VisibilityGridIntegrationTest {
             rebuildBegins.clear(); rebuildPages.clear(); rebuildFinishes.clear()
 
             integration.admitDepth(depth(cut, 10))
-            assertEquals("rendererRebuildPending", integration.integrationReceipt().status)
-            assertEquals(1, deltaAttempts.size)
+            assertEquals("pendingAck", integration.integrationReceipt().status)
+            assertEquals(0, deltaAttempts.size)
             assertEquals(1L, integration.snapshot().admittedDepths)
             val appliedDepth = depthKernel.resourceReceipt()
             rebuildBegins.clear(); rebuildPages.clear(); rebuildFinishes.clear()
@@ -2172,11 +2665,20 @@ class VisibilityGridIntegrationTest {
             assertEquals("pendingAck", integration.integrationReceipt().status)
             assertEquals(2, attemptedMutations.size)
             assertTrue(attemptedMutations[0] === attemptedMutations[1])
-            assertEquals(1, renderedCuts.size)
-            assertEquals(2, renderedCuts.single().transactionId)
             assertEquals(1, depthKernel.resourceReceipt().residentEvidenceRows)
             assertEquals(1L, integration.snapshot().admittedDepths)
             assertEquals(null, integration.pendingDepthRetentionReceipt())
+            val begin = exchange(messenger, viewId, stream, 5, 1, 1, 1).first
+            assertEquals(2, begin.messageKind)
+            var sequence = 6L
+            repeat(begin.chunkCount) {
+                assertEquals(3, exchange(messenger, viewId, stream, sequence++, 1, 1, 1).first.messageKind)
+            }
+            assertEquals(4, exchange(messenger, viewId, stream, sequence++, 1, 1, 1).first.messageKind)
+            assertEquals(0, exchange(messenger, viewId, stream, sequence, 2, 2, 1).first.messageKind)
+            await { integration.integrationReceipt().status == "acknowledged" }
+            assertEquals(1, renderedCuts.size)
+            assertEquals(2, renderedCuts.single().transactionId)
         } finally {
             integration.close()
             assertEquals(null, integration.depthLookupReceipt())
@@ -2390,6 +2892,15 @@ class VisibilityGridIntegrationTest {
 
             assertEquals("pendingAck", integration.integrationReceipt().status)
             assertEquals("DEPTH_BATCH", integration.integrationReceipt().canonicalOperation)
+            val begin = exchange(messenger, viewId, stream, 8, 2, 2, 1).first
+            assertEquals(2, begin.messageKind)
+            var sequence = 9L
+            repeat(begin.chunkCount) {
+                assertEquals(3, exchange(messenger, viewId, stream, sequence++, 2, 2, 1).first.messageKind)
+            }
+            assertEquals(4, exchange(messenger, viewId, stream, sequence++, 2, 2, 1).first.messageKind)
+            assertEquals(0, exchange(messenger, viewId, stream, sequence, 3, 3, 2).first.messageKind)
+            await { integration.integrationReceipt().status == "acknowledged" }
             assertEquals(2, renderedCuts.size)
             assertArrayEquals(longArrayOf(SurfaceId(1).value), renderedCuts.last().removedSurfaceIds)
             assertTrue(renderedCuts.last().upserts.isEmpty())
@@ -2452,6 +2963,11 @@ class VisibilityGridIntegrationTest {
 
             integration.admitDepth(depthWithSamples(ownership, 20, samples))
             assertEquals("pendingAck", integration.integrationReceipt().status)
+            exchange(messenger, viewId, stream, 8, 2, 2, 1)
+            exchange(messenger, viewId, stream, 9, 2, 2, 1)
+            exchange(messenger, viewId, stream, 10, 2, 2, 1)
+            exchange(messenger, viewId, stream, 11, 3, 3, 2)
+            await { integration.integrationReceipt().status == "acknowledged" }
             val historical = listOf(0, 1).map { requireNotNull(featureKernel.featureEvidenceAllocationFingerprint(it)) }
             val replacementCorrelations = arrayOfNulls<CanonicalFeatureCorrelation>(2)
             cuts.last().upserts.forEach { row ->
@@ -2465,11 +2981,6 @@ class VisibilityGridIntegrationTest {
                 assertEquals(row.normalConfidence, correlation.normalConfidence)
                 assertEquals(historical[slot], featureKernel.featureEvidenceAllocationFingerprint(slot))
             }
-            exchange(messenger, viewId, stream, 8, 2, 2, 1)
-            exchange(messenger, viewId, stream, 9, 2, 2, 1)
-            exchange(messenger, viewId, stream, 10, 2, 2, 1)
-            exchange(messenger, viewId, stream, 11, 3, 3, 2)
-            await { integration.integrationReceipt().status == "acknowledged" }
             integration.admitFeature(feature(ownership, 30, x = -0.75, z = -0.95))
             assertEquals("nonMaterialRetained", integration.integrationReceipt().status)
             integration.close()
@@ -2538,15 +3049,20 @@ class VisibilityGridIntegrationTest {
                 ownership, 10, depthMillimeters = 10, principalX = 1.6, principalY = 0.0,
             ))
             assertEquals("pendingAck", integration.integrationReceipt().status)
-            assertEquals(listOf(Voxel(-8, 0, -10)), cuts.single().upserts.map { it.voxel })
             exchange(messenger, viewId, stream, 4, 1, 1, 1)
             exchange(messenger, viewId, stream, 5, 1, 1, 1)
             exchange(messenger, viewId, stream, 6, 1, 1, 1)
             exchange(messenger, viewId, stream, 7, 2, 2, 1)
             await { integration.integrationReceipt().status == "acknowledged" }
+            assertEquals(listOf(Voxel(-8, 0, -10)), cuts.single().upserts.map { it.voxel })
 
             integration.admitFeature(mixedDepthOwnedAndNewFeature(ownership, 20))
             assertEquals("pendingAck", integration.integrationReceipt().status)
+            exchange(messenger, viewId, stream, 8, 2, 2, 1)
+            exchange(messenger, viewId, stream, 9, 2, 2, 1)
+            exchange(messenger, viewId, stream, 10, 2, 2, 1)
+            exchange(messenger, viewId, stream, 11, 3, 3, 1)
+            await { integration.integrationReceipt().status == "acknowledged" }
             assertEquals(2, cuts.size)
             assertEquals(listOf(Voxel(7, 0, -10)), cuts.last().upserts.map { it.voxel })
             assertTrue(cuts.last().removedSurfaceIds.isEmpty())
@@ -2556,11 +3072,6 @@ class VisibilityGridIntegrationTest {
             assertEquals(SurfaceId(2), newCorrelation.id)
             assertTrue(depthCorrelation.allocationFingerprint != newCorrelation.allocationFingerprint)
 
-            exchange(messenger, viewId, stream, 8, 2, 2, 1)
-            exchange(messenger, viewId, stream, 9, 2, 2, 1)
-            exchange(messenger, viewId, stream, 10, 2, 2, 1)
-            exchange(messenger, viewId, stream, 11, 3, 3, 1)
-            await { integration.integrationReceipt().status == "acknowledged" }
             integration.admitFeature(mixedDepthOwnedAndNewFeature(ownership, 21))
             assertEquals("nonMaterialRetained", integration.integrationReceipt().status)
         } finally {
@@ -2665,8 +3176,11 @@ class VisibilityGridIntegrationTest {
                 assertEquals(1, kernel.resourceReceipt().surfaceCount)
                 assertEquals(1, kernel.resourceReceipt().associationCount)
                 integration.admitFeature(feature(cut, 11, 0.32))
-                assertEquals("awaitingExactAck", integration.integrationReceipt().status)
-                assertEquals(1, projected.size)
+                // The renderer publication is now held until the exact
+                // structural ACK, even when the queue install itself was
+                // recovered synchronously.
+                assertEquals("publicationRetryPending", integration.integrationReceipt().status)
+                assertTrue(projected.isEmpty())
                 assertEquals(1, kernel.resourceReceipt().surfaceCount)
                 assertEquals(1, kernel.resourceReceipt().associationCount)
 
@@ -2675,6 +3189,7 @@ class VisibilityGridIntegrationTest {
                 exchange(messenger, viewId, stream, 6, 1, 1, 1)
                 exchange(messenger, viewId, stream, 7, 2, 2, 1)
                 await { integration.integrationReceipt().status == "acknowledged" }
+                assertEquals(1, projected.size)
                 integration.admitFeature(feature(cut, 12, 0.32))
                 assertEquals("pendingAck", integration.integrationReceipt().status)
                 assertEquals(2, kernel.resourceReceipt().surfaceCount)
@@ -2720,13 +3235,7 @@ class VisibilityGridIntegrationTest {
             rebuildBegins.clear(); rebuildPages.clear(); rebuildFinishes.clear()
 
             integration.admitFeature(feature(ownership, 10))
-            assertEquals("rendererRebuildPending", integration.integrationReceipt().status)
-            val retained = attempts.single()
-            assertEquals(2, retained.transactionId)
-            assertEquals(1, retained.baseGeometryRevision)
-            assertEquals(2, retained.geometryRevision)
-            assertEquals(1, retained.lineageRevision)
-            assertEquals(1, retained.upserts.size)
+            assertEquals("pendingAck", integration.integrationReceipt().status)
             rebuildBegins.clear(); rebuildPages.clear(); rebuildFinishes.clear()
 
             exchange(messenger, viewId, stream, 4, 1, 1, 1)
@@ -2734,6 +3243,12 @@ class VisibilityGridIntegrationTest {
             exchange(messenger, viewId, stream, 6, 1, 1, 1)
             exchange(messenger, viewId, stream, 7, 2, 2, 1)
             await { integration.integrationReceipt().status == "rendererRebuildPending" }
+            val retained = attempts.single()
+            assertEquals(2, retained.transactionId)
+            assertEquals(1, retained.baseGeometryRevision)
+            assertEquals(2, retained.geometryRevision)
+            assertEquals(1, retained.lineageRevision)
+            assertEquals(1, retained.upserts.size)
 
             integration.admitFeature(feature(ownership, 11, 0.32))
             assertEquals(1, attempts.size)
@@ -2793,15 +3308,17 @@ class VisibilityGridIntegrationTest {
             rebuildCount = 0
 
             integration.admitFeature(feature(ownership, 10))
-            assertEquals("rendererRebuildPending", integration.integrationReceipt().status)
-            assertEquals(1, applyCount)
-            assertEquals(1, sideEffectCount)
+            assertEquals("pendingAck", integration.integrationReceipt().status)
+            assertEquals(0, applyCount)
+            assertEquals(0, sideEffectCount)
 
             exchange(messenger, viewId, stream, 4, 1, 1, 1)
             exchange(messenger, viewId, stream, 5, 1, 1, 1)
             exchange(messenger, viewId, stream, 6, 1, 1, 1)
             exchange(messenger, viewId, stream, 7, 2, 2, 1)
             await { integration.integrationReceipt().status == "rendererRebuildPending" }
+            assertEquals(1, applyCount)
+            assertEquals(1, sideEffectCount)
 
             integration.admitFeature(feature(ownership, 11, 0.32))
             assertEquals("rendererRebuildPending", integration.integrationReceipt().status)
@@ -2858,17 +3375,17 @@ class VisibilityGridIntegrationTest {
             assertEquals(1, later.lineageRevision)
             assertEquals("FEATURE_BATCH", later.canonicalOperation)
             assertEquals(2, later.committed)
-            assertEquals(3, rendered.size)
-            assertEquals(later.geometryRevision, rendered.last().update?.geometryRevision)
-            assertEquals(later.rendererRows, rendered.last().count)
+            assertEquals(2, rendered.size)
+
+            // The pending receipt remains available while the successor cut is
+            // waiting for its exact structural acknowledgement. Capture the
+            // durable canonical identity before that acknowledgement consumes
+            // the activation current below.
             val canonical = requireNotNull(activeResources).readRendererPage(0, 512)
             assertEquals(later.geometryRevision, canonical?.cut?.geometryRevision)
-            assertArrayEquals(
-                canonical?.rows?.map { row ->
-                    packVisibilityGridKey(row.voxel.x, row.voxel.y, row.voxel.z)
-                }?.toLongArray(),
-                rendered.last().keys,
-            )
+            val canonicalKeys = canonical?.rows?.map { row ->
+                packVisibilityGridKey(row.voxel.x, row.voxel.y, row.voxel.z)
+            }?.toLongArray()
             val current = requireNotNull(activeResources.owner().activationState()?.current)
                 as CanonicalActivationCurrent.Receipt
             val currentBytes = ByteArrayOutputStream().use { output ->
@@ -2877,6 +3394,20 @@ class VisibilityGridIntegrationTest {
             assertArrayEquals(
                 current.identity.canonicalHash.toByteArray(),
                 MessageDigest.getInstance("SHA-256").digest(currentBytes),
+            )
+
+            exchange(messenger, 2108, stream, 8, 2, 2, 1)
+            exchange(messenger, 2108, stream, 9, 2, 2, 1)
+            exchange(messenger, 2108, stream, 10, 2, 2, 1)
+            exchange(messenger, 2108, stream, 11, 3, 3, 1)
+            await { integration.integrationReceipt().status == "acknowledged" }
+
+            assertEquals(3, rendered.size)
+            assertEquals(later.geometryRevision, rendered.last().update?.geometryRevision)
+            assertTrue(rendered.last().count > 0)
+            assertArrayEquals(
+                canonicalKeys,
+                rendered.last().keys,
             )
             val chargedPhysicalBytes = chargedPhysical(directory, coordinator)
             assertEquals(
@@ -2982,15 +3513,19 @@ class VisibilityGridIntegrationTest {
             val cut = requireNotNull(binding.currentObservationOwnership())
 
             replacement.admitFeature(feature(cut, 11, 0.32))
-            assertTrue(beginCount >= 2)
-            assertEquals(1, finishCount)
-            assertEquals("awaitingExactAck", replacement.integrationReceipt().status)
+             // Reopen may have a durable unacknowledged current, but the
+             // renderer rebuild remains fenced until its exact structural ACK.
+             assertEquals(1, beginCount)
+             assertEquals(0, finishCount)
+             assertEquals("pendingAck", replacement.integrationReceipt().status)
 
             exchange(messenger, viewId, stream, 4, 1, 1, 1)
             exchange(messenger, viewId, stream, 5, 1, 1, 1)
             exchange(messenger, viewId, stream, 6, 1, 1, 1)
             exchange(messenger, viewId, stream, 7, 2, 2, 1)
             await { replacement.integrationReceipt().status == "acknowledged" }
+             assertTrue(beginCount >= 2)
+             assertEquals(1, finishCount)
 
             replacement.admitFeature(feature(cut, 12, 0.32))
             assertEquals("pendingAck", replacement.integrationReceipt().status)
@@ -3057,7 +3592,7 @@ class VisibilityGridIntegrationTest {
                 assertEquals("rendererRebuildPending", replacement.integrationReceipt().status)
                 assertEquals(0, replacement.integrationReceipt().committed)
                 replacement.portableOwnerMemoryReceipt().let { memory ->
-                    assertEquals(176L, memory.integrationObjectBytes)
+                    assertEquals(364L, memory.integrationObjectBytes)
                     assertEquals(64L, memory.pendingRendererRebuildBytes)
                     assertEquals(
                         listOf(
@@ -3066,6 +3601,8 @@ class VisibilityGridIntegrationTest {
                             memory.retainedDeltaOwnerBytes,
                             memory.pendingRendererRebuildBytes,
                             memory.retainedDepthLookupReceiptBytes,
+                            memory.retainedDepthRefusalReceiptBytes,
+                            memory.deferredDepthObservationBytes,
                             memory.runtimeOwnerBytes,
                             memory.bindingOwnerBytes,
                             memory.coordinatorOwnerBytes,
@@ -3734,8 +4271,10 @@ class VisibilityGridIntegrationTest {
         return bytes.copyOfRange(qualifier.size, bytes.size)
     }
 
-    private fun await(condition: () -> Boolean) {
-        repeat(100) { if (condition()) return else Thread.sleep(5) }
+    private fun await(timeoutMillis: Long = 500L, condition: () -> Boolean) {
+        repeat((timeoutMillis / 5L).coerceAtLeast(1L).toInt()) {
+            if (condition()) return else Thread.sleep(5)
+        }
         assertTrue(condition())
     }
 

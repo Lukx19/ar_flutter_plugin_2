@@ -64,7 +64,8 @@ private class PresentationBacking(
             compareGlyphPriority(second, first)
         }
         repeat(surfaceIdTable.size) { index ->
-            if (styleAt(index).glyph == CoverageRendererGlyph.NONE) return@repeat
+            if (CoverageRendererStyleRowV1.validatedGlyph(styleTable,
+                    index * COVERAGE_RENDERER_STYLE_ROW_BYTES) == CoverageRendererGlyph.NONE) return@repeat
             if (bestGlyphRows.size < CoverageRendererLimits.GLYPH_CAPACITY) {
                 bestGlyphRows.add(index)
             } else if (compareGlyphPriority(index, checkNotNull(bestGlyphRows.peek())) < 0) {
@@ -74,11 +75,12 @@ private class PresentationBacking(
         }
         val retainedGlyphRows = bestGlyphRows.toIntArray().sortedArray()
         repeat(surfaceIdTable.size) { index ->
-            val style = styleAt(index)
-            val retained = style.glyph != CoverageRendererGlyph.NONE &&
+            val glyph = CoverageRendererStyleRowV1.validatedGlyph(styleTable,
+                index * COVERAGE_RENDERER_STYLE_ROW_BYTES)
+            val retained = glyph != CoverageRendererGlyph.NONE &&
                 retainedGlyphRows.binarySearch(index) >= 0
-            if (style.glyph != CoverageRendererGlyph.NONE && !retained) {
-                style.copy(
+            if (glyph != CoverageRendererGlyph.NONE && !retained) {
+                styleAt(index).copy(
                     glyph = CoverageRendererGlyph.NONE,
                     directionBin = COVERAGE_RENDERER_NO_DIRECTION,
                 ).encode()
@@ -132,10 +134,7 @@ private class PresentationBacking(
         }
         val pageStyles = styleRowsCopyRange(startSlot, page.count, palette)
         val pageColors = IntArray(page.count) { index ->
-            CoverageRendererStyleRowV1.decode(
-                pageStyles,
-                index * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-            ).packedColor()
+            CoverageRendererStyleRowV1.validatedPackedColor(pageStyles, index * COVERAGE_RENDERER_STYLE_ROW_BYTES)
         }
         block(
             page.copy(

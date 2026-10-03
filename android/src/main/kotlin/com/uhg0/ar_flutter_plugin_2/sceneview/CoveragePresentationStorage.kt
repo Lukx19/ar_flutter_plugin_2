@@ -65,6 +65,51 @@ internal class CoveragePresentationStorage(
         styleRowsPresent = withStyleRows
     }
 
+    /** Sorts the identity/destination pairs in place without boxing or copies. */
+    fun sortIdentityTable(count: Int) {
+        require(count in 0..capacity)
+        var start = count / 2 - 1
+        while (start >= 0) {
+            siftIdentityDown(start, count)
+            start--
+        }
+        var end = count - 1
+        while (end > 0) {
+            swapIdentityEntries(0, end)
+            siftIdentityDown(0, end)
+            end--
+        }
+    }
+
+    private fun siftIdentityDown(start: Int, size: Int) {
+        var root = start
+        while (true) {
+            val left = root * 2 + 1
+            if (left >= size) return
+            val right = left + 1
+            val child = if (
+                right < size &&
+                    sortedSurfaceIds[right] > sortedSurfaceIds[left]
+            ) {
+                right
+            } else {
+                left
+            }
+            if (sortedSurfaceIds[root] >= sortedSurfaceIds[child]) return
+            swapIdentityEntries(root, child)
+            root = child
+        }
+    }
+
+    private fun swapIdentityEntries(first: Int, second: Int) {
+        val surfaceId = sortedSurfaceIds[first]
+        sortedSurfaceIds[first] = sortedSurfaceIds[second]
+        sortedSurfaceIds[second] = surfaceId
+        val destination = sortedDestinations[first]
+        sortedDestinations[first] = sortedDestinations[second]
+        sortedDestinations[second] = destination
+    }
+
     fun ensureSourceCapacity(sourceCapacity: Int) {
         if (sourceSlotToDestination.size >= sourceCapacity) return
         val previousSourceCapacity = sourceSlotToDestination.size

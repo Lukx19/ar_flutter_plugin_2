@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/services.dart';
@@ -50,10 +49,20 @@ final class ARVisibilitySurfaceStream {
     final previous = _tail;
     final turn = Completer<void>();
     _tail = turn.future;
+    Future<Uint8List>? invocation;
     try {
       await previous;
       _ensureOpen();
       final operation = _exchangeNow(attempt.requestBytes);
+      invocation = operation;
+      // A timeout fences this binding immediately, but the accepted native
+      // invocation still owns the immutable request until its callback drains.
+      unawaited(
+        operation.then<void>(
+          (_) => _completeTurn(turn),
+          onError: (Object _, StackTrace __) => _completeTurn(turn),
+        ),
+      );
       final response =
           timeout == null ? await operation : await operation.timeout(timeout);
       return response;
@@ -61,7 +70,9 @@ final class ARVisibilitySurfaceStream {
       _abandoned = true;
       throw const ARVisibilitySurfaceStreamUnknownOutcome();
     } finally {
-      turn.complete();
+      if (invocation == null) {
+        _completeTurn(turn);
+      }
     }
   }
 
@@ -76,11 +87,19 @@ final class ARVisibilitySurfaceStream {
   Future<void> dispose() async {
     _closed = true;
     _abandoned = true;
-    // Marking the binding abandoned fences queued calls. The tail completes
-    // after the accepted invocation has replied, or immediately after its
-    // timeout made the outcome unknown, so teardown cannot start parallel
-    // same-binding work and remains bounded after abandonment.
-    await _tail;
+    // Marking the binding abandoned fences queued calls immediately. The tail
+    // remains pending until an accepted invocation actually drains, preserving
+    // the request bytes and making callback ownership observable to a teardown
+    // coordinator without making dispose wait forever on a broken channel.
+  }
+
+  /// Completes after the last accepted channel invocation has drained.
+  Future<void> get callbacksDrained => _tail;
+
+  void _completeTurn(Completer<void> turn) {
+    if (!turn.isCompleted) {
+      turn.complete();
+    }
   }
 
   void _ensureOpen() {

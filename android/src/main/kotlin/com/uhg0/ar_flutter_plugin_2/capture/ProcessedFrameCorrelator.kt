@@ -10,6 +10,7 @@ internal class ProcessedFrameCorrelator<Frame>(
     private val clockMs: () -> Long = { System.currentTimeMillis() },
     private val timeoutMs: Long = 1_000L,
     private val maxPendingEntries: Int = 8,
+    private val onFrameDiscarded: (Frame) -> Unit = {},
 ) {
     private data class TimedFrame<Frame>(val frame: Frame, val receivedAtMs: Long)
     private data class TimedResult(
@@ -24,8 +25,9 @@ internal class ProcessedFrameCorrelator<Frame>(
     fun onFrame(timestampNs: Long, frame: Frame): CorrelatedProcessedFrame<Frame>? {
         cleanupExpired()
         results.remove(timestampNs)?.let { return CorrelatedProcessedFrame(frame, it.result) }
+        frames.remove(timestampNs)?.let { onFrameDiscarded(it.frame) }
         frames[timestampNs] = TimedFrame(frame, clockMs())
-        trim(frames)
+        trimFrames()
         return null
     }
 
@@ -36,12 +38,13 @@ internal class ProcessedFrameCorrelator<Frame>(
             return CorrelatedProcessedFrame(it.frame, result)
         }
         results[result.sensorTimestampNs] = TimedResult(result, clockMs())
-        trim(results)
+        trimResults()
         return null
     }
 
     @Synchronized
     fun clear() {
+        frames.values.forEach { onFrameDiscarded(it.frame) }
         frames.clear()
         results.clear()
     }
@@ -51,11 +54,27 @@ internal class ProcessedFrameCorrelator<Frame>(
 
     private fun cleanupExpired() {
         val now = clockMs()
-        frames.entries.removeIf { now - it.value.receivedAtMs > timeoutMs }
+        val frameIterator = frames.entries.iterator()
+        while (frameIterator.hasNext()) {
+            val entry = frameIterator.next()
+            if (now - entry.value.receivedAtMs > timeoutMs) {
+                frameIterator.remove()
+                onFrameDiscarded(entry.value.frame)
+            }
+        }
         results.entries.removeIf { now - it.value.receivedAtMs > timeoutMs }
     }
 
-    private fun <K, V> trim(map: LinkedHashMap<K, V>) {
-        while (map.size > maxPendingEntries) map.remove(map.entries.first().key)
+    private fun trimFrames() {
+        while (frames.size > maxPendingEntries) {
+            val key = frames.entries.first().key
+            frames.remove(key)?.let { onFrameDiscarded(it.frame) }
+        }
+    }
+
+    private fun trimResults() {
+        while (results.size > maxPendingEntries) {
+            results.remove(results.entries.first().key)
+        }
     }
 }

@@ -210,6 +210,44 @@ class RendererStyleCommandV1Test {
         assertTrue(staging.canAccept(pages.first(), committedStyleRevision = 0L))
     }
 
+    @Test
+    fun `completed cut owns rows across input mutation failed staging and retry`() {
+        val staging = RendererStyleCommandStagingV1(ByteArray(16) { 7 }, maximumRows = 2)
+        val pages = twoPageCutPages()
+        staging.accept(pages.first())
+        val first = (staging.accept(pages.last()) as RendererStyleCommandStagingV1.Result.Complete).cut
+        val expectedIds = first.surfaceIds.copyOf()
+        val expectedStyles = first.styleRows.copyOf()
+
+        pages.forEach { page ->
+            page.surfaceIds.fill(99L)
+            page.styleRows.fill(99.toByte())
+        }
+        val next = first.copy(
+            styleRevision = first.styleRevision + 1L,
+            surfaceIds = longArrayOf(30L, 40L),
+            styleRows = ByteArray(32) { (it + 32).toByte() },
+        )
+        val nextBytes = RendererStyleCommandV1.encodePages(
+            next,
+            maxPageBytes = RendererStyleCommandV1.HEADER_BYTES + RendererStyleCommandV1.RECORD_BYTES,
+        )
+        val corrupted = nextBytes.map(RendererStyleCommandV1::decode)
+        staging.accept(corrupted.first())
+        corrupted.last().styleRows[0] = 0
+        assertThrows(IllegalArgumentException::class.java) { staging.accept(corrupted.last()) }
+        assertEquals(0, staging.stagedCutCount())
+
+        val retry = nextBytes.map(RendererStyleCommandV1::decode)
+        staging.accept(retry.first())
+        val second = (staging.accept(retry.last()) as RendererStyleCommandStagingV1.Result.Complete).cut
+        assertArrayEquals(next.surfaceIds, second.surfaceIds)
+        assertArrayEquals(next.styleRows, second.styleRows)
+        assertArrayEquals(expectedIds, first.surfaceIds)
+        assertArrayEquals(expectedStyles, first.styleRows)
+        assertEquals(0, staging.stagedCutCount())
+    }
+
     private fun twoPageCutPages(): List<RendererStyleCommandV1.Page> {
         val cut = RendererStyleCutPayloadV1(
             captureGroupId = ByteArray(16) { (it + 1).toByte() },

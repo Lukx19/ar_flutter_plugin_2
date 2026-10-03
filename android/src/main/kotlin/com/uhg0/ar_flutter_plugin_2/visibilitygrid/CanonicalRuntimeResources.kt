@@ -30,6 +30,10 @@ internal class CanonicalRuntimeResources private constructor(
     private var closed = false
     private var session: SessionCanonicalMemoryState? = null
     private var spatial: LiveSurfaceSpatialCache? = null
+    /** Serial bounded lookup cache; its epoch is fenced for every borrowed cut. */
+    private val boundedSurfaceCache = CanonicalBoundedSurfaceCache()
+    /** Fences kernel fingerprint resolvers when the authenticated cut is replaced. */
+    private var fingerprintGeneration = 0L
 
     fun openInitial(baseline: committedEmptyBaseline): SurfaceOwnershipOpenResult {
         checkOpen()
@@ -41,7 +45,9 @@ internal class CanonicalRuntimeResources private constructor(
             val state = SessionCanonicalMemoryState(group, seeded, directory.absoluteFile.toPath().normalize().toString())
             val opened = SurfaceOwnership.session(group, directory, seeded, state)
             session = state
+            fingerprintGeneration = Math.addExact(fingerprintGeneration, 1L)
             spatial = LiveSurfaceSpatialCache(configuration.surfaceCapacity, configuration.voxelMicrometers)
+            spatial?.certifyCurrent(state.cut.geometryRevision, state.cut.lineageRevision)
             owner = (opened as SurfaceOwnershipOpenResult.Opened).ownership
             return opened
         }
@@ -99,6 +105,48 @@ internal class CanonicalRuntimeResources private constructor(
 
     fun owner(): SurfaceOwnership = requireNotNull(owner) { "canonical surface runtime authority is unavailable" }
 
+    /**
+     * Binds the feature kernel to this resource owner without retaining a
+     * CurrentLease. The resolver checks the current cut and resource generation
+     * on every read, so a closed or replaced authority cannot satisfy a stale
+     * feature provenance request.
+     */
+    internal fun bindFeatureFingerprintResolver(kernel: FeatureFusionKernel): Boolean {
+        val qualifier = synchronized(this) {
+            if (closed) return false
+            val activeCut = session?.cut ?: current?.completeView?.cut ?: return false
+            Pair(activeCut, fingerprintGeneration)
+        }
+        val cut = qualifier.first
+        val generation = qualifier.second
+        val resolver = FeatureFusionKernel.CanonicalFingerprintResolver { sourceId,
+            expectedGeometryRevision, expectedLineageRevision, expectedGeneration ->
+            synchronized(this) {
+                val activeCut = session?.cut ?: current?.completeView?.cut
+                if (closed || expectedGeneration != fingerprintGeneration || activeCut == null ||
+                    activeCut.geometryRevision != expectedGeometryRevision ||
+                    activeCut.lineageRevision != expectedLineageRevision ||
+                    activeCut.geometryRevision != cut.geometryRevision ||
+                    activeCut.lineageRevision != cut.lineageRevision ||
+                    sourceId !in 1L..FeatureFusionKernel.UINT32_MASK
+                ) null else {
+                    val read = session?.readSourceById(SurfaceId(sourceId))
+                        ?: current?.completeView?.readSourceById(SurfaceId(sourceId))
+                    (read as? CanonicalPageRead.Complete)?.value?.allocationFingerprint
+                }
+            }
+        }
+        // Do not acquire the kernel lock while holding the authority lock:
+        // preflight may resolve provenance in the opposite direction.
+        kernel.bindCanonicalFingerprintResolver(
+            resolver,
+            cut.geometryRevision,
+            cut.lineageRevision,
+            generation,
+        )
+        return true
+    }
+
     private fun isDurablyCurrent(lease: CurrentLease): Boolean {
         val held = owner?.activationState() ?: return false
         if (!lease.isCurrent(held.cut)) return false
@@ -149,7 +197,10 @@ internal class CanonicalRuntimeResources private constructor(
             )
             val cache = spatial
             val view = if (cache == null) state else SpatialCanonicalLookupView(state, cache)
-            val bounded = BoundedCanonicalCurrentView(view, request, configuration.voxelMicrometers)
+            val bounded = BoundedCanonicalCurrentView(
+                view, request, configuration.voxelMicrometers,
+                surfaceCache = boundedSurfaceCache,
+            )
             return bounded.result(block(bounded))
         }
         return withAuthenticatedCompleteCurrent(
@@ -165,6 +216,7 @@ internal class CanonicalRuntimeResources private constructor(
             val bounded = BoundedCanonicalCurrentView(
                 routed, request, configuration.voxelMicrometers,
                 reuseAuthenticatedSurfaceReads = true,
+                surfaceCache = boundedSurfaceCache,
             )
             bounded.result(block(bounded))
         }
@@ -290,8 +342,12 @@ internal class CanonicalRuntimeResources private constructor(
         session?.let {
             val result = owner().commitAdjacentCanonicalMutation(plan, faults)
             if (result is CanonicalAdjacentCommitResult.Committed) {
+                fingerprintGeneration = Math.addExact(fingerprintGeneration, 1L)
+                spatial?.invalidateCertificate()
                 plan.visitRemovedSurfaceIds { id -> spatial?.remove(id); true }
                 plan.visitDirtyRows { row -> spatial?.upsert(row.id, row.voxel); true }
+                // Both visitors always continue; an exception leaves the certificate invalid.
+                spatial?.certifyCurrent(it.cut.geometryRevision, it.cut.lineageRevision)
             }
             return result
         }
@@ -316,6 +372,7 @@ internal class CanonicalRuntimeResources private constructor(
             lease.commit = successor
             lease.completeView = successor.view
             lease.scalarView = scalar
+            fingerprintGeneration = Math.addExact(fingerprintGeneration, 1L)
         }
         return result
     }
@@ -335,14 +392,37 @@ internal class CanonicalRuntimeResources private constructor(
     @Synchronized internal fun currentRowFoldScratchBytes(): Long? =
         if (session != null) 0L else current?.let { CurrentRowFoldScratch.memoryBytes() }
 
+    /** Reports retained serial preparation capacity without exposing mutable workspace storage. */
+    @Synchronized internal fun preparationWorkspaceReceipt(): CanonicalPreparationWorkspaceReceipt? =
+        listOfNotNull(session?.preparationWorkspaceReceipt(), owner?.preparationWorkspaceReceipt())
+            .takeIf { it.isNotEmpty() }
+            ?.let { receipts ->
+                CanonicalPreparationWorkspaceReceipt(
+                    receipts.fold(0L) { total, receipt -> Math.addExact(total, receipt.growthEvents) },
+                    receipts.fold(0L) { total, receipt -> Math.addExact(total, receipt.ownedCapacityBytes) },
+                )
+            }
+
     private fun sessionMemoryReceipt(state: SessionCanonicalMemoryState): CompactRetainedMemoryReceipt =
         state.retainedMemoryReceipt().let { it.copy(cacheMetadataBytes = it.cacheMetadataBytes + (spatial?.retainedPrimitiveBytes ?: 0)) }
 
     /** Frustum refresh is worker-only and reuses one spatial candidate buffer. */
     @Synchronized internal fun updateSpatialWindow(batch: DepthEvidenceBatch): Boolean {
+        return updateSpatialWindow(batch.groupFromCameraGl, batch.intrinsics)
+    }
+
+    /** Packed depth admission updates the same frustum window without a list batch. */
+    @Synchronized internal fun updateSpatialWindow(metadata: DepthEvidenceMetadataView): Boolean {
+        return updateSpatialWindow(metadata.groupFromCameraGl, metadata.intrinsics)
+    }
+
+    private fun updateSpatialWindow(
+        groupFromCameraGl: List<Double>,
+        intrinsics: VisibilityCameraIntrinsics,
+    ): Boolean {
         checkOpen()
         val cache = spatial ?: return true
-        if (!cache.updateWindow(batch.groupFromCameraGl, batch.intrinsics, 8_000.0)) return false
+        if (!cache.updateWindow(groupFromCameraGl, intrinsics, 8_000.0)) return false
         // Dirty rows have already been written to packed session authority at
         // commit. Movement can release their cold working-set markers without
         // another geometry copy, file write, or loss of canonical history.
@@ -358,7 +438,13 @@ internal class CanonicalRuntimeResources private constructor(
             16L + 16L + // coordinator budget adapter + surface group
             2L * 32L + // normalized directory File owners
             group.value.encodeToByteArray().size +
-            directory.path.encodeToByteArray().size + groupDirectory.path.encodeToByteArray().size
+            directory.path.encodeToByteArray().size + groupDirectory.path.encodeToByteArray().size +
+            // The serial preparation workspace is retained by the owner until
+            // close and must participate in the native aggregate ledger once.
+            // Session staging storage is already part of its packed current
+            // receipt; only the owner-issued preparation lane belongs here.
+            (owner?.preparationWorkspaceReceipt()?.ownedCapacityBytes ?: 0L) +
+            boundedSurfaceCache.retainedBytes()
 
     internal fun portableCoordinatorOwnerBytes(): Long =
         56L + 48L + 32L + 32L + // coordinator, descriptor filesystem, safe filesystem, policy
@@ -368,6 +454,7 @@ internal class CanonicalRuntimeResources private constructor(
     private fun warmCurrent(): Boolean {
         check(current == null)
         current = materializeCurrent()
+        if (current != null) fingerprintGeneration = Math.addExact(fingerprintGeneration, 1L)
         current?.let {
             val authenticatedCurrentBytes = when (val state = owner?.activationState()?.currentState) {
                 is CanonicalCurrentState.Unacknowledged -> state.identity.canonicalLength
@@ -480,7 +567,11 @@ internal class CanonicalRuntimeResources private constructor(
         identity?.let { PreparedIntentCurrentReceipt(it.canonicalLength, it.canonicalHash) }
     }
 
-    private fun invalidateCurrent() { current?.close(); current = null }
+    private fun invalidateCurrent() {
+        if (current != null) fingerprintGeneration = Math.addExact(fingerprintGeneration, 1L)
+        current?.close()
+        current = null
+    }
 
     /** One bounded renderer page from the active v6 root for restart rebuild. */
     fun readRendererPage(cursor: Long, limit: Int = 512): CanonicalRendererPage? {
@@ -578,6 +669,7 @@ internal class CanonicalRuntimeResources private constructor(
     override fun close() {
         if (closed) return
         closed = true
+        if (session != null) fingerprintGeneration = Math.addExact(fingerprintGeneration, 1L)
         try { owner?.close() } finally { invalidateCurrent() }
         owner = null
         session = null
@@ -1236,6 +1328,42 @@ private class RoutedCanonicalDepthView(
         maximumBytesRead: Long,
     ): CanonicalBoundedReadResult<CompactSurface?> =
         routes.resolveSurface(voxel, base, commit, maximumPageReads, maximumBytesRead)
+
+    /**
+     * Keep the scalar depth workspace on the same authenticated route as the
+     * object lookup.  Interface delegation would otherwise invoke the default
+     * scalar adapter on [delegate], which walks the complete COW overlay and
+     * can reread the same historical index and row pages for every endpoint.
+     */
+    override fun findByVoxelBoundedInto(
+        x: Int,
+        y: Int,
+        z: Int,
+        maximumPageReads: Long,
+        maximumBytesRead: Long,
+        scratch: CanonicalSurfaceScratch,
+    ): CanonicalBoundedReadResult<Boolean> {
+        return when (val result = routes.resolveSurface(
+            Voxel(x, y, z), base, commit, maximumPageReads, maximumBytesRead,
+        )) {
+            is CanonicalBoundedReadResult.Complete -> {
+                val row = result.value
+                if (row == null) {
+                    scratch.clear()
+                } else {
+                    scratch.setAddressed(
+                        row.id.value,
+                        x, y, z,
+                        row.voxel.x, row.voxel.y, row.voxel.z,
+                        row.packedNormal, row.normalConfidence, 0,
+                    )
+                }
+                CanonicalBoundedReadResult.Complete(row != null, result.work)
+            }
+            is CanonicalBoundedReadResult.Refused ->
+                CanonicalBoundedReadResult.Refused(result.reason, result.work)
+        }
+    }
 }
 
 private class RoutedFeaturePlanningView(

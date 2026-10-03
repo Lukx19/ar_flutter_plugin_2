@@ -4,12 +4,25 @@ import kotlin.math.floor
 
 /** The single checked, deterministic 3-D supercover traversal authority. */
 internal object DepthRaySupercover {
+    const val EMPTY_BLOCK_VOXELS = 4
     fun visit(
         camera: DepthPointMm,
         endpoint: DepthPointMm,
         voxelSizeMicrometres: Int,
         maximumVisits: Int,
         visitor: (Voxel) -> Boolean,
+    ): DepthRayVisitResult = visitCoordinates(
+        camera, endpoint, voxelSizeMicrometres, maximumVisits,
+    ) { x, y, z -> visitor(Voxel(x, y, z)) }
+
+    /** Scalar traversal used by the fusion workspace; it creates no cell objects. */
+    internal fun visitCoordinates(
+        camera: DepthPointMm,
+        endpoint: DepthPointMm,
+        voxelSizeMicrometres: Int,
+        maximumVisits: Int,
+        emptyBlock: ((Int, Int, Int, Int) -> Boolean)? = null,
+        visitor: (Int, Int, Int) -> Boolean,
     ): DepthRayVisitResult {
         if (maximumVisits !in 0..65_536 || voxelSizeMicrometres <= 0 ||
             !camera.isFinite() || !endpoint.isFinite()
@@ -55,22 +68,87 @@ internal object DepthRaySupercover {
             (boundary - camera.z) / deltaZ
         }
         var visited = 0
-        fun emit(voxel: Voxel): Int {
-            if (visited >= maximumVisits) return CAPACITY_STOP
+        var emptyBlocks = 0
+        var skippedBlock = false
+        var skippedMinX = 0
+        var skippedMinY = 0
+        var skippedMinZ = 0
+        var skippedSize = 0
+        var checkedBlockX = Int.MIN_VALUE
+        var checkedBlockY = Int.MIN_VALUE
+        var checkedBlockZ = Int.MIN_VALUE
+        var checkedSize = 0
+        var checkedEmpty = false
+        fun result(truncated: Boolean = false, arithmeticOverflow: Boolean = false) =
+            DepthRayVisitResult(visited, truncated, arithmeticOverflow, emptyBlocks)
+        fun checkBlock(x: Int, y: Int, z: Int): Int {
+            if (emptyBlock == null) return CONTINUE
+            if (checkedSize > 0 && x in checkedBlockX until checkedBlockX + checkedSize &&
+                y in checkedBlockY until checkedBlockY + checkedSize &&
+                z in checkedBlockZ until checkedBlockZ + checkedSize
+            ) return CONTINUE
+            var size = EMPTY_BLOCK_VOXELS
+            while (true) {
+                val bx = Math.floorDiv(x, size)
+                val by = Math.floorDiv(y, size)
+                val bz = Math.floorDiv(z, size)
+                val empty = emptyBlock(bx, by, bz, size)
+                if (empty || size == 1) {
+                    checkedBlockX = bx * size; checkedBlockY = by * size; checkedBlockZ = bz * size
+                    checkedSize = size
+                    checkedEmpty = empty
+                    if (empty) {
+                        if (visited + emptyBlocks >= maximumVisits) return CAPACITY_STOP
+                        emptyBlocks++
+                    }
+                    return CONTINUE
+                }
+                size = size shr 1
+            }
+        }
+        fun emit(x: Int, y: Int, z: Int): Int {
+            if (skippedBlock && x in skippedMinX until skippedMinX + skippedSize &&
+                y in skippedMinY until skippedMinY + skippedSize &&
+                z in skippedMinZ until skippedMinZ + skippedSize
+            ) return CONTINUE
+            if (checkBlock(x, y, z) == CAPACITY_STOP) return CAPACITY_STOP
+            if (emptyBlock != null && checkedEmpty) return CONTINUE
+            if (visited + emptyBlocks >= maximumVisits) return CAPACITY_STOP
             visited = Math.addExact(visited, 1)
-            return if (visitor(voxel)) CONTINUE else VISITOR_STOP
+            return if (visitor(x, y, z)) CONTINUE else VISITOR_STOP
         }
         try {
-            when (emit(start)) {
-                CAPACITY_STOP -> return DepthRayVisitResult(visited, truncated = true)
-                VISITOR_STOP -> return DepthRayVisitResult(visited)
+            when (emit(start.x, start.y, start.z)) {
+                CAPACITY_STOP -> return result(truncated = true)
+                VISITOR_STOP -> return result()
             }
             while (currentX != targetX || currentY != targetY || currentZ != targetZ) {
+                if (emptyBlock != null) {
+                    if (checkBlock(currentX, currentY, currentZ) == CAPACITY_STOP) return result(truncated = true)
+                    if (checkedEmpty) {
+                        skippedBlock = true
+                        skippedMinX = checkedBlockX
+                        skippedMinY = checkedBlockY
+                        skippedMinZ = checkedBlockZ
+                        skippedSize = checkedSize
+                        val exit = minOf(
+                            blockExit(currentX, targetX, stepX, tMaxX, tDeltaX, skippedMinX, skippedSize),
+                            blockExit(currentY, targetY, stepY, tMaxY, tDeltaY, skippedMinY, skippedSize),
+                            blockExit(currentZ, targetZ, stepZ, tMaxZ, tDeltaZ, skippedMinZ, skippedSize),
+                        )
+                        // Repeat each axis's original additions, rather than multiplying
+                        // tDelta: exact floating-point ties and boundary subset order survive.
+                        while (currentX != targetX && tMaxX < exit) { currentX += stepX; tMaxX += tDeltaX }
+                        while (currentY != targetY && tMaxY < exit) { currentY += stepY; tMaxY += tDeltaY }
+                        while (currentZ != targetZ && tMaxZ < exit) { currentZ += stepZ; tMaxZ += tDeltaZ }
+                        if (currentX == targetX && currentY == targetY && currentZ == targetZ) break
+                    }
+                }
                 var crossing = Double.POSITIVE_INFINITY
                 if (currentX != targetX && tMaxX < crossing) crossing = tMaxX
                 if (currentY != targetY && tMaxY < crossing) crossing = tMaxY
                 if (currentZ != targetZ && tMaxZ < crossing) crossing = tMaxZ
-                if (!crossing.isFinite()) return DepthRayVisitResult(visited, arithmeticOverflow = true)
+                if (!crossing.isFinite()) return result(arithmeticOverflow = true)
                 var tiedMask = 0
                 if (currentX != targetX && tMaxX == crossing) tiedMask = tiedMask or 1
                 if (currentY != targetY && tMaxY == crossing) tiedMask = tiedMask or 2
@@ -80,13 +158,12 @@ internal object DepthRaySupercover {
                     val nextX = if (subset and 1 != 0) Math.addExact(currentX, stepX) else currentX
                     val nextY = if (subset and 2 != 0) Math.addExact(currentY, stepY) else currentY
                     val nextZ = if (subset and 4 != 0) Math.addExact(currentZ, stepZ) else currentZ
-                    val voxel = Voxel(nextX, nextY, nextZ)
-                    if (!DepthVoxelAddressing.contains(voxel)) {
-                        return DepthRayVisitResult(visited, arithmeticOverflow = true)
+                    if (!DepthVoxelAddressing.contains(nextX, nextY, nextZ)) {
+                        return result(arithmeticOverflow = true)
                     }
-                    when (emit(voxel)) {
-                        CAPACITY_STOP -> return DepthRayVisitResult(visited, truncated = true)
-                        VISITOR_STOP -> return DepthRayVisitResult(visited)
+                    when (emit(nextX, nextY, nextZ)) {
+                        CAPACITY_STOP -> return result(truncated = true)
+                        VISITOR_STOP -> return result()
                     }
                 }
                 if (tiedMask and 1 != 0) {
@@ -103,9 +180,21 @@ internal object DepthRaySupercover {
                 }
             }
         } catch (_: ArithmeticException) {
-            return DepthRayVisitResult(visited, arithmeticOverflow = true)
+            return result(arithmeticOverflow = true)
         }
-        return DepthRayVisitResult(visited)
+        return result()
+    }
+
+    private fun blockExit(current: Int, target: Int, step: Int, first: Double, delta: Double, minimum: Int, size: Int): Double {
+        var coordinate = current
+        var crossing = first
+        while (coordinate != target) {
+            val next = coordinate + step
+            if (next < minimum || next >= minimum + size) return crossing
+            coordinate = next
+            crossing += delta
+        }
+        return Double.POSITIVE_INFINITY
     }
 
     private const val CONTINUE = 0
@@ -131,9 +220,12 @@ internal object DepthVoxelAddressing {
     }
 
     fun contains(voxel: Voxel): Boolean =
-        voxel.x in VOXEL_COORDINATE_MIN..VOXEL_COORDINATE_MAX &&
-            voxel.y in VOXEL_COORDINATE_MIN..VOXEL_COORDINATE_MAX &&
-            voxel.z in VOXEL_COORDINATE_MIN..VOXEL_COORDINATE_MAX
+        contains(voxel.x, voxel.y, voxel.z)
+
+    fun contains(x: Int, y: Int, z: Int): Boolean =
+        x in VOXEL_COORDINATE_MIN..VOXEL_COORDINATE_MAX &&
+            y in VOXEL_COORDINATE_MIN..VOXEL_COORDINATE_MAX &&
+            z in VOXEL_COORDINATE_MIN..VOXEL_COORDINATE_MAX
 }
 
 /** Compatibility adapter for callers of the bounded canonical-view traversal seam. */
@@ -148,6 +240,12 @@ internal class CanonicalSurfaceRayViewAdapter(
 
     override fun findSurfaceAt(voxel: Voxel): AddressedCanonicalSurface? = delegate.findSurfaceAt(voxel)
 
+    override fun findSurfaceAtInto(x: Int, y: Int, z: Int, scratch: CanonicalSurfaceScratch): Boolean =
+        delegate.findSurfaceAtInto(x, y, z, scratch)
+
+    override fun findSurfaceByIdInto(id: Long, scratch: CanonicalSurfaceScratch): Boolean =
+        delegate.findSurfaceByIdInto(id, scratch)
+
     override fun visitRayCells(
         startGroupMm: DepthPointMm,
         endpointGroupMm: DepthPointMm,
@@ -161,5 +259,18 @@ internal class CanonicalSurfaceRayViewAdapter(
             "canonical lookup returned a different addressed voxel"
         }
         visitor(voxel, addressed?.surface)
+    }
+
+    override fun visitRayCellsInto(
+        startGroupMm: DepthPointMm,
+        endpointGroupMm: DepthPointMm,
+        maximumVisits: Int,
+        scratch: CanonicalSurfaceScratch,
+        visitor: (Int, Int, Int, CanonicalSurfaceScratch) -> Boolean,
+    ): DepthRayVisitResult = DepthRaySupercover.visitCoordinates(
+        startGroupMm, endpointGroupMm, groupFrame.voxelSizeMicrometres, maximumVisits,
+    ) { x, y, z ->
+        if (!delegate.findSurfaceAtInto(x, y, z, scratch)) scratch.clear()
+        visitor(x, y, z, scratch)
     }
 }

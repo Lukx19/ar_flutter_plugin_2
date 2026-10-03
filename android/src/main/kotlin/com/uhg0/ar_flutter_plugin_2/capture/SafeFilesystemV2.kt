@@ -11,7 +11,6 @@ import java.nio.file.LinkOption
 import java.nio.file.OpenOption
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
-import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicBoolean
 
 enum class DurableStoreFaultPointV2 {
@@ -275,6 +274,9 @@ class SafeFilesystemV2(
     private val rootPath = root.absoluteFile.toPath().normalize()
     private val closed = AtomicBoolean(false)
     private val backend = backend.bind(rootPath.toFile())
+    // One synchronized workspace serves metadata reads, component copies, and
+    // digest checks on this root; callers retain only independent result bytes.
+    private val copyWorkspace = CaptureCopyWorkspace()
 
     fun child(vararg names: String): File {
         names.forEach(::validateSegment)
@@ -289,10 +291,14 @@ class SafeFilesystemV2(
     fun allocatedTreeBytes(directory: File): Long =
         walk(directory).fold(0L) { total, file -> Math.addExact(total, allocatedLength(file)) }
     fun readBytes(file: File): ByteArray {
-        val output = ByteArrayOutputStream(); backend.openRead(relative(file)).use { descriptor ->
-            val buffer = ByteArray(64 * 1024)
-            while (true) { val read = descriptor.read(buffer, 0, buffer.size); if (read < 0) break; if (read > 0) output.write(buffer, 0, read) }
-        }; return output.toByteArray()
+        val output = ByteArrayOutputStream()
+        backend.openRead(relative(file)).use { descriptor ->
+            copyWorkspace.transfer(
+                read = { buffer, offset, count -> descriptor.read(buffer, offset, count) },
+                write = { buffer, offset, count -> output.write(buffer, offset, count) },
+            )
+        }
+        return output.toByteArray()
     }
     fun readLines(file: File) = readBytes(file).toString(Charsets.UTF_8).lines().dropLastWhile(String::isEmpty)
     fun list(directory: File): List<File> = backend.list(relative(directory)).map { name -> validateSegment(name); File(directory, name).also(::requireContained) }
@@ -323,17 +329,32 @@ class SafeFilesystemV2(
         fault.at(DurableStoreFaultPointV2.ASSET_DIRECTORY_SYNC); backend.syncDirectory(parentSegments(to))
     }
     fun streamExclusive(file: File, input: InputStream): Pair<Long, ByteArray> {
-        prepareParent(file); fault.at(DurableStoreFaultPointV2.PART_CREATE); val digest = MessageDigest.getInstance("SHA-256"); var length = 0L
-        input.use { source -> backend.createExclusive(relative(file)).use { descriptor ->
-            val buffer = ByteArray(64 * 1024); while (true) { val read = source.read(buffer); if (read < 0) break; fault.at(DurableStoreFaultPointV2.PART_WRITE); descriptor.write(buffer, 0, read); digest.update(buffer, 0, read); length = Math.addExact(length, read.toLong()) }
-            fault.at(DurableStoreFaultPointV2.PART_FILE_SYNC); descriptor.sync()
-        } }; fault.at(DurableStoreFaultPointV2.PART_HASH); backend.syncDirectory(parentSegments(file)); return length to digest.digest()
+        prepareParent(file); fault.at(DurableStoreFaultPointV2.PART_CREATE)
+        val receipt = input.use { source ->
+            backend.createExclusive(relative(file)).use { descriptor ->
+                val measured = copyWorkspace.copy(
+                    read = { buffer, offset, count -> source.read(buffer, offset, count) },
+                    write = { buffer, offset, count ->
+                        fault.at(DurableStoreFaultPointV2.PART_WRITE)
+                        descriptor.write(buffer, offset, count)
+                    },
+                )
+                fault.at(DurableStoreFaultPointV2.PART_FILE_SYNC)
+                descriptor.sync()
+                measured
+            }
+        }
+        fault.at(DurableStoreFaultPointV2.PART_HASH)
+        backend.syncDirectory(parentSegments(file))
+        return receipt.length to receipt.digest
     }
     fun digestAndLength(file: File): Pair<Long, ByteArray> {
-        val digest = MessageDigest.getInstance("SHA-256"); var length = 0L; backend.openRead(relative(file)).use { descriptor ->
-            val buffer = ByteArray(64 * 1024); while (true) { val read = descriptor.read(buffer, 0, buffer.size); if (read < 0) break; if (read > 0) { digest.update(buffer, 0, read); length = Math.addExact(length, read.toLong()) } }
-        }; return length to digest.digest()
+        return backend.openRead(relative(file)).use { descriptor ->
+            copyWorkspace.digest { buffer, offset, count -> descriptor.read(buffer, offset, count) }
+                .let { it.length to it.digest }
+        }
     }
+
     fun allocateExclusive(file: File, bytes: Long) {
         require(bytes > 0); prepareParent(file); backend.allocateExclusive(relative(file), bytes); check(length(file) == bytes); syncParent(file)
     }
@@ -346,17 +367,25 @@ class SafeFilesystemV2(
     private fun syncParent(file: File) = backend.syncDirectory(parentSegments(file))
     private fun parentSegments(file: File) = relative(requireNotNull(file.parentFile))
     private fun relative(file: File): List<String> {
-        requireContained(file)
-        val path = rootPath.relativize(file.absoluteFile.toPath().normalize())
+        val path = rootPath.relativize(containedPath(file))
         if (path.toString().isEmpty()) return emptyList()
-        return path.map { it.toString() }.toList().onEach(::validateSegment)
+        return path.map { it.toString().also(::validateSegment) }
     }
-    private fun requireContained(file: File) { require(file.absoluteFile.toPath().normalize().startsWith(rootPath)) }
-    private fun validateSegment(name: String) { require(name.matches(SEGMENT) && name != "." && name != "..") }
-    override fun close() { if (closed.compareAndSet(false, true)) backend.close() }
-    companion object {
+    private fun containedPath(file: File): java.nio.file.Path {
+        val path = file.absoluteFile.toPath().normalize()
+        require(path.startsWith(rootPath))
+        return path
+    }
+    private fun requireContained(file: File) { containedPath(file) }
+    private fun validateSegment(name: String) {
         // Authenticated group-local activation attempts need 174 ASCII characters. The 240
         // ceiling admits that canonical name while retaining margin below Windows' 255 limit.
-        private val SEGMENT = Regex("[A-Za-z0-9._-]{1,240}")
+        require(name.length in 1..240 && name != "." && name != "..")
+        for (index in name.indices) {
+            val character = name[index]
+            require(character in 'A'..'Z' || character in 'a'..'z' || character in '0'..'9' ||
+                character == '.' || character == '_' || character == '-')
+        }
     }
+    override fun close() { if (closed.compareAndSet(false, true)) backend.close() }
 }

@@ -23,6 +23,22 @@ internal data class FinalizationWorkerSnapshot(
     val completedJobs: Long,
 )
 
+/** One bounded job whose input ownership can be canceled before execution. */
+private class FinalizationWork(
+    private val runJob: () -> Unit,
+    private val cancelJob: () -> Unit,
+) : Runnable {
+    private val started = AtomicBoolean(false)
+
+    override fun run() {
+        if (started.compareAndSet(false, true)) runJob()
+    }
+
+    fun cancelBeforeRun() {
+        if (started.compareAndSet(false, true)) cancelJob()
+    }
+}
+
 /**
  * Bounded worker pool shared by expensive encode and persistence work.
  *
@@ -53,12 +69,24 @@ internal class CaptureFinalizationWorkerPool(
             ThreadPoolExecutor.AbortPolicy(),
         )
 
-    fun submit(job: () -> Unit): FinalizationSubmissionStatus {
-        if (closed.get()) return FinalizationSubmissionStatus.CLOSED
+    /**
+     * Submits a job without waiting. [onCancelBeforeRun] owns inputs until
+     * execution starts and is invoked once for rejection or queue shutdown.
+     */
+    fun submit(
+        onCancelBeforeRun: () -> Unit = {},
+        job: () -> Unit,
+    ): FinalizationSubmissionStatus {
+        val work = FinalizationWork(job, onCancelBeforeRun)
+        if (closed.get()) {
+            work.cancelBeforeRun()
+            return FinalizationSubmissionStatus.CLOSED
+        }
         return try {
-            executor.execute(job)
+            executor.execute(work)
             FinalizationSubmissionStatus.ACCEPTED
         } catch (_: RejectedExecutionException) {
+            work.cancelBeforeRun()
             if (closed.get()) {
                 FinalizationSubmissionStatus.CLOSED
             } else {
@@ -78,7 +106,17 @@ internal class CaptureFinalizationWorkerPool(
 
     override fun close() {
         if (closed.compareAndSet(false, true)) {
-            executor.shutdownNow()
+            var firstCancellationFailure: Throwable? = null
+            executor.shutdownNow().forEach { task ->
+                try {
+                    (task as? FinalizationWork)?.cancelBeforeRun()
+                } catch (error: Throwable) {
+                    if (firstCancellationFailure == null) {
+                        firstCancellationFailure = error
+                    }
+                }
+            }
+            firstCancellationFailure?.let { throw it }
         }
     }
 

@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.Debug
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.os.PowerManager
 import android.util.Log
 import android.util.Size
@@ -64,6 +65,23 @@ internal class ArCaptureSession(
     private var disposeStarted = false
     private var disposeResult: Result<Unit>? = null
     private val disposeCallbacks = mutableListOf<(Result<Unit>) -> Unit>()
+    private val processTelemetryTiming = if (
+        sceneHost.context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
+    ) ProcessTelemetryTimingLedger() else null
+    private val processTelemetrySampler = ProcessTelemetrySampler(
+        pss = { Debug.getPss() * 1024L },
+        fileDescriptors = { File("/proc/self/fd").list()?.size },
+        // Preserve exact Java-thread semantics, including the diagnostic worker.
+        javaThreads = { Thread.getAllStackTraces().size },
+        timing = processTelemetryTiming,
+    )
+    private val processTelemetry = ProcessTelemetryCache(
+        clockMs = SystemClock::elapsedRealtime,
+        collect = {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+            processTelemetrySampler.sample()
+        },
+    )
     private val nativeCaptureSerialOwnerV2 = NativeCaptureSerialOwnerV2(
         completionExecutor = Executor { command -> mainHandler.post(command) },
     )
@@ -483,7 +501,11 @@ internal class ArCaptureSession(
         return sharedCameraManager?.getCaptureCapacity() ?: byteCache.getCaptureCapacity()
     }
 
-    fun getPerformanceSnapshot(): Map<String, Any?> {
+    fun getPerformanceSnapshot(
+        resetDiagnosticTiming: Boolean = false,
+        includeDiagnosticTiming: Boolean = false,
+    ): Map<String, Any?> {
+        if (resetDiagnosticTiming) processTelemetryTiming?.reset(processTelemetry.isRefreshPending())
         val runtime = Runtime.getRuntime()
         val batteryManager =
             sceneHost.context.getSystemService(BatteryManager::class.java)
@@ -511,13 +533,13 @@ internal class ArCaptureSession(
                 null
             }
         return resourceCounters.snapshot() +
+            (sharedCameraManager?.captureScratchReceipt() ?: emptyMap()) +
+            processTelemetry.snapshot().toMap() +
+            (if (includeDiagnosticTiming && processTelemetryTiming != null)
+                mapOf("processTelemetryTiming" to processTelemetryTiming.snapshot()) else emptyMap()) +
             mapOf(
-                "processPssBytes" to Debug.getPss() * 1024L,
                 "dartAndJavaHeapUsedBytes" to
                     runtime.totalMemory() - runtime.freeMemory(),
-                "openFileDescriptors" to
-                    (File("/proc/self/fd").list()?.size ?: -1),
-                "threadCount" to Thread.getAllStackTraces().size,
                 "batteryPercent" to batteryPercent,
                 "batteryChargeCounterMicroAh" to chargeCounterMicroAh,
                 "thermalStatus" to thermalStatus,
@@ -835,6 +857,30 @@ internal class ArCaptureSession(
 
     internal fun beginDebugPoseFixture(): Boolean = poseDataExtractor.beginDebugFixture()
 
+    internal fun beginDebugSyntheticPoseFixture(
+        bindingGeneration: Long,
+        groupGeneration: Long,
+    ): Map<String, Any?> {
+        require(bindingGeneration > 0L) { "binding generation must be positive" }
+        require(groupGeneration > 0L) { "group generation must be positive" }
+        val pose = poseDataExtractor.beginSyntheticDebugFixture(
+            bindingGeneration = bindingGeneration,
+            groupGeneration = groupGeneration,
+        )
+        return poseDataExtractor.toPoseMap(
+            poseDataExtractor.toAlignedPose(
+                pose = pose,
+                sensorTimestampNs = pose.timestampNs,
+                poseAlignment = "syntheticFixture",
+                poseTimeErrorNs = 0L,
+            ),
+        ) + mapOf(
+            "wireVersion" to "pose_batch_v1",
+            "sequence" to ++poseSequence,
+            "poseSource" to PoseDataExtractor.SYNTHETIC_POSE_SOURCE,
+        )
+    }
+
     internal fun setDebugPoseManualView() = poseDataExtractor.setDebugFixtureManualView()
 
     internal fun setDebugPoseAutomaticRevisit() =
@@ -960,6 +1006,8 @@ internal class ArCaptureSession(
         disposeStarted = true
         // The binding classifies every owner before the manager closes Camera2.
         disposed.set(true)
+        processTelemetryTiming?.close()
+        processTelemetry.close()
         val accepted = nativeCaptureSerialOwnerV2.close(
             timeoutMillis = NativeCaptureCloseTimeoutMs,
             operation = { nativeCaptureBindingV2.close() },
@@ -981,6 +1029,7 @@ internal class ArCaptureSession(
     }
 
     private fun disposeMainResources() {
+        poseDataExtractor.clearDebugFixture()
         syntheticCaptureCompletion.clear()
         byteCache.dispose()
         sharedCameraManager?.let { manager ->
