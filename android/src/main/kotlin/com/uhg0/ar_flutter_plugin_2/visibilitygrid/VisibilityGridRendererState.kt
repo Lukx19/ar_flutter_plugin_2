@@ -17,6 +17,9 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette
 import com.uhg0.ar_flutter_plugin_2.sceneview.BoundedCoveragePresentation
 import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationMode
 import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationPage
+import com.uhg0.ar_flutter_plugin_2.sceneview.PresentationPageReader
+import com.uhg0.ar_flutter_plugin_2.sceneview.PresentationWorkspace
+import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageRendererLimits
 
 /** Minimal immutable geometry retained after a group config's keys are consumed. */
 internal class RendererGroupGeometry private constructor(
@@ -112,7 +115,8 @@ class VisibilityGridRendererState(
                 // Dirty ranges may cover any canonical row, including rows
                 // outside the current top-k cut, so this queue remains
                 // source-sized even when geometry is borrowed.
-                DirtyRowQueue.ownedStorageBytes(capacity)
+                DirtyRowQueue.ownedStorageBytes(capacity) +
+                PresentationWorkspace.ownedStorageBytes(minOf(capacity, CoverageRendererLimits.CENTROID_CAPACITY))
         }
 
         private const val POSITION_COMPONENTS = 3
@@ -122,6 +126,7 @@ class VisibilityGridRendererState(
         require(capacity in 1..100_000)
     }
 
+    private val presentationWorkspace = PresentationWorkspace(minOf(capacity, CoverageRendererLimits.CENTROID_CAPACITY))
     private val surfaceIds = LongArray(capacity)
     private val voxelKeys = LongArray(capacity)
     private val packedNormals = if (retainCanonicalNormalMetadata) IntArray(capacity) else IntArray(0)
@@ -915,7 +920,7 @@ class VisibilityGridRendererState(
         if (!withCommittedRows(expected) { }) return null
         val boundedCount = minOf(selectedSourceSlots.size, mode.presentationCapacity)
         val slots = selectedSourceSlots.copyOf(boundedCount)
-        if (slots.any { it !in 0 until count } || slots.toSet().size != slots.size) return null
+        if (!presentationWorkspace.validSlots(slots, count)) return null
         val ids = LongArray(boundedCount)
         val styles = ByteArray(boundedCount * COVERAGE_RENDERER_STYLE_ROW_BYTES)
         repeat(boundedCount) { destination ->
@@ -930,48 +935,27 @@ class VisibilityGridRendererState(
             val styleOffset = destination * COVERAGE_RENDERER_STYLE_ROW_BYTES
             CoverageRendererStyleRowV1.validateEncoded(styles, styleOffset)
             if ((styles[styleOffset + 2].toInt() and 0xf) != palette.code) {
-                CoverageRendererStyleRowV1.decode(styles, styleOffset)
-                    .copy(palette = palette).encodeInto(styles, styleOffset)
+                styles[styleOffset + 2] = ((styles[styleOffset + 2].toInt() and 0xf0) or palette.code).toByte()
             }
         }
-        val pageReader: (CoverageRowsQualifier, Int, Int) -> CoveragePresentationPage? =
-            { pageExpected, start, maximum ->
-                var page: CoveragePresentationPage? = null
-                val accepted = withCommittedRows(pageExpected) { rows ->
-                    val pageCount = minOf(maximum, boundedCount - start)
-                    if (pageCount <= 0) return@withCommittedRows
-                    val pageIds = LongArray(pageCount)
-                    val pagePositions = FloatArray(pageCount * 3)
-                    val pageColors = IntArray(pageCount)
-                    val pageStyles = ByteArray(pageCount * COVERAGE_RENDERER_STYLE_ROW_BYTES)
-                    repeat(pageCount) { offset ->
-                        val destination = start + offset
-                        val source = slots[destination]
-                        val surfaceId = rows.surfaceIdAt(source)
-                        pageIds[offset] = surfaceId
-                        pagePositions[offset * 3] = rows.positionComponentAt(source, 0)
-                        pagePositions[offset * 3 + 1] = rows.positionComponentAt(source, 1)
-                        pagePositions[offset * 3 + 2] = rows.positionComponentAt(source, 2)
-                        styles.copyInto(
-                            pageStyles,
-                            offset * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-                            destination * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-                            (destination + 1) * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-                        )
-                        pageColors[offset] = CoverageRendererStyleRowV1.validatedPackedColor(pageStyles, offset * COVERAGE_RENDERER_STYLE_ROW_BYTES)
+        val pageReader = PresentationPageReader { pageExpected, start, pageCount, mapping, destination ->
+            var copied = false
+            val accepted = withCommittedRows(pageExpected) { rows ->
+                repeat(pageCount) { offset ->
+                    val source = mapping.sourceSlotAt(start + offset)
+                    if (source !in 0 until rows.count || rows.surfaceIdAt(source) != mapping.surfaceIdAt(start + offset)) {
+                        return@withCommittedRows
                     }
-                    page = CoveragePresentationPage(
-                        startSlot = start,
-                        totalCount = boundedCount,
-                        surfaceIds = pageIds,
-                        positions = pagePositions,
-                        colors = pageColors,
-                        styleRows = pageStyles,
-                    )
+                    destination.surfaceIds[offset] = rows.surfaceIdAt(source)
+                    destination.positions[offset * 3] = rows.positionComponentAt(source, 0)
+                    destination.positions[offset * 3 + 1] = rows.positionComponentAt(source, 1)
+                    destination.positions[offset * 3 + 2] = rows.positionComponentAt(source, 2)
                 }
-                page.takeIf { accepted }
+                copied = true
             }
-        return BoundedCoveragePresentation.create(
+            accepted && copied
+        }
+        return BoundedCoveragePresentation.createOwned(
             qualifier = expected,
             mode = mode,
             enabled = enabled,
@@ -986,6 +970,7 @@ class VisibilityGridRendererState(
             selectedSourceSlots = slots,
             styleRows = styles,
             update = update ?: nextUpdate(),
+            workspace = presentationWorkspace,
             pageReader = pageReader,
         )
     }

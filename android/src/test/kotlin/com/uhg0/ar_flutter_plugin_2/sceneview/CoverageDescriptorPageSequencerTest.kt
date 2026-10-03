@@ -8,6 +8,7 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRowsQualifier
 import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -17,6 +18,34 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 class CoverageDescriptorPageSequencerTest {
+    @Test
+    fun `page storage reuses only released tickets and short pages expose active prefix`() {
+        val sequencer = CoverageDescriptorPageSequencer()
+        sequencer.replace(descriptor(count = 513))
+        val first = checkNotNull(sequencer.nextPage())
+        val ids = first.page.surfaceIds
+        val positions = first.page.positions
+        val styles = first.page.styleRows
+        val heldId = ids[0]
+        assertNull(sequencer.nextPage())
+        assertEquals(heldId, ids[0])
+        sequencer.release(first.ticket)
+        val last = checkNotNull(sequencer.nextPage())
+        assertSame(first.page, last.page)
+        assertSame(ids, last.page.surfaceIds)
+        assertSame(positions, last.page.positions)
+        assertSame(styles, last.page.styleRows)
+        assertEquals(1, last.page.count)
+        assertEquals(512, last.page.surfaceIds.size)
+        sequencer.release(first.ticket)
+        assertTrue(sequencer.hasInFlightPage)
+        sequencer.clear()
+        sequencer.replace(descriptor(count = 2))
+        assertNull(sequencer.nextPage())
+        sequencer.release(last.ticket)
+        assertEquals(2, checkNotNull(sequencer.nextPage()).page.count)
+    }
+
     @Test
     fun `worker publication cannot mutate renderer owned pages and hands off the latest cut`() {
         val mailbox = CoverageRendererPublicationMailbox<BoundedCoveragePresentation>()

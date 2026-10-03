@@ -922,7 +922,7 @@ class CoverageRendererSelectionTest {
         assertEquals(2_000, CoverageRendererLimits.RAW_POINT_CAPACITY)
         assertEquals(20_000, CoverageRendererLimits.CENTROID_CAPACITY)
         assertEquals(8_000, CoverageRendererLimits.CUBE_CAPACITY)
-        assertEquals(13_197_572, CoverageRendererLimits.maximumActiveRendererBytes)
+        assertEquals(13_038_692, CoverageRendererLimits.maximumActiveRendererBytes)
         com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.entries.forEach { mode ->
             assertTrue(
                 "$mode startup peak must fit the active renderer cap",
@@ -955,17 +955,17 @@ class CoverageRendererSelectionTest {
             CoverageRendererLimits.TRANSITION_HEADROOM_BYTES,
             receipt.transitionHeadroomBytes,
         )
-        assertEquals(5_403_936, receipt.canonicalStateBytes)
+        assertEquals(5_645_056, receipt.canonicalStateBytes)
         assertEquals(800_000, receipt.mutableProjectionSelectorBytes)
         assertEquals(640_100, receipt.descriptorBackingBytes)
-        assertEquals(400_000, receipt.pageReaderCapturedMappingBytes)
+        assertEquals(0, receipt.pageReaderCapturedMappingBytes)
         assertEquals(65_536, receipt.stagingBytes)
         assertEquals(5_888_000, receipt.meshBytes)
-        assertEquals(13_197_572, receipt.totalBytes)
+        assertEquals(13_038_692, receipt.totalBytes)
         assertTrue(receipt.canonicalStateBytes > 0)
         assertTrue(receipt.mutableProjectionSelectorBytes > 0)
         assertTrue(receipt.descriptorBackingBytes > 0)
-        assertTrue(receipt.pageReaderCapturedMappingBytes > 0)
+        assertEquals(0, receipt.pageReaderCapturedMappingBytes)
         assertTrue(receipt.stagingBytes > 0)
         assertTrue(receipt.meshBytes > 0)
         assertEquals(
@@ -1024,9 +1024,9 @@ class CoverageRendererSelectionTest {
 
         ledger.releaseRendererResources()
 
-        assertEquals(7_244_036, telemetry.snapshot().getValue("ownedBufferBytes"))
+        assertEquals(7_085_156, telemetry.snapshot().getValue("ownedBufferBytes"))
         assertEquals(
-            5_403_936,
+            5_645_056,
             telemetry.snapshot().getValue("ownedBufferBytesByOwner").let { owners ->
                 @Suppress("UNCHECKED_CAST")
                 (owners as Map<String, Int>).getValue("coverage-renderer-state")
@@ -1047,12 +1047,12 @@ class CoverageRendererSelectionTest {
         ledger.installPointResources("coverage-centroids-epoch-1", CoverageRendererLimits.CENTROID_CAPACITY)
         ledger.releaseRendererResources()
         ledger.releaseRendererResources()
-        assertEquals(7_244_036, telemetry.snapshot().getValue("ownedBufferBytes"))
+        assertEquals(7_085_156, telemetry.snapshot().getValue("ownedBufferBytes"))
 
         ledger.installPersistentCoverageState(VoxelRenderMode.CENTROIDS)
-        assertEquals(7_309_572, telemetry.snapshot().getValue("ownedBufferBytes"))
+        assertEquals(7_150_692, telemetry.snapshot().getValue("ownedBufferBytes"))
         ledger.releaseRendererResources()
-        assertEquals(7_244_036, telemetry.snapshot().getValue("ownedBufferBytes"))
+        assertEquals(7_085_156, telemetry.snapshot().getValue("ownedBufferBytes"))
     }
 
     @Test
@@ -1107,7 +1107,7 @@ class CoverageRendererSelectionTest {
         )
 
         assertNull(failed)
-        assertEquals(7_244_036, telemetry.snapshot().getValue("ownedBufferBytes"))
+        assertEquals(7_085_156, telemetry.snapshot().getValue("ownedBufferBytes"))
     }
 
     @Test
@@ -1142,7 +1142,7 @@ class CoverageRendererSelectionTest {
         )
 
         assertNull(failed)
-        assertEquals(7_244_036, telemetry.snapshot().getValue("ownedBufferBytes"))
+        assertEquals(7_085_156, telemetry.snapshot().getValue("ownedBufferBytes"))
         ledger.clearCoverageState()
         ledger.clearCoverageState()
         assertEquals(0, telemetry.snapshot().getValue("ownedBufferBytes"))
@@ -1156,7 +1156,7 @@ class CoverageRendererSelectionTest {
         ledger.installCubeResources("coverage-cubes-epoch-1", CoverageRendererLimits.CUBE_CAPACITY)
 
         ledger.releaseRendererResources()
-        assertEquals(7_244_036, telemetry.snapshot().getValue("ownedBufferBytes"))
+        assertEquals(7_085_156, telemetry.snapshot().getValue("ownedBufferBytes"))
         ledger.clearCoverageState()
         ledger.clearCoverageState()
         assertEquals(0, telemetry.snapshot().getValue("ownedBufferBytes"))

@@ -443,7 +443,7 @@ internal class CoveragePointUploadCoordinator(
         val endSlot = range.endSlotExclusive
         val page = activePage
         if (page != null) {
-            buffers.writePage(page.positions, page.colors, page.startSlot)
+            buffers.writePage(page.positions, page.colors, page.startSlot, page.count)
         } else {
             val snapshot = checkNotNull(activeSnapshot)
             buffers.writeRange(snapshot.positions, snapshot.colors, startSlot, endSlot)

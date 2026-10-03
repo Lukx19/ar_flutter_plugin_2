@@ -17,6 +17,67 @@ import org.junit.Test
 
 class CoveragePresentationDescriptorTest {
     @Test
+    fun `packed glyph ranking and palette views match scalar ordering with stable old owners`() {
+        val size = 800
+        val ids = LongArray(size) { size - it.toLong() }
+        val scalar = Array(size) { index -> CoverageRendererStyleRowV1(
+            target = com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererTarget.entries[index % 3],
+            coverage = CoverageRendererCoverage.entries[index / 3 % 3],
+            residency = com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererResidency.entries[index / 9 % 3],
+            glyph = CoverageRendererGlyph.VIEW_ROSE,
+            directionBin = index % 24,
+        ) }
+        val ranked = (0 until size).sortedWith { a, b ->
+            compareCoverageStylePriority(scalar[a], ids[a], scalar[b], ids[b])
+        }.take(CoverageRendererLimits.GLYPH_CAPACITY).toSet()
+        val workspace = PresentationWorkspace(size)
+        fun descriptor(generation: Long): PresentationDescriptor = PresentationDescriptor.createOwned(
+            qualifier = CoverageRowsQualifier(1, 1, 0, generation, generation, generation),
+            mode = CoveragePresentationMode.SEMANTIC_CENTROIDS, enabled = true,
+            capacity = CoverageRendererLimits.CENTROID_CAPACITY, sourceCapacity = size, sourceCount = size,
+            palette = CoverageRendererPalette.COVERAGE, paletteEpoch = 0,
+            selectedSurfaceIds = ids.copyOf(), selectedSourceSlots = IntArray(size) { it },
+            styleRows = ByteArray(size * COVERAGE_RENDERER_STYLE_ROW_BYTES).also { rows ->
+                scalar.forEachIndexed { index, row -> row.encodeInto(rows, index * COVERAGE_RENDERER_STYLE_ROW_BYTES) }
+            }, update = null, workspace = workspace,
+            pageReader = PresentationPageReader { _, start, count, mapping, page ->
+                repeat(count) { index -> page.surfaceIds[index] = mapping.surfaceIdAt(start + index) }
+                true
+            },
+        )
+        val first = descriptor(1)
+        val oldStyles = first.styleRows
+        val scratch = listOf("ids", "slots", "heap").map { name ->
+            PresentationWorkspace::class.java.getDeclaredField(name).apply { isAccessible = true }.get(workspace)
+        }
+        repeat(4) { descriptor(it + 2L) }
+        listOf("ids", "slots", "heap").forEachIndexed { index, name ->
+            org.junit.Assert.assertSame(scratch[index], PresentationWorkspace::class.java.getDeclaredField(name)
+                .apply { isAccessible = true }.get(workspace))
+        }
+        org.junit.Assert.assertArrayEquals(oldStyles, first.styleRows)
+        val paletteRows = CoverageRendererPalette.entries.associateWith { palette ->
+            first.withControls(first.mode, palette = palette).styleRows
+        }
+        repeat(size) { index ->
+            val row = CoverageRendererStyleRowV1.decode(oldStyles, index * COVERAGE_RENDERER_STYLE_ROW_BYTES)
+            assertEquals(index in ranked, row.glyph != CoverageRendererGlyph.NONE)
+            CoverageRendererPalette.entries.forEach { palette ->
+                val recolored = checkNotNull(paletteRows[palette])
+                org.junit.Assert.assertArrayEquals(row.copy(palette = palette).encode(),
+                    recolored.copyOfRange(index * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                        (index + 1) * COVERAGE_RENDERER_STYLE_ROW_BYTES))
+            }
+        }
+        val destination = CoveragePresentationPage.allocate(512)
+        assertTrue(first.withPageInto(first.qualifier, 799, 512, destination))
+        assertEquals(1, destination.count)
+        assertEquals(ids[799], destination.surfaceIds[0])
+        assertFalse(first.withPageInto(first.qualifier.copy(styleRevision = 99), 0, 512, destination))
+        assertEquals(0, destination.count)
+    }
+
+    @Test
     fun `scalar glyph and color reads preserve all decoder validation including malformed none rows`() {
         val original = CoverageRendererStyleRowV1().encode()
         for (palette in CoverageRendererPalette.entries) {

@@ -1,5 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.sceneview
 
+import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
+
 import com.google.android.filament.IndexBuffer
 import com.google.android.filament.MaterialInstance
 import com.google.android.filament.RenderableManager
@@ -37,11 +39,11 @@ internal interface CoverageVoxelMeshResources {
             enabled = enabled,
             capacity = capacity,
             count = page.count,
-            keys = page.surfaceIds.copyOf(),
-            surfaceIds = page.surfaceIds.copyOf(),
-            positions = page.positions.copyOf(),
-            colors = page.colors.copyOf(),
-            styleRows = page.styleRows.copyOf(),
+            keys = page.surfaceIds.copyOf(page.count),
+            surfaceIds = page.surfaceIds.copyOf(page.count),
+            positions = page.positions.copyOf(page.count * 3),
+            colors = page.colors.copyOf(page.count),
+            styleRows = page.styleRows.copyOf(page.count * COVERAGE_RENDERER_STYLE_ROW_BYTES),
         )
         update(node, snapshot, materialInstance, pointSizePx)
     }

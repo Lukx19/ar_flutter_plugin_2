@@ -63,6 +63,7 @@ internal class CoverageDescriptorPageSequencer {
     private val pendingPages = ArrayDeque<PageWork>()
     private var inFlightPage: InFlightPage? = null
     private var nextTicketSerial = 0L
+    private val pageDestination = CoveragePresentationPage.allocate(MAX_ROWS_PER_PAGE)
 
     /** Replaces queued work while preserving any page already in flight. */
     fun replace(
@@ -126,16 +127,13 @@ internal class CoverageDescriptorPageSequencer {
         while (pendingPages.isNotEmpty()) {
             val work = pendingPages.removeFirst()
             if (work.descriptor !== currentDescriptor) continue
-            var page: CoveragePresentationPage? = null
-            val accepted = work.descriptor.withPage(
+            val accepted = work.descriptor.withPageInto(
                 expected = work.descriptor.qualifier,
                 startSlot = work.startSlot,
                 maximumRows = minOf(MAX_ROWS_PER_PAGE, work.endSlotExclusive - work.startSlot),
-            ) { borrowed ->
-                val end = minOf(work.endSlotExclusive, borrowed.startSlot + borrowed.count)
-                page = if (end == work.endSlotExclusive) borrowed else null
-            }
-            if (!accepted || page == null) {
+                destination = pageDestination,
+            )
+            if (!accepted || pageDestination.startSlot + pageDestination.count != work.endSlotExclusive) {
                 failedDescriptor = work.descriptor
                 pendingPages.clear()
                 completedDescriptor = null
@@ -143,7 +141,7 @@ internal class CoverageDescriptorPageSequencer {
             }
             val ticket = CoverageDescriptorPageTicket(++nextTicketSerial)
             inFlightPage = InFlightPage(work, ticket)
-            return CoverageDescriptorPageSubmission(ticket, page!!, work.reset, work.descriptor.enabled)
+            return CoverageDescriptorPageSubmission(ticket, pageDestination, work.reset, work.descriptor.enabled)
         }
         return null
     }

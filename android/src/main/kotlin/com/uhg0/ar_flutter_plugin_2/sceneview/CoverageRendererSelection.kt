@@ -146,9 +146,7 @@ internal object CoverageRendererLimits {
             descriptorBackingBytes = PresentationDescriptor.estimatedBackingBytes(
                 presentationCapacity,
             ),
-            pageReaderCapturedMappingBytes = presentationCapacity * (
-                Long.SIZE_BYTES * 2 + Int.SIZE_BYTES
-            ),
+            pageReaderCapturedMappingBytes = 0,
             stagingBytes = PAGE_STAGING_BYTES,
             meshBytes = resourcePeakBytes(mode),
         )

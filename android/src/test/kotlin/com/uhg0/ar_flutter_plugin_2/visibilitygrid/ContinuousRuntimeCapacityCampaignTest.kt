@@ -305,7 +305,7 @@ class ContinuousRuntimeCapacityCampaignTest {
             val depthReceipt = requireNotNull(integration.depthResourceReceipt())
             assertEquals(0, depthReceipt.preparedEvidenceRows)
             assertTrue(depthReceipt.residentEvidenceRows > 0)
-            assertEquals(1, requireNotNull(rendered).count)
+            assertEquals(0, requireNotNull(rendered).count)
             val depthCurrent = requireNotNull(activeResources.owner().activationState())
             assertEquals(depthCurrent.cut.geometryRevision, depthPublication.geometryRevision)
             assertEquals(depthCurrent.cut.lineageRevision, depthPublication.lineageRevision)
@@ -323,6 +323,7 @@ class ContinuousRuntimeCapacityCampaignTest {
             )
             assertEquals(0, exchange(messenger, viewId, stream, sequence++, previousAck).response.messageKind)
             assertEquals("acknowledged", integration.integrationReceipt().status)
+            assertEquals(1, requireNotNull(rendered).count)
             while (created < featureSurfaceTarget) {
                 val verificationBefore = verificationSnapshot?.invoke()
                 val count = minOf(V2_FEATURE_SAMPLE_CAPACITY, featureSurfaceTarget - created)
@@ -343,10 +344,8 @@ class ContinuousRuntimeCapacityCampaignTest {
                 assertEquals("FEATURE_BATCH", receipt.canonicalOperation)
                 assertEquals(previousAck.geometry + 1, receipt.geometryRevision)
                 assertEquals(previousAck.lineage, receipt.lineageRevision)
-                assertEquals(created + count + 1, receipt.rendererRows)
                 maximumCurrentBytes = maxOf(maximumCurrentBytes, receipt.canonicalBytes)
                 if (materialBatches > 0) {
-                    assertEquals(minOf(count, maxOf(0, RENDERER_ROWS - created - 1)), lastDirtyRendererRows)
                     val encodedLimit = 4_096L + count * 256L
                     assertTrue("later encoded batch=$materialBatches bytes=${receipt.canonicalBytes} limit=$encodedLimit", receipt.canonicalBytes <= encodedLimit)
                     maximumLaterCanonicalBytesPerRow = maxOf(
@@ -385,7 +384,14 @@ class ContinuousRuntimeCapacityCampaignTest {
                 assertArrayEquals(beforeHash, requireNotNull(resources).owner().activationState()?.cut?.rootHash?.toByteArray())
                 previousAck = Ack(receipt.transactionId, receipt.geometryRevision, receipt.lineageRevision)
                 assertEquals(0, exchange(messenger, viewId, stream, sequence++, previousAck).response.messageKind)
-                assertEquals("acknowledged", integration.integrationReceipt().status)
+                val acknowledgedReceipt = integration.integrationReceipt()
+                assertEquals("acknowledged", acknowledgedReceipt.status)
+                // Geometry and dirty spans are published only after the exact
+                // structural ACK installs this cut on the renderer lane.
+                assertEquals(created + count + 1, acknowledgedReceipt.rendererRows)
+                if (materialBatches > 0) {
+                    assertEquals(minOf(count, maxOf(0, RENDERER_ROWS - created - 1)), lastDirtyRendererRows)
+                }
                 if (measureBatchPersistence && materialBatches > 0) {
                     val selectedGroup = requireNotNull(groupDirectory)
                     val persistenceAfter = selectedGroup.listFiles().orEmpty().associate { it.name to CoordinatorStorageBudget(coordinator).allocatedBytes(it) }
