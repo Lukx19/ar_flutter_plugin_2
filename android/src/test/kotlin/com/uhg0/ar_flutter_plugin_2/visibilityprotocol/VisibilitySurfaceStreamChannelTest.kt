@@ -24,6 +24,36 @@ import org.junit.Test
 
 class VisibilitySurfaceStreamChannelTest {
     @Test
+    fun `qualified reply views stay immutable through replay later publication and disposal`() {
+        val held = mutableListOf<ByteBuffer>()
+        val messenger = TestMessenger(143) { held.add(it) }
+        val qualifier = ByteArray(32) { (it + 1).toByte() }
+        val binding = VisibilitySurfaceStreamChannel(messenger, 143, bindingQualifier = qualifier)
+        val firstRequest = qualifier + request(sequence = 1, token = 143)
+        val first = messenger.exchange(firstRequest)
+        assertTrue(held[0].isDirect)
+        assertTrue(held[0].isReadOnly)
+        assertThrows(java.nio.ReadOnlyBufferException::class.java) { held[0].put(0, 0) }
+        held[0].position(0)
+        val allocatedBeforeReplay = binding.transportInstrumentation.snapshot().allocationBytesObserved
+        assertArrayEquals(first, messenger.exchange(firstRequest))
+        assertEquals(firstRequest.size.toLong() - qualifier.size,
+            binding.transportInstrumentation.snapshot().allocationBytesObserved - allocatedBeforeReplay)
+        messenger.exchange(qualifier + request(sequence = 2, token = 143))
+        binding.dispose()
+        for (index in 0..1) {
+            val prior = ByteArray(first.size)
+            held[index].duplicate().apply { position(0); get(prior) }
+            assertArrayEquals(first, prior)
+        }
+        assertEquals(2L, PacketCodec.decodeResponse(
+            ByteArray(held[2].capacity() - qualifier.size).also { bytes ->
+                held[2].duplicate().apply { position(qualifier.size); get(bytes) }
+            },
+        ).requestSequence)
+    }
+
+    @Test
     fun `executor observer enters binding owner before the stream monitor`() {
         val messenger = TestMessenger(142)
         val bindingOwner = ReentrantLock()
@@ -2418,7 +2448,7 @@ private class HoldingTimeoutScheduler : TimeoutScheduler {
     }
 }
 
-private class TestMessenger(viewId: Int) : BinaryMessenger {
+private class TestMessenger(viewId: Int, private val onEngineReply: ((ByteBuffer) -> Unit)? = null) : BinaryMessenger {
     private val channelName = "visibility_surface_stream_$viewId"
     private val metricsChannelName = "visibility_surface_metrics_$viewId"
     private val handlers = mutableMapOf<String, BinaryMessenger.BinaryMessageHandler>()
@@ -2447,6 +2477,7 @@ private class TestMessenger(viewId: Int) : BinaryMessenger {
                     throw IllegalStateException("reply port closed")
                 }
                 val engineReply = reply?.let { buffer ->
+                    onEngineReply?.invoke(buffer)
                     val length = buffer.position()
                     val copy = ByteArray(length)
                     buffer.duplicate().apply {

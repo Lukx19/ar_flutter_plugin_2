@@ -90,12 +90,13 @@ data class ResyncCommandV1(val payload: ResyncPayloadV1) {
         const val VERSION = 1
         const val BYTE_LENGTH = 2 + ResyncPayloadV1.BYTE_LENGTH
 
-        fun decode(bytes: ByteArray): ResyncCommandV1 {
-            require(bytes.size == BYTE_LENGTH && bytes[0].toInt() and 0xff == KIND &&
-                bytes[1].toInt() and 0xff == VERSION) {
+        fun decode(bytes: ByteArray, offset: Int = 0, length: Int = bytes.size - offset): ResyncCommandV1 {
+            require(offset >= 0 && length >= 0 && offset <= bytes.size - length)
+            require(length == BYTE_LENGTH && bytes[offset].toInt() and 0xff == KIND &&
+                bytes[offset + 1].toInt() and 0xff == VERSION) {
                 "Resync command must be kind 4/version 1 with a 48-byte payload"
             }
-            return ResyncCommandV1(ResyncPayloadV1.decode(bytes.copyOfRange(2, BYTE_LENGTH)))
+            return ResyncCommandV1(ResyncPayloadV1.decode(bytes.copyOfRange(offset + 2, offset + BYTE_LENGTH)))
         }
     }
 }

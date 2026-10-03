@@ -17,6 +17,25 @@ import org.junit.Test
 
 class RendererStyleCommandV1Test {
     @Test
+    fun `renderer style source range excludes surrounding bytes and retains an exact owned page`() {
+        val expected = hex(fixture().getValue("pageHex").jsonPrimitive.content)
+        val source = ByteArray(expected.size + 26) { 0x5a }
+        expected.copyInto(source, 13)
+        val page = RendererStyleCommandV1.decode(source, 13, expected.size)
+        assertArrayEquals(expected, page.bytes)
+        assertArrayEquals(expected, RendererStyleCommandV1.encode(page))
+        source.fill(0)
+        assertArrayEquals(expected, page.bytes)
+        assertArrayEquals(expected, RendererStyleCommandV1.encode(page))
+        assertThrows(IllegalArgumentException::class.java) {
+            RendererStyleCommandV1.decode(expected, 1, expected.size)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            RendererStyleCommandV1.decode(expected, -1, expected.size)
+        }
+    }
+
+    @Test
     fun `renderer style page matches the checked in cross language vector`() {
         val fixture = fixture()
         val pageBytes = hex(fixture.getValue("pageHex").jsonPrimitive.content)

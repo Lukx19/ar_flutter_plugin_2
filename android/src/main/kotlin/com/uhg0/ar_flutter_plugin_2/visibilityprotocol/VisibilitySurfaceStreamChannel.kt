@@ -129,7 +129,7 @@ class VisibilitySurfaceStreamChannel(
     @Volatile private var lastSequence: Long? = null
     @Volatile private var nextExpectedSequence = initialNextExpectedSequence
     @Volatile private var lastRequest: ByteArray? = null
-    @Volatile private var lastResponse: ByteArray? = null
+    @Volatile private var lastResponse: EncodedResponse? = null
     @Volatile private var resyncPending = false
     private val bindingAbandoned = AtomicBoolean(false)
     private val publicationFence = Any()
@@ -195,7 +195,7 @@ class VisibilitySurfaceStreamChannel(
             check(lastSequence == null && synchronized(structuralFrames) { structuralFrames.isEmpty() })
             nextExpectedSequence = Long.MAX_VALUE
             check(isValidTerminalDrain(request))
-            val encoded = PacketCodec.encodeResponse(
+            val encoded = encodeStreamResponse(
                 PacketCodec.rolloverRequired(
                     streamToken = streamToken,
                     requestSequence = Long.MAX_VALUE,
@@ -209,9 +209,9 @@ class VisibilitySurfaceStreamChannel(
             lastSequence = Long.MAX_VALUE
             lastRequest = bytes
             lastResponse = encoded
-            telemetry.retainedReplayCache(bytes.size, encoded.size)
+            telemetry.retainedReplayCache(bytes.size, encoded.retainedBytes)
             telemetry.accepted(bytes.size, encoded.size)
-            PacketCodec.decodeResponse(encoded)
+            PacketCodec.decodeResponse(encoded.copyPacketBytes())
         }
     }
 
@@ -394,17 +394,16 @@ class VisibilitySurfaceStreamChannel(
         message: ByteBuffer?,
         reply: BasicMessageChannel.Reply<ByteBuffer>,
     ) {
-            val transportBytes = message?.let { buffer ->
-                val copy = ByteArray(buffer.remaining())
-                buffer.slice().get(copy)
-                copy
-            }
-            if (transportBytes == null) {
+            if (message == null) {
                 reply.reply(null)
                 return
             }
-            val correlatedDebugAttempt = debugTransportProbe?.ingress(transportBytes) == true
-            val bytes = authenticatedPayload(transportBytes)
+            val correlatedDebugAttempt = debugTransportProbe?.let { probe ->
+                val diagnostic = ByteArray(message.remaining())
+                message.duplicate().get(diagnostic)
+                probe.ingress(diagnostic)
+            } == true
+            val bytes = AuthenticatedStreamPacket.copyPayload(message, bindingQualifier)
             if (bytes == null) {
                 telemetry.rejected()
                 if (correlatedDebugAttempt) debugTransportProbe.rejected()
@@ -430,7 +429,7 @@ class VisibilitySurfaceStreamChannel(
                 return
             }
             telemetry.queued()
-            val pendingReply = PendingReply(bytes, reply, ::qualify) {
+            val pendingReply = PendingReply(bytes, reply) {
                 if (!queuedBackpressure.get()) outstandingInvocation.set(false)
                 activePendingReply = null
             }
@@ -454,7 +453,7 @@ class VisibilitySurfaceStreamChannel(
                             beforeWorkerProcessing?.invoke()
                             if (disposed.get()) {
                                 if (pendingReply.tryClaim()) {
-                                    workerLostResponseBytes(bytes)
+                                    workerLostResponse(bytes)
                                 } else {
                                     null
                                 }
@@ -465,7 +464,7 @@ class VisibilitySurfaceStreamChannel(
                                 var decodedRequest: PacketCodec.Request? = null
                                 var rendererStyleCommand: RendererStyleCommandV1.Page? = null
                                 val encoded = try {
-                                    val request = PacketCodec.decodeRequest(bytes)
+                                    val request = PacketCodec.decodeRequestView(bytes)
                                     decodedRequest = request
                                     beforeRequestProcessing?.invoke(request)
                                     controlLifecycle?.streamTokenError(request.streamToken)?.let {
@@ -502,11 +501,11 @@ class VisibilitySurfaceStreamChannel(
                                             val styleAcknowledgementRequest =
                                                 rendererStylePriority &&
                                                     rendererStyleAcknowledgementPending &&
-                                                    request.commandBytes.isEmpty() &&
+                                                    request.commandLength == 0 &&
                                                     request.nextStyleRevision == committedBaseline.styleRevision
                                             val hasCommitFrame =
                                                 nextStructuralFrame() is TransactionCommitFrameV1 &&
-                                                    request.commandBytes.isEmpty() &&
+                                                    request.commandLength == 0 &&
                                                     !styleAcknowledgementRequest
                                             if (hasCommitFrame) {
                                                 beforeAuthorityPublication?.invoke()
@@ -520,11 +519,11 @@ class VisibilitySurfaceStreamChannel(
                                                     committedBaseline = it.committedBaseline()
                                                 }
                                                 rendererStyleCommand = if (
-                                                    request.commandBytes.isNotEmpty() &&
+                                                    request.commandLength != 0 &&
                                                         request.requestFlags and RESYNC_REQUEST_FLAG == 0
                                                 ) {
-                                                    if (request.styleRecords.isNotEmpty() ||
-                                                        !RendererStyleCommandV1.isKind(request.commandBytes)
+                                                    if (request.styleCount != 0 ||
+                                                        !RendererStyleCommandV1.isKind(request.commandBytes, request.commandOffset, request.commandLength)
                                                     ) {
                                                         throw BindingError(MALFORMED_PACKET_ERROR_ID)
                                                     }
@@ -532,7 +531,7 @@ class VisibilitySurfaceStreamChannel(
                                                     // admission until after that ACK has cleared the previous
                                                     // renderer staging. A style page can describe the current
                                                     // style revision on the newly acknowledged geometry cut.
-                                                    RendererStyleCommandV1.decode(request.commandBytes)
+                                                    RendererStyleCommandV1.decode(request.commandBytes, request.commandOffset, request.commandLength)
                                                 } else {
                                                     null
                                                 }
@@ -579,7 +578,7 @@ class VisibilitySurfaceStreamChannel(
                                                         ((styleMatchesCommittedBaseline && stylePageNeedsPriority) ||
                                                             (rendererStylePriority &&
                                                                 rendererStyleAcknowledgementPending &&
-                                                                request.commandBytes.isEmpty() &&
+                                                                request.commandLength == 0 &&
                                                                 request.nextStyleRevision == committedBaseline.styleRevision))
                                                 publishesCommit =
                                                     nextStructuralFrame() is TransactionCommitFrameV1 &&
@@ -587,7 +586,7 @@ class VisibilitySurfaceStreamChannel(
                                                 if (publishesCommit) {
                                                     afterAuthorityPublicationFenceAcquired?.invoke()
                                                 }
-                                                val publicationBytes = PacketCodec.encodeResponse(
+                                                val publicationBytes = encodeStreamResponse(
                                                     when {
                                                     isValidTerminalDrain(request) -> {
                                                         PacketCodec.rolloverRequired(
@@ -603,7 +602,7 @@ class VisibilitySurfaceStreamChannel(
                                                         if (transactionReceiver.state ==
                                                             StructuralTransactionState.RESYNC_PENDING) {
                                                             transactionReceiver.resync(
-                                                                ResyncCommandV1.decode(request.commandBytes),
+                                                                ResyncCommandV1.decode(request.commandBytes, request.commandOffset, request.commandLength),
                                                             )
                                                         }
                                                         resyncPending = false
@@ -663,7 +662,7 @@ class VisibilitySurfaceStreamChannel(
                                                                 }
                                                             }
                                                         }
-                                                        if (request.styleRecords.isNotEmpty()) {
+                                                        if (request.styleCount != 0) {
                                                             val previousBaseline = committedBaseline
                                                             committedBaseline = committedBaseline.copy(
                                                                 styleRevision = StyleRevisionSemantics.committedRevision(
@@ -682,7 +681,7 @@ class VisibilitySurfaceStreamChannel(
                                                         }
                                                         if (deferStructuralForStyle) {
                                                             if (rendererStyleAcknowledgementPending &&
-                                                                request.commandBytes.isEmpty()) {
+                                                                request.commandLength == 0) {
                                                                 rendererStyleAcknowledgementPending = false
                                                                 rendererStylePriority = false
                                                             }
@@ -718,12 +717,12 @@ class VisibilitySurfaceStreamChannel(
                                             } else {
                                                 request.requestSequence + 1
                                             }
-                                            // Ingress owns bytes; qualify() copies the reply into
-                                            // platform storage. Neither private array is writable
-                                            // by the messenger, so replay needs no second clone.
+                                            // The request and direct publication have independent,
+                                            // immutable ownership. Callback views retain the same
+                                            // publication backing even after replay replacement.
                                             lastRequest = bytes
                                             lastResponse = encoded
-                                            telemetry.retainedReplayCache(bytes.size, encoded.size)
+                                            telemetry.retainedReplayCache(bytes.size, encoded.retainedBytes)
                                             telemetry.accepted(bytes.size, encoded.size)
                                             encoded
                                         }
@@ -740,7 +739,7 @@ class VisibilitySurfaceStreamChannel(
                                         0
                                     }
                                     val token = decodedRequest?.streamToken ?: 0
-                                    PacketCodec.encodeResponse(
+                                    encodeStreamResponse(
                                         streamError(
                                             streamToken = token,
                                             requestSequence = sequence,
@@ -761,7 +760,7 @@ class VisibilitySurfaceStreamChannel(
                                         0
                                     }
                                     val token = decodedRequest?.streamToken ?: 0
-                                    PacketCodec.encodeResponse(
+                                    encodeStreamResponse(
                                         streamError(
                                             streamToken = token,
                                             requestSequence = sequence,
@@ -771,7 +770,6 @@ class VisibilitySurfaceStreamChannel(
                                         PacketCodec.responseMinimumBytes,
                                     )
                                 }
-                                telemetry.allocated(encoded.size)
                                 if (publicationClaimedReply || pendingReply.tryClaim()) encoded else null
                             }
                         }
@@ -784,10 +782,9 @@ class VisibilitySurfaceStreamChannel(
                         timeoutHandle.cancel()
                         if (response != null) {
                             if (correlatedDebugAttempt) debugTransportProbe.published()
-                            telemetry.allocated(response.size)
                             // Flutter's Android messenger passes position() as the JNI
-                            // message length; qualify() leaves it after the bytes.
-                            reply.reply(qualify(response))
+                            // message length; the read-only view is positioned after all bytes.
+                            reply.reply(response.replyBuffer())
                         }
                     } catch (_: Exception) {
                         abandonForWorkerLoss(pendingReply, bytes)
@@ -803,28 +800,26 @@ class VisibilitySurfaceStreamChannel(
             }
     }
 
-    private fun authenticatedPayload(bytes: ByteArray): ByteArray? {
-        val qualifier = bindingQualifier ?: return bytes
-        if (bytes.size < qualifier.size) return null
-        for (index in qualifier.indices) if (bytes[index] != qualifier[index]) return null
-        return bytes.copyOfRange(qualifier.size, bytes.size)
+    private fun encodeStreamResponse(response: PacketCodec.Response, maximumBytes: Int): EncodedResponse {
+        val size = PacketCodec.validatedResponseSize(response, maximumBytes)
+        val prefixBytes = bindingQualifier?.size ?: 0
+        val destination = ByteBuffer.allocateDirect(prefixBytes + size)
+        bindingQualifier?.let(destination::put)
+        PacketCodec.encodeResponseInto(response, maximumBytes, destination, prefixBytes)
+        telemetry.allocated(prefixBytes + size)
+        return EncodedResponse(destination.asReadOnlyBuffer(), size, prefixBytes)
     }
 
-    private fun qualify(buffer: ByteBuffer): ByteBuffer {
-        val qualifier = bindingQualifier ?: return buffer
-        val payload = ByteArray(buffer.position())
-        buffer.duplicate().apply { flip(); get(payload) }
-        return ByteBuffer.allocateDirect(qualifier.size + payload.size).apply {
-            put(qualifier)
-            put(payload)
-        }
-    }
-
-    private fun qualify(bytes: ByteArray): ByteBuffer {
-        val qualifier = bindingQualifier
-        return ByteBuffer.allocateDirect((qualifier?.size ?: 0) + bytes.size).apply {
-            if (qualifier != null) put(qualifier)
-            put(bytes)
+    /** No backing is recycled: an engine-retained view keeps this publication alive. */
+    private class EncodedResponse(
+        private val storage: ByteBuffer,
+        val size: Int,
+        private val prefixBytes: Int,
+    ) {
+        val retainedBytes: Int get() = storage.capacity()
+        fun replyBuffer(): ByteBuffer = storage.asReadOnlyBuffer()
+        fun copyPacketBytes(): ByteArray = ByteArray(size).also { bytes ->
+            storage.duplicate().apply { position(prefixBytes); get(bytes) }
         }
     }
 
@@ -854,7 +849,7 @@ class VisibilitySurfaceStreamChannel(
         if (!claim.won) return
         claim.pendingReply?.let { pendingReply ->
             onAbandonedRequest?.invoke(
-                PacketCodec.decodeRequest(pendingReply.requestBytes),
+                PacketCodec.decodeRequestView(pendingReply.requestBytes),
                 pendingCommitBaseline(),
             )
         }
@@ -878,7 +873,7 @@ class VisibilitySurfaceStreamChannel(
         }
         val claim = claimAbandonFence(pendingReply)
         if (!claim.won) return
-        onAbandonedRequest?.invoke(PacketCodec.decodeRequest(bytes), pendingCommitBaseline())
+        onAbandonedRequest?.invoke(PacketCodec.decodeRequestView(bytes), pendingCommitBaseline())
         telemetry.timedOut()
         clearPreparedStaging()
         transactionReceiver.abandon()
@@ -899,7 +894,7 @@ class VisibilitySurfaceStreamChannel(
             claimed
         }
         if (ownsReply) {
-            onAbandonedRequest?.invoke(PacketCodec.decodeRequest(bytes), pendingCommitBaseline())
+            onAbandonedRequest?.invoke(PacketCodec.decodeRequestView(bytes), pendingCommitBaseline())
         }
         telemetry.workerLost()
         clearPreparedStaging()
@@ -987,10 +982,10 @@ class VisibilitySurfaceStreamChannel(
     }
 
     private fun isValidResyncRequest(request: PacketCodec.Request): Boolean {
-        if (request.requestFlags != RESYNC_REQUEST_FLAG || request.styleRecords.isNotEmpty()) {
+        if (request.requestFlags != RESYNC_REQUEST_FLAG || request.styleCount != 0) {
             return false
         }
-        val command = runCatching { ResyncCommandV1.decode(request.commandBytes) }
+        val command = runCatching { ResyncCommandV1.decode(request.commandBytes, request.commandOffset, request.commandLength) }
             .getOrNull() ?: return false
         val payload = command.payload
         return payload.lastCommittedTransactionId == request.acknowledgedTransactionId &&
@@ -1001,8 +996,8 @@ class VisibilitySurfaceStreamChannel(
     private fun isValidTerminalDrain(request: PacketCodec.Request): Boolean =
         request.requestSequence == Long.MAX_VALUE &&
             request.requestFlags == TERMINAL_DRAIN_REQUEST_FLAG &&
-            request.styleRecords.isEmpty() &&
-            request.commandBytes.isEmpty() &&
+            request.styleCount == 0 &&
+            request.commandLength == 0 &&
             request.nextStyleRevision == committedBaseline.styleRevision &&
             synchronized(structuralFrames) {
                 (structuralFrames.isEmpty() &&
@@ -1044,7 +1039,7 @@ class VisibilitySurfaceStreamChannel(
             !StyleRevisionSemantics.accepts(
                 committedBaseline.styleRevision,
                 request.nextStyleRevision,
-                request.styleRecords.isNotEmpty(),
+                request.styleCount != 0,
             )
         }
         return structuralMismatch || styleMismatch
@@ -1077,8 +1072,7 @@ class VisibilitySurfaceStreamChannel(
                 ).copy(acceptedStyleRevision = committedBaseline.styleRevision)
                 // The caller encodes this response under the negotiated ceiling
                 // before returning. Only then is the producer advanced.
-                val encoded = PacketCodec.encodeResponse(response, responseProfile.responseCeilingBytes)
-                check(encoded.isNotEmpty())
+                PacketCodec.validatedResponseSize(response, responseProfile.responseCeilingBytes)
                 structuralFrameCursor = Math.addExact(structuralFrameCursor, 1)
                 return response
             }
@@ -1102,9 +1096,7 @@ class VisibilitySurfaceStreamChannel(
                     requestSequence = request.requestSequence,
                     nextExpectedRequestSequence = request.requestSequence + 1,
                 ).copy(acceptedStyleRevision = request.nextStyleRevision)
-                check(
-                    PacketCodec.encodeResponse(response, responseProfile.responseCeilingBytes).isNotEmpty(),
-                )
+                PacketCodec.validatedResponseSize(response, responseProfile.responseCeilingBytes)
             }
         }
     }
@@ -1207,7 +1199,6 @@ class VisibilitySurfaceStreamChannel(
     private class PendingReply(
         val requestBytes: ByteArray,
         private val callback: BasicMessageChannel.Reply<ByteBuffer>,
-        private val qualify: (ByteBuffer) -> ByteBuffer,
         private val onClaimed: () -> Unit,
     ) {
         private val claimed = AtomicBoolean(false)
@@ -1218,19 +1209,19 @@ class VisibilitySurfaceStreamChannel(
             return ownsReply
         }
 
-        fun reply(buffer: ByteBuffer) {
-            callback.reply(qualify(buffer))
+        fun reply(response: EncodedResponse) {
+            callback.reply(response.replyBuffer())
         }
     }
 
-    private fun workerAbandonedResponse(bytes: ByteArray): ByteBuffer {
+    private fun workerAbandonedResponse(bytes: ByteArray): EncodedResponse {
         val sequence = if (bytes.size >= PacketCodec.requestHeaderBytes) {
             ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getLong(64).coerceAtLeast(0)
         } else {
             0
         }
-        val token = runCatching { PacketCodec.decodeRequest(bytes).streamToken }.getOrDefault(0)
-        val encoded = PacketCodec.encodeResponse(
+        val token = runCatching { PacketCodec.decodeRequestView(bytes).streamToken }.getOrDefault(0)
+        val encoded = encodeStreamResponse(
             streamError(
                 streamToken = token,
                 requestSequence = sequence,
@@ -1239,7 +1230,7 @@ class VisibilitySurfaceStreamChannel(
             ),
             PacketCodec.responseMinimumBytes,
         )
-        return ByteBuffer.allocateDirect(encoded.size).apply { put(encoded) }
+        return encoded
     }
 
     /** Serializes the consumed ID8 transition behind the invocation that caused pressure. */
@@ -1253,12 +1244,12 @@ class VisibilitySurfaceStreamChannel(
                 check(!disposed.get() && !bindingAbandoned.get()) {
                     "Queued backpressure request belongs to an abandoned binding"
                 }
-                val request = PacketCodec.decodeRequest(bytes)
+                val request = PacketCodec.decodeRequestView(bytes)
                 controlLifecycle?.streamTokenError(request.streamToken)?.let { throw BindingError(it) }
                 require(request.requestSequence == nextExpectedSequence) {
                     "Queued backpressure request must advertise the next sequence"
                 }
-                val response = PacketCodec.encodeResponse(
+                val response = encodeStreamResponse(
                     streamError(
                         streamToken = request.streamToken,
                         requestSequence = request.requestSequence,
@@ -1272,12 +1263,11 @@ class VisibilitySurfaceStreamChannel(
                 nextExpectedSequence = request.requestSequence + 1
                 lastRequest = bytes
                 lastResponse = response
-                telemetry.retainedReplayCache(bytes.size, response.size)
+                telemetry.retainedReplayCache(bytes.size, response.retainedBytes)
                 telemetry.accepted(bytes.size, response.size)
                 response
             }
-            telemetry.allocated(bytes.size + encoded.size)
-            reply.reply(qualify(encoded))
+            reply.reply(encoded.replyBuffer())
         } catch (_: Exception) {
             reply.reply(null)
         } finally {
@@ -1287,19 +1277,14 @@ class VisibilitySurfaceStreamChannel(
         }
     }
 
-    private fun workerLostResponse(bytes: ByteArray): ByteBuffer {
-        val encoded = workerLostResponseBytes(bytes)
-        return ByteBuffer.allocateDirect(encoded.size).apply { put(encoded) }
-    }
-
-    private fun workerLostResponseBytes(bytes: ByteArray): ByteArray {
+    private fun workerLostResponse(bytes: ByteArray): EncodedResponse {
         val sequence = if (bytes.size >= PacketCodec.requestHeaderBytes) {
             ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getLong(64).coerceAtLeast(0)
         } else {
             0
         }
-        val token = runCatching { PacketCodec.decodeRequest(bytes).streamToken }.getOrDefault(0)
-        val encoded = PacketCodec.encodeResponse(
+        val token = runCatching { PacketCodec.decodeRequestView(bytes).streamToken }.getOrDefault(0)
+        val encoded = encodeStreamResponse(
             streamError(
                 streamToken = token,
                 requestSequence = sequence,

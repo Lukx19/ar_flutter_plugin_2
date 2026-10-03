@@ -76,7 +76,24 @@ object PacketCodec {
         val styleRecords: List<ByteArray>,
         val commandBytes: ByteArray,
         val requestSequence: Long,
-    )
+        private var commandRangeOwner: ByteArray = commandBytes,
+        private var commandRangeOffset: Int = 0,
+        private var commandRangeLength: Int = commandBytes.size,
+    ) {
+        init {
+            // Data-class copy carries its old range fields. A replacement array
+            // starts a new full command; unchanged storage preserves its view.
+            // These private fields are normalized only during construction.
+            if (commandRangeOwner !== commandBytes) {
+                commandRangeOwner = commandBytes
+                commandRangeOffset = 0
+                commandRangeLength = commandBytes.size
+            }
+        }
+        val commandOffset: Int get() = commandRangeOffset
+        val commandLength: Int get() = commandRangeLength
+        val styleCount: Int get() = styleRecords.size
+    }
 
     data class Response(
         val messageKind: Int,
@@ -102,7 +119,7 @@ object PacketCodec {
     )
 
     fun encodeRequest(request: Request): ByteArray {
-        val size = requestHeaderBytes.toLong() + request.styleRecords.size.toLong() * styleRecordBytes + request.commandBytes.size
+        val size = requestHeaderBytes.toLong() + request.styleRecords.size.toLong() * styleRecordBytes + request.commandLength
         require(size <= requestCeilingBytes) { "Request exceeds the 16 KiB ceiling" }
         return ByteArray(size.toInt()).also { encodeRequestInto(request, it) }
     }
@@ -122,7 +139,9 @@ object PacketCodec {
         require(request.styleRecords.all { it.size == styleRecordBytes }) {
             "Style records must be exactly 8 bytes"
         }
-        val commandBytes = request.commandBytes.size
+        require(request.commandOffset >= 0 && request.commandLength >= 0 &&
+            request.commandOffset <= request.commandBytes.size - request.commandLength)
+        val commandBytes = request.commandLength
         val payloadBytes = request.styleRecords.size * styleRecordBytes + commandBytes
         val packetBytes = requestHeaderBytes + payloadBytes
         require(packetBytes <= requestCeilingBytes) { "Request exceeds the 16 KiB ceiling" }
@@ -151,12 +170,22 @@ object PacketCodec {
             record.copyInto(destination, offset)
             offset += record.size
         }
-        request.commandBytes.copyInto(destination, offset)
+        request.commandBytes.copyInto(destination, offset, request.commandOffset, request.commandOffset + request.commandLength)
         data.putInt(72, crc32(destination, 72, destinationOffset, packetBytes))
         return packetBytes
     }
 
-    fun decodeRequest(packet: ByteArray): Request {
+    fun decodeRequest(packet: ByteArray): Request = decodeRequestView(packet).let { request ->
+        request.copy(
+            styleRecords = request.styleRecords.toList(),
+            commandBytes = request.commandBytes.copyOfRange(
+                request.commandOffset, request.commandOffset + request.commandLength,
+            ),
+        )
+    }
+
+    /** Packet is privately owned by ingress and remains immutable throughout queued/replay ownership. */
+    internal fun decodeRequestView(packet: ByteArray): Request {
         require(packet.size >= requestHeaderBytes) { "Request is shorter than its header" }
         val data = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
         require(packet.magicIs("VGR2")) { "Packet magic is invalid" }
@@ -177,11 +206,15 @@ object PacketCodec {
         require(requestHeaderBytes + styleCount * styleRecordBytes + commandBytes == packet.size) {
             "Request payload lengths are invalid"
         }
-        var offset = requestHeaderBytes
-        val styles = buildList {
-            repeat(styleCount) {
-                add(packet.copyOfRange(offset, offset + styleRecordBytes))
-                offset += styleRecordBytes
+        val commandOffset = requestHeaderBytes + styleCount * styleRecordBytes
+        // Compatibility accessor materializes a record only when explicitly requested.
+        // Production admission uses styleCount and never creates per-record byte arrays.
+        val styles = object : AbstractList<ByteArray>() {
+            override val size: Int get() = styleCount
+            override fun get(index: Int): ByteArray {
+                require(index in 0 until size)
+                val offset = requestHeaderBytes + index * styleRecordBytes
+                return packet.copyOfRange(offset, offset + styleRecordBytes)
             }
         }
         val request = Request(
@@ -193,7 +226,9 @@ object PacketCodec {
             nextStyleRevision = data.getLong(48),
             maximumResponseBytes = data.getInt(56),
             styleRecords = styles,
-            commandBytes = packet.copyOfRange(offset, packet.size),
+            commandBytes = packet,
+            commandRangeOffset = commandOffset,
+            commandRangeLength = commandBytes,
             requestSequence = data.getLong(64),
         )
         validateOrdinal(request.streamToken, "streamToken")
@@ -210,12 +245,13 @@ object PacketCodec {
     }
 
     fun encodeResponse(response: Response, maximumBytes: Int): ByteArray {
-        val size = responseHeaderBytes.toLong() + response.payload.size + response.diagnostic.size
-        require(size <= maximumBytes && size <= catchUpMaximumBytes) { "Response exceeds negotiated or hard ceiling" }
-        return ByteArray(size.toInt()).also { encodeResponseInto(response, maximumBytes, it) }
+        return ByteArray(validatedResponseSize(response, maximumBytes)).also {
+            encodeResponseInto(response, maximumBytes, it)
+        }
     }
 
-    fun encodeResponseInto(response: Response, maximumBytes: Int, destination: ByteArray, destinationOffset: Int = 0): Int {
+    /** Complete validation without allocating a throwaway encoded response. */
+    fun validatedResponseSize(response: Response, maximumBytes: Int): Int {
         validateResponse(response)
         require(response.resultFlags in 0..0x1f)
         require(response.errorId in 0..0xffff)
@@ -234,13 +270,28 @@ object PacketCodec {
         require(response.lineageCount in 0..0xffff)
         require(response.regionResultCount in 0..0xffff)
         require(response.diagnostic.size <= 1024) { "Response diagnostic exceeds 1 KiB" }
-        val bodyBytes = response.payload.size + response.diagnostic.size
-        val packetBytes = responseHeaderBytes + bodyBytes
+        val packetBytes = responseHeaderBytes.toLong() + response.payload.size + response.diagnostic.size
         require(packetBytes <= maximumBytes && packetBytes <= catchUpMaximumBytes) {
             "Response exceeds negotiated or hard ceiling"
         }
-        require(destinationOffset >= 0 && destinationOffset <= destination.size - packetBytes) { "Response destination is too small" }
-        val data = ByteBuffer.wrap(destination, destinationOffset, packetBytes).slice().order(ByteOrder.LITTLE_ENDIAN)
+        return packetBytes.toInt()
+    }
+
+    fun encodeResponseInto(response: Response, maximumBytes: Int, destination: ByteArray, destinationOffset: Int = 0): Int =
+        encodeResponseInto(response, maximumBytes, ByteBuffer.wrap(destination), destinationOffset)
+
+    /** Writes directly into caller storage and advances its position to the exact packet end.
+     * The ceiling and CRC cover only the packet; prefix/suffix bytes remain untouched.
+     */
+    fun encodeResponseInto(response: Response, maximumBytes: Int, destination: ByteBuffer, destinationOffset: Int = destination.position()): Int {
+        val packetBytes = validatedResponseSize(response, maximumBytes)
+        require(!destination.isReadOnly) { "Response destination is read-only" }
+        require(destinationOffset >= 0 && destinationOffset <= destination.limit() - packetBytes) { "Response destination is too small" }
+        val bodyBytes = response.payload.size + response.diagnostic.size
+        val data = destination.duplicate().apply {
+            position(destinationOffset)
+            limit(destinationOffset + packetBytes)
+        }.slice().order(ByteOrder.LITTLE_ENDIAN)
         data.put(0, 0x56.toByte()); data.put(1, 0x47.toByte()); data.put(2, 0x53.toByte()); data.put(3, 0x32.toByte())
         data.putShort(4, 2)
         data.putShort(6, responseHeaderBytes.toShort())
@@ -269,9 +320,11 @@ object PacketCodec {
         data.putInt(100, bodyBytes)
         data.putInt(104, 0)
         data.putInt(108, 0)
-        response.payload.copyInto(destination, destinationOffset + responseHeaderBytes)
-        response.diagnostic.copyInto(destination, destinationOffset + responseHeaderBytes + response.payload.size)
-        data.putInt(104, crc32(destination, 104, destinationOffset, packetBytes))
+        data.position(responseHeaderBytes)
+        data.put(response.payload)
+        data.put(response.diagnostic)
+        data.putInt(104, crc32(data, 104, packetBytes))
+        destination.position(destinationOffset + packetBytes)
         return packetBytes
     }
 
@@ -435,7 +488,7 @@ object PacketCodec {
     }
 
     private fun validateResponse(response: Response) {
-        require(response.messageKind in setOf(0, 1, 2, 3, 4, 5, 255)) {
+        require(response.messageKind in 0..5 || response.messageKind == 255) {
             "Response message kind is invalid"
         }
         require(response.responseFlags in 0..0x1f) {
@@ -502,6 +555,18 @@ object PacketCodec {
         for (index in 0 until length) {
             val original = bytes[start + index]
             val byte = if (index in zeroOffset until zeroOffset + 4) 0 else original.toInt() and 0xff
+            crc = crc xor byte
+            repeat(8) {
+                crc = if ((crc and 1) == 1) (crc ushr 1) xor 0xedb88320.toInt() else crc ushr 1
+            }
+        }
+        return crc xor -1
+    }
+
+    private fun crc32(bytes: ByteBuffer, zeroOffset: Int, length: Int): Int {
+        var crc = -1
+        for (index in 0 until length) {
+            val byte = if (index in zeroOffset until zeroOffset + 4) 0 else bytes.get(index).toInt() and 0xff
             crc = crc xor byte
             repeat(8) {
                 crc = if ((crc and 1) == 1) (crc ushr 1) xor 0xedb88320.toInt() else crc ushr 1

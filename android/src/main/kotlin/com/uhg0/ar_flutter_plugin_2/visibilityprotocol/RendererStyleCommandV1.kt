@@ -233,11 +233,12 @@ object RendererStyleCommandV1 {
         return bytes
     }
 
-    fun decode(bytes: ByteArray): Page {
-        require(bytes.size in HEADER_BYTES..MAX_PAGE_BYTES) {
+    fun decode(bytes: ByteArray, sourceOffset: Int = 0, length: Int = bytes.size - sourceOffset): Page {
+        require(sourceOffset >= 0 && length >= 0 && sourceOffset <= bytes.size - length)
+        require(length in HEADER_BYTES..MAX_PAGE_BYTES) {
             "Renderer-style command page is outside the bounded VGR2 page range"
         }
-        val data = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+        val data = ByteBuffer.wrap(bytes, sourceOffset, length).slice().order(ByteOrder.LITTLE_ENDIAN)
         require(data.get().toInt() and 0xff == KIND && data.get().toInt() and 0xff == VERSION) {
             "Renderer-style command must be kind 5/version 1"
         }
@@ -246,7 +247,7 @@ object RendererStyleCommandV1 {
         require(data.short.toInt() and 0xffff == HEADER_BYTES && data.short.toInt() == 0) {
             "Renderer-style command header is invalid"
         }
-        val captureGroupId = bytes.copyOfRange(8, 24)
+        val captureGroupId = bytes.copyOfRange(sourceOffset + 8, sourceOffset + 24)
         val bindingGeneration = data.getLong(24)
         val groupGeneration = data.getLong(32)
         val transactionId = data.getLong(40)
@@ -266,7 +267,7 @@ object RendererStyleCommandV1 {
         require(data.getInt(132) == 0 && data.getInt(136) == 0 && data.getInt(140) == 0) {
             "Renderer-style command reserved bytes are non-zero"
         }
-        val digest = bytes.copyOfRange(144, 176)
+        val digest = bytes.copyOfRange(sourceOffset + 144, sourceOffset + 176)
         listOf(
             "bindingGeneration" to bindingGeneration,
             "groupGeneration" to groupGeneration,
@@ -283,7 +284,7 @@ object RendererStyleCommandV1 {
         require(styleRevision > 0)
         require(pageCount > 0 && pageIndex in 0 until pageCount)
         require(totalRows in 0..MAX_ROWS && rowCount >= 0 && rowCount <= totalRows)
-        require(bytes.size == HEADER_BYTES + rowCount * RECORD_BYTES)
+        require(length == HEADER_BYTES + rowCount * RECORD_BYTES)
         require((flags and FINAL_FLAG != 0) == (pageIndex == pageCount - 1))
         require((pageIndex < pageCount - 1 && rowCount > 0) || pageIndex == pageCount - 1)
         val targetSurfaceId = targetSurface.takeUnless { it == NO_TARGET_SURFACE_ID }
@@ -296,7 +297,7 @@ object RendererStyleCommandV1 {
         var offset = HEADER_BYTES
         repeat(rowCount) { index ->
             ids[index] = data.getLong(offset)
-            styles.copyFrom(bytes, offset + 8, index * STYLE_ROW_BYTES, STYLE_ROW_BYTES)
+            styles.copyFrom(bytes, sourceOffset + offset + 8, index * STYLE_ROW_BYTES, STYLE_ROW_BYTES)
             offset += RECORD_BYTES
         }
         require(ids.all { it >= 0 })
@@ -326,11 +327,12 @@ object RendererStyleCommandV1 {
             targetSurfaceId = targetSurfaceId,
             targetDirectionIndex = targetDirectionIndex,
             completeDigest = digest,
-            bytes = bytes.copyOf(),
+            bytes = bytes.copyOfRange(sourceOffset, sourceOffset + length),
         )
     }
 
-    fun isKind(bytes: ByteArray): Boolean = bytes.size >= 1 && bytes[0].toInt() and 0xff == KIND
+    fun isKind(bytes: ByteArray, offset: Int = 0, length: Int = bytes.size - offset): Boolean =
+        offset >= 0 && length >= 1 && offset <= bytes.size - length && bytes[offset].toInt() and 0xff == KIND
 
     private const val NO_TARGET_SURFACE_ID = -1L
     private const val NO_TARGET_DIRECTION = -1

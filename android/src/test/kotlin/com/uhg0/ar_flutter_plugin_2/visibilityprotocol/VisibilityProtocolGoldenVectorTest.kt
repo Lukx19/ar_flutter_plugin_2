@@ -2,6 +2,8 @@ package com.uhg0.ar_flutter_plugin_2.visibilityprotocol
 
 
 import java.security.MessageDigest
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
@@ -12,10 +14,48 @@ import kotlinx.serialization.json.long
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Assert.fail
 import org.junit.Test
 
 class VisibilityProtocolGoldenVectorTest {
+    @Test
+    fun `response destinations preserve offsets exact framing crc and normal and catchup ceilings`() {
+        for (maximum in listOf(PacketCodec.responseMaximumBytes, PacketCodec.catchUpMaximumBytes)) {
+            val response = PacketCodec.Response(
+                messageKind = 2, responseFlags = 0, resultFlags = 0, errorId = 0,
+                requestSequence = 7, streamToken = 11, nextExpectedRequestSequence = 8,
+                payload = ByteArray(maximum - PacketCodec.responseHeaderBytes - 17) { (it * 31).toByte() },
+                diagnostic = ByteArray(17) { (it + 9).toByte() },
+            )
+            val expected = PacketCodec.encodeResponse(response, maximum)
+            for (destination in listOf(ByteBuffer.allocate(maximum + 36), ByteBuffer.allocateDirect(maximum + 36))) {
+                for (index in 0 until destination.capacity()) destination.put(index, 0x5a.toByte())
+                destination.order(ByteOrder.BIG_ENDIAN)
+                destination.position(32)
+                destination.limit(maximum + 32)
+                assertEquals(maximum, PacketCodec.encodeResponseInto(response, maximum, destination))
+                assertEquals(maximum + 32, destination.position())
+                assertEquals(ByteOrder.BIG_ENDIAN, destination.order())
+                val actual = ByteArray(maximum)
+                destination.duplicate().apply { position(32); get(actual) }
+                assertArrayEquals(expected, actual)
+                assertArrayEquals(response.payload, PacketCodec.decodeResponse(actual).payload)
+                for (index in 0 until 32) assertEquals(0x5a.toByte(), destination.get(index))
+                destination.limit(destination.capacity())
+                for (index in maximum + 32 until destination.capacity()) assertEquals(0x5a.toByte(), destination.get(index))
+                actual[actual.lastIndex] = (actual.last().toInt() xor 1).toByte()
+                assertThrows(IllegalArgumentException::class.java) { PacketCodec.decodeResponse(actual) }
+            }
+            val short = ByteBuffer.allocateDirect(maximum - 1)
+            assertThrows(IllegalArgumentException::class.java) { PacketCodec.encodeResponseInto(response, maximum, short) }
+            assertEquals(0, short.position())
+            assertThrows(IllegalArgumentException::class.java) {
+                PacketCodec.encodeResponseInto(response, maximum - 1, ByteBuffer.allocateDirect(maximum))
+            }
+        }
+    }
+
     @Test
     fun `pinned Dart vector has identical Kotlin bytes and values`() {
         val root = fixture()
