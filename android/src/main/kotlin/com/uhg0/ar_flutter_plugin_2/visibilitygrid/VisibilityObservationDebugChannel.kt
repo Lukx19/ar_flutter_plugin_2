@@ -182,21 +182,22 @@ internal class VisibilityObservationDebugChannel(
                     "artBlockingGcCount" to Debug.getRuntimeStat("art.gc.blocking-gc-count")!!.toLong(),
                     "nativeHeapAllocatedBytes" to Debug.getNativeHeapAllocatedSize(),
                 ))
+                "prepareAllocationWorkload" -> {
+                    check(allocationWorkload == null) { "allocation workload already running" }
+                    val config = call.allocationWorkloadConfig()
+                    // One-time fixture construction is explicit and precedes measurement fences.
+                    // It offers no observations and leaves actual first-photo work cold.
+                    if (config.denseDepthGrids) source.prepareDenseDepthGrids(
+                        campaignVariants = config.depthVariantOffset != null,
+                    )
+                    result.success(true)
+                }
                 "startAllocationWorkload" -> {
                     check(allocationWorkload == null) { "allocation workload already running" }
-                    val denseDepthGrids = call.argument<Boolean>("denseDepthGrids") ?: false
-                    val maximumFeatureOffers = call.argument<Number>("maximumFeatureOffers")?.toLong()
-                    val depthVariantOffset = call.argument<Number>("depthVariantOffset")?.toLong()
-                    require(maximumFeatureOffers == null || maximumFeatureOffers in 1L..10_000L) {
-                        "maximum feature offers is outside the bounded fixture range"
-                    }
-                    if (depthVariantOffset != null) {
-                        require(denseDepthGrids && maximumFeatureOffers != null &&
-                            maximumFeatureOffers % 24L == 0L && depthVariantOffset in 0L until SYNTHETIC_DENSE_CAMPAIGN_VARIANTS.toLong() &&
-                            depthVariantOffset + maximumFeatureOffers / 24L <= SYNTHETIC_DENSE_CAMPAIGN_VARIANTS) {
-                            "dense campaign variants require a finite in-range sequence"
-                        }
-                    }
+                    val config = call.allocationWorkloadConfig()
+                    val denseDepthGrids = config.denseDepthGrids
+                    val maximumFeatureOffers = config.maximumFeatureOffers
+                    val depthVariantOffset = config.depthVariantOffset
                     if (denseDepthGrids) source.prepareDenseDepthGrids(campaignVariants = depthVariantOffset != null)
                     val depthEveryFeatureOffers = if (denseDepthGrids) 24L else 2L
                     workloadFeatureFixture = if (depthVariantOffset != null) SYNTHETIC_CAMPAIGN_FEATURE_FIXTURE else "legacyRotatingPoint"
@@ -303,6 +304,29 @@ internal class VisibilityObservationDebugChannel(
                 result.error("VG_PROTOCOL_INVALID", error.message, null)
             }
         }
+    }
+
+    private data class AllocationWorkloadConfig(
+        val denseDepthGrids: Boolean,
+        val maximumFeatureOffers: Long?,
+        val depthVariantOffset: Long?,
+    )
+
+    private fun MethodCall.allocationWorkloadConfig(): AllocationWorkloadConfig {
+        val denseDepthGrids = argument<Boolean>("denseDepthGrids") ?: false
+        val maximumFeatureOffers = argument<Number>("maximumFeatureOffers")?.toLong()
+        val depthVariantOffset = argument<Number>("depthVariantOffset")?.toLong()
+        require(maximumFeatureOffers == null || maximumFeatureOffers in 1L..10_000L) {
+            "maximum feature offers is outside the bounded fixture range"
+        }
+        if (depthVariantOffset != null) {
+            require(denseDepthGrids && maximumFeatureOffers != null &&
+                maximumFeatureOffers % 24L == 0L && depthVariantOffset in 0L until SYNTHETIC_DENSE_CAMPAIGN_VARIANTS.toLong() &&
+                depthVariantOffset + maximumFeatureOffers / 24L <= SYNTHETIC_DENSE_CAMPAIGN_VARIANTS) {
+                "dense campaign variants require a finite in-range sequence"
+            }
+        }
+        return AllocationWorkloadConfig(denseDepthGrids, maximumFeatureOffers, depthVariantOffset)
     }
 
     private fun MethodCall.requiredTimestamp(): Long =

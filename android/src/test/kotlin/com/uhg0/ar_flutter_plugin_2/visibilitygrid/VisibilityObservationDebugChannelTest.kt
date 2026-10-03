@@ -25,11 +25,12 @@ class VisibilityObservationDebugChannelTest {
             runtime = runtime, ownership = { null }, gate = VisibilityObservationDebugGate(),
         )
         try {
+            for (method in listOf("prepareAllocationWorkload", "startAllocationWorkload"))
             for ((offset, count) in listOf(-1L to 24L, 25L to 24L, 6L to 480L,
                 0L to 25L, 0L to null, 4_294_967_296L to 24L)) {
                 val result = RecordingResult()
                 MethodChannel(messenger, "visibility_observation_v2_79").invokeMethod(
-                    "startAllocationWorkload", mapOf("denseDepthGrids" to true,
+                    method, mapOf("denseDepthGrids" to true,
                         "depthVariantOffset" to offset, "maximumFeatureOffers" to count), result,
                 )
                 assertTrue(result.completed.await(2, TimeUnit.SECONDS))
@@ -37,6 +38,62 @@ class VisibilityObservationDebugChannelTest {
                 assertEquals(1, result.errorCount)
             }
             assertEquals(0L, runtime.snapshot().offeredDepthObservations)
+        } finally {
+            channel.dispose()
+            runtime.close()
+        }
+    }
+
+    @Test
+    fun `preparing dense allocation fixtures repeatedly offers no observations`() {
+        val messenger = MethodTestMessenger()
+        val ownership = VisibilityObservationOwnership(
+            sessionId = "01".repeat(16),
+            sessionGeneration = 1,
+            captureGroupId = "02".repeat(16),
+            groupGeneration = 1,
+            coverageEpoch = 1,
+            arSessionIdentity = "03".repeat(16),
+            viewInstanceId = "04".repeat(16),
+            viewGeneration = 1,
+            nativeStreamToken = "05".repeat(16),
+            workerBindingToken = "06".repeat(16),
+            bindingGeneration = 1,
+            lifecycleSequence = 1,
+            operationGeneration = 1,
+            groupFrame = VisibilityGroupFrame.copyOf(
+                identityVisibilityGridTransform(), identityVisibilityGridTransform(), 1_000, 100_000,
+            ),
+        )
+        val runtime = AndroidVisibilityGridRuntime(
+            ownership = { ownership },
+            mapper = object : VisibilityObservationMapper {
+                override fun admitFeature(observation: VisibilityFeatureObservation) = observation.close()
+                override fun admitDepth(observation: VisibilityDepthObservation) = observation.close()
+            },
+            scheduler = Executors.newSingleThreadScheduledExecutor(),
+            ownsScheduler = true,
+        )
+        runtime.configureSyntheticSource(VisibilityDepthCapability.AUTOMATIC)
+        val channel = VisibilityObservationDebugChannel(
+            messenger = messenger, viewId = 78, isDebuggable = true,
+            runtime = runtime, ownership = { ownership }, gate = VisibilityObservationDebugGate(),
+            allocationTimestampNs = { error("preparation must not schedule offers") },
+        )
+        try {
+            val before = runtime.snapshot()
+            repeat(2) {
+                val result = RecordingResult()
+                MethodChannel(messenger, "visibility_observation_v2_78").invokeMethod(
+                    "prepareAllocationWorkload", mapOf("denseDepthGrids" to true,
+                        "depthVariantOffset" to 5L, "maximumFeatureOffers" to 480L), result,
+                )
+                assertTrue(result.completed.await(2, TimeUnit.SECONDS))
+                assertEquals(1, result.successCount)
+                assertEquals(0, result.errorCount)
+            }
+            assertEquals(before, runtime.snapshot())
+            assertTrue(channel.samplePoolReceipts().values.all { it.outstanding == 0 })
         } finally {
             channel.dispose()
             runtime.close()
@@ -212,6 +269,7 @@ class VisibilityObservationDebugChannelTest {
             for (method in listOf(
                 "pressureSnapshot",
                 "allocationSnapshot",
+                "prepareAllocationWorkload",
                 "startAllocationWorkload",
                 "stopAllocationWorkload",
             )) {
