@@ -76,11 +76,11 @@ object Vgs2RecoveryCorpus {
         expectedSha256: String = SHA256,
         executeFreshBinding: (FreshBindingExpectation) -> FreshBindingObservation,
     ): Receipt {
-        require(sha256(bytes) == expectedSha256) { "Issue 98 corpus SHA-256 mismatch" }
+        require(sha256(bytes) == expectedSha256) { "VGS2 recovery corpus SHA-256 mismatch" }
         val root = Json.parseToJsonElement(bytes.decodeToString()).jsonObject
         root.requireExactKeys(rootKeys, "root")
         require(root.getValue("format").jsonPrimitive.content ==
-            "visibility_protocol_binding_lifecycle_vgs2_recovery_corpus_v1")
+            "proposal08_binding_lifecycle_vgs2_recovery_corpus_v1")
         val policies = root.getValue("policies").jsonArray.map { it.jsonObject }
         require(policies.map { it.int("errorId") }.toSet() == policyIds && policies.size == policyIds.size)
         policies.forEach { executePolicy(it) }

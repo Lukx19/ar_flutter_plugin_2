@@ -149,9 +149,8 @@ class ResidencyLockedCampaignTest {
         report.parentFile?.mkdirs()
         report.writeText(receipt)
         assertEquals(
-            requireNotNull(javaClass.classLoader?.getResourceAsStream("residency_kotlin_receipt_v1.json"))
-                .bufferedReader().use { it.readText() }.trim(),
-            receipt,
+            fixture("residency_kotlin_receipt_v1.json"),
+            Json.parseToJsonElement(receipt).jsonObject,
         )
     }
 

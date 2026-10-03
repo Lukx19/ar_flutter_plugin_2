@@ -360,8 +360,9 @@ class VisibilityProtocolFaultCorpusTest {
         )
         val detailBytes = ControlCodec.encodeErrorDetail(detail)
         assertEquals(detail, ControlCodec.decodeErrorDetail(detailBytes))
-        val response = PacketCodec.error(7, errorId.toLong(), errorId.toLong(), errorId)
-            .copy(payload = detailBytes)
+        val response = PacketCodec.error(7, errorId.toLong(), errorId.toLong(), errorId,
+            authority = PacketCodec.ErrorAuthority(11, 12, 13, 14, 15, 16, 17, 18),
+            expectedValue = errorId.toLong(), observedValue = errorId + 1L)
         val bytes = PacketCodec.encodeResponse(response, PacketCodec.responseMaximumBytes)
         assertEquals(errorId, PacketCodec.decodeResponse(bytes).errorId)
     }

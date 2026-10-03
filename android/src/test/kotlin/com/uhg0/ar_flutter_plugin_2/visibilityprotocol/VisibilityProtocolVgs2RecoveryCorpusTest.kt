@@ -12,8 +12,10 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
+import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VisibilityProtocolVgs2RecoveryCorpusTest {
@@ -30,7 +32,7 @@ class VisibilityProtocolVgs2RecoveryCorpusTest {
 
     @Test
     fun `VGS2 recovery corpus rejects missing unknown and mutated expected fields`() {
-        val source = fixture().decodeToString()
+        val source = Json.parseToJsonElement(fixture().decodeToString()).toString()
         listOf(
             source.replaceFirst("\"observedValue\":40", "\"observedValue\":41"),
             source.replaceFirst("\"fieldId\":4", "\"fieldId\":9"),
@@ -47,6 +49,7 @@ class VisibilityProtocolVgs2RecoveryCorpusTest {
             source.replaceFirst("\"oldTokenPublicationCount\":0", "\"oldTokenPublicationCount\":1"),
             source.replaceFirst("\"diagnosticBytes\":0", "\"diagnosticBytes\":1"),
         ).forEach { mutation ->
+            assertTrue("Negative case must change the parsed fixture", mutation != source)
             val bytes = mutation.encodeToByteArray()
             assertThrows(IllegalArgumentException::class.java) {
                 Vgs2RecoveryCorpus.run(
@@ -112,6 +115,28 @@ class VisibilityProtocolVgs2RecoveryCorpusTest {
             val startResponse = ControlCodec.decodeResponse(
                 stripQualifier(start.successValue as ByteArray, qualifier),
             )
+            // Restored START installs an authenticated acknowledged cut. The
+            // producer must explicitly supply its next structural transaction.
+            // An empty delta preserves the corpus's BEGIN/COMMIT-only sequence.
+            val restored = requireNotNull(binding.committedEmptyBaseline())
+            require(restored.transactionId == expected.freshTransactionId &&
+                restored.geometryRevision == expected.authority.geometryRevision &&
+                restored.lineageRevision == expected.authority.lineageRevision)
+            val selector = CurrentDeltaSelectorV1(
+                expected.nextTransactionId,
+                expected.targetGeometryRevision,
+                expected.targetLineageRevision,
+            )
+            val delta = CurrentDeltaReceiptV1(
+                selector,
+                restored.geometryRevision,
+                byteArrayOf(),
+                MessageDigest.getInstance("SHA-256").digest(byteArrayOf()),
+            )
+            binding.queueCommittedCurrentDelta(
+                CurrentDeltaSourceV1 { requested -> delta.takeIf { requested == selector } },
+                selector,
+            )
             val attempted = mutableListOf<Long>()
             fun exchange(sequence: Long, acknowledgedTransactionId: Long): PacketCodec.Response {
                 attempted += sequence
@@ -150,7 +175,10 @@ class VisibilityProtocolVgs2RecoveryCorpusTest {
             val begin = exchange(expected.beginRequestSequence, 0)
             val commit = exchange(expected.commitRequestSequence, 0)
             val acknowledged = exchange(expected.ackRequestSequence, expected.nextTransactionId)
-            require(begin.messageKind == 2 && commit.messageKind == 4 && acknowledged.messageKind == 0)
+            require(begin.messageKind == 2 && commit.messageKind == 4 && acknowledged.messageKind == 0) {
+                "Fresh binding responses begin=${begin.messageKind}/${begin.errorId} " +
+                    "commit=${commit.messageKind}/${commit.errorId} ack=${acknowledged.messageKind}/${acknowledged.errorId}"
+            }
             return Vgs2RecoveryCorpus.FreshBindingObservation(
                 freshTransactionId = startResponse.nativeTransactionId,
                 freshRequestSequence = startResponse.nextExchangeRequestSequence,

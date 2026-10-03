@@ -1025,6 +1025,9 @@ class VisibilitySmallSceneDebugChannelTest {
             val wall = invoke(method, "emit", mapOf(
                 "scenarioId" to "over-offer", "step" to "wall", "sequence" to 2L,
             ))
+            // Start the finite burst with the preceding command's producer slots released.
+            // Pool pressure and latest-only replacement still apply within the burst.
+            runtime.awaitDebugFixtureIdle()
             val offered = invoke(method, "emit", mapOf(
                 "scenarioId" to "over-offer", "step" to "overOffer", "sequence" to 3L,
             ))

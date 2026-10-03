@@ -278,8 +278,8 @@ class CanonicalStoreMigrationTest {
     }
 
     @Test
-    fun `independent maximum v3 fixture preserves 300k fingerprints support and high UInt32 IDs`() {
-        val directory = Files.createTempDirectory("canonical-surface-compact-maximum").toFile()
+    fun `maximum v3 migration graph stays within retained byte ceiling`() {
+        val directory = Files.createTempDirectory("canonical-surface-maximum-v3-graph").toFile()
         try {
             val group = SurfaceGroup("compact-maximum")
             writeMaximumV3Fixture(directory, group)
@@ -289,6 +289,17 @@ class CanonicalStoreMigrationTest {
                 migrationBytes <= MIGRATION_GRAPH_PROBE_LIMIT_BYTES,
             )
             println("CANONICAL_SURFACE_MAX_MIGRATION_MEMORY=constructedBytes=$migrationBytes limitBytes=$MIGRATION_GRAPH_PROBE_LIMIT_BYTES owners=kernel,legacyResidentColumns,idOrder,voxelOrder,pageOrder,rowOffsets,supportOffsets,lineageColumns,sourceAndSupportCursorClosures,maxDirectoryColumns,256SourcePageObjects,16384PageBuffer,65536CodecScratch")
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `independent maximum v3 fixture preserves 300k fingerprints support and high UInt32 IDs`() {
+        val directory = Files.createTempDirectory("canonical-surface-compact-maximum").toFile()
+        try {
+            val group = SurfaceGroup("compact-maximum")
+            writeMaximumV3Fixture(directory, group)
             val prepared =
                 CompactCanonicalStore.prepareV6SiblingMigration(
                     group,
@@ -344,7 +355,7 @@ class CanonicalStoreMigrationTest {
             assertEquals(138_296L, memory.directoryColumnsBytes)
             assertTrue(storage.pageBytes >= 38_404_096L)
             assertTrue(storage.directoryBytes <= 1_048_576L)
-            // The feature-fusion kernel is an external owner used by the migration probe above;
+            // The feature-fusion kernel is an external owner used by the separate migration probe;
             // compare the compact store graph with its own resident receipt here.
             val constructedStoreBytes = GraphLayout.parseInstance(store).totalSize()
             assertTrue(
@@ -359,8 +370,8 @@ class CanonicalStoreMigrationTest {
     }
 
     @Test
-    fun `maximum unsorted v5 sources use bounded radix index for all 300k support joins`() {
-        val directory = Files.createTempDirectory("canonical-surface-compact-maximum-unsorted").toFile()
+    fun `maximum unsorted v5 migration graph stays within retained byte ceiling`() {
+        val directory = Files.createTempDirectory("canonical-surface-maximum-unsorted-v5-graph").toFile()
         try {
             val group = SurfaceGroup("compact-maximum-unsorted")
             writeMaximumV3Fixture(directory, group, version = 5, unsortedSources = true)
@@ -369,6 +380,18 @@ class CanonicalStoreMigrationTest {
                 "unsorted migration graph bytes=$migrationBytes limit=$MIGRATION_GRAPH_PROBE_LIMIT_BYTES",
                 migrationBytes <= MIGRATION_GRAPH_PROBE_LIMIT_BYTES,
             )
+            println("CANONICAL_SURFACE_MAX_UNSORTED_MIGRATION_MEMORY=constructedBytes=$migrationBytes limitBytes=$MIGRATION_GRAPH_PROBE_LIMIT_BYTES owners=kernel,legacyColumns,sourceOrdinalRadixIndex,directoryColumns,pageObjects,pageBuffer,codecScratch")
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `maximum unsorted v5 sources use bounded radix index for all 300k support joins`() {
+        val directory = Files.createTempDirectory("canonical-surface-compact-maximum-unsorted").toFile()
+        try {
+            val group = SurfaceGroup("compact-maximum-unsorted")
+            writeMaximumV3Fixture(directory, group, version = 5, unsortedSources = true)
             val prepared = CompactCanonicalStore.prepareV6SiblingMigration(
                 group, directory, acceptingBudget(),
             ) as CompactCanonicalMigrationResult.Prepared
@@ -379,6 +402,7 @@ class CanonicalStoreMigrationTest {
             assertTrue(index.buildIdReads <= 2_700_000L)
             assertTrue(index.lookupIdReads <= 11_400_000L)
             assertTrue(index.maximumLookupIdReads <= 19)
+            assertEquals(100_000, prepared.cut.liveSurfaceCount)
             assertEquals(300_000, prepared.cut.sourceCount)
             assertEquals(300_000, prepared.cut.supportCount)
             assertEquals(200_000, prepared.cut.lineageCount)
@@ -393,7 +417,7 @@ class CanonicalStoreMigrationTest {
                 assertEquals(id, source.value!!.id.value)
             }
             store.close()
-            println("CANONICAL_SURFACE_MAX_UNSORTED_MIGRATION_MEMORY=constructedBytes=$migrationBytes sourceIndex=$index owners=kernel,legacyColumns,sourceOrdinalRadixIndex,directoryColumns,pageObjects,pageBuffer,codecScratch")
+            println("CANONICAL_SURFACE_MAX_UNSORTED_SOURCE_INDEX=$index")
         } finally {
             directory.deleteRecursively()
         }
@@ -583,6 +607,10 @@ class CanonicalStoreMigrationTest {
         val legacy = SurfaceOwnershipLegacyCodec.readValidated(
             group, directory, SurfaceOwnershipConfiguration(),
         )
+        assertEquals(100_000, legacy.resident.rows)
+        assertEquals(300_000, legacy.sourceCount)
+        assertEquals(300_000, legacy.supportCount)
+        assertEquals(200_000, legacy.lineageCount)
         val kernel = FeatureFusionKernel()
         assertTrue(kernel.accept(FeatureFusionBatch(1, 1, emptyList())) is FeatureFusionResult.Accepted)
         val directoryColumns = CompactDirectory(2_344)

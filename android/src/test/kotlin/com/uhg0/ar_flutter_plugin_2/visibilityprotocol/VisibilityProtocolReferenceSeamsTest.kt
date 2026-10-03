@@ -125,7 +125,7 @@ class VisibilityProtocolReferenceSeamsTest {
         assertEquals(request, ControlCodec.decodeRequest(requestBytes))
 
         val detail = ErrorDetail(
-            6, 0, 0, 2, 0, 4, 1, 0,
+            6, 0, 0, 2, 0, 4, 1, 2,
             7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
         )
         assertEquals(detail, ControlCodec.decodeErrorDetail(ControlCodec.encodeErrorDetail(detail)))
