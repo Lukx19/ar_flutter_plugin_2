@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -2157,6 +2158,26 @@ class ARCaptureManager {
           _poseStreamController.add(pose);
           break;
         case 'onPoseBatch':
+          if (call.arguments is Map &&
+              (call.arguments as Map)['wireVersion'] ==
+                  packedPoseBatchWireVersion) {
+            final batch = call.arguments as Map;
+            final count = batch['sampleCount'];
+            final payload = batch['sampleBytes'];
+            if (count is! int ||
+                count < 1 ||
+                count > 8 ||
+                payload is! Uint8List ||
+                payload.lengthInBytes != count * packedPoseSampleBytes) {
+              throw const FormatException('Invalid packed pose batch.');
+            }
+            final bytes = ByteData.sublistView(payload);
+            for (var index = 0; index < count; index++) {
+              _poseStreamController.add(
+                  ARFramePose.fromPacked(bytes, index * packedPoseSampleBytes));
+            }
+            break;
+          }
           final batch = _deepCastMap(call.arguments);
           if (batch['wireVersion'] != poseBatchWireVersion) {
             throw FormatException('Unsupported pose batch wire version.');

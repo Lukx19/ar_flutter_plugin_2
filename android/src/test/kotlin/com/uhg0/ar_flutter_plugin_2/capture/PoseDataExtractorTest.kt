@@ -5,8 +5,49 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 class PoseDataExtractorTest {
+    @Test
+    fun `retained history owns samples and old exposure snapshots survive eviction`() {
+        val extractor = PoseDataExtractor(2)
+        val original = sample(timestampNs = 1L, positionX = 2f)
+        extractor.addSample(original)
+        original.position[0] = 90f
+        val held = extractor.latest()!!
+        val aligned = extractor.resolvePose(PoseDataExtractor.CaptureTiming(1L, 0L), 0L)!!
+        extractor.addSample(sample(timestampNs = 3L, positionX = 3f))
+        extractor.addSample(sample(timestampNs = 2L, positionX = 4f))
+        extractor.addSample(sample(timestampNs = 4L, positionX = 5f))
+        assertEquals(2f, held.position[0], 0f)
+        assertEquals(2f, aligned.pose.position[0], 0f)
+        assertEquals(4L, extractor.latest()!!.timestampNs)
+    }
+
+    @Test
+    fun `packed sample exactly preserves legacy geometry timestamps and independent ownership`() {
+        val extractor = PoseDataExtractor(2)
+        extractor.addSample(sample(timestampNs = 9_007_199_254_740_993L, positionX = 0.24f))
+        val snapshot = extractor.latest()!!
+        val map = extractor.toPoseMap(extractor.toAlignedPose(snapshot))
+        val packed = extractor.latestPacked(7L)!!
+        val buffer = ByteBuffer.wrap(packed).order(ByteOrder.LITTLE_ENDIAN)
+        assertEquals(PackedPoseWireV2.SAMPLE_BYTES, packed.size)
+        assertEquals(7L, buffer.getLong(0))
+        assertEquals(snapshot.timestampNs, buffer.getLong(16))
+        val converted = map["transform"] as List<*>
+        for (i in 0..15) assertEquals(converted[i] as Double, buffer.getFloat(80 + i * 4).toDouble(), 0.0)
+        for (i in 0..15) assertEquals(snapshot.transform[i], buffer.getFloat(172 + i * 4), 0f)
+        val rotation = map["rotation"] as Map<*, *>
+        for ((i, name) in listOf("x", "y", "z", "w").withIndex()) {
+            assertEquals(rotation[name] as Double, buffer.getFloat(64 + i * 4).toDouble(), 0.0)
+        }
+        extractor.addSample(sample(timestampNs = snapshot.timestampNs + 1, positionX = 99f))
+        extractor.latestPacked(8L)
+        assertEquals(0.24f, buffer.getFloat(52), 0f)
+    }
+
     @Test
     fun `finite debug camera phases use one tracked native pose for stream and exposure`() {
         val extractor = PoseDataExtractor()

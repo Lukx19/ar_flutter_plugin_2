@@ -754,7 +754,7 @@ internal class ArCaptureSession(
         return requireSharedCameraControls().isFlashAvailable()
     }
 
-    fun buildPoseUpdate(frame: Frame): Map<String, Any?>? {
+    fun buildPoseUpdate(frame: Frame): ByteArray? {
         // AR frames also flow when high-resolution capture is disabled, and a
         // final Compose frame can race deterministic disposal. In both cases
         // there is no capture pose stream to update.
@@ -769,19 +769,7 @@ internal class ArCaptureSession(
             return null
         }
 
-        val sensorTimestampNs = frame.timestamp
-        val latestPose = poseDataExtractor.latest() ?: return null
-        return poseDataExtractor.toPoseMap(
-            poseDataExtractor.toAlignedPose(
-                pose = latestPose,
-                sensorTimestampNs = latestPose.timestampNs,
-                poseAlignment = "exact",
-                poseTimeErrorNs = 0L,
-            ),
-        ) + mapOf(
-            "wireVersion" to "pose_batch_v1",
-            "sequence" to ++poseSequence,
-        )
+        return poseDataExtractor.latestPacked(++poseSequence)
     }
 
     fun prepareNativeCaptureForPause(onCompleted: (Result<Unit>) -> Unit): Boolean =

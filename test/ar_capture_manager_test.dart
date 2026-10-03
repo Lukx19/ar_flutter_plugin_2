@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:ar_flutter_plugin_2/datatypes/config_planedetection.dart';
 import 'package:ar_flutter_plugin_2/datatypes/image_format.dart';
@@ -7,6 +8,7 @@ import 'package:ar_flutter_plugin_2/managers/ar_capture_manager.dart';
 import 'package:ar_flutter_plugin_2/managers/ar_session_manager.dart';
 import 'package:ar_flutter_plugin_2/models/ar_camera_intrinsics.dart';
 import 'package:ar_flutter_plugin_2/models/ar_capture_config.dart';
+import 'package:ar_flutter_plugin_2/models/ar_frame_pose.dart';
 import 'package:ar_flutter_plugin_2/models/camera_resolution.dart';
 import 'package:ar_flutter_plugin_2/models/capture_capacity.dart';
 import 'package:ar_flutter_plugin_2/models/capture_intent_contract.dart';
@@ -75,9 +77,8 @@ void main() {
       'rotation': <String, dynamic>{'x': 0.0, 'y': 0.0, 'z': 0.0, 'w': 1.0},
       'transform': List<double>.generate(
         16,
-        (index) => index == 0 || index == 5 || index == 10 || index == 15
-            ? 1.0
-            : 0.0,
+        (index) =>
+            index == 0 || index == 5 || index == 10 || index == 15 ? 1.0 : 0.0,
       ),
       'convention': 'opencv_c2w_v1',
       'timestampMs': 123,
@@ -1607,6 +1608,41 @@ void main() {
     expect(poses, hasLength(1));
     expect(poses.single.sequence, 7);
     expect(poses.single.wireVersion, 'pose_batch_v1');
+    await subscription.cancel();
+  });
+
+  test(
+      'accepts packed pose batches with exact timestamps through the method codec',
+      () async {
+    final sessionManager = ARSessionManager(
+        42, _FakeBuildContext(), PlaneDetectionConfig.horizontal);
+    final manager =
+        ARCaptureManager(sessionManager, captureConfig, _FakeBuildContext());
+    final poses = <ARFramePose>[];
+    final subscription = manager.poseDataStream.listen(poses.add);
+    final bytes = ByteData(packedPoseSampleBytes);
+    bytes.setInt64(0, 9, Endian.little);
+    bytes.setInt64(8, 123, Endian.little);
+    bytes.setInt64(16, 9007199254740993, Endian.little);
+    bytes.setFloat32(40, 1, Endian.little);
+    bytes.setInt32(44, 257, Endian.little);
+    const codec = StandardMethodCodec();
+    await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .handlePlatformMessage(
+      'arcapture_42',
+      codec.encodeMethodCall(MethodCall('onPoseBatch', {
+        'wireVersion': packedPoseBatchWireVersion,
+        'sampleCount': 1,
+        'sampleBytes': bytes.buffer.asUint8List(),
+        'droppedOldestCount': 0,
+      })),
+      (_) {},
+    );
+    await Future<void>.delayed(Duration.zero);
+    expect(poses, hasLength(1));
+    expect(poses.single.sensorTimestampNs, 9007199254740993);
+    expect(poses.single.sequence, 9);
+    expect(poses.single.wireVersion, packedPoseBatchWireVersion);
     await subscription.cancel();
   });
 
