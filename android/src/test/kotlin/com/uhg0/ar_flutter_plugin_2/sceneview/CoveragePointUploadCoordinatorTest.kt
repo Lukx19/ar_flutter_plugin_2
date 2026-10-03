@@ -10,6 +10,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -431,6 +432,304 @@ class CoveragePointUploadCoordinatorTest {
         uploader.completeAll()
         assertEquals(listOf(firstTicket, secondTicket), releasedTickets)
     }
+
+    @Test
+    fun `queued page tickets release once on replacement snapshot cancellation and destroy`() {
+        val uploader = FakeUploader()
+        val released = mutableListOf<CoverageDescriptorPageTicket>()
+        val coordinator = CoveragePointUploadCoordinator(
+            capacity = 2,
+            uploader = uploader,
+            onUploadPageReleasedWithTicket = released::add,
+        )
+        val tickets = List(4) { CoverageDescriptorPageTicket(it.toLong()) }
+        coordinator.submitPage(page(1f), RendererUploadPageOrigin.ORDINARY, tickets[0])
+        coordinator.submitPage(page(2f), RendererUploadPageOrigin.ORDINARY, tickets[1])
+        assertEquals(listOf(tickets[0]), released)
+        coordinator.submit(snapshot(1, 1f))
+        assertEquals(tickets.take(2), released)
+        coordinator.submitPage(page(3f), RendererUploadPageOrigin.ORDINARY, tickets[2])
+        coordinator.destroy()
+        coordinator.destroy()
+        coordinator.submitPage(page(4f), RendererUploadPageOrigin.ORDINARY, tickets[3])
+        coordinator.onRendererFrame()
+        assertEquals(tickets, released)
+        assertTrue(uploader.positionSubmissions.isEmpty())
+        assertEquals(0, uploader.submissionKickCount)
+    }
+
+    @Test
+    fun `destroy before or between consumption callbacks settles owners without completion`() {
+        for (positionConsumedFirst in listOf(false, true)) {
+            val uploader = FakeUploader()
+            val released = mutableListOf<CoverageDescriptorPageTicket>()
+            var completed = 0
+            var releasedNotifications = 0
+            val coordinator = CoveragePointUploadCoordinator(
+                capacity = 2,
+                uploader = uploader,
+                onUploadPageReleasedWithTicket = released::add,
+                onUploadCompleted = { completed++ },
+                onUploadPageReleased = { releasedNotifications++ },
+            )
+            val active = CoverageDescriptorPageTicket(1)
+            val queued = CoverageDescriptorPageTicket(2)
+            coordinator.submitPage(page(1f), RendererUploadPageOrigin.ORDINARY, active)
+            coordinator.onRendererFrame()
+            val callbacks = uploader.callbackHistory.toList()
+            val retained = uploader.positionBufferViews.single()
+            val original = retained.get(retained.position())
+            coordinator.submitPage(page(2f), RendererUploadPageOrigin.ORDINARY, queued)
+            if (positionConsumedFirst) callbacks[0]()
+            coordinator.destroy()
+            coordinator.destroy()
+            assertEquals(listOf(queued), released)
+            callbacks[0]()
+            callbacks[0]()
+            coordinator.onRendererFrame()
+            assertEquals(listOf(queued), released)
+            assertEquals(original, retained.get(retained.position()), 0f)
+            callbacks[1]()
+            callbacks[1]()
+            coordinator.destroy()
+            assertEquals(listOf(queued, active), released)
+            assertEquals(0, completed)
+            assertEquals(0, releasedNotifications)
+            assertEquals(1, uploader.positionSubmissions.size)
+        }
+    }
+
+    @Test
+    fun `duplicate and stale callbacks cannot release or mutate a successor page`() {
+        val uploader = FakeUploader()
+        val released = mutableListOf<CoverageDescriptorPageTicket>()
+        val reusablePage = page(1f)
+        val coordinator = CoveragePointUploadCoordinator(
+            capacity = 2,
+            uploader = uploader,
+            onUploadPageReleasedWithTicket = {
+                released += it
+                reusablePage.positions[0] += 10f
+            },
+        )
+        val first = CoverageDescriptorPageTicket(1)
+        val second = CoverageDescriptorPageTicket(2)
+        coordinator.submitPage(reusablePage, RendererUploadPageOrigin.ORDINARY, first)
+        coordinator.onRendererFrame()
+        val firstCallbacks = uploader.callbackHistory.toList()
+        firstCallbacks[0]()
+        firstCallbacks[0]()
+        assertTrue(released.isEmpty())
+        assertEquals(1f, reusablePage.positions[0], 0f)
+        firstCallbacks[1]()
+        assertEquals(11f, reusablePage.positions[0], 0f)
+        coordinator.submitPage(reusablePage, RendererUploadPageOrigin.ORDINARY, second)
+        coordinator.onRendererFrame()
+        val retained = uploader.positionBufferViews.last()
+        val original = retained.get(retained.position())
+        firstCallbacks.forEach { it() }
+        assertEquals(listOf(first), released)
+        assertEquals(11f, reusablePage.positions[0], 0f)
+        assertEquals(original, retained.get(retained.position()), 0f)
+        uploader.callbackHistory[2]()
+        firstCallbacks[1]()
+        assertEquals(listOf(first), released)
+        uploader.callbackHistory[3]()
+        uploader.callbackHistory[3]()
+        assertEquals(listOf(first, second), released)
+        assertEquals(21f, reusablePage.positions[0], 0f)
+    }
+
+    @Test
+    fun `submission rejection retains only previously accepted lane until consumption`() {
+        for (rejectedLane in listOf("positions", "colors")) {
+            for (synchronousPosition in listOf(false, true)) {
+                val uploader = FakeUploader().apply {
+                    rejection = rejectedLane
+                    consumePositionsSynchronously = synchronousPosition
+                }
+                val released = mutableListOf<CoverageDescriptorPageTicket>()
+                var completed = 0
+                val coordinator = CoveragePointUploadCoordinator(
+                    capacity = 2,
+                    uploader = uploader,
+                    onUploadPageReleasedWithTicket = released::add,
+                    onUploadCompleted = { completed++ },
+                )
+                val failed = CoverageDescriptorPageTicket(1)
+                val successor = CoverageDescriptorPageTicket(2)
+                coordinator.submitPage(page(1f), RendererUploadPageOrigin.ORDINARY, failed)
+                assertThrows(IllegalStateException::class.java) { coordinator.onRendererFrame() }
+                val retainedLane = rejectedLane == "colors" && !synchronousPosition
+                assertEquals(if (retainedLane) emptyList() else listOf(failed), released)
+                coordinator.submitPage(page(2f), RendererUploadPageOrigin.ORDINARY, successor)
+                uploader.rejection = null
+                if (retainedLane) {
+                    val retained = uploader.positionBufferViews.single()
+                    val original = retained.get(retained.position())
+                    coordinator.onRendererFrame()
+                    assertEquals(1, uploader.positionSubmissions.size)
+                    assertEquals(original, retained.get(retained.position()), 0f)
+                    uploader.completeAll()
+                }
+                assertEquals(listOf(failed), released)
+                assertEquals(0, completed)
+                coordinator.onRendererFrame()
+                uploader.completeAll()
+                assertEquals(listOf(failed, successor), released)
+                assertEquals(1, completed)
+            }
+        }
+    }
+
+    @Test
+    fun `submission kick failure retains both accepted lanes until consumption or teardown`() {
+        for (destroyBeforeCallbacks in listOf(false, true)) {
+            val uploader = FakeUploader().apply { rejection = "kick" }
+            val released = mutableListOf<CoverageDescriptorPageTicket>()
+            var completed = 0
+            var notifications = 0
+            val coordinator = CoveragePointUploadCoordinator(
+                capacity = 2,
+                uploader = uploader,
+                onUploadPageReleasedWithTicket = released::add,
+                onUploadCompleted = { completed++ },
+                onUploadPageReleased = { notifications++ },
+            )
+            val ticket = CoverageDescriptorPageTicket(1)
+            val successor = CoverageDescriptorPageTicket(2)
+            coordinator.submitPage(page(1f), RendererUploadPageOrigin.ORDINARY, ticket)
+            assertThrows(IllegalStateException::class.java) { coordinator.onRendererFrame() }
+            assertTrue(released.isEmpty())
+            val oldCallbacks = uploader.callbackHistory.toList()
+            val retained = uploader.positionBufferViews.single()
+            val original = retained.get(retained.position())
+            if (destroyBeforeCallbacks) coordinator.destroy()
+            else coordinator.submitPage(page(2f), RendererUploadPageOrigin.ORDINARY, successor)
+            oldCallbacks[1]()
+            oldCallbacks[1]()
+            coordinator.onRendererFrame()
+            assertTrue(released.isEmpty())
+            assertEquals(1, uploader.positionSubmissions.size)
+            assertEquals(original, retained.get(retained.position()), 0f)
+            oldCallbacks[0]()
+            oldCallbacks[0]()
+            assertEquals(listOf(ticket), released)
+            assertEquals(0, completed)
+            assertEquals(if (destroyBeforeCallbacks) 0 else 1, notifications)
+            if (!destroyBeforeCallbacks) {
+                uploader.rejection = null
+                coordinator.onRendererFrame()
+                oldCallbacks.forEach { it() }
+                assertEquals(listOf(ticket), released)
+                uploader.completeAll()
+                assertEquals(listOf(ticket, successor), released)
+                assertEquals(1, completed)
+            }
+        }
+    }
+
+    @Test
+    fun `synchronous callbacks cannot release a page or admit its successor before kick exits`() {
+        for (synchronousLanes in listOf(1, 2, 3)) {
+            val uploader = FakeUploader().apply {
+                consumePositionsSynchronously = synchronousLanes and 1 != 0
+                consumeColorsSynchronously = synchronousLanes and 2 != 0
+            }
+            val released = mutableListOf<CoverageDescriptorPageTicket>()
+            var completed = 0
+            val coordinator = CoveragePointUploadCoordinator(
+                capacity = 2,
+                uploader = uploader,
+                onUploadPageReleasedWithTicket = released::add,
+                onUploadCompleted = { completed++ },
+            )
+            val first = CoverageDescriptorPageTicket(1)
+            val successor = CoverageDescriptorPageTicket(2)
+            uploader.onKick = {
+                assertTrue(released.isEmpty())
+                assertEquals(0, completed)
+                coordinator.submitPage(page(2f), RendererUploadPageOrigin.ORDINARY, successor)
+                coordinator.onRendererFrame()
+                assertEquals(1, uploader.positionSubmissions.size)
+            }
+            coordinator.submitPage(page(1f), RendererUploadPageOrigin.ORDINARY, first)
+            coordinator.onRendererFrame()
+            uploader.completeAll()
+            assertEquals(listOf(first), released)
+            assertEquals(1, completed)
+            uploader.onKick = {}
+            coordinator.onRendererFrame()
+            uploader.completeAll()
+            assertEquals(listOf(first, successor), released)
+            assertEquals(2, completed)
+        }
+    }
+
+    @Test
+    fun `destruction inside synchronous consumption cancels the unsubmitted second lane`() {
+        val uploader = FakeUploader().apply { consumePositionsSynchronously = true }
+        val released = mutableListOf<CoverageDescriptorPageTicket>()
+        var completed = 0
+        var notifications = 0
+        lateinit var destroy: () -> Unit
+        val coordinator = CoveragePointUploadCoordinator(
+            capacity = 2,
+            uploader = uploader,
+            onUploadPageReleasedWithTicket = released::add,
+            onUploadCallback = { destroy() },
+            onUploadCompleted = { completed++ },
+            onUploadPageReleased = { notifications++ },
+        )
+        destroy = coordinator::destroy
+        val ticket = CoverageDescriptorPageTicket(1)
+        coordinator.submitPage(page(1f), RendererUploadPageOrigin.ORDINARY, ticket)
+        coordinator.onRendererFrame()
+        assertEquals(listOf(ticket), released)
+        assertTrue(uploader.colorSubmissions.isEmpty())
+        assertEquals(0, uploader.submissionKickCount)
+        uploader.callbackHistory.single()()
+        coordinator.destroy()
+        assertEquals(listOf(ticket), released)
+        assertEquals(0, completed)
+        assertEquals(0, notifications)
+    }
+
+    @Test
+    fun `queued cancellation installs state before a release callback enqueues its successor`() {
+        for (replaceWithSnapshot in listOf(false, true)) {
+            val uploader = FakeUploader()
+            val released = mutableListOf<CoverageDescriptorPageTicket>()
+            val first = CoverageDescriptorPageTicket(1)
+            val replaced = CoverageDescriptorPageTicket(2)
+            val successor = CoverageDescriptorPageTicket(3)
+            lateinit var enqueueSuccessor: () -> Unit
+            val coordinator = CoveragePointUploadCoordinator(
+                capacity = 2,
+                uploader = uploader,
+                onUploadPageReleasedWithTicket = {
+                    released += it
+                    if (it === first) enqueueSuccessor()
+                },
+            )
+            enqueueSuccessor = {
+                coordinator.submitPage(page(3f), RendererUploadPageOrigin.ORDINARY, successor)
+            }
+            coordinator.submitPage(page(1f), RendererUploadPageOrigin.ORDINARY, first)
+            if (replaceWithSnapshot) {
+                coordinator.submit(snapshot(1, 1f))
+            } else {
+                coordinator.submitPage(page(2f), RendererUploadPageOrigin.ORDINARY, replaced)
+            }
+            val cancelled = if (replaceWithSnapshot) listOf(first) else listOf(first, replaced)
+            assertEquals(cancelled, released)
+            coordinator.onRendererFrame()
+            assertEquals(1, uploader.positionSubmissions.size)
+            assertEquals(3f, uploader.positionSubmissions.single()[0], 0f)
+            uploader.completeAll()
+            assertEquals(cancelled + successor, released)
+        }
+    }
 }
 
 private class FakeUploader : CoveragePointVertexUploader {
@@ -440,6 +739,12 @@ private class FakeUploader : CoveragePointVertexUploader {
     val positionOffsets = mutableListOf<Int>()
     val colorOffsets = mutableListOf<Int>()
     var submissionKickCount = 0
+    var rejection: String? = null
+    var consumePositionsSynchronously = false
+    var consumeColorsSynchronously = false
+    var onKick: () -> Unit = {}
+    val callbackHistory = mutableListOf<() -> Unit>()
+    val positionBufferViews = mutableListOf<FloatBuffer>()
 
     override fun uploadPositions(
         buffer: FloatBuffer,
@@ -447,11 +752,14 @@ private class FakeUploader : CoveragePointVertexUploader {
         elementCount: Int,
         onConsumed: () -> Unit,
     ) {
+        check(rejection != "positions") { "position submission rejected" }
+        positionBufferViews += buffer.duplicate()
         positionOffsets += destOffsetBytes
         val copy = FloatArray(buffer.remaining())
         buffer.duplicate().get(copy)
         positionSubmissions += copy
-        pendingCallbacks += onConsumed
+        callbackHistory += onConsumed
+        if (consumePositionsSynchronously) onConsumed() else pendingCallbacks += onConsumed
     }
 
     override fun uploadColors(
@@ -460,15 +768,19 @@ private class FakeUploader : CoveragePointVertexUploader {
         byteCount: Int,
         onConsumed: () -> Unit,
     ) {
+        check(rejection != "colors") { "color submission rejected" }
         colorOffsets += destOffsetBytes
         val copy = ByteArray(buffer.remaining())
         buffer.duplicate().get(copy)
         colorSubmissions += copy
-        pendingCallbacks += onConsumed
+        callbackHistory += onConsumed
+        if (consumeColorsSynchronously) onConsumed() else pendingCallbacks += onConsumed
     }
 
     override fun kickSubmission() {
         submissionKickCount++
+        onKick()
+        check(rejection != "kick") { "submission kick failed" }
     }
 
     fun completeNext() {

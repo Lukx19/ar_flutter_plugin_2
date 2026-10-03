@@ -382,6 +382,9 @@ internal class CoverageCubeMeshResources(
         private val pendingPages = ArrayDeque<PendingPage>()
         private var uploadBusy = false
         private var consumedCallbackMask = 0
+        private var submittedCallbackMask = 0
+        private var submissionInProgress = false
+        private var activeUploadFailed = false
         private var activeUploadId = 0L
         private var destroyed = false
         private var activeUploadStartedNanos = 0L
@@ -403,10 +406,15 @@ internal class CoverageCubeMeshResources(
             origin: RendererUploadPageOrigin,
             ticket: CoverageDescriptorPageTicket? = null,
         ) {
-            if (destroyed) return
-            pendingPages.clear()
+            if (destroyed) {
+                if (ticket != null) onUploadPageReleasedWithTicket(ticket)
+                return
+            }
+            val cancelledPage = pendingPages.removeFirstOrNull()
             pendingUploads.clear()
             pendingPages.addLast(PendingPage(page, origin, ticket))
+            // Install the replacement before release: its callback may enqueue a newer page.
+            cancelledPage?.ticket?.let(onUploadPageReleasedWithTicket)
         }
 
         private fun enqueue(
@@ -414,6 +422,7 @@ internal class CoverageCubeMeshResources(
             origin: RendererUploadPageOrigin,
         ) {
             if (destroyed) return
+            val cancelledPage = pendingPages.removeFirstOrNull()
             val normalized =
                 if (!hasUploadedSnapshot &&
                     (uploadBusy || pendingRanges.isNotEmpty() || pendingUploads.isNotEmpty()) &&
@@ -430,6 +439,7 @@ internal class CoverageCubeMeshResources(
             }
             pendingUploads.addLast(PendingUpload(normalized, origin))
             if (uploadBusy) pendingRanges.clear()
+            cancelledPage?.ticket?.let(onUploadPageReleasedWithTicket)
         }
 
         /** Rehydrates a new Filament resource generation from the retained cut. */
@@ -443,14 +453,22 @@ internal class CoverageCubeMeshResources(
         }
 
         fun destroy() {
+            if (destroyed) return
             destroyed = true
+            val cancelledPage = pendingPages.removeFirstOrNull()
             pendingUploads.clear()
-            pendingPages.clear()
+            pendingRanges.clear()
+            // Submitted direct storage and its page owner survive until consumption.
+            if (!uploadBusy) releaseActivePage()
+            cancelledPage?.ticket?.let(onUploadPageReleasedWithTicket)
+        }
+
+        private fun releaseActivePage() {
             activeSnapshot = null
             activePage = null
+            val ticket = activePageTicket
             activePageTicket = null
-            pendingRanges.clear()
-            activeFullUpload = false
+            if (ticket != null) onUploadPageReleasedWithTicket(ticket)
         }
 
         fun onRendererFrame() {
@@ -492,41 +510,51 @@ internal class CoverageCubeMeshResources(
                 }
             }
             val range = pendingRanges.removeFirstOrNull() ?: return
-            activePage?.let { page ->
-                writePage(page, page.startSlot)
-            } ?: writeRange(checkNotNull(activeSnapshot), range.startSlot, range.endSlotExclusive)
             uploadBusy = true
             consumedCallbackMask = 0
+            submittedCallbackMask = 0
+            activeUploadFailed = false
+            submissionInProgress = true
             activeUploadStartedNanos = clockNanos()
             val uploadId = ++activeUploadId
-            val startVertex = range.startSlot * VERTICES_PER_VOXEL
-            val vertexCount =
-                (range.endSlotExclusive - range.startSlot) * VERTICES_PER_VOXEL
-            onUploadSubmitted(
-                vertexCount * (POSITION_COMPONENTS * Float.SIZE_BYTES + COLOR_COMPONENTS),
-            )
-            onUploadAttributed(
-                vertexCount * (POSITION_COMPONENTS * Float.SIZE_BYTES + COLOR_COMPONENTS),
-                activeOrigin,
-            )
-            uploader.uploadPositions(
-                positionBuffer,
-                startVertex * POSITION_COMPONENTS * Float.SIZE_BYTES,
-                vertexCount * POSITION_COMPONENTS,
-            ) {
-                consumed(uploadId, POSITION_CALLBACK)
+            try {
+                activePage?.let { page ->
+                    writePage(page, page.startSlot)
+                } ?: writeRange(checkNotNull(activeSnapshot), range.startSlot, range.endSlotExclusive)
+                val startVertex = range.startSlot * VERTICES_PER_VOXEL
+                val vertexCount = (range.endSlotExclusive - range.startSlot) * VERTICES_PER_VOXEL
+                val byteCount = vertexCount * (POSITION_COMPONENTS * Float.SIZE_BYTES + COLOR_COMPONENTS)
+                onUploadSubmitted(byteCount)
+                if (destroyed) return
+                onUploadAttributed(byteCount, activeOrigin)
+                if (destroyed) return
+                submitLane(POSITION_CALLBACK) {
+                    uploader.uploadPositions(
+                        positionBuffer,
+                        startVertex * POSITION_COMPONENTS * Float.SIZE_BYTES,
+                        vertexCount * POSITION_COMPONENTS,
+                    ) { consumed(uploadId, POSITION_CALLBACK) }
+                }
+                if (destroyed) return
+                submitLane(COLOR_CALLBACK) {
+                    uploader.uploadColors(
+                        colorBuffer,
+                        startVertex * COLOR_COMPONENTS,
+                        vertexCount * COLOR_COMPONENTS,
+                    ) { consumed(uploadId, COLOR_CALLBACK) }
+                }
+                if (destroyed) return
+                // A kick failure cannot cancel ownership of either queued lane.
+                uploader.kickSubmission()
+            } catch (error: Throwable) {
+                activeUploadFailed = true
+                hasUploadedSnapshot = false
+                pendingRanges.clear()
+                throw error
+            } finally {
+                submissionInProgress = false
+                settleConsumedUpload()
             }
-            uploader.uploadColors(
-                colorBuffer,
-                startVertex * COLOR_COMPONENTS,
-                vertexCount * COLOR_COMPONENTS,
-            ) {
-                consumed(uploadId, COLOR_CALLBACK)
-            }
-            // Submit the paired position/color page as one bounded unit. The
-            // direct buffers remain owned until Filament delivers both real
-            // consumption callbacks; the kick itself does not wait.
-            uploader.kickSubmission()
         }
 
         private fun writeRange(
@@ -626,33 +654,54 @@ internal class CoverageCubeMeshResources(
             colorBuffer.limit(lastColor)
         }
 
+        private inline fun submitLane(callbackBit: Int, submit: () -> Unit) {
+            // Register first: an uploader may consume synchronously inside submit.
+            submittedCallbackMask = submittedCallbackMask or callbackBit
+            try {
+                submit()
+            } catch (error: Throwable) {
+                // Upload methods reject before accepting ownership when they throw.
+                // Earlier successful lanes still retain their real callback obligations.
+                submittedCallbackMask = submittedCallbackMask and callbackBit.inv()
+                throw error
+            }
+        }
+
         private fun consumed(uploadId: Long, callbackBit: Int) {
+            if (!uploadBusy || uploadId != activeUploadId ||
+                submittedCallbackMask and callbackBit == 0 ||
+                consumedCallbackMask and callbackBit != 0
+            ) return
+            consumedCallbackMask = consumedCallbackMask or callbackBit
             if (destroyed) {
                 onDestroyedUploadCallback()
-                return
+            } else {
+                onUploadCallback()
+                if (!destroyed) onUploadCallbackAttributed(activeOrigin)
             }
-            if (!uploadBusy || uploadId != activeUploadId) return
-            if (consumedCallbackMask and callbackBit != 0) return
-            onUploadCallback()
-            onUploadCallbackAttributed(activeOrigin)
-            consumedCallbackMask = consumedCallbackMask or callbackBit
-            if (consumedCallbackMask == BOTH_CALLBACKS) {
-                val elapsedNanos = (clockNanos() - activeUploadStartedNanos).coerceAtLeast(0L)
+            settleConsumedUpload()
+        }
+
+        private fun settleConsumedUpload() {
+            if (!uploadBusy || submissionInProgress ||
+                consumedCallbackMask and submittedCallbackMask != submittedCallbackMask
+            ) return
+            val completed = !activeUploadFailed && submittedCallbackMask == BOTH_CALLBACKS
+            val origin = activeOrigin
+            val elapsedNanos = (clockNanos() - activeUploadStartedNanos).coerceAtLeast(0L)
+            uploadBusy = false
+            if (pendingRanges.isEmpty()) {
+                if (completed && !destroyed && activeFullUpload) hasUploadedSnapshot = true
+                activeFullUpload = false
+                releaseActivePage()
+            }
+            if (destroyed) return
+            if (completed) {
                 onUploadCompleted(elapsedNanos)
-                onUploadCompletedAttributed(elapsedNanos, activeOrigin)
-                uploadBusy = false
-                if (pendingRanges.isEmpty()) {
-                    if (activeFullUpload) hasUploadedSnapshot = true
-                    activeSnapshot = null
-                    activePage = null
-                    val ticket = activePageTicket
-                    activePageTicket = null
-                    if (ticket != null) onUploadPageReleasedWithTicket(ticket)
-                }
-                onUploadPageReleased()
-                // A completed callback only releases the page. The next page
-                // is admitted by a distinct rendered frame.
+                if (!destroyed) onUploadCompletedAttributed(elapsedNanos, origin)
             }
+            if (!destroyed) onUploadPageReleased()
+            // A completed callback only releases the page; a renderer frame admits the next one.
         }
 
         private fun uploadRanges(
@@ -693,6 +742,13 @@ internal class CoverageCubeMeshResources(
         }
     }
 
+    /**
+     * A throwing upload method rejects that lane before accepting storage ownership.
+     * A successful call owns its buffer until onConsumed, which may run synchronously.
+     * The Filament adapter uses setBufferAt: destroyed-object checks and native overflow
+     * rejection precede queuing the buffer descriptor (Filament 1.71.5 VertexBuffer.cpp).
+     * A throwing kickSubmission does not cancel any already accepted upload.
+     */
     internal interface CoverageCubeVertexUploader {
         fun uploadPositions(
             buffer: FloatBuffer,
