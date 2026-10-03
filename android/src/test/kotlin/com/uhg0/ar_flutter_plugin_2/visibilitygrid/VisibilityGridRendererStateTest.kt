@@ -17,6 +17,26 @@ import org.openjdk.jol.info.GraphLayout
 
 class VisibilityGridRendererStateTest {
     @Test
+    fun `packed visibility generations remain unsigned and copied across patches`() {
+        val state = VisibilityGridRendererState(capacity = 1)
+        val key = packVisibilityGridKey(0, 0, 0)
+        state.startGroup(group(1), geometryRevision = 4, restoredKeys = longArrayOf(key))
+        var revision = 0L
+        for (generation in longArrayOf(0x7fff_ffffL, 0x8000_0000L, 0xffff_ffffL)) {
+            val row = CoverageRendererStyleRowV1(semanticGeneration = generation, styleGeneration = generation,
+                coverage = CoverageRendererCoverage.COMPLETE)
+            val bytes = row.encode()
+            assertTrue(state.applyVisibility(4, ++revision, longArrayOf(key), bytes))
+            bytes.fill(0)
+            assertArrayEquals(row.encode(), state.snapshot().styleRows)
+            assertFalse(state.applyVisibility(4, revision + 1, longArrayOf(key),
+                row.copy(semanticGeneration = generation - 1).encode()))
+            assertFalse(state.applyVisibility(4, revision + 1, longArrayOf(key),
+                row.copy(styleGeneration = generation - 1).encode()))
+        }
+    }
+
+    @Test
     fun `scalar voxel coordinates preserve signed boundaries and component validation`() {
         val coordinates = intArrayOf(-1_048_576, -1, 0, 1, 1_048_575)
         for (x in coordinates) for (y in coordinates) for (z in coordinates) {

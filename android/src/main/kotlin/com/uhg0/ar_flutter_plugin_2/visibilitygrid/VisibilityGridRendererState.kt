@@ -397,12 +397,10 @@ class VisibilityGridRendererState(
         snapshot.keys.indices.forEach { source ->
             val row = rowsByIdentity[snapshot.keys[source]] ?: return@forEach
             val styleOffset = source * COVERAGE_RENDERER_STYLE_ROW_BYTES
-            val encoded = snapshot.styleRows.copyOfRange(
-                styleOffset,
-                styleOffset + COVERAGE_RENDERER_STYLE_ROW_BYTES,
-            )
-            encoded.copyInto(styleRows, row * COVERAGE_RENDERER_STYLE_ROW_BYTES)
-            setColor(row, CoverageRendererStyleRowV1.decode(encoded).packedColor())
+            val color = CoverageRendererStyleRowV1.validatedPackedColor(snapshot.styleRows, styleOffset)
+            snapshot.styleRows.copyInto(styleRows, row * COVERAGE_RENDERER_STYLE_ROW_BYTES,
+                styleOffset, styleOffset + COVERAGE_RENDERER_STYLE_ROW_BYTES)
+            setColor(row, color)
         }
         dirtyRows.addRange(count)
         resetUpload = true
@@ -595,21 +593,21 @@ class VisibilityGridRendererState(
         ) {
             return false
         }
-        val decoded = Array(patchKeys.size) { index ->
-            CoverageRendererStyleRowV1.decode(
-                patchStyleRows,
-                index * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-            )
+        for (index in patchKeys.indices) {
+            CoverageRendererStyleRowV1.validateEncoded(patchStyleRows, index * COVERAGE_RENDERER_STYLE_ROW_BYTES)
         }
-        if (!CoverageRendererStyleRowV1.hasCoherentGenerations(decoded.asIterable())) {
-            return false
+        for (index in 1 until patchKeys.size) {
+            val offset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
+            if (patchStyleRows.styleGenerationAt(offset + 8) != patchStyleRows.styleGenerationAt(8) ||
+                patchStyleRows.styleGenerationAt(offset + 12) != patchStyleRows.styleGenerationAt(12)
+            ) return false
         }
         patchKeys.indices.forEach { index ->
             val row = rowsByIdentity[patchKeys[index]] ?: return@forEach
-            val current = styleAt(row)
-            val next = decoded[index]
-            if (next.semanticGeneration < current.semanticGeneration ||
-                next.styleGeneration < current.styleGeneration
+            val source = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
+            val current = row * COVERAGE_RENDERER_STYLE_ROW_BYTES
+            if (patchStyleRows.styleGenerationAt(source + 8) < styleRows.styleGenerationAt(current + 8) ||
+                patchStyleRows.styleGenerationAt(source + 12) < styleRows.styleGenerationAt(current + 12)
             ) return false
         }
         patchKeys.indices.forEach { index ->
@@ -618,12 +616,13 @@ class VisibilityGridRendererState(
                 ignoredVisibilityKeyCount++
                 return@forEach
             }
-            val next = decoded[index]
-            val encoded = next.encode()
+            val source = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
             val styleOffset = row * COVERAGE_RENDERER_STYLE_ROW_BYTES
-            val color = next.packedColor()
-            if (!styleRows.regionMatches(styleOffset, encoded) || colorAt(row) != color) {
-                encoded.copyInto(styleRows, styleOffset)
+            val color = CoverageRendererStyleRowV1.validatedPackedColor(patchStyleRows, source)
+            if (!styleRows.regionMatches(styleOffset, patchStyleRows, source, COVERAGE_RENDERER_STYLE_ROW_BYTES) ||
+                colorAt(row) != color
+            ) {
+                patchStyleRows.copyInto(styleRows, styleOffset, source, source + COVERAGE_RENDERER_STYLE_ROW_BYTES)
                 setColor(row, color)
                 dirtyRows.add(row)
             }
@@ -705,7 +704,6 @@ class VisibilityGridRendererState(
         }
 
         var previousSurfaceId = 0L
-        val decoded = arrayOfNulls<CoverageRendererStyleRowV1>(rowCount)
         for (index in 0 until rowCount) {
             val surfaceId = candidate.surfaceIds[index]
             if (surfaceId !in 1 until 0x1_0000_0000L) {
@@ -721,8 +719,8 @@ class VisibilityGridRendererState(
             if (!rowsByIdentity.containsKey(surfaceId)) {
                 return RendererStyleCutResult.Rejected(RendererStyleCutRejection.UNKNOWN_SURFACE_ID)
             }
-            decoded[index] = try {
-                CoverageRendererStyleRowV1.decode(
+            try {
+                CoverageRendererStyleRowV1.validateEncoded(
                     candidate.styleRows,
                     index * COVERAGE_RENDERER_STYLE_ROW_BYTES,
                 )
@@ -730,14 +728,15 @@ class VisibilityGridRendererState(
                 return RendererStyleCutResult.Rejected(RendererStyleCutRejection.MALFORMED_STYLE)
             }
         }
-        val rows = decoded.map { requireNotNull(it) }
-        if (!CoverageRendererStyleRowV1.hasCoherentGenerations(rows)) {
-            return RendererStyleCutResult.Rejected(RendererStyleCutRejection.MIXED_STYLE_GENERATION)
+        for (index in 1 until rowCount) {
+            val offset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
+            if (candidate.styleRows.styleGenerationAt(offset + 8) != candidate.styleRows.styleGenerationAt(8) ||
+                candidate.styleRows.styleGenerationAt(offset + 12) != candidate.styleRows.styleGenerationAt(12)
+            ) return RendererStyleCutResult.Rejected(RendererStyleCutRejection.MIXED_STYLE_GENERATION)
         }
-        if (rows.any {
-                it.semanticGeneration != candidate.semanticRevision ||
-                    it.styleGeneration != candidate.styleRevision
-            }
+        if (rowCount > 0 &&
+            (candidate.styleRows.styleGenerationAt(8) != candidate.semanticRevision ||
+                candidate.styleRows.styleGenerationAt(12) != candidate.styleRevision)
         ) {
             return RendererStyleCutResult.Rejected(RendererStyleCutRejection.MALFORMED_STYLE)
         }
@@ -747,19 +746,17 @@ class VisibilityGridRendererState(
             return RendererStyleCutResult.Rejected(RendererStyleCutRejection.TARGET_NOT_SUPPLIED)
         }
         val targetIndex = candidate.targetSurfaceId?.let(candidate.surfaceIds::indexOf)
-        if (targetIndex != null) {
-            val targetRow = rows[targetIndex]
-            if (targetRow.target != CoverageRendererTarget.PRIMARY ||
-                targetRow.directionBin != candidate.targetDirectionIndex ||
-                targetRow.glyph != CoverageRendererGlyph.DESIRED_DIRECTION ||
-                rows.indices.any { index ->
-                    index != targetIndex && rows[index].target != CoverageRendererTarget.NONE
-                }
+        for (index in 0 until rowCount) {
+            val offset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
+            val target = (candidate.styleRows[offset + 1].toInt() ushr 6) and 3
+            val expectedTarget = if (index == targetIndex) CoverageRendererTarget.PRIMARY else CoverageRendererTarget.NONE
+            if (target != expectedTarget.code || (index == targetIndex &&
+                    ((candidate.styleRows[offset + 4].toInt() and 0xff) != candidate.targetDirectionIndex ||
+                        CoverageRendererStyleRowV1.validatedGlyph(candidate.styleRows, offset) !=
+                        CoverageRendererGlyph.DESIRED_DIRECTION))
             ) {
                 return RendererStyleCutResult.Rejected(RendererStyleCutRejection.MALFORMED_STYLE)
             }
-        } else if (rows.any { it.target != CoverageRendererTarget.NONE }) {
-            return RendererStyleCutResult.Rejected(RendererStyleCutRejection.MALFORMED_STYLE)
         }
         if (candidate.reset && !hasExactlyCurrentSurfaceIds(candidate.surfaceIds)) {
             return RendererStyleCutResult.Rejected(RendererStyleCutRejection.INCOMPLETE_RESET)
@@ -801,13 +798,12 @@ class VisibilityGridRendererState(
             val row = checkNotNull(rowsByIdentity[candidate.surfaceIds[index]])
             val encodedOffset = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
             val styleOffset = row * COVERAGE_RENDERER_STYLE_ROW_BYTES
-            val encoded = candidate.styleRows.copyOfRange(
-                encodedOffset,
-                encodedOffset + COVERAGE_RENDERER_STYLE_ROW_BYTES,
-            )
-            val nextColor = rows[index].packedColor()
-            if (!styleRows.regionMatches(styleOffset, encoded) || colorAt(row) != nextColor) {
-                encoded.copyInto(styleRows, styleOffset)
+            val nextColor = CoverageRendererStyleRowV1.validatedPackedColor(candidate.styleRows, encodedOffset)
+            if (!styleRows.regionMatches(styleOffset, candidate.styleRows, encodedOffset, COVERAGE_RENDERER_STYLE_ROW_BYTES) ||
+                colorAt(row) != nextColor
+            ) {
+                candidate.styleRows.copyInto(styleRows, styleOffset, encodedOffset,
+                    encodedOffset + COVERAGE_RENDERER_STYLE_ROW_BYTES)
                 setColor(row, nextColor)
                 dirtyRows.add(row)
                 changedRows++
@@ -1367,9 +1363,17 @@ class VisibilityGridRendererState(
             row * COVERAGE_RENDERER_STYLE_ROW_BYTES,
         )
 
-    private fun ByteArray.regionMatches(offset: Int, other: ByteArray): Boolean {
-        for (index in other.indices) {
-            if (this[offset + index] != other[index]) return false
+    /** Unsigned generation read from a row already accepted by validateEncoded. */
+    private fun ByteArray.styleGenerationAt(offset: Int): Long =
+        (this[offset].toLong() and 0xff) or
+            ((this[offset + 1].toLong() and 0xff) shl 8) or
+            ((this[offset + 2].toLong() and 0xff) shl 16) or
+            ((this[offset + 3].toLong() and 0xff) shl 24)
+
+    private fun ByteArray.regionMatches(offset: Int, other: ByteArray, otherOffset: Int = 0,
+        length: Int = other.size): Boolean {
+        for (index in 0 until length) {
+            if (this[offset + index] != other[otherOffset + index]) return false
         }
         return true
     }

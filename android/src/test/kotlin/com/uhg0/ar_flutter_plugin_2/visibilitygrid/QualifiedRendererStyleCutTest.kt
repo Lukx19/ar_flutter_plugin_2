@@ -12,6 +12,70 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class QualifiedRendererStyleCutTest {
+    @Test
+    fun `packed style cut preserves every palette and cut color projection`() {
+        for (palette in com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette.values()) {
+            for (cutState in com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererCut.values()) {
+                val state = stateWithRows()
+                val first = style(coverage = CoverageRendererCoverage.COMPLETE).copy(
+                    palette = palette, cut = cutState, lineageCount = 65535,
+                    glyph = CoverageRendererGlyph.VIEW_ROSE, directionBin = 23,
+                )
+                val second = style(coverage = CoverageRendererCoverage.PARTIAL).copy(
+                    palette = palette, cut = cutState, glyph = CoverageRendererGlyph.NORMAL,
+                )
+                assertTrue(state.applyStyleCut(cut(true, longArrayOf(1, 2), arrayOf(first, second))) is RendererStyleCutResult.Applied)
+                val snapshot = state.snapshot()
+                assertArrayEquals(styles(first, second), snapshot.styleRows)
+                assertArrayEquals(intArrayOf(first.packedColor(), second.packedColor()), snapshot.colors)
+                state.dispose()
+            }
+        }
+    }
+
+    @Test
+    fun `packed cut keeps malformed validation ahead of mixed generation rejection`() {
+        val state = stateWithRows()
+        val baseline = state.snapshot()
+        val mixed = cut(true, longArrayOf(1, 2), arrayOf(style(), style(styleGeneration = 2)))
+        assertEquals(RendererStyleCutResult.Rejected(RendererStyleCutRejection.MIXED_STYLE_GENERATION),
+            state.applyStyleCut(mixed))
+        val malformed = mixed.copy(styleRows = mixed.styleRows.copyOf().also { it[16 + 5] = 1 })
+        assertEquals(RendererStyleCutResult.Rejected(RendererStyleCutRejection.MALFORMED_STYLE),
+            state.applyStyleCut(malformed))
+        val snapshot = state.snapshot()
+        assertArrayEquals(baseline.styleRows, snapshot.styleRows)
+        assertEquals(baseline.revision, snapshot.revision)
+        assertTrue(snapshot.update!!.spans.isEmpty())
+    }
+
+    @Test
+    fun `caller edits and later cuts preserve held descriptor and exact replay receipt`() {
+        val state = stateWithRows()
+        val original = cut(true, longArrayOf(1, 2), arrayOf(style(), style(coverage = CoverageRendererCoverage.COMPLETE)))
+        val replay = original.copy(surfaceIds = original.surfaceIds.copyOf(), styleRows = original.styleRows.copyOf())
+        assertTrue(state.applyStyleCut(original) is RendererStyleCutResult.Applied)
+        val qualifier = com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRowsQualifier(
+            activeOwnership.bindingGeneration, activeOwnership.groupGeneration, 0, 9, 7, 1,
+        )
+        val held = requireNotNull(state.presentationDescriptor(qualifier,
+            com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationMode.SEMANTIC_CENTROIDS,
+            true, intArrayOf(0, 1), com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette.COVERAGE))
+        val heldBytes = held.styleRows
+        original.surfaceIds.fill(0)
+        original.styleRows.fill(0)
+        assertEquals(RendererStyleCutResult.Replayed(1), state.applyStyleCut(replay))
+        val later = replay.copy(semanticRevision = 2, coverageRevision = 2, styleRevision = 2,
+            residencyRevision = 2, targetRevision = 2,
+            styleRows = styles(style(semanticGeneration = 2, styleGeneration = 2),
+                style(semanticGeneration = 2, styleGeneration = 2)))
+        assertTrue(state.applyStyleCut(later) is RendererStyleCutResult.Applied)
+        later.styleRows.fill(0)
+        assertArrayEquals(heldBytes, held.styleRows)
+        assertArrayEquals(styles(style(semanticGeneration = 2, styleGeneration = 2),
+            style(semanticGeneration = 2, styleGeneration = 2)), state.snapshot().styleRows)
+        org.junit.Assert.assertFalse(held.withPage(qualifier, 0, 2) { error("superseded style qualifier must be rejected") })
+    }
     private val activeOwnership = ownership()
 
     @Test

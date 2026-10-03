@@ -62,6 +62,16 @@ data class RendererStyleCutPayloadV1(
     fun canonicalBytes(): ByteArray {
         val bytes = ByteArray(CANONICAL_HEADER_BYTES + surfaceIds.size * RECORD_BYTES)
         val data = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+        writeCanonicalHeader(data)
+        surfaceIds.forEachIndexed { index, surfaceId ->
+            data.putLong(surfaceId)
+            data.put(styleRows, index * RendererStyleCommandV1.STYLE_ROW_BYTES,
+                RendererStyleCommandV1.STYLE_ROW_BYTES)
+        }
+        return bytes
+    }
+
+    private fun writeCanonicalHeader(data: ByteBuffer) {
         data.put(captureGroupId)
         data.putLong(bindingGeneration)
         data.putLong(groupGeneration)
@@ -79,24 +89,29 @@ data class RendererStyleCutPayloadV1(
         data.putLong(targetSurfaceId ?: NO_TARGET_SURFACE_ID)
         data.putInt(targetDirectionIndex ?: NO_TARGET_DIRECTION)
         data.putInt(surfaceIds.size)
-        surfaceIds.forEachIndexed { index, surfaceId ->
-            data.putLong(surfaceId)
-            data.put(styleRows, index * RendererStyleCommandV1.STYLE_ROW_BYTES,
-                RendererStyleCommandV1.STYLE_ROW_BYTES)
-        }
-        return bytes
     }
 
-    fun completeDigest(): ByteArray = sha256(canonicalBytes())
+    /** Hash the canonical stream with fixed scratch, independent of the row count. */
+    fun completeDigest(): ByteArray {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val scratch = ByteArray(CANONICAL_HEADER_BYTES)
+        val data = ByteBuffer.wrap(scratch).order(ByteOrder.LITTLE_ENDIAN)
+        writeCanonicalHeader(data)
+        digest.update(scratch)
+        for (index in surfaceIds.indices) {
+            data.putLong(0, surfaceIds[index])
+            digest.update(scratch, 0, Long.SIZE_BYTES)
+            digest.update(styleRows, index * RendererStyleCommandV1.STYLE_ROW_BYTES,
+                RendererStyleCommandV1.STYLE_ROW_BYTES)
+        }
+        return digest.digest()
+    }
 
     private companion object {
         const val CANONICAL_HEADER_BYTES = 116
         const val RECORD_BYTES = 8 + RendererStyleCommandV1.STYLE_ROW_BYTES
         const val NO_TARGET_SURFACE_ID = -1L
         const val NO_TARGET_DIRECTION = -1
-
-        fun sha256(bytes: ByteArray): ByteArray =
-            MessageDigest.getInstance("SHA-256").digest(bytes)
     }
 }
 

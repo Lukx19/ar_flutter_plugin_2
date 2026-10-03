@@ -17,6 +17,38 @@ import org.junit.Test
 
 class RendererStyleCommandV1Test {
     @Test
+    fun `streaming complete digest matches canonical bytes for empty boundary and maximum cuts`() {
+        for (count in intArrayOf(0, 1, 2, 127, RendererStyleCommandV1.MAX_ROWS)) {
+            for (reset in listOf(false, true)) {
+                val cut = RendererStyleCutPayloadV1(
+                    captureGroupId = ByteArray(16) { (it * 17).toByte() },
+                    bindingGeneration = Long.MAX_VALUE,
+                    groupGeneration = 0,
+                    transactionId = 0x8000_0000L,
+                    geometryRevision = Long.MAX_VALUE - 1,
+                    lineageRevision = 0,
+                    semanticRevision = 0xffff_ffffL,
+                    coverageRevision = 23,
+                    styleRevision = 29,
+                    residencyRevision = 31,
+                    targetRevision = 37,
+                    reset = reset,
+                    surfaceIds = LongArray(count) { Long.MAX_VALUE - count + it },
+                    styleRows = ByteArray(count * RendererStyleCommandV1.STYLE_ROW_BYTES) { (it * 31).toByte() },
+                    targetSurfaceId = if (reset && count > 0) Long.MAX_VALUE - 1 else null,
+                    targetDirectionIndex = if (reset && count > 0) 23 else null,
+                )
+                val canonical = cut.canonicalBytes()
+                val digest = cut.completeDigest()
+                assertArrayEquals(MessageDigest.getInstance("SHA-256").digest(canonical), digest)
+                if (count > 0) cut.styleRows[cut.styleRows.lastIndex] = (cut.styleRows.last().toInt() xor 1).toByte()
+                assertArrayEquals(MessageDigest.getInstance("SHA-256").digest(cut.canonicalBytes()), cut.completeDigest())
+                assertArrayEquals(MessageDigest.getInstance("SHA-256").digest(canonical), digest)
+            }
+        }
+    }
+
+    @Test
     fun `renderer style source range excludes surrounding bytes and retains an exact owned page`() {
         val expected = hex(fixture().getValue("pageHex").jsonPrimitive.content)
         val source = ByteArray(expected.size + 26) { 0x5a }
