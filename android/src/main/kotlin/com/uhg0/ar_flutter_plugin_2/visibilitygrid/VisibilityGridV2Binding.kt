@@ -7,6 +7,7 @@ import com.uhg0.ar_flutter_plugin_2.util.toLowercaseHex
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineAuthority
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineScopeV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommitReceiptQueryV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.DirectStandardMethodCodec
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlCodec
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlLifecycle
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlOperation
@@ -124,6 +125,7 @@ class VisibilityGridV2Binding internal constructor(
     private val controlChannel = MethodChannel(
         messenger,
         "visibility_grid_v2_control_$viewId",
+        DirectStandardMethodCodec,
     )
     private var nativeStreamToken = newOpaqueToken()
     private var workerBindingToken = newOpaqueToken()
