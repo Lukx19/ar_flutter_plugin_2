@@ -7,6 +7,7 @@ import java.nio.file.Files
 import java.security.MessageDigest
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -44,6 +45,15 @@ class NativeCapturePreviewReaderV2Test {
             val reader = NativeCapturePreviewReaderV2(root)
             assertTrue(reader.materializeJpegPreview(manifestId, captureId, target))
             assertArrayEquals(image, target.readBytes())
+
+            val retainedRoot = File(session, "objects/$manifestId.root")
+            retainedRoot.writeText(rootText.replace("revision=1", "revision=2"))
+            assertFalse(reader.materializeJpegPreview(manifestId, captureId, target))
+            retainedRoot.writeText(rootText)
+            assertTrue(reader.materializeJpegPreview(manifestId, captureId, target))
+            File(session, "root-A.ptr").writeText("2\n$manifestId\n${"e".repeat(64)}\n")
+            assertFalse(reader.materializeJpegPreview(manifestId, captureId, target))
+            File(session, "root-A.ptr").writeText("1\n$manifestId\n${"e".repeat(64)}\n")
 
             // A damaged display copy is replaced only after its durable hash
             // fails; the source bytes remain the immutable authority.

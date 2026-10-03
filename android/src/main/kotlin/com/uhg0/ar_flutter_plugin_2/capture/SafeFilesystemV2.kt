@@ -30,6 +30,30 @@ interface DescriptorFileV2 : AutoCloseable {
     fun sync()
 }
 
+/** Immutable lexical components. Reusing these never skips backend no-follow traversal. */
+internal class RelativeComponentsV2 private constructor(
+    internal val nativeArray: Array<String>,
+) : AbstractList<String>() {
+    override val size: Int get() = nativeArray.size
+    override fun get(index: Int): String = nativeArray[index]
+    constructor(segments: List<String>) : this(segments.toTypedArray())
+    fun child(names: Array<out String>) = RelativeComponentsV2(
+        Array(size + names.size) { if (it < size) nativeArray[it] else names[it - size] },
+    )
+}
+
+private fun List<String>.nativeComponents(): Array<String> =
+    if (this is RelativeComponentsV2) nativeArray else toTypedArray()
+
+private class RootRelativeFileV2(
+    path: String,
+    val owner: Any,
+    val components: RelativeComponentsV2,
+    private val rootedParent: File?,
+) : File(path) {
+    override fun getParentFile(): File? = rootedParent
+}
+
 /** A backend is rebound once to a trusted root; all later operations are root-relative. */
 interface DescriptorFilesystemV2 : AutoCloseable {
     /** Returns a new backend that exclusively owns the root resource. The receiver remains borrowed. */
@@ -106,30 +130,30 @@ class AndroidDescriptorFilesystemV2 private constructor(private val rootDescript
         return requireNotNull(rootDescriptor) { "Descriptor filesystem is not root-bound" }
     }
     private inline fun <T> withRoot(block: (Long) -> T): T = synchronized(lock) { block(root()) }
-    override fun ensureDirectory(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeEnsureDirectory(it, segments.toTypedArray()) }
-    override fun isRegularFile(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeIsRegular(it, segments.toTypedArray()) }
-    override fun isDirectory(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeIsDirectory(it, segments.toTypedArray()) }
-    override fun size(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeSize(it, segments.toTypedArray()) }
+    override fun ensureDirectory(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeEnsureDirectory(it, segments.nativeComponents()) }
+    override fun isRegularFile(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeIsRegular(it, segments.nativeComponents()) }
+    override fun isDirectory(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeIsDirectory(it, segments.nativeComponents()) }
+    override fun size(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeSize(it, segments.nativeComponents()) }
     override fun allocatedSize(segments: List<String>) = withRoot {
         androidPhysicalBytesFromStatBlocks(
-            AndroidDescriptorNativeV2.nativeAllocatedBlocks(it, segments.toTypedArray())
+            AndroidDescriptorNativeV2.nativeAllocatedBlocks(it, segments.nativeComponents())
         )
     }
     override fun allocationUnit(segments: List<String>) = withRoot {
-        AndroidDescriptorNativeV2.nativeAllocationUnit(it, segments.toTypedArray())
+        AndroidDescriptorNativeV2.nativeAllocationUnit(it, segments.nativeComponents())
     }
     override fun openRead(segments: List<String>): DescriptorFileV2 =
-        withRoot { AndroidNativeFileV2(AndroidDescriptorNativeV2.nativeOpenRead(it, segments.toTypedArray())) }
+        withRoot { AndroidNativeFileV2(AndroidDescriptorNativeV2.nativeOpenRead(it, segments.nativeComponents())) }
     override fun createExclusive(segments: List<String>): DescriptorFileV2 =
-        withRoot { AndroidNativeFileV2(AndroidDescriptorNativeV2.nativeCreateExclusive(it, segments.toTypedArray())) }
+        withRoot { AndroidNativeFileV2(AndroidDescriptorNativeV2.nativeCreateExclusive(it, segments.nativeComponents())) }
     override fun allocateExclusive(segments: List<String>, bytes: Long) = withRoot {
-        AndroidDescriptorNativeV2.nativeAllocateExclusive(it, segments.toTypedArray(), bytes)
+        AndroidDescriptorNativeV2.nativeAllocateExclusive(it, segments.nativeComponents(), bytes)
     }
-    override fun atomicReplace(parent: List<String>, from: String, to: String) = withRoot { AndroidDescriptorNativeV2.nativeAtomicReplace(it, parent.toTypedArray(), from, to) }
-    override fun atomicMove(fromParent: List<String>, from: String, toParent: List<String>, to: String) = withRoot { AndroidDescriptorNativeV2.nativeAtomicMove(it, fromParent.toTypedArray(), from, toParent.toTypedArray(), to) }
-    override fun delete(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeDelete(it, segments.toTypedArray()) }
-    override fun list(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeList(it, segments.toTypedArray()).toList() }
-    override fun syncDirectory(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeSyncDirectory(it, segments.toTypedArray()) }
+    override fun atomicReplace(parent: List<String>, from: String, to: String) = withRoot { AndroidDescriptorNativeV2.nativeAtomicReplace(it, parent.nativeComponents(), from, to) }
+    override fun atomicMove(fromParent: List<String>, from: String, toParent: List<String>, to: String) = withRoot { AndroidDescriptorNativeV2.nativeAtomicMove(it, fromParent.nativeComponents(), from, toParent.nativeComponents(), to) }
+    override fun delete(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeDelete(it, segments.nativeComponents()) }
+    override fun list(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeList(it, segments.nativeComponents()).toList() }
+    override fun syncDirectory(segments: List<String>) = withRoot { AndroidDescriptorNativeV2.nativeSyncDirectory(it, segments.nativeComponents()) }
     override fun close() = synchronized(lock) {
         if (closed.compareAndSet(false, true)) rootDescriptor?.let(AndroidDescriptorNativeV2::nativeClose)
     }
@@ -277,10 +301,19 @@ class SafeFilesystemV2(
     // One synchronized workspace serves metadata reads, component copies, and
     // digest checks on this root; callers retain only independent result bytes.
     private val copyWorkspace = CaptureCopyWorkspace()
+    private val pathOwner = Any()
+    private val rootFile = RootRelativeFileV2(rootPath.toString(), pathOwner, RelativeComponentsV2(emptyList()), null)
 
-    fun child(vararg names: String): File {
+    fun child(vararg names: String): File = child(rootFile, *names)
+
+    fun child(base: File, vararg names: String): File {
         names.forEach(::validateSegment)
-        return rootPath.resolve(names.joinToString(File.separator)).normalize().toFile().also(::requireContained)
+        var parent: File = ownedPath(base)
+        for (name in names) {
+            val components = (parent as RootRelativeFileV2).components.child(arrayOf(name))
+            parent = RootRelativeFileV2(parent.path + File.separator + name, pathOwner, components, parent)
+        }
+        return parent
     }
     fun ensureDirectory(directory: File) = backend.ensureDirectory(relative(directory))
     fun isFile(file: File) = backend.isRegularFile(relative(file))
@@ -301,7 +334,9 @@ class SafeFilesystemV2(
         return output.toByteArray()
     }
     fun readLines(file: File) = readBytes(file).toString(Charsets.UTF_8).lines().dropLastWhile(String::isEmpty)
-    fun list(directory: File): List<File> = backend.list(relative(directory)).map { name -> validateSegment(name); File(directory, name).also(::requireContained) }
+    internal fun <T> readDescriptor(file: File, read: (DescriptorFileV2) -> T): T =
+        backend.openRead(relative(file)).use(read)
+    fun list(directory: File): List<File> = backend.list(relative(directory)).map { name -> child(directory, name) }
     fun walk(directory: File): Sequence<File> = sequence {
         yield(directory); if (backend.isDirectory(relative(directory))) for (child in list(directory)) { yield(child); if (backend.isDirectory(relative(child))) yieldAll(walk(child).drop(1)) }
     }
@@ -367,16 +402,22 @@ class SafeFilesystemV2(
     private fun syncParent(file: File) = backend.syncDirectory(parentSegments(file))
     private fun parentSegments(file: File) = relative(requireNotNull(file.parentFile))
     private fun relative(file: File): List<String> {
+        if (file is RootRelativeFileV2 && file.owner === pathOwner) return file.components
         val path = rootPath.relativize(containedPath(file))
-        if (path.toString().isEmpty()) return emptyList()
-        return path.map { it.toString().also(::validateSegment) }
+        if (path.toString().isEmpty()) return rootFile.components
+        return RelativeComponentsV2(path.map { it.toString().also(::validateSegment) })
     }
+    private fun ownedPath(file: File): File =
+        if (file is RootRelativeFileV2 && file.owner === pathOwner) file
+        else child(*relative(file).toTypedArray())
     private fun containedPath(file: File): java.nio.file.Path {
         val path = file.absoluteFile.toPath().normalize()
         require(path.startsWith(rootPath))
         return path
     }
-    private fun requireContained(file: File) { containedPath(file) }
+    private fun requireContained(file: File) {
+        if (file !is RootRelativeFileV2 || file.owner !== pathOwner) containedPath(file)
+    }
     private fun validateSegment(name: String) {
         // Authenticated group-local activation attempts need 174 ASCII characters. The 240
         // ceiling admits that canonical name while retaining margin below Windows' 255 limit.

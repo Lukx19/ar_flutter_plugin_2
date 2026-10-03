@@ -51,6 +51,7 @@ class DurableSessionStoreV2(
     private val sessionRoot = files.child("sessions")
     private val recoveryIndex = files.child("recovery-index.properties")
     private val uncertainRootHashes = mutableSetOf<String>()
+    private val rootMetadata = CaptureRootMetadataReaderV2()
 
     init {
         try { files.ensureDirectory(sessionRoot) }
@@ -80,11 +81,8 @@ class DurableSessionStoreV2(
         var source: File? = null
         for (location in locations) {
             if (manifestId !in retainedRootHashes(location)) continue
-            val rootFile = path(location, "objects", "$manifestId.root")
-            val jpegHash = files.readLines(rootFile)
-                .firstOrNull { it.startsWith("component=JPEG:") }
-                ?.substringAfterLast(':')
-                ?.takeIf(SAFE_HASH::matches)
+            val jpegHash = readRootMetadata(location, manifestId)?.components
+                ?.firstOrNull { it.kind == "JPEG" }?.hash
                 ?: continue
             val asset = path(location, "assets", captureId)
             source = path(asset, "jpeg.$jpegHash.blob").takeIf(files::isFile)
@@ -640,9 +638,8 @@ class DurableSessionStoreV2(
         val property = if (kind == CaptureComponentKind.JPEG) "jpegSizeBytes" else "dngSizeBytes"
         receipt.getProperty(property)?.let { return it.toLong().also { size -> require(size > 0) } }
         val rootHash = receipt.getProperty("rootHash") ?: return null
-        val root = path(location, "objects", "$rootHash.root")
-        return files.readLines(root).singleOrNull { it.startsWith("component=${kind.name}:") }
-            ?.substringAfter(':')?.substringBefore(':')?.toLong()?.also { require(it > 0) }
+        return readRootMetadata(location, rootHash)?.components
+            ?.singleOrNull { it.kind == kind.name }?.length?.also { require(it > 0) }
     }
     private fun acceptedHash(attempt: CaptureAcceptedAttempt) = sha256("${attempt.identity.commitId}|${attempt.identity.attemptId}|${attempt.reservation.totalStoreLiability}|${attempt.canonicalIntentHash.hex()}".toByteArray()).hex()
 
@@ -715,26 +712,41 @@ class DurableSessionStoreV2(
         if (prior.requestHash == requestHash(request)) return prior
         throw DurableStoreConflictV2("Changed replay conflicts with durable terminal identity")
     }
-    private fun selectedRoot(location: File): RootPointer? = listOf("root-A.ptr", "root-B.ptr").mapNotNull { file ->
-        path(location, file).takeIf(files::isFile)?.let(files::readLines)?.takeIf { it.size == 3 }?.let {
-            RootPointer(it[0].toLongOrNull() ?: return@let null, it[1], it[2], if (file == "root-A.ptr") "A" else "B", rootPrevious(location, it[1]))
+    private fun selectedRoot(location: File): RootPointer? {
+        var selected: RootPointer? = null
+        for (slot in 0..1) {
+            val file = path(location, if (slot == 0) "root-A.ptr" else "root-B.ptr")
+            if (!files.isFile(file)) continue
+            val pointer = files.readDescriptor(file) { rootMetadata.pointer(it::read) } ?: continue
+            if (pointer.hash in uncertainRootHashes) continue
+            val candidate = RootPointer(pointer.revision, pointer.hash, pointer.commit,
+                if (slot == 0) "A" else "B", rootPrevious(location, pointer.hash))
+            if (!validRoot(location, candidate)) continue
+            val prior = selected
+            if (prior != null && prior.revision == candidate.revision && prior.rootHash != candidate.rootHash) {
+                throw DurableStoreConflictV2("Schema-5 root fork")
+            }
+            if (prior == null || candidate.revision > prior.revision) selected = candidate
         }
-    }.filter { it.rootHash !in uncertainRootHashes && validRoot(location, it) }.let { candidates ->
-        candidates.groupBy { it.revision }.values.forEach { same -> if (same.map { it.rootHash }.toSet().size > 1) throw DurableStoreConflictV2("Schema-5 root fork") }
-        candidates.maxByOrNull { it.revision }
+        return selected
     }
-    private fun rootPrevious(location: File, hash: String): String? = path(location, "objects", "$hash.root").takeIf(files::isFile)?.let(files::readLines)?.firstOrNull { it.startsWith("previous=") }?.removePrefix("previous=")?.takeUnless { it == "-" }
+    private fun readRootMetadata(location: File, hash: String): CaptureRootMetadataV2? {
+        if (!CaptureRootMetadataReaderV2.isHash(hash)) return null
+        val file = path(location, "objects", "$hash.root")
+        if (!files.isFile(file)) return null
+        return files.readDescriptor(file) { rootMetadata.root(hash, it::read) }
+    }
+    private fun rootPrevious(location: File, hash: String): String? =
+        readRootMetadata(location, hash)?.previous?.takeUnless { it == "-" }
     private fun validRoot(location: File, pointer: RootPointer): Boolean {
         return validRootHash(location, pointer.rootHash, pointer.revision, 0)
     }
     private fun validRootHash(location: File, hash: String, revision: Long, depth: Int): Boolean {
-        if (depth > 2 || !hash.matches(Regex("[0-9a-f]{64}"))) return false
-        val file = path(location, "objects", "$hash.root")
-        if (!files.isFile(file) || files.digestAndLength(file).second.hex() != hash) return false
-        val values = files.readLines(file).associate { it.substringBefore('=') to it.substringAfter('=', "") }
-        if (values["schema"] != "5" || values["revision"]?.toLongOrNull() != revision || values["request"]?.matches(Regex("[0-9a-f]{64}")) != true) return false
-        val previous = values["previous"]
-        val second = values["secondPrevious"]
+        if (depth > 2) return false
+        val values = readRootMetadata(location, hash) ?: return false
+        if (values.schema != "5" || values.revision != revision || !CaptureRootMetadataReaderV2.isHash(values.request)) return false
+        val previous = values.previous
+        val second = values.secondPrevious
         if (depth == 2) return true
         if (revision == 1L) return previous == "-" && second == "-"
         if (previous == null || previous == "-" || !validRootHash(location, previous, revision - 1, depth + 1)) return false
@@ -768,11 +780,10 @@ class DurableSessionStoreV2(
             repeat(3) { hash?.let(::add); hash = hash?.let { rootPrevious(location, it) } }
         }
     }
-    private fun committedComponentBytes(location: File, rootHash: String): Long = files.readLines(path(location, "objects", "$rootHash.root"))
-        .filter { it.startsWith("component=") }
-        .fold(0L) { total, line -> Math.addExact(total, line.substringAfter(':').substringBefore(':').toLong()) }
-    private fun relative(file: File): Array<String> = root.absoluteFile.toPath().normalize().relativize(file.absoluteFile.toPath().normalize()).map { it.toString() }.toList().toTypedArray()
-    private fun path(base: File, vararg names: String): File = files.child(*(relative(base) + names))
+    private fun committedComponentBytes(location: File, rootHash: String): Long =
+        requireNotNull(readRootMetadata(location, rootHash)).components
+            .fold(0L) { total, component -> Math.addExact(total, component.length) }
+    private fun path(base: File, vararg names: String): File = files.child(base, *names)
     private fun safe(value: String) = sha256(value.toByteArray()).hex()
     private fun sha256(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes)
     private fun ByteArray.hex() = toCaptureHashHex()

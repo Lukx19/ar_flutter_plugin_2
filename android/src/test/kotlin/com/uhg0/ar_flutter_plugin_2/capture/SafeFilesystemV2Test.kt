@@ -12,6 +12,32 @@ import org.junit.Test
 
 class SafeFilesystemV2Test {
     @Test
+    fun `owned relative handles preserve containment across roots and current file replacement`() {
+        val root = Files.createTempDirectory("safe-relative-handles").toFile()
+        val other = Files.createTempDirectory("safe-relative-other").toFile()
+        try {
+            SafeFilesystemV2(root, DurableStoreFaultInjectorV2 { }, JvmDescriptorFilesystemV2()).use { files ->
+                SafeFilesystemV2(other, DurableStoreFaultInjectorV2 { }, JvmDescriptorFilesystemV2()).use { foreign ->
+                    val directory = files.child("nested")
+                    files.ensureDirectory(directory)
+                    val child = files.child(directory, "metadata")
+                    assertSame(directory, child.parentFile)
+                    child.writeBytes(byteArrayOf(1))
+                    assertArrayEquals(byteArrayOf(1), files.readBytes(child))
+                    child.delete()
+                    child.writeBytes(byteArrayOf(2))
+                    assertArrayEquals(byteArrayOf(2), files.readBytes(child))
+                    assertThrows(IllegalArgumentException::class.java) { foreign.readBytes(child) }
+                    assertThrows(IllegalArgumentException::class.java) { files.child(directory, "..") }
+                }
+            }
+        } finally {
+            root.deleteRecursively()
+            other.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `metadata reads reuse component scratch while returning independent bytes`() {
         val root = Files.createTempDirectory("safe-filesystem-metadata").toFile()
         val reads = ReadTrackingState()

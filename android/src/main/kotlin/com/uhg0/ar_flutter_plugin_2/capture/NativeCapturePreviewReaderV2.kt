@@ -17,7 +17,9 @@ internal class NativeCapturePreviewReaderV2(
     private val storeRoot: File,
 ) {
     private val copyWorkspace = CaptureCopyWorkspace()
+    private val rootMetadata = CaptureRootMetadataReaderV2()
 
+    @Synchronized
     fun materializeJpegPreview(
         manifestId: String,
         captureId: String,
@@ -30,7 +32,8 @@ internal class NativeCapturePreviewReaderV2(
             .orEmpty()
         for (session in sessions) {
             if (manifestId !in retainedRootHashes(session)) continue
-            val descriptor = jpegDescriptor(File(session, "objects/$manifestId.root"))
+            val descriptor = readRootMetadata(session, manifestId)?.components
+                ?.firstOrNull { it.kind == "JPEG" }?.let { Descriptor(it.length, it.hash) }
                 ?: continue
             val source = File(
                 session,
@@ -85,67 +88,44 @@ internal class NativeCapturePreviewReaderV2(
     }
 
     private fun selectedRoot(session: File): RootPointer? {
-        val candidates = listOf("root-A.ptr", "root-B.ptr")
-            .mapNotNull { slot ->
-                val pointer = File(session, slot)
-                val lines = pointer.takeIf(File::isFile)?.readLines()
-                    ?: return@mapNotNull null
-                if (lines.size != 3) return@mapNotNull null
-                val revision = lines[0].toLongOrNull() ?: return@mapNotNull null
-                val hash = lines[1]
-                if (!HASH.matches(hash) || !validRoot(session, hash, revision, 0)) {
-                    return@mapNotNull null
-                }
-                RootPointer(revision, hash)
-            }
-        if (candidates.groupBy { it.revision }.values.any { roots ->
-                roots.map { it.hash }.toSet().size > 1
-            }) {
-            return null
+        var selected: RootPointer? = null
+        for (slot in 0..1) {
+            val file = File(session, if (slot == 0) "root-A.ptr" else "root-B.ptr")
+            if (!file.isFile) continue
+            val pointer = FileInputStream(file).use { rootMetadata.pointer(it::read) } ?: continue
+            if (!validRoot(session, pointer.hash, pointer.revision, 0)) continue
+            val prior = selected
+            if (prior != null && prior.revision == pointer.revision && prior.hash != pointer.hash) return null
+            if (prior == null || pointer.revision > prior.revision) selected = RootPointer(pointer.revision, pointer.hash)
         }
-        return candidates.maxByOrNull { it.revision }
+        return selected
     }
 
     private fun validRoot(session: File, hash: String, revision: Long, depth: Int): Boolean {
         if (depth > MAX_ROOT_DEPTH || !HASH.matches(hash)) return false
-        val root = File(session, "objects/$hash.root")
-        if (!root.isFile || sha256(root).hex() != hash) return false
-        val values = root.readLines().associate { line ->
-            line.substringBefore('=') to line.substringAfter('=', "")
-        }
-        if (values["schema"] != "5" ||
-            values["revision"]?.toLongOrNull() != revision ||
-            !HASH.matches(values["request"].orEmpty())
+        val values = readRootMetadata(session, hash) ?: return false
+        if (values.schema != "5" ||
+            values.revision != revision ||
+            !CaptureRootMetadataReaderV2.isHash(values.request)
         ) return false
         if (depth == MAX_ROOT_DEPTH) return true
-        val previous = values["previous"]
-        val secondPrevious = values["secondPrevious"]
+        val previous = values.previous
+        val secondPrevious = values.secondPrevious
         if (revision == 1L) return previous == "-" && secondPrevious == "-"
         if (previous.isNullOrEmpty() || previous == "-") return false
         if (!validRoot(session, previous, revision - 1L, depth + 1)) return false
         return depth != 0 || revision < 3L || secondPrevious == rootPrevious(session, previous)
     }
 
-    private fun rootPrevious(session: File, hash: String): String? =
-        File(session, "objects/$hash.root")
-            .takeIf(File::isFile)
-            ?.readLines()
-            ?.firstOrNull { it.startsWith("previous=") }
-            ?.removePrefix("previous=")
-            ?.takeUnless { it == "-" }
-
-    private fun jpegDescriptor(root: File): Descriptor? {
+    private fun readRootMetadata(session: File, hash: String): CaptureRootMetadataV2? {
+        if (!CaptureRootMetadataReaderV2.isHash(hash)) return null
+        val root = File(session, "objects/$hash.root")
         if (!root.isFile) return null
-        val fields = root.readLines()
-            .firstOrNull { it.startsWith("component=JPEG:") }
-            ?.removePrefix("component=JPEG:")
-            ?.split(':')
-            ?: return null
-        if (fields.size != 2) return null
-        val length = fields[0].toLongOrNull() ?: return null
-        val hash = fields[1]
-        return Descriptor(length, hash).takeIf { length >= 0L && HASH.matches(hash) }
+        return FileInputStream(root).use { rootMetadata.root(hash, it::read) }
     }
+
+    private fun rootPrevious(session: File, hash: String): String? =
+        readRootMetadata(session, hash)?.previous?.takeUnless { it == "-" }
 
     private fun sha256(file: File): ByteArray {
         return FileInputStream(file).use { input ->

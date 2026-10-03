@@ -40,6 +40,12 @@ class SafeFilesystemV2AndroidTest {
                 Os.symlink(outside.absolutePath, sessions.absolutePath)
                 intermediateSymlinkInstalled = true
                 try {
+                    files.readBytes(pointer)
+                    fail("retained relative components must repeat no-follow traversal")
+                } catch (_: java.io.IOException) {
+                    // A cached lexical handle does not authorize a replaced directory.
+                }
+                try {
                     files.writeExclusive(
                         files.child("sessions", "attacker", "accepted.properties"),
                         "escaped".toByteArray(),
