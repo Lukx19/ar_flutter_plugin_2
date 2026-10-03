@@ -978,13 +978,14 @@ class VisibilityGridV2Binding internal constructor(
                     recordExecutorOperation("control:binding_snapshot")
                     val snapshot = snapshot()
                     val observationOwnershipReady = currentObservationOwnership() != null
+                    // Source health can wait behind a canonical mutation. Read
+                    // it after releasing the binding monitor and before main delivery.
+                    val reply = snapshot.toMap() + mapOf(
+                        "observationOwnershipReady" to observationOwnershipReady,
+                    )
                     post {
                         if (pending.tryClaim()) {
-                            pending.result.success(
-                                snapshot.toMap() + mapOf(
-                                    "observationOwnershipReady" to observationOwnershipReady,
-                                ),
-                            )
+                            pending.result.success(reply)
                         }
                     }
                 }
@@ -1011,13 +1012,14 @@ class VisibilityGridV2Binding internal constructor(
                     recordExecutorOperation("control:claim_binding_lease")
                     val snapshot = snapshot()
                     val observationOwnershipReady = currentObservationOwnership() != null
+                    // Source health can wait behind a canonical mutation. Read
+                    // it after releasing the binding monitor and before main delivery.
+                    val reply = snapshot.toMap() + mapOf(
+                        "observationOwnershipReady" to observationOwnershipReady,
+                    )
                     post {
                         if (pending.tryClaim()) {
-                            pending.result.success(
-                                snapshot.toMap() + mapOf(
-                                    "observationOwnershipReady" to observationOwnershipReady,
-                                ),
-                            )
+                            pending.result.success(reply)
                         }
                     }
                 }

@@ -35,6 +35,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -1309,6 +1310,100 @@ class VisibilityGridV2BindingTest {
             after["nativeStreamToken"] as ByteArray,
         )
         binding.dispose()
+    }
+
+    @Test
+    fun `snapshot replies capture source health off main before delayed delivery`() {
+        for (method in listOf("bindingSnapshot", "claimBindingLease")) {
+            assertSnapshotReplySourceHealthRead(method, disposeBeforeDelivery = false)
+        }
+    }
+
+    @Test
+    fun `dispose settles materialized snapshot replies once before delayed delivery`() {
+        for (method in listOf("bindingSnapshot", "claimBindingLease")) {
+            assertSnapshotReplySourceHealthRead(method, disposeBeforeDelivery = true)
+        }
+    }
+
+    private fun assertSnapshotReplySourceHealthRead(method: String, disposeBeforeDelivery: Boolean) {
+        val messenger = MethodTestMessenger()
+        val deliveryThread = Thread.currentThread()
+        val enteredRead = CountDownLatch(1)
+        val releaseRead = CountDownLatch(1)
+        val posted = CountDownLatch(1)
+        val queuedPosts = ArrayDeque<() -> Unit>()
+        val readCount = AtomicInteger()
+        val readOnDeliveryThread = AtomicBoolean()
+        val readWithBindingMonitor = AtomicBoolean()
+        val sourceReadsArmed = AtomicBoolean()
+        lateinit var binding: VisibilityGridV2Binding
+        val mapper = object : VisibilityObservationMapper {
+            override fun admitFeature(observation: VisibilityFeatureObservation) =
+                error("This fixture does not admit observations")
+            override fun admitDepth(observation: VisibilityDepthObservation) =
+                error("This fixture does not admit observations")
+
+            override fun snapshot(): VisibilityMappingAdmissionHealth {
+                if (!sourceReadsArmed.get()) return VisibilityMappingAdmissionHealth.empty()
+                readCount.incrementAndGet()
+                readOnDeliveryThread.set(Thread.currentThread() === deliveryThread)
+                readWithBindingMonitor.set(Thread.holdsLock(binding))
+                enteredRead.countDown()
+                check(releaseRead.await(2, TimeUnit.SECONDS)) { "Source health read was not released" }
+                return VisibilityMappingAdmissionHealth.empty()
+            }
+        }
+        val runtime = AndroidVisibilityGridRuntime(ownership = { null }, mapper = mapper)
+        binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 2150,
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
+            postToMain = { task ->
+                synchronized(queuedPosts) { queuedPosts.addLast(task) }
+                posted.countDown()
+            },
+        )
+        binding.attachObservationRuntime(runtime)
+        sourceReadsArmed.set(true)
+        try {
+            val result = RecordingResult()
+            val arguments = if (method == "claimBindingLease") ByteArray(16) { 7 } else null
+            MethodChannel(messenger, "visibility_grid_v2_control_2150")
+                .invokeMethod(method, arguments, result)
+            assertTrue("$method must read source health before posting", enteredRead.await(2, TimeUnit.SECONDS))
+            assertFalse(readOnDeliveryThread.get())
+            assertFalse("Source health must not hold the binding monitor", readWithBindingMonitor.get())
+            assertEquals(1L, posted.count)
+            assertEquals(0, result.successCount + result.errorCount)
+
+            releaseRead.countDown()
+            assertTrue(posted.await(2, TimeUnit.SECONDS))
+            val readsBeforeDelivery = readCount.get()
+            runtime.recordFeatureStalled()
+            if (disposeBeforeDelivery) {
+                binding.dispose()
+                assertEquals(0, result.successCount)
+                assertEquals(1, result.errorCount)
+                assertEquals("VG_STREAM_BINDING_ABANDONED", result.errorCode)
+            }
+            synchronized(queuedPosts) {
+                while (queuedPosts.isNotEmpty()) queuedPosts.removeFirst().invoke()
+            }
+            assertEquals("Main delivery must not reread source health", readsBeforeDelivery, readCount.get())
+            assertEquals(1, result.successCount + result.errorCount)
+            if (!disposeBeforeDelivery) {
+                assertEquals(1, result.successCount)
+                val reply = result.successValue as Map<*, *>
+                val health = reply["sourceHealth"] as Map<*, *>
+                assertEquals("configured", health["featureHealth"])
+                assertEquals(false, reply["observationOwnershipReady"])
+            }
+        } finally {
+            releaseRead.countDown()
+            binding.dispose()
+            runtime.close()
+        }
     }
 
     @Test
