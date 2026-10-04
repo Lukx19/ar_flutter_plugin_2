@@ -68,7 +68,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-/** SceneView 4.21.2 platform-view implementation. Flutter channels remain unchanged. */
+/** SceneView 4.47.0 platform-view implementation. Flutter channels remain unchanged. */
 internal class ArView(
     context: Context,
     private val activity: Activity,

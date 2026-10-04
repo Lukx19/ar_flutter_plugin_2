@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:ar_flutter_plugin_2/ar_flutter_plugin.dart';
 import 'screens/home_screen.dart';
 import 'examples/camera_capabilities_basic.dart';
 import 'examples/camera_config_validation.dart';
@@ -8,7 +7,7 @@ import 'examples/ar_with_camera_capabilities.dart';
 import 'examples/unified_camera_intrinsics.dart';
 import 'examples/phase5_runtime_camera_controls.dart';
 import 'examples/phase7_testing_framework.dart';
-import 'examples/phase8_documentation_examples.dart';
+import 'examples/capture_documentation_examples.dart';
 
 void main() {
   runApp(const CameraCapabilitiesExamplesApp());
@@ -35,7 +34,7 @@ class CameraCapabilitiesExamplesApp extends StatelessWidget {
         '/unified-intrinsics': (context) => const UnifiedCameraIntrinsicsExample(),
         '/phase5-runtime-controls': (context) => const Phase5RuntimeCameraControlsWidget(),
         '/phase7-testing-framework': (context) => const Phase7TestingFrameworkExample(),
-        '/phase8-documentation-examples': (context) => const Phase8DocumentationExamplesWidget(),
+        '/capture-documentation-examples': (context) => const CaptureDocumentationExamplesWidget(),
       },
       debugShowCheckedModeBanner: false,
     );

@@ -1475,7 +1475,7 @@ internal class SceneViewHost(
     override fun frameForCapture(): Frame? = latestFrame
 
     override fun prepareSharedCameraResume(session: Session) {
-        // SceneView 4.21.2 keeps config stable across resume. Release the first-resume gate only
+        // SceneView 4.47.0 keeps config stable across resume. Release the first-resume gate only
         // after SharedCameraManager has an active Camera2 repeating request.
         sharedCameraLifecycleGate.prepareSharedCameraResume()
     }

@@ -7,16 +7,12 @@ plugins {
 
 android {
     namespace = "com.example.example_test_app"
-    compileSdk = flutter.compileSdkVersion
-    ndkVersion = "27.0.12077973"
+    compileSdk = 37
+    ndkVersion = "28.2.13676358"
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
-    }
-
-    kotlinOptions {
-        jvmTarget = JavaVersion.VERSION_11.toString()
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
 
     defaultConfig {
@@ -26,7 +22,7 @@ android {
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         // AR plugin requires Android 9.0 (API level 28) minimum
         minSdk = 28
-        targetSdk = flutter.targetSdkVersion
+        targetSdk = 35 // Match the capture app runtime contract.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }
@@ -37,6 +33,12 @@ android {
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
         }
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
     }
 }
 

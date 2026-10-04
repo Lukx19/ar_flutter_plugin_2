@@ -2,28 +2,24 @@ import 'package:flutter/material.dart';
 import 'package:ar_flutter_plugin_2/ar_flutter_plugin.dart';
 import 'package:ar_flutter_plugin_2/capabilities/ar_camera_capabilities.dart';
 import 'package:ar_flutter_plugin_2/models/ar_capture_config.dart';
-import 'package:ar_flutter_plugin_2/models/camera_resolution.dart';
 import 'package:ar_flutter_plugin_2/datatypes/image_format.dart';
-import 'package:ar_flutter_plugin_2/documentation/documentation_generator.dart';
-import 'package:ar_flutter_plugin_2/examples/capture_example_app.dart';
 import 'package:ar_flutter_plugin_2/guides/integration_guide_helper.dart';
 import 'package:ar_flutter_plugin_2/optimization/performance_optimization_guide.dart';
-import 'package:ar_flutter_plugin_2/tools/capture_manager_dev_tools.dart';
 
-/// Phase 8: Documentation & Examples
+/// Capture Documentation & Examples
 /// 
 /// This example demonstrates the comprehensive documentation and examples
-/// system implemented in Phase 8, including API documentation generation,
+/// capture system, including API documentation generation,
 /// usage examples, integration guides, performance optimization, and
 /// developer tools.
-class Phase8DocumentationExamplesWidget extends StatefulWidget {
-  const Phase8DocumentationExamplesWidget({Key? key}) : super(key: key);
+class CaptureDocumentationExamplesWidget extends StatefulWidget {
+  const CaptureDocumentationExamplesWidget({Key? key}) : super(key: key);
 
   @override
-  State<Phase8DocumentationExamplesWidget> createState() => _Phase8DocumentationExamplesWidgetState();
+  State<CaptureDocumentationExamplesWidget> createState() => _CaptureDocumentationExamplesWidgetState();
 }
 
-class _Phase8DocumentationExamplesWidgetState extends State<Phase8DocumentationExamplesWidget> {
+class _CaptureDocumentationExamplesWidgetState extends State<CaptureDocumentationExamplesWidget> {
   String _selectedDemo = 'API Documentation';
   String _output = '';
   bool _isRunning = false;
@@ -47,7 +43,7 @@ class _Phase8DocumentationExamplesWidgetState extends State<Phase8DocumentationE
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Phase 8: Documentation & Examples'),
+        title: const Text('Capture Documentation & Examples'),
         backgroundColor: Colors.indigo,
       ),
       body: SingleChildScrollView(
@@ -76,7 +72,7 @@ class _Phase8DocumentationExamplesWidgetState extends State<Phase8DocumentationE
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              'Phase 8: Documentation & Examples System',
+              'Capture Documentation & Examples System',
               style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 8),

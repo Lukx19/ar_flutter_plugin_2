@@ -1347,7 +1347,7 @@ internal class SharedCameraManager(
         return textureId
     }
 
-    /** Delegates lifecycle preparation to the SceneView 4.21.2 renderer host. */
+    /** Delegates lifecycle preparation to the SceneView 4.47.0 renderer host. */
     private fun disableSceneViewResumeReconfiguration(arSession: Session) {
         if (sceneViewResumeReconfigurationDisabled) {
             return
