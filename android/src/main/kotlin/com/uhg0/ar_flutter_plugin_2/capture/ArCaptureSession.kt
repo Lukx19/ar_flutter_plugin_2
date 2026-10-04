@@ -48,6 +48,7 @@ internal class ArCaptureSession(
     private val onCaptureAccepted: (Map<String, Any?>) -> Unit = {},
     private val onCaptureFinalized: (Map<String, Any?>) -> Unit = {},
     private val captureSafetySignalV2: CaptureSafetySignalV2 = CaptureSafetySignalV2(),
+    private val isOwnerClosing: () -> Boolean = { false },
 ) {
     companion object {
         private const val TrackingPoseReadyTimeoutMs = 2_000L
@@ -55,6 +56,7 @@ internal class ArCaptureSession(
     }
 
     private var config: CaptureConfig? = null
+    private val startupGate = CaptureStartupGate()
     private var isCaptureInProgress = false
     private val byteCache = CaptureByteCache()
     private val resourceCounters = CaptureResourceCounters()
@@ -186,6 +188,43 @@ internal class ArCaptureSession(
 
     suspend fun initialize(configMap: Map<String, Any?>) {
         val parsedConfig = CaptureConfig.fromMap(configMap)
+        ensureStartupOwnerCurrent()
+        if (configMap["enableHighResCapture"] == true) {
+            try {
+                startupGate.initialize(
+                    isReady = {
+                        val session = sceneHost.activeSession
+                        if (session == null) {
+                            false
+                        } else {
+                            SharedCameraInteropPlanner.checkAvailability(
+                                hasSession = true,
+                                hasSharedCamera = session.sharedCamera != null,
+                            )?.let { failure ->
+                                throw CaptureSessionException(failure.code, failure.message)
+                            }
+                            sceneHost.cameraTexture != null
+                        }
+                    },
+                    ensureCurrent = ::ensureStartupOwnerCurrent,
+                    start = { initializeReady(configMap, parsedConfig) },
+                )
+            } catch (error: CaptureStartupTimeoutException) {
+                throw CaptureSessionException("CAPTURE_NOT_INITIALIZED", error.message.orEmpty())
+            }
+        } else {
+            initializeReady(configMap, parsedConfig)
+        }
+    }
+
+    private fun ensureStartupOwnerCurrent() {
+        if (disposed.get() || disposeStarted || isOwnerClosing()) {
+            throw CaptureSessionException("CAPTURE_DISPOSED", "Capture owner is closing")
+        }
+    }
+
+    private suspend fun initializeReady(configMap: Map<String, Any?>, parsedConfig: CaptureConfig) {
+        ensureStartupOwnerCurrent()
         config = parsedConfig
         poseStreamEnabled = configMap["enablePoseStream"] as? Boolean ?: true
         poseSequence = 0L

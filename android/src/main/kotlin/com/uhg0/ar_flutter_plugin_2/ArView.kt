@@ -244,6 +244,7 @@ internal class ArView(
         sceneHost = sceneHost,
         capabilityQuerier = CameraCapabilityQuerier(context),
         captureChannel = captureChannel,
+        isOwnerClosing = { disposed },
         onCapacityChanged = { value ->
             scope.launch { captureChannel.invokeMethod("onCaptureCapacityChanged", value) }
         },
