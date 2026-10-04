@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -15,8 +14,10 @@ import '../models/ar_capture_result.dart';
 import '../models/ar_frame_pose.dart';
 import '../models/camera_resolution.dart';
 import '../models/capture_capacity.dart';
+import '../models/capture_intent_contract.dart';
 import '../models/capture_quality_policy.dart';
 import '../models/image_size.dart';
+import '../models/native_capture_v2.dart';
 import 'ar_session_manager.dart';
 
 /// Available exposure modes
@@ -278,6 +279,33 @@ class CameraFlashState {
 class ARCaptureManager {
   @visibleForTesting
   static bool? debugIsSupportedOverride;
+  static const MethodChannel _nativeCapturePreviewChannel = MethodChannel(
+    'ar_flutter_plugin_2/native_capture_preview',
+  );
+
+  /// Resolves a committed native V2 JPEG without requiring a live AR view.
+  ///
+  /// This is read-only native-store access for History/detail rendering. The
+  /// returned persistent app-private path is a display copy; the native URI
+  /// remains the durable capture reference.
+  static Future<String?> materializeNativeCapturePreviewFromStore({
+    required String manifestId,
+    required String captureId,
+  }) async {
+    try {
+      return await _nativeCapturePreviewChannel.invokeMethod<String>(
+        'materializeNativeCapturePreview',
+        <String, String>{
+          'manifestId': manifestId,
+          'captureId': captureId,
+        },
+      );
+    } on MissingPluginException {
+      return null;
+    } on PlatformException {
+      return null;
+    }
+  }
 
   late MethodChannel _channel;
   final ARSessionManager _sessionManager;
@@ -301,6 +329,10 @@ class ARCaptureManager {
       StreamController.broadcast();
   final StreamController<ProfileApplicationStatus> _profileStatusController =
       StreamController.broadcast();
+  final StreamController<ARNativeCaptureEventV2> _nativeCaptureV2Controller =
+      StreamController.broadcast();
+  final Map<String, String> _nativeCaptureV2TerminalLedger = {};
+  static const int _nativeCaptureV2TerminalLedgerCapacity = 8;
   static const String _profilesKey = 'ar_capture_profiles';
   static const String _profileNotFoundCode = 'PROFILE_NOT_FOUND';
   final ARCaptureConfig _config;
@@ -313,6 +345,7 @@ class ARCaptureManager {
       (Platform.isAndroid || Platform.environment.containsKey('FLUTTER_TEST'));
   bool get isEnabled =>
       !_isDisposed && isSupported && _config.enableHighResCapture;
+  bool get isDisposed => _isDisposed;
   ARCaptureConfig get config => _config;
   CaptureInitializationResult? get initializationResult =>
       _initializationResult;
@@ -350,6 +383,15 @@ class ARCaptureManager {
     return _initializationFuture ??= _initializePlatformChannel();
   }
 
+  /// Wait for native shared-camera initialization and recovery ordering before
+  /// issuing a runtime control request. Concurrent controls share the existing
+  /// initialization future instead of starting another native startup path.
+  Future<void> _ensureRuntimeControlsInitialized() async {
+    if (isEnabled) {
+      await _ensureInitialized();
+    }
+  }
+
   Future<void> _initializePlatformChannel() async {
     try {
       // Validate configuration before initializing
@@ -368,6 +410,11 @@ class ARCaptureManager {
       _initializationResult = CaptureInitializationResult.fromPlatformValue(
         result,
       );
+      // The native owner may have completed bounded startup recovery before
+      // this Dart handler existed. Pull its scalar replay after attachment.
+      for (final event in await replayNativeCaptureRecoveryV2()) {
+        _publishNativeCaptureV2Event(event);
+      }
 
       debugPrint(
         'ARCaptureManager initialized with config: ${_config.toString()}',
@@ -453,13 +500,29 @@ class ARCaptureManager {
     }
   }
 
-  /// Returns a lightweight native resource snapshot for release diagnostics.
-  Future<Map<String, dynamic>?> getPerformanceSnapshot() async {
+  /// Returns current capture counters, scratch, heap and safety fields.
+  /// Android process PSS, file-descriptor and Java-thread counts are diagnostic
+  /// cached values: demand refresh at most every 5 s, null before the first
+  /// sample or once older than 10 s. `processTelemetryAgeMs` and refresh flags
+  /// describe freshness; thread count still uses Java getAllStackTraces size.
+  /// Debug timing arguments are ignored on non-debuggable Android builds.
+  /// Reset before measurement; serialize timing records only after its counters
+  /// are frozen. Ordinary calls neither reset nor serialize the timing ledger.
+  Future<Map<String, dynamic>?> getPerformanceSnapshot({
+    bool resetDiagnosticTiming = false,
+    bool includeDiagnosticTiming = false,
+  }) async {
     _throwIfDisposed();
     try {
       await _ensureInitialized();
       final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
         'getPerformanceSnapshot',
+        (resetDiagnosticTiming || includeDiagnosticTiming)
+            ? <String, bool>{
+                'resetDiagnosticTiming': resetDiagnosticTiming,
+                'includeDiagnosticTiming': includeDiagnosticTiming,
+              }
+            : null,
       );
       return result == null ? null : _deepCastMap(result);
     } on PlatformException catch (error) {
@@ -484,6 +547,191 @@ class ARCaptureManager {
 
   Stream<CaptureCapacity> get captureCapacityStream =>
       _captureCapacityController.stream;
+
+  /// Bounded scalar V2 capture ownership/terminal events. No image data or
+  /// native file paths are representable on this stream.
+  Stream<ARNativeCaptureEventV2> get nativeCaptureV2Events =>
+      _nativeCaptureV2Controller.stream;
+
+  Future<ARNativeCaptureAdmissionResultV2> admitNativeCaptureV2(
+    ARNativeCaptureAdmissionV2 admission,
+  ) async {
+    _throwIfDisposed();
+    await _ensureInitialized();
+    final Map<dynamic, dynamic>? value;
+    try {
+      value = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+        'admitNativeCaptureV2',
+        admission.toMap(),
+      );
+    } on PlatformException catch (error) {
+      throw _captureExceptionFromPlatformException(
+        error,
+        operation: 'admit native V2 capture',
+      );
+    }
+    if (value == null) {
+      throw const ARCaptureException(
+        'Native V2 admission result was missing',
+        code: 'NATIVE_CAPTURE_V2_RESULT_MISSING',
+      );
+    }
+    final result = ARNativeCaptureAdmissionResultV2.fromMap(
+      _deepCastMap(value),
+    );
+    final terminal = result.terminal;
+    if (terminal != null) {
+      _publishNativeCaptureV2Event(terminal);
+    }
+    return result;
+  }
+
+  Future<ARNativeCaptureHealthV2> getNativeCaptureHealthV2() async {
+    _throwIfDisposed();
+    final value = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+      'getNativeCaptureHealthV2',
+    );
+    if (value == null) {
+      throw const ARCaptureException(
+        'Native V2 health result was missing',
+        code: 'NATIVE_CAPTURE_V2_HEALTH_MISSING',
+      );
+    }
+    final event = ARNativeCaptureEventV2.fromMap(_deepCastMap(value));
+    return event.health ??
+        (throw const FormatException('Native V2 health payload was missing.'));
+  }
+
+  /// Resolves a committed native V2 JPEG into the plugin's app-private cache.
+  ///
+  /// The returned path is an app-private persistent display copy. The durable
+  /// V2 store remains native-owned and the terminal URI stays an opaque
+  /// reference in the capture model.
+  Future<String?> materializeNativeCapturePreview({
+    required String manifestId,
+    required String captureId,
+  }) async {
+    _throwIfDisposed();
+    await _ensureInitialized();
+    try {
+      return await _channel.invokeMethod<String>(
+        'materializeNativeCapturePreview',
+        <String, String>{
+          'manifestId': manifestId,
+          'captureId': captureId,
+        },
+      );
+    } on PlatformException catch (error) {
+      throw _captureExceptionFromPlatformException(
+        error,
+        operation: 'materialize native capture preview',
+      );
+    }
+  }
+
+  Future<List<ARNativeCaptureEventV2>> replayNativeCaptureRecoveryV2() async {
+    _throwIfDisposed();
+    final value = await _channel
+        .invokeMethod<List<dynamic>>('replayNativeCaptureRecoveryV2');
+    // Older/non-Android backends have no V2 owner and return null. Android V2
+    // must return a bounded list once the channel is present.
+    if (value == null) return const [];
+    if (value.length > 2) {
+      throw const ARCaptureException('Native V2 recovery replay was malformed',
+          code: 'NATIVE_CAPTURE_V2_REPLAY_INVALID');
+    }
+    return value.map((item) {
+      if (item is! Map)
+        throw const FormatException('Recovery replay entries must be maps.');
+      return ARNativeCaptureEventV2.fromMap(_deepCastMap(item));
+    }).toList(growable: false);
+  }
+
+  Future<void> acknowledgeNativeCaptureTerminalV2(String attemptId) async {
+    _throwIfDisposed();
+    if (attemptId.isEmpty) throw ArgumentError.value(attemptId, 'attemptId');
+    await _channel.invokeMethod<bool>(
+        'acknowledgeNativeCaptureTerminalV2', {'attemptId': attemptId});
+  }
+
+  Future<void> notifyNativeCaptureLifecycleV2(
+    CaptureLifecycleEvent event,
+  ) async {
+    if (event != CaptureLifecycleEvent.automaticDisabled &&
+        event != CaptureLifecycleEvent.routeLeft &&
+        event != CaptureLifecycleEvent.processRestarted) {
+      throw ArgumentError.value(
+          event, 'event', 'Lifecycle event is native-owned.');
+    }
+    await _channel.invokeMethod<void>(
+      'notifyNativeCaptureLifecycleV2',
+      <String, Object?>{'event': event.name},
+    );
+  }
+
+  /// Transfers post-exposure ownership to durable restart recovery without
+  /// requiring product callers to depend on the frozen intent-contract model.
+  Future<void> notifyNativeCaptureProcessRestartedV2() =>
+      notifyNativeCaptureLifecycleV2(CaptureLifecycleEvent.processRestarted);
+
+  @visibleForTesting
+  Future<void> debugConfigureNativeCaptureV2({String? fault}) async {
+    final installed = await _channel.invokeMethod<bool>(
+      'debugNativeCaptureV2Synthetic',
+      <String, Object?>{'fault': fault},
+    );
+    if (installed != true) {
+      throw const ARCaptureException(
+        'The native V2 synthetic exposure route was not installed.',
+        code: 'NATIVE_CAPTURE_V2_DEBUG_ROUTE_UNAVAILABLE',
+      );
+    }
+  }
+
+  /// Seeds one bounded, generation-fenced pose for the debug-only tablet
+  /// campaign. The native response remains tagged as synthetic and never
+  /// changes the ordinary ARCore tracking stream.
+  Future<ARFramePose> debugBeginSyntheticPoseFixture({
+    required int bindingGeneration,
+    required int groupGeneration,
+  }) async {
+    _throwIfDisposed();
+    if (bindingGeneration <= 0) {
+      throw ArgumentError.value(bindingGeneration, 'bindingGeneration');
+    }
+    if (groupGeneration <= 0) {
+      throw ArgumentError.value(groupGeneration, 'groupGeneration');
+    }
+    await _ensureInitialized();
+    final raw = await _channel.invokeMethod<Object?>(
+      'debugSyntheticPoseFixture',
+      <String, Object?>{
+        'bindingGeneration': bindingGeneration,
+        'groupGeneration': groupGeneration,
+      },
+    );
+    final pose = ARFramePose.fromMap(_deepCastMap(raw));
+    if (pose.poseSource != 'synthetic') {
+      throw const FormatException(
+          'Synthetic pose fixture response was missing its source tag.');
+    }
+    return pose;
+  }
+
+  Future<void> debugClearSyntheticPoseFixture() async {
+    _throwIfDisposed();
+    await _channel.invokeMethod<void>('debugClearSyntheticPoseFixture');
+  }
+
+  @visibleForTesting
+  Future<void> debugAdvanceNativeCaptureRecoveryV2() =>
+      _channel.invokeMethod<void>('debugNativeCaptureV2AdvanceRecovery');
+
+  @visibleForTesting
+  Future<bool> debugCompleteDeferredNativeCaptureV2() async =>
+      await _channel
+          .invokeMethod<bool>('debugNativeCaptureV2CompleteDeferred') ??
+      false;
 
   /// Get camera intrinsics data (unified for both AR tracking and capture)
   Future<ARCameraIntrinsics?> getCameraIntrinsics() async {
@@ -637,6 +885,7 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       // Validate against supported ISO range from capabilities
       final supportedISORange = await getSupportedISORange();
       if (supportedISORange != null && supportedISORange.isNotEmpty) {
@@ -681,6 +930,7 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       // Validate against supported exposure range from capabilities
       final supportedRange = await getSupportedExposureRange();
       if (supportedRange != null && supportedRange.isNotEmpty) {
@@ -730,6 +980,7 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       return await _channel.invokeMethod('getCurrentISO');
     } on PlatformException catch (e) {
       throw _captureExceptionFromPlatformException(
@@ -744,6 +995,7 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final int? microseconds = await _channel.invokeMethod(
         'getCurrentExposureTime',
       );
@@ -764,6 +1016,7 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final List<dynamic>? result = await _channel.invokeMethod(
         'getSupportedISORange',
       );
@@ -781,6 +1034,7 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
         'getSupportedExposureRange',
       );
@@ -804,6 +1058,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final bool result = await _channel.invokeMethod(
         'setAutoExposureEnabled',
         {'enabled': enabled},
@@ -830,6 +1085,7 @@ class ARCaptureManager {
     }
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
         'getCurrentExposureState',
       );
@@ -856,6 +1112,7 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
         'getExposureCompensationInfo',
       );
@@ -878,6 +1135,7 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
         'setExposureCompensation',
         {'evStep': evStep},
@@ -903,6 +1161,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final bool result = await _channel.invokeMethod('lockExposure');
 
       return result;
@@ -919,6 +1178,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final bool result = await _channel.invokeMethod('unlockExposure');
 
       return result;
@@ -944,6 +1204,7 @@ class ARCaptureManager {
     distance = distance.clamp(0.0, 1.0);
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
         'setFocusDistance',
         {'distance': distance},
@@ -969,6 +1230,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final bool result = await _channel.invokeMethod('setAutofocusEnabled', {
         'enabled': enabled,
       });
@@ -987,6 +1249,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final bool result = await _channel.invokeMethod('focusAtPoint', {
         'x': screenPoint.dx,
         'y': screenPoint.dy,
@@ -1014,6 +1277,7 @@ class ARCaptureManager {
     }
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
         'getCurrentFocusState',
       );
@@ -1041,6 +1305,7 @@ class ARCaptureManager {
     if (!isEnabled) return [FocusMode.auto];
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final List<dynamic> result = await _channel.invokeMethod(
         'getSupportedFocusModes',
       );
@@ -1065,6 +1330,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final bool result = await _channel.invokeMethod('setFocusMode', {
         'mode': mode.name,
       });
@@ -1088,6 +1354,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final bool result = await _channel.invokeMethod('setWhiteBalanceMode', {
         'mode': mode.name,
       });
@@ -1106,6 +1373,7 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       // Validate against supported temperature range
       final supportedRange = await getSupportedColorTemperatureRange();
       if (supportedRange != null && supportedRange.isNotEmpty) {
@@ -1153,6 +1421,7 @@ class ARCaptureManager {
     }
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
         'getCurrentWhiteBalanceState',
       );
@@ -1181,6 +1450,7 @@ class ARCaptureManager {
     if (!isEnabled) return null;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
         'getSupportedColorTemperatureRange',
       );
@@ -1204,6 +1474,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final bool result = await _channel.invokeMethod('lockWhiteBalance');
 
       return result;
@@ -1220,6 +1491,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final bool result = await _channel.invokeMethod('unlockWhiteBalance');
 
       return result;
@@ -1236,6 +1508,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final bool result = await _channel.invokeMethod(
         'setWhiteBalanceFromPoint',
         {'x': screenPoint.dx, 'y': screenPoint.dy},
@@ -1255,6 +1528,7 @@ class ARCaptureManager {
     if (!isEnabled) return [WhiteBalanceMode.auto];
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final List<dynamic> result = await _channel.invokeMethod(
         'getSupportedWhiteBalanceModes',
       );
@@ -1283,6 +1557,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       // Check flash availability first
       final isAvailable = await isFlashAvailable();
       if (!isAvailable && mode != FlashMode.off) {
@@ -1315,6 +1590,7 @@ class ARCaptureManager {
     }
 
     try {
+      await _ensureRuntimeControlsInitialized();
       final Map<dynamic, dynamic>? result = await _channel.invokeMethod(
         'getCurrentFlashState',
       );
@@ -1341,6 +1617,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       return await _channel.invokeMethod('isFlashAvailable');
     } on PlatformException catch (e) {
       throw _captureExceptionFromPlatformException(
@@ -1355,6 +1632,7 @@ class ARCaptureManager {
     if (!isEnabled) return false;
 
     try {
+      await _ensureRuntimeControlsInitialized();
       // Check flash availability first
       if (enabled && !await isFlashAvailable()) {
         debugPrint('Flash not available, cannot enable torch');
@@ -1613,7 +1891,6 @@ class ARCaptureManager {
           break;
         case QuickProfileType.auto:
         case QuickProfileType.macro:
-        default:
           // Use auto settings for unsupported types
           return await _applyAutoProfile();
       }
@@ -1880,6 +2157,26 @@ class ARCaptureManager {
           _poseStreamController.add(pose);
           break;
         case 'onPoseBatch':
+          if (call.arguments is Map &&
+              (call.arguments as Map)['wireVersion'] ==
+                  packedPoseBatchWireVersion) {
+            final batch = call.arguments as Map;
+            final count = batch['sampleCount'];
+            final payload = batch['sampleBytes'];
+            if (count is! int ||
+                count < 1 ||
+                count > 8 ||
+                payload is! Uint8List ||
+                payload.lengthInBytes != count * packedPoseSampleBytes) {
+              throw const FormatException('Invalid packed pose batch.');
+            }
+            final bytes = ByteData.sublistView(payload);
+            for (var index = 0; index < count; index++) {
+              _poseStreamController.add(
+                  ARFramePose.fromPacked(bytes, index * packedPoseSampleBytes));
+            }
+            break;
+          }
           final batch = _deepCastMap(call.arguments);
           if (batch['wireVersion'] != poseBatchWireVersion) {
             throw FormatException('Unsupported pose batch wire version.');
@@ -1911,6 +2208,11 @@ class ARCaptureManager {
           final capacity =
               CaptureCapacity.fromMap(_deepCastMap(call.arguments));
           _captureCapacityController.add(capacity);
+          break;
+        case 'onNativeCaptureV2Event':
+          _publishNativeCaptureV2Event(
+            ARNativeCaptureEventV2.fromMap(_deepCastMap(call.arguments)),
+          );
           break;
         case 'onExposureStateChanged':
           final exposureState = CameraExposureState.fromMap(
@@ -1946,6 +2248,41 @@ class ARCaptureManager {
     } catch (e) {
       debugPrint('Error handling platform call: $e');
     }
+  }
+
+  void _publishNativeCaptureV2Event(ARNativeCaptureEventV2 event) {
+    final attemptId = event.attemptId;
+    if (!event.isTerminal || attemptId == null) {
+      _nativeCaptureV2Controller.add(event);
+      return;
+    }
+    final signature = jsonEncode(<String, Object?>{
+      'kind': event.kind.name,
+      'captureId': event.captureId,
+      'captureRevision': event.captureRevision,
+      'manifestId': event.manifestId,
+      'jpegSizeBytes': event.jpegSizeBytes,
+      'dngSizeBytes': event.dngSizeBytes,
+      'reason': event.reason,
+      'recoveryContext': event.recoveryContext?.toMap(),
+    });
+    final existing = _nativeCaptureV2TerminalLedger[attemptId];
+    if (existing != null) {
+      if (existing != signature) {
+        _nativeCaptureV2Controller.addError(
+          StateError('Conflicting native V2 terminal for $attemptId.'),
+        );
+      }
+      return;
+    }
+    _nativeCaptureV2TerminalLedger[attemptId] = signature;
+    if (_nativeCaptureV2TerminalLedger.length >
+        _nativeCaptureV2TerminalLedgerCapacity) {
+      _nativeCaptureV2TerminalLedger.remove(
+        _nativeCaptureV2TerminalLedger.keys.first,
+      );
+    }
+    _nativeCaptureV2Controller.add(event);
   }
 
   // Deprecated runtime resolution methods with helpful error messages
@@ -2003,6 +2340,7 @@ class ARCaptureManager {
     _whiteBalanceStateController.close();
     _flashStateController.close();
     _profileStatusController.close();
+    _nativeCaptureV2Controller.close();
   }
 }
 

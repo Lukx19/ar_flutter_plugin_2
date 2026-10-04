@@ -7,6 +7,8 @@ import com.google.android.filament.MaterialInstance
 import com.google.android.filament.RenderableManager
 import com.google.android.filament.VertexBuffer
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointUploadQualifier
+import com.uhg0.ar_flutter_plugin_2.pointcloud.uploadQualifier
 import io.github.sceneview.node.Node
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -18,6 +20,8 @@ import android.os.Looper
 internal class CoveragePointMeshResources(
     private val engine: Engine,
     override val capacity: Int,
+    private val telemetry: RendererTelemetry? = null,
+    private val telemetryOwner: String = "coverage-points",
 ) : CoverageVoxelMeshResources {
     override val vertexBuffer: VertexBuffer = VertexBuffer.Builder()
         .bufferCount(2)
@@ -40,18 +44,40 @@ internal class CoveragePointMeshResources(
         .bufferType(IndexBuffer.Builder.IndexType.UINT)
         .build(engine)
 
-    private var lastRevision = Long.MIN_VALUE
+    private var lastUploadQualifier: CoveragePointUploadQualifier? = null
+    private var retainedSnapshotUploadRequired = true
+    private val descriptorSequencer = CoverageDescriptorPageSequencer()
     private var destroyed = false
+    @Volatile private var onUploadPageReleased: () -> Unit = {}
     private val uploadCoordinator = CoveragePointUploadCoordinator(
         capacity = capacity,
         uploader = FilamentCoveragePointVertexUploader(engine, vertexBuffer),
+        onUploadAttributed = { bytes, origin -> telemetry?.recordUpload(bytes, origin) },
+        onResourceResetScheduled = { telemetry?.recordResourceResetScheduled() },
+        onUploadCallbackAttributed = { origin -> telemetry?.recordUploadCallback(origin) },
+        onUploadCompletedAttributed = { elapsedNanos, origin ->
+            telemetry?.recordUploadCompletion(elapsedNanos, origin)
+        },
+        onDestroyedUploadCallback = {
+            telemetry?.recordFencedDestroyedUploadCallback()
+        },
+        onUploadPageReleasedWithTicket = { ticket ->
+            descriptorSequencer.release(ticket)
+        },
+        onUploadPageReleased = {
+            onUploadPageReleased()
+        },
     )
+    private val allocationLedger = telemetry?.let(::CoverageRendererAllocationLedger)
     private var indexStaging: java.nio.IntBuffer? = null
 
     override val primitiveType: RenderableManager.PrimitiveType =
         RenderableManager.PrimitiveType.POINTS
 
     init {
+        // The direct index staging remains live until Filament invokes this
+        // upload callback, so it is separately charged for the startup peak.
+        allocationLedger?.installPointResources(telemetryOwner, capacity)
         val indices = ByteBuffer.allocateDirect(capacity * Int.SIZE_BYTES)
             .order(ByteOrder.nativeOrder())
             .asIntBuffer()
@@ -64,7 +90,10 @@ internal class CoveragePointMeshResources(
             0,
             capacity,
             Handler(Looper.getMainLooper()),
-        ) { indexStaging = null }
+        ) {
+            indexStaging = null
+            allocationLedger?.completePointStartup(telemetryOwner)
+        }
     }
 
     override fun update(
@@ -73,27 +102,108 @@ internal class CoveragePointMeshResources(
         materialInstance: MaterialInstance,
         pointSizePx: Float,
     ) {
-        check(snapshot.capacity == capacity)
-        check(snapshot.count in 0..capacity)
-        check(snapshot.positions.size == snapshot.count * POSITION_COMPONENTS)
-        check(snapshot.colors.size == snapshot.count)
-        if (snapshot.revision != lastRevision) {
-            if (snapshot.count > 0) {
-                uploadCoordinator.submit(snapshot)
+        // The native visibility renderer already admits the active mode's
+        // bounded stable rows. Re-selecting here would retain a second full
+        // primitive selector and duplicate the presentation hand-off.
+        val presentation = snapshot
+        check(presentation.capacity == capacity)
+        check(presentation.count in 0..capacity)
+        check(presentation.positions.size == presentation.count * POSITION_COMPONENTS)
+        check(presentation.colors.size == presentation.count)
+        val uploadQualifier = presentation.uploadQualifier()
+        if (uploadQualifier != lastUploadQualifier || retainedSnapshotUploadRequired) {
+            if (presentation.count > 0) {
+                if (retainedSnapshotUploadRequired) {
+                    uploadCoordinator.submitForResourceGeneration(presentation)
+                } else {
+                    uploadCoordinator.submit(presentation)
+                }
             }
-            lastRevision = snapshot.revision
+            lastUploadQualifier = uploadQualifier
+            retainedSnapshotUploadRequired = false
         }
         setDrawCount(
             node,
-            if (snapshot.enabled) snapshot.count else 0,
+            if (presentation.enabled) presentation.count else 0,
         )
         materialInstance.setParameter("pointSize", pointSizePx)
-        node.isVisible = snapshot.enabled && snapshot.count > 0
+        node.isVisible = presentation.enabled && presentation.count > 0
     }
+
+    override fun updatePage(
+        node: Node,
+        page: CoveragePresentationPage,
+        materialInstance: MaterialInstance,
+        pointSizePx: Float,
+        reset: Boolean,
+        ticket: CoverageDescriptorPageTicket?,
+        enabled: Boolean,
+    ) {
+        uploadCoordinator.submitPage(
+            page,
+            RendererUploadPageOrigin.RESOURCE_GENERATION_RESET.takeIf { reset }
+                ?: RendererUploadPageOrigin.ORDINARY,
+            ticket,
+        )
+        setDrawCount(node, if (page.totalCount > 0) page.totalCount else 0)
+        materialInstance.setParameter("pointSize", pointSizePx)
+        node.isVisible = enabled && page.totalCount > 0
+    }
+
+    internal fun updateDescriptor(
+        node: Node,
+        descriptor: BoundedCoveragePresentation,
+        materialInstance: MaterialInstance,
+        pointSizePx: Float,
+    ) {
+        currentNodeForDescriptor = node
+        currentMaterialForDescriptor = materialInstance
+        currentPointSizeForDescriptor = pointSizePx
+        descriptorSequencer.replace(
+            descriptor,
+            rehydrate = retainedSnapshotUploadRequired,
+        )
+        retainedSnapshotUploadRequired = false
+        setDrawCount(node, descriptor.count)
+        materialInstance.setParameter("pointSize", pointSizePx)
+        node.isVisible = descriptor.enabled && descriptor.count > 0
+    }
+
+    private fun queueNextDescriptorPage() {
+        val submission = descriptorSequencer.nextPage() ?: return
+        updatePage(
+            node = checkNotNull(currentNodeForDescriptor),
+            page = submission.page,
+            materialInstance = checkNotNull(currentMaterialForDescriptor),
+            pointSizePx = currentPointSizeForDescriptor,
+            reset = submission.reset,
+            ticket = submission.ticket,
+            enabled = submission.enabled,
+        )
+    }
+
+    // These short-lived fields exist only while queueNextDescriptorPage runs;
+    // they avoid retaining a mesh/node in the descriptor itself.
+    private var currentNodeForDescriptor: Node? = null
+    private var currentMaterialForDescriptor: MaterialInstance? = null
+    private var currentPointSizeForDescriptor = 0f
 
     override fun hide(node: Node) {
         setDrawCount(node, 0)
         node.isVisible = false
+    }
+
+    override fun requireRetainedSnapshotUpload() {
+        retainedSnapshotUploadRequired = true
+    }
+
+    override fun onRendererFrame() {
+        uploadCoordinator.onRendererFrame()
+        if (!descriptorSequencer.hasInFlightPage) queueNextDescriptorPage()
+    }
+
+    override fun setOnUploadPageReleased(listener: () -> Unit) {
+        onUploadPageReleased = listener
     }
 
     private fun setDrawCount(node: Node, count: Int) {
@@ -113,8 +223,13 @@ internal class CoveragePointMeshResources(
     override fun destroy() {
         if (destroyed) return
         destroyed = true
+        onUploadPageReleased = {}
         uploadCoordinator.destroy()
         indexStaging = null
+        descriptorSequencer.clear()
+        currentNodeForDescriptor = null
+        currentMaterialForDescriptor = null
+        allocationLedger?.releasePointResources(telemetryOwner)
         engine.destroyVertexBuffer(vertexBuffer)
         engine.destroyIndexBuffer(indexBuffer)
     }
@@ -135,6 +250,12 @@ internal class CoveragePointMeshResources(
         const val COLOR_BUFFER_INDEX = 1
         const val POSITION_COMPONENTS = 3
         const val COLOR_COMPONENTS = 4
+        const val STEADY_OWNED_BYTES_PER_ROW =
+            POSITION_COMPONENTS * Float.SIZE_BYTES + COLOR_COMPONENTS +
+                Int.SIZE_BYTES + POSITION_COMPONENTS * Float.SIZE_BYTES + COLOR_COMPONENTS
+        const val STARTUP_INDEX_STAGING_BYTES_PER_ROW = Int.SIZE_BYTES
+        const val PEAK_OWNED_BYTES_PER_ROW =
+            STEADY_OWNED_BYTES_PER_ROW + STARTUP_INDEX_STAGING_BYTES_PER_ROW
 
         // VertexBuffer.setBufferAt sizes a typed FloatBuffer in float elements,
         // while the color upload below uses a raw ByteBuffer and therefore uses
@@ -157,6 +278,13 @@ internal class CoveragePointMeshResources(
     }
 }
 
+/**
+ * A throwing upload method rejects that lane before accepting storage ownership.
+ * A successful call owns its buffer until onConsumed, which may run synchronously.
+ * The Filament adapter uses setBufferAt: destroyed-object checks and native overflow
+ * rejection precede queuing the buffer descriptor (Filament 1.71.5 VertexBuffer.cpp).
+ * A throwing kickSubmission does not cancel any already accepted upload.
+ */
 internal interface CoveragePointVertexUploader {
     fun uploadPositions(
         buffer: FloatBuffer,
@@ -171,86 +299,305 @@ internal interface CoveragePointVertexUploader {
         byteCount: Int,
         onConsumed: () -> Unit,
     )
+
+    /**
+     * Kicks submission of this bounded paired page to Filament's command
+     * stream without waiting for the driver. The ownership callbacks remain
+     * the only release/completion signal for the direct buffers.
+     */
+    fun kickSubmission() = Unit
 }
 
 internal class CoveragePointUploadCoordinator(
     capacity: Int,
     private val uploader: CoveragePointVertexUploader,
+    private val onUploadSubmitted: (Int) -> Unit = {},
+    private val onUploadAttributed: (Int, RendererUploadPageOrigin) -> Unit = { _, _ -> },
+    private val onResourceResetScheduled: () -> Unit = {},
+    private val onUploadCallback: () -> Unit = {},
+    private val onUploadCallbackAttributed: (RendererUploadPageOrigin) -> Unit = {},
+    private val onUploadCompleted: (Long) -> Unit = {},
+    private val onUploadCompletedAttributed: (Long, RendererUploadPageOrigin) -> Unit = { _, _ -> },
+    private val onDestroyedUploadCallback: () -> Unit = {},
+    private val onUploadPageReleasedWithTicket: (CoverageDescriptorPageTicket) -> Unit = {},
+    private val onUploadPageReleased: () -> Unit = {},
+    private val clockNanos: () -> Long = System::nanoTime,
 ) {
     private val buffers = CoveragePointUploadBuffers(capacity)
     private var uploadBusy = false
     private var consumedCallbackMask = 0
+    private var submittedCallbackMask = 0
+    private var submissionInProgress = false
+    private var activeUploadFailed = false
     private var activeUploadId = 0L
-    private var pendingSnapshot: CoveragePointRenderSnapshot? = null
+    private data class PendingUpload(
+        val snapshot: CoveragePointRenderSnapshot,
+        val origin: RendererUploadPageOrigin,
+    )
+    private data class PendingPage(
+        val page: CoveragePresentationPage,
+        val origin: RendererUploadPageOrigin,
+        val ticket: CoverageDescriptorPageTicket?,
+    )
+
+    private val pendingUploads = ArrayDeque<PendingUpload>()
+    private val pendingPages = ArrayDeque<PendingPage>()
     private var hasUploadedSnapshot = false
     private var destroyed = false
-
+    private var activeUploadStartedNanos = 0L
+    private var activeSnapshot: CoveragePointRenderSnapshot? = null
+    private var activePage: CoveragePresentationPage? = null
+    private var activePageTicket: CoverageDescriptorPageTicket? = null
+    private var activeOrigin = RendererUploadPageOrigin.ORDINARY
+    private val pendingRanges = ArrayDeque<UploadRange>()
     fun submit(snapshot: CoveragePointRenderSnapshot) {
+        enqueue(snapshot, RendererUploadPageOrigin.ORDINARY)
+    }
+
+    fun submitPage(
+        page: CoveragePresentationPage,
+        origin: RendererUploadPageOrigin,
+        ticket: CoverageDescriptorPageTicket? = null,
+    ) {
+        if (destroyed) {
+            if (ticket != null) onUploadPageReleasedWithTicket(ticket)
+            return
+        }
+        val cancelledPage = pendingPages.removeFirstOrNull()
+        pendingUploads.clear()
+        pendingPages.addLast(PendingPage(page, origin, ticket))
+        // Install the replacement before release: its callback may enqueue a newer page.
+        cancelledPage?.ticket?.let(onUploadPageReleasedWithTicket)
+    }
+
+    private fun enqueue(
+        snapshot: CoveragePointRenderSnapshot,
+        origin: RendererUploadPageOrigin,
+    ) {
         if (destroyed) return
-        pendingSnapshot =
-            if (uploadBusy && snapshot.update?.reset == false) {
+        val cancelledPage = pendingPages.removeFirstOrNull()
+        val normalized =
+            if ((uploadBusy || pendingRanges.isNotEmpty() || pendingUploads.isNotEmpty()) &&
+                snapshot.update?.reset == false
+            ) {
                 snapshot.copy(update = snapshot.update.copy(reset = true))
             } else {
                 snapshot
             }
-        drain()
+        if (origin == RendererUploadPageOrigin.ORDINARY &&
+            pendingUploads.lastOrNull()?.origin == RendererUploadPageOrigin.ORDINARY
+        ) {
+            pendingUploads.removeLast()
+        }
+        pendingUploads.addLast(PendingUpload(normalized, origin))
+        // Do not mutate the direct buffers while Filament still owns the
+        // current range. Once its two callbacks return, a newer revision
+        // supersedes every remaining chunk from the old snapshot.
+        if (uploadBusy) pendingRanges.clear()
+        cancelledPage?.ticket?.let(onUploadPageReleasedWithTicket)
+    }
+
+    /** Rehydrates a new Filament resource generation from the retained cut. */
+    fun submitForResourceGeneration(snapshot: CoveragePointRenderSnapshot) {
+        if (destroyed) return
+        onResourceResetScheduled()
+        enqueue(
+            snapshot.copy(update = snapshot.update?.copy(reset = true)),
+            RendererUploadPageOrigin.RESOURCE_GENERATION_RESET,
+        )
     }
 
     fun stagingBuffers(): CoveragePointUploadBuffers = buffers
 
+    fun onRendererFrame() = drain()
+
     fun destroy() {
+        if (destroyed) return
         destroyed = true
-        pendingSnapshot = null
+        val cancelledPage = pendingPages.removeFirstOrNull()
+        pendingUploads.clear()
+        pendingRanges.clear()
+        // Submitted direct storage and its page owner survive until consumption.
+        if (!uploadBusy) releaseActivePage()
+        cancelledPage?.ticket?.let(onUploadPageReleasedWithTicket)
+    }
+
+    private fun releaseActivePage() {
+        activeSnapshot = null
+        activePage = null
+        val ticket = activePageTicket
+        activePageTicket = null
+        if (ticket != null) onUploadPageReleasedWithTicket(ticket)
     }
 
     private fun drain() {
         if (destroyed || uploadBusy) return
-        val snapshot = pendingSnapshot ?: return
-        pendingSnapshot = null
-        val update = snapshot.update
-        val spans = update?.spans.orEmpty()
-        val fullUpload = !hasUploadedSnapshot || update == null || update.reset
-        if (!fullUpload && spans.isEmpty()) {
-            return
+        if (pendingRanges.isEmpty()) {
+            val pendingPage = pendingPages.removeFirstOrNull()
+            if (pendingPage != null) {
+                activePage = pendingPage.page
+                activePageTicket = pendingPage.ticket
+                activeOrigin = pendingPage.origin
+                pendingRanges.addLast(
+                    UploadRange(
+                        pendingPage.page.startSlot,
+                        pendingPage.page.startSlot + pendingPage.page.count,
+                    ),
+                )
+            } else {
+                activePageTicket = null
+                val pending = pendingUploads.removeFirstOrNull() ?: return
+                val snapshot = pending.snapshot
+                val update = snapshot.update
+                val spans = update?.spans.orEmpty()
+                val fullUpload = !hasUploadedSnapshot || update == null || update.reset
+                if (!fullUpload && spans.isEmpty()) return
+                activeSnapshot = snapshot
+                activeOrigin = pending.origin
+                pendingRanges.addAll(
+                    uploadRanges(
+                        count = snapshot.count,
+                        fullUpload = fullUpload,
+                        spans = spans,
+                    ),
+                )
+                hasUploadedSnapshot = true
+            }
         }
-        val startSlot = if (fullUpload) {
-            0
-        } else {
-            spans.minOf { it.startSlot }
-        }
-        val endSlot = if (fullUpload) {
-            snapshot.count
-        } else {
-            spans.maxOf { it.startSlot + it.colors.size }
-        }
-        buffers.writeRange(snapshot.positions, snapshot.colors, startSlot, endSlot)
-        hasUploadedSnapshot = true
+        val range = pendingRanges.removeFirstOrNull() ?: return
         uploadBusy = true
         consumedCallbackMask = 0
+        submittedCallbackMask = 0
+        activeUploadFailed = false
+        submissionInProgress = true
+        activeUploadStartedNanos = clockNanos()
         val uploadId = ++activeUploadId
-        uploader.uploadPositions(
-            buffers.positionBuffer,
-            startSlot * CoveragePointMeshResources.POSITION_COMPONENTS * Float.SIZE_BYTES,
-            CoveragePointMeshResources.positionBufferElementCount(endSlot - startSlot),
-        ) { consumed(uploadId, POSITION_CALLBACK) }
-        uploader.uploadColors(
-            buffers.colorBuffer,
-            startSlot * CoveragePointMeshResources.COLOR_COMPONENTS,
-            (endSlot - startSlot) * CoveragePointMeshResources.COLOR_COMPONENTS,
-        ) { consumed(uploadId, COLOR_CALLBACK) }
+        try {
+            val startSlot = range.startSlot
+            val endSlot = range.endSlotExclusive
+            val page = activePage
+            if (page != null) {
+                buffers.writePage(page.positions, page.colors, page.startSlot, page.count)
+            } else {
+                val snapshot = checkNotNull(activeSnapshot)
+                buffers.writeRange(snapshot.positions, snapshot.colors, startSlot, endSlot)
+            }
+            val byteCount = (endSlot - startSlot) *
+                (CoveragePointMeshResources.POSITION_COMPONENTS * Float.SIZE_BYTES +
+                    CoveragePointMeshResources.COLOR_COMPONENTS)
+            onUploadSubmitted(byteCount)
+            if (destroyed) return
+            onUploadAttributed(byteCount, activeOrigin)
+            if (destroyed) return
+            submitLane(POSITION_CALLBACK) {
+                uploader.uploadPositions(
+                    buffers.positionBuffer,
+                    startSlot * CoveragePointMeshResources.POSITION_COMPONENTS * Float.SIZE_BYTES,
+                    CoveragePointMeshResources.positionBufferElementCount(endSlot - startSlot),
+                ) { consumed(uploadId, POSITION_CALLBACK) }
+            }
+            if (destroyed) return
+            submitLane(COLOR_CALLBACK) {
+                uploader.uploadColors(
+                    buffers.colorBuffer,
+                    startSlot * CoveragePointMeshResources.COLOR_COMPONENTS,
+                    (endSlot - startSlot) * CoveragePointMeshResources.COLOR_COMPONENTS,
+                ) { consumed(uploadId, COLOR_CALLBACK) }
+            }
+            if (destroyed) return
+            // A kick failure cannot cancel ownership of either queued lane.
+            uploader.kickSubmission()
+        } catch (error: Throwable) {
+            activeUploadFailed = true
+            hasUploadedSnapshot = false
+            pendingRanges.clear()
+            throw error
+        } finally {
+            submissionInProgress = false
+            settleConsumedUpload()
+        }
+    }
+
+    private inline fun submitLane(callbackBit: Int, submit: () -> Unit) {
+        // Register first: an uploader may consume synchronously inside submit.
+        submittedCallbackMask = submittedCallbackMask or callbackBit
+        try {
+            submit()
+        } catch (error: Throwable) {
+            // Upload methods reject before accepting ownership when they throw.
+            // Earlier successful lanes still retain their real callback obligations.
+            submittedCallbackMask = submittedCallbackMask and callbackBit.inv()
+            throw error
+        }
     }
 
     private fun consumed(uploadId: Long, callbackBit: Int) {
-        if (destroyed || !uploadBusy || uploadId != activeUploadId) return
-        if (consumedCallbackMask and callbackBit != 0) return
+        if (!uploadBusy || uploadId != activeUploadId ||
+            submittedCallbackMask and callbackBit == 0 ||
+            consumedCallbackMask and callbackBit != 0
+        ) return
         consumedCallbackMask = consumedCallbackMask or callbackBit
-        if (consumedCallbackMask == BOTH_CALLBACKS) {
-            uploadBusy = false
-            drain()
+        if (destroyed) {
+            onDestroyedUploadCallback()
+        } else {
+            onUploadCallback()
+            if (!destroyed) onUploadCallbackAttributed(activeOrigin)
+        }
+        settleConsumedUpload()
+    }
+
+    private fun settleConsumedUpload() {
+        if (!uploadBusy || submissionInProgress ||
+            consumedCallbackMask and submittedCallbackMask != submittedCallbackMask
+        ) return
+        val completed = !activeUploadFailed && submittedCallbackMask == BOTH_CALLBACKS
+        val origin = activeOrigin
+        val elapsedNanos = (clockNanos() - activeUploadStartedNanos).coerceAtLeast(0L)
+        uploadBusy = false
+        if (pendingRanges.isEmpty()) {
+            releaseActivePage()
+        }
+        if (destroyed) return
+        if (completed) {
+            onUploadCompleted(elapsedNanos)
+            if (!destroyed) onUploadCompletedAttributed(elapsedNanos, origin)
+        }
+        if (!destroyed) onUploadPageReleased()
+        // A completed callback only releases the page; a renderer frame admits the next one.
+    }
+
+    private fun uploadRanges(
+        count: Int,
+        fullUpload: Boolean,
+        spans: List<com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointSpan>,
+    ): List<UploadRange> {
+        val sourceRanges =
+            if (fullUpload) {
+                listOf(UploadRange(0, count))
+            } else {
+                spans.map { span ->
+                    UploadRange(span.startSlot, span.endSlotExclusive)
+                }
+            }
+        return buildList {
+            sourceRanges.forEach { range ->
+                var start = range.startSlot
+                while (start < range.endSlotExclusive) {
+                    val end = minOf(start + MAX_ROWS_PER_UPLOAD, range.endSlotExclusive)
+                    add(UploadRange(start, end))
+                    start = end
+                }
+            }
         }
     }
 
+    private data class UploadRange(val startSlot: Int, val endSlotExclusive: Int)
+
     private companion object {
+        const val MAX_ROWS_PER_UPLOAD =
+            RendererTelemetry.ORDINARY_UPLOAD_LIMIT_BYTES /
+                (CoveragePointMeshResources.POSITION_COMPONENTS * Float.SIZE_BYTES +
+                    CoveragePointMeshResources.COLOR_COMPONENTS)
         const val POSITION_CALLBACK = 1
         const val COLOR_CALLBACK = 2
         const val BOTH_CALLBACKS = POSITION_CALLBACK or COLOR_CALLBACK
@@ -295,5 +642,9 @@ private class FilamentCoveragePointVertexUploader(
             callbackHandler,
             Runnable(onConsumed),
         )
+    }
+
+    override fun kickSubmission() {
+        engine.flush()
     }
 }

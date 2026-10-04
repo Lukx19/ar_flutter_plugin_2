@@ -1,0 +1,39 @@
+{
+  "format": "residency_shard_resource_corpus_v1",
+  "status": "hash-bound-synthetic-boundary",
+  "baseVector": "residency_golden_vector_v1.json",
+  "baseVectorSha256": "2bdb4c36679cd05bab5a825a8c32783d9a660cb2f68b4a07ba137871dfa3fd5c",
+  "expectedCaseCount": 4,
+  "expectedCaseNames": [
+    "capture-watermark-high-bit",
+    "pending-watermark-high-bit",
+    "declared-stored-bytes-mismatch",
+    "packet-total-overflow"
+  ],
+  "cases": [
+    {
+      "name": "capture-watermark-high-bit",
+      "operation": "set-capture-high-bit",
+      "outcome": "reject",
+      "errorClass": "bounds"
+    },
+    {
+      "name": "pending-watermark-high-bit",
+      "operation": "set-pending-high-bit",
+      "outcome": "reject",
+      "errorClass": "bounds"
+    },
+    {
+      "name": "declared-stored-bytes-mismatch",
+      "operation": "set-stored-bytes-zero",
+      "outcome": "reject",
+      "errorClass": "bounds"
+    },
+    {
+      "name": "packet-total-overflow",
+      "operation": "oversize-packet",
+      "outcome": "reject",
+      "errorClass": "length"
+    }
+  ]
+}

@@ -30,11 +30,21 @@ import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.ThreadFactory
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+
+// V2 serializes still admissions and closes every acquired Image before the
+// next request. One retained reader buffer is therefore sufficient and avoids
+// keeping a second multi-megapixel gralloc allocation resident throughout the
+// live AR session.
+private const val STILL_READER_MAX_IMAGES = 1
 
 /// Complete configuration object parsed from ARCaptureConfig
 data class ParsedCaptureConfig(
@@ -105,6 +115,42 @@ data class ParsedCaptureConfig(
     }
 }
 
+/**
+ * Defers durable component consumption without leaking Camera2-owned streams
+ * when shutdown removes a queued task before its executor can run it.
+ */
+private class DirectStoreDispatch(
+    private val components: SharedCameraComponentSetV2,
+    private val callback: (SharedCameraComponentSetV2) -> Unit,
+    private val onFailure: (String) -> Unit,
+) : Runnable {
+    private val started = AtomicBoolean(false)
+
+    override fun run() {
+        if (!started.compareAndSet(false, true)) return
+        try {
+            // The callback owns stream closure after it claims the set.
+            // Unexpected callback failures still release every stream.
+            callback(components)
+        } catch (error: Throwable) {
+            closeStreams()
+            onFailure("component-dispatch")
+        }
+    }
+
+    fun cancel(reason: String) {
+        if (!started.compareAndSet(false, true)) return
+        closeStreams()
+        onFailure(reason)
+    }
+
+    private fun closeStreams() {
+        components.streams.forEach { stream ->
+            runCatching { stream.input.close() }
+        }
+    }
+}
+
 data class SharedCameraCaptureResult(
     val reservationToken: String,
     val imageId: String,
@@ -149,6 +195,83 @@ data class ExposureBracketMember(
             exposureEv > 0 -> "jpeg_ev+$exposureEv"
             else -> "jpeg"
         }
+}
+
+/** Atomically publishes the debug-only exposure route across platform and admission threads. */
+internal class AttemptQualifiedExposureHookV2 {
+    private data class Route(
+        val request: (
+            CaptureAttemptQualifierV2,
+            Set<CaptureComponentKind>,
+            SharedCameraExposureCallbackV2,
+        ) -> Boolean,
+        val cancel: (CaptureAttemptQualifierV2) -> Unit,
+    )
+
+    private val lock = Any()
+    private var current: Route? = null
+    private val owners = linkedMapOf<CaptureAttemptQualifierV2, Route>()
+    private val retired = linkedSetOf<CaptureAttemptQualifierV2>()
+
+    fun install(
+        request: (
+            CaptureAttemptQualifierV2,
+            Set<CaptureComponentKind>,
+            SharedCameraExposureCallbackV2,
+        ) -> Boolean,
+        cancel: (CaptureAttemptQualifierV2) -> Unit,
+    ) {
+        synchronized(lock) { current = Route(request, cancel) }
+    }
+
+    fun request(
+        qualifier: CaptureAttemptQualifierV2,
+        required: Set<CaptureComponentKind>,
+        callback: SharedCameraExposureCallbackV2,
+    ): Boolean? {
+        val installed = synchronized(lock) {
+            val selected = current ?: return null
+            check(owners.size < MAX_ACTIVE_OWNERS || qualifier in owners) {
+                "synthetic-exposure-owner-capacity"
+            }
+            check(owners.putIfAbsent(qualifier, selected) == null) {
+                "synthetic-exposure-owner-duplicate"
+            }
+            retired.remove(qualifier)
+            selected
+        }
+        return installed.request(qualifier, required, callback)
+    }
+
+    fun cancel(qualifier: CaptureAttemptQualifierV2): Boolean {
+        val installed = synchronized(lock) {
+            owners.remove(qualifier)?.also {
+                retired += qualifier
+                while (retired.size > MAX_RETIRED_OWNERS) retired.remove(retired.first())
+            } ?: return qualifier in retired
+        }
+        installed.cancel(qualifier)
+        return true
+    }
+
+    fun clear() {
+        val active = synchronized(lock) {
+            current = null
+            owners.toList().also { entries ->
+                owners.clear()
+                entries.forEach { (qualifier, _) -> retired += qualifier }
+                while (retired.size > MAX_RETIRED_OWNERS) retired.remove(retired.first())
+            }
+        }
+        active.forEach { (qualifier, installed) -> installed.cancel(qualifier) }
+    }
+
+    internal fun activeOwnersForTest(): Int = synchronized(lock) { owners.size }
+
+    private companion object {
+        const val MAX_ACTIVE_OWNERS = 2
+        const val MAX_RETIRED_OWNERS = 4
+    }
 }
 
 /**
@@ -202,24 +325,100 @@ internal class SharedCameraManager(
     private val onCaptureFinalizationFailed: (String, Throwable) -> Unit = { _, _ -> },
     private val resourceCounters: CaptureResourceCounters = CaptureResourceCounters(),
 ) {
+    // Additive V2 hook. V1 ImageCacheManager/correlation ownership is never
+    // consulted by this route; a per-view #101 binding installs the Camera2 hook.
+    private val v2ExposureHook = AttemptQualifiedExposureHookV2()
+
+    internal fun installAttemptQualifiedExposureHookV2(
+        request: (CaptureAttemptQualifierV2, Set<CaptureComponentKind>, SharedCameraExposureCallbackV2) -> Boolean,
+        cancel: (CaptureAttemptQualifierV2) -> Unit = {},
+    ) = v2ExposureHook.install(request, cancel)
+
+    internal fun requestAttemptQualifiedExposureV2(
+        qualifier: CaptureAttemptQualifierV2,
+        required: Set<CaptureComponentKind>,
+        callback: SharedCameraExposureCallbackV2,
+    ): Boolean = v2ExposureHook.request(qualifier, required, callback)
+        ?: requestDirectExposureV2(qualifier, required, callback)
+
+    internal fun cancelAttemptQualifiedExposureV2(qualifier: CaptureAttemptQualifierV2) {
+        if (!v2ExposureHook.cancel(qualifier)) cancelDirectExposureV2(qualifier)
+    }
+
+    internal fun clearAttemptQualifiedExposureHookV2() = v2ExposureHook.clear()
+
     companion object {
         private const val VendorCameraDrainWindowMs = 3_500L
         private const val ShutdownCompletionPollMs = 50L
         private const val StartupTimeoutMs = 5000L
         private const val ManualCaptureTimeoutMs = 5000L
         private const val ManualCaptureRequestTagPrefix = "capture3d_manual_shared_still"
+        private const val ProcessedFrameMaximumSlots = 6
         private val processRestartGate =
             SharedCameraRestartGate(cooldownMs = VendorCameraDrainWindowMs)
+
+        /**
+         * Two complete YUV frames, represented by three independently leased
+         * planes. Camera2's YUV_420_888 buffers can expose interleaved chroma
+         * and row padding, so reserve four profile-pixel units (two bytes per
+         * pixel across each complete frame) rather than the packed 1.5x JPEG
+         * size. This remains a finite profile-derived bound.
+         */
+        private fun processedFrameMaximumBytes(profile: Size): Long {
+            val pixels = profile.width.toLong() * profile.height.toLong()
+            require(pixels > 0L)
+            return Math.multiplyExact(pixels, 4L)
+        }
     }
 
+    private val config: ParsedCaptureConfig = ParsedCaptureConfig.fromMap(configMap)
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     private val capabilityQuerier = CameraCapabilityQuerier(context)
     private val stillCaptureCorrelator = PendingStillCaptureCorrelator(timeoutMs = 30_000L)
-    private val processedFrameCorrelator = ProcessedFrameCorrelator<PackedYuv420>()
+    // Processed capture is serialized by the pending-manual-capture gate. Keep
+    // the large YUV plane copies in an owner-private bounded pool and return
+    // them only after the worker has produced the immutable JPEG result. The
+    // profile bound covers two complete YUV frames and is charged as retained
+    // capture-owner capacity; exhaustion is a nonblocking capture refusal.
+    // The configured size describes the requested JPEG output. Defer pool
+    // creation until capability validation has selected the actual reader
+    // stream size, so the byte bound covers the CPU-side YUV planes that the
+    // processed path copies.
+    private val processedFrameBuffers: CaptureByteArrayPool by lazy(LazyThreadSafetyMode.NONE) {
+        CaptureByteArrayPool(
+            maximumSlots = ProcessedFrameMaximumSlots,
+            maximumBytes = processedFrameMaximumBytes(getEffectiveResolution()),
+        )
+    }
+    private val processedFrameCorrelator = ProcessedFrameCorrelator<PackedYuv420>(
+        onFrameDiscarded = { frame -> frame.release() },
+    )
     private val startupBarrier = SharedCameraStartupBarrier()
+    private val sessionCallbackFence = SharedCameraSessionCallbackFence()
     private val repeatingRequestLifecycle = SharedCameraRepeatingRequestLifecycle()
     private val rawJpegCaptureCorrelator =
-        RawJpegCaptureCorrelator<Image, TotalCaptureResult>(::closeTrackedImage)
+        RawJpegCaptureCorrelator<PendingStillImagePayload, Image, TotalCaptureResult>(
+            PendingStillImagePayload::sensorTimestampNs,
+            {},
+            ::closeTrackedImage,
+        )
+    private val directRawJpegCaptureCorrelator =
+        RawJpegCaptureCorrelator<Image, Image, TotalCaptureResult>(
+            Image::getTimestamp,
+            ::closeTrackedImage,
+            ::closeTrackedImage,
+        )
+    private val directComponentExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "capture3d-v2-component-stream").apply { isDaemon = true }
+    }
+    // Durable V2 commit reads the camera-owned component stream and may fsync
+    // several megabytes. Keep that work off the Camera2 callback handler so an
+    // automatic still cannot pause ARCore frame delivery while it is stored.
+    private val directStoreExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "capture3d-v2-store-commit").apply { isDaemon = true }
+    }
+    private val pendingDirectStoreDispatches =
+        mutableSetOf<DirectStoreDispatch>()
     private val captureObservationLock = Any()
     private val captureObservedTimestampsNs = linkedMapOf<Long, Long>()
     private val sharedCameraCaptureCallback =
@@ -230,6 +429,15 @@ internal class SharedCameraManager(
                 timestamp: Long,
                 frameNumber: Long,
             ) {
+                val directTag = request.tag as? DirectCaptureTagV2
+                if (directTag != null && pendingDirectCapture?.qualifier == directTag.qualifier) {
+                    recordCaptureObservation(timestamp, System.nanoTime())
+                    captureLatencyLog(
+                        "camera_capture_started",
+                        directTag.qualifier.identity.attemptId,
+                    )
+                    return
+                }
                 val pending = pendingManualCapture ?: return
                 val requestTag = request.tag as? ManualCaptureTag ?: return
                 if (requestTag.generation != pending.generation ||
@@ -252,6 +460,21 @@ internal class SharedCameraManager(
                         "SharedCameraManager",
                         "Capture result frame=${result.frameNumber} tag=${request.tag}",
                     )
+                }
+                val directTag = request.tag as? DirectCaptureTagV2
+                if (directTag != null && pendingDirectCapture?.qualifier == directTag.qualifier) {
+                    captureLatencyLog(
+                        "camera_capture_completed",
+                        directTag.qualifier.identity.attemptId,
+                    )
+                    // RAW/JPEG delivery also needs this result to write the DNG.
+                    // The JPEG-only path streams directly from its image reader.
+                    if (config.rawJpeg) {
+                        result.get(CaptureResult.SENSOR_TIMESTAMP)?.let { sensorTimestampNs ->
+                            handleRawJpegCaptureResult(sensorTimestampNs, result)
+                        }
+                    }
+                    return
                 }
                 val pending = pendingManualCapture ?: return
                 val requestTag = request.tag as? ManualCaptureTag ?: return
@@ -313,20 +536,107 @@ internal class SharedCameraManager(
     private var backgroundHandler: Handler? = null
     private var captureCallbackThread: HandlerThread? = null
     private var captureCallbackHandler: Handler? = null
+
+    /** Reusable per-finalizer encoding storage; no encoded output is retained here. */
+    private class JpegEncodingScratch {
+        var nv21 = ByteArray(0)
+        val output = ReusableJpegOutput()
+        var accountedNv21Bytes = 0L
+        var accountedOutputBytes = 0L
+
+        fun ensureNv21(required: Int): ByteArray {
+            if (nv21.size < required) nv21 = ByteArray(required)
+            return nv21
+        }
+
+        fun clear() {
+            nv21 = ByteArray(0)
+            output.reset()
+            accountedNv21Bytes = 0L
+            accountedOutputBytes = 0L
+        }
+    }
+
+    private class ReusableJpegOutput : ByteArrayOutputStream() {
+        fun capacityBytes(): Int = buf.size
+    }
+
+    private val jpegEncodingScratch: ThreadLocal<JpegEncodingScratch?> = ThreadLocal()
+    private val jpegScratchActiveOwners = AtomicLong(0L)
+    private val jpegScratchNv21ResidentBytes = AtomicLong(0L)
+    private val jpegScratchOutputResidentBytes = AtomicLong(0L)
+    private val jpegScratchPeakNv21Bytes = AtomicLong(0L)
+    private val jpegScratchPeakOutputBytes = AtomicLong(0L)
+
+    private fun currentJpegEncodingScratch(): JpegEncodingScratch {
+        jpegEncodingScratch.get()?.let { return it }
+        return JpegEncodingScratch().also {
+            jpegEncodingScratch.set(it)
+            jpegScratchActiveOwners.incrementAndGet()
+        }
+    }
+
+    private fun recordJpegScratchCapacity(scratch: JpegEncodingScratch) {
+        val nv21Bytes = scratch.nv21.size.toLong()
+        val outputBytes = scratch.output.capacityBytes().toLong()
+        if (nv21Bytes != scratch.accountedNv21Bytes) {
+            jpegScratchNv21ResidentBytes.addAndGet(nv21Bytes - scratch.accountedNv21Bytes)
+            scratch.accountedNv21Bytes = nv21Bytes
+        }
+        if (outputBytes != scratch.accountedOutputBytes) {
+            jpegScratchOutputResidentBytes.addAndGet(outputBytes - scratch.accountedOutputBytes)
+            scratch.accountedOutputBytes = outputBytes
+        }
+        updateMaximum(jpegScratchPeakNv21Bytes, jpegScratchNv21ResidentBytes.get())
+        updateMaximum(jpegScratchPeakOutputBytes, jpegScratchOutputResidentBytes.get())
+    }
+
+    private fun releaseCurrentJpegEncodingScratch() {
+        val scratch = jpegEncodingScratch.get() ?: return
+        jpegScratchNv21ResidentBytes.addAndGet(-scratch.accountedNv21Bytes)
+        jpegScratchOutputResidentBytes.addAndGet(-scratch.accountedOutputBytes)
+        scratch.clear()
+        jpegEncodingScratch.remove()
+        jpegScratchActiveOwners.decrementAndGet()
+    }
+
+    private fun updateMaximum(target: AtomicLong, candidate: Long) {
+        while (true) {
+            val current = target.get()
+            if (candidate <= current || target.compareAndSet(current, candidate)) return
+        }
+    }
+
+    private val finalizationThreadFactory = ThreadFactory { runnable ->
+        Thread(
+            {
+                try {
+                    runnable.run()
+                } finally {
+                    releaseCurrentJpegEncodingScratch()
+                }
+            },
+            "capture3d-v2-finalizer",
+        ).apply { isDaemon = true }
+    }
+
     private val finalizationWorkersDelegate = lazy {
+        val effectiveResolution = getEffectiveResolution()
         val transientBytes =
-            config.resolution.width.toLong() * config.resolution.height.toLong() * 7L
+            effectiveResolution.width.toLong() * effectiveResolution.height.toLong() * 7L
         val workers =
             CaptureFinalizationWorkerPool.recommendedWorkerCount(
                 availableProcessors = Runtime.getRuntime().availableProcessors().coerceAtLeast(1),
                 transientBytesPerJob = transientBytes.coerceAtLeast(1L),
                 memoryBudgetBytes = 256L * 1024L * 1024L,
             )
-        CaptureFinalizationWorkerPool(workerCount = workers, queueCapacity = workers)
+        CaptureFinalizationWorkerPool(
+            workerCount = workers,
+            queueCapacity = workers,
+            threadFactory = finalizationThreadFactory,
+        )
     }
     private val finalizationWorkers by finalizationWorkersDelegate
-
-    private val config: ParsedCaptureConfig = ParsedCaptureConfig.fromMap(configMap)
 
     private var imageCacheManager: ImageCacheManager? = null
     private var runtimeCameraController: RuntimeCameraController? = null
@@ -349,12 +659,19 @@ internal class SharedCameraManager(
     @Volatile
     private var cameraCloseLatch = CountDownLatch(1)
     private var processShutdownGeneration: Long? = null
+    private var sessionCallbackGeneration = 0L
 
     private var isInitialized = false
     private val requestGeneration = CaptureRequestGeneration()
     private val pendingManualCaptureOwner = CaptureAttemptOwner<PendingManualCapture>()
     private val pendingManualCapture: PendingManualCapture?
         get() = pendingManualCaptureOwner.get()
+    private val pendingDirectCaptureOwner =
+        QualifiedCaptureAttemptOwnerV2<PendingDirectCaptureV2, CaptureAttemptQualifierV2>(
+            PendingDirectCaptureV2::qualifier,
+        )
+    private val pendingDirectCapture: PendingDirectCaptureV2?
+        get() = pendingDirectCaptureOwner.get()
 
     private fun recordCaptureObservation(sensorTimestampNs: Long, observedTimestampNs: Long) {
         synchronized(captureObservationLock) {
@@ -384,6 +701,18 @@ internal class SharedCameraManager(
         @Volatile var preAlignedPose: PoseDataExtractor.AlignedPose? = null,
         @Volatile var accepted: SharedCaptureAccepted? = null,
         val bracketedCaptures: MutableMap<Int, ExposureBracketMember> = mutableMapOf(),
+    )
+
+    /**
+     * V2's image owner.  It is intentionally distinct from PendingManualCapture:
+     * no ImageCacheManager reservation, image id, or V1 finalization worker can
+     * observe this image. Camera2 Images remain owned until the durable store
+     * closes their bounded component streams.
+     */
+    private data class PendingDirectCaptureV2(
+        val qualifier: CaptureAttemptQualifierV2,
+        val required: Set<CaptureComponentKind>,
+        val callback: SharedCameraExposureCallbackV2,
     )
 
     private data class ExposureBracketSpec(
@@ -453,7 +782,7 @@ internal class SharedCameraManager(
                 effectiveResolution.width,
                 effectiveResolution.height,
                 config.format,
-                2,
+                STILL_READER_MAX_IMAGES,
             ).apply {
                 setOnImageAvailableListener({ reader ->
                     handlePreviewImageAvailable(reader)
@@ -466,7 +795,7 @@ internal class SharedCameraManager(
                     rawSize.width,
                     rawSize.height,
                     ImageFormat.RAW_SENSOR,
-                    2,
+                    STILL_READER_MAX_IMAGES,
                 ).apply {
                     setOnImageAvailableListener({ reader ->
                         handleRawImageAvailable(reader)
@@ -480,11 +809,19 @@ internal class SharedCameraManager(
         // still-capture surfaces are also targeted by the repeating request.
         sharedCamera.setAppSurfaces(cameraId, listOf(scenePreviewSurface))
 
+        val openCameraStartedNs = SystemClock.elapsedRealtimeNanos()
         val deviceStateCallback =
             object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
+                    startupProbe("onOpened-enter", openCameraStartedNs)
                     cameraDevice = camera
-                    validateSharedResolutionCandidates(camera)
+                    val resolutionProbeStartedNs = SystemClock.elapsedRealtimeNanos()
+                    startupProbe("resolution-probe-enter", openCameraStartedNs)
+                    try {
+                        validateSharedResolutionCandidates(camera)
+                    } finally {
+                        startupProbe("resolution-probe-exit", resolutionProbeStartedNs)
+                    }
                     createCaptureSession()
                 }
 
@@ -510,10 +847,69 @@ internal class SharedCameraManager(
         val wrappedDeviceStateCallback =
             sharedCamera.createARDeviceStateCallback(deviceStateCallback, backgroundHandler)
 
-        cameraManager.openCamera(
-            cameraId,
-            wrappedDeviceStateCallback,
-            backgroundHandler,
+        startupProbe("open-enter", openCameraStartedNs)
+        try {
+            cameraManager.openCamera(
+                cameraId,
+                wrappedDeviceStateCallback,
+                backgroundHandler,
+            )
+        } finally {
+            startupProbe("open-exit", openCameraStartedNs)
+        }
+    }
+
+    private data class DirectCaptureTagV2(val qualifier: CaptureAttemptQualifierV2)
+
+    private fun requestDirectExposureV2(
+        qualifier: CaptureAttemptQualifierV2,
+        required: Set<CaptureComponentKind>,
+        callback: SharedCameraExposureCallbackV2,
+    ): Boolean {
+        val supported = required == setOf(CaptureComponentKind.JPEG) ||
+            required == setOf(CaptureComponentKind.JPEG, CaptureComponentKind.DNG)
+        if (!supported || !isInitialized) return false
+        if (pendingManualCapture != null) return false
+        if ((CaptureComponentKind.DNG in required) != config.rawJpeg) return false
+        val pending = PendingDirectCaptureV2(qualifier, required, callback)
+        if (!pendingDirectCaptureOwner.acquire(pending)) return false
+        val activeSession = captureSession
+        val builder = manualCaptureRequestBuilder
+        if (activeSession == null || builder == null || !repeatingRequestLifecycle.isRepeatingActive()) {
+            pendingDirectCaptureOwner.release(pending)
+            return false
+        }
+        return try {
+            builder.setTag(DirectCaptureTagV2(qualifier))
+            captureLatencyLog("camera_request_submit", qualifier.identity.attemptId)
+            activeSession.capture(builder.build(), sharedCameraCaptureCallback, captureCallbackHandler)
+            captureLatencyLog("camera_request_submitted", qualifier.identity.attemptId)
+            true
+        } catch (error: Throwable) {
+            pendingDirectCaptureOwner.release(pending)
+            callback.onFailure(qualifier, "camera-submit")
+            false
+        }
+    }
+
+    private fun cancelDirectExposureV2(qualifier: CaptureAttemptQualifierV2) {
+        pendingDirectCaptureOwner.cancel(qualifier) ?: return
+        directRawJpegCaptureCorrelator.clear()
+    }
+
+    private fun captureLatencyLog(stage: String, attemptId: String) {
+        Log.i(
+            "CaptureLatency",
+            "stage=$stage attemptId=$attemptId elapsedRealtimeNs=${SystemClock.elapsedRealtimeNanos()}",
+        )
+    }
+
+    /** Temporary startup diagnosis; remove after the Camera2 handoff is explained. */
+    private fun startupProbe(stage: String, originNs: Long) {
+        Log.i(
+            "SharedCameraManager",
+            "[STARTUP-PROBE] stage=$stage thread=${Thread.currentThread().name} " +
+                "elapsedNs=${SystemClock.elapsedRealtimeNanos() - originNs}",
         )
     }
 
@@ -571,7 +967,7 @@ internal class SharedCameraManager(
                     candidate.width,
                     candidate.height,
                     config.format,
-                    2,
+                    STILL_READER_MAX_IMAGES,
                 )
             try {
                 val outputs =
@@ -784,7 +1180,10 @@ internal class SharedCameraManager(
             val wrappedSessionStateCallback =
                 sharedCamera.createARSessionStateCallback(sessionStateCallback, backgroundHandler)
             val guardedSessionStateCallback =
-                guardArCoreStartupStateCallback(wrappedSessionStateCallback)
+                guardArCoreStartupStateCallback(
+                    wrappedSessionStateCallback,
+                    sessionCallbackGeneration,
+                )
             cameraDevice.createCaptureSession(
                 sessionSurfaces,
                 guardedSessionStateCallback,
@@ -948,7 +1347,7 @@ internal class SharedCameraManager(
         return textureId
     }
 
-    /** Delegates lifecycle preparation to the SceneView 4.21.2 renderer host. */
+    /** Delegates lifecycle preparation to the SceneView 4.47.0 renderer host. */
     private fun disableSceneViewResumeReconfiguration(arSession: Session) {
         if (sceneViewResumeReconfigurationDisabled) {
             return
@@ -1038,8 +1437,10 @@ internal class SharedCameraManager(
         // callback on this same handler, preventing timestamp correlation.
         val image = reader.acquireLatestImage() ?: return
         resourceCounters.onImageAcquired()
+        var imageTransferred = false
         try {
-            if (pendingManualCapture == null) {
+            val direct = pendingDirectCapture
+            if (pendingManualCapture == null && direct == null) {
                 return
             }
             val encodeStartedAtMs = System.currentTimeMillis()
@@ -1094,6 +1495,27 @@ internal class SharedCameraManager(
             check(image.format == ImageFormat.JPEG) {
                 "Supported shared-camera capture modes must deliver hardware JPEG"
             }
+            if (direct != null) {
+                captureLatencyLog("camera_image_arrived", direct.qualifier.identity.attemptId)
+                if (CaptureComponentKind.DNG in direct.required) {
+                    imageTransferred = true
+                    directRawJpegCaptureCorrelator.onJpeg(image)
+                        ?.let(::handleCorrelatedDirectRawJpegCapture)
+                } else if (pendingDirectCaptureOwner.release(direct)) {
+                    imageTransferred = true
+                    val jpeg = CameraPlaneInputStreamV2(
+                        image.planes.single().buffer,
+                    ) { closeTrackedImage(image) }
+                        dispatchDirectStoreComponents(
+                            direct = direct,
+                            streams = listOf(
+                                CaptureComponentStreamV2(CaptureComponentKind.JPEG, jpeg),
+                            ),
+                            exposureTimestampNanoseconds = image.timestamp,
+                        )
+                }
+                return
+            }
             val jpegBytes = readImageBytes(image)
             Log.i(
                 "SharedCameraManager",
@@ -1119,24 +1541,39 @@ internal class SharedCameraManager(
             )?.let(::handleCorrelatedStillCapture)
         } catch (error: Throwable) {
             Log.e("SharedCameraManager", "Failed to encode shared-camera YUV frame", error)
+            pendingDirectCapture?.let { direct ->
+                if (pendingDirectCaptureOwner.release(direct)) {
+                    direct.callback.onFailure(direct.qualifier, "camera-component")
+                }
+            }
             pendingManualCapture?.let { pending ->
                 pending.error = error
                 pending.latch.countDown()
             }
         } finally {
-            closeTrackedImage(image)
+            if (!imageTransferred) closeTrackedImage(image)
         }
     }
 
     private fun handleRawImageAvailable(reader: ImageReader) {
         val image = reader.acquireNextImage() ?: return
         resourceCounters.onImageAcquired()
-        if (pendingManualCapture == null) {
+        if (pendingManualCapture == null && pendingDirectCapture == null) {
             closeTrackedImage(image)
             return
         }
-        rawJpegCaptureCorrelator.onRaw(image.timestamp, image)
-            ?.let(::handleCorrelatedRawJpegCapture)
+        val direct = pendingDirectCapture
+        if (direct != null) {
+            captureLatencyLog(
+                "camera_raw_image_arrived",
+                direct.qualifier.identity.attemptId,
+            )
+            directRawJpegCaptureCorrelator.onRaw(image.timestamp, image)
+                ?.let(::handleCorrelatedDirectRawJpegCapture)
+        } else {
+            rawJpegCaptureCorrelator.onRaw(image.timestamp, image)
+                ?.let(::handleCorrelatedRawJpegCapture)
+        }
     }
 
     private fun handleRawJpegImage(image: PendingStillImagePayload) {
@@ -1148,19 +1585,25 @@ internal class SharedCameraManager(
         sensorTimestampNs: Long,
         result: TotalCaptureResult,
     ) {
-        rawJpegCaptureCorrelator.onResult(sensorTimestampNs, result)
-            ?.let(::handleCorrelatedRawJpegCapture)
+        if (pendingDirectCapture != null) {
+            directRawJpegCaptureCorrelator.onResult(sensorTimestampNs, result)
+                ?.let(::handleCorrelatedDirectRawJpegCapture)
+        } else {
+            rawJpegCaptureCorrelator.onResult(sensorTimestampNs, result)
+                ?.let(::handleCorrelatedRawJpegCapture)
+        }
     }
 
     private fun handleCorrelatedRawJpegCapture(
-        capture: CorrelatedRawJpegCapture<Image, TotalCaptureResult>,
+        capture: CorrelatedRawJpegCapture<PendingStillImagePayload, Image, TotalCaptureResult>,
     ) {
         val jpeg = capture.jpeg
         val rawImage = capture.raw
         val totalResult = capture.result
         val pending = pendingManualCapture
+        val direct = pendingDirectCapture
         val characteristics = activeCameraCharacteristics
-        if (pending == null || characteristics == null) {
+        if ((pending == null && direct == null) || characteristics == null) {
             closeTrackedImage(rawImage)
             return
         }
@@ -1169,12 +1612,13 @@ internal class SharedCameraManager(
             if (closed.compareAndSet(false, true)) closeTrackedImage(rawImage)
         }
         try {
+            val manual = checkNotNull(pending)
             val imageId = generateImageId()
             val sensorTimestampNs =
                 totalResult.get(CaptureResult.SENSOR_TIMESTAMP) ?: jpeg.sensorTimestampNs
-            pending.result =
+            manual.result =
                 SharedCameraCaptureResult(
-                    reservationToken = pending.reservationToken,
+                    reservationToken = manual.reservationToken,
                     imageId = imageId,
                     imageBytes = jpeg.bytes,
                     format = ImageFormat.JPEG,
@@ -1209,16 +1653,21 @@ internal class SharedCameraManager(
                     rawHeight = rawImage.height,
                     primaryAssetName = "jpeg",
                 )
-            pending.latch.countDown()
+            manual.latch.countDown()
         } catch (error: Throwable) {
             closeRaw()
-            imageCacheManager?.releaseReservation(pending.reservationToken)
-            pending.error = error
-            pending.latch.countDown()
+            if (direct != null && pendingDirectCaptureOwner.release(direct)) {
+                direct.callback.onFailure(direct.qualifier, "raw-component")
+            }
+            pending?.let { manual ->
+                imageCacheManager?.releaseReservation(manual.reservationToken)
+                manual.error = error
+                manual.latch.countDown()
+            }
         }
     }
 
-    private data class PackedYuv420(
+    private class PackedYuv420(
         val width: Int,
         val height: Int,
         val yBytes: ByteArray,
@@ -1232,7 +1681,25 @@ internal class SharedCameraManager(
         val vPixelStride: Int,
         val cropLeft: Int,
         val cropTop: Int,
-    )
+        private val lease: PlaneBufferLease,
+    ) {
+        fun release() = lease.release()
+    }
+
+    private class PlaneBufferLease(
+        internal val yLease: CaptureByteArrayPool.Lease,
+        internal val uLease: CaptureByteArrayPool.Lease,
+        internal val vLease: CaptureByteArrayPool.Lease,
+    ) {
+        private val released = AtomicBoolean(false)
+
+        fun release() {
+            if (!released.compareAndSet(false, true)) return
+            yLease.close()
+            uLease.close()
+            vLease.close()
+        }
+    }
 
     private fun copyYuv420Image(image: Image): PackedYuv420 {
         require(image.format == ImageFormat.YUV_420_888)
@@ -1240,19 +1707,68 @@ internal class SharedCameraManager(
         val u = image.planes[1]
         val v = image.planes[2]
         val crop = image.cropRect
-        return PackedYuv420(
-            crop.width(), crop.height(),
-            y.buffer.toByteArrayFromStart(), y.rowStride, y.pixelStride,
-            u.buffer.toByteArrayFromStart(), u.rowStride, u.pixelStride,
-            v.buffer.toByteArrayFromStart(), v.rowStride, v.pixelStride,
-            crop.left, crop.top,
-        )
+        var yLease: CaptureByteArrayPool.Lease? = null
+        var uLease: CaptureByteArrayPool.Lease? = null
+        var vLease: CaptureByteArrayPool.Lease? = null
+        var planeLease: PlaneBufferLease? = null
+        return try {
+            yLease = processedFrameBuffers.acquire(y.buffer.remaining())
+                ?: throw CaptureSessionException(
+                    code = "CAPTURE_BUFFER_PRESSURE",
+                    message = "YUV capture scratch capacity is temporarily exhausted",
+                )
+            uLease = processedFrameBuffers.acquire(u.buffer.remaining())
+                ?: throw CaptureSessionException(
+                    code = "CAPTURE_BUFFER_PRESSURE",
+                    message = "YUV capture scratch capacity is temporarily exhausted",
+                )
+            vLease = processedFrameBuffers.acquire(v.buffer.remaining())
+                ?: throw CaptureSessionException(
+                    code = "CAPTURE_BUFFER_PRESSURE",
+                    message = "YUV capture scratch capacity is temporarily exhausted",
+                )
+            val lease = PlaneBufferLease(
+                checkNotNull(yLease),
+                checkNotNull(uLease),
+                checkNotNull(vLease),
+            )
+            planeLease = lease
+            yLease = null
+            uLease = null
+            vLease = null
+            copyPlaneBuffer(y.buffer, lease.yLease.buffer)
+            copyPlaneBuffer(u.buffer, lease.uLease.buffer)
+            copyPlaneBuffer(v.buffer, lease.vLease.buffer)
+            PackedYuv420(
+                crop.width(), crop.height(),
+                lease.yLease.buffer, y.rowStride, y.pixelStride,
+                lease.uLease.buffer, u.rowStride, u.pixelStride,
+                lease.vLease.buffer, v.rowStride, v.pixelStride,
+                crop.left, crop.top,
+                lease,
+            )
+        } catch (error: Throwable) {
+            planeLease?.release()
+            yLease?.close()
+            uLease?.close()
+            vLease?.close()
+            throw error
+        }
+    }
+
+    private fun copyPlaneBuffer(source: ByteBuffer, destination: ByteArray) {
+        val copy = source.duplicate()
+        copy.rewind()
+        check(copy.remaining() <= destination.size)
+        copy.get(destination, 0, copy.remaining())
     }
 
     private fun encodePackedYuv420AsJpeg(yuv: PackedYuv420): ByteArray {
         val width = yuv.width
         val height = yuv.height
-        val nv21 = ByteArray(width * height + width * height / 2)
+        val scratch = currentJpegEncodingScratch()
+        val nv21 = scratch.ensureNv21(width * height + width * height / 2)
+        recordJpegScratchCapacity(scratch)
         for (row in 0 until height) {
             val sourceRow = row + yuv.cropTop
             for (col in 0 until width) {
@@ -1272,22 +1788,30 @@ internal class SharedCameraManager(
                     yuv.uBytes[sourceRow * yuv.uRowStride + sourceCol * yuv.uPixelStride]
             }
         }
-        return ByteArrayOutputStream().use { stream ->
+        scratch.output.reset()
+        try {
             check(
                 YuvImage(nv21, ImageFormat.NV21, width, height, null).compressToJpeg(
                     Rect(0, 0, width, height),
                     config.jpegQuality,
-                    stream,
+                    scratch.output,
                 ),
             ) { "Android YUV JPEG encoder rejected the shared-camera frame" }
-            stream.toByteArray()
+        } finally {
+            recordJpegScratchCapacity(scratch)
         }
+        // The returned bytes are immutable capture output. The stream's
+        // backing buffer remains reusable only for the next conversion.
+        return scratch.output.toByteArray()
     }
 
     private fun handleCorrelatedProcessedFrame(
         correlated: CorrelatedProcessedFrame<PackedYuv420>,
     ) {
-        val pending = pendingManualCapture ?: return
+        val pending = pendingManualCapture ?: run {
+            correlated.frame.release()
+            return
+        }
         val processedFrameAtNs = System.nanoTime()
         val timing =
             PoseDataExtractor.CaptureTiming(
@@ -1306,6 +1830,7 @@ internal class SharedCameraManager(
                     message = "No exact or interpolated pose was available before encoding",
                 )
             pending.latch.countDown()
+            correlated.frame.release()
             return
         }
         pending.preAlignedPose = alignedPose
@@ -1320,61 +1845,66 @@ internal class SharedCameraManager(
         val workerStartGate = CountDownLatch(1)
         val workerSubmittedAtNs = System.nanoTime()
         val submitted =
-            finalizationWorkers.submit {
-                try {
-                    workerStartGate.await()
-                    val workerStartedAtNs = System.nanoTime()
-                    val encodingStartedAtNs = System.nanoTime()
-                    val encodedBytes = encodePackedYuv420AsJpeg(correlated.frame)
-                    val jpegEncodingMs = (System.nanoTime() - encodingStartedAtNs) / 1_000_000L
-                    val assetName = "jpeg"
-                    val assetFormat = ImageFormat.JPEG
-                    val encoded =
-                        SharedCameraCaptureResult(
-                            reservationToken = pending.reservationToken,
-                            imageId = imageId,
-                            imageBytes = encodedBytes,
-                            format = assetFormat,
-                            width = correlated.frame.width,
-                            height = correlated.frame.height,
-                            imageSizeBytes = encodedBytes.size,
-                            captureTimestampMs = System.currentTimeMillis(),
-                            sensorTimestampNs = correlated.result.sensorTimestampNs,
-                            exposureTimeNs = correlated.result.exposureTimeNs,
-                            rollingShutterSkewNs = correlated.result.rollingShutterSkewNs,
-                            observedTimestampNs = correlated.result.observedTimestampNs,
-                            intrinsics =
-                                capabilityQuerier.getCameraIntrinsicsForSize(
-                                    captureSize =
-                                        Size(correlated.frame.width, correlated.frame.height),
-                                    cropRegion = correlated.result.cropRegion,
-                                ),
-                            primaryAssetName = assetName,
-                            preEncodeQuality = pending.preEncodeQuality,
-                            preAlignedPose = alignedPose,
-                            requiresPose = pending.requiresPose,
-                            pipelineTimingMs =
-                                mapOf(
-                                    CapturePipelineTimingContract.REQUEST_TO_PROCESSED_FRAME to
-                                        ((processedFrameAtNs - pending.requestStartedAtNs) / 1_000_000L),
-                                    CapturePipelineTimingContract.PRE_ACCEPTANCE_POSE to poseResolutionMs,
-                                    CapturePipelineTimingContract.FINALIZATION_QUEUE_WAIT to
-                                        ((workerStartedAtNs - workerSubmittedAtNs) / 1_000_000L),
-                                    CapturePipelineTimingContract.JPEG_ENCODING to jpegEncodingMs,
-                                ),
+            finalizationWorkers.submit(
+                onCancelBeforeRun = correlated.frame::release,
+                job = {
+                    try {
+                        workerStartGate.await()
+                        val workerStartedAtNs = System.nanoTime()
+                        val encodingStartedAtNs = System.nanoTime()
+                        val encodedBytes = encodePackedYuv420AsJpeg(correlated.frame)
+                        val jpegEncodingMs = (System.nanoTime() - encodingStartedAtNs) / 1_000_000L
+                        val assetName = "jpeg"
+                        val assetFormat = ImageFormat.JPEG
+                        val encoded =
+                            SharedCameraCaptureResult(
+                                reservationToken = pending.reservationToken,
+                                imageId = imageId,
+                                imageBytes = encodedBytes,
+                                format = assetFormat,
+                                width = correlated.frame.width,
+                                height = correlated.frame.height,
+                                imageSizeBytes = encodedBytes.size,
+                                captureTimestampMs = System.currentTimeMillis(),
+                                sensorTimestampNs = correlated.result.sensorTimestampNs,
+                                exposureTimeNs = correlated.result.exposureTimeNs,
+                                rollingShutterSkewNs = correlated.result.rollingShutterSkewNs,
+                                observedTimestampNs = correlated.result.observedTimestampNs,
+                                intrinsics =
+                                    capabilityQuerier.getCameraIntrinsicsForSize(
+                                        captureSize =
+                                            Size(correlated.frame.width, correlated.frame.height),
+                                        cropRegion = correlated.result.cropRegion,
+                                    ),
+                                primaryAssetName = assetName,
+                                preEncodeQuality = pending.preEncodeQuality,
+                                preAlignedPose = alignedPose,
+                                requiresPose = pending.requiresPose,
+                                pipelineTimingMs =
+                                    mapOf(
+                                        CapturePipelineTimingContract.REQUEST_TO_PROCESSED_FRAME to
+                                            ((processedFrameAtNs - pending.requestStartedAtNs) / 1_000_000L),
+                                        CapturePipelineTimingContract.PRE_ACCEPTANCE_POSE to poseResolutionMs,
+                                        CapturePipelineTimingContract.FINALIZATION_QUEUE_WAIT to
+                                            ((workerStartedAtNs - workerSubmittedAtNs) / 1_000_000L),
+                                        CapturePipelineTimingContract.JPEG_ENCODING to jpegEncodingMs,
+                                    ),
+                            )
+                        onCaptureEncoded(encoded, pending.qualityPolicy)
+                        Log.i(
+                            "SharedCameraManager",
+                            "Encoded ${encodedBytes.size} ${assetName.uppercase()} bytes in " +
+                                "${jpegEncodingMs}ms",
                         )
-                    onCaptureEncoded(encoded, pending.qualityPolicy)
-                    Log.i(
-                        "SharedCameraManager",
-                        "Encoded ${encodedBytes.size} ${assetName.uppercase()} bytes in " +
-                            "${jpegEncodingMs}ms",
-                    )
-                } catch (error: Throwable) {
-                    pending.error = error
-                    imageCacheManager?.releaseReservation(pending.reservationToken)
-                    onCaptureFinalizationFailed(imageId, error)
-                }
-            }
+                    } catch (error: Throwable) {
+                        pending.error = error
+                        imageCacheManager?.releaseReservation(pending.reservationToken)
+                        onCaptureFinalizationFailed(imageId, error)
+                    } finally {
+                        correlated.frame.release()
+                    }
+                },
+            )
         if (submitted != FinalizationSubmissionStatus.ACCEPTED) {
             pending.error =
                 CaptureSessionException(
@@ -1416,14 +1946,9 @@ internal class SharedCameraManager(
         }
     }
 
-    private fun ByteBuffer.toByteArrayFromStart(): ByteArray {
-        val source = duplicate()
-        source.rewind()
-        return ByteArray(source.remaining()).also(source::get)
-    }
-
     private fun clearPendingRawJpegComponents() {
         rawJpegCaptureCorrelator.clear()
+        directRawJpegCaptureCorrelator.clear()
     }
 
     private fun closeTrackedImage(image: Image) {
@@ -1461,17 +1986,109 @@ internal class SharedCameraManager(
         return specs
     }
 
+    private fun handleCorrelatedDirectRawJpegCapture(
+        capture: CorrelatedRawJpegCapture<Image, Image, TotalCaptureResult>,
+    ) {
+        val direct = pendingDirectCapture
+        val characteristics = activeCameraCharacteristics
+        if (direct == null || characteristics == null || !pendingDirectCaptureOwner.release(direct)) {
+            closeTrackedImage(capture.jpeg)
+            closeTrackedImage(capture.raw)
+            return
+        }
+        val rawClosed = java.util.concurrent.atomic.AtomicBoolean(false)
+        val closeRaw = {
+            if (rawClosed.compareAndSet(false, true)) closeTrackedImage(capture.raw)
+        }
+        val dng = try {
+            BoundedProducerInputStreamV2.start(
+                executor = directComponentExecutor,
+                capacityBytes = 64 * 1024,
+                closeOwner = closeRaw,
+            ) { output ->
+                try {
+                    DngCreator(characteristics, capture.result).use { creator ->
+                        creator.writeImage(output, capture.raw)
+                    }
+                } finally {
+                    closeRaw()
+                }
+            }
+        } catch (error: Throwable) {
+            closeRaw()
+            closeTrackedImage(capture.jpeg)
+            throw error
+        }
+        val jpeg = CameraPlaneInputStreamV2(capture.jpeg.planes.single().buffer) {
+            closeTrackedImage(capture.jpeg)
+        }
+        try {
+            dispatchDirectStoreComponents(
+                direct = direct,
+                streams = listOf(
+                    CaptureComponentStreamV2(CaptureComponentKind.JPEG, jpeg),
+                    CaptureComponentStreamV2(CaptureComponentKind.DNG, dng),
+                ),
+                exposureTimestampNanoseconds =
+                    capture.result.get(CaptureResult.SENSOR_TIMESTAMP) ?: capture.jpeg.timestamp,
+            )
+        } catch (error: Throwable) {
+            jpeg.close()
+            dng.close()
+            throw error
+        }
+    }
+
+    private fun dispatchDirectStoreComponents(
+        direct: PendingDirectCaptureV2,
+        streams: List<CaptureComponentStreamV2>,
+        exposureTimestampNanoseconds: Long,
+    ) {
+        val dispatch = DirectStoreDispatch(
+            components = SharedCameraComponentSetV2(
+                direct.qualifier,
+                streams,
+                exposureTimestampNanoseconds,
+            ),
+            callback = direct.callback::onComponents,
+            onFailure = { reason ->
+                runCatching { direct.callback.onFailure(direct.qualifier, reason) }
+            },
+        )
+        synchronized(pendingDirectStoreDispatches) {
+            pendingDirectStoreDispatches += dispatch
+        }
+        try {
+            directStoreExecutor.execute {
+                try {
+                    dispatch.run()
+                } finally {
+                    synchronized(pendingDirectStoreDispatches) {
+                        pendingDirectStoreDispatches -= dispatch
+                    }
+                }
+            }
+        } catch (error: Throwable) {
+            synchronized(pendingDirectStoreDispatches) {
+                pendingDirectStoreDispatches -= dispatch
+            }
+            dispatch.cancel("component-dispatch")
+            throw error
+        }
+    }
+
     private fun guardArCoreStartupStateCallback(
         callback: CameraCaptureSession.StateCallback,
+        generation: Long,
     ): CameraCaptureSession.StateCallback =
         object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(session: CameraCaptureSession) =
-                forwardArCoreStartupCallback("configured", session) {
+                forwardArCoreSessionCallback("configured", session, generation) {
                     callback.onConfigured(session)
                 }
 
             override fun onConfigureFailed(session: CameraCaptureSession) =
-                forwardArCoreStartupCallback("configureFailed", session) {
+                forwardArCoreSessionCallback("configureFailed", session, generation) {
                     callback.onConfigureFailed(session)
                     failSharedCameraConfiguration(
                         session = session,
@@ -1480,34 +2097,58 @@ internal class SharedCameraManager(
                     )
                 }
 
-            override fun onReady(session: CameraCaptureSession) = callback.onReady(session)
+            override fun onReady(session: CameraCaptureSession) =
+                forwardArCoreSessionCallback("ready", session, generation) {
+                    callback.onReady(session)
+                }
 
-            override fun onActive(session: CameraCaptureSession) = callback.onActive(session)
+            override fun onActive(session: CameraCaptureSession) =
+                forwardArCoreSessionCallback("active", session, generation) {
+                    callback.onActive(session)
+                }
 
             override fun onCaptureQueueEmpty(session: CameraCaptureSession) =
-                callback.onCaptureQueueEmpty(session)
+                forwardArCoreSessionCallback("queueEmpty", session, generation) {
+                    callback.onCaptureQueueEmpty(session)
+                }
 
-            override fun onClosed(session: CameraCaptureSession) = callback.onClosed(session)
+            override fun onClosed(session: CameraCaptureSession) =
+                forwardArCoreSessionCallback("closed", session, generation, terminal = true) {
+                    callback.onClosed(session)
+                }
 
             override fun onSurfacePrepared(session: CameraCaptureSession, surface: Surface) =
-                callback.onSurfacePrepared(session, surface)
+                forwardArCoreSessionCallback("surfacePrepared", session, generation) {
+                    callback.onSurfacePrepared(session, surface)
+                }
         }
 
-    private inline fun forwardArCoreStartupCallback(
+    private fun forwardArCoreSessionCallback(
         stage: String,
         session: CameraCaptureSession,
+        generation: Long,
+        terminal: Boolean = false,
         callback: () -> Unit,
     ) {
         SharedCameraCallbackGuard.run(
             onFailure = { error ->
-                failSharedCameraConfiguration(
-                    session = session,
-                    stage = stage,
-                    cause = error,
-                )
+                if (cleanupRequested) {
+                    Log.w("SharedCameraManager", "Ignored ARCore callback failure during $stage teardown", error)
+                } else {
+                    failSharedCameraConfiguration(
+                        session = session,
+                        stage = stage,
+                        cause = error,
+                    )
+                }
             },
-            callback = callback,
-        )
+        ) {
+            if (terminal) {
+                sessionCallbackFence.runTerminal(generation, callback)
+            } else {
+                sessionCallbackFence.runActive(generation, callback)
+            }
+        }
     }
 
     private fun failSharedCameraConfiguration(
@@ -1580,6 +2221,9 @@ internal class SharedCameraManager(
         if (!isInitialized) {
             throw IllegalStateException("SharedCameraManager is not initialized")
         }
+        if (pendingDirectCapture != null) {
+            throw CaptureSessionException("CAPTURE_IN_PROGRESS", "A native V2 capture is in progress")
+        }
         val exposureBracket = if (exposureBracketEnabled) exposureBracketSpecs() else emptyList()
         val reservationToken =
             imageCacheManager?.reserveCaptureSlot()
@@ -1648,6 +2292,9 @@ internal class SharedCameraManager(
             "Two-phase capture is not enabled for this format"
         }
         if (!isInitialized) throw IllegalStateException("SharedCameraManager is not initialized")
+        if (pendingDirectCapture != null) {
+            throw CaptureSessionException("CAPTURE_IN_PROGRESS", "A native V2 capture is in progress")
+        }
         val reservationToken =
             imageCacheManager?.reserveCaptureSlot()
                 ?: throw IllegalStateException("ImageCacheManager is not initialized")
@@ -1686,6 +2333,35 @@ internal class SharedCameraManager(
     fun getCaptureCapacity(): Map<String, Any?> =
         imageCacheManager?.getCaptureCapacity()
             ?: throw IllegalStateException("ImageCacheManager is not initialized")
+
+    /** Scalar scratch ownership evidence used by the capture performance receipt. */
+    internal fun captureScratchReceipt(): Map<String, Long> {
+        val receipt = processedFrameBuffers.receipt()
+        return mapOf(
+            "captureYuvScratchMaximumSlots" to receipt.maximumSlots.toLong(),
+            "captureYuvScratchMaximumBytes" to receipt.maximumBytes,
+            "captureYuvScratchRetainedSlots" to receipt.retainedSlots.toLong(),
+            "captureYuvScratchOwnedSlots" to receipt.ownedSlots.toLong(),
+            "captureYuvScratchInUseSlots" to receipt.inUseSlots.toLong(),
+            "captureYuvScratchRetainedCapacityBytes" to receipt.retainedCapacityBytes,
+            "captureYuvScratchInUseCapacityBytes" to receipt.inUseCapacityBytes,
+            "captureYuvScratchOwnedCapacityBytes" to receipt.ownedCapacityBytes,
+            "captureYuvScratchPeakOwnedCapacityBytes" to receipt.peakOwnedCapacityBytes,
+            "captureYuvScratchPeakInUseSlots" to receipt.peakInUseSlots.toLong(),
+            "captureYuvScratchGrowthEvents" to receipt.growthEvents,
+            "captureYuvScratchRefusals" to receipt.refusalCount,
+            "captureYuvScratchClosed" to if (receipt.closed) 1L else 0L,
+            "captureJpegScratchActiveOwners" to jpegScratchActiveOwners.get(),
+            "captureJpegScratchNv21ResidentCapacityBytes" to jpegScratchNv21ResidentBytes.get(),
+            "captureJpegScratchOutputResidentCapacityBytes" to jpegScratchOutputResidentBytes.get(),
+            "captureJpegScratchResidentCapacityBytes" to
+                jpegScratchNv21ResidentBytes.get() + jpegScratchOutputResidentBytes.get(),
+            "captureJpegScratchPeakNv21CapacityBytes" to jpegScratchPeakNv21Bytes.get(),
+            "captureJpegScratchPeakOutputCapacityBytes" to jpegScratchPeakOutputBytes.get(),
+            "captureJpegScratchPeakCapacityBytes" to
+                jpegScratchPeakNv21Bytes.get() + jpegScratchPeakOutputBytes.get(),
+        )
+    }
 
     fun getImageData(imageId: String, format: String): ByteArray =
         imageCacheManager?.getImageData(imageId, format)
@@ -1844,10 +2520,12 @@ internal class SharedCameraManager(
     }
 
     fun cleanup() {
+        v2ExposureHook.clear()
         if (processShutdownGeneration == null) {
             processShutdownGeneration = processRestartGate.markShutdownStarted()
         }
         cleanupRequested = true
+        sessionCallbackFence.beginShutdown(sessionCallbackGeneration)
         pendingManualCapture?.let { pending ->
             pending.error = CaptureSessionException(
                 code = "CAPTURE_DISPOSED",
@@ -1857,6 +2535,10 @@ internal class SharedCameraManager(
             requestGeneration.clear(pending.generation)
             pendingManualCaptureOwner.release(pending)
             pending.latch.countDown()
+        }
+        pendingDirectCapture?.let { pending ->
+            pendingDirectCaptureOwner.release(pending)
+            directRawJpegCaptureCorrelator.clear()
         }
         val closingCaptureSession = captureSession
         captureSessionClosed = closingCaptureSession == null
@@ -1874,6 +2556,14 @@ internal class SharedCameraManager(
         manualCaptureRequestBuilder = null
 
         if (finalizationWorkersDelegate.isInitialized()) finalizationWorkers.close()
+        synchronized(pendingDirectStoreDispatches) {
+            pendingDirectStoreDispatches.toList().forEach { it.cancel("capture-disposed") }
+            pendingDirectStoreDispatches.clear()
+        }
+        directStoreExecutor.shutdownNow()
+        directComponentExecutor.shutdownNow()
+        processedFrameCorrelator.clear()
+        processedFrameBuffers.close()
 
         scheduleBackgroundThreadShutdownWhenClosed()
         // Vendor fallback: close callbacks are expected, but never retain a
@@ -1907,6 +2597,7 @@ internal class SharedCameraManager(
                 )
             }
         } finally {
+            sessionCallbackFence.finishShutdown(sessionCallbackGeneration)
             processShutdownGeneration?.let { generation ->
                 processRestartGate.markShutdownCompleted(
                     generation = generation,
@@ -2568,6 +3259,7 @@ internal class SharedCameraManager(
         } ?: config.resolution
 
     private fun startBackgroundThread() {
+        sessionCallbackGeneration = sessionCallbackFence.open()
         cleanupRequested = false
         captureSessionClosed = false
         cameraDeviceClosed = false

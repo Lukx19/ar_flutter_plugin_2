@@ -1,14 +1,28 @@
 package com.uhg0.ar_flutter_plugin_2.sceneview
 
 import android.content.Context
+import androidx.compose.ui.platform.ViewCompositionStrategy
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.LifecycleRegistry
 import com.google.android.filament.Engine
 import com.google.android.filament.Stream
 import com.google.android.filament.Texture
 import com.google.ar.core.Config
 import com.google.ar.core.Frame
 import com.google.ar.core.Session
+import com.uhg0.ar_flutter_plugin_2.pointcloud.PointCloudNativeConfig
 import java.io.File
 import kotlin.math.sqrt
+
+/**
+ * Coverage visibility is a draw-state change. Keep the mesh subtree mounted
+ * while a coverage configuration exists so hiding it cannot report a resource
+ * failure and strand a later show command.
+ */
+internal fun shouldComposeCoverageRenderer(config: PointCloudNativeConfig?): Boolean =
+    config != null
 
 /** SceneView-independent transform payload. Matrices use Flutter's column-major order. */
 internal data class PluginTransform(
@@ -216,6 +230,128 @@ internal class SceneViewHostOwnership {
     }
 }
 
+/**
+ * Platform views can be detached while Flutter swaps a shared-camera surface.
+ * Keep Compose-owned Filament resources until the view-tree lifecycle ends;
+ * [SceneViewHost.dispose] is the explicit terminal teardown fence.
+ */
+internal fun sceneViewCompositionStrategy(): ViewCompositionStrategy =
+    ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed
+
+/**
+ * Gives ARSceneView a lifecycle that is paused before its Compose resources
+ * are released. The SceneView frame loop checks its resumed state immediately
+ * before calling Filament; mirroring the host lifecycle through this owner
+ * makes the pause and renderer destruction one ordered ownership boundary.
+ */
+internal class SceneViewRenderLifecycle(
+    private val parentLifecycle: Lifecycle,
+    private val onTransition: (String) -> Unit = {},
+) : LifecycleOwner {
+    private val registry = LifecycleRegistry(this)
+    private var terminal = false
+    private val parentObserver = LifecycleEventObserver { _, event ->
+        if (terminal) return@LifecycleEventObserver
+        if (event == Lifecycle.Event.ON_DESTROY) {
+            // The host owns the Compose disposal callback. Stop frame
+            // production here, then let the host cancel the ARSceneView
+            // composition before calling destroyAfterComposition().
+            pauseForTeardown()
+        } else {
+            handleParentEvent(event)
+        }
+    }
+
+    init {
+        parentLifecycle.addObserver(parentObserver)
+    }
+
+    override val lifecycle: Lifecycle
+        get() = registry
+
+    /** Stops ARSceneView's render loop while Compose still owns its resources. */
+    fun pauseForTeardown() {
+        if (terminal) return
+        when {
+            registry.currentState.isAtLeast(Lifecycle.State.RESUMED) -> {
+                handleRenderEvent(Lifecycle.Event.ON_PAUSE, "pause")
+                handleRenderEvent(Lifecycle.Event.ON_STOP, "pause")
+            }
+            registry.currentState.isAtLeast(Lifecycle.State.STARTED) ->
+                handleRenderEvent(Lifecycle.Event.ON_STOP, "pause")
+        }
+    }
+
+    /** Resumes after a transient platform-view detach without recreating state. */
+    fun resumeAfterTransientDetach() {
+        if (terminal) return
+        val parentState = parentLifecycle.currentState
+        if (parentState.isAtLeast(Lifecycle.State.STARTED) &&
+            !registry.currentState.isAtLeast(Lifecycle.State.STARTED)
+        ) {
+            handleRenderEvent(Lifecycle.Event.ON_START, "resume")
+        }
+        if (parentState.isAtLeast(Lifecycle.State.RESUMED) &&
+            !registry.currentState.isAtLeast(Lifecycle.State.RESUMED)
+        ) {
+            handleRenderEvent(Lifecycle.Event.ON_RESUME, "resume")
+        }
+    }
+
+    /** Called after Compose has cancelled ARSceneView's frame coroutine. */
+    fun destroyAfterComposition() {
+        if (terminal) return
+        pauseForTeardown()
+        if (registry.currentState != Lifecycle.State.DESTROYED) {
+            handleRenderEvent(Lifecycle.Event.ON_DESTROY, "destroyAfterComposition")
+        }
+        terminal = true
+        parentLifecycle.removeObserver(parentObserver)
+    }
+
+    private fun handleParentEvent(event: Lifecycle.Event) {
+        handleRenderEvent(event, "parent")
+    }
+
+    private fun handleRenderEvent(event: Lifecycle.Event, source: String) {
+        val before = registry.currentState
+        registry.handleLifecycleEvent(event)
+        val after = registry.currentState
+        onTransition(
+            "source=$source event=$event before=$before after=$after " +
+                "parent=${parentLifecycle.currentState}",
+        )
+    }
+}
+
+/**
+ * Defers terminal Compose disposal until a later display frame. A queued
+ * ARSceneView BroadcastFrameClock continuation can then finish against the
+ * live Filament engine before its SceneRenderer and Engine effects are torn
+ * down.
+ */
+internal class SceneViewCompositionDisposalGate(
+    private val scheduleOnNextFrame: ((() -> Unit) -> Unit),
+    private val disposeComposition: () -> Unit,
+) {
+    private var requested = false
+
+    @Synchronized
+    fun request() {
+        if (requested) return
+        requested = true
+        scheduleOnNextFrame {
+            val shouldDispose = synchronized(this) {
+                if (!requested) false else {
+                    requested = false
+                    true
+                }
+            }
+            if (shouldDispose) disposeComposition()
+        }
+    }
+}
+
 /** Coordinates SceneView's first resume with ARCore SharedCamera startup. */
 internal class SharedCameraSceneLifecycleGate(sharedCameraRequested: Boolean) {
     private var resumeAllowed = !sharedCameraRequested
@@ -226,5 +362,191 @@ internal class SharedCameraSceneLifecycleGate(sharedCameraRequested: Boolean) {
     /** Called immediately before SharedCameraManager resumes the coordinated ARCore session. */
     fun prepareSharedCameraResume() {
         resumeAllowed = true
+    }
+}
+
+/** Exactly-once terminal reply fence for a bounded, replaceable native operation. */
+internal class BoundedReplyFence<T> {
+    private var generation = 0L
+    private var reply: ((T) -> Unit)? = null
+
+    @Synchronized
+    fun begin(next: (T) -> Unit, superseded: T): Long {
+        reply?.invoke(superseded)
+        generation++
+        reply = next
+        return generation
+    }
+
+    @Synchronized
+    fun settle(token: Long, terminal: T): Boolean {
+        if (token != generation) return false
+        val current = reply ?: return false
+        reply = null
+        current(terminal)
+        return true
+    }
+
+    @Synchronized
+    fun dispose(cancelled: T) {
+        generation++
+        reply?.invoke(cancelled)
+        reply = null
+    }
+}
+
+/** Production coordinator for a blocking operation with an independent deadline. */
+internal class BoundedOperationCoordinator<T>(
+    private val launchOperation: ((() -> Unit) -> Unit),
+    private val scheduleDeadline: (Long, () -> Unit) -> Unit,
+    private val dispatchTerminal: ((() -> Unit) -> Unit),
+) {
+    private val fence = BoundedReplyFence<T>()
+    private val lock = Any()
+    private var running: Operation<T>? = null
+    private var queued: Operation<T>? = null
+    private var disposed = false
+    private var onDisposedDrained: (() -> Unit)? = null
+
+    private class Operation<T>(
+        val token: Long,
+        val timedOut: T,
+        val failed: T,
+        val succeeded: T,
+        val operation: () -> Unit,
+        val rollbackLateSuccess: () -> Unit,
+    ) {
+        var abandonedBeforeStart = false
+    }
+
+    fun begin(
+        timeoutMillis: Long,
+        next: (T) -> Unit,
+        superseded: T,
+        timedOut: T,
+        failed: T,
+        succeeded: T,
+        operation: () -> Unit,
+        rollbackLateSuccess: () -> Unit,
+    ): Long {
+        lateinit var pending: Operation<T>
+        var start: Operation<T>? = null
+        synchronized(lock) {
+            // This admission check and fence registration must be one critical
+            // section. Otherwise a begin racing a completed dispose can retain
+            // a callback after disposal has already emitted SESSION_ERROR.
+            check(!disposed) { "Operation coordinator is disposed" }
+            val token = fence.begin(next, superseded)
+            pending = Operation(
+                token = token,
+                timedOut = timedOut,
+                failed = failed,
+                succeeded = succeeded,
+                operation = operation,
+                rollbackLateSuccess = rollbackLateSuccess,
+            )
+            // A not-yet-started request has no native side effect. Replace it
+            // outright; BoundedReplyFence has returned its terminal reply as
+            // superseded while this coordinator is still open.
+            queued?.abandonedBeforeStart = true
+            if (running == null) {
+                running = pending
+                start = pending
+            } else {
+                queued = pending
+            }
+        }
+        scheduleDeadline(timeoutMillis) {
+            dispatchTerminal {
+                fence.settle(pending.token, timedOut)
+                synchronized(lock) {
+                    if (queued === pending) {
+                        pending.abandonedBeforeStart = true
+                        queued = null
+                    }
+                }
+            }
+        }
+        start?.let(::launch)
+        return pending.token
+    }
+
+    /**
+     * Fence replies immediately, but delay [onDrained] until a blocking native
+     * operation has returned and a late successful resume has been rolled back.
+     */
+    fun dispose(cancelled: T, onDrained: () -> Unit) {
+        var drainNow = false
+        synchronized(lock) {
+            if (disposed) return
+            disposed = true
+            queued?.abandonedBeforeStart = true
+            queued = null
+            onDisposedDrained = onDrained
+            drainNow = running == null
+            if (drainNow) onDisposedDrained = null
+        }
+        // No begin can install a reply after disposed was set under lock.
+        // Fence the one already admitted reply exactly once outside that lock.
+        fence.dispose(cancelled)
+        if (drainNow) onDrained()
+    }
+
+    /**
+     * Fence a currently stalled operation and discard a queued successor.
+     * The running native call cannot be interrupted, so its eventual success
+     * still reaches [launch] and is rolled back before another queued resume
+     * is allowed to start.  This is the lifecycle pause boundary.
+     */
+    fun invalidate(invalidated: T) {
+        val tokens = mutableListOf<Long>()
+        synchronized(lock) {
+            running?.let { tokens += it.token }
+            queued?.let {
+                it.abandonedBeforeStart = true
+                tokens += it.token
+            }
+            queued = null
+        }
+        tokens.forEach { fence.settle(it, invalidated) }
+    }
+
+    private fun launch(pending: Operation<T>) {
+        launchOperation {
+            val success = runCatching(pending.operation).isSuccess
+            dispatchTerminal {
+                // A timeout, supersede, or disposal has fenced the Dart reply,
+                // but ARCore may still have completed Session.resume. Pause it
+                // before another resume or host disposal can proceed.
+                val accepted = fence.settle(
+                    pending.token,
+                    if (success) pending.succeeded else pending.failed,
+                )
+                if (success && !accepted) pending.rollbackLateSuccess()
+                finish(pending)
+            }
+        }
+    }
+
+    private fun finish(completed: Operation<T>) {
+        var next: Operation<T>? = null
+        var drained: (() -> Unit)? = null
+        synchronized(lock) {
+            if (running !== completed) return
+            running = null
+            if (disposed) {
+                drained = onDisposedDrained
+                onDisposedDrained = null
+            } else {
+                val candidate = queued
+                queued = null
+                if (candidate != null && !candidate.abandonedBeforeStart) {
+                    running = candidate
+                    next = candidate
+                }
+            }
+        }
+        drained?.invoke()
+        next?.let(::launch)
     }
 }

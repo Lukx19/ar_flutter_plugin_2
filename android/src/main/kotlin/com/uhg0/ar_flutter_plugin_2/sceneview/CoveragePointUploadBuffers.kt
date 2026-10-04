@@ -89,6 +89,41 @@ internal class CoveragePointUploadBuffers(capacity: Int) {
         colorStorage.limit(colorLast)
     }
 
+    /** Copies one compact source page into its global destination range. */
+    fun writePage(
+        positions: FloatArray,
+        colors: IntArray,
+        destinationStartSlot: Int,
+        count: Int = colors.size,
+    ) {
+        require(destinationStartSlot >= 0)
+        require(count >= 0 && count <= colors.size && count <= positions.size / POSITION_COMPONENTS)
+        val destinationEndSlot = destinationStartSlot + count
+        require(destinationEndSlot <= colorStorage.capacity() / COLOR_COMPONENTS)
+        val firstPosition = destinationStartSlot * POSITION_COMPONENTS
+        val lastPosition = destinationEndSlot * POSITION_COMPONENTS
+        val positionTarget = positionStorage.duplicate()
+        positionTarget.clear()
+        positionTarget.position(firstPosition)
+        positionTarget.put(positions, 0, count * POSITION_COMPONENTS)
+        positionStorage.clear()
+        positionStorage.position(firstPosition)
+        positionStorage.limit(lastPosition)
+        val colorTarget = colorStorage.duplicate()
+        colorTarget.clear()
+        colorTarget.position(destinationStartSlot * COLOR_COMPONENTS)
+        repeat(count) { index ->
+            val color = colors[index]
+            colorTarget.put((color shr 16 and 0xFF).toByte())
+            colorTarget.put((color shr 8 and 0xFF).toByte())
+            colorTarget.put((color and 0xFF).toByte())
+            colorTarget.put((color ushr 24 and 0xFF).toByte())
+        }
+        colorStorage.clear()
+        colorStorage.position(destinationStartSlot * COLOR_COMPONENTS)
+        colorStorage.limit(destinationEndSlot * COLOR_COMPONENTS)
+    }
+
     private companion object {
         const val POSITION_COMPONENTS = 3
         const val COLOR_COMPONENTS = 4

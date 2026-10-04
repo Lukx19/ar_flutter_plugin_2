@@ -13,8 +13,8 @@ class ArCoreDepthModeController(
 
     var activeMode: Config.DepthMode =
         when {
-            rawDepthSupported -> Config.DepthMode.RAW_DEPTH_ONLY
             automaticDepthSupported -> Config.DepthMode.AUTOMATIC
+            rawDepthSupported -> Config.DepthMode.RAW_DEPTH_ONLY
             else -> Config.DepthMode.DISABLED
         }
         private set

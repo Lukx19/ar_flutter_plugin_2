@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.18.1)
+project(capture3d_safe_fs_v2)
+add_library(capture3d_safe_fs_v2 SHARED safe_filesystem_v2.cpp)
+target_compile_features(capture3d_safe_fs_v2 PRIVATE cxx_std_17)
+target_compile_options(capture3d_safe_fs_v2 PRIVATE -Wall -Wextra -Werror)

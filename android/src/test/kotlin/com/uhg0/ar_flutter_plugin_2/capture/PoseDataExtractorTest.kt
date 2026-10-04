@@ -5,8 +5,125 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 class PoseDataExtractorTest {
+    @Test
+    fun `retained history owns samples and old exposure snapshots survive eviction`() {
+        val extractor = PoseDataExtractor(2)
+        val original = sample(timestampNs = 1L, positionX = 2f)
+        extractor.addSample(original)
+        original.position[0] = 90f
+        val held = extractor.latest()!!
+        val aligned = extractor.resolvePose(PoseDataExtractor.CaptureTiming(1L, 0L), 0L)!!
+        extractor.addSample(sample(timestampNs = 3L, positionX = 3f))
+        extractor.addSample(sample(timestampNs = 2L, positionX = 4f))
+        extractor.addSample(sample(timestampNs = 4L, positionX = 5f))
+        assertEquals(2f, held.position[0], 0f)
+        assertEquals(2f, aligned.pose.position[0], 0f)
+        assertEquals(4L, extractor.latest()!!.timestampNs)
+    }
+
+    @Test
+    fun `packed sample exactly preserves legacy geometry timestamps and independent ownership`() {
+        val extractor = PoseDataExtractor(2)
+        extractor.addSample(sample(timestampNs = 9_007_199_254_740_993L, positionX = 0.24f))
+        val snapshot = extractor.latest()!!
+        val map = extractor.toPoseMap(extractor.toAlignedPose(snapshot))
+        val packed = extractor.latestPacked(7L)!!
+        val buffer = ByteBuffer.wrap(packed).order(ByteOrder.LITTLE_ENDIAN)
+        assertEquals(PackedPoseWireV2.SAMPLE_BYTES, packed.size)
+        assertEquals(7L, buffer.getLong(0))
+        assertEquals(snapshot.timestampNs, buffer.getLong(16))
+        val converted = map["transform"] as List<*>
+        for (i in 0..15) assertEquals(converted[i] as Double, buffer.getFloat(80 + i * 4).toDouble(), 0.0)
+        for (i in 0..15) assertEquals(snapshot.transform[i], buffer.getFloat(172 + i * 4), 0f)
+        val rotation = map["rotation"] as Map<*, *>
+        for ((i, name) in listOf("x", "y", "z", "w").withIndex()) {
+            assertEquals(rotation[name] as Double, buffer.getFloat(64 + i * 4).toDouble(), 0.0)
+        }
+        extractor.addSample(sample(timestampNs = snapshot.timestampNs + 1, positionX = 99f))
+        extractor.latestPacked(8L)
+        assertEquals(0.24f, buffer.getFloat(52), 0f)
+    }
+
+    @Test
+    fun `finite debug camera phases use one tracked native pose for stream and exposure`() {
+        val extractor = PoseDataExtractor()
+        assertTrue(!extractor.beginDebugFixture())
+        extractor.addSample(sample(timestampNs = 1L, positionX = 2f))
+        assertTrue(extractor.beginDebugFixture())
+
+        extractor.setDebugFixtureManualView()
+        val manual = extractor.applyDebugFixture(
+            sample(timestampNs = 2L, positionX = 30f, isTracking = false),
+        )
+        assertEquals(2.24f, manual.position[0], 0.0001f)
+        assertEquals(2.24f, manual.transform[12], 0.0001f)
+        assertTrue(manual.isTracking)
+        assertEquals(2.24, extractor.debugFixtureTransform()!![12], 0.0001)
+
+        extractor.setDebugFixtureAutomaticRevisit()
+        val automatic = extractor.applyDebugFixture(
+            sample(timestampNs = 3L, positionX = -50f, isTracking = false),
+        )
+        assertEquals(2f, automatic.position[0], 0.0001f)
+        assertEquals(2f, automatic.transform[12], 0.0001f)
+        extractor.clearDebugFixture()
+        assertNull(extractor.debugFixtureTransform())
+        assertEquals(
+            -50f,
+            extractor.applyDebugFixture(sample(timestampNs = 4L, positionX = -50f)).position[0],
+            0.0001f,
+        )
+    }
+
+    @Test
+    fun `synthetic fixture is tagged bounded and cleared without a tracked anchor`() {
+        val extractor = PoseDataExtractor()
+
+        val seeded = extractor.beginSyntheticDebugFixture(
+            bindingGeneration = 7L,
+            groupGeneration = 11L,
+        )
+
+        assertTrue(seeded.isTracking)
+        assertEquals(PoseDataExtractor.SYNTHETIC_POSE_SOURCE, seeded.poseSource)
+        assertEquals(7L, seeded.fixtureBindingGeneration)
+        assertEquals(11L, seeded.fixtureGroupGeneration)
+        assertTrue(extractor.beginDebugFixture())
+        assertEquals(
+            PoseDataExtractor.SYNTHETIC_POSE_SOURCE,
+            extractor.latest()!!.poseSource,
+        )
+
+        extractor.clearDebugFixture()
+
+        assertNull(extractor.latest())
+        assertTrue(!extractor.awaitTrackingPose(timeoutMs = 0L))
+    }
+
+    @Test
+    fun `synthetic fixture rejects an ownership generation change`() {
+        val extractor = PoseDataExtractor()
+        extractor.beginSyntheticDebugFixture(
+            bindingGeneration = 7L,
+            groupGeneration = 11L,
+        )
+
+        var rejected = false
+        try {
+            extractor.beginSyntheticDebugFixture(
+                bindingGeneration = 8L,
+                groupGeneration = 11L,
+            )
+        } catch (_: IllegalStateException) {
+            rejected = true
+        }
+        assertTrue(rejected)
+    }
+
     @Test
     fun `tracking readiness waits for an observed tracking pose`() {
         val extractor = PoseDataExtractor()

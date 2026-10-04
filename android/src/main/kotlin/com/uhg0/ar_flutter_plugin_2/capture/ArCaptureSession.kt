@@ -1,6 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.capture
 
 import android.graphics.ImageFormat
+import android.graphics.Bitmap
 import android.graphics.Rect
 import android.graphics.YuvImage
 import android.graphics.SurfaceTexture
@@ -8,9 +9,13 @@ import android.media.Image
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Debug
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.os.PowerManager
 import android.util.Log
 import android.util.Size
+import java.io.ByteArrayInputStream
 import android.view.Surface
 import com.google.ar.core.TrackingState
 import com.google.android.filament.Stream
@@ -21,6 +26,11 @@ import com.uhg0.ar_flutter_plugin_2.sceneview.SceneViewCaptureHost
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.concurrent.Executor
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -37,9 +47,11 @@ internal class ArCaptureSession(
     private val onObservedControlStateChanged: (ArCaptureSession) -> Unit = {},
     private val onCaptureAccepted: (Map<String, Any?>) -> Unit = {},
     private val onCaptureFinalized: (Map<String, Any?>) -> Unit = {},
+    private val captureSafetySignalV2: CaptureSafetySignalV2 = CaptureSafetySignalV2(),
 ) {
     companion object {
         private const val TrackingPoseReadyTimeoutMs = 2_000L
+        private const val NativeCaptureCloseTimeoutMs = 1_000L
     }
 
     private var config: CaptureConfig? = null
@@ -48,9 +60,70 @@ internal class ArCaptureSession(
     private val resourceCounters = CaptureResourceCounters()
     private val poseDataExtractor = PoseDataExtractor()
     private var sharedCameraManager: SharedCameraManager? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val disposed = AtomicBoolean(false)
+    private var disposeStarted = false
+    private var disposeResult: Result<Unit>? = null
+    private val disposeCallbacks = mutableListOf<(Result<Unit>) -> Unit>()
+    private val processTelemetryTiming = if (
+        sceneHost.context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
+    ) ProcessTelemetryTimingLedger() else null
+    private val processTelemetrySampler = ProcessTelemetrySampler(
+        pss = { Debug.getPss() * 1024L },
+        fileDescriptors = { File("/proc/self/fd").list()?.size },
+        // Preserve exact Java-thread semantics, including the diagnostic worker.
+        javaThreads = { Thread.getAllStackTraces().size },
+        timing = processTelemetryTiming,
+    )
+    private val processTelemetry = ProcessTelemetryCache(
+        clockMs = SystemClock::elapsedRealtime,
+        collect = {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+            processTelemetrySampler.sample()
+        },
+    )
+    private val nativeCaptureSerialOwnerV2 = NativeCaptureSerialOwnerV2(
+        completionExecutor = Executor { command -> mainHandler.post(command) },
+    )
+    private val nativeDurableCaptureRevisionV2 = AtomicLong(0L)
+    private val nativeCaptureAdmissionCallsV2 = AtomicInteger(0)
+    private val nativeCapturePendingAttemptsV2 = ConcurrentHashMap.newKeySet<String>()
+    private val nativeCapturePendingCountV2 = AtomicInteger(0)
+    private val syntheticCaptureCompletion = SyntheticCaptureCompletionGate()
+    // Constructed per view now; #102 only provides a future native admission caller.
+    private val nativeCaptureBindingV2 = NativeCaptureBindingV2(
+        sceneHost.context,
+        captureSafetySignalV2,
+        events = { event ->
+            val attemptId = event.attemptId
+            if (attemptId != null) {
+                when (event.kind) {
+                    NativeCaptureEventKindV2.ACCEPTED, NativeCaptureEventKindV2.FINALIZING,
+                    NativeCaptureEventKindV2.RECOVERING -> {
+                        if (nativeCapturePendingAttemptsV2.add(attemptId)) nativeCapturePendingCountV2.incrementAndGet()
+                    }
+                    NativeCaptureEventKindV2.COMMITTED, NativeCaptureEventKindV2.ABANDONED -> {
+                        if (nativeCapturePendingAttemptsV2.remove(attemptId)) nativeCapturePendingCountV2.decrementAndGet()
+                    }
+                    else -> Unit
+                }
+            }
+            if (event.kind == NativeCaptureEventKindV2.COMMITTED) {
+                val revision = checkNotNull(event.captureRevision)
+                nativeDurableCaptureRevisionV2.accumulateAndGet(revision, ::maxOf)
+            }
+            mainHandler.post {
+                if (!disposed.get()) {
+                    captureChannel.invokeMethod("onNativeCaptureV2Event", NativeCaptureWireV2.event(event))
+                }
+            }
+        },
+    )
     private var sharedImageCacheManager: ImageCacheManager? = null
     private var highResCaptureEnabled = false
+    private var poseStreamEnabled = true
     private var poseSequence = 0L
+    private val poseWireRateLimiter = PoseUpdateRateLimiter()
     private var sharedCameraFilamentStream: Stream? = null
     private var sharedCameraPreviewSurfaceTexture: SurfaceTexture? = null
     private var sharedCameraPreviewSurface: Surface? = null
@@ -114,6 +187,10 @@ internal class ArCaptureSession(
     suspend fun initialize(configMap: Map<String, Any?>) {
         val parsedConfig = CaptureConfig.fromMap(configMap)
         config = parsedConfig
+        poseStreamEnabled = configMap["enablePoseStream"] as? Boolean ?: true
+        poseSequence = 0L
+        poseWireRateLimiter.onPause()
+        poseWireRateLimiter.onResume()
         highResCaptureEnabled = configMap["enableHighResCapture"] as? Boolean ?: false
         if (highResCaptureEnabled) {
             SharedCameraInteropPlanner
@@ -214,6 +291,7 @@ internal class ArCaptureSession(
                 try {
                     manager.initialize(imageCacheManager)
                     sharedCameraManager = manager
+                    nativeCaptureBindingV2.attachSharedCamera(manager)
                     break
                 } catch (error: Exception) {
                     startupError = error
@@ -423,7 +501,11 @@ internal class ArCaptureSession(
         return sharedCameraManager?.getCaptureCapacity() ?: byteCache.getCaptureCapacity()
     }
 
-    fun getPerformanceSnapshot(): Map<String, Any?> {
+    fun getPerformanceSnapshot(
+        resetDiagnosticTiming: Boolean = false,
+        includeDiagnosticTiming: Boolean = false,
+    ): Map<String, Any?> {
+        if (resetDiagnosticTiming) processTelemetryTiming?.reset(processTelemetry.isRefreshPending())
         val runtime = Runtime.getRuntime()
         val batteryManager =
             sceneHost.context.getSystemService(BatteryManager::class.java)
@@ -451,13 +533,13 @@ internal class ArCaptureSession(
                 null
             }
         return resourceCounters.snapshot() +
+            (sharedCameraManager?.captureScratchReceipt() ?: emptyMap()) +
+            processTelemetry.snapshot().toMap() +
+            (if (includeDiagnosticTiming && processTelemetryTiming != null)
+                mapOf("processTelemetryTiming" to processTelemetryTiming.snapshot()) else emptyMap()) +
             mapOf(
-                "processPssBytes" to Debug.getPss().toLong() * 1024L,
                 "dartAndJavaHeapUsedBytes" to
                     runtime.totalMemory() - runtime.freeMemory(),
-                "openFileDescriptors" to
-                    (File("/proc/self/fd").list()?.size ?: -1),
-                "threadCount" to Thread.getAllStackTraces().size,
                 "batteryPercent" to batteryPercent,
                 "batteryChargeCounterMicroAh" to chargeCounterMicroAh,
                 "thermalStatus" to thermalStatus,
@@ -672,39 +754,274 @@ internal class ArCaptureSession(
         return requireSharedCameraControls().isFlashAvailable()
     }
 
-    fun buildPoseUpdate(frame: Frame): Map<String, Any?>? {
+    fun buildPoseUpdate(frame: Frame): ByteArray? {
         // AR frames also flow when high-resolution capture is disabled, and a
         // final Compose frame can race deterministic disposal. In both cases
         // there is no capture pose stream to update.
         if (config == null) return null
         poseDataExtractor.onFrame(frame)
 
-        val sensorTimestampNs = frame.timestamp
-        val latestPose = poseDataExtractor.latest() ?: return null
+        // Keep every pose in PoseDataExtractor for still-image alignment, but
+        // avoid allocating and sending a complete nested wire map on every
+        // render callback. Coverage guidance remains comfortably above its
+        // ingress cadence at 30 Hz while the AR camera keeps its frame budget.
+        if (!poseStreamEnabled || !poseWireRateLimiter.shouldEmit(frame.timestamp)) {
+            return null
+        }
+
+        return poseDataExtractor.latestPacked(++poseSequence)
+    }
+
+    fun prepareNativeCaptureForPause(onCompleted: (Result<Unit>) -> Unit): Boolean =
+        nativeCaptureSerialOwnerV2.submit(
+            operation = { nativeCaptureBindingV2.onPause() },
+            completion = onCompleted,
+        )
+
+    /** Scalar-only V2 admission. Component descriptors and bytes are native post-output authority. */
+    fun admitNativeCaptureV2(
+        arguments: Any?,
+        onCompleted: (Result<Map<String, Any?>>) -> Unit,
+    ): Boolean {
+        nativeCaptureAdmissionCallsV2.incrementAndGet()
+        val submitted = nativeCaptureSerialOwnerV2.submit(
+            operation = {
+                val request = NativeCaptureWireV2.decodeAdmission(arguments)
+                val receipt = nativeCaptureBindingV2.admit(request)
+                mapOf(
+                    "wireVersion" to "native_capture_v2",
+                    "attemptId" to receipt.identity.attemptId,
+                    "phase" to receipt.phase.name.lowercase(),
+                    "durable" to receipt.durable,
+                    "terminal" to receipt.terminal?.let { terminal ->
+                        NativeCaptureWireV2.event(
+                            NativeCaptureEventV2(
+                                if (terminal.kind == CaptureTerminalKind.COMMITTED_PICTURE) {
+                                    NativeCaptureEventKindV2.COMMITTED
+                                } else {
+                                    NativeCaptureEventKindV2.ABANDONED
+                                },
+                                terminal.identity.attemptId,
+                                terminal.captureId,
+                                terminal.captureRevision,
+                                terminal.manifestId,
+                                jpegSizeBytes = terminal.jpegSizeBytes,
+                                dngSizeBytes = terminal.dngSizeBytes,
+                                reason = terminal.reason,
+                                recoveryContext = request.recoveryContext,
+                            ),
+                        )
+                    },
+                )
+            },
+            completion = { result ->
+                nativeCaptureAdmissionCallsV2.decrementAndGet()
+                onCompleted(result)
+            },
+        )
+        if (!submitted) nativeCaptureAdmissionCallsV2.decrementAndGet()
+        return submitted
+    }
+
+    /** Frame-thread admission gate: atomic reads only, with no native owner lock or I/O. */
+    fun nativeCaptureWorkPendingV2(): Boolean =
+        nativeCaptureAdmissionCallsV2.get() > 0 || nativeCapturePendingCountV2.get() > 0
+
+    fun nativeCaptureHealthV2(): Map<String, Any?> = NativeCaptureWireV2.event(
+        NativeCaptureEventV2(NativeCaptureEventKindV2.HEALTH, resources = nativeCaptureBindingV2.snapshot()),
+    )
+
+    fun materializeNativeCapturePreview(manifestId: String, captureId: String): String? =
+        nativeCaptureBindingV2.materializeJpegPreview(manifestId, captureId)
+
+    fun durableCaptureRevisionV2(): Long = nativeDurableCaptureRevisionV2.get()
+
+    fun replayNativeCaptureRecoveryV2(): List<Map<String, Any?>> =
+        nativeCaptureBindingV2.replayRecovery().map(NativeCaptureWireV2::event)
+
+    fun acknowledgeNativeCaptureTerminalV2(attemptId: String) {
+        nativeCaptureBindingV2.acknowledgeTerminal(attemptId)
+    }
+
+    internal fun beginDebugPoseFixture(): Boolean = poseDataExtractor.beginDebugFixture()
+
+    internal fun beginDebugSyntheticPoseFixture(
+        bindingGeneration: Long,
+        groupGeneration: Long,
+    ): Map<String, Any?> {
+        require(bindingGeneration > 0L) { "binding generation must be positive" }
+        require(groupGeneration > 0L) { "group generation must be positive" }
+        val pose = poseDataExtractor.beginSyntheticDebugFixture(
+            bindingGeneration = bindingGeneration,
+            groupGeneration = groupGeneration,
+        )
         return poseDataExtractor.toPoseMap(
             poseDataExtractor.toAlignedPose(
-                pose = latestPose,
-                sensorTimestampNs = latestPose.timestampNs,
-                poseAlignment = "exact",
+                pose = pose,
+                sensorTimestampNs = pose.timestampNs,
+                poseAlignment = "syntheticFixture",
                 poseTimeErrorNs = 0L,
             ),
         ) + mapOf(
             "wireVersion" to "pose_batch_v1",
             "sequence" to ++poseSequence,
+            "poseSource" to PoseDataExtractor.SYNTHETIC_POSE_SOURCE,
         )
     }
 
-    fun onSessionPaused() {
-        sharedCameraManager?.onArSessionPaused()
+    internal fun setDebugPoseManualView() = poseDataExtractor.setDebugFixtureManualView()
+
+    internal fun setDebugPoseAutomaticRevisit() =
+        poseDataExtractor.setDebugFixtureAutomaticRevisit()
+
+    internal fun debugPoseFixtureTransform(): DoubleArray? =
+        poseDataExtractor.debugFixtureTransform()
+
+    internal fun clearDebugPoseFixture() = poseDataExtractor.clearDebugFixture()
+
+    fun advanceNativeCaptureRecoveryV2() = nativeCaptureBindingV2.forceRecoveryForDebug()
+
+    fun completeDebugNativeCaptureV2(): Boolean = syntheticCaptureCompletion.complete()
+
+    fun notifyNativeCaptureLifecycleV2(
+        event: String,
+        onCompleted: (Result<Unit>) -> Unit,
+    ): Boolean {
+        val parsed = when (event) {
+            "automaticDisabled" -> CaptureLifecycleEvent.AUTOMATIC_DISABLED
+            "routeLeft" -> CaptureLifecycleEvent.ROUTE_LEFT
+            "processRestarted" -> CaptureLifecycleEvent.PROCESS_RESTARTED
+            else -> throw IllegalArgumentException("Unsupported V2 lifecycle event: $event")
+        }
+        return nativeCaptureSerialOwnerV2.submit(
+            operation = { nativeCaptureBindingV2.onLifecycle(parsed) },
+            completion = onCompleted,
+        )
     }
+
+    fun installDebugNativeCaptureSyntheticV2(fault: String?): Boolean {
+        require(fault == null || fault in setOf("camera", "hang", "malformed", "store", "deferred")) {
+            "Unsupported synthetic V2 capture fault"
+        }
+        val validJpeg = if (fault == null) createDebugCaptureJpeg() else null
+        return nativeCaptureBindingV2.installSyntheticExposureHookForTest(
+            request = request@{ qualifier, required, callback ->
+                when (fault) {
+                    "camera" -> callback.onFailure(qualifier, "synthetic-camera")
+                    "hang" -> Unit
+                    "deferred" -> return@request syntheticCaptureCompletion.hold(qualifier, required, callback)
+                    "malformed" -> callback.onComponents(
+                        SharedCameraComponentSetV2(
+                            qualifier,
+                            listOf(
+                                CaptureComponentStreamV2(CaptureComponentKind.JPEG, ByteArrayInputStream(byteArrayOf(1, 2, 3))),
+                                CaptureComponentStreamV2(CaptureComponentKind.JPEG, ByteArrayInputStream(byteArrayOf(4, 5, 6))),
+                            ),
+                            exposureTimestampNanoseconds = 1L,
+                        ),
+                    )
+                    "store" -> callback.onComponents(
+                        SharedCameraComponentSetV2(
+                            qualifier,
+                            required.sortedBy { it.ordinal }.map { kind ->
+                                CaptureComponentStreamV2(kind, object : java.io.InputStream() {
+                                    override fun read(): Int = throw java.io.IOException("synthetic-store-stream")
+                                })
+                            },
+                            exposureTimestampNanoseconds = 1L,
+                        ),
+                    )
+                    else -> callback.onComponents(
+                        SharedCameraComponentSetV2(
+                            qualifier,
+                            required.sortedBy { it.ordinal }.map { kind ->
+                                CaptureComponentStreamV2(
+                                    kind,
+                                    ByteArrayInputStream(
+                                        if (kind == CaptureComponentKind.JPEG) requireNotNull(validJpeg)
+                                        else byteArrayOf(kind.ordinal.toByte(), 7, 9),
+                                    ),
+                                )
+                            },
+                            exposureTimestampNanoseconds = 1L,
+                        ),
+                    )
+                }
+                true
+            },
+            cancel = syntheticCaptureCompletion::cancel,
+        )
+    }
+
+    private fun createDebugCaptureJpeg(): ByteArray {
+        val width = 128
+        val height = 128
+        val pixels = IntArray(width * height) { index ->
+            val x = index % width
+            val y = index / width
+            0xFF000000.toInt() or
+                (((x * 13 + y * 7) and 0xFF) shl 16) or
+                (((x * 3 + y * 19) and 0xFF) shl 8) or
+                ((x * 23 + y * 5) and 0xFF)
+        }
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        return try {
+            bitmap.setPixels(pixels, 0, width, 0, 0, width, height)
+            ByteArrayOutputStream().use { output ->
+                check(bitmap.compress(Bitmap.CompressFormat.JPEG, 90, output)) {
+                    "Synthetic capture JPEG encoding failed"
+                }
+                output.toByteArray()
+            }
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    fun finishSharedCameraPause() = sharedCameraManager?.onArSessionPaused()
 
     fun onSessionResumed() {
         sharedCameraManager?.onArSessionResumed()
     }
 
-    fun dispose() {
+    fun dispose(onCompleted: (Result<Unit>) -> Unit): Boolean {
+        disposeResult?.let {
+            onCompleted(it)
+            return true
+        }
+        disposeCallbacks += onCompleted
+        if (disposeStarted) return true
+        disposeStarted = true
+        // The binding classifies every owner before the manager closes Camera2.
+        disposed.set(true)
+        processTelemetryTiming?.close()
+        processTelemetry.close()
+        val accepted = nativeCaptureSerialOwnerV2.close(
+            timeoutMillis = NativeCaptureCloseTimeoutMs,
+            operation = { nativeCaptureBindingV2.close() },
+            timeoutOperation = { nativeCaptureBindingV2.forceCloseForDeadline() },
+        ) { durableResult ->
+            val cleanupResult = runCatching { disposeMainResources() }
+            val completed = durableResult.exceptionOrNull()?.let(Result.Companion::failure) ?: cleanupResult
+            disposeResult = completed
+            disposeCallbacks.toList().forEach { it(completed) }
+            disposeCallbacks.clear()
+        }
+        if (!accepted) {
+            val failed = Result.failure<Unit>(IllegalStateException("Native capture durable owner is already closing"))
+            disposeResult = failed
+            disposeCallbacks.toList().forEach { it(failed) }
+            disposeCallbacks.clear()
+        }
+        return accepted
+    }
+
+    private fun disposeMainResources() {
+        poseDataExtractor.clearDebugFixture()
+        syntheticCaptureCompletion.clear()
         byteCache.dispose()
         sharedCameraManager?.let { manager ->
+            nativeCaptureBindingV2.detachSharedCamera(manager)
             manager.cleanup()
             manager.finishCameraShutdown(1_000L)
         }
@@ -720,6 +1037,9 @@ internal class ArCaptureSession(
         sharedImageCacheManager = null
         config = null
         highResCaptureEnabled = false
+        poseStreamEnabled = true
+        poseSequence = 0L
+        poseWireRateLimiter.onDispose()
     }
 
     private fun createSharedCameraPreviewSurface(): Surface {

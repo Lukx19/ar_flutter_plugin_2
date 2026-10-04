@@ -18,7 +18,9 @@ pubspec.lock
 .DS_Store
 
 # Android related
+.kotlin/
 android/.gradle/
+android/.cxx/
 android/local.properties
 android/app/build/
 android/build/

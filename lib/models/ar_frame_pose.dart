@@ -1,7 +1,11 @@
+import 'dart:typed_data';
+
 import 'package:vector_math/vector_math_64.dart';
 
 const String arcoreGlCameraToWorldConvention = 'arcore_gl_c2w_v1';
 const String poseBatchWireVersion = 'pose_batch_v1';
+const String packedPoseBatchWireVersion = 'pose_batch_v2';
+const int packedPoseSampleBytes = 236;
 
 /// A camera-to-world transform with an explicit coordinate convention.
 final class ARPoseTransform {
@@ -75,6 +79,7 @@ class ARFramePose {
   final String? poseAlignment;
   final int? poseTimeErrorNs;
   final String? trackingState;
+  final String? poseSource;
   final String? wireVersion;
   final int? sequence;
 
@@ -91,6 +96,7 @@ class ARFramePose {
     this.poseAlignment,
     this.poseTimeErrorNs,
     this.trackingState,
+    this.poseSource,
     this.wireVersion,
     this.sequence,
   });
@@ -119,8 +125,67 @@ class ARFramePose {
       poseAlignment: map['poseAlignment'] as String?,
       poseTimeErrorNs: map['poseTimeErrorNs'] as int?,
       trackingState: map['trackingState'] as String?,
+      poseSource: map['poseSource'] as String?,
       wireVersion: map['wireVersion'] as String?,
       sequence: (map['sequence'] as num?)?.toInt(),
+    );
+  }
+
+  /// Decodes native float32 values without changing coordinate conversion precision.
+  factory ARFramePose.fromPacked(ByteData bytes, int offset) {
+    if (offset < 0 || offset + packedPoseSampleBytes > bytes.lengthInBytes) {
+      throw const FormatException('Truncated packed pose.');
+    }
+    int integer(int field) => bytes.getInt64(offset + field, Endian.little);
+    double scalar(int field) => bytes.getFloat32(offset + field, Endian.little);
+    Vector3 position(int field) =>
+        Vector3(scalar(field), scalar(field + 4), scalar(field + 8));
+    Quaternion rotation(int field) => Quaternion(scalar(field),
+        scalar(field + 4), scalar(field + 8), scalar(field + 12));
+    Matrix4 matrix(int field) {
+      final value = Matrix4.zero();
+      for (var index = 0; index < 16; index++) {
+        value.storage[index] = scalar(field + index * 4);
+      }
+      return value;
+    }
+
+    final flags = bytes.getInt32(offset + 44, Endian.little);
+    final state = flags & 255;
+    final source = bytes.getInt32(offset + 48, Endian.little);
+    if ((flags & ~511) != 0 ||
+        state < 1 ||
+        state > 4 ||
+        source < 0 ||
+        source > 1) {
+      throw const FormatException('Invalid packed pose flags.');
+    }
+    return ARFramePose(
+      position: position(52),
+      rotation: rotation(64),
+      transform: matrix(80),
+      timestamp: DateTime.fromMillisecondsSinceEpoch(integer(8)),
+      convention: 'opencv_c2w_v1',
+      trackingPose: ARPoseTransform(
+        position: position(144),
+        rotation: rotation(156),
+        cameraToWorld: matrix(172),
+        convention: arcoreGlCameraToWorldConvention,
+      ),
+      sensorTimestampNs: integer(16),
+      confidence: scalar(40),
+      isTracking: (flags & 256) != 0,
+      poseAlignment: 'exact',
+      poseTimeErrorNs: 0,
+      trackingState: const [
+        'tracking',
+        'paused',
+        'stopped',
+        'synthetic'
+      ][state - 1],
+      poseSource: source == 0 ? 'liveAnchor' : 'synthetic',
+      wireVersion: packedPoseBatchWireVersion,
+      sequence: integer(0),
     );
   }
 
@@ -147,6 +212,7 @@ class ARFramePose {
       if (poseAlignment != null) 'poseAlignment': poseAlignment,
       if (poseTimeErrorNs != null) 'poseTimeErrorNs': poseTimeErrorNs,
       if (trackingState != null) 'trackingState': trackingState,
+      if (poseSource != null) 'poseSource': poseSource,
       if (wireVersion != null) 'wireVersion': wireVersion,
       if (sequence != null) 'sequence': sequence,
     };
@@ -168,6 +234,7 @@ class ARFramePose {
         other.poseAlignment == poseAlignment &&
         other.poseTimeErrorNs == poseTimeErrorNs &&
         other.trackingState == trackingState &&
+        other.poseSource == poseSource &&
         other.wireVersion == wireVersion &&
         other.sequence == sequence;
   }
@@ -186,6 +253,7 @@ class ARFramePose {
       poseAlignment.hashCode ^
       poseTimeErrorNs.hashCode ^
       trackingState.hashCode ^
+      poseSource.hashCode ^
       wireVersion.hashCode ^
       sequence.hashCode;
 

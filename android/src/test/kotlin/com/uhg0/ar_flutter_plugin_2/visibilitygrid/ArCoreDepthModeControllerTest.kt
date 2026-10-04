@@ -6,18 +6,14 @@ import org.junit.Test
 
 class ArCoreDepthModeControllerTest {
     @Test
-    fun `failed raw probe falls back to automatic before feature-only`() {
+    fun `automatic predicted depth is preferred when both depth modes are supported`() {
         val controller =
             ArCoreDepthModeController(
                 rawDepthSupported = true,
                 automaticDepthSupported = true,
             )
 
-        assertEquals(Config.DepthMode.RAW_DEPTH_ONLY, controller.activeMode)
-        assertEquals(
-            Config.DepthMode.AUTOMATIC,
-            controller.recordProbe(DepthAcquisitionResult.Failure("raw probe failed")),
-        )
+        assertEquals(Config.DepthMode.AUTOMATIC, controller.activeMode)
         repeat(2) {
             assertEquals(
                 Config.DepthMode.AUTOMATIC,
@@ -27,6 +23,21 @@ class ArCoreDepthModeControllerTest {
         assertEquals(
             Config.DepthMode.DISABLED,
             controller.recordProbe(DepthAcquisitionResult.Failure("automatic failed")),
+        )
+    }
+
+    @Test
+    fun `raw depth remains the fallback when automatic depth is unsupported`() {
+        val controller =
+            ArCoreDepthModeController(
+                rawDepthSupported = true,
+                automaticDepthSupported = false,
+            )
+
+        assertEquals(Config.DepthMode.RAW_DEPTH_ONLY, controller.activeMode)
+        assertEquals(
+            Config.DepthMode.DISABLED,
+            controller.recordProbe(DepthAcquisitionResult.Failure("raw probe failed")),
         )
     }
 

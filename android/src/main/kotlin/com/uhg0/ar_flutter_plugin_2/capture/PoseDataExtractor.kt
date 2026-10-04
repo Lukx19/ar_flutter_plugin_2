@@ -21,6 +21,9 @@ class PoseDataExtractor(private val capacity: Int = 120) {
         val confidence: Float,
         val trackingState: String,
         val observedTimestampNs: Long = timestampNs,
+        val poseSource: String = "liveAnchor",
+        val fixtureBindingGeneration: Long? = null,
+        val fixtureGroupGeneration: Long? = null,
     )
 
     data class CaptureTiming(
@@ -46,7 +49,14 @@ class PoseDataExtractor(private val capacity: Int = 120) {
     )
 
     private val lock = Object()
-    private val poses = mutableListOf<CachedPose>()
+    private val poses = PoseHistory(capacity)
+    private val wireTransform = FloatArray(16)
+    private val wireQuaternion = FloatArray(4)
+    private var debugFixtureAnchor: CachedPose? = null
+    private var debugFixtureOffsetX = 0.0f
+    private var debugFixtureSource = LIVE_ANCHOR_POSE_SOURCE
+    private var debugFixtureBindingGeneration: Long? = null
+    private var debugFixtureGroupGeneration: Long? = null
 
     companion object {
         const val OPENCV_CONVENTION = "opencv_c2w_v1"
@@ -66,53 +76,231 @@ class PoseDataExtractor(private val capacity: Int = 120) {
         // around a still. Wait for a preferred bracket before using the
         // explicitly bounded nearest-pose fallback.
         const val OBSERVED_FRAME_WAIT_MS = 1_000L
+        const val LIVE_ANCHOR_POSE_SOURCE = "liveAnchor"
+        const val SYNTHETIC_POSE_SOURCE = "synthetic"
     }
 
     fun onFrame(frame: Frame) {
         val camera = frame.camera
         val pose = camera.pose
-        val transform = FloatArray(16)
-        pose.toMatrix(transform, 0)
         val trackingState = when (camera.trackingState) {
             TrackingState.TRACKING -> "tracking"
             TrackingState.PAUSED -> "paused"
             TrackingState.STOPPED -> "stopped"
         }
 
-        addSample(
-            CachedPose(
-                position = floatArrayOf(pose.tx(), pose.ty(), pose.tz()),
-                rotationQuaternion = pose.rotationQuaternion.clone(),
-                transform = transform,
-                timestampNs = frame.timestamp,
-                systemTimestampMs = System.currentTimeMillis(),
-                isTracking = camera.trackingState == TrackingState.TRACKING,
-                confidence = if (camera.trackingState == TrackingState.TRACKING) 1.0f else 0.0f,
-                trackingState = trackingState,
-                observedTimestampNs = System.nanoTime(),
-            ),
+        synchronized(lock) {
+            val slot = poses.insert(frame.timestamp) ?: return
+            slot.timestampNs = frame.timestamp
+            slot.systemTimestampMs = System.currentTimeMillis()
+            slot.observedTimestampNs = System.nanoTime()
+            val anchor = debugFixtureAnchor
+            if (anchor == null) {
+                slot.position[0] = pose.tx()
+                slot.position[1] = pose.ty()
+                slot.position[2] = pose.tz()
+                pose.getRotationQuaternion(slot.rotation, 0)
+                pose.toMatrix(slot.transform, 0)
+                slot.isTracking = camera.trackingState == TrackingState.TRACKING
+                slot.confidence = if (slot.isTracking) 1f else 0f
+                slot.trackingState = trackingState
+                slot.poseSource = LIVE_ANCHOR_POSE_SOURCE
+                slot.bindingGeneration = null
+                slot.groupGeneration = null
+            } else {
+                anchor.position.copyInto(slot.position)
+                anchor.rotationQuaternion.copyInto(slot.rotation)
+                anchor.transform.copyInto(slot.transform)
+                slot.position[0] += debugFixtureOffsetX
+                slot.transform[12] += debugFixtureOffsetX
+                slot.isTracking = true
+                slot.confidence = 1f
+                slot.trackingState = "tracking"
+                slot.poseSource = debugFixtureSource
+                slot.bindingGeneration = debugFixtureBindingGeneration
+                slot.groupGeneration = debugFixtureGroupGeneration
+            }
+            lock.notifyAll()
+        }
+    }
+
+    internal fun applyDebugFixture(raw: CachedPose): CachedPose {
+        val fixture = synchronized(lock) {
+            debugFixtureAnchor?.let {
+                DebugFixtureSnapshot(
+                    anchor = it,
+                    offsetX = debugFixtureOffsetX,
+                    source = debugFixtureSource,
+                    bindingGeneration = debugFixtureBindingGeneration,
+                    groupGeneration = debugFixtureGroupGeneration,
+                )
+            }
+        } ?: return raw
+        val position = fixture.anchor.position.clone()
+        val transform = fixture.anchor.transform.clone()
+        position[0] += fixture.offsetX
+        transform[12] += fixture.offsetX
+        return raw.copy(
+            position = position,
+            rotationQuaternion = fixture.anchor.rotationQuaternion.clone(),
+            transform = transform,
+            isTracking = true,
+            confidence = 1.0f,
+            trackingState = "tracking",
+            poseSource = fixture.source,
+            fixtureBindingGeneration = fixture.bindingGeneration,
+            fixtureGroupGeneration = fixture.groupGeneration,
         )
     }
 
     fun addSample(pose: CachedPose) {
         synchronized(lock) {
-            val insertIndex = poses.indexOfFirst { it.timestampNs > pose.timestampNs }
-            if (insertIndex >= 0) {
-                poses.add(insertIndex, pose)
-            } else {
-                poses.add(pose)
-            }
-            while (poses.size > capacity) {
-                poses.removeAt(0)
-            }
+            poses.insert(pose.timestampNs)?.set(pose)
             lock.notifyAll()
         }
     }
 
     fun latest(): CachedPose? = synchronized(lock) { poses.lastOrNull() }
 
+    /** New immutable wire owner; history and conversion scratch never escape the lock. */
+    internal fun latestPacked(sequence: Long): ByteArray? = synchronized(lock) {
+        val pose = poses.lastSlot() ?: return@synchronized null
+        pose.transform.copyInto(wireTransform)
+        for (row in 0..3) {
+            wireTransform[4 + row] = -wireTransform[4 + row]
+            wireTransform[8 + row] = -wireTransform[8 + row]
+        }
+        quaternionFromTransform(wireTransform, wireQuaternion)
+        val bytes = ByteArray(PackedPoseWireV2.SAMPLE_BYTES)
+        PackedPoseWireV2.putLong(bytes, 0, sequence)
+        PackedPoseWireV2.putLong(bytes, 8, pose.systemTimestampMs)
+        PackedPoseWireV2.putLong(bytes, 16, pose.timestampNs)
+        PackedPoseWireV2.putLong(bytes, 24, pose.bindingGeneration ?: 0L)
+        PackedPoseWireV2.putLong(bytes, 32, pose.groupGeneration ?: 0L)
+        PackedPoseWireV2.putFloat(bytes, 40, pose.confidence)
+        PackedPoseWireV2.putInt(bytes, 44, when (pose.trackingState) {
+            "tracking" -> 1
+            "paused" -> 2
+            "stopped" -> 3
+            "synthetic" -> 4
+            else -> 0
+        } or if (pose.isTracking) 256 else 0)
+        PackedPoseWireV2.putInt(bytes, 48, if (pose.poseSource == SYNTHETIC_POSE_SOURCE) 1 else 0)
+        var offset = 52
+        for (i in 12..14) { PackedPoseWireV2.putFloat(bytes, offset, wireTransform[i]); offset += 4 }
+        for (value in wireQuaternion) { PackedPoseWireV2.putFloat(bytes, offset, value); offset += 4 }
+        for (value in wireTransform) { PackedPoseWireV2.putFloat(bytes, offset, value); offset += 4 }
+        for (value in pose.position) { PackedPoseWireV2.putFloat(bytes, offset, value); offset += 4 }
+        for (value in pose.rotation) { PackedPoseWireV2.putFloat(bytes, offset, value); offset += 4 }
+        for (value in pose.transform) { PackedPoseWireV2.putFloat(bytes, offset, value); offset += 4 }
+        bytes
+    }
+
+    internal fun beginDebugFixture(): Boolean = synchronized(lock) {
+        if (debugFixtureAnchor != null) return@synchronized true
+        val anchor = poses.lastTrackingSlot()?.snapshot() ?: return@synchronized false
+        debugFixtureAnchor = anchor
+        debugFixtureOffsetX = 0.0f
+        debugFixtureSource = LIVE_ANCHOR_POSE_SOURCE
+        debugFixtureBindingGeneration = null
+        debugFixtureGroupGeneration = null
+        true
+    }
+
+    /**
+     * Seeds one bounded debug pose for a fully synthetic exposure campaign.
+     *
+     * This path is deliberately separate from [beginDebugFixture]: it never
+     * turns a real ARCore frame into a synthetic claim and requires the
+     * ownership generations supplied by the debug orchestration seam.
+     */
+    internal fun beginSyntheticDebugFixture(
+        bindingGeneration: Long,
+        groupGeneration: Long,
+    ): CachedPose = synchronized(lock) {
+        require(bindingGeneration > 0L) { "binding generation must be positive" }
+        require(groupGeneration > 0L) { "group generation must be positive" }
+        val current = debugFixtureAnchor
+        if (current != null) {
+            check(debugFixtureSource == SYNTHETIC_POSE_SOURCE) {
+                "a live pose fixture is already active"
+            }
+            check(debugFixtureBindingGeneration == bindingGeneration) {
+                "synthetic pose binding generation does not match"
+            }
+            check(debugFixtureGroupGeneration == groupGeneration) {
+                "synthetic pose group generation does not match"
+            }
+            return@synchronized current
+        }
+        val timestampNs = System.nanoTime()
+        val synthetic = CachedPose(
+            position = floatArrayOf(0.0f, 0.0f, 0.0f),
+            rotationQuaternion = floatArrayOf(0.0f, 0.0f, 0.0f, 1.0f),
+            transform = floatArrayOf(
+                1.0f, 0.0f, 0.0f, 0.0f,
+                0.0f, 1.0f, 0.0f, 0.0f,
+                0.0f, 0.0f, 1.0f, 0.0f,
+                0.0f, 0.0f, 0.0f, 1.0f,
+            ),
+            timestampNs = timestampNs,
+            systemTimestampMs = System.currentTimeMillis(),
+            isTracking = true,
+            confidence = 1.0f,
+            trackingState = "synthetic",
+            observedTimestampNs = timestampNs,
+            poseSource = SYNTHETIC_POSE_SOURCE,
+            fixtureBindingGeneration = bindingGeneration,
+            fixtureGroupGeneration = groupGeneration,
+        )
+        poses.insert(synthetic.timestampNs)?.set(synthetic)
+        debugFixtureAnchor = synthetic
+        debugFixtureOffsetX = 0.0f
+        debugFixtureSource = SYNTHETIC_POSE_SOURCE
+        debugFixtureBindingGeneration = bindingGeneration
+        debugFixtureGroupGeneration = groupGeneration
+        lock.notifyAll()
+        synthetic
+    }
+
+    internal fun setDebugFixtureManualView() = synchronized(lock) {
+        check(debugFixtureAnchor != null) { "synthetic pose fixture is not active" }
+        debugFixtureOffsetX = 0.24f
+    }
+
+    internal fun setDebugFixtureAutomaticRevisit() = synchronized(lock) {
+        check(debugFixtureAnchor != null) { "synthetic pose fixture is not active" }
+        debugFixtureOffsetX = 0.0f
+    }
+
+    internal fun debugFixtureTransform(): DoubleArray? = synchronized(lock) {
+        val anchor = debugFixtureAnchor ?: return@synchronized null
+        val transform = anchor.transform.clone()
+        transform[12] += debugFixtureOffsetX
+        DoubleArray(transform.size) { transform[it].toDouble() }
+    }
+
+    internal fun clearDebugFixture() {
+        synchronized(lock) {
+            debugFixtureAnchor = null
+            debugFixtureOffsetX = 0.0f
+            debugFixtureSource = LIVE_ANCHOR_POSE_SOURCE
+            debugFixtureBindingGeneration = null
+            debugFixtureGroupGeneration = null
+            poses.removeAll { it.poseSource == SYNTHETIC_POSE_SOURCE }
+        }
+    }
+
+    private data class DebugFixtureSnapshot(
+        val anchor: CachedPose,
+        val offsetX: Float,
+        val source: String,
+        val bindingGeneration: Long?,
+        val groupGeneration: Long?,
+    )
+
     fun alignmentDiagnostics(captureTiming: CaptureTiming): String = synchronized(lock) {
-        val tracked = poses.filter { it.isTracking }
+        val tracked = poses.trackedSlots()
         val target = captureTiming.referenceTimestampNs
         val nearestError = tracked.minOfOrNull { abs(it.timestampNs - target) }
         val before = tracked.lastOrNull { it.timestampNs <= target }
@@ -141,7 +329,7 @@ class PoseDataExtractor(private val capacity: Int = 120) {
     fun awaitTrackingPose(timeoutMs: Long): Boolean {
         val deadlineMs = System.currentTimeMillis() + timeoutMs
         synchronized(lock) {
-            while (poses.none { it.isTracking }) {
+            while (poses.lastTrackingSlot() == null) {
                 val remainingMs = deadlineMs - System.currentTimeMillis()
                 if (remainingMs <= 0) {
                     return false
@@ -199,6 +387,9 @@ class PoseDataExtractor(private val capacity: Int = 120) {
             "confidence" to alignedPose.pose.confidence.toDouble(),
             "isTracking" to alignedPose.pose.isTracking,
             "trackingState" to alignedPose.pose.trackingState,
+            "poseSource" to alignedPose.pose.poseSource,
+            "fixtureBindingGeneration" to alignedPose.pose.fixtureBindingGeneration,
+            "fixtureGroupGeneration" to alignedPose.pose.fixtureGroupGeneration,
             "poseAlignment" to alignedPose.poseAlignment,
             "poseTimeErrorNs" to alignedPose.poseTimeErrorNs,
             "trackingPose" to mapOf(
@@ -236,7 +427,7 @@ class PoseDataExtractor(private val capacity: Int = 120) {
                     return observedResolved
                 }
 
-                val latestTracked = poses.lastOrNull { it.isTracking }
+                val latestTracked = poses.lastTrackingSlot()
                 val observedTarget = captureTiming.observedReferenceTimestampNs
                 if (observedTarget != null) {
                     if (latestTracked != null &&
@@ -261,17 +452,16 @@ class PoseDataExtractor(private val capacity: Int = 120) {
 
     private fun resolvePoseLocked(captureTiming: CaptureTiming): AlignedPose? {
         val targetTimestampNs = captureTiming.referenceTimestampNs
-        val trackedPoses = poses.filter { it.isTracking }
+        val trackedPoses = poses.trackedSlots()
         if (trackedPoses.isEmpty()) {
             return null
         }
 
-        trackedPoses
-            .filter { abs(it.timestampNs - targetTimestampNs) <= EXACT_MATCH_THRESHOLD_NS }
-            .minByOrNull { abs(it.timestampNs - targetTimestampNs) }
+        trackedPoses.minByOrNull { abs(it.timestampNs - targetTimestampNs) }
+            ?.takeIf { abs(it.timestampNs - targetTimestampNs) <= EXACT_MATCH_THRESHOLD_NS }
             ?.let { exactPose ->
             return AlignedPose(
-                pose = exactPose,
+                pose = exactPose.snapshot(),
                 sensorTimestampNs = targetTimestampNs,
                 poseAlignment = "exact",
                 poseTimeErrorNs = abs(exactPose.timestampNs - targetTimestampNs),
@@ -348,17 +538,16 @@ class PoseDataExtractor(private val capacity: Int = 120) {
         captureTiming: CaptureTiming,
     ): AlignedPose? {
         val targetTimestampNs = captureTiming.observedReferenceTimestampNs ?: return null
-        val trackedPoses = poses.filter { it.isTracking }
+        val trackedPoses = poses.trackedSlots()
         if (trackedPoses.isEmpty()) {
             return null
         }
 
-        trackedPoses
-            .filter { abs(it.observedTimestampNs - targetTimestampNs) <= EXACT_MATCH_THRESHOLD_NS }
-            .minByOrNull { abs(it.observedTimestampNs - targetTimestampNs) }
+        trackedPoses.minByOrNull { abs(it.observedTimestampNs - targetTimestampNs) }
+            ?.takeIf { abs(it.observedTimestampNs - targetTimestampNs) <= EXACT_MATCH_THRESHOLD_NS }
             ?.let { exactPose ->
                 return AlignedPose(
-                    pose = exactPose,
+                    pose = exactPose.snapshot(),
                     sensorTimestampNs = captureTiming.referenceTimestampNs,
                     poseAlignment = "observedMonotonicExact",
                     poseTimeErrorNs = abs(exactPose.observedTimestampNs - targetTimestampNs),
@@ -411,7 +600,7 @@ class PoseDataExtractor(private val capacity: Int = 120) {
     private fun resolveNearestPoseLocked(
         captureTiming: CaptureTiming,
     ): AlignedPose? {
-        val trackedPoses = poses.filter { it.isTracking }
+        val trackedPoses = poses.trackedSlots()
         val sensorTargetNs = captureTiming.referenceTimestampNs
         val nearestSensorPose = trackedPoses.minByOrNull {
             abs(it.timestampNs - sensorTargetNs)
@@ -424,7 +613,7 @@ class PoseDataExtractor(private val capacity: Int = 120) {
             sensorErrorNs <= NEAREST_MATCH_THRESHOLD_NS
         ) {
             return AlignedPose(
-                pose = nearestSensorPose,
+                pose = nearestSensorPose.snapshot(),
                 sensorTimestampNs = sensorTargetNs,
                 poseAlignment = "nearest",
                 poseTimeErrorNs = sensorErrorNs,
@@ -442,7 +631,7 @@ class PoseDataExtractor(private val capacity: Int = 120) {
             return null
         }
         return AlignedPose(
-            pose = nearestObservedPose,
+            pose = nearestObservedPose.snapshot(),
             sensorTimestampNs = sensorTargetNs,
             poseAlignment = "observedMonotonicNearest",
             poseTimeErrorNs = observedErrorNs,
@@ -563,47 +752,132 @@ class PoseDataExtractor(private val capacity: Int = 120) {
         return converted
     }
 
-    private fun quaternionFromTransform(transform: FloatArray): FloatArray {
+    private fun quaternionFromTransform(transform: FloatArray): FloatArray =
+        FloatArray(4).also { quaternionFromTransform(transform, it) }
+
+    private fun quaternionFromTransform(transform: FloatArray, quaternion: FloatArray) {
         val m00 = transform[0]
         val m11 = transform[5]
         val m22 = transform[10]
         val trace = m00 + m11 + m22
 
-        val quaternion =
             if (trace > 0f) {
                 val scale = sqrt(trace + 1f) * 2f
-                floatArrayOf(
-                    (transform[6] - transform[9]) / scale,
-                    (transform[8] - transform[2]) / scale,
-                    (transform[1] - transform[4]) / scale,
-                    0.25f * scale,
-                )
+                quaternion[0] = (transform[6] - transform[9]) / scale
+                quaternion[1] = (transform[8] - transform[2]) / scale
+                quaternion[2] = (transform[1] - transform[4]) / scale
+                quaternion[3] = 0.25f * scale
             } else if (m00 > m11 && m00 > m22) {
                 val scale = sqrt(1f + m00 - m11 - m22) * 2f
-                floatArrayOf(
-                    0.25f * scale,
-                    (transform[4] + transform[1]) / scale,
-                    (transform[8] + transform[2]) / scale,
-                    (transform[6] - transform[9]) / scale,
-                )
+                quaternion[0] = 0.25f * scale
+                quaternion[1] = (transform[4] + transform[1]) / scale
+                quaternion[2] = (transform[8] + transform[2]) / scale
+                quaternion[3] = (transform[6] - transform[9]) / scale
             } else if (m11 > m22) {
                 val scale = sqrt(1f + m11 - m00 - m22) * 2f
-                floatArrayOf(
-                    (transform[4] + transform[1]) / scale,
-                    0.25f * scale,
-                    (transform[9] + transform[6]) / scale,
-                    (transform[8] - transform[2]) / scale,
-                )
+                quaternion[0] = (transform[4] + transform[1]) / scale
+                quaternion[1] = 0.25f * scale
+                quaternion[2] = (transform[9] + transform[6]) / scale
+                quaternion[3] = (transform[8] - transform[2]) / scale
             } else {
                 val scale = sqrt(1f + m22 - m00 - m11) * 2f
-                floatArrayOf(
-                    (transform[8] + transform[2]) / scale,
-                    (transform[9] + transform[6]) / scale,
-                    0.25f * scale,
-                    (transform[1] - transform[4]) / scale,
-                )
+                quaternion[0] = (transform[8] + transform[2]) / scale
+                quaternion[1] = (transform[9] + transform[6]) / scale
+                quaternion[2] = 0.25f * scale
+                quaternion[3] = (transform[1] - transform[4]) / scale
             }
 
-        return quaternion.normalizedQuaternion()
+        val magnitude = sqrt(quaternion[0] * quaternion[0] + quaternion[1] * quaternion[1] +
+            quaternion[2] * quaternion[2] + quaternion[3] * quaternion[3])
+        if (magnitude == 0f) {
+            quaternion.fill(0f)
+            quaternion[3] = 1f
+        } else for (i in 0..3) quaternion[i] /= magnitude
+    }
+
+    /** Fixed primitive history; a snapshot is created only when a caller takes ownership. */
+    private class PoseHistory(capacity: Int) : AbstractMutableList<CachedPose>() {
+        init { require(capacity > 0) }
+        private val slots = Array(capacity) { PoseSlot() }
+        private val tracked = ArrayList<PoseSlot>(capacity)
+        override var size = 0
+            private set
+        override fun get(index: Int): CachedPose {
+            require(index in 0 until size)
+            return slots[index].snapshot()
+        }
+        fun lastSlot(): PoseSlot? = if (size == 0) null else slots[size - 1]
+        fun lastTrackingSlot(): PoseSlot? {
+            for (index in size - 1 downTo 0) if (slots[index].isTracking) return slots[index]
+            return null
+        }
+        fun trackedSlots(): List<PoseSlot> {
+            tracked.clear()
+            for (index in 0 until size) if (slots[index].isTracking) tracked.add(slots[index])
+            return tracked
+        }
+        fun insert(timestamp: Long): PoseSlot? {
+            var index = 0
+            while (index < size && slots[index].timestampNs <= timestamp) index++
+            if (size == slots.size && index == 0) return null
+            val slot: PoseSlot
+            if (size == slots.size) {
+                slot = slots[0]
+                for (i in 1 until index) slots[i - 1] = slots[i]
+                index--
+            } else {
+                slot = slots[size]
+                for (i in size downTo index + 1) slots[i] = slots[i - 1]
+                size++
+            }
+            slots[index] = slot
+            return slot
+        }
+        override fun add(index: Int, element: CachedPose) {
+            require(index == size) { "History insertion is timestamp ordered" }
+            insert(element.timestampNs)?.set(element)
+        }
+        override fun set(index: Int, element: CachedPose): CachedPose =
+            get(index).also { slots[index].set(element) }
+        override fun removeAt(index: Int): CachedPose {
+            val result = get(index)
+            val freed = slots[index]
+            for (i in index until size - 1) slots[i] = slots[i + 1]
+            slots[--size] = freed
+            return result
+        }
+    }
+
+    private class PoseSlot {
+        val position = FloatArray(3)
+        val rotation = FloatArray(4)
+        val rotationQuaternion: FloatArray get() = rotation
+        val transform = FloatArray(16)
+        var timestampNs = 0L
+        var systemTimestampMs = 0L
+        var observedTimestampNs = 0L
+        var isTracking = false
+        var confidence = 0f
+        var trackingState = "stopped"
+        var poseSource = LIVE_ANCHOR_POSE_SOURCE
+        var bindingGeneration: Long? = null
+        var groupGeneration: Long? = null
+        fun set(pose: CachedPose) {
+            pose.position.copyInto(position)
+            pose.rotationQuaternion.copyInto(rotation)
+            pose.transform.copyInto(transform)
+            timestampNs = pose.timestampNs
+            systemTimestampMs = pose.systemTimestampMs
+            observedTimestampNs = pose.observedTimestampNs
+            isTracking = pose.isTracking
+            confidence = pose.confidence
+            trackingState = pose.trackingState
+            poseSource = pose.poseSource
+            bindingGeneration = pose.fixtureBindingGeneration
+            groupGeneration = pose.fixtureGroupGeneration
+        }
+        fun snapshot() = CachedPose(position.clone(), rotation.clone(), transform.clone(), timestampNs,
+            systemTimestampMs, isTracking, confidence, trackingState, observedTimestampNs,
+            poseSource, bindingGeneration, groupGeneration)
     }
 }

@@ -167,10 +167,10 @@ class ExamplesHomeScreen extends StatelessWidget {
       ),
       ExampleInfo(
         title: 'Documentation & Examples',
-        subtitle: 'Phase 8: Complete documentation system',
+        subtitle: 'Capture documentation system',
         description: 'Comprehensive documentation generation, usage examples, integration guides, performance optimization, and developer tools.',
         icon: Icons.library_books_rounded,
-        route: '/phase8-documentation-examples',
+        route: '/capture-documentation-examples',
         color: Colors.teal,
       ),
     ];

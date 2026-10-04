@@ -2,7 +2,7 @@ group 'com.uhg0.ar_flutter_plugin_2'
 version '1.0-SNAPSHOT'
 
 buildscript {
-    ext.kotlin_version = '2.4.0'
+    ext.kotlin_version = '2.4.20'
     repositories {
         mavenLocal()
         google()
@@ -10,7 +10,7 @@ buildscript {
     }
 
     dependencies {
-        classpath 'com.android.tools.build:gradle:8.9.1'
+        classpath 'com.android.tools.build:gradle:9.4.1'
         classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
         classpath "org.jetbrains.kotlin:compose-compiler-gradle-plugin:$kotlin_version"
     }
@@ -29,7 +29,8 @@ apply plugin: 'kotlin-android'
 apply plugin: 'org.jetbrains.kotlin.plugin.compose'
 
 android {
-    compileSdk 36
+    compileSdk 37
+    ndkVersion "28.2.13676358" // Match the host app native toolchain.
     namespace 'com.uhg0.ar_flutter_plugin_2'
 
     compileOptions {
@@ -44,12 +45,24 @@ android {
     sourceSets {
         main.java.srcDirs += 'src/main/kotlin'
         test.java.srcDirs += 'src/test/kotlin'
-        test.resources.srcDirs += '../test/fixtures'
+        test.resources.srcDirs += '../../../docs/proposal08/evidence'
     }
 
     defaultConfig {
         minSdkVersion 28
         targetSdkVersion 34
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        externalNativeBuild {
+            cmake { cppFlags "-std=c++17" }
+        }
+    }
+
+    externalNativeBuild {
+        cmake { path file("src/main/cpp/CMakeLists.txt") }
+    }
+
+    sourceSets {
+        androidTest.java.srcDirs += 'src/androidTest/kotlin'
     }
 
     testOptions {
@@ -65,12 +78,57 @@ android {
 dependencies {
     implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk7:$kotlin_version"
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0'
-    implementation platform('androidx.compose:compose-bom:2026.05.01')
+    implementation 'org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0'
+    implementation platform('androidx.compose:compose-bom:2026.09.00')
     implementation 'androidx.compose.ui:ui'
     implementation 'androidx.compose.foundation:foundation'
     implementation 'androidx.activity:activity-compose:1.13.0'
-    implementation 'io.github.sceneview:arsceneview:4.21.2'
+    implementation 'io.github.sceneview:arsceneview:4.47.0'
     implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
     testImplementation 'junit:junit:4.13.2'
     testImplementation 'org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0'
+    testImplementation 'org.openjdk.jol:jol-core:0.17'
+    androidTestImplementation 'androidx.test:runner:1.6.2'
+    androidTestImplementation 'androidx.test.ext:junit:1.2.1'
+}
+
+// T5's receipt lock is execution provenance, not a bundled fixture. Forward
+// it to the forked unit-test JVM only when a parent runner supplies it.
+tasks.withType(Test).configureEach {
+    // JOL reads this during its first VM singleton initialization. Per-test setup is too late
+    // and makes aggregate results depend on class order.
+    systemProperty 'jol.magicFieldOffset', 'true'
+    def m0dSourceLock = System.getProperty('m0d.source.lock') ?: System.getenv('M0D_SOURCE_LOCK')
+    if (m0dSourceLock != null && !m0dSourceLock.trim().isEmpty()) {
+        systemProperty 'm0d.source.lock', m0dSourceLock
+    }
+}
+
+// The Flutter Gradle plugin injects this dependency when the plugin is built
+// through a Flutter application. Keep the standalone JVM project equivalent
+// for deterministic native adapter tests without bundling Flutter into the
+// plugin artifact itself.
+def flutterSdk = providers.gradleProperty('flutter.sdk').orNull ?: System.getenv('FLUTTER_ROOT')
+if (flutterSdk == null) {
+    def localPropertiesFile = rootProject.file('local.properties')
+    if (localPropertiesFile.exists()) {
+        def localProperties = new Properties()
+        localPropertiesFile.withInputStream { localProperties.load(it) }
+        flutterSdk = localProperties.getProperty('flutter.sdk')
+    }
+}
+if (flutterSdk != null) {
+    def engineVersion = file("$flutterSdk/bin/cache/engine.stamp").text.trim()
+    repositories {
+        maven { url = uri('https://storage.googleapis.com/download.flutter.io') }
+    }
+    dependencies {
+        debugCompileOnly "io.flutter:flutter_embedding_debug:1.0.0-$engineVersion"
+        testImplementation "io.flutter:flutter_embedding_debug:1.0.0-$engineVersion"
+        androidTestImplementation "io.flutter:flutter_embedding_debug:1.0.0-$engineVersion"
+        androidTestImplementation "io.flutter:armeabi_v7a_debug:1.0.0-$engineVersion"
+        androidTestImplementation "io.flutter:arm64_v8a_debug:1.0.0-$engineVersion"
+        androidTestImplementation "io.flutter:x86_debug:1.0.0-$engineVersion"
+        androidTestImplementation "io.flutter:x86_64_debug:1.0.0-$engineVersion"
+    }
 }

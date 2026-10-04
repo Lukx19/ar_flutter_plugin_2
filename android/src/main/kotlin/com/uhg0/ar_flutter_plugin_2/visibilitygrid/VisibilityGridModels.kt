@@ -1,74 +1,10 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
-const val VISIBILITY_GRID_WIRE_VERSION = "visibility_grid_wire_v1"
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CoordinateFrameTransforms
 
 private const val VOXEL_COORDINATE_BIAS = 1L shl 20
 internal const val VOXEL_COORDINATE_MIN = -(1 shl 20)
 internal const val VOXEL_COORDINATE_MAX = (1 shl 20) - 1
-internal const val FEATURE_TRACK_ESTIMATED_BYTES = 192L
-internal const val STABLE_VOXEL_ESTIMATED_BYTES = 128L
-internal const val RESTORED_VOXEL_WORST_CASE_BYTES = 160L
-internal const val PENDING_GEOMETRY_KEY_ESTIMATED_BYTES = 64L
-internal const val IN_FLIGHT_GEOMETRY_KEY_ESTIMATED_BYTES = 32L
-internal const val FEATURE_ASSOCIATION_WORST_CASE_BYTES = 512L
-internal const val DEPTH_EVIDENCE_ESTIMATED_BYTES = 32L
-internal const val VISIBILITY_GRID_MEMORY_BUDGET_BYTES = 16L * 1024L * 1024L
-
-data class VisibilityGridFeatureConfig(
-    val stableVoxelCapacity: Int = 100_000,
-    val featureTrackCapacity: Int = 200_000,
-    val maxFeaturesPerObservation: Int = 2_000,
-    val publishIntervalMs: Int = 500,
-    val minimumConfidence: Double = 0.30,
-    val candidateSamples: Int = 5,
-    val candidateSpanNs: Long = 500_000_000,
-    val candidateMaxStdDevMeters: Double = 0.05,
-    val relocationHysteresisMeters: Double = 0.015,
-    val jumpResetMeters: Double = 0.30,
-    val candidateExpiryNs: Long = 2_000_000_000,
-) {
-    init {
-        require(stableVoxelCapacity in 1..100_000)
-        require(featureTrackCapacity in 1..200_000)
-        require(maxFeaturesPerObservation in 1..2_000)
-        require(publishIntervalMs >= 500)
-        require(minimumConfidence.isFinite() && minimumConfidence in 0.0..1.0)
-        require(candidateSamples > 0)
-        require(candidateSpanNs >= 0)
-        require(candidateMaxStdDevMeters.isFinite() && candidateMaxStdDevMeters >= 0.0)
-        require(relocationHysteresisMeters.isFinite() && relocationHysteresisMeters >= 0.0)
-        require(jumpResetMeters.isFinite() && jumpResetMeters > 0.0)
-        require(candidateExpiryNs > 0)
-    }
-}
-
-data class VisibilityGridDepthConfig(
-    val confidenceMinimum: Int = 128,
-    val safetyBandMeters: Double = 0.15,
-    val minimumDepthMeters: Double = 0.20,
-    val maximumDepthMeters: Double = 8.0,
-    val occupiedEvidenceToShow: Int = 4,
-    val freeEvidenceToCarve: Int = 8,
-    val freeEvidenceMargin: Int = 4,
-    val separatedDirectionBinsRequired: Int = 2,
-    val maxAcceptedPixelsPerObservation: Int = 4_096,
-    val maxRayVisitsPerObservation: Int = 65_536,
-    val terminalFailureThreshold: Int = 3,
-) {
-    init {
-        require(confidenceMinimum in 0..255)
-        require(safetyBandMeters.isFinite() && safetyBandMeters >= 0.0)
-        require(minimumDepthMeters.isFinite() && minimumDepthMeters > 0.0)
-        require(maximumDepthMeters.isFinite() && maximumDepthMeters > minimumDepthMeters)
-        require(occupiedEvidenceToShow in 1..255)
-        require(freeEvidenceToCarve in 1..255)
-        require(freeEvidenceMargin in 0..255)
-        require(separatedDirectionBinsRequired in 1..24)
-        require(maxAcceptedPixelsPerObservation in 1..4_096)
-        require(maxRayVisitsPerObservation in 1..65_536)
-        require(terminalFailureThreshold > 0)
-    }
-}
 
 data class DepthIntrinsics(
     val fx: Double,
@@ -120,15 +56,7 @@ data class DepthPixelSample(
     val confidence: Int,
 )
 
-data class DepthFusionResult(
-    val acceptedPixels: Int,
-    val rejectedPixels: Int,
-    val rayVisits: Int,
-    val duplicateTimestamp: Boolean = false,
-)
-
 data class VisibilityGridGroupConfig(
-    val wireVersion: String = VISIBILITY_GRID_WIRE_VERSION,
     val groupId: String,
     val groupGeneration: Long,
     val sessionGeneration: Long,
@@ -143,7 +71,6 @@ data class VisibilityGridGroupConfig(
     val restoredKeys: LongArray = longArrayOf(),
 ) {
     init {
-        require(wireVersion == VISIBILITY_GRID_WIRE_VERSION)
         require(groupId.isNotBlank())
         require(groupGeneration >= 0)
         require(sessionGeneration >= 0)
@@ -153,7 +80,7 @@ data class VisibilityGridGroupConfig(
         require(matrixConvention == "column_major_gl_v1")
         require(groupFromWorldGl.size == 16 && groupFromWorldGl.all(Double::isFinite))
         require(worldFromGroupGl.size == 16 && worldFromGroupGl.all(Double::isFinite))
-        require(areInverseTransforms(groupFromWorldGl, worldFromGroupGl))
+        require(CoordinateFrameTransforms.areFiniteAffineInverses(groupFromWorldGl, worldFromGroupGl))
         require(restoredGeometryRevision >= 0)
         require(restoredVisibilityRevision >= 0)
         require(restoredKeys.distinct().size == restoredKeys.size)
@@ -161,21 +88,6 @@ data class VisibilityGridGroupConfig(
         require(restoredKeys.isEmpty() || restoredGeometryRevision > 0)
     }
 }
-
-private fun areInverseTransforms(
-    first: DoubleArray,
-    second: DoubleArray,
-): Boolean =
-    (0 until 4).all { row ->
-        (0 until 4).all { column ->
-            val actual =
-                (0 until 4).sumOf { index ->
-                    first[index * 4 + row] * second[column * 4 + index]
-                }
-            val expected = if (row == column) 1.0 else 0.0
-            kotlin.math.abs(actual - expected) <= 1e-6
-        }
-    }
 
 data class FeatureSample(
     val id: Int,
@@ -207,176 +119,6 @@ data class FeatureObservation(
     }
 }
 
-data class VisibilityGridDiagnostics(
-    val candidateTracks: Int,
-    val stableTracks: Int,
-    val stableVoxels: Int,
-    val featureTrackCapacity: Int,
-    val stableVoxelCapacity: Int,
-    val featureObservationCount: Long = 0,
-    val featureMigrations: Long = 0,
-    val featureJumpResets: Long = 0,
-    val candidateExpirations: Long = 0,
-    val supportRemovals: Long = 0,
-    val acceptedSamples: Long,
-    val rejectedSamples: Long,
-    val capacityRejectedCandidates: Long,
-    val featureHealth: String,
-    val featureTransientUnavailableCount: Long,
-    val featureFailureCount: Long,
-    val lastFeatureFusionNs: Long,
-    val maxFeatureFusionNs: Long,
-    val featureFusionP95Ns: Long = 0,
-    val estimatedStateBytes: Long,
-    val depthHealth: String = "unsupported",
-    val depthObservationCount: Long = 0,
-    val depthAcceptedPixels: Long = 0,
-    val depthRejectedPixels: Long = 0,
-    val depthCapacityRejectedPixels: Long = 0,
-    val depthRayVisits: Long = 0,
-    val carvedVoxels: Long = 0,
-    val restoredVoxels: Long = 0,
-    val depthTransientUnavailableCount: Long = 0,
-    val depthFailureCount: Long = 0,
-    val lastDepthFusionNs: Long = 0,
-    val maxDepthFusionNs: Long = 0,
-    val depthFusionP95Ns: Long = 0,
-    val callbackCopyP95Ns: Long = 0,
-    val coalescedFeatureObservations: Long = 0,
-    val coalescedDepthObservations: Long = 0,
-    val coalescedGeometryChanges: Long = 0,
-    val geometryRevision: Long = 0,
-    val pendingGeometryKeys: Int = 0,
-    val unacknowledgedGeometryCallbacks: Int = 0,
-    val publishedDeltaCount: Long = 0,
-    val snapshotRecoveryCount: Long = 0,
-    val geometryAcknowledgementCount: Long = 0,
-    val rendererRows: Int = 0,
-    val rendererFreeRows: Int = 0,
-)
-
-data class VisibilityGridGeometryAck(
-    val wireVersion: String = VISIBILITY_GRID_WIRE_VERSION,
-    val groupId: String,
-    val groupGeneration: Long,
-    val sessionGeneration: Long,
-    val acceptedGeometryRevision: Long,
-)
-
-data class VisibilityGridSnapshotRequest(
-    val wireVersion: String = VISIBILITY_GRID_WIRE_VERSION,
-    val groupId: String,
-    val groupGeneration: Long,
-    val sessionGeneration: Long,
-    val receiverGeometryRevision: Long,
-)
-
-data class VisibilityGridSnapshot(
-    val groupId: String,
-    val groupGeneration: Long,
-    val sessionGeneration: Long,
-    val geometryRevision: Long,
-    val stableKeys: List<Long>,
-    val supportByKey: Map<Long, Int>,
-    val diagnostics: VisibilityGridDiagnostics,
-)
-
-data class VisibilityGridDelta(
-    val groupId: String,
-    val groupGeneration: Long,
-    val sessionGeneration: Long,
-    val baseGeometryRevision: Long,
-    val geometryRevision: Long,
-    val reset: Boolean,
-    val upsertKeys: List<Long>,
-    val removalKeys: List<Long>,
-    val capacity: Int,
-    val diagnostics: VisibilityGridDiagnostics,
-) {
-    fun toWireMap(
-        sourceHealth: Map<String, String> = diagnostics.toHealthWireMap(),
-    ): Map<String, Any> =
-        mapOf(
-            "version" to VISIBILITY_GRID_WIRE_VERSION,
-            "groupId" to groupId,
-            "groupGeneration" to groupGeneration,
-            "sessionGeneration" to sessionGeneration,
-            "baseGeometryRevision" to baseGeometryRevision,
-            "geometryRevision" to geometryRevision,
-            "reset" to reset,
-            "upsertKeys" to upsertKeys.toLongArray(),
-            "removalKeys" to removalKeys.toLongArray(),
-            "capacity" to capacity,
-            "sourceHealth" to
-                sourceHealth,
-            "diagnostics" to diagnostics.toWireMap(),
-        )
-}
-
-fun VisibilityGridDiagnostics.toWireMap(): Map<String, Any> =
-    mapOf(
-        "candidateTracks" to candidateTracks,
-        "stableTracks" to stableTracks,
-        "stableVoxels" to stableVoxels,
-        "featureTrackCapacity" to featureTrackCapacity,
-        "stableVoxelCapacity" to stableVoxelCapacity,
-        "featureObservationCount" to featureObservationCount,
-        "featureMigrations" to featureMigrations,
-        "featureJumpResets" to featureJumpResets,
-        "candidateExpirations" to candidateExpirations,
-        "supportRemovals" to supportRemovals,
-        "acceptedSamples" to acceptedSamples,
-        "rejectedSamples" to rejectedSamples,
-        "capacityRejectedCandidates" to capacityRejectedCandidates,
-        "featureTransientUnavailableCount" to featureTransientUnavailableCount,
-        "featureFailureCount" to featureFailureCount,
-        "lastFeatureFusionNs" to lastFeatureFusionNs,
-        "maxFeatureFusionNs" to maxFeatureFusionNs,
-        "featureFusionP95Ns" to featureFusionP95Ns,
-        "estimatedStateBytes" to estimatedStateBytes,
-        "depthObservationCount" to depthObservationCount,
-        "depthAcceptedPixels" to depthAcceptedPixels,
-        "depthRejectedPixels" to depthRejectedPixels,
-        "depthCapacityRejectedPixels" to depthCapacityRejectedPixels,
-        "depthRayVisits" to depthRayVisits,
-        "carvedVoxels" to carvedVoxels,
-        "restoredVoxels" to restoredVoxels,
-        "depthTransientUnavailableCount" to depthTransientUnavailableCount,
-        "depthFailureCount" to depthFailureCount,
-        "lastDepthFusionNs" to lastDepthFusionNs,
-        "maxDepthFusionNs" to maxDepthFusionNs,
-        "depthFusionP95Ns" to depthFusionP95Ns,
-        "callbackCopyP95Ns" to callbackCopyP95Ns,
-        "coalescedFeatureObservations" to coalescedFeatureObservations,
-        "coalescedDepthObservations" to coalescedDepthObservations,
-        "coalescedGeometryChanges" to coalescedGeometryChanges,
-        "geometryRevision" to geometryRevision,
-        "pendingGeometryKeys" to pendingGeometryKeys,
-        "unacknowledgedGeometryCallbacks" to unacknowledgedGeometryCallbacks,
-        "publishedDeltaCount" to publishedDeltaCount,
-        "snapshotRecoveryCount" to snapshotRecoveryCount,
-        "geometryAcknowledgementCount" to geometryAcknowledgementCount,
-        "rendererRows" to rendererRows,
-        "rendererFreeRows" to rendererFreeRows,
-    )
-
-fun VisibilityGridDiagnostics.toHealthWireMap(
-    rendererHealth: String = "configured",
-): Map<String, String> =
-    mapOf(
-        "feature" to featureHealth,
-        "depth" to depthHealth,
-        "renderer" to rendererHealth,
-        "totalGrid" to
-            when {
-                featureHealth == "failed" &&
-                    (depthHealth == "failed" || depthHealth == "unsupported") -> "failed"
-                featureHealth == "failed" -> "healthy"
-                depthHealth == "failed" -> "featureOnly"
-                else -> "healthy"
-            },
-    )
-
 fun identityVisibilityGridTransform(): DoubleArray =
     doubleArrayOf(
         1.0, 0.0, 0.0, 0.0,
@@ -405,4 +147,11 @@ fun unpackVisibilityGridKey(key: Long): IntArray {
         ((key ushr 21) and mask).toInt() - VOXEL_COORDINATE_BIAS.toInt(),
         (key and mask).toInt() - VOXEL_COORDINATE_BIAS.toInt(),
     )
+}
+
+/** One signed coordinate without allocating the legacy three-coordinate adapter. */
+internal fun visibilityGridCoordinate(key: Long, component: Int): Int {
+    require(component in 0..2)
+    return ((key ushr ((2 - component) * 21)) and ((1L shl 21) - 1)).toInt() -
+        VOXEL_COORDINATE_BIAS.toInt()
 }
