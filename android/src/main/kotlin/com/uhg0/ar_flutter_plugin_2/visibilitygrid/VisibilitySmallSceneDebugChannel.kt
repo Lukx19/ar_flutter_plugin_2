@@ -1,5 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
+import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageRendererSelectionConfig
+import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageRendererSelectionStrategy
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -540,6 +542,9 @@ internal class VisibilitySmallSceneDebugChannel(
             guidanceStatus = provided.guidanceStatus,
             rootIsolateSurfaceBytes = provided.rootIsolateSurfaceBytes,
             resourceBalance = provided.resourceBalance ?: health.resourceBalance,
+            rendererSelectionReuse = CoverageRendererSelectionConfig.strategy ==
+                CoverageRendererSelectionStrategy.QUALIFIED_REUSE,
+            rendererSelectionStrategy = CoverageRendererSelectionConfig.strategy.name,
             callbackCopyP95Micros = health.callbackCopyP95Ns / 1_000L,
             rootIsolateImageBytes = provided.rootIsolateImageBytes,
             rendererOwnedBytes = provided.rendererOwnedBytes,
@@ -660,6 +665,8 @@ internal data class SmallSceneScenarioReceipt(
     val guidanceStatus: String,
     val rootIsolateSurfaceBytes: Long,
     val resourceBalance: Long,
+    val rendererSelectionReuse: Boolean,
+    val rendererSelectionStrategy: String,
     val callbackCopyP95Micros: Long = 0L,
     val rootIsolateImageBytes: Long = 0L,
     val rendererOwnedBytes: Long = 0L,
@@ -684,6 +691,10 @@ internal data class SmallSceneScenarioReceipt(
         require(guidanceStatus.isNotEmpty() && guidanceStatus.length <= 64)
         require(rootIsolateSurfaceBytes >= 0L)
         require(resourceBalance >= 0L)
+        require(rendererSelectionStrategy == CoverageRendererSelectionStrategy.FULL_REBUILD.name ||
+            rendererSelectionStrategy == CoverageRendererSelectionStrategy.QUALIFIED_REUSE.name)
+        require(rendererSelectionReuse ==
+            (rendererSelectionStrategy == CoverageRendererSelectionStrategy.QUALIFIED_REUSE.name))
         require(callbackCopyP95Micros >= 0L)
         require(rootIsolateImageBytes >= 0L)
         require(rendererOwnedBytes >= 0L)
@@ -710,6 +721,8 @@ internal data class SmallSceneScenarioReceipt(
         "guidanceStatus" to guidanceStatus,
         "rootIsolateSurfaceBytes" to rootIsolateSurfaceBytes,
         "resourceBalance" to resourceBalance,
+        "rendererSelectionReuse" to rendererSelectionReuse,
+        "rendererSelectionStrategy" to rendererSelectionStrategy,
         "callbackCopyP95Micros" to callbackCopyP95Micros,
         "rootIsolateImageBytes" to rootIsolateImageBytes,
         "rendererOwnedBytes" to rendererOwnedBytes,

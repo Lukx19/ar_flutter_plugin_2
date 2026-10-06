@@ -175,6 +175,50 @@ class FrameCadenceTrackerTest {
     }
 
     @Test
+    fun `measurement window keeps exact p99 for four minutes at sixty hertz with late spikes`() {
+        val tracker = FrameCadenceTracker()
+        var timestamp = 0L
+        tracker.beginMeasurementWindow()
+        tracker.record(timestamp)
+
+        // 14,255 nominal intervals followed by 145 late intervals puts p99
+        // on the first late interval. The final interval is a larger spike.
+        repeat(14_255) {
+            timestamp += 16_666_667L
+            tracker.record(timestamp)
+        }
+        repeat(144) {
+            timestamp += 33_333_333L
+            tracker.record(timestamp)
+        }
+        timestamp += 250_000_000L
+        tracker.record(timestamp)
+
+        val snapshot = tracker.snapshot()
+        assertEquals(14_400, snapshot["measurementWindowSampleCount"])
+        assertEquals(33.333333, snapshot["measurementWindowP99FrameIntervalMs"] as Double, 0.001)
+        assertEquals(true, snapshot["measurementWindowP99Complete"])
+        assertEquals(250.0, snapshot["measurementWindowMaxFrameIntervalMs"] as Double, 0.001)
+    }
+
+    @Test
+    fun `measurement window leaves p99 unavailable beyond supported bounded window`() {
+        val tracker = FrameCadenceTracker()
+        var timestamp = 0L
+        tracker.beginMeasurementWindow()
+        tracker.record(timestamp)
+        repeat(100_801) {
+            timestamp += 16_666_667L
+            tracker.record(timestamp)
+        }
+
+        val snapshot = tracker.snapshot()
+        assertEquals(100_801, snapshot["measurementWindowSampleCount"])
+        assertEquals(false, snapshot["measurementWindowP99Complete"])
+        assertEquals(0.0, snapshot["measurementWindowP99FrameIntervalMs"] as Double, 0.001)
+    }
+
+    @Test
     fun `measurement window reports stale local arrival after the last advancing frame`() {
         var arrivalNow = 32_000_000L
         val tracker = FrameCadenceTracker(clockNs = { arrivalNow })

@@ -292,6 +292,51 @@ void main() {
     expect(valid['rootIsolateImageBytes'], 0);
   });
 
+  test('receipt codec preserves effective renderer selection configuration',
+      () {
+    final reuse = ARVisibilitySyntheticReceipt.fromMap(<String, Object?>{
+      ..._receipt(),
+      'rendererSelectionReuse': true,
+      'rendererSelectionStrategy': 'QUALIFIED_REUSE',
+    });
+    expect(reuse.rendererSelectionReuse, isTrue);
+    expect(reuse.rendererSelectionStrategy, 'QUALIFIED_REUSE');
+
+    final rebuild = ARVisibilitySyntheticReceipt.fromMap(<String, Object?>{
+      ..._receipt(),
+      'rendererSelectionReuse': false,
+      'rendererSelectionStrategy': 'FULL_REBUILD',
+    });
+    expect(rebuild.rendererSelectionReuse, isFalse);
+    expect(rebuild.rendererSelectionStrategy, 'FULL_REBUILD');
+
+    final historical = ARVisibilitySyntheticReceipt.fromMap(_receipt());
+    expect(historical.rendererSelectionReuse, isNull);
+    expect(historical.rendererSelectionStrategy, isNull);
+
+    for (final invalid in <Map<String, Object?>>[
+      {..._receipt(), 'rendererSelectionReuse': 'true'},
+      {..._receipt(), 'rendererSelectionStrategy': 'unknown'},
+      {
+        ..._receipt(),
+        'rendererSelectionReuse': true,
+        'rendererSelectionStrategy': 'FULL_REBUILD',
+      },
+      {
+        ..._receipt(),
+        'rendererSelectionReuse': false,
+        'rendererSelectionStrategy': 'QUALIFIED_REUSE',
+      },
+      {..._receipt(), 'rendererSelectionReuse': true},
+      {..._receipt(), 'rendererSelectionStrategy': 'FULL_REBUILD'},
+    ]) {
+      expect(
+        () => ARVisibilitySyntheticReceipt.fromMap(invalid),
+        throwsA(isA<FormatException>()),
+      );
+    }
+  });
+
   test('scenario id is bounded printable ASCII', () async {
     const channel = MethodChannel('visibility_scenario_v2_18');
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger

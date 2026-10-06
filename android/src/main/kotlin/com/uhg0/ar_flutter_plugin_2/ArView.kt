@@ -230,6 +230,10 @@ internal class ArView(
         ownership = visibilityGridV2Binding::currentObservationOwnership,
         gate = visibilityObservationDebugGate,
         pressureOwners = ::visibilityPressureOwnerScalars,
+        applySyntheticViewPose = { transform, quaternion, binding, group ->
+            check(!disposed) { "synthetic view owner is closed" }
+            captureSession.setDebugSyntheticViewPose(transform, quaternion, binding, group)
+        },
         physicalSamplePools = visibilityObservationSource::packedLeaseReceipts,
     )
 

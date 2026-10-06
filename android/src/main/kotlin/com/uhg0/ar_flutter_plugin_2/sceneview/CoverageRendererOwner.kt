@@ -442,7 +442,10 @@ internal class NativeCoverageRendererOwner(
     private var presentationPlan: CoveragePresentationPlan? = null
     private var latestPresentationDescriptor: PresentationDescriptor? = null
     private val presentationSelector =
-        CoveragePresentationSelector(CoverageRendererLimits.CENTROID_CAPACITY)
+        CoveragePresentationSelector(
+            CoverageRendererLimits.CENTROID_CAPACITY,
+            CoverageRendererSelectionConfig.strategy,
+        )
     private var selectorEpoch: SelectorEpoch? = null
     private var resourceEpoch = 0L
     private var resourceToken: CoverageResourceToken? = null

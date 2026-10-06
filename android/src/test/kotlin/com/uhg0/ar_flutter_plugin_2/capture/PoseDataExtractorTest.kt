@@ -105,6 +105,42 @@ class PoseDataExtractorTest {
     }
 
     @Test
+    fun `synthetic head view updates photo position rotation and preserves generation tags`() {
+        val extractor = PoseDataExtractor()
+        extractor.beginSyntheticDebugFixture(7L, 11L)
+        val transform = doubleArrayOf(0.0,0.0,-1.0,0.0, 0.0,1.0,0.0,0.0, 1.0,0.0,0.0,0.0, .2,.1,.05,1.0)
+        val quaternion = floatArrayOf(0f, .70710677f, 0f, .70710677f)
+        extractor.setSyntheticDebugView(transform, quaternion, 7L, 11L)
+        transform[12] = 99.0
+        quaternion[1] = 0f
+        val latest = checkNotNull(extractor.latest())
+        assertEquals(.2f, latest.position[0], 1e-6f)
+        assertEquals(.2f, latest.transform[12], 1e-6f)
+        assertEquals(.70710677f, latest.rotationQuaternion[1], 1e-6f)
+        assertEquals(PoseDataExtractor.SYNTHETIC_POSE_SOURCE, latest.poseSource)
+        assertEquals(7L, latest.fixtureBindingGeneration)
+        assertEquals(11L, latest.fixtureGroupGeneration)
+    }
+
+    @Test
+    fun `stale synthetic head view cannot change a replacement generation`() {
+        val extractor = PoseDataExtractor()
+        extractor.beginSyntheticDebugFixture(7L, 11L)
+        var rejected = false
+        try {
+            extractor.setSyntheticDebugView(DoubleArray(16), floatArrayOf(0f,0f,0f,1f), 8L, 11L)
+        } catch (_: IllegalStateException) { rejected = true }
+        assertTrue(rejected)
+        assertEquals(0f, checkNotNull(extractor.latest()).position[0], 0f)
+        extractor.clearDebugFixture()
+        rejected = false
+        try {
+            extractor.setSyntheticDebugView(DoubleArray(16), floatArrayOf(0f,0f,0f,1f), 7L, 11L)
+        } catch (_: IllegalStateException) { rejected = true }
+        assertTrue(rejected)
+    }
+
+    @Test
     fun `synthetic fixture rejects an ownership generation change`() {
         val extractor = PoseDataExtractor()
         extractor.beginSyntheticDebugFixture(

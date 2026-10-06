@@ -32,7 +32,10 @@ private const val DEFERRED_DEPTH_OBSERVATION_OWNER_BYTES = 64L
 // Portable object header + two Longs + eighteen Ints; accepted receipts alias
 // the kernel's prepared/committed output and are already covered by its reserve.
 internal const val RETAINED_DEPTH_REFUSAL_RECEIPT_BYTES = 104L
-internal const val VISIBILITY_GRID_INTEGRATION_SCALAR_OWNER_BYTES = 364L
+// Replace three mutable Long counters with one reference to the health owner.
+internal const val VISIBILITY_GRID_INTEGRATION_SCALAR_OWNER_BYTES = 344L
+// AtomicReference: 16 bytes. Immutable health: header + eleven Longs + Int + reference.
+internal const val VISIBILITY_GRID_ADMISSION_HEALTH_OWNER_BYTES = 128L
 private const val UNAVAILABLE_ALLOCATION_BYTES = -1L
 
 private data class PendingDepthCommit(
@@ -202,7 +205,14 @@ internal class VisibilityGridIntegration(
     @Volatile private var paused = false
     private val admissionEpoch = AtomicLong(0)
     private var active = 0
+    private val admissionHealth = AtomicReference(VisibilityMappingAdmissionHealth.empty())
     private var cut: VisibilityObservationOwnership? = null
+        set(value) {
+            synchronized(lock) {
+                field = value
+                publishAdmissionHealth(ownership = value, replaceOwnership = true)
+            }
+        }
     private var baseline: committedEmptyBaseline? = null
     private var kernel: FeatureFusionKernel? = null
     private var depthKernel: DepthEvidenceKernel? = null
@@ -283,10 +293,8 @@ internal class VisibilityGridIntegration(
     private var canonicalOwnedBytesHighWater = 0L
     private val retainedDelta = ExactCurrentDeltaSource()
     @Volatile private var committed = 0L
-    @Volatile private var committedFeatures = 0L
-    @Volatile private var admittedDepths = 0L
     @Volatile private var rejected = 0L
-    @Volatile private var fenced = 0L
+    private val fenced: Long get() = admissionHealth.get().rolloverDiscardedObservations
     @Volatile private var receipt = VisibilityGridIntegrationReceipt.empty()
 
     init {
@@ -546,22 +554,35 @@ internal class VisibilityGridIntegration(
         if (!alreadyRebound) renderer.clear()
     }
 
-    override fun snapshot(): VisibilityMappingAdmissionHealth = synchronized(lock) {
-        VisibilityMappingAdmissionHealth(
-            admittedFeatures = committedFeatures,
-            admittedDepths = admittedDepths,
-            replacedFeatures = 0,
-            replacedDepths = 0,
-            residentBytes = 0,
-            residentObservations = 0,
-            peakResidentBytes = 0,
-            rolloverCount = if (cut == null) 0 else 1,
-            rolloverDiscardedObservations = fenced,
-            rolloverBindingGeneration = cut?.bindingGeneration ?: 0,
-            rolloverGroupGeneration = cut?.groupGeneration ?: 0,
-            rolloverLifecycleSequence = cut?.lifecycleSequence ?: 0,
-            lastReceipt = null,
-        )
+    // Frame ingress must never wait for canonical ACK/storage/renderer work.
+    // Each returned object is immutable and remains valid across later writes.
+    override fun snapshot(): VisibilityMappingAdmissionHealth = admissionHealth.get()
+
+    private fun publishAdmissionHealth(
+        featureDelta: Long = 0L,
+        depthDelta: Long = 0L,
+        fencedDelta: Long = 0L,
+        ownership: VisibilityObservationOwnership? = null,
+        replaceOwnership: Boolean = false,
+    ) {
+        while (true) {
+            val previous = admissionHealth.get()
+            val next = previous.copy(
+                admittedFeatures = previous.admittedFeatures + featureDelta,
+                admittedDepths = previous.admittedDepths + depthDelta,
+                rolloverDiscardedObservations = previous.rolloverDiscardedObservations + fencedDelta,
+                rolloverCount = if (replaceOwnership) {
+                    if (ownership == null) 0L else 1L
+                } else previous.rolloverCount,
+                rolloverBindingGeneration = if (replaceOwnership) ownership?.bindingGeneration ?: 0L
+                    else previous.rolloverBindingGeneration,
+                rolloverGroupGeneration = if (replaceOwnership) ownership?.groupGeneration ?: 0L
+                    else previous.rolloverGroupGeneration,
+                rolloverLifecycleSequence = if (replaceOwnership) ownership?.lifecycleSequence ?: 0L
+                    else previous.rolloverLifecycleSequence,
+            )
+            if (admissionHealth.compareAndSet(previous, next)) return
+        }
     }
 
     override fun depthAdmissionTiming(): VisibilityDepthAdmissionTiming = synchronized(lock) {
@@ -805,7 +826,7 @@ internal class VisibilityGridIntegration(
             // 176 bytes even when counter collection is disabled.
             // Three latest-attempt input counts add twelve fixed scalar bytes.
             integrationObjectBytes = VISIBILITY_GRID_INTEGRATION_SCALAR_OWNER_BYTES,
-            integrationReceiptBytes = 104 +
+            integrationReceiptBytes = 104 + VISIBILITY_GRID_ADMISSION_HEALTH_OWNER_BYTES +
                 (if (pendingDepthTiming != null) 40L else 0L) +
                 (if (pendingFeatureTiming != null) 40L else 0L) +
                 (if (pendingDepthCommit != null) 32L else 0L),
@@ -879,7 +900,7 @@ internal class VisibilityGridIntegration(
     private fun mutate(expected: VisibilityObservationOwnership, work: () -> Unit) {
         val epoch = admissionEpoch.get()
         if (paused || ownership() != expected) {
-            synchronized(lock) { fenced++ }
+            synchronized(lock) { publishAdmissionHealth(fencedDelta = 1L) }
             return
         }
         val future = executor.submit {
@@ -888,7 +909,7 @@ internal class VisibilityGridIntegration(
                 beforeAdmission()
                 synchronized(publicationGate) {
                     if (closed || paused || admissionEpoch.get() != epoch || ownership() != expected) {
-                        synchronized(lock) { fenced++ }
+                        synchronized(lock) { publishAdmissionHealth(fencedDelta = 1L) }
                         return@submit
                     }
                     work()
@@ -926,8 +947,8 @@ internal class VisibilityGridIntegration(
             }
             return baseline
         }
-        val seeded = binding.committedEmptyBaseline() ?: run { fenced++; return null }
-        if (ownership() != expected) { fenced++; return null }
+        val seeded = binding.committedEmptyBaseline() ?: run { publishAdmissionHealth(fencedDelta = 1L); return null }
+        if (ownership() != expected) { publishAdmissionHealth(fencedDelta = 1L); return null }
         val group = SurfaceGroup(expected.captureGroupId)
         val runtimeResources = resourcesForGroup(group)
         val openResult = if (!runtimeResources.usesSessionMemory && CanonicalActivationSelector.hasDurableSelector(group, runtimeResources.directory)) {
@@ -1111,7 +1132,7 @@ internal class VisibilityGridIntegration(
             }
             requireNotNull(kernel).applyPreparedCanonicalRemap()
             check(depth.applyPrepared() is DepthEvidenceApplyResult.Applied)
-            admittedDepths++
+            publishAdmissionHealth(depthDelta = 1L)
             recordDepthTiming(
                 sequence = batchSequenceValue,
                 lookupMicros = lookupMicros,
@@ -1167,7 +1188,7 @@ internal class VisibilityGridIntegration(
             prepared.mutation.discard()
             requireNotNull(kernel).discardPreparedCanonicalRemap()
             depth.discardPrepared()
-            fenced++
+            publishAdmissionHealth(fencedDelta = 1L)
             receipt = receipt.copy(status = "publicationDeferred", fenced = fenced)
             return
         }
@@ -1219,7 +1240,7 @@ internal class VisibilityGridIntegration(
         refreshFeatureFingerprintResolver()
         requireNotNull(kernel).applyPreparedCanonicalRemap()
         check(depth.applyPrepared(prepared.mutation) is DepthEvidenceApplyResult.Applied)
-        admittedDepths++
+        publishAdmissionHealth(depthDelta = 1L)
         publishV6Current(
             observation.ownership,
             state,
@@ -1244,7 +1265,7 @@ internal class VisibilityGridIntegration(
         val pendingDepth = pendingDepthCommit ?: return false
         if (pendingDepth.ownership != expected || isFenced(pendingDepth.ownership)) {
             discardPendingDepthCommit()
-            fenced++
+            publishAdmissionHealth(fencedDelta = 1L)
             receipt = receipt.copy(status = "depthCommitFenced", fenced = fenced)
             return true
         }
@@ -1255,7 +1276,7 @@ internal class VisibilityGridIntegration(
                 refreshFeatureFingerprintResolver()
                 requireNotNull(kernel).applyPreparedCanonicalRemap()
                 check(requireNotNull(depthKernel).applyPrepared(pendingDepth.mutation) is DepthEvidenceApplyResult.Applied)
-                admittedDepths++
+                publishAdmissionHealth(depthDelta = 1L)
                 publishV6Current(
                     pendingDepth.ownership,
                     result.state,
@@ -1389,7 +1410,7 @@ internal class VisibilityGridIntegration(
             allocationNow(),
         ) ?: UNAVAILABLE_ALLOCATION_BYTES
         val mutationMicros = elapsedMicros(mutationStartedNs, System.nanoTime())
-        committedFeatures++
+        publishAdmissionHealth(featureDelta = 1L)
         refreshFeatureFingerprintResolver()
         requireNotNull(kernel).applyPrepared()
         publishV6Current(
@@ -1468,11 +1489,11 @@ internal class VisibilityGridIntegration(
             allocationNow(),
         ) ?: UNAVAILABLE_ALLOCATION_BYTES
         val mutationMicros = elapsedMicros(mutationStartedNs, System.nanoTime())
-        committedFeatures++
+        publishAdmissionHealth(featureDelta = 1L)
         refreshFeatureFingerprintResolver()
         requireNotNull(kernel).applyPrepared()
         if (isFenced(expected)) {
-            fenced++
+            publishAdmissionHealth(fencedDelta = 1L)
             receipt = receipt.copy(status = "publicationDeferred", fenced = fenced)
             return
         }
@@ -1601,7 +1622,7 @@ internal class VisibilityGridIntegration(
         }
         nextTransactionId++
         if (isFenced(expected)) {
-            fenced++
+            publishAdmissionHealth(fencedDelta = 1L)
             receipt = receipt.copy(status = "publicationDeferred", fenced = fenced)
             depthTiming?.offerLedger?.finish(depthTiming.offerId, DepthOfferTimingLedger.REFUSED)
             return
@@ -2329,6 +2350,7 @@ internal class NativeRendererProjection(
     )
     private val presentationSelector = CoveragePresentationSelector(
         CoveragePresentationMode.SEMANTIC_CENTROIDS.presentationCapacity,
+        com.uhg0.ar_flutter_plugin_2.sceneview.CoverageRendererSelectionConfig.strategy,
     )
     private var closed = false
     private var rebuildCut: CommittedGeometryCut? = null
@@ -2339,7 +2361,8 @@ internal class NativeRendererProjection(
     private var activePresentation: PresentationDescriptor? = null
     override val maximumRows: Int get() = state.capacity
     override fun portableOwnerBytes(): Long =
-        56L + 96L + 64L + state.retainedGroupGeometryBytes // projection, state, native config, group geometry
+        56L + 96L + 64L + state.retainedGroupGeometryBytes +
+            state.retainedPresentationGeometryBytes // projection, state, config, group and frozen geometry
 
     @Synchronized
     override fun pressureRevisions(): RendererProjectionPressureSnapshot =

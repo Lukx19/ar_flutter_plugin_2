@@ -9,6 +9,22 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageCommittedRows
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridRendererState
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.QUALIFIED_RENDERER_STYLE_CUT_MAX_ROWS
+import com.uhg0.ar_flutter_plugin_2.BuildConfig
+
+/** Matched-build switch for the qualified style-revision selection experiment. */
+internal enum class CoverageRendererSelectionStrategy {
+    FULL_REBUILD,
+    QUALIFIED_REUSE,
+}
+
+internal object CoverageRendererSelectionConfig {
+    val strategy: CoverageRendererSelectionStrategy =
+        if (BuildConfig.COVERAGE_SELECTION_REUSE) {
+            CoverageRendererSelectionStrategy.QUALIFIED_REUSE
+        } else {
+            CoverageRendererSelectionStrategy.FULL_REBUILD
+        }
+}
 
 /** Exact logical ownership receipt shared by admission and renderer telemetry. */
 internal data class CoverageRendererOwnershipReceipt(
@@ -145,6 +161,7 @@ internal object CoverageRendererLimits {
                 ),
             descriptorBackingBytes = PresentationDescriptor.estimatedBackingBytes(
                 presentationCapacity,
+                includesGeometry = true,
             ),
             pageReaderCapturedMappingBytes = 0,
             stagingBytes = PAGE_STAGING_BYTES,
@@ -438,6 +455,8 @@ internal class CoverageRendererAllocationLedger(
  */
 internal class CoveragePresentationSelector(
     private val maximumCapacity: Int,
+    private val strategy: CoverageRendererSelectionStrategy =
+        CoverageRendererSelectionStrategy.FULL_REBUILD,
 ) {
     private var activeCapacity = 0
     private val storage = CoveragePresentationStorage(maximumCapacity)
@@ -614,13 +633,20 @@ internal class CoveragePresentationSelector(
             rows.qualifier.styleRevision != streamStyleRevision
         val geometryRewritten = streamInitialized &&
             rows.qualifier.geometryRevision != streamGeometryRevision && sourceUpdate == null
-        val mustReset = forceReset || updateReset || !streamInitialized || styleChanged || geometryRewritten ||
+        val qualifiedStyleReuse = styleChanged &&
+            strategy == CoverageRendererSelectionStrategy.QUALIFIED_REUSE &&
+            !forceReset &&
+            !updateReset &&
+            sourceUpdate != null &&
+            streamSelectionStillExact(rows)
+        val mustReset = forceReset || updateReset || !streamInitialized ||
+            (styleChanged && !qualifiedStyleReuse) || geometryRewritten ||
             rows.count < streamSourceCount
         val reinitialized = if (mustReset) {
             streamInitialize(rows)
             true
         } else {
-            streamAcceptChanges(rows, sourceUpdate)
+            streamAcceptChanges(rows, sourceUpdate, qualifiedStyleReuse)
         }
         streamSourceCount = rows.count
         streamStyleRevision = rows.qualifier.styleRevision
@@ -639,6 +665,51 @@ internal class CoveragePresentationSelector(
             spans = spans,
             reset = mustReset,
         )
+    }
+
+    /**
+     * Proves that a style/geometry revision can keep the current ordered cut.
+     *
+     * The proof uses current authoritative rows, so it does not depend on a
+     * digest or a retained source-sized style cache. Every selected source
+     * must still exist with the same identity, selected rows must already be
+     * in the deterministic full-selection order, and no unselected row may
+     * outrank the current worst selected row. A failed proof falls back to
+     * [streamInitialize] before publication.
+     */
+    private fun streamSelectionStillExact(rows: CoverageCommittedRows): Boolean {
+        if (rows.count != streamSourceCount || selectedCount == 0) {
+            return selectedCount == 0 && rows.count == streamSourceCount
+        }
+        for (destination in 0 until selectedCount) {
+            val source = selectedSourceSlots[destination]
+            if (source !in 0 until rows.count ||
+                rows.surfaceIdAt(source) != selectedSurfaceIds[destination] ||
+                rows.keyAt(source) != selectedKeys[destination]
+            ) return false
+            if (destination > 0 &&
+                compareStreamRows(
+                    rows,
+                    selectedSourceSlots[destination - 1],
+                    source,
+                ) > 0
+            ) return false
+        }
+        val worstDestination = (0 until selectedCount).maxWithOrNull { first, second ->
+            compareStreamRows(rows, selectedSourceSlots[first], selectedSourceSlots[second])
+        } ?: return false
+        val worstSource = selectedSourceSlots[worstDestination]
+        for (source in 0 until rows.count) {
+            // The compact identity table makes this O(log selected) without
+            // allocating a source-sized marker array. Selected rows are
+            // already covered by the ordered-cut check above.
+            if (destinationForSurfaceId(rows.surfaceIdAt(source)) < 0 &&
+                compareStreamRows(rows, source, worstSource) < 0
+            ) {
+                return false
+            }
+        }
+        return true
     }
 
     /** Drops retained source-to-presentation state before a new resource cut. */
@@ -738,6 +809,7 @@ internal class CoveragePresentationSelector(
     private fun streamAcceptChanges(
         rows: CoverageCommittedRows,
         sourceUpdate: CoveragePointRenderUpdate?,
+        qualifiedStyleReuse: Boolean = false,
     ): Boolean {
         storage.clearDirty()
         if (rows.count > streamSourceCount) {
@@ -764,7 +836,14 @@ internal class CoveragePresentationSelector(
                     selectedKeys[destination] = key
                     selectedSurfaceIds[destination] = surfaceId
                 } else {
-                    considerStreamCandidate(rows, source)
+                    // A qualified reuse proof already compared every current
+                    // unselected row with the current worst selected row.
+                    // Reconsidering these rows here repeats that O(selected)
+                    // scan for every dirty source slot, turning a dense style
+                    // span into O(source * selected) work. The proof is the
+                    // exact admission guard; only retained rows need dirty
+                    // destination handling in this path.
+                    if (!qualifiedStyleReuse) considerStreamCandidate(rows, source)
                 }
             }
         }

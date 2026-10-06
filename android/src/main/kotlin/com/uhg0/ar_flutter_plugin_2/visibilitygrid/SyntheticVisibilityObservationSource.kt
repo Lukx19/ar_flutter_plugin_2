@@ -21,6 +21,8 @@ internal class SyntheticVisibilityObservationSource(
     private val runtime: AndroidVisibilityGridRuntime,
     private val ownership: () -> VisibilityObservationOwnership?,
 ) : AutoCloseable {
+    private var cachedSphere: SyntheticSphereDepthFixture? = null
+    private var cachedSphereOwnership: VisibilityObservationOwnership? = null
     private var sequence = 0L
     private var worldFromCameraGl = identityVisibilityGridTransform()
     private var groupFromCameraGl = identityVisibilityGridTransform()
@@ -57,11 +59,87 @@ internal class SyntheticVisibilityObservationSource(
     override fun close() {
         featureLeasePool.close()
         depthLeasePool.close()
+        cachedSphere = null
+        cachedSphereOwnership = null
         cachedDepthGrids = null
         cachedCampaignDepthGrids = null
         campaignFeatureCoordinates = null
         campaignFeatureFirstColumns = null
         campaignCameraPoses = null
+    }
+
+    /** Builds reusable inputs without offering geometry or pre-populating the surrounding shell. */
+    fun prepareSphereDepthViews() {
+        val cut = requireNotNull(ownership())
+        if (cachedSphere != null && sameSphereOwner(cut)) return
+        cachedSphere = SyntheticSphereDepthFixture(cut.groupFrame.worldFromGroupGl)
+        cachedSphereOwnership = cut
+    }
+
+    private fun sameSphereOwner(cut: VisibilityObservationOwnership): Boolean {
+        val cached = cachedSphereOwnership ?: return false
+        return cached.sessionId == cut.sessionId && cached.sessionGeneration == cut.sessionGeneration &&
+            cached.captureGroupId == cut.captureGroupId && cached.groupGeneration == cut.groupGeneration &&
+            cached.bindingGeneration == cut.bindingGeneration && cached.groupFrame == cut.groupFrame
+    }
+
+    /** Borrows the prebuilt head view only while its coordinate authority remains current. */
+    fun preparedSphereView(index: Int): SyntheticSphereDepthFixture.View {
+        check(sameSphereOwner(requireNotNull(ownership()))) { "prepared sphere owner changed" }
+        return requireNotNull(cachedSphere).views[index]
+    }
+
+    fun emitSphereFeatureFrame(timestampNs: Long, viewIndex: Int): Boolean {
+        val cut = ownership() ?: return false
+        val view = preparedSphereView(viewIndex)
+        val lease = featureLeasePool.tryAcquire(cut) ?: return false
+        lease.clear()
+        try {
+            repeat(SyntheticSphereDepthFixture.FEATURE_SAMPLES) { index ->
+                val id = 400_000 + viewIndex * SyntheticSphereDepthFixture.FEATURE_SAMPLES + index
+                check(lease.acceptId(id))
+                check(lease.append(id, view.featureCoordinates[index*3], view.featureCoordinates[index*3+1],
+                    view.featureCoordinates[index*3+2], 1.0))
+            }
+            val accepted = runtime.offerFeature(VisibilityFeatureObservation.fromPacked(
+                ownership = cut,
+                frame = syntheticFrame(VisibilityObservationSource.SYNTHETIC_FEATURE, timestampNs,
+                    view.groupPose, SyntheticSphereDepthFixture.FOCAL_LENGTH),
+                packedSamples = lease.samples,
+                sourceRejectedSamples = 0,
+            ))
+            if (accepted) lastCopiedFeatureTimestampNs = timestampNs
+            return accepted
+        } catch (error: RuntimeException) {
+            lease.close()
+            throw error
+        }
+    }
+
+    fun emitSphereDepthGrid(timestampNs: Long, viewIndex: Int): Boolean {
+        val cut = ownership() ?: return false
+        val copiedTimestampNs = nextDepthTimestamp(timestampNs)
+        val view = preparedSphereView(viewIndex)
+        val lease = depthLeasePool.tryAcquire(cut) ?: return false
+        lease.clear()
+        try {
+            for (index in view.depths.indices) {
+                check(lease.append(SyntheticSphereDepthFixture.pixelX(index),
+                    SyntheticSphereDepthFixture.pixelY(index), view.depths[index], 255))
+            }
+            val accepted = runtime.offerDepth(VisibilityDepthObservation.fromPacked(
+                ownership = cut,
+                frame = syntheticFrame(VisibilityObservationSource.SYNTHETIC_DEPTH, copiedTimestampNs,
+                    view.worldPose, SyntheticSphereDepthFixture.FOCAL_LENGTH),
+                packedSamples = lease.samples,
+                sourceRejectedSamples = 0,
+            ))
+            if (accepted) lastCopiedDepthTimestampNs = copiedTimestampNs
+            return accepted
+        } catch (error: RuntimeException) {
+            lease.close()
+            throw error
+        }
     }
 
     /** Prebuilds five legacy views or 25 finite campaign views of the fixed plane and patch. */

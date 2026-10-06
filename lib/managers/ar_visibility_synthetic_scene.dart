@@ -71,6 +71,8 @@ final class ARVisibilitySyntheticReceipt {
     required this.callbackCopyP95Micros,
     required this.rootIsolateImageBytes,
     required this.rendererOwnedBytes,
+    required this.rendererSelectionReuse,
+    required this.rendererSelectionStrategy,
   });
 
   final String scenarioId;
@@ -96,6 +98,8 @@ final class ARVisibilitySyntheticReceipt {
   final int callbackCopyP95Micros;
   final int rootIsolateImageBytes;
   final int rendererOwnedBytes;
+  final bool? rendererSelectionReuse;
+  final String? rendererSelectionStrategy;
 
   Map<String, Object?> toMap() => <String, Object?>{
         'scenarioId': scenarioId,
@@ -121,6 +125,8 @@ final class ARVisibilitySyntheticReceipt {
         'callbackCopyP95Micros': callbackCopyP95Micros,
         'rootIsolateImageBytes': rootIsolateImageBytes,
         'rendererOwnedBytes': rendererOwnedBytes,
+        'rendererSelectionReuse': rendererSelectionReuse,
+        'rendererSelectionStrategy': rendererSelectionStrategy,
       };
 
   static ARVisibilitySyntheticReceipt fromMap(Object? raw) {
@@ -150,8 +156,32 @@ final class ARVisibilitySyntheticReceipt {
       'rootIsolateImageBytes',
       'rendererOwnedBytes',
     };
-    if (!map.keys.toSet().containsAll(keys) || map.length != keys.length) {
+    const optionalKeys = <String>{
+      'rendererSelectionReuse',
+      'rendererSelectionStrategy',
+    };
+    final presentKeys = map.keys.toSet();
+    if (!presentKeys.containsAll(keys) ||
+        presentKeys.difference({...keys, ...optionalKeys}).isNotEmpty) {
       throw FormatException('Synthetic scene receipt fields are not fixed.');
+    }
+    final rendererSelectionReuse = _nullableBool(map, 'rendererSelectionReuse');
+    final rendererSelectionStrategy =
+        _nullableRendererSelectionStrategy(map, 'rendererSelectionStrategy');
+    if ((rendererSelectionReuse == null) !=
+        (rendererSelectionStrategy == null)) {
+      throw FormatException(
+        'Synthetic scene renderer selection configuration is incomplete.',
+      );
+    }
+    if (rendererSelectionReuse != null &&
+        ((rendererSelectionReuse &&
+                rendererSelectionStrategy != 'QUALIFIED_REUSE') ||
+            (!rendererSelectionReuse &&
+                rendererSelectionStrategy != 'FULL_REBUILD'))) {
+      throw FormatException(
+        'Synthetic scene renderer selection configuration disagrees.',
+      );
     }
     return ARVisibilitySyntheticReceipt(
       scenarioId: _string(map, 'scenarioId'),
@@ -183,6 +213,8 @@ final class ARVisibilitySyntheticReceipt {
       callbackCopyP95Micros: _nonNegativeInt(map, 'callbackCopyP95Micros'),
       rootIsolateImageBytes: _nonNegativeInt(map, 'rootIsolateImageBytes'),
       rendererOwnedBytes: _nonNegativeInt(map, 'rendererOwnedBytes'),
+      rendererSelectionReuse: rendererSelectionReuse,
+      rendererSelectionStrategy: rendererSelectionStrategy,
     );
   }
 }
@@ -494,6 +526,30 @@ bool _bool(Map<String, Object?> map, String key) {
   final value = map[key];
   if (value is! bool)
     throw FormatException('Synthetic scene field $key must be bool.');
+  return value;
+}
+
+bool? _nullableBool(Map<String, Object?> map, String key) {
+  final value = map[key];
+  if (value == null) return null;
+  if (value is! bool) {
+    throw FormatException('Synthetic scene field $key must be bool or null.');
+  }
+  return value;
+}
+
+String? _nullableRendererSelectionStrategy(
+  Map<String, Object?> map,
+  String key,
+) {
+  final value = map[key];
+  if (value == null) return null;
+  if (value is! String ||
+      (value != 'FULL_REBUILD' && value != 'QUALIFIED_REUSE')) {
+    throw FormatException(
+      'Synthetic scene field $key has an unknown renderer selection strategy.',
+    );
+  }
   return value;
 }
 

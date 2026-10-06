@@ -263,6 +263,34 @@ class PoseDataExtractor(private val capacity: Int = 120) {
         synthetic
     }
 
+    /** Changes an explicitly synthetic head pose without relabelling a live ARCore anchor. */
+    internal fun setSyntheticDebugView(
+        transform: DoubleArray,
+        quaternion: FloatArray,
+        bindingGeneration: Long,
+        groupGeneration: Long,
+    ) = synchronized(lock) {
+        val current = checkNotNull(debugFixtureAnchor) { "synthetic pose fixture is not active" }
+        check(debugFixtureSource == SYNTHETIC_POSE_SOURCE) { "live pose fixture cannot accept synthetic head views" }
+        check(debugFixtureBindingGeneration == bindingGeneration && debugFixtureGroupGeneration == groupGeneration) {
+            "synthetic head view ownership changed"
+        }
+        require(transform.size == 16 && transform.all { it.isFinite() })
+        require(quaternion.size == 4 && quaternion.all { it.isFinite() })
+        val now = System.nanoTime()
+        val next = current.copy(
+            position = FloatArray(3) { transform[12+it].toFloat() },
+            rotationQuaternion = quaternion.copyOf(),
+            transform = FloatArray(16) { transform[it].toFloat() },
+            timestampNs = now, observedTimestampNs = now,
+            systemTimestampMs = System.currentTimeMillis(),
+        )
+        debugFixtureAnchor = next
+        debugFixtureOffsetX = 0.0f
+        poses.insert(now)?.set(next)
+        lock.notifyAll()
+    }
+
     internal fun setDebugFixtureManualView() = synchronized(lock) {
         check(debugFixtureAnchor != null) { "synthetic pose fixture is not active" }
         debugFixtureOffsetX = 0.24f

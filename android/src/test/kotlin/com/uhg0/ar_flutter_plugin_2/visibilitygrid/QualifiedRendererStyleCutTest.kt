@@ -649,6 +649,91 @@ class QualifiedRendererStyleCutTest {
         assertEquals(2, state.currentStyleRevision)
     }
 
+    @Test
+    fun `frozen geometry page does not wait for mutable row monitor`() {
+        val state = stateWithRows()
+        val qualifier = pageQualifier()
+        val descriptor = frozenDescriptor(state, qualifier)
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val executor = java.util.concurrent.Executors.newFixedThreadPool(2)
+        try {
+            val holder = executor.submit {
+                synchronized(state) {
+                    entered.countDown()
+                    check(release.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                }
+            }
+            assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            val read = executor.submit<Boolean> {
+                descriptor.withPage(qualifier, 0, 2) { page ->
+                    assertArrayEquals(longArrayOf(1, 2), page.surfaceIds)
+                    assertArrayEquals(floatArrayOf(.05f, .05f, .05f, .05f, .05f, .05f), page.positions, .000001f)
+                }
+            }
+            assertTrue(read.get(1, java.util.concurrent.TimeUnit.SECONDS))
+            release.countDown()
+            holder.get(5, java.util.concurrent.TimeUnit.SECONDS)
+        } finally {
+            release.countDown()
+            executor.shutdownNow()
+            state.dispose()
+        }
+    }
+
+    @Test
+    fun `style cuts reuse frozen geometry and reject old qualifier`() {
+        val state = stateWithRows()
+        val firstCut = cut(true, longArrayOf(1, 2), arrayOf(style(), style()))
+        assertTrue(state.applyStyleCut(firstCut) is RendererStyleCutResult.Applied)
+        val first = frozenDescriptor(state, pageQualifier(style = 1))
+        assertEquals(1L, state.geometryPageBuildCount)
+        assertEquals(96L, state.retainedPresentationGeometryBytes)
+        val next = firstCut.copy(semanticRevision = 2, coverageRevision = 2,
+            styleRevision = 2, residencyRevision = 2, targetRevision = 2,
+            styleRows = styles(style(2, 2), style(2, 2)))
+        assertTrue(state.applyStyleCut(next) is RendererStyleCutResult.Applied)
+        val second = frozenDescriptor(state, pageQualifier(style = 2))
+        assertEquals(1L, state.geometryPageBuildCount)
+        org.junit.Assert.assertFalse(first.withPage(pageQualifier(style = 1), 0, 2) { error("stale cut") })
+        assertTrue(second.withPage(pageQualifier(style = 2), 0, 2) { page ->
+            assertArrayEquals(styles(style(2, 2), style(2, 2)), page.styleRows)
+        })
+        frozenDescriptor(state, pageQualifier(style = 2), intArrayOf(1, 0))
+        assertEquals(2L, state.geometryPageBuildCount)
+        state.dispose()
+        assertEquals(0L, state.retainedPresentationGeometryBytes)
+        org.junit.Assert.assertFalse(second.withPage(pageQualifier(style = 2), 0, 2) { error("disposed cut") })
+    }
+
+    @Test
+    fun `geometry replacement invalidates held frozen positions`() {
+        val state = stateWithRows()
+        val first = frozenDescriptor(state, pageQualifier())
+        assertTrue(state.applyGeometry(8, false, listOf(row(1, 4)), longArrayOf(),
+            activeOwnership, 10, 3))
+        org.junit.Assert.assertFalse(first.withPage(pageQualifier(), 0, 2) { error("old geometry") })
+        val current = pageQualifier().copy(transactionId = 10, geometryRevision = 8)
+        val second = frozenDescriptor(state, current)
+        assertEquals(2L, state.geometryPageBuildCount)
+        assertTrue(second.withPage(current, 0, 2) { page ->
+            assertEquals(.45f, page.positions[0], .000001f)
+        })
+        state.stopGroup()
+        assertEquals(0L, state.retainedPresentationGeometryBytes)
+        org.junit.Assert.assertFalse(second.withPage(current, 0, 2) { error("stopped group") })
+    }
+
+    private fun pageQualifier(style: Long = 0) =
+        com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRowsQualifier(
+            activeOwnership.bindingGeneration, activeOwnership.groupGeneration, 0, 9, 7, style)
+
+    private fun frozenDescriptor(state: VisibilityGridRendererState,
+        qualifier: com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRowsQualifier,
+        slots: IntArray = intArrayOf(0, 1)) = requireNotNull(state.presentationDescriptor(
+            qualifier, com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationMode.SEMANTIC_CENTROIDS,
+            true, slots))
+
     private fun stateWithRows(): VisibilityGridRendererState {
         val state = VisibilityGridRendererState(2)
         state.startCanonicalGroup(

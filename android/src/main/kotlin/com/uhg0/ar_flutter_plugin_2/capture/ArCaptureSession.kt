@@ -908,6 +908,13 @@ internal class ArCaptureSession(
         )
     }
 
+    internal fun setDebugSyntheticViewPose(
+        transform: DoubleArray,
+        quaternion: FloatArray,
+        bindingGeneration: Long,
+        groupGeneration: Long,
+    ) = poseDataExtractor.setSyntheticDebugView(transform, quaternion, bindingGeneration, groupGeneration)
+
     internal fun setDebugPoseManualView() = poseDataExtractor.setDebugFixtureManualView()
 
     internal fun setDebugPoseAutomaticRevisit() =

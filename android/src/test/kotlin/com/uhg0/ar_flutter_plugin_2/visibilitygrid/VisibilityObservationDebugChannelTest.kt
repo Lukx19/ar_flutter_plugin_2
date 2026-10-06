@@ -1,5 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
+import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageRendererSelectionConfig
+import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageRendererSelectionStrategy
 import io.flutter.plugin.common.MethodChannel
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -10,6 +12,50 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VisibilityObservationDebugChannelTest {
+    @Test
+    fun `snapshot reports the compiled renderer selection strategy`() {
+        val messenger = MethodTestMessenger()
+        val runtime = AndroidVisibilityGridRuntime(
+            ownership = { null },
+            mapper = object : VisibilityObservationMapper {
+                override fun admitFeature(observation: VisibilityFeatureObservation) = observation.close()
+                override fun admitDepth(observation: VisibilityDepthObservation) = observation.close()
+            },
+        )
+        val channel = VisibilityObservationDebugChannel(
+            messenger = messenger,
+            viewId = 80,
+            isDebuggable = true,
+            runtime = runtime,
+            ownership = { null },
+            gate = VisibilityObservationDebugGate(),
+        )
+        try {
+            val result = RecordingResult()
+            MethodChannel(messenger, "visibility_observation_v2_80").invokeMethod(
+                "snapshot",
+                null,
+                result,
+            )
+
+            assertTrue(result.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(1, result.successCount)
+            assertEquals(0, result.errorCount)
+            val snapshot = result.successValue as Map<*, *>
+            assertEquals(
+                CoverageRendererSelectionConfig.strategy == CoverageRendererSelectionStrategy.QUALIFIED_REUSE,
+                snapshot["rendererSelectionReuse"],
+            )
+            assertEquals(
+                CoverageRendererSelectionConfig.strategy.name,
+                snapshot["rendererSelectionStrategy"],
+            )
+        } finally {
+            channel.dispose()
+            runtime.close()
+        }
+    }
+
     @Test
     fun `finite dense campaign rejects missing partial and overflowing variant ranges`() {
         val messenger = MethodTestMessenger()
@@ -37,6 +83,16 @@ class VisibilityObservationDebugChannelTest {
                 assertEquals(0, result.successCount)
                 assertEquals(1, result.errorCount)
             }
+            for (count in listOf(null, 24L, 49L, 2016L)) {
+                val result = RecordingResult()
+                MethodChannel(messenger, "visibility_observation_v2_79").invokeMethod(
+                    "prepareAllocationWorkload", mapOf("denseDepthGrids" to true,
+                        "sphereDepthViews" to true, "maximumFeatureOffers" to count), result,
+                )
+                assertTrue(result.completed.await(2, TimeUnit.SECONDS))
+                assertEquals(0, result.successCount)
+                assertEquals(1, result.errorCount)
+            }
             assertEquals(0L, runtime.snapshot().offeredDepthObservations)
         } finally {
             channel.dispose()
@@ -45,7 +101,7 @@ class VisibilityObservationDebugChannelTest {
     }
 
     @Test
-    fun `preparing dense allocation fixtures repeatedly offers no observations`() {
+    fun `preparing plane and surrounding sphere inputs repeatedly offers no observations`() {
         val messenger = MethodTestMessenger()
         val ownership = VisibilityObservationOwnership(
             sessionId = "01".repeat(16),
@@ -82,11 +138,13 @@ class VisibilityObservationDebugChannelTest {
         )
         try {
             val before = runtime.snapshot()
-            repeat(2) {
+            for (arguments in listOf(
+                mapOf("denseDepthGrids" to true, "depthVariantOffset" to 5L, "maximumFeatureOffers" to 480L),
+                mapOf("denseDepthGrids" to true, "sphereDepthViews" to true, "maximumFeatureOffers" to 1920L),
+            )) repeat(2) {
                 val result = RecordingResult()
                 MethodChannel(messenger, "visibility_observation_v2_78").invokeMethod(
-                    "prepareAllocationWorkload", mapOf("denseDepthGrids" to true,
-                        "depthVariantOffset" to 5L, "maximumFeatureOffers" to 480L), result,
+                    "prepareAllocationWorkload", arguments, result,
                 )
                 assertTrue(result.completed.await(2, TimeUnit.SECONDS))
                 assertEquals(1, result.successCount)

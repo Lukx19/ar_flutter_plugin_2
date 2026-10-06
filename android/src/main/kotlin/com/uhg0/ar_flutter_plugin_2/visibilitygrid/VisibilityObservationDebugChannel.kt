@@ -4,6 +4,8 @@ import android.os.Debug
 import android.os.SystemClock
 import com.uhg0.ar_flutter_plugin_2.performance.AllocationCounters
 import com.uhg0.ar_flutter_plugin_2.performance.AllocationWorkReceipt
+import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageRendererSelectionConfig
+import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageRendererSelectionStrategy
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -51,7 +53,7 @@ internal class VisibilityObservationDebugChannel(
     viewId: Int,
     private val isDebuggable: Boolean,
     private val runtime: AndroidVisibilityGridRuntime,
-    ownership: () -> VisibilityObservationOwnership?,
+    private val ownership: () -> VisibilityObservationOwnership?,
     private val gate: VisibilityObservationDebugGate,
     private val pressureOwners: () -> VisibilityPressureOwnerScalars = {
         VisibilityPressureOwnerScalars()
@@ -59,6 +61,7 @@ internal class VisibilityObservationDebugChannel(
     private val allocationTimestampNs: () -> Long = {
         1_000_000_000_000_000_000L + SystemClock.elapsedRealtimeNanos()
     },
+    private val applySyntheticViewPose: ((DoubleArray, FloatArray, Long, Long) -> Unit)? = null,
     private val physicalSamplePools: (() -> Map<String, SampleLeasePoolReceipt>)? = null,
 ) : MethodChannel.MethodCallHandler {
     private val channel = MethodChannel(messenger, "visibility_observation_v2_$viewId")
@@ -137,6 +140,11 @@ internal class VisibilityObservationDebugChannel(
                 "snapshot" -> dispatchSnapshot(result) {
                     runtime.snapshotWireMap() + mapOf(
                         "mappingStalled" to gate.stalled(),
+                        "rendererSelectionReuse" to (
+                            CoverageRendererSelectionConfig.strategy ==
+                                CoverageRendererSelectionStrategy.QUALIFIED_REUSE
+                            ),
+                        "rendererSelectionStrategy" to CoverageRendererSelectionConfig.strategy.name,
                         "syntheticSamplePools" to samplePoolReceipts().mapValues { it.value.toWireMap() },
                         "arCoreSamplePools" to physicalSamplePools?.invoke()?.mapValues { it.value.toWireMap() },
                     )
@@ -187,7 +195,8 @@ internal class VisibilityObservationDebugChannel(
                     val config = call.allocationWorkloadConfig()
                     // One-time fixture construction is explicit and precedes measurement fences.
                     // It offers no observations and leaves actual first-photo work cold.
-                    if (config.denseDepthGrids) source.prepareDenseDepthGrids(
+                    if (config.sphereDepthViews) source.prepareSphereDepthViews()
+                    else if (config.denseDepthGrids) source.prepareDenseDepthGrids(
                         campaignVariants = config.depthVariantOffset != null,
                     )
                     result.success(true)
@@ -198,10 +207,14 @@ internal class VisibilityObservationDebugChannel(
                     val denseDepthGrids = config.denseDepthGrids
                     val maximumFeatureOffers = config.maximumFeatureOffers
                     val depthVariantOffset = config.depthVariantOffset
-                    if (denseDepthGrids) source.prepareDenseDepthGrids(campaignVariants = depthVariantOffset != null)
-                    val depthEveryFeatureOffers = if (denseDepthGrids) 24L else 2L
-                    workloadFeatureFixture = if (depthVariantOffset != null) SYNTHETIC_CAMPAIGN_FEATURE_FIXTURE else "legacyRotatingPoint"
-                    workloadFeatureSamplesPerOffer = if (depthVariantOffset != null) SYNTHETIC_CAMPAIGN_FEATURE_SAMPLES else 1
+                    if (config.sphereDepthViews) {
+                        source.prepareSphereDepthViews()
+                        applySpherePose(0)
+                    } else if (denseDepthGrids) source.prepareDenseDepthGrids(campaignVariants = depthVariantOffset != null)
+                    val featureOffersPerSphereView = config.sphereDepthIntervalMs / 125L * 4L
+                    val depthEveryFeatureOffers = if (config.sphereDepthViews) config.sphereDepthIntervalMs / 125L else if (denseDepthGrids) 24L else 2L
+                    workloadFeatureFixture = if (config.sphereDepthViews) "surroundingSphereVisibleTracks" else if (depthVariantOffset != null) SYNTHETIC_CAMPAIGN_FEATURE_FIXTURE else "legacyRotatingPoint"
+                    workloadFeatureSamplesPerOffer = if (config.sphereDepthViews) SyntheticSphereDepthFixture.FEATURE_SAMPLES else if (depthVariantOffset != null) SYNTHETIC_CAMPAIGN_FEATURE_SAMPLES else 1
                     workloadFeatureMaterialCommitsBefore = runtime.snapshot().admittedFeatureObservations
                     workloadFeatureOffers.set(0)
                     workloadDepthOffers.set(0)
@@ -219,7 +232,12 @@ internal class VisibilityObservationDebugChannel(
                             }
                             val offer = workloadFeatureOffers.getAndIncrement()
                             val timestampNs = allocationTimestampNs()
-                            val featureAccepted = if (depthVariantOffset != null) {
+                            if (config.sphereDepthViews && offer > 0L && offer % featureOffersPerSphereView == 0L) {
+                                applySpherePose((offer / featureOffersPerSphereView).toInt())
+                            }
+                            val featureAccepted = if (config.sphereDepthViews) {
+                                source.emitSphereFeatureFrame(timestampNs, (offer / featureOffersPerSphereView).toInt())
+                            } else if (depthVariantOffset != null) {
                                 source.emitCampaignFeatureFrame(timestampNs, (depthVariantOffset + offer / 24L).toInt())
                             } else source.emitFeature(timestampNs, (offer % 5).toInt())
                             if (featureAccepted) {
@@ -229,7 +247,9 @@ internal class VisibilityObservationDebugChannel(
                                 val depthOffer = workloadDepthOffers.getAndIncrement()
                                 val marker = if (depthVariantOffset != null) (depthVariantOffset + depthOffer).toInt()
                                     else (depthOffer % 5L).toInt()
-                                val accepted = if (denseDepthGrids) {
+                                val accepted = if (config.sphereDepthViews) {
+                                    source.emitSphereDepthGrid(timestampNs + 1L, (depthOffer / 4L).toInt())
+                                } else if (denseDepthGrids) {
                                     source.emitDenseDepthGrid(timestampNs + 1L, marker, campaignVariants = depthVariantOffset != null)
                                 } else source.emitDepth(timestampNs + 1L, marker)
                                 if (accepted) {
@@ -242,6 +262,13 @@ internal class VisibilityObservationDebugChannel(
                         }
                     }, 0L, 125L, TimeUnit.MILLISECONDS)
                     result.success(true)
+                }
+                "revisitSphereDepth" -> {
+                    check(allocationWorkload == null) { "sphere revisit requires a stopped workload" }
+                    val view = requireNotNull(call.argument<Number>("viewIndex")).toLong()
+                    require(view in 0L until SyntheticSphereDepthFixture.VIEW_COUNT.toLong())
+                    applySpherePose(view.toInt())
+                    result.success(source.emitSphereDepthGrid(allocationTimestampNs(), view.toInt()))
                 }
                 "stopAllocationWorkload" -> {
                     check(allocationWorkload != null) { "allocation workload is not running" }
@@ -306,18 +333,39 @@ internal class VisibilityObservationDebugChannel(
         }
     }
 
+    private fun applySpherePose(index: Int) {
+        val view = source.preparedSphereView(index)
+        val cut = requireNotNull(ownership())
+        requireNotNull(applySyntheticViewPose) { "sphere campaign requires synthetic photo pose ownership" }
+            .invoke(view.worldPose, view.rotationQuaternion, cut.bindingGeneration, cut.groupGeneration)
+    }
+
     private data class AllocationWorkloadConfig(
         val denseDepthGrids: Boolean,
+        val sphereDepthViews: Boolean,
+        val sphereDepthIntervalMs: Long,
         val maximumFeatureOffers: Long?,
         val depthVariantOffset: Long?,
     )
 
     private fun MethodCall.allocationWorkloadConfig(): AllocationWorkloadConfig {
         val denseDepthGrids = argument<Boolean>("denseDepthGrids") ?: false
+        val sphereDepthViews = argument<Boolean>("sphereDepthViews") ?: false
+        val sphereDepthIntervalMs = argument<Number>("sphereDepthIntervalMs")?.toLong() ?: 3000L
+        require(sphereDepthIntervalMs == 1500L || sphereDepthIntervalMs == 3000L) {
+            "sphere depth interval must preserve a supported finite schedule"
+        }
+        val featureOffersPerSphereView = sphereDepthIntervalMs / 125L * 4L
         val maximumFeatureOffers = argument<Number>("maximumFeatureOffers")?.toLong()
         val depthVariantOffset = argument<Number>("depthVariantOffset")?.toLong()
         require(maximumFeatureOffers == null || maximumFeatureOffers in 1L..10_000L) {
             "maximum feature offers is outside the bounded fixture range"
+        }
+        if (sphereDepthViews) {
+            require(denseDepthGrids && depthVariantOffset == null && maximumFeatureOffers != null &&
+                maximumFeatureOffers % featureOffersPerSphereView == 0L && maximumFeatureOffers <= SyntheticSphereDepthFixture.VIEW_COUNT * featureOffersPerSphereView) {
+                "sphere views require a finite surrounding-scene sweep"
+            }
         }
         if (depthVariantOffset != null) {
             require(denseDepthGrids && maximumFeatureOffers != null &&
@@ -326,7 +374,7 @@ internal class VisibilityObservationDebugChannel(
                 "dense campaign variants require a finite in-range sequence"
             }
         }
-        return AllocationWorkloadConfig(denseDepthGrids, maximumFeatureOffers, depthVariantOffset)
+        return AllocationWorkloadConfig(denseDepthGrids, sphereDepthViews, sphereDepthIntervalMs, maximumFeatureOffers, depthVariantOffset)
     }
 
     private fun MethodCall.requiredTimestamp(): Long =

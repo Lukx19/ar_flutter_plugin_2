@@ -15,9 +15,15 @@ internal class FrameCadenceTracker(
     debugGapTimingEnabled: Boolean = false,
 ) {
     private companion object {
-        // The tail retains enough samples to calculate an exact p99 for a
-        // 60-second window at up to 120 Hz without retaining the whole window.
-        private const val MEASUREMENT_TAIL_CAPACITY = 128
+        // The tail retains enough samples to calculate an exact p99 for the
+        // longest supported bounded measurement window: 14 minutes at 120 Hz.
+        // 1,024 entries cover the p99 rank of 100,800 intervals with margin.
+        // Keep this as a primitive array so record() remains allocation-free.
+        private const val MEASUREMENT_WINDOW_MAX_SECONDS = 14 * 60
+        private const val MEASUREMENT_WINDOW_MAX_FRAME_RATE_HZ = 120
+        private const val MEASUREMENT_TAIL_CAPACITY = 1024
+        private const val MEASUREMENT_WINDOW_MAX_EXACT_P99_SAMPLES =
+            MEASUREMENT_WINDOW_MAX_SECONDS * MEASUREMENT_WINDOW_MAX_FRAME_RATE_HZ
     }
 
     init {
@@ -287,6 +293,9 @@ internal class FrameCadenceTracker(
 
     private fun measurementP99Ns(): MeasurementP99 {
         if (measurementSampleCount == 0) return MeasurementP99(0L, true)
+        if (measurementSampleCount > MEASUREMENT_WINDOW_MAX_EXACT_P99_SAMPLES) {
+            return MeasurementP99(0L, false)
+        }
         val sortedTail = measurementTailNs.copyOf(measurementTailSize)
         Arrays.sort(sortedTail)
         val rank = ((measurementSampleCount.toLong() * 99L + 99L) / 100L - 1L).toInt()

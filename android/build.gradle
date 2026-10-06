@@ -1,6 +1,41 @@
 group 'com.uhg0.ar_flutter_plugin_2'
 version '1.0-SNAPSHOT'
 
+// Flutter forwards --dart-define values to every Android subproject through
+// the comma-separated, base64-encoded dart-defines project property. Keep the
+// explicit Gradle property as the standalone/native-test override, then use
+// the define as the APK-build fallback so matched Flutter builds do not depend
+// on daemon process environment inheritance.
+def coverageSelectionReuseProperty = project.findProperty('coverageSelectionReuse')?.toString()
+def encodedDartDefines = project.findProperty('dart-defines')?.toString()
+def coverageDefinePrefix = 'CAPTURE3D_COVERAGE_SELECTION_REUSE='
+def coverageDefineValues = encodedDartDefines?.split(',')?.collect { encoded ->
+        try {
+            new String(
+                java.util.Base64.decoder.decode(encoded),
+                java.nio.charset.StandardCharsets.UTF_8,
+            )
+        } catch (Exception ignored) {
+            null
+        }
+    }?.findAll { value -> value?.startsWith(coverageDefinePrefix) }
+if (coverageDefineValues != null && coverageDefineValues.size() > 1) {
+    throw new GradleException(
+        "Duplicate $coverageDefinePrefix dart-defines are not allowed",
+    )
+}
+if (coverageSelectionReuseProperty == null && coverageDefineValues?.size() == 1) {
+    coverageSelectionReuseProperty = coverageDefineValues[0].substring(coverageDefinePrefix.length())
+}
+def normalizedCoverageSelectionReuse = coverageSelectionReuseProperty?.trim()
+if (normalizedCoverageSelectionReuse != null &&
+    !['true', 'false'].any { value -> value.equalsIgnoreCase(normalizedCoverageSelectionReuse) }) {
+    throw new GradleException(
+        "$coverageDefinePrefix must be true or false, got '$coverageSelectionReuseProperty'",
+    )
+}
+def coverageSelectionReuse = normalizedCoverageSelectionReuse?.equalsIgnoreCase('true') ?: false
+
 buildscript {
     ext.kotlin_version = '2.4.20'
     repositories {
@@ -71,6 +106,17 @@ android {
 
     buildFeatures {
         compose true
+        // The renderer selection experiment is selected at APK build time so
+        // matched tablet control/candidate runs can use the same source.
+        buildConfig true
+    }
+
+    defaultConfig {
+        buildConfigField(
+            'boolean',
+            'COVERAGE_SELECTION_REUSE',
+            coverageSelectionReuse.toString(),
+        )
     }
 
 }

@@ -241,6 +241,126 @@ class CoverageRendererSelectionTest {
         assertArrayEquals(longArrayOf(10L, 20L), tieSelection.surfaceIds)
     }
 
+    @Test
+    fun `qualified reuse keeps exact ordered cut when style revision changes without ranking change`() {
+        val rows = FixedStreamRows(
+            mutableListOf(
+                committedRow(10L, 10L, CoverageRendererStyleRowV1(target = CoverageRendererTarget.PRIMARY)),
+                committedRow(20L, 20L, CoverageRendererStyleRowV1(coverage = CoverageRendererCoverage.PARTIAL)),
+                committedRow(30L, 30L, CoverageRendererStyleRowV1()),
+            ),
+        )
+        val selector = CoveragePresentationSelector(
+            maximumCapacity = 2,
+            strategy = CoverageRendererSelectionStrategy.QUALIFIED_REUSE,
+        )
+        val initial = selector.select(rows, requestedCapacity = 2, forceReset = true)
+        rows.styleRevision = 2L
+        val update = CoveragePointRenderUpdate(
+            geometryRevision = 1L,
+            visibilityRevision = 2L,
+            enabled = true,
+            count = rows.count,
+            spans = listOf(
+                CoveragePointSpan(
+                    startSlot = 0,
+                    positions = FloatArray(0),
+                    colors = IntArray(0),
+                    endSlotExclusive = 1,
+                ),
+            ),
+            reset = false,
+        )
+
+        val reused = selector.select(rows, sourceUpdate = update, forceReset = false)
+
+        assertArrayEquals(initial.surfaceIds, reused.surfaceIds)
+        assertEquals(false, reused.update!!.reset)
+        assertEquals(1, reused.update!!.spans.single().rowCount)
+    }
+
+    @Test
+    fun `qualified reuse keeps dense unchanged ranking span incremental`() {
+        val rows = FixedStreamRows(
+            mutableListOf(
+                committedRow(10L, 10L, CoverageRendererStyleRowV1(target = CoverageRendererTarget.PRIMARY)),
+                committedRow(20L, 20L, CoverageRendererStyleRowV1(coverage = CoverageRendererCoverage.PARTIAL)),
+                committedRow(30L, 30L, CoverageRendererStyleRowV1()),
+            ),
+        )
+        val selector = CoveragePresentationSelector(
+            maximumCapacity = 2,
+            strategy = CoverageRendererSelectionStrategy.QUALIFIED_REUSE,
+        )
+        val initial = selector.select(rows, requestedCapacity = 2, forceReset = true)
+        rows.styleRevision = 2L
+
+        val reused = selector.select(
+            rows,
+            sourceUpdate = CoveragePointRenderUpdate(
+                geometryRevision = 1L,
+                visibilityRevision = 2L,
+                enabled = true,
+                count = rows.count,
+                spans = listOf(
+                    CoveragePointSpan(
+                        startSlot = 0,
+                        positions = FloatArray(0),
+                        colors = IntArray(0),
+                        endSlotExclusive = rows.count,
+                    ),
+                ),
+                reset = false,
+            ),
+            forceReset = false,
+        )
+
+        assertArrayEquals(initial.surfaceIds, reused.surfaceIds)
+        assertEquals(false, reused.update!!.reset)
+        assertEquals(2, reused.update!!.spans.single().rowCount)
+    }
+
+    @Test
+    fun `qualified reuse falls back before publication when changed row would displace cut`() {
+        val rows = FixedStreamRows(
+            mutableListOf(
+                committedRow(10L, 10L, CoverageRendererStyleRowV1(target = CoverageRendererTarget.PRIMARY)),
+                committedRow(20L, 20L, CoverageRendererStyleRowV1()),
+                committedRow(30L, 30L, CoverageRendererStyleRowV1()),
+            ),
+        )
+        val selector = CoveragePresentationSelector(
+            maximumCapacity = 2,
+            strategy = CoverageRendererSelectionStrategy.QUALIFIED_REUSE,
+        )
+        selector.select(rows, requestedCapacity = 2, forceReset = true)
+        rows.replace(
+            2,
+            committedRow(30L, 30L, CoverageRendererStyleRowV1(target = CoverageRendererTarget.HALO)),
+        )
+        rows.styleRevision = 2L
+        val update = CoveragePointRenderUpdate(
+            geometryRevision = 1L,
+            visibilityRevision = 2L,
+            enabled = true,
+            count = rows.count,
+            spans = listOf(
+                CoveragePointSpan(
+                    startSlot = 2,
+                    positions = FloatArray(0),
+                    colors = IntArray(0),
+                    endSlotExclusive = 3,
+                ),
+            ),
+            reset = false,
+        )
+
+        val rebuilt = selector.select(rows, sourceUpdate = update, forceReset = false)
+
+        assertArrayEquals(longArrayOf(30L, 10L), rebuilt.surfaceIds)
+        assertEquals(true, rebuilt.update!!.reset)
+    }
+
     private fun committedRow(
         surfaceId: Long,
         key: Long,
@@ -922,7 +1042,7 @@ class CoverageRendererSelectionTest {
         assertEquals(2_000, CoverageRendererLimits.RAW_POINT_CAPACITY)
         assertEquals(20_000, CoverageRendererLimits.CENTROID_CAPACITY)
         assertEquals(8_000, CoverageRendererLimits.CUBE_CAPACITY)
-        assertEquals(13_038_692, CoverageRendererLimits.maximumActiveRendererBytes)
+        assertEquals(13_358_756, CoverageRendererLimits.maximumActiveRendererBytes)
         com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.entries.forEach { mode ->
             assertTrue(
                 "$mode startup peak must fit the active renderer cap",
@@ -957,11 +1077,11 @@ class CoverageRendererSelectionTest {
         )
         assertEquals(5_645_056, receipt.canonicalStateBytes)
         assertEquals(800_000, receipt.mutableProjectionSelectorBytes)
-        assertEquals(640_100, receipt.descriptorBackingBytes)
+        assertEquals(960_164, receipt.descriptorBackingBytes)
         assertEquals(0, receipt.pageReaderCapturedMappingBytes)
         assertEquals(65_536, receipt.stagingBytes)
         assertEquals(5_888_000, receipt.meshBytes)
-        assertEquals(13_038_692, receipt.totalBytes)
+        assertEquals(13_358_756, receipt.totalBytes)
         assertTrue(receipt.canonicalStateBytes > 0)
         assertTrue(receipt.mutableProjectionSelectorBytes > 0)
         assertTrue(receipt.descriptorBackingBytes > 0)
@@ -1024,7 +1144,7 @@ class CoverageRendererSelectionTest {
 
         ledger.releaseRendererResources()
 
-        assertEquals(7_085_156, telemetry.snapshot().getValue("ownedBufferBytes"))
+        assertEquals(7_405_220, telemetry.snapshot().getValue("ownedBufferBytes"))
         assertEquals(
             5_645_056,
             telemetry.snapshot().getValue("ownedBufferBytesByOwner").let { owners ->
@@ -1047,12 +1167,12 @@ class CoverageRendererSelectionTest {
         ledger.installPointResources("coverage-centroids-epoch-1", CoverageRendererLimits.CENTROID_CAPACITY)
         ledger.releaseRendererResources()
         ledger.releaseRendererResources()
-        assertEquals(7_085_156, telemetry.snapshot().getValue("ownedBufferBytes"))
+        assertEquals(7_405_220, telemetry.snapshot().getValue("ownedBufferBytes"))
 
         ledger.installPersistentCoverageState(VoxelRenderMode.CENTROIDS)
-        assertEquals(7_150_692, telemetry.snapshot().getValue("ownedBufferBytes"))
+        assertEquals(7_470_756, telemetry.snapshot().getValue("ownedBufferBytes"))
         ledger.releaseRendererResources()
-        assertEquals(7_085_156, telemetry.snapshot().getValue("ownedBufferBytes"))
+        assertEquals(7_405_220, telemetry.snapshot().getValue("ownedBufferBytes"))
     }
 
     @Test
@@ -1107,7 +1227,7 @@ class CoverageRendererSelectionTest {
         )
 
         assertNull(failed)
-        assertEquals(7_085_156, telemetry.snapshot().getValue("ownedBufferBytes"))
+        assertEquals(7_405_220, telemetry.snapshot().getValue("ownedBufferBytes"))
     }
 
     @Test
@@ -1142,7 +1262,7 @@ class CoverageRendererSelectionTest {
         )
 
         assertNull(failed)
-        assertEquals(7_085_156, telemetry.snapshot().getValue("ownedBufferBytes"))
+        assertEquals(7_405_220, telemetry.snapshot().getValue("ownedBufferBytes"))
         ledger.clearCoverageState()
         ledger.clearCoverageState()
         assertEquals(0, telemetry.snapshot().getValue("ownedBufferBytes"))
@@ -1156,7 +1276,7 @@ class CoverageRendererSelectionTest {
         ledger.installCubeResources("coverage-cubes-epoch-1", CoverageRendererLimits.CUBE_CAPACITY)
 
         ledger.releaseRendererResources()
-        assertEquals(7_085_156, telemetry.snapshot().getValue("ownedBufferBytes"))
+        assertEquals(7_405_220, telemetry.snapshot().getValue("ownedBufferBytes"))
         ledger.clearCoverageState()
         ledger.clearCoverageState()
         assertEquals(0, telemetry.snapshot().getValue("ownedBufferBytes"))

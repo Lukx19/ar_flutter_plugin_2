@@ -139,6 +139,7 @@ private class PresentationBacking(
     private val styleTable: ByteArray,
     workspace: PresentationWorkspace,
     private val pageReader: PresentationPageReader,
+    private val geometryBackingBytes: Long = 0L,
 ) : PresentationRowMapping {
     private val glyphPrefix = IntArray(surfaceIdTable.size + 1)
     init {
@@ -191,7 +192,7 @@ private class PresentationBacking(
         block(page)
         return true
     }
-    fun ownedStorageBytes(): Long = PresentationDescriptor.estimatedBackingBytes(count).toLong()
+    fun ownedStorageBytes(): Long = PresentationDescriptor.estimatedBackingBytes(count).toLong() + geometryBackingBytes
 }
 
 /** Immutable bounded presentation metadata published by the native projection. */
@@ -293,7 +294,7 @@ internal class PresentationDescriptor private constructor(
 
     companion object {
         /** Exact bytes of the immutable bounded backing, excluding borrowed pages. */
-        internal fun estimatedBackingBytes(rowCapacity: Int): Int {
+        internal fun estimatedBackingBytes(rowCapacity: Int, includesGeometry: Boolean = false): Int {
             require(rowCapacity in 0..CoverageRendererLimits.CENTROID_CAPACITY)
             return 96 +
                 rowCapacity * (
@@ -301,7 +302,7 @@ internal class PresentationDescriptor private constructor(
                         Int.SIZE_BYTES +
                         COVERAGE_RENDERER_STYLE_ROW_BYTES +
                         Int.SIZE_BYTES
-                ) + Int.SIZE_BYTES
+                ) + Int.SIZE_BYTES + if (includesGeometry) 64 + rowCapacity * (Int.SIZE_BYTES + 3 * Float.SIZE_BYTES) else 0
         }
 
         fun create(
@@ -344,11 +345,12 @@ internal class PresentationDescriptor private constructor(
             selectedSurfaceIds: LongArray, selectedSourceSlots: IntArray, styleRows: ByteArray,
             update: CoveragePointRenderUpdate?, workspace: PresentationWorkspace,
             pageReader: PresentationPageReader,
+            geometryBackingBytes: Long = 0L,
         ): PresentationDescriptor {
             require(capacity == mode.presentationCapacity)
             require(selectedSurfaceIds.size <= capacity)
             val backing = PresentationBacking(qualifier, sourceCapacity, sourceCount, palette,
-                selectedSurfaceIds, selectedSourceSlots, styleRows, workspace, pageReader)
+                selectedSurfaceIds, selectedSourceSlots, styleRows, workspace, pageReader, geometryBackingBytes)
             return PresentationDescriptor(
                 qualifier = qualifier,
                 mode = mode,

@@ -29,6 +29,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -38,6 +39,141 @@ import org.openjdk.jol.info.GraphLayout
 
 /** Locks Option A's BINDING-LIFECYCLE-ACK seeded CREATE cut without a Flutter payload seam. */
 class VisibilityGridIntegrationTest {
+    @Test
+    fun `admission health read never waits for canonical monitor`() {
+        val directory = Files.createTempDirectory("admission-health-contention").toFile()
+        val binding = VisibilityGridV2Binding(MethodTestMessenger(), 2161, CommittedBaselineAuthority(), postToMain = { it() })
+        val integration = VisibilityGridIntegration(binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = { error("read-only health fixture cannot open canonical storage") })
+        val monitor = VisibilityGridIntegration::class.java.getDeclaredField("lock").apply {
+            isAccessible = true
+        }.get(integration)
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val reader = Executors.newSingleThreadExecutor()
+        val holder = Thread {
+            synchronized(monitor) {
+                entered.countDown()
+                release.await(5, TimeUnit.SECONDS)
+            }
+        }
+        try {
+            val before = integration.snapshot()
+            assertTrue(before === integration.snapshot())
+            assertEquals(104L + VISIBILITY_GRID_ADMISSION_HEALTH_OWNER_BYTES,
+                integration.portableOwnerMemoryReceipt().integrationReceiptBytes)
+            holder.start()
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            val observed = reader.submit<VisibilityMappingAdmissionHealth> { integration.snapshot() }
+                .get(1, TimeUnit.SECONDS)
+            assertTrue(before === observed)
+        } finally {
+            release.countDown()
+            holder.join(2_000)
+            reader.shutdownNow()
+            integration.close(); binding.dispose(); directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `concurrent admission fences retain cumulative immutable health`() {
+        val directory = Files.createTempDirectory("admission-health-counters").toFile()
+        val binding = VisibilityGridV2Binding(MethodTestMessenger(), 2162, CommittedBaselineAuthority(), postToMain = { it() })
+        val ownership = rendererOwnership()
+        val integration = VisibilityGridIntegration(binding, { ownership }, directory,
+            resourcesForGroup = { error("paused health fixture cannot open canonical storage") })
+        val writers = Executors.newFixedThreadPool(4)
+        try {
+            integration.pause()
+            val held = integration.snapshot()
+            val writes = (0 until 4).map { worker ->
+                writers.submit {
+                    repeat(25) { index -> integration.admitFeature(feature(ownership, (worker * 25 + index + 1).toLong())) }
+                }
+            }
+            writes.forEach { it.get(5, TimeUnit.SECONDS) }
+            val current = integration.snapshot()
+            assertEquals(100L, current.rolloverDiscardedObservations)
+            assertEquals(0L, held.rolloverDiscardedObservations)
+            assertEquals(0L, current.admittedFeatures)
+            assertEquals(0L, current.admittedDepths)
+            assertEquals(0L, current.rolloverCount)
+            assertEquals(0L, current.rolloverBindingGeneration)
+            assertEquals(0L, current.rolloverGroupGeneration)
+            assertEquals(0L, current.rolloverLifecycleSequence)
+            integration.resume()
+            assertTrue(current === integration.snapshot())
+        } finally {
+            writers.shutdownNow()
+            integration.close(); binding.dispose(); directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `admission health publishes complete cut and preserves lifecycle counter scope`() {
+        for (rollover in listOf(false, true)) {
+            val directory = Files.createTempDirectory("admission-health-lifecycle").toFile()
+            val coordinator = budget(directory)
+            val messenger = MethodTestMessenger()
+            val viewId = if (rollover) 2163 else 2164
+            val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+            val replacement = AtomicReference<VisibilityObservationOwnership?>(null)
+            val integration = VisibilityGridIntegration(
+                binding, { replacement.get() ?: binding.currentObservationOwnership() }, directory,
+                resourcesForGroup = resources(directory, coordinator),
+            )
+            try {
+                val stream = start(binding, messenger, viewId)
+                exchange(messenger, viewId, stream, 1, 0, 0, 0)
+                exchange(messenger, viewId, stream, 2, 0, 0, 0)
+                exchange(messenger, viewId, stream, 3, 1, 1, 1)
+                val ownership = requireNotNull(binding.currentObservationOwnership())
+                integration.admitDepth(depth(ownership, 10))
+                integration.admitFeature(feature(ownership, 11))
+                val held = integration.snapshot()
+                assertEquals(1L, held.admittedDepths)
+                assertEquals(1L, held.admittedFeatures)
+                assertEquals(1L, held.rolloverCount)
+                assertEquals(ownership.bindingGeneration, held.rolloverBindingGeneration)
+                assertEquals(ownership.groupGeneration, held.rolloverGroupGeneration)
+                assertEquals(ownership.lifecycleSequence, held.rolloverLifecycleSequence)
+
+                integration.pause()
+                integration.admitFeature(feature(ownership, 12))
+                val fenced = integration.snapshot()
+                assertEquals(held.rolloverDiscardedObservations + 1, fenced.rolloverDiscardedObservations)
+                assertEquals(held.admittedFeatures, fenced.admittedFeatures)
+                integration.resume()
+                assertTrue(fenced === integration.snapshot())
+                if (rollover) {
+                    val next = ownership.copy(bindingGeneration = ownership.bindingGeneration + 1,
+                        groupGeneration = ownership.groupGeneration + 1, lifecycleSequence = ownership.lifecycleSequence + 1)
+                    replacement.set(next)
+                    integration.rollover(next)
+                    val rolled = integration.snapshot()
+                    assertEquals(0L, rolled.rolloverCount)
+                    assertEquals(0L, rolled.rolloverBindingGeneration)
+                    assertEquals(0L, rolled.rolloverGroupGeneration)
+                    assertEquals(0L, rolled.rolloverLifecycleSequence)
+                    assertEquals(fenced.admittedFeatures, rolled.admittedFeatures)
+                    assertEquals(fenced.admittedDepths, rolled.admittedDepths)
+                    assertEquals(fenced.rolloverDiscardedObservations, rolled.rolloverDiscardedObservations)
+                } else {
+                    integration.close()
+                    assertTrue(fenced === integration.snapshot())
+                    integration.admitFeature(feature(ownership, 13))
+                    assertEquals(fenced.rolloverDiscardedObservations + 1,
+                        integration.snapshot().rolloverDiscardedObservations)
+                    assertEquals(ownership.bindingGeneration, integration.snapshot().rolloverBindingGeneration)
+                }
+                assertEquals(1L, held.admittedFeatures)
+                assertEquals(ownership.bindingGeneration, held.rolloverBindingGeneration)
+            } finally {
+                integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()
+            }
+        }
+    }
+
     @Test
     fun `canonical open refusal publishes a bounded durability reason`() {
         val directory = Files.createTempDirectory("canonical-surface-open-refusal").toFile()
@@ -1036,13 +1172,19 @@ class VisibilityGridIntegrationTest {
     }
 
     @Test(timeout = 240_000)
-    fun `stationary camera sphere sweep advances one canonical map and renderer`() {
+    fun `stationary camera sphere sweep advances one canonical map and renderer`() = runSphereSweep(dense = false)
+
+    @Test
+    fun `progressive dense surrounding shell grows and revisits avoid duplicate walls`() = runSphereSweep(dense = true)
+
+    private fun runSphereSweep(dense: Boolean) {
         val directory = Files.createTempDirectory("canonical-sphere-sweep").toFile()
         val coordinator = budget(directory)
         val messenger = MethodTestMessenger()
         val viewId = 2192
         val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
-        val projection = NativeRendererProjection(render = { _, _ -> })
+        var rendered: com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot? = null
+        val projection = NativeRendererProjection(render = { snapshot, _ -> rendered = snapshot })
         val scheduler = Executors.newScheduledThreadPool(2)
         val clock = AtomicLong(1_000_000_000L)
         val mapperExecutor = Executors.newSingleThreadExecutor()
@@ -1055,7 +1197,7 @@ class VisibilityGridIntegrationTest {
             binding::currentObservationOwnership, integration, scheduler, nanoTime = clock::get,
         )
         try {
-            val stream = start(binding, messenger, viewId)
+            val stream = start(binding, messenger, viewId, if (dense) startRequestWithVoxelSize(100_000) else startRequest())
             exchange(messenger, viewId, stream, 1, 0, 0, 0)
             exchange(messenger, viewId, stream, 2, 0, 0, 0)
             exchange(messenger, viewId, stream, 3, 1, 1, 1)
@@ -1088,21 +1230,37 @@ class VisibilityGridIntegrationTest {
             val source = SyntheticVisibilityObservationSource(runtime, binding::currentObservationOwnership)
             source.anchor(identityVisibilityGridTransform(), requireNotNull(binding.currentObservationOwnership()).groupFrame)
             source.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            assertEquals(0, projection.currentRowCount())
+            if (dense) source.prepareSphereDepthViews()
+            assertEquals(0, projection.currentRowCount())
+            val rowCounts = ArrayList<Int>()
             val depthViews = (0 until SYNTHETIC_SPHERE_VIEW_COUNT).toSet()
             var admittedDepths = 0L
             for (view in 0 until SYNTHETIC_SPHERE_VIEW_COUNT) {
-                val timestamp = 1_000_000_000L + view * 1_000_000_000L
+                val timestamp = 1_000_000_000L + view * (if (dense) 6_000_000_000L else 3_000_000_000L)
                 clock.set(timestamp)
-                assertTrue("feature view $view", source.emitSphereView(view, timestamp,
-                    timestamp + 250_000_000L, includeDepth = false).first)
+                assertTrue("feature view $view", if (dense) source.emitSphereFeatureFrame(timestamp, view)
+                    else source.emitSphereView(view, timestamp, timestamp + 250_000_000L, includeDepth = false).first)
                 runtime.awaitDebugFixtureIdle()
                 acknowledgeMaterialCut()
-                if (view in depthViews) {
-                    clock.set(timestamp + 250_000_000L)
-                    assertTrue("depth view $view", source.emitSphereView(view, timestamp,
-                        timestamp + 250_000_000L, includeFeature = false).second)
+                repeat(if (dense) 4 else 1) { observation ->
+                    val depthTimestamp = timestamp + 250_000_000L + observation * 1_500_000_000L
+                    clock.set(depthTimestamp)
+                    assertTrue("depth view $view", if (dense) source.emitSphereDepthGrid(depthTimestamp, view)
+                        else source.emitSphereView(view, timestamp, timestamp + 250_000_000L, includeFeature = false).second)
                     runtime.awaitDebugFixtureIdle()
                     acknowledgeMaterialCut()
+                    if (!dense || observation == 3) rowCounts.add(projection.currentRowCount())
+                    if (dense) {
+                        val snapshot = checkNotNull(rendered)
+                        for (row in 0 until snapshot.count) {
+                            val offset = row * 3
+                            val x = snapshot.positions[offset].toDouble()
+                            val y = snapshot.positions[offset+1].toDouble()
+                            val z = snapshot.positions[offset+2].toDouble()
+                            assertTrue("view $view surface $row position $x,$y,$z radius ${kotlin.math.sqrt(x*x+y*y+z*z)} must remain on surrounding shell", kotlin.math.abs(kotlin.math.sqrt(x*x+y*y+z*z)-2.0) < .15)
+                        }
+                    }
                     admittedDepths++
                     assertEquals("depth view $view status ${integration.integrationReceipt().status} lookup ${integration.depthLookupReceipt()}",
                         admittedDepths, runtime.snapshot().admittedDepthObservations)
@@ -1111,10 +1269,38 @@ class VisibilityGridIntegrationTest {
             val receipt = integration.integrationReceipt()
             assertTrue("surface count ${receipt.rendererRows}", receipt.rendererRows > 100)
             assertTrue(projection.currentRowCount() > 100)
-            assertTrue(integration.pressureSnapshot().associationHighWater > 1_000)
+            assertTrue(integration.pressureSnapshot().associationHighWater > if (dense) 50 else 1_000)
             assertEquals(SYNTHETIC_SPHERE_VIEW_COUNT.toLong(), runtime.snapshot().admittedFeatureObservations)
-            assertEquals(depthViews.size.toLong(), runtime.snapshot().admittedDepthObservations)
+            assertEquals(depthViews.size.toLong() * if (dense) 4L else 1L, runtime.snapshot().admittedDepthObservations)
             assertTrue(acknowledgedTransaction > SYNTHETIC_SPHERE_VIEW_COUNT)
+            if (dense) {
+                assertTrue(rowCounts.last() > rowCounts.first() * 3)
+                assertTrue(rowCounts.toSet().size >= 10)
+                val snapshot = checkNotNull(rendered)
+                val extrema = DoubleArray(6)
+                for (row in 0 until snapshot.count) for (axis in 0..2) {
+                    val value = snapshot.positions[row*3+axis].toDouble()
+                    extrema[axis*2] = maxOf(extrema[axis*2], value)
+                    extrema[axis*2+1] = maxOf(extrema[axis*2+1], -value)
+                }
+                assertTrue("all six surrounding directions must be fused", extrema.all { it > 1.85 })
+                var previousRows = projection.currentRowCount()
+                repeat(3) { revisit ->
+                    val timestamp = 124_000_000_000L + revisit * 3_000_000_000L
+                    clock.set(timestamp)
+                    val beforeView = checkNotNull(rendered)
+                    val beforeKeys = beforeView.keys.take(beforeView.count).toSet()
+                    assertTrue(source.emitSphereDepthGrid(timestamp, 0))
+                    runtime.awaitDebugFixtureIdle()
+                    acknowledgeMaterialCut()
+                    val afterView = checkNotNull(rendered)
+                    val afterKeys = afterView.keys.take(afterView.count).toSet()
+                    assertEquals("revisit $revisit must not stack surfaces in one voxel", afterView.count, afterKeys.size)
+                    assertTrue("confirmed revisit $revisit must not invent new shell cells", afterKeys.minus(beforeKeys).isEmpty())
+                    assertTrue(projection.currentRowCount() <= previousRows)
+                    previousRows = projection.currentRowCount()
+                }
+            }
         } finally {
             runtime.close()
             mapperExecutor.shutdownNow()
@@ -1591,6 +1777,10 @@ class VisibilityGridIntegrationTest {
 
             val replacementOwnership = requireNotNull(binding.currentObservationOwnership())
             assertTrue(replacementOwnership.bindingGeneration > originalOwnership.bindingGeneration)
+            val reboundHealth = integration.snapshot()
+            assertEquals(replacementOwnership.bindingGeneration, reboundHealth.rolloverBindingGeneration)
+            assertEquals(replacementOwnership.groupGeneration, reboundHealth.rolloverGroupGeneration)
+            assertEquals(replacementOwnership.lifecycleSequence, reboundHealth.rolloverLifecycleSequence)
             assertEquals("rendererRebound", integration.integrationReceipt().status)
             assertEquals(0, integration.integrationReceipt().transactionId)
             assertEquals(renderedCountBeforeReplacement, rendered.size)
@@ -1656,6 +1846,12 @@ class VisibilityGridIntegrationTest {
             )
             val secondOwnership = requireNotNull(binding.currentObservationOwnership())
             assertTrue(secondOwnership.bindingGeneration > replacementOwnership.bindingGeneration)
+            val secondHealth = integration.snapshot()
+            assertEquals(secondOwnership.bindingGeneration, secondHealth.rolloverBindingGeneration)
+            assertEquals(secondOwnership.groupGeneration, secondHealth.rolloverGroupGeneration)
+            assertEquals(secondOwnership.lifecycleSequence, secondHealth.rolloverLifecycleSequence)
+            assertEquals(reboundHealth.admittedFeatures, secondHealth.admittedFeatures)
+            assertEquals(reboundHealth.admittedDepths, secondHealth.admittedDepths)
             assertEquals("rendererRebound", integration.integrationReceipt().status)
             assertEquals(0, integration.integrationReceipt().transactionId)
             assertEquals(3, projection.pressureRevisions().styleRevision)
@@ -3592,7 +3788,7 @@ class VisibilityGridIntegrationTest {
                 assertEquals("rendererRebuildPending", replacement.integrationReceipt().status)
                 assertEquals(0, replacement.integrationReceipt().committed)
                 replacement.portableOwnerMemoryReceipt().let { memory ->
-                    assertEquals(364L, memory.integrationObjectBytes)
+                    assertEquals(344L, memory.integrationObjectBytes)
                     assertEquals(64L, memory.pendingRendererRebuildBytes)
                     assertEquals(
                         listOf(

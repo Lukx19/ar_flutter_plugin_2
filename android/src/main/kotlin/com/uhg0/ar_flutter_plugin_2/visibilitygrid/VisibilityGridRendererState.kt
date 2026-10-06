@@ -169,6 +169,45 @@ class VisibilityGridRendererState(
     private var targetDirectionIndexValue: Int? = null
     private var lastStyleCut: QualifiedRendererStyleCut? = null
 
+    // Descriptor pages use frozen geometry and an atomic committed-cut fence.
+    // They never wait for the mutable row monitor on the camera/render thread.
+    @Volatile private var readableCut: DescriptorReadCut? = null
+    private var geometryPageEpoch = 0L
+    private var cachedGeometryPage: FrozenGeometryPage? = null
+    internal var geometryPageBuildCount = 0L
+        private set
+
+    private data class DescriptorReadCut(
+        val binding: Long, val group: Long, val transaction: Long,
+        val geometry: Long, val style: Long, val geometryPageEpoch: Long,
+    ) {
+        fun matches(expected: CoverageRowsQualifier, epoch: Long): Boolean =
+            binding == expected.bindingGeneration && group == expected.groupGeneration &&
+                transaction == expected.transactionId && geometry == expected.geometryRevision &&
+                style == expected.styleRevision && geometryPageEpoch == epoch
+    }
+
+    private class FrozenGeometryPage(
+        val epoch: Long, val sourceSlots: IntArray, val positions: FloatArray,
+    ) {
+        val portableBytes: Long get() = 64L + sourceSlots.size.toLong() * Int.SIZE_BYTES + positions.size.toLong() * Float.SIZE_BYTES
+    }
+
+    internal val retainedPresentationGeometryBytes: Long
+        @Synchronized get() = cachedGeometryPage?.portableBytes ?: 0L
+
+    private fun invalidateGeometryPage() {
+        geometryPageEpoch++
+        cachedGeometryPage = null
+    }
+
+    private fun publishReadableCut() {
+        readableCut = if (group == null || disposed) null else DescriptorReadCut(
+            installedOwnership?.bindingGeneration ?: 0L, installedGroupGeneration,
+            installedTransactionId, geometryRevision, styleRevision, geometryPageEpoch,
+        )
+    }
+
     val freeRowCount: Int
         @Synchronized get() = capacity - count
 
@@ -257,6 +296,8 @@ class VisibilityGridRendererState(
         installedGroupId = nextOwnership.captureGroupId
         installedGroupGeneration = nextOwnership.groupGeneration
         installedTransactionId = 0L
+        invalidateGeometryPage()
+        publishReadableCut()
         return true
     }
 
@@ -372,6 +413,7 @@ class VisibilityGridRendererState(
         dirtyRows.addRange(count)
         resetUpload = true
         renderRevision++
+        publishReadableCut()
     }
 
     /**
@@ -405,6 +447,7 @@ class VisibilityGridRendererState(
         dirtyRows.addRange(count)
         resetUpload = true
         renderRevision++
+        publishReadableCut()
     }
 
     @Synchronized
@@ -467,6 +510,7 @@ class VisibilityGridRendererState(
         }
         geometryRevision = revision
         renderRevision++
+        publishReadableCut()
         return true
     }
 
@@ -511,6 +555,7 @@ class VisibilityGridRendererState(
         dirtyRows.addRange(count)
         resetUpload = true
         renderRevision++
+        publishReadableCut()
     }
 
     /**
@@ -525,6 +570,7 @@ class VisibilityGridRendererState(
         require(count + rows.size <= capacity)
         require(rows.map { it.surfaceId }.toSet().size == rows.size)
         rows.forEach(::admitCandidate)
+        publishReadableCut()
     }
 
     /** Applies one V2 geometry delta without treating a voxel coordinate as identity. */
@@ -575,6 +621,7 @@ class VisibilityGridRendererState(
         invalidateStyleCutAfterGeometryChange(reset)
         geometryRevision = revision
         renderRevision++
+        publishReadableCut()
         return true
     }
 
@@ -629,6 +676,7 @@ class VisibilityGridRendererState(
         }
         visibilityRevision = nextVisibilityRevision
         renderRevision++
+        publishReadableCut()
         return true
     }
 
@@ -823,6 +871,7 @@ class VisibilityGridRendererState(
         targetDirectionIndexValue = candidate.targetDirectionIndex
         lastStyleCut = candidate
         renderRevision++
+        publishReadableCut()
         return RendererStyleCutResult.Applied(
             styleRevision = candidate.styleRevision,
             targetRevision = candidate.targetRevision,
@@ -837,6 +886,7 @@ class VisibilityGridRendererState(
         if (enabled == value) return
         enabled = value
         renderRevision++
+        publishReadableCut()
     }
 
     @Synchronized
@@ -845,6 +895,7 @@ class VisibilityGridRendererState(
         if (mode == value) return
         mode = value
         renderRevision++
+        publishReadableCut()
     }
 
     @Synchronized
@@ -899,9 +950,9 @@ class VisibilityGridRendererState(
     }
 
     /**
-     * Publishes only bounded presentation metadata.  Geometry/color values
-     * stay in this qualifier-fenced state and are copied one <=512-row page
-     * at a time by the returned descriptor.
+     * Publishes bounded metadata and immutable geometry shared by style cuts.
+     * GPU pages copy frozen positions without borrowing the mutable row monitor;
+     * an atomic committed-cut fence rejects superseded or disposed descriptors.
      */
     @Synchronized
     internal fun presentationDescriptor(
@@ -934,22 +985,31 @@ class VisibilityGridRendererState(
                 styles[styleOffset + 2] = ((styles[styleOffset + 2].toInt() and 0xf0) or palette.code).toByte()
             }
         }
-        val pageReader = PresentationPageReader { pageExpected, start, pageCount, mapping, destination ->
-            var copied = false
-            val accepted = withCommittedRows(pageExpected) { rows ->
-                repeat(pageCount) { offset ->
-                    val source = mapping.sourceSlotAt(start + offset)
-                    if (source !in 0 until rows.count || rows.surfaceIdAt(source) != mapping.surfaceIdAt(start + offset)) {
-                        return@withCommittedRows
-                    }
-                    destination.surfaceIds[offset] = rows.surfaceIdAt(source)
-                    destination.positions[offset * 3] = rows.positionComponentAt(source, 0)
-                    destination.positions[offset * 3 + 1] = rows.positionComponentAt(source, 1)
-                    destination.positions[offset * 3 + 2] = rows.positionComponentAt(source, 2)
+        val geometry = cachedGeometryPage?.takeIf {
+            it.epoch == geometryPageEpoch && it.sourceSlots.contentEquals(slots)
+        } ?: FrozenGeometryPage(geometryPageEpoch, slots, FloatArray(boundedCount * 3).also { frozen ->
+            repeat(boundedCount) { destination ->
+                val source = slots[destination]
+                repeat(3) { component ->
+                    frozen[destination * 3 + component] = positionComponent(source, component)
                 }
-                copied = true
             }
-            accepted && copied
+        }).also {
+            cachedGeometryPage = it
+            geometryPageBuildCount++
+        }
+        val pageReader = PresentationPageReader { pageExpected, start, pageCount, mapping, destination ->
+            if (readableCut?.matches(pageExpected, geometry.epoch) != true) {
+                false
+            } else {
+                repeat(pageCount) { offset ->
+                    destination.surfaceIds[offset] = mapping.surfaceIdAt(start + offset)
+                }
+                geometry.positions.copyInto(destination.positions, 0, start * 3, (start + pageCount) * 3)
+                // Recheck after copying: a newer committed cut or disposal
+                // cannot authorize an old descriptor's upload.
+                readableCut?.matches(pageExpected, geometry.epoch) == true
+            }
         }
         return BoundedCoveragePresentation.createOwned(
             qualifier = expected,
@@ -968,6 +1028,7 @@ class VisibilityGridRendererState(
             update = update ?: nextUpdate(),
             workspace = presentationWorkspace,
             pageReader = pageReader,
+            geometryBackingBytes = geometry.portableBytes,
         )
     }
 
@@ -977,6 +1038,7 @@ class VisibilityGridRendererState(
         resetUpload = true
         dirtyRows.addRange(count)
         renderRevision++
+        publishReadableCut()
     }
 
     @Synchronized
@@ -995,6 +1057,7 @@ class VisibilityGridRendererState(
         ignoredVisibilityKeyCount = 0
         resetUpload = true
         renderRevision++
+        publishReadableCut()
     }
 
     @Synchronized
@@ -1011,6 +1074,7 @@ class VisibilityGridRendererState(
         normalConfidence: Int = 0,
         lineageCount: Int = 0,
     ) {
+        invalidateGeometryPage()
         check(count < capacity)
         val row = count++
         surfaceIds[row] = identity
@@ -1073,6 +1137,7 @@ class VisibilityGridRendererState(
     }
 
     private fun updateGeometry(slot: Int, next: CanonicalRenderRow) {
+        invalidateGeometryPage()
         val changed = voxelKeys[slot] != next.voxelKey ||
             (retainCanonicalNormalMetadata &&
                 (packedNormals[slot] != next.packedNormal ||
@@ -1099,6 +1164,7 @@ class VisibilityGridRendererState(
     }
 
     private fun remove(identity: Long) {
+        invalidateGeometryPage()
         val row = rowsByIdentity.remove(identity) ?: return
         if (targetSurfaceIdValue == identity) {
             targetSurfaceIdValue = null
@@ -1239,6 +1305,8 @@ class VisibilityGridRendererState(
     }
 
     private fun clearRows() {
+        readableCut = null
+        invalidateGeometryPage()
         surfaceIds.fill(0)
         voxelKeys.fill(0)
         packedNormals.fill(0)

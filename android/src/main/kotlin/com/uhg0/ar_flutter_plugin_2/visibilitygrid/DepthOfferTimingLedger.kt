@@ -94,10 +94,10 @@ internal class DepthOfferTimingLedger(private val nanoTime: () -> Long = System:
     private fun matching(id: Long): Int? = if (id > 0 && ids[slot(id)] == id) slot(id) else null
 
     companion object {
-        const val CAPACITY = 64
+        const val CAPACITY = 128
         // Seven long columns, one int column, array headers, owner references/scalars.
         // Synthetic fixture instrumentation only; absent from the production owner budget.
-        const val PORTABLE_BYTES = 64L * (7 * 8 + 4) + 8 * 24 + 104
+        const val PORTABLE_BYTES = CAPACITY.toLong() * (7 * 8 + 4) + 8 * 24 + 104
         const val QUEUED = 0
         const val ADMITTING = 1
         const val DEFERRED = 2

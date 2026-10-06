@@ -435,6 +435,7 @@ internal class SharedCameraManager(
                     captureLatencyLog(
                         "camera_capture_started",
                         directTag.qualifier.identity.attemptId,
+                        exposureTimestampNs = timestamp,
                     )
                     return
                 }
@@ -897,10 +898,26 @@ internal class SharedCameraManager(
         directRawJpegCaptureCorrelator.clear()
     }
 
-    private fun captureLatencyLog(stage: String, attemptId: String) {
+    private fun captureLatencyLog(stage: String, attemptId: String, exposureTimestampNs: Long? = null) {
+        val sensorFields = if (exposureTimestampNs != null) {
+            val realtime = activeCameraCharacteristics?.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) ==
+                CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME
+            // Bracket the elapsed clock with both monotonic clocks. Android
+            // pointer event time is uptime-based; the interval preserves its
+            // millisecond quantization instead of using a delayed log timestamp.
+            val uptimeBeforeMs = SystemClock.uptimeMillis()
+            val monotonicBeforeNs = System.nanoTime()
+            val elapsedSampleNs = SystemClock.elapsedRealtimeNanos()
+            val monotonicAfterNs = System.nanoTime()
+            val uptimeAfterMs = SystemClock.uptimeMillis()
+            " exposureTimestampNs=$exposureTimestampNs sensorClock=${if (realtime) "elapsedRealtime" else "unqualified"}" +
+                " clockSampleElapsedNs=$elapsedSampleNs" +
+                " clockSampleMonotonicBeforeNs=$monotonicBeforeNs clockSampleMonotonicAfterNs=$monotonicAfterNs" +
+                " clockSampleUptimeBeforeMs=$uptimeBeforeMs clockSampleUptimeAfterMs=$uptimeAfterMs"
+        } else ""
         Log.i(
             "CaptureLatency",
-            "stage=$stage attemptId=$attemptId elapsedRealtimeNs=${SystemClock.elapsedRealtimeNanos()}",
+            "stage=$stage attemptId=$attemptId elapsedRealtimeNs=${SystemClock.elapsedRealtimeNanos()}$sensorFields",
         )
     }
 

@@ -1,5 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
+import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageRendererSelectionConfig
+import com.uhg0.ar_flutter_plugin_2.sceneview.CoverageRendererSelectionStrategy
 import io.flutter.plugin.common.MethodChannel
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
@@ -869,6 +871,14 @@ class VisibilitySmallSceneDebugChannelTest {
             assertTrue((wall["acceptedDepthObservations"] as Long) > 0L)
             assertEquals(0L, wall["rootIsolateSurfaceBytes"])
             assertEquals(0L, wall["rootIsolateImageBytes"])
+            assertEquals(
+                CoverageRendererSelectionConfig.strategy == CoverageRendererSelectionStrategy.QUALIFIED_REUSE,
+                wall["rendererSelectionReuse"],
+            )
+            assertEquals(
+                CoverageRendererSelectionConfig.strategy.name,
+                wall["rendererSelectionStrategy"],
+            )
             assertTrue(wall.values.all { it == null || it is String || it is Number || it is Boolean })
 
             val replay = invoke(

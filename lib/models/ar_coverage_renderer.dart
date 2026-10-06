@@ -107,19 +107,31 @@ final class ARCoverageRendererStyleRowV1 {
 
   Uint8List encode() {
     final bytes = Uint8List(coverageRendererStyleRowV1Bytes);
-    final data = ByteData.sublistView(bytes);
-    bytes[0] = 1;
-    bytes[1] = semantic.index |
-        coverage.index << 2 |
-        residency.index << 4 |
-        target.index << 6;
-    bytes[2] = palette.index | cut.index << 4;
-    bytes[3] = glyph.index | age.index << 2 | sourceHealth.index << 4;
-    bytes[4] = directionBin;
-    data.setUint16(6, lineageCount, Endian.little);
-    data.setUint32(8, semanticGeneration, Endian.little);
-    data.setUint32(12, styleGeneration, Endian.little);
+    encodeInto(ByteData.sublistView(bytes));
     return bytes;
+  }
+
+  /// Writes one complete row into caller-owned storage without temporary arrays.
+  void encodeInto(ByteData destination, {int offset = 0}) {
+    if (offset < 0 ||
+        destination.lengthInBytes - offset < coverageRendererStyleRowV1Bytes) {
+      throw RangeError('Coverage renderer style destination cannot fit a row.');
+    }
+    destination.setUint8(offset, 1);
+    destination.setUint8(
+        offset + 1,
+        semantic.index |
+            coverage.index << 2 |
+            residency.index << 4 |
+            target.index << 6);
+    destination.setUint8(offset + 2, palette.index | cut.index << 4);
+    destination.setUint8(
+        offset + 3, glyph.index | age.index << 2 | sourceHealth.index << 4);
+    destination.setUint8(offset + 4, directionBin);
+    destination.setUint8(offset + 5, 0);
+    destination.setUint16(offset + 6, lineageCount, Endian.little);
+    destination.setUint32(offset + 8, semanticGeneration, Endian.little);
+    destination.setUint32(offset + 12, styleGeneration, Endian.little);
   }
 
   static ARCoverageRendererStyleRowV1 decode(

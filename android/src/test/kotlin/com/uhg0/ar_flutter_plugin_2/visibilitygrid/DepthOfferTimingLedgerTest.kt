@@ -39,14 +39,14 @@ class DepthOfferTimingLedgerTest {
         }
     }
 
-    @Test fun `overflow retains exactly sixty four scalar entries and stale callbacks cannot alter new offers`() {
+    @Test fun `overflow retains exactly one hundred twenty eight scalar entries and stale callbacks cannot alter new offers`() {
         val ledger = DepthOfferTimingLedger { 1_000 }
-        repeat(65) { ledger.start(it.toLong()) }
+        repeat(129) { ledger.start(it.toLong()) }
         ledger.finish(1, DepthOfferTimingLedger.REPLACED)
         val snapshot = ledger.snapshot()
         val entries = snapshot["entries"] as List<*>
-        assertEquals(64, entries.size)
-        assertEquals(65L, snapshot["offeredCount"])
+        assertEquals(128, entries.size)
+        assertEquals(129L, snapshot["offeredCount"])
         assertEquals(1L, snapshot["overwrittenCount"])
         assertEquals(2L, (entries.first() as Map<*, *>)["offerId"])
         assertEquals("queued", (entries.last() as Map<*, *>)["status"])
