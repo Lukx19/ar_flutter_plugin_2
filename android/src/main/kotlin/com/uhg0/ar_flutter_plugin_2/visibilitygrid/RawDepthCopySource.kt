@@ -3,6 +3,8 @@ package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 interface RawDepthImage : AutoCloseable {
     val width: Int
     val height: Int
+    /** Zero is reserved for caller-provided pixel fixtures, never a qualified ARCore image. */
+    val timestampNs: Long get() = 0L
 
     fun unsignedValue(
         x: Int,
@@ -37,12 +39,18 @@ data class RawDepthFrameMetadata(
     val intrinsics: DepthIntrinsics,
     val worldFromCameraGl: DoubleArray,
     val imageOrientation: DepthImageOrientation = DepthImageOrientation.LANDSCAPE_RIGHT,
+    val arFrameTimestampNs: Long = timestampNs,
+    val confidenceTimestampNs: Long = 0L,
+    val sourceImageWidth: Int = width,
+    val sourceImageHeight: Int = height,
+    val acquisitionMode: DepthAcquisitionMode = DepthAcquisitionMode.PROVIDED,
 )
 
 sealed interface DepthAcquisitionResult {
     data class Observation(val value: DepthObservation) : DepthAcquisitionResult
 
     data object TransientUnavailable : DepthAcquisitionResult
+    data class Refused(val reason: DepthAcquisitionRefusal, val metadata: RawDepthFrameMetadata) : DepthAcquisitionResult
 
     data class Failure(val reason: String) : DepthAcquisitionResult
 }
@@ -55,6 +63,7 @@ internal sealed interface PackedDepthAcquisitionResult {
     ) : PackedDepthAcquisitionResult
 
     data object TransientUnavailable : PackedDepthAcquisitionResult
+    data class Refused(val reason: DepthAcquisitionRefusal, val metadata: RawDepthFrameMetadata) : PackedDepthAcquisitionResult
 
     data class Failure(val reason: String) : PackedDepthAcquisitionResult
 }
@@ -83,7 +92,10 @@ class RawDepthCopySource(
         return try {
             depth = acquirer.acquireDepth().also { onResourceAcquired() }
             confidence = acquirer.acquireConfidence()?.also { onResourceAcquired() }
-            val metadata = metadataForDimensions(depth.width, depth.height)
+            val metadata = acquiredDepthMetadata(metadataForDimensions(depth.width, depth.height), depth, confidence)
+            depthAcquisitionRefusal(metadata, depth, confidence)?.let {
+                return DepthAcquisitionResult.Refused(it, metadata)
+            }
             if (
                 (confidence != null && depth.width != confidence.width) ||
                 (confidence != null && depth.height != confidence.height) ||
@@ -129,7 +141,10 @@ class RawDepthCopySource(
         return try {
             depth = acquirer.acquireDepth().also { onResourceAcquired() }
             confidence = acquirer.acquireConfidence()?.also { onResourceAcquired() }
-            val metadata = metadataForDimensions(depth.width, depth.height)
+            val metadata = acquiredDepthMetadata(metadataForDimensions(depth.width, depth.height), depth, confidence)
+            depthAcquisitionRefusal(metadata, depth, confidence)?.let {
+                return PackedDepthAcquisitionResult.Refused(it, metadata)
+            }
             if (
                 (confidence != null && depth.width != confidence.width) ||
                 (confidence != null && depth.height != confidence.height) ||
@@ -337,6 +352,10 @@ class RawDepthCopySource(
                 intrinsics = metadata.intrinsics,
                 worldFromCameraGl = metadata.worldFromCameraGl.copyOf(),
                 imageOrientation = metadata.imageOrientation,
+                confidenceTimestampNs = metadata.confidenceTimestampNs,
+                sourceImageWidth = metadata.sourceImageWidth,
+                sourceImageHeight = metadata.sourceImageHeight,
+                acquisitionMode = metadata.acquisitionMode,
             ),
         )
     }

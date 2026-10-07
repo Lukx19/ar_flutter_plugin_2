@@ -78,6 +78,7 @@ internal object SampleLeasePoolPortableMemory {
         retainedColumnBytes: Long,
         outstanding: Int,
         closed: Boolean,
+        observationIncrementBytes: Long = 0L,
     ): Long {
         require(poolBytes >= 0L && retainedColumnBytes >= 0L && outstanding >= 0)
         // Closing the pool stops new leases and retires free columns, but the
@@ -89,7 +90,7 @@ internal object SampleLeasePoolPortableMemory {
             poolBytes,
             retainedColumnBytes,
             Math.multiplyExact(outstanding.toLong(), liveLeaseBytes()),
-            Math.multiplyExact(outstanding.toLong(), FROZEN_POSE_BYTES),
+            Math.multiplyExact(outstanding.toLong(), Math.addExact(FROZEN_POSE_BYTES, observationIncrementBytes)),
         ).fold(0L, Math::addExact)
     }
 }

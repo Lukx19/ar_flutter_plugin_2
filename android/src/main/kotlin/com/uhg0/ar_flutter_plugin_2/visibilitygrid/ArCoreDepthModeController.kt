@@ -25,6 +25,7 @@ class ArCoreDepthModeController(
         when (result) {
             is DepthAcquisitionResult.Observation -> consecutiveAutomaticFailures = 0
             DepthAcquisitionResult.TransientUnavailable -> Unit
+            is DepthAcquisitionResult.Refused -> Unit
             is DepthAcquisitionResult.Failure -> handleTerminalFailure()
         }
         return activeMode

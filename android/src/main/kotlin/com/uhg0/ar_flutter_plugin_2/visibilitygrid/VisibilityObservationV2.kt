@@ -264,6 +264,10 @@ internal class VisibilityDepthObservation(
     val sourceRejectedSamples: Int,
     val payloadBytes: Int,
     internal val packedSamples: BorrowedDepthSamples? = null,
+    val confidenceTimestampNs: Long = 0L,
+    val sourceImageWidth: Int = frame.intrinsics.imageWidth,
+    val sourceImageHeight: Int = frame.intrinsics.imageHeight,
+    val acquisitionMode: DepthAcquisitionMode = DepthAcquisitionMode.PROVIDED,
 ) : AutoCloseable {
     internal var debugOfferLedger: DepthOfferTimingLedger? = null
     internal var debugOfferId: Long = 0
@@ -311,6 +315,10 @@ internal class VisibilityDepthObservation(
             frame: VisibilityObservationFrame,
             packedSamples: BorrowedDepthSamples,
             sourceRejectedSamples: Int,
+            confidenceTimestampNs: Long = 0L,
+            sourceImageWidth: Int = frame.intrinsics.imageWidth,
+            sourceImageHeight: Int = frame.intrinsics.imageHeight,
+            acquisitionMode: DepthAcquisitionMode = DepthAcquisitionMode.PROVIDED,
         ): VisibilityDepthObservation {
             require(packedSamples.count > 0)
             return VisibilityDepthObservation(
@@ -320,6 +328,10 @@ internal class VisibilityDepthObservation(
                 sourceRejectedSamples = sourceRejectedSamples,
                 payloadBytes = DEPTH_FIXED_BYTES + packedSamples.count * DEPTH_SAMPLE_BYTES,
                 packedSamples = packedSamples,
+                confidenceTimestampNs = confidenceTimestampNs,
+                sourceImageWidth = sourceImageWidth,
+                sourceImageHeight = sourceImageHeight,
+                acquisitionMode = acquisitionMode,
             )
         }
     }
@@ -329,6 +341,10 @@ internal interface VisibilityObservationMapper : AutoCloseable {
     fun admitFeature(observation: VisibilityFeatureObservation)
 
     fun admitDepth(observation: VisibilityDepthObservation)
+
+    /** Capable mappers prepare on their existing worker; unsupported mappers refuse immediately. */
+    fun prepareDepthAcquisition(qualifier: DepthAcquisitionFunding, complete: (DepthAcquisitionPreparationResult) -> Unit) =
+        complete(DepthAcquisitionPreparationResult.REFUSED)
 
     /**
      * Gives a mapper with a retained latest-depth slot a chance to release

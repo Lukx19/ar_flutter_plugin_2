@@ -298,6 +298,7 @@ internal class DepthSamplesLeasePool(
             },
             outstanding = leasedCount(),
             closed = closed.get(),
+            observationIncrementBytes = DepthAcquisitionPortableMemory.OBSERVATION_INCREMENT_BYTES,
         ),
         portableMaximumOwnedBytes = Math.addExact(
             SampleLeasePoolPortableMemory.poolBytes(slotCount),
@@ -305,7 +306,7 @@ internal class DepthSamplesLeasePool(
                 maximumColumnBytes,
                 slotCount.toLong() * Math.addExact(
                     SampleLeasePoolPortableMemory.liveLeaseBytes(),
-                    SampleLeasePoolPortableMemory.FROZEN_POSE_BYTES,
+                    SampleLeasePoolPortableMemory.FROZEN_POSE_BYTES + DepthAcquisitionPortableMemory.OBSERVATION_INCREMENT_BYTES,
                 ),
             ),
         ),

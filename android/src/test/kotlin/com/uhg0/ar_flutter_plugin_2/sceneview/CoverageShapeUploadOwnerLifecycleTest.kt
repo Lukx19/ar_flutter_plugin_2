@@ -154,25 +154,44 @@ class CoverageShapeUploadOwnerLifecycleTest {
         assertTrue(fixture.uploads.inFlight)
         assertEquals(0, fixture.released)
         first.drainVertices(); first.drainIndices()
-        fixture.uploads.onFrame()
-        val second = uploader.pages.last()
-        assertEquals(2, uploader.pages.size)
-        assertTrue(second.ticket > first.ticket)
-        assertEquals(176, second.vertexCount)
-        assertEquals(0, second.indexCount)
-        second.assertBytesUnchanged()
-        first.completeWith(first.ticket)
-        second.completeWith(second.ticket + 1)
-        assertTrue(fixture.uploads.inFlight)
-        assertEquals(1, fixture.released)
-        assertTrue(fixture.completed.isEmpty())
-        second.assertBytesUnchanged()
-        second.drainVertices()
-        assertFalse(fixture.uploads.inFlight)
-        assertEquals(2, fixture.released)
-        assertEquals(listOf(mesh), fixture.completed)
-        second.completeWith(second.ticket)
-        assertEquals(2, fixture.released)
+        val vertices = mesh.vertexCount + mesh.pointCount
+        val indices = mesh.indexCount + mesh.pointCount
+        val pageCount = maxOf((vertices + 1023) / 1024, (indices + 4095) / 4096)
+        assertTrue(pageCount >= 2)
+        var previous = first
+        for (pageIndex in 1 until pageCount) {
+            fixture.uploads.onFrame()
+            val page = uploader.pages.last()
+            assertEquals(pageIndex + 1, uploader.pages.size)
+            assertTrue(page.ticket > previous.ticket)
+            assertEquals(minOf(vertices, pageIndex * 1024), page.vertexStart)
+            assertEquals(minOf(indices, pageIndex * 4096), page.indexStart)
+            assertEquals(minOf(1024, (vertices - pageIndex * 1024).coerceAtLeast(0)), page.vertexCount)
+            assertEquals(minOf(4096, (indices - pageIndex * 4096).coerceAtLeast(0)), page.indexCount)
+            page.assertBytesUnchanged()
+            previous.completeWith(previous.ticket)
+            page.completeWith(page.ticket + 1)
+            assertTrue(fixture.uploads.inFlight)
+            assertEquals(pageIndex, fixture.released)
+            assertTrue(fixture.completed.isEmpty())
+            page.assertBytesUnchanged()
+            if (page.verticesAccepted) {
+                page.drainVertices()
+                if (page.indicesAccepted) {
+                    assertTrue(fixture.uploads.inFlight)
+                    assertEquals(pageIndex, fixture.released)
+                }
+            }
+            if (page.indicesAccepted) page.drainIndices()
+            assertFalse(fixture.uploads.inFlight)
+            assertEquals(pageIndex + 1, fixture.released)
+            if (pageIndex == pageCount - 1) assertEquals(listOf(mesh), fixture.completed)
+            else assertTrue(fixture.completed.isEmpty())
+            page.completeWith(page.ticket)
+            assertEquals(pageIndex + 1, fixture.released)
+            previous = page
+        }
+        assertEquals(pageCount, fixture.released)
         assertEquals(listOf(mesh), fixture.completed)
     }
 
@@ -334,8 +353,9 @@ class CoverageShapeUploadOwnerLifecycleTest {
             IntArray(rows) { 0x2a2a }, IntArray(rows) { normalConfidence },
             IntArray(rows) { 0xff224400.toInt() or (selection.toInt() + it) },
             DoubleArray(16) { if (it % 5 == 0) 1.0 else 0.0 })
-        val geometry = CoverageGeometryBuffers(FloatArray(rows * (if (balls) 126 else 6) * 3),
-            IntArray(rows * if (balls) 126 else 6), IntArray(rows * if (balls) 456 else 12),
+        val geometry = CoverageGeometryBuffers(FloatArray(rows * (if (balls) 126 else CoveragePlanarPatchGeometry.MAX_VERTICES_PER_PATCH) * 3),
+            IntArray(rows * if (balls) 126 else CoveragePlanarPatchGeometry.MAX_VERTICES_PER_PATCH),
+            IntArray(rows * if (balls) 456 else CoveragePlanarPatchGeometry.MAX_INDICES_PER_PATCH),
             FloatArray(rows * 3), IntArray(rows))
         if (balls) CoverageDirectionalBallGeometry().write(input, CoverageDirectionalColors.unavailable(ids, 0xff999999.toInt()), geometry)
         else CoveragePlanarPatchGeometry().write(input, geometry)

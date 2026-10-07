@@ -204,15 +204,204 @@ class RendererAttributeHostPathTest {
         fixture.owner.dispose()
     }
 
+    @Test fun `attributed hide masks every primitive through renderer frames and delayed completion`() {
+        for (balls in listOf(false, true)) {
+            val fixture = Fixture(balls, 3, lowNormalRow = 2, deferUploads = true)
+            fixture.publish(1, 1)
+            val target = DrawTarget()
+            val descriptor = fixture.owner.presentationDescriptor() as PresentationDescriptor
+            val submittedMesh = fixture.reference()
+            assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, fixture.token, descriptor, null, true))
+            assertArrayEquals(intArrayOf(0, 3, 0, 0, 0), target.ranges)
+            assertTrue(target.layerVisible)
+            fixture.uploads.onFrame()
+            assertTrue(fixture.uploads.inFlight)
+            fixture.owner.setControls(CoverageRendererControls(false, fixture.mode, fixture.palette))
+            fixture.uploads.offer(null)
+            repeat(2) {
+                fixture.uploads.onFrame()
+                assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, fixture.token, descriptor,
+                    fixture.uploads.completedMesh, false))
+                target.assertHidden()
+            }
+            fixture.completeDelayedUpload()
+            assertFalse(fixture.uploads.inFlight)
+            assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, fixture.token, descriptor,
+                submittedMesh, false))
+            target.assertHidden()
+            fixture.owner.setControls(CoverageRendererControls(true, fixture.mode, fixture.palette))
+            fixture.publish(2, 1)
+            fixture.uploads.onFrame(); fixture.completeDelayedUpload()
+            val current = fixture.owner.presentationDescriptor() as PresentationDescriptor
+            val ready = checkNotNull(fixture.uploads.completedMesh)
+            assertTrue(CoverageAttributedDraw.apply(target, fixture.owner, fixture.token, current, ready, true))
+            assertTrue(target.layerVisible)
+            assertArrayEquals(intArrayOf(3, 0, ready.indexCount, ready.indexCount, if (balls) 0 else 1), target.ranges)
+            assertEquals(if (balls) 3 else 2, ready.shapeCount)
+            fixture.uploads.close(); fixture.owner.dispose()
+        }
+    }
+
+    @Test fun `old attributed generations and hidden mode changes cannot reopen drawable ranges`() {
+        val fixture = Fixture(false, 3, lowNormalRow = 2)
+        fixture.publish(1, 2); fixture.uploadUntilComplete()
+        val target = DrawTarget()
+        val oldToken = fixture.token
+        val oldDescriptor = fixture.owner.presentationDescriptor() as PresentationDescriptor
+        val oldMesh = checkNotNull(fixture.uploads.completedMesh)
+        assertTrue(CoverageAttributedDraw.apply(target, fixture.owner, oldToken, oldDescriptor, oldMesh, true))
+        fixture.owner.requestResourceReplacement()
+        assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, oldToken, oldDescriptor, oldMesh, true))
+        target.assertHidden()
+        fixture.owner.setControls(CoverageRendererControls(false, CoveragePresentationMode.DIRECTIONAL_BALLS, fixture.palette))
+        val successor = checkNotNull(fixture.owner.issueResourceToken())
+        fixture.owner.markResourceMounted(successor)
+        assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, successor,
+            fixture.owner.presentationDescriptor() as PresentationDescriptor, oldMesh, true))
+        target.assertHidden()
+        fixture.owner.setControls(CoverageRendererControls(true, CoveragePresentationMode.DIRECTIONAL_BALLS, fixture.palette))
+        val current = fixture.owner.presentationDescriptor() as PresentationDescriptor
+        assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, oldToken, oldDescriptor, oldMesh, true))
+        target.assertHidden()
+        // A prior patch mesh is never interpreted as current ball geometry.
+        assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, successor, current, oldMesh, true))
+        assertTrue(target.layerVisible)
+        assertArrayEquals(intArrayOf(0, current.count, 0, 0, 0), target.ranges)
+        fixture.owner.dispose()
+        assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, successor, current, oldMesh, true))
+        target.assertHidden()
+    }
+
+    @Test fun `current draw adapter keeps genuine point fallback and rejects stale descriptor completion`() {
+        val fixture = Fixture(false, 3, normalConfidence = 63)
+        fixture.publish(1, 0); fixture.uploadUntilComplete()
+        val target = DrawTarget()
+        val descriptor = fixture.owner.presentationDescriptor() as PresentationDescriptor
+        val ready = checkNotNull(fixture.uploads.completedMesh)
+        assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, fixture.token, descriptor, ready, true))
+        assertTrue(target.layerVisible)
+        assertArrayEquals(intArrayOf(3, 0, 0, 0, 3), target.ranges)
+        fixture.publish(2, 2)
+        assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, fixture.token, descriptor, ready, true))
+        target.assertHidden()
+        val current = fixture.owner.presentationDescriptor() as PresentationDescriptor
+        assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, fixture.token, current, ready, true))
+        assertArrayEquals(intArrayOf(0, 3, 0, 0, 0), target.ranges)
+        assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, fixture.token, current, ready, false))
+        target.assertHidden()
+        fixture.uploads.close(); fixture.owner.dispose()
+    }
+
+    @Test fun `ancestor hidden attributed draw retains own intent without ranges or shape credit`() {
+        val fixture = Fixture(false, 3, lowNormalRow = 2)
+        fixture.publish(1, 1); fixture.uploadUntilComplete()
+        val descriptor = fixture.owner.presentationDescriptor() as PresentationDescriptor
+        val ready = checkNotNull(fixture.uploads.completedMesh)
+        val target = DrawTarget().also { it.ancestorVisible = false }
+        fixture.owner.beginShapeMeasurementWindow()
+        val drawn = CoverageAttributedDraw.apply(target, fixture.owner, fixture.token, descriptor, ready,
+            true, renderableInstance = 1, parentVisible = false)
+        fixture.owner.recordShapeDrawState(fixture.token, drawn)
+        fixture.owner.recordShapeMeasurementFrame(System.nanoTime())
+        assertFalse(drawn)
+        assertTrue(target.ownVisible)
+        target.assertHidden()
+        fixture.owner.endShapeMeasurementWindow()
+        assertEquals(0L, fixture.owner.shapeMeasurementSnapshot()["shapeMeasurementMountedFrameCount"])
+        target.ancestorVisible = true
+        // Hierarchy visibility alone cannot restore geometry before a qualified renderer frame.
+        assertArrayEquals(intArrayOf(0, 0, 0, 0, 0), target.ranges)
+        assertTrue(CoverageAttributedDraw.apply(target, fixture.owner, fixture.token, descriptor, ready,
+            true, renderableInstance = 1, parentVisible = true))
+        assertTrue(target.layerVisible)
+        assertArrayEquals(intArrayOf(3, 0, ready.indexCount, ready.indexCount, 1), target.ranges)
+        fixture.uploads.close(); fixture.owner.dispose()
+    }
+
+    @Test fun `missing attributed renderable has zero ranges until a qualified mount and cannot credit late stale ownership`() {
+        val fixture = Fixture(true, 3)
+        fixture.publish(1, 2); fixture.uploadUntilComplete()
+        val descriptor = fixture.owner.presentationDescriptor() as PresentationDescriptor
+        val ready = checkNotNull(fixture.uploads.completedMesh)
+        val target = DrawTarget()
+        assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, fixture.token, descriptor, ready,
+            true, renderableInstance = 0))
+        assertTrue(target.ownVisible)
+        target.assertHidden()
+        assertTrue(CoverageAttributedDraw.apply(target, fixture.owner, fixture.token, descriptor, ready,
+            true, renderableInstance = 1))
+        assertTrue(target.layerVisible)
+        assertArrayEquals(intArrayOf(3, 0, ready.indexCount, ready.indexCount, 0), target.ranges)
+        fixture.owner.dispose()
+        assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, fixture.token, descriptor, ready,
+            true, renderableInstance = 1))
+        target.assertHidden()
+        assertFalse(target.ownVisible)
+        fixture.uploads.close()
+    }
+
+    private class DrawTarget : CoverageAttributedDrawTarget {
+        var ownVisible = false
+        var ancestorVisible = true
+        private var renderablePresent = false
+        val layerVisible: Boolean get() = ownVisible && ancestorVisible && renderablePresent
+        var ranges = intArrayOf(0, 0, 0, 0, 0)
+        override fun applyDrawState(pointStart: Int, pointCount: Int, triangleCount: Int,
+            fallbackStart: Int, fallbackCount: Int, visibleIntent: Boolean,
+            renderableInstance: Int): Boolean {
+            ranges = intArrayOf(pointStart, pointCount, triangleCount, fallbackStart, fallbackCount)
+            ownVisible = visibleIntent
+            renderablePresent = renderableInstance != 0
+            return layerVisible
+        }
+        fun assertHidden() {
+            assertFalse(layerVisible)
+            assertArrayEquals(intArrayOf(0, 0, 0, 0, 0), ranges)
+        }
+    }
+
+    @Test fun `rejected attribute candidate preserves completed shapes across equivalent descriptor replay`() {
+        val fixture = Fixture(false, 3, lowNormalRow = 2)
+        fixture.publish(1, 1); fixture.uploadUntilComplete()
+        val before = fixture.reference()
+        val token = fixture.token
+        val generation = fixture.owner.rendererGeometryStatus()["completedShapeSelectionGeneration"]
+        val target = DrawTarget()
+        var replayed = false
+        fixture.afterPageRead = {
+            fixture.afterPageRead = null
+            fixture.replay(1)
+            replayed = true
+        }
+        fixture.publish(1, 1, expectedCommit = "staleCut")
+        assertTrue(replayed)
+        assertTrue(before.available)
+        assertSame(before, fixture.reference())
+        assertSame(before, fixture.uploads.completedMesh)
+        assertEquals(token, fixture.owner.currentResourceToken())
+        assertEquals(generation, fixture.owner.rendererGeometryStatus()["completedShapeSelectionGeneration"])
+        assertEquals(1L, fixture.owner.rendererAttributeSnapshot()["accepted"])
+        assertTrue(CoverageAttributedDraw.apply(target, fixture.owner, token,
+            fixture.owner.presentationDescriptor() as PresentationDescriptor, before, true))
+        assertTrue(target.layerVisible)
+        assertArrayEquals(intArrayOf(3, 0, before.indexCount, before.indexCount, 1), target.ranges)
+        fixture.uploads.close(); fixture.owner.dispose()
+    }
+
     private class Fixture(val balls: Boolean, val rows: Int, val normalConfidence: Int = 200,
-        val palette: CoverageRendererPalette = CoverageRendererPalette.COVERAGE) {
+        val palette: CoverageRendererPalette = CoverageRendererPalette.COVERAGE,
+        val lowNormalRow: Int = -1, val deferUploads: Boolean = false) {
         val owner = NativeCoverageRendererOwner()
         var style = header(1)
         val mode = if (balls) CoveragePresentationMode.DIRECTIONAL_BALLS else CoveragePresentationMode.PLANAR_PATCHES
         var token: CoverageResourceToken
         var pages = 0
+        var afterPageRead: (() -> Unit)? = null
+        private var pendingCompletion: CoverageShapePageCompletion? = null
+        private var pendingTicket = 0L
         val uploads: CoverageShapeUploadOwner = CoverageShapeUploadOwner(CoverageShapePageUploader { _, _, _, _, _, _, ticket, done ->
-            pages++; done.complete(ticket)
+            pages++
+            if (deferUploads) { pendingCompletion = done; pendingTicket = ticket } else done.complete(ticket)
         }, { owner.presentationDescriptor()?.shapes === it && it.available },
             { owner.recordCompletedShapeUpload(token, it, uploadsReuse()) }, {})
         private fun uploadsReuse(): Boolean = uploads.completionWasReuse
@@ -256,10 +445,10 @@ class RendererAttributeHostPathTest {
                 pageReader = PresentationPageReader { _, first, count, mapping, page ->
                     repeat(count) { n -> page.surfaceIds[n] = mapping.surfaceIdAt(first+n)
                         page.positions[n*3] = (first+n)%20 * 0.1f; page.positions[n*3+1] = (first+n)/20 * 0.1f
-                        page.positions[n*3+2] = -2f }; true },
+                        page.positions[n*3+2] = -2f }; afterPageRead?.invoke(); true },
                 worldFromGroup = world, voxelSizeMeters = cellSize)
         }
-        fun publish(revision: Long, observationClass: Int) {
+        fun publish(revision: Long, observationClass: Int, expectedCommit: String = "accepted") {
             style = header(revision); install(revision)
             val request = RendererAttributeCodec.header(style, 1, 0, if (balls) 2 else 1,
                 if (palette == CoverageRendererPalette.DIRECTION) 2 else 1, 0)
@@ -273,17 +462,22 @@ class RendererAttributeHostPathTest {
             }
             val bytes = ByteArray(ids.size * 24); val data = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
             ids.forEachIndexed { index, id -> data.putLong(index*24,id).putShort(index*24+8,0)
-                bytes[index*24+10] = normalConfidence.toByte(); bytes[index*24+11] = 3
+                bytes[index*24+10] = (if (index == lowNormalRow) 63 else normalConfidence).toByte(); bytes[index*24+11] = 3
                 bytes[index*24+12] = observationClass.toByte() }
             val digest = RendererAttributeCodec.digest(selected, bytes)
             val pageCount = maxOf(1, (ids.size+667)/668)
             repeat(pageCount) { index -> val begin = index*668; val count = minOf(668,ids.size-begin)
                 assertEquals("accepted", (owner.exchangeRendererAttributes(selected.page(2,index,pageCount,begin,count,digest)
                     .encode(bytes,begin*24,count*24)) as Map<*,*>)["outcome"]) }
-            assertEquals("accepted", (owner.exchangeRendererAttributes(selected.page(3,0,0,0,0,digest).encode()) as Map<*,*>)["outcome"])
+            assertEquals(expectedCommit, (owner.exchangeRendererAttributes(selected.page(3,0,0,0,0,digest).encode()) as Map<*,*>)["outcome"])
             uploads.offer(reference())
         }
         fun uploadUntilComplete() { repeat(128) { uploads.onFrame() }; assertNotNull(uploads.completedMesh) }
+        fun completeDelayedUpload() {
+            val completion = checkNotNull(pendingCompletion)
+            pendingCompletion = null
+            completion.complete(pendingTicket)
+        }
     }
     private fun ByteArray.hex() = joinToString("") { "%02x".format(it.toInt() and 255) }
 }

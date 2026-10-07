@@ -543,12 +543,13 @@ internal class NativeCoverageRendererOwner(
         val mesh = try { PreparedCoverageShapes.build(descriptor, table) }
             catch (_: RuntimeException) { null }
         if (mesh == null) { shapeBodies.cancel(); return false }
-        val reference = shapeBodies.publish(mesh)
+        val matchingGeneration = shapeBodies.matchingContentGeneration(mesh)
         return synchronized(this) {
             if (disposed || lifecyclePaused || latestPresentationDescriptor !== descriptor ||
                 attributeAuthority?.invoke()?.let { table.header.styleMatches(it) } != true) {
-                shapeBodies.invalidate(); return@synchronized false
+                shapeBodies.cancel(); return@synchronized false
             }
+            val reference = shapeBodies.commit(mesh, matchingGeneration)
             latestPresentationDescriptor = descriptor.withAttributes(reference.header, reference)
             notifyPresentationChanged()
             true

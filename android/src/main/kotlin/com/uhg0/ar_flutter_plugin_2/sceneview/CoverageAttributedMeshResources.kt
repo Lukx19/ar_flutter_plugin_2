@@ -20,7 +20,7 @@ internal class CoverageAttributedMeshResources(
     private val owner: NativeCoverageRendererOwner,
     private val telemetry: RendererTelemetry,
     private val resourceBudget: CoverageShapeResourceBudget,
-) : CoverageVoxelMeshResources {
+) : CoverageVoxelMeshResources, CoverageAttributedDrawTarget {
     private val points = CoveragePointMeshResources(engine, capacity, telemetry, "coverage-attributed-points-${token.epoch}")
     private val balls = shape == CoveragePresentationMode.DIRECTIONAL_BALLS
     private val shapeCapacity = selectedCapacity.also { require(it in 1..if (balls) 256 else 4096) }
@@ -99,21 +99,29 @@ internal class CoverageAttributedMeshResources(
     }
 
     private fun applyDrawRanges() {
-        val node = node ?: return
-        val descriptor = descriptor ?: return
-        val ready = uploads.completedMesh
+        val node = node
+        val instance = if (node == null) 0 else engine.renderableManager.getInstance(node.entity)
+        val shapeVisible = CoverageAttributedDraw.apply(
+            this, owner, token, descriptor, uploads.completedMesh, !closed && drawEnabled,
+            instance, node?.parent?.isVisible != false,
+        )
+        owner.recordShapeDrawState(token, shapeVisible)
+    }
+
+    override fun applyDrawState(pointStart: Int, pointCount: Int, triangleCount: Int,
+        fallbackStart: Int, fallbackCount: Int, visibleIntent: Boolean,
+        renderableInstance: Int): Boolean {
+        val node = node ?: return false
         val manager = engine.renderableManager
-        val instance = manager.getInstance(node.entity)
-        if (instance == 0) return
-        val selected = if (ready == null) 0 else ready.header.total
-        manager.setGeometryAt(instance, 0, primitiveType, vertexBuffer, indexBuffer,
-            selected, (descriptor.count - selected).coerceAtLeast(0))
+        val instance = renderableInstance
+        if (instance == 0) return false
+        manager.setGeometryAt(instance, 0, primitiveType, vertexBuffer, indexBuffer, pointStart, pointCount)
         manager.setGeometryAt(instance, 1, RenderableManager.PrimitiveType.TRIANGLES,
-            shapeVertexBuffer, shapeIndexBuffer, 0, ready?.indexCount ?: 0)
+            shapeVertexBuffer, shapeIndexBuffer, 0, triangleCount)
         manager.setGeometryAt(instance, 2, RenderableManager.PrimitiveType.POINTS,
-            shapeVertexBuffer, shapeIndexBuffer, ready?.indexCount ?: 0, ready?.pointCount ?: 0)
-        node.isVisible = drawEnabled && descriptor.enabled && descriptor.count > 0
-        owner.recordShapeDrawState(token, node.isVisible && ready != null && ready.shapeCount > 0)
+            shapeVertexBuffer, shapeIndexBuffer, fallbackStart, fallbackCount)
+        node.isVisible = visibleIntent
+        return node.isVisible
     }
 
     override fun update(node: Node, snapshot: CoveragePointRenderSnapshot, materialInstance: MaterialInstance, pointSizePx: Float) =

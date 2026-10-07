@@ -36,6 +36,10 @@ data class DepthObservation(
     val intrinsics: DepthIntrinsics,
     val worldFromCameraGl: DoubleArray,
     val imageOrientation: DepthImageOrientation = DepthImageOrientation.LANDSCAPE_RIGHT,
+    val confidenceTimestampNs: Long = 0L,
+    val sourceImageWidth: Int = width,
+    val sourceImageHeight: Int = height,
+    val acquisitionMode: DepthAcquisitionMode = DepthAcquisitionMode.PROVIDED,
 ) {
     init {
         require(timestampNs >= 0)

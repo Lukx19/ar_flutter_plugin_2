@@ -47,22 +47,30 @@ internal class PreparedCoverageShapeOwner {
         } finally { gate.unlock() }
     }
     fun cancel() { gate.lock(); try { building = false } finally { gate.unlock() } }
-    fun publish(prepared: PreparedCoverageShapes): PreparedCoverageShapeReference {
+    fun matchingContentGeneration(prepared: PreparedCoverageShapes): Long {
         val previous: PreparedCoverageShapes?
+        val generation: Long
         gate.lock()
-        try { check(building); previous = body } finally { gate.unlock() }
+        try { check(building); previous = body; generation = currentContentGeneration } finally { gate.unlock() }
         // A producer may borrow the current immutable body while comparing.
         // The existing producer reservation funds both arrays; frames never
         // wait on this bounded comparison.
         val sameContent = previous != null && previous.header.shape == prepared.header.shape &&
             previous.header.color == prepared.header.color && identicalGeometry(previous.geometry, prepared.geometry)
         gate.lock()
+        try { return if (sameContent && body === previous && currentContentGeneration == generation) generation else 0 }
+        finally { gate.unlock() }
+    }
+    fun publish(prepared: PreparedCoverageShapes): PreparedCoverageShapeReference =
+        commit(prepared, matchingContentGeneration(prepared))
+
+    /** Constant-size commit after the renderer owner qualifies its exact descriptor. */
+    fun commit(prepared: PreparedCoverageShapes, matchingGeneration: Long): PreparedCoverageShapeReference {
+        gate.lock()
         try {
             check(building)
-            // Comparing the bounded candidate happens on the binding executor.
-            // Metadata may advance without restarting identical upload bytes.
-            val reused = sameContent && body === previous
-            val geometry = if (reused) previous!!.geometry else prepared.geometry
+            val reused = matchingGeneration != 0L && currentContentGeneration == matchingGeneration && body != null
+            val geometry = if (reused) body!!.geometry else prepared.geometry
             if (!reused) currentContentGeneration = ++contentSequence
             body = PreparedCoverageShapes(prepared.header, geometry)
             building = false; currentSelection = prepared.header.selectionGeneration

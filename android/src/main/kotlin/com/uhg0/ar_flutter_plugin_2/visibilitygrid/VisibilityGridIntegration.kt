@@ -33,6 +33,7 @@ private const val DEFERRED_DEPTH_OBSERVATION_OWNER_BYTES = 64L
 // the kernel's prepared/committed output and are already covered by its reserve.
 internal const val RETAINED_DEPTH_REFUSAL_RECEIPT_BYTES = 104L
 // Replace three mutable Long counters with one reference to the health owner.
+// Depth-acquisition fields are charged by their separate fixed reservation, not this base scalar layout.
 internal const val VISIBILITY_GRID_INTEGRATION_SCALAR_OWNER_BYTES = 344L
 // AtomicReference: 16 bytes. Immutable health: header + eleven Longs + Int + reference.
 internal const val VISIBILITY_GRID_ADMISSION_HEALTH_OWNER_BYTES = 128L
@@ -293,6 +294,7 @@ internal class VisibilityGridIntegration(
     private var associationHighWater = 0L
     private var canonicalOwnedBytesHighWater = 0L
     private var rendererAttributeReservationBytes = 0L
+    private val depthAcquisitionIdentityReservationBytes = DepthAcquisitionPortableMemory.RESERVATION_BYTES
     private val retainedDelta = ExactCurrentDeltaSource()
     @Volatile private var committed = 0L
     @Volatile private var rejected = 0L
@@ -738,6 +740,34 @@ internal class VisibilityGridIntegration(
         pendingDepthCommit?.let(::retentionReceipt)
     }
 
+    /** Prepares the fixed acquisition profile without making a frame wait for canonical work. */
+    override fun prepareDepthAcquisition(qualifier: DepthAcquisitionFunding, complete: (DepthAcquisitionPreparationResult) -> Unit) {
+        val epoch = admissionEpoch.get()
+        try {
+            executor.execute {
+                val result = try {
+                    synchronized(publicationGate) {
+                        val owner = ownership()?.takeIf { qualifier.matches(it) }
+                        if (owner == null || isFenced(owner) || admissionEpoch.get() != epoch) DepthAcquisitionPreparationResult.RETRYABLE else {
+                            synchronized(lock) {
+                                // A retained different cut must complete the existing rebind/rollover first.
+                                val opened = if (cut == null || cut == owner) ensureOpened(owner) else null
+                                if (opened == null || isFenced(owner)) DepthAcquisitionPreparationResult.RETRYABLE else {
+                                    check(DepthAcquisitionPortableMemory.MAXIMUM_INCREMENT_BYTES <= DepthAcquisitionPortableMemory.RESERVATION_BYTES)
+                                    if (rendererAttributeCanonicalCeilingBytes() > NATIVE_OWNER_LIMIT_BYTES - rendererAttributeReservationBytes) {
+                                        DepthAcquisitionPreparationResult.REFUSED
+                                    } else DepthAcquisitionPreparationResult.FUNDED
+                                }
+                            }
+                        }
+                    }
+                } catch (_: RuntimeException) { DepthAcquisitionPreparationResult.RETRYABLE }
+                // Runtime publication must not occur while holding mapper ownership locks.
+                complete(result)
+            }
+        } catch (_: RuntimeException) { complete(DepthAcquisitionPreparationResult.RETRYABLE) }
+    }
+
     /** Optional display work reserves the complete supported future profile.
      * Canonical/depth admission never waits for or refuses because of a display
      * table. An underfunded profile refuses only the optional sidecar. */
@@ -916,6 +946,7 @@ internal class VisibilityGridIntegration(
             coordinatorOwnerBytes = resources?.portableCoordinatorOwnerBytes() ?: 0,
             rendererOwnerBytes = renderer.portableOwnerBytes(),
             rendererAttributeReservationBytes = rendererAttributeReservationBytes,
+            depthAcquisitionIdentityReservationBytes = depthAcquisitionIdentityReservationBytes,
         )
     }
 
@@ -2243,6 +2274,7 @@ internal data class RuntimeOwnerMemoryReceipt(
     val coordinatorOwnerBytes: Long,
     val rendererOwnerBytes: Long,
     val rendererAttributeReservationBytes: Long = 0,
+    val depthAcquisitionIdentityReservationBytes: Long = 0,
 ) {
     val portableBytes: Long get() = listOf(
         integrationObjectBytes,
@@ -2257,6 +2289,7 @@ internal data class RuntimeOwnerMemoryReceipt(
         coordinatorOwnerBytes,
         rendererOwnerBytes,
         rendererAttributeReservationBytes,
+        depthAcquisitionIdentityReservationBytes,
     ).fold(0L, Math::addExact)
 }
 

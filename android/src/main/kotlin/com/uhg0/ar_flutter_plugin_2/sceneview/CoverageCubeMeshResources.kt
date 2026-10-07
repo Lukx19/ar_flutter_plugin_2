@@ -189,7 +189,7 @@ internal class CoverageCubeMeshResources(
                 ?: RendererUploadPageOrigin.ORDINARY,
             ticket,
         )
-        setDrawCount(node, page.totalCount)
+        setDrawCount(node, if (enabled) page.totalCount else 0)
         node.isVisible = enabled && page.totalCount > 0
     }
 

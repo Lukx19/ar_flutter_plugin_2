@@ -11,6 +11,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 internal sealed interface PreparedRawDepthResult {
     data class Ready(val frame: PreparedRawDepthFrame) : PreparedRawDepthResult
     data object TransientUnavailable : PreparedRawDepthResult
+    data class Refused(val reason: DepthAcquisitionRefusal, val metadata: RawDepthFrameMetadata) : PreparedRawDepthResult
     data class Failure(val reason: String) : PreparedRawDepthResult
 }
 
@@ -127,14 +128,13 @@ class ArCoreRawDepthSource(
             confidence = acquirer.acquireConfidence()?.let {
                 ManagedRawDepthImage(it, onResourceClosed).also { onResourceAcquired() }
             }
-            if ((confidence != null && depth.width != confidence.width) ||
-                (confidence != null && depth.height != confidence.height)
-            ) {
-                PreparedRawDepthResult.Failure("mismatched depth image dimensions")
+            val metadata = acquiredDepthMetadata(metadata(
+                frame, groupGeneration, sessionGeneration, depth.width, depth.height,
+            ), depth, confidence)
+            val refusal = depthAcquisitionRefusal(metadata, depth, confidence)
+            if (refusal != null) {
+                PreparedRawDepthResult.Refused(refusal, metadata)
             } else {
-                val metadata = metadata(
-                    frame, groupGeneration, sessionGeneration, depth.width, depth.height,
-                )
                 accepted = true
                 PreparedRawDepthResult.Ready(
                     PreparedRawDepthFrame(
@@ -190,6 +190,10 @@ class ArCoreRawDepthSource(
             ),
             worldFromCameraGl = DoubleArray(16) { pose[it].toDouble() },
             imageOrientation = DepthImageOrientation.LANDSCAPE_RIGHT,
+            arFrameTimestampNs = frame.timestamp,
+            sourceImageWidth = imageDimensions[0],
+            sourceImageHeight = imageDimensions[1],
+            acquisitionMode = if (depthMode == Config.DepthMode.AUTOMATIC) DepthAcquisitionMode.AUTOMATIC else DepthAcquisitionMode.RAW,
         )
     }
 }
@@ -199,6 +203,7 @@ private class ManagedRawDepthImage(
     private val onClosed: () -> Unit,
 ) : RawDepthImage {
     private val closed = AtomicBoolean(false)
+    override val timestampNs get() = delegate.timestampNs
     override val width get() = delegate.width
     override val height get() = delegate.height
     override fun unsignedValue(x: Int, y: Int) = delegate.unsignedValue(x, y)
@@ -259,6 +264,7 @@ private class AndroidRawDepthImage(
         ?: error("raw depth image must have exactly one plane")
     private val buffer = plane.buffer.duplicate().order(ByteOrder.LITTLE_ENDIAN)
 
+    override val timestampNs: Long get() = image.timestamp
     override val width: Int = image.width
     override val height: Int = image.height
 

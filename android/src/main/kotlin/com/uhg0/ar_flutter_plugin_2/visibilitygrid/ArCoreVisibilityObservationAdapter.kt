@@ -52,10 +52,15 @@ internal sealed interface VisibilityDepthCopyResult {
             ),
             packedSamples = lease.samples,
             sourceRejectedSamples = lease.samples.rejectedCount,
+            confidenceTimestampNs = metadata.confidenceTimestampNs,
+            sourceImageWidth = metadata.sourceImageWidth,
+            sourceImageHeight = metadata.sourceImageHeight,
+            acquisitionMode = metadata.acquisitionMode,
         )
     }
 
     data object TransientUnavailable : VisibilityDepthCopyResult
+    data class Refused(val reason: DepthAcquisitionRefusal, val metadata: RawDepthFrameMetadata) : VisibilityDepthCopyResult
 
     data class Rejected(val reason: String) : VisibilityDepthCopyResult
 }
@@ -63,6 +68,7 @@ internal sealed interface VisibilityDepthCopyResult {
 internal sealed interface PreparedVisibilityDepthResult {
     data class Ready(val frame: PreparedVisibilityDepthFrame) : PreparedVisibilityDepthResult
     data object TransientUnavailable : PreparedVisibilityDepthResult
+    data class Refused(val reason: DepthAcquisitionRefusal, val metadata: RawDepthFrameMetadata) : PreparedVisibilityDepthResult
     data class Rejected(val reason: String) : PreparedVisibilityDepthResult
 }
 
@@ -371,6 +377,7 @@ internal class ArCoreVisibilityObservationAdapter(
                 )
             PackedDepthAcquisitionResult.TransientUnavailable ->
                 VisibilityDepthCopyResult.TransientUnavailable
+            is PackedDepthAcquisitionResult.Refused -> VisibilityDepthCopyResult.Refused(result.reason, result.metadata)
             is PackedDepthAcquisitionResult.Failure ->
                 VisibilityDepthCopyResult.Rejected(result.reason)
         }
@@ -398,6 +405,7 @@ internal class ArCoreVisibilityObservationAdapter(
             )
             PreparedRawDepthResult.TransientUnavailable ->
                 PreparedVisibilityDepthResult.TransientUnavailable
+            is PreparedRawDepthResult.Refused -> PreparedVisibilityDepthResult.Refused(result.reason, result.metadata)
             is PreparedRawDepthResult.Failure -> PreparedVisibilityDepthResult.Rejected(result.reason)
         }
     }
@@ -424,6 +432,7 @@ internal class ArCoreVisibilityObservationAdapter(
                 )
             PackedDepthAcquisitionResult.TransientUnavailable ->
                 VisibilityDepthCopyResult.TransientUnavailable
+            is PackedDepthAcquisitionResult.Refused -> VisibilityDepthCopyResult.Refused(result.reason, result.metadata)
             is PackedDepthAcquisitionResult.Failure ->
                 VisibilityDepthCopyResult.Rejected(result.reason)
         }
@@ -451,6 +460,7 @@ internal class ArCoreVisibilityObservationAdapter(
         )
         DepthAcquisitionResult.TransientUnavailable ->
             VisibilityDepthCopyResult.TransientUnavailable
+        is DepthAcquisitionResult.Refused -> VisibilityDepthCopyResult.Refused(result.reason, result.metadata)
         is DepthAcquisitionResult.Failure -> VisibilityDepthCopyResult.Rejected(result.reason)
     }
 
@@ -571,6 +581,10 @@ internal fun convertDepthObservationResult(
                     ),
                     samples = copied,
                     sourceRejectedSamples = source.sourceRejectedPixels,
+                    confidenceTimestampNs = source.confidenceTimestampNs,
+                    sourceImageWidth = source.sourceImageWidth,
+                    sourceImageHeight = source.sourceImageHeight,
+                    acquisitionMode = source.acquisitionMode,
                     payloadBytes = VisibilityDepthObservation.DEPTH_FIXED_BYTES +
                         copied.size * VisibilityDepthObservation.DEPTH_SAMPLE_BYTES,
                 ),
@@ -617,6 +631,11 @@ internal class ArCoreVisibilityObservationSource(
                     runtime.offerDepth(result.toObservation(), callbackCopyNs)
                 }
                 VisibilityDepthCopyResult.TransientUnavailable -> {
+                    runtime.recordDepthProcessingTransient()
+                    runtime.recordDepthTransientUnavailable()
+                }
+                is VisibilityDepthCopyResult.Refused -> {
+                    runtime.recordDepthAcquisitionRefusal(result.reason, result.metadata)
                     runtime.recordDepthProcessingTransient()
                     runtime.recordDepthTransientUnavailable()
                 }
@@ -681,6 +700,8 @@ internal class ArCoreVisibilityObservationSource(
         }
         synchronized(depthAdmissionLock) {
             if (!depthSuspended && depthIntakeAllowed()) {
+                if (capability == VisibilityDepthCapability.UNSUPPORTED) return@synchronized
+                if (!runtime.prepareDepthAcquisition(cut)) return@synchronized
                 if (!depthProcessor.canAccept()) {
                     runtime.recordDepthProcessorBusyDrop()
                     return@synchronized
@@ -702,6 +723,11 @@ internal class ArCoreVisibilityObservationSource(
                         }
                     }
                     PreparedVisibilityDepthResult.TransientUnavailable -> {
+                        runtime.recordDepthPreparationTransient()
+                        runtime.recordDepthTransientUnavailable()
+                    }
+                    is PreparedVisibilityDepthResult.Refused -> {
+                        runtime.recordDepthAcquisitionRefusal(result.reason, result.metadata)
                         runtime.recordDepthPreparationTransient()
                         runtime.recordDepthTransientUnavailable()
                     }

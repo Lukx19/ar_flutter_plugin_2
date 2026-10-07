@@ -78,6 +78,7 @@ import io.github.sceneview.loaders.ModelLoader
 import io.github.sceneview.model.ModelInstance
 import io.github.sceneview.model.model
 import io.github.sceneview.node.Node
+import io.github.sceneview.node.RenderableNode
 import io.github.sceneview.node.MeshNode
 import io.github.sceneview.rememberEngine
 import io.github.sceneview.rememberEnvironmentLoader
@@ -2052,7 +2053,7 @@ internal class SceneViewHost(
         private val beforeDestroy: () -> Unit,
         private val releaseResources: () -> Unit,
         private val releaseMaterial: () -> Unit,
-    ) : Node(engine) {
+    ) : RenderableNode(engine) {
         private var closed = false
         init {
             RenderableManager.Builder(3).boundingBox(boundingBox).culling(true)
@@ -2079,7 +2080,7 @@ internal class SceneViewHost(
         private val beforeDestroy: () -> Unit,
         private val releaseResources: () -> Unit,
         private val releaseMaterials: () -> Unit,
-    ) : Node(engine = engine) {
+    ) : RenderableNode(engine = engine) {
         private var coverageDestroyed = false
 
         init {
@@ -2111,7 +2112,6 @@ internal class SceneViewHost(
             if (coverageDestroyed) return
             coverageDestroyed = true
             beforeDestroy()
-            engine.renderableManager.destroy(entity)
             super.destroy()
             releaseResources()
             releaseMaterials()

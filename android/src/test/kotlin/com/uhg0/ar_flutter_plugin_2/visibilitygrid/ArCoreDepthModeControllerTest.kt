@@ -6,6 +6,19 @@ import org.junit.Test
 
 class ArCoreDepthModeControllerTest {
     @Test
+    fun `identity refusal remains transient without disabling automatic depth`() {
+        val controller = ArCoreDepthModeController(rawDepthSupported = true, automaticDepthSupported = true)
+        val metadata = RawDepthFrameMetadata(10, 1, 1, true, 4, 3,
+            DepthIntrinsics(2.0, 2.0, 1.5, 1.0), identityVisibilityGridTransform(),
+            arFrameTimestampNs = 20, acquisitionMode = DepthAcquisitionMode.AUTOMATIC)
+        repeat(5) {
+            assertEquals(Config.DepthMode.AUTOMATIC, controller.recordProbe(
+                DepthAcquisitionResult.Refused(DepthAcquisitionRefusal.STALE_AUTOMATIC, metadata)))
+        }
+        assertEquals(Config.DepthMode.AUTOMATIC, controller.recordProbe(DepthAcquisitionResult.Failure("first terminal")))
+    }
+
+    @Test
     fun `automatic predicted depth is preferred when both depth modes are supported`() {
         val controller =
             ArCoreDepthModeController(

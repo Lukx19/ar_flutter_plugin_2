@@ -685,8 +685,85 @@ class AndroidVisibilityGridRuntimeTest {
             assertEquals(VisibilitySourceHealth.TRANSIENT_UNAVAILABLE, health.featureHealth)
             assertEquals(VisibilitySourceHealth.FAILED, health.depthHealth)
             assertEquals("featureOnly", health.totalGridHealth)
-            assertTrue(health.toWireMap().size <= 64)
-            assertFalse(health.toWireMap().values.any { it is Collection<*> || it is ByteArray })
+            val expectedKeys = setOf(
+                "version", "offeredFeatureObservations", "offeredDepthObservations",
+                "droppedFeatureObservations", "droppedDepthObservations", "maximumFeatureSamples",
+                "maximumDepthSamples", "featureMaximumHz", "depthMaximumHz",
+                "featureHealth", "depthHealth", "depthCapability",
+                "totalGridHealth", "copiedFeatureObservations", "copiedDepthObservations",
+                "freshEstimateAdmissions", "staleAutomaticRefusals", "rawReprojectedAcquisitions",
+                "duplicateEstimateRefusals", "depthConfidencePairRefusals", "invalidImageTimestampRefusals",
+                "latestDepthImageTimestampNs", "latestDepthFrameTimestampNs", "latestDepthConfidenceTimestampNs",
+                "latestDepthSourceImageWidth", "latestDepthSourceImageHeight", "latestDepthImageWidth",
+                "latestDepthImageHeight", "latestDepthAcquisitionMode", "depthCalibrationQualification",
+                "admittedFeatureObservations", "admittedDepthObservations", "invalidFeatureObservations",
+                "invalidDepthObservations", "duplicateFeatureObservations", "duplicateDepthObservations",
+                "staleGenerationObservations", "replacedFeatureObservations", "replacedDepthObservations",
+                "featureTransientUnavailable", "depthTransientUnavailable", "featureFailures",
+                "depthFailures", "depthPreparationReady", "depthPreparationTransient",
+                "depthPreparationRejected", "depthProcessorBusyDrops", "depthProcessingTransient",
+                "depthProcessingRejected", "mappingRuntimeFailureCount", "lastMappingFailureClass",
+                "acquiredProducerResources", "closedProducerResources", "resourceBalance",
+                "residentPayloadBytes", "peakResidentPayloadBytes", "callbackCopyP95Ns",
+                "callbackCopyBudgetNs", "callbackCopyBudgetState", "callbackCopyBudgetBreaches",
+                "callbackCopyBudgetRecoveries", "callbackCopyDepthSheds", "callbackCopyFeatureSheds",
+                "captureSafe", "paused", "pausedObservationRejections",
+                "lifecycleDiscardedObservations", "pauseCount", "resumeCount",
+                "sameCutResumeCount", "ownershipRolloverCount", "rolloverDiscardedIngressObservations",
+                "admittedBindingGeneration", "admittedSessionGeneration", "admittedGroupGeneration",
+                "admittedLifecycleSequence", "admittedOperationGeneration", "syntheticSource",
+            )
+            assertEquals(78, expectedKeys.size)
+            // Known host metadata exercises scalar projection, not acquired SDK pixels.
+            val evidence = RawDepthFrameMetadata(timestampNs = 100, groupGeneration = 1, sessionGeneration = 1,
+                tracking = true, width = 4, height = 3, intrinsics = DepthIntrinsics(2.0, 2.0, 1.5, 1.0),
+                worldFromCameraGl = identityVisibilityGridTransform(), arFrameTimestampNs = 200,
+                confidenceTimestampNs = 90, sourceImageWidth = 8, sourceImageHeight = 6,
+                acquisitionMode = DepthAcquisitionMode.AUTOMATIC)
+            runtime.recordDepthAcquisitionRefusal(DepthAcquisitionRefusal.STALE_AUTOMATIC, evidence)
+            val wire = runtime.snapshot().toWireMap()
+            fun assertScalarSchema(values: Map<String, Any>) {
+                assertEquals(expectedKeys, values.keys)
+                assertTrue(values.values.all { it is Int || it is Long || it is Boolean || it is String })
+                assertTrue(values.values.filterIsInstance<String>().all { it.length <= 128 })
+                assertFalse(values.values.any { it is Collection<*> || it is ByteArray })
+            }
+            assertScalarSchema(wire)
+            val expectedAcquisition = mapOf(
+                "freshEstimateAdmissions" to 0L,
+                "staleAutomaticRefusals" to 1L,
+                "rawReprojectedAcquisitions" to 0L,
+                "duplicateEstimateRefusals" to 0L,
+                "depthConfidencePairRefusals" to 0L,
+                "invalidImageTimestampRefusals" to 0L,
+                "latestDepthImageTimestampNs" to 100L,
+                "latestDepthFrameTimestampNs" to 200L,
+                "latestDepthConfidenceTimestampNs" to 90L,
+                "latestDepthSourceImageWidth" to 8,
+                "latestDepthSourceImageHeight" to 6,
+                "latestDepthImageWidth" to 4,
+                "latestDepthImageHeight" to 3,
+                "latestDepthAcquisitionMode" to "AUTOMATIC",
+                "depthCalibrationQualification" to "legacyScaleUnverified",
+            )
+            assertEquals(15, expectedAcquisition.size)
+            assertEquals(expectedAcquisition, wire.filterKeys { it in expectedAcquisition })
+            repeat(128) {
+                runtime.recordProducerResourceAcquired()
+                runtime.recordProducerResourceClosed()
+                runtime.recordDepthAcquisitionRefusal(DepthAcquisitionRefusal.STALE_AUTOMATIC, evidence)
+            }
+            val grown = runtime.snapshot()
+            val grownWire = grown.toWireMap()
+            assertScalarSchema(grownWire)
+            assertEquals(0L, grown.resourceBalance)
+            assertEquals(131L, grown.acquiredProducerResources)
+            assertEquals(131L, grown.closedProducerResources)
+            assertEquals(129L, grownWire["staleAutomaticRefusals"])
+            assertEquals(0L, grown.residentPayloadBytes)
+            assertEquals(health.featureHealth, grown.featureHealth)
+            assertEquals(health.depthHealth, grown.depthHealth)
+            assertEquals(health.totalGridHealth, grown.totalGridHealth)
         } finally {
             runtime.close()
         }

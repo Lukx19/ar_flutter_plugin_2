@@ -53,9 +53,9 @@ internal class AndroidVisibilityGridRuntime(
     private var ingressDrainFailures = 0L
     private var ingressDrainFailed = false
     private val lifecycleLock = ReentrantReadWriteLock()
-    private var closed = false
+    @Volatile private var closed = false
     private var closeCompleted = false
-    private var paused = false
+    @Volatile private var paused = false
     private var pauseDrainPending = false
     private var lifecycleGeneration = 0L
     private val pauseDrainGate = java.util.concurrent.locks.ReentrantLock()
@@ -64,6 +64,27 @@ internal class AndroidVisibilityGridRuntime(
     private var depthLastCopiedTimestampNs = Long.MIN_VALUE
     private var featureLastCopyAttemptTimestampNs = Long.MIN_VALUE
     private var depthLastCopyAttemptTimestampNs = Long.MIN_VALUE
+    @Volatile private var depthAcquisitionFunding: DepthAcquisitionFunding? = null
+    private var depthAcquisitionPreparationPending = false
+    private var depthEstimateBindingGeneration = -1L
+    private var depthEstimateSessionGeneration = -1L
+    private var depthEstimateGroupGeneration = -1L
+    private var depthEstimateLifecycleSequence = -1L
+    private var depthEstimateOperationGeneration = -1L
+    private var freshEstimateAdmissions = 0L
+    private var staleAutomaticRefusals = 0L
+    private var rawReprojectedAcquisitions = 0L
+    private var duplicateEstimateRefusals = 0L
+    private var depthConfidencePairRefusals = 0L
+    private var invalidImageTimestampRefusals = 0L
+    private var latestDepthImageTimestampNs = 0L
+    private var latestDepthFrameTimestampNs = 0L
+    private var latestDepthConfidenceTimestampNs = 0L
+    private var latestDepthSourceImageWidth = 0
+    private var latestDepthSourceImageHeight = 0
+    private var latestDepthImageWidth = 0
+    private var latestDepthImageHeight = 0
+    private var latestDepthAcquisitionMode = DepthAcquisitionMode.PROVIDED
     private var featureHealth = VisibilitySourceHealth.CONFIGURED
     private var depthHealth = VisibilitySourceHealth.UNSUPPORTED
     /**
@@ -396,14 +417,39 @@ internal class AndroidVisibilityGridRuntime(
                     observation.close()
                     return@tryOfferLifecycle false
                 }
-                if (observation.frame.sourceTimestampNs <= depthLastCopiedTimestampNs) {
-                    duplicateDepthObservations++
+                if (ownership() != observation.ownership) {
+                    staleGenerationObservations++
                     droppedDepthObservations++
                     observation.close()
                     return@tryOfferLifecycle false
                 }
-                if (ownership() != observation.ownership) {
-                    staleGenerationObservations++
+                if (observation.acquisitionMode != DepthAcquisitionMode.PROVIDED) {
+                    recordDepthAcquisitionEvidence(observation.frame.sourceTimestampNs, observation.frame.frameTimestampNs,
+                        observation.confidenceTimestampNs, observation.sourceImageWidth, observation.sourceImageHeight,
+                        observation.frame.intrinsics.imageWidth, observation.frame.intrinsics.imageHeight, observation.acquisitionMode)
+                    if (depthAcquisitionFunding?.let { it.funded && it.matches(observation.ownership) } != true) {
+                        droppedDepthObservations++
+                        observation.close()
+                        return@tryOfferLifecycle false
+                    }
+                    if (observation.frame.sourceTimestampNs > observation.frame.frameTimestampNs) {
+                        invalidImageTimestampRefusals++
+                        droppedDepthObservations++
+                        observation.close()
+                        return@tryOfferLifecycle false
+                    }
+                    if (observation.acquisitionMode == DepthAcquisitionMode.AUTOMATIC &&
+                        observation.frame.sourceTimestampNs != observation.frame.frameTimestampNs) {
+                        staleAutomaticRefusals++
+                        droppedDepthObservations++
+                        observation.close()
+                        return@tryOfferLifecycle false
+                    }
+                }
+                qualifyDepthEstimate(observation.ownership)
+                if (observation.frame.sourceTimestampNs <= depthLastCopiedTimestampNs) {
+                    duplicateDepthObservations++
+                    if (observation.acquisitionMode != DepthAcquisitionMode.PROVIDED) duplicateEstimateRefusals++
                     droppedDepthObservations++
                     observation.close()
                     return@tryOfferLifecycle false
@@ -414,6 +460,7 @@ internal class AndroidVisibilityGridRuntime(
                 depthFailures = 0
                 recordOwnership(observation.ownership)
                 copiedDepthObservations++
+                if (observation.acquisitionMode != DepthAcquisitionMode.PROVIDED) freshEstimateAdmissions++
                 recordCallbackCopy(callbackCopyNs)
             }
             try {
@@ -434,6 +481,74 @@ internal class AndroidVisibilityGridRuntime(
         featureTransientUnavailable++
         if (featureHealth != VisibilitySourceHealth.FAILED) {
             featureHealth = VisibilitySourceHealth.TRANSIENT_UNAVAILABLE
+        }
+    }
+
+    /** Cold reservation runs on the mapper executor; frames read only the immutable result. */
+    fun prepareDepthAcquisition(expected: VisibilityObservationOwnership): Boolean {
+        depthAcquisitionFunding?.takeIf { it.matches(expected) }?.let {
+            return it.funded && !closed && !paused && ownership() == expected
+        }
+        val generation = synchronized(lock) {
+            if (closed || paused || ownership() != expected || depthAcquisitionPreparationPending) return false
+            depthAcquisitionPreparationPending = true
+            lifecycleGeneration
+        }
+        val qualifier = DepthAcquisitionFunding.from(expected, false)
+        try {
+            mapper.prepareDepthAcquisition(qualifier) { result ->
+                synchronized(lock) {
+                    depthAcquisitionPreparationPending = false
+                    if (!closed && !paused && generation == lifecycleGeneration && ownership()?.let { qualifier.matches(it) } == true) {
+                        // Only final profile decisions are cached. One pending cold request
+                        // still bounds retries when opening or renderer recovery is incomplete.
+                        depthAcquisitionFunding = if (result == DepthAcquisitionPreparationResult.RETRYABLE) null
+                            else qualifier.copy(funded = result == DepthAcquisitionPreparationResult.FUNDED)
+                    }
+                }
+            }
+        } catch (_: RuntimeException) {
+            synchronized(lock) { depthAcquisitionPreparationPending = false }
+        }
+        return false
+    }
+
+    fun recordDepthAcquisitionRefusal(reason: DepthAcquisitionRefusal, metadata: RawDepthFrameMetadata) = synchronized(lock) {
+        recordDepthAcquisitionEvidence(metadata.timestampNs, metadata.arFrameTimestampNs,
+            metadata.confidenceTimestampNs, metadata.sourceImageWidth, metadata.sourceImageHeight,
+            metadata.width, metadata.height, metadata.acquisitionMode)
+        when (reason) {
+            DepthAcquisitionRefusal.STALE_AUTOMATIC -> staleAutomaticRefusals++
+            DepthAcquisitionRefusal.CONFIDENCE_PAIR -> depthConfidencePairRefusals++
+            DepthAcquisitionRefusal.INVALID_TIMESTAMP -> invalidImageTimestampRefusals++
+        }
+    }
+
+    private fun recordDepthAcquisitionEvidence(imageTime: Long, frameTime: Long, confidenceTime: Long,
+        sourceWidth: Int, sourceHeight: Int, depthWidth: Int, depthHeight: Int, mode: DepthAcquisitionMode) {
+        latestDepthImageTimestampNs = imageTime
+        latestDepthFrameTimestampNs = frameTime
+        latestDepthConfidenceTimestampNs = confidenceTime
+        latestDepthSourceImageWidth = sourceWidth
+        latestDepthSourceImageHeight = sourceHeight
+        latestDepthImageWidth = depthWidth
+        latestDepthImageHeight = depthHeight
+        latestDepthAcquisitionMode = mode
+        if (mode == DepthAcquisitionMode.RAW && imageTime > 0L && imageTime < frameTime) rawReprojectedAcquisitions++
+    }
+
+    private fun qualifyDepthEstimate(owner: VisibilityObservationOwnership) {
+        if (depthEstimateBindingGeneration != owner.bindingGeneration ||
+            depthEstimateSessionGeneration != owner.sessionGeneration ||
+            depthEstimateGroupGeneration != owner.groupGeneration ||
+            depthEstimateLifecycleSequence != owner.lifecycleSequence ||
+            depthEstimateOperationGeneration != owner.operationGeneration) {
+            depthLastCopiedTimestampNs = Long.MIN_VALUE
+            depthEstimateBindingGeneration = owner.bindingGeneration
+            depthEstimateSessionGeneration = owner.sessionGeneration
+            depthEstimateGroupGeneration = owner.groupGeneration
+            depthEstimateLifecycleSequence = owner.lifecycleSequence
+            depthEstimateOperationGeneration = owner.operationGeneration
         }
     }
 
@@ -651,6 +766,20 @@ internal class AndroidVisibilityGridRuntime(
                 depthCapability = depthCapability,
                 copiedFeatureObservations = copiedFeatureObservations,
                 copiedDepthObservations = copiedDepthObservations,
+                freshEstimateAdmissions = freshEstimateAdmissions,
+                staleAutomaticRefusals = staleAutomaticRefusals,
+                rawReprojectedAcquisitions = rawReprojectedAcquisitions,
+                duplicateEstimateRefusals = duplicateEstimateRefusals,
+                depthConfidencePairRefusals = depthConfidencePairRefusals,
+                invalidImageTimestampRefusals = invalidImageTimestampRefusals,
+                latestDepthImageTimestampNs = latestDepthImageTimestampNs,
+                latestDepthFrameTimestampNs = latestDepthFrameTimestampNs,
+                latestDepthConfidenceTimestampNs = latestDepthConfidenceTimestampNs,
+                latestDepthSourceImageWidth = latestDepthSourceImageWidth,
+                latestDepthSourceImageHeight = latestDepthSourceImageHeight,
+                latestDepthImageWidth = latestDepthImageWidth,
+                latestDepthImageHeight = latestDepthImageHeight,
+                latestDepthAcquisitionMode = latestDepthAcquisitionMode,
                 admittedFeatureObservations = admittedFeatureObservations,
                 admittedDepthObservations = admittedDepthObservations,
                 invalidFeatureObservations = invalidFeatureObservations,
@@ -1117,6 +1246,20 @@ internal data class VisibilityObservationHealth(
     val admittedLifecycleSequence: Long,
     val admittedOperationGeneration: Long,
     val syntheticSource: Boolean,
+    val freshEstimateAdmissions: Long = 0L,
+    val staleAutomaticRefusals: Long = 0L,
+    val rawReprojectedAcquisitions: Long = 0L,
+    val duplicateEstimateRefusals: Long = 0L,
+    val depthConfidencePairRefusals: Long = 0L,
+    val invalidImageTimestampRefusals: Long = 0L,
+    val latestDepthImageTimestampNs: Long = 0L,
+    val latestDepthFrameTimestampNs: Long = 0L,
+    val latestDepthConfidenceTimestampNs: Long = 0L,
+    val latestDepthSourceImageWidth: Int = 0,
+    val latestDepthSourceImageHeight: Int = 0,
+    val latestDepthImageWidth: Int = 0,
+    val latestDepthImageHeight: Int = 0,
+    val latestDepthAcquisitionMode: DepthAcquisitionMode = DepthAcquisitionMode.PROVIDED,
 ) {
     val resourceBalance: Long get() = acquiredProducerResources - closedProducerResources
 
@@ -1146,6 +1289,21 @@ internal data class VisibilityObservationHealth(
         "totalGridHealth" to totalGridHealth,
         "copiedFeatureObservations" to copiedFeatureObservations,
         "copiedDepthObservations" to copiedDepthObservations,
+        "freshEstimateAdmissions" to freshEstimateAdmissions,
+        "staleAutomaticRefusals" to staleAutomaticRefusals,
+        "rawReprojectedAcquisitions" to rawReprojectedAcquisitions,
+        "duplicateEstimateRefusals" to duplicateEstimateRefusals,
+        "depthConfidencePairRefusals" to depthConfidencePairRefusals,
+        "invalidImageTimestampRefusals" to invalidImageTimestampRefusals,
+        "latestDepthImageTimestampNs" to latestDepthImageTimestampNs,
+        "latestDepthFrameTimestampNs" to latestDepthFrameTimestampNs,
+        "latestDepthConfidenceTimestampNs" to latestDepthConfidenceTimestampNs,
+        "latestDepthSourceImageWidth" to latestDepthSourceImageWidth,
+        "latestDepthSourceImageHeight" to latestDepthSourceImageHeight,
+        "latestDepthImageWidth" to latestDepthImageWidth,
+        "latestDepthImageHeight" to latestDepthImageHeight,
+        "latestDepthAcquisitionMode" to latestDepthAcquisitionMode.name,
+        "depthCalibrationQualification" to "legacyScaleUnverified",
         "admittedFeatureObservations" to admittedFeatureObservations,
         "admittedDepthObservations" to admittedDepthObservations,
         "invalidFeatureObservations" to invalidFeatureObservations,

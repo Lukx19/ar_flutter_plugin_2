@@ -4005,6 +4005,7 @@ class VisibilityGridIntegrationTest {
                             memory.pendingRendererRebuildBytes,
                             memory.retainedDepthLookupReceiptBytes,
                             memory.retainedDepthRefusalReceiptBytes,
+                            memory.depthAcquisitionIdentityReservationBytes,
                             memory.deferredDepthObservationBytes,
                             memory.runtimeOwnerBytes,
                             memory.bindingOwnerBytes,

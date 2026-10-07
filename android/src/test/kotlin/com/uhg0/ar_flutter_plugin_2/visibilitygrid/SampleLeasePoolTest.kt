@@ -65,7 +65,7 @@ class SampleLeasePoolTest {
             // two slots, two live lease/view/generation envelopes and one
             // frozen 4x4 pose per possible live observation.
             assertEquals(3_880L, feature.portableMaximumOwnedBytes)
-            assertEquals(4_136L, depth.portableMaximumOwnedBytes)
+            assertEquals(4_184L, depth.portableMaximumOwnedBytes)
             assertTrue(feature.portableOwnedBytes < feature.portableMaximumOwnedBytes)
             assertTrue(depth.portableOwnedBytes < depth.portableMaximumOwnedBytes)
             assertTrue(
